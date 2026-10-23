@@ -1,7 +1,7 @@
 //! The HTTP/3 server: a QUIC endpoint on one UDP socket (ngtcp2), HTTP/3
 //! on each connection (nghttp3), and every request handed to the same
 //! router, middleware and `(req, res)` handlers as HTTP/1.1 and HTTP/2,
-//! through dusty's `Server.dispatch` with a sink-backed `Response`. On
+//! through the core's `Server.dispatch` with a sink-backed `Response`. On
 //! Linux a listener has one endpoint per executor, each on a socket of one
 //! SO_REUSEPORT group (`Endpoint`, `steer`).
 //!
@@ -36,7 +36,7 @@
 //!
 //! Ported from ngtcp2's examples/server.cc and
 //! http3_server_proto_codec.cc (MIT, ngtcp2 1.25.0); the request and
-//! response plumbing follows dusty's HTTP/2 engine (src/server/h2.zig in
+//! response plumbing follows the core's HTTP/2 engine (src/server/h2.zig in
 //! the xuckless/dusty fork).
 const std = @import("std");
 const zio = @import("zio");
@@ -62,7 +62,7 @@ const placement = dusty.placement;
 
 const log = std.log.scoped(.anole_h3);
 
-/// What a request body read can fail with, as dusty's engines report it.
+/// What a request body read can fail with, as the core's engines report it.
 const ReadError = @typeInfo(@typeInfo(@typeInfo(@FieldType(dusty.BodySource, "err")).pointer.child).@"fn".return_type.?).optional.child;
 const SendError = dusty.Response.SendError;
 
@@ -2391,35 +2391,35 @@ pub fn Endpoint(comptime Ctx: type) type {
                 request.* = .{
                     .arena = arena,
                     .io = io,
-                    .parser = undefined,
-                    .transport = undefined,
-                    .config = server.config.request,
+                    ._parser = undefined,
+                    ._transport = undefined,
+                    ._config = server.config.request,
                     .listener = &ep.listener,
                     .secure = true,
                     .version_major = 3,
                     .version_minor = 0,
                     .drain = &server.draining,
-                    .drain_hooks = &server.drain_hooks,
+                    ._drain_hooks = &server.drain_hooks,
                     ._timeout_context = if (inline_mode) null else &timer,
                     ._set_timeout = if (inline_mode) null else setTimeout,
                 };
                 const body_reader = &ex.body_reader;
                 body_reader.* = .init(s);
-                request.body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
+                request._body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
 
                 const sink_state = &ex.sink_state;
                 sink_state.* = .{ .stream = s };
                 const response = &ex.response;
-                response.* = try dusty.Response.initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
+                response.* = try dusty.Response._initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
                 server.configureResponse(response);
                 var detached = false;
                 defer if (!detached) response.deinit();
-                response.request = request;
-                request.response = response;
+                response._request = request;
+                request._response = response;
                 if (inline_mode) {
                     ex.attached = false;
-                    response.detach_engine = &detach_engine;
-                    response.detach_ctx = ex;
+                    response._detach_engine = &detach_engine;
+                    response._detach_ctx = ex;
                 }
 
                 if (s.head_too_large) {
@@ -2507,7 +2507,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         return .done;
                     }
                 }
-                request.applyEntityHeaders();
+                request._applyEntityHeaders();
                 if (server.config.request.max_content_length) |max| {
                     if (request.content_length) |len| if (len > max) {
                         response.status = .payload_too_large;
@@ -2531,7 +2531,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (request.headers.get("Expect")) |expect| {
                     if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
                         conn.lock();
-                        request.expects_continue = !s.body_done;
+                        request._expects_continue = !s.body_done;
                         conn.unlock();
                     } else {
                         response.status = .expectation_failed;
@@ -2642,11 +2642,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             const old = exchangeOf(d);
             const ex = try old.response.arena.create(Exchange);
             ex.* = old.*;
-            ex.request.response = &ex.response;
-            ex.response.request = &ex.request;
-            ex.request.body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
-            ex.response.sink = ex.sink_state.sink();
-            ex.response.detach_ctx = ex;
+            ex.request._response = &ex.response;
+            ex.response._request = &ex.request;
+            ex.request._body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
+            ex.response._sink = ex.sink_state.sink();
+            ex.response._detach_ctx = ex;
             d.request = &ex.request;
             d.response = &ex.response;
             return ex;

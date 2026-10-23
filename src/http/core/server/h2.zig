@@ -91,7 +91,7 @@ const out_queue_len = 32 * 1024;
 const body_writer_len = 16 * 1024;
 
 /// The PING sent with a drain's GOAWAY notice.
-const drain_ping: [8]u8 = "dusty-go".*;
+const drain_ping: [8]u8 = "anole-go".*;
 
 /// After the peer's side of the connection ended cleanly, while handlers
 /// still run, how often the writer sends a PING to learn whether the peer
@@ -886,7 +886,8 @@ pub fn Engine(comptime Ctx: type) type {
         /// or the buffer filled up) goes to `spill`, which the writer frees
         /// whenever it runs out of output, so an idle connection holds none.
         fn runWriter(conn: *Conn) !void {
-            const send_timeout = sendTimeout(conn);
+            // A write the peer does not take, however many streams wait behind it.
+            const send_timeout = conn.server.config.timeout.write;
             var spill: std.ArrayList(u8) = .empty;
             defer spill.deinit(conn.allocator);
             const writer = conn.connection.writer;
@@ -1197,35 +1198,35 @@ pub fn Engine(comptime Ctx: type) type {
             request.* = .{
                 .arena = arena,
                 .io = io,
-                .parser = undefined,
-                .transport = undefined,
-                .config = server.config.request,
+                ._parser = undefined,
+                ._transport = undefined,
+                ._config = server.config.request,
                 .listener = conn.listener,
                 .secure = conn.secure,
                 .peer_certificate = conn.connection.peerCertificate(),
                 .version_major = 2,
                 .version_minor = 0,
                 .drain = &server.draining,
-                .drain_hooks = &server.drain_hooks,
+                ._drain_hooks = &server.drain_hooks,
                 ._timeout_context = if (inline_mode) null else &timer,
                 ._set_timeout = if (inline_mode) null else setTimeout,
             };
             const body_reader = &ex.body_reader;
             body_reader.* = .init(stream);
-            request.body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
+            request._body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
 
             const sink_state = &ex.sink_state;
             sink_state.* = .{ .stream = stream };
             const response = &ex.response;
-            response.* = try Response.initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
+            response.* = try Response._initSink(arena, io, sink_state.sink(), server.config.response.max_header_count);
             server.configureResponse(response);
             var detached = false;
             defer if (!detached) response.deinit();
-            response.request = request;
-            request.response = response;
+            response._request = request;
+            request._response = response;
             if (inline_mode) {
-                response.detach_engine = &detach_engine;
-                response.detach_ctx = ex;
+                response._detach_engine = &detach_engine;
+                response._detach_ctx = ex;
             }
 
             request.method = parseMethod(stream.method) orelse {
@@ -1288,7 +1289,7 @@ pub fn Engine(comptime Ctx: type) type {
                     return .done;
                 }
             }
-            request.applyEntityHeaders();
+            request._applyEntityHeaders();
             // A body declared longer than allowed is refused unread; the
             // engine drops or resets the rest of the stream.
             if (server.config.request.max_content_length) |max| {
@@ -1306,7 +1307,7 @@ pub fn Engine(comptime Ctx: type) type {
 
             if (request.headers.get("Expect")) |expect| {
                 if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
-                    request.expects_continue = !stream.body_done;
+                    request._expects_continue = !stream.body_done;
                 } else {
                     response.status = .expectation_failed;
                     {
@@ -1346,11 +1347,11 @@ pub fn Engine(comptime Ctx: type) type {
             const old = exchangeOf(d);
             const ex = try old.response.arena.create(Exchange);
             ex.* = old.*;
-            ex.request.response = &ex.response;
-            ex.response.request = &ex.request;
-            ex.request.body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
-            ex.response.sink = ex.sink_state.sink();
-            ex.response.detach_ctx = ex;
+            ex.request._response = &ex.response;
+            ex.response._request = &ex.request;
+            ex.request._body_source = .{ .reader = &ex.body_reader.interface, .err = BodyReader.errorOf };
+            ex.response._sink = ex.sink_state.sink();
+            ex.response._detach_ctx = ex;
             d.request = &ex.request;
             d.response = &ex.response;
             return ex;
@@ -2063,7 +2064,7 @@ pub fn Engine(comptime Ctx: type) type {
         }
 
         /// The response is complete and nobody will read the rest of the
-        /// request body. Like dusty's HTTP/1.x drain, a little more of it is
+        /// request body. Like the core's HTTP/1.x drain, a little more of it is
         /// read and dropped, so a peer still sending a small body sees a
         /// clean end and its later frames are still checked; past one stream
         /// window the stream ends with RST_STREAM(NO_ERROR) (RFC 9113 §8.1).

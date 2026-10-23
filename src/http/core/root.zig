@@ -17,8 +17,9 @@ pub const Burst = @import("server.zig").Burst;
 pub const Address = @import("config.zig").Address;
 pub const Listener = @import("config.zig").Listener;
 pub const ServerConfig = @import("config.zig").ServerConfig;
-pub const TlsCa = @import("config.zig").TlsCa;
-pub const TlsPath = @import("config.zig").TlsPath;
+pub const Cert = @import("tls_options.zig").Cert;
+pub const Ca = @import("tls_options.zig").Ca;
+pub const ClientAuth = @import("tls_options.zig").ClientAuth;
 /// A peer range for `Listener.proxy_protocol_from`.
 pub const ProxyNetwork = @import("proxy_protocol.zig").Network;
 pub const Router = @import("router.zig").Router;
@@ -35,6 +36,9 @@ pub const Detached = @import("detach.zig").Detached;
 /// Task placement on zio's executors, for protocol engines outside the
 /// core (HTTP/3) that keep a connection's tasks on one executor.
 pub const placement = @import("placement.zig");
+
+/// Tests that provoke `err` logs on purpose declare it here.
+pub const expect_log = @import("expect_log.zig");
 pub const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 /// One time budget shared by several blocking calls (a request, then the
 /// reads of its body), as the client's `timeout` is; for protocol clients
@@ -49,6 +53,8 @@ pub const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 pub const EventStream = @import("response.zig").EventStream;
 pub const EventWriter = @import("response.zig").EventWriter;
 pub const WebSocket = @import("websocket.zig").WebSocket;
+/// Whether an HTTP/1.1 request is a valid WebSocket handshake.
+pub const isWebSocketHandshake = @import("websocket.zig").isHandshake;
 /// How a WebSocket sends once per read (`WebSocket`); for layers that
 /// frame WebSocket messages themselves.
 pub const WebSocketBatch = @import("websocket.zig").Batch;
@@ -57,6 +63,7 @@ pub const Status = @import("http.zig").Status;
 pub const Headers = @import("http.zig").Headers;
 pub const Params = @import("http.zig").Params;
 pub const ContentType = @import("http.zig").ContentType;
+pub const MisuseError = @import("http.zig").MisuseError;
 pub const ContentEncoding = @import("http.zig").ContentEncoding;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
@@ -80,7 +87,7 @@ pub const ErrorHandler = @import("config.zig").ErrorHandler;
 pub const middleware = @import("middleware/middleware.zig");
 pub const Middleware = @import("middleware.zig").Middleware;
 pub const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
-pub const Executor = @import("middleware.zig").Executor;
+pub const Chain = @import("middleware.zig").Chain;
 /// The status a handler error stands for (status-named errors such as
 /// `error.Unauthorized`, request-body faults), or null for a 500: for
 /// middleware that records the status it will send.
@@ -112,8 +119,8 @@ pub const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
 
 // Client
 pub const Client = @import("client.zig").Client;
-pub const ClientConfig = @import("client.zig").ClientConfig;
-pub const TlsConfig = @import("client.zig").TlsConfig;
+pub const ClientOptions = @import("client.zig").ClientOptions;
+pub const TlsOptions = @import("client.zig").TlsOptions;
 pub const ClientResponse = @import("client.zig").ClientResponse;
 pub const FetchOptions = @import("client.zig").FetchOptions;
 pub const WebSocketClient = @import("client.zig").WebSocketClient;

@@ -89,7 +89,7 @@ pub const SessionData = struct {
 };
 
 /// `Session.init`'s settings.
-pub const Config = struct {
+pub const Options = struct {
     /// The HMAC-SHA256 key the cookie is signed with: at least 32 random
     /// bytes from your secret store. `init` refuses a shorter one, or one
     /// of zeros, with `error.WeakSessionKey`.
@@ -113,7 +113,7 @@ pub const Config = struct {
     cookie_opts: SessionCookieOpts = .{},
 };
 
-config: Config,
+config: Options,
 
 const Session = @This();
 
@@ -123,7 +123,7 @@ const Session = @This();
 /// `error.CookiePrefixMismatch` when a `__Host-` or `__Secure-` cookie name
 /// asks for attributes `cookie_opts` does not give: browsers would drop
 /// the cookie.
-pub fn init(config: Config) error{ WeakSessionKey, CookiePrefixMismatch }!Session {
+pub fn init(config: Options) error{ WeakSessionKey, CookiePrefixMismatch }!Session {
     if (!strongKey(config.secret_key)) {
         log.err("session: secret_key must be at least 32 random bytes from your secret store, not shorter and not all zeros", .{});
         return error.WeakSessionKey;
@@ -147,7 +147,10 @@ test "init: a key shorter than 32 bytes, or of zeros, is refused" {
     _ = try init(.{ .secret_key = "test-secret-key-that-is-long-enough" });
 }
 
-pub fn execute(self: *const Session, req: *Request, res: *Response, executor: anytype) !void {
+/// Never waits: no I/O, so `no_wait` routes may sit behind it.
+pub const no_wait = true;
+
+pub fn execute(self: *const Session, req: *Request, res: *Response, next: anytype) !void {
     const cookie_value = req.cookies().get(self.config.cookie_name);
     // When the loaded cookie stops being honoured; 0 for none loaded.
     var expires_at: u32 = 0;
@@ -161,7 +164,7 @@ pub fn execute(self: *const Session, req: *Request, res: *Response, executor: an
         };
     }
 
-    try executor.next();
+    try next.call();
 
     // Re-sign if modified, or the session has data and its expiry should
     // slide: on every response with max_age (the cookie's Max-Age is
@@ -521,7 +524,7 @@ test "SessionData: clear" {
     try testing.expect(s.get("a") == null);
 }
 
-test "Config: setting one cookie_opts field keeps the secure defaults of the others" {
+test "Options: setting one cookie_opts field keeps the secure defaults of the others" {
     const session = try init(.{ .secret_key = "test-secret-key-that-is-long-enough", .cookie_opts = .{ .same_site = .none } });
     try testing.expect(session.config.cookie_opts.http_only);
     try testing.expect(session.config.cookie_opts.secure);

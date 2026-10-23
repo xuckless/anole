@@ -25,78 +25,11 @@ pub const ErrorFormat = enum {
 /// fall back to that mapping with `defaultError(req, res, err)`.
 pub const ErrorHandler = *const fn (req: *HttpRequest, res: *HttpResponse, err: anyerror) void;
 
-/// Where a TLS peer's certificate authorities are loaded from. Shared by the
-/// client (verifying server certificates) and the server (verifying client
-/// certificates under mutual TLS).
-pub const TlsCa = union(enum) {
-    /// The platform trust store.
-    system,
-    /// A single PEM file holding one or more certificates.
-    file: TlsPath,
-    /// A directory of PEM files, each holding one or more certificates.
-    dir: TlsPath,
-    /// One or more PEM certificates in memory: a CA that comes from a secret
-    /// store or the environment, or a development certificate made at
-    /// startup. Read when the trust store is loaded (a client's first HTTPS
-    /// request, a listener's start); it must stay alive until then.
-    pem: []const u8,
-    /// Trust nothing. Rejected unless the side using it says otherwise.
-    none,
-
-    /// Reads the certificates into a fresh bundle owned by the caller.
-    pub fn load(self: TlsCa, allocator: std.mem.Allocator, io: std.Io) !std.crypto.Certificate.Bundle {
-        const now = std.Io.Clock.real.now(io);
-
-        var bundle: std.crypto.Certificate.Bundle = .empty;
-        errdefer bundle.deinit(allocator);
-        switch (self) {
-            .system => try bundle.rescan(allocator, io, now),
-            .file => |src| try bundle.addCertsFromFilePath(
-                allocator,
-                io,
-                now,
-                src.dir orelse std.Io.Dir.cwd(),
-                src.path,
-            ),
-            .dir => |src| try bundle.addCertsFromDirPath(
-                allocator,
-                io,
-                src.dir orelse std.Io.Dir.cwd(),
-                src.path,
-            ),
-            .pem => |text| try addCertsFromPem(&bundle, allocator, text, now.toSeconds()),
-            .none => {},
-        }
-        return bundle;
-    }
-};
-
-/// `std.crypto.Certificate.Bundle.addCertsFromFile` for PEM text in memory:
-/// every `BEGIN CERTIFICATE` block, decoded and parsed; expired ones are
-/// skipped, as there.
-pub fn addCertsFromPem(
-    bundle: *std.crypto.Certificate.Bundle,
-    allocator: std.mem.Allocator,
-    pem: []const u8,
-    now_sec: i64,
-) !void {
-    const begin_marker = "-----BEGIN CERTIFICATE-----";
-    const end_marker = "-----END CERTIFICATE-----";
-    const base64 = std.base64.standard.decoderWithIgnore(" \t\r\n");
-    var start_index: usize = 0;
-    while (std.mem.indexOfPos(u8, pem, start_index, begin_marker)) |begin| {
-        const cert_start = begin + begin_marker.len;
-        const cert_end = std.mem.indexOfPos(u8, pem, cert_start, end_marker) orelse
-            return error.MissingEndCertificateMarker;
-        start_index = cert_end + end_marker.len;
-        const encoded = std.mem.trim(u8, pem[cert_start..cert_end], " \t\r\n");
-        const decoded_start = std.math.cast(u32, bundle.bytes.items.len) orelse
-            return error.CertificateAuthorityBundleTooBig;
-        try bundle.bytes.ensureUnusedCapacity(allocator, base64.calcSizeUpperBound(encoded.len));
-        bundle.bytes.items.len += try base64.decode(bundle.bytes.unusedCapacitySlice(), encoded);
-        try bundle.parseCert(allocator, decoded_start, now_sec);
-    }
-}
+pub const tls_options = @import("tls_options.zig");
+pub const Cert = tls_options.Cert;
+pub const Ca = tls_options.Ca;
+pub const ClientAuth = tls_options.ClientAuth;
+pub const addCertsFromPem = tls_options.addCertsFromPem;
 
 /// Kept free past the head in a request's read buffer, which is sized
 /// `buffer_size + body_read_reserve`. `parseHeaders` gives the body reader
@@ -104,14 +37,6 @@ pub fn addCertsFromPem(
 /// read; refusing a head that would eat into this is what makes it a reserve
 /// rather than a hope.
 pub const body_read_reserve = 1024;
-
-/// A file named by path, optionally relative to an open directory.
-pub const TlsPath = struct {
-    path: []const u8,
-    /// Directory `path` is resolved against. Defaults to the current working
-    /// directory.
-    dir: ?std.Io.Dir = null,
-};
 
 /// Where a listener binds, or a server's bound address: an IP address
 /// and port, or a Unix socket path.
@@ -133,7 +58,7 @@ pub const Address = union(enum) {
 pub const Listener = struct {
     address: Address,
     /// When set, every connection accepted here is TLS. Requires the
-    /// `use_tls` build option (enabled by default); with TLS compiled out,
+    /// `-Dtls` build option (enabled by default); with TLS compiled out,
     /// setting this fails `Server.run`.
     tls: ?ServerConfig.Tls = null,
     /// How many connections the kernel accepts on the server's behalf
@@ -160,7 +85,7 @@ pub const Listener = struct {
     ipv6_only: ?bool = null,
     /// Serve cleartext HTTP/2 to a client that opens with the HTTP/2
     /// connection preface ("prior knowledge", RFC 9113 §3.3), alongside
-    /// HTTP/1.x on the same port. Needs the `use_http2` build option, and
+    /// HTTP/1.x on the same port. Needs the `-Dhttp2` build option, and
     /// is ignored on a TLS listener, which negotiates "h2" through
     /// `Tls.alpn_protocols` instead. The deprecated `Upgrade: h2c` is not
     /// supported.
@@ -262,14 +187,9 @@ test "Listener.acceptorCount: log2 of the CPUs, at least two, unless given" {
     try std.testing.expectEqual(1, zero.acceptorCount(128));
 }
 
-/// The HTTP core's settings; through Anole, `anole.ServerOptions.server`
-/// (whose `listeners`, `http2`, `errors` and `error_handler` Anole sets
-/// from its own fields):
-///
-///     var app = try anole.App.init(gpa, .{ .server = .{
-///         .timeout = .{ .request = .fromSeconds(60) },
-///         .request = .{ .max_body_size = 8 * 1024 * 1024 },
-///     } });
+/// The HTTP core's settings. Anole builds one from `anole.ServerOptions`
+/// (`timeouts`, `limits`, `proxy`, `request`, `response`, `http2`); use
+/// `ServerOptions`, and this only to drive the core alone.
 pub const ServerConfig = struct {
     /// Request, header, keep-alive and shutdown time limits.
     timeout: Timeout = .{},
@@ -279,7 +199,7 @@ pub const ServerConfig = struct {
     /// How responses are written: buffer size, `Date`, the default
     /// content type, header count, Brotli quality.
     response: Response = .{},
-    /// HTTP/2 connections (with the `use_http2` build option): reached
+    /// HTTP/2 connections (with the `-Dhttp2` build option): reached
     /// through ALPN "h2" on a TLS listener or `Listener.http2_prior_knowledge`.
     http2: Http2 = .{},
     /// Where the server accepts connections. `Server.run` serves all of
@@ -348,10 +268,10 @@ pub const ServerConfig = struct {
 
     /// TLS is per listener: see `Listener.tls`.
     pub const Tls = struct {
-        /// Path to the PEM certificate (chain) file, resolved against `dir`.
+        /// Path to the PEM certificate (chain) file, relative to the working directory.
         /// Ignored when `pem` is set.
         cert_path: []const u8 = "",
-        /// Path to the PEM private key file, resolved against `dir`.
+        /// Path to the PEM private key file, relative to the working directory.
         /// Ignored when `pem` is set.
         key_path: []const u8 = "",
         /// The certificate (chain) and private key as PEM text in memory,
@@ -360,9 +280,6 @@ pub const ServerConfig = struct {
         /// should never be written to disk. Read once by listen(); it does
         /// not need to outlive that.
         pem: ?Pem = null,
-        /// Directory the cert/key paths are resolved against. Defaults to the
-        /// current working directory.
-        dir: ?std.Io.Dir = null,
         /// Ask connecting clients to authenticate with a certificate (mutual
         /// TLS). Null means client certificates are never requested.
         client_auth: ?ClientAuth = null,
@@ -377,19 +294,6 @@ pub const ServerConfig = struct {
             cert: []const u8,
             key: []const u8,
         };
-
-        /// Mutual TLS: which CAs a client certificate must chain to, and
-        /// whether one is required.
-        pub const ClientAuth = struct {
-            /// Certificate authorities used to verify client certificates.
-            /// `.none` is rejected by listen().
-            ca: TlsCa,
-            /// `.require` rejects a client that sends no certificate;
-            /// `.request` asks for one but accepts an empty reply.
-            mode: Mode = .require,
-
-            pub const Mode = enum { request, require };
-        };
     };
 
     /// HTTP/2 limits and windows (`anole.ServerOptions.http2`).
@@ -397,7 +301,7 @@ pub const ServerConfig = struct {
         /// SETTINGS_MAX_CONCURRENT_STREAMS: streams a client may have open
         /// at once. Each costs a task and, once it sends a body, a buffer
         /// of `stream_window` bytes.
-        max_concurrent_streams: u32 = 100,
+        max_concurrent_streams: u32 = 250,
         /// SETTINGS_INITIAL_WINDOW_SIZE: request body bytes a client may
         /// send on a stream before the handler reads them, which is also
         /// the stream's body buffer.
@@ -505,7 +409,14 @@ pub const ServerConfig = struct {
         /// in flight. Null waits for all of them, however long they take --
         /// which for a connection that never closes on its own, such as a
         /// WebSocket or an event stream, is forever.
-        shutdown: ?std.Io.Duration = .fromSeconds(30),
+        shutdown: ?std.Io.Duration = .fromSeconds(10),
+        /// A write the peer does not take for this long ends the response
+        /// (HTTP/1.x: the connection; HTTP/2 and HTTP/3: the stream). Once a
+        /// stream or file body has started it also replaces the request
+        /// deadline, which ends with the head (`Request.setTimeout` before
+        /// the stream keeps its own). On HTTP/2 it bounds every connection
+        /// write. Null: none.
+        write: ?std.Io.Duration = .fromSeconds(30),
     };
 
     /// `ServerConfig.request`.
@@ -566,6 +477,9 @@ pub const ServerConfig = struct {
         max_form_count: usize = 32,
         /// Maximum number of multipart form fields
         max_multiform_count: usize = 32,
+        /// The largest WebSocket message, in or out (after inflating): what
+        /// `anole.websocket.UpgradeOptions.max_message_size` falls back on.
+        ws_max_message: usize = 1024 * 1024,
     };
 
     /// `ServerConfig.response`.

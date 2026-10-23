@@ -8,8 +8,8 @@
 //! reference-counted set, so a rotation never frees keys in use.
 //!
 //! When the provider cannot be reached, the keys in hand stay in use for
-//! `stale_seconds` past their TTL, and a failed fetch is not tried again
-//! for a while (`retry_seconds`, doubling up to `max_retry_seconds`), so an
+//! `stale` past their TTL, and a failed fetch is not tried again
+//! for a while (`retry`, doubling up to `max_retry`), so an
 //! outage neither fails every request nor turns each one into a fetch.
 const std = @import("std");
 const jws = @import("jws.zig");
@@ -28,20 +28,20 @@ pub const Keyring = struct {
     client: Client,
     url: []const u8,
     /// Keys are refetched this long after the last fetch.
-    ttl_seconds: i64 = 3600,
+    ttl: std.Io.Duration = .fromSeconds(3600),
     /// Fetches for an unknown `kid` are at least this far apart, so a
     /// stream of bogus tokens cannot make us hammer the provider.
-    min_refresh_seconds: i64 = 60,
+    min_refresh: std.Io.Duration = .fromSeconds(60),
     /// While refetching fails, keys past their TTL are still used for this
     /// long (a day by default): an outage at the provider does not fail
     /// every request at once. Rotation away from a compromised key needs
     /// the provider to be reachable either way.
-    stale_seconds: i64 = 24 * 3600,
+    stale: std.Io.Duration = .fromSeconds(24 * 3600),
     /// After a failed fetch, the next waits this long, doubling with each
-    /// failure up to `max_retry_seconds`. Meanwhile requests use the stale
+    /// failure up to `max_retry`. Meanwhile requests use the stale
     /// keys, or fail at once (`error.JwksFetchFailed`) when there are none.
-    retry_seconds: i64 = 5,
-    max_retry_seconds: i64 = 300,
+    retry: std.Io.Duration = .fromSeconds(5),
+    max_retry: std.Io.Duration = .fromSeconds(300),
 
     /// Guards the fields below; never held across I/O or a verification.
     mutex: std.Io.Mutex = .init,
@@ -52,7 +52,7 @@ pub const Keyring = struct {
     fetched: std.Io.Condition = .init,
     /// Bumped whenever a fetch ends, successful or not.
     generation: u64 = 0,
-    /// When the last fetch began (for `min_refresh_seconds`).
+    /// When the last fetch began (for `min_refresh`).
     attempted_at: i64 = std.math.minInt(i64) / 2,
     /// Fetches failed in a row, and when the next may run.
     failures: u32 = 0,
@@ -109,9 +109,9 @@ pub const Keyring = struct {
 
     /// With `seen` null: a set within its TTL, fetching one (or waiting
     /// for the fetch running) when there is none; while fetches fail, the
-    /// set within `stale_seconds` past its TTL. With `seen`: a set newer
+    /// set within `stale` past its TTL. With `seen`: a set newer
     /// than `seen`, fetching one unless the last fetch began less than
-    /// `min_refresh_seconds` ago or fetches are backing off; null when
+    /// `min_refresh` ago or fetches are backing off; null when
     /// there is none. The caller releases what it gets.
     fn obtain(self: *Keyring, seen: ?*Set) !?*Set {
         try self.mutex.lock(self.io);
@@ -120,7 +120,7 @@ pub const Keyring = struct {
         while (true) {
             const t = self.now();
             if (self.current) |cur| {
-                const usable = if (seen) |s| cur != s else t - cur.fetched_at <= self.ttl_seconds;
+                const usable = if (seen) |s| cur != s else t - cur.fetched_at <= self.ttl.toSeconds();
                 if (usable) {
                     cur.refs += 1;
                     return cur;
@@ -139,7 +139,7 @@ pub const Keyring = struct {
                 try self.fetched.wait(self.io, &self.mutex);
                 continue;
             }
-            if (seen != null and t - self.attempted_at < self.min_refresh_seconds) return null;
+            if (seen != null and t - self.attempted_at < self.min_refresh.toSeconds()) return null;
             if (t < self.retry_at) {
                 // Backing off after a failed fetch.
                 if (seen != null) return null;
@@ -159,7 +159,7 @@ pub const Keyring = struct {
                 if (err == error.Canceled) return err;
                 self.failures +|= 1;
                 const shift: u6 = @intCast(@min(self.failures - 1, 20));
-                self.retry_at = t + @min(self.max_retry_seconds, self.retry_seconds << shift);
+                self.retry_at = t + @min(self.max_retry.toSeconds(), self.retry.toSeconds() << shift);
                 log.warn("JWKS fetch from {s} failed ({t}); next try in {d}s", .{ self.url, err, self.retry_at - t });
                 if (seen == null) if (self.staleLocked(t)) |stale| return stale;
                 return err;
@@ -171,11 +171,11 @@ pub const Keyring = struct {
         }
     }
 
-    /// The current set while it is within `stale_seconds` past its TTL,
+    /// The current set while it is within `stale` past its TTL,
     /// with a reference taken; null otherwise.
     fn staleLocked(self: *Keyring, t: i64) ?*Set {
         const cur = self.current orelse return null;
-        if (t - cur.fetched_at > self.ttl_seconds +| self.stale_seconds) return null;
+        if (t - cur.fetched_at > self.ttl.toSeconds() +| self.stale.toSeconds()) return null;
         cur.refs += 1;
         return cur;
     }

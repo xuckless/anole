@@ -1,5 +1,5 @@
 //! gRPC end to end: the four call modes, status in trailers, deadlines and
-//! gzip, against dusty's HTTP/2 engine with a minimal nghttp2 client.
+//! gzip, against the core's HTTP/2 engine with a minimal nghttp2 client.
 const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
@@ -336,7 +336,7 @@ test "gRPC: unary, server, client and bidi streaming; status and trailers; deadl
     }
 }
 
-/// One request with dusty's HTTP/1.1 client; the body and selected headers.
+/// One request with the core's HTTP/1.1 client; the body and selected headers.
 const Http1 = struct {
     status: u16,
     body: []const u8,

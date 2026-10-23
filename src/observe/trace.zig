@@ -155,7 +155,7 @@ pub const Options = struct {
     service_name: []const u8,
     /// Spans sent per request to the collector, and how often.
     batch_size: usize = 256,
-    interval_ms: u32 = 2000,
+    interval: std.Io.Duration = .fromSeconds(2),
     /// Spans waiting beyond this are dropped (and counted).
     queue_len: usize = 4096,
     /// Record only requests whose caller asked for it (sampled flag), or
@@ -252,7 +252,7 @@ pub const Exporter = struct {
             self.send(batch[0..n]);
             // A pause before the next batch, cut short by `deinit`.
             if (n < batch.len) self.closing.waitTimeout(self.io, .{ .duration = .{
-                .raw = .fromMilliseconds(self.options.interval_ms),
+                .raw = self.options.interval,
                 .clock = .awake,
             } }) catch |err| switch (err) {
                 error.Timeout => {},
@@ -323,8 +323,11 @@ pub const Middleware = struct {
         return .{ .exporter = exporter };
     }
 
-    pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
-        if (common.excluded(req, self.exporter.options.exclude)) return executor.next();
+    /// Never waits: no I/O, so `no_wait` routes may sit behind it.
+    pub const no_wait = true;
+
+    pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
+        if (common.excluded(req, self.exporter.options.exclude)) return next.call();
         const parent = if (req.headers.get("traceparent")) |h| Context.parse(h) else null;
         if (!self.exporter.options.sample_all) if (parent == null or !parent.?.sampled) {
             // Not recorded here, but the caller's context still goes on to
@@ -334,7 +337,7 @@ pub const Middleware = struct {
                 req.trace_id = try req.arena.dupe(u8, &p.trace_id);
                 req.span_id = try req.arena.dupe(u8, &p.span_id);
             }
-            return executor.next();
+            return next.call();
         };
         var span: Span = undefined;
         span.db = null;
@@ -345,7 +348,7 @@ pub const Middleware = struct {
         req.span_id = try req.arena.dupe(u8, &span.span_id);
         span.start_ns = std.Io.Clock.real.now(req.io).nanoseconds;
 
-        const result = executor.next();
+        const result = next.call();
 
         span.end_ns = std.Io.Clock.real.now(req.io).nanoseconds;
         var mbuf: [12]u8 = undefined;

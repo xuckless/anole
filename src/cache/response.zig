@@ -180,12 +180,15 @@ pub const ResponseCache = struct {
     /// The middleware: a GET or HEAD with a fresh kept response gets it
     /// without going further; any other request runs on, and a GET's
     /// answer is kept when it may be.
-    pub fn execute(self: *ResponseCache, req: *Request, res: *Response, executor: anytype) !void {
-        if (req.method != .get and req.method != .head) return executor.next();
-        if (!self.options.authenticated and self.credentials(req)) return executor.next();
-        if (self.options.cacheable) |may| if (!may(req)) return executor.next();
-        if (req.headers.get("Upgrade") != null) return executor.next();
-        const local = self.locals.get(req.io) orelse return executor.next();
+    /// Never waits: no I/O, so `no_wait` routes may sit behind it.
+    pub const no_wait = true;
+
+    pub fn execute(self: *ResponseCache, req: *Request, res: *Response, next: anytype) !void {
+        if (req.method != .get and req.method != .head) return next.call();
+        if (!self.options.authenticated and self.credentials(req)) return next.call();
+        if (self.options.cacheable) |may| if (!may(req)) return next.call();
+        if (req.headers.get("Upgrade") != null) return next.call();
+        const local = self.locals.get(req.io) orelse return next.call();
 
         const at = store.now(req.io);
         if (self.lookup(local, req, at) catch null) |entry| {
@@ -198,7 +201,7 @@ pub const ResponseCache = struct {
         // leaves its answer unkept.
         const stamp = self.gens.stamp(Generations.untagged, Generations.keySlot(std.hash.Wyhash.hash(0, pathOf(req.url))));
         const before = res.headers.len;
-        try executor.next();
+        try next.call();
         if (req.method == .head) return;
         if (res.isDetached()) {
             const later = try req.arena.create(Later);

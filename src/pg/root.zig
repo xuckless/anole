@@ -78,7 +78,7 @@ const pg = driver;
 const dusty_tls = if (has_tls) @import("anole_dusty_tls") else struct {};
 
 const has_tls = features.tls == .boringssl;
-const log = std.log.scoped(.anole);
+const log = @import("../errors.zig").log;
 const placement = dusty.placement;
 const Duration = std.Io.Duration;
 
@@ -94,8 +94,8 @@ pub const Options = struct {
     /// `PGDATABASE`, `PGSSLMODE`...), else `postgres://postgres@127.0.0.1:5432/postgres`.
     url: ?[]const u8 = null,
     /// The database's name in metrics (`db` label), spans, `/readyz` and
-    /// logs. Must outlive the connector.
-    name: []const u8 = "postgres",
+    /// logs. Must outlive the connector. Null: "postgres".
+    name: ?[]const u8 = null,
     /// Connections in all, split between the executors (at least one
     /// each). Null: the URL's `pool_max_conns`, else twice the number of
     /// executors, at least 4. A URL's `pool_max_conns` wins over this.
@@ -124,7 +124,7 @@ pub const Options = struct {
     /// With `tls.ca` set, the server's certificate is always checked:
     /// `verify-full` when no sslmode is given, and an sslmode that does not
     /// check it (`disable`, `allow`, `prefer`) is refused.
-    tls: Tls = .{},
+    tls: db.Tls = .{},
     /// Open one connection per executor before serving, and fail the
     /// start if that fails. Off: connections open as calls need them, and
     /// a database that is down shows in `/readyz` and as 503s.
@@ -133,6 +133,12 @@ pub const Options = struct {
     application_name: ?[]const u8 = null,
     /// What `/readyz` waits for the database's answer.
     ping_timeout: Duration = .fromSeconds(2),
+    /// A bound on every call that has no `QueryOptions.timeout` of its own,
+    /// in a request or not; past it the call is canceled and fails with
+    /// `error.GatewayTimeout`. A request's deadline applies too, whichever
+    /// comes first. Null: none (a call outside a request then waits as long
+    /// as the database does).
+    timeout: ?Duration = .fromSeconds(30),
     /// The bounds of the results kept for calls with `.cache`
     /// (`anole.db.QueryOptions`).
     cache: db.CacheOptions = .{},
@@ -162,7 +168,9 @@ pub const Options = struct {
         /// and `LOAD` close the connection instead. The limit: what a
         /// server-side function does is not in the SQL, so `SELECT
         /// my_function()` that runs `set_config(..., false)` or `SET ROLE`
-        /// inside leaves it for the next call; use `.always` then.
+        /// inside leaves it for the next call; use `.always` then. Not reported,
+        /// so not caught: a role set inside a function (`role` is not a
+        /// reported setting).
         auto,
         /// Reset on every release (`DISCARD ALL` but for the prepared
         /// statements and `UNLISTEN`).
@@ -174,14 +182,7 @@ pub const Options = struct {
     };
 
     /// Certificates beyond what the URL names (`Options.tls`).
-    pub const Tls = struct {
-        /// What `sslmode=verify-ca`/`verify-full` trust; null: the URL's
-        /// `sslrootcert`, else the system's store.
-        ca: ?dusty.TlsCa = null,
-        /// A client certificate for servers that ask (`clientcert` in
-        /// pg_hba.conf); null: the URL's `sslcert` and `sslkey`.
-        client_certificate: ?dusty.TlsConfig.ClientCertificate = null,
-    };
+    pub const Tls = db.Tls;
 };
 
 /// libpq's `sslmode`. Without one: `verify_full` for a remote host,
@@ -376,11 +377,17 @@ const Settings = struct {
             s.unix_path = try std.fmt.allocPrint(arena, "{s}/.s.PGSQL.{d}", .{ std.mem.trimEnd(u8, s.host, "/"), s.port });
         }
         const code_ca = opts.tls.ca != null;
+        const insecure = opts.tls.insecure_skip_verify;
+        if (insecure and code_ca) {
+            _ = why.set("Options.tls.insecure_skip_verify cannot be set with Options.tls.ca: one checks the server's certificate and the other does not", .{}) catch {};
+            return error.InvalidOptions;
+        }
+        if (insecure and s.sslmode_set and (s.sslmode == .disable or s.sslmode.verifies())) return why.set("Options.tls.insecure_skip_verify asks for TLS without checking the certificate, but sslmode={t} does not; take sslmode out of the URL and PGSSLMODE, or set require", .{s.sslmode});
         // No sslmode given: the server's certificate is checked unless the
         // server is on this machine and the code gives no CA.
-        if (!s.sslmode_set) s.sslmode = if (s.local() and !code_ca) .prefer else .verify_full;
+        if (!s.sslmode_set) s.sslmode = if (insecure) .require else if (s.local() and !code_ca) .prefer else .verify_full;
         // libpq: `require` with a root certificate checks the chain.
-        if (s.sslmode == .require and (s.sslrootcert != null or code_ca)) s.sslmode = .verify_ca;
+        if (s.sslmode == .require and !insecure and (s.sslrootcert != null or code_ca)) s.sslmode = .verify_ca;
         // The URL and the environment may not turn off the checks the code
         // asks for by giving a CA.
         if (code_ca and !s.sslmode.verifies()) {
@@ -452,6 +459,8 @@ pub const Client = struct {
     /// The settings' strings and the startup parameters.
     arena: std.heap.ArenaAllocator,
     name: []const u8,
+    /// `Options.timeout`: the bound of a call without its own.
+    timeout: ?Duration,
     settings: Settings,
     pools: internal.PerExecutor(Shard),
     errors: db.ErrorMap,
@@ -472,23 +481,33 @@ pub const Client = struct {
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.postgres` calls it.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*Client {
+        if (opts.max_connections) |n| if (n == 0) {
+            log.err("postgres: max_connections is 0; set at least 1, or leave it null for the default", .{});
+            return error.InvalidOptions;
+        };
+        if (opts.tls.client_certificate) |cc| if (cc == .dev_self_signed) {
+            log.err("postgres: tls.client_certificate cannot be .dev_self_signed", .{});
+            return error.InvalidOptions;
+        };
+        const name = opts.name orelse "postgres";
         const self = try gpa.create(Client);
         errdefer gpa.destroy(self);
         self.* = .{
             .gpa = gpa,
             .io = io,
             .arena = .init(gpa),
-            .name = opts.name,
+            .timeout = opts.timeout,
+            .name = name,
             .settings = undefined,
             .pools = undefined,
             .errors = opts.errors,
-            .observer = .{ .system = .postgresql, .name = opts.name },
+            .observer = .{ .system = .postgresql, .name = name },
             .readiness = .{ .io = io, .context = self, .ping = ping },
             .acquire_timeout = opts.acquire_timeout,
             .connect_timeout = undefined,
             .ping_timeout = opts.ping_timeout,
             .connect_at_start = opts.connect_at_start,
-            .cache = try .init(gpa, io, .postgresql, opts.name, opts.cache),
+            .cache = try .init(gpa, io, .postgresql, name, opts.cache),
         };
         errdefer self.cache.deinit();
         errdefer self.arena.deinit();
@@ -501,8 +520,8 @@ pub const Client = struct {
         if (comptime has_tls) {
             errdefer self.freeTls();
             if (s.sslmode == .verify_ca or s.sslmode == .verify_full) {
-                const ca: ?dusty.TlsCa = opts.tls.ca orelse if (s.sslrootcert) |path|
-                    (if (std.mem.eql(u8, path, "system")) null else dusty.TlsCa{ .file = .{ .path = path } })
+                const ca: ?dusty.Ca = opts.tls.ca orelse if (s.sslrootcert) |path|
+                    (if (std.mem.eql(u8, path, "system")) null else dusty.Ca{ .file = path })
                 else
                     null;
                 if (ca) |source| {
@@ -512,20 +531,21 @@ pub const Client = struct {
                     };
                 }
             }
-            const client_cert: ?dusty.TlsConfig.ClientCertificate = opts.tls.client_certificate orelse if (s.sslcert) |cert_path|
-                .{ .cert_path = cert_path, .key_path = s.sslkey orelse {
+            const client_cert: ?dusty.Cert = opts.tls.client_certificate orelse if (s.sslcert) |cert_path|
+                dusty.Cert.fromFiles(cert_path, s.sslkey orelse {
                     log.err("postgres: sslcert is set but sslkey is not", .{});
                     return error.InvalidDatabaseUrl;
-                } }
+                })
             else
                 null;
             if (client_cert) |cc| {
                 const pair = try gpa.create(dusty_tls.config.CertKeyPair);
                 errdefer gpa.destroy(pair);
-                pair.* = (if (cc.pem) |pem|
-                    dusty_tls.config.CertKeyPair.fromSlice(gpa, io, pem.cert, pem.key)
-                else
-                    dusty_tls.config.CertKeyPair.fromFilePath(gpa, io, cc.dir orelse std.Io.Dir.cwd(), cc.cert_path, cc.key_path)) catch |err| {
+                pair.* = (switch (cc) {
+                    .pem => |pem| dusty_tls.config.CertKeyPair.fromSlice(gpa, io, pem.cert, pem.key),
+                    .files => |f| dusty_tls.config.CertKeyPair.fromFilePath(gpa, io, std.Io.Dir.cwd(), f.cert_path, f.key_path),
+                    .dev_self_signed => error.DevCertificateUnavailable,
+                }) catch |err| {
                     log.err("postgres: cannot load the client certificate: {t}", .{err});
                     return err;
                 };
@@ -664,6 +684,12 @@ pub const Client = struct {
         return self.with(.{}).exec(c, sql, args);
     }
 
+    /// Runs `sql` (several statements allowed) with no bound on its time:
+    /// a schema or a migration at startup, outside any request.
+    pub fn execScript(self: *Client, c: anytype, sql: []const u8) Error!void {
+        _ = try self.with(.{ .timeout = .max }).exec(c, sql, .{});
+    }
+
     /// The first row as a `T`; none: `error.NotFound` (a 404).
     pub fn one(self: *Client, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
         return self.with(.{}).one(T, c, sql, args);
@@ -688,7 +714,7 @@ pub const Client = struct {
     /// A transaction on one connection: `defer tx.deinit()` (it rolls
     /// back unless committed), the verbs on `tx`, then `tx.commit(c)`.
     pub fn begin(self: *Client, c: anytype, opts: db.TxOptions) Error!Tx {
-        return self.beginWith(c, opts, if (opts.timeout) |t| dusty.Deadline.init(c.io, .{ .duration = .{ .raw = t, .clock = .awake } }) else null);
+        return self.beginWith(c, opts, if (internal.callTimeout(opts.timeout, self.timeout)) |t| dusty.Deadline.init(c.io, .{ .duration = .{ .raw = t, .clock = .awake } }) else null);
     }
 
     fn beginWith(self: *Client, c: anytype, opts: db.TxOptions, deadline: ?dusty.Deadline) Error!Tx {
@@ -725,7 +751,7 @@ pub const Client = struct {
     ///         _ = try tx.exec(req, "UPDATE accounts SET cents = cents + $1 WHERE id = $2", .{ cents, to });
     ///     }
     pub fn transaction(self: *Client, c: anytype, opts: db.TxOptions, comptime func: anytype, args: anytype) internal.Bounded(Retry(func, @TypeOf(c), @TypeOf(args)).run) {
-        return internal.bounded(c, .postgresql, opts.timeout, Retry(func, @TypeOf(c), @TypeOf(args)).run, .{ self, c, opts, args });
+        return internal.bounded(c, .postgresql, internal.callTimeout(opts.timeout, self.timeout), Retry(func, @TypeOf(c), @TypeOf(args)).run, .{ self, c, opts, args });
     }
 
     fn Retry(comptime func: anytype, comptime C: type, comptime Args: type) type {
@@ -801,10 +827,10 @@ pub const Client = struct {
         var j = job;
         const J = @TypeOf(j);
         const observed = self.observer.start(&ctx);
-        const deadline: ?dusty.Deadline = if (tx) |t|
-            t.deadline
-        else if (timeout) |t|
+        const deadline: ?dusty.Deadline = if (timeout) |t|
             .init(ctx.io, .{ .duration = .{ .raw = t, .clock = .awake } })
+        else if (tx) |t|
+            t.deadline
         else
             null;
         const result = self.guarded(&ctx, deadline, J.run, .{ &j, self, &ctx, tx, sql });
@@ -922,6 +948,15 @@ pub const Client = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.WrongNumberOfParameters => return ctx.fail(self.errors, .{ .system = .postgresql, .class = .other, .message = "the statement's parameters ($1, $2...) and the arguments given differ in number" }),
             else => {
+                // A statement failed inside the transaction: the server would
+                // answer every later one with 25P02 until the rollback, and
+                // the driver refuses to send them, so say what it would.
+                if (err == error.ConnectionBusy and conn._state == .fail) if (tx) |t| if (t.state == .open) return ctx.fail(self.errors, .{
+                    .system = .postgresql,
+                    .class = classify("25P02"),
+                    .code = "25P02",
+                    .message = "current transaction is aborted, commands ignored until end of transaction block",
+                });
                 if (tx) |t| t.state = .broken;
                 if (brokenConnection(err)) return ctx.failf(self.errors, .unavailable, "the connection to {f} broke: {t}", .{ self.settings, err });
                 return ctx.failf(self.errors, .other, "{t}", .{err});
@@ -953,7 +988,19 @@ pub const Client = struct {
 
 /// Why a call outside a transaction that left one open failed.
 const left_open = "the call left a transaction open (BEGIN without its COMMIT in the same call), so it was rolled back: " ++
-    "separate calls do not keep a connection; use begin() or transaction() (C ABI: one call with the whole transaction, until the transaction API)";
+    "separate calls do not keep a connection; use begin() or transaction() (C ABI: anole_db_begin)";
+
+/// A connection given back inside a transaction by `Rows.deinit` or
+/// `Conn.release`: rolled back (cancel-protected), and logged.
+fn rollbackLeftOpen(io: std.Io, conn: *pg.Conn, comptime what: []const u8) void {
+    if (conn._state != .transaction) return;
+    log.err(what, .{});
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
+    conn.rollback() catch {
+        conn._state = .fail;
+    };
+}
 
 /// Asks the server to stop what `conn` runs (CancelRequest on a
 /// connection of its own), within a second, whatever cancels the caller:
@@ -1037,7 +1084,7 @@ pub const Query = struct {
 
     /// `Client.exec`, with the options' `timeout` and `prepare`.
     pub fn exec(self: Query, c: anytype, sql: []const u8, args: anytype) Error!u64 {
-        return self.db.call(c, self.opts.timeout, null, sql, Exec(@TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.db.call(c, internal.callTimeout(self.opts.timeout, self.db.timeout), null, sql, Exec(@TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
 
     // The reads go through the cache, which shares them when `opts`
@@ -1061,7 +1108,7 @@ pub const Query = struct {
     /// The timeout bounds the statement until its first rows; reading the
     /// rest is the caller's.
     pub fn iterate(self: Query, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
-        return self.db.call(c, self.opts.timeout, null, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.db.call(c, internal.callTimeout(self.opts.timeout, self.db.timeout), null, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
 
     /// Every row, with columns and parameters known only at run time
@@ -1079,8 +1126,8 @@ pub const Query = struct {
     /// Runs `sql` with parameters known only at run time; the rows it
     /// changed (`last_insert_rowid` is 0: use `RETURNING` with `table`).
     /// Without parameters, several statements may go in one call.
-    pub fn run(self: Query, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
-        return self.db.call(c, self.opts.timeout, null, sql, RunJob{ .values = values, .prepare = self.opts.prepare });
+    pub fn execValues(self: Query, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
+        return self.db.call(c, internal.callTimeout(self.opts.timeout, self.db.timeout), null, sql, RunJob{ .values = values, .prepare = self.opts.prepare });
     }
 };
 
@@ -1091,7 +1138,7 @@ const TableRead = struct {
 
     pub fn run(r: TableRead, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Table {
         const q = r.query;
-        return q.db.call(c, q.opts.timeout, null, sql, TableJob{ .values = values, .prepare = q.opts.prepare });
+        return q.db.call(c, internal.callTimeout(q.opts.timeout, q.db.timeout), null, sql, TableJob{ .values = values, .prepare = q.opts.prepare });
     }
 };
 
@@ -1105,7 +1152,7 @@ fn Read(comptime T: type, comptime mode: Mode) type {
 
         pub fn run(r: @This(), c: anytype, sql: []const u8, args: anytype) Error!Fetch(T, mode, @TypeOf(args)).Out {
             const q = r.query;
-            return q.db.call(c, q.opts.timeout, null, sql, Fetch(T, mode, @TypeOf(args)){ .args = args, .prepare = q.opts.prepare });
+            return q.db.call(c, internal.callTimeout(q.opts.timeout, q.db.timeout), null, sql, Fetch(T, mode, @TypeOf(args)){ .args = args, .prepare = q.opts.prepare });
         }
     };
 }
@@ -1121,35 +1168,49 @@ pub const Tx = struct {
     deadline: ?dusty.Deadline,
     state: enum { open, done, broken } = .open,
 
+    /// The verbs with per-call options: `timeout` (bounding that statement
+    /// instead of the transaction's deadline) and `prepare` apply; a
+    /// `coalesce` or `cache` fails the call (`error.Database`, `lastError`:
+    /// "coalesce and cache are not for calls inside a transaction").
+    pub fn with(self: *Tx, opts: db.QueryOptions) TxQuery {
+        return .{ .tx = self, .opts = opts };
+    }
+
     /// `Client.exec` on the transaction's connection.
     pub fn exec(self: *Tx, c: anytype, sql: []const u8, args: anytype) Error!u64 {
-        try self.usable(c);
-        return self.db.call(c, null, self, sql, Exec(@TypeOf(args)){ .args = args, .prepare = true });
+        return self.with(.{}).exec(c, sql, args);
     }
 
     /// `Client.one` on the transaction's connection.
     pub fn one(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
-        try self.usable(c);
-        return self.db.call(c, null, self, sql, Fetch(T, .one, @TypeOf(args)){ .args = args, .prepare = true });
+        return self.with(.{}).one(T, c, sql, args);
     }
 
     /// `Client.optional` on the transaction's connection.
     pub fn optional(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!?T {
-        try self.usable(c);
-        return self.db.call(c, null, self, sql, Fetch(T, .optional, @TypeOf(args)){ .args = args, .prepare = true });
+        return self.with(.{}).optional(T, c, sql, args);
     }
 
     /// `Client.all` on the transaction's connection.
     pub fn all(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error![]T {
-        try self.usable(c);
-        return self.db.call(c, null, self, sql, Fetch(T, .all, @TypeOf(args)){ .args = args, .prepare = true });
+        return self.with(.{}).all(T, c, sql, args);
     }
 
     /// The rows one at a time; finish with them (`deinit`) before the
     /// next call on the transaction.
     pub fn iterate(self: *Tx, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
-        try self.usable(c);
-        return self.db.call(c, null, self, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = true });
+        return self.with(.{}).iterate(T, c, sql, args);
+    }
+
+    /// `Query.table` on the transaction's connection: rows whose columns are
+    /// known at run time (the C ABI's `anole_db_tx_query`).
+    pub fn table(self: *Tx, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Table {
+        return self.with(.{}).table(c, sql, values);
+    }
+
+    /// `Query.execValues` on the transaction's connection.
+    pub fn execValues(self: *Tx, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
+        return self.with(.{}).execValues(c, sql, values);
     }
 
     /// Commits. A transaction that already failed (a statement of it
@@ -1210,6 +1271,58 @@ pub const Tx = struct {
     };
 };
 
+/// `Tx.with`: the transaction's verbs with options.
+pub const TxQuery = struct {
+    tx: *Tx,
+    opts: db.QueryOptions,
+
+    /// The checks every call makes: the transaction is usable, and the
+    /// options are ones a call inside a transaction can take.
+    fn ready(self: TxQuery, c: anytype) Error!?Duration {
+        try self.tx.usable(c);
+        if (self.opts.coalesce or self.opts.cache != null) {
+            var ctx = erase(c);
+            return ctx.failf(self.tx.db.errors, .other, "coalesce and cache are not for calls inside a transaction", .{});
+        }
+        return internal.callTimeout(self.opts.timeout, null);
+    }
+
+    pub fn exec(self: TxQuery, c: anytype, sql: []const u8, args: anytype) Error!u64 {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, Exec(@TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+    }
+
+    pub fn one(self: TxQuery, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, Fetch(T, .one, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+    }
+
+    pub fn optional(self: TxQuery, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!?T {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, Fetch(T, .optional, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+    }
+
+    pub fn all(self: TxQuery, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error![]T {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, Fetch(T, .all, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+    }
+
+    pub fn iterate(self: TxQuery, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+    }
+
+    pub fn table(self: TxQuery, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Table {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, TableJob{ .values = values, .prepare = self.opts.prepare });
+    }
+
+    pub fn execValues(self: TxQuery, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
+        const t = try self.ready(c);
+        return self.tx.db.call(c, t, self.tx, sql, RunJob{ .values = values, .prepare = self.opts.prepare });
+    }
+};
+
 /// A connection of pg.zig's own (`Client.acquire`).
 pub const Conn = struct {
     db: *Client,
@@ -1222,6 +1335,7 @@ pub const Conn = struct {
     /// canceled, and the connection closed.
     pub fn release(self: *const Conn) void {
         if (self.lease.conn._state == .query) stopBackend(self.io, self.lease.conn);
+        rollbackLeftOpen(self.io, self.lease.conn, "acquire(): the connection was given back inside a transaction; rolled back");
         self.db.give(self.lease);
     }
 };
@@ -1249,6 +1363,7 @@ pub fn Rows(comptime T: type) type {
                 return self.db.failed(&self.ctx, self.leased(), err, self.tx);
             } orelse {
                 self.done = true;
+                if (self.lease) |l| try self.db.leftOpen(&self.ctx, l);
                 return null;
             };
             return decodeRow(T, &row, &self.columns, &self.ctx, self.db.errors) catch |err| {
@@ -1261,7 +1376,10 @@ pub fn Rows(comptime T: type) type {
         pub fn deinit(self: *Self) void {
             self.finish();
             self.result.deinit();
-            if (self.lease) |l| self.db.give(l);
+            if (self.lease) |l| {
+                rollbackLeftOpen(self.ctx.io, self.conn, "the call left a transaction open (BEGIN without its COMMIT in the same call); rolled back");
+                self.db.give(l);
+            }
             self.* = undefined;
         }
 
@@ -1365,7 +1483,7 @@ const TableJob = struct {
 /// numbers and bools converted, bytea as bytes, the rest as text.
 fn textValue(a: std.mem.Allocator, oid: i32, data: []const u8) error{OutOfMemory}!db.Value {
     switch (oid) {
-        Oid.@"bool" => return .{ .bool = std.mem.eql(u8, data, "t") },
+        Oid.bool => return .{ .bool = std.mem.eql(u8, data, "t") },
         Oid.int2, Oid.int4, Oid.int8, Oid.oid_, Oid.xid => if (std.fmt.parseInt(i64, data, 10)) |n| return .{ .int = n } else |_| {},
         Oid.float4, Oid.float8 => if (std.fmt.parseFloat(f64, data)) |f| return .{ .float = f } else |_| {},
         Oid.bytea => if (std.mem.startsWith(u8, data, "\\x") and data.len % 2 == 0) {
@@ -1805,6 +1923,13 @@ test "pg: settings from a URL, the PG* variables and the defaults" {
         try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d?sslmode=" ++ mode, .tls = ca }, &cw));
         try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = environ(&.{"PGSSLMODE=" ++ mode}), .tls = ca }, &cw));
     }
+
+    // insecure_skip_verify: TLS without checking; refused with a CA or with
+    // an sslmode that verifies or disables.
+    const skip: Options.Tls = .{ .insecure_skip_verify = true };
+    try testing.expectEqual(SslMode.require, (try Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d", .tls = skip }, &cw)).sslmode);
+    try testing.expectError(error.InvalidOptions, Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d", .tls = .{ .ca = .system, .insecure_skip_verify = true } }, &cw));
+    try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d?sslmode=verify-full", .tls = skip }, &cw));
 
     // No sslmode: verify-full for another host, prefer for this machine;
     // and the password goes in clear text or as MD5 only to a verified

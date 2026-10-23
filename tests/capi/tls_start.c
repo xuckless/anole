@@ -25,7 +25,9 @@ int main(void) {
     return 1;
   }
   uint16_t port = 0;
-  if (anole_server_port(s, 0, &port) != ANOLE_OK) return 1;
+  anole_listener_info info = {sizeof info};
+  if (anole_server_listener(s, 0, &info) != ANOLE_OK) return 1;
+  port = info.port;
   printf("%u\n", port);
   fflush(stdout);
   char buf[64];

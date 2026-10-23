@@ -67,13 +67,13 @@ fn transcript(arena: std.mem.Allocator, raw: []const u8, step: usize, buf_len: u
     var source = SourceReader.init(raw, step, buffer);
     var req: Request = .{
         .arena = arena,
-        .transport = .{ .reader = &source.interface, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &source.interface, .writer = undefined },
+        ._parser = undefined,
     };
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     request_mod.parseHeaders(&source.interface, &parser) catch |err| {
         try w.print("head: {t}", .{err});
@@ -88,7 +88,7 @@ fn transcript(arena: std.mem.Allocator, raw: []const u8, step: usize, buf_len: u
     }
 
     if (req.body()) |body| {
-        if (body) |b| try std.testing.expect(b.len <= req.config.max_body_size);
+        if (body) |b| try std.testing.expect(b.len <= req._config.max_body_size);
         try w.print("body {?s}\n", .{body});
     } else |err| {
         try w.print("body: {t}\n", .{err});

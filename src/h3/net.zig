@@ -129,7 +129,7 @@ pub fn bindReusePort(address: std.Io.net.IpAddress, ipv6_only: ?bool) !std.posix
 /// Fails with `error.AddressInUse` when some other UDP socket is bound to
 /// `address`, which binding with SO_REUSEPORT (`bindReusePort`) would
 /// otherwise join without a word, sharing the port's datagrams with a
-/// second copy of the server. As dusty's `checkAddressFree` for TCP; the
+/// second copy of the server. As the core's `checkAddressFree` for TCP; the
 /// probe sets no option at all, since UDP has no TIME_WAIT to tolerate and
 /// a probe with SO_REUSEADDR would join sockets that set it too. Port zero
 /// is not checked, and nothing is when the probe cannot be had.

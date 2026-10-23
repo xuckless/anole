@@ -194,7 +194,7 @@ When the server drains, each open session gets DRAIN_WEBTRANSPORT_SESSION
 and is then closed with code 0 and `drain_reason`. Its waits fail, and the
 handler returns. With `.close_on_drain = false` the session stays open:
 `session.draining()` turns true, and the handler finishes up and closes it
-itself, before `timeout.shutdown` (30 s) cuts it. `draining()` is also true
+itself, before `timeouts.shutdown` (10 s) cuts it. `draining()` is also true
 when the peer sent DRAIN_WEBTRANSPORT_SESSION.
 
 ## Limits

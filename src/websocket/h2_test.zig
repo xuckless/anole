@@ -1,4 +1,4 @@
-//! WebSocket over HTTP/2 (RFC 8441), end to end: dusty's HTTP/2 engine with
+//! WebSocket over HTTP/2 (RFC 8441), end to end: the core's HTTP/2 engine with
 //! an `anole.websocket` echo handler, and a minimal nghttp2 client that opens
 //! an extended CONNECT and speaks masked frames through websocket-zig's
 //! client codec. Autobahn has no RFC 8441 mode, so this is the HTTP/2 path's
@@ -19,7 +19,7 @@ fn echo(req: *dusty.Request, res: *dusty.Response) !void {
         return;
     };
     defer ws.deinit();
-    try std.testing.expect(ws.conn == .h2);
+    try std.testing.expect(ws.httpVersion() != .http1);
     while (true) {
         const msg = ws.receive() catch |err| switch (err) {
             error.ConnectionClosed => return,
@@ -73,6 +73,14 @@ const Client = struct {
     data_frames: usize = 0,
     /// The `origin` header to send, if any.
     origin: ?[]const u8 = null,
+    /// The `sec-websocket-protocol` header to send, if any, and what the
+    /// answer carried: that header and `x-user`.
+    protocols: ?[]const u8 = null,
+    answered_protocol: [32]u8 = undefined,
+    answered_protocol_len: usize = 0,
+    answered_user: [32]u8 = undefined,
+    answered_user_len: usize = 0,
+    path: []const u8 = "/chat",
 
     fn init(self: *Client, io: std.Io, addr: std.Io.net.IpAddress) !void {
         self.* = .{ .io = io, .stream = try addr.connect(io, .{ .mode = .stream }), .reader = undefined, .writer = undefined };
@@ -124,16 +132,26 @@ const Client = struct {
                 return c.nghttp2_session_get_remote_settings(cl.session, c.NGHTTP2_SETTINGS_ENABLE_CONNECT_PROTOCOL) == 1;
             }
         }.f);
-        const nva = [_]c.nghttp2_nv{
+        var nva_buf: [8]c.nghttp2_nv = undefined;
+        const base = [_]c.nghttp2_nv{
             nv(":method", "CONNECT"),
             nv(":protocol", "websocket"),
             nv(":scheme", "http"),
-            nv(":path", "/chat"),
+            nv(":path", self.path),
             nv(":authority", "localhost"),
             nv("sec-websocket-version", "13"),
-            nv("origin", self.origin orelse ""),
         };
-        const n: usize = if (self.origin != null) nva.len else nva.len - 1;
+        @memcpy(nva_buf[0..base.len], &base);
+        var n: usize = base.len;
+        if (self.origin) |o| {
+            nva_buf[n] = nv("origin", o);
+            n += 1;
+        }
+        if (self.protocols) |p| {
+            nva_buf[n] = nv("sec-websocket-protocol", p);
+            n += 1;
+        }
+        const nva = nva_buf;
         var provider: c.nghttp2_data_provider2 = .{ .source = .{ .ptr = self }, .read_callback = provide };
         self.stream_id = c.nghttp2_submit_request2(self.session, null, &nva, n, &provider, self);
         if (self.stream_id < 0) return error.Http2Submit;
@@ -151,7 +169,7 @@ const Client = struct {
     /// Queues one masked frame on the stream.
     fn sendFrame(self: *Client, opcode: wsc.Opcode, payload: []const u8) !void {
         var w: std.Io.Writer = .fixed(self.outgoing[self.out_len..]);
-        var copy: [256]u8 = undefined;
+        var copy: [2048]u8 = undefined;
         @memcpy(copy[0..payload.len], payload);
         try wsc.writeFrame(&w, copy[0..payload.len], .{ .opcode = opcode });
         self.out_len += w.buffered().len;
@@ -202,6 +220,14 @@ const Client = struct {
     fn onHeader(_: ?*c.nghttp2_session, _: [*c]const c.nghttp2_frame, name: [*c]const u8, namelen: usize, value: [*c]const u8, valuelen: usize, _: u8, user: ?*anyopaque) callconv(.c) c_int {
         const self: *Client = @ptrCast(@alignCast(user.?));
         if (std.mem.eql(u8, name[0..namelen], ":status")) self.status = std.fmt.parseInt(u16, value[0..valuelen], 10) catch 0;
+        if (std.mem.eql(u8, name[0..namelen], "sec-websocket-protocol") and valuelen <= self.answered_protocol.len) {
+            @memcpy(self.answered_protocol[0..valuelen], value[0..valuelen]);
+            self.answered_protocol_len = valuelen;
+        }
+        if (std.mem.eql(u8, name[0..namelen], "x-user") and valuelen <= self.answered_user.len) {
+            @memcpy(self.answered_user[0..valuelen], value[0..valuelen]);
+            self.answered_user_len = valuelen;
+        }
         return 0;
     }
 
@@ -224,6 +250,9 @@ const Client = struct {
         const self: *Client = @ptrCast(@alignCast(source.*.ptr.?));
         const rest = self.outgoing[self.out_sent..self.out_len];
         if (rest.len == 0) {
+            // All sent: reuse the buffer from the start.
+            self.out_sent = 0;
+            self.out_len = 0;
             if (!self.finished) return c.NGHTTP2_ERR_DEFERRED;
             flags.* |= c.NGHTTP2_DATA_FLAG_EOF;
             return 0;
@@ -304,6 +333,58 @@ test "WebSocket over HTTP/2 (RFC 8441): echo, ping, close" {
         if (std.mem.indexOf(u8, out.written(), "route=\"/chat\",status=\"101\"} 1") != null) break;
         try io.sleep(.fromMilliseconds(2), .awake);
     } else return error.TestUnexpectedResult;
+}
+
+test "WebSocket over HTTP/2: a socket carries more than limits.body_max in total" {
+    // Regression: the stream's body reader used the request body limit
+    // (1 MiB) as a lifetime cap, so a socket died with BodyTooBig after 1 MiB
+    // of traffic. Per-message limits apply; the stream has no total limit.
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/chat", echo);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: Client = undefined;
+    try client.init(io, server.address.ip);
+    defer client.deinit();
+    try client.open();
+    try std.testing.expectEqual(@as(u16, 200), client.status);
+
+    var msg: [1024]u8 = undefined;
+    var back: [1024 + 64]u8 = undefined;
+    var op: wsc.Opcode = undefined;
+    // 1536 x 1 KiB = 1.5 MiB, past the default body_max of 1 MiB.
+    for (0..1536) |i| {
+        @memset(&msg, @truncate(i));
+        try client.sendFrame(.binary, &msg);
+        const got = try client.nextFrame(&op, &back);
+        try std.testing.expectEqual(wsc.Opcode.binary, op);
+        try std.testing.expectEqualSlices(u8, &msg, got);
+    }
+
+    try client.sendFrame(.close, &.{ 0x03, 0xe8 });
+    _ = try client.nextFrame(&op, &back);
+    try std.testing.expectEqual(wsc.Opcode.close, op);
+    client.finished = true;
+    _ = c.nghttp2_session_resume_data(client.session, client.stream_id);
+    try client.pumpUntil(struct {
+        fn f(cl: *Client) bool {
+            return cl.closed;
+        }
+    }.f);
 }
 
 test "WebSocket over HTTP/2: the drain closes an open socket with 1001 and does not wait out timeout.shutdown" {
@@ -597,7 +678,7 @@ test "WebSocket over HTTP/2: a room member that stops reading is closed, its str
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    lobby = .initOptions(gpa, .{ .max_queued_bytes = 256 * 1024, .close_after_ms = 50 });
+    lobby = .init(gpa, .{ .max_queued_bytes = 256 * 1024, .close_after_ms = 50 });
     defer lobby.deinit();
 
     var server = dusty.Server(void).init(gpa, io, .{
@@ -638,4 +719,49 @@ test "WebSocket over HTTP/2: a room member that stops reading is closed, its str
         }
     }
     try std.testing.expect(left);
+}
+
+fn subprotocolSocket(req: *dusty.Request, res: *dusty.Response) !void {
+    var ws = (try websocket.upgrade(req, res, .{
+        .subprotocols = &.{ "a", "c" },
+        .headers = &.{.{ .name = "X-User", .value = "u1" }},
+    })) orelse {
+        res.status = .bad_request;
+        return;
+    };
+    defer ws.deinit();
+    try ws.send(.text, ws.subprotocol orelse "(none)");
+    _ = ws.receive() catch return;
+}
+
+test "WebSocket over HTTP/2: the selected subprotocol and extra headers ride on the 200" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/sp", subprotocolSocket);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: Client = undefined;
+    try client.init(io, server.address.ip);
+    defer client.deinit();
+    client.path = "/sp";
+    client.protocols = "b, a";
+    try client.open();
+    try std.testing.expectEqual(@as(u16, 200), client.status);
+    try std.testing.expectEqualStrings("a", client.answered_protocol[0..client.answered_protocol_len]);
+    try std.testing.expectEqualStrings("u1", client.answered_user[0..client.answered_user_len]);
+    var op: wsc.Opcode = undefined;
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("a", try client.nextFrame(&op, &buf));
 }

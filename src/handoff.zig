@@ -172,12 +172,13 @@ pub const Successor = struct {
     pid: c.pid_t,
     ready_fd: Fd,
 
-    /// Waits up to `timeout_ms` for the successor to say it is serving,
+    /// Waits up to `timeout` for the successor to say it is serving,
     /// without holding the executor's thread.
-    pub fn waitReady(self: Successor, io: std.Io, timeout_ms: u32) bool {
+    pub fn waitReady(self: Successor, io: std.Io, timeout: std.Io.Duration) bool {
         if (comptime !supported) unreachable; // `spawn` never made one
         defer _ = c.close(self.ready_fd);
-        var waited: u32 = 0;
+        const timeout_ms: u64 = @intCast(@max(timeout.toMilliseconds(), 0));
+        var waited: u64 = 0;
         while (waited < timeout_ms) : (waited += 50) {
             var pfd = [_]c.pollfd{.{ .fd = self.ready_fd, .events = c.POLL.IN, .revents = 0 }};
             if (c.poll(&pfd, 1, 0) > 0) {

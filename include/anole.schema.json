@@ -1,8 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/xuckless/anole/blob/main/include/anole.schema.json",
+  "$id": "https://github.com/xuckless/anole/blob/v0.1.3/include/anole.schema.json",
+  "x-anole-abi": "0.7",
   "title": "Anole C ABI configuration",
-  "description": "The JSON document anole_server_create takes (anole_server_options.config_json). Unknown keys are refused, with the line and column in anole_last_error. ABI 0.2.",
+  "description": "The JSON document anole_server_create takes (anole_server_options.config_json). Unknown keys are refused, with the line and column in anole_last_error (token UnknownKey).",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -21,31 +22,36 @@
       },
       "description": "Default: one on 127.0.0.1:8080."
     },
+    "timeouts": {
+      "$ref": "#/$defs/Timeouts"
+    },
     "limits": {
       "$ref": "#/$defs/Limits"
     },
-    "timeouts": {
-      "$ref": "#/$defs/Timeouts"
+    "proxy": {
+      "$ref": "#/$defs/Proxy"
+    },
+    "request": {
+      "$ref": "#/$defs/Request"
+    },
+    "response": {
+      "$ref": "#/$defs/Response"
+    },
+    "http2": {
+      "$ref": "#/$defs/Http2"
     },
     "http3": {
       "$ref": "#/$defs/Http3"
     },
-    "trusted_proxy_hops": {
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 255,
-      "default": 0,
-      "description": "Proxies in front whose X-Forwarded-For (and PROXY protocol) Anole trusts for the client's address."
-    },
-    "trust_forwarded_proto": {
-      "type": "boolean",
-      "default": true,
-      "description": "With trusted_proxy_hops: the last X-Forwarded-Proto value says whether the request is secure."
-    },
-    "trust_forwarded_host": {
-      "type": "boolean",
-      "default": false,
-      "description": "With trusted_proxy_hops: the last X-Forwarded-Host value is the request's host (only when every proxy in front sets it)."
+    "errors": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "json",
+        "text"
+      ],
+      "default": "auto",
+      "description": "How the server writes its own error answers (404, 405, the status an error maps to)."
     },
     "middleware": {
       "type": "array",
@@ -101,7 +107,7 @@
           "minimum": 0,
           "maximum": 65535,
           "default": 8080,
-          "description": "0 picks a free port (anole_server_port)."
+          "description": "0 picks a free port (anole_server_listener)."
         },
         "unix": {
           "anyOf": [
@@ -136,7 +142,7 @@
         "http3": {
           "type": "boolean",
           "default": false,
-          "description": "HTTP/3 over UDP on a TLS listener (one per server); its port follows the listeners' in anole_server_port."
+          "description": "HTTP/3 over UDP on a TLS listener (one per server); its port follows the listeners' in anole_server_listener (udp_port)."
         },
         "proxy_protocol": {
           "type": "boolean",
@@ -161,7 +167,7 @@
           "anyOf": [
             {
               "type": "string",
-              "description": "PEM file, read at start and by anole_server_reload_certificates."
+              "description": "PEM file, read at start and by anole_server_reload_tls with both arguments empty."
             },
             {
               "type": "null"
@@ -249,6 +255,22 @@
               "type": "null"
             }
           ]
+        },
+        "client_ca_dir": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "A directory of PEM files for the CAs client certificates must chain to, instead of client_ca_file."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_ca_system": {
+          "type": "boolean",
+          "default": false,
+          "description": "The system's trust store as the CAs client certificates must chain to."
         }
       },
       "description": "Exactly one of cert_file + key_file, cert_pem + key_pem, self_signed."
@@ -262,6 +284,43 @@
           "minimum": 0,
           "default": 1048576,
           "description": "The largest request body, inline or streamed: past it, 413."
+        },
+        "max_head_size": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 1048576,
+          "default": 16384,
+          "description": "The request line and headers; larger is 431. 1024 to 1048576."
+        },
+        "max_header_count": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 32,
+          "description": "Request headers at most."
+        },
+        "max_param_count": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 8,
+          "description": "Route parameters at most."
+        },
+        "max_query_count": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 32,
+          "description": "Query string values at most."
+        },
+        "max_form_count": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 32,
+          "description": "Form fields at most."
+        },
+        "max_multiform_count": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 32,
+          "description": "Multipart form fields at most."
         },
         "inline_body_max": {
           "type": "integer",
@@ -289,7 +348,7 @@
           "minimum": 0,
           "maximum": 4294967295,
           "default": 262144,
-          "description": "Bytes waiting in a streamed response before anole_stream_write answers ANOLE_BUSY."
+          "description": "Bytes waiting in a streamed response before anole_req_stream_write answers ANOLE_BUSY."
         },
         "ws_high_water": {
           "type": "integer",
@@ -312,6 +371,20 @@
           "default": 0,
           "description": "Open connections at most; 0 follows the open-file limit."
         },
+        "max_requests_per_connection": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "description": "Requests per keep-alive connection; null: no limit.",
+              "default": null
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "db_result_max": {
           "type": "integer",
           "minimum": 0,
@@ -326,25 +399,88 @@
       "additionalProperties": false,
       "properties": {
         "request_ms": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 4294967295,
-          "default": 30000,
-          "description": "A consumer request's default deadline: 504 from Anole after it."
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 30000,
+              "description": "A consumer request's default deadline: 504 from Anole after it. Null: none."
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
-        "shutdown_ms": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 4294967295,
-          "default": 10000,
-          "description": "How long a drain waits for requests in flight."
+        "read_header_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 10000,
+              "description": "The request head on HTTP/1.x (Slowloris). Null: request_ms alone."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "write_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 30000,
+              "description": "A write the peer does not take for this long ends the response. Once a stream or file body has started it replaces the request deadline. Null: none."
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "keepalive_ms": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 4294967295,
-          "default": 60000,
-          "description": "An idle keep-alive connection is closed after this."
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 60000,
+              "description": "An idle keep-alive connection is closed after this. Null: never."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idle_park_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 1000,
+              "description": "An idle HTTP/1.1 connection gives up its task after this. Null or 0: never parks."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "shutdown_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 10000,
+              "description": "How long a drain waits for requests in flight. Null: for all of them."
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "rewake_ms": {
           "type": "integer",
@@ -359,10 +495,42 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "address": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The UDP address; null: the TLS listener's.",
+              "default": null
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "port": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535,
+              "description": "The UDP port; null: the TLS listener's.",
+              "default": null
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "max_streams_bidi": {
           "type": "integer",
           "minimum": 0,
-          "default": 100
+          "default": 100,
+          "description": "Concurrent requests per connection."
+        },
+        "validate_address": {
+          "type": "boolean",
+          "default": false,
+          "description": "Make every new client prove its address with a Retry first."
         },
         "idle_timeout_ms": {
           "type": "integer",
@@ -379,8 +547,214 @@
           "type": "boolean",
           "default": false,
           "description": "Take 0-RTT from resuming clients (replayable: only safe methods run before the handshake completes)."
+        },
+        "prefer_v2": {
+          "type": "boolean",
+          "default": true,
+          "description": "Move clients that offer QUIC v2 to it."
+        },
+        "sockets": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 255,
+              "description": "UDP sockets on Linux; null: one per executor.",
+              "default": null
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "enable_connect_protocol": {
+          "type": "boolean",
+          "default": true,
+          "description": "Extended CONNECT (RFC 9220): WebSockets over HTTP/3."
+        },
+        "inline_no_wait": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run no_wait requests that arrive whole on the endpoint task."
         }
       }
+    },
+    "Proxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "trusted_hops": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "default": 0,
+          "description": "Proxies in front whose X-Forwarded-For Anole trusts for the client's address; 0 none. (PROXY protocol is per listener.)"
+        },
+        "trust_forwarded_proto": {
+          "type": "boolean",
+          "default": true,
+          "description": "With trusted_hops: the last X-Forwarded-Proto value says whether the request is secure."
+        },
+        "trust_forwarded_host": {
+          "type": "boolean",
+          "default": false,
+          "description": "With trusted_hops: the last X-Forwarded-Host value is the request's host (only when every proxy in front sets it)."
+        }
+      },
+      "description": "Trust in proxies in front of the server."
+    },
+    "Request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "require_host": {
+          "type": "boolean",
+          "default": true,
+          "description": "HTTP/1.1 without exactly one Host is 400."
+        },
+        "decompress": {
+          "type": "boolean",
+          "default": true,
+          "description": "Undo Content-Encoding on request bodies."
+        },
+        "keep_buffers": {
+          "type": "boolean",
+          "default": false,
+          "description": "Keep a connection's request buffers between requests."
+        }
+      },
+      "description": "How requests are read."
+    },
+    "Response": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "write_buffer_size": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 16384,
+          "description": "Bytes buffered while a response is written; at least 1."
+        },
+        "date": {
+          "type": "boolean",
+          "default": true,
+          "description": "Send a Date header on every response."
+        },
+        "default_content_type": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The Content-Type of a buffered body whose handler set none, by name (\"text\", \"json\", ...); null: none.",
+              "default": "text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_header_count": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 64,
+          "description": "Most headers a response can carry."
+        },
+        "brotli_quality": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 11,
+          "default": 5,
+          "description": "Brotli's quality, 0 to 11, for responses compressed as br."
+        }
+      },
+      "description": "How responses are written."
+    },
+    "Http2": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_concurrent_streams": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 250,
+          "description": "Streams a client may have open at once."
+        },
+        "stream_window": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647,
+          "default": 65536,
+          "description": "Request body bytes a client may send on a stream before the handler reads them."
+        },
+        "stream_window_reading": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647,
+          "default": 1048576,
+          "description": "The stream's window from the handler's first read of the body."
+        },
+        "reading_window_budget": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 16777216,
+          "description": "The most memory the raised windows of one connection's streams take at once."
+        },
+        "connection_window": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647,
+          "default": 16777216,
+          "description": "Request body bytes in flight across all streams of a connection."
+        },
+        "max_header_list_size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 65536,
+          "description": "The decoded size of a request's header block."
+        },
+        "stream_reset_burst": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1000,
+          "description": "RST_STREAM a client may send in a burst before the connection is closed."
+        },
+        "stream_reset_rate": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 33,
+          "description": "RST_STREAM refill per second."
+        },
+        "max_continuations": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 8,
+          "description": "CONTINUATION frames allowed after one HEADERS."
+        },
+        "refused_stream_burst": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 100,
+          "description": "Streams the server may refuse in a burst before the connection is closed."
+        },
+        "refused_stream_rate": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 10,
+          "description": "Refused-stream refill per second."
+        },
+        "enable_connect_protocol": {
+          "type": "boolean",
+          "default": true,
+          "description": "Advertise SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441): WebSockets over HTTP/2."
+        },
+        "inline_no_wait": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run no_wait requests that arrive whole on the connection's reader."
+        }
+      },
+      "description": "HTTP/2 settings, for h2c and h2 over TLS."
     },
     "Middleware": {
       "description": "One native middleware, as an object with a single key naming it.",
@@ -499,13 +873,13 @@
                   "type": "boolean",
                   "default": false
                 },
-                "max_age": {
+                "max_age_ms": {
                   "anyOf": [
                     {
                       "type": "integer",
                       "minimum": 0,
                       "maximum": 4294967295,
-                      "default": 600
+                      "default": 600000
                     },
                     {
                       "type": "null"
@@ -571,10 +945,10 @@
                   "default": false,
                   "description": "With jwks_url and no audience: only for keys that sign for this application alone."
                 },
-                "leeway_s": {
+                "leeway_ms": {
                   "type": "integer",
                   "minimum": 0,
-                  "default": 60
+                  "default": 60000
                 },
                 "require_exp": {
                   "type": "boolean",
@@ -688,6 +1062,21 @@
                 },
                 "ready": {
                   "type": "string"
+                },
+                "checks": {
+                  "type": "array",
+                  "maxItems": 16,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "description": "Readiness flags: each starts not ready, so /readyz answers 503 naming it until the consumer calls anole_server_set_ready."
+                },
+                "listener": {
+                  "type": "string",
+                  "description": "Serve both routes only on the listener of this name (404 on the others)."
                 }
               }
             },
@@ -797,7 +1186,7 @@
               "type": "integer",
               "minimum": 0,
               "maximum": 4294967295,
-              "description": "This route's request deadline (handler routes; at most 16 distinct values per server)."
+              "description": "This route's request deadline (handler routes, and websocket routes with \"accept\": \"consumer\": the decision's; at most 16 distinct values per server)."
             },
             {
               "type": "null"
@@ -830,7 +1219,7 @@
       "required": [
         "path"
       ],
-      "description": "Exactly one of handler, respond, static, websocket, webtransport."
+      "description": "Exactly one of handler, respond, static, websocket, webtransport; handler and a websocket with \"accept\": \"consumer\" may go together."
     },
     "Fixed": {
       "type": "object",
@@ -915,6 +1304,22 @@
           "minimum": 0,
           "maximum": 4294967295,
           "description": "The consumer's route id for this endpoint's events."
+        },
+        "accept": {
+          "enum": [
+            "auto",
+            "consumer"
+          ],
+          "default": "auto",
+          "description": "Who answers the handshake: \"auto\" (Anole: origins and subprotocols; the consumer hears ANOLE_EV_WS_OPEN) or \"consumer\" (ANOLE_EV_WS_UPGRADE, answered with anole_ws_accept or refused like any request). With \"consumer\" the route may also carry \"handler\": plain requests of the path go to it."
+        },
+        "subprotocols": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "\"auto\" only: the subprotocols this endpoint speaks, most preferred first; the first the client offered is selected and echoed (ANOLE_EV_WS_OPEN says which)."
         },
         "compression": {
           "type": "boolean",
@@ -1042,6 +1447,140 @@
             }
           },
           "description": "Bounds of the answers kept for queries with cache_ttl_ms, over every executor."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 30000,
+          "description": "A bound on every query that has no timeout_ms of its own, in a request or not; past it the statement is interrupted (ANOLE_E_TIMEOUT). 0: none."
+        },
+        "errors": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "unique": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "exclusion": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "foreign_key": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "not_null": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "check": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "serialization": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "deadlock": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "unavailable": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "service_unavailable"
+            },
+            "timeout": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "gateway_timeout"
+            },
+            "other": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            }
+          },
+          "description": "What status each class of database error becomes (anole.db.ErrorMap): a class name to the status it answers with."
         }
       },
       "required": [
@@ -1056,6 +1595,11 @@
         "path": {
           "type": "string",
           "description": "A file (created when missing), or \":memory:\"."
+        },
+        "uri": {
+          "type": "boolean",
+          "default": false,
+          "description": "Take a path starting with \"file:\" as a SQLite URI."
         },
         "readers": {
           "anyOf": [
@@ -1077,10 +1621,10 @@
           "default": 5000,
           "description": "How long a statement waits for a lock another process holds."
         },
-        "statement_cache": {
+        "statement_cache_size": {
           "type": "integer",
-          "minimum": 0,
-          "maximum": 4294967295,
+          "minimum": 1,
+          "maximum": 65535,
           "default": 64,
           "description": "Prepared statements kept per connection."
         },
@@ -1101,6 +1645,13 @@
               "type": "null"
             }
           ]
+        },
+        "ping_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 2000,
+          "description": "What /readyz waits for the database's answer."
         }
       },
       "required": [
@@ -1245,6 +1796,62 @@
               "type": "null"
             }
           ]
+        },
+        "client_cert_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "A PEM file with the client certificate (chain), for servers that ask. With client_key_file."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The client certificate's private key (PEM file)."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "insecure_skip_verify": {
+          "type": "boolean",
+          "default": false,
+          "description": "TLS without checking the server's certificate. Refused with a CA and with a URL that verifies."
+        },
+        "ping_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 2000,
+          "description": "What /readyz waits for the server's answer."
         }
       },
       "description": "A PostgreSQL database (anole.pg; docs/database.md)."
@@ -1324,6 +1931,62 @@
           "type": "boolean",
           "default": false,
           "description": "Open a connection per executor at start, and fail the start if that fails."
+        },
+        "client_cert_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "A PEM file with the client certificate (chain), for servers that ask. With client_key_file."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The client certificate's private key (PEM file)."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "insecure_skip_verify": {
+          "type": "boolean",
+          "default": false,
+          "description": "TLS without checking the server's certificate. Refused with a CA and with a URL that verifies."
+        },
+        "ping_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 2000,
+          "description": "What /readyz waits for the server's answer."
         }
       },
       "description": "A Redis or Valkey server (anole.redis; docs/database.md)."
@@ -1336,7 +1999,7 @@
           "anyOf": [
             {
               "type": "string",
-              "description": "mongodb:// or mongodb+srv:// connection string; its options win over the fields below. Null: MONGODB_URI, else mongodb://localhost:27017."
+              "description": "A mongodb:// connection string; its options win over the fields below. mongodb+srv:// is not supported yet (list the hosts with mongodb://). Null: MONGODB_URI, else mongodb://localhost:27017."
             },
             {
               "type": "null"
@@ -1377,11 +2040,17 @@
           ]
         },
         "max_connections": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 4294967295,
-          "default": 100,
-          "description": "Connections at most, split between the executors (maxPoolSize; 0: no limit)."
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "description": "Connections at most, split between the executors (maxPoolSize). Left out: 100."
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "acquire_timeout_ms": {
           "type": "integer",
@@ -1402,7 +2071,92 @@
           "minimum": 0,
           "maximum": 4294967295,
           "default": 10000,
-          "description": "TCP connect and TLS handshake."
+          "description": "TCP connect and TLS handshake; 0: no limit."
+        },
+        "client_cert_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "A PEM file with the client certificate (chain), for servers that ask. With client_key_file."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The client certificate's private key (PEM file)."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "insecure_skip_verify": {
+          "type": "boolean",
+          "default": false,
+          "description": "TLS without checking the server's certificate. Refused with a CA and with a URL that verifies."
+        },
+        "ping_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 2000,
+          "description": "What /readyz waits for the server's answer."
+        },
+        "idle_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 0,
+          "description": "Idle connections older than this are closed; 0: never."
+        },
+        "heartbeat_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "Between two checks of a server."
+        },
+        "retry_reads": {
+          "type": "boolean",
+          "default": true,
+          "description": "Retry a read once after a network error or a primary change."
+        },
+        "retry_writes": {
+          "type": "boolean",
+          "default": true,
+          "description": "Retry a single-document write once, likewise."
+        },
+        "connect_at_start": {
+          "type": "boolean",
+          "default": false,
+          "description": "Select a server and open a connection per executor at start, and fail the start if that fails."
         }
       },
       "description": "A MongoDB deployment (anole.mongodb; docs/database.md)."
@@ -1541,6 +2295,13 @@
           "type": "boolean",
           "default": true,
           "description": "Unary and server-streaming calls that arrive whole over HTTP/2 or HTTP/3 run with no task (detached), as no_wait routes do."
+        },
+        "middleware": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Middleware"
+          },
+          "description": "After the global ones; runs for the service's gRPC paths and its transcoded routes, as a route's middleware does."
         }
       },
       "required": [

@@ -68,7 +68,7 @@ fn publish(app: *App, req: *anole.Request, res: *anole.Response) !void {
 /// event cannot be sent) or the server starts to drain.
 fn events(app: *App, req: *anole.Request, res: *anole.Response) !void {
     const room = req.params.get("room") orelse return error.NotFound;
-    req.setTimeout(.none); // a stream, not a request with a deadline
+    req.setTimeout(null); // a stream, not a request with a deadline
     const channel = try std.fmt.allocPrint(req.arena, "example:room:{s}", .{room});
     const sub = try app.redis.subscribe(req, channel);
     defer sub.close();

@@ -58,7 +58,7 @@ fn stars(req: *anole.Request, res: *anole.Response) !void {
 
 It trusts the system's CA store and has the defaults below. To change them
 for the server's client, set `ServerOptions.client`, an
-`anole.http.ClientConfig` (CAs, a client certificate, HTTP/2, the timeout,
+`anole.http.ClientOptions` (CAs, a client certificate, HTTP/2, the timeout,
 the pool):
 
 ```zig
@@ -102,7 +102,7 @@ On zio each executor has a pool of its own, as the database connectors do:
 a request takes and gives back connections on its own executor, so a
 connection stays on one thread. (Off zio there is one pool.) Each keeps:
 
-| `ClientConfig` field | Default | What it bounds |
+| `ClientOptions` field | Default | What it bounds |
 | --- | --- | --- |
 | `max_idle_per_host` | 256 | Idle connections to one scheme, host and port (or unix socket). |
 | `max_idle_connections` | 1024 | Idle connections in all. 0 turns pooling off. |
@@ -162,19 +162,19 @@ method and body. Along the way:
   on it). A redirect that would take it elsewhere is not followed: `fetch`
   returns the 307 or 308 response.
 
-`ClientConfig.check_redirect` replaces that last rule with your own: a
+`ClientOptions.check_redirect` replaces that last rule with your own: a
 function that sees each redirect (`status`, `from`, `to`, `method`,
 `has_body`, `hops`, `cross_origin`) and returns `.follow`, `.stop` (return
 the redirect response) or `.fail` (`error.RedirectRefused`).
 
 For a client that fetches URLs from untrusted input (webhooks, link
-previews), set `ClientConfig.deny_private_addresses = true`. It refuses
+previews), set `ClientOptions.deny_private_addresses = true`. It refuses
 loopback, private, link-local (cloud metadata included), shared, multicast
 and unspecified addresses, IPv4 and IPv6, with `error.AddressNotAllowed`.
 The check is on the address the connection reached, after DNS, on every
 hop, before any byte of the request is sent.
 
-`ClientConfig.http2 = true` offers HTTP/2 ("h2", then "http/1.1") through
+`ClientOptions.http2 = true` offers HTTP/2 ("h2", then "http/1.1") through
 ALPN on HTTPS connections. A server that picks it gets the request over
 HTTP/2, through `anole.h2`'s client underneath; `response.version().major`
 says which was used. Everything above works the same, but such a connection
@@ -320,19 +320,19 @@ NAT rebinding looks; it exists for tests.
 
 ## TLS options
 
-The three clients take the same TLS fields (`anole.http.TlsConfig`'s), and
+The three clients take the same TLS fields (`anole.http.TlsOptions`'s), and
 all of them trust the system store unless told otherwise:
 
 | Need | `.tls = ...` |
 | --- | --- |
 | System trust store | `.ca = .system` (the default) |
-| A CA file or directory | `.ca = .{ .file = .{ .path = "ca.pem" } }`, or `.dir` |
-| A CA in memory | `.ca = .{ .pem = ca_pem }` (one or more certificates) |
+| A CA file or directory | `.ca = .fromFile("ca.pem")`, or `.{ .dir = "cas" }` |
+| A CA in memory | `.ca = .fromPem(ca_pem)` (one or more certificates) |
 | Skip verification (tests only) | `.insecure_skip_verify = true`, optionally `.ca = .none` |
-| Client certificate (mutual TLS) | `.client_certificate = .{ .cert_path = "client.pem", .key_path = "client.key" }`, or `.{ .pem = .{ .cert = cert_pem, .key = key_pem } }` |
+| Client certificate (mutual TLS) | `.client_certificate = .fromFiles("client.pem", "client.key")`, or `.fromPem(cert_pem, key_pem)` |
 | ALPN | `anole.http`: none, or "h2" and "http/1.1" with `.http2 = true`; `anole.h2`, `anole.h3`: "h2" or "h3", fixed |
 
-`ca` is an `anole.http.TlsCa`. `.none` without `insecure_skip_verify` fails
+`ca` is an `anole.Ca`. `.none` without `insecure_skip_verify` fails
 with `error.NoCertificateAuthority`.
 
 When it is read:
@@ -354,9 +354,10 @@ on the path, so reading such a body then fails with
 `error.TlsConnectionTruncated`. Framed bodies are not affected: their
 framing already shows a cut.
 
-Paths are relative to the current directory, or to `dir` when you set one
-(`.{ .path = "ca.pem", .dir = some_dir }`). A client key must be PKCS#8 or
-SEC1 PEM without a passphrase.
+Paths are relative to the working directory (`.fromFile("ca.pem")`). A
+client key must be PKCS#8 or SEC1 PEM without a passphrase. The same
+`anole.Cert` and `anole.Ca` describe certificates on listeners and in the
+database connectors.
 
 To trust a development certificate from `anole.tls.selfSigned`, pass its
 `cert` (not the key) as `.ca = .{ .pem = pem.cert }`, as `examples/clients`
@@ -370,7 +371,7 @@ SNI is sent for it.
 ## Timeouts
 
 `anole.http.Client` has one budget per `fetch`: connecting, the handshake,
-sending, every redirect, and reading the body. It is `ClientConfig.timeout`
+sending, every redirect, and reading the body. It is `ClientOptions.timeout`
 (30 s by default; null for none), or `FetchOptions.timeout` for one request:
 
 ```zig

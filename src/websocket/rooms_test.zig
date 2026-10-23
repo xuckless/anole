@@ -31,7 +31,7 @@ test "Rooms: a message to the room reaches every member" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    rooms = .init(gpa);
+    rooms = .init(gpa, .{});
     defer rooms.deinit();
 
     var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
@@ -89,7 +89,7 @@ const Stalled = struct {
     fn init(self: *Stalled, gpa: std.mem.Allocator, io: std.Io) void {
         self.* = .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} }, .io = io };
         self.ws = dusty.WebSocket.init(io, .{ .writer = &self.interface, .reader = &self.reader }, gpa, 0);
-        self.socket = .{ .conn = .{ .h1 = &self.ws }, .allocator = gpa, .io = io, .max_message_size = 1024 };
+        self.socket = .{ ._conn = .{ .h1 = &self.ws }, ._allocator = gpa, .io = io, .max_message_size = 1024 };
     }
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
@@ -111,7 +111,7 @@ test "Rooms: a stalled member holds up neither other rooms nor joins, and leaves
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .init(gpa);
+    var r: websocket.Rooms = .init(gpa, .{});
     defer r.deinit();
 
     var stalled: Stalled = undefined;
@@ -169,7 +169,7 @@ test "Rooms: joining twice is one membership, and one leave ends it" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .init(gpa);
+    var r: websocket.Rooms = .init(gpa, .{});
     defer r.deinit();
 
     var a: Stalled = undefined;
@@ -199,7 +199,7 @@ test "Rooms: a broadcast does not wait for a member that stopped reading, and a 
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .initOptions(gpa, .{ .max_queued_bytes = 1024, .close_after_ms = 50 });
+    var r: websocket.Rooms = .init(gpa, .{ .max_queued_bytes = 1024, .close_after_ms = 50 });
     defer r.deinit();
 
     var stalled: Stalled = undefined;
@@ -263,7 +263,7 @@ test "Rooms: with on_full = drop, a full member skips messages and stays" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .initOptions(gpa, .{ .max_queued_bytes = 600, .on_full = .drop });
+    var r: websocket.Rooms = .init(gpa, .{ .max_queued_bytes = 600, .on_full = .drop });
     defer r.deinit();
 
     var slow: Stalled = undefined;
@@ -297,9 +297,9 @@ test "Rooms: a socket released without leave is out of every room, so no broadca
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var r: websocket.Rooms = .init(gpa);
+    var r: websocket.Rooms = .init(gpa, .{});
     defer r.deinit();
-    var other_rooms: websocket.Rooms = .init(gpa);
+    var other_rooms: websocket.Rooms = .init(gpa, .{});
     defer other_rooms.deinit();
 
     // On the heap, as a request's arena or a callback socket holds it: once
@@ -373,7 +373,7 @@ test "Rooms: a socket whose handler ends without leave leaves its rooms" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    auto_rooms = .init(gpa);
+    auto_rooms = .init(gpa, .{});
     defer auto_rooms.deinit();
 
     var server: dusty.Server(void) = undefined;
@@ -410,7 +410,7 @@ test "Rooms: a member closed for not keeping up is shut down, so its handler end
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    auto_rooms = .initOptions(gpa, .{ .max_queued_bytes = 256 * 1024, .close_after_ms = 50 });
+    auto_rooms = .init(gpa, .{ .max_queued_bytes = 256 * 1024, .close_after_ms = 50 });
     defer auto_rooms.deinit();
 
     var server: dusty.Server(void) = undefined;

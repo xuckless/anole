@@ -15,8 +15,9 @@ const dusty = @import("dusty");
 /// TLS setup of its own. `anole.Server` builds on it and exposes it as
 /// `app.server`.
 pub const Server = dusty.Server;
-/// The core server's settings: timeouts, limits, listeners, HTTP/2.
-/// `anole.ServerOptions.server` takes it.
+/// The core server's settings: timeouts, limits, listeners, HTTP/2. Anole
+/// builds it from `anole.ServerOptions`; use that unless you drive the core
+/// alone.
 pub const ServerConfig = dusty.ServerConfig;
 /// An IP address and port, or a Unix socket path.
 pub const Address = dusty.Address;
@@ -53,16 +54,23 @@ pub const Middleware = dusty.Middleware;
 /// Inside a server use `anole.client(req)`, which shares one.
 pub const Client = dusty.Client;
 /// `Client.init`'s settings.
-pub const ClientConfig = dusty.ClientConfig;
+pub const ClientOptions = dusty.ClientOptions;
 /// Options for `Server.static` / `Router.static` and `Server.embedded`.
 pub const StaticOptions = dusty.StaticOptions;
 /// Options for `Server.embedded`.
 pub const EmbeddedOptions = dusty.EmbeddedOptions;
-/// `ClientConfig.tls`; `anole.h2` and `anole.h3` take the same fields.
-pub const TlsConfig = dusty.TlsConfig;
-/// Where a client's trusted CAs come from: the system store, a file, a
-/// directory, or PEM in memory.
-pub const TlsCa = dusty.TlsCa;
+/// `ClientOptions.tls`; `anole.h2` and `anole.h3` take the same fields.
+pub const TlsOptions = dusty.TlsOptions;
+/// A certificate and its key (`anole.Cert`).
+pub const Cert = dusty.Cert;
+/// Where trusted CAs come from (`anole.Ca`).
+pub const Ca = dusty.Ca;
+/// Mutual TLS on a listener (`anole.ClientAuth`).
+pub const ClientAuth = dusty.ClientAuth;
+
+/// Using a request or response out of order (a second `req.reader()`,
+/// `res.stream` after `res.body` was set): a named error, answered 500.
+pub const MisuseError = dusty.MisuseError;
 
 /// How the server writes its own error answers (`ServerConfig.errors`).
 pub const ErrorFormat = dusty.ErrorFormat;

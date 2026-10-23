@@ -1,0 +1,2 @@
+# Generated and compared byte for byte by `zig build capi-test`.
+include/anole.abi.json text eol=lf

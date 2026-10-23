@@ -2,7 +2,7 @@
 // contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
-//! HTTP/2 engine tests: a dusty server with cleartext HTTP/2 (prior
+//! HTTP/2 engine tests: a the core server with cleartext HTTP/2 (prior
 //! knowledge) on loopback, driven by a minimal nghttp2 client.
 const std = @import("std");
 const dusty = @import("../root.zig");
@@ -383,7 +383,7 @@ const Handlers = struct {
     /// it to, which returns credit for all of them, then stops while the
     /// peer fills the whole window again, then reads the rest.
     fn stall(req: *dusty.Request, res: *dusty.Response) !void {
-        const raw = req.body_source.?.reader;
+        const raw = req._body_source.?.reader;
         var hash: std.hash.Wyhash = .init(0);
         var n: usize = 0;
         while (n < stall_credit) n += try takeBody(raw, &hash, stall_credit - n);
@@ -430,6 +430,7 @@ const Fixture = struct {
     fn start(self: *Fixture, io: std.Io) !void {
         self.server = dusty.Server(void).init(std.testing.allocator, io, .{
             .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+            .request = .{ .max_body_size = 8 << 20 },
         }, {});
         self.server.router.get("/hello", Handlers.hello);
         self.server.router.get("/fields", Handlers.fields);
@@ -792,7 +793,7 @@ test "HTTP/2: over TLS, chosen through ALPN" {
     defer future.cancel(io) catch {};
     try server.waitReady(io);
 
-    const ca: dusty.TlsCa = .{ .file = .{ .path = "certs/cert.pem" } };
+    const ca: dusty.Ca = .{ .file = "certs/cert.pem" };
     var bundle = try ca.load(std.testing.allocator, io);
     defer bundle.deinit(std.testing.allocator);
 
@@ -1003,7 +1004,7 @@ test "HTTP/2: a PROXY protocol header ahead of TLS names the client of an h2 str
     defer future.cancel(io) catch {};
     try server.waitReady(io);
 
-    const ca: dusty.TlsCa = .{ .file = .{ .path = "certs/cert.pem" } };
+    const ca: dusty.Ca = .{ .file = "certs/cert.pem" };
     var bundle = try ca.load(std.testing.allocator, io);
     defer bundle.deinit(std.testing.allocator);
 
@@ -1417,4 +1418,35 @@ test "HTTP/2: the raised body windows of a connection share one budget" {
     for (ids) |id| try std.testing.expectEqualStrings(want.items, client.get(id).body.items);
     // Eight streams reading at once would raise eight 1 MiB windows.
     try std.testing.expect(live.peak.load(.monotonic) < 4 * 1024 * 1024);
+}
+
+test "HTTP/2: an event stream outlives timeouts.request" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+        .timeout = .{ .request = .fromMilliseconds(300), .write = .fromSeconds(5) },
+    }, {});
+    defer server.deinit();
+    server.router.get("/slow", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            var buf: [256]u8 = undefined;
+            var events = try res.startEventStream(&buf);
+            for (0..12) |_| {
+                try events.send("tick", .{});
+                try req.io.sleep(.fromMilliseconds(100), .awake);
+            }
+            try events.end();
+        }
+    }.handle);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    const id = try client.request("GET", "/slow", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
+    try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, client.get(id).body.items, "data: tick"));
 }

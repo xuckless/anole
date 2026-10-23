@@ -2,7 +2,7 @@
 // contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
-//! An asset bundle made by `addAssets` in dusty's build.zig: the files of a
+//! An asset bundle made by `addAssets` in the core's build.zig: the files of a
 //! directory, embedded, each linked to with a hash of its content in the URL.
 
 const std = @import("std");

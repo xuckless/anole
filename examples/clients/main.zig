@@ -157,7 +157,7 @@ fn callAll(server: *anole.Server(App), app: *App, ca_pem: []const u8) !void {
     // The dev certificate is its own CA. Every client takes it as PEM in
     // memory (`.ca = .{ .pem = ... }`); by default they trust the system
     // store.
-    const ca: http.TlsCa = .{ .pem = ca_pem };
+    const ca: http.Ca = .{ .pem = ca_pem };
 
     var url_buf: [128]u8 = undefined;
 

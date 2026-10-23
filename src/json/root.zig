@@ -357,7 +357,7 @@ test "parse: a type that contains itself nests at most max_depth deep" {
 test "readBody: bind's contract, answered 400 by the server" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
-    var req: dusty.Request = .{ .arena = arena_state.allocator(), .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena_state.allocator(), ._parser = undefined, ._transport = undefined };
     const T = struct { name: []const u8 };
     req._body_read = true;
     req._body = null;

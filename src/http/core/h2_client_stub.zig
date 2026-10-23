@@ -8,7 +8,7 @@
 //!
 //!     dusty_mod.addImport("h2_client", its_h2_client_module);
 //!
-//! What dusty needs from it (see `client.zig`, `has_h2_client`):
+//! What the core needs from it (see `client.zig`, `has_h2_client`):
 //!
 //!     ClientConnection.adopt(gpa, io, reader, writer, socket) !*ClientConnection
 //!         takes over a TLS connection that negotiated "h2": the cleartext

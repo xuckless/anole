@@ -13,7 +13,7 @@ const H2Socket = @import("h2_socket.zig").H2Socket;
 const deflate = if (features.compression) @import("deflate.zig") else struct {};
 
 /// The body reader's source. One check runs at a time, so it is global: the
-/// reader's `interface` lives inside dusty's `RequestBodyReader`, where a
+/// reader's `interface` lives inside the core's `RequestBodyReader`, where a
 /// `@fieldParentPtr` back to state of our own is not available.
 var source: struct { data: []const u8 = "", pos: usize = 0, step: usize = 1 } = .{};
 
@@ -60,13 +60,13 @@ fn run(arena: std.mem.Allocator, input: []const u8, step: usize, buf_len: usize,
     var d: if (features.compression) deflate.Deflate else void = if (features.compression) .init(.{}, .{}, arena) else {};
     defer if (features.compression) d.deinit();
     var socket: websocket.Socket = .{
-        .conn = .{ .h2 = sock },
-        .allocator = arena,
+        ._conn = .{ .stream = sock },
+        ._allocator = arena,
         .io = std.testing.io,
         .max_message_size = max_message_size,
     };
     if (comptime features.compression) {
-        if (compressed) socket.deflate = &d;
+        if (compressed) socket._deflate = &d;
     }
 
     var t: Transcript = .{};

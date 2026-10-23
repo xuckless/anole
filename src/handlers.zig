@@ -56,14 +56,17 @@ pub fn noWait(comptime handler: anytype) NoWait(handler) {
 }
 
 /// The type `noWait` returns: a marker the route methods recognise.
+/// Given a middleware function it marks the middleware instead (`use`,
+/// `group` and `with` take it).
 pub fn NoWait(comptime handler: anytype) type {
-    if (@typeInfo(@TypeOf(handler)) != .@"fn") @compileError("anole.noWait takes a handler function, not " ++ @typeName(@TypeOf(handler)));
+    if (@typeInfo(@TypeOf(handler)) != .@"fn") @compileError("anole.noWait takes a handler function or a middleware function, not " ++ @typeName(@TypeOf(handler)));
     return struct {
         pub const no_wait_handler = handler;
     };
 }
 
-fn isNoWait(comptime T: type) bool {
+/// Whether `T` is the type `noWait` returns.
+pub fn isNoWait(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "no_wait_handler");
 }
 
@@ -105,12 +108,12 @@ pub fn routeOptions(comptime handler: anytype) dusty.RouteOptions {
 /// calling it ends the request with whatever the middleware put in the
 /// response.
 pub const Next = struct {
-    executor: *anyopaque,
-    next_fn: *const fn (executor: *anyopaque) anyerror!void,
+    chain: *anyopaque,
+    next_fn: *const fn (chain: *anyopaque) anyerror!void,
 
     /// Runs the rest of the chain and returns its error, if any.
     pub fn call(self: Next) anyerror!void {
-        return self.next_fn(self.executor);
+        return self.next_fn(self.chain);
     }
 };
 
@@ -124,6 +127,23 @@ pub fn func(comptime f: anytype) Func(f) {
 /// The middleware type `func` returns for `f`. A compile error when `f`
 /// does not take `anole.Next` last.
 pub fn Func(comptime f: anytype) type {
+    return FuncMarked(f, false);
+}
+
+/// `Func(f)` that says it never waits (`pub const no_wait = true`), for
+/// routes registered `no_wait`: what `app.use(anole.noWait(f))` makes.
+pub fn FuncNoWait(comptime f: anytype) type {
+    return FuncMarked(f, true);
+}
+
+/// Whether `f` takes `anole.Next` last: a middleware function, not a
+/// handler.
+pub fn isMiddlewareFn(comptime f: anytype) bool {
+    const params = @typeInfo(@TypeOf(f)).@"fn".param_types;
+    return (params.len == 3 or params.len == 4) and params[params.len - 1] == Next;
+}
+
+fn FuncMarked(comptime f: anytype, comptime never_waits: bool) type {
     const params = @typeInfo(@TypeOf(f)).@"fn".param_types;
     if (params.len != 3 and params.len != 4 or params[params.len - 1] != Next)
         @compileError("a middleware function takes (*anole.Request, *anole.Response, anole.Next), or the server's state first; got " ++ @typeName(@TypeOf(f)));
@@ -131,15 +151,17 @@ pub fn Func(comptime f: anytype) type {
         // Not zero-sized: the server keeps a pointer to its copy.
         _: u8 = 0,
 
-        pub fn execute(_: *const @This(), req: *dusty.Request, res: *dusty.Response, executor: anytype) anyerror!void {
-            const E = @TypeOf(executor);
-            const next: Next = .{ .executor = executor, .next_fn = struct {
-                fn next(p: *anyopaque) anyerror!void {
+        pub const no_wait = never_waits;
+
+        pub fn execute(_: *const @This(), req: *dusty.Request, res: *dusty.Response, chain: anytype) anyerror!void {
+            const E = @TypeOf(chain);
+            const next: Next = .{ .chain = chain, .next_fn = struct {
+                fn call(p: *anyopaque) anyerror!void {
                     const e: E = @ptrCast(@alignCast(p));
-                    return e.next();
+                    return e.call();
                 }
-            }.next };
-            if (params.len == 4) return f(executor.ctx, req, res, next);
+            }.call };
+            if (params.len == 4) return f(chain.ctx, req, res, next);
             return f(req, res, next);
         }
     };

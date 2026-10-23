@@ -4,7 +4,7 @@
 //! the calling coroutine, never its thread.
 //!
 //!     const s = try anole.net.ClientStream.connect(gpa, io, .{
-//!         .host = "db.internal", .port = 27017, .tls = .{ .ca = .{ .file = .{ .path = "ca.pem" } } } });
+//!         .host = "db.internal", .port = 27017, .tls = .{ .ca = .{ .file = "ca.pem" } } });
 //!     defer s.close();
 //!     try s.writer().writeAll(request);
 //!     try s.writer().flush();
@@ -49,10 +49,10 @@ pub const ConnectOptions = struct {
         /// The system store (the default) is loaded once for the process; a
         /// file, directory or PEM is read on every handshake. `.none` only with
         /// `insecure_skip_verify`.
-        ca: Ca = .system,
+        ca: dusty.Ca = .system,
         /// A certificate to present when the server asks for one (mutual TLS):
         /// files or PEM in memory, read on every handshake.
-        client_certificate: ?ClientCertificate = null,
+        client_certificate: ?dusty.Cert = null,
         /// Accept any certificate, for any name: encryption without
         /// authentication (libpq's `sslmode=require` without a root
         /// certificate, MongoDB's `tlsInsecure`). For tests, or a network you
@@ -67,11 +67,6 @@ pub const ConnectOptions = struct {
         /// ALPN protocols to offer, such as "postgresql" for PostgreSQL 17's
         /// direct TLS; empty for none. See `alpnProtocol`.
         alpn: []const []const u8 = &.{},
-
-        /// The system store, a file, a directory, PEM in memory, or none.
-        pub const Ca = dusty.TlsCa;
-        /// A certificate and key, as files or PEM.
-        pub const ClientCertificate = dusty.TlsConfig.ClientCertificate;
     };
 };
 
@@ -261,9 +256,12 @@ fn timeoutFrom(duration: ?std.Io.Duration) std.Io.Timeout {
     return .{ .duration = .{ .raw = d, .clock = .awake } };
 }
 
-fn loadCertificate(gpa: std.mem.Allocator, io: std.Io, cc: ConnectOptions.Tls.ClientCertificate) !tls.config.CertKeyPair {
-    if (cc.pem) |pem| return tls.config.CertKeyPair.fromSlice(gpa, io, pem.cert, pem.key);
-    return tls.config.CertKeyPair.fromFilePath(gpa, io, cc.dir orelse std.Io.Dir.cwd(), cc.cert_path, cc.key_path);
+fn loadCertificate(gpa: std.mem.Allocator, io: std.Io, cc: dusty.Cert) !tls.config.CertKeyPair {
+    return switch (cc) {
+        .pem => |pem| tls.config.CertKeyPair.fromSlice(gpa, io, pem.cert, pem.key),
+        .files => |f| tls.config.CertKeyPair.fromFilePath(gpa, io, std.Io.Dir.cwd(), f.cert_path, f.key_path),
+        .dev_self_signed => error.DevCertificateUnavailable,
+    };
 }
 
 // ---------------------------------------------------------------------------

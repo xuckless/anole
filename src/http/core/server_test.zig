@@ -332,7 +332,7 @@ test "Server: an upgraded connection keeps what came with the handshake, and its
         echoed: bool = false,
 
         fn handle(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var ws = try res.upgradeWebSocket(req) orelse {
+            var ws = try res._upgradeWebSocket(req) orelse {
                 res.status = .bad_request;
                 return;
             };
@@ -417,7 +417,7 @@ test "Server: WebSocket echo" {
         }
 
         fn handleWebSocket(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var ws = try res.upgradeWebSocket(req) orelse {
+            var ws = try res._upgradeWebSocket(req) orelse {
                 res.status = .bad_request;
                 return;
             };
@@ -3302,13 +3302,13 @@ test "Server.dispatch: a request over a sink is routed through the middleware to
     var cap: Capture = .{};
     cap.w = .fixed(&cap.buf);
 
-    var req: dusty.Request = .{ .arena = arena, .io = io, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena, .io = io, ._parser = undefined, ._transport = undefined };
     req.headers = try dusty.Headers.init(arena, 8);
     req.method = .get;
     req.url = "/users/42";
-    var res = try dusty.Response.initSink(arena, io, cap.sink(), 16);
-    req.response = &res;
-    res.request = &req;
+    var res = try dusty.Response._initSink(arena, io, cap.sink(), 16);
+    req._response = &res;
+    res._request = &req;
 
     try server.dispatch(&req, &res);
     try res.write();
@@ -3539,7 +3539,7 @@ test "Server: the Compress middleware gzips text and leaves images alone" {
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
-    var compress = dusty.middleware.Compress.init();
+    var compress = dusty.middleware.Compress.init(.{});
     const mws = [_]dusty.Middleware(void){dusty.Middleware(void).init(&compress)};
     server.router.middlewares = &mws;
     server.router.get("/text", struct {
@@ -3586,16 +3586,16 @@ test "Server: router.use with RequestId and Logger, and nested groups" {
     defer server.deinit();
 
     var request_id = dusty.middleware.RequestId.init(.{});
-    var logger = dusty.middleware.Logger.init();
+    var logger = dusty.middleware.Logger.init(.{});
     server.router.use(dusty.Middleware(void).init(&request_id));
     server.router.use(dusty.Middleware(void).init(&logger));
 
     const Tag = struct {
         value: []const u8,
-        pub fn execute(self: *const @This(), req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
+        pub fn execute(self: *const @This(), req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
             _ = req;
             try res.header("X-Group", self.value);
-            return executor.next();
+            return next.call();
         }
     };
     var outer_tag: Tag = .{ .value = "outer" };
@@ -3890,7 +3890,7 @@ test "Server: an unread body left after the request timed out or lifted its time
         }
         /// Lifts the request timeout and never reads the body.
         fn unbounded(req: *dusty.Request, res: *dusty.Response) !void {
-            req.setTimeout(.none);
+            req.setTimeout(null);
             res.body = "ok";
         }
     };
@@ -4131,4 +4131,228 @@ test "Server: a response can carry more headers than a request may" {
         }
     }.run, .{ &server, io });
     try client_future.await(io);
+}
+
+// ---------------------------------------------------------------------------
+// The request deadline ends where a stream or file body starts
+
+const StreamWatch = struct {
+    /// What the handler's last failing write was, as an error code.
+    var write_error: std.atomic.Value(u8) = .init(0);
+    const timed_out: u8 = 1;
+    const other: u8 = 2;
+    var sent: std.atomic.Value(u32) = .init(0);
+};
+
+/// Connects, sends `request`, and returns the stream and its buffers' owner.
+fn startRaw(io: std.Io, server: *dusty.Server(void), request: []const u8) !std.Io.net.Stream {
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    var write_buf: [512]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll(request);
+    try writer.interface.flush();
+    return stream;
+}
+
+test "stream: an event stream outlives timeouts.request" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .timeout = .{ .request = .fromMilliseconds(300), .write = .fromSeconds(5) },
+    }, {});
+    defer server.deinit();
+    server.router.get("/slow", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            var buf: [256]u8 = undefined;
+            var events = try res.startEventStream(&buf);
+            for (0..12) |_| {
+                try events.send("tick", .{});
+                try req.io.sleep(.fromMilliseconds(100), .awake);
+            }
+            try events.end();
+        }
+    }.handle);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const stream = try startRaw(io, &server, "GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    defer stream.close(io);
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var out: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    _ = reader.interface.streamRemaining(&w) catch {};
+    const got = w.buffered();
+    try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, got, "data: tick"));
+    try std.testing.expect(std.mem.endsWith(u8, got, "0\r\n\r\n"));
+}
+
+test "stream: a peer that stops reading is cut after timeouts.write" {
+    const io = std.testing.io;
+    StreamWatch.write_error.store(0, .release);
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .timeout = .{ .request = .fromSeconds(30), .write = .fromMilliseconds(300) },
+    }, {});
+    defer server.deinit();
+    server.router.get("/big", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            var buf: [16 * 1024]u8 = undefined;
+            var body = try res.stream(&buf);
+            const chunk: [64 * 1024]u8 = @splat('x');
+            // 8 MiB is more than the socket buffers hold, and the client reads none.
+            for (0..128) |_| {
+                body.interface.writeAll(&chunk) catch {
+                    StreamWatch.write_error.store(if (body.err != null and body.err.? == error.WriteTimeout) StreamWatch.timed_out else StreamWatch.other, .release);
+                    return;
+                };
+            }
+        }
+    }.handle);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const stream = try startRaw(io, &server, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n");
+    defer stream.close(io);
+    const start = std.Io.Clock.awake.now(io);
+    while (StreamWatch.write_error.load(.acquire) == 0) {
+        try io.sleep(.fromMilliseconds(20), .awake);
+        if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() > 5000) return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(StreamWatch.timed_out, StreamWatch.write_error.load(.acquire));
+    try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 2000);
+}
+
+test "sendFile: a download slower than timeouts.request completes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const size: u64 = 32 * 1024 * 1024;
+    {
+        const file = try tmp.dir.createFile(io, "big.bin", .{});
+        defer file.close(io);
+        try file.setLength(io, size);
+    }
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .timeout = .{ .request = .fromMilliseconds(300), .write = .fromSeconds(5) },
+    }, {});
+    defer server.deinit();
+    server.router.static("/files", tmp.dir, .{});
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const stream = try startRaw(io, &server, "GET /files/big.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    defer stream.close(io);
+    var read_buf: [64 * 1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const start = std.Io.Clock.awake.now(io);
+    var total: u64 = 0;
+    var scratch: [2 * 1024 * 1024]u8 = undefined;
+    while (true) {
+        // 2 MiB per 40 ms: the whole file takes about twice the request timeout.
+        const n = reader.interface.readSliceShort(&scratch) catch break;
+        total += n;
+        if (n < scratch.len) break;
+        try io.sleep(.fromMilliseconds(40), .awake);
+    }
+    try std.testing.expect(total >= size);
+    try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() > 300);
+}
+
+test "stream: a handler's own setTimeout before the stream is kept" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .timeout = .{ .request = .fromSeconds(30), .write = .fromSeconds(30) },
+    }, {});
+    defer server.deinit();
+    server.router.get("/forever", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            req.setTimeout(.fromMilliseconds(500));
+            var buf: [256]u8 = undefined;
+            var events = try res.startEventStream(&buf);
+            while (true) {
+                try events.send("tick", .{});
+                try req.io.sleep(.fromMilliseconds(50), .awake);
+            }
+        }
+    }.handle);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const start = std.Io.Clock.awake.now(io);
+    const stream = try startRaw(io, &server, "GET /forever HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    defer stream.close(io);
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var out: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    _ = reader.interface.streamRemaining(&w) catch {};
+    const ms = start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    try std.testing.expect(ms >= 400 and ms < 3000);
+}
+
+test "reader: a chunked body past body_max fails with BodyTooBig; readerLimited lifts it" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .request = .{ .max_body_size = 1024, .max_content_length = null },
+    }, {});
+    defer server.deinit();
+    server.router.post("/limited", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            var buf: [256]u8 = undefined;
+            var r = try req.reader(&buf);
+            _ = r.interface.discardRemaining() catch {
+                res.status = if (r.err) |e| (if (e == error.BodyTooBig) .payload_too_large else .internal_server_error) else .internal_server_error;
+                return;
+            };
+            res.body = "ok";
+        }
+    }.handle);
+    server.router.post("/lifted", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            var buf: [256]u8 = undefined;
+            var r = try req.readerLimited(&buf, null);
+            _ = try r.interface.discardRemaining();
+            res.body = "ok";
+        }
+    }.handle);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    // 2 KiB in chunks, past the 1 KiB limit.
+    const chunk = "400\r\n" ++ &@as([1024]u8, @splat('x')) ++ "\r\n";
+    const body = chunk ++ chunk ++ "0\r\n\r\n";
+    var buf: [2048]u8 = undefined;
+    const limited = try rawAll(io, &server, "POST /limited HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" ++ body, &buf);
+    try std.testing.expect(std.mem.startsWith(u8, limited, "HTTP/1.1 413"));
+    const lifted = try rawAll(io, &server, "POST /lifted HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" ++ body, &buf);
+    try std.testing.expect(std.mem.startsWith(u8, lifted, "HTTP/1.1 200"));
 }

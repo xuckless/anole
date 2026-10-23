@@ -34,8 +34,8 @@ A `Key` has an optional `kid`, exactly one `alg`, and its `material`
 (`.hmac`, `.rsa` with big-endian `n` and `e`, `.p256`, `.p384` or `.ed25519`).
 It supports HS256/384/512, RS256/384/512, PS256/384/512, ES256, ES384 and
 EdDSA, all on Zig's `std.crypto`. `Policy` holds `issuer`, `audience`,
-`typ`, `leeway_seconds` (60), `require_exp` (true), `require_iat` (false),
-`max_age_seconds` and `allow_any_audience` (false). `now` is
+`typ`, `leeway` (a Duration, 60 s), `require_exp` (true), `require_iat` (false),
+`max_age` (a Duration) and `allow_any_audience` (false). `now` is
 in Unix seconds, for example `std.Io.Clock.real.now(req.io).toSeconds()`.
 
 Each key verifies only its own algorithm. A token whose `alg` differs from
@@ -50,7 +50,7 @@ These defaults are enforced, not optional:
   tokens that really have no expiry.
 - `nbf` and `iat` are checked when present (`require_iat` makes `iat`
   mandatory). `iss`, `aud` (a string or an array), the header's `typ` and
-  `max_age_seconds` are checked when you set them in the policy.
+  `max_age` are checked when you set them in the policy.
 - Set `issuer` and `audience` whenever the keys also sign tokens for
   others, as an identity provider's do: without `audience`, a token the
   provider issued to another application verifies too. A `Keyring` refuses
@@ -138,7 +138,7 @@ RS256, P-256 gets ES256, P-384 gets ES384 and Ed25519 gets EdDSA.
 
 For a provider's `jwks_uri`, use `anole.auth.Keyring`. Give it the
 server's client, `app.client()` (or `anole.client(io)`), and the URL. It
-fetches the set on first use, fetches it again after `ttl_seconds` (3600),
+fetches the set on first use, fetches it again after `ttl` (1 hour),
 and fetches it once more when a token names an unknown `kid`. Providers rotate keys, but those
 extra fetches are at least `min_refresh_seconds` (60) apart, so bogus tokens
 can't make you hammer the provider.
@@ -289,7 +289,7 @@ Pass `.key` for a sealed cookie, or `.store` for server-side sessions.
 `init` returns an error union: in cookie mode it refuses to start without
 a key (`error.SessionKeyMissing`, with the fix in the log), so a forgotten
 key never gives cookies anyone could forge or read. `Config` also has
-`cookie_name` (`anole_session`), `ttl_seconds` (24 h,
+`cookie_name` (`anole_session`), `ttl` (24 h,
 renewed by each response that carries the session) and `cookie_opts`
 (`Path=/`, `HttpOnly`, `Secure`, `SameSite=Lax`; setting one field keeps
 the others' defaults). Chrome, Firefox and curl
@@ -332,7 +332,7 @@ var sessions = try anole.session.Middleware.init(.{ .store = rs.store() });
 ```
 
 `MemoryStore` sweeps expired sessions as new ones are written and keeps at
-most `max_entries` (100,000; `MemoryStore.initOptions(gpa, io, .{
+most `max_entries` (100,000; `MemoryStore.init(gpa, io, .{
 .max_entries = n })`): past it, the session written longest ago is dropped,
 with a warning in the log.
 
@@ -491,7 +491,7 @@ var can_write = anole.auth.rbac.Require.init(&policy, "notes:write", .{ .ptr = &
 ## Rate limiting
 
 `anole.ratelimit` keeps a token bucket per key. `Policy` allows `limit`
-requests per `window_ms`, with a bucket of `burst`, which defaults to
+requests per `window`, with a bucket of `burst`, which defaults to
 `limit`.
 
 `ratelimit.Middleware` sets the `RateLimit-Limit`, `RateLimit-Remaining` and
@@ -501,7 +501,7 @@ answers 429 with `Retry-After`.
 ```zig
 var limiter = anole.ratelimit.MemoryLimiter.init(gpa, app.io(), .{}); // max_entries 10_000, idle_ms 300_000
 defer limiter.deinit();
-var login_limit = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 5, .window_ms = 60_000 });
+var login_limit = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 5, .window = .fromSeconds(60) });
 var per_key = anole.ratelimit.Middleware.init(limiter.limiter(), .{ .limit = 1000, .key = byApiKeyOwner, .on_error = .deny });
 ```
 
@@ -526,7 +526,7 @@ address, and a fresh bucket, for every request.
 `.key = anole.ratelimit.clientAddressPrefix(56)` groups by another prefix
 (48 or 56 for providers that hand out larger blocks, 128 for each address
 alone).
-Behind a proxy, set `.server = .{ .trusted_proxy_hops = 1 }` in the server
+Behind a proxy, set `.proxy = .{ .trusted_hops = 1 }` in the server
 options so that the address comes from `X-Forwarded-For`, or turn on the
 listener's `proxy_protocol`.
 Otherwise every client shares the proxy's bucket. To limit by something

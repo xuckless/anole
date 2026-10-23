@@ -155,6 +155,65 @@ pub fn isValidAsciiValue(value: []const u8) bool {
     return true;
 }
 
+/// Where a handler's metadata goes.
+pub const Place = enum { header, trailer };
+
+pub fn isTransportHeader(name: []const u8) bool {
+    if (name.len == 0 or name[0] == ':') return true;
+    const list = [_][]const u8{
+        "content-type",             "te",                 "grpc-timeout",             "grpc-encoding",
+        "grpc-accept-encoding",     "content-length",     "content-encoding",         "accept-encoding",
+        "connect-protocol-version", "connect-timeout-ms", "connect-content-encoding", "connect-accept-encoding",
+        "connection",               "keep-alive",         "transfer-encoding",        "upgrade",
+        "host",
+    };
+    for (list) |h| if (std.ascii.eqlIgnoreCase(name, h)) return true;
+    return false;
+}
+
+/// Whether a handler (Zig `Call.addHeader`/`addTrailer`, or a C ABI consumer)
+/// may send `key`: a valid key that is not the protocols' own: no `grpc-*`
+/// (but `grpc-status-details-bin`, in trailers only), `connect-*`,
+/// `trailer-*`, and none of the transport's headers (`content-type`, `te`,
+/// `content-length`, `content-encoding`, `accept-encoding`, `connection`,
+/// `keep-alive`, `transfer-encoding`, `upgrade`, `host`).
+pub fn isSendableKey(key: []const u8, place: Place) bool {
+    if (!isValidKey(key)) return false;
+    if (std.mem.startsWith(u8, key, "grpc-")) {
+        if (!(place == .trailer and std.mem.eql(u8, key, "grpc-status-details-bin"))) return false;
+    }
+    if (std.mem.startsWith(u8, key, "connect-") or std.mem.startsWith(u8, key, "trailer-")) return false;
+    if (isTransportHeader(key)) return false;
+    return true;
+}
+
+/// Whether `value` may go out under `key`: base64 (padded or not) for a
+/// `-bin` key given as text, else printable ASCII; empty is allowed.
+pub fn isSendableValue(key: []const u8, value: []const u8) bool {
+    if (isBinaryKey(key)) {
+        for (value) |ch| switch (ch) {
+            'A'...'Z', 'a'...'z', '0'...'9', '+', '/', '=' => {},
+            else => return false,
+        };
+        return true;
+    }
+    for (value) |ch| if (ch < 0x20 or ch > 0x7e) return false;
+    return true;
+}
+
+test "metadata: isSendableKey" {
+    const t = std.testing;
+    try t.expect(isSendableKey("x-tag", .header));
+    try t.expect(!isSendableKey("grpc-status-details-bin", .header));
+    try t.expect(isSendableKey("grpc-status-details-bin", .trailer));
+    try t.expect(!isSendableKey("grpc-status", .trailer));
+    try t.expect(!isSendableKey("connect-x", .header));
+    try t.expect(!isSendableKey("trailer-x", .trailer));
+    try t.expect(!isSendableKey("X-Upper", .header));
+    try t.expect(!isSendableKey(":path", .header));
+    try t.expect(!isSendableKey("content-type", .trailer));
+}
+
 /// Whether `key` ends in "-bin", so its values are binary.
 pub fn isBinaryKey(key: []const u8) bool {
     return std.mem.endsWith(u8, key, "-bin");

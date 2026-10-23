@@ -60,7 +60,7 @@ test "observe: traces reach the collector, metrics by route, readiness" {
     defer client.deinit();
     var endpoint_buf: [64]u8 = undefined;
     const endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{otel.address.ip.getPort()});
-    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = endpoint, .service_name = "test-api", .interval_ms = 50 });
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = endpoint, .service_name = "test-api", .interval = .fromMilliseconds(50) });
     var exporter_live = true;
     defer if (exporter_live) exporter.deinit();
     try exporter.start();
@@ -114,7 +114,7 @@ test "observe: traces reach the collector, metrics by route, readiness" {
 test "access log: text and JSON lines" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
-    var req: dusty.Request = .{ .arena = arena_state.allocator(), .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena_state.allocator(), ._parser = undefined, ._transport = undefined };
     req.method = .get;
     req.url = "/a\"b";
     req.id = "rid";
@@ -131,7 +131,7 @@ test "access log: a request ID cannot add JSON fields" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var req: dusty.Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena, ._parser = undefined, ._transport = undefined };
     req.method = .get;
     req.url = "/x";
     req.id = "x\",\"status\":200,\"y\":\"\\";
@@ -247,12 +247,12 @@ var held_started: std.Io.Event = .unset;
 /// to its route: a request routed during the drain, as an HTTP/2 stream
 /// opened before the final GOAWAY is.
 const HoldUntilDrain = struct {
-    pub fn execute(_: *const HoldUntilDrain, req: *dusty.Request, _: *dusty.Response, executor: anytype) !void {
+    pub fn execute(_: *const HoldUntilDrain, req: *dusty.Request, _: *dusty.Response, next: anytype) !void {
         if (std.mem.endsWith(u8, req.url, "?held")) {
             held_started.set(req.io);
             try req.drain.?.wait(req.io);
         }
-        return executor.next();
+        return next.call();
     }
 };
 
@@ -302,7 +302,7 @@ test "observe: the exporter stops at once, not after its interval" {
     defer client.deinit();
     // Nothing listens there: the one span is dropped, then the task pauses
     // for its (long) interval until deinit wakes it.
-    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .interval_ms = 60_000 });
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .interval = .fromSeconds(60) });
     try exporter.start();
     var span: observe.trace.Span = undefined;
     span.db = null;
@@ -371,7 +371,7 @@ test "access log: the query is left out unless log_query" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var req: dusty.Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena, ._parser = undefined, ._transport = undefined };
     req.method = .get;
     req.url = "/callback?code=secret-code&state=s";
     const json = try observe.access_log.format(arena, .json, &req, 200, 1, 0, null);
@@ -382,4 +382,19 @@ test "access log: the query is left out unless log_query" {
     try std.testing.expect(std.mem.indexOf(u8, text, "secret-code") == null);
     const kept = try observe.access_log.formatLine(arena, .{ .format = .text, .log_query = true }, &req, 200, 1, 0, null);
     try std.testing.expect(std.mem.startsWith(u8, kept, "GET /callback?code=secret-code&state=s 200 "));
+}
+
+test "tracing: OTEL_SERVICE_NAME from the process environment without .process" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const anole = @import("../root.zig");
+    const libc = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    _ = libc.setenv("OTEL_SERVICE_NAME", "from-the-environment", 1);
+    defer _ = libc.unsetenv("OTEL_SERVICE_NAME");
+    var app = try anole.App.init(std.testing.allocator, .{ .http = .{ .port = 0 }, .executors = .exact(1) });
+    defer app.deinit();
+    const exporter = try app.tracing(.{ .endpoint = "http://127.0.0.1:9", .interval = .fromSeconds(60) });
+    try std.testing.expectEqualStrings("from-the-environment", exporter.options.service_name);
 }

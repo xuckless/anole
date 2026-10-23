@@ -83,7 +83,7 @@ fn handleEcho(req: *anole.Request, res: *anole.Response) !void {
 /// -Dcompression, on zlib-ng).
 fn handleBig(_: *anole.Request, res: *anole.Response) !void {
     res.compress = true;
-    var w = res.writer();
+    var w = try res.writer();
     for (0..200) |i| try w.interface.print("line {d}: the quick brown fox jumps over the lazy dog\n", .{i});
     try w.end();
 }
@@ -129,7 +129,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Every response gets an X-Request-Id and an access-log line.
     app.use(anole.middleware.RequestId.init(.{}));
-    app.use(anole.middleware.Logger.init());
+    app.use(anole.middleware.Logger.init(.{}));
 
     app.get("/", handleRoot);
     app.get("/users/:id", handleUser);

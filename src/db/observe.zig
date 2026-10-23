@@ -207,7 +207,7 @@ test "Observer: metrics shared by two databases, and a child span in a traced re
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    var req: dusty.Request = .{ .arena = arena_state.allocator(), .io = testing.io, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena_state.allocator(), .io = testing.io, ._parser = undefined, ._transport = undefined };
     req.trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
     req.span_id = "00f067aa0ba902b7";
 

@@ -4,10 +4,11 @@
 
 const std = @import("std");
 const zio = @import("zio");
+const placement = @import("placement.zig");
 
 /// Whether the injected `zio` can arm a timer against the running task. The
 /// stub says so by declaring `is_stub`; the real package does not.
-pub const have_auto_cancel = !@hasDecl(zio, "is_stub");
+pub const have_auto_cancel = !placement.is_stub;
 
 /// A deadline one task publishes and another waits on.
 ///
@@ -166,6 +167,8 @@ pub const Timer = if (have_auto_cancel) struct {
 /// A budget shared by several calls, such as a request and the reads of its
 /// body, is one deadline pinned once by `init` and run as many times as
 /// there are calls.
+var warned_unbounded: std.atomic.Value(bool) = .init(false);
+
 pub const Deadline = struct {
     io: std.Io,
     /// Absolute, or `.none`: `init` pins a duration to the moment it was
@@ -196,7 +199,11 @@ pub const Deadline = struct {
     /// wins over the deadline and comes back as `error.Canceled`.
     pub fn run(self: Deadline, func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) Result(func) {
         if (self.timeout == .none) return @call(.auto, func, args);
-        if (comptime have_auto_cancel) return self.runAutoCanceled(func, args);
+        // Off a zio task (std.Io.Threaded, a blocking-pool thread) there is
+        // no task to arm a timer against.
+        if (comptime have_auto_cancel) {
+            if (placement.currentTask(self.io) != null) return self.runAutoCanceled(func, args);
+        }
         return self.runWatched(func, args);
     }
 
@@ -233,7 +240,19 @@ pub const Deadline = struct {
 
         var watch: Watch = .{};
         watch.set(self.io, self.timeout);
-        var future = try self.io.concurrent(Runner.run, .{ &watch, self.io, args });
+        var future = self.io.concurrent(Runner.run, .{ &watch, self.io, args }) catch |err| {
+            // Only `std.Io.Threaded` out of threads can get here (tests, or
+            // a program that does not run on zio): zio's `concurrent` always
+            // finds a task slot, and every request, blocking-pool and
+            // background call on zio takes the auto-cancel path above or
+            // this watched one. Without a second thread the call runs
+            // unbounded rather than failing, and says so once.
+            if (comptime have_auto_cancel) {
+                if (!warned_unbounded.swap(true, .monotonic)) std.log.scoped(.anole).warn("no thread is free to enforce a call's deadline: running it without one (std.Io.Threaded out of threads)", .{});
+                return @call(.auto, func, args);
+            }
+            return err;
+        };
 
         watch.wait(self.io) catch |err| switch (err) {
             // The call may have finished in the window between the deadline

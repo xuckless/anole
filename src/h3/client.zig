@@ -118,17 +118,12 @@ pub const ConnectOptions = struct {
         /// to, as for `anole.h2`: the system store by default, loaded on the
         /// first `connect` and kept for the process. `.none` only with
         /// `insecure_skip_verify`.
-        ca: Ca = .system,
+        ca: dusty.Ca = .system,
         /// Accept any certificate, for any name. For tests only.
         insecure_skip_verify: bool = false,
         /// A certificate to present when the server asks for one (mutual
         /// TLS): files or PEM in memory, read on every `connect`.
-        client_certificate: ?ClientCertificate = null,
-
-        /// The system store, a file, a directory, PEM in memory, or none.
-        pub const Ca = dusty.TlsCa;
-        /// A certificate and key, as files or PEM.
-        pub const ClientCertificate = dusty.TlsConfig.ClientCertificate;
+        client_certificate: ?dusty.Cert = null,
     };
 };
 
@@ -142,13 +137,18 @@ const Identity = struct {
     /// Read from files, so freed by `deinit`.
     owned: bool,
 
-    fn load(gpa: std.mem.Allocator, io: std.Io, cc: ConnectOptions.Tls.ClientCertificate) !Identity {
-        if (cc.pem) |p| return .{ .pem = .{ .cert_pem = p.cert, .key_pem = p.key }, .owned = false };
-        const dir = cc.dir orelse std.Io.Dir.cwd();
-        const cert = try dir.readFileAlloc(io, cc.cert_path, gpa, .limited(1 << 20));
-        errdefer gpa.free(cert);
-        const key = try dir.readFileAlloc(io, cc.key_path, gpa, .limited(1 << 20));
-        return .{ .pem = .{ .cert_pem = cert, .key_pem = key }, .owned = true };
+    fn load(gpa: std.mem.Allocator, io: std.Io, cc: dusty.Cert) !Identity {
+        switch (cc) {
+            .pem => |p| return .{ .pem = .{ .cert_pem = p.cert, .key_pem = p.key }, .owned = false },
+            .files => |f| {
+                const dir = std.Io.Dir.cwd();
+                const cert = try dir.readFileAlloc(io, f.cert_path, gpa, .limited(1 << 20));
+                errdefer gpa.free(cert);
+                const key = try dir.readFileAlloc(io, f.key_path, gpa, .limited(1 << 20));
+                return .{ .pem = .{ .cert_pem = cert, .key_pem = key }, .owned = true };
+            },
+            .dev_self_signed => return error.DevCertificateUnavailable,
+        }
     }
 
     fn deinit(self: *Identity, gpa: std.mem.Allocator) void {
@@ -416,7 +416,7 @@ pub const ClientConnection = struct {
         const ca = options.tls.ca;
         hashField(&hash, @tagName(ca));
         switch (ca) {
-            .file, .dir => |src| hashField(&hash, src.path),
+            .file, .dir => |ca_path| hashField(&hash, ca_path),
             .pem => |text| hashField(&hash, text),
             .system, .none => {},
         }
@@ -740,7 +740,7 @@ pub const ClientConnection = struct {
         const holder = try self.gpa.create(ClientSession);
         errdefer self.gpa.destroy(holder);
         holder.* = .{ .session = undefined, .stream = stream, .gpa = self.gpa };
-        try holder.session.start(core, stream.id, .{
+        try webtransport.Session.Driver.start(&holder.session, core, stream.id, .{
             .reader = stream.reader(),
             .writer = stream.writer(),
             .ctx = holder,

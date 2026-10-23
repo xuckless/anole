@@ -467,6 +467,9 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     run_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_tests.step);
+    // compile-tests: build the test binaries without running them.
+    const compile_tests_step = b.step("compile-tests", "Compile the test binaries without running them");
+    compile_tests_step.dependOn(&tests.step);
 
     // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
     // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
@@ -546,6 +549,7 @@ pub fn build(b: *std.Build) void {
             .use_llvm = use_llvm,
         });
         const run_core_tests = b.addRunArtifact(core_tests);
+        compile_tests_step.dependOn(&core_tests.step);
         // The TLS tests open certs/cert.pem and certs/key.pem from where
         // they run: a certificate made now by tests/test_cert.zig, so no
         // key is committed.
@@ -850,10 +854,34 @@ pub fn build(b: *std.Build) void {
             capi_step.dependOn(&check.step);
         };
 
+        // include/anole.abi.json, generated from src/capi/abi.zig: installed
+        // beside the header, regenerated with `zig build capi-abi-json`, and
+        // checked fresh by capi-test.
+        const abi_mod = b.createModule(.{ .root_source_file = b.path("src/capi/abi.zig"), .target = b.graph.host, .optimize = .Debug });
+        const abi_json = b.addExecutable(.{
+            .name = "capi_abi_json",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tools/capi_abi_json.zig"),
+                .target = b.graph.host,
+                .optimize = .Debug,
+                .imports = &.{.{ .name = "capi_abi", .module = abi_mod }},
+            }),
+        });
+        const abi_json_gen = b.addRunArtifact(abi_json);
+        const abi_json_out = abi_json_gen.addOutputFileArg("anole.abi.json");
+        capi_step.dependOn(&b.addInstallHeaderFile(abi_json_out, "anole.abi.json").step);
+        const abi_json_update = b.addUpdateSourceFiles();
+        abi_json_update.addCopyFileToSource(abi_json_out, "include/anole.abi.json");
+        b.step("capi-abi-json", "Regenerate include/anole.abi.json from src/capi/abi.zig").dependOn(&abi_json_update.step);
+        const abi_json_check = b.addRunArtifact(abi_json);
+        abi_json_check.addArg("--check");
+        abi_json_check.addFileArg(b.path("include/anole.abi.json"));
+
         // capi-test (also part of `test`): anole.h's layout against
         // src/capi/abi.zig (the header through translate-c), the symbol
         // check, and the C suite (tests/capi/consumer.c) on libanole.a.
         const capi_test_step = b.step("capi-test", "Test the C ABI: anole.h layout, exported symbols, the C suite");
+        capi_test_step.dependOn(&abi_json_check.step);
         if (b.lazyImport(@This(), "translate_c")) |tc| if (b.lazyDependency("translate_c", .{})) |tc_dep| {
             const header: tc.Translator = .init(tc_dep, .{
                 .name = "anole_h",
@@ -861,15 +889,41 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
             });
+            // What the tests compare the header with: the schema, the guide
+            // and the release's version, as text.
+            const embed = b.addWriteFiles();
+            _ = embed.addCopyFile(b.path("include/anole.schema.json"), "anole.schema.json");
+            _ = embed.addCopyFile(b.path("docs/c-abi.md"), "c-abi.md");
+            _ = embed.addCopyFile(b.path("include/anole.h"), "anole.h");
+            const schema_mod = b.createModule(.{ .root_source_file = embed.add("schema.zig", "pub const text = @embedFile(\"anole.schema.json\");\n") });
+            const guide_mod = b.createModule(.{ .root_source_file = embed.add("guide.zig", "pub const text = @embedFile(\"c-abi.md\");\n") });
+            const header_text_mod = b.createModule(.{ .root_source_file = embed.add("header.zig", "pub const text = @embedFile(\"anole.h\");\n") });
+            const version_mod = b.createModule(.{ .root_source_file = embed.add("version.zig", b.fmt("pub const text = \"{s}\";\n", .{@import("build.zig.zon").version})) });
+            const abi_for_test = b.createModule(.{ .root_source_file = b.path("src/capi/abi.zig"), .target = target, .optimize = optimize });
             const abi_test = b.addTest(.{
                 .name = "capi-abi-test",
+                // The test inspects every declaration of the translated
+                // header; the self-hosted x86_64 backend writes debug info
+                // for the extern functions among them, which then need the
+                // C symbols. LLVM drops the unused ones, as on aarch64.
+                .use_llvm = true,
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("src/capi/abi_test.zig"),
                     .target = target,
                     .optimize = optimize,
                     .imports = &.{
-                        .{ .name = "capi_abi", .module = b.createModule(.{ .root_source_file = b.path("src/capi/abi.zig"), .target = target, .optimize = optimize }) },
+                        .{ .name = "capi_abi", .module = abi_for_test },
+                        .{ .name = "capi_abi_json", .module = b.createModule(.{
+                            .root_source_file = b.path("tools/capi_abi_json.zig"),
+                            .target = target,
+                            .optimize = optimize,
+                            .imports = &.{.{ .name = "capi_abi", .module = abi_for_test }},
+                        }) },
                         .{ .name = "anole_h", .module = header.mod },
+                        .{ .name = "anole_schema", .module = schema_mod },
+                        .{ .name = "anole_guide", .module = guide_mod },
+                        .{ .name = "anole_header_text", .module = header_text_mod },
+                        .{ .name = "anole_version", .module = version_mod },
                     },
                 }),
             });
@@ -1285,8 +1339,10 @@ const Core = struct {
     fn init(b: *std.Build, c_mods: CModules, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Core {
         // Pinned by default (zio's own default is work stealing), so a
         // program that declares no `zio_options` still gets what Anole needs;
-        // anole.Server refuses to compile with work stealing declared.
-        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned }).module("zio");
+        // anole.Server refuses to compile with work stealing declared. And
+        // `fast_accept` (see `anole.zio_options`), so a program whose own
+        // `zio_options` leave it out still has it.
+        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true }).module("zio");
         const seam: ?*std.Build.Module = if (c_mods.boringssl) |bssl| b.createModule(.{
             .root_source_file = b.path("src/tls/dusty_tls.zig"),
             .target = target,
@@ -1388,6 +1444,7 @@ const Core = struct {
             .link_libc = true,
         });
         const opts = b.addOptions();
+        opts.addOption([]const u8, "version", @import("build.zig.zon").version);
         opts.addOption(bool, "use_tls", tls != null);
         opts.addOption(bool, "use_http2", nghttp2 != null);
         opts.addOption(bool, "use_zlib", zlib != null);
@@ -1620,6 +1677,7 @@ const AnoleModuleOptions = struct {
 fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     const f = o.features;
     const options = b.addOptions();
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
     options.addOption(Tls, "tls", f.tls);
     options.addOption(bool, "http2", f.http2);
     options.addOption(bool, "http3", f.http3);

@@ -18,27 +18,26 @@ const Logger = @This();
 /// Log the query string with the path.
 log_query: bool = false,
 
-/// `initWith`'s settings.
-pub const Config = struct {
+/// `init`'s settings.
+pub const Options = struct {
     /// Log the query string with the path. Off by default: queries carry
     /// sign-in codes, reset tokens and API keys, which logs keep.
     log_query: bool = false,
 };
 
-/// The middleware: `app.use(anole.middleware.Logger.init())`. See also
+/// The middleware: `app.use(anole.middleware.Logger.init(.{}))`;
+/// `.{ .log_query = true }` logs the query string too. See also
 /// `anole.observe.AccessLog`.
-pub fn init() Logger {
-    return .{};
+pub fn init(options: Options) Logger {
+    return .{ .log_query = options.log_query };
 }
 
-/// The middleware with `config`: `Logger.initWith(.{ .log_query = true })`.
-pub fn initWith(config: Config) Logger {
-    return .{ .log_query = config.log_query };
-}
+/// Never waits: no I/O, so `no_wait` routes may sit behind it.
+pub const no_wait = true;
 
-pub fn execute(self: *const Logger, req: *Request, res: *Response, executor: anytype) !void {
+pub fn execute(self: *const Logger, req: *Request, res: *Response, next: anytype) !void {
     const start: std.Io.Clock.Timestamp = .now(req.io, .awake);
-    executor.next() catch |err| {
+    next.call() catch |err| {
         self.line(req, res, start, err);
         return err;
     };

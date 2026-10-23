@@ -2,11 +2,11 @@
 // contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
-//! Stub used when the `use_tls` build option is disabled.
+//! Stub used when the `-Dtls` build option is disabled.
 //!
 //! It mirrors just enough of the tls.zig API surface for `client.zig` to type
 //! check. The bodies are never reached: the HTTPS path in `Connection.init`
-//! returns `error.TlsNotConfigured` up front when `use_tls` is false.
+//! returns `error.TlsNotConfigured` up front when `-Dtls` is false.
 
 const std = @import("std");
 

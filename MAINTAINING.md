@@ -154,10 +154,25 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
 
 - **zio**: after a change, run its suite in both scheduling modes
   (`./check.sh` and `./check.sh --scheduling pinned` in the fork; Anole
-  runs pinned). Its changes: the pinned mode's run queue (`pinned-fifo`), and
-  accepting on a busy executor (`accept-now`: a direct accept with its own
-  budget, and spawn backpressure every 64 spawns instead of on every one).
-  The bench suite's `conns` and `raw` scenarios measure both.
+  runs pinned; add `--fast-accept`, which Anole builds with, and once
+  without it). Its changes: the pinned run queue kept one FIFO order across
+  the ring and its overflow (`anole-merge-fix`, on top of upstream #841,
+  whose push could leave overflowed tasks waiting forever behind more than
+  256 yielding tasks), and accepting on a busy executor (`accept-now`: a
+  direct accept with its own budget, and spawn backpressure every 64 spawns
+  instead of on every one; `accept-fairness`: both budgets grow to the
+  number of tasks that ran during the last trip to the back of the run
+  queue), all behind zio's `fast_accept` option except the run-queue fix, as
+  in lalinsky/zio#837, which Anole turns on in `build.zig` and
+  `anole.zio_options`. The bench suite's `conns` and `raw` scenarios measure
+  them.
+  Anole requires the fork's declarations and fails to compile without them
+  (src/http/core/placement.zig, top): `Placement`, `Group` (with
+  `spawnInto`), `AutoCancel` (with its `task` field), `currentTask`, `Event`,
+  `Runtime` (with `fromIo`, `currentExecutor` and `executors`), and off
+  Windows `CompletionQueue` and `ev.NetPoll`/`ev.Async`. After a bump, a
+  compile error naming one of them means the branch lost it. The core's own
+  tests build against src/http/core/zio_stub.zig instead (`is_stub`).
 - **nghttp2**, **ngtcp2**, **nghttp3**: see above.
 - **websocket-zig**, **zig-jwt**: ports to Zig 0.17 with small fixes; rebase
   when upstream moves and the fixes are still needed. websocket-zig also
@@ -291,7 +306,10 @@ by hand.
    the same version in build.zig.zon's `.version` and in the MongoDB
    client's handshake metadata (`driver_version` in
    src/mongodb/connection.zig), and point the install snippets (README.md,
-   docs/getting-started.md) at the new tag.
+   docs/getting-started.md) at the new tag. Set the new tag in
+   `include/anole.schema.json`'s `$id` (`.../blob/vX.Y.Z/...`; a test checks
+   it against `.version`) and run `zig build capi-abi-json` when the C ABI
+   changed (`include/anole.abi.json` is checked fresh by `capi-test`).
 2. Make sure CI is green on the commit, including the `consumer` job, which
    builds a fresh project that adds Anole with `zig fetch --save`.
 3. Tag it `vX.Y.Z` and push the tag. Users then add it with

@@ -25,17 +25,20 @@ const Cipher = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 const base64url = std.base64.url_safe_no_pad;
 const log = std.log.scoped(.anole_session);
 
-/// The session cookie's attributes (`Config.cookie_opts`), with secure
+/// The session cookie's attributes (`Options.cookie_opts`), with secure
 /// defaults for every field.
 pub const CookieOpts = dusty.SessionCookieOpts;
 
-/// The cookie encryption key's length in bytes (32), for `Config.key`.
+/// The cookie encryption key's length in bytes (32), for `Options.key`.
 pub const key_length = Cipher.key_length;
 
 /// Where server-side sessions live.
 pub const Store = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Its calls never wait (memory only): routes registered `no_wait` may
+    /// sit behind a session middleware that uses it.
+    never_waits: bool = false,
 
     /// What a store implements. `update` and `touch` must not bring back a
     /// session that is gone: a request still running when the session was
@@ -110,20 +113,15 @@ pub const MemoryStore = struct {
         node: std.DoublyLinkedList.Node = .{},
     };
 
-    /// `initOptions`' settings.
+    /// `init`'s settings.
     pub const Options = struct {
         /// Sessions kept at most; past it, the one written longest ago is
         /// dropped (its user is signed out), with a warning in the log.
         max_entries: usize = 100_000,
     };
 
-    /// An empty store with the default `Options`.
-    pub fn init(gpa: std.mem.Allocator, io: std.Io) MemoryStore {
-        return initOptions(gpa, io, .{});
-    }
-
-    /// An empty store.
-    pub fn initOptions(gpa: std.mem.Allocator, io: std.Io, options: Options) MemoryStore {
+    /// An empty store: `MemoryStore.init(gpa, io, .{})`.
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, options: MemoryStore.Options) MemoryStore {
         return .{ .gpa = gpa, .io = io, .max_entries = @max(1, options.max_entries) };
     }
 
@@ -134,10 +132,10 @@ pub const MemoryStore = struct {
         self.entries.deinit(self.gpa);
     }
 
-    /// The store interface for `Config.store`; `self` must outlive the
+    /// The store interface for `Options.store`; `self` must outlive the
     /// middleware.
     pub fn store(self: *MemoryStore) Store {
-        return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .destroy = destroy, .update = update, .touch = touch } };
+        return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .destroy = destroy, .update = update, .touch = touch }, .never_waits = true };
     }
 
     /// How many sessions are kept now, expired ones not yet swept included.
@@ -269,7 +267,7 @@ pub const RedisStore = if (features.redis) struct {
     /// For the scratch memory of a save or destroy.
     gpa: std.mem.Allocator,
 
-    /// The store interface for `Config.store`; `self` must outlive the
+    /// The store interface for `Options.store`; `self` must outlive the
     /// middleware.
     pub fn store(self: *@This()) Store {
         return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .destroy = destroy, .update = update, .touch = touch } };
@@ -328,7 +326,7 @@ pub const RedisStore = if (features.redis) struct {
 /// `Middleware` settings. Cookie mode (no `store`) needs `key`, and
 /// `Middleware.init` refuses to start without one; with `store`, `key` is
 /// unused.
-pub const Config = struct {
+pub const Options = struct {
     /// Server-side store; null keeps the session in an encrypted cookie.
     store: ?Store = null,
     /// The cookie encryption key, required in cookie mode: 32 random bytes
@@ -345,10 +343,10 @@ pub const Config = struct {
     cookie_name: []const u8 = "anole_session",
     /// How long a session lives without being touched; each response that
     /// carries it renews it.
-    ttl_seconds: u32 = 24 * 3600,
+    ttl: std.Io.Duration = .fromSeconds(24 * 3600),
     /// The cookie's attributes: path `/`, `HttpOnly`, `Secure` and
     /// `SameSite=Lax` by default, each kept unless set here (`.{ .same_site =
-    /// .none }` changes only that one). `Max-Age` comes from `ttl_seconds`.
+    /// .none }` changes only that one). `Max-Age` comes from `ttl`.
     cookie_opts: CookieOpts = .{},
 };
 
@@ -379,8 +377,8 @@ pub fn regenerate(req: *dusty.Request) error{ SessionFull, InvalidSessionData }!
 
 /// What `Middleware.init` refuses: cookie mode without a usable key, and
 /// a cookie name whose prefix `cookie_opts` does not satisfy.
-pub const ConfigError = error{
-    /// Cookie mode (no `Config.store`) with `Config.key` null or all
+pub const OptionsError = error{
+    /// Cookie mode (no `Options.store`) with `Options.key` null or all
     /// zeros: such cookies could be forged and read by anyone.
     SessionKeyMissing,
     /// A `__Host-` name without `Secure`, `Path=/` and no `Domain`, or a
@@ -390,7 +388,7 @@ pub const ConfigError = error{
 
 /// The session middleware: `app.use(try anole.session.Middleware.init(config))`.
 pub const Middleware = struct {
-    config: Config,
+    config: Options,
     /// The cookie key, checked by `init` (cookie mode only).
     key: [key_length]u8,
 
@@ -405,21 +403,27 @@ pub const Middleware = struct {
     /// how to fix it) when `config.key` is null or all zeros. It fails with
     /// `error.CookiePrefixMismatch` for a `__Host-`/`__Secure-` name that
     /// `cookie_opts` does not allow.
-    pub fn init(config: Config) ConfigError!Middleware {
+    pub fn init(config: Options) OptionsError!Middleware {
         config.cookie_opts.checkPrefix(config.cookie_name) catch |err| {
             log.err("anole.session: a __Host- cookie needs Secure, Path=/ and no Domain; a __Secure- one needs Secure", .{});
             return err;
         };
         if (config.store != null) return .{ .config = config, .key = @splat(0) };
         const key = cookieKey(config.key) orelse {
-            log.err("anole.session: cookie sessions need Config.key, 32 random bytes (not all zeros) from your secret store and the same on every node " ++
-                "(anole.session.keyFromBase64 reads one), or a Config.store; anole.session.devKey(io) makes one for local development", .{});
+            log.err("anole.session: cookie sessions need Options.key, 32 random bytes (not all zeros) from your secret store and the same on every node " ++
+                "(anole.session.keyFromBase64 reads one), or a Options.store; anole.session.devKey(io) makes one for local development", .{});
             return error.SessionKeyMissing;
         };
         return .{ .config = config, .key = key };
     }
 
-    pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
+    /// Cookie sessions and a memory store never wait; another store may.
+    pub fn noWait(self: *const Middleware) bool {
+        const store = self.config.store orelse return true;
+        return store.never_waits;
+    }
+
+    pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         var id: ?[]const u8 = null;
         if (req.cookies().get(self.config.cookie_name)) |raw| {
             self.load(req, raw, &id) catch |err| switch (err) {
@@ -429,7 +433,7 @@ pub const Middleware = struct {
             };
         }
 
-        try executor.next();
+        try next.call();
 
         if (!req.session.modified and req.session.len == 0) return;
         const fresh = req.session.get(regenerate_key) != null;
@@ -466,8 +470,8 @@ pub const Middleware = struct {
             if (self.config.store) |store| if (id) |i| try store.destroy(i);
             return res.setCookie(self.config.cookie_name, "", self.config.cookie_opts.withMaxAge(.zero));
         }
-        const opts = self.config.cookie_opts.withMaxAge(.fromSeconds(self.config.ttl_seconds));
-        const ttl = self.config.ttl_seconds;
+        const opts = self.config.cookie_opts.withMaxAge(self.config.ttl);
+        const ttl: u32 = @intCast(std.math.clamp(self.config.ttl.toSeconds(), 0, std.math.maxInt(u32)));
         if (self.config.store) |store| {
             if (fresh) if (id) |old| try store.destroy(old);
             if (id != null and !fresh) {
@@ -484,14 +488,14 @@ pub const Middleware = struct {
             }
             // A new id, which only a cookie can hand out: none is stored
             // once the response has started.
-            if (res.headers_written) return error.HeadersAlreadySent;
+            if (res.headersSent()) return error.HeadersAlreadySent;
             const session_id = try newId(req.arena, req.io);
             try store.save(session_id, try serialize(req.arena, &req.session), ttl);
             return res.setCookie(self.config.cookie_name, session_id, opts);
         }
         const data = try serialize(req.arena, &req.session);
         const plain = try req.arena.alloc(u8, 8 + data.len);
-        std.mem.writeInt(i64, plain[0..8], std.Io.Clock.real.now(req.io).toSeconds() + self.config.ttl_seconds, .little);
+        std.mem.writeInt(i64, plain[0..8], std.Io.Clock.real.now(req.io).toSeconds() + self.config.ttl.toSeconds(), .little);
         @memcpy(plain[8..], data);
         const sealed = try seal(req.arena, req.io, self.key, self.config.cookie_name, plain);
         const encoded = try req.arena.alloc(u8, base64url.Encoder.calcSize(sealed.len));
@@ -511,7 +515,7 @@ fn cookieKey(key: ?[key_length]u8) ?[key_length]u8 {
 ///
 ///     app.use(try anole.session.Middleware.init(.{ .key = anole.session.devKey(app.io()) }));
 pub fn devKey(io: std.Io) [key_length]u8 {
-    log.warn("anole.session: using a random development key; sessions end on restart and differ between nodes. Set Config.key from your secret store in production", .{});
+    log.warn("anole.session: using a random development key; sessions end on restart and differ between nodes. Set Options.key from your secret store in production", .{});
     var key: [key_length]u8 = undefined;
     // From the operating system, or not at all: a key from a weaker
     // source would make every cookie forgeable.
@@ -619,7 +623,7 @@ test "Middleware.init: cookie mode needs a key that is not all zeros" {
     try std.testing.expect(cookieKey(almost) != null);
     // A key is enough for cookie mode, and a store needs none.
     _ = try Middleware.init(.{ .key = almost });
-    var mem = MemoryStore.init(std.testing.allocator, std.testing.io);
+    var mem = MemoryStore.init(std.testing.allocator, std.testing.io, .{});
     defer mem.deinit();
     _ = try Middleware.init(.{ .store = mem.store() });
 }
@@ -673,7 +677,7 @@ test "MemoryStore: capped at max_entries, and update/touch never bring a session
     const level = std.testing.log_level;
     std.testing.log_level = .err; // the "store full" warning is expected
     defer std.testing.log_level = level;
-    var mem = MemoryStore.initOptions(std.testing.allocator, std.testing.io, .{ .max_entries = 3 });
+    var mem = MemoryStore.init(std.testing.allocator, std.testing.io, .{ .max_entries = 3 });
     defer mem.deinit();
     const s = mem.store();
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -696,7 +700,7 @@ test "MemoryStore: capped at max_entries, and update/touch never bring a session
 }
 
 test "regenerate drops the CSRF token, and __Host- names are checked" {
-    var req: dusty.Request = .{ .arena = std.testing.allocator, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = std.testing.allocator, ._parser = undefined, ._transport = undefined };
     try req.session.set(csrf_key, "old-token");
     try req.session.set("user", "alice");
     try regenerate(&req);
@@ -709,7 +713,7 @@ test "regenerate drops the CSRF token, and __Host- names are checked" {
     try std.testing.expectError(error.CookiePrefixMismatch, opts.checkPrefix("__Host-s"));
 }
 
-test "Config: setting one cookie_opts field keeps the secure defaults of the others" {
+test "Options: setting one cookie_opts field keeps the secure defaults of the others" {
     const mw = try Middleware.init(.{ .key = @splat(1), .cookie_opts = .{ .same_site = .strict } });
     try std.testing.expect(mw.config.cookie_opts.http_only);
     try std.testing.expect(mw.config.cookie_opts.secure);
@@ -717,7 +721,7 @@ test "Config: setting one cookie_opts field keeps the secure defaults of the oth
 }
 
 test "MemoryStore: expired sessions are swept as new ones come in" {
-    var mem = MemoryStore.init(std.testing.allocator, std.testing.io);
+    var mem = MemoryStore.init(std.testing.allocator, std.testing.io, .{});
     defer mem.deinit();
     const s = mem.store();
     var buf: [16]u8 = undefined;

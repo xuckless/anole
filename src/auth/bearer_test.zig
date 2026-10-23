@@ -30,10 +30,10 @@ const FakeSession = struct {
     after: *[64]u8,
     after_len: *usize,
 
-    pub fn execute(self: *const FakeSession, req: *dusty.Request, _: *dusty.Response, executor: anytype) !void {
+    pub fn execute(self: *const FakeSession, req: *dusty.Request, _: *dusty.Response, next: anytype) !void {
         try req.session.set("user", "from-session");
         req.session.modified = false;
-        try executor.next();
+        try next.call();
         const v = req.session.get("user") orelse "(none)";
         @memcpy(self.after[0..v.len], v);
         self.after_len.* = v.len;
@@ -156,4 +156,18 @@ test "RequireJwt: RFC 6750 answers, claims in the locals only, required claims, 
     resp = try exchange(io, port, "/mapped/me", try std.fmt.allocPrint(arena, "Bearer {s}", .{narrow_role}), &out);
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 403"));
     try std.testing.expect(has(resp, "WWW-Authenticate: Bearer error=\"insufficient_scope\", scope=\"notes:read notes:write\"\r\n"));
+}
+
+test "RequireJwt.noWait: static keys yes, a keyring no, a hook no" {
+    const keys: []const jws.Key = &.{};
+    const static_mw = bearer.RequireJwt.init(.{ .static = keys }, .{}, .{});
+    try std.testing.expect(static_mw.noWait());
+    var ring: @import("keyring.zig").Keyring = undefined;
+    const ring_mw = bearer.RequireJwt.init(.{ .keyring = &ring }, .{}, .{});
+    try std.testing.expect(!ring_mw.noWait());
+    const Hooks = struct {
+        fn check(_: ?*anyopaque, _: *dusty.Request, _: *const jws.Verified) anyerror!void {}
+    };
+    const hooked = bearer.RequireJwt.init(.{ .static = keys }, .{}, .{ .hook = .{ .func = Hooks.check } });
+    try std.testing.expect(!hooked.noWait());
 }

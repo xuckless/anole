@@ -33,9 +33,10 @@ const App = struct {
 const chat_idle: std.Io.Duration = .fromSeconds(300);
 
 fn versionName(ws: *const websocket.Socket) []const u8 {
-    return switch (ws.conn) {
-        .h1 => "HTTP/1.1",
-        .h2 => "HTTP/2",
+    return switch (ws.httpVersion()) {
+        .http1 => "HTTP/1.1",
+        .http2 => "HTTP/2",
+        .http3 => "HTTP/3",
     };
 }
 
@@ -62,7 +63,7 @@ fn chat(app: *App, ws: *websocket.Socket, req: *anole.Request) !void {
     while (true) {
         // An idle limit: the timer restarts before every wait. When it
         // runs out the connection is closed and `next` returns null.
-        req.setTimeout(.{ .duration = .{ .raw = chat_idle, .clock = .awake } });
+        req.setTimeout(chat_idle);
         const msg = try ws.next() orelse return;
         _ = app.rooms.broadcast(room, msg.type, msg.data, null);
     }
@@ -107,7 +108,7 @@ pub fn main(init: std.process.Init) !void {
 
     // The rooms take the runtime's Io from the first socket that joins, so
     // they can be made before the server.
-    var state: App = .{ .rooms = .init(init.gpa) };
+    var state: App = .{ .rooms = .init(init.gpa, .{}) };
     defer state.rooms.deinit();
     var app = try anole.Server(App).init(init.gpa, .{
         // HTTP/1.1, plus HTTP/2 (h2c) for clients that open with its preface.
@@ -116,11 +117,11 @@ pub fn main(init: std.process.Init) !void {
         .https = if (anole.features.tls != .none) .{ .port = tls_port, .cert = .dev_self_signed } else null,
         // Open sockets hold a graceful shutdown until they close or this
         // runs out (30 s by default); then they are cut.
-        .server = .{ .timeout = .{ .shutdown = .fromSeconds(5) } },
+        .timeouts = .{ .shutdown = .fromSeconds(5) },
     }, &state);
     defer app.deinit();
 
-    app.use(anole.middleware.Logger.init());
+    app.use(anole.middleware.Logger.init(.{}));
     app.get("/", page);
     // A plain HTTP request to either gets 426 Upgrade Required. A message
     // bigger than 1 MiB is refused with close code 1009.

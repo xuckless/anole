@@ -109,7 +109,7 @@ pub const EngineState = struct {
     health_live: bool = false,
     pending: std.ArrayList(Pending) = .empty,
 
-    const Pending = struct { name: []u8, status: c_int };
+    const Pending = struct { name: []u8, status: u32 };
 };
 
 // ---------------------------------------------------------------------------
@@ -349,46 +349,53 @@ pub fn buildRoutes(e: *Engine, app: *anole.App, global_ok: bool) !void {
         x.grpc.len = 0;
     }
     var bindings: std.ArrayList(*Binding) = .empty;
-    for (e.grpc.services) |*svc| for (svc.methods) |*m| {
-        const whole = m.kind == .unary or m.kind == .server_streaming;
-        m.detachable = whole and svc.cfg.no_wait and global_ok;
-        const route_options: dusty.RouteOptions = .{ .data = m, .no_wait = m.detachable };
-        app.router.addRouteWith(.post, m.path, handler, route_options);
-        if (noSideEffects(m)) app.router.addRouteWith(.get, m.path, handler, route_options);
-        // google.api.http, with descriptors.
-        if (!svc.cfg.transcode or m.input == null) continue;
-        const sch = e.grpc.schema.?;
-        const desc = sch.service(svc.name).?;
-        const dm = for (desc.methods) |*d| {
-            if (std.mem.eql(u8, d.name, m.name)) break d;
-        } else unreachable;
-        for (dm.rules) |rule| {
-            const b = try a.create(Binding);
-            const where = try std.fmt.allocPrint(a, "{s}.{s} ({s})", .{ svc.name, m.name, rule.pattern });
-            b.* = .{
-                .method = m,
-                .rule = rule,
-                .template = transcode.Template.parse(rule.pattern) catch {
-                    log.err("google.api.http on {s}: invalid path template", .{where});
+    for (e.grpc.services) |*svc| {
+        // The service's own middleware, after the global ones.
+        var chain: std.ArrayList(http.Middleware(void)) = .empty;
+        for (svc.cfg.middleware) |mw| try chain.append(a, try config_mod.middleware(app, a, mw));
+        const group = app.with(chain.items);
+        const svc_ok = global_ok and config_mod.neverWaits(svc.cfg.middleware);
+        for (svc.methods) |*m| {
+            const whole = m.kind == .unary or m.kind == .server_streaming;
+            m.detachable = whole and svc.cfg.no_wait and svc_ok;
+            const route_options: dusty.RouteOptions = .{ .data = m, .no_wait = m.detachable };
+            group.inner.addRouteWith(.post, m.path, handler, route_options);
+            if (noSideEffects(m)) group.inner.addRouteWith(.get, m.path, handler, route_options);
+            // google.api.http, with descriptors.
+            if (!svc.cfg.transcode or m.input == null) continue;
+            const sch = e.grpc.schema.?;
+            const desc = sch.service(svc.name).?;
+            const dm = for (desc.methods) |*d| {
+                if (std.mem.eql(u8, d.name, m.name)) break d;
+            } else unreachable;
+            for (dm.rules) |rule| {
+                const b = try a.create(Binding);
+                const where = try std.fmt.allocPrint(a, "{s}.{s} ({s})", .{ svc.name, m.name, rule.pattern });
+                b.* = .{
+                    .method = m,
+                    .rule = rule,
+                    .template = transcode.Template.parse(rule.pattern) catch {
+                        log.err("google.api.http on {s}: invalid path template", .{where});
+                        return error.InvalidTemplate;
+                    },
+                    .options = m.options,
+                };
+                b.options.data = b;
+                var why_buf: [256]u8 = undefined;
+                var why: std.Io.Writer = .fixed(&why_buf);
+                schema.checkRule(m.input.?, m.output.?, rule, &b.template, where, &why) catch {
+                    log.err("{s}", .{why.buffered()});
                     return error.InvalidTemplate;
-                },
-                .options = m.options,
-            };
-            b.options.data = b;
-            var why_buf: [256]u8 = undefined;
-            var why: std.Io.Writer = .fixed(&why_buf);
-            schema.checkRule(m.input.?, m.output.?, rule, &b.template, where, &why) catch {
-                log.err("{s}", .{why.buffered()});
-                return error.InvalidTemplate;
-            };
-            for (bindings.items) |other| if (other.rule.method == rule.method and other.template.sameShape(&b.template)) {
-                log.err("google.api.http on {s}: {t} matches the same paths as {s}.{s} ({s})", .{ where, rule.method, other.method.service.name, other.method.name, other.rule.pattern });
-                return error.InvalidTemplate;
-            };
-            try bindings.append(a, b);
-            transcode.addBinding(void, app.router, rule.method, &b.template, serveTranscoded, &b.options, where, m.detachable and m.kind == .unary);
+                };
+                for (bindings.items) |other| if (other.rule.method == rule.method and other.template.sameShape(&b.template)) {
+                    log.err("google.api.http on {s}: {t} matches the same paths as {s}.{s} ({s})", .{ where, rule.method, other.method.service.name, other.method.name, other.rule.pattern });
+                    return error.InvalidTemplate;
+                };
+                try bindings.append(a, b);
+                transcode.addBinding(void, group.inner, rule.method, &b.template, serveTranscoded, &b.options, where, m.detachable and m.kind == .unary);
+            }
         }
-    };
+    }
     if (cfg.health) {
         const health = app.grpcHealth();
         for (e.grpc.services) |svc| try health.set(svc.name, .SERVING);
@@ -496,7 +503,8 @@ fn readUnary(call: *Call, m: *const Method, whole: bool) ![]const u8 {
         }
     } else {
         var in_buf: [16 * 1024]u8 = undefined;
-        var body = try call.req.reader(&in_buf);
+        // Each message is bounded by max_message_size; no lifetime cap.
+        var body = try call.req.readerLimited(&in_buf, null);
         const p = (try serving.readPayload(call, &body, false)) orelse
             return call.fail(.unimplemented, "a unary call needs one request message");
         defer p.deinit();
@@ -525,6 +533,9 @@ fn start(x: *Exec, m: *const Method, call: *Call, message: []const u8, timeout_n
     const e = x.engine;
     const req = call.req;
     const res = call.res;
+    if (e.abandon.load(.acquire)) {
+        return serving.finish(call, call.fail(.unavailable, "the server is stopping"));
+    }
     if (detach_wanted and x.ring.full()) {
         _ = e.busy_count.fetchAdd(1, .monotonic);
         return serving.finish(call, call.fail(.unavailable, "the application is behind"));
@@ -587,9 +598,16 @@ fn start(x: *Exec, m: *const Method, call: *Call, message: []const u8, timeout_n
     var canceled = false;
     while (!x.ring.push(.{ .handle = x.handleOf(si, gen), .rec = null })) {
         std.debug.assert(d == null);
-        zio.yield() catch {
-            canceled = true;
-            break;
+        x.waitRoom(0, g.deadline) catch |err| switch (err) {
+            error.Canceled => {
+                canceled = true;
+                break;
+            },
+            error.Timeout => {
+                // The call's deadline passed while the consumer was behind.
+                canceled = true;
+                break;
+            },
         };
     }
     x.consumer.?.wake();
@@ -605,7 +623,8 @@ fn start(x: *Exec, m: *const Method, call: *Call, message: []const u8, timeout_n
     var reader: std.Io.Group = .init;
     defer reader.cancel(r.io);
     if (m.kind == .client_streaming or m.kind == .bidi_streaming) {
-        body = r.reader(&in_buf) catch |err| {
+        // Each message is bounded by max_message_size; no lifetime cap.
+        body = r.readerLimited(&in_buf, null) catch |err| {
             g.read_error = err;
             return wait(x, si, gen, call, canceled);
         };
@@ -624,7 +643,7 @@ fn collectMetadata(req: *http.Request) ![]const [2][]const u8 {
     const out = try req.arena.alloc([2][]const u8, n);
     var k: usize = 0;
     for (req.headers.keys[0..n], req.headers.values[0..n]) |name_in, value| {
-        if (isTransportHeader(name_in)) continue;
+        if (md_keys.isTransportHeader(name_in)) continue;
         var name = name_in;
         for (name_in) |ch| if (std.ascii.isUpper(ch)) {
             name = try std.ascii.allocLowerString(req.arena, name_in);
@@ -643,20 +662,6 @@ fn collectMetadata(req: *http.Request) ![]const [2][]const u8 {
         k += 1;
     }
     return out[0..k];
-}
-
-/// Headers the protocols use themselves, and hop-by-hop ones: not metadata.
-fn isTransportHeader(name: []const u8) bool {
-    if (name.len == 0 or name[0] == ':') return true;
-    const list = [_][]const u8{
-        "content-type",             "te",                 "grpc-timeout",             "grpc-encoding",
-        "grpc-accept-encoding",     "content-length",     "content-encoding",         "accept-encoding",
-        "connect-protocol-version", "connect-timeout-ms", "connect-content-encoding", "connect-accept-encoding",
-        "connection",               "keep-alive",         "transfer-encoding",        "upgrade",
-        "host",
-    };
-    for (list) |h| if (std.ascii.eqlIgnoreCase(name, h)) return true;
-    return false;
 }
 
 /// The call's task waits for the answer, and writes it.
@@ -679,8 +684,18 @@ fn wait(x: *Exec, si: u32, gen: u32, call: *Call, canceled_in: bool) anyerror!vo
             },
             .queued, .out => {
                 if (canceled or s.grpc.read_error != null) {
+                    // Why it is over, for the consumer that saw it.
+                    var reason: u16 = abi.ABORT_CLIENT;
+                    var status: u16 = 0;
+                    if (s.grpc.read_error != null) {
+                        reason = abi.ABORT_BODY;
+                        status = @intCast(@backingInt(call.status));
+                    } else if (call.deadlineExceeded()) {
+                        reason = abi.ABORT_DEADLINE;
+                        status = abi.GRPC_STATUS_DEADLINE_EXCEEDED;
+                    } else reason = e.clientReason();
                     if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) == null) {
-                        if (stateOf(w) == .out) x.postEvent(.abort, x.handleOf(si, gen));
+                        if (stateOf(w) == .out and !s.abandoned) x.postAbort(x.handleOf(si, gen), reason, status);
                         break .expired;
                     }
                     continue;
@@ -809,16 +824,11 @@ fn readFailed(x: *Exec, si: u32, gen: u32, err: anyerror) void {
 }
 
 fn newRecord(size: usize, typ: abi.EventType, handle: u64) ![]align(8) u8 {
-    const n = abi.alignUp(size);
-    const rec = try gpa.alignedAlloc(u8, .@"8", n);
-    @memset(rec[@sizeOf(abi.Event)..], 0);
-    const ev: *abi.Event = @ptrCast(rec.ptr);
-    ev.* = .{ .type = @backingInt(typ), .len = @intCast(n), .handle = handle };
-    return rec;
+    return engine.newRecord(size, typ, handle);
 }
 
 fn freeRecord(rec: []align(8) u8) void {
-    gpa.free(rec);
+    engine.freeRecord(rec.ptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -979,7 +989,7 @@ fn stream(x: *Exec, si: u32, gen: u32, call: *Call) anyerror!void {
 fn streamGone(x: *Exec, si: u32, gen: u32) void {
     const s = &x.slots[si];
     x.closePipe(&s.out, gen, si);
-    x.postEvent(.abort, x.handleOf(si, gen));
+    x.postAbort(x.handleOf(si, gen), x.engine.clientReason(), 0);
 }
 
 /// A detached call answered (from the capi task's done list).
@@ -993,7 +1003,7 @@ pub fn finishDetached(x: *Exec, si: u32) void {
         // A task writes the stream; the deadline stays watched.
         const spawned = if (d.attach()) |group| placement.concurrent(group, x.engine.io, .local, attachedTask, .{ x, si, gen }) else error.ConnectionClosed;
         spawned catch {
-            x.postEvent(.abort, x.handleOf(si, gen));
+            x.postAbort(x.handleOf(si, gen), abi.ABORT_CLIENT, 0);
             d.finish(error.ConnectionResetByPeer);
             x.release(si);
         };
@@ -1050,22 +1060,65 @@ pub fn sweep(x: *Exec, now: i96) ?i96 {
 }
 
 fn expire(x: *Exec, si: u32, w: u64) void {
+    endDetached(x, si, w, false);
+}
+
+/// A detached call ended by the sweeper: DEADLINE_EXCEEDED at its deadline
+/// (the consumer hears ABORT), or UNAVAILABLE when the server is being
+/// destroyed (it hears nothing more).
+fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
     const s = &x.slots[si];
     const gen = genOf(w);
     if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) != null) return;
-    if (stateOf(w) == .out) x.postEvent(.abort, x.handleOf(si, gen));
-    _ = x.engine.expired_count.fetchAdd(1, .monotonic);
+    if (!abandoning) {
+        if (stateOf(w) == .out) x.postAbort(x.handleOf(si, gen), abi.ABORT_DEADLINE, abi.GRPC_STATUS_DEADLINE_EXCEEDED);
+        _ = x.engine.expired_count.fetchAdd(1, .monotonic);
+    }
     heapRemove(x, si);
     const call = s.grpc.call;
     if (s.detached) |d| {
         s.detached = null;
         var buf: std.ArrayList(u8) = .empty;
         call.impl.buffer = &buf;
-        const result = serving.finish(call, call.fail(.deadline_exceeded, "deadline exceeded"));
+        const result = if (abandoning)
+            serving.finish(call, call.fail(.unavailable, "the server is stopping"))
+        else
+            serving.finish(call, call.fail(.deadline_exceeded, "deadline exceeded"));
         call.impl.buffer = null;
         d.finish(result);
     }
     x.release(si);
+}
+
+/// `destroy` on a server not drained: this call is ended with UNAVAILABLE
+/// (from the capi task); the consumer hears nothing more.
+pub fn abandon(x: *Exec, si: u32, w: u64) void {
+    const s = &x.slots[si];
+    switch (stateOf(w)) {
+        .queued, .out => {
+            if (s.orphan) {
+                if (s.word.cmpxchgStrong(w, pack(genOf(w), .expired), .acq_rel, .acquire) != null) return;
+                heapRemove(x, si);
+                x.release(si);
+            } else if (s.detached != null) {
+                endDetached(x, si, w, true);
+            } else if (!s.abandoned) {
+                s.abandoned = true;
+                s.grpc.call.status = .unavailable;
+                s.grpc.call.status_message = "the server is stopping";
+                s.grpc.read_error = error.GrpcStatus;
+                s.event.set(x.engine.io);
+            }
+        },
+        .streaming => if (!s.abandoned) {
+            s.abandoned = true;
+            s.grpc.call.status = .unavailable;
+            s.grpc.call.status_message = "the server is stopping";
+            s.grpc.read_error = error.GrpcStatus;
+            s.event.set(x.engine.io);
+        },
+        else => {},
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,16 +1130,18 @@ pub fn recordSize(s: *const Slot) usize {
     var n: usize = @sizeOf(abi.GrpcCallEvent) + g.metadata.len * 2 * @sizeOf(abi.Span);
     n += g.method.path.len + g.message.len + s.remote_len + req.listener.name.len + req.id.len + s.claims.len;
     for (g.metadata) |kv| n += kv[0].len + kv[1].len;
+    if (req.peerCertificate()) |der| n += der.len;
     return abi.alignUp(n);
 }
 
-pub fn encodeRecord(s: *const Slot, handle: u64, out: []u8) usize {
+pub fn encodeRecord(s: *const Slot, handle: u64, out: []u8, now: i96) usize {
     const g = &s.grpc;
     const m = g.method;
     const req = s.req;
     const size = out.len;
-    const spans: [*]align(1) abi.Span = @ptrCast(out[@sizeOf(abi.GrpcCallEvent)..].ptr);
-    var pos: usize = @sizeOf(abi.GrpcCallEvent) + g.metadata.len * 2 * @sizeOf(abi.Span);
+    const metadata_off: usize = @sizeOf(abi.GrpcCallEvent);
+    const spans: [*]align(1) abi.Span = @ptrCast(out[metadata_off..].ptr);
+    var pos: usize = metadata_off + g.metadata.len * 2 * @sizeOf(abi.Span);
     const put = struct {
         fn f(buf: []u8, p: *usize, bytes: []const u8) abi.Span {
             const at = p.*;
@@ -1105,12 +1160,14 @@ pub fn encodeRecord(s: *const Slot, handle: u64, out: []u8) usize {
     const listener = put(out, &pos, req.listener.name);
     const id = put(out, &pos, req.id);
     const claims = put(out, &pos, s.claims);
+    var peer_cert: abi.Span = .{};
+    if (req.peerCertificate()) |der| peer_cert = put(out, &pos, der);
     std.debug.assert(abi.alignUp(pos) == size);
     @memset(out[pos..size], 0);
-    const timeout_us: i64 = if (g.deadline) |dl| blk: {
-        const now = std.Io.Clock.awake.now(m.engine.io).nanoseconds;
-        break :blk @intCast(@max(@divTrunc(dl - now, std.time.ns_per_us), 0));
-    } else -1;
+    const timeout_us: i64 = if (g.deadline) |dl|
+        @intCast(@max(@divTrunc(dl - now, std.time.ns_per_us), 0))
+    else
+        -1;
     const rec: *align(1) abi.GrpcCallEvent = @ptrCast(out.ptr);
     rec.* = .{
         .ev = .{ .type = @backingInt(abi.EventType.grpc_call), .len = @intCast(size), .handle = handle },
@@ -1118,7 +1175,7 @@ pub fn encodeRecord(s: *const Slot, handle: u64, out: []u8) usize {
         .method_id = m.id,
         .kind = @backingInt(m.kind),
         .protocol = @backingInt(g.call.impl.protocol),
-        .flags = g.flags,
+        .flags = g.flags | if (peer_cert.len != 0) abi.GRPC_CALL_PEER_CERT else 0,
         .version = req.version_major * 10 + req.version_minor,
         .nmetadata = @intCast(g.metadata.len),
         .method = method,
@@ -1128,6 +1185,8 @@ pub fn encodeRecord(s: *const Slot, handle: u64, out: []u8) usize {
         .id = id,
         .claims = claims,
         .timeout_us = timeout_us,
+        .metadata_off = @intCast(metadata_off),
+        .peer_cert = peer_cert,
     };
     return size;
 }
@@ -1139,27 +1198,23 @@ pub fn encodeRecord(s: *const Slot, handle: u64, out: []u8) usize {
 /// (`grpc-*` but grpc-status-details-bin, `connect-*`, `trailer-*`, HTTP's
 /// framing), an ASCII value unless it is `-bin` (bytes, base64-encoded by
 /// Anole).
-fn checkMetadata(list: []const CHeader) error{Invalid}!void {
+fn checkMetadata(list: []const CHeader, place: md_keys.Place) error{Invalid}!void {
     for (list) |hd| {
         const name = hd.name.slice();
-        const value = hd.value.slice();
-        if (!md_keys.isValidKey(name)) return error.Invalid;
-        if (std.mem.startsWith(u8, name, "grpc-") and !std.mem.eql(u8, name, "grpc-status-details-bin")) return error.Invalid;
-        if (std.mem.startsWith(u8, name, "connect-") or std.mem.startsWith(u8, name, "trailer-")) return error.Invalid;
-        if (isTransportHeader(name)) return error.Invalid;
+        if (!md_keys.isSendableKey(name, place)) return error.Invalid;
         if (md_keys.isBinaryKey(name)) continue;
-        for (value) |ch| if (ch < 0x20 or ch > 0x7e) return error.Invalid;
+        if (!md_keys.isSendableValue(name, hd.value.slice())) return error.Invalid;
     }
 }
 
-fn slotOf(e: *Engine, hv: u64) ?struct { *Exec, *Slot, Handle } {
+fn slotOf(e: *Engine, hv: u64) engine.HandleError!struct { *Exec, *Slot, Handle } {
     return engine.slotOfKind(e, hv, .grpc_call);
 }
 
 /// `out` to `responding`; `error.Gone` when the call is over (or was never
 /// this), `error.State` when its answer is streaming.
 fn claim(e: *Engine, hv: u64) AnswerError!struct { *Exec, *Slot, Handle } {
-    const x, const s, const h = slotOf(e, hv) orelse return e.gone();
+    const x, const s, const h = slotOf(e, hv) catch |err| return e.badHandle(err);
     if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .responding), .acquire, .monotonic)) |w| {
         if (genOf(w) == h.gen and stateOf(w) == .streaming) return error.State;
         return e.gone();
@@ -1172,7 +1227,7 @@ fn unclaim(s: *Slot, h: Handle) void {
 }
 
 pub fn sendHeaders(e: *Engine, hv: u64, md: []const CHeader) AnswerError!void {
-    try checkMetadata(md);
+    try checkMetadata(md, .header);
     _, const s, const h = try claim(e, hv);
     defer unclaim(s, h);
     if (s.grpc.headers_set or s.grpc.has_message) return error.State;
@@ -1183,7 +1238,10 @@ pub fn sendHeaders(e: *Engine, hv: u64, md: []const CHeader) AnswerError!void {
 
 /// `ANOLE_BUSY` is `true`.
 pub fn send(e: *Engine, hv: u64, msg: []const u8, borrow: bool, finish_ok: bool) AnswerError!bool {
-    _, const s0, const h0 = slotOf(e, hv) orelse return e.gone();
+    const x0, const s0, const h0 = slotOf(e, hv) catch |err| return e.badHandle(err);
+    // The SENT record first: a call that fails takes nothing.
+    const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(msg) else null;
+    errdefer if (sent) |r| engine.freeRecord(r.ptr);
     const kind = s0.grpc.method.kind;
     if (kind == .unary or kind == .client_streaming) {
         const x, const s, const h = try claim(e, hv);
@@ -1193,6 +1251,7 @@ pub fn send(e: *Engine, hv: u64, msg: []const u8, borrow: bool, finish_ok: bool)
         }
         if (borrow) {
             s.borrowed = msg;
+            s.borrowed_sent = sent;
         } else {
             if (msg.len > std.math.maxInt(u32)) {
                 unclaim(s, h);
@@ -1219,10 +1278,11 @@ pub fn send(e: *Engine, hv: u64, msg: []const u8, borrow: bool, finish_ok: bool)
     const h = h0;
     const owned: ?[]u8 = if (borrow or msg.len == 0) null else try gpa.dupe(u8, msg);
     errdefer if (owned) |o| gpa.free(o);
+    // An empty message has nothing to read: a borrowed one is "sent" at once.
     const chunk: Chunk = if (msg.len == 0)
         .{ .data = "", .owner = .request }
     else
-        .{ .data = owned orelse msg, .owner = if (borrow) .consumer else .pipe };
+        .{ .data = owned orelse msg, .owner = if (borrow) .consumer else .pipe, .sent = sent };
     if (s.out.gen != h.gen) {
         // The first message: the answer starts streaming.
         const x, _, _ = try claim(e, hv);
@@ -1240,6 +1300,7 @@ pub fn send(e: *Engine, hv: u64, msg: []const u8, borrow: bool, finish_ok: bool)
         if (finish_ok) s.out.ended = true;
         s.out.release();
         engine.handBack(x, s, h, .streaming);
+        if (msg.len == 0) if (sent) |r| x.postSentRec(hv, r);
         return false;
     }
     s.out.acquire();
@@ -1261,13 +1322,14 @@ pub fn send(e: *Engine, hv: u64, msg: []const u8, borrow: bool, finish_ok: bool)
     s.out.exec_waiting = false;
     s.out.release();
     if (wake) s.event.set(e.io);
+    if (msg.len == 0) if (sent) |r| x0.postSentRec(hv, r);
     return busy and !finish_ok;
 }
 
 /// Waits (a blocking consumer thread) until the stream has room, then
 /// sends `msg` (copied).
 pub fn sendWait(e: *Engine, hv: u64, msg: []const u8, timeout_ms: i32) AnswerError!void {
-    _, const s, const h = slotOf(e, hv) orelse return e.gone();
+    _, const s, const h = slotOf(e, hv) catch |err| return e.badHandle(err);
     if (s.grpc.method.kind == .unary or s.grpc.method.kind == .client_streaming or s.out.gen != h.gen) {
         _ = try send(e, hv, msg, false, false);
         return;
@@ -1294,9 +1356,9 @@ pub fn sendWait(e: *Engine, hv: u64, msg: []const u8, timeout_ms: i32) AnswerErr
 
 pub fn finish(e: *Engine, hv: u64, code: u32, message: []const u8, trailers: []const CHeader) AnswerError!void {
     if (code > 16) return error.Invalid;
-    try checkMetadata(trailers);
+    try checkMetadata(trailers, .trailer);
     if (message.len > 64 * 1024) return error.Invalid;
-    _, const s0, const h0 = slotOf(e, hv) orelse return e.gone();
+    _, const s0, const h0 = slotOf(e, hv) catch |err| return e.badHandle(err);
     if (s0.out.gen == h0.gen) {
         // Streaming: the status goes after the messages.
         const s = s0;
@@ -1341,9 +1403,25 @@ fn storeStatus(s: *Slot, code: u32, message: []const u8, trailers: []const CHead
     s.grpc.code = @intCast(code);
 }
 
+/// `anole_handle_release` on a call: finishes it with UNKNOWN. A cleanup
+/// call: `error.Over` (not counted) when the call is already over.
+pub fn release(e: *Engine, hv: u64) AnswerError!void {
+    _, const s, const h = try slotOf(e, hv);
+    const w = s.word.load(.acquire);
+    if (genOf(w) != h.gen) return error.Over;
+    switch (stateOf(w)) {
+        .free, .expired, .done => return error.Over,
+        else => {},
+    }
+    finish(e, hv, abi.GRPC_STATUS_UNKNOWN, "Application error processing RPC", &.{}) catch |err| switch (err) {
+        error.Gone => return error.Over,
+        else => return err,
+    };
+}
+
 /// The consumer takes `n` more request messages.
 pub fn read(e: *Engine, hv: u64, n: u32) AnswerError!void {
-    _, const s, const h = slotOf(e, hv) orelse return e.gone();
+    _, const s, const h = slotOf(e, hv) catch |err| return e.badHandle(err);
     const w = s.word.load(.acquire);
     if (genOf(w) != h.gen) return e.gone();
     switch (stateOf(w)) {
@@ -1359,10 +1437,10 @@ pub fn read(e: *Engine, hv: u64, n: u32) AnswerError!void {
 // ---------------------------------------------------------------------------
 // Health
 
-pub fn healthSet(e: *Engine, service: []const u8, status: c_int) AnswerError!void {
+pub fn healthSet(e: *Engine, service: []const u8, status: u32) AnswerError!void {
     const cfg = e.config.grpc orelse return error.State;
     if (!cfg.health) return error.State;
-    if (status < abi.GRPC_HEALTH_UNKNOWN or status > abi.GRPC_HEALTH_NOT_SERVING) return error.Invalid;
+    if (status > abi.GRPC_HEALTH_NOT_SERVING) return error.Invalid;
     if (service.len > 255) return error.Invalid;
     const name = try gpa.dupe(u8, service);
     errdefer gpa.free(name);
@@ -1388,7 +1466,7 @@ pub fn healthSet(e: *Engine, service: []const u8, status: c_int) AnswerError!voi
 const HealthCmd = struct {
     cmd: Command = .{ .run = run },
     name: []u8,
-    status: c_int,
+    status: u32,
 
     fn run(c: *Command, x: *Exec) void {
         const self: *HealthCmd = @fieldParentPtr("cmd", c);

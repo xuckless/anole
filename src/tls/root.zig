@@ -83,7 +83,7 @@ pub const SelfSignedOptions = struct {
     /// subjectAltName entries, in OpenSSL config syntax.
     alt_names: []const u8 = "DNS:localhost,IP:127.0.0.1,IP:::1",
     /// How long the certificate is valid from now.
-    valid_for_seconds: i64 = 7 * 24 * 3600,
+    valid_for: std.Io.Duration = .fromSeconds(7 * 24 * 3600),
     /// P-256 is fast to make and to use; RSA-4096 is the heaviest key a
     /// handshake meets in practice (and takes a second or more to make).
     key: enum { p256, rsa4096 } = .p256,
@@ -136,7 +136,7 @@ pub fn selfSigned(gpa: std.mem.Allocator, opt: SelfSignedOptions) !Pem {
     if (c.X509_set_version(x, c.X509_VERSION_3) != 1 or
         c.BN_to_ASN1_INTEGER(bn, c.X509_get_serialNumber(x)) == null or
         c.X509_gmtime_adj(c.X509_getm_notBefore(x), -60) == null or
-        c.X509_gmtime_adj(c.X509_getm_notAfter(x), @intCast(opt.valid_for_seconds)) == null)
+        c.X509_gmtime_adj(c.X509_getm_notAfter(x), @intCast(opt.valid_for.toSeconds())) == null)
         return error.TlsCertificateFailed;
 
     var cn_buf: [256]u8 = undefined;
@@ -415,9 +415,16 @@ const Https = struct {
     rt: *zio.Runtime,
     io: std.Io,
     pem: Pem,
-    /// Holds cert.pem for the client's CA file (dusty's client reads its
+    /// Holds cert.pem for the client's CA file (the core's client reads its
     /// trust anchors from a file); the key never leaves memory.
     tmp: std.testing.TmpDir,
+    ca_buf: [160]u8 = undefined,
+
+    /// The path of `name` in `tmp`, relative to the working directory (the
+    /// settings take paths, not directory handles).
+    fn path(self: *const Https, buf: []u8, name: []const u8) []const u8 {
+        return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}/{s}", .{ self.tmp.sub_path, name }) catch unreachable;
+    }
 
     fn init() !Https {
         return initWith(.{});
@@ -441,13 +448,13 @@ const Https = struct {
         self.rt.deinit();
     }
 
-    fn caFile(self: *Https) dusty.TlsCa {
-        return .{ .file = .{ .path = "cert.pem", .dir = self.tmp.dir } };
+    fn caFile(self: *Https) dusty.Ca {
+        return .{ .file = self.path(&self.ca_buf, "cert.pem") };
     }
 };
 
 /// A blocking BoringSSL client over a plain socket, for tests that need to
-/// see what dusty's client hides. Run it off the runtime (`onThread`): its
+/// see what the core's client hides. Run it off the runtime (`onThread`): its
 /// I/O blocks.
 const RawClient = struct {
     fd: c_int,
@@ -538,7 +545,7 @@ test "TLS hello: HTTPS GET through dusty's seam, certificate verified, ALPN http
     defer server_future.cancel(io) catch {};
 
     var client_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(void), _io: std.Io, ca: dusty.TlsCa) !void {
+        fn run(s: *dusty.Server(void), _io: std.Io, ca: dusty.Ca) !void {
             try s.waitReady(_io);
             var client = dusty.Client.init(std.testing.allocator, _io, .{ .tls = .{ .ca = ca } });
             defer client.deinit();
@@ -580,19 +587,20 @@ test "TLS hello: a client that does not trust the certificate is refused" {
     var other = try selfSigned(std.testing.allocator, .{});
     defer other.deinit(std.testing.allocator);
     try h.tmp.dir.writeFile(io, .{ .sub_path = "other.pem", .data = other.cert });
+    var other_buf: [160]u8 = undefined;
 
     var client_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(void), _io: std.Io, dir: std.Io.Dir) !void {
+        fn run(s: *dusty.Server(void), _io: std.Io, other_path: []const u8) !void {
             try s.waitReady(_io);
             var client = dusty.Client.init(std.testing.allocator, _io, .{
-                .tls = .{ .ca = .{ .file = .{ .path = "other.pem", .dir = dir } } },
+                .tls = .{ .ca = .{ .file = other_path } },
             });
             defer client.deinit();
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
             try std.testing.expectError(error.CertificateIssuerNotFound, client.fetch(url, .{}));
         }
-    }.run, .{ &server, io, h.tmp.dir });
+    }.run, .{ &server, io, h.path(&other_buf, "other.pem") });
     try client_future.await(io);
 }
 
@@ -602,6 +610,8 @@ test "TLS hello: mutual TLS rejects a client without a certificate and accepts o
     const io = h.io;
     // dusty's client loads its certificate from files; this one is a test key.
     try h.tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = h.pem.key });
+    var cert_buf: [160]u8 = undefined;
+    var key_buf: [160]u8 = undefined;
 
     // The self-signed certificate is CA:TRUE, so it is the server identity,
     // the client identity and the CA that verifies both.
@@ -618,7 +628,7 @@ test "TLS hello: mutual TLS rejects a client without a certificate and accepts o
     defer server_future.cancel(io) catch {};
 
     var client_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(void), _io: std.Io, ca: dusty.TlsCa, dir: std.Io.Dir) !void {
+        fn run(s: *dusty.Server(void), _io: std.Io, ca: dusty.Ca, cert_path: []const u8, key_path: []const u8) !void {
             try s.waitReady(_io);
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
@@ -640,14 +650,14 @@ test "TLS hello: mutual TLS rejects a client without a certificate and accepts o
             }
             var authed = dusty.Client.init(std.testing.allocator, _io, .{ .tls = .{
                 .ca = ca,
-                .client_certificate = .{ .cert_path = "cert.pem", .key_path = "key.pem", .dir = dir },
+                .client_certificate = .fromFiles(cert_path, key_path),
             } });
             defer authed.deinit();
             var response = try authed.fetch(url, .{});
             defer response.deinit();
             try std.testing.expectEqual(.ok, response.status());
         }
-    }.run, .{ &server, io, h.caFile(), h.tmp.dir });
+    }.run, .{ &server, io, h.caFile(), h.path(&cert_buf, "cert.pem"), h.path(&key_buf, "key.pem") });
     try client_future.await(io);
 }
 
@@ -755,7 +765,7 @@ test "TLS hello: an RSA-4096 handshake fits the default coroutine stacks on both
     defer server_future.cancel(io) catch {};
 
     var client_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(void), _io: std.Io, ca: dusty.TlsCa) !void {
+        fn run(s: *dusty.Server(void), _io: std.Io, ca: dusty.Ca) !void {
             try s.waitReady(_io);
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});

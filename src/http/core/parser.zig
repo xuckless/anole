@@ -242,7 +242,7 @@ pub const RequestParser = struct {
         // table starts small (`parseHeaders`) and grows to the limit.
         const headers = &self.request.headers;
         headers.add(self.state.header_field, self.state.header_value) catch {
-            if (!headers.grow(self.request.arena, self.request.config.max_header_count)) return -1;
+            if (!headers.grow(self.request.arena, self.request._config.max_header_count)) return -1;
             headers.add(self.state.header_field, self.state.header_value) catch return -1;
         };
 
@@ -256,7 +256,7 @@ pub const RequestParser = struct {
     fn onHeadersComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
 
-        self.request.applyEntityHeaders();
+        self.request._applyEntityHeaders();
 
         self.state.headers_complete = true;
         return c.HPE_PAUSED; // Always pause so we can track consumed bytes
@@ -598,6 +598,10 @@ pub fn BodyReader(comptime Parser: type) type {
         /// read just as surely and the connection has nothing to say about
         /// it.
         err: ?Error = null,
+        /// The most bytes the reader hands out (after decoding); past it
+        /// reading fails with `error.BodyTooBig`. Null: no limit.
+        body_limit: ?usize = null,
+        body_count: usize = 0,
 
         const Self = @This();
 
@@ -637,7 +641,7 @@ pub fn BodyReader(comptime Parser: type) type {
         /// What reading a body can fail with, once the sentinel is resolved.
         pub const Error = Transport.ReadError || Transport.WriteError ||
             ParseError || @typeInfo(@TypeOf(decodeCause(undefined))).error_union.error_set ||
-            error{ IncompleteBody, InvalidZstd, MalformedBody, Unexpected };
+            error{ IncompleteBody, InvalidZstd, MalformedBody, BodyTooBig, WriteTimeout, Unexpected };
 
         /// Stores what actually went wrong and reports the sentinel the
         /// vtable requires. Mirrors `fail` on the buffered body writer.
@@ -788,27 +792,31 @@ pub fn BodyReader(comptime Parser: type) type {
 
         fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             const self: *Self = @alignCast(@fieldParentPtr("interface", io_r));
-            if (self.decode) |decode| return self.streamDecoded(decode, w, limit);
-            return self.streamFramed(w, limit);
+            const n = if (self.decode) |decode| try self.streamDecoded(decode, w, limit) else try self.streamFramed(w, limit);
+            if (self.body_limit) |max| {
+                self.body_count +|= n;
+                if (self.body_count > max) return self.fail(error.BodyTooBig);
+            }
+            return n;
         }
 
         fn streamFramed(self: *Self, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             // Send 100 Continue on first body read if client expects it
             if (self.request) |req| {
-                if (req.expects_continue) {
-                    if (req.response) |res| {
+                if (req._expects_continue) {
+                    if (req._response) |res| {
                         // A final response has started, and 100 can no
                         // longer precede it. The peer may still be holding
                         // the body, so the flag stays.
-                        if (!res.headers_written) {
-                            req.expects_continue = false;
+                        if (!res._headers_written) {
+                            req._expects_continue = false;
                             // A write, on a read: the caller asked for the body
                             // and this is what unblocks the peer from sending it.
-                            if (res.sink) |sink| {
+                            if (res._sink) |sink| {
                                 sink.interim(.@"continue") catch
                                     return self.fail(sink.writeError() orelse error.Unexpected);
                             } else {
-                                sendContinue(res.conn.writer) catch
+                                sendContinue(res._conn.?.writer) catch
                                     return self.fail(self.transport.getWriteError() orelse error.Unexpected);
                             }
                         }
@@ -1002,8 +1010,8 @@ test "RequestParser: basic" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
         // Allocated by `parseHeaders`, which this test goes around.
         .headers = try Headers.init(arena.allocator(), 32),
     };

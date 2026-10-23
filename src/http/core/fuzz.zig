@@ -8,7 +8,7 @@
 //!
 //! Under Zig's own test runner and `--fuzz` each target is a real fuzz
 //! test, seeded with its seeds (`zig build fuzz --fuzz`). Everywhere else,
-//! dusty's test runner included, it runs on the seeds and on a few thousand
+//! the core's test runner included, it runs on the seeds and on a few thousand
 //! mutations of them from a fixed PRNG seed, so every test run explores
 //! past the seeds, reproducibly.
 const std = @import("std");

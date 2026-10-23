@@ -16,7 +16,10 @@ pub const std_options: std.Options = .{
 };
 
 fn echo(req: *anole.Request, res: *anole.Response) !void {
-    var ws = (try anole.websocket.upgrade(req, res, .{})) orelse {
+    var ws = (try anole.websocket.upgrade(req, res, .{
+        // Autobahn's case 9 sends messages up to 16 MiB.
+        .max_message_size = 16 * 1024 * 1024,
+    })) orelse {
         res.status = .bad_request;
         return;
     };
@@ -46,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
     var app = try anole.Server(void).init(init.gpa, .{
         // Docker reaches the host through its gateway, not loopback.
         .http = .{ .address = "0.0.0.0", .port = port },
-        .server = .{ .timeout = .{ .idle_park = if (callbacks) .fromMilliseconds(1) else .fromSeconds(1) } },
+        .timeouts = .{ .idle_park = if (callbacks) .fromMilliseconds(1) else .fromSeconds(1) },
     }, {});
     defer app.deinit();
     if (callbacks) app.wsCallbacks("/", Echo) else app.get("/", echo);

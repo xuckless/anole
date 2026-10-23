@@ -110,7 +110,7 @@ pub const CookieOpts = struct {
 };
 
 /// A session cookie's attributes, for the session middleware
-/// (`anole.session.Config.cookie_opts`, `middleware.Session.Config.cookie_opts`).
+/// (`anole.session.Options.cookie_opts`, `middleware.Session.Options.cookie_opts`).
 /// Unlike `CookieOpts`, every field defaults to the safe choice, so setting
 /// one (`.{ .same_site = .none }`) keeps the others: `Path=/`, `HttpOnly`,
 /// `Secure`, `SameSite=Lax`. `Max-Age` is the middleware's to set.

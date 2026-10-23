@@ -70,7 +70,9 @@ pub const RouteOptions = struct {
     /// that completed its head). A handler that waits anyway still works,
     /// but holds up every other request on its connection meanwhile, and
     /// gets no request timeout. Leave it off for anything that talks to a
-    /// database, a cache, another service or the file system.
+    /// database, a cache, another service or the file system. Checked at
+    /// registration: every middleware in front of the route must say it
+    /// never waits (`pub const no_wait = true`), or the route is a conflict.
     no_wait: bool = false,
 };
 
@@ -201,7 +203,7 @@ pub fn Router(comptime Ctx: type) type {
 
         /// A conflict: a panic, or under `record_conflicts` the message
         /// (the first one) and the route left out.
-        fn conflicted(self: *Self, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
+        pub fn conflicted(self: *Self, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
             if (!self.record_conflicts) std.debug.panic(fmt, args);
             if (self.conflict == null) self.conflict = try std.fmt.allocPrint(self.arena.allocator(), fmt, args);
         }
@@ -219,6 +221,10 @@ pub fn Router(comptime Ctx: type) type {
             if (self.findConflict(path, method)) |c| {
                 return self.conflicted("route {s} {s} conflicts with any() route {s}: both match some paths, but {s} is not more specific", .{ c.method.name(), c.method_path, c.any_path, c.method_path });
             }
+
+            if (opts.no_wait) for (middlewares) |m| if (!m.no_wait) {
+                return self.conflicted("route {s} {s} is marked noWait, but middleware {s} may wait (I/O, a lock, a sleep): drop noWait from the route, or mark the middleware if it never waits (pub const no_wait = true; anole.noWait(f) for a function middleware)", .{ if (method) |mm| mm.name() else "ANY", path, m.name });
+            };
 
             const slot = if (method) |m| &self.trees[@backingInt(m)] else &self.any_tree;
 
@@ -370,7 +376,7 @@ pub fn Router(comptime Ctx: type) type {
 
             // 2. Try param child (medium precedence)
             if (node.param_child) |c| {
-                if (req.params.count() >= req.config.max_param_count) {
+                if (req.params.count() >= req._config.max_param_count) {
                     return error.TooManyParams;
                 }
                 try req.params.map.put(req.arena, c.param_name.?, current_segment);
@@ -381,7 +387,7 @@ pub fn Router(comptime Ctx: type) type {
 
             // 3. Try wildcard child (lowest precedence)
             if (node.wildcard_child) |c| {
-                if (req.params.count() >= req.config.max_param_count) {
+                if (req.params.count() >= req._config.max_param_count) {
                     return error.TooManyParams;
                 }
                 // Capture remaining path (without query parameters)
@@ -739,6 +745,19 @@ pub fn Router(comptime Ctx: type) type {
                 g.router.insertRoute(g.concatPath(path), method, handler, g.mergeMiddlewares(), opts) catch @panic("OOM");
             }
 
+            /// Registers `handler` behind the group's middleware at `path` as
+            /// given: the prefix is not added (paths fixed elsewhere, such as
+            /// gRPC's).
+            pub fn addRouteUnprefixed(g: Group, method: ?Method, path: []const u8, handler: Handler, opts: RouteOptions) void {
+                g.router.insertRoute(path, method, handler, g.mergeMiddlewares(), opts) catch @panic("OOM");
+            }
+
+            /// The middleware a route of this group runs: the router's, then
+            /// the group's.
+            pub fn chain(g: Group) []const Middleware(Ctx) {
+                return g.mergeMiddlewares();
+            }
+
             pub fn get(g: Group, path: []const u8, handler: Handler) void {
                 g.register(.get, path, handler);
             }
@@ -790,7 +809,7 @@ pub fn Router(comptime Ctx: type) type {
             // Count '&' to estimate capacity (upper bound on number of key-value pairs)
             // Number of segments = ampersands + 1
             const ampersand_count = std.mem.count(u8, query_string, "&");
-            const max_params = @min(ampersand_count + 1, req.config.max_query_count);
+            const max_params = @min(ampersand_count + 1, req._config.max_query_count);
 
             // Pre-allocate capacity for the query hashmap
             try req.query.map.ensureTotalCapacity(req.arena, @intCast(max_params));
@@ -800,7 +819,7 @@ pub fn Router(comptime Ctx: type) type {
                 if (pair.len == 0) continue;
 
                 // Check query count limit
-                if (req.query.count() >= req.config.max_query_count) {
+                if (req.query.count() >= req._config.max_query_count) {
                     return error.TooManyQueryParams;
                 }
 
@@ -869,8 +888,8 @@ test "Router: register and find GET route" {
         .method = .get,
         .url = "/users",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -891,8 +910,8 @@ test "Router: register and find POST route" {
         .method = .post,
         .url = "/posts",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -913,8 +932,8 @@ test "Router: method mismatch returns null" {
         .method = .post,
         .url = "/users",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -934,8 +953,8 @@ test "Router: path mismatch returns null" {
         .method = .get,
         .url = "/posts",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -955,8 +974,8 @@ test "Router: parameterized routes" {
         .method = .get,
         .url = "/users/123",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -980,8 +999,8 @@ test "Router: multiple routes" {
         .method = .get,
         .url = "/users",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     const handler1 = try router.findHandler(&req1);
     try std.testing.expect(handler1 != null);
@@ -992,8 +1011,8 @@ test "Router: multiple routes" {
         .method = .post,
         .url = "/users",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     const handler2 = try router.findHandler(&req2);
     try std.testing.expect(handler2 != null);
@@ -1004,8 +1023,8 @@ test "Router: multiple routes" {
         .method = .get,
         .url = "/posts",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     const handler3 = try router.findHandler(&req3);
     try std.testing.expect(handler3 != null);
@@ -1026,8 +1045,8 @@ test "Router: all HTTP methods" {
             .method = method,
             .url = "/resource",
             .arena = arena.allocator(),
-            .parser = undefined,
-            .transport = undefined,
+            ._parser = undefined,
+            ._transport = undefined,
         };
         const handler = try router.findHandler(&req);
         try std.testing.expect(handler != null);
@@ -1047,8 +1066,8 @@ test "Router: extract single parameter" {
         .method = .get,
         .url = "/users/123",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1073,8 +1092,8 @@ test "Router: the matched route is on the request, by its pattern" {
         .method = .get,
         .url = "/api/users/123",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     _ = try router.findHandler(&req);
     try std.testing.expectEqualStrings("/api/users/:id", req.route.?.path);
@@ -1101,8 +1120,8 @@ test "Router: addRoute hands its data to the request" {
         .method = .post,
         .url = "/two",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     _ = try router.findHandler(&req);
     try std.testing.expectEqual(@as(u32, 2), @as(*const u32, @ptrCast(@alignCast(req.route.?.data.?))).*);
@@ -1127,8 +1146,8 @@ test "Router: extract multiple parameters" {
         .method = .get,
         .url = "/users/456/posts/789",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1156,8 +1175,8 @@ test "Router: mixed static and parameter segments" {
         .method = .get,
         .url = "/api/v1/users/abc123/profile",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1184,8 +1203,8 @@ test "Router: static route has precedence over param route" {
         .method = .get,
         .url = "/users/new",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1227,8 +1246,8 @@ test "Router: a static path finds what the tree walk would, in any spelling" {
             .method = case.method,
             .url = case.url,
             .arena = arena.allocator(),
-            .parser = undefined,
-            .transport = undefined,
+            ._parser = undefined,
+            ._transport = undefined,
         };
         const found = try router.findHandler(&req);
         if (case.want) |want| {
@@ -1251,8 +1270,8 @@ test "Router: wildcard route basic matching" {
         .method = .get,
         .url = "/files/document.txt",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1273,8 +1292,8 @@ test "Router: wildcard captures remaining path" {
         .method = .get,
         .url = "/files/path/to/file.txt",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1299,8 +1318,8 @@ test "Router: static route has precedence over wildcard" {
         .method = .get,
         .url = "/files/config.json",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1325,8 +1344,8 @@ test "Router: param route has precedence over wildcard" {
         .method = .get,
         .url = "/api/123",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1353,8 +1372,8 @@ test "Router: wildcard with multiple segments" {
         .method = .get,
         .url = "/assets/images/icons/logo.png",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1378,8 +1397,8 @@ test "Router: wildcard with prefix path" {
         .method = .get,
         .url = "/api/v1/files/docs/readme.md",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1403,8 +1422,8 @@ test "Router: static route with query parameters" {
         .method = .get,
         .url = "/users/profile?debug=true&page=1",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1429,8 +1448,8 @@ test "Router: param route with query parameters" {
         .method = .get,
         .url = "/users/123?format=json",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1459,8 +1478,8 @@ test "Router: multiple params with query parameters" {
         .method = .get,
         .url = "/users/456/posts/789?include=comments&sort=date",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1493,8 +1512,8 @@ test "Router: wildcard route with query parameters" {
         .method = .get,
         .url = "/files/docs/readme.md?download=true",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1522,8 +1541,8 @@ test "Router: empty query string" {
         .method = .get,
         .url = "/users/123?",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1550,8 +1569,8 @@ test "Router: no query parameters" {
         .method = .get,
         .url = "/users/123",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1578,8 +1597,8 @@ test "Router: URL encoded query parameters" {
         .method = .get,
         .url = "/search?q=hello+world&tag=foo%20bar&special=%21%40%23%24",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1604,8 +1623,8 @@ test "Router: query parameter without value" {
         .method = .get,
         .url = "/items?featured&sort=name",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1629,8 +1648,8 @@ test "Router: query with empty key-value pairs" {
         .method = .get,
         .url = "/test?a=1&&b=2&",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1671,8 +1690,8 @@ test "Group: prefix concatenation" {
         .method = .get,
         .url = "/api/v1/users",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     const route1 = try router.findHandler(&req1);
     try std.testing.expect(route1 != null);
@@ -1682,8 +1701,8 @@ test "Group: prefix concatenation" {
         .method = .post,
         .url = "/api/v1/users",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     const route2 = try router.findHandler(&req2);
     try std.testing.expect(route2 != null);
@@ -1699,7 +1718,7 @@ test "Group: routes without group middleware get global middlewares" {
 
     const TestMw = struct {
         id: u8,
-        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Executor(void)) !void {}
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Chain(void)) !void {}
     };
 
     var mw1 = TestMw{ .id = 1 };
@@ -1712,8 +1731,8 @@ test "Group: routes without group middleware get global middlewares" {
         .method = .get,
         .url = "/direct",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     const route = try router.findHandler(&req);
     try std.testing.expect(route != null);
@@ -1729,7 +1748,7 @@ test "Group: group middlewares appended after global" {
 
     const TestMw = struct {
         id: u8,
-        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Executor(void)) !void {}
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Chain(void)) !void {}
     };
 
     var mw_global = TestMw{ .id = 1 };
@@ -1743,8 +1762,8 @@ test "Group: group middlewares appended after global" {
         .method = .get,
         .url = "/api/users",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     const route = try router.findHandler(&req);
     try std.testing.expect(route != null);
@@ -1764,7 +1783,7 @@ test "Group: no global middlewares, only group middlewares" {
 
     const TestMw = struct {
         id: u8,
-        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Executor(void)) !void {}
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Chain(void)) !void {}
     };
 
     var mw_group = TestMw{ .id = 1 };
@@ -1775,8 +1794,8 @@ test "Group: no global middlewares, only group middlewares" {
         .method = .get,
         .url = "/api/users",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     const route = try router.findHandler(&req);
     try std.testing.expect(route != null);
@@ -1792,7 +1811,7 @@ test "Group: keeps its own copy of the middleware list" {
 
     const TestMw = struct {
         id: u8,
-        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Executor(void)) !void {}
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Chain(void)) !void {}
     };
 
     var mw_group = TestMw{ .id = 1 };
@@ -1810,8 +1829,8 @@ test "Group: keeps its own copy of the middleware list" {
             .method = .get,
             .url = url,
             .arena = arena.allocator(),
-            .parser = undefined,
-            .transport = undefined,
+            ._parser = undefined,
+            ._transport = undefined,
         };
         const route = try router.findHandler(&req);
         try std.testing.expect(route != null);
@@ -1833,8 +1852,8 @@ test "Group: direct routes have no middlewares when none set" {
         .method = .get,
         .url = "/health",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     const route = try router.findHandler(&req);
     try std.testing.expect(route != null);
@@ -1856,8 +1875,8 @@ test "Group: any method registers all methods" {
             .method = method,
             .url = "/api/resource",
             .arena = arena.allocator(),
-            .parser = undefined,
-            .transport = undefined,
+            ._parser = undefined,
+            ._transport = undefined,
         };
         const route = try router.findHandler(&req);
         try std.testing.expect(route != null);
@@ -1878,8 +1897,8 @@ test "Router: QUERY route" {
         .method = .query,
         .url = "/search",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
     req.url = "/api/search";
@@ -1914,8 +1933,8 @@ test "Router: any() comes after the method's own routes" {
             .method = case[0],
             .url = case[1],
             .arena = arena.allocator(),
-            .parser = undefined,
-            .transport = undefined,
+            ._parser = undefined,
+            ._transport = undefined,
         };
         try std.testing.expectEqual(case[2], (try router.findHandler(&req)).?.action);
     }
@@ -1973,8 +1992,8 @@ test "Router: record_conflicts keeps the first conflict and leaves the route out
         .method = .get,
         .url = "/users/7",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
 }
@@ -1992,8 +2011,8 @@ test "Router: a GET route answers HEAD" {
         .method = .head,
         .url = "/users",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
 
@@ -2019,8 +2038,8 @@ test "Router: an explicit HEAD route wins over the GET one" {
         .method = .head,
         .url = "/users",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     try std.testing.expectEqual(&testHandler2, (try router.findHandler(&req)).?.action);
 
@@ -2043,8 +2062,8 @@ test "Router: HEAD falls back per path, not per tree" {
         .method = .head,
         .url = "/users",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
 }
@@ -2062,9 +2081,60 @@ test "Router: HEAD falling back to GET still captures path params" {
         .method = .head,
         .url = "/users/42",
         .arena = arena.allocator(),
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     try std.testing.expect(try router.findHandler(&req) != null);
     try std.testing.expectEqualStrings("42", req.params.get("id").?);
+}
+
+test "router: a no_wait route behind middleware that may wait is a conflict, recorded under record_conflicts" {
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.record_conflicts = true;
+    const Waits = struct {
+        _: u8 = 0,
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, next: anytype) !void {
+            return next.call();
+        }
+    };
+    var mw: Waits = .{};
+    router.use(Middleware(void).init(&mw));
+    router.addRouteWith(.get, "/ping", voidHandler1, .{ .no_wait = true });
+    try std.testing.expect(router.conflict != null);
+    try std.testing.expect(std.mem.indexOf(u8, router.conflict.?, "route GET /ping is marked noWait, but middleware") != null);
+    try std.testing.expect(std.mem.indexOf(u8, router.conflict.?, "Waits") != null);
+    // Without the mark the route registers.
+    router.conflict = null;
+    router.addRouteWith(.get, "/slow", voidHandler1, .{});
+    try std.testing.expect(router.conflict == null);
+}
+
+test "router: a no_wait route behind no_wait middleware registers" {
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.record_conflicts = true;
+    const Quick = struct {
+        _: u8 = 0,
+        pub const no_wait = true;
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, next: anytype) !void {
+            return next.call();
+        }
+    };
+    const Depends = struct {
+        quick: bool,
+        pub fn noWait(self: *const @This()) bool {
+            return self.quick;
+        }
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, next: anytype) !void {
+            return next.call();
+        }
+    };
+    var q: Quick = .{};
+    var d: Depends = .{ .quick = true };
+    router.use(Middleware(void).init(&q));
+    router.use(Middleware(void).init(&d));
+    router.addRouteWith(.get, "/ping", voidHandler1, .{ .no_wait = true });
+    try std.testing.expect(router.conflict == null);
+    try std.testing.expect(router.has_no_wait);
 }

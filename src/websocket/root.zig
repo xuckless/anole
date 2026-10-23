@@ -37,7 +37,7 @@
 //!         }
 //!     }
 //!
-//! HTTP/1.1 runs on the HTTP core's RFC 6455 implementation (from
+//! HTTP/1.1 runs on the HTTP core's RFC 6455 implementation (adapted from
 //! lalinsky/dusty, MIT). HTTP/2 and HTTP/3 run on the sans-IO frame codec
 //! of xuckless/websocket-zig (a fork of mattrobenolt/websocket-zig, MIT)
 //! over the stream's request body and streamed response; h2_socket.zig is
@@ -50,14 +50,13 @@
 //! to end (the answer to the last buffered message, a read that would
 //! wait, or the handler waiting for anything else), so a client that
 //! pipelines messages gets one write for them, not one each. Sends from
-//! other tasks (`Rooms.broadcast`) go out at once. dusty's
+//! other tasks (`Rooms.broadcast`) go out at once. the core's
 //! `WebSocketBatch` has the rule.
 //!
 //! The HTTP/2 and HTTP/3 engines advertise extended CONNECT, and a browser
 //! that sees it (Firefox does, over HTTP/2) opens WebSockets on it: answer
-//! upgrades with `upgrade` here, not dusty's HTTP/1.1-only
-//! `res.upgradeWebSocket`, or turn `http2.enable_connect_protocol` (and
-//! `http3.enable_connect_protocol`) off.
+//! upgrades with `upgrade` here, or turn `http2.enable_connect_protocol`
+//! (and `http3.enable_connect_protocol`) off.
 //!
 //! permessage-deflate (RFC 7692) is accepted when offered and
 //! `-Dcompression` is on (`UpgradeOptions.compression`), on either version.
@@ -98,7 +97,7 @@ pub const CloseCode = WebSocket.CloseCode;
 pub const Client = dusty.WebSocketClient;
 
 /// How `upgrade` (and `app.wsWith`) accepts a socket. The defaults suit
-/// most handlers: dusty's message limit, no timeout, compression when
+/// most handlers: the core's message limit, no timeout, compression when
 /// built in, close 1001 on drain, pages from the same origin only.
 pub const UpgradeOptions = struct {
     /// The pages that may open the socket, by the handshake's `Origin`:
@@ -110,8 +109,8 @@ pub const UpgradeOptions = struct {
     allowed_origins: Origins = .same_origin,
     /// The largest message `receive` assembles (after inflating). A bigger
     /// one fails `receive` with `error.MessageTooLarge`, and the peer gets
-    /// close 1009 first.
-    max_message_size: usize = WebSocket.default_max_message_size,
+    /// close 1009 first. Null: the server's `limits.ws_max_message` (1 MiB).
+    max_message_size: ?usize = null,
     /// Replaces the request's timeout once the socket is open: a socket
     /// outlives `timeout.request`. Set a deadline here, or call
     /// `req.setTimeout` before each `receive` for an idle limit.
@@ -128,7 +127,93 @@ pub const UpgradeOptions = struct {
     close_on_drain: bool = true,
     /// The reason sent with the drain's close 1001.
     drain_reason: []const u8 = "server shutting down",
+    /// The subprotocols this endpoint speaks, most preferred first. The
+    /// first of them that the client offered (`Sec-WebSocket-Protocol`,
+    /// every line, comma-separated) is selected, echoed in the handshake's
+    /// answer and set as `Socket.subprotocol`. When the client offered none
+    /// of them, or none at all, the socket opens without one (RFC 6455
+    /// 4.2.2). Each must be a token (RFC 9110 tchar); `upgrade` fails with
+    /// `error.InvalidSubprotocol` otherwise.
+    subprotocols: []const []const u8 = &.{},
+    /// Extra headers on the handshake's answer (101 over HTTP/1.1, 200 over
+    /// HTTP/2 and HTTP/3): `Set-Cookie`, `X-Request-Id`. A name the
+    /// handshake writes itself (`Upgrade`, `Connection`, any
+    /// `Sec-WebSocket-*`) or a framing header (`Content-Length`,
+    /// `Transfer-Encoding`) is `error.InvalidHeaderName`. The values must
+    /// stay valid until `upgrade` returns.
+    headers: []const std.http.Header = &.{},
 };
+
+/// Whether `req` is a WebSocket handshake `upgrade` would accept, origins
+/// aside: an HTTP/1.1 GET with `Upgrade: websocket`, `Connection: upgrade`,
+/// `Sec-WebSocket-Version: 13` and a valid `Sec-WebSocket-Key`; or an
+/// HTTP/2 or HTTP/3 extended CONNECT with `:protocol websocket` and
+/// version 13.
+pub fn isUpgrade(req: *const dusty.Request) bool {
+    if (req.protocol) |protocol| {
+        if (!(features.http2 or features.http3) or !std.ascii.eqlIgnoreCase(protocol, "websocket")) return false;
+        const version = req.headers.get("Sec-WebSocket-Version") orelse return false;
+        return std.mem.eql(u8, version, "13");
+    }
+    return dusty.isWebSocketHandshake(req);
+}
+
+/// The subprotocols the client offered, in its order: every
+/// `Sec-WebSocket-Protocol` line, split on commas, spaces and tabs trimmed,
+/// empty items skipped.
+pub fn offeredSubprotocols(req: *const dusty.Request) SubprotocolIterator {
+    return .{ .headers = req.headers.iterator() };
+}
+
+pub const SubprotocolIterator = struct {
+    headers: dusty.Headers.Iterator,
+    rest: []const u8 = "",
+
+    pub fn next(it: *SubprotocolIterator) ?[]const u8 {
+        while (true) {
+            while (it.rest.len > 0) {
+                const comma = std.mem.indexOfScalar(u8, it.rest, ',') orelse it.rest.len;
+                const item = std.mem.trim(u8, it.rest[0..comma], " \t");
+                it.rest = if (comma < it.rest.len) it.rest[comma + 1 ..] else "";
+                if (item.len > 0) return item;
+            }
+            while (it.headers.next()) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.key, "Sec-WebSocket-Protocol")) {
+                    it.rest = entry.value;
+                    break;
+                }
+            } else return null;
+        }
+    }
+};
+
+/// The first of `preferred` that `req` offered, or null.
+pub fn selectSubprotocol(req: *const dusty.Request, preferred: []const []const u8) ?[]const u8 {
+    for (preferred) |want| {
+        var it = offeredSubprotocols(req);
+        while (it.next()) |offered| if (std.mem.eql(u8, offered, want)) return want;
+    }
+    return null;
+}
+
+/// Whether `name` is a header an endpoint may add to the handshake's
+/// answer: not one the handshake writes itself or the framing owns.
+pub fn handshakeHeaderAllowed(name: []const u8) bool {
+    if (name.len == 0) return false;
+    const refused = [_][]const u8{ "Upgrade", "Connection", "Content-Length", "Transfer-Encoding" };
+    for (refused) |r| if (std.ascii.eqlIgnoreCase(name, r)) return false;
+    return !std.ascii.startsWithIgnoreCase(name, "Sec-WebSocket-");
+}
+
+/// Whether `text` is a token (RFC 9110 tchar), which a subprotocol must be.
+pub fn isToken(text: []const u8) bool {
+    if (text.len == 0) return false;
+    for (text) |c| {
+        if (std.ascii.isAlphanumeric(c)) continue;
+        if (std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) == null) return false;
+    }
+    return true;
+}
 
 /// permessage-deflate settings: window size, memory level, level, and the
 /// shortest message worth compressing (64 bytes). Empty without
@@ -138,40 +223,42 @@ const deflate_impl = if (features.compression) @import("deflate.zig") else struc
     pub const Deflate = void;
 };
 
+/// The HTTP version a `Socket` runs over.
+pub const HttpVersion = enum { http1, http2, http3 };
+
 /// A WebSocket a handler holds, whichever HTTP version it arrived on.
 pub const Socket = struct {
-    /// The protocol underneath, to tell which you got: `.h1` (the HTTP
-    /// core's HTTP/1.1 WebSocket) or `.h2` (a stream of HTTP/2 or HTTP/3).
-    /// Send and receive through `Socket`'s methods, not through it; see
-    /// `Conn`.
-    conn: Conn,
+    /// The protocol underneath: `.h1` (the HTTP core's HTTP/1.1 WebSocket)
+    /// or `.stream` (a stream of HTTP/2 or HTTP/3). Anole's: send and
+    /// receive through `Socket`'s methods, and ask `httpVersion`.
+    _conn: Conn,
     /// permessage-deflate, when negotiated.
-    deflate: if (features.compression) ?*deflate_impl.Deflate else void =
+    _deflate: if (features.compression) ?*deflate_impl.Deflate else void =
         if (features.compression) null else {},
     /// What the socket's parts live in: the request's arena, or for a
     /// callback socket over HTTP/1.1 the server's allocator. Used only by
     /// the task that reads the socket; the compressor has an allocator of
     /// its own.
-    allocator: std.mem.Allocator,
+    _allocator: std.mem.Allocator,
     /// The request's `std.Io`.
     io: std.Io,
     /// The executor the socket was opened on, where `Rooms` sends to it
     /// from; null off zio.
-    executor: ?usize = null,
+    _executor: ?usize = null,
     /// `UpgradeOptions.max_message_size`.
     max_message_size: usize,
     /// Held across compressing and sending a message, so tasks sending on
     /// one socket (a `Rooms.broadcast` beside the socket's own handler) do
     /// not interleave on the compressor.
-    send_mutex: std.Io.Mutex = .init,
+    _send_mutex: std.Io.Mutex = .init,
     /// The server's drain signal (`Request.drain`); null in a request the
     /// server did not build.
-    drain: ?*std.Io.Event = null,
+    _drain: ?*std.Io.Event = null,
     /// Sends 1001 when the drain starts (`UpgradeOptions.close_on_drain`).
-    drain_watch: ?*DrainWatch = null,
+    _drain_watch: ?*DrainWatch = null,
     /// A close went out through `close`, or came in through `receive` (and
     /// was answered), or `next` saw the connection end.
-    closed: std.atomic.Value(bool) = .init(false),
+    _closed: std.atomic.Value(bool) = .init(false),
     /// Why the socket ended when it was not the peer's close (`next`
     /// returned null, or a callback socket's `close` ran): the error its
     /// read failed with, `error.EndOfStream` for a peer that left without
@@ -180,21 +267,26 @@ pub const Socket = struct {
     /// The code of the peer's close, once one arrived (null for a close
     /// with no code, or none yet).
     close_code: ?CloseCode = null,
+    /// The subprotocol selected in the handshake; null for none. Lives as
+    /// long as the socket.
+    subprotocol: ?[]const u8 = null,
+    /// `httpVersion`.
+    _http_version: HttpVersion = .http1,
     /// The application's, for state it keeps per socket: a callback socket
     /// (`callbacks`) sets it in `open` and frees what it points at in
     /// `close`. See `contextAs`.
     context: ?*anyopaque = null,
     /// The rooms the socket is in (`Rooms.join`), across every `Rooms`:
     /// `deinit` leaves them all. Under `memberships_lock`.
-    memberships: ?*Rooms.Member = null,
+    _memberships: ?*Rooms.Member = null,
     /// Over `memberships`; held only for a list operation, inside the
     /// `Rooms`' own lock.
-    memberships_lock: std.atomic.Mutex = .unlocked,
+    _memberships_lock: std.atomic.Mutex = .unlocked,
     /// The task that serves the socket over HTTP/2 or HTTP/3 (its stream's),
     /// and over HTTP/1.1 on Windows (its connection's, see
     /// `abort_cancels_h1_reader`), which `abortConnection` cancels; null
     /// over HTTP/1.1 elsewhere and off zio.
-    task: ?placement.Task = null,
+    _task: ?placement.Task = null,
 
     /// Which protocol a socket runs on. The sockets it points at are
     /// internal: they hand over permessage-deflate messages still
@@ -204,14 +296,24 @@ pub const Socket = struct {
     pub const Conn = union(enum) {
         h1: *WebSocket,
         /// An HTTP/2 or an HTTP/3 stream (RFC 8441, RFC 9220).
-        h2: *H2Socket,
+        stream: *H2Socket,
     };
+
+    /// The HTTP version the socket runs over.
+    pub fn httpVersion(self: *const Socket) HttpVersion {
+        return self._http_version;
+    }
+
+    /// A close went out or came in, or the connection ended.
+    pub fn isClosed(self: *const Socket) bool {
+        return self._closed.load(.acquire);
+    }
 
     /// Whether the server has started to drain. With `close_on_drain` the
     /// close is already on its way; without, the handler should end the
     /// socket (close 1001, then `receive` until the answer) soon.
     pub fn draining(self: *const Socket) bool {
-        const d = self.drain orelse return false;
+        const d = self._drain orelse return false;
         return d.isSet();
     }
 
@@ -223,17 +325,17 @@ pub const Socket = struct {
     /// than through a call for each layer, which costs an echo loop about a
     /// tenth of its CPU.
     pub fn receive(self: *Socket) !Message {
-        return @call(.always_inline, finishMessage, .{ self, switch (self.conn) {
+        return @call(.always_inline, finishMessage, .{ self, switch (self._conn) {
             inline else => |ws| try @call(.always_inline, @TypeOf(ws.*).receive, .{ws}),
         } });
     }
 
     /// Over HTTP/1.1, for a reading task that waits for the peer in its
     /// own way (`callbacks`): the next message once one has begun in the
-    /// read buffer, null when it is empty (dusty's
+    /// read buffer, null when it is empty (the core's
     /// `WebSocket.receiveStarted`).
     fn receiveStarted(self: *Socket) !?Message {
-        const msg = (try self.conn.h1.receiveStarted()) orelse return null;
+        const msg = (try self._conn.h1.receiveStarted()) orelse return null;
         return try self.finishMessage(msg);
     }
 
@@ -243,11 +345,11 @@ pub const Socket = struct {
         var msg = received;
         if (msg.type == .close) {
             self.close_code = msg.close_code;
-            self.closed.store(true, .release);
+            self._closed.store(true, .release);
         }
         if (!msg.compressed) return msg;
         if (comptime !features.compression) unreachable;
-        const d = self.deflate orelse unreachable; // RSV1 is refused unless negotiated
+        const d = self._deflate orelse unreachable; // RSV1 is refused unless negotiated
         msg.data = d.decompress(msg.data, self.max_message_size) catch |err| {
             self.close(if (err == error.MessageTooLarge) .too_large else .invalid_payload, "") catch {};
             return err;
@@ -270,18 +372,18 @@ pub const Socket = struct {
     /// the socket's own handler from other tasks (`Rooms.broadcast`).
     /// A text message must be valid UTF-8; that is the caller's to keep.
     pub fn send(self: *Socket, msg_type: MessageType, data: []const u8) !void {
-        try self.send_mutex.lock(self.io);
-        defer self.send_mutex.unlock(self.io);
+        try self._send_mutex.lock(self.io);
+        defer self._send_mutex.unlock(self.io);
         if (comptime features.compression) {
-            if (self.deflate) |d| if ((msg_type == .text or msg_type == .binary) and data.len >= d.options.min_length) {
+            if (self._deflate) |d| if ((msg_type == .text or msg_type == .binary) and data.len >= d.options.min_length) {
                 const packed_data = try d.compress(data);
-                return switch (self.conn) {
+                return switch (self._conn) {
                     .h1 => |ws| ws.sendCompressed(msg_type, packed_data),
-                    .h2 => |ws| ws.sendMessage(msg_type, packed_data, true),
+                    .stream => |ws| ws.sendMessage(msg_type, packed_data, true),
                 };
             };
         }
-        return switch (self.conn) {
+        return switch (self._conn) {
             inline else => |ws| ws.send(msg_type, data),
         };
     }
@@ -289,7 +391,7 @@ pub const Socket = struct {
     /// Sends a ping with `data`: at most 125 bytes, else
     /// `error.LargeControlFrame`. The pong is dropped inside `receive`.
     pub fn ping(self: *Socket, data: []const u8) !void {
-        return switch (self.conn) {
+        return switch (self._conn) {
             inline else => |ws| ws.ping(data),
         };
     }
@@ -307,7 +409,7 @@ pub const Socket = struct {
                 const e: anyerror = err;
                 if (e == error.Canceled or e == error.OutOfMemory) return e;
                 self.end_error = e;
-                self.closed.store(true, .release);
+                self._closed.store(true, .release);
                 return null;
             };
             switch (msg.type) {
@@ -321,8 +423,8 @@ pub const Socket = struct {
     /// Sends a close frame. The peer's answer still arrives through
     /// `receive`.
     pub noinline fn close(self: *Socket, code: CloseCode, reason: []const u8) !void {
-        self.closed.store(true, .release);
-        return switch (self.conn) {
+        self._closed.store(true, .release);
+        return switch (self._conn) {
             inline else => |ws| ws.close(code, reason),
         };
     }
@@ -335,9 +437,9 @@ pub const Socket = struct {
         // First, so nothing sends on the socket once it is gone: no room
         // keeps it, and no broadcast is still sending to it.
         Rooms.leaveEvery(self);
-        if (self.drain_watch) |w| w.stop();
-        if (comptime features.compression) if (self.deflate) |d| d.deinit();
-        switch (self.conn) {
+        if (self._drain_watch) |w| w.stop();
+        if (comptime features.compression) if (self._deflate) |d| d.deinit();
+        switch (self._conn) {
             inline else => |ws| ws.deinit(),
         }
     }
@@ -361,8 +463,8 @@ const abort_cancels_h1_reader = builtin.os.tag == .windows;
 /// still alive (a `Rooms` sender, which `leave` waits for), so the task
 /// serving it has not returned.
 fn abortConnection(socket: *Socket) void {
-    socket.closed.store(true, .release);
-    switch (socket.conn) {
+    socket._closed.store(true, .release);
+    switch (socket._conn) {
         .h1 => |ws| {
             ws.write_mutex.lockUncancelable(socket.io);
             ws.closed = true;
@@ -372,13 +474,13 @@ fn abortConnection(socket: *Socket) void {
             const protection = socket.io.swapCancelProtection(.blocked);
             defer _ = socket.io.swapCancelProtection(protection);
             if (ws.transport.tcp_reader) |r| r.stream.shutdown(socket.io, .both) catch {};
-            if (comptime abort_cancels_h1_reader) if (socket.task) |t| placement.cancelTask(t);
+            if (comptime abort_cancels_h1_reader) if (socket._task) |t| placement.cancelTask(t);
         },
-        .h2 => |ws| {
+        .stream => |ws| {
             ws.write_mutex.lockUncancelable(socket.io);
             ws.closed = true;
             ws.write_mutex.unlock(socket.io);
-            if (socket.task) |t| placement.cancelTask(t);
+            if (socket._task) |t| placement.cancelTask(t);
         },
     }
 }
@@ -435,19 +537,21 @@ pub fn upgrade(req: *dusty.Request, res: *dusty.Response, options: UpgradeOption
 fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions, owner: ?std.mem.Allocator) !?Socket {
     // An extended CONNECT, over HTTP/2 or HTTP/3.
     const h2 = req.protocol != null;
-    if (h2) {
-        if (!(features.http2 or features.http3) or !std.ascii.eqlIgnoreCase(req.protocol.?, "websocket")) return null;
-        const version = req.headers.get("Sec-WebSocket-Version") orelse return null;
-        if (!std.mem.eql(u8, version, "13")) return null;
-    } else {
-        const up = req.headers.get("Upgrade") orelse return null;
-        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, up, " \t"), "websocket")) return null;
-    }
+    if (!isUpgrade(req)) return null;
     // A WebSocket handshake from here: from a page that may open it?
     if (!origin.allowed(req, options.allowed_origins)) return error.Forbidden;
+    for (options.subprotocols) |sp| if (!isToken(sp)) return error.InvalidSubprotocol;
+    for (options.headers) |h| if (!handshakeHeaderAllowed(h.name)) return error.InvalidHeaderName;
 
     // What lives as long as the socket.
     const alloc = if (h2) req.arena else owner orelse req.arena;
+
+    // The subprotocol the client offered that we prefer, and the extra
+    // headers: on the response before the handshake's answer goes out.
+    const subprotocol: ?[]const u8 = if (selectSubprotocol(req, options.subprotocols)) |sp| try alloc.dupe(u8, sp) else null;
+    errdefer if (owner != null and !h2) if (subprotocol) |sp| alloc.free(sp);
+    if (subprotocol) |sp| try res.header("Sec-WebSocket-Protocol", sp);
+    for (options.headers) |h| try res.header(try req.arena.dupe(u8, h.name), try req.arena.dupe(u8, h.value));
 
     // permessage-deflate: the first offer we can take, answered in the
     // handshake's response.
@@ -464,50 +568,58 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
                 // send (`Rooms`). The server's allocator there; over HTTP/2
                 // and HTTP/3 the stream's arena is a `std.heap.ArenaAllocator`
                 // over the server's allocator, which is thread-safe.
-                d.* = .init(accepted.config, options.deflate, if (h2) req.arena else res.conn.allocator);
+                d.* = .init(accepted.config, options.deflate, if (h2) req.arena else res._conn.?.allocator);
                 deflate = d;
             }
         }
     };
     const negotiated = if (comptime features.compression) deflate != null else false;
 
+    const max_message = options.max_message_size orelse req._config.ws_max_message;
     var socket: Socket = .{
-        .conn = undefined,
-        .deflate = deflate,
-        .allocator = alloc,
+        ._conn = undefined,
+        ._deflate = deflate,
+        ._allocator = alloc,
         .io = req.io,
-        .max_message_size = options.max_message_size,
-        .drain = req.drain,
-        .executor = placement.currentExecutor(req.io),
+        .max_message_size = max_message,
+        .subprotocol = subprotocol,
+        ._http_version = switch (req.version_major) {
+            3 => .http3,
+            2 => .http2,
+            else => .http1,
+        },
+        ._drain = req.drain,
+        ._executor = placement.currentExecutor(req.io),
         // The stream's task serves the socket for its whole life over
         // HTTP/2 and HTTP/3; over HTTP/1.1 a callback socket outlives the
         // task that opened it where connections park (not on Windows).
-        .task = if (h2 or abort_cancels_h1_reader) placement.currentTask(req.io) else null,
+        ._task = if (h2 or abort_cancels_h1_reader) placement.currentTask(req.io) else null,
     };
     if (h2) {
-        socket.conn = .{ .h2 = try H2Socket.accept(req, res, options.max_message_size, negotiated) };
+        socket._conn = .{ .stream = try H2Socket.accept(req, res, max_message, negotiated) };
     } else {
         const ws = try alloc.create(WebSocket);
         errdefer if (owner != null) alloc.destroy(ws);
-        ws.* = (try res.upgradeWebSocket(req)) orelse {
+        ws.* = (try res._upgradeWebSocket(req)) orelse {
             if (owner != null) alloc.destroy(ws);
             if (comptime features.compression) if (owner != null) if (deflate) |d| alloc.destroy(d);
+            if (owner != null) if (subprotocol) |sp| alloc.free(sp);
             return null;
         };
         // Its messages' memory too, when the socket outlives the request
         // (empty yet).
         if (owner != null) ws.msg_arena = .init(alloc);
-        ws.max_message_size = options.max_message_size;
+        ws.max_message_size = max_message;
         ws.rsv1_allowed = negotiated;
-        socket.conn = .{ .h1 = ws };
+        socket._conn = .{ .h1 = ws };
     }
-    req.setTimeout(options.timeout);
-    if (options.close_on_drain) if (req.drain_hooks) |hooks| {
+    req.setDeadline(options.timeout);
+    if (options.close_on_drain) if (req._drain_hooks) |hooks| {
         const watch = try alloc.create(DrainWatch);
         watch.* = .{
             .hooks = hooks,
             .io = req.io,
-            .conn = socket.conn,
+            .conn = socket._conn,
             // Copied for a socket in the request's arena, where `options`
             // may be a caller's temporary; a socket that outlives the
             // request has comptime options.
@@ -515,17 +627,18 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
             .executor = placement.currentExecutor(req.io),
         };
         hooks.add(req.io, &watch.hook);
-        socket.drain_watch = watch;
+        socket._drain_watch = watch;
     };
     return socket;
 }
 
 /// Deinitializes `socket` and frees what `openSocket` took from `owner`.
 fn freeParts(owner: std.mem.Allocator, socket: *Socket) void {
-    const ws = socket.conn.h1;
+    const ws = socket._conn.h1;
     socket.deinit();
-    if (comptime features.compression) if (socket.deflate) |d| owner.destroy(d);
-    if (socket.drain_watch) |w| owner.destroy(w);
+    if (comptime features.compression) if (socket._deflate) |d| owner.destroy(d);
+    if (socket._drain_watch) |w| owner.destroy(w);
+    if (socket.subprotocol) |sp| owner.free(sp);
     owner.destroy(ws);
 }
 
@@ -542,7 +655,7 @@ noinline fn failed(ws: *Socket, req: *dusty.Request, res: *dusty.Response, err: 
     // The peer went away mid-send: not the handler's fault.
     if (res.peerGone()) return;
     std.log.scoped(.anole).warn("WebSocket handler for {s} failed: {t}", .{ req.url, err });
-    if (!ws.closed.load(.acquire)) ws.close(.internal_error, "") catch {};
+    if (!ws._closed.load(.acquire)) ws.close(.internal_error, "") catch {};
 }
 
 /// A route handler for `Server.ws`: upgrades, runs `handler` with the open
@@ -569,7 +682,7 @@ pub fn route(comptime Ctx: type, comptime handler: anytype, comptime options: Up
                 else => unreachable,
             };
             result catch |err| return failed(&ws, req, res, err);
-            if (!ws.closed.load(.acquire)) ws.close(.normal, "") catch {};
+            if (!ws._closed.load(.acquire)) ws.close(.normal, "") catch {};
         }
     };
     return if (Ctx == void) struct {
@@ -710,7 +823,7 @@ const H1Callbacks = struct {
     const window_len = 2048;
 
     fn open(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions, table: *const Table, state: ?*anyopaque) !?*H1Callbacks {
-        const gpa = res.conn.allocator;
+        const gpa = res._conn.?.allocator;
         const self = try gpa.create(H1Callbacks);
         errdefer gpa.destroy(self);
         var socket = (try openSocket(req, res, options, gpa)) orelse {
@@ -741,12 +854,12 @@ const H1Callbacks = struct {
         self.ending = true;
         if (err == error.Canceled) return;
         std.log.scoped(.anole).warn("WebSocket open for {s} failed: {t}", .{ req.url, err });
-        if (!self.socket.closed.load(.acquire)) self.socket.close(.internal_error, "") catch {};
+        if (!self.socket._closed.load(.acquire)) self.socket.close(.internal_error, "") catch {};
     }
 
     fn serve(a: *dusty.Adopter, burst: *dusty.Burst) anyerror!dusty.Burst.End {
         const self: *H1Callbacks = @fieldParentPtr("adopter", a);
-        const ws = self.socket.conn.h1;
+        const ws = self.socket._conn.h1;
         if (self.ending) return self.finish(null);
         // The core gives the request's buffers back before the first run,
         // unless the peer sent something behind the handshake already: then
@@ -769,7 +882,7 @@ const H1Callbacks = struct {
             };
             switch (msg.type) {
                 .text, .binary => self.table.message(self.state, &self.socket, msg) catch |err| {
-                    if (err != error.Canceled and !self.socket.closed.load(.acquire)) {
+                    if (err != error.Canceled and !self.socket._closed.load(.acquire)) {
                         std.log.scoped(.anole).warn("WebSocket message handler failed: {t}", .{err});
                         self.socket.close(.internal_error, "") catch {};
                     }
@@ -788,8 +901,8 @@ const H1Callbacks = struct {
         if (err) |e| if (self.socket.end_error == null and self.socket.close_code == null) {
             self.socket.end_error = e;
         };
-        self.socket.closed.store(true, .release);
-        self.socket.conn.h1.shut();
+        self.socket._closed.store(true, .release);
+        self.socket._conn.h1.shut();
         return .close;
     }
 
@@ -798,8 +911,8 @@ const H1Callbacks = struct {
         const gpa = self.gpa;
         // Closed by the server (a deadline, the stop) while parked, or
         // before its first run: no frame goes out from here on.
-        self.socket.closed.store(true, .release);
-        self.socket.conn.h1.shut();
+        self.socket._closed.store(true, .release);
+        self.socket._conn.h1.shut();
         self.table.close(self.state, &self.socket);
         freeParts(gpa, &self.socket);
         gpa.destroy(self);
@@ -971,12 +1084,8 @@ pub const Rooms = struct {
     /// No rooms yet. `allocator` holds the room names, members and queued
     /// messages; it must be thread-safe when sockets on several executors
     /// join.
-    pub fn init(allocator: std.mem.Allocator) Rooms {
-        return .{ .allocator = allocator };
-    }
-
-    /// `init` with options other than the defaults.
-    pub fn initOptions(allocator: std.mem.Allocator, options: Options) Rooms {
+    /// `Rooms.init(gpa, .{})` takes the defaults.
+    pub fn init(allocator: std.mem.Allocator, options: Options) Rooms {
         return .{ .allocator = allocator, .options = options };
     }
 
@@ -1015,22 +1124,22 @@ pub const Rooms = struct {
     }
 
     fn lockMemberships(socket: *Socket) void {
-        while (!socket.memberships_lock.tryLock()) std.atomic.spinLoopHint();
+        while (!socket._memberships_lock.tryLock()) std.atomic.spinLoopHint();
     }
 
     /// `m` into `socket`'s memberships. Under the mutex.
     fn linkMember(socket: *Socket, m: *Member) void {
         lockMemberships(socket);
-        defer socket.memberships_lock.unlock();
-        m.next_of_socket = socket.memberships;
-        socket.memberships = m;
+        defer socket._memberships_lock.unlock();
+        m.next_of_socket = socket._memberships;
+        socket._memberships = m;
     }
 
     /// `m` out of `socket`'s memberships. Under the mutex.
     fn unlinkMember(socket: *Socket, m: *Member) void {
         lockMemberships(socket);
-        defer socket.memberships_lock.unlock();
-        var link = &socket.memberships;
+        defer socket._memberships_lock.unlock();
+        var link = &socket._memberships;
         while (link.*) |cur| : (link = &cur.next_of_socket) {
             if (cur == m) {
                 link.* = cur.next_of_socket;
@@ -1044,13 +1153,13 @@ pub const Rooms = struct {
     fn leaveEvery(socket: *Socket) void {
         while (true) {
             lockMemberships(socket);
-            const first = socket.memberships orelse {
-                socket.memberships_lock.unlock();
+            const first = socket._memberships orelse {
+                socket._memberships_lock.unlock();
                 return;
             };
             // Alive as long as a socket is in it (see `Rooms`).
             const rooms = first.rooms;
-            socket.memberships_lock.unlock();
+            socket._memberships_lock.unlock();
             rooms.leaveAllOf(socket);
         }
     }
@@ -1063,8 +1172,8 @@ pub const Rooms = struct {
         var mine: ?*Member = null;
         {
             lockMemberships(socket);
-            defer socket.memberships_lock.unlock();
-            var link = &socket.memberships;
+            defer socket._memberships_lock.unlock();
+            var link = &socket._memberships;
             while (link.*) |m| {
                 if (m.rooms == self) {
                     link.* = m.next_of_socket;
@@ -1254,7 +1363,7 @@ pub const Rooms = struct {
     /// Starts `m`'s sender, `m.running` already set. Without a task to
     /// spare, what is queued waits for the next broadcast to try again.
     fn startSender(self: *Rooms, io: std.Io, m: *Member) void {
-        const where: placement.Where = if (m.socket.executor) |i| .{ .executor = i } else .local;
+        const where: placement.Where = if (m.socket._executor) |i| .{ .executor = i } else .local;
         placement.concurrent(&m.sender, io, where, sendQueued, .{ self, m }) catch {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
@@ -1327,4 +1436,47 @@ test "WebSocket accept key matches RFC 6455 section 1.3" {
     var out: [28]u8 = undefined;
     WebSocket.computeAcceptKey("dGhlIHNhbXBsZSBub25jZQ==", &out);
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &out);
+}
+
+test "isUpgrade and offeredSubprotocols: header lines, commas, spaces, HTTP/2 :protocol" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var req: dusty.Request = .{ .arena = a, ._transport = undefined, ._parser = undefined };
+    req.headers = try dusty.Headers.init(a, 16);
+    // Not a handshake yet.
+    try std.testing.expect(!isUpgrade(&req));
+    req.method = .get;
+    try req.headers.add("Upgrade", "WebSocket");
+    try req.headers.add("Connection", "keep-alive, Upgrade");
+    try req.headers.add("Sec-WebSocket-Version", "13");
+    try req.headers.add("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    try req.headers.add("Sec-WebSocket-Protocol", "b ,  a,,\tc");
+    try req.headers.add("sec-websocket-protocol", "d");
+    try std.testing.expect(isUpgrade(&req));
+    var it = offeredSubprotocols(&req);
+    const want = [_][]const u8{ "b", "a", "c", "d" };
+    for (want) |w| try std.testing.expectEqualStrings(w, it.next().?);
+    try std.testing.expect(it.next() == null);
+    try std.testing.expectEqualStrings("a", selectSubprotocol(&req, &.{ "x", "a", "b" }).?);
+    try std.testing.expectEqualStrings("d", selectSubprotocol(&req, &.{ "d", "a" }).?);
+    try std.testing.expect(selectSubprotocol(&req, &.{"x"}) == null);
+    try std.testing.expect(selectSubprotocol(&req, &.{}) == null);
+    // Wrong version.
+    try req.headers.put("Sec-WebSocket-Version", "8");
+    try std.testing.expect(!isUpgrade(&req));
+    // HTTP/2 extended CONNECT.
+    if (features.http2 or features.http3) {
+        req.protocol = "websocket";
+        try req.headers.put("Sec-WebSocket-Version", "13");
+        try std.testing.expect(isUpgrade(&req));
+        req.protocol = "connect-udp";
+        try std.testing.expect(!isUpgrade(&req));
+    }
+    try std.testing.expect(isToken("graphql-transport-ws"));
+    try std.testing.expect(!isToken("a b"));
+    try std.testing.expect(!isToken(""));
+    try std.testing.expect(!handshakeHeaderAllowed("sec-websocket-accept"));
+    try std.testing.expect(!handshakeHeaderAllowed("Content-Length"));
+    try std.testing.expect(handshakeHeaderAllowed("Set-Cookie"));
 }

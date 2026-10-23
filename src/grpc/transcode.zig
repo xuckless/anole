@@ -831,7 +831,7 @@ fn Dispatch(comptime Ctx: type) type {
 /// Adds the REST routes of one method's bindings to `router`.
 pub fn registerMethod(
     comptime Ctx: type,
-    router: *dusty.Router(Ctx),
+    target: anytype,
     comptime Service: type,
     comptime name: []const u8,
     comptime M: type,
@@ -850,7 +850,7 @@ pub fn registerMethod(
                 return server.serveTranscoded(M, handler, rule.body, rule.response_body, ctx, req, res, captures, opts);
             }
         };
-        addBinding(Ctx, router, rule.method, &B.template, B.serve, options, where ++ " (" ++ rule.pattern ++ ")", false);
+        addBinding(Ctx, target, rule.method, &B.template, B.serve, options, where ++ " (" ++ rule.pattern ++ ")", false);
     }
 }
 
@@ -862,7 +862,7 @@ pub fn registerMethod(
 /// that makes its route.
 pub fn addBinding(
     comptime Ctx: type,
-    router: *dusty.Router(Ctx),
+    target: anytype,
     method: dusty.Method,
     template: *const Template,
     serve: *const ServeFn,
@@ -870,6 +870,7 @@ pub fn addBinding(
     where: []const u8,
     no_wait: bool,
 ) void {
+    const router = server.routerOf(Ctx, target);
     const alloc = router.arena.allocator();
     const binding = alloc.create(Binding) catch @panic("OOM");
     binding.* = .{ .template = template, .serve = serve, .options = options, .where = where };
@@ -919,7 +920,12 @@ pub fn addBinding(
     if (node) |n| if (n.route) |opaque_route| {
         const route: *const dusty.Router(Ctx).Route = @ptrCast(@alignCast(opaque_route));
         if (route.action != &Dispatch(Ctx).handle) {
-            std.debug.panic("google.api.http on {s}: {s} {s} is already a route", .{ where, method.name(), route.info.path });
+            router.conflicted("google.api.http on {s}: {s} {s} is already a route", .{ where, method.name(), route.info.path }) catch @panic("OOM");
+            return;
+        }
+        if (!sameChain(Ctx, route.middlewares, server.chainOf(Ctx, target))) {
+            router.conflicted("google.api.http on {s}: {s} {s} is already a route of a service registered with other middleware", .{ where, method.name(), route.info.path }) catch @panic("OOM");
+            return;
         }
         const bindings: *Bindings = @ptrCast(@alignCast(@constCast(route.info.data.?)));
         insert(bindings, binding, method);
@@ -927,7 +933,14 @@ pub fn addBinding(
     };
     const bindings = alloc.create(Bindings) catch @panic("OOM");
     bindings.* = .{ .first = binding };
-    router.addRouteWith(method, path.items, Dispatch(Ctx).handle, .{ .data = bindings, .no_wait = no_wait });
+    server.addRoute(Ctx, target, method, path.items, Dispatch(Ctx).handle, .{ .data = bindings, .no_wait = no_wait });
+}
+
+/// Whether two middleware chains are the same handles in the same order.
+fn sameChain(comptime Ctx: type, a: []const dusty.Middleware(Ctx), b: []const dusty.Middleware(Ctx)) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (x.ptr != y.ptr or x.executeFn != y.executeFn) return false;
+    return true;
 }
 
 fn insert(bindings: *Bindings, binding: *Binding, method: dusty.Method) void {

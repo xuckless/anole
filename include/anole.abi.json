@@ -1,0 +1,1640 @@
+{
+  "anole_abi_json": 1,
+  "abi": {
+    "major": 0,
+    "minor": 7,
+    "version": 7
+  },
+  "endian": "little",
+  "record_align": 8,
+  "handle_kinds": [
+    {
+      "kind": 1,
+      "name": "request",
+      "c_type": "anole_req"
+    },
+    {
+      "kind": 2,
+      "name": "websocket",
+      "c_type": "anole_ws"
+    },
+    {
+      "kind": 3,
+      "name": "grpc_call",
+      "c_type": "anole_grpc_call"
+    },
+    {
+      "kind": 4,
+      "name": "wt_session",
+      "c_type": "anole_wt"
+    },
+    {
+      "kind": 5,
+      "name": "wt_stream",
+      "c_type": "anole_wt_stream"
+    },
+    {
+      "kind": 6,
+      "name": "db_tx",
+      "c_type": "anole_db_tx"
+    }
+  ],
+  "events": [
+    {
+      "type": 0,
+      "name": "ANOLE_EV_NONE",
+      "record": "anole_event",
+      "handles": [],
+      "obligation": null
+    },
+    {
+      "type": 1,
+      "name": "ANOLE_EV_REQUEST",
+      "record": "anole_request_event",
+      "handles": [
+        "request"
+      ],
+      "obligation": "answer"
+    },
+    {
+      "type": 2,
+      "name": "ANOLE_EV_BODY",
+      "record": "anole_event",
+      "handles": [
+        "request"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 3,
+      "name": "ANOLE_EV_ABORT",
+      "record": "anole_abort_event",
+      "handles": [
+        "request",
+        "grpc_call"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 4,
+      "name": "ANOLE_EV_WRITABLE",
+      "record": "anole_event",
+      "handles": [
+        "request",
+        "grpc_call",
+        "websocket",
+        "wt_stream"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 5,
+      "name": "ANOLE_EV_SENT",
+      "record": "anole_sent_event",
+      "handles": [
+        "request",
+        "websocket",
+        "grpc_call",
+        "wt_stream",
+        "wt_session"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 6,
+      "name": "ANOLE_EV_WS_OPEN",
+      "record": "anole_request_event",
+      "handles": [
+        "websocket"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 7,
+      "name": "ANOLE_EV_WS_MESSAGE",
+      "record": "anole_ws_message_event",
+      "handles": [
+        "websocket"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 8,
+      "name": "ANOLE_EV_WS_CLOSE",
+      "record": "anole_ws_close_event",
+      "handles": [
+        "websocket"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 10,
+      "name": "ANOLE_EV_DB_RESULT",
+      "record": "anole_db_result_event",
+      "handles": [
+        "db_tx"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 11,
+      "name": "ANOLE_EV_STOPPED",
+      "record": "anole_event",
+      "handles": [],
+      "obligation": null
+    },
+    {
+      "type": 12,
+      "name": "ANOLE_EV_GRPC_CALL",
+      "record": "anole_grpc_call_event",
+      "handles": [
+        "grpc_call"
+      ],
+      "obligation": "finish"
+    },
+    {
+      "type": 13,
+      "name": "ANOLE_EV_GRPC_MESSAGE",
+      "record": "anole_grpc_message_event",
+      "handles": [
+        "grpc_call"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 14,
+      "name": "ANOLE_EV_GRPC_HALF_CLOSE",
+      "record": "anole_event",
+      "handles": [
+        "grpc_call"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 20,
+      "name": "ANOLE_EV_WT_OPEN",
+      "record": "anole_request_event",
+      "handles": [
+        "wt_session"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 21,
+      "name": "ANOLE_EV_WT_CLOSE",
+      "record": "anole_wt_close_event",
+      "handles": [
+        "wt_session"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 22,
+      "name": "ANOLE_EV_WT_DRAIN",
+      "record": "anole_event",
+      "handles": [
+        "wt_session"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 23,
+      "name": "ANOLE_EV_WT_STREAM",
+      "record": "anole_wt_stream_event",
+      "handles": [
+        "wt_stream"
+      ],
+      "obligation": "release"
+    },
+    {
+      "type": 24,
+      "name": "ANOLE_EV_WT_DATA",
+      "record": "anole_wt_data_event",
+      "handles": [
+        "wt_stream"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 25,
+      "name": "ANOLE_EV_WT_STREAM_RESET",
+      "record": "anole_wt_code_event",
+      "handles": [
+        "wt_stream"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 26,
+      "name": "ANOLE_EV_WT_STREAM_STOP",
+      "record": "anole_wt_code_event",
+      "handles": [
+        "wt_stream"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 27,
+      "name": "ANOLE_EV_WT_DATAGRAM",
+      "record": "anole_wt_datagram_event",
+      "handles": [
+        "wt_session"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 40,
+      "name": "ANOLE_EV_WS_UPGRADE",
+      "record": "anole_request_event",
+      "handles": [
+        "request"
+      ],
+      "obligation": "accept or answer"
+    },
+    {
+      "type": 41,
+      "name": "ANOLE_EV_DRAINING",
+      "record": "anole_event",
+      "handles": [],
+      "obligation": null
+    }
+  ],
+  "event_ranges": [
+    {
+      "from": 0,
+      "to": 0,
+      "use": "none: only the header written on ANOLE_E_TOOBIG"
+    },
+    {
+      "from": 1,
+      "to": 11,
+      "use": "core (9 retired)"
+    },
+    {
+      "from": 12,
+      "to": 19,
+      "use": "gRPC"
+    },
+    {
+      "from": 20,
+      "to": 29,
+      "use": "WebTransport"
+    },
+    {
+      "from": 30,
+      "to": 39,
+      "use": "database"
+    },
+    {
+      "from": 40,
+      "to": 49,
+      "use": "HTTP and WebSocket additions"
+    },
+    {
+      "from": 50,
+      "to": 63,
+      "use": "core additions"
+    },
+    {
+      "from": 64,
+      "to": 255,
+      "use": "new areas, a block of 16 per area"
+    },
+    {
+      "from": 256,
+      "to": 2147483647,
+      "use": "never used"
+    },
+    {
+      "from": 2147483648,
+      "to": 4294967295,
+      "use": "never used by Anole: free for a binding's own synthetic events"
+    }
+  ],
+  "constants": {
+    "abi": {},
+    "abort_reason": {
+      "ANOLE_ABORT_CLIENT": 1,
+      "ANOLE_ABORT_DEADLINE": 2,
+      "ANOLE_ABORT_BODY": 3,
+      "ANOLE_ABORT_DRAIN": 4,
+      "ANOLE_ABORT_SERVER": 5
+    },
+    "body_flag": {
+      "ANOLE_BODY_BORROW": 1
+    },
+    "consumer_flag": {
+      "ANOLE_CONSUMER_F_SHARED": 1
+    },
+    "db_error_class": {
+      "ANOLE_DB_ERR_NONE": 0,
+      "ANOLE_DB_ERR_UNIQUE": 1,
+      "ANOLE_DB_ERR_EXCLUSION": 2,
+      "ANOLE_DB_ERR_FOREIGN_KEY": 3,
+      "ANOLE_DB_ERR_NOT_NULL": 4,
+      "ANOLE_DB_ERR_CHECK": 5,
+      "ANOLE_DB_ERR_SERIALIZATION": 6,
+      "ANOLE_DB_ERR_DEADLOCK": 7,
+      "ANOLE_DB_ERR_UNAVAILABLE": 8,
+      "ANOLE_DB_ERR_TIMEOUT": 9,
+      "ANOLE_DB_ERR_OTHER": 10
+    },
+    "db_flag": {
+      "ANOLE_DB_F_WRITE": 1,
+      "ANOLE_DB_F_COALESCE": 2,
+      "ANOLE_DB_F_NO_PREPARE": 4,
+      "ANOLE_DB_F_DROP_EMPTY": 8
+    },
+    "db_isolation": {
+      "ANOLE_DB_ISOLATION_DEFAULT": 0,
+      "ANOLE_DB_ISOLATION_READ_UNCOMMITTED": 1,
+      "ANOLE_DB_ISOLATION_READ_COMMITTED": 2,
+      "ANOLE_DB_ISOLATION_REPEATABLE_READ": 3,
+      "ANOLE_DB_ISOLATION_SERIALIZABLE": 4
+    },
+    "db_source": {
+      "ANOLE_DB_FROM_DATABASE": 0,
+      "ANOLE_DB_FROM_COALESCED": 1,
+      "ANOLE_DB_FROM_CACHE": 2
+    },
+    "db_timeout": {
+      "ANOLE_DB_TIMEOUT_NONE": 4294967295
+    },
+    "db_tx_flag": {
+      "ANOLE_DB_TX_READ_ONLY": 1
+    },
+    "db_type": {
+      "ANOLE_DB_TYPE_NULL": 0,
+      "ANOLE_DB_TYPE_INT": 1,
+      "ANOLE_DB_TYPE_FLOAT": 2,
+      "ANOLE_DB_TYPE_TEXT": 3,
+      "ANOLE_DB_TYPE_BLOB": 4,
+      "ANOLE_DB_TYPE_BOOL": 5,
+      "ANOLE_DB_TYPE_ARRAY": 6,
+      "ANOLE_DB_TYPE_MAP": 7,
+      "ANOLE_DB_TYPE_ERROR": 8,
+      "ANOLE_DB_TYPE_BSON": 9
+    },
+    "event": {
+      "ANOLE_EV_NONE": 0,
+      "ANOLE_EV_REQUEST": 1,
+      "ANOLE_EV_BODY": 2,
+      "ANOLE_EV_ABORT": 3,
+      "ANOLE_EV_WRITABLE": 4,
+      "ANOLE_EV_SENT": 5,
+      "ANOLE_EV_WS_OPEN": 6,
+      "ANOLE_EV_WS_MESSAGE": 7,
+      "ANOLE_EV_WS_CLOSE": 8,
+      "ANOLE_EV_DB_RESULT": 10,
+      "ANOLE_EV_STOPPED": 11,
+      "ANOLE_EV_GRPC_CALL": 12,
+      "ANOLE_EV_GRPC_MESSAGE": 13,
+      "ANOLE_EV_GRPC_HALF_CLOSE": 14,
+      "ANOLE_EV_WT_OPEN": 20,
+      "ANOLE_EV_WT_CLOSE": 21,
+      "ANOLE_EV_WT_DRAIN": 22,
+      "ANOLE_EV_WT_STREAM": 23,
+      "ANOLE_EV_WT_DATA": 24,
+      "ANOLE_EV_WT_STREAM_RESET": 25,
+      "ANOLE_EV_WT_STREAM_STOP": 26,
+      "ANOLE_EV_WT_DATAGRAM": 27,
+      "ANOLE_EV_WS_UPGRADE": 40,
+      "ANOLE_EV_DRAINING": 41
+    },
+    "grpc_call_flag": {
+      "ANOLE_GRPC_CALL_MESSAGE": 1,
+      "ANOLE_GRPC_CALL_PEER_CERT": 2,
+      "ANOLE_GRPC_CALL_SECURE": 4,
+      "ANOLE_GRPC_CALL_EARLY_DATA": 8,
+      "ANOLE_GRPC_CALL_JSON": 16,
+      "ANOLE_GRPC_CALL_COMPRESSED": 32
+    },
+    "grpc_health": {
+      "ANOLE_GRPC_HEALTH_UNKNOWN": 0,
+      "ANOLE_GRPC_HEALTH_SERVING": 1,
+      "ANOLE_GRPC_HEALTH_NOT_SERVING": 2
+    },
+    "grpc_kind": {
+      "ANOLE_GRPC_KIND_UNARY": 0,
+      "ANOLE_GRPC_KIND_SERVER_STREAMING": 1,
+      "ANOLE_GRPC_KIND_CLIENT_STREAMING": 2,
+      "ANOLE_GRPC_KIND_BIDI_STREAMING": 3
+    },
+    "grpc_protocol": {
+      "ANOLE_GRPC_PROTOCOL_GRPC": 0,
+      "ANOLE_GRPC_PROTOCOL_GRPC_WEB": 1,
+      "ANOLE_GRPC_PROTOCOL_GRPC_WEB_TEXT": 2,
+      "ANOLE_GRPC_PROTOCOL_CONNECT": 3,
+      "ANOLE_GRPC_PROTOCOL_CONNECT_STREAM": 4,
+      "ANOLE_GRPC_PROTOCOL_HTTP_JSON": 5
+    },
+    "grpc_send_flag": {
+      "ANOLE_GRPC_F_FINISH": 2
+    },
+    "grpc_status": {
+      "ANOLE_GRPC_STATUS_OK": 0,
+      "ANOLE_GRPC_STATUS_CANCELLED": 1,
+      "ANOLE_GRPC_STATUS_UNKNOWN": 2,
+      "ANOLE_GRPC_STATUS_INVALID_ARGUMENT": 3,
+      "ANOLE_GRPC_STATUS_DEADLINE_EXCEEDED": 4,
+      "ANOLE_GRPC_STATUS_NOT_FOUND": 5,
+      "ANOLE_GRPC_STATUS_ALREADY_EXISTS": 6,
+      "ANOLE_GRPC_STATUS_PERMISSION_DENIED": 7,
+      "ANOLE_GRPC_STATUS_RESOURCE_EXHAUSTED": 8,
+      "ANOLE_GRPC_STATUS_FAILED_PRECONDITION": 9,
+      "ANOLE_GRPC_STATUS_ABORTED": 10,
+      "ANOLE_GRPC_STATUS_OUT_OF_RANGE": 11,
+      "ANOLE_GRPC_STATUS_UNIMPLEMENTED": 12,
+      "ANOLE_GRPC_STATUS_INTERNAL": 13,
+      "ANOLE_GRPC_STATUS_UNAVAILABLE": 14,
+      "ANOLE_GRPC_STATUS_DATA_LOSS": 15,
+      "ANOLE_GRPC_STATUS_UNAUTHENTICATED": 16
+    },
+    "listener_flag": {
+      "ANOLE_LISTENER_F_TLS": 1,
+      "ANOLE_LISTENER_F_HTTP1": 2,
+      "ANOLE_LISTENER_F_HTTP2": 4,
+      "ANOLE_LISTENER_F_HTTP3": 8,
+      "ANOLE_LISTENER_F_UNIX": 16,
+      "ANOLE_LISTENER_F_PROXY_PROTOCOL": 32
+    },
+    "listener_state": {
+      "ANOLE_LISTENER_PENDING": 0,
+      "ANOLE_LISTENER_LISTENING": 1,
+      "ANOLE_LISTENER_FAILED": 2,
+      "ANOLE_LISTENER_CLOSED": 3
+    },
+    "log_level": {
+      "ANOLE_LOG_ERROR": 1,
+      "ANOLE_LOG_WARN": 2,
+      "ANOLE_LOG_INFO": 3,
+      "ANOLE_LOG_DEBUG": 4
+    },
+    "method": {
+      "ANOLE_METHOD_OTHER": 0,
+      "ANOLE_METHOD_GET": 1,
+      "ANOLE_METHOD_HEAD": 2,
+      "ANOLE_METHOD_POST": 3,
+      "ANOLE_METHOD_PUT": 4,
+      "ANOLE_METHOD_DELETE": 5,
+      "ANOLE_METHOD_CONNECT": 6,
+      "ANOLE_METHOD_OPTIONS": 7,
+      "ANOLE_METHOD_TRACE": 8,
+      "ANOLE_METHOD_PATCH": 9
+    },
+    "poll_flag": {
+      "ANOLE_POLL_F_NOARM": 1
+    },
+    "req_flag": {
+      "ANOLE_REQ_BODY_INLINE": 1,
+      "ANOLE_REQ_BODY_STREAM": 2,
+      "ANOLE_REQ_SECURE": 4,
+      "ANOLE_REQ_EARLY_DATA": 8,
+      "ANOLE_REQ_PEER_CERT": 16
+    },
+    "server_flag": {
+      "ANOLE_SERVER_F_SIGNALS": 1
+    },
+    "status": {
+      "ANOLE_OK": 0,
+      "ANOLE_BUSY": 1,
+      "ANOLE_E_INVALID": -1,
+      "ANOLE_E_GONE": -2,
+      "ANOLE_E_AGAIN": -3,
+      "ANOLE_E_NOMEM": -4,
+      "ANOLE_E_CONFIG": -5,
+      "ANOLE_E_STATE": -6,
+      "ANOLE_E_UNSUPPORTED": -7,
+      "ANOLE_E_TOOBIG": -8,
+      "ANOLE_E_SYSTEM": -9,
+      "ANOLE_E_TIMEOUT": -10,
+      "ANOLE_E_DB": -11
+    },
+    "tls_flag": {
+      "ANOLE_TLS_F_PEM": 1
+    },
+    "ws_type": {
+      "ANOLE_WS_TEXT": 1,
+      "ANOLE_WS_BINARY": 2
+    },
+    "wt_closed_by": {
+      "ANOLE_WT_CLOSED_LOCAL": 0,
+      "ANOLE_WT_CLOSED_PEER": 1,
+      "ANOLE_WT_CLOSED_CONNECTION": 2
+    },
+    "wt_flag": {
+      "ANOLE_WT_F_UNI": 1,
+      "ANOLE_WT_F_FIN": 2
+    }
+  },
+  "records": {
+    "anole_str": {
+      "size": 16,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ptr",
+          "offset": 0,
+          "type": "ptr"
+        },
+        {
+          "name": "len",
+          "offset": 8,
+          "type": "usize"
+        }
+      ]
+    },
+    "anole_header": {
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "name",
+          "offset": 0,
+          "type": "anole_str"
+        },
+        {
+          "name": "value",
+          "offset": 16,
+          "type": "anole_str"
+        }
+      ]
+    },
+    "anole_server_options": {
+      "size": 48,
+      "align": 8,
+      "fields": [
+        {
+          "name": "size",
+          "offset": 0,
+          "type": "usize"
+        },
+        {
+          "name": "config_json",
+          "offset": 8,
+          "type": "anole_str"
+        },
+        {
+          "name": "flags",
+          "offset": 24,
+          "type": "u32"
+        },
+        {
+          "name": "log_level",
+          "offset": 28,
+          "type": "u32"
+        },
+        {
+          "name": "log",
+          "offset": 32,
+          "type": "fnptr"
+        },
+        {
+          "name": "log_ud",
+          "offset": 40,
+          "type": "ptr"
+        }
+      ]
+    },
+    "anole_stats": {
+      "size": 120,
+      "align": 8,
+      "fields": [
+        {
+          "name": "size",
+          "offset": 0,
+          "type": "usize"
+        },
+        {
+          "name": "requests",
+          "offset": 8,
+          "type": "u64"
+        },
+        {
+          "name": "detached",
+          "offset": 16,
+          "type": "u64"
+        },
+        {
+          "name": "inflight",
+          "offset": 24,
+          "type": "u64"
+        },
+        {
+          "name": "expired",
+          "offset": 32,
+          "type": "u64"
+        },
+        {
+          "name": "aborted",
+          "offset": 40,
+          "type": "u64"
+        },
+        {
+          "name": "gone",
+          "offset": 48,
+          "type": "u64"
+        },
+        {
+          "name": "busy",
+          "offset": 56,
+          "type": "u64"
+        },
+        {
+          "name": "wakes",
+          "offset": 64,
+          "type": "u64"
+        },
+        {
+          "name": "rewakes",
+          "offset": 72,
+          "type": "u64"
+        },
+        {
+          "name": "websockets",
+          "offset": 80,
+          "type": "u64"
+        },
+        {
+          "name": "ws_messages_in",
+          "offset": 88,
+          "type": "u64"
+        },
+        {
+          "name": "ws_messages_out",
+          "offset": 96,
+          "type": "u64"
+        },
+        {
+          "name": "wt_sessions",
+          "offset": 104,
+          "type": "u64"
+        },
+        {
+          "name": "wt_datagrams_dropped",
+          "offset": 112,
+          "type": "u64"
+        }
+      ]
+    },
+    "anole_consumer_options": {
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "size",
+          "offset": 0,
+          "type": "usize"
+        },
+        {
+          "name": "wake",
+          "offset": 8,
+          "type": "fnptr"
+        },
+        {
+          "name": "wake_ud",
+          "offset": 16,
+          "type": "ptr"
+        },
+        {
+          "name": "flags",
+          "offset": 24,
+          "type": "u32"
+        }
+      ]
+    },
+    "anole_event": {
+      "size": 16,
+      "align": 8,
+      "fields": [
+        {
+          "name": "type",
+          "offset": 0,
+          "type": "u32"
+        },
+        {
+          "name": "len",
+          "offset": 4,
+          "type": "u32"
+        },
+        {
+          "name": "handle",
+          "offset": 8,
+          "type": "u64"
+        }
+      ]
+    },
+    "anole_span": {
+      "size": 8,
+      "align": 4,
+      "fields": [
+        {
+          "name": "off",
+          "offset": 0,
+          "type": "u32"
+        },
+        {
+          "name": "len",
+          "offset": 4,
+          "type": "u32"
+        }
+      ]
+    },
+    "anole_request_event": {
+      "size": 128,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "route_id",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "method",
+          "offset": 20,
+          "type": "u8"
+        },
+        {
+          "name": "version",
+          "offset": 21,
+          "type": "u8"
+        },
+        {
+          "name": "flags",
+          "offset": 22,
+          "type": "u16"
+        },
+        {
+          "name": "method_name",
+          "offset": 24,
+          "type": "anole_span"
+        },
+        {
+          "name": "path",
+          "offset": 32,
+          "type": "anole_span"
+        },
+        {
+          "name": "query",
+          "offset": 40,
+          "type": "anole_span"
+        },
+        {
+          "name": "body",
+          "offset": 48,
+          "type": "anole_span"
+        },
+        {
+          "name": "remote_addr",
+          "offset": 56,
+          "type": "anole_span"
+        },
+        {
+          "name": "listener",
+          "offset": 64,
+          "type": "anole_span"
+        },
+        {
+          "name": "id",
+          "offset": 72,
+          "type": "anole_span"
+        },
+        {
+          "name": "claims",
+          "offset": 80,
+          "type": "anole_span"
+        },
+        {
+          "name": "nheaders",
+          "offset": 88,
+          "type": "u16"
+        },
+        {
+          "name": "nparams",
+          "offset": 90,
+          "type": "u16"
+        },
+        {
+          "name": "spans_off",
+          "offset": 92,
+          "type": "u32"
+        },
+        {
+          "name": "content_length",
+          "offset": 96,
+          "type": "u64"
+        },
+        {
+          "name": "peer_cert",
+          "offset": 104,
+          "type": "anole_span"
+        },
+        {
+          "name": "timeout_us",
+          "offset": 112,
+          "type": "i64"
+        },
+        {
+          "name": "subprotocol",
+          "offset": 120,
+          "type": "anole_span"
+        }
+      ],
+      "arrays": [
+        {
+          "name": "headers",
+          "at": "spans_off",
+          "item": "anole_span",
+          "count": "2*nheaders"
+        },
+        {
+          "name": "params",
+          "after": "headers",
+          "item": "anole_span",
+          "count": "2*nparams"
+        }
+      ]
+    },
+    "anole_abort_event": {
+      "size": 24,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "reason",
+          "offset": 16,
+          "type": "u16"
+        },
+        {
+          "name": "status",
+          "offset": 18,
+          "type": "u16"
+        },
+        {
+          "name": "reserved",
+          "offset": 20,
+          "type": "u32"
+        }
+      ]
+    },
+    "anole_sent_event": {
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "data",
+          "offset": 16,
+          "type": "u64"
+        },
+        {
+          "name": "len",
+          "offset": 24,
+          "type": "u64"
+        }
+      ]
+    },
+    "anole_ws_message_event": {
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "route_id",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "type",
+          "offset": 20,
+          "type": "u32"
+        },
+        {
+          "name": "data",
+          "offset": 24,
+          "type": "anole_span"
+        }
+      ]
+    },
+    "anole_ws_close_event": {
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "route_id",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "code",
+          "offset": 20,
+          "type": "u16"
+        },
+        {
+          "name": "reserved",
+          "offset": 22,
+          "type": "u16"
+        },
+        {
+          "name": "reason",
+          "offset": 24,
+          "type": "anole_span"
+        }
+      ]
+    },
+    "anole_ws_accept_options": {
+      "size": 48,
+      "align": 8,
+      "fields": [
+        {
+          "name": "size",
+          "offset": 0,
+          "type": "usize"
+        },
+        {
+          "name": "flags",
+          "offset": 8,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 12,
+          "type": "u32"
+        },
+        {
+          "name": "subprotocol",
+          "offset": 16,
+          "type": "anole_str"
+        },
+        {
+          "name": "headers",
+          "offset": 32,
+          "type": "ptr"
+        },
+        {
+          "name": "nheaders",
+          "offset": 40,
+          "type": "usize"
+        }
+      ]
+    },
+    "anole_grpc_call_event": {
+      "size": 104,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "route_id",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "method_id",
+          "offset": 20,
+          "type": "u16"
+        },
+        {
+          "name": "kind",
+          "offset": 22,
+          "type": "u8"
+        },
+        {
+          "name": "protocol",
+          "offset": 23,
+          "type": "u8"
+        },
+        {
+          "name": "flags",
+          "offset": 24,
+          "type": "u16"
+        },
+        {
+          "name": "version",
+          "offset": 26,
+          "type": "u8"
+        },
+        {
+          "name": "reserved0",
+          "offset": 27,
+          "type": "u8"
+        },
+        {
+          "name": "nmetadata",
+          "offset": 28,
+          "type": "u16"
+        },
+        {
+          "name": "reserved1",
+          "offset": 30,
+          "type": "u16"
+        },
+        {
+          "name": "method",
+          "offset": 32,
+          "type": "anole_span"
+        },
+        {
+          "name": "message",
+          "offset": 40,
+          "type": "anole_span"
+        },
+        {
+          "name": "remote_addr",
+          "offset": 48,
+          "type": "anole_span"
+        },
+        {
+          "name": "listener",
+          "offset": 56,
+          "type": "anole_span"
+        },
+        {
+          "name": "id",
+          "offset": 64,
+          "type": "anole_span"
+        },
+        {
+          "name": "claims",
+          "offset": 72,
+          "type": "anole_span"
+        },
+        {
+          "name": "timeout_us",
+          "offset": 80,
+          "type": "i64"
+        },
+        {
+          "name": "metadata_off",
+          "offset": 88,
+          "type": "u32"
+        },
+        {
+          "name": "reserved2",
+          "offset": 92,
+          "type": "u32"
+        },
+        {
+          "name": "peer_cert",
+          "offset": 96,
+          "type": "anole_span"
+        }
+      ],
+      "arrays": [
+        {
+          "name": "metadata",
+          "at": "metadata_off",
+          "item": "anole_span",
+          "count": "2*nmetadata"
+        }
+      ]
+    },
+    "anole_grpc_message_event": {
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "route_id",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 20,
+          "type": "u32"
+        },
+        {
+          "name": "data",
+          "offset": 24,
+          "type": "anole_span"
+        }
+      ]
+    },
+    "anole_wt_stream_event": {
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "route_id",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "flags",
+          "offset": 20,
+          "type": "u32"
+        },
+        {
+          "name": "session",
+          "offset": 24,
+          "type": "u64"
+        }
+      ]
+    },
+    "anole_wt_data_event": {
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "flags",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 20,
+          "type": "u32"
+        },
+        {
+          "name": "data",
+          "offset": 24,
+          "type": "anole_span"
+        }
+      ]
+    },
+    "anole_wt_code_event": {
+      "size": 24,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "code",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 20,
+          "type": "u32"
+        }
+      ]
+    },
+    "anole_wt_datagram_event": {
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "route_id",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 20,
+          "type": "u32"
+        },
+        {
+          "name": "data",
+          "offset": 24,
+          "type": "anole_span"
+        }
+      ]
+    },
+    "anole_wt_close_event": {
+      "size": 40,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "route_id",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "code",
+          "offset": 20,
+          "type": "u32"
+        },
+        {
+          "name": "by",
+          "offset": 24,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 28,
+          "type": "u32"
+        },
+        {
+          "name": "reason",
+          "offset": 32,
+          "type": "anole_span"
+        }
+      ]
+    },
+    "anole_listener_info": {
+      "size": 72,
+      "align": 8,
+      "fields": [
+        {
+          "name": "size",
+          "offset": 0,
+          "type": "usize"
+        },
+        {
+          "name": "name",
+          "offset": 8,
+          "type": "anole_str"
+        },
+        {
+          "name": "address",
+          "offset": 24,
+          "type": "anole_str"
+        },
+        {
+          "name": "port",
+          "offset": 40,
+          "type": "u16"
+        },
+        {
+          "name": "udp_port",
+          "offset": 42,
+          "type": "u16"
+        },
+        {
+          "name": "flags",
+          "offset": 44,
+          "type": "u32"
+        },
+        {
+          "name": "state",
+          "offset": 48,
+          "type": "u32"
+        },
+        {
+          "name": "error_errno",
+          "offset": 52,
+          "type": "i32"
+        },
+        {
+          "name": "error_name",
+          "offset": 56,
+          "type": "anole_str"
+        }
+      ]
+    },
+    "anole_db_value": {
+      "size": 24,
+      "align": 8,
+      "fields": [
+        {
+          "name": "type",
+          "offset": 0,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 4,
+          "type": "u32"
+        },
+        {
+          "name": "v",
+          "offset": 8,
+          "type": {
+            "union": [
+              {
+                "name": "i",
+                "type": "i64"
+              },
+              {
+                "name": "f",
+                "type": "f64"
+              },
+              {
+                "name": "s",
+                "type": "anole_str"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "anole_db_options": {
+      "size": 48,
+      "align": 8,
+      "fields": [
+        {
+          "name": "size",
+          "offset": 0,
+          "type": "usize"
+        },
+        {
+          "name": "flags",
+          "offset": 8,
+          "type": "u32"
+        },
+        {
+          "name": "timeout_ms",
+          "offset": 12,
+          "type": "u32"
+        },
+        {
+          "name": "cache_ttl_ms",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 20,
+          "type": "u32"
+        },
+        {
+          "name": "cache_tag",
+          "offset": 24,
+          "type": "anole_str"
+        },
+        {
+          "name": "req",
+          "offset": 40,
+          "type": "u64"
+        }
+      ]
+    },
+    "anole_db_tx_options": {
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "size",
+          "offset": 0,
+          "type": "usize"
+        },
+        {
+          "name": "flags",
+          "offset": 8,
+          "type": "u32"
+        },
+        {
+          "name": "isolation",
+          "offset": 12,
+          "type": "u32"
+        },
+        {
+          "name": "timeout_ms",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 20,
+          "type": "u32"
+        },
+        {
+          "name": "req",
+          "offset": 24,
+          "type": "u64"
+        }
+      ]
+    },
+    "anole_db_cell": {
+      "size": 16,
+      "align": 8,
+      "fields": [
+        {
+          "name": "type",
+          "offset": 0,
+          "type": "u32"
+        },
+        {
+          "name": "db_type",
+          "offset": 4,
+          "type": "u32"
+        },
+        {
+          "name": "v",
+          "offset": 8,
+          "type": {
+            "union": [
+              {
+                "name": "i",
+                "type": "i64"
+              },
+              {
+                "name": "f",
+                "type": "f64"
+              },
+              {
+                "name": "s",
+                "type": "anole_span"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "anole_db_result_event": {
+      "size": 104,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "user_data",
+          "offset": 16,
+          "type": "u64"
+        },
+        {
+          "name": "status",
+          "offset": 24,
+          "type": "i32"
+        },
+        {
+          "name": "http_status",
+          "offset": 28,
+          "type": "u16"
+        },
+        {
+          "name": "error_class",
+          "offset": 30,
+          "type": "u8"
+        },
+        {
+          "name": "source",
+          "offset": 31,
+          "type": "u8"
+        },
+        {
+          "name": "ncolumns",
+          "offset": 32,
+          "type": "u32"
+        },
+        {
+          "name": "nrows",
+          "offset": 36,
+          "type": "u32"
+        },
+        {
+          "name": "changes",
+          "offset": 40,
+          "type": "u64"
+        },
+        {
+          "name": "last_insert_rowid",
+          "offset": 48,
+          "type": "i64"
+        },
+        {
+          "name": "columns",
+          "offset": 56,
+          "type": "anole_span"
+        },
+        {
+          "name": "cells",
+          "offset": 64,
+          "type": "anole_span"
+        },
+        {
+          "name": "error",
+          "offset": 72,
+          "type": "anole_span"
+        },
+        {
+          "name": "error_code",
+          "offset": 80,
+          "type": "anole_span"
+        },
+        {
+          "name": "constraint",
+          "offset": 88,
+          "type": "anole_span"
+        },
+        {
+          "name": "table",
+          "offset": 96,
+          "type": "anole_span"
+        }
+      ],
+      "arrays": [
+        {
+          "name": "columns",
+          "span": "columns",
+          "item": "anole_span",
+          "count": "ncolumns"
+        },
+        {
+          "name": "cells",
+          "span": "cells",
+          "item": "anole_db_cell",
+          "count": "nrows*ncolumns"
+        }
+      ]
+    }
+  },
+  "error_names": [
+    "AccessDenied",
+    "AddressInUse",
+    "AddressNotAvailable",
+    "Again",
+    "Canceled",
+    "CertificateFileUnreadable",
+    "ClientCaFileUnreadable",
+    "Config",
+    "ConsumerWithoutExecutor",
+    "Database",
+    "DatabaseUnavailable",
+    "DuplicateListenerName",
+    "FileNotFound",
+    "Gone",
+    "HqInteropNotAllowed",
+    "Http2NotBuilt",
+    "Http3NeedsHttps",
+    "Http3NeedsTls",
+    "Http3NotBuilt",
+    "InheritedSocketMismatch",
+    "Invalid",
+    "InvalidCertificate",
+    "InvalidClientCa",
+    "InvalidKey",
+    "InvalidListenAddress",
+    "InvalidListenerName",
+    "InvalidProxyNetwork",
+    "InvalidValue",
+    "KeyFileUnreadable",
+    "KeyMismatch",
+    "ListenersAlreadySet",
+    "MissingKey",
+    "NoConsumer",
+    "NoMemory",
+    "NoProtocols",
+    "NoTlsListener",
+    "NotRunning",
+    "OneServerPerProcess",
+    "OutOfMemory",
+    "ReservedNotZero",
+    "RouteConflict",
+    "ServerAlreadyOnThread",
+    "SeveralHttp3Listeners",
+    "State",
+    "SyntaxError",
+    "System",
+    "SystemResources",
+    "Timeout",
+    "TlsNotBuilt",
+    "TooBig",
+    "TooManyListeners",
+    "TooManyOpenFiles",
+    "Unexpected",
+    "UnknownCheck",
+    "UnknownField",
+    "UnknownFlag",
+    "UnknownKey",
+    "Unsupported",
+    "WrongHandleKind"
+  ]
+}

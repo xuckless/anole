@@ -5,27 +5,30 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         // Core, always used, pinned by commit. zio: Anole's fork
-        // xuckless/zio, branch `anole`: lalinsky/zio 4e4e1ed (main HEAD on
-        // 2026-10-17; its v0.19.x tags are the Zig 0.16 line) plus pinned
-        // scheduling that keeps a ring and its overflow one FIFO queue (the
-        // HTTP/1.1 p99 at 256+ connections per executor), and an accept loop
-        // that keeps up on a busy executor (direct accept with its own
-        // budget, spawn backpressure every 64 spawns), and idle tasks that
-        // give back their deeper stack pages (Linux, pinned), recvmmsg with
-        // control messages and sendmmsg in sendMany, and a spawn
-        // cache per executor (stacks and task allocations without the
-        // runtime's locks). Pinned at 683612b (`anole`): the direct accept
-        // puts back a cancel it finds pending, so an accept loop canceled
-        // before its first accept no longer parks for good (dcaf6fe);
-        // net.ReadyWatch (unused by Anole); and for Windows, streaming file
-        // reads and writes on IOCP's overlapped handles, UDP sockets that
-        // ignore an earlier datagram's ICMP error, and peer-caused socket
-        // errors logged at debug (branch windows-dev). The HTTP core
-        // (adapted from lalinsky/dusty) is in src/http/core, not a
+        // xuckless/zio, branch `anole`: lalinsky/zio main
+        // 035d245 (2026-10-21) merged into the fork. Upstream now carries
+        // what used to be fork patches: the pinned overflow queue drained
+        // into the ring fully (#841), sendmmsg in sendMany (#833, #843) and
+        // the Windows UDP ICMP fix (#849); it also drops the runtime-wide
+        // task counter (#842) and re-arms a caller's cancel after
+        // waitUntilComplete (#823). Fork patches on top: a push that waits
+        // behind the pinned overflow queue (one FIFO order; #841 alone could
+        // starve overflowed tasks behind >256 yielding ones), an accept loop that
+        // keeps up on a busy executor (direct accept with its own budget,
+        // putting back a cancel it finds pending; spawn backpressure every
+        // 64 spawns), a spawn cache per executor (stacks and task
+        // allocations without the runtime's locks), idle tasks that give
+        // back their deeper stack pages (Linux, pinned),
+        // Runtime.currentExecutor and zio.currentTask, operateInner arms out
+        // of line (smaller I/O wait frames), recvmmsg with control messages,
+        // and for Windows, streaming file reads and writes on IOCP's
+        // overlapped handles and peer-caused socket errors logged at debug.
+        // net.ReadyWatch is gone (Anole parks through CompletionQueue). The
+        // HTTP core (adapted from lalinsky/dusty) is in src/http/core, not a
         // dependency.
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#683612bba6b4f34ef5b989d2ca335a84008dc780",
-            .hash = "zio-0.19.0-xHbVVDqXLQDYaDoeYaMHQ9_OrsDGo4yFX61vY8m-sa_p",
+            .url = "git+https://github.com/xuckless/zio#b4974873565677327cb45f8731b4f393ff637bad",
+            .hash = "zio-0.19.0-xHbVVCTMLQD1ucYoMOJfO8bzSuHnrjjXYubniBKtnu8F",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{

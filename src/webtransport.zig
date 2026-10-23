@@ -106,8 +106,10 @@ pub fn accept(req: *dusty.Request, res: *dusty.Response, options: AcceptOptions)
     if (req.headers.get("sec-webtransport-http3-draft02") != null)
         try res.header("sec-webtransport-http3-draft", "draft02");
     self.out = try res.stream(&self.out_buf);
-    self.body = try req.reader(&self.in_buf);
-    try self.session.start(connect.core, connect.session_id, .{
+    // The session lives as long as the CONNECT stream: no lifetime cap on
+    // its body (capsules and streams have their own limits).
+    self.body = try req.readerLimited(&self.in_buf, null);
+    try Session.Driver.start(&self.session, connect.core, connect.session_id, .{
         .reader = &self.body.interface,
         .writer = &self.out.interface,
         .ctx = self,
@@ -120,7 +122,7 @@ pub fn accept(req: *dusty.Request, res: *dusty.Response, options: AcceptOptions)
     errdefer self.session.deinit();
     // The 200 out now: the client opens streams once it has it.
     try self.out.interface.flush();
-    req.setTimeout(options.timeout);
+    req.setDeadline(options.timeout);
     return &self.session;
 }
 

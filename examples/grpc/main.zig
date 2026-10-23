@@ -79,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
     }, {});
     defer app.deinit();
 
-    app.use(anole.middleware.Logger.init());
+    app.use(anole.middleware.Logger.init(.{}));
 
     // One POST route per method (/greeter.Greeter/SayHello), Connect GET,
     // and the REST routes of its google.api.http annotation.

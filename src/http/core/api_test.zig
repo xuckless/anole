@@ -243,10 +243,10 @@ test "bind: unknown fields ignored, a missing or malformed body is 400" {
 }
 
 const SetTenant = struct {
-    pub fn execute(_: *const SetTenant, req: *dusty.Request, _: *dusty.Response, executor: anytype) !void {
+    pub fn execute(_: *const SetTenant, req: *dusty.Request, _: *dusty.Response, next: anytype) !void {
         try req.setLocal("tenant", @as([]const u8, req.headers.get("X-Tenant") orelse "none"));
         try req.setLocal("level", @as(u8, 3));
-        return executor.next();
+        return next.call();
     }
 };
 
@@ -267,13 +267,13 @@ test "locals: a middleware hands typed values to the handler, per request" {
 }
 
 test "locals: reset with the request on a keep-alive connection" {
-    var req: dusty.Request = .{ .arena = std.testing.allocator, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = std.testing.allocator, ._parser = undefined, ._transport = undefined };
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     req.arena = arena.allocator();
     try req.setLocal("k", @as(u32, 1));
     try std.testing.expectEqual(@as(u32, 1), req.local(u32, "k").?);
-    req.reset();
+    req._reset();
     try std.testing.expect(req.local(u32, "k") == null);
 }
 

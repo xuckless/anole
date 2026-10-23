@@ -39,10 +39,13 @@ pub const AccessLog = struct {
     /// finished.
     pub const detach_safe = true;
 
-    pub fn execute(self: *const AccessLog, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
-        if (common.excluded(req, self.options.exclude)) return executor.next();
+    /// Never waits: no I/O, so `no_wait` routes may sit behind it.
+    pub const no_wait = true;
+
+    pub fn execute(self: *const AccessLog, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
+        if (common.excluded(req, self.options.exclude)) return next.call();
         const start: std.Io.Clock.Timestamp = .now(req.io, .awake);
-        const result = executor.next();
+        const result = next.call();
         if (res.isDetached()) {
             const later = try req.arena.create(Later);
             later.* = .{ .log = self, .start = start };

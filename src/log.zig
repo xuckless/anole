@@ -9,8 +9,8 @@
 //! started and stopped) and of the connection loops out of Debug builds.
 //!
 //! `logFn` is kept for programs that set it: it renames the scopes older
-//! builds of the dusty fork used (`dusty` -> `anole`, `dusty_access` ->
-//! `access`, `dusty_h2` -> `anole_h2`) and passes everything else through.
+//! builds of the core used to the current ones (`anole`, `access`,
+//! `anole_h2`) and passes everything else through.
 const std = @import("std");
 
 pub const std_options: std.Options = .{

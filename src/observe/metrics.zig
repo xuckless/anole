@@ -355,12 +355,15 @@ pub const HttpMetrics = struct {
     /// finished.
     pub const detach_safe = true;
 
-    pub fn execute(self: *const HttpMetrics, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
-        if (common.excluded(req, self.options.exclude)) return executor.next();
+    /// Never waits: no I/O, so `no_wait` routes may sit behind it.
+    pub const no_wait = true;
+
+    pub fn execute(self: *const HttpMetrics, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
+        if (common.excluded(req, self.options.exclude)) return next.call();
         const gauge = self.in_flight.with(&.{});
         gauge.add(1);
         const start: std.Io.Clock.Timestamp = .now(req.io, .awake);
-        const result = executor.next();
+        const result = next.call();
         if (res.isDetached()) {
             const later = req.arena.create(Later) catch {
                 gauge.add(-1);

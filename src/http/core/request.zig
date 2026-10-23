@@ -73,9 +73,10 @@ pub const Request = struct {
     content_length: ?usize = null,
     /// The route the request matched, null when none did.
     route: ?*const RouteInfo = null,
-    /// The route's path parameters: for "/users/:id",
-    /// `req.params.get("id")` or `req.params.getInt(u64, "id")`; a
-    /// `*wildcard` segment's rest of the path under its name.
+    /// The route's path parameters, raw (percent-encoded, as in the path):
+    /// for "/users/:id", `req.params.get("id")` or
+    /// `req.params.getInt(u64, "id")`; a `*wildcard` segment's rest of the
+    /// path under its name. `paramDecoded` gives the decoded text.
     params: http.Params = .{},
     /// The query string's values, percent-decoded:
     /// `req.query.get("q")`, `req.query.getInt(u32, "page")`. A name
@@ -120,7 +121,7 @@ pub const Request = struct {
     /// The server's drain callbacks (`DrainHooks`): what a long-lived
     /// request registers with instead of keeping a task waiting on `drain`.
     /// Null in a request the server did not build.
-    drain_hooks: ?*DrainHooks = null,
+    _drain_hooks: ?*DrainHooks = null,
 
     /// Freed in one go once the response has gone out: for anything the
     /// handler builds for this request.
@@ -138,15 +139,18 @@ pub const Request = struct {
     /// clock; null for none (or `.none`). The rest of an unread body is
     /// drained no later than this.
     _handler_deadline: ?std.Io.Clock.Timestamp = null,
+    /// A handler called `setTimeout` or `setDeadline`: a stream or file body
+    /// then leaves its deadline alone (`Response.liftDeadline`).
+    _deadline_from_handler: bool = false,
 
     // Body reading support
-    parser: *RequestParser,
-    transport: Transport,
+    _parser: *RequestParser,
+    _transport: Transport,
     /// Set by a protocol engine that delivers the body itself, unframed (an
     /// HTTP/2 stream), in place of `parser` and `transport`, which are then
     /// unused.
-    body_source: ?BodySource = null,
-    config: ServerConfig.Request = .{},
+    _body_source: ?BodySource = null,
+    _config: ServerConfig.Request = .{},
     _body: ?[]const u8 = null,
     _body_read: bool = false,
     // Set up on the first body read that calls for decoding, and kept so a
@@ -165,8 +169,8 @@ pub const Request = struct {
     locals: Locals = .{},
 
     // 100-continue support
-    response: ?*Response = null,
-    expects_continue: bool = false,
+    _response: ?*Response = null,
+    _expects_continue: bool = false,
 
     /// The host the client asked for: `X-Forwarded-Host` from a trusted
     /// proxy, else `Host` (which HTTP/2's `:authority` fills).
@@ -186,13 +190,13 @@ pub const Request = struct {
 
     /// Clears the request for reuse on the same connection. Called by
     /// the server between requests; not for handlers.
-    pub fn reset(self: *Request) void {
+    pub fn _reset(self: *Request) void {
         const arena = self.arena;
         const io = self.io;
-        const parser = self.parser;
-        const transport = self.transport;
-        const cfg = self.config;
-        const res = self.response;
+        const parser = self._parser;
+        const transport = self._transport;
+        const cfg = self._config;
+        const res = self._response;
         const timeout_context = self._timeout_context;
         const set_timeout = self._set_timeout;
         // Belongs to the connection, not the request, so it outlives the
@@ -201,20 +205,20 @@ pub const Request = struct {
         const listener = self.listener;
         const secure = self.secure;
         const drain = self.drain;
-        const drain_hooks = self.drain_hooks;
+        const drain_hooks = self._drain_hooks;
         const peer_certificate = self.peer_certificate;
         self.* = .{
             .arena = arena,
             .io = io,
-            .parser = parser,
-            .transport = transport,
-            .config = cfg,
-            .response = res,
+            ._parser = parser,
+            ._transport = transport,
+            ._config = cfg,
+            ._response = res,
             .remote_address = addr,
             .listener = listener,
             .secure = secure,
             .drain = drain,
-            .drain_hooks = drain_hooks,
+            ._drain_hooks = drain_hooks,
             .peer_certificate = peer_certificate,
             ._timeout_context = timeout_context,
             ._set_timeout = set_timeout,
@@ -224,7 +228,7 @@ pub const Request = struct {
     /// Fills `content_type`, `content_encoding` and `content_length` from
     /// the headers. The HTTP/1.x parser calls it when the head is complete;
     /// another protocol engine calls it once it has the headers.
-    pub fn applyEntityHeaders(self: *Request) void {
+    pub fn _applyEntityHeaders(self: *Request) void {
         if (self.headers.get("Content-Type")) |content_type| {
             self.content_type = http.ContentType.fromContentType(content_type);
         }
@@ -236,13 +240,28 @@ pub const Request = struct {
         }
     }
 
-    /// Replaces the deadline for this request. A duration starts now, a
-    /// deadline is absolute, and `.none` disables the deadline. The server
-    /// installs its normal keepalive deadline after the handler returns.
+    /// Replaces this request's deadline with one `timeout` from now; null
+    /// for none. The server installs its normal keepalive deadline after the
+    /// handler returns. A response that streams (`res.stream`,
+    /// `res.startEventStream`) or sends a file lifts the request deadline
+    /// itself, once its head is out (`timeouts.write` then bounds each
+    /// write); a deadline set here before that is kept.
     ///
     /// Call from the connection's handler task, not concurrently from a task
     /// spawned by the handler.
-    pub fn setTimeout(self: *Request, timeout: std.Io.Timeout) void {
+    pub fn setTimeout(self: *Request, timeout: ?std.Io.Duration) void {
+        self.setDeadline(if (timeout) |d| .{ .duration = .{ .raw = d, .clock = .awake } } else .none);
+    }
+
+    /// As `setTimeout`, with a `std.Io.Timeout`: a duration starts now, a
+    /// deadline is absolute, and `.none` disables the deadline.
+    pub fn setDeadline(self: *Request, deadline: std.Io.Timeout) void {
+        self._deadline_from_handler = true;
+        self._applyDeadline(deadline);
+    }
+
+    /// The deadline in place, without marking it the handler's.
+    pub fn _applyDeadline(self: *Request, timeout: std.Io.Timeout) void {
         const set = self._set_timeout orelse return;
         self._handler_deadline = if (timeout.toDurationFromNow(self.io)) |d|
             std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d.raw, .clock = .awake })
@@ -264,8 +283,17 @@ pub const Request = struct {
     /// One per body. `body` takes it if you have not, so a handler that
     /// streams cannot then ask for the body whole.
     pub fn reader(self: *Request, buffer: []u8) !RequestBodyReader {
-        var r = RequestBodyReader.init(self.parser, self.transport, buffer);
-        r.raw = self.body_source;
+        return self.readerLimited(buffer, self._config.max_body_size);
+    }
+
+    /// `reader` with a limit of your own: the most bytes the body may bring
+    /// (decoded), `null` for any amount (an upload to a file, say). Past the
+    /// limit reading fails with `error.BodyTooBig` (a 413). `reader` stops
+    /// at `limits.body_max`, chunked bodies too.
+    pub fn readerLimited(self: *Request, buffer: []u8, limit: ?usize) !RequestBodyReader {
+        var r = RequestBodyReader.init(self._parser, self._transport, buffer);
+        r.body_limit = limit;
+        r.raw = self._body_source;
 
         // Once the body is in memory there is nothing left on the wire, and
         // what is cached has already been decoded.
@@ -277,12 +305,12 @@ pub const Request = struct {
         // The buffer belongs to the caller, so a second reader starts empty
         // and whatever the first one had buffered is unreachable -- bytes off
         // the body, with nothing to say they went missing.
-        std.debug.assert(!self._body_reader_taken); // one body reader per request
+        if (self._body_reader_taken) return error.BodyReaderTaken;
 
         r.request = self;
         if (self._decode) |decode| {
             r.decode = decode;
-        } else if (self.config.decompress) {
+        } else if (self._config.decompress) {
             try r.startDecoding(self.arena, self.content_encoding);
             if (r.decode != null) self.dropEncodedBodyHeaders();
             self._decode = r.decode;
@@ -316,7 +344,7 @@ pub const Request = struct {
         // Nothing to stage: `allocRemaining` streams straight into the arena.
         var no_buf: [0]u8 = .{};
         var r = try self.reader(&no_buf);
-        const result = r.interface.allocRemaining(self.arena, .limited(self.config.max_body_size)) catch |err| switch (err) {
+        const result = r.interface.allocRemaining(self.arena, .limited(self._config.max_body_size)) catch |err| switch (err) {
             error.StreamTooLong => return error.BodyTooBig,
             // The interface can only say that a read failed; the reader
             // holds what it was.
@@ -338,6 +366,17 @@ pub const Request = struct {
     /// `req.params.getInt(u64, "id")` parses one.
     pub fn param(self: *const Request, name: []const u8) ?[]const u8 {
         return self.params.get(name);
+    }
+
+    /// The route parameter `name`, percent-decoded into the request's arena
+    /// (the slice in `params` itself when it has no '%'). `params` holds the
+    /// raw, percent-encoded text: matching runs on the raw path, so an
+    /// encoded '/' (%2F) never splits a segment, and decodes to '/' here.
+    /// '+' stays '+'. `error.BadRequest` (400) for a '%' not followed by
+    /// two hex digits.
+    pub fn paramDecoded(self: *Request, name: []const u8) error{ BadRequest, OutOfMemory }!?[]const u8 {
+        const raw = self.params.get(name) orelse return null;
+        return try http.percentDecode(self.arena, raw, false);
     }
 
     /// A query-string value by name, percent-decoded, null when absent:
@@ -446,7 +485,7 @@ pub const Request = struct {
         var entry_iterator = std.mem.splitScalar(u8, buffer, '&');
 
         while (entry_iterator.next()) |entry| {
-            if (self._fd.count() >= self.config.max_form_count) {
+            if (self._fd.count() >= self._config.max_form_count) {
                 return error.TooManyFormFields;
             }
 
@@ -537,7 +576,7 @@ pub const Request = struct {
                 break;
             }
 
-            if (self._mfd.count() >= self.config.max_multiform_count) {
+            if (self._mfd.count() >= self._config.max_multiform_count) {
                 return error.TooManyMultiFormFields;
             }
 
@@ -559,57 +598,9 @@ pub const Request = struct {
     /// space. Returns `input` itself when there is nothing to decode, else
     /// a copy allocated with `allocator`.
     pub fn urlUnescape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-        var has_plus = false;
-        var unescaped_len = input.len;
-
-        var in_i: usize = 0;
-        while (in_i < input.len) {
-            const b = input[in_i];
-            if (b == '%') {
-                if (in_i + 2 >= input.len or !std.ascii.isHex(input[in_i + 1]) or !std.ascii.isHex(input[in_i + 2])) {
-                    return error.InvalidEscapeSequence;
-                }
-                in_i += 3;
-                unescaped_len -= 2;
-            } else if (b == '+') {
-                has_plus = true;
-                in_i += 1;
-            } else {
-                in_i += 1;
-            }
-        }
-
-        // no encoding, and no plus. nothing to unescape
-        if (unescaped_len == input.len and !has_plus) {
-            return input;
-        }
-
-        const out = try allocator.alloc(u8, unescaped_len);
-
-        in_i = 0;
-        for (0..unescaped_len) |i| {
-            const b = input[in_i];
-            if (b == '%') {
-                out[i] = decodeHex(input[in_i + 1]) << 4 | decodeHex(input[in_i + 2]);
-                in_i += 3;
-            } else if (b == '+') {
-                out[i] = ' ';
-                in_i += 1;
-            } else {
-                out[i] = b;
-                in_i += 1;
-            }
-        }
-
-        return out;
-    }
-
-    fn decodeHex(c: u8) u8 {
-        return switch (c) {
-            '0'...'9' => c - '0',
-            'A'...'F' => c - 'A' + 10,
-            'a'...'f' => c - 'a' + 10,
-            else => 0,
+        return http.percentDecode(allocator, input, true) catch |err| switch (err) {
+            error.BadRequest => error.InvalidEscapeSequence,
+            error.OutOfMemory => error.OutOfMemory,
         };
     }
 };
@@ -801,7 +792,7 @@ pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeaders
     // by the next one, so the headers are allocated for each: room for
     // most heads, grown to `max_header_count` for one with more, so that an
     // ordinary request takes little of its arena.
-    parser.request.headers = try http.Headers.init(parser.request.arena, @min(parser.request.config.max_header_count, initial_header_room));
+    parser.request.headers = try http.Headers.init(parser.request.arena, @min(parser.request._config.max_header_count, initial_header_room));
     var parsed_len: usize = 0;
     while (!parser.state.headers_complete) {
         const buffered = reader.buffered();
@@ -884,23 +875,24 @@ test "Request.setTimeout: forwards relative, absolute, and disabled deadlines" {
     var req: Request = .{
         .arena = std.testing.allocator,
         .io = std.testing.io,
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
         ._timeout_context = &probe,
         ._set_timeout = Probe.set,
     };
 
-    req.setTimeout(.{ .duration = .{ .raw = .fromSeconds(7), .clock = .awake } });
+    req.setTimeout(.fromSeconds(7));
     try std.testing.expectEqual(std.Io.Duration.fromSeconds(7), probe.last.duration.raw);
+    try std.testing.expect(req._deadline_from_handler);
 
     const deadline = std.Io.Clock.Timestamp.now(std.testing.io, .real).addDuration(.{
         .raw = .fromSeconds(11),
         .clock = .real,
     });
-    req.setTimeout(.{ .deadline = deadline });
+    req.setDeadline(.{ .deadline = deadline });
     try std.testing.expectEqual(deadline, probe.last.deadline);
 
-    req.setTimeout(.none);
+    req.setTimeout(null);
     try std.testing.expect(probe.last == .none);
     try std.testing.expectEqual(@as(usize, 3), probe.calls);
 }
@@ -909,14 +901,14 @@ test "Request.peerCertificate: belongs to the connection, so it outlives reset" 
     var req: Request = .{
         .arena = std.testing.allocator,
         .io = std.testing.io,
-        .parser = undefined,
-        .transport = undefined,
+        ._parser = undefined,
+        ._transport = undefined,
     };
     try std.testing.expectEqual(@as(?[]const u8, null), req.peerCertificate());
     const der = "\x30\x82\x01\x00";
     req.peer_certificate = der;
     req.url = "/a";
-    req.reset();
+    req._reset();
     try std.testing.expectEqualStrings(der, req.peerCertificate().?);
     try std.testing.expectEqualStrings("", req.url);
 }
@@ -957,14 +949,14 @@ test "Request.body: basic POST" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1007,14 +999,14 @@ test "Request.body: a gzip request body is decoded" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1040,14 +1032,14 @@ test "Request.body: a chunked gzip body is unwrapped by both layers" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1116,14 +1108,14 @@ test "Request.body: a chunked trailer split across a buffer wrap is dropped, not
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &source.interface, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &source.interface, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&source.interface, &parser);
 
@@ -1142,14 +1134,14 @@ test "Request: decoding takes the headers that described the encoded body" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1180,15 +1172,15 @@ test "Request: decoding off leaves the headers alone" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
-        .config = .{ .decompress = false },
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
+        ._config = .{ .decompress = false },
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
     _ = try req.body();
@@ -1208,15 +1200,15 @@ test "Request.body: decoding off yields what the wire carried" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
-        .config = .{ .decompress = false },
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
+        ._config = .{ .decompress = false },
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1237,14 +1229,14 @@ test "Request.body: a compressed body cut short is a bad body, not a departed pe
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1265,14 +1257,14 @@ test "Request.body: a coding we cannot undo is refused rather than guessed at" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1290,14 +1282,14 @@ test "Request.body: a body read that failed before it started can be asked for a
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1321,14 +1313,14 @@ test "Request: a streaming read resolves through the reader it hands out" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1352,14 +1344,14 @@ test "Request.body: a body cut short is IncompleteBody, not a failed read" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1378,14 +1370,14 @@ test "Request.body: a chunked body cut short is IncompleteBody" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1402,14 +1394,14 @@ test "Request.body: framing the parser rejects is reported as itself" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1426,14 +1418,14 @@ test "Request.body: large body over 128 bytes" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1451,14 +1443,14 @@ test "Request.cookies: parse cookies from header" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1477,14 +1469,14 @@ test "Request.formData: basic key and value" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1502,14 +1494,14 @@ test "Request.formData: URL-encoded key and value" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1526,14 +1518,14 @@ test "Request.formData: entry with no value" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1550,14 +1542,14 @@ test "Request.multiFormData: basic key and value" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1575,14 +1567,14 @@ test "Request.multiFormData: entry with filename" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1613,14 +1605,14 @@ test "Request.multiFormData: semicolon in attribute name (regression)" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1650,14 +1642,14 @@ test "Request.multiFormData: trailing backslash in quoted attribute (regression)
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
 
     try parseHeaders(&reader, &parser);
 
@@ -1673,12 +1665,12 @@ test "Request.body: a body source delivers the body without the HTTP/1 parser" {
     defer arena.deinit();
 
     var source: std.Io.Reader = .fixed("unframed body bytes");
-    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined };
+    var req: Request = .{ .arena = arena.allocator(), ._transport = undefined, ._parser = undefined };
     req.headers = try http.Headers.init(arena.allocator(), 4);
     try req.headers.put("content-type", "application/json");
     try req.headers.put("content-length", "19");
-    req.applyEntityHeaders();
-    req.body_source = .{ .reader = &source, .err = noBodySourceError };
+    req._applyEntityHeaders();
+    req._body_source = .{ .reader = &source, .err = noBodySourceError };
 
     try std.testing.expectEqual(http.ContentType.json, req.content_type.?);
     try std.testing.expectEqual(@as(?usize, 19), req.content_length);
@@ -1692,11 +1684,11 @@ test "Request.body: a gzip body from a body source is decoded" {
 
     const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
     var source: std.Io.Reader = .fixed(gzip_hello);
-    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined };
+    var req: Request = .{ .arena = arena.allocator(), ._transport = undefined, ._parser = undefined };
     req.headers = try http.Headers.init(arena.allocator(), 4);
     try req.headers.put("content-encoding", "gzip");
-    req.applyEntityHeaders();
-    req.body_source = .{ .reader = &source, .err = noBodySourceError };
+    req._applyEntityHeaders();
+    req._body_source = .{ .reader = &source, .err = noBodySourceError };
 
     try std.testing.expectEqualStrings("hello", (try req.body()).?);
 }
@@ -1736,16 +1728,54 @@ test "Request.body: 100 Continue goes through the response's sink" {
         }
     };
     var probe: Probe = .{};
-    var res = try Response.initSink(arena.allocator(), std.testing.io, probe.sink(), 8);
+    var res = try Response._initSink(arena.allocator(), std.testing.io, probe.sink(), 8);
 
     var source: std.Io.Reader = .fixed("data");
-    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined };
+    var req: Request = .{ .arena = arena.allocator(), ._transport = undefined, ._parser = undefined };
     req.headers = try http.Headers.init(arena.allocator(), 4);
-    req.body_source = .{ .reader = &source, .err = noBodySourceError };
-    req.expects_continue = true;
-    req.response = &res;
+    req._body_source = .{ .reader = &source, .err = noBodySourceError };
+    req._expects_continue = true;
+    req._response = &res;
 
     try std.testing.expectEqualStrings("data", (try req.body()).?);
     try std.testing.expectEqual(http.Status.@"continue", probe.interim.?);
-    try std.testing.expect(!req.expects_continue);
+    try std.testing.expect(!req._expects_continue);
+}
+
+test "misuse: a second reader is BodyReaderTaken in every build mode" {
+    var req: Request = .{
+        .arena = std.testing.allocator,
+        .io = std.testing.io,
+        ._parser = undefined,
+        ._transport = undefined,
+    };
+    var buf: [16]u8 = undefined;
+    _ = try req.reader(&buf);
+    try std.testing.expectError(error.BodyReaderTaken, req.reader(&buf));
+    // And `body` after `reader` is the same mistake.
+    try std.testing.expectError(error.BodyReaderTaken, req.body());
+}
+
+test "Request.paramDecoded: %C3%BC, %2F, a lone %, no escapes returns the same slice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var req: Request = .{
+        .arena = arena.allocator(),
+        ._transport = undefined,
+        ._parser = undefined,
+    };
+    try req.params.map.put(arena.allocator(), "name", "J%C3%BCrgen");
+    try req.params.map.put(arena.allocator(), "path", "a%2Fb+c");
+    try req.params.map.put(arena.allocator(), "bad", "50%");
+    try req.params.map.put(arena.allocator(), "bad2", "%zz");
+    try req.params.map.put(arena.allocator(), "plain", "plain");
+    try std.testing.expectEqualStrings("Jürgen", (try req.paramDecoded("name")).?);
+    try std.testing.expectEqualStrings("a/b+c", (try req.paramDecoded("path")).?);
+    try std.testing.expectError(error.BadRequest, req.paramDecoded("bad"));
+    try std.testing.expectError(error.BadRequest, req.paramDecoded("bad2"));
+    const raw = req.params.get("plain").?;
+    try std.testing.expectEqual(raw.ptr, (try req.paramDecoded("plain")).?.ptr);
+    try std.testing.expect((try req.paramDecoded("missing")) == null);
+    // The raw text is what `params` keeps.
+    try std.testing.expectEqualStrings("J%C3%BCrgen", req.params.get("name").?);
 }

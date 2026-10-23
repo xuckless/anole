@@ -284,7 +284,7 @@ fn finish(req: *Request, res: *Response, etag: []const u8, mtime: ?i64) !void {
             return;
         },
         .failed => {
-            res.resetBody();
+            res.resetBody() catch {};
             res.status = .precondition_failed;
             return;
         },
@@ -300,7 +300,7 @@ fn finish(req: *Request, res: *Response, etag: []const u8, mtime: ?i64) !void {
     switch (parseRange(range, size)) {
         .ignore => {},
         .unsatisfiable => {
-            res.resetBody();
+            res.resetBody() catch {};
             res.status = .range_not_satisfiable;
             try res.header("Content-Range", try std.fmt.allocPrint(req.arena, "bytes */{d}", .{size}));
         },

@@ -19,6 +19,7 @@ const Request = @import("request.zig").Request;
 const parseHeaders = @import("request.zig").parseHeaders;
 const Headers = @import("http.zig").Headers;
 const Response = @import("response.zig").Response;
+const config_mod = @import("config.zig");
 const ServerConfig = @import("config.zig").ServerConfig;
 const default_listeners = @import("config.zig").default_listeners;
 const body_read_reserve = @import("config.zig").body_read_reserve;
@@ -26,15 +27,16 @@ const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersP
 const RequestBuffers = @import("server/request_buffers.zig").RequestBuffers;
 const block_cache = @import("block_cache.zig");
 const WriteBuffer = @import("server/request_buffers.zig").WriteBuffer;
-const Executor = @import("middleware.zig").Executor;
+const Chain = @import("middleware.zig").Chain;
 const Middleware = @import("middleware.zig").Middleware;
 const Transport = @import("transport.zig").Transport;
 const have_auto_cancel = @import("deadline.zig").have_auto_cancel;
 const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
 const placement = @import("placement.zig");
+const expect_log = @import("expect_log.zig");
 const DrainHooks = @import("drain_hooks.zig").DrainHooks;
-/// The HTTP/2 engine, with the `use_http2` build option.
+/// The HTTP/2 engine, with the `-Dhttp2` build option.
 const proxy_protocol = @import("proxy_protocol.zig");
 const h2 = if (build_options.use_http2) @import("server/h2.zig") else struct {};
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
@@ -166,7 +168,7 @@ fn applyForwardedFn(request: *Request, peer: std.Io.net.IpAddress, forwarding: F
 const ClientAuthRef = struct {
     bundle: *std.crypto.Certificate.Bundle,
     trust: ?*const TrustStore,
-    mode: ServerConfig.Tls.ClientAuth.Mode,
+    mode: config_mod.ClientAuth.Mode,
 };
 
 /// What every connection accepted on a TLS listener handshakes with: the
@@ -180,7 +182,7 @@ const TlsMaterial = struct {
     auth: tls.config.CertKeyPair,
     client_ca: ?std.crypto.Certificate.Bundle = null,
     client_trust: ?TrustStore = null,
-    client_auth_mode: ServerConfig.Tls.ClientAuth.Mode = .require,
+    client_auth_mode: config_mod.ClientAuth.Mode = .require,
 
     /// Reads the certificate, key and client CAs `cfg` names (files are
     /// read now).
@@ -189,7 +191,7 @@ const TlsMaterial = struct {
             log.err("tls.client_auth.ca is .none, so no client certificate could ever verify", .{});
             return error.NoCertificateAuthority;
         };
-        const dir = cfg.dir orelse std.Io.Dir.cwd();
+        const dir = std.Io.Dir.cwd();
         const loaded = if (cfg.pem) |pem|
             tls.config.CertKeyPair.fromSlice(allocator, io, pem.cert, pem.key)
         else if (cfg.cert_path.len == 0 or cfg.key_path.len == 0) {
@@ -197,6 +199,7 @@ const TlsMaterial = struct {
             return error.MissingTlsCertificate;
         } else tls.config.CertKeyPair.fromFilePath(allocator, io, dir, cfg.cert_path, cfg.key_path);
         var auth = loaded catch |err| {
+            if (expect_log.swallow()) return err;
             if (cfg.pem != null) {
                 log.err("cannot load the TLS certificate and key (PEM in memory): {t}", .{err});
             } else {
@@ -1046,6 +1049,9 @@ pub fn Server(comptime Ctx: type) type {
         settled: std.Io.Event = .unset,
         /// Why `run` stopped before it was listening.
         start_error: ?anyerror = null,
+        /// The index (in `config.listeners`) of the listener that could not
+        /// be opened, when that is why `run` stopped.
+        start_error_listener: ?usize = null,
         _middleware_registry: std.SinglyLinkedList,
         request_buffers: RequestBuffersPool,
         /// The listeners while `run` serves them, for `reloadTls`; empty
@@ -1200,7 +1206,7 @@ pub fn Server(comptime Ctx: type) type {
         /// Creates a middleware instance managed by the server.
         /// The middleware is allocated on the router's arena and will be freed when the server is deinit'd.
         /// Supports middlewares with init(Config) or init(Config, MiddlewareConfig) signatures.
-        pub fn middleware(self: *Self, comptime M: type, config: M.Config) !Middleware(Ctx) {
+        pub fn middleware(self: *Self, comptime M: type, config: M.Options) !Middleware(Ctx) {
             const arena = self.router.arena.allocator();
             const m = try arena.create(M);
             const init_info = @typeInfo(@TypeOf(M.init)).@"fn";
@@ -1284,8 +1290,11 @@ pub fn Server(comptime Ctx: type) type {
             defer self.allocator.free(acceptors);
             var opened: usize = 0;
             defer for (active[0..opened]) |*l| l.close(self.io, self.allocator);
-            for (listeners, active, addresses) |*cfg, *l, *address| {
-                l.* = try self.open(cfg, cfg.kernel_backlog orelse default_backlog, cfg.acceptorCountFor(cpu_count, executors));
+            for (listeners, active, addresses, 0..) |*cfg, *l, *address, index| {
+                l.* = self.open(cfg, cfg.kernel_backlog orelse default_backlog, cfg.acceptorCountFor(cpu_count, executors)) catch |err| {
+                    self.start_error_listener = index;
+                    return err;
+                };
                 opened += 1;
                 address.* = l.address;
             }
@@ -2370,10 +2379,11 @@ pub fn Server(comptime Ctx: type) type {
         /// Applies `ServerConfig.response` to a response the server built,
         /// for every engine.
         pub fn configureResponse(self: *const Self, res: *Response) void {
-            res.send_date = self.config.response.date;
-            res.default_content_type = self.config.response.default_content_type;
-            res.brotli_quality = self.config.response.brotli_quality;
-            res.error_format = self.config.errors;
+            res._send_date = self.config.response.date;
+            res._default_content_type = self.config.response.default_content_type;
+            res._brotli_quality = self.config.response.brotli_quality;
+            res._error_format = self.config.errors;
+            res._write_timeout = self.config.timeout.write;
         }
 
         /// The client address for a request from `peer` with `headers`,
@@ -2410,7 +2420,7 @@ pub fn Server(comptime Ctx: type) type {
                 else => |e| return e,
             };
             const miss: ?Router(Ctx).Miss = if (found == null) try self.router.miss(req) else null;
-            var executor = Executor(Ctx){
+            var executor = Chain(Ctx){
                 .req = req,
                 .res = res,
                 .ctx = self.ctx,
@@ -2507,14 +2517,14 @@ pub fn Server(comptime Ctx: type) type {
                 // The pooled arena, once a request has arrived.
                 .arena = undefined,
                 .io = self.io,
-                .transport = connection.transport(),
-                .parser = undefined,
-                .config = self.config.request,
+                ._transport = connection.transport(),
+                ._parser = undefined,
+                ._config = self.config.request,
                 .remote_address = connection.peerAddress(),
                 .listener = l.config,
                 .secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure,
                 .drain = &self.draining,
-                .drain_hooks = &self.drain_hooks,
+                ._drain_hooks = &self.drain_hooks,
                 .peer_certificate = connection.peerCertificate(),
                 ._timeout_context = timer,
                 ._set_timeout = setRequestTimeout,
@@ -2524,7 +2534,7 @@ pub fn Server(comptime Ctx: type) type {
             try parser.init(&request);
             defer parser.deinit();
 
-            request.parser = &parser;
+            request._parser = &parser;
 
             while (true) {
                 // Nothing buffered means the next request has not begun.
@@ -2712,13 +2722,13 @@ pub fn Server(comptime Ctx: type) type {
                 request.secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure;
                 applyForwardedFn(&request, connection.peerAddress(), .of(&self.config));
 
-                var response = try Response.init(request.arena, connection, self.config.response.max_header_count);
+                var response = try Response._init(request.arena, connection, self.config.response.max_header_count);
                 self.configureResponse(&response);
                 defer response.deinit();
                 response.head = request.method == .head;
                 response.http10 = request.version_major == 1 and request.version_minor == 0;
-                response.request = &request;
-                request.response = &response;
+                response._request = &request;
+                request._response = &response;
 
                 // A body declared longer than allowed is refused unread
                 // (and before any 100 Continue): 413, and the connection
@@ -2755,7 +2765,7 @@ pub fn Server(comptime Ctx: type) type {
                 if (request.headers.get("Expect")) |expect| {
                     if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
                         // RFC 9110 10.1.1: ignored in an HTTP/1.0 request.
-                        request.expects_continue = !response.http10;
+                        request._expects_continue = !response.http10;
                     } else {
                         // Unknown Expect value - return 417
                         response.status = .expectation_failed;
@@ -2791,7 +2801,7 @@ pub fn Server(comptime Ctx: type) type {
                     else => |e| return e,
                 };
                 const miss: ?Router(Ctx).Miss = if (found == null) try self.router.miss(&request) else null;
-                var executor = Executor(Ctx){
+                var executor = Chain(Ctx){
                     .req = &request,
                     .res = &response,
                     .ctx = self.ctx,
@@ -2820,7 +2830,7 @@ pub fn Server(comptime Ctx: type) type {
                         // to drain, and a read would wait for it. A
                         // peer that sent the body anyway is not waiting, and
                         // its body is drained like any other.
-                        if (request.expects_continue and connection.reader.bufferedLen() == 0) break :blk false;
+                        if (request._expects_continue and connection.reader.bufferedLen() == 0) break :blk false;
                         // What the wire carried, which is what there is left
                         // to throw away -- and still readable after decoding
                         // took the header off.
@@ -2876,7 +2886,7 @@ pub fn Server(comptime Ctx: type) type {
                 // holds none while it waits to answer.
                 connection.releaseWriteBuffer();
                 parser.reset();
-                request.reset();
+                request._reset();
                 buffers.?.resetArena();
                 connection.rewindReader();
             }

@@ -24,7 +24,10 @@ test "examples/sqlite: create, list, get, done, delete; 409 on a duplicate title
     var app = try Server.init(alloc, .{ .errors = .json, .executors = .exact(2) }, &state);
     defer app.deinit();
     state.db = try app.sqlite(":memory:");
-    try state.db.execScript(example.schema);
+    var setup_arena: std.heap.ArenaAllocator = .init(alloc);
+    defer setup_arena.deinit();
+    var setup: anole.db.Ctx = .{ .io = app.io(), .arena = setup_arena.allocator() };
+    try state.db.execScript(&setup, example.schema);
     example.routes(&app);
 
     const Check = struct {

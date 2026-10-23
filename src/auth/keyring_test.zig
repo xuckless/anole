@@ -86,7 +86,7 @@ test "Keyring: one fetch for concurrent verifiers, and known keys never wait on 
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/jwks", .{server.address.ip.getPort()});
     var keyring = Keyring.init(gpa, io, .{ .http = &client }, url);
     defer keyring.deinit();
-    keyring.min_refresh_seconds = 0;
+    keyring.min_refresh = .fromSeconds(0);
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -123,14 +123,14 @@ test "Keyring: one fetch for concurrent verifiers, and known keys never wait on 
     try std.testing.expectEqual(@as(usize, 0), failed.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 2), fetches.load(.monotonic));
 
-    // An unknown kid within `min_refresh_seconds` of the last fetch: no fetch.
-    keyring.min_refresh_seconds = 60;
+    // An unknown kid within `min_refresh` of the last fetch: no fetch.
+    keyring.min_refresh = .fromSeconds(60);
     delay_ms.store(0, .monotonic);
     try std.testing.expectError(error.NoMatchingKey, verifyTimed(&keyring, io, t3, "u3"));
     try std.testing.expectEqual(@as(usize, 2), fetches.load(.monotonic));
 
     // Past it, the unknown kid makes one refetch, which finds k3.
-    keyring.min_refresh_seconds = 0;
+    keyring.min_refresh = .fromSeconds(0);
     served.store(3, .monotonic);
     _ = try verifyTimed(&keyring, io, t3, "u3");
     try std.testing.expectEqual(@as(usize, 3), fetches.load(.monotonic));
@@ -252,7 +252,7 @@ test "Keyring: past its TTL, a provider outage leaves the keys in hand, and fail
     _ = try verifyTimed(&f.keyring, io, t1, "u1");
     const fetched = fetches.load(.monotonic);
     // The set is past its TTL, and the provider is down.
-    f.keyring.current.?.fetched_at -= f.keyring.ttl_seconds + 10;
+    f.keyring.current.?.fetched_at -= f.keyring.ttl.toSeconds() + 10;
     down.store(true, .monotonic);
     for (0..20) |_| _ = try verifyTimed(&f.keyring, io, t1, "u1");
     // One attempt, then a pause before the next.

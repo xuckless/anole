@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
         .host = if (ca_path != null) "localhost" else "127.0.0.1",
         .address = .{ .ip4 = .loopback(port) },
         .port = port,
-        .tls = if (ca_path) |path| .{ .ca = .{ .file = .{ .path = path } } } else null,
+        .tls = if (ca_path) |path| .{ .ca = .{ .file = path } } else null,
     });
     defer conn.close();
     var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost", .scheme = if (ca_path != null) "https" else "http" };

@@ -31,7 +31,7 @@ pub fn token(req: *dusty.Request) ![]const u8 {
 }
 
 /// `Middleware` settings.
-pub const Config = struct {
+pub const Options = struct {
     /// JSON bodies are skipped as jetzig does: a browser cannot send
     /// `application/json` across sites without a CORS preflight. Turn this
     /// on to check them too.
@@ -42,19 +42,22 @@ pub const Config = struct {
 /// form field) and answers 403 when it is missing or wrong. Other methods
 /// pass through.
 pub const Middleware = struct {
-    config: Config,
+    config: Options,
 
-    pub fn init(config: Config) Middleware {
+    pub fn init(config: Options) Middleware {
         return .{ .config = config };
     }
 
-    pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, executor: anytype) !void {
+    /// Never waits: no I/O, so `no_wait` routes may sit behind it.
+    pub const no_wait = true;
+
+    pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
         switch (req.method) {
             .post, .put, .patch, .delete => {},
-            else => return executor.next(),
+            else => return next.call(),
         }
         const content_type = req.headers.get("Content-Type") orelse "";
-        if (!self.config.check_json and std.mem.startsWith(u8, content_type, "application/json")) return executor.next();
+        if (!self.config.check_json and std.mem.startsWith(u8, content_type, "application/json")) return next.call();
 
         const expected = req.session.get(session_key) orelse return reject(res);
         const sent = req.headers.get(header_name) orelse blk: {
@@ -64,7 +67,7 @@ pub const Middleware = struct {
         } orelse return reject(res);
         if (sent.len != token_len or expected.len != token_len) return reject(res);
         if (!std.crypto.timing_safe.eql([token_len]u8, sent[0..token_len].*, expected[0..token_len].*)) return reject(res);
-        return executor.next();
+        return next.call();
     }
 
     fn reject(res: *dusty.Response) void {

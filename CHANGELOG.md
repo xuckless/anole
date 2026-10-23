@@ -3,6 +3,323 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+The API review before the Node and Python bindings: every breaking change
+of 0.2 is listed below, and [docs/migrating.md](docs/migrating.md)
+has the old -> new table for each area. The C ABI is now 0.7.
+
+### Breaking
+
+- `ServerOptions.server` is gone. Its settings are now flat groups with the
+  same names as the C ABI's JSON config: `timeouts`, `limits`, `proxy`,
+  `request`, `response` (see the migration table). `errors`, `error_handler`,
+  `http2` and `listeners` set inside `.server` used to be ignored without a
+  word; there is no such place to put them any more.
+- Durations in options are `anole.Duration` (`.fromSeconds(10)`) and lose
+  their unit suffix: `restart_timeout_ms` is `restart_timeout`; `window`,
+  `idle`, `ttl`, `leeway`, `max_age`, `interval`, `valid_for`, `lifetime`,
+  `min_refresh`, `stale`, `retry` and `max_retry` replace the `_ms` and
+  `_seconds` fields of the rate limiter, sessions, JWT verification, OIDC,
+  the keyring, CORS, tracing and `tls.selfSigned`.
+- TLS settings have one shape everywhere: `anole.Cert` (`.fromFiles`,
+  `.fromPem`, `.dev_self_signed`) for listener and client certificates,
+  `anole.Ca` (`.system`, `.fromFile(path)`, `.dir`, `.fromPem`) for trusted
+  CAs, `anole.ClientAuth` for mutual TLS. `alpn_protocols` is `alpn`. The
+  `dir` fields are gone (paths are relative to the working directory).
+  `http.ClientConfig` is `anole.ClientOptions`, `http.TlsConfig` is
+  `http.TlsOptions`. A listener that serves `.dev_self_signed` on anything
+  but loopback logs a warning.
+- `init`, `listen`, `listenTls`, `run` and `waitReady` return
+  `anole.ServerError`, and the certificate reloads `anole.TlsLoadError`:
+  named, documented sets you can switch on (`error.AddressInUse`,
+  `error.KeyMismatch`, ...). `app.failedListener()` names the listener whose
+  port could not be bound.
+- `req.setTimeout` takes `?anole.Duration` (`req.setTimeout(.fromSeconds(60))`,
+  `null` for none); the old form is `req.setDeadline(std.Io.Timeout)`.
+- Every middleware is built with `init(.{ ... })` and takes `Options`
+  (`Cors.Options`, `Logger.init(.{})`, `Compress.init(.{})`,
+  `MemoryStore.init(gpa, io, .{})`). Struct middleware gets the chain as
+  `next` and calls `next.call()`, as function middleware does (was
+  `executor.next()`).
+- Using a request or response out of order (a second `req.reader()`,
+  `res.stream` after `res.body` was set, writing after the head went out)
+  returns a named error (`anole.http.MisuseError`, answered 500) instead of
+  undefined behaviour in ReleaseFast. `res.writer()` can now fail: add `try`.
+- Engine fields of `Request` and `Response` are marked internal with a
+  leading `_` (`res.conn`, `req.parser`, `res.headers_written`, ...). Use
+  `res.headersSent()`.
+- A route marked `anole.noWait` (or `RouteOptions.no_wait`, or a gRPC service
+  registered `no_wait`) behind middleware that may wait is now refused at
+  startup with a message naming both. Until now it registered and, under
+  load, a waiting middleware (a Redis rate limiter, a session store, a JWKS
+  fetch) stalled the whole HTTP/2 connection or every HTTP/3 connection on
+  the core. Your own struct middleware needs `pub const no_wait = true;` to
+  sit in front of `noWait` routes, and a function middleware
+  `app.use(anole.noWait(f))`.
+- `websocket.Socket`'s internals are `_`-prefixed (`ws.conn`, `ws.closed`,
+  ...): use `ws.httpVersion()` and `ws.isClosed()`. WebTransport's
+  non-waiting driver calls moved to `Session.Driver` and `Stream.Driver`.
+  `Rooms.init(allocator, options)` is the one constructor (`initOptions` is
+  gone).
+- The graceful drain now waits 10 s by default (was 30 s in Zig; the C ABI
+  already used 10 s), the same as Docker's stop grace. Set
+  `timeouts.shutdown` for longer.
+- WebSocket messages are limited to 1 MiB by default (was 16 MiB; the C ABI
+  already used 1 MiB): set `limits.ws_max_message` or the route's
+  `max_message_size`. `req.reader()` now stops at `limits.body_max` for
+  chunked bodies too (`error.BodyTooBig`, 413); `req.readerLimited(buf, n)`
+  takes larger ones.
+- C ABI 0.7 configuration: `trusted_proxy_hops`, `trust_forwarded_proto` and
+  `trust_forwarded_host` move into a `proxy` group (`proxy.trusted_hops`).
+  Timeouts take `null` for none. New keys: `timeouts.read_header_ms`,
+  `write_ms`, `idle_park_ms`; request head limits in `limits`; `proxy`,
+  `request`, `response`, `http2` and `errors` groups; `http3.address`,
+  `port`, `validate_address`, `prefer_v2`, `sockets`,
+  `enable_connect_protocol`, `inline_no_wait`; `tls.client_ca_dir` and
+  `client_ca_system`. `jwt.leeway_s` is `leeway_ms`, `cors.max_age` is
+  `max_age_ms`. Every Zig server option now has a JSON key with the same name
+  or is listed in docs/c-abi.md with the reason it has none.
+- Outbound requests say `User-Agent: anole/<version>` (was `dusty/0.4.0`);
+  `anole.version` is the version.
+- Database calls are bounded by 30 s by default: `Options.timeout` on all
+  four connectors (it was MongoDB's alone, and off), and the C ABI's
+  `databases[].timeout_ms`. A call without a bound used to wait as long as the
+  database did, which a stuck database turned into an exhausted pool. Set
+  `timeout = null` (`"timeout_ms": 0`) for the old behaviour, or
+  `.with(.{ .timeout = .max })` (`ANOLE_DB_TIMEOUT_NONE`) for one call.
+  `TxOptions.timeout = null` is the connector's bound, not none.
+- Databases: the run-time pair is `table` and `execValues` (was `run`) on
+  both SQL connectors, and MongoDB's `with(options).dynamic(ctx, op,
+  collection, docs)` takes the context first.
+- Databases, one vocabulary: `anole.sqlite.Options`: `busy_timeout_ms` is
+  `busy_timeout` (a Duration), `statement_cache` is `statement_cache_size`
+  (`u16`), `readers` is `?u32`; `sqlite.Client.execScript` takes a context
+  (`execScript(&ctx, sql)`, and `pg.Client.execScript` is new).
+  `anole.mongodb.Options`: `max_idle` is `idle_timeout`; `max_connections`
+  is `?u32`, null for 100, and 0 (no limit) is refused; `connect_timeout` is
+  optional; `tls` is `anole.db.Tls`. Every connector: `name` is optional;
+  `max_connections = 0` is refused at init; `tls` is `anole.db.Tls`
+  (`ca: ?anole.Ca`, `client_certificate: ?anole.Cert`,
+  `insecure_skip_verify`); `Conn.release` takes `*const Conn`. C ABI config:
+  `databases[].sqlite.statement_cache` is `statement_cache_size`;
+  `databases[].mongodb.max_connections` 0 is refused.
+- C ABI: `anole_db_options.timeout_ms = 0` now means the database's
+  `timeout_ms`, not "none"; `anole_db_options` grows to 48 bytes and
+  `anole_db_result_event` to 104.
+- gRPC: `Call.addHeader` and `Call.addTrailer` refuse the protocols' own keys
+  (`grpc-*` but `grpc-status-details-bin` in trailers, `connect-*`,
+  `trailer-*`, `content-type`, `te`...), as the C ABI did: a handler could
+  send a second `grpc-status`. `addHeader` now adds a value instead of
+  replacing one, so a repeated key keeps every value. The C ABI refuses
+  `grpc-status-details-bin` as initial metadata (it was sent as a header,
+  which no client reads).
+
+The migration table is in [docs/migrating.md](docs/migrating.md)
+and docs/c-abi.md ("From ABI 0.6").
+
+- Before 1.0 a library serves only code built against the same ABI version,
+  major and minor: compare with `ANOLE_ABI_COMPATIBLE(anole_abi_version())`.
+  The header used to say a newer minor was enough, which was never true
+  under 0.x. Options structs larger than the library knows are refused
+  unless the extra bytes are 0, unknown flag bits are refused on every call
+  (`anole_db_options.flags` was not checked), and reserved fields in
+  `anole_db_value` and `anole_db_options` must be 0.
+- Cleanup calls (`anole_handle_release`, `anole_req_abort`, `anole_ws_close`,
+  `anole_ws_unsubscribe`, `anole_wt_close`, `anole_wt_stream_reset`,
+  `anole_wt_stream_stop`) now return `ANOLE_OK` on a handle whose object is
+  already over, closed or released, set no error and are not counted in
+  `anole_stats.gone`, so finalizers and `finally` blocks can call them
+  blindly. Answer and data calls keep `ANOLE_E_GONE`. A handle of the wrong
+  kind, or 0, is now `ANOLE_E_INVALID` on every call (was `ANOLE_E_GONE`).
+  New `anole_handle_release(h)` ends any handle the way the application
+  giving up would; it replaces `anole_wt_stream_release`.
+- Request calls share the `anole_req_` prefix every other family already had:
+  `anole_respond` -> `anole_req_respond`, `anole_respond_fd` ->
+  `anole_req_respond_fd` (the fd is an `intptr_t`), `anole_stream_start/write/
+  write_wait/end` -> `anole_req_stream_*`. `anole_release` is gone:
+  `anole_req_fail(r, status, message)` answers an error in the server's
+  configured error format (status 0 for 500), `anole_req_abort(r)` drops the
+  request without an answer (Zig's `res.abort()`), and `anole_handle_release(h)`
+  is the generic cleanup. Constants are grouped by family (`ANOLE_DB_TYPE_*`,
+  `ANOLE_DB_F_*`, `ANOLE_GRPC_STATUS_*`, `ANOLE_GRPC_KIND_*`,
+  `ANOLE_GRPC_F_FINISH`, `ANOLE_WT_F_*`, `ANOLE_TLS_F_PEM`,
+  `ANOLE_SERVER_F_SIGNALS`, `ANOLE_CONSUMER_F_SHARED`, `ANOLE_POLL_F_NOARM`).
+  `anole_server_port`'s "one past the last is the HTTP/3 port" is replaced by
+  `anole_server_listener(s, i, &info)`, which also gives the address, the UDP
+  port, the protocols and, when start failed, which listener and why.
+  `anole_server_reload_tls` takes `anole_str` and, with both empty, does what
+  `anole_server_reload_certificates` did (removed). WebSockets signal room
+  with `ANOLE_EV_WRITABLE`, as every other handle does; `ANOLE_EV_WS_DRAIN`
+  (9) is gone. `anole_wt_send_datagram` takes `flags`. Enum-valued parameters
+  are `uint32_t`.
+- Request records are 128 bytes: `spans_off` says where the header spans
+  start (`anole_request_spans` reads it), `peer_cert` is a plain span
+  (`anole_request_peer_cert` is gone: `anole_event_str(r, r->peer_cert)`),
+  and `timeout_us` and `subprotocol` are new. gRPC call records are 104
+  bytes with `metadata_off` (`anole_grpc_metadata(c)`) and `peer_cert`. A
+  record's fixed part may now grow at its end; arrays are reached through
+  offsets, never `sizeof`.
+- `ANOLE_EV_ABORT` now carries an `anole_abort_event`: why
+  (`ANOLE_ABORT_CLIENT`, `_DEADLINE`, `_BODY`, `_DRAIN`, `_SERVER`) and what
+  the client was sent.
+- Event types and handle kinds have one frozen allocation table (docs/c-abi.md,
+  `anole.abi.json`): consumers skip types they do not know, obligations come
+  only when the configuration asks, numbers are never reused. 40
+  `ANOLE_EV_WS_UPGRADE` and 41 `ANOLE_EV_DRAINING` are allocated; handle kind
+  6 is a database transaction.
+
+### Added
+
+- `app.listen("3000")` (a bare port) listens on every interface, like
+  `":3000"`. A listen address Anole cannot read is now logged with examples.
+- `app.rateLimit(.{ .limit = 100 })`, a one-line in-memory rate limiter.
+- `anole.websocket.UpgradeOptions.subprotocols` and `.headers`: an endpoint
+  that speaks graphql-ws, STOMP or MQTT now echoes the subprotocol the browser
+  asked for (browsers fail the connection without it), and the handshake can
+  carry a cookie or other headers. `Socket.subprotocol` says which was
+  selected. `anole.websocket.isUpgrade(req)` tells a handler it has a
+  handshake before it decides.
+- `req.paramDecoded(name)`: a route parameter percent-decoded
+  (`/users/J%C3%BCrgen` -> `Jürgen`). `req.params` stays raw, as before, and
+  now says so.
+- `ws.httpVersion()` and `ws.isClosed()`.
+- `req.readerLimited`, `req.setDeadline`, `res.headersSent()`.
+- `EventStream.comment` (heartbeats), `end` and `draining`.
+- `timeouts.write` (30 s) bounds each write once a stream or file body has
+  started.
+- `anole.Duration`, `anole.Ca`, `anole.ClientAuth`, `anole.ClientOptions`,
+  `anole.ServerError`, `anole.TlsLoadError`, `anole.errors`.
+- `Compress.Options.brotli_quality`, a per-middleware Brotli quality.
+- Databases: `connect_at_start` and `ping_timeout` on MongoDB, `ping_timeout`
+  on SQLite, `anole.db.Tls`; `Tx.table`, `Tx.run` and `Tx.with(options)` on
+  both SQL connectors; `call.failFmt(code, fmt, args)` in gRPC.
+- `Group.grpc` and `Group.grpcWith` register a gRPC service behind a group's
+  middleware, for its gRPC calls and its transcoded routes alike; until now a
+  transcoded `/v1/...` route skipped a `/v1` group's auth middleware.
+
+- WebSocket handshakes can be decided by the application: `"accept":
+  "consumer"` on a websocket route sends each handshake as
+  `ANOLE_EV_WS_UPGRADE`, answered with `anole_ws_accept` (a subprotocol,
+  extra headers) or refused like any request (401, 403, a body). A route may
+  take `handler` and such a `websocket` together, so one app sees every
+  request on a path. Auto routes take `"subprotocols"`, and
+  `ANOLE_EV_WS_OPEN` says which was selected in the request record's new
+  `subprotocol` span. This is what ASGI's `websocket.accept` and
+  `websocket.close`, Bun's `server.upgrade()` and graphql-ws clients need.
+- Publishes to one topic arrive in the order they were made.
+
+- `include/anole.abi.json`, generated from `src/capi/abi.zig`
+  (`zig build capi-abi-json`; checked by `capi-test`): every record with
+  offsets, every constant by family, events, handle kinds and error tokens,
+  for generated parsers in anole-node and anole-py. `include/anole.schema.json`
+  carries `x-anole-abi` and a per-release `$id`.
+- `anole_last_error_name()` gives a stable token for the last error
+  (`AddressInUse`, `KeyMismatch`, `UnknownKey`...; the full list is in
+  docs/c-abi.md and `anole.abi.json`) and `anole_last_errno()` the OS error
+  behind it, so bindings can raise `EADDRINUSE` or `OSError(errno)` without
+  parsing text. `anole_ws_publish` on a server that is not running answers
+  `ANOLE_E_STATE` (was `E_GONE`); a failed `dup` in `anole_req_respond_fd` is
+  `ANOLE_E_SYSTEM` (was `E_INVALID`).
+- `ANOLE_E_TOOBIG` from `anole_poll` and `anole_poll_wait` now writes an
+  `ANOLE_EV_NONE` header whose `len` is the size the next record needs, so a
+  binding allocates once instead of doubling.
+- `anole_server_open` starts Anole's threads and opens the databases without
+  listening, for startup work before traffic (`anole_server_start` still
+  opens by itself). `observe.health.checks` declares readiness checks that
+  keep `/readyz` at 503 until `anole_server_set_ready` marks them ready;
+  `observe.health.listener` serves the health routes on one listener only.
+  `anole_server_destroy` on a server that was not drained no longer waits
+  for answers only its caller could give: it answers what consumers still owe
+  with 503 at once, so it can run on a consumer's thread (Node cleanup hooks,
+  Python `atexit`). The log callback belongs to its server and is cleared by
+  `anole_server_destroy`.
+- In embedded mode Anole's threads block asynchronous signals, so a host's
+  SIGCHLD or SIGINT handler never runs on them. A forked child no longer
+  inherits a usable server: calls on the parent's server answer
+  `ANOLE_E_STATE`, and the child may create its own. `anole_server_start`
+  refuses a configuration with more consumers than executors (one would
+  never get an event). `anole_consumer_set_wake` lets a restarted worker or a
+  new event loop take over a consumer.
+
+- Database transactions: `anole_db_begin` answers with an `anole_db_tx`
+  handle; `anole_db_tx_query`/`_exec` run on its connection in order,
+  `anole_db_tx_commit`/`_rollback` end it, `anole_db_tx_release` (or
+  `anole_handle_release`) rolls back from a finalizer. A transaction is
+  bounded as a whole by `timeout_ms` (the database's, 30 s, by default) and
+  can be tied to a request. SQLite and PostgreSQL.
+- `anole_db_options.req` ties a query to the request or gRPC call it serves:
+  it runs on that request's executor, and is canceled (answering
+  `ANOLE_E_GONE`) when the request is aborted or passes its deadline.
+- `databases[]` takes `timeout_ms` and `errors` (a class to status map, as
+  `anole.db.ErrorMap`), and client certificates and `insecure_skip_verify`
+  for PostgreSQL, Redis and MongoDB, with the options MongoDB lacked
+  (`idle_timeout_ms`, `heartbeat_ms`, `retry_reads`, `retry_writes`,
+  `connect_at_start`, `ping_timeout_ms`) and SQLite's `uri` and
+  `ping_timeout_ms`; `anole_db_result_event.table` names the table or
+  collection of an error.
+- `grpc.services[].middleware`: native middleware per gRPC service.
+
+### Fixed
+
+- C ABI: two `anole_ws_publish` calls to the same topic could reach a
+  subscriber in the opposite order (they fanned out on different executors).
+  Publishes to one topic now arrive in the order they were made.
+- C ABI: a fixed-response route behind a JWKS `jwt` middleware ran inline on
+  the HTTP/2 reader, where the JWKS fetch could stall the connection; it now
+  keeps a task.
+- Event streams, streamed responses and file downloads are no longer cut at
+  the request timeout (30 s in Zig, `request_ms` + 5 s through the C ABI over
+  HTTP/1.1 and tasked HTTP/2 and HTTP/3 streams). Once the head is out, the
+  request deadline ends and `timeouts.write` bounds each write the client does
+  not take.
+- Setting any `http2` option no longer drops the concurrent-stream limit from
+  250 to 100.
+- `app.tracing()` reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME`
+  from the environment; it used to need `.process`.
+- `iterate` that leaves a transaction open, and a connection from `acquire`
+  given back inside one, are now rolled back (and logged) as plain calls
+  already were in 0.1.3. A finished SQLite `Tx` fails with `error.Database`
+  instead of asserting (undefined behaviour in release builds).
+- `Call.fail`, `Call.addTrailer` and `Call.addHeader` copy their strings: a
+  message formatted into a stack buffer used to be read after the handler
+  returned.
+- The C ABI's schema advertised `mongodb+srv://`, which is refused at start;
+  it now says so, with the way around it.
+- docs/database.md no longer says `.auto` catches a role change made inside a
+  function: PostgreSQL does not report `role`; use `.always` for apps that
+  switch roles.
+
+- C ABI: `ANOLE_EV_SENT` follows every borrowing call that returned `>= 0`,
+  exactly once, zero-length writes included, and is never lost to a full
+  queue or a failed allocation (the record is allocated by the call, which
+  answers `ANOLE_E_NOMEM` and takes nothing if it cannot). Borrowing calls
+  that fail never produce one. On HTTP/2 and HTTP/3 a borrowed whole-response
+  body is copied (documented).
+- C ABI: a libanole built with Redis or MongoDB but neither SQLite nor
+  PostgreSQL refused every `anole_db_query` and `anole_db_exec` with
+  `ANOLE_E_UNSUPPORTED`.
+- C ABI executors no longer spin a core at 100% while a consumer's queue is
+  full: they sleep until the consumer polls. Events (`ANOLE_EV_ABORT`,
+  `_WRITABLE`, `_BODY`, `_SENT`) are no longer dropped when the queue is full.
+
+- A server busy with many thousands of connections on one executor let new
+  ones in slowly: its accept loop took 128 connections per pass over the
+  busy ones (64 once spawn backpressure applied), and a pass takes about
+  200 ms at 25,000 connections. The clients still in the backlog waited
+  10 s or more for their first answer while those already in were served
+  every pass (HTTP/1.1 at 25,000 connections on one CPU: p99 6.3 s, about
+  3,800 timeouts). Idle connections waking from parking queued behind the
+  same limit (p50 1.6 s). zio's accept and spawn budgets now grow to the
+  number of tasks that ran during the last trip to the back of the run
+  queue (zio `fast_accept`, which Anole turns on).
+
+- zio: since upstream lalinsky/zio#841, with pinned scheduling a task in the
+  overflow queue (one woken by a timer or I/O included) could wait forever
+  once more than 256 tasks on one executor kept yielding: the fork keeps the
+  ring and its overflow one FIFO queue again. zio is now upstream main
+  035d245 merged into the fork, plus that fix.
+
 ## 0.1.3 (2026-10-22)
 
 ### Security

@@ -15,7 +15,7 @@ const std = @import("std");
 // the client import them directly.
 const ngtcp2 = @import("ngtcp2.zig");
 const nghttp3 = @import("nghttp3.zig");
-/// The HTTP/3 server endpoint for a dusty server's router.
+/// The HTTP/3 server endpoint for a the core server's router.
 pub const Endpoint = @import("server.zig").Endpoint;
 /// An `Endpoint`'s settings; `ServerOptions.Http3` is the usual way in.
 pub const EndpointOptions = @import("server.zig").Options;

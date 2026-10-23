@@ -12,7 +12,7 @@ const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 
 /// `RequestId.init`'s settings.
-pub const Config = struct {
+pub const Options = struct {
     /// The header the ID is read from (with `trust_incoming`) and sent in.
     header: []const u8 = "X-Request-Id",
     /// Reuse an incoming ID. Only for a server reachable solely through a
@@ -28,7 +28,7 @@ trust_incoming: bool,
 const RequestId = @This();
 
 /// The middleware: `app.use(anole.middleware.RequestId.init(.{}))`.
-pub fn init(config: Config) RequestId {
+pub fn init(config: Options) RequestId {
     return .{ .header = config.header, .trust_incoming = config.trust_incoming };
 }
 
@@ -36,10 +36,13 @@ pub fn init(config: Config) RequestId {
 /// (`Detached`).
 pub const detach_safe = true;
 
-pub fn execute(self: *const RequestId, req: *Request, res: *Response, executor: anytype) !void {
+/// Never waits: no I/O, so `no_wait` routes may sit behind it.
+pub const no_wait = true;
+
+pub fn execute(self: *const RequestId, req: *Request, res: *Response, next: anytype) !void {
     req.id = if (self.trust_incoming) incoming(req, self.header) orelse try generate(req) else try generate(req);
     try res.header(self.header, req.id);
-    return executor.next();
+    return next.call();
 }
 
 /// An incoming ID worth keeping: one that `validIncoming` accepts.

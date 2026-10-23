@@ -61,7 +61,7 @@ fn port(req: *dusty.Request, res: *dusty.Response) !void {
 /// GET /download?n=BYTES: that many bytes, streamed.
 fn download(req: *dusty.Request, res: *dusty.Response) !void {
     const n = std.fmt.parseInt(usize, req.query.get("n") orelse "0", 10) catch 0;
-    var w = res.writer();
+    var w = try res.writer();
     var chunk: [16 * 1024]u8 = undefined;
     for (&chunk, 0..) |*b, i| b.* = @truncate(i);
     var left = n;
@@ -76,6 +76,18 @@ fn download(req: *dusty.Request, res: *dusty.Response) !void {
 fn slow(req: *dusty.Request, res: *dusty.Response) !void {
     try req.io.sleep(.fromSeconds(5), .awake);
     res.body = "too late";
+}
+
+/// An event every 100 ms for 1.2 s: a stream that outlives a short
+/// request timeout.
+fn ticks(req: *dusty.Request, res: *dusty.Response) !void {
+    var buf: [256]u8 = undefined;
+    var events = try res.startEventStream(&buf);
+    for (0..12) |_| {
+        try events.send("tick", .{});
+        try req.io.sleep(.fromMilliseconds(100), .awake);
+    }
+    try events.end();
 }
 
 /// The head and some of the body, then nothing for a while.
@@ -191,7 +203,7 @@ const Fixture = struct {
     bundle: std.crypto.Certificate.Bundle,
 
     fn start(gpa: std.mem.Allocator, io: std.Io) !Fixture {
-        return startWith(gpa, io, .{ .listeners = &.{} }, .{});
+        return startWith(gpa, io, .{ .listeners = &.{}, .request = .{ .max_body_size = 8 << 20 } }, .{});
     }
 
     /// What `startWith` sets on the endpoint beyond the defaults.
@@ -224,6 +236,7 @@ const Fixture = struct {
         http.router.post("/echo", echo);
         http.router.get("/trailers", withTrailers);
         http.router.get("/slow", slow);
+        http.router.get("/ticks", ticks);
         http.router.get("/stall", stall);
         http.router.get("/peer", peer);
         http.router.get("/abort", aborted);
@@ -728,6 +741,20 @@ test "h3 server: a request that outlives timeout.request is reset" {
     try std.testing.expectEqualStrings("hello over h3", body);
 }
 
+test "h3 server: an event stream outlives timeouts.request" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{}, .timeout = .{ .request = .fromMilliseconds(300), .write = .fromSeconds(5) } }, .{});
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const body = try get(conn, "/ticks", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, body, "data: tick"));
+}
+
 test "h3 server: mutual TLS in request mode, and the client certificate in handlers (PEM or files)" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
@@ -763,13 +790,17 @@ test "h3 server: mutual TLS in request mode, and the client certificate in handl
         defer tmp.cleanup();
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "cert.pem", .data = f.pem.cert });
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "key.pem", .data = f.pem.key });
+        var cert_buf: [160]u8 = undefined;
+        var key_buf: [160]u8 = undefined;
+        const cert_path = try std.fmt.bufPrint(&cert_buf, ".zig-cache/tmp/{s}/cert.pem", .{tmp.sub_path});
+        const key_path = try std.fmt.bufPrint(&key_buf, ".zig-cache/tmp/{s}/key.pem", .{tmp.sub_path});
         const conn = try client.ClientConnection.connect(gpa, io, .{
             .host = "localhost",
             .address = f.ep.address(),
             .port = f.ep.address().getPort(),
             .tls = .{
-                .ca = .{ .file = .{ .path = "cert.pem", .dir = tmp.dir } },
-                .client_certificate = .{ .cert_path = "cert.pem", .key_path = "key.pem", .dir = tmp.dir },
+                .ca = .{ .file = cert_path },
+                .client_certificate = .fromFiles(cert_path, key_path),
             },
         });
         defer conn.close();

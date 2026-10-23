@@ -134,6 +134,12 @@ pub fn Bounded(comptime func: anytype) type {
     return (eu.error_set || error{GatewayTimeout})!eu.payload;
 }
 
+/// The bound a call runs under: its own, else the connector's; `.max` is none.
+pub fn callTimeout(call: ?std.Io.Duration, connector: ?std.Io.Duration) ?std.Io.Duration {
+    const t = call orelse connector orelse return null;
+    return if (t.nanoseconds == std.Io.Duration.max.nanoseconds) null else t;
+}
+
 /// Runs `func(args...)` under `timeout` (a call's `QueryOptions.timeout`);
 /// null runs it as it is. Past it, the call is canceled where it waits,
 /// which `func` handles as any cancel (leaving the connection reset or
@@ -249,7 +255,7 @@ test "fail and lastError: on a Ctx and on a request, copied into the arena" {
         try std.fmt.bufPrint(&buf, "{f}", .{detail}),
     );
 
-    var req: dusty.Request = .{ .arena = arena, .io = testing.io, .parser = undefined, .transport = undefined };
+    var req: dusty.Request = .{ .arena = arena, .io = testing.io, ._parser = undefined, ._transport = undefined };
     try testing.expect(db.lastError(&req) == null);
     const lost = fail(&req, .{}, .{ .system = .postgresql, .class = .serialization, .code = "40001", .message = "could not serialize access" });
     try testing.expectEqual(error.Conflict, lost);
@@ -283,6 +289,18 @@ test "bounded: past its timeout a call is canceled and fails with GatewayTimeout
     defer testing.log_level = level;
     try testing.expectError(error.GatewayTimeout, bounded(&ctx, .postgresql, .fromMilliseconds(20), Slow.wait, .{ io, 10_000 }));
     try testing.expectEqual(db.Class.timeout, db.lastError(&ctx).?.class);
+}
+
+test "db: callTimeout" {
+    const D = std.Io.Duration;
+    try std.testing.expectEqual(@as(i96, 5 * std.time.ns_per_s), internal_ns(callTimeout(D.fromSeconds(5), D.fromSeconds(30))));
+    try std.testing.expectEqual(@as(i96, 30 * std.time.ns_per_s), internal_ns(callTimeout(null, D.fromSeconds(30))));
+    try std.testing.expect(callTimeout(D.max, D.fromSeconds(30)) == null);
+    try std.testing.expect(callTimeout(null, null) == null);
+}
+
+fn internal_ns(d: ?std.Io.Duration) i96 {
+    return d.?.nanoseconds;
 }
 
 test "split: the parts add up, differ by one at most, and none is empty" {

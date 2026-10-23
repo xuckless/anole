@@ -306,14 +306,14 @@ test "WebTransport: a peer stream reset before its session prefix completes is f
     for (0..120) |i| {
         var tries: usize = 0;
         const id = while (true) : (tries += 1) {
-            break session.testOpenRaw(if (i % 2 == 0) .uni_out else .bidi, if (i % 2 == 0) "\x40\x54" else "\x40\x41") catch |err| {
+            break wt.Session.Driver.testOpenRaw(session, if (i % 2 == 0) .uni_out else .bidi, if (i % 2 == 0) "\x40\x54" else "\x40\x41") catch |err| {
                 if (err != error.StreamIdBlocked or tries > 200) return err;
                 try io.sleep(.fromMilliseconds(10), .awake);
                 continue;
             };
         };
         try io.sleep(.fromMilliseconds(2), .awake);
-        session.testReset(id);
+        wt.Session.Driver.testReset(session, id);
     }
     // The connection still works.
     const s = try session.openStream();

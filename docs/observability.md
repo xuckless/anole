@@ -135,7 +135,7 @@ returns. Options:
 - `.log_query`: also log the query string (false). Off by default, because
   queries carry OIDC `code` and `state`, password-reset tokens and API keys,
   and logs keep them. `anole.middleware.Logger` has the same switch
-  (`Logger.initWith(.{ .log_query = true })`).
+  (`Logger.init(.{ .log_query = true })`).
 
 Each line is a single write, so lines from concurrent requests do not
 interleave. The line is written straight to the file, not through
@@ -160,7 +160,7 @@ middleware are installed. A handler that returns `error.NotFound` is logged
 as the 404 it becomes. Any other error adds `error` and reports the status
 the server answers it with (`anole.errorStatus`): a status-named error's own,
 such as 401 for `error.Unauthorized`, the 4xx for a request-body fault, such
-as 413 for a body over `max_body_size`, and 500 for anything else. Metrics
+as 413 for a body over `limits.body_max`, and 500 for anything else. Metrics
 and spans record the same status. An error raised after the response head went out
 (a stream cut short, say) is recorded with the status that was sent. A
 WebSocket over HTTP/2 is recorded as 101, like one over HTTP/1.1, though the
@@ -283,7 +283,7 @@ collector as JSON, with `POST {endpoint}/v1/traces`. It sends through the
 
 - `.endpoint`: the collector's base URL, such as `http://127.0.0.1:4318`.
 - `.service_name`: the `service.name` resource attribute.
-- `.batch_size` (256) and `.interval_ms` (2000): the most spans per POST,
+- `.batch_size` (256) and `.interval` (2 s): the most spans per POST,
   and the pause after a POST that did not fill a batch.
 - `.queue_len` (4096): spans waiting beyond this are dropped.
 - `.sample_all` (true): trace every request. With false, trace only

@@ -706,3 +706,47 @@ test "transcoding: off for a registration" {
     try std.testing.expect(router.trees[@backingInt(dusty.Method.get)] == null);
     try std.testing.expect(router.trees[@backingInt(dusty.Method.patch)] == null);
 }
+
+/// Middleware that refuses every request.
+const DenyAll = struct {
+    pub fn execute(_: *DenyAll, _: *dusty.Request, res: *dusty.Response, _: anytype) !void {
+        res.fail(.unauthorized, "denied");
+    }
+};
+
+test "grpc: a group's middleware runs for gRPC paths and transcoded routes, and its prefix does not move gRPC paths" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }},
+    }, {});
+    defer server.deinit();
+    var deny: DenyAll = .{};
+    const group = server.router.group("/v1", &.{dusty.Middleware(void).init(&deny)});
+    grpc.registerWith(void, group, Library, impl, .{});
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+    const port = server.address.ip.getPort();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = level;
+
+    // The transcoded REST route and the gRPC path (Connect JSON) are both behind it.
+    const rest = try http1(gpa, arena, io, port, .{ .method = .get, .path = "/v1/books/one" });
+    try std.testing.expectEqual(@as(u16, 401), rest.status);
+    const rpc = try http1(gpa, arena, io, port, .{ .method = .post, .path = "/transcode.Library/GetBook", .body = "{\"name\":\"c\"}" });
+    try std.testing.expectEqual(@as(u16, 401), rpc.status);
+    // The group's prefix is not added to the gRPC path.
+    const moved = try http1(gpa, arena, io, port, .{ .method = .post, .path = "/v1/transcode.Library/GetBook", .body = "{\"name\":\"c\"}" });
+    try std.testing.expectEqual(@as(u16, 404), moved.status);
+}

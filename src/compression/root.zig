@@ -12,7 +12,7 @@ const std = @import("std");
 const features = @import("build_options");
 
 /// `Compress` (a `std.Io.Writer` that deflates) and `Decompress` (a
-/// `std.Io.Reader` that inflates) over zlib-ng; the same module dusty uses.
+/// `std.Io.Reader` that inflates) over zlib-ng; the same module the core uses.
 pub const zlib = @import("anole_zlib");
 
 /// zstd.h.
@@ -115,7 +115,7 @@ const zio = @import("zio");
 
 fn bigHandler(_: *dusty.Request, res: *dusty.Response) !void {
     res.compress = true;
-    var w = res.writer();
+    var w = try res.writer();
     for (0..300) |i| try w.interface.print("row {d}: compressible compressible compressible\n", .{i});
     try w.end();
 }

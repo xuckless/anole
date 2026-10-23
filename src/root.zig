@@ -60,6 +60,9 @@ const std = @import("std");
 /// `-Dsqlite`, `-Dmongodb`...).
 pub const features = @import("build_options");
 
+/// The version of Anole this build is (`build.zig.zon`).
+pub const version = features.version;
+
 /// The async runtime underneath (lalinsky/zio). `Server` owns one; reach
 /// for this only to run zio code of your own beside it. Anole needs
 /// zio's pinned scheduling, which its build of zio uses by default: a root
@@ -77,14 +80,29 @@ pub const Server = @import("server.zig").Server;
 /// Everything `Server` has, with `(req, res)` handlers.
 pub const App = @import("server.zig").App;
 /// What `App.init` and `Server(Ctx).init` take: listeners (`http`,
-/// `https`, `http3`, `listeners`), executors, limits and timeouts
-/// (`server`), error answers, the blocking pool. `.{}` is a working
-/// default.
+/// `https`, `http3`, `listeners`), `timeouts`, `limits`, `proxy`, `request`,
+/// `response` and `http2` (the C ABI's names), executors, error answers, the
+/// blocking pool. `.{}` is a working default.
 pub const ServerOptions = @import("server.zig").Options;
 /// A TLS certificate for `listenTls` and `ServerOptions.https`:
 /// `.fromFiles("cert.pem", "key.pem")`, `.fromPem(cert, key)` or
 /// `.dev_self_signed`.
 pub const Cert = ServerOptions.Cert;
+/// Certificate authorities a peer's certificate must chain to
+/// (`Ca.fromFile("ca.pem")`, `.system`, `.dir`, `.fromPem`).
+pub const Ca = @import("http/root.zig").Ca;
+/// Mutual TLS on a listener: `.{ .ca = .fromFile("clients-ca.pem") }`.
+pub const ClientAuth = ServerOptions.ClientAuth;
+/// A length of time: `.fromSeconds(30)`.
+pub const Duration = @import("server.zig").Duration;
+/// The outbound HTTP client's settings (`ServerOptions.client`).
+pub const ClientOptions = @import("http/root.zig").ClientOptions;
+/// Every way `init`, `listen`, `listenTls`, `run` and `waitReady` fail.
+pub const ServerError = @import("errors.zig").ServerError;
+/// What `reloadCertificates` and `setCertificate` fail with.
+pub const TlsLoadError = @import("errors.zig").TlsLoadError;
+/// Error-name helpers shared with the C ABI.
+pub const errors = @import("errors.zig");
 /// A listener in `ServerOptions.listeners`: address or unix socket, TLS,
 /// protocols, name.
 pub const Listener = ServerOptions.Listener;
@@ -98,7 +116,10 @@ pub const func = @import("handlers.zig").func;
 pub const Next = @import("handlers.zig").Next;
 /// Marks a handler that never waits on I/O, so HTTP/2 and HTTP/3 run it
 /// without a task of its own: `app.get("/ping", anole.noWait(ping))`.
-/// Not for handlers that query a database or call another service.
+/// Not for handlers that query a database or call another service. The
+/// middleware in front of such a route must say it never waits
+/// (`pub const no_wait = true;`), or registering the route is a startup
+/// error; around a middleware function, `app.use(anole.noWait(f))` says it.
 pub const noWait = @import("handlers.zig").noWait;
 /// A route whose answers are kept per executor and served from memory:
 /// `app.get("/feed", anole.cached(.{ .ttl = .fromSeconds(5) }, feed))`.
@@ -159,7 +180,7 @@ pub const Response = http.Response;
 ///
 ///     app.use(anole.middleware.RequestId.init(.{}));
 ///     app.use(anole.middleware.Cors.init(.{}));
-///     app.use(anole.middleware.Compress.init());
+///     app.use(anole.middleware.Compress.init(.{}));
 pub const middleware = struct {
     /// Cross-origin requests: `Cors.init(.{})` allows any origin.
     pub const Cors = http.middleware.Cors;
@@ -286,6 +307,7 @@ pub const auth = if (features.auth) @import("auth/root.zig") else struct {};
 test {
     _ = @import("server.zig");
     _ = @import("api_test.zig");
+    _ = @import("db_options_test.zig");
     _ = @import("address.zig");
     _ = @import("handlers.zig");
     _ = @import("client.zig");

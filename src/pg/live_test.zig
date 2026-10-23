@@ -188,7 +188,7 @@ test "pg: live table and run: values known only at run time, in PostgreSQL's tex
     const q = d.with(.{});
 
     // Several statements, no parameters.
-    const ch = try q.run(&c,
+    const ch = try q.execValues(&c,
         \\DROP TABLE IF EXISTS anole_pg_dyn;
         \\CREATE TABLE anole_pg_dyn (id int8 PRIMARY KEY, name text UNIQUE NOT NULL, ok bool, score float8,
         \\  price numeric(8, 2), data bytea, at timestamptz, tags text[]);
@@ -198,8 +198,8 @@ test "pg: live table and run: values known only at run time, in PostgreSQL's tex
     // Every kind of value as a parameter; numbers into numeric and text go
     // as text.
     const row: []const db.Value = &.{ .{ .int = 1 }, .{ .text = "ada" }, .{ .bool = true }, .{ .float = 2.5 }, .{ .int = 12 }, .{ .blob = "\x00\xff" }, .{ .text = "2026-10-22T10:00:00Z" }, .{ .text = "{a,b}" } };
-    try testing.expectEqual(@as(u64, 1), (try q.run(&c, "INSERT INTO anole_pg_dyn VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", row)).changes);
-    try testing.expectEqual(@as(u64, 1), (try q.run(&c, "INSERT INTO anole_pg_dyn (id, name) VALUES ($1, $2)", &.{ .{ .int = 2 }, .{ .text = "bob" } })).changes);
+    try testing.expectEqual(@as(u64, 1), (try q.execValues(&c, "INSERT INTO anole_pg_dyn VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", row)).changes);
+    try testing.expectEqual(@as(u64, 1), (try q.execValues(&c, "INSERT INTO anole_pg_dyn (id, name) VALUES ($1, $2)", &.{ .{ .int = 2 }, .{ .text = "bob" } })).changes);
 
     const t = try q.table(&c, "SELECT id, name, ok, score, price, data, at, tags, NULL::int4 AS nothing, 'Infinity'::float8 AS inf FROM anole_pg_dyn WHERE id >= $1 ORDER BY id", &.{.{ .int = 1 }});
     try testing.expectEqual(@as(usize, 10), t.columns.len);
@@ -230,14 +230,14 @@ test "pg: live table and run: values known only at run time, in PostgreSQL's tex
 
     const level = quiet();
     defer testing.log_level = level;
-    try testing.expectError(error.Conflict, q.run(&c, "INSERT INTO anole_pg_dyn (id, name) VALUES ($1, $2)", &.{ .{ .int = 3 }, .{ .text = "ada" } }));
+    try testing.expectError(error.Conflict, q.execValues(&c, "INSERT INTO anole_pg_dyn (id, name) VALUES ($1, $2)", &.{ .{ .int = 3 }, .{ .text = "ada" } }));
     try testing.expectEqualStrings("anole_pg_dyn_name_key", db.lastError(&c).?.constraint.?);
     // An error in the middle of the rows; the connection carries on.
     try testing.expectError(error.Database, q.table(&c, "SELECT 10 / (x - 2) FROM generate_series(1, 3) x", &.{}));
     try testing.expectEqualStrings("22012", db.lastError(&c).?.code);
     try testing.expectError(error.Database, q.table(&c, "SELECT $1::int4", &.{.{ .float = 1.5 }}));
     try testing.expectEqual(@as(i64, 2), (try q.table(&c, "SELECT count(*) FROM anole_pg_dyn", &.{})).rows[0][0].int);
-    _ = try q.run(&c, "DROP TABLE anole_pg_dyn", &.{});
+    _ = try q.execValues(&c, "DROP TABLE anole_pg_dyn", &.{});
 }
 
 test "pg: live transactions: commit, roll back, retry a serialization failure" {
@@ -599,6 +599,44 @@ test "pg: live channel binding, and what a call sets for the session is reset" {
     }
 }
 
+test "pg: .auto misses a role switch inside a function; .always resets it" {
+    _ = try testUrl();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+
+    {
+        const setup = try open(io, .{ .max_connections = 1 });
+        defer setup.deinit();
+        _ = try setup.exec(&c, "DROP ROLE IF EXISTS anole_b", .{});
+        // A superuser, like the test login: switching to a role that is not
+        // one flips `is_superuser`, which the server does report, and .auto
+        // would see that.
+        _ = try setup.exec(&c, "CREATE ROLE anole_b SUPERUSER", .{});
+        _ = try setup.exec(&c, "CREATE OR REPLACE FUNCTION anole_pg_switch_role() RETURNS text LANGUAGE sql AS $$ SELECT set_config('role', 'anole_b', false) $$", .{});
+    }
+    defer {
+        const cleanup = open(io, .{ .max_connections = 1 }) catch null;
+        if (cleanup) |d| {
+            _ = d.exec(&c, "DROP FUNCTION IF EXISTS anole_pg_switch_role()", .{}) catch {};
+            _ = d.exec(&c, "DROP ROLE IF EXISTS anole_b", .{}) catch {};
+            d.deinit();
+        }
+    }
+    for ([_]pg.Options.ResetSession{ .auto, .always }) |mode| {
+        const d = try open(io, .{ .max_connections = 1, .reset_session = mode });
+        defer d.deinit();
+        const login = try d.one([]const u8, &c, "SELECT session_user::text", .{});
+        _ = try d.one([]const u8, &c, "SELECT anole_pg_switch_role()", .{});
+        const now = try d.one([]const u8, &c, "SELECT current_user::text", .{});
+        // the documented limit of .auto: `role` is not a reported setting
+        try testing.expectEqualStrings(if (mode == .auto) "anole_b" else login, now);
+    }
+}
+
 const AppState = struct {
     db: *pg.Client,
 };
@@ -691,4 +729,37 @@ test "pg: live app.postgres: handlers, statuses, /readyz and /metrics" {
     var checking = try app.io().concurrent(Check.run, .{&app});
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
+}
+
+test "pg: iterate over a bare BEGIN fails left-open; acquire released in a transaction rolls back" {
+    _ = try testUrl();
+    // The left-open transaction is logged at err on purpose.
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    const d = try open(io, .{ .max_connections = 1 });
+    defer d.deinit();
+    _ = try d.exec(&c, "DROP TABLE IF EXISTS anole_pg_guard; CREATE TABLE anole_pg_guard (n int)", .{});
+    defer _ = d.exec(&c, "DROP TABLE IF EXISTS anole_pg_guard", .{}) catch {};
+
+    const level = quiet();
+    defer testing.log_level = level;
+    {
+        var rows = try d.iterate(struct {}, &c, "BEGIN", .{});
+        defer rows.deinit();
+        try testing.expectError(error.Database, rows.next());
+        try testing.expect(std.mem.indexOf(u8, db.lastError(&c).?.message, "left a transaction open") != null);
+    }
+    {
+        const conn = try d.acquire(&c);
+        _ = try conn.raw.exec("BEGIN", .{});
+        _ = try conn.raw.exec("INSERT INTO anole_pg_guard VALUES (1)", .{});
+        conn.release();
+    }
+    try testing.expectEqual(@as(i64, 0), try d.one(i64, &c, "SELECT count(*) FROM anole_pg_guard", .{}));
 }

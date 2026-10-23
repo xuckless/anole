@@ -63,7 +63,7 @@ fn run(kind: Kind) !void {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var mem = session.MemoryStore.init(gpa, io);
+    var mem = session.MemoryStore.init(gpa, io, .{});
     defer mem.deinit();
     var redis_store: RedisStore = undefined;
     var store: ?session.Store = null;
@@ -197,7 +197,7 @@ fn runInFlight(slow_path: []const u8) !void {
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     const io = rt.io();
-    var mem = session.MemoryStore.init(gpa, io);
+    var mem = session.MemoryStore.init(gpa, io, .{});
     defer mem.deinit();
     var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
     defer server.deinit();

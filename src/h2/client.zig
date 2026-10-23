@@ -1,6 +1,6 @@
 //! An HTTP/2 client connection on nghttp2: many concurrent streams over one
 //! TCP connection, cleartext (prior knowledge) or TLS with ALPN "h2". The
-//! shape follows the server engine in the dusty fork: a reader task feeds
+//! shape follows the server engine in the the core fork: a reader task feeds
 //! the session, a writer task drains it, one mutex serializes every
 //! nghttp2 call, and nothing blocks while holding it.
 //!
@@ -18,8 +18,8 @@
 //! `closeSend()`; its response body is read through `reader()`, and the
 //! trailers are in `trailers` once that reports the end.
 //!
-//! Its own module (`anole_h2_client`), because dusty's client takes it as
-//! its `h2_client` import: when a server picks "h2" through ALPN, dusty
+//! Its own module (`anole_h2_client`), because the core's client takes it as
+//! its `h2_client` import: when a server picks "h2" through ALPN, the core
 //! hands the TLS connection over (`adopt`), so `anole.http.Client` speaks
 //! HTTP/2 too.
 const std = @import("std");
@@ -68,23 +68,18 @@ pub const ConnectOptions = struct {
     /// fails with `error.HeadersTooLarge`.
     max_header_list_size: u32 = default_max_header_list_size,
 
-    /// The fields of `anole.http.TlsConfig`, with the same defaults.
+    /// The fields of `anole.http.TlsOptions`, with the same defaults.
     pub const Tls = struct {
         /// The certificate authorities the server's certificate must chain
         /// to. The system store (the default) is loaded on the first
         /// `connect` and kept for the process; a file, directory or PEM is
         /// read on every `connect`. `.none` only with `insecure_skip_verify`.
-        ca: Ca = .system,
+        ca: dusty.Ca = .system,
         /// A certificate to present when the server asks for one (mutual
         /// TLS): files or PEM in memory, read on every `connect`.
-        client_certificate: ?ClientCertificate = null,
+        client_certificate: ?dusty.Cert = null,
         /// Accept any certificate, for any name. For tests only.
         insecure_skip_verify: bool = false,
-
-        /// The system store, a file, a directory, PEM in memory, or none.
-        pub const Ca = dusty.TlsCa;
-        /// A certificate and key, as files or PEM.
-        pub const ClientCertificate = dusty.TlsConfig.ClientCertificate;
     };
 };
 
@@ -201,7 +196,7 @@ pub const ClientConnection = struct {
     }
 
     /// Takes over a connection on which the TLS handshake picked "h2", as
-    /// dusty's client does (its `h2_client` seam): `reader` and `writer`
+    /// the core's client does (its `h2_client` seam): `reader` and `writer`
     /// carry the cleartext from here on, and only this connection's tasks
     /// use them. `socket` is shut down when the session ends but not
     /// closed; the caller closes it, and frees the TLS state, after
@@ -926,7 +921,10 @@ pub const Stream = struct {
     }
 };
 
-fn loadCertificate(gpa: std.mem.Allocator, io: std.Io, cc: ConnectOptions.Tls.ClientCertificate) !tls.config.CertKeyPair {
-    if (cc.pem) |pem| return tls.config.CertKeyPair.fromSlice(gpa, io, pem.cert, pem.key);
-    return tls.config.CertKeyPair.fromFilePath(gpa, io, cc.dir orelse std.Io.Dir.cwd(), cc.cert_path, cc.key_path);
+fn loadCertificate(gpa: std.mem.Allocator, io: std.Io, cc: dusty.Cert) !tls.config.CertKeyPair {
+    return switch (cc) {
+        .pem => |pem| tls.config.CertKeyPair.fromSlice(gpa, io, pem.cert, pem.key),
+        .files => |f| tls.config.CertKeyPair.fromFilePath(gpa, io, std.Io.Dir.cwd(), f.cert_path, f.key_path),
+        .dev_self_signed => error.DevCertificateUnavailable,
+    };
 }

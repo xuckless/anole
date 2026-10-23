@@ -77,14 +77,14 @@ pub const Policy = struct {
     /// for this application alone.
     allow_any_audience: bool = false,
     /// Clock skew allowed on `exp`, `nbf` and `iat`.
-    leeway_seconds: i64 = 60,
+    leeway: std.Io.Duration = .fromSeconds(60),
     /// Refuse a token without `exp` (`error.MissingExpiry`).
     require_exp: bool = true,
     /// Refuse a token without `iat` (`error.MissingIssuedAt`); OIDC ID
     /// tokens must carry one.
     require_iat: bool = false,
     /// A token older than this (by `iat`) is refused.
-    max_age_seconds: ?i64 = null,
+    max_age: ?std.Io.Duration = null,
 };
 
 /// Why `verify` refused a token. `NoMatchingKey`: no key has the token's
@@ -206,17 +206,17 @@ fn mediaSubtype(typ: []const u8) []const u8 {
 
 fn checkClaims(v: Verified, policy: Policy, now: i64) Error!void {
     // Saturating: the claims are any i64 the issuer wrote.
-    const leeway = policy.leeway_seconds;
+    const leeway = policy.leeway.toSeconds();
     if (v.integer("exp")) |exp| {
         if (now -| leeway >= exp) return error.Expired;
     } else if (policy.require_exp) return error.MissingExpiry;
     if (v.integer("nbf")) |nbf| if (now +| leeway < nbf) return error.NotYetValid;
     if (v.integer("iat")) |iat| {
         if (now +| leeway < iat) return error.IssuedInFuture;
-        if (policy.max_age_seconds) |max| if (now -| iat > max +| leeway) return error.TooOld;
+        if (policy.max_age) |max| if (now -| iat > max.toSeconds() +| leeway) return error.TooOld;
     } else if (policy.require_iat) {
         return error.MissingIssuedAt;
-    } else if (policy.max_age_seconds != null) return error.TooOld;
+    } else if (policy.max_age != null) return error.TooOld;
     if (policy.issuer) |iss| {
         const got = v.string("iss") orelse return error.WrongIssuer;
         if (!std.mem.eql(u8, got, iss)) return error.WrongIssuer;
@@ -458,7 +458,7 @@ test "claims: times past what an i64 holds are refused, not a crash" {
     try std.testing.expectEqual(@as(?i64, null), v.integer("big"));
     try std.testing.expectEqual(@as(?i64, 1700000000), v.integer("whole"));
     try std.testing.expectError(error.MissingExpiry, checkClaims(v, .{}, 1700000000));
-    try std.testing.expectError(error.TooOld, checkClaims(v, .{ .require_exp = false, .max_age_seconds = 60 }, 1700000000));
+    try std.testing.expectError(error.TooOld, checkClaims(v, .{ .require_exp = false, .max_age = .fromSeconds(60) }, 1700000000));
 }
 
 test "fuzz: JWS verification and JWK Sets" {
