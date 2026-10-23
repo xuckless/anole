@@ -841,7 +841,7 @@ pub const Client = struct {
     /// (TLS, login): for session state that must outlive one call, such as
     /// an advisory lock. `close` it.
     pub fn session(self: *Client, c: anytype) Error!Session {
-        const pool = &self.pools.pools[0].pool;
+        const pool = self.pools.pools[0].pool;
         const conn = self.gpa.create(pg.Conn) catch return error.OutOfMemory;
         errdefer self.gpa.destroy(conn);
         conn.* = pg.Conn.openAndAuth(pool._io, pool._allocator, pool._opts.connect, pool._opts.auth) catch |err| switch (err) {
