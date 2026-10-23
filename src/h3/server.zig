@@ -324,8 +324,8 @@ pub const Stats = struct {
     /// (`Options.inline_no_wait`).
     served_inline: std.atomic.Value(u64) = .init(0),
     /// Times a connection armed QUIC keep-alive (a request opened on an
-    /// idle connection); counted in test builds only.
-    keep_alive_arms: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {},
+    /// idle connection).
+    keep_alive_arms: std.atomic.Value(u64) = .init(0),
     /// The endpoint's 4 KiB send and receive blocks: handed out (a pooled
     /// request stream keeps one), and kept for reuse
     /// (`Endpoint.sampleStats` fills them in).
@@ -1571,7 +1571,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const want = conn.streams.count() > 0 and conn.state == .open;
                 if (want == conn.keep_alive_on) return;
                 conn.keep_alive_on = want;
-                if (want and builtin.is_test) _ = conn.ep.stats.keep_alive_arms.fetchAdd(1, .monotonic);
+                if (want) _ = conn.ep.stats.keep_alive_arms.fetchAdd(1, .monotonic);
                 c.ngtcp2_conn_set_keep_alive_timeout(conn.q, if (want) conn.keepAliveInterval() else std.math.maxInt(u64));
                 conn.kick();
             }
@@ -1580,7 +1580,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// at least 1 s; ours alone before the peer's parameters are known.
             fn keepAliveInterval(conn: *Conn) u64 {
                 var idle: u64 = std.math.lossyCast(u64, conn.ep.options.idle_timeout.toNanoseconds());
-                if (c.ngtcp2_conn_get_remote_transport_params(conn.q)) |p| {
+                if (c.ngtcp2_conn_get_remote_transport_params2(conn.q)) |p| {
                     const peer = p.*.max_idle_timeout;
                     if (peer != 0 and peer < idle) idle = peer;
                 }
