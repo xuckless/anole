@@ -441,6 +441,21 @@ src/smtp/core/ (the SMTP client's message encoding and protocol pieces)
             538d0ddc064248b6c1431bfd68df2481f431c0fd
   Linked:   -Dsmtp=true
 
+tests/lambda/events/*.json (sample AWS events for the Lambda adapter's tests)
+  Copied unchanged from aws-lambda-rust-runtime: lambda-http/tests/data
+  (the API Gateway REST and HTTP API, Function URL, ALB and VPC Lattice
+  requests) and lambda-events/src/fixtures (the SQS, S3, EventBridge and API
+  Gateway WebSocket events). Test data only; nothing of it is compiled into
+  a program. The adapter's code (src/lambda) is Anole's own and copies none
+  of the runtime's: only the rules it documents are followed (lambda_http's
+  type list for text bodies and its cookie handling, Hono's detection order).
+  NOTICE of the source repository:
+      AWS Lambda Rust Runtime
+      Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+  Licence:  Apache License 2.0 (text in part E)
+  Source:   https://github.com/aws/aws-lambda-rust-runtime, commit
+            7f89224ce954a0ad3998cc095e80539c3d110ab9
+
 C. MIT licence text (applies to every MIT component above)
 -----------------------------------------------------------
 
@@ -527,8 +542,8 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 
 
-E. Apache License 2.0 (BoringSSL, fiat-crypto, grpc-proto, googleapis, zig-jwt)
--------------------------------------------------------------------------------
+E. Apache License 2.0 (BoringSSL, fiat-crypto, grpc-proto, googleapis, zig-jwt, aws-lambda-rust-runtime sample events)
+-------------------------------------------------------------------------------------------------------------------------
 
 Copied verbatim from the LICENSE file of the pinned BoringSSL tree (commit
 22a0079b). That file also covers Go-licensed TLS test-suite code, which is

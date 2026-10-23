@@ -101,6 +101,12 @@ breaking changes are listed anyway.
   `unix:///path` and (Linux) `unix-abstract:name`, with no TLS. The socket
   file is created `0660`; `Listener.unix_mode` changes it. A leftover socket
   file is replaced.
+- `client.upload(url, options)`: a request whose body is written as it goes
+  (chunked, with trailers), over HTTP/1.1; `client.closeIdle()` closes the
+  idle pooled connections; `Exporter.flush(timeout)` sends queued spans and
+  waits for the collector. The AWS Lambda adapter's event mapping, answers
+  and Runtime API client are in `src/lambda` (docs/lambda.md); the rest of
+  the adapter follows.
 
 ### Changed
 
@@ -130,6 +136,8 @@ breaking changes are listed anyway.
   CANCELLED) instead of answering UNKNOWN.
 - `anole.grpc.Channel.conn` is optional (`h3` is the other connection); code
   that only sets it is unchanged, code that reads `channel.conn` unwraps it.
+- The `RequestId` middleware keeps an ID the engine set already (Lambda's
+  request ID) instead of generating another.
 - `anole.db.System` has `s3` and `smtp`, and `anole.resilience.Kind` too.
 - C ABI: a handle's kind takes five bits (28-32), so Kafka groups and
   batches are kinds of their own (17 and 18): a NATS handle given to a

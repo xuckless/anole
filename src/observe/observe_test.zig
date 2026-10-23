@@ -442,3 +442,45 @@ test "formatLine json: the shared record shape, no ts" {
     try std.testing.expectEqualStrings("Boom", parsed.object.get("error").?.string);
     try std.testing.expect(parsed.object.get("request_id") == null);
 }
+
+test "trace: flush sends queued spans before it returns" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var otel = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer otel.deinit();
+    otel.router.post("/v1/traces", collector);
+    var otel_future = try io.concurrent(serve, .{&otel});
+    defer otel_future.cancel(io) catch {};
+    try otel.waitReady(io);
+
+    var client = dusty.Client.init(gpa, io, .{});
+    defer client.deinit();
+    var endpoint_buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{otel.address.ip.getPort()});
+    // A long interval: only `flush` can make the span leave in time.
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = endpoint, .service_name = "flush-api", .interval = .fromSeconds(600) });
+    defer exporter.deinit();
+    try exporter.start();
+
+    collected_len = 0;
+    var span: observe.trace.Span = undefined;
+    span.db = null;
+    span.name_len = 0;
+    span.method_len = 0;
+    span.route_len = 0;
+    span.parent_span_id = null;
+    span.status_code = 200;
+    span.start_ns = 0;
+    span.end_ns = 0;
+    @memset(&span.trace_id, 'a');
+    @memset(&span.span_id, 'b');
+    exporter.submit(span);
+    exporter.flush(.fromSeconds(30));
+    try std.testing.expect(std.mem.indexOf(u8, collected[0..collected_len], "\"traceId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"") != null);
+    try std.testing.expectEqual(@as(u64, 1), exporter.exported.load(.monotonic));
+    // Nothing queued: returns at once.
+    exporter.flush(.fromSeconds(30));
+}

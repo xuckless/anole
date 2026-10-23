@@ -787,6 +787,19 @@ pub const ConnectionPool = struct {
         if (start_reaper) self.startReaper();
     }
 
+    /// Closes every idle connection (the busy ones are not touched).
+    pub fn closeIdle(self: *ConnectionPool) void {
+        var taken: std.DoublyLinkedList = .{};
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            while (self.idle.popFirst()) |n| taken.append(n);
+            self.idle_len = 0;
+        }
+        // Closing suspends, so it happens outside the critical section.
+        while (taken.popFirst()) |n| self.destroy(fromNode(n));
+    }
+
     /// Hands `conn` to a background drain, or returns false if no task
     /// could be had for it, in which case the caller still owns it.
     fn startDrain(self: *ConnectionPool, conn: *Connection) bool {
@@ -1522,6 +1535,143 @@ pub const ClientResponse = struct {
 /// connectors do: a request takes and gives back connections on its own
 /// executor, so a connection stays on one thread, and no lock is contended
 /// across them. Elsewhere there is one pool.
+/// `Client.upload`'s settings.
+pub const UploadOptions = struct {
+    method: Method = .post,
+    headers: ?*const Headers = null,
+    /// Trailer names announced in a `Trailer` header up front.
+    trailer_names: []const []const u8 = &.{},
+    /// Bounds opening the connection and sending the head, and (in
+    /// `finish`) waiting for the response head. Writing the body is the
+    /// caller's pace. Null inherits ClientOptions.timeout; .none lifts it.
+    timeout: ?std.Io.Timeout = null,
+    unix_socket_path: ?[]const u8 = null,
+};
+
+/// A request whose body is written as it goes (Transfer-Encoding:
+/// chunked), over HTTP/1.1 only, with no redirects. `Client.upload` makes
+/// one; end it with `finish` or `abort`.
+pub const Upload = struct {
+    /// Each flush (and each drain of its buffer) sends one chunk.
+    writer: *std.Io.Writer,
+    impl: *UploadImpl,
+
+    /// Ends the body (the last chunk, then `trailers`) and reads the
+    /// response head. The `Upload` is spent afterwards.
+    pub fn finish(self: *Upload, trailers: ?*const Headers) !ClientResponse {
+        return self.impl.finish(trailers);
+    }
+
+    /// Gives up: the connection is closed, not pooled. The `Upload` is
+    /// spent afterwards.
+    pub fn abort(self: *Upload) void {
+        self.impl.abort();
+    }
+};
+
+const UploadImpl = struct {
+    client: *Client,
+    conn: *Connection,
+    timeout: std.Io.Timeout,
+    write_err: ?Connection.WriteError = null,
+    w: std.Io.Writer,
+    buffer: [4096]u8 = undefined,
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain, .flush = flush };
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *UploadImpl = @alignCast(@fieldParentPtr("w", w));
+        const buffered = w.buffered();
+        var from_data: usize = 0;
+        for (data[0 .. data.len - 1]) |d| from_data += d.len;
+        from_data += data[data.len - 1].len * splat;
+        const total = buffered.len + from_data;
+        if (total == 0) return 0;
+        const out = self.conn.writer;
+        errdefer self.conn.closing = true;
+        try out.print("{x}\r\n", .{total});
+        try out.writeAll(buffered);
+        for (data[0 .. data.len - 1]) |d| try out.writeAll(d);
+        try out.splatBytesAll(data[data.len - 1], splat);
+        try out.writeAll("\r\n");
+        w.end = 0;
+        return from_data;
+    }
+
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *UploadImpl = @alignCast(@fieldParentPtr("w", w));
+        try std.Io.Writer.defaultFlush(w);
+        self.conn.flush() catch |err| {
+            self.conn.closing = true;
+            self.write_err = err;
+            return error.WriteFailed;
+        };
+    }
+
+    fn finish(self: *UploadImpl, trailers: ?*const Headers) !ClientResponse {
+        const client = self.client;
+        const conn = self.conn;
+        defer client.allocator.destroy(self);
+        errdefer conn.pool.release(conn);
+        self.w.flush() catch return self.writeError();
+        conn.writer.writeAll("0\r\n") catch |err| return self.fail(err);
+        if (trailers) |t| {
+            var it = t.iterator();
+            while (it.next()) |entry| {
+                try http.validateHeaderName(entry.key);
+                try http.validateHeaderValue(entry.value);
+                conn.writer.print("{s}: {s}\r\n", .{ entry.key, entry.value }) catch |err| return self.fail(err);
+            }
+        }
+        conn.writer.writeAll("\r\n") catch |err| return self.fail(err);
+        conn.flush() catch |err| {
+            conn.closing = true;
+            return err;
+        };
+        const deadline: Deadline = .init(client.io, self.timeout);
+        deadline.run(Connection.parseHead, .{conn}) catch |err| {
+            conn.closing = true;
+            return err;
+        };
+        return .{
+            .arena = conn.arena.allocator(),
+            .parser = &conn.parser,
+            .transport = conn.transport(),
+            .parsed = &conn.parsed_response,
+            .max_response_size = client.config.max_response_size,
+            .decompress = false,
+            .owner = conn,
+            .raw = null,
+        };
+    }
+
+    fn writeError(self: *UploadImpl) anyerror {
+        self.conn.closing = true;
+        if (self.write_err) |e| return e;
+        if (self.conn.getWriteError()) |e| return e;
+        return error.WriteFailed;
+    }
+
+    fn fail(self: *UploadImpl, err: std.Io.Writer.Error) anyerror {
+        self.conn.closing = true;
+        return switch (err) {
+            error.WriteFailed => self.conn.getWriteError() orelse error.WriteFailed,
+        };
+    }
+
+    fn abort(self: *UploadImpl) void {
+        self.conn.closing = true;
+        self.conn.pool.release(self.conn);
+        self.client.allocator.destroy(self);
+    }
+};
+
+/// The `Content-Length` and `Transfer-Encoding` of an upload are its own.
+fn writeUploadField(writer: *std.Io.Writer, name: []const u8, value: []const u8) !void {
+    if (std.ascii.eqlIgnoreCase(name, "Content-Length") or std.ascii.eqlIgnoreCase(name, "Transfer-Encoding") or std.ascii.eqlIgnoreCase(name, "Trailer")) return;
+    return writeField(writer, name, value);
+}
+
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1792,6 +1942,81 @@ pub const Client = struct {
                 .next => |next| state = next,
             }
         }
+    }
+
+    /// Starts a request whose body is written as it goes (see `Upload`):
+    /// the head is sent at once, over HTTP/1.1 only (also for https), with
+    /// no redirects, retries or breaker. `url` must be http or https.
+    pub fn upload(self: *Client, url: []const u8, options: UploadOptions) !Upload {
+        const uri = try parseUrl(url);
+        const info = try uriPortAndProtocol(uri);
+        const timeout = options.timeout orelse self.defaultTimeout();
+        const deadline: Deadline = .init(self.io, timeout);
+        return deadline.run(openUpload, .{ self, uri, info.port, info.protocol, options, timeout });
+    }
+
+    fn openUpload(self: *Client, uri: Uri, port: u16, protocol: Protocol, options: UploadOptions, timeout: std.Io.Timeout) !Upload {
+        var host_buffer: [255]u8 = undefined;
+        const host = try uriHost(uri, &host_buffer);
+        try http.validateHeaderValue(host);
+        const tls_config: ?TlsRef = if (protocol == .https) blk: {
+            if (!build_options.use_tls) return error.TlsNotConfigured;
+            break :blk try self.ensureTlsState();
+        } else null;
+        const conn = try self.acquireConnection(host, port, protocol, tls_config, options.unix_socket_path, false);
+        var armed = true;
+        errdefer if (armed) {
+            conn.closing = true;
+            conn.pool.release(conn);
+        };
+        const impl = try self.allocator.create(UploadImpl);
+        errdefer self.allocator.destroy(impl);
+        impl.* = .{ .client = self, .conn = conn, .timeout = timeout, .w = .{ .vtable = &UploadImpl.vtable, .buffer = &.{} } };
+        impl.w.buffer = &impl.buffer;
+
+        conn.parser.head_request = options.method == .head;
+        conn.parser.connect_request = false;
+        const w = conn.writer;
+        try http.validateHeaderValue(host);
+        try checkRequestTarget(uri);
+        const path = uriPath(uri);
+        if (uri.query) |query| {
+            try w.print("{s} {s}?{s} HTTP/1.1\r\n", .{ options.method.name(), path, query.percent_encoded });
+        } else {
+            try w.print("{s} {s} HTTP/1.1\r\n", .{ options.method.name(), path });
+        }
+        try requestFields(.{
+            .method = options.method,
+            .uri = uri,
+            .host = host,
+            .port = port,
+            .protocol = protocol,
+            .headers = options.headers,
+            .body = null,
+            .decompress = false,
+            .user_agent = self.config.user_agent,
+        }, w, writeUploadField);
+        try w.writeAll("Transfer-Encoding: chunked\r\n");
+        if (options.trailer_names.len > 0) {
+            try w.writeAll("Trailer: ");
+            for (options.trailer_names, 0..) |name, i| {
+                try http.validateHeaderName(name);
+                if (i > 0) try w.writeAll(", ");
+                try w.writeAll(name);
+            }
+            try w.writeAll("\r\n");
+        }
+        try w.writeAll("\r\n");
+        conn.flush() catch |err| return err;
+        armed = false;
+        return .{ .writer = &impl.w, .impl = impl };
+    }
+
+    /// Closes the idle pooled connections of every executor's pool (busy
+    /// ones are left alone): for a process that was frozen and thawed,
+    /// whose idle sockets the network may have dropped.
+    pub fn closeIdle(self: *Client) void {
+        for (self.pools[0..self.pool_count]) |*p| p.closeIdle();
     }
 
     /// The pool of the executor the calling task runs on: the first one
