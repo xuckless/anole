@@ -37,7 +37,11 @@ fn pack(gen: u32, state: State) u64 {
 
 const OutMsg = struct {
     type: websocket.MessageType,
+    /// A borrowed body (empty when `owned`).
     data: []const u8,
+    /// Owned: `len` bytes at `off` in the slot's `buf`.
+    off: usize = 0,
+    len: usize = 0,
     owned: bool,
     /// Borrowed: the `ANOLE_EV_SENT` record the sending call built.
     sent: ?[]align(8) u8 = null,
@@ -48,6 +52,10 @@ pub const WsSlot = struct {
     /// Over the outbox fields; never held across a send.
     lock: std.atomic.Mutex = .unlocked,
     msgs: std.ArrayList(OutMsg) = .empty,
+    /// The owned messages' bytes, one after the other: a burst of sends
+    /// costs one amortized allocation, not one per message. The sender
+    /// takes the whole list out with `msgs`.
+    buf: std.ArrayList(u8) = .empty,
     /// Bytes queued or being sent.
     bytes: usize = 0,
     /// A send got ANOLE_BUSY: ANOLE_EV_WRITABLE when there is room again.
@@ -142,6 +150,7 @@ pub const ExecState = struct {
         s.kick_pending = false;
         s.close_code = null;
         s.msgs.clearRetainingCapacity();
+        s.buf.clearRetainingCapacity();
         gpa.free(s.close_reason);
         s.close_reason = &.{};
         s.release();
@@ -176,10 +185,10 @@ pub const ExecState = struct {
             const c = cv.load(.acquire).?;
             for (c) |*s| {
                 for (s.msgs.items) |m| {
-                    if (m.owned) gpa.free(m.data);
                     if (m.sent) |r| engine.freeRecord(r.ptr);
                 }
                 s.msgs.deinit(gpa);
+                s.buf.deinit(gpa);
                 gpa.free(s.close_reason);
                 for (s.topics.items) |t| gpa.free(t);
                 s.topics.deinit(gpa);
@@ -381,13 +390,16 @@ fn retire(x: *Exec, s: *WsSlot, g: u32, sock: ?*Socket, code: u16) void {
     s.acquire();
     var rest = s.msgs;
     s.msgs = .empty;
+    var rest_buf = s.buf;
+    s.buf = .empty;
     s.bytes = 0;
     s.scheduled = false;
     gpa.free(s.close_reason);
     s.close_reason = &.{};
     s.release();
-    for (rest.items) |m| if (m.owned) gpa.free(m.data) else if (m.sent) |r| x.postSentRec(s.handle(g), r);
+    for (rest.items) |m| if (!m.owned) if (m.sent) |r| x.postSentRec(s.handle(g), r);
     rest.deinit(gpa);
+    rest_buf.deinit(gpa);
     if (sock) |sk| {
         for (s.topics.items) |t| {
             e.rooms.leave(t, sk);
@@ -451,12 +463,15 @@ fn sender(s: *WsSlot) std.Io.Cancelable!void {
         }
         const batch = s.msgs;
         s.msgs = .empty;
+        var buf = s.buf;
+        s.buf = .empty;
         const close_code = s.close_code;
         s.close_code = null;
         const reason = s.close_reason;
         s.close_reason = &.{};
         if (batch.items.len == 0 and close_code == null) {
             s.scheduled = false;
+            s.buf = buf;
             s.release();
             return;
         }
@@ -467,14 +482,28 @@ fn sender(s: *WsSlot) std.Io.Cancelable!void {
         var sent: usize = 0;
         var failed = false;
         for (list.items) |m| {
+            const data = if (m.owned) buf.items[m.off..][0..m.len] else m.data;
             if (!failed) {
-                if (sock.send(m.type, m.data)) |_| {
+                if (sock.sendDeferred(m.type, data)) |_| {
                     _ = e.ws_out.fetchAdd(1, .monotonic);
                 } else |_| failed = true;
             }
-            sent += m.data.len;
-            if (m.owned) gpa.free(m.data) else if (m.sent) |r| x.postSentRec(s.handle(g), r);
+            sent += data.len;
         }
+        // The burst leaves in one flush; the borrowed bodies are let go
+        // once it has.
+        sock.flushOut() catch {
+            failed = true;
+        };
+        for (list.items) |m| if (!m.owned) if (m.sent) |r| x.postSentRec(s.handle(g), r);
+        // The byte buffer goes back to the slot when it is small and the
+        // slot has none, so a steady stream allocates nothing.
+        buf.clearRetainingCapacity();
+        s.acquire();
+        const keep = s.buf.capacity == 0 and buf.capacity <= 64 * 1024;
+        if (keep) s.buf = buf;
+        s.release();
+        if (!keep) buf.deinit(gpa);
         if (close_code) |c| sock.close(@fromBackingInt(@intCast(c)), reason) catch {};
         s.acquire();
         s.bytes -|= sent;
@@ -498,14 +527,18 @@ pub fn send(e: *Engine, hv: u64, typ: u32, data: []const u8, borrow: bool) engin
     // The SENT record first: a call that fails takes nothing.
     const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
     errdefer if (sent) |r| engine.freeRecord(r.ptr);
-    const owned: ?[]u8 = if (borrow) null else try gpa.dupe(u8, data);
-    errdefer if (owned) |o| gpa.free(o);
     s.acquire();
     if (!s.live(g)) {
         s.release();
         return e.gone();
     }
-    s.msgs.append(gpa, .{ .type = mt, .data = owned orelse data, .owned = !borrow, .sent = sent }) catch {
+    const off = s.buf.items.len;
+    if (!borrow) s.buf.appendSlice(gpa, data) catch {
+        s.release();
+        return error.OutOfMemory;
+    };
+    s.msgs.append(gpa, .{ .type = mt, .data = if (borrow) data else &.{}, .off = off, .len = if (borrow) 0 else data.len, .owned = !borrow, .sent = sent }) catch {
+        s.buf.shrinkRetainingCapacity(off);
         s.release();
         return error.OutOfMemory;
     };
@@ -654,7 +687,8 @@ const PublishCmd = struct {
     except: u64,
     type: websocket.MessageType,
     topic: []u8,
-    data: []u8,
+    /// The message, made on the publishing thread; the one copy.
+    payload: *websocket.Rooms.Payload,
     /// `Engine.topic_changes` when it was taken.
     after: u32,
     /// The next publish in the executor's lane.
@@ -662,9 +696,9 @@ const PublishCmd = struct {
 
     fn free(p: *PublishCmd) void {
         _ = p.engine.publishing.fetchSub(1, .monotonic);
-        _ = p.engine.publish_bytes.fetchSub(p.topic.len + p.data.len, .monotonic);
+        _ = p.engine.publish_bytes.fetchSub(p.topic.len + p.payload.len, .monotonic);
         gpa.free(p.topic);
-        gpa.free(p.data);
+        p.payload.release(p.engine.rooms.allocator);
         gpa.destroy(p);
     }
 };
@@ -709,7 +743,8 @@ pub fn publish(e: *Engine, topic: []const u8, typ: u32, data: []const u8, except
     errdefer gpa.destroy(p);
     const t = try gpa.dupe(u8, topic);
     errdefer gpa.free(t);
-    p.* = .{ .cmd = .{ .run = runPublish }, .engine = e, .except = except, .type = mt, .topic = t, .data = try gpa.dupe(u8, data), .after = e.topic_changes.load(.acquire) };
+    const payload = try websocket.Rooms.Payload.create(e.rooms.allocator, mt, data);
+    p.* = .{ .cmd = .{ .run = runPublish }, .engine = e, .except = except, .type = mt, .topic = t, .payload = payload, .after = e.topic_changes.load(.acquire) };
     // One executor per topic, so publishes to a topic fan out in the order
     // they were taken; topics spread over the executors.
     const xi: usize = @intCast(std.hash.Wyhash.hash(0, topic) % e.execs.len);
@@ -761,7 +796,7 @@ fn publishLane(e: *Engine, x: *Exec) std.Io.Cancelable!void {
         if (p.except != 0) if (slotOf(e, p.except)) |found| {
             if (found[0].live(found[1])) except = found[0].socket;
         } else |_| {};
-        const reached = e.rooms.broadcast(p.topic, p.type, p.data, except);
+        const reached = e.rooms.broadcastPayload(p.topic, p.payload, except);
         _ = e.ws_out.fetchAdd(reached, .monotonic);
     }
 }
