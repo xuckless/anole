@@ -3161,6 +3161,7 @@ test "Connection: the placeholders it descends past stay out of its error sets" 
 test "Connection: isPeerGone separates a departed peer from a real failure" {
     try std.testing.expect(Connection.isPeerGone(error.EndOfStream));
     try std.testing.expect(Connection.isPeerGone(error.ConnectionResetByPeer));
+    try std.testing.expect(Connection.isPeerGone(error.SocketUnconnected));
     // Closed mid-record: a record was cut, which is worth hearing about.
     try std.testing.expect(!Connection.isPeerGone(error.TlsConnectionTruncated));
     try std.testing.expect(!Connection.isPeerGone(error.TlsBadRecordMac));

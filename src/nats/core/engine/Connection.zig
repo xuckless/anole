@@ -42,6 +42,9 @@ pub const TransportError = error{
     Canceled,
     ConnectionResetByPeer,
     BrokenPipe,
+    /// std's name for a send on a socket whose peer or sending side is
+    /// gone (EPIPE).
+    SocketUnconnected,
     Unexpected,
     /// The socket or the TLS layer failed (the log says how).
     TransportFailed,

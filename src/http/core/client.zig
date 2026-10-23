@@ -1455,7 +1455,9 @@ pub const Client = struct {
 
     fn transportVerdict(name: []const u8) resilience.Verdict {
         if (std.mem.eql(u8, name, "Canceled")) return .neutral;
-        const transient = [_][]const u8{ "Timeout", "ConnectionRefused", "ConnectionResetByPeer", "ConnectionTimedOut", "EndOfStream", "BrokenPipe", "NetworkUnreachable", "HostUnreachable", "UnknownHostName", "TemporaryNameServerFailure", "NameServerFailure" };
+        // SocketUnconnected: std's name for a send on a socket whose peer
+        // or sending side is gone (EPIPE).
+        const transient = [_][]const u8{ "Timeout", "ConnectionRefused", "ConnectionResetByPeer", "ConnectionTimedOut", "EndOfStream", "BrokenPipe", "SocketUnconnected", "NetworkUnreachable", "HostUnreachable", "UnknownHostName", "TemporaryNameServerFailure", "NameServerFailure" };
         for (transient) |t| if (std.mem.eql(u8, name, t)) return .transient;
         return .failure;
     }
