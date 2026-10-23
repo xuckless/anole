@@ -1,0 +1,3 @@
+info(anole): Graceful shutdown requested
+info(anole): signal received (term); drained and stopped
+info: server stopped cleanly

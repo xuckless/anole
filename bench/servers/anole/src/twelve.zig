@@ -4,6 +4,15 @@ const std = @import("std");
 const anole = @import("anole");
 const App = @import("main.zig").App;
 
+/// No clock leeway. 0.2.0 renamed `leeway_seconds` to `leeway` (a
+/// Duration); the bench builds against both.
+const no_leeway = blk: {
+    const Policy = @typeInfo(@TypeOf(anole.auth.verify)).@"fn".param_types[3].?;
+    var p: Policy = .{};
+    if (@hasField(Policy, "leeway")) p.leeway = .fromSeconds(0) else p.leeway_seconds = 0;
+    break :blk p;
+};
+
 const sql_health = "SELECT 1";
 const sql_feed =
     \\SELECT p.id, p.body, p.created_at, u.username,
@@ -82,7 +91,7 @@ fn auth(app: *App, req: *anole.Request, res: *anole.Response) !?Claims {
         return null;
     }
     const now = std.Io.Clock.real.now(req.io).toSeconds();
-    const v = anole.auth.verify(req.arena, header["Bearer ".len..], &app.twelve.?.keys, .{ .leeway_seconds = 0 }, now) catch {
+    const v = anole.auth.verify(req.arena, header["Bearer ".len..], &app.twelve.?.keys, no_leeway, now) catch {
         try fail(res, .unauthorized, "invalid or expired token");
         return null;
     };

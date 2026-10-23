@@ -1,0 +1,6 @@
+h1ka 1094
+h1close 182
+tlsclose 90
+h2big 1336
+h2cecho 63
+h3 53

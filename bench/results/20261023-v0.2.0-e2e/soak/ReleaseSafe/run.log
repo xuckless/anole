@@ -1,0 +1,5 @@
+23:50:27 anole-bench/soak-full:020-ReleaseSafe: probe
+23:52:27 rates at 0.5 of the probe: h1ka 4099 h1close 678 tlsclose 340 h2big 4910 h2cecho 239 h3 211 
+23:52:27 anole-bench/soak-full:020-ReleaseSafe: soak
+23:53:38 phase 1 (120m)
+01:55:46 SIGTERM

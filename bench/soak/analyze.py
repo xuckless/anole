@@ -2,7 +2,8 @@
 """Soak results (bench/soak/run.sh).
 
   analyze.py rates <probe-dir> <fraction>   # per-stream rates for the soak
-  analyze.py report <out-dir>               # Markdown summary, and summary.json
+  analyze.py report <out-dir> [settle-s]    # Markdown summary, and summary.json; the slope leaves
+                                            # out each phase's first settle-s seconds (default 60)
 """
 import csv, json, os, re, sys
 
@@ -51,7 +52,7 @@ def slope(points):
     return sum((t - mx) * (v - my) for t, v in points) / den if den else None
 
 
-def report(out):
+def report(out, settle=60):
     with open(os.path.join(out, "samples.csv")) as f:
         rows = [{k: float(v) for k, v in r.items() if v} for r in csv.DictReader(f)]
     rows = [r for r in rows if "rss_kb" in r]
@@ -73,13 +74,13 @@ def report(out):
     idle0 = window(t0, events.get("phase1-start", t0))
     if idle0:
         res["idle"].append({"when": "before", "rss_mb": mb(idle0[-1]["rss_kb"])})
-    md += ["| phase | CPU (charged) | RSS start → end (MB) | RSS max | slope, after the first minute | anon slope | requests ok | errors |",
+    md += [f"| phase | CPU (charged) | RSS start → end (MB) | RSS max | slope, after the first {settle // 60:g} min | anon slope | requests ok | errors |",
            "|---|---|---|---|---|---|---|---|"]
     p = 1
     while f"phase{p}-start" in events:
         a, b = events[f"phase{p}-start"], events[f"phase{p}-end"]
         w = window(a, b)
-        steady = [r for r in w if r["t"] >= a + 60]
+        steady = [r for r in w if r["t"] >= a + settle]
         s_rss = slope([(r["t"], r["rss_kb"]) for r in steady])
         s_anon = slope([(r["t"], r["anon"] / 1024) for r in steady])
         cpu = (w[-1]["cpu_usec"] - w[0]["cpu_usec"]) / 1e6 / (w[-1]["t"] - w[0]["t"]) if len(w) > 1 else 0
@@ -100,6 +101,17 @@ def report(out):
         p += 1
     md += ["", "Idle RSS (the last sample of each idle stretch): " +
            ", ".join(f"{i['when']} {i['rss_mb']:.1f} MB" for i in res["idle"])]
+    # RSS over time: the mean of each 10-minute stretch of each phase.
+    md += ["", "| phase | minutes | RSS mean (MB) | RSS max (MB) | anon mean (MB) |", "|---|---|---|---|---|"]
+    for ph in range(1, p):
+        a, b = events[f"phase{ph}-start"], events[f"phase{ph}-end"]
+        m = 0
+        while a + m * 60 < b - 60:
+            w = window(a + m * 60, min(b, a + (m + 10) * 60))
+            if w:
+                md.append(f"| {ph} | {m}–{min(m + 10, (b - a) / 60):.0f} | {mb(sum(r['rss_kb'] for r in w) / len(w)):.1f} | "
+                          f"{mb(max(r['rss_kb'] for r in w)):.1f} | {sum(r['anon'] for r in w) / len(w) / 2**20:.1f} |")
+            m += 10
     md += ["", "| stream | phase | ok/s | p50 ms | p99 ms | errors |", "|---|---|---|---|---|---|"]
     for ph in res["phases"]:
         for n, s in ph["streams"].items():
@@ -131,4 +143,4 @@ if __name__ == "__main__":
     if sys.argv[1] == "rates":
         rates(sys.argv[2], float(sys.argv[3]))
     else:
-        report(sys.argv[2])
+        report(sys.argv[2], float(sys.argv[3]) if len(sys.argv) > 3 else 60)

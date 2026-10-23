@@ -7,7 +7,7 @@
 # 1. Capacity probe: a fresh server, rested, every stream of load.sh flat out
 #    for PROBE. Each stream's rate for the soak is FRAC of what it reached.
 # 2. Soak: a fresh server; RSS, cgroup memory and CPU every 5 s from start to
-#    exit. REST idle, then PHASES phases of PHASE each with IDLE idle between,
+#    exit (every SAMPLE s). REST idle, then PHASES phases of PHASE each with IDLE idle between,
 #    then IDLE idle, then SIGTERM; the allocator's leak report is in server.log.
 set -u
 bench=$(cd "$(dirname "$0")/.." && pwd)
@@ -19,11 +19,13 @@ IDLE=${IDLE:-120}
 FRAC=${FRAC:-0.5}
 REST=${REST:-70}
 PROBE=${PROBE:-20s}
+SAMPLE=${SAMPLE:-5}     # seconds between memory samples
+SETTLE=${SETTLE:-60}    # seconds of each phase left out of the fitted slope
 id=${1:-$(date +%Y%m%d-%H%M)-soak}
 out=$bench/results/$id/soak/$OPT
 rm -rf "$out"
 mkdir -p "$out"
-image=anole-bench/soak-full:$OPT
+image=${IMAGE:-anole-bench/soak-full:$OPT}
 log() { echo "$(date +%H:%M:%S) $*" | tee -a "$out/run.log"; }
 event() { echo "$(date +%s.%N),$1" >>"$out/events.csv"; }
 
@@ -63,7 +65,7 @@ echo "t,rss_kb,hwm_kb,threads,mem_current,anon,cpu_usec" >"$out/samples.csv"
   while [ -d "$cg" ] && [ -r "/proc/$pid/status" ]; do
     s=$(awk '/^VmRSS/{r=$2} /^VmHWM/{h=$2} /^Threads/{t=$2} END{print r","h","t}' "/proc/$pid/status" 2>/dev/null) || break
     echo "$(date +%s.%N),$s,$(cat "$cg/memory.current"),$(awk '$1=="anon"{print $2}' "$cg/memory.stat"),$(awk '$1=="usage_usec"{print $2}' "$cg/cpu.stat")" >>"$out/samples.csv"
-    sleep 5
+    sleep "$SAMPLE"
   done 2>/dev/null
 ) &
 sampler=$!
@@ -86,4 +88,4 @@ kill "$sampler" 2>/dev/null
 docker logs soak-sut 2>&1 | grep -v '^info(access)' | tail -n 5000 >"$out/server.log"
 docker logs soak-sut 2>&1 | tail -n 200 >"$out/server-tail.log"
 docker rm -f soak-sut >/dev/null
-python3 "$bench/soak/analyze.py" report "$out" | tee "$out/report.md"
+python3 "$bench/soak/analyze.py" report "$out" "$SETTLE" | tee "$out/report.md"

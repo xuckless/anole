@@ -28,6 +28,8 @@ def parse(d):
         if m := re.search(r"time for request:\s+([\d.]+)(us|ms|s)\s+([\d.]+)(us|ms|s)\s+([\d.]+)(us|ms|s)", t):
             r["mean_ms"] = ms(m.group(5), m.group(6))
             r["max_ms"] = ms(m.group(3), m.group(4))
+        if m := re.search(r"percentiles: p50 (\d+) us p99 (\d+) us", t):
+            r["p50_ms"], r["p99_ms"] = int(m.group(1)) / 1000, int(m.group(2)) / 1000
         if m := re.search(r"requests: \d+ total, \d+ started, \d+ done, (\d+) succeeded, (\d+) failed, (\d+) errored, (\d+) timeout", t):
             r["failed"], r["timeouts"] = int(m.group(2)) + int(m.group(3)), int(m.group(4))
     try:
@@ -56,7 +58,7 @@ def one(d):
     s = f"{r.get('rps', 0):,.0f} req/s"
     if "p50_ms" in r:
         s += f", p50 {r['p50_ms']:.2f} ms, p99 {r.get('p99_ms', 0):.2f} ms"
-    if "mean_ms" in r:
+    if "mean_ms" in r and "p50_ms" not in r:
         s += f", mean {r['mean_ms']:.2f} ms, max {r.get('max_ms', 0):.1f} ms"
     s += f", timeouts {r.get('timeouts', 0)}, Recv-Q peak {r.get('recvq_peak', '?')}, mem {r.get('mem_peak_mb', 0):.0f} MB"
     if w := r.get("wake"):
@@ -76,7 +78,7 @@ def table(out):
             "|---|---|---|---|---|---|---|---|---|---|"]
     f = lambda v, p=0: "–" if v is None else f"{v:,.{p}f}"
     for be in ("epoll", "uring"):
-        for case in ("c4096", "c10000", "c25000", "park", "c256", "h2c"):
+        for case in ("c4096", "c10000", "c25000", "park", "c256", "h2c", "h3"):
             for side in ("a", "b"):
                 runs = [parse(d) for d in sorted(glob.glob(os.path.join(out, be, case, f"{side}-r*")))]
                 if not runs:
@@ -90,7 +92,7 @@ def table(out):
                 rows.append(f"| {be} | {case} | {side.upper()} | {f(g('rps'))} | {f(p50, 2)} | {f(g('p99_ms'), 2)} | {f(g('timeouts'))} | "
                             f"{f(g('recvq_peak'))} | {f(g('mem_peak_mb'))} | {wake} |")
     n = max((len(glob.glob(os.path.join(d, "a-r*"))) for d in glob.glob(os.path.join(out, "*", "*"))), default=0)
-    print(f"Medians of {n} runs per side. h2c: mean latency in the p50 column.\n")
+    print(f"Medians of {n} runs per side. h2c and h3 (h2load): percentiles from h2load's per-request log.\n")
     print("\n".join(rows))
 
 

@@ -218,11 +218,14 @@ pub fn main(init: std.process.Init) !void {
     const https_port = envInt(u16, "HTTPS_PORT", 8443);
     const cert: anole.Cert = .fromFiles(env("CERT_FILE", "/certs/cert.pem"), env("KEY_FILE", "/certs/key.pem"));
 
-    var state: App = .{ .gpa = init.gpa, .feed = .init(init.gpa) };
+    const ServerOptions = @typeInfo(@TypeOf(anole.Server(App).init)).@"fn".param_types[1].?;
+    // Rooms.init takes options from 0.2.0 on; the bench builds against both.
+    const rooms_args = @typeInfo(@TypeOf(websocket.Rooms.init)).@"fn".param_types.len;
+    var state: App = .{ .gpa = init.gpa, .feed = if (rooms_args == 2) .init(init.gpa, .{}) else .init(init.gpa) };
     defer state.feed.deinit();
     state.retained = try buildRetained(init.gpa, envInt(u32, "RETAIN", 0));
 
-    var app = try anole.Server(App).init(init.gpa, .{
+    var opts: ServerOptions = .{
         .executors = .exact(@intCast(workers)),
         .http = switch (mode) {
             .h1, .h2c => .{ .address = "0.0.0.0", .port = http_port },
@@ -234,15 +237,25 @@ pub fn main(init: std.process.Init) !void {
         },
         // QUIC's idle timeout to the benchmark's 75 s keep-alive floor.
         .http3 = if (mode == .h3) http3Options() else null,
-        .server = .{
-            // Video streams and sockets outlive the 30 s default; the
-            // challenge wants idle keep-alive kept 65 s or more; the
-            // connection tests go past the 10 000 default cap.
+    };
+    // Video streams and sockets outlive the 30 s default; the challenge
+    // wants idle keep-alive kept 65 s or more; the connection tests go past
+    // the 10 000 default cap. 0.2.0 split `server` into `timeouts` and
+    // `limits` (max_connections 0 follows the open-file limit); the bench
+    // builds against both.
+    if (comptime @hasField(ServerOptions, "timeouts")) {
+        opts.timeouts.request = null;
+        opts.timeouts.keepalive = .fromSeconds(75);
+        opts.limits.body_max = 8 << 20;
+        opts.limits.max_connections = 0;
+    } else {
+        opts.server = .{
             .timeout = .{ .request = null, .keepalive = .fromSeconds(75) },
             .request = .{ .max_body_size = 8 << 20 },
             .max_connections = null,
-        },
-    }, &state);
+        };
+    }
+    var app = try anole.Server(App).init(init.gpa, opts, &state);
     defer app.deinit();
 
     // Handlers that never wait (docs/routing.md): on HTTP/2 a request that

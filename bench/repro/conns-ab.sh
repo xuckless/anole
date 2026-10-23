@@ -9,6 +9,7 @@
 #                        behind wrk c=20000 (bench/tools/cmd/parkwake)
 #   c256                 wrk h1 /json (regression)
 #   h2c                  h2load c=256 m=10 /json (regression)
+#   h3                   h2load --alpn-list=h3 c=64 m=10 /json on :8443 (the suite's h3 load)
 # The listener's Recv-Q (accept backlog) is sampled every 0.2 s; its peak is kept.
 set -u
 bench=$(cd "$(dirname "$0")/.." && pwd)
@@ -25,10 +26,13 @@ log() { echo "$(date +%H:%M:%S) $*" | tee -a "$out/run.log"; }
 
 load_cmd() {
   local u=http://127.0.0.1:8080/json
+  # h2load prints no percentiles: take them from its per-request log (µs).
+  local pct="cut -f3 /tmp/req.log | sort -n | awk '{a[NR]=\$1} END {printf \"percentiles: p50 %d us p99 %d us n %d\\n\", a[int(NR*0.5)], a[int(NR*0.99)], NR}'"
   case $1 in
     c256) echo "wrk -t8 -c256 -d${DUR:-30}s --timeout 10s --latency $u" ;;
     c*) echo "wrk -t16 -c${1#c} -d${DUR:-30}s --timeout 10s --latency $u" ;;
-    h2c) echo "h2load -t8 -c256 -m10 -D${DUR:-30} --warm-up-time=5 $u" ;;
+    h2c) echo "h2load -t8 -c256 -m10 -D${DUR:-30} --warm-up-time=5 --log-file=/tmp/req.log $u; $pct" ;;
+    h3) echo "h2load -t8 -c64 -m10 -D${DUR:-30} --warm-up-time=5 --alpn-list=h3 --log-file=/tmp/req.log https://127.0.0.1:8443/json; $pct" ;;
     park) echo "/pw/parkwake -idle 2000 -hold ${HOLD:-15}s >/out/park.json 2>/out/park.err & \
 until grep -q parked /out/park.err 2>/dev/null; do sleep 0.1; done; \
 wrk -t16 -c20000 -d${DUR:-30}s --timeout 10s --latency $u; wait" ;;
@@ -38,20 +42,25 @@ wrk -t16 -c20000 -d${DUR:-30}s --timeout 10s --latency $u; wait" ;;
 one() { # one <backend> <side> <image> <case> <run>
   local dir=$out/$1/$4/$2-r$5
   mkdir -p "$dir"
-  local extra=()
+  local extra=() mode=h1
+  [ "$4" = h3 ] && mode=h3
   [ "$1" = uring ] && extra=(--security-opt seccomp=unconfined --ulimit memlock=-1:-1)
   docker rm -f repro-sut >/dev/null 2>&1
   local cid
   cid=$(docker run -d --name repro-sut --network host --cpuset-cpus "$SUT_CPUS_1" --cpus 1 \
     --memory 2g --memory-swap 2g --ulimit nofile=1048576:1048576 "${extra[@]}" \
-    -e MODE=h1 -e WORKERS=1 "$3")
-  for _ in $(seq 60); do curl -s -o /dev/null http://127.0.0.1:8080/json && break; sleep 0.5; done
+    -v "$bench/.data/certs:/certs:ro,z" -e MODE=$mode -e WORKERS=1 "$3")
+  for _ in $(seq 60); do
+    if [ $mode = h3 ]; then curl -sk -o /dev/null https://127.0.0.1:8443/json && break
+    else curl -s -o /dev/null http://127.0.0.1:8080/json && break; fi
+    sleep 0.5
+  done
   sleep "$REST"
   (peak=0; while :; do q=$(ss -Hltn 'sport = :8080' | awk '{print $2; exit}'); [ "${q:-0}" -gt "$peak" ] && { peak=$q; echo "$peak" >"$dir/recvq-peak"; }; sleep 0.2; done) &
   local sampler=$!
   echo 0 >"$dir/recvq-peak"
   docker run --rm --name repro-load --network host --cpuset-cpus "$LOAD_CPUS" \
-    --ulimit nofile=1048576:1048576 -v "$dir:/out" -v "$(dirname "$PARKWAKE"):/pw:ro" \
+    --ulimit nofile=1048576:1048576 --tmpfs /tmp:size=4g -v "$dir:/out" -v "$(dirname "$PARKWAKE"):/pw:ro" \
     --entrypoint sh anole-bench/loadgen -c "$(load_cmd "$4")" >"$dir/load.txt" 2>&1
   kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null
   local cg=/sys/fs/cgroup/system.slice/docker-$cid.scope

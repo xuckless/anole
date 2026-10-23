@@ -1,0 +1,5 @@
+01:55:48 anole-bench/soak-full:020-Debug: probe
+01:57:49 rates at 0.5 of the probe: h1ka 1094 h1close 182 tlsclose 90 h2big 1336 h2cecho 63 h3 53 
+01:57:49 anole-bench/soak-full:020-Debug: soak
+01:58:59 phase 1 (10m)
+02:11:00 SIGTERM
