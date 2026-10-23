@@ -303,6 +303,10 @@ pub const Upload = struct {
         self.unlock();
         if (!finished) self.abort() else {
             self.group.cancel(self.io);
+            // A part task can still be in its tail (freeing its buffer,
+            // ringing the bells) after the driver saw `inflight == 0` and
+            // finished: wait for it before the Upload goes away.
+            self.parts.cancel(self.io);
         }
         self.freeBuffers();
         const gpa = self.gpa;
