@@ -39,6 +39,9 @@ pub const Header = struct { name: []const u8, value: []const u8 };
 /// `anole.h3.ConnectOptions`, except where a field says it is HTTP/2's own.
 pub const ConnectOptions = struct {
     /// The server's name (for TLS: SNI and certificate checks) or address.
+    /// Or a Unix domain socket, named as gRPC names targets: "unix:/path"
+    /// or "unix:///path"; on Linux also "unix-abstract:name". Calls then
+    /// run cleartext (prior knowledge) with no TLS, and `port` is ignored.
     host: []const u8,
     port: u16,
     /// Connect here instead of resolving `host`.
@@ -113,6 +116,33 @@ pub const StreamError = error{
     TooManyInterimResponses,
 };
 
+/// A Unix socket named as gRPC names targets.
+pub const UnixTarget = struct {
+    path: []const u8,
+    /// Linux's abstract namespace ("unix-abstract:name").
+    abstract: bool,
+};
+
+/// The socket a `ConnectOptions.host` of the form "unix:/path",
+/// "unix:///path" or "unix-abstract:name" names; null for a host name.
+pub fn unixTarget(host: []const u8) ?UnixTarget {
+    if (std.mem.startsWith(u8, host, "unix-abstract:")) return .{ .path = host["unix-abstract:".len..], .abstract = true };
+    if (!std.mem.startsWith(u8, host, "unix:")) return null;
+    var rest = host["unix:".len..];
+    if (std.mem.startsWith(u8, rest, "//")) rest = rest[2..];
+    return .{ .path = rest, .abstract = false };
+}
+
+test "unixTarget parses gRPC's unix targets" {
+    try std.testing.expectEqualStrings("/run/a.sock", unixTarget("unix:/run/a.sock").?.path);
+    try std.testing.expectEqualStrings("/run/a.sock", unixTarget("unix:///run/a.sock").?.path);
+    try std.testing.expectEqualStrings("rel.sock", unixTarget("unix:rel.sock").?.path);
+    const a = unixTarget("unix-abstract:name").?;
+    try std.testing.expect(a.abstract and std.mem.eql(u8, a.path, "name"));
+    try std.testing.expect(unixTarget("localhost") == null);
+    try std.testing.expect(unixTarget("unixhost") == null);
+}
+
 fn timeoutFrom(duration: ?std.Io.Duration) std.Io.Timeout {
     const d = duration orelse return .none;
     return .{ .duration = .{ .raw = d, .clock = .awake } };
@@ -178,6 +208,7 @@ pub const ClientConnection = struct {
         const owned = try gpa.create(Owned);
         errdefer gpa.destroy(owned);
         owned.* = .{};
+        if (opts.tls != null and unixTarget(opts.host) != null) return error.TlsOnUnixSocket;
         const deadline: Deadline = .init(io, timeoutFrom(opts.connect_timeout));
         const socket = try deadline.run(dial, .{ io, opts });
         errdefer socket.close(io);
@@ -210,6 +241,19 @@ pub const ClientConnection = struct {
     }
 
     fn dial(io: std.Io, opts: ConnectOptions) !std.Io.net.Stream {
+        if (unixTarget(opts.host)) |t| {
+            var buf: [std.Io.net.UnixAddress.max_len]u8 = undefined;
+            var path = t.path;
+            if (t.abstract) {
+                if (comptime @import("builtin").os.tag != .linux) return error.UnixAbstractUnsupported;
+                if (t.path.len + 1 > buf.len) return error.NameTooLong;
+                buf[0] = 0;
+                @memcpy(buf[1..][0..t.path.len], t.path);
+                path = buf[0 .. t.path.len + 1];
+            }
+            const ua = try std.Io.net.UnixAddress.init(path);
+            return ua.connect(io);
+        }
         if (opts.address) |a| return a.connect(io, .{ .mode = .stream });
         if (std.Io.net.IpAddress.parse(opts.host, opts.port)) |a| return a.connect(io, .{ .mode = .stream }) else |_| {}
         return (try std.Io.net.HostName.init(opts.host)).connect(io, opts.port, .{ .mode = .stream });

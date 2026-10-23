@@ -183,6 +183,15 @@ fn warnUntrustedPeerProxy(peer: std.Io.net.IpAddress) bool {
     return true;
 }
 
+/// Sets the permission bits of a unix socket's file. A failure is
+/// logged, not fatal: the socket still works for its owner.
+pub fn setUnixMode(io: std.Io, address: std.Io.net.UnixAddress, mode: u16) void {
+    if (comptime builtin.os.tag == .windows or std.posix.mode_t == u0) return;
+    if (address.isAbstract()) return;
+    std.Io.Dir.cwd().setFilePermissions(io, address.path, .fromMode(mode), .{}) catch |err|
+        log.warn("could not set mode {o} on {s}: {t}", .{ mode, address.path, err });
+}
+
 pub fn resetUntrustedWarningForTest() void {
     warned_untrusted.store(false, .monotonic);
 }
@@ -1704,6 +1713,7 @@ pub fn Server(comptime Ctx: type) type {
             };
             errdefer l.server.deinit(self.io);
             if (cfg.address == .ip) l.address = .{ .ip = l.server.socket.address };
+            if (cfg.address == .unix) if (cfg.unix_mode) |mode| setUnixMode(self.io, cfg.address.unix, mode);
 
             if (cfg.socket_per_acceptor and acceptor_count > 1) {
                 const extra = try self.allocator.alloc(std.Io.net.Server, acceptor_count - 1);

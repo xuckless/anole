@@ -668,6 +668,14 @@ pub const ClientConnection = struct {
         self.mutex.unlock(self.io);
     }
 
+    /// Whether new requests may still go out: the handshake has not
+    /// failed, no GOAWAY, no `close`.
+    pub fn isOpen(self: *ClientConnection) bool {
+        self.lock();
+        defer self.unlock();
+        return !self.closing and self.state != .closed;
+    }
+
     fn kick(self: *ClientConnection) void {
         self.gen.notify(self.io);
     }
