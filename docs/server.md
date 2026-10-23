@@ -315,6 +315,7 @@ or instead of those two. Each has:
 | `http3` | false | HTTP/3 on the same port number over UDP, with `Options.http3`'s settings. TLS only, one listener per server. |
 | `proxy_protocol` | null | Every connection starts with a PROXY protocol header. Null: on under `anole_lb`, else off. |
 | `proxy_protocol_from` | `&.{}` | With `proxy_protocol`: the peers allowed to send it, in CIDR notation; others are closed unread. Empty: `proxy.trusted` when set, else any peer. |
+| `tcp`, `udp` | null | Raw TCP or UDP instead of HTTP: `anole.net.tcp(...)` / `anole.net.udp(...)` (or `app.tcp`, `app.udp`; see [net.md](net.md)). A raw listener needs a `port` (0 for a free one) or `unix`, never takes `$PORT` or 8080, and ignores `http1`/`http2`; `http3` is refused. UDP takes no `tls`, `unix` or `proxy_protocol`. Without a `tcp`/`udp` it is named `tcp-<port>` or `udp-<port>`. |
 
 A TLS listener offers by ALPN the protocols it speaks: `h2` and `http/1.1`,
 or one of them. One with `http2 = false` gives a client that offers `h2`
@@ -362,6 +363,10 @@ A unix socket file that a stopped server left behind is replaced when
 nothing listens on it; one that something answers on is `AddressInUse`.
 Anole never removes the file itself, since a restarted server may still be
 serving it.
+
+A server that names listeners of any kind opens no others: the implicit
+127.0.0.1:8080 appears only when nothing at all is named, so `app.tcp(...)`
+and `app.run()` serve the raw listener alone.
 
 `listeners` alone, without `http` or `https`, is set up by `run` (or by
 `listen` and `listenTls`, which add theirs in front), not by `init`; with
@@ -559,7 +564,10 @@ listener whose port could not be bound. The C ABI reports the same names
 | `DeploymentUnavailable` | `deployment = .lambda` before Anole 0.4. | Use `platform` or wait for the Lambda adapter. |
 | `ProxyProtocolNoPeers` | `proxy_protocol` on with `proxy.trusted` empty and no `proxy_protocol_from`. | Name the load balancers. |
 | `NoProtocols`, `SeveralHttp3Listeners`, `Http3NeedsTls`, `Http3NeedsHttps` | A listener that speaks nothing; HTTP/3 on several listeners, or on one without TLS. | One TLS listener serves HTTP/3. |
-| `TooManyListeners` | More listeners than a restart can hand over. | Fewer listeners, or no `process`. |
+| `TooManyListeners` | More listeners than a restart can hand over (64 TCP ones, raw TCP included, and 1024 UDP sockets). | Fewer listeners, or no `process`. |
+| `NetNotBuilt`, `NetListenerNeedsPort`, `NetListenerHttp3`, `TcpAndUdp` | A raw listener on a build without `-Dnet`; a raw listener with no port or `unix`; HTTP/3 asked of one; or `tcp` and `udp` on one listener. | Build with `-Dnet`; give it a port; use two listeners. |
+| `UdpWithTls`, `UdpOnUnixSocket`, `UdpWithProxyProtocol` | A UDP listener with TLS (DTLS is not supported), a unix socket or a PROXY header. | Leave them off the UDP listener. |
+| `InvalidFraming`, `NetHandlerContext` | A raw listener's option out of range (a length prefix of 1, 2 or 4 bytes, a `max` of 1 byte to 1 GiB, `read_window` 4 to 64 KiB, `batch` 1 to 64, `max_datagram` up to 65507); or a service built for another state type. | The error's text names the listener and the limit. |
 | `RouteConflict` | Two routes (or a helper route) on one path. | Rename one of them. |
 | `HqInteropNotAllowed` | The QUIC interop runner's mode, off in programs that did not ask for it. | Leave `http3.hq_interop_root` out. |
 | `TlsNotBuilt`, `Http2NotBuilt`, `Http3NotBuilt` | A listener asks for what this build left out. | Build with `-Dtls`, `-Dhttp2` or `-Dhttp3`. |
