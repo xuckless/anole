@@ -285,6 +285,7 @@ pub const server_options = [_]Entry{
     .{ .zig = "listeners[].address", .json = "listeners[].address" },
     .{ .zig = "listeners[].port", .json = "listeners[].port" },
     .{ .zig = "listeners[].unix", .json = "listeners[].unix" },
+    .{ .zig = "listeners[].unix_mode", .omitted = "the socket file mode (0o660 default) is not in the ABI config yet; a later key can add it" },
     .{ .zig = "listeners[].http1", .json = "listeners[].http1" },
     .{ .zig = "listeners[].http2", .json = "listeners[].http2", .kind = .custom, .note = "Zig defaults to whether -Dhttp2 is built in; the schema and Config say true" },
     .{ .zig = "listeners[].http3", .json = "listeners[].http3" },
