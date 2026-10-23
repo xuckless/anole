@@ -66,6 +66,14 @@ pub const Headers = @import("http.zig").Headers;
 pub const Params = @import("http.zig").Params;
 pub const ContentType = @import("http.zig").ContentType;
 pub const MisuseError = @import("http.zig").MisuseError;
+pub const Violation = @import("http.zig").Violation;
+pub const Violations = @import("http.zig").Violations;
+pub const Problem = @import("http.zig").Problem;
+pub const bindJson = @import("bind.zig").bindJson;
+pub const BindOptions = @import("bind.zig").BindOptions;
+pub const BindResult = @import("bind.zig").BindResult;
+pub const UnknownFields = @import("bind.zig").UnknownFields;
+pub const route_pattern = @import("route_pattern.zig");
 pub const ContentEncoding = @import("http.zig").ContentEncoding;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
@@ -163,4 +171,9 @@ comptime {
     if (@import("build_options").use_http2) _ = @import("server/h2_test.zig");
     if (@import("build_options").use_brotli) _ = @import("brotli_io.zig");
     _ = @import("block_cache.zig");
+    _ = @import("bind.zig");
+    _ = @import("bind_strings.zig");
+    _ = @import("bind_violations.zig");
+    _ = @import("json_out.zig");
+    _ = @import("route_pattern.zig");
 }

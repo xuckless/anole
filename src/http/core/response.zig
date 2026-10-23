@@ -21,6 +21,7 @@ const statusBody = @import("middleware.zig").statusBody;
 const zstd_io = if (build_options.use_zstd) @import("zstd_io.zig") else struct {};
 const brotli_io = if (build_options.use_brotli) @import("brotli_io.zig") else struct {};
 const block_cache = @import("block_cache.zig");
+const json_out = @import("json_out.zig");
 
 var no_buf: [0]u8 = .{};
 
@@ -1207,11 +1208,40 @@ pub const Response = struct {
         // The open writer owns the segment being filled, and would write
         // over this, or publish a length past the end of it.
         if (self._body_writer_buffering) return error.BodyWriterOpen;
-        const json_formatter = std.json.fmt(value, options);
         var w: BodyWriter = .init(self);
         defer w.interface.flush() catch unreachable;
-        try json_formatter.format(&w.interface);
+        // A type that renames a field (`v.rename`) is written by outside
+        // names; every other type keeps the std.json path byte for byte.
+        if (comptime json_out.hasOutsideNames(@TypeOf(value))) {
+            try json_out.write(&w.interface, value, .{ .omit_null_fields = !options.emit_null_optional_fields });
+        } else {
+            const json_formatter = std.json.fmt(value, options);
+            try json_formatter.format(&w.interface);
+        }
         try self.header("Content-Type", "application/json; charset=UTF-8");
+    }
+
+    /// Answers with an RFC 9457 problem document (`application/problem+json`),
+    /// in place of anything written so far; does nothing once the headers
+    /// are out. Strings must outlive the response (literals, or the
+    /// request's arena). Members in order: `type`, `title`, `status`,
+    /// `detail`, `instance` (when set), `errors`:
+    ///
+    ///     res.problem(.{ .status = .conflict, .detail = "already exists" });
+    ///
+    /// The default `detail` of a problem with `errors` counts them.
+    pub fn problem(self: *Response, p: http.Problem) void {
+        if (self._headers_written) return;
+        self.resetBody() catch return;
+        self.status = p.status;
+        self.content_type = .problem_json;
+        var out: std.Io.Writer.Allocating = .init(self.arena);
+        writeProblem(&out.writer, p) catch {
+            self.body = "{\"type\":\"about:blank\",\"title\":\"Internal Server Error\",\"status\":500}";
+            self.status = .internal_server_error;
+            return;
+        };
+        self.body = out.written();
     }
 
     /// Answers with `status` and `message`, in place of anything written
@@ -2120,6 +2150,59 @@ fn writeDecimal(w: *std.Io.Writer, n: usize) std.Io.Writer.Error!void {
         if (v == 0) break;
     }
     return w.writeAll(buf[i..]);
+}
+
+fn writeJsonString(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
+    try std.json.Stringify.encodeJsonString(text, .{}, w);
+}
+
+/// The detail of a problem that has errors and no detail of its own.
+fn problemDetail(w: *std.Io.Writer, p: http.Problem) std.Io.Writer.Error!void {
+    if (p.truncated) return w.print("More than {d} fields are invalid; the first {d} are listed.", .{ p.errors.len, p.errors.len });
+    if (p.errors.len == 1) return w.writeAll("1 field is invalid.");
+    return w.print("{d} fields are invalid.", .{p.errors.len});
+}
+
+fn writeProblem(w: *std.Io.Writer, p: http.Problem) std.Io.Writer.Error!void {
+    try w.writeAll("{\"type\":");
+    try writeJsonString(w, p.type);
+    try w.writeAll(",\"title\":");
+    try writeJsonString(w, p.title orelse p.status.phrase());
+    try w.print(",\"status\":{d}", .{@backingInt(p.status)});
+    if (p.detail) |d| {
+        try w.writeAll(",\"detail\":");
+        try writeJsonString(w, d);
+    } else if (p.errors.len > 0) {
+        var buf: [96]u8 = undefined;
+        var dw: std.Io.Writer = .fixed(&buf);
+        try problemDetail(&dw, p);
+        try w.writeAll(",\"detail\":");
+        try writeJsonString(w, dw.buffered());
+    }
+    if (p.instance) |i| {
+        try w.writeAll(",\"instance\":");
+        try writeJsonString(w, i);
+    }
+    if (p.errors.len > 0) {
+        try w.writeAll(",\"errors\":[");
+        for (p.errors, 0..) |e, i| {
+            if (i > 0) try w.writeByte(',');
+            try w.writeAll("{\"in\":\"");
+            try w.writeAll(@tagName(e.in));
+            try w.writeByte('"');
+            if (e.field) |f| {
+                try w.writeAll(",\"field\":");
+                try writeJsonString(w, f);
+            }
+            try w.writeAll(",\"code\":");
+            try writeJsonString(w, e.code);
+            try w.writeAll(",\"message\":");
+            try writeJsonString(w, e.message);
+            try w.writeByte('}');
+        }
+        try w.writeByte(']');
+    }
+    try w.writeByte('}');
 }
 
 test writeDecimal {
@@ -4782,4 +4865,88 @@ test "misuse: writer after the head is HeadersAlreadySent, resetBody too" {
     try body.end();
     try std.testing.expectError(error.HeadersAlreadySent, response.writer());
     try std.testing.expectError(error.HeadersAlreadySent, response.resetBody());
+}
+
+fn expectProblemBody(p: http.Problem, expected: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    response.body = "stale";
+    response.problem(p);
+    try std.testing.expectEqual(http.ContentType.problem_json, response.content_type.?);
+    try std.testing.expectEqualStrings(expected, response.body);
+}
+
+test "problem: member order, content type, field left out for the root, detail for 1 / N / truncated" {
+    try expectProblemBody(.{ .errors = &.{.{ .in = .body, .code = "validation.not_blank", .message = "must not be blank" }} },
+        \{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"1 field is invalid.","errors":[{"in":"body","code":"validation.not_blank","message":"must not be blank"}]}
+    );
+    try expectProblemBody(.{ .errors = &.{
+        .{ .in = .query, .field = "page", .code = "http.invalid_type", .message = "must be an integer" },
+        .{ .in = .header, .field = "X-Id", .code = "http.missing_field", .message = "is required" },
+    } },
+        \{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"2 fields are invalid.","errors":[{"in":"query","field":"page","code":"http.invalid_type","message":"must be an integer"},{"in":"header","field":"X-Id","code":"http.missing_field","message":"is required"}]}
+    );
+    try expectProblemBody(.{ .status = .conflict, .detail = "exists", .instance = "/todos/1" },
+        \{"type":"about:blank","title":"Conflict","status":409,"detail":"exists","instance":"/todos/1"}
+    );
+    try expectProblemBody(.{ .truncated = true, .errors = &.{.{ .code = "a.b", .message = "m" }} },
+        \{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"More than 1 fields are invalid; the first 1 are listed.","errors":[{"in":"body","code":"a.b","message":"m"}]}
+    );
+}
+
+test "problem: does nothing once headers are out" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    response.body = "kept";
+    response._headers_written = true;
+    response.problem(.{});
+    try std.testing.expectEqualStrings("kept", response.body);
+}
+
+test "json: renamed fields by outside names, nested and in slices" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    const validate = @import("validate");
+    const Line = struct {
+        display_name: []const u8,
+        pub const field_rules = .{ .display_name = validate.rename("displayName") };
+    };
+    try response.json(.{ .lines = [_]Line{.{ .display_name = "a" }}, .n = 1 });
+    var all: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer all.deinit();
+    try response.write();
+    try std.testing.expect(std.mem.indexOf(u8, conn_writer.buffered(), "{\"lines\":[{\"displayName\":\"a\"}],\"n\":1}") != null);
+}
+
+test "json: a type without renames writes exactly what std.json writes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    const Plain = struct { id: u32, name: []const u8, opt: ?u8 = null };
+    const value: Plain = .{ .id = 1, .name = "x" };
+    try response.json(value);
+    try response.write();
+    var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer expected.deinit();
+    try expected.writer.print("{f}", .{std.json.fmt(value, .{})});
+    try std.testing.expect(std.mem.indexOf(u8, conn_writer.buffered(), expected.written()) != null);
 }

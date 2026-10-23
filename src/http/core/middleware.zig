@@ -8,6 +8,7 @@ const Response = @import("response.zig").Response;
 const http = @import("http.zig");
 const Action = @import("router.zig").Action;
 const Connection = @import("server.zig").Connection;
+const expect_log = @import("expect_log.zig");
 
 const log = std.log.scoped(.anole);
 const ErrorHandler = @import("config.zig").ErrorHandler;
@@ -147,7 +148,14 @@ pub fn Chain(comptime Ctx: type) type {
                     if (@backingInt(self.res.status) < 500) {
                         log.debug("request rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     } else {
-                        log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                        if (!expect_log.swallow()) {
+                            const url = self.req.url;
+                            self.req.log().scoped(.anole).err("unhandled error in request handler", .{
+                                .@"error" = @errorName(err),
+                                .method = self.req.method.name(),
+                                .path = if (std.mem.indexOfScalar(u8, url, '?')) |q| url[0..q] else url,
+                            });
+                        }
                     }
                 },
             };
@@ -251,6 +259,8 @@ pub fn errorStatus(err: anyerror) ?http.Status {
         error.CircuitOpen => .service_unavailable,
         error.UnsupportedContentEncoding => .unsupported_media_type,
         error.InvalidZstd, error.IncompleteBody, error.MalformedBody, error.InvalidJsonBody, error.MissingBody => .bad_request,
+        // `req.bind` and friends found problems in the input (`req.violations()`).
+        error.ValidationFailed => .unprocessable_entity,
         error.BadPathName => .not_found,
         else => status_errors.get(@errorName(err)),
     };
@@ -268,7 +278,13 @@ pub fn clientError(err: anyerror) ?ErrorAnswer {
 /// body, or `{"error":"..."}` (see `ServerConfig.errors`). For an
 /// `uncaughtError` or `error_handler` that handles some errors itself and
 /// leaves the rest to this.
-pub fn defaultError(_: *Request, res: *Response, err: anyerror) void {
+pub fn defaultError(req: *Request, res: *Response, err: anyerror) void {
+    // The body was JSON and the answer says which fields are wrong, whatever
+    // `ServerConfig.errors` says.
+    if (err == error.ValidationFailed) {
+        const found = req.violations();
+        return res.problem(.{ .errors = found.items, .truncated = found.truncated });
+    }
     const status = errorStatus(err);
     if (status == null and res._error_detail) {
         const text = std.fmt.allocPrint(res.arena, "Internal Server Error: {t}", .{err}) catch "";
@@ -924,4 +940,8 @@ test "Executor: a middleware that wrote a body does not supply the 404" {
     try std.testing.expect(std.mem.indexOf(u8, written, "half") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "application/json") == null);
     try std.testing.expect(std.mem.endsWith(u8, written, "404 Not Found\n"));
+}
+
+test "errorStatus: ValidationFailed is 422" {
+    try std.testing.expectEqual(http.Status.unprocessable_entity, errorStatus(error.ValidationFailed).?);
 }
