@@ -87,7 +87,7 @@ pub fn execNow(p: *const Plan) error{ExecFailed} {
     // socket-activated process keeps.
     var closed = false;
     if (comptime builtin.os.tag == .linux) {
-        const rc = std.os.linux.close_range(3, std.math.maxInt(i32), .{ .CLOEXEC = true });
+        const rc = std.os.linux.close_range(3, std.math.maxInt(i32), .{ .UNSHARE = false, .CLOEXEC = true });
         closed = std.os.linux.errno(rc) == .SUCCESS;
     }
     if (!closed) {

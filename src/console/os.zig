@@ -176,15 +176,30 @@ pub fn lstat(path: []const u8) ?FileInfo {
     if (comptime !supported) return null;
     var pb: [std.fs.max_path_bytes:0]u8 = undefined;
     const p = cpathBig(&pb, path) catch return null;
-    var st: std.c.Stat = undefined;
-    if (std.c.fstatat(std.c.AT.FDCWD, p, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) return null;
-    const fmt: u32 = @as(u32, @intCast(st.mode)) & 0o170000;
+    var mode: u32 = undefined;
+    var uid: u32 = undefined;
+    if (comptime builtin.os.tag == .linux) {
+        // std.c.fstatat is void on Linux in Zig 0.17: statx, straight to
+        // the kernel (no libc version needed). 0x100 = AT_SYMLINK_NOFOLLOW.
+        const linux = std.os.linux;
+        var sx: linux.Statx = undefined;
+        const rc = linux.statx(linux.AT.FDCWD, p, 0x100, .{ .TYPE = true, .MODE = true, .UID = true }, &sx);
+        if (linux.errno(rc) != .SUCCESS) return null;
+        mode = sx.mode;
+        uid = sx.uid;
+    } else {
+        var st: std.c.Stat = undefined;
+        if (std.c.fstatat(std.c.AT.FDCWD, p, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) return null;
+        mode = @intCast(st.mode);
+        uid = @intCast(st.uid);
+    }
+    const fmt: u32 = mode & 0o170000;
     return .{
         .is_dir = fmt == 0o040000,
         .is_socket = fmt == 0o140000,
         .is_symlink = fmt == 0o120000,
-        .uid = @intCast(st.uid),
-        .mode = @as(u32, @intCast(st.mode)) & 0o7777,
+        .uid = uid,
+        .mode = mode & 0o7777,
     };
 }
 
