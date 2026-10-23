@@ -41,13 +41,15 @@ pub fn init(cs: *ClientStream, buffer: []u8, limits: Parser.Limits) Connection {
 pub const TransportError = error{
     Canceled,
     ConnectionResetByPeer,
-    BrokenPipe,
     Unexpected,
     /// The socket or the TLS layer failed (the log says how).
     TransportFailed,
 };
 
 fn transportError(err: anyerror) TransportError {
+    // A write after the peer closed: the same as a reset, and the name
+    // std.Io's net errors use.
+    if (err == error.BrokenPipe) return error.ConnectionResetByPeer;
     inline for (@typeInfo(TransportError).error_set.error_names.?) |name| {
         if (err == @field(TransportError, name)) return @field(TransportError, name);
     }

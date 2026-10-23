@@ -343,7 +343,7 @@ test "the pool holds 64 servers at most; addresses that do not parse are skipped
     var texts: [Options.max_servers + 10][8]u8 = undefined;
     var urls: [Options.max_servers + 10][]const u8 = undefined;
     for (&urls, &texts, 0..) |*u, *t, i| u.* = try std.fmt.bufPrint(t, "h{d}", .{i});
-    urls[3] = "tls://h3";
+    urls[3] = "ws://h3";
     pool.update(io, &urls, &ignore_changes);
     try testing.expectEqual(Options.max_servers, pool.count(io));
     try testing.expect(pool.find(&parsed("h3")) == null);

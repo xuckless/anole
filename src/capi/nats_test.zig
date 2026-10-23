@@ -88,7 +88,7 @@ const Fake = struct {
 /// The consumer's records, kept as they are polled.
 const Events = struct {
     c: *engine.Consumer,
-    list: std.ArrayList(struct { typ: u32, handle: u64, bytes: []u8 }) = .empty,
+    list: std.ArrayList(struct { typ: u32, handle: u64, bytes: []align(8) u8 }) = .empty,
 
     fn pump(ev: *Events, ms: i32) !void {
         var buf: [64 * 1024]u8 align(8) = undefined;
@@ -155,16 +155,19 @@ const Rig = struct {
     }
 
     fn startWith(r: *Rig, extra_nats: []const u8, with_route: bool, fake: Fake) !void {
-        const tio = engine.threadedIo();
+        // The fake server runs as its own task: on std.testing.io, which
+        // runs tasks concurrently (threadedIo's single-threaded instance
+        // does not).
+        const fio = std.testing.io;
         r.fake = fake;
-        try r.fake.start(tio);
-        errdefer r.fake.stop(tio);
+        try r.fake.start(fio);
+        errdefer r.fake.stop(fio);
         r.json = try std.fmt.allocPrint(alloc,
             \\{{"executors": 1, "timeouts": {{"shutdown_ms": 200}},
             \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
             \\ "routes": [{s}],
             \\ "brokers": [{{"name": "events", "nats": {{"url": "{s}", "connect_at_start": true{s}}}}}]}}
-        , .{ if (with_route) "{\"path\": \"/hold\", \"handler\": 1}" else "", try r.fake.url(), extra_nats });
+        , .{ if (with_route) "{\"path\": \"/hold\", \"handler\": 1, \"timeout_ms\": 2000}" else "", try r.fake.url(), extra_nats });
         errdefer alloc.free(r.json);
         var why_buf: [512]u8 = undefined;
         var why: Io.Writer = .fixed(&why_buf);
@@ -187,7 +190,7 @@ const Rig = struct {
         r.e.drain() catch {};
         _ = r.e.wait(5000);
         r.e.destroy();
-        r.fake.stop(engine.threadedIo());
+        r.fake.stop(std.testing.io);
         alloc.free(r.json);
     }
 };
@@ -264,27 +267,26 @@ test "capi nats: a live subscription ends with SUB_END at the server's stop, bef
 
 test "capi nats: a request tied to a req answers E_GONE when the req ends" {
     if (comptime !features.nats) return error.SkipZigTest;
-    if (comptime !features.http2) return error.SkipZigTest;
     var r: Rig = undefined;
     try r.start("", true);
     defer r.deinit();
     const tio = engine.threadedIo();
-    // An HTTP/1.1 request the consumer holds, unanswered.
+    // An HTTP/1.1 request the consumer holds, unanswered. It ends at its
+    // route's deadline (2 s, a 504): an HTTP/1.1 request waiting for the
+    // consumer does not watch its socket, so the end comes from the
+    // deadline, not from the client closing.
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", r.e.port(0));
     var conn = try addr.connect(tio, .{ .mode = .stream });
-    var closed = false;
-    defer if (!closed) conn.close(tio);
+    defer conn.close(tio);
     var wbuf: [256]u8 = undefined;
     var w = conn.writer(tio, &wbuf);
     try w.interface.writeAll("GET /hold HTTP/1.1\r\nHost: x\r\n\r\n");
     try w.interface.flush();
     const req_i = try r.ev.waitFor(.request, 0, 5000);
     const req_handle = r.ev.list.items[req_i].handle;
-    // A request to the broker for it: the fake never answers.
-    try engine.nats.request(r.broker(), r.c, out("no.answer", "?"), .{ .size = @sizeOf(abi.NatsRequestOptions), .req = req_handle }, 31);
-    // The client goes away: the request ends, and the call with it.
-    conn.close(tio);
-    closed = true;
+    // A request to the broker for it: the fake never answers, and the
+    // call has no timeout of its own.
+    try engine.nats.request(r.broker(), r.c, out("no.answer", "?"), .{ .size = @sizeOf(abi.NatsRequestOptions), .req = req_handle, .timeout_ms = abi.DB_TIMEOUT_NONE }, 31);
     const reply_i = try r.ev.waitFor(.nats_reply, 0, 10_000);
     const reply = r.ev.as(abi.NatsReplyEvent, reply_i);
     try std.testing.expectEqual(@as(u64, 31), reply.user_data);
@@ -302,7 +304,7 @@ test "capi nats: a request for a req that is already over is refused with E_GONE
     try std.testing.expect(std.meta.isError(got));
 }
 
-test "capi nats: past the outbound limit a publish is E_AGAIN; when the server reads again, WRITABLE comes once" {
+test "capi nats: past the outbound limit a publish is E_AGAIN; when the server reads again, WRITABLE comes once per answer that asked for it" {
     if (comptime !features.nats) return error.SkipZigTest;
     var r: Rig = undefined;
     try r.startStalled(", \"limits\": {\"outbound_bytes\": 1}");
@@ -311,19 +313,33 @@ test "capi nats: past the outbound limit a publish is E_AGAIN; when the server r
     defer alloc.free(payload);
     @memset(payload, 'x');
     const tio = engine.threadedIo();
+    // Every BUSY answer and the E_AGAIN ask for one WRITABLE; how many
+    // BUSY answers come before the queue refuses depends on how much the
+    // sockets take, so the count is kept rather than assumed.
+    var asked: usize = 0;
     var again = false;
     for (0..100_000) |_| {
-        if (engine.nats.publish(r.broker(), r.c, out("stalled", payload), 0)) |_| {
+        if (engine.nats.publish(r.broker(), r.c, out("stalled", payload), 0)) |busy| {
+            if (busy) asked += 1;
             try Io.sleep(tio, .fromMilliseconds(1), .awake);
         } else |err| {
             try std.testing.expectEqual(error.Again, err);
+            asked += 1;
             again = true;
             break;
         }
     }
     try std.testing.expect(again);
-    // The server reads again: the consumer that was refused is told once.
-    r.fake.release.set(tio);
-    _ = try r.ev.waitFor(.nats_writable, 0, 10_000);
-    try std.testing.expectEqual(@as(usize, 1), r.ev.count(.nats_writable));
+    try r.ev.pump(0);
+    const refused_at = r.ev.list.items.len;
+    // The server reads again: the consumer that was refused is told.
+    r.fake.release.set(std.testing.io);
+    _ = try r.ev.waitFor(.nats_writable, refused_at, 10_000);
+    // A publish is taken again, and WRITABLE never came more often than
+    // answers asked for it (a consumer is told once per refusal, not on
+    // every pass of the watcher).
+    _ = try engine.nats.publish(r.broker(), r.c, out("stalled", "again"), 0);
+    try r.ev.pump(0);
+    const writable = r.ev.count(.nats_writable);
+    try std.testing.expect(writable >= 1 and writable <= asked);
 }

@@ -1405,7 +1405,7 @@ slow consumer holds back its client through HTTP/2 flow control rather than
 filling memory. Metadata the consumer sends follows gRPC's rules: a
 lower-case key, a printable ASCII value, bytes under a `-bin` key (Anole
 encodes them); the protocols' own keys (`grpc-*` but
-`grpc-status-details-bin` in trailers only, `connect-*`, `trailer-*`,
+`grpc-status-details-bin` and `grpc-retry-pushback-ms` in trailers only, `connect-*`, `trailer-*`,
 `content-type`, `te` and the transport's headers) are refused with
 `ANOLE_E_INVALID`: the same rule as Zig's `Call.addHeader` and `addTrailer`.
 

@@ -276,7 +276,8 @@ test "defaults are valid and match the spec" {
 
 test "servers: at least one, at most 64, every one parses" {
     try expectInvalid(.{ .servers = &.{} });
-    try expectInvalid(.{ .servers = &.{ "nats://a:4222", "tls://b:4222" } });
+    try validate(.{ .servers = &.{ "nats://a:4222", "tls://b:4222" } });
+    try expectInvalid(.{ .servers = &.{ "nats://a:4222", "ws://b:4222" } });
     const many: [max_servers + 1][]const u8 = @splat("a:4222");
     try validate(.{ .servers = many[0..max_servers] });
     try expectInvalid(.{ .servers = &many });
