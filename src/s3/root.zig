@@ -982,7 +982,7 @@ pub const Client = struct {
                 break err;
             }
         };
-        observed.end(c, op.name, op.bucket, if (result) |_| null else |e| e);
+        observed.endWith(c, op.name, op.bucket, if (result) |_| null else |e| e, .{ .key = if (op.key.len > 0) op.key else null });
         return result;
     }
 

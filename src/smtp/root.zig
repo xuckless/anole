@@ -409,7 +409,7 @@ pub const Client = struct {
         const ctx = erase(c);
         const observed = self.observer.start(&ctx);
         const result = self.composeAndDeliver(&ctx, message, opts);
-        endCall(&ctx, observed, "send", if (result) |_| null else |e| e);
+        endCall(&ctx, observed, "send", result, message.to.len + message.cc.len + message.bcc.len);
         return result;
     }
 
@@ -417,7 +417,7 @@ pub const Client = struct {
         const ctx = erase(c);
         const observed = self.observer.start(&ctx);
         const result = self.rawAndDeliver(&ctx, envelope, message, opts);
-        endCall(&ctx, observed, "send raw", if (result) |_| null else |e| e);
+        endCall(&ctx, observed, "send raw", result, envelope.to.len);
         return result;
     }
 
@@ -741,8 +741,13 @@ pub const Client = struct {
     }
 };
 
-fn endCall(ctx: *const Ctx, observed: db.Call, op: []const u8, failure: ?anyerror) void {
-    if (ctx.request) |req| observed.end(req, op, null, failure) else observed.end(ctx, op, null, failure);
+fn endCall(ctx: *const Ctx, observed: db.Call, op: []const u8, result: Error!Sent, recipients: usize) void {
+    const failure: ?anyerror = if (result) |_| null else |e| e;
+    const detail: db.Call.Detail = .{
+        .recipients = std.math.lossyCast(u32, recipients),
+        .message_id = if (result) |sent| (if (sent.message_id.len > 0) sent.message_id else null) else |_| null,
+    };
+    if (ctx.request) |req| observed.endWith(req, op, null, failure, detail) else observed.endWith(ctx, op, null, failure, detail);
 }
 
 // ---------------------------------------------------------------------------
