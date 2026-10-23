@@ -1,0 +1,17 @@
+# started on Fri Oct 23 20:57:25 2026
+
+
+ Performance counter stats for process id '1502862':
+
+             53636      syscalls:sys_enter_recvmmsg                                           
+                 0      syscalls:sys_enter_recvmsg                                            
+                 0      syscalls:sys_enter_recvfrom                                           
+             53631      syscalls:sys_enter_sendmmsg                                           
+                 0      syscalls:sys_enter_sendmsg                                            
+                 0      syscalls:sys_enter_sendto                                             
+                 0      syscalls:sys_enter_io_uring_enter                                      
+                 0      syscalls:sys_enter_epoll_wait                                         
+                 0      syscalls:sys_enter_epoll_pwait                                        
+
+       5.001726929 seconds time elapsed
+

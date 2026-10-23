@@ -1,0 +1,10 @@
+.{
+    .name = .anole_grpc_bench,
+    .fingerprint = 0x672afdfd7dbe92c7,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .anole = .{ .path = "../../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

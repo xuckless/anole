@@ -1,0 +1,3 @@
+{"time":"2026-10-23T20:58:17.993Z","level":"info","scope":"anole","message":"Graceful shutdown requested"}
+{"time":"2026-10-23T20:58:27.994Z","level":"warn","scope":"anole","message":"Shutdown timed out with 1000 request(s) still in flight"}
+{"time":"2026-10-23T20:58:28.003Z","level":"info","scope":"anole","message":"signal received (term); drained and stopped"}

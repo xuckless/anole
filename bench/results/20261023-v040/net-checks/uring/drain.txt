@@ -1,0 +1,5 @@
+0 polite stop_s .050998513 exit 0
+100 rude stop_s 10.102467918 exit 0
+100 polite stop_s 10.099500815 exit 0
+1000 rude stop_s 10.108277383 exit 0
+1000 polite stop_s 10.110229559 exit 0

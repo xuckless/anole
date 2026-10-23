@@ -42,7 +42,7 @@ def table(out):
     f = lambda v, p=0: "–" if v is None else f"{v:,.{p}f}"
     rows = ["| backend | case | side | req/s | vs " + sides[0] + " | p50 ms | p99 ms | mem MB | runs |", "|---|---|---|---|---|---|---|---|---|"]
     for be in ("epoll", "uring"):
-        for case in ("plain", "json", "h2c", "h3", "asyncdb", "wsecho"):
+        for case in ("plain", "json", "h2c", "h2c64", "h3", "asyncdb", "wsecho"):
             base = None
             for side in sides:
                 runs = [parse(d) for d in sorted(glob.glob(os.path.join(out, be, case, f"{side}-r*")))]

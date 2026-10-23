@@ -1,0 +1,2 @@
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti MemErrors
+Udp: 1815817857 689744 74653463 1551149683 74653463 226 0 294083 0

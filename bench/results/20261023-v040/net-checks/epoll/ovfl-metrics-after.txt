@@ -1,0 +1,7 @@
+anole_net_datagrams_received_total{listener="echo-udp"} 13204481
+anole_net_datagrams_sent_total{listener="echo-udp"} 13204481
+anole_net_datagrams_dropped_total{listener="echo-udp",reason="kernel"} 33425575
+anole_net_datagrams_dropped_total{listener="echo-udp",reason="truncated"} 0
+anole_net_datagrams_dropped_total{listener="echo-udp",reason="queue_full"} 0
+anole_net_datagrams_dropped_total{listener="echo-udp",reason="send_failed"} 0
+anole_net_datagrams_dropped_total{listener="echo-udp",reason="sessions_full"} 0

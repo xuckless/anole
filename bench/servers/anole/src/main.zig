@@ -7,6 +7,7 @@ const anole = @import("anole");
 const websocket = anole.websocket;
 const twelve = @import("twelve.zig");
 const asyncdb = @import("asyncdb.zig");
+const features = @import("features.zig");
 
 pub const zio_options = anole.zio_options;
 pub const std_options = anole.std_options;
@@ -257,8 +258,18 @@ pub fn main(init: std.process.Init) !void {
             .max_connections = null,
         };
     }
+    const feature_cfg: features.Config = .{
+        .tcp_port = envInt(u16, "NET_TCP_PORT", 0),
+        .udp_port = envInt(u16, "NET_UDP_PORT", 0),
+        .sse = envInt(u8, "SSE", 0) == 1,
+        .upstream = env("UPSTREAM", ""),
+        .upstream_h2c = envInt(u8, "UPSTREAM_H2C", 0) == 1,
+        .metrics = envInt(u8, "METRICS", 0) == 1,
+    };
+    features.configure(&opts, feature_cfg);
     var app = try anole.Server(App).init(init.gpa, opts, &state);
     defer app.deinit();
+    features.registerEarly(&app, feature_cfg);
 
     // Handlers that never wait (docs/routing.md): on HTTP/2 a request that
     // arrives whole runs where the connection reads it, without a task.
@@ -288,6 +299,8 @@ pub fn main(init: std.process.Init) !void {
         state.asyncdb = try asyncdb.State.init(&app, arena_url, envInt(u32, "PG_POOL", 20));
         asyncdb.routes(&app);
     }
+
+    try features.register(&app, feature_cfg);
 
     const hz = envInt(u32, "TICK_HZ", 1000);
     var tick = if (hz > 0) try app.io().concurrent(ticker, .{ &state, app.io(), hz }) else null;

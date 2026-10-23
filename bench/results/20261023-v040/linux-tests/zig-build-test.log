@@ -1,0 +1,323 @@
+info: fetching lazy dependency N-V-__8AAHq03wFyL3GDg1B5WQRqK98uTOOjLUIriuv5DdbW
+info: fetching lazy dependency translate_c-2.0.2-Q_BUWvBNBwDnyehSiuAJmdFcMYHYGA-Jc3KiYdrV2Dqx
+info: fetching lazy dependency N-V-__8AAP98WQBOcqCV-jYjCmw19Aw3aCtmPAMilcMGfLOK
+info: fetching lazy dependency N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq
+info: fetching lazy dependency N-V-__8AAMCuQwCjsxFJ5ddtVQcmqA7wQVrluqzivC1f7D72
+info: fetching lazy dependency N-V-__8AAEFLFQDX6X1kJVbgLtI2HqUnToQWeqwqMuAlG7Oa
+info: fetching lazy dependency N-V-__8AAPaJcABkB6U-96R7h2xuXX5TlDMvwPbE4PucPI59
+info: fetching lazy dependency N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5
+info: fetching lazy dependency N-V-__8AAJudKgCQCuIiH6MJjAiIJHfg_tT_Ew-0vZwVkCo_
+info: fetching lazy dependency N-V-__8AAPaNGQD6bmfRjArvYAnsL8DYxbXiNxVE_B6HRpUx
+info: fetching lazy dependency zlib-0.1.0-X-kZxmTyEQCJtIUdNRXSe6B4h1r1FGi0GvTcX2pvokom
+info: fetching lazy dependency websocket-0.0.0-UEQdXkQJAgCHF--QcM8bzQIEl_nf38Q0RouBNZuGLh6B
+info: fetching lazy dependency protobuf-7.0.0-0e82aujmNgDEMIIEm-NBypMzOKX8l0fZK0gyCpbF1tmE
+info: fetching lazy dependency N-V-__8AABFlbgB11C3wOoHo9lqDatPMvTuIdHI0vwVxDpTe
+info: fetching lazy dependency N-V-__8AAPJv3gI7D9QT5MqUNa7RaXBRPTLdOd6eUVgbJ0Nm
+info: fetching lazy dependency N-V-__8AAPwwCwC-qD60sHS0_NF1XJZ_qtzgIE_XlRCts2kn
+info: fetching lazy dependency zig_jwt-1.7.6-w3q9SD1JHwCv7Y7wd9cdliyEaGpggJhl1M9QbZm2oNP6
+info: fetching lazy dependency pg-0.0.0-Wp_7gVtzCQChogRE8uzrNYv1eqywmg0Vc_7aM7sr6sGT
+info: fetching lazy dependency N-V-__8AAETTsABEodUZZFAyfdAm9hEyqBXuLw9pRSO0vFh9
+info: fetching lazy dependency N-V-__8AAMtRpADAGtPCqgS57gPLl02TIK7HbJ1MkIm4Eq8F
+info: fetching lazy dependency sqlite-3.54.1-F2R_a_YmBADq3G8bA-jCBgWFcQEaVlxVql4mEN2SbliG
+[0K[32m
+736 of 736 tests passed
+[0m[33m3 tests skipped
+[0m
+Slowest 5 tests: 
+  1103.92ms	server.h2_test.test.HTTP/2: a drain waits for a response that is taken from the session but not yet written
+  1152.31ms	server.test.fuzz: a connection's bytes, HTTP/1.1 or HTTP/2 with prior knowledge
+  1202.27ms	server_test.test.Server: a keep-alive request outlives the keepalive timeout; a half head on one does not outlive read_header
+  1202.64ms	server_test.test.stream: an event stream outlives timeouts.request
+  1205.34ms	server.h2_test.test.HTTP/2: an event stream outlives timeouts.request
+
+ok basics
+{"time":"2026-10-23T20:21:49.267Z","level":"info","scope":"anole","message":"environment production (default): JSON Lines logs"}
+{"time":"2026-10-23T20:21:49.267Z","level":"info","scope":"anole","message":"Debug build"}
+{"time":"2026-10-23T20:21:49.267Z","level":"error","scope":"anole","message":"can't register the routes: route GET /metrics is registered twice.\n  Change the path or the method of one of them; a parameter at one position has one name."}
+ok route conflicts: ANOLE_E_CONFIG naming the routes, no panic
+ok routes
+ok bodies
+ok borrowed body
+ok streamed response
+ok respond_fd
+ok response cache
+ok stale handles and slot reuse
+ok deadline /hold (504 after 400 ms)
+ok deadline /short (504 after 151 ms)
+ok client gone
+ok websocket
+ok concurrency (32000 requests, 28389 batches, 25419 wakes, 13 rewakes)
+ok drain (stopped after 401 ms; dropped request: 504)
+[2 anole] {"time":"2026-10-23T20:21:52.283Z","level":"warn","scope":"anole","message":"Shutdown timed out with 1 request(s) still in flight"}
+ok stale handles across servers: ANOLE_E_GONE
+[2 anole] {"time":"2026-10-23T20:21:52.601Z","level":"warn","scope":"anole","message":"Shutdown timed out with 2 request(s) still in flight"}
+ok shared consumer, max_inflight 503, drain past shutdown_ms (302 ms)
+[2 anole] {"time":"2026-10-23T20:21:52.656Z","level":"warn","scope":"anole","message":"database error: sqlite 1 (other): near \"SELEKT\": syntax error"}
+[2 anole] {"time":"2026-10-23T20:21:52.657Z","level":"warn","scope":"anole","message":"database error: sqlite (other): the call left a transaction open (BEGIN without its COMMIT in the same call), so it was rolled back: separate calls do not keep a connection, and the writer is shared by every request; use begin() or transaction() (C ABI: anole_db_begin)"}
+[2 anole] {"time":"2026-10-23T20:21:52.657Z","level":"warn","scope":"anole","message":"database error: sqlite 1 (other): no such table: nope"}
+[2 anole] {"time":"2026-10-23T20:21:52.658Z","level":"warn","scope":"anole","message":"database error: sqlite (other): the call left a transaction open (BEGIN without its COMMIT in the same call), so it was rolled back: separate calls do not keep a connection, and the writer is shared by every request; use begin() or transaction() (C ABI: anole_db_begin)"}
+[2 anole] {"time":"2026-10-23T20:21:52.720Z","level":"warn","scope":"anole","message":"database error: sqlite (timeout): the call ran past its timeout"}
+ok databases: values both ways, errors, scripts, cache, 198 of 200 coalesced, timeout, size limit
+ok postgres (no ANOLE_TEST_POSTGRES_URL)
+ok redis (no ANOLE_TEST_REDIS_URL)
+ok mongodb (no ANOLE_TEST_MONGODB_URL)
+ok webtransport: a session from a Zig client, streams both ways, datagrams, the client's close
+[1 anole] {"time":"2026-10-23T20:21:52.954Z","level":"error","scope":"anole","message":"cannot load the TLS certificate and key (PEM in memory): TlsInvalidCertificate"}
+[1 anole] {"time":"2026-10-23T20:21:52.954Z","level":"error","scope":"anole","message":"cannot read the TLS certificate \"/nonexistent/anole-cert.pem\": FileNotFound"}
+ok tls: mutual TLS and proxy settings in the configuration, anole_server_reload_tls's refusals
+ok abi 0.7: version rule, oversize options, unknown flags and reserved fields
+ok database transactions: commit, rollback, order, release, timeout, validation, stop
+[2 anole] {"time":"2026-10-23T20:21:57.488Z","level":"warn","scope":"anole","message":"database error: sqlite (timeout): the call ran past its timeout"}
+ok database queries and transactions tied to requests: cut at the deadline, kept after the answer
+ok postgres transactions (no ANOLE_TEST_POSTGRES_URL)
+[2 anole] {"time":"2026-10-23T20:21:58.904Z","level":"warn","scope":"anole","message":"Shutdown timed out with 1 request(s) still in flight"}
+ok cleanup calls are idempotent, wrong kinds are invalid, req_fail, req_abort, handle_release
+[1 anole] {"time":"2026-10-23T20:21:58.921Z","level":"error","scope":"anole","message":"127.0.0.1:32785 is already in use: another process is listening on it"}
+ok error identity: tokens, errno, the failing listener, TOOBIG sizes
+[2 anole] {"time":"2026-10-23T20:22:00.167Z","level":"warn","scope":"anole","message":"Shutdown timed out with 1 request(s) still in flight"}
+ok abort reasons: deadline, body, drain
+ok SENT: exactly one per borrowing call that was taken
+ok listener info: states, ports, flags
+ok anole_server_open: databases before traffic, readiness checks, destroy after open
+ok destroy without a drain answers what is owed at once (1 ms)
+{"time":"2026-10-23T20:22:00.896Z","level":"info","scope":"anole","message":"environment production (default): JSON Lines logs"}
+{"time":"2026-10-23T20:22:00.896Z","level":"info","scope":"anole","message":"Debug build"}
+{"time":"2026-10-23T20:22:00.897Z","level":"info","scope":"anole","message":"listening on http://127.0.0.1:35999 (HTTP/1.1, HTTP/2 cleartext)"}
+{"time":"2026-10-23T20:22:00.897Z","level":"info","scope":"anole","message":"console: `anole console capi-consumer` attaches (socket /run/anole/capi-consumer.17337.sock)"}
+{"time":"2026-10-23T20:22:00.897Z","level":"info","scope":"anole","message":"Graceful shutdown requested"}
+ok the log callback belongs to its server
+ok log.format json: the callback gets whole JSON records
+ok signals never run on Anole's threads
+ok a forked child cannot use its parent's server and may create its own
+ok a consumer that would get no executor is refused at start
+[2 anole] {"time":"2026-10-23T20:22:01.186Z","level":"warn","scope":"anole","message":"Shutdown timed out with 3 request(s) still in flight"}
+ok anole_consumer_set_wake: callback to fd to another callback
+ok WebSocket: WRITABLE signals room, borrowed sends are reported once
+ok WebSocket: handshakes decided by the consumer (accept, refuse, argument checks)
+ok WebSocket: configured subprotocols are selected by the server's order
+ok WebSocket: publishes to one topic arrive in order
+ok raw TCP and UDP: framed lines, FIN, stale handles, datagrams, addresses
+PASS
+{"time":"2026-10-23T20:22:01.741Z","level":"info","scope":"anole","message":"environment production (default): JSON Lines logs"}
+{"time":"2026-10-23T20:22:01.741Z","level":"info","scope":"anole","message":"Debug build"}
+{"time":"2026-10-23T20:22:01.743Z","level":"info","scope":"anole","message":"listening on https://127.0.0.1:41579 (HTTP/2, HTTP/1.1)"}
+{"time":"2026-10-23T20:22:01.743Z","level":"info","scope":"anole","message":"console: `anole console capi-tls-start` attaches (socket /run/anole/capi-tls-start.17772.sock)"}
+{"time":"2026-10-23T20:22:01.924Z","level":"info","scope":"anole","message":"Graceful shutdown requested"}
+tls_start: HTTPS over a dead-stripped libanole.a link, ok
+ok argument checks
+ok native route
+ok consumer route
+sse: all passed
+ok unary
+ok error status and trailers
+ok metadata and state checks
+ok server streaming
+ok backpressure
+ok client streaming
+ok bidi
+ok deadline
+ok cancel
+ok handle_release on a call
+ok borrowed messages: one SENT each
+ok json refused without descriptors
+ok health
+grpc: all passed
+test
++- run test anole-test 1581 pass, 100 skip, 1 fail, 3 crash (1685 total)
+[anole] (warn): can't make one listener both TCP and UDP.
+  Use two listeners: one with tcp, one with udp.
+[anole] (warn): can't start a raw TCP or UDP listener: listener "tcp" has no port; a raw listener never takes $PORT or the 8080 default.
+  Give it a port (0 picks a free one) or a unix socket path; a raw listener never takes $PORT or 8080.
+[anole] (warn): can't serve HTTP/3 on a raw TCP or UDP listener.
+  Turn http3 off for that listener.
+[anole] (warn): can't serve a raw listener built for another server state type.
+  Build the service with this server's Ctx (app.tcp and app.udp do).
+[anole] (warn): can't use these raw listener options: listener "tcp-0": a framing max is 1 byte to 1 GiB, length prefixes are 1, 2 or 4 bytes, read_window 4 KiB to 64 KiB.
+  Length prefixes are 1, 2 or 4 bytes, a frame max 1 byte to 1 GiB, read_window 4 KiB to 64 KiB, batch 1 to 64, max_datagram up to 65507.
+[anole] (warn): Shutdown timed out with 2 request(s) still in flight
+[anole] (warn): can't use TLS on a UDP listener: DTLS is not supported.
+  Leave tls out of the UDP listener, or serve the protocol over TCP.
+[anole] (warn): can't listen for UDP on a unix socket.
+  Give the UDP listener an address and a port.
+[anole] (warn): can't read the PROXY protocol on a UDP listener.
+  Turn proxy_protocol off for the UDP listener.
+[anole] (warn): database error: nats outbound_full (unavailable): Full
+[nats] (warn): 1 publishes never sent: dropped
+[anole] (warn): can't go on: the OpenAPI file does not match the app's routes.
+  Run `zig build openapi` to write it again, and commit the result.
+[anole] (warn): circuit breaker grpc 127.0.0.1:42549: open
+error: 'h3.alt_svc.test.quoted values with escapes' terminated with signal ABRT with stderr:
+       thread 17128 panic: access of union field 'h3' while field 'none' is active
+       /src/src/h3/alt_svc.zig:144:49: 0x1d0fde0 in test.quoted values with escapes (root.zig)
+           try std.testing.expectEqual(@as(u16, 443), r.h3.port);
+                                                       ^
+       /opt/zig/lib/compiler/test_runner.zig:143:68: 0x1ca204a in mainServer (test_runner.zig)
+                       const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                                                                          ^
+       /opt/zig/lib/compiler/test_runner.zig:72:26: 0x1ca2e7d in main (test_runner.zig)
+               return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+                                ^
+       /opt/zig/lib/std/start.zig:789:88: 0x1c9fb88 in callMain (std.zig)
+           if (fn_info.param_types[0].? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                              ^
+       ???:?:?: 0x7f60bf371ca7 in ??? (/lib/x86_64-linux-gnu/libc.so.6)
+       ???:?:?: 0x7f60bf371d64 in ??? (/lib/x86_64-linux-gnu/libc.so.6)
+       /opt/zig/lib/libc/glibc/sysdeps/x86_64/start.S:115: 0x7ff03d0 in ??? (/opt/zig/lib/libc/glibc/sysdeps/x86_64/start.S)
+       	call *__libc_start_main@GOTPCREL(%rip)
+error: 'tls.root.test.TLS hello: a response body that runs to the end of the connection needs close_notify' terminated with signal ABRT with stderr:
+       thread 17832 panic: attempt to use null value
+       /src/src/tls/dusty_tls.zig:1679:51: 0x21b76c1 in bioShared (dusty_tls.zig)
+           return @ptrCast(@alignCast(c.BIO_get_data(bio).?));
+                                                         ^
+       /src/src/tls/dusty_tls.zig:879:28: 0x21db39d in alpnSelect (dusty_tls.zig)
+           const prefs = bioShared(bio).alpn;
+                                  ^
+       zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/extensions.cc:1577:13: 0x7bc4e3f in ssl_negotiate_alpn (zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/extensions.cc)
+         int ret = alpn_select_cb(
+                   ^
+       zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/tls13_server.cc:467:8: 0x7cfdb0e in do_select_parameters (zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/tls13_server.cc)
+         if (!ssl_negotiate_alpn(hs, &alert, &client_hello)) {
+              ^
+       zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/tls13_server.cc:1506:15: 0x7cfc28d in tls13_server_handshake (zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/tls13_server.cc)
+               ret = do_select_parameters(hs);
+                     ^
+       zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/handshake_server.cc:726:29: 0x7c26534 in do_tls13 (zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/handshake_server.cc)
+         enum ssl_hs_wait_t wait = tls13_server_handshake(hs);
+                                   ^
+       zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/handshake_server.cc:1825:15: 0x7c23ee4 in ssl_server_handshake (zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/handshake_server.cc)
+               ret = do_tls13(hs);
+                     ^
+       zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/handshake.cc:685:16: 0x7c0a96d in ssl_run_handshake (zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/handshake.cc)
+           hs->wait = ssl->do_handshake(hs);
+                      ^
+       zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/ssl_lib.cc:752:13: 0x7c8778d in SSL_do_handshake (zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/ssl_lib.cc)
+         int ret = ssl_run_handshake(hs, &early_return);
+                   ^
+       zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/ssl_lib.cc:784:10: 0x7c87d53 in SSL_accept (zig-pkg/N-V-__8AAPOrbw7gV-8XeYfUaBxCqpoXGrn_bb_vyzdnkayq/ssl/ssl_lib.cc)
+         return SSL_do_handshake(ssl);
+                ^
+       /src/src/tls/root.zig:955:25: 0x22f8e93 in serveOnce (root.zig)
+               if (c.SSL_accept(ssl) != 1) return;
+                               ^
+       /opt/zig/lib/std/Thread.zig:422:13: 0x22f8586 in callFn__func_4368 (std.zig)
+                   @call(.auto, f, args);
+                   ^
+       /opt/zig/lib/std/Thread.zig:753:30: 0x22f817a in entryFn (std.zig)
+                       return callFn(f, args_ptr.*);
+                                    ^
+       ???:?:?: 0x7fc8fc30ab7a in ??? (/lib/x86_64-linux-gnu/libc.so.6)
+       ???:?:?: 0x7fc8fc3887b7 in ??? (/lib/x86_64-linux-gnu/libc.so.6)
+error: 'errors.test.explain: every member of ServerError has text, and none holds a credential' failed:
+       [anole] (warn): can't listen on the configured address: that is not an address.
+         Write it as ":3000" (every interface), "127.0.0.1:3000" or "[::1]:3000".
+       [anole] (warn): listener "https" serves a development certificate (dev_self_signed) on [::]:0: browsers will warn and clients cannot verify it. Use Cert.fromFiles(...) outside development.
+       [anole] (warn): can't register the routes: route /a/:name: :name conflicts with :id, registered at the same position by another route.
+         Change the path or the method of one of them; a parameter at one position has one name.
+       anole: route /a/:name: :name conflicts with :id, registered at the same position by another route
+       [anole] (warn): can't register the routes: route /a/:name: :name conflicts with :id, registered at the same position by another route.
+         Change the path or the method of one of them; a parameter at one position has one name.
+       [nats] (warn): message does not fit the type violations=1 first_field=n first_code=http.invalid_type request_id=nats-1
+       [nats] (warn): message does not fit the type violations=1 first_field=name first_code=validation.max_length request_id=nats-1
+       [anole] (warn): Shutdown timed out with 1 request(s) still in flight
+       /opt/zig/lib/std/testing.zig:584:14: 0x1cf14a9 in expect (std.zig)
+           if (!ok) return error.TestUnexpectedResult;
+                    ^
+       /src/src/errors.zig:525:9: 0x28b64ed in test.explain: every member of ServerError has text, and none holds a credential (root.zig)
+               try std.testing.expect(std.mem.startsWith(u8, text, "can't "));
+               ^
+error: 's3.s3_test.test.s3: put(.request) sends the request body to the object without the handler reading it' terminated with signal SEGV with stderr:
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): 23 publishes never sent: dropped
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): 3 publishes never sent: dropped
+       [nats] (warn): 10 publishes never sent: dropped
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): 1 publishes never sent: dropped
+       [nats] (warn): no memory to keep the server's INFO
+       [anole_auth] (warn): JWKS fetch from http://127.0.0.1:43809/jwks failed (ConnectionRefused); next try in 5s
+       [anole_auth] (warn): JWKS fetch from http://127.0.0.1:39303/jwks failed (JwksFetchFailed); next try in 5s
+       [anole] (warn): Shutdown timed out with 1 request(s) still in flight
+       [anole] (warn): job-3 t.work failed (attempt 1 of 20); next try scheduled
+       [anole] (warn): database error: redis (unavailable): cannot connect to redis://127.0.0.1:1/0: ConnectionRefused
+       [anole] (warn): redis watch: cannot open the SUBSCRIBE connection (ServiceUnavailable); trying again
+       [anole] (warn): database error: redis (unavailable): cannot connect to redis://127.0.0.1:1/0: ConnectionRefused
+       [anole] (warn): watch "feed": the Redis stream connection failed (ServiceUnavailable); trying again
+       [anole] (warn): database error: redis (unavailable): cannot connect to redis://127.0.0.1:1/0: ConnectionRefused
+       [anole] (warn): redis watch: cannot open the SUBSCRIBE connection (ServiceUnavailable); trying again
+       [anole] (warn): database error: redis (unavailable): cannot connect to redis://127.0.0.1:1/0: ConnectionRefused
+       [anole] (warn): watch "feed": the Redis stream connection failed (ServiceUnavailable); trying again
+       [anole] (warn): database error: smtp 4.0.0 (unavailable): 451 4.0.0 scripted reply
+       [anole] (warn): database error: smtp 4.0.0 (unavailable): 451 4.0.0 scripted reply
+       [anole] (warn): database error: kafka UNKNOWN_TOPIC_OR_PARTITION (other): the topic does not exist
+       [anole] (warn): database error: kafka UNKNOWN_TOPIC_OR_PARTITION (other): the topic does not exist
+       [anole] (warn): database error: kafka MESSAGE_TOO_LARGE (other): the record is larger than max_request_bytes
+       [anole] (warn): database error: kafka buffer_full (unavailable): the producer's buffer is full
+       [anole] (warn): database error: kafka delivery_pending (timeout): no acknowledgement within the timeout; the record may still be delivered
+       [anole] (warn): kafka group g1: fetch from broker 0 failed: ConnectionLost
+       [anole] (warn): kafka group g2: fetch from broker 0 failed: ConnectionLost
+       [anole] (warn): kafka group g2: fetch from broker 0 failed: ConnectionLost
+       [anole] (warn): kafka group g3: handler failed for kafka-jobs-0-1 (attempt 1 of 3): BadRecord
+       [anole] (warn): kafka group g3: handler failed for kafka-jobs-0-1 (attempt 2 of 3): BadRecord
+       [anole] (warn): kafka group g3: handler failed for kafka-jobs-0-1 (attempt 3 of 3): BadRecord
+       [anole] (warn): kafka group g3: fetch from broker 0 failed: ConnectionLost
+       [anole] (warn): kafka group g-old: fetch from broker 0 failed: ConnectionLost
+       [anole] (warn): watch "orders": the handler failed for watch-1: Boom
+       [anole] (warn): database error: mongodb 286 (other): scripted failure [table users]
+       [anole] (warn): database error: mongodb change_stream_history_lost (other): the oplog no longer holds the events after the stream's resume token: events were lost; start a new stream [table users]
+       [anole] (warn): watch "orders": the handler failed for watch-1: Boom
+       [anole] (warn): watch "orders": the handler failed for watch-3: Boom
+       [anole] (warn): database error: mongodb 91 (unavailable): scripted failure [table users]
+       [anole] (warn): database error: mongodb 6 (other): scripted failure [table users]
+       [anole] (warn): database error: mongodb 91 (unavailable): scripted failure [table users]
+       [anole] (warn): Shutdown timed out with 1 request(s) still in flight
+       [anole] (warn): Shutdown timed out with 1 request(s) still in flight
+       [anole] (warn): Shutdown timed out with 1 request(s) still in flight
+       [anole] (warn): Shutdown timed out with 1 request(s) still in flight
+       [anole] (warn): lambda: an event could not be read as a request (keys: (not JSON))
+       [anole] (warn): Shutdown timed out with 1 request(s) still in flight
+       [anole] (warn): Shutdown timed out with 1 request(s) still in flight
+       [anole] (warn): can't register the routes: route /x/:b: :b conflicts with :a, registered at the same position by another route.
+         Change the path or the method of one of them; a parameter at one position has one name.
+       [anole] (warn): lambda: SnapStart is not supported yet (restored copies would share random-number state).
+         Publish the function without SnapStart.
+       [anole] (warn): lambda: the Runtime API at 127.0.0.1:35621 failed: it answered with an error that leaves this environment unusable; exiting so Lambda starts a new environment.
+         Nothing to fix in the app; if it repeats, the function's logs before this line say why.
+       [anole] (warn): Shutdown timed out with 2 request(s) still in flight
+       [anole] (warn): Shutdown timed out with 1 request(s) still in flight
+       [anole] (warn): Shutdown timed out with 1 request(s) still in flight
+       [anole] (warn): Shutdown timed out with 1 request(s) still in flight
+       [anole] (warn): database error: smtp recipients_deferred (unavailable): 450 4.2.0 <busy@example.com>: Recipient address deferred: try later (recipient busy@example.com)
+       [anole] (warn): database error: smtp 4.0.0 (unavailable): 451 4.0.0 scripted reply
+       [anole] (warn): database error: smtp 4.0.0 (unavailable): 451 4.0.0 scripted reply
+       [anole] (warn): database error: smtp 4.0.0 (unavailable): 451 4.0.0 scripted reply
+       [anole] (warn): database error: smtp connection_closed (unavailable): 127.0.0.1:46489 closed the connection
+       [anole] (warn): database error: smtp connect_failed (unavailable): cannot connect to 127.0.0.1:1: ConnectionRefused
+       [anole] (warn): database error: smtp connect_failed (unavailable): cannot connect to 127.0.0.1:1: ConnectionRefused
+       [anole] (warn): database error: smtp connect_failed (unavailable): cannot connect to 127.0.0.1:1: ConnectionRefused
+       [anole] (warn): database error: smtp connect_failed (unavailable): cannot connect to 127.0.0.1:1: ConnectionRefused
+       [anole] (warn): database error: smtp starttls_unavailable (unavailable): 127.0.0.1:40561 does not offer STARTTLS; mail and credentials would cross the network in clear text (use smtps://, or ?tls=none on a trusted network)
+       [anole] (warn): database error: smtp authentication_failed (other): 535 5.7.8 authentication credentials invalid
+       [anole] (warn): database error: smtp auth_unsupported (other): 127.0.0.1:33385 offers no AUTH PLAIN or LOGIN (no AUTH at all: remove the credentials from the URL?)
+       [anole] (warn): database error: smtp draining (unavailable): the server is shutting down; no new mail is sent
+       [anole] (warn): database error: s3 SlowDown (unavailable): scripted failure
+       [anole] (warn): database error: s3 SlowDown (unavailable): scripted failure
+       [anole] (warn): database error: s3 RequestTimeTooSkewed (other): scripted failure
+       [anole] (warn): s3 "s3": no bucket (Options.bucket or S3_BUCKET); calls need bucket(name)
+       Segmentation fault at address 0x7fd41516a74e
+failed command: ./.zig-cache/o/02eb5b255d084a2ac90f717592eaba52/anole-test --cache-dir=./.zig-cache --seed=0x726cbba6 --listen=-
+
+Build Summary: 195/197 steps succeeded (1 failed); 2060/2164 tests passed (100 skipped, 1 failed, 3 crashed)
+test transitive failure
++- run test anole-test 1581 pass, 100 skip, 1 fail, 3 crash (1685 total)
+
+exit 1

@@ -7,10 +7,12 @@
 # Cases (bench server):
 #   plain   wrk h1 /plaintext c256          json    wrk h1 /json c256
 #   h2c     h2load c256 m10 /json (noWait)  h3      h2load h3 c64 m10 /json on :8443
+#   h2c64   h2load c256 m64 /json
 #   asyncdb wrk h1 c256 /async-db?min=10&max=50&limit=20 on HttpArena's seeded
 #           Postgres 18 (cpus 16-19, data/pgdb-seed.sql from $ARENA, pool 20)
 #   wsecho  64 sockets echoing 64-byte messages on /ws/echo (bench/tools/cmd/wsecho)
-# CASES run on epoll, URING_CASES on io_uring; results go to
+# TIER=4 runs the server on $SUT_CPUS_4 with 4 executors (default TIER=1:
+# $SUT_CPUS_1, 1 executor). CASES run on epoll, URING_CASES on io_uring; results go to
 # results/<id>/$GATE_DIR (default gate).
 set -u
 bench=$(cd "$(dirname "$0")/.." && pwd)
@@ -18,7 +20,8 @@ bench=$(cd "$(dirname "$0")/.." && pwd)
 id=$1; shift
 out=$bench/results/$id/${GATE_DIR:-gate}
 mkdir -p "$out"
-REST=${REST:-70} RUNS=${RUNS:-3} DUR=${DUR:-30}
+REST=${REST:-70} RUNS=${RUNS:-3} DUR=${DUR:-30} TIER=${TIER:-1}
+if [ "$TIER" = 4 ]; then SUT_CPUS=$SUT_CPUS_4 NCPU=4; else SUT_CPUS=$SUT_CPUS_1 NCPU=1; fi
 CASES=${CASES:-"plain json h2c h3 asyncdb wsecho"}
 URING_CASES=${URING_CASES:-"h3"}
 TOOLS=${TOOLS:?set TOOLS to the directory with the wsecho binary}
@@ -52,6 +55,7 @@ load_cmd() {
     json) echo "wrk -t8 -c256 -d${DUR}s --timeout 10s --latency $u/json" ;;
     asyncdb) echo "wrk -t8 -c256 -d${DUR}s --timeout 10s --latency '$u/async-db?min=10&max=50&limit=20'" ;;
     h2c) echo "h2load -t8 -c256 -m10 -D$DUR --warm-up-time=5 --log-file=/tmp/req.log $u/json; $pct" ;;
+    h2c64) echo "h2load -t8 -c256 -m64 -D$DUR --warm-up-time=5 --log-file=/tmp/req.log $u/json; $pct" ;;
     h3) echo "h2load -t8 -c64 -m10 -D$DUR --warm-up-time=5 --alpn-list=h3 --log-file=/tmp/req.log https://127.0.0.1:8443/json; $pct" ;;
     wsecho) echo "/tools/wsecho -url ws://127.0.0.1:8080/ws/echo -c 64 -d ${DUR}s > /out/wsecho.json" ;;
   esac
@@ -68,9 +72,9 @@ one() { # one <backend> <side> <case> <run>
   IFS=, read -ra kv <<<"${envs[$side]}"; for e in "${kv[@]}"; do extra+=(-e "$e"); done
   docker rm -f gate-sut >/dev/null 2>&1
   local cid
-  cid=$(docker run -d --name gate-sut --network host --cpuset-cpus "$SUT_CPUS_1" --cpus 1 \
+  cid=$(docker run -d --name gate-sut --network host --cpuset-cpus "$SUT_CPUS" --cpus $NCPU \
     --memory 2g --memory-swap 2g --ulimit nofile=1048576:1048576 "${extra[@]}" \
-    -v "$bench/.data/certs:/certs:ro,z" -e MODE=$mode -e WORKERS=1 -e TICK_HZ=0 "${image[$side]}")
+    -v "$bench/.data/certs:/certs:ro,z" -e MODE=$mode -e WORKERS=$NCPU -e TICK_HZ=0 "${image[$side]}")
   for _ in $(seq 60); do
     if [ $mode = h3 ]; then curl -sk -o /dev/null https://127.0.0.1:8443/json && break
     else curl -s -o /dev/null http://127.0.0.1:8080/json && break; fi
