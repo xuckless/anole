@@ -179,6 +179,13 @@
             .hash = "sqlite-3.54.1-F2R_a_YmBADq3G8bA-jCBgWFcQEaVlxVql4mEN2SbliG",
             .lazy = true,
         },
+        // -Dkafka: lz4 1.10.0 (BSD-2, Kafka's most used batch codec), built
+        // by build/lz4.zig.
+        .lz4 = .{
+            .url = "https://github.com/lz4/lz4/archive/refs/tags/v1.10.0.tar.gz",
+            .hash = "N-V-__8AAPaNGQD6bmfRjArvYAnsL8DYxbXiNxVE_B6HRpUx",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

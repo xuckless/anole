@@ -341,6 +341,7 @@ test {
     _ = pg;
     _ = mongodb;
     _ = @import("net/client_stream.zig");
+    _ = @import("net/scram.zig");
     _ = session;
     _ = early_data;
     _ = ratelimit;
