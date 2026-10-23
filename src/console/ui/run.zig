@@ -286,6 +286,8 @@ fn fixedNow() i64 {
 }
 
 test "run: a scripted session over pipes quits on /quit" {
+    // The console's terminal side is not on Windows yet (design D15): no pipes, no clock.
+    if (!sys.supported) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const tty_in = try sys.pipe();
     const tty_out = try sys.pipe();
