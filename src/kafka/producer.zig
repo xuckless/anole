@@ -32,6 +32,9 @@ pub const Config = struct {
     buffer_bytes: u32 = 32 * 1024 * 1024,
     compression: compress.Codec = .none,
     delivery_timeout: Duration = .fromSeconds(30),
+    /// How long a record for a topic the cluster does not list yet waits
+    /// for it to appear (auto-create, an admin call still spreading).
+    metadata_wait: Duration = .fromSeconds(5),
     max_request_bytes: u32 = 1024 * 1024,
     request_timeout: Duration = .fromSeconds(30),
 };
@@ -189,8 +192,8 @@ pub const Producer = struct {
     }
 
     /// Queues one record. `slot`, when given, receives the outcome (the
-    /// producer then owns one reference to it). A topic the cluster is
-    /// still creating is waited for, at most `delivery_timeout`.
+    /// producer then owns one reference to it). A topic the cluster does
+    /// not list yet is waited for, at most `metadata_wait`.
     pub fn append(
         self: *Producer,
         topic: []const u8,
@@ -201,7 +204,7 @@ pub const Producer = struct {
         timestamp_ms: i64,
         slot: ?*Slot,
     ) AppendError!void {
-        return self.appendWithin(topic, key, value, headers, explicit_partition, timestamp_ms, slot, self.cfg.delivery_timeout);
+        return self.appendWithin(topic, key, value, headers, explicit_partition, timestamp_ms, slot, self.cfg.metadata_wait);
     }
 
     fn appendWithin(
@@ -288,7 +291,7 @@ pub const Producer = struct {
     ) AppendError!Outcome {
         const slot = try Slot.create(self.gpa);
         const started: Timestamp = .now(self.io, .awake);
-        const wait = if (timeout) |t| (if (t.nanoseconds < self.cfg.delivery_timeout.nanoseconds) t else self.cfg.delivery_timeout) else self.cfg.delivery_timeout;
+        const wait = if (timeout) |t| (if (t.nanoseconds < self.cfg.metadata_wait.nanoseconds) t else self.cfg.metadata_wait) else self.cfg.metadata_wait;
         self.appendWithin(topic, key, value, headers, partition, timestamp_ms, slot, wait) catch |err| {
             slot.release();
             slot.release();

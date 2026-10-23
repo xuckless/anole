@@ -1296,6 +1296,8 @@ forms, `insecure_skip_verify`), `sasl` (`mechanism` `"PLAIN"`,
 `connect_at_start` and `producer` (`acks` `"none"`, `"leader"` or `"all"`,
 `idempotent` (needs `"all"`), `linger_ms`, `batch_bytes`, `buffer_bytes`,
 `compression` `"none"`, `"gzip"`, `"zstd"` or `"lz4"`, `delivery_timeout_ms`,
+`metadata_wait_ms` (default 5000: how long a record for a topic the cluster
+does not list yet waits for it before `UNKNOWN_TOPIC_OR_PARTITION`),
 `max_request_bytes`). `timeout_ms` of the broker bounds `anole_kafka_flush`.
 There is one producer per broker, so records of a key keep their order across
 the calls of every thread. The partitioner is Java's (murmur2 of the key),

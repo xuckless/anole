@@ -469,6 +469,7 @@ pub const Config = struct {
         /// "none", "gzip", "zstd" or "lz4".
         compression: []const u8 = "none",
         delivery_timeout_ms: u32 = 30_000,
+        metadata_wait_ms: u32 = 5_000,
         max_request_bytes: u32 = 1024 * 1024,
     };
 

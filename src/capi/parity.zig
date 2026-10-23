@@ -461,7 +461,7 @@ pub const kafka_options = [_]Entry{
     .{ .zig = "request_timeout", .json = "brokers[].kafka.request_timeout_ms", .kind = .ms },
     .{ .zig = "metadata_max_age", .json = "brokers[].kafka.metadata_max_age_ms", .kind = .ms },
     .{ .zig = "connect_at_start", .json = "brokers[].kafka.connect_at_start" },
-    .{ .zig = "producer", .json = "brokers[].kafka.producer", .kind = .custom, .note = "acks \"none\"|\"leader\"|\"all\", idempotent, linger_ms, batch_bytes, buffer_bytes, compression \"none\"|\"gzip\"|\"zstd\"|\"lz4\", delivery_timeout_ms, max_request_bytes" },
+    .{ .zig = "producer", .json = "brokers[].kafka.producer", .kind = .custom, .note = "acks \"none\"|\"leader\"|\"all\", idempotent, linger_ms, batch_bytes, buffer_bytes, compression \"none\"|\"gzip\"|\"zstd\"|\"lz4\", delivery_timeout_ms, metadata_wait_ms, max_request_bytes" },
     .{ .zig = "errors", .json = "brokers[].errors", .kind = .same },
     .{ .zig = "readiness", .omitted = "always on in the ABI (/readyz includes the broker)" },
     .{ .zig = "environ", .omitted = "the process environment, as the other connectors" },

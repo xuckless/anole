@@ -3280,6 +3280,12 @@
                       "maximum": 4294967295,
                       "default": 30000
                     },
+                    "metadata_wait_ms": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4294967295,
+                      "default": 5000
+                    },
                     "max_request_bytes": {
                       "type": "integer",
                       "minimum": 1024,

@@ -117,6 +117,11 @@ pub const Options = struct {
         compression: enum { none, gzip, zstd, lz4 } = .none,
         /// How long a record is retried before its delivery fails.
         delivery_timeout: Duration = .fromSeconds(30),
+        /// How long a record for a topic the cluster does not list yet
+        /// waits for it to appear (the broker's auto-create, or an admin
+        /// call still spreading), capped by the call's timeout; then
+        /// UNKNOWN_TOPIC_OR_PARTITION.
+        metadata_wait: Duration = .fromSeconds(5),
         max_request_bytes: u32 = 1024 * 1024,
     };
 };
@@ -257,6 +262,7 @@ pub const Client = struct {
                 .lz4 => .lz4,
             },
             .delivery_timeout = p.delivery_timeout,
+            .metadata_wait = p.metadata_wait,
             .max_request_bytes = p.max_request_bytes,
             .request_timeout = options.request_timeout,
         });

@@ -121,9 +121,16 @@ test "fake broker: a topic being auto-created is waited for; one that never appe
     try testing.expectEqual(@as(u32, 0), broker.creating_answers.load(.acquire));
     try testing.expectEqual(@as(i64, 1), broker.count("fresh", @intCast(d.partition)));
 
-    // A topic that never appears fails once the call's timeout has passed.
+    // A topic that never appears fails after metadata_wait, though the
+    // call's own timeout is far longer; then after a shorter call timeout.
     broker.hide_topics.store(true, .release);
-    var o = opts(broker, .{});
+    var o = opts(broker, .{ .metadata_wait = .fromMilliseconds(200) });
+    o.timeout = .fromSeconds(600);
+    const waiting = try kafka.Client.init(gpa, io, o);
+    defer waiting.deinit();
+    try testing.expectError(error.Database, waiting.produce(&c, .{ .topic = "absent", .value = "v" }));
+    try testing.expectEqualStrings("UNKNOWN_TOPIC_OR_PARTITION", db.lastError(&c).?.code);
+    o = opts(broker, .{ .metadata_wait = .fromSeconds(600) });
     o.timeout = .fromMilliseconds(200);
     const short = try kafka.Client.init(gpa, io, o);
     defer short.deinit();

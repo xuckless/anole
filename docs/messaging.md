@@ -175,7 +175,8 @@ start if no broker answers; `/readyz` reports the cluster either way).
 Options (`anole.kafka.Options`): `brokers`, `client_id`, `tls`, `sasl`,
 `timeout`, `connect_timeout`, `request_timeout`, `metadata_max_age`,
 `producer` (`acks`, `idempotent`, `linger`, `batch_bytes`, `buffer_bytes`,
-`compression`, `delivery_timeout`, `max_request_bytes`) and `errors`. The C
+`compression`, `delivery_timeout`, `metadata_wait`, `max_request_bytes`) and
+`errors`. The C
 ABI's `"brokers"` takes the same names with `_ms` on durations (see
 [c-abi.md](c-abi.md#kafka)). `-Dkafka` needs `-Dcompression`, and builds lz4.
 
@@ -247,7 +248,11 @@ Record keys are not put in spans (they can be personal data). Metrics:
 Transactions and exactly-once, the KIP-848 consumer protocol, cooperative-sticky
 assignment, the admin API, OAUTHBEARER and GSSAPI, fetch from followers, and
 producing with snappy (a consumer reads it). A topic is not created on first
-use: create it first (or let the broker's auto-create do it).
+use: create it first (or let the broker's auto-create do it). A record for a
+topic the cluster does not list yet waits for it up to `producer.metadata_wait`
+(5 s; less when the call's timeout is shorter), which covers auto-create and
+an admin call still reaching the broker; then the call fails with
+`UNKNOWN_TOPIC_OR_PARTITION`.
 
 ### Testing
 

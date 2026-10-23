@@ -125,6 +125,10 @@ handlers, JSON Lines logs, OpenAPI documents, project templates and the
   consumer groups with offset commits and a dead letter topic, TLS and SASL
   PLAIN/SCRAM. `send` queues and never waits; `produce` waits for the
   acknowledgement. `app.kafka(.{})` reads `KAFKA_BOOTSTRAP_SERVERS`.
+- A record for a topic the cluster does not list yet (auto-create in
+  progress, Kafka 4.x answers UNKNOWN_TOPIC_OR_PARTITION meanwhile) waits for
+  it up to `producer.metadata_wait` (5 s, capped by the call's timeout; ABI
+  `metadata_wait_ms`) before failing with `UNKNOWN_TOPIC_OR_PARTITION`.
 
 ### OpenAPI and CLI
 

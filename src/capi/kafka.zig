@@ -168,6 +168,7 @@ fn kafkaOptions(e: *Engine, b: *Broker) !anole.kafka.Options {
             .buffer_bytes = p.buffer_bytes,
             .compression = std.meta.stringToEnum(@FieldType(anole.kafka.Options.Producer, "compression"), p.compression).?,
             .delivery_timeout = ms(p.delivery_timeout_ms),
+            .metadata_wait = ms(p.metadata_wait_ms),
             .max_request_bytes = p.max_request_bytes,
         },
         .errors = b.config.errors,
