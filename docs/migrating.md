@@ -6,6 +6,8 @@
 | --- | --- |
 | An exhaustive `switch` on `anole.db.Class` | add the cases `.not_found`, `.precondition` and `.invalid` |
 | An exhaustive `switch` on `anole.db.System` or `anole.resilience.Kind` | add the cases `.s3` and `.smtp` |
+| A C consumer's `switch` over every event type | add `ANOLE_EV_SSE_SUBSCRIBE`, `ANOLE_EV_SSE_CLOSE`, `ANOLE_EV_WATCH_EVENT`, `ANOLE_EV_WATCH_STATUS` and `ANOLE_EV_WATCH_END` (a consumer without `sse` routes or `watches` never gets them); the new handle kinds are `anole_sse` and `anole_watch_sub` |
+| A `Response` held open by `res.adopt` for anything but a streamed 200 | the same: `adopt` serves a streamed 200 (an event stream); `anole.sse` and `app.sse` park such a response without holding a task |
 
 ## 0.2 to 0.3
 
