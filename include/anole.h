@@ -197,6 +197,8 @@ typedef uint64_t anole_wt_stream; /* one of its streams: until anole_handle_rele
 typedef uint64_t anole_db_tx;     /* one database transaction: from the answer to anole_db_begin until commit, rollback or release */
 typedef uint64_t anole_nats_sub;  /* a NATS subscription or JetStream consume: until ANOLE_EV_NATS_SUB_END */
 typedef uint64_t anole_nats_msg;  /* a JetStream message: until acked, nak'd, termed or released */
+typedef uint64_t anole_kafka_group; /* a Kafka group membership: until ANOLE_EV_KAFKA_GROUP_END */
+typedef uint64_t anole_kafka_batch; /* the records of one partition: until done, retried or released */
 typedef struct anole_server anole_server;     /* opaque */
 typedef struct anole_consumer anole_consumer; /* opaque */
 
@@ -452,10 +454,19 @@ enum anole_event_type {
                                     route with "accept": "consumer": answer it with anole_ws_accept,
                                     or refuse it with any answer to a request (anole_req_respond,
                                     anole_req_fail, anole_req_stream_*, anole_req_abort) */
-  ANOLE_EV_DRAINING = 41         /* anole_event, handle 0: anole_server_drain was called; once per
+  ANOLE_EV_DRAINING = 41,        /* anole_event, handle 0: anole_server_drain was called; once per
                                     consumer, before any WebSocket 1001 or abort. Long polls and
                                     event streams finish up while the drain's deadline
                                     (timeouts.shutdown_ms) runs */
+  ANOLE_EV_KAFKA_RECORDS = 80,   /* anole_kafka_records_event; handle: anole_kafka_batch. Owes
+                                    anole_kafka_batch_done, anole_kafka_batch_retry or
+                                    anole_handle_release (= retry now) */
+  ANOLE_EV_KAFKA_DELIVERY = 81,  /* anole_kafka_delivery_event; handle 0 (user_data) */
+  ANOLE_EV_KAFKA_ASSIGN = 82,    /* anole_kafka_assign_event; handle: anole_kafka_group */
+  ANOLE_EV_KAFKA_REVOKE = 83,    /* anole_kafka_assign_event: finish those partitions' batches */
+  ANOLE_EV_KAFKA_WRITABLE = 84,  /* anole_broker_status_event: a produce refused with
+                                    ANOLE_E_AGAIN (or advised with ANOLE_BUSY) would be taken now */
+  ANOLE_EV_KAFKA_GROUP_END = 85  /* anole_broker_end_event; handle: anole_kafka_group, now over */
 };
 
 /* Every event starts with this. Records are 8-byte aligned and `len`
@@ -1530,6 +1541,141 @@ typedef struct anole_broker_status_event {
   uint32_t broker;       /* anole_nats_index */
   uint32_t status;       /* ANOLE_BROKER_WRITABLE */
 } anole_broker_status_event; /* 24 bytes */
+
+/* ---- Kafka -----------------------------------------------------------------
+   The configuration's "brokers" with a "kafka" key. Producing never waits:
+   the record is copied and queued, and what became of it is one
+   ANOLE_EV_KAFKA_DELIVERY. A group member receives one partition's records
+   at a time as ANOLE_EV_KAFKA_RECORDS and answers each batch before the
+   next of that partition comes. */
+
+typedef struct anole_kafka anole_kafka; /* opaque; lives until anole_server_destroy */
+
+/* Looks up a broker by its "name"; ANOLE_E_INVALID when there is none, or it is not a Kafka broker. */
+ANOLE_API anole_status anole_kafka_find(anole_server *s, anole_str name, anole_kafka **out);
+/* The broker's index in the configuration's "brokers": what
+   anole_broker_status_event.broker names. */
+ANOLE_API uint32_t anole_kafka_index(const anole_kafka *k);
+
+typedef struct anole_kafka_out {
+  size_t size;           /* sizeof(anole_kafka_out) */
+  anole_str topic;
+  int32_t partition;     /* -1: by key (murmur2, as Java's producer), sticky without a key */
+  uint32_t flags;        /* ANOLE_KAFKA_F_* */
+  anole_str key;         /* with ANOLE_KAFKA_F_NULL_KEY ignored */
+  const void *value;
+  size_t len;            /* with ANOLE_KAFKA_F_NULL_VALUE: a tombstone */
+  const anole_header *headers;
+  size_t nheaders;
+  int64_t timestamp_ms;  /* 0: now */
+} anole_kafka_out;       /* 88 bytes */
+#define ANOLE_KAFKA_F_NULL_KEY 2u    /* bit 0 stays ANOLE_BODY_BORROW, refused here */
+#define ANOLE_KAFKA_F_NULL_VALUE 4u
+#define ANOLE_KAFKA_F_NO_REPORT 8u   /* no ANOLE_EV_KAFKA_DELIVERY; failures are logged */
+
+/* Queues a record; copied; never blocks. ANOLE_OK; ANOLE_BUSY (taken; past
+   half of producer.buffer_bytes); ANOLE_E_AGAIN (not taken: the buffer is
+   full; ANOLE_EV_KAFKA_WRITABLE follows to `c`); ANOLE_E_INVALID;
+   ANOLE_E_STATE. Unless NO_REPORT, its delivery (or failure) is one
+   ANOLE_EV_KAFKA_DELIVERY to `c` with user_data. Records of one broker are
+   handed to the producer in the order the calls were made. */
+ANOLE_API anole_status anole_kafka_produce(anole_kafka *k, anole_consumer *c, const anole_kafka_out *r,
+                                           uint64_t user_data);
+
+#define ANOLE_KAFKA_START_LATEST 0u
+#define ANOLE_KAFKA_START_EARLIEST 1u
+#define ANOLE_KAFKA_ASSIGN_RANGE 0u
+#define ANOLE_KAFKA_ASSIGN_ROUNDROBIN 1u
+typedef struct anole_kafka_subscribe_options {
+  size_t size;
+  anole_str group;
+  const anole_str *topics;
+  size_t ntopics;
+  anole_str instance_id;         /* static membership; {NULL,0}: none */
+  uint32_t start;                /* ANOLE_KAFKA_START_* */
+  uint32_t assignor;             /* ANOLE_KAFKA_ASSIGN_* */
+  uint32_t max_batch;            /* records per ANOLE_EV_KAFKA_RECORDS, at most; 0: 500 */
+  uint32_t prefetch_bytes;       /* per partition; 0: 1 MiB */
+  uint32_t session_timeout_ms;   /* 0: 45000 */
+  uint32_t rebalance_timeout_ms; /* 0: 300000; also how long a revoked batch may stay out */
+  uint32_t commit_interval_ms;   /* 0: 5000 */
+  uint32_t reserved;
+} anole_kafka_subscribe_options; /* 88 bytes */
+/* Joins `group` (one member). Records come to `c` as ANOLE_EV_KAFKA_RECORDS,
+   one partition per record, in order, at most one batch per partition
+   outstanding; ANOLE_EV_KAFKA_ASSIGN / _REVOKE say what this member has. */
+ANOLE_API anole_status anole_kafka_subscribe(anole_kafka *k, anole_consumer *c,
+                                             const anole_kafka_subscribe_options *opts, uint64_t user_data,
+                                             anole_kafka_group *out);
+/* The batch was processed: its offsets are committed with the next commit.
+   Cleanup-style: ANOLE_OK on one that is over (its partition was revoked
+   and the rebalance timeout passed: its offsets are not committed). */
+ANOLE_API anole_status anole_kafka_batch_done(anole_kafka_batch b);
+/* Deliver the same records again after delay_ms (the partition waits).
+   ANOLE_E_GONE when the batch is over. anole_handle_release = retry with 0. */
+ANOLE_API anole_status anole_kafka_batch_retry(anole_kafka_batch b, uint32_t delay_ms);
+/* Cleanup: leaves the group after committing done batches; outstanding
+   batches go stale; ANOLE_EV_KAFKA_GROUP_END follows. ANOLE_OK on one that is over. */
+ANOLE_API anole_status anole_kafka_group_close(anole_kafka_group g);
+/* Sends what is buffered now; ANOLE_EV_KAFKA_DELIVERY with user_data and
+   topic empty answers when everything queued before is acked or failed. */
+ANOLE_API anole_status anole_kafka_flush(anole_kafka *k, anole_consumer *c, uint64_t user_data);
+
+/* One record of an ANOLE_EV_KAFKA_RECORDS. Its spans and headers_off count
+   from the start of the event's record. */
+#define ANOLE_KAFKA_REC_F_NULL_KEY 1u
+#define ANOLE_KAFKA_REC_F_NULL_VALUE 2u
+typedef struct anole_kafka_record {
+  int64_t offset;
+  int64_t timestamp_ms;
+  anole_span key;
+  anole_span value;
+  uint32_t headers_off;  /* nheaders (name, value) anole_span pairs */
+  uint32_t nheaders;
+  uint32_t flags;        /* ANOLE_KAFKA_REC_F_* */
+  uint32_t reserved;
+} anole_kafka_record;    /* 48 bytes */
+typedef struct anole_kafka_records_event {
+  anole_event ev;        /* the anole_kafka_batch */
+  uint64_t user_data;    /* the subscribe call's */
+  uint64_t group;        /* the anole_kafka_group */
+  anole_span topic;
+  int32_t partition;
+  uint32_t nrecords;
+  uint32_t records_off;  /* nrecords anole_kafka_record */
+  uint32_t reserved;
+  int64_t high_watermark;
+} anole_kafka_records_event; /* 64 bytes */
+
+/* ANOLE_EV_KAFKA_DELIVERY. */
+typedef struct anole_kafka_delivery_event {
+  anole_event ev;        /* handle 0 */
+  uint64_t user_data;
+  int32_t status;        /* ANOLE_OK; ANOLE_E_BROKER; ANOLE_E_TIMEOUT (delivery_timeout) */
+  uint16_t http_status;  /* what Anole's handlers would answer: 503, 504, 500; 0 on success */
+  uint8_t error_class;   /* ANOLE_DB_ERR_* */
+  uint8_t reserved;
+  int32_t partition;
+  uint32_t reserved2;
+  int64_t offset;        /* -1 when the broker was not asked to acknowledge (acks none) */
+  int64_t timestamp_ms;
+  anole_span topic;      /* empty for the answer to anole_kafka_flush */
+  anole_span error;      /* for logs */
+  anole_span error_code; /* the Kafka error name: "MESSAGE_TOO_LARGE" */
+} anole_kafka_delivery_event; /* 80 bytes */
+
+typedef struct anole_kafka_partition {
+  anole_span topic;
+  int32_t partition;
+  uint32_t reserved;
+} anole_kafka_partition; /* 16 bytes */
+/* ANOLE_EV_KAFKA_ASSIGN and ANOLE_EV_KAFKA_REVOKE. */
+typedef struct anole_kafka_assign_event {
+  anole_event ev;        /* the anole_kafka_group */
+  uint64_t user_data;
+  uint32_t entries_off;  /* nentries anole_kafka_partition */
+  uint32_t nentries;
+} anole_kafka_assign_event; /* 32 bytes */
 
 #ifdef __cplusplus
 }

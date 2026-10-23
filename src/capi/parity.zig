@@ -441,3 +441,21 @@ pub const mongodb_options = dbCommon("mongodb") ++ resilience_entries ++ [_]Entr
     .{ .zig = "connect_at_start", .json = "databases[].mongodb.connect_at_start" },
     .{ .zig = "ping_timeout", .json = "databases[].mongodb.ping_timeout_ms", .kind = .ms },
 };
+
+/// `anole.kafka.Options` against `brokers[].kafka`.
+pub const kafka_options = [_]Entry{
+    .{ .zig = "brokers", .json = "brokers[].kafka.brokers" },
+    .{ .zig = "client_id", .json = "brokers[].kafka.client_id" },
+    .{ .zig = "label", .json = "brokers[].name", .kind = .custom, .note = "the broker's name" },
+    .{ .zig = "tls", .json = "brokers[].kafka.tls", .kind = .custom, .note = "tls: true, or any of ca_file or ca_pem; client_cert_file + client_key_file or client_cert_pem + client_key_pem; insecure_skip_verify" },
+    .{ .zig = "sasl", .json = "brokers[].kafka.sasl", .kind = .custom, .note = "an object: mechanism \"PLAIN\", \"SCRAM-SHA-256\" or \"SCRAM-SHA-512\", username, password" },
+    .{ .zig = "timeout", .json = "brokers[].timeout_ms", .kind = .ms, .note = "0 is none; bounds the flush" },
+    .{ .zig = "connect_timeout", .json = "brokers[].kafka.connect_timeout_ms", .kind = .ms },
+    .{ .zig = "request_timeout", .json = "brokers[].kafka.request_timeout_ms", .kind = .ms },
+    .{ .zig = "metadata_max_age", .json = "brokers[].kafka.metadata_max_age_ms", .kind = .ms },
+    .{ .zig = "connect_at_start", .json = "brokers[].kafka.connect_at_start" },
+    .{ .zig = "producer", .json = "brokers[].kafka.producer", .kind = .custom, .note = "acks \"none\"|\"leader\"|\"all\", idempotent, linger_ms, batch_bytes, buffer_bytes, compression \"none\"|\"gzip\"|\"zstd\"|\"lz4\", delivery_timeout_ms, max_request_bytes" },
+    .{ .zig = "errors", .json = "brokers[].errors", .kind = .same },
+    .{ .zig = "readiness", .omitted = "always on in the ABI (/readyz includes the broker)" },
+    .{ .zig = "environ", .omitted = "the process environment, as the other connectors" },
+};

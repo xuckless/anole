@@ -2548,7 +2548,7 @@
       "properties": {
         "name": {
           "type": "string",
-          "description": "What anole_nats_find looks it up by: unique, 1-255 bytes."
+          "description": "What anole_nats_find and anole_kafka_find look it up by: unique, 1-255 bytes."
         },
         "nats": {
           "anyOf": [
@@ -3025,6 +3025,223 @@
             }
           ],
           "description": "A NATS server or cluster (exactly one of the kind keys)."
+        },
+        "kafka": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "brokers": {
+                  "anyOf": [
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "minItems": 1
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "host:port entries. Null: KAFKA_BOOTSTRAP_SERVERS, else KAFKA_URL, else localhost:9092."
+                },
+                "client_id": {
+                  "type": "string",
+                  "default": "anole"
+                },
+                "tls": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "TLS to the brokers; any ca or client certificate key turns it on too."
+                },
+                "ca_file": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ca_pem": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "client_cert_file": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "client_key_file": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "client_cert_pem": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "client_key_pem": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "insecure_skip_verify": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "sasl": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "mechanism",
+                        "username",
+                        "password"
+                      ],
+                      "properties": {
+                        "mechanism": {
+                          "type": "string",
+                          "enum": [
+                            "PLAIN",
+                            "SCRAM-SHA-256",
+                            "SCRAM-SHA-512"
+                          ]
+                        },
+                        "username": {
+                          "type": "string"
+                        },
+                        "password": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "connect_timeout_ms": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4294967295,
+                  "default": 10000
+                },
+                "request_timeout_ms": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4294967295,
+                  "default": 30000
+                },
+                "metadata_max_age_ms": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4294967295,
+                  "default": 300000
+                },
+                "connect_at_start": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "producer": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "acks": {
+                      "type": "string",
+                      "enum": [
+                        "none",
+                        "leader",
+                        "all"
+                      ],
+                      "default": "all"
+                    },
+                    "idempotent": {
+                      "type": "boolean",
+                      "default": true,
+                      "description": "Needs acks \"all\"."
+                    },
+                    "linger_ms": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 4294967295,
+                      "default": 5
+                    },
+                    "batch_bytes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4294967295,
+                      "default": 16384
+                    },
+                    "buffer_bytes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4294967295,
+                      "default": 33554432
+                    },
+                    "compression": {
+                      "type": "string",
+                      "enum": [
+                        "none",
+                        "gzip",
+                        "zstd",
+                        "lz4"
+                      ],
+                      "default": "none"
+                    },
+                    "delivery_timeout_ms": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4294967295,
+                      "default": 30000
+                    },
+                    "max_request_bytes": {
+                      "type": "integer",
+                      "minimum": 1024,
+                      "maximum": 4294967295,
+                      "default": 1048576
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        ,
+          "description": "A Kafka cluster (exactly one of the kind keys)."
         },
         "timeout_ms": {
           "type": "integer",

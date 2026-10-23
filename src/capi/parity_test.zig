@@ -72,6 +72,10 @@ test "capi config: every connector option is in the schema or listed" {
         comptime parity.checkCoverage(anole.nats.Options, &parity.nats_options);
         try parity.checkSchemaAndDefaults(anole.nats.Options, config.Config, &parity.nats_options, root);
     }
+    if (comptime features.kafka) {
+        comptime parity.checkCoverage(anole.kafka.Options, &parity.kafka_options);
+        try parity.checkSchemaAndDefaults(anole.kafka.Options, config.Config, &parity.kafka_options, root);
+    }
 }
 
 test "capi config: mongodb max_connections 0 is E_CONFIG; sqlite statement_cache is an unknown key" {
@@ -104,8 +108,25 @@ test "capi config: brokers parse with the defaults, and bad combinations are E_C
         try std.testing.expectEqual(@as(usize, 1), cfg.brokers[0].nats.?.jetstream.streams.len);
         try std.testing.expectEqualStrings("limits", cfg.brokers[0].nats.?.jetstream.streams[0].retention);
     }
+    if (comptime features.kafka) {
+        const cfg = try config.parse(arena.allocator(),
+            \\{"brokers":[{"name":"log","kafka":{"brokers":["k1:9092"],"sasl":{"mechanism":"SCRAM-SHA-512","username":"u","password":"p"},"producer":{"compression":"lz4"}}}]}
+        , &why);
+        try std.testing.expectEqual(@as(usize, 1), cfg.brokers.len);
+        try std.testing.expectEqualStrings("anole", cfg.brokers[0].kafka.?.client_id);
+        try std.testing.expectEqualStrings("all", cfg.brokers[0].kafka.?.producer.acks);
+        try std.testing.expectEqualStrings("lz4", cfg.brokers[0].kafka.?.producer.compression);
+    }
     for ([_][]const u8{
         \\{"brokers":[{"name":"e"}]}
+        ,
+        \\{"brokers":[{"name":"e","nats":{},"kafka":{}}]}
+        ,
+        \\{"brokers":[{"name":"e","kafka":{"sasl":{"mechanism":"NTLM","username":"u","password":"p"}}}]}
+        ,
+        \\{"brokers":[{"name":"e","kafka":{"producer":{"acks":"leader"}}}]}
+        ,
+        \\{"brokers":[{"name":"e","kafka":{"ca_file":"a","ca_pem":"b"}}]}
         ,
         \\{"brokers":[{"name":"e","nats":{"token":"a","user":"u","password":"p"}}]}
         ,
