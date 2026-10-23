@@ -353,6 +353,20 @@ pub const AppOptions = struct {
     imports: []const std.Build.Module.Import = &.{},
     /// Add `zig build run` (arguments after `--` go to the program).
     run_step: bool = true,
+    /// `zig build openapi` (writes the file) and `zig build openapi-check`
+    /// (fails when it differs from the app's routes); null: neither step.
+    /// Both run the app's executable with `ANOLE_OPENAPI_OUT` /
+    /// `ANOLE_OPENAPI_CHECK` set: `run()` writes or compares the document
+    /// right after the routes exist and returns before anything binds, so a
+    /// project needs no test file or code split. Code before `listen` still
+    /// runs: keep secrets in `.env` and connect lazily (the default).
+    openapi: ?OpenApiBuild = .{},
+};
+
+/// `AppOptions.openapi`.
+pub const OpenApiBuild = struct {
+    /// Relative to build.zig.
+    file: []const u8 = "openapi.json",
 };
 
 /// What `addApp` made.
@@ -409,6 +423,20 @@ pub fn addApp(b: *std.Build, options: AppOptions) App {
         run.step.dependOn(b.getInstallStep());
         run.addPassthruArgs();
         b.step("run", b.fmt("Run {s}", .{options.name})).dependOn(&run.step);
+    }
+    if (options.openapi) |oa| {
+        // The run steps' working directory is the project, so the name is relative to it.
+        const file = oa.file;
+        const write = b.addRunArtifact(exe);
+        write.setCwd(b.path("."));
+        write.has_side_effects = true;
+        write.setEnvironmentVariable("ANOLE_OPENAPI_OUT", file);
+        b.step("openapi", b.fmt("Write {s} from the app's routes (runs the app up to listen; nothing binds)", .{oa.file})).dependOn(&write.step);
+        const check = b.addRunArtifact(exe);
+        check.setCwd(b.path("."));
+        check.has_side_effects = true;
+        check.setEnvironmentVariable("ANOLE_OPENAPI_CHECK", file);
+        b.step("openapi-check", b.fmt("Check that {s} matches the app's routes", .{oa.file})).dependOn(&check.step);
     }
     return .{ .exe = exe, .anole = anole_dep };
 }

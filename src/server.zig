@@ -2182,16 +2182,18 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const a = self.arena.allocator();
             const chain = self.chainDocs(target);
             inline for (0..ops.len) |i| {
-                if (ops[i].kind == .transcoded and !opts.transcode) continue;
-                const op: *const openapi_mod.operation.Operation = comptime &ops[i].op;
-                self.extras.doc_entries.append(a, .{
-                    .verb = ops[i].verb,
-                    .path = ops[i].path,
-                    .op = op,
-                    .middleware = chain,
-                    .annotated = ops[i].annotated,
-                    .tag_doc = comptime openapi_mod.proto.serviceDoc(Svc),
-                }) catch @panic("OOM");
+                const wanted = ops[i].kind != .transcoded or opts.transcode;
+                if (wanted) {
+                    const op: *const openapi_mod.operation.Operation = comptime &ops[i].op;
+                    self.extras.doc_entries.append(a, .{
+                        .verb = ops[i].verb,
+                        .path = ops[i].path,
+                        .op = op,
+                        .middleware = chain,
+                        .annotated = ops[i].annotated,
+                        .tag_doc = comptime openapi_mod.proto.serviceDoc(Svc),
+                    }) catch @panic("OOM");
+                }
             }
         }
 

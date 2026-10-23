@@ -31,7 +31,7 @@ pub fn environment() Environment {
         return .production;
     }
     if (builtin.is_test) return .production;
-    return if (builtin.mode == .Debug) .development else .production;
+    return if (builtin.mode == .debug) .development else .production;
 }
 
 const development_files = [_][]const u8{ ".env.development.local", ".env.local", ".env.development", ".env" };
