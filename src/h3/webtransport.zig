@@ -2083,3 +2083,135 @@ test "WebTransport error codes map onto HTTP/3's and back, skipping the reserved
     try std.testing.expectEqual(@as(?u32, null), fromHttp3Error(0x100));
     try std.testing.expectEqual(@as(?u32, null), fromHttp3Error(error_session_gone));
 }
+
+test "Sched: the most urgent class goes first, a class takes turns, the ready mask stays consistent" {
+    var q: Sched = .{};
+    var a: std.DoublyLinkedList.Node = .{};
+    var b: std.DoublyLinkedList.Node = .{};
+    var c3: std.DoublyLinkedList.Node = .{};
+    try std.testing.expect(q.firstNode() == null);
+    try std.testing.expectEqual(@as(?u3, null), q.mostUrgent());
+    q.push(&a, 3);
+    q.push(&b, 3);
+    q.push(&c3, 1);
+    try std.testing.expect(q.firstNode().? == &c3);
+    try std.testing.expectEqual(@as(?u3, 1), q.mostUrgent());
+    try std.testing.expectEqual(@as(u8, 0b1010), q.ready);
+    // Round-robin within class 3 once class 1 is empty.
+    q.remove(&c3, 1);
+    try std.testing.expectEqual(@as(u8, 0b1000), q.ready);
+    try std.testing.expect(q.firstNode().? == &a);
+    q.remove(&a, 3);
+    q.push(&a, 3);
+    try std.testing.expect(q.firstNode().? == &b);
+    // Removing the last of a class clears its bit; re-pushing sets it.
+    q.remove(&b, 3);
+    q.remove(&a, 3);
+    try std.testing.expectEqual(@as(u8, 0), q.ready);
+    q.push(&a, 7);
+    try std.testing.expectEqual(@as(u8, 0b10000000), q.ready);
+    q.remove(&a, 7);
+    try std.testing.expect(q.firstNode() == null);
+}
+
+fn makeCapsule(buf: []u8, kind: u64, payload: []const u8) []const u8 {
+    var n = putVarint(buf, kind);
+    n += putVarint(buf[n..], payload.len);
+    @memcpy(buf[n..][0..payload.len], payload);
+    return buf[0 .. n + payload.len];
+}
+
+/// Feeds `bytes` in pieces of `step` and records what the parser said.
+fn parseAll(bytes: []const u8, step: usize, out: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
+    var p: CapsuleParser = .{};
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const piece = bytes[i..@min(bytes.len, i + step)];
+        i += piece.len;
+        var rest = piece;
+        while (rest.len > 0) {
+            const fed = p.feed(rest);
+            rest = rest[fed.used..];
+            const event = fed.event orelse continue;
+            switch (event) {
+                .close => |cl| {
+                    try out.print(gpa, "C{d}:{s};", .{ cl.code, cl.reason });
+                },
+                .drain => try out.appendSlice(gpa, "D;"),
+                .malformed => try out.appendSlice(gpa, "M;"),
+            }
+        }
+    }
+}
+
+test "CapsuleParser: a close split at every byte, a drain, an unknown capsule skipped, an over-long close malformed" {
+    const gpa = std.testing.allocator;
+    var buf: [2048]u8 = undefined;
+    var close_payload: [4 + 5]u8 = undefined;
+    std.mem.writeInt(u32, close_payload[0..4], 42, .big);
+    @memcpy(close_payload[4..], "bye!!");
+    const close = makeCapsule(&buf, capsule_close, &close_payload);
+    var whole: std.ArrayList(u8) = .empty;
+    defer whole.deinit(gpa);
+    try parseAll(close, close.len, &whole, gpa);
+    try std.testing.expectEqualStrings("C42:bye!!;", whole.items);
+    for (1..close.len + 1) |step| {
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(gpa);
+        try parseAll(close, step, &got, gpa);
+        try std.testing.expectEqualStrings(whole.items, got.items);
+    }
+
+    // Unknown (with a payload, and without), then a drain, then a close.
+    var seq: std.ArrayList(u8) = .empty;
+    defer seq.deinit(gpa);
+    var tmp: [64]u8 = undefined;
+    try seq.appendSlice(gpa, makeCapsule(&tmp, 0x1234, "xyz"));
+    try seq.appendSlice(gpa, makeCapsule(&tmp, 0x99, ""));
+    try seq.appendSlice(gpa, makeCapsule(&tmp, capsule_drain, ""));
+    try seq.appendSlice(gpa, close);
+    for ([_]usize{ 1, 2, 3, 7, seq.items.len }) |step| {
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(gpa);
+        try parseAll(seq.items, step, &got, gpa);
+        try std.testing.expectEqualStrings("D;C42:bye!!;", got.items);
+    }
+
+    // A close longer than 4 + 1024 is malformed, and the parser stops.
+    var big: [4 + max_close_message + 1]u8 = @splat(0);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const over = try gpa.alloc(u8, 16 + big.len);
+    defer gpa.free(over);
+    try parseAll(makeCapsule(over, capsule_close, &big), 5, &out, gpa);
+    try std.testing.expectEqualStrings("M;", out.items);
+    // A close shorter than its code too.
+    out.clearRetainingCapacity();
+    try parseAll(makeCapsule(&tmp, capsule_close, "ab"), 1, &out, gpa);
+    try std.testing.expectEqualStrings("M;", out.items);
+}
+
+test "fuzz: WebTransport capsules" {
+    var tmp: [64]u8 = undefined;
+    var close_payload: [4 + 3]u8 = undefined;
+    std.mem.writeInt(u32, close_payload[0..4], 7, .big);
+    @memcpy(close_payload[4..], "end");
+    try @import("../fuzz.zig").bytes(struct {
+        fn check(input: []const u8) anyerror!void {
+            const gpa = std.testing.allocator;
+            var whole: std.ArrayList(u8) = .empty;
+            defer whole.deinit(gpa);
+            try parseAll(input, input.len + 1, &whole, gpa);
+            // Fed a byte at a time, it says the same.
+            var bytewise: std.ArrayList(u8) = .empty;
+            defer bytewise.deinit(gpa);
+            try parseAll(input, 1, &bytewise, gpa);
+            try std.testing.expectEqualStrings(whole.items, bytewise.items);
+        }
+    }.check, &.{
+        makeCapsule(&tmp, capsule_close, &close_payload),
+        makeCapsule(&tmp, capsule_drain, ""),
+        makeCapsule(&tmp, 0x1234, "skip me"),
+        &.{ 0xc0, 0, 0, 0, 0, 0, 0, 0x28, 0x43 },
+    });
+}
