@@ -60,6 +60,11 @@ const Duration = std.Io.Duration;
 pub const Header = records.Header;
 pub const Msg = consumer_mod.Msg;
 pub const ConsumeOptions = consumer_mod.ConsumeOptions;
+/// The engine room, for the C ABI (src/capi/kafka.zig).
+pub const impl = struct {
+    pub const producer = producer_mod;
+    pub const consumer = consumer_mod;
+};
 pub const Assignor = consumer_mod.Assignor;
 
 /// What every call fails with, besides what the call says: `anole.db.Error`
@@ -524,6 +529,19 @@ pub const Client = struct {
         defer self.consumers_mutex.unlock(self.io);
         try self.consumers.append(self.gpa, c);
         if (self.started) try c.start();
+    }
+
+    /// `consume` for callers that bring their own function pointers (the C
+    /// ABI): the consumer joins once serving starts (at once when it
+    /// already has). It lives, stopped or not, until the client is freed.
+    pub fn consumeRaw(self: *Client, opts: ConsumeOptions, handler: consumer_mod.HandlerFn, context: ?*anyopaque) !*consumer_mod.Consumer {
+        const c = try consumer_mod.Consumer.create(self.host(), opts, handler, context);
+        errdefer c.destroy();
+        self.consumers_mutex.lockUncancelable(self.io);
+        defer self.consumers_mutex.unlock(self.io);
+        try self.consumers.append(self.gpa, c);
+        if (self.started) try c.start();
+        return c;
     }
 
     fn appOf(server: anytype) *anyopaque {

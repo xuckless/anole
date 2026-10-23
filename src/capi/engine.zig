@@ -73,6 +73,7 @@ pub const wt = if (features.http3) @import("wt.zig") else struct {
 pub const pipe = pipe_mod;
 pub const db = @import("db.zig");
 pub const nats = @import("nats.zig");
+pub const kafka = @import("kafka.zig");
 pub const config = config_mod;
 
 const log = std.log.scoped(.anole_capi);
@@ -451,6 +452,7 @@ pub const Exec = struct {
     wt: wt.ExecState = .{},
     db: db.ExecState = .{},
     nats: nats.ExecState = .{},
+    kafka: kafka.ExecState = .{},
 
     /// The capi task is asleep for a whole request timeout: wakes it, as a
     /// deadline (or a lost doorbell) now needs watching.
@@ -1004,6 +1006,9 @@ pub const Engine = struct {
     /// The configuration's brokers (`anole_nats *`), and their handles.
     brokers: []nats.Broker = &.{},
     nats_state: nats.State = .{},
+    /// The Kafka ones (`anole_kafka *`), and their handles.
+    kafka_brokers: []kafka.Broker = &.{},
+    kafka_state: kafka.State = .{},
     /// WebSocket topics, shared by every executor.
     rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) .init(gpa, .{}) else {},
     /// gRPC services, methods, descriptors and health.
@@ -1042,6 +1047,15 @@ pub const Engine = struct {
         e.brokers = try a.alloc(nats.Broker, cfg.brokers.len);
         for (e.brokers, cfg.brokers, 0..) |*b, bc, i| b.* = .{ .engine = e, .config = bc, .index = @intCast(i) };
         e.nats_state.init(e.first_gen);
+        var nkafka: usize = 0;
+        for (cfg.brokers) |bc| nkafka += @intFromBool(bc.kafka != null);
+        e.kafka_brokers = try a.alloc(kafka.Broker, nkafka);
+        var ki: usize = 0;
+        for (cfg.brokers, 0..) |bc, i| if (bc.kafka != null) {
+            e.kafka_brokers[ki] = .{ .engine = e, .config = bc, .index = @intCast(i) };
+            ki += 1;
+        };
+        e.kafka_state.init(e.first_gen);
         // The modes (docs/config.md): resolved once, here, so a binding sees
         // $PORT and the filled addresses before it starts.
         var opts = try e.serverOptions(a);
@@ -1165,6 +1179,7 @@ pub const Engine = struct {
         }
         db.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         nats.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
+        kafka.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         for (e.execs, 0..) |*x, i| placement.concurrent(&e.tasks, app.io(), .{ .executor = i }, capiTask, .{ e, x }) catch |err| {
             e.tasks.cancel(app.io());
             return e.failStartDeinit(&app, err);
@@ -1176,6 +1191,7 @@ pub const Engine = struct {
             e.tasks.cancel(app.io());
             db.close(e);
             nats.close(e);
+            kafka.close(e);
             return e.failStartDeinit(&app, err);
         };
         e.phase.store(.open, .release);
@@ -1188,6 +1204,7 @@ pub const Engine = struct {
                 e.tasks.cancel(app.io());
                 db.close(e);
                 nats.close(e);
+                kafka.close(e);
                 return e.failStartDeinit(&app, err);
             };
             // Control calls may reach the server from here until `run` returns.
@@ -1201,8 +1218,10 @@ pub const Engine = struct {
         if (comptime features.websocket) for (e.execs) |*x| x.ws.cancel(app.io());
         for (e.execs) |*x| x.db.cancel(app.io());
         for (e.execs) |*x| x.nats.cancel(app.io());
+        for (e.execs) |*x| x.kafka.cancel(app.io());
         db.close(e);
         nats.close(e);
+        kafka.close(e);
         if (result) |_| {} else |err| {
             if (!e.started.isSet()) {
                 e.noteFailedListener(app.failedListenerIndex(), err);
@@ -1585,7 +1604,10 @@ pub const Engine = struct {
         defer e.leave();
         // The first drain call tells every consumer (once each), before the
         // server starts closing sockets and cutting requests.
-        if (e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire) == null) e.notifyDraining();
+        if (e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire) == null) {
+            e.notifyDraining();
+            kafka.draining(e);
+        }
         app.stop();
     }
 
@@ -1653,6 +1675,7 @@ pub const Engine = struct {
             last = @max(last, x.ws.maxGen(), x.wt.maxGen(), x.db.maxGen());
         }
         last = @max(last, e.nats_state.maxGen());
+        last = @max(last, e.kafka_state.maxGen());
         next_first_gen = nextGen(last);
         if (global == e) global = null;
         for (e.execs) |*x| {
@@ -1681,8 +1704,11 @@ pub const Engine = struct {
             x.wt.deinit();
             x.db.deinit();
             x.nats.deinit();
+            x.kafka.deinit();
         }
         e.nats_state.deinit();
+        kafka.destroy(e);
+        e.kafka_state.deinit();
         gpa.free(e.execs);
         if (comptime features.grpc) grpc.deinit(e);
         for (e.consumers.items) |c| {
@@ -3215,10 +3241,14 @@ pub fn handleRelease(e: *Engine, hv: u64) AnswerError!void {
         // A NATS subscription or JetStream consume ends; a JetStream message
         // is NAK'd (cleanup calls).
         .broker_sub => {
-            nats.unsubscribe(e, hv);
+            if (kafka.isKafka(hv)) kafka.groupClose(e, hv) else nats.unsubscribe(e, hv);
             return error.Over;
         },
         .broker_msg => {
+            if (kafka.isKafka(hv)) {
+                kafka.batchRetry(e, hv, 0) catch return error.Over;
+                return;
+            }
             nats.ack(e, hv, abi.NATS_NAK, 0) catch return error.Over;
             return;
         },

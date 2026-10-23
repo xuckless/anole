@@ -51,16 +51,16 @@ pub const Broker = struct {
 
 /// Consumers whose publish was refused or advised against: told when the
 /// queue has room.
-const Wants = struct {
+pub const Wants = struct {
     lock: std.atomic.Mutex = .unlocked,
     list: [32]?*Consumer = @splat(null),
     running: std.atomic.Value(bool) = .init(false),
 
-    fn acquire(w: *Wants) void {
+    pub fn acquire(w: *Wants) void {
         while (!w.lock.tryLock()) std.atomic.spinLoopHint();
     }
 
-    fn add(w: *Wants, c: *Consumer) bool {
+    pub fn add(w: *Wants, c: *Consumer) bool {
         w.acquire();
         defer w.lock.unlock();
         for (w.list) |e| if (e == c) return true;
@@ -71,14 +71,14 @@ const Wants = struct {
         return false;
     }
 
-    fn any(w: *Wants) bool {
+    pub fn any(w: *Wants) bool {
         w.acquire();
         defer w.lock.unlock();
         for (w.list) |e| if (e != null) return true;
         return false;
     }
 
-    fn take(w: *Wants, out: *[32]?*Consumer) void {
+    pub fn take(w: *Wants, out: *[32]?*Consumer) void {
         w.acquire();
         defer w.lock.unlock();
         out.* = w.list;
@@ -89,7 +89,7 @@ const Wants = struct {
 // ---------------------------------------------------------------------------
 // Handles
 
-fn Table(comptime T: type) type {
+pub fn Table(comptime T: type) type {
     return struct {
         const Self = @This();
         pub const Entry = struct { gen: u32, live: bool = false, value: T = undefined };
@@ -108,35 +108,36 @@ fn Table(comptime T: type) type {
         }
 
         /// Under the lock.
-        fn alloc(t: *Self, value: T) !struct { index: u32, gen: u32 } {
+        pub fn alloc(t: *Self, value: T) !struct { index: u32, gen: u32 } {
             if (t.free.pop()) |i| {
                 const e = &t.entries.items[i];
                 e.live = true;
                 e.value = value;
                 return .{ .index = i, .gen = e.gen };
             }
-            if (t.entries.items.len >= (1 << 24)) return error.TooMany;
+            // Bit 23 of a slot marks a Kafka handle (src/capi/kafka.zig).
+            if (t.entries.items.len >= (1 << 23)) return error.TooMany;
             try t.entries.append(gpa, .{ .gen = @max(1, t.first_gen), .live = true, .value = value });
             const i: u32 = @intCast(t.entries.items.len - 1);
             return .{ .index = i, .gen = t.entries.items[i].gen };
         }
 
         /// Under the lock: the live entry the handle names, or null.
-        fn get(t: *Self, h: Handle) ?*Entry {
+        pub fn get(t: *Self, h: Handle) ?*Entry {
             if (h.slot >= t.entries.items.len) return null;
             const e = &t.entries.items[h.slot];
             return if (e.live and e.gen == h.gen) e else null;
         }
 
         /// Under the lock.
-        fn drop(t: *Self, index: u32) void {
+        pub fn drop(t: *Self, index: u32) void {
             const e = &t.entries.items[index];
             e.live = false;
             e.gen = engine.nextGen(e.gen);
             t.free.append(gpa, index) catch {};
         }
 
-        fn maxGen(t: *Self) u32 {
+        pub fn maxGen(t: *Self) u32 {
             t.acquire();
             defer t.release();
             var max: u32 = 0;
@@ -144,7 +145,7 @@ fn Table(comptime T: type) type {
             return max;
         }
 
-        fn deinit(t: *Self) void {
+        pub fn deinit(t: *Self) void {
             t.entries.deinit(gpa);
             t.free.deinit(gpa);
         }
@@ -183,7 +184,7 @@ pub const ExecState = struct {
     pub fn deinit(_: *ExecState) void {}
 };
 
-fn handleOf(kind: Handle.Kind, index: u32, gen: u32, exec: u8) u64 {
+pub fn handleOf(kind: Handle.Kind, index: u32, gen: u32, exec: u8) u64 {
     return Handle.encode(.{ .gen = @intCast(gen), .kind = kind, .slot = @intCast(index), .exec = exec });
 }
 
@@ -194,6 +195,7 @@ fn handleOf(kind: Handle.Kind, index: u32, gen: u32, exec: u8) u64 {
 /// before the listeners open). They connect when serving starts.
 pub fn open(e: *Engine, app: *anole.App) !void {
     for (e.brokers) |*b| {
+        if (b.config.nats == null) continue;
         if (comptime !features.nats) unreachable;
         b.client = try app.nats(try natsOptions(e, b));
         b.open.store(true, .release);
@@ -242,7 +244,7 @@ pub fn close(e: *Engine) void {
 }
 
 pub fn find(e: *Engine, name: []const u8) ?*Broker {
-    for (e.brokers) |*b| if (std.mem.eql(u8, b.config.name, name)) return b;
+    for (e.brokers) |*b| if (b.config.nats != null and std.mem.eql(u8, b.config.name, name)) return b;
     return null;
 }
 

@@ -1026,6 +1026,94 @@ export fn anole_nats_ack(m: u64, kind: u32, delay_ms: u32) i32 {
     return abi.OK;
 }
 
+// ---- Kafka --------------------------------------------------------------------------
+
+const kafka_mod = engine.kafka;
+
+fn kafkaOf(k: ?*const anyopaque) ?*kafka_mod.Broker {
+    const b: *kafka_mod.Broker = @ptrCast(@alignCast(@constCast(k orelse return null)));
+    return if (engine.global == b.engine) b else null;
+}
+
+fn kafkaFailure(err: kafka_mod.CallError) i32 {
+    return switch (err) {
+        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a topic, partition, flag, size, group or topic list, or a consumer of another server)", .{}),
+        error.State => named(abi.E_STATE, "State", 0, "the server is not open, the broker is not connected, or no executor feeds this consumer", .{}),
+        error.Again => failCode(abi.E_AGAIN),
+        error.OutOfMemory => failCode(abi.E_NOMEM),
+        error.Unsupported => failCode(abi.E_UNSUPPORTED),
+        error.Gone => blk: {
+            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
+            break :blk named(abi.E_GONE, "Gone", 0, "the batch it served is over", .{});
+        },
+    };
+}
+
+export fn anole_kafka_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    const b = kafka_mod.find(e, name.slice()) orelse {
+        return named(abi.E_INVALID, "Invalid", 0, "no Kafka broker \"{s}\" in the configuration", .{name.slice()});
+    };
+    dst.* = b;
+    return abi.OK;
+}
+
+export fn anole_kafka_index(k: ?*const anyopaque) u32 {
+    const b = kafkaOf(k) orelse return 0;
+    return b.index;
+}
+
+export fn anole_kafka_produce(k: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi.KafkaOut, user_data: u64) i32 {
+    clearError();
+    const b = kafkaOf(k) orelse return badPointer(k);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    const out: abi.KafkaOut = readSized(abi.KafkaOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
+    const busy = kafka_mod.produce(b, c, out, user_data) catch |err| return kafkaFailure(err);
+    return if (busy) abi.BUSY else abi.OK;
+}
+
+export fn anole_kafka_subscribe(k: ?*anyopaque, c_: ?*anyopaque, opts: ?*const abi.KafkaSubscribeOptions, user_data: u64, out: ?*u64) i32 {
+    clearError();
+    const b = kafkaOf(k) orelse return badPointer(k);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    const o: abi.KafkaSubscribeOptions = readSized(abi.KafkaSubscribeOptions, opts orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
+    dst.* = kafka_mod.subscribe(b, c, o, user_data) catch |err| return kafkaFailure(err);
+    return abi.OK;
+}
+
+export fn anole_kafka_batch_done(b: u64) i32 {
+    if (badKind(b, .broker_msg) or !kafka_mod.isKafka(b)) return wrongKind();
+    const e = live() orelse return abi.OK;
+    kafka_mod.batchDone(e, b);
+    return abi.OK;
+}
+
+export fn anole_kafka_batch_retry(b: u64, delay_ms: u32) i32 {
+    clearError();
+    if (badKind(b, .broker_msg) or !kafka_mod.isKafka(b)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    kafka_mod.batchRetry(e, b, delay_ms) catch |err| return kafkaFailure(err);
+    return abi.OK;
+}
+
+export fn anole_kafka_group_close(g: u64) i32 {
+    if (badKind(g, .broker_sub) or !kafka_mod.isKafka(g)) return wrongKind();
+    const e = live() orelse return abi.OK;
+    kafka_mod.groupClose(e, g);
+    return abi.OK;
+}
+
+export fn anole_kafka_flush(k: ?*anyopaque, c_: ?*anyopaque, user_data: u64) i32 {
+    clearError();
+    const b = kafkaOf(k) orelse return badPointer(k);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    kafka_mod.flush(b, c, user_data) catch |err| return kafkaFailure(err);
+    return abi.OK;
+}
+
 // ---- databases ---------------------------------------------------------------------
 
 const db_mod = engine.db;

@@ -342,13 +342,9 @@ pub const Config = struct {
     pub const Broker = struct {
         /// What `anole_nats_find` looks it up by: unique, 1-255 bytes.
         name: []const u8,
-        /// Exactly one of the kinds (`nats`).
-        // TODO(dx/kafka, lane B2): add `kafka: ?Kafka = null` and make the
-        // check in `validate` "exactly one of nats or kafka". Not done at the
-        // phase-A merge: src/capi/nats.zig reads `config.nats.?` for every
-        // broker, so a Kafka-only entry must not pass before Kafka's engine
-        // wiring exists.
+        /// Exactly one of the kinds: `nats` or `kafka`.
         nats: ?Nats = null,
+        kafka: ?Kafka = null,
         /// A bound on requests and JetStream calls that have no timeout_ms of
         /// their own. 0: none.
         timeout_ms: u32 = 30_000,
@@ -398,6 +394,49 @@ pub const Config = struct {
         reconnect: Reconnect = .{},
         limits: NatsLimits = .{},
         jetstream: JetStream = .{},
+    };
+
+    pub const Kafka = struct {
+        /// host:port entries. Null: KAFKA_BOOTSTRAP_SERVERS, else
+        /// KAFKA_URL, else localhost:9092.
+        brokers: ?[]const []const u8 = null,
+        client_id: []const u8 = "anole",
+        /// TLS to the brokers; any ca/client certificate key turns it on too.
+        tls: bool = false,
+        ca_file: ?[]const u8 = null,
+        ca_pem: ?[]const u8 = null,
+        client_cert_file: ?[]const u8 = null,
+        client_key_file: ?[]const u8 = null,
+        client_cert_pem: ?[]const u8 = null,
+        client_key_pem: ?[]const u8 = null,
+        insecure_skip_verify: bool = false,
+        sasl: ?KafkaSasl = null,
+        connect_timeout_ms: u32 = 10_000,
+        request_timeout_ms: u32 = 30_000,
+        metadata_max_age_ms: u32 = 300_000,
+        connect_at_start: bool = false,
+        producer: KafkaProducer = .{},
+    };
+
+    pub const KafkaSasl = struct {
+        /// "PLAIN", "SCRAM-SHA-256" or "SCRAM-SHA-512".
+        mechanism: []const u8,
+        username: []const u8,
+        password: []const u8,
+    };
+
+    pub const KafkaProducer = struct {
+        /// "none", "leader" or "all".
+        acks: []const u8 = "all",
+        /// Needs acks "all".
+        idempotent: bool = true,
+        linger_ms: u32 = 5,
+        batch_bytes: u32 = 16 * 1024,
+        buffer_bytes: u32 = 32 * 1024 * 1024,
+        /// "none", "gzip", "zstd" or "lz4".
+        compression: []const u8 = "none",
+        delivery_timeout_ms: u32 = 30_000,
+        max_request_bytes: u32 = 1024 * 1024,
     };
 
     pub const Reconnect = struct {
@@ -888,7 +927,26 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (b.name.len == 0 or b.name.len > 255) return fail(why, "brokers[{d}].name: 1-255 bytes", .{i});
         for (cfg.brokers[0..i]) |other| if (std.mem.eql(u8, b.name, other.name))
             return fail(why, "brokers[{d}].name \"{s}\" is taken", .{ i, b.name });
-        if (b.nats == null) return fail(why, "brokers[{d}]: exactly one of nats", .{i});
+        if ((b.nats == null) == (b.kafka == null)) return fail(why, "brokers[{d}]: exactly one of nats or kafka", .{i});
+        if (b.kafka) |k| {
+            if (comptime !features.kafka) return fail(why, "brokers[{d}].kafka: Kafka is not built in (-Dkafka)", .{i});
+            if (k.ca_file != null and k.ca_pem != null) return fail(why, "brokers[{d}].kafka: ca_file or ca_pem, not both", .{i});
+            try checkClientCert(k, "brokers", "kafka", i, why);
+            if (k.brokers) |list| {
+                if (list.len == 0) return fail(why, "brokers[{d}].kafka.brokers: at least one host:port", .{i});
+                for (list) |h| if (h.len == 0) return fail(why, "brokers[{d}].kafka.brokers: empty entry", .{i});
+            }
+            if (k.sasl) |sa| {
+                if (!oneOf(sa.mechanism, &.{ "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512" }))
+                    return fail(why, "brokers[{d}].kafka.sasl.mechanism: PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512", .{i});
+            }
+            const p = k.producer;
+            if (!oneOf(p.acks, &.{ "none", "leader", "all" })) return fail(why, "brokers[{d}].kafka.producer.acks: none, leader or all", .{i});
+            if (!oneOf(p.compression, &.{ "none", "gzip", "zstd", "lz4" })) return fail(why, "brokers[{d}].kafka.producer.compression: none, gzip, zstd or lz4", .{i});
+            if (p.idempotent and !std.mem.eql(u8, p.acks, "all")) return fail(why, "brokers[{d}].kafka.producer.idempotent: needs acks \"all\"", .{i});
+            if (p.batch_bytes == 0 or p.buffer_bytes < p.batch_bytes or p.max_request_bytes < 1024)
+                return fail(why, "brokers[{d}].kafka.producer: batch_bytes, buffer_bytes or max_request_bytes", .{i});
+        }
         if (b.nats) |n| {
             if (comptime !features.nats) return fail(why, "brokers[{d}].nats: NATS is not built in (-Dnats)", .{i});
             const logins = @as(u8, @intFromBool(n.token != null)) + @intFromBool(n.user != null or n.password != null) +

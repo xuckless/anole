@@ -90,7 +90,36 @@ pub const ConsumeOptions = struct {
     dead_letter: ?[]const u8 = null,
     /// A bound per handler run; null: none.
     timeout: ?Duration = .fromSeconds(30),
+    /// The C ABI's way in: when set, records go to this in batches of at
+    /// most `max_batch` (one partition, in order, one batch outstanding per
+    /// partition) instead of one by one to the record handler, which is
+    /// then never called, and `retry` and `dead_letter` do not apply (the
+    /// consumer of the batch decides).
+    batch_handler: ?BatchHandlerFn = null,
+    max_batch: u32 = 500,
+    /// Told (from the member's task, without waiting) which partitions this
+    /// member got after a join, and which it is about to give up.
+    on_assign: ?PartitionsFn = null,
+    on_revoke: ?PartitionsFn = null,
 };
+
+/// The records of one partition handed to a batch handler.
+pub const BatchView = struct {
+    topic: []const u8,
+    partition: i32,
+    recs: []const records.Record,
+    high_watermark: i64,
+};
+
+/// What a batch handler answers: processed, or deliver the same records
+/// again after `retry` milliseconds.
+pub const BatchAnswer = union(enum) { done, retry: u32 };
+
+/// Runs on the partition's delivery task; may wait for the answer. A
+/// cancel (the session ended and the rebalance timeout passed) leaves the
+/// batch unprocessed.
+pub const BatchHandlerFn = *const fn (context: ?*anyopaque, batch: *const BatchView) std.Io.Cancelable!BatchAnswer;
+pub const PartitionsFn = *const fn (context: ?*anyopaque, parts: []const protocol.TopicPartition) void;
 
 pub const HandlerFn = *const fn (context: ?*anyopaque, msg: *Msg) anyerror!void;
 
@@ -495,6 +524,11 @@ fn runSession(m: *Member) (SessionError || error{ InvalidOptions, ConcurrencyUna
     try initialOffsets(&sess, arena, coord);
 
     // ---- run
+    if (c.opts.on_assign) |f| if (sess.parts.len > 0) {
+        const tps = try arena.alloc(protocol.TopicPartition, sess.parts.len);
+        for (sess.parts, tps) |ps, *o| o.* = .{ .topic = ps.topic, .partition = ps.partition };
+        f(c.context, tps);
+    };
     runTasks(&sess) catch |err| {
         sess.stop.store(true, .release);
         endSession(&sess);
@@ -731,6 +765,12 @@ fn runTasks(sess: *Session) !void {
 fn endSession(sess: *Session) void {
     const c = sess.consumer;
     const io = c.host.io;
+    if (c.opts.on_revoke) |f| if (sess.parts.len > 0) {
+        if (sess.arena_state.allocator().alloc(protocol.TopicPartition, sess.parts.len)) |tps| {
+            for (sess.parts, tps) |ps, *o| o.* = .{ .topic = ps.topic, .partition = ps.partition };
+            f(c.context, tps);
+        } else |_| {}
+    };
     sess.group.cancel(io);
     for (sess.parts) |ps| {
         ps.mutex.lockUncancelable(io);
@@ -987,6 +1027,35 @@ fn deliverLoop(sess: *Session, ps: *PartState) std.Io.Cancelable!void {
         }
         const chunk = ps.chunks.items[0];
         ps.mutex.unlock(io);
+        if (c.opts.batch_handler) |bh| {
+            const remaining = chunk.recs[chunk.idx..];
+            const n = @min(remaining.len, @max(c.opts.max_batch, 1));
+            const view: BatchView = .{
+                .topic = ps.topic,
+                .partition = ps.partition,
+                .recs = remaining[0..n],
+                .high_watermark = ps.high_watermark.load(.acquire),
+            };
+            switch (try bh(c.context, &view)) {
+                .retry => |delay_ms| {
+                    try io.sleep(.fromMilliseconds(delay_ms), .awake);
+                    continue;
+                },
+                .done => {},
+            }
+            ps.mutex.lockUncancelable(io);
+            chunk.idx += n;
+            ps.processed.store(remaining[n - 1].offset + 1, .release);
+            if (chunk.idx >= chunk.recs.len) {
+                _ = ps.chunks.orderedRemove(0);
+                ps.buffered -|= chunk.size;
+                ps.mutex.unlock(io);
+                chunk.resp.release();
+                c.host.gpa.destroy(chunk);
+            } else ps.mutex.unlock(io);
+            if (c.host.tel) |t| for (0..n) |_| t.consumedOne(c.opts.group, ps.topic);
+            continue;
+        }
         const rec = chunk.recs[chunk.idx];
 
         _ = scratch.reset(.retain_capacity);

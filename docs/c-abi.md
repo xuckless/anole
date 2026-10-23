@@ -262,6 +262,13 @@ parameters, metadata) are reached through the offset stored in the record.
 | (68) | reserved for NATS connection status | | |
 | `ANOLE_EV_NATS_STATUS` (68) | `anole_broker_status_event`: the connection came up (`ANOLE_BROKER_CONNECTED`), was lost (`DISCONNECTED`), came back (`RECONNECTED`) or the server announced lame duck mode (`LAME_DUCK`); sent to every consumer | 0 | none |
 | `ANOLE_EV_NATS_WRITABLE` (69) | `anole_broker_status_event`: a publish refused with `ANOLE_E_AGAIN` (or advised with `ANOLE_BUSY`) would be taken now | 0 | none |
+| `ANOLE_EV_KAFKA_RECORDS` (80) | `anole_kafka_records_event`, then `anole_kafka_record`s, header spans and bytes: the next records of one partition | `anole_kafka_batch` | `anole_kafka_batch_done`, `anole_kafka_batch_retry`, or `anole_handle_release` (= retry now) |
+| `ANOLE_EV_KAFKA_DELIVERY` (81) | `anole_kafka_delivery_event`: what became of a produced record, or (topic empty) of `anole_kafka_flush` | 0 (`user_data`) | none |
+| `ANOLE_EV_KAFKA_ASSIGN` (82) | `anole_kafka_assign_event`: the partitions this member got | `anole_kafka_group` | none |
+| `ANOLE_EV_KAFKA_REVOKE` (83) | `anole_kafka_assign_event`: the partitions it is about to lose | `anole_kafka_group` | finish those partitions' batches (they go stale at `rebalance_timeout_ms`) |
+| `ANOLE_EV_KAFKA_WRITABLE` (84) | `anole_broker_status_event`: a produce refused with `ANOLE_E_AGAIN` (or advised with `ANOLE_BUSY`) would be taken now | 0 | none |
+| `ANOLE_EV_KAFKA_GROUP_END` (85) | `anole_broker_end_event`: the group membership is over (`reason`) | `anole_kafka_group` | ends it |
+| (86-95) | reserved for Kafka | | |
 | `ANOLE_EV_DRAINING` (41) | `anole_event`: `anole_server_drain` was called; once per consumer, before sockets get 1001 or requests are cut: finish long polls and event streams | 0 | none |
 
 The numbers are allocated once and frozen: 0 none; 1-11 core; 12-19 gRPC;
@@ -1185,8 +1192,9 @@ anole_db_query(db, consumer, (anole_str){"find orders", 11}, p, 2, NULL, 1);
 ## Brokers
 
 Brokers are configured under `"brokers"` (one object per broker, with a
-`"name"` and exactly one kind key; `"nats"` is the one built so far) and used
-through `anole_nats_*` calls. They are built with `-Dnats` (`anole_has_feature("nats")`).
+`"name"` and exactly one kind key, `"nats"` or `"kafka"`) and used through
+`anole_nats_*` and `anole_kafka_*` calls. They are built with `-Dnats` and
+`-Dkafka` (`anole_has_feature("nats")`, `anole_has_feature("kafka")`).
 
 ```json
 "brokers": [
@@ -1245,6 +1253,65 @@ by the server after the consumer's `ack_wait`.
 At the stop, subscriptions end without events (the consumer's last event is
 `ANOLE_EV_STOPPED`). `anole_nats_find` looks a broker up by name and
 `anole_nats_index` gives its place in `"brokers"`.
+
+### Kafka
+
+```json
+"brokers": [
+  { "name": "log",
+    "kafka": { "brokers": ["kafka-1:9093"], "ca_file": "/etc/ssl/kafka-ca.pem",
+               "sasl": { "mechanism": "SCRAM-SHA-512", "username": "app", "password": "..." },
+               "producer": { "acks": "all", "compression": "zstd" } } }
+]
+```
+
+`kafka` takes `brokers` (`host:port` entries; null reads `KAFKA_BOOTSTRAP_SERVERS`,
+then `KAFKA_URL`, else `localhost:9092`), `client_id`, TLS (`tls`, or any of
+`ca_file`/`ca_pem`, `client_cert_file` and `client_key_file` or their `_pem`
+forms, `insecure_skip_verify`), `sasl` (`mechanism` `"PLAIN"`,
+`"SCRAM-SHA-256"` or `"SCRAM-SHA-512"`, `username`, `password`),
+`connect_timeout_ms`, `request_timeout_ms`, `metadata_max_age_ms`,
+`connect_at_start` and `producer` (`acks` `"none"`, `"leader"` or `"all"`,
+`idempotent` (needs `"all"`), `linger_ms`, `batch_bytes`, `buffer_bytes`,
+`compression` `"none"`, `"gzip"`, `"zstd"` or `"lz4"`, `delivery_timeout_ms`,
+`max_request_bytes`). `timeout_ms` of the broker bounds `anole_kafka_flush`.
+There is one producer per broker, so records of a key keep their order across
+the calls of every thread. The partitioner is Java's (murmur2 of the key),
+so keys land where Java producers put them.
+
+**Producing never waits.** `anole_kafka_produce` copies the record and
+returns: `ANOLE_OK`, `ANOLE_BUSY` (taken; the buffer is past half), or
+`ANOLE_E_AGAIN` (not taken: `producer.buffer_bytes` are waiting; the consumer
+gets `ANOLE_EV_KAFKA_WRITABLE` when there is room). Unless
+`ANOLE_KAFKA_F_NO_REPORT`, the record's fate is one `ANOLE_EV_KAFKA_DELIVERY`
+with the caller's `user_data`: `status` `ANOLE_OK` (`partition`, `offset`,
+`timestamp_ms`), `ANOLE_E_TIMEOUT` (`delivery_timeout_ms`) or `ANOLE_E_BROKER`
+(`error_class` `UNAVAILABLE` or `OTHER`; `error_code` is the Kafka error name,
+such as `MESSAGE_TOO_LARGE`, or one of `buffer_full`, `no_broker`, `closing`,
+`delivery_pending`). `anole_kafka_flush` answers with a delivery event whose
+topic is empty once everything queued before it is acknowledged or failed.
+
+**Groups.** `anole_kafka_subscribe` joins a consumer group as one member.
+Each assigned partition delivers `ANOLE_EV_KAFKA_RECORDS`: at most
+`max_batch` records of that partition, in order, and never a second batch of
+the partition before the first is answered. `anole_kafka_batch_done` marks the
+records processed (their offsets are committed with the next commit);
+`anole_kafka_batch_retry` delivers the same records again after a delay, and
+the partition waits meanwhile. Dead letters are the binding's: produce the
+record to a dead-letter topic with `anole_kafka_produce`, then call
+`anole_kafka_batch_done`. A rebalance first sends `ANOLE_EV_KAFKA_REVOKE`; a
+batch not answered within `rebalance_timeout_ms` goes stale (answering it is
+`ANOLE_OK` for `anole_kafka_batch_done`, `ANOLE_E_GONE` for `_retry`, and its
+offsets are not committed). `ANOLE_EV_KAFKA_ASSIGN` follows the join.
+`anole_kafka_group_close` (or `anole_handle_release`) commits the done batches
+and leaves the group; `ANOLE_EV_KAFKA_GROUP_END` says it is over
+(`ANOLE_BROKER_END_CLOSED`, `_DRAINED` when `anole_server_drain` ended it,
+`_FAILED`). At the stop, groups end without events.
+
+`anole_kafka_find` looks a broker up by name and `anole_kafka_index` gives
+its place in `"brokers"` (what `anole_broker_status_event.broker` names).
+The consumer reads none, gzip, zstd, lz4 and snappy batches. Transactions,
+the KIP-848 protocol and the admin API are not part of the ABI.
 
 ## gRPC
 

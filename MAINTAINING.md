@@ -15,7 +15,7 @@ that happens promptly.
 | BoringSSL | build.zig.zon | upstream commit tarball, compiled by `build/boringssl.zig` |
 | ngtcp2 1.25.0 | build.zig.zon | commit of the xuckless/ngtcp2 fork, branch `anole` (git URL) |
 | nghttp3 1.18.0 | build.zig.zon | commit of the xuckless/nghttp3 fork, branch `anole` (tarball) |
-| zlib-ng, zstd, Brotli, yyjson, hiredis | build.zig.zon | upstream release tag tarballs |
+| zlib-ng, zstd, Brotli, yyjson, hiredis, lz4 1.10.0 | build.zig.zon | upstream release tag tarballs (lz4: `-Dkafka`, built by `build/lz4.zig`) |
 | zig-protobuf | build.zig.zon | commit of the xuckless/zig-protobuf fork, branch `anole`; it pins protoc per platform |
 | websocket-zig, zig-jwt, zig-sqlite | build.zig.zon | commits of the xuckless forks, branch `anole` |
 | pg.zig | build.zig.zon | commit of the xuckless/pg.zig fork, branch `anole` (git URL) |
@@ -260,6 +260,19 @@ the copy: the `ClientStream` transport and TLS (`engine/Connection.zig`,
 (`Client.executor`, `placement.concurrent` in the manager). JetStream
 (`src/nats/jetstream.zig`) and the connector layer are Anole's own. Live
 tests: `tests/nats/run.sh` (a nats-server with `-js` in Docker).
+
+## The Kafka client
+
+`src/kafka` is Anole's own client (no upstream to track); the protocol
+follows Apache Kafka's message definitions, with the versions listed in
+`src/kafka/protocol.zig`. lz4 is the only C dependency: bump it like the
+other tarballs (step 2 above; lz4 is not yet in `tools/advisories.py`'s table
+or `tools/sanitize-c-libs.sh`, so check lz4's GitHub advisories by hand at a
+bump and add it to both when its tests are wired in). Live tests:
+`tests/kafka/run.sh` (Apache Kafka 4.x in KRaft mode and Redpanda, in Docker;
+CI job `kafka`). When Kafka releases a new major, run them against it before
+claiming support, and re-check the removed API versions (KIP-896 removed the
+oldest ones in 4.0).
 
 ## The docs site
 

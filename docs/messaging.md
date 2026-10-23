@@ -9,6 +9,7 @@ gives the right status), and the connection is checked by `/readyz`.
 | Broker | Flag | Profiles | Handle |
 | --- | --- | --- | --- |
 | [NATS](#nats) | `-Dnats` | `full` | `anole.nats.Client`, from `app.nats(.{})` |
+| [Kafka](#kafka) | `-Dkafka` (needs `-Dcompression`) | `full` | `anole.kafka.Client`, from `app.kafka(.{})` |
 
 ## NATS
 
@@ -139,3 +140,114 @@ A publish from a traced request carries `traceparent`; calls make
 for unit tests. Against a real server: `tests/nats/run.sh`, or
 `zig build test -Dnats-test-url=nats://127.0.0.1:4222` (a nats-server started
 with `-js`).
+
+## Kafka
+
+`anole.kafka` is a client written for Anole on `std.Io`, from Kafka's protocol
+specification: no librdkafka, which starts threads of its own and links
+OpenSSL (it would clash with the bundled BoringSSL). Version one covers
+produce (acks 0, 1 or all, idempotent by default, batching with `linger`,
+gzip, zstd and lz4 compression), consumer groups (the classic protocol, eager
+rebalance, range and roundrobin assignors, static membership, commit of
+processed offsets, retry and a dead-letter topic), TLS (BoringSSL, mutual TLS)
+and SASL PLAIN, SCRAM-SHA-256 and SCRAM-SHA-512. It runs against Apache Kafka
+2.8 and later (tested on 4.1) and Redpanda.
+
+### Setup
+
+```zig
+const kc = try app.kafka(.{});          // KAFKA_BOOTSTRAP_SERVERS, else KAFKA_URL, else localhost:9092
+try kc.consume(&app, .{ .group = "workers", .topics = &.{"events"} }, onEvent);
+
+fn onEvent(state: *State, msg: *anole.kafka.Msg) !void {
+    const event = try msg.json(Event);
+    _ = try state.db.exec(msg, "INSERT INTO events ...", .{event.id});
+}
+```
+
+`app.kafka` connects when serving starts (`connect_at_start = true` fails the
+start if no broker answers; `/readyz` reports the cluster either way).
+Options (`anole.kafka.Options`): `brokers`, `client_id`, `tls`, `sasl`,
+`timeout`, `connect_timeout`, `request_timeout`, `metadata_max_age`,
+`producer` (`acks`, `idempotent`, `linger`, `batch_bytes`, `buffer_bytes`,
+`compression`, `delivery_timeout`, `max_request_bytes`) and `errors`. The C
+ABI's `"brokers"` takes the same names with `_ms` on durations (see
+[c-abi.md](c-abi.md#kafka)). `-Dkafka` needs `-Dcompression`, and builds lz4.
+
+### send and produce
+
+```zig
+try kc.send(req, .{ .topic = "events", .key = "user-7", .value = req.body() });
+const d = try kc.produce(req, .{ .topic = "events", .value = body }); // waits for the ack
+```
+
+`send` queues the record and returns; a full buffer (`producer.buffer_bytes`,
+32 MiB) is `error.ServiceUnavailable` with `lastError` code `buffer_full`, and
+`kc.waitWritable(req, timeout)` waits for room. A delivery that fails later is
+logged and counted. `produce` waits for the broker's acknowledgement, bounded
+by `timeout` (30 s); on a timeout it fails with `GatewayTimeout` (code
+`delivery_pending`: the record may still arrive). `kc.flush(req)` sends what
+is buffered at once.
+
+### Partitioning and ordering
+
+The partitioner is Java's: `murmur2(key) % partitions`, so a key lands where
+Java producers put it (librdkafka's default differs). Records without a key
+stick to one partition per batch. There is one producer per client, not one
+per executor, and its accumulators are shared: the records of one key keep
+their order across requests served on different cores. With `idempotent`
+(the default, needs `acks = .all`) a retry never duplicates a record.
+
+### Consumer groups
+
+`kc.consume(&app, opts, handler)` joins `opts.group` once serving starts.
+Each partition is handled by one task at a time, in order, on executor
+`partition % executors`; `members` (default 1) adds more group members in the
+process for CPU-bound handlers. Offsets of finished records are committed
+every `commit_interval` (5 s) and when the group is left; a crash replays at
+most the records since the last commit, so handlers should be idempotent.
+`start` picks where a partition without a committed offset begins (`.latest`
+or `.earliest`); `instance_id` makes the membership static, so a restart
+within `session_timeout` keeps its partitions.
+
+A handler that fails is retried in place (`opts.retry`: 10 attempts, 100 ms to
+10 s) and then, if `dead_letter` names a topic, produced there with the
+headers `anole-dlt-topic`, `-partition`, `-offset` and `-error`; without one it
+is logged and skipped, so a poison record never stops a partition. A
+rebalance lets the record in progress finish (up to `rebalance_timeout`),
+commits, and rejoins. Metrics have the client, group and topic in their
+labels (below).
+
+### Tracing and metrics
+
+A produce from a traced request carries `traceparent`; calls make
+`messaging` spans with `messaging.system = "kafka"`, the topic as
+`messaging.destination.name`, and for consumed records the offset and group.
+Record keys are not put in spans (they can be personal data). Metrics:
+`anole_kafka_produced_total`, `anole_kafka_produce_errors_total`,
+`anole_kafka_buffer_bytes`, `anole_kafka_consumed_total`,
+`anole_kafka_consumer_lag`, `anole_kafka_rebalances_total` and
+`anole_kafka_dead_lettered_total`.
+
+### Errors
+
+| Condition | class | `lastError` code | Error |
+| --- | --- | --- | --- |
+| no broker reachable, buffer full, shutting down | unavailable | `no_broker`, `buffer_full`, `closing` | `ServiceUnavailable` (503) |
+| no acknowledgement within the timeout | timeout | `delivery_pending` | `GatewayTimeout` (504) |
+| record too large, unknown topic, bad partition, login refused | other | `MESSAGE_TOO_LARGE`, `UNKNOWN_TOPIC_OR_PARTITION`, `invalid_partition`, `SASL_AUTHENTICATION_FAILED` | `Database` (500: the backing service refused) |
+
+### What version one leaves out
+
+Transactions and exactly-once, the KIP-848 consumer protocol, cooperative-sticky
+assignment, the admin API, OAUTHBEARER and GSSAPI, fetch from followers, and
+producing with snappy (a consumer reads it). A topic is not created on first
+use: create it first (or let the broker's auto-create do it).
+
+### Testing
+
+`anole.kafka.testing.FakeBroker` is an in-process broker for tests (point
+`Options.brokers` at `broker.address()`): one node, no replication, topics made
+on first use. Against real brokers: `zig build test -Dkafka-test-url=host:9092`
+with Apache Kafka 4.x (KRaft) or Redpanda; CI runs both, each with a plain
+listener and a SASL SCRAM + TLS one.

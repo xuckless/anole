@@ -315,6 +315,56 @@
       "record": "anole_broker_status_event",
       "handles": [],
       "obligation": null
+    },
+    {
+      "type": 80,
+      "name": "ANOLE_EV_KAFKA_RECORDS",
+      "record": "anole_kafka_records_event",
+      "handles": [
+        "broker_msg"
+      ],
+      "obligation": "batch_done or batch_retry"
+    },
+    {
+      "type": 81,
+      "name": "ANOLE_EV_KAFKA_DELIVERY",
+      "record": "anole_kafka_delivery_event",
+      "handles": [],
+      "obligation": null
+    },
+    {
+      "type": 82,
+      "name": "ANOLE_EV_KAFKA_ASSIGN",
+      "record": "anole_kafka_assign_event",
+      "handles": [
+        "broker_sub"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 83,
+      "name": "ANOLE_EV_KAFKA_REVOKE",
+      "record": "anole_kafka_assign_event",
+      "handles": [
+        "broker_sub"
+      ],
+      "obligation": null
+    },
+    {
+      "type": 84,
+      "name": "ANOLE_EV_KAFKA_WRITABLE",
+      "record": "anole_broker_status_event",
+      "handles": [],
+      "obligation": null
+    },
+    {
+      "type": 85,
+      "name": "ANOLE_EV_KAFKA_GROUP_END",
+      "record": "anole_broker_end_event",
+      "handles": [
+        "broker_sub"
+      ],
+      "obligation": null
     }
   ],
   "event_ranges": [
@@ -478,7 +528,13 @@
       "ANOLE_EV_NATS_JS_MSG": 66,
       "ANOLE_EV_NATS_SUB_END": 67,
       "ANOLE_EV_NATS_STATUS": 68,
-      "ANOLE_EV_NATS_WRITABLE": 69
+      "ANOLE_EV_NATS_WRITABLE": 69,
+      "ANOLE_EV_KAFKA_RECORDS": 80,
+      "ANOLE_EV_KAFKA_DELIVERY": 81,
+      "ANOLE_EV_KAFKA_ASSIGN": 82,
+      "ANOLE_EV_KAFKA_REVOKE": 83,
+      "ANOLE_EV_KAFKA_WRITABLE": 84,
+      "ANOLE_EV_KAFKA_GROUP_END": 85
     },
     "grpc_call_flag": {
       "ANOLE_GRPC_CALL_MESSAGE": 1,
@@ -528,6 +584,23 @@
       "ANOLE_GRPC_STATUS_UNAVAILABLE": 14,
       "ANOLE_GRPC_STATUS_DATA_LOSS": 15,
       "ANOLE_GRPC_STATUS_UNAUTHENTICATED": 16
+    },
+    "kafka_assignor": {
+      "ANOLE_KAFKA_ASSIGN_RANGE": 0,
+      "ANOLE_KAFKA_ASSIGN_ROUNDROBIN": 1
+    },
+    "kafka_flag": {
+      "ANOLE_KAFKA_F_NULL_KEY": 2,
+      "ANOLE_KAFKA_F_NULL_VALUE": 4,
+      "ANOLE_KAFKA_F_NO_REPORT": 8
+    },
+    "kafka_record_flag": {
+      "ANOLE_KAFKA_REC_F_NULL_KEY": 1,
+      "ANOLE_KAFKA_REC_F_NULL_VALUE": 2
+    },
+    "kafka_start": {
+      "ANOLE_KAFKA_START_LATEST": 0,
+      "ANOLE_KAFKA_START_EARLIEST": 1
     },
     "listener_flag": {
       "ANOLE_LISTENER_F_TLS": 1,
@@ -2098,6 +2171,364 @@
           "name": "status",
           "offset": 20,
           "type": "u32"
+        }
+      ]
+    },
+    "anole_kafka_out": {
+      "size": 88,
+      "align": 8,
+      "fields": [
+        {
+          "name": "size",
+          "offset": 0,
+          "type": "usize"
+        },
+        {
+          "name": "topic",
+          "offset": 8,
+          "type": "anole_str"
+        },
+        {
+          "name": "partition",
+          "offset": 24,
+          "type": "i32"
+        },
+        {
+          "name": "flags",
+          "offset": 28,
+          "type": "u32"
+        },
+        {
+          "name": "key",
+          "offset": 32,
+          "type": "anole_str"
+        },
+        {
+          "name": "value",
+          "offset": 48,
+          "type": "ptr"
+        },
+        {
+          "name": "len",
+          "offset": 56,
+          "type": "usize"
+        },
+        {
+          "name": "headers",
+          "offset": 64,
+          "type": "ptr"
+        },
+        {
+          "name": "nheaders",
+          "offset": 72,
+          "type": "usize"
+        },
+        {
+          "name": "timestamp_ms",
+          "offset": 80,
+          "type": "i64"
+        }
+      ]
+    },
+    "anole_kafka_subscribe_options": {
+      "size": 88,
+      "align": 8,
+      "fields": [
+        {
+          "name": "size",
+          "offset": 0,
+          "type": "usize"
+        },
+        {
+          "name": "group",
+          "offset": 8,
+          "type": "anole_str"
+        },
+        {
+          "name": "topics",
+          "offset": 24,
+          "type": "ptr"
+        },
+        {
+          "name": "ntopics",
+          "offset": 32,
+          "type": "usize"
+        },
+        {
+          "name": "instance_id",
+          "offset": 40,
+          "type": "anole_str"
+        },
+        {
+          "name": "start",
+          "offset": 56,
+          "type": "u32"
+        },
+        {
+          "name": "assignor",
+          "offset": 60,
+          "type": "u32"
+        },
+        {
+          "name": "max_batch",
+          "offset": 64,
+          "type": "u32"
+        },
+        {
+          "name": "prefetch_bytes",
+          "offset": 68,
+          "type": "u32"
+        },
+        {
+          "name": "session_timeout_ms",
+          "offset": 72,
+          "type": "u32"
+        },
+        {
+          "name": "rebalance_timeout_ms",
+          "offset": 76,
+          "type": "u32"
+        },
+        {
+          "name": "commit_interval_ms",
+          "offset": 80,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 84,
+          "type": "u32"
+        }
+      ]
+    },
+    "anole_kafka_record": {
+      "size": 48,
+      "align": 8,
+      "fields": [
+        {
+          "name": "offset",
+          "offset": 0,
+          "type": "i64"
+        },
+        {
+          "name": "timestamp_ms",
+          "offset": 8,
+          "type": "i64"
+        },
+        {
+          "name": "key",
+          "offset": 16,
+          "type": "anole_span"
+        },
+        {
+          "name": "value",
+          "offset": 24,
+          "type": "anole_span"
+        },
+        {
+          "name": "headers_off",
+          "offset": 32,
+          "type": "u32"
+        },
+        {
+          "name": "nheaders",
+          "offset": 36,
+          "type": "u32"
+        },
+        {
+          "name": "flags",
+          "offset": 40,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 44,
+          "type": "u32"
+        }
+      ]
+    },
+    "anole_kafka_records_event": {
+      "size": 64,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "user_data",
+          "offset": 16,
+          "type": "u64"
+        },
+        {
+          "name": "group",
+          "offset": 24,
+          "type": "u64"
+        },
+        {
+          "name": "topic",
+          "offset": 32,
+          "type": "anole_span"
+        },
+        {
+          "name": "partition",
+          "offset": 40,
+          "type": "i32"
+        },
+        {
+          "name": "nrecords",
+          "offset": 44,
+          "type": "u32"
+        },
+        {
+          "name": "records_off",
+          "offset": 48,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 52,
+          "type": "u32"
+        },
+        {
+          "name": "high_watermark",
+          "offset": 56,
+          "type": "i64"
+        }
+      ],
+      "arrays": [
+        {
+          "name": "records",
+          "at": "records_off",
+          "item": "anole_kafka_record",
+          "count": "nrecords"
+        }
+      ]
+    },
+    "anole_kafka_delivery_event": {
+      "size": 80,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "user_data",
+          "offset": 16,
+          "type": "u64"
+        },
+        {
+          "name": "status",
+          "offset": 24,
+          "type": "i32"
+        },
+        {
+          "name": "http_status",
+          "offset": 28,
+          "type": "u16"
+        },
+        {
+          "name": "error_class",
+          "offset": 30,
+          "type": "u8"
+        },
+        {
+          "name": "reserved",
+          "offset": 31,
+          "type": "u8"
+        },
+        {
+          "name": "partition",
+          "offset": 32,
+          "type": "i32"
+        },
+        {
+          "name": "reserved2",
+          "offset": 36,
+          "type": "u32"
+        },
+        {
+          "name": "offset",
+          "offset": 40,
+          "type": "i64"
+        },
+        {
+          "name": "timestamp_ms",
+          "offset": 48,
+          "type": "i64"
+        },
+        {
+          "name": "topic",
+          "offset": 56,
+          "type": "anole_span"
+        },
+        {
+          "name": "error",
+          "offset": 64,
+          "type": "anole_span"
+        },
+        {
+          "name": "error_code",
+          "offset": 72,
+          "type": "anole_span"
+        }
+      ]
+    },
+    "anole_kafka_partition": {
+      "size": 16,
+      "align": 4,
+      "fields": [
+        {
+          "name": "topic",
+          "offset": 0,
+          "type": "anole_span"
+        },
+        {
+          "name": "partition",
+          "offset": 8,
+          "type": "i32"
+        },
+        {
+          "name": "reserved",
+          "offset": 12,
+          "type": "u32"
+        }
+      ]
+    },
+    "anole_kafka_assign_event": {
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "user_data",
+          "offset": 16,
+          "type": "u64"
+        },
+        {
+          "name": "entries_off",
+          "offset": 24,
+          "type": "u32"
+        },
+        {
+          "name": "nentries",
+          "offset": 28,
+          "type": "u32"
+        }
+      ],
+      "arrays": [
+        {
+          "name": "entries",
+          "at": "entries_off",
+          "item": "anole_kafka_partition",
+          "count": "nentries"
         }
       ]
     }
