@@ -104,5 +104,7 @@ test {
     _ = @import("transcode_test.zig");
     _ = health;
     _ = client;
+    _ = @import("wire.zig");
     if (features.http2) _ = @import("server_test.zig");
+    if (features.http3 and features.http2 and features.tls == .boringssl) _ = @import("h3_test.zig");
 }
