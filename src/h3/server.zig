@@ -277,6 +277,14 @@ fn earlyDataContext(q: *const c.ngtcp2_conn, settings: nghttp3.Settings, wt: boo
 /// more are dropped, which QUIC takes as loss.
 const inbox_len = 256;
 
+/// What one connection's streams hold unacknowledged, all together.
+const conn_budget = 4 << 20;
+/// A response stream's own cap: ordinary responses, and extended CONNECT
+/// streams (WebSocket over HTTP/3, the WebTransport CONNECT), which carry
+/// messages and are latency-sensitive.
+const response_cap = 64 * 1024;
+const connect_cap = 1 << 20;
+
 /// One endpoint's counters. Several endpoints serve one listener on Linux
 /// (`Options.sockets`); these show how the kernel's steering does.
 pub const Stats = struct {
@@ -308,6 +316,10 @@ pub const Stats = struct {
     /// Requests for `no_wait` routes run inline, without a task
     /// (`Options.inline_no_wait`).
     served_inline: std.atomic.Value(u64) = .init(0),
+    /// The endpoint's 4 KiB send and receive blocks: handed out, and kept
+    /// for reuse (`Endpoint.sampleStats` fills them in).
+    blocks_live: std.atomic.Value(u64) = .init(0),
+    blocks_pooled: std.atomic.Value(u64) = .init(0),
 };
 
 /// One HTTP/3 listener, serving `server`'s router: one endpoint per UDP
@@ -412,6 +424,8 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// is never contended there; it only keeps other `Io`s safe.
         pool_lock: std.atomic.Mutex = .unlocked,
         pool: std.ArrayList(*Stream) = .empty,
+        /// Free 4 KiB blocks for the streams' send and receive queues.
+        blocks: bridge.BlockPool,
         /// The thread serving the endpoint, in test builds (`Stats.foreign`).
         thread: ?std.Thread.Id = null,
 
@@ -522,6 +536,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .inbox = undefined,
                 .rx = try gpa.alloc(u8, net.Udp.batch_buffer_len),
                 .tx = .{ tx0, tx1 },
+                .blocks = .init(gpa, 256),
             };
             self.inbox = .init(&self.inbox_buf);
             return self;
@@ -582,11 +597,18 @@ pub fn Endpoint(comptime Ctx: type) type {
             for (&self.tx) |*o| o.deinit(self.gpa);
             for (self.pool.items) |s| s.destroy(self.gpa);
             self.pool.deinit(self.gpa);
+            self.blocks.deinit();
             self.gpa.destroy(self);
         }
 
         /// Streams kept at most per endpoint.
-        const pool_max = 256;
+        const pool_max = 64;
+
+        /// Copies the block pool's counts into `stats`.
+        pub fn sampleStats(self: *Self) void {
+            self.stats.blocks_live.store(self.blocks.live.load(.monotonic), .monotonic);
+            self.stats.blocks_pooled.store(self.blocks.pooled(), .monotonic);
+        }
 
         fn takeStream(self: *Self) ?*Stream {
             while (!self.pool_lock.tryLock()) std.atomic.spinLoopHint();
@@ -1337,7 +1359,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             mutex: std.Io.Mutex = .init,
             /// Bumped to wake the stream tasks waiting on the connection
             /// (`kick`, which also queues it for the driver).
-            gen: std.atomic.Value(u32) = .init(0),
+            gen: bridge.Signal = .{},
+            /// What all of the connection's send queues hold unacknowledged.
+            budget: bridge.Budget,
             refs: std.atomic.Value(u32) = .init(1),
             /// Handed to the driver (`accept`): kicks queue it from then on.
             driven: bool = false,
@@ -1418,6 +1442,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     .scid = undefined,
                     .local = if (local) |l| .from(l) else ep.local,
                     .remote = remote,
+                    .budget = .init(ep.io, conn_budget),
                 };
                 c.ngtcp2_ccerr_default(&conn.last_error);
                 conn.scid.datalen = scid_len;
@@ -1430,14 +1455,14 @@ pub fn Endpoint(comptime Ctx: type) type {
                 settings.tokenlen = hd.tokenlen;
                 settings.token_type = token_type;
                 settings.rand_ctx = .{ .native_handle = conn };
-                settings.max_window = 6 * ep.options.max_data;
+                settings.max_window = ep.options.max_data;
                 // QUIC v2 (RFC 9369) when the client offers it and
                 // `prefer_v2` is on, through compatible version
                 // negotiation; v1 otherwise.
                 const versions = preferredVersions(&ep.options);
                 settings.preferred_versions = versions.ptr;
                 settings.preferred_versionslen = versions.len;
-                settings.max_stream_window = 6 * ep.options.max_stream_data;
+                settings.max_stream_window = ep.options.max_stream_data;
                 // qlog stays off: both of ngtcp2's high-severity
                 // advisories were in its qlog code.
                 settings.qlog_write = null;
@@ -1517,8 +1542,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Something changed: the stream tasks waiting look again, and
             /// the driver services the connection in its next round.
             fn kick(conn: *Conn) void {
-                _ = conn.gen.fetchAdd(1, .release);
-                conn.ep.io.futexWake(u32, &conn.gen.raw, std.math.maxInt(u32));
+                conn.gen.notify(conn.ep.io);
                 if (conn.driven) conn.ep.queue(conn);
             }
 
@@ -1538,12 +1562,58 @@ pub fn Endpoint(comptime Ctx: type) type {
                     fn kick(ctx: *anyopaque) void {
                         of(ctx).kick();
                     }
+                    fn bind(ctx: *anyopaque, id: i64, session: *webtransport.Session) void {
+                        of(ctx).bindSession(id, session);
+                    }
+                    fn end(ctx: *anyopaque, id: i64) bool {
+                        return of(ctx).endConnect(id);
+                    }
                 };
-                return .{ .ctx = conn, .gen = &conn.gen, .lock_fn = S.lock, .unlock_fn = S.unlock, .kick_fn = S.kick };
+                return .{
+                    .ctx = conn,
+                    .gen = &conn.gen,
+                    .pool = &conn.ep.blocks,
+                    .budget = &conn.budget,
+                    .bind_session_fn = S.bind,
+                    .end_connect_fn = S.end,
+                    .lock_fn = S.lock,
+                    .unlock_fn = S.unlock,
+                    .kick_fn = S.kick,
+                };
             }
 
             fn path(conn: *Conn) c.ngtcp2_path {
                 return .{ .local = conn.local.ngtcp2Addr(), .remote = conn.remote.ngtcp2Addr(), .user_data = null };
+            }
+
+            /// A WebTransport session on request stream `id` (its CONNECT):
+            /// the stream's later bytes go to the session as capsules, and
+            /// the ones queued already go now. Locked.
+            fn bindSession(conn: *Conn, id: i64, session: *webtransport.Session) void {
+                const s = conn.streams.get(id) orelse return session.onChannelEnd(.connection);
+                s.wt_session = session;
+                var buf: [1024]u8 = undefined;
+                while (s.body.len > 0) {
+                    const n = s.body.take(&conn.ep.blocks, &buf);
+                    session.onCapsuleBytes(buf[0..n]);
+                    if (!s.reset) conn.consume(id, n);
+                }
+                if (s.body_done) session.onChannelEnd(.peer) else if (s.reset) session.onChannelEnd(.connection);
+            }
+
+            /// Ends the CONNECT stream's response (its FIN) without
+            /// waiting, from a callback. False while the 200 has not gone
+            /// out. Locked.
+            fn endConnect(conn: *Conn, id: i64) bool {
+                const s = conn.streams.get(id) orelse return true;
+                if (s.ended) return true;
+                if (!s.submitted) return false;
+                s.trailer_nv = &.{};
+                s.ended = true;
+                s.resume_();
+                s.unhold();
+                conn.kick();
+                return true;
             }
 
             /// Takes the connection's IDs out of the endpoint's map.
@@ -1890,7 +1960,11 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             /// Every stream's handler sees the connection gone.
             fn wakeStreams(conn: *Conn) void {
-                for (conn.streams.values()) |s| s.reset = true;
+                for (conn.streams.values()) |s| {
+                    s.reset = true;
+                    s.wakeAll();
+                    if (s.wt_session) |session| session.onChannelEnd(.connection);
+                }
                 if (conn.wt) |w| w.connectionClosed();
             }
 
@@ -1909,6 +1983,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     const before = conn.streams.count();
                     if (s.detached != null) {
                         s.reset = true;
+                        s.wakeAll();
                         abortDetached(s);
                     }
                     // Freed (and swapped out) by the abort: look at the
@@ -2154,8 +2229,15 @@ pub fn Endpoint(comptime Ctx: type) type {
             authority: []const u8 = "",
             headers: std.ArrayList(Field) = .empty,
             /// Request body bytes not yet read by the handler.
-            body: std.ArrayList(u8) = .empty,
-            body_start: usize = 0,
+            body: bridge.RecvQueue = .{},
+            /// Woken when the body changes (data, end, reset), and when the
+            /// response has room (acknowledgments, budget, reset).
+            rx: bridge.Signal = .{},
+            tx: bridge.Signal = .{},
+            waiter: bridge.Budget.Waiter = .{ .signal = undefined },
+            /// A WebTransport session on this CONNECT stream with its
+            /// capsules parsed as they arrive (`Session.Options.inline_capsules`).
+            wt_session: ?*webtransport.Session = null,
             body_done: bool = false,
             /// The peer reset the stream, or the connection is gone.
             reset: bool = false,
@@ -2180,15 +2262,12 @@ pub fn Endpoint(comptime Ctx: type) type {
             holds: bool = false,
             round: u32 = 0,
             /// A `no_wait` route's request, run on the endpoint task
-            /// (`runInline`), which must never wait for the peer: what its
-            /// response does not fit in the ring waits in `spill`, which
-            /// grows as needed.
+            /// (`runInline`), which must never wait for the peer: its
+            /// response is queued past the stream's cap instead.
             inline_mode: bool = false,
             /// A `no_wait` route's request with its body still coming, in
             /// `Conn.awaiting`.
             await_body: bool = false,
-            spill: std.ArrayList(u8) = .empty,
-            spill_pos: usize = 0,
             /// The handler detached the response (`dusty.Detached`): the
             /// request and response live on in the stream's arena, and the
             /// handler's hold on the stream goes when it is finished or
@@ -2203,26 +2282,20 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// nghttp3 asked for data and got none: resume it on the next.
             deferred: bool = false,
             /// The response body until the peer acknowledges it.
-            out: bridge.Ring = .{},
+            out: bridge.SendQueue = .{},
             /// The response's Content-Length, when the head named one:
-            /// sizes the ring and the body buffer.
+            /// sizes the body buffer.
             length_hint: ?usize = null,
 
             /// What a stream keeps when it goes back to the pool: enough
-            /// for a typical request's head and a small response, so most
-            /// requests allocate nothing.
-            const arena_keep = 8 * 1024;
-            const ring_keep = 16 * 1024;
-            const body_keep = 4 * 1024;
+            /// for a typical request's head. Its queues keep nothing.
+            const arena_keep = 4 * 1024;
 
             fn create(conn: *Conn, id: i64) !*Stream {
                 const ep = conn.ep;
                 if (ep.takeStream()) |s| {
                     const arena = s.arena;
-                    const body = s.body;
-                    const ring = s.out.buf;
-                    s.* = .{ .conn = conn, .id = id, .arena = arena, .body = body };
-                    s.out.buf = ring;
+                    s.* = .{ .conn = conn, .id = id, .arena = arena };
                     return s;
                 }
                 const s = try ep.gpa.create(Stream);
@@ -2234,24 +2307,14 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn free(s: *Stream) void {
                 const ep = s.conn.ep;
                 const gpa = ep.gpa;
-                if (s.body.capacity > body_keep) {
-                    s.body.deinit(gpa);
-                    s.body = .empty;
-                } else s.body.clearRetainingCapacity();
-                if (s.out.buf.len > ring_keep) {
-                    gpa.free(s.out.buf);
-                    s.out.buf = &.{};
-                }
-                s.spill.deinit(gpa);
-                s.spill = .empty;
+                s.conn.budget.unlink(&s.waiter);
+                s.out.deinit(&ep.blocks, &s.conn.budget);
+                s.body.deinit(&ep.blocks);
                 _ = s.arena.reset(.{ .retain_with_limit = arena_keep });
                 if (!ep.keepStream(s)) s.destroy(gpa);
             }
 
             fn destroy(s: *Stream, gpa: std.mem.Allocator) void {
-                s.spill.deinit(gpa);
-                s.body.deinit(gpa);
-                s.out.deinit(gpa);
                 s.arena.deinit();
                 gpa.destroy(s);
             }
@@ -2361,6 +2424,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 defer conn.unlock();
                 if (s.reset) return;
                 s.reset = true;
+                s.wakeAll();
                 _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, s.id, code);
                 conn.kick();
             }
@@ -2559,24 +2623,23 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return .done;
             }
 
-            /// Every byte of the response body is in the ring and handed
-            /// to nghttp3. Locked.
+            /// Every byte of the response body is queued and handed to
+            /// nghttp3. Locked.
             fn allSent(s: *const Stream) bool {
-                return s.out.allSent() and s.spill_pos == s.spill.items.len;
+                return s.out.allSent();
             }
 
-            /// Moves what waits in `spill` into the ring, as far as the
-            /// peer's acknowledgments have made room. Locked.
-            fn refill(s: *Stream) void {
-                if (s.spill_pos == s.spill.items.len) return;
-                const n = s.out.write(s.conn.ep.gpa, s.spill.items[s.spill_pos..]) catch return;
-                if (n == 0) return;
-                s.spill_pos += n;
-                if (s.spill_pos == s.spill.items.len) {
-                    s.spill.clearRetainingCapacity();
-                    s.spill_pos = 0;
-                }
-                s.resume_();
+            /// Wakes this stream's waiters (reader and writer). The
+            /// connection's own are woken by `Conn.kick`.
+            fn wakeAll(s: *Stream) void {
+                const io = s.conn.ep.io;
+                s.rx.notify(io);
+                s.tx.notify(io);
+            }
+
+            /// The send cap of this stream's queue.
+            fn sendCap(s: *const Stream) usize {
+                return if (s.protocol.len > 0) connect_cap else response_cap;
             }
 
             /// Tells nghttp3 there is more of the body, if it was waiting
@@ -2587,8 +2650,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (s.conn.h3) |hc| _ = h.nghttp3_conn_resume_stream(hc, s.id);
             }
 
-            /// Waits for the connection to change. Unlocked.
-            fn wait(s: *Stream, gen: u32) std.Io.Cancelable!void {
+            /// Waits for `signal` to change after `seen`. Unlocked.
+            fn wait(s: *Stream, signal: *bridge.Signal, seen: u32) std.Io.Cancelable!void {
                 if (s.holds) {
                     // The flush must not wait for a request that waits
                     // for it; the kick lets a holding driver go on.
@@ -2596,7 +2659,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     s.conn.kick();
                     return;
                 }
-                try s.conn.ep.io.futexWait(u32, &s.conn.gen.raw, gen);
+                try signal.wait(s.conn.ep.io, seen);
             }
 
             /// Waits until the handshake completes; fails if the stream or
@@ -2605,14 +2668,14 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn awaitHandshake(s: *Stream) !void {
                 const conn = s.conn;
                 while (true) {
-                    const gen = conn.gen.load(.acquire);
+                    const seen = conn.gen.epoch();
                     conn.lock();
                     const done = conn.handshakeDone();
                     const gone = s.reset;
                     conn.unlock();
                     if (done) return;
                     if (gone) return error.ConnectionResetByPeer;
-                    try s.wait(gen);
+                    try s.wait(&conn.gen, seen);
                 }
             }
         };
@@ -2747,17 +2810,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const dest = limit.slice(try w.writableSliceGreedy(1));
                 if (dest.len == 0) return 0;
                 while (true) {
-                    const gen = conn.gen.load(.acquire);
+                    const seen = s.rx.epoch();
                     conn.lock();
-                    const have = s.body.items[s.body_start..];
-                    if (have.len > 0) {
-                        const n = @min(have.len, dest.len);
-                        @memcpy(dest[0..n], have[0..n]);
-                        s.body_start += n;
-                        if (s.body_start == s.body.items.len) {
-                            s.body.clearRetainingCapacity();
-                            s.body_start = 0;
-                        }
+                    if (s.body.len > 0) {
+                        const n = s.body.take(&conn.ep.blocks, dest);
                         if (!s.reset) conn.consume(s.id, n);
                         conn.unlock();
                         conn.kick();
@@ -2769,7 +2825,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     conn.unlock();
                     if (done) return error.EndOfStream;
                     if (reset) return self.fail(error.ConnectionResetByPeer);
-                    s.wait(gen) catch return self.fail(error.Canceled);
+                    s.wait(&s.rx, seen) catch return self.fail(error.Canceled);
                 }
             }
 
@@ -2856,7 +2912,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (self.writer.buffer.len == 0) {
                     // A known length needs no more; at least a little, so
                     // that a body written in pieces is not sent in pieces.
-                    const size = if (self.stream.length_hint) |n| std.math.clamp(n, 256, 16 * 1024) else 16 * 1024;
+                    const size = if (self.stream.length_hint) |n| std.math.clamp(n, 256, 4096) else 4096;
                     self.writer.buffer = self.stream.arena.allocator().alloc(u8, size) catch &.{};
                 }
                 return &self.writer;
@@ -2912,14 +2968,16 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return n;
             }
 
-            /// Copies body bytes into the ring, waiting while it is full
-            /// (the peer has not acknowledged enough yet).
+            /// Copies body bytes into the stream's queue, waiting while the
+            /// stream (or the connection) holds as much unacknowledged as
+            /// its cap allows. A `no_wait` request on the endpoint task
+            /// never waits: its bytes go in past the cap.
             fn put(self: *StreamSink, bytes: []const u8) std.Io.Writer.Error!void {
                 const s = self.stream;
                 const conn = s.conn;
                 var rest = bytes;
                 while (rest.len > 0) {
-                    const gen = conn.gen.load(.acquire);
+                    const seen = s.tx.epoch();
                     conn.lock();
                     if (s.reset) {
                         conn.unlock();
@@ -2929,37 +2987,23 @@ pub fn Endpoint(comptime Ctx: type) type {
                         conn.unlock();
                         return err;
                     };
-                    if (s.out.written == 0) s.out.reserve(conn.ep.gpa, ringSize(s.length_hint)) catch {
-                        conn.unlock();
-                        return self.fail(error.SystemResources);
-                    };
-                    // Behind what already waits in the spill, if any.
-                    const n = if (s.spill.items.len > 0) 0 else s.out.write(conn.ep.gpa, rest) catch {
+                    const n = s.out.write(&conn.ep.blocks, &conn.budget, rest, s.sendCap(), s.inline_mode) catch {
                         conn.unlock();
                         return self.fail(error.SystemResources);
                     };
                     if (n > 0) {
                         rest = rest[n..];
                         s.resume_();
-                    }
-                    if (s.inline_mode and rest.len > 0) {
-                        // On the endpoint task, which must not wait for the
-                        // acknowledgments that make room: the rest goes out
-                        // as they come in (`refill`).
-                        s.spill.appendSlice(conn.ep.gpa, rest) catch {
-                            conn.unlock();
-                            return self.fail(error.SystemResources);
-                        };
-                        conn.unlock();
-                        conn.kick();
-                        return;
+                    } else {
+                        // Woken by an acknowledgment, or by the budget.
+                        s.waiter.signal = &s.tx;
+                        conn.budget.link(&s.waiter);
                     }
                     conn.unlock();
-                    // Kick only for new bytes: a kick would also move `gen`
-                    // on, the wait below would return at once, and the
-                    // handler would spin, starving the connection's other
-                    // tasks on this executor.
-                    if (n > 0) conn.kick() else s.wait(gen) catch return self.fail(error.Canceled);
+                    // Kick only for new bytes: a kick would also move the
+                    // connection's epoch on and, with the wait below,
+                    // would spin the handler.
+                    if (n > 0) conn.kick() else s.wait(&s.tx, seen) catch return self.fail(error.Canceled);
                 }
             }
 
@@ -2997,13 +3041,6 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return s.reset;
             }
         };
-
-        /// A response ring for a body of `hint` bytes: no larger than it
-        /// needs, up to the full `Ring.len` when the length is unknown.
-        fn ringSize(hint: ?usize) usize {
-            const n = hint orelse return bridge.Ring.len;
-            return std.math.ceilPowerOfTwoAssert(usize, std.math.clamp(n, 1024, bridge.Ring.len));
-        }
 
         fn field(name: []const u8, value: []const u8) h.nghttp3_nv {
             return .{
@@ -3138,7 +3175,9 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         fn onExtendMaxLocalStreams(_: ?*c.ngtcp2_conn, _: u64, user_data: ?*anyopaque) callconv(.c) c_int {
             // A WebTransport handler waiting to open a stream may go on.
-            connOf(user_data).kick();
+            const conn = connOf(user_data);
+            if (conn.wt) |w| w.onStreamCredit();
+            conn.kick();
             return 0;
         }
 
@@ -3185,6 +3224,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (conn.streamOf(stream_id)) |s| {
                     // Unless it ended cleanly, the handler sees it gone.
                     if (!(s.ended and s.allSent() and s.body_done)) s.reset = true;
+                    s.wakeAll();
+                    if (s.wt_session) |session| session.onChannelEnd(.connection);
                     // Gone with its response detached: the owner lets go now.
                     if (s.reset) abortDetached(s);
                     // Its credit comes back once the handler is done too.
@@ -3201,7 +3242,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             const conn = connOf(user_data);
             if (conn.wt) |w| if (w.onReset(stream_id, code)) return 0;
             if (conn.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
-            if (conn.streamOf(stream_id)) |s| s.reset = true;
+            if (conn.streamOf(stream_id)) |s| {
+                s.reset = true;
+                s.wakeAll();
+                if (s.wt_session) |session| session.onChannelEnd(.connection);
+            }
             conn.kick();
             return 0;
         }
@@ -3211,7 +3256,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (conn.wt) |w| if (w.onStopSending(stream_id, code)) return 0;
             if (conn.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             // The peer wants no more of the response.
-            if (conn.streamOf(stream_id)) |s| s.reset = true;
+            if (conn.streamOf(stream_id)) |s| {
+                s.reset = true;
+                s.wakeAll();
+            }
             conn.kick();
             return 0;
         }
@@ -3294,9 +3342,9 @@ pub fn Endpoint(comptime Ctx: type) type {
 
         fn onH3AckedStreamData(_: ?*h.nghttp3_conn, _: i64, len: u64, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
             const s = streamOfUser(sud) orelse return 0;
-            s.out.acked += len;
-            s.refill();
-            // Room in the ring: a handler waiting to write may go on.
+            s.out.ack(&s.conn.ep.blocks, &s.conn.budget, len);
+            // Room in the queue: a handler waiting to write may go on.
+            s.tx.notify(s.conn.ep.io);
             s.conn.kick();
             return 0;
         }
@@ -3307,9 +3355,17 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.consume(stream_id, len);
                 return 0;
             };
+            // The CONNECT stream of a WebTransport session: capsules, parsed
+            // as they arrive; their credit comes back at once.
+            if (s.wt_session) |session| {
+                session.onCapsuleBytes(data[0..len]);
+                conn.consume(stream_id, len);
+                return 0;
+            }
             // The peer cannot send past the stream's window, so this is
             // bounded by `max_stream_data`.
-            s.body.appendSlice(conn.ep.gpa, data[0..len]) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
+            s.body.append(&conn.ep.blocks, data[0..len]) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
+            s.rx.notify(conn.ep.io);
             conn.kick();
             return 0;
         }
@@ -3383,6 +3439,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             const conn = connOf(user_data);
             const s = streamOfUser(sud) orelse return 0;
             s.body_done = true;
+            s.rx.notify(conn.ep.io);
+            if (s.wt_session) |session| session.onChannelEnd(.peer);
             if (s.await_body) {
                 // Whole within the packet: inline after all.
                 s.await_body = false;
