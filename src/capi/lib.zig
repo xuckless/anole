@@ -855,19 +855,29 @@ export fn anole_db_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
 fn dbSubmit(verb: db_mod.Verb, d_: ?*anyopaque, c_: ?*anyopaque, sql: Str, params: ?[*]const abi.DbValue, nparams: usize, opts: ?*const abi.DbOptions, user_data: u64) i32 {
     clearError();
     const d = dbOf(d_) orelse return badPointer(d_);
-    const c = consumerOf(c_) orelse return badPointer(c_);
+    // NULL only with `opts->req`: the answer goes to that request's consumer.
+    const c: ?*Consumer = if (c_ == null) null else (consumerOf(c_) orelse return badPointer(c_));
     const ps: []const abi.DbValue = if (nparams == 0) &.{} else (params orelse return failCode(abi.E_INVALID))[0..nparams];
     for (ps) |p| if (p.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_db_value.reserved must be 0", .{});
     const o: abi.DbOptions = if (opts) |p| readSized(abi.DbOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.DbOptions) };
     if (o.flags & ~(abi.DB_F_WRITE | abi.DB_F_COALESCE | abi.DB_F_NO_PREPARE | abi.DB_F_DROP_EMPTY) != 0) return unknownFlag();
     if (o.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_db_options.reserved must be 0", .{});
-    db_mod.submit(d, c, verb, sql.slice(), ps, o, user_data) catch |err| return switch (err) {
-        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a value type, or a consumer of another server)", .{}),
+    db_mod.submit(d, c, verb, sql.slice(), ps, o, user_data) catch |err| return dbFailure(err);
+    return abi.OK;
+}
+
+/// A query or transaction call's refusal as its answer.
+fn dbFailure(err: db_mod.QueryError) i32 {
+    return switch (err) {
+        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a value type, an option this call does not take, a consumer of another server or other than the request's, or a request handle of another kind)", .{}),
         error.State => named(abi.E_STATE, "State", 0, "the server is not open, or no executor feeds this consumer", .{}),
         error.OutOfMemory => failCode(abi.E_NOMEM),
-        error.Unsupported => failCode(abi.E_UNSUPPORTED),
+        error.Unsupported => named(abi.E_UNSUPPORTED, "Unsupported", 0, "this database or build has no transactions (SQLite and PostgreSQL only)", .{}),
+        error.Gone => blk: {
+            if (live()) |e| _ = e.gone();
+            break :blk named(abi.E_GONE, "Gone", 0, "the request or transaction it served is over", .{});
+        },
     };
-    return abi.OK;
 }
 
 export fn anole_db_query(d: ?*anyopaque, c: ?*anyopaque, sql: Str, params: ?[*]const abi.DbValue, nparams: usize, opts: ?*const abi.DbOptions, user_data: u64) i32 {
@@ -882,5 +892,63 @@ export fn anole_db_invalidate(d_: ?*anyopaque, tag: Str) i32 {
     clearError();
     const d = dbOf(d_) orelse return badPointer(d_);
     db_mod.invalidate(d, tag.slice()) catch return named(abi.E_STATE, "State", 0, "the database is not open", .{});
+    return abi.OK;
+}
+
+// ---- database transactions ---------------------------------------------------------
+
+export fn anole_db_begin(d_: ?*anyopaque, c_: ?*anyopaque, opts: ?*const abi.DbTxOptions, user_data: u64) i32 {
+    clearError();
+    const d = dbOf(d_) orelse return badPointer(d_);
+    const c: ?*Consumer = if (c_ == null) null else (consumerOf(c_) orelse return badPointer(c_));
+    const o: abi.DbTxOptions = if (opts) |p| readSized(abi.DbTxOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.DbTxOptions) };
+    if (o.flags & ~abi.DB_TX_READ_ONLY != 0) return unknownFlag();
+    if (o.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_db_tx_options.reserved must be 0", .{});
+    if (o.isolation > abi.DB_ISOLATION_SERIALIZABLE) return named(abi.E_INVALID, "Invalid", 0, "anole_db_tx_options.isolation is not an ANOLE_DB_ISOLATION_* value", .{});
+    db_mod.begin(d, c, o, user_data) catch |err| return dbFailure(err);
+    return abi.OK;
+}
+
+fn dbTxCall(what: db_mod.TxWhat, tx: u64, sql: Str, params: ?[*]const abi.DbValue, nparams: usize, opts: ?*const abi.DbOptions, user_data: u64) i32 {
+    clearError();
+    if (badKind(tx, .db_tx)) return wrongKind();
+    const ps: []const abi.DbValue = if (nparams == 0) &.{} else (params orelse return failCode(abi.E_INVALID))[0..nparams];
+    for (ps) |p| if (p.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_db_value.reserved must be 0", .{});
+    const o: abi.DbOptions = if (opts) |p| readSized(abi.DbOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.DbOptions) };
+    if (o.flags & ~abi.DB_F_NO_PREPARE != 0) return named(abi.E_INVALID, "UnknownFlag", 0, "inside a transaction only ANOLE_DB_F_NO_PREPARE applies", .{});
+    if (o.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_db_options.reserved must be 0", .{});
+    const e = live() orelse return failCode(abi.E_GONE);
+    db_mod.txSubmit(e, tx, what, sql.slice(), ps, o, user_data) catch |err| return dbFailure(err);
+    return abi.OK;
+}
+
+export fn anole_db_tx_query(tx: u64, sql: Str, params: ?[*]const abi.DbValue, nparams: usize, opts: ?*const abi.DbOptions, user_data: u64) i32 {
+    return dbTxCall(.query, tx, sql, params, nparams, opts, user_data);
+}
+
+export fn anole_db_tx_exec(tx: u64, sql: Str, params: ?[*]const abi.DbValue, nparams: usize, opts: ?*const abi.DbOptions, user_data: u64) i32 {
+    return dbTxCall(.exec, tx, sql, params, nparams, opts, user_data);
+}
+
+fn dbTxFinish(what: db_mod.TxWhat, tx: u64, user_data: u64) i32 {
+    clearError();
+    if (badKind(tx, .db_tx)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    db_mod.txFinish(e, tx, what, user_data) catch |err| return dbFailure(err);
+    return abi.OK;
+}
+
+export fn anole_db_tx_commit(tx: u64, user_data: u64) i32 {
+    return dbTxFinish(.commit, tx, user_data);
+}
+
+export fn anole_db_tx_rollback(tx: u64, user_data: u64) i32 {
+    return dbTxFinish(.rollback, tx, user_data);
+}
+
+export fn anole_db_tx_release(tx: u64) i32 {
+    if (badKind(tx, .db_tx)) return wrongKind();
+    const e = live() orelse return abi.OK;
+    db_mod.txRelease(e, tx);
     return abi.OK;
 }

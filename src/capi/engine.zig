@@ -249,6 +249,12 @@ pub const Slot = struct {
     next_free: u32 = no_slot,
     /// A gRPC call's own state (`kind` grpc_call).
     grpc: grpc.SlotState = .{},
+    /// Database queries and transactions that serve this request or call
+    /// (`anole_db_options.req`): cut when it ends unanswered.
+    db_tied: ?*db.Tied = null,
+    /// The consumer answered it (any `handBack`): what is tied to it is then
+    /// left to finish.
+    answered: std.atomic.Value(bool) = .init(false),
 
     /// Above this, a slot's answer buffer is freed after use.
     const keep_capacity = 64 * 1024;
@@ -474,6 +480,8 @@ pub const Exec = struct {
     pub fn release(x: *Exec, i: u32) void {
         x.unlink(i);
         const s = &x.slots[i];
+        db.endTied(x, i, !s.answered.load(.acquire));
+        s.answered.store(false, .monotonic);
         const gen = genOf(s.word.load(.monotonic));
         x.closePipe(&s.in, gen, i);
         x.closePipe(&s.out, gen, i);
@@ -1542,7 +1550,7 @@ pub const Engine = struct {
         var last = e.first_gen;
         for (e.execs) |*x| {
             for (x.slots) |*s| last = @max(last, genOf(s.word.load(.acquire)));
-            last = @max(last, x.ws.maxGen(), x.wt.maxGen());
+            last = @max(last, x.ws.maxGen(), x.wt.maxGen(), x.db.maxGen());
         }
         next_first_gen = nextGen(last);
         if (global == e) global = null;
@@ -1570,6 +1578,7 @@ pub const Engine = struct {
             x.ws.deinit();
             x.grpc.deinit();
             x.wt.deinit();
+            x.db.deinit();
         }
         gpa.free(e.execs);
         if (comptime features.grpc) grpc.deinit(e);
@@ -1724,7 +1733,7 @@ pub fn errorErrno(err: anyerror) i32 {
         error.NotDir => .NOTDIR,
         else => return 0,
     };
-    return @intFromEnum(code);
+    return @backingInt(code);
 }
 
 // ---------------------------------------------------------------------------
@@ -2862,6 +2871,7 @@ fn claim(e: *Engine, hv: u64) AnswerError!struct { *Exec, *Slot, Handle } {
 
 /// Hands slot `si` to its executor (`done` or `streaming`).
 pub fn handBack(x: *Exec, s: *Slot, h: Handle, state: SlotState) void {
+    s.answered.store(true, .release);
     s.drained.store(false, .monotonic);
     s.word.store(pack(h.gen, state), .release);
     // Onto the executor's done list; only the push that finds it empty
@@ -3013,9 +3023,12 @@ pub fn handleRelease(e: *Engine, hv: u64) AnswerError!void {
             if (comptime !features.http3) return error.Over;
             return wt.streamOp(e, hv, .release, 0);
         },
-        // Database transactions: rolled back by the database layer (the
-        // handle kind is allocated; no transaction exists yet).
-        .db_tx => return error.Over,
+        // A database transaction: rolled back (a cleanup call: nothing to
+        // say when it is over).
+        .db_tx => {
+            if (comptime !features.sqlite and !features.postgres) return error.Over;
+            return db.txRelease(e, hv);
+        },
         .db_query, _ => return error.WrongKind,
     }
 }
@@ -3037,7 +3050,7 @@ pub fn respondFd(e: *Engine, hv: u64, status: u16, headers: []const CHeader, fd:
     }
     const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
     const st = file.stat(threadedIo()) catch {
-        engine_errno = @intFromEnum(std.posix.E.BADF);
+        engine_errno = @backingInt(std.posix.E.BADF);
         return error.Invalid;
     };
     if (st.kind != .file) return error.Invalid;
