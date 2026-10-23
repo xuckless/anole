@@ -1419,7 +1419,19 @@ pub const Client = struct {
     const Attempt = struct {
         result: FetchOut,
         statuses: []const u16,
+        /// Wall-clock seconds when the attempt ended (for Retry-After dates).
+        now_s: i64 = 0,
     };
+
+    /// A `Retry-After` value: delta-seconds, or an HTTP date (IMF-fixdate)
+    /// counted from `now_s`; a date in the past is no wait.
+    pub fn retryAfterValue(value: []const u8, now_s: i64) ?std.Io.Duration {
+        const v = std.mem.trim(u8, value, " \t");
+        if (std.fmt.parseInt(u32, v, 10)) |secs| return .fromSeconds(secs) else |_| {}
+        const date = @import("server/static.zig").parseHttpDate(v) orelse return null;
+        const secs = @max(0, date - now_s);
+        return .fromSeconds(@min(secs, std.math.maxInt(u32)));
+    }
 
     fn attemptFetch(ctx: *AttemptCtx, n: u32) Attempt {
         _ = n;
@@ -1435,7 +1447,8 @@ pub const Client = struct {
                 else => d,
             };
         }
-        return .{ .result = d.run(fetchFollowing, .{ ctx.client, ctx.state }), .statuses = ctx.client.config.retry_statuses };
+        const result = d.run(fetchFollowing, .{ ctx.client, ctx.state });
+        return .{ .result = result, .statuses = ctx.client.config.retry_statuses, .now_s = std.Io.Clock.real.now(ctx.client.io).toSeconds() };
     }
 
     fn transportVerdict(name: []const u8) resilience.Verdict {
@@ -1462,8 +1475,7 @@ pub const Client = struct {
             const code = @intFromEnum(resp.status());
             if (code != 429 and code != 503) return null;
             const value = resp.headers().get("Retry-After") orelse return null;
-            const secs = std.fmt.parseInt(u32, std.mem.trim(u8, value, " "), 10) catch return null;
-            return .fromSeconds(secs);
+            return retryAfterValue(value, a.now_s);
         }
         pub fn discard(a: *Attempt) void {
             if (a.result) |*resp| {

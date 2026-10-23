@@ -323,6 +323,7 @@ pub fn Client(comptime Service: type) type {
                 request: M.Request,
                 options: CallOptions,
                 started: std.Io.Clock.Timestamp,
+                attempt_timeout: ?std.Io.Duration = null,
             };
             const Judge = UnaryJudge(M.Response);
             const A = Judge.Attempt;
@@ -340,6 +341,11 @@ pub fn Client(comptime Service: type) type {
                             opts.timeout = .{ .nanoseconds = @max(1_000_000, t.nanoseconds - spent) };
                         }
                     }
+                    // One attempt's own bound (`Retry.attempt_timeout`), within
+                    // what is left of the call's.
+                    if (ctx.attempt_timeout) |at| {
+                        opts.timeout = if (opts.timeout) |t| .{ .nanoseconds = @min(t.nanoseconds, at.nanoseconds) } else at;
+                    }
                     var out = unaryOnce(M, ctx.ch, path(method), ctx.arena, ctx.request, opts);
                     // Not processed by the server: once more, not counted.
                     if (out) |o| {
@@ -349,7 +355,7 @@ pub fn Client(comptime Service: type) type {
                 }
             }.run;
             const now = std.Io.Clock.Timestamp.now(ch.conn.io, .awake);
-            var ctx: Ctx = .{ .ch = ch, .arena = arena, .request = request, .options = options, .started = now };
+            var ctx: Ctx = .{ .ch = ch, .arena = arena, .request = request, .options = options, .started = now, .attempt_timeout = if (policy_retry) |r| r.attempt_timeout else null };
             const rp: resilience.Policy = .{
                 .retry = policy_retry,
                 .breaker = if (ch.breaker) |*b| b else null,

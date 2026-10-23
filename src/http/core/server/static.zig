@@ -488,7 +488,7 @@ fn formatHttpDate(allocator: std.mem.Allocator, seconds: i64) ![]const u8 {
 /// Seconds since the epoch for an IMF-fixdate, or null for anything else.
 /// RFC 9110 also asks for the obsolete RFC 850 and asctime forms, which
 /// clients only send back when the server sent them.
-fn parseHttpDate(value: []const u8) ?i64 {
+pub fn parseHttpDate(value: []const u8) ?i64 {
     const v = std.mem.trim(u8, value, " \t");
     if (v.len != 29) return null;
     if (v[3] != ',' or v[4] != ' ' or v[7] != ' ' or v[11] != ' ' or v[16] != ' ' or v[19] != ':' or v[22] != ':') return null;
