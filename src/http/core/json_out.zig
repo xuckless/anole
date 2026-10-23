@@ -216,7 +216,7 @@ test "json out: renamed fields by outside names, nested and in slices" {
         .owner = null,
     };
     try expectJson(
-        \{"id":7,"userName":"Ann","priority":"high","note":"call back","ratio":2.5,"lines":[{"displayName":"milk","done":false},{"displayName":"bread","done":true}],"tags":["home","shop"],"owner":null}
+        \\{"id":7,"userName":"Ann","priority":"high","note":"call back","ratio":2.5,"lines":[{"displayName":"milk","done":false},{"displayName":"bread","done":true}],"tags":["home","shop"],"owner":null}
     , value, .{});
     try expectJson("{\"displayName\":\"x\"}", struct {
         display_name: []const u8,

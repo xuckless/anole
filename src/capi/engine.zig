@@ -1246,6 +1246,7 @@ pub const Engine = struct {
             .environment = cfg.environment,
             .deployment = cfg.deployment,
             .error_detail = cfg.error_detail,
+            .log = .{ .format = cfg.log.format, .service = cfg.log.service },
             .timeouts = .{
                 .request = request,
                 .read_header = msOrNull(cfg.timeouts.read_header_ms),

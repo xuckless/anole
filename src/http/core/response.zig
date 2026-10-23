@@ -4883,19 +4883,19 @@ fn expectProblemBody(p: http.Problem, expected: []const u8) !void {
 
 test "problem: member order, content type, field left out for the root, detail for 1 / N / truncated" {
     try expectProblemBody(.{ .errors = &.{.{ .in = .body, .code = "validation.not_blank", .message = "must not be blank" }} },
-        \{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"1 field is invalid.","errors":[{"in":"body","code":"validation.not_blank","message":"must not be blank"}]}
+        \\{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"1 field is invalid.","errors":[{"in":"body","code":"validation.not_blank","message":"must not be blank"}]}
     );
     try expectProblemBody(.{ .errors = &.{
         .{ .in = .query, .field = "page", .code = "http.invalid_type", .message = "must be an integer" },
         .{ .in = .header, .field = "X-Id", .code = "http.missing_field", .message = "is required" },
     } },
-        \{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"2 fields are invalid.","errors":[{"in":"query","field":"page","code":"http.invalid_type","message":"must be an integer"},{"in":"header","field":"X-Id","code":"http.missing_field","message":"is required"}]}
+        \\{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"2 fields are invalid.","errors":[{"in":"query","field":"page","code":"http.invalid_type","message":"must be an integer"},{"in":"header","field":"X-Id","code":"http.missing_field","message":"is required"}]}
     );
     try expectProblemBody(.{ .status = .conflict, .detail = "exists", .instance = "/todos/1" },
-        \{"type":"about:blank","title":"Conflict","status":409,"detail":"exists","instance":"/todos/1"}
+        \\{"type":"about:blank","title":"Conflict","status":409,"detail":"exists","instance":"/todos/1"}
     );
     try expectProblemBody(.{ .truncated = true, .errors = &.{.{ .code = "a.b", .message = "m" }} },
-        \{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"More than 1 fields are invalid; the first 1 are listed.","errors":[{"in":"body","code":"a.b","message":"m"}]}
+        \\{"type":"about:blank","title":"Unprocessable Content","status":422,"detail":"More than 1 fields are invalid; the first 1 are listed.","errors":[{"in":"body","code":"a.b","message":"m"}]}
     );
 }
 

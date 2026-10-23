@@ -67,14 +67,15 @@ pub fn In(comptime spec: anytype) type {
             @compileError("anole.In: unknown key ." ++ name ++ "; the keys are .path, .query, .headers and .body" ++ hint);
         }
     }
-    comptime checkSpec(parsed);
+    const final: InSpec = parsed;
+    comptime checkSpec(final);
     return struct {
-        path: parsed.path,
-        query: parsed.query,
-        headers: parsed.headers,
-        body: parsed.body,
+        path: final.path,
+        query: final.query,
+        headers: final.headers,
+        body: final.body,
 
-        pub const anole_in: InSpec = parsed;
+        pub const anole_in: InSpec = final;
     };
 }
 
@@ -344,7 +345,7 @@ pub fn adapt(comptime Ctx: type, comptime handler: anytype) dusty.Router(Ctx).Ha
 /// run-time string; `required_params` covers it at startup).
 pub fn checkRoute(comptime method: ?dusty.Method, comptime path: []const u8, comptime handler: anytype, comptime whole_path: bool) void {
     const handlers = @import("handlers.zig");
-    const name = comptime (if (method) |m| m.name() else "ANY");
+    const name = comptime (if (method) |m| upper(@tagName(m)) else "ANY");
     const where = "anole: route " ++ name ++ " " ++ path ++ ": ";
     if (comptime route_pattern.problem(path)) |p| @compileError(where ++ route_pattern.comptimeMessage(p));
     if (comptime handlers.isCached(@TypeOf(handler))) {
@@ -374,6 +375,15 @@ pub fn checkRoute(comptime method: ?dusty.Method, comptime path: []const u8, com
                 if (!found) @compileError(where ++ "anole.In path field \"" ++ fname ++ "\" is not a parameter of the route" ++ paramHint(params));
             }
         }
+    }
+}
+
+fn upper(comptime s: []const u8) []const u8 {
+    comptime {
+        var out: [s.len]u8 = undefined;
+        for (s, &out) |c, *o| o.* = std.ascii.toUpper(c);
+        const final = out;
+        return &final;
     }
 }
 

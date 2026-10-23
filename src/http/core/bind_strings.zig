@@ -161,6 +161,7 @@ pub fn map(comptime T: type, comptime source: Source, arena: Allocator, pairs: [
 /// header's name, copied into `arena`: `idempotency_key` is
 /// `Idempotency-Key`, `tags[1]` is `Tags[1]`.
 pub fn headerPath(comptime T: type, arena: Allocator, path: []const u8) Allocator.Error![]const u8 {
+    if (comptime @typeInfo(T) != .@"struct") return arena.dupe(u8, path);
     const end = std.mem.findAny(u8, path, "[.") orelse path.len;
     const info = @typeInfo(T).@"struct";
     inline for (info.field_names, info.field_attrs) |field, attrs| {

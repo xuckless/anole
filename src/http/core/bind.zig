@@ -443,9 +443,9 @@ pub fn toViolations(arena: Allocator, sink: *const Collector, in: http.Violation
 /// Runs the transforms of `value`'s `field_rules`, then its rules. Null
 /// when every rule holds. `fix` rewrites a rule path (headers).
 pub fn applyRules(comptime T: type, arena: Allocator, value: *T, in: http.Violation.Source) error{ OutOfMemory, TransformFailed }!?http.Violations {
-    v.transform(arena, value) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.TransformFailed,
+    v.transform(arena, value) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.TransformFailed;
     };
     const report = try v.checkAll(arena, value);
     if (report.violations.len == 0) return null;
