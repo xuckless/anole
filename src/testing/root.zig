@@ -324,9 +324,17 @@ pub fn Client(comptime S: type) type {
             var fields: std.ArrayList(inmem.Field) = .empty;
             var upgrade = false;
             if (comptime @hasField(@TypeOf(opts), "headers")) {
-                for (opts.headers) |h| {
-                    try fields.append(a, .{ .name = h[0], .value = h[1] });
-                    if (std.ascii.eqlIgnoreCase(h[0], "upgrade") and std.ascii.eqlIgnoreCase(h[1], "websocket")) upgrade = true;
+                const T = @TypeOf(opts.headers);
+                const Elem = switch (@typeInfo(T)) {
+                    .pointer => |p| p.child,
+                    else => T,
+                };
+                if (comptime @typeInfo(Elem) == .@"struct" and @typeInfo(Elem).@"struct".is_tuple) {
+                    // A literal list of pairs: `&.{ .{ "Name", "value" }, ... }`.
+                    const tuple = if (comptime @typeInfo(T) == .pointer) opts.headers.* else opts.headers;
+                    inline for (tuple) |h| try addField(a, &fields, &upgrade, h[0], h[1]);
+                } else {
+                    for (opts.headers) |h| try addField(a, &fields, &upgrade, h[0], h[1]);
                 }
             }
             if (upgrade) return error.WebSocketNotSupported;
@@ -361,6 +369,11 @@ pub fn Client(comptime S: type) type {
             placement.concurrent(&run.group, io, .local, RunT.task, .{ self.server.server, run }) catch return error.ConcurrencyUnavailable;
             run.started = true;
             return run;
+        }
+
+        fn addField(a: std.mem.Allocator, fields: *std.ArrayList(inmem.Field), upgrade: *bool, name: []const u8, value: []const u8) RequestError!void {
+            try fields.append(a, .{ .name = name, .value = value });
+            if (std.ascii.eqlIgnoreCase(name, "upgrade") and std.ascii.eqlIgnoreCase(value, "websocket")) upgrade.* = true;
         }
 
         fn defaultClient() std.Io.net.IpAddress {
@@ -570,8 +583,8 @@ fn jsonEqual(a: std.json.Value, b: std.json.Value) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) {
         // 1 and 1.0 are the same number.
         const num = struct {
-            fn f(v: std.json.Value) ?f64 {
-                return switch (v) {
+            fn f(val: std.json.Value) ?f64 {
+                return switch (val) {
                     .integer => |i| @floatFromInt(i),
                     .float => |x| x,
                     else => null,
@@ -799,3 +812,274 @@ pub const LogCapture = struct {
         return error.TestUnexpectedResult;
     }
 };
+
+// ------------------------------------------------------------------ tests
+
+const anole = @import("../root.zig");
+const v = anole.validate;
+
+const NewTodo = struct {
+    title: []const u8,
+    due: ?[]const u8 = null,
+    tags: []const []const u8 = &.{},
+
+    pub const field_rules = .{
+        .title = .{ v.trim, v.notBlank, v.maxLength(200) },
+        .due = v.date,
+        .tags = .{ v.maxItems(10), v.each(v.notEmpty) },
+    };
+};
+
+const Routes = struct {
+    fn hello(_: *anole.Request, res: *anole.Response) !void {
+        res.body = "hello";
+    }
+    fn create(req: *anole.Request, res: *anole.Response) !void {
+        const in = try req.bind(NewTodo);
+        res.status = .created;
+        try res.json(.{ .title = in.title, .id = 7 });
+    }
+    fn nothing(_: *anole.Request, res: *anole.Response) !void {
+        res.status = .no_content;
+    }
+    fn echoId(req: *anole.Request, res: *anole.Response) !void {
+        res.body = req.id;
+    }
+    fn size(req: *anole.Request, res: *anole.Response) !void {
+        const b = try req.body();
+        try res.print(.text, "{d}", .{if (b) |x| x.len else 0});
+    }
+    fn events(req: *anole.Request, res: *anole.Response) !void {
+        var buf: [256]u8 = undefined;
+        var stream = try res.startEventStream(&buf);
+        try stream.send("one", .{ .event = "first", .id = "1" });
+        try stream.send("two", .{});
+        _ = req;
+        try stream.end();
+    }
+    fn forever(req: *anole.Request, res: *anole.Response) !void {
+        var buf: [256]u8 = undefined;
+        var stream = try res.startEventStream(&buf);
+        while (true) {
+            try stream.send("tick", .{});
+            try req.io.sleep(.fromMilliseconds(5), .awake);
+        }
+    }
+    fn logs(req: *anole.Request, res: *anole.Response) !void {
+        req.log().info("seen", .{ .n = 1 });
+        res.body = "ok";
+    }
+};
+
+fn testApp() !anole.App {
+    return anole.App.init(std.testing.allocator, .{ .executors = .exact(1) });
+}
+
+test "client: GET a route; status, headers (content-length), body" {
+    var app = try testApp();
+    defer app.deinit();
+    app.get("/hello", Routes.hello);
+    var t = try client(&app);
+    defer t.deinit();
+    var res = try t.get("/hello", .{});
+    defer res.deinit();
+    try res.expectStatus(.ok);
+    try res.expectBody("hello");
+    try res.expectHeader("content-length", "5");
+}
+
+test "client: POST json -> 201; json(T) parses the answer" {
+    var app = try testApp();
+    defer app.deinit();
+    app.post("/todos", Routes.create);
+    var t = try client(&app);
+    defer t.deinit();
+    var res = try t.post("/todos", .{ .json = .{ .title = "  Buy milk " } });
+    defer res.deinit();
+    try res.expectStatus(.created);
+    const got = try res.json(struct { title: []const u8, id: u32 });
+    try std.testing.expectEqualStrings("Buy milk", got.title);
+    try std.testing.expectEqual(@as(u32, 7), got.id);
+    try res.expectJson(.{ .id = 7, .title = "Buy milk" });
+}
+
+test "client: 422 problem document; expectViolation finds the field and code" {
+    var app = try testApp();
+    defer app.deinit();
+    app.post("/todos", Routes.create);
+    var t = try client(&app);
+    defer t.deinit();
+    var res = try t.post("/todos", .{ .json = .{ .title = "   ", .tags = [_][]const u8{ "a", "" }, .due = "tomorrow" } });
+    defer res.deinit();
+    try res.expectStatus(.unprocessable_entity);
+    try res.expectHeader("content-type", "application/problem+json");
+    try res.expectViolation("title", "validation.not_blank");
+    try res.expectViolation("due", "validation.date");
+    try res.expectViolation("tags[1]", "validation.not_empty");
+}
+
+test "client: global and group middleware run (RequestId with trust_incoming echoes X-Request-Id)" {
+    var app = try testApp();
+    defer app.deinit();
+    app.use(anole.middleware.RequestId.init(.{ .trust_incoming = true }));
+    app.get("/id", Routes.echoId);
+    var t = try client(&app);
+    defer t.deinit();
+    var res = try t.get("/id", .{ .headers = &.{.{ "X-Request-Id", "abc-123" }} });
+    defer res.deinit();
+    try res.expectBody("abc-123");
+    try res.expectHeader("x-request-id", "abc-123");
+}
+
+test "client: HEAD has no body and keeps content-length; 204 has none" {
+    var app = try testApp();
+    defer app.deinit();
+    app.get("/hello", Routes.hello);
+    app.get("/none", Routes.nothing);
+    var t = try client(&app);
+    defer t.deinit();
+    var head_res = try t.head("/hello", .{});
+    defer head_res.deinit();
+    try head_res.expectStatus(.ok);
+    try head_res.expectBody("");
+    try head_res.expectHeader("content-length", "5");
+    var none = try t.get("/none", .{});
+    defer none.deinit();
+    try none.expectStatus(.no_content);
+    try none.expectBody("");
+    try std.testing.expect(none.header("content-length") == null);
+}
+
+test "client: a body over max_body_size is 413" {
+    var app = try anole.App.init(std.testing.allocator, .{ .executors = .exact(1), .limits = .{ .body_max = 8 } });
+    defer app.deinit();
+    app.post("/size", Routes.size);
+    var t = try client(&app);
+    defer t.deinit();
+    var ok = try t.post("/size", .{ .body = "12345678" });
+    defer ok.deinit();
+    try ok.expectBody("8");
+    var big = try t.post("/size", .{ .body = "123456789" });
+    defer big.deinit();
+    try big.expectStatus(.payload_too_large);
+}
+
+test "client: 404 and 405 with Allow" {
+    var app = try testApp();
+    defer app.deinit();
+    app.get("/hello", Routes.hello);
+    var t = try client(&app);
+    defer t.deinit();
+    var missing = try t.get("/nope", .{});
+    defer missing.deinit();
+    try missing.expectStatus(.not_found);
+    var wrong = try t.post("/hello", .{});
+    defer wrong.deinit();
+    try wrong.expectStatus(.method_not_allowed);
+    try std.testing.expect(wrong.header("allow") != null);
+}
+
+test "client: a Server(Ctx) handler reads its state" {
+    const State = struct {
+        greeting: []const u8,
+        fn hi(self: *@This(), _: *anole.Request, res: *anole.Response) !void {
+            res.body = self.greeting;
+        }
+    };
+    var state: State = .{ .greeting = "from state" };
+    var app = try anole.Server(State).init(std.testing.allocator, .{ .executors = .exact(1) }, &state);
+    defer app.deinit();
+    app.get("/hi", State.hi);
+    var t = try client(&app);
+    defer t.deinit();
+    var res = try t.get("/hi", .{});
+    defer res.deinit();
+    try res.expectBody("from state");
+}
+
+test "client: an Upgrade: websocket request is WebSocketNotSupported" {
+    var app = try testApp();
+    defer app.deinit();
+    app.get("/hello", Routes.hello);
+    var t = try client(&app);
+    defer t.deinit();
+    try std.testing.expectError(error.WebSocketNotSupported, t.get("/hello", .{ .headers = &.{.{ "Upgrade", "websocket" }} }));
+}
+
+test "client: a route conflict makes client() fail with RouteConflict" {
+    var app = try testApp();
+    defer app.deinit();
+    app.get("/a/:id", Routes.hello);
+    app.get("/a/:name", Routes.hello);
+    try std.testing.expect(app.routeConflict() != null);
+    try std.testing.expectError(error.RouteConflict, client(&app));
+}
+
+test "open: SSE events in order, then null after the handler returns" {
+    var app = try testApp();
+    defer app.deinit();
+    app.get("/events", Routes.events);
+    var t = try client(&app);
+    defer t.deinit();
+    const stream = try t.open(.get, "/events", .{});
+    defer stream.deinit();
+    try std.testing.expectEqual(dusty.Status.ok, stream.status);
+    try std.testing.expectEqualStrings("text/event-stream", stream.header("content-type").?);
+    const first = (try stream.nextEvent()).?;
+    try std.testing.expectEqualStrings("one", first.data);
+    try std.testing.expectEqualStrings("first", first.event.?);
+    try std.testing.expectEqualStrings("1", first.id.?);
+    const second = (try stream.nextEvent()).?;
+    try std.testing.expectEqualStrings("two", second.data);
+    try std.testing.expect(second.event == null);
+    try std.testing.expect((try stream.nextEvent()) == null);
+}
+
+test "open: close() makes the handler's next write fail and waits for it" {
+    var app = try testApp();
+    defer app.deinit();
+    app.get("/forever", Routes.forever);
+    var t = try client(&app);
+    defer t.deinit();
+    const stream = try t.open(.get, "/forever", .{});
+    const e = (try stream.nextEvent()).?;
+    try std.testing.expectEqualStrings("tick", e.data);
+    stream.deinit();
+}
+
+test "LogCapture: req.log() in json format carries request_id from X-Request-Id" {
+    var app = try testApp();
+    defer app.deinit();
+    app.use(anole.middleware.RequestId.init(.{ .trust_incoming = true }));
+    app.get("/logs", Routes.logs);
+    var t = try client(&app);
+    defer t.deinit();
+    var capture = LogCapture.init(std.testing.allocator);
+    defer capture.deinit();
+    anole_log.setFormat(.json);
+    defer anole_log.setFormat(.text);
+    capture.start();
+    var res = try t.get("/logs", .{ .headers = &.{.{ "X-Request-Id", "req-9" }} });
+    defer res.deinit();
+    try capture.expectContains("\"request_id\":\"req-9\"");
+    try capture.expectContains("\"message\":\"seen\",");
+}
+
+test "client: sqlite :memory: connector is started" {
+    if (comptime !anole.features.sqlite) return error.SkipZigTest;
+    const Db = struct {
+        fn count(req: *anole.Request, res: *anole.Response) !void {
+            _ = req;
+            res.body = "ok";
+        }
+    };
+    var app = try testApp();
+    defer app.deinit();
+    _ = try app.sqlite(":memory:");
+    app.get("/count", Db.count);
+    var t = try client(&app);
+    defer t.deinit();
+    var res = try t.get("/count", .{});
+    defer res.deinit();
+    try res.expectStatus(.ok);
+}
