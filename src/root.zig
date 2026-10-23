@@ -273,6 +273,11 @@ pub const sqlite = if (features.sqlite) @import("sqlite/root.zig") else struct {
 /// reads and writes. `app.mongodb(.{})` connects from `MONGODB_URI`.
 pub const mongodb = if (features.mongodb) @import("mongodb/root.zig") else struct {};
 
+/// A NATS client on std.Io (`-Dnats`): publish, request/reply, handlers,
+/// queue groups, TLS, token/NKey/creds auth and JetStream.
+/// `app.nats(.{})` connects from `NATS_URL`.
+pub const nats = if (features.nats) @import("nats/root.zig") else struct {};
+
 /// BSON (`-Dmongodb`): documents, the struct mapping, ObjectId, Decimal128
 /// and Extended JSON, as the MongoDB client reads and writes them.
 pub const bson = if (features.mongodb) @import("bson") else struct {};
@@ -340,6 +345,7 @@ test {
     _ = db;
     _ = pg;
     _ = mongodb;
+    _ = nats;
     _ = @import("net/client_stream.zig");
     _ = session;
     _ = early_data;
