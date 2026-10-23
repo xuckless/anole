@@ -730,6 +730,14 @@ pub const Stream = struct {
         return self.id > self.conn.goaway_last_id and !self.head_ready;
     }
 
+    /// The error code of the RST_STREAM that ended the stream (the
+    /// server's, or the echo of one sent here); null when it did not end
+    /// in a reset.
+    pub fn resetCode(self: *const Stream) ?u64 {
+        if (self.cause != null and self.cause.? == error.StreamReset) return self.error_code;
+        return null;
+    }
+
     /// Waits for the response head (`status`, `headers`).
     pub fn waitHead(self: *Stream) StreamError!void {
         const conn = self.conn;

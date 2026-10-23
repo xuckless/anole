@@ -1617,7 +1617,7 @@ test "h3 client: unprocessed is true after H3_REQUEST_REJECTED and for a request
     s.conn = &conn;
     s.id = 4;
     s.status = 0;
-    s.reset_code = 0;
+    s.reset_code = null;
     conn.goaway_id = std.math.maxInt(i64);
     // Nothing happened to it.
     try std.testing.expect(!s.unprocessed());
@@ -1627,7 +1627,7 @@ test "h3 client: unprocessed is true after H3_REQUEST_REJECTED and for a request
     // Another error code is not "unprocessed".
     s.reset_code = h.NGHTTP3_H3_REQUEST_CANCELLED;
     try std.testing.expect(!s.unprocessed());
-    s.reset_code = 0;
+    s.reset_code = null;
     // GOAWAY(8): streams at or above 8 were not processed, those below were
     // (unless they have no head, below it they carry on).
     conn.goaway_id = 8;
