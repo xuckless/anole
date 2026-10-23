@@ -3,10 +3,10 @@
 # Grpc.Tools' bundled protoc is glibc-linked. run.sh builds the image when
 # it is missing and tags it with this file's hash.
 #
-# Pin the base image by digest (`docker buildx imagetools inspect`) and
-# libmsquic by version (`apt-cache policy libmsquic`) once a run is green;
-# .NET 7+ needs libmsquic 2.2 or later.
-FROM mcr.microsoft.com/dotnet/sdk:10.0-noble
+# The base image is pinned by digest (`docker buildx imagetools inspect`)
+# and libmsquic by version (`apt-cache policy libmsquic`); .NET 7+ needs
+# libmsquic 2.2 or later. Green with these pins on 2026-10-23 (aarch64).
+FROM mcr.microsoft.com/dotnet/sdk:10.0-noble@sha256:747cbade5bfd918a175ac32f8f1d931edec2c7d0d5397a3de72eaef1ac1f66d2
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git openssl \
@@ -14,7 +14,7 @@ RUN apt-get update \
  && dpkg -i /tmp/ms.deb \
  && rm /tmp/ms.deb \
  && apt-get update \
- && apt-get install -y --no-install-recommends libmsquic \
+ && apt-get install -y --no-install-recommends libmsquic=2.6.3 \
  && rm -rf /var/lib/apt/lists/*
 
 # Fails loudly when QUIC is missing.

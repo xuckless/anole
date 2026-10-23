@@ -68,6 +68,11 @@ fn streamingInputCall(call: *Call, in: *std.Io.Queue(pb.StreamingInputCallReques
             error.Closed => break,
             else => |e| return e,
         };
+        // The probe of client_compressed_streaming: an uncompressed message
+        // that expects compression is refused at once, before the client
+        // half-closes (grpc-dotnet waits for the status without closing).
+        if (req.expect_compressed) |e| if (e.value and call.requestCompression() == .identity)
+            return call.fail(.invalid_argument, "expected a compressed request");
         if (req.payload) |p| total += @intCast(p.body.len);
     }
     return .{ .aggregated_payload_size = total };
