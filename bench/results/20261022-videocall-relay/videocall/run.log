@@ -1,0 +1,27 @@
+19:11:54 anole ws: ramp
+19:34:13 bun ws: ramp
+19:55:58 bun ws: stopped: refusing users for 30 s at 2610 users after 21m45s [running exit=0 oom=false]
+19:57:08 fiber ws: ramp
+20:06:52 fiber ws: stopped: collapsed (under 10% of video frames shown for 30s) at 1170 users after 9m43s [running exit=0 oom=false]
+20:08:02 axum ws: ramp
+20:19:12 axum ws: stopped: collapsed (under 10% of video frames shown for 30s) at 1340 users after 11m10s [running exit=0 oom=false]
+20:20:23 bun wt: ramp
+20:21:55 bun wt: stopped: collapsed (under 10% of video frames shown for 30s) at 190 users after 1m32s [running exit=0 oom=false]
+20:23:06 fiber wt: ramp
+20:27:05 fiber wt: stopped: collapsed (under 10% of video frames shown for 30s) at 480 users after 3m59s [running exit=0 oom=false]
+20:28:15 axum wt: ramp
+20:33:24 axum wt: stopped: collapsed (under 10% of video frames shown for 30s) at 620 users after 5m8s [running exit=0 oom=false]
+20:34:34 anole wt: ramp
+20:38:57 anole wt: stopped: collapsed (under 10% of video frames shown for 30s) at 530 users after 4m23s [running exit=0 oom=false]
+20:40:07 anole ws: ramp
+20:47:09 anole ws: stopped: collapsed (under 10% of video frames shown for 30s) at 850 users after 7m1s [running exit=0 oom=false]
+20:47:09 quality pass
+/run: 84 steps scored (intact VMAF 99.88)
+/run: 52 steps scored (intact VMAF 99.88)
+/run: 133 steps scored (intact VMAF 99.88)
+/run: 61 steps scored (intact VMAF 99.88)
+/run: 260 steps scored (intact VMAF 99.88)
+/run: 18 steps scored (intact VMAF 99.88)
+/run: 116 steps scored (intact VMAF 99.88)
+/run: 47 steps scored (intact VMAF 99.88)
+20:50:40 chart: /home/xuckl/Dev/anole/bench/results/20261022-videocall-relay/videocall/index.html

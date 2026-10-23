@@ -21,7 +21,7 @@ type ramp struct {
 	step, maxTime, collapse      time.Duration
 	videoDeadline, audioDeadline time.Duration
 	chatEvery                    time.Duration
-	maxUsers                     int
+	maxUsers, batch              int
 
 	d     *dialer
 	start time.Time
@@ -159,8 +159,15 @@ func (r *ramp) run() error {
 				reason = "max users"
 				break
 			}
-			u := r.newUser(n)
-			go u.run(usersF)
+			for i := 0; i < r.batch; i++ {
+				if i == 2 && n == 0 {
+					// Users 0 and 1 are the probe call: let them pair
+					// before the rest of the first batch joins the lobby.
+					time.Sleep(500 * time.Millisecond)
+				}
+				u := r.newUser(n + i)
+				go u.run(usersF)
+			}
 			nextUser = nextUser.Add(r.step)
 		}
 		<-tick.C
@@ -212,7 +219,7 @@ func (r *ramp) run() error {
 	r.probeMu.Unlock()
 	sum := map[string]any{"transport": r.transport, "url": r.base, "stop": reason, "users": r.count(),
 		"start_us": r.start.UnixMicro(), "media_deflate": os.Getenv("MEDIA_DEFLATE") != "off",
-		"seconds": int(time.Since(r.start).Seconds()), "step_s": r.step.Seconds(), "clip": r.clip.String(),
+		"seconds": int(time.Since(r.start).Seconds()), "step_s": r.step.Seconds(), "batch": r.batch, "clip": r.clip.String(),
 		"video_deadline_ms": r.videoDeadline.Milliseconds(), "audio_deadline_ms": r.audioDeadline.Milliseconds(),
 		"mem_peak_mb": cg.peakMB}
 	f, _ := os.Create(filepath.Join(r.out, "summary.json"))

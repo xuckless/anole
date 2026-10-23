@@ -1,0 +1,1 @@
+{"audio_deadline_ms":150,"batch":10,"clip":"1800 frames (GOP 60, 4.02 Mbit/s), 3001 audio packets (64 kbit/s)","media_deflate":false,"mem_peak_mb":358.5546875,"seconds":1305,"start_us":1792712053462752,"step_s":5,"stop":"refusing users for 30 s","transport":"ws","url":"https://127.0.0.1:8443","users":2610,"video_deadline_ms":200}

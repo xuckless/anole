@@ -7,6 +7,7 @@
 #   bench/videocall/run.sh [results-id]          # all of it
 #   SERVERS="anole bun" TRANSPORTS=ws STEP=5s bench/videocall/run.sh test-1
 #   MEDIA_DEFLATE=off bench/videocall/run.sh <id>   # a pure relay
+#   EXTRA="-batch 10" SKIP="anole-ws" bench/videocall/run.sh <id>   # 10 users a step
 #
 # Server: 1 CPU (SUT_CPUS_1) / 2 GB, no swap. Load generator: LOAD_CPUS.
 # Images: anole-bench/vc-<app> (each servers/<app>/Dockerfile),
@@ -24,6 +25,8 @@ REST=${REST:-70}
 EXTRA=${EXTRA:-}
 # off: the servers relay media as it came, without deflating it.
 MEDIA_DEFLATE=${MEDIA_DEFLATE:-on}
+# app-transport pairs already measured in this results directory, kept as they are.
+SKIP=${SKIP:-}
 media=$bench/.data/media/vc
 sh "$bench/lib/certs.sh" >/dev/null
 [ -f "$media/video.h264" ] || docker run --rm -v "$media:/out:z" anole-bench/vc-media sh -c "gen.sh /out >/dev/null && chown -R $(id -u):$(id -g) /out"
@@ -37,6 +40,7 @@ for transport in $TRANSPORTS; do
   for ((i = 0; i < n; i++)); do
     app=${servers[$(((i + k) % n))]}
     dir=$out/$app-$transport
+    case " $SKIP " in *" $app-$transport "*) continue ;; esac
     rm -rf "$dir"
     mkdir -p "$dir"
     sleep "$REST"
@@ -70,6 +74,8 @@ for transport in $TRANSPORTS; do
   k=$((k + 1))
 done
 
+# QUALITY=0 leaves the quality pass and the page to a later invocation.
+[ "${QUALITY:-1}" = 0 ] && exit 0
 log "quality pass"
 for d in "$out"/*-*/; do
   [ -f "$d/probe.csv" ] || continue

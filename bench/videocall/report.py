@@ -51,13 +51,16 @@ def main():
         for r in rows:
             if (r["video_ok"] or 0) >= GOOD["video_ok"] and (r["audio_ok"] or 0) >= GOOD["audio_ok"] \
                     and (r["lat_video_p95_ms"] or 1e9) <= GOOD["lat_video_p95_ms"]:
-                good = r["users"]
+                # Users actually served: past its limit a server may stop
+                # taking new users while the connected ones still do fine.
+                good = max(good, r["connected"] or 0)
             elif r["users"] > 4:
                 break
         runs.setdefault(transport, {})[app] = {
             "rows": rows, "stop": summary.get("stop", "not run"), "users": summary.get("users", 0),
             "seconds": summary.get("seconds"), "mem_peak_mb": summary.get("mem_peak_mb"),
             "container": container.get("container", ""), "good_users": good, "clip": summary.get("clip", ""),
+            "batch": summary.get("batch", 1),
         }
     data = json.dumps(runs, separators=(",", ":"))
     html = PAGE.replace("/*DATA*/null", data)
@@ -139,7 +142,8 @@ th { color: var(--muted); font-weight: 600; font-size: 13px; }
 
 <h2>Summary</h2>
 <div class="panel tablewrap"><table id="summary"></table>
-<p class="note">Good quality: at least 99% of video frames shown and 99% of audio packets played on time, with video p95 one-way latency at most 200 ms. "Shown" means arrived within 200 ms and every frame since its keyframe did too. VMAF and PSNR are for the probe call (users 0 and 1), rebuilt frame by frame from what arrived.</p></div>
+<p class="note">Good quality: at least 99% of video frames shown and 99% of audio packets played on time, with video p95 one-way latency at most 200 ms. "Shown" means arrived within 200 ms and every frame since its keyframe did too. VMAF and PSNR are for the probe call (users 0 and 1), rebuilt frame by frame from what arrived.</p>
+<p class="note">CPU: the container is charged for its own work and its system calls, but not for the kernel's network interrupt work on its core. At saturation that is 10&ndash;25% of the core, so a full core shows as 0.73&ndash;0.88 here. Users are added 10 at a time every 5 s.</p></div>
 </main>
 <script>
 const DATA = /*DATA*/null;
@@ -154,7 +158,7 @@ const METRICS = [
   { key: "probe_video_psnr_db", label: "PSNR (probe call)", unit: "dB", max: 60 },
   { key: "probe_audio_snr_db", label: "Audio SNR (probe call)", unit: "dB", max: 60 },
   { key: "mem_mb", label: "Server memory", unit: "MB" },
-  { key: "cpu", label: "Server CPU", unit: "cores", max: 1.05 },
+  { key: "cpu", label: "Server CPU charged to the container", unit: "cores", max: 1.05 },
   { key: "error_rate", label: "Error rate", unit: "%", scale: 100 },
   { key: "in_call", label: "Users in a call", unit: "" },
 ];
@@ -181,8 +185,13 @@ function buildControls() {
     seg.appendChild(b);
   }
   const s = document.getElementById("users");
+  // Runs that add 10 users a step have rows every 10 users; the slider
+  // moves in 10s then, and single-step runs are read at the same counts.
+  const step = Math.max(1, ...apps().map(a => runs()[a].batch || 1));
+  s.step = step;
+  s.min = step;
   s.max = maxUsers();
-  users = Math.min(users, maxUsers());
+  users = Math.max(step, Math.round(Math.min(users, maxUsers()) / step) * step);
   s.value = users;
   s.oninput = () => { users = +s.value; update(); };
 }

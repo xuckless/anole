@@ -6,7 +6,7 @@
 //	       -cgroup /host/cgroup/system.slice/docker-<id>.scope -out results/vc/anole-wt
 //
 // -smoke runs the protocol end to end with three users and prints each
-// check. Otherwise it ramps: one more user every -step until the server
+// check. Otherwise it ramps: -batch more users (default 1) every -step until the server
 // crashes (its cgroup goes away, or an OOM kill), stops answering, or calls
 // collapse. Each user streams the clip's H.264 video and Opus audio to its
 // peer at real time, and chats every 3 s. It writes seconds.jsonl (one line
@@ -32,6 +32,7 @@ func main() {
 	cgroup := flag.String("cgroup", "", "the server's cgroup directory (memory, CPU, OOM and crash detection)")
 	out := flag.String("out", "", "output directory (ramp)")
 	step := flag.Duration("step", 5*time.Second, "time between added users")
+	batch := flag.Int("batch", 1, "users added each step")
 	maxUsers := flag.Int("max-users", 3000, "stop after this many users")
 	maxTime := flag.Duration("max-time", 2*time.Hour, "stop after this long")
 	collapse := flag.Duration("collapse", 30*time.Second, "stop when calls stay collapsed this long")
@@ -61,7 +62,7 @@ func main() {
 		os.Exit(1)
 	}
 	r := &ramp{base: *url, transport: *transport, clip: c, cgroup: *cgroup, out: *out, step: *step,
-		maxUsers: *maxUsers, maxTime: *maxTime, collapse: *collapse, videoDeadline: *videoDeadline,
+		maxUsers: *maxUsers, batch: max(1, *batch), maxTime: *maxTime, collapse: *collapse, videoDeadline: *videoDeadline,
 		audioDeadline: *audioDeadline, chatEvery: *chatEvery}
 	if err := r.run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

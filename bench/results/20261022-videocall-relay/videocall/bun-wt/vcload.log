@@ -1,0 +1,11 @@
+vcload wt https://127.0.0.1:8443: 1800 frames (GOP 60, 4.02 Mbit/s), 3001 audio packets (64 kbit/s); one user every 5s
+   10s users   20 connected   20 in call   20  video ok 100.0%  p99   29.0 ms  mem     34 MB  cpu 0.37  load 0.18
+   20s users   40 connected   40 in call   40  video ok 100.0%  p99   34.9 ms  mem     42 MB  cpu 0.54  load 0.36
+   30s users   60 connected   60 in call   60  video ok 100.1%  p99   63.1 ms  mem     57 MB  cpu 0.69  load 0.57
+   40s users   80 connected   80 in call   80  video ok 100.2%  p99  100.3 ms  mem     59 MB  cpu 0.81  load 0.73
+   50s users  100 connected  100 in call  100  video ok  89.8%  p99  161.2 ms  mem     67 MB  cpu 0.87  load 0.96
+   60s users  120 connected  120 in call  120  video ok  55.0%  p99  353.8 ms  mem     67 MB  cpu 0.88  load 1.12
+   70s users  140 connected  140 in call  140  video ok   1.4%  p99 2701.5 ms  mem     85 MB  cpu 0.88  load 1.18
+   80s users  160 connected  140 in call  140  video ok   0.0%  p99 5981.7 ms  mem     93 MB  cpu 0.88  load 1.19
+   90s users  180 connected  144 in call  144  video ok   0.2%  p99 8572.5 ms  mem     88 MB  cpu 0.88  load 1.22
+stopped: collapsed (under 10% of video frames shown for 30s) at 190 users after 1m32s
