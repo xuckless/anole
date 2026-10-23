@@ -471,3 +471,19 @@ test "lambda: the event path is reserved for events" {
     try serveUntil(&app, &f, 1);
     try std.testing.expect(has(f.post(0).body, "\"statusCode\":404"));
 }
+
+test "lambda: a watch is not started under lambda; invocations are served" {
+    if (comptime !anole.features.redis) return error.SkipZigTest;
+    var f: Fake = undefined;
+    try f.start(&.{.{ .request_id = "r-watch", .event = http_api_get }});
+    defer f.stop();
+    var app = try lambdaApp(&f, .{ .sigterm = false });
+    defer app.deinit();
+    app.get("/hello", hello);
+    // Nothing listens on port 1: a started watch would keep reconnecting.
+    const rc = try app.redis(.{ .url = "redis://127.0.0.1:1", .environ = .empty });
+    const w = try app.watch(.{ .redis = .{ .client = rc, .channels = &.{"orders"} } }, .{});
+    try serveUntil(&app, &f, 1);
+    try std.testing.expect(w.disabled and !w.started);
+    try std.testing.expect(has(f.post(0).body, "\"statusCode\":200"));
+}
