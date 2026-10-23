@@ -11,6 +11,7 @@
 const std = @import("std");
 const dusty = @import("dusty");
 const ResponseCache = @import("cache/response.zig").ResponseCache;
+const typed = @import("typed.zig");
 
 /// `handler` as the router of a `Server(Ctx)` takes it: as it is when it
 /// already has that shape, or wrapped when it is a `(req, res)` handler on a
@@ -23,6 +24,8 @@ pub fn adapt(comptime Ctx: type, comptime handler: anytype) dusty.Router(Ctx).Ha
         .@"fn" => |f| f,
         else => @compileError("a handler is a function taking (*anole.Request, *anole.Response), not " ++ @typeName(F)),
     };
+    // Typed inputs or output (anole.In, a result type): see typed.zig.
+    if (comptime typed.shapeOf(F).typed) return typed.adapt(Ctx, handler);
     const want = if (Ctx == void) 2 else 3;
     if (info.param_types.len == want) return handler;
     if (Ctx != void and info.param_types.len == 2) return struct {
@@ -100,7 +103,25 @@ pub fn isCached(comptime T: type) bool {
 pub fn routeOptions(comptime handler: anytype) dusty.RouteOptions {
     const F = @TypeOf(handler);
     if (comptime isCached(F)) return routeOptions(F.cached_handler);
-    return .{ .no_wait = comptime isNoWait(F) };
+    return .{ .no_wait = comptime isNoWait(F), .required_params = comptime typed.requiredParams(handler) };
+}
+
+/// The function type inside `noWait` and `cached` markers (`F` itself for
+/// a bare function).
+pub fn Unwrapped(comptime F: type) type {
+    if (isNoWait(F)) return Unwrapped(@TypeOf(F.no_wait_handler));
+    if (isCached(F)) return Unwrapped(@TypeOf(F.cached_handler));
+    return F;
+}
+
+/// The handler function inside `noWait` / `cached` markers, as a pointer
+/// to it: what tools that read a handler's signature (`anole.routeInfo`,
+/// OpenAPI) start from.
+pub fn unwrap(comptime handler: anytype) *const Unwrapped(@TypeOf(handler)) {
+    const F = @TypeOf(handler);
+    if (comptime isNoWait(F)) return unwrap(F.no_wait_handler);
+    if (comptime isCached(F)) return unwrap(F.cached_handler);
+    return &handler;
 }
 
 /// What a function middleware calls to run the rest of the chain (the

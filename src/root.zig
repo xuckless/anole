@@ -187,6 +187,37 @@ pub const Request = http.Request;
 /// What a handler writes: `res.status`, `res.body`, `res.json(value)`,
 /// `res.header(name, value)`, `res.fail(status, message)`.
 pub const Response = http.Response;
+/// Validation rules declared on structs (`pub const field_rules = .{ ... }`),
+/// checked by `req.bind`, `req.bindQuery` and `anole.In`; from
+/// vkiryakov/zefir. docs/validation.md. Usually `const v = anole.validate;`.
+pub const validate = @import("validate");
+/// Typed handler inputs, a handler's last parameter:
+/// `fn (req: *anole.Request, in: anole.In(.{ .path = P, .body = B })) !Out`.
+/// docs/routing.md.
+pub const In = @import("typed.zig").In;
+/// Typed handler outputs: 201 with a `Location`, 202, any 2xx.
+pub const Created = @import("typed.zig").Created;
+pub const Accepted = @import("typed.zig").Accepted;
+pub const WithStatus = @import("typed.zig").WithStatus;
+/// What a handler takes and returns, read from its signature (for tools
+/// such as OpenAPI): `anole.routeInfo(handler)`.
+pub const RouteInfo = @import("typed.zig").RouteInfo;
+pub const routeInfo = @import("typed.zig").routeInfo;
+/// One problem in a request's input; `req.violations()`.
+pub const Violation = http.Violation;
+pub const Violations = http.Violations;
+/// An RFC 9457 problem document: `res.problem(.{ ... })`.
+pub const Problem = http.Problem;
+/// JSON bytes as a `T` checked by its `field_rules`, with no request.
+pub const bindJson = http.bindJson;
+pub const BindResult = http.BindResult;
+pub const BindOptions = http.BindOptions;
+/// Structured logs, in text or JSON Lines: `anole.log.info("msg", .{ .k = v })`,
+/// `req.log()`. docs/logging.md.
+pub const log = @import("anole_log");
+/// An in-memory client for routes and middleware, no sockets:
+/// `var t = try anole.testing.client(&app);`. docs/testing.md.
+pub const testing = @import("testing/root.zig");
 /// The built-in middleware: the HTTP core's (`Cors`, `Compress`,
 /// `RequestId`, `Logger`) and `ResponseCache`. Sessions are
 /// `anole.session.Middleware`, rate limits `anole.ratelimit.Middleware`,
@@ -356,6 +387,8 @@ test {
     _ = @import("panic.zig");
     _ = @import("fuzz.zig");
     _ = @import("log.zig");
+    _ = @import("typed.zig");
+    _ = testing;
     _ = http;
     _ = resilience;
     _ = tls;

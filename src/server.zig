@@ -52,6 +52,16 @@ const ratelimit = @import("ratelimit/root.zig");
 const h3 = if (features.http3) @import("h3/root.zig") else struct {};
 const address_mod = @import("address.zig");
 const handlers = @import("handlers.zig");
+const typed = @import("typed.zig");
+const anole_log = @import("anole_log");
+const log_mod = @import("log.zig");
+const route_pattern = @import("dusty").route_pattern;
+
+/// The compile-time pattern check of a route that is not an ordinary
+/// handler route (WebSocket, WebTransport).
+fn checkPattern(comptime method: []const u8, comptime path: []const u8) void {
+    if (route_pattern.problem(path)) |p| @compileError("anole: route " ++ method ++ " " ++ path ++ ": " ++ route_pattern.comptimeMessage(p));
+}
 const ResponseCache = @import("cache/response.zig").ResponseCache;
 const client_mod = @import("client.zig");
 const observe = @import("observe/root.zig");
@@ -193,6 +203,10 @@ pub const Options = struct {
     /// mapping, which it can fall back on with `anole.defaultError(req,
     /// res, err)`: no `Ctx` with `uncaughtError` needed.
     error_handler: ?http.ErrorHandler = null,
+    /// Logging, process-wide: the format (`.auto`: JSON Lines in production,
+    /// text otherwise), a level filter, a service name written in every
+    /// JSON record. docs/logging.md.
+    log: anole_log.Options = .{},
 
     // Modes (docs/config.md)
 
@@ -900,6 +914,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 };
             }
 
+            applyLogOptions(&opts, mode);
+
             const rt = try zio.Runtime.init(gpa, .{
                 .executors = opts.executors,
                 .stack_pool = .{
@@ -980,6 +996,20 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 try self.listenOn(opts);
             }
             return self;
+        }
+
+        /// The log format, level and service name (process-wide), after the
+        /// modes are resolved and before anything logs.
+        fn applyLogOptions(opts: *const Options, mode: *const modes.Resolved) void {
+            const format: anole_log.Format = switch (opts.log.format) {
+                .auto => if (mode.log_json_from_mode) .json else .text,
+                else => |f| f,
+            };
+            anole_log.setFormat(format);
+            anole_log.setLevel(opts.log.level);
+            anole_log.setService(opts.log.service);
+            if (format == .json and !log_mod.usesAnoleLogFn() and !anole_log.hasSink())
+                std.log.scoped(.anole).warn("log format is json, but this program's std.log lines stay text: add `pub const std_options = anole.std_options;` to the root file", .{});
         }
 
         /// The modes for `opts`: the environment, the `.env` files it reads,
@@ -1628,6 +1658,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             target.addRouteWith(method, path, route(handler), handlers.routeOptions(handler));
         }
 
+        /// A route whose path is known only at run time (from configuration):
+        /// `null` method is every method, as `any`. Checked when registered
+        /// (a malformed pattern or a conflict panics, or is recorded in test
+        /// builds), as the compile-time checks of `get` and the others would.
+        ///
+        ///     app.addRoute(.get, cfg.health_path, health);
+        pub fn addRoute(self: *Self, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
+            self.register(self.router, method, path, handler);
+        }
+
         /// A `ResponseCache` owned by the server, for `with`, `group` or
         /// `use`; it reports to `app.metrics` once serving starts and is
         /// freed with the server. `anole.cached` makes one per route.
@@ -1650,41 +1690,50 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// when the route is already registered or conflicts with another.
         ///
         ///     app.get("/users/:id", getUser);
-        pub fn get(self: *Self, path: []const u8, comptime handler: anytype) void {
+        pub fn get(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            comptime typed.checkRoute(.get, path, handler, true);
             self.register(self.router, .get, path, handler);
         }
         /// As `get`, for HEAD.
-        pub fn head(self: *Self, path: []const u8, comptime handler: anytype) void {
+        pub fn head(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            comptime typed.checkRoute(.head, path, handler, true);
             self.register(self.router, .head, path, handler);
         }
         /// As `get`, for POST.
-        pub fn post(self: *Self, path: []const u8, comptime handler: anytype) void {
+        pub fn post(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            comptime typed.checkRoute(.post, path, handler, true);
             self.register(self.router, .post, path, handler);
         }
         /// As `get`, for PUT.
-        pub fn put(self: *Self, path: []const u8, comptime handler: anytype) void {
+        pub fn put(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            comptime typed.checkRoute(.put, path, handler, true);
             self.register(self.router, .put, path, handler);
         }
         /// As `get`, for PATCH.
-        pub fn patch(self: *Self, path: []const u8, comptime handler: anytype) void {
+        pub fn patch(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            comptime typed.checkRoute(.patch, path, handler, true);
             self.register(self.router, .patch, path, handler);
         }
         /// As `get`, for DELETE.
-        pub fn delete(self: *Self, path: []const u8, comptime handler: anytype) void {
+        pub fn delete(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            comptime typed.checkRoute(.delete, path, handler, true);
             self.register(self.router, .delete, path, handler);
         }
         /// As `get`, for OPTIONS. (`middleware.Cors` answers preflights
         /// without one.)
-        pub fn options(self: *Self, path: []const u8, comptime handler: anytype) void {
+        pub fn options(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            comptime typed.checkRoute(.options, path, handler, true);
             self.register(self.router, .options, path, handler);
         }
         /// The HTTP QUERY method (a GET with a body).
-        pub fn query(self: *Self, path: []const u8, comptime handler: anytype) void {
+        pub fn query(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            comptime typed.checkRoute(.query, path, handler, true);
             self.register(self.router, .query, path, handler);
         }
         /// As `get`, for every method; a route for a specific method at a
         /// path wins over it.
-        pub fn any(self: *Self, path: []const u8, comptime handler: anytype) void {
+        pub fn any(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            comptime typed.checkRoute(null, path, handler, true);
             self.register(self.router, null, path, handler);
         }
 
@@ -1700,14 +1749,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///         while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
         ///     }
         ///     app.ws("/echo", echo);
-        pub fn ws(self: *Self, path: []const u8, comptime handler: anytype) void {
+        pub fn ws(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
             self.wsWith(path, handler, .{});
         }
 
         /// `ws` with upgrade options (message size limit, compression,
         /// timeout, the drain close).
-        pub fn wsWith(self: *Self, path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
+        pub fn wsWith(self: *Self, comptime path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
             if (comptime !features.websocket) @compileError("app.ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+            comptime checkPattern("GET", path);
             self.router.get(path, websocket.route(Ctx, handler, upgrade));
         }
 
@@ -1723,13 +1773,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///         }
         ///     };
         ///     app.wsCallbacks("/echo", Echo);
-        pub fn wsCallbacks(self: *Self, path: []const u8, comptime Handlers: type) void {
+        pub fn wsCallbacks(self: *Self, comptime path: []const u8, comptime Handlers: type) void {
             self.wsCallbacksWith(path, Handlers, .{});
         }
 
         /// `wsCallbacks` with upgrade options.
-        pub fn wsCallbacksWith(self: *Self, path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
+        pub fn wsCallbacksWith(self: *Self, comptime path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
             if (comptime !features.websocket) @compileError("app.wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+            comptime checkPattern("GET", path);
             self.router.get(path, websocket.callbacks(Ctx, Handlers, upgrade));
         }
 
@@ -1750,13 +1801,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         ///         }
         ///     }
         ///     app.webtransport("/echo", echo);
-        pub fn webtransport(self: *Self, path: []const u8, comptime handler: anytype) void {
+        pub fn webtransport(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
             self.webtransportWith(path, handler, .{});
         }
 
         /// `webtransport` with accept options (the drain's close, timeout).
-        pub fn webtransportWith(self: *Self, path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
+        pub fn webtransportWith(self: *Self, comptime path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
             if (comptime !features.http3) @compileError("app.webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
+            comptime checkPattern("GET", path);
             self.enableWebTransport();
             self.router.get(path, webtransport_mod.route(Ctx, handler, accept));
         }
@@ -1857,68 +1909,84 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 return g.group("", middlewares);
             }
             /// `Server.get` under this group.
-            pub fn get(g: Group, path: []const u8, comptime handler: anytype) void {
+            pub fn get(g: Group, comptime path: []const u8, comptime handler: anytype) void {
+                comptime typed.checkRoute(.get, path, handler, false);
                 g.server.register(g.inner, .get, path, handler);
             }
             /// `Server.head` under this group.
-            pub fn head(g: Group, path: []const u8, comptime handler: anytype) void {
+            pub fn head(g: Group, comptime path: []const u8, comptime handler: anytype) void {
+                comptime typed.checkRoute(.head, path, handler, false);
                 g.server.register(g.inner, .head, path, handler);
             }
             /// `Server.post` under this group.
-            pub fn post(g: Group, path: []const u8, comptime handler: anytype) void {
+            pub fn post(g: Group, comptime path: []const u8, comptime handler: anytype) void {
+                comptime typed.checkRoute(.post, path, handler, false);
                 g.server.register(g.inner, .post, path, handler);
             }
             /// `Server.put` under this group.
-            pub fn put(g: Group, path: []const u8, comptime handler: anytype) void {
+            pub fn put(g: Group, comptime path: []const u8, comptime handler: anytype) void {
+                comptime typed.checkRoute(.put, path, handler, false);
                 g.server.register(g.inner, .put, path, handler);
             }
             /// `Server.patch` under this group.
-            pub fn patch(g: Group, path: []const u8, comptime handler: anytype) void {
+            pub fn patch(g: Group, comptime path: []const u8, comptime handler: anytype) void {
+                comptime typed.checkRoute(.patch, path, handler, false);
                 g.server.register(g.inner, .patch, path, handler);
             }
             /// `Server.delete` under this group.
-            pub fn delete(g: Group, path: []const u8, comptime handler: anytype) void {
+            pub fn delete(g: Group, comptime path: []const u8, comptime handler: anytype) void {
+                comptime typed.checkRoute(.delete, path, handler, false);
                 g.server.register(g.inner, .delete, path, handler);
             }
             /// `Server.options` under this group.
-            pub fn options(g: Group, path: []const u8, comptime handler: anytype) void {
+            pub fn options(g: Group, comptime path: []const u8, comptime handler: anytype) void {
+                comptime typed.checkRoute(.options, path, handler, false);
                 g.server.register(g.inner, .options, path, handler);
             }
             /// `Server.query` under this group.
-            pub fn query(g: Group, path: []const u8, comptime handler: anytype) void {
+            pub fn query(g: Group, comptime path: []const u8, comptime handler: anytype) void {
+                comptime typed.checkRoute(.query, path, handler, false);
                 g.server.register(g.inner, .query, path, handler);
             }
             /// `Server.any` under this group.
-            pub fn any(g: Group, path: []const u8, comptime handler: anytype) void {
+            pub fn any(g: Group, comptime path: []const u8, comptime handler: anytype) void {
+                comptime typed.checkRoute(null, path, handler, false);
                 g.server.register(g.inner, null, path, handler);
             }
             /// `Server.ws` under this group.
-            pub fn ws(g: Group, path: []const u8, comptime handler: anytype) void {
+            pub fn ws(g: Group, comptime path: []const u8, comptime handler: anytype) void {
                 g.wsWith(path, handler, .{});
             }
             /// `Server.wsWith` under this group.
-            pub fn wsWith(g: Group, path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
+            pub fn wsWith(g: Group, comptime path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+                comptime checkPattern("GET", path);
                 g.inner.get(path, websocket.route(Ctx, handler, upgrade));
             }
             /// `Server.wsCallbacks` under this group.
-            pub fn wsCallbacks(g: Group, path: []const u8, comptime Handlers: type) void {
+            pub fn wsCallbacks(g: Group, comptime path: []const u8, comptime Handlers: type) void {
                 g.wsCallbacksWith(path, Handlers, .{});
             }
             /// `Server.wsCallbacksWith` under this group.
-            pub fn wsCallbacksWith(g: Group, path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
+            pub fn wsCallbacksWith(g: Group, comptime path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
+                comptime checkPattern("GET", path);
                 g.inner.get(path, websocket.callbacks(Ctx, Handlers, upgrade));
             }
             /// `Server.webtransport` under this group.
-            pub fn webtransport(g: Group, path: []const u8, comptime handler: anytype) void {
+            pub fn webtransport(g: Group, comptime path: []const u8, comptime handler: anytype) void {
                 g.webtransportWith(path, handler, .{});
             }
             /// `Server.webtransportWith` under this group.
-            pub fn webtransportWith(g: Group, path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
+            pub fn webtransportWith(g: Group, comptime path: []const u8, comptime handler: anytype, comptime accept: webtransport_mod.AcceptOptions) void {
                 if (comptime !features.http3) @compileError("webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
+                comptime checkPattern("GET", path);
                 g.server.enableWebTransport();
                 g.inner.get(path, webtransport_mod.route(Ctx, handler, accept));
+            }
+            /// `Server.addRoute` under this group.
+            pub fn addRoute(g: Group, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
+                g.server.register(g.inner, method, path, handler);
             }
             /// `Server.static` under this group.
             pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: http.StaticOptions) void {
@@ -2448,6 +2516,32 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return self.server.start_error_listener;
         }
 
+        /// The first route conflict recorded (test builds, the C ABI), or
+        /// null: what `run` fails with `error.RouteConflict` for.
+        pub fn routeConflict(self: *const Self) ?[]const u8 {
+            return self.router.conflict;
+        }
+
+        /// For `anole.testing`: everything `run` does before binding (the
+        /// helper routes, the conflict check, the connectors), and no
+        /// listener. Repeatable.
+        pub fn _prepareInMemory(self: *Self) errors.ServerError!void {
+            return self.prepareInMemoryInner() catch |err| self.failWith(err);
+        }
+
+        fn prepareInMemoryInner(self: *Self) !void {
+            self.addHelperRoutes();
+            if (self.router.conflict) |msg| {
+                // Printed, not logged: a test that provokes it must not fail on the log.
+                std.debug.print("anole: {s}\n", .{msg});
+                return self.failStart(error.RouteConflict);
+            }
+            self.startConnectors() catch |err| {
+                errors.log.err("a database connector could not start: {t}", .{err});
+                return self.failStart(error.DatabaseUnavailable);
+            };
+        }
+
         /// Serves until SIGINT, SIGTERM or `stop`, then stops accepting and
         /// drains the requests in flight (bounded by `timeout.shutdown`).
         /// Sets up the listeners first when `init` left them (the options'
@@ -2463,9 +2557,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.logModes();
             logBuildMode(self.mode.debug_production);
             self.addHelperRoutes();
-            // Only with `router.record_conflicts` (the C ABI): a route the
-            // helper routes collided with.
-            if (self.router.conflict != null) return self.failStart(error.RouteConflict);
+            // Only with `router.record_conflicts` (the C ABI, test builds): a
+            // route that conflicted with another, or that the helper routes
+            // collided with.
+            if (self.router.conflict) |msg| {
+                if (!http.core.expect_log.swallow()) errors.log.err("{s}", .{msg});
+                return self.failStart(error.RouteConflict);
+            }
             self.startConnectors() catch |err| {
                 errors.log.err("a database connector could not start: {t}", .{err});
                 return self.failStart(error.DatabaseUnavailable);

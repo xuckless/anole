@@ -1,20 +1,26 @@
 //! Access logs: one line per request, in text or JSON (one object per
 //! line, for log shippers), with the request ID and trace ID when the
 //! RequestId and tracing middleware run first. Each line is one write, so
-//! lines from concurrent requests do not interleave.
+//! lines from concurrent requests do not interleave. The JSON line is the
+//! same record the rest of Anole's logs are (`time`, `level`, `scope`,
+//! `message`, `request_id`, `trace_id`, `span_id`), plus `method`, `path`,
+//! `route`, `status`, `duration_us`, `client` and `error`. Without a file,
+//! lines go where the logs go: stderr, or the C ABI's log callback.
 //!
-//!     app.use(anole.observe.AccessLog.init(.{ .format = .json }));
+//!     app.use(anole.observe.AccessLog.init(.{}));   // the log format follows the environment
 const std = @import("std");
 const dusty = @import("dusty");
+const anole_log = @import("anole_log");
 const common = @import("common.zig");
 
 /// `text`: `GET /users/42 200 153us 10.0.0.7:51234 id=...`; `json`: one
-/// object per line with the same fields.
+/// record per line with the same fields.
 pub const Format = enum { text, json };
 
 /// `AccessLog` settings.
 pub const Options = struct {
-    format: Format = .text,
+    /// Null: follows `anole.log`'s format (JSON in production by default).
+    format: ?Format = null,
     /// Where lines go; stderr by default.
     file: ?std.Io.File = null,
     /// Paths not logged: exact, or a prefix when the entry ends in `*`.
@@ -70,13 +76,18 @@ pub const AccessLog = struct {
     fn write(self: *const AccessLog, req: *dusty.Request, res: *dusty.Response, result: anyerror!void, start: std.Io.Clock.Timestamp) anyerror!void {
         const micros = start.durationTo(.now(req.io, .awake)).raw.toMicroseconds();
         const status = statusOf(req, res, result);
-        const line = formatLine(req.arena, .{ .format = self.options.format, .log_query = self.options.log_query }, req, status, micros, std.Io.Clock.real.now(req.io).toMilliseconds(), if (result) |_| null else |e| e) catch return result;
-        const file = self.options.file orelse std.Io.File.stderr();
-        file.writeStreamingAll(req.io, line) catch |err| switch (err) {
-            // The request's cancel (its deadline, the drain) is for what runs next.
-            error.Canceled => req.io.recancel(),
-            else => {},
-        };
+        const fmt: Format = self.options.format orelse (if (anole_log.currentFormat() == .json) .json else .text);
+        const line = formatLine(req.arena, .{ .format = fmt, .log_query = self.options.log_query }, req, status, micros, std.Io.Clock.real.now(req.io).toMilliseconds(), if (result) |_| null else |e| e) catch return result;
+        if (self.options.file) |file| {
+            file.writeStreamingAll(req.io, line) catch |err| switch (err) {
+                // The request's cancel (its deadline, the drain) is for what runs next.
+                error.Canceled => req.io.recancel(),
+                else => {},
+            };
+        } else {
+            // To the log sink (stderr, or the C ABI's callback), one line.
+            anole_log.writeRaw(.info, "access", std.mem.trimEnd(u8, line, "\n"));
+        }
         return result;
     }
 };
@@ -126,14 +137,19 @@ pub fn formatLine(arena: std.mem.Allocator, opts: LineOptions, req: *const dusty
             if (err) |e| try w.print(" error={t}", .{e});
         },
         .json => {
-            try w.print("{{\"ts\":{d},\"method\":\"{s}\",\"path\":{f},\"status\":{d},\"duration_us\":{d},\"client\":\"{s}\"", .{ now_ms, method, std.json.fmt(path, .{}), status, micros, addr });
-            if (req.route) |r| try w.print(",\"route\":{f}", .{std.json.fmt(r.path, .{})});
-            // Escaped: an ID may come from the client (RequestId's
-            // `trust_incoming`, or one set by the app).
-            if (req.id.len > 0) try w.print(",\"request_id\":{f}", .{std.json.fmt(req.id, .{})});
-            if (req.trace_id.len > 0) try w.print(",\"trace_id\":{f},\"span_id\":{f}", .{ std.json.fmt(req.trace_id, .{}), std.json.fmt(req.span_id, .{}) });
-            if (err) |e| try w.print(",\"error\":\"{t}\"", .{e});
-            try w.writeByte('}');
+            // The record's own members after its head: what the request was.
+            var frag: std.Io.Writer.Allocating = .init(arena);
+            const fw = &frag.writer;
+            try fw.print(",\"method\":\"{s}\",\"path\":{f}", .{ method, std.json.fmt(path, .{}) });
+            if (req.route) |r| try fw.print(",\"route\":{f}", .{std.json.fmt(r.path, .{})});
+            try fw.print(",\"status\":{d},\"duration_us\":{d},\"client\":\"{s}\"", .{ status, micros, addr });
+            if (err) |e| try fw.print(",\"error\":\"{t}\"", .{e});
+            const message = try std.fmt.allocPrint(arena, "{s} {s} {d}", .{ method, path, status });
+            const ctx: anole_log.Context = .{ .request_id = req.id, .trace_id = req.trace_id, .span_id = req.span_id };
+            // Room for the head, with every string escaped at its worst.
+            const cap = frag.written().len + 6 * (message.len + req.id.len + req.trace_id.len + req.span_id.len) + 512;
+            const buf = try arena.alloc(u8, @min(cap, 64 * 1024));
+            try w.writeAll(anole_log.renderJson(buf, now_ms, .info, "access", ctx, message, frag.written()));
         },
     }
     try w.writeByte('\n');

@@ -74,6 +74,11 @@ pub const BindOptions = @import("bind.zig").BindOptions;
 pub const BindResult = @import("bind.zig").BindResult;
 pub const UnknownFields = @import("bind.zig").UnknownFields;
 pub const route_pattern = @import("route_pattern.zig");
+/// The request mappers behind `req.bind*`, for tools that check types at compile time.
+pub const input = struct {
+    pub const strings = @import("bind_strings.zig");
+    pub const json = @import("bind.zig");
+};
 pub const ContentEncoding = @import("http.zig").ContentEncoding;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;

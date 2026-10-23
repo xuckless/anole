@@ -285,6 +285,21 @@ pub fn writeJsonRecord(level: std.log.Level, scope: []const u8, ctx: Context, me
     deliver(level, scope, line);
 }
 
+/// The JSON record for time `now_ms` (milliseconds since the epoch) into
+/// `buf`, no newline: the shape every JSON record has (`time`, `level`,
+/// `scope`, `message`, `service`, the request's ids), then `fragment`
+/// (rendered members, each starting with a comma). For the access log.
+pub fn renderJson(buf: []u8, now_ms: i64, level: std.log.Level, scope: []const u8, ctx: Context, message: []const u8, fragment: []const u8) []const u8 {
+    return record.json(buf, .{
+        .now = .{ .nanoseconds = @as(i96, now_ms) * std.time.ns_per_ms },
+        .level = level,
+        .scope = scope,
+        .message = message,
+        .service = service(),
+        .context = ctx,
+    }, .{}, fragment);
+}
+
 /// A pre-rendered line (the access log's text form): to the sink, or to
 /// stderr as is.
 pub fn writeRaw(level: std.log.Level, scope: []const u8, line: []const u8) void {

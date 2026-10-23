@@ -86,6 +86,9 @@ pub const Resolved = struct {
     deployment_source: Source,
     error_detail: bool,
     error_detail_from_mode: bool,
+    /// `log.format = .auto` chose JSON Lines because the environment is
+    /// production (the startup line says so).
+    log_json_from_mode: bool = false,
     /// Parsed; null: no gate (standalone without proxy.trusted).
     trusted: ?[]const http.ProxyNetwork,
     /// What `trusted` was written as.
@@ -173,6 +176,7 @@ pub fn resolve(
     // 3. error_detail
     r.error_detail = opts.error_detail orelse (environment == .development);
     r.error_detail_from_mode = opts.error_detail == null;
+    r.log_json_from_mode = opts.log.format == .auto and environment == .production and !builtin.is_test;
 
     // 4. trusted proxies
     const mode_default = r.deployment == .behind_proxy or r.deployment == .anole_lb or r.deployment == .platform;
@@ -346,6 +350,10 @@ pub fn writeLines(r: *const Resolved, ctx: LineContext, w: *std.Io.Writer) std.I
     if (r.error_detail_from_mode and r.error_detail) {
         try sep(w, &first);
         try w.writeAll("500 answers name the error");
+    }
+    if (r.log_json_from_mode) {
+        try sep(w, &first);
+        try w.writeAll("JSON Lines logs");
     }
     try w.writeByte('\n');
     if (r.files) |files| if (files.saw_anole_env) |f| {
