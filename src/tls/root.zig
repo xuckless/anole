@@ -58,6 +58,12 @@ test "TLS: an idle connection keeps no ciphertext buffer beyond its stash" {
     try testing.duplex.idle(std.testing.allocator, rt.io());
 }
 
+test "TLS: a header ahead of a big payload and keyframe-sized writes arrive in order" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    try testing.duplex.framed(std.testing.allocator, rt.io());
+}
+
 /// A certificate and private key as PEM text, owned by the allocator that
 /// made them.
 pub const Pem = struct {

@@ -209,3 +209,65 @@ fn readAllInner(side: *Side, total: usize) !void {
         got += n;
     }
 }
+
+/// A small header buffered ahead of big slices (the relay's WebSocket
+/// frames): the first record is topped up from the first slice, and every
+/// byte still arrives in order. Also the keyframe-sized gather path.
+pub fn framed(gpa: std.mem.Allocator, io: std.Io) !void {
+    var pem = try selfSigned(gpa, .{});
+    defer pem.deinit(gpa);
+    var auth = try tls.config.CertKeyPair.fromSlice(gpa, io, pem.cert, pem.key);
+    defer auth.deinit(gpa);
+
+    const listen_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try listen_addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+
+    var server_side: Side = undefined;
+    var client_side: Side = undefined;
+    var accept_future = try io.concurrent(acceptAndHandshake, .{ io, &listener, &server_side, &auth });
+    defer _ = accept_future.cancel(io) catch {};
+    try connectAndHandshake(io, listener.socket.address, &client_side);
+    try accept_future.await(io);
+    defer {
+        client_side.conn.deinit();
+        client_side.stream.close(io);
+        server_side.conn.deinit();
+        server_side.stream.close(io);
+    }
+
+    const sizes = [_]usize{ 20 * 1024, 100 * 1024, 16 * 1024 - 8, 3, 70 * 1024 };
+    var total: usize = 0;
+    for (sizes) |s| total += 8 + s;
+
+    var results: [2]anyerror!void = @splat({});
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, writeFramed, .{ &server_side, &sizes, &results[0] });
+    try group.concurrent(io, readAll, .{ &client_side, total, &results[1] });
+    try group.await(io);
+    for (results) |r| try r;
+}
+
+fn writeFramed(side: *Side, sizes: []const usize, result: *anyerror!void) void {
+    result.* = writeFramedInner(side, sizes) catch |err| err;
+}
+
+fn writeFramedInner(side: *Side, sizes: []const usize) !void {
+    var plain_buf: [16 * 1024]u8 = undefined;
+    var w = side.conn.writer(&plain_buf);
+    const payload = try std.testing.allocator.alloc(u8, 128 * 1024);
+    defer std.testing.allocator.free(payload);
+    var sent: usize = 0;
+    for (sizes) |s| {
+        var header: [8]u8 = undefined;
+        for (&header, 0..) |*b, i| b.* = expectedByte(side.id, sent + i);
+        for (payload[0..s], 0..) |*b, i| b.* = expectedByte(side.id, sent + 8 + i);
+        // Header into the buffer, payload as a slice of its own.
+        try w.interface.writeAll(&header);
+        var vec = [_][]const u8{payload[0..s]};
+        try w.interface.writeVecAll(&vec);
+        try w.interface.flush();
+        sent += 8 + s;
+    }
+}

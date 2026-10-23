@@ -57,6 +57,12 @@ const max_plaintext_len = 16 * 1024;
 /// borrows a block.
 const stash_len = 1024;
 
+/// Socket reads a connection keeps its read block for after a big one.
+const busy_reads = 8;
+
+/// Queued ciphertext handed to the socket without waiting for `flush`.
+const gather_len = 48 * 1024;
+
 /// The handshake settings `server` and `client` take, in tls.zig's shapes.
 pub const config = struct {
     /// A certificate chain and private key. On a server listener it also owns
@@ -513,6 +519,7 @@ pub const Connection = struct {
         if (c.SSL_has_pending(sh.ssl) != 0) return false;
         if (sh.block != null or sh.foreign) sh.useStash();
         sh.read_full = false;
+        sh.busy = 0;
         return true;
     }
 
@@ -568,6 +575,23 @@ pub const Connection = struct {
                 };
                 continue;
             }
+            // A record whose header is buffered but whose body is not all
+            // here yet can only make SSL_read say WANT_READ: read first. Only
+            // when the read block can hold the whole record, and BoringSSL
+            // holds nothing itself (so the buffered bytes start a record).
+            if (sh.block != null and !sh.input_eof and c.SSL_has_pending(sh.ssl) == 0) {
+                const b = sh.input.buffered();
+                if (b.len >= 5 and b[1] == 3) {
+                    const rec = 5 + ((@as(usize, b[3]) << 8) | b[4]);
+                    if (b.len < rec and rec <= sh.input.buffer.len) {
+                        sh.unlock();
+                        sh.fill() catch |err| switch (err) {
+                            error.ReadFailed => return error.ReadFailed,
+                        };
+                        continue;
+                    }
+                }
+            }
             // SSL_read empties the error queue on entry.
             const rc = c.SSL_read(sh.ssl, buf.ptr, len);
             // It may have queued handshake messages (a KeyUpdate reply) for
@@ -575,7 +599,7 @@ pub const Connection = struct {
             sh.write_owed = true;
             const code = if (rc > 0) c.SSL_ERROR_NONE else c.SSL_get_error(sh.ssl, rc);
             const failure: ?HandshakeError = if (code == c.SSL_ERROR_SSL) queuedError("SSL_read") else null;
-            if (rc <= 0) c.ERR_clear_error();
+            if (rc <= 0 and c.ERR_peek_error() != 0) c.ERR_clear_error();
             const eof = sh.input_eof;
             sh.unlock();
 
@@ -620,7 +644,8 @@ pub const Connection = struct {
             // The memory BIO cannot fail a write, so any failure is TLS-level.
             if (rc <= 0) return error.TlsFailure;
             rest = rest[@intCast(rc)..];
-            try sh.sendPending();
+            // Records go out together: at `flush`, or once this much is queued.
+            if (sh.pending.len >= gather_len) try sh.sendPending();
         }
     }
 
@@ -686,16 +711,32 @@ pub const Connection = struct {
         /// bytes consumed from `data` (tls.zig `Connection.Writer.drain`).
         fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
             const self: *Writer = @fieldParentPtr("interface", w);
+            // A header ahead of a big payload would become a record of its
+            // own: top the buffer up from the first slice, so the first
+            // record is full.
+            var off: usize = 0;
+            const buffered = w.buffered();
+            if (data.len > 0 and (data.len > 1 or splat == 1) and buffered.len > 0 and
+                buffered.len < max_plaintext_len and data[0].len > 0)
+            {
+                const room = @min(w.buffer.len, max_plaintext_len) - buffered.len;
+                const take = @min(room, data[0].len);
+                @memcpy(w.buffer[w.end..][0..take], data[0][0..take]);
+                w.end += take;
+                off = take;
+            }
             try self.writeAll(w.buffered());
             w.end = 0;
 
-            var n: usize = 0;
+            var n: usize = off;
             if (data.len > 0) {
-                for (data[0 .. data.len - 1]) |bytes| {
+                for (data[0 .. data.len - 1], 0..) |full, i| {
+                    const bytes = if (i == 0) full[off..] else full;
                     try self.writeAll(bytes);
                     n += bytes.len;
                 }
-                const pattern = data[data.len - 1];
+                const last = data[data.len - 1];
+                const pattern = if (data.len == 1) last[off..] else last;
                 switch (pattern.len) {
                     0 => {},
                     1 => {
@@ -1324,6 +1365,11 @@ const Shared = struct {
     /// The last socket read filled the buffer, so more is probably waiting
     /// and the next read goes into a block.
     read_full: bool = false,
+    /// A socket read of at least `stash_len` bytes sets it to `busy_reads`;
+    /// every smaller read counts it down. The read block is kept while it is
+    /// above 0, so a connection receiving big messages makes one `recv` per
+    /// message, and one that went quiet is back on the stash after a few reads.
+    busy: u8 = 0,
 
     /// Owned by the writing side: the other half of the double buffer.
     sending: Buf = .{},
@@ -1349,11 +1395,18 @@ const Shared = struct {
         sh.lock();
         sh.filling = true;
         sh.unlock();
+        const had = sh.input.end - sh.input.seek;
         const result: std.Io.Reader.Error!void = if (sh.prepareInput()) |_| sh.input.fillMore() else |err| err;
         const full = sh.input.end == sh.input.buffer.len;
+        const got = (sh.input.end -| sh.input.seek) -| had;
         sh.lock();
         sh.filling = false;
         sh.read_full = full;
+        if (got >= stash_len) {
+            sh.busy = busy_reads;
+        } else if (sh.busy > 0) {
+            sh.busy -= 1;
+        }
         if (result) |_| {} else |err| switch (err) {
             error.EndOfStream => sh.input_eof = true,
             error.ReadFailed => {},
@@ -1377,7 +1430,7 @@ const Shared = struct {
         if (buffered == 0) {
             r.seek = 0;
             r.end = 0;
-            if (!sh.read_full) {
+            if (!sh.read_full and sh.busy == 0) {
                 sh.useStash();
             } else if (sh.block == null) {
                 // Out of memory: the stash still works, a little slower.
@@ -1466,6 +1519,32 @@ fn giveBlock(b: []u8) void {
     std.heap.c_allocator.free(b);
 }
 
+/// A block for a keyframe's worth of records (`gather_len` plus one more
+/// record), so a big message costs no malloc. A second, smaller pool.
+const big_len = 64 * 1024 + 512;
+const big_pool_cap = 8;
+
+threadlocal var big_blocks: [big_pool_cap][*]u8 = undefined;
+threadlocal var big_pool_len: usize = 0;
+
+fn takeBig() ?[]u8 {
+    if (big_pool_len > 0) {
+        big_pool_len -= 1;
+        return big_blocks[big_pool_len][0..big_len];
+    }
+    return std.heap.c_allocator.alloc(u8, big_len) catch null;
+}
+
+fn giveBig(b: []u8) void {
+    std.debug.assert(b.len == big_len);
+    if (big_pool_len < big_pool_cap) {
+        big_blocks[big_pool_len] = b.ptr;
+        big_pool_len += 1;
+        return;
+    }
+    std.heap.c_allocator.free(b);
+}
+
 /// Bytes queued for the socket, in a pool block, or in a bigger allocation
 /// for anything that does not fit one (a large handshake flight).
 const Buf = struct {
@@ -1488,8 +1567,20 @@ const Buf = struct {
             b.mem = takeBlock() orelse return error.OutOfMemory;
             return;
         }
-        // Never `block_len` long, so `release` can tell the two apart.
-        const new = try std.heap.c_allocator.alloc(u8, @max(need, 2 * block_len, 2 * b.mem.len));
+        if (need <= big_len and b.mem.len < big_len) {
+            if (takeBig()) |big| {
+                @memcpy(big[0..b.len], b.mem[0..b.len]);
+                const len = b.len;
+                b.release();
+                b.mem = big;
+                b.len = len;
+                return;
+            }
+        }
+        // Never `block_len` or `big_len` long, so `release` can tell them apart.
+        var size = @max(need, 2 * block_len, 2 * b.mem.len);
+        if (size == block_len or size == big_len) size += 1;
+        const new = try std.heap.c_allocator.alloc(u8, size);
         @memcpy(new[0..b.len], b.mem[0..b.len]);
         const len = b.len;
         b.release();
@@ -1501,6 +1592,8 @@ const Buf = struct {
     fn release(b: *Buf) void {
         if (b.mem.len == block_len) {
             giveBlock(b.mem);
+        } else if (b.mem.len == big_len) {
+            giveBig(b.mem);
         } else if (b.mem.len > 0) {
             std.heap.c_allocator.free(b.mem);
         }
@@ -1562,7 +1655,7 @@ fn bioRead(bio: ?*c.BIO, out: [*c]u8, len: c_int) callconv(.c) c_int {
     const n = @min(got.len, @as(usize, @intCast(len)));
     @memcpy(out[0..n], got[0..n]);
     sh.input.toss(n);
-    if (n == got.len and (sh.foreign or (sh.block != null and !sh.read_full))) sh.useStash();
+    if (n == got.len and (sh.foreign or (sh.block != null and !sh.read_full and sh.busy == 0))) sh.useStash();
     return @intCast(n);
 }
 
