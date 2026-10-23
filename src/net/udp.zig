@@ -154,7 +154,7 @@ pub const Udp = struct {
             if (wildcard) _ = setOption(fd, posix.IPPROTO.IP, posix.IP.PKTINFO, 1);
         }
         if (native_os == .linux) {
-            if (options.rxq_ovfl) _ = setOption(fd, posix.SOL.SOCKET, posix.SO.RXQ_OVFL, 1);
+            if (options.rxq_ovfl) _ = setOption(fd, posix.SOL.SOCKET, linux.SO.RXQ_OVFL, 1);
             // DF set, and the kernel's path MTU cache ignored: ngtcp2 probes.
             if (options.pmtu_probe) {
                 if (ip6)
@@ -302,7 +302,7 @@ pub const Udp = struct {
                     const pi = std.mem.bytesToValue(std.c.in6_pktinfo, m.data[0..@sizeOf(std.c.in6_pktinfo)]);
                     d.local = .{ .ip6 = .{ .bytes = pi.addr, .port = self.socket.address.getPort() } };
                 }
-            } else if (native_os == .linux and level == posix.SOL.SOCKET and kind == posix.SO.RXQ_OVFL and m.data.len >= @sizeOf(u32)) {
+            } else if (native_os == .linux and level == posix.SOL.SOCKET and kind == linux.SO.RXQ_OVFL and m.data.len >= @sizeOf(u32)) {
                 d.dropped = std.mem.readInt(u32, m.data[0..@sizeOf(u32)], native_endian);
             } else if (native_os == .linux and level == posix.IPPROTO.UDP and kind == linux.UDP.GRO and m.data.len >= @sizeOf(c_int)) {
                 const size = std.mem.readInt(c_int, m.data[0..@sizeOf(c_int)], native_endian);
