@@ -35,6 +35,7 @@ PAGES = {
     "auth.md": ("Auth", "JWT, OIDC sign-in, sessions, CSRF, API keys, roles and rate limits."),
     "observability.md": ("Observability", "Access logs, Prometheus metrics, OpenTelemetry tracing, health checks."),
     "logging.md": ("Logging", "JSON Lines and text logs, request logs, redaction."),
+    "console.md": ("Console", "The live console: anole console, c + Enter in development, commands, the control socket."),
     "testing.md": ("Testing", "anole.testing: an in-memory client for routes and middleware."),
     "from-fiber.md": ("From-Fiber", "Fiber's API next to Anole's."),
     "migrating.md": ("Migrating", "What changes between releases and how to update an app."),

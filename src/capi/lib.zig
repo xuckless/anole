@@ -280,6 +280,7 @@ export fn anole_has_feature(name: Str) i32 {
         .{ "mongodb", f.mongodb },
         .{ "nats", f.nats },
         .{ "kafka", f.kafka },
+        .{ "console", f.console },
     };
     inline for (table) |entry| if (std.mem.eql(u8, n, entry[0])) return @intFromBool(entry[1]);
     return 0;
@@ -557,6 +558,80 @@ export fn anole_server_reload_tls(s: ?*anyopaque, flags: u32, cert: Str, key: St
     else
         .{ .files = .{ .cert_path = cs, .key_path = ks } };
     e.setCertificate(source) catch |err| return reloadFailure(err, if (pem) null else cs, if (pem) null else ks);
+    return abi.OK;
+}
+
+// ---- console -----------------------------------------------------------------------
+
+export fn anole_console_open(s: ?*anyopaque, flags: u32) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    if (flags != 0) return unknownFlag();
+    e.consoleOpen() catch |err| return switch (err) {
+        error.State => named(abi.E_STATE, "State", 0, "anole_console_open: the server is not running, or a console is open already", .{}),
+        error.Disabled => named(abi.E_CONFIG, "ConsoleOff", 0, "anole_console_open: the console is off (the \"console\" configuration group)", .{}),
+        error.NotATerminal, error.DumbTerminal, error.Unsupported => named(abi.E_UNSUPPORTED, "NoTerminal", 0, "anole_console_open: no terminal here (TERM=dumb, no /dev/tty, or Windows)", .{}),
+        error.OutOfMemory => fail(abi.E_NOMEM, "anole_console_open", err),
+        else => fail(abi.E_SYSTEM, "anole_console_open", err),
+    };
+    return abi.OK;
+}
+
+export fn anole_console_close(s: ?*anyopaque) i32 {
+    // The cleanup-call rule: ANOLE_OK, no error text, on one that is over.
+    const e = engineOf(s) orelse return abi.OK;
+    e.consoleClose();
+    return abi.OK;
+}
+
+export fn anole_console_attached(s: ?*anyopaque) i32 {
+    const e = engineOf(s) orelse return 0;
+    return e.consoleAttached();
+}
+
+export fn anole_console_report(s: ?*anyopaque, m: ?[*]const abi.ConsoleMetric, n: usize) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    if (n > 32) return named(abi.E_INVALID, "Invalid", 0, "anole_console_report: at most 32 metrics", .{});
+    if (n > 0 and m == null) return failCode(abi.E_INVALID);
+    var items: [32]anole.console.service.Metric = undefined;
+    for (0..n) |i| {
+        const x = m.?[i];
+        const name = x.name.slice();
+        if (name.len == 0 or name.len > 48) return named(abi.E_INVALID, "Invalid", 0, "anole_console_report: a name is 1 to 48 bytes of [a-z0-9_.]", .{});
+        for (name) |ch| {
+            if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '_' or ch == '.'))
+                return named(abi.E_INVALID, "Invalid", 0, "anole_console_report: a name is 1 to 48 bytes of [a-z0-9_.]", .{});
+        }
+        const unit: []const u8 = switch (x.unit) {
+            abi.UNIT_NONE => "",
+            abi.UNIT_BYTES => "bytes",
+            abi.UNIT_SECONDS => "seconds",
+            abi.UNIT_COUNT => "count",
+            abi.UNIT_PERCENT => "percent",
+            else => return named(abi.E_INVALID, "Invalid", 0, "anole_console_report: unknown unit", .{}),
+        };
+        items[i] = .{ .name = name, .value = x.value, .unit = unit };
+    }
+    e.consoleReport(items[0..n]) catch |err| return switch (err) {
+        error.State => named(abi.E_STATE, "State", 0, "anole_console_report: the server is not running", .{}),
+        else => fail(abi.E_NOMEM, "anole_console_report", err),
+    };
+    return abi.OK;
+}
+
+export fn anole_console_log(s: ?*anyopaque, level: u32, scope: Str, msg: Str, req: u64) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    _ = req;
+    const lvl: std.log.Level = switch (level) {
+        abi.LOG_ERROR => .err,
+        abi.LOG_WARN => .warn,
+        abi.LOG_INFO => .info,
+        abi.LOG_DEBUG => .debug,
+        else => return failCode(abi.E_INVALID),
+    };
+    e.consoleLog(lvl, scope.slice(), msg.slice());
     return abi.OK;
 }
 

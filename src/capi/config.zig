@@ -27,6 +27,9 @@ pub const Config = struct {
     /// Print the startup banner when stderr is a terminal and the logs are
     /// text. Off by default under the ABI: a binding opts in.
     banner: bool = false,
+    /// The live console (docs/console.md): a control socket for `anole
+    /// console`, and `anole_console_*`.
+    console: Console = .{},
     listeners: []const Listener = &.{.{}},
     timeouts: Timeouts = .{},
     limits: Limits = .{},
@@ -53,6 +56,24 @@ pub const Config = struct {
     databases: []const Database = &.{},
     /// Message brokers for `anole_nats_*`, opened at start.
     brokers: []const Broker = &.{},
+
+    pub const Console = struct {
+        /// The control socket. Null: on (off under deployment lambda, on
+        /// Windows, with ANOLE_CONSOLE=0).
+        enabled: ?bool = null,
+        /// What `anole console <name>` finds the app by; bindings pass the
+        /// package or module name.
+        name: ?[]const u8 = null,
+        socket: ?[]const u8 = null,
+        /// Null: on in development, off in production.
+        allow_restart: ?bool = null,
+        read_only: bool = false,
+        log_buffer: usize = 4 * 1024 * 1024,
+        errors_kept: u16 = 256,
+        max_routes: u16 = 256,
+        /// Shown in the console's status line, e.g. "node 22.11.0".
+        runtime: ?[]const u8 = null,
+    };
 
     pub const Log = struct {
         /// "auto" (JSON Lines in production, else text), "text" or "json".

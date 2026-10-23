@@ -269,6 +269,13 @@
       "obligation": null
     },
     {
+      "type": 132,
+      "name": "ANOLE_EV_CONSOLE_CLOSED",
+      "record": "anole_console_closed_event",
+      "handles": [],
+      "obligation": null
+    },
+    {
       "type": 64,
       "name": "ANOLE_EV_NATS_MSG",
       "record": "anole_nats_msg_event",
@@ -445,6 +452,18 @@
       "ANOLE_BROKER_LAME_DUCK": 3,
       "ANOLE_BROKER_WRITABLE": 4
     },
+    "console_reason": {
+      "ANOLE_CONSOLE_QUIT": 0,
+      "ANOLE_CONSOLE_INTERRUPT": 1,
+      "ANOLE_CONSOLE_RESTARTING": 2
+    },
+    "console_unit": {
+      "ANOLE_UNIT_NONE": 0,
+      "ANOLE_UNIT_BYTES": 1,
+      "ANOLE_UNIT_SECONDS": 2,
+      "ANOLE_UNIT_COUNT": 3,
+      "ANOLE_UNIT_PERCENT": 4
+    },
     "consumer_flag": {
       "ANOLE_CONSUMER_F_SHARED": 1
     },
@@ -523,6 +542,7 @@
       "ANOLE_EV_WT_DATAGRAM": 27,
       "ANOLE_EV_WS_UPGRADE": 40,
       "ANOLE_EV_DRAINING": 41,
+      "ANOLE_EV_CONSOLE_CLOSED": 132,
       "ANOLE_EV_NATS_MSG": 64,
       "ANOLE_EV_NATS_REPLY": 65,
       "ANOLE_EV_NATS_JS_MSG": 66,
@@ -1056,6 +1076,53 @@
         {
           "name": "reserved",
           "offset": 20,
+          "type": "u32"
+        }
+      ]
+    },
+    "anole_console_closed_event": {
+      "size": 24,
+      "align": 8,
+      "fields": [
+        {
+          "name": "ev",
+          "offset": 0,
+          "type": "anole_event"
+        },
+        {
+          "name": "reason",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 20,
+          "type": "u32"
+        }
+      ]
+    },
+    "anole_console_metric": {
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "name",
+          "offset": 0,
+          "type": "anole_str"
+        },
+        {
+          "name": "value",
+          "offset": 16,
+          "type": "f64"
+        },
+        {
+          "name": "unit",
+          "offset": 24,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 28,
           "type": "u32"
         }
       ]

@@ -113,6 +113,9 @@ pub const EventType = enum(u32) {
     ws_upgrade = 40,
     /// http-realtime: the drain started.
     draining = 41,
+    /// The in-process console closed (`anole_console_open`); 133-135 are
+    /// reserved for the console.
+    console_closed = 132,
     nats_msg = 64,
     nats_reply = 65,
     nats_js_msg = 66,
@@ -169,6 +172,32 @@ pub const AbortEvent = extern struct {
     ev: Event,
     reason: u16,
     status: u16,
+    reserved: u32 = 0,
+};
+
+/// ANOLE_EV_CONSOLE_CLOSED.
+pub const ConsoleClosedEvent = extern struct {
+    ev: Event,
+    reason: u32,
+    reserved: u32 = 0,
+};
+
+/// Why the in-process console closed (ConsoleClosedEvent.reason).
+pub const CONSOLE_QUIT: u32 = 0;
+pub const CONSOLE_INTERRUPT: u32 = 1;
+pub const CONSOLE_RESTARTING: u32 = 2;
+
+pub const UNIT_NONE: u32 = 0;
+pub const UNIT_BYTES: u32 = 1;
+pub const UNIT_SECONDS: u32 = 2;
+pub const UNIT_COUNT: u32 = 3;
+pub const UNIT_PERCENT: u32 = 4;
+
+/// One language metric `/runtime` shows (`anole_console_report`).
+pub const ConsoleMetric = extern struct {
+    name: Str,
+    value: f64,
+    unit: u32,
     reserved: u32 = 0,
 };
 
@@ -747,6 +776,8 @@ comptime {
     std.debug.assert(@sizeOf(Span) == 8);
     std.debug.assert(@sizeOf(RequestEvent) == 128);
     std.debug.assert(@sizeOf(AbortEvent) == 24);
+    std.debug.assert(@sizeOf(ConsoleClosedEvent) == 24);
+    std.debug.assert(@sizeOf(ConsoleMetric) == 32);
     std.debug.assert(@sizeOf(ListenerInfo) == 72);
     std.debug.assert(@sizeOf(SentEvent) == 32);
     std.debug.assert(@sizeOf(WsMessageEvent) == 32);
@@ -806,6 +837,8 @@ pub const records = .{
     .{ "anole_span", Span },
     .{ "anole_request_event", RequestEvent },
     .{ "anole_abort_event", AbortEvent },
+    .{ "anole_console_closed_event", ConsoleClosedEvent },
+    .{ "anole_console_metric", ConsoleMetric },
     .{ "anole_sent_event", SentEvent },
     .{ "anole_ws_message_event", WsMessageEvent },
     .{ "anole_ws_close_event", WsCloseEvent },
@@ -918,6 +951,7 @@ pub const events = [_]EventInfo{
     .{ .type = 27, .name = "ANOLE_EV_WT_DATAGRAM", .record = "anole_wt_datagram_event", .handles = &.{"wt_session"} },
     .{ .type = 40, .name = "ANOLE_EV_WS_UPGRADE", .record = "anole_request_event", .handles = &.{"request"}, .obligation = "accept or answer" },
     .{ .type = 41, .name = "ANOLE_EV_DRAINING", .record = "anole_event" },
+    .{ .type = 132, .name = "ANOLE_EV_CONSOLE_CLOSED", .record = "anole_console_closed_event" },
     .{ .type = 64, .name = "ANOLE_EV_NATS_MSG", .record = "anole_nats_msg_event", .handles = &.{"broker_sub"} },
     .{ .type = 65, .name = "ANOLE_EV_NATS_REPLY", .record = "anole_nats_reply_event" },
     .{ .type = 66, .name = "ANOLE_EV_NATS_JS_MSG", .record = "anole_nats_msg_event", .handles = &.{"broker_msg"}, .obligation = "ack" },
@@ -957,6 +991,8 @@ pub const constant_groups = [_]ConstantGroup{
     .{ .prefix = "ANOLE_BUSY", .group = "status" },
     .{ .prefix = "ANOLE_EV_", .group = "event" },
     .{ .prefix = "ANOLE_ABORT_", .group = "abort_reason" },
+    .{ .prefix = "ANOLE_CONSOLE_", .group = "console_reason" },
+    .{ .prefix = "ANOLE_UNIT_", .group = "console_unit" },
     .{ .prefix = "ANOLE_LOG_", .group = "log_level" },
     .{ .prefix = "ANOLE_SERVER_F_", .group = "server_flag" },
     .{ .prefix = "ANOLE_CONSUMER_F_", .group = "consumer_flag" },

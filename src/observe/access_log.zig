@@ -86,7 +86,8 @@ pub const AccessLog = struct {
             };
         } else {
             // To the log sink (stderr, or the C ABI's callback), one line.
-            anole_log.writeRaw(.info, "access", std.mem.trimEnd(u8, line, "\n"));
+            const ctx: anole_log.Context = .{ .request_id = req.id, .trace_id = req.trace_id, .span_id = req.span_id, .route = if (req.route) |r| r.path else "" };
+            anole_log.writeRawCtx(.info, "access", ctx, std.mem.trimEnd(u8, line, "\n"));
         }
         return result;
     }

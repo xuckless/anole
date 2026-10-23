@@ -15,6 +15,9 @@ const value = @import("value.zig");
 
 pub const Context = record.Context;
 
+/// Which names and types the logger redacts (`password`, `Secret`...).
+pub const redact = @import("redact.zig");
+
 pub const Format = enum { auto, text, json };
 
 pub const Options = struct {
@@ -34,7 +37,25 @@ pub const Callback = struct {
     ud: ?*anyopaque = null,
 };
 
+/// What the live console (or anything else) is given of each record,
+/// besides the normal output. `text` is the rendered line: the text record,
+/// or the JSON record when `json` is true. Called on any thread; must not
+/// block or log.
+pub const Tap = struct {
+    func: *const fn (ud: ?*anyopaque, level: std.log.Level, scope: []const u8, ctx: Context, json: bool, text: []const u8) void,
+    ud: ?*anyopaque = null,
+    /// The least severe level passed on (as std.log.Level's integer): warn
+    /// while no console shows logs, debug while one does.
+    min_level: std.atomic.Value(u8) = .init(@intFromEnum(std.log.Level.warn)),
+};
+
 // ------------------------------------------------------------------ state
+
+var tap_state: std.atomic.Value(?*Tap) = .init(null);
+var suppress_stderr: std.atomic.Value(bool) = .init(false);
+/// Set while `emit` hands a rendered line to std.log, whose bridge
+/// (`fromStd`) must not tap it a second time.
+threadlocal var tl_tapped: bool = false;
 
 var format_state: std.atomic.Value(u8) = .init(@intFromEnum(Format.text));
 /// 255: no runtime filter.
@@ -78,6 +99,30 @@ fn service() []const u8 {
     return service_buf[0..service_len.load(.acquire)];
 }
 
+/// Installs (or, with null, removes) the tap. It must stay valid until
+/// removed.
+pub fn setTap(t: ?*Tap) void {
+    tap_state.store(t, .release);
+}
+
+/// While true, records skip stderr (the in-process console captures the
+/// terminal and gets them through the tap). Sinks are still called.
+pub fn suppressStderr(on: bool) void {
+    suppress_stderr.store(on, .release);
+}
+
+/// The tap, when it wants records of `level`: one relaxed load when none.
+inline fn tapFor(level: std.log.Level) ?*Tap {
+    const t = tap_state.load(.monotonic) orelse return null;
+    if (@intFromEnum(level) > t.min_level.load(.monotonic)) return null;
+    return t;
+}
+
+fn tapRecord(level: std.log.Level, scope: []const u8, ctx: Context, json: bool, text: []const u8) void {
+    const t = tapFor(level) orelse return;
+    t.func(t.ud, level, scope, ctx, json, text);
+}
+
 /// Null: stderr. The Callback must stay valid until replaced.
 pub fn setSink(cb: ?*const Callback) void {
     sink_state.store(cb, .release);
@@ -116,8 +161,10 @@ fn writeStderrLine(line: []const u8) void {
     t.writer.flush() catch {};
 }
 
-fn deliver(level: std.log.Level, scope: []const u8, line: []const u8) void {
+fn deliver(level: std.log.Level, scope: []const u8, ctx: Context, line: []const u8) void {
+    tapRecord(level, scope, ctx, line.len > 0 and line[0] == '{' and currentFormat() == .json, line);
     if (sink_state.load(.acquire)) |cb| return cb.func(cb.ud, level, scope, line);
+    if (suppress_stderr.load(.monotonic)) return;
     writeStderrLine(line);
 }
 
@@ -171,11 +218,16 @@ fn emit(
                 .service = service(),
                 .context = ctx,
             }, fields, "");
-            deliver(level, @tagName(scope), line);
+            deliver(level, @tagName(scope), ctx, line);
         },
         .auto, .text => {
             const line = record.text(b.buf, message, ctx, fields);
+            tapRecord(level, @tagName(scope), ctx, false, line);
             if (sink_state.load(.acquire)) |cb| return cb.func(cb.ud, level, @tagName(scope), line);
+            if (suppress_stderr.load(.monotonic)) return;
+            const was = tl_tapped;
+            tl_tapped = true;
+            defer tl_tapped = was;
             stdLogAt(level, scope, line);
         },
     }
@@ -247,7 +299,23 @@ pub fn fromStd(
     if (!enabled(level)) return;
     const f = currentFormat();
     const sink = sink_state.load(.acquire);
-    if (f != .json and sink == null) return std.log.defaultLog(level, scope, format, args);
+    if (f != .json and sink == null) {
+        const t = if (tl_tapped) null else tapFor(level);
+        const suppressed = suppress_stderr.load(.monotonic);
+        if (t == null) {
+            if (suppressed) return;
+            return std.log.defaultLog(level, scope, format, args);
+        }
+        var small_t: [1024]u8 = undefined;
+        var small_msg_t: [512]u8 = undefined;
+        const bt = acquire(&small_t, &small_msg_t);
+        defer release(bt);
+        var mwt: std.Io.Writer = .fixed(bt.msg);
+        mwt.print(format, args) catch {};
+        t.?.func(t.?.ud, level, @tagName(scope), .{}, false, mwt.buffered());
+        if (suppressed) return;
+        return std.log.defaultLog(level, scope, format, args);
+    }
     var small: [1024]u8 = undefined;
     var small_msg: [512]u8 = undefined;
     const b = acquire(&small, &small_msg);
@@ -263,8 +331,9 @@ pub fn fromStd(
             .message = message,
             .service = service(),
         }, .{}, "");
-        deliver(level, @tagName(scope), line);
+        deliver(level, @tagName(scope), .{}, line);
     } else {
+        if (!tl_tapped) tapRecord(level, @tagName(scope), .{}, false, message);
         sink.?.func(sink.?.ud, level, @tagName(scope), message);
     }
 }
@@ -287,7 +356,7 @@ pub fn writeJsonRecord(level: std.log.Level, scope: []const u8, ctx: Context, me
         .service = service(),
         .context = ctx,
     }, .{}, fragment);
-    deliver(level, scope, line);
+    deliver(level, scope, ctx, line);
 }
 
 /// The JSON record for time `now_ms` (milliseconds since the epoch) into
@@ -308,8 +377,14 @@ pub fn renderJson(buf: []u8, now_ms: i64, level: std.log.Level, scope: []const u
 /// A pre-rendered line (the access log's text form): to the sink, or to
 /// stderr as is.
 pub fn writeRaw(level: std.log.Level, scope: []const u8, line: []const u8) void {
+    writeRawCtx(level, scope, .{}, line);
+}
+
+/// `writeRaw` for a record that belongs to a request: `ctx` carries its id
+/// and route to the console's tap.
+pub fn writeRawCtx(level: std.log.Level, scope: []const u8, ctx: Context, line: []const u8) void {
     if (!enabled(level)) return;
-    deliver(level, scope, line);
+    deliver(level, scope, ctx, line);
 }
 
 test "level filter: below the runtime level nothing reaches the sink" {

@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const gauges = @import("gauges.zig");
+const hooks = @import("hooks.zig");
 const builtin = @import("builtin");
 const tls = @import("tls");
 /// See client.zig: the TLS module's trust store, loaded once per listener.
@@ -2549,7 +2550,10 @@ pub fn Server(comptime Ctx: type) type {
                 .allow = if (miss) |m| m.allow else null,
                 .error_handler = self.config.error_handler,
             };
-            try executor.run();
+            const t0 = hooks.begin(req.io);
+            const result = executor.run();
+            hooks.end(req, res, result, t0);
+            return result;
         }
 
         /// Throws away the rest of a request body the handler left unread,
@@ -2930,7 +2934,10 @@ pub fn Server(comptime Ctx: type) type {
                     .allow = if (miss) |m| m.allow else null,
                     .error_handler = self.config.error_handler,
                 };
-                executor.run() catch |err| switch (err) {
+                const t0 = hooks.begin(self.io);
+                const run_result = executor.run();
+                hooks.end(&request, &response, run_result, t0);
+                run_result catch |err| switch (err) {
                     error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
                     error.WriteFailed => return connection.getWriteError() orelse error.Unexpected,
                     // `Response.abort`: the connection closes under the

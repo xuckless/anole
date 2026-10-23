@@ -564,7 +564,7 @@ pub const Request = struct {
 
     /// A logger whose records carry this request's id, trace id and span id.
     pub fn log(self: *const Request) anole_log.Logger {
-        return .{ .context = .{ .request_id = self.id, .trace_id = self.trace_id, .span_id = self.span_id } };
+        return .{ .context = .{ .request_id = self.id, .trace_id = self.trace_id, .span_id = self.span_id, .route = if (self.route) |r| r.path else "" } };
     }
 
     /// The JSON body as a generic value; null without a body, and

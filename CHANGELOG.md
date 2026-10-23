@@ -135,6 +135,20 @@ OpenAPI documents and the `anole` command line.
   server-sent event streams and log capture
   ([testing.md](docs/testing.md)).
 
+### Console
+
+- A live console: `anole console` attaches to a running app over a local
+  socket (logs with filters, per-route req/s and p50/p99, recent 5xx,
+  connections, databases, HTTP/3, runtime, resolved config, routes; `/reload`,
+  `/drain`, `/restart`, `/full-restart`). In development, `c` + Enter opens
+  it in the terminal the app runs in. `ServerOptions.console`, `-Dconsole`
+  ([console.md](docs/console.md)).
+- C ABI: `anole_console_open`, `anole_console_close`, `anole_console_attached`,
+  `anole_console_report`, `anole_console_log`, event 132
+  `ANOLE_EV_CONSOLE_CLOSED`, the `console` configuration group.
+- `anole console` in the CLI (`--list`, `--snapshot <view>`).
+- `RouteInfo` gains `index`; `anole_log.Context` gains `route`.
+
 ### Breaking
 
 - A JSON body that is valid JSON but whose values do not fit the type is now

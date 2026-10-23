@@ -45,6 +45,7 @@ export default defineConfig({
 						'auth',
 						'observability',
 						'logging',
+						'console',
 						'testing',
 						'from-fiber',
 						'migrating',

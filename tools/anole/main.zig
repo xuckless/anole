@@ -14,6 +14,7 @@ const std = @import("std");
 const options = @import("cli_options");
 const index = @import("templates");
 const banner = @import("banner");
+const console_cmd = @import("console.zig");
 
 const Io = std.Io;
 
@@ -40,6 +41,10 @@ const EnvReader = struct {
     }
 };
 
+fn consoleEnv(_: ?*const anyopaque, name: []const u8) ?[]const u8 {
+    return getEnv(name);
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -59,6 +64,7 @@ fn run(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
     }
     const cmd = args[0];
     if (std.mem.eql(u8, cmd, "new")) return newCommand(gpa, io, args[1..]);
+    if (std.mem.eql(u8, cmd, "console")) return console_cmd.command(gpa, io, args[1..], .{ .get = consoleEnv });
     if (std.mem.eql(u8, cmd, "templates")) {
         try listTemplates(io);
         return 0;
@@ -69,7 +75,8 @@ fn run(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
     }
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         const topic: ?[]const u8 = if (args.len > 1) args[1] else null;
-        try say(io, "{s}", .{if (topic != null and std.mem.eql(u8, topic.?, "new")) new_help else usage_text});
+        const text = if (topic != null and std.mem.eql(u8, topic.?, "new")) new_help else if (topic != null and std.mem.eql(u8, topic.?, "console")) console_cmd.help_text else usage_text;
+        try say(io, "{s}", .{text});
         return 0;
     }
     std.debug.print("anole: unknown command \"{s}\"\n\n{s}", .{ cmd, usage_text });

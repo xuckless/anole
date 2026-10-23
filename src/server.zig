@@ -39,6 +39,35 @@ const env_mod = @import("env.zig");
 /// SIGUSR2 (restart) and SIGHUP (certificate reload): not on Windows.
 const unix_signals = builtin.os.tag != .windows;
 
+/// The text `/config` shows, rendered once at init: the resolved modes, the
+/// options with secrets left out, the `.env` files read (names and counts
+/// only) and the features this build has.
+fn renderConsoleConfig(a: std.mem.Allocator, opts: *const Options, mode: *const modes.Resolved) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    const w = &aw.writer;
+    try w.writeAll("# modes\n");
+    var lines: [2048]u8 = undefined;
+    var lw: std.Io.Writer = .fixed(&lines);
+    modes.writeLines(mode, .{ .used_listen_tls = false }, &lw) catch {};
+    var it = std.mem.splitScalar(u8, lw.buffered(), '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        try w.print("{s}\n", .{if (line[0] == '!') line[1..] else line});
+    }
+    try w.writeAll("\n# options\n");
+    try console.config_text.writeOptions(w, opts.*);
+    if (mode.files) |f| {
+        try w.writeAll("\n# .env files read (names and value counts)\n");
+        for (f.read) |r| try w.print("{s}: {d} values\n", .{ r.path, r.count });
+    }
+    try w.writeAll("\n# build\n");
+    try w.print("anole {s}, {s}\n", .{ features.version, @tagName(builtin.mode) });
+    inline for (.{ "tls", "http2", "http3", "grpc", "websocket", "auth", "compression", "brotli", "json", "redis", "postgres", "sqlite", "mongodb", "nats", "kafka", "openapi" }) |name| {
+        try w.print("{s} = {any}\n", .{ name, @field(features, name) });
+    }
+    return aw.written();
+}
+
 /// `name` in `environ`; on Windows, where `Environ` holds UTF-16 with
 /// nothing to slice, in the C library's environment.
 fn envVar(environ: std.process.Environ, name: []const u8) ?[]const u8 {
@@ -54,6 +83,8 @@ const address_mod = @import("address.zig");
 const handlers = @import("handlers.zig");
 const typed = @import("typed.zig");
 const banner_mod = @import("banner.zig");
+const console = @import("console/root.zig");
+const console_host = @import("console/host.zig");
 const anole_log = @import("anole_log");
 const log_mod = @import("log.zig");
 const route_pattern = @import("dusty").route_pattern;
@@ -280,6 +311,14 @@ pub const Options = struct {
     /// the executors, at most this many at once. Password hashing uses it.
     /// Null: none, and such work runs on the request's executor.
     blocking: ?blocking.Options = null,
+    /// The live console (docs/console.md): a control socket that
+    /// `anole console` attaches to, and in development `c` + Enter in the
+    /// terminal. Nothing is collected on the request path unless a console
+    /// is attached.
+    console: console.Options = .{},
+    /// Internal: the language runtime the C ABI's console shows
+    /// ("node 22.11.0").
+    _console_runtime: ?[]const u8 = null,
 
     // Outbound
 
@@ -678,6 +717,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// The resolved modes (docs/config.md): environment, deployment and
         /// what they fill in. In the server's arena.
         mode: *modes.Resolved,
+        /// The live console: its resolved options, the running console (from
+        /// `run` to the drain), the event `/restart` sets, and what `/config`
+        /// shows.
+        console_resolved: console.Resolved,
+        console: ?*console.Console = null,
+        console_restart: *std.Io.Event,
+        console_config_text: []const u8 = "",
+        console_runtime: ?[]const u8 = null,
+        console_embedded: bool = false,
+        last_successor_pid: i32 = 0,
         /// `listenTls` set up the TLS listener (for the startup line).
         used_listen_tls: bool = false,
         /// The TLS listeners' certificates, one per distinct source, for
@@ -737,6 +786,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             deinit: *const fn (context: *anyopaque) void,
             /// "postgres", "redis"...; "connector" for the rest.
             name: []const u8 = "connector",
+            /// Writes the console's `/db` entry fields ("system", "name",
+            /// "target", "pools") without the braces.
+            describe: *const fn (context: *anyopaque, name: []const u8, w: *std.Io.Writer) anyerror!void,
 
             fn systemOf(comptime T: type) []const u8 {
                 const n = @typeName(T);
@@ -757,8 +809,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         const v: *T = @ptrCast(@alignCast(context));
                         v.deinit();
                     }
+                    fn describe(context: *anyopaque, name: []const u8, w: *std.Io.Writer) anyerror!void {
+                        const v: *T = @ptrCast(@alignCast(context));
+                        if (comptime @hasDecl(T, "consoleInfo")) return v.consoleInfo(w);
+                        try w.print("\"system\":\"{s}\",\"name\":\"{s}\",\"target\":\"\",\"pools\":[]", .{ name, name });
+                    }
                 };
-                return .{ .context = value, .start = Hooks.start, .deinit = Hooks.deinit, .name = comptime systemOf(T) };
+                return .{ .context = value, .start = Hooks.start, .deinit = Hooks.deinit, .describe = Hooks.describe, .name = comptime systemOf(T) };
             }
         };
 
@@ -940,6 +997,17 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
             applyLogOptions(&opts, mode);
 
+            var console_resolved: console.Resolved = undefined;
+            {
+                var cwhy_buf: [256]u8 = undefined;
+                var cwhy: std.Io.Writer = .fixed(&cwhy_buf);
+                console_resolved = console.resolve(opts.console, .process, mode.environment, mode.deployment, .current, &cwhy) catch |err| {
+                    errors.log.err("{s}", .{cwhy.buffered()});
+                    return err;
+                };
+            }
+            const console_config_text: []const u8 = if (features.console and console_resolved.enabled) renderConsoleConfig(a, &opts, mode) catch "" else "";
+
             const rt = try zio.Runtime.init(gpa, .{
                 .executors = opts.executors,
                 .stack_pool = .{
@@ -982,7 +1050,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 extras.client.deinit();
             }
 
+            const console_restart = try a.create(std.Io.Event);
+            console_restart.* = .unset;
             var self: Self = .{
+                .console_resolved = console_resolved,
+                .console_restart = console_restart,
+                .console_config_text = console_config_text,
+                .console_runtime = opts._console_runtime,
+                .console_embedded = opts._resolved != null,
                 .gpa = gpa,
                 .rt = rt,
                 .arena = arena,
@@ -2565,6 +2640,115 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.stopped.set(self.rt.io());
         }
 
+        /// The live console's socket, once `run` serves; null when it is off
+        /// or could not be set up.
+        pub fn consoleSocket(self: *const Self) ?[]const u8 {
+            const c = self.console orelse return null;
+            return c.socket_path;
+        }
+
+        /// Whether SIGUSR2's hand-off (and so the console's /restart) is
+        /// possible.
+        pub fn consoleRestartable(self: *const Self) bool {
+            return unix_signals and self.process != null and self.held.len > 0;
+        }
+
+        /// HTTP/3 is on.
+        pub fn consoleHasH3(self: *const Self) bool {
+            if (comptime !features.http3) return false;
+            return self.h3 != null;
+        }
+
+        /// The console's /restart: `run` hands over as it does on SIGUSR2.
+        pub fn consoleRequestRestart(self: *Self) void {
+            self.console_restart.set(self.rt.io());
+        }
+
+        /// Why /restart cannot hand over the listeners, or null.
+        fn consoleRestartWhy(self: *const Self) ?[]const u8 {
+            if (!unix_signals) return "not on Windows";
+            if (self.console_embedded) return "the C ABI has no listener hand-off; /full-restart re-executes the process";
+            if (self.process == null) return "no listener hand-off: set .process = init.minimal in ServerOptions";
+            if (self.held.len == 0) return "no listener to hand over";
+            return null;
+        }
+
+        const console_features: []const []const u8 = blk: {
+            var l: []const []const u8 = &.{"h1"};
+            if (features.http2) l = l ++ &[_][]const u8{"h2"};
+            if (features.http3) l = l ++ &[_][]const u8{"h3"};
+            if (features.websocket) l = l ++ &[_][]const u8{"ws"};
+            if (features.grpc) l = l ++ &[_][]const u8{"grpc"};
+            if (features.postgres or features.sqlite or features.mongodb or features.redis) l = l ++ &[_][]const u8{"db"};
+            break :blk l;
+        };
+
+        /// Starts the live console (socket, rings, hooks) unless it is off.
+        fn startConsole(self: *Self) void {
+            if (comptime !features.console) return;
+            if (!self.console_resolved.enabled) return;
+            const executors: u32 = @intCast(self.rt.executors.items.len);
+            self.console = console.Console.start(.{
+                .gpa = self.gpa,
+                .io = self.rt.io(),
+                .resolved = self.console_resolved,
+                .host = console_host.Of(Self).make(self, executors),
+                .executors = executors,
+                .environment = @tagName(self.mode.environment),
+                .deployment = @tagName(self.mode.deployment),
+                .runtime = self.console_runtime,
+                .features = console_features,
+                .has_tls = self.certs.len > 0,
+                .restart_unavailable = self.consoleRestartWhy(),
+                .embedded = self.console_embedded,
+            }) catch |err| {
+                std.log.scoped(.anole).warn("console: not available: {t}", .{err});
+                return;
+            };
+        }
+
+        /// Once the listeners are up: the console's startup lines, and the
+        /// development hotkey.
+        fn consoleAnnounce(self: *Self) void {
+            const c = self.console orelse return;
+            const log = std.log.scoped(.anole);
+            self.server.waitReady(self.rt.io()) catch return;
+            if (c.warning) |w| {
+                log.warn("{s}", .{w});
+            } else if (c.socket_path) |path| {
+                if (self.console_resolved.socket != null) {
+                    log.info("console: `anole console {s}` attaches", .{path});
+                } else log.info("console: `anole console {s}` attaches (socket {s})", .{ c.name, path });
+            }
+            if (self.console_embedded) return;
+            const ui_sys = @import("anole_console_ui").sys;
+            const gate: console.keys_dev.Gate = .{
+                .enabled = true,
+                .development = self.mode.environment == .development,
+                .is_test = builtin.is_test,
+                .stdin_tty = ui_sys.isatty(0),
+                .stderr_tty = ui_sys.isatty(2),
+                .term = ui_sys.getenv("TERM"),
+                .invocation_id = ui_sys.getenv("INVOCATION_ID") != null,
+                .journal_stream = ui_sys.getenv("JOURNAL_STREAM") != null,
+                .ci = ui_sys.getenv("CI") != null,
+                .container = console.supervisor.inContainer(),
+                .explicit = self.console_resolved.keys,
+            };
+            if (console.keys_dev.allowed(gate)) {
+                c.startKeys() catch return;
+                log.info("press c + Enter for the live console", .{});
+            } else if (self.console_resolved.keys == true) {
+                log.info("console: keys need a terminal on stdin", .{});
+            }
+        }
+
+        fn stopConsole(self: *Self, drain: bool) void {
+            const c = self.console orelse return;
+            self.console = null;
+            c.stop(drain);
+        }
+
         /// The bound address of each listener (`http`, `https`, then
         /// `listeners`, in order), once serving; a listener given port 0
         /// has its real port here.
@@ -2641,6 +2825,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 restart: anyerror!void,
                 h3: anyerror!void,
                 reload: anyerror!void,
+                restart_cmd: anyerror!void,
             };
             var done_buf: [8]Done = undefined;
             var sel = std.Io.Select(Done).init(rt_io, &done_buf);
@@ -2649,6 +2834,17 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 try sel.concurrent(.term, waitForSignal, .{.terminate});
             }
             try sel.concurrent(.stop, waitStopped, .{ self.stopped, rt_io });
+            // The live console: its socket and rings, and what it may ask of
+            // this loop (/restart).
+            self.startConsole();
+            defer if (self.console != null) self.stopConsole(false);
+            if (self.console != null) {
+                if (self.consoleRestartWhy() == null and self.console_resolved.allow_restart and !self.console_resolved.read_only) {
+                    try sel.concurrent(.restart_cmd, waitStopped, .{ self.console_restart, rt_io });
+                }
+            }
+            var announce: ?std.Io.Future(void) = if (self.console != null) try rt_io.concurrent(consoleAnnounce, .{self}) else null;
+            defer if (announce) |*f| f.cancel(rt_io);
             try sel.concurrent(.served, serve, .{self.server});
             if (comptime features.http3) if (self.h3) |ep| try sel.concurrent(.h3, serveH3, .{ep});
             // Windows has neither SIGUSR2 nor SIGHUP (zio maps Ctrl-C to
@@ -2672,13 +2868,29 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 const done = try sel.await();
                 // Ends only when it cannot listen for SIGHUP (logged).
                 if (done == .reload) continue;
-                if (done != .restart) break done;
-                // SIGUSR2: start the successor; drain once it serves.
+                if (done != .restart and done != .restart_cmd) break done;
+                // SIGUSR2 or the console's /restart: start the successor;
+                // drain once it serves.
                 if (comptime !unix_signals) unreachable;
-                if (self.restart()) break done;
-                try sel.concurrent(.restart, waitForSignal, .{.user2});
+                if (self.restart()) {
+                    if (self.console) |c| c.service.restartFinished(true, self.last_successor_pid);
+                    break done;
+                }
+                if (self.console) |c| c.service.restartFinished(false, 0);
+                if (done == .restart) {
+                    try sel.concurrent(.restart, waitForSignal, .{.user2});
+                } else {
+                    self.console_restart.reset();
+                    try sel.concurrent(.restart_cmd, waitStopped, .{ self.console_restart, rt_io });
+                }
             };
-            if (first == .restart) {
+            // The console says goodbye before the drain, and the terminal is
+            // back for what the drain logs.
+            switch (first) {
+                .served, .h3 => self.stopConsole(false),
+                else => self.stopConsole(true),
+            }
+            if (first == .restart or first == .restart_cmd) {
                 // HTTP/3 cannot drain beside the successor on one UDP
                 // socket: its connections close now and it stops reading.
                 if (comptime features.http3) if (self.h3) |ep| ep.handOver();
@@ -2693,7 +2905,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .served, .h3 => |r| return r,
                 .reload => unreachable,
                 .int, .term => log.info("signal received ({t}); drained and stopped", .{first}),
-                .restart => log.info("handed over to the new process; drained and stopped", .{}),
+                .restart, .restart_cmd => log.info("handed over to the new process; drained and stopped", .{}),
                 .stop => {},
             }
         }
@@ -2714,6 +2926,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 return false;
             };
             log.info("restart: started process {d}; waiting for it to serve", .{successor.pid});
+            self.last_successor_pid = @intCast(successor.pid);
             if (!successor.waitReady(self.rt.io(), self.restart_timeout)) {
                 log.err("restart: process {d} did not report serving; stopped it and carrying on", .{successor.pid});
                 successor.abandon();

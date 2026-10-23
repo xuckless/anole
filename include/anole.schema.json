@@ -83,6 +83,22 @@
       },
       "description": "Logging, process-wide (docs/logging.md)."
     },
+    "console": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The live console (docs/console.md): a control socket that `anole console` attaches to, and anole_console_open for a terminal in this process.",
+      "properties": {
+        "enabled": { "type": ["boolean", "null"], "default": null, "description": "The control socket; null: on (off under deployment lambda, on Windows, with ANOLE_CONSOLE=0)." },
+        "name": { "type": ["string", "null"], "default": null, "maxLength": 48, "description": "What `anole console <name>` finds the app by; bindings pass the package or module name." },
+        "socket": { "type": ["string", "null"], "default": null, "description": "The socket's path; null: <runtime dir>/anole/<name>.<pid>.sock." },
+        "allow_restart": { "type": ["boolean", "null"], "default": null, "description": "/restart and /full-restart; null: on in development, off in production." },
+        "read_only": { "type": "boolean", "default": false, "description": "Refuse /reload, /drain, /restart and /full-restart." },
+        "log_buffer": { "type": "integer", "minimum": 0, "default": 4194304, "description": "Bytes of recent log records kept (warnings and errors always, every level while a console shows logs); 0: none." },
+        "errors_kept": { "type": "integer", "minimum": 16, "maximum": 4096, "default": 256, "description": "5xx answers kept for /errors." },
+        "max_routes": { "type": "integer", "minimum": 1, "maximum": 4096, "default": 256, "description": "Routes with latency numbers of their own; the rest are counted together." },
+        "runtime": { "type": ["string", "null"], "default": null, "maxLength": 64, "description": "Shown in the console's status line, e.g. \"node 22.11.0\"." }
+      }
+    },
     "banner": {
       "type": "boolean",
       "default": false,

@@ -482,7 +482,11 @@ enum anole_event_type {
   ANOLE_EV_KAFKA_REVOKE = 83,    /* anole_kafka_assign_event: finish those partitions' batches */
   ANOLE_EV_KAFKA_WRITABLE = 84,  /* anole_broker_status_event: a produce refused with
                                     ANOLE_E_AGAIN (or advised with ANOLE_BUSY) would be taken now */
-  ANOLE_EV_KAFKA_GROUP_END = 85  /* anole_broker_end_event; handle: anole_kafka_group, now over */
+  ANOLE_EV_KAFKA_GROUP_END = 85, /* anole_broker_end_event; handle: anole_kafka_group, now over */
+  ANOLE_EV_CONSOLE_CLOSED = 132  /* anole_console_closed_event, handle 0: the in-process console
+                                    (anole_console_open) closed; the terminal is the binding's
+                                    again. Only after anole_console_open. 133-135 are reserved
+                                    for the console */
 };
 
 /* Every event starts with this. Records are 8-byte aligned and `len`
@@ -574,6 +578,57 @@ typedef struct anole_abort_event {
                         code for a gRPC call; 0 when nothing was sent */
   uint32_t reserved;
 } anole_abort_event; /* 24 */
+
+/* ---- Console (docs/console.md) ----
+   The live console: `anole console` attaches to the control socket the
+   "console" configuration group sets up, and anole_console_open shows the
+   same screen in this process's terminal. libanole never reads stdin: the
+   binding does, and calls anole_console_open when the user asks for it. */
+enum {
+  ANOLE_CONSOLE_QUIT = 0,       /* Esc or /quit: resume reading stdin */
+  ANOLE_CONSOLE_INTERRUPT = 1,  /* Ctrl-C: libanole raises SIGINT right after the event */
+  ANOLE_CONSOLE_RESTARTING = 2  /* /full-restart: the process execs right after */
+};
+typedef struct anole_console_closed_event {
+  anole_event ev;     /* type ANOLE_EV_CONSOLE_CLOSED, handle 0 */
+  uint32_t reason;    /* ANOLE_CONSOLE_* */
+  uint32_t reserved;
+} anole_console_closed_event; /* 24 */
+
+enum {
+  ANOLE_UNIT_NONE = 0,
+  ANOLE_UNIT_BYTES = 1,
+  ANOLE_UNIT_SECONDS = 2,
+  ANOLE_UNIT_COUNT = 3,
+  ANOLE_UNIT_PERCENT = 4
+};
+typedef struct anole_console_metric {
+  anole_str name;     /* [a-z0-9_.], 1 to 48 bytes */
+  double value;
+  uint32_t unit;      /* ANOLE_UNIT_* */
+  uint32_t reserved;
+} anole_console_metric; /* 32 */
+
+/* Opens the console in this process's terminal (/dev/tty), on a thread of
+   libanole's: stop reading stdin first, and resume after
+   ANOLE_EV_CONSOLE_CLOSED. flags: 0. ANOLE_E_STATE: the server is not
+   running, or a console is open already. ANOLE_E_UNSUPPORTED: no terminal,
+   TERM=dumb, or Windows. ANOLE_E_CONFIG: the console is off ("console"
+   group). */
+ANOLE_API anole_status anole_console_open(anole_server *s, uint32_t flags);
+/* Closes it (no event). ANOLE_OK when it was not open. */
+ANOLE_API anole_status anole_console_close(anole_server *s);
+/* Consoles attached now (in-process included), >= 0: report metrics only
+   while it is above 0. */
+ANOLE_API int32_t anole_console_attached(anole_server *s);
+/* Replaces the language metrics /runtime shows (at most 32; copied).
+   ANOLE_E_INVALID: more than 32, or a bad name or unit. */
+ANOLE_API anole_status anole_console_report(anole_server *s, const anole_console_metric *m, size_t n);
+/* A record from the binding's logger, for /logs only (nothing is written;
+   the binding writes its own). level: ANOLE_LOG_*. req: the request it
+   belongs to, or 0. ANOLE_OK also when nothing is kept (the console is off,
+   or the level is below what is kept). */
+ANOLE_API anole_status anole_console_log(anole_server *s, uint32_t level, anole_str scope, anole_str msg, uint64_t req);
 
 /* ANOLE_EV_SENT: Anole no longer reads the memory of a body passed with
    ANOLE_BODY_BORROW (to anole_req_respond or anole_req_stream_write on the request

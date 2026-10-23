@@ -15,6 +15,11 @@ const std = @import("std");
 var trace_buf: [32 * 1024]u8 = undefined;
 var taken: std.atomic.Value(bool) = .init(false);
 
+/// Called first, before anything is written: the live console sets it while
+/// it owns the terminal, so the message reaches the real screen. Must be
+/// async-signal-safe.
+pub var before_panic: ?*const fn () void = null;
+
 /// The handler `panic` wraps.
 pub fn handler(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @branchHint(.cold);
@@ -26,6 +31,7 @@ pub fn handler(msg: []const u8, first_trace_addr: ?usize) noreturn {
 /// inside the logging itself, takes Zig's own path (standard error).
 pub fn log(msg: []const u8, first_address: usize) void {
     @branchHint(.cold);
+    if (before_panic) |f| f();
     if (taken.swap(true, .acq_rel)) std.debug.defaultPanic(msg, first_address);
     var w: std.Io.Writer = .fixed(&trace_buf);
     write(&w, msg, first_address);

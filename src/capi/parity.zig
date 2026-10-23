@@ -323,6 +323,9 @@ pub const server_options = [_]Entry{
     .{ .zig = "log.format", .json = "log.format" },
     .{ .zig = "log.level", .omitted = "the ABI keeps `anole_server_options.log_level`" },
     .{ .zig = "log.service", .json = "log.service" },
+    .{ .zig = "console", .json = "console", .kind = .same },
+    .{ .zig = "console.keys", .omitted = "a binding owns stdin: it reads the hotkey and calls anole_console_open" },
+    .{ .zig = "_console_runtime", .omitted = "internal: the ABI's console.runtime" },
     .{ .zig = "env_files", .omitted = "the binding reads .env files into its language's environment (anole_dotenv_read)" },
     .{ .zig = "_resolved", .omitted = "internal: the C ABI resolves the modes at create" },
 };
