@@ -93,8 +93,13 @@ pub const ExecState = struct {
     chunks: [max_chunks]std.atomic.Value(?*Chunk) = @splat(.init(null)),
     nchunks: u32 = 0,
     free_head: u32 = engine.no_slot,
-    /// Unsubscribes and publishes.
+    /// Unsubscribes and the publish lane.
     work: std.Io.Group = .init,
+    /// The publish lane: publishes to topics that hash to this executor,
+    /// in the order they were taken, and the one task that fans them out.
+    lane_head: ?*PublishCmd = null,
+    lane_tail: ?*PublishCmd = null,
+    lane_running: bool = false,
 
     fn slot(st: *ExecState, i: u32) ?*WsSlot {
         // `i` may come from a made-up handle: past the table is no socket.
@@ -133,6 +138,7 @@ pub const ExecState = struct {
     }
 
     pub fn deinit(st: *ExecState) void {
+        st.dropLane();
         for (st.chunks[0..st.nchunks]) |*cv| {
             const c = cv.load(.acquire).?;
             for (c) |*s| {
@@ -148,6 +154,15 @@ pub const ExecState = struct {
             gpa.destroy(c);
         }
         st.nchunks = 0;
+    }
+
+    /// Frees the publishes left in the lane.
+    fn dropLane(st: *ExecState) void {
+        while (st.lane_head) |p| {
+            st.lane_head = p.next;
+            p.free();
+        }
+        st.lane_tail = null;
     }
 
     /// Cancels the executor's WebSocket work (at the server's end).
@@ -515,6 +530,8 @@ const PublishCmd = struct {
     data: []u8,
     /// `Engine.topic_changes` when it was taken.
     after: u32,
+    /// The next publish in the executor's lane.
+    next: ?*PublishCmd = null,
 
     fn free(p: *PublishCmd) void {
         _ = p.engine.publishing.fetchSub(1, .monotonic);
@@ -536,8 +553,6 @@ pub fn publishLimits(e: *const Engine) struct { tasks: usize, bytes: usize } {
         .bytes = @max(16 * hw, 2 * max_msg),
     };
 }
-
-var next_publisher: std.atomic.Value(usize) = .init(0);
 
 pub fn publish(e: *Engine, topic: []const u8, typ: u32, data: []const u8, except: u64) engine.AnswerError!void {
     try checkTopic(topic);
@@ -568,25 +583,58 @@ pub fn publish(e: *Engine, topic: []const u8, typ: u32, data: []const u8, except
     const t = try gpa.dupe(u8, topic);
     errdefer gpa.free(t);
     p.* = .{ .cmd = .{ .run = runPublish }, .engine = e, .except = except, .type = mt, .topic = t, .data = try gpa.dupe(u8, data), .after = e.topic_changes.load(.acquire) };
-    // Spread over the executors.
-    const xi = next_publisher.fetchAdd(1, .monotonic) % e.execs.len;
+    // One executor per topic, so publishes to a topic fan out in the order
+    // they were taken; topics spread over the executors.
+    const xi: usize = @intCast(std.hash.Wyhash.hash(0, topic) % e.execs.len);
     e.execs[xi].post(&p.cmd);
 }
 
 fn runPublish(cmd: *Command, x: *Exec) void {
     const p: *PublishCmd = @fieldParentPtr("cmd", cmd);
     if (x.engine.phase.load(.acquire) == .stopped) return p.free();
-    placement.concurrent(&x.ws.work, x.engine.io, .local, publishTask, .{ x.engine, p }) catch p.free();
+    const st = &x.ws;
+    p.next = null;
+    if (st.lane_tail) |t| t.next = p else st.lane_head = p;
+    st.lane_tail = p;
+    if (st.lane_running) return;
+    st.lane_running = true;
+    placement.concurrent(&st.work, x.engine.io, .local, publishLane, .{ x.engine, x }) catch {
+        // No task to spare: what is queued is dropped, and counted.
+        st.lane_running = false;
+        while (st.lane_head) |q| {
+            st.lane_head = q.next;
+            _ = x.engine.publish_dropped.fetchAdd(1, .monotonic);
+            q.free();
+        }
+        st.lane_tail = null;
+    };
 }
 
-fn publishTask(e: *Engine, p: *PublishCmd) std.Io.Cancelable!void {
-    defer p.free();
-    try awaitTopicChanges(e, p.after);
-    // Only compared, never followed: a stale handle names no member.
-    var except: ?*Socket = null;
-    if (p.except != 0) if (slotOf(e, p.except)) |found| {
-        if (found[0].live(found[1])) except = found[0].socket;
-    } else |_| {};
-    const reached = e.rooms.broadcast(p.topic, p.type, p.data, except);
-    _ = e.ws_out.fetchAdd(reached, .monotonic);
+/// Takes the executor's publishes one after the other, in order: each waits
+/// for the topic changes taken before it, then fans out to the topic's
+/// members (every member's queue gets it before the next publish starts).
+fn publishLane(e: *Engine, x: *Exec) std.Io.Cancelable!void {
+    const st = &x.ws;
+    while (true) {
+        const p = st.lane_head orelse {
+            st.lane_running = false;
+            return;
+        };
+        st.lane_head = p.next;
+        if (st.lane_head == null) st.lane_tail = null;
+        defer p.free();
+        awaitTopicChanges(e, p.after) catch |err| {
+            // The stop: what is left is dropped.
+            st.lane_running = false;
+            st.dropLane();
+            return err;
+        };
+        // Only compared, never followed: a stale handle names no member.
+        var except: ?*Socket = null;
+        if (p.except != 0) if (slotOf(e, p.except)) |found| {
+            if (found[0].live(found[1])) except = found[0].socket;
+        } else |_| {};
+        const reached = e.rooms.broadcast(p.topic, p.type, p.data, except);
+        _ = e.ws_out.fetchAdd(reached, .monotonic);
+    }
 }
