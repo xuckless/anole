@@ -6,17 +6,18 @@ apart by the request's content type:
 
 | Protocol | Content type | Transport |
 | --- | --- | --- |
-| gRPC | `application/grpc`, `application/grpc+proto` | HTTP/2 only (h2c or TLS) |
-| gRPC-Web | `application/grpc-web`, `application/grpc-web-text` (`+proto`) | HTTP/1.1 or HTTP/2 |
-| Connect unary | `application/proto`, `application/json` | HTTP/1.1 or HTTP/2 |
-| Connect streaming | `application/connect+proto`, `application/connect+json` | HTTP/1.1 or HTTP/2 |
+| gRPC | `application/grpc`, `application/grpc+proto` | HTTP/2 (h2c or TLS) or HTTP/3 |
+| gRPC-Web | `application/grpc-web`, `application/grpc-web-text` (`+proto`) | HTTP/1.1, 2 or 3 |
+| Connect unary | `application/proto`, `application/json` | HTTP/1.1, 2 or 3 |
+| Connect streaming | `application/connect+proto`, `application/connect+json` | HTTP/1.1, 2 or 3 |
 
 Methods annotated with `google.api.http` also get REST routes of their own,
 JSON in and out ([JSON transcoding](#json-transcoding)).
 
 A gRPC request over HTTP/1.1 gets `505 HTTP Version Not Supported`, and an
 unknown content type gets `415`. gRPC needs `-Dgrpc` and `-Dhttp2`, both on in
-the default `full` profile.
+the default `full` profile. HTTP/3 needs `-Dhttp3` and a TLS listener with
+HTTP/3 (on by default with `listenTls`); see [HTTP/3](#http3).
 
 `examples/grpc` is a runnable Greeter with the health service:
 
@@ -660,12 +661,103 @@ code without a generated service type. A non-200 HTTP answer (from a proxy,
 say) maps to gRPC's codes, and a call that ends without a status after its
 deadline reports DEADLINE_EXCEEDED.
 
+## HTTP/3
+
+Native gRPC over HTTP/3 follows gRFC G2: the same headers, `application/grpc`
+content type, length-prefixed messages in DATA frames and status in
+trailers as over HTTP/2.
+
+**Serving.** There is nothing to switch on. A service you registered answers
+native gRPC on every listener that serves HTTP/2 or HTTP/3, the C ABI's
+services too. The `Alt-Svc` header the TLS listener already puts on its
+responses advertises HTTP/3 to clients that start on HTTP/2.
+
+**The client.** Give a channel an HTTP/3 connection, or let it own one:
+
+```zig
+const conn = try anole.h3.ClientConnection.connect(gpa, io, .{ .host = "api.example", .port = 443 });
+defer conn.close();
+var channel: anole.grpc.Channel = .{ .h3 = conn, .authority = "api.example", .scheme = "https" };
+
+// Or a channel that dials and redials for itself:
+const owned = try anole.grpc.Channel.connect(gpa, io, .{ .host = "api.example", .port = 443, .tls = .{} }, .{ .http = .auto });
+defer owned.close();
+```
+
+`.http = .h2` (the default) is HTTP/2 only. `.h3` is HTTP/3 by prior
+knowledge: the server must serve it on `http3.port` (default: the same
+number over UDP), and a server without it fails the call with UNAVAILABLE.
+`.auto` starts on HTTP/2; once a response's `Alt-Svc` advertises `h3` for the
+host, the next call dials HTTP/3 and later calls use it. If QUIC does not
+come up within `http3.connect_timeout` (3 s), calls stay on HTTP/2 and
+HTTP/3 is not tried again for `http3.retry_after` (5 minutes). A call
+HTTP/3 provably did not carry (never processed, or the connection lost before
+a response) goes once more over HTTP/2. `UnaryResult.transport` says which
+version carried a call. Both modes need `tls`.
+
+**Limits.** A connection takes 100 concurrent calls (HTTP/2: 250). Each call
+has a 1 MiB send buffer and receive window (`http3.stream_window`), and a
+connection holds 4 MiB unacknowledged. Message limits (`max_message_size`,
+`max_received_bytes`) are the same as on HTTP/2.
+
+**Deadlines and cancellation.** Past a deadline the server cancels the
+handler and sends DEADLINE_EXCEEDED in the trailers, then STOP_SENDING if the
+request side is still open. A client that cancels, or passes its own
+deadline, resets the stream with `H3_REQUEST_CANCELLED`, and the handler's
+next wait returns `error.Canceled`, as on HTTP/2. A server that resets a
+call maps to a status in the client by its code, on both transports:
+refused (`REFUSED_STREAM`, `H3_REQUEST_REJECTED`) is UNAVAILABLE, cancelled
+is CANCELLED, excessive load is RESOURCE_EXHAUSTED, `INADEQUATE_SECURITY` is
+PERMISSION_DENIED, and anything else INTERNAL. Only UNAVAILABLE is retried by
+`Channel.retry`.
+
+**Keep-alive and 0-RTT.** While a call is open, QUIC PINGs keep the
+connection alive, so a quiet stream outlives the 30 s idle timeout; an idle
+connection still closes at it. Calls are never sent in 0-RTT.
+
+Which clients speak it: grpc-dotnet (`HttpVersion = 3.0`), connect-go on
+quic-go with `WithGRPC`, `buf curl --http3`. grpc-go, grpc-java and grpc-node
+do not.
+
+## gRPC between processes on one host
+
+A gRPC service can listen on a Unix domain socket, with no TLS and no network
+port, for calls between a web app and a worker on the same machine:
+
+```zig
+var app = try anole.Server(void).init(gpa, .{
+    .listeners = &.{.{ .unix = "/run/app/worker.sock" }},
+}, {});
+app.grpc(pb.Worker, .{ .Run = run });
+```
+
+The listener serves cleartext HTTP/2 (prior knowledge), so gRPC works on it
+without further options. The socket file is created `0660` (owner and group
+may connect; others may not): change it with `unix_mode`. A socket file left
+by a server that is gone is replaced; one something still listens on is an
+error. The client names the socket as gRPC does:
+
+```zig
+const channel = try anole.grpc.Channel.connect(gpa, io, .{ .host = "unix:/run/app/worker.sock", .port = 0 }, .{});
+defer channel.close();
+```
+
+`unix:/path` and `unix:///path` work everywhere; Linux also takes
+`unix-abstract:name`. The connection is cleartext HTTP/2 and the authority is
+`localhost`, as in grpc-go; `tls` on a Unix target is refused
+(`error.TlsOnUnixSocket`). Services written in Node or Python through the C
+ABI get the same listener (`"unix"` in `listeners`); the ABI has no outbound
+gRPC client yet. Windows needs `AF_UNIX` support and comes after 0.4.
+
 ## Interop
 
 grpc-go v1.84.0's interop client passes all 14 cases it runs against Anole's
 server (`tests/grpc/interop/run.sh`), and Anole's client passes 11 cases
 against grpc-go's server (`tests/grpc/interop/run-client.sh`), each over h2c
-and, with `--tls`, over TLS with a certificate made for the run. grpc's
+and, with `--tls`, over TLS with a certificate made for the run. Over HTTP/3,
+grpc-dotnet v2.84.0's interop client passes 18 cases against Anole's server
+and against the C ABI's, and Anole's client passes 11 against grpc-dotnet's
+Kestrel server (`tests/grpc/h3/run.sh`, in Docker with libmsquic). grpc's
 HTTP/2 server checks (`tools/http2_interop`, `tests/grpc/interop/run-http2.sh`)
 pass their framing cases over h2c and TLS and the TLS profile, except five
 results the tool itself causes (listed with reasons in
@@ -683,7 +775,8 @@ the test service on that ABI (`tests/capi/grpc_interop.c`).
 
 ## Not there yet
 
-- gRPC over HTTP/3. Native gRPC runs over HTTP/2 only.
+- gRPC over HTTP/3 in the C ABI's client: the ABI has no outbound gRPC client
+  of any kind yet.
 - Server reflection.
 - Canceling the handler of a gRPC-Web or Connect call over HTTP/1.1 when the
   client goes away (check `call.cancelled()`).

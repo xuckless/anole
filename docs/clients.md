@@ -10,7 +10,7 @@ a thread, and all of them use the same BoringSSL as the server.
 | `anole.http.Client` | HTTP/1.1, HTTPS, optionally HTTP/2 | Ordinary REST calls: one request at a time per connection, pooled keep-alive connections, redirects, decompression. |
 | `anole.h2.ClientConnection` | HTTP/2 (TLS or h2c) | Many concurrent requests over one connection, full-duplex streaming, trailers. |
 | `anole.h3.ClientConnection` | HTTP/3 over QUIC | The same as HTTP/2, over UDP. Same API. |
-| `anole.grpc.Client(Service)` | gRPC over HTTP/2 | Calling gRPC services from generated code. |
+| `anole.grpc.Client(Service)` | gRPC over HTTP/2 or HTTP/3 | Calling gRPC services from generated code. |
 
 `examples/clients` starts a server in-process and calls it with each client:
 
@@ -508,13 +508,19 @@ suspends that request only; the executor serves others meanwhile.
 ## gRPC
 
 `anole.grpc.Client(Service)` calls a service from the code zig-protobuf
-generates, over an `anole.h2.ClientConnection`:
+generates, over an `anole.h2.ClientConnection` or an `anole.h3.ClientConnection`:
 
 ```zig
 var channel: anole.grpc.Channel = .{ .conn = conn, .authority = "localhost", .scheme = "https" };
 const health: anole.grpc.Client(anole.grpc.health.pb.Health(anole.grpc.Call, anyerror)) = .{ .channel = &channel };
 const result = try health.unary("Check", arena, .{ .service = "" }, .{ .timeout = .fromSeconds(2) });
 // result.status.code, result.message
+
+// HTTP/3: give the channel an anole.h3.ClientConnection, or let it own one.
+var h3_channel: anole.grpc.Channel = .{ .h3 = h3_conn, .authority = "localhost", .scheme = "https" };
+const auto = try anole.grpc.Channel.connect(gpa, io, .{ .host = "api.example", .port = 443, .tls = .{} }, .{ .http = .auto });
+// A Unix socket on this host: no TLS, authority "localhost".
+const ipc = try anole.grpc.Channel.connect(gpa, io, .{ .host = "unix:/run/app/worker.sock", .port = 0 }, .{});
 ```
 
 `unary` covers unary calls; `stream` covers the streaming kinds. `timeout` is

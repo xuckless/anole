@@ -14,7 +14,38 @@ breaking changes are listed anyway.
 
 ### Added
 
+- gRPC over HTTP/3, server and client (gRFC G2). Services answer native gRPC
+  on the HTTP/3 listener with no change, the C ABI's too. The client takes
+  `Channel{ .h3 = conn }`, or `Channel.connect` with `.http = .h3` (prior
+  knowledge) or `.auto` (switches on Alt-Svc, falls back to HTTP/2).
+  Interop-tested against grpc-dotnet v2.84.0 in both directions.
+- `anole.h3.RequestOptions.send_buffer`; `anole.h2.Stream.resetCode()` and
+  `anole.h3.Stream.resetCode()`; `anole.h3.parseAltSvc`; `anole.h3`
+  `ClientConnection.isOpen()`.
+- gRPC between processes on one host over a Unix domain socket: a `unix`
+  listener serves h2c with gRPC; the client and `Channel` dial `unix:/path`,
+  `unix:///path` and (Linux) `unix-abstract:name`, with no TLS. The socket
+  file is created `0660`; `Listener.unix_mode` changes it. A leftover socket
+  file is replaced.
+
 ### Changed
+
+- HTTP/3: a client's RESET_STREAM (or STOP_SENDING with an error) cancels the
+  handler's task, as on HTTP/2.
+- HTTP/3: while a request is open, QUIC PINGs keep the connection alive.
+  Long-lived responses (gRPC streams, SSE, WebSocket and WebTransport over
+  HTTP/3) no longer end at the 30 s idle timeout; idle connections still do.
+- HTTP/3: gRPC and Connect streaming responses may hold 1 MiB unacknowledged
+  per stream (was 64 KiB).
+- `anole.grpc` client: a stream reset maps to the status gRPC specifies for
+  its code (INTERNAL for most, UNAVAILABLE only for a refused stream,
+  CANCELLED, RESOURCE_EXHAUSTED, PERMISSION_DENIED); it was always
+  UNAVAILABLE. `Channel.retry` therefore no longer repeats a call the server
+  reset with INTERNAL_ERROR.
+- `Response.abort` in a gRPC handler resets the stream (the client reads
+  CANCELLED) instead of answering UNKNOWN.
+- `anole.grpc.Channel.conn` is optional (`h3` is the other connection); code
+  that only sets it is unchanged, code that reads `channel.conn` unwraps it.
 
 - `anole.db.System` has `s3` and `smtp`, and `anole.resilience.Kind` too.
 - C ABI: a handle's kind takes five bits (28-32), so Kafka groups and
