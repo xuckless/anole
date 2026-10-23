@@ -155,11 +155,12 @@ pub fn hasFormat(comptime T: type) bool {
     return true;
 }
 
-/// Whether `T` is written as a string: a slice or array of bytes, or a
-/// pointer to one.
+/// Whether `T` is written as a string: a slice of bytes, a pointer to an
+/// array of bytes (a string literal), or a sentinel-terminated byte array.
+/// A plain `[N]u8` is a list of numbers, as in the validator.
 pub fn isString(comptime T: type) bool {
     return switch (@typeInfo(T)) {
-        .array => |a| a.child == u8,
+        .array => |a| a.child == u8 and a.sentinel() != null,
         .pointer => |p| switch (p.size) {
             .slice => p.child == u8,
             .one => switch (@typeInfo(p.child)) {
