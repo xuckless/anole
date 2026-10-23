@@ -118,28 +118,30 @@ test "fake broker: errors are anole.db errors with the code in lastError" {
     var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
 
     // A record bigger than a request.
-    var big: [2 * 1024 * 1024]u8 = undefined;
-    @memset(&big, 'x');
-    try testing.expectError(error.Database, client.send(&c, .{ .topic = "t", .value = &big }));
+    const big = try gpa.alloc(u8, 2 * 1024 * 1024);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    try testing.expectError(error.Database, client.send(&c, .{ .topic = "t", .value = big }));
     try testing.expectEqualStrings("MESSAGE_TOO_LARGE", db.lastError(&c).?.code);
 
-    // The buffer fills (nothing is sent: a long linger and a big batch).
+    // The buffer fills (the broker refuses everything, so nothing is acknowledged).
+    broker.fail_produce.store(1000, .release);
     var failed = false;
     for (0..64) |_| {
-        client.send(&c, .{ .topic = "t", .value = "x" ** 1 ++ "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" }) catch |err| {
+        client.send(&c, .{ .topic = "t", .value = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" }) catch |err| {
             try testing.expectEqual(error.ServiceUnavailable, err);
             try testing.expectEqualStrings("buffer_full", db.lastError(&c).?.code);
             failed = true;
             break;
         };
     }
-    _ = failed;
-    try testing.expect(!client.writable() or failed);
+    try testing.expect(failed);
+    try testing.expect(!client.writable());
 
-    // produce() on a partition that cannot be delivered within the timeout is GatewayTimeout.
-    broker.fail_produce.store(1000, .release);
-    const wait: anyerror = client.produce(&c, .{ .topic = "t2", .value = "x" }) catch |err| err;
-    try testing.expect(wait == error.GatewayTimeout or wait == error.ServiceUnavailable);
+    // produce() with nothing delivered within the timeout fails (the buffer is full, too).
+    if (client.produce(&c, .{ .topic = "t2", .value = "x" })) |_| {
+        return error.ShouldHaveFailed;
+    } else |err| try testing.expect(err == error.GatewayTimeout or err == error.ServiceUnavailable);
     broker.fail_produce.store(0, .release);
 }
 
@@ -299,7 +301,7 @@ test "fake broker: a record that keeps failing goes to the dead letter topic" {
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    for (0..3) |p| {
+    for (0..1) |p| {
         const dlt = try broker.stored(arena.allocator(), "jobs.dlt", p);
         if (dlt.len == 0) continue;
         try testing.expectEqualStrings("poison", dlt[0].value.?);

@@ -152,7 +152,7 @@ pub const FakeBroker = struct {
         defer b.gpa.free(bytes);
         b.mutex.lockUncancelable(b.io);
         defer b.mutex.unlock(b.io);
-        const t = try b.topic(topic);
+        const t = try b.topicOf(topic);
         try b.store(&t.parts[partition], bytes);
     }
 
@@ -193,7 +193,7 @@ pub const FakeBroker = struct {
     }
 
     // Under `mutex`.
-    fn topic(b: *FakeBroker, name: []const u8) !*Topic {
+    fn topicOf(b: *FakeBroker, name: []const u8) !*Topic {
         if (b.topics.get(name)) |t| return t;
         const t = try b.gpa.create(Topic);
         errdefer b.gpa.destroy(t);
@@ -372,7 +372,7 @@ pub const FakeBroker = struct {
         try out.arrayLen(names.items.len);
         for (names.items) |name| {
             const hidden = b.hide_topics.load(.acquire);
-            const t: ?*Topic = if (hidden) null else if (b.topics.get(name)) |t| t else if (auto_create) try b.topic(name) else null;
+            const t: ?*Topic = if (hidden) null else if (b.topics.get(name)) |t| t else if (auto_create) try b.topicOf(name) else null;
             if (t) |tp| {
                 try out.i16_(0);
                 try out.string(name);
@@ -428,7 +428,7 @@ pub const FakeBroker = struct {
                 } else {
                     b.mutex.lockUncancelable(b.io);
                     defer b.mutex.unlock(b.io);
-                    const t = try b.topic(name);
+                    const t = try b.topicOf(name);
                     if (index < 0 or @as(usize, @intCast(index)) >= t.parts.len) {
                         code = protocol.unknown_topic_or_partition;
                     } else {
@@ -742,6 +742,7 @@ pub const FakeBroker = struct {
         };
         if (me == null) return reply.write(out, protocol.unknown_member_id, "");
         if (generation != g.generation) return reply.write(out, protocol.illegal_generation, "");
+        if (g.state == .joining) return reply.write(out, protocol.rebalance_in_progress, "");
         for (0..na) |_| {
             const mid = try d.string();
             const bytes = try d.bytes();
@@ -948,15 +949,15 @@ pub const FakeBroker = struct {
                 std.base64.standard.Decoder.decode(proof[0..n], proof_b64) catch return fail.write(out, "bad proof");
                 const keys = scram.deriveKeys(m, cfg.password, salt, 4096);
                 const auth_message = try std.fmt.allocPrint(arena, "{s},{s},{s}", .{ st.first_bare, st.server_first, without_proof });
-                var stored: [scram.max_digest]u8 = undefined;
-                scram.hash(m, keys.client[0..n], stored[0..n]);
+                var stored_key: [scram.max_digest]u8 = undefined;
+                scram.hash(m, keys.client[0..n], stored_key[0..n]);
                 var sig: [scram.max_digest]u8 = undefined;
-                scram.hmac(m, sig[0..n], auth_message, stored[0..n]);
+                scram.hmac(m, sig[0..n], auth_message, stored_key[0..n]);
                 var client_key: [scram.max_digest]u8 = undefined;
                 for (client_key[0..n], proof[0..n], sig[0..n]) |*o, p, s| o.* = p ^ s;
                 var check: [scram.max_digest]u8 = undefined;
                 scram.hash(m, client_key[0..n], check[0..n]);
-                if (!std.mem.eql(u8, check[0..n], stored[0..n])) return fail.write(out, "Authentication failed: Invalid username or password");
+                if (!std.mem.eql(u8, check[0..n], stored_key[0..n])) return fail.write(out, "Authentication failed: Invalid username or password");
                 var server_sig: [scram.max_digest]u8 = undefined;
                 scram.hmac(m, server_sig[0..n], auth_message, keys.server[0..n]);
                 var sig_b64: [88]u8 = undefined;

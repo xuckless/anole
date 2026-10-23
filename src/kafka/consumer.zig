@@ -339,6 +339,11 @@ fn memberMain(m: *Member) std.Io.Cancelable!void {
     while (!c.stopping.load(.acquire)) {
         runSession(m) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
+            error.Rebalance => {
+                // Another member joined: join again at once.
+                failures = 0;
+                continue;
+            },
             error.Fenced => {
                 log.err("kafka group {s}: this member's instance id is in use by another member (FENCED_INSTANCE_ID); stopping it", .{c.opts.group});
                 return;
@@ -902,7 +907,7 @@ fn fetchLoopInner(sess: *Session, g: *LeaderGroup) !void {
         try protocol.encodeFetch(&e, max_wait_ms, 1, @intCast(total), want.items);
         const resp = try RespArena.create(gpa);
         defer resp.release();
-        const timeout: Duration = .fromMilliseconds(max_wait_ms + @divTrunc(c.host.cluster.settings.request_timeout.nanoseconds, std.time.ns_per_ms));
+        const timeout: Duration = .fromMilliseconds(@as(i64, max_wait_ms) + @as(i64, msOf(c.host.cluster.settings.request_timeout)));
         const body = try g.conn.call(resp.arena.allocator(), .fetch, e.bytesWritten(), timeout);
         const fr = protocol.decodeFetch(resp.arena.allocator(), body) catch return error.ProtocolError;
         if (fr.error_code != 0) return error.GroupError;

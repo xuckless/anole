@@ -278,7 +278,7 @@ pub const Client = struct {
     /// Drains (a consumer's records in flight finish, offsets are committed,
     /// the producer flushes; at most 10 s) and frees everything.
     pub fn deinit(self: *Client) void {
-        self.drain(.now(self.io, .awake).addDuration(.{ .raw = .fromSeconds(10), .clock = .awake }));
+        self.drain(std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = .fromSeconds(10), .clock = .awake }));
         for (self.consumers.items) |c| c.destroy();
         self.consumers.deinit(self.gpa);
         self.producer.deinit();
@@ -507,12 +507,12 @@ pub const Client = struct {
     /// and then dead-lettered or skipped (`ConsumeOptions.retry`,
     /// `dead_letter`); offsets are committed once handled.
     pub fn consume(self: *Client, server: anytype, opts: ConsumeOptions, comptime handler: anytype) !void {
-        const params = @typeInfo(@TypeOf(handler)).@"fn".params;
+        const params = @typeInfo(@TypeOf(handler)).@"fn".param_types;
         if (params.len < 1 or params.len > 2) @compileError("a Kafka handler is fn (*Msg) !void or fn (*App, *Msg) !void");
         const Thunk = struct {
             fn call(context: ?*anyopaque, msg: *Msg) anyerror!void {
                 if (comptime params.len == 1) return handler(msg);
-                const App = @typeInfo(params[0].type.?).pointer.child;
+                const App = @typeInfo(params[0].?).pointer.child;
                 const app: *App = @ptrCast(@alignCast(context.?));
                 return handler(app, msg);
             }
@@ -545,6 +545,36 @@ test {
     _ = testing;
     _ = @import("fake_test.zig");
     _ = @import("live_test.zig");
+}
+
+test "kafka: every call compiles for a Ctx and for a Msg" {
+    const Probe = struct {
+        fn run(k: *Client, c: *db.Ctx, m: *Msg) !void {
+            _ = try k.produce(c, .{ .topic = "t", .value = null });
+            try k.send(c, .{ .topic = "t", .value = "v" });
+            try k.waitWritable(c, null);
+            try k.flush(c);
+            _ = try k.with(.{ .timeout = .fromSeconds(1) }).produce(c, .{ .topic = "t", .value = null });
+            try k.with(.{}).flush(c);
+            try k.with(.{}).send(c, .{ .topic = "t", .value = null });
+            _ = try k.produce(m, .{ .topic = "t", .value = m.value });
+            try k.send(m, .{ .topic = "t", .value = m.value });
+            _ = m.header("traceparent");
+            _ = try m.json(struct { id: u32 });
+            _ = k.writable();
+            k.drain(std.Io.Clock.Timestamp.now(c.io, .awake));
+        }
+        fn app(_: *u32, _: *Msg) !void {}
+        fn plain(_: *Msg) !void {}
+        const Fake = struct { ctx: *u32 };
+        const Wrapper = struct { server: *Fake };
+        fn consume(k: *Client, server: *Wrapper) !void {
+            try k.consume(server, .{ .group = "g", .topics = &.{"t"} }, app);
+            try k.consume(server, .{ .group = "g", .topics = &.{"t"} }, plain);
+        }
+    };
+    _ = &Probe.run;
+    _ = &Probe.consume;
 }
 
 test "parseBrokers: plain lists, Heroku's URL form, and the TLS schemes" {

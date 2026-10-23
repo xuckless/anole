@@ -621,7 +621,7 @@ pub const Producer = struct {
             for (work) |w| self.finish(w.accum, w.batch, .{ .ok = .{ .partition = w.accum.partition, .offset = -1, .timestamp_ms = 0 } });
             return;
         }
-        const timeout: Duration = .fromMilliseconds(@divTrunc(self.cfg.request_timeout.nanoseconds, std.time.ns_per_ms) + 5000);
+        const timeout: Duration = .fromMilliseconds(@as(i64, @intCast(@divTrunc(self.cfg.request_timeout.nanoseconds, std.time.ns_per_ms))) + 5000);
         const body = try conn.call(arena, .produce, e.bytesWritten(), timeout);
         const results = protocol.decodeProduce(arena, body) catch return error.ProtocolError;
         for (work) |w| {
