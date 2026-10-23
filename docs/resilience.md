@@ -54,7 +54,7 @@ holds every request for `acquire_timeout` or `connect_timeout` before its
 ## What counts as a failure
 
 A breaker protects against a down or drowning target, not against bad
-requests or our own pool size.
+requests or the client's own pool size.
 
 - **Failures**: connect refused or reset, TLS and DNS errors, attempt
   timeouts, HTTP 408, 500, 502, 503 and 504, gRPC `UNAVAILABLE`, and a

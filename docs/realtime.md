@@ -92,8 +92,10 @@ indicator) out of the buffers.
   of a JSON payload) and for MongoDB `{db}`, `{collection}`, `{key}`.
   `"room:{data.room}"` sends each change to its own browsers. An event a
   template cannot be filled for is skipped and counted.
-- A gap reaches an SSE target as the `gap` event, a WebSocket target as its
-  `gap_message`, a handler as an event with `op = .gap` (`gaps = true`).
+- A gap reaches an SSE target as the `gap` event, a WebSocket target whose
+  room has no placeholders as its `gap_message` (a templated room such as
+  `"room:{data.room}"` gets nothing), a handler as an event with
+  `op = .gap` (`gaps = true`).
 - `w.handle(app, .{}, handler)` runs a handler for each event
   (`fn (*watch.Event) !void`, or with the server's state first). Concurrency 1
   runs them in order; more spreads them over the executors. A handler on a
@@ -112,8 +114,9 @@ indicator) out of the buffers.
   stream follows a collection that is dropped and made again.
   `Collection.watch`, `Database.watch` and `Client.watch` give the stream
   itself, with automatic resume.
-- Each instance runs its own watches and serves its own subscribers; topics
-  across instances come with anole-lb.
+- Each instance runs its own watches and serves its own subscribers. Topics
+  shared across instances are not built yet; they are planned together with
+  anole-lb.
 
 Metrics: `anole_sse_*` (subscribers, topics, replay bytes, events, closed by
 reason, resumes) and `anole_watch_*{watch}`.
