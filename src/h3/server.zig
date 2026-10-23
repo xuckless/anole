@@ -3186,7 +3186,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (conn.hq) return conn.hqRecv(flags, stream_id, bytes);
             const rv = bridge.recvStreamData(conn.side(), flags, stream_id, offset, bytes);
             // A bidirectional stream WebTransport took is no request.
-            if (conn.wt) |w| if (w.owns(stream_id)) if (conn.streams.fetchSwapRemove(stream_id)) |e| e.value.free();
+            if (conn.wt) |w| if (w.owns(stream_id)) if (conn.streams.fetchSwapRemove(stream_id)) |e| {
+                e.value.free();
+                gauges.add(conn.ep.io, .h3_streams, -1);
+            };
             return rv;
         }
 
