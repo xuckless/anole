@@ -915,4 +915,5 @@ test {
     _ = nkeys;
     _ = auth;
     _ = jetstream;
+    _ = @import("live_test.zig");
 }
