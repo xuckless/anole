@@ -1,0 +1,24 @@
+== a-r1: 15 samples, 200 trade and 2000 feed sockets per sample
+  trade_srv_rq  mean          0 B  p50        0  p99         0  max         0  non-zero   0.0%
+  trade_srv_sq  mean          0 B  p50        0  p99         0  max         0  non-zero   0.0%
+  trade_cli_rq  mean          0 B  p50        0  p99         0  max         0  non-zero   0.0%
+  feed_srv_sq   mean          0 B  p50        0  p99         0  max        72  non-zero   0.2%
+  feed_cli_rq   mean          0 B  p50        0  p99         0  max        71  non-zero   0.1%
+== a-r2: 15 samples, 200 trade and 2000 feed sockets per sample
+  trade_srv_rq  mean          0 B  p50        0  p99         0  max         0  non-zero   0.0%
+  trade_srv_sq  mean          0 B  p50        0  p99         0  max         0  non-zero   0.0%
+  trade_cli_rq  mean          0 B  p50        0  p99         0  max        81  non-zero   0.0%
+  feed_srv_sq   mean          0 B  p50        0  p99         0  max        72  non-zero   0.3%
+  feed_cli_rq   mean          0 B  p50        0  p99         0  max        71  non-zero   0.1%
+== b-r1: 15 samples, 200 trade and 2000 feed sockets per sample
+  trade_srv_rq  mean          0 B  p50        0  p99         0  max         0  non-zero   0.0%
+  trade_srv_sq  mean          5 B  p50        0  p99        82  max        82  non-zero   6.7%
+  trade_cli_rq  mean          5 B  p50        0  p99        82  max        82  non-zero   6.5%
+  feed_srv_sq   mean     119391 B  p50   125136  p99    257786  max    285173  non-zero  93.9%
+  feed_cli_rq   mean      93695 B  p50    93590  p99    216331  max    303319  non-zero 100.0%
+== b-r2: 15 samples, 200 trade and 2000 feed sockets per sample
+  trade_srv_rq  mean          0 B  p50        0  p99         0  max         0  non-zero   0.0%
+  trade_srv_sq  mean         16 B  p50        0  p99        82  max        82  non-zero  19.7%
+  trade_cli_rq  mean         15 B  p50        0  p99        82  max        82  non-zero  18.6%
+  feed_srv_sq   mean      52024 B  p50      711  p99    234375  max    266540  non-zero  71.8%
+  feed_cli_rq   mean      79740 B  p50    77157  p99    240056  max    314535  non-zero 100.0%

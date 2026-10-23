@@ -1,0 +1,267 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 15K of event 'cpu_core/cycles/P'
+# Event count (approx.): 24963284842
+#
+# Overhead  Symbol                                                       
+# ........  .............................................................
+#
+    10.92%  [.] websocket.root.Rooms.sendQueued
+            |          
+             --10.86%--websocket.root.Rooms.sendQueued
+                       group.Group.spawnInto__func_795.Wrapper.start
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     8.27%  [k] nft_do_chain
+            |          
+             --8.12%--nft_do_chain
+                       |          
+                        --6.21%--nft_do_chain_inet
+                                  nf_hook_slow
+                                  |          
+                                   --5.40%--ip_rcv
+                                             __netif_receive_skb_one_core
+                                             process_backlog
+                                             __napi_poll
+                                             net_rx_action
+                                             handle_softirqs
+                                             |          
+                                              --5.32%--do_softirq.part.0
+                                                        __local_bh_enable_ip
+                                                        __dev_queue_xmit
+                                                        ip_finish_output2
+                                                        ip_output
+                                                        __ip_queue_xmit
+                                                        __tcp_transmit_skb
+                                                        tcp_write_xmit
+                                                        __tcp_push_pending_frames
+                                                        tcp_sendmsg_locked
+                                                        tcp_sendmsg
+                                                        __sys_sendto
+                                                        __x64_sys_sendto
+                                                        do_syscall_64
+                                                        entry_SYSCALL_64_after_hwframe
+                                                        os.net.send
+                                                        ev.backends.linux.epoll.checkCompletion
+                                                        ev.sockreg.submitIo__func_1293
+                                                        common.waitForIo
+                                                        io.netWriteOpImpl
+                                                        io.operateInner
+                                                        io.operateImpl
+                                                        Io.net.Stream.Writer.drain
+                                                        |          
+                                                         --5.28%--Io.Writer.defaultFlush
+                                                                   websocket.root.Rooms.sendQueued
+                                                                   group.Group.spawnInto__func_795.Wrapper.start
+                                                                   task.AnyTask.startFn
+                                                                   coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                                                   0
+
+     4.94%  [.] runtime.Executor.switchOut
+            |          
+             --4.92%--runtime.Executor.switchOut
+                       |          
+                        --4.47%--task.AnyTask.yield__func_1467
+                                  common.Waiter.wait__func_830
+                                  common.waitForIo
+                                  |          
+                                   --4.45%--io.netWriteOpImpl
+                                             io.operateInner
+                                             io.operateImpl
+                                             Io.net.Stream.Writer.drain
+                                             |          
+                                              --4.43%--Io.Writer.defaultFlush
+                                                        websocket.root.Rooms.sendQueued
+                                                        group.Group.spawnInto__func_795.Wrapper.start
+                                                        task.AnyTask.startFn
+                                                        coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                                        0
+
+     3.36%  [k] tcp_sendmsg_locked
+            |          
+             --3.24%--tcp_sendmsg_locked
+                       tcp_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       os.net.send
+                       ev.backends.linux.epoll.checkCompletion
+                       ev.sockreg.submitIo__func_1293
+                       common.waitForIo
+                       io.netWriteOpImpl
+                       io.operateInner
+                       io.operateImpl
+                       Io.net.Stream.Writer.drain
+                       |          
+                        --3.23%--Io.Writer.defaultFlush
+                                  websocket.root.Rooms.sendQueued
+                                  group.Group.spawnInto__func_795.Wrapper.start
+                                  task.AnyTask.startFn
+                                  coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                  0
+
+     2.89%  [k] sock_has_perm
+            |          
+             --2.88%--sock_has_perm
+                       selinux_socket_sendmsg
+                       security_socket_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       os.net.send
+                       ev.backends.linux.epoll.checkCompletion
+                       ev.sockreg.submitIo__func_1293
+                       common.waitForIo
+                       io.netWriteOpImpl
+                       io.operateInner
+                       io.operateImpl
+                       Io.net.Stream.Writer.drain
+                       |          
+                        --2.87%--Io.Writer.defaultFlush
+                                  websocket.root.Rooms.sendQueued
+                                  group.Group.spawnInto__func_795.Wrapper.start
+                                  task.AnyTask.startFn
+                                  coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                  0
+
+     2.62%  [k] __nf_conntrack_find_get
+            |          
+             --2.60%--__nf_conntrack_find_get
+                       resolve_normal_ct
+                       nf_conntrack_in
+                       nf_hook_slow
+                       __ip_local_out
+                       ip_local_out
+                       __ip_queue_xmit
+                       __tcp_transmit_skb
+                       |          
+                        --2.20%--tcp_write_xmit
+                                  __tcp_push_pending_frames
+                                  |          
+                                   --2.19%--tcp_sendmsg_locked
+                                             tcp_sendmsg
+                                             __sys_sendto
+                                             __x64_sys_sendto
+                                             do_syscall_64
+                                             entry_SYSCALL_64_after_hwframe
+                                             os.net.send
+                                             ev.backends.linux.epoll.checkCompletion
+                                             ev.sockreg.submitIo__func_1293
+                                             common.waitForIo
+                                             io.netWriteOpImpl
+                                             io.operateInner
+                                             io.operateImpl
+                                             Io.net.Stream.Writer.drain
+                                             |          
+                                              --2.14%--Io.Writer.defaultFlush
+                                                        websocket.root.Rooms.sendQueued
+                                                        group.Group.spawnInto__func_795.Wrapper.start
+                                                        task.AnyTask.startFn
+                                                        coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                                        0
+
+     2.20%  [k] __inet_lookup_established
+            |          
+             --2.19%--__inet_lookup_established
+                       __inet_lookup_skb
+                       tcp_v4_rcv
+                       ip_protocol_deliver_rcu
+                       ip_local_deliver_finish
+                       __netif_receive_skb_one_core
+                       process_backlog
+                       __napi_poll
+                       net_rx_action
+                       handle_softirqs
+                       |          
+                        --2.16%--do_softirq.part.0
+                                  __local_bh_enable_ip
+                                  __dev_queue_xmit
+                                  ip_finish_output2
+                                  ip_output
+                                  __ip_queue_xmit
+                                  __tcp_transmit_skb
+                                  tcp_write_xmit
+                                  __tcp_push_pending_frames
+                                  tcp_sendmsg_locked
+                                  tcp_sendmsg
+                                  __sys_sendto
+                                  __x64_sys_sendto
+                                  do_syscall_64
+                                  entry_SYSCALL_64_after_hwframe
+                                  os.net.send
+                                  ev.backends.linux.epoll.checkCompletion
+                                  ev.sockreg.submitIo__func_1293
+                                  common.waitForIo
+                                  io.netWriteOpImpl
+                                  io.operateInner
+                                  io.operateImpl
+                                  Io.net.Stream.Writer.drain
+                                  |          
+                                   --2.15%--Io.Writer.defaultFlush
+                                             websocket.root.Rooms.sendQueued
+                                             group.Group.spawnInto__func_795.Wrapper.start
+                                             task.AnyTask.startFn
+                                             coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                             0
+
+     2.17%  [k] tcp_skb_can_collapse
+            |
+            ---tcp_write_xmit
+               __tcp_push_pending_frames
+               |          
+                --2.16%--tcp_sendmsg_locked
+                          tcp_sendmsg
+                          __sys_sendto
+                          __x64_sys_sendto
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          os.net.send
+                          ev.backends.linux.epoll.checkCompletion
+                          ev.sockreg.submitIo__func_1293
+                          common.waitForIo
+                          io.netWriteOpImpl
+                          io.operateInner
+                          io.operateImpl
+                          Io.net.Stream.Writer.drain
+                          Io.Writer.defaultFlush
+                          websocket.root.Rooms.sendQueued
+                          group.Group.spawnInto__func_795.Wrapper.start
+                          task.AnyTask.startFn
+                          coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                          0
+
+     2.09%  [k] __sys_sendto
+            |          
+             --2.06%--__sys_sendto
+                       __x64_sys_sendto
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       os.net.send
+                       ev.backends.linux.epoll.checkCompletion
+                       ev.sockreg.submitIo__func_1293
+                       common.waitForIo
+                       io.netWriteOpImpl
+                       io.operateInner
+                       io.operateImpl
+                       Io.net.Stream.Writer.drain
+                       |          
+                        --2.04%--Io.Writer.defaultFlush
+                                  websocket.root.Rooms.sendQueued
+                                  group.Group.spawnInto__func_795.Wrapper.start
+                                  task.AnyTask.startFn
+                                  coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                  0
+
+     2.03%  [.] Io.net.Stream.Writer.drain
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

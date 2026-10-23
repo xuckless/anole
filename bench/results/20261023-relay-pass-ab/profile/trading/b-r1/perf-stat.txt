@@ -1,0 +1,25 @@
+# started on Fri Oct 23 10:22:25 2026
+
+
+ Performance counter stats for process id '954308':
+
+           4695.50 msec task-clock                                                            
+     <not counted>      cpu_atom/cycles/                                                        (0.00%)
+       23385527959      cpu_core/cycles/                                                      
+     <not counted>      cpu_atom/instructions/                                                  (0.00%)
+       24546828480      cpu_core/instructions/                                                
+               339      context-switches                                                      
+                 2      page-faults                                                           
+           1787738      raw_syscalls:sys_enter                                                
+           1720610      syscalls:sys_enter_sendto                                             
+                 0      syscalls:sys_enter_sendmsg                                            
+                 0      syscalls:sys_enter_writev                                             
+                 0      syscalls:sys_enter_write                                              
+                 0      syscalls:sys_enter_recvfrom                                           
+                 0      syscalls:sys_enter_read                                               
+                 0      syscalls:sys_enter_epoll_wait                                         
+                 0      syscalls:sys_enter_epoll_pwait                                        
+                 0      syscalls:sys_enter_futex                                              
+
+       5.001165317 seconds time elapsed
+

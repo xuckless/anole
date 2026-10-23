@@ -1,0 +1,145 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 15K of event 'cpu_core/cycles/P'
+# Event count (approx.): 25929780238
+#
+# Children      Self  Symbol                                                        
+# ........  ........  ..............................................................
+#
+    98.58%     0.00%  [k] 0000000000000000
+    98.36%     0.00%  [.] coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+    98.36%     0.00%  [.] task.AnyTask.startFn
+    95.99%     3.22%  [.] websocket.root.Rooms.sendQueued
+    95.99%     0.00%  [.] group.Group.spawnInto__func_794.Wrapper.start
+    93.39%     3.97%  [.] websocket.root.Socket.send
+    89.41%     2.74%  [.] websocket.WebSocket.writeFrame
+    86.65%     0.94%  [.] websocket.WebSocket.writeFrameRsv
+    85.70%     0.42%  [.] websocket.WebSocket.writeUnbuffered
+    85.22%     2.02%  [.] Io.net.Stream.Writer.drain
+    83.37%     0.55%  [.] io.operateImpl
+    82.83%     0.86%  [.] io.operateInner
+    81.80%     1.96%  [.] io.netWriteOpImpl
+    79.91%     0.26%  [.] common.waitForIo
+    74.78%     0.21%  [.] ev.backends.linux.epoll.checkCompletion
+    74.75%     0.55%  [.] ev.sockreg.submitIo__func_1295
+    74.44%     0.67%  [.] os.net.send
+    73.27%     0.15%  [.] entry_SYSCALL_64_after_hwframe
+    73.13%     0.29%  [.] do_syscall_64
+    72.10%     0.22%  [.] __x64_sys_sendto
+    71.88%     1.48%  [.] __sys_sendto
+    66.86%     0.10%  [.] tcp_sendmsg
+    66.31%     1.22%  [.] tcp_sendmsg_locked
+    60.99%     0.10%  [.] __tcp_push_pending_frames
+    60.90%     0.37%  [.] tcp_write_xmit
+    58.23%     0.71%  [.] __tcp_transmit_skb
+    56.71%     0.44%  [.] __ip_queue_xmit
+    46.14%     0.21%  [.] ip_output
+    44.59%     0.59%  [.] ip_finish_output2
+    43.95%     0.43%  [.] __dev_queue_xmit
+    42.42%     0.55%  [.] __local_bh_enable_ip
+    41.97%     0.15%  [.] do_softirq.part.0
+    41.85%     0.16%  [.] handle_softirqs
+    41.24%     0.29%  [.] net_rx_action
+    37.51%     0.13%  [.] __napi_poll
+    37.37%     0.15%  [.] process_backlog
+    36.94%     0.07%  [.] __netif_receive_skb_one_core
+    31.58%     0.69%  [.] nf_hook_slow
+    22.63%    10.60%  [.] nft_do_chain
+    17.91%     0.57%  [.] nft_do_chain_inet
+    17.18%     0.07%  [.] ip_rcv
+    15.24%     0.15%  [.] ip_local_deliver_finish
+    14.78%     0.08%  [.] ip_protocol_deliver_rcu
+    14.63%     1.11%  [.] tcp_v4_rcv
+     9.97%     0.03%  [.] ip_local_out
+     9.94%     0.09%  [.] __ip_local_out
+     9.79%     0.05%  [.] tcp_v4_do_rcv
+     9.19%     0.94%  [.] tcp_rcv_established
+     7.27%     0.30%  [.] tcp_data_queue
+     6.36%     0.89%  [.] sock_def_readable
+     5.94%     0.28%  [.] common.Waiter.wait__func_832
+     5.64%     0.09%  [.] task.AnyTask.yield__func_1469
+     5.42%     0.03%  [.] __wake_up_sync_key
+     5.25%     1.38%  [.] __wake_up_common
+     5.05%     0.40%  [.] nf_conntrack_in
+     4.70%     1.73%  [.] nft_meta_store_ifname
+     4.30%     0.06%  [.] ip_local_deliver
+     4.11%     1.03%  [.] ep_poll_callback
+     3.84%     0.09%  [.] resolve_normal_ct
+     3.81%     0.36%  [.] nft_do_chain_ipv4
+     3.73%     3.71%  [.] runtime.Executor.switchOut
+     3.42%     1.41%  [.] skb_defer_free_flush
+     3.18%     3.13%  [k] __nf_conntrack_find_get
+     2.53%     0.07%  [.] __inet_lookup_skb
+     2.46%     2.45%  [k] __inet_lookup_established
+     2.08%     1.95%  [k] nft_meta_get_eval
+     2.04%     0.00%  [.] __wake_up_sync
+     1.98%     0.13%  [.] nf_route_table_hook4
+     1.97%     1.82%  [k] sized_strscpy
+     1.89%     0.09%  [.] security_socket_sendmsg
+     1.84%     0.05%  [.] tcp_stream_alloc_skb
+     1.74%     0.03%  [.] ep_autoremove_wake_function
+     1.72%     1.67%  [.] __raw_spin_lock_irqsave
+     1.70%     0.13%  [.] try_to_wake_up
+     1.63%     1.63%  [k] fdget
+     1.61%     0.04%  [.] selinux_socket_sendmsg
+     1.57%     1.23%  [k] sock_has_perm
+     1.37%     0.03%  [.] websocket.root.route.S.serve
+     1.37%     0.00%  [.] group.Group.spawnInto__func_1739.Wrapper.start
+     1.37%     0.00%  [.] middleware.Chain(main.App).call
+     1.37%     0.00%  [.] middleware.Chain(main.App).run
+     1.37%     0.00%  [.] server.Server(main.App).handleConnectionWrapper
+     1.37%     0.00%  [.] server.Server(main.App).handleRequests
+     1.34%     0.33%  [.] nft_lookup_eval
+     1.28%     0.59%  [k] tcp_event_new_data_sent
+     1.18%     0.41%  [.] runtime.Executor.run
+     1.18%     0.00%  [.] Io.Condition.waitTimeout
+     1.18%     0.00%  [.] Io.TypeErasedQueue.getLocked
+     1.18%     0.00%  [.] io.futexWaitImpl
+     1.18%     0.00%  [.] main
+     1.18%     0.00%  [.] main.main
+     1.18%     0.00%  [.] server.ServerOf(main.App,false).runInner
+     1.18%     0.00%  [.] sync.Futex.wait
+     1.18%     0.00%  [.] sync.Futex.waitTimeoutClock
+     1.18%     0.00%  [.] 0x00007f91ec2a0ca8
+     1.17%     0.97%  [k] strnlen
+     1.17%     0.63%  [.] nft_match_eval
+     1.13%     0.09%  [.] nf_route_table_inet
+     1.13%     0.03%  [.] sk_reset_timer
+     1.09%     0.03%  [.] mem_cgroup_sk_charge
+     1.08%     0.09%  [.] napi_consume_skb
+     1.08%     0.31%  [.] __mod_timer
+     1.00%     0.71%  [.] Io.concurrent__func_144.TypeErased.start
+     0.99%     0.04%  [.] dev_hard_start_xmit
+     0.99%     0.22%  [.] nft_set_do_lookup
+     0.99%     0.92%  [k] skb_release_data
+     0.97%     0.32%  [.] _raw_spin_lock
+     0.97%     0.92%  [k] __pi_memcpy
+     0.95%     0.07%  [.] xmit_one.constprop.0
+     0.90%     0.03%  [.] sk_forced_mem_schedule
+     0.89%     0.13%  [.] __alloc_skb
+     0.87%     0.27%  [.] loopback_xmit
+     0.87%     0.05%  [.] skb_do_copy_data_nocache
+     0.77%     0.53%  [k] expr_call_ops_eval
+     0.77%     0.46%  [k] nft_rhash_lookup
+     0.76%     0.35%  [k] nf_conntrack_tcp_packet
+     0.75%     0.75%  [k] ktime_get
+     0.75%     0.32%  [.] kmem_cache_alloc_node_noprof
+     0.74%     0.49%  [.] __rcu_read_unlock
+     0.72%     0.61%  [k] tcp_ack
+     0.71%     0.03%  [.] ___task_rq_lock
+     0.69%     0.00%  [.] raw_spin_rq_lock_nested
+     0.67%     0.67%  [k] native_queued_spin_lock_slowpath
+     0.67%     0.25%  [.] sk_filter_trim_cap
+     0.63%     0.56%  [k] nft_immediate_eval
+     0.61%     0.03%  [.] sk_page_frag_refill
+     0.60%     0.49%  [k] skb_page_frag_refill
+     0.58%     0.52%  [k] try_charge_memcg
+     0.51%     0.51%  [k] kfree_skbmem
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

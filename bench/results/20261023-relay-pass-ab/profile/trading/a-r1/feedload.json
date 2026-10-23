@@ -1,0 +1,1 @@
+{"subscribers":2000,"connected":2000,"tick_hz":500,"expected_per_s":1000000,"delivered_per_s":213311.93593362038,"gaps":0,"lag":{"n":799368,"p50_ms":13471.301,"p99_ms":25030.141,"p999_ms":25246.312,"max_ms":25266.848},"orders":60000,"orders_per_s":1999.9968990714744,"order_rtt":{"n":60000,"p50_ms":10.177,"p99_ms":12.879,"p999_ms":14.526,"max_ms":17.48}}

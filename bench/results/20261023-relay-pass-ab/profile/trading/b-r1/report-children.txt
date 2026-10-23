@@ -1,0 +1,131 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 11K of event 'cpu_core/cycles/P'
+# Event count (approx.): 18278923169
+#
+# Children      Self  Symbol                                                        
+# ........  ........  ..............................................................
+#
+    94.58%     0.00%  [.] 0000000000000000
+    94.57%     0.07%  [.] coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+    94.05%     0.04%  [.] task.AnyTask.startFn
+    85.11%     0.04%  [.] group.Group.spawnInto__func_795.Wrapper.start
+    84.96%    14.59%  [.] websocket.root.Rooms.sendQueued
+    66.12%     0.46%  [.] Io.net.Stream.Writer.drain
+    65.82%     0.50%  [.] io.operateImpl
+    65.31%     1.10%  [.] io.operateInner
+    65.08%     0.19%  [.] Io.Writer.defaultFlush
+    63.81%     2.34%  [.] io.netWriteOpImpl
+    61.66%     0.34%  [.] common.waitForIo
+    53.18%     0.13%  [.] ev.backends.linux.epoll.checkCompletion
+    52.82%     1.53%  [.] os.net.send
+    52.51%     1.03%  [.] ev.sockreg.submitIo__func_1293
+    50.82%     0.23%  [.] entry_SYSCALL_64_after_hwframe
+    50.60%     0.46%  [.] do_syscall_64
+    48.95%     0.03%  [.] __x64_sys_sendto
+    48.91%     3.71%  [.] __sys_sendto
+    33.97%     0.09%  [.] tcp_sendmsg
+    32.90%     8.47%  [.] tcp_sendmsg_locked
+    19.42%     0.10%  [.] __tcp_push_pending_frames
+    19.32%     5.21%  [.] tcp_write_xmit
+    11.62%     0.36%  [.] common.Waiter.wait__func_830
+    10.91%     0.26%  [.] task.AnyTask.yield__func_1467
+     8.60%     8.58%  [k] tcp_skb_can_collapse
+     7.81%     0.12%  [.] security_socket_sendmsg
+     7.17%     0.05%  [.] selinux_socket_sendmsg
+     7.12%     6.33%  [k] sock_has_perm
+     6.08%     1.02%  [.] Io.concurrent__func_144.TypeErased.start
+     5.06%     1.95%  [.] websocket.root.Rooms.startSender
+     4.91%     1.48%  [.] websocket.WebSocket.writeFrameRsv
+     3.88%     1.69%  [.] runtime.Executor.run
+     3.88%     0.00%  [.] Io.Condition.waitTimeout
+     3.88%     0.00%  [.] Io.TypeErasedQueue.getLocked
+     3.88%     0.00%  [.] io.futexWaitImpl
+     3.88%     0.00%  [.] main
+     3.88%     0.00%  [.] main.main
+     3.88%     0.00%  [.] server.ServerOf(main.App,false).runInner
+     3.88%     0.00%  [.] sync.Futex.wait
+     3.88%     0.00%  [.] sync.Futex.waitTimeoutClock
+     3.88%     0.00%  [.] 0x00007f6c94d5eca8
+     3.81%     0.02%  [.] __tcp_transmit_skb
+     3.74%     0.01%  [.] __ip_queue_xmit
+     3.34%     3.33%  [k] fdget
+     3.29%     3.13%  [.] runtime.Executor.switchOut
+     3.10%     0.93%  [.] task.spawnTask
+     3.09%     0.00%  [.] ip_output
+     2.99%     0.12%  [.] __local_bh_enable_ip
+     2.99%     0.03%  [.] ip_finish_output2
+     2.97%     0.04%  [.] __dev_queue_xmit
+     2.90%     0.01%  [.] handle_softirqs
+     2.84%     0.02%  [.] do_softirq.part.0
+     2.81%     0.00%  [.] net_rx_action
+     2.28%     0.00%  [.] __napi_poll
+     2.28%     0.00%  [.] process_backlog
+     2.27%     0.00%  [.] __netif_receive_skb_one_core
+     1.96%     1.33%  [.] runtime.Executor.processCleanup
+     1.95%     1.91%  [.] server.Connection.lendWriteBuffer
+     1.93%     0.03%  [.] nf_hook_slow
+     1.73%     0.07%  [.] websocket.root.route.S.serve
+     1.73%     0.00%  [.] group.Group.spawnInto__func_1739.Wrapper.start
+     1.73%     0.00%  [.] middleware.Chain(main.App).call
+     1.73%     0.00%  [.] middleware.Chain(main.App).run
+     1.73%     0.00%  [.] server.Server(main.App).handleConnectionWrapper
+     1.73%     0.00%  [.] server.Server(main.App).handleRequests
+     1.58%     0.09%  [.] skb_do_copy_data_nocache
+     1.50%     0.54%  [.] runtime.Executor.drainDispatched
+     1.49%     1.48%  [.] coro.coroutines.coroEntry
+     1.46%     0.23%  [.] tcp_send_mss
+     1.33%     0.66%  [.] nft_do_chain
+     1.32%     0.15%  [.] entry_SYSCALL_64
+     1.30%     1.30%  [.] coro.stack_pool.StackPool.acquire
+     1.22%     0.00%  [.] websocket.root.Socket.send
+     1.21%     0.32%  [.] tcp_current_mss
+     1.21%     0.05%  [.] websocket.WebSocket.writeFrame
+     1.20%     1.16%  [.] runtime.Executor.scheduleTask
+     1.17%     0.00%  [.] websocket.WebSocket.writeUnbuffered
+     1.08%     0.00%  [.] ip_local_deliver_finish
+     1.04%     0.00%  [.] ip_protocol_deliver_rcu
+     1.02%     0.03%  [.] tcp_v4_rcv
+     0.99%     0.05%  [.] nft_do_chain_inet
+     0.97%     0.44%  [.] task.finishTask
+     0.97%     0.00%  [.] ip_rcv
+     0.92%     0.03%  [.] tcp_rcv_established
+     0.92%     0.00%  [.] tcp_v4_do_rcv
+     0.89%     0.87%  [.] ev.loop.Loop.addInternal
+     0.78%     0.21%  [.] __check_object_size
+     0.78%     0.15%  [.] avc_has_perm
+     0.75%     0.11%  [k] sk_page_frag_refill
+     0.75%     0.00%  [.] tcp_stream_alloc_skb
+     0.73%     0.71%  [k] _copy_from_iter
+     0.70%     0.14%  [.] skb_page_frag_refill
+     0.70%     0.69%  [k] tcp_established_options
+     0.68%     0.00%  [.] __alloc_frozen_pages_noprof
+     0.68%     0.00%  [.] __ip_local_out
+     0.68%     0.00%  [.] ip_local_out
+     0.67%     0.00%  [.] get_page_from_freelist
+     0.66%     0.06%  [.] __alloc_skb
+     0.66%     0.04%  [.] ev.backends.linux.epoll.poll
+     0.66%     0.03%  [.] ev.loop.Loop.poll
+     0.66%     0.62%  [k] skb_shift
+     0.65%     0.11%  [k] avc_has_perm_noaudit
+     0.63%     0.30%  [.] runtime.getCurrentExecutorOrNull
+     0.63%     0.60%  [.] coro.stack_pool.StackPool.release
+     0.60%     0.13%  [.] kmem_cache_alloc_node_noprof
+     0.59%     0.55%  [.] task.TaskPool.alloc
+     0.58%     0.58%  [k] clear_highpages_kasan_tagged
+     0.58%     0.00%  [.] post_alloc_hook
+     0.57%     0.55%  [k] ktime_get
+     0.55%     0.03%  [.] clock_gettime
+     0.52%     0.23%  [k] check_heap_object
+     0.52%     0.08%  [.] skb_defer_free_flush
+     0.52%     0.49%  [k] hook_socket_sendmsg
+     0.51%     0.00%  [.] alloc_pages_mpol
+     0.51%     0.00%  [.] alloc_pages_noprof
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

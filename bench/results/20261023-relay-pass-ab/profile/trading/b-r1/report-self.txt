@@ -1,0 +1,143 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 11K of event 'cpu_core/cycles/P'
+# Event count (approx.): 18278923169
+#
+# Overhead  Symbol                                                        
+# ........  ..............................................................
+#
+    14.59%  [.] websocket.root.Rooms.sendQueued
+     8.58%  [k] tcp_skb_can_collapse
+     8.47%  [k] tcp_sendmsg_locked
+     6.33%  [k] sock_has_perm
+     5.21%  [k] tcp_write_xmit
+     3.71%  [k] __sys_sendto
+     3.33%  [k] fdget
+     3.13%  [.] runtime.Executor.switchOut
+     2.34%  [.] io.netWriteOpImpl
+     1.95%  [.] websocket.root.Rooms.startSender
+     1.91%  [.] server.Connection.lendWriteBuffer
+     1.69%  [.] runtime.Executor.run
+     1.53%  [.] os.net.send
+     1.48%  [.] coro.coroutines.coroEntry
+     1.48%  [.] websocket.WebSocket.writeFrameRsv
+     1.33%  [.] runtime.Executor.processCleanup
+     1.30%  [.] coro.stack_pool.StackPool.acquire
+     1.16%  [.] runtime.Executor.scheduleTask
+     1.10%  [.] io.operateInner
+     1.03%  [.] ev.sockreg.submitIo__func_1293
+     1.02%  [.] Io.concurrent__func_144.TypeErased.start
+     0.93%  [.] task.spawnTask
+     0.87%  [.] ev.loop.Loop.addInternal
+     0.71%  [k] _copy_from_iter
+     0.69%  [k] tcp_established_options
+     0.66%  [k] nft_do_chain
+     0.62%  [k] skb_shift
+     0.60%  [.] coro.stack_pool.StackPool.release
+     0.58%  [k] clear_highpages_kasan_tagged
+     0.55%  [.] task.TaskPool.alloc
+     0.55%  [k] ktime_get
+     0.54%  [.] runtime.Executor.drainDispatched
+     0.50%  [.] io.operateImpl
+     0.49%  [k] hook_socket_sendmsg
+     0.48%  [k] entry_SYSRETQ_unsafe_stack
+     0.46%  [k] do_syscall_64
+     0.46%  [.] Io.net.Stream.Writer.drain
+     0.45%  [.] server.Connection.takeBackWriteBuffer
+     0.44%  [.] task.finishTask
+     0.44%  [k] avc_lookup
+     0.43%  [.] task.TaskPool.free
+     0.40%  [.] sync.Futex.wake
+     0.39%  [.] group.unregisterGroupTask
+     0.39%  [k] lock_sock_nested
+     0.37%  [.] server.Connection.releaseWriteBuffer
+     0.36%  [.] common.Waiter.wait__func_830
+     0.35%  [.] compiler_rt.memcpy.memcpyFast
+     0.34%  [.] common.waitForIo
+     0.32%  [k] tcp_current_mss
+     0.30%  [.] runtime.getCurrentExecutorOrNull
+     0.29%  [k] skb_release_data
+     0.27%  [.] 0x0000000000000cf7
+     0.27%  [k] tcp_rate_check_app_limited
+     0.26%  [.] task.AnyTask.yield__func_1467
+     0.23%  [k] tcp_send_mss
+     0.23%  [k] check_heap_object
+     0.23%  [k] entry_SYSCALL_64_after_hwframe
+     0.22%  [k] _raw_spin_lock_bh
+     0.21%  [k] tcp_tso_segs
+     0.21%  [k] __check_object_size
+     0.20%  [k] entry_SYSCALL_64_safe_stack
+     0.20%  [.] ev.backends.linux.Backend(.auto).submit__func_889
+     0.19%  [.] Io.Writer.defaultFlush
+     0.19%  [k] __nf_conntrack_find_get
+     0.18%  [.] io.nowImpl
+     0.16%  [k] tcp_mtu_probe
+     0.15%  [k] entry_SYSCALL_64
+     0.15%  [k] __refill_objects_node
+     0.15%  [k] avc_has_perm
+     0.14%  [k] prandom_u32_state
+     0.14%  [k] seccomp_run_filters
+     0.14%  [k] __virt_addr_valid
+     0.14%  [k] skb_page_frag_refill
+     0.14%  [k] populate_seccomp_data
+     0.13%  [k] kmem_cache_alloc_node_noprof
+     0.13%  [k] __inet_lookup_established
+     0.13%  [.] ev.backends.linux.epoll.checkCompletion
+     0.13%  [k] kmem_cache_free
+     0.12%  [k] security_socket_sendmsg
+     0.12%  [k] tcp_push
+     0.12%  [.] runtime.Executor.spendQuantum
+     0.12%  [k] __local_bh_enable_ip
+     0.12%  [.] utils.writer.fillBuf
+     0.12%  [k] __wake_up_common
+     0.11%  [k] avc_has_perm_noaudit
+     0.11%  [k] sock_def_readable
+     0.11%  [k] ipv4_mtu
+     0.11%  [k] sk_page_frag_refill
+     0.11%  [.] ev.sockreg.service__func_845
+     0.10%  [k] __tcp_push_pending_frames
+     0.10%  [k] __seccomp_filter
+     0.10%  [k] tcp_try_coalesce
+     0.09%  [k] __rcu_read_unlock
+     0.09%  [k] import_ubuf
+     0.09%  [k] tcp_sendmsg
+     0.09%  [k] syscall_return_via_sysret
+     0.09%  [k] strnlen
+     0.09%  [k] skb_do_copy_data_nocache
+     0.09%  [k] __rcu_read_lock
+     0.08%  [k] __pi_memcpy
+     0.08%  [k] sized_strscpy
+     0.08%  [k] skb_defer_free_flush
+     0.08%  [k] kfree
+     0.08%  [k] nft_meta_get_eval
+     0.08%  [k] __nr_to_section
+     0.08%  [k] x64_sys_call
+     0.07%  [k] nft_meta_store_ifname
+     0.07%  [.] coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+     0.07%  [.] websocket.root.route.S.serve
+     0.06%  [k] inet_sendmsg
+     0.06%  [k] check_stack_object
+     0.06%  [k] nf_conntrack_tcp_packet
+     0.06%  [k] tcp_event_new_data_sent
+     0.06%  [k] __secure_computing
+     0.06%  [k] __alloc_skb
+     0.06%  [.] runtime.getCurrentExecutor
+     0.06%  [k] ep_poll_callback
+     0.06%  [.] 0x0000000000000d26
+     0.05%  [k] selinux_socket_sendmsg
+     0.05%  [k] nft_match_eval
+     0.05%  [k] __pi_memset
+     0.05%  [k] skb_try_coalesce
+     0.05%  [k] arch_exit_to_user_mode_prepare.isra.0
+     0.05%  [.] websocket.root.Socket.next
+     0.05%  [.] common.timedWaitForIoClock
+     0.05%  [k] __raw_spin_lock_irqsave
+     0.05%  [k] _raw_spin_unlock_bh
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#
