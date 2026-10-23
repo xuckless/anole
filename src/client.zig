@@ -19,6 +19,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const http = @import("http/root.zig");
+const resilience = @import("resilience_core");
 
 /// A request header, as a pair: `.{ "User-Agent", "anole" }`.
 pub const Header = [2][]const u8;
@@ -42,6 +43,12 @@ pub const FetchOptions = struct {
     max_redirects: ?u8 = null,
     /// Undo gzip, deflate or zstd on the response body.
     decompress: bool = true,
+    /// `.inherit` (the client's `ServerOptions.client.retry`), `.off`, or
+    /// `.on` with a policy of its own.
+    retry: resilience.Choice = .inherit,
+    /// Whether this request may be sent twice. Null: by method (GET, HEAD,
+    /// OPTIONS, TRACE, QUERY) or an Idempotency-Key header.
+    idempotent: ?bool = null,
 };
 
 /// A handle on a server's outbound client (`anole.client(req)`,
@@ -70,6 +77,8 @@ pub const Client = struct {
             .timeout = options.timeout,
             .max_redirects = options.max_redirects,
             .decompress = options.decompress,
+            .retry = options.retry,
+            .idempotent = options.idempotent,
         }) };
     }
 };

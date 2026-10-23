@@ -247,6 +247,8 @@ pub const ErrorAnswer = struct { status: http.Status, body: []const u8 };
 pub fn errorStatus(err: anyerror) ?http.Status {
     return switch (err) {
         error.BodyTooBig => .payload_too_large,
+        // An open circuit breaker (`anole.resilience`): the same 503 a handler answers.
+        error.CircuitOpen => .service_unavailable,
         error.UnsupportedContentEncoding => .unsupported_media_type,
         error.InvalidZstd, error.IncompleteBody, error.MalformedBody, error.InvalidJsonBody, error.MissingBody => .bad_request,
         error.BadPathName => .not_found,
@@ -338,6 +340,7 @@ pub fn statusBody(status: http.Status) []const u8 {
 
 test "errorStatus: status-named errors, body faults, and nothing else" {
     try std.testing.expectEqual(http.Status.payload_too_large, errorStatus(error.BodyTooBig).?);
+    try std.testing.expectEqual(http.Status.service_unavailable, errorStatus(error.CircuitOpen).?);
     try std.testing.expectEqual(http.Status.unsupported_media_type, errorStatus(error.UnsupportedContentEncoding).?);
     try std.testing.expectEqual(http.Status.bad_request, errorStatus(error.InvalidJsonBody).?);
     try std.testing.expectEqual(http.Status.bad_request, errorStatus(error.MissingBody).?);

@@ -538,6 +538,9 @@ pub const Verdict = enum {
     /// Failed for a reason that may pass: retried when the policy, the
     /// throttle and the budget allow; the breaker counts a failure.
     transient,
+    /// Retried like `transient`, but the target is not failing, so the
+    /// breaker counts nothing (an HTTP 429).
+    retryable,
     /// Failed for good; returned; the breaker counts a failure.
     failure,
     /// Returned as it is; the breaker counts nothing (a 404, a unique violation).
@@ -599,15 +602,15 @@ pub fn run(
         if (policy.breaker) |b| b.record(permit.?, switch (v) {
             .success => .success,
             .transient, .failure => .failure,
-            .neutral => .neutral,
+            .neutral, .retryable => .neutral,
         }, nowNs(io));
         if (policy.throttle) |t| switch (v) {
             .success => t.onSuccess(),
-            .transient, .failure => t.onFailure(),
+            .transient, .failure, .retryable => t.onFailure(),
             .neutral => {},
         };
         const retry = policy.retry orelse return r;
-        if (v != .transient or n >= retry.attempts) return r;
+        if ((v != .transient and v != .retryable) or n >= retry.attempts) return r;
         if (policy.throttle) |t| if (!t.allowRetry()) {
             if (policy.metrics) |m| m.on_throttled(m.context, kindOf(policy), targetOf(policy));
             return r;
