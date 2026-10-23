@@ -1530,4 +1530,5 @@ fn pathHasParam(path: []const u8, name: []const u8) bool {
 test {
     _ = replay;
     _ = @import("topics_test.zig");
+    _ = @import("serve_test.zig");
 }
