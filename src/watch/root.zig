@@ -18,7 +18,23 @@ const std = @import("std");
 const builtin = @import("builtin");
 const features = @import("build_options");
 const dusty = @import("dusty");
-const bson = @import("bson");
+const bson = if (features.mongodb) @import("bson") else struct {
+    // Without MongoDB nothing makes a document: the shapes the events name.
+    pub const Timestamp = struct { t: u32, i: u32 };
+    pub const Value = union(enum) { document: Document };
+    pub const Document = struct {
+        bytes: []const u8 = "",
+        pub fn get(_: Document, _: []const u8) ?Value {
+            return null;
+        }
+        pub fn dupe(d: Document, arena: std.mem.Allocator) error{OutOfMemory}!Document {
+            return .{ .bytes = try arena.dupe(u8, d.bytes) };
+        }
+    };
+    pub fn decodeDocument(comptime T: type, _: std.mem.Allocator, _: Document, _: anytype) error{NotFound}!T {
+        return error.NotFound;
+    }
+};
 const placement = dusty.placement;
 const sse = @import("../sse/root.zig");
 const resilience = @import("../resilience/root.zig");

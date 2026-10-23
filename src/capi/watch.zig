@@ -170,8 +170,11 @@ fn sourceOf(e: *Engine, a: std.mem.Allocator, cfg: config_mod.Config.Watch, manu
             .block = .fromMilliseconds(r.block_ms),
         } };
     }
-    const m = cfg.mongodb.?;
     if (comptime !features.mongodb) unreachable;
+    return mongoSource(d, a, cfg.mongodb.?);
+}
+
+fn mongoSource(d: *db_mod.Db, a: std.mem.Allocator, m: config_mod.Config.WatchMongo) !aw.Source {
     var from: aw.MongoStart = .now;
     if (m.start) |v| switch (v) {
         .string => |s| if (!std.mem.eql(u8, s, "now")) return error.InvalidStart,

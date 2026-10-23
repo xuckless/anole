@@ -14,6 +14,11 @@ breaking changes are listed anyway.
 
 ### Added
 
+- SSE topics (`anole.sse.Topics`, `app.sse`): publish once to every subscriber over HTTP/1.1, HTTP/2 and HTTP/3, with no task per idle subscriber; `Last-Event-ID` resume from a replay buffer, heartbeats, a slow-subscriber policy and a reconnect spread at drain.
+- `app.watch`: PostgreSQL LISTEN/NOTIFY, Redis pub/sub and streams, and MongoDB change streams, straight into SSE and WebSocket topics, into handlers, or read from handlers.
+- MongoDB change streams: `Collection.watch`, `Database.watch`, `Client.watch`, with automatic resume.
+- C ABI: `"sse"` routes and config, `anole_sse_publish`, `anole_sse_gap`, `anole_sse_accept`/`_subscribe`/`_unsubscribe`/`_send`/`_close`; `"watches"` and `anole_watch_find`/`_listen`/`_unlisten`/`_ack`; events 112, 113, 116-118; handle kinds 14 and 15.
+
 ### Changed
 
 - `anole.db.System` has `s3` and `smtp`, and `anole.resilience.Kind` too.
