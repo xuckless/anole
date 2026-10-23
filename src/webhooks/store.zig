@@ -216,7 +216,7 @@ pub const Store = struct {
     pub fn msgPut(self: *Store, c: anytype, id: []const u8, owner: []const u8, idem: ?[]const u8, created_ms: i64, body: []const u8) Error!?[]const u8 {
         const ik = idem orelse "";
         switch (self.backend) {
-            .memory => |m| return m.msgPut(c.arena, id, owner, ik, body),
+            .memory => |m| return m.msgPut(c.arena, id, owner, ik, created_ms, body),
             .postgres => |p| {
                 const n = try p.exec(c, self.sql.msg_put, .{ id, owner, ik, created_ms, body });
                 if (n > 0) return null;
@@ -261,9 +261,11 @@ pub const Store = struct {
     pub fn msgList(self: *Store, c: anytype, owner: ?[]const u8, before: ?[]const u8, limit: u16) Error![]const []const u8 {
         const o = owner orelse "";
         const all_owners = owner == null;
-        const b = before orelse "\xff";
+        // No `before`: every id (SQL: '' turns the bound off; "\xff" is not
+        // valid UTF-8 for PostgreSQL's text).
+        const b = before orelse "";
         switch (self.backend) {
-            .memory => |m| return m.msgList(c.arena, o, all_owners, b, limit),
+            .memory => |m| return m.msgList(c.arena, o, all_owners, before orelse "\xff", limit),
             .postgres => |p| return bodies(c.arena, try p.all(BodyRow, c, self.sql.msg_list, .{ o, all_owners, b, @as(i64, limit) })),
             .sqlite => |s| return bodies(c.arena, try s.all(BodyRow, c, self.sql.msg_list, .{ o, @as(i64, @intFromBool(all_owners)), b, @as(i64, limit) })),
             .redis => |r| {
@@ -410,8 +412,8 @@ fn buildSql(gpa: std.mem.Allocator, d: Dialect, p: []const u8) !Store.Sql {
     s.msg_get = try fmt(gpa, d, p, "SELECT body FROM {0s}webhook_messages WHERE id = $1");
     s.msg_idem = try fmt(gpa, d, p, "SELECT body FROM {0s}webhook_messages WHERE (owner = $1 AND idempotency = $2 AND $2 <> '') OR id = $3 LIMIT 1");
     s.msg_list = switch (d) {
-        .postgres => try fmt(gpa, d, p, "SELECT body FROM {0s}webhook_messages WHERE ($2 OR owner = $1) AND id < $3 ORDER BY id DESC LIMIT $4"),
-        .sqlite => try fmt(gpa, d, p, "SELECT body FROM {0s}webhook_messages WHERE ($2 <> 0 OR owner = $1) AND id < $3 ORDER BY id DESC LIMIT $4"),
+        .postgres => try fmt(gpa, d, p, "SELECT body FROM {0s}webhook_messages WHERE ($2 OR owner = $1) AND ($3 = '' OR id < $3) ORDER BY id DESC LIMIT $4"),
+        .sqlite => try fmt(gpa, d, p, "SELECT body FROM {0s}webhook_messages WHERE ($2 <> 0 OR owner = $1) AND ($3 = '' OR id < $3) ORDER BY id DESC LIMIT $4"),
     };
     s.att_add = try fmt(gpa, d, p, "INSERT INTO {0s}webhook_attempts (message_id, endpoint_id, at_ms, body) VALUES ($1, $2, $3, $4)");
     s.att_list = try fmt(gpa, d, p, "SELECT id, body FROM {0s}webhook_attempts WHERE ($1 = '' OR endpoint_id = $1) AND ($2 = '' OR message_id = $2) AND ($3 = 0 OR id < $3) ORDER BY id DESC LIMIT $4");
@@ -539,7 +541,7 @@ pub const Memory = struct {
         return n;
     }
 
-    fn msgPut(m: *Memory, arena: std.mem.Allocator, id: []const u8, owner: []const u8, idem: []const u8, body: []const u8) Error!?[]const u8 {
+    fn msgPut(m: *Memory, arena: std.mem.Allocator, id: []const u8, owner: []const u8, idem: []const u8, created_ms: i64, body: []const u8) Error!?[]const u8 {
         m.lock();
         defer m.unlock();
         if (m.msgs.get(id)) |e| return try arena.dupe(u8, e.body);
@@ -554,7 +556,7 @@ pub const Memory = struct {
         errdefer m.gpa.free(i);
         const b = try m.gpa.dupe(u8, body);
         errdefer m.gpa.free(b);
-        try m.msgs.put(m.gpa, k, .{ .owner = o, .idem = i, .created_ms = 0, .body = b });
+        try m.msgs.put(m.gpa, k, .{ .owner = o, .idem = i, .created_ms = created_ms, .body = b });
         return null;
     }
 
@@ -624,7 +626,18 @@ pub const Memory = struct {
                 _ = m.atts.orderedRemove(i);
             } else i += 1;
         }
-        _ = msgs_before_ms; // messages carry no time in memory; they go with the process
+        i = 0;
+        while (i < m.msgs.count()) {
+            const v = m.msgs.values()[i];
+            if (v.created_ms < msgs_before_ms) {
+                const k = m.msgs.keys()[i];
+                m.msgs.orderedRemoveAt(i);
+                m.gpa.free(k);
+                m.gpa.free(v.owner);
+                m.gpa.free(v.idem);
+                m.gpa.free(v.body);
+            } else i += 1;
+        }
     }
 };
 

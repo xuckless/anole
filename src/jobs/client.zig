@@ -605,7 +605,7 @@ pub const Client = struct {
     }
 
     fn internalKind(name: []const u8) bool {
-        return std.mem.eql(u8, name, "anole.webhook") or std.mem.eql(u8, name, "anole.sql");
+        return std.mem.eql(u8, name, "anole.webhook") or std.mem.eql(u8, name, "anole.webhook.prune") or std.mem.eql(u8, name, "anole.sql");
     }
 
     fn enqueueWith(self: *Client, c: anytype, def: Kind, args_json: []const u8, opts: EnqueueOptions) Error!Enqueued {
