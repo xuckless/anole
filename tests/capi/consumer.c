@@ -3241,14 +3241,18 @@ static void test_abort_reasons(void) {
   CHECK(write(fd, head, strlen(head)) == (ssize_t)strlen(head));
   static char chunk[8000];
   memset(chunk, 'b', sizeof chunk);
+  /* One chunk (past inline_body_max) brings the request out; the rest go
+     only once the consumer has it. Sent all at once, the engine could reach
+     body_max before the consumer polled, and a request that ends unpolled
+     ends silently (no REQUEST, no ABORT). */
   for (int i = 0; i < 5; i++) {
     char size[32];
     int n = snprintf(size, sizeof size, "%x\r\n", (unsigned)sizeof chunk);
     if (write(fd, size, (size_t)n) != n) break;
     if (write(fd, chunk, sizeof chunk) != (ssize_t)sizeof chunk) break;
     if (write(fd, "\r\n", 2) != 2) break;
+    if (i == 0) h = next_request(c);
   }
-  h = next_request(c);
   ab = (const anole_abort_event *)next_event(c, ANOLE_EV_ABORT);
   CHECK(ab->ev.handle == h && ab->reason == ANOLE_ABORT_BODY && ab->status == 413);
   close(fd);
