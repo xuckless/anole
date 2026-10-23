@@ -93,6 +93,9 @@ pub const Fake = struct {
     }
 
     pub fn stop(f: *Fake) void {
+        // Release held `/next` and extension requests first: the server's
+        // shutdown then has nothing to wait out.
+        f.hold.set(tio);
         f.future.cancel(tio) catch {};
         f.server.deinit();
         for (f.posts.items) |p| {
