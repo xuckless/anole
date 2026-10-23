@@ -1,2 +1,7 @@
 # Generated and compared byte for byte by `zig build capi-test`.
 include/anole.abi.json text eol=lf
+# Read by tests as text (abi_test.zig parses the header; the OpenAPI goldens
+# are compared byte for byte): LF on every checkout, Windows included.
+include/anole.h text eol=lf
+include/anole.schema.json text eol=lf
+tests/openapi/*.json text eol=lf
