@@ -4,6 +4,7 @@
 //! is never linked into an application.
 //!
 //!     anole new <dir> [--template <name>] [--anole <ref>] [--anole-path <dir>] [--no-fetch] [--force]
+//!     anole init [--template <name>] [--anole <ref>] [--anole-path <dir>] [--no-fetch] [--force]
 //!     anole templates
 //!     anole version
 //!     anole help [command]
@@ -58,7 +59,11 @@ fn run(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
         return exit_usage;
     }
     const cmd = args[0];
-    if (std.mem.eql(u8, cmd, "new")) return newCommand(gpa, io, args[1..]);
+    if (std.mem.eql(u8, cmd, "new")) return newCommand(gpa, io, args[1..], .new);
+    if (std.mem.eql(u8, cmd, "init")) return newCommand(gpa, io, args[1..], .init);
+    // ---- console slot (dx/console2 replaces consoleCommand below) ----
+    if (std.mem.eql(u8, cmd, "console")) return consoleCommand(gpa, io, args[1..]);
+    // ---- end console slot ----
     if (std.mem.eql(u8, cmd, "templates")) {
         try listTemplates(io);
         return 0;
@@ -69,7 +74,7 @@ fn run(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
     }
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         const topic: ?[]const u8 = if (args.len > 1) args[1] else null;
-        try say(io, "{s}", .{if (topic != null and std.mem.eql(u8, topic.?, "new")) new_help else usage_text});
+        try say(io, "{s}", .{if (topic != null and (std.mem.eql(u8, topic.?, "new") or std.mem.eql(u8, topic.?, "init"))) new_help else usage_text});
         return 0;
     }
     std.debug.print("anole: unknown command \"{s}\"\n\n{s}", .{ cmd, usage_text });
@@ -81,6 +86,7 @@ const usage_text =
     \\
     \\usage:
     \\  anole new <dir> [--template <name>] [--anole <ref>] [--anole-path <dir>] [--no-fetch] [--force]
+    \\  anole init [--template <name>] [--anole <ref>] [--anole-path <dir>] [--no-fetch] [--force]
     \\  anole templates
     \\  anole version
     \\  anole help [command]
@@ -89,12 +95,16 @@ const usage_text =
 
 const new_help =
     \\anole new <dir>: make a project from a template
+    \\anole init: the same in the current directory (extends an existing Zig project:
+    \\  build.zig.zon is kept and Anole is added to it; a file that exists is never overwritten)
     \\
     \\  --template <name>    which template (default: minimal; `anole templates` lists them)
     \\  --anole <ref>        the Anole tag, branch or commit to depend on (default: this CLI's tag)
     \\  --anole-path <dir>   depend on a local checkout instead (a path dependency)
     \\  --no-fetch           leave the dependency out and print the `zig fetch` line
     \\  --force              allow a non-empty directory (never overwrites a file)
+    \\
+    \\Every template writes a ready .env (copied from .env.example) unless one exists.
     \\
 ;
 
@@ -112,8 +122,17 @@ pub const ArgError = error{ MissingDir, UnknownOption, MissingValue, Conflicting
 
 /// Parses the arguments after `new`.
 pub fn parseNewArgs(args: []const []const u8) ArgError!NewArgs {
-    var out: NewArgs = .{ .dir = "" };
-    var have_dir = false;
+    return parseArgs(args, true);
+}
+
+/// Parses the arguments after `init`: the directory is the current one.
+pub fn parseInitArgs(args: []const []const u8) ArgError!NewArgs {
+    return parseArgs(args, false);
+}
+
+fn parseArgs(args: []const []const u8, comptime want_dir: bool) ArgError!NewArgs {
+    var out: NewArgs = .{ .dir = if (want_dir) "" else "." };
+    var have_dir = !want_dir;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -139,23 +158,26 @@ pub fn parseNewArgs(args: []const []const u8) ArgError!NewArgs {
     return out;
 }
 
-fn newCommand(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
+const Mode = enum { new, init };
+
+fn newCommand(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8, mode: Mode) !u8 {
     const list = try gpa.alloc([]const u8, args.len);
     defer gpa.free(list);
     for (args, list) |a, *out| out.* = a;
-    const parsed = parseNewArgs(list) catch |err| {
-        std.debug.print("anole new: {s}\n\n{s}", .{ switch (err) {
+    const cmd_name = if (mode == .new) "new" else "init";
+    const parsed = (if (mode == .new) parseNewArgs(list) else parseInitArgs(list)) catch |err| {
+        std.debug.print("anole {s}: {s}\n\n{s}", .{ cmd_name, switch (err) {
             error.MissingDir => "give a directory: anole new <dir>",
             error.UnknownOption => "unknown option",
             error.MissingValue => "an option is missing its value",
             error.ConflictingDependency => "--anole and --anole-path cannot be used together",
-            error.ExtraArgument => "one directory only",
+            error.ExtraArgument => if (mode == .new) "one directory only" else "init works in the current directory; it takes no directory",
         }, new_help });
         return exit_usage;
     };
 
     const template = findTemplate(parsed.template) orelse {
-        std.debug.print("anole new: no template named \"{s}\"; the templates are:\n", .{parsed.template});
+        std.debug.print("anole {s}: no template named \"{s}\"; the templates are:\n", .{ cmd_name, parsed.template });
         for (index.templates) |t| std.debug.print("  {s}  {s}\n", .{ t.name, t.summary });
         if (index.templates.len == 0) std.debug.print("  (none built in)\n", .{});
         return exit_usage;
@@ -163,7 +185,7 @@ fn newCommand(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
 
     const cwd = Io.Dir.cwd();
     // 1. The directory: created if missing, empty unless --force.
-    cwd.createDirPath(io, parsed.dir) catch |err| {
+    if (mode == .new) cwd.createDirPath(io, parsed.dir) catch |err| {
         std.debug.print("anole new: cannot create {s}: {s}\n", .{ parsed.dir, @errorName(err) });
         return exit_exists;
     };
@@ -172,34 +194,37 @@ fn newCommand(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
     if (!parsed.force) {
         var it = dir.iterate();
         if (try it.next(io)) |entry| {
-            std.debug.print("anole new: {s} is not empty (found {s}); use an empty directory or --force\n", .{ parsed.dir, entry.name });
+            std.debug.print("anole {s}: {s} is not empty (found {s}); use an empty directory or --force\n", .{ cmd_name, parsed.dir, entry.name });
             return exit_exists;
         }
     }
+    // An existing Zig project (init in a directory with a build.zig.zon) keeps
+    // its manifest: Anole is added to it, and `zig init` does not run.
+    const existing_project = mode == .init and exists(io, dir, "build.zig.zon");
     // A template file must not overwrite anything (build.zig, which `zig init`
-    // writes, excepted).
+    // writes, excepted in a new project).
     for (template.files) |f| {
-        if (std.mem.eql(u8, f.path, "build.zig")) continue;
-        if (dir.access(io, f.path, .{})) |_| {
-            std.debug.print("anole new: {s}/{s} exists; nothing was written\n", .{ parsed.dir, f.path });
+        if (!existing_project and std.mem.eql(u8, f.path, "build.zig")) continue;
+        if (exists(io, dir, f.path)) {
+            std.debug.print("anole {s}: {s}/{s} exists; nothing was written\n", .{ cmd_name, parsed.dir, f.path });
             return exit_exists;
-        } else |_| {}
+        }
     }
 
     // 2. zig init -m.
     const version = zigVersion(gpa, io) catch |err| switch (err) {
         error.FileNotFound => {
-            std.debug.print("anole new: `zig` was not found on PATH; install Zig 0.17.0 from https://ziglang.org/download/\n", .{});
+            std.debug.print("anole {s}: `zig` was not found on PATH; install Zig 0.17.0 from https://ziglang.org/download/\n", .{cmd_name});
             return exit_no_zig;
         },
         else => return err,
     };
     defer gpa.free(version);
     if (!std.mem.startsWith(u8, version, "0.17.")) {
-        std.debug.print("anole new: warning: Anole needs Zig 0.17.x, this is {s}\n", .{version});
+        std.debug.print("anole {s}: warning: Anole needs Zig 0.17.x, this is {s}\n", .{ cmd_name, version });
     }
-    if (!(try runZig(io, &.{ "zig", "init", "-m" }, parsed.dir))) {
-        std.debug.print("anole new: `zig init -m` failed; retry it in {s}\n", .{parsed.dir});
+    if (!existing_project and !(try runZig(io, &.{ "zig", "init", "-m" }, parsed.dir))) {
+        std.debug.print("anole {s}: `zig init -m` failed; retry it in {s}\n", .{ cmd_name, parsed.dir });
         return exit_zig_failed;
     }
 
@@ -207,21 +232,34 @@ fn newCommand(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
     const zon_bytes = try dir.readFileAlloc(io, "build.zig.zon", gpa, .limited(1 << 20));
     defer gpa.free(zon_bytes);
     const name = projectName(zon_bytes) orelse {
-        std.debug.print("anole new: could not read the project name from build.zig.zon\n", .{});
+        std.debug.print("anole {s}: could not read the project name from build.zig.zon\n", .{cmd_name});
         return exit_zig_failed;
     };
 
-    // 4. The template's files.
+    // 4. The template's files, and a ready .env from .env.example.
     for (template.files) |f| {
         const text = try substitute(gpa, f.data, name);
         defer gpa.free(text);
         if (std.fs.path.dirname(f.path)) |parent| try dir.createDirPath(io, parent);
         try dir.writeFile(io, .{ .sub_path = f.path, .data = text });
+        if (std.mem.eql(u8, f.path, ".env.example") and !exists(io, dir, ".env")) {
+            try dir.writeFile(io, .{ .sub_path = ".env", .data = text });
+        }
     }
 
     // 5. The dependency.
-    if (parsed.anole_path) |path| {
-        const edited = try insertPathDependency(gpa, zon_bytes, path);
+    if (existing_project and std.mem.find(u8, zon_bytes, ".anole = ") != null) {
+        std.debug.print("anole init: build.zig.zon already has an anole dependency; left as it is\n", .{});
+    } else if (parsed.anole_path) |path| {
+        // The manifest wants a path relative to the project, whatever the
+        // path was relative to (or absolute) on the command line.
+        const project_abs = try dir.realPathFileAlloc(io, ".", gpa);
+        defer gpa.free(project_abs);
+        const cwd_abs = try cwd.realPathFileAlloc(io, ".", gpa);
+        defer gpa.free(cwd_abs);
+        const rel = try relativeDependencyPath(gpa, project_abs, cwd_abs, path);
+        defer gpa.free(rel);
+        const edited = try insertPathDependency(gpa, zon_bytes, rel);
         defer gpa.free(edited);
         try dir.writeFile(io, .{ .sub_path = "build.zig.zon", .data = edited });
     } else {
@@ -232,16 +270,49 @@ fn newCommand(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
         if (parsed.no_fetch) {
             try say(io, "no dependency added; run it yourself:\n  cd {s} && zig fetch --save=anole {s}\n", .{ parsed.dir, url });
         } else if (!(try runZig(io, &.{ "zig", "fetch", "--save=anole", url }, parsed.dir))) {
-            std.debug.print("anole new: `zig fetch` failed; retry it:\n  cd {s} && zig fetch --save=anole {s}\n", .{ parsed.dir, url });
+            std.debug.print("anole {s}: `zig fetch` failed; retry it:\n  cd {s} && zig fetch --save=anole {s}\n", .{ cmd_name, parsed.dir, url });
             return exit_zig_failed;
         }
     }
 
     // 6. Next steps, after the anole when a person is looking.
     printBanner(io);
-    try say(io, "created {s} (template: {s}, anole v{s})\n  cd {s}\n{s}", .{ parsed.dir, template.name, options.version, parsed.dir, template.next_steps });
+    if (mode == .new) {
+        try say(io, "created {s} (template: {s}, anole v{s})\n  cd {s}\n{s}", .{ parsed.dir, template.name, options.version, parsed.dir, template.next_steps });
+    } else {
+        try say(io, "added the {s} template (anole v{s}) to {s}\n{s}", .{ template.name, options.version, if (std.mem.eql(u8, parsed.dir, ".")) "this directory" else parsed.dir, template.next_steps });
+    }
     return 0;
 }
+
+/// `path` (relative to `cwd_abs`, or absolute) as a path relative to the
+/// project directory `project_abs`, '/'-separated as a manifest wants it.
+pub fn relativeDependencyPath(gpa: std.mem.Allocator, project_abs: []const u8, cwd_abs: []const u8, path: []const u8) ![]u8 {
+    const target = try std.fs.path.resolve(gpa, &.{ cwd_abs, path });
+    defer gpa.free(target);
+    const rel = try std.fs.path.relativeAlloc(gpa, project_abs, null, project_abs, target);
+    if (rel.len == 0) {
+        gpa.free(rel);
+        return gpa.dupe(u8, ".");
+    }
+    std.mem.replaceScalar(u8, rel, '\\', '/');
+    return rel;
+}
+
+fn exists(io: Io, dir: Io.Dir, path: []const u8) bool {
+    dir.access(io, path, .{}) catch return false;
+    return true;
+}
+
+// ---- console slot: dx/console2 replaces this function ----
+fn consoleCommand(gpa: std.mem.Allocator, io: Io, args: []const [:0]const u8) !u8 {
+    _ = gpa;
+    _ = io;
+    _ = args;
+    std.debug.print("anole console: not available in this build\n", .{});
+    return exit_usage;
+}
+// ---- end console slot ----
 
 /// The anole, when stdout is a terminal (not under NO_COLOR's colour, nor
 /// with ANOLE_NO_BANNER=1).
@@ -389,6 +460,23 @@ test "path dependency goes into an existing dependencies table, empty or not" {
     defer testing.allocator.free(b);
     try testing.expect(std.mem.find(u8, b, ".x = .{ .path = \"x\" }") != null);
     try testing.expect(std.mem.find(u8, b, ".anole = .{ .path = \"p\" }") != null);
+}
+
+test "the path dependency is relative to the project" {
+    const a = try relativeDependencyPath(testing.allocator, "/work/apps/my_api", "/work/apps", "../anole");
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("../../anole", a);
+    const b = try relativeDependencyPath(testing.allocator, "/work/apps/my_api", "/elsewhere", "/work/anole");
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("../../anole", b);
+}
+
+test "init takes no directory" {
+    const ok = try parseInitArgs(&.{ "--template", "grpc", "--force" });
+    try testing.expectEqualStrings(".", ok.dir);
+    try testing.expectEqualStrings("grpc", ok.template);
+    try testing.expectError(error.ExtraArgument, parseInitArgs(&.{"dir"}));
+    try testing.expectError(error.ConflictingDependency, parseInitArgs(&.{ "--anole", "main", "--anole-path", "../anole" }));
 }
 
 test "placeholders" {

@@ -27,6 +27,7 @@ const cluster_mod = @import("cluster.zig");
 const producer_mod = @import("producer.zig");
 const resilience = @import("../resilience/root.zig");
 const Telemetry = @import("telemetry.zig").Telemetry;
+const anole_log = @import("anole_log");
 
 const log = std.log.scoped(.anole);
 const Duration = std.Io.Duration;
@@ -61,6 +62,33 @@ pub const Msg = struct {
     pub fn json(self: *Msg, comptime T: type) !T {
         const v = self.value orelse return error.BadRequest;
         return std.json.parseFromSliceLeaky(T, self.arena, v, .{ .ignore_unknown_fields = true }) catch error.BadRequest;
+    }
+
+    /// The value as a `T`, mapped field by field and checked by `T`'s
+    /// `field_rules` (`anole.bindJson`): `error.BadRequest` when there is no
+    /// value, `error.InvalidJsonBody` when it is not JSON,
+    /// `error.ValidationFailed` when it does not fit or breaks a rule, after
+    /// one warning that names the first problem.
+    pub fn bind(self: *Msg, comptime T: type) !T {
+        const v = self.value orelse return error.BadRequest;
+        const result = try dusty.bindJson(T, self.arena, v, .{});
+        switch (result) {
+            .ok => |value| return value,
+            .invalid => |found| {
+                const first = found.items[0];
+                self.log().warn("message does not fit the type", .{
+                    .violations = found.items.len,
+                    .first_field = first.field orelse "",
+                    .first_code = first.code,
+                });
+                return error.ValidationFailed;
+            },
+        }
+    }
+
+    /// A logger whose records carry this message's id, under the scope `kafka`.
+    pub fn log(self: *const Msg) anole_log.Scoped(.kafka) {
+        return .{ .context = .{ .request_id = self.id } };
     }
 };
 

@@ -12,12 +12,15 @@
 //! the document assembler resolves the names when it writes. Anonymous types
 //! stand inline.
 //!
-//! The validator's `field_rules` are not merged here yet: the tooling lane's
-//! second part adds `withRules` over `anole.validate.schemaOf`.
+//! The validator's `field_rules` are merged into each field's schema
+//! (`withRules`, over `validate.schemaOf`): `maxLength`, `minimum`, `pattern`
+//! and the like come from the rules, and a field's outside name from
+//! `v.rename`.
 const std = @import("std");
 const json = @import("json.zig");
 const example = @import("example.zig");
 const declarations = @import("declarations.zig");
+const v = @import("validate");
 
 pub const Component = json.Component;
 
@@ -342,6 +345,7 @@ fn fieldParts(comptime T: type, comptime name: []const u8, comptime F: type, com
     var p = typeParts(F, false, where, stack, refs);
     const doc = fieldDocOf(T, name);
     if (doc.description) |text| p.description = &.{text};
+    p = withRules(p, rulesOf(T, name));
     p.deprecated = doc.deprecated;
     if (!declarations.writesItself(F)) {
         if (attrs.defaultValue(F)) |default| p.default = example.value(F, default, .input, where);
@@ -391,6 +395,177 @@ fn unionParts(comptime T: type, comptime nullable: bool, comptime stack: []const
         .deprecated = typeDeprecated(T),
         .examples = typeExamples(T),
     };
+}
+
+// ------------------------------------------------------------------ parameters
+
+/// What a parameter of a path, query or header DTO needs in the document.
+pub const ParamInfo = struct {
+    schema: json.Node,
+    description: ?[]const u8,
+    deprecated: bool,
+    /// A `[]const T` query field (repeated keys).
+    is_list: bool,
+    required: bool,
+};
+
+fn fieldAttrs(comptime T: type, comptime name: []const u8) std.lang.Type.Struct.FieldAttributes {
+    const s = @typeInfo(T).@"struct";
+    for (s.field_names, s.field_attrs) |n, a| {
+        if (std.mem.eql(u8, n, name)) return a;
+    }
+    unreachable;
+}
+
+/// The parameter of the field `field` of the DTO `Dto`: its schema with the
+/// rules of the field merged in, its default, its text.
+pub fn paramOf(comptime Dto: type, comptime field: []const u8) ParamInfo {
+    comptime {
+        @setEvalBranchQuota(quota);
+        const F = @FieldType(Dto, field);
+        const where = typeName(Dto) ++ "." ++ field;
+        const Value = if (@typeInfo(F) == .optional) @typeInfo(F).optional.child else F;
+        const Item = @import("dusty").input.strings.listItem(Value) orelse Value;
+        var p = typeParts(Value, false, where, &.{}, false);
+        p = withRules(p, rulesAs(Dto, field, Value));
+        const attrs = fieldAttrs(Dto, field);
+        if (attrs.defaultValue(F)) |default| {
+            if (@typeInfo(F) != .optional or default != null) p.default = example.value(F, default, .input, where);
+        }
+        const doc = fieldDocOf(Dto, field);
+        var description: []const []const u8 = if (doc.description) |text| &.{text} else &.{};
+        description = description ++ p.description;
+        p.description = &.{};
+        return .{
+            .schema = node(p),
+            .description = if (description.len > 0) joined(description) else null,
+            .deprecated = doc.deprecated,
+            .is_list = Item != Value and !isString(Value),
+            .required = @typeInfo(F) != .optional and attrs.default_value_ptr == null,
+        };
+    }
+}
+
+// ------------------------------------------------------------------ rules
+
+const rename_example = v.rename("x");
+const Rename = @TypeOf(rename_example);
+const Transform = @TypeOf(v.trim);
+
+/// The schemas of the rules and transforms of the field `name` of `T`, in
+/// the order of its entry in `field_rules`.
+fn rulesOf(comptime T: type, comptime name: []const u8) []const v.RuleSchema {
+    return rulesAs(T, name, @FieldType(T, name));
+}
+
+fn rulesAs(comptime T: type, comptime name: []const u8, comptime F: type) []const v.RuleSchema {
+    if (@typeInfo(T) != .@"struct" or !@hasDecl(T, "field_rules")) return &.{};
+    if (!@hasField(@TypeOf(T.field_rules), name)) return &.{};
+    const entry = @field(T.field_rules, name);
+    const E = @TypeOf(entry);
+    if (E == v.Rule or E == Transform) return &.{v.schemaOf(entry, F)};
+    if (E == Rename) return &.{};
+    var out: []const v.RuleSchema = &.{};
+    for (0..entry.len) |i| {
+        const Element = @TypeOf(entry[i]);
+        if (Element == v.Rule or Element == Transform) out = out ++ [_]v.RuleSchema{v.schemaOf(entry[i], F)};
+    }
+    return out;
+}
+
+/// `p` with the keywords of `schemas` merged in and their notes after its
+/// description; `each`'s item rules apply to the items.
+fn withRules(comptime p: Parts, comptime schemas: []const v.RuleSchema) Parts {
+    var out = p;
+    var fragments: []const []const json.Member = &.{};
+    var notes: []const []const u8 = &.{};
+    for (schemas) |rs| {
+        if (rs.note) |note| notes = notes ++ [_][]const u8{note};
+        if (rs.keywords.len > 0) {
+            var members: [rs.keywords.len]json.Member = undefined;
+            for (rs.keywords, &members) |k, *m| m.* = .{ .key = k.name, .value = .{ .raw = k.value } };
+            const final = members;
+            fragments = fragments ++ [_][]const json.Member{&final};
+        }
+        if (rs.items.len > 0 and out.items != null) {
+            const items = withRules(out.items.?.*, rs.items);
+            out.items = &items;
+        }
+    }
+    out.keywords = merged(out, fragments);
+    out.description = out.description ++ notes;
+    return out;
+}
+
+fn merged(comptime p: Parts, comptime fragments: []const []const json.Member) []const json.Member {
+    if (fragments.len == 0) return p.keywords;
+    const taken = takenKeys(p);
+    var keywords = p.keywords;
+    var names: []const []const u8 = &.{};
+    for (fragments) |fragment| {
+        for (fragment) |k| {
+            if (contains(names, k.key) or contains(taken, k.key)) return withAllOf(p.keywords, fragments);
+            names = names ++ [_][]const u8{k.key};
+            for (keywords, 0..) |own, i| {
+                if (!std.mem.eql(u8, own.key, k.key)) continue;
+                const kept = tighter(own, k) orelse return withAllOf(p.keywords, fragments);
+                keywords = keywords[0..i] ++ [_]json.Member{kept} ++ keywords[i + 1 ..];
+                break;
+            } else keywords = keywords ++ [_]json.Member{k};
+        }
+    }
+    return keywords;
+}
+
+fn withAllOf(comptime keywords: []const json.Member, comptime fragments: []const []const json.Member) []const json.Member {
+    var all: []const json.Node = &.{};
+    for (fragments) |fragment| all = all ++ [_]json.Node{.{ .object = fragment }};
+    return keywords ++ [_]json.Member{.{ .key = "allOf", .value = .{ .array = all } }};
+}
+
+fn takenKeys(comptime p: Parts) []const []const u8 {
+    var out: []const []const u8 = &.{ "description", "deprecated", "default", "examples" };
+    for (p.kind) |m| out = out ++ [_][]const u8{m.key};
+    if (p.items != null) out = out ++ [_][]const u8{"items"};
+    if (p.properties != null) out = out ++ [_][]const u8{ "required", "properties", "additionalProperties" };
+    return out;
+}
+
+fn tighter(comptime own: json.Member, comptime rule: json.Member) ?json.Member {
+    const key = own.key;
+    if (std.mem.eql(u8, key, "enum")) return rule;
+    if (own.value != .raw or rule.value != .raw) return null;
+    const lower = contains(&.{ "minimum", "exclusiveMinimum", "minLength", "minItems" }, key);
+    const upper = contains(&.{ "maximum", "exclusiveMaximum", "maxLength", "maxItems" }, key);
+    if (!lower and !upper) return null;
+    const rule_less = lessNumber(rule.value.raw, own.value.raw) orelse return null;
+    return if (rule_less == upper) rule else own;
+}
+
+fn lessNumber(comptime a: []const u8, comptime b: []const u8) ?bool {
+    if (integerOf(a)) |x| if (integerOf(b)) |y| return x < y;
+    const x = std.fmt.parseFloat(f128, a) catch return null;
+    const y = std.fmt.parseFloat(f128, b) catch return null;
+    return x < y;
+}
+
+fn integerOf(comptime text: []const u8) ?comptime_int {
+    const negative = text.len > 0 and text[0] == '-';
+    const digits = if (negative) text[1..] else text;
+    if (digits.len == 0) return null;
+    var n: comptime_int = 0;
+    for (digits) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+        n = n * 10 + @as(comptime_int, c - '0');
+    }
+    return if (negative) -n else n;
+}
+
+fn contains(comptime list: []const []const u8, comptime key: []const u8) bool {
+    for (list) |item| {
+        if (std.mem.eql(u8, item, key)) return true;
+    }
+    return false;
 }
 
 // ------------------------------------------------------------------ examples
@@ -789,4 +964,25 @@ test "a jsonStringify type uses Doc.as" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "field_rules become keywords, and the tighter bound wins" {
+    const Rules = struct {
+        name: []const u8,
+        age: u8,
+        tags: []const []const u8 = &.{},
+        pub const field_rules = .{
+            .name = .{ v.minLength(2), v.maxLength(10) },
+            .age = v.min(18),
+            .tags = v.maxItems(3),
+        };
+    };
+    const text = try written(componentOf(Rules).schema, &.{});
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "\"minLength\": 2") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"maxLength\": 10") != null);
+    // The rule's 18 is tighter than the type's 0; the type's 255 stays.
+    try testing.expect(std.mem.indexOf(u8, text, "\"minimum\": 18") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"maximum\": 255") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"maxItems\": 3") != null);
 }

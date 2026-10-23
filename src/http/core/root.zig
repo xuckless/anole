@@ -109,6 +109,8 @@ pub const Chain = @import("middleware.zig").Chain;
 /// `error.Unauthorized`, request-body faults), or null for a 500: for
 /// middleware that records the status it will send.
 pub const errorStatus = @import("middleware.zig").errorStatus;
+/// `errorStatus` by error name, at compile time.
+pub const comptimeErrorStatus = @import("middleware.zig").comptimeErrorStatus;
 /// `errorStatus` with the default answer's text body.
 pub const clientError = @import("middleware.zig").clientError;
 /// The answer the server gives an error when nothing else does, for an

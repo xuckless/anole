@@ -52,6 +52,13 @@ Zig compiles every C dependency, so you install nothing but Zig. Each one
 sits behind a build flag, and whatever you switch off is never downloaded or
 compiled.
 
+## Start from a template
+
+`anole new my-api` makes a project (a JSON API, a PostgreSQL API, a chat, a gRPC
+service, or most of Anole in one app) with tests, an OpenAPI page at `/docs`
+and a ready `.env`; see [docs/templates.md](docs/templates.md) for the
+download. The sections below build the same thing by hand.
+
 ## Hello, World
 
 ```zig
@@ -248,6 +255,7 @@ memory, so `-k` it. Pass other ports with `zig build run-full -- 9000 9443`.
 | `-Dpostgres=bool` | false | true | true | PostgreSQL client (pg.zig fork) |
 | `-Dsqlite=bool` | false | true | true | SQLite (amalgamation, zig-sqlite fork) |
 | `-Dmongodb=bool` | false | false | true | MongoDB client and BSON |
+| `-Dopenapi=bool` | false | true | true | OpenAPI 3.1 documents and the docs page (pure Zig) |
 
 Constraints:
 - gRPC needs HTTP/2, so `-Dhttp2=false` turns gRPC off. Asking for both

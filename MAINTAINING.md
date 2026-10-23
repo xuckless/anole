@@ -193,6 +193,13 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   and `scalar.integrity` together (the SRI hash of
   `@scalar/api-reference@<version>/dist/browser/standalone.js`: fetch the
   file and compute `sha384`).
+- **The templates** (`templates/<name>/`): embedded in the CLI through
+  `templates/index.zig`, which `python3 tools/anole/gen_index.py` regenerates
+  (rerun it when a file is added; `cli-test` fails on a file it doesn't list).
+  `tests/templates/run.sh` builds, tests and lints each template against this
+  checkout (CI job `templates`); a template uses only names that exist, so an
+  API change that breaks one fails there. The Scalar and OpenAPI lint pin
+  (`openapi-spec-validator==0.7.1`) is in that script.
 - **The `anole` CLI** (`tools/anole`): after tagging, `zig build cli-dist`
   builds the five binaries and SHA256SUMS in `zig-out/dist`; attach them with
   `gh release upload vX.Y.Z zig-out/dist/*`.

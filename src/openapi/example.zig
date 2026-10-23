@@ -9,6 +9,7 @@
 const std = @import("std");
 const json = @import("json.zig");
 const declarations = @import("declarations.zig");
+const validate = @import("validate");
 
 
 /// How a value goes: in a request, in a response, or in a response body
@@ -86,8 +87,8 @@ pub fn value(comptime T: type, comptime x: T, comptime way: Way, comptime where:
 /// name. Part 2 of the tooling lane maps `anole.validate.nameOf` here once the
 /// validator exists, so `v.rename` shows in examples as `req.bind` reads it.
 pub fn outsideName(comptime T: type, comptime field: []const u8) []const u8 {
-    _ = T;
-    return field;
+    if (@typeInfo(T) != .@"struct") return field;
+    return validate.nameOf(T, @field(std.meta.FieldEnum(T), field));
 }
 
 fn items(comptime Item: type, comptime list: []const Item, comptime way: Way, comptime where: []const u8) json.Node {

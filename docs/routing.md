@@ -104,8 +104,8 @@ Any other handler of this shape is typed:
 
 `anole.routeInfo(handler)` reads a handler's signature (inputs, output,
 declared errors, `takes_res`, `typed`, `no_wait`, `cached`), also through
-`anole.noWait` and `anole.cached`; tools that describe routes (OpenAPI) use
-it. `anole.cached` is only for GET and HEAD routes: on another method it is a
+`anole.noWait` and `anole.cached`; tools that describe routes (the OpenAPI
+document, [openapi.md](openapi.md)) use it. `anole.cached` is only for GET and HEAD routes: on another method it is a
 compile error.
 
 ## Path parameters and the query string

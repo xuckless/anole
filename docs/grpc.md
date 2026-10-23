@@ -692,3 +692,10 @@ the test service on that ABI (`tests/capi/grpc_interop.c`).
 ## Client retries and redial
 
 `Channel.retry`, `Channel.retry_codes` (default `UNAVAILABLE`) and `Channel.breaker` apply to unary calls: each retry sends `grpc-previous-rpc-attempts` and the remaining `grpc-timeout`, and a `grpc-retry-pushback-ms` trailer is obeyed. `Channel.connect(gpa, io, connect_options, .{})` makes a channel that owns its connection and redials it after a GOAWAY or a failure. See [resilience.md](resilience.md).
+
+## OpenAPI from your protos
+
+`app.openapi(.{})` describes a gRPC service too: each annotated method as its
+REST route, each other unary method in Connect's form, with the `.proto`
+comments as descriptions and `field_behavior` as `required` and `readOnly`.
+See [openapi.md](openapi.md#grpc-services).

@@ -5,6 +5,22 @@ files, TLS and gRPC, and how to deploy it. Each step is the shortest program
 that does the job; the other guides go further. Coming from Go's Fiber,
 [from-fiber.md](from-fiber.md) maps what you know onto Anole.
 
+## Start from a template
+
+The quickest start is the `anole` command line, which makes a project from a
+template (a small JSON API, a PostgreSQL REST API, a WebSocket chat, a gRPC
+service, or one app with most features) with its tests, an OpenAPI page and a
+ready `.env`:
+
+```sh
+anole new my-api         # download anole from the latest release, see templates.md
+cd my-api
+zig build run            # http://localhost:3000, API docs at /docs
+```
+
+[templates.md](templates.md) has the download and what each template holds.
+Or build the same thing by hand:
+
 ## A project
 
 You need Zig 0.17 (`zig version` prints `0.17.0`) on macOS or Linux, and

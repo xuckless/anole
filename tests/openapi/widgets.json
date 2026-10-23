@@ -1,0 +1,499 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Widgets",
+    "version": "1.0.0"
+  },
+  "tags": [
+    {
+      "name": "transcode.Widgets",
+      "description": "Widgets of the shop."
+    }
+  ],
+  "paths": {
+    "/transcode.Widgets/Make": {
+      "post": {
+        "tags": [
+          "transcode.Widgets"
+        ],
+        "operationId": "Widgets_Make",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Widget"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Widget"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/transcode.Widgets/Peek": {
+      "get": {
+        "tags": [
+          "transcode.Widgets"
+        ],
+        "operationId": "Widgets_Peek_get",
+        "parameters": [
+          {
+            "name": "message",
+            "in": "query",
+            "description": "The request as JSON.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "encoding",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json"
+              ]
+            }
+          },
+          {
+            "name": "connect",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "v1"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Widget"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "transcode.Widgets"
+        ],
+        "operationId": "Widgets_Peek",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GetWidgetRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Widget"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/watch/{name}": {
+      "get": {
+        "tags": [
+          "transcode.Widgets"
+        ],
+        "operationId": "Widgets_Watch",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "description": "The whole stream as one JSON array.",
+                  "items": {
+                    "$ref": "#/components/schemas/Widget"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/widgets": {
+      "get": {
+        "tags": [
+          "transcode.Widgets"
+        ],
+        "operationId": "Widgets_ListWidgets",
+        "parameters": [
+          {
+            "name": "pageSize",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "filter",
+            "in": "query",
+            "style": "form",
+            "explode": true,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListWidgetsResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/widgets/{name_1}": {
+      "get": {
+        "tags": [
+          "transcode.Widgets"
+        ],
+        "summary": "Gets a widget.",
+        "description": "It must exist.",
+        "operationId": "Widgets_GetWidget",
+        "parameters": [
+          {
+            "name": "name_1",
+            "in": "path",
+            "description": "A segment of `name` (`widgets/{name_1}`); the server joins the segments.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Widget"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Color": {
+        "type": "string",
+        "enum": [
+          "COLOR_UNSPECIFIED",
+          "RED",
+          "GREEN"
+        ],
+        "description": "Paint colours."
+      },
+      "ConnectError": {
+        "type": "object",
+        "description": "The HTTP status follows the code (Connect protocol).",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "canceled",
+              "unknown",
+              "invalid_argument",
+              "deadline_exceeded",
+              "not_found",
+              "already_exists",
+              "permission_denied",
+              "resource_exhausted",
+              "failed_precondition",
+              "aborted",
+              "out_of_range",
+              "unimplemented",
+              "internal",
+              "unavailable",
+              "data_loss",
+              "unauthenticated"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "details": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string"
+                },
+                "value": {
+                  "type": "string",
+                  "format": "byte"
+                },
+                "debug": {}
+              }
+            }
+          }
+        }
+      },
+      "GetWidgetRequest": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "ListWidgetsResponse": {
+        "type": "object",
+        "properties": {
+          "widgets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Widget"
+            }
+          }
+        }
+      },
+      "Status": {
+        "type": "object",
+        "description": "google.rpc.Status: the gRPC status of a failed call.",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "message": {
+            "type": "string"
+          },
+          "details": {
+            "type": "array",
+            "items": {}
+          }
+        }
+      },
+      "Widget": {
+        "type": "object",
+        "description": "A widget.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The widget's resource name."
+          },
+          "etag": {
+            "type": "string",
+            "readOnly": true
+          },
+          "secret": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "old": {
+            "type": "string",
+            "deprecated": true
+          },
+          "count": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "ucount": {
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "big": {
+            "type": "string",
+            "format": "int64"
+          },
+          "ubig": {
+            "type": "string",
+            "format": "uint64"
+          },
+          "ratio": {
+            "type": "number",
+            "format": "double"
+          },
+          "blob": {
+            "type": "string",
+            "format": "byte"
+          },
+          "on": {
+            "type": "boolean"
+          },
+          "color": {
+            "$ref": "#/components/schemas/Color"
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "scores": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          "created": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ttl": {
+            "type": "string",
+            "pattern": "^-?[0-9]+(\\.[0-9]+)?s$"
+          },
+          "nick": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maybe": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "format": "int32"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "a": {
+            "type": "string",
+            "description": "At most one of: a, b."
+          },
+          "b": {
+            "type": "integer",
+            "format": "int32",
+            "description": "At most one of: a, b."
+          }
+        }
+      }
+    }
+  }
+}

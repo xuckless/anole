@@ -247,8 +247,8 @@ pub fn routeInfo(comptime handler: anytype) RouteInfo {
         .errors = sh.Errors,
         .takes_res = sh.takes_res,
         .typed = sh.typed,
-        .no_wait = handlers.isNoWait(@TypeOf(handler)) or (handlers.isCached(@TypeOf(handler)) and handlers.isNoWait(@TypeOf(@TypeOf(handler).cached_handler))),
-        .cached = handlers.isCached(@TypeOf(handler)),
+        .no_wait = handlers.anyNoWait(handler),
+        .cached = handlers.anyCached(handler),
     };
 }
 

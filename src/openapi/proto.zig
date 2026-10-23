@@ -950,7 +950,7 @@ test "Connect and transcoded forms per method" {
     // Annotated unary: transcoded GET, and a Connect form flagged annotated.
     const get = comptime findOp(ops, "Widgets_GetWidget").?;
     try testing.expectEqual(Operation.Kind.transcoded, get.kind);
-    try testing.expectEqualStrings("/v1/{name}", get.path);
+    try testing.expectEqualStrings("/v1/widgets/{name_1}", get.path);
     try testing.expectEqualStrings("Gets a widget.", get.op.summary.?);
     try testing.expectEqualStrings("It must exist.", get.op.description.?);
     const get_connect = comptime findOp(ops, "Widgets_GetWidget_connect").?;

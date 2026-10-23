@@ -53,6 +53,7 @@ const h3 = if (features.http3) @import("h3/root.zig") else struct {};
 const address_mod = @import("address.zig");
 const handlers = @import("handlers.zig");
 const typed = @import("typed.zig");
+const openapi_mod = if (features.openapi) @import("openapi/root.zig") else @import("openapi/off.zig");
 const banner_mod = @import("banner.zig");
 const anole_log = @import("anole_log");
 const log_mod = @import("log.zig");
@@ -692,9 +693,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pending: ?Options = null,
         /// The `Alt-Svc` middleware, once there is one.
         alt_svc: ?*AltSvc = null,
+        /// For tests: stands for ANOLE_OPENAPI_OUT / ANOLE_OPENAPI_CHECK.
+        _openapi_env: ?OpenApiEnv = null,
         /// What the one-line helpers made (`client`, `metrics`, `health`,
         /// `grpcHealth`, `tracing`, `staticDir`), freed with the server.
         extras: *Extras,
+
+        /// What `zig build openapi` and `openapi-check` pass the app.
+        pub const OpenApiEnv = struct { out: ?[]const u8 = null, check: ?[]const u8 = null };
 
         const Extras = struct {
             /// The outbound client (`client()`, `anole.client(req)`).
@@ -725,6 +731,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             failed_cause: ?[]const u8 = null,
             /// One certificate reload at a time.
             cert_mutex: std.Io.Mutex = .init,
+            /// The routes recorded for the OpenAPI document (`-Dopenapi`),
+            /// and what `app.openapi` asked for.
+            doc_entries: if (features.openapi) std.ArrayList(openapi_mod.Entry) else void = if (features.openapi) .empty else {},
+            openapi_options: if (features.openapi) ?openapi_mod.Options else void = if (features.openapi) null else {},
+            /// `serveOpenApi` could not build the document; `run` fails with it.
+            openapi_failed: if (features.openapi) ?anyerror else void = if (features.openapi) null else {},
         };
 
         /// A database connector the server made: when serving starts it
@@ -1686,7 +1698,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
             const copy = self.arena.allocator().create(T) catch @panic("OOM");
             copy.* = value;
-            const handle = http.Middleware(Ctx).init(copy);
+            var handle = http.Middleware(Ctx).init(copy);
+            // What the middleware tells the OpenAPI document.
+            if (comptime features.openapi) {
+                if (comptime openapi_mod.mw.infoOfType(T)) |info| handle.openapi = @ptrCast(info);
+            }
             self.owned_middleware.append(self.arena.allocator(), handle) catch @panic("OOM");
             return handle;
         }
@@ -1709,6 +1725,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// behind a `ResponseCache` of its own when it is `anole.cached`.
         fn register(self: *Self, target: anytype, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
             const H = @TypeOf(handler);
+            if (comptime features.openapi) if (method) |m| self.recordRoute(target, m, path, handler);
             if (comptime handlers.isCached(H)) {
                 var settings: ResponseCache.Options = H.cache_options;
                 // Named by its route in metrics.
@@ -1720,6 +1737,35 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 return g.addRouteWith(method, path, route(handler), handlers.routeOptions(handler));
             }
             target.addRouteWith(method, path, route(handler), handlers.routeOptions(handler));
+        }
+
+        /// Keeps the route for the OpenAPI document: its comptime-built
+        /// operation, its path and the documented middleware of its chain.
+        fn recordRoute(self: *Self, target: anytype, method: http.Method, path: []const u8, comptime handler: anytype) void {
+            if (comptime handlers.routeDoc(handler).hidden) return;
+            const verb = std.meta.stringToEnum(openapi_mod.operation.Verb, @tagName(method)) orelse return;
+            const a = self.arena.allocator();
+            const prefix = if (comptime @TypeOf(target) == *http.Router(Ctx)) "" else target.prefix;
+            const joined = std.fmt.allocPrint(a, "{s}{s}", .{ prefix, path }) catch @panic("OOM");
+            const op = comptime &openapi_mod.operation.forHandler(handler);
+            self.extras.doc_entries.append(a, .{
+                .verb = verb,
+                .path = openapi_mod.operation.openApiPathAlloc(a, joined) catch @panic("OOM"),
+                .op = op,
+                .middleware = self.chainDocs(target),
+            }) catch @panic("OOM");
+        }
+
+        /// The OpenAPI declarations of the middleware a route on `target`
+        /// runs behind, the server's first.
+        fn chainDocs(self: *Self, target: anytype) []const *const openapi_mod.mw.Info {
+            const a = self.arena.allocator();
+            var out: std.ArrayList(*const openapi_mod.mw.Info) = .empty;
+            const groups: []const http.Middleware(Ctx) = if (comptime @TypeOf(target) == *http.Router(Ctx)) &.{} else target.middlewares;
+            for ([_][]const http.Middleware(Ctx){ self.router.middlewares, groups }) |list| {
+                for (list) |m| if (m.openapi) |p| out.append(a, @ptrCast(@alignCast(p))) catch @panic("OOM");
+            }
+            return out.items;
         }
 
         /// A route whose path is known only at run time (from configuration):
@@ -2112,9 +2158,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// `grpcWith` on a router or one of its groups (`Group.grpc`).
         fn grpcOn(self: *Self, target: anytype, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
-            _ = self;
             if (comptime !features.grpc) @compileError("app.grpc needs gRPC (-Dgrpc, on in the full profile)");
             const Svc = if (@TypeOf(Service) == type) Service else Service(grpc_mod.Call, anyerror);
+            if (comptime features.openapi) self.recordGrpc(target, Svc, opts);
             const I = @TypeOf(impl);
             if (@typeInfo(I) == .pointer and @typeInfo(@typeInfo(I).pointer.child) == .@"struct") {
                 // Methods on a value: the registration carries the pointer
@@ -2126,6 +2172,28 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 grpc_mod.registerWith(Ctx, target, Svc, comptime declaredMethods(Svc, impl), opts);
             } else {
                 grpc_mod.registerWith(Ctx, target, Svc, comptime listedMethods(Svc, impl), opts);
+            }
+        }
+
+        /// Keeps the documented operations of `Svc` for the OpenAPI document.
+        /// Which forms appear (`Options.grpc`) is decided when it is built.
+        fn recordGrpc(self: *Self, target: anytype, comptime Svc: type, opts: grpc_mod.RegisterOptions) void {
+            const ops = comptime openapi_mod.proto.serviceOperations(Svc);
+            const a = self.arena.allocator();
+            const chain = self.chainDocs(target);
+            inline for (0..ops.len) |i| {
+                const wanted = ops[i].kind != .transcoded or opts.transcode;
+                if (wanted) {
+                    const op: *const openapi_mod.operation.Operation = comptime &ops[i].op;
+                    self.extras.doc_entries.append(a, .{
+                        .verb = ops[i].verb,
+                        .path = ops[i].path,
+                        .op = op,
+                        .middleware = chain,
+                        .annotated = ops[i].annotated,
+                        .tag_doc = comptime openapi_mod.proto.serviceDoc(Svc),
+                    }) catch @panic("OOM");
+                }
             }
         }
 
@@ -2204,6 +2272,107 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             extras.routes_added = true;
             if (extras.metrics) |r| r.serveOnListener(Ctx, self.router, extras.metrics_path, extras.metrics_listener);
             if (extras.health) |h| h.registerOn(Ctx, self.router, self.server);
+            if (comptime features.openapi) self.serveOpenApi();
+        }
+
+        /// Serves the OpenAPI document of this server's routes at
+        /// `opts.path` and the Scalar page at `opts.page`, when `opts.serve`
+        /// allows (by default in development only). Call it any time before
+        /// `run`/`listen`. The document is built once when serving starts, so
+        /// a schema-name clash stops the start (`error.OpenApiNameClash`,
+        /// with both type names in the log).
+        pub fn openapi(self: *Self, opts: openapi_mod.Options) void {
+            if (comptime !features.openapi) @compileError("app.openapi needs -Dopenapi (on in the web and full profiles)");
+            self.extras.openapi_options = opts;
+        }
+
+        /// The document as `run` would serve it, in `gpa`'s memory (caller
+        /// frees), for tests and tools. Works whether or not `openapi` was
+        /// called (default options then).
+        pub fn openapiDocument(self: *Self, gpa: std.mem.Allocator) openapi_mod.BuildError![]u8 {
+            if (comptime !features.openapi) @compileError("app.openapiDocument needs -Dopenapi (on in the web and full profiles)");
+            const opts = self.extras.openapi_options orelse openapi_mod.Options{};
+            return openapi_mod.document.build(gpa, self.extras.doc_entries.items, opts, self.server.config.errors, errors.log);
+        }
+
+        fn serveOpenApi(self: *Self) void {
+            const opts = self.extras.openapi_options orelse return;
+            const on = switch (opts.serve) {
+                .always => true,
+                .development => self.mode.environment == .development,
+                .never => false,
+            };
+            if (!on) return;
+            const a = self.arena.allocator();
+            const doc = self.openapiDocument(self.gpa) catch |err| {
+                // `run` reports it again as the start's error.
+                self.extras.openapi_failed = err;
+                return;
+            };
+            defer self.gpa.free(doc);
+            const data = a.dupe(u8, doc) catch @panic("OOM");
+            var chain: [1]http.Middleware(Ctx) = undefined;
+            var n: usize = 0;
+            if (opts.listener) |name| {
+                const only = a.create(OnlyOn) catch @panic("OOM");
+                only.* = onlyOn(name);
+                chain[0] = http.Middleware(Ctx).init(only);
+                n = 1;
+            }
+            const g = self.router.group("", chain[0..n]);
+            g.embedded(opts.path, data, .{ .content_type = .json, .cache_control = "no-cache" });
+            if (opts.page) |page_path| {
+                const html = openapi_mod.page.render(self.gpa, opts.info.title, opts.path) catch @panic("OOM");
+                defer self.gpa.free(html);
+                g.embedded(page_path, a.dupe(u8, html) catch @panic("OOM"), .{ .content_type = .html, .cache_control = "no-cache" });
+            }
+            std.log.scoped(.anole).info("openapi: {s} and {s} (development only unless serve = .always)", .{ opts.path, opts.page orelse "(no page)" });
+        }
+
+        /// ANOLE_OPENAPI_OUT / ANOLE_OPENAPI_CHECK: the real environment
+        /// only, never a `.env` file.
+        fn openapiEnv(self: *const Self) OpenApiEnv {
+            if (self._openapi_env) |e| return e;
+            const environ = if (self.process) |p| p.environ else null;
+            const url = @import("db/url.zig");
+            return .{ .out = url.realEnv(environ, "ANOLE_OPENAPI_OUT"), .check = url.realEnv(environ, "ANOLE_OPENAPI_CHECK") };
+        }
+
+        /// `zig build openapi` / `openapi-check`: writes or compares the
+        /// document, before anything binds or starts.
+        fn openapiTool(self: *Self, env: OpenApiEnv) !void {
+            const log = errors.log;
+            if (comptime !features.openapi) return self.failStart(error.OpenApiNotBuilt);
+            if (self.router.conflict != null) return self.failStart(error.RouteConflict);
+            const doc = self.openapiDocument(self.gpa) catch |err| return self.failStart(errors.toServerError(err));
+            defer self.gpa.free(doc);
+            const io_ = self.rt.io();
+            const cwd = std.Io.Dir.cwd();
+            if (env.out) |path| {
+                const tmp = std.fmt.allocPrint(self.gpa, "{s}.tmp", .{path}) catch return self.failStart(error.OutOfMemory);
+                defer self.gpa.free(tmp);
+                cwd.writeFile(io_, .{ .sub_path = tmp, .data = doc }) catch |err| {
+                    log.err("openapi: can't write {s}: {t}", .{ path, err });
+                    return self.failStart(error.AccessDenied);
+                };
+                cwd.rename(tmp, cwd, path, io_) catch |err| {
+                    log.err("openapi: can't write {s}: {t}", .{ path, err });
+                    return self.failStart(error.AccessDenied);
+                };
+                var paths: usize = 0;
+                for (self.extras.doc_entries.items) |_| paths += 1;
+                log.info("openapi: wrote {s} ({d} operations)", .{ path, paths });
+                return;
+            }
+            if (env.check) |path| {
+                const have = cwd.readFileAlloc(io_, path, self.gpa, .limited(64 << 20)) catch "";
+                defer if (have.len > 0) self.gpa.free(have);
+                if (!std.mem.eql(u8, have, doc)) {
+                    log.err("openapi: {s} is out of date; run `zig build openapi`", .{path});
+                    return self.failStart(error.OpenApiOutOfDate);
+                }
+                log.info("openapi: {s} is up to date", .{path});
+            }
         }
 
         /// The standard gRPC health service (grpc.health.v1), owned by the
@@ -2623,10 +2792,20 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         fn runInner(self: *Self) !void {
             if (self.pending) |opts| try self.configure(opts);
+            // `zig build openapi` and `openapi-check`: before the banner, the
+            // helper routes, any listener or connector.
+            {
+                const env = self.openapiEnv();
+                if (env.out != null or env.check != null) return self.openapiTool(env);
+            }
             self.printBanner();
             self.logModes();
             logBuildMode(self.mode.debug_production);
             self.addHelperRoutes();
+            if (comptime features.openapi) if (self.extras.openapi_failed) |err| {
+                errors.log.err("openapi: the document can't be built: {t}", .{err});
+                return self.failStart(errors.toServerError(err));
+            };
             // Only with `router.record_conflicts` (the C ABI, test builds): a
             // route that conflicted with another, or that the helper routes
             // collided with.

@@ -9,6 +9,7 @@
 //!     policy.allows("editor", "posts:write") // true
 const std = @import("std");
 const dusty = @import("dusty");
+const declarations = @import("../openapi/declarations.zig");
 
 /// A named role: the permissions it grants (`*` and `area:*` allowed) and
 /// the roles whose grants it also has.
@@ -71,6 +72,11 @@ pub const Roles = struct {
 ///
 ///     var can_write = anole.auth.rbac.Require.init(&policy, "notes:write", .{ .ptr = &app, .roles = rolesOf });
 pub const Require = struct {
+    /// What the OpenAPI document says of a route behind it.
+    pub const openapi: declarations.MiddlewareDoc = .{
+        .responses = .{ .forbidden = .{ .description = "The caller's roles lack the permission" } },
+    };
+
     policy: *const Policy,
     permission: []const u8,
     roles: Roles,
