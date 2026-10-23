@@ -402,7 +402,7 @@ test "lambda event: REST GET" {
     try testing.expectEqualStrings("{\r\n\t\"a\": 1\r\n}", in.body);
 
     const single = try parseFixture(arena_state.allocator(), "apigw_proxy_request", .{});
-    try testing.expectEqualStrings("/hello", single.target);
+    try testing.expectEqualStrings("/hello?name=me", single.target);
     try testing.expectEqualStrings("test", single.stage.?);
 }
 
