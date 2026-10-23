@@ -5,6 +5,7 @@
 //! `Authorization: Bearer ak_...`, and asks a lookup for its owner.
 const std = @import("std");
 const dusty = @import("dusty");
+const declarations = @import("../openapi/declarations.zig");
 
 /// What every generated key starts with. `fromRequest` takes an
 /// `Authorization: Bearer` token as a key only when it has this prefix, so
@@ -77,6 +78,18 @@ pub fn owner(req: *const dusty.Request) ?[]const u8 {
 /// `WWW-Authenticate: Bearer` without one. The owner goes into the
 /// request's locals, for the handler to read with `owner(req)`.
 pub const Middleware = struct {
+    /// What the OpenAPI document says of a route behind it. `fromRequest`
+    /// also takes `Authorization: Bearer <prefix>...`.
+    pub const openapi: declarations.MiddlewareDoc = .{
+        .security_schemes = &.{.{
+            .name = "apiKey",
+            .description = "An API key, in X-API-Key or as Authorization: Bearer <key>.",
+            .kind = .{ .api_key = .{ .in = .header, .param = "X-API-Key" } },
+        }},
+        .security = .any,
+        .responses = .{ .unauthorized = .{ .description = "Missing or unknown API key" } },
+    };
+
     lookup: Lookup,
 
     /// A middleware that asks `lookup` for the owner of each request's key.

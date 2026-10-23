@@ -14,10 +14,9 @@ pub const ResponseDoc = declarations.ResponseDoc;
 
 /// A function middleware with a `MiddlewareDoc`: in a build without
 /// `-Dopenapi` the document is dropped and the function is the middleware.
-/// (The tooling lane's second part makes this `anole.func(f)`.)
-pub fn middleware(comptime doc: MiddlewareDoc, comptime f: anytype) @TypeOf(f) {
-    _ = doc;
-    return f;
+pub fn middleware(comptime d: MiddlewareDoc, comptime f: anytype) @import("../handlers.zig").Func(f) {
+    _ = d;
+    return .{};
 }
 
 test {

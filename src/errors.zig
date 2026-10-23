@@ -16,6 +16,10 @@ pub const ServerError = error{
     InvalidEnvFile,
     DeploymentUnavailable,
     ProxyProtocolNoPeers,
+    // The OpenAPI document (`app.openapi`, `zig build openapi`)
+    OpenApiNameClash,
+    OpenApiOutOfDate,
+    OpenApiNotBuilt,
     NoProtocols,
     SeveralHttp3Listeners,
     Http3NeedsTls,
@@ -279,6 +283,23 @@ pub fn explain(err: ServerError, ctx: Context, w: *std.Io.Writer) std.Io.Writer.
             try w.writeAll(ctx.detail orelse "two of them conflict, or one is malformed");
             try w.writeAll(".");
             try fix(w, "Change the path or the method of one of them; a parameter at one position has one name.");
+        },
+        error.OpenApiNameClash => {
+            try w.writeAll("can't build the OpenAPI document: two types or security schemes have the same name.");
+            try fix(w, "The log names both. Name one with pub const openapi: anole.openapi.Doc(@This()) = .{ .name = \"...\" }, or with app.openapi(.{ .rename = ... }).");
+        },
+        error.OpenApiOutOfDate => {
+            try w.writeAll("the OpenAPI file ");
+            if (ctx.path) |p| {
+                try w.writeAll(p);
+                try w.writeAll(" ");
+            }
+            try w.writeAll("does not match the app's routes.");
+            try fix(w, "Run `zig build openapi` to write it again, and commit the result.");
+        },
+        error.OpenApiNotBuilt => {
+            try w.writeAll("can't write or check the OpenAPI file: this build leaves OpenAPI out (-Dopenapi=false).");
+            try fix(w, "Build with -Dopenapi (on in the web and full profiles), or drop the openapi steps from build.zig.");
         },
         error.HqInteropNotAllowed => {
             try w.writeAll("can't serve the hq-interop test protocol from this program.");

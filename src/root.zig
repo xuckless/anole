@@ -203,6 +203,13 @@ pub const WithStatus = @import("typed.zig").WithStatus;
 /// such as OpenAPI): `anole.routeInfo(handler)`.
 pub const RouteInfo = @import("typed.zig").RouteInfo;
 pub const routeInfo = @import("typed.zig").routeInfo;
+
+/// A route's texts for the OpenAPI document (summary, tags, ...) and, for a
+/// plain (req, res) handler, its body and response types:
+/// `app.get("/health", anole.doc(.{ .summary = "Liveness" }, health));`
+/// Combines with `noWait` and `cached` in any order. Compiles (and is
+/// ignored) in builds without -Dopenapi.
+pub const doc = @import("handlers.zig").doc;
 /// One problem in a request's input; `req.violations()`.
 pub const Violation = http.Violation;
 pub const Violations = http.Violations;
@@ -365,6 +372,8 @@ pub const grpc = if (features.grpc) @import("grpc/root.zig") else struct {};
 /// build without it, only the declaration types are present, so
 /// `pub const openapi: anole.openapi.Doc(@This()) = ...` compiles in every
 /// profile. Types: `Doc`, `FieldDoc`, `Example`, `MiddlewareDoc`, `RouteDoc`.
+/// `app.openapi(.{})` serves /openapi.json and /docs in development;
+/// `zig build openapi` writes the file.
 pub const openapi = if (features.openapi) @import("openapi/root.zig") else @import("openapi/off.zig");
 
 /// Auth (`-Dauth`): JWT/JWKS verification and signing, OIDC, CSRF,

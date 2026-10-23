@@ -10,6 +10,7 @@
 //!     // in a form: <input type="hidden" name="_csrf" value="{token}">, token = try anole.auth.csrf.token(req)
 const std = @import("std");
 const dusty = @import("dusty");
+const declarations = @import("../openapi/declarations.zig");
 
 /// The session key the token is kept under.
 pub const session_key = @import("../session/root.zig").csrf_key;
@@ -42,6 +43,11 @@ pub const Options = struct {
 /// form field) and answers 403 when it is missing or wrong. Other methods
 /// pass through.
 pub const Middleware = struct {
+    /// What the OpenAPI document says of a route behind it.
+    pub const openapi: declarations.MiddlewareDoc = .{
+        .responses = .{ .forbidden = .{ .description = "Missing or wrong CSRF token" } },
+    };
+
     config: Options,
 
     pub fn init(config: Options) Middleware {

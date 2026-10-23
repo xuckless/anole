@@ -48,6 +48,10 @@ pub fn Middleware(comptime Ctx: type) type {
         no_wait: bool = false,
         /// `@typeName` of the middleware, for messages.
         name: []const u8 = "",
+        /// What the middleware tells the OpenAPI document: a pointer to
+        /// Anole's own record of its `pub const openapi` (set by
+        /// `Server.middleware`; this core does not read it).
+        openapi: ?*const anyopaque = null,
 
         /// A handle on `impl`, a pointer to a middleware value that must
         /// outlive the router.
@@ -264,6 +268,21 @@ pub fn errorStatus(err: anyerror) ?http.Status {
         error.BadPathName => .not_found,
         else => status_errors.get(@errorName(err)),
     };
+}
+
+/// `errorStatus` for the error named `name`, at compile time (the OpenAPI
+/// document lists the statuses a handler's error set can answer with).
+pub fn comptimeErrorStatus(comptime name: []const u8) ?u16 {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "BodyTooBig")) return 413;
+    if (eql(u8, name, "CircuitOpen")) return 503;
+    if (eql(u8, name, "UnsupportedContentEncoding")) return 415;
+    if (eql(u8, name, "InvalidZstd") or eql(u8, name, "IncompleteBody") or eql(u8, name, "MalformedBody") or
+        eql(u8, name, "InvalidJsonBody") or eql(u8, name, "MissingBody")) return 400;
+    if (eql(u8, name, "ValidationFailed")) return 422;
+    if (eql(u8, name, "BadPathName")) return 404;
+    const status = status_errors.get(name) orelse return null;
+    return @backingInt(status);
 }
 
 /// `errorStatus` with the body the default answer sends in text form
