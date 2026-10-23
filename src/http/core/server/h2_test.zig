@@ -1570,3 +1570,57 @@ test "parked h2: the connection closing with a parked stream tells the owner, an
     try std.testing.expectEqual(@as(u32, 1), ParkProbe.gone_calls.load(.monotonic));
     ParkProbe.parked.?.release();
 }
+
+test "parked h2: the connection closing with a burst blocked on a full outbox: the burst fails, gone comes after it, teardown waits for release" {
+    const io = std.testing.io;
+    ParkProbe.reset();
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    fx.server.router.get("/live", ParkProbe.handle);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    _ = try client.request("GET", "/live", null);
+    try ParkProbe.flushClient(&client);
+    try ParkProbe.opened.wait(io);
+
+    // The client reads nothing: no WINDOW_UPDATE, so past the stream's
+    // window and the 1 MiB outbox the burst waits for room.
+    const Writer = struct {
+        written: std.atomic.Value(u32) = .init(0),
+        failed: ?dusty.Parked.WriteError = null,
+        gone_before_end: u32 = 0,
+        fn run(self: *@This(), p: *dusty.Parked) void {
+            if (!p.begin()) return;
+            const chunk: [16 * 1024]u8 = @splat('x');
+            while (true) {
+                p.write(&.{&chunk}) catch |err| {
+                    self.failed = err;
+                    break;
+                };
+                _ = self.written.fetchAdd(1, .release);
+            }
+            // No `gone` during the burst: it is deferred to its end.
+            self.gone_before_end = ParkProbe.gone_calls.load(.acquire);
+            p.endBurst();
+        }
+    };
+    var w: Writer = .{};
+    var writing = try io.concurrent(Writer.run, .{ &w, ParkProbe.parked.? });
+    // 1 MiB + 64 KiB fills the outbox and the window: wait until most of it
+    // is written, then close the connection under the waiting burst.
+    var polls: usize = 0;
+    while (w.written.load(.acquire) < 66) : (polls += 1) {
+        if (polls > 10_000) return error.Timeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    client.deinit();
+    writing.await(io);
+    try std.testing.expect(w.failed != null);
+    try std.testing.expectEqual(@as(u32, 0), w.gone_before_end);
+    try ParkProbe.gone.wait(io);
+    try std.testing.expectEqual(@as(u32, 1), ParkProbe.gone_calls.load(.monotonic));
+    try std.testing.expect(!ParkProbe.parked.?.begin());
+    ParkProbe.parked.?.release();
+}
