@@ -744,7 +744,7 @@ test "pg: iterate over a bare BEGIN fails left-open; acquire released in a trans
     const level = quiet();
     defer testing.log_level = level;
     {
-        var rows = try d.iterate(void, &c, "BEGIN", .{});
+        var rows = try d.iterate(struct {}, &c, "BEGIN", .{});
         defer rows.deinit();
         try testing.expectError(error.Database, rows.next());
         try testing.expect(std.mem.indexOf(u8, db.lastError(&c).?.message, "left a transaction open") != null);

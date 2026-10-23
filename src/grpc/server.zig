@@ -1508,7 +1508,7 @@ test "grpc: fail copies its message" {
     var call: Call = .{ .req = undefined, .res = undefined, .arena = arena.allocator(), .io = undefined, .ctx = null, .impl = .{ .max_message_size = 0 } };
     var buf: [16]u8 = undefined;
     const msg = try std.fmt.bufPrint(&buf, "no user {d}", .{7});
-    try std.testing.expectError(error.GrpcStatus, call.fail(.not_found, msg));
+    try std.testing.expect(call.fail(.not_found, msg) == error.GrpcStatus);
     @memset(&buf, 'x');
     try std.testing.expectEqualStrings("no user 7", call.status_message);
 }
@@ -1517,7 +1517,7 @@ test "grpc: failFmt" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     var call: Call = .{ .req = undefined, .res = undefined, .arena = arena.allocator(), .io = undefined, .ctx = null, .impl = .{ .max_message_size = 0 } };
-    try std.testing.expectError(error.GrpcStatus, call.failFmt(.not_found, "no user {d}", .{42}));
+    try std.testing.expect(call.failFmt(.not_found, "no user {d}", .{42}) == error.GrpcStatus);
     try std.testing.expectEqualStrings("no user 42", call.status_message);
     try std.testing.expectEqual(Code.not_found, call.status);
 }

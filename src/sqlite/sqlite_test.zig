@@ -937,7 +937,7 @@ test "sqlite: iterate over a bare BEGIN fails left-open and rolls back" {
     _ = try db.exec(ctx, schema, .{});
     const level = quiet();
     defer testing.log_level = level;
-    var rows = try db.with(.{ .write = true }).iterate(void, ctx, "BEGIN", .{});
+    var rows = try db.with(.{ .write = true }).iterate(struct {}, ctx, "BEGIN", .{});
     defer rows.deinit();
     try testing.expectError(error.Database, rows.next());
     try testing.expect(std.mem.indexOf(u8, anole_db.lastError(ctx).?.message, "left a transaction open") != null);
@@ -956,7 +956,7 @@ test "sqlite: Rows deinit inside an open transaction rolls back" {
     _ = try db.exec(ctx, schema, .{});
     const level = quiet();
     defer testing.log_level = level;
-    var rows = try db.with(.{ .write = true }).iterate(void, ctx, "BEGIN", .{});
+    var rows = try db.with(.{ .write = true }).iterate(struct {}, ctx, "BEGIN", .{});
     rows.deinit();
     try testing.expectEqual(@as(u64, 1), try db.exec(ctx, "INSERT INTO notes (title) VALUES ('x')", .{}));
     try testing.expectEqual(@as(i64, 1), c.sqlite3_get_autocommit(db.writer.conn.handle.db));
@@ -1041,8 +1041,8 @@ test "sqlite: Options.timeout bounds a plain call and .max lifts it" {
     const ctx = &s.ctx;
     const level = quiet();
     defer testing.log_level = level;
-    const forever = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000000000) SELECT count(*) FROM n";
-    try testing.expectError(error.GatewayTimeout, db.one(i64, ctx, forever, .{}));
+    const endless = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000000000) SELECT count(*) FROM n";
+    try testing.expectError(error.GatewayTimeout, db.one(i64, ctx, endless, .{}));
     const small = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 100000) SELECT count(*) FROM n";
     try testing.expectEqual(@as(i64, 100000), try db.with(.{ .timeout = .max }).one(i64, ctx, small, .{}));
 }

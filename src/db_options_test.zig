@@ -8,16 +8,14 @@ const db = anole.db;
 
 const Duration = std.Io.Duration;
 
-fn connectors() []const type {
-    comptime {
-        var list: []const type = &.{};
-        if (features.postgres) list = list ++ [_]type{anole.pg.Options};
-        if (features.sqlite) list = list ++ [_]type{anole.sqlite.Options};
-        if (features.redis) list = list ++ [_]type{anole.redis.Options};
-        if (features.mongodb) list = list ++ [_]type{anole.mongodb.Options};
-        return list;
-    }
-}
+const connectors: []const type = blk: {
+    var list: []const type = &.{};
+    if (features.postgres) list = list ++ [_]type{anole.pg.Options};
+    if (features.sqlite) list = list ++ [_]type{anole.sqlite.Options};
+    if (features.redis) list = list ++ [_]type{anole.redis.Options};
+    if (features.mongodb) list = list ++ [_]type{anole.mongodb.Options};
+    break :blk list;
+};
 
 test "db: the connectors' options agree" {
     const shared = .{
@@ -34,18 +32,16 @@ test "db: the connectors' options agree" {
         .{ "connect_at_start", bool },
         .{ "acquire_timeout", Duration },
     };
-    inline for (connectors()) |Options| {
+    inline for (connectors) |Options| {
         inline for (shared) |entry| {
             if (@hasField(Options, entry[0])) {
                 const T = @FieldType(Options, entry[0]);
-                // The one exception: MongoDB's acquire timeout and sizes keep
-                // their own defaults but not their types.
                 try std.testing.expect(T == entry[1]);
             }
         }
-        inline for (@typeInfo(Options).@"struct".fields) |f| {
-            try std.testing.expect(!std.mem.endsWith(u8, f.name, "_ms"));
-            try std.testing.expect(!std.mem.endsWith(u8, f.name, "_seconds"));
+        inline for (@typeInfo(Options).@"struct".field_names) |name| {
+            try std.testing.expect(!std.mem.endsWith(u8, name, "_ms"));
+            try std.testing.expect(!std.mem.endsWith(u8, name, "_seconds"));
         }
     }
 }

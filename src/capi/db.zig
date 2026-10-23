@@ -893,7 +893,7 @@ pub const TxSlot = struct {
 };
 
 fn cutTx(tied: *Tied) void {
-    const t: *TxSlot = @fieldParentPtr("tied", tied);
+    const t: *TxSlot = @alignCast(@fieldParentPtr("tied", tied));
     if (t.done) return;
     t.setEnd(.request);
     t.wake();
@@ -1152,8 +1152,8 @@ fn txTask(x: *Exec, t: *TxSlot, st: TxStart) std.Io.Cancelable!void {
     defer begin_arena.deinit();
     var bctx: db.Ctx = .{ .io = io, .arena = begin_arena.allocator() };
 
-    const ms: u32 = if (st.timeout_ms == abi.DB_TIMEOUT_NONE) 0 else if (st.timeout_ms > 0) st.timeout_ms else t.d.config.timeout_ms;
-    if (ms > 0) t.deadline = nowNs(io) + @as(i96, ms) * std.time.ns_per_ms;
+    const bound_ms: u32 = if (st.timeout_ms == abi.DB_TIMEOUT_NONE) 0 else if (st.timeout_ms > 0) st.timeout_ms else t.d.config.timeout_ms;
+    if (bound_ms > 0) t.deadline = nowNs(io) + @as(i96, bound_ms) * std.time.ns_per_ms;
 
     var any: ?AnyTx = null;
     if (t.endNow() == .none and t.d.open.load(.acquire)) {
