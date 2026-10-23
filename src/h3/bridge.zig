@@ -4,6 +4,7 @@
 //! examples/http3_server_proto_codec.cc and http3_client_proto_codec.cc
 //! (MIT).
 const std = @import("std");
+const builtin = @import("builtin");
 const ngtcp2 = @import("ngtcp2.zig");
 const nghttp3 = @import("nghttp3.zig");
 const webtransport = @import("webtransport.zig");
@@ -158,6 +159,536 @@ pub fn closeStream(side: Side, flags: u32, stream_id: i64, rx_code: u64, tx_code
         return c.NGTCP2_ERR_CALLBACK_FAILURE;
     }
     return 0;
+}
+
+// -- Block-backed queues ------------------------------------------------------
+
+pub const block_size = 4096;
+
+/// One allocation: the link and the bytes behind it.
+pub const Block = struct {
+    next: ?*Block,
+    data: [block_size - @sizeOf(?*Block)]u8,
+};
+const block_data = @sizeOf(@FieldType(Block, "data"));
+
+/// Free blocks of one endpoint (or one client connection). All users run on
+/// the owner's executor; the spin lock only keeps other Io's safe.
+pub const BlockPool = struct {
+    gpa: std.mem.Allocator,
+    lock: std.atomic.Mutex = .unlocked,
+    free: ?*Block = null,
+    free_count: u32 = 0,
+    /// Blocks kept for reuse; the rest go back to the allocator.
+    keep: u32,
+    /// Blocks handed out and not yet returned.
+    live: std.atomic.Value(u32) = .init(0),
+
+    pub fn init(gpa: std.mem.Allocator, keep: u32) BlockPool {
+        return .{ .gpa = gpa, .keep = keep };
+    }
+
+    fn acquire(p: *BlockPool) void {
+        while (!p.lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    pub fn get(p: *BlockPool) error{OutOfMemory}!*Block {
+        p.acquire();
+        if (p.free) |b| {
+            p.free = b.next;
+            p.free_count -= 1;
+            p.lock.unlock();
+            b.next = null;
+            _ = p.live.fetchAdd(1, .monotonic);
+            return b;
+        }
+        p.lock.unlock();
+        const b = try p.gpa.create(Block);
+        b.next = null;
+        _ = p.live.fetchAdd(1, .monotonic);
+        return b;
+    }
+
+    pub fn put(p: *BlockPool, b: *Block) void {
+        _ = p.live.fetchSub(1, .monotonic);
+        p.acquire();
+        if (p.free_count < p.keep) {
+            b.next = p.free;
+            p.free = b;
+            p.free_count += 1;
+            p.lock.unlock();
+            return;
+        }
+        p.lock.unlock();
+        p.gpa.destroy(b);
+    }
+
+    pub fn pooled(p: *BlockPool) u32 {
+        p.acquire();
+        defer p.lock.unlock();
+        return p.free_count;
+    }
+
+    pub fn deinit(p: *BlockPool) void {
+        var it = p.free;
+        while (it) |b| {
+            it = b.next;
+            p.gpa.destroy(b);
+        }
+        p.free = null;
+        p.free_count = 0;
+    }
+};
+
+/// A wait point with a sleeper count, so a notify nobody waits for costs one
+/// atomic add and one load (no futex bucket lock).
+pub const Signal = struct {
+    gen: std.atomic.Value(u32) = .init(0),
+    sleepers: std.atomic.Value(u32) = .init(0),
+    /// Test builds: how many waits returned.
+    returns: std.atomic.Value(u32) = .init(0),
+    /// Test builds: futex wake calls made.
+    wakes: std.atomic.Value(u32) = .init(0),
+
+    /// Read this BEFORE checking the state it guards.
+    pub fn epoch(s: *const Signal) u32 {
+        return s.gen.load(.acquire);
+    }
+
+    /// Sleeps until `notify` after `seen`.
+    pub fn wait(s: *Signal, io: std.Io, seen: u32) std.Io.Cancelable!void {
+        _ = s.sleepers.fetchAdd(1, .seq_cst);
+        defer {
+            _ = s.sleepers.fetchSub(1, .seq_cst);
+            if (builtin.is_test) _ = s.returns.fetchAdd(1, .monotonic);
+        }
+        try io.futexWait(u32, &s.gen.raw, seen);
+    }
+
+    pub fn notify(s: *Signal, io: std.Io) void {
+        _ = s.gen.fetchAdd(1, .seq_cst);
+        if (s.sleepers.load(.seq_cst) > 0) {
+            if (builtin.is_test) _ = s.wakes.fetchAdd(1, .monotonic);
+            io.futexWake(u32, &s.gen.raw, std.math.maxInt(u32));
+        }
+    }
+};
+
+/// Bytes a connection holds unacknowledged across all its send queues.
+pub const Budget = struct {
+    used: usize = 0,
+    max: usize = 4 << 20,
+    waiting: std.DoublyLinkedList = .{},
+    io: std.Io,
+
+    pub const Waiter = struct {
+        node: std.DoublyLinkedList.Node = .{},
+        signal: *Signal,
+        linked: bool = false,
+    };
+
+    pub fn init(io: std.Io, max: usize) Budget {
+        return .{ .io = io, .max = max };
+    }
+
+    pub fn room(b: *const Budget) usize {
+        return b.max -| b.used;
+    }
+
+    pub fn charge(b: *Budget, n: usize) void {
+        b.used += n;
+    }
+
+    /// Frees `n` and wakes every writer waiting for room.
+    pub fn release(b: *Budget, n: usize) void {
+        b.used -= @min(n, b.used);
+        while (b.waiting.popFirst()) |node| {
+            const w: *Waiter = @alignCast(@fieldParentPtr("node", node));
+            w.linked = false;
+            w.signal.notify(b.io);
+        }
+    }
+
+    pub fn link(b: *Budget, w: *Waiter) void {
+        if (w.linked) return;
+        w.linked = true;
+        b.waiting.append(&w.node);
+    }
+
+    pub fn unlink(b: *Budget, w: *Waiter) void {
+        if (!w.linked) return;
+        w.linked = false;
+        b.waiting.remove(&w.node);
+    }
+};
+
+/// Send data until the peer acknowledges it. Offsets only grow: [acked,
+/// sent) is handed to ngtcp2/nghttp3 (they point into it) and [sent,
+/// written) is not yet. Blocks are freed as `acked` passes their end; when
+/// acked == written every block goes (an idle stream holds none). Only the
+/// tail block is partly filled, so offsets map to blocks by arithmetic.
+pub const SendQueue = struct {
+    head: ?*Block = null,
+    tail: ?*Block = null,
+    /// Stream offset of head.data[0] and tail.data[0].
+    head_base: u64 = 0,
+    tail_base: u64 = 0,
+    /// A block at or before the one holding `sent` (null: start at head).
+    cursor: ?*Block = null,
+    cursor_base: u64 = 0,
+    acked: u64 = 0,
+    sent: u64 = 0,
+    written: u64 = 0,
+
+    pub fn buffered(q: *const SendQueue) u64 {
+        return q.written - q.acked;
+    }
+
+    pub fn pending(q: *const SendQueue) u64 {
+        return q.written - q.sent;
+    }
+
+    pub fn allSent(q: *const SendQueue) bool {
+        return q.sent == q.written;
+    }
+
+    /// Copies what fits under `cap` and the budget; returns how much. `force`
+    /// ignores both (inline answers, capsules, stream prefixes) but still
+    /// charges the budget.
+    pub fn write(q: *SendQueue, pool: *BlockPool, budget: *Budget, bytes: []const u8, cap: usize, force: bool) error{OutOfMemory}!usize {
+        var want = bytes.len;
+        if (!force) {
+            want = @min(want, cap -| @as(usize, @intCast(q.buffered())));
+            want = @min(want, budget.room());
+        }
+        var done: usize = 0;
+        while (done < want) {
+            if (q.tail == null or q.written - q.tail_base == block_data) {
+                const b = pool.get() catch {
+                    budget.charge(done);
+                    if (done > 0) return done;
+                    return error.OutOfMemory;
+                };
+                if (q.tail) |t| {
+                    t.next = b;
+                    q.tail_base += block_data;
+                } else {
+                    q.head = b;
+                    q.head_base = q.written;
+                    q.tail_base = q.written;
+                }
+                q.tail = b;
+            }
+            const t = q.tail.?;
+            const fill: usize = @intCast(q.written - q.tail_base);
+            const n = @min(want - done, block_data - fill);
+            @memcpy(t.data[fill..][0..n], bytes[done..][0..n]);
+            q.written += n;
+            done += n;
+        }
+        budget.charge(done);
+        return done;
+    }
+
+    /// The block holding offset `off` (>= acked), and its base.
+    fn blockAt(q: *SendQueue, off: u64) ?struct { *Block, u64 } {
+        var b = q.cursor orelse q.head orelse return null;
+        var base = if (q.cursor != null) q.cursor_base else q.head_base;
+        if (base > off) {
+            b = q.head.?;
+            base = q.head_base;
+        }
+        while (off >= base + block_data) {
+            b = b.next orelse return null;
+            base += block_data;
+        }
+        q.cursor = b;
+        q.cursor_base = base;
+        return .{ b, base };
+    }
+
+    /// What is written and not yet sent, in up to `runs.len` runs, leaving
+    /// `sent` where it is.
+    pub fn unsent(q: *SendQueue, runs: *[4][]const u8) usize {
+        var count: usize = 0;
+        var from = q.sent;
+        if (from >= q.written) return 0;
+        var cur = q.blockAt(from) orelse return 0;
+        while (from < q.written and count < runs.len) {
+            const off: usize = @intCast(from - cur[1]);
+            const k: usize = @intCast(@min(@as(u64, block_data - off), q.written - from));
+            runs[count] = cur[0].data[off..][0..k];
+            count += 1;
+            from += k;
+            if (from < q.written) {
+                cur = .{ cur[0].next orelse break, cur[1] + block_data };
+            }
+        }
+        return count;
+    }
+
+    pub fn advance(q: *SendQueue, n: usize) void {
+        q.sent += n;
+    }
+
+    /// Hands what is unsent to nghttp3 in up to `veccnt` runs and marks it
+    /// sent. Returns the vector count.
+    pub fn take(q: *SendQueue, vec: [*c]h.nghttp3_vec, veccnt: usize) usize {
+        var count: usize = 0;
+        var runs: [4][]const u8 = undefined;
+        while (count < veccnt and q.sent < q.written) {
+            const k = q.unsent(&runs);
+            if (k == 0) break;
+            for (runs[0..k]) |run| {
+                if (count >= veccnt) break;
+                vec[count] = .{ .base = @constCast(run.ptr), .len = run.len };
+                count += 1;
+                q.sent += run.len;
+            }
+        }
+        return count;
+    }
+
+    /// The peer acknowledged `n` more bytes: frees the blocks passed.
+    pub fn ack(q: *SendQueue, pool: *BlockPool, budget: *Budget, n: u64) void {
+        const m = @min(n, q.written - q.acked);
+        q.acked += m;
+        if (q.acked == q.written) {
+            q.freeAll(pool);
+            q.head_base = q.written;
+            q.tail_base = q.written;
+        } else {
+            while (q.head) |b| {
+                if (q.acked < q.head_base + block_data) break;
+                q.head = b.next;
+                q.head_base += block_data;
+                if (q.cursor == b) {
+                    q.cursor = b.next;
+                    q.cursor_base += block_data;
+                }
+                pool.put(b);
+            }
+        }
+        budget.release(m);
+    }
+
+    fn freeAll(q: *SendQueue, pool: *BlockPool) void {
+        var it = q.head;
+        while (it) |b| {
+            it = b.next;
+            pool.put(b);
+        }
+        q.head = null;
+        q.tail = null;
+        q.cursor = null;
+    }
+
+    /// Returns every block and the whole charge.
+    pub fn deinit(q: *SendQueue, pool: *BlockPool, budget: *Budget) void {
+        q.freeAll(pool);
+        budget.release(@intCast(q.written - q.acked));
+        q.acked = q.written;
+    }
+};
+
+/// Received and not yet read; in order (ngtcp2 delivers in order).
+pub const RecvQueue = struct {
+    head: ?*Block = null,
+    tail: ?*Block = null,
+    read_off: usize = 0,
+    tail_fill: usize = 0,
+    len: usize = 0,
+
+    pub fn append(q: *RecvQueue, pool: *BlockPool, bytes: []const u8) error{OutOfMemory}!void {
+        var done: usize = 0;
+        while (done < bytes.len) {
+            if (q.tail == null or q.tail_fill == block_data) {
+                const b = try pool.get();
+                if (q.tail) |t| t.next = b else {
+                    q.head = b;
+                    q.read_off = 0;
+                }
+                q.tail = b;
+                q.tail_fill = 0;
+            }
+            const t = q.tail.?;
+            const n = @min(bytes.len - done, block_data - q.tail_fill);
+            @memcpy(t.data[q.tail_fill..][0..n], bytes[done..][0..n]);
+            q.tail_fill += n;
+            q.len += n;
+            done += n;
+        }
+    }
+
+    /// Copies up to `dest.len` bytes out, freeing emptied blocks.
+    pub fn take(q: *RecvQueue, pool: *BlockPool, dest: []u8) usize {
+        var done: usize = 0;
+        while (done < dest.len and q.len > 0) {
+            const b = q.head.?;
+            const end = if (b == q.tail) q.tail_fill else block_data;
+            const n = @min(dest.len - done, end - q.read_off);
+            @memcpy(dest[done..][0..n], b.data[q.read_off..][0..n]);
+            q.read_off += n;
+            q.len -= n;
+            done += n;
+            if (q.read_off == end and (b != q.tail or q.len == 0)) {
+                q.head = b.next;
+                q.read_off = 0;
+                if (b == q.tail) {
+                    q.tail = null;
+                    q.tail_fill = 0;
+                }
+                pool.put(b);
+            }
+        }
+        return done;
+    }
+
+    pub fn deinit(q: *RecvQueue, pool: *BlockPool) void {
+        var it = q.head;
+        while (it) |b| {
+            it = b.next;
+            pool.put(b);
+        }
+        q.* = .{};
+    }
+};
+
+fn testIo() std.Io {
+    return undefined;
+}
+
+test "send queue spans blocks, frees acked ones and holds none when idle" {
+    const gpa = std.testing.allocator;
+    var pool = BlockPool.init(gpa, 2);
+    defer pool.deinit();
+    var budget = Budget.init(testIo(), 1 << 20);
+    var q: SendQueue = .{};
+    const big = try gpa.alloc(u8, block_data * 3 + 10);
+    defer gpa.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 7);
+    try std.testing.expectEqual(big.len, try q.write(&pool, &budget, big, 1 << 20, false));
+    try std.testing.expectEqual(@as(u32, 4), pool.live.load(.monotonic));
+    try std.testing.expectEqual(big.len, budget.used);
+    // unsent over a block boundary: four runs, in order.
+    var runs: [4][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), q.unsent(&runs));
+    var got: usize = 0;
+    for (runs) |r| {
+        try std.testing.expectEqualSlices(u8, big[got..][0..r.len], r);
+        got += r.len;
+    }
+    try std.testing.expectEqual(big.len, got);
+    // A partial advance, then the runs start where it stopped.
+    q.advance(block_data + 5);
+    try std.testing.expectEqual(@as(usize, 3), q.unsent(&runs));
+    try std.testing.expectEqualSlices(u8, big[block_data + 5 ..][0 .. block_data - 5], runs[0]);
+    q.advance(big.len - q.sent);
+    try std.testing.expectEqual(@as(usize, 0), q.unsent(&runs));
+    // Acking frees the blocks passed.
+    q.ack(&pool, &budget, block_data * 2);
+    try std.testing.expectEqual(@as(u32, 2), pool.live.load(.monotonic));
+    try std.testing.expectEqual(big.len - block_data * 2, budget.used);
+    // More data after a partial free still maps right.
+    try std.testing.expectEqual(@as(usize, 20), try q.write(&pool, &budget, big[0..20], 1 << 20, false));
+    try std.testing.expectEqual(@as(usize, 1), q.unsent(&runs));
+    try std.testing.expectEqualSlices(u8, big[0..20], runs[0]);
+    q.ack(&pool, &budget, q.written - q.acked);
+    try std.testing.expectEqual(@as(u32, 0), pool.live.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), budget.used);
+    try std.testing.expect(q.head == null);
+    // And it starts again from the offset it reached.
+    try std.testing.expectEqual(@as(usize, 3), try q.write(&pool, &budget, "abc", 1 << 20, false));
+    try std.testing.expectEqual(@as(usize, 1), q.unsent(&runs));
+    try std.testing.expectEqualStrings("abc", runs[0]);
+    q.deinit(&pool, &budget);
+    try std.testing.expectEqual(@as(u32, 0), pool.live.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), budget.used);
+}
+
+test "send queue: the cap and the budget stop a write, force passes both and still charges" {
+    const gpa = std.testing.allocator;
+    var pool = BlockPool.init(gpa, 0);
+    defer pool.deinit();
+    var budget = Budget.init(testIo(), 150);
+    var q: SendQueue = .{};
+    defer q.deinit(&pool, &budget);
+    const data = [_]u8{1} ** 400;
+    try std.testing.expectEqual(@as(usize, 100), try q.write(&pool, &budget, &data, 100, false));
+    try std.testing.expectEqual(@as(usize, 0), try q.write(&pool, &budget, &data, 100, false));
+    // The cap is 300 now, but the budget has 50 left.
+    try std.testing.expectEqual(@as(usize, 50), try q.write(&pool, &budget, &data, 300, false));
+    try std.testing.expectEqual(@as(usize, 0), try q.write(&pool, &budget, &data, 300, false));
+    try std.testing.expectEqual(@as(usize, 400), try q.write(&pool, &budget, &data, 100, true));
+    try std.testing.expectEqual(@as(usize, 550), budget.used);
+    q.ack(&pool, &budget, 100);
+    try std.testing.expectEqual(@as(usize, 450), budget.used);
+}
+
+test "send queue take hands nghttp3 the same runs and marks them sent" {
+    const gpa = std.testing.allocator;
+    var pool = BlockPool.init(gpa, 4);
+    defer pool.deinit();
+    var budget = Budget.init(testIo(), 1 << 20);
+    var q: SendQueue = .{};
+    defer q.deinit(&pool, &budget);
+    const data = [_]u8{9} ** (block_data + 100);
+    _ = try q.write(&pool, &budget, &data, 1 << 20, false);
+    var vec: [16]h.nghttp3_vec = undefined;
+    try std.testing.expectEqual(@as(usize, 2), q.take(&vec, vec.len));
+    try std.testing.expectEqual(@as(usize, block_data), vec[0].len);
+    try std.testing.expectEqual(@as(usize, 100), vec[1].len);
+    try std.testing.expect(q.allSent());
+}
+
+test "recv queue appends and takes across blocks and frees every block when drained" {
+    const gpa = std.testing.allocator;
+    var pool = BlockPool.init(gpa, 0);
+    defer pool.deinit();
+    var q: RecvQueue = .{};
+    const data = try gpa.alloc(u8, block_data * 2 + 50);
+    defer gpa.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 13);
+    try q.append(&pool, data[0..10]);
+    try q.append(&pool, data[10..]);
+    try std.testing.expectEqual(data.len, q.len);
+    try std.testing.expectEqual(@as(u32, 3), pool.live.load(.monotonic));
+    const out = try gpa.alloc(u8, data.len);
+    defer gpa.free(out);
+    var got: usize = 0;
+    while (got < data.len) got += q.take(&pool, out[got..@min(out.len, got + 1000)]);
+    try std.testing.expectEqualSlices(u8, data, out);
+    try std.testing.expectEqual(@as(u32, 0), pool.live.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), q.take(&pool, out));
+    // Usable again after it drained.
+    try q.append(&pool, "xyz");
+    try std.testing.expectEqual(@as(usize, 3), q.take(&pool, out));
+    try std.testing.expectEqual(@as(u32, 0), pool.live.load(.monotonic));
+}
+
+test "block pool keeps up to `keep` blocks and frees the rest" {
+    const gpa = std.testing.allocator;
+    var pool = BlockPool.init(gpa, 2);
+    defer pool.deinit();
+    const a = try pool.get();
+    const b = try pool.get();
+    const c3 = try pool.get();
+    pool.put(a);
+    pool.put(b);
+    pool.put(c3);
+    try std.testing.expectEqual(@as(u32, 2), pool.pooled());
+    try std.testing.expectEqual(@as(u32, 0), pool.live.load(.monotonic));
+}
+
+test "signal: a notify between epoch and wait makes wait return at once; no sleepers, no futex call" {
+    var s: Signal = .{};
+    const seen = s.epoch();
+    // Nobody sleeps: no wake call (the io is never touched).
+    s.notify(testIo());
+    try std.testing.expectEqual(@as(u32, 0), s.wakes.load(.monotonic));
+    try std.testing.expect(s.epoch() != seen);
+    try s.wait(std.testing.io, seen);
+    try std.testing.expectEqual(@as(u32, 1), s.returns.load(.monotonic));
 }
 
 /// A body ring: [acked, sent) handed to nghttp3 and not yet acknowledged,
