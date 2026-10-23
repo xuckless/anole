@@ -1,0 +1,11 @@
+h1 /json c256; perf stat (hardware + software counters) 10 s inside 25 s wrk; one rested round, order a, b0, b
+                                   a          b0           b   b0/a   b/a   b/b0
+req/s (wrk)                  224,670     222,895     235,270  0.992 1.047 1.056
+context-switches/s             10.60        9.50       11.90  0.896 1.123 1.253
+cpu-migrations/s                0.00        0.00        0.00  0.000 0.000 0.000
+cycles/req                  23500.10    23681.80    22430.59  1.008 0.954 0.947
+instructions/req            36977.90    36832.08    37745.06  0.996 1.021 1.025
+branch-misses/req              70.57       73.84       42.56  1.046 0.603 0.576
+L1-icache-load-misses/req     2055.93     2091.42     2186.79  1.017 1.064 1.046
+iTLB-load-misses/req           29.89       34.18        0.10  1.144 0.003 0.003
+dTLB-load-misses/req           10.88       10.29        9.66  0.945 0.888 0.939

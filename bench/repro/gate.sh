@@ -10,12 +10,13 @@
 #   asyncdb wrk h1 c256 /async-db?min=10&max=50&limit=20 on HttpArena's seeded
 #           Postgres 18 (cpus 16-19, data/pgdb-seed.sql from $ARENA, pool 20)
 #   wsecho  64 sockets echoing 64-byte messages on /ws/echo (bench/tools/cmd/wsecho)
-# CASES run on epoll, URING_CASES on io_uring.
+# CASES run on epoll, URING_CASES on io_uring; results go to
+# results/<id>/$GATE_DIR (default gate).
 set -u
 bench=$(cd "$(dirname "$0")/.." && pwd)
 . "$bench/lib/cpus.sh"
 id=$1; shift
-out=$bench/results/$id/gate
+out=$bench/results/$id/${GATE_DIR:-gate}
 mkdir -p "$out"
 REST=${REST:-70} RUNS=${RUNS:-3} DUR=${DUR:-30}
 CASES=${CASES:-"plain json h2c h3 asyncdb wsecho"}

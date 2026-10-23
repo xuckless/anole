@@ -1,0 +1,3 @@
+a=anole-bench/anole:v021
+b=anole-bench/anole:dx3
+b0=anole-bench/anole:dx3,ANOLE_CONSOLE=0
