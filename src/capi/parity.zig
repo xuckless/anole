@@ -286,7 +286,7 @@ pub const server_options = [_]Entry{
     .{ .zig = "listeners[].port", .json = "listeners[].port" },
     .{ .zig = "listeners[].unix", .json = "listeners[].unix" },
     .{ .zig = "listeners[].http1", .json = "listeners[].http1" },
-    .{ .zig = "listeners[].http2", .json = "listeners[].http2" },
+    .{ .zig = "listeners[].http2", .json = "listeners[].http2", .kind = .custom, .note = "Zig defaults to whether -Dhttp2 is built in; the schema and Config say true" },
     .{ .zig = "listeners[].http3", .json = "listeners[].http3" },
     .{ .zig = "listeners[].proxy_protocol", .json = "listeners[].proxy_protocol" },
     .{ .zig = "listeners[].proxy_protocol_from", .json = "listeners[].proxy_protocol_from" },

@@ -1909,6 +1909,7 @@ test "capi engine: a streamed answer outlives request_ms + 5 s on every protocol
 }
 
 test "capi engine: a fixed route behind a JWKS jwt middleware is not run inline; behind none it is" {
+    if (comptime !features.auth) return error.SkipZigTest;
     const base =
         \\{"executors": 1, "timeouts": {"shutdown_ms": 200},
         \\ "listeners": [{"address": "127.0.0.1", "port": 0}],
