@@ -129,8 +129,8 @@ pub const Options = struct {
     /// `ssl_cert_reqs=none` for `rediss://`.
     url: ?[]const u8 = null,
     /// The server's name in metrics (`db` label), spans, `/readyz` and
-    /// logs. Must outlive the client.
-    name: []const u8 = "redis",
+    /// logs. Must outlive the client. Null: "redis".
+    name: ?[]const u8 = null,
     /// Connections in all, split between the executors (at least one
     /// each). Null: ten per executor (go-redis's default per CPU).
     max_connections: ?u32 = null,
@@ -146,13 +146,19 @@ pub const Options = struct {
     /// What each class of error becomes (`anole.db.ErrorMap`).
     errors: db.ErrorMap = .{},
     /// Certificates for `rediss://`, beyond what the URL names.
-    tls: Tls = .{},
+    tls: db.Tls = .{},
     /// Open one connection per executor before serving, and fail the
     /// start if that fails. Off: connections open as calls need them, and
     /// a server that is down shows in `/readyz` and as 503s.
     connect_at_start: bool = false,
     /// What `/readyz` waits for the server's PONG.
     ping_timeout: Duration = .fromSeconds(2),
+    /// A bound on every call that has no `QueryOptions.timeout` of its own,
+    /// in a request or not; past it the call is canceled and fails with
+    /// `error.GatewayTimeout`. A request's deadline applies too, whichever
+    /// comes first. Null: none. Calls on a connection from `acquire`
+    /// (blocking commands, subscriptions) are not bounded by it.
+    timeout: ?Duration = .fromSeconds(30),
     /// Where `REDIS_URL` comes from; null: the process's environment
     /// (`app.redis` passes `ServerOptions.process`'s).
     environ: ?std.process.Environ = null,
@@ -161,18 +167,7 @@ pub const Options = struct {
     cache: db.CacheOptions = .{},
 
     /// `Options.tls`.
-    pub const Tls = struct {
-        /// What the server's certificate must chain to; null: the URL's
-        /// `ssl_ca_certs`, else the system's store.
-        ca: ?dusty.Ca = null,
-        /// A client certificate for servers that ask (`tls-auth-clients`);
-        /// null: the URL's `ssl_certfile` and `ssl_keyfile`.
-        client_certificate: ?dusty.Cert = null,
-        /// Accept any certificate (the URL's `ssl_cert_reqs=none`): for a
-        /// managed server with a self-signed certificate, on a network you
-        /// trust anyway.
-        insecure_skip_verify: bool = false,
-    };
+    pub const Tls = db.Tls;
 };
 
 /// A connection's settings: the URL, the environment and `Options`,
@@ -399,6 +394,8 @@ pub const Client = struct {
     /// The settings' strings and the login commands.
     arena: std.heap.ArenaAllocator,
     name: []const u8,
+    /// `Options.timeout`: the bound of a call without its own.
+    timeout: ?Duration,
     settings: Settings,
     stream_options: client_stream.ConnectOptions,
     /// AUTH and SELECT, sent as a connection opens; empty when neither is
@@ -420,26 +417,40 @@ pub const Client = struct {
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.redis` calls it.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*Client {
+        if (opts.max_connections) |n| if (n == 0) {
+            log.err("redis: max_connections is 0; set at least 1, or leave it null for the default", .{});
+            return error.InvalidOptions;
+        };
+        if (opts.tls.insecure_skip_verify and opts.tls.ca != null) {
+            log.err("redis: tls.insecure_skip_verify cannot be set with tls.ca: one checks the server's certificate and the other does not", .{});
+            return error.InvalidOptions;
+        }
+        if (opts.tls.client_certificate) |cc| if (cc == .dev_self_signed) {
+            log.err("redis: tls.client_certificate cannot be .dev_self_signed", .{});
+            return error.InvalidOptions;
+        };
+        const name = opts.name orelse "redis";
         const self = try gpa.create(Client);
         errdefer gpa.destroy(self);
         self.* = .{
             .gpa = gpa,
             .io = io,
             .arena = .init(gpa),
-            .name = opts.name,
+            .timeout = opts.timeout,
+            .name = name,
             .settings = undefined,
             .stream_options = undefined,
             .login = .{},
             .pools = undefined,
             .errors = opts.errors,
-            .observer = .{ .system = .redis, .name = opts.name },
+            .observer = .{ .system = .redis, .name = name },
             .readiness = .{ .io = io, .context = self, .ping = ping },
             .acquire_timeout = opts.acquire_timeout,
             .connect_timeout = opts.connect_timeout,
             .idle_timeout = opts.idle_timeout,
             .ping_timeout = opts.ping_timeout,
             .connect_at_start = opts.connect_at_start,
-            .cache = try .init(gpa, io, .redis, opts.name, opts.cache),
+            .cache = try .init(gpa, io, .redis, name, opts.cache),
         };
         errdefer self.cache.deinit();
         errdefer self.arena.deinit();
@@ -449,6 +460,10 @@ pub const Client = struct {
         if (s.host.len > 255) {
             log.err("redis: the host name is longer than 255 bytes", .{});
             return error.InvalidDatabaseUrl;
+        }
+        if (!s.tls and (opts.tls.ca != null or opts.tls.client_certificate != null)) {
+            log.err("redis: tls.ca or tls.client_certificate is set, but the URL is not rediss://: it would be sent in plain text; use rediss://", .{});
+            return error.InvalidOptions;
         }
         if (s.tls and !has_tls) {
             log.err("redis: {f} needs TLS, which this build leaves out (-Dtls=none)", .{s});
@@ -940,7 +955,7 @@ pub const Query = struct {
 
     /// `Client.command`, with the options.
     pub fn command(self: Query, c: anytype, args: anytype) Error!Reply {
-        return self.client.call(c, self.opts.timeout, null, Reply, .reply, args);
+        return self.client.call(c, internal.callTimeout(self.opts.timeout, self.client.timeout), null, Reply, .reply, args);
     }
 
     // The reads go through the cache, which shares them when `opts` asks
@@ -974,7 +989,7 @@ pub const Query = struct {
 
     /// `Client.pipeline`, with the options.
     pub fn pipeline(self: Query, c: anytype, commands: anytype) Error![]Reply {
-        return self.client.call(c, self.opts.timeout, null, Reply, .replies, commands);
+        return self.client.call(c, internal.callTimeout(self.opts.timeout, self.client.timeout), null, Reply, .replies, commands);
     }
 
     /// Through the cache when `opts` asks for sharing and `args` is a
@@ -990,7 +1005,7 @@ pub const Query = struct {
     }
 
     fn plain(self: Query, comptime T: type, comptime mode: Mode, c: anytype, args: anytype) Error!Out(T, mode) {
-        return self.client.call(c, self.opts.timeout, null, T, mode, args);
+        return self.client.call(c, internal.callTimeout(self.opts.timeout, self.client.timeout), null, T, mode, args);
     }
 
     /// `Client.get`, with the options.
@@ -1165,9 +1180,8 @@ pub const Conn = struct {
 
     /// Gives the connection back; one left inside MULTI or WATCH, on
     /// another database or subscribed, or broken, is closed instead.
-    pub fn release(self: *Conn) void {
+    pub fn release(self: *const Conn) void {
         self.client.give(self.conn);
-        self.* = undefined;
     }
 
     /// `Client.command`, on this connection.

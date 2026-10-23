@@ -1790,6 +1790,21 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             pub fn embedded(g: Group, path: []const u8, data: []const u8, opts: http.EmbeddedOptions) void {
                 g.inner.embedded(path, data, opts);
             }
+            /// `Server.grpc` behind this group's middleware (and the global
+            /// ones). The gRPC paths (`/pkg.Service/Method`) and the
+            /// transcoded REST paths come from the proto, so the group's
+            /// prefix does not apply to them; its middleware runs for both,
+            /// as for any route of the group.
+            ///
+            ///     const api = app.group("/v1", .{auth});
+            ///     api.grpc(pb.Users, users);          // /pkg.Users/Get and GET /v1/users/{id}, both behind auth
+            pub fn grpc(g: Group, comptime Service: anytype, impl: anytype) void {
+                g.grpcWith(Service, impl, .{});
+            }
+            /// `Server.grpcWith` under this group.
+            pub fn grpcWith(g: Group, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
+                g.server.grpcOn(g.inner, Service, impl, opts);
+            }
         };
 
         /// The server's outbound HTTP client, made with the server and
@@ -1818,6 +1833,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `grpc`, with options for this registration (the message size
         /// limit, transcoding off).
         pub fn grpcWith(self: *Self, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
+            self.grpcOn(self.router, Service, impl, opts);
+        }
+
+        /// `grpcWith` on a router or one of its groups (`Group.grpc`).
+        fn grpcOn(self: *Self, target: anytype, comptime Service: anytype, impl: anytype, opts: grpc_mod.RegisterOptions) void {
+            _ = self;
             if (comptime !features.grpc) @compileError("app.grpc needs gRPC (-Dgrpc, on in the full profile)");
             const Svc = if (@TypeOf(Service) == type) Service else Service(grpc_mod.Call, anyerror);
             const I = @TypeOf(impl);
@@ -1826,11 +1847,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 // (`Call.data`) to them.
                 var with_data = opts;
                 with_data.data = @ptrCast(@constCast(impl));
-                grpc_mod.registerWith(Ctx, self.router, Svc, comptime boundMethods(Svc, @typeInfo(I).pointer.child), with_data);
+                grpc_mod.registerWith(Ctx, target, Svc, comptime boundMethods(Svc, @typeInfo(I).pointer.child), with_data);
             } else if (I == type) {
-                grpc_mod.registerWith(Ctx, self.router, Svc, comptime declaredMethods(Svc, impl), opts);
+                grpc_mod.registerWith(Ctx, target, Svc, comptime declaredMethods(Svc, impl), opts);
             } else {
-                grpc_mod.registerWith(Ctx, self.router, Svc, comptime listedMethods(Svc, impl), opts);
+                grpc_mod.registerWith(Ctx, target, Svc, comptime listedMethods(Svc, impl), opts);
             }
         }
 
@@ -2037,7 +2058,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// app has, and it is closed with the server, after the drain.
         ///
         ///     state.db = try app.sqlite("app.db");
-        ///     state.db = try app.sqlite(.{ .path = "data/app.db", .busy_timeout_ms = 10_000 });
+        ///     state.db = try app.sqlite(.{ .path = "data/app.db", .busy_timeout = .fromSeconds(10) });
         pub fn sqlite(self: *Self, config: anytype) !*sqlite_mod.Client {
             if (comptime !features.sqlite) @compileError("app.sqlite needs SQLite (-Dsqlite, on in the web and full profiles)");
             const opts: sqlite_mod.Options = switch (@typeInfo(@TypeOf(config))) {

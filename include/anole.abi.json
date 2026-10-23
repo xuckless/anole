@@ -131,7 +131,9 @@
       "type": 10,
       "name": "ANOLE_EV_DB_RESULT",
       "record": "anole_db_result_event",
-      "handles": [],
+      "handles": [
+        "db_tx"
+      ],
       "obligation": null
     },
     {
@@ -343,10 +345,23 @@
       "ANOLE_DB_F_NO_PREPARE": 4,
       "ANOLE_DB_F_DROP_EMPTY": 8
     },
+    "db_isolation": {
+      "ANOLE_DB_ISOLATION_DEFAULT": 0,
+      "ANOLE_DB_ISOLATION_READ_UNCOMMITTED": 1,
+      "ANOLE_DB_ISOLATION_READ_COMMITTED": 2,
+      "ANOLE_DB_ISOLATION_REPEATABLE_READ": 3,
+      "ANOLE_DB_ISOLATION_SERIALIZABLE": 4
+    },
     "db_source": {
       "ANOLE_DB_FROM_DATABASE": 0,
       "ANOLE_DB_FROM_COALESCED": 1,
       "ANOLE_DB_FROM_CACHE": 2
+    },
+    "db_timeout": {
+      "ANOLE_DB_TIMEOUT_NONE": 4294967295
+    },
+    "db_tx_flag": {
+      "ANOLE_DB_TX_READ_ONLY": 1
     },
     "db_type": {
       "ANOLE_DB_TYPE_NULL": 0,
@@ -1348,7 +1363,7 @@
       ]
     },
     "anole_db_options": {
-      "size": 40,
+      "size": 48,
       "align": 8,
       "fields": [
         {
@@ -1380,6 +1395,47 @@
           "name": "cache_tag",
           "offset": 24,
           "type": "anole_str"
+        },
+        {
+          "name": "req",
+          "offset": 40,
+          "type": "u64"
+        }
+      ]
+    },
+    "anole_db_tx_options": {
+      "size": 32,
+      "align": 8,
+      "fields": [
+        {
+          "name": "size",
+          "offset": 0,
+          "type": "usize"
+        },
+        {
+          "name": "flags",
+          "offset": 8,
+          "type": "u32"
+        },
+        {
+          "name": "isolation",
+          "offset": 12,
+          "type": "u32"
+        },
+        {
+          "name": "timeout_ms",
+          "offset": 16,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 20,
+          "type": "u32"
+        },
+        {
+          "name": "req",
+          "offset": 24,
+          "type": "u64"
         }
       ]
     },
@@ -1420,7 +1476,7 @@
       ]
     },
     "anole_db_result_event": {
-      "size": 96,
+      "size": 104,
       "align": 8,
       "fields": [
         {
@@ -1496,6 +1552,11 @@
         {
           "name": "constraint",
           "offset": 88,
+          "type": "anole_span"
+        },
+        {
+          "name": "table",
+          "offset": 96,
           "type": "anole_span"
         }
       ],

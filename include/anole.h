@@ -70,11 +70,13 @@
  *  9. Handles: request from its event to its answer, ABORT or STOPPED; gRPC
  *     call to anole_grpc_finish or ABORT; WebSocket to WS_CLOSE; WebTransport
  *     session to WT_CLOSE; WebTransport stream to anole_handle_release or
- *     its session's end. Events for a handle that is already over may still
+ *     its session's end; database transaction to commit, rollback, release,
+ *     its timeout, its request's abort or deadline, or ANOLE_EV_STOPPED. Events for a handle that is already over may still
  *     be queued.
  * 10. Answer and data calls on an over handle: ANOLE_E_GONE. Cleanup calls
  *     (anole_handle_release, anole_req_abort, anole_ws_close,
- *     anole_ws_unsubscribe, anole_wt_close, anole_wt_stream_reset/_stop):
+ *     anole_ws_unsubscribe, anole_wt_close, anole_wt_stream_reset/_stop,
+ *     anole_db_tx_release):
  *     ANOLE_OK, nothing done, no error set. 0 or a handle of another kind:
  *     ANOLE_E_INVALID everywhere.
  *  Ownership
@@ -181,8 +183,8 @@ ANOLE_API anole_str anole_version(void);
 ANOLE_API int32_t anole_has_feature(anole_str name);
 
 /* 64-bit, generation-checked; 0 is never valid. Each handle has a kind
-   (a request, a WebSocket, a gRPC call, a WebTransport session or stream;
-   database transactions later), and a function given a handle of another
+   (a request, a WebSocket, a gRPC call, a WebTransport session or stream, a
+   database transaction), and a function given a handle of another
    kind, or 0, answers ANOLE_E_INVALID. The bits are Anole's: treat them as
    opaque. */
 typedef uint64_t anole_req;       /* one request: from ANOLE_EV_REQUEST until answered */
@@ -190,6 +192,7 @@ typedef uint64_t anole_ws;        /* one WebSocket: from ANOLE_EV_WS_OPEN until 
 typedef uint64_t anole_grpc_call; /* one gRPC call: from ANOLE_EV_GRPC_CALL until finished or aborted */
 typedef uint64_t anole_wt;        /* one WebTransport session: from ANOLE_EV_WT_OPEN until ANOLE_EV_WT_CLOSE */
 typedef uint64_t anole_wt_stream; /* one of its streams: until anole_handle_release or the session's close */
+typedef uint64_t anole_db_tx;     /* one database transaction: from the answer to anole_db_begin until commit, rollback or release */
 typedef struct anole_server anole_server;     /* opaque */
 typedef struct anole_consumer anole_consumer; /* opaque */
 
@@ -1002,9 +1005,11 @@ ANOLE_API anole_status anole_wt_close(anole_wt w, uint32_t code, anole_str reaso
    ANOLE_EV_DB_RESULT to the consumer named in the call, with the caller's
    user_data. SQLite: reads run beside the writer (WAL), writes take turns on
    the database's writer thread. PostgreSQL, Redis and MongoDB: each
-   executor has its own pool of connections. Statements may be queued from anole_server_start until
-   the server stops; ones still running when it stops get no answer
-   (ANOLE_EV_STOPPED is the consumer's last event). */
+   executor has its own pool of connections. Statements may be queued from
+   anole_server_open (or start) until the server stops; open transactions are
+   rolled back at the stop, and nothing queued then is answered
+   (ANOLE_EV_STOPPED is the consumer's last event). Every query is bounded by
+   the database's timeout_ms (30 s by default) unless it names its own. */
 typedef struct anole_db anole_db; /* opaque; lives until anole_server_destroy */
 
 /* The database named `name` in the configuration (after
@@ -1071,21 +1076,38 @@ typedef struct anole_db_value {
 #define ANOLE_DB_F_NO_PREPARE 4u
 #define ANOLE_DB_F_DROP_EMPTY 8u
 
+/* anole_db_options.timeout_ms: no bound for this query. */
+#define ANOLE_DB_TIMEOUT_NONE 0xFFFFFFFFu
+
 typedef struct anole_db_options {
   size_t size;           /* sizeof(anole_db_options): fields past it read as 0 */
   uint32_t flags;        /* ANOLE_DB_F_* (unknown bits: ANOLE_E_INVALID) */
-  uint32_t timeout_ms;   /* 0: none; past it, the statement is interrupted (ANOLE_E_TIMEOUT);
-                            PostgreSQL also gets a CancelRequest */
+  uint32_t timeout_ms;   /* 0: the database's timeout_ms (30 s by default);
+                            ANOLE_DB_TIMEOUT_NONE: none. Past it the statement is
+                            interrupted (ANOLE_E_TIMEOUT); PostgreSQL also gets a
+                            CancelRequest */
   uint32_t cache_ttl_ms; /* reads: keep the answer this long per executor, served
                             from memory meanwhile; 0: not kept */
   uint32_t reserved;     /* must be 0 */
   anole_str cache_tag;   /* a name to drop kept answers by (anole_db_invalidate); copied */
-} anole_db_options;
+  uint64_t req;          /* ABI 0.7: the anole_req or anole_grpc_call this query
+                            serves, or 0. It runs on that request's executor (its
+                            pools and cache) and answers to the consumer that
+                            polled it; `c` may then be NULL. When the request is
+                            aborted or passes its deadline, the query is canceled
+                            and answers ANOLE_E_GONE; an answered request leaves
+                            it running (bounded by timeout_ms). A stale req:
+                            ANOLE_E_GONE from the call, nothing queued. Another
+                            handle kind: ANOLE_E_INVALID. */
+} anole_db_options; /* 48 bytes (was 40) */
 
 /* Queues a read (or any statement that returns rows): the answer holds the
    column names and every row. `params` (copied) bind in order; `opts` may
    be NULL. `c` receives the answer; it must be fed by at least one
-   executor (ANOLE_E_STATE otherwise, or before start or after the stop).
+   executor (ANOLE_E_STATE otherwise, or after the stop). `c` may be NULL
+   only with opts->req, where the answer goes to that request's consumer (a
+   non-NULL `c` must be it: ANOLE_E_INVALID otherwise). The answer's status
+   is also ANOLE_E_GONE when the request it served ended first.
    ANOLE_E_INVALID: a bad value type or options size. Returns at once.
    Redis: runs the command and answers with its whole reply. timeout_ms,
    ANOLE_DB_F_COALESCE and cache_ttl_ms apply; the last two only to commands
@@ -1106,6 +1128,101 @@ ANOLE_API anole_status anole_db_exec(anole_db *db, anole_consumer *c, anole_str 
    every kept answer), and keeps reads that started before from filling the
    cache. Call it after a write commits. */
 ANOLE_API anole_status anole_db_invalidate(anole_db *db, anole_str tag);
+
+/* ---- database transactions ------------------------------------------------- */
+
+/* One transaction on one connection of one executor: from the
+   ANOLE_EV_DB_RESULT that answers anole_db_begin (its ev.handle) until
+   anole_db_tx_commit, anole_db_tx_rollback or anole_db_tx_release is
+   called. SQLite and PostgreSQL only. */
+
+/* anole_db_tx_options.flags. PostgreSQL: BEGIN READ ONLY. SQLite: on a
+   reader connection, a snapshot that writes do not disturb (the writer
+   when the database has no readers, as ":memory:"). */
+#define ANOLE_DB_TX_READ_ONLY 1u
+
+/* anole_db_tx_options.isolation. SQLite is always serializable and takes
+   any of them. */
+enum {
+  ANOLE_DB_ISOLATION_DEFAULT = 0, /* the database's own default */
+  ANOLE_DB_ISOLATION_READ_UNCOMMITTED = 1,
+  ANOLE_DB_ISOLATION_READ_COMMITTED = 2,
+  ANOLE_DB_ISOLATION_REPEATABLE_READ = 3,
+  ANOLE_DB_ISOLATION_SERIALIZABLE = 4
+};
+
+typedef struct anole_db_tx_options {
+  size_t size;         /* sizeof(anole_db_tx_options) */
+  uint32_t flags;      /* ANOLE_DB_TX_*; other bits: ANOLE_E_INVALID */
+  uint32_t isolation;  /* ANOLE_DB_ISOLATION_* */
+  uint32_t timeout_ms; /* the whole transaction, from begin to commit, idle time
+                          included: past it, it is rolled back. 0: the
+                          database's timeout_ms; ANOLE_DB_TIMEOUT_NONE: none */
+  uint32_t reserved;   /* 0 */
+  uint64_t req;        /* the anole_req or anole_grpc_call it serves, or 0 (see
+                          anole_db_options.req) */
+} anole_db_tx_options; /* 32 bytes */
+
+/* Queues a BEGIN. The answer (ANOLE_EV_DB_RESULT to `c`) carries the new
+   transaction in ev.handle when status is ANOLE_OK, else 0 with the reason
+   (ANOLE_E_DB, error_class UNAVAILABLE: no connection in time; ANOLE_E_TIMEOUT:
+   the SQLite writer or a connection was not had within timeout_ms;
+   ANOLE_E_GONE: the request it serves ended first). `opts` may be NULL.
+   With opts->req, the transaction runs on that request's executor and `c`
+   may be NULL (if given, it must be the consumer that request came to).
+   Returns ANOLE_E_UNSUPPORTED for Redis and MongoDB (and when SQLite and
+   PostgreSQL are not built in), ANOLE_E_GONE for a stale opts->req,
+   ANOLE_E_INVALID for bad options, ANOLE_E_STATE before the databases are
+   open or after the stop. */
+ANOLE_API anole_status anole_db_begin(anole_db *db, anole_consumer *c, const anole_db_tx_options *opts,
+                                      uint64_t user_data);
+/* anole_db_query and anole_db_exec inside the transaction. Calls on one
+   transaction run one at a time, in the order made; the consumer may queue
+   several without waiting for answers. Each answer is an
+   ANOLE_EV_DB_RESULT whose ev.handle is the transaction. `opts`: only
+   timeout_ms and ANOLE_DB_F_NO_PREPARE apply; any other flag, a
+   cache_ttl_ms, a cache_tag or a req is ANOLE_E_INVALID. ANOLE_E_GONE once
+   the transaction is over, or once commit, rollback or release was called.
+   A failed statement does not end the transaction: PostgreSQL then refuses
+   every later statement until the rollback (SQLSTATE 25P02; use SAVEPOINT
+   to recover part of it), SQLite keeps what the others did. */
+ANOLE_API anole_status anole_db_tx_query(anole_db_tx tx, anole_str sql, const anole_db_value *params,
+                                         size_t nparams, const anole_db_options *opts, uint64_t user_data);
+ANOLE_API anole_status anole_db_tx_exec(anole_db_tx tx, anole_str sql, const anole_db_value *params,
+                                        size_t nparams, const anole_db_options *opts, uint64_t user_data);
+/* Queue COMMIT (ROLLBACK) after the calls already queued; from this call on
+   the handle takes nothing more. Answered with ev.handle the transaction:
+   ANOLE_OK, or ANOLE_E_DB when the commit was refused (error_class
+   SERIALIZATION: lost a race, 409) or the transaction had failed and was
+   rolled back instead (PostgreSQL). Either way the connection goes back and
+   the handle is stale once the answer is queued. ANOLE_E_GONE when the
+   transaction is already over (timed out, its request ended, released). */
+ANOLE_API anole_status anole_db_tx_commit(anole_db_tx tx, uint64_t user_data);
+ANOLE_API anole_status anole_db_tx_rollback(anole_db_tx tx, uint64_t user_data);
+/* Cleanup, for finalizers and `finally`: rolls back an open transaction now
+   and gives its connection back. Calls queued and not started answer
+   ANOLE_E_GONE; one running is interrupted (SQLite) or canceled (PostgreSQL
+   CancelRequest) and answers ANOLE_E_GONE; the release itself is not
+   answered. ANOLE_OK on a transaction already over or released;
+   ANOLE_E_INVALID for 0 or a handle of another kind. anole_handle_release
+   does the same for an anole_db_tx.
+
+   How a transaction ends, and what its queued and running calls answer:
+     commit / rollback        they run first, answered normally; then COMMIT or
+                              ROLLBACK is answered
+     anole_db_tx_release      ANOLE_E_GONE; ROLLBACK, not answered
+     its timeout_ms           ANOLE_E_TIMEOUT (error_class TIMEOUT, http_status
+                              504); ROLLBACK
+     its request aborted or   ANOLE_E_GONE; ROLLBACK
+     past its deadline
+     its request answered     nothing: it goes on, bounded by timeout_ms
+     the server stops         no answer (ANOLE_EV_STOPPED is the consumer's
+                              last event); ROLLBACK
+   A later call on the stale handle returns ANOLE_E_GONE at once;
+   anole_last_error says which ending it was. A read-write SQLite
+   transaction holds the database's writer: every other write waits, so a
+   forgotten transaction blocks writes for at most timeout_ms. */
+ANOLE_API anole_status anole_db_tx_release(anole_db_tx tx);
 
 /* Where an answer came from. */
 enum { ANOLE_DB_FROM_DATABASE = 0, ANOLE_DB_FROM_COALESCED = 1, ANOLE_DB_FROM_CACHE = 2 };
@@ -1157,7 +1274,9 @@ typedef struct anole_db_cell {
   } v;
 } anole_db_cell;
 
-/* ANOLE_EV_DB_RESULT: ev.handle is 0; user_data as given to the call.
+/* ANOLE_EV_DB_RESULT: ev.handle is 0 for a plain query, and the transaction
+   (the new one, for anole_db_begin's answer) for a call on one; user_data as
+   given to the call.
    Followed by the column names (`columns`: ncolumns anole_span), the cells
    (`cells`: nrows * ncolumns anole_db_cell, row after row) and their bytes.
    A large answer makes a large record: anole_poll answers ANOLE_E_TOOBIG
@@ -1183,7 +1302,8 @@ typedef struct anole_db_result_event {
                             PostgreSQL's SQLSTATE, the first word of a Redis error,
                             MongoDB's error code: "11000") */
   anole_span constraint; /* the constraint that failed, when the database names it */
-} anole_db_result_event;
+  anole_span table;      /* ABI 0.7: the table (or collection) the error names, when the database says */
+} anole_db_result_event; /* 104 bytes (was 96) */
 
 #ifdef __cplusplus
 }

@@ -3,6 +3,7 @@ const std = @import("std");
 const anole = @import("../root.zig");
 const parity = @import("parity.zig");
 const config = @import("config.zig");
+const features = anole.features;
 
 // A new ServerOptions field without a JSON key or a reason is a compile
 // error here, naming it.
@@ -44,4 +45,41 @@ test "parity: every WebSocket UpgradeOptions leaf has a C ABI key or a reason, a
     defer arena.deinit();
     const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{});
     try parity.checkSchemaAndDefaults(anole.websocket.UpgradeOptions, config.Config, &parity.websocket_options, root);
+}
+
+test "capi config: every connector option is in the schema or listed" {
+    const text = @import("anole_capi_schema").text;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{});
+    if (comptime features.postgres) {
+        comptime parity.checkCoverage(anole.pg.Options, &parity.pg_options);
+        try parity.checkSchemaAndDefaults(anole.pg.Options, config.Config, &parity.pg_options, root);
+    }
+    if (comptime features.sqlite) {
+        comptime parity.checkCoverage(anole.sqlite.Options, &parity.sqlite_options);
+        try parity.checkSchemaAndDefaults(anole.sqlite.Options, config.Config, &parity.sqlite_options, root);
+    }
+    if (comptime features.redis) {
+        comptime parity.checkCoverage(anole.redis.Options, &parity.redis_options);
+        try parity.checkSchemaAndDefaults(anole.redis.Options, config.Config, &parity.redis_options, root);
+    }
+    if (comptime features.mongodb) {
+        comptime parity.checkCoverage(anole.mongodb.Options, &parity.mongodb_options);
+        try parity.checkSchemaAndDefaults(anole.mongodb.Options, config.Config, &parity.mongodb_options, root);
+    }
+}
+
+test "capi config: mongodb max_connections 0 is E_CONFIG; sqlite statement_cache is an unknown key" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [512]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    try std.testing.expectError(error.Config, config.parse(arena.allocator(),
+        \\{"databases":[{"name":"m","mongodb":{"max_connections":0}}]}
+    , &why));
+    var why2: std.Io.Writer = .fixed(&buf);
+    try std.testing.expectError(error.Config, config.parse(arena.allocator(),
+        \\{"databases":[{"name":"s","sqlite":{"path":":memory:","statement_cache":8}}]}
+    , &why2));
 }

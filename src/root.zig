@@ -307,6 +307,7 @@ pub const auth = if (features.auth) @import("auth/root.zig") else struct {};
 test {
     _ = @import("server.zig");
     _ = @import("api_test.zig");
+    _ = @import("db_options_test.zig");
     _ = @import("address.zig");
     _ = @import("handlers.zig");
     _ = @import("client.zig");

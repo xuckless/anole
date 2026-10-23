@@ -1307,12 +1307,14 @@ static void test_shared_consumer(void) {
 /* The next ANOLE_EV_DB_RESULT, copied into `out` (other events are not
    expected here). */
 static unsigned char db_buf[1 << 20];
+static size_t db_have = 0, db_at = 0;
+/* Forgets what db_next has read ahead (a new server, a new consumer). */
+static void db_flush(void) { db_have = db_at = 0; }
 static const anole_db_result_event *db_next(anole_consumer *c, void *out, size_t cap) {
-  static size_t have = 0, at = 0;
   for (;;) {
-    if (at < have) {
-      const anole_event *ev = (const anole_event *)(db_buf + at);
-      at += ev->len;
+    if (db_at < db_have) {
+      const anole_event *ev = (const anole_event *)(db_buf + db_at);
+      db_at += ev->len;
       if (ev->type != ANOLE_EV_DB_RESULT) continue;
       CHECK(ev->len <= cap);
       memcpy(out, ev, ev->len);
@@ -1320,8 +1322,8 @@ static const anole_db_result_event *db_next(anole_consumer *c, void *out, size_t
     }
     int64_t n = anole_poll_wait(c, db_buf, sizeof db_buf, 10000);
     CHECK(n > 0);
-    have = (size_t)n;
-    at = 0;
+    db_have = (size_t)n;
+    db_at = 0;
   }
 }
 
@@ -1728,6 +1730,8 @@ static void test_db_redis(void) {
   anole_consumer_options co = {sizeof co, NULL, NULL, 0};
   CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
   CHECK(anole_server_start(s) == ANOLE_OK);
+  /* No transactions here: SQLite and PostgreSQL only. */
+  CHECK(anole_db_begin(db, c, NULL, 1) == ANOLE_E_UNSUPPORTED);
   static unsigned char rec[1 << 20];
   const anole_db_result_event *r;
   anole_str del = LIT("DEL"), set = LIT("SET"), get = LIT("GET"), rpush = LIT("RPUSH"), lrange = LIT("LRANGE");
@@ -1972,6 +1976,8 @@ static void test_db_mongodb(void) {
   anole_consumer_options co = {sizeof co, NULL, NULL, 0};
   CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
   CHECK(anole_server_start(s) == ANOLE_OK);
+  /* No transactions here: SQLite and PostgreSQL only. */
+  CHECK(anole_db_begin(db, c, NULL, 1) == ANOLE_E_UNSUPPORTED);
   static unsigned char rec[1 << 20];
   static bson_b b1, b2, b3;
   const anole_db_result_event *r;
@@ -2545,6 +2551,411 @@ static anole_server *hold_server(anole_consumer **c, int request_ms, int shutdow
   anole_server *s = polled_server(json, c);
   CHECK(anole_server_start(s) == ANOLE_OK);
   return s;
+}
+
+/* ---- database transactions and queries tied to requests -------------------------------------- */
+
+static const char *const slow_sql =
+    "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT count(*) FROM n";
+
+static int64_t db_count(anole_db *db, anole_consumer *c, const char *table, uint64_t ud) {
+  char sql[128];
+  int k = snprintf(sql, sizeof sql, "SELECT count(*) FROM %s", table);
+  static unsigned char rec[1 << 16];
+  CHECK(anole_db_query(db, c, (anole_str){sql, (size_t)k}, NULL, 0, NULL, ud) == ANOLE_OK);
+  const anole_db_result_event *r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == ud && r->status == ANOLE_OK);
+  return db_cell(r, 0, 0)->v.i;
+}
+
+static void test_db_tx(void) {
+  if (!anole_has_feature(LIT("sqlite"))) {
+    printf("ok database transactions (SQLite not built in)\n");
+    return;
+  }
+  char path[64];
+  snprintf(path, sizeof path, "/tmp/anole-capi-tx-%d.db", (int)getpid());
+  char json[1024];
+  snprintf(json, sizeof json,
+           "{\"executors\":1,\"listeners\":[{\"port\":0}],"
+           " \"databases\":[{\"name\":\"d\",\"timeout_ms\":5000,\"sqlite\":{\"path\":\"%s\","
+           "  \"init\":\"CREATE TABLE IF NOT EXISTS acct (id INTEGER PRIMARY KEY, cents INTEGER NOT NULL);\"}}]}",
+           path);
+  anole_consumer *c = NULL;
+  anole_server *s = polled_server(json, &c);
+  anole_db *db = NULL;
+  CHECK(anole_db_find(s, LIT("d"), &db) == ANOLE_OK);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  db_flush();
+  static unsigned char rec[1 << 16];
+  const anole_db_result_event *r;
+  anole_str ins1 = LIT("INSERT INTO acct (id, cents) VALUES (1, 100)");
+  anole_str ins2 = LIT("INSERT INTO acct (id, cents) VALUES (2, 50)");
+
+  /* begin, a statement, a second begin that waits for the writer, commit */
+  CHECK(anole_db_begin(db, c, NULL, 100) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 100 && r->status == ANOLE_OK && r->ev.handle != 0);
+  anole_db_tx tx1 = r->ev.handle;
+  CHECK(anole_db_tx_exec(tx1, ins1, NULL, 0, NULL, 101) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 101 && r->status == ANOLE_OK && r->changes == 1 && r->ev.handle == tx1);
+  CHECK(anole_db_begin(db, c, NULL, 103) == ANOLE_OK);
+  CHECK(count_events(c, ANOLE_EV_DB_RESULT, 150) == 0); /* the writer is tx1's */
+  CHECK(anole_db_tx_commit(tx1, 102) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 102 && r->status == ANOLE_OK && r->ev.handle == tx1);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 103 && r->status == ANOLE_OK && r->ev.handle != 0 && r->ev.handle != tx1);
+  anole_db_tx tx2 = r->ev.handle;
+
+  /* after the commit the handle is stale: GONE at once; release is OK */
+  CHECK(anole_db_tx_exec(tx1, ins2, NULL, 0, NULL, 110) == ANOLE_E_GONE && name_is("Gone"));
+  CHECK(anole_db_tx_query(tx1, ins2, NULL, 0, NULL, 111) == ANOLE_E_GONE);
+  CHECK(anole_db_tx_commit(tx1, 112) == ANOLE_E_GONE);
+  CHECK(anole_db_tx_release(tx1) == ANOLE_OK);
+  CHECK(anole_db_tx_release(tx1) == ANOLE_OK);
+  CHECK(anole_db_tx_release(0) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
+  CHECK(anole_db_tx_commit(((uint64_t)1 << 28) | 1, 0) == ANOLE_E_INVALID); /* a request handle */
+
+  /* a rollback leaves nothing; a read inside sees the transaction's own write */
+  CHECK(anole_db_tx_exec(tx2, ins2, NULL, 0, NULL, 120) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->changes == 1);
+  CHECK(anole_db_tx_query(tx2, LIT("SELECT count(*) FROM acct"), NULL, 0, NULL, 121) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->ev.handle == tx2 && db_cell(r, 0, 0)->v.i == 2);
+  CHECK(anole_db_tx_rollback(tx2, 122) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 122 && r->status == ANOLE_OK);
+  CHECK(db_count(db, c, "acct", 123) == 1);
+
+  /* options are validated */
+  anole_db_tx_options bad = {sizeof bad};
+  bad.flags = 1u << 5;
+  CHECK(anole_db_begin(db, c, &bad, 0) == ANOLE_E_INVALID && name_is("UnknownFlag"));
+  bad.flags = 0;
+  bad.isolation = 9;
+  CHECK(anole_db_begin(db, c, &bad, 0) == ANOLE_E_INVALID);
+  bad.isolation = 0;
+  bad.reserved = 1;
+  CHECK(anole_db_begin(db, c, &bad, 0) == ANOLE_E_INVALID && name_is("ReservedNotZero"));
+  struct {
+    anole_db_tx_options o;
+    uint64_t extra;
+  } big;
+  memset(&big, 0, sizeof big);
+  big.o.size = sizeof big;
+  big.extra = 1;
+  CHECK(anole_db_begin(db, c, &big.o, 0) == ANOLE_E_INVALID && name_is("UnknownField"));
+  anole_db_tx_options ro = {sizeof ro, ANOLE_DB_TX_READ_ONLY, ANOLE_DB_ISOLATION_SERIALIZABLE, 0, 0, 0};
+  CHECK(anole_db_begin(db, c, &ro, 130) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK);
+  anole_db_tx tx3 = r->ev.handle;
+  anole_db_options coalesce = {sizeof coalesce, ANOLE_DB_F_COALESCE};
+  CHECK(anole_db_tx_query(tx3, LIT("SELECT 1"), NULL, 0, &coalesce, 0) == ANOLE_E_INVALID);
+  anole_db_options cached = {sizeof cached, 0, 0, 1000};
+  CHECK(anole_db_tx_query(tx3, LIT("SELECT 1"), NULL, 0, &cached, 0) == ANOLE_E_INVALID);
+  anole_db_options tied = {sizeof tied};
+  tied.req = ((uint64_t)1 << 28) | 1;
+  CHECK(anole_db_tx_query(tx3, LIT("SELECT 1"), NULL, 0, &tied, 0) == ANOLE_E_INVALID);
+  CHECK(anole_handle_release(tx3) == ANOLE_OK); /* the generic release rolls it back */
+  CHECK(anole_db_tx_exec(tx3, LIT("SELECT 1"), NULL, 0, NULL, 0) == ANOLE_E_GONE);
+
+  /* calls queued without waiting answer in the order made */
+  CHECK(anole_db_begin(db, c, NULL, 300) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  anole_db_tx tx4 = r->ev.handle;
+  anole_str ins3 = LIT("INSERT INTO acct (id, cents) VALUES (?, 1)");
+  for (int i = 0; i < 3; i++) {
+    anole_db_value v = {ANOLE_DB_TYPE_INT, 0, {.i = 10 + i}};
+    CHECK(anole_db_tx_exec(tx4, ins3, &v, 1, NULL, 301 + i) == ANOLE_OK);
+  }
+  CHECK(anole_db_tx_commit(tx4, 304) == ANOLE_OK);
+  for (int i = 0; i < 4; i++) {
+    r = db_next(c, rec, sizeof rec);
+    CHECK(r->user_data == (uint64_t)(301 + i) && r->status == ANOLE_OK && r->ev.handle == tx4);
+  }
+  CHECK(db_count(db, c, "acct", 305) == 4);
+
+  /* release answers what was queued GONE and frees the writer */
+  CHECK(anole_db_begin(db, c, NULL, 400) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  anole_db_tx tx5 = r->ev.handle;
+  CHECK(anole_db_tx_query(tx5, (anole_str){slow_sql, strlen(slow_sql)}, NULL, 0, NULL, 401) == ANOLE_OK);
+  CHECK(anole_db_tx_exec(tx5, ins1, NULL, 0, NULL, 402) == ANOLE_OK);
+  CHECK(anole_db_tx_exec(tx5, ins1, NULL, 0, NULL, 403) == ANOLE_OK);
+  usleep(100 * 1000);
+  double t0 = now_ms();
+  CHECK(anole_db_tx_release(tx5) == ANOLE_OK);
+  for (int i = 0; i < 3; i++) {
+    r = db_next(c, rec, sizeof rec);
+    CHECK(r->user_data == (uint64_t)(401 + i) && r->status == ANOLE_E_GONE && r->http_status == 0);
+  }
+  CHECK(now_ms() - t0 < 3000);
+  CHECK(db_count(db, c, "acct", 404) == 4); /* the writer is free and nothing was kept */
+
+  /* its timeout rolls it back: idle, the next call is GONE; with a statement running, TIMEOUT */
+  anole_db_tx_options quick = {sizeof quick};
+  quick.timeout_ms = 100;
+  CHECK(anole_db_begin(db, c, &quick, 500) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  anole_db_tx tx6 = r->ev.handle;
+  usleep(300 * 1000);
+  CHECK(anole_db_tx_exec(tx6, ins1, NULL, 0, NULL, 501) == ANOLE_E_GONE);
+  CHECK(anole_db_begin(db, c, &quick, 510) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  anole_db_tx tx7 = r->ev.handle;
+  CHECK(anole_db_tx_query(tx7, (anole_str){slow_sql, strlen(slow_sql)}, NULL, 0, NULL, 511) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 511 && r->status == ANOLE_E_TIMEOUT && r->http_status == 504 && r->error_class == ANOLE_DB_ERR_TIMEOUT);
+  usleep(100 * 1000);
+  CHECK(anole_db_tx_exec(tx7, ins1, NULL, 0, NULL, 512) == ANOLE_E_GONE);
+
+  /* the server's stop rolls back what is open and answers nothing more */
+  CHECK(anole_db_begin(db, c, NULL, 600) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK);
+  stop_polled(s);
+  unlink(path);
+  char side[80];
+  snprintf(side, sizeof side, "%s-wal", path);
+  unlink(side);
+  snprintf(side, sizeof side, "%s-shm", path);
+  unlink(side);
+  printf("ok database transactions: commit, rollback, order, release, timeout, validation, stop\n");
+}
+
+static void test_db_request_tie(void) {
+  if (!anole_has_feature(LIT("sqlite"))) {
+    printf("ok database queries tied to requests (SQLite not built in)\n");
+    return;
+  }
+  const char *json =
+      "{\"executors\":1,\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],"
+      " \"timeouts\":{\"request_ms\":5000,\"shutdown_ms\":500},"
+      " \"routes\":[{\"method\":\"GET\",\"path\":\"/short\",\"handler\":1,\"timeout_ms\":100},"
+      "             {\"method\":\"GET\",\"path\":\"/hold\",\"handler\":1}],"
+      " \"databases\":[{\"name\":\"d\",\"timeout_ms\":200,\"sqlite\":{\"path\":\":memory:\","
+      "  \"init\":\"CREATE TABLE tt (n);\"}}]}";
+  anole_consumer *c = NULL;
+  anole_server *s = polled_server(json, &c);
+  anole_db *db = NULL;
+  CHECK(anole_db_find(s, LIT("d"), &db) == ANOLE_OK);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  db_flush();
+  uint16_t port = port_of(s, 0);
+  static unsigned char rec[1 << 16];
+  const anole_db_result_event *r;
+  pthread_t t;
+  anole_str slow = {slow_sql, strlen(slow_sql)};
+
+  /* canceled at the request's deadline: the client gets 504, the query GONE */
+  async_req *a = start_get(port, "/short", &t);
+  anole_req h = next_request(c);
+  CHECK(anole_db_query(db, NULL, slow, NULL, 0, &(anole_db_options){.size = sizeof(anole_db_options), .req = h}, 1) == ANOLE_OK);
+  CHECK(finish_get(a, t, NULL) == 504);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 1 && r->status == ANOLE_E_GONE && r->http_status == 0 && r->error_class == ANOLE_DB_ERR_NONE);
+
+  /* an answered request leaves its query running */
+  a = start_get(port, "/hold", &t);
+  h = next_request(c);
+  anole_str some = LIT("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 20000) SELECT count(*) FROM n");
+  anole_db_options on_h = {sizeof on_h};
+  on_h.req = h;
+  CHECK(anole_db_query(db, c, some, NULL, 0, &on_h, 2) == ANOLE_OK); /* the request's own consumer, named */
+  CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
+  CHECK(finish_get(a, t, NULL) == 200);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 2 && r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 20000);
+
+  /* a stale request: GONE from the call, nothing queued */
+  usleep(100 * 1000);
+  CHECK(anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, &on_h, 3) == ANOLE_E_GONE && name_is("Gone"));
+  CHECK(count_events(c, ANOLE_EV_DB_RESULT, 100) == 0);
+  /* another kind of handle, and a NULL consumer without a request */
+  anole_db_options on_ws = {sizeof on_ws};
+  on_ws.req = ((uint64_t)2 << 28) | 1;
+  CHECK(anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, &on_ws, 4) == ANOLE_E_INVALID);
+  CHECK(anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, NULL, 5) == ANOLE_E_INVALID);
+
+  /* timeout_ms 0 takes the database's (200 ms here); NONE lifts it */
+  double t0 = now_ms();
+  CHECK(anole_db_query(db, c, slow, NULL, 0, NULL, 6) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 6 && r->status == ANOLE_E_TIMEOUT && r->http_status == 504);
+  CHECK(now_ms() - t0 < 3000);
+  anole_db_options none = {sizeof none};
+  none.timeout_ms = ANOLE_DB_TIMEOUT_NONE;
+  CHECK(anole_db_query(db, c, LIT("SELECT 1"), NULL, 0, &none, 7) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 7 && r->status == ANOLE_OK);
+
+  /* a transaction tied to a request is rolled back at the request's deadline */
+  a = start_get(port, "/short", &t);
+  h = next_request(c);
+  anole_db_tx_options to = {sizeof to};
+  to.req = h;
+  CHECK(anole_db_begin(db, NULL, &to, 10) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 10 && r->status == ANOLE_OK);
+  anole_db_tx tx = r->ev.handle;
+  CHECK(anole_db_tx_exec(tx, LIT("INSERT INTO tt VALUES (1)"), NULL, 0, NULL, 11) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 11 && r->status == ANOLE_OK);
+  CHECK(finish_get(a, t, NULL) == 504);
+  usleep(100 * 1000);
+  CHECK(anole_db_tx_exec(tx, LIT("INSERT INTO tt VALUES (2)"), NULL, 0, NULL, 12) == ANOLE_E_GONE);
+  CHECK(db_count(db, c, "tt", 13) == 0);
+
+  /* ... and survives the request's answer, bounded by its own timeout */
+  a = start_get(port, "/hold", &t);
+  h = next_request(c);
+  to.req = h;
+  CHECK(anole_db_begin(db, c, &to, 20) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 20 && r->status == ANOLE_OK);
+  tx = r->ev.handle;
+  CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
+  CHECK(finish_get(a, t, NULL) == 200);
+  usleep(50 * 1000);
+  CHECK(anole_db_tx_exec(tx, LIT("INSERT INTO tt VALUES (3)"), NULL, 0, NULL, 21) == ANOLE_OK);
+  CHECK(anole_db_tx_commit(tx, 22) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 21 && r->status == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 22 && r->status == ANOLE_OK);
+  CHECK(db_count(db, c, "tt", 23) == 1);
+
+  stop_polled(s);
+  printf("ok database queries and transactions tied to requests: cut at the deadline, kept after the answer\n");
+}
+
+/* PostgreSQL transactions and tied queries, against ANOLE_TEST_POSTGRES_URL. */
+static void test_db_postgres_tx(void) {
+  const char *url = getenv("ANOLE_TEST_POSTGRES_URL");
+  if (!anole_has_feature(LIT("postgres")) || url == NULL || url[0] == 0) {
+    printf("ok postgres transactions (%s)\n", anole_has_feature(LIT("postgres")) ? "no ANOLE_TEST_POSTGRES_URL" : "not built in");
+    return;
+  }
+  char json[4096];
+  snprintf(json, sizeof json,
+           "{\"executors\": 2, \"listeners\": [{\"address\": \"127.0.0.1\", \"port\": 0}],"
+           " \"routes\": [{\"method\": \"GET\", \"path\": \"/short\", \"handler\": 1, \"timeout_ms\": 100}],"
+           " \"databases\": [{\"name\": \"pg\", \"postgres\": {\"url\": \"%s\", \"max_connections\": 6,"
+           "   \"init\": \"DROP TABLE IF EXISTS anole_capi_fk_child, anole_capi_fk_parent, anole_capi_acct;"
+           " CREATE TABLE anole_capi_acct (id int PRIMARY KEY, n int NOT NULL); INSERT INTO anole_capi_acct VALUES (1, 0), (2, 0);"
+           " CREATE TABLE anole_capi_fk_parent (id int PRIMARY KEY);"
+           " CREATE TABLE anole_capi_fk_child (pid int REFERENCES anole_capi_fk_parent (id))\"}}]}",
+           url);
+  anole_consumer *c = NULL;
+  anole_server *s = polled_server(json, &c);
+  anole_db *db = NULL;
+  CHECK(anole_db_find(s, LIT("pg"), &db) == ANOLE_OK);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  db_flush();
+  static unsigned char rec[1 << 20];
+  const anole_db_result_event *r;
+  anole_str sum = LIT("SELECT sum(n) FROM anole_capi_acct");
+
+  /* an error names its table */
+  CHECK(anole_db_exec(db, c, LIT("INSERT INTO anole_capi_fk_child VALUES (999)"), NULL, 0, NULL, 1) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB && r->error_class == ANOLE_DB_ERR_FOREIGN_KEY && str_is(anole_event_str(r, r->table), "anole_capi_fk_child"));
+
+  /* serializable transactions with crossed reads and writes: one loses (409) */
+  anole_db_tx_options ser = {sizeof ser, 0, ANOLE_DB_ISOLATION_SERIALIZABLE, 0, 0, 0};
+  CHECK(anole_db_begin(db, c, &ser, 10) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK);
+  anole_db_tx ta = r->ev.handle;
+  CHECK(anole_db_begin(db, c, &ser, 11) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK);
+  anole_db_tx tb = r->ev.handle;
+  CHECK(anole_db_tx_query(ta, sum, NULL, 0, NULL, 12) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->ev.handle == ta);
+  CHECK(anole_db_tx_query(tb, sum, NULL, 0, NULL, 13) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->ev.handle == tb);
+  CHECK(anole_db_tx_exec(ta, LIT("UPDATE anole_capi_acct SET n = n + 1 WHERE id = 1"), NULL, 0, NULL, 14) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK);
+  CHECK(anole_db_tx_exec(tb, LIT("UPDATE anole_capi_acct SET n = n + 1 WHERE id = 2"), NULL, 0, NULL, 15) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  int b_failed = r->status != ANOLE_OK;
+  if (b_failed) CHECK(r->error_class == ANOLE_DB_ERR_SERIALIZATION && r->http_status == 409);
+  CHECK(anole_db_tx_commit(ta, 16) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 16 && r->status == ANOLE_OK);
+  CHECK(anole_db_tx_commit(tb, 17) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 17 && r->status == ANOLE_E_DB);
+  if (!b_failed) CHECK(r->error_class == ANOLE_DB_ERR_SERIALIZATION && r->http_status == 409);
+
+  /* a failed statement poisons the transaction: 25P02 until the rollback */
+  CHECK(anole_db_begin(db, c, NULL, 20) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  anole_db_tx tp = r->ev.handle;
+  CHECK(anole_db_tx_exec(tp, LIT("SELEKT 1"), NULL, 0, NULL, 21) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB);
+  CHECK(anole_db_tx_query(tp, LIT("SELECT 1"), NULL, 0, NULL, 22) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB && str_is(anole_event_str(r, r->error_code), "25P02"));
+  CHECK(anole_db_tx_commit(tp, 23) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB && memmem(anole_event_str(r, r->error).ptr, anole_event_str(r, r->error).len, "rolled back", 11) != NULL);
+
+  /* release cancels a running statement on the server */
+  CHECK(anole_db_begin(db, c, NULL, 30) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  anole_db_tx tr = r->ev.handle;
+  CHECK(anole_db_tx_query(tr, LIT("SELECT pg_sleep(10)"), NULL, 0, NULL, 31) == ANOLE_OK);
+  usleep(200 * 1000);
+  double t0 = now_ms();
+  CHECK(anole_db_tx_release(tr) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 31 && r->status == ANOLE_E_GONE);
+  CHECK(now_ms() - t0 < 1500);
+  anole_str sleepers = LIT("SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(10)%' AND pid <> pg_backend_pid()");
+  int64_t left = -1;
+  for (int i = 0; i < 20 && left != 0; i++) {
+    CHECK(anole_db_query(db, c, sleepers, NULL, 0, NULL, 40 + i) == ANOLE_OK);
+    r = db_next(c, rec, sizeof rec);
+    CHECK(r->status == ANOLE_OK);
+    left = db_cell(r, 0, 0)->v.i;
+    if (left != 0) usleep(100 * 1000);
+  }
+  CHECK(left == 0);
+
+  /* a query tied to a request sends CancelRequest at the request's deadline */
+  pthread_t t;
+  async_req *a = start_get(port_of(s, 0), "/short", &t);
+  anole_req h = next_request(c);
+  anole_db_options on = {sizeof on};
+  on.req = h;
+  CHECK(anole_db_query(db, NULL, LIT("SELECT pg_sleep(10)"), NULL, 0, &on, 60) == ANOLE_OK);
+  CHECK(finish_get(a, t, NULL) == 504);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 60 && r->status == ANOLE_E_GONE);
+  left = -1;
+  for (int i = 0; i < 20 && left != 0; i++) {
+    CHECK(anole_db_query(db, c, sleepers, NULL, 0, NULL, 70 + i) == ANOLE_OK);
+    r = db_next(c, rec, sizeof rec);
+    left = db_cell(r, 0, 0)->v.i;
+    if (left != 0) usleep(100 * 1000);
+  }
+  CHECK(left == 0);
+
+  CHECK(anole_db_exec(db, c, LIT("DROP TABLE anole_capi_fk_child, anole_capi_fk_parent, anole_capi_acct"), NULL, 0, NULL, 99) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK);
+  stop_polled(s);
+  printf("ok postgres transactions: serialization 409, failed statement, release cancels, tied query cancels, error table\n");
 }
 
 static void test_abi07_rules(void) {
@@ -3438,6 +3849,9 @@ static int run_tests(void) {
   test_webtransport();
   test_tls();
   test_abi07_rules();
+  test_db_tx();
+  test_db_request_tie();
+  test_db_postgres_tx();
   test_cleanup_rules();
   test_error_identity();
   test_abort_reasons();

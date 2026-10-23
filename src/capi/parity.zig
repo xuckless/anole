@@ -332,4 +332,76 @@ pub const websocket_options = [_]Entry{
     .{ .zig = "drain_reason", .omitted = "the drain's close carries the default reason" },
     .{ .zig = "subprotocols", .json = "routes[].websocket.subprotocols", .note = "\"accept\": \"auto\" only; with \"consumer\" the application picks in anole_ws_accept" },
     .{ .zig = "headers", .omitted = "Zig only: the consumer passes headers per accept (anole_ws_accept_options.headers)" },
+
+// Database connectors
+
+fn dbCommon(comptime kind: []const u8) [4]Entry {
+    return .{
+        .{ .zig = "name", .json = "databases[].name" },
+        .{ .zig = "errors", .json = "databases[].errors", .kind = .same },
+        .{ .zig = "cache", .json = "databases[].cache", .kind = .custom, .note = "max_entries and max_bytes, over every executor" },
+        .{ .zig = "timeout", .json = "databases[].timeout_ms", .kind = .ms, .note = "0 is none (`" ++ kind ++ "`)" },
+    };
+}
+
+const tls_note = "ca_file or ca_pem; client_cert_file + client_key_file or client_cert_pem + client_key_pem; insecure_skip_verify";
+
+/// `anole.pg.Options` against `databases[].postgres`.
+pub const pg_options = dbCommon("postgres") ++ [_]Entry{
+    .{ .zig = "url", .json = "databases[].postgres.url" },
+    .{ .zig = "max_connections", .json = "databases[].postgres.max_connections" },
+    .{ .zig = "acquire_timeout", .json = "databases[].postgres.acquire_timeout_ms", .kind = .ms },
+    .{ .zig = "connect_timeout", .json = "databases[].postgres.connect_timeout_ms", .kind = .ms },
+    .{ .zig = "statement_cache_size", .json = "databases[].postgres.statement_cache_size" },
+    .{ .zig = "max_lifetime", .json = "databases[].postgres.max_lifetime_ms", .kind = .ms },
+    .{ .zig = "idle_timeout", .json = "databases[].postgres.idle_timeout_ms", .kind = .ms },
+    .{ .zig = "sslmode", .json = "databases[].postgres.sslmode", .kind = .custom, .note = "by name: \"disable\", \"verify-full\"..." },
+    .{ .zig = "tls", .json = "databases[].postgres.ca_file", .kind = .custom, .note = tls_note },
+    .{ .zig = "connect_at_start", .json = "databases[].postgres.connect_at_start" },
+    .{ .zig = "application_name", .json = "databases[].postgres.application_name" },
+    .{ .zig = "ping_timeout", .json = "databases[].postgres.ping_timeout_ms", .kind = .ms },
+    .{ .zig = "environ", .omitted = "the ABI reads the process's environment" },
+    .{ .zig = "reset_session", .json = "databases[].postgres.reset_session" },
+};
+
+/// `anole.sqlite.Options` against `databases[].sqlite`.
+pub const sqlite_options = dbCommon("sqlite") ++ [_]Entry{
+    .{ .zig = "path", .json = "databases[].sqlite.path" },
+    .{ .zig = "uri", .json = "databases[].sqlite.uri" },
+    .{ .zig = "readers", .json = "databases[].sqlite.readers" },
+    .{ .zig = "busy_timeout", .json = "databases[].sqlite.busy_timeout_ms", .kind = .ms },
+    .{ .zig = "statement_cache_size", .json = "databases[].sqlite.statement_cache_size" },
+    .{ .zig = "ping_timeout", .json = "databases[].sqlite.ping_timeout_ms", .kind = .ms },
+    .{ .zig = "pragmas", .json = "databases[].sqlite.pragmas", .kind = .custom },
+};
+
+/// `anole.redis.Options` against `databases[].redis`.
+pub const redis_options = dbCommon("redis") ++ [_]Entry{
+    .{ .zig = "url", .json = "databases[].redis.url" },
+    .{ .zig = "max_connections", .json = "databases[].redis.max_connections" },
+    .{ .zig = "acquire_timeout", .json = "databases[].redis.acquire_timeout_ms", .kind = .ms },
+    .{ .zig = "connect_timeout", .json = "databases[].redis.connect_timeout_ms", .kind = .ms },
+    .{ .zig = "idle_timeout", .json = "databases[].redis.idle_timeout_ms", .kind = .ms },
+    .{ .zig = "tls", .json = "databases[].redis.ca_file", .kind = .custom, .note = tls_note },
+    .{ .zig = "connect_at_start", .json = "databases[].redis.connect_at_start" },
+    .{ .zig = "ping_timeout", .json = "databases[].redis.ping_timeout_ms", .kind = .ms },
+    .{ .zig = "environ", .omitted = "the ABI reads the process's environment" },
+};
+
+/// `anole.mongodb.Options` against `databases[].mongodb`.
+pub const mongodb_options = dbCommon("mongodb") ++ [_]Entry{
+    .{ .zig = "url", .json = "databases[].mongodb.url" },
+    .{ .zig = "environ", .omitted = "the ABI reads the process's environment" },
+    .{ .zig = "database", .json = "databases[].mongodb.database" },
+    .{ .zig = "tls", .json = "databases[].mongodb.ca_file", .kind = .custom, .note = tls_note },
+    .{ .zig = "max_connections", .json = "databases[].mongodb.max_connections" },
+    .{ .zig = "acquire_timeout", .json = "databases[].mongodb.acquire_timeout_ms", .kind = .ms },
+    .{ .zig = "server_selection_timeout", .json = "databases[].mongodb.server_selection_timeout_ms", .kind = .ms },
+    .{ .zig = "connect_timeout", .json = "databases[].mongodb.connect_timeout_ms", .kind = .ms },
+    .{ .zig = "heartbeat", .json = "databases[].mongodb.heartbeat_ms", .kind = .ms },
+    .{ .zig = "idle_timeout", .json = "databases[].mongodb.idle_timeout_ms", .kind = .custom, .note = "0 is null (never)" },
+    .{ .zig = "retry_reads", .json = "databases[].mongodb.retry_reads" },
+    .{ .zig = "retry_writes", .json = "databases[].mongodb.retry_writes" },
+    .{ .zig = "connect_at_start", .json = "databases[].mongodb.connect_at_start" },
+    .{ .zig = "ping_timeout", .json = "databases[].mongodb.ping_timeout_ms", .kind = .ms },
 };

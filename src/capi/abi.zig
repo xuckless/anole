@@ -320,6 +320,30 @@ pub const DbOptions = extern struct {
     cache_ttl_ms: u32 = 0,
     reserved: u32 = 0,
     cache_tag: Str = .{},
+    /// The request or gRPC call this query serves, or 0 (ABI 0.7).
+    req: u64 = 0,
+};
+
+/// `anole_db_options.timeout_ms`: no bound for this query.
+pub const DB_TIMEOUT_NONE: u32 = 0xFFFFFFFF;
+
+/// `anole_db_tx_options.flags`.
+pub const DB_TX_READ_ONLY: u32 = 1;
+
+/// `anole_db_tx_options.isolation`.
+pub const DB_ISOLATION_DEFAULT: u32 = 0;
+pub const DB_ISOLATION_READ_UNCOMMITTED: u32 = 1;
+pub const DB_ISOLATION_READ_COMMITTED: u32 = 2;
+pub const DB_ISOLATION_REPEATABLE_READ: u32 = 3;
+pub const DB_ISOLATION_SERIALIZABLE: u32 = 4;
+
+pub const DbTxOptions = extern struct {
+    size: usize,
+    flags: u32 = 0,
+    isolation: u32 = 0,
+    timeout_ms: u32 = 0,
+    reserved: u32 = 0,
+    req: u64 = 0,
 };
 
 pub const DB_FROM_DATABASE: u8 = 0;
@@ -357,6 +381,9 @@ pub const DbResultEvent = extern struct {
     @"error": Span,
     error_code: Span,
     constraint: Span,
+    /// The table (or collection) the error names, when the database says
+    /// (ABI 0.7).
+    table: Span,
 };
 
 pub const DbCell = extern struct {
@@ -460,8 +487,9 @@ comptime {
     std.debug.assert(@sizeOf(GrpcCallEvent) == 104);
     std.debug.assert(@sizeOf(GrpcMessageEvent) == 32);
     std.debug.assert(@sizeOf(DbValue) == 24);
-    std.debug.assert(@sizeOf(DbOptions) == 40);
-    std.debug.assert(@sizeOf(DbResultEvent) == 96);
+    std.debug.assert(@sizeOf(DbOptions) == 48);
+    std.debug.assert(@sizeOf(DbTxOptions) == 32);
+    std.debug.assert(@sizeOf(DbResultEvent) == 104);
     std.debug.assert(@sizeOf(DbCell) == 16);
     std.debug.assert(@sizeOf(WtStreamEvent) == 32);
     std.debug.assert(@sizeOf(WtDataEvent) == 32);
@@ -508,6 +536,7 @@ pub const records = .{
     .{ "anole_listener_info", ListenerInfo },
     .{ "anole_db_value", DbValue },
     .{ "anole_db_options", DbOptions },
+    .{ "anole_db_tx_options", DbTxOptions },
     .{ "anole_db_cell", DbCell },
     .{ "anole_db_result_event", DbResultEvent },
 };
@@ -566,7 +595,7 @@ pub const events = [_]EventInfo{
     .{ .type = 6, .name = "ANOLE_EV_WS_OPEN", .record = "anole_request_event", .handles = &.{"websocket"} },
     .{ .type = 7, .name = "ANOLE_EV_WS_MESSAGE", .record = "anole_ws_message_event", .handles = &.{"websocket"} },
     .{ .type = 8, .name = "ANOLE_EV_WS_CLOSE", .record = "anole_ws_close_event", .handles = &.{"websocket"} },
-    .{ .type = 10, .name = "ANOLE_EV_DB_RESULT", .record = "anole_db_result_event" },
+    .{ .type = 10, .name = "ANOLE_EV_DB_RESULT", .record = "anole_db_result_event", .handles = &.{"db_tx"} },
     .{ .type = 11, .name = "ANOLE_EV_STOPPED", .record = "anole_event" },
     .{ .type = 12, .name = "ANOLE_EV_GRPC_CALL", .record = "anole_grpc_call_event", .handles = &.{"grpc_call"}, .obligation = "finish" },
     .{ .type = 13, .name = "ANOLE_EV_GRPC_MESSAGE", .record = "anole_grpc_message_event", .handles = &.{"grpc_call"} },
@@ -631,6 +660,9 @@ pub const constant_groups = [_]ConstantGroup{
     .{ .prefix = "ANOLE_DB_F_", .group = "db_flag" },
     .{ .prefix = "ANOLE_DB_FROM_", .group = "db_source" },
     .{ .prefix = "ANOLE_DB_ERR_", .group = "db_error_class" },
+    .{ .prefix = "ANOLE_DB_TX_", .group = "db_tx_flag" },
+    .{ .prefix = "ANOLE_DB_ISOLATION_", .group = "db_isolation" },
+    .{ .prefix = "ANOLE_DB_TIMEOUT_", .group = "db_timeout" },
     .{ .prefix = "ANOLE_ABI_", .group = "abi" },
 };
 

@@ -81,6 +81,38 @@ Server options, TLS and errors (API hardening; see
   or is listed in docs/c-abi.md with the reason it has none.
 - Outbound requests say `User-Agent: anole/<version>` (was `dusty/0.4.0`);
   `anole.version` is the version.
+- Database calls are bounded by 30 s by default: `Options.timeout` on all
+  four connectors (it was MongoDB's alone, and off), and the C ABI's
+  `databases[].timeout_ms`. A call without a bound used to wait as long as the
+  database did, which a stuck database turned into an exhausted pool. Set
+  `timeout = null` (`"timeout_ms": 0`) for the old behaviour, or
+  `.with(.{ .timeout = .max })` (`ANOLE_DB_TIMEOUT_NONE`) for one call.
+  `TxOptions.timeout = null` is the connector's bound, not none.
+- Databases: the run-time pair is `table` and `execValues` (was `run`) on
+  both SQL connectors, and MongoDB's `with(options).dynamic(ctx, op,
+  collection, docs)` takes the context first.
+- Databases, one vocabulary: `anole.sqlite.Options`: `busy_timeout_ms` is
+  `busy_timeout` (a Duration), `statement_cache` is `statement_cache_size`
+  (`u16`), `readers` is `?u32`; `sqlite.Client.execScript` takes a context
+  (`execScript(&ctx, sql)`, and `pg.Client.execScript` is new).
+  `anole.mongodb.Options`: `max_idle` is `idle_timeout`; `max_connections`
+  is `?u32`, null for 100, and 0 (no limit) is refused; `connect_timeout` is
+  optional; `tls` is `anole.db.Tls`. Every connector: `name` is optional;
+  `max_connections = 0` is refused at init; `tls` is `anole.db.Tls`
+  (`ca: ?anole.Ca`, `client_certificate: ?anole.Cert`,
+  `insecure_skip_verify`); `Conn.release` takes `*const Conn`. C ABI config:
+  `databases[].sqlite.statement_cache` is `statement_cache_size`;
+  `databases[].mongodb.max_connections` 0 is refused.
+- C ABI: `anole_db_options.timeout_ms = 0` now means the database's
+  `timeout_ms`, not "none"; `anole_db_options` grows to 48 bytes and
+  `anole_db_result_event` to 104.
+- gRPC: `Call.addHeader` and `Call.addTrailer` refuse the protocols' own keys
+  (`grpc-*` but `grpc-status-details-bin` in trailers, `connect-*`,
+  `trailer-*`, `content-type`, `te`...), as the C ABI did: a handler could
+  send a second `grpc-status`. `addHeader` now adds a value instead of
+  replacing one, so a repeated key keeps every value. The C ABI refuses
+  `grpc-status-details-bin` as initial metadata (it was sent as a header,
+  which no client reads).
 
 ### Added
 
@@ -104,6 +136,12 @@ Server options, TLS and errors (API hardening; see
 - `anole.Duration`, `anole.Ca`, `anole.ClientAuth`, `anole.ClientOptions`,
   `anole.ServerError`, `anole.TlsLoadError`, `anole.errors`.
 - `Compress.Options.brotli_quality`, a per-middleware Brotli quality.
+- Databases: `connect_at_start` and `ping_timeout` on MongoDB, `ping_timeout`
+  on SQLite, `anole.db.Tls`; `Tx.table`, `Tx.run` and `Tx.with(options)` on
+  both SQL connectors; `call.failFmt(code, fmt, args)` in gRPC.
+- `Group.grpc` and `Group.grpcWith` register a gRPC service behind a group's
+  middleware, for its gRPC calls and its transcoded routes alike; until now a
+  transcoded `/v1/...` route skipped a `/v1` group's auth middleware.
 
 ### Fixed
 
@@ -122,6 +160,18 @@ Server options, TLS and errors (API hardening; see
   250 to 100.
 - `app.tracing()` reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME`
   from the environment; it used to need `.process`.
+- `iterate` that leaves a transaction open, and a connection from `acquire`
+  given back inside one, are now rolled back (and logged) as plain calls
+  already were in 0.1.3. A finished SQLite `Tx` fails with `error.Database`
+  instead of asserting (undefined behaviour in release builds).
+- `Call.fail`, `Call.addTrailer` and `Call.addHeader` copy their strings: a
+  message formatted into a stack buffer used to be read after the handler
+  returned.
+- The C ABI's schema advertised `mongodb+srv://`, which is refused at start;
+  it now says so, with the way around it.
+- docs/database.md no longer says `.auto` catches a role change made inside a
+  function: PostgreSQL does not report `role`; use `.always` for apps that
+  switch roles.
 
 ### Added (C ABI 0.7, HTTP and WebSocket)
 
@@ -227,6 +277,24 @@ and docs/c-abi.md ("From ABI 0.6").
   never get an event). `anole_consumer_set_wake` lets a restarted worker or a
   new event loop take over a consumer.
 
+- Database transactions: `anole_db_begin` answers with an `anole_db_tx`
+  handle; `anole_db_tx_query`/`_exec` run on its connection in order,
+  `anole_db_tx_commit`/`_rollback` end it, `anole_db_tx_release` (or
+  `anole_handle_release`) rolls back from a finalizer. A transaction is
+  bounded as a whole by `timeout_ms` (the database's, 30 s, by default) and
+  can be tied to a request. SQLite and PostgreSQL.
+- `anole_db_options.req` ties a query to the request or gRPC call it serves:
+  it runs on that request's executor, and is canceled (answering
+  `ANOLE_E_GONE`) when the request is aborted or passes its deadline.
+- `databases[]` takes `timeout_ms` and `errors` (a class to status map, as
+  `anole.db.ErrorMap`), and client certificates and `insecure_skip_verify`
+  for PostgreSQL, Redis and MongoDB, with the options MongoDB lacked
+  (`idle_timeout_ms`, `heartbeat_ms`, `retry_reads`, `retry_writes`,
+  `connect_at_start`, `ping_timeout_ms`) and SQLite's `uri` and
+  `ping_timeout_ms`; `anole_db_result_event.table` names the table or
+  collection of an error.
+- `grpc.services[].middleware`: native middleware per gRPC service.
+
 ### Fixed
 
 - C ABI: `ANOLE_EV_SENT` follows every borrowing call that returned `>= 0`,
@@ -235,6 +303,9 @@ and docs/c-abi.md ("From ABI 0.6").
   answers `ANOLE_E_NOMEM` and takes nothing if it cannot). Borrowing calls
   that fail never produce one. On HTTP/2 and HTTP/3 a borrowed whole-response
   body is copied (documented).
+- C ABI: a libanole built with Redis or MongoDB but neither SQLite nor
+  PostgreSQL refused every `anole_db_query` and `anole_db_exec` with
+  `ANOLE_E_UNSUPPORTED`.
 - C ABI executors no longer spin a core at 100% while a consumer's queue is
   full: they sleep until the consumer polls. Events (`ANOLE_EV_ABORT`,
   `_WRITABLE`, `_BODY`, `_SENT`) are no longer dropped when the queue is full.

@@ -135,18 +135,31 @@ pub const Config = struct {
         /// The bounds of the answers kept for queries with cache_ttl_ms,
         /// over every executor.
         cache: CacheBounds = .{},
+        /// A bound on every query that has no timeout_ms of its own, in a
+        /// request or not; past it the statement is interrupted
+        /// (ANOLE_E_TIMEOUT). 0: none.
+        timeout_ms: u32 = 30_000,
+        /// What status each class of database error becomes, as
+        /// `anole.db.ErrorMap`: a class name to "bad_request", "not_found",
+        /// "conflict", "unprocessable_entity", "internal_server_error",
+        /// "service_unavailable" or "gateway_timeout".
+        errors: anole.db.ErrorMap = .{},
     };
 
     pub const Sqlite = struct {
         /// A file (created when missing), or ":memory:".
         path: []const u8,
+        /// Take a path starting with "file:" as a SQLite URI.
+        uri: bool = false,
         /// Read-only connections beside the writer; null: one per executor,
         /// at most 8; 0: everything on the writer.
         readers: ?u32 = null,
         /// How long a statement waits for a lock another process holds.
         busy_timeout_ms: u32 = 5000,
         /// Prepared statements kept per connection.
-        statement_cache: u32 = 64,
+        statement_cache_size: u16 = 64,
+        /// What /readyz waits for the database's answer.
+        ping_timeout_ms: u32 = 2000,
         /// Run on every connection as it opens: "PRAGMA cache_size = -20000".
         pragmas: []const []const u8 = &.{},
         /// SQL run once at start, before the listeners open: a schema.
@@ -168,6 +181,17 @@ pub const Config = struct {
         /// Null: the URL's sslrootcert, else the system's store.
         ca_file: ?[]const u8 = null,
         ca_pem: ?[]const u8 = null,
+        /// A client certificate and key (PEM), as files or as text, for
+        /// servers that ask. Null: the URL's.
+        client_cert_file: ?[]const u8 = null,
+        client_key_file: ?[]const u8 = null,
+        client_cert_pem: ?[]const u8 = null,
+        client_key_pem: ?[]const u8 = null,
+        /// TLS without checking the server's certificate. Refused with a CA
+        /// and with a URL that verifies.
+        insecure_skip_verify: bool = false,
+        /// What /readyz waits for the server's answer.
+        ping_timeout_ms: u32 = 2000,
         /// Connections in all, split between the executors. Null: the URL's
         /// pool_max_conns, else twice the executors, at least 4.
         max_connections: ?u32 = null,
@@ -204,6 +228,17 @@ pub const Config = struct {
         /// ssl_ca_certs, else the system's store.
         ca_file: ?[]const u8 = null,
         ca_pem: ?[]const u8 = null,
+        /// A client certificate and key (PEM), as files or as text, for
+        /// servers that ask. Null: the URL's.
+        client_cert_file: ?[]const u8 = null,
+        client_key_file: ?[]const u8 = null,
+        client_cert_pem: ?[]const u8 = null,
+        client_key_pem: ?[]const u8 = null,
+        /// TLS without checking the server's certificate. Refused with a CA
+        /// and with a URL that verifies.
+        insecure_skip_verify: bool = false,
+        /// What /readyz waits for the server's answer.
+        ping_timeout_ms: u32 = 2000,
         /// Connections in all, split between the executors. Null: ten per
         /// executor.
         max_connections: ?u32 = null,
@@ -220,9 +255,9 @@ pub const Config = struct {
 
     /// A MongoDB deployment, as `anole.mongodb.Options` (docs/database.md).
     pub const Mongodb = struct {
-        /// mongodb:// or mongodb+srv:// connection string; its options win
-        /// over the fields below. Null: MONGODB_URI, else
-        /// mongodb://localhost:27017.
+        /// A mongodb:// connection string; its options win over the fields
+        /// below. mongodb+srv:// is not supported yet (list the hosts with
+        /// mongodb://). Null: MONGODB_URI, else mongodb://localhost:27017.
         url: ?[]const u8 = null,
         /// The database operations name no other for. Null: the URL's
         /// path, else "test".
@@ -232,15 +267,37 @@ pub const Config = struct {
         /// URL that turns it off or stops checking is refused.
         ca_file: ?[]const u8 = null,
         ca_pem: ?[]const u8 = null,
-        /// Connections at most, split between the executors (maxPoolSize;
-        /// 0: no limit).
-        max_connections: u32 = 100,
+        /// A client certificate and key (PEM), as files or as text, for
+        /// servers that ask. Null: the URL's.
+        client_cert_file: ?[]const u8 = null,
+        client_key_file: ?[]const u8 = null,
+        client_cert_pem: ?[]const u8 = null,
+        client_key_pem: ?[]const u8 = null,
+        /// TLS without checking the server's certificate. Refused with a CA
+        /// and with a URL that verifies.
+        insecure_skip_verify: bool = false,
+        /// What /readyz waits for the server's answer.
+        ping_timeout_ms: u32 = 2000,
+        /// Connections at most, split between the executors (maxPoolSize).
+        /// Null: 100. 0 is refused.
+        max_connections: ?u32 = null,
         /// How long an operation waits for a pooled connection.
         acquire_timeout_ms: u32 = 10_000,
         /// How long an operation waits for a server it can use (a primary).
         server_selection_timeout_ms: u32 = 30_000,
-        /// TCP connect and TLS handshake.
+        /// TCP connect and TLS handshake; 0: no limit.
         connect_timeout_ms: u32 = 10_000,
+        /// Idle connections older than this are closed; 0: never.
+        idle_timeout_ms: u32 = 0,
+        /// Between two checks of a server.
+        heartbeat_ms: u32 = 10_000,
+        /// Retry a read once after a network error or a primary change.
+        retry_reads: bool = true,
+        /// Retry a single-document write once, likewise.
+        retry_writes: bool = true,
+        /// Select a server and open a connection per executor at start, and
+        /// fail the start if that fails.
+        connect_at_start: bool = false,
     };
 
     pub const CacheBounds = struct {
@@ -489,6 +546,9 @@ pub const Config = struct {
         /// Unary and server-streaming calls that arrive whole run on the
         /// protocol's reader, detached (as `no_wait` routes do).
         no_wait: bool = true,
+        /// After the global ones; runs for the service's gRPC paths and its
+        /// transcoded routes, as a route's `middleware` does.
+        middleware: []const Middleware = &.{},
     };
     pub const GrpcMethod = struct {
         name: []const u8,
@@ -641,6 +701,7 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (d.sqlite) |sq| {
             if (comptime !features.sqlite) return fail(why, "databases[{d}].sqlite: SQLite is not built in (-Dsqlite)", .{i});
             if (sq.path.len == 0) return fail(why, "databases[{d}].sqlite.path: a file or \":memory:\"", .{i});
+            if (sq.statement_cache_size == 0) return fail(why, "databases[{d}].sqlite.statement_cache_size: at least 1", .{i});
         }
         if (d.postgres) |p| {
             if (comptime !features.postgres) return fail(why, "databases[{d}].postgres: PostgreSQL is not built in (-Dpostgres)", .{i});
@@ -650,16 +711,20 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
                     return fail(why, "databases[{d}].postgres: sslmode is given twice, in the url and beside it", .{i});
             }
             if (p.ca_file != null and p.ca_pem != null) return fail(why, "databases[{d}].postgres: ca_file or ca_pem, not both", .{i});
+            try checkClientCert(p, "postgres", i, why);
             if (p.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].postgres.max_connections: at least 1", .{i});
         }
         if (d.redis) |r| {
             if (comptime !features.redis) return fail(why, "databases[{d}].redis: Redis is not built in (-Dredis)", .{i});
             if (r.ca_file != null and r.ca_pem != null) return fail(why, "databases[{d}].redis: ca_file or ca_pem, not both", .{i});
+            try checkClientCert(r, "redis", i, why);
             if (r.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].redis.max_connections: at least 1", .{i});
         }
         if (d.mongodb) |m| {
             if (comptime !features.mongodb) return fail(why, "databases[{d}].mongodb: MongoDB is not built in (-Dmongodb)", .{i});
             if (m.ca_file != null and m.ca_pem != null) return fail(why, "databases[{d}].mongodb: ca_file or ca_pem, not both", .{i});
+            try checkClientCert(m, "mongodb", i, why);
+            if (m.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].mongodb.max_connections: at least 1", .{i});
         }
     }
     if (cfg.observe.health) |h| {
@@ -735,6 +800,17 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     }
 }
 
+/// The client certificate and key of a database: files or text, a
+/// certificate with its key, and not with `insecure_skip_verify` and a CA.
+fn checkClientCert(c: anytype, comptime kind: []const u8, i: usize, why: *std.Io.Writer) Problem!void {
+    const files = c.client_cert_file != null or c.client_key_file != null;
+    const pem = c.client_cert_pem != null or c.client_key_pem != null;
+    if (files and pem) return fail(why, "databases[{d}]." ++ kind ++ ": client_cert_file/client_key_file or client_cert_pem/client_key_pem, not both", .{i});
+    if (files and (c.client_cert_file == null or c.client_key_file == null)) return fail(why, "databases[{d}]." ++ kind ++ ": client_cert_file and client_key_file go together", .{i});
+    if (pem and (c.client_cert_pem == null or c.client_key_pem == null)) return fail(why, "databases[{d}]." ++ kind ++ ": client_cert_pem and client_key_pem go together", .{i});
+    if (c.insecure_skip_verify and (c.ca_file != null or c.ca_pem != null)) return fail(why, "databases[{d}]." ++ kind ++ ": insecure_skip_verify cannot be set with a CA", .{i});
+}
+
 fn checkGrpc(g: Config.Grpc, why: *std.Io.Writer) Problem!void {
     if (comptime !features.grpc) return fail(why, "grpc: gRPC is not built in (-Dgrpc)", .{});
     if (g.descriptor_set != null and g.descriptor_set_file != null) return fail(why, "grpc: one of descriptor_set and descriptor_set_file", .{});
@@ -744,6 +820,8 @@ fn checkGrpc(g: Config.Grpc, why: *std.Io.Writer) Problem!void {
         if (svc.name.len == 0 or svc.name.len > 255) return fail(why, "grpc.services[{d}].name: 1-255 bytes", .{i});
         for (g.services[0..i]) |other| if (std.mem.eql(u8, other.name, svc.name)) return fail(why, "grpc.services[{d}]: {s} twice", .{ i, svc.name });
         if (svc.max_message_size == 0 or svc.max_message_size > max_record_payload) return fail(why, "grpc.services[{d}].max_message_size: 1 to {d}", .{ i, max_record_payload });
+        var mw_buf: [48]u8 = undefined;
+        try checkMiddleware(svc.middleware, std.fmt.bufPrint(&mw_buf, "grpc.services[{d}].middleware", .{i}) catch "grpc.services[].middleware", why);
         if (svc.methods == null and !descriptors) return fail(why, "grpc.services[{d}]: methods, or the descriptors (descriptor_set)", .{i});
         const methods = svc.methods orelse continue;
         if (methods.len > std.math.maxInt(u16)) return fail(why, "grpc.services[{d}].methods: too many", .{i});
@@ -996,6 +1074,35 @@ test "parse: the defaults, a full document, and what is refused" {
         _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\", \"allow_any_audience\": true}}]}", &why);
         // Inline keys are the application's own: no audience needed.
         _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks\": {\"keys\": []}}}]}", &why);
+    }
+}
+
+test "parse: a gRPC service takes middleware; one that fetches keys keeps its calls attached" {
+    if (!features.grpc) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [512]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    const cfg = try parse(a,
+        \\{"grpc": {"services": [{"name": "a.B", "handler": 1, "methods": [{"name": "M", "kind": "unary"}],
+        \\  "middleware": [{"rate_limit": {"limit": 5}}]}]}}
+    , &why);
+    try std.testing.expectEqual(@as(usize, 1), cfg.grpc.?.services[0].middleware.len);
+    try std.testing.expect(neverWaits(cfg.grpc.?.services[0].middleware));
+    if (features.auth) {
+        const waits = try parse(a,
+            \\{"grpc": {"services": [{"name": "a.B", "handler": 1, "methods": [{"name": "M", "kind": "unary"}],
+            \\  "middleware": [{"jwt": {"jwks_url": "https://issuer.example/jwks", "audience": "api"}}]}]}}
+        , &why);
+        try std.testing.expect(!neverWaits(waits.grpc.?.services[0].middleware));
+        // Checked like a route's: both key sources is a config error naming the service.
+        why.end = 0;
+        try std.testing.expectError(error.Config, parse(a,
+            \\{"grpc": {"services": [{"name": "a.B", "handler": 1, "methods": [{"name": "M", "kind": "unary"}],
+            \\  "middleware": [{"jwt": {"jwks_url": "https://i/jwks", "jwks": {"keys": []}}}]}]}}
+        , &why));
+        try std.testing.expect(std.mem.indexOf(u8, why.buffered(), "grpc.services[0].middleware") != null);
     }
 }
 
