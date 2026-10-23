@@ -34,6 +34,7 @@ const nats = if (features.nats) anole.nats else struct {
     pub const JsMsg = void;
 };
 const Puller = if (features.nats) anole.nats.jetstream.Puller else void;
+const JsMsg = if (features.nats) anole.nats.jetstream.JsMsg else void;
 
 const log = std.log.scoped(.anole);
 const ms = std.Io.Duration.fromMilliseconds;
@@ -955,7 +956,7 @@ pub const MsgWait = struct {
     kind: u32 = abi.NATS_ACK,
     delay_ms: u32 = 0,
     resolved: bool = false,
-    jm: *anole.nats.jetstream.JsMsg,
+    jm: *JsMsg,
 };
 
 /// The handler of a consume: posts the message and waits for the consumer.
