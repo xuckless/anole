@@ -247,6 +247,12 @@ pub const json = if (features.json) @import("json/root.zig") else struct {};
 /// executor.
 pub const redis = if (features.redis) @import("redis/root.zig") else struct {};
 
+/// Kafka (`-Dkafka`): a client of Anole's own on `std.Io`. `state.kafka =
+/// try app.kafka(.{})` (KAFKA_BOOTSTRAP_SERVERS), then `send`/`produce` to
+/// publish and `consume` to handle a topic as a member of a group. See
+/// `anole.kafka` (src/kafka/root.zig).
+pub const kafka = if (features.kafka) @import("kafka/root.zig") else struct {};
+
 /// What the database connectors share: calls that take the request, a
 /// pool per executor, errors that are statuses (`NotFound` 404, `Conflict`
 /// 409...), `Time`, connection URLs from the environment, and the health,
@@ -342,6 +348,7 @@ test {
     _ = mongodb;
     _ = @import("net/client_stream.zig");
     _ = @import("net/scram.zig");
+    _ = kafka;
     _ = session;
     _ = early_data;
     _ = ratelimit;

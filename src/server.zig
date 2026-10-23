@@ -74,6 +74,10 @@ const redis_mod = if (features.redis) @import("redis/root.zig") else struct {
     pub const Options = struct {};
     pub const Client = void;
 };
+const kafka_mod = if (features.kafka) @import("kafka/root.zig") else struct {
+    pub const Options = struct {};
+    pub const Client = void;
+};
 const grpc_mod = if (features.grpc) @import("grpc/root.zig") else struct {
     pub const Health = void;
     pub const RegisterOptions = struct {};
@@ -2120,6 +2124,27 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             errdefer r.deinit();
             try self.extras.connectors.append(self.arena.allocator(), .of(redis_mod.Client, r));
             return r;
+        }
+
+        /// A Kafka client for the handlers, owned by the server:
+        /// `state.kafka = try app.kafka(.{});` reads KAFKA_BOOTSTRAP_SERVERS
+        /// (or `options.brokers`), else `localhost:9092`. Nothing connects
+        /// before the first call (unless `connect_at_start`). Once serving,
+        /// it reports to `app.metrics`, `app.tracing` and `app.health` when
+        /// the app has them, joins the groups registered with `consume`,
+        /// and at shutdown drains: records in flight finish, offsets are
+        /// committed, the producer flushes. See `anole.kafka`.
+        pub fn kafka(self: *Self, config: kafka_mod.Options) !*kafka_mod.Client {
+            if (comptime !features.kafka) @compileError("app.kafka needs Kafka (-Dkafka, on in the full profile)");
+            var opts = config;
+            if (opts.environ == null) if (self.process) |p| {
+                opts.environ = p.environ;
+            };
+            const k = try kafka_mod.Client.init(self.gpa, self.rt.io(), opts);
+            errdefer k.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(kafka_mod.Client, k));
+            if (self.extras.connectors_started) try k.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            return k;
         }
 
         /// Loads every TLS listener's certificate and key again (from their
