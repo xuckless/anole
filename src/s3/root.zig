@@ -773,14 +773,16 @@ pub const Client = struct {
             self.bytes_down = bytes.with(&.{ self.label, "down" });
             self.memory_gauge = (try r.gauge("anole_s3_upload_memory_bytes", "Memory held by upload part buffers.", &.{"db"})).with(&.{self.label});
         }
-        if (!self.anonymous and self.creds.current_ == null) {
-            self.creds.resolve(util.nowSeconds(self.io)) catch |err| switch (err) {
-                error.NoCredentials => {
-                    log.err("s3 \"{s}\": no credentials ({s})", .{ self.label, self.creds.report.items });
-                    return error.DatabaseUnavailable;
-                },
-                else => |e| return e,
-            };
+        if (!self.anonymous) {
+            if (self.creds.current_ == null) {
+                self.creds.resolve(util.nowSeconds(self.io)) catch |err| switch (err) {
+                    error.NoCredentials => {
+                        log.err("s3 \"{s}\": no credentials ({s})", .{ self.label, self.creds.report.items });
+                        return error.DatabaseUnavailable;
+                    },
+                    else => |e| return e,
+                };
+            }
             self.creds.start();
         }
         if (health) |h| if (self.readiness_on) try h.addCheck(self.label, readyCheck, self);

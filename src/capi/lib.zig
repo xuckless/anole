@@ -1358,6 +1358,226 @@ export fn anole_db_tx_release(tx: u64) i32 {
 // ---- end p3/realtime ----
 
 // ---- p3/s3 ----
+// ---- object storage ---------------------------------------------------------------
+
+const s3_mod = engine.s3;
+
+fn s3Of(p: ?*anyopaque) ?*s3_mod.Store {
+    const st: *s3_mod.Store = @ptrCast(@alignCast(p orelse return null));
+    return if (engine.global == st.engine) st else null;
+}
+
+export fn anole_s3_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    const st = s3_mod.find(e, name.slice()) orelse {
+        return named(abi.E_INVALID, "Invalid", 0, "no storage \"{s}\" in the configuration", .{name.slice()});
+    };
+    dst.* = st;
+    return abi.OK;
+}
+
+export fn anole_s3_index(p: ?*const anyopaque) u32 {
+    const st = s3Of(@constCast(p)) orelse return std.math.maxInt(u32);
+    return st.index;
+}
+
+/// A call's refusal as its answer.
+fn s3Failure(err: s3_mod.QueryError) i32 {
+    return switch (err) {
+        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a key of 0 or over 1024 bytes, an option this call does not take, a consumer of another server or other than the request's, or a request handle of another kind)", .{}),
+        error.State => named(abi.E_STATE, "State", 0, "the server is not open, or no executor feeds this consumer", .{}),
+        error.OutOfMemory => failCode(abi.E_NOMEM),
+        error.Gone => failCode(abi.E_GONE),
+        error.Unsupported => failCode(abi.E_UNSUPPORTED),
+    };
+}
+
+fn s3Consumer(c_: ?*anyopaque) error{Bad}!?*Consumer {
+    return if (c_ == null) null else (consumerOf(c_) orelse return error.Bad);
+}
+
+const s3_get_flags = abi.S3_F_STREAM | abi.S3_F_RANGE | abi.S3_F_NO_RETRY | abi.S3_F_PASS_NOT_FOUND | abi.S3_F_REPORT;
+const s3_put_flags = abi.S3_F_IF_ABSENT | abi.S3_F_NO_RETRY | abi.S3_F_REPLACE_METADATA | abi.S3_F_LENGTH;
+
+fn s3GetCall(p: ?*anyopaque, c_: ?*anyopaque, key: Str, opts: ?*const abi.S3GetOptions, user_data: u64, head: bool) i32 {
+    clearError();
+    const st = s3Of(p) orelse return badPointer(p);
+    const c = s3Consumer(c_) catch return badPointer(c_);
+    const o: abi.S3GetOptions = if (opts) |q| readSized(abi.S3GetOptions, q) catch |err| return sizedFailure(err) else .{};
+    const allowed: u32 = if (head) abi.S3_F_NO_RETRY else s3_get_flags & ~(abi.S3_F_PASS_NOT_FOUND | abi.S3_F_REPORT);
+    if (o.flags & ~allowed != 0) return unknownFlag();
+    s3_mod.get(st, c, key, o, user_data, head) catch |err| return s3Failure(err);
+    return abi.OK;
+}
+
+export fn anole_s3_get(p: ?*anyopaque, c_: ?*anyopaque, key: Str, opts: ?*const abi.S3GetOptions, user_data: u64) i32 {
+    return s3GetCall(p, c_, key, opts, user_data, false);
+}
+
+export fn anole_s3_head(p: ?*anyopaque, c_: ?*anyopaque, key: Str, opts: ?*const abi.S3GetOptions, user_data: u64) i32 {
+    return s3GetCall(p, c_, key, opts, user_data, true);
+}
+
+export fn anole_s3_read_more(t: u64, nbytes: u32) i32 {
+    clearError();
+    if (badKind(t, .transfer)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    s3_mod.readMore(e, t, nbytes) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_s3_serve(p: ?*anyopaque, r: u64, key: Str, opts: ?*const abi.S3GetOptions, user_data: u64) i32 {
+    clearError();
+    if (badKind(r, .request)) return wrongKind();
+    const st = s3Of(p) orelse return badPointer(p);
+    const o: abi.S3GetOptions = if (opts) |q| readSized(abi.S3GetOptions, q) catch |err| return sizedFailure(err) else .{};
+    if (o.flags & ~(abi.S3_F_RANGE | abi.S3_F_NO_RETRY | abi.S3_F_PASS_NOT_FOUND | abi.S3_F_REPORT) != 0) return unknownFlag();
+    s3_mod.serve(st, r, key, o, user_data) catch |err| return s3Failure(err);
+    return abi.OK;
+}
+
+export fn anole_s3_put(p: ?*anyopaque, c_: ?*anyopaque, key: Str, data: ?*const anyopaque, len: usize, opts: ?*const abi.S3PutOptions, user_data: u64) i32 {
+    clearError();
+    const st = s3Of(p) orelse return badPointer(p);
+    const c = s3Consumer(c_) catch return badPointer(c_);
+    const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
+    const o: abi.S3PutOptions = if (opts) |q| readSized(abi.S3PutOptions, q) catch |err| return sizedFailure(err) else .{};
+    if (o.flags & ~(abi.S3_F_IF_ABSENT | abi.S3_F_NO_RETRY) != 0) return unknownFlag();
+    s3_mod.put(st, c, key, b, o, user_data) catch |err| return s3Failure(err);
+    return abi.OK;
+}
+
+export fn anole_s3_put_body(p: ?*anyopaque, r: u64, key: Str, opts: ?*const abi.S3PutOptions, user_data: u64) i32 {
+    clearError();
+    if (badKind(r, .request)) return wrongKind();
+    const st = s3Of(p) orelse return badPointer(p);
+    const o: abi.S3PutOptions = if (opts) |q| readSized(abi.S3PutOptions, q) catch |err| return sizedFailure(err) else .{};
+    if (o.flags & ~(abi.S3_F_IF_ABSENT | abi.S3_F_NO_RETRY) != 0) return unknownFlag();
+    s3_mod.putBody(st, r, key, o, user_data) catch |err| return s3Failure(err);
+    return abi.OK;
+}
+
+export fn anole_s3_upload_open(p: ?*anyopaque, c_: ?*anyopaque, key: Str, opts: ?*const abi.S3PutOptions, user_data: u64) i32 {
+    clearError();
+    const st = s3Of(p) orelse return badPointer(p);
+    const c = s3Consumer(c_) catch return badPointer(c_);
+    const o: abi.S3PutOptions = if (opts) |q| readSized(abi.S3PutOptions, q) catch |err| return sizedFailure(err) else .{};
+    if (o.flags & ~(abi.S3_F_IF_ABSENT | abi.S3_F_NO_RETRY | abi.S3_F_LENGTH) != 0) return unknownFlag();
+    s3_mod.uploadOpen(st, c, key, o, user_data) catch |err| return s3Failure(err);
+    return abi.OK;
+}
+
+export fn anole_s3_upload_write(t: u64, data: ?*const anyopaque, len: usize, flags: u32) i32 {
+    clearError();
+    if (badKind(t, .transfer)) return wrongKind();
+    if (flags & abi.BODY_BORROW != 0) return named(abi.E_INVALID, "UnknownFlag", 0, "ANOLE_BODY_BORROW is refused here: the bytes are always copied", .{});
+    if (flags != 0) return unknownFlag();
+    const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
+    const e = live() orelse return failCode(abi.E_GONE);
+    const busy = s3_mod.uploadWrite(e, t, b, flags) catch |err| return answer(err);
+    return if (busy) abi.BUSY else abi.OK;
+}
+
+export fn anole_s3_upload_finish(t: u64, user_data: u64) i32 {
+    clearError();
+    if (badKind(t, .transfer)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    s3_mod.uploadFinish(e, t, user_data) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_s3_delete(p: ?*anyopaque, c_: ?*anyopaque, key: Str, opts: ?*const abi.S3Options, user_data: u64) i32 {
+    clearError();
+    const st = s3Of(p) orelse return badPointer(p);
+    const c = s3Consumer(c_) catch return badPointer(c_);
+    const o: abi.S3Options = if (opts) |q| readSized(abi.S3Options, q) catch |err| return sizedFailure(err) else .{};
+    if (o.flags & ~abi.S3_F_NO_RETRY != 0) return unknownFlag();
+    s3_mod.delete(st, c, key, o, user_data) catch |err| return s3Failure(err);
+    return abi.OK;
+}
+
+export fn anole_s3_delete_many(p: ?*anyopaque, c_: ?*anyopaque, keys: ?[*]const Str, n: usize, opts: ?*const abi.S3Options, user_data: u64) i32 {
+    clearError();
+    const st = s3Of(p) orelse return badPointer(p);
+    const c = s3Consumer(c_) catch return badPointer(c_);
+    const o: abi.S3Options = if (opts) |q| readSized(abi.S3Options, q) catch |err| return sizedFailure(err) else .{};
+    if (o.flags & ~abi.S3_F_NO_RETRY != 0) return unknownFlag();
+    const list: []const Str = if (n == 0) &.{} else (keys orelse return failCode(abi.E_INVALID))[0..n];
+    s3_mod.deleteMany(st, c, list, o, user_data) catch |err| return s3Failure(err);
+    return abi.OK;
+}
+
+export fn anole_s3_list(p: ?*anyopaque, c_: ?*anyopaque, opts: ?*const abi.S3ListOptions, user_data: u64) i32 {
+    clearError();
+    const st = s3Of(p) orelse return badPointer(p);
+    const c = s3Consumer(c_) catch return badPointer(c_);
+    const o: abi.S3ListOptions = if (opts) |q| readSized(abi.S3ListOptions, q) catch |err| return sizedFailure(err) else .{};
+    if (o.flags & ~abi.S3_F_NO_RETRY != 0) return unknownFlag();
+    if (o.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_s3_list_options.reserved must be 0", .{});
+    s3_mod.listObjects(st, c, o, user_data) catch |err| return s3Failure(err);
+    return abi.OK;
+}
+
+export fn anole_s3_copy(p: ?*anyopaque, c_: ?*anyopaque, src_bucket: Str, src_key: Str, dst_key: Str, opts: ?*const abi.S3PutOptions, user_data: u64) i32 {
+    clearError();
+    const st = s3Of(p) orelse return badPointer(p);
+    const c = s3Consumer(c_) catch return badPointer(c_);
+    const o: abi.S3PutOptions = if (opts) |q| readSized(abi.S3PutOptions, q) catch |err| return sizedFailure(err) else .{};
+    if (o.flags & ~(abi.S3_F_IF_ABSENT | abi.S3_F_NO_RETRY | abi.S3_F_REPLACE_METADATA) != 0) return unknownFlag();
+    s3_mod.copy(st, c, src_bucket, src_key, dst_key, o, user_data) catch |err| return s3Failure(err);
+    return abi.OK;
+}
+
+export fn anole_s3_presign(p: ?*anyopaque, method: u32, key: Str, opts: ?*const abi.S3PresignOptions, buf: ?[*]u8, cap: usize) i64 {
+    clearError();
+    const st = s3Of(p) orelse return badPointer(p);
+    const o: abi.S3PresignOptions = if (opts) |q| readSized(abi.S3PresignOptions, q) catch |err| return sizedFailure(err) else .{};
+    if (o.flags & ~abi.S3_PRESIGN_F_CONTENT_LENGTH != 0) return unknownFlag();
+    if (o.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_s3_presign_options.reserved must be 0", .{});
+    const out: []u8 = if (buf) |b| b[0..cap] else &.{};
+    const n = s3_mod.presign(st, method, key, o, out);
+    if (n < 0) {
+        const code: i32 = @intCast(n);
+        return switch (code) {
+            abi.E_STATE => named(abi.E_STATE, "NoCredentials", 0, "the store is not open yet, or has no credentials", .{}),
+            else => failCode(code),
+        };
+    }
+    return n;
+}
+
+export fn anole_s3_multipart_create(p: ?*anyopaque, c_: ?*anyopaque, key: Str, opts: ?*const abi.S3PutOptions, user_data: u64) i32 {
+    clearError();
+    const st = s3Of(p) orelse return badPointer(p);
+    const c = s3Consumer(c_) catch return badPointer(c_);
+    const o: abi.S3PutOptions = if (opts) |q| readSized(abi.S3PutOptions, q) catch |err| return sizedFailure(err) else .{};
+    if (o.flags & ~abi.S3_F_NO_RETRY != 0) return unknownFlag();
+    s3_mod.multipartCreate(st, c, key, o, user_data) catch |err| return s3Failure(err);
+    return abi.OK;
+}
+
+export fn anole_s3_multipart_complete(p: ?*anyopaque, c_: ?*anyopaque, key: Str, upload_id: Str, parts: ?[*]const abi.S3Part, nparts: usize, opts: ?*const abi.S3Options, user_data: u64) i32 {
+    clearError();
+    const st = s3Of(p) orelse return badPointer(p);
+    const c = s3Consumer(c_) catch return badPointer(c_);
+    const o: abi.S3Options = if (opts) |q| readSized(abi.S3Options, q) catch |err| return sizedFailure(err) else .{};
+    if (o.flags & ~abi.S3_F_NO_RETRY != 0) return unknownFlag();
+    const list: []const abi.S3Part = if (nparts == 0) &.{} else (parts orelse return failCode(abi.E_INVALID))[0..nparts];
+    s3_mod.multipartComplete(st, c, key, upload_id, list, o, user_data) catch |err| return s3Failure(err);
+    return abi.OK;
+}
+
+export fn anole_s3_multipart_abort(p: ?*anyopaque, c_: ?*anyopaque, key: Str, upload_id: Str, opts: ?*const abi.S3Options, user_data: u64) i32 {
+    clearError();
+    const st = s3Of(p) orelse return badPointer(p);
+    const c = s3Consumer(c_) catch return badPointer(c_);
+    const o: abi.S3Options = if (opts) |q| readSized(abi.S3Options, q) catch |err| return sizedFailure(err) else .{};
+    if (o.flags & ~abi.S3_F_NO_RETRY != 0) return unknownFlag();
+    s3_mod.multipartAbort(st, c, key, upload_id, o, user_data) catch |err| return s3Failure(err);
+    return abi.OK;
+}
 // ---- end p3/s3 ----
 
 // ---- p3/smtp ----

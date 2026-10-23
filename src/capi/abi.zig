@@ -145,6 +145,8 @@ pub const EventType = enum(u32) {
     // ---- end p3/realtime ----
 
     // ---- p3/s3 ----
+    s3_result = 124,
+    s3_data = 125,
     // ---- end p3/s3 ----
 
     // ---- p3/smtp ----
@@ -730,6 +732,192 @@ pub const KafkaAssignEvent = extern struct {
 // ---- end p3/realtime ----
 
 // ---- p3/s3 ----
+/// `anole_s3_*` call flags.
+pub const S3_F_STREAM: u32 = 1;
+pub const S3_F_RANGE: u32 = 2;
+pub const S3_F_NO_RETRY: u32 = 4;
+pub const S3_F_IF_ABSENT: u32 = 8;
+pub const S3_F_REPLACE_METADATA: u32 = 16;
+pub const S3_F_LENGTH: u32 = 32;
+pub const S3_F_PASS_NOT_FOUND: u32 = 64;
+pub const S3_F_REPORT: u32 = 128;
+
+pub const S3_OP_GET: u8 = 1;
+pub const S3_OP_HEAD: u8 = 2;
+pub const S3_OP_PUT: u8 = 3;
+pub const S3_OP_PUT_BODY: u8 = 4;
+pub const S3_OP_DELETE: u8 = 5;
+pub const S3_OP_DELETE_MANY: u8 = 6;
+pub const S3_OP_LIST: u8 = 7;
+pub const S3_OP_COPY: u8 = 8;
+pub const S3_OP_UPLOAD_OPEN: u8 = 9;
+pub const S3_OP_UPLOAD_FINISH: u8 = 10;
+pub const S3_OP_SERVE: u8 = 11;
+pub const S3_OP_MULTIPART_CREATE: u8 = 12;
+pub const S3_OP_MULTIPART_COMPLETE: u8 = 13;
+pub const S3_OP_MULTIPART_ABORT: u8 = 14;
+
+pub const S3_RES_F_TRUNCATED: u16 = 1;
+pub const S3_RES_F_DELETE_MARKER: u16 = 2;
+pub const S3_DATA_F_FIN: u32 = 1;
+
+pub const S3_PRESIGN_GET: u32 = 0;
+pub const S3_PRESIGN_PUT: u32 = 1;
+pub const S3_PRESIGN_HEAD: u32 = 2;
+pub const S3_PRESIGN_DELETE: u32 = 3;
+pub const S3_PRESIGN_UPLOAD_PART: u32 = 4;
+pub const S3_PRESIGN_F_CONTENT_LENGTH: u32 = 1;
+
+pub const S3Options = extern struct {
+    size: usize = @sizeOf(S3Options),
+    flags: u32 = 0,
+    timeout_ms: u32 = 0,
+    req: u64 = 0,
+    bucket: Str = .{},
+    version_id: Str = .{},
+};
+
+pub const S3GetOptions = extern struct {
+    size: usize = @sizeOf(S3GetOptions),
+    flags: u32 = 0,
+    timeout_ms: u32 = 0,
+    req: u64 = 0,
+    bucket: Str = .{},
+    version_id: Str = .{},
+    range_start: u64 = 0,
+    range_end: u64 = std.math.maxInt(u64),
+    if_none_match: Str = .{},
+    if_match: Str = .{},
+    if_modified_since_ms: i64 = 0,
+    max_bytes: u32 = 0,
+    window: u32 = 0,
+    response_content_type: Str = .{},
+    response_cache_control: Str = .{},
+    response_content_disposition: Str = .{},
+};
+
+pub const S3PutOptions = extern struct {
+    size: usize = @sizeOf(S3PutOptions),
+    flags: u32 = 0,
+    timeout_ms: u32 = 0,
+    req: u64 = 0,
+    bucket: Str = .{},
+    content_type: Str = .{},
+    cache_control: Str = .{},
+    content_disposition: Str = .{},
+    content_encoding: Str = .{},
+    metadata: ?[*]const Header = null,
+    nmetadata: usize = 0,
+    storage_class: Str = .{},
+    if_match: Str = .{},
+    content_length: u64 = 0,
+};
+
+pub const S3ListOptions = extern struct {
+    size: usize = @sizeOf(S3ListOptions),
+    flags: u32 = 0,
+    timeout_ms: u32 = 0,
+    req: u64 = 0,
+    bucket: Str = .{},
+    prefix: Str = .{},
+    delimiter: Str = .{},
+    start_after: Str = .{},
+    continuation: Str = .{},
+    max_keys: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const S3PresignOptions = extern struct {
+    size: usize = @sizeOf(S3PresignOptions),
+    flags: u32 = 0,
+    expires_s: u32 = 0,
+    bucket: Str = .{},
+    version_id: Str = .{},
+    content_type: Str = .{},
+    content_length: u64 = 0,
+    response_content_type: Str = .{},
+    response_content_disposition: Str = .{},
+    upload_id: Str = .{},
+    part_number: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const S3Part = extern struct {
+    number: u32,
+    reserved: u32 = 0,
+    etag: Str,
+};
+
+pub const S3ResultEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    op: u8,
+    s3_status: u16,
+    flags: u16,
+    nentries: u32,
+    content_length: u64,
+    object_size: u64,
+    range_start: u64,
+    last_modified_ms: i64,
+    etag: Span,
+    version_id: Span,
+    content_type: Span,
+    cache_control: Span,
+    content_disposition: Span,
+    content_encoding: Span,
+    metadata_off: u32,
+    nmetadata: u32,
+    body: Span,
+    entries_off: u32,
+    prefixes_off: u32,
+    nprefixes: u32,
+    parts: u32,
+    next: Span,
+    upload_id: Span,
+    @"error": Span,
+    error_code: Span,
+    request_id: Span,
+};
+
+pub const S3Entry = extern struct {
+    key: Span,
+    etag: Span,
+    storage_class: Span,
+    size: u64,
+    last_modified_ms: i64,
+};
+
+pub const S3Failure = extern struct {
+    key: Span,
+    code: Span,
+    message: Span,
+};
+
+pub const S3DataEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    flags: u32,
+    offset: u64,
+    data: Span,
+    @"error": Span,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(S3Options) == 56);
+    std.debug.assert(@sizeOf(S3GetOptions) == 168);
+    std.debug.assert(@sizeOf(S3PutOptions) == 160);
+    std.debug.assert(@sizeOf(S3ListOptions) == 112);
+    std.debug.assert(@sizeOf(S3PresignOptions) == 128);
+    std.debug.assert(@sizeOf(S3Part) == 24);
+    std.debug.assert(@sizeOf(S3ResultEvent) == 192);
+    std.debug.assert(@sizeOf(S3Entry) == 40);
+    std.debug.assert(@sizeOf(S3Failure) == 24);
+    std.debug.assert(@sizeOf(S3DataEvent) == 56);
+}
 // ---- end p3/s3 ----
 
 // ---- p3/smtp ----
@@ -934,6 +1122,16 @@ pub const records = .{
     // ---- end p3/realtime ----
 
     // ---- p3/s3 ----
+    .{ "anole_s3_options", S3Options },
+    .{ "anole_s3_get_options", S3GetOptions },
+    .{ "anole_s3_put_options", S3PutOptions },
+    .{ "anole_s3_list_options", S3ListOptions },
+    .{ "anole_s3_presign_options", S3PresignOptions },
+    .{ "anole_s3_part", S3Part },
+    .{ "anole_s3_result_event", S3ResultEvent },
+    .{ "anole_s3_entry", S3Entry },
+    .{ "anole_s3_failure", S3Failure },
+    .{ "anole_s3_data_event", S3DataEvent },
     // ---- end p3/s3 ----
 
     // ---- p3/smtp ----
@@ -980,6 +1178,9 @@ pub const arrays = [_]ArrayInfo{
     // ---- end p3/realtime ----
 
     // ---- p3/s3 ----
+    .{ .record = "anole_s3_result_event", .name = "metadata", .at = "metadata_off", .item = "anole_span", .count = "2*nmetadata" },
+    .{ .record = "anole_s3_result_event", .name = "entries", .at = "entries_off", .item = "anole_s3_entry", .count = "nentries" },
+    .{ .record = "anole_s3_result_event", .name = "prefixes", .at = "prefixes_off", .item = "anole_span", .count = "nprefixes" },
     // ---- end p3/s3 ----
 
     // ---- p3/smtp ----
@@ -1075,6 +1276,8 @@ pub const events = [_]EventInfo{
     // ---- end p3/realtime ----
 
     // ---- p3/s3 ----
+    .{ .type = 124, .name = "ANOLE_EV_S3_RESULT", .record = "anole_s3_result_event", .handles = &.{"transfer"}, .obligation = "for a transfer it opens: write/finish/read_more until done, or release" },
+    .{ .type = 125, .name = "ANOLE_EV_S3_DATA", .record = "anole_s3_data_event", .handles = &.{"transfer"} },
     // ---- end p3/s3 ----
 
     // ---- p3/smtp ----
@@ -1171,6 +1374,12 @@ pub const constant_groups = [_]ConstantGroup{
     // ---- end p3/realtime ----
 
     // ---- p3/s3 ----
+    .{ .prefix = "ANOLE_S3_F_", .group = "s3_flag" },
+    .{ .prefix = "ANOLE_S3_OP_", .group = "s3_op" },
+    .{ .prefix = "ANOLE_S3_RES_F_", .group = "s3_result_flag" },
+    .{ .prefix = "ANOLE_S3_DATA_F_", .group = "s3_data_flag" },
+    .{ .prefix = "ANOLE_S3_PRESIGN_F_", .group = "s3_presign_flag" },
+    .{ .prefix = "ANOLE_S3_PRESIGN_", .group = "s3_presign_method" },
     // ---- end p3/s3 ----
 
     // ---- p3/smtp ----
@@ -1278,7 +1487,7 @@ const realtime_error_names = [_][]const u8{};
 // ---- end p3/realtime ----
 
 // ---- p3/s3 ----
-const s3_error_names = [_][]const u8{};
+const s3_error_names = [_][]const u8{"NoCredentials"};
 // ---- end p3/s3 ----
 
 // ---- p3/smtp ----
