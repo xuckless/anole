@@ -1063,7 +1063,18 @@ pub const Topics = struct {
                 break;
             };
         }
-        if (sub.running) if (sub.task) |t| placement.cancelTask(t);
+        if (sub.running) {
+            if (sub.task) |t| {
+                placement.cancelTask(t);
+            } else if (!sub.fallback) {
+                // No task to cancel by itself (std.Io.Threaded): cancel the
+                // sender's group, which also waits for it; it takes the
+                // mutex on its way out.
+                self.mutex.unlock(io);
+                sub.sender.cancel(io);
+                self.mutex.lockUncancelable(io);
+            }
+        }
         while (sub.running) self.idle.waitUncancelable(io, &self.mutex);
         return canceled;
     }

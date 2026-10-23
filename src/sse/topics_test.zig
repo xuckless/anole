@@ -379,9 +379,15 @@ test "sse: on_full=drop: the full subscriber misses the event, the others get it
     const fast = try h.add(&.{"t"}, null);
     _ = try h.hub.publish("t", .{ .data = "first" });
     slow.held.wait(io) catch unreachable;
-    for (0..20) |_| _ = try h.hub.publish("t", .{ .data = "more" });
+    // One at a time, each waited for on the fast one, so only the held one
+    // fills up (the fast one has the same cap).
+    Harness.waitBytes(fast, "data: first\n\n".len);
+    for (1..21) |i| {
+        _ = try h.hub.publish("t", .{ .data = "more" });
+        Harness.waitBytes(fast, "data: first\n\n".len + i * "data: more\n\n".len);
+    }
     try std.testing.expect(h.hub.stats().dropped > 0);
-    Harness.waitBytes(fast, "data: first\n\n".len + 20 * "data: more\n\n".len);
+    try std.testing.expectEqual(@as(usize, 20), std.mem.count(u8, Harness.text(fast), "data: more"));
 }
 
 test "sse: Subscriber.send reaches one subscriber, with no id; Full past the cap" {
@@ -489,4 +495,86 @@ test "sse: routes: templates are checked against the path" {
     try std.testing.expect(root.templatesMatch("/rooms/:room/events", .{ .topics = &.{ "news", "room:{room}" } }));
     try std.testing.expect(!root.templatesMatch("/rooms/:id/events", .{ .topics = &.{"room:{room}"} }));
     try std.testing.expect(root.templatesMatch("/a/*rest", .{ .topics = &.{"{rest}"} }));
+}
+
+/// A hub and one held subscriber on a zio runtime, whose tasks can be
+/// canceled one by one (the stuck-sender and leave paths cancel the
+/// sender's task).
+const ZioCase = struct {
+    rt: *@import("zio").Runtime,
+    hub: Topics,
+    f: Fake,
+    closed: std.atomic.Value(u32) = .init(0),
+    reason: std.atomic.Value(u32) = .init(99),
+
+    fn onClose(sub: *Subscriber, reason: root.CloseReason) void {
+        const c: *ZioCase = @ptrCast(@alignCast(sub.context.?));
+        c.reason.store(@intFromEnum(reason), .release);
+        _ = c.closed.fetchAdd(1, .release);
+    }
+
+    fn init(c: *ZioCase, options: Topics.Options) !*Subscriber {
+        c.rt = try @import("zio").Runtime.init(gpa, .{});
+        const rio = c.rt.io();
+        var o = options;
+        o._manual_ticks = true;
+        c.hub = try Topics.init(gpa, o);
+        c.hub.fake_now_ms.store(1000, .monotonic);
+        c.f = .init(gpa, rio);
+        c.f.hold = true;
+        c.closed = .init(0);
+        c.reason = .init(99);
+        return c.hub._attach(rio, c.f.out(), .{ .topics = &.{"t"}, .context = c, .on_close = onClose }, null);
+    }
+
+    fn waitClosed(c: *ZioCase) void {
+        while (c.closed.load(.acquire) == 0) c.rt.io().sleep(.fromMilliseconds(1), .awake) catch return;
+    }
+
+    fn deinit(c: *ZioCase) void {
+        c.f.open();
+        c.hub.deinit();
+        c.f.deinit();
+        c.rt.deinit();
+    }
+};
+
+test "sse: on_full=close with a stuck sender: the tick past close_after aborts the stream" {
+    var c: ZioCase = undefined;
+    _ = try c.init(.{ .max_queued_bytes = 400, .replay = null, .close_after = .fromSeconds(1) });
+    defer c.deinit();
+    const rio = c.rt.io();
+    _ = try c.hub.publish("t", .{ .data = "first" });
+    c.f.held.wait(rio) catch unreachable;
+    // Fill the queue: the subscriber is ending (slow) with its sender stuck.
+    for (0..20) |_| _ = try c.hub.publish("t", .{ .data = "more" });
+    try std.testing.expectEqual(@as(u64, 1), c.hub.stats().closed_slow);
+    // Before close_after: nothing happens.
+    _ = c.hub._tick(0, 1000 + 500);
+    try std.testing.expectEqual(@as(u32, 0), c.closed.load(.acquire));
+    // Past it: the sender is canceled and the stream aborted.
+    _ = c.hub._tick(0, 1000 + 1_500);
+    c.waitClosed();
+    try std.testing.expectEqual(@as(u32, @intFromEnum(root.CloseReason.slow)), c.reason.load(.acquire));
+    try std.testing.expect(c.f.aborted);
+    try std.testing.expect(!c.f.ended);
+    try std.testing.expectEqual(@as(u32, 0), c.f.writes_done.load(.acquire));
+}
+
+test "sse: leave while a write is under way: nothing is written after the end returns" {
+    var c: ZioCase = undefined;
+    const sub = try c.init(.{ .replay = null, .leave_grace = .fromMilliseconds(20) });
+    defer c.deinit();
+    const rio = c.rt.io();
+    _ = try c.hub.publish("t", .{ .data = "x" });
+    c.f.held.wait(rio) catch unreachable;
+    Topics._gone(sub);
+    c.waitClosed();
+    try std.testing.expectEqual(@as(u32, @intFromEnum(root.CloseReason.client_gone)), c.reason.load(.acquire));
+    try std.testing.expect(c.f.released);
+    // The held write was canceled: letting it go writes nothing.
+    c.f.open();
+    try std.testing.expectEqual(@as(u32, 0), c.f.writes_done.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), c.f.bytes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), c.hub.count("t"));
 }
