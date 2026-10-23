@@ -26,7 +26,7 @@ pub const Id = i64;
 pub const Store = union(enum) {
     postgres: *anole.pg.Client,
     sqlite: *anole.sqlite.Client,
-    redis: *anole.redis.Client,
+    redis: if (anole.features.redis) *anole.redis.Client else *anyopaque,
     /// In this process only: lost on restart. Tests and single-process apps.
     memory,
 };

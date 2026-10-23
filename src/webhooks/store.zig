@@ -7,6 +7,7 @@
 //! carries `io` and the `arena` that results live in.
 const std = @import("std");
 const anole = @import("../root.zig");
+const dedup_mod = @import("dedup.zig");
 
 pub const Error = anole.db.Error || error{ Canceled, OutOfMemory };
 
@@ -24,7 +25,7 @@ pub const Backend = union(enum) {
     memory: *Memory,
     postgres: *anole.pg.Client,
     sqlite: *anole.sqlite.Client,
-    redis: *anole.redis.Client,
+    redis: *dedup_mod.RedisClient,
 };
 
 pub const Store = struct {
@@ -69,10 +70,10 @@ pub const Store = struct {
                 self.backend = .{ .sqlite = s };
                 self.sql = try buildSql(gpa, .sqlite, table_prefix);
             },
-            .redis => |r| {
+            .redis => |r| if (comptime anole.features.redis) {
                 self.backend = .{ .redis = r };
                 self.sql.ep_put = try gpa.dupe(u8, redis_prefix);
-            },
+            } else unreachable,
         }
         return self;
     }

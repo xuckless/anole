@@ -15,8 +15,27 @@ pub const Config = union(enum) {
     redis: RedisOptions,
 };
 
+/// The Redis client and reply types; placeholders in builds without `-Dredis`.
+pub const RedisClient = if (anole.features.redis) anole.redis.Client else struct {
+    pub fn command(self: *@This(), c: anytype, args: anytype) error{OutOfMemory}!RedisReply {
+        _ = .{ self, c, args };
+        unreachable;
+    }
+};
+pub const RedisReply = if (anole.features.redis) anole.redis.Reply else union(enum) {
+    nil,
+    int: i64,
+    string: []const u8,
+    status: []const u8,
+    array: []RedisReply,
+    pub fn text(self: RedisReply) ?[]const u8 {
+        _ = self;
+        return null;
+    }
+};
+
 pub const RedisOptions = struct {
-    client: *anole.redis.Client,
+    client: *RedisClient,
     ttl: anole.Duration = .fromSeconds(24 * 3600),
     prefix: []const u8 = "anole:webhooks:seen:",
 };
