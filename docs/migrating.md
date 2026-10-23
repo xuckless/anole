@@ -1,4 +1,22 @@
-# Migrating from 0.1 to 0.2
+# Migrating
+
+## 0.2 to 0.3
+
+0.3 adds settings, `.env` files and deployment modes. Nothing you set is
+changed; the table lists what reads differently.
+
+| 0.2 | 0.3 |
+| --- | --- |
+| `opts.http.?.address` (read) | `opts.http.?.address orelse "127.0.0.1"` (null is the deployment's default) |
+| `listener.port` (read) | `listener.port orelse 8080` |
+| `.proxy = .{ .trusted_hops = 1 }` | unchanged and still works; `.deployment = .behind_proxy` (or `.proxy = .{ .trusted = &.{"private"} }`) is the recommended form: it ignores headers from peers that are not your proxy |
+| `"proxy_protocol": false` written in JSON to mean "default" | unchanged; leaving it out now means "the deployment's default" (false unless `anole_lb`) |
+| X-Forwarded-For `"1.2.3.4:5678"` gave 0.0.0.0 | gives 1.2.3.4 |
+| A Debug build read no `.env` | a Debug build is `development` and reads `.env` files from the working directory; `ANOLE_ENV=production` or `.env_files = &.{}` turns that off |
+| A Debug build's 500s said `Internal Server Error` | they name the error (`error_detail`, development); `.error_detail = false` keeps 0.2's |
+| `timeouts.keepalive` 60 s | 75 s (set `.timeouts = .{ .keepalive = .fromSeconds(60) }` for the old value) |
+
+## 0.1 to 0.2
 
 0.2 batches the breaking changes of the API review. Each area has its section
 below; the changelog lists the rest. Before 1.0 there is no stability promise,

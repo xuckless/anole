@@ -3,6 +3,50 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.3.0 (unreleased)
+
+Developer experience: settings, `.env` files and deployment modes.
+
+### Breaking
+
+- `ServerOptions.listen_tls_http3`, `http.address`, `http.port`,
+  `http.proxy_protocol`, `https.address`, `https.proxy_protocol`,
+  `Listener.address`, `Listener.port` and `Listener.proxy_protocol` are
+  optional; null means the deployment's default (0.2's values when
+  standalone). Code that only sets them is unchanged; code that reads them
+  unwraps. JSON: `listeners[].address`, `port` and `proxy_protocol` default
+  to null.
+- `timeouts.keepalive` (`keepalive_ms`) defaults to 75 s, up from 60 s, so it
+  sits above the idle timeout of nginx and AWS load balancers.
+
+### Added
+
+- `anole.config.load(T, init, .{})`: typed settings from defaults,
+  per-environment defaults, a JSON or INI file, `.env` files and the
+  environment, every problem reported at once; `anole.Secret` never prints;
+  durations as `"30s"`. Adapted from zefir's confy.
+- `.env` files in development (`.env.development.local`, `.env.local`,
+  `.env.development`, `.env`), read once and used by every environment read
+  in Anole (`DATABASE_URL`, `REDIS_URL`, `OTEL_*`...); never in production or
+  tests unless named (`env_files`).
+- `environment` (`development` or `production`, `ANOLE_ENV`) and `deployment`
+  (`standalone`, `behind_proxy`, `anole_lb`, `platform`; `lambda` from 0.4;
+  `ANOLE_DEPLOYMENT`) options in Zig and the JSON config: defaults only,
+  every change printed at startup.
+- `proxy.trusted` (`ANOLE_PROXY_TRUSTED`): trusted proxies by address,
+  network or name; the client is the rightmost untrusted X-Forwarded-For
+  address; one warning for the first request that bypasses the proxy.
+- `error_detail`: 500 answers name the error in development.
+- C ABI: `anole_dotenv_read`; JSON keys `environment`, `deployment`,
+  `error_detail` and `proxy.trusted`.
+
+### Changed
+
+- X-Forwarded-For entries with a port give the address instead of 0.0.0.0.
+- With `proxy_protocol` on and no `proxy_protocol_from`, only `proxy.trusted`
+  peers may connect when `proxy.trusted` is set (any peer otherwise, as
+  before).
+
 ## Unreleased
 
 The relay pass: cross-task WebSocket sends, fan-out, TLS and HTTP/2
