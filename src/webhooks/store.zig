@@ -21,10 +21,33 @@ pub const AttFilter = struct {
     limit: u16 = 50,
 };
 
+/// A database left out of the build (-Dpostgres=false, -Dsqlite=false): the
+/// store's calls on it compile and are never reached.
+const NoDb = struct {
+    pub fn exec(self: *NoDb, c: anytype, sql: []const u8, args: anytype) error{OutOfMemory}!usize {
+        _ = .{ self, c, sql, args };
+        unreachable;
+    }
+    pub fn one(self: *NoDb, comptime T: type, c: anytype, sql: []const u8, args: anytype) error{OutOfMemory}!T {
+        _ = .{ self, c, sql, args };
+        unreachable;
+    }
+    pub fn optional(self: *NoDb, comptime T: type, c: anytype, sql: []const u8, args: anytype) error{OutOfMemory}!?T {
+        _ = .{ self, c, sql, args };
+        unreachable;
+    }
+    pub fn all(self: *NoDb, comptime T: type, c: anytype, sql: []const u8, args: anytype) error{OutOfMemory}![]T {
+        _ = .{ self, c, sql, args };
+        unreachable;
+    }
+};
+pub const PgClient = if (anole.features.postgres) anole.pg.Client else NoDb;
+pub const SqliteClient = if (anole.features.sqlite) anole.sqlite.Client else NoDb;
+
 pub const Backend = union(enum) {
     memory: *Memory,
-    postgres: *anole.pg.Client,
-    sqlite: *anole.sqlite.Client,
+    postgres: *PgClient,
+    sqlite: *SqliteClient,
     redis: *dedup_mod.RedisClient,
 };
 
@@ -62,14 +85,14 @@ pub const Store = struct {
                 self.memory = m;
                 self.backend = .{ .memory = m };
             },
-            .postgres => |p| {
+            .postgres => |p| if (comptime anole.features.postgres) {
                 self.backend = .{ .postgres = p };
                 self.sql = try buildSql(gpa, .postgres, table_prefix);
-            },
-            .sqlite => |s| {
+            } else unreachable,
+            .sqlite => |s| if (comptime anole.features.sqlite) {
                 self.backend = .{ .sqlite = s };
                 self.sql = try buildSql(gpa, .sqlite, table_prefix);
-            },
+            } else unreachable,
             .redis => |r| if (comptime anole.features.redis) {
                 self.backend = .{ .redis = r };
                 self.sql.ep_put = try gpa.dupe(u8, redis_prefix);
