@@ -1,0 +1,26 @@
+# started on Fri Oct 23 11:16:07 2026
+
+
+ Performance counter stats for process id '1011092':
+
+           4999.84 msec task-clock                                                            
+     <not counted>      cpu_atom/cycles/                                                        (0.00%)
+       26137414222      cpu_core/cycles/                                                      
+     <not counted>      cpu_atom/instructions/                                                  (0.00%)
+       60623688009      cpu_core/instructions/                                                
+                56      context-switches                                                      
+                 0      cpu-migrations                                                        
+             17037      page-faults                                                           
+             33701      raw_syscalls:sys_enter                                                
+                 0      syscalls:sys_enter_sendmsg                                            
+              6383      syscalls:sys_enter_sendmmsg                                           
+                 0      syscalls:sys_enter_recvmsg                                            
+             12260      syscalls:sys_enter_recvmmsg                                           
+                 0      syscalls:sys_enter_epoll_wait                                         
+                 0      syscalls:sys_enter_epoll_pwait                                        
+                 0      syscalls:sys_enter_futex                                              
+                 0      syscalls:sys_enter_write                                              
+                 0      syscalls:sys_enter_read                                               
+
+       5.000923028 seconds time elapsed
+

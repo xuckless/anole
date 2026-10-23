@@ -1,0 +1,2 @@
+warning(anole): built with ReleaseFast: Zig's safety checks are off, so a bug that ReleaseSafe would stop at the faulty line can corrupt memory instead; ReleaseSafe is the recommended build for production
+info(anole): listening on https://0.0.0.0:8443 (HTTP/2, HTTP/1.1, HTTP/3)

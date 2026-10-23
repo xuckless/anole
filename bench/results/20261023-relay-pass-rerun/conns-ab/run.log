@@ -1,0 +1,12 @@
+06:52:47 epoll h3 a r1: 428,287 req/s, p50 1.59 ms, p99 2.14 ms, timeouts 0, Recv-Q peak 0, mem 57 MB
+06:54:37 epoll h3 b r1: 422,498 req/s, p50 1.65 ms, p99 2.16 ms, timeouts 0, Recv-Q peak 0, mem 35 MB
+06:56:28 epoll h3 b r2: 430,133 req/s, p50 1.62 ms, p99 2.12 ms, timeouts 0, Recv-Q peak 0, mem 35 MB
+06:58:18 epoll h3 a r2: 417,420 req/s, p50 1.62 ms, p99 2.15 ms, timeouts 0, Recv-Q peak 0, mem 50 MB
+07:00:08 epoll h3 a r3: 413,991 req/s, p50 1.61 ms, p99 2.17 ms, timeouts 0, Recv-Q peak 0, mem 54 MB
+07:01:59 epoll h3 b r3: 429,492 req/s, p50 1.63 ms, p99 2.13 ms, timeouts 0, Recv-Q peak 0, mem 35 MB
+07:03:48 uring h3 a r1: 378,308 req/s, p50 1.59 ms, p99 5.09 ms, timeouts 0, Recv-Q peak 0, mem 49 MB
+07:05:38 uring h3 b r1: 365,725 req/s, p50 1.64 ms, p99 5.29 ms, timeouts 0, Recv-Q peak 0, mem 34 MB
+07:07:27 uring h3 b r2: 361,529 req/s, p50 1.66 ms, p99 5.36 ms, timeouts 0, Recv-Q peak 0, mem 33 MB
+07:09:17 uring h3 a r2: 377,667 req/s, p50 1.59 ms, p99 5.09 ms, timeouts 0, Recv-Q peak 0, mem 43 MB
+07:11:06 uring h3 a r3: 376,840 req/s, p50 1.59 ms, p99 5.13 ms, timeouts 0, Recv-Q peak 0, mem 48 MB
+07:12:56 uring h3 b r3: 363,513 req/s, p50 1.65 ms, p99 5.33 ms, timeouts 0, Recv-Q peak 0, mem 33 MB
