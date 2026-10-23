@@ -361,9 +361,9 @@ always empty. The errors of the mode itself:
 
 | Error | When |
 |---|---|
-| `LambdaRuntimeApiMissing` | `deployment "lambda": AWS_LAMBDA_RUNTIME_API is not set; Lambda sets it, and so does the Runtime Interface Emulator (docs/lambda.md, "Running locally")` |
-| `LambdaNotBuilt` | `deployment "lambda": this build leaves the Lambda adapter out (-Dlambda)` |
-| `LambdaRuntimeApiFailed` | the Runtime API answered 500, or asking it for the next invocation failed three times in a row: `lambda: the Runtime API at <api> failed: <what>; exiting so Lambda starts a new environment` |
+| `LambdaRuntimeApiMissing` | `can't start in deployment "lambda": AWS_LAMBDA_RUNTIME_API is not set; Lambda sets it, and so does the Runtime Interface Emulator (docs/lambda.md, "Running locally")` |
+| `LambdaNotBuilt` | `can't start in deployment "lambda": this build leaves the Lambda adapter out (-Dlambda)` |
+| `LambdaRuntimeApiFailed` | the Runtime API answered 500, or asking it for the next invocation failed three times in a row: `can't go on with the Lambda Runtime API at <api>: <what>; exiting so Lambda starts a new environment` |
 | `SnapStartUnsupported` | see [SnapStart](#snapstart) |
 | `InvalidEnvironmentVariable` | `AWS_LAMBDA_RUNTIME_API` or `AWS_LAMBDA_HTTP_ENDPOINT` that is not `host:port` (`AWS_LAMBDA_RUNTIME_API="localhost": use host:port`), `ANOLE_LAMBDA_INVOKE_MODE` that is not `buffered` or `response_stream`, `AWS_LAMBDA_MAX_CONCURRENCY` outside 1 to 4096 |
 

@@ -318,19 +318,19 @@ pub fn explain(err: ServerError, ctx: Context, w: *std.Io.Writer) std.Io.Writer.
 
         // ---- p3/lambda ----
         error.LambdaRuntimeApiMissing => {
-            try w.writeAll("deployment \"lambda\": AWS_LAMBDA_RUNTIME_API is not set; Lambda sets it, and so does the Runtime Interface Emulator (docs/lambda.md, \"Running locally\").");
+            try w.writeAll("can't start in deployment \"lambda\": AWS_LAMBDA_RUNTIME_API is not set; Lambda sets it, and so does the Runtime Interface Emulator (docs/lambda.md, \"Running locally\").");
             try fix(w, "Run it on Lambda or under the Runtime Interface Emulator, set lambda.runtime_api, or use another deployment.");
         },
         error.LambdaNotBuilt => {
-            try w.writeAll("deployment \"lambda\": this build leaves the Lambda adapter out (-Dlambda).");
+            try w.writeAll("can't start in deployment \"lambda\": this build leaves the Lambda adapter out (-Dlambda).");
             try fix(w, "Build with -Dlambda (on in every profile), or use another deployment.");
         },
         error.LambdaRuntimeApiFailed => {
-            try w.print("lambda: the Runtime API at {s} failed: {s}; exiting so Lambda starts a new environment.", .{ ctx.address orelse "AWS_LAMBDA_RUNTIME_API", ctx.detail orelse "it gave an answer the adapter cannot use" });
+            try w.print("can't go on with the Lambda Runtime API at {s}: {s}; exiting so Lambda starts a new environment.", .{ ctx.address orelse "AWS_LAMBDA_RUNTIME_API", ctx.detail orelse "it gave an answer the adapter cannot use" });
             try fix(w, "Nothing to fix in the app; if it repeats, the function's logs before this line say why.");
         },
         error.SnapStartUnsupported => {
-            try w.writeAll("lambda: SnapStart is not supported yet (restored copies would share random-number state).");
+            try w.writeAll("can't run under Lambda SnapStart: it is not supported yet (restored copies would share random-number state).");
             try fix(w, "Publish the function without SnapStart.");
         },
         // ---- end p3/lambda ----
