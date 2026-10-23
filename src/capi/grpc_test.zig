@@ -426,6 +426,127 @@ test "capi grpc: every call mode over h2c, status and metadata, deadlines, cance
     try std.testing.expectEqual(@as(u64, 0), e.stats().inflight);
 }
 
+fn checkH3(a: *Consumer, port: u16, io: std.Io) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const conn = try anole.h3.ClientConnection.connect(alloc, io, .{
+        .host = "localhost",
+        .address = try .parseIp4("127.0.0.1", port),
+        .port = port,
+        .tls = .{ .insecure_skip_verify = true },
+        .connect_timeout = .fromSeconds(5),
+    });
+    defer conn.close();
+    var channel: grpc.Channel = .{ .h3 = conn, .authority = "localhost", .scheme = "https" };
+    const client: grpc.Client(Echo) = .{ .channel = &channel };
+    var step: []const u8 = "unary";
+    errdefer std.debug.print("capi grpc h3 check failed at {s}\n", .{step});
+
+    const d0 = a.e.stats().detached;
+    {
+        const r = try client.unary("Unary", arena, .{ .message = "hello" }, .{ .metadata = &.{.{ .name = "x-trace", .value = "t1" }} });
+        try std.testing.expectEqual(grpc.Code.ok, r.status.code);
+        try std.testing.expectEqual(grpc.Transport.h3, r.transport);
+        try std.testing.expectEqualStrings("hello", r.message.?.message);
+        var echoed: []const u8 = "";
+        for (r.trailers) |t| if (std.mem.eql(u8, t.name, "x-echoed")) {
+            echoed = t.value;
+        };
+        try std.testing.expectEqualStrings("t1", echoed);
+    }
+    try std.testing.expect(a.e.stats().detached > d0);
+
+    step = "error status";
+    {
+        const r = try client.unary("Unary", arena, .{ .message = "fail" }, .{});
+        try std.testing.expectEqual(grpc.Code.not_found, r.status.code);
+        try std.testing.expectEqualStrings("no such thing: fail", r.status.message);
+    }
+
+    step = "server stream";
+    {
+        var s = try client.stream("ServerStream", arena, .{});
+        defer s.deinit();
+        try s.send(.{ .message = "n", .repeat = 3 });
+        try s.closeSend();
+        var n: usize = 0;
+        while (try s.receive()) |m| : (n += 1) try std.testing.expectEqual(@as(i32, @intCast(n)), m.index);
+        try std.testing.expectEqual(@as(usize, 3), n);
+        try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    }
+
+    step = "bidi";
+    {
+        var s = try client.stream("Bidi", arena, .{});
+        defer s.deinit();
+        for ([_][]const u8{ "ping", "pong" }, 0..) |m, i| {
+            try s.send(.{ .message = m });
+            const reply = (try s.receive()).?;
+            try std.testing.expectEqualStrings(m, reply.message);
+            try std.testing.expectEqual(@as(i32, @intCast(i)), reply.index);
+        }
+        try s.closeSend();
+        try std.testing.expect(try s.receive() == null);
+        try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
+    }
+
+    step = "cancel arrives as abort";
+    {
+        var s = try client.stream("Unary", arena, .{});
+        try s.send(.{ .message = "hold" });
+        try s.closeSend();
+        const held = try waitUntil(io, &a.held, null);
+        s.cancel();
+        s.deinit();
+        _ = try waitUntil(io, &a.last_abort, held);
+        try std.testing.expectError(error.Gone, grpc_capi.send(a.e, held, "", false, true));
+    }
+}
+
+test "capi grpc over HTTP/3: detached unary, server stream, bidi, status and trailers, cancel" {
+    if (comptime !features.http3 or !features.http2) return error.SkipZigTest;
+    const json =
+        \\{"executors": 2, "timeouts": {"request_ms": 3000, "shutdown_ms": 1000},
+        \\ "listeners": [{"address": "127.0.0.1", "port": 0, "tls": {"self_signed": true}, "http3": true}],
+        \\ "grpc": {"descriptor_set": "DESCRIPTORS", "services": [
+        \\   {"name": "anole.test.Echo", "handler": 10}
+        \\ ]}}
+    ;
+    const set = @import("anole_test_descriptors").set;
+    const b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(set.len));
+    defer alloc.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, set);
+    const config = try std.mem.replaceOwned(u8, alloc, json, "DESCRIPTORS", b64);
+    defer alloc.free(config);
+    var why_buf: [400]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(config, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    defer e.destroy();
+    const c = try e.attach(null, null, true);
+    try e.start();
+
+    var a: Consumer = .{ .e = e, .c = c };
+    const t = try std.Thread.spawn(.{}, Consumer.run, .{&a});
+    defer {
+        a.stop.store(true, .release);
+        t.join();
+    }
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    // HTTP/3's UDP port comes after the listeners'.
+    var f = try io.concurrent(checkH3, .{ &a, e.port(1), io });
+    try f.await(io);
+    try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
+    try e.drain();
+    try std.testing.expect(e.wait(5000));
+    try std.testing.expectEqual(@as(u64, 0), e.stats().inflight);
+}
+
 test "capi grpc: configurations refused" {
     const cases = [_][]const u8{
         // No descriptors and no methods.
