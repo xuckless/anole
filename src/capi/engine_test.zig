@@ -1724,3 +1724,173 @@ test "capi engine: ANOLE_EV_DRAINING reaches every consumer once when the drain 
     try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.stopped)]);
     try std.testing.expect(e.wait(5000));
 }
+
+// ---------------------------------------------------------------------------
+// A streamed answer outlives request_ms + 5 s on every protocol
+
+/// Route 20: a stream that writes one byte every 500 ms, 13 times (6.5 s),
+/// from a thread of the test's, then ends.
+const SlowStreams = struct {
+    e: *engine.Engine,
+    c: *engine.Consumer,
+    stop: std.atomic.Value(bool) = .init(false),
+    failures: std.atomic.Value(u32) = .init(0),
+    started: std.atomic.Value(u32) = .init(0),
+    threads: [8]?std.Thread = @splat(null),
+    nthreads: usize = 0,
+
+    fn run(self: *SlowStreams) void {
+        var buf: [64 * 1024]u8 align(8) = undefined;
+        var need: u32 = 0;
+        while (!self.stop.load(.acquire)) {
+            const n = engine.pollWait(self.c, &buf, 50, &need) catch unreachable;
+            var off: usize = 0;
+            while (off < n) {
+                const ev: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
+                if (ev.type == @backingInt(abi.EventType.request)) {
+                    const r: *const abi.RequestEvent = @ptrCast(@alignCast(&buf[off]));
+                    if (r.route_id == 20) self.begin(ev.handle);
+                }
+                off += ev.len;
+            }
+        }
+        for (&self.threads) |*t| if (t.*) |th| th.join();
+    }
+
+    fn begin(self: *SlowStreams, h: u64) void {
+        engine.streamStart(self.e, h, 200, &.{}) catch {
+            _ = self.failures.fetchAdd(1, .monotonic);
+            return;
+        };
+        _ = self.started.fetchAdd(1, .monotonic);
+        if (self.nthreads == self.threads.len) {
+            _ = self.failures.fetchAdd(1, .monotonic);
+            return;
+        }
+        self.threads[self.nthreads] = std.Thread.spawn(.{}, pump, .{ self, h }) catch {
+            _ = self.failures.fetchAdd(1, .monotonic);
+            return;
+        };
+        self.nthreads += 1;
+    }
+
+    fn pump(self: *SlowStreams, h: u64) void {
+        const tio = engine.threadedIo();
+        for (0..13) |_| {
+            std.Io.sleep(tio, .fromMilliseconds(500), .awake) catch return;
+            _ = engine.streamWrite(self.e, h, "x", false) catch {
+                _ = self.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+        }
+        engine.streamEnd(self.e, h, &.{}) catch {
+            _ = self.failures.fetchAdd(1, .monotonic);
+        };
+    }
+};
+
+fn slowH1(io: std.Io, port: u16) !void {
+    const stream = try (try std.Io.net.IpAddress.parse("127.0.0.1", port)).connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll("GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    try w.interface.flush();
+    var rbuf: [1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var out: [2048]u8 = undefined;
+    var fw: std.Io.Writer = .fixed(&out);
+    _ = r.interface.streamRemaining(&fw) catch {};
+    const got = fw.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try std.testing.expectEqual(@as(usize, 13), std.mem.count(u8, got, "\r\n1\r\nx\r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, got, "0\r\n\r\n"));
+}
+
+fn slowH2(io: std.Io, port: u16, path: []const u8) !void {
+    const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = port });
+    defer conn.close();
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "GET" },  .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{});
+    defer s.release();
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    const body = try s.reader().allocRemaining(alloc, .unlimited);
+    defer alloc.free(body);
+    try std.testing.expectEqual(@as(usize, 13), body.len);
+}
+
+fn slowH3(io: std.Io, port: u16) !void {
+    const conn = try anole.h3.ClientConnection.connect(alloc, io, .{
+        .host = "localhost",
+        .address = try .parseIp4("127.0.0.1", port),
+        .port = port,
+        .tls = .{ .insecure_skip_verify = true },
+        .connect_timeout = .fromSeconds(3),
+    });
+    defer conn.close();
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/slowd" },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{});
+    defer s.release();
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    const body = try s.reader().allocRemaining(alloc, .unlimited);
+    defer alloc.free(body);
+    try std.testing.expectEqual(@as(usize, 13), body.len);
+}
+
+fn slowAll(plain_port: u16, h3_port: u16, io: std.Io) !void {
+    var h1 = try io.concurrent(slowH1, .{ io, plain_port });
+    var h2_tasked = try io.concurrent(slowH2, .{ io, plain_port, "/slow" });
+    var h2_detached = try io.concurrent(slowH2, .{ io, plain_port, "/slowd" });
+    var h3 = try io.concurrent(slowH3, .{ io, h3_port });
+    // Await all before returning an error: the futures reference this frame.
+    const r1 = h1.await(io);
+    const r2 = h2_tasked.await(io);
+    const r3 = h2_detached.await(io);
+    const r4 = h3.await(io);
+    try r1;
+    try r2;
+    try r3;
+    try r4;
+}
+
+test "C ABI: a streamed answer outlives request_ms + 5 s on every protocol" {
+    if (comptime !features.http2 or !features.http3) return error.SkipZigTest;
+    const json =
+        \\{"executors": 2, "timeouts": {"request_ms": 200, "shutdown_ms": 1000},
+        \\ "listeners": [{"address": "127.0.0.1", "port": 0},
+        \\               {"address": "127.0.0.1", "port": 0, "tls": {"self_signed": true}, "http3": true}],
+        \\ "routes": [{"path": "/slow", "handler": 20, "no_wait": false},
+        \\            {"path": "/slowd", "handler": 20}]}
+    ;
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    defer e.destroy();
+    const c = try e.attach(null, null, true);
+    try e.start();
+    var a: SlowStreams = .{ .e = e, .c = c };
+    const t = try std.Thread.spawn(.{}, SlowStreams.run, .{&a});
+    defer {
+        a.stop.store(true, .release);
+        t.join();
+    }
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    // The UDP port of the HTTP/3 listener comes after the listeners'.
+    var f = try io.concurrent(slowAll, .{ e.port(0), e.port(2), io });
+    try f.await(io);
+    try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 4), a.started.load(.acquire));
+    try e.drain();
+    try std.testing.expect(e.wait(5000));
+}
