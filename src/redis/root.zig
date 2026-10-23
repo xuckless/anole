@@ -337,6 +337,10 @@ const Connection = struct {
     /// Out of step with the server (a failure or a cancel mid-reply):
     /// closed when given back.
     broken: bool = false,
+    /// Taken idle from the pool (not dialed for this call).
+    reused: bool = false,
+    /// The last `transfer` failed while writing: nothing of it was read.
+    write_failed: bool = false,
 
     /// What the commands sent so far have left on the connection.
     const State = struct {
@@ -354,7 +358,11 @@ const Connection = struct {
     /// the connection broken.
     fn transfer(self: *Connection, arena: std.mem.Allocator, batch: *const Batch) ![]Reply {
         errdefer self.broken = true;
-        try self.send(batch.bytes);
+        self.write_failed = false;
+        self.send(batch.bytes) catch |err| {
+            self.write_failed = true;
+            return err;
+        };
         const replies = try arena.alloc(Reply, batch.count);
         for (replies) |*r| r.* = try self.receive(arena);
         self.state = batch.effect.apply(self.state);
@@ -807,10 +815,25 @@ pub const Client = struct {
     /// Sends `batch` on `held` or a pooled connection and reads its
     /// replies; the first error reply fails the call.
     fn exchange(self: *Client, ctx: *const Ctx, held: ?*Connection, batch: *const Batch) anyerror![]Reply {
-        const conn = held orelse try self.take(ctx);
+        var conn = held orelse try self.take(ctx);
         defer if (held == null) self.give(conn);
         if (conn.broken) return ctx.failf(self.errors, .unavailable, "the connection broke in an earlier call; release it and acquire another", .{});
-        const replies = conn.transfer(ctx.arena, batch) catch |err| return self.broke(ctx, conn, err);
+        var stale_retries: u8 = 0;
+        const replies = while (true) {
+            break conn.transfer(ctx.arena, batch) catch |err| {
+                // A write that failed on a connection taken idle from the
+                // pool (the server or a proxy closed it meanwhile) reached
+                // no one: once more on another connection, not a failure
+                // of the call (and not counted by the retry policy).
+                if (held == null and conn.reused and conn.write_failed and err != error.Canceled and stale_retries < 4) {
+                    stale_retries += 1;
+                    self.give(conn);
+                    conn = try self.take(ctx);
+                    continue;
+                }
+                return self.broke(ctx, conn, err);
+            };
+        };
         for (replies) |r| if (r == .err) return self.serverError(ctx, conn, r.err);
         return replies;
     }
@@ -875,6 +898,7 @@ pub const Client = struct {
                 pool.mutex.unlock(io);
                 self.observer.connections(-1, 1);
                 self.observer.acquired(started.durationTo(.now(io, .awake)).raw);
+                conn.reused = true;
                 return conn;
             }
             if (pool.open < pool.max) {
