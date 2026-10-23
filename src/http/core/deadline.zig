@@ -167,6 +167,8 @@ pub const Timer = if (have_auto_cancel) struct {
 /// A budget shared by several calls, such as a request and the reads of its
 /// body, is one deadline pinned once by `init` and run as many times as
 /// there are calls.
+var warned_unbounded: std.atomic.Value(bool) = .init(false);
+
 pub const Deadline = struct {
     io: std.Io,
     /// Absolute, or `.none`: `init` pins a duration to the moment it was
@@ -239,9 +241,16 @@ pub const Deadline = struct {
         var watch: Watch = .{};
         watch.set(self.io, self.timeout);
         var future = self.io.concurrent(Runner.run, .{ &watch, self.io, args }) catch |err| {
-            // Off a zio task a call that cannot get a second thread runs
-            // unbounded rather than failing; elsewhere the error stands.
-            if (comptime have_auto_cancel) return @call(.auto, func, args);
+            // Only `std.Io.Threaded` out of threads can get here (tests, or
+            // a program that does not run on zio): zio's `concurrent` always
+            // finds a task slot, and every request, blocking-pool and
+            // background call on zio takes the auto-cancel path above or
+            // this watched one. Without a second thread the call runs
+            // unbounded rather than failing, and says so once.
+            if (comptime have_auto_cancel) {
+                if (!warned_unbounded.swap(true, .monotonic)) std.log.scoped(.anole).warn("no thread is free to enforce a call's deadline: running it without one (std.Io.Threaded out of threads)", .{});
+                return @call(.auto, func, args);
+            }
             return err;
         };
 

@@ -229,6 +229,8 @@ const StateRoutes = struct {
 };
 
 test "anole.Server(State): (req, res) and (state, req, res) handlers, function middleware with state, grpc with methods on a value; listen refused beside init's listeners" {
+    const expected_log = @import("errors.zig").expectLog();
+    defer expected_log.deinit();
     var state: State = .{};
     var app = try Server(State).init(alloc, .{ .http = .{ .port = 0, .h2c = false }, .executors = .exact(2) }, &state);
     defer app.deinit();
@@ -400,6 +402,8 @@ test "anole.App: listenTls serves HTTPS, and HTTP/3 advertised with Alt-Svc" {
 }
 
 test "anole.App: an address listen cannot take fails listen, and waitReady with it" {
+    const expected_log = @import("errors.zig").expectLog();
+    defer expected_log.deinit();
     var app = try App.init(alloc, .{ .executors = .exact(1) });
     defer app.deinit();
     try std.testing.expectError(error.InvalidListenAddress, app.listen("example.com:80"));

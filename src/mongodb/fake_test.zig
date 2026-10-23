@@ -295,6 +295,8 @@ test "fake mongod: no server, a timeout and a bad connection string" {
 }
 
 test "mongodb: max_connections = 0 and a URL's maxPoolSize=0 are InvalidOptions" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();
@@ -303,6 +305,8 @@ test "mongodb: max_connections = 0 and a URL's maxPoolSize=0 are InvalidOptions"
 }
 
 test "mongodb: connect_at_start fails start when nothing listens" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();

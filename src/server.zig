@@ -3437,6 +3437,8 @@ test "run: a port in use is error.AddressInUse and names its listener" {
 }
 
 test "setCertificate: a key that does not match is error.KeyMismatch, from either reload" {
+    const expected_log = @import("errors.zig").expectLog();
+    defer expected_log.deinit();
     if (comptime features.tls != .boringssl) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var a = try tls.selfSigned(gpa, .{});

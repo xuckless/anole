@@ -947,6 +947,8 @@ test "sqlite: iterate over a bare BEGIN fails left-open and rolls back" {
 }
 
 test "sqlite: Rows deinit inside an open transaction rolls back" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
     const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
     defer db.deinit();
     var s: Scratch = undefined;
@@ -963,6 +965,8 @@ test "sqlite: Rows deinit inside an open transaction rolls back" {
 }
 
 test "sqlite: acquire released inside a transaction rolls the writer back" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
     const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
     defer db.deinit();
     var s: Scratch = undefined;

@@ -47,12 +47,16 @@ test "db: the connectors' options agree" {
 }
 
 test "pg and redis: max_connections = 0 is InvalidOptions" {
+    const expected_log = @import("errors.zig").expectLog();
+    defer expected_log.deinit();
     const io = std.testing.io;
     if (features.postgres) try std.testing.expectError(error.InvalidOptions, anole.pg.Client.init(std.testing.allocator, io, .{ .max_connections = 0, .environ = .empty }));
     if (features.redis) try std.testing.expectError(error.InvalidOptions, anole.redis.Client.init(std.testing.allocator, io, .{ .max_connections = 0, .environ = .empty }));
 }
 
 test "redis: tls.ca with redis:// is InvalidOptions" {
+    const expected_log = @import("errors.zig").expectLog();
+    defer expected_log.deinit();
     if (!features.redis) return error.SkipZigTest;
     try std.testing.expectError(error.InvalidOptions, anole.redis.Client.init(std.testing.allocator, std.testing.io, .{
         .url = "redis://127.0.0.1:1",

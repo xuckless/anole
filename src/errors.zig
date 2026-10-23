@@ -146,15 +146,19 @@ test "errors: every member maps to itself; unknown names become Unexpected" {
     try std.testing.expectEqual(@as(i32, 0), posixErrno(error.KeyMismatch));
 }
 
-/// The `anole` log scope with `err` silent under `zig build test`: the
-/// validation and start-up failures that tests provoke on purpose are logged
-/// at `err`, and the test runner fails a test that logs one.
+/// A test that provokes `err` logs on purpose: `const g = errors.expectLog();
+/// defer g.deinit();` around the call. Elsewhere an `err` log still fails
+/// the test runner.
+pub const expectLog = @import("dusty").expect_log.expect;
+
+/// The `anole` log scope. Its `err` is dropped only inside `expectLog`.
 pub const log = struct {
     const scoped = std.log.scoped(.anole);
     pub const debug = scoped.debug;
     pub const info = scoped.info;
     pub const warn = scoped.warn;
     pub fn err(comptime format: []const u8, args: anytype) void {
-        if (!@import("builtin").is_test) scoped.err(format, args);
+        if (@import("dusty").expect_log.swallow()) return;
+        scoped.err(format, args);
     }
 };
