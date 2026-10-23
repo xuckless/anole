@@ -4081,10 +4081,17 @@ test "anole.Server: several listeners: h1 + h2c, TLS h1 only, h2c only, TLS h2 +
             var name_buf: [128]u8 = undefined;
             try std.testing.expect(std.mem.endsWith(u8, resp, try std.fmt.bufPrint(&name_buf, "on unix-{s}", .{path})));
 
-            // TLS, HTTP/2 only: a client that offers HTTP/1.1 alone (as
-            // the HTTP client does by default) is not served.
+            // TLS, HTTP/2 only: a client that offers HTTP/1.1 alone is not
+            // served; the HTTP client offers h2 by default and is.
             const h2tls = addrs[6].ip.getPort();
-            try std.testing.expect(std.meta.isError(client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{h2tls}), .{})));
+            {
+                var h1_only = http.Client.init(alloc, io_, .{ .tls = .{ .ca = ca }, .http2 = false });
+                defer h1_only.deinit();
+                try std.testing.expect(std.meta.isError(h1_only.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{h2tls}), .{})));
+                var r = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{h2tls}), .{});
+                defer r.deinit();
+                try std.testing.expectEqualStrings("on h2tls", (try r.body()).?);
+            }
             try expectH2(try h2c.ClientConnection.connect(alloc, io_, .{
                 .host = "localhost",
                 .port = h2tls,
