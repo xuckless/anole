@@ -287,6 +287,8 @@ pub const Client = struct {
     /// (`app.webhooks` calls it with the server).
     pub fn register(self: *Client, server: anytype) !void {
         const o = self.options;
+        // The delivery queue need not be listed in the jobs options.
+        try self.jobs.addQueue(.{ .name = o.queue });
         try self.jobs.handleRaw(server, .{
             .name = job_kind,
             .queue = o.queue,

@@ -2087,8 +2087,12 @@ ANOLE_API anole_status anole_job_complete_in(anole_job job, anole_db_tx tx, uint
 /* One JSON request, answered by ANOLE_EV_JOBS_RESULT with the JSON answer.
    Operations (the "op" key): "jobs.get" {id}, "jobs.list" {state, queue, kind,
    limit, before}, "jobs.counts", "jobs.retry" {id}, "jobs.cancel" {id},
-   "jobs.delete" {id}, "cron.list", "cron.trigger" {name}; and "webhooks.*" when
-   the configuration has webhooks. The shapes are the admin routes'. */
+   "jobs.delete" {id}, "cron.list", "cron.trigger" {name}; and, when the
+   configuration has webhooks, "webhooks.endpoint.create" / ".update" /
+   ".delete" / ".get" / ".list" / ".rotate_secret" / ".enable",
+   "webhooks.replay", "webhooks.recover", "webhooks.attempts" and
+   "webhooks.messages" (keys and answers: docs/c-abi.md, Jobs, "Admin").
+   The jobs shapes are the admin routes'. */
 ANOLE_API anole_status anole_jobs_admin(anole_jobs *j, anole_consumer *c, anole_str request_json, uint64_t user_data);
 
 /* ANOLE_EV_JOB_ENQUEUED */

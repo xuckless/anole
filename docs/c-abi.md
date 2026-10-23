@@ -1549,8 +1549,32 @@ second); `anole_server_drain` stops them all (`ANOLE_JOB_WORKER_DRAINED`).
 admin routes would send. Operations (`"op"`): `jobs.get` and `jobs.retry`,
 `jobs.cancel`, `jobs.delete` (`{"id": 7}`), `jobs.list` (`state`, `queue`,
 `kind`, `limit`, `before`), `jobs.counts`, `cron.list`, `cron.trigger`
-(`{"name": ...}`), and the `webhooks.*` operations when the configuration has
-webhooks.
+(`{"name": ...}`), and the `webhooks.*` operations below when the configuration
+has webhooks.
+
+The `webhooks.*` operations are `anole.webhooks.Client`'s methods, with the
+request's keys named after the Zig parameters and struct fields (snake_case)
+and the answers being the Zig structs as JSON (times RFC 3339):
+
+| `"op"` | Request keys | Answer |
+|---|---|---|
+| `webhooks.endpoint.create` | `url` (required), `owner`, `types` (patterns such as `"invoice.*"`), `description`, `secret` (null: a new `whsec_` one), `metadata` (an object) | `{"endpoint": {...}, "secret": "whsec_..."}` |
+| `webhooks.endpoint.update` | `id`, and any of `url`, `types`, `description`, `metadata` | the endpoint |
+| `webhooks.endpoint.delete` | `id` | `{"ok": true}` |
+| `webhooks.endpoint.get` | `id` | the endpoint (`id`, `owner`, `url`, `types`, `description`, `enabled`, `disabled_reason`, `failing_since`, `created_at`, `updated_at`, `metadata`) |
+| `webhooks.endpoint.list` | `owner` (default `""`) | `{"endpoints": [...]}` |
+| `webhooks.endpoint.rotate_secret` | `id`, `keep_old_ms` (default 86400000: the old secret keeps signing for 24 h) | `{"secret": "whsec_..."}` |
+| `webhooks.endpoint.enable` | `id` | `{"ok": true}` |
+| `webhooks.replay` | `message_id`, `endpoint` (null: every endpoint it went to) | `{"deliveries": n}` |
+| `webhooks.recover` | `endpoint`, `since` (RFC 3339 or Unix milliseconds) | `{"deliveries": n}` |
+| `webhooks.attempts` | `endpoint`, `message`, `limit` (50, at most 500), `before` (an attempt id) | `{"attempts": [...], "next": <id or null>}` |
+| `webhooks.messages` | `owner`, `type`, `limit`, `before` (a message id) | `{"messages": [...], "next": <id or null>}` |
+
+An unknown endpoint or message answers `http_status` 404 (`status` OK), a URL,
+event type, owner or metadata the client refuses (or an owner past
+`max_endpoints_per_owner`) 400 (`ANOLE_E_INVALID`), a conflict the store
+reports 409, and a missing or mistyped key or a request that is not JSON 400
+(`ANOLE_E_INVALID`). Error answers are `{"error": "..."}`.
 
 <!-- p3/s3 -->
 ## Object storage (S3)
@@ -1959,7 +1983,7 @@ The `"webhooks"` configuration turns on endpoints, signed deliveries and the del
 
 - `anole_webhooks_publish(jobs, consumer, &out, user_data)` sends one event (copied) to the owner's matching endpoints. It returns at once; `ANOLE_EV_WEBHOOK_PUBLISHED` answers with the message id, the number of deliveries and `duplicate` (the `id` was published before: nothing new is enqueued). `anole_webhook_out.tx` names an open `anole_db_tx`: the deliveries are enqueued in that transaction, so they exist only if it commits, and the answer is `ANOLE_EV_DB_RESULT` on the transaction (`rows_affected` is the number of deliveries).
 - `anole_webhooks_watch(jobs, consumer, user_data)` sends `ANOLE_EV_WEBHOOK_STATUS` to that consumer when a delivery is dead or an endpoint was disabled, so your app can tell its customer. Calling it again replaces the consumer.
-- Endpoints (create, update, delete, list, rotate the secret, enable) and replaying or recovering messages go through `anole_jobs_admin` (`webhooks.*`).
+- Endpoints (create, update, delete, get, list, rotate the secret, enable), replaying or recovering messages and reading the delivery log go through `anole_jobs_admin` (the `webhooks.*` operations under Jobs, "Admin").
 
 A send returns once the event is buffered; a slow endpoint never blocks the caller.
 

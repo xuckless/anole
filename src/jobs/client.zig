@@ -305,6 +305,19 @@ pub const Client = struct {
         }
     }
 
+    /// Adds a queue the options did not list, before `start` (webhooks adds
+    /// its delivery queue this way). A queue that exists is left as it is.
+    pub fn addQueue(self: *Client, q: root.QueueOptions) !void {
+        if (self.queueIndex(q.name) != null) return;
+        if (self.started) {
+            log.err("jobs: queue \"{s}\" must be in Options.queues (it is needed after the queue started)", .{q.name});
+            return error.InvalidOptions;
+        }
+        const name = try self.arena_state.allocator().dupe(u8, q.name);
+        self.queues = try self.gpa.realloc(self.queues, self.queues.len + 1);
+        self.queues[self.queues.len - 1] = .{ .name = name, .concurrency = q.concurrency };
+    }
+
     fn queueIndex(self: *Client, name: []const u8) ?usize {
         for (self.queues, 0..) |q, i| if (std.mem.eql(u8, q.name, name)) return i;
         return null;

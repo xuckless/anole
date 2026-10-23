@@ -136,6 +136,7 @@ pub fn open(e: *Engine, app: *anole.App) !void {
     };
     if (w.secrets_key_env.len > 0) opts.secrets_key = env.get(w.secrets_key_env);
     e.webhooks_state.client = try app.webhooks(opts);
+    e.jobs_state.webhooks_admin = &adminOp;
 }
 
 /// The drain started (`anole_server_drain`, once).
@@ -151,6 +152,7 @@ pub fn close(e: *Engine) void {
 /// `anole_server_destroy`: frees what a stopped server still holds.
 pub fn destroy(e: *Engine) void {
     e.webhooks_state.client = if (features.webhooks) null else {};
+    e.jobs_state.webhooks_admin = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +410,183 @@ pub fn txOp(any: *db.AnyTx, ctx: *anole.db.Ctx, op: *const db.TxOp, answer: *db.
     };
     answer.changes = .{ .changes = published.deliveries };
     answer.message = published.message_id;
+}
+
+// ---------------------------------------------------------------------------
+// Admin: the "webhooks.*" operations of `anole_jobs_admin`
+
+const ErrorAnswer = struct { @"error": []const u8 };
+
+fn adminStr(v: std.json.Value, name: []const u8) error{InvalidRequest}!?[]const u8 {
+    const f = v.object.get(name) orelse return null;
+    return switch (f) {
+        .string => |s| s,
+        .null => null,
+        else => error.InvalidRequest,
+    };
+}
+
+fn adminInt(v: std.json.Value, name: []const u8) error{InvalidRequest}!?i64 {
+    const f = v.object.get(name) orelse return null;
+    return switch (f) {
+        .integer => |i| i,
+        .null => null,
+        else => error.InvalidRequest,
+    };
+}
+
+fn adminTypes(a: std.mem.Allocator, v: std.json.Value) !?[]const []const u8 {
+    const f = v.object.get("types") orelse return null;
+    switch (f) {
+        .null => return null,
+        .array => |arr| {
+            const out = try a.alloc([]const u8, arr.items.len);
+            for (arr.items, out) |item, *o| {
+                if (item != .string) return error.InvalidRequest;
+                o.* = item.string;
+            }
+            return out;
+        },
+        else => return error.InvalidRequest,
+    }
+}
+
+/// `metadata`: a JSON object, kept as its text.
+fn adminMetadata(a: std.mem.Allocator, v: std.json.Value) !?[]const u8 {
+    const f = v.object.get("metadata") orelse return null;
+    return switch (f) {
+        .null => null,
+        .object => try std.json.Stringify.valueAlloc(a, f, .{}),
+        else => error.InvalidRequest,
+    };
+}
+
+fn adminLimit(v: std.json.Value) !u16 {
+    const l = (try adminInt(v, "limit")) orelse return 50;
+    return @intCast(std.math.clamp(l, 1, 500));
+}
+
+/// One `"webhooks.*"` operation (`jobs.AdminFn`): the JSON answer goes to
+/// `w`, the HTTP status is returned. Field names are the Zig methods'
+/// parameters and structs' fields; docs/c-abi.md lists them.
+fn adminOp(e: *Engine, ctx: *anole.db.Ctx, op: []const u8, request: std.json.Value, w: *std.Io.Writer) anyerror!u16 {
+    if (comptime !features.webhooks) return error.Unsupported;
+    const client = e.webhooks_state.client orelse return error.Unsupported;
+    var jw: std.json.Stringify = .{ .writer = w, .options = .{} };
+    return adminRun(client, ctx, op, request, &jw) catch |err| switch (err) {
+        error.InvalidJob => {
+            try jw.write(ErrorAnswer{ .@"error" = "invalid: a URL, event type, owner, metadata or the endpoint limit was refused" });
+            return 400;
+        },
+        error.NotFound => {
+            try jw.write(ErrorAnswer{ .@"error" = "not found" });
+            return 404;
+        },
+        error.Conflict => {
+            try jw.write(ErrorAnswer{ .@"error" = if (anole.db.lastError(ctx)) |d| d.message else "conflict" });
+            return 409;
+        },
+        else => return err,
+    };
+}
+
+fn adminRun(client: *Wh.Client, ctx: *anole.db.Ctx, op: []const u8, root: std.json.Value, jw: *std.json.Stringify) !u16 {
+    const a = ctx.arena;
+    const eql = std.mem.eql;
+    const prefix = "webhooks.endpoint.";
+    if (std.mem.startsWith(u8, op, prefix)) {
+        const what = op[prefix.len..];
+        if (eql(u8, what, "create")) {
+            const url = (try adminStr(root, "url")) orelse return error.InvalidRequest;
+            const made = try client.createEndpoint(ctx, .{
+                .owner = (try adminStr(root, "owner")) orelse "",
+                .url = url,
+                .types = (try adminTypes(a, root)) orelse &.{},
+                .description = (try adminStr(root, "description")) orelse "",
+                .secret = try adminStr(root, "secret"),
+                .metadata = try adminMetadata(a, root),
+            });
+            try jw.write(made);
+            return 200;
+        }
+        if (eql(u8, what, "list")) {
+            const owner = (try adminStr(root, "owner")) orelse "";
+            try jw.write(.{ .endpoints = try client.listEndpoints(ctx, owner) });
+            return 200;
+        }
+        const id = (try adminStr(root, "id")) orelse return error.InvalidRequest;
+        if (eql(u8, what, "get")) {
+            const ep = (try client.getEndpoint(ctx, id)) orelse return error.NotFound;
+            try jw.write(ep);
+            return 200;
+        } else if (eql(u8, what, "update")) {
+            const ep = try client.updateEndpoint(ctx, id, .{
+                .url = try adminStr(root, "url"),
+                .types = try adminTypes(a, root),
+                .description = try adminStr(root, "description"),
+                .metadata = try adminMetadata(a, root),
+            });
+            try jw.write(ep);
+            return 200;
+        } else if (eql(u8, what, "delete")) {
+            if (!try client.deleteEndpoint(ctx, id)) return error.NotFound;
+            try jw.write(.{ .ok = true });
+            return 200;
+        } else if (eql(u8, what, "rotate_secret")) {
+            const keep = (try adminInt(root, "keep_old_ms")) orelse 24 * 3600 * 1000;
+            if (keep < 0) return error.InvalidRequest;
+            const secret = try client.rotateSecret(ctx, id, ms(keep));
+            try jw.write(.{ .secret = secret });
+            return 200;
+        } else if (eql(u8, what, "enable")) {
+            if (!try client.enable(ctx, id)) return error.NotFound;
+            try jw.write(.{ .ok = true });
+            return 200;
+        }
+        return error.InvalidRequest;
+    }
+    if (eql(u8, op, "webhooks.replay")) {
+        const mid = (try adminStr(root, "message_id")) orelse return error.InvalidRequest;
+        const n = try client.replay(ctx, mid, try adminStr(root, "endpoint"));
+        try jw.write(.{ .deliveries = n });
+        return 200;
+    } else if (eql(u8, op, "webhooks.recover")) {
+        const endpoint = (try adminStr(root, "endpoint")) orelse return error.InvalidRequest;
+        const since: anole.db.Time = blk: {
+            const f = root.object.get("since") orelse return error.InvalidRequest;
+            break :blk switch (f) {
+                .integer => |i| anole.db.Time.fromMillis(i),
+                .string => anole.db.Time.jsonParseFromValue(a, f, .{}) catch return error.InvalidRequest,
+                else => return error.InvalidRequest,
+            };
+        };
+        const n = try client.recover(ctx, endpoint, since);
+        try jw.write(.{ .deliveries = n });
+        return 200;
+    } else if (eql(u8, op, "webhooks.attempts")) {
+        const limit = try adminLimit(root);
+        const list = try client.attempts(ctx, .{
+            .endpoint = try adminStr(root, "endpoint"),
+            .message = try adminStr(root, "message"),
+            .limit = limit,
+            .before = try adminInt(root, "before"),
+        });
+        const next: ?i64 = if (list.len == limit) list[list.len - 1].id else null;
+        try jw.write(.{ .attempts = list, .next = next });
+        return 200;
+    } else if (eql(u8, op, "webhooks.messages")) {
+        const limit = try adminLimit(root);
+        const list = try client.messages(ctx, .{
+            .owner = try adminStr(root, "owner"),
+            .type = try adminStr(root, "type"),
+            .limit = limit,
+            .before = try adminStr(root, "before"),
+        });
+        const next: ?[]const u8 = if (list.len == limit) list[list.len - 1].id else null;
+        try jw.write(.{ .messages = list, .next = next });
+        return 200;
+    }
+    return error.InvalidRequest;
 }
 
 // ---------------------------------------------------------------------------
