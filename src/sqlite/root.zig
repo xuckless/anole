@@ -934,7 +934,7 @@ pub fn Rows(comptime T: type) type {
 
         /// The next row; null after the last.
         pub fn next(self: *Self) Error!?T {
-            std.debug.assert(!self.finished);
+            if (self.finished) return null;
             if (self.pos == self.batch.len) {
                 if (self.done) return self.leftOpen();
                 var failure: Failure = .{};

@@ -2828,6 +2828,131 @@ static void test_db_request_tie(void) {
   printf("ok database queries and transactions tied to requests: cut at the deadline, kept after the answer\n");
 }
 
+/* PostgreSQL transactions and tied queries, against ANOLE_TEST_POSTGRES_URL. */
+static void test_db_postgres_tx(void) {
+  const char *url = getenv("ANOLE_TEST_POSTGRES_URL");
+  if (!anole_has_feature(LIT("postgres")) || url == NULL || url[0] == 0) {
+    printf("ok postgres transactions (%s)\n", anole_has_feature(LIT("postgres")) ? "no ANOLE_TEST_POSTGRES_URL" : "not built in");
+    return;
+  }
+  char json[4096];
+  snprintf(json, sizeof json,
+           "{\"executors\": 2, \"listeners\": [{\"address\": \"127.0.0.1\", \"port\": 0}],"
+           " \"routes\": [{\"method\": \"GET\", \"path\": \"/short\", \"handler\": 1, \"timeout_ms\": 100}],"
+           " \"databases\": [{\"name\": \"pg\", \"postgres\": {\"url\": \"%s\", \"max_connections\": 6,"
+           "   \"init\": \"DROP TABLE IF EXISTS anole_capi_fk_child, anole_capi_fk_parent, anole_capi_acct;"
+           " CREATE TABLE anole_capi_acct (id int PRIMARY KEY, n int NOT NULL); INSERT INTO anole_capi_acct VALUES (1, 0), (2, 0);"
+           " CREATE TABLE anole_capi_fk_parent (id int PRIMARY KEY);"
+           " CREATE TABLE anole_capi_fk_child (pid int REFERENCES anole_capi_fk_parent (id))\"}}]}",
+           url);
+  anole_consumer *c = NULL;
+  anole_server *s = polled_server(json, &c);
+  anole_db *db = NULL;
+  CHECK(anole_db_find(s, LIT("pg"), &db) == ANOLE_OK);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  db_flush();
+  static unsigned char rec[1 << 20];
+  const anole_db_result_event *r;
+  anole_str sum = LIT("SELECT sum(n) FROM anole_capi_acct");
+
+  /* an error names its table */
+  CHECK(anole_db_exec(db, c, LIT("INSERT INTO anole_capi_fk_child VALUES (999)"), NULL, 0, NULL, 1) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB && r->error_class == ANOLE_DB_ERR_FOREIGN_KEY && str_is(anole_event_str(r, r->table), "anole_capi_fk_child"));
+
+  /* serializable transactions with crossed reads and writes: one loses (409) */
+  anole_db_tx_options ser = {sizeof ser, 0, ANOLE_DB_ISOLATION_SERIALIZABLE, 0, 0, 0};
+  CHECK(anole_db_begin(db, c, &ser, 10) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK);
+  anole_db_tx ta = r->ev.handle;
+  CHECK(anole_db_begin(db, c, &ser, 11) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK);
+  anole_db_tx tb = r->ev.handle;
+  CHECK(anole_db_tx_query(ta, sum, NULL, 0, NULL, 12) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->ev.handle == ta);
+  CHECK(anole_db_tx_query(tb, sum, NULL, 0, NULL, 13) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK && r->ev.handle == tb);
+  CHECK(anole_db_tx_exec(ta, LIT("UPDATE anole_capi_acct SET n = n + 1 WHERE id = 1"), NULL, 0, NULL, 14) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK);
+  CHECK(anole_db_tx_exec(tb, LIT("UPDATE anole_capi_acct SET n = n + 1 WHERE id = 2"), NULL, 0, NULL, 15) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  int b_failed = r->status != ANOLE_OK;
+  if (b_failed) CHECK(r->error_class == ANOLE_DB_ERR_SERIALIZATION && r->http_status == 409);
+  CHECK(anole_db_tx_commit(ta, 16) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 16 && r->status == ANOLE_OK);
+  CHECK(anole_db_tx_commit(tb, 17) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 17 && r->status == ANOLE_E_DB);
+  if (!b_failed) CHECK(r->error_class == ANOLE_DB_ERR_SERIALIZATION && r->http_status == 409);
+
+  /* a failed statement poisons the transaction: 25P02 until the rollback */
+  CHECK(anole_db_begin(db, c, NULL, 20) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  anole_db_tx tp = r->ev.handle;
+  CHECK(anole_db_tx_exec(tp, LIT("SELEKT 1"), NULL, 0, NULL, 21) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB);
+  CHECK(anole_db_tx_query(tp, LIT("SELECT 1"), NULL, 0, NULL, 22) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB && str_is(anole_event_str(r, r->error_code), "25P02"));
+  CHECK(anole_db_tx_commit(tp, 23) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_E_DB && memmem(anole_event_str(r, r->error).ptr, anole_event_str(r, r->error).len, "rolled back", 11) != NULL);
+
+  /* release cancels a running statement on the server */
+  CHECK(anole_db_begin(db, c, NULL, 30) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  anole_db_tx tr = r->ev.handle;
+  CHECK(anole_db_tx_query(tr, LIT("SELECT pg_sleep(10)"), NULL, 0, NULL, 31) == ANOLE_OK);
+  usleep(200 * 1000);
+  double t0 = now_ms();
+  CHECK(anole_db_tx_release(tr) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 31 && r->status == ANOLE_E_GONE);
+  CHECK(now_ms() - t0 < 1500);
+  anole_str sleepers = LIT("SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(10)%' AND pid <> pg_backend_pid()");
+  int64_t left = -1;
+  for (int i = 0; i < 20 && left != 0; i++) {
+    CHECK(anole_db_query(db, c, sleepers, NULL, 0, NULL, 40 + i) == ANOLE_OK);
+    r = db_next(c, rec, sizeof rec);
+    CHECK(r->status == ANOLE_OK);
+    left = db_cell(r, 0, 0)->v.i;
+    if (left != 0) usleep(100 * 1000);
+  }
+  CHECK(left == 0);
+
+  /* a query tied to a request sends CancelRequest at the request's deadline */
+  pthread_t t;
+  async_req *a = start_get(port_of(s, 0), "/short", &t);
+  anole_req h = next_request(c);
+  anole_db_options on = {sizeof on};
+  on.req = h;
+  CHECK(anole_db_query(db, NULL, LIT("SELECT pg_sleep(10)"), NULL, 0, &on, 60) == ANOLE_OK);
+  CHECK(finish_get(a, t, NULL) == 504);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 60 && r->status == ANOLE_E_GONE);
+  left = -1;
+  for (int i = 0; i < 20 && left != 0; i++) {
+    CHECK(anole_db_query(db, c, sleepers, NULL, 0, NULL, 70 + i) == ANOLE_OK);
+    r = db_next(c, rec, sizeof rec);
+    left = db_cell(r, 0, 0)->v.i;
+    if (left != 0) usleep(100 * 1000);
+  }
+  CHECK(left == 0);
+
+  CHECK(anole_db_exec(db, c, LIT("DROP TABLE anole_capi_fk_child, anole_capi_fk_parent, anole_capi_acct"), NULL, 0, NULL, 99) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->status == ANOLE_OK);
+  stop_polled(s);
+  printf("ok postgres transactions: serialization 409, failed statement, release cancels, tied query cancels, error table\n");
+}
+
 static void test_abi07_rules(void) {
   /* the version rule */
   CHECK(anole_abi_version() == ANOLE_ABI_VERSION);
@@ -3546,6 +3671,7 @@ static int run_tests(void) {
   test_abi07_rules();
   test_db_tx();
   test_db_request_tie();
+  test_db_postgres_tx();
   test_cleanup_rules();
   test_error_identity();
   test_abort_reasons();
