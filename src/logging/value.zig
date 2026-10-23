@@ -524,5 +524,5 @@ test "nested objects and lists" {
 }
 
 test "control bytes are escaped and invalid UTF-8 replaced" {
-    try expectFields(.{ .s = "a\nb\xff" }, ",\"s\":\"a\\nb\\ufffd\"", " s=\"a\\nb\\ufffd\"");
+    try expectFields(.{ .s = "a\nb\xff" }, ",\"s\":\"a\\nb\u{fffd}\"", " s=\"a\\nb\u{fffd}\"");
 }
