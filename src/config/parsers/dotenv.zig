@@ -60,7 +60,8 @@ pub fn parse(arena: Allocator, text: []const u8, file: []const u8, diag: *Diagno
             error.OutOfMemory => return error.OutOfMemory,
             error.UnterminatedQuote => {
                 try diag.add(.{ .kind = .syntax, .origin = key_origin, .detail = "unterminated quote" });
-                // Nothing after an unterminated quote can be trusted: stop at this line.
+                // Reported; the next line is read as an entry of its own,
+                // so every problem in the file is reported at once.
                 continue;
             },
         };
@@ -68,9 +69,10 @@ pub fn parse(arena: Allocator, text: []const u8, file: []const u8, diag: *Diagno
             // Skip the lines the value used, and count them.
             const end_abs = @intFromPtr(value_text.ptr) - @intFromPtr(text.ptr) + consumed;
             if (end_abs > pos) {
-                line_number += @intCast(std.mem.countScalar(u8, text[pos..end_abs], '\n'));
-                pos = std.mem.findScalarPos(u8, text, end_abs, '\n') orelse text.len;
-                pos = @min(pos + 1, text.len + 1);
+                // Past the line the closing quote is on, newline included.
+                const next = if (std.mem.findScalarPos(u8, text, end_abs, '\n')) |nl| nl + 1 else text.len;
+                line_number += @intCast(std.mem.countScalar(u8, text[pos..next], '\n'));
+                pos = next;
             }
         }
 
@@ -280,7 +282,10 @@ test "dotenv: a multi-line double-quoted value (PEM)" {
 
     var diag2: Diagnostics = .init(std.testing.allocator);
     defer diag2.deinit();
+    // Unterminated at the end of the file: a problem, and the line after
+    // the opening one is read on its own (every problem is reported).
     const v2 = try parse(arena_state.allocator(), "K=\"never closed\nmore\n", ".env", &diag2);
     try std.testing.expectEqual(0, v2.count());
-    try std.testing.expectEqual(1, diag2.problems.items.len);
+    try std.testing.expectEqual(2, diag2.problems.items.len);
+    try std.testing.expectEqual(@as(u32, 1), diag2.problems.items[0].origin.?.line);
 }
