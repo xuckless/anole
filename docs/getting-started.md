@@ -356,6 +356,42 @@ curl -H 'Content-Type: application/json' -d '{"name":"Ada"}' localhost:3000/gree
 [grpc.md](grpc.md) covers streaming calls, deadlines, metadata, REST routes
 from `google.api.http` annotations, the health service and the client.
 
+## Settings and secrets
+
+Put what changes between machines in a `.env` file next to the program:
+
+```sh
+# .env (add it to .gitignore; commit a .env.example without the values)
+DATABASE_URL=postgres://app:secret@localhost/app
+PORT=3000
+```
+
+A build you run with `zig build run` is a Debug build, which Anole treats as
+`development`: it reads `.env` (and `.env.local`, `.env.development`,
+`.env.development.local`) and every environment read in Anole sees it, so
+`app.postgres(.{})` finds `DATABASE_URL` without any code. Read your own
+settings into a struct, every problem reported at once and secrets that never
+print:
+
+```zig
+const Config = struct {
+    database_url: anole.Secret,
+    port: u16 = 3000,
+    request_timeout: anole.Duration = .fromSeconds(30),
+};
+
+pub fn main(init: std.process.Init) !void {
+    const cfg = try anole.config.load(Config, init, .{});
+    var app = try anole.App.init(init.gpa, .{ .timeouts = .{ .request = cfg.request_timeout } });
+    defer app.deinit();
+    _ = cfg.database_url.expose(); // pass it to a connector's `.url`
+    try app.listen(":3000");
+}
+```
+
+A release build is `production` and reads no `.env`; the real environment
+supplies everything. See [config.md](config.md).
+
 ## Deploying
 
 **Build** with `zig build -Doptimize=ReleaseSafe`, which keeps Zig's safety
@@ -383,9 +419,12 @@ WebSockets a close, for up to 10 seconds (`.timeouts = .{ .shutdown = ... }`
 in the options). Give the process manager a little longer before it kills.
 
 **Behind a proxy** such as nginx or a cloud load balancer, set
-`.proxy = .{ .trusted_hops = 1 }` so `req.remote_address` is the
-client's address from `X-Forwarded-For` rather than the proxy's
-([server.md](server.md#behind-a-proxy)). Anole serves TLS, HTTP/2 and
+`ANOLE_DEPLOYMENT=behind_proxy` (or `.deployment = .behind_proxy`) so
+`req.remote_address` is the client's address from `X-Forwarded-For` rather
+than the proxy's, read only from the proxy's address; on Render, Heroku, Fly.io
+or Cloud Run use `ANOLE_DEPLOYMENT=platform`, which also listens on `$PORT`
+([config.md](config.md#deployment), [server.md](server.md#behind-a-proxy)).
+Set `ANOLE_ENV=production` where the binary is a Debug build. Anole serves TLS, HTTP/2 and
 HTTP/3 itself, so a proxy is optional.
 
 **systemd.** A minimal unit:

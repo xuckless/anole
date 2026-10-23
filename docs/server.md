@@ -180,10 +180,13 @@ interface), `":3000"`, or `"127.0.0.1:3000"` (this machine only).
 | `https` | `null` | The TLS listener. Needs `-Dtls=boringssl`. |
 | `http3` | `null` | HTTP/3 over QUIC. Needs `-Dhttp3` and `https` (or a listener in `listeners` with `http3 = true`, which it then tunes). |
 | `listeners` | none | More listeners, each with its own address or unix socket, TLS and protocols; see [Several listeners](#several-listeners). |
-| `listen_tls_http3` | true | Whether `listenTls` adds HTTP/3 (when built in). |
+| `listen_tls_http3` | null | Whether `listenTls` adds HTTP/3 (when built in). Null: the deployment's default (on, except `behind_proxy` and `platform`). |
+| `environment`, `deployment` | null | `development` or `production`, and what sits in front (`standalone`, `behind_proxy`, `anole_lb`, `platform`). Null: `ANOLE_ENV` / `ANOLE_DEPLOYMENT`, else the build and `standalone`. See [config.md](config.md). |
+| `env_files` | null | The `.env` files read at `init`. Null: the environment's (development: four files in the working directory; production: none); `&.{}`: none. |
+| `error_detail` | null | A 500 for an error with no status of its own names the error. Null: on in development. |
 | `timeouts` | see below | The request, head, write, keep-alive and drain deadlines. |
 | `limits` | see below | Body, head and connection limits. |
-| `proxy` | none trusted | Trust in proxies in front: `X-Forwarded-*`. |
+| `proxy` | none trusted | Trust in proxies in front: `trusted`, `X-Forwarded-*`. |
 | `request`, `response` | see below | How requests are read and responses written. |
 | `http2` | 250 streams | HTTP/2 settings, for h2c and h2 over TLS. |
 | `errors` | `.auto` | Error answers as text or `{"error":"..."}`: by the request's `Accept` (`.auto`), or always `.json` or `.text`. See [routing.md](routing.md#error-handling). |
@@ -208,7 +211,7 @@ configuration ([c-abi.md](c-abi.md#configuration)). A duration is an
 | `request` | 30 s | A whole request: reading it, the handler, writing the response; also the TLS handshake. It ends when a stream or file body starts (see [streams](routing.md#timeouts-and-limits)); `write` bounds each write after that. |
 | `read_header` | 10 s | The request head on HTTP/1.x (against Slowloris). Null: `request` alone. |
 | `write` | 30 s | One write the peer does not take for this long ends the response (HTTP/1.1: the connection; HTTP/2 and HTTP/3: the stream). Applies once a stream or file body has started, and to every HTTP/2 connection write. |
-| `keepalive` | 60 s | An idle connection between requests. Null: never. |
+| `keepalive` | 75 s | An idle connection between requests. Null: never. Keep it above the idle timeout of a balancer in front (nginx 60 s, AWS ALB 60 s) so the balancer never reuses a connection Anole just closed. |
 | `idle_park` | 1 s | An idle HTTP/1.1 connection gives up its coroutine after this. Null: never. |
 | `shutdown` | 10 s | The graceful drain. Null waits for every connection. |
 
@@ -223,7 +226,7 @@ configuration ([c-abi.md](c-abi.md#configuration)). A duration is an
 | `max_requests_per_connection` | none | Requests per keep-alive connection. |
 | `ws_max_message` | 1 MiB | The largest WebSocket message, in or out; a route's `max_message_size` overrides it. |
 
-`proxy`: `trusted_hops` (0), `trust_forwarded_proto` (true) and
+`proxy`: `trusted` (null), `trusted_hops` (0), `trust_forwarded_proto` (true) and
 `trust_forwarded_host` (false), as in [Behind a proxy](#behind-a-proxy).
 `request`: `require_host` (true), `decompress` (true) and `keep_buffers`
 (false). `response`: `write_buffer_size` (16 KiB), `date` (true),
@@ -302,14 +305,14 @@ or instead of those two. Each has:
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `name` | made up | What the listener is called: `LISTEN_FDNAMES` for socket activation and restarts, and `req.listener.name` for handlers. Unique, at most 255 bytes, no `:`. Without one: `http-<port>`, `https-<port>` or `unix-<path>`. |
-| `address`, `port` | `127.0.0.1`, 8080 | Where it listens. |
+| `address`, `port` | null | Where it listens. Null: the deployment's default (`127.0.0.1`, 8080; `""` for `anole_lb` and `platform`, and `$PORT` for `platform`). |
 | `unix` | `null` | A unix domain socket at this path instead. |
 | `tls` | `null` | `.{ .cert = ... }` for TLS, with optional `alpn` and `client_auth`. Listeners that name the same certificate (the same files, the same PEM) share one copy of it. |
 | `http1` | true | HTTP/1.1 (and 1.0). |
 | `http2` | true | HTTP/2: by ALPN over TLS, by prior knowledge (h2c) on cleartext. |
 | `http3` | false | HTTP/3 on the same port number over UDP, with `Options.http3`'s settings. TLS only, one listener per server. |
-| `proxy_protocol` | false | Every connection starts with a PROXY protocol header. |
-| `proxy_protocol_from` | `&.{}` | With `proxy_protocol`: the peers allowed to send it, in CIDR notation; others are closed unread. Empty allows any peer. |
+| `proxy_protocol` | null | Every connection starts with a PROXY protocol header. Null: on under `anole_lb`, else off. |
+| `proxy_protocol_from` | `&.{}` | With `proxy_protocol`: the peers allowed to send it, in CIDR notation; others are closed unread. Empty: `proxy.trusted` when set, else any peer. |
 
 A TLS listener offers by ALPN the protocols it speaks: `h2` and `http/1.1`,
 or one of them. One with `http2 = false` gives a client that offers `h2`
@@ -537,7 +540,11 @@ listener whose port could not be bound. The C ABI reports the same names
 | `InvalidListenAddress` | An address Anole cannot read. | Use a port (`"3000"`), `":3000"` or `"127.0.0.1:3000"`. |
 | `ListenersAlreadySet` | `listen` or `listenTls` on a server whose options name listeners. | Serve them with `run`, or leave `http` and `https` out of the options. |
 | `InvalidListenerName`, `DuplicateListenerName` | A listener name that is empty, longer than 255 bytes, holds `:`, or is taken. | Give each listener its own short name. |
-| `InvalidProxyNetwork` | A `proxy_protocol_from` entry that is not an address or a CIDR network. | Write `"10.0.0.0/8"` or `"192.0.2.7"`. |
+| `InvalidProxyNetwork` | A `proxy_protocol_from`, `proxy.trusted` or `ANOLE_PROXY_TRUSTED` entry that is not an address, a CIDR network or `loopback`, `private`, `link_local`. | Write `"10.0.0.0/8"` or `"192.0.2.7"`. |
+| `InvalidEnvironmentVariable` | `ANOLE_ENV`, `ANOLE_DEPLOYMENT` or (platform) `PORT` holds a value Anole can't use; the log names it. | Set one of the listed values. |
+| `InvalidEnvFile` | A `.env` file has a problem; every problem is logged with its file and line. | Fix the lines; values are never printed. |
+| `DeploymentUnavailable` | `deployment = .lambda` before Anole 0.4. | Use `platform` or wait for the Lambda adapter. |
+| `ProxyProtocolNoPeers` | `proxy_protocol` on with `proxy.trusted` empty and no `proxy_protocol_from`. | Name the load balancers. |
 | `NoProtocols`, `SeveralHttp3Listeners`, `Http3NeedsTls`, `Http3NeedsHttps` | A listener that speaks nothing; HTTP/3 on several listeners, or on one without TLS. | One TLS listener serves HTTP/3. |
 | `TooManyListeners` | More listeners than a restart can hand over. | Fewer listeners, or no `process`. |
 | `RouteConflict` | Two routes (or a helper route) on one path. | Rename one of them. |
@@ -561,7 +568,7 @@ One table; the C ABI's defaults are the same (the schema test checks them).
 
 | Setting | Default |
 | --- | --- |
-| `timeouts.request` / `read_header` / `write` / `keepalive` / `idle_park` / `shutdown` | 30 s / 10 s / 30 s / 60 s / 1 s / 10 s |
+| `timeouts.request` / `read_header` / `write` / `keepalive` / `idle_park` / `shutdown` | 30 s / 10 s / 30 s / 75 s / 1 s / 10 s |
 | `limits.body_max` | 1 MiB (chunked `req.reader()` too) |
 | `limits.max_head_size` | 16 KiB (431 past it) |
 | `limits.max_connections` | 0: the open-file limit |
@@ -569,7 +576,8 @@ One table; the C ABI's defaults are the same (the schema test checks them).
 | `http2.max_concurrent_streams` | 250 |
 | HTTP/3 streams / idle / 0-RTT / Retry | 100 / 30 s / off / off |
 | `errors` | `.auto` |
-| `proxy.trusted_hops` | 0 |
+| `proxy.trusted` / `trusted_hops` | null (the deployment's) / 0 |
+| `environment` / `deployment` / `error_detail` | null / null / null |
 | `response.write_buffer_size` / `date` / `default_content_type` / `max_header_count` / `brotli_quality` | 16 KiB / on / text / 64 / 5 |
 | `executors` | one per CPU |
 | databases: `timeout` / transaction bound | 30 s (`timeout_ms` 30000) / the database's |
@@ -1045,25 +1053,37 @@ Limits:
 
 ## Behind a proxy
 
-Anole runs on its own, but a load balancer or proxy can sit in front. Two
-mechanisms carry the client address.
+Anole runs on its own, but a load balancer or proxy can sit in front. Say
+what is there with `deployment` (`.deployment = .behind_proxy`, or
+`ANOLE_DEPLOYMENT=behind_proxy`; [config.md](config.md#deployment)) and Anole
+trusts the right headers from the right peers. Two mechanisms carry the
+client address.
 
 **The PROXY protocol** (v1 and v2, as HAProxy, nginx, AWS NLB and Envoy send
-it), per listener: `.http = .{ .port = 8080, .proxy_protocol = true }`. Each
-connection must open with a valid header, read before TLS and within
-`timeouts.read_header`, or it is closed. The header's address becomes
-`req.remote_address`, and v2's SSL field sets `req.secure`.
-Name the load balancers with `proxy_protocol_from`
-(`.proxy_protocol_from = &.{ "10.0.0.0/8", "2001:db8::/32" }`) and a
-connection from any other peer is closed before anything is read, so a
-client that reaches the port directly cannot claim another address.
+it), per listener: `.http = .{ .port = 8080, .proxy_protocol = true }`, or on
+every listener under `anole_lb`. Each connection must open with a valid
+header, read before TLS and within `timeouts.read_header`, or it is closed.
+The header's address becomes `req.remote_address`, and v2's SSL field sets
+`req.secure`. Name the load balancers with `proxy_protocol_from`
+(`.proxy_protocol_from = &.{ "10.0.0.0/8", "2001:db8::/32" }`), or leave it
+empty to follow `proxy.trusted`; a connection from any other peer is closed
+before anything is read, so a client that reaches the port directly cannot
+claim another address. With neither set, any peer may send the header.
 
-**`X-Forwarded-*`**, with `.proxy = .{ .trusted_hops = 1 }`. With `n`
-hops, `req.remote_address` is the `n`-th address from the right of
-`X-Forwarded-For` (with port 0); entries left of it are the client's own and
-are not read, and a selected entry that is not an address gives `0.0.0.0`,
-never the proxy's address. The nearest proxy's `X-Forwarded-Proto` sets
-`req.secure` (`.proxy = .{ .trust_forwarded_proto = false }` turns that off). Its
+**`X-Forwarded-*`**, from the peers in `proxy.trusted`: addresses, CIDR
+networks, or the names `loopback`, `private` (RFC 1918 and `fc00::/7`) and
+`link_local`. `behind_proxy`, `anole_lb` and `platform` trust `loopback` and
+`private` unless you say otherwise; `ANOLE_PROXY_TRUSTED=10.0.0.0/8,203.0.113.7`
+sets it from the environment. From a trusted peer, `req.remote_address` is the
+rightmost `X-Forwarded-For` address that is not itself trusted (the walk:
+each proxy appends the address it saw, so what lies right of the first
+untrusted one is the chain of your own proxies); an entry may carry a port
+(`203.0.113.9:4711`, `[2001:db8::1]:443`) and the address is used. An entry
+on the way that is not an address gives `0.0.0.0`, never the proxy's address.
+From any other peer the headers are ignored, the first such request logs one
+warning, and `req.remote_address` is the peer. The nearest proxy's
+`X-Forwarded-Proto` sets `req.secure`
+(`.proxy = .{ .trust_forwarded_proto = false }` turns that off). Its
 `X-Forwarded-Host` is what `req.host()` returns only with
 `.proxy = .{ .trust_forwarded_host = true }`: a proxy that passes the client's header
 through (nginx does unless told `proxy_set_header X-Forwarded-Host $host`)
@@ -1072,10 +1092,12 @@ The proxy must set (overwrite) both headers on every request; append-only
 proxies are not enough for them. The `Forwarded` header (RFC 7239) is not
 read.
 
-Enable either only on a listener that nothing but the proxy can reach;
-otherwise clients write the header themselves and choose the address your
-handlers see. The two combine: the PROXY header sets the peer, and
-`proxy.trusted_hops` applies on top.
+`.proxy = .{ .trusted_hops = n }` is the fixed-count alternative: the `n`-th
+address from the right, whoever the proxies are. On its own (standalone, no
+`trusted`) it reads the headers from any peer, as in 0.2, so use it only on a
+listener that nothing but the proxy can reach; with `trusted` set it applies
+to trusted peers only. The two mechanisms combine: the PROXY header sets the
+peer, and the `X-Forwarded-*` rules apply on top.
 
 ## Build flags
 

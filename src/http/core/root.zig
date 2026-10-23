@@ -22,6 +22,8 @@ pub const Ca = @import("tls_options.zig").Ca;
 pub const ClientAuth = @import("tls_options.zig").ClientAuth;
 /// A peer range for `Listener.proxy_protocol_from`.
 pub const ProxyNetwork = @import("proxy_protocol.zig").Network;
+pub const proxy_networks = @import("proxy_protocol.zig").networks;
+pub const isPublicAddress = @import("proxy_protocol.zig").isPublic;
 pub const Router = @import("router.zig").Router;
 pub const Action = @import("router.zig").Action;
 pub const RouteInfo = @import("router.zig").RouteInfo;

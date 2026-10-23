@@ -267,7 +267,12 @@ pub fn clientError(err: anyerror) ?ErrorAnswer {
 /// `uncaughtError` or `error_handler` that handles some errors itself and
 /// leaves the rest to this.
 pub fn defaultError(_: *Request, res: *Response, err: anyerror) void {
-    res.fail(errorStatus(err) orelse .internal_server_error, "");
+    const status = errorStatus(err);
+    if (status == null and res._error_detail) {
+        const text = std.fmt.allocPrint(res.arena, "Internal Server Error: {t}", .{err}) catch "";
+        return res.fail(.internal_server_error, text);
+    }
+    res.fail(status orelse .internal_server_error, "");
 }
 
 /// The standard 4xx and 5xx codes, the ones an error can be named after.

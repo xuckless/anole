@@ -34,6 +34,8 @@ const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct 
 const tls_testing = if (features.tls == .boringssl) @import("tls/testing.zig") else struct {};
 const handoff = @import("handoff.zig");
 const errors = @import("errors.zig");
+const modes = @import("modes.zig");
+const env_mod = @import("env.zig");
 /// SIGUSR2 (restart) and SIGHUP (certificate reload): not on Windows.
 const unix_signals = builtin.os.tag != .windows;
 
@@ -152,7 +154,10 @@ pub const Options = struct {
     /// Whether `listenTls` also serves HTTP/3 on the same port number (UDP),
     /// advertised with `Alt-Svc`, when HTTP/3 is built in (the default
     /// `full` profile): with `http3`'s settings when set, else the defaults.
-    listen_tls_http3: bool = true,
+    ///
+    /// Null: the deployment's default (on, except behind a proxy or on a
+    /// platform, which terminate TLS themselves: docs/config.md).
+    listen_tls_http3: ?bool = null,
 
     // HTTP behaviour: the same groups and names as the C ABI's JSON config.
 
@@ -179,6 +184,26 @@ pub const Options = struct {
     /// mapping, which it can fall back on with `anole.defaultError(req,
     /// res, err)`: no `Ctx` with `uncaughtError` needed.
     error_handler: ?http.ErrorHandler = null,
+
+    // Modes (docs/config.md)
+
+    /// development or production. Null: ANOLE_ENV, else development in a
+    /// Debug build and production in a release build (production in tests).
+    /// What it changes: docs/config.md.
+    environment: ?modes.Environment = null,
+    /// What sits in front of the server. Null: ANOLE_DEPLOYMENT, else
+    /// standalone. What each changes: docs/config.md.
+    deployment: ?modes.Deployment = null,
+    /// The `.env` files read at `init` (first wins per key), relative to the
+    /// working directory. Null: the environment's (development:
+    /// ".env.development.local", ".env.local", ".env.development", ".env";
+    /// production: none); `&.{}`: none.
+    env_files: ?[]const []const u8 = null,
+    /// A 500 answer for an error with no status of its own names the error
+    /// ("Internal Server Error: ConnectionRefused"). Null: on in development.
+    error_detail: ?bool = null,
+    /// Internal: a resolution made already (the C ABI resolves at create).
+    _resolved: ?*const modes.Resolved = null,
 
     // Process and runtime
 
@@ -250,7 +275,7 @@ pub const Options = struct {
         /// every HTTP/2 connection write. Null: none.
         write: ?Duration = .fromSeconds(30),
         /// An idle keep-alive connection is closed after this. Null: never.
-        keepalive: ?Duration = .fromSeconds(60),
+        keepalive: ?Duration = .fromSeconds(75),
         /// An idle HTTP/1.1 connection gives up its task after this
         /// (parks). Null or zero: never parks.
         idle_park: ?Duration = .fromSeconds(1),
@@ -282,12 +307,28 @@ pub const Options = struct {
 
     /// `Options.proxy`.
     pub const Proxy = struct {
-        /// Proxies in front whose X-Forwarded-For Anole trusts: 0 none.
+        /// The proxies in front: addresses ("192.0.2.7"), networks in CIDR
+        /// notation ("10.0.0.0/8", "2001:db8::/32"), or the names "loopback"
+        /// (127.0.0.0/8, ::1), "private" (10.0.0.0/8, 172.16.0.0/12,
+        /// 192.168.0.0/16, fc00::/7) and "link_local" (169.254.0.0/16,
+        /// fe80::/10). Only a request whose peer is one of them has its
+        /// X-Forwarded-For, X-Forwarded-Proto (and, with trust_forwarded_host,
+        /// X-Forwarded-Host) read; the client is the rightmost X-Forwarded-For
+        /// address that is not one of them. On a listener with proxy_protocol
+        /// and no proxy_protocol_from, only they may connect. Null:
+        /// ANOLE_PROXY_TRUSTED, else the deployment's (behind_proxy, anole_lb,
+        /// platform: "loopback" and "private"; standalone: none, and
+        /// trusted_hops alone decides, as in 0.2). `&.{}`: no proxy is trusted.
+        trusted: ?[]const []const u8 = null,
+        /// A fixed number of proxies instead of the walk: the client is the
+        /// trusted_hops-th X-Forwarded-For address from the right. With
+        /// `trusted` set, only from a trusted peer. 0: the walk (or nothing,
+        /// with no `trusted`).
         trusted_hops: u8 = 0,
-        /// With `trusted_hops`: the last `X-Forwarded-Proto` value sets
+        /// From a trusted proxy: the last `X-Forwarded-Proto` value sets
         /// `req.secure`.
         trust_forwarded_proto: bool = true,
-        /// With `trusted_hops`: the last `X-Forwarded-Host` value is
+        /// From a trusted proxy: the last `X-Forwarded-Host` value is
         /// `req.host`.
         trust_forwarded_host: bool = false,
     };
@@ -316,20 +357,25 @@ pub const Options = struct {
         /// `listen(":3000")` binds), "0.0.0.0" (every IPv4 interface
         /// only), "::" (every IPv6 one, and IPv4 too where the system's
         /// default maps it).
-        address: []const u8 = "127.0.0.1",
-        /// 0 picks a free port (see `addresses`).
-        port: u16 = 8080,
+        /// Null: the deployment's default ("127.0.0.1"; "" for anole_lb
+        /// and platform).
+        address: ?[]const u8 = null,
+        /// 0 picks a free port (see `addresses`). Null: 8080, or $PORT
+        /// under the platform deployment.
+        port: ?u16 = null,
         /// Cleartext HTTP/2 for clients that open with its preface, beside
         /// HTTP/1.1 on the same port.
         h2c: bool = features.http2,
         /// Every connection starts with a PROXY protocol header (v1 or v2)
         /// from a load balancer in front, which gives the client's real
         /// address. Only for a port nothing else can reach, or with
-        /// `proxy_protocol_from` naming the load balancers.
-        proxy_protocol: bool = false,
+        /// `proxy_protocol_from` naming the load balancers. Null: on under
+        /// the anole_lb deployment, else off.
+        proxy_protocol: ?bool = null,
         /// With `proxy_protocol`: the peers allowed to connect, in CIDR
         /// notation ("10.0.0.0/8", "2001:db8::/32", "192.0.2.7"); a
-        /// connection from anywhere else is closed unread. Empty: any peer.
+        /// connection from anywhere else is closed unread. Empty:
+        /// `proxy.trusted` when set, else any peer.
         proxy_protocol_from: []const []const u8 = &.{},
     };
 
@@ -386,7 +432,7 @@ pub const Options = struct {
     /// `Options.https`: a TLS listener with HTTP/2 and HTTP/1.1 by ALPN.
     pub const Https = struct {
         /// As `Http.address`.
-        address: []const u8 = "127.0.0.1",
+        address: ?[]const u8 = null,
         port: u16 = 8443,
         /// The certificate and key: `.fromFiles(...)`, `.fromPem(...)` or
         /// `.dev_self_signed`.
@@ -397,7 +443,7 @@ pub const Options = struct {
         /// (`req.peerCertificate()` has it). Null: none asked for.
         client_auth: ?ClientAuth = null,
         /// As `Http.proxy_protocol`.
-        proxy_protocol: bool = false,
+        proxy_protocol: ?bool = null,
         /// As `Http.proxy_protocol_from`.
         proxy_protocol_from: []const []const u8 = &.{},
     };
@@ -412,9 +458,9 @@ pub const Options = struct {
         /// "https-<port>", or "unix-<path>".
         name: ?[]const u8 = null,
         /// As `Http.address`.
-        address: []const u8 = "127.0.0.1",
-        /// 0 picks a free port (see `addresses`).
-        port: u16 = 8080,
+        address: ?[]const u8 = null,
+        /// 0 picks a free port (see `addresses`). Null: as `Http.port`.
+        port: ?u16 = null,
         /// A unix domain socket at this path instead of `address` and
         /// `port`. A socket file left behind by a server that is gone is
         /// replaced; one that something still listens on is an error.
@@ -433,7 +479,7 @@ pub const Options = struct {
         /// listeners only, and one per server. Needs `-Dhttp3`.
         http3: bool = false,
         /// As `Http.proxy_protocol`.
-        proxy_protocol: bool = false,
+        proxy_protocol: ?bool = null,
         /// As `Http.proxy_protocol_from`.
         proxy_protocol_from: []const []const u8 = &.{},
 
@@ -469,7 +515,7 @@ fn warnsDevCert(cert: Options.Cert, address: http.Address) bool {
 
 /// The core's server configuration for `opts`: the only place one is built.
 /// The listeners are set later, by `listenOn`.
-fn coreConfig(opts: Options) http.ServerConfig {
+fn coreConfig(opts: Options, mode: *const modes.Resolved) http.ServerConfig {
     return .{
         .timeout = .{
             .request = opts.timeouts.request,
@@ -498,6 +544,9 @@ fn coreConfig(opts: Options) http.ServerConfig {
         .http2 = opts.http2,
         .listeners = &.{},
         .trusted_proxy_hops = opts.proxy.trusted_hops,
+        .trusted_proxies = mode.trusted,
+        .warn_untrusted_peer = mode.warn_untrusted_peer,
+        .error_detail = mode.error_detail,
         .trust_forwarded_proto = opts.proxy.trust_forwarded_proto,
         .trust_forwarded_host = opts.proxy.trust_forwarded_host,
         .max_connections = if (opts.limits.max_connections == 0)
@@ -593,6 +642,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         h3: H3Endpoint,
         /// The blocking pool, when `Options.blocking` asked for one.
         blocking_pool: ?*blocking.Pool = null,
+        /// The resolved modes (docs/config.md): environment, deployment and
+        /// what they fill in. In the server's arena.
+        mode: *modes.Resolved,
+        /// `listenTls` set up the TLS listener (for the startup line).
+        used_listen_tls: bool = false,
         /// The TLS listeners' certificates, one per distinct source, for
         /// `reloadCertificates`; empty without a TLS listener.
         certs: []const *CertState = &.{},
@@ -821,6 +875,20 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
             const a = arena.allocator();
 
+            // The modes first: they can size the runtime, and the `.env`
+            // files they read reach every environment read after this.
+            const mode = try a.create(modes.Resolved);
+            if (opts._resolved) |m| {
+                mode.* = m.*;
+            } else {
+                var why_buf: [512]u8 = undefined;
+                var why: std.Io.Writer = .fixed(&why_buf);
+                mode.* = resolveModes(a, &opts, &why) catch |err| {
+                    errors.log.err("{s}", .{why.buffered()});
+                    return err;
+                };
+            }
+
             const rt = try zio.Runtime.init(gpa, .{
                 .executors = opts.executors,
                 .stack_pool = .{
@@ -839,7 +907,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             server_on_thread = true;
             errdefer server_on_thread = false;
 
-            const server_config = coreConfig(opts);
+            const server_config = coreConfig(opts, mode);
             const server = try a.create(http.Server(Ctx));
             server.* = .init(gpa, rt_io, server_config, ctx);
             errdefer server.deinit();
@@ -876,13 +944,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .h3 = if (features.http3) null else {},
                 .blocking_pool = pool,
                 .extras = extras,
+                .mode = mode,
             };
             // RFC 8470 §5.1: unsafe requests taken in early data (marked
             // `Early-Data: 1`, by the HTTP/3 endpoint or a proxy in front)
             // get 425 Too Early, on every route, with HTTP/3 or without:
             // a TLS-terminating proxy can forward the mark to any listener.
             // Now, before any route.
-            const h3_possible = features.http3 and (opts.http3 != null or opts.listen_tls_http3 or anyHttp3(opts.listeners));
+            const h3_possible = features.http3 and (opts.http3 != null or mode.listen_tls_http3 or anyHttp3(opts.listeners));
             {
                 const guard = try a.create(early_data.Guard);
                 guard.* = .{};
@@ -902,6 +971,31 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             return self;
         }
 
+        /// The modes for `opts`: the environment, the `.env` files it reads,
+        /// then the deployment and its defaults.
+        fn resolveModes(a: std.mem.Allocator, opts: *const Options, why: *std.Io.Writer) !modes.Resolved {
+            const e = try modes.resolveEnvironment(opts.environment, .process, .current, why);
+            const list = opts.env_files orelse env_mod.defaultFiles(e.environment);
+            var files: ?*const env_mod.Files = null;
+            if (list.len > 0) {
+                files = env_mod.loadOnce(std.Io.Threaded.global_single_threaded.io(), list, null) catch |err| {
+                    why.writeAll("the .env files have problems (logged above)") catch {};
+                    return err;
+                };
+            }
+            return modes.resolve(a, opts, e.environment, e.source, files, .process, why);
+        }
+
+        /// `development` or `production`, as resolved at `init`.
+        pub fn environment(self: *const Self) modes.Environment {
+            return self.mode.environment;
+        }
+
+        /// What sits in front of the server, as resolved at `init`.
+        pub fn deployment(self: *const Self) modes.Deployment {
+            return self.mode.deployment;
+        }
+
         fn addAltSvc(self: *Self) *AltSvc {
             const alt = self.arena.allocator().create(AltSvc) catch @panic("OOM");
             alt.* = .{};
@@ -914,30 +1008,36 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// `opts`' listeners in serving order (`http`, `https`, then
         /// `listeners`), named. `checkSpecs` checks them.
-        fn listenerSpecs(a: std.mem.Allocator, opts: Options) ![]const Spec {
+        fn listenerSpecs(a: std.mem.Allocator, opts: Options, m: *const modes.Resolved) ![]const Spec {
             var specs: std.ArrayList(Spec) = .empty;
             // 127.0.0.1:8080 when nothing else is named.
             const http_opts: ?Options.Http = opts.http orelse if (opts.https == null and opts.listeners.len == 0) .{} else null;
             if (http_opts) |h| try specs.append(a, .{ .name = "http", .listener = .{
-                .address = h.address,
-                .port = h.port,
+                .address = h.address orelse m.default_address,
+                .port = h.port orelse m.default_port,
                 .http2 = h.h2c and features.http2,
-                .proxy_protocol = h.proxy_protocol,
+                .proxy_protocol = h.proxy_protocol orelse m.proxy_protocol_default,
                 .proxy_protocol_from = h.proxy_protocol_from,
             } });
             if (opts.https) |h| try specs.append(a, .{ .name = "https", .listener = .{
-                .address = h.address,
+                .address = h.address orelse m.default_address,
                 .port = h.port,
                 .tls = .{ .cert = h.cert, .alpn = h.alpn, .client_auth = h.client_auth },
                 .http3 = opts.http3 != null,
-                .proxy_protocol = h.proxy_protocol,
+                .proxy_protocol = h.proxy_protocol orelse m.proxy_protocol_default,
                 .proxy_protocol_from = h.proxy_protocol_from,
             } });
-            for (opts.listeners) |l| {
+            for (opts.listeners) |l0| {
+                var l = l0;
+                if (l.unix == null) {
+                    l.address = l.address orelse m.default_address;
+                    l.port = l.port orelse m.default_port;
+                    l.proxy_protocol = l.proxy_protocol orelse m.proxy_protocol_default;
+                }
                 var name = l.name orelse if (l.unix) |path|
                     try std.fmt.allocPrint(a, "unix-{s}", .{path})
                 else
-                    try std.fmt.allocPrint(a, "{s}-{d}", .{ if (l.tls != null) "https" else "http", l.port });
+                    try std.fmt.allocPrint(a, "{s}-{d}", .{ if (l.tls != null) "https" else "http", l.port.? });
                 // A made-up name taken already (two on port 0): made unique.
                 if (l.name == null) for (specs.items) |other| {
                     if (std.mem.eql(u8, other.name, name)) {
@@ -953,7 +1053,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// Fails when `specs` cannot be served as they are, saying why to
         /// `why`: names unique, each listener speaking something, HTTP/3 on
         /// one TLS listener at most, and on one when `opts.http3` is set.
-        fn checkSpecs(specs: []const Spec, opts: Options, why: *std.Io.Writer) !void {
+        fn checkSpecs(specs: []const Spec, opts: Options, m: *const modes.Resolved, why: *std.Io.Writer) !void {
             var h3_count: usize = 0;
             for (specs, 0..) |spec, i| {
                 const l = spec.listener;
@@ -964,6 +1064,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 for (specs[0..i]) |other| if (std.mem.eql(u8, other.name, spec.name)) {
                     try why.print("two listeners are named \"{s}\"", .{spec.name});
                     return error.DuplicateListenerName;
+                };
+                if (l.proxy_protocol == true and l.proxy_protocol_from.len == 0) if (m.trusted) |t| if (t.len == 0) {
+                    try why.print("listener \"{s}\": proxy_protocol is on but proxy.trusted is empty, so no peer may send the header; name the load balancers in proxy_protocol_from or proxy.trusted", .{spec.name});
+                    return error.ProxyProtocolNoPeers;
                 };
                 for (l.proxy_protocol_from) |text| {
                     _ = http.ProxyNetwork.parse(text) catch {
@@ -1021,16 +1125,19 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// Sets up the listeners `opts` names (`http`, `https`,
         /// `listeners`, `http3`; 127.0.0.1:8080 when it names none). Once,
         /// before serving.
-        fn listenOn(self: *Self, opts: Options) !void {
+        fn listenOn(self: *Self, opts_in: Options) !void {
             const gpa = self.gpa;
             const a = self.arena.allocator();
             const rt_io = self.rt.io();
             const server = self.server;
-            const specs = try listenerSpecs(a, opts);
+            // What the options left null, from the modes.
+            var opts = opts_in;
+            try modes.fillListeners(a, &opts, self.mode);
+            const specs = try listenerSpecs(a, opts, self.mode);
             {
                 var why_buf: [512]u8 = undefined;
                 var why: std.Io.Writer = .fixed(&why_buf);
-                checkSpecs(specs, opts, &why) catch |err| {
+                checkSpecs(specs, opts, self.mode, &why) catch |err| {
                     errors.log.err("{s}", .{why.buffered()});
                     return err;
                 };
@@ -1064,7 +1171,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 const address: http.Address = if (l.unix) |path|
                     .{ .unix = try std.Io.net.UnixAddress.init(path) }
                 else blk: {
-                    const bind = try address_mod.resolve(l.address, l.port, l.address.len == 0 and dual.get());
+                    const bind = try address_mod.resolve(l.address.?, l.port.?, l.address.?.len == 0 and dual.get());
                     ipv6_only = bind.ipv6_only;
                     break :blk .{ .ip = bind.ip };
                 };
@@ -1102,7 +1209,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .http2_prior_knowledge = l.tls == null and l.http2 and features.http2,
                     .socket_per_acceptor = per_core_sockets and address == .ip,
                     .ipv6_only = ipv6_only,
-                    .proxy_protocol = l.proxy_protocol,
+                    .proxy_protocol = l.proxy_protocol.?,
                     .proxy_protocol_from = from: {
                         const nets = try a.alloc(http.ProxyNetwork, l.proxy_protocol_from.len);
                         for (l.proxy_protocol_from, nets) |text, *net| net.* = http.ProxyNetwork.parse(text) catch return error.InvalidProxyNetwork;
@@ -1143,8 +1250,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 };
                 const secret: ?[32]u8 = if (h3_fds.len > 0) handoff.inheritedSecret(opts.process.?.environ) else null;
                 // The UDP socket follows the TCP listener's address, "" (dual-stack) included.
-                const udp_host = q.address orelse l.address;
-                const udp_bind = try address_mod.resolve(udp_host, q.port orelse l.port, udp_host.len == 0 and dual.get());
+                const udp_host = q.address orelse l.address.?;
+                const udp_bind = try address_mod.resolve(udp_host, q.port orelse l.port.?, udp_host.len == 0 and dual.get());
                 const ep = h3.Endpoint(Ctx).init(gpa, rt_io, server, .{
                     .address = udp_bind.ip,
                     .ipv6_only = udp_bind.ipv6_only,
@@ -1327,6 +1434,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 return err;
             };
             opts.http = .{ .address = at.host, .port = at.port };
+            self.warnPlatformPort("listen", address, at.port);
             try self.configure(opts);
             return self.runInner();
         }
@@ -1350,9 +1458,22 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             };
             opts.https = .{ .address = at.host, .port = at.port, .cert = cert };
             // Unless a listener in `listeners` serves HTTP/3 already.
-            if (features.http3 and opts.listen_tls_http3 and opts.http3 == null and !anyHttp3(opts.listeners)) opts.http3 = .{};
+            self.warnPlatformPort("listenTls", address, at.port);
+            self.used_listen_tls = true;
+            if (features.http3 and self.mode.listen_tls_http3 and opts.http3 == null and !anyHttp3(opts.listeners)) opts.http3 = .{};
             try self.configure(opts);
             return self.runInner();
+        }
+
+        /// Under the platform deployment the platform sends traffic to
+        /// $PORT: a port named in code wins, and this says so when it differs.
+        fn warnPlatformPort(self: *const Self, comptime what: []const u8, address: []const u8, port: u16) void {
+            const m = self.mode;
+            if (m.deployment != .platform or m.port_source == .default or port == m.default_port) return;
+            std.log.scoped(.anole).warn(
+                "deployment platform: PORT={d}, but " ++ what ++ "(\"{s}\") names port {d}; the platform sends traffic to PORT. Leave the port to it: app.run(), or .http = .{{}}",
+                .{ m.default_port, address, port },
+            );
         }
 
         fn takePending(self: *Self, comptime what: []const u8) !Options {
@@ -2274,7 +2395,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         fn runInner(self: *Self) !void {
             if (self.pending) |opts| try self.configure(opts);
-            logBuildMode();
+            self.logModes();
+            logBuildMode(self.mode.debug_production);
             self.addHelperRoutes();
             // Only with `router.record_conflicts` (the C ABI): a route the
             // helper routes collided with.
@@ -2397,9 +2519,23 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
         }
 
+        /// The startup lines about the environment and deployment
+        /// (`modes.writeLines`), one log record each.
+        fn logModes(self: *const Self) void {
+            var buf: [2048]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            modes.writeLines(self.mode, .{ .used_listen_tls = self.used_listen_tls }, &w) catch return;
+            const log = std.log.scoped(.anole);
+            var lines = std.mem.splitScalar(u8, w.buffered(), '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                if (line[0] == '!') log.warn("{s}", .{line[1..]}) else log.info("{s}", .{line});
+            }
+        }
+
         /// Which build this is; a loud word for ReleaseFast, which has none
         /// of Zig's safety checks (docs/server.md recommends ReleaseSafe).
-        fn logBuildMode() void {
+        fn logBuildMode(quiet_debug: bool) void {
             const log = std.log.scoped(.anole);
             const name = switch (builtin.mode) {
                 .debug => "Debug",
@@ -2409,7 +2545,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             };
             switch (builtin.mode) {
                 .fast, .small => log.warn("built with {s}: Zig's safety checks are off, so a bug that ReleaseSafe would stop at the faulty line can corrupt memory instead; ReleaseSafe is the recommended build for production", .{name}),
-                .debug, .safe => log.info("{s} build", .{name}),
+                .debug => if (!quiet_debug) log.info("{s} build", .{name}),
+                .safe => log.info("{s} build", .{name}),
             }
         }
 
@@ -3238,17 +3375,19 @@ test "anole.Server: listeners that cannot be set up are refused, with what is wr
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     for (cases) |c| {
-        const specs = try S.listenerSpecs(arena.allocator(), c.opts);
+        const m = try testMode(arena.allocator(), c.opts);
+        const specs = try S.listenerSpecs(arena.allocator(), c.opts, m);
         var why_buf: [512]u8 = undefined;
         var why: std.Io.Writer = .fixed(&why_buf);
-        try std.testing.expectError(c.err, S.checkSpecs(specs, c.opts, &why));
+        try std.testing.expectError(c.err, S.checkSpecs(specs, c.opts, m, &why));
         try std.testing.expect(why.buffered().len > 0);
     }
     // The names made up for listeners without one, unique on port 0 too.
-    const specs = try S.listenerSpecs(arena.allocator(), .{
+    const names_opts: Options = .{
         .http = .{},
         .listeners = &.{ .{ .port = 0 }, .{ .port = 0 }, .{ .port = 9443, .tls = .{ .cert = cert } }, .{ .unix = "/run/app.sock" } },
-    });
+    };
+    const specs = try S.listenerSpecs(arena.allocator(), names_opts, try testMode(arena.allocator(), names_opts));
     var names: [5][]const u8 = undefined;
     for (specs, &names) |spec, *n| n.* = spec.name;
     for ([_][]const u8{ "http", "http-0", "http-0-2", "https-9443", "unix-/run/app.sock" }, names) |want, got| try std.testing.expectEqualStrings(want, got);
@@ -3308,8 +3447,21 @@ test "anole.Server: the open-file limit is raised, and max_connections follows i
     try g.await(capped.io());
 }
 
+/// The modes of a test: production, standalone unless `opts` says otherwise.
+fn testMode(a: std.mem.Allocator, opts: Options) !*const modes.Resolved {
+    var buf: [512]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    const m = try a.create(modes.Resolved);
+    m.* = try modes.resolve(a, &opts, .production, .tests, null, .process, &why);
+    return m;
+}
+
+fn testCoreConfig(opts: Options) http.ServerConfig {
+    return coreConfig(opts, testMode(std.heap.page_allocator, opts) catch unreachable);
+}
+
 test "options: coreConfig maps every group" {
-    const cfg = coreConfig(.{
+    const cfg = testCoreConfig(.{
         .timeouts = .{
             .request = .fromSeconds(61),
             .read_header = .fromSeconds(7),
@@ -3370,17 +3522,17 @@ test "options: coreConfig maps every group" {
 }
 
 test "options: limits.max_connections 0 follows the open-file limit" {
-    try std.testing.expectEqual(@as(?u32, http.ServerConfig.max_connections_from_fd_limit), coreConfig(.{}).max_connections);
-    try std.testing.expectEqual(@as(?u32, 5), coreConfig(.{ .limits = .{ .max_connections = 5 } }).max_connections);
+    try std.testing.expectEqual(@as(?u32, http.ServerConfig.max_connections_from_fd_limit), testCoreConfig(.{}).max_connections);
+    try std.testing.expectEqual(@as(?u32, 5), testCoreConfig(.{ .limits = .{ .max_connections = 5 } }).max_connections);
 }
 
 test "options: shutdown drains for 10 s by default" {
-    try std.testing.expectEqual(Duration.fromSeconds(10), coreConfig(.{}).timeout.shutdown.?);
+    try std.testing.expectEqual(Duration.fromSeconds(10), testCoreConfig(.{}).timeout.shutdown.?);
 }
 
 test "options: http2 with one field set keeps 250 streams" {
-    try std.testing.expectEqual(@as(u32, 250), coreConfig(.{ .http2 = .{ .stream_window = 128 * 1024 } }).http2.max_concurrent_streams);
-    try std.testing.expectEqual(@as(u32, 250), coreConfig(.{}).http2.max_concurrent_streams);
+    try std.testing.expectEqual(@as(u32, 250), testCoreConfig(.{ .http2 = .{ .stream_window = 128 * 1024 } }).http2.max_concurrent_streams);
+    try std.testing.expectEqual(@as(u32, 250), testCoreConfig(.{}).http2.max_concurrent_streams);
 }
 
 test "options: no struct-typed default is a partial literal" {
@@ -3482,4 +3634,116 @@ test "listenOn: only a development certificate off loopback warns" {
     try std.testing.expect(!warnsDevCert(.dev_self_signed, .{ .ip = .{ .ip6 = .loopback(8443) } }));
     try std.testing.expect(!warnsDevCert(.fromPem("c", "k"), .{ .ip = .{ .ip4 = .unspecified(8443) } }));
     try std.testing.expect(!warnsDevCert(.dev_self_signed, .{ .unix = try std.Io.net.UnixAddress.init("/tmp/x.sock") }));
+}
+
+const RawRequest = struct {
+    fn send(io_: std.Io, address: std.Io.net.IpAddress, request: []const u8, out: []u8) ![]const u8 {
+        const stream = try address.connect(io_, .{ .mode = .stream });
+        defer stream.close(io_);
+        var wbuf: [512]u8 = undefined;
+        var w = stream.writer(io_, &wbuf);
+        try w.interface.writeAll(request);
+        try w.interface.flush();
+        var rbuf: [1024]u8 = undefined;
+        var r = stream.reader(io_, &rbuf);
+        var fw: std.Io.Writer = .fixed(out);
+        _ = r.interface.streamRemaining(&fw) catch {};
+        return fw.buffered();
+    }
+};
+
+fn echoRemote(req: *http.Request, res: *http.Response) !void {
+    try res.print(.text, "{f}", .{req.remote_address});
+}
+
+fn failBoom(_: *http.Request, _: *http.Response) !void {
+    return error.Boom;
+}
+
+fn failNotFound(_: *http.Request, _: *http.Response) !void {
+    return error.NotFound;
+}
+
+test "anole.Server: behind_proxy over a real connection reads X-Forwarded-For from a trusted peer" {
+    const gpa = std.testing.allocator;
+    var app = try Server(void).init(gpa, .{
+        .deployment = .behind_proxy,
+        .http = .{ .port = 0, .h2c = false },
+        .executors = .exact(1),
+    }, {});
+    defer app.deinit();
+    try std.testing.expectEqual(modes.Deployment.behind_proxy, app.deployment());
+    app.get("/who", echoRemote);
+    var client_future = try app.io().concurrent(struct {
+        fn run(a: *Server(void)) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            var out: [1024]u8 = undefined;
+            const resp = try RawRequest.send(io_, a.addresses()[0].ip, "GET /who HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 198.51.100.7\r\nConnection: close\r\n\r\n", &out);
+            try std.testing.expect(std.mem.endsWith(u8, resp, "198.51.100.7:0"));
+        }
+    }.run, .{&app});
+    try app.run();
+    try client_future.await(app.io());
+}
+
+test "anole.Server: error_detail names the error in a 500, in development only" {
+    const gpa = std.testing.allocator;
+    inline for (.{ modes.Environment.development, modes.Environment.production }) |environment| {
+        var app = try Server(void).init(gpa, .{
+            .environment = environment,
+            .http = .{ .port = 0, .h2c = false },
+            .executors = .exact(1),
+        }, {});
+        defer app.deinit();
+        app.get("/boom", failBoom);
+        app.get("/missing", failNotFound);
+        const Client = struct {
+            fn run(a: *Server(void)) !void {
+                defer a.stop();
+                const io_ = a.io();
+                try a.waitReady();
+                var out: [1024]u8 = undefined;
+                const resp = try RawRequest.send(io_, a.addresses()[0].ip, "GET /boom HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+                try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 500"));
+                const detail = std.mem.indexOf(u8, resp, "Internal Server Error: Boom") != null;
+                try std.testing.expectEqual(environment == .development, detail);
+                var out2: [1024]u8 = undefined;
+                const resp2 = try RawRequest.send(io_, a.addresses()[0].ip, "GET /missing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out2);
+                try std.testing.expect(std.mem.startsWith(u8, resp2, "HTTP/1.1 404"));
+            }
+        };
+        var client_future = try app.io().concurrent(Client.run, .{&app});
+        try app.run();
+        try client_future.await(app.io());
+    }
+}
+
+test "anole.Server: proxy_protocol with an empty proxy.trusted is ProxyProtocolNoPeers" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.ProxyProtocolNoPeers, Server(void).init(gpa, .{
+        .proxy = .{ .trusted = &.{} },
+        .http = .{ .port = 0, .proxy_protocol = true },
+        .executors = .exact(1),
+    }, {}));
+}
+
+test "anole.Server: a .env file with a problem is InvalidEnvFile" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.env", .data = "NOT A PAIR\n" });
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
+    defer gpa.free(dir_path);
+    const path = try std.fmt.allocPrint(gpa, "{s}/bad.env", .{dir_path});
+    defer gpa.free(path);
+    env_mod._resetForTest();
+    defer env_mod._resetForTest();
+    try std.testing.expectError(error.InvalidEnvFile, Server(void).init(gpa, .{
+        .environment = .development,
+        .env_files = &.{path},
+        .http = .{ .port = 0 },
+        .executors = .exact(1),
+    }, {}));
 }

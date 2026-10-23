@@ -808,6 +808,8 @@ pub const Response = struct {
     /// started, each write the peer does not take within it ends the
     /// response (`error.WriteTimeout`).
     _write_timeout: ?std.Io.Duration = null,
+    /// `ServerConfig.error_detail`: `defaultError` names the error in a 500.
+    _error_detail: bool = false,
     /// When the write in progress times out, if one is being timed.
     _write_deadline: ?std.Io.Clock.Timestamp = null,
     /// The request deadline was lifted for a stream or file body.

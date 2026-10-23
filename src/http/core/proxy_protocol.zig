@@ -93,7 +93,25 @@ pub const Network = struct {
         return @as(u8, 0xff) << @intCast(@as(u4, 8) - keep);
     }
 
-    fn unmap(address: IpAddress) IpAddress {
+    /// "10.0.0.0/8", "::1/128".
+    pub fn format(self: Network, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self.address) {
+            .ip4 => |a| try w.print("{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }),
+            .ip6 => |a| {
+                const plain: IpAddress = .{ .ip6 = .{ .bytes = a.bytes, .port = 0 } };
+                // IpAddress prints "[addr]:port"; the network wants the bare address.
+                var buf: [64]u8 = undefined;
+                var fw: std.Io.Writer = .fixed(&buf);
+                fw.print("{f}", .{plain}) catch {};
+                const text = fw.buffered();
+                const close = std.mem.indexOfScalar(u8, text, ']') orelse text.len;
+                try w.writeAll(text[@min(1, close)..close]);
+            },
+        }
+        try w.print("/{d}", .{self.prefix_len});
+    }
+
+    pub fn unmap(address: IpAddress) IpAddress {
         const a = switch (address) {
             .ip4 => return address,
             .ip6 => |a| a,
@@ -110,6 +128,61 @@ pub fn trustedPeer(trusted: []const Network, peer: IpAddress) bool {
     if (trusted.len == 0) return true;
     for (trusted) |net| if (net.contains(peer)) return true;
     return false;
+}
+
+fn v4net(a: u8, b: u8, c: u8, d: u8, len: u8) Network {
+    return .{ .address = .{ .ip4 = .{ .bytes = .{ a, b, c, d }, .port = 0 } }, .prefix_len = len };
+}
+
+fn v6net(first: u16, len: u8) Network {
+    var bytes: [16]u8 = @splat(0);
+    bytes[0] = @intCast(first >> 8);
+    bytes[1] = @intCast(first & 0xff);
+    return .{ .address = .{ .ip6 = .{ .bytes = bytes, .port = 0 } }, .prefix_len = len };
+}
+
+fn v6loopback() Network {
+    var bytes: [16]u8 = @splat(0);
+    bytes[15] = 1;
+    return .{ .address = .{ .ip6 = .{ .bytes = bytes, .port = 0 } }, .prefix_len = 128 };
+}
+
+/// The named groups of `proxy.trusted`.
+pub const networks = struct {
+    /// 127.0.0.0/8, ::1/128.
+    pub const loopback = [_]Network{
+        v4net(127, 0, 0, 0, 8),
+        v6loopback(),
+    };
+    /// 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7.
+    pub const private = [_]Network{ v4net(10, 0, 0, 0, 8), v4net(172, 16, 0, 0, 12), v4net(192, 168, 0, 0, 16), v6net(0xfc00, 7) };
+    /// 169.254.0.0/16, fe80::/10.
+    pub const link_local = [_]Network{ v4net(169, 254, 0, 0, 16), v6net(0xfe80, 10) };
+};
+
+/// Whether `peer` is in any of `nets` (an IPv4-mapped address is compared as IPv4).
+pub fn containsAny(nets: []const Network, peer: IpAddress) bool {
+    for (nets) |net| if (net.contains(peer)) return true;
+    return false;
+}
+
+/// Not loopback, private, link-local, 100.64.0.0/10, unspecified or multicast.
+pub fn isPublic(peer: IpAddress) bool {
+    const p = Network.unmap(peer);
+    switch (p) {
+        .ip4 => |a| {
+            if (a.bytes[0] == 0 or a.bytes[0] >= 224) return false; // unspecified/"this network", multicast and above
+            if (a.bytes[0] == 100 and a.bytes[1] & 0xc0 == 64) return false; // 100.64.0.0/10
+        },
+        .ip6 => |a| {
+            if (std.mem.allEqual(u8, &a.bytes, 0)) return false;
+            if (a.bytes[0] == 0xff) return false; // multicast
+        },
+    }
+    if (containsAny(&networks.loopback, p)) return false;
+    if (containsAny(&networks.private, p)) return false;
+    if (containsAny(&networks.link_local, p)) return false;
+    return true;
 }
 
 /// The v2 signature, the first 12 bytes of every v2 header.
@@ -595,3 +668,28 @@ const Host = struct {
         }
     }
 };
+
+test "isPublic table" {
+    for ([_][]const u8{ "8.8.8.8", "2001:4860::8888" }) |t| try std.testing.expect(isPublic(try IpAddress.parse(t, 0)));
+    for ([_][]const u8{ "127.0.0.1", "::1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "fc00::1", "169.254.1.1", "fe80::1", "100.64.0.1", "0.0.0.0", "224.0.0.1" }) |t| {
+        try std.testing.expect(!isPublic(try IpAddress.parse(t, 0)));
+    }
+}
+
+test "named networks and Network.format" {
+    try std.testing.expect(containsAny(&networks.private, try IpAddress.parse("172.31.255.255", 0)));
+    try std.testing.expect(!containsAny(&networks.private, try IpAddress.parse("172.32.0.1", 0)));
+    try std.testing.expect(containsAny(&networks.loopback, try IpAddress.parse("::ffff:127.0.0.1", 0)));
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try networks.private[1].format(&w);
+    try std.testing.expectEqualStrings("172.16.0.0/12", w.buffered());
+    w = .fixed(&buf);
+    try networks.loopback[1].format(&w);
+    try std.testing.expectEqualStrings("::1/128", w.buffered());
+    w = .fixed(&buf);
+    try networks.private[3].format(&w);
+    try std.testing.expectEqualStrings("fc00::/7", w.buffered());
+    const parsed = try Network.parse("10.0.0.0/8");
+    try std.testing.expect(parsed.contains(try IpAddress.parse("10.9.9.9", 0)));
+}

@@ -14,6 +14,14 @@ const features = anole.features;
 pub const Config = struct {
     /// Executor threads: 0 for one per CPU (cgroup-aware).
     executors: u32 = 0,
+    /// "development" or "production". Null: ANOLE_ENV, else production.
+    environment: ?anole.Environment = null,
+    /// What sits in front: "standalone", "behind_proxy", "anole_lb",
+    /// "platform" or "lambda". Null: ANOLE_DEPLOYMENT, else standalone.
+    deployment: ?anole.Deployment = null,
+    /// A 500 answer for an error with no status names the error. Null: on in
+    /// development.
+    error_detail: ?bool = null,
     listeners: []const Listener = &.{.{}},
     timeouts: Timeouts = .{},
     limits: Limits = .{},
@@ -45,9 +53,11 @@ pub const Config = struct {
         name: ?[]const u8 = null,
         /// "127.0.0.1" (this machine), "" (every interface, IPv6 and IPv4),
         /// "0.0.0.0", "::".
-        address: []const u8 = "127.0.0.1",
-        /// 0 picks a free port (`anole_server_listener`).
-        port: u16 = 8080,
+        /// Null: the deployment's ("127.0.0.1"; "" for anole_lb and platform).
+        address: ?[]const u8 = null,
+        /// 0 picks a free port (`anole_server_listener`). Null: 8080, or
+        /// $PORT under platform.
+        port: ?u16 = null,
         /// A unix domain socket at this path instead of address and port.
         unix: ?[]const u8 = null,
         /// TLS with this certificate; cleartext when left out.
@@ -57,10 +67,12 @@ pub const Config = struct {
         http2: bool = true,
         /// HTTP/3 on the same port over UDP (a TLS listener; one per server).
         http3: bool = false,
-        /// Connections start with a PROXY protocol header.
-        proxy_protocol: bool = false,
+        /// Connections start with a PROXY protocol header. Null: on under
+        /// anole_lb, else off.
+        proxy_protocol: ?bool = null,
         /// With proxy_protocol: the proxies allowed to send one (addresses
-        /// or CIDR networks, "10.0.0.0/8"); empty: any peer.
+        /// or CIDR networks, "10.0.0.0/8"); empty: proxy.trusted when set,
+        /// else any peer.
         proxy_protocol_from: []const []const u8 = &.{},
     };
 
@@ -318,7 +330,7 @@ pub const Config = struct {
         /// deadline. Null: none.
         write_ms: ?u32 = 30_000,
         /// An idle keep-alive connection is closed after this. Null: never.
-        keepalive_ms: ?u32 = 60_000,
+        keepalive_ms: ?u32 = 75_000,
         /// An idle HTTP/1.1 connection gives up its task after this
         /// (parks). Null or 0: never parks.
         idle_park_ms: ?u32 = 1_000,
@@ -679,7 +691,7 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             if (mode != .none and cas != 1) return fail(why, "listeners[{d}].tls: client_auth \"{s}\" needs exactly one of client_ca_file, client_ca_pem, client_ca_dir, client_ca_system", .{ i, t.client_auth });
             if (mode == .none and cas != 0) return fail(why, "listeners[{d}].tls: the client_ca_* settings go with client_auth \"request\" or \"require\"", .{i});
         }
-        if (l.proxy_protocol_from.len > 0 and !l.proxy_protocol) return fail(why, "listeners[{d}].proxy_protocol_from: with proxy_protocol", .{i});
+        if (l.proxy_protocol_from.len > 0 and l.proxy_protocol == false) return fail(why, "listeners[{d}].proxy_protocol_from: with proxy_protocol", .{i});
         if (l.http3) {
             if (comptime !features.http3) return fail(why, "listeners[{d}].http3: HTTP/3 is not built in (-Dhttp3)", .{i});
             if (l.tls == null) return fail(why, "listeners[{d}].http3 needs tls", .{i});
@@ -1051,7 +1063,9 @@ test "parse: the defaults, a full document, and what is refused" {
         "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"require\"}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"request\", \"client_ca_file\": \"a\", \"client_ca_pem\": \"b\"}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_ca_pem\": \"b\"}}]}",
-        "{\"listeners\": [{\"proxy_protocol_from\": [\"10.0.0.0/8\"]}]}",
+        "{\"listeners\": [{\"proxy_protocol\": false, \"proxy_protocol_from\": [\"10.0.0.0/8\"]}]}",
+        "{\"deployment\": \"cloud\"}",
+        "{\"environment\": \"staging\"}",
     };
     for (bad) |doc| {
         why.end = 0;
@@ -1226,3 +1240,25 @@ const SchemaCheck = struct {
         }
     }
 };
+
+test "config: modes keys" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [400]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    const c = try parse(a,
+        \\{"environment": "development", "deployment": "behind_proxy", "error_detail": false,
+        \\ "proxy": {"trusted": ["private", "203.0.113.7"]},
+        \\ "listeners": [{"proxy_protocol_from": ["10.0.0.0/8"]}, {"port": 0}]}
+    , &why);
+    try std.testing.expectEqual(anole.Environment.development, c.environment.?);
+    try std.testing.expectEqual(anole.Deployment.behind_proxy, c.deployment.?);
+    try std.testing.expectEqual(false, c.error_detail.?);
+    try std.testing.expectEqual(@as(usize, 2), c.proxy.trusted.?.len);
+    try std.testing.expect(c.listeners[0].address == null and c.listeners[0].port == null and c.listeners[0].proxy_protocol == null);
+    try std.testing.expectEqual(@as(?u16, 0), c.listeners[1].port);
+    const d = try parse(a, "{}", &why);
+    try std.testing.expect(d.environment == null and d.deployment == null and d.error_detail == null);
+    try std.testing.expectEqual(@as(?u32, 75_000), d.timeouts.keepalive_ms);
+}

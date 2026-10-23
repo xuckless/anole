@@ -309,6 +309,8 @@ export fn anole_server_create(options: ?*const abi.ServerOptions, out: ?*?*anyop
     const e = Engine.create(if (json.len == 0) "{}" else json, o.flags & abi.SERVER_F_SIGNALS != 0, &why) catch |err| switch (err) {
         error.Config => return named(abi.E_CONFIG, engine.config.last_problem, 0, "{s}", .{why.buffered()}),
         error.OutOfMemory => return fail(abi.E_NOMEM, "anole_server_create", err),
+        // The modes: ANOLE_ENV, ANOLE_DEPLOYMENT, PORT, ANOLE_PROXY_TRUSTED, "deployment": "lambda".
+        else => |other| return named(abi.E_CONFIG, engine.errorName(other), 0, "{s}", .{if (why.buffered().len > 0) why.buffered() else @errorName(other)}),
     };
     log_max.store(if (o.log_level == 0) abi.LOG_INFO else o.log_level, .monotonic);
     // This server's log callback, or stderr (a later server without one
@@ -374,6 +376,63 @@ export fn anole_server_set_ready(s: ?*anyopaque, check: Str, ready: u32) i32 {
     clearError();
     const e = engineOf(s) orelse return badPointer(s);
     e.setReady(check.slice(), ready != 0) catch return named(abi.E_INVALID, "UnknownCheck", 0, "observe.health.checks has no check \"{s}\"", .{check.slice()});
+    return abi.OK;
+}
+
+fn writeProblem(w: *std.Io.Writer, p: anole.config.Diagnostics.Problem, separator: bool) std.Io.Writer.Error!void {
+    if (separator) try w.writeAll("; ");
+    if (p.origin) |o| if (o.file) |file| {
+        if (o.line != 0) try w.print("{s}:{d}: ", .{ file, o.line }) else try w.print("{s}: ", .{file});
+    };
+    try w.writeAll(if (p.detail.len > 0) p.detail else "problem");
+}
+
+/// One `.env` variable, for `anole_dotenv_read`.
+pub const DotenvFn = *const fn (ud: ?*anyopaque, key: Str, value: Str, file: Str, line: u32) callconv(.c) void;
+
+export fn anole_dotenv_read(dir: Str, environment: Str, f: ?DotenvFn, ud: ?*anyopaque) i32 {
+    clearError();
+    const callback = f orelse return named(abi.E_INVALID, "Invalid", 0, "fn is NULL", .{});
+    const env_name = std.meta.stringToEnum(anole.Environment, environment.slice()) orelse
+        return named(abi.E_INVALID, "UnknownEnvironment", 0, "environment: \"development\" or \"production\"", .{});
+    const paths = anole.env.defaultFilesFor(env_name);
+    if (paths.len == 0) return abi.OK;
+    const tio = engine.threadedIo();
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var opened: ?std.Io.Dir = null;
+    defer if (opened) |d| d.close(tio);
+    if (dir.slice().len > 0) {
+        opened = std.Io.Dir.cwd().openDir(tio, dir.slice(), .{}) catch |err|
+            return named(abi.E_CONFIG, "InvalidEnvFile", 0, "cannot open directory \"{s}\": {t}", .{ dir.slice(), err });
+    }
+    var diag: anole.config.Diagnostics = .init(a);
+    const files = anole.env.Files.load(a, tio, opened, paths, &diag) catch |err| switch (err) {
+        error.OutOfMemory => return fail(abi.E_NOMEM, "anole_dotenv_read", err),
+        error.InvalidEnvFile => {
+            // Every problem that fits, by file and line; never a value.
+            var w: std.Io.Writer = .fixed(&last_error_buf);
+            const n = diag.problems.items.len;
+            var shown: usize = 0;
+            for (diag.problems.items) |p| {
+                const before = w.end;
+                writeProblem(&w, p, shown > 0) catch {
+                    w.end = before;
+                    break;
+                };
+                shown += 1;
+            }
+            if (shown < n) w.print(" (and {d} more)", .{n - shown}) catch {};
+            last_error_len = w.end;
+            last_error_name = "InvalidEnvFile";
+            last_errno = 0;
+            return abi.E_CONFIG;
+        },
+    };
+    for (files.entries.keys(), files.entries.values()) |key, entry| {
+        callback(ud, Str.of(key), Str.of(entry.value), Str.of(entry.file), entry.line);
+    }
     return abi.OK;
 }
 
