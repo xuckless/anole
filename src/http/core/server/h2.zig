@@ -411,9 +411,28 @@ pub fn Engine(comptime Ctx: type) type {
                 o.drain_pos = 0;
             }
 
+            /// Copies up to `buf.len` queued bytes into `buf`: the filled
+            /// list becomes the one read once `draining` is used up.
+            fn take(o: *Outbox, buf: []u8) usize {
+                if (o.drain_pos == o.draining.items.len) {
+                    o.draining.clearRetainingCapacity();
+                    o.drain_pos = 0;
+                    std.mem.swap(std.ArrayList(u8), &o.filling, &o.draining);
+                }
+                const avail = o.draining.items[o.drain_pos..];
+                const n = @min(avail.len, buf.len);
+                @memcpy(buf[0..n], avail[0..n]);
+                o.drain_pos += n;
+                return n;
+            }
+
             /// Frees the lists when nothing is queued and they grew big.
+            /// Nothing queued means `draining` is used up, so its read
+            /// position goes back to 0 with it.
             fn trim(o: *Outbox, gpa: std.mem.Allocator) void {
                 if (o.pending() != 0) return;
+                o.draining.clearRetainingCapacity();
+                o.drain_pos = 0;
                 if (o.filling.capacity > outbox_keep) o.filling.clearAndFree(gpa);
                 if (o.draining.capacity > outbox_keep) o.draining.clearAndFree(gpa);
             }
@@ -2364,16 +2383,7 @@ pub fn Engine(comptime Ctx: type) type {
             const stream: *Stream = @ptrCast(@alignCast(source.*.ptr.?));
             if (stream.outbox_mode) {
                 const ob = &stream.outbox;
-                if (ob.drain_pos == ob.draining.items.len) {
-                    // Used up: the filled list becomes the one read.
-                    ob.draining.clearRetainingCapacity();
-                    ob.drain_pos = 0;
-                    std.mem.swap(std.ArrayList(u8), &ob.filling, &ob.draining);
-                }
-                const avail = ob.draining.items[ob.drain_pos..];
-                const n = @min(avail.len, length);
-                @memcpy(buf[0..n], avail[0..n]);
-                ob.drain_pos += n;
+                const n = ob.take(buf[0..length]);
                 if (n > 0) ob.room.set(conn.io);
                 const empty = ob.pending() == 0;
                 if (empty) ob.trim(conn.allocator);
@@ -2442,4 +2452,30 @@ pub fn Engine(comptime Ctx: type) type {
             return @intCast(n);
         }
     };
+}
+
+test "HTTP/2 tunnel outbox: a message past outbox_keep drained, trimmed, then the next one" {
+    // A 120 KB video keyframe on a WebSocket over HTTP/2 grew the outbox
+    // past outbox_keep; once it was sent, trim freed `draining` but kept
+    // the read position, and the next message read past its end.
+    const gpa = std.testing.allocator;
+    const Outbox = Engine(void).Outbox;
+    var ob: Outbox = .{};
+    defer ob.deinit(gpa);
+    var buf: [16 * 1024]u8 = undefined;
+    for (0..3) |round| {
+        const size: usize = if (round == 1) 300 else 120 * 1024;
+        try ob.filling.appendNTimes(gpa, @truncate(round + 1), size);
+        var got: usize = 0;
+        while (ob.pending() > 0) {
+            const n = ob.take(&buf);
+            try std.testing.expect(n > 0);
+            for (buf[0..n]) |b| try std.testing.expectEqual(@as(u8, @truncate(round + 1)), b);
+            got += n;
+            if (ob.pending() == 0) ob.trim(gpa);
+        }
+        try std.testing.expectEqual(size, got);
+        try std.testing.expectEqual(@as(usize, 0), ob.drain_pos);
+        try std.testing.expectEqual(@as(usize, 0), ob.take(&buf));
+    }
 }
