@@ -148,7 +148,7 @@ pub fn run(gpa: std.mem.Allocator, opts: RunOptions) !Exit {
         var timeout: i64 = 250;
         if (esc_pending) timeout = 25;
         if (dirty) timeout = @min(timeout, @max(opts.min_frame_ms - (now - last_render), 1));
-        const ready = sys.poll(fds[0..n], @intCast(timeout));
+        const ready = t.poll(fds[0..n], @intCast(timeout));
         now = opts.clock();
         const wall = opts.wall_clock();
 
@@ -159,14 +159,22 @@ pub fn run(gpa: std.mem.Allocator, opts: RunOptions) !Exit {
                 esc_pending = false;
             }
         } else {
-            if (fds[0].revents & (sys.POLLIN | sys.POLLHUP) != 0) {
+            if (fds[0].revents & (sys.POLLNVAL | sys.POLLERR) != 0) {
+                // The terminal cannot be read: leave rather than spin
+                // deaf to every key.
+                exit = .quit;
+            } else if (fds[0].revents & (sys.POLLIN | sys.POLLHUP) != 0) {
                 var buf: [1024]u8 = undefined;
-                const got = sys.read(t.read_fd, &buf) catch 0;
-                if (got == 0 and fds[0].revents & sys.POLLHUP != 0) {
-                    exit = .quit;
-                } else if (got > 0) {
-                    parser.feed(buf[0..got], &sink);
-                    esc_pending = parser.state == .esc;
+                if (sys.read(t.read_fd, &buf)) |got| {
+                    if (got == 0) {
+                        exit = .quit; // the terminal is gone
+                    } else {
+                        parser.feed(buf[0..got], &sink);
+                        esc_pending = parser.state == .esc;
+                    }
+                } else |err| switch (err) {
+                    error.WouldBlock => {},
+                    else => exit = .quit,
                 }
             }
             if (fds[conn_idx].revents & (sys.POLLIN | sys.POLLHUP | sys.POLLERR) != 0) {
