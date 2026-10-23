@@ -854,7 +854,8 @@ the socket of its first), a socket group without the program (a kernel older
 than 4.5: logged as a warning, and everything still works, one hop slower),
 and sockets inherited in another order than they were bound in. Each
 endpoint counts what it handled, passed on and accepted
-(`anole.h3.EndpointStats`).
+(`anole.h3.EndpointStats`), and `connections_open` is how many connections
+it holds now (the live console's `/h3` view shows it).
 
 The endpoints share one TLS context, so a session ticket from one resumes,
 with 0-RTT, on any other, and a certificate reload switches them all; one

@@ -157,7 +157,7 @@ default ends this side for you once what is queued is out.
 
 ## 5. TLS, PROXY protocol, unix sockets
 
-`app.tcpOn(.{ .address = ":7443", .tls = .{ .cert = .fromFiles("c.pem", "k.pem") } }, Handler, .{})`
+`app.tcpOn(.{ .address = "", .port = 7443, .tls = .{ .cert = .fromFiles("c.pem", "k.pem") } }, Handler, .{})`
 puts a whole listener in your hands: a name, TLS with `alpn` and mutual TLS,
 `proxy_protocol` / `proxy_protocol_from`, or `.unix = "/run/app.sock"`.
 The certificate reloads on SIGHUP and `reloadCertificates()` like HTTP's.
