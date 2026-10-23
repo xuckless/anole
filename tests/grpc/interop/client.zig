@@ -3,9 +3,12 @@
 //! on anole.grpc's client, against any interop server (grpc-go's, in
 //! tests/grpc/interop/run-client.sh).
 //!
-//!   grpc-interop-client <port> <test_case> [<ca.pem>]
+//!   grpc-interop-client <port> <test_case> [<ca.pem>] [--h3] [--host=NAME]
 //!
 //! With a CA certificate, over TLS to "localhost"; else cleartext HTTP/2.
+//! `--h3` speaks HTTP/3 (gRFC G2) to the UDP port (needs the CA). `--host`
+//! sets the TLS name and `:authority` (default "localhost"); the address
+//! stays 127.0.0.1.
 const std = @import("std");
 const anole = @import("anole");
 const pb = @import("anole_interop_pb");
@@ -150,19 +153,46 @@ pub fn main(init: std.process.Init) !void {
     const case = args.next() orelse return error.MissingTestCase;
     // TLS, trusting this CA certificate (PEM), for the server's name
     // "localhost"; cleartext HTTP/2 without it.
-    const ca_path = args.next();
+    var ca_path: ?[]const u8 = null;
+    var use_h3 = false;
+    var host: []const u8 = "localhost";
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--h3")) {
+            use_h3 = true;
+        } else if (std.mem.startsWith(u8, arg, "--host=")) {
+            host = arg["--host=".len..];
+        } else if (std.mem.eql(u8, arg, "--host")) {
+            host = args.next() orelse return error.MissingHost;
+        } else ca_path = arg;
+    }
 
     const rt = try anole.zio.Runtime.init(init.gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    const conn = try anole.h2.ClientConnection.connect(init.gpa, io, .{
-        .host = if (ca_path != null) "localhost" else "127.0.0.1",
-        .address = .{ .ip4 = .loopback(port) },
-        .port = port,
-        .tls = if (ca_path) |path| .{ .ca = .{ .file = path } } else null,
-    });
-    defer conn.close();
-    var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost", .scheme = if (ca_path != null) "https" else "http" };
+    var h2_conn: ?*anole.h2.ClientConnection = null;
+    var h3_conn: ?*anole.h3.ClientConnection = null;
+    defer if (h2_conn) |c| c.close();
+    defer if (h3_conn) |c| c.close();
+    var channel: grpc.Channel = .{ .authority = host, .scheme = if (ca_path != null) "https" else "http" };
+    if (use_h3) {
+        if (comptime !anole.features.http3) return error.Http3NotBuilt;
+        const path = ca_path orelse return error.Http3NeedsTls;
+        h3_conn = try anole.h3.ClientConnection.connect(init.gpa, io, .{
+            .host = host,
+            .address = .{ .ip4 = .loopback(port) },
+            .port = port,
+            .tls = .{ .ca = .{ .file = path } },
+        });
+        channel.h3 = h3_conn;
+    } else {
+        h2_conn = try anole.h2.ClientConnection.connect(init.gpa, io, .{
+            .host = if (ca_path != null) host else "127.0.0.1",
+            .address = .{ .ip4 = .loopback(port) },
+            .port = port,
+            .tls = if (ca_path) |path| .{ .ca = .{ .file = path } } else null,
+        });
+        channel.conn = h2_conn;
+    }
     const client: Client = .{ .channel = &channel };
     var arena_state: std.heap.ArenaAllocator = .init(init.gpa);
     defer arena_state.deinit();

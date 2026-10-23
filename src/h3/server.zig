@@ -285,11 +285,12 @@ const inbox_len = 256;
 
 /// What one connection's streams hold unacknowledged, all together.
 const conn_budget = 4 << 20;
-/// A response stream's own cap: ordinary responses, and extended CONNECT
-/// streams (WebSocket over HTTP/3, the WebTransport CONNECT), which carry
-/// messages and are latency-sensitive.
+/// A response stream's own cap: ordinary responses, and message streams
+/// (extended CONNECT: WebSocket over HTTP/3, the WebTransport CONNECT; and
+/// gRPC or Connect streaming calls), which carry messages and are
+/// latency-sensitive.
 const response_cap = 64 * 1024;
-const connect_cap = 1 << 20;
+const message_cap = 1 << 20;
 
 /// One endpoint's counters. Several endpoints serve one listener on Linux
 /// (`Options.sockets`); these show how the kernel's steering does.
@@ -322,6 +323,9 @@ pub const Stats = struct {
     /// Requests for `no_wait` routes run inline, without a task
     /// (`Options.inline_no_wait`).
     served_inline: std.atomic.Value(u64) = .init(0),
+    /// Times a connection armed QUIC keep-alive (a request opened on an
+    /// idle connection).
+    keep_alive_arms: std.atomic.Value(u64) = .init(0),
     /// The endpoint's 4 KiB send and receive blocks: handed out (a pooled
     /// request stream keeps one), and kept for reuse
     /// (`Endpoint.sampleStats` fills them in).
@@ -1387,6 +1391,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Request tasks running.
             tasks: std.atomic.Value(u32) = .init(0),
             state: State = .open,
+            /// ngtcp2's keep-alive is armed: a request stream is open.
+            keep_alive_on: bool = false,
             last_error: c.ngtcp2_ccerr = undefined,
             /// The CONNECTION_CLOSE to repeat in the closing period.
             close_pkt: []u8 = &.{},
@@ -1555,6 +1561,30 @@ pub fn Endpoint(comptime Ctx: type) type {
             fn kick(conn: *Conn) void {
                 conn.gen.notify(conn.ep.io);
                 if (conn.driven) conn.ep.queue(conn);
+            }
+
+            /// Arms ngtcp2's keep-alive while a request stream is open, and
+            /// disarms it when the last one goes, so a quiet gRPC stream or
+            /// SSE response outlives the idle timeout and an idle connection
+            /// still closes at it. Locked.
+            fn updateKeepAlive(conn: *Conn) void {
+                const want = conn.streams.count() > 0 and conn.state == .open;
+                if (want == conn.keep_alive_on) return;
+                conn.keep_alive_on = want;
+                if (want) _ = conn.ep.stats.keep_alive_arms.fetchAdd(1, .monotonic);
+                c.ngtcp2_conn_set_keep_alive_timeout(conn.q, if (want) conn.keepAliveInterval() else std.math.maxInt(u64));
+                conn.kick();
+            }
+
+            /// Half the smaller of our idle timeout and the peer's (0: none),
+            /// at least 1 s; ours alone before the peer's parameters are known.
+            fn keepAliveInterval(conn: *Conn) u64 {
+                var idle: u64 = std.math.lossyCast(u64, conn.ep.options.idle_timeout.toNanoseconds());
+                if (c.ngtcp2_conn_get_remote_transport_params2(conn.q)) |p| {
+                    const peer = p.*.max_idle_timeout;
+                    if (peer != 0 and peer < idle) idle = peer;
+                }
+                return @max(idle / 2, std.time.ns_per_s);
             }
 
             /// How WebTransport's sessions and streams reach the
@@ -2252,6 +2282,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             body_done: bool = false,
             /// The peer reset the stream, or the connection is gone.
             reset: bool = false,
+            /// The task running the handler, published for `cancelHandler`;
+            /// taken back under the lock before the task ends. Null for
+            /// inline and detached requests (they don't wait).
+            task: ?placement.Task = null,
+            /// The request's content type says it carries messages (gRPC,
+            /// gRPC-Web, Connect streaming): the larger send cap.
+            message: bool = false,
             started: bool = false,
             /// The request's head came in 0-RTT, before the handshake
             /// completed.
@@ -2352,7 +2389,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
                 if (s.refs.quic or s.refs.handler) return;
                 const conn = s.conn;
-                if (conn.streams.swapRemove(s.id)) gauges.add(conn.ep.io, .h3_streams, -1);
+                if (conn.streams.swapRemove(s.id)) {
+                    gauges.add(conn.ep.io, .h3_streams, -1);
+                    conn.updateKeepAlive();
+                }
                 // The client may open another request only now: one it
                 // reset still counts while its handler runs.
                 _ = c.ngtcp2_conn_extend_max_streams_bidi(conn.q, 1);
@@ -2372,13 +2412,26 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (left == 0) conn.holding.store(0, .monotonic);
             }
 
+            /// The peer is gone or reset the stream before the response
+            /// ended: cancel the handler, so a wait it is in returns
+            /// `error.Canceled`. Locked.
+            fn cancelHandler(s: *Stream) void {
+                if (s.ended) return;
+                if (s.task) |t| placement.cancelTask(t);
+            }
+
             fn run(s: *Stream) std.Io.Cancelable!void {
                 const conn = s.conn;
                 // Last: the driver may free the connection once none run.
                 defer _ = conn.tasks.fetchSub(1, .acq_rel);
+                conn.lock();
+                s.task = placement.currentTask(conn.ep.io);
+                const gone = s.reset;
+                conn.unlock();
                 defer {
                     s.unhold();
                     conn.lock();
+                    s.task = null;
                     // A handler done before the request body is: the rest
                     // is not wanted (RFC 9114 §4.1).
                     if (!s.body_done and !s.reset)
@@ -2387,6 +2440,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     conn.unlock();
                     conn.kick();
                 }
+                if (gone) return;
                 _ = s.serve(false) catch |err| return s.failed(err);
             }
 
@@ -2664,7 +2718,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             /// The send cap of this stream's queue.
             fn sendCap(s: *const Stream) usize {
-                return if (s.protocol.len > 0) connect_cap else response_cap;
+                return if (s.protocol.len > 0 or s.message) message_cap else response_cap;
             }
 
             /// Tells nghttp3 there is more of the body, if it was waiting
@@ -3191,6 +3245,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (conn.wt) |w| if (w.owns(stream_id)) if (conn.streams.fetchSwapRemove(stream_id)) |e| {
                 e.value.free();
                 gauges.add(conn.ep.io, .h3_streams, -1);
+                conn.updateKeepAlive();
             };
             return rv;
         }
@@ -3235,6 +3290,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return c.NGTCP2_ERR_CALLBACK_FAILURE;
             };
             gauges.add(conn.ep.io, .h3_streams, 1);
+            conn.updateKeepAlive();
             return 0;
         }
 
@@ -3252,7 +3308,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (c.ngtcp2_is_bidi_stream(stream_id) != 0) {
                 if (conn.streamOf(stream_id)) |s| {
                     // Unless it ended cleanly, the handler sees it gone.
-                    if (!(s.ended and s.allSent() and s.body_done)) s.reset = true;
+                    if (!(s.ended and s.allSent() and s.body_done)) {
+                        s.reset = true;
+                        s.cancelHandler();
+                    }
                     s.wakeAll();
                     if (s.wt_session) |session| session.onChannelEnd(.connection);
                     // Gone with its response detached: the owner lets go now.
@@ -3274,6 +3333,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (conn.streamOf(stream_id)) |s| {
                 s.reset = true;
                 s.wakeAll();
+                s.cancelHandler();
                 if (s.wt_session) |session| session.onChannelEnd(.connection);
             }
             conn.kick();
@@ -3288,6 +3348,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (conn.streamOf(stream_id)) |s| {
                 s.reset = true;
                 s.wakeAll();
+                if (code != h.NGHTTP3_H3_NO_ERROR) s.cancelHandler();
             }
             conn.kick();
             return 0;
@@ -3411,6 +3472,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             return 0;
         }
 
+        /// Request content types that carry a stream of messages (gRPC,
+        /// gRPC-Web, Connect streaming): a case-insensitive prefix.
+        fn isMessageType(value: []const u8) bool {
+            return std.ascii.startsWithIgnoreCase(value, "application/grpc") or
+                std.ascii.startsWithIgnoreCase(value, "application/connect+");
+        }
+
         fn onH3RecvHeader(_: ?*h.nghttp3_conn, _: i64, token: i32, name: ?*h.nghttp3_rcbuf, value: ?*h.nghttp3_rcbuf, _: u8, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
             const s = streamOfUser(sud) orelse return 0;
             // Trailers on a request are not passed on.
@@ -3432,11 +3500,13 @@ pub fn Endpoint(comptime Ctx: type) type {
                 h.NGHTTP3_QPACK_TOKEN__AUTHORITY => s.authority = val,
                 h.NGHTTP3_QPACK_TOKEN__PROTOCOL => s.protocol = val,
                 h.NGHTTP3_QPACK_TOKEN__SCHEME => {},
+
                 else => {
                     if (s.headers.items.len >= s.conn.ep.http.config.request.max_header_count) {
                         s.head_too_large = true;
                         return 0;
                     }
+                    if (token == h.NGHTTP3_QPACK_TOKEN_CONTENT_TYPE and isMessageType(val)) s.message = true;
                     const key = arena.dupe(u8, n.base[0..n.len]) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
                     s.headers.append(arena, .{ .name = key, .value = val }) catch return h.NGHTTP3_ERR_CALLBACK_FAILURE;
                 },

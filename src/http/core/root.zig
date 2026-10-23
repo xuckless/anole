@@ -130,6 +130,8 @@ pub const statusBody = @import("middleware.zig").statusBody;
 pub const checkAddressFree = @import("server.zig").checkAddressFree;
 /// A listening TCP socket, with IPV6_V6ONLY as asked (dual-stack `::`).
 pub const listenIp = @import("server.zig").listenIp;
+/// Sets the permission bits of a unix socket file (`Listener.unix_mode`).
+pub const setUnixMode = @import("server.zig").setUnixMode;
 /// `listenIp`'s options.
 pub const ListenIpOptions = @import("server.zig").ListenIpOptions;
 /// An IPv4-mapped IPv6 address as the IPv4 address it stands for.

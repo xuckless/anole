@@ -33,6 +33,15 @@ Python packages the protocol checks install are pinned with hashes in
 (the QUIC interop runner's, which follow its pinned commit): regenerate them
 with every file's SHA-256 from PyPI when either moves.
 
+The gRPC over HTTP/3 interop (`tests/grpc/h3/run.sh`) runs grpc-dotnet's
+interop programs (tag v2.84.0, cloned in `tests/grpc/h3/Dockerfile`) in a
+.NET SDK image with Microsoft's libmsquic. After the first green run, pin the
+base image by digest and libmsquic by version in the Dockerfile; bump the
+grpc-dotnet tag, rebuild (the image tag carries the Dockerfile's hash) and
+run it when the gRPC or HTTP/3 code changes in a way a second implementation
+should see. If libmsquic's newest version stops working with the pinned
+.NET image, hold the version back there, not in the test.
+
 ## Advisories
 
 `.github/workflows/advisories.yml` runs `tools/advisories.py` every Monday and
@@ -139,8 +148,8 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      rename one copy's symbols with `-D` macros or build one shared sfparse.
 4. Run everything CI runs: `zig build test`, `zig build test-flags`,
    the profile builds, h2spec, Autobahn, the gRPC
-   interop, `tests/h3/run.sh`, `tests/interop/run.sh` and
-   `tests/interop/webtransport/run.sh`.
+   interop, `tests/grpc/h3/run.sh`, `tests/h3/run.sh`, `tests/interop/run.sh`
+   and `tests/interop/webtransport/run.sh`.
 
 ## The forks
 

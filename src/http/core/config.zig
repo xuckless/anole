@@ -71,6 +71,11 @@ pub const Listener = struct {
     /// `SOMAXCONN` elsewhere, as Go does. The kernel caps a larger value
     /// to that silently.
     kernel_backlog: ?u31 = null,
+    /// Permission bits for the socket file of a unix listener, set right
+    /// after the bind (a connection needs write permission on the file).
+    /// Null leaves what the umask gave it. Ignored for IP listeners,
+    /// abstract sockets and on Windows.
+    unix_mode: ?u16 = null,
     /// Sets SO_REUSEADDR (and SO_REUSEPORT on POSIX) on an IP listener.
     /// Ignored on Windows, where SO_REUSEADDR would let another socket
     /// bind the same port.

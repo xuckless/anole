@@ -156,12 +156,21 @@ pub const ClientOptions = struct {
     user_agent: ?[]const u8 = default_user_agent,
     /// Offer HTTP/2 ("h2") through TLS ALPN on HTTPS connections. Only
     /// effective with an injected HTTP/2 client (the `h2_client` import);
-    /// ignored without one, and for cleartext (http://) connections. A
-    /// connection on which the server picks h2 carries one request at a time
-    /// and is pooled like an HTTP/1.1 one. Defaults off for now: without
-    /// requests sharing a connection, h2 saves no connections, and its fixed
-    /// 64 KiB stream window slows large downloads. Sharing comes in 0.4.
-    http2: bool = false,
+    /// ignored without one, and for cleartext (http://) connections (see
+    /// `h2c_hosts`). Requests to a host whose server picks h2 share one
+    /// connection per executor, as concurrent streams: the first dial for a
+    /// host is made once and the others wait for it; each stream has a
+    /// 1 MiB receive window, the connection 16 MiB. A request the server
+    /// provably did not process (REFUSED_STREAM, or past its GOAWAY) is
+    /// sent again on a new connection, whatever its method. On by default
+    /// over TLS; `false` keeps every HTTPS connection on HTTP/1.1.
+    http2: bool = true,
+    /// Hosts that speak cleartext HTTP/2 with prior knowledge (RFC 9113
+    /// §3.3), so `http://` requests to them use HTTP/2 without TLS: "host"
+    /// for any port or "host:port" (a literal IPv6 host in brackets), ASCII
+    /// case-insensitive. Needs `http2` and an injected HTTP/2 client. A
+    /// listed host that only speaks HTTP/1.1 fails its requests.
+    h2c_hosts: []const []const u8 = &.{},
     /// Decides every redirect before it is followed (within
     /// `max_redirects`). Without one, redirects are followed, except one
     /// that would send the request's body (a 307 or 308) to another host,
@@ -407,6 +416,15 @@ pub const ConnectionPool = struct {
     idle_timeout: ?std.Io.Duration,
     /// Whether `reap` is running or about to (guarded by `mutex`).
     reaping: bool = false,
+    /// HTTP/2 origins with requests in flight (their carrier connections
+    /// are out of `idle`), and dials in progress that may end in one; both
+    /// guarded by `mutex`.
+    origins: std.DoublyLinkedList = .{},
+    dialing: std.DoublyLinkedList = .{},
+    dial_gen: std.atomic.Value(u32) = .init(0),
+    /// Origins whose last dial ended on HTTP/1.1 (a few; a ring).
+    h1_seen: [8]struct { key: u64 = 0, until: std.Io.Timestamp = .{ .nanoseconds = 0 } } = @splat(.{}),
+    h1_next: usize = 0,
     drains: std.Io.Group = .init,
     reaper: std.Io.Group = .init,
 
@@ -454,6 +472,13 @@ pub const ConnectionPool = struct {
 
         // Close and free all idle connections
         while (self.idle.popFirst()) |node| destroy(self, fromNode(node));
+        // And the carriers of origins still in use (their requests must
+        // be done by now).
+        if (comptime has_h2_client) while (self.origins.popFirst()) |node| {
+            const origin: *H2Origin = @alignCast(@fieldParentPtr("node", node));
+            origin.listed = false;
+            destroy(self, origin.carrier);
+        };
     }
 
     /// Whether released connections are kept at all.
@@ -466,8 +491,10 @@ pub const ConnectionPool = struct {
     }
 
     fn destroy(self: *ConnectionPool, conn: *Connection) void {
+        const origin = if (comptime has_h2_client) conn.carrier_of else null;
         conn.deinit();
         self.allocator.destroy(conn);
+        if (comptime has_h2_client) if (origin) |o| self.allocator.destroy(o);
     }
 
     /// When idle `conn` is due to be closed: at the server's `Keep-Alive`
@@ -526,10 +553,183 @@ pub const ConnectionPool = struct {
         return found;
     }
 
+    /// An open HTTP/2 connection to this origin with requests in flight, as
+    /// a new request handle on it; null if there is none.
+    fn acquireOrigin(self: *ConnectionPool, remote_host: []const u8, remote_port: u16, protocol: Protocol) !?*Connection {
+        if (comptime !has_h2_client) return null;
+        const origin: *H2Origin = found: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            var node = self.origins.first;
+            while (node) |n| : (node = n.next) {
+                const o: *H2Origin = @alignCast(@fieldParentPtr("node", n));
+                if (!o.carrier.matches(remote_host, remote_port, protocol, null)) continue;
+                if (!o.carrier.h2.?.isOpen()) continue;
+                o.refs += 1;
+                break :found o;
+            }
+            return null;
+        };
+        return self.makeView(origin) catch |err| {
+            self.dropView(origin, false);
+            return err;
+        };
+    }
+
+    /// A carrier taken from `idle` becomes an active origin, and the
+    /// request's handle on it.
+    fn promote(self: *ConnectionPool, carrier: *Connection) !*Connection {
+        const origin = carrier.carrier_of.?;
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            origin.refs = 1;
+            origin.listed = true;
+            self.origins.append(&origin.node);
+        }
+        return self.makeView(origin) catch |err| {
+            self.dropView(origin, false);
+            return err;
+        };
+    }
+
+    /// A newly dialed HTTP/2 connection becomes the carrier of an origin,
+    /// and the first request's handle on it.
+    fn adoptCarrier(self: *ConnectionPool, carrier: *Connection) !*Connection {
+        const origin = try self.allocator.create(H2Origin);
+        origin.* = .{ .carrier = carrier, .refs = 1, .listed = true };
+        carrier.carrier_of = origin;
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.origins.append(&origin.node);
+        }
+        return self.makeView(origin) catch |err| {
+            self.dropView(origin, false);
+            return err;
+        };
+    }
+
+    fn makeView(self: *ConnectionPool, origin: *H2Origin) !*Connection {
+        const view = try self.allocator.create(Connection);
+        errdefer self.allocator.destroy(view);
+        try view.initView(self, origin);
+        return view;
+    }
+
+    /// One request handle fewer on `origin`. With the last one gone the
+    /// carrier goes back to `idle` (or is closed, if the session failed or
+    /// the pool is off). `broken`: the session is no good for new requests.
+    fn dropView(self: *ConnectionPool, origin: *H2Origin, broken: bool) void {
+        if (comptime !has_h2_client) return;
+        const carrier = origin.carrier;
+        var last = false;
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            origin.refs -= 1;
+            if (broken) carrier.closing = true;
+            if (origin.refs == 0 or broken) {
+                // A broken session takes no new requests: out of the list
+                // now, though requests on it still finish.
+                if (origin.listed) {
+                    self.origins.remove(&origin.node);
+                    origin.listed = false;
+                }
+            }
+            last = origin.refs == 0;
+        }
+        if (last) self.release(carrier);
+    }
+
+    /// Release a view (a request's handle on a shared HTTP/2 connection).
+    fn releaseView(self: *ConnectionPool, view: *Connection) void {
+        if (comptime !has_h2_client) return;
+        const origin = view.origin.?;
+        const broken = view.closing;
+        if (view.h2_stream) |st| st.release();
+        view.h2_stream = null;
+        view.deinitView();
+        self.allocator.destroy(view);
+        self.dropView(origin, broken);
+    }
+
+    /// The first dial for an origin that may speak HTTP/2 is made once:
+    /// the others wait for it (`dial_gen` changes when a dial ends), then
+    /// find its connection, or dial for themselves if it came to HTTP/1.1
+    /// (remembered for `h1_memory`) or failed.
+    const DialTicket = struct {
+        node: std.DoublyLinkedList.Node = .{},
+        key: u64,
+    };
+
+    const h1_memory: std.Io.Duration = .fromSeconds(60);
+
+    fn dialKey(remote_host: []const u8, port: u16, protocol: Protocol) u64 {
+        var h: std.hash.Wyhash = .init(port);
+        var buf: [255]u8 = undefined;
+        const n = @min(remote_host.len, buf.len);
+        for (remote_host[0..n], buf[0..n]) |ch, *o| o.* = std.ascii.toLower(ch);
+        h.update(buf[0..n]);
+        h.update(&.{@intFromEnum(protocol)});
+        return h.final();
+    }
+
+    /// Whether a dial to this origin recently ended on HTTP/1.1, so
+    /// there is nothing to share and nothing to wait for.
+    fn knownH1(self: *ConnectionPool, key: u64) bool {
+        const now = std.Io.Timestamp.now(self.io, .awake);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.h1_seen) |e| if (e.key == key and now.nanoseconds < e.until.nanoseconds) return true;
+        return false;
+    }
+
+    fn noteH1(self: *ConnectionPool, key: u64) void {
+        const until = std.Io.Timestamp.now(self.io, .awake).addDuration(h1_memory);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (&self.h1_seen) |*e| if (e.key == key) {
+            e.until = until;
+            return;
+        };
+        self.h1_seen[self.h1_next % self.h1_seen.len] = .{ .key = key, .until = until };
+        self.h1_next +%= 1;
+    }
+
+    /// Null: this task dials, and ends with `endDial`. Else the generation
+    /// to wait on (`waitDial`) until some dial ends.
+    fn beginDial(self: *ConnectionPool, ticket: *DialTicket) ?u32 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var node = self.dialing.first;
+        while (node) |n| : (node = n.next) {
+            const other: *DialTicket = @alignCast(@fieldParentPtr("node", n));
+            if (other.key == ticket.key) return self.dial_gen.load(.acquire);
+        }
+        self.dialing.append(&ticket.node);
+        return null;
+    }
+
+    fn waitDial(self: *ConnectionPool, gen: u32) std.Io.Cancelable!void {
+        try self.io.futexWait(u32, &self.dial_gen.raw, gen);
+    }
+
+    fn endDial(self: *ConnectionPool, ticket: *DialTicket) void {
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.dialing.remove(&ticket.node);
+            _ = self.dial_gen.fetchAdd(1, .release);
+        }
+        self.io.futexWake(u32, &self.dial_gen.raw, std.math.maxInt(u32));
+    }
+
     /// Release a connection back to the pool, or close it if the pool is
     /// off or the connection is closing. A full pool (in all, or for the
     /// connection's host) closes its oldest idle connection to make room.
     pub fn release(self: *ConnectionPool, conn: *Connection) void {
+        if (comptime has_h2_client) if (conn.origin != null) return self.releaseView(conn);
         // Don't pool connections that are closing
         if (conn.closing or !self.pooling()) {
             self.destroy(conn);
@@ -660,6 +860,21 @@ pub const ConnectionPool = struct {
     }
 };
 
+/// An HTTP/2 connection many requests share (`ClientOptions.http2`): the
+/// handshaken `carrier` (it owns the socket, the TLS state and the session)
+/// and the requests in flight on it, each holding its own `Connection` as a
+/// handle (a "view": its own arena, parser and stream; the session is the
+/// carrier's). With the last handle gone the carrier goes back to the pool's
+/// idle list, and the next request makes it an origin again.
+const H2Origin = if (has_h2_client) struct {
+    node: std.DoublyLinkedList.Node = .{},
+    carrier: *Connection,
+    /// Handles in flight (guarded by the pool's mutex).
+    refs: u32,
+    /// In the pool's `origins` list.
+    listed: bool,
+} else void;
+
 /// A client connection that owns all resources for a request/response cycle.
 pub const Connection = struct {
     allocator: std.mem.Allocator,
@@ -727,6 +942,14 @@ pub const Connection = struct {
     // connection from then on, and the stream of the request in flight.
     h2: if (has_h2_client) ?*h2_client.ClientConnection else void,
     h2_stream: if (has_h2_client) ?*h2_client.Stream else void,
+    /// A request's handle on a shared HTTP/2 connection (a "view"): the
+    /// origin it belongs to. The session, socket and TLS state are the
+    /// carrier's.
+    origin: if (has_h2_client) ?*H2Origin else void = if (has_h2_client) null else {},
+    /// The last HTTP/2 request on this handle was provably not processed.
+    h2_unprocessed: bool = false,
+    /// The origin this connection carries (it owns the session).
+    carrier_of: if (has_h2_client) ?*H2Origin else void = if (has_h2_client) null else {},
 
     /// Initialize the connection in place (required because parser stores internal pointers).
     pub fn init(
@@ -785,7 +1008,10 @@ pub const Connection = struct {
         if (comptime has_h2_client) {
             self.h2 = null;
             self.h2_stream = null;
+            self.origin = null;
+            self.carrier_of = null;
         }
+        self.h2_unprocessed = false;
 
         if (protocol == .https) {
             if (!build_options.use_tls) return error.TlsNotConfigured;
@@ -876,7 +1102,64 @@ pub const Connection = struct {
 
             self.reader = &self.tcp_reader.interface;
             self.writer = &self.tcp_writer.interface;
+
+            // Cleartext HTTP/2 with prior knowledge (`ClientOptions.h2c_hosts`).
+            if (comptime has_h2_client) if (advertise_http2 and unix_socket_path == null) {
+                self.http_version = .http_2;
+                self.h2 = try h2_client.ClientConnection.adopt(allocator, io, self.reader, self.writer, stream);
+            };
         }
+    }
+
+    /// A request's handle on a shared HTTP/2 connection: its own arena,
+    /// parser and stream, over the carrier's session. Nothing here owns the
+    /// socket or TLS state.
+    fn initView(self: *Connection, pool: *ConnectionPool, origin: *H2Origin) !void {
+        if (comptime !has_h2_client) unreachable;
+        const carrier = origin.carrier;
+        self.allocator = carrier.allocator;
+        self.io = carrier.io;
+        self.stream = carrier.stream;
+        self.arena = std.heap.ArenaAllocator.init(carrier.allocator);
+        errdefer self.arena.deinit();
+        self.pool = pool;
+        self.buffer_size = carrier.buffer_size;
+        self.max_response_headers = carrier.max_response_headers;
+        self.protocol = carrier.protocol;
+        self.http_version = .http_2;
+        self.tcp_reader = undefined;
+        self.tcp_writer = undefined;
+        self.tls_tcp_read_buffer = &.{};
+        self.tls_tcp_write_buffer = &.{};
+        self.tls_conn = null;
+        self.tls_reader = undefined;
+        self.tls_writer = undefined;
+        self.tls_rng = undefined;
+        self.read_buffer = &.{};
+        self.write_buffer = &.{};
+        self.reader = carrier.reader;
+        self.writer = carrier.writer;
+        self.pool_node = .{};
+        self.host_buffer = carrier.host_buffer;
+        self.host_len = carrier.host_len;
+        self.port = carrier.port;
+        self.closing = false;
+        self.unix_path_len = 0;
+        self.request_count = 0;
+        self.keep_alive = .{};
+        self.idle_deadline = null;
+        self.pooled_at = .{ .nanoseconds = 0 };
+        self.h2 = carrier.h2;
+        self.h2_stream = null;
+        self.origin = origin;
+        self.carrier_of = null;
+        self.h2_unprocessed = false;
+        self.parsed_response = .{ .arena = self.arena.allocator() };
+        try self.parser.init(&self.parsed_response, self.max_response_headers);
+    }
+
+    fn deinitView(self: *Connection) void {
+        self.arena.deinit();
     }
 
     /// A borrowed view of the reader/writer stack, and the one thing that
@@ -884,6 +1167,7 @@ pub const Connection = struct {
     /// the server rather than reimplemented, which is how the TLS layer's
     /// errors stopped being invisible here.
     pub fn transport(self: *Connection) Transport {
+        if (comptime has_h2_client) if (self.origin) |o| return o.carrier.transport();
         const has_tls = build_options.use_tls and self.tls_conn != null;
         return .{
             .reader = self.reader,
@@ -1522,6 +1806,68 @@ pub const Client = struct {
         return .{ .duration = .{ .raw = duration, .clock = .awake } };
     }
 
+    /// Whether `http://` requests to this host use cleartext HTTP/2
+    /// (`ClientOptions.h2c_hosts`).
+    fn isH2cHost(self: *const Client, host: []const u8, port: u16) bool {
+        if (comptime !has_h2_client) return false;
+        if (!self.config.http2) return false;
+        for (self.config.h2c_hosts) |entry| {
+            // "host:port" (the last colon, unless the entry is a bare
+            // IPv6 literal in brackets), or "host".
+            const colon = std.mem.lastIndexOfScalar(u8, entry, ':');
+            if (colon != null and colon.? > 0 and entry[colon.? - 1] != ':' and !(entry[0] == '[' and entry[entry.len - 1] == ']')) {
+                const entry_port = std.fmt.parseInt(u16, entry[colon.? + 1 ..], 10) catch continue;
+                if (entry_port == port and std.ascii.eqlIgnoreCase(entry[0..colon.?], host)) return true;
+            } else if (std.ascii.eqlIgnoreCase(entry, host)) return true;
+        }
+        return false;
+    }
+
+    /// A connection for a request: one in flight to the same HTTP/2 origin
+    /// (shared), an idle one, or a new dial. Only one task dials for an
+    /// origin that may speak HTTP/2; the rest wait for it and share the
+    /// result. `reused` says whether it is a connection that existed.
+    fn takeConnection(
+        self: *Client,
+        host: []const u8,
+        port: u16,
+        protocol: Protocol,
+        tls_config: ?TlsRef,
+        unix_socket_path: ?[]const u8,
+        advertise_http2: bool,
+        reused: *bool,
+    ) !*Connection {
+        const p = self.pool();
+        while (true) {
+            if (comptime has_h2_client) if (unix_socket_path == null) {
+                if (try p.acquireOrigin(host, port, protocol)) |view| {
+                    reused.* = true;
+                    return view;
+                }
+            };
+            if (p.acquire(host, port, protocol, unix_socket_path)) |c| {
+                reused.* = true;
+                if (comptime has_h2_client) if (c.carrier_of != null) return p.promote(c);
+                return c;
+            }
+            reused.* = false;
+            if (comptime has_h2_client) if (advertise_http2 and unix_socket_path == null) {
+                var ticket: ConnectionPool.DialTicket = .{ .key = ConnectionPool.dialKey(host, port, protocol) };
+                if (!p.knownH1(ticket.key)) {
+                    if (p.beginDial(&ticket)) |gen| {
+                        try p.waitDial(gen);
+                        continue;
+                    }
+                    defer p.endDial(&ticket);
+                    const conn = try self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
+                    if (conn.origin == null) p.noteH1(ticket.key);
+                    return conn;
+                }
+            };
+            return self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
+        }
+    }
+
     /// Acquire a connection from the pool or create a new one.
     fn acquireConnection(
         self: *Client,
@@ -1544,8 +1890,24 @@ pub const Client = struct {
         return self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
     }
 
-    /// Open a new connection, bypassing the pool.
+    /// Open a new connection, bypassing the pool. One that came to HTTP/2
+    /// is handed back as a request's handle on it (`H2Origin`): the
+    /// connection itself is shared from here on.
     fn dialConnection(
+        self: *Client,
+        host: []const u8,
+        port: u16,
+        protocol: Protocol,
+        tls_config: ?TlsRef,
+        unix_socket_path: ?[]const u8,
+        advertise_http2: bool,
+    ) !*Connection {
+        const conn = try self.dialRaw(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
+        if (comptime has_h2_client) if (conn.http_version == .http_2) return conn.pool.adoptCarrier(conn);
+        return conn;
+    }
+
+    fn dialRaw(
         self: *Client,
         host: []const u8,
         port: u16,
@@ -1677,12 +2039,10 @@ pub const Client = struct {
         // Acquire or create a connection. The redirect path releases it early
         // and continues with fallible work, so the errdefer must be disarmed
         // after that release to avoid releasing the connection twice.
-        const advertise_http2 = has_h2_client and self.config.http2 and state.protocol == .https;
+        const advertise_http2 = has_h2_client and self.config.http2 and
+            (state.protocol == .https or (state.options.unix_socket_path == null and self.isH2cHost(host, state.port)));
         var reused = true;
-        var conn = self.pool().acquire(host, state.port, state.protocol, state.options.unix_socket_path) orelse blk: {
-            reused = false;
-            break :blk try self.dialConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, advertise_http2);
-        };
+        var conn = try self.takeConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, advertise_http2, &reused);
         var conn_released = false;
         errdefer if (!conn_released) conn.pool.release(conn);
 
@@ -1690,11 +2050,14 @@ pub const Client = struct {
         self.sendRequest(conn, state, host, &lost) catch |err| {
             // The server may have closed the idle connection just as it was
             // picked up. Retried on a new one under the same conditions as
-            // Go's net/http.
-            if (!lost or !reused or !isReplayable(state.options)) return err;
+            // Go's net/http. A request an HTTP/2 server provably did not
+            // process (refused, or past its GOAWAY) goes again whatever
+            // its method, once.
+            const unprocessed = lost and conn.h2_unprocessed;
+            if (!lost or (!unprocessed and (!reused or !isReplayable(state.options)))) return err;
             conn.pool.release(conn);
             conn_released = true;
-            conn = try self.dialConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, advertise_http2);
+            conn = try self.takeConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, advertise_http2, &reused);
             conn_released = false;
             try self.sendRequest(conn, state, host, &lost);
         };
@@ -1947,7 +2310,7 @@ pub const Client = struct {
         var fields: H2Fields = .{ .arena = arena };
         try fields.list.appendSlice(arena, &.{
             .{ .name = ":method", .value = state.options.method.name() },
-            .{ .name = ":scheme", .value = "https" },
+            .{ .name = ":scheme", .value = if (conn.protocol == .https) "https" else "http" },
             .{ .name = ":path", .value = if (state.uri.query) |query|
                 try std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query.percent_encoded })
             else
@@ -1986,6 +2349,12 @@ pub const Client = struct {
             // one may retry.
             if (err == error.ConnectionClosed) {
                 conn.closing = true;
+                lost.* = true;
+            }
+            // Refused, or past the server's GOAWAY: it never ran, and
+            // may go to another connection whatever it is.
+            if (err == error.StreamReset and stream.unprocessed()) {
+                conn.h2_unprocessed = true;
                 lost.* = true;
             }
             return err;

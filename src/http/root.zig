@@ -111,6 +111,8 @@ pub const checkAddressFree = dusty.checkAddressFree;
 /// A listening TCP socket like `IpAddress.listen`'s, with IPV6_V6ONLY as
 /// asked: `.ipv6_only = false` on `::` takes IPv4 clients too.
 pub const listenIp = dusty.listenIp;
+/// Sets the permission bits of a unix socket file.
+pub const setUnixMode = dusty.setUnixMode;
 /// An IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) as the IPv4 address
 /// it stands for; any other address as it is.
 pub const unmapIpv4 = dusty.unmapIpv4;

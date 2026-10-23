@@ -39,6 +39,9 @@ pub const Header = struct { name: []const u8, value: []const u8 };
 /// `anole.h3.ConnectOptions`, except where a field says it is HTTP/2's own.
 pub const ConnectOptions = struct {
     /// The server's name (for TLS: SNI and certificate checks) or address.
+    /// Or a Unix domain socket, named as gRPC names targets: "unix:/path"
+    /// or "unix:///path"; on Linux also "unix-abstract:name". Calls then
+    /// run cleartext (prior knowledge) with no TLS, and `port` is ignored.
     host: []const u8,
     port: u16,
     /// Connect here instead of resolving `host`.
@@ -113,6 +116,33 @@ pub const StreamError = error{
     TooManyInterimResponses,
 };
 
+/// A Unix socket named as gRPC names targets.
+pub const UnixTarget = struct {
+    path: []const u8,
+    /// Linux's abstract namespace ("unix-abstract:name").
+    abstract: bool,
+};
+
+/// The socket a `ConnectOptions.host` of the form "unix:/path",
+/// "unix:///path" or "unix-abstract:name" names; null for a host name.
+pub fn unixTarget(host: []const u8) ?UnixTarget {
+    if (std.mem.startsWith(u8, host, "unix-abstract:")) return .{ .path = host["unix-abstract:".len..], .abstract = true };
+    if (!std.mem.startsWith(u8, host, "unix:")) return null;
+    var rest = host["unix:".len..];
+    if (std.mem.startsWith(u8, rest, "//")) rest = rest[2..];
+    return .{ .path = rest, .abstract = false };
+}
+
+test "unixTarget parses gRPC's unix targets" {
+    try std.testing.expectEqualStrings("/run/a.sock", unixTarget("unix:/run/a.sock").?.path);
+    try std.testing.expectEqualStrings("/run/a.sock", unixTarget("unix:///run/a.sock").?.path);
+    try std.testing.expectEqualStrings("rel.sock", unixTarget("unix:rel.sock").?.path);
+    const a = unixTarget("unix-abstract:name").?;
+    try std.testing.expect(a.abstract and std.mem.eql(u8, a.path, "name"));
+    try std.testing.expect(unixTarget("localhost") == null);
+    try std.testing.expect(unixTarget("unixhost") == null);
+}
+
 fn timeoutFrom(duration: ?std.Io.Duration) std.Io.Timeout {
     const d = duration orelse return .none;
     return .{ .duration = .{ .raw = d, .clock = .awake } };
@@ -178,6 +208,7 @@ pub const ClientConnection = struct {
         const owned = try gpa.create(Owned);
         errdefer gpa.destroy(owned);
         owned.* = .{};
+        if (opts.tls != null and unixTarget(opts.host) != null) return error.TlsOnUnixSocket;
         const deadline: Deadline = .init(io, timeoutFrom(opts.connect_timeout));
         const socket = try deadline.run(dial, .{ io, opts });
         errdefer socket.close(io);
@@ -198,6 +229,11 @@ pub const ClientConnection = struct {
         return start(gpa, io, socket, owned, r, w, opts.stream_window, opts.max_data, opts.max_header_list_size, timeoutFrom(opts.timeout));
     }
 
+    /// The receive window per stream of an adopted connection (the HTTP
+    /// client's). Its queue is sized per response (`allocBody`), so a large
+    /// window costs nothing for small answers.
+    const adopted_stream_window: u31 = 1 << 20;
+
     /// Takes over a connection on which the TLS handshake picked "h2", as
     /// the core's client does (its `h2_client` seam): `reader` and `writer`
     /// carry the cleartext from here on, and only this connection's tasks
@@ -206,10 +242,23 @@ pub const ClientConnection = struct {
     /// `close`. Requests have no timeout unless they ask for one.
     pub fn adopt(gpa: std.mem.Allocator, io: std.Io, reader: *std.Io.Reader, writer: *std.Io.Writer, socket: std.Io.net.Stream) !*ClientConnection {
         const defaults: ConnectOptions = .{ .host = "", .port = 0 };
-        return start(gpa, io, socket, null, reader, writer, defaults.stream_window, defaults.max_data, defaults.max_header_list_size, .none);
+        return start(gpa, io, socket, null, reader, writer, adopted_stream_window, defaults.max_data, defaults.max_header_list_size, .none);
     }
 
     fn dial(io: std.Io, opts: ConnectOptions) !std.Io.net.Stream {
+        if (unixTarget(opts.host)) |t| {
+            var buf: [std.Io.net.UnixAddress.max_len]u8 = undefined;
+            var path = t.path;
+            if (t.abstract) {
+                if (comptime @import("builtin").os.tag != .linux) return error.UnixAbstractUnsupported;
+                if (t.path.len + 1 > buf.len) return error.NameTooLong;
+                buf[0] = 0;
+                @memcpy(buf[1..][0..t.path.len], t.path);
+                path = buf[0 .. t.path.len + 1];
+            }
+            const ua = try std.Io.net.UnixAddress.init(path);
+            return ua.connect(io);
+        }
         if (opts.address) |a| return a.connect(io, .{ .mode = .stream });
         if (std.Io.net.IpAddress.parse(opts.host, opts.port)) |a| return a.connect(io, .{ .mode = .stream }) else |_| {}
         return (try std.Io.net.HostName.init(opts.host)).connect(io, opts.port, .{ .mode = .stream });
@@ -557,6 +606,7 @@ pub const ClientConnection = struct {
         switch (hd.type) {
             c.NGHTTP2_HEADERS => {
                 if (!stream.head_ready and stream.status >= 200) {
+                    if (!end) stream.allocBody() catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
                     stream.head_ready = true;
                     stream.head_event.set(self.io);
                 } else if (!stream.head_ready) {
@@ -669,7 +719,9 @@ pub const Stream = struct {
         };
         errdefer self.arena.deinit();
         const a = self.arena.allocator();
-        self.body = .init(try a.alloc(u8, conn.stream_window));
+        // The receive queue comes with the response head (`allocBody`),
+        // sized by what the response says it will carry.
+        self.body = .init(&.{});
         self.body_reader.buffer = try a.alloc(u8, 16 * 1024);
         if (has_body) {
             self.out = .init(try a.alloc(u8, 32 * 1024));
@@ -691,6 +743,22 @@ pub const Stream = struct {
         conn.unlock();
         self.arena.deinit();
         conn.gpa.destroy(self);
+    }
+
+    /// Under the connection's mutex, when the final response head is in:
+    /// the receive queue. As large as the flow-control window needs to be,
+    /// but no larger than a response with a `content-length` will fill, so
+    /// a stream for a small answer costs a small buffer whatever the
+    /// window is.
+    fn allocBody(self: *Stream) !void {
+        var size: usize = self.conn.stream_window;
+        for (self.headers.items) |f| {
+            if (!std.ascii.eqlIgnoreCase(f.name, "content-length")) continue;
+            const n = std.fmt.parseInt(usize, f.value, 10) catch break;
+            size = @min(size, @max(n, 1));
+            break;
+        }
+        self.body = .init(try self.arena.allocator().alloc(u8, size));
     }
 
     /// Under the connection's mutex: END_STREAM arrived. The reader sees
@@ -728,6 +796,14 @@ pub const Stream = struct {
     pub fn unprocessed(self: *const Stream) bool {
         if (self.error_code == c.NGHTTP2_REFUSED_STREAM) return true;
         return self.id > self.conn.goaway_last_id and !self.head_ready;
+    }
+
+    /// The error code of the RST_STREAM that ended the stream (the
+    /// server's, or the echo of one sent here); null when it did not end
+    /// in a reset.
+    pub fn resetCode(self: *const Stream) ?u64 {
+        if (self.cause != null and self.cause.? == error.StreamReset) return self.error_code;
+        return null;
     }
 
     /// Waits for the response head (`status`, `headers`).

@@ -556,6 +556,11 @@ pub const Options = struct {
         /// `port`. A socket file left behind by a server that is gone is
         /// replaced; one that something still listens on is an error.
         unix: ?[]const u8 = null,
+        /// Permission bits for the socket file of a `unix` listener
+        /// (owner and group may connect; others may not). A client needs
+        /// write permission on the file. `0o666` opens it to every local
+        /// user; ignored on Windows and for abstract sockets.
+        unix_mode: u16 = 0o660,
         /// TLS with this certificate, or null for cleartext.
         tls: ?Tls = null,
         /// HTTP/1.1 (and 1.0).
@@ -1486,7 +1491,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     h3_core = core_next - 1;
                 }
                 if (address == .unix and !handoff_mode) try clearStaleUnixSocket(rt_io, address.unix);
-                const fd = try listenerFd(rt_io, inherited, handoff_mode, spec.name, core_next - 1, address, ipv6_only);
+                const fd = try listenerFd(rt_io, inherited, handoff_mode, spec.name, core_next - 1, address, ipv6_only, l.unix_mode);
                 if (fd) |f| try held.append(a, .{ .fd = f, .name = spec.name });
                 // ---- p3/net ----
                 var raw: ?*net_mod.TcpListener = null;
@@ -1513,6 +1518,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .http2_prior_knowledge = l.tls == null and l.http2 and features.http2,
                     .socket_per_acceptor = per_core_sockets and address == .ip,
                     .ipv6_only = ipv6_only,
+                    .unix_mode = if (address == .unix) l.unix_mode else null,
                     // Null only on a unix socket: the modes' default is for TCP listeners.
                     .proxy_protocol = l.proxy_protocol orelse false,
                     .proxy_protocol_from = from: {
@@ -1682,7 +1688,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// The socket for one listener in hand-off mode: inherited if one
         /// was passed in under `name` (or at `index`), else opened here.
         /// Null outside hand-off mode (the core binds).
-        fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: http.Address, ipv6_only: ?bool) !?handoff.Fd {
+        fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: http.Address, ipv6_only: ?bool, mode: u16) !?handoff.Fd {
             if (!handoff_mode) return null;
             if (inherited) |inh| if (inh.find(name, index)) |fd| {
                 handoff.checkInherited(fd, .listener, address == .ip) catch |err| {
@@ -1701,6 +1707,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .unix => |unix| {
                     try clearStaleUnixSocket(io_, unix);
                     const s = try unix.listen(io_, .{});
+                    http.setUnixMode(io_, unix, mode);
                     return s.socket.handle;
                 },
             }
@@ -4512,10 +4519,17 @@ test "anole.Server: several listeners: h1 + h2c, TLS h1 only, h2c only, TLS h2 +
             var name_buf: [128]u8 = undefined;
             try std.testing.expect(std.mem.endsWith(u8, resp, try std.fmt.bufPrint(&name_buf, "on unix-{s}", .{path})));
 
-            // TLS, HTTP/2 only: a client that offers HTTP/1.1 alone (as
-            // the HTTP client does by default) is not served.
+            // TLS, HTTP/2 only: a client that offers HTTP/1.1 alone is not
+            // served; the HTTP client offers h2 by default and is.
             const h2tls = addrs[6].ip.getPort();
-            try std.testing.expect(std.meta.isError(client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{h2tls}), .{})));
+            {
+                var h1_only = http.Client.init(alloc, io_, .{ .tls = .{ .ca = ca }, .http2 = false });
+                defer h1_only.deinit();
+                try std.testing.expect(std.meta.isError(h1_only.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{h2tls}), .{})));
+                var r = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{h2tls}), .{});
+                defer r.deinit();
+                try std.testing.expectEqualStrings("on h2tls", (try r.body()).?);
+            }
             try expectH2(try h2c.ClientConnection.connect(alloc, io_, .{
                 .host = "localhost",
                 .port = h2tls,

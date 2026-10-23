@@ -10,6 +10,10 @@
 | A restart (`process`) with up to 255 HTTP/3 sockets | `handoff.max_listeners` is 64 TCP listeners (raw TCP ones among them) and 1024 UDP sockets (HTTP/3's and every raw UDP listener's); no program that fit before fails |
 | `ServerOptions.Listener` built field by field | new fields `tcp` and `udp` (null); a server that names only raw listeners opens no HTTP listener, where before `run()` with no `http` or `https` always opened 127.0.0.1:8080 (a server that names a listener of any kind never did) |
 | The C ABI's `anole_stats` of 0.9 | six more `u64` fields at the end (`net_connections` ... `udp_datagrams_dropped`); a caller passing its `size` gets the fields it knows |
+| `anole.http.Client` over HTTPS offered only HTTP/1.1 | it offers h2 too (`ClientOptions.http2` is on by default) and shares one connection per origin and executor; `.http2 = false` keeps 0.3's behaviour |
+| `channel.conn` (read) | `channel.conn.?` (the field is optional; `h3` is the other connection) |
+| A gRPC client call whose stream the server reset was UNAVAILABLE | the status follows the reset code (INTERNAL for most; only a refused stream is UNAVAILABLE, so `Channel.retry` no longer repeats the others) |
+| `Response.abort()` in a gRPC handler answered UNKNOWN | the stream is reset; the client reads CANCELLED |
 
 ## 0.2 to 0.3
 
