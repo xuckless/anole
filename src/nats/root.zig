@@ -20,6 +20,7 @@
 //! every executor. See docs/messaging.md.
 const std = @import("std");
 const dusty = @import("dusty");
+const anole_log = @import("anole_log");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
 const url_mod = @import("../db/url.zig");
@@ -192,6 +193,32 @@ pub const Msg = struct {
     /// The payload parsed as JSON into T (in the message's arena).
     pub fn json(self: *Msg, comptime T: type) !T {
         return std.json.parseFromSliceLeaky(T, self.arena, self.payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    }
+
+    /// The payload as a `T`, mapped field by field and checked by `T`'s
+    /// `field_rules` (`anole.bindJson`): `error.InvalidJsonBody` when it is
+    /// not JSON, `error.ValidationFailed` (a service error 422) when it does
+    /// not fit or breaks a rule, after one warning that names the first
+    /// problem.
+    pub fn bind(self: *Msg, comptime T: type) !T {
+        const result = try dusty.bindJson(T, self.arena, self.payload, .{});
+        switch (result) {
+            .ok => |value| return value,
+            .invalid => |found| {
+                const first = found.items[0];
+                self.log().warn("message does not fit the type", .{
+                    .violations = found.items.len,
+                    .first_field = first.field orelse "",
+                    .first_code = first.code,
+                });
+                return error.ValidationFailed;
+            },
+        }
+    }
+
+    /// A logger whose records carry this message's id, under the scope `nats`.
+    pub fn log(self: *const Msg) anole_log.Scoped(.nats) {
+        return .{ .context = .{ .request_id = self.id } };
     }
 
     /// Publishes to reply_to; error.BadRequest when there is none.
@@ -916,4 +943,32 @@ test {
     _ = auth;
     _ = jetstream;
     _ = @import("live_test.zig");
+}
+
+test "Msg.bind: a payload that does not fit, or breaks a rule, is ValidationFailed" {
+    const validate = @import("validate");
+    const Job = struct {
+        n: u8,
+        name: []const u8 = "x",
+        pub const field_rules = .{ .name = validate.maxLength(3) };
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m: Msg = .{
+        .io = std.testing.io,
+        .arena = arena_state.allocator(),
+        .id = "nats-1",
+        .subject = "jobs",
+        .reply_to = null,
+        .headers = &.{},
+        .payload = "{\"n\":1}",
+        .client = undefined,
+    };
+    try std.testing.expectEqual(@as(u8, 1), (try m.bind(Job)).n);
+    m.payload = "{\"n\":\"x\"}";
+    try std.testing.expectError(error.ValidationFailed, m.bind(Job));
+    m.payload = "{\"n\":1,\"name\":\"toolong\"}";
+    try std.testing.expectError(error.ValidationFailed, m.bind(Job));
+    m.payload = "not json";
+    try std.testing.expectError(error.InvalidJsonBody, m.bind(Job));
 }
