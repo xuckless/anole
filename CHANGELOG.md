@@ -47,6 +47,9 @@ breaking changes are listed anyway.
 - `jobs.enqueueIn`, `enqueueRawIn` and `completeIn` on SQLite transactions,
   jobs metrics, `traceparent` carried in job meta, and the queue draining when
   the server does.
+- `jobs.Client.addQueue`: adds a queue the options did not list, before
+  `start` (a queue that exists is left as it is). `webhooks.register` adds
+  its delivery queue this way; an app's own module can too.
 - C ABI: `"jobs"` in the configuration (with native `sql` cron actions),
   `anole_jobs_get`, `anole_jobs_enqueue` (optionally inside an
   `anole_db_tx`), `anole_jobs_work` and `anole_jobs_stop`, `anole_job_finish`,
