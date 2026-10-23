@@ -1894,3 +1894,37 @@ test "C ABI: a streamed answer outlives request_ms + 5 s on every protocol" {
     try e.drain();
     try std.testing.expect(e.wait(5000));
 }
+
+test "capi engine: a fixed route behind a JWKS jwt middleware is not run inline; behind none it is" {
+    const base =
+        \\{"executors": 1, "timeouts": {"shutdown_ms": 200},
+        \\ "listeners": [{"address": "127.0.0.1", "port": 0}],
+    ;
+    const cases = [_]struct { json: []const u8, inline_ok: bool }{
+        .{ .json = base ++
+            \\ "middleware": [{"jwt": {"jwks_url": "http://127.0.0.1:1/jwks", "audience": "api"}}],
+            \\ "routes": [{"path": "/fixed", "respond": {"status": 200, "body": "ok"}}]}
+        , .inline_ok = false },
+        .{ .json = base ++
+            \\ "routes": [{"path": "/fixed", "respond": {"status": 200, "body": "ok"}}]}
+        , .inline_ok = true },
+        .{ .json = base ++
+            \\ "routes": [{"path": "/fixed", "no_wait": false, "respond": {"status": 200, "body": "ok"}}]}
+        , .inline_ok = false },
+    };
+    inline for (cases) |case| {
+        var why_buf: [256]u8 = undefined;
+        var why: std.Io.Writer = .fixed(&why_buf);
+        const e = engine.Engine.create(case.json, false, &why) catch |err| {
+            std.debug.print("{s}\n", .{why.buffered()});
+            return err;
+        };
+        defer e.destroy();
+        _ = try e.attach(null, null, false);
+        try e.start();
+        // `has_no_wait`: some route promised not to wait.
+        try std.testing.expectEqual(case.inline_ok, e.app.?.router.has_no_wait);
+        try e.drain();
+        try std.testing.expect(e.wait(5000));
+    }
+}
