@@ -474,12 +474,12 @@ pub const Client = struct {
     /// `server` is the `*anole.Server(App)`. Register before `run`.
     pub fn handle(self: *Client, server: anytype, subject: []const u8, opts: HandleOptions, comptime handler: anytype) !void {
         const Info = @typeInfo(@TypeOf(handler)).@"fn";
-        const with_state = Info.params.len == 2;
+        const with_state = Info.param_types.len == 2;
         const state: ?*anyopaque = if (with_state) @ptrCast(server.server.ctx) else null;
         const Tramp = struct {
             fn run(ctx: ?*anyopaque, m: *Msg) anyerror!void {
                 if (with_state) {
-                    const P = Info.params[0].type.?;
+                    const P = Info.param_types[0].?;
                     return handler(@as(P, @ptrCast(@alignCast(ctx.?))), m);
                 }
                 return handler(m);
@@ -916,4 +916,5 @@ test {
     _ = auth;
     _ = jetstream;
     _ = @import("live_test.zig");
+    _ = @import("anole_test.zig");
 }
