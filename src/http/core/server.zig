@@ -2982,7 +2982,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 if (!response.keepalive) {
                     // Input after a 101 belongs to the upgraded protocol.
-                    if (response.status != .switching_protocols and hasUnreadInput(connection, &parser)) {
+                    if (response.status != .switching_protocols and !response._parked and hasUnreadInput(connection, &parser)) {
                         try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                     }
                     if (connection.adopter != null) {

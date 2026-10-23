@@ -35,6 +35,10 @@ pub const Sink = @import("sink.zig").Sink;
 /// A response finished after its handler returned, with no task waiting
 /// (`Response.detach`): HTTP/2 and HTTP/3 requests that ran on the reader.
 pub const Detached = @import("detach.zig").Detached;
+/// A streamed response no task holds (`Response._park`); internal, for `anole.sse`.
+pub const Parked = @import("parked.zig").Parked;
+/// `EventStream`'s encoder: one event as bytes.
+pub const writeEvent = @import("response.zig").writeEvent;
 /// Task placement on zio's executors, for protocol engines outside the
 /// core (HTTP/3) that keep a connection's tasks on one executor.
 pub const placement = @import("placement.zig");
