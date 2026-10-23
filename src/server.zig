@@ -1414,7 +1414,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // Not on Windows (`handoff.supported`): there `process` only
             // carries the environment, and dusty binds as usual.
             const handoff_mode = opts.process != null and handoff.supported;
-            if (handoff_mode and specs.len > handoff.max_tcp_listeners) return error.TooManyListeners;
+            if (handoff_mode) {
+                var tcp_specs: usize = 0;
+                for (specs) |sp| tcp_specs += @intFromBool(sp.listener.udp == null);
+                if (tcp_specs > handoff.max_tcp_listeners) return error.TooManyListeners;
+            }
             const per_core_sockets = builtin.os.tag == .linux and !handoff_mode;
             const inherited = if (opts.process) |p| handoff.inherited(p.environ) else null;
             var held: std.ArrayList(handoff.Listener) = .empty;

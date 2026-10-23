@@ -450,8 +450,9 @@ enum anole_event_type {
                               its answer (the client went away, its deadline passed, its body broke
                               a limit, the drain cut it); nothing more is owed, and answer calls on
                               it get ANOLE_E_GONE */
-  ANOLE_EV_WRITABLE = 4,   /* anole_event: a streamed response, gRPC call, WebSocket or WebTransport
-                              stream that took ANOLE_BUSY has room (ev.handle) */
+  ANOLE_EV_WRITABLE = 4,   /* anole_event: a streamed response, gRPC call, WebSocket, WebTransport
+                              stream, raw TCP connection or UDP socket that took ANOLE_BUSY (or
+                              was refused with ANOLE_E_AGAIN) has room (ev.handle) */
   ANOLE_EV_SENT = 5,       /* anole_sent_event: a borrowed body is no longer read */
   ANOLE_EV_WS_OPEN = 6,    /* anole_request_event (the upgrade request; subprotocol set); handle:
                               anole_ws. Routes with "accept": "auto" only (the default) */
@@ -897,7 +898,8 @@ ANOLE_API int64_t anole_req_read(anole_req r, void *buf, size_t cap, int32_t tim
 
 /* ---- responses ------------------------------------------------------------------ */
 
-/* Body flags. ANOLE_BODY_BORROW: Anole reads the bytes where they are
+/* Body flags. ANOLE_BODY_BORROW (also for anole_net_write: borrowing pays for
+   large writes on plain TCP): Anole reads the bytes where they are
    instead of copying them; they must stay valid and unchanged until
    ANOLE_EV_SENT for them. With ANOLE_BODY_BORROW, a call that answers >= 0
    (OK or BUSY) produces exactly one ANOLE_EV_SENT for that (data, len),
@@ -980,6 +982,8 @@ ANOLE_API anole_status anole_req_abort(anole_req r);
                       let go (the peer may open another)
      database         an open transaction is rolled back
      transaction
+     raw TCP          closed gracefully (anole_net_close): what is queued goes
+     connection       out, this side ends; a UDP socket: nothing (ANOLE_OK)
    A cleanup call: ANOLE_OK also when the object is already over, from any
    thread, before or after the server is destroyed. ANOLE_E_INVALID for 0
    or a value that is no handle kind. */

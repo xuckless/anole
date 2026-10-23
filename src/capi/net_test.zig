@@ -452,3 +452,18 @@ test "capi net: parity, the net options have a C ABI key with the same default" 
     try parity.checkSchemaAndDefaults(anole.net.Tcp.Options, config.Config, &parity.net_tcp, root);
     try parity.checkSchemaAndDefaults(anole.net.Udp.Options, config.Config, &parity.net_udp, root);
 }
+
+fn addrFuzz(input: []const u8) anyerror!void {
+    // What anole_net_addr_parse accepts, formats and parses back to itself.
+    const ip = std.Io.net.IpAddress.parseLiteral(input) catch return;
+    var buf: [96]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    ip.format(&w) catch return;
+    const again = std.Io.net.IpAddress.parseLiteral(w.buffered()) catch return error.RoundTripFailed;
+    try std.testing.expect(std.meta.eql(ip, again));
+}
+
+test "fuzz: net addr parse" {
+    const fuzz = @import("../fuzz.zig");
+    try fuzz.bytes(addrFuzz, &.{ "10.0.0.1:53", "[::1]:53", "[2001:db8::1]:443", "127.0.0.1", "[::ffff:1.2.3.4]:80", "1.2.3.4:99999", "[fe80::1%eth0]:1", "" });
+}

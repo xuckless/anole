@@ -646,3 +646,61 @@ test "net tcp: metrics count connections and bytes per listener" {
     }.run);
     _ = registry;
 }
+
+const Cert = struct {
+    pub fn open(conn: *net.Conn) !void {
+        var buf: [64]u8 = undefined;
+        const text = if (conn.peerCertificate()) |der|
+            try std.fmt.bufPrint(&buf, "cert {d} {x}\n", .{ der.len, der[0] })
+        else
+            try std.fmt.bufPrint(&buf, "no cert\n", .{});
+        _ = try conn.send(text);
+    }
+    pub fn data(_: *net.Conn, _: []const u8) !void {}
+};
+
+test "net tcp: mutual TLS gives the handler the peer certificate" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    var pem = try @import("../tls/root.zig").selfSigned(alloc, .{});
+    defer pem.deinit(alloc);
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.tcpOn(.{ .address = "127.0.0.1", .port = 0, .tls = .{
+        .cert = .fromPem(pem.cert, pem.key),
+        .client_auth = .{ .ca = .{ .pem = pem.cert }, .mode = .request },
+    } }, Cert, .{});
+    const Check = struct {
+        fn run(a: *App, p: *const @TypeOf(pem)) !void {
+            defer a.stop();
+            try a.waitReady();
+            // With a certificate: its DER length and first byte (0x30).
+            {
+                const s = try ClientStream.connect(alloc, a.io(), .{
+                    .host = "localhost",
+                    .port = portOf(a),
+                    .address = .{ .ip4 = .loopback(portOf(a)) },
+                    .tls = .{ .ca = .{ .pem = p.cert }, .client_certificate = .{ .pem = .{ .cert = p.cert, .key = p.key } }, .server_name = "localhost" },
+                });
+                defer s.close();
+                const line = try s.reader().takeDelimiterExclusive('\n');
+                try std.testing.expect(std.mem.startsWith(u8, line, "cert "));
+                try std.testing.expect(std.mem.endsWith(u8, line, " 30"));
+            }
+            // Without one (mode request): the handshake succeeds, no certificate.
+            {
+                const s = try ClientStream.connect(alloc, a.io(), .{
+                    .host = "localhost",
+                    .port = portOf(a),
+                    .address = .{ .ip4 = .loopback(portOf(a)) },
+                    .tls = .{ .ca = .{ .pem = p.cert }, .server_name = "localhost" },
+                });
+                defer s.close();
+                const line = try s.reader().takeDelimiterExclusive('\n');
+                try std.testing.expectEqualStrings("no cert", line);
+            }
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{ &app, &pem });
+    try app.run();
+    try checking.await(app.io());
+}

@@ -718,6 +718,7 @@ none.
 | `proxy.trusted`, `trusted_hops`, `trust_forwarded_proto`, `trust_forwarded_host` | null, 0, true, false | `proxy.*` |
 | `environment`, `deployment`, `error_detail` | null, null, null | `environment`, `deployment`, `error_detail` (null: `ANOLE_ENV` else production; `ANOLE_DEPLOYMENT` else standalone; on in development) |
 | `listeners[].address`, `port`, `proxy_protocol` | null, null, null | `Listener.*` (null: the deployment's default: `127.0.0.1`, 8080 or `$PORT`, off or on under `anole_lb`) |
+| `listeners[].tcp`, `listeners[].udp` | null | the raw TCP and UDP listener options (`anole.net.Tcp.Options`, `Udp.Options`, durations as `_ms`); see [Raw TCP and UDP](#raw-tcp-and-udp) |
 | `request.require_host`, `decompress`, `keep_buffers` | true, true, false | `request.*` |
 | `response.write_buffer_size`, `date`, `default_content_type`, `max_header_count`, `brotli_quality` | 16384, true, "text", 64, 5 | `response.*` (`default_content_type` by tag name; null: none) |
 | `http2.*` | 250 streams, ..., `enable_connect_protocol` false | `http2.*` (`max_concurrent_streams`, `stream_window`, `stream_window_reading`, `tunnel_window`, `reading_window_budget`, `connection_window`, `max_header_list_size`, `stream_reset_burst`, `stream_reset_rate`, `max_continuations`, `refused_stream_burst`, `refused_stream_rate`, `enable_connect_protocol`, `inline_no_wait`) |
