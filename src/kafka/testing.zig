@@ -71,6 +71,8 @@ pub const FakeBroker = struct {
     config: Config,
     listener: std.Io.net.Server,
     addr_buf: [32]u8 = undefined,
+    /// `address()` as a one-entry broker list, for `Options.brokers`.
+    bootstrap_list: [1][]const u8 = undefined,
     addr_len: usize = 0,
     group: std.Io.Group = .init,
     mutex: std.Io.Mutex = .init,
@@ -100,6 +102,7 @@ pub const FakeBroker = struct {
         const listen_at: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
         b.* = .{ .gpa = gpa, .io = io, .config = config, .listener = try listen_at.listen(io, .{}) };
         b.addr_len = (try std.fmt.bufPrint(&b.addr_buf, "127.0.0.1:{d}", .{b.listener.socket.address.getPort()})).len;
+        b.bootstrap_list = .{b.address()};
         try b.group.concurrent(io, acceptLoop, .{b});
         return b;
     }
@@ -144,6 +147,12 @@ pub const FakeBroker = struct {
     /// "127.0.0.1:port".
     pub fn address(b: *const FakeBroker) []const u8 {
         return b.addr_buf[0..b.addr_len];
+    }
+
+    /// The broker list for `Options.brokers`: lives as long as the broker
+    /// (a `&.{b.address()}` made in a helper points into its stack frame).
+    pub fn bootstrap(b: *const FakeBroker) []const []const u8 {
+        return &b.bootstrap_list;
     }
 
     /// Stores a batch of `recs` at the end of a partition (making the topic).

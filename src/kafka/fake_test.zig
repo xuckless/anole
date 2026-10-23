@@ -14,7 +14,7 @@ const gpa = testing.allocator;
 
 fn opts(broker: *const FakeBroker, producer: kafka.Options.Producer) kafka.Options {
     return .{
-        .brokers = &.{broker.address()},
+        .brokers = broker.bootstrap(),
         .producer = producer,
         .request_timeout = .fromSeconds(5),
         .timeout = .fromSeconds(10),
