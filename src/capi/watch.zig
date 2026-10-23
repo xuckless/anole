@@ -425,9 +425,8 @@ pub fn ack(e: *Engine, hv: u64, position: []const u8) AnswerError!void {
     const sub = subOf(e, hv) catch |err| return e.badHandle(err);
     const en = sub.entry;
     if (!en.manual_ack) return error.State;
-    const hook = en.w.ack_hook orelse return error.State;
     if (position.len == 0) return error.Invalid;
-    for (en.keys) |key| hook.call(hook.ctx, key, position) catch |err| switch (err) {
+    for (en.keys) |key| en.w.ackEntry(key, position) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Unsupported => return error.State,
     };

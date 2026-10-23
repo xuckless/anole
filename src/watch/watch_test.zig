@@ -228,3 +228,132 @@ test "watch mongo: history lost -> a gap, then the stream reopens from now" {
     try std.testing.expect(stage.get("resumeAfter") == null);
     try std.testing.expect(stage.get("startAfter") == null);
 }
+
+const Acks = struct {
+    var lock: std.atomic.Mutex = .unlocked;
+    var ids: [8][8]u8 = undefined;
+    var lens: [8]usize = @splat(0);
+    var count: usize = 0;
+    var handled: std.atomic.Value(u32) = .init(0);
+
+    fn reset() void {
+        count = 0;
+        handled.store(0, .release);
+    }
+
+    fn call(_: *anyopaque, _: []const u8, id: []const u8) error{ OutOfMemory, Unsupported }!void {
+        while (!lock.tryLock()) std.atomic.spinLoopHint();
+        defer lock.unlock();
+        @memcpy(ids[count][0..id.len], id);
+        lens[count] = id.len;
+        count += 1;
+    }
+
+    fn has(id: []const u8) bool {
+        while (!lock.tryLock()) std.atomic.spinLoopHint();
+        defer lock.unlock();
+        for (0..count) |i| if (std.mem.eql(u8, ids[i][0..lens[i]], id)) return true;
+        return false;
+    }
+
+    /// Fails for the data "bad".
+    fn handle(_: ?*anyopaque, ev: *root.Event) anyerror!void {
+        defer _ = handled.fetchAdd(1, .acq_rel);
+        if (std.mem.eql(u8, ev.data, "bad")) return error.Boom;
+    }
+};
+
+fn entry(data: []const u8, id: []const u8) root.Raw {
+    return .{ .op = .entry, .op_name = "entry", .channel = "k", .data = data, .position = id };
+}
+
+test "watch: auto-ack: after the handler succeeded, never after it failed (handler on the reader, and on its own tasks)" {
+    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
+    defer topics.deinit();
+    const w = try newWatch(&topics, "t", &.{});
+    defer w.deinit();
+    Acks.reset();
+    var dummy: u8 = 0;
+    const hook: root.AckHook = .{ .ctx = &dummy, .call = Acks.call };
+    w.setAckHooks(null, hook);
+
+    // Concurrency 1: the outcome tells the reader whether to ack.
+    w.setHandler(null, .{ .timeout = null }, Acks.handle);
+    try std.testing.expectEqual(root.Outcome.ok, w.deliver(entry("good", "1-0")));
+    try std.testing.expectEqual(root.Outcome.failed, w.deliver(entry("bad", "2-0")));
+    try std.testing.expectEqual(@as(usize, 0), Acks.count);
+
+    // More: each handler acks its own entry when it succeeded.
+    Acks.reset();
+    w.setHandler(null, .{ .timeout = null, .concurrency = 2 }, Acks.handle);
+    try std.testing.expectEqual(root.Outcome.deferred, w.deliver(entry("good", "3-0")));
+    try std.testing.expectEqual(root.Outcome.deferred, w.deliver(entry("bad", "4-0")));
+    try std.testing.expectEqual(root.Outcome.deferred, w.deliver(entry("good", "5-0")));
+    var polls: usize = 0;
+    while (true) : (polls += 1) {
+        w.slots.mutex.lockUncancelable(io);
+        const busy = w.slots.in_use;
+        w.slots.mutex.unlock(io);
+        if (busy == 0 and Acks.handled.load(.acquire) == 3) break;
+        if (polls > 10_000) return error.Timeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(Acks.has("3-0"));
+    try std.testing.expect(Acks.has("5-0"));
+    try std.testing.expect(!Acks.has("4-0"));
+    try std.testing.expectEqual(@as(usize, 2), Acks.count);
+
+    // Manual: Event.ack goes through the manual hook only.
+    w.setAckHooks(hook, null);
+    Acks.reset();
+    w.setHandler(null, .{ .timeout = null }, Acks.handle);
+    try std.testing.expectEqual(root.Outcome.ok, w.deliver(entry("good", "6-0")));
+    try std.testing.expectEqual(@as(usize, 0), Acks.count);
+    try w.ackEntry("k", "6-0");
+    try std.testing.expect(Acks.has("6-0"));
+    // The reader gone: acks are refused, not queued into freed memory.
+    w.setAckHooks(null, null);
+    try std.testing.expectError(error.Unsupported, w.ackEntry("k", "7-0"));
+}
+
+const Gate = struct {
+    var entered: std.Io.Event = .unset;
+    var open: std.Io.Event = .unset;
+    var finished: std.atomic.Value(bool) = .init(false);
+
+    fn handle(_: ?*anyopaque, _: *root.Event) anyerror!void {
+        entered.set(io);
+        open.waitUncancelable(io);
+        finished.store(true, .release);
+    }
+};
+
+test "watch: stop: a running handler finishes, a listener ends after what it has queued" {
+    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
+    defer topics.deinit();
+    const w = try newWatch(&topics, "t", &.{});
+    defer w.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    const l = try w.listen(&c, .{});
+    defer l.close();
+    Gate.entered = .unset;
+    Gate.open = .unset;
+    Gate.finished.store(false, .release);
+    w.setHandler(null, .{ .timeout = null }, Gate.handle);
+    try w._startWorker();
+    w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = "a" });
+    w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = "b" });
+    try Gate.entered.wait(io);
+    w.stop();
+    try std.testing.expectEqual(root.Status.stopped, w.status());
+    // The handler was not canceled by the stop: it ends its event.
+    Gate.open.set(io);
+    while (!Gate.finished.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    // The listener still has both events, then the end.
+    try std.testing.expectEqualStrings("a", (try l.next(&c)).?.data);
+    try std.testing.expectEqualStrings("b", (try l.next(&c)).?.data);
+    try std.testing.expect((try l.next(&c)) == null);
+    try std.testing.expectError(error.Stopped, w.listen(&c, .{}));
+}

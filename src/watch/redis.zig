@@ -521,13 +521,17 @@ pub fn startStream(w: *Watch) !void {
         made += 1;
     }
     if (cfg.group) |g| {
-        if (g.ack == .manual) w.ack_hook = .{ .ctx = r, .call = StreamReader.ackCall };
+        const hook: root.AckHook = .{ .ctx = r, .call = StreamReader.ackCall };
+        if (g.ack == .manual) w.setAckHooks(hook, null) else w.setAckHooks(null, hook);
     }
+    errdefer w.setAckHooks(null, null);
     try placement.concurrent(&w.group, w.io, .local, streamTask, .{r});
 }
 
 fn streamTask(r: *StreamReader) std.Io.Cancelable!void {
     defer r.destroy();
+    // First: nothing queues an ack into `r` once it is going.
+    defer r.w.setAckHooks(null, null);
     const w = r.w;
     w.reader_task = placement.currentTask(r.io);
     var attempt: u32 = 0;

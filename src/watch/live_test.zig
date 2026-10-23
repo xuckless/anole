@@ -304,8 +304,7 @@ test "watch live: redis: a group redelivers its pending entries before new ones,
         _ = parts.next();
         _ = parts.next();
         const position = parts.next().?;
-        const hook = w.ack_hook.?;
-        try hook.call(hook.ctx, "anole_stream_g", position);
+        try w.ackEntry("anole_stream_g", position);
         // Wait for the XACK to be sent: the pending count falls to 2.
         for (0..4000) |_| {
             const pending = try r.command(&c, .{ "XPENDING", "anole_stream_g", "g1" });

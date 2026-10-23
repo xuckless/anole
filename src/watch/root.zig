@@ -240,8 +240,7 @@ pub const Event = struct {
     /// Redis stream group with `ack = .manual`: XACK this entry (queued;
     /// never waits).
     pub fn ack(self: *const Event) error{ OutOfMemory, Unsupported }!void {
-        const hook = self.watch.ack_hook orelse return error.Unsupported;
-        try hook.call(hook.ctx, self.channel, self.position orelse return error.Unsupported);
+        return self.watch.ackEntry(self.channel, self.position orelse return error.Unsupported);
     }
 
     /// A copy of the event in `arena`, everything it points to included.
@@ -339,8 +338,11 @@ const Owned = struct {
     }
 };
 
-/// What the outcome of one event for the reader says.
-pub const Outcome = enum { ok, failed };
+/// What the outcome of one event for the reader says: `.ok` the handler
+/// (if any) succeeded, `.failed` it failed, `.deferred` it runs on its own
+/// task (concurrency > 1), which acks a stream group's entry itself when it
+/// succeeds.
+pub const Outcome = enum { ok, failed, deferred };
 
 const TargetRt = struct {
     kind: union(enum) {
@@ -373,7 +375,12 @@ pub const Watch = struct {
     arena: std.heap.ArenaAllocator,
     event_seq: std.atomic.Value(u64) = .init(0),
     position_text: ?[]u8 = null,
+    /// Stream groups: `ack_hook` for `ack = .manual` (`Event.ack`),
+    /// `auto_ack_hook` for `.auto` with handlers on their own tasks. Both
+    /// under `ack_lock`, cleared by the reader before it goes.
     ack_hook: ?AckHook = null,
+    auto_ack_hook: ?AckHook = null,
+    ack_lock: std.atomic.Mutex = .unlocked,
     /// The server's drain.
     drain_hook: dusty.DrainHooks.Hook = .{ .callback = onDrain },
     drain_hooks: ?*dusty.DrainHooks = null,
@@ -871,6 +878,40 @@ pub const Watch = struct {
         };
     }
 
+    // -- acks ---------------------------------------------------------------
+
+    /// The stream reader's hooks (both null: none, before it goes away).
+    pub fn setAckHooks(self: *Watch, manual: ?AckHook, auto: ?AckHook) void {
+        while (!self.ack_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.ack_lock.unlock();
+        self.ack_hook = manual;
+        self.auto_ack_hook = auto;
+    }
+
+    /// Whether the entries are acked by hand (`Event.ack`).
+    pub fn manualAck(self: *Watch) bool {
+        while (!self.ack_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.ack_lock.unlock();
+        return self.ack_hook != null;
+    }
+
+    /// `Event.ack` / `anole_watch_ack`: queues an XACK. Never waits.
+    pub fn ackEntry(self: *Watch, key: []const u8, id: []const u8) error{ OutOfMemory, Unsupported }!void {
+        while (!self.ack_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.ack_lock.unlock();
+        const hook = self.ack_hook orelse return error.Unsupported;
+        return hook.call(hook.ctx, key, id);
+    }
+
+    /// A handler on its own task succeeded: the automatic ack.
+    fn autoAck(self: *Watch, ev: *const Event) void {
+        const id = ev.position orelse return;
+        while (!self.ack_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.ack_lock.unlock();
+        const hook = self.auto_ack_hook orelse return;
+        hook.call(hook.ctx, ev.channel, id) catch {};
+    }
+
     // -- the handler ------------------------------------------------------
 
     fn runHandler(self: *Watch, h: HandlerSlot, ev: *Event) Outcome {
@@ -890,7 +931,7 @@ pub const Watch = struct {
             self.releaseSlot();
             return .failed;
         };
-        return .ok;
+        return .deferred;
     }
 
     fn releaseSlot(self: *Watch) void {
@@ -905,7 +946,7 @@ pub const Watch = struct {
             owned.destroy(self.gpa);
             self.releaseSlot();
         }
-        _ = self.callHandler(h, &owned.ev);
+        if (self.callHandler(h, &owned.ev) == .ok) self.autoAck(&owned.ev);
     }
 
     fn callHandler(self: *Watch, h: HandlerSlot, ev: *Event) Outcome {
