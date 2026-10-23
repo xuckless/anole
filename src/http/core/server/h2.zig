@@ -324,9 +324,14 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.unflushed_finishes = 0;
             }
 
+            /// Wakes every waiter on `write_gen`: the writer, and any
+            /// handler waiting for its stream's first DATA frame or end
+            /// (`BodyReader.streamFn`). Waking one could hand the kick to
+            /// such a reader, which finds nothing and waits again, while
+            /// the writer sleeps on with a frame another task queued.
             fn kickWriter(conn: *Conn) void {
                 _ = conn.write_gen.fetchAdd(1, .release);
-                conn.io.futexWake(u32, &conn.write_gen.raw, 1);
+                conn.io.futexWake(u32, &conn.write_gen.raw, std.math.maxInt(u32));
             }
 
             fn lock(conn: *Conn) void {
@@ -1555,7 +1560,8 @@ pub fn Engine(comptime Ctx: type) type {
                         if (reset) return self.fail(error.ConnectionResetByPeer);
                         if (q) |queue| break :blk queue;
                         if (done) return error.EndOfStream;
-                        // A DATA frame or the end wakes the writer generation.
+                        // A DATA frame or the end wakes the writer generation
+                        // (`kickWriter` wakes every waiter, the writer too).
                         const gen = conn.write_gen.load(.acquire);
                         conn.lock();
                         const ready = stream.body != null or stream.body_done or stream.reset;

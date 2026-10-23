@@ -814,3 +814,90 @@ test "WebSocket over HTTP/2: the selected subprotocol and extra headers ride on 
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("a", try client.nextFrame(&op, &buf));
 }
+
+var parked_socket: std.atomic.Value(?*websocket.Socket) = .init(null);
+
+fn park(req: *dusty.Request, res: *dusty.Response) !void {
+    var ws = (try websocket.upgrade(req, res, .{})) orelse {
+        res.status = .bad_request;
+        return;
+    };
+    defer ws.deinit();
+    parked_socket.store(&ws, .release);
+    defer parked_socket.store(null, .release);
+    // Reads only: everything this socket gets comes from another
+    // connection's task.
+    while (true) {
+        const msg = ws.receive() catch return;
+        if (msg.type == .close) return;
+    }
+}
+
+fn poke(req: *dusty.Request, res: *dusty.Response) !void {
+    var ws = (try websocket.upgrade(req, res, .{})) orelse {
+        res.status = .bad_request;
+        return;
+    };
+    defer ws.deinit();
+    while (true) {
+        const msg = ws.receive() catch return;
+        switch (msg.type) {
+            .text, .binary => {
+                const other = parked_socket.load(.acquire) orelse return error.NoParkedSocket;
+                try other.send(.text, "from another connection");
+                try ws.send(.text, "sent");
+            },
+            else => return,
+        }
+    }
+}
+
+test "WebSocket over HTTP/2: a message from another connection's task goes out without the peer sending anything" {
+    // A socket that only waits got nothing until its own client sent
+    // something: its handler, waiting for the stream's first DATA frame,
+    // waited on the writer's wake word and took the one wake the other
+    // task's send gave, so the writer slept on.
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/park", park);
+    server.router.get("/poke", poke);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var a: Client = undefined;
+    try a.init(io, server.address.ip);
+    defer a.deinit();
+    a.path = "/park";
+    try a.open();
+    try std.testing.expectEqual(@as(u16, 200), a.status);
+
+    var b: Client = undefined;
+    try b.init(io, server.address.ip);
+    defer b.deinit();
+    b.path = "/poke";
+    try b.open();
+    try std.testing.expectEqual(@as(u16, 200), b.status);
+
+    // The parked handler has run once its 200 is in.
+    while (parked_socket.load(.acquire) == null) try io.sleep(.fromMilliseconds(1), .awake);
+
+    var back: [256]u8 = undefined;
+    var op: wsc.Opcode = undefined;
+    for (0..3) |_| {
+        try b.sendFrame(.text, "go");
+        try std.testing.expectEqualStrings("sent", try b.nextFrame(&op, &back));
+        try std.testing.expectEqualStrings("from another connection", try a.nextFrame(&op, &back));
+    }
+}
