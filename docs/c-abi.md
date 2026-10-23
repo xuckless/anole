@@ -374,6 +374,8 @@ Bindings may switch on it; tokens are only ever added.
 | `NoConsumer`, `ConsumerWithoutExecutor` | `ANOLE_E_STATE` | `anole_server_open` / `anole_server_start` |
 | `NotRunning`, `NoTlsListener` | `ANOLE_E_STATE` | reload, publish |
 | `UnknownCheck` | `ANOLE_E_INVALID` | `anole_server_set_ready` |
+| `InvalidEnvironmentVariable`, `DeploymentUnavailable`, `ProxyProtocolNoPeers` | `ANOLE_E_CONFIG` | `anole_server_create` (`ANOLE_ENV`, `ANOLE_DEPLOYMENT`, `PORT`; `deployment` lambda; `proxy_protocol` with an empty `proxy.trusted`) |
+| `UnknownEnvironment`, `InvalidEnvFile` | `ANOLE_E_INVALID`, `ANOLE_E_CONFIG` | `anole_dotenv_read` |
 | `AddressInUse`, `AddressNotAvailable`, `AccessDenied`, `TooManyOpenFiles`, `SystemResources` | `ANOLE_E_SYSTEM` | binds, threads, files (errno set) |
 | `CertificateFileUnreadable`, `KeyFileUnreadable`, `ClientCaFileUnreadable` | `ANOLE_E_SYSTEM` | TLS files (errno set) |
 | `InvalidCertificate`, `InvalidKey`, `KeyMismatch`, `InvalidClientCa` | `ANOLE_E_INVALID` from a reload, `ANOLE_E_CONFIG` from start | TLS contents |
@@ -545,8 +547,12 @@ changes the server's own certificate only; it re-reads the client CA source
 the configuration names (`client_ca_file`, `client_ca_dir` or the system
 store again; `client_ca_pem` as given).
 
-Behind a proxy, `proxy.trusted_hops` says how many proxies in front to
-trust for `X-Forwarded-For` (the client's address in `remote_addr`), with
+Behind a proxy, `deployment` (`"behind_proxy"`, `"anole_lb"`, `"platform"`)
+and `proxy.trusted` (addresses, CIDR networks, `"loopback"`, `"private"`,
+`"link_local"`) say which peers' `X-Forwarded-For` to read: the client's
+address in `remote_addr` is the rightmost address in it that is not trusted
+([config.md](config.md#deployment)). `proxy.trusted_hops` is the fixed-count
+alternative (how many proxies in front), with
 `proxy.trust_forwarded_proto` (default true: `X-Forwarded-Proto` decides
 `ANOLE_REQ_SECURE`) and `proxy.trust_forwarded_host` (default false). A
 listener's `proxy_protocol` expects a PROXY protocol (v1 or v2) header on
@@ -564,6 +570,39 @@ for port 0), `udp_port` (HTTP/3's, 0 when the listener serves none), `flags`
 `error_errno`. Node's `server.address()` and an EADDRINUSE error are built
 from it.
 
+## Environment and .env
+
+`environment` ("development" or "production") and `deployment` are resolved
+once, at `anole_server_create`: the key, else `ANOLE_ENV` / `ANOLE_DEPLOYMENT`
+in the process environment, else production and standalone. libanole reads
+no `.env` file itself and treats a build without `environment` as
+production, so a binding that leaves it out gets JSON records in its log
+callback. Resolution failures are `ANOLE_E_CONFIG` from `anole_server_create`
+(`InvalidEnvironmentVariable`, `InvalidProxyNetwork`, `DeploymentUnavailable`),
+with the reason in `anole_last_error`. `anole_server_listener` reports the
+filled address and port before start, so a binding sees `$PORT` at once.
+
+`anole_dotenv_read(dir, environment, fn, ud)` reads the `.env` files Anole
+reads for the environment (development: `.env.development.local`,
+`.env.local`, `.env.development`, `.env`; the first file with a key wins;
+`ANOLE_ENV` is never passed on) and calls `fn` once per variable; production
+reads nothing. It does not touch the process environment: the binding sets
+each variable that is not already set, in its language, before
+`anole_server_create`. One parser in every language, so the dialect (quotes,
+multi-line values, comments) and the order are the same everywhere.
+
+- anole-node: `environment` = the option, else `ANOLE_ENV`, else
+  `"production"` when `NODE_ENV === "production"`, else `"development"`; in
+  development call `anole_dotenv_read(root, "development", ...)` and set
+  `process.env[k] = v` when it is undefined; pass `environment` explicitly in
+  the JSON. Next.js loads the same files in the same order itself.
+- anole-py: `environment` = the option, else `ANOLE_ENV`, else
+  `"production"`; in development `os.environ.setdefault(k, v)` per entry; pass
+  it in the JSON.
+
+libanole then sees `ANOLE_DEPLOYMENT`, `ANOLE_PROXY_TRUSTED`, `PORT`,
+`DATABASE_URL`... through `getenv`.
+
 ## Keys and defaults
 
 Every option of Zig's `ServerOptions` has a key here with the same name and
@@ -577,7 +616,7 @@ none.
 | `timeouts.request_ms` | 30000 | `timeouts.request`: the consumer deadline (504); the core gets the longest plus 5 s |
 | `timeouts.read_header_ms` | 10000 | `timeouts.read_header` |
 | `timeouts.write_ms` | 30000 | `timeouts.write`: a write the peer does not take ends the response; replaces the request deadline once a stream or file body has started |
-| `timeouts.keepalive_ms` | 60000 | `timeouts.keepalive` |
+| `timeouts.keepalive_ms` | 75000 | `timeouts.keepalive` |
 | `timeouts.idle_park_ms` | 1000 | `timeouts.idle_park` |
 | `timeouts.shutdown_ms` | 10000 | `timeouts.shutdown` |
 | `limits.body_max` | 1048576 | `limits.body_max` |
@@ -586,7 +625,9 @@ none.
 | `limits.max_connections` | 0 | `limits.max_connections` (0: the open-file limit) |
 | `limits.max_requests_per_connection` | null | `limits.max_requests_per_connection` |
 | `limits.ws_max_message` | 1048576 | `limits.ws_max_message` |
-| `proxy.trusted_hops`, `trust_forwarded_proto`, `trust_forwarded_host` | 0, true, false | `proxy.*` |
+| `proxy.trusted`, `trusted_hops`, `trust_forwarded_proto`, `trust_forwarded_host` | null, 0, true, false | `proxy.*` |
+| `environment`, `deployment`, `error_detail` | null, null, null | `environment`, `deployment`, `error_detail` (null: `ANOLE_ENV` else production; `ANOLE_DEPLOYMENT` else standalone; on in development) |
+| `listeners[].address`, `port`, `proxy_protocol` | null, null, null | `Listener.*` (null: the deployment's default: `127.0.0.1`, 8080 or `$PORT`, off or on under `anole_lb`) |
 | `request.require_host`, `decompress`, `keep_buffers` | true, true, false | `request.*` |
 | `response.write_buffer_size`, `date`, `default_content_type`, `max_header_count`, `brotli_quality` | 16384, true, "text", 64, 5 | `response.*` (`default_content_type` by tag name; null: none) |
 | `http2.*` | 250 streams, ... | `http2.*` (`max_concurrent_streams`, `stream_window`, `stream_window_reading`, `tunnel_window`, `reading_window_budget`, `connection_window`, `max_header_list_size`, `stream_reset_burst`, `stream_reset_rate`, `max_continuations`, `refused_stream_burst`, `refused_stream_rate`, `enable_connect_protocol`, `inline_no_wait`) |
@@ -612,6 +653,7 @@ Zig options with no key, and why:
 | `max_stack_size` | stacks run Anole's native work only, never language handlers |
 | `raise_fd_limit` | always on under the ABI |
 | `signals` | the `ANOLE_SERVER_SIGNALS` flag of `anole_server_create` |
+| `env_files` | the binding reads `.env` files into its language's environment (`anole_dotenv_read`) |
 | `process`, `restart_timeout` | embedded mode: no hand-off, SIGUSR2, LISTEN_FDS or sd_notify |
 | `blocking` | the ABI starts a pool when SQLite is configured |
 | `client` | no outbound client in the ABI |
