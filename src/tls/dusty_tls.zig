@@ -533,6 +533,16 @@ pub const Connection = struct {
         return true;
     }
 
+    /// On a server connection, the name the client asked for in its
+    /// ClientHello (SNI), or null when it sent none. Valid for the
+    /// connection's life.
+    pub fn serverName(self: *const Connection) ?[]const u8 {
+        const sh = self.shared orelse return null;
+        // TLSEXT_NAMETYPE_host_name is 0.
+        const p = c.SSL_get_servername(sh.ssl, 0) orelse return null;
+        return std.mem.span(p);
+    }
+
     /// Frees the SSL, which frees the BIO and the shared state with it.
     pub fn deinit(self: *Connection) void {
         if (self.shared) |sh| c.SSL_free(sh.ssl);
