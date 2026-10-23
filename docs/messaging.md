@@ -165,6 +165,11 @@ fn onEvent(state: *State, msg: *anole.kafka.Msg) !void {
 }
 ```
 
+`msg.bind(Event)` is `msg.json` with the validator: the value mapped field by
+field and checked by `Event`'s `field_rules`; a value that does not fit logs
+one warning (the count and the first problem) and returns
+`error.ValidationFailed`, as NATS's `Msg.bind` does.
+
 `app.kafka` connects when serving starts (`connect_at_start = true` fails the
 start if no broker answers; `/readyz` reports the cluster either way).
 Options (`anole.kafka.Options`): `brokers`, `client_id`, `tls`, `sasl`,
