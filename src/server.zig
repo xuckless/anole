@@ -2715,6 +2715,39 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         // ---- end p3/net ----
 
         // ---- p3/jobs ----
+        const jobs_mod = if (features.jobs) @import("jobs/root.zig") else struct {
+            pub const Options = struct {};
+            pub const Client = void;
+        };
+
+        /// A durable job queue for the handlers, owned by the server
+        /// (`anole.jobs`): its store is a connector made with `postgres`,
+        /// `sqlite` or `redis` (or `.memory`, lost on restart). It starts
+        /// with serving, after its store, and is drained and closed with the
+        /// server. Register handlers with `jobs.handle(&app, Args, .{}, fn)`
+        /// before `run`. Under `deployment = lambda` it only enqueues.
+        pub fn jobs(self: *Self, config: jobs_mod.Options) !*jobs_mod.Client {
+            if (comptime !features.jobs) @compileError("app.jobs needs jobs (-Djobs, on in the web and full profiles)");
+            switch (config.store) {
+                .memory => {},
+                inline else => |store_client| {
+                    var known = false;
+                    for (self.extras.connectors.items) |k| {
+                        if (k.context == @as(*anyopaque, @ptrCast(store_client))) known = true;
+                    }
+                    if (!known) {
+                        std.log.scoped(.anole).err("jobs.store: a client made by this app (app.postgres, app.sqlite or app.redis)", .{});
+                        return error.InvalidOptions;
+                    }
+                },
+            }
+            const j = try jobs_mod.Client.init(self.gpa, self.rt.io(), config);
+            errdefer j.deinit();
+            j.suppress_workers = self.mode.deployment == .lambda;
+            try self.extras.connectors.append(self.arena.allocator(), .of(jobs_mod.Client, j));
+            if (self.extras.connectors_started) try j.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            return j;
+        }
         // ---- end p3/jobs ----
 
         // ---- p3/webhooks ----

@@ -475,6 +475,17 @@ const Lease = struct {
 /// before the call writes).
 pub var test_after_take: if (builtin.is_test) ?*const fn (*pg.Conn) void else void = if (builtin.is_test) null else {};
 
+/// A connection from `Client.session`.
+pub const Session = struct {
+    raw: *pg.Conn,
+    gpa: std.mem.Allocator,
+
+    pub fn close(self: *Session) void {
+        self.raw.deinit();
+        self.gpa.destroy(self.raw);
+    }
+};
+
 /// A PostgreSQL database: the handle in the App state. Its calls take the
 /// request (or an `anole.db.Ctx`) first; see `anole.db`.
 pub const Client = struct {
@@ -824,6 +835,24 @@ pub const Client = struct {
     /// `Listener`): it waits for notifications as long as it is open.
     pub fn listener(self: *Client) !pg.Listener {
         return self.pools.pools[0].pool.newListener();
+    }
+
+    /// A connection of its own, outside the pools, with the pools' settings
+    /// (TLS, login): for session state that must outlive one call, such as
+    /// an advisory lock. `close` it.
+    pub fn session(self: *Client, c: anytype) Error!Session {
+        const pool = &self.pools.pools[0].pool;
+        const conn = self.gpa.create(pg.Conn) catch return error.OutOfMemory;
+        errdefer self.gpa.destroy(conn);
+        conn.* = pg.Conn.openAndAuth(pool._io, pool._allocator, pool._opts.connect, pool._opts.auth) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            else => {
+                var ctx = erase(c);
+                return self.unavailable(&ctx, &self.pools.pools[0], err, null);
+            },
+        };
+        return .{ .raw = conn, .gpa = self.gpa };
     }
 
     /// True when the database answers `SELECT 1` within `ping_timeout`:

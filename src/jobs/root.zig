@@ -22,6 +22,15 @@ pub const Duration = std.Io.Duration;
 pub const Time = anole.db.Time;
 pub const Id = i64;
 
+/// A duration in microseconds, clamped far below overflow (`Duration.max`).
+pub fn micros(d: Duration) i64 {
+    return @intCast(@min(@divFloor(d.nanoseconds, 1000), std.math.maxInt(i64) / 4));
+}
+/// A duration in milliseconds, clamped likewise.
+pub fn millis(d: Duration) i64 {
+    return @intCast(@min(@divFloor(d.nanoseconds, std.time.ns_per_ms), std.math.maxInt(i64) / 4000));
+}
+
 /// Where jobs live.
 pub const Store = union(enum) {
     postgres: *anole.pg.Client,
@@ -44,9 +53,9 @@ pub const Kind = struct {
     attempts: u16 = 20,
     backoff: resilience.Backoff = default_backoff,
     /// A bound on each run; `.max`: none.
-    timeout: Duration = .fromMinutes(15),
+    timeout: Duration = .fromSeconds(900),
 };
-pub const default_backoff: resilience.Backoff = .{ .base = .fromSeconds(15), .multiplier = 2, .max = .fromHours(6), .jitter = .equal };
+pub const default_backoff: resilience.Backoff = .{ .base = .fromSeconds(15), .multiplier = 2, .max = .fromSeconds(21600), .jitter = .equal };
 
 pub const QueueOptions = struct {
     /// 1-64 bytes of [a-z0-9_.-].
@@ -92,9 +101,9 @@ pub const Options = struct {
         manual,
     };
     pub const Keep = struct {
-        completed: Duration = .fromHours(24),
-        dead: Duration = .fromDays(30),
-        cancelled: Duration = .fromDays(7),
+        completed: Duration = .fromSeconds(86400),
+        dead: Duration = .fromSeconds(2592000),
+        cancelled: Duration = .fromSeconds(604800),
     };
     pub const Leader = struct {
         /// auto: advisory_lock on PostgreSQL, lease row on SQLite, SET NX on Redis.
@@ -150,7 +159,7 @@ pub const CronOptions = struct {
     tz: ?[]const u8 = null,
     missed: Missed = .once,
     /// `.all` looks back this far at most.
-    catch_up: Duration = .fromHours(24),
+    catch_up: Duration = .fromSeconds(86400),
     /// Job options for each tick (queue/priority/attempts/timeout; `unique` and `run_at` are set by the runner).
     job: EnqueueOptions = .{},
     pub const Missed = enum { skip, once, all };
@@ -235,6 +244,7 @@ pub const Job = struct {
     client: *Client,
     /// What the handler asked for (`snooze`, `discard`, `retryIn`, `explain`).
     outcome: Outcome = .{},
+    cron_name: ?[]const u8 = null,
 
     pub const Outcome = struct {
         kind: enum { none, snooze, discard, retry_in } = .none,
@@ -253,13 +263,15 @@ pub const Job = struct {
         const result = try dusty.bindJson(T, self.arena, self.args_json, .{});
         switch (result) {
             .ok => |value| return value,
-            else => {
+            .invalid => |found| {
+                const first = found.items[0];
                 self.discard("the job's arguments are invalid");
+                self.explain("{s}: {s}", .{ first.field orelse "", first.code });
                 return error.ValidationFailed;
             },
         }
     }
-    /// The handler then returns normally (`return job.snooze(.fromMinutes(5));`):
+    /// The handler then returns normally (`return job.snooze(.fromSeconds(300));`):
     /// run again later, the attempt not counted.
     pub fn snooze(self: *Job, delay: Duration) void {
         self.outcome = .{ .kind = .snooze, .delay = delay };
@@ -278,153 +290,11 @@ pub const Job = struct {
     }
     /// The cron schedule that made it, or null.
     pub fn cronName(self: *const Job) ?[]const u8 {
-        _ = self;
-        return null;
+        return self.cron_name;
     }
 };
 
-pub const Client = struct {
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    options: Options,
-
-    /// `app.jobs(options)` calls it; outside an app, `init`, `start`, `drain`, `deinit`.
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
-        const self = try gpa.create(Client);
-        self.* = .{ .gpa = gpa, .io = io, .options = options };
-        return self;
-    }
-    pub fn deinit(self: *Client) void {
-        self.gpa.destroy(self);
-    }
-    /// Migrates, loads cron state, starts fetchers, heartbeat, wakes, leader (per `run`).
-    pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
-        _ = self;
-        _ = registry;
-        _ = tracer;
-        _ = health;
-    }
-    /// Stops claiming; running jobs finish by `deadline`, then are put back (J14).
-    pub fn drain(self: *Client, deadline: std.Io.Clock.Timestamp) void {
-        _ = self;
-        _ = deadline;
-    }
-
-    // ---- enqueue (every call takes the request, a Ctx, a *Job or a broker Msg first)
-    /// `args`' type declares `pub const job: Kind`; serialized with std.json.
-    pub fn enqueue(self: *Client, c: anytype, args: anytype, opts: EnqueueOptions) Error!Enqueued {
-        _ = .{ self, c, args, opts };
-        return error.InvalidJob;
-    }
-    /// By kind name and a JSON value (an object, usually). The kind's defaults
-    /// come from `Options.kinds`, else `Kind{ .name }`'s.
-    pub fn enqueueRaw(self: *Client, c: anytype, kind: []const u8, args_json: []const u8, opts: EnqueueOptions) Error!Enqueued {
-        _ = .{ self, c, kind, args_json, opts };
-        return error.InvalidJob;
-    }
-    /// Inside the app's transaction (`*anole.pg.Tx` or `*anole.sqlite.Tx` on
-    /// this store's database); committed with it.
-    pub fn enqueueIn(self: *Client, tx: anytype, c: anytype, args: anytype, opts: EnqueueOptions) Error!Enqueued {
-        _ = .{ self, tx, c, args, opts };
-        return error.InvalidJob;
-    }
-    pub fn enqueueRawIn(self: *Client, tx: anytype, c: anytype, kind: []const u8, args_json: []const u8, opts: EnqueueOptions) Error!Enqueued {
-        _ = .{ self, tx, c, kind, args_json, opts };
-        return error.InvalidJob;
-    }
-    /// Up to 1000 jobs in one round trip.
-    pub fn enqueueMany(self: *Client, c: anytype, items: []const Item) Error![]Enqueued {
-        _ = .{ self, c, items };
-        return error.InvalidJob;
-    }
-    pub const Item = struct { kind: []const u8, args_json: []const u8, opts: EnqueueOptions = .{} };
-
-    // ---- workers
-    /// Runs `handler` for every job of `Args`' kind once serving starts.
-    /// `handler` is `fn (*Job, Args) !void` or `fn (*App, *Job, Args) !void`
-    /// (`server` is the `*anole.Server(App)`). Register before `run`/`start`.
-    pub fn handle(self: *Client, server: anytype, comptime Args: type, opts: HandleOptions, comptime handler: anytype) !void {
-        _ = .{ self, server, opts, handler };
-        if (@TypeOf(Args.job) != Kind) @compileError(@typeName(Args) ++ " needs `pub const job: anole.jobs.Kind = .{ .name = \"...\" }`");
-        return error.InvalidOptions;
-    }
-    /// The same by name, args as JSON text: `fn (*Job) !void` / `fn (*App, *Job) !void`.
-    pub fn handleRaw(self: *Client, server: anytype, kind: Kind, opts: HandleOptions, comptime handler: anytype) !void {
-        _ = .{ self, server, kind, opts, handler };
-        return error.InvalidOptions;
-    }
-
-    /// Marks `job` completed inside `tx` (PostgreSQL/SQLite): exactly once
-    /// with the handler's own writes.
-    pub fn completeIn(self: *Client, tx: anytype, job: *Job) Error!void {
-        _ = .{ self, tx, job };
-        return error.InvalidJob;
-    }
-
-    // ---- cron
-    pub fn cron(self: *Client, name: []const u8, spec: []const u8, args: anytype, opts: CronOptions) !void {
-        _ = .{ self, name, spec, args, opts };
-        return error.InvalidOptions;
-    }
-    pub fn cronRaw(self: *Client, name: []const u8, spec: []const u8, kind: []const u8, args_json: []const u8, opts: CronOptions) !void {
-        _ = .{ self, name, spec, kind, args_json, opts };
-        return error.InvalidOptions;
-    }
-
-    // ---- admin
-    pub fn get(self: *Client, c: anytype, id: Id) Error!?JobInfo {
-        _ = .{ self, c, id };
-        return error.InvalidJob;
-    }
-    pub fn list(self: *Client, c: anytype, filter: Filter) Error![]JobInfo {
-        _ = .{ self, c, filter };
-        return error.InvalidJob;
-    }
-    pub fn counts(self: *Client, c: anytype) Error![]Count {
-        _ = .{ self, c };
-        return error.InvalidJob;
-    }
-    /// dead, cancelled, retrying or scheduled -> available now; an exhausted
-    /// job gets one more attempt. False: not in such a state.
-    pub fn retry(self: *Client, c: anytype, id: Id) Error!bool {
-        _ = .{ self, c, id };
-        return error.InvalidJob;
-    }
-    /// scheduled/available/retrying -> cancelled; running -> cancelled, and
-    /// its run is canceled. False: finished already.
-    pub fn cancel(self: *Client, c: anytype, id: Id) Error!bool {
-        _ = .{ self, c, id };
-        return error.InvalidJob;
-    }
-    /// Finished jobs only (completed, dead, cancelled).
-    pub fn delete(self: *Client, c: anytype, id: Id) Error!bool {
-        _ = .{ self, c, id };
-        return error.InvalidJob;
-    }
-    pub fn cronList(self: *Client, c: anytype) Error![]CronInfo {
-        _ = .{ self, c };
-        return error.InvalidJob;
-    }
-    /// Enqueues the schedule's job now (unique key `cron:<name>:manual:<now ms>`).
-    pub fn cronTrigger(self: *Client, c: anytype, name: []const u8) Error!Enqueued {
-        _ = .{ self, c, name };
-        return error.InvalidJob;
-    }
-    /// GET <prefix>/jobs, /jobs/:id, /counts, /cron; POST /jobs/:id/retry,
-    /// /jobs/:id/cancel, /cron/:name/trigger; DELETE /jobs/:id. JSON only.
-    /// Mount it behind your own authentication.
-    pub fn adminRoutes(self: *Client, group: anytype) void {
-        _ = .{ self, group };
-    }
-
-    // ---- tests (run = .manual)
-    /// One round: leader, cron, stage, rescue, prune, then claims and runs
-    /// every due job of every handled kind, until none is due at the clock's now.
-    pub fn step(self: *Client, c: anytype) Error!StepReport {
-        _ = .{ self, c };
-        return error.InvalidJob;
-    }
-};
+pub const Client = @import("client.zig").Client;
 
 /// The DDL for apps that migrate themselves (`migrate = false`).
 pub fn sql(comptime dialect: enum { postgresql, sqlite }, table_prefix: []const u8, arena: std.mem.Allocator) ![]const u8 {
@@ -447,10 +317,16 @@ pub const testing = struct {
             return .{ .context = self, .now = read };
         }
         pub fn advance(self: *FakeClock, d: Duration) void {
-            _ = self.ms.fetchAdd(@divFloor(d.nanoseconds, std.time.ns_per_ms), .acq_rel);
+            _ = self.ms.fetchAdd(millis(d), .acq_rel);
         }
         pub fn set(self: *FakeClock, t: Time) void {
             self.ms.store(@divFloor(t.us, 1000), .release);
         }
     };
 };
+
+test {
+    _ = @import("conformance_test.zig");
+    _ = @import("unique.zig");
+    _ = @import("../cron/root.zig");
+}
