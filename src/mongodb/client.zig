@@ -21,6 +21,7 @@ const sdam = @import("sdam.zig");
 const uri = @import("uri.zig");
 const scram = @import("scram.zig");
 const conn_mod = @import("connection.zig");
+const dynamic_mod = @import("dynamic.zig");
 
 const observe = @import("../observe/root.zig");
 const coll_mod = @import("collection.zig");
@@ -142,6 +143,15 @@ pub const Query = struct {
     /// `Client.collection`, with the options.
     pub fn collection(self: Query, name: []const u8) Collection {
         return self.client.collection(name).with(self.options);
+    }
+
+    /// Runs `op` ("find", "insertOne"... as `anole.mongodb.dynamic.Op`) on
+    /// `collection_name` of the default database with documents known only at
+    /// run time (what the C ABI passes), the context first like every other
+    /// call: `anole.mongodb.dynamic.run` with these options.
+    pub fn dynamic(self: Query, c: *shared.Ctx, op: dynamic_mod.Op, collection_name: []const u8, docs: []const bson.Document) Error!dynamic_mod.Result {
+        const database = self.db(self.client.default_database);
+        return dynamic_mod.run(database.collection(collection_name), database, c, op, docs);
     }
 };
 

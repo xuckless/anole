@@ -487,7 +487,7 @@ fn task(x: *Exec, q: *Query) std.Io.Cancelable!void {
                 .query => if (with.table(&ctx, q.sql, q.params)) |t| {
                     answer.table = t;
                 } else |err| answer.failed(&ctx, err),
-                .exec => if (with.run(&ctx, q.sql, q.params)) |ch| {
+                .exec => if (with.execValues(&ctx, q.sql, q.params)) |ch| {
                     answer.changes = ch;
                 } else |err| answer.failed(&ctx, err),
             }
@@ -974,7 +974,7 @@ const AnyTx = union(enum) {
     fn run(a: *AnyTx, ctx: *db.Ctx, sql: []const u8, values: []const db.Value, opts: db.QueryOptions) anyerror!db.Changes {
         switch (a.*) {
             inline else => |*tx, tag| if (comptime @field(features, @tagName(tag))) {
-                return tx.with(opts).run(ctx, sql, values);
+                return tx.with(opts).execValues(ctx, sql, values);
             } else unreachable,
         }
     }

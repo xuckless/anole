@@ -202,6 +202,8 @@ that does not wait for answers only its caller could give.
 | `.tls = .{ .ca = .{ .file = .{ .path = "ca.pem" } } }` | `.tls = .{ .ca = .{ .file = "ca.pem" } }` (`anole.Ca`) |
 | `name: []const u8 = "postgres"` | `name: ?[]const u8 = null` (the same default label) |
 | `sqlite.Client.execScript(sql)` | `execScript(&ctx, sql)`; `pg.Client.execScript(&ctx, sql)` is new (both unbounded) |
+| `pg`/`sqlite` `Query.run(req, sql, values)`, `Tx.run` | `execValues` (`table` keeps its name) |
+| `anole.mongodb.dynamic.run(collection, database, ctx, op, docs)` | still there; `app.mongodb.with(opts).dynamic(ctx, op, "users", docs)` takes the context first |
 | `max_connections = 0` | refused at init with `error.InvalidOptions` on PostgreSQL, Redis and MongoDB |
 
   New fields: `connect_at_start` and `ping_timeout` on MongoDB,
@@ -211,7 +213,7 @@ that does not wait for answers only its caller could give.
 - **Leaving a transaction open is caught on more paths.** `iterate` that
   leaves one, and a connection from `acquire` given back inside one, are
   rolled back and logged, as plain calls already were.
-  `Tx.table`, `Tx.run` and `Tx.with(options)` exist on both SQL
+  `Tx.table`, `Tx.execValues` and `Tx.with(options)` exist on both SQL
   connectors; a finished SQLite `Tx` fails with `error.Database` instead of
   asserting.
 - **Role switches inside functions under `.auto`.** PostgreSQL does not

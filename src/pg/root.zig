@@ -1117,7 +1117,7 @@ pub const Query = struct {
     /// Runs `sql` with parameters known only at run time; the rows it
     /// changed (`last_insert_rowid` is 0: use `RETURNING` with `table`).
     /// Without parameters, several statements may go in one call.
-    pub fn run(self: Query, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
+    pub fn execValues(self: Query, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
         return self.db.call(c, internal.callTimeout(self.opts.timeout, self.db.timeout), null, sql, RunJob{ .values = values, .prepare = self.opts.prepare });
     }
 };
@@ -1199,9 +1199,9 @@ pub const Tx = struct {
         return self.with(.{}).table(c, sql, values);
     }
 
-    /// `Query.run` on the transaction's connection.
-    pub fn run(self: *Tx, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
-        return self.with(.{}).run(c, sql, values);
+    /// `Query.execValues` on the transaction's connection.
+    pub fn execValues(self: *Tx, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
+        return self.with(.{}).execValues(c, sql, values);
     }
 
     /// Commits. A transaction that already failed (a statement of it
@@ -1308,7 +1308,7 @@ pub const TxQuery = struct {
         return self.tx.db.call(c, t, self.tx, sql, TableJob{ .values = values, .prepare = self.opts.prepare });
     }
 
-    pub fn run(self: TxQuery, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
+    pub fn execValues(self: TxQuery, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
         const t = try self.ready(c);
         return self.tx.db.call(c, t, self.tx, sql, RunJob{ .values = values, .prepare = self.opts.prepare });
     }

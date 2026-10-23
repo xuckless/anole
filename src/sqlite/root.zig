@@ -133,7 +133,7 @@ pub const Blob = struct {
 };
 
 /// A value whose type is known only at run time (`anole.db.Value`): a
-/// parameter of `table` and `run`, or a cell of a `Table`. A bool binds as
+/// parameter of `table` and `execValues`, or a cell of a `Table`. A bool binds as
 /// 1 or 0; cells are never bools.
 pub const Value = db.Value;
 
@@ -552,7 +552,7 @@ pub const Query = struct {
     /// Runs a statement on the writer and says what it changed: `exec` with
     /// the last inserted rowid too, `params` as for `table`. With no
     /// `params`, `sql` may hold several statements, run in order.
-    pub fn run(q: Query, cx: anytype, sql: []const u8, params: []const Value) Error!Changes {
+    pub fn execValues(q: Query, cx: anytype, sql: []const u8, params: []const Value) Error!Changes {
         return q.call(.run, void, cx, sql, params);
     }
 
@@ -691,9 +691,9 @@ pub const Tx = struct {
         return tx.with(.{}).table(cx, sql, values);
     }
 
-    /// `Query.run` inside the transaction.
-    pub fn run(tx: *Tx, cx: anytype, sql: []const u8, values: []const Value) Error!Changes {
-        return tx.with(.{}).run(cx, sql, values);
+    /// `Query.execValues` inside the transaction.
+    pub fn execValues(tx: *Tx, cx: anytype, sql: []const u8, values: []const Value) Error!Changes {
+        return tx.with(.{}).execValues(cx, sql, values);
     }
 
     /// Commits and gives the connection back; `deinit` after it does
@@ -793,7 +793,7 @@ pub const TxQuery = struct {
         return q.go(cx, .table, void, sql, values);
     }
 
-    pub fn run(q: TxQuery, cx: anytype, sql: []const u8, values: []const Value) Error!Changes {
+    pub fn execValues(q: TxQuery, cx: anytype, sql: []const u8, values: []const Value) Error!Changes {
         return q.go(cx, .run, void, sql, values);
     }
 

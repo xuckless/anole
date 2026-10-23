@@ -155,12 +155,12 @@ test "sqlite: table and run, with values known only at run time; cached on a pin
         const ctx = &s.ctx;
         const q = db.with(.{});
         // Several statements with no parameters.
-        const made = try q.run(ctx, schema ++ "CREATE TABLE kv (k TEXT, v);", &.{});
+        const made = try q.execValues(ctx, schema ++ "CREATE TABLE kv (k TEXT, v);", &.{});
         try testing.expectEqual(@as(u64, 0), made.changes);
-        const ins = try q.run(ctx, "INSERT INTO notes (title, done) VALUES (?, ?)", &.{ .{ .text = "first" }, .{ .int = 1 } });
+        const ins = try q.execValues(ctx, "INSERT INTO notes (title, done) VALUES (?, ?)", &.{ .{ .text = "first" }, .{ .int = 1 } });
         try testing.expectEqual(@as(u64, 1), ins.changes);
         try testing.expectEqual(@as(i64, 1), ins.last_insert_rowid);
-        _ = try q.run(ctx, "INSERT INTO kv VALUES (?, ?), (?, ?), (?, ?), (?, ?)", &.{
+        _ = try q.execValues(ctx, "INSERT INTO kv VALUES (?, ?), (?, ?), (?, ?), (?, ?)", &.{
             .{ .text = "f" }, .{ .float = 1.5 },
             .{ .text = "b" }, .{ .blob = "\x00\x01" },
             .{ .text = "n" }, .null,
@@ -182,7 +182,7 @@ test "sqlite: table and run, with values known only at run time; cached on a pin
         const level = quiet();
         defer testing.log_level = level;
         try testing.expectError(error.Database, q.table(ctx, "SELECT ?", &.{}));
-        try testing.expectError(error.Conflict, q.run(ctx, "INSERT INTO notes (title) VALUES (?)", &.{.{ .text = "first" }}));
+        try testing.expectError(error.Conflict, q.execValues(ctx, "INSERT INTO notes (title) VALUES (?)", &.{.{ .text = "first" }}));
         try testing.expect(anole_db.lastError(ctx) != null);
     }
 
@@ -201,13 +201,13 @@ test "sqlite: table and run, with values known only at run time; cached on a pin
             sc.init(io_);
             defer sc.deinit();
             const ctx = &sc.ctx;
-            _ = try d.with(.{}).run(ctx, schema, &.{});
-            _ = try d.with(.{}).run(ctx, "INSERT INTO notes (title) VALUES (?)", &.{.{ .text = "a" }});
+            _ = try d.with(.{}).execValues(ctx, schema, &.{});
+            _ = try d.with(.{}).execValues(ctx, "INSERT INTO notes (title) VALUES (?)", &.{.{ .text = "a" }});
             const cached: anole_db.QueryOptions = .{ .cache = .{ .ttl = .fromSeconds(60), .tag = "notes" } };
             const sql = "SELECT title FROM notes WHERE id > ?";
             const one = try d.with(cached).table(ctx, sql, &.{.{ .int = 0 }});
             try testing.expectEqualStrings("a", one.rows[0][0].text);
-            _ = try d.with(.{}).run(ctx, "INSERT INTO notes (title) VALUES ('b')", &.{});
+            _ = try d.with(.{}).execValues(ctx, "INSERT INTO notes (title) VALUES ('b')", &.{});
             // From the cache: the write does not show until invalidated.
             try testing.expectEqual(@as(usize, 1), (try d.with(cached).table(ctx, sql, &.{.{ .int = 0 }})).rows.len);
             try testing.expectEqual(anole_db.Source.cache, anole_db.lastSource(ctx).?);
@@ -993,7 +993,7 @@ test "sqlite: Tx.table and Tx.run see the transaction's own writes" {
     _ = try db.exec(ctx, schema, .{});
     var tx = try db.begin(ctx, .{});
     defer tx.deinit();
-    const ch = try tx.run(ctx, "INSERT INTO notes (title) VALUES (?)", &.{.{ .text = "inside" }});
+    const ch = try tx.execValues(ctx, "INSERT INTO notes (title) VALUES (?)", &.{.{ .text = "inside" }});
     try testing.expectEqual(@as(u64, 1), ch.changes);
     const t = try tx.table(ctx, "SELECT title FROM notes", &.{});
     try testing.expectEqual(@as(usize, 1), t.rows.len);

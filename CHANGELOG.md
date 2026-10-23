@@ -75,6 +75,9 @@ Server options, TLS and errors (API hardening; see
   `timeout = null` (`"timeout_ms": 0`) for the old behaviour, or
   `.with(.{ .timeout = .max })` (`ANOLE_DB_TIMEOUT_NONE`) for one call.
   `TxOptions.timeout = null` is the connector's bound, not none.
+- Databases: the run-time pair is `table` and `execValues` (was `run`) on
+  both SQL connectors, and MongoDB's `with(options).dynamic(ctx, op,
+  collection, docs)` takes the context first.
 - Databases, one vocabulary: `anole.sqlite.Options`: `busy_timeout_ms` is
   `busy_timeout` (a Duration), `statement_cache` is `statement_cache_size`
   (`u16`), `readers` is `?u32`; `sqlite.Client.execScript` takes a context

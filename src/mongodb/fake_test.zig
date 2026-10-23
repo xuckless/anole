@@ -376,3 +376,8 @@ test "fake mongod: coalesced and cached reads, invalidation" {
     _ = try users.findOne(Row, &c, .{ .name = "Ada" }, .{});
     try testing.expectEqual(@as(u32, 6), fake.finds.load(.monotonic));
 }
+
+test "mongodb: with(options).dynamic is the dynamic runner with the context first" {
+    const f = &mongodb.Query.dynamic;
+    _ = f;
+}

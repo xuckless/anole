@@ -131,7 +131,7 @@ pub const Ctx = struct {
 };
 
 /// A value whose type is known only at run time: a parameter of a SQL
-/// connector's `table` and `run` (`anole.pg`, `anole.sqlite`), or a cell of
+/// connector's `table` and `execValues` (`anole.pg`, `anole.sqlite`), or a cell of
 /// a `Table`. What the C ABI (`anole_db_*`) and the language bindings pass.
 pub const Value = union(enum) {
     null,

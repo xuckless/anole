@@ -231,7 +231,7 @@ request's arena, so they outlive the call.
 When the columns and parameters are known only at run time (what the C ABI
 and the language bindings do), `with(opts).table(req, sql, params)` returns
 an `anole.db.Table` (column names, type OIDs, rows of `anole.db.Value`) and
-`with(opts).run(req, sql, params)` the rows changed, with `params` a
+`with(opts).execValues(req, sql, params)` the rows changed, with `params` a
 `[]const anole.db.Value`. Values come in PostgreSQL's text format: bool,
 the integer types and float4/float8 are converted, bytea becomes bytes,
 and everything else stays text (numeric exactly, dates as PostgreSQL prints
