@@ -3482,11 +3482,9 @@ pub const GeneratedCodeInfo = struct {
     }
 };
 
-pub const Timestamp = protobuf.wkt.Timestamp;
-
 pub const Duration = protobuf.wkt.Duration;
 
-pub const Empty = protobuf.wkt.Empty;
+pub const Timestamp = protobuf.wkt.Timestamp;
 
 pub const DoubleValue = protobuf.wkt.DoubleValue;
 

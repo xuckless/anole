@@ -1179,7 +1179,7 @@ pub fn build(b: *std.Build) void {
             // google/api/annotations.proto and http.proto come from
             // src/grpc/proto (vendored, Apache-2.0).
             const gen_transcode = pb.RunProtocStep.create(b, target, .{
-                .source_files = &.{ b.path("tests/grpc/proto/transcode.proto"), b.path("tests/grpc/proto/openapi.proto") },
+                .source_files = &.{b.path("tests/grpc/proto/transcode.proto")},
                 .include_directories = &.{ b.path("tests/grpc/proto"), b.path("src/grpc/proto") },
                 .destination_directory = b.path("tests/grpc/gen"),
                 .generator = dep.artifact("protoc-gen-zig"),
@@ -1814,13 +1814,6 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         .imports = &.{.{ .name = "protobuf", .module = o.c.protobuf.? }},
     }));
     // The JSON transcoding test service (google.api.http annotations).
-    // The OpenAPI test service (field_behavior, comments, every proto form).
-    if (f.grpc and o.for_test) mod.addImport("anole_openapi_pb", b.createModule(.{
-        .root_source_file = b.path("tests/grpc/gen/openapitest.pb.zig"),
-        .target = o.target,
-        .optimize = o.optimize,
-        .imports = &.{.{ .name = "protobuf", .module = o.c.protobuf.? }},
-    }));
     if (f.grpc and o.for_test) mod.addImport("anole_transcode_pb", b.createModule(.{
         .root_source_file = b.path("tests/grpc/gen/transcode.pb.zig"),
         .target = o.target,

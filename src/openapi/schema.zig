@@ -700,8 +700,15 @@ fn Page(comptime T: type) type {
 
 test "optional, default, required" {
     const Opt = struct { a: ?u8, b: u8 = 3, c: []const u8 };
-    try expectCompact(Opt, "{\"type\":\"object\",\"required\":[\"c\"],\"properties\":{\"a\":{\"type\":[\"integer\",\"null\"],\"format\":\"uint8\",\"minimum\":0,\"maximum\":255}," ++
-        "\"b\":{\"type\":\"integer\",\"format\":\"uint8\",\"minimum\":0,\"maximum\":255,\"default\":3},\"c\":{\"type\":\"string\"}}}");
+    const text = try written(componentOf(Opt).schema, &.{});
+    defer testing.allocator.free(text);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{});
+    defer parsed.deinit();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(parsed.value, .{}, &out.writer);
+    try testing.expectEqualStrings("{\"type\":\"object\",\"required\":[\"c\"],\"properties\":{\"a\":{\"type\":[\"integer\",\"null\"],\"format\":\"uint8\",\"minimum\":0,\"maximum\":255}," ++
+        "\"b\":{\"type\":\"integer\",\"format\":\"uint8\",\"minimum\":0,\"maximum\":255,\"default\":3},\"c\":{\"type\":\"string\"}}}", out.written());
 }
 
 test "named vs anonymous structs, and a generic's name" {
@@ -761,7 +768,8 @@ test "Doc texts and examples" {
     try testing.expect(std.mem.indexOf(u8, text, "\"description\": \"A documented thing.\"") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"deprecated\": true") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"description\": \"Its id.\"") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "\"id\": 9") != null);
+    // The field's example (9) and the type's example ({"id": 5}), both under "examples".
+    try testing.expect(std.mem.indexOf(u8, text, "\"examples\": [\n        9\n      ]") != null);
     try testing.expect(std.mem.indexOf(u8, text, "\"id\": 5") != null);
 }
 

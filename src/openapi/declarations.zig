@@ -290,8 +290,6 @@ test "Doc: a union's fields are its variants; an enum has none; a type that writ
     try testing.expect(@FieldType(FieldDoc(?u8), "example") == ??u8);
 }
 
-/// A controller with a route of each kind of default status, and one with
-
 test "MiddlewareDoc: security, input and a response for each status" {
     const doc: MiddlewareDoc = .{
         .security_schemes = &.{

@@ -347,6 +347,22 @@ examples/full/main.zig (wiring)
   Licence:  MIT. Copyright (c) 2025 Lukas Lalinsky and contributors
   Source:   https://github.com/lalinsky/dusty
 
+src/openapi/json.zig, declarations.zig, example.zig, schema.zig, page.zig
+  Adapted from zefir's src/openapi/json.zig, openapi.zig, example.zig,
+  schema.zig and the page part of Docs.zig: the JSON tree and writer (a
+  `ref` node added), the Doc / FieldDoc / Example / MiddlewareDoc
+  declarations (Anole's RouteDoc added, the controller types dropped), values
+  as std.json writes them, schemas of Zig types (one schema per type, as
+  components), and the Scalar page (pinned release, Subresource Integrity).
+  Licence:  MIT (text in part C). Copyright (c) 2026 vkiryakov
+  Source:   https://github.com/vkiryakov/zefir, commit dbcc967
+
+src/grpc/proto/google/api/field_behavior.proto
+  The google.api.field_behavior option (REQUIRED, OUTPUT_ONLY, INPUT_ONLY),
+  for the OpenAPI document; protoc reads it through `addProtoGen`'s include
+  path, beside annotations.proto and http.proto.
+  Licence:  Apache License 2.0 (text in part E). Copyright 2026 Google LLC
+  Source:   https://github.com/googleapis/googleapis (google/api)
 
 C. MIT licence text (applies to every MIT component above)
 -----------------------------------------------------------

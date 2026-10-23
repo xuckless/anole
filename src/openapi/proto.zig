@@ -846,8 +846,8 @@ fn topLevel(comptime path: []const u8) []const u8 {
 
 const testing = std.testing;
 
-const wpb = @import("anole_openapi_pb");
 const tpb = @import("anole_transcode_pb");
+const wpb = tpb;
 const Widgets = wpb.Widgets(server.Call, anyerror);
 const Library = tpb.Library(server.Call, anyerror);
 
@@ -940,7 +940,7 @@ test "Connect and transcoded forms per method" {
     // Unannotated unary: Connect POST only. NO_SIDE_EFFECTS: POST and GET.
     const make = comptime findOp(ops, "Widgets_Make").?;
     try testing.expectEqual(operation.Verb.post, make.verb);
-    try testing.expectEqualStrings("/openapitest.Widgets/Make", make.path);
+    try testing.expectEqualStrings("/transcode.Widgets/Make", make.path);
     try testing.expect(!make.annotated);
     const peek = comptime findOp(ops, "Widgets_Peek").?;
     try testing.expect(peek.no_side_effects);
@@ -967,7 +967,7 @@ test "Connect and transcoded forms per method" {
     try testing.expect(comptime findOp(ops, "Widgets_Upload") == null);
     try testing.expect(comptime findOp(ops, "Widgets_Watch_connect") == null);
     // The service tag and comment.
-    try testing.expectEqualStrings("openapitest.Widgets", comptime serviceTag(Widgets));
+    try testing.expectEqualStrings("transcode.Widgets", comptime serviceTag(Widgets));
     try testing.expectEqualStrings("Widgets of the shop.", comptime serviceDoc(Widgets).?);
 }
 

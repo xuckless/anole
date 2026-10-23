@@ -141,12 +141,12 @@ fn compact(node: json.Node, w: *std.Io.Writer) std.Io.Writer.Error!void {
 }
 
 const Kind = enum { a, b };
-const Item = struct { id: u64, name: []const u8, kind: Kind = .b, tags: []const []const u8 = &.{}, note: ?[]const u8 = null, pub const x = 1 };
+const Sample = struct { id: u64, name: []const u8, kind: Kind = .b, tags: []const []const u8 = &.{}, note: ?[]const u8 = null };
 const Shape = union(enum) { circle: u32, none };
 
 test "value: the bytes std.json writes" {
-    const item: Item = .{ .id = 7, .name = "a\"b", .tags = &.{ "x", "y" } };
-    const node = comptime value(Item, item, .output, "Item");
+    const item: Sample = .{ .id = 7, .name = "a\"b", .tags = &.{ "x", "y" } };
+    const node = comptime value(Sample, item, .output, "Sample");
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
     try compact(node, &out.writer);
