@@ -510,6 +510,40 @@ pub fn build(b: *std.Build) void {
         b.step(t.name, "Run the tests of the module alone").dependOn(&run_sub.step);
     }
 
+    // test-compile-errors: routes and calls the compiler must refuse, each a
+    // tiny file in tests/compile_errors with the message it must give.
+    {
+        const cases = [_]struct { file: []const u8, contains: []const u8 }{
+            .{ .file = "01_wildcard_not_last", .contains = "anole: route GET /a/*x/b: a wildcard (*x) must be the last segment" },
+            .{ .file = "02_duplicate_param", .contains = "names the parameter \"id\" twice" },
+            .{ .file = "03_query_in_path", .contains = "read the query with req.query, req.bindQuery or anole.In(.{ .query = T }))" },
+            .{ .file = "04_in_path_not_a_param", .contains = "is not a parameter of the route (parameters: id)" },
+            .{ .file = "05_in_optional_path_field", .contains = "a route parameter is always there" },
+            .{ .file = "06_in_body_on_get", .contains = "(use .query, or app.query for the QUERY method)" },
+            .{ .file = "07_in_unknown_key", .contains = "anole.In: unknown key .bdy; the keys are .path, .query, .headers and .body (did you mean .body?)" },
+            .{ .file = "08_cached_on_post", .contains = "it cannot wrap a POST route" },
+            .{ .file = "09_log_tuple_fields", .contains = "for a format string use std.log" },
+            .{ .file = "10_log_reserved_field", .contains = "rename it, e.g. 'user_level'" },
+            .{ .file = "11_invalid_code_grammar", .contains = "e.g. 'users.name_taken'" },
+            .{ .file = "12_rename_on_fallback_type", .contains = "structs, ?T and []const T" },
+        };
+        const ce_step = b.step("test-compile-errors", "Check that bad routes and calls are compile errors with the right message");
+        for (cases) |c| {
+            const obj = b.addObject(.{
+                .name = c.file,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(b.fmt("tests/compile_errors/{s}.zig", .{c.file})),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "anole", .module = anole_mod }},
+                }),
+            });
+            obj.expect_errors = .{ .contains = c.contains };
+            ce_step.dependOn(&obj.step);
+        }
+        test_step.dependOn(ce_step);
+    }
+
     // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
     // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
     if (features.postgres) {
@@ -748,6 +782,21 @@ pub fn build(b: *std.Build) void {
             const run_rest_test = b.addRunArtifact(rest_test);
             run_rest_test.skip_foreign_checks = true;
             test_step.dependOn(&run_rest_test.step);
+            compile_tests_step.dependOn(&rest_test.step);
+            // The same scenario through anole.testing, no socket.
+            const rest_memory_test = b.addTest(.{
+                .name = "rest-memory-test",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/rest_memory_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{ .{ .name = "anole", .module = anole_mod }, .{ .name = "rest", .module = ex_mod } },
+                }),
+            });
+            const run_rest_memory_test = b.addRunArtifact(rest_memory_test);
+            run_rest_memory_test.skip_foreign_checks = true;
+            test_step.dependOn(&run_rest_memory_test.step);
+            compile_tests_step.dependOn(&rest_memory_test.step);
         }
         if (std.mem.eql(u8, ex.name, "sqlite")) {
             const sqlite_test = b.addTest(.{
