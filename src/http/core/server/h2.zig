@@ -508,6 +508,15 @@ pub fn Engine(comptime Ctx: type) type {
             /// handler's hold on the stream goes when it is finished or
             /// aborted.
             detached: ?*Exchange = null,
+            /// `serveStream` is still running this stream's handler (on the
+            /// reader or on its task), which holds the stream: an end of a
+            /// detached or parked response before it returns (a park that
+            /// failed, or a finish or release from inside the handler)
+            /// leaves the handler's hold to it and sets `ended_in_handler`,
+            /// rather than letting go of a stream `serveStream` still
+            /// touches. Executor-local.
+            in_handler: bool = false,
+            ended_in_handler: bool = false,
             /// The response is parked (`Response._park`): bursts of
             /// DATA from whichever task has something to send.
             parked: ?*H2Parked = null,
@@ -1358,6 +1367,8 @@ pub fn Engine(comptime Ctx: type) type {
             server.configureResponse(response);
             var detached = false;
             defer if (!detached) response.deinit();
+            stream.in_handler = true;
+            defer stream.in_handler = false;
             response._request = request;
             request._response = response;
             response._detach_engine = &detach_engine;
@@ -1456,20 +1467,31 @@ pub fn Engine(comptime Ctx: type) type {
 
             log.debug("Received (h2 stream {d}): {f} {s}", .{ stream.id, request.method, request.url });
 
-            server.dispatch(request, response) catch |err| switch (err) {
-                error.ReadFailed => return body_reader.err orelse error.Unexpected,
-                error.WriteFailed => return sink_state.writeErr() orelse error.Unexpected,
-                else => |e| return e,
-            };
+            const dispatched = server.dispatch(request, response);
+            // A detached response is its owner's (or over already, a park
+            // that failed having handled the error), whatever the handler
+            // returned: the stack copy is not written or freed here.
             if (response.detached) |d| {
                 // Finished later (`detach_engine`), from the moved copy;
                 // the stream is held till then.
                 detached = true;
                 conn.lock();
+                defer conn.unlock();
+                // Already over (a park that failed, or a finish or release
+                // from inside the handler): `d` may be gone with the
+                // exchange, and the handler's hold is the caller's to let
+                // go, as for a response written in place.
+                if (stream.ended_in_handler) return .done;
+                // On a task the detach was a park: the park holds the
+                // stream (the task's hold goes to it).
                 stream.detached = exchangeOf(d);
-                conn.unlock();
                 return .detached;
             }
+            dispatched catch |err| switch (err) {
+                error.ReadFailed => return body_reader.err orelse error.Unexpected,
+                error.WriteFailed => return sink_state.writeErr() orelse error.Unexpected,
+                else => |e| return e,
+            };
             try response.write();
             return .done;
         }
@@ -1535,6 +1557,13 @@ pub fn Engine(comptime Ctx: type) type {
             conn.lock();
             defer conn.unlock();
             stream.detached = null;
+            if (stream.in_handler) {
+                // `serveStream` is still in the handler (a park that failed,
+                // or a finish from inside it): it lets go when it returns.
+                stream.ended_in_handler = true;
+                conn.kickWriter();
+                return;
+            }
             stream.task = null;
             stream.release(.handler);
             conn.kickWriter();
@@ -1705,6 +1734,13 @@ pub fn Engine(comptime Ctx: type) type {
                 stream.detached = null;
                 conn.parked_open -= 1;
                 if (conn.parked_open == 0) conn.parked_idle.broadcast(conn.io);
+                if (stream.in_handler) {
+                    // Released from inside the handler: `serveStream` lets
+                    // go when it returns.
+                    stream.ended_in_handler = true;
+                    conn.kickWriter();
+                    return;
+                }
                 // The stream may be freed here, with `self` in its arena.
                 stream.release(.handler);
                 conn.kickWriter();

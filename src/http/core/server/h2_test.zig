@@ -1633,3 +1633,72 @@ test "parked h2: the connection closing with a burst blocked on a full outbox: t
     try std.testing.expect(!ParkProbe.parked.?.begin());
     ParkProbe.parked.?.release();
 }
+
+/// A park that fails inside the handler (the peer reset the stream first):
+/// the park finishes the exchange, the handler returns the error, and the
+/// stream is let go exactly once, by `serveStream`'s caller.
+const FailedPark = struct {
+    var result: ?anyerror = null;
+    var started: std.Io.Event = .unset;
+    var done: std.Io.Event = .unset;
+
+    fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+        const io = req.io;
+        started.set(io);
+        const prev = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(prev);
+        // Wait for the reset (the body reader reports it), so the park
+        // meets a reset stream.
+        const body = req._body_source.?.reader;
+        var polls: usize = 0;
+        while (true) : (polls += 1) {
+            var buf: [1]u8 = undefined;
+            _ = body.readSliceShort(&buf) catch break;
+            if (polls > 10_000) {
+                result = error.Timeout;
+                done.set(io);
+                return error.Timeout;
+            }
+            io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        try res.header("Content-Type", "text/event-stream");
+        var dummy: u8 = 0;
+        const p = res._park(req, .{ .gone = ParkProbe.onGone, .ctx = &dummy }) catch |err| {
+            result = err;
+            done.set(io);
+            return err;
+        };
+        p.release();
+        result = null;
+        done.set(io);
+    }
+};
+
+test "parked h2: a park that fails on a reset stream lets go of the stream once" {
+    const io = std.testing.io;
+    ParkProbe.reset();
+    FailedPark.result = null;
+    FailedPark.done = .unset;
+    FailedPark.started = .unset;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    fx.server.router.get("/live", FailedPark.handle);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const id = try client.request("GET", "/live", null);
+    try ParkProbe.flushClient(&client);
+    try FailedPark.started.wait(io);
+    _ = c.nghttp2_submit_rst_stream(client.session, c.NGHTTP2_FLAG_NONE, id, c.NGHTTP2_CANCEL);
+    try ParkProbe.flushClient(&client);
+    try FailedPark.done.wait(io);
+    try std.testing.expectEqual(@as(?anyerror, error.WriteFailed), FailedPark.result);
+    // The connection serves on (a double release would have broken its
+    // stream count), and the fixture's allocator checks the rest.
+    const next = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(next).body.items);
+    try std.testing.expectEqual(@as(u32, 0), ParkProbe.gone_calls.load(.monotonic));
+}
