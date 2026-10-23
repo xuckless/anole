@@ -1862,7 +1862,7 @@ fn slowAll(plain_port: u16, h3_port: u16, io: std.Io) !void {
     try r4;
 }
 
-test "C ABI: a streamed answer outlives request_ms + 5 s on every protocol" {
+test "capi engine: a streamed answer outlives request_ms + 5 s on every protocol (C ABI)" {
     if (comptime !features.http2 or !features.http3) return error.SkipZigTest;
     const json =
         \\{"executors": 2, "timeouts": {"request_ms": 200, "shutdown_ms": 1000},
