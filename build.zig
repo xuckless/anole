@@ -655,6 +655,18 @@ pub fn build(b: *std.Build) void {
         b.step("test-redis", "Run the Redis tests (live with -Dredis-test-url=redis://...)").dependOn(&run_redis_tests.step);
     }
 
+    // ---- p3/s3 ----
+    // test-s3: the S3 client's tests alone ("s3: ..."), and the C ABI's
+    // storage tests ("capi s3: ..."); with -Ds3-test-url, also against that
+    // server (tests/s3/run.sh).
+    if (features.s3) {
+        const s3_tests = b.addTest(.{ .name = "anole-test-s3", .root_module = tests.root_module, .filters = &.{ "s3: ", "capi s3: " }, .use_llvm = use_llvm });
+        const run_s3_tests = b.addRunArtifact(s3_tests);
+        run_s3_tests.has_side_effects = s3_test_url != null;
+        b.step("test-s3", "Run the S3 tests (live with -Ds3-test-url=http://...)").dependOn(&run_s3_tests.step);
+    }
+    // ---- end p3/s3 ----
+
     // test-capi-engine: the C ABI engine's Zig tests alone (HTTP/2 and
     // HTTP/3 detached answers, the configuration parser).
     {

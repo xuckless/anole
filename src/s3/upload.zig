@@ -278,7 +278,6 @@ pub const Upload = struct {
 
     fn replay(self: *Upload, c: anytype, f: Fail) Error {
         internal.keepError(c, .{ .system = .s3, .class = f.class, .code = f.code, .message = f.message, .table = self.bucket });
-        _ = self;
         return f.err;
     }
 

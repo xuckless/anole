@@ -429,8 +429,6 @@ pub const FakeServer = struct {
         const h = std.fmt.parseInt(u8, text[9..11], 10) catch return null;
         const mi = std.fmt.parseInt(u8, text[11..13], 10) catch return null;
         const s = std.fmt.parseInt(u8, text[13..15], 10) catch return null;
-        var buf: [29]u8 = undefined;
-        _ = buf;
         // Days from civil, as in util.
         const yy: i64 = if (mo <= 2) @as(i64, y) - 1 else y;
         const era = @divFloor(yy, 400);
@@ -520,13 +518,13 @@ pub const FakeServer = struct {
             if (std.mem.startsWith(u8, range, "bytes=")) {
                 const spec = range[6..];
                 const dash = std.mem.indexOfScalar(u8, spec, '-') orelse 0;
-                const start = std.fmt.parseInt(u64, spec[0..dash], 10) catch 0;
+                const first = std.fmt.parseInt(u64, spec[0..dash], 10) catch 0;
                 const end_incl = if (dash + 1 < spec.len) (std.fmt.parseInt(u64, spec[dash + 1 ..], 10) catch o.bytes.len - 1) else o.bytes.len - 1;
-                if (start >= o.bytes.len) return errorXml(res, .range_not_satisfiable, "InvalidRange", "The requested range is not satisfiable");
+                if (first >= o.bytes.len) return errorXml(res, .range_not_satisfiable, "InvalidRange", "The requested range is not satisfiable");
                 const end = @min(end_incl, o.bytes.len - 1);
-                bytes = o.bytes[start .. end + 1];
+                bytes = o.bytes[first .. end + 1];
                 res.status = .partial_content;
-                try res.header("Content-Range", try std.fmt.allocPrint(res.arena, "bytes {d}-{d}/{d}", .{ start, end, o.bytes.len }));
+                try res.header("Content-Range", try std.fmt.allocPrint(res.arena, "bytes {d}-{d}/{d}", .{ first, end, o.bytes.len }));
             }
         }
         if (req.method == .head) {
