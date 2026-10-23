@@ -70,13 +70,26 @@ OpenAPI documents and the `anole` command line.
 
 ### OpenAPI and CLI
 
-- `-Dopenapi` (on in `web` and `full`) and `anole.openapi`, the building
-  blocks of OpenAPI 3.1 documents (schemas of Zig types, protobuf messages
-  and services, the Scalar page). Adapted from zefir.
+- OpenAPI 3.1 (`-Dopenapi`, on in `web` and `full`): `app.openapi(.{})`
+  serves /openapi.json and a Scalar page at /docs in development, built from
+  typed handlers, the validator's rules, middleware (JWT, API keys, RBAC, rate
+  limits, CSRF) and gRPC services (Connect forms and JSON transcoding);
+  `anole.doc(.{ .summary = ... }, handler)` gives a route texts and, for a
+  plain handler, types; `zig build openapi` writes openapi.json and `zig
+  build openapi-check` checks it (`addApp`). Adapted from zefir.
+- `error.OpenApiNameClash`, `OpenApiOutOfDate` and `OpenApiNotBuilt`.
+- `google/api/field_behavior.proto` is bundled (`REQUIRED`, `OUTPUT_ONLY`
+  show in the document).
 - Generated protobuf code carries the `.proto` comments as `_doc`
   declarations (zig-protobuf pinned to xuckless/zig-protobuf e6de363).
-- The `anole` command line (`zig build cli`): `anole new <dir>` makes a
-  project from a template, `anole templates`, `anole version`.
+- The `anole` command line (`zig build cli`; binaries for five targets with
+  SHA256SUMS on each release): `anole new <dir>` and `anole init` make a
+  project from one of five templates (`minimal`, `rest-postgres`, `realtime`,
+  `grpc`, `full`), each with tests, an OpenAPI page and a ready `.env`;
+  `anole templates`, `anole version` ([templates.md](docs/templates.md)).
+- `zig build test -Dtest-filter=<text>` runs only the unit tests whose name
+  contains the text.
+- Fixed: `env.environment()` did not compile in a Debug build (`.Debug`).
 
 ### C ABI
 

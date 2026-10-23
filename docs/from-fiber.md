@@ -245,6 +245,14 @@ name)` read and write the session, and `anole.auth.subject(req)` and
 server, which locals of `main` do. Redis-backed limits and sessions, JWKS
 key sets, OIDC sign-in, CSRF and API keys are in [auth.md](auth.md).
 
+## Swagger and API docs
+
+Fiber's swagger middleware serves a file you keep up to date. In Anole the
+document is made from your handlers' signatures, validation rules and gRPC
+services: `app.openapi(.{})` serves it at `/openapi.json` with a docs page at
+`/docs` in development, and `zig build openapi` writes it for CI. See
+[openapi.md](openapi.md).
+
 ## What is different
 
 **Memory.** Go collects garbage; Zig does not. Each request has an arena,
