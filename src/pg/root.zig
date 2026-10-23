@@ -77,6 +77,7 @@ const resilience = @import("../resilience/root.zig");
 /// types (`Numeric`, `Cidr`) and `listener`.
 pub const driver = @import("anole_pg");
 const pg = driver;
+const NotifyHub = @import("../watch/pg.zig").NotifyHub;
 const dusty_tls = if (has_tls) @import("anole_dusty_tls") else struct {};
 
 const has_tls = features.tls == .boringssl;
@@ -503,6 +504,10 @@ pub const Client = struct {
     store: if (has_tls) @FieldType(pg.TlsConfig, "store") else void = if (has_tls) null else {},
     /// The client certificate, when there is one.
     cert: if (has_tls) ?*dusty_tls.config.CertKeyPair else void = if (has_tls) null else {},
+    /// The one LISTEN connection of this client's `anole.watch`es, made on
+    /// first use (`_notifyHub`).
+    notify_hub: ?*NotifyHub = null,
+    notify_hub_mutex: std.Io.Mutex = .init,
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.postgres` calls it.
@@ -658,7 +663,9 @@ pub const Client = struct {
     /// `deinit` does it then).
     pub fn deinit(self: *Client) void {
         const gpa = self.gpa;
-        // First: a statement still running for the cache holds a connection.
+        // First: the LISTEN connection and its tasks.
+        if (self.notify_hub) |h| h.destroy();
+        // A statement still running for the cache holds a connection.
         self.cache.deinit();
         self.guard.deinit();
         for (self.pools.pools) |*shard| shard.pool.deinit();
@@ -818,6 +825,17 @@ pub const Client = struct {
         var ctx = erase(c);
         const lease = try self.take(&ctx);
         return .{ .db = self, .io = c.io, .lease = lease, .raw = lease.conn };
+    }
+
+    /// The shared LISTEN connection of `anole.watch` (internal): one per
+    /// client, made on first use.
+    pub fn _notifyHub(self: *Client) !*NotifyHub {
+        self.notify_hub_mutex.lockUncancelable(self.io);
+        defer self.notify_hub_mutex.unlock(self.io);
+        if (self.notify_hub) |h| return h;
+        const h = try NotifyHub.create(self);
+        self.notify_hub = h;
+        return h;
     }
 
     /// A connection for `LISTEN`/`NOTIFY`, outside the pools (pg.zig's

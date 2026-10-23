@@ -88,6 +88,7 @@ const observe = @import("../observe/root.zig");
 const resilience = @import("../resilience/root.zig");
 const client_stream = @import("../net/client_stream.zig");
 const ClientStream = client_stream.ClientStream;
+const PubSubHub = @import("../watch/redis.zig").PubSubHub;
 
 const builtin = @import("builtin");
 
@@ -441,6 +442,10 @@ pub const Client = struct {
     /// Reads with `.coalesce` or `.cache` (`with`), and `invalidate` for
     /// kept replies: `app.redis.cache.invalidate(.{ .tag = "profiles" })`.
     cache: db.QueryCache,
+    /// The one SUBSCRIBE connection of this client's `anole.watch`es, made
+    /// on first use (`_pubsubHub`).
+    pubsub_hub: ?*PubSubHub = null,
+    pubsub_hub_mutex: std.Io.Mutex = .init,
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.redis` calls it.
@@ -548,7 +553,9 @@ pub const Client = struct {
     /// `deinit` does it then).
     pub fn deinit(self: *Client) void {
         const gpa = self.gpa;
-        // First: a read still running for the cache holds a connection.
+        // First: the watches' SUBSCRIBE connection and its task.
+        if (self.pubsub_hub) |h| h.destroy();
+        // A read still running for the cache holds a connection.
         self.cache.deinit();
         self.guard.deinit();
         for (self.pools.pools) |*p| {
@@ -639,6 +646,17 @@ pub const Client = struct {
         const ctx = erase(c);
         const conn = self.take(&ctx) catch |err| return self.narrow(&ctx, err);
         return .{ .client = self, .conn = conn };
+    }
+
+    /// The shared SUBSCRIBE connection of `anole.watch` (internal): one per
+    /// client, made on first use.
+    pub fn _pubsubHub(self: *Client) !*PubSubHub {
+        self.pubsub_hub_mutex.lockUncancelable(self.io);
+        defer self.pubsub_hub_mutex.unlock(self.io);
+        if (self.pubsub_hub) |h| return h;
+        const h = try PubSubHub.create(self);
+        self.pubsub_hub = h;
+        return h;
     }
 
     /// A connection of its own subscribed to `channels` (a string, or a

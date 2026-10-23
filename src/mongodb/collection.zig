@@ -21,6 +21,7 @@ const wire = @import("wire.zig");
 const sdam = @import("sdam.zig");
 const client_mod = @import("client.zig");
 const conn_mod = @import("connection.zig");
+const change_stream = @import("change_stream.zig");
 
 const Client = client_mod.Client;
 const Context = client_mod.Context;
@@ -45,6 +46,12 @@ pub const Database = struct {
         var out = self;
         out.options = opts;
         return out;
+    }
+
+    /// A change stream over this database's collections (an `aggregate: 1`
+    /// with `$changeStream`); see `Collection.watch`.
+    pub fn watch(self: Database, comptime T: type, c: anytype, pipeline: anytype, opts: change_stream.ChangeStreamOptions) Error!change_stream.ChangeStream(T) {
+        return .{ .raw = try change_stream.open(self.client, c, .{ .database = self.name }, pipeline, opts) };
     }
 
     /// Runs `command` (a document: `.{ .ping = 1 }`, `.{ .collMod = "users", ... }`)
@@ -129,6 +136,23 @@ pub const Collection = struct {
         const cx = client_mod.erase(c);
         const body: FindBody(@TypeOf(filter), @TypeOf(opts)) = .{ .collection = self.name, .filter = filter, .opts = opts };
         return self.open(T, cx, "find", body, batchSizeOf(opts), .read);
+    }
+
+    /// A change stream over this collection: events decode into `T`
+    /// (`anole.mongodb.ChangeEvent`, or `bson.Document` for the raw event)
+    /// in `c`'s arena. `pipeline` is a tuple of stages after
+    /// `$changeStream` (`.{}` for none). Needs a replica set or a sharded
+    /// cluster. The stream resumes by itself after a network error or a
+    /// failover, from its cached resume token; `deinit` it when done.
+    ///
+    ///     var stream = try app.db.collection("orders").watch(ChangeEvent, req, .{}, .{ .full_document = .update_lookup });
+    ///     defer stream.deinit();
+    ///     while (try stream.next()) |event| try handle(event);
+    ///
+    /// Each event decodes into `c`'s arena; for a long stream use
+    /// `anole.watch`, which frees them as it goes.
+    pub fn watch(self: Collection, comptime T: type, c: anytype, pipeline: anytype, opts: change_stream.ChangeStreamOptions) Error!change_stream.ChangeStream(T) {
+        return .{ .raw = try change_stream.open(self.client, c, .{ .collection = .{ .database = self.database, .name = self.name } }, pipeline, opts) };
     }
 
     /// Runs the aggregation `pipeline` (a tuple of stages) and returns its

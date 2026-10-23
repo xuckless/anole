@@ -92,6 +92,15 @@ const route_pattern = @import("dusty").route_pattern;
 
 /// The compile-time pattern check of a route that is not an ordinary
 /// handler route (WebSocket, WebTransport).
+/// The `(req, res)` handler of an `app.sse` route with these options.
+fn sseHandlerFor(comptime route_options: sse_mod.RouteOptions) fn (*http.Request, *http.Response) anyerror!void {
+    return struct {
+        fn handle(req: *http.Request, res: *http.Response) anyerror!void {
+            return sse_mod.serveRoute(req, res, route_options);
+        }
+    }.handle;
+}
+
 fn checkPattern(comptime method: []const u8, comptime path: []const u8) void {
     if (route_pattern.problem(path)) |p| @compileError("anole: route " ++ method ++ " " ++ path ++ ": " ++ route_pattern.comptimeMessage(p));
 }
@@ -120,6 +129,7 @@ const nats_mod = if (features.nats) @import("nats/root.zig") else struct {
     pub const Client = struct {};
 };
 const resilience_mod = @import("resilience/root.zig");
+const sse_mod = @import("sse/root.zig");
 const redis_mod = if (features.redis) @import("redis/root.zig") else struct {
     pub const Options = struct {};
     pub const Client = void;
@@ -791,6 +801,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             dirs: std.ArrayList(std.Io.Dir) = .empty,
             /// A WebTransport route exists: the HTTP/3 listener speaks it.
             webtransport: bool = false,
+            /// `app.sse` routes (for the plain-HTTP note at startup).
+            sse_routes: u32 = 0,
             /// The database connectors and response caches made here
             /// (`postgres`, `sqlite`, `mongodb`, `redis`, `responseCache`),
             /// in order.
@@ -2191,6 +2203,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 g.server.enableWebTransport();
                 g.inner.get(path, webtransport_mod.route(Ctx, handler, accept));
             }
+            // ---- p3/realtime ----
+            /// `Server.sse` under this group (the group's prefix goes before `path`).
+            pub fn sse(g: Group, comptime path: []const u8, topics: *sse_mod.Topics, comptime route_options: sse_mod.RouteOptions) void {
+                if (comptime path.len > 0) comptime checkPattern("GET", path);
+                const data = g.server.arena.allocator().create(sse_mod.RouteData) catch @panic("OOM");
+                data.* = .{ .topics = topics };
+                g.server.extras.sse_routes += 1;
+                g.inner.addRouteWith(.get, path, Self.route(sseHandlerFor(route_options)), .{ .data = data });
+            }
+            // ---- end p3/realtime ----
             /// `Server.addRoute` under this group.
             pub fn addRoute(g: Group, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, method, path, handler);
@@ -2721,6 +2743,48 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         // ---- end p3/webhooks ----
 
         // ---- p3/realtime ----
+        /// A set of server-sent-event topics owned by the server: metrics
+        /// (with `app.metrics`), the drain (every subscriber gets a
+        /// `retry:` and its stream ends), freed with the server. Serve it
+        /// with `app.sse` or `topics.serve` in a handler, and publish with
+        /// `topics.publish`. See `anole.sse`.
+        ///
+        ///     const live = try app.sseTopics(.{});
+        ///     app.sse("/orders/live", live, .{ .topics = &.{"orders"} });
+        pub fn sseTopics(self: *Self, topic_options: sse_mod.Topics.Options) !*sse_mod.Topics {
+            const topics = try sse_mod.Topics.create(self.gpa, topic_options);
+            errdefer topics.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(sse_mod.Topics, topics));
+            topics._registerDrain(self.rt.io(), &self.server.drain_hooks);
+            if (self.extras.connectors_started) try topics.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            return topics;
+        }
+
+        /// GET `path`: an event stream subscribed to `options.topics`,
+        /// where a `{name}` is the route parameter `name`
+        /// (`"room:{room}"` on `/rooms/:room/events`; a name the path
+        /// lacks is a compile error). Over HTTP/1.1 and HTTP/2 an idle
+        /// subscriber holds no task. A handler that decides the topics
+        /// itself calls `topics.serve`.
+        ///
+        ///     app.sse("/rooms/:room/events", live, .{ .topics = &.{ "news", "room:{room}" } });
+        pub fn sse(self: *Self, comptime path: []const u8, topics: *sse_mod.Topics, comptime route_options: sse_mod.RouteOptions) void {
+            comptime checkPattern("GET", path);
+            comptime if (!sse_mod.templatesMatch(path, route_options)) @compileError("anole: app.sse " ++ path ++ ": a {name} in the topics is not a parameter of the path");
+            const data = self.arena.allocator().create(sse_mod.RouteData) catch @panic("OOM");
+            data.* = .{ .topics = topics };
+            self.extras.sse_routes += 1;
+            if (comptime features.openapi) self.recordRoute(self.router, .get, path, sseHandlerFor(route_options));
+            self.router.addRouteWith(.get, path, route(sseHandlerFor(route_options)), .{ .data = data });
+        }
+
+        /// A development run with `app.sse` routes and only plain
+        /// listeners: browsers speak HTTP/2 only over TLS, so each tab's
+        /// stream uses one of its six HTTP/1.1 connections per host.
+        fn sseNote(self: *const Self) void {
+            if (self.extras.sse_routes == 0 or self.certs.len > 0 or self.mode.environment != .development) return;
+            std.log.scoped(.anole).info("server-sent events are served over plain HTTP/1.1 here: browsers use HTTP/2 only over TLS (listenTls), and HTTP/1.1 allows six connections per host, one per open tab's stream", .{});
+        }
         // ---- end p3/realtime ----
 
         // ---- p3/s3 ----
@@ -3027,6 +3091,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
             self.printBanner();
             self.logModes();
+            self.sseNote();
             logBuildMode(self.mode.debug_production);
             self.addHelperRoutes();
             if (comptime features.openapi) if (self.extras.openapi_failed) |err| {
