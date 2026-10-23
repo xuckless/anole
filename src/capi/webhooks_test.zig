@@ -20,6 +20,7 @@ test "webhooks: the records are the sizes anole.h states" {
 }
 
 test "webhooks: the configuration parses, with defaults" {
+    if (comptime !features.webhooks) return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     var buf: [400]u8 = undefined;

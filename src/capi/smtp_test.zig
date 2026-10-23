@@ -254,6 +254,7 @@ test "capi smtp: find by name; an unknown name is none" {
 }
 
 test "capi config: mail parses with its defaults; bad entries say which key" {
+    if (comptime !features.smtp) return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(alloc);
     defer arena.deinit();
     var buf: [400]u8 = undefined;
