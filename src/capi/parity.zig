@@ -332,7 +332,9 @@ pub const websocket_options = [_]Entry{
     .{ .zig = "drain_reason", .omitted = "the drain's close carries the default reason" },
     .{ .zig = "subprotocols", .json = "routes[].websocket.subprotocols", .note = "\"accept\": \"auto\" only; with \"consumer\" the application picks in anole_ws_accept" },
     .{ .zig = "headers", .omitted = "Zig only: the consumer passes headers per accept (anole_ws_accept_options.headers)" },
+};
 
+// ---------------------------------------------------------------------------
 // Database connectors
 
 fn dbCommon(comptime kind: []const u8) [4]Entry {
