@@ -76,7 +76,7 @@ fn expectDetail(h: *Harness, class: db.Class, code: []const u8) !void {
 
 test "send: a plain message arrives with its envelope and headers" {
     var h: Harness = undefined;
-    try h.init(.{}, .{});
+    try h.init(.{ .size_limit = 10_000_000 }, .{});
     defer h.deinit();
     const sent = try h.client.send(&h.c, .{
         .from = "Ada <ada@example.com>",
@@ -197,7 +197,7 @@ test "send: bad addresses and injected headers fail before anything is sent" {
 
 test "a file attachment larger than the writer buffer is streamed" {
     var h: Harness = undefined;
-    try h.init(.{}, .{});
+    try h.init(.{ .size_limit = 10_000_000 }, .{});
     defer h.deinit();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
