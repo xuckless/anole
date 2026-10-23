@@ -31,10 +31,10 @@ nghttp2 and the rest) itself.
 mkdir api && cd api
 zig init
 rm src/root.zig
-zig fetch --save git+https://github.com/xuckless/anole#v0.2.1
+zig fetch --save git+https://github.com/xuckless/anole#v0.3.0
 ```
 
-(`#v0.2.1` is the latest release; a later tag or a commit works the same way.)
+(`#v0.3.0` is the latest release; a later tag or a commit works the same way.)
 
 Replace the `build.zig` that `zig init` wrote with this one:
 
@@ -466,7 +466,7 @@ in the options). Give the process manager a little longer before it kills.
 `req.remote_address` is the client's address from `X-Forwarded-For` rather
 than the proxy's, read only from the proxy's address; on Render, Heroku, Fly.io
 or Cloud Run use `ANOLE_DEPLOYMENT=platform`, which also listens on `$PORT`
-([config.md](config.md#deployment), [server.md](server.md#behind-a-proxy)).
+([config.md](config.md#6-deployment), [server.md](server.md#behind-a-proxy)).
 Set `ANOLE_ENV=production` where the binary is a Debug build. Anole serves TLS, HTTP/2 and
 HTTP/3 itself, so a proxy is optional.
 

@@ -1302,7 +1302,10 @@ pub fn Engine(comptime Ctx: type) type {
                 ._drain_hooks = &server.drain_hooks,
                 ._timeout_context = if (inline_mode) null else &timer,
                 ._set_timeout = if (inline_mode) null else setTimeout,
+                // Its entry table is never read past `len`: not zeroed.
+                .session = undefined,
             };
+            request.session._empty();
             const body_reader = &ex.body_reader;
             body_reader.* = .init(stream);
             request._body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };

@@ -165,7 +165,7 @@ breaking changes are listed anyway.
 
 ### Fixed
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-10-23)
 
 Developer experience: settings, `.env` files and deployment modes, retries
 and circuit breakers, the NATS and Kafka clients, validation and typed

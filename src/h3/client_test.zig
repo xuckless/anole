@@ -1306,10 +1306,15 @@ test "h3: a new connection given up after its first packet started a 0-RTT reque
     // right after reading its first packet.
     f.ep.test_fail_accept = true;
     try relay.replayCoalesced();
-    try io.sleep(.fromMilliseconds(300), .awake);
+    // It did start a request before it was given up (a busy machine may
+    // take a while over the handshake's first packet).
+    const GivenUp = struct {
+        fn once(ep: *Endpoint) bool {
+            return ep.test_given_up_with_tasks.load(.acquire) == 1;
+        }
+    };
+    try eventually(io, 10, GivenUp.once, f.ep);
     try std.testing.expect(!f.ep.test_fail_accept);
-    // It did start a request before it was given up.
-    try std.testing.expectEqual(@as(u32, 1), f.ep.test_given_up_with_tasks.load(.monotonic));
     // The endpoint still serves.
     const conn = try f.connect(gpa, io);
     defer conn.close();

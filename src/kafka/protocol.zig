@@ -25,7 +25,8 @@ pub const Api = enum(i16) {
     init_producer_id = 22,
     sasl_authenticate = 36,
 
-    /// The version this client speaks (§4.2 of the design).
+    /// The newest version this client speaks (§4.2 of the design); a
+    /// connection uses it when the broker serves it.
     pub fn version(self: Api) i16 {
         return switch (self) {
             .produce => 8,
@@ -43,6 +44,19 @@ pub const Api = enum(i16) {
             .api_versions => 0,
             .init_producer_id => 1,
             .sasl_authenticate => 1,
+        };
+    }
+
+    /// The oldest version this client speaks; a connection takes the
+    /// newest version both sides serve, between this and `version()`.
+    /// Produce v7 lacks only v8's record_errors and error_message in the
+    /// answer (Redpanda serves 0-7); ListOffsets v4 and v5 share one layout
+    /// (Redpanda serves 0-4).
+    pub fn minVersion(self: Api) i16 {
+        return switch (self) {
+            .produce => 7,
+            .list_offsets => 4,
+            else => self.version(),
         };
     }
 };
@@ -615,7 +629,8 @@ pub fn decodeSaslAuthenticate(arena: std.mem.Allocator, body: []const u8) Error!
 
 pub const ProduceResult = struct { topic: []const u8, partition: i32, error_code: i16, base_offset: i64, log_append_time: i64 };
 
-pub fn decodeProduce(arena: std.mem.Allocator, body: []const u8) Error![]ProduceResult {
+/// `version` is the one the request was sent at (7 or 8).
+pub fn decodeProduce(arena: std.mem.Allocator, body: []const u8, version: i16) Error![]ProduceResult {
     var d: Dec = .init(body);
     const nt = try d.arrayLen();
     var out: std.ArrayList(ProduceResult) = .empty;
@@ -628,12 +643,14 @@ pub fn decodeProduce(arena: std.mem.Allocator, body: []const u8) Error![]Produce
             const base = try d.i64_();
             const lat = try d.i64_();
             _ = try d.i64_(); // log start offset
-            const nr = try d.arrayLen();
-            for (0..nr) |_| {
-                _ = try d.i32_();
+            if (version >= 8) {
+                const nr = try d.arrayLen();
+                for (0..nr) |_| {
+                    _ = try d.i32_();
+                    _ = try d.nullableString();
+                }
                 _ = try d.nullableString();
             }
-            _ = try d.nullableString();
             try out.append(arena, .{ .topic = topic, .partition = index, .error_code = ec, .base_offset = base, .log_append_time = lat });
         }
     }

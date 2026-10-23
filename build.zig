@@ -747,7 +747,9 @@ pub fn build(b: *std.Build) void {
             obj.expect_errors = .{ .contains = c.contains };
             ce_step.dependOn(&obj.step);
         }
-        test_step.dependOn(ce_step);
+        // COFF can't put the anole module's C objects into one object file,
+        // so these run on Linux and macOS only (the checks are the same).
+        if (target.result.os.tag != .windows) test_step.dependOn(ce_step);
     }
 
     // The live console's std-only part (src/console/ui): protocol, client, TUI,

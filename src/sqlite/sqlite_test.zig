@@ -439,21 +439,36 @@ test "sqlite: coalesced and cached reads on 4 executors; invalidation after a wr
     const ctx = &s.ctx;
     _ = try db.exec(ctx, schema, .{});
 
-    // A read slow enough that the callers on each executor meet in flight.
-    const slow = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < ?) SELECT count(*) FROM n";
+    // Every reader held by a read-only transaction: the statement each
+    // executor starts waits for one, so all the callers on that executor
+    // meet it in flight, however slowly a busy machine runs them.
+    const count_to = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < ?) SELECT count(*) FROM n";
     const Worker = struct {
         fn run(d: *sqlite.Client, io_: std.Io, failures: *std.atomic.Value(u32)) void {
             var sc: Scratch = undefined;
             sc.init(io_);
             defer sc.deinit();
-            const n = d.with(.{ .coalesce = true }).one(i64, &sc.ctx, slow, .{1_000_000}) catch 0;
-            if (n != 1_000_000) _ = failures.fetchAdd(1, .monotonic);
+            const n = d.with(.{ .coalesce = true }).one(i64, &sc.ctx, count_to, .{1000}) catch 0;
+            if (n != 1000) _ = failures.fetchAdd(1, .monotonic);
         }
     };
+    var holds: [4]sqlite.Tx = undefined;
+    try testing.expectEqual(holds.len, db.readers.conns.len);
+    var held: usize = 0;
+    defer for (holds[0..held]) |*h| h.deinit();
+    while (held < holds.len) : (held += 1) holds[held] = try db.begin(ctx, .{ .read_only = true });
     var failures: std.atomic.Value(u32) = .init(0);
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     for (0..32) |n| try dusty.placement.concurrent(&group, io, .{ .executor = n % 4 }, Worker.run, .{ db, io, &failures });
+    // 7 of the 8 callers on each executor join its statement.
+    var waited: usize = 0;
+    while (db.cache.stats().coalesced < 28) : (waited += 1) {
+        if (waited == 1000) return error.TimedOut;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    for (holds[0..held]) |*h| h.deinit();
+    held = 0;
     try group.await(io);
     try testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
     try testing.expectEqual(@as(u64, 28), db.cache.stats().coalesced);
