@@ -31,14 +31,24 @@
 </p>
 
 
-An anole is a small lizard that changes colour to fit wherever it lands, and
-that's the idea: one server core that speaks whatever protocol the client
-showed up with. (Zig's mascot is a lizard too.)
+## What this Library Offers (Brief Overview): 
+1. REST - HTTP/1.1, HTTP/2, HTTP/3 [see docs]()
+2. Websockets - HTTP/1.1, HTTP/2, HTTP/3 [see docs]
+2. gRPC - HTTP/2, HTTP/3 [see docs]
+3. WebTransport - QUIC HTTP/3 (draft-02) [see docs]
+4. Auth - JWT, ODIC, CSRF (and more...) [see docs]
+5. Database Connectors - SQLite, PostgreSQL, MariaDB, MongoDB and more... [see docs]
+6. Caching Built in - Redis, Coalesing, Result caching [see docs] 
+7. S3 Compatibility [see docs]
+8. 
+
+
 
 Anole doesn't reinvent the hard parts. It stands on libraries that have
 already survived the internet:
 - [zio](https://github.com/lalinsky/zio) for async I/O;
 - [dusty](https://github.com/lalinsky/dusty) for HTTP, adapted into Anole as its HTTP core;
+- [zig-protobuf](https://link.com) for protobuf generation
 - nghttp2 for HTTP/2;
 - BoringSSL for TLS;
 - ngtcp2 and nghttp3 for HTTP/3.
