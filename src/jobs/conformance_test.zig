@@ -5,7 +5,13 @@ const std = @import("std");
 const root = @import("root.zig");
 const Time = root.Time;
 const anole = @import("../root.zig");
-const Backend = enum { memory, sqlite };
+const Backend = enum { memory, sqlite, postgres, redis };
+const features = anole.features;
+const build_options = @import("build_options");
+const zio = @import("zio");
+
+/// The Redis server of the live tests, or null.
+const redis_url: ?[]const u8 = if (build_options.redis_test_url) |u| u else if (build_options.redis_test_port) |p| std.fmt.comptimePrint("redis://127.0.0.1:{d}", .{p}) else null;
 const testing_mod = @import("../testing/root.zig");
 
 fn Suite(comptime B: Backend) type {
@@ -24,8 +30,31 @@ fn Suite(comptime B: Backend) type {
             level: std.log.Level,
 
             sq: if (B == .sqlite) *anole.sqlite.Client else void,
+            /// PostgreSQL and Redis run on their own zio runtime, like the connectors' live tests.
+            rt: if (B == .postgres or B == .redis) *zio.Runtime else void,
+            pgc: if (B == .postgres) *anole.pg.Client else void,
+            rdc: if (B == .redis) *anole.redis.Client else void,
 
             fn init(fx: *Fx, queues: []const root.QueueOptions) !void {
+                // Live stores skip without a server (-Dpostgres-test-url, -Dredis-test-url).
+                if (B == .postgres and (!features.postgres or build_options.postgres_test_url == null)) return error.SkipZigTest;
+                if (B == .redis and (!features.redis or redis_url == null)) return error.SkipZigTest;
+                var io = std.testing.io;
+                if (B == .postgres or B == .redis) {
+                    fx.rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+                    io = fx.rt.io();
+                }
+                var scratch: std.heap.ArenaAllocator = .init(std.testing.allocator);
+                defer scratch.deinit();
+                var wipe: anole.db.Ctx = .{ .io = io, .arena = scratch.allocator() };
+                if (B == .postgres) {
+                    fx.pgc = try anole.pg.Client.init(std.testing.allocator, io, .{ .url = build_options.postgres_test_url.?, .environ = .empty });
+                    try fx.pgc.execScript(&wipe, "DROP TABLE IF EXISTS jtest_jobs, jtest_cron, jtest_leader, jtest_schema");
+                }
+                if (B == .redis) {
+                    fx.rdc = try anole.redis.Client.init(std.testing.allocator, io, .{ .url = redis_url.?, .environ = .empty });
+                    _ = try fx.rdc.with(.{}).reply(&wipe, &.{ "EVAL", "for _, k in ipairs(redis.call('KEYS', ARGV[1] .. '*')) do redis.call('DEL', k) end", "0", "jtest:" });
+                }
                 fx.level = std.testing.log_level;
                 std.testing.log_level = .err;
                 fx.logs = .init(std.testing.allocator);
@@ -33,18 +62,28 @@ fn Suite(comptime B: Backend) type {
                 fx.arena_state = .init(std.testing.allocator);
                 if (B == .sqlite) fx.sq = try anole.sqlite.Client.init(std.testing.allocator, std.testing.io, .{ .path = ":memory:" });
                 fx.clock = .init(Time.fromSeconds(1_800_000_000));
-                fx.client = try root.Client.init(std.testing.allocator, std.testing.io, .{
-                    .store = if (B == .sqlite) .{ .sqlite = fx.sq } else .memory,
+                fx.client = try root.Client.init(std.testing.allocator, io, .{
+                    .store = switch (B) {
+                        .sqlite => .{ .sqlite = fx.sq },
+                        .postgres => .{ .postgres = fx.pgc },
+                        .redis => .{ .redis = fx.rdc },
+                        .memory => .memory,
+                    },
+                    .table_prefix = "jtest_",
+                    .key_prefix = "jtest:",
                     .run = .manual,
                     .queues = queues,
                     .clock = fx.clock.clock(),
                     .name = "test",
                 });
-                fx.ctx = .{ .io = std.testing.io, .arena = fx.arena_state.allocator() };
+                fx.ctx = .{ .io = io, .arena = fx.arena_state.allocator() };
             }
             fn deinit(fx: *Fx) void {
                 fx.client.deinit();
                 if (B == .sqlite) fx.sq.deinit();
+                if (B == .postgres) fx.pgc.deinit();
+                if (B == .redis) fx.rdc.deinit();
+                if (B == .postgres or B == .redis) fx.rt.deinit();
                 fx.arena_state.deinit();
                 fx.logs.deinit();
                 std.testing.log_level = fx.level;
@@ -66,7 +105,10 @@ fn Suite(comptime B: Backend) type {
             fn run(_: ?*anyopaque, job: *root.Job) anyerror!void {
                 runs += 1;
                 if (n < order.len) {
-                    order[n] = job.args_json[1 + std.mem.indexOf(u8, job.args_json, ":").? + 1 - 1 ..][0];
+                    var at = std.mem.indexOf(u8, job.args_json, ":").? + 1;
+                    // jsonb writes `{"a": 1}`: skip the blank.
+                    while (job.args_json[at] == ' ') at += 1;
+                    order[n] = job.args_json[at];
                     n += 1;
                 }
                 if (fail_times > 0) {
@@ -415,6 +457,8 @@ fn Suite(comptime B: Backend) type {
         }
 
         test "jobs: adminRoutes registers on a group" {
+            // The live stores run on a runtime of their own; the server wants the thread for itself.
+            if (B == .postgres or B == .redis) return error.SkipZigTest;
             const gpa = std.testing.allocator;
             var state: struct {} = .{};
             var app = try anole.Server(@TypeOf(state)).init(gpa, .{}, &state);
@@ -430,4 +474,6 @@ fn Suite(comptime B: Backend) type {
 test {
     _ = Suite(.memory);
     if (anole.features.sqlite) _ = Suite(.sqlite);
+    if (anole.features.postgres) _ = Suite(.postgres);
+    if (anole.features.redis) _ = Suite(.redis);
 }

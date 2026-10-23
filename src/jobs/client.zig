@@ -11,6 +11,8 @@ const unique_mod = @import("unique.zig");
 const memory = @import("store_memory.zig");
 const anole = @import("../root.zig");
 const sqlite_store = if (anole.features.sqlite) @import("store_sqlite.zig") else struct {};
+const pg_store = if (anole.features.postgres) @import("store_pg.zig") else struct {};
+const redis_store = if (anole.features.redis) @import("store_redis.zig") else struct {};
 const cron_mod = @import("../cron/root.zig");
 const observe = @import("../observe/root.zig");
 const placement = dusty.placement;
@@ -123,8 +125,15 @@ pub const Client = struct {
                 log.err("jobs: the sqlite store needs -Dsqlite", .{});
                 return error.InvalidOptions;
             },
-            else => {
-                log.err("jobs: the {s} store is not available in this build yet", .{@tagName(options.store)});
+            .postgres => |pc| if (comptime anole.features.postgres) try pg_store.Postgres.create(gpa, io, pc, options.table_prefix, .{
+                .notify = options.notify,
+                .advisory_lock = options.leader.method != .lease_row,
+            }) else {
+                log.err("jobs: the postgres store needs -Dpostgres", .{});
+                return error.InvalidOptions;
+            },
+            .redis => |rc| if (comptime anole.features.redis) try redis_store.Redis.create(gpa, io, rc, options.key_prefix, options.notify) else {
+                log.err("jobs: the redis store needs -Dredis", .{});
                 return error.InvalidOptions;
             },
         };

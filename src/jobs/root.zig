@@ -300,7 +300,7 @@ pub const Client = @import("client.zig").Client;
 pub fn sql(comptime dialect: enum { postgresql, sqlite }, table_prefix: []const u8, arena: std.mem.Allocator) ![]const u8 {
     switch (dialect) {
         .sqlite => return @import("store_sqlite.zig").ddlText(arena, table_prefix),
-        .postgresql => return error.Unsupported,
+        .postgresql => return @import("store_pg.zig").ddlText(arena, table_prefix),
     }
 }
 
