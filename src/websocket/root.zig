@@ -389,9 +389,9 @@ pub const Socket = struct {
     }
 
     /// `send` that leaves the frame in the write buffer: follow a run of
-    /// them with one `flushOut`, so they leave together (a room's sender, the
+    /// them with one `_flushOut`, so they leave together (a room's sender, the
     /// C ABI's). Internal.
-    pub fn sendDeferred(self: *Socket, msg_type: MessageType, data: []const u8) !void {
+    pub fn _sendDeferred(self: *Socket, msg_type: MessageType, data: []const u8) !void {
         try self._send_mutex.lock(self.io);
         defer self._send_mutex.unlock(self.io);
         if (comptime features.compression) {
@@ -409,8 +409,8 @@ pub const Socket = struct {
         };
     }
 
-    /// Sends what `sendDeferred` left. Internal.
-    pub fn flushOut(self: *Socket) !void {
+    /// Sends what `_sendDeferred` left. Internal.
+    pub fn _flushOut(self: *Socket) !void {
         return switch (self._conn) {
             inline else => |ws| ws.flush(),
         };
@@ -1432,14 +1432,14 @@ pub const Rooms = struct {
             var sent = true;
             for (round[0..n]) |p| {
                 if (!sent) break;
-                m.socket.sendDeferred(p.type, p.bytes()) catch |err| {
+                m.socket._sendDeferred(p.type, p.bytes()) catch |err| {
                     if (err == error.Canceled) canceled = true;
                     sent = false;
                 };
             }
             // Whatever was written goes out, or is dropped with the
             // connection: nothing stays in the buffer unannounced.
-            m.socket.flushOut() catch |err| {
+            m.socket._flushOut() catch |err| {
                 if (err == error.Canceled) canceled = true;
                 sent = false;
             };

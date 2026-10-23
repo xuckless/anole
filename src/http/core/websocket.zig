@@ -1917,6 +1917,74 @@ test "WebSocket: a send from another task is not held by the reader's batch" {
     try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'A', 0x81, 1, 'X' }, probe.out.items);
 }
 
+test "WebSocket: a send outside any batch leaves at once; from a task mid-batch it waits on the receiver's batch" {
+    const gpa = std.testing.allocator;
+    // The reading socket A: two messages buffered, so reading the first
+    // starts a batch for this task.
+    var a_buf: [256]u8 = undefined;
+    var a_probe = SocketProbe.init(gpa, &a_buf);
+    defer a_probe.out.deinit(gpa);
+    const frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b");
+    var reader: std.Io.Reader = undefined;
+    var a = serverSocketOver(&frames, &reader, &a_probe.interface);
+    defer a.deinit();
+    a.batch.backstop_on = false;
+
+    // The receiver B, a socket of its own with a write buffer.
+    var b_buf: [256]u8 = undefined;
+    var b_probe = SocketProbe.init(gpa, &b_buf);
+    defer b_probe.out.deinit(gpa);
+    var b_reader: std.Io.Reader = .fixed("");
+    var b = WebSocket.init(std.testing.io, .{ .writer = &b_probe.interface, .reader = &b_reader }, gpa, 0);
+    defer b.deinit();
+    b.batch.backstop_on = false;
+
+    // Outside a batch: one write per message.
+    try b.send(.text, "1");
+    try b.send(.text, "2");
+    try std.testing.expectEqual(@as(usize, 2), b_probe.writes);
+
+    // Mid-batch (another whole message is buffered behind this one).
+    _ = try a.receive();
+    try b.send(.text, "x");
+    try b.send(.text, "y");
+    try b.send(.text, "z");
+    try std.testing.expectEqual(@as(usize, 2), b_probe.writes);
+    try b.flush();
+    try std.testing.expectEqual(@as(usize, 3), b_probe.writes);
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, '1', 0x81, 1, '2', 0x81, 1, 'x', 0x81, 1, 'y', 0x81, 1, 'z' }, b_probe.out.items);
+
+    // The batch ends with the last whole message: sends leave at once again.
+    _ = try a.receive();
+    try b.send(.text, "w");
+    try std.testing.expectEqual(@as(usize, 4), b_probe.writes);
+}
+
+test "WebSocket: sendNoFlush leaves frames for one flush, in order" {
+    const gpa = std.testing.allocator;
+    var wbuf: [256]u8 = undefined;
+    var probe = SocketProbe.init(gpa, &wbuf);
+    defer probe.out.deinit(gpa);
+    var reader: std.Io.Reader = .fixed("");
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &probe.interface, .reader = &reader }, gpa, 0);
+    defer ws.deinit();
+    ws.batch.backstop_on = false;
+    for (0..10) |_| try ws.sendNoFlush(.text, "m");
+    try std.testing.expectEqual(@as(usize, 0), probe.writes);
+    try ws.flush();
+    try std.testing.expectEqual(@as(usize, 1), probe.writes);
+    try std.testing.expectEqual(@as(usize, 30), probe.out.items.len);
+}
+
+test "WebSocket: a frame header with its payload still below the reader keeps the batch" {
+    try std.testing.expect(WebSocket.bufferedHeader(&[_]u8{ 0x82, 0x7E, 0x10, 0x00, 0, 0, 0, 0 }));
+    try std.testing.expect(!WebSocket.bufferedHeader(&[_]u8{ 0x82, 0x7E, 0x10 }));
+    try std.testing.expect(!WebSocket.bufferedHeader(&[_]u8{0x82}));
+    // A masked header needs its 4 key bytes too.
+    try std.testing.expect(!WebSocket.bufferedHeader(&[_]u8{ 0x82, 0x85, 0, 0, 0 }));
+    try std.testing.expect(WebSocket.bufferedHeader(&[_]u8{ 0x82, 0x85, 0, 0, 0, 0 }));
+}
+
 test "WebSocket: a pong in a batch keeps its place, and a close ends the batch" {
     const gpa = std.testing.allocator;
     var wbuf: [256]u8 = undefined;

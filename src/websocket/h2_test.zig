@@ -387,6 +387,55 @@ test "WebSocket over HTTP/2: a socket carries more than limits.body_max in total
     }.f);
 }
 
+test "WebSocket over HTTP/2: traffic far past the tunnel window keeps flowing, both ways" {
+    // The tunnel's window is 128 KiB and WINDOW_UPDATEs go out only when
+    // nghttp2 queues one: 1.5 MB of 3 KB messages each way proves they do.
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/chat", echo);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: Client = undefined;
+    try client.init(io, server.address.ip);
+    defer client.deinit();
+    try client.open();
+    try std.testing.expectEqual(@as(u16, 200), client.status);
+
+    var msg: [3000]u8 = undefined;
+    var back: [3000 + 64]u8 = undefined;
+    var op: wsc.Opcode = undefined;
+    for (0..500) |i| {
+        @memset(&msg, @truncate(i));
+        try client.sendFrame(.binary, &msg);
+        const got = try client.nextFrame(&op, &back);
+        try std.testing.expectEqual(wsc.Opcode.binary, op);
+        try std.testing.expectEqualSlices(u8, &msg, got);
+    }
+
+    try client.sendFrame(.close, &.{ 0x03, 0xe8 });
+    _ = try client.nextFrame(&op, &back);
+    client.finished = true;
+    _ = c.nghttp2_session_resume_data(client.session, client.stream_id);
+    try client.pumpUntil(struct {
+        fn f(cl: *Client) bool {
+            return cl.closed;
+        }
+    }.f);
+}
+
 test "WebSocket over HTTP/2: the drain closes an open socket with 1001 and does not wait out timeout.shutdown" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});

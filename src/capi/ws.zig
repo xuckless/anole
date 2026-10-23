@@ -484,7 +484,7 @@ fn sender(s: *WsSlot) std.Io.Cancelable!void {
         for (list.items) |m| {
             const data = if (m.owned) buf.items[m.off..][0..m.len] else m.data;
             if (!failed) {
-                if (sock.sendDeferred(m.type, data)) |_| {
+                if (sock._sendDeferred(m.type, data)) |_| {
                     _ = e.ws_out.fetchAdd(1, .monotonic);
                 } else |_| failed = true;
             }
@@ -492,7 +492,7 @@ fn sender(s: *WsSlot) std.Io.Cancelable!void {
         }
         // The burst leaves in one flush; the borrowed bodies are let go
         // once it has.
-        sock.flushOut() catch {
+        sock._flushOut() catch {
             failed = true;
         };
         for (list.items) |m| if (!m.owned) if (m.sent) |r| x.postSentRec(s.handle(g), r);
