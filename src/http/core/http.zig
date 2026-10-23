@@ -956,6 +956,7 @@ pub const ContentType = enum(u32) {
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/javascript")) and std.mem.eql(u8, main, "application/javascript")) return .js;
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/xml")) and std.mem.eql(u8, main, "application/xml")) return .xml;
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/json")) and std.mem.eql(u8, main, "application/json")) return .json;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("application/problem+json")) and std.mem.eql(u8, main, "application/problem+json")) return .problem_json;
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/vnd.msgpack")) and std.mem.eql(u8, main, "application/vnd.msgpack")) return .msgpack;
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/yaml")) and std.mem.eql(u8, main, "application/yaml")) return .yaml;
         if ((hash == comptime std.hash.Fnv1a_32.hash("image/png")) and std.mem.eql(u8, main, "image/png")) return .png;
@@ -1157,6 +1158,7 @@ test "isCompressible: text and structured types yes, compressed media no" {
     try std.testing.expect(isCompressible("text/html; charset=utf-8"));
     try std.testing.expect(isCompressible("application/json"));
     try std.testing.expect(isCompressible("application/vnd.api+json"));
+    try std.testing.expect(isCompressible("application/problem+json"));
     try std.testing.expect(isCompressible("image/svg+xml"));
     try std.testing.expect(isCompressible(null));
     try std.testing.expect(!isCompressible("image/png"));

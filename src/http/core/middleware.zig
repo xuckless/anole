@@ -945,3 +945,20 @@ test "Executor: a middleware that wrote a body does not supply the 404" {
 test "errorStatus: ValidationFailed is 422" {
     try std.testing.expectEqual(http.Status.unprocessable_entity, errorStatus(error.ValidationFailed).?);
 }
+
+test "defaultError: ValidationFailed answers problem+json with the request's violations, also with errors = .text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    response._error_format = .text;
+    var req: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined };
+    req.addViolation("title", "users.bad", "is bad");
+    defaultError(&req, &response, error.ValidationFailed);
+    try std.testing.expectEqual(http.Status.unprocessable_entity, response.status);
+    try std.testing.expectEqual(http.ContentType.problem_json, response.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"field\":\"title\",\"code\":\"users.bad\"") != null);
+}
