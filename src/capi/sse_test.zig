@@ -498,3 +498,19 @@ test "capi engine: anole_sse_send: BUSY past half the queue, AGAIN past it, WRIT
     try e.drain();
     try std.testing.expect(e.wait(5000));
 }
+
+test "capi config: a MongoDB watch's pipeline is an array of stages" {
+    if (comptime !features.mongodb) return error.SkipZigTest;
+    try expectConfig(
+        \\{"databases":[{"name":"m","mongodb":{"url":"mongodb://localhost/app"}}],
+        \\ "watches":[{"name":"a","database":"m","mongodb":{"collection":"users","pipeline":[{"$match":{"operationType":"insert"}}]}}]}
+    );
+    try expectRefused(
+        \\{"databases":[{"name":"m","mongodb":{"url":"mongodb://localhost/app"}}],
+        \\ "watches":[{"name":"a","database":"m","mongodb":{"collection":"users","pipeline":{"$match":{}}}}]}
+    , "an array of stage documents");
+    try expectRefused(
+        \\{"databases":[{"name":"m","mongodb":{"url":"mongodb://localhost/app"}}],
+        \\ "watches":[{"name":"a","database":"m","mongodb":{"full_document":"sometimes"}}]}
+    , "full_document");
+}
