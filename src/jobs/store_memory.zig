@@ -193,7 +193,7 @@ pub const Memory = struct {
     }
 
     fn before(_: void, a: *MemRow, b: *MemRow) bool {
-        if (a.priority != b.priority) return @intFromEnum(a.priority) < @intFromEnum(b.priority);
+        if (a.priority != b.priority) return @backingInt(a.priority) < @backingInt(b.priority);
         if (a.run_at.us != b.run_at.us) return a.run_at.us < b.run_at.us;
         return a.id < b.id;
     }

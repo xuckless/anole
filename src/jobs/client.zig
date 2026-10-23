@@ -9,6 +9,8 @@ const store = @import("store.zig");
 const clock_mod = @import("clock.zig");
 const unique_mod = @import("unique.zig");
 const memory = @import("store_memory.zig");
+const anole = @import("../root.zig");
+const sqlite_store = if (anole.features.sqlite) @import("store_sqlite.zig") else struct {};
 const cron_mod = @import("../cron/root.zig");
 const observe = @import("../observe/root.zig");
 const placement = dusty.placement;
@@ -117,6 +119,10 @@ pub const Client = struct {
         for (options.queues, self.queues) |q, *dst| dst.* = .{ .name = try a.dupe(u8, q.name), .concurrency = q.concurrency };
         self.backend = switch (options.store) {
             .memory => try memory.Memory.create(gpa, io),
+            .sqlite => |sq| if (comptime anole.features.sqlite) try sqlite_store.Sqlite.create(gpa, io, sq, options.table_prefix) else {
+                log.err("jobs: the sqlite store needs -Dsqlite", .{});
+                return error.InvalidOptions;
+            },
             else => {
                 log.err("jobs: the {s} store is not available in this build yet", .{@tagName(options.store)});
                 return error.InvalidOptions;

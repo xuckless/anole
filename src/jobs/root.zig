@@ -33,9 +33,9 @@ pub fn millis(d: Duration) i64 {
 
 /// Where jobs live.
 pub const Store = union(enum) {
-    postgres: *anole.pg.Client,
-    sqlite: *anole.sqlite.Client,
-    redis: *anole.redis.Client,
+    postgres: if (anole.features.postgres) *anole.pg.Client else *opaque {},
+    sqlite: if (anole.features.sqlite) *anole.sqlite.Client else *opaque {},
+    redis: if (anole.features.redis) *anole.redis.Client else *opaque {},
     /// In this process only: lost on restart. Tests and single-process apps.
     memory,
 };
@@ -298,8 +298,10 @@ pub const Client = @import("client.zig").Client;
 
 /// The DDL for apps that migrate themselves (`migrate = false`).
 pub fn sql(comptime dialect: enum { postgresql, sqlite }, table_prefix: []const u8, arena: std.mem.Allocator) ![]const u8 {
-    _ = .{ dialect, table_prefix, arena };
-    return error.Unsupported;
+    switch (dialect) {
+        .sqlite => return @import("store_sqlite.zig").ddlText(arena, table_prefix),
+        .postgresql => return error.Unsupported,
+    }
 }
 
 pub const testing = struct {
