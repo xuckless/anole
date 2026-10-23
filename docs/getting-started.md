@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
 
 `addApp` makes the executable, gives it the `anole` module, installs it and
 adds `zig build run`. `-Doptimize` and `-Dtarget` work as usual, and
-`.profile = .web` leaves out HTTP/3, gRPC, MongoDB and Redis (the
+`.profile = .web` leaves out HTTP/3, gRPC, MongoDB, Redis, NATS and Kafka (the
 [build flags](../README.md#build-flags)); `.features = .{ .postgres = false }`
 turns single features on or off over the preset, like Anole's own
 `-D<feature>` flags.
@@ -389,7 +389,7 @@ pub fn main(init: std.process.Init) !void {
 ```
 
 gRPC runs over HTTP/2, which `listen` serves in cleartext (h2c) beside
-HTTP/1.1, and `listenTls` over TLS. The same route also answers gRPC-Web
+HTTP/1.1, and `listenTls` over TLS and over HTTP/3. The same route also answers gRPC-Web
 and Buf's Connect protocol, so plain curl can call it:
 
 ```sh

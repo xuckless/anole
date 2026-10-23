@@ -290,30 +290,30 @@ parameters, metadata) are reached through the offset stored in the record.
 | `ANOLE_EV_KAFKA_WRITABLE` (84) | `anole_broker_status_event`: a produce refused with `ANOLE_E_AGAIN` (or advised with `ANOLE_BUSY`) would be taken now | 0 | none |
 | `ANOLE_EV_KAFKA_GROUP_END` (85) | `anole_broker_end_event`: the group membership is over (`reason`) | `anole_kafka_group` | ends it |
 | (86-95) | reserved for Kafka | | |
-| `ANOLE_EV_NET_OPEN` (96) | `anole_net_open_event`: a raw TCP connection opened (ABI 0.10, p3/net) | `anole_net_conn` | none (the connection runs until CLOSE) |
+| `ANOLE_EV_NET_OPEN` (96) | `anole_net_open_event`: a raw TCP connection opened (ABI 0.10) | `anole_net_conn` | none (the connection runs until CLOSE) |
 | `ANOLE_EV_NET_DATA` (97) | `anole_net_data_event`: bytes or frames of a connection | `anole_net_conn` | none |
 | `ANOLE_EV_NET_END` (98) | `anole_event`: the peer ended its side | `anole_net_conn` | with `half_open`: end this side when done |
 | `ANOLE_EV_NET_CLOSE` (99) | `anole_net_close_event`: the connection is over | `anole_net_conn` | ends it |
 | `ANOLE_EV_NET_DATAGRAMS` (100) | `anole_net_datagrams_event`: a batch of datagrams of a UDP socket | `anole_net_udp` | none |
 | (101-103) | reserved for raw TCP and UDP | | |
-| `ANOLE_EV_JOB_ENQUEUED` (104) | `anole_job_enqueued_event`: the answer to `anole_jobs_enqueue` (ABI 0.10, p3/jobs) | 0, or the `anole_db_tx` | none |
+| `ANOLE_EV_JOB_ENQUEUED` (104) | `anole_job_enqueued_event`: the answer to `anole_jobs_enqueue` (ABI 0.10) | 0, or the `anole_db_tx` | none |
 | `ANOLE_EV_JOB` (105) | `anole_job_event`: a job for a worker | `anole_job` | `anole_job_finish` (or `anole_handle_release` = retry) |
 | `ANOLE_EV_JOB_CANCEL` (106) | `anole_job_cancel_event`: a held job was canceled | `anole_job` | ends it |
 | `ANOLE_EV_JOB_WORKER_END` (107) | `anole_job_worker_end_event`: the worker stopped | `anole_job_worker` | ends it |
 | `ANOLE_EV_JOBS_RESULT` (108) | `anole_jobs_result_event`: the answer to an admin call | 0 | none |
-| `ANOLE_EV_WEBHOOK_PUBLISHED` (109) | `anole_webhook_published_event`: the answer to `anole_webhooks_publish` without a transaction (p3/webhooks; with `tx`, the answer is `ANOLE_EV_DB_RESULT` on the transaction) | 0 | none |
+| `ANOLE_EV_WEBHOOK_PUBLISHED` (109) | `anole_webhook_published_event`: the answer to `anole_webhooks_publish` without a transaction (ABI 0.10; with `tx`, the answer is `ANOLE_EV_DB_RESULT` on the transaction) | 0 | none |
 | `ANOLE_EV_WEBHOOK_STATUS` (110) | `anole_webhook_status_event`: a delivery ran out of attempts, or an endpoint was disabled; only after `anole_webhooks_watch` | 0 | none |
 | (111) | reserved for jobs and webhooks | | |
-| `ANOLE_EV_SSE_SUBSCRIBE` (112) | `anole_request_event`: a subscriber on a consumer's SSE route (ABI 0.10, p3/realtime) | `anole_req` | `anole_sse_accept`, or any request answer (a refusal) |
+| `ANOLE_EV_SSE_SUBSCRIBE` (112) | `anole_request_event`: a subscriber on a consumer's SSE route (ABI 0.10) | `anole_req` | `anole_sse_accept`, or any request answer (a refusal) |
 | `ANOLE_EV_SSE_CLOSE` (113) | `anole_sse_close_event`: the subscriber is gone | `anole_sse` | ends it |
 | (114-115) | reserved for SSE | | |
 | `ANOLE_EV_WATCH_EVENT` (116) | `anole_watch_event`: a change a watch saw | `anole_watch_sub` | `anole_watch_ack` for a stream group with `"ack": "manual"` |
 | `ANOLE_EV_WATCH_STATUS` (117) | `anole_watch_status_event` | `anole_watch_sub` | none |
 | `ANOLE_EV_WATCH_END` (118) | `anole_watch_end_event`: the watch is over | `anole_watch_sub` | ends it |
 | (119-123) | reserved for watch | | |
-| `ANOLE_EV_S3_RESULT` (124) | `anole_s3_result_event`: the answer to an `anole_s3_*` call (ABI 0.10, p3/s3) | 0, or the `anole_s3_transfer` it opens or ends | a transfer it opens: write and finish it, or read it to the end, or `anole_handle_release` |
+| `ANOLE_EV_S3_RESULT` (124) | `anole_s3_result_event`: the answer to an `anole_s3_*` call (ABI 0.10) | 0, or the `anole_s3_transfer` it opens or ends | a transfer it opens: write and finish it, or read it to the end, or `anole_handle_release` |
 | `ANOLE_EV_S3_DATA` (125) | `anole_s3_data_event`: bytes of a download | `anole_s3_transfer` | none (FIN ends the handle) |
-| `ANOLE_EV_SMTP_RESULT` (126) | `anole_smtp_result_event`: the answer to `anole_smtp_send` or `anole_smtp_send_raw`, then the rejected recipients and the spans' bytes (ABI 0.10, p3/smtp) | 0 | none |
+| `ANOLE_EV_SMTP_RESULT` (126) | `anole_smtp_result_event`: the answer to `anole_smtp_send` or `anole_smtp_send_raw`, then the rejected recipients and the spans' bytes (ABI 0.10) | 0 | none |
 | (127-131) | reserved for storage and mail | | |
 | `ANOLE_EV_CONSOLE_CLOSED` (132) | `anole_console_closed_event`: the in-process console closed (`reason`: `ANOLE_CONSOLE_QUIT`, `_INTERRUPT`, `_RESTARTING`); only after `anole_console_open` | 0 | none: resume reading stdin |
 | (133-135) | reserved for the console | | |
@@ -1485,7 +1485,6 @@ its place in `"brokers"` (what `anole_broker_status_event.broker` names).
 The consumer reads none, gzip, zstd, lz4 and snappy batches. Transactions,
 the KIP-848 protocol and the admin API are not part of the ABI.
 
-<!-- p3/net -->
 ## Raw TCP and UDP
 
 A `"tcp"` or `"udp"` key on a listener serves that listener's connections or
@@ -1578,7 +1577,6 @@ New error tokens: `NetNotBuilt`, `NetListenerNeedsPort`, `NetListenerHttp3`,
 `udp_datagrams_in`, `udp_datagrams_out` and `udp_datagrams_dropped`; listener
 flags `ANOLE_LISTENER_F_TCP` and `ANOLE_LISTENER_F_UDP` mark the kinds (a
 UDP listener's `port` is 0 and `udp_port` its bound port).
-<!-- end p3/net -->
 
 ## Jobs
 
@@ -1669,7 +1667,6 @@ event type, owner or metadata the client refuses (or an owner past
 reports 409, and a missing or mistyped key or a request that is not JSON 400
 (`ANOLE_E_INVALID`). Error answers are `{"error": "..."}`.
 
-<!-- p3/s3 -->
 ## Object storage (S3)
 
 Object stores are configured under `"storage"` (one object per store, with a `"name"` and an `"s3"` object that has `anole.s3.Options`' keys in snake_case) and used through `anole_s3_*` calls. Built with `-Ds3` (`anole_has_feature("s3")`); see [storage.md](storage.md) for what the calls mean.
@@ -1707,7 +1704,6 @@ Without `access_key_id` and `secret_access_key` the AWS credential chain runs wh
 **serve and put_body.** `anole_s3_serve(s3, req, key, opts, user_data)` answers the request itself (Range and `If-*` from the request, status and headers passed through, the body streamed by Anole). With `ANOLE_S3_F_PASS_NOT_FOUND` a missing key leaves the request owed and posts a result (op `SERVE`, class NOT_FOUND) so the consumer can answer with its own 404; `ANOLE_S3_F_REPORT` posts a result when the serve is done. `anole_s3_put_body(s3, req, key, opts, user_data)` stores the request's body (inline or streamed) without it passing through the consumer; the request stays owed and the consumer answers it after the `PUT_BODY` result.
 
 Records: `anole_s3_options`, `anole_s3_get_options`, `anole_s3_put_options`, `anole_s3_list_options`, `anole_s3_presign_options` and `anole_s3_part` take a leading `size` like the database options; `anole_s3_result_event`, `anole_s3_entry`, `anole_s3_failure` and `anole_s3_data_event` are in [anole.h](../include/anole.h). Server drain stops new uploads; those in flight finish. The stop aborts every upload and ends no more events.
-<!-- end p3/s3 -->
 
 ## Mail
 
@@ -1885,8 +1881,8 @@ request (no copy when it is not compressed), and the consumer's answer is
 written by the executor's capi task as one response with its trailers.
 Deadlines of detached calls sit in a per-executor heap the capi task
 sweeps. Client and bidirectional streaming, and calls over HTTP/1.1, run
-on a task, whose deadline cancels it as a native handler's does. gRPC over
-HTTP/3 is not served (as natively: gRPC runs over HTTP/2).
+on a task, whose deadline cancels it as a native handler's does. The same
+services answer native gRPC on the HTTP/3 listener with no change.
 
 **Health.** With `"health": true`, `grpc.health.v1.Health` (Check, List,
 Watch) is Anole's: the server (`""`) and every configured service start
@@ -1896,8 +1892,8 @@ thread, before or after start.
 
 **Not in this ABI yet.** Reflection, server-side interceptors in the
 language (Anole's middleware applies: `request_id`, `jwt` (its claims are
-in the call event), `cors`, rate limits), gRPC over HTTP/3, and the
-gRPC client.
+in the call event), `cors`, rate limits), and the gRPC client (over
+HTTP/2 or HTTP/3).
 
 ## Lifecycle
 

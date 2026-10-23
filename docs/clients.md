@@ -249,6 +249,9 @@ defer gpa.free(body);
   (1xx) responses may come before the final one, as over HTTP/1.1.
 - After the server's GOAWAY, `request` fails with `error.ConnectionClosed`
   and `isOpen()` is false, while the streams the GOAWAY covers finish.
+- `s.resetCode()` is the error code of the RST_STREAM that ended a stream
+  (the server's, or the echo of one sent here), null when it did not end in
+  a reset.
 - A stream's `status`, `headers` and `trailers` live until `release`; copy
   what you keep.
 - `stream_window` (64 KiB) is what the server may send on a stream before
@@ -286,13 +289,21 @@ stream is open, a PING after that long, or half the idle timeout if that is
 shorter, with nothing sent or received, so a
 download whose client's port a NAT rebinding moved resumes instead of
 stalling; null for none), `session_cache`, `early_data` and `webtransport`
-(below), and `RequestOptions.early`; `tls` is not optional. `anole.h3` exports the names `anole.h2` does:
+(below), `RequestOptions.early`, and `RequestOptions.send_buffer` (how much
+request body may wait unacknowledged before a write waits; 64 KiB, the
+connection's budget still bounding all streams together); `tls` is not
+optional. `isOpen()` is false once the handshake failed, after a GOAWAY or
+after `close`, and `s.resetCode()` is the application error code of the
+server's RESET_STREAM. `anole.h3` exports the names `anole.h2` does:
 `ClientConnection`, `Stream`, `Header`, `ConnectOptions`, `RequestOptions`,
 `StreamError` and `version()` ("ngtcp2/1.25.0 nghttp3/1.18.0", against
 `anole.h2.version()`'s "nghttp2/1.70.0").
 
 The client does not discover HTTP/3 from `Alt-Svc` or retry over TCP.
-Connect to it when you know the server speaks it.
+Connect to it when you know the server speaks it, or read the header with
+`anole.h3.parseAltSvc(value, origin_host)`, which returns `.none`, `.clear`
+or `.h3 = .{ .port, .max_age_s }` (`anole.h3.AltSvc`). A gRPC `Channel`
+with `.http = .auto` does this itself ([grpc.md](grpc.md#http3)).
 
 ### Resumption and 0-RTT
 
