@@ -2336,6 +2336,16 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// from whichever task has something to send, no task holding
             /// it in between (`H3Parked`).
             parked: ?*H3Parked = null,
+            /// `serve` is still running this stream's handler (inline or on
+            /// its task), which holds the stream: an end of a detached or
+            /// parked response before it returns (a park that failed, or a
+            /// finish or release from inside the handler) leaves the
+            /// handler's hold to `serve`'s caller and sets
+            /// `ended_in_handler`, rather than letting go of a stream
+            /// `serve` still touches. Executor-local; `ended_in_handler`
+            /// is locked.
+            in_handler: bool = false,
+            ended_in_handler: bool = false,
 
             // The response.
             response_nv: []h.nghttp3_nv = &.{},
@@ -2711,26 +2721,38 @@ pub fn Endpoint(comptime Ctx: type) type {
                     }
                 }
 
-                server.dispatch(request, response) catch |err| switch (err) {
+                // Executor-local, as everything that ends a detached or
+                // parked response runs on the endpoint's executor: set and
+                // cleared without the lock, read under it.
+                s.in_handler = true;
+                const dispatched = server.dispatch(request, response);
+                s.in_handler = false;
+                // A detached response is its owner's (or over already, a
+                // park that failed having handled the error), whatever the
+                // handler returned: the stack copy is not written or freed
+                // here.
+                if (response.detached) |d| {
+                    detached = true;
+                    conn.lock();
+                    defer conn.unlock();
+                    const ended = s.ended_in_handler;
+                    s.ended_in_handler = false;
+                    // Already over (a park that failed, or a finish or
+                    // release from inside the handler): `d` may be gone with
+                    // the exchange, and the handler's hold is the caller's
+                    // to let go, as for a response written in place.
+                    if (ended) return .done;
+                    // On a task the detach was a park: the park holds the
+                    // stream, and the task's hold goes as usual. Inline, the
+                    // detach keeps the handler's hold until it is finished.
+                    if (inline_mode) s.detached = exchangeOf(d);
+                    return .detached;
+                }
+                dispatched catch |err| switch (err) {
                     error.ReadFailed => return body_reader.err orelse error.Unexpected,
                     error.WriteFailed => return sink_state.err orelse error.Unexpected,
                     else => |e| return e,
                 };
-                if (response.detached) |d| {
-                    // Finished later, from the moved copy.
-                    detached = true;
-                    // On a task the detach was a park (or a failed one,
-                    // already finished): the park holds the stream, and the
-                    // task's hold goes as usual.
-                    if (!inline_mode) return .detached;
-                    // A park that failed has finished the exchange and let
-                    // go of the stream already.
-                    if (d.state == .ended) return .detached;
-                    conn.lock();
-                    s.detached = exchangeOf(d);
-                    conn.unlock();
-                    return .detached;
-                }
                 try response.write();
                 return .done;
             }
@@ -2859,17 +2881,21 @@ pub fn Endpoint(comptime Ctx: type) type {
                 ex.response.write() catch |err| s.failed(err) catch {};
             } else |err| s.failed(err) catch {};
             ex.response.deinit();
+            conn.lock();
+            // Ended inside the handler (a park that failed, or a finish
+            // from inside it): `serve` sees it, and its caller lets go.
+            if (s.in_handler) s.ended_in_handler = true;
             // A park that failed on a handler's task: that task still holds
             // the stream and lets go when it ends.
             if (ex.response._detach_park_only) {
+                conn.unlock();
                 conn.kick();
                 return;
             }
-            conn.lock();
             s.detached = null;
             if (!s.body_done and !s.reset)
                 _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
-            s.release(.handler);
+            if (!s.in_handler) s.release(.handler);
             conn.unlock();
             conn.kick();
             // Last: the driver may free the connection once no task runs.
@@ -3054,8 +3080,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.parked_open -= 1;
                 _ = conn.tasks.fetchSub(1, .acq_rel);
                 // One release for both holds: the stream may be freed
-                // here, with `self` in its arena.
-                if (holds_handler) s.refs.handler = false;
+                // here, with `self` in its arena. Released from inside the
+                // handler, the handler's hold stays: `serve`'s caller lets
+                // go when it returns.
+                if (holds_handler) {
+                    if (s.in_handler) s.ended_in_handler = true else s.refs.handler = false;
+                }
                 s.release(.parked);
                 conn.kick();
                 if (conn.parked_open == 0) conn.parked_idle.broadcast(conn.ep.io);

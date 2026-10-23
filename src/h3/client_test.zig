@@ -1949,3 +1949,118 @@ test "parked h3: a no_wait route parks on the endpoint task; the connection clos
     try H3Park.on(io, .release);
     try eventually(io, 10, noConnections, f.ep);
 }
+
+/// A park that fails inside the handler (the peer reset the stream first):
+/// the park finishes the exchange, the handler returns the error, and the
+/// stream is let go exactly once, by `serve`'s caller. On the request's
+/// task, which waits for the reset through the body reader.
+const FailedPark = struct {
+    var result: ?anyerror = null;
+    var started: std.Io.Event = .unset;
+    var done: std.Io.Event = .unset;
+
+    fn reset() void {
+        result = null;
+        started = .unset;
+        done = .unset;
+    }
+
+    fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+        const io = req.io;
+        H3Park.io_ = io;
+        started.set(io);
+        const prev = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(prev);
+        // The body never comes: the read ends with the reset, so the park
+        // meets a reset stream.
+        var buf: [1]u8 = undefined;
+        _ = req._body_source.?.reader.readSliceShort(&buf) catch {};
+        try res.header("Content-Type", "text/event-stream");
+        const p = res._park(req, .{ .gone = H3Park.onGone, .ctx = &H3Park.dummy }) catch |err| {
+            result = err;
+            done.set(io);
+            return err;
+        };
+        p.release();
+        result = null;
+        done.set(io);
+    }
+
+    fn isDone(_: void) bool {
+        return done.isSet();
+    }
+};
+
+test "parked h3: a park that fails on a reset stream lets go of the stream once" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    H3Park.reset();
+    FailedPark.reset();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    f.http.router.post("/live", FailedPark.handle);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const s = try request(conn, "POST", "/live", .{ .body = true });
+    try FailedPark.started.wait(io);
+    s.cancel();
+    s.release();
+    try eventually(io, 10, FailedPark.isDone, {});
+    try std.testing.expectEqual(@as(?anyerror, error.WriteFailed), FailedPark.result);
+
+    // The connection serves on (a double release would have broken its
+    // stream count), and the stream is freed once.
+    const hello_body = try get(conn, "/hello", gpa);
+    defer gpa.free(hello_body);
+    try std.testing.expectEqualStrings("hello over h3", hello_body);
+    try eventually(io, 10, noServerStreams, f.ep);
+    try std.testing.expectEqual(@as(u32, 0), H3Park.gone_calls.load(.monotonic));
+}
+
+/// A `no_wait` handler (on the endpoint task) that parks, then sends,
+/// ends and releases the park before it returns: the stream is let go
+/// once, by `serve`'s caller, after the handler.
+fn parkEndRelease(req: *dusty.Request, res: *dusty.Response) !void {
+    try res.header("Content-Type", "text/event-stream");
+    H3Park.io_ = req.io;
+    const p = try res._park(req, .{ .gone = H3Park.onGone, .ctx = &H3Park.dummy });
+    if (!p.begin()) {
+        p.release();
+        return error.NoBurst;
+    }
+    p.write(&.{"data: x\n\n"}) catch |err| {
+        p.abort();
+        p.release();
+        return err;
+    };
+    p.end();
+    p.release();
+}
+
+test "parked h3: a no_wait handler that ends and releases its park before it returns lets go of the stream once" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    H3Park.reset();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    f.http.router.addRouteWith(.get, "/nw/once", parkEndRelease, .{ .no_wait = true });
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    for (0..3) |_| {
+        const s = try request(conn, "GET", "/nw/once", .{});
+        const body = try finish(s, gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings("data: x\n\n", body);
+    }
+    const hello_body = try get(conn, "/hello", gpa);
+    defer gpa.free(hello_body);
+    try std.testing.expectEqualStrings("hello over h3", hello_body);
+    try eventually(io, 10, noServerStreams, f.ep);
+    try std.testing.expectEqual(@as(u32, 0), H3Park.gone_calls.load(.monotonic));
+}
