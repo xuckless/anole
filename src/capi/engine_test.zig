@@ -230,7 +230,7 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
             step = "made-up handles";
             // Garbage handles are refused, never followed.
             {
-                const forged_ws: u64 = (@as(u64, 0xffffff) << 32) | (@as(u64, 2) << 28) | 1;
+                const forged_ws: u64 = (@as(u64, 0x7fffff) << 33) | (@as(u64, 2) << 28) | 1;
                 if (comptime features.websocket) {
                     try std.testing.expectError(error.Gone, engine.ws.send(a.e, forged_ws, abi.WS_TEXT, "x", false));
                     try std.testing.expectError(error.Over, engine.ws.close(a.e, forged_ws, 1000, ""));
@@ -649,8 +649,8 @@ fn wtCheck(a: *WtAnswerer, port: u16, io: std.Io, keep: *?*anole.webtransport.Se
 
     step = "made-up handles";
     {
-        const forged_session: u64 = (@as(u64, 0xffffff) << 32) | (@as(u64, 4) << 28) | 1;
-        const forged_stream: u64 = (@as(u64, 0xffffff) << 32) | (@as(u64, 5) << 28) | 1;
+        const forged_session: u64 = (@as(u64, 0x7fffff) << 33) | (@as(u64, 4) << 28) | 1;
+        const forged_stream: u64 = (@as(u64, 0x7fffff) << 33) | (@as(u64, 5) << 28) | 1;
         try std.testing.expectError(error.Gone, engine.wt.openStream(a.e, forged_session, false));
         try std.testing.expectError(error.Over, engine.wt.close(a.e, forged_session, 0, ""));
         try std.testing.expectError(error.Gone, engine.wt.write(a.e, forged_stream, "x", false, false));
@@ -1965,4 +1965,16 @@ test "capi: deployment resolution at create" {
         try std.testing.expectError(error.DeploymentUnavailable, engine.Engine.create("{\"deployment\":\"lambda\"}", false, &why));
         try std.testing.expect(why.buffered().len > 0);
     }
+}
+
+// Pass 3's areas: each its own file of C ABI tests (research/p3-pass/PLAN.md R8).
+test {
+    _ = @import("net_test.zig");
+    _ = @import("jobs_test.zig");
+    _ = @import("webhooks_test.zig");
+    _ = @import("sse_test.zig");
+    _ = @import("watch_test.zig");
+    _ = @import("s3_test.zig");
+    _ = @import("smtp_test.zig");
+    _ = @import("lambda_test.zig");
 }

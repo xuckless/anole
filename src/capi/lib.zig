@@ -114,6 +114,7 @@ fn genericName(code: i32) []const u8 {
         abi.E_TIMEOUT => "Timeout",
         abi.E_DB => "Database",
         abi.E_BROKER => "Broker",
+        abi.E_SERVICE => "Service",
         else => "Unexpected",
     };
 }
@@ -134,6 +135,7 @@ fn failCode(code: i32) i32 {
         abi.E_TIMEOUT => "the timeout passed",
         abi.E_DB => "the database refused the statement",
         abi.E_BROKER => "the message broker refused the call or could not be reached",
+        abi.E_SERVICE => "the object store or mail server refused the call or could not be reached",
         else => "error",
     }});
     last_error_name = genericName(code);
@@ -281,6 +283,12 @@ export fn anole_has_feature(name: Str) i32 {
         .{ "nats", f.nats },
         .{ "kafka", f.kafka },
         .{ "console", f.console },
+        .{ "net", f.net },
+        .{ "jobs", f.jobs },
+        .{ "webhooks", f.webhooks },
+        .{ "s3", f.s3 },
+        .{ "smtp", f.smtp },
+        .{ "lambda", f.lambda },
     };
     inline for (table) |entry| if (std.mem.eql(u8, n, entry[0])) return @intFromBool(entry[1]);
     return 0;
@@ -811,6 +819,7 @@ export fn anole_handle_release(h: u64) i32 {
     const kind = Handle.decode(h).kind;
     const valid = h != 0 and Handle.decode(h).gen != 0 and switch (kind) {
         .request, .websocket, .grpc_call, .wt_session, .wt_stream, .db_tx, .broker_sub, .broker_msg => true,
+        .net_conn, .net_udp, .job_worker, .job, .sse, .watch_sub, .transfer, .kafka_group, .kafka_batch => true,
         else => false,
     };
     if (!valid) return wrongKind();
@@ -1186,7 +1195,7 @@ export fn anole_kafka_subscribe(k: ?*anyopaque, c_: ?*anyopaque, opts: ?*const a
 }
 
 export fn anole_kafka_batch_done(b: u64) i32 {
-    if (badKind(b, .broker_msg) or !kafka_mod.isKafka(b)) return wrongKind();
+    if (badKind(b, .kafka_batch)) return wrongKind();
     const e = live() orelse return abi.OK;
     kafka_mod.batchDone(e, b);
     return abi.OK;
@@ -1194,14 +1203,14 @@ export fn anole_kafka_batch_done(b: u64) i32 {
 
 export fn anole_kafka_batch_retry(b: u64, delay_ms: u32) i32 {
     clearError();
-    if (badKind(b, .broker_msg) or !kafka_mod.isKafka(b)) return wrongKind();
+    if (badKind(b, .kafka_batch)) return wrongKind();
     const e = live() orelse return failCode(abi.E_GONE);
     kafka_mod.batchRetry(e, b, delay_ms) catch |err| return kafkaFailure(err);
     return abi.OK;
 }
 
 export fn anole_kafka_group_close(g: u64) i32 {
-    if (badKind(g, .broker_sub) or !kafka_mod.isKafka(g)) return wrongKind();
+    if (badKind(g, .kafka_group)) return wrongKind();
     const e = live() orelse return abi.OK;
     kafka_mod.groupClose(e, g);
     return abi.OK;
@@ -1335,3 +1344,24 @@ export fn anole_db_tx_release(tx: u64) i32 {
     db_mod.txRelease(e, tx);
     return abi.OK;
 }
+
+// ---- p3/net ----
+// ---- end p3/net ----
+
+// ---- p3/jobs ----
+// ---- end p3/jobs ----
+
+// ---- p3/webhooks ----
+// ---- end p3/webhooks ----
+
+// ---- p3/realtime ----
+// ---- end p3/realtime ----
+
+// ---- p3/s3 ----
+// ---- end p3/s3 ----
+
+// ---- p3/smtp ----
+// ---- end p3/smtp ----
+
+// ---- p3/lambda ----
+// ---- end p3/lambda ----

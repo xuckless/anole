@@ -47,6 +47,51 @@
       "kind": 9,
       "name": "broker_msg",
       "c_type": "anole_nats_msg"
+    },
+    {
+      "kind": 10,
+      "name": "net_conn",
+      "c_type": "anole_net_conn"
+    },
+    {
+      "kind": 11,
+      "name": "net_udp",
+      "c_type": "anole_net_udp"
+    },
+    {
+      "kind": 12,
+      "name": "job_worker",
+      "c_type": "anole_job_worker"
+    },
+    {
+      "kind": 13,
+      "name": "job",
+      "c_type": "anole_job"
+    },
+    {
+      "kind": 14,
+      "name": "sse",
+      "c_type": "anole_sse"
+    },
+    {
+      "kind": 15,
+      "name": "watch_sub",
+      "c_type": "anole_watch_sub"
+    },
+    {
+      "kind": 16,
+      "name": "transfer",
+      "c_type": "anole_s3_transfer"
+    },
+    {
+      "kind": 17,
+      "name": "kafka_group",
+      "c_type": "anole_kafka_group"
+    },
+    {
+      "kind": 18,
+      "name": "kafka_batch",
+      "c_type": "anole_kafka_batch"
     }
   ],
   "events": [
@@ -93,7 +138,11 @@
         "request",
         "grpc_call",
         "websocket",
-        "wt_stream"
+        "wt_stream",
+        "net_conn",
+        "net_udp",
+        "sse",
+        "transfer"
       ],
       "obligation": null
     },
@@ -106,7 +155,8 @@
         "websocket",
         "grpc_call",
         "wt_stream",
-        "wt_session"
+        "wt_session",
+        "net_conn"
       ],
       "obligation": null
     },
@@ -328,7 +378,7 @@
       "name": "ANOLE_EV_KAFKA_RECORDS",
       "record": "anole_kafka_records_event",
       "handles": [
-        "broker_msg"
+        "kafka_batch"
       ],
       "obligation": "batch_done or batch_retry"
     },
@@ -344,7 +394,7 @@
       "name": "ANOLE_EV_KAFKA_ASSIGN",
       "record": "anole_kafka_assign_event",
       "handles": [
-        "broker_sub"
+        "kafka_group"
       ],
       "obligation": null
     },
@@ -353,7 +403,7 @@
       "name": "ANOLE_EV_KAFKA_REVOKE",
       "record": "anole_kafka_assign_event",
       "handles": [
-        "broker_sub"
+        "kafka_group"
       ],
       "obligation": null
     },
@@ -369,7 +419,7 @@
       "name": "ANOLE_EV_KAFKA_GROUP_END",
       "record": "anole_broker_end_event",
       "handles": [
-        "broker_sub"
+        "kafka_group"
       ],
       "obligation": null
     }
@@ -412,8 +462,48 @@
     },
     {
       "from": 64,
+      "to": 79,
+      "use": "NATS"
+    },
+    {
+      "from": 80,
+      "to": 95,
+      "use": "Kafka"
+    },
+    {
+      "from": 96,
+      "to": 103,
+      "use": "raw TCP and UDP (net; 101-103 reserved)"
+    },
+    {
+      "from": 104,
+      "to": 111,
+      "use": "jobs and webhooks (111 reserved)"
+    },
+    {
+      "from": 112,
+      "to": 115,
+      "use": "SSE (114-115 reserved)"
+    },
+    {
+      "from": 116,
+      "to": 123,
+      "use": "watch (119-123 reserved)"
+    },
+    {
+      "from": 124,
+      "to": 131,
+      "use": "storage and mail: S3 124-125, SMTP 126 (127-131 reserved)"
+    },
+    {
+      "from": 132,
+      "to": 135,
+      "use": "console (133-135 reserved)"
+    },
+    {
+      "from": 136,
       "to": 255,
-      "use": "new areas, a block of 16 per area"
+      "use": "new areas"
     },
     {
       "from": 256,
@@ -478,7 +568,10 @@
       "ANOLE_DB_ERR_DEADLOCK": 7,
       "ANOLE_DB_ERR_UNAVAILABLE": 8,
       "ANOLE_DB_ERR_TIMEOUT": 9,
-      "ANOLE_DB_ERR_OTHER": 10
+      "ANOLE_DB_ERR_OTHER": 10,
+      "ANOLE_DB_ERR_NOT_FOUND": 11,
+      "ANOLE_DB_ERR_PRECONDITION": 12,
+      "ANOLE_DB_ERR_INVALID": 13
     },
     "db_flag": {
       "ANOLE_DB_F_WRITE": 1,
@@ -702,7 +795,8 @@
       "ANOLE_E_SYSTEM": -9,
       "ANOLE_E_TIMEOUT": -10,
       "ANOLE_E_DB": -11,
-      "ANOLE_E_BROKER": -12
+      "ANOLE_E_BROKER": -12,
+      "ANOLE_E_SERVICE": -13
     },
     "tls_flag": {
       "ANOLE_TLS_F_PEM": 1
@@ -2651,6 +2745,7 @@
     "ReservedNotZero",
     "RouteConflict",
     "ServerAlreadyOnThread",
+    "Service",
     "SeveralHttp3Listeners",
     "State",
     "SyntaxError",

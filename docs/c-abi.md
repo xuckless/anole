@@ -290,12 +290,40 @@ parameters, metadata) are reached through the offset stored in the record.
 | `ANOLE_EV_KAFKA_WRITABLE` (84) | `anole_broker_status_event`: a produce refused with `ANOLE_E_AGAIN` (or advised with `ANOLE_BUSY`) would be taken now | 0 | none |
 | `ANOLE_EV_KAFKA_GROUP_END` (85) | `anole_broker_end_event`: the group membership is over (`reason`) | `anole_kafka_group` | ends it |
 | (86-95) | reserved for Kafka | | |
-| `ANOLE_EV_CONSOLE_CLOSED` (132) | `anole_console_closed_event`: the in-process console closed (`reason`: `ANOLE_CONSOLE_QUIT`, `_INTERRUPT`, `_RESTARTING`); only after `anole_console_open`. 133-135 are reserved for the console | 0 | none: resume reading stdin |
+| `ANOLE_EV_NET_OPEN` (96) | `anole_net_open_event`: a raw TCP connection opened (ABI 0.10, p3/net) | `anole_net_conn` | none (the connection runs until CLOSE) |
+| `ANOLE_EV_NET_DATA` (97) | `anole_net_data_event`: bytes or frames of a connection | `anole_net_conn` | none |
+| `ANOLE_EV_NET_END` (98) | `anole_event`: the peer ended its side | `anole_net_conn` | with `half_open`: end this side when done |
+| `ANOLE_EV_NET_CLOSE` (99) | `anole_net_close_event`: the connection is over | `anole_net_conn` | ends it |
+| `ANOLE_EV_NET_DATAGRAMS` (100) | `anole_net_datagrams_event`: a batch of datagrams of a UDP socket | `anole_net_udp` | none |
+| (101-103) | reserved for raw TCP and UDP | | |
+| `ANOLE_EV_JOB_ENQUEUED` (104) | `anole_job_enqueued_event`: the answer to `anole_jobs_enqueue` (ABI 0.10, p3/jobs) | 0, or the `anole_db_tx` | none |
+| `ANOLE_EV_JOB` (105) | `anole_job_event`: a job for a worker | `anole_job` | `anole_job_finish` (or `anole_handle_release` = retry) |
+| `ANOLE_EV_JOB_CANCEL` (106) | `anole_job_cancel_event`: a held job was canceled | `anole_job` | ends it |
+| `ANOLE_EV_JOB_WORKER_END` (107) | `anole_job_worker_end_event`: the worker stopped | `anole_job_worker` | ends it |
+| `ANOLE_EV_JOBS_RESULT` (108) | `anole_jobs_result_event`: the answer to an admin call | 0 | none |
+| `ANOLE_EV_WEBHOOK_PUBLISHED` (109) | `anole_webhook_published_event`: the answer to `anole_webhooks_publish` (p3/webhooks) | 0, or the `anole_db_tx` | none |
+| `ANOLE_EV_WEBHOOK_STATUS` (110) | `anole_webhook_status_event` | 0 | none |
+| (111) | reserved for jobs and webhooks | | |
+| `ANOLE_EV_SSE_SUBSCRIBE` (112) | `anole_request_event`: a subscriber on a consumer's SSE route (ABI 0.10, p3/realtime) | `anole_req` | `anole_sse_accept`, or any request answer (a refusal) |
+| `ANOLE_EV_SSE_CLOSE` (113) | `anole_sse_close_event`: the subscriber is gone | `anole_sse` | ends it |
+| (114-115) | reserved for SSE | | |
+| `ANOLE_EV_WATCH_EVENT` (116) | `anole_watch_event`: a change a watch saw | `anole_watch_sub` | `anole_watch_ack` for a stream group with `"ack": "manual"` |
+| `ANOLE_EV_WATCH_STATUS` (117) | `anole_watch_status_event` | `anole_watch_sub` | none |
+| `ANOLE_EV_WATCH_END` (118) | `anole_watch_end_event`: the watch is over | `anole_watch_sub` | ends it |
+| (119-123) | reserved for watch | | |
+| `ANOLE_EV_S3_RESULT` (124) | `anole_s3_result_event`: the answer to an `anole_s3_*` call (ABI 0.10, p3/s3) | 0, or the `anole_s3_transfer` it opens or ends | a transfer it opens: write and finish it, or read it to the end, or `anole_handle_release` |
+| `ANOLE_EV_S3_DATA` (125) | `anole_s3_data_event`: bytes of a download | `anole_s3_transfer` | none (FIN ends the handle) |
+| `ANOLE_EV_SMTP_RESULT` (126) | `anole_smtp_result_event`: the answer to `anole_smtp_send` (p3/smtp) | 0 | none |
+| (127-131) | reserved for storage and mail | | |
+| `ANOLE_EV_CONSOLE_CLOSED` (132) | `anole_console_closed_event`: the in-process console closed (`reason`: `ANOLE_CONSOLE_QUIT`, `_INTERRUPT`, `_RESTARTING`); only after `anole_console_open` | 0 | none: resume reading stdin |
+| (133-135) | reserved for the console | | |
 | `ANOLE_EV_DRAINING` (41) | `anole_event`: `anole_server_drain` was called; once per consumer, before sockets get 1001 or requests are cut: finish long polls and event streams | 0 | none |
 
 The numbers are allocated once and frozen: 0 none; 1-11 core; 12-19 gRPC;
 20-29 WebTransport; 30-39 database; 40-49 HTTP and WebSocket additions;
-50-63 core additions; 64-255 new areas, sixteen per area; 256 and up are
+50-63 core additions; 64-79 NATS; 80-95 Kafka; 96-103 raw TCP and UDP;
+104-111 jobs and webhooks; 112-115 SSE; 116-123 watch; 124-131 storage and
+mail; 132-135 the console; 136-255 new areas; 256 and up are
 never used by Anole (0x80000000 and up are free for a binding's own
 synthetic events in its dispatch loop). Three rules go with them: a consumer
 **skips types it does not know** (`ev.len`); an event that creates an
@@ -336,9 +364,32 @@ was answered, expired, aborted or made up gets `ANOLE_E_GONE`, never another
 request; a cleanup call gets `ANOLE_OK`; a handle that is 0 or of another
 kind than the call takes gets `ANOLE_E_INVALID` (rule 10). Treat the bits as
 opaque; 0 is never a handle. The kinds (published in `anole.abi.json` for
-diagnostics) are: 1 request, 2 websocket, 3 grpc_call, 4 wt_session,
-5 wt_stream, 6 db_tx (a database transaction; `anole_handle_release` rolls an
-open one back), 7 reserved for a per-query handle, 8-15 reserved.
+diagnostics) are:
+
+| Kind | Name | C type |
+| --- | --- | --- |
+| 1 | request | `anole_req` |
+| 2 | websocket | `anole_ws` |
+| 3 | grpc_call | `anole_grpc_call` |
+| 4 | wt_session | `anole_wt` |
+| 5 | wt_stream | `anole_wt_stream` |
+| 6 | db_tx | `anole_db_tx` (`anole_handle_release` rolls an open one back) |
+| 7 | reserved for a per-query handle | |
+| 8 | broker_sub | `anole_nats_sub` |
+| 9 | broker_msg | `anole_nats_msg` |
+| 10 | net_conn | `anole_net_conn` |
+| 11 | net_udp | `anole_net_udp` |
+| 12 | job_worker | `anole_job_worker` |
+| 13 | job | `anole_job` |
+| 14 | sse | `anole_sse` |
+| 15 | watch_sub | `anole_watch_sub` |
+| 16 | transfer | `anole_s3_transfer` |
+| 17 | kafka_group | `anole_kafka_group` |
+| 18 | kafka_batch | `anole_kafka_batch` |
+
+19-31 are free. Since ABI 0.10 a Kafka group and batch are kinds of their
+own (before, NATS's kinds with a marker bit), so a NATS handle given to a
+Kafka call is the wrong kind.
 
 `anole_handle_release(h)` ends any handle, whatever its kind, the way the
 application giving up would: an unanswered request gets
@@ -392,13 +443,15 @@ when it did not come from the OS):
 | `ANOLE_E_TIMEOUT` | a blocking call's timeout passed (a query's `timeout_ms`, in its answer) |
 | `ANOLE_E_DB` | in a query's answer: the database refused the statement (`error_class`) |
 | `ANOLE_E_BROKER` | in a broker call's answer: the broker refused it or could not be reached (`error_class`) |
+| `ANOLE_E_SERVICE` | in an object store's or mail server's answer: it refused the call or could not be reached (`error_class`, `http_status`, `error_code`) |
 
 ### Error tokens
 
 `anole_last_error_name()` is a stable token for the same error: a specific
 name from this table (also `error_names` in `anole.abi.json`), or, when
 there is none, the code's own name (`Invalid`, `Gone`, `Again`, `NoMemory`,
-`Config`, `State`, `Unsupported`, `TooBig`, `System`, `Timeout`, `Database`).
+`Config`, `State`, `Unsupported`, `TooBig`, `System`, `Timeout`, `Database`,
+`Broker`, `Service`).
 Bindings may switch on it; tokens are only ever added.
 
 | Token | Code | From |

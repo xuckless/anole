@@ -155,8 +155,11 @@ enum {
   ANOLE_E_SYSTEM = -9,      /* the OS refused (threads, sockets, files) */
   ANOLE_E_TIMEOUT = -10,    /* a blocking call's timeout passed */
   ANOLE_E_DB = -11,         /* a database refused a statement (anole_db_result_event) */
-  ANOLE_E_BROKER = -12      /* a message broker refused a call or could not be reached
+  ANOLE_E_BROKER = -12,     /* a message broker refused a call or could not be reached
                                (anole_nats_reply_event: error_class says why) */
+  ANOLE_E_SERVICE = -13     /* an object store or mail server refused a call or could not be
+                               reached (the record's error_class, http_status and error_code
+                               say why) */
 };
 
 /* The text of the last error on the calling thread, for logs: not API.
@@ -168,7 +171,7 @@ ANOLE_API anole_str anole_last_error(void);
    "AddressInUse", "KeyMismatch", "UnknownField", "WrongHandleKind"; or, when
    there is none, the code's own name: "Invalid", "Gone", "Again",
    "NoMemory", "Config", "State", "Unsupported", "TooBig", "System",
-   "Timeout", "Database". Static storage. API: bindings may switch on it,
+   "Timeout", "Database", "Broker", "Service". Static storage. API: bindings may switch on it,
    and tokens are only ever added. */
 ANOLE_API anole_str anole_last_error_name(void);
 /* The OS error behind the last error on this thread: errno on POSIX, the
@@ -181,7 +184,8 @@ ANOLE_API uint32_t anole_abi_version(void);
 ANOLE_API anole_str anole_version(void);
 /* 1 when `name` is built in, else 0: "tls", "http2", "http3",
    "webtransport" (with http3), "websocket", "compression", "brotli",
-   "auth", "grpc", "sqlite", "postgres", "redis", "mongodb". */
+   "auth", "grpc", "sqlite", "postgres", "redis", "mongodb", "nats", "kafka",
+   "console", "net", "jobs", "webhooks", "s3", "smtp", "lambda". */
 ANOLE_API int32_t anole_has_feature(anole_str name);
 
 /* 64-bit, generation-checked; 0 is never valid. Each handle has a kind
@@ -197,6 +201,13 @@ typedef uint64_t anole_wt_stream; /* one of its streams: until anole_handle_rele
 typedef uint64_t anole_db_tx;     /* one database transaction: from the answer to anole_db_begin until commit, rollback or release */
 typedef uint64_t anole_nats_sub;  /* a NATS subscription or JetStream consume: until ANOLE_EV_NATS_SUB_END */
 typedef uint64_t anole_nats_msg;  /* a JetStream message: until acked, nak'd, termed or released */
+typedef uint64_t anole_net_conn;   /* one raw TCP connection: from ANOLE_EV_NET_OPEN until ANOLE_EV_NET_CLOSE */
+typedef uint64_t anole_net_udp;    /* one UDP socket of a raw listener: from start until ANOLE_EV_STOPPED */
+typedef uint64_t anole_job_worker; /* a jobs worker: until ANOLE_EV_JOB_WORKER_END */
+typedef uint64_t anole_job;        /* one job a worker holds: until finished, released or ANOLE_EV_JOB_CANCEL */
+typedef uint64_t anole_sse;        /* one SSE subscriber a consumer accepted: until ANOLE_EV_SSE_CLOSE */
+typedef uint64_t anole_watch_sub;  /* one watch listener: until ANOLE_EV_WATCH_END */
+typedef uint64_t anole_s3_transfer; /* an S3 upload or download: until finished, failed or released */
 typedef uint64_t anole_kafka_group; /* a Kafka group membership: until ANOLE_EV_KAFKA_GROUP_END */
 typedef uint64_t anole_kafka_batch; /* the records of one partition: until done, retried or released */
 typedef struct anole_server anole_server;     /* opaque */
@@ -483,6 +494,27 @@ enum anole_event_type {
   ANOLE_EV_KAFKA_WRITABLE = 84,  /* anole_broker_status_event: a produce refused with
                                     ANOLE_E_AGAIN (or advised with ANOLE_BUSY) would be taken now */
   ANOLE_EV_KAFKA_GROUP_END = 85, /* anole_broker_end_event; handle: anole_kafka_group, now over */
+  /* ---- p3/net ---- */
+  /* ---- end p3/net ---- */
+
+  /* ---- p3/jobs ---- */
+  /* ---- end p3/jobs ---- */
+
+  /* ---- p3/webhooks ---- */
+  /* ---- end p3/webhooks ---- */
+
+  /* ---- p3/realtime ---- */
+  /* ---- end p3/realtime ---- */
+
+  /* ---- p3/s3 ---- */
+  /* ---- end p3/s3 ---- */
+
+  /* ---- p3/smtp ---- */
+  /* ---- end p3/smtp ---- */
+
+  /* ---- p3/lambda ---- */
+  /* ---- end p3/lambda ---- */
+
   ANOLE_EV_CONSOLE_CLOSED = 132  /* anole_console_closed_event, handle 0: the in-process console
                                     (anole_console_open) closed; the terminal is the binding's
                                     again. Only after anole_console_open. 133-135 are reserved
@@ -1362,7 +1394,11 @@ enum {
   ANOLE_DB_ERR_DEADLOCK = 7,
   ANOLE_DB_ERR_UNAVAILABLE = 8,   /* no connection, or busy past its timeout */
   ANOLE_DB_ERR_TIMEOUT = 9,
-  ANOLE_DB_ERR_OTHER = 10         /* syntax, a wrong parameter count, ... */
+  ANOLE_DB_ERR_OTHER = 10,        /* syntax, a wrong parameter count, ... */
+  ANOLE_DB_ERR_NOT_FOUND = 11,    /* the object, bucket or upload does not exist (S3 404) */
+  ANOLE_DB_ERR_PRECONDITION = 12, /* a condition the call set did not hold (S3 412, 409) */
+  ANOLE_DB_ERR_INVALID = 13       /* the service refused the input: a range past the end, a
+                                     key too long, every mail recipient refused */
 };
 
 /* One cell of a row. Text and blobs are spans in the record.
@@ -1749,6 +1785,27 @@ typedef struct anole_kafka_assign_event {
   uint32_t entries_off;  /* nentries anole_kafka_partition */
   uint32_t nentries;
 } anole_kafka_assign_event; /* 32 bytes */
+
+/* ---- p3/net ---- */
+/* ---- end p3/net ---- */
+
+/* ---- p3/jobs ---- */
+/* ---- end p3/jobs ---- */
+
+/* ---- p3/webhooks ---- */
+/* ---- end p3/webhooks ---- */
+
+/* ---- p3/realtime ---- */
+/* ---- end p3/realtime ---- */
+
+/* ---- p3/s3 ---- */
+/* ---- end p3/s3 ---- */
+
+/* ---- p3/smtp ---- */
+/* ---- end p3/smtp ---- */
+
+/* ---- p3/lambda ---- */
+/* ---- end p3/lambda ---- */
 
 #ifdef __cplusplus
 }

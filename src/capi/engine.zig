@@ -74,6 +74,15 @@ pub const pipe = pipe_mod;
 pub const db = @import("db.zig");
 pub const nats = @import("nats.zig");
 pub const kafka = @import("kafka.zig");
+/// Pass 3's areas (ABI 0.10): each a module with fixed hooks, called from
+/// here in one order (`openAreas`, `closeAreas`, ...).
+pub const net = @import("net.zig");
+pub const jobs = @import("jobs.zig");
+pub const webhooks = @import("webhooks.zig");
+pub const sse = @import("sse.zig");
+pub const watch = @import("watch.zig");
+pub const s3 = @import("s3.zig");
+pub const smtp = @import("smtp.zig");
 pub const config = config_mod;
 
 const log = std.log.scoped(.anole_capi);
@@ -125,15 +134,17 @@ pub fn stateOf(word: u64) SlotState {
 /// A handle as the consumer sees it: which executor, which slot, which
 /// generation of it, and which kind of thing (a function given a handle of
 /// another kind answers `ANOLE_E_GONE`, never acts on the wrong object).
+/// Bits 0-27 the generation, 28-32 the kind, 33-55 the slot, 56-63 the
+/// executor (ABI 0.10).
 pub const Handle = packed struct(u64) {
     gen: u28,
     kind: Kind,
-    slot: u24,
+    slot: u23,
     exec: u8,
 
-    /// Room for what ABI 0.x adds before it freezes: gRPC calls, WebTransport
-    /// sessions and streams, database queries.
-    pub const Kind = enum(u4) {
+    /// Room for what ABI 0.x adds before it freezes; 7 is reserved and
+    /// 19-31 are free.
+    pub const Kind = enum(u5) {
         request = 1,
         websocket = 2,
         grpc_call = 3,
@@ -147,6 +158,24 @@ pub const Handle = packed struct(u64) {
         broker_sub = 8,
         /// A JetStream message (`anole_nats_msg`).
         broker_msg = 9,
+        /// A raw TCP connection (`anole_net_conn`).
+        net_conn = 10,
+        /// A raw UDP socket of a listener (`anole_net_udp`).
+        net_udp = 11,
+        /// A jobs worker (`anole_job_worker`).
+        job_worker = 12,
+        /// A job a worker holds (`anole_job`).
+        job = 13,
+        /// An SSE subscriber a consumer accepted (`anole_sse`).
+        sse = 14,
+        /// A watch listener (`anole_watch_sub`).
+        watch_sub = 15,
+        /// An S3 upload or download (`anole_s3_transfer`).
+        transfer = 16,
+        /// A Kafka group membership (`anole_kafka_group`).
+        kafka_group = 17,
+        /// The records of one Kafka partition (`anole_kafka_batch`).
+        kafka_batch = 18,
         _,
     };
 
@@ -158,8 +187,26 @@ pub const Handle = packed struct(u64) {
     }
 };
 
+test "Handle: the kind in bits 28-32; every kind, the last slot and the last generation round-trip" {
+    try std.testing.expectEqual(@as(u64, 18) << 28, Handle.encode(.{ .gen = 0, .kind = .kafka_batch, .slot = 0, .exec = 0 }));
+    try std.testing.expectEqual(@as(u64, 1) << 33, Handle.encode(.{ .gen = 0, .kind = @fromBackingInt(@as(u5, 0)), .slot = 1, .exec = 0 }));
+    for (1..19) |k| {
+        const h: Handle = .{ .gen = std.math.maxInt(u28), .kind = @fromBackingInt(@as(u5, @intCast(k))), .slot = max_slots - 1, .exec = 255 };
+        const back = Handle.decode(Handle.encode(h));
+        try std.testing.expectEqual(h.kind, back.kind);
+        try std.testing.expectEqual(@as(u23, max_slots - 1), back.slot);
+        try std.testing.expectEqual(@as(u28, std.math.maxInt(u28)), back.gen);
+        try std.testing.expectEqual(@as(u8, 255), back.exec);
+    }
+}
+
 /// Generations count 1..max_gen and wrap to 1 (0 is never valid).
 pub const max_gen: u32 = std.math.maxInt(u28);
+
+/// Slots per executor a handle can name: every slot table stays below it
+/// (a comptime check where its bound is static, a start-time one where the
+/// configuration sets it).
+pub const max_slots: u32 = 1 << 23;
 
 pub fn nextGen(gen: u32) u32 {
     return if (gen >= max_gen) 1 else gen + 1;
@@ -453,6 +500,13 @@ pub const Exec = struct {
     db: db.ExecState = .{},
     nats: nats.ExecState = .{},
     kafka: kafka.ExecState = .{},
+    net: net.ExecState = .{},
+    jobs: jobs.ExecState = .{},
+    webhooks: webhooks.ExecState = .{},
+    sse: sse.ExecState = .{},
+    watch: watch.ExecState = .{},
+    s3: s3.ExecState = .{},
+    smtp: smtp.ExecState = .{},
 
     /// The capi task is asleep for a whole request timeout: wakes it, as a
     /// deadline (or a lost doorbell) now needs watching.
@@ -1015,6 +1069,14 @@ pub const Engine = struct {
     /// The Kafka ones (`anole_kafka *`), and their handles.
     kafka_brokers: []kafka.Broker = &.{},
     kafka_state: kafka.State = .{},
+    /// Pass 3's areas, engine-wide.
+    net_state: net.State = .{},
+    jobs_state: jobs.State = .{},
+    webhooks_state: webhooks.State = .{},
+    sse_state: sse.State = .{},
+    watch_state: watch.State = .{},
+    s3_state: s3.State = .{},
+    smtp_state: smtp.State = .{},
     /// WebSocket topics, shared by every executor.
     rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) .init(gpa, .{}) else {},
     /// gRPC services, methods, descriptors and health.
@@ -1062,6 +1124,14 @@ pub const Engine = struct {
             ki += 1;
         };
         e.kafka_state.init(e.first_gen);
+        e.net_state.init(e.first_gen);
+        e.jobs_state.init(e.first_gen);
+        e.webhooks_state.init(e.first_gen);
+        e.sse_state.init(e.first_gen);
+        e.watch_state.init(e.first_gen);
+        e.s3_state.init(e.first_gen);
+        e.smtp_state.init(e.first_gen);
+        try sse.create(e, why);
         // The modes (docs/config.md): resolved once, here, so a binding sees
         // $PORT and the filled addresses before it starts.
         var opts = try e.serverOptions(a);
@@ -1186,6 +1256,10 @@ pub const Engine = struct {
         db.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         nats.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         kafka.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
+        e.openAreas(&app) catch |err| {
+            e.closeAreas();
+            return e.failStartDeinit(&app, err);
+        };
         for (e.execs, 0..) |*x, i| placement.concurrent(&e.tasks, app.io(), .{ .executor = i }, capiTask, .{ e, x }) catch |err| {
             e.tasks.cancel(app.io());
             return e.failStartDeinit(&app, err);
@@ -1196,6 +1270,7 @@ pub const Engine = struct {
         app.startConnectors() catch |err| {
             e.explained_len = app.explainStart(&e.explained, error.DatabaseUnavailable).len;
             e.tasks.cancel(app.io());
+            e.closeAreas();
             db.close(e);
             nats.close(e);
             kafka.close(e);
@@ -1209,6 +1284,7 @@ pub const Engine = struct {
         if (!e.abandon.load(.acquire)) {
             watcher = app.io().concurrent(watchReady, .{ e, &app }) catch |err| {
                 e.tasks.cancel(app.io());
+                e.closeAreas();
                 db.close(e);
                 nats.close(e);
                 kafka.close(e);
@@ -1217,7 +1293,8 @@ pub const Engine = struct {
             // Control calls may reach the server from here until `run` returns.
             _ = e.ctl.fetchAnd(~ctl_closed, .release);
             e.phase.store(.running, .release);
-            result = app.run();
+            // The watches start with serving (`anole_server_start`).
+            result = if (watch.start(e, &app)) |_| app.run() else |err| err;
         }
         e.closeControl(app.io());
         if (watcher) |*w| w.cancel(app.io());
@@ -1226,6 +1303,8 @@ pub const Engine = struct {
         for (e.execs) |*x| x.db.cancel(app.io());
         for (e.execs) |*x| x.nats.cancel(app.io());
         for (e.execs) |*x| x.kafka.cancel(app.io());
+        for (e.execs) |*x| cancelAreas(x, app.io());
+        e.closeAreas();
         db.close(e);
         nats.close(e);
         kafka.close(e);
@@ -1558,6 +1637,8 @@ pub const Engine = struct {
 
     fn setupExecs(e: *Engine, n: usize) !void {
         const per = e.config.limits.max_inflight;
+        // Request slots are named by a handle's 23-bit slot.
+        if (per == 0 or per > max_slots) return error.InvalidValue;
         const queue = if (e.config.limits.queue > 0) e.config.limits.queue else per * 2;
         e.execs = try gpa.alloc(Exec, n);
         var made: usize = 0;
@@ -1629,6 +1710,11 @@ pub const Engine = struct {
         if (e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire) == null) {
             e.notifyDraining();
             kafka.draining(e);
+            jobs.draining(e);
+            webhooks.draining(e);
+            watch.draining(e);
+            s3.draining(e);
+            smtp.draining(e);
         }
         app.stop();
     }
@@ -1754,9 +1840,13 @@ pub const Engine = struct {
         for (e.execs) |*x| {
             for (x.slots) |*s| last = @max(last, genOf(s.word.load(.acquire)));
             last = @max(last, x.ws.maxGen(), x.wt.maxGen(), x.db.maxGen());
+            last = @max(last, x.net.maxGen(), x.jobs.maxGen(), x.webhooks.maxGen(), x.sse.maxGen());
+            last = @max(last, x.watch.maxGen(), x.s3.maxGen(), x.smtp.maxGen());
         }
         last = @max(last, e.nats_state.maxGen());
         last = @max(last, e.kafka_state.maxGen());
+        last = @max(last, e.net_state.maxGen(), e.jobs_state.maxGen(), e.webhooks_state.maxGen(), e.sse_state.maxGen());
+        last = @max(last, e.watch_state.maxGen(), e.s3_state.maxGen(), e.smtp_state.maxGen());
         next_first_gen = nextGen(last);
         if (global == e) global = null;
         for (e.execs) |*x| {
@@ -1786,7 +1876,15 @@ pub const Engine = struct {
             x.db.deinit();
             x.nats.deinit();
             x.kafka.deinit();
+            x.net.deinit();
+            x.jobs.deinit();
+            x.webhooks.deinit();
+            x.sse.deinit();
+            x.watch.deinit();
+            x.s3.deinit();
+            x.smtp.deinit();
         }
+        e.destroyAreas();
         e.nats_state.deinit();
         kafka.destroy(e);
         e.kafka_state.deinit();
@@ -1811,7 +1909,7 @@ pub const Engine = struct {
             wakes += c.wakes.load(.monotonic);
             rewakes += c.rewakes.load(.monotonic);
         }
-        return .{
+        var out: abi.Stats = .{
             .size = @sizeOf(abi.Stats),
             .requests = e.requests.load(.monotonic),
             .detached = e.detached_count.load(.monotonic),
@@ -1828,6 +1926,44 @@ pub const Engine = struct {
             .wt_sessions = e.wt_sessions.load(.monotonic),
             .wt_datagrams_dropped = e.wt_datagrams_dropped.load(.monotonic),
         };
+        net.stats(e, &out);
+        return out;
+    }
+
+    /// Pass 3's `open` hooks (R42's order), after `db`, `nats` and `kafka`.
+    fn openAreas(e: *Engine, app: *anole.App) !void {
+        try s3.open(e, app);
+        try smtp.open(e, app);
+        try jobs.open(e, app);
+        try webhooks.open(e, app);
+        try watch.open(e, app);
+    }
+
+    /// Their `close` hooks, in the reverse order.
+    fn closeAreas(e: *Engine) void {
+        watch.close(e);
+        webhooks.close(e);
+        jobs.close(e);
+        smtp.close(e);
+        s3.close(e);
+        sse.close(e);
+    }
+
+    /// Their `destroy` hooks, in the reverse order, then their states.
+    fn destroyAreas(e: *Engine) void {
+        watch.destroy(e);
+        webhooks.destroy(e);
+        jobs.destroy(e);
+        smtp.destroy(e);
+        s3.destroy(e);
+        sse.destroy(e);
+        e.smtp_state.deinit();
+        e.s3_state.deinit();
+        e.watch_state.deinit();
+        e.sse_state.deinit();
+        e.webhooks_state.deinit();
+        e.jobs_state.deinit();
+        e.net_state.deinit();
     }
 
     /// `anole_server_set_ready`.
@@ -3280,6 +3416,17 @@ pub fn wsAccept(e: *Engine, hv: u64, subprotocol: []const u8, headers: []const C
     return handle;
 }
 
+/// Pass 3's per-executor tasks, canceled at the stop.
+fn cancelAreas(x: *Exec, io: std.Io) void {
+    x.net.cancel(io);
+    x.jobs.cancel(io);
+    x.webhooks.cancel(io);
+    x.sse.cancel(io);
+    x.watch.cancel(io);
+    x.s3.cancel(io);
+    x.smtp.cancel(io);
+}
+
 /// `anole_handle_release`: ends whatever the handle is, the way the
 /// application giving up would. A cleanup call.
 pub fn handleRelease(e: *Engine, hv: u64) AnswerError!void {
@@ -3322,17 +3469,27 @@ pub fn handleRelease(e: *Engine, hv: u64) AnswerError!void {
         // A NATS subscription or JetStream consume ends; a JetStream message
         // is NAK'd (cleanup calls).
         .broker_sub => {
-            if (kafka.isKafka(hv)) kafka.groupClose(e, hv) else nats.unsubscribe(e, hv);
+            nats.unsubscribe(e, hv);
             return error.Over;
         },
         .broker_msg => {
-            if (kafka.isKafka(hv)) {
-                kafka.batchRetry(e, hv, 0) catch return error.Over;
-                return;
-            }
             nats.ack(e, hv, abi.NATS_NAK, 0) catch return error.Over;
             return;
         },
+        // A Kafka group leaves; a batch is retried now (cleanup calls).
+        .kafka_group => {
+            kafka.groupClose(e, hv);
+            return error.Over;
+        },
+        .kafka_batch => {
+            kafka.batchRetry(e, hv, 0) catch return error.Over;
+            return;
+        },
+        .net_conn, .net_udp => return net.release(e, hv),
+        .job_worker, .job => return jobs.release(e, hv),
+        .sse => return sse.release(e, hv),
+        .watch_sub => return watch.release(e, hv),
+        .transfer => return s3.release(e, hv),
         .db_query, _ => return error.WrongKind,
     }
 }
@@ -3522,4 +3679,11 @@ test {
     _ = @import("nats_test.zig");
     _ = @import("parity_test.zig");
     if (features.grpc) _ = grpc;
+    _ = net;
+    _ = jobs;
+    _ = webhooks;
+    _ = sse;
+    _ = watch;
+    _ = s3;
+    _ = smtp;
 }

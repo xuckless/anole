@@ -466,3 +466,24 @@ pub const kafka_options = [_]Entry{
     .{ .zig = "readiness", .omitted = "always on in the ABI (/readyz includes the broker)" },
     .{ .zig = "environ", .omitted = "the process environment, as the other connectors" },
 };
+
+// ---- p3/net ----
+// ---- end p3/net ----
+
+// ---- p3/jobs ----
+// ---- end p3/jobs ----
+
+// ---- p3/webhooks ----
+// ---- end p3/webhooks ----
+
+// ---- p3/realtime ----
+// ---- end p3/realtime ----
+
+// ---- p3/s3 ----
+// ---- end p3/s3 ----
+
+// ---- p3/smtp ----
+// ---- end p3/smtp ----
+
+// ---- p3/lambda ----
+// ---- end p3/lambda ----

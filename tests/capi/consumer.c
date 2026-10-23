@@ -955,7 +955,7 @@ static void test_main_server(void) {
     CHECK(anole_req_respond(0, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_INVALID); /* 0 is no handle */
     CHECK(anole_req_respond(h + 1, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
     CHECK(anole_req_respond(h ^ (1ull << 60), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
-    CHECK(anole_req_respond(h | (0xffffffull << 32), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+    CHECK(anole_req_respond(h | (0x7fffffull << 33), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
     CHECK(anole_req_respond(h, 200, NULL, 0, NULL, 0, 2) == ANOLE_E_INVALID);
     /* Every error answer sets its own text: none is left over from an earlier call. */
     CHECK(str_has(anole_last_error(), "flag"));
@@ -3065,7 +3065,7 @@ static void test_cleanup_rules(void) {
   CHECK(anole_ws_send(h, ANOLE_WS_TEXT, "x", 1, 0) == (anole_has_feature(LIT("websocket")) ? ANOLE_E_INVALID : ANOLE_E_UNSUPPORTED));
   if (anole_has_feature(LIT("websocket"))) CHECK(name_is("WrongHandleKind"));
   CHECK(anole_handle_release(0) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
-  CHECK(anole_handle_release(((uint64_t)15 << 28) | 1) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
+  CHECK(anole_handle_release(((uint64_t)31 << 28) | 1) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
   CHECK(anole_req_abort(0) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
   CHECK(anole_req_fail(0, 500, (anole_str){0}) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
   CHECK(gone_count(s) == gone);

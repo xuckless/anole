@@ -57,6 +57,24 @@ pub const Config = struct {
     /// Message brokers for `anole_nats_*`, opened at start.
     brokers: []const Broker = &.{},
 
+    // ---- p3/jobs ----
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    // ---- end p3/lambda ----
+
     pub const Console = struct {
         /// The control socket. Null: on (off under deployment lambda, on
         /// Windows, with ANOLE_CONSOLE=0).
@@ -109,6 +127,9 @@ pub const Config = struct {
         /// or CIDR networks, "10.0.0.0/8"); empty: proxy.trusted when set,
         /// else any peer.
         proxy_protocol_from: []const []const u8 = &.{},
+
+        // ---- p3/net ----
+        // ---- end p3/net ----
     };
 
     pub const Tls = struct {
@@ -169,6 +190,9 @@ pub const Config = struct {
         /// The largest database answer, in bytes of its record: past it,
         /// the answer is ANOLE_E_TOOBIG.
         db_result_max: u32 = 16 << 20,
+
+        // ---- p3/realtime ----
+        // ---- end p3/realtime ----
     };
 
     pub const Database = struct {
@@ -589,6 +613,9 @@ pub const Config = struct {
         cors: Cors,
         jwt: Jwt,
         rate_limit: RateLimit,
+
+        // ---- p3/webhooks ----
+        // ---- end p3/webhooks ----
     };
 
     pub const RequestId = struct {
@@ -694,6 +721,9 @@ pub const Config = struct {
         cache: ?Cache = null,
         /// After the global ones.
         middleware: []const Middleware = &.{},
+
+        // ---- p3/realtime ----
+        // ---- end p3/realtime ----
     };
     pub const Fixed = struct {
         status: u16 = 200,
@@ -813,6 +843,28 @@ pub const Config = struct {
         max_entries: u32 = 1024,
         max_bytes: u64 = 16 << 20,
     };
+
+    // Each area's own types.
+    // ---- p3/net (types) ----
+    // ---- end p3/net (types) ----
+
+    // ---- p3/jobs (types) ----
+    // ---- end p3/jobs (types) ----
+
+    // ---- p3/webhooks (types) ----
+    // ---- end p3/webhooks (types) ----
+
+    // ---- p3/realtime (types) ----
+    // ---- end p3/realtime (types) ----
+
+    // ---- p3/s3 (types) ----
+    // ---- end p3/s3 (types) ----
+
+    // ---- p3/smtp (types) ----
+    // ---- end p3/smtp (types) ----
+
+    // ---- p3/lambda (types) ----
+    // ---- end p3/lambda (types) ----
 };
 
 pub const ClientAuth = enum { none, request, require };

@@ -22,6 +22,9 @@ pub const E_SYSTEM: Status = -9;
 pub const E_TIMEOUT: Status = -10;
 pub const E_DB: Status = -11;
 pub const E_BROKER: Status = -12;
+/// An object store or mail server refused a call or could not be reached
+/// (the record's error_class, http_status and error_code say why).
+pub const E_SERVICE: Status = -13;
 
 pub const Str = extern struct {
     ptr: ?[*]const u8 = null,
@@ -128,6 +131,27 @@ pub const EventType = enum(u32) {
     kafka_revoke = 83,
     kafka_writable = 84,
     kafka_group_end = 85,
+
+    // ---- p3/net ----
+    // ---- end p3/net ----
+
+    // ---- p3/jobs ----
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    // ---- end p3/lambda ----
 };
 
 pub const Event = extern struct {
@@ -406,6 +430,9 @@ pub const DbErrorClass = enum(u8) {
     unavailable = 8,
     timeout = 9,
     other = 10,
+    not_found = 11,
+    precondition = 12,
+    invalid = 13,
 };
 
 pub const DbResultEvent = extern struct {
@@ -690,6 +717,27 @@ pub const KafkaAssignEvent = extern struct {
     nentries: u32,
 };
 
+// ---- p3/net ----
+// ---- end p3/net ----
+
+// ---- p3/jobs ----
+// ---- end p3/jobs ----
+
+// ---- p3/webhooks ----
+// ---- end p3/webhooks ----
+
+// ---- p3/realtime ----
+// ---- end p3/realtime ----
+
+// ---- p3/s3 ----
+// ---- end p3/s3 ----
+
+// ---- p3/smtp ----
+// ---- end p3/smtp ----
+
+// ---- p3/lambda ----
+// ---- end p3/lambda ----
+
 pub const POLL_F_NOARM: u32 = 1;
 pub const BODY_BORROW: u32 = 1;
 
@@ -872,6 +920,27 @@ pub const records = .{
     .{ "anole_kafka_delivery_event", KafkaDeliveryEvent },
     .{ "anole_kafka_partition", KafkaPartition },
     .{ "anole_kafka_assign_event", KafkaAssignEvent },
+
+    // ---- p3/net ----
+    // ---- end p3/net ----
+
+    // ---- p3/jobs ----
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    // ---- end p3/lambda ----
 };
 
 /// A variable part of a record, reached through an offset or a span in it.
@@ -897,14 +966,33 @@ pub const arrays = [_]ArrayInfo{
     .{ .record = "anole_nats_reply_event", .name = "headers", .at = "headers_off", .item = "anole_span", .count = "2*nheaders" },
     .{ .record = "anole_kafka_records_event", .name = "records", .at = "records_off", .item = "anole_kafka_record", .count = "nrecords" },
     .{ .record = "anole_kafka_assign_event", .name = "entries", .at = "entries_off", .item = "anole_kafka_partition", .count = "nentries" },
+
+    // ---- p3/net ----
+    // ---- end p3/net ----
+
+    // ---- p3/jobs ----
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    // ---- end p3/lambda ----
 };
 
 pub const HandleKindInfo = struct { kind: u8, name: []const u8, c_type: []const u8 };
 
-/// (A Kafka group is a `broker_sub` and a Kafka batch a `broker_msg`; the
-/// c_type names the NATS use.)
-/// The kind lives in bits 28-31 of a handle (`engine.Handle`). 7 is
-/// reserved for a per-query handle; 10-15 are reserved.
+/// The kind lives in bits 28-32 of a handle (`engine.Handle`). 7 is
+/// reserved for a per-query handle; 19-31 are free.
 pub const handle_kinds = [_]HandleKindInfo{
     .{ .kind = 1, .name = "request", .c_type = "anole_req" },
     .{ .kind = 2, .name = "websocket", .c_type = "anole_ws" },
@@ -914,6 +1002,15 @@ pub const handle_kinds = [_]HandleKindInfo{
     .{ .kind = 6, .name = "db_tx", .c_type = "anole_db_tx" },
     .{ .kind = 8, .name = "broker_sub", .c_type = "anole_nats_sub" },
     .{ .kind = 9, .name = "broker_msg", .c_type = "anole_nats_msg" },
+    .{ .kind = 10, .name = "net_conn", .c_type = "anole_net_conn" },
+    .{ .kind = 11, .name = "net_udp", .c_type = "anole_net_udp" },
+    .{ .kind = 12, .name = "job_worker", .c_type = "anole_job_worker" },
+    .{ .kind = 13, .name = "job", .c_type = "anole_job" },
+    .{ .kind = 14, .name = "sse", .c_type = "anole_sse" },
+    .{ .kind = 15, .name = "watch_sub", .c_type = "anole_watch_sub" },
+    .{ .kind = 16, .name = "transfer", .c_type = "anole_s3_transfer" },
+    .{ .kind = 17, .name = "kafka_group", .c_type = "anole_kafka_group" },
+    .{ .kind = 18, .name = "kafka_batch", .c_type = "anole_kafka_batch" },
 };
 
 pub const EventInfo = struct {
@@ -931,8 +1028,8 @@ pub const events = [_]EventInfo{
     .{ .type = 1, .name = "ANOLE_EV_REQUEST", .record = "anole_request_event", .handles = &.{"request"}, .obligation = "answer" },
     .{ .type = 2, .name = "ANOLE_EV_BODY", .record = "anole_event", .handles = &.{"request"} },
     .{ .type = 3, .name = "ANOLE_EV_ABORT", .record = "anole_abort_event", .handles = &.{ "request", "grpc_call" } },
-    .{ .type = 4, .name = "ANOLE_EV_WRITABLE", .record = "anole_event", .handles = &.{ "request", "grpc_call", "websocket", "wt_stream" } },
-    .{ .type = 5, .name = "ANOLE_EV_SENT", .record = "anole_sent_event", .handles = &.{ "request", "websocket", "grpc_call", "wt_stream", "wt_session" } },
+    .{ .type = 4, .name = "ANOLE_EV_WRITABLE", .record = "anole_event", .handles = &.{ "request", "grpc_call", "websocket", "wt_stream", "net_conn", "net_udp", "sse", "transfer" } },
+    .{ .type = 5, .name = "ANOLE_EV_SENT", .record = "anole_sent_event", .handles = &.{ "request", "websocket", "grpc_call", "wt_stream", "wt_session", "net_conn" } },
     .{ .type = 6, .name = "ANOLE_EV_WS_OPEN", .record = "anole_request_event", .handles = &.{"websocket"} },
     .{ .type = 7, .name = "ANOLE_EV_WS_MESSAGE", .record = "anole_ws_message_event", .handles = &.{"websocket"} },
     .{ .type = 8, .name = "ANOLE_EV_WS_CLOSE", .record = "anole_ws_close_event", .handles = &.{"websocket"} },
@@ -958,12 +1055,33 @@ pub const events = [_]EventInfo{
     .{ .type = 67, .name = "ANOLE_EV_NATS_SUB_END", .record = "anole_broker_end_event", .handles = &.{"broker_sub"} },
     .{ .type = 68, .name = "ANOLE_EV_NATS_STATUS", .record = "anole_broker_status_event" },
     .{ .type = 69, .name = "ANOLE_EV_NATS_WRITABLE", .record = "anole_broker_status_event" },
-    .{ .type = 80, .name = "ANOLE_EV_KAFKA_RECORDS", .record = "anole_kafka_records_event", .handles = &.{"broker_msg"}, .obligation = "batch_done or batch_retry" },
+    .{ .type = 80, .name = "ANOLE_EV_KAFKA_RECORDS", .record = "anole_kafka_records_event", .handles = &.{"kafka_batch"}, .obligation = "batch_done or batch_retry" },
     .{ .type = 81, .name = "ANOLE_EV_KAFKA_DELIVERY", .record = "anole_kafka_delivery_event" },
-    .{ .type = 82, .name = "ANOLE_EV_KAFKA_ASSIGN", .record = "anole_kafka_assign_event", .handles = &.{"broker_sub"} },
-    .{ .type = 83, .name = "ANOLE_EV_KAFKA_REVOKE", .record = "anole_kafka_assign_event", .handles = &.{"broker_sub"} },
+    .{ .type = 82, .name = "ANOLE_EV_KAFKA_ASSIGN", .record = "anole_kafka_assign_event", .handles = &.{"kafka_group"} },
+    .{ .type = 83, .name = "ANOLE_EV_KAFKA_REVOKE", .record = "anole_kafka_assign_event", .handles = &.{"kafka_group"} },
     .{ .type = 84, .name = "ANOLE_EV_KAFKA_WRITABLE", .record = "anole_broker_status_event" },
-    .{ .type = 85, .name = "ANOLE_EV_KAFKA_GROUP_END", .record = "anole_broker_end_event", .handles = &.{"broker_sub"} },
+    .{ .type = 85, .name = "ANOLE_EV_KAFKA_GROUP_END", .record = "anole_broker_end_event", .handles = &.{"kafka_group"} },
+
+    // ---- p3/net ----
+    // ---- end p3/net ----
+
+    // ---- p3/jobs ----
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    // ---- end p3/lambda ----
 };
 
 pub const EventRange = struct { from: u32, to: u32, use: []const u8 };
@@ -976,7 +1094,15 @@ pub const event_ranges = [_]EventRange{
     .{ .from = 30, .to = 39, .use = "database" },
     .{ .from = 40, .to = 49, .use = "HTTP and WebSocket additions" },
     .{ .from = 50, .to = 63, .use = "core additions" },
-    .{ .from = 64, .to = 255, .use = "new areas, a block of 16 per area" },
+    .{ .from = 64, .to = 79, .use = "NATS" },
+    .{ .from = 80, .to = 95, .use = "Kafka" },
+    .{ .from = 96, .to = 103, .use = "raw TCP and UDP (net; 101-103 reserved)" },
+    .{ .from = 104, .to = 111, .use = "jobs and webhooks (111 reserved)" },
+    .{ .from = 112, .to = 115, .use = "SSE (114-115 reserved)" },
+    .{ .from = 116, .to = 123, .use = "watch (119-123 reserved)" },
+    .{ .from = 124, .to = 131, .use = "storage and mail: S3 124-125, SMTP 126 (127-131 reserved)" },
+    .{ .from = 132, .to = 135, .use = "console (133-135 reserved)" },
+    .{ .from = 136, .to = 255, .use = "new areas" },
     .{ .from = 256, .to = 0x7FFFFFFF, .use = "never used" },
     .{ .from = 0x80000000, .to = 0xFFFFFFFF, .use = "never used by Anole: free for a binding's own synthetic events" },
 };
@@ -1031,13 +1157,39 @@ pub const constant_groups = [_]ConstantGroup{
     .{ .prefix = "ANOLE_KAFKA_ASSIGN_", .group = "kafka_assignor" },
     .{ .prefix = "ANOLE_BROKER_END_", .group = "broker_end" },
     .{ .prefix = "ANOLE_BROKER_", .group = "broker_status" },
+
+    // ---- p3/net ----
+    // ---- end p3/net ----
+
+    // ---- p3/jobs ----
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    // ---- end p3/lambda ----
+
     .{ .prefix = "ANOLE_ABI_", .group = "abi" },
 };
 
 /// The tokens `anole_last_error_name` returns (sorted). Tokens are only
 /// ever added. The member names of `anole.ServerError` and
-/// `anole.TlsLoadError` are tokens verbatim.
-pub const error_names = [_][]const u8{
+/// `anole.TlsLoadError` are tokens verbatim. Each area of pass 3 lists its
+/// own in its block below (any order); `error_names` is them all, sorted.
+pub const error_names = sortedNames(&(base_error_names ++ net_error_names ++ jobs_error_names ++ webhooks_error_names ++
+    realtime_error_names ++ s3_error_names ++ smtp_error_names ++ lambda_error_names));
+
+const base_error_names = [_][]const u8{
     "AccessDenied",
     "AddressInUse",
     "AddressNotAvailable",
@@ -1088,6 +1240,7 @@ pub const error_names = [_][]const u8{
     "ReservedNotZero",
     "RouteConflict",
     "ServerAlreadyOnThread",
+    "Service",
     "SeveralHttp3Listeners",
     "State",
     "SyntaxError",
@@ -1107,3 +1260,44 @@ pub const error_names = [_][]const u8{
     "Unsupported",
     "WrongHandleKind",
 };
+
+// ---- p3/net ----
+const net_error_names = [_][]const u8{};
+// ---- end p3/net ----
+
+// ---- p3/jobs ----
+const jobs_error_names = [_][]const u8{};
+// ---- end p3/jobs ----
+
+// ---- p3/webhooks ----
+const webhooks_error_names = [_][]const u8{};
+// ---- end p3/webhooks ----
+
+// ---- p3/realtime ----
+const realtime_error_names = [_][]const u8{};
+// ---- end p3/realtime ----
+
+// ---- p3/s3 ----
+const s3_error_names = [_][]const u8{};
+// ---- end p3/s3 ----
+
+// ---- p3/smtp ----
+const smtp_error_names = [_][]const u8{};
+// ---- end p3/smtp ----
+
+// ---- p3/lambda ----
+const lambda_error_names = [_][]const u8{};
+// ---- end p3/lambda ----
+
+fn sortedNames(comptime in: []const []const u8) [in.len][]const u8 {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        var out: [in.len][]const u8 = in[0..in.len].*;
+        std.sort.insertion([]const u8, &out, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        return out;
+    }
+}

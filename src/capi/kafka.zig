@@ -17,8 +17,8 @@
 //! posts `ANOLE_EV_KAFKA_REVOKE` first; batches the consumer does not finish
 //! within `rebalance_timeout_ms` go stale.
 //!
-//! Handles: a group is a `broker_sub` and a batch a `broker_msg`, as the
-//! NATS ones are; bit 23 of the slot tells a Kafka handle from a NATS one.
+//! Handles: a group is a `kafka_group` and a batch a `kafka_batch`, kinds of
+//! their own (a NATS handle given to a Kafka call is the wrong kind).
 const std = @import("std");
 const anole = @import("../root.zig");
 const dusty = @import("dusty");
@@ -44,19 +44,6 @@ const KMsg = if (features.kafka) anole.kafka.Msg else void;
 
 const log = std.log.scoped(.anole);
 const ms = std.Io.Duration.fromMilliseconds;
-
-/// Bit 23 of a handle's slot.
-const marker: u32 = 1 << 23;
-
-pub fn isKafka(hv: u64) bool {
-    return Handle.decode(hv).slot & marker != 0;
-}
-
-fn localHandle(hv: u64) Handle {
-    var h = Handle.decode(hv);
-    h.slot &= 0x7f_ffff;
-    return h;
-}
 
 const Table = nats_cap.Table;
 
@@ -728,7 +715,7 @@ pub const Group = struct {
     fn release(g: *Group) void {
         const st = &g.b.engine.kafka_state;
         st.groups.acquire();
-        const h = localHandle(g.handle);
+        const h = Handle.decode(g.handle);
         if (st.groups.get(h)) |_| st.groups.drop(h.slot);
         st.groups.release();
         g.free();
@@ -777,7 +764,7 @@ pub fn subscribe(b: *Broker, c: *Consumer, opts: abi.KafkaSubscribeOptions, user
         st.groups.release();
         return error.OutOfMemory;
     };
-    g.handle = nats_cap.handleOf(.broker_sub, slot.index | marker, slot.gen, x.index);
+    g.handle = nats_cap.handleOf(.kafka_group, slot.index, slot.gen, x.index);
     st.groups.release();
     x.post(&g.cmd);
     return g.handle;
@@ -785,7 +772,7 @@ pub fn subscribe(b: *Broker, c: *Consumer, opts: abi.KafkaSubscribeOptions, user
 
 /// `anole_kafka_group_close` and releasing a group handle (a cleanup call).
 pub fn groupClose(e: *Engine, hv: u64) void {
-    const h = localHandle(hv);
+    const h = Handle.decode(hv);
     const st = &e.kafka_state;
     st.groups.acquire();
     defer st.groups.release();
@@ -925,7 +912,7 @@ fn batchHandler(context: ?*anyopaque, view: *const anole.kafka.impl.consumer.Bat
         return Answer{ .retry = 1000 };
     }
     const x = execs[@as(usize, @intCast(view.partition)) % execs.len];
-    const handle = nats_cap.handleOf(.broker_msg, slot.index | marker, slot.gen, x.index);
+    const handle = nats_cap.handleOf(.kafka_batch, slot.index, slot.gen, x.index);
     defer {
         st.batches.acquire();
         st.batches.drop(slot.index);
@@ -949,7 +936,7 @@ pub fn batchDone(e: *Engine, hv: u64) void {
     const st = &e.kafka_state;
     st.batches.acquire();
     defer st.batches.release();
-    const entry = st.batches.get(localHandle(hv)) orelse return;
+    const entry = st.batches.get(Handle.decode(hv)) orelse return;
     const w = entry.value;
     if (w.resolved) return;
     w.retry = false;
@@ -963,7 +950,7 @@ pub fn batchRetry(e: *Engine, hv: u64, delay_ms: u32) CallError!void {
     const st = &e.kafka_state;
     st.batches.acquire();
     defer st.batches.release();
-    const entry = st.batches.get(localHandle(hv)) orelse return error.Gone;
+    const entry = st.batches.get(Handle.decode(hv)) orelse return error.Gone;
     const w = entry.value;
     if (w.resolved) return error.Gone;
     w.retry = true;
