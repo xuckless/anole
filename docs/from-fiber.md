@@ -25,7 +25,9 @@ builds a whole API step by step.
 | `fiber.Query[int](c, "limit", 20)` | `req.query.getInt(usize, "limit") orelse 20` |
 | `c.Get("X-Api-Key")` | `req.headers.get("X-Api-Key")` |
 | `c.Cookies("sid")` | `req.cookies().get("sid")` |
-| `c.IP()` | `req.remote_address` (behind a proxy, with `proxy.trusted_hops` set) |
+| `c.IP()` | `req.remote_address` (behind a proxy, with `deployment = .behind_proxy` or `proxy.trusted` set) |
+| `fiber.Config{ProxyHeader: ..., TrustedProxies: ..., EnableTrustedProxyCheck: true}` | `.proxy = .{ .trusted = &.{"10.0.0.0/8", "private"} }` (or `ANOLE_PROXY_TRUSTED`); the client is the rightmost untrusted `X-Forwarded-For` address |
+| `os.Getenv("PORT")` | `.deployment = .platform` (or `ANOLE_DEPLOYMENT=platform`) listens on `$PORT` |
 | `c.Body()` | `try req.body()`, a `?[]const u8` |
 | `c.Bind().Body(&in)` | `const in = try req.bind(NewUser);` |
 | `c.SendString("hi")` | `res.body = "hi";` or `try res.print(.text, "hi {s}", .{name});` |
