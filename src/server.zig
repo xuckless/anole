@@ -636,6 +636,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
     return struct {
         const Self = @This();
         const Cert = Options.Cert;
+        /// The server's state type (`void` for `App`).
+        pub const State = Ctx;
         /// A handler as the router stores it: `fn (*Request, *Response)
         /// anyerror!void`, with `*Ctx` first on a server with state.
         pub const Handler = http.Router(Ctx).Handler;

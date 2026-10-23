@@ -83,6 +83,11 @@ pub fn setSink(cb: ?*const Callback) void {
     sink_state.store(cb, .release);
 }
 
+/// The sink in place, null for stderr (to restore it later).
+pub fn currentSink() ?*const Callback {
+    return sink_state.load(.acquire);
+}
+
 pub fn hasSink() bool {
     return sink_state.load(.acquire) != null;
 }
