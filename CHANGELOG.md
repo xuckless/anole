@@ -5,8 +5,9 @@ breaking changes are listed anyway.
 
 ## Unreleased
 
-Server options, TLS and errors (API hardening; see
-[docs/migrating-to-0.2.md](docs/migrating-to-0.2.md)).
+The API review before the Node and Python bindings: every breaking change
+of 0.2 is listed below, and [docs/migrating-to-0.2.md](docs/migrating-to-0.2.md)
+has the old -> new table for each area. The C ABI is now 0.7.
 
 ### Breaking
 
@@ -114,80 +115,6 @@ Server options, TLS and errors (API hardening; see
   `grpc-status-details-bin` as initial metadata (it was sent as a header,
   which no client reads).
 
-### Added
-
-- `app.listen("3000")` (a bare port) listens on every interface, like
-  `":3000"`. A listen address Anole cannot read is now logged with examples.
-- `app.rateLimit(.{ .limit = 100 })`, a one-line in-memory rate limiter.
-- `anole.websocket.UpgradeOptions.subprotocols` and `.headers`: an endpoint
-  that speaks graphql-ws, STOMP or MQTT now echoes the subprotocol the browser
-  asked for (browsers fail the connection without it), and the handshake can
-  carry a cookie or other headers. `Socket.subprotocol` says which was
-  selected. `anole.websocket.isUpgrade(req)` tells a handler it has a
-  handshake before it decides.
-- `req.paramDecoded(name)`: a route parameter percent-decoded
-  (`/users/J%C3%BCrgen` -> `Jürgen`). `req.params` stays raw, as before, and
-  now says so.
-- `ws.httpVersion()` and `ws.isClosed()`.
-- `req.readerLimited`, `req.setDeadline`, `res.headersSent()`.
-- `EventStream.comment` (heartbeats), `end` and `draining`.
-- `timeouts.write` (30 s) bounds each write once a stream or file body has
-  started.
-- `anole.Duration`, `anole.Ca`, `anole.ClientAuth`, `anole.ClientOptions`,
-  `anole.ServerError`, `anole.TlsLoadError`, `anole.errors`.
-- `Compress.Options.brotli_quality`, a per-middleware Brotli quality.
-- Databases: `connect_at_start` and `ping_timeout` on MongoDB, `ping_timeout`
-  on SQLite, `anole.db.Tls`; `Tx.table`, `Tx.run` and `Tx.with(options)` on
-  both SQL connectors; `call.failFmt(code, fmt, args)` in gRPC.
-- `Group.grpc` and `Group.grpcWith` register a gRPC service behind a group's
-  middleware, for its gRPC calls and its transcoded routes alike; until now a
-  transcoded `/v1/...` route skipped a `/v1` group's auth middleware.
-
-### Fixed
-
-- C ABI: two `anole_ws_publish` calls to the same topic could reach a
-  subscriber in the opposite order (they fanned out on different executors).
-  Publishes to one topic now arrive in the order they were made.
-- C ABI: a fixed-response route behind a JWKS `jwt` middleware ran inline on
-  the HTTP/2 reader, where the JWKS fetch could stall the connection; it now
-  keeps a task.
-- Event streams, streamed responses and file downloads are no longer cut at
-  the request timeout (30 s in Zig, `request_ms` + 5 s through the C ABI over
-  HTTP/1.1 and tasked HTTP/2 and HTTP/3 streams). Once the head is out, the
-  request deadline ends and `timeouts.write` bounds each write the client does
-  not take.
-- Setting any `http2` option no longer drops the concurrent-stream limit from
-  250 to 100.
-- `app.tracing()` reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME`
-  from the environment; it used to need `.process`.
-- `iterate` that leaves a transaction open, and a connection from `acquire`
-  given back inside one, are now rolled back (and logged) as plain calls
-  already were in 0.1.3. A finished SQLite `Tx` fails with `error.Database`
-  instead of asserting (undefined behaviour in release builds).
-- `Call.fail`, `Call.addTrailer` and `Call.addHeader` copy their strings: a
-  message formatted into a stack buffer used to be read after the handler
-  returned.
-- The C ABI's schema advertised `mongodb+srv://`, which is refused at start;
-  it now says so, with the way around it.
-- docs/database.md no longer says `.auto` catches a role change made inside a
-  function: PostgreSQL does not report `role`; use `.always` for apps that
-  switch roles.
-
-### Added (C ABI 0.7, HTTP and WebSocket)
-
-- WebSocket handshakes can be decided by the application: `"accept":
-  "consumer"` on a websocket route sends each handshake as
-  `ANOLE_EV_WS_UPGRADE`, answered with `anole_ws_accept` (a subprotocol,
-  extra headers) or refused like any request (401, 403, a body). A route may
-  take `handler` and such a `websocket` together, so one app sees every
-  request on a path. Auto routes take `"subprotocols"`, and
-  `ANOLE_EV_WS_OPEN` says which was selected in the request record's new
-  `subprotocol` span. This is what ASGI's `websocket.accept` and
-  `websocket.close`, Bun's `server.upgrade()` and graphql-ws clients need.
-- Publishes to one topic arrive in the order they were made.
-
-### Breaking (C ABI 0.7)
-
 The migration table is in [docs/migrating-to-0.2.md](docs/migrating-to-0.2.md)
 and docs/c-abi.md ("From ABI 0.6").
 
@@ -244,6 +171,44 @@ and docs/c-abi.md ("From ABI 0.6").
 
 ### Added
 
+- `app.listen("3000")` (a bare port) listens on every interface, like
+  `":3000"`. A listen address Anole cannot read is now logged with examples.
+- `app.rateLimit(.{ .limit = 100 })`, a one-line in-memory rate limiter.
+- `anole.websocket.UpgradeOptions.subprotocols` and `.headers`: an endpoint
+  that speaks graphql-ws, STOMP or MQTT now echoes the subprotocol the browser
+  asked for (browsers fail the connection without it), and the handshake can
+  carry a cookie or other headers. `Socket.subprotocol` says which was
+  selected. `anole.websocket.isUpgrade(req)` tells a handler it has a
+  handshake before it decides.
+- `req.paramDecoded(name)`: a route parameter percent-decoded
+  (`/users/J%C3%BCrgen` -> `Jürgen`). `req.params` stays raw, as before, and
+  now says so.
+- `ws.httpVersion()` and `ws.isClosed()`.
+- `req.readerLimited`, `req.setDeadline`, `res.headersSent()`.
+- `EventStream.comment` (heartbeats), `end` and `draining`.
+- `timeouts.write` (30 s) bounds each write once a stream or file body has
+  started.
+- `anole.Duration`, `anole.Ca`, `anole.ClientAuth`, `anole.ClientOptions`,
+  `anole.ServerError`, `anole.TlsLoadError`, `anole.errors`.
+- `Compress.Options.brotli_quality`, a per-middleware Brotli quality.
+- Databases: `connect_at_start` and `ping_timeout` on MongoDB, `ping_timeout`
+  on SQLite, `anole.db.Tls`; `Tx.table`, `Tx.run` and `Tx.with(options)` on
+  both SQL connectors; `call.failFmt(code, fmt, args)` in gRPC.
+- `Group.grpc` and `Group.grpcWith` register a gRPC service behind a group's
+  middleware, for its gRPC calls and its transcoded routes alike; until now a
+  transcoded `/v1/...` route skipped a `/v1` group's auth middleware.
+
+- WebSocket handshakes can be decided by the application: `"accept":
+  "consumer"` on a websocket route sends each handshake as
+  `ANOLE_EV_WS_UPGRADE`, answered with `anole_ws_accept` (a subprotocol,
+  extra headers) or refused like any request (401, 403, a body). A route may
+  take `handler` and such a `websocket` together, so one app sees every
+  request on a path. Auto routes take `"subprotocols"`, and
+  `ANOLE_EV_WS_OPEN` says which was selected in the request record's new
+  `subprotocol` span. This is what ASGI's `websocket.accept` and
+  `websocket.close`, Bun's `server.upgrade()` and graphql-ws clients need.
+- Publishes to one topic arrive in the order they were made.
+
 - `include/anole.abi.json`, generated from `src/capi/abi.zig`
   (`zig build capi-abi-json`; checked by `capi-test`): every record with
   offsets, every constant by family, events, handle kinds and error tokens,
@@ -297,6 +262,34 @@ and docs/c-abi.md ("From ABI 0.6").
 
 ### Fixed
 
+- C ABI: two `anole_ws_publish` calls to the same topic could reach a
+  subscriber in the opposite order (they fanned out on different executors).
+  Publishes to one topic now arrive in the order they were made.
+- C ABI: a fixed-response route behind a JWKS `jwt` middleware ran inline on
+  the HTTP/2 reader, where the JWKS fetch could stall the connection; it now
+  keeps a task.
+- Event streams, streamed responses and file downloads are no longer cut at
+  the request timeout (30 s in Zig, `request_ms` + 5 s through the C ABI over
+  HTTP/1.1 and tasked HTTP/2 and HTTP/3 streams). Once the head is out, the
+  request deadline ends and `timeouts.write` bounds each write the client does
+  not take.
+- Setting any `http2` option no longer drops the concurrent-stream limit from
+  250 to 100.
+- `app.tracing()` reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME`
+  from the environment; it used to need `.process`.
+- `iterate` that leaves a transaction open, and a connection from `acquire`
+  given back inside one, are now rolled back (and logged) as plain calls
+  already were in 0.1.3. A finished SQLite `Tx` fails with `error.Database`
+  instead of asserting (undefined behaviour in release builds).
+- `Call.fail`, `Call.addTrailer` and `Call.addHeader` copy their strings: a
+  message formatted into a stack buffer used to be read after the handler
+  returned.
+- The C ABI's schema advertised `mongodb+srv://`, which is refused at start;
+  it now says so, with the way around it.
+- docs/database.md no longer says `.auto` catches a role change made inside a
+  function: PostgreSQL does not report `role`; use `.always` for apps that
+  switch roles.
+
 - C ABI: `ANOLE_EV_SENT` follows every borrowing call that returned `>= 0`,
   exactly once, zero-length writes included, and is never lost to a full
   queue or a failed allocation (the record is allocated by the call, which
@@ -309,6 +302,23 @@ and docs/c-abi.md ("From ABI 0.6").
 - C ABI executors no longer spin a core at 100% while a consumer's queue is
   full: they sleep until the consumer polls. Events (`ANOLE_EV_ABORT`,
   `_WRITABLE`, `_BODY`, `_SENT`) are no longer dropped when the queue is full.
+
+- A server busy with many thousands of connections on one executor let new
+  ones in slowly: its accept loop took 128 connections per pass over the
+  busy ones (64 once spawn backpressure applied), and a pass takes about
+  200 ms at 25,000 connections. The clients still in the backlog waited
+  10 s or more for their first answer while those already in were served
+  every pass (HTTP/1.1 at 25,000 connections on one CPU: p99 6.3 s, about
+  3,800 timeouts). Idle connections waking from parking queued behind the
+  same limit (p50 1.6 s). zio's accept and spawn budgets now grow to the
+  number of tasks that ran during the last trip to the back of the run
+  queue (zio `fast_accept`, which Anole turns on).
+
+- zio: since upstream lalinsky/zio#841, with pinned scheduling a task in the
+  overflow queue (one woken by a timer or I/O included) could wait forever
+  once more than 256 tasks on one executor kept yielding: the fork keeps the
+  ring and its overflow one FIFO queue again. zio is now upstream main
+  035d245 merged into the fork, plus that fix.
 
 ## 0.1.3 (2026-10-22)
 
@@ -391,19 +401,6 @@ and docs/c-abi.md ("From ABI 0.6").
   Python). `anole_server_start` now answers `ANOLE_E_CONFIG`, and
   `anole_last_error` names the routes. Zig's `app.get` and friends still
   panic on a conflict, at registration.
-
-### Fixed
-
-- A server busy with many thousands of connections on one executor let new
-  ones in slowly: its accept loop took 128 connections per pass over the
-  busy ones (64 once spawn backpressure applied), and a pass takes about
-  200 ms at 25,000 connections. The clients still in the backlog waited
-  10 s or more for their first answer while those already in were served
-  every pass (HTTP/1.1 at 25,000 connections on one CPU: p99 6.3 s, about
-  3,800 timeouts). Idle connections waking from parking queued behind the
-  same limit (p50 1.6 s). zio's accept and spawn budgets now grow to the
-  number of tasks that ran during the last trip to the back of the run
-  queue (zio `fast_accept`, which Anole turns on).
 
 ## 0.1.2 (2026-10-22)
 
