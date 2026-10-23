@@ -1299,6 +1299,12 @@ fn checkRealtime(cfg: Config, why: *std.Io.Writer) Problem!void {
             if (t.ws != null and !oneOf(t.type, &.{ "text", "binary" })) return fail(why, "watches[{d}].to[{d}].type: text or binary", .{ i, k });
             const text = t.sse orelse t.ws.?;
             if (text.len == 0 or text.len > 255) return fail(why, "watches[{d}].to[{d}]: the topic or room is 1-255 bytes", .{ i, k });
+            var scratch: [8192]u8 = undefined;
+            var fba: std.heap.FixedBufferAllocator = .init(&scratch);
+            _ = anole.watch.template.Template.parse(fba.allocator(), text, w.mongodb != null) catch |err| switch (err) {
+                error.OutOfMemory => {},
+                else => return fail(why, "watches[{d}].to[{d}]: the template \"{s}\" is not valid: use {{channel}}, {{op}}, {{data.<field>}} and, for MongoDB, {{db}}, {{collection}} and {{key}}", .{ i, k, text }),
+            };
         }
     }
 }

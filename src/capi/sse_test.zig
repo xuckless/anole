@@ -102,6 +102,14 @@ test "capi config: watches name their database and exactly one source" {
         \\{"databases":[{"name":"main","postgres":{"url":"postgres://u@localhost/db"}}],
         \\ "watches":[{"name":"a","database":"main","postgres":{"channels":[]}}]}
     , "watches[0].postgres.channels");
+    try expectRefused(
+        \\{"databases":[{"name":"main","postgres":{"url":"postgres://u@localhost/db"}}],
+        \\ "watches":[{"name":"a","database":"main","postgres":{"channels":["a"]},"to":[{"sse":"room:{nope"}]}]}
+    , "watches[0].to[0]: the template \"room:{nope\" is not valid");
+    try expectRefused(
+        \\{"databases":[{"name":"main","postgres":{"url":"postgres://u@localhost/db"}}],
+        \\ "watches":[{"name":"a","database":"main","postgres":{"channels":["a"]},"to":[{"sse":"{collection}"}]}]}
+    , "is not valid");
 }
 
 test "capi config: a watch on SQLite says it has no change feed" {
