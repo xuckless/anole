@@ -2741,7 +2741,7 @@ static void test_db_request_tie(void) {
       " \"timeouts\":{\"request_ms\":5000,\"shutdown_ms\":500},"
       " \"routes\":[{\"method\":\"GET\",\"path\":\"/short\",\"handler\":1,\"timeout_ms\":1000},"
       "             {\"method\":\"GET\",\"path\":\"/hold\",\"handler\":1}],"
-      " \"databases\":[{\"name\":\"d\",\"timeout_ms\":200,\"sqlite\":{\"path\":\":memory:\","
+      " \"databases\":[{\"name\":\"d\",\"timeout_ms\":2500,\"sqlite\":{\"path\":\":memory:\","
       "  \"init\":\"CREATE TABLE tt (n);\"}}]}";
   anole_consumer *c = NULL;
   anole_server *s = polled_server(json, &c);
@@ -2785,12 +2785,12 @@ static void test_db_request_tie(void) {
   CHECK(anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, &on_ws, 4) == ANOLE_E_INVALID);
   CHECK(anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, NULL, 5) == ANOLE_E_INVALID);
 
-  /* timeout_ms 0 takes the database's (200 ms here); NONE lifts it */
+  /* timeout_ms 0 takes the database's (2.5 s here, above /short's deadline); NONE lifts it */
   double t0 = now_ms();
   CHECK(anole_db_query(db, c, slow, NULL, 0, NULL, 6) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 6 && r->status == ANOLE_E_TIMEOUT && r->http_status == 504);
-  CHECK(now_ms() - t0 < 3000);
+  CHECK(now_ms() - t0 < 6000);
   anole_db_options none = {sizeof none};
   none.timeout_ms = ANOLE_DB_TIMEOUT_NONE;
   CHECK(anole_db_query(db, c, LIT("SELECT 1"), NULL, 0, &none, 7) == ANOLE_OK);
