@@ -53,6 +53,53 @@
       "default": "auto",
       "description": "How the server writes its own error answers (404, 405, the status an error maps to)."
     },
+    "environment": {
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "development",
+            "production"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "development or production. null: ANOLE_ENV, else production. development: 500 answers name the error (error_detail). See docs/config.md."
+    },
+    "deployment": {
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "standalone",
+            "behind_proxy",
+            "anole_lb",
+            "platform",
+            "lambda"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "What sits in front. null: ANOLE_DEPLOYMENT, else standalone. behind_proxy and platform trust X-Forwarded-* from loopback and private networks; anole_lb expects a PROXY header; platform listens on $PORT. lambda needs Anole 0.4. See docs/config.md."
+    },
+    "error_detail": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "A 500 Anole answers for an error with no status of its own names the error. null: on in development."
+    },
     "middleware": {
       "type": "array",
       "items": {
@@ -99,15 +146,30 @@
           ]
         },
         "address": {
-          "type": "string",
-          "description": "\"127.0.0.1\" (this machine, the default), \"\" (every interface, IPv6 and IPv4), \"0.0.0.0\", \"::\"."
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "\"127.0.0.1\" (this machine), \"\" (every interface, IPv6 and IPv4), \"0.0.0.0\", \"::\". null: the deployment's (\"127.0.0.1\"; \"\" for anole_lb and platform)."
         },
         "port": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 65535,
-          "default": 8080,
-          "description": "0 picks a free port (anole_server_listener)."
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "0 picks a free port (anole_server_listener). null: 8080, or $PORT under platform."
         },
         "unix": {
           "anyOf": [
@@ -145,9 +207,16 @@
           "description": "HTTP/3 over UDP on a TLS listener (one per server); its port follows the listeners' in anole_server_listener (udp_port)."
         },
         "proxy_protocol": {
-          "type": "boolean",
-          "default": false,
-          "description": "Connections start with a PROXY protocol header."
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Connections start with a PROXY protocol header. null: on under anole_lb, else off."
         },
         "proxy_protocol_from": {
           "type": "array",
@@ -155,7 +224,7 @@
             "type": "string"
           },
           "default": [],
-          "description": "With proxy_protocol: the proxies allowed to send one (addresses or CIDR networks); empty: any peer."
+          "description": "With proxy_protocol: the proxies allowed to send one (addresses or CIDR networks); empty: proxy.trusted when set, else any peer."
         }
       }
     },
@@ -446,7 +515,7 @@
               "type": "integer",
               "minimum": 0,
               "maximum": 4294967295,
-              "default": 60000,
+              "default": 75000,
               "description": "An idle keep-alive connection is closed after this. Null: never."
             },
             {
@@ -583,22 +652,37 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "trusted": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The proxies in front: addresses, CIDR networks or \"loopback\", \"private\", \"link_local\". Only their X-Forwarded-* is read; the client is the rightmost X-Forwarded-For address not among them. null: ANOLE_PROXY_TRUSTED, else the deployment's (loopback and private for behind_proxy, anole_lb, platform; none for standalone). []: none."
+        },
         "trusted_hops": {
           "type": "integer",
           "minimum": 0,
           "maximum": 255,
           "default": 0,
-          "description": "Proxies in front whose X-Forwarded-For Anole trusts for the client's address; 0 none. (PROXY protocol is per listener.)"
+          "description": "A fixed number of proxies instead of the walk: the client is the trusted_hops-th X-Forwarded-For address from the right; with trusted, only from a trusted peer. 0: the walk (or nothing, with no trusted)."
         },
         "trust_forwarded_proto": {
           "type": "boolean",
           "default": true,
-          "description": "With trusted_hops: the last X-Forwarded-Proto value says whether the request is secure."
+          "description": "From a trusted proxy: the last X-Forwarded-Proto value says whether the request is secure."
         },
         "trust_forwarded_host": {
           "type": "boolean",
           "default": false,
-          "description": "With trusted_hops: the last X-Forwarded-Host value is the request's host (only when every proxy in front sets it)."
+          "description": "From a trusted proxy: the last X-Forwarded-Host value is the request's host (only when every proxy in front sets it)."
         }
       },
       "description": "Trust in proxies in front of the server."

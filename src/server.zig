@@ -3635,3 +3635,115 @@ test "listenOn: only a development certificate off loopback warns" {
     try std.testing.expect(!warnsDevCert(.fromPem("c", "k"), .{ .ip = .{ .ip4 = .unspecified(8443) } }));
     try std.testing.expect(!warnsDevCert(.dev_self_signed, .{ .unix = try std.Io.net.UnixAddress.init("/tmp/x.sock") }));
 }
+
+const RawRequest = struct {
+    fn send(io_: std.Io, address: std.Io.net.IpAddress, request: []const u8, out: []u8) ![]const u8 {
+        const stream = try address.connect(io_, .{ .mode = .stream });
+        defer stream.close(io_);
+        var wbuf: [512]u8 = undefined;
+        var w = stream.writer(io_, &wbuf);
+        try w.interface.writeAll(request);
+        try w.interface.flush();
+        var rbuf: [1024]u8 = undefined;
+        var r = stream.reader(io_, &rbuf);
+        var fw: std.Io.Writer = .fixed(out);
+        _ = r.interface.streamRemaining(&fw) catch {};
+        return fw.buffered();
+    }
+};
+
+fn echoRemote(req: *http.Request, res: *http.Response) !void {
+    try res.print(.text, "{f}", .{req.remote_address});
+}
+
+fn failBoom(_: *http.Request, _: *http.Response) !void {
+    return error.Boom;
+}
+
+fn failNotFound(_: *http.Request, _: *http.Response) !void {
+    return error.NotFound;
+}
+
+test "anole.Server: behind_proxy over a real connection reads X-Forwarded-For from a trusted peer" {
+    const gpa = std.testing.allocator;
+    var app = try Server(void).init(gpa, .{
+        .deployment = .behind_proxy,
+        .http = .{ .port = 0, .h2c = false },
+        .executors = .exact(1),
+    }, {});
+    defer app.deinit();
+    try std.testing.expectEqual(modes.Deployment.behind_proxy, app.deployment());
+    app.get("/who", echoRemote);
+    var client_future = try app.io().concurrent(struct {
+        fn run(a: *Server(void)) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            var out: [1024]u8 = undefined;
+            const resp = try RawRequest.send(io_, a.addresses()[0].ip, "GET /who HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 198.51.100.7\r\nConnection: close\r\n\r\n", &out);
+            try std.testing.expect(std.mem.endsWith(u8, resp, "198.51.100.7:0"));
+        }
+    }.run, .{&app});
+    try app.run();
+    try client_future.await(app.io());
+}
+
+test "anole.Server: error_detail names the error in a 500, in development only" {
+    const gpa = std.testing.allocator;
+    inline for (.{ modes.Environment.development, modes.Environment.production }) |environment| {
+        var app = try Server(void).init(gpa, .{
+            .environment = environment,
+            .http = .{ .port = 0, .h2c = false },
+            .executors = .exact(1),
+        }, {});
+        defer app.deinit();
+        app.get("/boom", failBoom);
+        app.get("/missing", failNotFound);
+        const Client = struct {
+            fn run(a: *Server(void)) !void {
+                defer a.stop();
+                const io_ = a.io();
+                try a.waitReady();
+                var out: [1024]u8 = undefined;
+                const resp = try RawRequest.send(io_, a.addresses()[0].ip, "GET /boom HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+                try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 500"));
+                const detail = std.mem.indexOf(u8, resp, "Internal Server Error: Boom") != null;
+                try std.testing.expectEqual(environment == .development, detail);
+                var out2: [1024]u8 = undefined;
+                const resp2 = try RawRequest.send(io_, a.addresses()[0].ip, "GET /missing HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out2);
+                try std.testing.expect(std.mem.startsWith(u8, resp2, "HTTP/1.1 404"));
+            }
+        };
+        var client_future = try app.io().concurrent(Client.run, .{&app});
+        try app.run();
+        try client_future.await(app.io());
+    }
+}
+
+test "anole.Server: proxy_protocol with an empty proxy.trusted is ProxyProtocolNoPeers" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.ProxyProtocolNoPeers, Server(void).init(gpa, .{
+        .proxy = .{ .trusted = &.{} },
+        .http = .{ .port = 0, .proxy_protocol = true },
+        .executors = .exact(1),
+    }, {}));
+}
+
+test "anole.Server: a .env file with a problem is InvalidEnvFile" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.env", .data = "NOT A PAIR\n" });
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
+    defer gpa.free(dir_path);
+    const path = try std.fmt.allocPrint(gpa, "{s}/bad.env", .{dir_path});
+    defer gpa.free(path);
+    env_mod._resetForTest();
+    defer env_mod._resetForTest();
+    try std.testing.expectError(error.InvalidEnvFile, Server(void).init(gpa, .{
+        .environment = .development,
+        .env_files = &.{path},
+        .http = .{ .port = 0 },
+        .executors = .exact(1),
+    }, {}));
+}

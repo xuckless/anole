@@ -3376,6 +3376,75 @@ static void test_listener_info(void) {
   printf("ok listener info: states, ports, flags\n");
 }
 
+/* anole_dotenv_read: the files, their order, ANOLE_ENV dropped, problems named. */
+struct dotenv_seen {
+  int calls;
+  char keys[8][16];
+  char values[8][16];
+  char files[8][32];
+};
+
+static void on_dotenv(void *ud, anole_str key, anole_str value, anole_str file, uint32_t line) {
+  struct dotenv_seen *d = ud;
+  (void)line;
+  if (d->calls < 8) {
+    snprintf(d->keys[d->calls], 16, "%.*s", (int)key.len, key.ptr);
+    snprintf(d->values[d->calls], 16, "%.*s", (int)value.len, value.ptr);
+    snprintf(d->files[d->calls], 32, "%.*s", (int)file.len, file.ptr);
+  }
+  d->calls++;
+}
+
+static void write_file(const char *dir, const char *name, const char *text) {
+  char path[512];
+  snprintf(path, sizeof path, "%s/%s", dir, name);
+  FILE *f = fopen(path, "w");
+  CHECK(f != NULL);
+  fputs(text, f);
+  fclose(f);
+}
+
+static void test_dotenv(void) {
+  char dir[] = "/tmp/anole-dotenv-XXXXXX";
+  CHECK(mkdtemp(dir) != NULL);
+  anole_str d = {dir, strlen(dir)};
+  write_file(dir, ".env", "A=1\nB=\"x\"\nANOLE_ENV=production\n");
+  write_file(dir, ".env.local", "A=2\n");
+  write_file(dir, ".env.development", "C='z'\n");
+
+  struct dotenv_seen seen = {0};
+  CHECK(anole_dotenv_read(d, LIT("development"), on_dotenv, &seen) == ANOLE_OK);
+  CHECK(seen.calls == 3);
+  CHECK(strcmp(seen.keys[0], "A") == 0 && strcmp(seen.values[0], "2") == 0 && strcmp(seen.files[0], ".env.local") == 0);
+  CHECK(strcmp(seen.keys[1], "C") == 0 && strcmp(seen.values[1], "z") == 0);
+  CHECK(strcmp(seen.keys[2], "B") == 0 && strcmp(seen.values[2], "x") == 0);
+
+  struct dotenv_seen none = {0};
+  CHECK(anole_dotenv_read(d, LIT("production"), on_dotenv, &none) == ANOLE_OK);
+  CHECK(none.calls == 0);
+
+  CHECK(anole_dotenv_read(d, LIT("staging"), on_dotenv, &none) == ANOLE_E_INVALID);
+  CHECK(name_is("UnknownEnvironment"));
+  CHECK(anole_dotenv_read(d, LIT("development"), NULL, NULL) == ANOLE_E_INVALID);
+
+  write_file(dir, ".env", "BAD LINE\n");
+  struct dotenv_seen bad = {0};
+  CHECK(anole_dotenv_read(d, LIT("development"), on_dotenv, &bad) == ANOLE_E_CONFIG);
+  CHECK(name_is("InvalidEnvFile"));
+  CHECK(bad.calls == 0);
+  anole_str why = anole_last_error();
+  CHECK(why.len > 0 && memmem(why.ptr, why.len, ".env:1", 6) != NULL);
+  CHECK(memmem(why.ptr, why.len, "LINE", 4) == NULL);
+
+  const char *names[] = {".env", ".env.local", ".env.development"};
+  for (int i = 0; i < 3; i++) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+    unlink(path);
+  }
+  rmdir(dir);
+}
+
 static void test_open_before_start(void) {
   int have_sqlite = anole_has_feature(LIT("sqlite"));
   const char *json = have_sqlite
@@ -3872,6 +3941,7 @@ static int run_tests(void) {
   test_abort_reasons();
   test_sent_once();
   test_listener_info();
+  test_dotenv();
   test_open_before_start();
   test_destroy_on_consumer_thread();
   test_log_callback_per_server();

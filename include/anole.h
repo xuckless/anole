@@ -343,6 +343,29 @@ typedef struct anole_stats {
 /* Counters since start. Fills what out->size covers. */
 ANOLE_API anole_status anole_server_stats(anole_server *s, anole_stats *out);
 
+/* ---- environment ----------------------------------------------------------- */
+
+/* One variable of a .env file, for anole_dotenv_read. key, value and file
+   are valid during the call only (copy them). Values may be secrets: never
+   log them. */
+typedef void (*anole_dotenv_fn)(void *ud, anole_str key, anole_str value, anole_str file, uint32_t line);
+
+/* Reads the .env files Anole reads for `environment` in `dir` (empty: the
+   working directory) and calls fn once per variable, in the files' order of
+   precedence: "development" reads .env.development.local, .env.local,
+   .env.development and .env (missing files skipped; the first file that has
+   a key wins; ANOLE_ENV is never passed on); "production" reads none and
+   returns ANOLE_OK at once. The process environment is not touched: the
+   binding sets each variable that is not already set, in its language
+   (Node: process.env, Python: os.environ), before anole_server_create.
+   No server needed; any thread; not concurrently with itself.
+   ANOLE_E_INVALID ("UnknownEnvironment") for another environment, or a
+   NULL fn. ANOLE_E_CONFIG ("InvalidEnvFile"): a problem in a file (a line
+   without '=', a bad name, an unterminated quote, a key twice in one file,
+   a file over 1 MiB or unreadable); anole_last_error names every problem
+   by file and line (never a value), fn is not called at all. */
+ANOLE_API anole_status anole_dotenv_read(anole_str dir, anole_str environment, anole_dotenv_fn fn, void *ud);
+
 /* ---- consumers and events --------------------------------------------------- */
 
 /* Many threads poll this consumer (a WSGI thread pool) with anole_poll_wait;

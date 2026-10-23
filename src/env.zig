@@ -40,6 +40,12 @@ const development_files = [_][]const u8{ ".env.development.local", ".env.local",
 /// directory (the first wins per key); production, none. None in tests.
 pub fn defaultFiles(e: Environment) []const []const u8 {
     if (builtin.is_test) return &.{};
+    return defaultFilesFor(e);
+}
+
+/// `defaultFiles` without the empty list tests get: what the C ABI's
+/// `anole_dotenv_read` reads for `e`.
+pub fn defaultFilesFor(e: Environment) []const []const u8 {
     return switch (e) {
         .development => &development_files,
         .production => &.{},

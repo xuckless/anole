@@ -1942,3 +1942,27 @@ test "capi engine: a fixed route behind a JWKS jwt middleware is not run inline;
         try std.testing.expect(e.wait(5000));
     }
 }
+
+fn testVarsReal(_: ?*const anyopaque, name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "PORT")) return "41234";
+    return null;
+}
+
+test "capi: deployment resolution at create" {
+    engine._test_vars = .{ .real = testVarsReal, .any = testVarsReal };
+    defer engine._test_vars = null;
+    {
+        var why_buf: [256]u8 = undefined;
+        var why: std.Io.Writer = .fixed(&why_buf);
+        const e = try engine.Engine.create("{\"deployment\":\"platform\",\"listeners\":[{}]}", false, &why);
+        defer e.destroy();
+        try std.testing.expectEqualStrings("[::]:41234", e.listeners[0].cfg_address);
+        try std.testing.expectEqualStrings("http-41234", e.listeners[0].name);
+    }
+    {
+        var why_buf: [256]u8 = undefined;
+        var why: std.Io.Writer = .fixed(&why_buf);
+        try std.testing.expectError(error.DeploymentUnavailable, engine.Engine.create("{\"deployment\":\"lambda\"}", false, &why));
+        try std.testing.expect(why.buffered().len > 0);
+    }
+}
