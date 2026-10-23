@@ -1137,7 +1137,7 @@ pub const Engine = struct {
         var opts = try e.serverOptions(a);
         const vars = _test_vars orelse modes.Vars.process;
         const env_res = try modes.resolveEnvironment(cfg.environment, vars, .abi, why);
-        e.resolved = try modes.resolve(a, &opts, env_res.environment, env_res.source, null, vars, why);
+        e.resolved = try modes.resolve(a, &opts, env_res.environment, env_res.source, null, vars, .abi, why);
         try modes.fillListeners(a, &opts, &e.resolved);
         e.options = opts;
         e.listeners = try a.alloc(ListenerState, opts.listeners.len);
@@ -1370,6 +1370,22 @@ pub const Engine = struct {
                 .max_routes = cfg.console.max_routes,
             },
             ._console_runtime = cfg.console.runtime,
+            // ---- p3/lambda ----
+            .lambda = .{
+                .runtime_api = cfg.lambda.runtime_api,
+                .invoke_mode = cfg.lambda.invoke_mode,
+                .concurrency = cfg.lambda.concurrency,
+                .event_path = cfg.lambda.event_path,
+                .base_path = cfg.lambda.base_path,
+                .keep_stage = cfg.lambda.keep_stage,
+                .context_headers = cfg.lambda.context_headers,
+                .deadline_margin = .fromMilliseconds(cfg.lambda.deadline_margin_ms),
+                .idle_reset = if (cfg.lambda.idle_reset_ms) |ms| .fromMilliseconds(ms) else null,
+                .sigterm = cfg.lambda.sigterm,
+                .shutdown_timeout = .fromMilliseconds(cfg.lambda.shutdown_timeout_ms),
+                .flush_timeout = .fromMilliseconds(cfg.lambda.flush_timeout_ms),
+            },
+            // ---- end p3/lambda ----
             .timeouts = .{
                 .request = request,
                 .read_header = msOrNull(cfg.timeouts.read_header_ms),
@@ -1822,7 +1838,7 @@ pub const Engine = struct {
         if (e.consumers.items.len == 0 or e.consumers.items[0].execs.items.len == 0) return;
         const rec = newRecord(@sizeOf(abi.ConsoleClosedEvent), .console_closed, 0) catch return;
         const ev: *abi.ConsoleClosedEvent = @ptrCast(rec.ptr);
-        ev.reason = @intFromEnum(reason);
+        ev.reason = @backingInt(reason);
         e.consumers.items[0].execs.items[0].postRecord(rec, false);
     }
 
@@ -2270,7 +2286,10 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
         .refused => unreachable,
     }
     s.word.store(pack(gen, .queued), .release);
-    x.link(si, route.list, std.Io.Clock.awake.now(io).nanoseconds + e.timeouts[route.list]);
+    // The earlier of the route's deadline and one the engine set before
+    // dispatch (AWS Lambda: the invocation's deadline less the margin), so
+    // `timeout_us` reports the one that applies.
+    x.link(si, route.list, @min(std.Io.Clock.awake.now(io).nanoseconds + e.timeouts[route.list], handlerDeadlineNs(req)));
 
     // Hand over. A full ring (the consumer far behind) is backpressure:
     // wait for room, up to the deadline; on a reader, refuse instead.
@@ -2940,6 +2959,13 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
 
 /// What `timeouts.request_ms: null` stands for in the deadline lists: a day.
 const no_deadline: i96 = 24 * 3600 * std.time.ns_per_s;
+
+/// `req._handler_deadline` on the awake clock, in nanoseconds; the largest
+/// value when there is none.
+fn handlerDeadlineNs(req: *const http.Request) i96 {
+    const d = req._handler_deadline orelse return std.math.maxInt(i96);
+    return d.raw.nanoseconds;
+}
 
 fn msOrNull(ms: ?u32) ?std.Io.Duration {
     return if (ms) |v| std.Io.Duration.fromMilliseconds(v) else null;

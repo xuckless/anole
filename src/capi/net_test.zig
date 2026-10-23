@@ -414,6 +414,7 @@ test "capi net: drain closes a connection the consumer leaves open" {
 }
 
 test "capi net: config tcp and udp keys parse, and each refusal says why" {
+    if (comptime !features.net) return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(alloc);
     defer arena.deinit();
     var buf: [400]u8 = undefined;

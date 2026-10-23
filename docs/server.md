@@ -559,9 +559,12 @@ listener whose port could not be bound. The C ABI reports the same names
 | `ListenersAlreadySet` | `listen` or `listenTls` on a server whose options name listeners. | Serve them with `run`, or leave `http` and `https` out of the options. |
 | `InvalidListenerName`, `DuplicateListenerName` | A listener name that is empty, longer than 255 bytes, holds `:`, or is taken. | Give each listener its own short name. |
 | `InvalidProxyNetwork` | A `proxy_protocol_from`, `proxy.trusted` or `ANOLE_PROXY_TRUSTED` entry that is not an address, a CIDR network or `loopback`, `private`, `link_local`. | Write `"10.0.0.0/8"` or `"192.0.2.7"`. |
-| `InvalidEnvironmentVariable` | `ANOLE_ENV`, `ANOLE_DEPLOYMENT` or (platform) `PORT` holds a value Anole can't use; the log names it. | Set one of the listed values. |
+| `InvalidEnvironmentVariable` | `ANOLE_ENV`, `ANOLE_DEPLOYMENT`, (platform) `PORT`, or (lambda) `AWS_LAMBDA_RUNTIME_API`, `AWS_LAMBDA_HTTP_ENDPOINT`, `ANOLE_LAMBDA_INVOKE_MODE` or `AWS_LAMBDA_MAX_CONCURRENCY` holds a value Anole can't use; the log names it. | Set one of the listed values. |
 | `InvalidEnvFile` | A `.env` file has a problem; every problem is logged with its file and line. | Fix the lines; values are never printed. |
-| `DeploymentUnavailable` | `deployment = .lambda` before Anole 0.4. | Use `platform` or wait for the Lambda adapter. |
+| `LambdaRuntimeApiMissing` | `deployment = .lambda` with no `lambda.runtime_api`, no `AWS_LAMBDA_RUNTIME_API` and no `AWS_LAMBDA_HTTP_ENDPOINT`. | Run it on Lambda or under the Runtime Interface Emulator, set `lambda.runtime_api`, or use another deployment. |
+| `LambdaNotBuilt` | `deployment = .lambda` in a `-Dlambda=false` build. | Build with `-Dlambda` (on in every profile), or use another deployment. |
+| `LambdaRuntimeApiFailed` | The Runtime API answered 500, or asking it for the next invocation failed three times in a row. | Nothing to fix in the app: the process exits so Lambda starts a new environment. If it repeats, the lines before it say why. |
+| `SnapStartUnsupported` | `AWS_LAMBDA_INITIALIZATION_TYPE=snap-start`: restored copies would share random-number state. | Publish the function without SnapStart. |
 | `ProxyProtocolNoPeers` | `proxy_protocol` on with `proxy.trusted` empty and no `proxy_protocol_from`. | Name the load balancers. |
 | `NoProtocols`, `SeveralHttp3Listeners`, `Http3NeedsTls`, `Http3NeedsHttps` | A listener that speaks nothing; HTTP/3 on several listeners, or on one without TLS. | One TLS listener serves HTTP/3. |
 | `TooManyListeners` | More listeners than a restart can hand over (64 TCP ones, raw TCP included, and 1024 UDP sockets). | Fewer listeners, or no `process`. |
@@ -1148,6 +1151,18 @@ On platforms (`deployment = platform`), Cloud Run's "Use HTTP/2
 end-to-end" and Fly's `h2_backend = true` send h2c with prior knowledge.
 The default cleartext listener serves it as it is; gRPC needs it there, and
 on Cloud Run it also lifts the 32 MiB request size limit of HTTP/1.1.
+
+## AWS Lambda
+
+The same `main` runs as a Lambda function. With `deployment = .lambda` (or
+`ANOLE_DEPLOYMENT=lambda`, or a `zig build lambda` build, whose default it
+is), `run`, `listen` and `listenTls` serve invocations from the Lambda
+Runtime API instead of opening listeners: each API Gateway, Function URL,
+ALB or VPC Lattice event goes through the router and middleware as a
+request, and other events (SQS, EventBridge, S3) are POSTed to
+`/_lambda/event`. Listeners named in the options are set aside, and one
+startup line says which. `zig build lambda` writes `provided.al2023` zips
+for arm64 and x86_64. See [lambda.md](lambda.md).
 
 ## Build flags
 

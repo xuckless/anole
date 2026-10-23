@@ -14,6 +14,7 @@
 | `channel.conn` (read) | `channel.conn.?` (the field is optional; `h3` is the other connection) |
 | A gRPC client call whose stream the server reset was UNAVAILABLE | the status follows the reset code (INTERNAL for most; only a refused stream is UNAVAILABLE, so `Channel.retry` no longer repeats the others) |
 | `Response.abort()` in a gRPC handler answered UNKNOWN | the stream is reset; the client reads CANCELLED |
+| `error.DeploymentUnavailable` for `deployment = .lambda` | gone: `deployment = .lambda` serves AWS Lambda invocations (docs/lambda.md); an exhaustive `switch` on `anole.ServerError` drops `DeploymentUnavailable` and adds `LambdaRuntimeApiMissing`, `LambdaNotBuilt`, `LambdaRuntimeApiFailed` and `SnapStartUnsupported` |
 
 ## 0.2 to 0.3
 

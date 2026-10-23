@@ -780,6 +780,35 @@ pub const Client = struct {
         }
     }
 
+    /// Closes the idle pooled connections of every server and executor;
+    /// calls open new ones as they need them, and the monitors reconnect
+    /// on their own. The Lambda adapter calls it after a long freeze, when
+    /// a NAT gateway may have dropped them without telling either end.
+    pub fn closeIdle(self: *Client) void {
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        const servers = self.gpa.dupe(*Server, self.servers.items) catch {
+            self.mutex.unlock(io);
+            return;
+        };
+        self.mutex.unlock(io);
+        defer self.gpa.free(servers);
+        for (servers) |s| for (s.pools.pools) |*p| {
+            while (true) {
+                p.mutex.lockUncancelable(io);
+                const c = p.idle.pop() orelse {
+                    p.mutex.unlock(io);
+                    break;
+                };
+                p.total -= 1;
+                p.cond.signal(io);
+                p.mutex.unlock(io);
+                self.observer.connections(-1, 0);
+                c.close();
+            }
+        };
+    }
+
     fn stale(self: *Client, s: *Server, c: *Connection, io: std.Io) bool {
         if (c.generation != s.generation.load(.acquire) or s.retired.load(.acquire)) return true;
         if (self.options.idle_timeout) |max| {

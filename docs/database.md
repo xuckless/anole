@@ -26,6 +26,27 @@ Choose them where you add the dependency, as for the other
 
 After 5 connection failures in a row (or half of 20 calls in 10 s) a network connector's breaker opens: calls fail at once with `error.ServiceUnavailable` and `lastError` code `circuit_open`, for 5 s and then while probes fail (up to 60 s). Answers from a live server (a unique violation, a statement timeout) and a busy pool (`pool_timeout`) never count. `breaker = null` turns it off. `with(.{ .retry = true })` runs a statement again on a transient failure (the server unreachable, a connection lost) with the connector's `retry`; use it only for statements that are safe to repeat. See [resilience.md](resilience.md).
 
+### On AWS Lambda
+
+Under `deployment = .lambda` ([lambda.md](lambda.md)) the connectors work
+as on a server, with three things to know:
+
+- **Pools multiply.** Every Lambda environment holds its own pools, capped
+  per executor (with one executor, the usual case, a handful of
+  connections). A burst that starts a hundred environments opens a hundred
+  pools. For PostgreSQL, put RDS Proxy (or PgBouncer) in front and size
+  `max_connections` with that product in mind.
+- **The freeze.** Lambda freezes the process between invocations, and a NAT
+  gateway forgets an idle TCP connection after 350 s without telling either
+  end. When an invocation arrives more than `lambda.idle_reset` (300 s)
+  after the last one ended, the idle connections of every connector and of
+  the outbound client are closed before it runs, so no query lands on a
+  dead socket and waits for its timeout. Busy connections are left alone,
+  and the pools reconnect on the next use.
+- **Connecting during init.** Everything before `run()` is Lambda's INIT
+  phase. `connect_at_start = true` opens the first connection there, so the
+  first invocation does not pay for it; without it, pools stay lazy.
+
 ### Options every connector shares
 
 One vocabulary: a concept has the same field name and type on every

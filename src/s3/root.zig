@@ -799,6 +799,13 @@ pub const Client = struct {
         }
     }
 
+    /// Closes the idle pooled connections of its HTTP client; the next
+    /// call opens a new one. The Lambda adapter calls it after a long
+    /// freeze, when a NAT gateway may have dropped them silently.
+    pub fn closeIdle(self: *Client) void {
+        self.http.closeIdle();
+    }
+
     pub fn deinit(self: *Client) void {
         self.draining.store(true, .release);
         self.creds.stop.store(true, .release);
@@ -1064,7 +1071,7 @@ pub const Client = struct {
         var keep = false;
         defer if (!keep) resp.deinit();
         if (self.bytes_up) |m| m.add(op.body.len);
-        const status: u16 = @intCast(@intFromEnum(resp.status()));
+        const status: u16 = @intCast(@backingInt(resp.status()));
         if (status >= 300 and !(status == 304 and op.allow_304)) {
             return self.errorAnswer(c, &resp, op, status);
         }

@@ -333,6 +333,21 @@ as a collector receives it:
 The span name is the method and route pattern. Status code 2 (error) marks
 a 5xx response; anything else is left unset (0).
 
+`exporter.flush(timeout)` sends the spans queued so far and waits until the
+collector has answered for them, or `timeout` passes (the spans are not lost
+then; the batching task keeps going). It is for a process that may be
+frozen right after the call: the AWS Lambda adapter calls it after each
+answer and before asking for the next invocation, bounded by
+`lambda.flush_timeout` (500 ms). One caller at a time; it does nothing
+before `start`.
+
+On AWS Lambda, an invocation carries X-Ray's trace ID
+(`Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1`).
+When the request has no `traceparent`, the adapter adds one made from it:
+`00-5759e988bd862e3fe1be46a994272793-53995c3f42cd8ad8-01` (the root's two
+hex parts joined, the parent, and the sampled flag), so the span joins
+X-Ray's trace. A trace ID that does not parse adds nothing.
+
 ### Passing the trace on
 
 For an outgoing call, `anole.observe.trace.outgoing(req, &buf)` returns a

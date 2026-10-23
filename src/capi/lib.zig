@@ -386,6 +386,12 @@ fn startFailure(e: *Engine, err: anyerror, comptime what: []const u8) i32 {
         // without SMTP_URL, a URL that is not one): the configuration's.
         error.InvalidOptions => if (explained.len > 0) return named(abi.E_CONFIG, "InvalidOptions", 0, "{s}", .{explained}),
         // ---- end p3/smtp ----
+        // ---- p3/lambda ----
+        // SnapStart is how the function was published: the configuration's
+        // to change. A Runtime API that failed is the platform's.
+        error.SnapStartUnsupported => return named(abi.E_CONFIG, "SnapStartUnsupported", 0, "{s}", .{if (explained.len > 0) explained else "lambda: SnapStart is not supported yet"}),
+        error.LambdaRuntimeApiFailed => return named(abi.E_SYSTEM, "LambdaRuntimeApiFailed", 0, "{s}", .{if (explained.len > 0) explained else "lambda: the Runtime API failed"}),
+        // ---- end p3/lambda ----
         error.DatabaseUnavailable => {
             if (explained.len > 0) return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), "{s}", .{explained});
             return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), what ++ ": {t}", .{err});
@@ -1102,8 +1108,16 @@ export fn anole_nats_subscribe(n: ?*anyopaque, c_: ?*anyopaque, subject: Str, op
     const c = consumerOf(c_) orelse return badPointer(c_);
     const dst = out orelse return failCode(abi.E_INVALID);
     const o: abi.NatsSubscribeOptions = if (opts) |p| readSized(abi.NatsSubscribeOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsSubscribeOptions) };
+    if (b.engine.resolved.deployment == .lambda) return lambdaNoConsumers("anole_nats_subscribe");
     dst.* = nats_mod.subscribe(b, c, subject.slice(), o, user_data) catch |err| return natsFailure(err);
     return abi.OK;
+}
+
+/// Under `deployment = lambda` nothing consumes between invocations (the
+/// process is frozen), so a subscription would deliver nothing reliably:
+/// refused at once rather than left silent.
+fn lambdaNoConsumers(comptime what: []const u8) i32 {
+    return named(abi.E_STATE, "State", 0, what ++ ": deployment lambda starts no subscriptions or consumer groups (the process is frozen between invocations); publishing works, and an event source mapping delivers messages to the event path", .{});
 }
 
 export fn anole_nats_unsubscribe(sub: u64) i32 {
@@ -1129,6 +1143,7 @@ export fn anole_nats_js_consume(n: ?*anyopaque, c_: ?*anyopaque, stream: Str, co
     const c = consumerOf(c_) orelse return badPointer(c_);
     const dst = out orelse return failCode(abi.E_INVALID);
     const o: abi.NatsJsConsumeOptions = if (opts) |p| readSized(abi.NatsJsConsumeOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsJsConsumeOptions) };
+    if (b.engine.resolved.deployment == .lambda) return lambdaNoConsumers("anole_nats_js_consume");
     dst.* = nats_mod.consume(b, c, stream.slice(), consumer.slice(), o, user_data) catch |err| return natsFailure(err);
     return abi.OK;
 }
@@ -1195,6 +1210,7 @@ export fn anole_kafka_subscribe(k: ?*anyopaque, c_: ?*anyopaque, opts: ?*const a
     const c = consumerOf(c_) orelse return badPointer(c_);
     const dst = out orelse return failCode(abi.E_INVALID);
     const o: abi.KafkaSubscribeOptions = readSized(abi.KafkaSubscribeOptions, opts orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
+    if (b.engine.resolved.deployment == .lambda) return lambdaNoConsumers("anole_kafka_subscribe");
     dst.* = kafka_mod.subscribe(b, c, o, user_data) catch |err| return kafkaFailure(err);
     return abi.OK;
 }

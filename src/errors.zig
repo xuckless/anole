@@ -14,7 +14,6 @@ pub const ServerError = error{
     InvalidProxyNetwork,
     InvalidEnvironmentVariable,
     InvalidEnvFile,
-    DeploymentUnavailable,
     ProxyProtocolNoPeers,
     // ---- p3/net ----
     NetNotBuilt,
@@ -29,6 +28,10 @@ pub const ServerError = error{
     // ---- end p3/net ----
 
     // ---- p3/lambda ----
+    LambdaRuntimeApiMissing,
+    LambdaNotBuilt,
+    LambdaRuntimeApiFailed,
+    SnapStartUnsupported,
     // ---- end p3/lambda ----
 
     // The OpenAPI document (`app.openapi`, `zig build openapi`)
@@ -266,10 +269,6 @@ pub fn explain(err: ServerError, ctx: Context, w: *std.Io.Writer) std.Io.Writer.
             try w.writeAll("can't read a .env file: it has a line that is not NAME=value.");
             try fix(w, "The log above says which file and line; comment it out with '#' or fix it.");
         },
-        error.DeploymentUnavailable => {
-            try w.writeAll("can't use this deployment mode: it is not available in this version.");
-            try fix(w, "Use standalone, behind_proxy, anole_lb or platform (ANOLE_DEPLOYMENT or the deployment option).");
-        },
         error.ProxyProtocolNoPeers => {
             try w.writeAll("can't turn on the PROXY protocol: no peer is allowed to send the header.");
             try fix(w, "Name the load balancers in proxy.trusted or the listener's proxy_protocol_from.");
@@ -318,6 +317,22 @@ pub fn explain(err: ServerError, ctx: Context, w: *std.Io.Writer) std.Io.Writer.
         // ---- end p3/net ----
 
         // ---- p3/lambda ----
+        error.LambdaRuntimeApiMissing => {
+            try w.writeAll("deployment \"lambda\": AWS_LAMBDA_RUNTIME_API is not set; Lambda sets it, and so does the Runtime Interface Emulator (docs/lambda.md, \"Running locally\").");
+            try fix(w, "Run it on Lambda or under the Runtime Interface Emulator, set lambda.runtime_api, or use another deployment.");
+        },
+        error.LambdaNotBuilt => {
+            try w.writeAll("deployment \"lambda\": this build leaves the Lambda adapter out (-Dlambda).");
+            try fix(w, "Build with -Dlambda (on in every profile), or use another deployment.");
+        },
+        error.LambdaRuntimeApiFailed => {
+            try w.print("lambda: the Runtime API at {s} failed: {s}; exiting so Lambda starts a new environment.", .{ ctx.address orelse "AWS_LAMBDA_RUNTIME_API", ctx.detail orelse "it gave an answer the adapter cannot use" });
+            try fix(w, "Nothing to fix in the app; if it repeats, the function's logs before this line say why.");
+        },
+        error.SnapStartUnsupported => {
+            try w.writeAll("lambda: SnapStart is not supported yet (restored copies would share random-number state).");
+            try fix(w, "Publish the function without SnapStart.");
+        },
         // ---- end p3/lambda ----
 
         error.NoProtocols => {

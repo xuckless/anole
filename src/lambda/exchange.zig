@@ -163,6 +163,13 @@ pub const BufferedSink = struct {
     }
 };
 
+/// Headers for a text answer the adapter writes itself.
+fn plainHeaders(arena: std.mem.Allocator) error{OutOfMemory}!dusty.Headers {
+    var h = try dusty.Headers.init(arena, 2);
+    h.put("Content-Type", "text/plain") catch return error.OutOfMemory;
+    return h;
+}
+
 fn statusCode(status: dusty.Status) u16 {
     return @intCast(@backingInt(status));
 }
@@ -345,8 +352,8 @@ pub fn lambdaContextJson(arena: std.mem.Allocator, inv: *const runtime.Invocatio
     try w.writeAll(",\"identity\":");
     try rawJsonOrNull(arena, w, inv.cognito_identity);
     try w.print(",\"env_config\":{{\"function_name\":{f},\"memory\":{d},\"version\":{f},\"log_stream\":{f},\"log_group\":{f}}}}}", .{
-        std.json.fmt(env.function_name, .{}), env.memory_mb, std.json.fmt(env.version, .{}),
-        std.json.fmt(env.log_stream, .{}),     std.json.fmt(env.log_group, .{}),
+        std.json.fmt(env.function_name, .{}), env.memory_mb,                    std.json.fmt(env.version, .{}),
+        std.json.fmt(env.log_stream, .{}),    std.json.fmt(env.log_group, .{}),
     });
     return out.written();
 }
@@ -402,6 +409,9 @@ pub fn Exchange(comptime Ctx: type) type {
                 const timed = dusty.placement.currentTask(io) != null;
                 var timer: Timer = .{ .limit = self.limit };
                 defer if (timed) timer.auto.clear();
+                // What the C ABI reports as the request's `timeout_us`: never
+                // past Lambda's deadline minus the margin.
+                req._handler_deadline = self.limit;
                 if (timed) {
                     timer.arm(io, if (self.request_timeout) |d| .{ .duration = .{ .raw = d, .clock = .awake } } else .none);
                     req._timeout_context = &timer;
@@ -517,25 +527,21 @@ pub fn Exchange(comptime Ctx: type) type {
             // The event path is reserved for events: a web client cannot
             // forge an SQS batch through the front door.
             if (cfg.event_path) |ep| if (std.mem.eql(u8, pathOf(plan.target), ep)) {
-                var headers = try dusty.Headers.init(arena, 2);
-                try headers.put("Content-Type", "text/plain");
+                var headers = try plainHeaders(arena);
                 const out = encode.Answer{ .status = 404, .headers = &headers, .parts = &.{"404 Not Found\n"}, .head = std.ascii.eqlIgnoreCase(plan.method, "HEAD") };
                 return postBuffered(rt, inv, arena, plan, out);
             };
             return runAndPost(core, rt, inv, arena, cfg, ctx, plan, io);
         }
 
-        fn postFailure(err: runtime.PostError) AnswerError {
+        fn postFailure(err: runtime.PostError) AnswerError!void {
             return switch (err) {
                 error.Canceled => error.Canceled,
                 error.OutOfMemory => error.OutOfMemory,
                 error.RuntimeApiFailed => error.RuntimeApiFailed,
                 // Lambda no longer wants this invocation's answer (it timed
                 // out already) or it is too big: logged, serving goes on.
-                error.InvalidInvocationId, error.PayloadTooLarge => blk: {
-                    log.warn("lambda: the Runtime API refused an answer: {t}", .{err});
-                    break :blk error.RuntimeApiFailed;
-                },
+                error.InvalidInvocationId, error.PayloadTooLarge => log.warn("lambda: the Runtime API refused an answer: {t}", .{err}),
             };
         }
 
@@ -563,8 +569,7 @@ pub fn Exchange(comptime Ctx: type) type {
             const limit = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromMilliseconds(remaining_ms), .clock = .awake });
 
             const method = parseMethod(plan.method) orelse {
-                var headers = try dusty.Headers.init(arena, 2);
-                try headers.put("Content-Type", "text/plain");
+                var headers = try plainHeaders(arena);
                 return postBuffered(rt, inv, arena, plan, .{ .status = 501, .headers = &headers, .parts = &.{"501 Not Implemented\n"}, .head = false });
             };
 
@@ -577,7 +582,7 @@ pub fn Exchange(comptime Ctx: type) type {
                     const text = std.json.Stringify.valueAlloc(arena, rc, .{}) catch return error.OutOfMemory;
                     try fields.append(arena, .{ .name = "x-amzn-request-context", .value = text });
                 }
-                try fields.append(arena, .{ .name = "x-amzn-lambda-context", .value = try lambdaContextJson(arena, inv, cfg.env) });
+                try fields.append(arena, .{ .name = "x-amzn-lambda-context", .value = lambdaContextJson(arena, inv, cfg.env) catch return error.OutOfMemory });
             }
             var has_traceparent = false;
             for (plan.headers) |f| if (std.ascii.eqlIgnoreCase(f.name, "traceparent")) {
@@ -650,8 +655,7 @@ pub fn Exchange(comptime Ctx: type) type {
             if (plan.source == .event) return postEvent(rt, inv, arena, &buffered);
             if (!buffered.touched()) {
                 // Nothing came out of the handler at all.
-                var headers = try dusty.Headers.init(arena, 2);
-                try headers.put("Content-Type", "text/plain");
+                var headers = try plainHeaders(arena);
                 return postBuffered(rt, inv, arena, plan, .{ .status = 500, .headers = &headers, .parts = &.{"500 Internal Server Error\n"}, .head = false });
             }
             if (buffered.too_large) return postTooLarge(rt, inv, arena, plan, req, buffered.limit, null);
@@ -675,8 +679,7 @@ pub fn Exchange(comptime Ctx: type) type {
             _ = streamed;
             _ = run;
             if (plan.source == .event) return rt.fail(inv, "Function.Timeout", "deadline passed") catch |e| return postFailure(e);
-            var headers = try dusty.Headers.init(arena, 2);
-            try headers.put("Content-Type", "text/plain");
+            var headers = try plainHeaders(arena);
             return postBuffered(rt, inv, arena, plan, .{ .status = 504, .headers = &headers, .parts = &.{"504 Gateway Timeout\n"}, .head = false });
         }
 
@@ -687,8 +690,7 @@ pub fn Exchange(comptime Ctx: type) type {
             } else {
                 log.err("lambda: the response to {s} is past Lambda's limit of {d} bytes; answering 500", .{ route, limit });
             }
-            var headers = try dusty.Headers.init(arena, 2);
-            try headers.put("Content-Type", "text/plain");
+            var headers = try plainHeaders(arena);
             const message = if (size) |n|
                 try std.fmt.allocPrint(arena, "response too large for Lambda ({d} bytes; the limit is {d})\n", .{ n, limit })
             else
@@ -734,8 +736,7 @@ pub fn Exchange(comptime Ctx: type) type {
             const size = enc.written().len;
             if (size > limit) {
                 // Replace the answer with a 500 the app can see in its logs.
-                var headers = try dusty.Headers.init(arena, 2);
-                try headers.put("Content-Type", "text/plain");
+                var headers = try plainHeaders(arena);
                 log.err("lambda: a response of {d} bytes is past Lambda's limit of {d}; answering 500", .{ size, limit });
                 const message = try std.fmt.allocPrint(arena, "response too large for Lambda ({d} bytes; the limit is {d})\n", .{ size, limit });
                 return postEncoded(rt, inv, arena, plan, .{ .status = 500, .headers = &headers, .parts = &.{message}, .head = false });

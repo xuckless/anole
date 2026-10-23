@@ -13,6 +13,9 @@ pub const encode = @import("encode.zig");
 pub const runtime = @import("runtime.zig");
 pub const exchange = @import("exchange.zig");
 
+/// `ServerOptions.lambda`: where invocations come from and how answers go back.
+pub const Options = @import("../server.zig").Options.Lambda;
+
 /// What the invocation came from.
 pub const Source = enum { rest_api, http_api, function_url, alb, vpc_lattice, event };
 
@@ -67,4 +70,5 @@ test {
     _ = encode;
     _ = runtime;
     _ = exchange;
+    _ = @import("fake_runtime_test.zig");
 }

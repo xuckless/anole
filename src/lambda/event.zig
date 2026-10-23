@@ -625,10 +625,10 @@ test "lambda event: spoofed context headers are removed" {
 
 test "fuzz: lambda event parse" {
     const seeds = [_][]const u8{
-        fixture("apigw_proxy_request"),     fixture("apigw_multi_value_proxy_request"), fixture("apigw_v2_proxy_request"),
-        fixture("lambda_function_url_request"), fixture("alb_request"),                  fixture("alb_multi_value_request"),
-        fixture("vpc_lattice_v2_request"),  fixture("vpc_lattice_v2_request_base64"),    fixture("sqs_event"),
-        fixture("apigw_websocket_request"), "{}",                                         "{\"httpMethod\":\"GET\",\"path\":\"/\"}",
+        fixture("apigw_proxy_request"),         fixture("apigw_multi_value_proxy_request"), fixture("apigw_v2_proxy_request"),
+        fixture("lambda_function_url_request"), fixture("alb_request"),                     fixture("alb_multi_value_request"),
+        fixture("vpc_lattice_v2_request"),      fixture("vpc_lattice_v2_request_base64"),   fixture("sqs_event"),
+        fixture("apigw_websocket_request"),     "{}",                                       "{\"httpMethod\":\"GET\",\"path\":\"/\"}",
     };
     try @import("../fuzz.zig").bytes(struct {
         fn check(input: []const u8) !void {

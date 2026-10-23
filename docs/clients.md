@@ -470,6 +470,40 @@ On an error before `await`, cancel the sender instead. Flow control follows
 the reader: the server gets more window only as you take bytes, so a slow
 reader slows the server rather than filling memory.
 
+### Uploading as you go
+
+`client.upload(url, options)` starts a request whose body is written as it
+goes, with `Transfer-Encoding: chunked`. The head is sent at once, over
+HTTP/1.1 only (also for https), with no redirects, retries or breaker.
+`url` must be http or https.
+
+```zig
+var up = try client.upload(url, .{ .trailer_names = &.{"X-Checksum"} });
+try up.writer.writeAll("part one");
+try up.writer.flush(); // sends one chunk
+var trailers = try anole.http.Headers.init(gpa, 1);
+try trailers.put("X-Checksum", "abc");
+var response = try up.finish(&trailers);
+defer response.deinit();
+```
+
+`UploadOptions`: `method` (POST), `headers`, `trailer_names` (announced up
+front in a `Trailer` header), `timeout` (bounds opening the connection and
+sending the head, and in `finish` waiting for the response head; writing
+the body goes at your pace; null inherits the client's `timeout`, `.none`
+lifts it) and `unix_socket_path`. Each flush (and each drain of the
+writer's buffer) sends one chunk. `finish(trailers)` writes the last chunk
+and the trailers and returns the response as `fetch` does; `abort()` closes
+the connection instead of pooling it. The `Upload` is spent after either.
+
+### Closing idle connections
+
+`client.closeIdle()` closes the idle pooled connections of every
+executor's pool; connections in use are left alone, and the pools reconnect
+on the next request. It is for a process that was frozen and thawed, whose
+idle sockets the network may have dropped: the AWS Lambda adapter calls it
+when an invocation comes after a long gap (`lambda.idle_reset`).
+
 ## Trailers
 
 HTTP/2 and HTTP/3 responses can end with trailers. They are in `s.trailers`
@@ -480,7 +514,7 @@ const body = try s.reader().allocRemaining(gpa, .unlimited);
 const checksum = s.trailer("x-checksum"); // null if absent
 ```
 
-The client sends no request trailers. `anole.http.Client` exposes none either.
+The HTTP/2 and HTTP/3 clients send no request trailers. `anole.http.Client` sends them only with `client.upload` (see [Uploading as you go](#uploading-as-you-go)) and exposes none on responses.
 
 ## Many requests on one connection
 

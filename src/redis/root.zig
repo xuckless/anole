@@ -949,6 +949,30 @@ pub const Client = struct {
         return conn;
     }
 
+    /// Closes the idle pooled connections of every executor's pool; the
+    /// next call dials a new one. Subscriptions keep their connections.
+    /// The Lambda adapter calls it after a long freeze, when a NAT gateway
+    /// may have dropped them without telling either end.
+    pub fn closeIdle(self: *Client) void {
+        const io = self.io;
+        for (self.pools.pools) |*pool| {
+            while (true) {
+                pool.mutex.lockUncancelable(io);
+                if (pool.idle_len == 0) {
+                    pool.mutex.unlock(io);
+                    break;
+                }
+                pool.idle_len -= 1;
+                const conn = pool.idle[pool.idle_len];
+                pool.open -= 1;
+                pool.returned.signal(io);
+                pool.mutex.unlock(io);
+                self.observer.connections(-1, 0);
+                conn.close();
+            }
+        }
+    }
+
     fn expired(self: *const Client, conn: *const Connection, io: std.Io) bool {
         const limit = self.idle_timeout orelse return false;
         return conn.idle_since.durationTo(.now(io, .awake)).raw.nanoseconds > limit.nanoseconds;

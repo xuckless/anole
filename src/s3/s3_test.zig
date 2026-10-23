@@ -14,7 +14,7 @@ const zio = @import("zio");
 
 const testing = std.testing;
 
-/// The runtime the current test runs on (dusty's server and the zio-aware
+/// The runtime the current test runs on (the HTTP core's server and the zio-aware
 /// client want zio's `Io`, not `std.tio()`).
 var current_rt: ?*zio.Runtime = null;
 
@@ -108,7 +108,7 @@ fn pattern(arena: std.mem.Allocator, n: usize, seed: u8) ![]u8 {
 }
 
 fn code(resp: anytype) u16 {
-    return @intCast(@intFromEnum(resp.status()));
+    return @intCast(@backingInt(resp.status()));
 }
 
 test "s3: put, get, head, delete round trip; content type from the extension; metadata comes back" {

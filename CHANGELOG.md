@@ -11,6 +11,10 @@ breaking changes are listed anyway.
   `invalid` (and `anole.db.ErrorMap` the matching fields, answering 404,
   409 and 400): an exhaustive `switch` on `Class` needs them. The object
   storage and mail connectors use them; no database does.
+- `anole.ServerError.DeploymentUnavailable` is gone: `deployment = .lambda`
+  works now. `ServerError` gains `LambdaRuntimeApiMissing`, `LambdaNotBuilt`,
+  `LambdaRuntimeApiFailed` and `SnapStartUnsupported`; an exhaustive
+  `switch` on it needs them.
 
 ### Added
 
@@ -101,12 +105,25 @@ breaking changes are listed anyway.
   `unix:///path` and (Linux) `unix-abstract:name`, with no TLS. The socket
   file is created `0660`; `Listener.unix_mode` changes it. A leftover socket
   file is replaced.
-- `client.upload(url, options)`: a request whose body is written as it goes
-  (chunked, with trailers), over HTTP/1.1; `client.closeIdle()` closes the
-  idle pooled connections; `Exporter.flush(timeout)` sends queued spans and
-  waits for the collector. The AWS Lambda adapter's event mapping, answers
-  and Runtime API client are in `src/lambda` (docs/lambda.md); the rest of
-  the adapter follows.
+- AWS Lambda: with `deployment = .lambda` (or `ANOLE_DEPLOYMENT=lambda`) the
+  same app serves Lambda invocations: API Gateway REST and HTTP APIs,
+  Function URLs (buffered or streamed), ALB and VPC Lattice through the
+  router and middleware, other events (SQS, EventBridge, ...) on
+  `POST /_lambda/event`. `zig build lambda` (addApp) writes
+  `provided.al2023` zips for arm64 and x86_64. Also Lambda Managed
+  Instances (concurrent invocations) and Web Functions. The C ABI's
+  `lambda` config group does the same for Node and Python apps. See
+  docs/lambda.md.
+- `anole.lambda.context(req)` and the `x-amzn-request-context` /
+  `x-amzn-lambda-context` request headers.
+- `client.upload`: requests whose body is written as it goes (chunked, with
+  trailers), over HTTP/1.1; `client.closeIdle()` closes the idle pooled
+  connections.
+- `Exporter.flush(timeout)`: sends the queued spans and waits for the
+  collector.
+- `-Dlambda` build flag (on in every profile), and `-Ddefault-deployment`
+  (the deployment a build falls back on; `zig build lambda` builds with
+  `lambda`).
 
 ### Changed
 
@@ -138,6 +155,8 @@ breaking changes are listed anyway.
   that only sets it is unchanged, code that reads `channel.conn` unwraps it.
 - The `RequestId` middleware keeps an ID the engine set already (Lambda's
   request ID) instead of generating another.
+- `deployment = .lambda` no longer fails with `DeploymentUnavailable`; that
+  error is gone.
 - `anole.db.System` has `s3` and `smtp`, and `anole.resilience.Kind` too.
 - C ABI: a handle's kind takes five bits (28-32), so Kafka groups and
   batches are kinds of their own (17 and 18): a NATS handle given to a

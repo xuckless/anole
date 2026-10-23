@@ -112,6 +112,10 @@ startup line says so.
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME` | tracing | as before | yes |
 | `NATS_URL`, `KAFKA_BOOTSTRAP_SERVERS` (then `KAFKA_URL`) | the brokers | as before | yes |
 | `SMTP_URL`, `SMTP_FROM` | `anole.smtp` (docs/email.md) | Mailpit's `smtp://127.0.0.1:1025` outside production; in production a missing `SMTP_URL` stops `app.smtp` | yes |
+| `ANOLE_LAMBDA_INVOKE_MODE` | deployment `lambda`, `lambda.invoke_mode` is null | `buffered` or `response_stream`; else refuses to start | yes |
+| `AWS_LAMBDA_RUNTIME_API` | deployment `lambda`, `lambda.runtime_api` is null | the Runtime API (`host:port`); Lambda and the Runtime Interface Emulator set it. Under `standalone` by default, a hint | never |
+| `AWS_LAMBDA_HTTP_ENDPOINT` | deployment `lambda`, `lambda.runtime_api` is null | a Lambda web function: one HTTP/1.1 listener there (wins over `AWS_LAMBDA_RUNTIME_API`). Under `standalone` by default, a hint | never |
+| `AWS_LAMBDA_MAX_CONCURRENCY` | deployment `lambda`, `lambda.concurrency` is null | invocations at once (1 to 4096; Lambda Managed Instances); else refuses to start | never |
 | `LISTEN_PID`, `LISTEN_FDS`, `LISTEN_FDNAMES`, `NOTIFY_SOCKET`, `ANOLE_READY_FD`, `ANOLE_H3_SECRET_FD` | process control from systemd or a predecessor | as before | never |
 
 Values are case-sensitive and lower case (`ANOLE_DEPLOYMENT=behind_proxy`).
@@ -154,9 +158,15 @@ resolved value.
 ## 6. `deployment`
 
 `ServerOptions.deployment` says what sits in front. Null resolves from
-`ANOLE_DEPLOYMENT`, else `standalone`; Anole never guesses from the platform
-(it prints a hint when it sees Cloud Run's, Heroku's, Fly.io's or Render's
-variables).
+`ANOLE_DEPLOYMENT`, else the build's default deployment, else `standalone`;
+Anole never guesses from the platform (it prints a hint when it sees Cloud
+Run's, Heroku's, Fly.io's, Render's or AWS Lambda's variables).
+
+The build's default is the `-Ddefault-deployment` option of Anole's
+dependency (`standalone` unless set). `zig build lambda` (an `addApp` with
+`.lambda = .{}`) builds its `bootstrap` with `lambda`, so the same `main`
+serves Lambda invocations there and listens everywhere else; the deployment
+line then says `(lambda build)`. `ANOLE_DEPLOYMENT` still wins over it.
 
 | Setting | standalone | behind_proxy | anole_lb | platform |
 | --- | --- | --- | --- | --- |
@@ -210,7 +220,48 @@ behind their own proxy and name the port in `PORT`. Leave the port to it
 wins, with a startup warning when `PORT` differs. TLS is the platform's, so
 `listenTls` adds no HTTP/3.
 
-**lambda** is reserved: `error.DeploymentUnavailable` before Anole 0.4.
+**lambda**: AWS Lambda ([lambda.md](lambda.md)). There is no inbound
+connection to accept, so `app.run()` (and `listen`, `listenTls`) polls the
+Lambda Runtime API at `AWS_LAMBDA_RUNTIME_API` and serves each invocation
+through the router. When `AWS_LAMBDA_HTTP_ENDPOINT` is set instead (a Lambda
+web function), Anole opens one HTTP/1.1 listener there and nothing else.
+This is the one place where a mode overrides an explicit option: every
+listener the options name (`http`, `https`, `listeners`, `http3`,
+`listen(":3000")`, `listenTls`, raw TCP and UDP) is set aside, and one
+startup line says which. It applies to null fields like the other modes,
+except the two rows marked "always".
+
+| Setting | lambda (Runtime API) | lambda (web function: `AWS_LAMBDA_HTTP_ENDPOINT`) |
+| --- | --- | --- |
+| `proxy.trusted` (after `ANOLE_PROXY_TRUSTED`) | none: the client address comes from the event | `loopback`, `private` (Lambda's local proxy) |
+| `X-Forwarded-*` read | none by default; with `proxy.trusted` set, the walk starts at the event's client address | from trusted peers, as `platform` |
+| `proxy_protocol` | n/a (no listener) | off |
+| listener `address` / `port` | **always**: every listener named is set aside | **always**: one HTTP/1.1 listener at `AWS_LAMBDA_HTTP_ENDPOINT`, the others set aside |
+| h2c on that listener | n/a | off |
+| `listenTls` adds HTTP/3 | no | no |
+| warning for an untrusted peer | no | no |
+| `executors` when `.auto` | 1 at concurrency 1; the CPU count above that | the CPU count |
+| invocations at once | `lambda.concurrency`, else `AWS_LAMBDA_MAX_CONCURRENCY`, else 1 | the platform's |
+| `timeouts.request` | the smaller of it and the invocation's deadline minus `lambda.deadline_margin` | as configured |
+| background work between invocations | none started; spans flushed before the next invocation | normal |
+| shutdown | SIGTERM (through a no-op extension, `lambda.sigterm`): stop polling, flush, return within `lambda.shutdown_timeout` | SIGTERM: drain within `min(timeouts.shutdown, 900 ms)` |
+| `req.id` | `Lambda-Runtime-Aws-Request-Id` | `lambda-web-request-id` |
+| `environment` | unchanged by the mode | unchanged |
+
+`lambda.runtime_api` set in the options wins over both variables. The
+platform's variables (`AWS_LAMBDA_*`) are read from the real environment
+only: a `.env` line never makes a development run poll a Runtime API.
+`ANOLE_LAMBDA_INVOKE_MODE` may come from `.env`. The other `lambda` options
+(`invoke_mode`, `concurrency`, `event_path`, `base_path`, `keep_stage`,
+`context_headers`, `deadline_margin`, `idle_reset`, `sigterm`,
+`shutdown_timeout`, `flush_timeout`) are described in lambda.md.
+
+A build without the adapter (`-Dlambda=false`) refuses `lambda` with
+`LambdaNotBuilt`; `lambda` with neither variable nor `lambda.runtime_api`
+refuses with `LambdaRuntimeApiMissing`; a variable that is not `host:port`,
+an `ANOLE_LAMBDA_INVOKE_MODE` that is not `buffered` or `response_stream`,
+and an `AWS_LAMBDA_MAX_CONCURRENCY` outside 1 to 4096 refuse with
+`InvalidEnvironmentVariable`.
 
 ## 7. What is printed at startup
 
@@ -224,6 +275,11 @@ deployment behind_proxy (ANOLE_DEPLOYMENT): X-Forwarded-For and X-Forwarded-Prot
 deployment platform (ANOLE_DEPLOYMENT): X-Forwarded-For and X-Forwarded-Proto from ...; every interface (address ""); port 41234 from PORT; no HTTP/3 from listenTls (listen_tls_http3)
 proxy.trusted from ANOLE_PROXY_TRUSTED: 10.0.0.0/8, 203.0.113.7/32
 this looks like Cloud Run (K_SERVICE is set): set ANOLE_DEPLOYMENT=platform to listen on $PORT and trust its proxy
+AWS_LAMBDA_RUNTIME_API is set: to serve Lambda invocations, set ANOLE_DEPLOYMENT=lambda or build with zig build lambda (behind the Lambda Web Adapter, leave it as is)
+AWS_LAMBDA_HTTP_ENDPOINT is set: set ANOLE_DEPLOYMENT=lambda to listen there
+deployment lambda (lambda build): invocations from the Lambda Runtime API at 127.0.0.1:9001, 1 at a time on 1 executor; buffered answers; other events to POST /_lambda/event; SIGTERM through a no-op extension; ready in 3.4 ms
+deployment lambda (ANOLE_DEPLOYMENT): a Lambda web function: HTTP/1.1 on 127.0.0.1:9002 from AWS_LAMBDA_HTTP_ENDPOINT; X-Forwarded-For and X-Forwarded-Proto from 127.0.0.0/8, ::1/128, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7 (proxy.trusted); drain at most 900 ms
+deployment lambda: no listener opens here, so listen(":3000") and https are set aside; requests come from Lambda
 ANOLE_ENV in .env.local is not used: it decides whether .env files are read, so set it in the environment
 ```
 

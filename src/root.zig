@@ -366,7 +366,14 @@ pub const s3 = if (features.s3) @import("s3/root.zig") else struct {};
 pub const smtp = if (features.smtp) @import("smtp/root.zig") else struct {};
 
 /// The AWS Lambda adapter (`-Dlambda`): `deployment = lambda`.
-pub const lambda = if (features.lambda) @import("lambda/root.zig") else struct {};
+pub const lambda = if (features.lambda) @import("lambda/root.zig") else struct {
+    pub const Options = ServerOptions.Lambda;
+    /// Always null in a build without the adapter.
+    pub fn context(req: *const http.Request) ?*const anyopaque {
+        _ = req;
+        return null;
+    }
+};
 
 /// Server-sent events with topics, heartbeats and `Last-Event-ID` replay.
 pub const sse = @import("sse/root.zig");

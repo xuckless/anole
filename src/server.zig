@@ -37,6 +37,7 @@ const errors = @import("errors.zig");
 const modes = @import("modes.zig");
 const env_mod = @import("env.zig");
 const net_mod = @import("net/root.zig");
+const lambda_serve = if (features.lambda) @import("lambda/serve.zig") else struct {};
 /// SIGUSR2 (restart) and SIGHUP (certificate reload): not on Windows.
 const unix_signals = builtin.os.tag != .windows;
 
@@ -350,6 +351,68 @@ pub const Options = struct {
     // ---- end p3/smtp ----
 
     // ---- p3/lambda ----
+    /// AWS Lambda (`deployment = .lambda`): where invocations come from
+    /// and how answers go back. Ignored by other deployments.
+    /// docs/lambda.md.
+    lambda: Lambda = .{},
+    // ---- end p3/lambda ----
+
+    // ---- p3/lambda ----
+    /// `Options.lambda` (also `anole.lambda.Options`).
+    pub const Lambda = struct {
+        /// The Runtime API, "host:port". Null: AWS_LAMBDA_RUNTIME_API, which
+        /// Lambda sets (and so does the Runtime Interface Emulator for local
+        /// runs). Set, it also wins over AWS_LAMBDA_HTTP_ENDPOINT.
+        runtime_api: ?[]const u8 = null,
+        /// How the function is invoked: `.buffered` (Invoke, API Gateway,
+        /// ALB, a Function URL with BUFFERED) or `.response_stream` (a
+        /// Function URL with RESPONSE_STREAM, or a REST API integration with
+        /// responseTransferMode STREAM). Null: ANOLE_LAMBDA_INVOKE_MODE, else
+        /// buffered. ALB, HTTP API and VPC Lattice events are always answered
+        /// buffered.
+        invoke_mode: ?InvokeMode = null,
+        /// Invocations served at once. Null: AWS_LAMBDA_MAX_CONCURRENCY
+        /// (Lambda Managed Instances), else 1.
+        concurrency: ?u16 = null,
+        /// Where events that are not HTTP requests go (SQS, SNS, S3,
+        /// EventBridge, schedules, DynamoDB streams, API Gateway WebSocket):
+        /// POSTed to this path, the event as a JSON body. A 2xx answer's body
+        /// is the invocation's result; any other status fails the invocation.
+        /// An HTTP request for this path gets 404. Null: such events fail the
+        /// invocation (Runtime.UnsupportedEvent).
+        event_path: ?[]const u8 = "/_lambda/event",
+        /// Taken off the front of every HTTP event's path: the base path of an
+        /// API Gateway custom domain mapping ("/v1"). Null: none.
+        base_path: ?[]const u8 = null,
+        /// Keep a named stage at the front of an HTTP API path
+        /// ("/prod/users"). Off: the app sees "/users", as locally.
+        keep_stage: bool = false,
+        /// Handlers get the invocation in the `x-amzn-request-context` and
+        /// `x-amzn-lambda-context` headers (as AWS Lambda Web Adapter sends
+        /// them). A client's own copies are removed either way.
+        context_headers: bool = true,
+        /// A request still running this long before the invocation's deadline
+        /// is canceled and answered 504, before Lambda's timeout ends the
+        /// environment.
+        deadline_margin: Duration = .fromMilliseconds(100),
+        /// Close idle outbound and database connections when an invocation
+        /// arrives this long after the last one ended: a frozen environment's
+        /// connections may have been dropped silently (a NAT gateway forgets
+        /// idle TCP after 350 s). Null: never.
+        idle_reset: ?Duration = .fromSeconds(300),
+        /// Register a no-op Lambda extension so that Lambda sends SIGTERM
+        /// (and allows 500 ms) before it shuts the environment down; without
+        /// any extension the process is killed with no warning. Not used on
+        /// Lambda Managed Instances.
+        sigterm: bool = true,
+        /// The most the shutdown after SIGTERM may take.
+        shutdown_timeout: Duration = .fromMilliseconds(400),
+        /// The most that sending finished spans may hold up the next
+        /// invocation (after the answer is sent, so clients don't wait).
+        flush_timeout: Duration = .fromMilliseconds(500),
+
+        pub const InvokeMode = enum { buffered, response_stream };
+    };
     // ---- end p3/lambda ----
 
     /// `Options.timeouts`. A duration is null for none.
@@ -629,7 +692,7 @@ fn coreConfig(opts: Options, mode: *const modes.Resolved) http.ServerConfig {
             .keepalive = opts.timeouts.keepalive,
             .request_count = if (opts.limits.max_requests_per_connection) |n| n else null,
             .idle_park = opts.timeouts.idle_park,
-            .shutdown = opts.timeouts.shutdown,
+            .shutdown = if (webFunction(mode)) capDuration(opts.timeouts.shutdown, .fromMilliseconds(900)) else opts.timeouts.shutdown,
         },
         .request = .{
             .max_body_size = opts.limits.body_max,
@@ -660,7 +723,21 @@ fn coreConfig(opts: Options, mode: *const modes.Resolved) http.ServerConfig {
             opts.limits.max_connections,
         .errors = opts.errors,
         .error_handler = opts.error_handler,
+        // A Lambda web function: Lambda names the request in this header.
+        .request_id_header = if (webFunction(mode)) "lambda-web-request-id" else null,
     };
+}
+
+/// `deployment = lambda` as a Lambda web function (AWS_LAMBDA_HTTP_ENDPOINT).
+fn webFunction(mode: *const modes.Resolved) bool {
+    const l = mode.lambda orelse return false;
+    return l.sub_mode == .web_function;
+}
+
+/// `d` at most `cap`; none becomes `cap`.
+fn capDuration(d: ?Duration, cap: Duration) ?Duration {
+    const v = d orelse return cap;
+    return if (v.nanoseconds > cap.nanoseconds) cap else v;
 }
 
 /// `Server(void)` with `init(gpa, options)`: a server without state, for
@@ -776,6 +853,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         last_successor_pid: i32 = 0,
         /// `listenTls` set up the TLS listener (for the startup line).
         used_listen_tls: bool = false,
+        // ---- p3/lambda ----
+        /// When `init` began (real clock, ns): the Lambda adapter's
+        /// "ready in" is measured from it.
+        init_started_ns: i96 = 0,
+        /// `Options.lambda`.
+        lambda_options: Options.Lambda = .{},
+        /// Why the Lambda Runtime API failed (the startup error's text).
+        lambda_failure: ?[]const u8 = null,
+        // ---- end p3/lambda ----
         /// The TLS listeners' certificates, one per distinct source, for
         /// `reloadCertificates`; empty without a TLS listener.
         certs: []const *CertState = &.{},
@@ -847,6 +933,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// Writes the console's `/db` entry fields ("system", "name",
             /// "target", "pools") without the braces.
             describe: *const fn (context: *anyopaque, name: []const u8, w: *std.Io.Writer) anyerror!void,
+            /// Closes the connector's idle connections (under AWS Lambda,
+            /// after a long freeze); null when it has no pool to close.
+            closeIdle: ?*const fn (context: *anyopaque) void = null,
 
             fn systemOf(comptime T: type) []const u8 {
                 const n = @typeName(T);
@@ -873,7 +962,20 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         try w.print("\"system\":\"{s}\",\"name\":\"{s}\",\"target\":\"\",\"pools\":[]", .{ name, name });
                     }
                 };
-                return .{ .context = value, .start = Hooks.start, .deinit = Hooks.deinit, .describe = Hooks.describe, .name = comptime systemOf(T) };
+                const Idle = struct {
+                    fn closeIdle(context: *anyopaque) void {
+                        const v: *T = @ptrCast(@alignCast(context));
+                        _ = v.closeIdle();
+                    }
+                };
+                return .{
+                    .context = value,
+                    .start = Hooks.start,
+                    .deinit = Hooks.deinit,
+                    .describe = Hooks.describe,
+                    .name = comptime systemOf(T),
+                    .closeIdle = if (comptime @hasDecl(T, "closeIdle")) Idle.closeIdle else null,
+                };
             }
         };
 
@@ -1023,6 +1125,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // zio binds the runtime to this thread (its first executor), and
             // a second runtime would take the thread over from the first.
             if (server_on_thread) return error.ServerAlreadyOnThread;
+            const init_started_ns = std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
             // systemd's notify socket is this process's to use, not its
             // children's: kept, and taken out of the environment.
             if (opts.process) |p| sd_notify.take(p.environ);
@@ -1066,8 +1169,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
             const console_config_text: []const u8 = if (features.console and console_resolved.enabled) renderConsoleConfig(a, &opts, mode) catch "" else "";
 
+            // Under AWS Lambda at one invocation at a time, one executor:
+            // one thread, the least memory, the fastest init.
+            var executors = opts.executors;
+            if (executors == .auto) if (mode.lambda) |l| if (l.executors) |n| {
+                executors = .exact(@intCast(n));
+            };
             const rt = try zio.Runtime.init(gpa, .{
-                .executors = opts.executors,
+                .executors = executors,
                 .stack_pool = .{
                     .maximum_size = opts.max_stack_size,
                     .committed_size = @min(opts.max_stack_size, 256 * 1024),
@@ -1130,13 +1239,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .blocking_pool = pool,
                 .extras = extras,
                 .mode = mode,
+                .init_started_ns = init_started_ns,
+                .lambda_options = opts.lambda,
             };
             // RFC 8470 §5.1: unsafe requests taken in early data (marked
             // `Early-Data: 1`, by the HTTP/3 endpoint or a proxy in front)
             // get 425 Too Early, on every route, with HTTP/3 or without:
             // a TLS-terminating proxy can forward the mark to any listener.
             // Now, before any route.
-            const h3_possible = features.http3 and (opts.http3 != null or mode.listen_tls_http3 or anyHttp3(opts.listeners));
+            const h3_possible = features.http3 and mode.deployment != .lambda and (opts.http3 != null or mode.listen_tls_http3 or anyHttp3(opts.listeners));
             {
                 const guard = try a.create(early_data.Guard);
                 guard.* = .{};
@@ -1144,7 +1255,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
             // Neither `http` nor `https`: `listen`, `listenTls` or `run`
             // sets up the listeners, `listeners` among them.
-            if (opts.http == null and opts.https == null) {
+            if ((opts.http == null and opts.https == null) or mode.deployment == .lambda) {
+                // Under AWS Lambda nothing opens here: `run` serves the
+                // invocations (or the web function's one listener).
                 self.pending = opts;
                 // `listenTls` turns HTTP/3 on once routes exist, when no
                 // middleware can be added any more: its `Alt-Svc` goes in
@@ -1182,7 +1295,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     return err;
                 };
             }
-            return modes.resolve(a, opts, e.environment, e.source, files, .process, why);
+            return modes.resolve(a, opts, e.environment, e.source, files, .process, .current, why);
         }
 
         /// `development` or `production`, as resolved at `init`.
@@ -1801,6 +1914,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 errors.log.err("listen(\"{s}\"): not an address to listen on; use a port (\"3000\", every interface), \":3000\", or \"127.0.0.1:3000\" (this machine only)", .{address});
                 return err;
             };
+            if (self.mode.deployment == .lambda) {
+                self.mode.set_aside.listen = address;
+                try self.configure(opts);
+                return self.runInner();
+            }
             opts.http = .{ .address = at.host, .port = at.port };
             self.warnPlatformPort("listen", address, at.port);
             try self.configure(opts);
@@ -1824,6 +1942,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 errors.log.err("listenTls(\"{s}\"): not an address to listen on; use a port (\"443\", every interface), \":443\", or \"127.0.0.1:8443\" (this machine only)", .{address});
                 return err;
             };
+            if (self.mode.deployment == .lambda) {
+                self.mode.set_aside.listen_tls = address;
+                try self.configure(opts);
+                return self.runInner();
+            }
             opts.https = .{ .address = at.host, .port = at.port, .cert = cert };
             // Unless a listener in `listeners` serves HTTP/3 already.
             self.warnPlatformPort("listenTls", address, at.port);
@@ -1856,6 +1979,30 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `waitReady`.
         fn configure(self: *Self, opts: Options) !void {
             self.pending = null;
+            if (self.mode.lambda) |l| {
+                // Lambda accepts no connections: what the options named is
+                // set aside (one startup line says what).
+                const sa = &self.mode.set_aside;
+                sa.http = opts.http != null;
+                sa.https = opts.https != null;
+                sa.http3 = opts.http3 != null;
+                for (opts.listeners) |li| {
+                    if (li.tcp != null) {
+                        sa.tcp += 1;
+                    } else if (li.udp != null) {
+                        sa.udp += 1;
+                    } else sa.listeners += 1;
+                }
+                if (l.sub_mode == .runtime_api) return;
+                // A web function: one HTTP/1.1 listener at the endpoint.
+                var web = opts;
+                web.http = .{ .address = self.mode.default_address, .port = self.mode.default_port, .h2c = false };
+                web.https = null;
+                web.http3 = null;
+                web.listeners = &.{};
+                self.listenOn(web) catch |err| return self.failStart(errors.toServerError(err));
+                return;
+            }
             self.listenOn(opts) catch |err| return self.failStart(errors.toServerError(err));
         }
 
@@ -1905,6 +2052,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 ctx.cause = self.extras.failed_cause;
             }
             if (err == error.RouteConflict) ctx.detail = self.router.conflict;
+            // ---- p3/lambda ----
+            if (err == error.LambdaRuntimeApiFailed) {
+                if (self.mode.lambda) |l| ctx.address = l.endpoint;
+                ctx.detail = self.lambda_failure;
+            }
+            // ---- end p3/lambda ----
             // ---- p3/net ----
             switch (err) {
                 error.NetNotBuilt, error.NetListenerNeedsPort, error.NetListenerHttp3, error.TcpAndUdp, error.UdpWithTls, error.UdpOnUnixSocket, error.UdpWithProxyProtocol, error.InvalidFraming, error.NetHandlerContext => ctx.detail = self.net_why,
@@ -2881,6 +3034,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             };
             const n = try nats_mod.Client.init(self.gpa, self.rt.io(), opts);
             errdefer n.deinit();
+            n.suppress_consumers = self.mode.deployment == .lambda;
             try self.extras.connectors.append(self.arena.allocator(), .of(nats_mod.Client, n));
             return n;
         }
@@ -2901,6 +3055,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             };
             const k = try kafka_mod.Client.init(self.gpa, self.rt.io(), opts);
             errdefer k.deinit();
+            k.suppress_consumers = self.mode.deployment == .lambda;
             try self.extras.connectors.append(self.arena.allocator(), .of(kafka_mod.Client, k));
             if (self.extras.connectors_started) try k.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return k;
@@ -3122,6 +3277,32 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         // ---- end p3/smtp ----
 
         // ---- p3/lambda ----
+        /// For the Lambda adapter: what `run` does before serving (the
+        /// helper routes, the OpenAPI document, the conflict check, the
+        /// connectors), returning the error rather than logging it, so the
+        /// adapter can report it to Lambda first.
+        pub fn _lambdaPrepare(self: *Self) !void {
+            self.addHelperRoutes();
+            if (comptime features.openapi) if (self.extras.openapi_failed) |err| return err;
+            if (self.router.conflict != null) return error.RouteConflict;
+            self.startConnectors() catch return error.DatabaseUnavailable;
+        }
+
+        /// Closes the idle connections of the outbound client and of every
+        /// connector that has a pool (the Lambda adapter, after a freeze).
+        pub fn closeIdleConnections(self: *Self) void {
+            self.extras.client.closeIdle();
+            for (self.extras.connectors.items) |c| if (c.closeIdle) |f| f(c.context);
+        }
+
+        /// The line naming what `deployment = lambda` set aside, if anything.
+        fn logSetAside(self: *const Self) void {
+            var buf: [512]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            modes.writeSetAside(self.mode, &w) catch return;
+            const line = std.mem.trimEnd(u8, w.buffered(), "\n");
+            if (line.len > 0) std.log.scoped(.anole).info("{s}", .{line});
+        }
         // ---- end p3/lambda ----
 
         /// Loads every TLS listener's certificate and key again (from their
@@ -3417,6 +3598,19 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 const env = self.openapiEnv();
                 if (env.out != null or env.check != null) return self.openapiTool(env);
             }
+            // ---- p3/lambda ----
+            if (self.mode.lambda) |l| {
+                self.logSetAside();
+                if (l.sub_mode == .runtime_api) {
+                    if (comptime !features.lambda) unreachable;
+                    // Lambda's INIT phase: no banner (nothing listens); the
+                    // adapter writes the deployment line once it is ready.
+                    self.logModes();
+                    logBuildMode(self.mode.debug_production);
+                    return lambda_serve.serve(Ctx, self);
+                }
+            }
+            // ---- end p3/lambda ----
             self.printBanner();
             self.logModes();
             logBuildMode(self.mode.debug_production);
@@ -4642,7 +4836,7 @@ fn testMode(a: std.mem.Allocator, opts: Options) !*const modes.Resolved {
     var buf: [512]u8 = undefined;
     var why: std.Io.Writer = .fixed(&buf);
     const m = try a.create(modes.Resolved);
-    m.* = try modes.resolve(a, &opts, .production, .tests, null, .process, &why);
+    m.* = try modes.resolve(a, &opts, .production, .tests, null, .process, .current, &why);
     return m;
 }
 

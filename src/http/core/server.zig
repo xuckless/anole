@@ -2653,6 +2653,15 @@ pub fn Server(comptime Ctx: type) type {
             applyForwardedFn(request, connection.peerAddress(), .of(&self.config));
         }
 
+        /// `Request.id` from `config.request_id_header`, when the request
+        /// carries it.
+        pub fn applyRequestIdHeader(self: *const Self, request: *Request) void {
+            const name = self.config.request_id_header orelse return;
+            if (request.headers.get(name)) |v| if (v.len > 0) {
+                request.id = v;
+            };
+        }
+
         /// `applyForwarded` for an engine with no `Connection` (HTTP/3 over
         /// UDP): the peer address is given directly.
         pub fn applyForwardedFrom(self: *const Self, request: *Request, peer: std.Io.net.IpAddress) void {
@@ -2978,6 +2987,7 @@ pub fn Server(comptime Ctx: type) type {
                 // request's forwarded address.
                 request.secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure;
                 applyForwardedFn(&request, connection.peerAddress(), .of(&self.config));
+                self.applyRequestIdHeader(&request);
 
                 var response = try Response._init(request.arena, connection, self.config.response.max_header_count);
                 self.configureResponse(&response);

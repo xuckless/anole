@@ -249,6 +249,10 @@ pub const ServerConfig = struct {
     /// redirects and cache keys are built from. Turn it on only when the
     /// nearest proxy sets the header on every request.
     trust_forwarded_host: bool = false,
+    /// A request header whose value becomes `Request.id` when present and
+    /// non-empty (`lambda-web-request-id` under an AWS Lambda web
+    /// function); the RequestId middleware keeps it. Null: none.
+    request_id_header: ?[]const u8 = null,
     /// The peers whose X-Forwarded-* headers are read (and who may send a
     /// PROXY header on a listener with an empty `proxy_protocol_from`).
     /// Null: no gate; `trusted_proxy_hops` alone decides, as before.

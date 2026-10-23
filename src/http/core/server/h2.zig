@@ -1396,6 +1396,7 @@ pub fn Engine(comptime Ctx: type) type {
                 };
             }
             server.applyForwarded(request, conn.connection);
+            server.applyRequestIdHeader(request);
 
             if (request.headers.get("Expect")) |expect| {
                 if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {

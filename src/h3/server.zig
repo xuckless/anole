@@ -2668,6 +2668,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 request.peer_certificate = quic_tls.peerCertificate(conn.ssl);
                 conn.unlock();
                 server.applyForwardedFrom(request, peer);
+                server.applyRequestIdHeader(request);
                 // The client is on our TLS, whatever proxies say.
                 request.secure = true;
 

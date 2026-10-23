@@ -81,7 +81,7 @@ pub const Runtime = struct {
         var response = self.client.fetch(url, .{ .timeout = .none, .decompress = false }) catch |err| return nextError(err);
         defer response.deinit();
         if (response.status() != .ok) {
-            log.warn("lambda: the Runtime API answered {d} to /next", .{@intFromEnum(response.status())});
+            log.warn("lambda: the Runtime API answered {d} to /next", .{@backingInt(response.status())});
             return error.RuntimeApiFailed;
         }
         const h = response.headers();
@@ -110,8 +110,8 @@ pub const Runtime = struct {
         var storage: [512]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&storage);
         var headers = try dusty.Headers.init(fba.allocator(), 2);
-        try headers.put("Content-Type", "application/json");
-        if (inv.invocation_id.len > 0) try headers.put("Lambda-Runtime-Invocation-Id", inv.invocation_id);
+        headers.put("Content-Type", "application/json") catch return error.OutOfMemory;
+        if (inv.invocation_id.len > 0) headers.put("Lambda-Runtime-Invocation-Id", inv.invocation_id) catch return error.OutOfMemory;
         return self.post(url, &headers, body);
     }
 
@@ -127,9 +127,9 @@ pub const Runtime = struct {
         var storage: [768]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&storage);
         var headers = try dusty.Headers.init(fba.allocator(), 4);
-        try headers.put("Content-Type", content_type);
-        try headers.put("Lambda-Runtime-Function-Response-Mode", "streaming");
-        if (inv.invocation_id.len > 0) try headers.put("Lambda-Runtime-Invocation-Id", inv.invocation_id);
+        headers.put("Content-Type", content_type) catch return error.OutOfMemory;
+        headers.put("Lambda-Runtime-Function-Response-Mode", "streaming") catch return error.OutOfMemory;
+        if (inv.invocation_id.len > 0) headers.put("Lambda-Runtime-Invocation-Id", inv.invocation_id) catch return error.OutOfMemory;
         return self.client.upload(url, .{
             .headers = &headers,
             .trailer_names = &.{ "Lambda-Runtime-Function-Error-Type", "Lambda-Runtime-Function-Error-Body" },
@@ -150,10 +150,10 @@ pub const Runtime = struct {
     /// answer went out: the error type and the base64 of `message`.
     pub fn errorTrailers(arena: std.mem.Allocator, error_type: []const u8, message: []const u8) !dusty.Headers {
         var trailers = try dusty.Headers.init(arena, 2);
-        try trailers.put("Lambda-Runtime-Function-Error-Type", error_type);
+        trailers.put("Lambda-Runtime-Function-Error-Type", error_type) catch return error.OutOfMemory;
         const encoded = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(message.len));
         _ = std.base64.standard.Encoder.encode(encoded, message);
-        try trailers.put("Lambda-Runtime-Function-Error-Body", encoded);
+        trailers.put("Lambda-Runtime-Function-Error-Body", encoded) catch return error.OutOfMemory;
         return trailers;
     }
 
@@ -178,8 +178,8 @@ pub const Runtime = struct {
         var storage: [256]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&storage);
         var headers = try dusty.Headers.init(fba.allocator(), 2);
-        try headers.put("Lambda-Extension-Name", "anole-sigterm");
-        try headers.put("Content-Type", "application/json");
+        headers.put("Lambda-Extension-Name", "anole-sigterm") catch return error.OutOfMemory;
+        headers.put("Content-Type", "application/json") catch return error.OutOfMemory;
         var response = self.client.fetch(url, .{ .method = .post, .headers = &headers, .body = "{\"events\":[]}", .timeout = post_timeout, .decompress = false }) catch |err| return postError(err);
         defer response.deinit();
         if (response.status() != .ok) return error.RuntimeApiFailed;
@@ -220,16 +220,16 @@ pub const Runtime = struct {
         var storage: [768]u8 = undefined;
         var fba = std.heap.FixedBufferAllocator.init(&storage);
         var headers = try dusty.Headers.init(fba.allocator(), 3);
-        try headers.put("Content-Type", "application/json");
+        headers.put("Content-Type", "application/json") catch return error.OutOfMemory;
         // Header values cannot carry control characters; the type is ours.
-        try headers.put("Lambda-Runtime-Function-Error-Type", error_type);
-        if (invocation_id.len > 0) try headers.put("Lambda-Runtime-Invocation-Id", invocation_id);
+        headers.put("Lambda-Runtime-Function-Error-Type", error_type) catch return error.OutOfMemory;
+        if (invocation_id.len > 0) headers.put("Lambda-Runtime-Invocation-Id", invocation_id) catch return error.OutOfMemory;
         return self.post(url, &headers, body);
     }
 };
 
 fn statusResult(status: dusty.Status) PostError!void {
-    return switch (@intFromEnum(status)) {
+    return switch (@backingInt(status)) {
         200...299 => {},
         400 => error.InvalidInvocationId,
         // The environment may not answer for this invocation (it timed

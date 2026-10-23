@@ -57,6 +57,9 @@ comptime {
 pub const Tls = enum { boringssl, none };
 pub const Profile = enum { minimal, web, full };
 
+/// `-Ddefault-deployment`: src/modes.zig's `Deployment`, by name.
+pub const DefaultDeployment = enum { standalone, behind_proxy, anole_lb, platform, lambda };
+
 pub const Features = struct {
     tls: Tls,
     http2: bool,
@@ -108,6 +111,11 @@ pub const Features = struct {
     /// The AWS Lambda adapter (`anole.lambda`, `deployment = lambda`).
     /// Pure Zig.
     lambda: bool,
+    /// The deployment a program falls back on when neither the options nor
+    /// ANOLE_DEPLOYMENT name one (`-Ddefault-deployment`; `zig build
+    /// lambda` builds with `lambda`). Not a feature: it compiles nothing in
+    /// or out.
+    default_deployment: DefaultDeployment = .standalone,
 
     pub fn preset(profile: Profile) Features {
         return switch (profile) {
@@ -192,6 +200,13 @@ const flag_combos = [_]struct { name: []const u8, features: Features }{
         f.postgres = false;
         f.sqlite = false;
         f.mongodb = false;
+        break :blk f;
+    } },
+    // The smallest build without the Lambda adapter: `anole.lambda` is the
+    // stub, and `deployment = lambda` fails with LambdaNotBuilt.
+    .{ .name = "minimal-no-lambda", .features = blk: {
+        var f = Features.preset(.minimal);
+        f.lambda = false;
         break :blk f;
     } },
     // The connectors on HTTP/1.1 alone: no TLS (plain connections only),
@@ -381,7 +396,32 @@ pub const AppOptions = struct {
     /// project needs no test file or code split. Code before `listen` still
     /// runs: keep secrets in `.env` and connect lazily (the default).
     openapi: ?OpenApiBuild = .{},
+    /// `zig build lambda`: the program as AWS Lambda zips
+    /// (zig-out/lambda/<name>-<arch>.zip, for `provided.al2023`), built
+    /// with `deployment = lambda` as its default (docs/lambda.md). Null: no
+    /// such step.
+    lambda: ?LambdaBuild = null,
 };
+
+/// `AppOptions.lambda`.
+pub const LambdaBuild = struct {
+    /// One zip each: zig-out/lambda/<name>-<arch>.zip. `-Dlambda-arch`
+    /// picks one.
+    arch: []const LambdaArch = &.{ .arm64, .x86_64 },
+    /// Files and directories (relative to build.zig) put in the zip beside
+    /// bootstrap, under the same relative path: static files, templates.
+    /// Lambda runs the program in that directory (LAMBDA_TASK_ROOT,
+    /// /var/task).
+    include: []const []const u8 = &.{},
+    /// `-Dlambda-optimize` overrides.
+    optimize: std.builtin.OptimizeMode = .ReleaseSafe,
+    /// glibc 2.34 (Amazon Linux 2023, `provided.al2023`) or a static musl
+    /// binary (any `provided` runtime, container images).
+    libc: enum { glibc, musl } = .glibc,
+};
+
+/// The architectures Lambda runs: Graviton (arm64) and x86_64.
+pub const LambdaArch = enum { arm64, x86_64 };
 
 /// `AppOptions.openapi`.
 pub const OpenApiBuild = struct {
@@ -458,7 +498,95 @@ pub fn addApp(b: *std.Build, options: AppOptions) App {
         check.setEnvironmentVariable("ANOLE_OPENAPI_CHECK", file);
         b.step("openapi-check", b.fmt("Check that {s} matches the app's routes", .{oa.file})).dependOn(&check.step);
     }
+    if (options.lambda) |lb| addLambda(b, options, lb, anole_dep);
     return .{ .exe = exe, .anole = anole_dep };
+}
+
+/// `zig build lambda` (and `lambda-arm64`, `lambda-x86_64`): for each
+/// architecture, the program built as `bootstrap` for Amazon Linux 2023
+/// against its own Anole dependency (the same arguments plus
+/// `default-deployment = lambda`), zipped by tools/lambda_zip.zig (built for
+/// the host) with the `include` files, and installed as
+/// zig-out/lambda/<name>-<arch>.zip.
+fn addLambda(b: *std.Build, options: AppOptions, lb: LambdaBuild, anole_dep: *std.Build.Dependency) void {
+    const only = b.option(LambdaArch, "lambda-arch", "zig build lambda: only this architecture (arm64 or x86_64)");
+    const optimize = b.option(std.builtin.OptimizeMode, "lambda-optimize", "zig build lambda: the optimize mode (default ReleaseSafe)") orelse lb.optimize;
+    const all_step = b.step("lambda", b.fmt("Build {s} as AWS Lambda zips (provided.al2023): zig-out/lambda/", .{options.name}));
+    const zip_tool = b.addExecutable(.{
+        .name = "lambda_zip",
+        .root_module = b.createModule(.{
+            .root_source_file = anole_dep.path("tools/lambda_zip.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    for (std.enums.values(LambdaArch)) |arch| {
+        const arch_step = b.step(b.fmt("lambda-{t}", .{arch}), b.fmt("Build {s} as an AWS Lambda zip for {t}: zig-out/lambda/{s}-{t}.zip", .{ options.name, arch, options.name, arch }));
+        const wanted = for (lb.arch) |a| {
+            if (a == arch) break true;
+        } else false;
+        if (!wanted) {
+            arch_step.dependOn(&b.addFail(b.fmt("{s}: lambda.arch leaves {t} out", .{ options.name, arch })).step);
+            continue;
+        }
+        const triple = switch (arch) {
+            .arm64 => if (lb.libc == .glibc) "aarch64-linux-gnu.2.34" else "aarch64-linux-musl",
+            .x86_64 => if (lb.libc == .glibc) "x86_64-linux-gnu.2.34" else "x86_64-linux-musl",
+        };
+        const cpu = switch (arch) {
+            .arm64 => "neoverse_n1",
+            .x86_64 => "x86_64_v2+avx2",
+        };
+        const query = std.Target.Query.parse(.{ .arch_os_abi = triple, .cpu_features = cpu }) catch @panic("lambda target");
+        const target = b.resolveTargetQuery(query);
+        // A dependency of its own: another target and the lambda default.
+        // Reached only through this executable, and its lazy dependencies
+        // are fetched in the same configure pass as the main one's.
+        const dep = if (options.profile) |profile|
+            b.dependency(options.dependency, .{ .target = target, .optimize = optimize, .profile = profile, .@"default-deployment" = .lambda })
+        else
+            b.dependency(options.dependency, .{ .target = target, .optimize = optimize, .@"default-deployment" = .lambda });
+        const exe = b.addExecutable(.{
+            .name = "bootstrap",
+            .root_module = b.createModule(.{
+                .root_source_file = options.root_source_file,
+                .target = target,
+                .optimize = optimize,
+                .imports = options.imports,
+            }),
+        });
+        exe.root_module.addImport("anole", dep.module("anole"));
+        for (options.protos) |proto| {
+            const m = addProtoModule(b, dep, proto);
+            m.resolved_target = target;
+            m.optimize = optimize;
+            exe.root_module.addImport(proto.name, m);
+        }
+        const zip_name = b.fmt("{s}-{t}.zip", .{ options.name, arch });
+        const run = b.addRunArtifact(zip_tool);
+        const out = run.addOutputFileArg(zip_name);
+        run.addArtifactArg2(exe, .{ .prefix = "bootstrap=", .suffix = ":755" });
+        for (lb.include) |rel| {
+            const is_dir = blk: {
+                const in_root = if (b.root.sub_path.len == 0) rel else b.fmt("{s}/{s}", .{ b.root.sub_path, rel });
+                const d = b.root.root_dir.handle.openDir(b.graph.io, in_root, .{}) catch break :blk false;
+                d.close(b.graph.io);
+                break :blk true;
+            };
+            if (is_dir) {
+                // The tool walks the directory; a change to a file in it
+                // must make a new zip, so the step always runs (the zip
+                // is the same bytes when nothing changed).
+                run.addDirectoryArg2(b.path(rel), .{ .prefix = b.fmt("{s}=", .{rel}) });
+                run.has_side_effects = true;
+            } else {
+                run.addFileArg2(b.path(rel), .{ .prefix = b.fmt("{s}=", .{rel}), .suffix = ":644" });
+            }
+        }
+        const install = b.addInstallFileWithDir(out, .{ .custom = "lambda" }, zip_name);
+        arch_step.dependOn(&install.step);
+        if (only == null or only.? == arch) all_step.dependOn(&install.step);
+    }
 }
 
 pub fn build(b: *std.Build) void {
@@ -869,6 +997,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "sqlite", .needs = features.sqlite, .about = "a to-do API on SQLite (todos.db, or a path after --), on port 3000" },
         .{ .name = "mongodb", .needs = features.mongodb, .about = "a users API on MongoDB (MONGODB_URI), on port 3000" },
         .{ .name = "redis", .needs = features.redis, .about = "a counter, a cache, a leaderboard and pub/sub on Redis (REDIS_URL), on port 3000" },
+        .{ .name = "lambda", .needs = features.lambda, .about = "the same app as a server on port 3000 or an AWS Lambda function (examples/lambda/README.md)" },
     };
     for (examples) |ex| {
         if (!ex.needs) continue;
@@ -1550,6 +1679,7 @@ fn resolveFeatures(b: *std.Build) Features {
     const s3 = b.option(bool, "s3", "S3-compatible object storage client (overrides the profile)");
     const smtp = b.option(bool, "smtp", "SMTP client for sending mail (overrides the profile)");
     const lambda = b.option(bool, "lambda", "The AWS Lambda adapter (overrides the profile)");
+    const default_deployment = b.option(DefaultDeployment, "default-deployment", "The deployment used when neither the options nor ANOLE_DEPLOYMENT name one (zig build lambda: lambda)") orelse .standalone;
 
     var f = Features.preset(profile);
     if (tls) |v| f.tls = v;
@@ -1575,6 +1705,7 @@ fn resolveFeatures(b: *std.Build) Features {
     if (s3) |v| f.s3 = v;
     if (smtp) |v| f.smtp = v;
     if (lambda) |v| f.lambda = v;
+    f.default_deployment = default_deployment;
 
     if (f.tls == .none and http3 == null) f.http3 = false;
     if (!f.http2 and grpc == null) f.grpc = false;
@@ -2029,6 +2160,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(bool, "s3", f.s3);
     options.addOption(bool, "smtp", f.smtp);
     options.addOption(bool, "lambda", f.lambda);
+    options.addOption(DefaultDeployment, "default_deployment", f.default_deployment);
     // Live servers for tests (`-Dredis-test-port=6379` or
     // `-Dredis-test-url=redis://...`,
     // `-Dpostgres-test-url=postgres://...`, `-Dmongodb-test-url=mongodb://...`),

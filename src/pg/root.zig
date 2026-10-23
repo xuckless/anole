@@ -665,6 +665,38 @@ pub const Client = struct {
         return self;
     }
 
+    /// Closes the idle connections of every executor's pool; calls open
+    /// new ones as they need them (the pools keep their size). The Lambda
+    /// adapter calls it after a long freeze, when a NAT gateway may have
+    /// dropped them without telling either end. Done here the way pg.zig's
+    /// own idle expiry does it (`takeExpired`, `closeExpired`): the idle
+    /// connections are taken out under the pool's lock and closed outside
+    /// it, and their slots freed for waiters.
+    pub fn closeIdle(self: *Client) void {
+        for (self.pools.pools) |*shard| {
+            const pool = shard.pool;
+            const io = pool._io;
+            while (true) {
+                pool._mutex.lockUncancelable(io);
+                if (pool._available == 0) {
+                    pool._mutex.unlock(io);
+                    break;
+                }
+                // The bottom of the idle stack: idle the longest.
+                const conn = pool._conns[0];
+                const available = pool._available - 1;
+                std.mem.copyForwards(*pg.Conn, pool._conns[0..available], pool._conns[1 .. available + 1]);
+                pool._available = available;
+                pool._open -= 1;
+                pool._mutex.unlock(io);
+                conn.deinit();
+                pool._allocator.destroy(conn);
+                pool._cond.broadcast(io);
+            }
+            self.report(shard);
+        }
+    }
+
     /// Closes every connection: after the server has drained (`app`'s
     /// `deinit` does it then).
     pub fn deinit(self: *Client) void {

@@ -464,7 +464,10 @@ Bindings may switch on it; tokens are only ever added.
 | `NoConsumer`, `ConsumerWithoutExecutor` | `ANOLE_E_STATE` | `anole_server_open` / `anole_server_start` |
 | `NotRunning`, `NoTlsListener` | `ANOLE_E_STATE` | reload, publish |
 | `UnknownCheck` | `ANOLE_E_INVALID` | `anole_server_set_ready` |
-| `InvalidEnvironmentVariable`, `DeploymentUnavailable`, `ProxyProtocolNoPeers` | `ANOLE_E_CONFIG` | `anole_server_create` (`ANOLE_ENV`, `ANOLE_DEPLOYMENT`, `PORT`; `deployment` lambda; `proxy_protocol` with an empty `proxy.trusted`) |
+| `InvalidEnvironmentVariable`, `ProxyProtocolNoPeers` | `ANOLE_E_CONFIG` | `anole_server_create` (`ANOLE_ENV`, `ANOLE_DEPLOYMENT`, `PORT`, `AWS_LAMBDA_*`, `ANOLE_LAMBDA_INVOKE_MODE`; `proxy_protocol` with an empty `proxy.trusted`) |
+| `LambdaRuntimeApiMissing`, `LambdaNotBuilt` | `ANOLE_E_CONFIG` | `anole_server_create` (`deployment` lambda with no Runtime API, or a build without `-Dlambda`) |
+| `SnapStartUnsupported` | `ANOLE_E_CONFIG` | `anole_server_start` (a function published with SnapStart) |
+| `LambdaRuntimeApiFailed` | `ANOLE_E_SYSTEM` | `anole_server_start` / `anole_server_wait` (the Runtime API failed; Lambda starts a new environment) |
 | `UnknownEnvironment`, `InvalidEnvFile` | `ANOLE_E_INVALID`, `ANOLE_E_CONFIG` | `anole_dotenv_read` |
 | `AddressInUse`, `AddressNotAvailable`, `AccessDenied`, `TooManyOpenFiles`, `SystemResources` | `ANOLE_E_SYSTEM` | binds, threads, files (errno set) |
 | `CertificateFileUnreadable`, `KeyFileUnreadable`, `ClientCaFileUnreadable` | `ANOLE_E_SYSTEM` | TLS files (errno set) |
@@ -668,7 +671,8 @@ in the process environment, else production and standalone. libanole reads
 no `.env` file itself and treats a build without `environment` as
 production, so a binding that leaves it out gets JSON records in its log
 callback. Resolution failures are `ANOLE_E_CONFIG` from `anole_server_create`
-(`InvalidEnvironmentVariable`, `InvalidProxyNetwork`, `DeploymentUnavailable`),
+(`InvalidEnvironmentVariable`, `InvalidProxyNetwork`, `LambdaRuntimeApiMissing`,
+`LambdaNotBuilt`),
 with the reason in `anole_last_error`. `anole_server_listener` reports the
 filled address and port before start, so a binding sees `$PORT` at once.
 
@@ -728,6 +732,7 @@ none.
 | `executors` | 0 | `executors` (0 is `.auto`, n is `.exact(n)`) |
 | `databases[].timeout_ms` | 30000 | the connectors' `timeout` (0 is null: none); also a transaction's bound when its `timeout_ms` is 0 |
 | `databases[].mongodb.max_connections`, `databases[].sqlite.ping_timeout_ms` | null (100), 2000 | `mongodb.Options.max_connections`, `sqlite.Options.ping_timeout` |
+| `lambda.*` | see [Lambda](#lambda) | `lambda.*` (durations as `_ms`) |
 
 Keys with no Zig option: `limits.inline_body_max`, `max_inflight`, `queue`,
 `stream_high_water`, `ws_high_water`, `db_result_max`; `timeouts.rewake_ms`;
@@ -1997,3 +2002,80 @@ A native middleware, on the whole server or a route:
 
 Presets: `standard` (v1 HMAC and v1a Ed25519), `stripe`, `github`, `slack`, `hmac` (a header, algorithm, encoding and prefix of your choice). The signature is checked over the body as received; several secrets are tried (rotation). A missing or wrong signature, or a timestamp outside `tolerance_ms` (5 minutes), answers 400 with no detail. A delivery id seen before answers 200 without reaching your handler; one still being processed answers 409 with `Retry-After`. `dedup` is `"memory"` (the default), `"none"` or `"redis:<database>"`. Read the body with the request's body and parse that, never a re-serialized copy.
 
+## Lambda
+
+With `"deployment": "lambda"` (or `ANOLE_DEPLOYMENT=lambda` in the
+environment) the same configuration serves AWS Lambda invocations: libanole
+polls the Lambda Runtime API at `AWS_LAMBDA_RUNTIME_API`, turns each HTTP
+event (API Gateway REST and HTTP APIs, Function URLs, ALB, VPC Lattice) into
+a request through the router and the native routes, and posts the answer
+back. Events that are not HTTP requests (SQS, SNS, EventBridge, schedules)
+arrive as a `POST` to `lambda.event_path` with the event as the body; a 2xx
+answer's body is the invocation's result. No new functions, events or
+handle kinds: a consumer sees ordinary `ANOLE_EV_REQUEST` records. Built with
+`-Dlambda`, on in every profile (`anole_has_feature("lambda")`). What the
+mapping does is in [lambda.md](lambda.md).
+
+**The binding contract.**
+
+- The binding's process runs as the function's runtime, with
+  `ANOLE_DEPLOYMENT=lambda` in its environment, its handlers attached as
+  usual. At concurrency 1 (classic Lambda) one consumer is enough.
+- On the managed Node.js or Python runtime, set `AWS_LAMBDA_EXEC_WRAPPER`
+  to the binding's wrapper script and the handler setting to the app's entry
+  file; the script does `export ANOLE_DEPLOYMENT=lambda; exec node
+  "$LAMBDA_TASK_ROOT/$_HANDLER"` (Python: `exec python3 ...`) and ignores
+  the runtime client it was given. On `provided.al2023` with the language in
+  a layer, `bootstrap` is the same script.
+- Embedded mode installs no signal handlers. With `lambda.sigterm` on,
+  Lambda sends SIGTERM before it shuts the environment down; the binding
+  calls `anole_server_drain`, which stops polling and ends the run within
+  `lambda.shutdown_timeout_ms`.
+- A request record's `listener` is `"lambda"` and its `remote_addr`
+  `"<client ip>:0"` (`"0.0.0.0:0"` when the event names no client).
+  `anole_server_listener` reports the configured listeners with port 0:
+  nothing is bound.
+- The invocation arrives in two request headers, as AWS Lambda Web Adapter
+  sends them: `x-amzn-request-context` (the event's `requestContext` as
+  JSON) and `x-amzn-lambda-context` (`request_id`, `deadline`,
+  `invoked_function_arn`, `xray_trace_id`, `client_context`, `identity`,
+  `env_config`). A client's own copies are removed first.
+- `timeout_us` follows the invocation: it is the earlier of the route's
+  deadline and the invocation's deadline less `lambda.deadline_margin_ms`.
+  Past it the request is answered 504 before Lambda's own timeout ends the
+  environment.
+- To give the AWS SDKs their per-invocation trace ID, a binding sets its
+  language-level `_X_AMZN_TRACE_ID` from `x-amzn-lambda-context`'s
+  `xray_trace_id` when a request starts (safe at concurrency 1 only).
+- Lambda web functions (`AWS_LAMBDA_HTTP_ENDPOINT` set, and no
+  `lambda.runtime_api`): the same `ANOLE_DEPLOYMENT=lambda` makes libanole
+  listen on that endpoint, HTTP/1.1 only, and set aside every other
+  listener.
+
+**Keys** (`"lambda": { ... }`; ignored by other deployments):
+
+| Key | Default | Zig |
+| --- | --- | --- |
+| `runtime_api` | null | `lambda.runtime_api` ("host:port"; null: `AWS_LAMBDA_RUNTIME_API`) |
+| `invoke_mode` | null | `lambda.invoke_mode` ("buffered" or "response_stream"; null: `ANOLE_LAMBDA_INVOKE_MODE`, else buffered) |
+| `concurrency` | null | `lambda.concurrency` (1 to 4096; null: `AWS_LAMBDA_MAX_CONCURRENCY`, else 1) |
+| `event_path` | "/_lambda/event" | `lambda.event_path` (null: other events fail with `Runtime.UnsupportedEvent`) |
+| `base_path` | null | `lambda.base_path` |
+| `keep_stage` | false | `lambda.keep_stage` |
+| `context_headers` | true | `lambda.context_headers` |
+| `deadline_margin_ms` | 100 | `lambda.deadline_margin` |
+| `idle_reset_ms` | 300000 | `lambda.idle_reset` (null: never) |
+| `sigterm` | true | `lambda.sigterm` |
+| `shutdown_timeout_ms` | 400 | `lambda.shutdown_timeout` |
+| `flush_timeout_ms` | 500 | `lambda.flush_timeout` |
+
+- `anole_nats_subscribe`, `anole_nats_js_consume` and `anole_kafka_subscribe`
+  answer `ANOLE_E_STATE` under `deployment = lambda`: the process is frozen
+  between invocations, so nothing would deliver. Publishing and producing
+  work; an event source mapping delivers queue and stream messages to the
+  event path.
+
+Errors: `LambdaRuntimeApiMissing` and `LambdaNotBuilt` from
+`anole_server_create`, `SnapStartUnsupported` from `anole_server_start`, and
+`LambdaRuntimeApiFailed` when the Runtime API fails (the run ends; Lambda
+starts a new environment). See [Status codes](#status-codes).

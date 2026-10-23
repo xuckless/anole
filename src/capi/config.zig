@@ -82,6 +82,9 @@ pub const Config = struct {
     // ---- end p3/smtp ----
 
     // ---- p3/lambda ----
+    /// AWS Lambda (`"deployment": "lambda"`): where invocations come from
+    /// and how answers go back. Ignored by other deployments.
+    lambda: Lambda = .{},
     // ---- end p3/lambda ----
 
     pub const Console = struct {
@@ -1161,6 +1164,26 @@ pub const Config = struct {
     // ---- end p3/smtp (types) ----
 
     // ---- p3/lambda (types) ----
+    /// `ServerOptions.lambda`, durations in milliseconds.
+    pub const Lambda = struct {
+        /// "host:port". Null: AWS_LAMBDA_RUNTIME_API.
+        runtime_api: ?[]const u8 = null,
+        /// "buffered" or "response_stream". Null: ANOLE_LAMBDA_INVOKE_MODE,
+        /// else buffered.
+        invoke_mode: ?anole.ServerOptions.Lambda.InvokeMode = null,
+        /// 1 to 4096. Null: AWS_LAMBDA_MAX_CONCURRENCY, else 1.
+        concurrency: ?u16 = null,
+        event_path: ?[]const u8 = "/_lambda/event",
+        base_path: ?[]const u8 = null,
+        keep_stage: bool = false,
+        context_headers: bool = true,
+        deadline_margin_ms: u32 = 100,
+        /// Null: never.
+        idle_reset_ms: ?u32 = 300_000,
+        sigterm: bool = true,
+        shutdown_timeout_ms: u32 = 400,
+        flush_timeout_ms: u32 = 500,
+    };
     // ---- end p3/lambda (types) ----
 };
 
@@ -1396,6 +1419,16 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (m.retry.attempts == 0 or m.retry.attempts > 10) return fail(why, "mail[{d}].retry.attempts: 1-10", .{i});
     }
     // ---- end p3/smtp (validate) ----
+    // ---- p3/lambda (validate) ----
+    {
+        const l = cfg.lambda;
+        if (l.concurrency) |n| if (n == 0 or n > 4096) return fail(why, "lambda.concurrency: 1 to 4096", .{});
+        if (l.runtime_api) |api| if (std.mem.lastIndexOfScalar(u8, api, ':') == null) return fail(why, "lambda.runtime_api: host:port", .{});
+        if (l.event_path) |p| if (p.len == 0 or p[0] != '/') return fail(why, "lambda.event_path: a path starting with '/'", .{});
+        if (l.base_path) |p| if (p.len == 0 or p[0] != '/') return fail(why, "lambda.base_path: a path starting with '/'", .{});
+        if (l.shutdown_timeout_ms == 0) return fail(why, "lambda.shutdown_timeout_ms: at least 1", .{});
+    }
+    // ---- end p3/lambda (validate) ----
     if (cfg.observe.health) |h| {
         if (h.checks.len > 16) return fail(why, "observe.health.checks: at most 16", .{});
         for (h.checks, 0..) |name, i| {

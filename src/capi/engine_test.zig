@@ -1959,12 +1959,6 @@ test "capi: deployment resolution at create" {
         try std.testing.expectEqualStrings("[::]:41234", e.listeners[0].cfg_address);
         try std.testing.expectEqualStrings("http-41234", e.listeners[0].name);
     }
-    {
-        var why_buf: [256]u8 = undefined;
-        var why: std.Io.Writer = .fixed(&why_buf);
-        try std.testing.expectError(error.DeploymentUnavailable, engine.Engine.create("{\"deployment\":\"lambda\"}", false, &why));
-        try std.testing.expect(why.buffered().len > 0);
-    }
 }
 
 // Pass 3's areas: each its own file of C ABI tests (research/p3-pass/PLAN.md R8).

@@ -333,6 +333,13 @@ pub const server_options = [_]Entry{
     .{ .zig = "_console_runtime", .omitted = "internal: the ABI's console.runtime" },
     .{ .zig = "env_files", .omitted = "the binding reads .env files into its language's environment (anole_dotenv_read)" },
     .{ .zig = "_resolved", .omitted = "internal: the C ABI resolves the modes at create" },
+    // ---- p3/lambda ----
+    .{ .zig = "lambda", .json = "lambda", .kind = .same },
+    .{ .zig = "lambda.deadline_margin", .json = "lambda.deadline_margin_ms", .kind = .ms },
+    .{ .zig = "lambda.idle_reset", .json = "lambda.idle_reset_ms", .kind = .ms },
+    .{ .zig = "lambda.shutdown_timeout", .json = "lambda.shutdown_timeout_ms", .kind = .ms },
+    .{ .zig = "lambda.flush_timeout", .json = "lambda.flush_timeout_ms", .kind = .ms },
+    // ---- end p3/lambda ----
 };
 
 // ---------------------------------------------------------------------------

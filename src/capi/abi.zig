@@ -1900,7 +1900,6 @@ const base_error_names = [_][]const u8{
     "ConsumerWithoutExecutor",
     "Database",
     "DatabaseUnavailable",
-    "DeploymentUnavailable",
     "DuplicateListenerName",
     "FileNotFound",
     "Gone",
@@ -1996,7 +1995,7 @@ const smtp_error_names = [_][]const u8{};
 // ---- end p3/smtp ----
 
 // ---- p3/lambda ----
-const lambda_error_names = [_][]const u8{};
+const lambda_error_names = [_][]const u8{ "LambdaRuntimeApiMissing", "LambdaNotBuilt", "LambdaRuntimeApiFailed", "SnapStartUnsupported" };
 // ---- end p3/lambda ----
 
 fn sortedNames(comptime in: []const []const u8) [in.len][]const u8 {

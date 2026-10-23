@@ -3,7 +3,8 @@
 # repository, with the path dependency replaced by `zig fetch --save` of a
 # git URL, then `zig build` (which generates the protobuf code) and `zig
 # build gen-proto` (the same into src/gen), then `zig build openapi` and
-# `openapi-check`.
+# `openapi-check`, then `zig build lambda` for arm64 (a second Anole
+# dependency with other arguments in the same build).
 #
 #   tests/consumer/run.sh [URL]
 #
@@ -46,4 +47,15 @@ test -f src/gen/greeter.pb.zig
 "$zig" build openapi
 test -s openapi.json
 "$zig" build openapi-check
+# AWS Lambda (addApp's `.lambda`): the arm64 zip, holding bootstrap
+# (mode 0755) and the included proto directory.
+"$zig" build lambda -Dlambda-arch=arm64
+python3 -I - zig-out/lambda/consumer-arm64.zip <<'PY'
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+names = z.namelist()
+assert names[0] == 'bootstrap', names
+assert (z.getinfo('bootstrap').external_attr >> 16) & 0o777 == 0o755
+assert 'proto/greeter.proto' in names, names
+PY
 echo "consumer built against $url"

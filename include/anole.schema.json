@@ -212,9 +212,31 @@
         "$ref": "#/$defs/Mail"
       },
       "description": "Mail servers for anole_smtp_*, opened at start."
+    },
+    "lambda": {
+      "$ref": "#/$defs/Lambda",
+      "description": "AWS Lambda (deployment \"lambda\"): where invocations come from and how answers go back. Ignored by other deployments. docs/lambda.md."
     }
   },
   "$defs": {
+    "Lambda": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "runtime_api": { "type": ["string", "null"], "default": null, "description": "The Runtime API, host:port; null: AWS_LAMBDA_RUNTIME_API. Set, it also wins over AWS_LAMBDA_HTTP_ENDPOINT." },
+        "invoke_mode": { "enum": ["buffered", "response_stream", null], "default": null, "description": "buffered or response_stream (a Function URL with RESPONSE_STREAM, a REST API with responseTransferMode STREAM); null: ANOLE_LAMBDA_INVOKE_MODE, else buffered." },
+        "concurrency": { "type": ["integer", "null"], "minimum": 1, "maximum": 4096, "default": null, "description": "Invocations served at once; null: AWS_LAMBDA_MAX_CONCURRENCY (Lambda Managed Instances), else 1." },
+        "event_path": { "type": ["string", "null"], "default": "/_lambda/event", "description": "Where events that are not HTTP requests are POSTed (the event as the JSON body); a 2xx answer's body is the result. null: such events fail the invocation." },
+        "base_path": { "type": ["string", "null"], "default": null, "description": "Taken off the front of every HTTP event's path (an API Gateway custom domain's base path); null: none." },
+        "keep_stage": { "type": "boolean", "default": false, "description": "Keep a named stage at the front of an HTTP API path." },
+        "context_headers": { "type": "boolean", "default": true, "description": "Send the invocation in x-amzn-request-context and x-amzn-lambda-context (a client's own copies are removed either way)." },
+        "deadline_margin_ms": { "type": "integer", "minimum": 0, "default": 100, "description": "A request still running this long before the invocation's deadline is canceled and answered 504." },
+        "idle_reset_ms": { "type": ["integer", "null"], "minimum": 0, "default": 300000, "description": "Close idle outbound and database connections when an invocation arrives this long after the last one ended; null: never." },
+        "sigterm": { "type": "boolean", "default": true, "description": "Register a no-op Lambda extension so that Lambda sends SIGTERM before it shuts the environment down." },
+        "shutdown_timeout_ms": { "type": "integer", "minimum": 1, "default": 400, "description": "The most the shutdown after SIGTERM may take." },
+        "flush_timeout_ms": { "type": "integer", "minimum": 0, "default": 500, "description": "The most that sending finished spans may hold up the next invocation." }
+      }
+    },
     "Storage": {
       "type": "object",
       "additionalProperties": false,
