@@ -2,8 +2,8 @@
 //!
 //! Features are chosen with `-Dprofile=minimal|web|full` (default `full`) and
 //! overridden one by one with `-Dtls=boringssl|none`, `-Dhttp2`, `-Dhttp3`,
-//! `-Dgrpc`, `-Dwebsocket`, `-Dauth`, `-Dpostgres`, `-Dsqlite`, `-Dmongodb`, `-Dopenapi` and
-//! the rest below. The result is exposed to Zig code as the `build_options`
+//! `-Dgrpc`, `-Dwebsocket`, `-Dauth`, `-Dpostgres`, `-Dsqlite`, `-Dmongodb`, `-Dopenapi`,
+//! `-Dnet`, `-Djobs`, `-Dwebhooks`, `-Ds3`, `-Dsmtp`, `-Dlambda` and the rest below. The result is exposed to Zig code as the `build_options`
 //! module (re-exported as `anole.features`).
 //!
 //! Every C library is a lazy dependency in build.zig.zon and is requested only
@@ -93,22 +93,38 @@ pub const Features = struct {
     /// control socket, log and error rings and the terminal UI. Pure Zig:
     /// no C library.
     console: bool,
+    /// Raw TCP and UDP servers (`anole.net`'s listeners). Pure Zig.
+    net: bool,
+    /// Durable jobs and cron (`anole.jobs`, `anole.cron`). The stores
+    /// follow their own flags; the memory store always works. Pure Zig.
+    jobs: bool,
+    /// Webhooks out and the Verify middleware (`anole.webhooks`); needs
+    /// `jobs`. Pure Zig.
+    webhooks: bool,
+    /// The S3-compatible object storage client (`anole.s3`). Pure Zig.
+    s3: bool,
+    /// The SMTP client for sending mail (`anole.smtp`). Pure Zig.
+    smtp: bool,
+    /// The AWS Lambda adapter (`anole.lambda`, `deployment = lambda`).
+    /// Pure Zig.
+    lambda: bool,
 
     pub fn preset(profile: Profile) Features {
         return switch (profile) {
             // HTTP/1.1 only.
-            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .brotli = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false, .nats = false, .kafka = false, .openapi = false, .console = false },
-            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false, .nats = false, .kafka = false, .openapi = true, .console = true },
-            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true, .nats = true, .kafka = true, .openapi = true, .console = true },
+            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .brotli = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false, .nats = false, .kafka = false, .openapi = false, .console = false, .net = false, .jobs = false, .webhooks = false, .s3 = false, .smtp = false, .lambda = true },
+            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false, .nats = false, .kafka = false, .openapi = true, .console = true, .net = true, .jobs = true, .webhooks = true, .s3 = true, .smtp = true, .lambda = true },
+            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true, .nats = true, .kafka = true, .openapi = true, .console = true, .net = true, .jobs = true, .webhooks = true, .s3 = true, .smtp = true, .lambda = true },
         };
     }
 
     /// Null when the combination is valid, otherwise what is wrong with it.
     pub fn invalid(f: Features) ?[]const u8 {
-        if (f.grpc and !f.http2) return "-Dgrpc=true requires -Dhttp2=true (gRPC runs over HTTP/2 with trailers)";
+        if (f.grpc and !f.http2) return "-Dgrpc=true requires -Dhttp2=true (gRPC's HTTP/2 path and its client; HTTP/3 is added with -Dhttp3)";
         if (f.http3 and f.tls == .none) return "-Dhttp3=true requires -Dtls=boringssl (QUIC always uses TLS 1.3)";
         if (f.brotli and !f.compression) return "-Dbrotli=true requires -Dcompression=true (Brotli is one of the Compress middleware's codings)";
         if (f.kafka and !f.compression) return "-Dkafka=true requires -Dcompression=true (Kafka batches use gzip and zstd)";
+        if (f.webhooks and !f.jobs) return "-Dwebhooks=true requires -Djobs=true (webhook deliveries run as jobs)";
         return null;
     }
 
@@ -458,6 +474,9 @@ pub fn build(b: *std.Build) void {
     const mongodb_test_url = b.option([]const u8, "mongodb-test-url", "Run the MongoDB tests against a live server at this URL (mongodb://...)");
     const nats_test_url = b.option([]const u8, "nats-test-url", "Run the NATS tests against a live server at this URL (nats://...)");
     const kafka_test_url = b.option([]const u8, "kafka-test-url", "Run the Kafka tests against a live broker at this address (host:port)");
+    const s3_test_url = b.option([]const u8, "s3-test-url", "Run the S3 tests against a live S3-compatible server at this URL (http://, https://...)");
+    const smtp_test_url = b.option([]const u8, "smtp-test-url", "Run the SMTP tests against a live server at this URL (smtp://, smtps://...)");
+    const mailpit_api_url = b.option([]const u8, "mailpit-api-url", "The SMTP tests read what was sent from this Mailpit API (http://...)");
     // `zig build test --fuzz` needs LLVM: Zig 0.17's self-hosted backend (the
     // Debug default on x86_64-linux) emits no coverage tables, so the fuzzer
     // would see none ("pcs_len was zero").
@@ -523,7 +542,7 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{
         .name = "anole-test",
         .filters = test_filters,
-        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url, .nats_test_url = nats_test_url, .kafka_test_url = kafka_test_url }),
+        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url, .nats_test_url = nats_test_url, .kafka_test_url = kafka_test_url, .s3_test_url = s3_test_url, .smtp_test_url = smtp_test_url, .mailpit_api_url = mailpit_api_url }),
         .use_llvm = use_llvm,
     });
     const run_tests = b.addRunArtifact(tests);
@@ -1461,7 +1480,7 @@ pub fn build(b: *std.Build) void {
 /// Reads -Dprofile and the per-feature overrides. A feature that depends on a
 /// turned-off one follows it when it was not set explicitly (`-Dtls=none`
 /// turns http3 off, `-Dhttp2=false` turns grpc off, `-Dcompression=false`
-/// brotli); an explicit contradiction
+/// brotli, `-Djobs=false` webhooks); an explicit contradiction
 /// is an error.
 fn resolveFeatures(b: *std.Build) Features {
     const profile = b.option(Profile, "profile", "Feature preset: minimal (HTTP/1.1 only), web, full (default)") orelse .full;
@@ -1482,6 +1501,12 @@ fn resolveFeatures(b: *std.Build) Features {
     const kafka = b.option(bool, "kafka", "Kafka client; needs -Dcompression=true (overrides the profile)");
     const openapi = b.option(bool, "openapi", "OpenAPI 3.1 document generation (overrides the profile)");
     const console_opt = b.option(bool, "console", "The live console: control socket, rings and terminal UI (overrides the profile)");
+    const net = b.option(bool, "net", "Raw TCP and UDP servers (overrides the profile)");
+    const jobs = b.option(bool, "jobs", "Durable jobs, cron and webhooks out (overrides the profile)");
+    const webhooks = b.option(bool, "webhooks", "Webhooks out and the Verify middleware; needs -Djobs=true (overrides the profile)");
+    const s3 = b.option(bool, "s3", "S3-compatible object storage client (overrides the profile)");
+    const smtp = b.option(bool, "smtp", "SMTP client for sending mail (overrides the profile)");
+    const lambda = b.option(bool, "lambda", "The AWS Lambda adapter (overrides the profile)");
 
     var f = Features.preset(profile);
     if (tls) |v| f.tls = v;
@@ -1501,11 +1526,18 @@ fn resolveFeatures(b: *std.Build) Features {
     if (kafka) |v| f.kafka = v;
     if (openapi) |v| f.openapi = v;
     if (console_opt) |v| f.console = v;
+    if (net) |v| f.net = v;
+    if (jobs) |v| f.jobs = v;
+    if (webhooks) |v| f.webhooks = v;
+    if (s3) |v| f.s3 = v;
+    if (smtp) |v| f.smtp = v;
+    if (lambda) |v| f.lambda = v;
 
     if (f.tls == .none and http3 == null) f.http3 = false;
     if (!f.http2 and grpc == null) f.grpc = false;
     if (!f.compression and brotli == null) f.brotli = false;
     if (!f.compression and kafka == null) f.kafka = false;
+    if (!f.jobs and webhooks == null) f.webhooks = false;
 
     if (f.invalid()) |msg| {
         std.debug.print("error: invalid Anole feature flags: {s}\n", .{msg});
@@ -1918,6 +1950,9 @@ const AnoleModuleOptions = struct {
     mongodb_test_url: ?[]const u8 = null,
     nats_test_url: ?[]const u8 = null,
     kafka_test_url: ?[]const u8 = null,
+    s3_test_url: ?[]const u8 = null,
+    smtp_test_url: ?[]const u8 = null,
+    mailpit_api_url: ?[]const u8 = null,
     /// src/bson as a module, for -Dmongodb.
     bson: ?*std.Build.Module = null,
 };
@@ -1945,6 +1980,12 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(bool, "kafka", f.kafka);
     options.addOption(bool, "openapi", f.openapi);
     options.addOption(bool, "console", f.console);
+    options.addOption(bool, "net", f.net);
+    options.addOption(bool, "jobs", f.jobs);
+    options.addOption(bool, "webhooks", f.webhooks);
+    options.addOption(bool, "s3", f.s3);
+    options.addOption(bool, "smtp", f.smtp);
+    options.addOption(bool, "lambda", f.lambda);
     // Live servers for tests (`-Dredis-test-port=6379` or
     // `-Dredis-test-url=redis://...`,
     // `-Dpostgres-test-url=postgres://...`, `-Dmongodb-test-url=mongodb://...`),
@@ -1955,6 +1996,9 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(?[]const u8, "mongodb_test_url", o.mongodb_test_url);
     options.addOption(?[]const u8, "nats_test_url", o.nats_test_url);
     options.addOption(?[]const u8, "kafka_test_url", o.kafka_test_url);
+    options.addOption(?[]const u8, "s3_test_url", o.s3_test_url);
+    options.addOption(?[]const u8, "smtp_test_url", o.smtp_test_url);
+    options.addOption(?[]const u8, "mailpit_api_url", o.mailpit_api_url);
 
     const create: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("src/root.zig"),
