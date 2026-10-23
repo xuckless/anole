@@ -601,7 +601,7 @@ jobs:
         timeout-minutes: 35
         run: tests/s3/run.sh
       - name: Fuzz the XML reader
-        run: zig build test -Dtest-filter="fuzz: s3 xml" -Dllvm=true --fuzz=200K
+        run: 'zig build test -Dtest-filter="fuzz: s3 xml" -Dllvm=true --fuzz=200K'
   # ---- end p3/s3 ----
 
   postgres:
@@ -703,7 +703,7 @@ jobs:
         run: tests/mongodb/run.sh ${{ matrix.image }}
 
   smtp:
-    name: SMTP (live tests against Mailpit: plain, STARTTLS with AUTH, implicit TLS)
+    name: "SMTP (live tests against Mailpit: plain, STARTTLS with AUTH, implicit TLS)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
