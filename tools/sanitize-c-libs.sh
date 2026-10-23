@@ -7,7 +7,7 @@
 # CI, since its tests need a git submodule the tarball lacks. BoringSSL tests
 # itself under sanitizers upstream at every commit.)
 #
-#   tools/sanitize-c-libs.sh [ngtcp2 nghttp3 zlib-ng yyjson zstd brotli]
+#   tools/sanitize-c-libs.sh [ngtcp2 nghttp3 zlib-ng yyjson zstd brotli lz4]
 #
 # Needs clang, make, cmake, curl, tar and git (ngtcp2 and nghttp3 come from
 # the xuckless forks, whose archives lack the tests' munit submodule, so
@@ -20,7 +20,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 work=${SANITIZE_WORK:-$(mktemp -d)}
 mkdir -p "$work"
 libs=("$@")
-[ ${#libs[@]} -gt 0 ] || libs=(ngtcp2 nghttp3 zlib-ng yyjson zstd brotli)
+[ ${#libs[@]} -gt 0 ] || libs=(ngtcp2 nghttp3 zlib-ng yyjson zstd brotli lz4)
 jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
 export CC=${CC:-clang}
@@ -44,6 +44,7 @@ sha256_of() {
     https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz) echo 37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3 ;;
     https://github.com/google/brotli/archive/refs/tags/v1.2.0.tar.gz) echo 816c96e8e8f193b40151dad7e8ff37b1221d019dbcb9c35cd3fadbfe6477dfec ;;
     https://github.com/google/brotli/releases/download/v1.2.0/testdata.txz) echo e8624d888f13067e7635353397cf42956bf4ca1382da67f9cec8d43e800deecb ;;
+    https://github.com/lz4/lz4/archive/refs/tags/v1.10.0.tar.gz) echo 537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b ;;
     *) echo "" ;;
   esac
 }
@@ -139,6 +140,14 @@ for lib in "${libs[@]}"; do
         -DCMAKE_C_FLAGS="$san" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" >/dev/null
       cmake --build build -j"$jobs" >/dev/null
       (cd build && ctest --output-on-failure -j"$jobs" | tail -3)
+      ;;
+    lz4)
+      fetch lz4 "lz4/archive"
+      # The block and frame fuzzers (Kafka batches use the frame format),
+      # for a bounded time, as its own test-fuzzer/test-frametest do.
+      make -C tests -j"$jobs" fuzzer frametest CFLAGS="$san" LDFLAGS="-fsanitize=address,undefined" >/dev/null
+      ./tests/fuzzer -T60s
+      ./tests/frametest -T60s
       ;;
     *)
       echo "unknown library: $lib" >&2
