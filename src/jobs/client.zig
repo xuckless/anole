@@ -14,6 +14,8 @@ const sqlite_store = if (anole.features.sqlite) @import("store_sqlite.zig") else
 const pg_store = if (anole.features.postgres) @import("store_pg.zig") else struct {};
 const redis_store = if (anole.features.redis) @import("store_redis.zig") else struct {};
 const cron_mod = @import("../cron/root.zig");
+const metrics_mod = @import("metrics.zig");
+const internal = @import("../db/internal.zig");
 const observe = @import("../observe/root.zig");
 const placement = dusty.placement;
 
@@ -55,6 +57,7 @@ const JobBox = struct {
     row: store.Row,
     job: Job = undefined,
     task: ?placement.Task = null,
+    started: std.Io.Clock.Timestamp = undefined,
     lost: std.atomic.Value(bool) = .init(false),
     interrupted: std.atomic.Value(bool) = .init(false),
 };
@@ -93,6 +96,10 @@ pub const Client = struct {
     last_rescue: i64 = 0,
     /// Set by `app.jobs` when the deployment runs no workers (lambda).
     suppress_workers: bool = false,
+    /// The server's drain event: set by `app.jobs`, so the queue drains when serving does.
+    drain_event: ?*std.Io.Event = null,
+    metrics: ?*metrics_mod.Series = null,
+    last_gauges: i64 = 0,
 
     /// `app.jobs(options)` calls it; outside an app, `init`, `start`, `drain`, `deinit`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
@@ -156,6 +163,10 @@ pub const Client = struct {
         }
         self.crons.deinit(self.gpa);
         self.held.deinit(self.gpa);
+        if (self.metrics) |mm| {
+            mm.deinit();
+            self.gpa.destroy(mm);
+        }
         self.arena_state.deinit();
         self.gpa.destroy(self);
     }
@@ -249,11 +260,16 @@ pub const Client = struct {
 
     /// Migrates, loads cron state, starts fetchers, heartbeat, wakes, leader (per `run`).
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
-        _ = registry;
         _ = tracer;
         _ = health;
         if (self.started) return;
         self.started = true;
+        if (registry) |r| {
+            const mm = try self.gpa.create(metrics_mod.Series);
+            errdefer self.gpa.destroy(mm);
+            mm.* = try metrics_mod.Series.init(self.gpa, r);
+            self.metrics = mm;
+        }
         self.backend.vt.migrate(self.backend.ptr) catch |e| {
             log.err("jobs: migrating the store failed: {t}", .{e});
             return error.DatabaseUnavailable;
@@ -272,6 +288,7 @@ pub const Client = struct {
             if (self.suppress_workers) log.info("jobs: lambda deployment runs no workers or schedules here; jobs are only enqueued", .{});
             return;
         }
+        if (self.drain_event != null) try placement.concurrent(&self.group, self.io, .{ .executor = 0 }, drainWatcher, .{self});
         try placement.concurrent(&self.group, self.io, .{ .executor = 0 }, maintenanceTask, .{self});
         try placement.concurrent(&self.group, self.io, .{ .executor = 0 }, heartbeatTask, .{self});
         for (self.queues, 0..) |*q, i| {
@@ -293,6 +310,13 @@ pub const Client = struct {
             return error.InvalidOptions;
         };
         c.zone_loaded = true;
+    }
+
+    /// Waits for the server's drain, then drains the queue within `drain_timeout`.
+    fn drainWatcher(self: *Client) std.Io.Cancelable!void {
+        const ev = self.drain_event orelse return;
+        try ev.wait(self.io);
+        self.drain(std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = self.options.drain_timeout, .clock = .awake }));
     }
 
     fn runningTotal(self: *Client) u32 {
@@ -348,23 +372,86 @@ pub const Client = struct {
         return self.enqueueWith(c, self.kindDefaults(kind), args_json, opts);
     }
 
+    /// Inside the app's transaction (`*anole.pg.Tx` or `*anole.sqlite.Tx` on
+    /// this store's database); committed with it.
     pub fn enqueueIn(self: *Client, tx: anytype, c: anytype, args: anytype, opts: EnqueueOptions) Error!Enqueued {
-        _ = .{ tx, c, args, opts };
-        return self.noTransactions();
+        const def = comptime kindOf(@TypeOf(args));
+        const json = std.json.Stringify.valueAlloc(c.arena, args, .{}) catch return error.OutOfMemory;
+        return self.enqueueInWith(tx, c, def, json, opts);
     }
     pub fn enqueueRawIn(self: *Client, tx: anytype, c: anytype, kind: []const u8, args_json: []const u8, opts: EnqueueOptions) Error!Enqueued {
-        _ = .{ self, tx, c, kind, args_json, opts };
-        return self.noTransactions();
-    }
-    pub fn completeIn(self: *Client, tx: anytype, job: *Job) Error!void {
-        _ = .{ tx, job };
-        _ = self.noTransactions() catch |e| return e;
+        return self.enqueueInWith(tx, c, self.kindDefaults(kind), args_json, opts);
     }
 
-    fn noTransactions(self: *Client) Error {
+    /// Marks `job` completed inside `tx` (PostgreSQL/SQLite): exactly once
+    /// with the handler's own writes. If the transaction rolls back, the job
+    /// runs again after its lease.
+    pub fn completeIn(self: *Client, tx: anytype, job: *Job) Error!void {
+        const txp = try self.txPointer(tx, "completeIn");
+        const fin = self.backend.vt.finishIn.?;
+        var ctx: anole.db.Ctx = .{ .io = job.io, .arena = job.arena };
+        const ok = fin(self.backend.ptr, txp, &ctx, .{ .id = job.id, .attempt = job.attempt, .to = .completed, .finished_at = self.now() }) catch |e| return self.storeError(job, e);
+        if (!ok) {
+            log.warn("{s}: completeIn found the job no longer held", .{job.id_text});
+            return error.Conflict;
+        }
+        job.completed_in = true;
+    }
+
+    /// Checks `tx` is a transaction of this store's connector, and erases it.
+    fn txPointer(self: *Client, tx: anytype, comptime what: []const u8) Error!*anyopaque {
+        const T = @typeInfo(@TypeOf(tx)).pointer.child;
+        const kind: store.TxKind = comptime if (anole.features.sqlite and T == anole.sqlite.Tx)
+            .sqlite
+        else if (anole.features.postgres and T == anole.pg.Tx)
+            .postgres
+        else
+            @compileError(what ++ " takes the *Tx of anole.pg or anole.sqlite");
+        if (self.backend.tx_kind != kind or self.backend.vt.insertIn == null) {
+            log.warn("jobs: {s} needs a transaction of the jobs store's own database (PostgreSQL or SQLite)", .{what});
+            return error.InvalidJob;
+        }
+        if (@as(?*anyopaque, @ptrCast(tx.db)) != self.backend.owner) {
+            log.warn("jobs: {s}: the transaction is on another database than the jobs store", .{what});
+            return error.InvalidJob;
+        }
+        return @ptrCast(tx);
+    }
+
+    fn enqueueInWith(self: *Client, tx: anytype, c: anytype, def: Kind, args_json: []const u8, opts: EnqueueOptions) Error!Enqueued {
+        const txp = try self.txPointer(tx, "enqueueIn");
+        const meta_opts = try self.withTrace(c, opts);
+        const nj = try self.newJob(c.arena, def, args_json, meta_opts);
+        var ctx: anole.db.Ctx = .{ .io = c.io, .arena = c.arena };
+        const r = self.backend.vt.insertIn.?(self.backend.ptr, txp, &ctx, self.now(), nj) catch |e| return self.storeError(c, e);
+        if (self.metrics) |mm| mm.onEnqueued(nj.queue, def.name, r.inserted);
+        if (r.inserted) self.wakeQueue(nj.queue);
+        return r;
+    }
+
+    /// `opts` with the caller's `traceparent` added to its meta: a traced
+    /// request's span, or the one the running job came with.
+    fn withTrace(self: *Client, c: anytype, opts: EnqueueOptions) Error!EnqueueOptions {
         _ = self;
-        log.warn("jobs: enqueueIn and completeIn need a PostgreSQL or SQLite jobs store", .{});
-        return error.InvalidJob;
+        const arena = c.arena;
+        var tp: ?[]const u8 = null;
+        if (internal.requestOf(c)) |req| {
+            if (req.trace_id.len == 32 and req.span_id.len == 16) tp = std.fmt.allocPrint(arena, "00-{s}-{s}-01", .{ req.trace_id, req.span_id }) catch return error.OutOfMemory;
+        } else if (comptime @typeInfo(@TypeOf(c)) == .pointer and @typeInfo(@TypeOf(c)).pointer.child == Job) {
+            tp = c.traceparent();
+        }
+        const t = tp orelse return opts;
+        var obj: std.json.ObjectMap = .empty;
+        if (opts.meta) |m| {
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, m, .{}) catch return opts;
+            if (parsed != .object) return opts;
+            obj = parsed.object;
+        }
+        if (obj.contains("traceparent")) return opts;
+        obj.put(arena, "traceparent", .{ .string = t }) catch return error.OutOfMemory;
+        var out = opts;
+        out.meta = std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = obj }, .{}) catch return error.OutOfMemory;
+        return out;
     }
 
     pub fn enqueueMany(self: *Client, c: anytype, items: []const Client.Item) Error![]Enqueued {
@@ -436,8 +523,9 @@ pub const Client = struct {
     }
 
     fn enqueueWith(self: *Client, c: anytype, def: Kind, args_json: []const u8, opts: EnqueueOptions) Error!Enqueued {
-        const nj = try self.newJob(c.arena, def, args_json, opts);
+        const nj = try self.newJob(c.arena, def, args_json, try self.withTrace(c, opts));
         const r = self.backend.vt.insert(self.backend.ptr, self.now(), nj) catch |e| return self.storeError(c, e);
+        if (self.metrics) |mm| mm.onEnqueued(nj.queue, def.name, r.inserted);
         if (r.inserted) self.wakeQueue(nj.queue);
         return r;
     }
@@ -516,6 +604,7 @@ pub const Client = struct {
     fn runJob(self: *Client, box: *JobBox) Outcome {
         const row = box.row;
         const a = box.arena_state.allocator();
+        box.started = .now(self.io, .awake);
         const h = self.handlerFor(row.kind);
         const def: Kind = if (h) |hh| hh.kind else self.kindDefaults(row.kind);
         var id_buf: [32]u8 = undefined;
@@ -561,6 +650,10 @@ pub const Client = struct {
         return if (v == .string) v.string else null;
     }
 
+    fn took(self: *Client, box: *JobBox) std.Io.Duration {
+        return box.started.durationTo(.now(self.io, .awake)).raw;
+    }
+
     /// Writes the outcome of a run (J3's conditional state change).
     fn settle(self: *Client, box: *JobBox, def: Kind, result: anyerror!void) Outcome {
         const job = &box.job;
@@ -571,6 +664,10 @@ pub const Client = struct {
         const o = job.outcome;
         const interrupted = box.interrupted.load(.acquire);
         const lost = box.lost.load(.acquire);
+        if (job.completed_in and result != error.Canceled) {
+            if (self.metrics) |mm| mm.onFinished(row.queue, row.kind, .completed, took(self, box));
+            return .completed;
+        }
 
         if (lost) {
             log.info("{s}: no longer held (cancelled, or its lease expired); its run was stopped", .{job.id_text});
@@ -607,6 +704,21 @@ pub const Client = struct {
                 return .lost;
             }
             break;
+        }
+        if (self.metrics) |mm| {
+            const label: metrics_mod.Outcome = if (result) |_| switch (plan.outcome) {
+                .completed => .completed,
+                .retried => .retried,
+                .dead => .dead,
+                .snoozed => .snoozed,
+                else => .interrupted,
+            } else |err| if (err == error.Timeout or err == error.Canceled) .timeout else switch (plan.outcome) {
+                .retried => .retried,
+                .dead => .dead,
+                .snoozed => .snoozed,
+                else => .interrupted,
+            };
+            mm.onFinished(row.queue, row.kind, label, took(self, box));
         }
         if (plan.outcome == .dead) {
             // Tests expect dead jobs; an error line would fail them.
@@ -720,7 +832,9 @@ pub const Client = struct {
             box.task = placement.currentTask(self.io);
             self.held.put(self.gpa, box.row.id, box) catch {};
         }
+        if (self.metrics) |mm| mm.running.with(&.{box.queue.name}).add(1);
         _ = self.runJob(box);
+        if (self.metrics) |mm| mm.running.with(&.{box.queue.name}).add(-1);
         {
             self.held_mutex.lockUncancelable(self.io);
             defer self.held_mutex.unlock(self.io);
@@ -784,6 +898,7 @@ pub const Client = struct {
         const was = self.is_leader.load(.acquire);
         const lead = self.backend.vt.leaderTake(self.backend.ptr, self.worker_name, t, self.options.leader.ttl) catch false;
         self.is_leader.store(lead, .release);
+        if (self.metrics) |mm| mm.leader.with(&.{}).set(@intFromBool(lead));
         if (lead and !was) log.info("jobs: this process leads schedules and maintenance", .{});
         if (!lead and was) log.info("jobs: this process no longer leads schedules and maintenance", .{});
 
@@ -798,13 +913,27 @@ pub const Client = struct {
             self.last_rescue = ms;
             const rescued = self.backend.vt.rescue(self.backend.ptr, arena, t) catch &[_]store.Rescued{};
             report.rescued += @intCast(rescued.len);
+            if (self.metrics) |mm| mm.rescued.with(&.{"*"}).add(rescued.len);
             for (rescued) |r| log.info("job-{d}: its lease expired; {s}", .{ r.id, if (r.dead) "dead" else "put back" });
             if (rescued.len > 0) for (self.queues) |*q| q.signal.set(self.io);
+        }
+        if (lead and self.metrics != null and ms - self.last_gauges >= 15_000) {
+            self.last_gauges = ms;
+            self.reportGauges(arena);
         }
         if (lead and ms - self.last_prune >= 60_000) {
             self.last_prune = ms;
             report.pruned += self.backend.vt.prune(self.backend.ptr, t, self.options.keep) catch 0;
         }
+    }
+
+    /// The leader reports queue depth by state (§7.1).
+    fn reportGauges(self: *Client, arena: std.mem.Allocator) void {
+        const mm = self.metrics orelse return;
+        const rows = self.backend.vt.counts(self.backend.ptr, arena) catch return;
+        // States that have no row now read zero.
+        for (self.queues) |q| inline for (.{ "scheduled", "available", "running", "retrying", "dead" }) |st| mm.queued.with(&.{ q.name, st }).set(0);
+        for (rows) |r| mm.queued.with(&.{ r.queue, @tagName(r.state) }).set(@intCast(r.n));
     }
 
     // ---- cron
@@ -907,6 +1036,7 @@ pub const Client = struct {
         const res = try self.backend.vt.cronTick(self.backend.ptr, t, e.name, e.spec_text, tick, nj);
         if (res.enqueued) |en| if (en.inserted) {
             report.cron_enqueued += 1;
+            if (self.metrics) |mm| mm.onCron(e.name);
             self.wakeQueue(nj.queue);
             return true;
         };

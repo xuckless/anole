@@ -34,7 +34,7 @@ pub const Sqlite = struct {
         const self = try gpa.create(Sqlite);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .io = io, .client = client, .prefix = try gpa.dupe(u8, prefix), .sql_buf = .init(gpa) };
-        return .{ .ptr = self, .vt = &vtable, .transactional = true };
+        return .{ .ptr = self, .vt = &vtable, .transactional = true, .tx_kind = .sqlite, .owner = client };
     }
 
     const vtable: store.VTable = .{
@@ -59,6 +59,8 @@ pub const Sqlite = struct {
         .cronTick = cronTick,
         .leaderTake = leaderTake,
         .leaderRelease = leaderRelease,
+        .insertIn = insertIn,
+        .finishIn = finishInErased,
     };
 
     fn me(ptr: *anyopaque) *Sqlite {
@@ -333,6 +335,16 @@ pub const Sqlite = struct {
 
     pub fn finishIn(self: *Sqlite, tx: anytype, ctx: *db.Ctx, f: store.Finish) !bool {
         return self.finishOn(tx, ctx, f);
+    }
+
+    fn insertIn(ptr: *anyopaque, txp: *anyopaque, ctx: *db.Ctx, now: Time, job: store.NewJob) anyerror!root.Enqueued {
+        const tx: *sqlite.Tx = @ptrCast(@alignCast(txp));
+        return me(ptr).insertOn(tx, ctx, now, job);
+    }
+
+    fn finishInErased(ptr: *anyopaque, txp: *anyopaque, ctx: *db.Ctx, f: store.Finish) anyerror!bool {
+        const tx: *sqlite.Tx = @ptrCast(@alignCast(txp));
+        return me(ptr).finishOn(tx, ctx, f);
     }
 
     fn finish(ptr: *anyopaque, f: store.Finish) anyerror!bool {

@@ -89,6 +89,8 @@ pub const Options = struct {
     name: ?[]const u8 = null,
     /// Kinds known by name only (`enqueueRaw`, the ABI): their defaults.
     kinds: []const Kind = &.{},
+    /// How long a server drain lets running jobs finish before they are put back.
+    drain_timeout: Duration = .fromSeconds(10),
     /// Hook for every job that becomes dead (after its last attempt or a discard).
     on_dead: ?DeadHook = null,
 
@@ -245,6 +247,8 @@ pub const Job = struct {
     /// What the handler asked for (`snooze`, `discard`, `retryIn`, `explain`).
     outcome: Outcome = .{},
     cron_name: ?[]const u8 = null,
+    /// Set by `completeIn`: the run already completed the job in its own transaction.
+    completed_in: bool = false,
 
     pub const Outcome = struct {
         kind: enum { none, snooze, discard, retry_in } = .none,
@@ -287,6 +291,13 @@ pub const Job = struct {
     /// A message stored with the error if the handler then fails.
     pub fn explain(self: *Job, comptime fmt: []const u8, a: anytype) void {
         self.outcome.explanation = std.fmt.allocPrint(self.arena, fmt, a) catch "";
+    }
+    /// The `traceparent` of the request (or job) that enqueued it, or null.
+    pub fn traceparent(self: *const Job) ?[]const u8 {
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.arena, self.meta_json, .{}) catch return null;
+        if (parsed != .object) return null;
+        const v = parsed.object.get("traceparent") orelse return null;
+        return if (v == .string) v.string else null;
     }
     /// The cron schedule that made it, or null.
     pub fn cronName(self: *const Job) ?[]const u8 {
