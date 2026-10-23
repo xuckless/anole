@@ -51,7 +51,8 @@ fn early(req: *http.Request, res: *http.Response) !void {
 /// POST /upload: the body's length and a checksum.
 fn upload(req: *http.Request, res: *http.Response) !void {
     var reader_buf: [16 * 1024]u8 = undefined;
-    var r = try req.reader(&reader_buf);
+    // Uploads of any size: the test sends up to 5 MB.
+    var r = try req.readerLimited(&reader_buf, null);
     var buf: [16 * 1024]u8 = undefined;
     var total: usize = 0;
     var sum: u32 = 0;
@@ -67,7 +68,7 @@ fn upload(req: *http.Request, res: *http.Response) !void {
 /// POST /echo: the body back, as it arrives.
 fn echo(req: *http.Request, res: *http.Response) !void {
     var in_buf: [16 * 1024]u8 = undefined;
-    var body = try req.reader(&in_buf);
+    var body = try req.readerLimited(&in_buf, null);
     var out_buf: [16 * 1024]u8 = undefined;
     var out = try res.stream(&out_buf);
     _ = body.interface.streamRemaining(&out.interface) catch |err| switch (err) {

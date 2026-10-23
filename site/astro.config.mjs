@@ -41,6 +41,7 @@ export default defineConfig({
 						'auth',
 						'observability',
 						'from-fiber',
+						'migrating',
 						'c-abi',
 					],
 				},

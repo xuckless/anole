@@ -16,7 +16,10 @@ pub const std_options: std.Options = .{
 };
 
 fn echo(req: *anole.Request, res: *anole.Response) !void {
-    var ws = (try anole.websocket.upgrade(req, res, .{})) orelse {
+    var ws = (try anole.websocket.upgrade(req, res, .{
+        // Autobahn's case 9 sends messages up to 16 MiB.
+        .max_message_size = 16 * 1024 * 1024,
+    })) orelse {
         res.status = .bad_request;
         return;
     };

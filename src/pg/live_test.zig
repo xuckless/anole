@@ -733,6 +733,9 @@ test "pg: live app.postgres: handlers, statuses, /readyz and /metrics" {
 
 test "pg: iterate over a bare BEGIN fails left-open; acquire released in a transaction rolls back" {
     _ = try testUrl();
+    // The left-open transaction is logged at err on purpose.
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();

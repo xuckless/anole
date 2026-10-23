@@ -6,7 +6,7 @@ breaking changes are listed anyway.
 ## Unreleased
 
 The API review before the Node and Python bindings: every breaking change
-of 0.2 is listed below, and [docs/migrating-to-0.2.md](docs/migrating-to-0.2.md)
+of 0.2 is listed below, and [docs/migrating.md](docs/migrating.md)
 has the old -> new table for each area. The C ABI is now 0.7.
 
 ### Breaking
@@ -115,7 +115,7 @@ has the old -> new table for each area. The C ABI is now 0.7.
   `grpc-status-details-bin` as initial metadata (it was sent as a header,
   which no client reads).
 
-The migration table is in [docs/migrating-to-0.2.md](docs/migrating-to-0.2.md)
+The migration table is in [docs/migrating.md](docs/migrating.md)
 and docs/c-abi.md ("From ABI 0.6").
 
 - Before 1.0 a library serves only code built against the same ABI version,
