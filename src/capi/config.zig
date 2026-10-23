@@ -343,6 +343,11 @@ pub const Config = struct {
         /// What `anole_nats_find` looks it up by: unique, 1-255 bytes.
         name: []const u8,
         /// Exactly one of the kinds (`nats`).
+        // TODO(dx/kafka, lane B2): add `kafka: ?Kafka = null` and make the
+        // check in `validate` "exactly one of nats or kafka". Not done at the
+        // phase-A merge: src/capi/nats.zig reads `config.nats.?` for every
+        // broker, so a Kafka-only entry must not pass before Kafka's engine
+        // wiring exists.
         nats: ?Nats = null,
         /// A bound on requests and JetStream calls that have no timeout_ms of
         /// their own. 0: none.

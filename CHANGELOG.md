@@ -5,21 +5,11 @@ breaking changes are listed anyway.
 
 ## 0.3.0 (unreleased)
 
-Developer experience: settings, `.env` files and deployment modes.
+Developer experience: settings, `.env` files and deployment modes, retries
+and circuit breakers, the NATS and Kafka clients, and the groundwork for
+OpenAPI documents and the `anole` command line.
 
-### Breaking
-
-- `ServerOptions.listen_tls_http3`, `http.address`, `http.port`,
-  `http.proxy_protocol`, `https.address`, `https.proxy_protocol`,
-  `Listener.address`, `Listener.port` and `Listener.proxy_protocol` are
-  optional; null means the deployment's default (0.2's values when
-  standalone). Code that only sets them is unchanged; code that reads them
-  unwraps. JSON: `listeners[].address`, `port` and `proxy_protocol` default
-  to null.
-- `timeouts.keepalive` (`keepalive_ms`) defaults to 75 s, up from 60 s, so it
-  sits above the idle timeout of nginx and AWS load balancers.
-
-### Added
+### Config and modes
 
 - `anole.config.load(T, init, .{})`: typed settings from defaults,
   per-environment defaults, a JSON or INI file, `.env` files and the
@@ -37,28 +27,76 @@ Developer experience: settings, `.env` files and deployment modes.
   network or name; the client is the rightmost untrusted X-Forwarded-For
   address; one warning for the first request that bypasses the proxy.
 - `error_detail`: 500 answers name the error in development.
-- C ABI: `anole_dotenv_read`; JSON keys `environment`, `deployment`,
-  `error_detail` and `proxy.trusted`.
+- Changed: X-Forwarded-For entries with a port give the address instead of
+  0.0.0.0.
+- Changed: with `proxy_protocol` on and no `proxy_protocol_from`, only
+  `proxy.trusted` peers may connect when `proxy.trusted` is set (any peer
+  otherwise, as before).
 
-### Changed
+### Resilience
 
-- X-Forwarded-For entries with a port give the address instead of 0.0.0.0.
-- With `proxy_protocol` on and no `proxy_protocol_from`, only `proxy.trusted`
-  peers may connect when `proxy.trusted` is set (any peer otherwise, as
-  before).
-### Added
-
-- `anole.resilience`: retries with backoff and jitter, retry throttling and circuit breakers, used by the HTTP client (`ClientOptions.retry`, `.breaker`; `FetchOptions.retry`, `.idempotent`), gRPC channels (`Channel.retry`, `.breaker`, `Channel.connect` with redial) and the database connectors (`Options.breaker`, `Options.retry`, `with(.{ .retry = true })`).
+- `anole.resilience`: retries with backoff and jitter, retry throttling and
+  circuit breakers, used by the HTTP client (`ClientOptions.retry`,
+  `.breaker`; `FetchOptions.retry`, `.idempotent`), gRPC channels
+  (`Channel.retry`, `.breaker`, `Channel.connect` with redial) and the
+  database connectors (`Options.breaker`, `Options.retry`,
+  `with(.{ .retry = true })`).
 - HTTP/2 and HTTP/3 client `Stream.unprocessed()`.
-- `anole.nats` (`-Dnats`, on in `full`): NATS publish (never waits), request/reply, handlers with queue groups, TLS, token, NKey and `.creds` logins, and JetStream publish with ack and pull consumers. The client is adapted from zefir (MIT). `app.nats(.{})`.
-- C ABI: `"brokers"` in the configuration, `anole_nats_*`, events `ANOLE_EV_NATS_MSG`, `_REPLY`, `_JS_MSG`, `_SUB_END` and `_WRITABLE` (64-69), handle kinds for subscriptions and messages, `ANOLE_E_BROKER`, `ANOLE_DB_F_RETRY`, `"breaker"` and `"retry"` on databases.
+- Changed: PostgreSQL, Redis and MongoDB calls fail fast with 503
+  (`lastError` code `circuit_open`) after 5 connection failures in a row,
+  for 5 s and then while probes fail (up to 60 s). Set `breaker = null`
+  (`"breaker": null`) for the old behaviour.
 
-### Changed
+### Messaging: NATS
 
-- PostgreSQL, Redis and MongoDB calls fail fast with 503 (`lastError` code `circuit_open`) after 5 connection failures in a row, for 5 s and then while probes fail (up to 60 s). Set `breaker = null` (`"breaker": null`) for the old behaviour.
-- `anole.db.System` has `nats` and `kafka`; an exhaustive `switch` on it needs the two new cases.
+- `anole.nats` (`-Dnats`, on in `full`): NATS publish (never waits),
+  request/reply, handlers with queue groups, TLS, token, NKey and `.creds`
+  logins, and JetStream publish with ack and pull consumers. The client is
+  adapted from zefir (MIT). `app.nats(.{})`.
 
-## Unreleased
+### Messaging: Kafka
+
+- `anole.kafka` (`-Dkafka`, on in `full`; needs `-Dcompression`): Anole's own
+  Kafka client on std.Io, no librdkafka. Produce (acks 0, 1 or all,
+  idempotent by default, batching, gzip/zstd/lz4, Java's partitioner),
+  consumer groups with offset commits and a dead letter topic, TLS and SASL
+  PLAIN/SCRAM. `send` queues and never waits; `produce` waits for the
+  acknowledgement. `app.kafka(.{})` reads `KAFKA_BOOTSTRAP_SERVERS`.
+
+### OpenAPI and CLI
+
+- `-Dopenapi` (on in `web` and `full`) and `anole.openapi`, the building
+  blocks of OpenAPI 3.1 documents (schemas of Zig types, protobuf messages
+  and services, the Scalar page). Adapted from zefir.
+- Generated protobuf code carries the `.proto` comments as `_doc`
+  declarations (zig-protobuf pinned to xuckless/zig-protobuf e6de363).
+- The `anole` command line (`zig build cli`): `anole new <dir>` makes a
+  project from a template, `anole templates`, `anole version`.
+
+### C ABI
+
+- `anole_dotenv_read`; JSON keys `environment`, `deployment`,
+  `error_detail` and `proxy.trusted`.
+- `"brokers"` in the configuration, `anole_nats_*`, events
+  `ANOLE_EV_NATS_MSG`, `_REPLY`, `_JS_MSG`, `_SUB_END` and `_WRITABLE`
+  (64-69), handle kinds for subscriptions and messages, `ANOLE_E_BROKER`,
+  `ANOLE_DB_F_RETRY`, `"breaker"` and `"retry"` on databases.
+
+### Breaking
+
+- `ServerOptions.listen_tls_http3`, `http.address`, `http.port`,
+  `http.proxy_protocol`, `https.address`, `https.proxy_protocol`,
+  `Listener.address`, `Listener.port` and `Listener.proxy_protocol` are
+  optional; null means the deployment's default (0.2's values when
+  standalone). Code that only sets them is unchanged; code that reads them
+  unwraps. JSON: `listeners[].address`, `port` and `proxy_protocol` default
+  to null.
+- `timeouts.keepalive` (`keepalive_ms`) defaults to 75 s, up from 60 s, so it
+  sits above the idle timeout of nginx and AWS load balancers.
+- `anole.db.System` has `nats` and `kafka`; an exhaustive `switch` on it
+  needs the two new cases.
+
+## 0.2.1 (unreleased)
 
 The relay pass: cross-task WebSocket sends, fan-out, TLS and HTTP/2
 WebSocket overhead, and HTTP/3 and WebTransport memory and wake-ups. The C

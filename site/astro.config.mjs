@@ -39,6 +39,8 @@ export default defineConfig({
 						'grpc',
 						'clients',
 						'database',
+						'messaging',
+						'resilience',
 						'auth',
 						'observability',
 						'from-fiber',

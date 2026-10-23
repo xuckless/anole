@@ -29,6 +29,8 @@ PAGES = {
     "grpc.md": ("gRPC", "gRPC services, gRPC-Web, Connect and JSON transcoding."),
     "clients.md": ("Clients", "Outbound HTTP/1.1, HTTP/2, HTTP/3 and gRPC from a handler."),
     "database.md": ("Database", "PostgreSQL, SQLite, MongoDB and Redis, and the opt-in caches."),
+    "messaging.md": ("Messaging", "Message brokers: NATS publish, request/reply, handlers and JetStream."),
+    "resilience.md": ("Resilience", "Retries, retry throttling and circuit breakers for clients, databases and brokers."),
     "auth.md": ("Auth", "JWT, OIDC sign-in, sessions, CSRF, API keys, roles and rate limits."),
     "observability.md": ("Observability", "Access logs, Prometheus metrics, OpenTelemetry tracing, health checks."),
     "from-fiber.md": ("From-Fiber", "Fiber's API next to Anole's."),

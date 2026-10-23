@@ -2,8 +2,9 @@
 
 ## 0.2 to 0.3
 
-0.3 adds settings, `.env` files and deployment modes. Nothing you set is
-changed; the table lists what reads differently.
+0.3 adds settings, `.env` files, deployment modes, retries and circuit
+breakers, and the NATS and Kafka clients. Nothing you set is changed; the
+table lists what reads or behaves differently.
 
 | 0.2 | 0.3 |
 | --- | --- |
@@ -15,16 +16,10 @@ changed; the table lists what reads differently.
 | A Debug build read no `.env` | a Debug build is `development` and reads `.env` files from the working directory; `ANOLE_ENV=production` or `.env_files = &.{}` turns that off |
 | A Debug build's 500s said `Internal Server Error` | they name the error (`error_detail`, development); `.error_detail = false` keeps 0.2's |
 | `timeouts.keepalive` 60 s | 75 s (set `.timeouts = .{ .keepalive = .fromSeconds(60) }` for the old value) |
+| PostgreSQL, Redis and MongoDB calls tried to connect every time while the database was down | a circuit breaker is on by default: after 5 connection failures in a row calls fail at once with 503 (`lastError` code `circuit_open`); `.breaker = null` (`"breaker": null` in the C ABI) keeps 0.2's behaviour |
+| An exhaustive `switch` on `anole.db.System` | add the cases `.nats` and `.kafka` |
 
 ## 0.1 to 0.2
-# Migrating from 0.2 to 0.3
-
-## Resilience
-
-- Database connectors now have a circuit breaker (on by default): after repeated connection failures calls fail at once with 503 (`lastError` code `circuit_open`). Opt out with `.breaker = null` (`"breaker": null` in the C ABI).
-- `anole.db.System` gained `nats` and `kafka`; add the cases to an exhaustive `switch`.
-
-# Migrating from 0.1 to 0.2
 
 0.2 batches the breaking changes of the API review. Each area has its section
 below; the changelog lists the rest. Before 1.0 there is no stability promise,

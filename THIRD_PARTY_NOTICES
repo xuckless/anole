@@ -388,7 +388,7 @@ src/config/ (typed configuration: anole.config, anole.Secret, the .env parser)
 C. MIT licence text (applies to every MIT component above)
 -----------------------------------------------------------
 
-zefir (src/config): Copyright (c) 2026 vkiryakov
+zefir (src/config, src/nats/core, src/openapi): Copyright (c) 2026 vkiryakov
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
