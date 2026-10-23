@@ -491,3 +491,79 @@ test "PerExecutor: one pool off zio" {
     try testing.expectEqual(@as(usize, 25), pools.share(25, 0));
     try testing.expect(pools.get(testing.io) == &pools.pools[0]);
 }
+
+const guard_test = struct {
+    var calls: u32 = 0;
+    var mode: enum { down, pool, unique, flaky } = .down;
+
+    fn run(c: *db.Ctx) db.Error!u8 {
+        calls += 1;
+        switch (mode) {
+            .down => return fail(c, .{}, .{ .system = .redis, .class = .unavailable, .code = "conn", .message = "down" }),
+            .pool => return fail(c, .{}, .{ .system = .redis, .class = .unavailable, .code = "pool_timeout", .message = "busy" }),
+            .unique => return fail(c, .{}, .{ .system = .redis, .class = .unique, .code = "23505", .message = "dup" }),
+            .flaky => {
+                if (calls < 3) return fail(c, .{}, .{ .system = .redis, .class = .unavailable, .code = "conn", .message = "down" });
+                return 7;
+            },
+        }
+    }
+};
+
+fn guardCtx(arena: *std.heap.ArenaAllocator) db.Ctx {
+    return .{ .io = testing.io, .arena = arena.allocator() };
+}
+
+test "guarded: unavailable failures open the breaker; the next call is ServiceUnavailable with code circuit_open and no call" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var ctx = guardCtx(&arena);
+    var g: Guard = try .init(.redis, "t", .{ .consecutive_failures = 3 }, .{});
+    defer g.deinit();
+    guard_test.calls = 0;
+    guard_test.mode = .down;
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    for (0..3) |_| try testing.expectError(error.ServiceUnavailable, guarded(&ctx, &g, .{}, false, null, guard_test.run, .{&ctx}));
+    try testing.expectEqual(@as(u32, 3), guard_test.calls);
+    try testing.expectError(error.ServiceUnavailable, guarded(&ctx, &g, .{}, false, null, guard_test.run, .{&ctx}));
+    try testing.expectEqual(@as(u32, 3), guard_test.calls);
+    try testing.expectEqualStrings("circuit_open", lastError(&ctx).?.code);
+}
+
+test "guarded: pool_timeout and answers from a live server never open it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var ctx = guardCtx(&arena);
+    var g: Guard = try .init(.redis, "t", .{ .consecutive_failures = 2 }, .{});
+    defer g.deinit();
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    guard_test.calls = 0;
+    guard_test.mode = .pool;
+    for (0..5) |_| try testing.expectError(error.ServiceUnavailable, guarded(&ctx, &g, .{}, false, null, guard_test.run, .{&ctx}));
+    guard_test.mode = .unique;
+    for (0..5) |_| try testing.expectError(error.Conflict, guarded(&ctx, &g, .{}, false, null, guard_test.run, .{&ctx}));
+    try testing.expectEqual(@as(u32, 10), guard_test.calls);
+    try testing.expectEqual(resilience.Breaker.State.closed, g.breaker.?.state());
+}
+
+test "guarded: with retry a transient failure is run again until it succeeds; without it, once" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var ctx = guardCtx(&arena);
+    var g: Guard = try .init(.redis, "t", null, .{ .attempts = 5, .backoff = .{ .base = .fromMilliseconds(1), .max = .fromMilliseconds(1), .jitter = .none } });
+    defer g.deinit();
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    guard_test.mode = .flaky;
+    guard_test.calls = 0;
+    try testing.expectError(error.ServiceUnavailable, guarded(&ctx, &g, .{}, false, null, guard_test.run, .{&ctx}));
+    try testing.expectEqual(@as(u32, 1), guard_test.calls);
+    guard_test.calls = 0;
+    try testing.expectEqual(@as(u8, 7), try guarded(&ctx, &g, .{}, true, null, guard_test.run, .{&ctx}));
+    try testing.expectEqual(@as(u32, 3), guard_test.calls);
+}

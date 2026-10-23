@@ -87,3 +87,52 @@ test "capi config: mongodb max_connections 0 is E_CONFIG; sqlite statement_cache
         \\{"databases":[{"name":"s","sqlite":{"path":":memory:","statement_cache":8}}]}
     , &why2));
 }
+
+test "capi config: brokers parse with the defaults, and bad combinations are E_CONFIG" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [512]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    if (comptime features.nats) {
+        const cfg = try config.parse(arena.allocator(),
+            \\{"brokers":[{"name":"events","nats":{"url":"nats://127.0.0.1:4222","jetstream":{"streams":[{"name":"ORDERS","subjects":["orders.>"]}]}}}]}
+        , &why);
+        try std.testing.expectEqual(@as(usize, 1), cfg.brokers.len);
+        try std.testing.expectEqual(@as(u32, 30_000), cfg.brokers[0].timeout_ms);
+        try std.testing.expectEqual(@as(u8, 5), cfg.brokers[0].retry.attempts);
+        try std.testing.expectEqualStrings("one", cfg.brokers[0].nats.?.connections);
+        try std.testing.expectEqual(@as(usize, 1), cfg.brokers[0].nats.?.jetstream.streams.len);
+        try std.testing.expectEqualStrings("limits", cfg.brokers[0].nats.?.jetstream.streams[0].retention);
+    }
+    for ([_][]const u8{
+        \\{"brokers":[{"name":"e"}]}
+        ,
+        \\{"brokers":[{"name":"e","nats":{"token":"a","user":"u","password":"p"}}]}
+        ,
+        \\{"brokers":[{"name":"e","nats":{"connections":"many"}}]}
+        ,
+        \\{"brokers":[{"name":"e","nats":{}},{"name":"e","nats":{}}]}
+        ,
+        \\{"brokers":[{"name":"e","nats":{"ca_file":"a","ca_pem":"b"}}]}
+        ,
+    }) |text| {
+        var w: std.Io.Writer = .fixed(&buf);
+        try std.testing.expectError(error.Config, config.parse(arena.allocator(), text, &w));
+    }
+}
+
+test "capi config: databases breaker and retry default to Zig's, and breaker null turns it off" {
+    if (comptime !features.redis) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [512]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    const cfg = try config.parse(arena.allocator(),
+        \\{"databases":[{"name":"a","redis":{}},{"name":"b","redis":{},"breaker":null,"retry":{"attempts":2}}]}
+    , &why);
+    const defaults = anole.resilience.Breaker.Options{};
+    try std.testing.expectEqual(defaults.consecutive_failures, cfg.databases[0].breaker.?.consecutive_failures);
+    try std.testing.expectEqual(@as(u32, @intCast(@divTrunc(defaults.open_for.nanoseconds, std.time.ns_per_ms))), cfg.databases[0].breaker.?.open_ms);
+    try std.testing.expect(cfg.databases[1].breaker == null);
+    try std.testing.expectEqual(@as(u8, 2), cfg.databases[1].retry.attempts);
+}
