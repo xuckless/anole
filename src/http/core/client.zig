@@ -16,7 +16,7 @@ const build_options = @import("build_options");
 /// `ClientOptions.http2` offers "h2" through ALPN, and a connection on which
 /// the server picks it is handed to it after the handshake.
 const h2_client = @import("h2_client");
-const has_h2_client = build_options.use_tls and !@hasDecl(h2_client, "is_stub");
+const has_h2_client = !@hasDecl(h2_client, "is_stub");
 
 const unix_path_max = 108;
 
