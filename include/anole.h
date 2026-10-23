@@ -1013,7 +1013,8 @@ enum {
 
 /* Metadata (anole_header name/value pairs) a consumer sends: a lower-case
    key (letters, digits, '-', '_', '.'), not the protocols' own (grpc-*
-   except grpc-status-details-bin, connect-*, trailer-*, content-type, te,
+   except grpc-status-details-bin and grpc-retry-pushback-ms in trailers,
+   connect-*, trailer-*, content-type, te,
    HTTP's framing); a printable ASCII value, except under a key ending in
    "-bin", whose value is bytes (Anole base64-encodes them). Copied.
    ANOLE_E_INVALID otherwise. */

@@ -201,8 +201,8 @@ spec's table (401 UNAUTHENTICATED, 403 PERMISSION_DENIED, 429 UNAVAILABLE,
 A call's strings are copied: `call.fail(code, message)`, `call.failFmt(code,
 fmt, args)`, `call.addHeader` and `call.addTrailer` keep their own copies, so a
 message formatted into a stack buffer is safe. `addHeader` and `addTrailer`
-refuse the protocols' own keys (`grpc-*` but `grpc-status-details-bin` in
-trailers, `connect-*`, `trailer-*`, `content-type`, `te` and the transport's
+refuse the protocols' own keys (`grpc-*` but `grpc-status-details-bin` and
+`grpc-retry-pushback-ms` in trailers, `connect-*`, `trailer-*`, `content-type`, `te` and the transport's
 headers) with `error.InvalidMetadata`; `addHeader` adds a value, so a repeated
 key keeps every value.
 
