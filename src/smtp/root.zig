@@ -53,10 +53,8 @@ const os = @import("../console/os.zig");
 const errors = @import("../errors.zig");
 const placement = dusty.placement;
 
-const address = @import("address.zig");
 const session_mod = @import("session.zig");
 const pool_mod = @import("pool.zig");
-const mime = @import("mime.zig");
 
 pub const testing = @import("testing.zig");
 
@@ -67,6 +65,11 @@ const Pool = pool_mod.Pool;
 const Ctx = session_mod.Ctx;
 
 const has_tls = features.tls == .boringssl;
+
+/// Mailbox parsing and message composing, for the C ABI (`src/capi/smtp.zig`),
+/// which checks a message on its caller's thread before queueing it.
+pub const address = @import("address.zig");
+pub const mime = @import("mime.zig");
 
 pub const Header = mime.Header;
 pub const Message = mime.Message;
@@ -150,6 +153,8 @@ pub const Sent = struct {
     rejected: []const Rejected,
     /// The server's answer to the final ".", often its queue id.
     response: []const u8,
+    /// The reply code of that answer (250).
+    code: u16 = 250,
 };
 
 pub const Rejected = session_mod.Session.Rejected;
@@ -208,7 +213,10 @@ pub const Client = struct {
     readiness: db.Readiness,
     readiness_on: bool,
     group: std.Io.Group = .init,
+    /// No new sends are taken (`stopAccepting`, `drain`).
     draining: std.atomic.Value(bool) = .init(false),
+    /// `drain` has run.
+    drained: std.atomic.Value(bool) = .init(false),
     inflight: std.atomic.Value(u32) = .init(0),
     started: bool = false,
 
@@ -289,7 +297,8 @@ pub const Client = struct {
     /// Stops accepting sends, lets those in flight finish (until
     /// `deadline`), and QUITs the idle connections. `deinit` calls it.
     pub fn drain(self: *Client, deadline: std.Io.Clock.Timestamp) void {
-        if (self.draining.swap(true, .acq_rel)) return;
+        if (self.drained.swap(true, .acq_rel)) return;
+        self.draining.store(true, .release);
         const io = self.io;
         while (self.inflight.load(.acquire) > 0) {
             if (deadline.untilNow(io).raw.nanoseconds >= 0) break;
@@ -300,6 +309,12 @@ pub const Client = struct {
         }
         self.group.cancel(io);
         _ = self.closeIdle();
+    }
+
+    /// Refuses new sends from now on (a send in flight finishes) without
+    /// waiting for anything: the start of a drain.
+    pub fn stopAccepting(self: *Client) void {
+        self.draining.store(true, .release);
     }
 
     /// Closes the connections now idle (QUIT, then the socket), for a
@@ -363,7 +378,8 @@ pub const Client = struct {
         var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
         const ctx = erase(&c);
         const deadline: dusty.Deadline = .init(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
-        return deadline.run(Session.probe, .{ self.gpa, &ctx, self.errors, &self.settings }) catch false;
+        deadline.run(Session.probe, .{ self.gpa, &ctx, self.errors, &self.settings }) catch return false;
+        return true;
     }
 
     // -- calls ------------------------------------------------------------------
@@ -519,6 +535,7 @@ pub const Client = struct {
                 .accepted = out.accepted,
                 .rejected = out.rejected,
                 .response = out.response,
+                .code = out.code,
             };
         }
     }

@@ -148,6 +148,8 @@ pub const EventType = enum(u32) {
     // ---- end p3/s3 ----
 
     // ---- p3/smtp ----
+    /// p3/smtp: the answer to anole_smtp_send.
+    smtp_result = 126,
     // ---- end p3/smtp ----
 
     // ---- p3/lambda ----
@@ -733,6 +735,95 @@ pub const KafkaAssignEvent = extern struct {
 // ---- end p3/s3 ----
 
 // ---- p3/smtp ----
+
+// ---- Mail (SMTP) -----------------------------------------------------------
+
+/// `anole_smtp_options.flags`: retry transient failures before the final
+/// "." (a failure after it is never retried).
+pub const SMTP_F_RETRY: u32 = 1;
+/// `anole_smtp_attachment.flags`: an inline part (with `content_id`).
+pub const SMTP_ATTACH_F_INLINE: u32 = 1;
+
+/// One attachment of an `anole_smtp_message`: `data` (copied) or `path` (a
+/// file read while sending).
+pub const SmtpAttachment = extern struct {
+    size: usize,
+    filename: Str = .{},
+    content_type: Str = .{},
+    data: ?[*]const u8 = null,
+    len: usize = 0,
+    path: Str = .{},
+    content_id: Str = .{},
+    flags: u32 = 0,
+    reserved: u32 = 0,
+};
+
+/// A message for Anole to compose (`anole_smtp_send`).
+pub const SmtpMessage = extern struct {
+    size: usize,
+    from: Str = .{},
+    reply_to: Str = .{},
+    to: ?[*]const Str = null,
+    nto: usize = 0,
+    cc: ?[*]const Str = null,
+    ncc: usize = 0,
+    bcc: ?[*]const Str = null,
+    nbcc: usize = 0,
+    subject: Str = .{},
+    text: Str = .{},
+    html: Str = .{},
+    headers: ?[*]const Header = null,
+    nheaders: usize = 0,
+    attachments: ?[*]const SmtpAttachment = null,
+    nattachments: usize = 0,
+    envelope_from: Str = .{},
+    message_id: Str = .{},
+};
+
+pub const SmtpOptions = extern struct {
+    size: usize,
+    flags: u32 = 0,
+    /// 0: the mail entry's timeout_ms; DB_TIMEOUT_NONE: none.
+    timeout_ms: u32 = 0,
+    /// The request this send serves (0: none): the send is cut with it.
+    req: u64 = 0,
+};
+
+/// ANOLE_EV_SMTP_RESULT: the answer to anole_smtp_send or
+/// anole_smtp_send_raw. `rejected_off` counts from the start of the record.
+pub const SmtpResultEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    reserved8: u8,
+    smtp_code: u16,
+    reserved16: u16,
+    nrejected: u32,
+    message_id: Span,
+    response: Span,
+    rejected_off: u32,
+    reserved: u32,
+    @"error": Span,
+    error_code: Span,
+};
+
+pub const SmtpRejected = extern struct {
+    address: Span,
+    code: u16,
+    reserved: u16,
+    reserved2: u32,
+    message: Span,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(SmtpAttachment) == 96);
+    std.debug.assert(@sizeOf(SmtpMessage) == 200);
+    std.debug.assert(@sizeOf(SmtpOptions) == 24);
+    std.debug.assert(@sizeOf(SmtpResultEvent) == 80);
+    std.debug.assert(@sizeOf(SmtpRejected) == 24);
+}
 // ---- end p3/smtp ----
 
 // ---- p3/lambda ----
@@ -937,6 +1028,11 @@ pub const records = .{
     // ---- end p3/s3 ----
 
     // ---- p3/smtp ----
+    .{ "anole_smtp_attachment", SmtpAttachment },
+    .{ "anole_smtp_message", SmtpMessage },
+    .{ "anole_smtp_options", SmtpOptions },
+    .{ "anole_smtp_result_event", SmtpResultEvent },
+    .{ "anole_smtp_rejected", SmtpRejected },
     // ---- end p3/smtp ----
 
     // ---- p3/lambda ----
@@ -983,6 +1079,7 @@ pub const arrays = [_]ArrayInfo{
     // ---- end p3/s3 ----
 
     // ---- p3/smtp ----
+    .{ .record = "anole_smtp_result_event", .name = "rejected", .at = "rejected_off", .item = "anole_smtp_rejected", .count = "nrejected" },
     // ---- end p3/smtp ----
 
     // ---- p3/lambda ----
@@ -1078,6 +1175,7 @@ pub const events = [_]EventInfo{
     // ---- end p3/s3 ----
 
     // ---- p3/smtp ----
+    .{ .type = 126, .name = "ANOLE_EV_SMTP_RESULT", .record = "anole_smtp_result_event" },
     // ---- end p3/smtp ----
 
     // ---- p3/lambda ----
@@ -1174,6 +1272,8 @@ pub const constant_groups = [_]ConstantGroup{
     // ---- end p3/s3 ----
 
     // ---- p3/smtp ----
+    .{ .prefix = "ANOLE_SMTP_ATTACH_F_", .group = "smtp_attach_flag" },
+    .{ .prefix = "ANOLE_SMTP_F_", .group = "smtp_flag" },
     // ---- end p3/smtp ----
 
     // ---- p3/lambda ----

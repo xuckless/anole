@@ -113,8 +113,8 @@ fn withRuntime(t: Target, comptime body: anytype) !void {
 }
 
 test "mailpit: text, html, an attachment and an inline image arrive as composed" {
-    const t = try plain();
-    try withRuntime(t, struct {
+    const target = try plain();
+    try withRuntime(target, struct {
         fn run(io: std.Io, t: Target) !void {
             try clear(io, t);
             const client = try open(io, t, .{});
@@ -155,8 +155,8 @@ test "mailpit: text, html, an attachment and an inline image arrive as composed"
 }
 
 test "mailpit: twenty messages over one connection, pipelined" {
-    const t = try plain();
-    try withRuntime(t, struct {
+    const target = try plain();
+    try withRuntime(target, struct {
         fn run(io: std.Io, t: Target) !void {
             try clear(io, t);
             const client = try open(io, t, .{ .max_connections = 1 });
@@ -176,8 +176,8 @@ test "mailpit: twenty messages over one connection, pipelined" {
 }
 
 test "mailpit: a message composed elsewhere goes through sendRaw" {
-    const t = try plain();
-    try withRuntime(t, struct {
+    const target = try plain();
+    try withRuntime(target, struct {
         fn run(io: std.Io, t: Target) !void {
             try clear(io, t);
             const client = try open(io, t, .{});
@@ -199,8 +199,8 @@ test "mailpit: a message composed elsewhere goes through sendRaw" {
 
 test "mailpit: STARTTLS with AUTH PLAIN" {
     if (comptime features.tls != .boringssl) return error.SkipZigTest;
-    const t = try starttls();
-    try withRuntime(t, struct {
+    const target = try starttls();
+    try withRuntime(target, struct {
         fn run(io: std.Io, t: Target) !void {
             try clear(io, t);
             const client = try open(io, t, .{});
@@ -218,8 +218,8 @@ test "mailpit: STARTTLS with AUTH PLAIN" {
 
 test "mailpit: implicit TLS" {
     if (comptime features.tls != .boringssl) return error.SkipZigTest;
-    const t = try smtps();
-    try withRuntime(t, struct {
+    const target = try smtps();
+    try withRuntime(target, struct {
         fn run(io: std.Io, t: Target) !void {
             try clear(io, t);
             const client = try open(io, t, .{});

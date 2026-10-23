@@ -127,17 +127,21 @@ const Builder = struct {
     }
 };
 
-/// Composes `msg`. `fail` says what is wrong when this returns
-/// `error.Invalid`.
-pub fn compose(
-    arena: Allocator,
-    io: std.Io,
-    msg: Message,
-    defaults: Defaults,
-    random: std.Random,
-    now: i64,
-    fail: *Failure,
-) Error!Composed {
+/// What `prepare` found out about a message's addresses.
+const Prepared = struct {
+    from: address.Mailbox,
+    to_boxes: []const address.Mailbox,
+    cc_boxes: []const address.Mailbox,
+    reply_to: ?address.Mailbox,
+    recipients: []const []const u8,
+    envelope_from: []const u8,
+    utf8: bool,
+};
+
+/// Checks everything about `msg` that needs no rendering: the addresses,
+/// the header values, the attachments' names. `fail` says what is wrong
+/// when this returns `error.Invalid`.
+fn prepare(arena: Allocator, msg: Message, defaults: Defaults, fail: *Failure) Error!Prepared {
     // Addresses.
     const from_text = msg.from orelse defaults.from orelse
         return invalid(fail, "invalid_address", "the message has no From address: set Message.from or Options.from (SMTP_FROM)");
@@ -179,6 +183,39 @@ pub fn compose(
     for (msg.headers) |h| try checkExtraHeader(fail, h);
     if (msg.message_id) |id| try checkMessageId(fail, id);
     for (msg.attachments) |a| try checkAttachment(fail, a);
+    return .{
+        .from = from,
+        .to_boxes = to_boxes.items,
+        .cc_boxes = cc_boxes.items,
+        .reply_to = reply_to,
+        .recipients = recipients.items,
+        .envelope_from = envelope_from,
+        .utf8 = utf8,
+    };
+}
+
+/// `prepare` without composing: for a caller that wants to refuse a message
+/// at once (the C ABI, on its caller's thread) and compose it later.
+pub fn validate(arena: Allocator, msg: Message, defaults: Defaults, fail: *Failure) Error!void {
+    _ = try prepare(arena, msg, defaults, fail);
+}
+
+/// Composes `msg`. `fail` says what is wrong when this returns
+/// `error.Invalid`.
+pub fn compose(
+    arena: Allocator,
+    io: std.Io,
+    msg: Message,
+    defaults: Defaults,
+    random: std.Random,
+    now: i64,
+    fail: *Failure,
+) Error!Composed {
+    const p = try prepare(arena, msg, defaults, fail);
+    const from = p.from;
+    const recipients = p.recipients;
+    const utf8 = p.utf8;
+    const envelope_from = p.envelope_from;
 
     var message_id: []const u8 = undefined;
     if (msg.message_id) |id| {
@@ -194,9 +231,9 @@ pub fn compose(
 
     // The headers.
     try writeMailboxes(arena, w, "From", &.{from});
-    try writeMailboxes(arena, w, "To", to_boxes.items);
-    try writeMailboxes(arena, w, "Cc", cc_boxes.items);
-    if (reply_to) |r| try writeMailboxes(arena, w, "Reply-To", &.{r});
+    try writeMailboxes(arena, w, "To", p.to_boxes);
+    try writeMailboxes(arena, w, "Cc", p.cc_boxes);
+    if (p.reply_to) |r| try writeMailboxes(arena, w, "Reply-To", &.{r});
     if (msg.subject.len > 0) {
         var ve = encode.ValueEncoder.init(msg.subject, false);
         if (longestWord(msg.subject) > 70) ve.encoder = .base64;
@@ -255,7 +292,7 @@ pub fn compose(
         .parts = b.parts.items,
         .size = b.size,
         .envelope_from = envelope_from,
-        .recipients = recipients.items,
+        .recipients = recipients,
         .message_id = message_id,
         .utf8 = utf8,
     };
@@ -568,6 +605,19 @@ pub fn writeData(c: *const Composed, io: std.Io, w: *Writer) WriteError!void {
 
 const testing = std.testing;
 
+/// `s` repeated `n` times, at compile time (Zig 0.17 has no `**`).
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    const Storage = struct {
+        const data: [s.len * n]u8 = blk: {
+            @setEvalBranchQuota(10_000_000);
+            var out: [s.len * n]u8 = undefined;
+            for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+            break :blk out;
+        };
+    };
+    return &Storage.data;
+}
+
 fn composeTest(arena: Allocator, msg: Message, defaults: Defaults) !Composed {
     var prng = std.Random.DefaultPrng.init(42);
     var fail: Failure = .{};
@@ -724,7 +774,7 @@ test "compose: a message over the limit fails before anything is sent" {
     try testing.expectError(error.Invalid, compose(arena, testing.io, .{
         .from = "ada@example.com",
         .to = &.{"bob@example.com"},
-        .text = "x" ** 5000,
+        .text = repeat("x", 5000),
     }, .{ .max_bytes = 1000 }, prng.random(), 0, &fail));
     try testing.expectEqualStrings("message_too_large", fail.code);
 }
@@ -733,7 +783,7 @@ test "compose: a long subject without spaces is folded as encoded words; no line
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const c = try composeTest(arena, .{ .from = "ada@example.com", .to = &.{"bob@example.com"}, .subject = "x" ** 1500, .text = "a" ** 5000 }, .{});
+    const c = try composeTest(arena, .{ .from = "ada@example.com", .to = &.{"bob@example.com"}, .subject = repeat("x", 1500), .text = repeat("a", 5000) }, .{});
     const out = try rendered(arena, c);
     var it = std.mem.splitSequence(u8, out, "\r\n");
     while (it.next()) |line| try testing.expect(line.len <= 998);

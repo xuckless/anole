@@ -150,7 +150,7 @@ fn checkDomain(domain: []const u8) error{InvalidAddress}!void {
     if (domain[0] == '[') {
         if (domain[domain.len - 1] != ']' or domain.len < 3) return error.InvalidAddress;
         for (domain[1 .. domain.len - 1]) |b| switch (b) {
-            '0'...'9', 'a'...'f', 'A'...'F', '.', ':', 'I', 'P', 'v', '6' => {},
+            '0'...'9', 'a'...'f', 'A'...'F', '.', ':', 'I', 'P', 'v' => {},
             else => return error.InvalidAddress,
         };
         return;
@@ -176,6 +176,19 @@ fn checkDomain(domain: []const u8) error{InvalidAddress}!void {
 }
 
 const testing = std.testing;
+
+/// `s` repeated `n` times, at compile time (Zig 0.17 has no `**`).
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    const Storage = struct {
+        const data: [s.len * n]u8 = blk: {
+            @setEvalBranchQuota(10_000_000);
+            var out: [s.len * n]u8 = undefined;
+            for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+            break :blk out;
+        };
+    };
+    return &Storage.data;
+}
 
 fn expectMailbox(text: []const u8, name: ?[]const u8, address: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -222,8 +235,8 @@ test "address: header and command injection, and plain mistakes, are refused" {
     try expectInvalid("ada,bob@example.com");
     try expectInvalid("a\x00da@example.com");
     try expectInvalid("\"unclosed <ada@example.com>");
-    try expectInvalid("a" ** 65 ++ "@example.com");
-    try expectInvalid("ada@" ++ "a" ** 64 ++ ".com");
+    try expectInvalid(repeat("a", 65) ++ "@example.com");
+    try expectInvalid("ada@" ++ repeat("a", 64) ++ ".com");
 }
 
 test "address: SMTPUTF8 is needed for a non-ASCII address only" {

@@ -236,6 +236,19 @@ pub fn base64Size(raw: u64) u64 {
 
 const testing = std.testing;
 
+/// `s` repeated `n` times, at compile time (Zig 0.17 has no `**`).
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    const Storage = struct {
+        const data: [s.len * n]u8 = blk: {
+            @setEvalBranchQuota(10_000_000);
+            var out: [s.len * n]u8 = undefined;
+            for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+            break :blk out;
+        };
+    };
+    return &Storage.data;
+}
+
 fn writeValue(w: *Writer, e: ValueEncoder) Writer.Error!void {
     try e.write(w);
 }
@@ -264,7 +277,7 @@ test "ValueEncoder: plain, quoted and encoded words" {
 }
 
 test "ValueEncoder: a long value is several encoded words, none cut inside a character" {
-    const value = "ƒ" ** 60;
+    const value = repeat("ƒ", 60);
     const out = try render(writeValue, .{ValueEncoder.init(value, false)});
     defer testing.allocator.free(out);
     var words = std.mem.splitScalar(u8, out, ' ');
@@ -297,8 +310,8 @@ test "is7bit and write7bit" {
     try testing.expect(is7bit("hello\nworld"));
     try testing.expect(!is7bit("héllo"));
     try testing.expect(!is7bit("a\rb"));
-    try testing.expect(!is7bit("a" ** 999));
-    try testing.expect(is7bit("a" ** 998));
+    try testing.expect(!is7bit(repeat("a", 999)));
+    try testing.expect(is7bit(repeat("a", 998)));
     const out = try render(write7bit, .{"one\ntwo\r\nthree"});
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("one\r\ntwo\r\nthree\r\n", out);
@@ -311,8 +324,8 @@ test "quoted-printable: hard breaks kept, specials and trailing space encoded, s
         .{ .in = "line one\nline two \nend", .out = "line one\r\nline two=20\r\nend\r\n" },
         .{ .in = "tab\t\r\nnext", .out = "tab=09\r\nnext\r\n" },
         .{ .in = "caf\xc3\xa9", .out = "caf=C3=A9\r\n" },
-        .{ .in = "a" ** 76, .out = "a" ** 75 ++ "=\r\na\r\n" },
-        .{ .in = "a" ** 74 ++ "\xc3\xa9", .out = "a" ** 74 ++ "=\r\n=C3=A9\r\n" },
+        .{ .in = repeat("a", 76), .out = repeat("a", 75) ++ "=\r\na\r\n" },
+        .{ .in = repeat("a", 74) ++ "\xc3\xa9", .out = repeat("a", 74) ++ "=\r\n=C3=A9\r\n" },
         .{ .in = "", .out = "\r\n" },
     };
     for (cases) |c| {

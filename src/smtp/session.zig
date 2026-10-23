@@ -49,7 +49,7 @@ pub const Settings = struct {
     host: []const u8,
     port: u16,
     tls_mode: TlsMode,
-    tls: ClientStream.ConnectOptions.Tls,
+    tls: net.ConnectOptions.Tls,
     username: ?[]const u8,
     password: ?[]const u8,
     helo: []const u8,
@@ -443,8 +443,8 @@ pub const Session = struct {
 
     /// EHLO and QUIT on a fresh connection: whether the server answers
     /// (the readiness check). The settings are the client's.
-    pub fn probe(gpa: std.mem.Allocator, ctx: *const Ctx, map: db.ErrorMap, s: *const Settings) bool {
-        const self = open(gpa, ctx, map, &.{
+    pub fn probe(gpa: std.mem.Allocator, ctx: *const Ctx, map: db.ErrorMap, s: *const Settings) anyerror!void {
+        const self = try open(gpa, ctx, map, &.{
             .host = s.host,
             .port = s.port,
             .tls_mode = s.tls_mode,
@@ -454,8 +454,7 @@ pub const Session = struct {
             .helo = s.helo,
             .connect_timeout = s.connect_timeout,
             .loopback = s.loopback,
-        }) catch return false;
+        });
         self.close(true);
-        return true;
     }
 };

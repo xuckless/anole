@@ -183,6 +183,13 @@
         "$ref": "#/$defs/Broker"
       },
       "description": "Message brokers for anole_nats_*, opened at start."
+    },
+    "mail": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Mail"
+      },
+      "description": "Mail servers for anole_smtp_*, opened at start."
     }
   },
   "$defs": {
@@ -3552,6 +3559,487 @@
             }
           },
           "description": "What queries with ANOLE_DB_F_RETRY are retried with, on a transient failure (the server unreachable, a connection lost). Ignored for SQLite and MongoDB."
+        }
+      }
+    },
+    "Mail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "smtp"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "What anole_smtp_find looks it up by: unique, 1-255 bytes."
+        },
+        "smtp": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "url": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "smtp://user:pass@host:587 (STARTTLS), smtps://user:pass@host:465, smtp://127.0.0.1:1025?tls=none. Null: SMTP_URL, else Mailpit's smtp://127.0.0.1:1025 (not in production)."
+            },
+            "from": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The default From (\"App <hello@example.com>\"). Null: SMTP_FROM."
+            },
+            "username": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Overrides the URL's user name."
+            },
+            "password": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Overrides the URL's password."
+            },
+            "tls_mode": {
+              "enum": [
+                "auto",
+                "starttls",
+                "implicit",
+                "none"
+              ],
+              "default": "auto",
+              "description": "auto: smtps:// is implicit TLS, smtp:// to a public host requires STARTTLS, to loopback it uses STARTTLS when offered."
+            },
+            "ca_file": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "ca_pem": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "client_cert_file": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "client_key_file": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "client_cert_pem": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "client_key_pem": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "insecure_skip_verify": {
+              "type": "boolean",
+              "default": false
+            },
+            "helo_name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The EHLO name. Null: the host name."
+            },
+            "max_connections": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4294967295
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Connections in all, split between executors. Null: 2 per executor."
+            },
+            "max_messages_per_connection": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "default": 100,
+              "description": "A connection QUITs after this many messages."
+            },
+            "idle_timeout_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 30000,
+              "description": "Idle connections are closed after this; 0: never."
+            },
+            "acquire_timeout_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 5000
+            },
+            "connect_timeout_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 10000
+            },
+            "min_throughput": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1048576,
+              "description": "Bytes per second a send may take at the least, added to the timeout for the message's size."
+            },
+            "max_message_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 26214400,
+              "description": "Refused before connecting when the encoded message is larger."
+            },
+            "readiness": {
+              "type": "boolean",
+              "default": false,
+              "description": "Register a readiness check (/readyz): connect, EHLO, QUIT, cached 30 s."
+            }
+          },
+          "description": "An SMTP server, as anole.smtp.Options (docs/email.md)."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 30000,
+          "description": "A bound on every send that has no timeout_ms of its own, plus the message's size at min_throughput; 0: none."
+        },
+        "breaker": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "consecutive_failures": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 5,
+                  "description": "Open after this many failures in a row; 0: not this rule."
+                },
+                "failure_ratio": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1,
+                  "default": 0.5,
+                  "description": "Open when failures / calls reaches this over window_ms, once min_calls calls are in it; 0: not this rule."
+                },
+                "min_calls": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 20
+                },
+                "window_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 10000,
+                  "description": "The failure ratio's sliding window."
+                },
+                "open_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 5000,
+                  "description": "The first open period; it doubles after each failed probe."
+                },
+                "max_open_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 60000
+                },
+                "half_open_calls": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 255,
+                  "default": 1,
+                  "description": "Calls let through at once while half-open."
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A circuit breaker: after repeated connection failures sends fail fast with ANOLE_E_SERVICE, class UNAVAILABLE, error_code \"circuit_open\" and http_status 503. null: none."
+        },
+        "retry": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "attempts": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 3,
+              "description": "Attempts in all, the first included."
+            },
+            "base_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 500
+            },
+            "max_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 5000
+            },
+            "multiplier": {
+              "type": "number",
+              "minimum": 1,
+              "default": 2.0
+            },
+            "attempt_timeout_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 0,
+              "description": "A bound on each attempt; 0: none."
+            },
+            "max_retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 10000
+            }
+          },
+          "description": "What sends with ANOLE_SMTP_F_RETRY are retried with, on a failure before the final \".\" (a failure after it is never retried)."
+        },
+        "errors": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "unique": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "exclusion": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "foreign_key": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "not_null": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "check": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "serialization": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "deadlock": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "unavailable": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "service_unavailable"
+            },
+            "timeout": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "gateway_timeout"
+            },
+            "other": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "not_found": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "not_found"
+            },
+            "precondition": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "invalid": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "bad_request"
+            }
+          },
+          "description": "What status each class of database error becomes (anole.db.ErrorMap): a class name to the status it answers with."
         }
       }
     }

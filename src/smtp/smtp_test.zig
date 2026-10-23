@@ -11,6 +11,19 @@ const mime = @import("mime.zig");
 
 const FakeServer = smtp.testing.FakeServer;
 const testing = std.testing;
+
+/// `s` repeated `n` times, at compile time (Zig 0.17 has no `**`).
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    const Storage = struct {
+        const data: [s.len * n]u8 = blk: {
+            @setEvalBranchQuota(10_000_000);
+            var out: [s.len * n]u8 = undefined;
+            for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+            break :blk out;
+        };
+    };
+    return &Storage.data;
+}
 const gpa = testing.allocator;
 const has_tls = features.tls == .boringssl;
 
@@ -24,7 +37,7 @@ const Harness = struct {
     c: db.Ctx,
     url_buf: [160]u8 = undefined,
 
-    fn init(h: *Harness, fake_options: FakeServer.Options, client_options: smtp.Options) !void {
+    fn init(h: *Harness, fake_options: smtp.testing.Options, client_options: smtp.Options) !void {
         h.rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
         errdefer h.rt.deinit();
         h.io = h.rt.io();
@@ -162,10 +175,10 @@ test "size: a message over the server's SIZE fails before MAIL, and over max_mes
     var h: Harness = undefined;
     try h.init(.{ .size_limit = 1000 }, .{ .max_message_bytes = 100_000 });
     defer h.deinit();
-    try testing.expectError(error.BadRequest, h.client.send(&h.c, .{ .to = &.{"a@example.com"}, .text = "x" ** 3000 }));
+    try testing.expectError(error.BadRequest, h.client.send(&h.c, .{ .to = &.{"a@example.com"}, .text = repeat("x", 3000) }));
     try expectDetail(&h, .invalid, "message_too_large");
     try testing.expectEqual(@as(usize, 0), h.fake.commandCount("MAIL"));
-    try testing.expectError(error.BadRequest, h.client.send(&h.c, .{ .to = &.{"a@example.com"}, .text = "x" ** 200_000 }));
+    try testing.expectError(error.BadRequest, h.client.send(&h.c, .{ .to = &.{"a@example.com"}, .text = repeat("x", 200_000) }));
     try expectDetail(&h, .invalid, "message_too_large");
     try testing.expectEqual(@as(usize, 0), h.fake.commandCount("MAIL"));
 }
@@ -451,7 +464,7 @@ test "readiness: the probe connects and says goodbye" {
     defer h.deinit();
     var c: db.Ctx = .{ .io = h.io, .arena = h.arena.allocator() };
     var ctx = smtp.erase(&c);
-    try testing.expect(@import("session.zig").Session.probe(gpa, &ctx, h.client.errors, &h.client.settings));
+    try @import("session.zig").Session.probe(gpa, &ctx, h.client.errors, &h.client.settings);
     try testing.expectEqual(@as(usize, 1), h.fake.commandCount("QUIT"));
 }
 
