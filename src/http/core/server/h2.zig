@@ -90,6 +90,17 @@ const out_queue_len = 32 * 1024;
 /// The handler-side buffer in front of that queue.
 const body_writer_len = 16 * 1024;
 
+/// The body writer buffer of a tunnel stream, whose frames go to the outbox
+/// (`StreamSink.appendParts`) and not through it.
+const tunnel_writer_len = 1024;
+
+/// An idle tunnel's outbox lists are freed past this capacity.
+const outbox_keep = 16 * 1024;
+
+/// The most bytes a tunnel's handler may have queued for the peer before
+/// its send waits, when the caller names no limit.
+const tunnel_outbox_max = 1024 * 1024;
+
 /// The PING sent with a drain's GOAWAY notice.
 const drain_ping: [8]u8 = "anole-go".*;
 
@@ -373,6 +384,41 @@ pub fn Engine(comptime Ctx: type) type {
         /// protocol stream outlives the handler while the response drains.
         const Side = enum { handler, protocol };
 
+        /// A tunnel's response bytes, in place of the 32 KiB `out` ring: the
+        /// handler appends to `filling` under the mutex, the data provider
+        /// reads `draining`, and the two swap when `draining` is used up. It
+        /// grows to a message and is freed when idle, so a quiet tunnel
+        /// holds nothing. Both lists are under the connection's mutex.
+        const Outbox = struct {
+            filling: std.ArrayList(u8) = .empty,
+            draining: std.ArrayList(u8) = .empty,
+            drain_pos: usize = 0,
+            /// Set by the provider as it takes bytes; the one sender
+            /// waiting for room (they are serialized by the caller) sleeps
+            /// on it.
+            room: placement.Signal = .{},
+            /// The provider found nothing to send and deferred the stream:
+            /// the next append must resume it.
+            deferred: bool = false,
+
+            fn pending(o: *const Outbox) usize {
+                return o.filling.items.len + (o.draining.items.len - o.drain_pos);
+            }
+
+            fn deinit(o: *Outbox, gpa: std.mem.Allocator) void {
+                o.filling.deinit(gpa);
+                o.draining.deinit(gpa);
+                o.drain_pos = 0;
+            }
+
+            /// Frees the lists when nothing is queued and they grew big.
+            fn trim(o: *Outbox, gpa: std.mem.Allocator) void {
+                if (o.pending() != 0) return;
+                if (o.filling.capacity > outbox_keep) o.filling.clearAndFree(gpa);
+                if (o.draining.capacity > outbox_keep) o.draining.clearAndFree(gpa);
+            }
+        };
+
         const Stream = struct {
             conn: *Conn,
             id: i32,
@@ -431,6 +477,9 @@ pub fn Engine(comptime Ctx: type) type {
 
             /// Response body: the handler in, the data provider out.
             out: ?std.Io.Queue(u8) = null,
+            /// A tunnel's response body goes to `outbox` instead of `out`.
+            outbox_mode: bool = false,
+            outbox: Outbox = .{},
             /// Or a whole body in memory (`StreamSink.complete`), which the
             /// provider takes in order: `parts[part][part_offset..]` is next.
             parts: []const []const u8 = &.{},
@@ -476,6 +525,8 @@ pub fn Engine(comptime Ctx: type) type {
             fn raiseWindow(stream: *Stream) void {
                 const conn = stream.conn;
                 const want = conn.config.stream_window_reading;
+                // A tunnel has its one window already (`setTunnelWindow`).
+                if (stream.connect_protocol.len > 0) return;
                 if (stream.recv_window != 0 or want <= conn.config.stream_window) return;
                 stream.recv_window = conn.config.stream_window;
                 if (stream.body_done or stream.reset or stream.discarding) return;
@@ -508,6 +559,21 @@ pub fn Engine(comptime Ctx: type) type {
                 stream.raised_bytes = size;
                 conn.raised_bytes += size;
                 conn.kickWriter();
+            }
+
+            /// A tunnel (an extended CONNECT) reads at `tunnel_window`, fixed:
+            /// its body buffer is that big from the first DATA and its window
+            /// is set to it now. Under the mutex.
+            fn setTunnelWindow(stream: *Stream) void {
+                const conn = stream.conn;
+                const want = conn.config.tunnel_window;
+                stream.recv_window = want;
+                if (want == conn.config.stream_window) return;
+                // Less by what the peer's ACK of SETTINGS will add to it,
+                // so the window lands on `want` (see `raiseWindow`).
+                const acked = conn.ackedStreamWindow();
+                const pending = if (conn.config.stream_window > acked) conn.config.stream_window - acked else 0;
+                _ = c.nghttp2_session_set_local_window_size(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, want -| pending);
             }
 
             /// A stream from the connection's spares (its arena trimmed when it
@@ -549,6 +615,7 @@ pub fn Engine(comptime Ctx: type) type {
                 if (!stream.handler_done) return;
                 if (stream.send_pending) conn.send_pending -= 1;
                 conn.raised_bytes -= stream.raised_bytes;
+                stream.outbox.deinit(conn.allocator);
                 _ = conn.streams.remove(stream.id);
                 if (stream.counted) {
                     conn.open_streams -= 1;
@@ -1493,8 +1560,11 @@ pub fn Engine(comptime Ctx: type) type {
                 w.advance(n);
                 conn.lock();
                 _ = c.nghttp2_session_consume(conn.session, stream.id, n);
+                // The writer has work only if the credit queued a
+                // WINDOW_UPDATE (about once per half window), not per read.
+                const wants_write = c.nghttp2_session_want_write(conn.session) != 0;
                 conn.unlock();
-                conn.kickWriter();
+                if (wants_write) conn.kickWriter();
                 return n;
             }
 
@@ -1519,6 +1589,8 @@ pub fn Engine(comptime Ctx: type) type {
                     .writeError = writeError,
                     .peerGone = peerGone,
                     .complete = complete,
+                    .appendParts = appendParts,
+                    .kickOut = kickOut,
                 } };
             }
 
@@ -1639,9 +1711,24 @@ pub fn Engine(comptime Ctx: type) type {
                 const self = fromPtr(ptr);
                 if (self.writer.buffer.len == 0) {
                     // A handler that never writes a body never pays for it.
-                    self.writer.buffer = self.stream.arena.allocator().alloc(u8, body_writer_len) catch &.{};
+                    const len: usize = if (self.stream.connect_protocol.len > 0) tunnel_writer_len else body_writer_len;
+                    self.writer.buffer = self.stream.arena.allocator().alloc(u8, len) catch &.{};
                 }
                 return &self.writer;
+            }
+
+            /// Picks where the body goes: a tunnel's to the outbox, any other
+            /// stream's to the `out` ring (an inline one to its backlog).
+            /// Under the mutex.
+            fn prepareBody(self: *StreamSink) std.Io.Writer.Error!void {
+                const stream = self.stream;
+                if (stream.out != null or stream.outbox_mode or stream.inline_mode) return;
+                if (stream.connect_protocol.len > 0) {
+                    stream.outbox_mode = true;
+                    return;
+                }
+                const buf = stream.arena.allocator().alloc(u8, out_queue_len) catch return self.fail(error.SystemResources);
+                stream.out = .init(buf);
             }
 
             /// Submits the head with a data provider, once. Under the mutex.
@@ -1680,10 +1767,7 @@ pub fn Engine(comptime Ctx: type) type {
                 {
                     conn.lock();
                     defer conn.unlock();
-                    if (stream.out == null and !stream.inline_mode) {
-                        const buf = stream.arena.allocator().alloc(u8, out_queue_len) catch return self.fail(error.SystemResources);
-                        stream.out = .init(buf);
-                    }
+                    try self.prepareBody();
                     try self.submit(true);
                 }
                 try self.put(w.buffered());
@@ -1699,10 +1783,7 @@ pub fn Engine(comptime Ctx: type) type {
                 {
                     conn.lock();
                     defer conn.unlock();
-                    if (stream.out == null and !stream.inline_mode) {
-                        const buf = stream.arena.allocator().alloc(u8, out_queue_len) catch return self.fail(error.SystemResources);
-                        stream.out = .init(buf);
-                    }
+                    try self.prepareBody();
                     try self.submit(true);
                 }
                 try self.put(w.buffered());
@@ -1722,10 +1803,87 @@ pub fn Engine(comptime Ctx: type) type {
                 return n;
             }
 
+            /// Appends `parts` to a tunnel's outbox, in one copy, after the
+            /// head is submitted. With `kick` the writer is told at once if
+            /// the provider was idle; without, the caller follows a run of
+            /// frames with `kickOut`. Waits, cancelably, while more than
+            /// `max_pending` bytes are queued (a message is always taken
+            /// when nothing is), kicking first so the queue can drain.
+            fn appendOutbox(self: *StreamSink, parts: []const []const u8, max_pending: usize, kick: bool) std.Io.Writer.Error!void {
+                const stream = self.stream;
+                const conn = stream.conn;
+                var total: usize = 0;
+                for (parts) |p| total += p.len;
+                if (total == 0) return;
+                while (true) {
+                    conn.lock();
+                    if (stream.reset) {
+                        conn.unlock();
+                        return self.fail(error.ConnectionResetByPeer);
+                    }
+                    const ob = &stream.outbox;
+                    const pending = ob.pending();
+                    if (pending == 0 or pending + total <= max_pending) {
+                        defer conn.unlock();
+                        ob.filling.ensureUnusedCapacity(conn.allocator, total) catch return self.fail(error.SystemResources);
+                        for (parts) |p| ob.filling.appendSliceAssumeCapacity(p);
+                        // The provider defers on an empty outbox, so it
+                        // needs a resume; with bytes queued it is running.
+                        if (kick and ob.deferred) {
+                            ob.deferred = false;
+                            _ = c.nghttp2_session_resume_data(conn.session, stream.id);
+                            conn.kickWriter();
+                        }
+                        return;
+                    }
+                    // Full: let the writer take what is queued, then wait
+                    // for it to. Reset under the mutex, so a take cannot
+                    // slip in between this check and the wait.
+                    ob.room.reset(conn.io);
+                    ob.deferred = false;
+                    _ = c.nghttp2_session_resume_data(conn.session, stream.id);
+                    conn.unlock();
+                    conn.kickWriter();
+                    ob.room.wait(conn.io) catch return self.fail(error.Canceled);
+                }
+            }
+
+            fn appendParts(ptr: *anyopaque, parts: []const []const u8, max_pending: usize, kick: bool) std.Io.Writer.Error!void {
+                const self = fromPtr(ptr);
+                const stream = self.stream;
+                const conn = stream.conn;
+                {
+                    conn.lock();
+                    defer conn.unlock();
+                    try self.prepareBody();
+                    try self.submit(true);
+                }
+                if (!stream.outbox_mode) {
+                    for (parts) |p| try self.put(p);
+                    return;
+                }
+                return self.appendOutbox(parts, max_pending, kick);
+            }
+
+            /// Tells the writer about what `appendParts` left without a kick.
+            fn kickOut(ptr: *anyopaque) void {
+                const stream = fromPtr(ptr).stream;
+                const conn = stream.conn;
+                conn.lock();
+                const wake = stream.outbox.deferred and stream.outbox.pending() != 0;
+                if (wake) {
+                    stream.outbox.deferred = false;
+                    _ = c.nghttp2_session_resume_data(conn.session, stream.id);
+                }
+                conn.unlock();
+                if (wake) conn.kickWriter();
+            }
+
             fn put(self: *StreamSink, bytes: []const u8) std.Io.Writer.Error!void {
                 if (bytes.len == 0) return;
                 const stream = self.stream;
                 const conn = stream.conn;
+                if (stream.outbox_mode) return self.appendOutbox(&.{bytes}, tunnel_outbox_max, true);
                 if (stream.inline_mode) {
                     // On the reader: never wait for the writer, which may
                     // need the reader to take a WINDOW_UPDATE first. The
@@ -1763,6 +1921,12 @@ pub fn Engine(comptime Ctx: type) type {
                 defer conn.unlock();
                 stream.trailer_nv = trailer_nv;
                 stream.ended = true;
+                if (stream.outbox_mode) {
+                    _ = c.nghttp2_session_resume_data(conn.session, stream.id);
+                    stream.outbox.room.set(conn.io);
+                    conn.kickWriter();
+                    return;
+                }
                 if (stream.out) |*q| {
                     q.close(conn.io);
                     _ = c.nghttp2_session_resume_data(conn.session, stream.id);
@@ -1988,6 +2152,7 @@ pub fn Engine(comptime Ctx: type) type {
             _ = conn.server.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
             conn.open_streams += 1;
             stream.counted = true;
+            if (stream.connect_protocol.len > 0) stream.setTunnelWindow();
             placement.concurrent(group, conn.io, .local, runStream, .{ conn, stream }) catch {
                 log.err("HTTP/2: no task for stream {d}", .{stream.id});
                 stream.reset = true;
@@ -2139,6 +2304,8 @@ pub fn Engine(comptime Ctx: type) type {
             if (error_code != c.NGHTTP2_NO_ERROR or !stream.ended) stream.reset = true;
             stream.closeBody();
             if (stream.out) |*q| q.close(conn.io);
+            // A sender waiting for room in the outbox wakes to find it gone.
+            if (stream.outbox_mode) stream.outbox.room.set(conn.io);
             if (stream.reset) stream.cancelHandler();
             // Reset with its response detached: the owner lets go now.
             if (stream.reset) abortDetached(stream);
@@ -2195,6 +2362,31 @@ pub fn Engine(comptime Ctx: type) type {
         ) callconv(.c) c.nghttp2_ssize {
             const conn = connFrom(user_data);
             const stream: *Stream = @ptrCast(@alignCast(source.*.ptr.?));
+            if (stream.outbox_mode) {
+                const ob = &stream.outbox;
+                if (ob.drain_pos == ob.draining.items.len) {
+                    // Used up: the filled list becomes the one read.
+                    ob.draining.clearRetainingCapacity();
+                    ob.drain_pos = 0;
+                    std.mem.swap(std.ArrayList(u8), &ob.filling, &ob.draining);
+                }
+                const avail = ob.draining.items[ob.drain_pos..];
+                const n = @min(avail.len, length);
+                @memcpy(buf[0..n], avail[0..n]);
+                ob.drain_pos += n;
+                if (n > 0) ob.room.set(conn.io);
+                const empty = ob.pending() == 0;
+                if (empty) ob.trim(conn.allocator);
+                if (n > 0) {
+                    if (stream.ended and empty) return finish(session, stream_id, stream, data_flags, n);
+                    return @intCast(n);
+                }
+                if (!stream.ended) {
+                    ob.deferred = true;
+                    return c.NGHTTP2_ERR_DEFERRED;
+                }
+                return finish(session, stream_id, stream, data_flags, 0);
+            }
             if (stream.out) |*q| {
                 const n = q.getUncancelable(conn.io, buf[0..length], 0) catch |err| switch (err) {
                     error.Closed => return finish(session, stream_id, stream, data_flags, 0),

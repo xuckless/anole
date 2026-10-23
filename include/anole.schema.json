@@ -693,6 +693,13 @@
           "default": 1048576,
           "description": "The stream's window from the handler's first read of the body."
         },
+        "tunnel_window": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647,
+          "default": 131072,
+          "description": "The window (and body buffer) of a tunnel stream, a WebSocket over HTTP/2 (extended CONNECT): one fixed window, no raise."
+        },
         "reading_window_budget": {
           "type": "integer",
           "minimum": 0,
