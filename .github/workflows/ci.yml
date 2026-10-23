@@ -665,3 +665,25 @@ jobs:
       - name: Tests with a live server
         timeout-minutes: 35
         run: tests/mongodb/run.sh ${{ matrix.image }}
+
+  smtp:
+    name: SMTP (live tests against Mailpit: plain, STARTTLS with AUTH, implicit TLS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: smtp
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # Three Mailpit servers, one plain, one that requires STARTTLS and one
+      # with TLS on connect, the last two on a CA made for the run; what was
+      # sent is read back from each one's API. The image is pinned by digest
+      # (MAINTAINING.md lists the pins and how to bump them).
+      - name: Tests against live servers
+        timeout-minutes: 35
+        env:
+          # v1.32.0
+          MAILPIT_IMAGE: axllent/mailpit@sha256:0790692be935ea4420d085694f7985b1f692ca6a8771ab0e0bd8ba75ac180498
+        run: tests/smtp/run.sh

@@ -614,6 +614,31 @@ pub const s3_options = [_]Entry{
 // ---- end p3/s3 ----
 
 // ---- p3/smtp ----
+/// `anole.smtp.Options` against `mail[].smtp`.
+pub const smtp_options = [_]Entry{
+    .{ .zig = "url", .json = "mail[].smtp.url" },
+    .{ .zig = "from", .json = "mail[].smtp.from" },
+    .{ .zig = "username", .json = "mail[].smtp.username" },
+    .{ .zig = "password", .json = "mail[].smtp.password" },
+    .{ .zig = "tls_mode", .json = "mail[].smtp.tls_mode", .kind = .custom, .note = "\"auto\", \"starttls\", \"implicit\" or \"none\"" },
+    .{ .zig = "tls", .json = "mail[].smtp.ca_file", .kind = .custom, .note = "ca_file or ca_pem; client_cert_file + client_key_file or client_cert_pem + client_key_pem; insecure_skip_verify" },
+    .{ .zig = "helo_name", .json = "mail[].smtp.helo_name" },
+    .{ .zig = "name", .json = "mail[].name", .kind = .custom, .note = "the mail server's name" },
+    .{ .zig = "max_connections", .json = "mail[].smtp.max_connections" },
+    .{ .zig = "max_messages_per_connection", .json = "mail[].smtp.max_messages_per_connection" },
+    .{ .zig = "idle_timeout", .json = "mail[].smtp.idle_timeout_ms", .kind = .ms, .note = "0 is never" },
+    .{ .zig = "acquire_timeout", .json = "mail[].smtp.acquire_timeout_ms", .kind = .ms },
+    .{ .zig = "connect_timeout", .json = "mail[].smtp.connect_timeout_ms", .kind = .ms },
+    .{ .zig = "timeout", .json = "mail[].timeout_ms", .kind = .ms, .note = "0 is none" },
+    .{ .zig = "min_throughput", .json = "mail[].smtp.min_throughput" },
+    .{ .zig = "max_message_bytes", .json = "mail[].smtp.max_message_bytes" },
+    .{ .zig = "errors", .json = "mail[].errors", .kind = .same },
+    .{ .zig = "retry", .json = "mail[].retry", .kind = .custom, .note = "an object (attempts, base_ms, max_ms, multiplier, attempt_timeout_ms, max_retry_after_ms): what `ANOLE_SMTP_F_RETRY` sends retry with" },
+    .{ .zig = "breaker", .json = "mail[].breaker", .kind = .custom, .note = "an object (consecutive_failures, failure_ratio, min_calls, window_ms, open_ms, max_open_ms, half_open_calls), or null for none" },
+    .{ .zig = "readiness", .json = "mail[].smtp.readiness" },
+    .{ .zig = "environment", .omitted = "the server's environment (`environment` in the configuration)" },
+    .{ .zig = "environ", .omitted = "the process environment, as the other connectors" },
+};
 // ---- end p3/smtp ----
 
 // ---- p3/lambda ----

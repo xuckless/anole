@@ -76,6 +76,12 @@ test "capi config: every connector option is in the schema or listed" {
         comptime parity.checkCoverage(anole.kafka.Options, &parity.kafka_options);
         try parity.checkSchemaAndDefaults(anole.kafka.Options, config.Config, &parity.kafka_options, root);
     }
+    // ---- p3/smtp ----
+    if (comptime features.smtp) {
+        comptime parity.checkCoverage(anole.smtp.Options, &parity.smtp_options);
+        try parity.checkSchemaAndDefaults(anole.smtp.Options, config.Config, &parity.smtp_options, root);
+    }
+    // ---- end p3/smtp ----
 }
 
 test "capi config: mongodb max_connections 0 is E_CONFIG; sqlite statement_cache is an unknown key" {

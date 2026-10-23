@@ -545,6 +545,8 @@ enum anole_event_type {
   /* ---- end p3/s3 ---- */
 
   /* ---- p3/smtp ---- */
+  ANOLE_EV_SMTP_RESULT = 126,    /* anole_smtp_result_event: the answer to anole_smtp_send or
+                                    anole_smtp_send_raw; handle 0 (user_data) */
   /* ---- end p3/smtp ---- */
 
   /* ---- p3/lambda ---- */
@@ -2488,6 +2490,99 @@ ANOLE_API anole_status anole_s3_multipart_abort(anole_s3 *s3, anole_consumer *c,
 /* ---- end p3/s3 ---- */
 
 /* ---- p3/smtp ---- */
+/* Mail. The configuration's "mail" entries are SMTP servers (smtp:// with
+   STARTTLS, smtps:// with TLS from the first byte), pooled per executor.
+   A send is a command for an executor, which composes and sends it; the
+   answer is ANOLE_EV_SMTP_RESULT. Nothing waits on the caller's thread, and
+   everything passed is copied before the call returns (an attachment's
+   `path` is read while sending). */
+
+typedef struct anole_smtp anole_smtp; /* opaque; lives until anole_server_destroy */
+
+/* Looks up a mail server by its "name"; ANOLE_E_INVALID when there is none. */
+ANOLE_API anole_status anole_smtp_find(anole_server *s, anole_str name, anole_smtp **out);
+/* Its place in the configuration's "mail". */
+ANOLE_API uint32_t anole_smtp_index(const anole_smtp *m);
+
+#define ANOLE_SMTP_F_RETRY 1u         /* retry transient failures before the final "." (never after it) */
+#define ANOLE_SMTP_ATTACH_F_INLINE 1u /* with content_id: an inline part (cid:) */
+
+typedef struct anole_smtp_attachment {
+  size_t size;            /* sizeof(anole_smtp_attachment) */
+  anole_str filename;
+  anole_str content_type; /* {NULL,0}: from the filename */
+  const void *data;       /* copied */
+  size_t len;
+  anole_str path;         /* instead of data: a file read while sending */
+  anole_str content_id;   /* set: inline, referenced from the HTML as cid:<content_id> */
+  uint32_t flags;         /* ANOLE_SMTP_ATTACH_F_* */
+  uint32_t reserved;
+} anole_smtp_attachment;  /* 96 bytes */
+
+typedef struct anole_smtp_message {
+  size_t size;             /* sizeof(anole_smtp_message) */
+  anole_str from;          /* "Name <a@b>" or "a@b"; {NULL,0}: the configured from */
+  anole_str reply_to;
+  const anole_str *to;  size_t nto;
+  const anole_str *cc;  size_t ncc;
+  const anole_str *bcc; size_t nbcc;
+  anole_str subject;
+  anole_str text;          /* {NULL,0}: none */
+  anole_str html;
+  const anole_header *headers; size_t nheaders;
+  const anole_smtp_attachment *attachments; size_t nattachments;
+  anole_str envelope_from; /* {NULL,0}: from's address */
+  anole_str message_id;    /* {NULL,0}: generated */
+} anole_smtp_message;      /* 200 bytes */
+
+typedef struct anole_smtp_options {
+  size_t size;         /* sizeof(anole_smtp_options) */
+  uint32_t flags;      /* ANOLE_SMTP_F_* */
+  uint32_t timeout_ms; /* 0: the mail entry's timeout_ms; ANOLE_DB_TIMEOUT_NONE: none */
+  uint64_t req;        /* the anole_req / anole_grpc_call it serves (as anole_db_options.req), or 0 */
+} anole_smtp_options;  /* 24 bytes */
+
+/* Composes the message and sends it. Everything is copied before return;
+   addresses, headers and sizes are checked now (ANOLE_E_INVALID, and
+   anole_last_error says which). The answer is ANOLE_EV_SMTP_RESULT to `c`
+   (or to req's consumer) with user_data. ANOLE_E_GONE: a stale req;
+   ANOLE_E_STATE: before start or after the stop. */
+ANOLE_API anole_status anole_smtp_send(anole_smtp *m, anole_consumer *c, const anole_smtp_message *msg,
+                                       const anole_smtp_options *opts, uint64_t user_data);
+/* A message composed by the language's own library (nodemailer's
+   MailComposer, Python's email): sent as it is, dot-stuffed, line ends made
+   CRLF, to `recipients`. `envelope_from` {NULL,0} is the null sender. */
+ANOLE_API anole_status anole_smtp_send_raw(anole_smtp *m, anole_consumer *c, anole_str envelope_from,
+                                           const anole_str *recipients, size_t n, const void *message, size_t len,
+                                           const anole_smtp_options *opts, uint64_t user_data);
+
+/* ANOLE_EV_SMTP_RESULT. */
+typedef struct anole_smtp_result_event {
+  anole_event ev;          /* handle 0 */
+  uint64_t user_data;
+  int32_t status;          /* ANOLE_OK (accepted for at least one recipient); ANOLE_E_SERVICE;
+                              ANOLE_E_TIMEOUT; ANOLE_E_GONE (its req ended first) */
+  uint16_t http_status;    /* what Anole's handlers would answer: 400, 500, 503, 504; 0 on success */
+  uint8_t error_class;     /* ANOLE_DB_ERR_* */
+  uint8_t reserved8;
+  uint16_t smtp_code;      /* the server's last reply code (250 on success) */
+  uint16_t reserved16;
+  uint32_t nrejected;      /* recipients the server refused while others were taken */
+  anole_span message_id;   /* without the angle brackets */
+  anole_span response;     /* the answer to the final "." (often a queue id) */
+  uint32_t rejected_off;   /* nrejected anole_smtp_rejected, from the start of the record */
+  uint32_t reserved;
+  anole_span error;        /* for logs; never sent to a client */
+  anole_span error_code;   /* "authentication_failed", "recipient_rejected", "5.7.1" */
+} anole_smtp_result_event; /* 80 bytes */
+
+typedef struct anole_smtp_rejected {
+  anole_span address;
+  uint16_t code;
+  uint16_t reserved;
+  uint32_t reserved2;
+  anole_span message;
+} anole_smtp_rejected;     /* 24 bytes */
 /* ---- end p3/smtp ---- */
 
 /* ---- p3/lambda ---- */

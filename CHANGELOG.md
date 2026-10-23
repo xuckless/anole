@@ -78,6 +78,16 @@ breaking changes are listed anyway.
   125, handle kind 16 for uploads and downloads, `ANOLE_E_SERVICE`, error
   classes `NOT_FOUND`, `PRECONDITION` and `INVALID`). `serve` and `put_body`
   move an object to and from a request without it entering the language.
+- `anole.smtp` (`-Dsmtp`): sending mail over SMTP with STARTTLS or TLS from
+  the first byte, AUTH PLAIN and LOGIN, MIME with HTML, attachments and
+  inline images, pooled connections per executor, and `sendRaw` for messages
+  composed elsewhere. `app.smtp(.{})` reads `SMTP_URL` and falls back to
+  Mailpit's port outside production; retries are opt-in, because a retry
+  after the final "." could send an email twice. `anole.smtp.testing.FakeServer`
+  is an SMTP server for tests. Pieces adapted from smtp_client.zig (MIT).
+  See docs/email.md.
+- C ABI: `"mail"` in the configuration, `anole_smtp_find`, `anole_smtp_index`,
+  `anole_smtp_send` and `anole_smtp_send_raw`, and `ANOLE_EV_SMTP_RESULT` (126).
 
 ### Changed
 

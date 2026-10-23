@@ -381,6 +381,11 @@ fn startFailure(e: *Engine, err: anyerror, comptime what: []const u8) i32 {
         // such as metrics) that the router cannot tell apart.
         error.RouteConflict => return named(abi.E_CONFIG, "RouteConflict", 0, "routes: {s}", .{e.start_why[0..e.start_why_len]}),
         error.OutOfMemory => return fail(abi.E_NOMEM, what, err),
+        // ---- p3/smtp ----
+        // A mail server's settings that do not hold (a production run
+        // without SMTP_URL, a URL that is not one): the configuration's.
+        error.InvalidOptions => if (explained.len > 0) return named(abi.E_CONFIG, "InvalidOptions", 0, "{s}", .{explained}),
+        // ---- end p3/smtp ----
         error.DatabaseUnavailable => {
             if (explained.len > 0) return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), "{s}", .{explained});
             return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), what ++ ": {t}", .{err});
@@ -1804,6 +1809,68 @@ export fn anole_s3_multipart_abort(p: ?*anyopaque, c_: ?*anyopaque, key: Str, up
 // ---- end p3/s3 ----
 
 // ---- p3/smtp ----
+// ---- Mail --------------------------------------------------------------------------
+
+const smtp_mod = engine.smtp;
+
+fn smtpOf(m: ?*const anyopaque) ?*smtp_mod.Mail {
+    const mail: *smtp_mod.Mail = @ptrCast(@alignCast(@constCast(m orelse return null)));
+    return if (engine.global == mail.engine) mail else null;
+}
+
+fn smtpFailure(err: smtp_mod.CallError, why: *const smtp_mod.Why) i32 {
+    return switch (err) {
+        error.Invalid => if (why.len > 0)
+            named(abi.E_INVALID, "Invalid", 0, "{s}", .{why.text()})
+        else
+            named(abi.E_INVALID, "Invalid", 0, "invalid argument (a flag, a size, or a consumer of another server or other than the request's)", .{}),
+        error.State => named(abi.E_STATE, "State", 0, "the server is not open, or no executor feeds this consumer", .{}),
+        error.OutOfMemory => failCode(abi.E_NOMEM),
+        error.Unsupported => failCode(abi.E_UNSUPPORTED),
+        error.Gone => blk: {
+            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
+            break :blk named(abi.E_GONE, "Gone", 0, "the request it served is over", .{});
+        },
+    };
+}
+
+export fn anole_smtp_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    const m = smtp_mod.find(e, name.slice()) orelse {
+        return named(abi.E_INVALID, "Invalid", 0, "no mail server \"{s}\" in the configuration", .{name.slice()});
+    };
+    dst.* = m;
+    return abi.OK;
+}
+
+export fn anole_smtp_index(m: ?*const anyopaque) u32 {
+    const mail = smtpOf(m) orelse return 0;
+    return mail.index;
+}
+
+export fn anole_smtp_send(m: ?*anyopaque, c_: ?*anyopaque, msg: ?*const abi.SmtpMessage, opts: ?*const abi.SmtpOptions, user_data: u64) i32 {
+    clearError();
+    const mail = smtpOf(m) orelse return badPointer(m);
+    const c: ?*Consumer = if (c_ == null) null else (consumerOf(c_) orelse return badPointer(c_));
+    const message: abi.SmtpMessage = readSized(abi.SmtpMessage, msg orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
+    const o: abi.SmtpOptions = if (opts) |p| readSized(abi.SmtpOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.SmtpOptions) };
+    var why: smtp_mod.Why = .{};
+    smtp_mod.send(mail, c, message, o, user_data, &why) catch |err| return smtpFailure(err, &why);
+    return abi.OK;
+}
+
+export fn anole_smtp_send_raw(m: ?*anyopaque, c_: ?*anyopaque, envelope_from: Str, recipients: ?[*]const Str, n: usize, message: ?*const anyopaque, len: usize, opts: ?*const abi.SmtpOptions, user_data: u64) i32 {
+    clearError();
+    const mail = smtpOf(m) orelse return badPointer(m);
+    const c: ?*Consumer = if (c_ == null) null else (consumerOf(c_) orelse return badPointer(c_));
+    const body = bytes(message, len) orelse return failCode(abi.E_INVALID);
+    const o: abi.SmtpOptions = if (opts) |p| readSized(abi.SmtpOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.SmtpOptions) };
+    var why: smtp_mod.Why = .{};
+    smtp_mod.sendRaw(mail, c, envelope_from, recipients, n, body, o, user_data, &why) catch |err| return smtpFailure(err, &why);
+    return abi.OK;
+}
 // ---- end p3/smtp ----
 
 // ---- p3/lambda ----

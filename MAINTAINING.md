@@ -289,6 +289,21 @@ CI job `kafka`). When Kafka releases a new major, run them against it before
 claiming support, and re-check the removed API versions (KIP-896 removed the
 oldest ones in 4.0).
 
+## The SMTP client
+
+`src/smtp/core` holds the pieces adapted from karlseguin/smtp_client.zig
+(commit 538d0ddc, MIT; its licence is `src/LICENSE.smtp_client`): the header
+value encoder, the base64 line writer, boundary and Message-ID generation, the
+date writer, the reply parser, EHLO parsing and AUTH PLAIN/LOGIN. The rest of
+`src/smtp` (transport, pool, MIME composition, the connector layer) is Anole's.
+That repository is a watch-list item like the HTTP core's: look at its commits
+at each release and pick fixes by hand. Live tests: `tests/smtp/run.sh` starts
+three Mailpit servers (plain, STARTTLS required, TLS on connect) in Docker and
+reads the messages back from their APIs (CI job `smtp`). The image is pinned by
+digest in `tests/smtp/run.sh` and the job (v1.32.0, `axllent/mailpit`, MIT):
+bump both together, from the manifest list's digest on Docker Hub, and check
+that the `MP_SMTP_*` variables in the script still exist (`mailpit --help`).
+
 ## The docs site
 
 https://xuckless.github.io/anole/ is `site/`, an Astro + Starlight project

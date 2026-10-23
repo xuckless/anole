@@ -77,6 +77,8 @@ pub const Config = struct {
     // ---- end p3/s3 ----
 
     // ---- p3/smtp ----
+    /// Mail servers for `anole_smtp_*`, opened at start.
+    mail: []const Mail = &.{},
     // ---- end p3/smtp ----
 
     // ---- p3/lambda ----
@@ -1094,6 +1096,68 @@ pub const Config = struct {
     // ---- end p3/s3 (types) ----
 
     // ---- p3/smtp (types) ----
+    pub const Mail = struct {
+        /// What `anole_smtp_find` looks it up by: unique, 1-255 bytes.
+        name: []const u8,
+        smtp: Smtp,
+        /// A bound on every send that has no timeout_ms of its own (plus
+        /// the message's size at min_throughput). 0: none.
+        timeout_ms: u32 = 30_000,
+        /// A circuit breaker: after repeated connection failures sends fail
+        /// fast with ANOLE_E_SERVICE, class UNAVAILABLE, error_code
+        /// "circuit_open" and http_status 503. null: none.
+        breaker: ?Breaker = .{},
+        /// What sends with ANOLE_SMTP_F_RETRY are retried with.
+        retry: MailRetry = .{},
+        /// What status each class of error becomes, as `anole.db.ErrorMap`.
+        errors: anole.db.ErrorMap = .{},
+    };
+
+    pub const MailRetry = struct {
+        attempts: u8 = 3,
+        base_ms: u32 = 500,
+        max_ms: u32 = 5_000,
+        multiplier: f32 = 2.0,
+        attempt_timeout_ms: u32 = 0,
+        max_retry_after_ms: u32 = 10_000,
+    };
+
+    /// An SMTP server, as `anole.smtp.Options` (docs/email.md).
+    pub const Smtp = struct {
+        /// smtp://user:pass@host:587 (STARTTLS), smtps://user:pass@host:465,
+        /// smtp://127.0.0.1:1025?tls=none. Null: SMTP_URL, else Mailpit's
+        /// smtp://127.0.0.1:1025 (not in production).
+        url: ?[]const u8 = null,
+        /// The default From ("App <hello@example.com>"). Null: SMTP_FROM.
+        from: ?[]const u8 = null,
+        /// Override the URL's user name and password.
+        username: ?[]const u8 = null,
+        password: ?[]const u8 = null,
+        /// "auto", "starttls", "implicit" or "none".
+        tls_mode: []const u8 = "auto",
+        ca_file: ?[]const u8 = null,
+        ca_pem: ?[]const u8 = null,
+        client_cert_file: ?[]const u8 = null,
+        client_key_file: ?[]const u8 = null,
+        client_cert_pem: ?[]const u8 = null,
+        client_key_pem: ?[]const u8 = null,
+        insecure_skip_verify: bool = false,
+        /// The EHLO name. Null: the host name.
+        helo_name: ?[]const u8 = null,
+        /// Connections in all, split between executors. Null: 2 per executor.
+        max_connections: ?u32 = null,
+        max_messages_per_connection: u32 = 100,
+        idle_timeout_ms: u32 = 30_000,
+        acquire_timeout_ms: u32 = 5_000,
+        connect_timeout_ms: u32 = 10_000,
+        /// Bytes per second a send may take at the least, added to the
+        /// timeout for the message's size.
+        min_throughput: u64 = 1_048_576,
+        /// Refused before connecting when the encoded message is larger.
+        max_message_bytes: u64 = 26_214_400,
+        /// Register a readiness check (/readyz): off by default.
+        readiness: bool = false,
+    };
     // ---- end p3/smtp (types) ----
 
     // ---- p3/lambda (types) ----
@@ -1315,6 +1379,23 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             }
         }
     }
+    // ---- p3/smtp (validate) ----
+    for (cfg.mail, 0..) |m, i| {
+        if (comptime !features.smtp) return fail(why, "mail[{d}]: SMTP is not built in (-Dsmtp)", .{i});
+        if (m.name.len == 0 or m.name.len > 255) return fail(why, "mail[{d}].name: 1-255 bytes", .{i});
+        for (cfg.mail[0..i]) |other| if (std.mem.eql(u8, m.name, other.name))
+            return fail(why, "mail[{d}].name \"{s}\" is taken", .{ i, m.name });
+        const sm = m.smtp;
+        if (!oneOf(sm.tls_mode, &.{ "auto", "starttls", "implicit", "none" })) return fail(why, "mail[{d}].smtp.tls_mode: auto, starttls, implicit or none", .{i});
+        try checkClientCert(sm, "mail", "smtp", i, why);
+        if (sm.max_connections) |n| if (n == 0) return fail(why, "mail[{d}].smtp.max_connections: at least 1", .{i});
+        if (sm.max_messages_per_connection == 0) return fail(why, "mail[{d}].smtp.max_messages_per_connection: at least 1", .{i});
+        if (sm.min_throughput == 0) return fail(why, "mail[{d}].smtp.min_throughput: at least 1", .{i});
+        if (sm.password != null and sm.username == null and (sm.url == null or std.mem.indexOfScalar(u8, sm.url.?, '@') == null))
+            return fail(why, "mail[{d}].smtp: a password needs a username", .{i});
+        if (m.retry.attempts == 0 or m.retry.attempts > 10) return fail(why, "mail[{d}].retry.attempts: 1-10", .{i});
+    }
+    // ---- end p3/smtp (validate) ----
     if (cfg.observe.health) |h| {
         if (h.checks.len > 16) return fail(why, "observe.health.checks: at most 16", .{});
         for (h.checks, 0..) |name, i| {

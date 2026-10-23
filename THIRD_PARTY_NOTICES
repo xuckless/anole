@@ -429,6 +429,18 @@ src/testing/root.zig
   Its request, response and stream API follows the shape of zefir's
   src/http/testing/Backend.zig (no code copied).
 
+src/smtp/core/ (the SMTP client's message encoding and protocol pieces)
+  Adapted from karlseguin/smtp_client.zig: the header value encoder
+  (RFC 2047 encoded words and quoting), the base64 line writer, boundary and
+  Message-ID generation, the RFC 5322 date writer, the reply parser, the EHLO
+  extension parsing and AUTH PLAIN/LOGIN. Its transport, single-connection
+  client and CRAM-MD5 are not taken. Every file carries an attribution
+  header; the licence is kept as src/LICENSE.smtp_client.
+  Licence:  MIT (text in part C). Copyright (c) 2024 Karl Seguin
+  Source:   https://github.com/karlseguin/smtp_client.zig, commit
+            538d0ddc064248b6c1431bfd68df2481f431c0fd
+  Linked:   -Dsmtp=true
+
 C. MIT licence text (applies to every MIT component above)
 -----------------------------------------------------------
 
