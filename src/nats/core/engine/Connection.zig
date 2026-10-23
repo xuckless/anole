@@ -48,8 +48,8 @@ pub const TransportError = error{
 
 fn transportError(err: anyerror) TransportError {
     // A write after the peer closed: the same as a reset, and the name
-    // std.Io's net errors use.
-    if (err == error.BrokenPipe) return error.ConnectionResetByPeer;
+    // std.Io's net errors use. std reports EPIPE as SocketUnconnected.
+    if (err == error.BrokenPipe or err == error.SocketUnconnected) return error.ConnectionResetByPeer;
     inline for (@typeInfo(TransportError).error_set.error_names.?) |name| {
         if (err == @field(TransportError, name)) return @field(TransportError, name);
     }

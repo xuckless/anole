@@ -149,10 +149,12 @@
         // cache, pool lifetimes, a refused connect's error, TLS through an
         // injected module (Anole's BoringSSL, src/pg/tls.zig), the session
         // reset on release (Pool.Reset: .always or .auto), parameters as a
-        // slice of tagged unions and text results (the C ABI).
+        // slice of tagged unions and text results (the C ABI), and the
+        // bytes the socket accepted (Conn.bytesSent: when a failed call
+        // may run again).
         .pg = .{
-            .url = "git+https://github.com/xuckless/pg.zig#6f47a57bd5f7d9e96440526d5b51bd7a043a8203",
-            .hash = "pg-0.0.0-Wp_7gVBZCQCvg5pWYYxKTW8zxBa1VzUO8IWy4OiYhwDA",
+            .url = "git+https://github.com/xuckless/pg.zig#6327fc61f3a3e90aa5b014af21e12bbb073e0fcc",
+            .hash = "pg-0.0.0-Wp_7gU5jCQD89Co7vWWqcTa2s4vhSZ85OldH348fzrP4",
             .lazy = true,
         },
         // Tests only, fetched only when Anole is the root build: the BSON

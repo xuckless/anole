@@ -763,3 +763,69 @@ test "pg: iterate over a bare BEGIN fails left-open; acquire released in a trans
     }
     try testing.expectEqual(@as(i64, 0), try d.one(i64, &c, "SELECT count(*) FROM anole_pg_guard", .{}));
 }
+
+/// What `test_after_take` does to the next connection handed out, once.
+const Break = struct {
+    var mode: enum { none, before, after_bytes } = .none;
+
+    fn hook(conn: *pg.driver.Conn) void {
+        const m = mode;
+        mode = .none;
+        switch (m) {
+            .none => return,
+            .before => {},
+            // A whole simple Query ("SELECT 1"): bytes of the call left.
+            .after_bytes => conn._stream.writeAll("Q\x00\x00\x00\x0dSELECT 1\x00") catch {},
+        }
+        // The next write on it fails at once (EPIPE), sending nothing.
+        conn._stream.shutdown(.send) catch {};
+    }
+};
+
+test "pg: live a call broken before sending on a pooled connection runs again; not once bytes left or on a fresh one" {
+    _ = try testUrl();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    pg.test_after_take = Break.hook;
+    defer pg.test_after_take = null;
+    defer Break.mode = .none;
+
+    {
+        // Fresh: the first call dials its connection, so it is not run again.
+        const d = try open(io, .{ .max_connections = 2 });
+        defer d.deinit();
+        const level = quiet();
+        defer testing.log_level = level;
+        Break.mode = .before;
+        try testing.expectError(error.ServiceUnavailable, d.exec(&c, "SELECT 1", .{}));
+    }
+
+    const d = try open(io, .{ .max_connections = 2 });
+    defer d.deinit();
+    _ = try d.exec(&c, "DROP TABLE IF EXISTS anole_pg_resend; CREATE TABLE anole_pg_resend (n int)", .{});
+    defer _ = d.exec(&c, "DROP TABLE IF EXISTS anole_pg_resend", .{}) catch {};
+
+    // Pooled, nothing sent: run once more on another connection, once.
+    {
+        // The first attempt's failure is logged (warn).
+        const level = quiet();
+        defer testing.log_level = level;
+        Break.mode = .before;
+        try testing.expectEqual(@as(u64, 1), try d.exec(&c, "INSERT INTO anole_pg_resend VALUES (1)", .{}));
+        try testing.expect(Break.mode == .none);
+    }
+    try testing.expectEqual(@as(i64, 1), try d.one(i64, &c, "SELECT count(*) FROM anole_pg_resend", .{}));
+
+    // Pooled, bytes of the call already left: not run again.
+    {
+        const level = quiet();
+        defer testing.log_level = level;
+        Break.mode = .after_bytes;
+        try testing.expectError(error.ServiceUnavailable, d.exec(&c, "INSERT INTO anole_pg_resend VALUES (2)", .{}));
+    }
+    try testing.expectEqual(@as(i64, 1), try d.one(i64, &c, "SELECT count(*) FROM anole_pg_resend", .{}));
+}

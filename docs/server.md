@@ -727,6 +727,13 @@ windows, each of up to `max_concurrent_streams` streams may hold a
 up to `limits.body_max`. Size memory for `max_connections` times
 that, or lower `max_concurrent_streams` or `body_max`.
 
+`max_concurrent_streams` (250) also caps long-lived streams. Chrome shares
+one HTTP/2 connection per origin across every tab of a profile, and an open
+EventSource or a parked long poll counts as an open stream. Past 250, Chrome
+queues new streams without an error: the EventSource stays `CONNECTING`.
+Give a page one EventSource that carries every topic it follows, not one
+per topic; raise `http2.max_concurrent_streams` if you have to.
+
 ## HTTP/3
 
 HTTP/3 needs `-Dhttp3` (on in `full`) and an `https` listener, whose
@@ -1111,6 +1118,26 @@ address from the right, whoever the proxies are. On its own (standalone, no
 listener that nothing but the proxy can reach; with `trusted` set it applies
 to trusted peers only. The two mechanisms combine: the PROXY header sets the
 peer, and the `X-Forwarded-*` rules apply on top.
+
+### Upstream protocol
+
+- **HTTP/1.1 upstream** for ordinary request and response traffic (nginx's
+  `proxy_http_version 1.1` with `keepalive`). It spreads over Anole's
+  cores: each upstream connection lands on one executor and never leaves
+  it, so many pooled connections use every core.
+- **h2c upstream** for gRPC, which needs HTTP/2 (nginx's `grpc_pass`,
+  Caddy's `versions h2c`, Envoy's `http2_protocol_options`). Anole's
+  cleartext listeners accept h2c by default. The caveat: a proxy that
+  multiplexes everything onto one connection per host (Caddy does, up to
+  250 streams) puts all of that traffic on one core. Fewer multiplexed
+  connections cost less CPU per request, so h2c also suits a proxy that
+  opens a connection per worker, as Envoy does.
+- nginx needs nothing extra for server-sent events.
+
+On platforms (`deployment = platform`), Cloud Run's "Use HTTP/2
+end-to-end" and Fly's `h2_backend = true` send h2c with prior knowledge.
+The default cleartext listener serves it as it is; gRPC needs it there, and
+on Cloud Run it also lifts the 32 MiB request size limit of HTTP/1.1.
 
 ## Build flags
 
