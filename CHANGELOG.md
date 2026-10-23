@@ -7,7 +7,7 @@ breaking changes are listed anyway.
 
 The API review before the Node and Python bindings: every breaking change
 of 0.2 is listed below, and [docs/migrating.md](docs/migrating.md)
-has the old -> new table for each area. The C ABI is now 0.7.
+has the old -> new table for each area. The C ABI is now 0.8.
 
 ### Breaking
 
@@ -171,6 +171,10 @@ and docs/c-abi.md ("From ABI 0.6").
 
 ### Added
 
+- WebTransport stream urgency: `Stream.setPriority(urgency)`, 0 (most urgent)
+  to 7, RFC 9218 classes with round-robin inside each; the default stays 3
+  for every stream. C ABI 0.8: `anole_wt_stream_set_priority`.
+
 - `app.listen("3000")` (a bare port) listens on every interface, like
   `":3000"`. A listen address Anole cannot read is now logged with examples.
 - `app.rateLimit(.{ .limit = 100 })`, a one-line in-memory rate limiter.
@@ -261,6 +265,31 @@ and docs/c-abi.md ("From ABI 0.6").
 - `grpc.services[].middleware`: native middleware per gRPC service.
 
 ### Fixed
+
+- HTTP/3 and WebTransport memory: send and receive queues are shared 4 KiB
+  blocks held only while data is unacknowledged or unread (a stream used to
+  keep a 64 KiB ring for its whole life, plus 8 KiB reader and writer
+  buffers); the request-stream pool keeps 64 streams of 4 KiB (was 256 of 8
+  KiB plus rings). A connection's streams hold at most 4 MiB unacknowledged.
+- WebTransport writes no longer wait for the peer's acknowledgments below
+  1 MiB per stream: a 1080p keyframe larger than the old 64 KiB ring blocked
+  mid-write, and audio behind the same lock waited with it.
+- Every waiter of an HTTP/3 connection no longer wakes on every packet: a
+  stream's reader and writer, and a session's `acceptStream`, `openStream`
+  and datagram calls, each wait on their own signal.
+- A WebTransport session on the server runs no tasks of its own: capsules are
+  parsed as they arrive and the drain is a hook (it was two tasks).
+- The WebSocket-over-HTTP/3 and WebTransport CONNECT streams hold up to 1 MiB
+  unacknowledged (ordinary responses keep 64 KiB).
+
+### Changed
+
+- HTTP/3 receive windows no longer auto-tune past the initial ones
+  (`max_window` = `max_data`, `max_stream_window` = `max_stream_data`, was
+  six times each): a peer can no longer park up to 6 MiB of unread data per
+  stream when the app falls behind. One stream's upload now tops out near
+  `max_stream_data` per round trip (about 80 Mbit/s at 100 ms); raise
+  `max_stream_data` for more.
 
 - C ABI: two `anole_ws_publish` calls to the same topic could reach a
   subscriber in the opposite order (they fanned out on different executors).
