@@ -1790,6 +1790,7 @@ const SlowStreams = struct {
 };
 
 fn slowH1(io: std.Io, port: u16) !void {
+    errdefer std.debug.print("slow stream over HTTP/1.1 failed\n", .{});
     const stream = try (try std.Io.net.IpAddress.parse("127.0.0.1", port)).connect(io, .{ .mode = .stream });
     defer stream.close(io);
     var wbuf: [256]u8 = undefined;
@@ -1808,6 +1809,7 @@ fn slowH1(io: std.Io, port: u16) !void {
 }
 
 fn slowH2(io: std.Io, port: u16, path: []const u8) !void {
+    errdefer std.debug.print("slow stream over HTTP/2 {s} failed\n", .{path});
     const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = port });
     defer conn.close();
     const s = try conn.request(&.{
@@ -1823,6 +1825,7 @@ fn slowH2(io: std.Io, port: u16, path: []const u8) !void {
 }
 
 fn slowH3(io: std.Io, port: u16) !void {
+    errdefer std.debug.print("slow stream over HTTP/3 failed\n", .{});
     const conn = try anole.h3.ClientConnection.connect(alloc, io, .{
         .host = "localhost",
         .address = try .parseIp4("127.0.0.1", port),

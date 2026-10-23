@@ -396,10 +396,18 @@ fn subprotocolEcho(req: *dusty.Request, res: *dusty.Response) !void {
 }
 
 fn badHeaders(req: *dusty.Request, res: *dusty.Response) !void {
-    var ws = (try websocket.upgrade(req, res, .{
+    if (websocket.upgrade(req, res, .{
         .headers = &.{.{ .name = "Sec-WebSocket-Accept", .value = "x" }},
-    })) orelse return;
-    ws.deinit();
+    })) |opened| {
+        var ws = opened orelse return;
+        ws.deinit();
+        return;
+    } else |err| {
+        // Refused before anything was written: the handler answers.
+        if (err != error.InvalidHeaderName) return err;
+        res.status = .internal_server_error;
+        res.body = "bad headers";
+    }
 }
 
 /// A handshake with `extra` request headers; the answer's head.
