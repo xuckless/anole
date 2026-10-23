@@ -3,11 +3,21 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
-## Unreleased
+## 0.2.1 (2026-10-23)
 
 The relay pass: cross-task WebSocket sends, fan-out, TLS and HTTP/2
 WebSocket overhead, and HTTP/3 and WebTransport memory and wake-ups. The C
 ABI is now 0.8.
+
+Measured on the x86 box against 0.2.0 (bench/results/20261023-relay-pass-rerun):
+WebSocket video-call relay +9% users at less CPU per message, WebTransport +8%
+users at about half the memory per user (audio now holds through a video
+collapse), room fan-out 2.4x the messages at a quarter of the memory, HTTP/3
+memory -35%. Known trade-offs, tracked as issues: under fan-out past
+saturation a handler's reply waits behind the larger send rounds (#92);
+WebSocket over HTTP/2 costs more CPU per message (#91); WebSocket over
+HTTP/1.1 memory per user and HTTP/3 on io_uring are slightly behind 0.2.0
+(#93, #94).
 
 ### Added
 
@@ -71,7 +81,7 @@ ABI is now 0.8.
 - The WebSocket-over-HTTP/3 and WebTransport CONNECT streams hold up to 1 MiB
   unacknowledged (ordinary responses keep 64 KiB).
 
-## 0.2.0
+## 0.2.0 (2026-10-23)
 
 The API review before the Node and Python bindings: every breaking change
 of 0.2 is listed below, and [docs/migrating.md](docs/migrating.md)

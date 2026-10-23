@@ -43,7 +43,7 @@ try health.addCheck("db", dbReady, &pool);
 - `tracing(.{ .endpoint, .service_name, .sample_all, .exclude, ... })`
   exports through the server's own client. The endpoint and the service
   name default to `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME`
-  when the server has `process` (`init.minimal`), else
+  from the environment (with or without `process`), else
   `http://localhost:4318` and `"anole"`. The server sends the spans still
   queued when it is freed.
 - `metrics` and `tracing` add a middleware, so they go before the routes,

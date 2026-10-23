@@ -39,3 +39,5 @@ zig-pkg/
 # Python bytecode
 __pycache__/
 *.pyc
+
+SECURITY_REVIEW.md

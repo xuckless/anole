@@ -31,6 +31,8 @@ PAGES = {
     "auth.md": ("Auth", "JWT, OIDC sign-in, sessions, CSRF, API keys, roles and rate limits."),
     "observability.md": ("Observability", "Access logs, Prometheus metrics, OpenTelemetry tracing, health checks."),
     "from-fiber.md": ("From-Fiber", "Fiber's API next to Anole's."),
+    "migrating.md": ("Migrating", "What changes between releases and how to update an app."),
+    "c-abi.md": ("C-ABI", "The C ABI that Node, Python and other languages build on."),
 }
 
 LINK = re.compile(r"\]\(([^)\s]+)\)")
