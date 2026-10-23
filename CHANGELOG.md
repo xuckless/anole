@@ -14,6 +14,23 @@ breaking changes are listed anyway.
 
 ### Added
 
+- Webhooks (`-Dwebhooks`, on in the web and full profiles; needs `-Djobs`):
+  `app.webhooks(.{ .jobs = jobs })` keeps endpoints, messages and a delivery
+  log in the jobs store, and `publish` sends an event to the owner's matching
+  endpoints as Standard Webhooks (`webhook-id`, `webhook-timestamp`,
+  `webhook-signature`). Each delivery is a job: retried with backoff for about
+  three days, refused for private addresses in production, behind a circuit
+  breaker per origin, with the attempts recorded. Endpoints get a `whsec_`
+  secret, rotation keeps the old one signing for a while, an endpoint failing
+  for five days is disabled, and `replay` and `recover` re-send. Secrets are
+  encrypted at rest when `ANOLE_WEBHOOKS_KEY` is set.
+- `app.webhookVerify(.{ .preset = .stripe, .secrets = &.{secret} })` checks
+  incoming webhooks (Standard Webhooks, Stripe, GitHub, Slack, or any HMAC
+  header) and drops duplicate deliveries (in memory, or in Redis).
+  `anole.webhooks.standard` has the signing and verifying functions.
+- C ABI: `anole_webhooks_publish` and `anole_webhooks_watch`, events 109 and
+  110, the `"webhooks"` configuration and the `webhook_verify` middleware.
+
 ### Changed
 
 - `anole.db.System` has `s3` and `smtp`, and `anole.resilience.Kind` too.
