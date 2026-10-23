@@ -183,6 +183,10 @@
         "$ref": "#/$defs/Broker"
       },
       "description": "Message brokers for anole_nats_*, opened at start."
+    },
+    "jobs": {
+      "$ref": "#/$defs/Jobs",
+      "description": "The durable job queue for anole_jobs_*."
     }
   },
   "$defs": {
@@ -3910,6 +3914,89 @@
           },
           "description": "What queries with ANOLE_DB_F_RETRY are retried with, on a transient failure (the server unreachable, a connection lost). Ignored for SQLite and MongoDB."
         }
+      }
+    },
+    "Jobs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "store": { "type": "string", "default": "memory", "description": "A databases[].name (SQLite, PostgreSQL or Redis), or \"memory\" (lost on restart)." },
+        "queues": { "type": "array", "default": [{ "name": "default", "concurrency": 10 }], "items": { "$ref": "#/$defs/JobQueue" }, "description": "The queues this process works." },
+        "lease_ms": { "type": "integer", "minimum": 3000, "default": 30000, "description": "How long a claimed job is held without a heartbeat." },
+        "poll_ms": { "type": "integer", "minimum": 100, "maximum": 60000, "default": 1000, "description": "Staging, idle claims and rescue checks." },
+        "migrate": { "type": "boolean", "default": true, "description": "Create the tables at start." },
+        "notify": { "type": "boolean", "default": true, "description": "LISTEN/NOTIFY (PostgreSQL) or pub/sub (Redis) wakes; off behind PgBouncer transaction pooling." },
+        "table_prefix": { "type": "string", "default": "anole_", "maxLength": 32 },
+        "key_prefix": { "type": "string", "default": "anole:", "maxLength": 32 },
+        "kinds": { "type": "array", "default": [], "items": { "$ref": "#/$defs/JobKind" }, "description": "Kinds known by name: their defaults for anole_jobs_enqueue." },
+        "keep": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "completed_ms": { "type": "integer", "minimum": 0, "default": 86400000 },
+            "dead_ms": { "type": "integer", "minimum": 0, "default": 2592000000 },
+            "cancelled_ms": { "type": "integer", "minimum": 0, "default": 604800000 }
+          },
+          "description": "How long finished jobs are kept before the leader prunes them."
+        },
+        "leader": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "method": { "enum": ["auto", "advisory_lock", "lease_row"], "default": "auto" },
+            "ttl_ms": { "type": "integer", "minimum": 1, "default": 15000 },
+            "renew_ms": { "type": "integer", "minimum": 1, "default": 5000 }
+          },
+          "description": "Which instance runs schedules and maintenance."
+        },
+        "drain_ms": { "type": "integer", "minimum": 0, "default": 10000, "description": "How long a server drain lets running jobs finish before they are put back." },
+        "cron": { "type": "array", "default": [], "items": { "$ref": "#/$defs/JobCron" }, "description": "Schedules: each enqueues a job of kind, or runs a statement." }
+      }
+    },
+    "JobQueue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9_.-]{1,64}$" },
+        "concurrency": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 10 }
+      }
+    },
+    "JobKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "maxLength": 128, "description": "1-128 bytes of [A-Za-z0-9_.:-]; \"anole.\" is reserved." },
+        "queue": { "type": "string", "default": "default" },
+        "priority": { "enum": ["critical", "high", "normal", "low"], "default": "normal" },
+        "attempts": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 20 },
+        "timeout_ms": { "type": "integer", "minimum": 0, "default": 900000, "description": "0: no bound." }
+      }
+    },
+    "JobCron": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "schedule"],
+      "properties": {
+        "name": { "type": "string" },
+        "schedule": { "type": "string", "description": "Five fields, or six with seconds first; @daily and the like; @every 90s." },
+        "tz": { "type": ["string", "null"], "default": null, "description": "An IANA name, \"UTC\" or an offset; null: UTC." },
+        "kind": { "type": ["string", "null"], "default": null, "description": "The kind to enqueue; exactly one of kind and sql." },
+        "args": { "description": "The kind's arguments (a JSON value)." },
+        "sql": {
+          "type": ["object", "null"],
+          "default": null,
+          "additionalProperties": false,
+          "required": ["database", "statement"],
+          "properties": {
+            "database": { "type": "string" },
+            "statement": { "type": "string" }
+          },
+          "description": "A statement run on a configured database (SQLite or PostgreSQL) at each tick."
+        },
+        "missed": { "enum": ["once", "skip", "all"], "default": "once" },
+        "catch_up_ms": { "type": "integer", "minimum": 0, "default": 86400000 }
       }
     }
   }

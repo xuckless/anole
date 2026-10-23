@@ -31,6 +31,25 @@ breaking changes are listed anyway.
   `anole_net_conn` and `anole_net_udp`; `anole_stats` net fields; listener
   flags `ANOLE_LISTENER_F_TCP` and `_UDP`.
 
+- `anole.jobs` (`-Djobs`, on in the web and full profiles): background jobs
+  with retries and backoff, delays, priorities, unique jobs, leases with
+  heartbeats, an admin API and JSON routes, on the memory and SQLite stores
+  (PostgreSQL and Redis stores follow). Job kinds are types
+  (`pub const job: anole.jobs.Kind`), `app.jobs(...)` owns the queue.
+- `anole.cron`: cron expressions (5 or 6 fields, `L`, `5L`, `MON#2`,
+  nicknames, `@every`), time zones from the system's tzdata with the DST
+  rules written down in docs/cron.md, and `jobs.cron(...)`, which enqueues
+  one job per tick across instances.
+- `anole.pg.Client.session`: a connection of its own outside the pools.
+- `jobs.enqueueIn`, `enqueueRawIn` and `completeIn` on SQLite transactions,
+  jobs metrics, `traceparent` carried in job meta, and the queue draining when
+  the server does.
+- C ABI: `"jobs"` in the configuration (with native `sql` cron actions),
+  `anole_jobs_get`, `anole_jobs_enqueue` (optionally inside an
+  `anole_db_tx`), `anole_jobs_work` and `anole_jobs_stop`, `anole_job_finish`,
+  `anole_job_complete_in` and `anole_jobs_admin`; events 104-108, handle kinds
+  12 and 13.
+
 ### Changed
 
 - A server that names only raw TCP/UDP listeners opens no HTTP listener.

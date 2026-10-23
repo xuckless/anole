@@ -58,6 +58,8 @@ pub const Config = struct {
     brokers: []const Broker = &.{},
 
     // ---- p3/jobs ----
+    /// The durable job queue for `anole_jobs_*` (-Djobs).
+    jobs: ?Jobs = null,
     // ---- end p3/jobs ----
 
     // ---- p3/webhooks ----
@@ -894,6 +896,57 @@ pub const Config = struct {
     // ---- end p3/net (types) ----
 
     // ---- p3/jobs (types) ----
+    pub const Jobs = struct {
+        /// A `databases[].name` (PostgreSQL, SQLite or Redis), or "memory".
+        store: []const u8 = "memory",
+        queues: []const JobQueue = &.{.{ .name = "default" }},
+        lease_ms: u32 = 30_000,
+        poll_ms: u32 = 1000,
+        migrate: bool = true,
+        notify: bool = true,
+        table_prefix: []const u8 = "anole_",
+        key_prefix: []const u8 = "anole:",
+        /// Kinds known by name: their defaults for `anole_jobs_enqueue`.
+        kinds: []const JobKind = &.{},
+        keep: struct { completed_ms: u64 = 86_400_000, dead_ms: u64 = 2_592_000_000, cancelled_ms: u64 = 604_800_000 } = .{},
+        leader: struct { method: []const u8 = "auto", ttl_ms: u32 = 15_000, renew_ms: u32 = 5000 } = .{},
+        /// How long a server drain lets running jobs finish before they are put back.
+        drain_ms: u32 = 10_000,
+        /// Schedules: each enqueues a job of `kind`, or runs a statement.
+        cron: []const JobCron = &.{},
+    };
+
+    pub const JobCron = struct {
+        name: []const u8,
+        schedule: []const u8,
+        tz: ?[]const u8 = null,
+        /// Exactly one of `kind` and `sql`.
+        kind: ?[]const u8 = null,
+        args: ?std.json.Value = null,
+        sql: ?JobSql = null,
+        /// "once", "skip" or "all".
+        missed: []const u8 = "once",
+        catch_up_ms: u32 = 86_400_000,
+    };
+
+    /// A statement run on a configured database at each tick, with no language involved.
+    pub const JobSql = struct {
+        database: []const u8,
+        statement: []const u8,
+    };
+
+    pub const JobQueue = struct {
+        name: []const u8,
+        concurrency: u32 = 10,
+    };
+
+    pub const JobKind = struct {
+        name: []const u8,
+        queue: []const u8 = "default",
+        priority: []const u8 = "normal",
+        attempts: u16 = 20,
+        timeout_ms: u64 = 900_000,
+    };
     // ---- end p3/jobs (types) ----
 
     // ---- p3/webhooks (types) ----

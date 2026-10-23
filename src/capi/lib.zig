@@ -1449,6 +1449,90 @@ export fn anole_net_udp_find(s: ?*anyopaque, listener: Str, out: ?*u64) i32 {
 // ---- end p3/net ----
 
 // ---- p3/jobs ----
+const jobs_mod = engine.jobs;
+
+fn jobsFailure(err: jobs_mod.CallError) i32 {
+    return switch (err) {
+        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a job's kind, JSON, size or flag, a queue or kind the configuration or another worker does not allow, a transaction on another database than the jobs store)", .{}),
+        error.State => named(abi.E_STATE, "State", 0, "the server is not open (workers: before the start only), or no executor feeds this consumer", .{}),
+        error.OutOfMemory => failCode(abi.E_NOMEM),
+        error.Unsupported => named(abi.E_UNSUPPORTED, "Unsupported", 0, "the configuration has no \"jobs\", or jobs are not built in (-Djobs)", .{}),
+        error.Gone => blk: {
+            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
+            break :blk named(abi.E_GONE, "Gone", 0, "the job, request or transaction it served is over", .{});
+        },
+    };
+}
+
+/// The configuration's job queue (`anole_jobs *`): the engine's own state,
+/// valid until `anole_server_destroy`. `ANOLE_E_UNSUPPORTED` when the
+/// configuration has no "jobs".
+export fn anole_jobs_get(s: ?*anyopaque, out: ?*?*anyopaque) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    if (e.config.jobs == null) return named(abi.E_UNSUPPORTED, "Unsupported", 0, "the configuration has no \"jobs\"", .{});
+    dst.* = @ptrCast(&e.jobs_state);
+    return abi.OK;
+}
+
+fn jobsOf(j: ?*anyopaque) ?*Engine {
+    const st: *jobs_mod.State = @ptrCast(@alignCast(j orelse return null));
+    const e = live() orelse return null;
+    return if (st == &e.jobs_state) e else null;
+}
+
+export fn anole_jobs_enqueue(j: ?*anyopaque, c_: ?*anyopaque, jobs: ?[*]const abi.JobOut, njobs: usize, opts: ?*const abi.JobsEnqueueOptions, user_data: u64) i32 {
+    clearError();
+    const e = jobsOf(j) orelse return badPointer(j);
+    const o: abi.JobsEnqueueOptions = if (opts) |p| (readSized(abi.JobsEnqueueOptions, p) catch |err| return sizedFailure(err)) else .{ .size = @sizeOf(abi.JobsEnqueueOptions) };
+    const c: ?*Consumer = if (c_ == null) null else (consumerOf(c_) orelse return badPointer(c_));
+    if (c == null and o.tx == 0 and o.req == 0) return failCode(abi.E_INVALID);
+    const list = (jobs orelse return failCode(abi.E_INVALID))[0..njobs];
+    jobs_mod.enqueue(e, c, list, o, user_data) catch |err| return jobsFailure(err);
+    return abi.OK;
+}
+
+export fn anole_jobs_work(j: ?*anyopaque, c_: ?*anyopaque, o: ?*const abi.JobsWorkOptions, user_data: u64, out: ?*u64) i32 {
+    clearError();
+    const e = jobsOf(j) orelse return badPointer(j);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    const opt: abi.JobsWorkOptions = if (o) |p| (readSized(abi.JobsWorkOptions, p) catch |err| return sizedFailure(err)) else .{ .size = @sizeOf(abi.JobsWorkOptions) };
+    dst.* = jobs_mod.work(e, c, opt, user_data) catch |err| return jobsFailure(err);
+    return abi.OK;
+}
+
+export fn anole_jobs_stop(w: u64) i32 {
+    if (badKind(w, .job_worker)) return wrongKind();
+    const e = live() orelse return abi.OK;
+    jobs_mod.stop(e, w);
+    return abi.OK;
+}
+
+export fn anole_job_finish(job: u64, outcome: u32, delay_ms: u32, err_text: Str) i32 {
+    clearError();
+    if (badKind(job, .job)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    jobs_mod.finish(e, job, outcome, delay_ms, err_text.slice()) catch |err| return jobsFailure(err);
+    return abi.OK;
+}
+
+export fn anole_job_complete_in(job: u64, tx: u64, user_data: u64) i32 {
+    clearError();
+    if (badKind(job, .job) or badKind(tx, .db_tx)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    jobs_mod.completeIn(e, job, tx, user_data) catch |err| return jobsFailure(err);
+    return abi.OK;
+}
+
+export fn anole_jobs_admin(j: ?*anyopaque, c_: ?*anyopaque, request: Str, user_data: u64) i32 {
+    clearError();
+    const e = jobsOf(j) orelse return badPointer(j);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    jobs_mod.admin(e, c, request.slice(), user_data) catch |err| return jobsFailure(err);
+    return abi.OK;
+}
 // ---- end p3/jobs ----
 
 // ---- p3/webhooks ----

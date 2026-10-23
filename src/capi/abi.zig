@@ -150,6 +150,11 @@ pub const EventType = enum(u32) {
     // ---- end p3/net ----
 
     // ---- p3/jobs ----
+    job_enqueued = 104,
+    job = 105,
+    job_cancel = 106,
+    job_worker_end = 107,
+    jobs_result = 108,
     // ---- end p3/jobs ----
 
     // ---- p3/webhooks ----
@@ -854,6 +859,155 @@ comptime {
 // ---- end p3/net ----
 
 // ---- p3/jobs ----
+/// Priorities of `JobOut.priority` (0: the kind's).
+pub const JOB_PRIORITY_DEFAULT: u8 = 0;
+pub const JOB_PRIORITY_CRITICAL: u8 = 1;
+pub const JOB_PRIORITY_HIGH: u8 = 2;
+pub const JOB_PRIORITY_NORMAL: u8 = 3;
+pub const JOB_PRIORITY_LOW: u8 = 4;
+/// `JobOut.unique_scope` (0: unfinished).
+pub const JOB_UNIQUE_DEFAULT: u8 = 0;
+pub const JOB_UNIQUE_PENDING: u8 = 1;
+pub const JOB_UNIQUE_UNFINISHED: u8 = 2;
+pub const JOB_UNIQUE_ANY: u8 = 3;
+/// `JobOut.flags`: unique by `unique_key`, or by the args when it is empty
+/// (bit 0 stays ANOLE_BODY_BORROW, refused).
+pub const JOB_F_UNIQUE: u32 = 2;
+/// `anole_job_finish` outcomes.
+pub const JOB_DONE: u32 = 0;
+pub const JOB_RETRY: u32 = 1;
+pub const JOB_SNOOZE: u32 = 2;
+pub const JOB_DISCARD: u32 = 3;
+/// `JobCancelEvent.reason`.
+pub const JOB_CANCEL_TIMEOUT: u32 = 1;
+pub const JOB_CANCEL_ADMIN: u32 = 2;
+pub const JOB_CANCEL_LEASE_LOST: u32 = 3;
+pub const JOB_CANCEL_DRAIN: u32 = 4;
+/// `JobWorkerEndEvent.reason`.
+pub const JOB_WORKER_STOPPED: u32 = 0;
+pub const JOB_WORKER_DRAINED: u32 = 1;
+pub const JOB_WORKER_FAILED: u32 = 2;
+
+/// One job to enqueue (`anole_job_out`).
+pub const JobOut = extern struct {
+    size: usize,
+    kind: Str = .{},
+    args_json: Str = .{},
+    queue: Str = .{},
+    unique_key: Str = .{},
+    meta_json: Str = .{},
+    run_at_ms: i64 = 0,
+    delay_ms: u32 = 0,
+    flags: u32 = 0,
+    unique_period_ms: u32 = 0,
+    attempts: u16 = 0,
+    priority: u8 = 0,
+    unique_scope: u8 = 0,
+    timeout_ms: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const JobsEnqueueOptions = extern struct {
+    size: usize,
+    timeout_ms: u32 = 0,
+    reserved: u32 = 0,
+    tx: u64 = 0,
+    req: u64 = 0,
+};
+
+pub const JobsWorkOptions = extern struct {
+    size: usize,
+    queue: Str = .{},
+    kinds: ?[*]const Str = null,
+    nkinds: usize = 0,
+    concurrency: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const JobEnqueuedEntry = extern struct {
+    id: i64,
+    inserted: u32,
+    reserved: u32,
+};
+
+/// ANOLE_EV_JOB_ENQUEUED.
+pub const JobEnqueuedEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    reserved: u8,
+    entries_off: u32,
+    nentries: u32,
+    @"error": Span,
+    error_code: Span,
+};
+
+/// ANOLE_EV_JOB.
+pub const JobEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    worker: u64,
+    id: i64,
+    kind: Span,
+    queue: Span,
+    args: Span,
+    meta: Span,
+    errors: Span,
+    run_at_ms: i64,
+    created_at_ms: i64,
+    timeout_us: i64,
+    attempt: u16,
+    max_attempts: u16,
+    priority: u8,
+    reserved8: u8,
+    reserved16: u16,
+    cron: Span,
+    traceparent: Span,
+};
+
+/// ANOLE_EV_JOB_CANCEL.
+pub const JobCancelEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    id: i64,
+    reason: u32,
+    reserved: u32,
+};
+
+/// ANOLE_EV_JOB_WORKER_END.
+pub const JobWorkerEndEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    reason: u32,
+    reserved: u32,
+    @"error": Span,
+};
+
+/// ANOLE_EV_JOBS_RESULT.
+pub const JobsResultEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    reserved: u8,
+    json: Span,
+    @"error": Span,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(JobOut) == 120);
+    std.debug.assert(@sizeOf(JobsEnqueueOptions) == 32);
+    std.debug.assert(@sizeOf(JobsWorkOptions) == 48);
+    std.debug.assert(@sizeOf(JobEnqueuedEntry) == 16);
+    std.debug.assert(@sizeOf(JobEnqueuedEvent) == 56);
+    std.debug.assert(@sizeOf(JobEvent) == 128);
+    std.debug.assert(@sizeOf(JobCancelEvent) == 40);
+    std.debug.assert(@sizeOf(JobWorkerEndEvent) == 40);
+    std.debug.assert(@sizeOf(JobsResultEvent) == 48);
+}
 // ---- end p3/jobs ----
 
 // ---- p3/webhooks ----
@@ -1065,6 +1219,15 @@ pub const records = .{
     // ---- end p3/net ----
 
     // ---- p3/jobs ----
+    .{ "anole_job_out", JobOut },
+    .{ "anole_jobs_enqueue_options", JobsEnqueueOptions },
+    .{ "anole_jobs_work_options", JobsWorkOptions },
+    .{ "anole_job_enqueued_entry", JobEnqueuedEntry },
+    .{ "anole_job_enqueued_event", JobEnqueuedEvent },
+    .{ "anole_job_event", JobEvent },
+    .{ "anole_job_cancel_event", JobCancelEvent },
+    .{ "anole_job_worker_end_event", JobWorkerEndEvent },
+    .{ "anole_jobs_result_event", JobsResultEvent },
     // ---- end p3/jobs ----
 
     // ---- p3/webhooks ----
@@ -1113,6 +1276,7 @@ pub const arrays = [_]ArrayInfo{
     // ---- end p3/net ----
 
     // ---- p3/jobs ----
+    .{ .record = "anole_job_enqueued_event", .name = "entries", .at = "entries_off", .item = "anole_job_enqueued_entry", .count = "nentries" },
     // ---- end p3/jobs ----
 
     // ---- p3/webhooks ----
@@ -1213,6 +1377,11 @@ pub const events = [_]EventInfo{
     // ---- end p3/net ----
 
     // ---- p3/jobs ----
+    .{ .type = 104, .name = "ANOLE_EV_JOB_ENQUEUED", .record = "anole_job_enqueued_event" },
+    .{ .type = 105, .name = "ANOLE_EV_JOB", .record = "anole_job_event", .handles = &.{"job"}, .obligation = "anole_job_finish (or release = retry)" },
+    .{ .type = 106, .name = "ANOLE_EV_JOB_CANCEL", .record = "anole_job_cancel_event", .handles = &.{"job"} },
+    .{ .type = 107, .name = "ANOLE_EV_JOB_WORKER_END", .record = "anole_job_worker_end_event", .handles = &.{"job_worker"} },
+    .{ .type = 108, .name = "ANOLE_EV_JOBS_RESULT", .record = "anole_jobs_result_event" },
     // ---- end p3/jobs ----
 
     // ---- p3/webhooks ----
@@ -1315,6 +1484,12 @@ pub const constant_groups = [_]ConstantGroup{
     // ---- end p3/net ----
 
     // ---- p3/jobs ----
+    .{ .prefix = "ANOLE_JOB_PRIORITY_", .group = "job_priority" },
+    .{ .prefix = "ANOLE_JOB_UNIQUE_", .group = "job_unique" },
+    .{ .prefix = "ANOLE_JOB_CANCEL_", .group = "job_cancel" },
+    .{ .prefix = "ANOLE_JOB_WORKER_", .group = "job_worker" },
+    .{ .prefix = "ANOLE_JOB_F_", .group = "job_flag" },
+    .{ .prefix = "ANOLE_JOB_", .group = "job_outcome" },
     // ---- end p3/jobs ----
 
     // ---- p3/webhooks ----
