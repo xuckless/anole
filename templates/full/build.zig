@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
         .name = "{{name}}",
         .root_source_file = b.path("src/main.zig"),
         .profile = .full,
+        .protos = &.{.{ .name = "greeter_pb", .file = b.path("proto/greeter.proto") }},
     });
 
     // `zig build test`: src/main_test.zig serves the same routes in memory.
