@@ -14,8 +14,17 @@ breaking changes are listed anyway.
 
 ### Added
 
+- `client.upload(url, options)`: a request whose body is written as it goes
+  (chunked, with trailers), over HTTP/1.1; `client.closeIdle()` closes the
+  idle pooled connections; `Exporter.flush(timeout)` sends queued spans and
+  waits for the collector. The AWS Lambda adapter's event mapping, answers
+  and Runtime API client are in `src/lambda` (docs/lambda.md); the rest of
+  the adapter follows.
+
 ### Changed
 
+- The `RequestId` middleware keeps an ID the engine set already (Lambda's
+  request ID) instead of generating another.
 - `anole.db.System` has `s3` and `smtp`, and `anole.resilience.Kind` too.
 - C ABI: a handle's kind takes five bits (28-32), so Kafka groups and
   batches are kinds of their own (17 and 18): a NATS handle given to a
