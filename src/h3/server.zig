@@ -1275,7 +1275,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// it ends as any other does, once they have.
         fn giveUp(self: *Self, conn: *Conn) void {
             if (conn.tasks.load(.acquire) == 0) return conn.destroy();
-            if (builtin.is_test) _ = self.test_given_up_with_tasks.fetchAdd(1, .monotonic);
+            if (builtin.is_test) _ = self.test_given_up_with_tasks.fetchAdd(1, .release);
             conn.retired = true;
             placement.concurrent(&self.finishers, self.io, .local, Conn.finishTask, .{conn}) catch conn.finish();
         }
