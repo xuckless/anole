@@ -283,6 +283,363 @@
           },
           "default": [],
           "description": "With proxy_protocol: the proxies allowed to send one (addresses or CIDR networks); empty: proxy.trusted when set, else any peer."
+        },
+        "tcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetTcp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Raw TCP instead of HTTP (needs a port or unix; not with http3)."
+        },
+        "udp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetUdp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "UDP instead of HTTP (needs a port; not with tls, unix or proxy_protocol)."
+        }
+      }
+    },
+    "NetFraming": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How input is cut into messages: exactly one of lines, length, varint. Left out: bytes as they arrive.",
+      "properties": {
+        "lines": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "max": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1073741824,
+                  "default": 65536,
+                  "description": "A line longer than this (without its end) closes the connection."
+                },
+                "strip_cr": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Drop a \"\\r\" before the \"\\n\"."
+                },
+                "crlf": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "anole_net_write with ANOLE_NET_F_FRAME ends the line with \"\\r\\n\"."
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "length": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "bytes": {
+                  "type": "integer",
+                  "enum": [
+                    1,
+                    2,
+                    4
+                  ],
+                  "default": 4,
+                  "description": "Bytes of the length prefix."
+                },
+                "endian": {
+                  "type": "string",
+                  "enum": [
+                    "big",
+                    "little"
+                  ],
+                  "default": "big"
+                },
+                "includes_header": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "The length counts its own bytes."
+                },
+                "max": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1073741824,
+                  "default": 1048576,
+                  "description": "A frame longer than this closes the connection."
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "varint": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "max": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1073741824,
+                  "default": 1048576,
+                  "description": "A frame longer than this closes the connection."
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "NetTcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "handler"
+      ],
+      "description": "A raw TCP listener: connections and their data go to the consumer as events (ANOLE_EV_NET_*), not HTTP.",
+      "properties": {
+        "handler": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Carried in the listener's records (handler_id); any number the consumer picks."
+        },
+        "framing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetFraming"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "half_open": {
+          "type": "boolean",
+          "default": false,
+          "description": "After the peer ends its side the connection stays open for writing until the consumer ends it (ANOLE_EV_NET_END)."
+        },
+        "no_delay": {
+          "type": "boolean",
+          "default": true,
+          "description": "TCP_NODELAY."
+        },
+        "keepalive_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 60000,
+          "description": "TCP keep-alive probes after this much silence; null: off."
+        },
+        "handshake_timeout_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 10000,
+          "description": "The PROXY header and the TLS handshake, together; null: the request timeout."
+        },
+        "idle_timeout_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "No input for this long closes the connection; null: never."
+        },
+        "lifetime_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The longest a connection may stay open; null: no limit."
+        },
+        "write_timeout_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 30000,
+          "description": "A flush the peer does not take for this long closes the connection; null: none."
+        },
+        "write_high_water": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 262144,
+          "description": "Past this many queued bytes anole_net_write answers ANOLE_BUSY."
+        },
+        "write_max": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 8388608,
+          "description": "Past this many it takes nothing (ANOLE_E_AGAIN)."
+        },
+        "read_window": {
+          "type": "integer",
+          "minimum": 4096,
+          "maximum": 65536,
+          "default": 16384,
+          "description": "The read buffer of each burst."
+        },
+        "read_ahead": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 262144,
+          "description": "Bytes of one connection posted and not yet polled, at most."
+        },
+        "max_connections": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Open connections on this listener, at most; null: the server's limit alone."
+        },
+        "log_connections": {
+          "type": "boolean",
+          "default": false,
+          "description": "One access-log line per closed connection."
+        }
+      }
+    },
+    "NetUdp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "handler"
+      ],
+      "description": "A raw UDP listener: datagrams go to the consumer in batches (ANOLE_EV_NET_DATAGRAMS). No TLS, unix socket or PROXY header.",
+      "properties": {
+        "handler": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Carried in the listener's records (handler_id)."
+        },
+        "sockets": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 255
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SO_REUSEPORT sockets (Linux), each on an executor; null: one per executor."
+        },
+        "max_datagram": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65507,
+          "default": 2048,
+          "description": "The largest datagram taken; a larger one is dropped and counted."
+        },
+        "batch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 32,
+          "description": "Datagrams per receive call."
+        },
+        "send_queue": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 1048576,
+          "description": "Bytes waiting to go out per socket."
+        },
+        "receive_buffer": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SO_RCVBUF; null: the system's."
+        },
+        "send_buffer": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SO_SNDBUF; null: the system's."
         }
       }
     },

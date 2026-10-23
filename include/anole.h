@@ -281,6 +281,8 @@ ANOLE_API anole_status anole_server_set_ready(anole_server *s, anole_str check, 
 #define ANOLE_LISTENER_F_HTTP3 8u
 #define ANOLE_LISTENER_F_UNIX 16u
 #define ANOLE_LISTENER_F_PROXY_PROTOCOL 32u
+#define ANOLE_LISTENER_F_TCP 64u  /* a raw TCP listener ("tcp" in the configuration) */
+#define ANOLE_LISTENER_F_UDP 128u /* a UDP listener ("udp"): port is 0, udp_port is the bound port */
 enum {
   ANOLE_LISTENER_PENDING = 0,   /* not bound yet (before start, or start under way) */
   ANOLE_LISTENER_LISTENING = 1, /* bound and accepting */
@@ -360,6 +362,14 @@ typedef struct anole_stats {
   uint64_t ws_messages_out;
   uint64_t wt_sessions;          /* WebTransport sessions open now */
   uint64_t wt_datagrams_dropped; /* outgoing datagrams dropped: past datagram_queue, or too large */
+  /* ---- p3/net ---- */
+  uint64_t net_connections;       /* raw TCP connections open now */
+  uint64_t net_bytes_in;          /* bytes read from raw TCP connections (added as each closes) */
+  uint64_t net_bytes_out;
+  uint64_t udp_datagrams_in;
+  uint64_t udp_datagrams_out;
+  uint64_t udp_datagrams_dropped; /* received but lost (kernel buffer, too large) or refused to send */
+  /* ---- end p3/net ---- */
 } anole_stats;
 /* Counters since start. Fills what out->size covers. */
 ANOLE_API anole_status anole_server_stats(anole_server *s, anole_stats *out);
@@ -495,6 +505,14 @@ enum anole_event_type {
                                     ANOLE_E_AGAIN (or advised with ANOLE_BUSY) would be taken now */
   ANOLE_EV_KAFKA_GROUP_END = 85, /* anole_broker_end_event; handle: anole_kafka_group, now over */
   /* ---- p3/net ---- */
+  ANOLE_EV_NET_OPEN = 96,        /* anole_net_open_event; handle: anole_net_conn, until
+                                    ANOLE_EV_NET_CLOSE */
+  ANOLE_EV_NET_DATA = 97,        /* anole_net_data_event; handle: anole_net_conn */
+  ANOLE_EV_NET_END = 98,         /* anole_event: the peer ended its side. With tcp.half_open,
+                                    end this side when done (ANOLE_NET_F_END or a close) */
+  ANOLE_EV_NET_CLOSE = 99,       /* anole_net_close_event: the connection is over; its handle
+                                    is stale */
+  ANOLE_EV_NET_DATAGRAMS = 100,  /* anole_net_datagrams_event; handle: anole_net_udp */
   /* ---- end p3/net ---- */
 
   /* ---- p3/jobs ---- */
@@ -1787,6 +1805,169 @@ typedef struct anole_kafka_assign_event {
 } anole_kafka_assign_event; /* 32 bytes */
 
 /* ---- p3/net ---- */
+/* ---- raw TCP and UDP ----
+   A "tcp" or "udp" key on a listener in the configuration serves that
+   listener's connections (TCP, optionally with TLS, PROXY protocol and a
+   framing) or datagrams (UDP) to the consumer as events, instead of HTTP.
+   Writes never wait for the peer: a write returns once the bytes are
+   queued (ANOLE_BUSY past tcp.write_high_water, ANOLE_E_AGAIN past
+   tcp.write_max with nothing taken), and ANOLE_EV_WRITABLE says when to go
+   on. A connection posts at most tcp.read_ahead bytes the consumer has not
+   polled; the rest waits in the kernel (TCP flow control). */
+
+/* An IP address and port, binary (no parsing on the hot path). family 4:
+   addr[0..4]; 6: addr[0..16] (IPv4 peers of a dual-stack socket come as 4);
+   0: none (a unix socket). */
+typedef struct anole_net_addr {
+  uint16_t family;
+  uint16_t port;
+  uint32_t scope_id;   /* IPv6 link-local zone, else 0 */
+  uint8_t addr[16];
+} anole_net_addr;      /* 24 bytes */
+
+/* "203.0.113.9:4711", "[2001:db8::1]:443": bytes written (no NUL), or
+   ANOLE_E_TOOBIG when cap is short (64 always fits), ANOLE_E_INVALID for
+   family 0 or another. No server needed. */
+ANOLE_API int64_t anole_net_addr_format(const anole_net_addr *a, char *buf, size_t cap);
+/* The reverse, for a literal address and a port ("[::1]:53", "10.0.0.1:53").
+   ANOLE_E_INVALID for anything else (names are not resolved). */
+ANOLE_API anole_status anole_net_addr_parse(anole_str text, anole_net_addr *out);
+
+/* anole_net_open_event.flags */
+#define ANOLE_NET_OPEN_F_TLS 1u       /* TLS on this listener */
+#define ANOLE_NET_OPEN_F_PEER_CERT 2u /* mutual TLS: see peer_cert */
+#define ANOLE_NET_OPEN_F_PROXIED 4u   /* remote and local come from a PROXY header */
+#define ANOLE_NET_OPEN_F_SECURE 8u    /* TLS here, or the PROXY v2 SSL TLV */
+#define ANOLE_NET_OPEN_F_UNIX 16u
+enum {
+  ANOLE_NET_FRAMING_NONE = 0,
+  ANOLE_NET_FRAMING_LINES = 1,
+  ANOLE_NET_FRAMING_LENGTH = 2,
+  ANOLE_NET_FRAMING_VARINT = 3
+};
+
+/* ANOLE_EV_NET_OPEN: a connection on a "tcp" listener, ready (PROXY header
+   read, TLS handshake done). Data, END and CLOSE follow on this consumer.
+   The spans point into the record, after the struct. */
+typedef struct anole_net_open_event {
+  anole_event ev;          /*   0 handle: anole_net_conn */
+  uint32_t handler_id;     /*  16 the listener's tcp.handler */
+  uint32_t flags;          /*  20 ANOLE_NET_OPEN_F_* */
+  anole_net_addr remote;   /*  24 the client (the PROXY source when proxied) */
+  anole_net_addr local;    /*  48 */
+  anole_span listener;     /*  72 */
+  anole_span remote_text;  /*  80 "ip:port" ("[ip]:port"); empty on a unix socket */
+  anole_span alpn;         /*  88 the protocol ALPN chose, empty when none */
+  anole_span server_name;  /*  96 SNI */
+  anole_span peer_cert;    /* 104 DER, with ANOLE_NET_OPEN_F_PEER_CERT */
+  uint32_t framing;        /* 112 ANOLE_NET_FRAMING_* of the listener */
+  uint32_t reserved;       /* 116 */
+} anole_net_open_event;    /* 120 bytes */
+
+#define ANOLE_NET_DATA_F_FRAMES 1u /* each span is one whole frame (prefix or line end removed) */
+/* ANOLE_EV_NET_DATA: what one read burst brought, followed at frames_off by
+   `anole_span frames[nframes]` and the bytes. Without framing: one span, the
+   bytes as they came (up to 64 KiB per record). With framing: every whole
+   frame of the burst, in order (a frame larger than 64 KiB comes in a record
+   of its own). Each record's bytes count against the connection's read_ahead
+   until polled. */
+typedef struct anole_net_data_event {
+  anole_event ev;          /*  0 handle: anole_net_conn */
+  uint32_t flags;          /* 16 ANOLE_NET_DATA_F_* */
+  uint32_t nframes;        /* 20 */
+  uint32_t frames_off;     /* 24 */
+  uint32_t reserved;       /* 28 */
+} anole_net_data_event;    /* 32 bytes */
+
+enum {
+  ANOLE_NET_CLOSED_PEER = 0,
+  ANOLE_NET_CLOSED_LOCAL = 1,
+  ANOLE_NET_CLOSED_RESET = 2,
+  ANOLE_NET_CLOSED_FAILED = 3,
+  ANOLE_NET_CLOSED_IDLE = 4,
+  ANOLE_NET_CLOSED_WRITE_TIMEOUT = 5,
+  ANOLE_NET_CLOSED_LIFETIME = 6,
+  ANOLE_NET_CLOSED_FRAME = 7,
+  ANOLE_NET_CLOSED_DRAIN = 8,
+  ANOLE_NET_CLOSED_SERVER = 9
+};
+/* ANOLE_EV_NET_CLOSE: the connection is over; its handle is stale. */
+typedef struct anole_net_close_event {
+  anole_event ev;          /*  0 */
+  uint32_t reason;         /* 16 ANOLE_NET_CLOSED_* */
+  int32_t error_errno;     /* 20 the OS error behind FAILED or RESET, else 0 */
+  uint64_t bytes_in;       /* 24 */
+  uint64_t bytes_out;      /* 32 */
+  uint64_t duration_ms;    /* 40 */
+  anole_span error;        /* 48 a token for logs ("ConnectionReset", "InvalidFrame"), empty when none */
+} anole_net_close_event;   /* 56 bytes */
+
+/* One datagram of an ANOLE_EV_NET_DATAGRAMS. */
+typedef struct anole_net_datagram_in {
+  anole_net_addr remote;   /*  0 */
+  anole_net_addr local;    /* 24 the address it was sent to (family 0 when the socket is not wildcard-bound) */
+  anole_span data;         /* 48 */
+  uint64_t reserved;       /* 56 */
+} anole_net_datagram_in;   /* 64 bytes */
+/* ANOLE_EV_NET_DATAGRAMS: one receive batch of a "udp" listener's socket
+   (ev.handle; reply through it), followed at datagrams_off by
+   `anole_net_datagram_in datagrams[ndatagrams]` and the bytes. A peer's
+   datagrams always come through the same socket, in order. */
+typedef struct anole_net_datagrams_event {
+  anole_event ev;          /*  0 handle: anole_net_udp */
+  uint32_t handler_id;     /* 16 */
+  uint32_t ndatagrams;     /* 20 */
+  uint32_t datagrams_off;  /* 24 */
+  uint32_t dropped;        /* 28 datagrams lost on this socket since its last record (the kernel's
+                                  receive buffer overflowed, or one was too large) */
+} anole_net_datagrams_event; /* 32 bytes */
+
+/* anole_net_write flags (bit 0 is ANOLE_BODY_BORROW) */
+#define ANOLE_NET_F_END 2u   /* after these bytes (len may be 0), end this side: TLS close_notify, then FIN */
+#define ANOLE_NET_F_FRAME 4u /* frame the bytes by the listener's framing (prefix, or line end) */
+
+/* Queues bytes (copied, or borrowed with ANOLE_BODY_BORROW: ANOLE_EV_SENT
+   follows; a framed write is always copied); never blocks, never waits for
+   the peer. ANOLE_OK; ANOLE_BUSY: taken, but past tcp.write_high_water bytes
+   wait (write no more until ANOLE_EV_WRITABLE on c); ANOLE_E_AGAIN: not
+   taken, past tcp.write_max (ANOLE_EV_WRITABLE follows); ANOLE_E_INVALID: a
+   flag, ANOLE_NET_F_FRAME on a listener without framing or over its max, or
+   after this side ended ("Ended"); ANOLE_E_GONE once closed. */
+ANOLE_API anole_status anole_net_write(anole_net_conn c, const void *data, size_t len, uint32_t flags);
+
+enum { ANOLE_NET_CLOSE_GRACEFUL = 0, ANOLE_NET_CLOSE_RESET = 1 };
+/* GRACEFUL: what is queued goes out, this side ends, input is dropped until
+   the peer ends (at most 2 s), then ANOLE_EV_NET_CLOSE (LOCAL). RESET: now,
+   with an RST; queued bytes are dropped (borrowed ones get their SENT). A
+   cleanup call; anole_handle_release is GRACEFUL. */
+ANOLE_API anole_status anole_net_close(anole_net_conn c, uint32_t how);
+/* Stops reading c (its input waits in the kernel: TCP slows the peer) until
+   anole_net_resume. Data already read may still come. Answer calls:
+   ANOLE_E_GONE once closed. */
+ANOLE_API anole_status anole_net_pause(anole_net_conn c);
+ANOLE_API anole_status anole_net_resume(anole_net_conn c);
+/* Replaces the listener's tcp.idle_timeout_ms for c (0: none). */
+ANOLE_API anole_status anole_net_set_idle_timeout(anole_net_conn c, uint32_t ms);
+
+/* One datagram to send. from.family 0: the system picks the source. */
+typedef struct anole_net_datagram {
+  anole_net_addr to;       /*  0 */
+  anole_net_addr from;     /* 24 a received datagram's `local`, to answer from the address it reached */
+  const void *data;        /* 48 */
+  size_t len;              /* 56 */
+} anole_net_datagram;      /* 64 bytes */
+/* Queues n datagrams on u (all copied), sent together; never blocks. All or
+   none: ANOLE_OK; ANOLE_BUSY (taken, past half of udp.send_queue);
+   ANOLE_E_AGAIN (none taken: the queue is full; ANOLE_EV_WRITABLE on u
+   follows); ANOLE_E_INVALID (a datagram over 65507 bytes or the socket's
+   max_datagram, an address of the wrong family, n 0, flags != 0);
+   ANOLE_E_GONE after the stop. Datagrams are unreliable: one the kernel
+   refuses is dropped and counted. */
+ANOLE_API anole_status anole_net_udp_send(anole_net_udp u, const anole_net_datagram *d, size_t n, uint32_t flags);
+/* The first socket of the "udp" listener named `listener`, to send without
+   having received (any socket of a listener sends from its port). After
+   anole_server_start. ANOLE_E_INVALID ("UnknownListener"). */
+ANOLE_API anole_status anole_net_udp_find(anole_server *s, anole_str listener, anole_net_udp *out);
 /* ---- end p3/net ---- */
 
 /* ---- p3/jobs ---- */

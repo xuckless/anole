@@ -1346,6 +1346,106 @@ export fn anole_db_tx_release(tx: u64) i32 {
 }
 
 // ---- p3/net ----
+
+export fn anole_net_addr_format(a: ?*const abi.NetAddr, buf: ?[*]u8, cap: usize) i64 {
+    const addr = a orelse return failCode(abi.E_INVALID);
+    const ip: std.Io.net.IpAddress = switch (addr.family) {
+        4 => .{ .ip4 = .{ .bytes = addr.addr[0..4].*, .port = addr.port } },
+        6 => .{ .ip6 = .{ .bytes = addr.addr, .port = addr.port, .interface = .{ .index = addr.scope_id } } },
+        else => return failCode(abi.E_INVALID),
+    };
+    var tmp: [96]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&tmp);
+    ip.format(&w) catch return failCode(abi.E_TOOBIG);
+    const text = w.buffered();
+    if (text.len > cap) return failCode(abi.E_TOOBIG);
+    if (text.len > 0) @memcpy((buf orelse return failCode(abi.E_INVALID))[0..text.len], text);
+    return @intCast(text.len);
+}
+
+export fn anole_net_addr_parse(text: Str, out: ?*abi.NetAddr) i32 {
+    const o = out orelse return failCode(abi.E_INVALID);
+    o.* = .{};
+    const ip = std.Io.net.IpAddress.parseLiteral(text.slice()) catch
+        return named(abi.E_INVALID, "Invalid", 0, "not an IP address literal with a port (\"10.0.0.1:53\", \"[::1]:53\"); names are not resolved", .{});
+    switch (ip) {
+        .ip4 => |v| {
+            o.family = 4;
+            o.port = v.port;
+            @memcpy(o.addr[0..4], &v.bytes);
+        },
+        .ip6 => |v| {
+            o.family = 6;
+            o.port = v.port;
+            o.scope_id = v.interface.index;
+            o.addr = v.bytes;
+        },
+    }
+    return abi.OK;
+}
+
+export fn anole_net_write(c: u64, data: ?*const anyopaque, len: usize, flags: u32) i32 {
+    if (badKind(c, .net_conn)) return wrongKind();
+    if (flags & ~(abi.BODY_BORROW | abi.NET_F_END | abi.NET_F_FRAME) != 0) return unknownFlag();
+    const b = bytes(data, len) orelse return failCode(abi.E_INVALID);
+    const e = live() orelse return failCode(abi.E_GONE);
+    const busy = engine.net.write(e, c, b, flags) catch |err| return switch (err) {
+        error.Invalid => named(abi.E_INVALID, engine.net.invalid_token, 0, "{s}", .{engine.net.invalid_text}),
+        else => answer(err),
+    };
+    return if (busy) abi.BUSY else abi.OK;
+}
+
+export fn anole_net_close(c: u64, how: u32) i32 {
+    if (badKind(c, .net_conn)) return wrongKind();
+    const e = live() orelse return abi.OK;
+    engine.net.closeConn(e, c, how) catch |err| return cleanup(err);
+    return abi.OK;
+}
+
+export fn anole_net_pause(c: u64) i32 {
+    if (badKind(c, .net_conn)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    engine.net.pause(e, c, true) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_net_resume(c: u64) i32 {
+    if (badKind(c, .net_conn)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    engine.net.pause(e, c, false) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_net_set_idle_timeout(c: u64, ms: u32) i32 {
+    if (badKind(c, .net_conn)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    engine.net.setIdleTimeout(e, c, ms) catch |err| return answer(err);
+    return abi.OK;
+}
+
+export fn anole_net_udp_send(u: u64, d: ?[*]const abi.NetDatagram, n: usize, flags: u32) i32 {
+    if (badKind(u, .net_udp)) return wrongKind();
+    if (flags != 0) return unknownFlag();
+    if (n == 0) return named(abi.E_INVALID, "Invalid", 0, "anole_net_udp_send needs at least one datagram", .{});
+    const items = (d orelse return failCode(abi.E_INVALID))[0..n];
+    const e = live() orelse return failCode(abi.E_GONE);
+    const busy = engine.net.udpSend(e, u, items, flags) catch |err| return answer(err);
+    return if (busy) abi.BUSY else abi.OK;
+}
+
+export fn anole_net_udp_find(s: ?*anyopaque, listener: Str, out: ?*u64) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    const o = out orelse return failCode(abi.E_INVALID);
+    o.* = 0;
+    o.* = engine.net.udpFind(e, listener.slice()) catch |err| return switch (err) {
+        error.Invalid => named(abi.E_INVALID, "UnknownListener", 0, "no UDP listener of that name", .{}),
+        error.State => named(abi.E_STATE, "State", 0, "anole_net_udp_find works once the server runs (after anole_server_start)", .{}),
+        else => answer(err),
+    };
+    return abi.OK;
+}
 // ---- end p3/net ----
 
 // ---- p3/jobs ----

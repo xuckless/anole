@@ -266,7 +266,7 @@ pub const Conn = struct {
     context: ?*anyopaque = null,
 
     fn tc(c: *const Conn) *TcpConn {
-        return @constCast(@fieldParentPtr("conn", c));
+        return @alignCast(@constCast(@fieldParentPtr("conn", c)));
     }
 
     pub fn contextAs(c: *const Conn, comptime T: type) *T {
@@ -326,6 +326,36 @@ pub const Conn = struct {
     /// Mutual TLS: the client's certificate (DER), verified.
     pub fn peerCertificate(c: *const Conn) ?[]const u8 {
         return c.tc().connection.peerCertificate();
+    }
+
+    /// TLS on this connection itself (not just the PROXY v2 SSL TLV).
+    pub fn isTls(c: *const Conn) bool {
+        return c.tc().connection.tls_conn != null;
+    }
+
+    /// Its addresses came from a PROXY header.
+    pub fn proxied(c: *const Conn) bool {
+        const t = c.tc();
+        return t.connection.proxied_peer != null or t.connection.proxied_local != null;
+    }
+
+    pub fn isUnix(c: *const Conn) bool {
+        return c.tc().info.listener.address == .unix;
+    }
+
+    /// What the connection moved so far, for the end-of-life records.
+    pub const Totals = struct { bytes_in: u64, bytes_out: u64, duration_ms: u64, errno: i32 };
+
+    pub fn totals(c: *const Conn) Totals {
+        const t = c.tc();
+        const now = std.Io.Clock.Timestamp.now(t.io, .awake);
+        const ms = @divTrunc(t.opened_at.durationTo(now).raw.nanoseconds, std.time.ns_per_ms);
+        return .{
+            .bytes_in = t.bytes_in,
+            .bytes_out = t.bytes_out.load(.monotonic),
+            .duration_ms = @intCast(@max(0, ms)),
+            .errno = t.errno_value.load(.monotonic),
+        };
     }
 
     pub const Sent = enum { ok, busy };
@@ -497,7 +527,7 @@ pub const ListenerStats = struct {
     bytes_in: std.atomic.Value(u64) = .init(0),
     bytes_out: std.atomic.Value(u64) = .init(0),
     queue_full: std.atomic.Value(u64) = .init(0),
-    closes: [@typeInfo(CloseReason).@"enum".fields.len]std.atomic.Value(u64) = @splat(.init(0)),
+    closes: [std.enums.values(CloseReason).len]std.atomic.Value(u64) = @splat(.init(0)),
 };
 
 var next_conn_id: std.atomic.Value(u64) = .init(1);
@@ -541,7 +571,7 @@ pub const TcpListener = struct {
     }
 
     fn start(raw: *const dusty.Raw, connection: *dusty.Connection, info: *const dusty.RawInfo) anyerror!?*dusty.Adopter {
-        const self: *TcpListener = @constCast(@fieldParentPtr("raw", raw));
+        const self: *TcpListener = @alignCast(@constCast(@fieldParentPtr("raw", raw)));
         return TcpConn.open(self, connection, info);
     }
 };
@@ -601,7 +631,7 @@ const Driver = struct {
             while (rev) |t| {
                 rev = t.next;
                 t.next = null;
-                t.service();
+                t.serviceOutbox();
                 t.helperDone();
             }
         }
@@ -724,7 +754,8 @@ const TcpConn = struct {
         t.tuneSocket(o);
         const table = service.table;
         if (table.state_size > 0) {
-            t.state_buf = try gpa.alignedAlloc(u8, .fromByteUnits(table.state_align), table.state_size);
+            std.debug.assert(table.state_align <= 16);
+            t.state_buf = try gpa.alignedAlloc(u8, .@"16", table.state_size);
             table.state_init.?(t.state_buf.ptr);
             t.conn.context = t.state_buf.ptr;
         }
@@ -745,7 +776,7 @@ const TcpConn = struct {
     }
 
     fn release(a: *dusty.Adopter) void {
-        const t: *TcpConn = @fieldParentPtr("adopter", a);
+        const t: *TcpConn = @alignCast(@fieldParentPtr("adopter", a));
         const io = t.io;
         // No more output; unblock anything writing or waiting.
         t.closed.store(true, .release);
@@ -1039,7 +1070,7 @@ const TcpConn = struct {
     }
 
     /// The driver's turn with a kicked connection.
-    fn service(t: *TcpConn) void {
+    fn serviceOutbox(t: *TcpConn) void {
         if (comptime native_os != .windows) {
             if (t.connection.tls_conn == null and !t.close_graceful.load(.acquire)) return t.serviceDirect();
         }
@@ -1346,7 +1377,7 @@ const TcpConn = struct {
 
     /// Runs under the drain's lock: must not wait.
     fn onDrain(hook: *dusty.DrainHooks.Hook) void {
-        const t: *TcpConn = @fieldParentPtr("drain_hook", hook);
+        const t: *TcpConn = @alignCast(@fieldParentPtr("drain_hook", hook));
         if (t.service.table.drain == null) return;
         _ = t.spawn(drainTask);
     }
@@ -1384,7 +1415,7 @@ const TcpConn = struct {
     // -- Serving ---------------------------------------------------------------
 
     fn serve(a: *dusty.Adopter, burst: *dusty.Burst) anyerror!dusty.Burst.End {
-        const t: *TcpConn = @fieldParentPtr("adopter", a);
+        const t: *TcpConn = @alignCast(@fieldParentPtr("adopter", a));
         if (t.ending) return .close;
         if (t.task_form) return t.serveTask(burst);
         const w = t.service.options.read_window;
@@ -1683,7 +1714,7 @@ const TaskWriter = struct {
     interface: std.Io.Writer,
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *TaskWriter = @fieldParentPtr("interface", w);
+        const self: *TaskWriter = @alignCast(@fieldParentPtr("interface", w));
         const t = self.conn;
         if (w.end > 0) {
             _ = t.queue(&.{w.buffered()}, 0) catch return error.WriteFailed;

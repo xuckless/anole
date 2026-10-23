@@ -78,6 +78,15 @@ pub const Stats = extern struct {
     ws_messages_out: u64 = 0,
     wt_sessions: u64 = 0,
     wt_datagrams_dropped: u64 = 0,
+    // ---- p3/net ----
+    /// Raw TCP connections open now, and the bytes they moved (summed as each closes).
+    net_connections: u64 = 0,
+    net_bytes_in: u64 = 0,
+    net_bytes_out: u64 = 0,
+    udp_datagrams_in: u64 = 0,
+    udp_datagrams_out: u64 = 0,
+    udp_datagrams_dropped: u64 = 0,
+    // ---- end p3/net ----
 };
 
 pub const CONSUMER_F_SHARED: u32 = 1;
@@ -133,6 +142,11 @@ pub const EventType = enum(u32) {
     kafka_group_end = 85,
 
     // ---- p3/net ----
+    net_open = 96,
+    net_data = 97,
+    net_end = 98,
+    net_close = 99,
+    net_datagrams = 100,
     // ---- end p3/net ----
 
     // ---- p3/jobs ----
@@ -231,6 +245,8 @@ pub const LISTENER_F_HTTP2: u32 = 4;
 pub const LISTENER_F_HTTP3: u32 = 8;
 pub const LISTENER_F_UNIX: u32 = 16;
 pub const LISTENER_F_PROXY_PROTOCOL: u32 = 32;
+pub const LISTENER_F_TCP: u32 = 64;
+pub const LISTENER_F_UDP: u32 = 128;
 pub const LISTENER_PENDING: u32 = 0;
 pub const LISTENER_LISTENING: u32 = 1;
 pub const LISTENER_FAILED: u32 = 2;
@@ -718,6 +734,123 @@ pub const KafkaAssignEvent = extern struct {
 };
 
 // ---- p3/net ----
+/// An IP address and port, binary. family 4: addr[0..4]; 6: addr[0..16]; 0: none.
+pub const NetAddr = extern struct {
+    family: u16 = 0,
+    port: u16 = 0,
+    scope_id: u32 = 0,
+    addr: [16]u8 = @splat(0),
+};
+
+pub const NET_OPEN_F_TLS: u32 = 1;
+pub const NET_OPEN_F_PEER_CERT: u32 = 2;
+pub const NET_OPEN_F_PROXIED: u32 = 4;
+pub const NET_OPEN_F_SECURE: u32 = 8;
+pub const NET_OPEN_F_UNIX: u32 = 16;
+pub const NET_FRAMING_NONE: u32 = 0;
+pub const NET_FRAMING_LINES: u32 = 1;
+pub const NET_FRAMING_LENGTH: u32 = 2;
+pub const NET_FRAMING_VARINT: u32 = 3;
+
+/// ANOLE_EV_NET_OPEN: a connection on a "tcp" listener, ready. The spans
+/// point into the record, after the struct.
+pub const NetOpenEvent = extern struct {
+    ev: Event,
+    handler_id: u32,
+    flags: u32,
+    remote: NetAddr,
+    local: NetAddr,
+    listener: Span,
+    remote_text: Span,
+    alpn: Span,
+    server_name: Span,
+    peer_cert: Span,
+    framing: u32,
+    reserved: u32 = 0,
+};
+
+pub const NET_DATA_F_FRAMES: u32 = 1;
+
+/// ANOLE_EV_NET_DATA: what one read burst brought; at `frames_off`,
+/// `anole_span frames[nframes]` and the bytes they point into.
+pub const NetDataEvent = extern struct {
+    ev: Event,
+    flags: u32,
+    nframes: u32,
+    frames_off: u32,
+    reserved: u32 = 0,
+};
+
+pub const NET_CLOSED_PEER: u32 = 0;
+pub const NET_CLOSED_LOCAL: u32 = 1;
+pub const NET_CLOSED_RESET: u32 = 2;
+pub const NET_CLOSED_FAILED: u32 = 3;
+pub const NET_CLOSED_IDLE: u32 = 4;
+pub const NET_CLOSED_WRITE_TIMEOUT: u32 = 5;
+pub const NET_CLOSED_LIFETIME: u32 = 6;
+pub const NET_CLOSED_FRAME: u32 = 7;
+pub const NET_CLOSED_DRAIN: u32 = 8;
+pub const NET_CLOSED_SERVER: u32 = 9;
+
+/// ANOLE_EV_NET_CLOSE: the connection is over; its handle is stale.
+pub const NetCloseEvent = extern struct {
+    ev: Event,
+    reason: u32,
+    error_errno: i32,
+    bytes_in: u64,
+    bytes_out: u64,
+    duration_ms: u64,
+    @"error": Span,
+};
+
+/// One datagram of an ANOLE_EV_NET_DATAGRAMS.
+pub const NetDatagramIn = extern struct {
+    remote: NetAddr,
+    local: NetAddr,
+    data: Span,
+    reserved: u64 = 0,
+};
+
+/// ANOLE_EV_NET_DATAGRAMS: one receive batch of a "udp" listener's socket,
+/// followed at `datagrams_off` by `anole_net_datagram_in datagrams[]`.
+pub const NetDatagramsEvent = extern struct {
+    ev: Event,
+    handler_id: u32,
+    ndatagrams: u32,
+    datagrams_off: u32,
+    dropped: u32,
+};
+
+/// `anole_net_write` flags (bit 0 is ANOLE_BODY_BORROW).
+pub const NET_F_END: u32 = 2;
+pub const NET_F_FRAME: u32 = 4;
+pub const NET_CLOSE_GRACEFUL: u32 = 0;
+pub const NET_CLOSE_RESET: u32 = 1;
+
+/// One datagram to send (`anole_net_udp_send`).
+pub const NetDatagram = extern struct {
+    to: NetAddr,
+    from: NetAddr,
+    data: ?*const anyopaque,
+    len: usize,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(NetAddr) == 24);
+    std.debug.assert(@sizeOf(NetOpenEvent) == 120);
+    std.debug.assert(@offsetOf(NetOpenEvent, "remote") == 24);
+    std.debug.assert(@offsetOf(NetOpenEvent, "local") == 48);
+    std.debug.assert(@offsetOf(NetOpenEvent, "listener") == 72);
+    std.debug.assert(@offsetOf(NetOpenEvent, "peer_cert") == 104);
+    std.debug.assert(@offsetOf(NetOpenEvent, "framing") == 112);
+    std.debug.assert(@sizeOf(NetDataEvent) == 32);
+    std.debug.assert(@sizeOf(NetCloseEvent) == 56);
+    std.debug.assert(@offsetOf(NetCloseEvent, "bytes_in") == 24);
+    std.debug.assert(@offsetOf(NetCloseEvent, "error") == 48);
+    std.debug.assert(@sizeOf(NetDatagramIn) == 64);
+    std.debug.assert(@sizeOf(NetDatagramsEvent) == 32);
+    std.debug.assert(@sizeOf(NetDatagram) == 64);
+}
 // ---- end p3/net ----
 
 // ---- p3/jobs ----
@@ -922,6 +1055,13 @@ pub const records = .{
     .{ "anole_kafka_assign_event", KafkaAssignEvent },
 
     // ---- p3/net ----
+    .{ "anole_net_addr", NetAddr },
+    .{ "anole_net_open_event", NetOpenEvent },
+    .{ "anole_net_data_event", NetDataEvent },
+    .{ "anole_net_close_event", NetCloseEvent },
+    .{ "anole_net_datagram_in", NetDatagramIn },
+    .{ "anole_net_datagrams_event", NetDatagramsEvent },
+    .{ "anole_net_datagram", NetDatagram },
     // ---- end p3/net ----
 
     // ---- p3/jobs ----
@@ -968,6 +1108,8 @@ pub const arrays = [_]ArrayInfo{
     .{ .record = "anole_kafka_assign_event", .name = "entries", .at = "entries_off", .item = "anole_kafka_partition", .count = "nentries" },
 
     // ---- p3/net ----
+    .{ .record = "anole_net_data_event", .name = "frames", .at = "frames_off", .item = "anole_span", .count = "nframes" },
+    .{ .record = "anole_net_datagrams_event", .name = "datagrams", .at = "datagrams_off", .item = "anole_net_datagram_in", .count = "ndatagrams" },
     // ---- end p3/net ----
 
     // ---- p3/jobs ----
@@ -1063,6 +1205,11 @@ pub const events = [_]EventInfo{
     .{ .type = 85, .name = "ANOLE_EV_KAFKA_GROUP_END", .record = "anole_broker_end_event", .handles = &.{"kafka_group"} },
 
     // ---- p3/net ----
+    .{ .type = 96, .name = "ANOLE_EV_NET_OPEN", .record = "anole_net_open_event", .handles = &.{"net_conn"} },
+    .{ .type = 97, .name = "ANOLE_EV_NET_DATA", .record = "anole_net_data_event", .handles = &.{"net_conn"} },
+    .{ .type = 98, .name = "ANOLE_EV_NET_END", .record = "anole_event", .handles = &.{"net_conn"}, .obligation = "with half_open: end this side when done (ANOLE_NET_F_END or close)" },
+    .{ .type = 99, .name = "ANOLE_EV_NET_CLOSE", .record = "anole_net_close_event", .handles = &.{"net_conn"} },
+    .{ .type = 100, .name = "ANOLE_EV_NET_DATAGRAMS", .record = "anole_net_datagrams_event", .handles = &.{"net_udp"} },
     // ---- end p3/net ----
 
     // ---- p3/jobs ----
@@ -1159,6 +1306,12 @@ pub const constant_groups = [_]ConstantGroup{
     .{ .prefix = "ANOLE_BROKER_", .group = "broker_status" },
 
     // ---- p3/net ----
+    .{ .prefix = "ANOLE_NET_OPEN_F_", .group = "net_open_flag" },
+    .{ .prefix = "ANOLE_NET_FRAMING_", .group = "net_framing" },
+    .{ .prefix = "ANOLE_NET_DATA_F_", .group = "net_data_flag" },
+    .{ .prefix = "ANOLE_NET_CLOSED_", .group = "net_closed_by" },
+    .{ .prefix = "ANOLE_NET_F_", .group = "net_write_flag" },
+    .{ .prefix = "ANOLE_NET_CLOSE_", .group = "net_close_mode" },
     // ---- end p3/net ----
 
     // ---- p3/jobs ----
@@ -1262,7 +1415,19 @@ const base_error_names = [_][]const u8{
 };
 
 // ---- p3/net ----
-const net_error_names = [_][]const u8{};
+const net_error_names = [_][]const u8{
+    "Ended",
+    "InvalidFraming",
+    "NetHandlerContext",
+    "NetListenerHttp3",
+    "NetListenerNeedsPort",
+    "NetNotBuilt",
+    "TcpAndUdp",
+    "UdpOnUnixSocket",
+    "UdpWithProxyProtocol",
+    "UdpWithTls",
+    "UnknownListener",
+};
 // ---- end p3/net ----
 
 // ---- p3/jobs ----

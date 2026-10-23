@@ -1344,7 +1344,7 @@ pub const Engine = struct {
             };
             break :blk .fromMilliseconds(@as(i64, longest) + 5000);
         } else null;
-        const listeners = try buildListeners(a, cfg);
+        const listeners = try e.buildListeners(a, cfg);
         return .{
             .listeners = listeners,
             .executors = if (cfg.executors == 0) .auto else .exact(@intCast(cfg.executors)),
@@ -1419,7 +1419,7 @@ pub const Engine = struct {
         return false;
     }
 
-    fn buildListeners(a: std.mem.Allocator, cfg: Config) ![]const anole.ServerOptions.Listener {
+    fn buildListeners(e: *Engine, a: std.mem.Allocator, cfg: Config) ![]const anole.ServerOptions.Listener {
         const out = try a.alloc(anole.ServerOptions.Listener, cfg.listeners.len);
         for (cfg.listeners, out) |l, *o| {
             o.* = .{
@@ -1432,6 +1432,10 @@ pub const Engine = struct {
                 .http3 = l.http3,
                 .proxy_protocol = l.proxy_protocol,
                 .proxy_protocol_from = l.proxy_protocol_from,
+                // ---- p3/net ----
+                .tcp = if (l.tcp) |t| try net.tcpService(e, a, t) else null,
+                .udp = if (l.udp) |u| try net.udpService(e, a, u) else null,
+                // ---- end p3/net ----
             };
             if (l.tls) |t| {
                 if (comptime features.tls != .boringssl) return error.Unsupported;
@@ -1588,7 +1592,9 @@ pub const Engine = struct {
             e.started.set(threadedIo());
             return;
         };
-        for (app.addresses(), 0..) |addr, i| {
+        for (app.addresses(), 0..) |addr, core_i| {
+            // The core's listeners leave out the UDP ones.
+            const i = net.configIndex(e, core_i);
             if (i >= e.listeners.len) break;
             const l = &e.listeners[i];
             var w: std.Io.Writer = .fixed(&l.bound_buf);
@@ -1605,6 +1611,7 @@ pub const Engine = struct {
         if (app.http3Address()) |q| for (e.config.listeners, e.listeners) |lc, *l| {
             if (lc.http3) l.udp_port = q.getPort();
         };
+        net.opened(e, app);
         for (e.listeners) |*l| l.state.store(abi.LISTENER_LISTENING, .release);
         e.started.set(threadedIo());
     }
@@ -1612,7 +1619,8 @@ pub const Engine = struct {
     /// A start that failed binding listener `index` (or none known): its
     /// state turns FAILED with the reason.
     fn noteFailedListener(e: *Engine, index: ?usize, err: anyerror) void {
-        const i = index orelse return;
+        // The core's index: its listeners leave out the UDP ones.
+        const i = net.configIndex(e, index orelse return);
         if (i >= e.listeners.len) return;
         e.failed_listener = i;
         const l = &e.listeners[i];
@@ -1941,6 +1949,7 @@ pub const Engine = struct {
 
     /// Their `close` hooks, in the reverse order.
     fn closeAreas(e: *Engine) void {
+        net.close(e);
         watch.close(e);
         webhooks.close(e);
         jobs.close(e);
@@ -2013,11 +2022,15 @@ fn listenerState(a: std.mem.Allocator, l: anole.ServerOptions.Listener) !Listene
     if (l.http3) flags |= abi.LISTENER_F_HTTP3;
     if (l.unix != null) flags |= abi.LISTENER_F_UNIX;
     if (l.proxy_protocol orelse false) flags |= abi.LISTENER_F_PROXY_PROTOCOL;
-    const scheme = if (l.tls != null) "https" else "http";
+    if (l.tcp != null) flags |= abi.LISTENER_F_TCP;
+    if (l.udp != null) flags |= abi.LISTENER_F_UDP;
+    const scheme = if (l.udp != null) "udp" else if (l.tcp != null) "tcp" else if (l.tls != null) "https" else "http";
     const name: []const u8 = l.name orelse if (l.unix) |path|
         try std.fmt.allocPrint(a, "unix-{s}", .{path})
+    else if (l.port) |p|
+        try std.fmt.allocPrint(a, "{s}-{d}", .{ scheme, p })
     else
-        try std.fmt.allocPrint(a, "{s}-{d}", .{ scheme, l.port.? });
+        try std.fmt.allocPrint(a, "{s}", .{scheme});
     // "127.0.0.1:8080", "[::]:8443", "unix:/run/app.sock".
     const address: []const u8 = if (l.unix) |path|
         try std.fmt.allocPrint(a, "unix:{s}", .{path})
@@ -3118,6 +3131,9 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                     @memcpy(out[pos..][0..ev.len], rec[0..ev.len]);
                     pos += ev.len;
                     const len = ev.len;
+                    // ---- p3/net ----
+                    if (ev.type == @backingInt(abi.EventType.net_data)) net.polled(e, ev.handle, len);
+                    // ---- end p3/net ----
                     freeRecord(rec);
                     x.ring.pop();
                     popped = true;
@@ -3167,6 +3183,9 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                 }
                 @memcpy(out[pos..][0..ev.len], rec[0..ev.len]);
                 pos += ev.len;
+                // ---- p3/net ----
+                if (ev.type == @backingInt(abi.EventType.net_data)) net.polled(e, ev.handle, ev.len);
+                // ---- end p3/net ----
                 x.ovf_head = linkOf(rec).*;
                 if (x.ovf_head == null) x.ovf_tail = null;
                 freeRecord(rec);

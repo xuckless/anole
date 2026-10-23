@@ -17,6 +17,15 @@ pub const ServerError = error{
     DeploymentUnavailable,
     ProxyProtocolNoPeers,
     // ---- p3/net ----
+    NetNotBuilt,
+    NetListenerNeedsPort,
+    NetListenerHttp3,
+    TcpAndUdp,
+    UdpWithTls,
+    UdpOnUnixSocket,
+    UdpWithProxyProtocol,
+    InvalidFraming,
+    NetHandlerContext,
     // ---- end p3/net ----
 
     // ---- p3/lambda ----
@@ -265,6 +274,46 @@ pub fn explain(err: ServerError, ctx: Context, w: *std.Io.Writer) std.Io.Writer.
             try fix(w, "Name the load balancers in proxy.trusted or the listener's proxy_protocol_from.");
         },
         // ---- p3/net ----
+        error.NetNotBuilt => {
+            try w.writeAll("can't serve raw TCP or UDP: this build leaves it out.");
+            try fix(w, "Build with -Dnet (on in the web and full profiles).");
+        },
+        error.NetListenerNeedsPort => {
+            try w.writeAll("can't start a raw TCP or UDP listener: ");
+            try w.writeAll(ctx.detail orelse "it has no port");
+            try w.writeAll(".");
+            try fix(w, "Give it a port (0 picks a free one) or a unix socket path; a raw listener never takes $PORT or 8080.");
+        },
+        error.NetListenerHttp3 => {
+            try w.writeAll("can't serve HTTP/3 on a raw TCP or UDP listener.");
+            try fix(w, "Turn http3 off for that listener.");
+        },
+        error.TcpAndUdp => {
+            try w.writeAll("can't make one listener both TCP and UDP.");
+            try fix(w, "Use two listeners: one with tcp, one with udp.");
+        },
+        error.UdpWithTls => {
+            try w.writeAll("can't use TLS on a UDP listener: DTLS is not supported.");
+            try fix(w, "Leave tls out of the UDP listener, or serve the protocol over TCP.");
+        },
+        error.UdpOnUnixSocket => {
+            try w.writeAll("can't listen for UDP on a unix socket.");
+            try fix(w, "Give the UDP listener an address and a port.");
+        },
+        error.UdpWithProxyProtocol => {
+            try w.writeAll("can't read the PROXY protocol on a UDP listener.");
+            try fix(w, "Turn proxy_protocol off for the UDP listener.");
+        },
+        error.InvalidFraming => {
+            try w.writeAll("can't use these raw listener options: ");
+            try w.writeAll(ctx.detail orelse "a limit is out of range");
+            try w.writeAll(".");
+            try fix(w, "Length prefixes are 1, 2 or 4 bytes, a frame max 1 byte to 1 GiB, read_window 4 KiB to 64 KiB, batch 1 to 64, max_datagram up to 65507.");
+        },
+        error.NetHandlerContext => {
+            try w.writeAll("can't serve a raw listener built for another server state type.");
+            try fix(w, "Build the service with this server's Ctx (app.tcp and app.udp do).");
+        },
         // ---- end p3/net ----
 
         // ---- p3/lambda ----
