@@ -24,6 +24,9 @@ pub const Config = struct {
     error_detail: ?bool = null,
     /// Logging, process-wide: the format and a service name.
     log: Log = .{},
+    /// Print the startup banner when stderr is a terminal and the logs are
+    /// text. Off by default under the ABI: a binding opts in.
+    banner: bool = false,
     listeners: []const Listener = &.{.{}},
     timeouts: Timeouts = .{},
     limits: Limits = .{},

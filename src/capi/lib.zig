@@ -344,9 +344,18 @@ export fn anole_server_create(options: ?*const abi.ServerOptions, out: ?*?*anyop
 
 /// A start or open that failed, as an answer.
 fn startFailure(e: *Engine, err: anyerror, comptime what: []const u8) i32 {
+    const explained = e.explained[0..e.explained_len];
     // Which listener could not be bound, in the text.
     if (e.failed_listener) |i| if (i < e.listeners.len) {
         const l = &e.listeners[i];
+        // The log's own words: what could not be done, why, and the way out.
+        if (explained.len > 0) return named(
+            if (l.error_errno != 0) abi.E_SYSTEM else abi.E_CONFIG,
+            l.error_name,
+            l.error_errno,
+            "{s}",
+            .{explained},
+        );
         return named(
             if (l.error_errno != 0) abi.E_SYSTEM else abi.E_CONFIG,
             l.error_name,
@@ -363,7 +372,10 @@ fn startFailure(e: *Engine, err: anyerror, comptime what: []const u8) i32 {
         // such as metrics) that the router cannot tell apart.
         error.RouteConflict => return named(abi.E_CONFIG, "RouteConflict", 0, "routes: {s}", .{e.start_why[0..e.start_why_len]}),
         error.OutOfMemory => return fail(abi.E_NOMEM, what, err),
-        error.DatabaseUnavailable => return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), what ++ ": {t}", .{err}),
+        error.DatabaseUnavailable => {
+            if (explained.len > 0) return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), "{s}", .{explained});
+            return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), what ++ ": {t}", .{err});
+        },
         else => {},
     }
     const token = engine.errorName(err);

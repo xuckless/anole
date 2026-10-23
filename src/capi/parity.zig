@@ -319,6 +319,7 @@ pub const server_options = [_]Entry{
     .{ .zig = "environment", .json = "environment" },
     .{ .zig = "deployment", .json = "deployment" },
     .{ .zig = "error_detail", .json = "error_detail" },
+    .{ .zig = "banner", .json = "banner", .kind = .custom, .note = "true in Zig, false in the ABI (a binding opts in)" },
     .{ .zig = "log.format", .json = "log.format" },
     .{ .zig = "log.level", .omitted = "the ABI keeps `anole_server_options.log_level`" },
     .{ .zig = "log.service", .json = "log.service" },

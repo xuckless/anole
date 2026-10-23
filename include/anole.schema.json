@@ -83,6 +83,11 @@
       },
       "description": "Logging, process-wide (docs/logging.md)."
     },
+    "banner": {
+      "type": "boolean",
+      "default": false,
+      "description": "Print the startup banner (the anole, the version, the address) to stderr when it is a terminal and log.format resolves to text. Never under systemd. ANOLE_NO_BANNER=1 turns it off."
+    },
     "environment": {
       "anyOf": [
         {

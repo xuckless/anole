@@ -53,6 +53,7 @@ const h3 = if (features.http3) @import("h3/root.zig") else struct {};
 const address_mod = @import("address.zig");
 const handlers = @import("handlers.zig");
 const typed = @import("typed.zig");
+const banner_mod = @import("banner.zig");
 const anole_log = @import("anole_log");
 const log_mod = @import("log.zig");
 const route_pattern = @import("dusty").route_pattern;
@@ -207,6 +208,11 @@ pub const Options = struct {
     /// text otherwise), a level filter, a service name written in every
     /// JSON record. docs/logging.md.
     log: anole_log.Options = .{},
+    /// Print the startup banner (the anole, the version, the address) when
+    /// stderr is a terminal and the logs are text. Never under systemd, in
+    /// JSON logs or when piped; off with false or `ANOLE_NO_BANNER=1`. The
+    /// C ABI's default is false (config `banner`).
+    banner: bool = true,
 
     // Modes (docs/config.md)
 
@@ -663,6 +669,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         restart_timeout: Duration = .fromSeconds(10),
         /// `Options.signals`.
         signals: bool = true,
+        /// `Options.banner`.
+        banner: bool = true,
         /// The HTTP/3 endpoint, when `Options.http3` asked for one.
         h3: H3Endpoint,
         /// The blocking pool, when `Options.blocking` asked for one.
@@ -712,6 +720,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// in order.
             connectors: std.ArrayList(Connector) = .empty,
             connectors_started: bool = false,
+            /// The connector whose start failed, and why (for the startup error's text).
+            failed_system: ?[]const u8 = null,
+            failed_cause: ?[]const u8 = null,
             /// One certificate reload at a time.
             cert_mutex: std.Io.Mutex = .init,
         };
@@ -724,6 +735,17 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             context: *anyopaque,
             start: *const fn (context: *anyopaque, metrics: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) anyerror!void,
             deinit: *const fn (context: *anyopaque) void,
+            /// "postgres", "redis"...; "connector" for the rest.
+            name: []const u8 = "connector",
+
+            fn systemOf(comptime T: type) []const u8 {
+                const n = @typeName(T);
+                inline for (.{ "postgres:pg", "sqlite:sqlite", "mongodb:mongodb", "redis:redis", "nats:nats", "kafka:kafka" }) |pair| {
+                    const colon = comptime std.mem.indexOfScalar(u8, pair, ':').?;
+                    if (std.mem.find(u8, n, pair[colon + 1 ..]) != null) return pair[0..colon];
+                }
+                return "connector";
+            }
 
             fn of(comptime T: type, value: *T) Connector {
                 const Hooks = struct {
@@ -736,7 +758,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         v.deinit();
                     }
                 };
-                return .{ .context = value, .start = Hooks.start, .deinit = Hooks.deinit };
+                return .{ .context = value, .start = Hooks.start, .deinit = Hooks.deinit, .name = comptime systemOf(T) };
             }
         };
 
@@ -970,6 +992,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .process = opts.process,
                 .restart_timeout = opts.restart_timeout,
                 .signals = opts.signals,
+                .banner = opts.banner,
                 .h3 = if (features.http3) null else {},
                 .blocking_pool = pool,
                 .extras = extras,
@@ -1544,8 +1567,47 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (!self.server.settled.isSet()) {
                 self.server.start_error = err;
                 self.server.settled.set(self.rt.io());
+                // Once, readable: what could not be done, why, and the way out.
+                errors.logExplained(err, self.startContext(err));
             }
             return err;
+        }
+
+        /// The readable text of the startup failure `err` (`errors.explain`
+        /// with this server's context: the listener that failed, the
+        /// connector), into `buf`; empty for an error that is not one of
+        /// `ServerError`'s. The C ABI's `anole_last_error` shows the same.
+        pub fn explainStart(self: *Self, buf: []u8, err: anyerror) []const u8 {
+            const known = errors.serverErrorNamed(@errorName(err)) orelse return "";
+            return errors.explainBuf(buf, known, self.startContext(known));
+        }
+
+        /// What `errors.explain` needs to know about a startup failure.
+        fn startContext(self: *Self, err: errors.ServerError) errors.Context {
+            var ctx: errors.Context = .{};
+            if (err == error.AddressInUse or err == error.AddressNotAvailable or err == error.AccessDenied) {
+                if (self.server.start_error_listener) |i| {
+                    const listeners = self.server.config.listeners;
+                    if (i < listeners.len) {
+                        const l = listeners[i];
+                        ctx.listener = l.name;
+                        const a = self.arena.allocator();
+                        switch (l.address) {
+                            .ip => |ip| {
+                                ctx.address = std.fmt.allocPrint(a, "{f}", .{ip}) catch null;
+                                ctx.port = ip.getPort();
+                            },
+                            .unix => |u| ctx.address = u.path,
+                        }
+                    }
+                }
+            }
+            if (err == error.DatabaseUnavailable) {
+                ctx.system = self.extras.failed_system;
+                ctx.cause = self.extras.failed_cause;
+            }
+            if (err == error.RouteConflict) ctx.detail = self.router.conflict;
+            return ctx;
         }
 
         /// `failStart` for whatever the layers below returned. A second
@@ -2118,7 +2180,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const extras = self.extras;
             if (extras.connectors_started) return;
             extras.connectors_started = true;
-            for (extras.connectors.items) |c| try c.start(c.context, extras.metrics, extras.exporter, extras.health);
+            for (extras.connectors.items) |c| c.start(c.context, extras.metrics, extras.exporter, extras.health) catch |err| {
+                extras.failed_system = c.name;
+                extras.failed_cause = @errorName(err);
+                return err;
+            };
             if (extras.metrics) |registry| {
                 const cfg = extras.client.config;
                 if (cfg.breaker != null or cfg.retry != null) {
@@ -2556,20 +2622,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         fn runInner(self: *Self) !void {
             if (self.pending) |opts| try self.configure(opts);
+            self.printBanner();
             self.logModes();
             logBuildMode(self.mode.debug_production);
             self.addHelperRoutes();
             // Only with `router.record_conflicts` (the C ABI, test builds): a
             // route that conflicted with another, or that the helper routes
             // collided with.
-            if (self.router.conflict) |msg| {
-                if (!http.core.expect_log.swallow()) errors.log.err("{s}", .{msg});
-                return self.failStart(error.RouteConflict);
-            }
-            self.startConnectors() catch |err| {
-                errors.log.err("a database connector could not start: {t}", .{err});
-                return self.failStart(error.DatabaseUnavailable);
-            };
+            if (self.router.conflict != null) return self.failStart(error.RouteConflict);
+            self.startConnectors() catch return self.failStart(error.DatabaseUnavailable);
             const rt_io = self.rt.io();
             const Done = union(enum) {
                 int: anyerror!void,
@@ -2682,6 +2743,82 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 }
                 if (self.process) |p| sd_notify.ready(p.environ, null);
             }
+        }
+
+        /// The banner, when a person is looking (docs/server.md): see
+        /// `Options.banner`.
+        fn printBanner(self: *const Self) void {
+            if (comptime builtin.is_test) return;
+            const dbg_io = std.Options.debug_io;
+            const tty = std.Io.File.stderr().isTty(dbg_io) catch false;
+            const Env = struct {
+                pub fn get(_: @This(), name: []const u8) ?[]const u8 {
+                    return @import("db/url.zig").realEnv(null, name);
+                }
+            };
+            const env: Env = .{};
+            if (!banner_mod.show(self.banner, anole_log.currentFormat() == .text, tty, env)) return;
+            var info: banner_mod.Info = .{ .version = features.version, .environment = @tagName(self.mode.environment) };
+            const listeners = self.server.config.listeners;
+            var host_buf: [64]u8 = undefined;
+            if (listeners.len > 0) {
+                const l = listeners[0];
+                info.scheme = if (l.tls != null) "https" else "http";
+                info.h1 = l.http1;
+                if (l.tls) |t| {
+                    for (t.alpn_protocols) |p| if (std.mem.eql(u8, p, "h2")) {
+                        info.h2 = true;
+                    };
+                } else info.h2 = l.http2_prior_knowledge;
+                if (comptime features.http3) info.h3 = l.tls != null and self.h3 != null;
+                switch (l.address) {
+                    .ip => |ip| {
+                        info.port = ip.getPort();
+                        const local = switch (ip) {
+                            .ip4 => |a| a.bytes[0] == 127 or std.mem.eql(u8, &a.bytes, &.{ 0, 0, 0, 0 }),
+                            .ip6 => |a| blk: {
+                                // :: (every interface) or ::1.
+                                for (a.bytes[0..15]) |b| if (b != 0) break :blk false;
+                                break :blk a.bytes[15] == 0 or a.bytes[15] == 1;
+                            },
+                        };
+                        if (local) {
+                            info.host = "localhost";
+                        } else {
+                            var w: std.Io.Writer = .fixed(&host_buf);
+                            switch (ip) {
+                                .ip4 => |a| w.print("{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }) catch {},
+                                .ip6 => w.print("[{f}]", .{ip}) catch {},
+                            }
+                            info.host = w.buffered();
+                        }
+                    },
+                    .unix => {},
+                }
+            }
+            var buf: [1024]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            banner_mod.write(&w, info, banner_mod.styleFor(terminalColumns(dbg_io), env)) catch return;
+            const prev = dbg_io.swapCancelProtection(.blocked);
+            defer _ = dbg_io.swapCancelProtection(prev);
+            var lock_buf: [64]u8 = undefined;
+            const t = std.debug.lockStderr(&lock_buf).terminal();
+            defer std.debug.unlockStderr();
+            t.writer.writeAll(w.buffered()) catch return;
+            t.writer.flush() catch {};
+        }
+
+        /// The width of the terminal on stderr, or null when unknown.
+        fn terminalColumns(dbg_io: std.Io) ?usize {
+            if (comptime builtin.os.tag == .windows) return null;
+            var size: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+            const result = (dbg_io.operate(.{ .device_io_control = .{
+                .file = std.Io.File.stderr(),
+                .code = std.posix.T.IOCGWINSZ,
+                .arg = &size,
+            } }) catch return null).device_io_control;
+            if (result < 0 or size.col == 0) return null;
+            return size.col;
         }
 
         /// The startup lines about the environment and deployment

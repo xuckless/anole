@@ -931,6 +931,10 @@ pub const Engine = struct {
     /// (`error.RouteConflict`: the routes).
     start_why: [400]u8 = undefined,
     start_why_len: usize = 0,
+    /// A start that failed, as `errors.explain` says it (the same text the
+    /// log has): what `anole_last_error` shows.
+    explained: [640]u8 = undefined,
+    explained_len: usize = 0,
     stopped: std.Io.Event = .unset,
     /// The server, on the run thread's stack: freed when `run` returns.
     /// Control calls from other threads (`drain`, the reloads) reach it
@@ -1172,6 +1176,7 @@ pub const Engine = struct {
         // The databases connect now (`connect_at_start` included): the
         // consumers can query before anything listens.
         app.startConnectors() catch |err| {
+            e.explained_len = app.explainStart(&e.explained, error.DatabaseUnavailable).len;
             e.tasks.cancel(app.io());
             db.close(e);
             nats.close(e);
@@ -1204,6 +1209,7 @@ pub const Engine = struct {
         nats.close(e);
         if (result) |_| {} else |err| {
             if (!e.started.isSet()) {
+                e.explained_len = app.explainStart(&e.explained, err).len;
                 e.noteFailedListener(app.failedListenerIndex(), err);
                 e.start_error = err;
                 e.started.set(threadedIo());
@@ -1247,6 +1253,7 @@ pub const Engine = struct {
             .deployment = cfg.deployment,
             .error_detail = cfg.error_detail,
             .log = .{ .format = cfg.log.format, .service = cfg.log.service },
+            .banner = cfg.banner,
             .timeouts = .{
                 .request = request,
                 .read_header = msOrNull(cfg.timeouts.read_header_ms),
