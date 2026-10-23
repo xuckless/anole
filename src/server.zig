@@ -2341,7 +2341,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `zig build openapi` / `openapi-check`: writes or compares the
         /// document, before anything binds or starts.
         fn openapiTool(self: *Self, env: OpenApiEnv) !void {
-            const log = std.log.scoped(.anole);
+            const log = errors.log;
             if (comptime !features.openapi) return self.failStart(error.OpenApiNotBuilt);
             if (self.router.conflict != null) return self.failStart(error.RouteConflict);
             const doc = self.openapiDocument(self.gpa) catch |err| return self.failStart(errors.toServerError(err));
@@ -2803,7 +2803,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             logBuildMode(self.mode.debug_production);
             self.addHelperRoutes();
             if (comptime features.openapi) if (self.extras.openapi_failed) |err| {
-                std.log.scoped(.anole).err("openapi: the document can't be built: {t}", .{err});
+                errors.log.err("openapi: the document can't be built: {t}", .{err});
                 return self.failStart(errors.toServerError(err));
             };
             // Only with `router.record_conflicts` (the C ABI, test builds): a

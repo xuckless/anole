@@ -457,6 +457,7 @@ pub fn build(b: *std.Build) void {
     // `zig build test --fuzz` needs LLVM: Zig 0.17's self-hosted backend (the
     // Debug default on x86_64-linux) emits no coverage tables, so the fuzzer
     // would see none ("pcs_len was zero").
+    const test_filter = b.option([]const u8, "test-filter", "Run only the unit tests whose name contains this text (zig build test -Dtest-filter=golden)");
     const use_llvm = b.option(bool, "llvm", "Build the unit tests with LLVM (needed for --fuzz on x86_64-linux)");
     // The BSON corpus, a test-only download: requested here so a fresh cache
     // fetches it with the C libraries, and never for a project depending on
@@ -515,6 +516,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");
     const tests = b.addTest(.{
         .name = "anole-test",
+        .filters = if (test_filter) |f| b.dupeStrings(&.{f}) else &.{},
         .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url, .nats_test_url = nats_test_url, .kafka_test_url = kafka_test_url }),
         .use_llvm = use_llvm,
     });

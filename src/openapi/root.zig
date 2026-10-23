@@ -139,4 +139,5 @@ test {
     _ = fixed;
     _ = page;
     _ = proto;
+    _ = @import("golden_test.zig");
 }

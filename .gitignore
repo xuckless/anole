@@ -39,3 +39,4 @@ zig-pkg/
 # Python bytecode
 __pycache__/
 *.pyc
+*.actual.json

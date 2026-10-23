@@ -440,7 +440,7 @@ pub fn paramOf(comptime Dto: type, comptime field: []const u8) ParamInfo {
             .schema = node(p),
             .description = if (description.len > 0) joined(description) else null,
             .deprecated = doc.deprecated,
-            .is_list = Item != Value,
+            .is_list = Item != Value and !isString(Value),
             .required = @typeInfo(F) != .optional and attrs.default_value_ptr == null,
         };
     }
@@ -964,4 +964,25 @@ test "a jsonStringify type uses Doc.as" {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "field_rules become keywords, and the tighter bound wins" {
+    const Rules = struct {
+        name: []const u8,
+        age: u8,
+        tags: []const []const u8 = &.{},
+        pub const field_rules = .{
+            .name = .{ v.minLength(2), v.maxLength(10) },
+            .age = v.min(18),
+            .tags = v.maxItems(3),
+        };
+    };
+    const text = try written(componentOf(Rules).schema, &.{});
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "\"minLength\": 2") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"maxLength\": 10") != null);
+    // The rule's 18 is tighter than the type's 0; the type's 255 stays.
+    try testing.expect(std.mem.indexOf(u8, text, "\"minimum\": 18") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"maximum\": 255") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"maxItems\": 3") != null);
 }
