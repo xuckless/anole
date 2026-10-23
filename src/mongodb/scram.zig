@@ -19,7 +19,17 @@ pub fn newConversation(arena: std.mem.Allocator, mechanism: Mechanism, username:
     };
 }
 
-
+/// SCRAM-SHA-1's password: `hex(md5(username ":mongo:" password))`.
+pub fn mongoHashedPassword(arena: std.mem.Allocator, username: []const u8, password: []const u8) error{OutOfMemory}![]const u8 {
+    var md5 = std.crypto.hash.Md5.init(.{});
+    md5.update(username);
+    md5.update(":mongo:");
+    md5.update(password);
+    var digest: [16]u8 = undefined;
+    md5.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return arena.dupe(u8, &hex);
+}
 
 test "MongoDB's hashed password (auth.md)" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);

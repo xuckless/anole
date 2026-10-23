@@ -203,11 +203,12 @@ test "batch round trip with every codec, headers, nulls" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const big = "x" ** 500;
+    var big: [500]u8 = undefined;
+    @memset(&big, 'x');
     const recs = [_]Rec{
         .{ .key = "k1", .value = "hello", .headers = &.{ .{ .key = "h", .value = "v" }, .{ .key = "n" } }, .timestamp_ms = 1_700_000_000_000 },
         .{ .key = null, .value = null, .timestamp_ms = 1_700_000_000_005 },
-        .{ .key = "k3", .value = big, .timestamp_ms = 1_700_000_000_010 },
+        .{ .key = "k3", .value = &big, .timestamp_ms = 1_700_000_000_010 },
     };
     for ([_]Codec{ .none, .gzip, .zstd, .lz4 }) |codec| {
         const batch = try encodeBatch(testing.allocator, &recs, .{ .codec = codec, .producer_id = 7, .producer_epoch = 1, .base_sequence = 0 });
