@@ -1251,8 +1251,8 @@ const TcpConn = struct {
     /// The local end is finished (FIN sent): the connection is over when
     /// the peer's side is too.
     fn endFinished(t: *TcpConn) void {
-        t.end_done.store(true, .release);
-        if (t.peer_ended.load(.acquire)) t.setOver();
+        t.end_done.store(true, .seq_cst);
+        if (t.peer_ended.load(.seq_cst)) t.setOver();
     }
 
     fn setOver(t: *TcpConn) void {
@@ -1536,7 +1536,7 @@ const TcpConn = struct {
     /// queued is out.
     fn peerEnded(t: *TcpConn, burst: *dusty.Burst) anyerror!dusty.Burst.End {
         t.setReason(.peer);
-        t.peer_ended.store(true, .release);
+        t.peer_ended.store(true, .seq_cst);
         const o = &t.service.options;
         if (o.half_open) {
             if (t.service.table.end) |f| {
@@ -1549,9 +1549,11 @@ const TcpConn = struct {
                     return .close;
                 };
             }
-            if (t.end_done.load(.acquire)) t.setOver();
+            if (t.end_done.load(.seq_cst)) t.setOver();
         } else {
             t.requestEnd(false);
+            // Ended already (an `end` before the peer's): both sides are.
+            if (t.end_done.load(.seq_cst)) t.setOver();
         }
         burst.deadline = t.lifetimeAt();
         burst.armDeadline();

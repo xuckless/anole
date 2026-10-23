@@ -1164,6 +1164,9 @@ pub const Engine = struct {
     pub fn needsConsumer(e: *const Engine) bool {
         for (e.config.routes) |r| if (r.handler != null or r.websocket != null or r.webtransport != null) return true;
         if (e.config.grpc) |g| if (g.services.len > 0) return true;
+        // ---- p3/net ----
+        for (e.config.listeners) |l| if (l.tcp != null or l.udp != null) return true;
+        // ---- end p3/net ----
         return false;
     }
 

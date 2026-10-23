@@ -423,3 +423,189 @@ test "net tcp: a raw listener beside HTTP, in one server" {
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
+
+const Who = struct {
+    pub fn open(conn: *net.Conn) !void {
+        var buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.print("tls={} sni={s} alpn={s} secure={}\n", .{ conn.isTls(), conn.serverName() orelse "-", conn.alpn() orelse "-", conn.secure() }) catch {};
+        _ = try conn.send(w.buffered());
+    }
+    pub fn data(_: *net.Conn, _: []const u8) !void {}
+};
+
+test "net tcp: TLS with SNI and ALPN" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    var app = try App.init(alloc, .{ .executors = .exact(2) });
+    defer app.deinit();
+    try app.tcpOn(.{ .address = "127.0.0.1", .port = 0, .tls = .{ .cert = .dev_self_signed, .alpn = &.{"chat/1"} } }, Who, .{});
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try ClientStream.connect(alloc, a.io(), .{
+                .host = "127.0.0.1",
+                .port = portOf(a),
+                .address = .{ .ip4 = .loopback(portOf(a)) },
+                .tls = .{ .insecure_skip_verify = true, .server_name = "chat.local", .alpn = &.{"chat/1"} },
+            });
+            defer s.close();
+            const want = "tls=true sni=chat.local alpn=chat/1 secure=true\n";
+            try expectRead(s, want);
+        }
+    }.run);
+}
+
+const Peer = struct {
+    pub fn open(conn: *net.Conn) !void {
+        var buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        const r = conn.remote().?;
+        const l = conn.local().?;
+        const d = conn.direct().?;
+        w.print("remote={f} local={f} direct={s}\n", .{ r, l, if (d.getPort() != 0) "socket" else "?" }) catch {};
+        _ = try conn.send(w.buffered());
+    }
+    pub fn data(_: *net.Conn, _: []const u8) !void {}
+};
+
+test "net tcp: a PROXY v1 header sets remote and local, direct stays the socket's" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.tcpOn(.{ .address = "127.0.0.1", .port = 0, .proxy_protocol = true, .proxy_protocol_from = &.{"127.0.0.1"} }, Peer, .{});
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            try s.writer().writeAll("PROXY TCP4 198.51.100.7 203.0.113.1 4711 7000\r\n");
+            try s.writer().flush();
+            try expectRead(s, "remote=198.51.100.7:4711 local=203.0.113.1:7000 direct=socket\n");
+        }
+    }.run);
+}
+
+test "net tcp: the listener's max_connections holds a second connection in the backlog" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", Stats, .{ .max_connections = 1 });
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s1 = try connect(a, portOf(a));
+            try s1.writer().writeAll("one");
+            try s1.writer().flush();
+            try expectRead(s1, "one");
+            const s2 = try connect(a, portOf(a));
+            defer s2.close();
+            try s2.writer().writeAll("two");
+            try s2.writer().flush();
+            // The second waits in the kernel: only one connection is open.
+            try a.io().sleep(.fromMilliseconds(100), .awake);
+            try std.testing.expectEqual(@as(u64, 1), a.netStats().connections);
+            s1.close();
+            try expectRead(s2, "two");
+        }
+    }.run);
+}
+
+const Idle = struct {
+    var reason: std.atomic.Value(u32) = .init(99);
+    var closed: std.atomic.Value(u32) = .init(0);
+    pub fn data(_: *net.Conn, _: []const u8) !void {}
+    pub fn close(_: *net.Conn, r: net.CloseReason) void {
+        reason.store(@intFromEnum(r), .release);
+        _ = closed.fetchAdd(1, .release);
+    }
+};
+
+test "net tcp: idle_timeout closes with reason idle" {
+    Idle.closed.store(0, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", Idle, .{ .idle_timeout = .fromMilliseconds(50) });
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            try waitFor(a.io(), &Idle.closed, 1);
+            try std.testing.expectEqual(@intFromEnum(net.CloseReason.idle), Idle.reason.load(.acquire));
+            try expectEnd(s);
+        }
+    }.run);
+}
+
+const Parked = struct {
+    pub fn data(conn: *net.Conn, bytes: []const u8) !void {
+        _ = try conn.send(bytes);
+    }
+};
+
+test "net tcp: idle callback connections hold no task, and each still echoes" {
+    var app = try App.init(alloc, .{ .executors = .exact(1), .timeouts = .{ .idle_park = .fromMilliseconds(5) } });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", Parked, .{});
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            var streams: [20]*ClientStream = undefined;
+            var made: usize = 0;
+            defer for (streams[0..made]) |s| s.close();
+            for (&streams) |*s| {
+                s.* = try connect(a, portOf(a));
+                made += 1;
+                try s.*.writer().writeAll("a");
+                try s.*.writer().flush();
+                try expectRead(s.*, "a");
+            }
+            // Parked, with no timing bound asserted: poll until all are.
+            while (a.server.parkedConnections() < streams.len) try a.io().sleep(.fromMilliseconds(2), .awake);
+            for (streams) |s| {
+                try s.writer().writeAll("b");
+                try s.writer().flush();
+                try expectRead(s, "b");
+            }
+        }
+    }.run);
+}
+
+const Goodbye = struct {
+    var closed: std.atomic.Value(u32) = .init(0);
+    var drains: std.atomic.Value(u32) = .init(0);
+    var last: std.atomic.Value(u32) = .init(99);
+    pub fn data(_: *net.Conn, bytes: []const u8) !void {
+        _ = bytes;
+    }
+    pub fn drain(conn: *net.Conn) !void {
+        _ = drains.fetchAdd(1, .release);
+        _ = try conn.send("bye");
+        // Only the first connection says goodbye; the other is left open.
+        if (conn.id() % 2 == 1) conn.close();
+    }
+    pub fn close(_: *net.Conn, r: net.CloseReason) void {
+        last.store(@intFromEnum(r), .release);
+        _ = closed.fetchAdd(1, .release);
+    }
+};
+
+test "net tcp: drain runs the handler's drain, and the connections left open close at the deadline" {
+    Goodbye.closed.store(0, .monotonic);
+    Goodbye.drains.store(0, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1), .timeouts = .{ .shutdown = .fromMilliseconds(200) } });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", Goodbye, .{});
+    const Run = struct {
+        fn run(a: *App) !void {
+            try a.waitReady();
+            const s1 = try connect(a, portOf(a));
+            defer s1.close();
+            const s2 = try connect(a, portOf(a));
+            defer s2.close();
+            while (a.netStats().connections < 2) try a.io().sleep(.fromMilliseconds(2), .awake);
+            a.stop();
+            // Both said goodbye (the callback ran for both).
+            try expectRead(s1, "bye");
+            try expectRead(s2, "bye");
+            try waitFor(a.io(), &Goodbye.closed, 2);
+        }
+    };
+    var checking = try app.io().concurrent(Run.run, .{&app});
+    try app.run();
+    try checking.await(app.io());
+    try std.testing.expectEqual(@as(u32, 2), Goodbye.drains.load(.acquire));
+}

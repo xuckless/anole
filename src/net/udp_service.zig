@@ -179,15 +179,17 @@ pub const Datagram = struct {
 };
 
 /// How a session ended.
-pub const EndReason = enum { idle, local, stop };
+const SessionEnd = enum { idle, local, stop };
 
 /// A peer's session (`Udp.Options.sessions`).
 pub const Session = struct {
+    pub const EndReason = SessionEnd;
+
     context: ?*anyopaque = null,
     socket_: *UdpSocket,
     remote_: std.Io.net.IpAddress,
     last_local: ?std.Io.net.IpAddress = null,
-    end_reason: EndReason = .idle,
+    end_reason: SessionEnd = .idle,
     close_requested: bool = false,
     state_buf: []align(16) u8 = &.{},
 
@@ -213,7 +215,7 @@ pub const Session = struct {
         s.close_requested = true;
     }
 
-    pub fn endReason(s: *const Session) EndReason {
+    pub fn endReason(s: *const Session) SessionEnd {
         return s.end_reason;
     }
 };
@@ -527,7 +529,7 @@ pub const UdpSocket = struct {
     }
 
     /// Runs `close`, frees the session's state and takes it out.
-    fn endSession(s: *UdpSocket, node: *SessionNode.Node, reason: EndReason) void {
+    fn endSession(s: *UdpSocket, node: *SessionNode.Node, reason: SessionEnd) void {
         const table = s.group.service.table;
         const sess = &node.value;
         sess.end_reason = reason;
@@ -558,7 +560,7 @@ pub const UdpSocket = struct {
         }
     }
 
-    fn closeAllSessions(s: *UdpSocket, reason: EndReason) void {
+    fn closeAllSessions(s: *UdpSocket, reason: SessionEnd) void {
         const t = &(s.table orelse return);
         const table = s.group.service.table;
         while (t.popOldest()) |node| {

@@ -63,5 +63,6 @@ test {
     _ = @import("tcp.zig");
     _ = @import("udp_service.zig");
     _ = @import("tcp_test.zig");
+    _ = @import("udp_test.zig");
     if (features.http3 or features.net) _ = @import("udp.zig");
 }
