@@ -161,6 +161,7 @@ test {
 // Import tests
 comptime {
     _ = @import("server_test.zig");
+    _ = @import("parked_test.zig");
     _ = @import("server/request_buffers.zig");
     _ = @import("drain_hooks.zig");
     _ = @import("websocket.zig");

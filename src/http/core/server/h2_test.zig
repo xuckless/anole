@@ -1452,3 +1452,121 @@ test "HTTP/2: an event stream outlives timeouts.request" {
     try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
     try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, client.get(id).body.items, "data: tick"));
 }
+
+/// A parked response (`Response._park`): the handler returns, and bursts
+/// from any task write DATA.
+const ParkProbe = struct {
+    var parked: ?*dusty.Parked = null;
+    var opened: std.Io.Event = .unset;
+    var gone: std.Io.Event = .unset;
+    var gone_calls: std.atomic.Value(u32) = .init(0);
+
+    fn reset() void {
+        parked = null;
+        opened = .unset;
+        gone = .unset;
+        gone_calls.store(0, .monotonic);
+    }
+
+    fn onGone(_: *anyopaque) void {
+        _ = gone_calls.fetchAdd(1, .monotonic);
+        gone.set(std.testing.io);
+    }
+
+    /// Waits first, as a handler that talks to a database before it parks.
+    fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+        try req.io.sleep(.fromMilliseconds(1), .awake);
+        try res.header("Content-Type", "text/event-stream");
+        var dummy: u8 = 0;
+        parked = try res._park(req, .{ .gone = onGone, .ctx = &dummy });
+        opened.set(req.io);
+    }
+
+    fn flushClient(client: *TestClient) !void {
+        while (true) {
+            var data: [*c]const u8 = undefined;
+            const n = c.nghttp2_session_mem_send2(client.session, &data);
+            if (n <= 0) break;
+            try client.w.writeAll(data[0..@intCast(n)]);
+        }
+        try client.w.flush();
+    }
+};
+
+test "parked h2: a handler that waited first parks; bursts arrive as DATA; end finishes the stream and release frees it" {
+    const io = std.testing.io;
+    ParkProbe.reset();
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    fx.server.router.get("/live", ParkProbe.handle);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const id = try client.request("GET", "/live", null);
+    try ParkProbe.flushClient(&client);
+    try ParkProbe.opened.wait(io);
+    const p = ParkProbe.parked.?;
+    try std.testing.expect(p.begin());
+    try p.write(&.{ "id: 1\n", "data: a\n\n" });
+    p.endBurst();
+    try std.testing.expect(p.begin());
+    try p.write(&.{"data: b\n\n"});
+    p.end();
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
+    try std.testing.expectEqualStrings("id: 1\ndata: a\n\ndata: b\n\n", client.get(id).body.items);
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_NO_ERROR), client.get(id).error_code);
+    try std.testing.expect(!p.begin());
+    p.release();
+    // The stream is freed (the fixture's allocator checks the rest).
+    const next = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(next).body.items);
+    try std.testing.expectEqual(@as(u32, 0), ParkProbe.gone_calls.load(.monotonic));
+}
+
+test "parked h2: RST_STREAM tells the owner once; release frees the stream" {
+    const io = std.testing.io;
+    ParkProbe.reset();
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    fx.server.router.get("/live", ParkProbe.handle);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const id = try client.request("GET", "/live", null);
+    try ParkProbe.flushClient(&client);
+    try ParkProbe.opened.wait(io);
+    _ = c.nghttp2_submit_rst_stream(client.session, c.NGHTTP2_FLAG_NONE, id, c.NGHTTP2_CANCEL);
+    try ParkProbe.flushClient(&client);
+    try ParkProbe.gone.wait(io);
+    try std.testing.expectEqual(@as(u32, 1), ParkProbe.gone_calls.load(.monotonic));
+    try std.testing.expect(!ParkProbe.parked.?.begin());
+    ParkProbe.parked.?.release();
+    const next = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(next).body.items);
+}
+
+test "parked h2: the connection closing with a parked stream tells the owner, and teardown waits for release" {
+    const io = std.testing.io;
+    ParkProbe.reset();
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    fx.server.router.get("/live", ParkProbe.handle);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    _ = try client.request("GET", "/live", null);
+    try ParkProbe.flushClient(&client);
+    try ParkProbe.opened.wait(io);
+    client.deinit();
+    try ParkProbe.gone.wait(io);
+    try std.testing.expectEqual(@as(u32, 1), ParkProbe.gone_calls.load(.monotonic));
+    ParkProbe.parked.?.release();
+}
