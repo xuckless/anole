@@ -584,3 +584,21 @@ test "jetstream: stream and consumer JSON, with extra keys merged" {
     try testing.expect(std.mem.indexOf(u8, k, "\"stream_name\":\"ORDERS\"") != null);
     try testing.expect(std.mem.indexOf(u8, k, "\"backoff\":[1000000000]") != null);
 }
+
+const fuzz = @import("../fuzz.zig");
+
+test "fuzz: the JetStream ack subject parse never crashes and fills what it returns" {
+    try fuzz.bytes(struct {
+        fn check(input: []const u8) anyerror!void {
+            const info = parseAckSubject(input) orelse return;
+            // Names are slices of the input.
+            if (info.stream.len > input.len or info.consumer.len > input.len) return error.OutOfBounds;
+        }
+    }.check, &.{
+        "$JS.ACK.ORDERS.billing.2.17.5.1700000000000000000.9",
+        "$JS.ACK.dom.ACCHASH.ORDERS.billing.1.3.4.1700000000000000001.0.rnd123",
+        "$JS.ACK.a.b.c",
+        "",
+        "$JS.ACK.....................",
+    });
+}

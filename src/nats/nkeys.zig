@@ -171,3 +171,20 @@ test "nkeys: a bad CRC, a wrong prefix and a bad length are refused" {
     @memcpy(as_seed[0..56], seed.publicKey(&pk_buf));
     try testing.expectError(error.InvalidChecksum, decodeSeed(&as_seed));
 }
+
+const fuzz = @import("../fuzz.zig");
+
+test "fuzz: the NKey seed decode never crashes, and what decodes signs" {
+    var bytes: [32]u8 = @splat(5);
+    var buf: [58]u8 = undefined;
+    const good = encodeSeed(&buf, .user, &bytes);
+    try fuzz.bytes(struct {
+        fn check(input: []const u8) anyerror!void {
+            const seed = decodeSeed(input) catch return;
+            var pk: [56]u8 = undefined;
+            var sig: [86]u8 = undefined;
+            _ = seed.publicKey(&pk);
+            _ = try seed.signNonce("n", &sig);
+        }
+    }.check, &.{ good, "SUAAAA", "", "not a seed at all" });
+}

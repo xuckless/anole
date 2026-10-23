@@ -61,3 +61,23 @@ test "creds: the JWT and the seed are found in a .creds file" {
     try testing.expectEqualStrings("SUAMK2FG4MI6UE3ACF3FK3OIQBCEIEZV7NSWFFEW63UXMRLFM2XLAXK4GY", creds.seed);
     try testing.expectError(error.InvalidCreds, parseCreds("nothing here"));
 }
+
+const fuzz = @import("../fuzz.zig");
+
+test "fuzz: the .creds parse never crashes, and returns slices of its input" {
+    try fuzz.bytes(struct {
+        fn check(input: []const u8) anyerror!void {
+            const creds = parseCreds(input) catch return;
+            const lo = @intFromPtr(input.ptr);
+            const hi = lo + input.len;
+            for ([_][]const u8{ creds.jwt, creds.seed }) |s| {
+                const p = @intFromPtr(s.ptr);
+                if (s.len > 0 and (p < lo or p + s.len > hi)) return error.OutOfBounds;
+            }
+        }
+    }.check, &.{
+        "-----BEGIN NATS USER JWT-----\nabc.def.ghi\n------END NATS USER JWT------\n-----BEGIN USER NKEY SEED-----\nSUAAA\n------END USER NKEY SEED------\n",
+        "-----BEGIN",
+        "",
+    });
+}
