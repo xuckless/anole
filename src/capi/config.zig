@@ -129,6 +129,12 @@ pub const Config = struct {
         proxy_protocol_from: []const []const u8 = &.{},
 
         // ---- p3/net ----
+        /// Raw TCP instead of HTTP: connections and their data go to the
+        /// consumer as events. Needs a port or unix; not with http3.
+        tcp: ?NetTcp = null,
+        /// UDP instead of HTTP: datagrams go to the consumer in batches.
+        /// Needs a port; not with tls, unix or proxy_protocol.
+        udp: ?NetUdp = null,
         // ---- end p3/net ----
     };
 
@@ -846,6 +852,45 @@ pub const Config = struct {
 
     // Each area's own types.
     // ---- p3/net (types) ----
+    /// How a raw TCP listener cuts input into messages: exactly one of
+    /// lines, length, varint (`anole.net.Framing`).
+    pub const NetFraming = struct {
+        lines: ?struct { max: u32 = 64 * 1024, strip_cr: bool = true, crlf: bool = false } = null,
+        length: ?struct { bytes: u8 = 4, endian: []const u8 = "big", includes_header: bool = false, max: u32 = 1 << 20 } = null,
+        varint: ?struct { max: u32 = 1 << 20 } = null,
+    };
+
+    /// `Listener.tcp`: `anole.net.Tcp.Options` with durations in ms.
+    pub const NetTcp = struct {
+        /// Carried in the listener's records (`handler_id`).
+        handler: u32,
+        framing: ?NetFraming = null,
+        half_open: bool = false,
+        no_delay: bool = true,
+        keepalive_ms: ?u32 = 60_000,
+        handshake_timeout_ms: ?u32 = 10_000,
+        idle_timeout_ms: ?u32 = null,
+        lifetime_ms: ?u32 = null,
+        write_timeout_ms: ?u32 = 30_000,
+        write_high_water: u32 = 256 * 1024,
+        write_max: u32 = 8 * 1024 * 1024,
+        read_window: u32 = 16 * 1024,
+        read_ahead: u32 = 256 * 1024,
+        max_connections: ?u32 = null,
+        log_connections: bool = false,
+    };
+
+    /// `Listener.udp`: `anole.net.Udp.Options` (no sessions: a binding keeps
+    /// its own map keyed by address).
+    pub const NetUdp = struct {
+        handler: u32,
+        sockets: ?u16 = null,
+        max_datagram: u16 = 2048,
+        batch: u8 = 32,
+        send_queue: u32 = 1 << 20,
+        receive_buffer: ?u32 = null,
+        send_buffer: ?u32 = null,
+    };
     // ---- end p3/net (types) ----
 
     // ---- p3/jobs (types) ----
@@ -968,6 +1013,9 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             if (l.tls == null) return fail(why, "listeners[{d}].http3 needs tls", .{i});
             http3_listeners += 1;
         }
+        // ---- p3/net ----
+        if (l.tcp != null or l.udp != null) try checkNet(l, i, why);
+        // ---- end p3/net ----
         if (l.name) |n| if (n.len == 0 or n.len > 255 or std.mem.indexOfScalar(u8, n, ':') != null)
             return fail(why, "listeners[{d}].name: 1-255 bytes, no ':'", .{i});
         for (cfg.listeners[0..i]) |other| if (l.name != null and other.name != null and std.mem.eql(u8, l.name.?, other.name.?))
@@ -1132,6 +1180,60 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
 
 /// The client certificate and key of a database: files or text, a
 /// certificate with its key, and not with `insecure_skip_verify` and a CA.
+// ---- p3/net ----
+/// A raw listener's keys (design-net.md §6.2).
+fn checkNet(l: Config.Listener, i: usize, why: *std.Io.Writer) Problem!void {
+    if (l.tcp != null and l.udp != null) return fail(why, "listeners[{d}]: tcp and udp together", .{i});
+    if (comptime !features.net) return fail(why, "listeners[{d}].{s}: raw TCP is not built in (-Dnet)", .{ i, if (l.tcp != null) "tcp" else "udp" });
+    if (l.http3) return fail(why, "listeners[{d}]: http3 on a raw listener", .{i});
+    if (l.port == null and l.unix == null) return fail(why, "listeners[{d}]: a raw listener needs a port (0 for a free one) or unix", .{i});
+    if (l.udp) |u| {
+        if (l.tls != null) return fail(why, "listeners[{d}].udp: with tls (DTLS is not supported)", .{i});
+        if (l.unix != null) return fail(why, "listeners[{d}].udp: on a unix socket", .{i});
+        if (l.proxy_protocol == true) return fail(why, "listeners[{d}].udp: with proxy_protocol", .{i});
+        if (u.sockets) |n| if (n == 0 or n > 255) return fail(why, "listeners[{d}].udp.sockets: 1 to 255", .{i});
+        if (u.max_datagram == 0 or u.max_datagram > 65507) return fail(why, "listeners[{d}].udp.max_datagram: 1 to 65507", .{i});
+        if (u.batch == 0 or u.batch > 64) return fail(why, "listeners[{d}].udp.batch: 1 to 64", .{i});
+        if (u.send_queue == 0) return fail(why, "listeners[{d}].udp.send_queue: at least 1", .{i});
+    }
+    if (l.tcp) |t| {
+        if (t.read_window < 4096 or t.read_window > 65536) return fail(why, "listeners[{d}].tcp.read_window: 4096 to 65536", .{i});
+        if (t.write_high_water == 0 or t.write_max < t.write_high_water) return fail(why, "listeners[{d}].tcp: write_max is below write_high_water", .{i});
+        if (t.read_ahead == 0) return fail(why, "listeners[{d}].tcp.read_ahead: at least 1", .{i});
+        if (t.max_connections) |n| if (n == 0) return fail(why, "listeners[{d}].tcp.max_connections: at least 1", .{i});
+        if (t.framing) |f| {
+            const n = @as(u8, @intFromBool(f.lines != null)) + @intFromBool(f.length != null) + @intFromBool(f.varint != null);
+            if (n != 1) return fail(why, "listeners[{d}].tcp.framing: exactly one of lines, length, varint", .{i});
+            if (f.length) |len| {
+                if (len.bytes != 1 and len.bytes != 2 and len.bytes != 4) return fail(why, "listeners[{d}].tcp.framing.length.bytes: 1, 2 or 4", .{i});
+                if (!std.mem.eql(u8, len.endian, "big") and !std.mem.eql(u8, len.endian, "little")) return fail(why, "listeners[{d}].tcp.framing.length.endian: \"big\" or \"little\"", .{i});
+            }
+            const max: u32 = if (f.lines) |x| x.max else if (f.length) |x| x.max else f.varint.?.max;
+            if (max == 0 or max > 1 << 30) return fail(why, "listeners[{d}].tcp.framing: max 1 to 1073741824", .{i});
+        }
+    }
+}
+
+/// The Zig framing a listener's `tcp.framing` stands for.
+pub fn netFraming(f: ?Config.NetFraming) anole.net.Framing {
+    const fr = f orelse return .none;
+    if (fr.lines) |x| return .{ .lines = .{ .max = x.max, .strip_cr = x.strip_cr, .crlf = x.crlf } };
+    if (fr.length) |x| return .{ .length = .{
+        .bytes = x.bytes,
+        .endian = if (std.mem.eql(u8, x.endian, "little")) .little else .big,
+        .includes_header = x.includes_header,
+        .max = x.max,
+    } };
+    if (fr.varint) |x| return .{ .varint = .{ .max = x.max } };
+    return .none;
+}
+
+/// A duration given in milliseconds.
+pub fn netMs(ms: ?u32) ?std.Io.Duration {
+    return if (ms) |v| std.Io.Duration.fromMilliseconds(v) else null;
+}
+// ---- end p3/net ----
+
 fn checkClientCert(c: anytype, comptime root: []const u8, comptime kind: []const u8, i: usize, why: *std.Io.Writer) Problem!void {
     const files = c.client_cert_file != null or c.client_key_file != null;
     const pem = c.client_cert_pem != null or c.client_key_pem != null;

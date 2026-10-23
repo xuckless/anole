@@ -661,6 +661,13 @@ pub fn build(b: *std.Build) void {
         const capi_engine_tests = b.addTest(.{ .name = "anole-test-capi", .root_module = tests.root_module, .filters = &.{ "capi engine", "parse: " }, .use_llvm = use_llvm });
         b.step("test-capi-engine", "Run the C ABI engine's Zig tests").dependOn(&b.addRunArtifact(capi_engine_tests).step);
     }
+    // test-net: the raw TCP and UDP tests alone (framing, sessions, the
+    // servers over loopback, the C ABI's).
+    if (features.net) {
+        const net_tests = b.addTest(.{ .name = "anole-test-net", .root_module = tests.root_module, .filters = &.{ "net tcp", "net udp", "framing:", "sessions:", "fuzz: net", "capi net" }, .use_llvm = use_llvm });
+        b.step("test-net", "Run the raw TCP and UDP tests (anole.net, the C ABI's anole_net_*)").dependOn(&b.addRunArtifact(net_tests).step);
+        b.step("test-net-build", "Build the raw TCP and UDP test binary (zig-out/bin/anole-test-net) without running it").dependOn(&b.addInstallArtifact(net_tests, .{}).step);
+    }
     // test-grpc: the gRPC tests alone (the native server and client, JSON
     // transcoding, and the C ABI's gRPC server).
     if (features.grpc) {
@@ -818,6 +825,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "hello", .needs = true, .about = "the smallest server, on port 3000" },
         .{ .name = "rest", .needs = true, .about = "a JSON REST API: CRUD in memory, behind an API key, on port 3000" },
         .{ .name = "websocket", .needs = features.websocket, .about = "WebSocket echo and a broadcast room" },
+        .{ .name = "net", .needs = features.net, .about = "a line chat over TCP, a UDP responder with sessions and an HTTP /stats page (ports 7000, 7001, 3000)" },
         .{ .name = "grpc", .needs = features.grpc, .about = "a gRPC Greeter, also over gRPC-Web, Connect and REST (JSON transcoding)" },
         .{ .name = "auth", .needs = features.auth and features.json, .about = "JWT bearer tokens, sessions, CSRF, API keys and rate limits" },
         .{ .name = "clients", .needs = features.tls == .boringssl and features.http2 and features.http3, .about = "outbound HTTP/1.1, HTTP/2, HTTP/3 and gRPC" },

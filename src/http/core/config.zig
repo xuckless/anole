@@ -149,6 +149,17 @@ pub const Listener = struct {
     /// server, such as HTTP/3 on the UDP port of the same number, named
     /// after its own in the line logged when it starts listening.
     extra_protocols: []const []const u8 = &.{},
+    /// The application's own protocol instead of HTTP: once a connection is
+    /// accepted, its PROXY header read and its TLS handshake done, it is
+    /// handed to `raw.start` and never parsed as HTTP. `http1` and
+    /// `http2_prior_knowledge` are ignored. See `server.Raw`.
+    raw: ?*const @import("server.zig").Raw = null,
+    /// Open connections on this listener at most (on top of
+    /// `ServerConfig.max_connections`). Null: none of its own.
+    max_connections: ?u32 = null,
+    /// A raw listener's own limit for the PROXY header and the TLS
+    /// handshake together. Null: the HTTP timeouts (`Timeout.request`).
+    handshake_timeout: ?std.Io.Duration = null,
 
     /// The number of accept loops, with `cpu_count` standing in for the
     /// CPUs the process may use when `acceptors` is null.

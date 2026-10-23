@@ -14,8 +14,27 @@ breaking changes are listed anyway.
 
 ### Added
 
+- Raw TCP and UDP servers on Anole's runtime and listeners: `app.tcp(":7000", Handler, .{})`
+  (callbacks that park idle connections, or a task per connection) and
+  `app.udp(...)` (batched receive and send, one socket per core on Linux,
+  optional per-peer sessions); TLS with SNI, ALPN, mutual TLS and hot reload,
+  the PROXY protocol, per-listener connection caps, a drain callback, socket
+  activation and SIGUSR2 restarts, counters in `app.netStats()`. `tcp` and
+  `udp` on `.listeners`. `-Dnet` (on in `web` and `full`). See docs/net.md.
+- Framing for TCP: lines, length prefixes (1, 2 or 4 bytes) and varints, with
+  `conn.sendFrame` for the way out.
+- C ABI: the `"tcp"` and `"udp"` listener keys, `anole_net_write`,
+  `anole_net_close`, `anole_net_pause`, `anole_net_resume`,
+  `anole_net_set_idle_timeout`, `anole_net_udp_send`, `anole_net_udp_find`,
+  `anole_net_addr_format` and `anole_net_addr_parse`; events
+  `ANOLE_EV_NET_OPEN` (96) to `ANOLE_EV_NET_DATAGRAMS` (100); handle kinds
+  `anole_net_conn` and `anole_net_udp`; `anole_stats` net fields; listener
+  flags `ANOLE_LISTENER_F_TCP` and `_UDP`.
+
 ### Changed
 
+- A server that names only raw TCP/UDP listeners opens no HTTP listener.
+- `handoff.max_listeners` is 64 TCP listeners and 1024 UDP sockets.
 - `anole.db.System` has `s3` and `smtp`, and `anole.resilience.Kind` too.
 - C ABI: a handle's kind takes five bits (28-32), so Kafka groups and
   batches are kinds of their own (17 and 18): a NATS handle given to a

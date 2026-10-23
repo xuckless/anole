@@ -290,6 +290,10 @@ pub const server_options = [_]Entry{
     .{ .zig = "listeners[].http3", .json = "listeners[].http3" },
     .{ .zig = "listeners[].proxy_protocol", .json = "listeners[].proxy_protocol" },
     .{ .zig = "listeners[].proxy_protocol_from", .json = "listeners[].proxy_protocol_from" },
+    // ---- p3/net ----
+    .{ .zig = "listeners[].tcp", .json = "listeners[].tcp", .kind = .custom, .note = "the keys of `anole.net.Tcp.Options` (net_tcp below) plus handler, the number carried in the listener's records" },
+    .{ .zig = "listeners[].udp", .json = "listeners[].udp", .kind = .custom, .note = "the keys of `anole.net.Udp.Options` (net_udp below) plus handler" },
+    // ---- end p3/net ----
     .{ .zig = "listeners[].tls", .json = "listeners[].tls", .kind = .custom, .note = "cert: cert_file + key_file, cert_pem + key_pem or self_signed; client_auth: client_auth + one of client_ca_file, client_ca_pem, client_ca_dir, client_ca_system; alpn: alpn" },
     .{ .zig = "http3", .json = "http3", .kind = .same },
     .{ .zig = "http3.idle_timeout", .json = "http3.idle_timeout_ms", .kind = .ms },
@@ -468,6 +472,34 @@ pub const kafka_options = [_]Entry{
 };
 
 // ---- p3/net ----
+/// `anole.net.Tcp.Options` against `listeners[].tcp`.
+pub const net_tcp = [_]Entry{
+    .{ .zig = "framing", .json = "listeners[].tcp.framing", .kind = .custom, .note = "an object with exactly one of lines {max, strip_cr, crlf}, length {bytes, endian, includes_header, max}, varint {max}; left out: none" },
+    .{ .zig = "half_open", .json = "listeners[].tcp.half_open" },
+    .{ .zig = "no_delay", .json = "listeners[].tcp.no_delay" },
+    .{ .zig = "keepalive", .json = "listeners[].tcp.keepalive_ms", .kind = .ms },
+    .{ .zig = "handshake_timeout", .json = "listeners[].tcp.handshake_timeout_ms", .kind = .ms },
+    .{ .zig = "idle_timeout", .json = "listeners[].tcp.idle_timeout_ms", .kind = .ms },
+    .{ .zig = "lifetime", .json = "listeners[].tcp.lifetime_ms", .kind = .ms },
+    .{ .zig = "write_timeout", .json = "listeners[].tcp.write_timeout_ms", .kind = .ms },
+    .{ .zig = "write_high_water", .json = "listeners[].tcp.write_high_water" },
+    .{ .zig = "write_max", .json = "listeners[].tcp.write_max" },
+    .{ .zig = "read_window", .json = "listeners[].tcp.read_window" },
+    .{ .zig = "read_ahead", .json = "listeners[].tcp.read_ahead" },
+    .{ .zig = "max_connections", .json = "listeners[].tcp.max_connections" },
+    .{ .zig = "log_connections", .json = "listeners[].tcp.log_connections" },
+};
+
+/// `anole.net.Udp.Options` against `listeners[].udp`.
+pub const net_udp = [_]Entry{
+    .{ .zig = "sockets", .json = "listeners[].udp.sockets" },
+    .{ .zig = "max_datagram", .json = "listeners[].udp.max_datagram" },
+    .{ .zig = "batch", .json = "listeners[].udp.batch" },
+    .{ .zig = "send_queue", .json = "listeners[].udp.send_queue" },
+    .{ .zig = "receive_buffer", .json = "listeners[].udp.receive_buffer" },
+    .{ .zig = "send_buffer", .json = "listeners[].udp.send_buffer" },
+    .{ .zig = "sessions", .omitted = "per-peer state is the binding's: a Map or dict keyed by address" },
+};
 // ---- end p3/net ----
 
 // ---- p3/jobs ----

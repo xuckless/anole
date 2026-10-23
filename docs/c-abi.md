@@ -718,6 +718,7 @@ none.
 | `proxy.trusted`, `trusted_hops`, `trust_forwarded_proto`, `trust_forwarded_host` | null, 0, true, false | `proxy.*` |
 | `environment`, `deployment`, `error_detail` | null, null, null | `environment`, `deployment`, `error_detail` (null: `ANOLE_ENV` else production; `ANOLE_DEPLOYMENT` else standalone; on in development) |
 | `listeners[].address`, `port`, `proxy_protocol` | null, null, null | `Listener.*` (null: the deployment's default: `127.0.0.1`, 8080 or `$PORT`, off or on under `anole_lb`) |
+| `listeners[].tcp`, `listeners[].udp` | null | the raw TCP and UDP listener options (`anole.net.Tcp.Options`, `Udp.Options`, durations as `_ms`); see [Raw TCP and UDP](#raw-tcp-and-udp) |
 | `request.require_host`, `decompress`, `keep_buffers` | true, true, false | `request.*` |
 | `response.write_buffer_size`, `date`, `default_content_type`, `max_header_count`, `brotli_quality` | 16384, true, "text", 64, 5 | `response.*` (`default_content_type` by tag name; null: none) |
 | `http2.*` | 250 streams, ..., `enable_connect_protocol` false | `http2.*` (`max_concurrent_streams`, `stream_window`, `stream_window_reading`, `tunnel_window`, `reading_window_budget`, `connection_window`, `max_header_list_size`, `stream_reset_burst`, `stream_reset_rate`, `max_continuations`, `refused_stream_burst`, `refused_stream_rate`, `enable_connect_protocol`, `inline_no_wait`) |
@@ -1390,6 +1391,101 @@ and leaves the group; `ANOLE_EV_KAFKA_GROUP_END` says it is over
 its place in `"brokers"` (what `anole_broker_status_event.broker` names).
 The consumer reads none, gzip, zstd, lz4 and snappy batches. Transactions,
 the KIP-848 protocol and the admin API are not part of the ABI.
+
+<!-- p3/net -->
+## Raw TCP and UDP
+
+A `"tcp"` or `"udp"` key on a listener serves that listener's connections or
+datagrams to the consumer as events, instead of HTTP (`-Dnet`,
+`anole_has_feature("net")`; ABI 0.10). The listener keeps everything Anole's
+listeners have: one accept loop per executor, TLS with `alpn`, mutual TLS and
+`anole_server_reload_tls`, `proxy_protocol`, `unix` sockets, the connection
+caps, the drain and `SIGUSR2` restarts. What you get is the bytes, cut by the
+listener's `framing`. See [net.md](net.md) for the same servers in Zig.
+
+```json
+"listeners": [
+  { "name": "chat", "port": 7000, "tls": { "self_signed": true, "alpn": ["chat/1"] },
+    "tcp": { "handler": 2, "framing": { "lines": { "max": 8192 } },
+             "half_open": false, "idle_timeout_ms": 60000, "write_high_water": 262144 } },
+  { "name": "game", "port": 7001, "udp": { "handler": 3, "max_datagram": 1400 } }
+]
+```
+
+`handler` is any number the consumer picks; it comes back as `handler_id`.
+`framing` is exactly one of `{"lines": {max, strip_cr, crlf}}`, `{"length":
+{bytes, endian, includes_header, max}}` and `{"varint": {max}}`; left out, bytes
+come as they arrive. Every other key is the Zig option of the same name (a
+duration as `<name>_ms`), listed with its default in the schema. A raw
+listener needs `port` (0 for a free one) or `unix`, and never takes `$PORT`.
+UDP takes no `tls`, `unix` or `proxy_protocol`.
+
+**Events.** `ANOLE_EV_NET_OPEN` (`anole_net_open_event`) when a connection is
+ready (PROXY header read, TLS done): both addresses in binary
+(`anole_net_addr`) and as text, the ALPN protocol, the SNI name and the
+client certificate. `ANOLE_EV_NET_DATA` (`anole_net_data_event`) brings what
+one read burst held: without framing one span (up to 64 KiB per record), with
+framing every whole frame of the burst, so one crossing carries many
+messages. `ANOLE_EV_NET_END` is the peer's FIN; with `half_open` the
+consumer ends its side when done, without it Anole does. `ANOLE_EV_NET_CLOSE`
+(`anole_net_close_event`) ends the connection: why (`ANOLE_NET_CLOSED_*`),
+bytes each way, how long. For UDP, `ANOLE_EV_NET_DATAGRAMS`
+(`anole_net_datagrams_event`) is one receive batch of one socket, with each
+datagram's remote and local address (`anole_net_datagram_in`) and the count
+the kernel dropped since the last record. A peer's datagrams always come
+through the same socket (`anole_net_udp`), in order.
+
+**Writing never waits for the peer.** `anole_net_write(c, data, len, flags)`
+queues the bytes (copied, or borrowed with `ANOLE_BODY_BORROW`: `ANOLE_EV_SENT`
+follows) and returns. `ANOLE_BUSY`: taken, but more than
+`tcp.write_high_water` bytes wait, so write no more until
+`ANOLE_EV_WRITABLE` on `c`. `ANOLE_E_AGAIN`: not taken, past `tcp.write_max`
+(`ANOLE_EV_WRITABLE` follows). `ANOLE_NET_F_FRAME` adds the listener's
+framing around the bytes; `ANOLE_NET_F_END` ends this side after them (`len`
+may be 0), with TLS close_notify and a FIN. After this side ended, a write is
+`ANOLE_E_INVALID` ("Ended"). `anole_net_close(c, how)` closes gracefully
+(`ANOLE_NET_CLOSE_GRACEFUL`: what is queued goes out, input is dropped until
+the peer ends, at most 2 s) or with a reset (`ANOLE_NET_CLOSE_RESET`: now);
+`anole_handle_release` on a connection is the graceful close.
+`anole_net_pause` and `anole_net_resume` stop and restart reading (the input
+waits in the kernel, so TCP slows the peer); `anole_net_set_idle_timeout`
+replaces `tcp.idle_timeout_ms` for one connection.
+
+**Read credit.** A connection posts at most `tcp.read_ahead` bytes the
+consumer has not polled yet; the rest waits in the kernel. One fast peer and a
+slow consumer cannot fill a core's ring.
+
+**UDP.** `anole_net_udp_send(u, datagrams, n, 0)` queues `n`
+`anole_net_datagram`s on a socket, all or none, sent together
+(`sendmmsg`). `from.family` 0 lets the system pick the source; a received
+datagram's `local` answers from the address it reached. `ANOLE_BUSY` means the
+queue is past half full; `ANOLE_E_AGAIN` that none was taken
+(`ANOLE_EV_WRITABLE` on `u` follows). `anole_net_udp_find(s, "game", &u)` gives
+the first socket of a UDP listener, to send without having received. Datagrams
+are unreliable: one the kernel refuses is dropped and counted in
+`anole_stats.udp_datagrams_dropped`.
+
+**Addresses.** `anole_net_addr_format` writes `"203.0.113.9:4711"` or
+`"[2001:db8::1]:443"` (64 bytes always fit); `anole_net_addr_parse` reads a
+literal address and port (names are not resolved).
+
+**Language bindings.** The calls map one to one onto `node:net` and
+`node:dgram` (`write()` returning false is `ANOLE_BUSY`, `'drain'` is
+`ANOLE_EV_WRITABLE`, `socket.pause()` is `anole_net_pause`, `'end'` is
+`ANOLE_EV_NET_END`, `allowHalfOpen` is `half_open`) and asyncio's `Protocol`
+and `DatagramProtocol` (`pause_writing()`/`resume_writing()`,
+`eof_received()`, `connection_lost()`). An idle connection has no task in
+Anole and none in the language: one consumer thread drains every
+connection's events with one `anole_poll` per wake.
+
+New error tokens: `NetNotBuilt`, `NetListenerNeedsPort`, `NetListenerHttp3`,
+`TcpAndUdp`, `UdpWithTls`, `UdpOnUnixSocket`, `UdpWithProxyProtocol`,
+`InvalidFraming`, `NetHandlerContext`, `UnknownListener` and `Ended`.
+`anole_stats` gained `net_connections`, `net_bytes_in`, `net_bytes_out`,
+`udp_datagrams_in`, `udp_datagrams_out` and `udp_datagrams_dropped`; listener
+flags `ANOLE_LISTENER_F_TCP` and `ANOLE_LISTENER_F_UDP` mark the kinds (a
+UDP listener's `port` is 0 and `udp_port` its bound port).
+<!-- end p3/net -->
 
 ## gRPC
 

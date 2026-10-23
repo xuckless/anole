@@ -23,10 +23,11 @@ const sd_notify = @import("sd_notify.zig");
 pub const supported = builtin.os.tag != .windows;
 
 pub const Fd = std.posix.fd_t;
-/// Room for `max_tcp_listeners` TCP listeners and an HTTP/3 socket per
-/// core.
-pub const max_listeners = max_tcp_listeners + 255;
+/// Room for `max_tcp_listeners` TCP listeners (raw TCP ones included) and
+/// `max_udp_sockets` UDP sockets: HTTP/3's and every raw UDP listener's.
+pub const max_listeners = max_tcp_listeners + max_udp_sockets;
 pub const max_tcp_listeners = 64;
+pub const max_udp_sockets = 1024;
 
 /// The listening sockets handed to this process, with their names.
 pub const Inherited = struct {
