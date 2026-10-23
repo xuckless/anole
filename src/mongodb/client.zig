@@ -15,6 +15,7 @@ const bson = @import("bson");
 const dusty = @import("dusty");
 const shared = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
+const resilience = @import("../resilience/root.zig");
 const net = @import("../net/client_stream.zig");
 const wire = @import("wire.zig");
 const sdam = @import("sdam.zig");
@@ -87,6 +88,13 @@ pub const Options = struct {
     retry_writes: bool = true,
     /// Which error classes become which statuses.
     errors: shared.ErrorMap = .{},
+    /// Fails calls fast (503, `lastError` code "circuit_open") after no
+    /// server could be reached repeatedly; null: never.
+    breaker: ?resilience.Breaker.Options = .{},
+    /// Accepted for the same shape as the other connectors; MongoDB has
+    /// the spec's retryable reads and writes (`retry_reads`,
+    /// `retry_writes`) and ignores `QueryOptions.retry`.
+    retry: resilience.Retry = .{ .attempts = 3, .backoff = .{ .base = .fromMilliseconds(50), .max = .fromSeconds(1) } },
     /// The bounds of the results kept for reads with `.cache`
     /// (`anole.db.QueryOptions`).
     cache: shared.CacheOptions = .{},
@@ -190,6 +198,8 @@ pub const Client = struct {
     /// `Options.max_connections`, resolved.
     max_connections: u32,
     errors: shared.ErrorMap,
+    /// The breaker (`Options.breaker`).
+    guard: internal.Guard,
     /// Write and read concerns from the URL, as BSON (empty when unset).
     write_concern: ?[]const u8 = null,
     read_concern: ?[]const u8 = null,
@@ -244,6 +254,7 @@ pub const Client = struct {
             .default_database = undefined,
             .options = opts,
             .errors = opts.errors,
+            .guard = try .init(.mongodb, name, opts.breaker, opts.retry),
             .direct = false,
             .observer = .{ .system = .mongodb, .name = name },
             .topology = undefined,
@@ -427,6 +438,7 @@ pub const Client = struct {
     /// app's metrics registry, tracer and health checks, when it has them.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
         self.observer = try .init(.mongodb, self.name, registry, tracer);
+        try self.guard.observe(self.gpa, registry);
         try self.cache.observe(registry);
         if (health) |h| {
             self.readiness = .{ .io = self.io, .context = self, .ping = readyPing };
@@ -479,6 +491,7 @@ pub const Client = struct {
         const io = self.io;
         // First: a read still running for the cache holds a connection.
         self.cache.deinit();
+        self.guard.deinit();
         self.endSessions();
         self.closing.store(true, .release);
         self.mutex.lockUncancelable(io);
@@ -901,13 +914,7 @@ pub const Client = struct {
         const timeout = internal.callTimeout(op.options.timeout, self.options.timeout);
         const deadline: ?std.Io.Clock.Timestamp = if (timeout) |t| .fromNow(c.io, .{ .raw = t, .clock = .awake }) else null;
         const call = self.observer.start(c);
-        const result = if (timeout) |t| bounded: {
-            const d: dusty.Deadline = .init(c.io, .{ .duration = .{ .raw = t, .clock = .awake } });
-            break :bounded d.run(Run(Ctx).attempt, .{ self, c, op, ctx, deadline }) catch |err| switch (err) {
-                error.Timeout => c.fail(self.errors, .{ .system = .mongodb, .class = .timeout, .message = "the call ran past its timeout", .table = op.collection }),
-                else => |e| e,
-            };
-        } else Run(Ctx).attempt(self, c, op, ctx, deadline);
+        const result = internal.guarded(c, &self.guard, self.errors, false, deadline, boundedAttempt(Ctx), .{ self, c, op, ctx, timeout, deadline });
         if (c.request) |req| {
             call.end(req, op.name, op.collection, if (result) |_| null else |e| e);
         } else {
@@ -915,6 +922,21 @@ pub const Client = struct {
             call.end(&plain, op.name, op.collection, if (result) |_| null else |e| e);
         }
         return result;
+    }
+
+    /// One run of the command loop under the call's timeout.
+    fn boundedAttempt(comptime Ctx: type) fn (*Client, *const Context, Operation, *Ctx, ?std.Io.Duration, ?std.Io.Clock.Timestamp) Error!Ctx.Result {
+        return struct {
+            fn run(self: *Client, c: *const Context, op: Operation, ctx: *Ctx, timeout: ?std.Io.Duration, deadline: ?std.Io.Clock.Timestamp) Error!Ctx.Result {
+                return if (timeout) |t| bounded: {
+                    const d: dusty.Deadline = .init(c.io, .{ .duration = .{ .raw = t, .clock = .awake } });
+                    break :bounded d.run(Run(Ctx).attempt, .{ self, c, op, ctx, deadline }) catch |err| switch (err) {
+                        error.Timeout => c.fail(self.errors, .{ .system = .mongodb, .class = .timeout, .message = "the call ran past its timeout", .table = op.collection }),
+                        else => |e| e,
+                    };
+                } else Run(Ctx).attempt(self, c, op, ctx, deadline);
+            }
+        }.run;
     }
 
     fn Run(comptime Ctx: type) type {
@@ -950,7 +972,7 @@ pub const Client = struct {
                     const server = x.server;
                     const connection = self.acquire(server, io, deadline) catch |err| switch (err) {
                         error.Canceled => return error.Canceled,
-                        error.PoolTimeout => return c.fail(self.errors, .{ .system = .mongodb, .class = if (past(io, deadline)) .timeout else .unavailable, .message = "no pooled connection free in time", .table = op.collection }),
+                        error.PoolTimeout => return c.fail(self.errors, .{ .system = .mongodb, .class = if (past(io, deadline)) .timeout else .unavailable, .code = "pool_timeout", .message = "no pooled connection free in time", .table = op.collection }),
                         else => {
                             // A failed handshake or authentication: the
                             // server is marked Unknown and its pools cleared.
@@ -1113,6 +1135,12 @@ pub const Context = struct {
     record: *const fn (any: *anyopaque, map: shared.ErrorMap, detail: shared.ErrorDetail) shared.Error,
     /// For spans.
     request: ?*const dusty.Request,
+    last: *const fn (any: *anyopaque) ?shared.ErrorDetail,
+
+    /// The last error recorded on the context it stands for.
+    pub fn lastDetail(self: *const Context) ?shared.ErrorDetail {
+        return self.last(self.any);
+    }
 
     /// `internal.fail` on the context it stands for.
     pub fn fail(self: *const Context, map: shared.ErrorMap, detail: shared.ErrorDetail) shared.Error {
@@ -1128,8 +1156,11 @@ pub fn erase(c: anytype) Context {
         fn record(any: *anyopaque, map: shared.ErrorMap, detail: shared.ErrorDetail) shared.Error {
             return internal.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
         }
+        fn last(any: *anyopaque) ?shared.ErrorDetail {
+            return internal.lastError(@as(C, @ptrCast(@alignCast(any))));
+        }
     };
-    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(@constCast(c)), .record = R.record, .request = internal.requestOf(c) };
+    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(@constCast(c)), .record = R.record, .last = R.last, .request = internal.requestOf(c) };
 }
 
 /// What every call can fail with: the shared errors (`anole.db.Error`),

@@ -204,6 +204,18 @@ pub const Guard = struct {
     }
 };
 
+/// A connector's own context type (pg's erased `Ctx`) may carry `fail` and
+/// `lastDetail`; a request or `db.Ctx` goes through `fail`/`lastError`.
+fn failIn(c: anytype, map: ErrorMap, detail: ErrorDetail) Error {
+    if (comptime @hasDecl(Pointee(@TypeOf(c)), "lastDetail")) return c.fail(map, detail);
+    return fail(c, map, detail);
+}
+
+fn lastIn(c: anytype) ?ErrorDetail {
+    if (comptime @hasDecl(Pointee(@TypeOf(c)), "lastDetail")) return c.lastDetail();
+    return lastError(c);
+}
+
 /// What a guarded call returns: what `func` returns.
 pub fn Guarded(comptime func: anytype) type {
     return @typeInfo(@TypeOf(func)).@"fn".return_type.?;
@@ -228,12 +240,12 @@ pub fn guarded(c: anytype, g: *Guard, map: ErrorMap, retry: bool, deadline: ?std
                 var buf: [160]u8 = undefined;
                 const left: i96 = if (b.openUntil()) |u| @max(0, u - now) else 0;
                 const msg = std.fmt.bufPrint(&buf, "circuit breaker open after repeated connection failures; next try in {d} s", .{@divTrunc(left + std.time.ns_per_s - 1, std.time.ns_per_s)}) catch "circuit breaker open";
-                return fail(c, map, .{ .system = g.system, .class = .unavailable, .code = "circuit_open", .message = msg });
+                return failIn(c, map, .{ .system = g.system, .class = .unavailable, .code = "circuit_open", .message = msg });
             };
         }
         const r = @call(.auto, func, args);
         const transient = if (r) |_| false else |_| blk: {
-            const d = lastError(c) orelse break :blk false;
+            const d = lastIn(c) orelse break :blk false;
             break :blk d.class == .unavailable and !std.mem.eql(u8, d.code, "pool_timeout") and !std.mem.eql(u8, d.code, "circuit_open");
         };
         const failed = if (r) |_| false else |_| transient;

@@ -346,10 +346,16 @@ fn dbCommon(comptime kind: []const u8) [4]Entry {
     };
 }
 
+/// `breaker` and `retry` of the network connectors (not SQLite).
+const resilience_entries = [_]Entry{
+    .{ .zig = "breaker", .json = "databases[].breaker", .kind = .custom, .note = "an object (consecutive_failures, failure_ratio, min_calls, window_ms, open_ms, max_open_ms, half_open_calls), or null for none; ignored for SQLite" },
+    .{ .zig = "retry", .json = "databases[].retry", .kind = .custom, .note = "an object (attempts, base_ms, max_ms, multiplier, attempt_timeout_ms, max_retry_after_ms): what `ANOLE_DB_F_RETRY` retries with" },
+};
+
 const tls_note = "ca_file or ca_pem; client_cert_file + client_key_file or client_cert_pem + client_key_pem; insecure_skip_verify";
 
 /// `anole.pg.Options` against `databases[].postgres`.
-pub const pg_options = dbCommon("postgres") ++ [_]Entry{
+pub const pg_options = dbCommon("postgres") ++ resilience_entries ++ [_]Entry{
     .{ .zig = "url", .json = "databases[].postgres.url" },
     .{ .zig = "max_connections", .json = "databases[].postgres.max_connections" },
     .{ .zig = "acquire_timeout", .json = "databases[].postgres.acquire_timeout_ms", .kind = .ms },
@@ -378,7 +384,7 @@ pub const sqlite_options = dbCommon("sqlite") ++ [_]Entry{
 };
 
 /// `anole.redis.Options` against `databases[].redis`.
-pub const redis_options = dbCommon("redis") ++ [_]Entry{
+pub const redis_options = dbCommon("redis") ++ resilience_entries ++ [_]Entry{
     .{ .zig = "url", .json = "databases[].redis.url" },
     .{ .zig = "max_connections", .json = "databases[].redis.max_connections" },
     .{ .zig = "acquire_timeout", .json = "databases[].redis.acquire_timeout_ms", .kind = .ms },
@@ -391,7 +397,7 @@ pub const redis_options = dbCommon("redis") ++ [_]Entry{
 };
 
 /// `anole.mongodb.Options` against `databases[].mongodb`.
-pub const mongodb_options = dbCommon("mongodb") ++ [_]Entry{
+pub const mongodb_options = dbCommon("mongodb") ++ resilience_entries ++ [_]Entry{
     .{ .zig = "url", .json = "databases[].mongodb.url" },
     .{ .zig = "environ", .omitted = "the ABI reads the process's environment" },
     .{ .zig = "database", .json = "databases[].mongodb.database" },
