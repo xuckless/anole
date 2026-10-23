@@ -23,6 +23,10 @@ pub const Config = struct {
     sasl: ?struct { mechanism: sasl.Mechanism, username: []const u8, password: []const u8 } = null,
     /// How long a JoinGroup waits for the other members of the round.
     join_wait_ms: u32 = 300,
+    /// Replaces the version range ApiVersions advertises for these APIs
+    /// (by default 0 to one past what the client speaks), to act as an
+    /// older broker or Redpanda.
+    serves: []const protocol.ApiRange = &.{},
 };
 
 const Stored = struct { base_offset: i64, count: i32, bytes: []u8 };
@@ -90,6 +94,8 @@ pub const FakeBroker = struct {
     drop_after_store: std.atomic.Value(u32) = .init(0),
     /// Counters.
     produce_requests: std.atomic.Value(u32) = .init(0),
+    /// The version of the last Produce request.
+    produce_version: std.atomic.Value(i16) = .init(-1),
     fetch_requests: std.atomic.Value(u32) = .init(0),
     connections: std.atomic.Value(u32) = .init(0),
     commits: std.atomic.Value(u32) = .init(0),
@@ -301,7 +307,6 @@ pub const FakeBroker = struct {
     const Outcome = enum { reply, no_reply, drop };
 
     fn handle(b: *FakeBroker, arena: std.mem.Allocator, conn: *Conn, api_key: i16, version: i16, d: *Dec, out: *Enc) !Outcome {
-        _ = version;
         const api = std.enums.fromInt(protocol.Api, api_key) orelse return .drop;
         if (!conn.authenticated and api != .api_versions and api != .sasl_handshake and api != .sasl_authenticate) return .drop;
         switch (api) {
@@ -310,9 +315,15 @@ pub const FakeBroker = struct {
                 const all = [_]protocol.Api{ .produce, .fetch, .list_offsets, .metadata, .offset_commit, .offset_fetch, .find_coordinator, .join_group, .heartbeat, .leave_group, .sync_group, .sasl_handshake, .api_versions, .init_producer_id, .sasl_authenticate };
                 try out.arrayLen(all.len);
                 for (all) |a| {
+                    var lo: i16 = 0;
+                    var hi: i16 = a.version() + 1;
+                    for (b.config.serves) |r| if (r.key == @intFromEnum(a)) {
+                        lo = r.min;
+                        hi = r.max;
+                    };
                     try out.i16_(@intFromEnum(a));
-                    try out.i16_(0);
-                    try out.i16_(a.version() + 1);
+                    try out.i16_(lo);
+                    try out.i16_(hi);
                 }
             },
             .sasl_handshake => {
@@ -348,7 +359,7 @@ pub const FakeBroker = struct {
                 try out.i64_(pid);
                 try out.i16_(0);
             },
-            .produce => return b.produce(arena, d, out),
+            .produce => return b.produce(arena, version, d, out),
             .fetch => try b.fetch(arena, d, out),
             .list_offsets => try b.listOffsets(arena, d, out),
             .join_group => try b.joinGroup(arena, d, out),
@@ -422,12 +433,13 @@ pub const FakeBroker = struct {
         try out.i32_(0);
     }
 
-    fn produce(b: *FakeBroker, arena: std.mem.Allocator, d: *Dec, out: *Enc) !Outcome {
+    fn produce(b: *FakeBroker, arena: std.mem.Allocator, version: i16, d: *Dec, out: *Enc) !Outcome {
         _ = arena;
         _ = try d.nullableString();
         const acks = try d.i16_();
         _ = try d.i32_();
         _ = b.produce_requests.fetchAdd(1, .monotonic);
+        b.produce_version.store(version, .release);
         const failing = takeOne(&b.fail_produce);
         const fail_code = b.fail_code.load(.acquire);
         const drop = takeOne(&b.drop_after_store);
@@ -479,8 +491,10 @@ pub const FakeBroker = struct {
                 try out.i64_(base);
                 try out.i64_(-1);
                 try out.i64_(0);
-                try out.arrayLen(0);
-                try out.nullableString(null);
+                if (version >= 8) {
+                    try out.arrayLen(0);
+                    try out.nullableString(null);
+                }
             }
         }
         try out.i32_(0);

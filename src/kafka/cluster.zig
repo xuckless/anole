@@ -55,6 +55,20 @@ pub const Conn = struct {
     node_id: i32,
     host: []const u8,
     port: u16,
+    /// The version of each API this connection speaks, settled against the
+    /// broker's ApiVersions answer when it opens.
+    versions: std.EnumArray(Api, i16) = versions_newest,
+
+    const versions_newest: std.EnumArray(Api, i16) = blk: {
+        var v: std.EnumArray(Api, i16) = undefined;
+        for (std.enums.values(Api)) |api| v.set(api, api.version());
+        break :blk v;
+    };
+
+    /// The version `api` requests go out at on this connection.
+    pub fn version(self: *const Conn, api: Api) i16 {
+        return self.versions.get(api);
+    }
 
     /// Connects (TCP, TLS), checks the broker speaks the versions this
     /// client needs, and authenticates when `settings.sasl` is set.
@@ -107,15 +121,22 @@ pub const Conn = struct {
         if (r.error_code != 0) return error.UnsupportedBroker;
         const all = [_]Api{ .produce, .fetch, .list_offsets, .metadata, .offset_commit, .offset_fetch, .find_coordinator, .join_group, .heartbeat, .leave_group, .sync_group, .sasl_handshake, .init_producer_id, .sasl_authenticate };
         for (all) |api| {
-            const want = api.version();
+            const lo = api.minVersion();
+            const hi = api.version();
             var found = false;
             for (r.apis) |a| {
                 if (a.key != @intFromEnum(api)) continue;
                 found = true;
-                if (want < a.min or want > a.max) {
-                    log.warn("kafka {s}:{d}: the broker serves {t} versions {d}-{d}; this client needs {d}", .{ self.host, self.port, api, a.min, a.max, want });
+                const use = @min(hi, a.max);
+                if (use < lo or use < a.min) {
+                    if (lo == hi) {
+                        log.warn("kafka {s}:{d}: the broker serves {t} versions {d}-{d}; this client needs {d}", .{ self.host, self.port, api, a.min, a.max, hi });
+                    } else {
+                        log.warn("kafka {s}:{d}: the broker serves {t} versions {d}-{d}; this client needs one of {d}-{d}", .{ self.host, self.port, api, a.min, a.max, lo, hi });
+                    }
                     return error.UnsupportedBroker;
                 }
+                self.versions.set(api, use);
             }
             // SASL APIs are absent from a broker without SASL support at all;
             // everything else is required.
@@ -170,7 +191,7 @@ pub const Conn = struct {
         var e: protocol.Enc = .init(arena);
         const at = try e.reserveLen();
         try e.i16_(@intFromEnum(api));
-        try e.i16_(api.version());
+        try e.i16_(self.versions.get(api));
         try e.i32_(corr);
         try e.string(self.settings.client_id);
         try e.raw(body);

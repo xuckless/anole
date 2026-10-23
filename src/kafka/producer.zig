@@ -646,7 +646,7 @@ pub const Producer = struct {
         }
         const timeout: Duration = .fromMilliseconds(@as(i64, @intCast(@divTrunc(self.cfg.request_timeout.nanoseconds, std.time.ns_per_ms))) + 5000);
         const body = try conn.call(arena, .produce, e.bytesWritten(), timeout);
-        const results = protocol.decodeProduce(arena, body) catch return error.ProtocolError;
+        const results = protocol.decodeProduce(arena, body, conn.version(.produce)) catch return error.ProtocolError;
         for (work) |w| {
             var code: i16 = protocol.unknown_topic_or_partition;
             var base: i64 = -1;
