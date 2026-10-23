@@ -35,6 +35,8 @@ const ngtcp2 = @import("ngtcp2.zig");
 const nghttp3 = @import("nghttp3.zig");
 const quic_tls = @import("quic_tls.zig");
 const net = @import("net.zig");
+const udp_net = @import("../net/udp.zig");
+const Udp = udp_net.Udp;
 const bridge = @import("bridge.zig");
 const webtransport = @import("webtransport.zig");
 pub const SessionCache = @import("session_cache.zig").SessionCache;
@@ -216,7 +218,7 @@ pub const Rebind = enum {
 pub const ClientConnection = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    udp: net.Udp,
+    udp: Udp,
     /// The socket's address; every path uses it as is, so the connection
     /// never looks migrated.
     local: Addr,
@@ -308,7 +310,7 @@ pub const ClientConnection = struct {
             .blocks = .init(gpa, 16),
             .budget = .init(io, 4 << 20),
             .io = io,
-            .udp = .init(socket),
+            .udp = .init(socket, .{}),
             .local = .from(socket.address),
             .remote = .from(remote_ip),
             .tx = tx,
@@ -521,7 +523,7 @@ pub const ClientConnection = struct {
             self.local = local;
         }
         const old = self.udp.socket;
-        self.udp = .init(next.socket);
+        self.udp = .init(next.socket, .{});
         const udp = self.udp;
         self.unlock();
         // What arrives on the old socket from here on is lost, as it would
@@ -907,8 +909,8 @@ pub const ClientConnection = struct {
 
     // -- In: the reader task -------------------------------------------------
 
-    fn readerLoop(self: *ClientConnection, udp: net.Udp) std.Io.Cancelable!void {
-        var control: net.Udp.Control align(std.Io.net.cmsg_align) = undefined;
+    fn readerLoop(self: *ClientConnection, udp: Udp) std.Io.Cancelable!void {
+        var control: Udp.Control align(std.Io.net.cmsg_align) = undefined;
         while (true) {
             var dg = udp.receive(self.io, self.rx, &control, .none) catch |err| switch (err) {
                 error.Canceled => |e| return e,

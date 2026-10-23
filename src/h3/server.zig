@@ -46,6 +46,8 @@ const nghttp3 = @import("nghttp3.zig");
 const quic_tls = @import("quic_tls.zig");
 const dusty_tls = @import("anole_dusty_tls");
 const net = @import("net.zig");
+const udp_net = @import("../net/udp.zig");
+const Udp = udp_net.Udp;
 const bridge = @import("bridge.zig");
 const webtransport = @import("webtransport.zig");
 const early_data = @import("../early_data.zig");
@@ -351,7 +353,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// limits differ. Change them through the listener (as
         /// `enableWebTransport` does), never on one endpoint.
         options: Options,
-        udp: net.Udp,
+        udp: Udp,
         local: Addr,
         /// This endpoint's place among the listener's: its socket's index in
         /// the reuseport group (the order they were bound in), the executor
@@ -418,7 +420,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// one outbox (`tx_fill`) while the other is being sent.
         /// `tx_lock` covers the filling one, and is never held across a
         /// yield; `tx_send` lets one task at a time send.
-        tx: [2]net.Udp.Outbox,
+        tx: [2]Udp.Outbox,
         tx_fill: u1 = 0,
         tx_lock: std.atomic.Mutex = .unlocked,
         tx_send: std.Io.Mutex = .init,
@@ -479,7 +481,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             // Several sockets share the port: none but ours may be on it
             // already. An inherited group is ours.
-            if (inherited.len == 0 and count > 1) try net.checkUdpAddressFree(options.address, options.ipv6_only);
+            if (inherited.len == 0 and count > 1) try udp_net.checkUdpAddressFree(options.address, options.ipv6_only);
             // Only an IPv6 socket takes IPV6_V6ONLY (zio refuses it on IPv4).
             const ipv6_only: ?bool = if (options.address == .ip6) options.ipv6_only else null;
             var made: usize = 0;
@@ -513,7 +515,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn bindMember(io: std.Io, at: std.Io.net.IpAddress, ipv6_only: ?bool) !std.Io.net.Socket {
             // One socket per listener there (`init`).
             if (comptime builtin.os.tag == .windows) unreachable;
-            const fd = try net.bindReusePort(at, ipv6_only);
+            const fd = try udp_net.bindReusePort(at, ipv6_only);
             return adoptSocket(io, fd, at) catch |err| {
                 _ = std.c.close(fd);
                 return err;
@@ -523,23 +525,23 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn initOne(gpa: std.mem.Allocator, io: std.Io, http: *HttpServer, options: Options, socket: std.Io.net.Socket, index: u8, shared: *Shared, secret: [32]u8) !*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            var tx0: net.Udp.Outbox = try .init(gpa);
+            var tx0: Udp.Outbox = try .init(gpa);
             errdefer tx0.deinit(gpa);
-            var tx1: net.Udp.Outbox = try .init(gpa);
+            var tx1: Udp.Outbox = try .init(gpa);
             errdefer tx1.deinit(gpa);
             self.* = .{
                 .gpa = gpa,
                 .io = io,
                 .http = http,
                 .options = options,
-                .udp = .init(socket),
+                .udp = .init(socket, .{}),
                 .local = .from(socket.address),
                 .index = index,
                 .shared = shared,
                 .secret = secret,
                 .listener = .{ .address = .{ .ip = socket.address }, .name = options.listener_name },
                 .inbox = undefined,
-                .rx = try gpa.alloc(u8, net.Udp.batch_buffer_len),
+                .rx = try gpa.alloc(u8, Udp.batch_buffer_len),
                 .tx = .{ tx0, tx1 },
                 .blocks = .initAdaptive(gpa, 256),
             };
@@ -744,7 +746,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 reader.cancel(io);
                 return;
             };
-            var batch: net.Udp.Batch = .{};
+            var batch: Udp.Batch = .{};
             while (true) {
                 const n = self.udp.receiveBatch(io, self.rx, &batch, .none) catch |err| switch (err) {
                     error.Canceled => break,
@@ -778,7 +780,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// The outbox to write a connection's packets into, locked, with
         /// room for `tx_round`; null when it has none (send it, then try
         /// again).
-        fn txReserve(self: *Self) ?*net.Udp.Outbox {
+        fn txReserve(self: *Self) ?*Udp.Outbox {
             self.lockTx();
             const o = &self.tx[self.tx_fill];
             if (o.fits(tx_round, burst)) return o;
@@ -1053,11 +1055,11 @@ pub fn Endpoint(comptime Ctx: type) type {
         }
 
         /// `ts`: when it came in.
-        fn onDatagram(self: *Self, dg: *net.Udp.Datagram, ts: u64) void {
+        fn onDatagram(self: *Self, dg: *Udp.Datagram, ts: u64) void {
             while (dg.next()) |data| self.onPacket(dg.from, dg.local, dg.ecn, data, ts);
         }
 
-        fn shutdown(self: *Self, control: *align(std.Io.net.cmsg_align) net.Udp.Control) void {
+        fn shutdown(self: *Self, control: *align(std.Io.net.cmsg_align) Udp.Control) void {
             const protection = self.io.swapCancelProtection(.blocked);
             defer _ = self.io.swapCancelProtection(protection);
             self.draining = true;

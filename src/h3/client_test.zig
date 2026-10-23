@@ -11,6 +11,8 @@ const client = @import("client.zig");
 const Endpoint = @import("server.zig").Endpoint(void);
 const quic_tls = @import("quic_tls.zig");
 const net = @import("net.zig");
+const udp_net = @import("../net/udp.zig");
+const Udp = udp_net.Udp;
 const early_data = @import("../early_data.zig");
 
 fn hello(_: *dusty.Request, res: *dusty.Response) !void {
@@ -512,7 +514,7 @@ test "h3 server: long-header packets with a connection ID over 20 bytes are drop
     defer f.stop(gpa, io);
 
     const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var raw: net.Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }));
+    var raw: Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), .{});
     defer raw.socket.close(io);
     var pkt: [1300]u8 = undefined;
     // Version 0 (Version Negotiation), version 1 and an unknown version,
@@ -959,11 +961,11 @@ pub const Relay = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     /// Where the client sends.
-    front: net.Udp,
+    front: Udp,
     /// Toward the server.
-    back: net.Udp,
+    back: Udp,
     /// Toward the server after a NAT rebinding (`rebind_after_up`).
-    back2: net.Udp,
+    back2: Udp,
     server: std.Io.net.IpAddress,
     mutex: std.Io.Mutex = .init,
     client: ?std.Io.net.IpAddress = null,
@@ -992,9 +994,9 @@ pub const Relay = struct {
         r.* = .{
             .gpa = gpa,
             .io = io,
-            .front = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp })),
-            .back = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp })),
-            .back2 = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp })),
+            .front = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), .{}),
+            .back = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), .{}),
+            .back2 = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), .{}),
             .server = server,
         };
         try r.group.concurrent(io, up, .{r});
@@ -1048,7 +1050,7 @@ pub const Relay = struct {
     fn up(r: *Relay) std.Io.Cancelable!void {
         const buf = r.gpa.alloc(u8, 65536) catch return;
         defer r.gpa.free(buf);
-        var control: net.Udp.Control align(std.Io.net.cmsg_align) = undefined;
+        var control: Udp.Control align(std.Io.net.cmsg_align) = undefined;
         while (true) {
             var dg = r.front.receive(r.io, buf, &control, .none) catch |err| switch (err) {
                 error.Canceled => |e| return e,
@@ -1096,7 +1098,7 @@ pub const Relay = struct {
     fn down(r: *Relay, second: bool) std.Io.Cancelable!void {
         const buf = r.gpa.alloc(u8, 65536) catch return;
         defer r.gpa.free(buf);
-        var control: net.Udp.Control align(std.Io.net.cmsg_align) = undefined;
+        var control: Udp.Control align(std.Io.net.cmsg_align) = undefined;
         const from = if (second) &r.back2 else &r.back;
         while (true) {
             var dg = from.receive(r.io, buf, &control, .none) catch |err| switch (err) {
@@ -1123,7 +1125,7 @@ pub const Relay = struct {
     /// attacker who captured the flight.
     fn replay(r: *Relay) !void {
         const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-        var attacker: net.Udp = .init(try lo.bind(r.io, .{ .mode = .dgram, .protocol = .udp }));
+        var attacker: Udp = .init(try lo.bind(r.io, .{ .mode = .dgram, .protocol = .udp }), .{});
         defer attacker.socket.close(r.io);
         r.mutex.lockUncancelable(r.io);
         defer r.mutex.unlock(r.io);
@@ -1134,7 +1136,7 @@ pub const Relay = struct {
     /// clients that coalesce their first flight send it).
     fn replayCoalesced(r: *Relay) !void {
         const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-        var sender: net.Udp = .init(try lo.bind(r.io, .{ .mode = .dgram, .protocol = .udp }));
+        var sender: Udp = .init(try lo.bind(r.io, .{ .mode = .dgram, .protocol = .udp }), .{});
         defer sender.socket.close(r.io);
         r.mutex.lockUncancelable(r.io);
         defer r.mutex.unlock(r.io);
