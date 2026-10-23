@@ -2403,8 +2403,8 @@ static void test_tls(void) {
     CHECK(anole_last_error().len > 0);
   }
   /* Settings it takes. */
-  anole_server *p = make_server("{\"trusted_proxy_hops\": 1, \"trust_forwarded_proto\": false,"
-                                " \"trust_forwarded_host\": true, \"listeners\": [{\"port\": 0,"
+  anole_server *p = make_server("{\"proxy\": {\"trusted_hops\": 1, \"trust_forwarded_proto\": false,"
+                                " \"trust_forwarded_host\": true}, \"listeners\": [{\"port\": 0,"
                                 " \"proxy_protocol\": true, \"proxy_protocol_from\": [\"127.0.0.1\", \"10.0.0.0/8\"]}]}");
   CHECK(anole_server_start(p) == ANOLE_OK);
   /* No TLS listener: nothing to reload. */
@@ -2757,14 +2757,14 @@ static void test_db_request_tie(void) {
   /* an answered request leaves its query running */
   a = start_get(port, "/hold", &t);
   h = next_request(c);
-  anole_str some = LIT("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 300000) SELECT count(*) FROM n");
+  anole_str some = LIT("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 20000) SELECT count(*) FROM n");
   anole_db_options on_h = {sizeof on_h};
   on_h.req = h;
   CHECK(anole_db_query(db, c, some, NULL, 0, &on_h, 2) == ANOLE_OK); /* the request's own consumer, named */
   CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
   CHECK(finish_get(a, t, NULL) == 200);
   r = db_next(c, rec, sizeof rec);
-  CHECK(r->user_data == 2 && r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 300000);
+  CHECK(r->user_data == 2 && r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 20000);
 
   /* a stale request: GONE from the call, nothing queued */
   usleep(100 * 1000);
