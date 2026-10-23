@@ -497,6 +497,35 @@ pub fn build(b: *std.Build) void {
     const compile_tests_step = b.step("compile-tests", "Compile the test binaries without running them");
     compile_tests_step.dependOn(&tests.step);
 
+    // The live console's std-only part (src/console/ui): protocol, client, TUI,
+    // restart logic. Part 2 imports it as "anole_console_ui" into the anole
+    // module, libanole and the CLI. libc is linked for the terminal calls.
+    const console_ui = b.createModule(.{
+        .root_source_file = b.path("src/console/ui/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    {
+        const ui_tests = b.addTest(.{
+            .name = "console-ui-test",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/console/ui/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{.{ .name = "fuzz", .module = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig"), .target = target, .optimize = optimize }) }},
+            }),
+            .use_llvm = use_llvm,
+        });
+        const run_ui_tests = b.addRunArtifact(ui_tests);
+        run_ui_tests.skip_foreign_checks = true;
+        test_step.dependOn(&run_ui_tests.step);
+        compile_tests_step.dependOn(&ui_tests.step);
+        b.step("console-ui-test", "Run the live console's std-only module tests (protocol, keys, screen, app, restart plan)").dependOn(&run_ui_tests.step);
+    }
+    _ = console_ui;
+
     // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
     // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
     if (features.postgres) {
