@@ -36,12 +36,6 @@ pub const Verify = struct {
 
     pub const Dedup = dedup.Config;
 
-    /// Where "now" comes from (tests set it).
-    pub const Clock = struct {
-        context: ?*anyopaque = null,
-        now_ms: *const fn (context: ?*anyopaque) i64,
-    };
-
     pub const Options = struct {
         preset: Preset,
         /// One or more (rotation). standard: "whsec_<base64>" (v1) or
@@ -54,7 +48,8 @@ pub const Verify = struct {
         on_store_error: enum { reject, process } = .reject,
         /// For `.hmac`.
         hmac: ?Hmac = null,
-        clock: ?Clock = null,
+        /// Null: the real clock.
+        clock: ?anole.jobs.Clock = null,
     };
 
     pub const InitError = error{InvalidOptions} || std.mem.Allocator.Error;
@@ -124,11 +119,16 @@ pub const Verify = struct {
         self.gpa.destroy(self);
     }
 
+    /// Nothing to start (the connector hook of `app.webhookVerify`).
+    pub fn start(self: *Verify, registry: anytype, tracer: anytype, health: anytype) !void {
+        _ = .{ self, registry, tracer, health };
+    }
+
     /// It marks the id after the handler, so requests behind it keep a task.
     pub const detach_safe = false;
 
     fn nowMs(self: *const Verify) i64 {
-        if (self.options.clock) |c| return c.now_ms(c.context);
+        if (self.options.clock) |c| return c.now(c.context).toMillis();
         return std.Io.Timestamp.now(self.io, .real).toMilliseconds();
     }
 

@@ -171,7 +171,8 @@ pub fn open(gpa: std.mem.Allocator, key: [32]u8, sealed: []const u8, endpoint_id
     return out;
 }
 
-// The Standard Webhooks reference vector (standard-webhooks/libraries test data).
+// The reference vector from the Standard Webhooks libraries' tests
+// (github.com/standard-webhooks/standard-webhooks, libraries/python/tests/test_webhooks.py).
 test "sign and verify: the reference vector" {
     const secret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
     const id = "msg_p5jXN8AQM9LWM0D4loKWxJek";

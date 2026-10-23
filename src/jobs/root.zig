@@ -44,9 +44,9 @@ pub const Kind = struct {
     attempts: u16 = 20,
     backoff: resilience.Backoff = default_backoff,
     /// A bound on each run; `.max`: none.
-    timeout: Duration = .fromMinutes(15),
+    timeout: Duration = .fromSeconds(900),
 };
-pub const default_backoff: resilience.Backoff = .{ .base = .fromSeconds(15), .multiplier = 2, .max = .fromHours(6), .jitter = .equal };
+pub const default_backoff: resilience.Backoff = .{ .base = .fromSeconds(15), .multiplier = 2, .max = .fromSeconds(21600), .jitter = .equal };
 
 pub const QueueOptions = struct {
     /// 1-64 bytes of [a-z0-9_.-].
@@ -92,9 +92,9 @@ pub const Options = struct {
         manual,
     };
     pub const Keep = struct {
-        completed: Duration = .fromHours(24),
-        dead: Duration = .fromDays(30),
-        cancelled: Duration = .fromDays(7),
+        completed: Duration = .fromSeconds(86400),
+        dead: Duration = .fromSeconds(2592000),
+        cancelled: Duration = .fromSeconds(604800),
     };
     pub const Leader = struct {
         /// auto: advisory_lock on PostgreSQL, lease row on SQLite, SET NX on Redis.
@@ -150,7 +150,7 @@ pub const CronOptions = struct {
     tz: ?[]const u8 = null,
     missed: Missed = .once,
     /// `.all` looks back this far at most.
-    catch_up: Duration = .fromHours(24),
+    catch_up: Duration = .fromSeconds(86400),
     /// Job options for each tick (queue/priority/attempts/timeout; `unique` and `run_at` are set by the runner).
     job: EnqueueOptions = .{},
     pub const Missed = enum { skip, once, all };
@@ -259,7 +259,7 @@ pub const Job = struct {
             },
         }
     }
-    /// The handler then returns normally (`return job.snooze(.fromMinutes(5));`):
+    /// The handler then returns normally (`return job.snooze(.fromSeconds(300));`):
     /// run again later, the attempt not counted.
     pub fn snooze(self: *Job, delay: Duration) void {
         self.outcome = .{ .kind = .snooze, .delay = delay };
