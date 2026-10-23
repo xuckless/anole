@@ -188,12 +188,23 @@ repeated field of empty messages costs a whole struct per two bytes, a packed
 field eight bytes per byte), so a registration whose messages carry large
 repeated fields is worth a `max_message_size` well below the 4 MiB default.
 
-`app.grpc` registers on the root router, so the middleware of a
-`router.group(prefix, ...)` does not run for gRPC calls or for the REST
-routes of transcoded methods, even when their paths start with the group's
-prefix: an auth middleware on a `/v1` group does not cover a transcoded
-`/v1/...` route. Middleware added with `app.use` (or `router.use`) runs for
-them like for any route; check authorization there, or in the handler.
+`app.grpc` registers behind the global middleware only. To put a service
+behind more, register it through a group: `app.group("/v1", .{auth}).grpc(...)`
+or `app.with(.{auth}).grpc(...)`. The group's middleware runs for the
+service's gRPC calls and its transcoded REST routes; its prefix does not
+apply (both paths come from the proto: `/pkg.Users/Get` stays where it is).
+What a gRPC client sees when middleware answers first (a JWT 401, a rate
+limit 429) is the HTTP status, which gRPC and Connect clients map by the
+spec's table (401 UNAUTHENTICATED, 403 PERMISSION_DENIED, 429 UNAVAILABLE,
+404 UNIMPLEMENTED).
+
+A call's strings are copied: `call.fail(code, message)`, `call.failFmt(code,
+fmt, args)`, `call.addHeader` and `call.addTrailer` keep their own copies, so a
+message formatted into a stack buffer is safe. `addHeader` and `addTrailer`
+refuse the protocols' own keys (`grpc-*` but `grpc-status-details-bin` in
+trailers, `connect-*`, `trailer-*`, `content-type`, `te` and the transport's
+headers) with `error.InvalidMetadata`; `addHeader` adds a value, so a repeated
+key keeps every value.
 
 `no_wait` is `anole.noWait` ([routing.md](routing.md)) for the
 registration's unary methods: their handlers answer from the request and

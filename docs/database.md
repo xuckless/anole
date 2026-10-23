@@ -22,6 +22,42 @@ connector's) in a build without it is a compile error that names the flag.
 Choose them where you add the dependency, as for the other
 [build flags](server.md#build-flags).
 
+### Options every connector shares
+
+One vocabulary: a concept has the same field name and type on every
+connector that has it (durations are `anole.Duration`, with no unit suffix).
+The C ABI's JSON config uses the same names, with `_ms` on durations (0 is
+null where the field is optional).
+
+| Concept | PostgreSQL | SQLite | Redis | MongoDB | JSON (`databases[i].<kind>.`) |
+| --- | --- | --- | --- | --- | --- |
+| `name` (metrics label) | `?[]const u8`, "postgres" | file name | "redis" | "mongodb" | `databases[i].name` |
+| pool size | `max_connections: ?u32` | `readers: ?u32` | `max_connections: ?u32` | `max_connections: ?u32` (null: 100) | `max_connections`, `readers` |
+| 0 connections | `error.InvalidOptions` | `readers = 0`: all on the writer | `error.InvalidOptions` | `error.InvalidOptions` (a URL's `maxPoolSize=0` too) | E_CONFIG |
+| wait for a connection | `acquire_timeout` (5 s) | - | `acquire_timeout` (5 s) | `acquire_timeout` (10 s) | `acquire_timeout_ms` |
+| connect bound | `connect_timeout: ?Duration` (10 s) | - | same | same | `connect_timeout_ms` (0: none) |
+| idle close | `idle_timeout` (30 min) | - | `idle_timeout` (5 min) | `idle_timeout` (null) | `idle_timeout_ms` (0: none) |
+| lifetime | `max_lifetime` (1 h) | - | - | - | `max_lifetime_ms` |
+| statement cache | `statement_cache_size: u16` (256) | `statement_cache_size: u16` (64) | - | - | `statement_cache_size` |
+| lock wait | - | `busy_timeout: Duration` (5 s) | - | - | `busy_timeout_ms` |
+| per-call bound | `timeout: ?Duration` (30 s) | same | same | same (also `maxTimeMS`) | `databases[i].timeout_ms` (0: none) |
+| fail fast at start | `connect_at_start` | opens at init | `connect_at_start` | `connect_at_start` | `connect_at_start` |
+| readiness bound | `ping_timeout` (2 s) | `ping_timeout` (2 s) | `ping_timeout` | `ping_timeout` | `ping_timeout_ms` |
+| TLS | `tls: anole.db.Tls` | - | `tls: anole.db.Tls` | `tls: anole.db.Tls` | `ca_file`, `ca_pem`, `client_cert_file`, `client_key_file`, `client_cert_pem`, `client_key_pem`, `insecure_skip_verify` |
+| errors | `errors: db.ErrorMap` | same | same | same | `databases[i].errors` |
+| result cache bounds | `cache: db.CacheOptions` | same | same | same | `databases[i].cache` |
+
+`anole.db.Tls` has three fields: `ca: ?anole.Ca`, `client_certificate:
+?anole.Cert` (`.dev_self_signed` is refused) and `insecure_skip_verify`.
+Whether TLS is used is the URL's (`sslmode`, `rediss://`, `tls=true`);
+giving `ca` or `client_certificate` asks for it with the certificate
+checked, and a URL that turns TLS off or stops checking (`sslmode=disable`,
+`allow`, `prefer`, `redis://`, `tls=false`, `tlsInsecure`) is refused at
+init rather than silently obeyed. `insecure_skip_verify` (TLS without
+checking, for a managed server with a self-signed certificate on a network
+you trust) is refused with `ca` and with an sslmode that verifies. Invalid
+combinations log one message and fail with `error.InvalidOptions`.
+
 The calls:
 
 | Call | Returns |
@@ -277,8 +313,14 @@ try tx.commit(req); // under the request's deadline, like every call
   request's deadline passes or the client goes away (an HTTP/2 reset),
   the call is canceled, Anole sends PostgreSQL a CancelRequest so the
   statement stops on the server too, and the connection is replaced.
+  Every call is bounded by `Options.timeout` (30 s) unless it passes its
+  own `QueryOptions.timeout`; `.max` lifts it for one call (a long
+  migration, a background job: `app.db.with(.{ .timeout = .max })`), and
+  `timeout = null` removes it from the connector. Inside a request the
+  request's deadline applies too, whichever comes first.
   `with(.{ .timeout = .fromSeconds(2) })` bounds one call (a 504 past
-  it); `TxOptions.timeout` a whole transaction. The server's own
+  it); `TxOptions.timeout` a whole transaction (null: the connector's).
+  The server's own
   `statement_timeout` (`?options=-c%20statement_timeout%3D5s`) is a 504
   as well.
 - **Shared and cached reads.** `with(.{ .coalesce = true })` and
@@ -298,7 +340,9 @@ try tx.commit(req); // under the request's deadline, like every call
   connection given back inside a transaction is closed, never handed on.
   A plain call (`exec`, `one`, `all`... on the client, not a `Tx`) that
   leaves a transaction open, such as a bare `BEGIN`, is rolled back and
-  fails: the next call may get another connection, so the transaction
+  fails, and so does an `iterate` that leaves one open; a connection from
+  `acquire` given back inside a transaction is rolled back (and logged).
+  The next call may get another connection, so the transaction
   would not be one. Use `begin` or `transaction`; a whole `BEGIN; ...;
   COMMIT` in one call without parameters still works. SQLite does the
   same, since its writer is shared by every request.
@@ -473,6 +517,15 @@ _ = try tx.exec(req, "DELETE FROM notes WHERE done = 1", .{});
 try tx.commit(req);
 ```
 
+On both SQL connectors a `Tx` also has `table(req, sql, values)` and
+`run(req, sql, values)` (columns and parameters known at run time) and
+`with(options)`, whose calls take `timeout` and `prepare`; `coalesce` and
+`cache` fail the call inside a transaction. A `Tx` used after `commit` or
+`rollback` fails with `error.Database` ("the transaction is over"), never
+an assert. A transaction left open by `iterate`, or by a connection from
+`acquire` given back (the writer, for SQLite), is rolled back and logged,
+as a plain call that leaves one is.
+
 ### Options
 
 ```zig
@@ -482,6 +535,8 @@ state.db = try app.sqlite(.{
     .readers = 4,                // read-only connections; 0: everything on the writer
     .busy_timeout = .fromSeconds(5), // waiting for a lock another process holds
     .statement_cache_size = 64,     // per connection
+    .ping_timeout = .fromSeconds(2), // /readyz
+    .timeout = .fromSeconds(30),     // every call without its own bound
     .pragmas = &.{"PRAGMA cache_size = -20000"}, // run on every connection
 });
 ```
@@ -595,8 +650,12 @@ Not yet: `mongodb+srv://` (it needs a DNS SRV lookup; use the standard
 Atlas shows under Connect > Drivers when you pick an older driver version), read preferences other than `primary`,
 `loadBalanced`, compression, and the GSSAPI, AWS and OIDC mechanisms; the
 client refuses them at start rather than ignore them. `anole.mongodb.Options`
-has the same settings as fields, plus `tls.ca` and `tls.client_certificate`
-in memory, `errors`, and `name` (the `db` label in metrics, `"mongodb"`).
+has the same settings as fields (`idle_timeout`, `connect_timeout: ?Duration`,
+`max_connections: ?u32`, `connect_at_start`, `ping_timeout`), plus `tls`
+(`anole.db.Tls`: a CA and a client certificate in memory), `errors`, and
+`name` (the `db` label in metrics, `"mongodb"`). With `connect_at_start`
+the start selects a server and opens a connection per executor, and fails
+if that fails.
 
 ### Handlers
 
@@ -699,8 +758,9 @@ number, so the server applies them once; reads are retried once too.
 A request that ends early (a client gone, `req.setTimeout`, an HTTP/2
 reset) cancels the call where it waits; the connection it was using is
 closed, so no reply arrives on a reused one. `with(.{ .timeout = .fromSeconds(2) })`
-or `timeoutMS` bounds a call (server selection, the pool, the round trip)
-and sends the rest of the budget as `maxTimeMS`, so the server stops too.
+or `timeoutMS` (`Options.timeout`, 30 s unless set) bounds a call (server
+selection, the pool, the round trip) and sends the rest of the budget as
+`maxTimeMS`, so the server stops too.
 The request's own deadline is not sent as `maxTimeMS` yet.
 
 ### Observability

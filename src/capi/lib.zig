@@ -874,7 +874,7 @@ fn dbFailure(err: db_mod.QueryError) i32 {
         error.OutOfMemory => failCode(abi.E_NOMEM),
         error.Unsupported => named(abi.E_UNSUPPORTED, "Unsupported", 0, "this database or build has no transactions (SQLite and PostgreSQL only)", .{}),
         error.Gone => blk: {
-            if (live()) |e| _ = e.gone();
+            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
             break :blk named(abi.E_GONE, "Gone", 0, "the request or transaction it served is over", .{});
         },
     };

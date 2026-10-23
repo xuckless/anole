@@ -435,7 +435,11 @@ marked (C): they answer `ANOLE_OK` on an object that is already over.
 | `anole_wt_max_datagram` | `ANOLE_E_GONE` |
 | `anole_wt_close` (C) | `ANOLE_E_INVALID` (reason), `ANOLE_E_NOMEM` |
 | `anole_db_find` | `ANOLE_E_INVALID` |
-| `anole_db_query`, `anole_db_exec` | `ANOLE_E_INVALID` (value, options, flags, reserved), `ANOLE_E_STATE`, `ANOLE_E_NOMEM` |
+| `anole_db_query`, `anole_db_exec` | `ANOLE_E_INVALID` (value, options, flags, reserved, a NULL consumer without `req`, a `req` of another kind or another consumer's), `ANOLE_E_GONE` (a stale `req`), `ANOLE_E_STATE`, `ANOLE_E_NOMEM` |
+| `anole_db_begin` | `ANOLE_E_INVALID` (options), `ANOLE_E_UNSUPPORTED` (Redis, MongoDB), `ANOLE_E_GONE` (a stale `req`), `ANOLE_E_STATE`, `ANOLE_E_NOMEM` |
+| `anole_db_tx_query`, `anole_db_tx_exec` | `ANOLE_E_INVALID` (value, options: only `timeout_ms` and `ANOLE_DB_F_NO_PREPARE`; a handle of another kind), `ANOLE_E_GONE` (over, or commit/rollback/release called), `ANOLE_E_NOMEM` |
+| `anole_db_tx_commit`, `anole_db_tx_rollback` | `ANOLE_E_INVALID` (a handle of another kind), `ANOLE_E_GONE` |
+| `anole_db_tx_release` (C) | `ANOLE_E_INVALID` (0 or another kind) |
 | `anole_db_invalidate` | `ANOLE_E_STATE`, `ANOLE_E_NOMEM` |
 
 ## Configuration
@@ -776,7 +780,18 @@ anole_db_query(db, consumer, sql_select, NULL, 0, &o, 8);
   `changes` and `last_insert_rowid`; with no parameters its SQL may hold
   several statements.
 - Options (`anole_db_options`, or NULL):
-  - `timeout_ms` interrupts the statement (`ANOLE_E_TIMEOUT`, 504).
+  - `timeout_ms` interrupts the statement (`ANOLE_E_TIMEOUT`, 504). Every
+    query is bounded: 0 takes the database's `timeout_ms` (30 s by default;
+    0 there lifts it), and `ANOLE_DB_TIMEOUT_NONE` lifts it for one call.
+  - `req` ties the query to the `anole_req` or `anole_grpc_call` it serves.
+    It then runs on that request's executor (its pools and cache) and its
+    answer goes to the consumer that polled the request, so the `anole_consumer`
+    argument may be NULL (a non-NULL one must be that consumer). When the
+    request is aborted or passes its deadline, the query is canceled and
+    answers `ANOLE_E_GONE` (`http_status` 0); a request that was answered
+    leaves it running, bounded by `timeout_ms`. A stale `req` is
+    `ANOLE_E_GONE` from the call, nothing queued; a handle of another kind
+    is `ANOLE_E_INVALID`.
   - `ANOLE_DB_F_COALESCE`: identical reads in flight at once on one executor
     share one run.
   - `cache_ttl_ms`: the answer is kept per executor and served from memory
@@ -791,8 +806,74 @@ anole_db_query(db, consumer, sql_select, NULL, 0, &o, 8);
     504, 500).
   - The database's message, its code and the constraint are in the record,
     for logs. Don't send them to clients.
+  - An error names its table (or collection) in `table`, when the database
+    says.
+- A database can also set, beside its kind's keys: `timeout_ms` (above),
+  `errors` (a class name to the status it answers with, as
+  `anole.db.ErrorMap`: `{"foreign_key": "unprocessable_entity"}`) and, for
+  PostgreSQL, Redis and MongoDB, a client certificate (`client_cert_file` and
+  `client_key_file`, or `client_cert_pem` and `client_key_pem`),
+  `insecure_skip_verify` and `ping_timeout_ms`. SQLite takes `uri`,
+  `statement_cache_size` and `ping_timeout_ms`; MongoDB `idle_timeout_ms`,
+  `heartbeat_ms`, `retry_reads`, `retry_writes`, `connect_at_start`
+  (`max_connections` 0 is refused, as for every connector).
 - Queries can be queued from `anole_server_open` (or `anole_server_start`) until the server stops.
   Queries still running at the stop get no answer.
+
+### Transactions
+
+SQLite and PostgreSQL. `anole_db_begin` answers with an `anole_db_tx`
+handle in the `ev.handle` of its `ANOLE_EV_DB_RESULT`; from then on the
+consumer sends `anole_db_tx_query` and `anole_db_tx_exec` (they take
+`anole_db_options` but only `timeout_ms` and `ANOLE_DB_F_NO_PREPARE` apply),
+and ends it with `anole_db_tx_commit` or `anole_db_tx_rollback`. Calls on
+one transaction run one at a time, in the order made, on one connection of
+one executor; the consumer may queue several without waiting for answers,
+and each answer is an `ANOLE_EV_DB_RESULT` whose `ev.handle` is the
+transaction.
+
+```c
+anole_db_tx_options o = {sizeof o, 0, ANOLE_DB_ISOLATION_SERIALIZABLE, /*timeout_ms*/ 5000, 0, /*req*/ r};
+anole_db_begin(db, NULL, &o, 1);              /* answer: ev.handle = the transaction */
+anole_db_tx_exec(tx, debit, p1, 2, NULL, 2);
+anole_db_tx_exec(tx, credit, p2, 2, NULL, 3);
+anole_db_tx_commit(tx, 4);                    /* error_class SERIALIZATION: lost a race, 409 */
+```
+
+`anole_db_tx_options.timeout_ms` bounds the whole transaction, idle time
+included (0: the database's `timeout_ms`; `ANOLE_DB_TIMEOUT_NONE`: none).
+`req` ties it to a request as for a query. How it ends, and what its queued
+and running calls answer:
+
+| How it ends | Calls queued or running | Then |
+| --- | --- | --- |
+| `anole_db_tx_commit` / `_rollback` | run first, answered normally | COMMIT/ROLLBACK answered |
+| `anole_db_tx_release` | `ANOLE_E_GONE` | ROLLBACK, not answered |
+| its `timeout_ms` | `ANOLE_E_TIMEOUT` (504) | ROLLBACK |
+| its request aborted or past its deadline | `ANOLE_E_GONE` | ROLLBACK |
+| its request answered normally | nothing: it goes on, bounded by `timeout_ms` | |
+| the server stops | no answer | ROLLBACK |
+
+A later call on the stale handle returns `ANOLE_E_GONE` at once, and
+`anole_last_error` says which ending it was. `anole_db_tx_release` (or
+`anole_handle_release`) is the cleanup call for finalizers: it rolls back an
+open transaction and is `ANOLE_OK` on one that is over. A failed statement does
+not end the transaction: PostgreSQL then refuses every later statement
+until the rollback (SQLSTATE 25P02, `SAVEPOINT` recovers part of it), SQLite
+keeps what the others did. A read-write SQLite transaction holds the
+database's writer, so every other write waits: a forgotten transaction
+blocks writes for at most its `timeout_ms`.
+
+How bindings wrap it: a `pg`-style client keeps no connection until a
+`BEGIN` statement (`BEGIN`/`START TRANSACTION` becomes `anole_db_begin`,
+statements while open `anole_db_tx_query`, `COMMIT`/`ROLLBACK` the matching
+calls, `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` plain statements, `release()`
+`anole_db_tx_release` if still open); a `db.transaction(fn)` helper commits
+on return, rolls back on a throw and retries on `error_class` SERIALIZATION or
+DEADLOCK; a DB-API connection begins on its first `execute` and maps
+`commit()`/`rollback()`/`close()` one to one. A pinned connection without a
+transaction (session `SET`, temporary tables across calls, `LISTEN`) is not
+offered; use `SET LOCAL` inside a transaction.
 
 ### PostgreSQL
 
@@ -965,7 +1046,7 @@ anole_db_query(db, consumer, (anole_str){"find orders", 11}, p, 2, NULL, 1);
   key: `ANOLE_DB_ERR_UNIQUE`, 409); no primary or an unreachable server is
   `ANOLE_DB_ERR_UNAVAILABLE` (503). Retryable reads and writes are retried
   once, as the drivers do.
-- Transactions and change streams are not part of the ABI yet.
+- Transactions (`anole_db_begin`) are SQLite and PostgreSQL only; change streams are not part of the ABI yet.
 
 ## gRPC
 
@@ -1037,7 +1118,19 @@ slow consumer holds back its client through HTTP/2 flow control rather than
 filling memory. Metadata the consumer sends follows gRPC's rules: a
 lower-case key, a printable ASCII value, bytes under a `-bin` key (Anole
 encodes them); the protocols' own keys (`grpc-*` but
-`grpc-status-details-bin`, `connect-*`, `content-type`, `te`) are refused.
+`grpc-status-details-bin` in trailers only, `connect-*`, `trailer-*`,
+`content-type`, `te` and the transport's headers) are refused with
+`ANOLE_E_INVALID`: the same rule as Zig's `Call.addHeader` and `addTrailer`.
+
+**Per-service middleware.** A service can carry `"middleware"`, a list as a
+route's (`jwt`, `rate_limit`, `compress`...), after the global one. It runs
+for the service's gRPC paths and its transcoded REST routes alike; a
+rejection reaches a gRPC or Connect client as the HTTP status
+(401 UNAUTHENTICATED, 403 PERMISSION_DENIED, 429 UNAVAILABLE, 404
+UNIMPLEMENTED). A middleware that can wait (`jwt` with `jwks_url`) keeps the
+service's calls attached to a task instead of detached. Two transcoded
+bindings may share a route only behind the same middleware; otherwise
+`anole_server_start` answers `ANOLE_E_CONFIG` naming the route.
 
 **The end.** `ANOLE_EV_ABORT` ends a call the consumer has not finished:
 the client reset the stream or left, the deadline passed (the client got

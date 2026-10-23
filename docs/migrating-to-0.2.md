@@ -175,3 +175,79 @@ New in 0.7 (see docs/c-abi.md): `anole_server_open`, `anole_server_set_ready`,
 `anole_server_listener(_count)`, `anole_last_error_name`, `anole_last_errno`,
 `anole_consumer_set_wake`, the allocation table, abort reasons, and a destroy
 that does not wait for answers only its caller could give.
+
+## Databases and gRPC
+
+### Options (every connector)
+
+- **Every call is bounded by 30 s.** `Options.timeout` exists on all four
+  connectors (it was MongoDB's alone, and off) and defaults to 30 s;
+  `TxOptions.timeout = null` now means the connector's too. A call that
+  must run longer (a migration, a background job) passes
+  `.with(.{ .timeout = .max })`, or set `timeout = null` on the connector.
+  C ABI: `anole_db_options.timeout_ms = 0` now means the database's
+  `timeout_ms` (30000), not "none"; use `ANOLE_DB_TIMEOUT_NONE`.
+- **One vocabulary, renamed fields:**
+
+| 0.1 | 0.2 |
+| --- | --- |
+| `sqlite.Options.busy_timeout_ms = 5000` | `busy_timeout = .fromSeconds(5)` |
+| `sqlite.Options.statement_cache = 64` | `statement_cache_size = 64` (`u16`) |
+| `sqlite.Options.readers: ?usize` | `?u32` |
+| `mongodb.Options.max_idle` | `idle_timeout` |
+| `mongodb.Options.max_connections: usize = 100` (0: no limit) | `?u32`, null for 100; 0 is refused |
+| `mongodb.Options.connect_timeout: Duration` | `?Duration` (null: none) |
+| `mongodb.Options.tls: ?net.ConnectOptions.Tls` | `tls: anole.db.Tls` (`ca`, `client_certificate`, `insecure_skip_verify`) |
+| `pg.Options.tls`, `redis.Options.tls` | the same `anole.db.Tls` (old paths still compile) |
+| `.tls = .{ .ca = .{ .file = .{ .path = "ca.pem" } } }` | `.tls = .{ .ca = .{ .file = "ca.pem" } }` (`anole.Ca`) |
+| `name: []const u8 = "postgres"` | `name: ?[]const u8 = null` (the same default label) |
+| `sqlite.Client.execScript(sql)` | `execScript(&ctx, sql)`; `pg.Client.execScript(&ctx, sql)` is new (both unbounded) |
+| `max_connections = 0` | refused at init with `error.InvalidOptions` on PostgreSQL, Redis and MongoDB |
+
+  New fields: `connect_at_start` and `ping_timeout` on MongoDB,
+  `ping_timeout` on SQLite. `Conn.release` takes `*const Conn` on every
+  connector (so `const conn = try app.redis.acquire(req); defer
+  conn.release();` compiles).
+- **Leaving a transaction open is caught on more paths.** `iterate` that
+  leaves one, and a connection from `acquire` given back inside one, are
+  rolled back and logged, as plain calls already were.
+  `Tx.table`, `Tx.run` and `Tx.with(options)` exist on both SQL
+  connectors; a finished SQLite `Tx` fails with `error.Database` instead of
+  asserting.
+- **Role switches inside functions under `.auto`.** PostgreSQL does not
+  report `role`, so `reset_session = .auto` does not catch `SET ROLE` made
+  inside a function; use `.always` for apps that switch roles for row-level
+  security, or `SET LOCAL ROLE` inside a transaction.
+
+### C ABI: databases
+
+- `anole_db_options` is 48 bytes (`req` at the end) and
+  `anole_db_result_event` 104 (`table` span at the end); read both through
+  `size`/`len` as before.
+- New: `anole_db_begin`, `anole_db_tx_query`, `_exec`, `_commit`,
+  `_rollback`, `_release` (handle kind `db_tx`), `ANOLE_DB_TIMEOUT_NONE`,
+  `ANOLE_DB_TX_READ_ONLY`, `ANOLE_DB_ISOLATION_*`; `anole_db_query` and
+  `anole_db_exec` accept a NULL consumer with `anole_db_options.req`.
+- JSON config: `databases[].timeout_ms` (30000), `errors`, client
+  certificates (`client_cert_file`, `client_key_file`, `client_cert_pem`,
+  `client_key_pem`), `insecure_skip_verify` and `ping_timeout_ms` for
+  PostgreSQL, Redis and MongoDB; MongoDB `idle_timeout_ms`, `heartbeat_ms`,
+  `retry_reads`, `retry_writes`, `connect_at_start`; SQLite `uri`,
+  `ping_timeout_ms`. `sqlite.statement_cache` is `statement_cache_size`, and
+  `mongodb.max_connections` 0 is refused.
+- A libanole built with Redis or MongoDB but neither SQLite nor PostgreSQL
+  answers `anole_db_query` (it used to refuse every call).
+
+### gRPC
+
+- `Call.addHeader` and `Call.addTrailer` refuse the protocols' own keys
+  (`grpc-*` but `grpc-status-details-bin` in trailers, `connect-*`,
+  `trailer-*`, `content-type`, `te`...): a handler could send a second
+  `grpc-status`. `addHeader` adds a value instead of replacing one. The C ABI
+  also refuses `grpc-status-details-bin` as initial metadata.
+- `Call.fail`, `addTrailer` and `addHeader` copy their strings;
+  `Call.failFmt(code, fmt, args)` is new.
+- `Group.grpc` and `Group.grpcWith` register a service behind a group's
+  middleware, for its gRPC calls and its transcoded routes alike (before, a
+  transcoded `/v1/...` route skipped a `/v1` group's auth middleware). C ABI:
+  `grpc.services[].middleware`.
