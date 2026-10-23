@@ -699,6 +699,8 @@ pub fn finish(call: *Call, result: anyerror!void) !void {
             call.status = .unimplemented;
             call.status_message = "more than one request message for a unary method";
         },
+        // `Response.abort`: the stream is reset, with no status to send.
+        error.ResponseAborted => return err,
         // The peer is gone: nothing can be told.
         error.ConnectionResetByPeer, error.BrokenPipe => return,
         else => {
