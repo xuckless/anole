@@ -1804,8 +1804,18 @@ fn slowH1(io: std.Io, port: u16) !void {
     _ = r.interface.streamRemaining(&fw) catch {};
     const got = fw.buffered();
     try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
-    try std.testing.expectEqual(@as(usize, 13), std.mem.count(u8, got, "\r\n1\r\nx\r\n"));
-    try std.testing.expect(std.mem.endsWith(u8, got, "0\r\n\r\n"));
+    // The chunked body, whole: the writes may share chunks.
+    var rest = got[(std.mem.indexOf(u8, got, "\r\n\r\n") orelse return error.NoBody) + 4 ..];
+    var total: usize = 0;
+    while (true) {
+        const eol = std.mem.indexOf(u8, rest, "\r\n") orelse return error.TruncatedBody;
+        const n = try std.fmt.parseInt(usize, rest[0..eol], 16);
+        if (n == 0) break;
+        total += n;
+        if (rest.len < eol + 2 + n + 2) return error.TruncatedBody;
+        rest = rest[eol + 2 + n + 2 ..];
+    }
+    try std.testing.expectEqual(@as(usize, 13), total);
 }
 
 fn slowH2(io: std.Io, port: u16, path: []const u8) !void {
