@@ -54,6 +54,16 @@ fn stall(req: *dusty.Request, res: *dusty.Response) !void {
     try out.end();
 }
 
+/// GET /gate: answers once `gate_expected` requests are in at once.
+var gate_arrivals: std.atomic.Value(u32) = .init(0);
+var gate_expected: u32 = 0;
+var gate_open: std.Io.Event = .unset;
+fn gate(req: *dusty.Request, res: *dusty.Response) !void {
+    if (gate_arrivals.fetchAdd(1, .acq_rel) + 1 == gate_expected) gate_open.set(req.io);
+    try gate_open.wait(req.io);
+    res.body = "through the gate";
+}
+
 fn redirect(_: *dusty.Request, res: *dusty.Response) !void {
     res.status = .found;
     try res.header("Location", "/hello");
@@ -68,6 +78,7 @@ fn startServer(gpa: std.mem.Allocator, io: std.Io, listeners: []const dusty.List
     server.router.get("/slow", slow);
     server.router.get("/stall", stall);
     server.router.get("/redirect", redirect);
+    server.router.get("/gate", gate);
     return server;
 }
 
@@ -585,6 +596,113 @@ test "dusty's client over HTTP/2: GET, POST, HEAD, a redirect, reuse, a timeout,
         try std.testing.expectEqual(@as(u8, 1), response.version().major);
         try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
     }
+}
+
+test "dusty's client over HTTP/2: concurrent requests share one connection and one dial" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const anole_tls = @import("../tls/root.zig");
+    var pem = try anole_tls.selfSigned(gpa, .{});
+    defer pem.deinit(gpa);
+    // One executor, so one pool: the clients' tasks all share it.
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var srv = try Running.start(gpa, io, &.{
+        .{ .address = loopback, .tls = .{ .pem = .{ .cert = pem.cert, .key = pem.key }, .alpn_protocols = &.{ "h2", "http/1.1" } } },
+        .{ .address = loopback, .tls = .{ .pem = .{ .cert = pem.cert, .key = pem.key }, .alpn_protocols = &.{"http/1.1"} } },
+    });
+    defer srv.stop(gpa, io);
+    const h2_port = srv.server.addresses[0].ip.getPort();
+    const h1_port = srv.server.addresses[1].ip.getPort();
+
+    var client = dusty.Client.init(gpa, io, .{ .tls = .{ .ca = .{ .pem = pem.cert } } });
+    defer client.deinit();
+
+    const n = 16;
+    gate_arrivals.store(0, .release);
+    gate_expected = n;
+    gate_open = .unset;
+    const Worker = struct {
+        fn run(c: *dusty.Client, port: u16, ok: *std.atomic.Value(u32)) void {
+            var url_buf: [64]u8 = undefined;
+            const url = std.fmt.bufPrint(&url_buf, "https://localhost:{d}/gate", .{port}) catch return;
+            var response = c.fetch(url, .{}) catch return;
+            defer response.deinit();
+            const body = response.body() catch return;
+            if (response.version().major == 2 and std.mem.eql(u8, body orelse "", "through the gate")) _ = ok.fetchAdd(1, .monotonic);
+        }
+    };
+    var ok: std.atomic.Value(u32) = .init(0);
+    var group: std.Io.Group = .init;
+    for (0..n) |_| try dusty.placement.concurrent(&group, io, .local, Worker.run, .{ &client, h2_port, &ok });
+    try group.await(io);
+    // All sixteen were in flight together, on one connection.
+    try std.testing.expectEqual(@as(u32, n), ok.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), client.dials.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), client.pool().idle_len);
+
+    // A host that only speaks HTTP/1.1: each gets a connection of its own,
+    // after the first dial showed it.
+    gate_arrivals.store(0, .release);
+    gate_open = .unset;
+    ok.store(0, .release);
+    const dials_before = client.dials.load(.monotonic);
+    const H1Worker = struct {
+        fn run(c: *dusty.Client, port: u16, count: *std.atomic.Value(u32)) void {
+            var url_buf: [64]u8 = undefined;
+            const url = std.fmt.bufPrint(&url_buf, "https://localhost:{d}/hello", .{port}) catch return;
+            var response = c.fetch(url, .{}) catch return;
+            defer response.deinit();
+            if (response.version().major == 1) _ = count.fetchAdd(1, .monotonic);
+        }
+    };
+    var group2: std.Io.Group = .init;
+    for (0..4) |_| try dusty.placement.concurrent(&group2, io, .local, H1Worker.run, .{ &client, h1_port, &ok });
+    try group2.await(io);
+    try std.testing.expectEqual(@as(u32, 4), ok.load(.acquire));
+    try std.testing.expect(client.dials.load(.monotonic) > dials_before);
+}
+
+test "dusty's client over HTTP/2: h2c_hosts speak cleartext HTTP/2 with prior knowledge" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var srv = try Running.start(gpa, io, &.{.{ .address = loopback, .http2_prior_knowledge = true }});
+    defer srv.stop(gpa, io);
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello", .{srv.port()});
+
+    var plain = dusty.Client.init(gpa, io, .{});
+    defer plain.deinit();
+    {
+        var response = try plain.fetch(url, .{});
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u8, 1), response.version().major);
+    }
+
+    var entry_buf: [32]u8 = undefined;
+    const with_port = try std.fmt.bufPrint(&entry_buf, "127.0.0.1:{d}", .{srv.port()});
+    for ([_][]const []const u8{ &.{"127.0.0.1"}, &.{with_port} }) |hosts| {
+        var client = dusty.Client.init(gpa, io, .{ .h2c_hosts = hosts });
+        defer client.deinit();
+        for (0..2) |_| {
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+            try std.testing.expectEqual(.ok, response.status());
+            try std.testing.expectEqual(@as(u8, 2), response.version().major);
+            try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
+        }
+        // The second request reused the connection.
+        try std.testing.expectEqual(@as(u64, 1), client.dials.load(.monotonic));
+    }
+    // Another port is not listed: HTTP/1.1.
+    var other = dusty.Client.init(gpa, io, .{ .h2c_hosts = &.{"127.0.0.1:1"} });
+    defer other.deinit();
+    var response = try other.fetch(url, .{});
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u8, 1), response.version().major);
 }
 
 /// A scripted HTTP/2 server for the client: the test feeds the frames the
