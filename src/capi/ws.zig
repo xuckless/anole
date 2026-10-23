@@ -17,6 +17,7 @@ const abi = @import("abi.zig");
 const engine = @import("engine.zig");
 const placement = dusty.placement;
 const websocket = anole.websocket;
+const origin = @import("../origin.zig");
 const Socket = websocket.Socket;
 const Engine = engine.Engine;
 const Exec = engine.Exec;
@@ -28,7 +29,7 @@ const gpa = engine.gpa;
 const chunk_len = 256;
 const max_chunks = 4096;
 
-const State = enum(u32) { free, open };
+const State = enum(u32) { free, open, reserved };
 
 fn pack(gen: u32, state: State) u64 {
     return (@as(u64, gen) << 32) | @backingInt(state);
@@ -128,6 +129,38 @@ pub const ExecState = struct {
         return s;
     }
 
+    /// A slot for a socket whose handshake the consumer is deciding
+    /// (executor-local): not open yet, its handle not handed out. The
+    /// outbox is clean and the socket unset.
+    fn reserve(st: *ExecState, x: *Exec, route: *const Route) !*WsSlot {
+        const s = try st.alloc(x);
+        const g = s.gen();
+        s.acquire();
+        s.bytes = 0;
+        s.want_event = false;
+        s.scheduled = false;
+        s.kick_pending = false;
+        s.close_code = null;
+        s.msgs.clearRetainingCapacity();
+        gpa.free(s.close_reason);
+        s.close_reason = &.{};
+        s.release();
+        s.route = route;
+        s.socket = null;
+        s.word.store(pack(g, .reserved), .release);
+        return s;
+    }
+
+    /// A reserved slot that was not used (the handshake was refused, timed
+    /// out or failed before any handle was handed out): back on the free
+    /// list under a new generation.
+    fn unreserve(st: *ExecState, s: *WsSlot) void {
+        const g = s.gen();
+        s.word.store(pack(engine.nextGen(g), .free), .release);
+        s.next_free = st.free_head;
+        st.free_head = s.index;
+    }
+
     /// The highest generation of any slot (`Engine.destroy`).
     pub fn maxGen(st: *const ExecState) u32 {
         var max: u32 = 0;
@@ -179,20 +212,103 @@ fn slotOf(e: *Engine, hv: u64) engine.HandleError!struct { *WsSlot, u32 } {
     return .{ s, h.gen };
 }
 
+/// `anole_ws_accept`: the reserved slot `i` of `x` becomes the open socket
+/// of the handshake the consumer accepted; its handle. Any thread.
+pub fn openReserved(x: *Exec, i: u32) u64 {
+    const s = x.ws.slot(i).?;
+    const g = s.gen();
+    s.word.store(pack(g, .open), .release);
+    _ = x.engine.websockets.fetchAdd(1, .monotonic);
+    return s.handle(g);
+}
+
 // ---------------------------------------------------------------------------
 // The route and its callbacks (on the socket's executor)
 
 const table: websocket.Table = .{ .open = onOpen, .message = onMessage, .close = onClose };
+const accepted_table: websocket.Table = .{ .open = onOpenAccepted, .message = onMessage, .close = onClose };
 
 pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
     const route: *const Route = @ptrCast(@alignCast(req.route.?.data.?));
     const e = route.engine;
     const xi = placement.currentExecutor(req.io) orelse return error.InternalServerError;
+    // The same path, plain requests: the consumer's other route.
+    if (route.plain) |plain| if (!websocket.isUpgrade(req)) return engine.serveConsumer(plain, req, res);
     if (e.execs[xi].consumer == null) {
         res.fail(.service_unavailable, "no consumer");
         return;
     }
+    if (route.ws_consumer and websocket.isUpgrade(req)) return serveAccepted(route, req, res, &e.execs[xi]);
     return websocket.serveTable(req, res, route.ws.?, &table, @constCast(route));
+}
+
+/// The state an accepted handshake carries to `onOpenAccepted`.
+const Accepted = struct {
+    route: *const Route,
+    slot: *WsSlot,
+    gen: u32,
+    opened: bool = false,
+};
+
+/// A handshake the consumer decides (`"accept": "consumer"`): the request
+/// goes to it as `ANOLE_EV_WS_UPGRADE`, and an accept opens the socket.
+fn serveAccepted(route: *const Route, req: *dusty.Request, res: *dusty.Response, x: *Exec) anyerror!void {
+    const e = route.engine;
+    if (e.abandon.load(.acquire)) {
+        res.fail(.service_unavailable, "the server is stopping");
+        return;
+    }
+    // Decided natively, before the consumer hears of it.
+    if (!origin.allowed(req, route.ws.?.allowed_origins)) return error.Forbidden;
+    const slot = x.ws.reserve(x, route) catch {
+        res.fail(.service_unavailable, "too many WebSockets");
+        return;
+    };
+    const g = slot.gen();
+    var up: engine.Upgrade = .{ .ws_slot = slot.index };
+    engine.serveUpgrade(route, req, res, &up) catch |err| {
+        x.ws.unreserve(slot);
+        return err;
+    };
+    if (!up.accepted) {
+        x.ws.unreserve(slot);
+        return;
+    }
+    // The socket is open from the consumer's side: if the handshake's
+    // answer cannot be written, it hears a close with 1006.
+    var acc: Accepted = .{ .route = route, .slot = slot, .gen = g };
+    defer if (!acc.opened) failAccepted(x, slot, g);
+    var opts = route.ws.?;
+    const chosen = [1][]const u8{up.subprotocol};
+    opts.subprotocols = if (up.subprotocol.len > 0) &chosen else &.{};
+    opts.headers = up.headers;
+    return websocket.serveTable(req, res, opts, &accepted_table, &acc);
+}
+
+/// The accepted socket's handshake went out: it is the slot's socket now,
+/// and what the consumer queued meanwhile is sent. No `ANOLE_EV_WS_OPEN`
+/// (the accept was the open).
+fn onOpenAccepted(state: ?*anyopaque, sock: *Socket, _: *dusty.Request) anyerror!void {
+    const acc: *Accepted = @ptrCast(@alignCast(state.?));
+    const s = acc.slot;
+    acc.opened = true;
+    s.socket = sock;
+    sock.context = s;
+    s.acquire();
+    const pending = (s.msgs.items.len > 0 or s.close_code != null) and !s.scheduled and !s.kick_pending;
+    if (pending) {
+        s.kick_pending = true;
+        s.scheduled = true;
+    }
+    s.release();
+    if (pending) s.exec.post(&s.kick);
+}
+
+/// The handshake's answer of an accepted socket could not be written: the
+/// slot goes stale, what was queued is dropped (a borrowed body is let go),
+/// and the consumer hears a close with 1006.
+fn failAccepted(x: *Exec, s: *WsSlot, g: u32) void {
+    retire(x, s, g, null, 1006);
 }
 
 fn onOpen(state: ?*anyopaque, sock: *Socket, req: *dusty.Request) anyerror!void {
@@ -217,6 +333,7 @@ fn onOpen(state: ?*anyopaque, sock: *Socket, req: *dusty.Request) anyerror!void 
         .flags = if (req.secure) abi.REQ_SECURE else 0,
         .remote = remote[0..engine.remoteText(req, &remote)],
         .claims = engine.claimsOf(req),
+        .subprotocol = sock.subprotocol orelse "",
     };
     const size = head.size();
     const rec = try engine.allocRecord(size);
@@ -246,9 +363,15 @@ fn onMessage(_: ?*anyopaque, sock: *Socket, msg: websocket.Message) anyerror!voi
 
 fn onClose(_: ?*anyopaque, sock: *Socket) void {
     const s: *WsSlot = @ptrCast(@alignCast(sock.context orelse return));
-    const x = s.exec;
+    const code: u16 = if (sock.close_code) |c| @backingInt(c) else if (sock.end_error != null) 1006 else 1005;
+    retire(s.exec, s, s.gen(), sock, code);
+}
+
+/// The socket is over: its handle goes stale, what was queued for it is
+/// dropped, it leaves its topics, and the consumer hears the close.
+/// `sock` is null for a socket that never opened.
+fn retire(x: *Exec, s: *WsSlot, g: u32, sock: ?*Socket, code: u16) void {
     const e = x.engine;
-    const g = s.gen();
     // Stale from here: the consumer's calls get ANOLE_E_GONE.
     const next = engine.nextGen(g);
     s.acquire();
@@ -265,15 +388,19 @@ fn onClose(_: ?*anyopaque, sock: *Socket) void {
     s.release();
     for (rest.items) |m| if (m.owned) gpa.free(m.data) else if (m.sent) |r| x.postSentRec(s.handle(g), r);
     rest.deinit(gpa);
-    for (s.topics.items) |t| {
-        e.rooms.leave(t, sock);
-        gpa.free(t);
+    if (sock) |sk| {
+        for (s.topics.items) |t| {
+            e.rooms.leave(t, sk);
+            gpa.free(t);
+        }
+        s.topics.clearRetainingCapacity();
+        sk.context = null;
+    } else {
+        for (s.topics.items) |t| gpa.free(t);
+        s.topics.clearRetainingCapacity();
     }
-    s.topics.clearRetainingCapacity();
-    sock.context = null;
     s.socket = null;
 
-    const code: u16 = if (sock.close_code) |c| @backingInt(c) else if (sock.end_error != null) 1006 else 1005;
     if (newRecord(@sizeOf(abi.WsCloseEvent), .ws_close, s.handle(g))) |rec| {
         const ev: *abi.WsCloseEvent = @ptrCast(rec.ptr);
         ev.route_id = s.route.id;

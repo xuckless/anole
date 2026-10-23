@@ -216,6 +216,16 @@ pub const SentEvent = extern struct {
     len: u64,
 };
 
+/// `anole_ws_accept`'s options (NULL takes the defaults).
+pub const WsAcceptOptions = extern struct {
+    size: usize,
+    flags: u32 = 0,
+    reserved: u32 = 0,
+    subprotocol: Str = .{},
+    headers: ?[*]const Header = null,
+    nheaders: usize = 0,
+};
+
 pub const WS_TEXT: u32 = 1;
 pub const WS_BINARY: u32 = 2;
 
@@ -446,6 +456,7 @@ comptime {
     std.debug.assert(@sizeOf(SentEvent) == 32);
     std.debug.assert(@sizeOf(WsMessageEvent) == 32);
     std.debug.assert(@sizeOf(WsCloseEvent) == 32);
+    std.debug.assert(@sizeOf(WsAcceptOptions) == 48);
     std.debug.assert(@sizeOf(GrpcCallEvent) == 104);
     std.debug.assert(@sizeOf(GrpcMessageEvent) == 32);
     std.debug.assert(@sizeOf(DbValue) == 24);
@@ -486,6 +497,7 @@ pub const records = .{
     .{ "anole_sent_event", SentEvent },
     .{ "anole_ws_message_event", WsMessageEvent },
     .{ "anole_ws_close_event", WsCloseEvent },
+    .{ "anole_ws_accept_options", WsAcceptOptions },
     .{ "anole_grpc_call_event", GrpcCallEvent },
     .{ "anole_grpc_message_event", GrpcMessageEvent },
     .{ "anole_wt_stream_event", WtStreamEvent },

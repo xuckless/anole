@@ -167,7 +167,7 @@ var next_first_gen: u32 = 1;
 
 pub const ReplyHeader = struct { name_off: u32, name_len: u32, value_off: u32, value_len: u32 };
 
-const Reply = enum { respond, fail, abort, fd };
+const Reply = enum { respond, fail, abort, fd, ws_accept };
 
 pub const Slot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
@@ -249,6 +249,15 @@ pub const Slot = struct {
     next_free: u32 = no_slot,
     /// A gRPC call's own state (`kind` grpc_call).
     grpc: grpc.SlotState = .{},
+    /// A WebSocket handshake the consumer decides (ANOLE_EV_WS_UPGRADE),
+    /// with the WebSocket slot reserved for it (executor-local, set before
+    /// the `queued` store and read by `poll` after its CAS).
+    ws_upgrade: bool = false,
+    ws_slot: u32 = no_slot,
+    /// `anole_ws_accept`: the extra headers are stored as a response's are,
+    /// the accepted subprotocol's bytes follow them in `bytes`.
+    subprotocol_off: u32 = 0,
+    subprotocol_len: u32 = 0,
 
     /// Above this, a slot's answer buffer is freed after use.
     const keep_capacity = 64 * 1024;
@@ -499,6 +508,10 @@ pub const Exec = struct {
         s.abandoned = false;
         s.body_error = null;
         s.claims = "";
+        s.ws_upgrade = false;
+        s.ws_slot = no_slot;
+        s.subprotocol_off = 0;
+        s.subprotocol_len = 0;
         if (comptime features.grpc) if (s.kind.load(.monotonic) == @backingInt(Handle.Kind.grpc_call)) grpc.onRelease(x, i);
         s.kind.store(@backingInt(Handle.Kind.request), .monotonic);
         _ = x.engine.inflight.fetchSub(1, .monotonic);
@@ -841,6 +854,12 @@ pub const Route = struct {
     list: u8 = 0,
     /// Its requests may detach: nothing in its chain waits.
     detachable: bool = true,
+    /// A WebSocket route whose handshakes the consumer decides
+    /// (`"accept": "consumer"`).
+    ws_consumer: bool = false,
+    /// A WebSocket route that is also a plain route (`handler` and
+    /// `websocket` together): the route plain requests go to.
+    plain: ?*const Route = null,
     /// A WebSocket endpoint's settings.
     ws: if (features.websocket) ?anole.websocket.UpgradeOptions else void = if (features.websocket) null else {},
     /// A WebTransport endpoint's settings.
@@ -1303,6 +1322,42 @@ pub const Engine = struct {
                     .cache_control = st.cache_control,
                     .hide_dotfiles = st.hide_dotfiles,
                 });
+            } else if (rc.websocket) |wc| {
+                if (comptime !features.websocket) unreachable;
+                // `handler` beside `websocket` (consumer-decided
+                // handshakes): plain requests of the path go to it.
+                var plain: ?*const Route = null;
+                if (rc.handler) |id| {
+                    const pr = try a.create(Route);
+                    pr.* = .{
+                        .engine = e,
+                        .id = id,
+                        .list = e.listFor(rc.timeout_ms),
+                        .detachable = rc.no_wait and global_ok and config_mod.neverWaits(rc.middleware),
+                    };
+                    plain = pr;
+                }
+                const route = try a.create(Route);
+                route.* = .{
+                    .engine = e,
+                    .id = wc.handler,
+                    .list = e.listFor(rc.timeout_ms),
+                    .ws_consumer = wc.accept == .consumer,
+                    .plain = plain,
+                    .ws = .{
+                        .max_message_size = cfg.limits.ws_max_message,
+                        .compression = wc.compression and features.compression,
+                        .close_on_drain = wc.close_on_drain,
+                        .allowed_origins = wsOrigins(wc.origins),
+                        .subprotocols = wc.subprotocols,
+                    },
+                };
+                // An extended CONNECT never arrives whole, so handshakes
+                // always get a task; `no_wait` is for the plain requests.
+                group.inner.addRouteWith(if (plain != null) method else .get, rc.path, ws.handler, .{
+                    .data = route,
+                    .no_wait = if (plain) |pr| pr.detachable else false,
+                });
             } else if (rc.handler) |id| {
                 const route = try a.create(Route);
                 route.* = .{
@@ -1312,16 +1367,6 @@ pub const Engine = struct {
                     .detachable = rc.no_wait and global_ok and config_mod.neverWaits(rc.middleware),
                 };
                 group.inner.addRouteWith(method, rc.path, consumerHandler, .{ .data = route, .no_wait = route.detachable });
-            } else if (rc.websocket) |wc| {
-                if (comptime !features.websocket) unreachable;
-                const route = try a.create(Route);
-                route.* = .{ .engine = e, .id = wc.handler, .ws = .{
-                    .max_message_size = cfg.limits.ws_max_message,
-                    .compression = wc.compression and features.compression,
-                    .close_on_drain = wc.close_on_drain,
-                    .allowed_origins = wsOrigins(wc.origins),
-                } };
-                group.inner.addRouteWith(.get, rc.path, ws.handler, .{ .data = route });
             } else if (rc.webtransport) |wc| {
                 if (comptime !features.http3) unreachable;
                 const route = try a.create(Route);
@@ -1788,6 +1833,33 @@ fn planBody(e: *Engine, req: *http.Request, whole_only: bool) !BodyPlan {
 
 fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
     const route: *const Route = @ptrCast(@alignCast(req.route.?.data.?));
+    return serveConsumer(route, req, res);
+}
+
+/// A WebSocket handshake being decided by the consumer: the WebSocket slot
+/// reserved for it, and what the answer was.
+pub const Upgrade = struct {
+    ws_slot: u32,
+    accepted: bool = false,
+    /// `accepted`: the subprotocol and extra headers the consumer chose,
+    /// copied into the request's arena.
+    subprotocol: []const u8 = "",
+    headers: []const std.http.Header = &.{},
+};
+
+/// A plain request of `route`, handed to the consumer (`ANOLE_EV_REQUEST`).
+pub fn serveConsumer(route: *const Route, req: *http.Request, res: *http.Response) anyerror!void {
+    return serve(route, req, res, null);
+}
+
+/// A WebSocket handshake of `route`, handed to the consumer
+/// (`ANOLE_EV_WS_UPGRADE`); `up.accepted` tells whether it was accepted.
+/// Any other answer was applied to `res`.
+pub fn serveUpgrade(route: *const Route, req: *http.Request, res: *http.Response, up: *Upgrade) anyerror!void {
+    return serve(route, req, res, up);
+}
+
+fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upgrade) anyerror!void {
     const e = route.engine;
     const io = req.io;
     const xi = placement.currentExecutor(io) orelse return error.InternalServerError;
@@ -1800,7 +1872,8 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
         res.fail(.service_unavailable, "the server is stopping");
         return;
     }
-    const detach = res.canDetach() and route.detachable;
+    // A handshake never detaches (an extended CONNECT never arrives whole).
+    const detach = up == null and res.canDetach() and route.detachable;
     const plan = try planBody(e, req, detach);
     switch (plan) {
         .refused => |status| {
@@ -1843,6 +1916,8 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
     s.claims = claimsOf(r);
     s.detached = d;
     s.body = "";
+    s.ws_upgrade = up != null;
+    s.ws_slot = if (up) |u| u.ws_slot else no_slot;
     s.event.reset();
     s.pump_event.reset();
     s.drained.store(true, .monotonic);
@@ -1910,12 +1985,12 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
         },
         else => {},
     }
-    return waitForAnswer(x, si, gen, req, res, canceled);
+    return waitForAnswer(x, si, gen, req, res, canceled, up);
 }
 
 /// The request's task waits for its answer (HTTP/1.1, and requests that
 /// could not detach), and writes it.
-fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Response, canceled_in: bool) anyerror!void {
+fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Response, canceled_in: bool, up: ?*Upgrade) anyerror!void {
     const e = x.engine;
     const io = req.io;
     const s = &x.slots[si];
@@ -1994,6 +2069,21 @@ fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Res
             if (canceled) io.recancel();
             x.unlink(si);
             defer x.release(si);
+            if (s.reply == .ws_accept) {
+                // The handshake is accepted: what the consumer chose, out
+                // of the slot before it is freed.
+                const u = up.?;
+                const bytes = s.bytes.items;
+                u.subprotocol = try req.arena.dupe(u8, bytes[s.subprotocol_off..][0..s.subprotocol_len]);
+                const list = try req.arena.alloc(std.http.Header, s.headers.items.len);
+                for (s.headers.items, list) |h, *out| out.* = .{
+                    .name = try req.arena.dupe(u8, bytes[h.name_off..][0..h.name_len]),
+                    .value = try req.arena.dupe(u8, bytes[h.value_off..][0..h.value_len]),
+                };
+                u.headers = list;
+                u.accepted = true;
+                return;
+            }
             try applyAnswer(x, si, req, res);
             // A borrowed body must be out before the consumer hears it may
             // let go of it.
@@ -2049,7 +2139,7 @@ fn applyAnswer(x: *Exec, si: u32, req: *http.Request, res: *http.Response) !void
             };
             s.fd = -1;
         },
-        .fail, .abort => unreachable,
+        .fail, .abort, .ws_accept => unreachable,
     }
 }
 
@@ -2741,7 +2831,7 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                     c.next_exec = (c.next_exec + i) % c.execs.items.len;
                     break :outer;
                 }
-                pos += if (is_grpc) grpc.encodeRecord(s, entry.handle, out[pos..][0..size], now) else headOf(s, now).encode(.request, entry.handle, out[pos..][0..size]);
+                pos += if (is_grpc) grpc.encodeRecord(s, entry.handle, out[pos..][0..size], now) else headOf(s, now).encode(if (s.ws_upgrade) .ws_upgrade else .request, entry.handle, out[pos..][0..size]);
                 s.word.store(pack(h.gen, .out), .release);
                 x.ring.pop();
                 popped = true;
@@ -2978,6 +3068,37 @@ pub fn abort(e: *Engine, hv: u64) AnswerError!void {
     s.headers.clearRetainingCapacity();
     s.bytes.clearRetainingCapacity();
     handBack(x, s, h, .done);
+}
+
+/// `anole_ws_accept`: the consumer accepts the WebSocket handshake `hv`
+/// (an `ANOLE_EV_WS_UPGRADE`). Returns the socket's handle, open at once;
+/// the handshake's answer goes out from the request's task.
+pub fn wsAccept(e: *Engine, hv: u64, subprotocol: []const u8, headers: []const CHeader) AnswerError!u64 {
+    if (comptime !features.websocket) return error.Unsupported;
+    _ = try checkHeaders(headers);
+    for (headers) |h| if (!anole.websocket.handshakeHeaderAllowed(h.name.slice())) return error.Invalid;
+    if (subprotocol.len > 0 and (subprotocol.len > 255 or !anole.websocket.isToken(subprotocol))) return error.Invalid;
+    const x, const s, const h = try claim(e, hv);
+    errdefer s.word.store(pack(h.gen, .out), .release);
+    if (!s.ws_upgrade) return error.State;
+    // The request's memory is alive: its task waits for this answer.
+    if (subprotocol.len > 0) {
+        var offered = anole.websocket.offeredSubprotocols(s.req);
+        const found = while (offered.next()) |o| {
+            if (std.mem.eql(u8, o, subprotocol)) break true;
+        } else false;
+        if (!found) return error.Invalid;
+    }
+    try storeHeaders(&s.headers, &s.bytes, headers, subprotocol.len);
+    s.subprotocol_off = @intCast(s.bytes.items.len);
+    s.subprotocol_len = @intCast(subprotocol.len);
+    s.bytes.appendSliceAssumeCapacity(subprotocol);
+    s.reply = .ws_accept;
+    s.status = 200;
+    // Cannot fail: the slot was reserved for this request.
+    const handle = ws.openReserved(x, s.ws_slot);
+    handBack(x, s, h, .done);
+    return handle;
 }
 
 /// `anole_handle_release`: ends whatever the handle is, the way the

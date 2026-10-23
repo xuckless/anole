@@ -381,18 +381,22 @@ pub const Config = struct {
         method: ?[]const u8 = null,
         /// "/users/:id", "/files/*rest".
         path: []const u8,
-        /// Exactly one of these four:
+        /// Exactly one of these (`handler` and `websocket` may go together
+        /// when the websocket's handshakes are the consumer's to decide):
         /// a consumer's route id: the request goes to a consumer;
         handler: ?u32 = null,
         /// a fixed response, served natively;
         respond: ?Fixed = null,
         /// files under a directory (the path is the prefix);
         static: ?Static = null,
-        /// a WebSocket endpoint whose events go to a consumer;
+        /// a WebSocket endpoint whose events go to a consumer (with
+        /// `handler` too, plain requests of the path go to that handler:
+        /// one app sees every request on a path);
         websocket: ?WebSocket = null,
         /// a WebTransport endpoint (HTTP/3) whose events go to a consumer.
         webtransport: ?WebTransport = null,
-        /// This route's request deadline (consumer routes).
+        /// This route's request deadline (consumer routes; a websocket
+        /// route whose handshakes the consumer decides: the decision's).
         timeout_ms: ?u32 = null,
         /// Handler and respond routes run on the protocol's reader when
         /// they can (HTTP/2, HTTP/3: no task per request, the answer
@@ -419,6 +423,15 @@ pub const Config = struct {
     pub const WebSocket = struct {
         /// The consumer's route id for this endpoint's events.
         handler: u32,
+        /// Who answers the handshake: "auto" (Anole: origins and
+        /// subprotocols; the consumer hears ANOLE_EV_WS_OPEN) or "consumer"
+        /// (ANOLE_EV_WS_UPGRADE, answered with anole_ws_accept or refused
+        /// like any request).
+        accept: Accept = .auto,
+        /// "auto" only: the subprotocols this endpoint speaks, most
+        /// preferred first; the first the client offered is selected and
+        /// echoed (ANOLE_EV_WS_OPEN says which).
+        subprotocols: []const []const u8 = &.{},
         /// permessage-deflate when the client offers it.
         compression: bool = true,
         /// Close 1001 when the server drains.
@@ -427,6 +440,7 @@ pub const Config = struct {
         /// request's own host ("https://app.example.com"); "*" for any.
         origins: []const []const u8 = &.{},
     };
+    pub const Accept = enum { auto, consumer };
     pub const Grpc = struct {
         /// The services' descriptors, a serialized FileDescriptorSet with
         /// its imports (`protoc --include_imports --descriptor_set_out`,
@@ -668,7 +682,12 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     for (cfg.routes, 0..) |r, i| {
         const kinds = @as(u8, @intFromBool(r.handler != null)) + @intFromBool(r.respond != null) +
             @intFromBool(r.static != null) + @intFromBool(r.websocket != null) + @intFromBool(r.webtransport != null);
-        if (kinds != 1) return fail(why, "routes[{d}]: exactly one of handler, respond, static, websocket, webtransport", .{i});
+        const combined = r.handler != null and r.websocket != null and r.websocket.?.accept == .consumer and kinds == 2;
+        if (kinds != 1 and !combined) {
+            if (r.handler != null and r.websocket != null and kinds == 2)
+                return fail(why, "routes[{d}]: handler and websocket go together only with \"accept\": \"consumer\"", .{i});
+            return fail(why, "routes[{d}]: exactly one of handler, respond, static, websocket, webtransport", .{i});
+        }
         if (r.path.len == 0 or r.path[0] != '/') return fail(why, "routes[{d}].path must start with '/'", .{i});
         if (r.method) |m| if (methodOf(m) == null) return fail(why, "routes[{d}].method \"{s}\" is unknown", .{ i, m });
         if (r.respond) |f| {
@@ -683,7 +702,14 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         }
         if (r.websocket != null) {
             if (comptime !features.websocket) return fail(why, "routes[{d}].websocket: WebSocket is not built in (-Dwebsocket)", .{i});
-            if (r.method) |m| if (methodOf(m) != .get) return fail(why, "routes[{d}]: a websocket route is GET", .{i});
+            if (!combined) if (r.method) |m| if (methodOf(m) != .get) return fail(why, "routes[{d}]: a websocket route is GET", .{i});
+            const w = r.websocket.?;
+            if (w.accept == .consumer and w.subprotocols.len != 0)
+                return fail(why, "routes[{d}].websocket.subprotocols: only with \"accept\": \"auto\" (the consumer picks in anole_ws_accept)", .{i});
+            for (w.subprotocols, 0..) |sp, k| {
+                if (sp.len == 0 or sp.len > 255 or !anole.websocket.isToken(sp))
+                    return fail(why, "routes[{d}].websocket.subprotocols[{d}]: a token of 1-255 bytes", .{ i, k });
+            }
         }
         if (r.webtransport) |w| {
             if (comptime !features.http3) return fail(why, "routes[{d}].webtransport: HTTP/3 is not built in (-Dhttp3)", .{i});
@@ -696,7 +722,8 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (r.static != null and r.method != null) return fail(why, "routes[{d}]: a static route takes no method (GET and HEAD)", .{i});
         if (r.cache != null and r.handler == null and r.respond == null) return fail(why, "routes[{d}].cache: on handler and respond routes", .{i});
         if (r.timeout_ms) |t| {
-            if (r.handler == null) return fail(why, "routes[{d}].timeout_ms: on handler routes", .{i});
+            const decides = r.websocket != null and r.websocket.?.accept == .consumer;
+            if (r.handler == null and !decides) return fail(why, "routes[{d}].timeout_ms: on handler routes, and websocket routes whose handshakes the consumer decides", .{i});
             if (std.mem.indexOfScalar(u32, timeouts[0..ntimeouts], t) == null) {
                 if (ntimeouts == max_timeouts) return fail(why, "routes: at most {d} distinct timeout_ms values", .{max_timeouts});
                 timeouts[ntimeouts] = t;

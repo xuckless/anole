@@ -396,7 +396,8 @@ enum anole_event_type {
   ANOLE_EV_WRITABLE = 4,   /* anole_event: a streamed response, gRPC call, WebSocket or WebTransport
                               stream that took ANOLE_BUSY has room (ev.handle) */
   ANOLE_EV_SENT = 5,       /* anole_sent_event: a borrowed body is no longer read */
-  ANOLE_EV_WS_OPEN = 6,    /* anole_request_event (the upgrade request); handle: anole_ws */
+  ANOLE_EV_WS_OPEN = 6,    /* anole_request_event (the upgrade request; subprotocol set); handle:
+                              anole_ws. Routes with "accept": "auto" only (the default) */
   ANOLE_EV_WS_MESSAGE = 7, /* anole_ws_message_event */
   ANOLE_EV_WS_CLOSE = 8,   /* anole_ws_close_event: the handle is stale from now on */
   /* 9 is retired (was ANOLE_EV_WS_DRAIN: WebSockets use ANOLE_EV_WRITABLE) */
@@ -417,8 +418,10 @@ enum anole_event_type {
   ANOLE_EV_WT_STREAM_STOP = 26,  /* anole_wt_code_event: the peer asked this side to stop
                                     sending (writes now answer ANOLE_E_GONE) */
   ANOLE_EV_WT_DATAGRAM = 27,     /* anole_wt_datagram_event; handle: anole_wt */
-  ANOLE_EV_WS_UPGRADE = 40,      /* anole_request_event; handle: anole_req. A WebSocket upgrade the
-                                    consumer accepts or refuses; only with "accept": "consumer" */
+  ANOLE_EV_WS_UPGRADE = 40,      /* anole_request_event; handle: anole_req. A WebSocket handshake on a
+                                    route with "accept": "consumer": answer it with anole_ws_accept,
+                                    or refuse it with any answer to a request (anole_req_respond,
+                                    anole_req_fail, anole_req_stream_*, anole_req_abort) */
   ANOLE_EV_DRAINING = 41         /* anole_event, handle 0: the drain started */
 };
 
@@ -465,7 +468,9 @@ enum anole_method {
    ANOLE_EV_WS_UPGRADE. Followed, at spans_off, by
    `anole_span headers[2 * nheaders]` (name, value: names lower-cased, order
    and duplicates kept) and then `anole_span params[2 * nparams]` (route
-   parameters: name, value); the bytes the spans point into come after. */
+   parameters: name, value; values raw and percent-encoded as in the path:
+   decode with decodeURIComponent / urllib.parse.unquote); the bytes the
+   spans point into come after. */
 typedef struct anole_request_event {
   anole_event ev;          /*   0 */
   uint32_t route_id;       /*  16 the route's "handler" id */
@@ -542,6 +547,18 @@ typedef struct anole_ws_close_event {
   uint16_t reserved;
   anole_span reason;
 } anole_ws_close_event;
+
+/* Options for anole_ws_accept; NULL takes the defaults (no subprotocol, no
+   extra headers). */
+typedef struct anole_ws_accept_options {
+  size_t size;                  /* sizeof(anole_ws_accept_options) */
+  uint32_t flags;               /* ANOLE_WS_F_*: none defined yet, 0 */
+  uint32_t reserved;            /* 0 */
+  anole_str subprotocol;        /* one the client offered (see the request's sec-websocket-protocol
+                                   headers); {NULL, 0}: none */
+  const anole_header *headers;  /* extra headers on the handshake's answer (Set-Cookie, ...), copied */
+  size_t nheaders;
+} anole_ws_accept_options;
 
 /* ---- gRPC events ---------------------------------------------------------- */
 
@@ -815,6 +832,21 @@ ANOLE_API anole_status anole_ws_send(anole_ws w, uint32_t type, const void *data
    3000-4999; a reason of up to 123 bytes, copied);
    ANOLE_EV_WS_CLOSE follows once the socket is done. A cleanup call. */
 ANOLE_API anole_status anole_ws_close(anole_ws w, uint16_t code, anole_str reason);
+/* Accepts the WebSocket handshake r (an ANOLE_EV_WS_UPGRADE): Anole answers
+   it (101 over HTTP/1.1, 200 over HTTP/2 and HTTP/3; permessage-deflate as
+   the route says) and *out is the socket's handle, usable at once: sends,
+   closes and topic changes wait until the answer is out. The request handle
+   is stale from here. ANOLE_EV_WS_MESSAGE and ANOLE_EV_WS_CLOSE follow on
+   this consumer; ANOLE_EV_WS_OPEN does not. If the answer cannot be sent
+   (the client left), ANOLE_EV_WS_CLOSE with 1006 follows alone.
+   ANOLE_E_STATE: r is a request that is not a WebSocket handshake.
+   ANOLE_E_INVALID: a subprotocol the client did not offer, a header Anole
+   writes for the handshake (Upgrade, Connection, Sec-WebSocket-*,
+   Content-Length, Transfer-Encoding) or an invalid one, unknown flags or
+   reserved != 0, a NULL out, or an options->size larger than this header's.
+   Nothing is taken on a negative answer: r is still owed an answer
+   (ANOLE_E_GONE excepted: it is over). */
+ANOLE_API anole_status anole_ws_accept(anole_req r, const anole_ws_accept_options *options, anole_ws *out);
 /* Joins or leaves a topic (copied, 1-255 bytes). A socket leaves every
    topic when it closes. A publish called after this returns sees the
    change (it reaches a socket that joined, and not one that left).
@@ -823,7 +855,10 @@ ANOLE_API anole_status anole_ws_subscribe(anole_ws w, anole_str topic);
 ANOLE_API anole_status anole_ws_unsubscribe(anole_ws w, anole_str topic);
 /* Sends one message to every socket subscribed to `topic` but `except` (0:
    none), fanned out on Anole's threads; returns at once (topic and data
-   copied). At most limits.ws_max_message bytes (else ANOLE_E_INVALID).
+   copied). Publishes to one topic reach every subscriber in the order they
+   were taken (from one thread: call order); publishes to different topics,
+   and a publish against an anole_ws_send to the same socket, are not
+   ordered against each other. At most limits.ws_max_message bytes (else ANOLE_E_INVALID).
    No subscriber holds a publish up: each has up to limits.ws_high_water
    bytes queued for it, past which publishes skip it (and one stuck that way
    for a second is closed). ANOLE_E_AGAIN: not sent, because too many

@@ -677,6 +677,25 @@ export fn anole_ws_close(w: u64, code: u16, reason: Str) i32 {
     return abi.OK;
 }
 
+export fn anole_ws_accept(r: u64, options: ?*const abi.WsAcceptOptions, out: ?*u64) i32 {
+    if (comptime !have_ws) return failCode(abi.E_UNSUPPORTED);
+    if (badKind(r, .request)) return wrongKind();
+    const o = out orelse return failCode(abi.E_INVALID);
+    const opts: abi.WsAcceptOptions = if (options) |p| readSized(abi.WsAcceptOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.WsAcceptOptions) };
+    if (opts.flags != 0) return unknownFlag();
+    if (opts.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_ws_accept_options.reserved must be 0", .{});
+    const hs = headersOf(opts.headers, opts.nheaders) orelse return failCode(abi.E_INVALID);
+    const sub = bytes(opts.subprotocol.ptr, opts.subprotocol.len) orelse return failCode(abi.E_INVALID);
+    const e = live() orelse return failCode(abi.E_GONE);
+    o.* = 0;
+    o.* = engine.wsAccept(e, r, sub, hs) catch |err| return switch (err) {
+        error.State => named(abi.E_STATE, "State", 0, "not a WebSocket handshake (anole_ws_accept answers ANOLE_EV_WS_UPGRADE only)", .{}),
+        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "a subprotocol the client did not offer, or a header the handshake writes itself (Upgrade, Connection, Sec-WebSocket-*, Content-Length, Transfer-Encoding), or an invalid one", .{}),
+        else => answer(err),
+    };
+    return abi.OK;
+}
+
 export fn anole_ws_subscribe(w: u64, topic: Str) i32 {
     if (comptime !have_ws) return failCode(abi.E_UNSUPPORTED);
     if (badKind(w, .websocket)) return wrongKind();
