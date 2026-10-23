@@ -46,6 +46,8 @@ export default defineConfig({
 						'observability',
 						'logging',
 						'testing',
+						'openapi',
+						'templates',
 						'from-fiber',
 						'migrating',
 						'c-abi',
