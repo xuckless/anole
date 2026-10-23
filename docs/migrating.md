@@ -6,6 +6,9 @@
 | --- | --- |
 | An exhaustive `switch` on `anole.db.Class` | add the cases `.not_found`, `.precondition` and `.invalid` |
 | An exhaustive `switch` on `anole.db.System` or `anole.resilience.Kind` | add the cases `.s3` and `.smtp` |
+| `channel.conn` (read) | `channel.conn.?` (the field is optional; `h3` is the other connection) |
+| A gRPC client call whose stream the server reset was UNAVAILABLE | the status follows the reset code (INTERNAL for most; only a refused stream is UNAVAILABLE, so `Channel.retry` no longer repeats the others) |
+| `Response.abort()` in a gRPC handler answered UNKNOWN | the stream is reset; the client reads CANCELLED |
 
 ## 0.2 to 0.3
 
