@@ -106,5 +106,6 @@ test {
     _ = client;
     _ = @import("wire.zig");
     if (features.http2) _ = @import("server_test.zig");
+    if (features.http2 and features.grpc) _ = @import("unix_test.zig");
     if (features.http3 and features.http2 and features.tls == .boringssl) _ = @import("h3_test.zig");
 }

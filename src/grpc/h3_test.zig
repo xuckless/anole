@@ -7,8 +7,8 @@ const pb = @import("anole_test_pb");
 const h2c = @import("anole_h2_client");
 const grpc = @import("root.zig");
 const frame = @import("frame.zig");
-const tls = @import("../tls/root.zig");
-const h3 = @import("../h3/root.zig");
+const tls = if (features.tls == .boringssl) @import("../tls/root.zig") else struct {};
+const h3 = if (features.http3) @import("../h3/root.zig") else struct {};
 const server_mod = @import("../server.zig");
 
 const Server = server_mod.Server;
@@ -27,7 +27,7 @@ const Probe = struct {
     }
 };
 
-fn unary(call: *grpc.Call, req: pb.EchoRequest) anyerror!pb.EchoResponse {
+pub fn unary(call: *grpc.Call, req: pb.EchoRequest) anyerror!pb.EchoResponse {
     if (std.mem.eql(u8, req.message, "fail")) return call.fail(.not_found, "no such thing: fail é");
     if (std.mem.eql(u8, req.message, "hang")) {
         Probe.started.set(call.io);
@@ -42,11 +42,11 @@ fn unary(call: *grpc.Call, req: pb.EchoRequest) anyerror!pb.EchoResponse {
     return .{ .message = req.message, .index = 0 };
 }
 
-fn serverStream(call: *grpc.Call, req: pb.EchoRequest, out: *std.Io.Queue(pb.EchoResponse)) anyerror!void {
+pub fn serverStream(call: *grpc.Call, req: pb.EchoRequest, out: *std.Io.Queue(pb.EchoResponse)) anyerror!void {
     for (0..@intCast(req.repeat)) |i| try out.putOne(call.io, .{ .message = req.message, .index = @intCast(i) });
 }
 
-fn clientStream(call: *grpc.Call, in: *std.Io.Queue(pb.EchoRequest)) anyerror!pb.EchoResponse {
+pub fn clientStream(call: *grpc.Call, in: *std.Io.Queue(pb.EchoRequest)) anyerror!pb.EchoResponse {
     var joined: std.ArrayList(u8) = .empty;
     var n: i32 = 0;
     while (true) {
@@ -62,7 +62,7 @@ fn clientStream(call: *grpc.Call, in: *std.Io.Queue(pb.EchoRequest)) anyerror!pb
     return .{ .message = joined.items, .index = n };
 }
 
-fn bidi(call: *grpc.Call, in: *std.Io.Queue(pb.EchoRequest), out: *std.Io.Queue(pb.EchoResponse)) anyerror!void {
+pub fn bidi(call: *grpc.Call, in: *std.Io.Queue(pb.EchoRequest), out: *std.Io.Queue(pb.EchoResponse)) anyerror!void {
     var i: i32 = 0;
     while (true) {
         const req = in.getOne(call.io) catch |err| switch (err) {
