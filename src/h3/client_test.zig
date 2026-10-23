@@ -186,6 +186,25 @@ fn bigHead(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = "big head";
 }
 
+/// GET /wait: tells the test it started, then waits for a cancel.
+var wait_started: std.Io.Event = .unset;
+var wait_canceled: std.Io.Event = .unset;
+fn waitHandler(req: *dusty.Request, res: *dusty.Response) !void {
+    wait_started.set(req.io);
+    req.io.sleep(.fromSeconds(30), .awake) catch |err| {
+        wait_canceled.set(req.io);
+        return err;
+    };
+    res.body = "late";
+}
+
+/// POST /gated: reads nothing until the test opens the gate, then echoes.
+var gate: std.Io.Event = .unset;
+fn gated(req: *dusty.Request, res: *dusty.Response) !void {
+    try gate.wait(req.io);
+    return echo(req, res);
+}
+
 fn get(conn: *client.ClientConnection, path: []const u8, gpa: std.mem.Allocator) ![]u8 {
     const s = try conn.request(&.{
         .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = path },
@@ -249,6 +268,8 @@ const Fixture = struct {
         http.router.get("/huge-head", hugeHead);
         http.router.get("/fields", fields);
         http.router.get("/hold", holdHandler);
+        http.router.get("/wait", waitHandler);
+        http.router.post("/gated", gated);
         http.router.get("/big-head", bigHead);
         http.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
         http.router.addRouteWith(.post, "/nw/sum", sum, .{ .no_wait = true });
@@ -1640,4 +1661,107 @@ test "h3 client: unprocessed is true after H3_REQUEST_REJECTED and for a request
     // A request that already has its answer ran.
     s.status = 200;
     try std.testing.expect(!s.unprocessed());
+}
+
+test "h3 client: resetCode reports the server's RESET_STREAM code" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/abort" },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{});
+    defer s.release();
+    s.waitHead() catch {};
+    _ = s.reader().allocRemaining(gpa, .unlimited) catch |err| switch (err) {
+        error.ReadFailed, error.OutOfMemory, error.StreamTooLong => {},
+    };
+    try std.testing.expectEqual(@as(?u64, @import("nghttp3.zig").c.NGHTTP3_H3_REQUEST_CANCELLED), s.resetCode());
+}
+
+test "h3 client: send_buffer = 1 MiB queues a 1 MiB body before the server reads it" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    gate = .unset;
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "POST" },   .{ .name = ":path", .value = "/gated" },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{ .body = true, .send_buffer = 1 << 20 });
+    defer s.release();
+    const body = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 7);
+    try s.writer().writeAll(body);
+    try s.writer().flush();
+    gate.set(io);
+    try s.closeSend();
+    try s.waitHead();
+    const echoed = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(echoed);
+    try std.testing.expectEqualSlices(u8, body, echoed);
+}
+
+fn keepAliveOn(conn: *client.ClientConnection) bool {
+    return conn.keepAliveArmed();
+}
+
+test "h3 client: keep-alive is armed while a request is open and disarmed after" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    wait_started = .unset;
+    wait_canceled = .unset;
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    try std.testing.expect(!keepAliveOn(conn));
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/wait" },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{});
+    try wait_started.wait(io);
+    try std.testing.expect(keepAliveOn(conn));
+    // The server arms its side the same way.
+    try std.testing.expect(f.ep.stats.keep_alive_arms.load(.monotonic) >= 1);
+    s.release();
+    // The stream is freed once QUIC has closed it; then it disarms.
+    var tries: usize = 0;
+    while (keepAliveOn(conn)) : (tries += 1) {
+        if (tries > 1000) return error.StillArmed;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+}
+
+test "h3 server: a peer RESET_STREAM cancels a REST handler's wait" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    wait_started = .unset;
+    wait_canceled = .unset;
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/wait" },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{});
+    defer s.release();
+    try wait_started.wait(io);
+    s.cancel();
+    try wait_canceled.wait(io);
 }

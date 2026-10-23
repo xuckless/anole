@@ -680,6 +680,13 @@ pub const ClientConnection = struct {
         self.gen.notify(self.io);
     }
 
+    /// Whether QUIC keep-alive is armed: a request is live. For tests.
+    pub fn keepAliveArmed(self: *ClientConnection) bool {
+        self.lock();
+        defer self.unlock();
+        return self.keep_alive_on;
+    }
+
     /// Arms ngtcp2's keep-alive (a PING after half the smaller idle
     /// timeout of silence, at least 1 s) while a request stream is live, so
     /// a quiet call outlives the idle timeout; disarms it when the last
