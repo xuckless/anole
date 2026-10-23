@@ -1366,3 +1366,348 @@ test "capi: every ServerError and TlsLoadError name is an ABI error token" {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// WebSocket handshakes decided by the consumer (ANOLE_EV_WS_UPGRADE)
+
+/// A consumer for "accept": "consumer" routes. `/decide?accept`: accepts
+/// with the subprotocol "b" and a cookie and sends a message at once;
+/// `?refuse`: 401 with a body; `?silent`: holds the request until its 504.
+/// `/app` takes plain requests (route 11) and handshakes (route 12).
+const WsDecider = struct {
+    e: *engine.Engine,
+    c: *engine.Consumer,
+    stop: std.atomic.Value(bool) = .init(false),
+    failures: std.atomic.Value(u32) = .init(0),
+    opens: std.atomic.Value(u32) = .init(0),
+    upgrades: std.atomic.Value(u32) = .init(0),
+    plains: std.atomic.Value(u32) = .init(0),
+    closes: std.atomic.Value(u32) = .init(0),
+    close_code: std.atomic.Value(u32) = .init(0),
+    held: std.atomic.Value(u64) = .init(0),
+    aborts: std.atomic.Value(u32) = .init(0),
+
+    fn run(self: *WsDecider) void {
+        var buf: [64 * 1024]u8 align(8) = undefined;
+        var need: u32 = 0;
+        while (!self.stop.load(.acquire)) {
+            const n = engine.pollWait(self.c, &buf, 50, &need) catch unreachable;
+            var off: usize = 0;
+            while (off < n) {
+                const ev: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
+                self.handle(buf[off..][0..ev.len]) catch |err| {
+                    std.debug.print("ws decider failed: {t}\n", .{err});
+                    _ = self.failures.fetchAdd(1, .monotonic);
+                };
+                off += ev.len;
+            }
+        }
+    }
+
+    fn str(rec: []const u8, s: abi.Span) []const u8 {
+        return rec[s.off..][0..s.len];
+    }
+
+    fn handle(self: *WsDecider, rec: []const u8) !void {
+        const ev: *const abi.Event = @ptrCast(@alignCast(rec.ptr));
+        const e = self.e;
+        const h = ev.handle;
+        switch (@as(abi.EventType, @fromBackingInt(@intCast(ev.type)))) {
+            .ws_upgrade => {
+                _ = self.upgrades.fetchAdd(1, .monotonic);
+                const r: *const abi.RequestEvent = @ptrCast(@alignCast(rec.ptr));
+                const query = str(rec, r.query);
+                if (std.mem.eql(u8, query, "accept") or r.route_id == 12) {
+                    const ws = try engine.wsAccept(e, h, "b", &.{.{ .name = .of("Set-Cookie"), .value = .of("s=1") }});
+                    // Queued before the handshake's answer is out: it must
+                    // arrive first, and the request handle is stale.
+                    _ = try engine.ws.send(e, ws, abi.WS_TEXT, "first", false);
+                    if (engine.respond(e, h, 200, &.{}, "", false)) |_| return error.NotStale else |err| if (err != error.Gone) return err;
+                    // A request that is not a handshake is refused with a State error.
+                } else if (std.mem.eql(u8, query, "refuse")) {
+                    try engine.respond(e, h, 401, &.{.{ .name = .of("content-type"), .value = .of("text/plain") }}, "no thanks", false);
+                } else if (std.mem.eql(u8, query, "bad-subprotocol")) {
+                    try std.testing.expectError(error.Invalid, engine.wsAccept(e, h, "zzz", &.{}));
+                    try std.testing.expectError(error.Invalid, engine.wsAccept(e, h, "", &.{.{ .name = .of("Sec-WebSocket-Accept"), .value = .of("x") }}));
+                    // Nothing was taken: the request is still owed an answer.
+                    try engine.respond(e, h, 400, &.{}, "bad", false);
+                } else if (std.mem.eql(u8, query, "silent")) {
+                    self.held.store(h, .release);
+                }
+            },
+            .request => {
+                const r: *const abi.RequestEvent = @ptrCast(@alignCast(rec.ptr));
+                _ = self.plains.fetchAdd(1, .monotonic);
+                if (r.route_id == 11) {
+                    try engine.respond(e, h, 200, &.{}, "plain", false);
+                } else {
+                    // anole_ws_accept on a request that is no handshake.
+                    try std.testing.expectError(error.State, engine.wsAccept(e, h, "", &.{}));
+                    try engine.respond(e, h, 200, &.{}, "not a handshake", false);
+                }
+            },
+            .ws_open => _ = self.opens.fetchAdd(1, .monotonic),
+            .ws_message => {
+                const m: *const abi.WsMessageEvent = @ptrCast(@alignCast(rec.ptr));
+                _ = try engine.ws.send(e, h, m.type, str(rec, m.data), false);
+            },
+            .ws_close => {
+                const c: *const abi.WsCloseEvent = @ptrCast(@alignCast(rec.ptr));
+                self.close_code.store(c.code, .release);
+                _ = self.closes.fetchAdd(1, .monotonic);
+            },
+            .abort => _ = self.aborts.fetchAdd(1, .monotonic),
+            else => {},
+        }
+    }
+};
+
+/// A raw HTTP/1.1 WebSocket client: the handshake's head, then short
+/// unmasked server frames and masked (zero key) client frames.
+const RawWs = struct {
+    stream: std.Io.net.Stream,
+    reader: std.Io.net.Stream.Reader,
+    writer: std.Io.net.Stream.Writer,
+    rbuf: [2048]u8 = undefined,
+    wbuf: [1024]u8 = undefined,
+    head: [1024]u8 = undefined,
+    head_len: usize = 0,
+
+    fn open(self: *RawWs, io: std.Io, port: u16, path: []const u8, extra: []const u8) !void {
+        self.stream = try (try std.Io.net.IpAddress.parse("127.0.0.1", port)).connect(io, .{ .mode = .stream });
+        self.reader = self.stream.reader(io, &self.rbuf);
+        self.writer = self.stream.writer(io, &self.wbuf);
+        try self.writer.interface.print("GET {s} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{s}\r\n", .{ path, extra });
+        try self.writer.interface.flush();
+        self.head_len = 0;
+        while (std.mem.indexOf(u8, self.head[0..self.head_len], "\r\n\r\n") == null) {
+            const line = try self.reader.interface.takeDelimiterInclusive('\n');
+            @memcpy(self.head[self.head_len..][0..line.len], line);
+            self.head_len += line.len;
+        }
+    }
+
+    fn headText(self: *const RawWs) []const u8 {
+        return self.head[0..self.head_len];
+    }
+
+    fn frame(self: *RawWs, out: []u8) !struct { opcode: u8, payload: []u8 } {
+        const h = try self.reader.interface.takeArray(2);
+        const len = h[1] & 0x7f;
+        try self.reader.interface.readSliceAll(out[0..len]);
+        return .{ .opcode = h[0] & 0x0f, .payload = out[0..len] };
+    }
+
+    fn send(self: *RawWs, opcode: u8, payload: []const u8) !void {
+        try self.writer.interface.writeAll(&.{ 0x80 | opcode, 0x80 | @as(u8, @intCast(payload.len)), 0, 0, 0, 0 });
+        try self.writer.interface.writeAll(payload);
+        try self.writer.interface.flush();
+    }
+
+    fn close(self: *RawWs, io: std.Io) void {
+        self.stream.close(io);
+    }
+};
+
+fn wsDecideCheck(a: *WsDecider, port: u16, io: std.Io) !void {
+    var step: []const u8 = "accept";
+    errdefer std.debug.print("ws decide check failed at {s}\n", .{step});
+    var buf: [256]u8 = undefined;
+    // An accept: the subprotocol and the cookie ride on the 101, the
+    // message sent right after the accept comes first, no WS_OPEN.
+    {
+        var c: RawWs = undefined;
+        try c.open(io, port, "/decide?accept", "Sec-WebSocket-Protocol: a, b\r\n");
+        defer c.close(io);
+        try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 101"));
+        try std.testing.expect(std.ascii.findIgnoreCase(c.headText(), "Sec-WebSocket-Protocol: b\r\n") != null);
+        try std.testing.expect(std.ascii.findIgnoreCase(c.headText(), "Set-Cookie: s=1\r\n") != null);
+        const first = try c.frame(&buf);
+        try std.testing.expectEqualStrings("first", first.payload);
+        try c.send(0x1, "echo me");
+        try std.testing.expectEqualStrings("echo me", (try c.frame(&buf)).payload);
+        try c.send(0x8, &.{ 0x03, 0xe8 });
+        _ = try c.frame(&buf);
+    }
+    try waitAtLeast(io, &a.closes, 1);
+    try std.testing.expectEqual(@as(u32, 1000), a.close_code.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), a.opens.load(.acquire));
+
+    step = "refuse";
+    {
+        var c: RawWs = undefined;
+        try c.open(io, port, "/decide?refuse", "");
+        defer c.close(io);
+        try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 401"));
+    }
+
+    step = "bad accept arguments";
+    {
+        var c: RawWs = undefined;
+        try c.open(io, port, "/decide?bad-subprotocol", "Sec-WebSocket-Protocol: a\r\n");
+        defer c.close(io);
+        try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 400"));
+    }
+
+    step = "deadline";
+    {
+        a.held.store(0, .release);
+        var c: RawWs = undefined;
+        try c.open(io, port, "/decide?silent", "");
+        defer c.close(io);
+        try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 504"));
+        const h = a.held.load(.acquire);
+        try std.testing.expect(h != 0);
+        // The decision came late: the handle is stale.
+        try std.testing.expectError(error.Gone, engine.wsAccept(a.e, h, "", &.{}));
+    }
+
+    step = "one route, plain requests and handshakes";
+    {
+        const p0 = a.plains.load(.acquire);
+        var plain: RawWs = undefined;
+        // A GET without Upgrade headers: the plain handler (route 11).
+        plain.stream = try (try std.Io.net.IpAddress.parse("127.0.0.1", port)).connect(io, .{ .mode = .stream });
+        defer plain.stream.close(io);
+        plain.reader = plain.stream.reader(io, &plain.rbuf);
+        plain.writer = plain.stream.writer(io, &plain.wbuf);
+        try plain.writer.interface.writeAll("GET /app HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        try plain.writer.interface.flush();
+        var out: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        _ = plain.reader.interface.streamRemaining(&w) catch {};
+        try std.testing.expect(std.mem.startsWith(u8, w.buffered(), "HTTP/1.1 200"));
+        try std.testing.expect(std.mem.endsWith(u8, w.buffered(), "plain"));
+        try std.testing.expectEqual(p0 + 1, a.plains.load(.acquire));
+
+        var c: RawWs = undefined;
+        try c.open(io, port, "/app", "");
+        defer c.close(io);
+        try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 101"));
+        const first = try c.frame(&buf);
+        try std.testing.expectEqualStrings("first", first.payload);
+    }
+}
+
+test "capi engine: WebSocket handshakes decided by the consumer: accept with a subprotocol and headers, refuse, bad arguments, deadline 504, one route for plain requests and handshakes" {
+    if (comptime !features.websocket) return error.SkipZigTest;
+    const json =
+        \\{"executors": 2, "timeouts": {"request_ms": 3000, "shutdown_ms": 1000},
+        \\ "listeners": [{"address": "127.0.0.1", "port": 0}],
+        \\ "routes": [
+        \\   {"path": "/decide", "timeout_ms": 300, "websocket": {"handler": 10, "accept": "consumer", "origins": ["*"]}},
+        \\   {"path": "/app", "handler": 11, "websocket": {"handler": 12, "accept": "consumer", "origins": ["*"]}}
+        \\ ]}
+    ;
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    defer e.destroy();
+    const c = try e.attach(null, null, true);
+    try e.start();
+    var a: WsDecider = .{ .e = e, .c = c };
+    const t = try std.Thread.spawn(.{}, WsDecider.run, .{&a});
+    defer {
+        a.stop.store(true, .release);
+        t.join();
+    }
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(wsDecideCheck, .{ &a, e.port(0), io });
+    try f.await(io);
+    try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
+    try std.testing.expect(a.upgrades.load(.acquire) >= 5);
+    try e.drain();
+    try std.testing.expect(e.wait(5000));
+}
+
+test "capi engine: two publishes to one topic from one thread never swap, on 4 executors, 2000 rounds" {
+    if (comptime !features.websocket) return error.SkipZigTest;
+    const json =
+        \\{"executors": 4, "timeouts": {"shutdown_ms": 500},
+        \\ "listeners": [{"address": "127.0.0.1", "port": 0}],
+        \\ "routes": [{"path": "/ws", "websocket": {"handler": 20}}]}
+    ;
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    defer e.destroy();
+    const c = try e.attach(null, null, true);
+    try e.start();
+    const Sub = struct {
+        e: *engine.Engine,
+        c: *engine.Consumer,
+        stop: std.atomic.Value(bool) = .init(false),
+        failures: std.atomic.Value(u32) = .init(0),
+        fn run(self: *@This()) void {
+            var buf: [64 * 1024]u8 align(8) = undefined;
+            var need: u32 = 0;
+            while (!self.stop.load(.acquire)) {
+                const n = engine.pollWait(self.c, &buf, 50, &need) catch unreachable;
+                var off: usize = 0;
+                while (off < n) {
+                    const ev: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
+                    if (ev.type == @backingInt(abi.EventType.ws_open)) {
+                        engine.ws.subscribe(self.e, ev.handle, "seq", true) catch {
+                            _ = self.failures.fetchAdd(1, .monotonic);
+                        };
+                    }
+                    off += ev.len;
+                }
+            }
+        }
+    };
+    var sub: Sub = .{ .e = e, .c = c };
+    const t = try std.Thread.spawn(.{}, Sub.run, .{&sub});
+    defer {
+        sub.stop.store(true, .release);
+        t.join();
+    }
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    const Body = struct {
+        fn run(e_: *engine.Engine, port: u16, io_: std.Io) !void {
+            var client: RawWs = undefined;
+            try client.open(io_, port, "/ws", "");
+            defer client.close(io_);
+            // Let the subscription land.
+            try io_.sleep(.fromMilliseconds(200), .awake);
+            var i: u32 = 0;
+            while (i < 2000) : (i += 1) {
+                var b0: [16]u8 = undefined;
+                const text = try std.fmt.bufPrint(&b0, "{d}", .{i});
+                while (true) {
+                    engine.ws.publish(e_, "seq", abi.WS_TEXT, text, 0) catch |err| switch (err) {
+                        error.Again => {
+                            try io_.sleep(.fromMilliseconds(1), .awake);
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    break;
+                }
+            }
+            var buf: [64]u8 = undefined;
+            var want: u32 = 0;
+            while (want < 2000) : (want += 1) {
+                const f = try client.frame(&buf);
+                var exp: [16]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&exp, "{d}", .{want}), f.payload);
+            }
+        }
+    };
+    var f = try io.concurrent(Body.run, .{ e, e.port(0), io });
+    try f.await(io);
+    try std.testing.expectEqual(@as(u32, 0), sub.failures.load(.acquire));
+    try e.drain();
+    try std.testing.expect(e.wait(5000));
+}
