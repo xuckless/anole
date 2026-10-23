@@ -1307,6 +1307,8 @@ and leaves the group; `ANOLE_EV_KAFKA_GROUP_END` says it is over
 (`ANOLE_BROKER_END_CLOSED`, `_DRAINED` when `anole_server_drain` ended it,
 `_FAILED`). At the stop, groups end without events.
 
+`anole_kafka_find` looks a broker up by name and `anole_kafka_index` gives
+its place in `"brokers"` (what `anole_broker_status_event.broker` names).
 The consumer reads none, gzip, zstd, lz4 and snappy batches. Transactions,
 the KIP-848 protocol and the admin API are not part of the ABI.
 
