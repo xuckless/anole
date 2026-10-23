@@ -592,10 +592,10 @@ const Driver = struct {
     signal: placement.Signal = .{},
     stopped: std.atomic.Value(bool) = .init(false),
 
-    /// Puts `t` on the stack and wakes the driver. `t` counts as a helper
-    /// until the driver is done with it.
+    /// Puts `t` on the stack and wakes the driver. The caller counted `t`
+    /// as a helper (under `t.lock`, see `schedule`); it stays one until the
+    /// driver is done with it.
     fn kick(d: *Driver, t: *TcpConn) void {
-        _ = t.helpers.fetchAdd(1, .acq_rel);
         var head = d.stack.load(.acquire);
         while (true) {
             t.next = head;
@@ -785,13 +785,24 @@ const TcpConn = struct {
     fn release(a: *dusty.Adopter) void {
         const t: *TcpConn = @alignCast(@fieldParentPtr("adopter", a));
         const io = t.io;
-        // No more output; unblock anything writing or waiting.
-        t.closed.store(true, .release);
+        // No more output; unblock anything writing or waiting. Set under
+        // `lock`, where a schedule counts its driver kick as a helper: a
+        // kick is either counted before the wait below or never made (a
+        // C ABI reset racing the connection's end used to reach the driver
+        // after the wait, which then serviced a freed connection).
+        {
+            t.spinLock();
+            defer t.lock.unlock();
+            t.closed.store(true, .release);
+        }
         t.shutdownSocket(.both);
         t.over.store(1, .release);
         io.futexWake(u32, &t.over.raw, std.math.maxInt(u32));
         io.futexWake(u32, &t.paused.raw, std.math.maxInt(u32));
         io.futexWake(u32, &t.queued.raw, std.math.maxInt(u32));
+        // No drain hook spawns a helper after this (it runs under the
+        // drain's lock, which `remove` takes), so the wait sees it.
+        t.info.drain_hooks.remove(io, &t.drain_hook);
         // The driver and the helper tasks are done with it.
         t.release_waiting.store(true, .release);
         while (true) {
@@ -799,7 +810,6 @@ const TcpConn = struct {
             if (n == 0) break;
             io.futexWaitUncancelable(u32, &t.helpers.raw, n);
         }
-        t.info.drain_hooks.remove(io, &t.drain_hook);
         t.dropOutput();
         const reason = t.finalReason();
         const stats = &t.listener.stats;
@@ -986,6 +996,7 @@ const TcpConn = struct {
             if (!t.scheduled) {
                 t.scheduled = true;
                 kick_it = true;
+                _ = t.helpers.fetchAdd(1, .acq_rel);
             }
         }
         if (fresh) |f| t.gpa.free(f);
@@ -993,15 +1004,19 @@ const TcpConn = struct {
         return if (busy) .busy else .ok;
     }
 
-    /// Makes sure someone looks at the outbox (and the end flags).
+    /// Makes sure someone looks at the outbox (and the end flags). Once the
+    /// connection is released (`closed`), nobody needs to: `release` drops
+    /// the outbox itself.
     fn schedule(t: *TcpConn) void {
         var kick_it = false;
         {
             t.spinLock();
             defer t.lock.unlock();
+            if (t.closed.load(.monotonic)) return;
             if (!t.scheduled) {
                 t.scheduled = true;
                 kick_it = true;
+                _ = t.helpers.fetchAdd(1, .acq_rel);
             }
         }
         if (kick_it) t.driver.kick(t);

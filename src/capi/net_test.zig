@@ -261,6 +261,27 @@ test "capi net: close RESET resets the client" {
     engine.net.closeConn(rig.e, open.handle, abi.NET_CLOSE_GRACEFUL) catch |err| try std.testing.expectEqual(error.Over, err);
 }
 
+test "capi net: RESET racing the connection's end, many times" {
+    // The reset shuts the socket, the connection's task ends and releases
+    // it, all while the consumer's call still holds the slot: the reset's
+    // own wake-up of the writer must not reach a released connection (it
+    // used to: the driver then spun on freed memory, at teardown).
+    if (comptime !features.net) return error.SkipZigTest;
+    const rig = try Rig.create(tcp_plain);
+    defer rig.destroy();
+    for (0..200) |_| {
+        const s = try rig.client();
+        defer s.close();
+        try s.writer().writeAll("x");
+        try s.writer().flush();
+        const open = try rig.take(.net_open);
+        defer free(open);
+        try engine.net.closeConn(rig.e, open.handle, abi.NET_CLOSE_RESET);
+        const close = try rig.take(.net_close);
+        defer free(close);
+    }
+}
+
 test "capi net: pause holds input until resume" {
     if (comptime !features.net) return error.SkipZigTest;
     const rig = try Rig.create(tcp_plain);
