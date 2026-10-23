@@ -395,13 +395,16 @@ fn Suite(comptime B: Backend) type {
         }
 
         test "cron: missed skip enqueues none; missed all enqueues each tick inside catch_up" {
-            var a: Fx = undefined;
-            try cronFx(&a, .skip);
-            defer a.deinit();
-            _ = try a.client.step(&a.ctx);
-            a.clock.advance(.fromSeconds(7620));
-            try std.testing.expectEqual(@as(u32, 0), (try a.client.step(&a.ctx)).cron_enqueued);
-
+            // One fixture at a time: the live stores' fixtures each own a zio
+            // runtime, and a thread can only use the one it made last.
+            {
+                var a: Fx = undefined;
+                try cronFx(&a, .skip);
+                defer a.deinit();
+                _ = try a.client.step(&a.ctx);
+                a.clock.advance(.fromSeconds(7620));
+                try std.testing.expectEqual(@as(u32, 0), (try a.client.step(&a.ctx)).cron_enqueued);
+            }
             var b: Fx = undefined;
             try cronFx(&b, .all);
             defer b.deinit();
@@ -432,26 +435,36 @@ fn Suite(comptime B: Backend) type {
 
         var tx_fx: *Fx = undefined;
         fn completingHandler(_: ?*anyopaque, job: *root.Job) anyerror!void {
-            var tx = try tx_fx.sq.begin(&tx_fx.ctx, .{});
+            if (B != .sqlite and B != .postgres) unreachable;
+            var tx = try txDb(tx_fx).begin(&tx_fx.ctx, .{});
             defer tx.deinit();
             try tx_fx.client.completeIn(&tx, job);
             try tx.commit(&tx_fx.ctx);
         }
 
+        /// The store's own database, for the transactional calls (SQLite, PostgreSQL).
+        fn txDb(fx: *Fx) if (B == .sqlite) *anole.sqlite.Client else if (B == .postgres) *anole.pg.Client else void {
+            return switch (B) {
+                .sqlite => fx.sq,
+                .postgres => fx.pgc,
+                else => {},
+            };
+        }
+
         test "jobs: enqueueIn rolls back with the transaction and commits with it" {
-            if (B != .sqlite) return error.SkipZigTest;
+            if (B != .sqlite and B != .postgres) return error.SkipZigTest;
             var fx: Fx = undefined;
             try setup(&fx);
             defer fx.deinit();
             {
-                var tx = try fx.sq.begin(&fx.ctx, .{});
+                var tx = try txDb(&fx).begin(&fx.ctx, .{});
                 defer tx.deinit();
                 _ = try fx.client.enqueueIn(&tx, &fx.ctx, Typed{ .n = 1 }, .{});
                 try tx.rollback(&fx.ctx);
             }
             try std.testing.expectEqual(@as(u32, 0), (try fx.client.step(&fx.ctx)).ran);
             {
-                var tx = try fx.sq.begin(&fx.ctx, .{});
+                var tx = try txDb(&fx).begin(&fx.ctx, .{});
                 defer tx.deinit();
                 _ = try fx.client.enqueueIn(&tx, &fx.ctx, Typed{ .n = 2 }, .{});
                 try tx.commit(&fx.ctx);
@@ -460,7 +473,7 @@ fn Suite(comptime B: Backend) type {
         }
 
         test "jobs: completeIn completes inside the handler's transaction" {
-            if (B != .sqlite) return error.SkipZigTest;
+            if (B != .sqlite and B != .postgres) return error.SkipZigTest;
             var fx: Fx = undefined;
             Probe.reset();
             try fx.init(&.{.{ .name = "default" }});
@@ -552,6 +565,40 @@ fn Suite(comptime B: Backend) type {
             client.drain(std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromSeconds(5), .clock = .awake }));
             const info = (try client.get(&ctx, e.id)).?;
             try std.testing.expectEqual(root.State.completed, info.state);
+        }
+
+        var wake_hits: std.atomic.Value(u32) = .init(0);
+        fn wakeRun(_: ?*anyopaque, _: *root.Job) anyerror!void {
+            _ = wake_hits.fetchAdd(1, .acq_rel);
+        }
+
+        test "jobs: live wake-up: a job another client enqueues runs long before the poll interval" {
+            // PostgreSQL LISTEN/NOTIFY and Redis SUBSCRIBE/PUBLISH carry the wake-up.
+            if (B != .postgres and B != .redis) return error.SkipZigTest;
+            var fx: Fx = undefined;
+            try fx.init(&.{.{ .name = "default" }});
+            defer fx.deinit();
+            const io = fx.ctx.io;
+            const st: root.Store = switch (B) {
+                .postgres => .{ .postgres = fx.pgc },
+                .redis => .{ .redis = fx.rdc },
+                else => unreachable,
+            };
+            wake_hits.store(0, .release);
+            const worker = try root.Client.init(std.testing.allocator, io, .{ .store = st, .table_prefix = "jtest_", .key_prefix = "jtest:", .poll_interval = .fromSeconds(60), .name = "worker" });
+            defer worker.deinit();
+            try worker.addHandler(plain, null, wakeRun);
+            try worker.start(null, null, null);
+            defer worker.drain(std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromSeconds(5), .clock = .awake }));
+            const producer = try root.Client.init(std.testing.allocator, io, .{ .store = st, .table_prefix = "jtest_", .key_prefix = "jtest:", .run = .enqueue_only, .name = "producer" });
+            defer producer.deinit();
+            try producer.start(null, null, null);
+            // The worker's first claim found nothing; its fetcher now waits for a wake or the 60 s poll.
+            try io.sleep(.fromMilliseconds(1500), .awake);
+            _ = try producer.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":1}", .{});
+            var waited: u32 = 0;
+            while (wake_hits.load(.acquire) == 0 and waited < 100) : (waited += 1) try io.sleep(.fromMilliseconds(50), .awake);
+            try std.testing.expectEqual(@as(u32, 1), wake_hits.load(.acquire));
         }
 
         test "jobs: adminRoutes registers on a group" {
