@@ -1137,3 +1137,59 @@ test "unsubscribe() from another task while next() waits: null at once" {
     try s.client.flush(quick);
     try s.finish();
 }
+
+// ---------------------------------------------------------------------------
+// The publish that never waits (`publishNow`): what Anole's layer uses.
+
+test "publishNow sends what publishMessage sends and says .ok while the queue has room" {
+    var r: Recorded = undefined;
+    try r.start(golden.info_default, .{ .servers = &.{} });
+    defer r.deinit();
+    try testing.expectEqual(.ok, try r.client.publishNow(.{ .subject = "foo", .reply_to = "reply.to", .payload = "x" }));
+    try testing.expectEqual(.ok, try r.client.publishNow(.{ .subject = "h", .headers = &.{.{ .name = "K", .value = "v" }}, .payload = "p" }));
+    // The arguments are checked first, as by publishMessage.
+    try testing.expectError(error.InvalidSubject, r.client.publishNow(.{ .subject = "foo bar" }));
+    try testing.expect(r.client.writable());
+    try r.finish();
+    try testing.expectEqualStrings("PUB foo reply.to 1\r\nx\r\n" ++
+        "HPUB h 18 19\r\nNATS/1.0\r\nK: v\r\n\r\np\r\n" ++
+        "PING\r\n", r.transcript.items);
+}
+
+test "publishNow on a closed client is ConnectionClosed" {
+    var r: Recorded = undefined;
+    try r.start(golden.info_default, .{ .servers = &.{} });
+    defer r.deinit();
+    try r.finish();
+    try testing.expectError(error.ConnectionClosed, r.client.publishNow(.{ .subject = "foo", .payload = "x" }));
+}
+
+test "publishNow past the outbound limit is Full at once: nothing queued, nobody waits, the client goes on" {
+    const io = testing.io;
+    var s: Stalled = undefined;
+    try s.start();
+    defer s.deinit();
+    // The server reads nothing: the sockets fill, then the queue. No
+    // timing is relied on; the loop ends at the first Full (bounded).
+    var attempts: u32 = 0;
+    const full = while (attempts < 100_000) : (attempts += 1) {
+        _ = s.client.publishNow(.{ .subject = "stalled", .payload = s.payload }) catch |err| break err;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    } else return error.TestNeverFull;
+    try testing.expectEqual(error.Full, full);
+    try testing.expect(!s.client.writable());
+    const out = s.client.stats().messages_out;
+    try testing.expectError(error.Full, s.client.publishNow(.{ .subject = "stalled", .payload = "late" }));
+    try testing.expectEqual(out, s.client.stats().messages_out);
+    try testing.expectEqual(@as(u32, 0), s.client.outbound.roomWaiters(io));
+    try testing.expect(s.client.isConnected());
+
+    // The server reads again: room comes back, and the next publish is taken.
+    s.release.set(io);
+    var tries: u32 = 0;
+    while (!s.client.writable()) : (tries += 1) {
+        if (tries > 5000) return error.TestNeverWritable;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    _ = try s.client.publishNow(.{ .subject = "stalled", .payload = "again" });
+}
