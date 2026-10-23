@@ -21,7 +21,8 @@
 //!
 //!   GET /          -> "hello"
 //!   GET /users/:id -> "user <id>"
-//!   POST /echo     -> the request body, streamed back (a gzip body is decoded)
+//!   POST /echo     -> the request body, streamed back (a gzip body is decoded;
+//!                     bodies past limits.body_max, 1 MiB by default, get 413)
 //!   GET /big       -> 200 lines of text, gzipped for a client that accepts it
 //!
 //! Every response carries `X-Thread: <os thread id>` so a test can see which

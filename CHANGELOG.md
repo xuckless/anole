@@ -3,7 +3,7 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
-## Unreleased
+## 0.2.0 (2026-10-23)
 
 The API review before the Node and Python bindings: every breaking change
 of 0.2 is listed below, and [docs/migrating.md](docs/migrating.md)
