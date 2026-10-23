@@ -25,3 +25,11 @@
 /run: 116 steps scored (intact VMAF 99.88)
 /run: 47 steps scored (intact VMAF 99.88)
 20:50:40 chart: /home/xuckl/Dev/anole/bench/results/20261022-videocall-relay/videocall/index.html
+20:56:15 anole ws-h2: ramp
+21:01:51 anole ws-h2: stopped: collapsed (under 10% of video frames shown for 30s) at 670 users after 5m35s [running exit=0 oom=false]
+21:03:01 anole ws-h3: ramp
+21:09:22 anole ws-h3: stopped: collapsed (under 10% of video frames shown for 30s) at 550 users after 4m33s [running exit=0 oom=false]
+21:09:22 quality pass
+/run: 66 steps scored (intact VMAF 99.88)
+/run: 54 steps scored (intact VMAF 99.88)
+21:10:06 chart: /home/xuckl/Dev/anole/bench/results/20261022-videocall-relay/videocall/index.html

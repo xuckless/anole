@@ -72,8 +72,13 @@ func newDialer(base, transport string) *dialer {
 func (d *dialer) dial(token string, h handlers) (conn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if d.transport == "wt" {
+	switch d.transport {
+	case "wt":
 		return dialWT(ctx, d.wt, d.base, token, h)
+	case "ws-h2":
+		return dialWSH2(ctx, d.base, token, h)
+	case "ws-h3":
+		return dialWSH3(ctx, d.base, token, h)
 	}
 	return dialWS(ctx, d.base, token, h)
 }

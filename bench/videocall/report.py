@@ -28,7 +28,7 @@ def main():
         d = os.path.join(out, name)
         if not os.path.isdir(d) or "-" not in name:
             continue
-        app, transport = name.rsplit("-", 1)
+        app, transport = name.split("-", 1)
         steps = load(os.path.join(d, "steps.jsonl"))
         q = {r["users"]: r for r in load(os.path.join(d, "quality.jsonl"))}
         rows = []
@@ -164,7 +164,9 @@ const METRICS = [
 ];
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const color = a => css("--" + a);
-let transport = Object.keys(DATA)[0] || "ws";
+const ORDER = ["ws", "ws-h2", "ws-h3", "wt"];
+const TRANSPORTS = Object.keys(DATA).sort((a, b) => ORDER.indexOf(a) - ORDER.indexOf(b));
+let transport = TRANSPORTS[0] || "ws";
 let users = 10;
 const charts = [];
 
@@ -177,9 +179,9 @@ function val(m, r) { if (!r || r[m.key] == null) return null; return r[m.key] * 
 function buildControls() {
   const seg = document.getElementById("transport");
   seg.innerHTML = "";
-  for (const t of Object.keys(DATA)) {
+  for (const t of TRANSPORTS) {
     const b = document.createElement("button");
-    b.textContent = t === "ws" ? "WebSocket" : "WebTransport";
+    b.textContent = { ws: "WebSocket", "ws-h2": "WebSocket over HTTP/2", "ws-h3": "WebSocket over HTTP/3", wt: "WebTransport" }[t] || t;
     b.setAttribute("aria-pressed", t === transport);
     b.onclick = () => { transport = t; build(); };
     seg.appendChild(b);

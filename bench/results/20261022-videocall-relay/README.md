@@ -60,3 +60,27 @@ time, with video p95 ≤ 200 ms. "Collapse" is the first count with under
 - **Axum:** WebSocket p99 sits at ~20 ms even at 100 users. That's likely
   Nagle (no TCP_NODELAY in axum-server's default setup), and it's not
   verified.
+
+## Anole: WebSocket over HTTP/1.1, HTTP/2 and HTTP/3
+
+These are the same app and the same ramp. HTTP/2 is RFC 8441 and HTTP/3 is
+RFC 9220, extended CONNECT in both. Each simulated user has its own
+connection. The page's tabs are `ws-h2` and `ws-h3`.
+
+| | good quality | collapse | memory per user | core saturated at |
+|---|---|---|---|---|
+| WebSocket over HTTP/1.1 | **~760** | ~780 | 0.23 MB | ~750 users |
+| WebSocket over HTTP/2 | ~540 | ~580 | 1.4 MB | ~540 |
+| WebSocket over HTTP/3 | ~370 | ~490 | 0.44 MB | ~400 |
+| WebTransport (HTTP/3) | ~360 | ~410 | 0.63 MB | ~400 |
+
+- **CPU per user grows with each layer**, roughly 1 : 1.4 : 2 for HTTP/1.1,
+  HTTP/2 and QUIC. WebSocket over HTTP/3 costs about what WebTransport does,
+  so the cost is in Anole's QUIC path, not in the protocol on top.
+- **HTTP/2's limit is the large messages.** At 600 users, 98% of frames
+  arrived within 200 ms, but only 17% could be shown: the ~100 KB keyframes
+  were the late ones, held by the per-stream flow-control window, and
+  without its keyframe a GOP can't be decoded. Memory per user is 6×
+  HTTP/1.1's.
+- **HTTP/3 degrades over ~120 users,** where HTTP/1.1 drops off a cliff
+  within ~30.

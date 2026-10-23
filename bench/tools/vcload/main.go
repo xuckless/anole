@@ -27,7 +27,7 @@ import (
 func main() {
 	smokeMode := flag.Bool("smoke", false, "check the protocol end to end and exit")
 	url := flag.String("url", "https://127.0.0.1:8443", "server base URL")
-	transport := flag.String("transport", "ws", "ws or wt")
+	transport := flag.String("transport", "ws", "ws (WebSocket over HTTP/1.1), ws-h2 (RFC 8441), ws-h3 (RFC 9220) or wt")
 	mediaDir := flag.String("media", "/data/media/vc", "directory with video.h264 and audio.opus")
 	cgroup := flag.String("cgroup", "", "the server's cgroup directory (memory, CPU, OOM and crash detection)")
 	out := flag.String("out", "", "output directory (ramp)")
@@ -42,8 +42,10 @@ func main() {
 	deflate := flag.Bool("deflate", true, "smoke: expect the server to deflate media (false for MEDIA_DEFLATE=off)")
 	flag.Parse()
 
-	if *transport != "ws" && *transport != "wt" {
-		fmt.Fprintln(os.Stderr, "-transport must be ws or wt")
+	switch *transport {
+	case "ws", "ws-h2", "ws-h3", "wt":
+	default:
+		fmt.Fprintln(os.Stderr, "-transport must be ws, ws-h2, ws-h3 or wt")
 		os.Exit(2)
 	}
 	if *smokeMode {
