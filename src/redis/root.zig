@@ -89,6 +89,8 @@ const resilience = @import("../resilience/root.zig");
 const client_stream = @import("../net/client_stream.zig");
 const ClientStream = client_stream.ClientStream;
 
+const builtin = @import("builtin");
+
 const has_tls = features.tls == .boringssl;
 const log = @import("../errors.zig").log;
 const Duration = std.Io.Duration;
@@ -312,6 +314,10 @@ pub const Message = struct {
     pattern: ?[]const u8 = null,
 };
 
+/// Tests only: runs on every connection `takeFrom` hands out, with its
+/// stream (to break it before the call writes).
+pub var test_after_take: if (builtin.is_test) ?*const fn (*ClientStream) void else void = if (builtin.is_test) null else {};
+
 /// The pool of one executor: idle connections, and how many are open.
 const Pool = struct {
     mutex: std.Io.Mutex = .init,
@@ -337,10 +343,12 @@ const Connection = struct {
     /// Out of step with the server (a failure or a cancel mid-reply):
     /// closed when given back.
     broken: bool = false,
-    /// Taken idle from the pool (not dialed for this call).
+    /// Taken idle from the pool (not dialed for this call): the server may
+    /// have closed it while it waited.
     reused: bool = false,
-    /// The last `transfer` failed while writing: nothing of it was read.
-    write_failed: bool = false,
+    /// `stream.bytesSent()` when it was taken: unchanged after a failure,
+    /// nothing of the call reached the server.
+    sent: u64 = 0,
 
     /// What the commands sent so far have left on the connection.
     const State = struct {
@@ -350,6 +358,14 @@ const Connection = struct {
         tainted: bool = false,
     };
 
+    /// Whether a call on it that failed can run once more on another
+    /// connection, transparently: it came idle from the pool and not one
+    /// byte of the call left on it. Once anything was sent the server may
+    /// have run it, and a second run could repeat an INCR.
+    fn untouched(self: *const Connection) bool {
+        return self.reused and self.stream.bytesSent() == self.sent;
+    }
+
     fn reusable(self: *const Connection) bool {
         return !self.broken and !self.state.multi and !self.state.watching and !self.state.tainted;
     }
@@ -358,11 +374,7 @@ const Connection = struct {
     /// the connection broken.
     fn transfer(self: *Connection, arena: std.mem.Allocator, batch: *const Batch) ![]Reply {
         errdefer self.broken = true;
-        self.write_failed = false;
-        self.send(batch.bytes) catch |err| {
-            self.write_failed = true;
-            return err;
-        };
+        try self.send(batch.bytes);
         const replies = try arena.alloc(Reply, batch.count);
         for (replies) |*r| r.* = try self.receive(arena);
         self.state = batch.effect.apply(self.state);
@@ -821,11 +833,12 @@ pub const Client = struct {
         var stale_retries: u8 = 0;
         const replies = while (true) {
             break conn.transfer(ctx.arena, batch) catch |err| {
-                // A write that failed on a connection taken idle from the
-                // pool (the server or a proxy closed it meanwhile) reached
-                // no one: once more on another connection, not a failure
-                // of the call (and not counted by the retry policy).
-                if (held == null and conn.reused and conn.write_failed and err != error.Canceled and stale_retries < 4) {
+                // A call that broke before one byte of it left a connection
+                // taken idle from the pool (the server or a proxy closed it
+                // meanwhile) reached no one: once more on another
+                // connection, not a failure of the call (and not counted by
+                // the retry policy).
+                if (held == null and conn.untouched() and err != error.Canceled and stale_retries < 4) {
                     stale_retries += 1;
                     self.give(conn);
                     conn = try self.take(ctx);
@@ -899,7 +912,7 @@ pub const Client = struct {
                 self.observer.connections(-1, 1);
                 self.observer.acquired(started.durationTo(.now(io, .awake)).raw);
                 conn.reused = true;
-                return conn;
+                return handOut(conn);
             }
             if (pool.open < pool.max) {
                 pool.open += 1;
@@ -913,7 +926,7 @@ pub const Client = struct {
                 };
                 self.observer.connections(0, 1);
                 self.observer.acquired(started.durationTo(.now(io, .awake)).raw);
-                return conn;
+                return handOut(conn);
             }
             self.observer.waiting(1);
             pool.returned.waitTimeout(io, &pool.mutex, until) catch |err| {
@@ -926,6 +939,14 @@ pub const Client = struct {
             };
             self.observer.waiting(-1);
         }
+    }
+
+    /// `conn` as `takeFrom` hands it out: what it has sent so far noted
+    /// (see `Connection.untouched`).
+    fn handOut(conn: *Connection) *Connection {
+        conn.sent = conn.stream.bytesSent();
+        if (builtin.is_test) if (test_after_take) |f| f(conn.stream);
+        return conn;
     }
 
     fn expired(self: *const Client, conn: *const Connection, io: std.Io) bool {
