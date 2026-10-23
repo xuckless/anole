@@ -1,0 +1,48 @@
+22:01:35 epoll c4096 a r1: 143,410 req/s, p50 28.10 ms, p99 32.72 ms, timeouts 0, Recv-Q peak 210, mem 105 MB
+22:03:15 epoll c4096 b r1: 147,143 req/s, p50 27.04 ms, p99 32.43 ms, timeouts 0, Recv-Q peak 0, mem 111 MB
+22:04:56 epoll c10000 a r1: 117,740 req/s, p50 84.65 ms, p99 89.61 ms, timeouts 0, Recv-Q peak 1743, mem 248 MB
+22:06:37 epoll c10000 b r1: 117,318 req/s, p50 85.08 ms, p99 90.13 ms, timeouts 0, Recv-Q peak 0, mem 256 MB
+22:08:18 epoll c25000 a r1: 132,476 req/s, p50 184.63 ms, p99 6060.00 ms, timeouts 654, Recv-Q peak 6418, mem 590 MB
+22:09:58 epoll c25000 b r1: 120,405 req/s, p50 204.09 ms, p99 230.89 ms, timeouts 0, Recv-Q peak 808, mem 652 MB
+22:11:39 epoll park a r1: 120,710 req/s, p50 163.52 ms, p99 4220.00 ms, timeouts 0, Recv-Q peak 5056, mem 497 MB; wake 2000/2000 p50 1584.7 ms p99 2820.7 ms max 2820.9 ms timeouts 0
+22:13:21 epoll park b r1: 134,773 req/s, p50 146.56 ms, p99 174.02 ms, timeouts 0, Recv-Q peak 4957, mem 540 MB; wake 2000/2000 p50 249.1 ms p99 257.5 ms max 257.6 ms timeouts 0
+22:15:01 epoll c256 a r1: 219,605 req/s, p50 1.15 ms, p99 1.28 ms, timeouts 0, Recv-Q peak 0, mem 8 MB
+22:16:42 epoll c256 b r1: 229,199 req/s, p50 1.12 ms, p99 1.24 ms, timeouts 0, Recv-Q peak 0, mem 9 MB
+22:18:27 epoll h2c a r1: 657,708 req/s, mean 3.90 ms, max 6.4 ms, timeouts 0, Recv-Q peak 0, mem 33 MB
+22:20:13 epoll h2c b r1: 654,183 req/s, mean 3.90 ms, max 5.3 ms, timeouts 0, Recv-Q peak 0, mem 33 MB
+22:21:53 epoll c4096 b r2: 139,272 req/s, p50 29.59 ms, p99 32.31 ms, timeouts 0, Recv-Q peak 0, mem 111 MB
+22:23:34 epoll c4096 a r2: 140,712 req/s, p50 29.46 ms, p99 32.31 ms, timeouts 0, Recv-Q peak 74, mem 104 MB
+22:25:15 epoll c10000 b r2: 113,846 req/s, p50 88.58 ms, p99 93.57 ms, timeouts 0, Recv-Q peak 0, mem 251 MB
+22:26:55 epoll c10000 a r2: 121,557 req/s, p50 82.01 ms, p99 86.89 ms, timeouts 0, Recv-Q peak 1948, mem 243 MB
+22:28:36 epoll c25000 b r2: 135,504 req/s, p50 181.94 ms, p99 200.60 ms, timeouts 0, Recv-Q peak 4198, mem 637 MB
+22:30:17 epoll c25000 a r2: 123,761 req/s, p50 201.86 ms, p99 5880.00 ms, timeouts 189, Recv-Q peak 5885, mem 601 MB
+22:31:58 epoll park b r2: 134,313 req/s, p50 147.25 ms, p99 165.80 ms, timeouts 0, Recv-Q peak 1777, mem 547 MB; wake 2000/2000 p50 242.7 ms p99 248.7 ms max 248.8 ms timeouts 0
+22:33:39 epoll park a r2: 132,593 req/s, p50 148.03 ms, p99 3730.00 ms, timeouts 0, Recv-Q peak 5147, mem 496 MB; wake 2000/2000 p50 1423.5 ms p99 2554.2 ms max 2554.4 ms timeouts 0
+22:35:20 epoll c256 b r2: 222,861 req/s, p50 1.16 ms, p99 1.28 ms, timeouts 0, Recv-Q peak 0, mem 9 MB
+22:37:00 epoll c256 a r2: 225,528 req/s, p50 1.15 ms, p99 1.27 ms, timeouts 0, Recv-Q peak 0, mem 8 MB
+22:38:46 epoll h2c b r2: 650,191 req/s, mean 3.94 ms, max 6.9 ms, timeouts 0, Recv-Q peak 0, mem 33 MB
+22:40:31 epoll h2c a r2: 655,297 req/s, mean 3.91 ms, max 5.7 ms, timeouts 0, Recv-Q peak 2, mem 33 MB
+22:42:12 uring c4096 a r1: 160,107 req/s, p50 25.39 ms, p99 27.69 ms, timeouts 0, Recv-Q peak 644, mem 97 MB
+22:43:53 uring c4096 b r1: 161,351 req/s, p50 25.11 ms, p99 27.41 ms, timeouts 0, Recv-Q peak 1368, mem 105 MB
+22:45:33 uring c10000 a r1: 121,848 req/s, p50 81.44 ms, p99 478.80 ms, timeouts 0, Recv-Q peak 2634, mem 230 MB
+22:47:14 uring c10000 b r1: 122,212 req/s, p50 81.88 ms, p99 84.34 ms, timeouts 0, Recv-Q peak 394, mem 253 MB
+22:48:55 uring c25000 a r1: 139,251 req/s, p50 174.71 ms, p99 6310.00 ms, timeouts 2481, Recv-Q peak 9235, mem 550 MB
+22:50:36 uring c25000 b r1: 143,135 req/s, p50 172.01 ms, p99 197.14 ms, timeouts 0, Recv-Q peak 6283, mem 590 MB
+22:52:17 uring park a r1: 139,267 req/s, p50 140.51 ms, p99 4720.00 ms, timeouts 0, Recv-Q peak 6788, mem 468 MB; wake 2000/2000 p50 1327.5 ms p99 2391.5 ms max 2459.7 ms timeouts 0
+22:53:58 uring park b r1: 144,765 req/s, p50 136.20 ms, p99 155.28 ms, timeouts 0, Recv-Q peak 7006, mem 530 MB; wake 2000/2000 p50 227.8 ms p99 233.5 ms max 233.6 ms timeouts 0
+22:55:39 uring c256 a r1: 241,024 req/s, p50 1.05 ms, p99 1.19 ms, timeouts 0, Recv-Q peak 0, mem 9 MB
+22:57:19 uring c256 b r1: 244,072 req/s, p50 1.04 ms, p99 1.17 ms, timeouts 0, Recv-Q peak 0, mem 9 MB
+22:59:05 uring h2c a r1: 678,258 req/s, mean 3.76 ms, max 6.7 ms, timeouts 0, Recv-Q peak 0, mem 33 MB
+23:00:50 uring h2c b r1: 670,173 req/s, mean 3.82 ms, max 7.1 ms, timeouts 0, Recv-Q peak 1, mem 33 MB
+23:02:31 uring c4096 b r2: 162,483 req/s, p50 25.00 ms, p99 27.32 ms, timeouts 0, Recv-Q peak 27, mem 108 MB
+23:04:11 uring c4096 a r2: 159,578 req/s, p50 25.48 ms, p99 27.64 ms, timeouts 0, Recv-Q peak 397, mem 98 MB
+23:05:52 uring c10000 b r2: 121,182 req/s, p50 82.42 ms, p99 86.22 ms, timeouts 0, Recv-Q peak 647, mem 265 MB
+23:07:33 uring c10000 a r2: 122,906 req/s, p50 81.05 ms, p99 541.35 ms, timeouts 0, Recv-Q peak 2625, mem 228 MB
+23:09:14 uring c25000 b r2: 144,008 req/s, p50 170.87 ms, p99 194.34 ms, timeouts 0, Recv-Q peak 5389, mem 593 MB
+23:10:54 uring c25000 a r2: 137,483 req/s, p50 176.78 ms, p99 6220.00 ms, timeouts 2041, Recv-Q peak 8309, mem 568 MB
+23:12:36 uring park b r2: 144,320 req/s, p50 136.32 ms, p99 160.53 ms, timeouts 0, Recv-Q peak 6207, mem 523 MB; wake 2000/2000 p50 215.3 ms p99 221.5 ms max 221.5 ms timeouts 0
+23:14:17 uring park a r2: 139,421 req/s, p50 140.84 ms, p99 4620.00 ms, timeouts 0, Recv-Q peak 6819, mem 463 MB; wake 2000/2000 p50 1283.6 ms p99 2378.2 ms max 2450.7 ms timeouts 0
+23:15:57 uring c256 b r2: 240,728 req/s, p50 1.06 ms, p99 1.19 ms, timeouts 0, Recv-Q peak 0, mem 9 MB
+23:17:38 uring c256 a r2: 243,918 req/s, p50 1.05 ms, p99 1.18 ms, timeouts 0, Recv-Q peak 0, mem 9 MB
+23:19:23 uring h2c b r2: 669,659 req/s, mean 3.81 ms, max 5.7 ms, timeouts 0, Recv-Q peak 0, mem 33 MB
+23:21:09 uring h2c a r2: 677,289 req/s, mean 3.78 ms, max 6.6 ms, timeouts 0, Recv-Q peak 0, mem 33 MB

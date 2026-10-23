@@ -1,0 +1,23 @@
+warning(anole): built with ReleaseFast: Zig's safety checks are off, so a bug that ReleaseSafe would stop at the faulty line can corrupt memory instead; ReleaseSafe is the recommended build for production
+info(anole): listening on http://0.0.0.0:8080 (HTTP/1.1, HTTP/2 cleartext)
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
+info(anole_h2): HTTP/2 connection error: error.Unexpected
