@@ -374,3 +374,30 @@ test "cron: two clients sharing nothing still record one job per tick through th
     const r2 = try be.vt.cronTick(be.ptr, t, "tick", "*/10 * * * *", t, null);
     try std.testing.expect(r1.recorded and !r2.recorded);
 }
+
+var bg_event: std.Io.Event = .unset;
+fn bgRun(_: ?*anyopaque, job: *root.Job) anyerror!void {
+    _ = job;
+    bg_event.set(std.testing.io);
+}
+
+test "jobs: the background runner claims and runs an enqueued job, and drains" {
+    const io = std.testing.io;
+    bg_event = .unset;
+    const lvl = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = lvl;
+    const client = try root.Client.init(std.testing.allocator, io, .{ .store = .memory });
+    defer client.deinit();
+    try client.addHandler(plain, null, bgRun);
+    try client.start(null, null, null);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx: Ctx = .{ .io = io, .arena = arena.allocator() };
+    const e = try client.enqueueRaw(&ctx, "t.plain", "{\"a\":1}", .{});
+    try bg_event.wait(io);
+    // The state write follows the handler's return; drain waits for the task.
+    client.drain(std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromSeconds(5), .clock = .awake }));
+    const info = (try client.get(&ctx, e.id)).?;
+    try std.testing.expectEqual(root.State.completed, info.state);
+}
