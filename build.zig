@@ -2,7 +2,7 @@
 //!
 //! Features are chosen with `-Dprofile=minimal|web|full` (default `full`) and
 //! overridden one by one with `-Dtls=boringssl|none`, `-Dhttp2`, `-Dhttp3`,
-//! `-Dgrpc`, `-Dwebsocket`, `-Dauth`, `-Dpostgres`, `-Dsqlite`, `-Dmongodb` and
+//! `-Dgrpc`, `-Dwebsocket`, `-Dauth`, `-Dpostgres`, `-Dsqlite`, `-Dmongodb`, `-Dopenapi` and
 //! the rest below. The result is exposed to Zig code as the `build_options`
 //! module (re-exported as `anole.features`).
 //!
@@ -34,6 +34,7 @@ const nghttp3_build = @import("build/nghttp3.zig");
 const zlib_ng_build = @import("build/zlib_ng.zig");
 const zstd_build = @import("build/zstd.zig");
 const brotli_build = @import("build/brotli.zig");
+const lz4_build = @import("build/lz4.zig");
 const yyjson_build = @import("build/yyjson.zig");
 const upb_build = @import("build/upb.zig");
 const hiredis_build = @import("build/hiredis.zig");
@@ -81,13 +82,24 @@ pub const Features = struct {
     /// The MongoDB client (`anole.mongodb`) and its BSON codec
     /// (`anole.bson`).
     mongodb: bool,
+    /// The NATS client (`anole.nats`).
+    nats: bool,
+    /// The Kafka client (`anole.kafka`); needs `compression`.
+    kafka: bool,
+    /// OpenAPI 3.1 documents (`anole.openapi`, `app.openapi`). Pure Zig:
+    /// no C library. libanole is always built without it.
+    openapi: bool,
+    /// The live console (`anole console`, `c` + Enter in development): the
+    /// control socket, log and error rings and the terminal UI. Pure Zig:
+    /// no C library.
+    console: bool,
 
     pub fn preset(profile: Profile) Features {
         return switch (profile) {
             // HTTP/1.1 only.
-            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .brotli = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false },
-            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false },
-            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true },
+            .minimal => .{ .tls = .none, .http2 = false, .http3 = false, .grpc = false, .websocket = false, .auth = false, .compression = false, .brotli = false, .json = false, .redis = false, .postgres = false, .sqlite = false, .mongodb = false, .nats = false, .kafka = false, .openapi = false, .console = false },
+            .web => .{ .tls = .boringssl, .http2 = true, .http3 = false, .grpc = false, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = false, .postgres = true, .sqlite = true, .mongodb = false, .nats = false, .kafka = false, .openapi = true, .console = true },
+            .full => .{ .tls = .boringssl, .http2 = true, .http3 = true, .grpc = true, .websocket = true, .auth = true, .compression = true, .brotli = true, .json = true, .redis = true, .postgres = true, .sqlite = true, .mongodb = true, .nats = true, .kafka = true, .openapi = true, .console = true },
         };
     }
 
@@ -96,6 +108,7 @@ pub const Features = struct {
         if (f.grpc and !f.http2) return "-Dgrpc=true requires -Dhttp2=true (gRPC runs over HTTP/2 with trailers)";
         if (f.http3 and f.tls == .none) return "-Dhttp3=true requires -Dtls=boringssl (QUIC always uses TLS 1.3)";
         if (f.brotli and !f.compression) return "-Dbrotli=true requires -Dcompression=true (Brotli is one of the Compress middleware's codings)";
+        if (f.kafka and !f.compression) return "-Dkafka=true requires -Dcompression=true (Kafka batches use gzip and zstd)";
         return null;
     }
 
@@ -110,7 +123,8 @@ pub const Features = struct {
         return (!f.needsTls() or have.needsTls()) and (!f.http2 or have.http2) and (!f.http3 or have.http3) and
             (!f.compression or have.compression) and (!f.brotli or have.brotli) and (!f.websocket or have.websocket) and (!f.grpc or have.grpc) and
             (!f.json or have.json) and (!f.redis or have.redis) and (!f.auth or have.auth) and
-            (!f.postgres or have.postgres) and (!f.sqlite or have.sqlite) and (!f.mongodb or have.mongodb);
+            (!f.postgres or have.postgres) and (!f.sqlite or have.sqlite) and (!f.mongodb or have.mongodb) and
+            (!f.nats or have.nats) and (!f.kafka or have.kafka);
     }
 };
 
@@ -129,6 +143,14 @@ const flag_combos = [_]struct { name: []const u8, features: Features }{
         var f = Features.preset(.full);
         f.compression = false;
         f.brotli = false;
+        f.kafka = false;
+        break :blk f;
+    } },
+    // Everything but the brokers.
+    .{ .name = "brokers-none", .features = blk: {
+        var f = Features.preset(.full);
+        f.nats = false;
+        f.kafka = false;
         break :blk f;
     } },
     // zstd and gzip without Brotli.
@@ -140,6 +162,12 @@ const flag_combos = [_]struct { name: []const u8, features: Features }{
     .{ .name = "http2-no-grpc", .features = blk: {
         var f = Features.preset(.full);
         f.grpc = false;
+        break :blk f;
+    } },
+    // No OpenAPI: `anole.openapi` is the declaration stubs only.
+    .{ .name = "full-no-openapi", .features = blk: {
+        var f = Features.preset(.full);
+        f.openapi = false;
         break :blk f;
     } },
     // Everything but the database connectors.
@@ -329,6 +357,20 @@ pub const AppOptions = struct {
     imports: []const std.Build.Module.Import = &.{},
     /// Add `zig build run` (arguments after `--` go to the program).
     run_step: bool = true,
+    /// `zig build openapi` (writes the file) and `zig build openapi-check`
+    /// (fails when it differs from the app's routes); null: neither step.
+    /// Both run the app's executable with `ANOLE_OPENAPI_OUT` /
+    /// `ANOLE_OPENAPI_CHECK` set: `run()` writes or compares the document
+    /// right after the routes exist and returns before anything binds, so a
+    /// project needs no test file or code split. Code before `listen` still
+    /// runs: keep secrets in `.env` and connect lazily (the default).
+    openapi: ?OpenApiBuild = .{},
+};
+
+/// `AppOptions.openapi`.
+pub const OpenApiBuild = struct {
+    /// Relative to build.zig.
+    file: []const u8 = "openapi.json",
 };
 
 /// What `addApp` made.
@@ -386,6 +428,20 @@ pub fn addApp(b: *std.Build, options: AppOptions) App {
         run.addPassthruArgs();
         b.step("run", b.fmt("Run {s}", .{options.name})).dependOn(&run.step);
     }
+    if (options.openapi) |oa| {
+        // The run steps' working directory is the project, so the name is relative to it.
+        const file = oa.file;
+        const write = b.addRunArtifact(exe);
+        write.setCwd(b.path("."));
+        write.has_side_effects = true;
+        write.setEnvironmentVariable("ANOLE_OPENAPI_OUT", file);
+        b.step("openapi", b.fmt("Write {s} from the app's routes (runs the app up to listen; nothing binds)", .{oa.file})).dependOn(&write.step);
+        const check = b.addRunArtifact(exe);
+        check.setCwd(b.path("."));
+        check.has_side_effects = true;
+        check.setEnvironmentVariable("ANOLE_OPENAPI_CHECK", file);
+        b.step("openapi-check", b.fmt("Check that {s} matches the app's routes", .{oa.file})).dependOn(&check.step);
+    }
     return .{ .exe = exe, .anole = anole_dep };
 }
 
@@ -400,6 +456,8 @@ pub fn build(b: *std.Build) void {
     const redis_test_url = b.option([]const u8, "redis-test-url", "Run the Redis tests against a live Redis/Valkey at this URL (redis://, rediss://...)");
     const postgres_test_url = b.option([]const u8, "postgres-test-url", "Run the PostgreSQL tests against a live server at this URL (postgres://...)");
     const mongodb_test_url = b.option([]const u8, "mongodb-test-url", "Run the MongoDB tests against a live server at this URL (mongodb://...)");
+    const nats_test_url = b.option([]const u8, "nats-test-url", "Run the NATS tests against a live server at this URL (nats://...)");
+    const kafka_test_url = b.option([]const u8, "kafka-test-url", "Run the Kafka tests against a live broker at this address (host:port)");
     // `zig build test --fuzz` needs LLVM: Zig 0.17's self-hosted backend (the
     // Debug default on x86_64-linux) emits no coverage tables, so the fuzzer
     // would see none ("pcs_len was zero").
@@ -461,11 +519,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");
     // `zig build test -Dtest-filter="WebSocket over HTTP/2"` runs only the
     // main suite's tests whose names contain the text (repeatable).
-    const test_filters = b.option([]const []const u8, "test-filter", "Run only the main suite's tests whose names contain this text") orelse &.{};
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only the main suite's tests whose names contain this text (repeatable; zig build test -Dtest-filter=golden)") orelse &.{};
     const tests = b.addTest(.{
         .name = "anole-test",
         .filters = test_filters,
-        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url }),
+        .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url, .nats_test_url = nats_test_url, .kafka_test_url = kafka_test_url }),
         .use_llvm = use_llvm,
     });
     const run_tests = b.addRunArtifact(tests);
@@ -474,6 +532,77 @@ pub fn build(b: *std.Build) void {
     // compile-tests: build the test binaries without running them.
     const compile_tests_step = b.step("compile-tests", "Compile the test binaries without running them");
     compile_tests_step.dependOn(&tests.step);
+    // The validator's and the logger's own tests: each is its own module
+    // (no imports), so the anole test binary does not collect them.
+    for ([_]struct { name: []const u8, mod: *std.Build.Module }{
+        .{ .name = "validate-test", .mod = core.validate },
+        .{ .name = "log-test", .mod = core.anole_log },
+    }) |t| {
+        const sub_tests = b.addTest(.{ .name = t.name, .root_module = t.mod, .use_llvm = use_llvm });
+        const run_sub = b.addRunArtifact(sub_tests);
+        run_sub.skip_foreign_checks = true;
+        test_step.dependOn(&run_sub.step);
+        compile_tests_step.dependOn(&sub_tests.step);
+        b.step(t.name, "Run the tests of the module alone").dependOn(&run_sub.step);
+    }
+
+    // test-compile-errors: routes and calls the compiler must refuse, each a
+    // tiny file in tests/compile_errors with the message it must give.
+    {
+        const cases = [_]struct { file: []const u8, contains: []const u8 }{
+            .{ .file = "01_wildcard_not_last", .contains = "anole: route GET /a/*x/b: a wildcard (*x) must be the last segment" },
+            .{ .file = "02_duplicate_param", .contains = "names the parameter \"id\" twice" },
+            .{ .file = "03_query_in_path", .contains = "read the query with req.query, req.bindQuery or anole.In(.{ .query = T }))" },
+            .{ .file = "04_in_path_not_a_param", .contains = "is not a parameter of the route (parameters: id)" },
+            .{ .file = "05_in_optional_path_field", .contains = "a route parameter is always there" },
+            .{ .file = "06_in_body_on_get", .contains = "(use .query, or app.query for the QUERY method)" },
+            .{ .file = "07_in_unknown_key", .contains = "anole.In: unknown key .bdy; the keys are .path, .query, .headers and .body (did you mean .body?)" },
+            .{ .file = "08_cached_on_post", .contains = "it cannot wrap a POST route" },
+            .{ .file = "09_log_tuple_fields", .contains = "for a format string use std.log" },
+            .{ .file = "10_log_reserved_field", .contains = "rename it, e.g. 'user_level'" },
+            .{ .file = "11_invalid_code_grammar", .contains = "e.g. 'users.name_taken'" },
+            .{ .file = "12_rename_on_fallback_type", .contains = "structs, ?T and []const T" },
+        };
+        const ce_step = b.step("test-compile-errors", "Check that bad routes and calls are compile errors with the right message");
+        for (cases) |c| {
+            const obj = b.addObject(.{
+                .name = c.file,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(b.fmt("tests/compile_errors/{s}.zig", .{c.file})),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "anole", .module = anole_mod }},
+                }),
+            });
+            obj.expect_errors = .{ .contains = c.contains };
+            ce_step.dependOn(&obj.step);
+        }
+        // COFF can't put the anole module's C objects into one object file,
+        // so these run on Linux and macOS only (the checks are the same).
+        if (target.result.os.tag != .windows) test_step.dependOn(ce_step);
+    }
+
+    // The live console's std-only part (src/console/ui): protocol, client, TUI,
+    // restart logic. Imported as "anole_console_ui" into the anole module
+    // (and so libanole) and the CLI. Its own tests run here.
+    {
+        const ui_tests = b.addTest(.{
+            .name = "console-ui-test",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/console/ui/root.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{.{ .name = "fuzz", .module = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig"), .target = target, .optimize = optimize }) }},
+            }),
+            .use_llvm = use_llvm,
+        });
+        const run_ui_tests = b.addRunArtifact(ui_tests);
+        run_ui_tests.skip_foreign_checks = true;
+        test_step.dependOn(&run_ui_tests.step);
+        compile_tests_step.dependOn(&ui_tests.step);
+        b.step("console-ui-test", "Run the live console's std-only module tests (protocol, keys, screen, app, restart plan)").dependOn(&run_ui_tests.step);
+    }
 
     // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
     // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
@@ -713,6 +842,21 @@ pub fn build(b: *std.Build) void {
             const run_rest_test = b.addRunArtifact(rest_test);
             run_rest_test.skip_foreign_checks = true;
             test_step.dependOn(&run_rest_test.step);
+            compile_tests_step.dependOn(&rest_test.step);
+            // The same scenario through anole.testing, no socket.
+            const rest_memory_test = b.addTest(.{
+                .name = "rest-memory-test",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/rest_memory_test.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{ .{ .name = "anole", .module = anole_mod }, .{ .name = "rest", .module = ex_mod } },
+                }),
+            });
+            const run_rest_memory_test = b.addRunArtifact(rest_memory_test);
+            run_rest_memory_test.skip_foreign_checks = true;
+            test_step.dependOn(&run_rest_memory_test.step);
+            compile_tests_step.dependOn(&rest_memory_test.step);
         }
         if (std.mem.eql(u8, ex.name, "sqlite")) {
             const sqlite_test = b.addTest(.{
@@ -772,6 +916,10 @@ pub fn build(b: *std.Build) void {
     // capi: libanole, the C ABI (include/anole.h) as a static and a shared
     // library, every exported symbol `anole_*` (src/capi/lib.zig). M17 spike.
     {
+        // libanole never carries OpenAPI: the bindings use their ecosystems' generators.
+        var capi_features = features;
+        capi_features.openapi = false;
+        const capi_anole_mod = anoleModule(b, .{ .features = capi_features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize });
         const capi_mod = b.createModule(.{
             .root_source_file = b.path("src/capi/lib.zig"),
             .target = target,
@@ -779,7 +927,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             // Linked into shared objects (a Node addon, a Python extension).
             .pic = true,
-            .imports = &.{.{ .name = "anole", .module = anole_mod }},
+            .imports = &.{.{ .name = "anole", .module = capi_anole_mod }},
         });
         const capi_opts = b.addOptions();
         capi_opts.addOption([]const u8, "version", @import("build.zig.zon").version);
@@ -1196,6 +1344,68 @@ pub fn build(b: *std.Build) void {
         };
     }
 
+    // `anole`, the command line (tools/anole): `anole new <dir>` makes a
+    // project from the templates in templates/. Std-only, so it depends on no
+    // C library and no feature flag.
+    //   cli        build and install it (zig-out/bin/anole)
+    //   cli-test   its unit tests
+    //   cli-dist   the release binaries for five targets and SHA256SUMS in zig-out/dist
+    {
+        const cli_options = b.addOptions();
+        cli_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+        const templates_mod = b.createModule(.{ .root_source_file = b.path("templates/index.zig") });
+        const CliBuild = struct {
+            fn module(bb: *std.Build, opts: *std.Build.Step.Options, tmpl: *std.Build.Module, tgt: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode) *std.Build.Module {
+                return bb.createModule(.{
+                    .root_source_file = bb.path("tools/anole/main.zig"),
+                    .target = tgt,
+                    .optimize = opt,
+                    .imports = &.{
+                        .{ .name = "cli_options", .module = opts.createModule() },
+                        .{ .name = "templates", .module = tmpl },
+                        // The startup banner (src/banner.zig, std only).
+                        .{ .name = "banner", .module = bb.createModule(.{ .root_source_file = bb.path("src/banner.zig") }) },
+                        // The live console's client and terminal UI (src/console/ui, std only).
+                        .{ .name = "anole_console_ui", .module = bb.createModule(.{ .root_source_file = bb.path("src/console/ui/root.zig"), .target = tgt, .optimize = opt, .link_libc = true }) },
+                    },
+                });
+            }
+        };
+        const cli = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize) });
+        const install_cli = b.addInstallArtifact(cli, .{});
+        b.step("cli", "Build and install the anole command line (zig-out/bin/anole)").dependOn(&install_cli.step);
+
+        const cli_tests = b.addTest(.{ .name = "anole-cli-test", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize) });
+        b.step("cli-test", "Run the anole command line's unit tests").dependOn(&b.addRunArtifact(cli_tests).step);
+
+        const dist = b.step("cli-dist", "Cross-build the anole binaries for five targets and SHA256SUMS into zig-out/dist");
+        const sums_exe = b.addExecutable(.{ .name = "anole-sums", .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/anole/sums.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }) });
+        const sums = b.addRunArtifact(sums_exe);
+        const sums_out = sums.addOutputFileArg("SHA256SUMS");
+        const dist_targets = [_]struct { query: std.Target.Query, name: []const u8 }{
+            .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }, .name = "anole-x86_64-linux" },
+            .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl }, .name = "anole-aarch64-linux" },
+            .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .macos }, .name = "anole-x86_64-macos" },
+            .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .macos }, .name = "anole-aarch64-macos" },
+            .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .windows }, .name = "anole-x86_64-windows.exe" },
+        };
+        for (dist_targets) |dt| {
+            const exe = b.addExecutable(.{ .name = "anole", .root_module = CliBuild.module(b, cli_options, templates_mod, b.resolveTargetQuery(dt.query), .ReleaseSafe) });
+            const installed = b.addInstallFileWithDir(exe.getEmittedBin(), .{ .custom = "dist" }, dt.name);
+            dist.dependOn(&installed.step);
+            // The sums are over the built files, named as they are installed.
+            const named = b.addWriteFiles();
+            const copy = named.addCopyFile(exe.getEmittedBin(), dt.name);
+            sums.addFileArg(copy);
+        }
+        const install_sums = b.addInstallFileWithDir(sums_out, .{ .custom = "dist" }, "SHA256SUMS");
+        dist.dependOn(&install_sums.step);
+    }
+
     // tests/grpc/interop: grpc.testing.TestService for grpc-go's interop
     // client (tests/grpc/interop/run.sh).
     if (features.grpc) {
@@ -1270,6 +1480,10 @@ fn resolveFeatures(b: *std.Build) Features {
     const postgres = b.option(bool, "postgres", "PostgreSQL client (overrides the profile)");
     const sqlite = b.option(bool, "sqlite", "SQLite, built in (overrides the profile)");
     const mongodb = b.option(bool, "mongodb", "MongoDB client (overrides the profile)");
+    const nats = b.option(bool, "nats", "NATS client (overrides the profile)");
+    const kafka = b.option(bool, "kafka", "Kafka client; needs -Dcompression=true (overrides the profile)");
+    const openapi = b.option(bool, "openapi", "OpenAPI 3.1 document generation (overrides the profile)");
+    const console_opt = b.option(bool, "console", "The live console: control socket, rings and terminal UI (overrides the profile)");
 
     var f = Features.preset(profile);
     if (tls) |v| f.tls = v;
@@ -1285,10 +1499,15 @@ fn resolveFeatures(b: *std.Build) Features {
     if (postgres) |v| f.postgres = v;
     if (sqlite) |v| f.sqlite = v;
     if (mongodb) |v| f.mongodb = v;
+    if (nats) |v| f.nats = v;
+    if (kafka) |v| f.kafka = v;
+    if (openapi) |v| f.openapi = v;
+    if (console_opt) |v| f.console = v;
 
     if (f.tls == .none and http3 == null) f.http3 = false;
     if (!f.http2 and grpc == null) f.grpc = false;
     if (!f.compression and brotli == null) f.brotli = false;
+    if (!f.compression and kafka == null) f.kafka = false;
 
     if (f.invalid()) |msg| {
         std.debug.print("error: invalid Anole feature flags: {s}\n", .{msg});
@@ -1339,6 +1558,18 @@ const Core = struct {
     h2_client_by: [2][2][2][2]?*std.Build.Module,
     /// src/tls/dusty_tls.zig, the module the TLS instances import as `tls`.
     tls_seam: ?*std.Build.Module,
+    /// src/resilience/core.zig (retries, breakers): imported as
+    /// `resilience_core` by every HTTP core instance and by anole.
+    resilience: *std.Build.Module,
+    /// src/validate (the validator, no imports): `validate` in the HTTP core
+    /// (`req.bind`) and in anole.
+    validate: *std.Build.Module,
+    /// src/logging (the JSON Lines logger, no imports): `anole_log` in the
+    /// HTTP core (`req.log()`) and in anole.
+    anole_log: *std.Build.Module,
+    /// src/console/ui (the live console's std-only protocol, client, terminal
+    /// UI and restart logic): `anole_console_ui` in anole.
+    console_ui: *std.Build.Module,
 
     fn init(b: *std.Build, c_mods: CModules, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Core {
         // Pinned by default (zio's own default is work stealing), so a
@@ -1346,7 +1577,7 @@ const Core = struct {
         // anole.Server refuses to compile with work stealing declared. And
         // `fast_accept` (see `anole.zio_options`), so a program whose own
         // `zio_options` leave it out still has it.
-        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true }).module("zio");
+        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .diagnostics = true }).module("zio");
         const seam: ?*std.Build.Module = if (c_mods.boringssl) |bssl| b.createModule(.{
             .root_source_file = b.path("src/tls/dusty_tls.zig"),
             .target = target,
@@ -1354,7 +1585,11 @@ const Core = struct {
             .link_libc = true,
             .imports = &.{.{ .name = "anole_boringssl_c", .module = bssl }},
         }) else null;
-        var core: Core = .{ .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
+        const resilience = b.createModule(.{ .root_source_file = b.path("src/resilience/core.zig"), .target = target, .optimize = optimize });
+        const validate = b.createModule(.{ .root_source_file = b.path("src/validate/root.zig"), .target = target, .optimize = optimize });
+        const anole_log = b.createModule(.{ .root_source_file = b.path("src/logging/root.zig"), .target = target, .optimize = optimize });
+        const console_ui = b.createModule(.{ .root_source_file = b.path("src/console/ui/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        var core: Core = .{ .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
@@ -1375,6 +1610,9 @@ const Core = struct {
                             target,
                             optimize,
                         );
+                        dusty_mod.addImport("resilience_core", resilience);
+                        dusty_mod.addImport("validate", validate);
+                        dusty_mod.addImport("anole_log", anole_log);
                         core.dusty_by[@intFromBool(tls)][@intFromBool(http2)][@intFromBool(compression)][@intFromBool(brotli)] = dusty_mod;
                         if (http2) core.h2_client_by[@intFromBool(tls)][1][@intFromBool(compression)][@intFromBool(brotli)] = h2ClientModule(
                             b,
@@ -1497,6 +1735,8 @@ const CModules = struct {
     zstd: ?*std.Build.Module = null,
     /// brotli/encode.h and brotli/decode.h (brotli)
     brotli: ?*std.Build.Module = null,
+    /// lz4.h, lz4hc.h and lz4frame.h (kafka)
+    lz4: ?*std.Build.Module = null,
     /// xuckless/websocket-zig, the sans-IO frame codec for WebSocket over
     /// HTTP/2 (websocket). Pure Zig, but fetched lazily like the C libraries.
     websocket: ?*std.Build.Module = null,
@@ -1533,6 +1773,7 @@ const CModules = struct {
         const zlib_ng_dep = if (f.compression) b.lazyDependency("zlib_ng", .{}) else null;
         const zstd_dep = if (f.compression) b.lazyDependency("zstd", .{}) else null;
         const brotli_dep = if (f.brotli) b.lazyDependency("brotli", .{}) else null;
+        const lz4_dep = if (f.kafka) b.lazyDependency("lz4", .{}) else null;
         // Only its src/root.zig is used (its module would compile a second,
         // vendored zlib).
         const zlib_zig_dep = if (f.compression) b.lazyDependency("zlib_zig", .{}) else null;
@@ -1557,6 +1798,7 @@ const CModules = struct {
         if (f.http3 and (ngtcp2_dep == null or nghttp3_dep == null)) return null;
         if (f.compression and (zlib_ng_dep == null or zstd_dep == null or zlib_zig_dep == null)) return null;
         if (f.brotli and brotli_dep == null) return null;
+        if (f.kafka and lz4_dep == null) return null;
         if (f.websocket and websocket_dep == null) return null;
         if (f.grpc and protobuf_dep == null) return null;
         if (f.json and yyjson_dep == null) return null;
@@ -1618,6 +1860,10 @@ const CModules = struct {
             const lib = brotli_build.library(b, up, target, optimize);
             m.brotli = brotli_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
         }
+        if (lz4_dep) |up| {
+            const lib = lz4_build.library(b, up, target, optimize);
+            m.lz4 = lz4_build.module(b, Translator, tc_dep.?, up, lib, target, optimize);
+        }
 
         if (nghttp2_dep) |up| {
             const lib = nghttp2_build.library(b, up, target, optimize);
@@ -1672,6 +1918,8 @@ const AnoleModuleOptions = struct {
     redis_test_url: ?[]const u8 = null,
     postgres_test_url: ?[]const u8 = null,
     mongodb_test_url: ?[]const u8 = null,
+    nats_test_url: ?[]const u8 = null,
+    kafka_test_url: ?[]const u8 = null,
     /// src/bson as a module, for -Dmongodb.
     bson: ?*std.Build.Module = null,
 };
@@ -1695,6 +1943,10 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(bool, "postgres", f.postgres);
     options.addOption(bool, "sqlite", f.sqlite);
     options.addOption(bool, "mongodb", f.mongodb);
+    options.addOption(bool, "nats", f.nats);
+    options.addOption(bool, "kafka", f.kafka);
+    options.addOption(bool, "openapi", f.openapi);
+    options.addOption(bool, "console", f.console);
     // Live servers for tests (`-Dredis-test-port=6379` or
     // `-Dredis-test-url=redis://...`,
     // `-Dpostgres-test-url=postgres://...`, `-Dmongodb-test-url=mongodb://...`),
@@ -1703,6 +1955,8 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     options.addOption(?[]const u8, "redis_test_url", o.redis_test_url);
     options.addOption(?[]const u8, "postgres_test_url", o.postgres_test_url);
     options.addOption(?[]const u8, "mongodb_test_url", o.mongodb_test_url);
+    options.addOption(?[]const u8, "nats_test_url", o.nats_test_url);
+    options.addOption(?[]const u8, "kafka_test_url", o.kafka_test_url);
 
     const create: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("src/root.zig"),
@@ -1714,6 +1968,10 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addOptions("build_options", options);
     mod.addImport("zio", o.core.zio);
     mod.addImport("dusty", o.core.dusty(f));
+    mod.addImport("resilience_core", o.core.resilience);
+    mod.addImport("validate", o.core.validate);
+    mod.addImport("anole_log", o.core.anole_log);
+    mod.addImport("anole_console_ui", o.core.console_ui);
     if (f.http2) {
         mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
         mod.addImport("anole_h2_client", o.core.h2Client(f));
@@ -1774,6 +2032,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
         mod.addImport("anole_zstd_c", o.c.zstd.?);
     }
     if (f.brotli) mod.addImport("anole_brotli_c", o.c.brotli.?);
+    if (f.kafka) mod.addImport("anole_lz4_c", o.c.lz4.?);
     if (f.needsTls()) {
         mod.addImport("anole_boringssl_c", o.c.boringssl.?);
         mod.addImport("anole_dusty_tls", o.core.tls_seam.?);

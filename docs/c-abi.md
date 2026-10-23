@@ -83,6 +83,28 @@ before including `anole.h`. There is no doorbell fd and no
   the late answer gets `ANOLE_E_GONE`. One sweeper per executor checks them,
   no timer per request.
 
+## Console
+
+The live console ([console.md](console.md)). The `console` configuration group
+(`enabled`, `name`, `socket`, `allow_restart`, `read_only`, `log_buffer`,
+`errors_kept`, `max_routes`, `runtime`) sets up the control socket that
+`anole console` attaches to; a binding passes `name` (its package or module)
+and `runtime` (`"node 22.11.0"`). libanole never reads stdin: the binding does,
+stops reading and calls `anole_console_open(s, 0)` when the user asks, and
+resumes after `ANOLE_EV_CONSOLE_CLOSED`. While it is open, descriptors 1 and 2
+are captured and show in `/logs` as `stdout` and `stderr`.
+
+| Call | Answers |
+|---|---|
+| `anole_console_open` | `ANOLE_E_STATE` (not running, or open already), `ANOLE_E_UNSUPPORTED` (`NoTerminal`), `ANOLE_E_CONFIG` (`ConsoleOff`) |
+| `anole_console_close` | `ANOLE_OK`, also when it was not open (no event) |
+| `anole_console_attached` | the consoles attached now, 0 or more |
+| `anole_console_report` | `ANOLE_E_INVALID` (more than 32, a bad name or unit) |
+| `anole_console_log` | `ANOLE_OK`, also when nothing is kept |
+
+`anole_console_log` keeps the record for `/logs` only; the request handle
+argument is accepted and not yet used to attach the request id.
+
 ## Rules
 
 Fourteen rules, the same ones `anole.h` states at its top.
@@ -255,6 +277,20 @@ parameters, metadata) are reached through the offset stored in the record.
 | `ANOLE_EV_WT_STREAM_STOP` | `anole_wt_code_event`: the peer asked this side to stop sending | `anole_wt_stream` | none |
 | `ANOLE_EV_WT_DATAGRAM` | `anole_wt_datagram_event`, then the bytes | `anole_wt` | none |
 | `ANOLE_EV_WS_UPGRADE` (40) | `anole_request_event`: a WebSocket handshake the consumer accepts (`anole_ws_accept`) or refuses (any request answer); only on routes with `"accept": "consumer"` | `anole_req` | accept or a refusing answer |
+| `ANOLE_EV_NATS_MSG` (64) | `anole_nats_msg_event`, then header spans and bytes: a message of a subscription | `anole_nats_sub` | none (answer with `anole_nats_publish` to its `reply` if wanted) |
+| `ANOLE_EV_NATS_REPLY` (65) | `anole_nats_reply_event`: the answer to `anole_nats_request` or `anole_nats_js_publish` | 0 (`user_data`) | none |
+| `ANOLE_EV_NATS_JS_MSG` (66) | `anole_nats_msg_event` with the JetStream fields set | `anole_nats_msg` | `anole_nats_ack` (any kind) or `anole_handle_release` (= NAK) |
+| `ANOLE_EV_NATS_SUB_END` (67) | `anole_broker_end_event`: the subscription is over (`reason`, `dropped`) | `anole_nats_sub` | ends it |
+| `ANOLE_EV_NATS_STATUS` (68) | `anole_broker_status_event`: the connection came up (`ANOLE_BROKER_CONNECTED`), was lost (`DISCONNECTED`), came back (`RECONNECTED`) or the server announced lame duck mode (`LAME_DUCK`); sent to every consumer | 0 | none |
+| `ANOLE_EV_NATS_WRITABLE` (69) | `anole_broker_status_event`: a publish refused with `ANOLE_E_AGAIN` (or advised with `ANOLE_BUSY`) would be taken now | 0 | none |
+| `ANOLE_EV_KAFKA_RECORDS` (80) | `anole_kafka_records_event`, then `anole_kafka_record`s, header spans and bytes: the next records of one partition | `anole_kafka_batch` | `anole_kafka_batch_done`, `anole_kafka_batch_retry`, or `anole_handle_release` (= retry now) |
+| `ANOLE_EV_KAFKA_DELIVERY` (81) | `anole_kafka_delivery_event`: what became of a produced record, or (topic empty) of `anole_kafka_flush` | 0 (`user_data`) | none |
+| `ANOLE_EV_KAFKA_ASSIGN` (82) | `anole_kafka_assign_event`: the partitions this member got | `anole_kafka_group` | none |
+| `ANOLE_EV_KAFKA_REVOKE` (83) | `anole_kafka_assign_event`: the partitions it is about to lose | `anole_kafka_group` | finish those partitions' batches (they go stale at `rebalance_timeout_ms`) |
+| `ANOLE_EV_KAFKA_WRITABLE` (84) | `anole_broker_status_event`: a produce refused with `ANOLE_E_AGAIN` (or advised with `ANOLE_BUSY`) would be taken now | 0 | none |
+| `ANOLE_EV_KAFKA_GROUP_END` (85) | `anole_broker_end_event`: the group membership is over (`reason`) | `anole_kafka_group` | ends it |
+| (86-95) | reserved for Kafka | | |
+| `ANOLE_EV_CONSOLE_CLOSED` (132) | `anole_console_closed_event`: the in-process console closed (`reason`: `ANOLE_CONSOLE_QUIT`, `_INTERRUPT`, `_RESTARTING`); only after `anole_console_open`. 133-135 are reserved for the console | 0 | none: resume reading stdin |
 | `ANOLE_EV_DRAINING` (41) | `anole_event`: `anole_server_drain` was called; once per consumer, before sockets get 1001 or requests are cut: finish long polls and event streams | 0 | none |
 
 The numbers are allocated once and frozen: 0 none; 1-11 core; 12-19 gRPC;
@@ -355,6 +391,7 @@ when it did not come from the OS):
 | `ANOLE_E_SYSTEM` | the OS refused (a port in use, a certificate that will not load) |
 | `ANOLE_E_TIMEOUT` | a blocking call's timeout passed (a query's `timeout_ms`, in its answer) |
 | `ANOLE_E_DB` | in a query's answer: the database refused the statement (`error_class`) |
+| `ANOLE_E_BROKER` | in a broker call's answer: the broker refused it or could not be reached (`error_class`) |
 
 ### Error tokens
 
@@ -374,6 +411,8 @@ Bindings may switch on it; tokens are only ever added.
 | `NoConsumer`, `ConsumerWithoutExecutor` | `ANOLE_E_STATE` | `anole_server_open` / `anole_server_start` |
 | `NotRunning`, `NoTlsListener` | `ANOLE_E_STATE` | reload, publish |
 | `UnknownCheck` | `ANOLE_E_INVALID` | `anole_server_set_ready` |
+| `InvalidEnvironmentVariable`, `DeploymentUnavailable`, `ProxyProtocolNoPeers` | `ANOLE_E_CONFIG` | `anole_server_create` (`ANOLE_ENV`, `ANOLE_DEPLOYMENT`, `PORT`; `deployment` lambda; `proxy_protocol` with an empty `proxy.trusted`) |
+| `UnknownEnvironment`, `InvalidEnvFile` | `ANOLE_E_INVALID`, `ANOLE_E_CONFIG` | `anole_dotenv_read` |
 | `AddressInUse`, `AddressNotAvailable`, `AccessDenied`, `TooManyOpenFiles`, `SystemResources` | `ANOLE_E_SYSTEM` | binds, threads, files (errno set) |
 | `CertificateFileUnreadable`, `KeyFileUnreadable`, `ClientCaFileUnreadable` | `ANOLE_E_SYSTEM` | TLS files (errno set) |
 | `InvalidCertificate`, `InvalidKey`, `KeyMismatch`, `InvalidClientCa` | `ANOLE_E_INVALID` from a reload, `ANOLE_E_CONFIG` from start | TLS contents |
@@ -545,8 +584,12 @@ changes the server's own certificate only; it re-reads the client CA source
 the configuration names (`client_ca_file`, `client_ca_dir` or the system
 store again; `client_ca_pem` as given).
 
-Behind a proxy, `proxy.trusted_hops` says how many proxies in front to
-trust for `X-Forwarded-For` (the client's address in `remote_addr`), with
+Behind a proxy, `deployment` (`"behind_proxy"`, `"anole_lb"`, `"platform"`)
+and `proxy.trusted` (addresses, CIDR networks, `"loopback"`, `"private"`,
+`"link_local"`) say which peers' `X-Forwarded-For` to read: the client's
+address in `remote_addr` is the rightmost address in it that is not trusted
+([config.md](config.md#6-deployment)). `proxy.trusted_hops` is the fixed-count
+alternative (how many proxies in front), with
 `proxy.trust_forwarded_proto` (default true: `X-Forwarded-Proto` decides
 `ANOLE_REQ_SECURE`) and `proxy.trust_forwarded_host` (default false). A
 listener's `proxy_protocol` expects a PROXY protocol (v1 or v2) header on
@@ -564,6 +607,39 @@ for port 0), `udp_port` (HTTP/3's, 0 when the listener serves none), `flags`
 `error_errno`. Node's `server.address()` and an EADDRINUSE error are built
 from it.
 
+## Environment and .env
+
+`environment` ("development" or "production") and `deployment` are resolved
+once, at `anole_server_create`: the key, else `ANOLE_ENV` / `ANOLE_DEPLOYMENT`
+in the process environment, else production and standalone. libanole reads
+no `.env` file itself and treats a build without `environment` as
+production, so a binding that leaves it out gets JSON records in its log
+callback. Resolution failures are `ANOLE_E_CONFIG` from `anole_server_create`
+(`InvalidEnvironmentVariable`, `InvalidProxyNetwork`, `DeploymentUnavailable`),
+with the reason in `anole_last_error`. `anole_server_listener` reports the
+filled address and port before start, so a binding sees `$PORT` at once.
+
+`anole_dotenv_read(dir, environment, fn, ud)` reads the `.env` files Anole
+reads for the environment (development: `.env.development.local`,
+`.env.local`, `.env.development`, `.env`; the first file with a key wins;
+`ANOLE_ENV` is never passed on) and calls `fn` once per variable; production
+reads nothing. It does not touch the process environment: the binding sets
+each variable that is not already set, in its language, before
+`anole_server_create`. One parser in every language, so the dialect (quotes,
+multi-line values, comments) and the order are the same everywhere.
+
+- anole-node: `environment` = the option, else `ANOLE_ENV`, else
+  `"production"` when `NODE_ENV === "production"`, else `"development"`; in
+  development call `anole_dotenv_read(root, "development", ...)` and set
+  `process.env[k] = v` when it is undefined; pass `environment` explicitly in
+  the JSON. Next.js loads the same files in the same order itself.
+- anole-py: `environment` = the option, else `ANOLE_ENV`, else
+  `"production"`; in development `os.environ.setdefault(k, v)` per entry; pass
+  it in the JSON.
+
+libanole then sees `ANOLE_DEPLOYMENT`, `ANOLE_PROXY_TRUSTED`, `PORT`,
+`DATABASE_URL`... through `getenv`.
+
 ## Keys and defaults
 
 Every option of Zig's `ServerOptions` has a key here with the same name and
@@ -577,7 +653,7 @@ none.
 | `timeouts.request_ms` | 30000 | `timeouts.request`: the consumer deadline (504); the core gets the longest plus 5 s |
 | `timeouts.read_header_ms` | 10000 | `timeouts.read_header` |
 | `timeouts.write_ms` | 30000 | `timeouts.write`: a write the peer does not take ends the response; replaces the request deadline once a stream or file body has started |
-| `timeouts.keepalive_ms` | 60000 | `timeouts.keepalive` |
+| `timeouts.keepalive_ms` | 75000 | `timeouts.keepalive` |
 | `timeouts.idle_park_ms` | 1000 | `timeouts.idle_park` |
 | `timeouts.shutdown_ms` | 10000 | `timeouts.shutdown` |
 | `limits.body_max` | 1048576 | `limits.body_max` |
@@ -586,10 +662,12 @@ none.
 | `limits.max_connections` | 0 | `limits.max_connections` (0: the open-file limit) |
 | `limits.max_requests_per_connection` | null | `limits.max_requests_per_connection` |
 | `limits.ws_max_message` | 1048576 | `limits.ws_max_message` |
-| `proxy.trusted_hops`, `trust_forwarded_proto`, `trust_forwarded_host` | 0, true, false | `proxy.*` |
+| `proxy.trusted`, `trusted_hops`, `trust_forwarded_proto`, `trust_forwarded_host` | null, 0, true, false | `proxy.*` |
+| `environment`, `deployment`, `error_detail` | null, null, null | `environment`, `deployment`, `error_detail` (null: `ANOLE_ENV` else production; `ANOLE_DEPLOYMENT` else standalone; on in development) |
+| `listeners[].address`, `port`, `proxy_protocol` | null, null, null | `Listener.*` (null: the deployment's default: `127.0.0.1`, 8080 or `$PORT`, off or on under `anole_lb`) |
 | `request.require_host`, `decompress`, `keep_buffers` | true, true, false | `request.*` |
 | `response.write_buffer_size`, `date`, `default_content_type`, `max_header_count`, `brotli_quality` | 16384, true, "text", 64, 5 | `response.*` (`default_content_type` by tag name; null: none) |
-| `http2.*` | 250 streams, ... | `http2.*` (`max_concurrent_streams`, `stream_window`, `stream_window_reading`, `tunnel_window`, `reading_window_budget`, `connection_window`, `max_header_list_size`, `stream_reset_burst`, `stream_reset_rate`, `max_continuations`, `refused_stream_burst`, `refused_stream_rate`, `enable_connect_protocol`, `inline_no_wait`) |
+| `http2.*` | 250 streams, ..., `enable_connect_protocol` false | `http2.*` (`max_concurrent_streams`, `stream_window`, `stream_window_reading`, `tunnel_window`, `reading_window_budget`, `connection_window`, `max_header_list_size`, `stream_reset_burst`, `stream_reset_rate`, `max_continuations`, `refused_stream_burst`, `refused_stream_rate`, `enable_connect_protocol`, `inline_no_wait`) |
 | `http3.address`, `port`, `max_streams_bidi`, `validate_address`, `idle_timeout_ms`, `alt_svc`, `early_data`, `prefer_v2`, `sockets`, `enable_connect_protocol`, `inline_no_wait` | null, null, 100, false, 30000, true, false, true, null, true, true | `http3.*` |
 | `errors` | "auto" | `errors` ("auto", "json", "text") |
 | `routes[].websocket.accept`, `subprotocols`, `compression`, `close_on_drain`, `origins` | "auto", [], true, true, [] | `websocket.UpgradeOptions` (`subprotocols`, `compression`, `close_on_drain`, `allowed_origins`); `accept` is the ABI's own: "consumer" hands each handshake to the application |
@@ -612,6 +690,7 @@ Zig options with no key, and why:
 | `max_stack_size` | stacks run Anole's native work only, never language handlers |
 | `raise_fd_limit` | always on under the ABI |
 | `signals` | the `ANOLE_SERVER_SIGNALS` flag of `anole_server_create` |
+| `env_files` | the binding reads `.env` files into its language's environment (`anole_dotenv_read`) |
 | `process`, `restart_timeout` | embedded mode: no hand-off, SIGUSR2, LISTEN_FDS or sd_notify |
 | `blocking` | the ABI starts a pool when SQLite is configured |
 | `client` | no outbound client in the ABI |
@@ -683,8 +762,9 @@ returns, no borrowed memory is read and no `ANOLE_EV_SENT` comes.
 
 ## WebSocket
 
-A `websocket` route upgrades over HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3
-(RFC 9220). Who answers the handshake is the route's `"accept"`.
+A `websocket` route upgrades over HTTP/1.1, HTTP/2 (RFC 8441, only with
+`"http2": {"enable_connect_protocol": true}`, off by default since 0.3:
+about twice the CPU per message of HTTP/1.1) and HTTP/3 (RFC 9220). Who answers the handshake is the route's `"accept"`.
 
 **Auto endpoints** (`"accept": "auto"`, the default). Anole answers the
 handshake: origins (`"origins"`, 403 otherwise), permessage-deflate, and
@@ -1132,6 +1212,132 @@ anole_db_query(db, consumer, (anole_str){"find orders", 11}, p, 2, NULL, 1);
   once, as the drivers do.
 - Transactions (`anole_db_begin`) are SQLite and PostgreSQL only; change streams are not part of the ABI yet.
 
+## Brokers
+
+Brokers are configured under `"brokers"` (one object per broker, with a
+`"name"` and exactly one kind key, `"nats"` or `"kafka"`) and used through
+`anole_nats_*` and `anole_kafka_*` calls. They are built with `-Dnats` and
+`-Dkafka` (`anole_has_feature("nats")`, `anole_has_feature("kafka")`).
+
+```json
+"brokers": [
+  { "name": "events",
+    "nats": { "url": "tls://nats.internal:4222", "creds_file": "/run/secrets/app.creds",
+              "connections": "one",
+              "jetstream": { "streams": [ { "name": "ORDERS", "subjects": ["orders.>"] } ],
+                             "consumers": [ { "stream": "ORDERS", "durable": "billing" } ] } },
+    "timeout_ms": 30000, "retry": { "attempts": 5 } }
+]
+```
+
+`nats` takes `url` (`nats://`, `tls://`, a comma-separated list; `user:password@`
+or `token@` in it log in), `name`, one login (`token`, `user` and `password`,
+`nkey_seed` or `nkey_seed_file`, `creds` or `creds_file`), TLS (`ca_file` or
+`ca_pem`, `client_cert_file` and `client_key_file` or their `_pem` forms,
+`insecure_skip_verify`, `tls_first`, `tls_required`), `connections` (`"one"`,
+the default, keeps publishes ordered across the app; `"per_executor"`),
+`connect_timeout_ms`, `connect_at_start`, `ping_interval_ms`,
+`max_outstanding_pings`, `no_echo`, `reconnect`, `limits` and `jetstream`
+(`domain`, `streams`, `consumers`, created or updated when the server starts).
+`timeout_ms` bounds requests that have none of their own; `retry` is what
+`ANOLE_NATS_F_RETRY` requests retry with (only on no-responders: the request
+was never delivered).
+
+**Publishing never waits.** `anole_nats_publish` copies the message and
+returns: `ANOLE_OK`, `ANOLE_BUSY` (taken, but the queue is past half its
+limit), or `ANOLE_E_AGAIN` (not taken: the queue is full; the consumer gets
+`ANOLE_EV_NATS_WRITABLE` when there is room). A send that blocks on the
+network would stall whatever lock the caller holds.
+
+**Requests and JetStream publishes** return at once; the answer is one
+`ANOLE_EV_NATS_REPLY` to the consumer given, with the caller's `user_data`:
+`status` is `ANOLE_OK`, `ANOLE_E_TIMEOUT`, `ANOLE_E_BROKER` (`error_class`
+`UNAVAILABLE` for no responders or a lost connection, `OTHER` for a refusal;
+`error_code` says which: `no_responders`, `timeout`, `outbound_full`, a
+JetStream `err_code`) or `ANOLE_E_GONE` (the request it served ended first).
+`http_status` is what Anole's own handlers would answer (503, 504, 500).
+
+**Subscriptions** (`anole_nats_subscribe`, with a queue group when several
+processes share the work) deliver `ANOLE_EV_NATS_MSG` records on the consumer
+given. Delivery waits for room in the consumer's ring; meanwhile the
+subscription's own queue applies its `overflow` policy (`ANOLE_NATS_DROP_*`,
+`ANOLE_NATS_CLOSE`), and the drops are counted in the
+`ANOLE_EV_NATS_SUB_END` record (`dropped`). `anole_nats_unsubscribe` (or
+`anole_handle_release`) ends one.
+
+**JetStream consumption** (`anole_nats_js_consume`) pulls with credit: it
+asks for more only while fewer than `max_inflight` messages are unacked, so
+nothing is dropped. Each message is an `ANOLE_EV_NATS_JS_MSG` with its own
+`anole_nats_msg` handle, owing `anole_nats_ack` (`ANOLE_NATS_ACK`,
+`ANOLE_NATS_NAK` with a delay, `ANOLE_NATS_TERM`, `ANOLE_NATS_PROGRESS`) or
+`anole_handle_release`, which is a NAK. An unanswered message is redelivered
+by the server after the consumer's `ack_wait`.
+
+At the stop, subscriptions end without events (the consumer's last event is
+`ANOLE_EV_STOPPED`). `anole_nats_find` looks a broker up by name and
+`anole_nats_index` gives its place in `"brokers"`.
+
+### Kafka
+
+```json
+"brokers": [
+  { "name": "log",
+    "kafka": { "brokers": ["kafka-1:9093"], "ca_file": "/etc/ssl/kafka-ca.pem",
+               "sasl": { "mechanism": "SCRAM-SHA-512", "username": "app", "password": "..." },
+               "producer": { "acks": "all", "compression": "zstd" } } }
+]
+```
+
+`kafka` takes `brokers` (`host:port` entries; null reads `KAFKA_BOOTSTRAP_SERVERS`,
+then `KAFKA_URL`, else `localhost:9092`), `client_id`, TLS (`tls`, or any of
+`ca_file`/`ca_pem`, `client_cert_file` and `client_key_file` or their `_pem`
+forms, `insecure_skip_verify`), `sasl` (`mechanism` `"PLAIN"`,
+`"SCRAM-SHA-256"` or `"SCRAM-SHA-512"`, `username`, `password`),
+`connect_timeout_ms`, `request_timeout_ms`, `metadata_max_age_ms`,
+`connect_at_start` and `producer` (`acks` `"none"`, `"leader"` or `"all"`,
+`idempotent` (needs `"all"`), `linger_ms`, `batch_bytes`, `buffer_bytes`,
+`compression` `"none"`, `"gzip"`, `"zstd"` or `"lz4"`, `delivery_timeout_ms`,
+`metadata_wait_ms` (default 5000: how long a record for a topic the cluster
+does not list yet waits for it before `UNKNOWN_TOPIC_OR_PARTITION`),
+`max_request_bytes`). `timeout_ms` of the broker bounds `anole_kafka_flush`.
+There is one producer per broker, so records of a key keep their order across
+the calls of every thread. The partitioner is Java's (murmur2 of the key),
+so keys land where Java producers put them.
+
+**Producing never waits.** `anole_kafka_produce` copies the record and
+returns: `ANOLE_OK`, `ANOLE_BUSY` (taken; the buffer is past half), or
+`ANOLE_E_AGAIN` (not taken: `producer.buffer_bytes` are waiting; the consumer
+gets `ANOLE_EV_KAFKA_WRITABLE` when there is room). Unless
+`ANOLE_KAFKA_F_NO_REPORT`, the record's fate is one `ANOLE_EV_KAFKA_DELIVERY`
+with the caller's `user_data`: `status` `ANOLE_OK` (`partition`, `offset`,
+`timestamp_ms`), `ANOLE_E_TIMEOUT` (`delivery_timeout_ms`) or `ANOLE_E_BROKER`
+(`error_class` `UNAVAILABLE` or `OTHER`; `error_code` is the Kafka error name,
+such as `MESSAGE_TOO_LARGE`, or one of `buffer_full`, `no_broker`, `closing`,
+`delivery_pending`). `anole_kafka_flush` answers with a delivery event whose
+topic is empty once everything queued before it is acknowledged or failed.
+
+**Groups.** `anole_kafka_subscribe` joins a consumer group as one member.
+Each assigned partition delivers `ANOLE_EV_KAFKA_RECORDS`: at most
+`max_batch` records of that partition, in order, and never a second batch of
+the partition before the first is answered. `anole_kafka_batch_done` marks the
+records processed (their offsets are committed with the next commit);
+`anole_kafka_batch_retry` delivers the same records again after a delay, and
+the partition waits meanwhile. Dead letters are the binding's: produce the
+record to a dead-letter topic with `anole_kafka_produce`, then call
+`anole_kafka_batch_done`. A rebalance first sends `ANOLE_EV_KAFKA_REVOKE`; a
+batch not answered within `rebalance_timeout_ms` goes stale (answering it is
+`ANOLE_OK` for `anole_kafka_batch_done`, `ANOLE_E_GONE` for `_retry`, and its
+offsets are not committed). `ANOLE_EV_KAFKA_ASSIGN` follows the join.
+`anole_kafka_group_close` (or `anole_handle_release`) commits the done batches
+and leaves the group; `ANOLE_EV_KAFKA_GROUP_END` says it is over
+(`ANOLE_BROKER_END_CLOSED`, `_DRAINED` when `anole_server_drain` ended it,
+`_FAILED`). At the stop, groups end without events.
+
+`anole_kafka_find` looks a broker up by name and `anole_kafka_index` gives
+its place in `"brokers"` (what `anole_broker_status_event.broker` names).
+The consumer reads none, gzip, zstd, lz4 and snappy batches. Transactions,
+the KIP-848 protocol and the admin API are not part of the ABI.
+
 ## gRPC
 
 A `"grpc"` section serves gRPC services whose methods the consumer
@@ -1202,7 +1408,7 @@ slow consumer holds back its client through HTTP/2 flow control rather than
 filling memory. Metadata the consumer sends follows gRPC's rules: a
 lower-case key, a printable ASCII value, bytes under a `-bin` key (Anole
 encodes them); the protocols' own keys (`grpc-*` but
-`grpc-status-details-bin` in trailers only, `connect-*`, `trailer-*`,
+`grpc-status-details-bin` and `grpc-retry-pushback-ms` in trailers only, `connect-*`, `trailer-*`,
 `content-type`, `te` and the transport's headers) are refused with
 `ANOLE_E_INVALID`: the same rule as Zig's `Call.addHeader` and `addTrailer`.
 
@@ -1307,6 +1513,24 @@ The callback belongs to its server: it is set by `anole_server_create`,
 cleared by `anole_server_destroy`, and a later server without one logs to
 stderr.
 
+`"log": {"format": "auto" | "text" | "json", "service": "..."}` picks the
+format of every record (`auto`: JSON when `environment` is production, which
+is what a binding that leaves it out gets). In `json` the callback's `msg` is
+the complete record as one JSON object with no newline, byte for byte what
+stderr would get; in `text` it is the message, with structured fields
+appended as ` key=value`. Access log lines (the `access_log` middleware, whose
+`format` defaults to `"auto"`, following `log.format`) reach the callback too,
+with scope `access`. Records can be up to 16 KiB; a binding that parses them
+should expect `time`, `level`, `scope`, `message`, `service`, `request_id`,
+`trace_id` and `span_id`, then the record's fields ([logging.md](logging.md)).
+
+`"banner": true` prints the startup banner to stderr (when it is a terminal
+and the format is text); it is off by default under the ABI.
+
+Validation stays in the binding's language (zod, pydantic): the 422
+problem document is described in [validation.md](validation.md#the-422-document)
+for bindings that want the same shape.
+
 ## Testing
 
 `zig build capi-test` (part of `zig build test`) checks `anole.h` through
@@ -1332,6 +1556,17 @@ routes with native ones.
 ## From ABI 0.6
 
 ABI 0.8 only adds `anole_wt_stream_set_priority`; nothing from 0.7 changes.
+
+ABI 0.9 adds the `environment`, `deployment`, `error_detail`, `proxy.trusted`,
+`log`, `banner` and `console` keys, `anole_dotenv_read`, the brokers (NATS
+events 64-69, Kafka events 80-85, handle kinds 8 and 9, `ANOLE_E_BROKER`),
+`ANOLE_DB_F_RETRY` with `breaker` and `retry` on databases, and the console
+calls with event 132. What a 0.8 binding notices: with `environment` unset
+(production) the log callback's `msg` is a whole JSON record (`"log":
+{"format": "text"}` keeps messages) and access lines reach the callback;
+`timeouts.keepalive_ms` defaults to 75 s; `listeners[].address`, `port` and
+`proxy_protocol` default to null (the deployment's default); a malformed
+route pattern is `ANOLE_E_CONFIG` ([migrating.md](migrating.md#c-abi-json-config-abi-09)).
 
 | 0.6 | 0.7 |
 | --- | --- |
@@ -1370,8 +1605,16 @@ send-type call's flags `ANOLE_BODY_BORROW`, so `ANOLE_WT_F_FIN` moved from 1 to
 `anole_handle_release`, the `anole_req_` names and the constant families,
 stable error tokens, `anole_server_open`, `anole_listener_info`, abort
 reasons, the SENT contract and a poll that never drops an event. 0.8 adds
-`anole_wt_stream_set_priority`. Before 1.0
+`anole_wt_stream_set_priority`. 0.9 is the developer-experience release:
+environment and deployment modes with `.env` files, the NATS and Kafka
+brokers, breakers and retries on databases, JSON Lines logs, the banner and
+the live console. Before 1.0
 every minor may break (`ANOLE_ABI_COMPATIBLE` asks for an exact match).
 The freeze, ABI 1.0, comes after anole-node 0.1 and anole-py 0.1 ship on it.
 
 Auth beyond the configured `jwt` middleware comes later.
+
+
+## Breakers and retries (databases)
+
+Every `databases[]` entry of a network connector (PostgreSQL, Redis, MongoDB) takes `"breaker"` (an object with `consecutive_failures`, `failure_ratio`, `min_calls`, `window_ms`, `open_ms`, `max_open_ms`, `half_open_calls`; `null` turns it off; ignored for SQLite) and `"retry"` (`attempts`, `base_ms`, `max_ms`, `multiplier`, `attempt_timeout_ms`, `max_retry_after_ms`). `ANOLE_DB_F_RETRY` marks a query that may run again on a transient failure; it is refused (`ANOLE_E_INVALID`) on `anole_db_tx_query` and `anole_db_tx_exec`, and SQLite and MongoDB ignore it. An open breaker answers `ANOLE_EV_DB_RESULT` with `status = ANOLE_E_DB`, `error_class = ANOLE_DB_ERR_UNAVAILABLE`, `http_status = 503` and `error_code = "circuit_open"`.

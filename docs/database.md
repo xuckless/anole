@@ -22,6 +22,10 @@ connector's) in a build without it is a compile error that names the flag.
 Choose them where you add the dependency, as for the other
 [build flags](server.md#build-flags).
 
+### Failing fast and retrying
+
+After 5 connection failures in a row (or half of 20 calls in 10 s) a network connector's breaker opens: calls fail at once with `error.ServiceUnavailable` and `lastError` code `circuit_open`, for 5 s and then while probes fail (up to 60 s). Answers from a live server (a unique violation, a statement timeout) and a busy pool (`pool_timeout`) never count. `breaker = null` turns it off. `with(.{ .retry = true })` runs a statement again on a transient failure (the server unreachable, a connection lost) with the connector's `retry`; use it only for statements that are safe to repeat. See [resilience.md](resilience.md).
+
 ### Options every connector shares
 
 One vocabulary: a concept has the same field name and type on every
@@ -38,6 +42,8 @@ null where the field is optional).
 | connect bound | `connect_timeout: ?Duration` (10 s) | - | same | same | `connect_timeout_ms` (0: none) |
 | idle close | `idle_timeout` (30 min) | - | `idle_timeout` (5 min) | `idle_timeout` (null) | `idle_timeout_ms` (0: none) |
 | lifetime | `max_lifetime` (1 h) | - | - | - | `max_lifetime_ms` |
+| circuit breaker | `breaker: ?resilience.Breaker.Options` (on) | - | same | same | `databases[i].breaker` (null: off) |
+| retry policy | `retry: resilience.Retry` (3 attempts, 50 ms .. 1 s) | - | same | same (ignored: the spec's retryable reads and writes) | `databases[i].retry` |
 | statement cache | `statement_cache_size: u16` (256) | `statement_cache_size: u16` (64) | - | - | `statement_cache_size` |
 | lock wait | - | `busy_timeout: Duration` (5 s) | - | - | `busy_timeout_ms` |
 | per-call bound | `timeout: ?Duration` (30 s) | same | same | same (also `maxTimeMS`) | `databases[i].timeout_ms` (0: none) |
@@ -70,7 +76,7 @@ The calls:
 | `begin(req, opts)` | a transaction: the same calls, `commit(req)`, `rollback(req)`, `deinit()` |
 | `transaction(req, opts, func, args)` | `func(&tx, args...)`, committed, retried after a serialization failure |
 | `acquire(req)` | the driver's own connection, given back with `release()` |
-| `with(.{ .timeout, .prepare, .coalesce, .cache })` | the same calls with options; see [Caching](#caching) |
+| `with(.{ .timeout, .prepare, .coalesce, .cache, .retry })` | the same calls with options; see [Caching](#caching) |
 
 Each connector has the calls its database can do, and a call of the same
 name means the same thing in each:

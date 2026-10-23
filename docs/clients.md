@@ -73,6 +73,10 @@ your own. The APIs that make requests for you
 take the `anole.Client` that `app.client()` and `anole.client(req)` return;
 wrap one of your own as `.{ .http = &my_client }`.
 
+## Retries and circuit breakers
+
+`ClientOptions.retry`, `retry_statuses` and `breaker` retry idempotent requests and fail fast on a host that keeps failing (`error.CircuitOpen`, a 503 from `errorStatus`); `FetchOptions.retry` and `idempotent` decide per call. The fetch's `timeout` bounds all attempts. HTTP/2 and HTTP/3 `Stream.unprocessed()` says a request was never run and can be sent again on another connection. See [resilience.md](resilience.md).
+
 ## HTTP/1.1 and HTTPS
 
 `anole.http.Client` is the HTTP core's client. Create one, share it, and call `fetch`:

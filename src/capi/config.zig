@@ -14,6 +14,22 @@ const features = anole.features;
 pub const Config = struct {
     /// Executor threads: 0 for one per CPU (cgroup-aware).
     executors: u32 = 0,
+    /// "development" or "production". Null: ANOLE_ENV, else production.
+    environment: ?anole.Environment = null,
+    /// What sits in front: "standalone", "behind_proxy", "anole_lb",
+    /// "platform" or "lambda". Null: ANOLE_DEPLOYMENT, else standalone.
+    deployment: ?anole.Deployment = null,
+    /// A 500 answer for an error with no status names the error. Null: on in
+    /// development.
+    error_detail: ?bool = null,
+    /// Logging, process-wide: the format and a service name.
+    log: Log = .{},
+    /// Print the startup banner when stderr is a terminal and the logs are
+    /// text. Off by default under the ABI: a binding opts in.
+    banner: bool = false,
+    /// The live console (docs/console.md): a control socket for `anole
+    /// console`, and `anole_console_*`.
+    console: Console = .{},
     listeners: []const Listener = &.{.{}},
     timeouts: Timeouts = .{},
     limits: Limits = .{},
@@ -38,6 +54,33 @@ pub const Config = struct {
     observe: Observe = .{},
     /// Databases for `anole_db_*`, opened at start.
     databases: []const Database = &.{},
+    /// Message brokers for `anole_nats_*`, opened at start.
+    brokers: []const Broker = &.{},
+
+    pub const Console = struct {
+        /// The control socket. Null: on (off under deployment lambda, on
+        /// Windows, with ANOLE_CONSOLE=0).
+        enabled: ?bool = null,
+        /// What `anole console <name>` finds the app by; bindings pass the
+        /// package or module name.
+        name: ?[]const u8 = null,
+        socket: ?[]const u8 = null,
+        /// Null: on in development, off in production.
+        allow_restart: ?bool = null,
+        read_only: bool = false,
+        log_buffer: usize = 4 * 1024 * 1024,
+        errors_kept: u16 = 256,
+        max_routes: u16 = 256,
+        /// Shown in the console's status line, e.g. "node 22.11.0".
+        runtime: ?[]const u8 = null,
+    };
+
+    pub const Log = struct {
+        /// "auto" (JSON Lines in production, else text), "text" or "json".
+        format: anole.log.Format = .auto,
+        /// Written as "service" in every JSON record; at most 64 bytes.
+        service: ?[]const u8 = null,
+    };
 
     pub const Listener = struct {
         /// Unique; "http-<port>" / "https-<port>" when left out. Requests
@@ -45,9 +88,11 @@ pub const Config = struct {
         name: ?[]const u8 = null,
         /// "127.0.0.1" (this machine), "" (every interface, IPv6 and IPv4),
         /// "0.0.0.0", "::".
-        address: []const u8 = "127.0.0.1",
-        /// 0 picks a free port (`anole_server_listener`).
-        port: u16 = 8080,
+        /// Null: the deployment's ("127.0.0.1"; "" for anole_lb and platform).
+        address: ?[]const u8 = null,
+        /// 0 picks a free port (`anole_server_listener`). Null: 8080, or
+        /// $PORT under platform.
+        port: ?u16 = null,
         /// A unix domain socket at this path instead of address and port.
         unix: ?[]const u8 = null,
         /// TLS with this certificate; cleartext when left out.
@@ -57,10 +102,12 @@ pub const Config = struct {
         http2: bool = true,
         /// HTTP/3 on the same port over UDP (a TLS listener; one per server).
         http3: bool = false,
-        /// Connections start with a PROXY protocol header.
-        proxy_protocol: bool = false,
+        /// Connections start with a PROXY protocol header. Null: on under
+        /// anole_lb, else off.
+        proxy_protocol: ?bool = null,
         /// With proxy_protocol: the proxies allowed to send one (addresses
-        /// or CIDR networks, "10.0.0.0/8"); empty: any peer.
+        /// or CIDR networks, "10.0.0.0/8"); empty: proxy.trusted when set,
+        /// else any peer.
         proxy_protocol_from: []const []const u8 = &.{},
     };
 
@@ -139,6 +186,12 @@ pub const Config = struct {
         /// request or not; past it the statement is interrupted
         /// (ANOLE_E_TIMEOUT). 0: none.
         timeout_ms: u32 = 30_000,
+        /// A circuit breaker: after repeated connection failures calls fail
+        /// fast with ANOLE_E_DB, class UNAVAILABLE, error_code
+        /// "circuit_open" and http_status 503. null: none. Ignored for SQLite.
+        breaker: ?Breaker = .{},
+        /// What queries with ANOLE_DB_F_RETRY are retried with.
+        retry: Retry = .{},
         /// What status each class of database error becomes, as
         /// `anole.db.ErrorMap`: a class name to "bad_request", "not_found",
         /// "conflict", "unprocessable_entity", "internal_server_error",
@@ -300,6 +353,183 @@ pub const Config = struct {
         connect_at_start: bool = false,
     };
 
+    pub const Breaker = struct {
+        consecutive_failures: u32 = 5,
+        failure_ratio: f32 = 0.5,
+        min_calls: u32 = 20,
+        window_ms: u32 = 10_000,
+        open_ms: u32 = 5_000,
+        max_open_ms: u32 = 60_000,
+        half_open_calls: u8 = 1,
+    };
+
+    pub const Retry = struct {
+        attempts: u8 = 3,
+        base_ms: u32 = 50,
+        max_ms: u32 = 1_000,
+        multiplier: f32 = 2.0,
+        attempt_timeout_ms: u32 = 0,
+        max_retry_after_ms: u32 = 10_000,
+    };
+
+    pub const Broker = struct {
+        /// What `anole_nats_find` looks it up by: unique, 1-255 bytes.
+        name: []const u8,
+        /// Exactly one of the kinds: `nats` or `kafka`.
+        nats: ?Nats = null,
+        kafka: ?Kafka = null,
+        /// A bound on requests and JetStream calls that have no timeout_ms of
+        /// their own. 0: none.
+        timeout_ms: u32 = 30_000,
+        /// What status each class of broker error becomes, as `anole.db.ErrorMap`.
+        errors: anole.db.ErrorMap = .{},
+        /// What requests with ANOLE_NATS_F_RETRY are retried with.
+        retry: BrokerRetry = .{},
+    };
+
+    pub const BrokerRetry = struct {
+        attempts: u8 = 5,
+        base_ms: u32 = 100,
+        max_ms: u32 = 2_000,
+        multiplier: f32 = 2.0,
+        attempt_timeout_ms: u32 = 0,
+        max_retry_after_ms: u32 = 10_000,
+    };
+
+    pub const Nats = struct {
+        /// nats://, tls:// or a comma-separated list; user:password@ or
+        /// token@ in it log in. Null: NATS_URL, else nats://127.0.0.1:4222.
+        url: ?[]const u8 = null,
+        name: ?[]const u8 = null,
+        token: ?[]const u8 = null,
+        user: ?[]const u8 = null,
+        password: ?[]const u8 = null,
+        nkey_seed: ?[]const u8 = null,
+        nkey_seed_file: ?[]const u8 = null,
+        creds: ?[]const u8 = null,
+        creds_file: ?[]const u8 = null,
+        ca_file: ?[]const u8 = null,
+        ca_pem: ?[]const u8 = null,
+        client_cert_file: ?[]const u8 = null,
+        client_key_file: ?[]const u8 = null,
+        client_cert_pem: ?[]const u8 = null,
+        client_key_pem: ?[]const u8 = null,
+        insecure_skip_verify: bool = false,
+        tls_first: bool = false,
+        tls_required: bool = false,
+        /// "one" or "per_executor".
+        connections: []const u8 = "one",
+        connect_timeout_ms: u32 = 5_000,
+        connect_at_start: bool = false,
+        ping_interval_ms: u32 = 30_000,
+        max_outstanding_pings: u8 = 2,
+        no_echo: bool = false,
+        reconnect: Reconnect = .{},
+        limits: NatsLimits = .{},
+        jetstream: JetStream = .{},
+    };
+
+    pub const Kafka = struct {
+        /// host:port entries. Null: KAFKA_BOOTSTRAP_SERVERS, else
+        /// KAFKA_URL, else localhost:9092.
+        brokers: ?[]const []const u8 = null,
+        client_id: []const u8 = "anole",
+        /// TLS to the brokers; any ca/client certificate key turns it on too.
+        tls: bool = false,
+        ca_file: ?[]const u8 = null,
+        ca_pem: ?[]const u8 = null,
+        client_cert_file: ?[]const u8 = null,
+        client_key_file: ?[]const u8 = null,
+        client_cert_pem: ?[]const u8 = null,
+        client_key_pem: ?[]const u8 = null,
+        insecure_skip_verify: bool = false,
+        sasl: ?KafkaSasl = null,
+        connect_timeout_ms: u32 = 10_000,
+        request_timeout_ms: u32 = 30_000,
+        metadata_max_age_ms: u32 = 300_000,
+        connect_at_start: bool = false,
+        producer: KafkaProducer = .{},
+    };
+
+    pub const KafkaSasl = struct {
+        /// "PLAIN", "SCRAM-SHA-256" or "SCRAM-SHA-512".
+        mechanism: []const u8,
+        username: []const u8,
+        password: []const u8,
+    };
+
+    pub const KafkaProducer = struct {
+        /// "none", "leader" or "all".
+        acks: []const u8 = "all",
+        /// Needs acks "all".
+        idempotent: bool = true,
+        linger_ms: u32 = 5,
+        batch_bytes: u32 = 16 * 1024,
+        buffer_bytes: u32 = 32 * 1024 * 1024,
+        /// "none", "gzip", "zstd" or "lz4".
+        compression: []const u8 = "none",
+        delivery_timeout_ms: u32 = 30_000,
+        metadata_wait_ms: u32 = 5_000,
+        max_request_bytes: u32 = 1024 * 1024,
+    };
+
+    pub const Reconnect = struct {
+        enabled: bool = true,
+        max_attempts: ?u32 = null,
+        min_delay_ms: u32 = 500,
+        max_delay_ms: u32 = 10_000,
+        jitter: bool = true,
+        buffer_bytes: u64 = 8 << 20,
+        abort_on_auth_error: bool = true,
+    };
+
+    pub const NatsLimits = struct {
+        outbound_bytes: u64 = 8 << 20,
+        subscription_messages: u32 = 1024,
+        subscription_bytes: u64 = 8 << 20,
+        max_pending_requests: u32 = 65_536,
+        max_subscriptions: u32 = 65_536,
+        max_control_line_bytes: u32 = 4096,
+        max_inbound_frame_bytes: u32 = 64 << 20,
+        max_header_bytes: u32 = 64 << 10,
+        max_event_queue: u32 = 1024,
+    };
+
+    pub const JetStream = struct {
+        domain: ?[]const u8 = null,
+        streams: []const JsStream = &.{},
+        consumers: []const JsConsumer = &.{},
+    };
+
+    pub const JsStream = struct {
+        name: []const u8,
+        subjects: []const []const u8 = &.{},
+        /// "limits", "interest" or "workqueue".
+        retention: []const u8 = "limits",
+        /// "file" or "memory".
+        storage: []const u8 = "file",
+        replicas: u8 = 1,
+        max_age_ms: ?u64 = null,
+        max_bytes: ?i64 = null,
+        max_msgs: ?i64 = null,
+        duplicate_window_ms: ?u64 = null,
+        /// Any other keys of the stream configuration the server takes.
+        extra: ?std.json.Value = null,
+    };
+
+    pub const JsConsumer = struct {
+        stream: []const u8,
+        durable: []const u8,
+        filter_subjects: []const []const u8 = &.{},
+        /// "all", "last", "new" or "last_per_subject".
+        deliver_policy: []const u8 = "all",
+        ack_wait_ms: u32 = 30_000,
+        max_deliver: i32 = -1,
+        max_ack_pending: i32 = 1000,
+        backoff_ms: []const u32 = &.{},
+        extra: ?std.json.Value = null,
+    };
+
     pub const CacheBounds = struct {
         max_entries: u32 = 4096,
         max_bytes: u64 = 32 << 20,
@@ -318,7 +548,7 @@ pub const Config = struct {
         /// deadline. Null: none.
         write_ms: ?u32 = 30_000,
         /// An idle keep-alive connection is closed after this. Null: never.
-        keepalive_ms: ?u32 = 60_000,
+        keepalive_ms: ?u32 = 75_000,
         /// An idle HTTP/1.1 connection gives up its task after this
         /// (parks). Null or 0: never parks.
         idle_park_ms: ?u32 = 1_000,
@@ -366,7 +596,8 @@ pub const Config = struct {
         trust_incoming: bool = false,
     };
     pub const AccessLog = struct {
-        format: enum { text, json } = .text,
+        /// "auto" follows `log.format`.
+        format: enum { auto, text, json } = .auto,
         /// Paths not logged: exact, or a prefix ending in "*".
         exclude: []const []const u8 = &.{},
     };
@@ -679,7 +910,7 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             if (mode != .none and cas != 1) return fail(why, "listeners[{d}].tls: client_auth \"{s}\" needs exactly one of client_ca_file, client_ca_pem, client_ca_dir, client_ca_system", .{ i, t.client_auth });
             if (mode == .none and cas != 0) return fail(why, "listeners[{d}].tls: the client_ca_* settings go with client_auth \"request\" or \"require\"", .{i});
         }
-        if (l.proxy_protocol_from.len > 0 and !l.proxy_protocol) return fail(why, "listeners[{d}].proxy_protocol_from: with proxy_protocol", .{i});
+        if (l.proxy_protocol_from.len > 0 and l.proxy_protocol == false) return fail(why, "listeners[{d}].proxy_protocol_from: with proxy_protocol", .{i});
         if (l.http3) {
             if (comptime !features.http3) return fail(why, "listeners[{d}].http3: HTTP/3 is not built in (-Dhttp3)", .{i});
             if (l.tls == null) return fail(why, "listeners[{d}].http3 needs tls", .{i});
@@ -711,20 +942,67 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
                     return fail(why, "databases[{d}].postgres: sslmode is given twice, in the url and beside it", .{i});
             }
             if (p.ca_file != null and p.ca_pem != null) return fail(why, "databases[{d}].postgres: ca_file or ca_pem, not both", .{i});
-            try checkClientCert(p, "postgres", i, why);
+            try checkClientCert(p, "databases", "postgres", i, why);
             if (p.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].postgres.max_connections: at least 1", .{i});
         }
         if (d.redis) |r| {
             if (comptime !features.redis) return fail(why, "databases[{d}].redis: Redis is not built in (-Dredis)", .{i});
             if (r.ca_file != null and r.ca_pem != null) return fail(why, "databases[{d}].redis: ca_file or ca_pem, not both", .{i});
-            try checkClientCert(r, "redis", i, why);
+            try checkClientCert(r, "databases", "redis", i, why);
             if (r.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].redis.max_connections: at least 1", .{i});
         }
         if (d.mongodb) |m| {
             if (comptime !features.mongodb) return fail(why, "databases[{d}].mongodb: MongoDB is not built in (-Dmongodb)", .{i});
             if (m.ca_file != null and m.ca_pem != null) return fail(why, "databases[{d}].mongodb: ca_file or ca_pem, not both", .{i});
-            try checkClientCert(m, "mongodb", i, why);
+            try checkClientCert(m, "databases", "mongodb", i, why);
             if (m.max_connections) |n| if (n == 0) return fail(why, "databases[{d}].mongodb.max_connections: at least 1", .{i});
+        }
+    }
+    for (cfg.brokers, 0..) |b, i| {
+        if (b.name.len == 0 or b.name.len > 255) return fail(why, "brokers[{d}].name: 1-255 bytes", .{i});
+        for (cfg.brokers[0..i]) |other| if (std.mem.eql(u8, b.name, other.name))
+            return fail(why, "brokers[{d}].name \"{s}\" is taken", .{ i, b.name });
+        if ((b.nats == null) == (b.kafka == null)) return fail(why, "brokers[{d}]: exactly one of nats or kafka", .{i});
+        if (b.kafka) |k| {
+            if (comptime !features.kafka) return fail(why, "brokers[{d}].kafka: Kafka is not built in (-Dkafka)", .{i});
+            if (k.ca_file != null and k.ca_pem != null) return fail(why, "brokers[{d}].kafka: ca_file or ca_pem, not both", .{i});
+            try checkClientCert(k, "brokers", "kafka", i, why);
+            if (k.brokers) |list| {
+                if (list.len == 0) return fail(why, "brokers[{d}].kafka.brokers: at least one host:port", .{i});
+                for (list) |h| if (h.len == 0) return fail(why, "brokers[{d}].kafka.brokers: empty entry", .{i});
+            }
+            if (k.sasl) |sa| {
+                if (!oneOf(sa.mechanism, &.{ "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512" }))
+                    return fail(why, "brokers[{d}].kafka.sasl.mechanism: PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512", .{i});
+            }
+            const p = k.producer;
+            if (!oneOf(p.acks, &.{ "none", "leader", "all" })) return fail(why, "brokers[{d}].kafka.producer.acks: none, leader or all", .{i});
+            if (!oneOf(p.compression, &.{ "none", "gzip", "zstd", "lz4" })) return fail(why, "brokers[{d}].kafka.producer.compression: none, gzip, zstd or lz4", .{i});
+            if (p.idempotent and !std.mem.eql(u8, p.acks, "all")) return fail(why, "brokers[{d}].kafka.producer.idempotent: needs acks \"all\"", .{i});
+            if (p.batch_bytes == 0 or p.buffer_bytes < p.batch_bytes or p.max_request_bytes < 1024)
+                return fail(why, "brokers[{d}].kafka.producer: batch_bytes, buffer_bytes or max_request_bytes", .{i});
+        }
+        if (b.nats) |n| {
+            if (comptime !features.nats) return fail(why, "brokers[{d}].nats: NATS is not built in (-Dnats)", .{i});
+            const logins = @as(u8, @intFromBool(n.token != null)) + @intFromBool(n.user != null or n.password != null) +
+                @intFromBool(n.nkey_seed != null or n.nkey_seed_file != null) + @intFromBool(n.creds != null or n.creds_file != null);
+            if (logins > 1) return fail(why, "brokers[{d}].nats: exactly one of token, user/password, nkey_seed(_file), creds(_file)", .{i});
+            if ((n.user == null) != (n.password == null)) return fail(why, "brokers[{d}].nats: user and password go together", .{i});
+            if (n.nkey_seed != null and n.nkey_seed_file != null) return fail(why, "brokers[{d}].nats: nkey_seed or nkey_seed_file, not both", .{i});
+            if (n.creds != null and n.creds_file != null) return fail(why, "brokers[{d}].nats: creds or creds_file, not both", .{i});
+            if (n.ca_file != null and n.ca_pem != null) return fail(why, "brokers[{d}].nats: ca_file or ca_pem, not both", .{i});
+            try checkClientCert(n, "brokers", "nats", i, why);
+            if (!std.mem.eql(u8, n.connections, "one") and !std.mem.eql(u8, n.connections, "per_executor"))
+                return fail(why, "brokers[{d}].nats.connections: \"one\" or \"per_executor\"", .{i});
+            for (n.jetstream.streams, 0..) |s, j| {
+                if (s.name.len == 0) return fail(why, "brokers[{d}].nats.jetstream.streams[{d}].name: required", .{ i, j });
+                if (!oneOf(s.retention, &.{ "limits", "interest", "workqueue" })) return fail(why, "brokers[{d}].nats.jetstream.streams[{d}].retention: limits, interest or workqueue", .{ i, j });
+                if (!oneOf(s.storage, &.{ "file", "memory" })) return fail(why, "brokers[{d}].nats.jetstream.streams[{d}].storage: file or memory", .{ i, j });
+            }
+            for (n.jetstream.consumers, 0..) |k, j| {
+                if (k.stream.len == 0 or k.durable.len == 0) return fail(why, "brokers[{d}].nats.jetstream.consumers[{d}]: stream and durable are required", .{ i, j });
+                if (!oneOf(k.deliver_policy, &.{ "all", "last", "new", "last_per_subject" })) return fail(why, "brokers[{d}].nats.jetstream.consumers[{d}].deliver_policy: all, last, new or last_per_subject", .{ i, j });
+            }
         }
     }
     if (cfg.observe.health) |h| {
@@ -802,13 +1080,18 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
 
 /// The client certificate and key of a database: files or text, a
 /// certificate with its key, and not with `insecure_skip_verify` and a CA.
-fn checkClientCert(c: anytype, comptime kind: []const u8, i: usize, why: *std.Io.Writer) Problem!void {
+fn checkClientCert(c: anytype, comptime root: []const u8, comptime kind: []const u8, i: usize, why: *std.Io.Writer) Problem!void {
     const files = c.client_cert_file != null or c.client_key_file != null;
     const pem = c.client_cert_pem != null or c.client_key_pem != null;
-    if (files and pem) return fail(why, "databases[{d}]." ++ kind ++ ": client_cert_file/client_key_file or client_cert_pem/client_key_pem, not both", .{i});
-    if (files and (c.client_cert_file == null or c.client_key_file == null)) return fail(why, "databases[{d}]." ++ kind ++ ": client_cert_file and client_key_file go together", .{i});
-    if (pem and (c.client_cert_pem == null or c.client_key_pem == null)) return fail(why, "databases[{d}]." ++ kind ++ ": client_cert_pem and client_key_pem go together", .{i});
-    if (c.insecure_skip_verify and (c.ca_file != null or c.ca_pem != null)) return fail(why, "databases[{d}]." ++ kind ++ ": insecure_skip_verify cannot be set with a CA", .{i});
+    if (files and pem) return fail(why, root ++ "[{d}]." ++ kind ++ ": client_cert_file/client_key_file or client_cert_pem/client_key_pem, not both", .{i});
+    if (files and (c.client_cert_file == null or c.client_key_file == null)) return fail(why, root ++ "[{d}]." ++ kind ++ ": client_cert_file and client_key_file go together", .{i});
+    if (pem and (c.client_cert_pem == null or c.client_key_pem == null)) return fail(why, root ++ "[{d}]." ++ kind ++ ": client_cert_pem and client_key_pem go together", .{i});
+    if (c.insecure_skip_verify and (c.ca_file != null or c.ca_pem != null)) return fail(why, root ++ "[{d}]." ++ kind ++ ": insecure_skip_verify cannot be set with a CA", .{i});
+}
+
+fn oneOf(value: []const u8, comptime options: []const []const u8) bool {
+    inline for (options) |o| if (std.mem.eql(u8, value, o)) return true;
+    return false;
 }
 
 fn checkGrpc(g: Config.Grpc, why: *std.Io.Writer) Problem!void {
@@ -907,6 +1190,7 @@ pub fn middleware(app: *anole.App, arena: std.mem.Allocator, m: Config.Middlewar
         .request_id => |c| return app.middleware(http.middleware.RequestId.init(.{ .header = c.header, .trust_incoming = c.trust_incoming })),
         .access_log => |c| return app.middleware(anole.observe.AccessLog.init(.{
             .format = switch (c.format) {
+                .auto => null,
                 .text => .text,
                 .json => .json,
             },
@@ -1051,7 +1335,9 @@ test "parse: the defaults, a full document, and what is refused" {
         "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"require\"}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"request\", \"client_ca_file\": \"a\", \"client_ca_pem\": \"b\"}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_ca_pem\": \"b\"}}]}",
-        "{\"listeners\": [{\"proxy_protocol_from\": [\"10.0.0.0/8\"]}]}",
+        "{\"listeners\": [{\"proxy_protocol\": false, \"proxy_protocol_from\": [\"10.0.0.0/8\"]}]}",
+        "{\"deployment\": \"cloud\"}",
+        "{\"environment\": \"staging\"}",
     };
     for (bad) |doc| {
         why.end = 0;
@@ -1226,3 +1512,46 @@ const SchemaCheck = struct {
         }
     }
 };
+
+test "config: modes keys" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [400]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    const c = try parse(a,
+        \\{"environment": "development", "deployment": "behind_proxy", "error_detail": false,
+        \\ "proxy": {"trusted": ["private", "203.0.113.7"]},
+        \\ "listeners": [{"proxy_protocol_from": ["10.0.0.0/8"]}, {"port": 0}]}
+    , &why);
+    try std.testing.expectEqual(anole.Environment.development, c.environment.?);
+    try std.testing.expectEqual(anole.Deployment.behind_proxy, c.deployment.?);
+    try std.testing.expectEqual(false, c.error_detail.?);
+    try std.testing.expectEqual(@as(usize, 2), c.proxy.trusted.?.len);
+    try std.testing.expect(c.listeners[0].address == null and c.listeners[0].port == null and c.listeners[0].proxy_protocol == null);
+    try std.testing.expectEqual(@as(?u16, 0), c.listeners[1].port);
+    const d = try parse(a, "{}", &why);
+    try std.testing.expect(d.environment == null and d.deployment == null and d.error_detail == null);
+    try std.testing.expectEqual(@as(?u32, 75_000), d.timeouts.keepalive_ms);
+}
+
+test "config: log.format and log.service parse; the access log's format defaults to auto" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [400]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    const c = try parse(a,
+        \\{"log": {"format": "json", "service": "api"}, "banner": true,
+        \\ "middleware": [{"access_log": {}}, {"access_log": {"format": "text"}}]}
+    , &why);
+    try std.testing.expectEqual(anole.log.Format.json, c.log.format);
+    try std.testing.expectEqualStrings("api", c.log.service.?);
+    try std.testing.expect(c.banner);
+    try std.testing.expect(c.middleware[0].access_log.format == .auto);
+    try std.testing.expect(c.middleware[1].access_log.format == .text);
+    const d = try parse(a, "{}", &why);
+    try std.testing.expectEqual(anole.log.Format.auto, d.log.format);
+    try std.testing.expect(d.log.service == null and !d.banner);
+    try std.testing.expect(std.mem.indexOf(u8, @import("anole_capi_schema").text, "\"log\"") != null);
+}

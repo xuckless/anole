@@ -144,6 +144,9 @@ pub const ClientConnection = struct {
     /// The connection is going or gone: no new streams. A GOAWAY sets it,
     /// and the streams it covers carry on.
     closing: bool = false,
+    /// The last stream ID the server's GOAWAY says it may have processed;
+    /// above it, a stream never ran (`Stream.unprocessed`).
+    goaway_last_id: i32 = std.math.maxInt(i32),
     /// The session is over: the reader has ended or a write failed. From
     /// here nothing calls into nghttp2 but `close`, so no callback can
     /// reach a stream any more.
@@ -546,6 +549,7 @@ pub const ClientConnection = struct {
             // Streams above the last one taken never ran; nghttp2 closes
             // them. No new ones from here.
             self.closing = true;
+            self.goaway_last_id = frame.*.goaway.last_stream_id;
             return 0;
         }
         const stream = streamFrom(session, hd.stream_id) orelse return 0;
@@ -715,6 +719,15 @@ pub const Stream = struct {
         conn.live.remove(&self.node);
         self.arena.deinit();
         conn.gpa.destroy(self);
+    }
+
+    /// True when the server provably did not process the request: it
+    /// refused the stream (REFUSED_STREAM) or its GOAWAY's last stream ID
+    /// is below this stream's. Such a request can be sent again on another
+    /// connection whatever its method.
+    pub fn unprocessed(self: *const Stream) bool {
+        if (self.error_code == c.NGHTTP2_REFUSED_STREAM) return true;
+        return self.id > self.conn.goaway_last_id and !self.head_ready;
     }
 
     /// Waits for the response head (`status`, `headers`).

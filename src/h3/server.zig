@@ -59,6 +59,7 @@ const wallClock = net.wallClock;
 const c = ngtcp2.c;
 const h = nghttp3.c;
 const placement = dusty.placement;
+const gauges = dusty.gauges;
 
 const log = std.log.scoped(.anole_h3);
 
@@ -1274,7 +1275,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// it ends as any other does, once they have.
         fn giveUp(self: *Self, conn: *Conn) void {
             if (conn.tasks.load(.acquire) == 0) return conn.destroy();
-            if (builtin.is_test) _ = self.test_given_up_with_tasks.fetchAdd(1, .monotonic);
+            if (builtin.is_test) _ = self.test_given_up_with_tasks.fetchAdd(1, .release);
             conn.retired = true;
             placement.concurrent(&self.finishers, self.io, .local, Conn.finishTask, .{conn}) catch conn.finish();
         }
@@ -1518,6 +1519,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const gpa = conn.ep.gpa;
                 for (conn.hq_streams.values()) |hs| hs.free(gpa);
                 conn.hq_streams.deinit(gpa);
+                gauges.add(conn.ep.io, .h3_streams, -@as(i64, @intCast(conn.streams.count())));
                 for (conn.streams.values()) |s| s.free();
                 conn.streams.deinit(gpa);
                 conn.ready.deinit(gpa);
@@ -2348,7 +2350,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 }
                 if (s.refs.quic or s.refs.handler) return;
                 const conn = s.conn;
-                _ = conn.streams.swapRemove(s.id);
+                if (conn.streams.swapRemove(s.id)) gauges.add(conn.ep.io, .h3_streams, -1);
                 // The client may open another request only now: one it
                 // reset still counts while its handler runs.
                 _ = c.ngtcp2_conn_extend_max_streams_bidi(conn.q, 1);
@@ -2487,7 +2489,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                     ._drain_hooks = &server.drain_hooks,
                     ._timeout_context = if (inline_mode) null else &timer,
                     ._set_timeout = if (inline_mode) null else setTimeout,
+                    // Its entry table is never read past `len`: not zeroed.
+                    .session = undefined,
                 };
+                request.session._empty();
                 const body_reader = &ex.body_reader;
                 body_reader.* = .init(s);
                 request._body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
@@ -3184,7 +3189,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (conn.hq) return conn.hqRecv(flags, stream_id, bytes);
             const rv = bridge.recvStreamData(conn.side(), flags, stream_id, offset, bytes);
             // A bidirectional stream WebTransport took is no request.
-            if (conn.wt) |w| if (w.owns(stream_id)) if (conn.streams.fetchSwapRemove(stream_id)) |e| e.value.free();
+            if (conn.wt) |w| if (w.owns(stream_id)) if (conn.streams.fetchSwapRemove(stream_id)) |e| {
+                e.value.free();
+                gauges.add(conn.ep.io, .h3_streams, -1);
+            };
             return rv;
         }
 
@@ -3227,6 +3235,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.free();
                 return c.NGTCP2_ERR_CALLBACK_FAILURE;
             };
+            gauges.add(conn.ep.io, .h3_streams, 1);
             return 0;
         }
 

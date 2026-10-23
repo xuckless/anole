@@ -65,11 +65,13 @@
 //!   HTTP/2 reset, `QueryOptions.timeout`) sends a CancelRequest so the
 //!   server stops the statement, and the connection is closed.
 const std = @import("std");
+const builtin = @import("builtin");
 const features = @import("build_options");
 const dusty = @import("dusty");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
 const observe = @import("../observe/root.zig");
+const resilience = @import("../resilience/root.zig");
 
 /// pg.zig itself (xuckless/pg.zig), for `acquire`'s connection, its
 /// types (`Numeric`, `Cidr`) and `listener`.
@@ -133,6 +135,11 @@ pub const Options = struct {
     application_name: ?[]const u8 = null,
     /// What `/readyz` waits for the database's answer.
     ping_timeout: Duration = .fromSeconds(2),
+    /// Fails calls fast (503, `lastError` code "circuit_open") after the
+    /// server could not be reached repeatedly; null: never.
+    breaker: ?resilience.Breaker.Options = .{},
+    /// What `with(.{ .retry = true })` retries with.
+    retry: resilience.Retry = .{ .attempts = 3, .backoff = .{ .base = .fromMilliseconds(50), .max = .fromSeconds(1) } },
     /// A bound on every call that has no `QueryOptions.timeout` of its own,
     /// in a request or not; past it the call is canceled and fails with
     /// `error.GatewayTimeout`. A request's deadline applies too, whichever
@@ -449,7 +456,24 @@ const Shard = struct {
 const Lease = struct {
     shard: *Shard,
     conn: *pg.Conn,
+    /// Taken idle from the pool, not dialed for this call: the server may
+    /// have closed it while it waited.
+    reused: bool = false,
+    /// `conn.bytesSent()` when it was taken: unchanged after a failure,
+    /// nothing of the call reached the server.
+    sent: u64 = 0,
+
+    /// Whether a call on this lease that failed with a broken connection
+    /// can run once more on another, transparently: the connection came
+    /// idle from the pool and not one byte of the call left on it.
+    fn untouched(self: Lease) bool {
+        return self.reused and self.conn.bytesSent() == self.sent;
+    }
 };
+
+/// Tests only: runs on every connection `takeFrom` hands out (to break it
+/// before the call writes).
+pub var test_after_take: if (builtin.is_test) ?*const fn (*pg.Conn) void else void = if (builtin.is_test) null else {};
 
 /// A PostgreSQL database: the handle in the App state. Its calls take the
 /// request (or an `anole.db.Ctx`) first; see `anole.db`.
@@ -464,6 +488,8 @@ pub const Client = struct {
     settings: Settings,
     pools: internal.PerExecutor(Shard),
     errors: db.ErrorMap,
+    /// The breaker and the retry policy (`Options.breaker`, `Options.retry`).
+    guard: internal.Guard,
     observer: db.Observer,
     readiness: db.Readiness,
     acquire_timeout: Duration,
@@ -501,6 +527,7 @@ pub const Client = struct {
             .settings = undefined,
             .pools = undefined,
             .errors = opts.errors,
+            .guard = try .init(.postgresql, name, opts.breaker, opts.retry),
             .observer = .{ .system = .postgresql, .name = name },
             .readiness = .{ .io = io, .context = self, .ping = ping },
             .acquire_timeout = opts.acquire_timeout,
@@ -633,6 +660,7 @@ pub const Client = struct {
         const gpa = self.gpa;
         // First: a statement still running for the cache holds a connection.
         self.cache.deinit();
+        self.guard.deinit();
         for (self.pools.pools) |*shard| shard.pool.deinit();
         self.pools.deinit(gpa);
         if (comptime has_tls) self.freeTls();
@@ -657,6 +685,7 @@ pub const Client = struct {
     /// a connection per executor and fails if one cannot.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
         self.observer = try .init(.postgresql, self.name, registry, tracer);
+        try self.guard.observe(self.gpa, registry);
         try self.cache.observe(registry);
         if (health) |h| try self.readiness.register(h, self.name);
         if (!self.connect_at_start) return;
@@ -721,7 +750,7 @@ pub const Client = struct {
         var tx: Tx = .{ .db = self, .io = c.io, .lease = undefined, .deadline = deadline };
         var buf: [96]u8 = undefined;
         const sql = beginSql(&buf, opts);
-        tx.lease = try self.call(c, null, &tx, sql, Begin{});
+        tx.lease = try self.call(c, null, false, &tx, sql, Begin{});
         return tx;
     }
 
@@ -822,7 +851,7 @@ pub const Client = struct {
     /// Runs `job` (a struct with `Out` and `run`) as one database call:
     /// observed (metrics, a span), bounded by `timeout` or the
     /// transaction's deadline, its error narrowed to `Error`.
-    fn call(self: *Client, c: anytype, timeout: ?Duration, tx: ?*Tx, sql: []const u8, job: anytype) Error!@TypeOf(job).Out {
+    fn call(self: *Client, c: anytype, timeout: ?Duration, retry: bool, tx: ?*Tx, sql: []const u8, job: anytype) Error!@TypeOf(job).Out {
         var ctx = erase(c);
         var j = job;
         const J = @TypeOf(j);
@@ -833,12 +862,35 @@ pub const Client = struct {
             t.deadline
         else
             null;
-        const result = self.guarded(&ctx, deadline, J.run, .{ &j, self, &ctx, tx, sql });
+        const deadline_ts: ?std.Io.Clock.Timestamp = if (deadline) |d| switch (d.timeout) {
+            .deadline => |ts| ts,
+            else => null,
+        } else null;
+        const result = internal.guarded(&ctx, &self.guard, self.errors, retry and tx == null, deadline_ts, boundedRun(J), .{ self, &ctx, deadline, &j, tx, sql });
         var op: [16]u8 = undefined;
         const failure: ?anyerror = if (result) |_| null else |e| e;
         // A span when the call came from a traced request.
         if (ctx.request) |req| observed.end(req, operation(&op, sql), null, failure) else observed.end(&ctx, operation(&op, sql), null, failure);
         return result catch |err| self.narrow(&ctx, err);
+    }
+
+    /// One attempt of a job under the call's deadline (`guarded`).
+    fn boundedRun(comptime J: type) fn (*Client, *Ctx, ?dusty.Deadline, *J, ?*Tx, []const u8) internal.Bounded(J.run) {
+        return struct {
+            fn run(self: *Client, ctx: *Ctx, deadline: ?dusty.Deadline, j: *J, tx: ?*Tx, sql: []const u8) internal.Bounded(J.run) {
+                const first = self.guarded(ctx, deadline, J.run, .{ j, self, ctx, tx, sql });
+                // A statement outside a transaction that failed on a
+                // connection taken idle from the pool (the server closed it
+                // while it waited) before one byte of it was sent did not
+                // run: once more on another, outside the retry policy.
+                if (tx == null) if (first) |_| {} else |_| {
+                    const d = ctx.lastDetail() orelse return first;
+                    if (!std.mem.eql(u8, d.code, write_failed_code)) return first;
+                    return self.guarded(ctx, deadline, J.run, .{ j, self, ctx, tx, sql });
+                };
+                return first;
+            }
+        }.run;
     }
 
     /// `func(args...)` before `deadline`, as `internal.bounded` (whose
@@ -880,7 +932,11 @@ pub const Client = struct {
         const conn = got catch |err| return self.unavailable(ctx, shard, err, refused.err);
         self.observer.acquired(started.durationTo(.now(io, .awake)).raw);
         self.report(shard);
-        return .{ .shard = shard, .conn = conn };
+        // Opened before this call asked: it waited idle in the pool.
+        const reused = conn._opened_at.nanoseconds < started.raw.nanoseconds;
+        const lease: Lease = .{ .shard = shard, .conn = conn, .reused = reused, .sent = conn.bytesSent() };
+        if (builtin.is_test) if (test_after_take) |f| f(conn);
+        return lease;
     }
 
     /// Why no connection could be had, as `ServiceUnavailable`.
@@ -889,7 +945,12 @@ pub const Client = struct {
         switch (err) {
             error.Canceled => return error.Canceled,
             error.OutOfMemory => return error.OutOfMemory,
-            error.Timeout => return ctx.failf(self.errors, .unavailable, "no connection within {d} ms: all {d} of this executor's connections were busy, or the server did not answer", .{ millis(self.acquire_timeout), shard.pool._conns.len }),
+            error.Timeout => {
+                // All busy: local overload, not a down server (the breaker ignores it).
+                const busy = shard.pool.stats().available == 0 and shard.pool.stats().in_use > 0;
+                const message = std.fmt.allocPrint(ctx.arena, "no connection within {d} ms: all {d} of this executor's connections were busy, or the server did not answer", .{ millis(self.acquire_timeout), shard.pool._conns.len }) catch "no connection within the acquire timeout";
+                return ctx.fail(self.errors, .{ .system = .postgresql, .class = .unavailable, .code = if (busy) "pool_timeout" else "", .message = message });
+            },
             error.PG => {
                 const e = refused orelse return ctx.failf(self.errors, .unavailable, "{f} refused the connection", .{s.*});
                 return ctx.fail(self.errors, .{ .system = .postgresql, .class = .unavailable, .code = e.code, .message = e.message });
@@ -958,7 +1019,20 @@ pub const Client = struct {
                     .message = "current transaction is aborted, commands ignored until end of transaction block",
                 });
                 if (tx) |t| t.state = .broken;
-                if (brokenConnection(err)) return ctx.failf(self.errors, .unavailable, "the connection to {f} broke: {t}", .{ self.settings, err });
+                if (brokenConnection(err)) {
+                    // Broken before one byte of the call left a connection
+                    // that waited idle in the pool: the server never saw the
+                    // statement (`boundedRun` runs it once more, transparently).
+                    // Once anything was sent it may have run, and a second
+                    // run could repeat an INSERT.
+                    const code: []const u8 = if (tx == null and lease.untouched()) write_failed_code else "";
+                    return ctx.fail(self.errors, .{
+                        .system = .postgresql,
+                        .class = .unavailable,
+                        .code = code,
+                        .message = std.fmt.allocPrint(ctx.arena, "the connection to {f} broke: {t}", .{ self.settings, err }) catch "the connection broke",
+                    });
+                }
                 return ctx.failf(self.errors, .other, "{t}", .{err});
             },
         }
@@ -1020,9 +1094,15 @@ fn sendCancel(io: std.Io, conn: *pg.Conn) void {
     deadline.run(pg.Conn.cancel, .{conn}) catch |err| log.debug("postgres: CancelRequest: {t}", .{err});
 }
 
+/// The error code of a call that broke before sending anything on a
+/// connection taken idle from the pool (see `Client.failed`, `Lease.untouched`).
+const write_failed_code = "connection_write_failed";
+
 fn brokenConnection(err: anyerror) bool {
     return switch (err) {
-        error.EndOfStream, error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.ConnectionTimedOut, error.Timeout, error.NotOpenForReading, error.TlsReadFailed, error.TlsWriteFailed, error.UnexpectedDBMessage, error.ConnectionBusy, error.InvalidMessageLength, error.InvalidDataRow, error.SessionResetFailed => true,
+        // SocketUnconnected: std's name for a send on a socket whose
+        // sending side is shut (EPIPE)
+        error.EndOfStream, error.Closed, error.ConnectionResetByPeer, error.BrokenPipe, error.SocketUnconnected, error.ConnectionTimedOut, error.Timeout, error.NotOpenForReading, error.TlsReadFailed, error.TlsWriteFailed, error.UnexpectedDBMessage, error.ConnectionBusy, error.InvalidMessageLength, error.InvalidDataRow, error.SessionResetFailed => true,
         else => false,
     };
 }
@@ -1084,7 +1164,7 @@ pub const Query = struct {
 
     /// `Client.exec`, with the options' `timeout` and `prepare`.
     pub fn exec(self: Query, c: anytype, sql: []const u8, args: anytype) Error!u64 {
-        return self.db.call(c, internal.callTimeout(self.opts.timeout, self.db.timeout), null, sql, Exec(@TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.db.call(c, internal.callTimeout(self.opts.timeout, self.db.timeout), self.opts.retry, null, sql, Exec(@TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
 
     // The reads go through the cache, which shares them when `opts`
@@ -1108,7 +1188,7 @@ pub const Query = struct {
     /// The timeout bounds the statement until its first rows; reading the
     /// rest is the caller's.
     pub fn iterate(self: Query, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
-        return self.db.call(c, internal.callTimeout(self.opts.timeout, self.db.timeout), null, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.db.call(c, internal.callTimeout(self.opts.timeout, self.db.timeout), self.opts.retry, null, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
 
     /// Every row, with columns and parameters known only at run time
@@ -1127,7 +1207,7 @@ pub const Query = struct {
     /// changed (`last_insert_rowid` is 0: use `RETURNING` with `table`).
     /// Without parameters, several statements may go in one call.
     pub fn execValues(self: Query, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
-        return self.db.call(c, internal.callTimeout(self.opts.timeout, self.db.timeout), null, sql, RunJob{ .values = values, .prepare = self.opts.prepare });
+        return self.db.call(c, internal.callTimeout(self.opts.timeout, self.db.timeout), self.opts.retry, null, sql, RunJob{ .values = values, .prepare = self.opts.prepare });
     }
 };
 
@@ -1138,7 +1218,7 @@ const TableRead = struct {
 
     pub fn run(r: TableRead, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Table {
         const q = r.query;
-        return q.db.call(c, internal.callTimeout(q.opts.timeout, q.db.timeout), null, sql, TableJob{ .values = values, .prepare = q.opts.prepare });
+        return q.db.call(c, internal.callTimeout(q.opts.timeout, q.db.timeout), q.opts.retry, null, sql, TableJob{ .values = values, .prepare = q.opts.prepare });
     }
 };
 
@@ -1152,7 +1232,7 @@ fn Read(comptime T: type, comptime mode: Mode) type {
 
         pub fn run(r: @This(), c: anytype, sql: []const u8, args: anytype) Error!Fetch(T, mode, @TypeOf(args)).Out {
             const q = r.query;
-            return q.db.call(c, internal.callTimeout(q.opts.timeout, q.db.timeout), null, sql, Fetch(T, mode, @TypeOf(args)){ .args = args, .prepare = q.opts.prepare });
+            return q.db.call(c, internal.callTimeout(q.opts.timeout, q.db.timeout), q.opts.retry, null, sql, Fetch(T, mode, @TypeOf(args)){ .args = args, .prepare = q.opts.prepare });
         }
     };
 }
@@ -1225,7 +1305,7 @@ pub const Tx = struct {
             var ctx = erase(c);
             return ctx.failf(self.db.errors, .other, "the transaction had failed, so it was rolled back instead of committed", .{});
         }
-        _ = try self.db.call(c, null, self, "COMMIT", Exec(@TypeOf(.{})){ .args = .{}, .prepare = false });
+        _ = try self.db.call(c, null, false, self, "COMMIT", Exec(@TypeOf(.{})){ .args = .{}, .prepare = false });
         self.state = .done;
     }
 
@@ -1233,7 +1313,7 @@ pub const Tx = struct {
     /// ran; call it for the error a failed rollback returns.
     pub fn rollback(self: *Tx, c: anytype) Error!void {
         try self.usable(c);
-        _ = try self.db.call(c, null, self, "ROLLBACK", Rollback{});
+        _ = try self.db.call(c, null, false, self, "ROLLBACK", Rollback{});
         self.state = .done;
     }
 
@@ -1289,37 +1369,37 @@ pub const TxQuery = struct {
 
     pub fn exec(self: TxQuery, c: anytype, sql: []const u8, args: anytype) Error!u64 {
         const t = try self.ready(c);
-        return self.tx.db.call(c, t, self.tx, sql, Exec(@TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.tx.db.call(c, t, false, self.tx, sql, Exec(@TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
 
     pub fn one(self: TxQuery, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!T {
         const t = try self.ready(c);
-        return self.tx.db.call(c, t, self.tx, sql, Fetch(T, .one, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.tx.db.call(c, t, false, self.tx, sql, Fetch(T, .one, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
 
     pub fn optional(self: TxQuery, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!?T {
         const t = try self.ready(c);
-        return self.tx.db.call(c, t, self.tx, sql, Fetch(T, .optional, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.tx.db.call(c, t, false, self.tx, sql, Fetch(T, .optional, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
 
     pub fn all(self: TxQuery, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error![]T {
         const t = try self.ready(c);
-        return self.tx.db.call(c, t, self.tx, sql, Fetch(T, .all, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.tx.db.call(c, t, false, self.tx, sql, Fetch(T, .all, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
 
     pub fn iterate(self: TxQuery, comptime T: type, c: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
         const t = try self.ready(c);
-        return self.tx.db.call(c, t, self.tx, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
+        return self.tx.db.call(c, t, false, self.tx, sql, Fetch(T, .iterate, @TypeOf(args)){ .args = args, .prepare = self.opts.prepare });
     }
 
     pub fn table(self: TxQuery, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Table {
         const t = try self.ready(c);
-        return self.tx.db.call(c, t, self.tx, sql, TableJob{ .values = values, .prepare = self.opts.prepare });
+        return self.tx.db.call(c, t, false, self.tx, sql, TableJob{ .values = values, .prepare = self.opts.prepare });
     }
 
     pub fn execValues(self: TxQuery, c: anytype, sql: []const u8, values: []const db.Value) Error!db.Changes {
         const t = try self.ready(c);
-        return self.tx.db.call(c, t, self.tx, sql, RunJob{ .values = values, .prepare = self.opts.prepare });
+        return self.tx.db.call(c, t, false, self.tx, sql, RunJob{ .values = values, .prepare = self.opts.prepare });
     }
 };
 
@@ -1829,9 +1909,15 @@ const Ctx = struct {
     any: *anyopaque,
     record: *const fn (any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error,
     request: ?*const dusty.Request,
+    last: *const fn (any: *anyopaque) ?db.ErrorDetail,
+
+    /// The last error recorded on the context it stands for.
+    pub fn lastDetail(self: *const Ctx) ?db.ErrorDetail {
+        return self.last(self.any);
+    }
 
     /// `internal.fail` on the context it stands for.
-    fn fail(self: *const Ctx, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
+    pub fn fail(self: *const Ctx, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
         return self.record(self.any, map, detail);
     }
 
@@ -1848,8 +1934,11 @@ fn erase(c: anytype) Ctx {
         fn record(any: *anyopaque, map: db.ErrorMap, detail: db.ErrorDetail) db.Error {
             return internal.fail(@as(C, @ptrCast(@alignCast(any))), map, detail);
         }
+        fn last(any: *anyopaque) ?db.ErrorDetail {
+            return internal.lastError(@as(C, @ptrCast(@alignCast(any))));
+        }
     };
-    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .request = internal.requestOf(c) };
+    return .{ .io = c.io, .arena = c.arena, .any = @ptrCast(c), .record = R.record, .last = R.last, .request = internal.requestOf(c) };
 }
 
 // ---------------------------------------------------------------------------

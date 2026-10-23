@@ -243,6 +243,9 @@ pub const ClientConnection = struct {
     timeout: std.Io.Timeout,
     /// The server sent GOAWAY, or `close` began: no new requests.
     closing: bool = false,
+    /// The stream ID of the server's GOAWAY: requests at or above it were
+    /// not processed (`Stream.unprocessed`).
+    goaway_id: i64 = std.math.maxInt(i64),
     last_error: c.ngtcp2_ccerr = undefined,
     /// The reader and the driver.
     group: std.Io.Group = .init,
@@ -1204,7 +1207,10 @@ pub const ClientConnection = struct {
         const self = connOf(user_data);
         if (self.wt) |w| if (w.onReset(stream_id, code)) return 0;
         if (self.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
-        if (streamOfUser(sud)) |s| s.endEarly(error.StreamReset);
+        if (streamOfUser(sud)) |s| {
+            if (s.reset_code == 0) s.reset_code = code;
+            s.endEarly(error.StreamReset);
+        }
         self.kick();
         return 0;
     }
@@ -1251,6 +1257,7 @@ pub const ClientConnection = struct {
         const rv = bridge.closeStream(self.side(), flags, stream_id, rx_code, tx_code);
         if (rv != 0) return rv;
         if (streamOfUser(sud)) |s| {
+            if (s.reset_code == 0) s.reset_code = rx_code;
             s.endEarly(error.StreamReset);
             s.protocol_done = true;
             s.maybeFree();
@@ -1394,9 +1401,10 @@ pub const ClientConnection = struct {
     }
 
     /// GOAWAY: requests already sent below `id` still finish; no new ones.
-    fn onH3Shutdown(_: ?*h.nghttp3_conn, _: i64, user_data: ?*anyopaque) callconv(.c) c_int {
+    fn onH3Shutdown(_: ?*h.nghttp3_conn, id: i64, user_data: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
         self.closing = true;
+        self.goaway_id = id;
         self.kick();
         return 0;
     }
@@ -1446,6 +1454,8 @@ pub const Stream = struct {
     /// (the writing task's).
     read_err: ?StreamError = null,
     write_err: ?StreamError = null,
+    /// The application error code the server reset the stream with (0: none).
+    reset_code: u64 = 0,
 
     /// Response body bytes not yet read.
     body: std.ArrayList(u8) = .empty,
@@ -1539,6 +1549,15 @@ pub const Stream = struct {
     fn addField(self: *Stream, list: *std.ArrayList(Header), name: []const u8, value: []const u8) !void {
         const a = self.arena.allocator();
         try list.append(a, .{ .name = try a.dupe(u8, name), .value = try a.dupe(u8, value) });
+    }
+
+    /// True when the server provably did not process the request: it
+    /// rejected the stream (H3_REQUEST_REJECTED) or its GOAWAY's stream ID
+    /// is at or below this stream's. Such a request can be sent again on
+    /// another connection whatever its method.
+    pub fn unprocessed(self: *const Stream) bool {
+        if (self.reset_code == h.NGHTTP3_H3_REQUEST_REJECTED) return true;
+        return self.id >= self.conn.goaway_id and self.status == 0;
     }
 
     /// Waits for the response head (`status`, `headers`).

@@ -408,7 +408,7 @@ fn authError(self: *const Connection, reply: bson.Document) error{Authentication
 fn newConversation(arena: std.mem.Allocator, io: std.Io, m: scram.Mechanism, c: uri.Credential) !scram.Conversation {
     var random: [24]u8 = undefined;
     io.random(&random);
-    return scram.Conversation.init(arena, m, c.username.?, c.password orelse "", random);
+    return scram.newConversation(arena, m, c.username.?, c.password orelse "", random);
 }
 
 fn appendSaslStart(b: *bson.Builder, arena: std.mem.Allocator, conv: *const scram.Conversation, source: []const u8) !void {

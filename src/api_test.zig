@@ -236,6 +236,7 @@ test "public surface: Request, Response and websocket.Socket expose only the fie
             "host",     "peerCertificate", "setTimeout", "setDeadline", "reader",        "readerLimited", "body",
             "param",    "queryParam",      "bind",       "bindWith",    "json",          "jsonValue",     "jsonObject",
             "setLocal", "local",           "cookies",    "formData",    "multiFormData", "urlUnescape",   "paramDecoded",
+            "bindQuery", "bindPath", "bindHeaders", "violations", "addViolation", "invalid", "log",
         };
         const socket_fields = [_][]const u8{ "io", "max_message_size", "end_error", "close_code", "context", "subprotocol" };
         const socket_decls = [_][]const u8{
@@ -253,6 +254,7 @@ test "public surface: Request, Response and websocket.Socket expose only the fie
             "writer",   "stream",      "clearWriter",     "resetBody",     "json",             "jsonWith",  "fail",
             "render",   "encode",      "print",           "setCookie",     "startEventStream", "canDetach", "isDetached",
             "detach",   "onFinish",    "adopt",           "write",         "memoryBodyLen",    "copyBody",
+            "problem",
         };
         fn listed(comptime list: []const []const u8, name: []const u8) bool {
             for (list) |n| if (std.mem.eql(u8, n, name)) return true;

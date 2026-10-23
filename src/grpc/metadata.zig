@@ -173,14 +173,17 @@ pub fn isTransportHeader(name: []const u8) bool {
 
 /// Whether a handler (Zig `Call.addHeader`/`addTrailer`, or a C ABI consumer)
 /// may send `key`: a valid key that is not the protocols' own: no `grpc-*`
-/// (but `grpc-status-details-bin`, in trailers only), `connect-*`,
+/// (but `grpc-status-details-bin` and `grpc-retry-pushback-ms`, the
+/// server's retry advice (gRPC A6), in trailers only), `connect-*`,
 /// `trailer-*`, and none of the transport's headers (`content-type`, `te`,
 /// `content-length`, `content-encoding`, `accept-encoding`, `connection`,
 /// `keep-alive`, `transfer-encoding`, `upgrade`, `host`).
 pub fn isSendableKey(key: []const u8, place: Place) bool {
     if (!isValidKey(key)) return false;
     if (std.mem.startsWith(u8, key, "grpc-")) {
-        if (!(place == .trailer and std.mem.eql(u8, key, "grpc-status-details-bin"))) return false;
+        const server_trailer = std.mem.eql(u8, key, "grpc-status-details-bin") or
+            std.mem.eql(u8, key, "grpc-retry-pushback-ms");
+        if (!(place == .trailer and server_trailer)) return false;
     }
     if (std.mem.startsWith(u8, key, "connect-") or std.mem.startsWith(u8, key, "trailer-")) return false;
     if (isTransportHeader(key)) return false;
@@ -207,6 +210,8 @@ test "metadata: isSendableKey" {
     try t.expect(!isSendableKey("grpc-status-details-bin", .header));
     try t.expect(isSendableKey("grpc-status-details-bin", .trailer));
     try t.expect(!isSendableKey("grpc-status", .trailer));
+    try t.expect(isSendableKey("grpc-retry-pushback-ms", .trailer));
+    try t.expect(!isSendableKey("grpc-retry-pushback-ms", .header));
     try t.expect(!isSendableKey("connect-x", .header));
     try t.expect(!isSendableKey("trailer-x", .trailer));
     try t.expect(!isSendableKey("X-Upper", .header));

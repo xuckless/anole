@@ -121,8 +121,11 @@ test "access log: text and JSON lines" {
     req.trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
     req.span_id = "00f067aa0ba902b7";
     const json = try observe.access_log.format(arena_state.allocator(), .json, &req, 200, 42, 1700000000000, null);
-    try std.testing.expect(std.mem.startsWith(u8, json, "{\"ts\":1700000000000,\"method\":\"GET\",\"path\":\"/a\\\"b\",\"status\":200,\"duration_us\":42,"));
-    try std.testing.expect(std.mem.endsWith(u8, json, "\"request_id\":\"rid\",\"trace_id\":\"4bf92f3577b34da6a3ce929d0e0e4736\",\"span_id\":\"00f067aa0ba902b7\"}\n"));
+    // The shared record: time, level, scope, message, the ids, then the request.
+    try std.testing.expect(std.mem.startsWith(u8, json, "{\"time\":\"2023-11-14T22:13:20.000Z\",\"level\":\"info\",\"scope\":\"access\",\"message\":\"GET /a\\\"b 200\","));
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"request_id\":\"rid\",\"trace_id\":\"4bf92f3577b34da6a3ce929d0e0e4736\",\"span_id\":\"00f067aa0ba902b7\",\"method\":\"GET\",\"path\":\"/a\\\"b\",\"status\":200,\"duration_us\":42,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"ts\"") == null);
+    try std.testing.expect(std.mem.endsWith(u8, json, "}\n"));
     const text = try observe.access_log.format(arena_state.allocator(), .text, &req, 404, 7, 0, null);
     try std.testing.expect(std.mem.startsWith(u8, text, "GET /a\"b 404 7us "));
 }
@@ -397,4 +400,45 @@ test "tracing: OTEL_SERVICE_NAME from the process environment without .process" 
     defer app.deinit();
     const exporter = try app.tracing(.{ .endpoint = "http://127.0.0.1:9", .interval = .fromSeconds(60) });
     try std.testing.expectEqualStrings("from-the-environment", exporter.options.service_name);
+}
+
+test "observe: runtime gauges appear on /metrics" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var registry = observe.metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    registry.runtime_gauges = true;
+
+    var app = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer app.deinit();
+    registry.serveOn(void, &app.router, "/metrics");
+    var app_future = try io.concurrent(serve, .{&app});
+    defer app_future.cancel(io) catch {};
+    try app.waitReady(io);
+
+    var out: [16384]u8 = undefined;
+    const metrics = try get(io, app.address.ip.getPort(), "GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_connections{executor=\"0\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_streams{executor=\"0\",protocol=\"h2\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_runtime_tasks{executor=\"0\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_runtime_run_queue{executor=\"0\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics, "anole_runtime_stack_committed_bytes ") != null);
+}
+
+test "formatLine json: the shared record shape, no ts" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var req: dusty.Request = .{ .arena = arena, ._parser = undefined, ._transport = undefined };
+    req.method = .get;
+    req.url = "/users/42";
+    const json = try observe.access_log.format(arena, .json, &req, 500, 9, 0, error.Boom);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    try std.testing.expectEqualStrings("access", parsed.object.get("scope").?.string);
+    try std.testing.expectEqualStrings("GET /users/42 500", parsed.object.get("message").?.string);
+    try std.testing.expectEqualStrings("Boom", parsed.object.get("error").?.string);
+    try std.testing.expect(parsed.object.get("request_id") == null);
 }

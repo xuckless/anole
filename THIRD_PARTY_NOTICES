@@ -13,7 +13,7 @@ attribution header and are listed in part B; that includes the HTTP core
 Which components end up in a binary depends on the build flags:
 `-Dprofile=minimal` links only zio, the HTTP core and llhttp;
 `-Dtls=boringssl` adds BoringSSL; `-Dhttp2` adds nghttp2; `-Dhttp3` adds
-ngtcp2 and nghttp3; `-Dbrotli` adds Brotli; `-Dpostgres` adds pg.zig and
+ngtcp2 and nghttp3; `-Dbrotli` adds Brotli; `-Dkafka` adds lz4; `-Dpostgres` adds pg.zig and
 buffer.zig; `-Dsqlite` adds SQLite and zig-sqlite.
 
 
@@ -98,6 +98,13 @@ zstd 1.5.7 (Zstandard)
   Source:   https://github.com/facebook/zstd (tag archive v1.5.7)
   Linked:   -Dcompression=true
 
+lz4 1.10.0 (LZ4 compression)
+  Licence:  BSD-2-Clause, text in part G (the library under lib/; lz4 is
+            GPL-2.0 for its programs, which Anole does not build).
+            Copyright (c) 2011-2020, Yann Collet
+  Source:   https://github.com/lz4/lz4 (tag archive v1.10.0)
+  Linked:   -Dkafka=true (the Kafka client reads and writes lz4 batches)
+
 Brotli 1.2.0 (Brotli compression)
   Licence:  MIT. Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
   Source:   https://github.com/google/brotli (tag archive v1.2.0)
@@ -147,8 +154,9 @@ pg.zig (PostgreSQL client)
             channel binding, and an optional session reset on release,
             every time or only when the SQL may have changed the session;
             for the C ABI: parameters as a slice of tagged unions, and
-            results in PostgreSQL's text format)
-  Pinned:   commit 6f47a57bd5f7d9e96440526d5b51bd7a043a8203 of the fork
+            results in PostgreSQL's text format; the bytes the socket
+            accepted, so a failed call is run again only when none left)
+  Pinned:   commit 6327fc61f3a3e90aa5b014af21e12bbb073e0fcc of the fork
   Linked:   -Dpostgres=true
 
 buffer.zig (byte buffers; a dependency of pg.zig)
@@ -240,6 +248,18 @@ client, WebSocket, the HTTP/2 server engine, static files, assets)
             https://github.com/xuckless/dusty, commit
             86d152f353c8ec029185e75ce5d2caf8d5756e59 (branch anole)
   Linked:   always
+
+src/nats/core/ (the NATS protocol engine and client: parser, encoder,
+connection, reconnect, subscriptions, requests, drain, its tests and fake
+server)
+  Adapted from zefir's src/nats, with TLS, token/NKey/creds logins,
+  placement on Anole's executors, a non-waiting publish and Anole's own
+  transport; every Zig file carries an attribution header and zefir's licence
+  is src/LICENSE.zefir.
+  Licence:  MIT. Copyright (c) 2026 vkiryakov
+  Source:   https://github.com/vkiryakov/zefir, commit
+            dbcc9677e6364997d1c897dc813985d76504e2b0
+  Linked:   -Dnats=true
 
 src/http/core/llhttp/ (llhttp 9.3.1, the HTTP/1.1 parser, as dusty
 vendored it; its licence is src/http/core/llhttp/LICENSE)
@@ -347,9 +367,64 @@ examples/full/main.zig (wiring)
   Licence:  MIT. Copyright (c) 2025 Lukas Lalinsky and contributors
   Source:   https://github.com/lalinsky/dusty
 
+src/openapi/json.zig, declarations.zig, example.zig, schema.zig, page.zig
+  Adapted from zefir's src/openapi/json.zig, openapi.zig, example.zig,
+  schema.zig and the page part of Docs.zig: the JSON tree and writer (a
+  `ref` node added), the Doc / FieldDoc / Example / MiddlewareDoc
+  declarations (Anole's RouteDoc added, the controller types dropped), values
+  as std.json writes them, schemas of Zig types (one schema per type, as
+  components), and the Scalar page (pinned release, Subresource Integrity).
+  Licence:  MIT (text in part C). Copyright (c) 2026 vkiryakov
+  Source:   https://github.com/vkiryakov/zefir, commit dbcc967
+
+src/grpc/proto/google/api/field_behavior.proto
+  The google.api.field_behavior option (REQUIRED, OUTPUT_ONLY, INPUT_ONLY),
+  for the OpenAPI document; protoc reads it through `addProtoGen`'s include
+  path, beside annotations.proto and http.proto.
+  Licence:  Apache License 2.0 (text in part E). Copyright 2026 Google LLC
+  Source:   https://github.com/googleapis/googleapis (google/api)
+
+src/config/ (typed configuration: anole.config, anole.Secret, the .env parser)
+  Adapted from zefir's confy module (src/confy), with Anole's changes:
+  the Duration type, per-environment defaults, multi-line .env values,
+  the process-wide .env overlay and Anole's API. Every file carries an
+  attribution header; zefir's licence is kept as src/LICENSE.zefir.
+  Licence:  MIT. Copyright (c) 2026 vkiryakov
+  Source:   https://github.com/vkiryakov/zefir, commit dbcc9677
+
+src/console/ui/ctlseqs.zig, keys.zig (the live console's terminal layer)
+  ctlseqs.zig is the subset of libvaxis's control-sequence constants the
+  console uses; the legacy CSI/SS3 key table in keys.zig is adapted from
+  libvaxis's src/Parser.zig. libvaxis is not a dependency: the rest of the
+  terminal layer (raw mode, screen grid, renderer) is Anole's own.
+  src/console/ui/width_table.zig holds character-width ranges derived from
+  Unicode 16.0 EastAsianWidth.txt and emoji-data.txt (Unicode License v3,
+  text at the end of part C).
+  Licence:  MIT (text in part C). Copyright (c) 2023 Tim Culverhouse
+  Source:   https://github.com/rockorager/libvaxis, commit bb94364
+
+src/validate/ (the validator), src/logging/escape.zig, timestamp.zig,
+redact.zig, value.zig, src/http/core/bind.zig, bind_strings.zig,
+bind_violations.zig, json_out.zig
+  Copied or adapted from zefir: the validator verbatim (src/validator/, with
+  three exports added at the end of root.zig), the log escaping, timestamps,
+  redaction and value writer (src/log/), and the request mapping and JSON
+  output of its HTTP module (src/http/input/, src/http/output/). Every file
+  carries an attribution header; zefir's licence is src/LICENSE.zefir.
+  Licence:  MIT (text in part C). Copyright (c) 2026 vkiryakov
+  Source:   https://github.com/vkiryakov/zefir, commit
+            dbcc9677e6364997d1c897dc813985d76504e2b0 (branch dev)
+  Linked:   always (the validator only as far as a program uses it)
+
+src/testing/root.zig
+  Its request, response and stream API follows the shape of zefir's
+  src/http/testing/Backend.zig (no code copied).
 
 C. MIT licence text (applies to every MIT component above)
 -----------------------------------------------------------
+
+zefir (src/config, src/nats/core, src/openapi, src/validate, src/logging, src/http/core/bind*.zig, json_out.zig): Copyright (c) 2026 vkiryakov
+libvaxis (src/console/ui/ctlseqs.zig, keys.zig): Copyright (c) 2023 Tim Culverhouse
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -368,6 +443,47 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+Unicode License v3 (src/console/ui/width_table.zig)
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright (c) 1991-2025 Unicode, Inc.
+
+NOTICE TO USER: Carefully read the following legal agreement. BY
+DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of data files and any associated documentation (the "Data Files") or
+software and any associated documentation (the "Software") to deal in the
+Data Files or Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, and/or sell
+copies of the Data Files or Software, and to permit persons to whom the
+Data Files or Software are furnished to do so, provided that either (a)
+this copyright and permission notice appear with all copies of the Data
+Files or Software, or (b) this copyright and permission notice appear in
+associated Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+THIRD PARTY RIGHTS.
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+FILES OR SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall
+not be used in advertising or otherwise to promote the sale, use or other
+dealings in these Data Files or Software without prior written
+authorization of the copyright holder.
 
 
 D. Zlib licence text (allyourcodebase/boringssl build script, zlib-ng)
@@ -661,6 +777,37 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
 ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
 WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
 DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+G. BSD-2-Clause licence text (lz4)
+----------------------------------
+
+Copied verbatim from the lib/LICENSE file of lz4 1.10.0.
+
+LZ4 Library
+Copyright (c) 2011-2020, Yann Collet
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice, this
+  list of conditions and the following disclaimer in the documentation and/or
+  other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
 ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
 (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
 LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON

@@ -41,6 +41,7 @@ const http = anole.http;
 const zio = anole.zio;
 const placement = dusty.placement;
 const server_mod = @import("../server.zig");
+const modes = @import("../modes.zig");
 const Detached = dusty.Detached;
 const Pipe = pipe_mod.Pipe;
 const Chunk = pipe_mod.Chunk;
@@ -71,6 +72,8 @@ pub const wt = if (features.http3) @import("wt.zig") else struct {
 };
 pub const pipe = pipe_mod;
 pub const db = @import("db.zig");
+pub const nats = @import("nats.zig");
+pub const kafka = @import("kafka.zig");
 pub const config = config_mod;
 
 const log = std.log.scoped(.anole_capi);
@@ -140,6 +143,10 @@ pub const Handle = packed struct(u64) {
         db_tx = 6,
         /// Reserved for a per-query handle.
         db_query = 7,
+        /// A NATS subscription or JetStream consume (`anole_nats_sub`).
+        broker_sub = 8,
+        /// A JetStream message (`anole_nats_msg`).
+        broker_msg = 9,
         _,
     };
 
@@ -444,6 +451,8 @@ pub const Exec = struct {
     grpc: grpc.ExecState = .{},
     wt: wt.ExecState = .{},
     db: db.ExecState = .{},
+    nats: nats.ExecState = .{},
+    kafka: kafka.ExecState = .{},
 
     /// The capi task is asleep for a whole request timeout: wakes it, as a
     /// deadline (or a lost doorbell) now needs watching.
@@ -905,11 +914,15 @@ pub const ListenerState = struct {
 /// Tests: runs inside a control call (drain, reload) once it holds the
 /// server, before it calls into it.
 pub var test_control_hook: ?*const fn () void = null;
+/// Tests only: the environment lookups `create` resolves the modes with.
+pub var _test_vars: ?modes.Vars = null;
 
 pub const Engine = struct {
     arena: std.heap.ArenaAllocator,
     config: Config,
     signals: bool,
+    /// `anole_console_close` is closing the console: no event 132.
+    console_quiet: std.atomic.Value(bool) = .init(false),
     consumers: std.ArrayList(*Consumer) = .empty,
     execs: []Exec = &.{},
     thread: ?std.Thread = null,
@@ -922,6 +935,10 @@ pub const Engine = struct {
     /// (`error.RouteConflict`: the routes).
     start_why: [400]u8 = undefined,
     start_why_len: usize = 0,
+    /// A start that failed, as `errors.explain` says it (the same text the
+    /// log has): what `anole_last_error` shows.
+    explained: [640]u8 = undefined,
+    explained_len: usize = 0,
     stopped: std.Io.Event = .unset,
     /// The server, on the run thread's stack: freed when `run` returns.
     /// Control calls from other threads (`drain`, the reloads) reach it
@@ -938,6 +955,11 @@ pub const Engine = struct {
     io: std.Io = undefined,
     /// The configuration's listeners, in order.
     listeners: []ListenerState = &.{},
+    /// The server's options as the configuration gives them, with the modes
+    /// filled in (`create`); `mainThread` hands them to `App.init`.
+    options: anole.ServerOptions = undefined,
+    /// The environment and deployment, resolved at `create`.
+    resolved: modes.Resolved = undefined,
     /// The listener whose socket could not be bound (a failed start).
     failed_listener: ?usize = null,
     /// Readiness flags of `observe.health.checks` (`anole_server_set_ready`).
@@ -987,6 +1009,12 @@ pub const Engine = struct {
     wt_datagrams_dropped: std.atomic.Value(u64) = .init(0),
     /// The configuration's databases (`anole_db *`).
     dbs: []db.Db = &.{},
+    /// The configuration's brokers (`anole_nats *`), and their handles.
+    brokers: []nats.Broker = &.{},
+    nats_state: nats.State = .{},
+    /// The Kafka ones (`anole_kafka *`), and their handles.
+    kafka_brokers: []kafka.Broker = &.{},
+    kafka_state: kafka.State = .{},
     /// WebSocket topics, shared by every executor.
     rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) .init(gpa, .{}) else {},
     /// gRPC services, methods, descriptors and health.
@@ -1022,8 +1050,28 @@ pub const Engine = struct {
         e.timeouts[0] = if (cfg.timeouts.request_ms) |ms| @as(i96, ms) * std.time.ns_per_ms else no_deadline;
         e.dbs = try a.alloc(db.Db, cfg.databases.len);
         for (e.dbs, cfg.databases) |*d, dc| d.* = .{ .engine = e, .config = dc };
-        e.listeners = try a.alloc(ListenerState, cfg.listeners.len);
-        for (cfg.listeners, e.listeners) |l, *ls| ls.* = try listenerState(a, l);
+        e.brokers = try a.alloc(nats.Broker, cfg.brokers.len);
+        for (e.brokers, cfg.brokers, 0..) |*b, bc, i| b.* = .{ .engine = e, .config = bc, .index = @intCast(i) };
+        e.nats_state.init(e.first_gen);
+        var nkafka: usize = 0;
+        for (cfg.brokers) |bc| nkafka += @intFromBool(bc.kafka != null);
+        e.kafka_brokers = try a.alloc(kafka.Broker, nkafka);
+        var ki: usize = 0;
+        for (cfg.brokers, 0..) |bc, i| if (bc.kafka != null) {
+            e.kafka_brokers[ki] = .{ .engine = e, .config = bc, .index = @intCast(i) };
+            ki += 1;
+        };
+        e.kafka_state.init(e.first_gen);
+        // The modes (docs/config.md): resolved once, here, so a binding sees
+        // $PORT and the filled addresses before it starts.
+        var opts = try e.serverOptions(a);
+        const vars = _test_vars orelse modes.Vars.process;
+        const env_res = try modes.resolveEnvironment(cfg.environment, vars, .abi, why);
+        e.resolved = try modes.resolve(a, &opts, env_res.environment, env_res.source, null, vars, why);
+        try modes.fillListeners(a, &opts, &e.resolved);
+        e.options = opts;
+        e.listeners = try a.alloc(ListenerState, opts.listeners.len);
+        for (opts.listeners, e.listeners) |l, *ls| ls.* = try listenerState(a, l);
         if (cfg.observe.health) |h| {
             e.ready = try a.alloc(std.atomic.Value(bool), h.checks.len);
             for (e.ready) |*r| r.* = .init(false);
@@ -1110,8 +1158,105 @@ pub const Engine = struct {
         // take none.
         if (!e.signals) blockSignals();
         server_mod.failed_listener_index = null;
+        var init_opts = e.options;
+        init_opts._resolved = &e.resolved;
+        var app = anole.App.init(gpa, init_opts) catch |err| return e.failStart(err);
+        e.app = &app;
+        e.io = app.io();
+        const nexec = app.rt.executors.items.len;
+        if (nexec > 256) return e.failStartDeinit(&app, error.TooManyExecutors);
+        // Executor e feeds consumer e mod M: one past the executors would
+        // never get an event.
+        if (e.consumers.items.len > nexec) {
+            var w: std.Io.Writer = .fixed(&e.start_why);
+            w.print("{d} consumers but only {d} executors: consumer {d} would get no events", .{ e.consumers.items.len, nexec, nexec }) catch {};
+            e.start_why_len = w.end;
+            return e.failStartDeinit(&app, error.ConsumerWithoutExecutor);
+        }
+        e.setupExecs(nexec) catch |err| return e.failStartDeinit(&app, err);
+        // The routes come from the configuration: a conflict between them
+        // is ANOLE_E_CONFIG, not a panic in the host process. Those Anole
+        // adds while starting (metrics, health) are checked by `run`.
+        app.router.record_conflicts = true;
+        e.buildRoutes(&app) catch |err| return e.failStartDeinit(&app, err);
+        if (app.router.conflict) |why| {
+            e.setWhy(why);
+            return e.failStartDeinit(&app, error.RouteConflict);
+        }
+        db.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
+        nats.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
+        kafka.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
+        for (e.execs, 0..) |*x, i| placement.concurrent(&e.tasks, app.io(), .{ .executor = i }, capiTask, .{ e, x }) catch |err| {
+            e.tasks.cancel(app.io());
+            return e.failStartDeinit(&app, err);
+        };
+        nats.watchStatus(e, app.io());
+        // The databases connect now (`connect_at_start` included): the
+        // consumers can query before anything listens.
+        app.startConnectors() catch |err| {
+            e.explained_len = app.explainStart(&e.explained, error.DatabaseUnavailable).len;
+            e.tasks.cancel(app.io());
+            db.close(e);
+            nats.close(e);
+            kafka.close(e);
+            return e.failStartDeinit(&app, err);
+        };
+        e.phase.store(.open, .release);
+        e.opened.set(threadedIo());
+        e.go.waitUncancelable(app.io());
+        var result: anyerror!void = {};
+        var watcher: ?std.Io.Future(void) = null;
+        if (!e.abandon.load(.acquire)) {
+            watcher = app.io().concurrent(watchReady, .{ e, &app }) catch |err| {
+                e.tasks.cancel(app.io());
+                db.close(e);
+                nats.close(e);
+                kafka.close(e);
+                return e.failStartDeinit(&app, err);
+            };
+            // Control calls may reach the server from here until `run` returns.
+            _ = e.ctl.fetchAnd(~ctl_closed, .release);
+            e.phase.store(.running, .release);
+            result = app.run();
+        }
+        e.closeControl(app.io());
+        if (watcher) |*w| w.cancel(app.io());
+        e.tasks.cancel(app.io());
+        if (comptime features.websocket) for (e.execs) |*x| x.ws.cancel(app.io());
+        for (e.execs) |*x| x.db.cancel(app.io());
+        for (e.execs) |*x| x.nats.cancel(app.io());
+        for (e.execs) |*x| x.kafka.cancel(app.io());
+        db.close(e);
+        nats.close(e);
+        kafka.close(e);
+        if (result) |_| {} else |err| {
+            if (!e.started.isSet()) {
+                e.explained_len = app.explainStart(&e.explained, err).len;
+                e.noteFailedListener(app.failedListenerIndex(), err);
+                e.start_error = err;
+                e.started.set(threadedIo());
+            } else if (e.start_error == null) log.err("server stopped: {t}", .{err});
+        }
+        e.phase.store(.stopped, .release);
+        for (e.listeners) |*l| {
+            const st = l.state.load(.acquire);
+            if (st == abi.LISTENER_LISTENING or st == abi.LISTENER_PENDING) l.state.store(abi.LISTENER_CLOSED, .release);
+        }
+        e.app = null;
+        app.deinit();
+        if (comptime features.websocket) e.rooms.deinit();
+        // Every consumer hears of the stop (ANOLE_EV_STOPPED).
+        for (e.consumers.items) |c| {
+            c.awake.store(false, .seq_cst);
+            c.wake();
+        }
+        e.stopped.set(threadedIo());
+    }
+
+    /// The server options this configuration describes, with the modes
+    /// still unresolved (`create` fills them).
+    fn serverOptions(e: *Engine, a: std.mem.Allocator) !anole.ServerOptions {
         const cfg = e.config;
-        const a = e.arena.allocator();
         // Anole's own backstop, past the consumer deadline.
         const request: ?std.Io.Duration = if (cfg.timeouts.request_ms) |default_ms| blk: {
             var longest: u32 = default_ms;
@@ -1120,12 +1265,29 @@ pub const Engine = struct {
             };
             break :blk .fromMilliseconds(@as(i64, longest) + 5000);
         } else null;
-        const listeners = buildListeners(a, cfg) catch |err| return e.failStart(err);
-        var app = anole.App.init(gpa, .{
+        const listeners = try buildListeners(a, cfg);
+        return .{
             .listeners = listeners,
             .executors = if (cfg.executors == 0) .auto else .exact(@intCast(cfg.executors)),
             .signals = e.signals,
             .raise_fd_limit = true,
+            .environment = cfg.environment,
+            .deployment = cfg.deployment,
+            .error_detail = cfg.error_detail,
+            .log = .{ .format = cfg.log.format, .service = cfg.log.service },
+            .banner = cfg.banner,
+            .console = .{
+                .enabled = cfg.console.enabled,
+                .name = cfg.console.name,
+                .socket = cfg.console.socket,
+                .allow_restart = cfg.console.allow_restart,
+                .read_only = cfg.console.read_only,
+                .keys = false,
+                .log_buffer = cfg.console.log_buffer,
+                .errors_kept = cfg.console.errors_kept,
+                .max_routes = cfg.console.max_routes,
+            },
+            ._console_runtime = cfg.console.runtime,
             .timeouts = .{
                 .request = request,
                 .read_header = msOrNull(cfg.timeouts.read_header_ms),
@@ -1165,84 +1327,7 @@ pub const Engine = struct {
                 .inline_no_wait = cfg.http3.inline_no_wait,
                 .webtransport = wantsWebTransport(cfg),
             } else null,
-        }) catch |err| return e.failStart(err);
-        e.app = &app;
-        e.io = app.io();
-        const nexec = app.rt.executors.items.len;
-        if (nexec > 256) return e.failStartDeinit(&app, error.TooManyExecutors);
-        // Executor e feeds consumer e mod M: one past the executors would
-        // never get an event.
-        if (e.consumers.items.len > nexec) {
-            var w: std.Io.Writer = .fixed(&e.start_why);
-            w.print("{d} consumers but only {d} executors: consumer {d} would get no events", .{ e.consumers.items.len, nexec, nexec }) catch {};
-            e.start_why_len = w.end;
-            return e.failStartDeinit(&app, error.ConsumerWithoutExecutor);
-        }
-        e.setupExecs(nexec) catch |err| return e.failStartDeinit(&app, err);
-        // The routes come from the configuration: a conflict between them
-        // is ANOLE_E_CONFIG, not a panic in the host process. Those Anole
-        // adds while starting (metrics, health) are checked by `run`.
-        app.router.record_conflicts = true;
-        e.buildRoutes(&app) catch |err| return e.failStartDeinit(&app, err);
-        if (app.router.conflict) |why| {
-            e.setWhy(why);
-            return e.failStartDeinit(&app, error.RouteConflict);
-        }
-        db.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
-        for (e.execs, 0..) |*x, i| placement.concurrent(&e.tasks, app.io(), .{ .executor = i }, capiTask, .{ e, x }) catch |err| {
-            e.tasks.cancel(app.io());
-            return e.failStartDeinit(&app, err);
         };
-        // The databases connect now (`connect_at_start` included): the
-        // consumers can query before anything listens.
-        app.startConnectors() catch |err| {
-            e.tasks.cancel(app.io());
-            db.close(e);
-            return e.failStartDeinit(&app, err);
-        };
-        e.phase.store(.open, .release);
-        e.opened.set(threadedIo());
-        e.go.waitUncancelable(app.io());
-        var result: anyerror!void = {};
-        var watcher: ?std.Io.Future(void) = null;
-        if (!e.abandon.load(.acquire)) {
-            watcher = app.io().concurrent(watchReady, .{ e, &app }) catch |err| {
-                e.tasks.cancel(app.io());
-                db.close(e);
-                return e.failStartDeinit(&app, err);
-            };
-            // Control calls may reach the server from here until `run` returns.
-            _ = e.ctl.fetchAnd(~ctl_closed, .release);
-            e.phase.store(.running, .release);
-            result = app.run();
-        }
-        e.closeControl(app.io());
-        if (watcher) |*w| w.cancel(app.io());
-        e.tasks.cancel(app.io());
-        if (comptime features.websocket) for (e.execs) |*x| x.ws.cancel(app.io());
-        for (e.execs) |*x| x.db.cancel(app.io());
-        db.close(e);
-        if (result) |_| {} else |err| {
-            if (!e.started.isSet()) {
-                e.noteFailedListener(app.failedListenerIndex(), err);
-                e.start_error = err;
-                e.started.set(threadedIo());
-            } else if (e.start_error == null) log.err("server stopped: {t}", .{err});
-        }
-        e.phase.store(.stopped, .release);
-        for (e.listeners) |*l| {
-            const st = l.state.load(.acquire);
-            if (st == abi.LISTENER_LISTENING or st == abi.LISTENER_PENDING) l.state.store(abi.LISTENER_CLOSED, .release);
-        }
-        e.app = null;
-        app.deinit();
-        if (comptime features.websocket) e.rooms.deinit();
-        // Every consumer hears of the stop (ANOLE_EV_STOPPED).
-        for (e.consumers.items) |c| {
-            c.awake.store(false, .seq_cst);
-            c.wake();
-        }
-        e.stopped.set(threadedIo());
     }
 
     fn wantsWebTransport(cfg: Config) bool {
@@ -1541,7 +1626,10 @@ pub const Engine = struct {
         defer e.leave();
         // The first drain call tells every consumer (once each), before the
         // server starts closing sockets and cutting requests.
-        if (e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire) == null) e.notifyDraining();
+        if (e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire) == null) {
+            e.notifyDraining();
+            kafka.draining(e);
+        }
         app.stop();
     }
 
@@ -1582,6 +1670,65 @@ pub const Engine = struct {
         try app.setCertificate(cert);
     }
 
+    // ---- the live console ---------------------------------------------------
+
+    pub const ConsoleError = error{ State, Disabled, OutOfMemory } || anole.console.inprocess.OpenError;
+
+    /// `anole_console_open`.
+    pub fn consoleOpen(e: *Engine) ConsoleError!void {
+        if (e.phase.load(.acquire) != .running) return error.State;
+        const app = e.enter() orelse return error.State;
+        defer e.leave();
+        const c = app.console orelse return error.Disabled;
+        e.console_quiet.store(false, .release);
+        c.openInProcess(consoleClosed, e) catch |err| return switch (err) {
+            error.AlreadyOpen, error.NotRunning => error.State,
+            else => |x| x,
+        };
+    }
+
+    /// `anole_console_close`: no event.
+    pub fn consoleClose(e: *Engine) void {
+        const app = e.enter() orelse return;
+        defer e.leave();
+        const c = app.console orelse return;
+        if (!anole.console.inprocess.isOpen()) return;
+        e.console_quiet.store(true, .release);
+        c.closeInProcess();
+    }
+
+    pub fn consoleAttached(e: *Engine) i32 {
+        const app = e.enter() orelse return 0;
+        defer e.leave();
+        const c = app.console orelse return 0;
+        return @intCast(c.attached());
+    }
+
+    pub fn consoleReport(e: *Engine, items: []const anole.console.service.Metric) !void {
+        const app = e.enter() orelse return error.State;
+        defer e.leave();
+        const c = app.console orelse return;
+        try c.service.setMetrics(items);
+    }
+
+    pub fn consoleLog(e: *Engine, level: std.log.Level, scope: []const u8, msg: []const u8) void {
+        const app = e.enter() orelse return;
+        defer e.leave();
+        const c = app.console orelse return;
+        c.logRecord(level, scope, "", "", msg);
+    }
+
+    /// On the console's thread: event 132 to consumer 0.
+    fn consoleClosed(ctx: ?*anyopaque, reason: anole.console.inprocess.CloseReason) void {
+        const e: *Engine = @ptrCast(@alignCast(ctx.?));
+        if (e.console_quiet.swap(false, .acq_rel)) return;
+        if (e.consumers.items.len == 0 or e.consumers.items[0].execs.items.len == 0) return;
+        const rec = newRecord(@sizeOf(abi.ConsoleClosedEvent), .console_closed, 0) catch return;
+        const ev: *abi.ConsoleClosedEvent = @ptrCast(rec.ptr);
+        ev.reason = @intFromEnum(reason);
+        e.consumers.items[0].execs.items[0].postRecord(rec, false);
+    }
+
     pub fn destroy(e: *Engine) void {
         if (e.thread) |t| {
             switch (e.phase.load(.acquire)) {
@@ -1608,6 +1755,8 @@ pub const Engine = struct {
             for (x.slots) |*s| last = @max(last, genOf(s.word.load(.acquire)));
             last = @max(last, x.ws.maxGen(), x.wt.maxGen(), x.db.maxGen());
         }
+        last = @max(last, e.nats_state.maxGen());
+        last = @max(last, e.kafka_state.maxGen());
         next_first_gen = nextGen(last);
         if (global == e) global = null;
         for (e.execs) |*x| {
@@ -1635,7 +1784,12 @@ pub const Engine = struct {
             x.grpc.deinit();
             x.wt.deinit();
             x.db.deinit();
+            x.nats.deinit();
+            x.kafka.deinit();
         }
+        e.nats_state.deinit();
+        kafka.destroy(e);
+        e.kafka_state.deinit();
         gpa.free(e.execs);
         if (comptime features.grpc) grpc.deinit(e);
         for (e.consumers.items) |c| {
@@ -1715,28 +1869,28 @@ pub const Engine = struct {
     }
 };
 
-fn listenerState(a: std.mem.Allocator, l: Config.Listener) !ListenerState {
+fn listenerState(a: std.mem.Allocator, l: anole.ServerOptions.Listener) !ListenerState {
     var flags: u32 = 0;
     if (l.tls != null) flags |= abi.LISTENER_F_TLS;
     if (l.http1) flags |= abi.LISTENER_F_HTTP1;
     if (l.http2 and features.http2) flags |= abi.LISTENER_F_HTTP2;
     if (l.http3) flags |= abi.LISTENER_F_HTTP3;
     if (l.unix != null) flags |= abi.LISTENER_F_UNIX;
-    if (l.proxy_protocol) flags |= abi.LISTENER_F_PROXY_PROTOCOL;
+    if (l.proxy_protocol orelse false) flags |= abi.LISTENER_F_PROXY_PROTOCOL;
     const scheme = if (l.tls != null) "https" else "http";
     const name: []const u8 = l.name orelse if (l.unix) |path|
         try std.fmt.allocPrint(a, "unix-{s}", .{path})
     else
-        try std.fmt.allocPrint(a, "{s}-{d}", .{ scheme, l.port });
+        try std.fmt.allocPrint(a, "{s}-{d}", .{ scheme, l.port.? });
     // "127.0.0.1:8080", "[::]:8443", "unix:/run/app.sock".
     const address: []const u8 = if (l.unix) |path|
         try std.fmt.allocPrint(a, "unix:{s}", .{path})
-    else if (l.address.len == 0)
-        try std.fmt.allocPrint(a, "[::]:{d}", .{l.port})
-    else if (std.mem.indexOfScalar(u8, l.address, ':') != null)
-        try std.fmt.allocPrint(a, "[{s}]:{d}", .{ l.address, l.port })
+    else if (l.address.?.len == 0)
+        try std.fmt.allocPrint(a, "[::]:{d}", .{l.port.?})
+    else if (std.mem.indexOfScalar(u8, l.address.?, ':') != null)
+        try std.fmt.allocPrint(a, "[{s}]:{d}", .{ l.address.?, l.port.? })
     else
-        try std.fmt.allocPrint(a, "{s}:{d}", .{ l.address, l.port });
+        try std.fmt.allocPrint(a, "{s}:{d}", .{ l.address.?, l.port.? });
     return .{ .name = name, .cfg_address = address, .flags = flags };
 }
 
@@ -3165,6 +3319,20 @@ pub fn handleRelease(e: *Engine, hv: u64) AnswerError!void {
             if (comptime !features.sqlite and !features.postgres) return error.Over;
             return db.txRelease(e, hv);
         },
+        // A NATS subscription or JetStream consume ends; a JetStream message
+        // is NAK'd (cleanup calls).
+        .broker_sub => {
+            if (kafka.isKafka(hv)) kafka.groupClose(e, hv) else nats.unsubscribe(e, hv);
+            return error.Over;
+        },
+        .broker_msg => {
+            if (kafka.isKafka(hv)) {
+                kafka.batchRetry(e, hv, 0) catch return error.Over;
+                return;
+            }
+            nats.ack(e, hv, abi.NATS_NAK, 0) catch return error.Over;
+            return;
+        },
         .db_query, _ => return error.WrongKind,
     }
 }
@@ -3351,6 +3519,7 @@ pub fn reqRead(e: *Engine, hv: u64, out: []u8, timeout_ms: i32) AnswerError!usiz
 test {
     _ = config_mod;
     _ = @import("engine_test.zig");
+    _ = @import("nats_test.zig");
     _ = @import("parity_test.zig");
     if (features.grpc) _ = grpc;
 }

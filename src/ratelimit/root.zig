@@ -14,6 +14,7 @@
 //! LRU list so a full table costs O(1) per new key.
 const std = @import("std");
 const dusty = @import("dusty");
+const declarations = @import("../openapi/declarations.zig");
 const features = @import("build_options");
 const redis = if (features.redis) @import("../redis/root.zig") else struct {};
 const db = @import("../db/root.zig");
@@ -378,6 +379,11 @@ pub const Key = union(enum) {
 /// A rate limit on a memory limiter of its own, for `Server.rateLimit`:
 /// `Middleware`'s answers, counted by a `Key`.
 pub const OwnedMiddleware = struct {
+    /// What the OpenAPI document says of a route behind it.
+    pub const openapi: declarations.MiddlewareDoc = .{
+        .responses = .{ .too_many_requests = .{ .description = "Too many requests; Retry-After says when to try again" } },
+    };
+
     limiter: *MemoryLimiter,
     key: Key,
     policy: Policy,
@@ -428,6 +434,11 @@ pub const OnError = enum {
 /// limiter that fails lets the request through, or answers 503 with
 /// `.on_error = .deny`.
 pub const Middleware = struct {
+    /// What the OpenAPI document says of a route behind it.
+    pub const openapi: declarations.MiddlewareDoc = .{
+        .responses = .{ .too_many_requests = .{ .description = "Too many requests; Retry-After says when to try again" } },
+    };
+
     limiter: Limiter,
     options: Options,
 

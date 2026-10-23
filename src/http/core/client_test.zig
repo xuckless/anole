@@ -2328,3 +2328,223 @@ fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
         break :blk &final;
     };
 }
+
+// ---------------------------------------------------------------------------
+// Retries and the circuit breaker (all by counting what the server saw; no
+// timing is asserted).
+
+const fast_retry: @import("resilience_core").Retry = .{
+    .attempts = 4,
+    .backoff = .{ .base = .fromMilliseconds(1), .max = .fromMilliseconds(1), .jitter = .none },
+    .throttle = null,
+};
+
+const Flaky = struct {
+    var hits: std.atomic.Value(u32) = .init(0);
+    var methods_seen: std.atomic.Value(u32) = .init(0);
+    /// The first `fail_first` requests answer `fail_status`.
+    var fail_first: u32 = 0;
+    var fail_status: dusty.Status = .service_unavailable;
+    var retry_after: ?[]const u8 = null;
+
+    fn reset(first: u32, status: dusty.Status, after: ?[]const u8) void {
+        hits.store(0, .monotonic);
+        methods_seen.store(0, .monotonic);
+        fail_first = first;
+        fail_status = status;
+        retry_after = after;
+    }
+
+    fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+        _ = req;
+        const n = hits.fetchAdd(1, .monotonic);
+        if (n < fail_first) {
+            res.status = fail_status;
+            if (retry_after) |v| try res.header("Retry-After", v);
+            res.body = "no\n";
+            return;
+        }
+        res.body = "yes\n";
+    }
+};
+
+fn withFlakyServer(comptime body: fn (std.Io, u16) anyerror!void) !void {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.get("/x", Flaky.handle);
+    server.router.post("/x", Flaky.handle);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+    try body(io, server.address.ip.getPort());
+}
+
+fn flakyUrl(buf: []u8, port: u16) ![]const u8 {
+    return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}/x", .{port});
+}
+
+test "client retry: 503 twice then 200 is one fetch and three requests at the server" {
+    Flaky.reset(2, .service_unavailable, null);
+    try withFlakyServer(struct {
+        fn run(io: std.Io, port: u16) !void {
+            var buf: [64]u8 = undefined;
+            var client = dusty.Client.init(std.testing.allocator, io, .{ .retry = fast_retry });
+            defer client.deinit();
+            var response = try client.fetch(try flakyUrl(&buf, port), .{});
+            defer response.deinit();
+            try std.testing.expectEqual(.ok, response.status());
+            try std.testing.expectEqual(@as(u32, 3), Flaky.hits.load(.monotonic));
+        }
+    }.run);
+}
+
+test "client retry: the attempts run out and the last answer is returned" {
+    Flaky.reset(100, .bad_gateway, null);
+    try withFlakyServer(struct {
+        fn run(io: std.Io, port: u16) !void {
+            var buf: [64]u8 = undefined;
+            var client = dusty.Client.init(std.testing.allocator, io, .{ .retry = fast_retry });
+            defer client.deinit();
+            var response = try client.fetch(try flakyUrl(&buf, port), .{});
+            defer response.deinit();
+            try std.testing.expectEqual(.bad_gateway, response.status());
+            try std.testing.expectEqual(@as(u32, 4), Flaky.hits.load(.monotonic));
+        }
+    }.run);
+}
+
+test "client retry: POST is not retried; idempotent = true and an Idempotency-Key make it so" {
+    try withFlakyServer(struct {
+        fn run(io: std.Io, port: u16) !void {
+            var buf: [64]u8 = undefined;
+            const url = try flakyUrl(&buf, port);
+            var client = dusty.Client.init(std.testing.allocator, io, .{ .retry = fast_retry });
+            defer client.deinit();
+
+            Flaky.reset(1, .service_unavailable, null);
+            {
+                var response = try client.fetch(url, .{ .method = .post, .body = "a" });
+                defer response.deinit();
+                try std.testing.expectEqual(.service_unavailable, response.status());
+                try std.testing.expectEqual(@as(u32, 1), Flaky.hits.load(.monotonic));
+            }
+
+            Flaky.reset(1, .service_unavailable, null);
+            {
+                var response = try client.fetch(url, .{ .method = .post, .body = "a", .idempotent = true });
+                defer response.deinit();
+                try std.testing.expectEqual(.ok, response.status());
+                try std.testing.expectEqual(@as(u32, 2), Flaky.hits.load(.monotonic));
+            }
+
+            Flaky.reset(1, .service_unavailable, null);
+            {
+                var headers = try dusty.Headers.init(std.testing.allocator, 4);
+                defer headers.deinit(std.testing.allocator);
+                try headers.put("Idempotency-Key", "k-1");
+                var response = try client.fetch(url, .{ .method = .post, .body = "a", .headers = &headers });
+                defer response.deinit();
+                try std.testing.expectEqual(.ok, response.status());
+                try std.testing.expectEqual(@as(u32, 2), Flaky.hits.load(.monotonic));
+            }
+        }
+    }.run);
+}
+
+test "client retry: Retry-After above max_retry_after returns that answer at once; 0 retries" {
+    try withFlakyServer(struct {
+        fn run(io: std.Io, port: u16) !void {
+            var buf: [64]u8 = undefined;
+            const url = try flakyUrl(&buf, port);
+            var policy = fast_retry;
+            policy.max_retry_after = .fromSeconds(5);
+            var client = dusty.Client.init(std.testing.allocator, io, .{ .retry = policy });
+            defer client.deinit();
+
+            // 3600 s is past the cap: one request, the 429 comes back.
+            Flaky.reset(1, .too_many_requests, "3600");
+            {
+                var response = try client.fetch(url, .{});
+                defer response.deinit();
+                try std.testing.expectEqual(.too_many_requests, response.status());
+                try std.testing.expectEqual(@as(u32, 1), Flaky.hits.load(.monotonic));
+            }
+            // 0 s: obeyed, the retry follows at once.
+            Flaky.reset(1, .too_many_requests, "0");
+            {
+                var response = try client.fetch(url, .{});
+                defer response.deinit();
+                try std.testing.expectEqual(.ok, response.status());
+                try std.testing.expectEqual(@as(u32, 2), Flaky.hits.load(.monotonic));
+            }
+            // An HTTP date in the past is no wait either.
+            Flaky.reset(1, .service_unavailable, "Sun, 06 Nov 1994 08:49:37 GMT");
+            {
+                var response = try client.fetch(url, .{});
+                defer response.deinit();
+                try std.testing.expectEqual(.ok, response.status());
+                try std.testing.expectEqual(@as(u32, 2), Flaky.hits.load(.monotonic));
+            }
+        }
+    }.run);
+}
+
+test "client retry: retryAfterValue reads seconds and HTTP dates against an injected clock" {
+    const C = dusty.Client;
+    try std.testing.expectEqual(@as(i64, 7), C.retryAfterValue("7", 0).?.toSeconds());
+    try std.testing.expectEqual(@as(i64, 0), C.retryAfterValue(" 0 ", 0).?.toSeconds());
+    // 1994-11-06 08:49:37 GMT is 784111777.
+    try std.testing.expectEqual(@as(i64, 30), C.retryAfterValue("Sun, 06 Nov 1994 08:49:37 GMT", 784111747).?.toSeconds());
+    try std.testing.expectEqual(@as(i64, 0), C.retryAfterValue("Sun, 06 Nov 1994 08:49:37 GMT", 784111800).?.toSeconds());
+    try std.testing.expect(C.retryAfterValue("soon", 0) == null);
+    try std.testing.expect(C.retryAfterValue("", 0) == null);
+}
+
+test "client breaker: refused connects open it and the next fetch fails CircuitOpen without dialing; 404s never open it" {
+    const io = std.testing.io;
+    var client = dusty.Client.init(std.testing.allocator, io, .{
+        .breaker = .{ .consecutive_failures = 3, .failure_ratio = 0 },
+    });
+    defer client.deinit();
+
+    // A port nobody listens on: bind and close one.
+    const probe_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var probe = try probe_addr.listen(io, .{ .reuse_address = true });
+    const port = probe.socket.address.getPort();
+    probe.deinit(io);
+    var buf: [64]u8 = undefined;
+    const url = try flakyUrl(&buf, port);
+
+    // Each refused connect is a breaker failure (design R9). `dials`
+    // counts connections opened, so refused ones leave it at 0.
+    for (0..3) |_| try std.testing.expectError(error.ConnectionRefused, client.fetch(url, .{}));
+    try std.testing.expectEqual(@as(u64, 0), client.dials.load(.monotonic));
+    // Open: the next fetch fails before any connect is tried.
+    try std.testing.expectError(error.CircuitOpen, client.fetch(url, .{}));
+    try std.testing.expectEqual(@as(u64, 0), client.dials.load(.monotonic));
+}
+
+test "client breaker: 404 answers never open it" {
+    Flaky.reset(1000, .not_found, null);
+    try withFlakyServer(struct {
+        fn run(io: std.Io, port: u16) !void {
+            var buf: [64]u8 = undefined;
+            const url = try flakyUrl(&buf, port);
+            var client = dusty.Client.init(std.testing.allocator, io, .{
+                .breaker = .{ .consecutive_failures = 3, .failure_ratio = 0 },
+            });
+            defer client.deinit();
+            for (0..10) |_| {
+                var response = try client.fetch(url, .{});
+                defer response.deinit();
+                try std.testing.expectEqual(.not_found, response.status());
+            }
+            try std.testing.expectEqual(@as(u32, 10), Flaky.hits.load(.monotonic));
+        }
+    }.run);
+}

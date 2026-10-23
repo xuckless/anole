@@ -26,9 +26,11 @@
         // net.ReadyWatch is gone (Anole parks through CompletionQueue). The
         // HTTP core (adapted from lalinsky/dusty) is in src/http/core, not a
         // dependency.
+        // Plus `diagnostics` (88f6d69): comptime-gated per-executor task
+        // counters and stack stats for the runtime gauges on /metrics.
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#b4974873565677327cb45f8731b4f393ff637bad",
-            .hash = "zio-0.19.0-xHbVVCTMLQD1ucYoMOJfO8bzSuHnrjjXYubniBKtnu8F",
+            .url = "git+https://github.com/xuckless/zio#88f6d6985c78deac16d937a0a8d95e7c649eba6d",
+            .hash = "zio-0.19.0-xHbVVFndLQBjQr_KxPh7mRuZ-dllPXBf8YBFu6FX-mok",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
@@ -113,8 +115,8 @@
             .lazy = true,
         },
         .protobuf = .{
-            .url = "git+https://github.com/xuckless/zig-protobuf#ef23c279af0dcb12cce9eee39838c14f5955c75f",
-            .hash = "protobuf-7.0.0-0e82aj2WNAAZimii5Crz-Ce8fLdCHUW-Ra-95-3lLMnw",
+            .url = "git+https://github.com/xuckless/zig-protobuf#e6de363eb44854f453280875169d063eb077639e",
+            .hash = "protobuf-7.0.0-0e82aujmNgDEMIIEm-NBypMzOKX8l0fZK0gyCpbF1tmE",
             .lazy = true,
         },
         // -Dgrpc: upb, protobuf's C runtime, from the protobuf 36.2 release
@@ -147,10 +149,12 @@
         // cache, pool lifetimes, a refused connect's error, TLS through an
         // injected module (Anole's BoringSSL, src/pg/tls.zig), the session
         // reset on release (Pool.Reset: .always or .auto), parameters as a
-        // slice of tagged unions and text results (the C ABI).
+        // slice of tagged unions and text results (the C ABI), and the
+        // bytes the socket accepted (Conn.bytesSent: when a failed call
+        // may run again).
         .pg = .{
-            .url = "git+https://github.com/xuckless/pg.zig#6f47a57bd5f7d9e96440526d5b51bd7a043a8203",
-            .hash = "pg-0.0.0-Wp_7gVBZCQCvg5pWYYxKTW8zxBa1VzUO8IWy4OiYhwDA",
+            .url = "git+https://github.com/xuckless/pg.zig#6327fc61f3a3e90aa5b014af21e12bbb073e0fcc",
+            .hash = "pg-0.0.0-Wp_7gU5jCQD89Co7vWWqcTa2s4vhSZ85OldH348fzrP4",
             .lazy = true,
         },
         // Tests only, fetched only when Anole is the root build: the BSON
@@ -179,6 +183,13 @@
             .hash = "sqlite-3.54.1-F2R_a_YmBADq3G8bA-jCBgWFcQEaVlxVql4mEN2SbliG",
             .lazy = true,
         },
+        // -Dkafka: lz4 1.10.0 (BSD-2, Kafka's most used batch codec), built
+        // by build/lz4.zig.
+        .lz4 = .{
+            .url = "https://github.com/lz4/lz4/archive/refs/tags/v1.10.0.tar.gz",
+            .hash = "N-V-__8AAPaNGQD6bmfRjArvYAnsL8DYxbXiNxVE_B6HRpUx",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
@@ -186,6 +197,8 @@
         "build",
         "src",
         "examples",
+        "tools",
+        "templates",
         "tests",
         "LICENSE",
         "THIRD_PARTY_NOTICES",

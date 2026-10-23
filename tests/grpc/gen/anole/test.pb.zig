@@ -168,6 +168,9 @@ pub fn Lookup(comptime UserDataType: type, comptime ErrorSet: type) type {
         pub const package = "anole.test";
         pub const service_name = "Lookup";
 
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "Connect GET: Find has no side effects, Store has.";
+
         /// Options of the methods that have some (`google.protobuf.MethodOptions`).
         pub const _method_options = .{
             .Find = .{

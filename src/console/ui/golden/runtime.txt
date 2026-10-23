@@ -1,0 +1,30 @@
+ api · pid 48213 · development · up 4m12s   843 req/s   p99 120 us   90 err/min   conns 37   ● live 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ memory (RSS)    50.0 MiB                                                                           
+ CPU time        8s                                                                                 
+ threads         11                                                                                 
+ open fds        64 of 1048576                                                                      
+ uptime          4m12s                                                                              
+ build           Debug                                                                              
+ anole           0.3.0                                                                              
+ runtime         node 22.11.0                                                                       
+                                                                                                    
+ node 22.11.0                                                                                       
+ event_loop_lag_p99          3.1 ms                                                                 
+ heap_used                   30.0 MiB                                                               
+ active_handles              14.0                                                                   
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ >                                                                                                  
+ Tab complete · ↑↓ history · PgUp/PgDn scroll · /quit or Ctrl-C leave (the app keeps running)       

@@ -233,6 +233,15 @@ pub const ServerConfig = struct {
     /// redirects and cache keys are built from. Turn it on only when the
     /// nearest proxy sets the header on every request.
     trust_forwarded_host: bool = false,
+    /// The peers whose X-Forwarded-* headers are read (and who may send a
+    /// PROXY header on a listener with an empty `proxy_protocol_from`).
+    /// Null: no gate; `trusted_proxy_hops` alone decides, as before.
+    trusted_proxies: ?[]const proxy_protocol.Network = null,
+    /// Log one warning (per process) for the first request or connection
+    /// from a peer outside `trusted_proxies`.
+    warn_untrusted_peer: bool = false,
+    /// `defaultError` names the error in a 500 it maps no status for.
+    error_detail: bool = false,
     /// How many connections may be open at once. At the cap the server stops
     /// accepting; what arrives meanwhile waits in the kernel's accept queue,
     /// `Listener.kernel_backlog` deep. Null lifts the cap.
@@ -357,8 +366,10 @@ pub const ServerConfig = struct {
         /// client may open a WebSocket, or another protocol, on a stream
         /// with an extended CONNECT. Such a request reaches the router as a
         /// GET, as the HTTP/1.1 upgrade it replaces does, with
-        /// `Request.protocol` set.
-        enable_connect_protocol: bool = true,
+        /// `Request.protocol` set. Off by default: measured, a WebSocket
+        /// over HTTP/2 cost about twice the CPU per message of one over
+        /// HTTP/1.1, and Firefox takes it whenever it is offered.
+        enable_connect_protocol: bool = false,
         /// Requests for routes registered `no_wait` (`RouteOptions`) that
         /// arrive whole (their end, body included, in the read that brought
         /// their HEADERS) run on the

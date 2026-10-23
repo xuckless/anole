@@ -25,7 +25,9 @@ builds a whole API step by step.
 | `fiber.Query[int](c, "limit", 20)` | `req.query.getInt(usize, "limit") orelse 20` |
 | `c.Get("X-Api-Key")` | `req.headers.get("X-Api-Key")` |
 | `c.Cookies("sid")` | `req.cookies().get("sid")` |
-| `c.IP()` | `req.remote_address` (behind a proxy, with `proxy.trusted_hops` set) |
+| `c.IP()` | `req.remote_address` (behind a proxy, with `deployment = .behind_proxy` or `proxy.trusted` set) |
+| `fiber.Config{ProxyHeader: ..., TrustedProxies: ..., EnableTrustedProxyCheck: true}` | `.proxy = .{ .trusted = &.{"10.0.0.0/8", "private"} }` (or `ANOLE_PROXY_TRUSTED`); the client is the rightmost untrusted `X-Forwarded-For` address |
+| `os.Getenv("PORT")` | `.deployment = .platform` (or `ANOLE_DEPLOYMENT=platform`) listens on `$PORT` |
 | `c.Body()` | `try req.body()`, a `?[]const u8` |
 | `c.Bind().Body(&in)` | `const in = try req.bind(NewUser);` |
 | `c.SendString("hi")` | `res.body = "hi";` or `try res.print(.text, "hi {s}", .{name});` |
@@ -57,7 +59,7 @@ builds a whole API step by step.
 | `jwtware.New(jwtware.Config{...})` (contrib/jwt) | `anole.auth.RequireJwt.init(keys, policy, .{})` and `anole.auth.claims(req)` |
 | `healthcheck.New()` | `_ = app.health(.{});` (`/healthz`, `/readyz`) |
 | `client.Get(url)` | `anole.client(req).fetch(url, .{})` |
-| `app.Test(req)` | `app.listen("127.0.0.1:0")` with the checks in a task on `app.io()` (`tests/rest_test.zig`) |
+| `app.Test(req)` | `anole.testing.client(&app)`, in memory ([testing.md](testing.md)); `app.listen("127.0.0.1:0")` with the checks in a task on `app.io()` for a real socket (`tests/rest_test.zig`) |
 | `Prefork: true` | the default: an accept loop on every core (one `SO_REUSEPORT` socket each on Linux) |
 
 What Fiber cannot do and Anole does: HTTP/2 and HTTP/3 without a proxy in
@@ -67,13 +69,15 @@ front, and gRPC (`app.grpc(pb.Greeter, .{ .SayHello = sayHello })`, see
 ## A handler
 
 ```go
+type NewUser struct {
+    Name  string `json:"name"  validate:"required"`
+    Email string `json:"email" validate:"required,email"`
+}
+
 app.Post("/users", func(c fiber.Ctx) error {
     var in NewUser
-    if err := c.Bind().Body(&in); err != nil {
+    if err := c.Bind().Body(&in); err != nil { // go-playground/validator inside
         return err
-    }
-    if in.Name == "" {
-        return fiber.NewError(fiber.StatusUnprocessableEntity, "name is empty")
     }
     u := store.Add(in)
     return c.Status(fiber.StatusCreated).JSON(u)
@@ -81,16 +85,33 @@ app.Post("/users", func(c fiber.Ctx) error {
 ```
 
 ```zig
-fn createUser(app: *App, req: *anole.Request, res: *anole.Response) !void {
-    const in = try req.bind(NewUser);
-    if (in.name.len == 0) return res.fail(.unprocessable_entity, "name is empty");
-    const user = try app.store.add(in);
+const v = anole.validate;
+
+const NewUser = struct {
+    name: []const u8,
+    email: []const u8,
+
+    pub const field_rules = .{
+        .name = .{ v.trim, v.notBlank },
+        .email = v.email,
+    };
+};
+
+fn createUser(app: *App, _: *anole.Request, res: *anole.Response, in: anole.In(.{ .body = NewUser })) !User {
+    const user = try app.store.add(in.body);
     res.status = .created;
-    try res.json(user);
+    return user; // written as JSON, with the status you set
 }
 
 app.post("/users", createUser);
 ```
+
+`anole.In(.{ .body = T })` is `c.Bind().Body` plus the validator in one
+step: it binds before the handler runs and answers a body that breaks a rule
+with a 422 that names every field (`validation.not_blank`,
+`validation.email`...), not only the first. A handler that returns a value
+has it written as JSON; one that wants to answer itself keeps `res`. Inside a
+handler, `req.bind(T)` does the same. See [validation.md](validation.md).
 
 Fiber's one `c` is two values here, the request and the response, and the
 handler is a named function: Zig has no closures. Shared state (`store`
@@ -192,7 +213,7 @@ app.ws("/ws", echo);
 
 No upgrade-check middleware is needed: a request that is not a WebSocket
 handshake gets 426. The same route serves WebSockets over HTTP/2 (RFC
-8441). `anole.websocket.Rooms` broadcasts to groups of sockets
+8441) once `http2.enable_connect_protocol` is on. `anole.websocket.Rooms` broadcasts to groups of sockets
 ([websocket.md](websocket.md)).
 
 ## Rate limits, sessions and JWT
@@ -223,6 +244,14 @@ name)` read and write the session, and `anole.auth.subject(req)` and
 `c.Locals("user")`). `limiter`, `keys` and the secrets must outlive the
 server, which locals of `main` do. Redis-backed limits and sessions, JWKS
 key sets, OIDC sign-in, CSRF and API keys are in [auth.md](auth.md).
+
+## Swagger and API docs
+
+Fiber's swagger middleware serves a file you keep up to date. In Anole the
+document is made from your handlers' signatures, validation rules and gRPC
+services: `app.openapi(.{})` serves it at `/openapi.json` with a docs page at
+`/docs` in development, and `zig build openapi` writes it for CI. See
+[openapi.md](openapi.md).
 
 ## What is different
 

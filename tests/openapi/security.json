@@ -1,0 +1,117 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Secure",
+    "version": "1.0.0"
+  },
+  "tags": [
+    {
+      "name": "admin"
+    },
+    {
+      "name": "me"
+    },
+    {
+      "name": "open"
+    },
+    {
+      "name": "service"
+    }
+  ],
+  "paths": {
+    "/api/admin": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "postApiAdmin",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "Missing, expired or invalid token"
+          },
+          "403": {
+            "description": "The caller's roles lack the permission"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/me": {
+      "get": {
+        "tags": [
+          "me"
+        ],
+        "operationId": "getApiMe",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "Missing, expired or invalid token"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/open": {
+      "get": {
+        "tags": [
+          "open"
+        ],
+        "operationId": "getOpen",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/service/stats": {
+      "get": {
+        "tags": [
+          "service"
+        ],
+        "operationId": "getServiceStats",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "description": "Missing or unknown API key"
+          }
+        },
+        "security": [
+          {
+            "apiKey": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "apiKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "An API key, in X-API-Key or as Authorization: Bearer <key>."
+      },
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  }
+}

@@ -23,6 +23,7 @@ const status_mod = @import("status.zig");
 const deadline = @import("deadline.zig");
 const Compression = @import("compression.zig").Compression;
 const server = @import("server.zig");
+const resilience = @import("resilience_core");
 
 /// A call's outcome: code and message.
 pub const Status = status_mod.Status;
@@ -47,6 +48,100 @@ pub const Channel = struct {
     /// call is canceled and ends with RESOURCE_EXHAUSTED.
     /// `CallOptions.max_received_bytes` overrides it per call.
     max_received_bytes: usize = 64 * 1024 * 1024,
+    /// Retries for unary calls whose status is in `retry_codes`; null:
+    /// none. Transparent retries of calls the server did not process
+    /// (REFUSED_STREAM, past a GOAWAY) stay on.
+    retry: ?resilience.Retry = null,
+    retry_codes: []const Code = &.{.unavailable},
+    /// A breaker for this channel's target; null: none. Set it with
+    /// `.breaker = .init(.{}, .grpc, "billing:50051")`; the channel must
+    /// not move after its first call.
+    breaker: ?resilience.Breaker = null,
+    /// The retry throttle (gRPC A6) of this channel.
+    _throttle: resilience.Throttle = .init(.{}),
+    /// Set by `Channel.connect`: the channel owns its connection and opens
+    /// a new one when the old one is closed (GOAWAY, failure).
+    _owned: ?*Owned = null,
+    /// True when `connect` allocated `authority`.
+    owns_authority: bool = false,
+
+    const Owned = struct {
+        gpa: std.mem.Allocator,
+        options: h2.ConnectOptions,
+        mutex: std.Io.Mutex = .init,
+        /// Connections replaced by a redial: they may still carry calls,
+        /// so they close with the channel.
+        retired: std.ArrayList(*h2.ClientConnection) = .empty,
+    };
+
+    /// What `connect` takes besides the connection's options.
+    pub const Options = struct {
+        authority: ?[]const u8 = null, // null: host:port
+        scheme: ?[]const u8 = null, // null: "https" with TLS, else "http"
+        retry: ?resilience.Retry = null,
+        retry_codes: []const Code = &.{.unavailable},
+        breaker: ?resilience.Breaker.Options = null,
+        max_message_size: usize = 4 * 1024 * 1024,
+        max_received_bytes: usize = 64 * 1024 * 1024,
+    };
+
+    /// A channel that owns its HTTP/2 connection and redials it lazily: the
+    /// next call after the connection closed opens a new one (one dial at
+    /// a time; other calls wait for it). `options` (host and TLS slices
+    /// included) must outlive the channel. `close` it.
+    pub fn connect(gpa: std.mem.Allocator, io: std.Io, options: h2.ConnectOptions, channel: Options) !*Channel {
+        const self = try gpa.create(Channel);
+        errdefer gpa.destroy(self);
+        const owned = try gpa.create(Owned);
+        errdefer gpa.destroy(owned);
+        owned.* = .{ .gpa = gpa, .options = options };
+        const conn = try h2.ClientConnection.connect(gpa, io, options);
+        errdefer conn.close();
+        const authority = channel.authority orelse try std.fmt.allocPrint(gpa, "{s}:{d}", .{ options.host, options.port });
+        self.* = .{
+            .conn = conn,
+            .authority = authority,
+            .scheme = channel.scheme orelse if (options.tls != null) "https" else "http",
+            .max_message_size = channel.max_message_size,
+            .max_received_bytes = channel.max_received_bytes,
+            .retry = channel.retry,
+            .retry_codes = channel.retry_codes,
+            .breaker = if (channel.breaker) |o| resilience.Breaker.init(o, .grpc, authority) else null,
+            ._throttle = .init(if (channel.retry) |r| (r.throttle orelse .{}) else .{}),
+            ._owned = owned,
+        };
+        self.owns_authority = channel.authority == null;
+        return self;
+    }
+
+    /// Closes the connections and frees the channel (from `connect`).
+    pub fn close(self: *Channel) void {
+        const owned = self._owned orelse return;
+        const gpa = owned.gpa;
+        self.conn.close();
+        for (owned.retired.items) |c| c.close();
+        owned.retired.deinit(gpa);
+        if (self.owns_authority) gpa.free(self.authority);
+        gpa.destroy(owned);
+        gpa.destroy(self);
+    }
+
+    /// The connection a call goes out on: `conn`, or for an owned channel
+    /// a fresh one when the current has gone.
+    pub fn activeConn(self: *Channel) !*h2.ClientConnection {
+        const owned = self._owned orelse return self.conn;
+        if (self.conn.isOpen()) return self.conn;
+        const io = self.conn.io;
+        owned.mutex.lockUncancelable(io);
+        defer owned.mutex.unlock(io);
+        // Another call may have redialed while this one waited.
+        if (self.conn.isOpen()) return self.conn;
+        const fresh = try h2.ClientConnection.connect(owned.gpa, io, owned.options);
+        errdefer fresh.close();
+        try owned.retired.append(owned.gpa, self.conn);
+        self.conn = fresh;
+        return fresh;
+    }
 };
 
 /// Per call: deadline, metadata, compression.
@@ -60,6 +155,9 @@ pub const CallOptions = struct {
     compression: Compression = .identity,
     /// The channel's `max_received_bytes` for this call, when set.
     max_received_bytes: ?usize = null,
+    /// `.inherit` (the channel's), `.off`, or `.on` with a policy of its
+    /// own. Unary calls only.
+    retry: resilience.Choice = .inherit,
 };
 
 /// What `Client.unary` returns: the status, and the response message when
@@ -206,25 +304,149 @@ pub fn Client(comptime Service: type) type {
             return open(MethodOf(method).Request, MethodOf(method).Response, self.channel, path(method), arena, options);
         }
 
-        /// A unary call (or a server-streaming one's first response).
+        /// A unary call (or a server-streaming one's first response). With
+        /// a retry policy (the channel's, or `options.retry`) a status in
+        /// `retry_codes` is retried within the call's `timeout`; with a
+        /// breaker, a target that keeps failing answers UNAVAILABLE
+        /// "circuit open" without a call.
         pub fn unary(self: Self, comptime method: []const u8, arena: std.mem.Allocator, request: MethodOf(method).Request, options: CallOptions) !UnaryResult(MethodOf(method).Response) {
             const M = MethodOf(method);
-            var s = try open(M.Request, M.Response, self.channel, path(method), arena, options);
-            defer s.deinit();
-            try s.send(request);
-            try s.closeSend();
-            const message = try s.receive();
-            // Drain to the trailers.
-            if (message != null) while (try s.receive()) |_| {};
-            const st = s.status orelse Status.init(.internal, "no status");
-            return .{
-                .status = st,
-                .message = if (st.code == .ok) message else null,
-                // Copied out: the stream (and what it received) is freed
-                // on return.
-                .headers = try copyHeaders(s.arena, s.stream.headers.items),
-                .trailers = try copyHeaders(s.arena, s.stream.trailers.items),
+            const ch = self.channel;
+            const policy_retry = options.retry.resolve(ch.retry);
+            if (policy_retry == null and ch.breaker == null) {
+                const once = try unaryOnce(M, ch, path(method), arena, request, options);
+                return once.result;
+            }
+            const Ctx = struct {
+                ch: *Channel,
+                arena: std.mem.Allocator,
+                request: M.Request,
+                options: CallOptions,
+                started: std.Io.Clock.Timestamp,
+                attempt_timeout: ?std.Io.Duration = null,
             };
+            const Judge = UnaryJudge(M.Response);
+            const A = Judge.Attempt;
+            const attempt = struct {
+                fn run(ctx: *Ctx, n: u32) A {
+                    var opts = ctx.options;
+                    if (n > 1) {
+                        const extra = ctx.arena.alloc(h2.Header, opts.metadata.len + 1) catch
+                            return .{ .result = error.OutOfMemory, .codes = ctx.ch.retry_codes };
+                        @memcpy(extra[0..opts.metadata.len], opts.metadata);
+                        extra[opts.metadata.len] = .{ .name = "grpc-previous-rpc-attempts", .value = std.fmt.allocPrint(ctx.arena, "{d}", .{n - 1}) catch "1" };
+                        opts.metadata = extra;
+                        if (ctx.options.timeout) |t| {
+                            const spent = ctx.started.durationTo(std.Io.Clock.Timestamp.now(ctx.ch.conn.io, .awake)).raw.nanoseconds;
+                            opts.timeout = .{ .nanoseconds = @max(1_000_000, t.nanoseconds - spent) };
+                        }
+                    }
+                    // One attempt's own bound (`Retry.attempt_timeout`), within
+                    // what is left of the call's.
+                    if (ctx.attempt_timeout) |at| {
+                        opts.timeout = if (opts.timeout) |t| .{ .nanoseconds = @min(t.nanoseconds, at.nanoseconds) } else at;
+                    }
+                    var out = unaryOnce(M, ctx.ch, path(method), ctx.arena, ctx.request, opts);
+                    // Not processed by the server: once more, not counted.
+                    if (out) |o| {
+                        if (o.unprocessed) out = unaryOnce(M, ctx.ch, path(method), ctx.arena, ctx.request, opts);
+                    } else |_| {}
+                    return .{ .result = if (out) |o| o.result else |e| e, .codes = ctx.ch.retry_codes };
+                }
+            }.run;
+            const now = std.Io.Clock.Timestamp.now(ch.conn.io, .awake);
+            var ctx: Ctx = .{ .ch = ch, .arena = arena, .request = request, .options = options, .started = now, .attempt_timeout = if (policy_retry) |r| r.attempt_timeout else null };
+            const rp: resilience.Policy = .{
+                .retry = policy_retry,
+                .breaker = if (ch.breaker) |*b| b else null,
+                .throttle = if (policy_retry != null and policy_retry.?.throttle != null) &ch._throttle else null,
+                .deadline = if (options.timeout) |t| now.addDuration(.{ .raw = t, .clock = .awake }) else null,
+                .kind = .grpc,
+                .target = ch.authority,
+            };
+            const res = resilience.run(ch.conn.io, rp, &ctx, attempt, Judge) catch |err| switch (err) {
+                error.CircuitOpen => return .{
+                    .status = .init(.unavailable, "circuit open"),
+                    .message = null,
+                    .headers = &.{},
+                    .trailers = &.{},
+                },
+                else => |e| return e,
+            };
+            return res.result;
+        }
+    };
+}
+
+/// One unary attempt, and whether the server provably did not process it.
+fn unaryOnce(comptime M: type, channel: *Channel, method_path: []const u8, arena: std.mem.Allocator, request: M.Request, options: CallOptions) !struct { result: UnaryResult(M.Response), unprocessed: bool } {
+    var s = try open(M.Request, M.Response, channel, method_path, arena, options);
+    defer s.deinit();
+    try s.send(request);
+    try s.closeSend();
+    const message = try s.receive();
+    // Drain to the trailers.
+    if (message != null) while (try s.receive()) |_| {};
+    const st = s.status orelse Status.init(.internal, "no status");
+    return .{
+        .result = .{
+            .status = st,
+            .message = if (st.code == .ok) message else null,
+            // Copied out: the stream (and what it received) is freed
+            // on return.
+            .headers = try copyHeaders(s.arena, s.stream.headers.items),
+            .trailers = try copyHeaders(s.arena, s.stream.trailers.items),
+        },
+        .unprocessed = st.code == .unavailable and s.stream.unprocessed(),
+    };
+}
+
+/// How `resilience.run` judges a unary attempt (gRPC A6).
+fn UnaryJudge(comptime Resp: type) type {
+    return struct {
+        pub const Attempt = struct {
+            result: anyerror!UnaryResult(Resp),
+            codes: []const Code,
+        };
+
+        fn pushback(r: UnaryResult(Resp)) ?union(enum) { ms: u32, stop } {
+            for (r.trailers) |t| {
+                if (std.mem.eql(u8, t.name, "grpc-retry-pushback-ms")) {
+                    const ms = std.fmt.parseInt(u32, std.mem.trim(u8, t.value, " "), 10) catch return .stop;
+                    return .{ .ms = ms };
+                }
+            }
+            return null;
+        }
+
+        pub fn verdict(a: *const Attempt) resilience.Verdict {
+            const r = a.result catch return .failure;
+            if (r.status.code == .ok) return .success;
+            var retryable = false;
+            for (a.codes) |c| if (c == r.status.code) {
+                retryable = true;
+            };
+            if (retryable) {
+                if (pushback(r)) |p| switch (p) {
+                    .stop => return .failure,
+                    .ms => {},
+                };
+                return .transient;
+            }
+            return if (r.status.code == .unavailable) .failure else .neutral;
+        }
+
+        pub fn retryAfter(a: *const Attempt) ?std.Io.Duration {
+            const r = a.result catch return null;
+            if (pushback(r)) |p| switch (p) {
+                .ms => |ms| return .fromMilliseconds(ms),
+                .stop => {},
+            };
+            return null;
+        }
+
+        pub fn reason(_: *const Attempt) []const u8 {
+            return "code";
         }
     };
 }
@@ -255,7 +477,8 @@ pub fn open(comptime Req: type, comptime Resp: type, channel: *Channel, method_p
         null;
     // The deadline bounds the stream on this side too; a call without one
     // may stream for as long as it likes.
-    const s = try channel.conn.request(headers.items, .{
+    const conn = try channel.activeConn();
+    const s = try conn.request(headers.items, .{
         .body = true,
         .timeout = if (call_deadline) |d| .{ .deadline = d } else .none,
     });
@@ -320,3 +543,4 @@ test "percentDecode undoes grpc-message encoding" {
     try std.testing.expectEqualStrings("a%b\né", try percentDecode(arena.allocator(), "a%25b%0A%C3%A9"));
     try std.testing.expectEqualStrings("plain", try percentDecode(arena.allocator(), "plain"));
 }
+pub const ChannelOptions = Channel.Options;

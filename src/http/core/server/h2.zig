@@ -49,6 +49,7 @@ const Sink = @import("../sink.zig").Sink;
 const Transport = @import("../transport.zig").Transport;
 const Timer = @import("../deadline.zig").Timer;
 const placement = @import("../placement.zig");
+const gauges = @import("../gauges.zig");
 
 const log = std.log.scoped(.anole_h2);
 
@@ -640,7 +641,7 @@ pub fn Engine(comptime Ctx: type) type {
                 if (stream.send_pending) conn.send_pending -= 1;
                 conn.raised_bytes -= stream.raised_bytes;
                 stream.outbox.deinit(conn.allocator);
-                _ = conn.streams.remove(stream.id);
+                if (conn.streams.remove(stream.id)) gauges.add(conn.io, .h2_streams, -1);
                 if (stream.counted) {
                     conn.open_streams -= 1;
                     if (conn.writer_gone) {
@@ -1301,7 +1302,10 @@ pub fn Engine(comptime Ctx: type) type {
                 ._drain_hooks = &server.drain_hooks,
                 ._timeout_context = if (inline_mode) null else &timer,
                 ._set_timeout = if (inline_mode) null else setTimeout,
+                // Its entry table is never read past `len`: not zeroed.
+                .session = undefined,
             };
+            request.session._empty();
             const body_reader = &ex.body_reader;
             body_reader.* = .init(stream);
             request._body_source = .{ .reader = &body_reader.interface, .err = BodyReader.errorOf };
@@ -2087,6 +2091,7 @@ pub fn Engine(comptime Ctx: type) type {
                 stream.destroy(conn.allocator);
                 return c.NGHTTP2_ERR_CALLBACK_FAILURE;
             };
+            gauges.add(conn.io, .h2_streams, 1);
             _ = c.nghttp2_session_set_stream_user_data(session, id, stream);
             return 0;
         }

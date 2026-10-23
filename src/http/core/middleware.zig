@@ -8,6 +8,7 @@ const Response = @import("response.zig").Response;
 const http = @import("http.zig");
 const Action = @import("router.zig").Action;
 const Connection = @import("server.zig").Connection;
+const expect_log = @import("expect_log.zig");
 
 const log = std.log.scoped(.anole);
 const ErrorHandler = @import("config.zig").ErrorHandler;
@@ -47,6 +48,10 @@ pub fn Middleware(comptime Ctx: type) type {
         no_wait: bool = false,
         /// `@typeName` of the middleware, for messages.
         name: []const u8 = "",
+        /// What the middleware tells the OpenAPI document: a pointer to
+        /// Anole's own record of its `pub const openapi` (set by
+        /// `Server.middleware`; this core does not read it).
+        openapi: ?*const anyopaque = null,
 
         /// A handle on `impl`, a pointer to a middleware value that must
         /// outlive the router.
@@ -147,7 +152,14 @@ pub fn Chain(comptime Ctx: type) type {
                     if (@backingInt(self.res.status) < 500) {
                         log.debug("request rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     } else {
-                        log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                        if (!expect_log.swallow()) {
+                            const url = self.req.url;
+                            self.req.log().scoped(.anole).err("unhandled error in request handler", .{
+                                .@"error" = @errorName(err),
+                                .method = self.req.method.name(),
+                                .path = if (std.mem.indexOfScalar(u8, url, '?')) |q| url[0..q] else url,
+                            });
+                        }
                     }
                 },
             };
@@ -247,11 +259,30 @@ pub const ErrorAnswer = struct { status: http.Status, body: []const u8 };
 pub fn errorStatus(err: anyerror) ?http.Status {
     return switch (err) {
         error.BodyTooBig => .payload_too_large,
+        // An open circuit breaker (`anole.resilience`): the same 503 a handler answers.
+        error.CircuitOpen => .service_unavailable,
         error.UnsupportedContentEncoding => .unsupported_media_type,
         error.InvalidZstd, error.IncompleteBody, error.MalformedBody, error.InvalidJsonBody, error.MissingBody => .bad_request,
+        // `req.bind` and friends found problems in the input (`req.violations()`).
+        error.ValidationFailed => .unprocessable_entity,
         error.BadPathName => .not_found,
         else => status_errors.get(@errorName(err)),
     };
+}
+
+/// `errorStatus` for the error named `name`, at compile time (the OpenAPI
+/// document lists the statuses a handler's error set can answer with).
+pub fn comptimeErrorStatus(comptime name: []const u8) ?u16 {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "BodyTooBig")) return 413;
+    if (eql(u8, name, "CircuitOpen")) return 503;
+    if (eql(u8, name, "UnsupportedContentEncoding")) return 415;
+    if (eql(u8, name, "InvalidZstd") or eql(u8, name, "IncompleteBody") or eql(u8, name, "MalformedBody") or
+        eql(u8, name, "InvalidJsonBody") or eql(u8, name, "MissingBody")) return 400;
+    if (eql(u8, name, "ValidationFailed")) return 422;
+    if (eql(u8, name, "BadPathName")) return 404;
+    const status = status_errors.get(name) orelse return null;
+    return @backingInt(status);
 }
 
 /// `errorStatus` with the body the default answer sends in text form
@@ -266,8 +297,19 @@ pub fn clientError(err: anyerror) ?ErrorAnswer {
 /// body, or `{"error":"..."}` (see `ServerConfig.errors`). For an
 /// `uncaughtError` or `error_handler` that handles some errors itself and
 /// leaves the rest to this.
-pub fn defaultError(_: *Request, res: *Response, err: anyerror) void {
-    res.fail(errorStatus(err) orelse .internal_server_error, "");
+pub fn defaultError(req: *Request, res: *Response, err: anyerror) void {
+    // The body was JSON and the answer says which fields are wrong, whatever
+    // `ServerConfig.errors` says.
+    if (err == error.ValidationFailed) {
+        const found = req.violations();
+        return res.problem(.{ .errors = found.items, .truncated = found.truncated });
+    }
+    const status = errorStatus(err);
+    if (status == null and res._error_detail) {
+        const text = std.fmt.allocPrint(res.arena, "Internal Server Error: {t}", .{err}) catch "";
+        return res.fail(.internal_server_error, text);
+    }
+    res.fail(status orelse .internal_server_error, "");
 }
 
 /// The standard 4xx and 5xx codes, the ones an error can be named after.
@@ -338,6 +380,7 @@ pub fn statusBody(status: http.Status) []const u8 {
 
 test "errorStatus: status-named errors, body faults, and nothing else" {
     try std.testing.expectEqual(http.Status.payload_too_large, errorStatus(error.BodyTooBig).?);
+    try std.testing.expectEqual(http.Status.service_unavailable, errorStatus(error.CircuitOpen).?);
     try std.testing.expectEqual(http.Status.unsupported_media_type, errorStatus(error.UnsupportedContentEncoding).?);
     try std.testing.expectEqual(http.Status.bad_request, errorStatus(error.InvalidJsonBody).?);
     try std.testing.expectEqual(http.Status.bad_request, errorStatus(error.MissingBody).?);
@@ -916,4 +959,25 @@ test "Executor: a middleware that wrote a body does not supply the 404" {
     try std.testing.expect(std.mem.indexOf(u8, written, "half") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "application/json") == null);
     try std.testing.expect(std.mem.endsWith(u8, written, "404 Not Found\n"));
+}
+
+test "errorStatus: ValidationFailed is 422" {
+    try std.testing.expectEqual(http.Status.unprocessable_entity, errorStatus(error.ValidationFailed).?);
+}
+
+test "defaultError: ValidationFailed answers problem+json with the request's violations, also with errors = .text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    response._error_format = .text;
+    var req: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined };
+    req.addViolation("title", "users.bad", "is bad");
+    defaultError(&req, &response, error.ValidationFailed);
+    try std.testing.expectEqual(http.Status.unprocessable_entity, response.status);
+    try std.testing.expectEqual(http.ContentType.problem_json, response.content_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"field\":\"title\",\"code\":\"users.bad\"") != null);
 }

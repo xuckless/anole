@@ -86,6 +86,15 @@ pub const SessionData = struct {
     pub fn items(self: *const SessionData) []const Entry {
         return self.entries[0..self.len];
     }
+
+    /// Empty, unmodified, the entry table left as it is: what the servers
+    /// start a request with (`.session = undefined`, then this), so a
+    /// request does not write 512 bytes nothing reads. Not for handlers
+    /// (`clear` logs out).
+    pub fn _empty(self: *SessionData) void {
+        self.len = 0;
+        self.modified = false;
+    }
 };
 
 /// `Session.init`'s settings.

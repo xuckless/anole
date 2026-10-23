@@ -3,6 +3,8 @@
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const route_pattern = @import("route_pattern.zig");
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const Method = @import("http.zig").Method;
@@ -22,6 +24,9 @@ pub const RouteInfo = struct {
     /// back (`Router.addRoute`). Null for the routes `get`, `post` and the
     /// like register.
     data: ?*const anyopaque = null,
+    /// 1-based, in registration order; 0 is "no route". The live console
+    /// keys its per-route numbers on it.
+    index: u32 = 0,
 };
 
 const NodeKind = enum {
@@ -74,6 +79,9 @@ pub const RouteOptions = struct {
     /// registration: every middleware in front of the route must say it
     /// never waits (`pub const no_wait = true`), or the route is a conflict.
     no_wait: bool = false,
+    /// Parameter names the route's handler reads (`anole.In` path fields);
+    /// one the full path lacks is a conflict. Checked at registration.
+    required_params: []const []const u8 = &.{},
 };
 
 pub fn Action(comptime Ctx: type) type {
@@ -95,6 +103,8 @@ pub fn Router(comptime Ctx: type) type {
             middlewares: []const Middleware(Ctx),
             /// See `RouteOptions.no_wait`.
             no_wait: bool = false,
+            /// The method it was registered for; null for `any`.
+            method: ?Method = null,
         };
 
         /// One method's route in `static_routes`; the methods for one path
@@ -124,13 +134,19 @@ pub fn Router(comptime Ctx: type) type {
         has_routes: bool = false,
         /// Some route was registered with `no_wait`.
         has_no_wait: bool = false,
+        /// Every route in registration order (`info.index - 1`), for the
+        /// live console's `/routes` and per-route names.
+        routes: std.ArrayList(*const Route) = .empty,
         /// A route that conflicts with one registered before it panics
         /// (a programmer error in Zig code) unless this is set: then it is
         /// left out, and the first conflict's message is kept in `conflict`
         /// for the caller to report. For route tables that come from data
         /// at run time (the C ABI's configuration), where a panic would
         /// take the host process with it.
-        record_conflicts: bool = false,
+        ///
+        /// On in test builds, so a conflicting route surfaces in `zig build
+        /// test` as an error with its message, not as a crashed test binary.
+        record_conflicts: bool = builtin.is_test,
         /// The first conflict found under `record_conflicts`.
         conflict: ?[]const u8 = null,
 
@@ -218,6 +234,20 @@ pub fn Router(comptime Ctx: type) type {
         ) !void {
             self.has_routes = true;
             if (opts.no_wait) self.has_no_wait = true;
+            if (route_pattern.problem(path)) |p| {
+                return self.conflicted("route {s} {s}: {f}", .{ if (method) |mm| mm.name() else "ANY", path, p });
+            }
+            if (opts.required_params.len > 0) {
+                var names: [64][]const u8 = undefined;
+                const n = @min(route_pattern.collectParamNames(path, &names), names.len);
+                for (opts.required_params) |want| {
+                    for (names[0..n]) |have| {
+                        if (std.mem.eql(u8, want, have)) break;
+                    } else {
+                        return self.conflicted("route {s} {s}: the handler reads the path parameter \"{s}\", but the route has no :{s} or *{s}", .{ if (method) |mm| mm.name() else "ANY", path, want, want, want });
+                    }
+                }
+            }
             if (self.findConflict(path, method)) |c| {
                 return self.conflicted("route {s} {s} conflicts with any() route {s}: both match some paths, but {s} is not more specific", .{ c.method.name(), c.method_path, c.any_path, c.method_path });
             }
@@ -312,11 +342,13 @@ pub fn Router(comptime Ctx: type) type {
             const alloc = self.arena.allocator();
             const route = try alloc.create(Route);
             route.* = .{
-                .info = .{ .path = try alloc.dupe(u8, path), .data = opts.data },
+                .info = .{ .path = try alloc.dupe(u8, path), .data = opts.data, .index = @intCast(self.routes.items.len + 1) },
                 .action = handler,
                 .middlewares = middlewares,
                 .no_wait = opts.no_wait,
+                .method = method,
             };
+            try self.routes.append(alloc, route);
             current.route = @ptrCast(route);
 
             if (method) |m| if (std.mem.indexOfAny(u8, path, ":*") == null) {
@@ -2137,4 +2169,28 @@ test "router: a no_wait route behind no_wait middleware registers" {
     router.addRouteWith(.get, "/ping", voidHandler1, .{ .no_wait = true });
     try std.testing.expect(router.conflict == null);
     try std.testing.expect(router.has_no_wait);
+}
+
+test "insertRoute: a malformed pattern is recorded under record_conflicts" {
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.record_conflicts = true;
+    router.get("/a/*x/b", testHandler);
+    try std.testing.expectEqualStrings("route GET /a/*x/b: a wildcard (*x) must be the last segment", router.conflict.?);
+}
+
+test "required_params: a name the full path lacks is recorded" {
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.record_conflicts = true;
+    router.addRouteWith(.get, "/users/:id", testHandler, .{ .required_params = &.{"id"} });
+    try std.testing.expect(router.conflict == null);
+    router.addRouteWith(.get, "/posts/:id", testHandler, .{ .required_params = &.{ "id", "slug" } });
+    try std.testing.expect(std.mem.indexOf(u8, router.conflict.?, "\"slug\"") != null);
+}
+
+test "record_conflicts defaults to true in test builds" {
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+    try std.testing.expect(router.record_conflicts);
 }

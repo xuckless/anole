@@ -5,6 +5,22 @@ files, TLS and gRPC, and how to deploy it. Each step is the shortest program
 that does the job; the other guides go further. Coming from Go's Fiber,
 [from-fiber.md](from-fiber.md) maps what you know onto Anole.
 
+## Start from a template
+
+The quickest start is the `anole` command line, which makes a project from a
+template (a small JSON API, a PostgreSQL REST API, a WebSocket chat, a gRPC
+service, or one app with most features) with its tests, an OpenAPI page and a
+ready `.env`:
+
+```sh
+anole new my-api         # download anole from the latest release, see templates.md
+cd my-api
+zig build run            # http://localhost:3000, API docs at /docs
+```
+
+[templates.md](templates.md) has the download and what each template holds.
+Or build the same thing by hand:
+
 ## A project
 
 You need Zig 0.17 (`zig version` prints `0.17.0`) on macOS or Linux, and
@@ -81,8 +97,14 @@ const anole = @import("anole");
 pub const std_options = anole.std_options;
 pub const panic = anole.panic;
 
+const v = anole.validate;
+
 const Todo = struct { id: usize, title: []const u8, done: bool = false };
-const NewTodo = struct { title: []const u8 };
+const NewTodo = struct {
+    title: []const u8,
+
+    pub const field_rules = .{ .title = .{ v.trim, v.notBlank, v.maxLength(200) } };
+};
 
 const App = struct {
     gpa: std.mem.Allocator,
@@ -112,12 +134,10 @@ fn get(app: *App, req: *anole.Request, res: *anole.Response) !void {
     try res.json(app.todos.items[id - 1]);
 }
 
-fn create(app: *App, req: *anole.Request, res: *anole.Response) !void {
-    const in = try req.bind(NewTodo);
-    if (in.title.len == 0) return res.fail(.unprocessable_entity, "the title is empty");
+fn create(app: *App, req: *anole.Request, res: *anole.Response, in: anole.In(.{ .body = NewTodo })) !void {
     try app.mutex.lock(req.io);
     defer app.mutex.unlock(req.io);
-    const title = try app.gpa.dupe(u8, in.title);
+    const title = try app.gpa.dupe(u8, in.body.title);
     errdefer app.gpa.free(title);
     const todo: Todo = .{ .id = app.todos.items.len + 1, .title = title };
     try app.todos.append(app.gpa, todo);
@@ -177,9 +197,13 @@ What each piece does:
   waits for it; `std.Thread.Mutex` would block the whole thread.
 - **Input.** `req.params` and `req.query` have `get` (a string) and
   `getInt`/`getFloat`, which return null when the value is missing or does
-  not parse. `req.bind(T)` parses a JSON body into a `T`, ignoring fields
-  `T` does not have; no body, or one that does not fit, is answered 400.
-  `req.headers.get` reads a header.
+  not parse. `anole.In(.{ .body = T })` as a handler's last parameter parses
+  the JSON body into a `T` before the handler runs, ignoring fields `T` does
+  not have, and checks the rules in `T`'s `field_rules`: a body that is not
+  JSON, or missing, is answered 400; one that is JSON but does not fit or
+  breaks a rule is a 422 that names every field
+  ([validation.md](validation.md)). `req.bind(T)` does the same from inside a
+  handler. `req.headers.get` reads a header.
 - **Memory.** What `bind` returns lives in the request's arena, freed once
   the response is sent, so `create` copies the title into the state's
   allocator. Allocate anything for this request alone from `req.arena`.
@@ -204,6 +228,25 @@ What each piece does:
   middleware for every request (before the routes), and `app.group(prefix,
   .{...})` for the routes under a prefix. `app.with(.{...})` does the same
   without a prefix, for single routes.
+
+- **Tests.** `anole.testing` runs requests in memory, with no socket
+  ([testing.md](testing.md)):
+
+  ```zig
+  test "a blank title is a 422 that names the field" {
+      var state: App = .{ .gpa = std.testing.allocator, .api_key_digest = sha256("k") };
+      defer state.deinit();
+      var app = try anole.Server(App).init(std.testing.allocator, .{ .executors = .exact(1) }, &state);
+      defer app.deinit();
+      app.post("/todos", create);
+      var t = try anole.testing.client(&app);
+      defer t.deinit();
+      var res = try t.post("/todos", .{ .json = .{ .title = "   " } });
+      defer res.deinit();
+      try res.expectStatus(.unprocessable_entity);
+      try res.expectViolation("title", "validation.not_blank");
+  }
+  ```
 
 `examples/rest` is the same API with update and delete
 (`zig build run-rest` in Anole's repository), and
@@ -356,6 +399,42 @@ curl -H 'Content-Type: application/json' -d '{"name":"Ada"}' localhost:3000/gree
 [grpc.md](grpc.md) covers streaming calls, deadlines, metadata, REST routes
 from `google.api.http` annotations, the health service and the client.
 
+## Settings and secrets
+
+Put what changes between machines in a `.env` file next to the program:
+
+```sh
+# .env (add it to .gitignore; commit a .env.example without the values)
+DATABASE_URL=postgres://app:secret@localhost/app
+PORT=3000
+```
+
+A build you run with `zig build run` is a Debug build, which Anole treats as
+`development`: it reads `.env` (and `.env.local`, `.env.development`,
+`.env.development.local`) and every environment read in Anole sees it, so
+`app.postgres(.{})` finds `DATABASE_URL` without any code. Read your own
+settings into a struct, every problem reported at once and secrets that never
+print:
+
+```zig
+const Config = struct {
+    database_url: anole.Secret,
+    port: u16 = 3000,
+    request_timeout: anole.Duration = .fromSeconds(30),
+};
+
+pub fn main(init: std.process.Init) !void {
+    const cfg = try anole.config.load(Config, init, .{});
+    var app = try anole.App.init(init.gpa, .{ .timeouts = .{ .request = cfg.request_timeout } });
+    defer app.deinit();
+    _ = cfg.database_url.expose(); // pass it to a connector's `.url`
+    try app.listen(":3000");
+}
+```
+
+A release build is `production` and reads no `.env`; the real environment
+supplies everything. See [config.md](config.md).
+
 ## Deploying
 
 **Build** with `zig build -Doptimize=ReleaseSafe`, which keeps Zig's safety
@@ -383,9 +462,12 @@ WebSockets a close, for up to 10 seconds (`.timeouts = .{ .shutdown = ... }`
 in the options). Give the process manager a little longer before it kills.
 
 **Behind a proxy** such as nginx or a cloud load balancer, set
-`.proxy = .{ .trusted_hops = 1 }` so `req.remote_address` is the
-client's address from `X-Forwarded-For` rather than the proxy's
-([server.md](server.md#behind-a-proxy)). Anole serves TLS, HTTP/2 and
+`ANOLE_DEPLOYMENT=behind_proxy` (or `.deployment = .behind_proxy`) so
+`req.remote_address` is the client's address from `X-Forwarded-For` rather
+than the proxy's, read only from the proxy's address; on Render, Heroku, Fly.io
+or Cloud Run use `ANOLE_DEPLOYMENT=platform`, which also listens on `$PORT`
+([config.md](config.md#6-deployment), [server.md](server.md#behind-a-proxy)).
+Set `ANOLE_ENV=production` where the binary is a Debug build. Anole serves TLS, HTTP/2 and
 HTTP/3 itself, so a proxy is optional.
 
 **systemd.** A minimal unit:

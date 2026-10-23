@@ -1283,10 +1283,15 @@ test "h3: a new connection given up after its first packet started a 0-RTT reque
     // right after reading its first packet.
     f.ep.test_fail_accept = true;
     try relay.replayCoalesced();
-    try io.sleep(.fromMilliseconds(300), .awake);
+    // It did start a request before it was given up (a busy machine may
+    // take a while over the handshake's first packet).
+    const GivenUp = struct {
+        fn once(ep: *Endpoint) bool {
+            return ep.test_given_up_with_tasks.load(.acquire) == 1;
+        }
+    };
+    try eventually(io, 10, GivenUp.once, f.ep);
     try std.testing.expect(!f.ep.test_fail_accept);
-    // It did start a request before it was given up.
-    try std.testing.expectEqual(@as(u32, 1), f.ep.test_given_up_with_tasks.load(.monotonic));
     // The endpoint still serves.
     const conn = try f.connect(gpa, io);
     defer conn.close();
@@ -1606,4 +1611,36 @@ test "h3 server: a response streamed past its send buffer completes and leaves n
         if (tries > 200) return error.TestUnexpectedResult;
         try io.sleep(.fromMilliseconds(10), .awake);
     }
+}
+
+test "h3 client: unprocessed is true after H3_REQUEST_REJECTED and for a request the GOAWAY did not reach" {
+    const h = @import("anole_nghttp3_c");
+    var conn: client.ClientConnection = undefined;
+    var s: client.Stream = undefined;
+    s.conn = &conn;
+    s.id = 4;
+    s.status = 0;
+    s.reset_code = 0;
+    conn.goaway_id = std.math.maxInt(i64);
+    // Nothing happened to it.
+    try std.testing.expect(!s.unprocessed());
+    // Rejected by the server (RFC 9114 H3_REQUEST_REJECTED).
+    s.reset_code = h.NGHTTP3_H3_REQUEST_REJECTED;
+    try std.testing.expect(s.unprocessed());
+    // Another error code is not "unprocessed".
+    s.reset_code = h.NGHTTP3_H3_REQUEST_CANCELLED;
+    try std.testing.expect(!s.unprocessed());
+    s.reset_code = 0;
+    // GOAWAY(8): streams at or above 8 were not processed, those below were
+    // (unless they have no head, below it they carry on).
+    conn.goaway_id = 8;
+    s.id = 4;
+    try std.testing.expect(!s.unprocessed());
+    s.id = 8;
+    try std.testing.expect(s.unprocessed());
+    s.id = 12;
+    try std.testing.expect(s.unprocessed());
+    // A request that already has its answer ran.
+    s.status = 200;
+    try std.testing.expect(!s.unprocessed());
 }

@@ -3,6 +3,211 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.3.0 (unreleased)
+
+Developer experience: settings, `.env` files and deployment modes, retries
+and circuit breakers, the NATS and Kafka clients, validation and typed
+handlers, JSON Lines logs, OpenAPI documents, project templates and the
+`anole` command line, and a live console.
+
+### Breaking
+
+- A JSON body that is valid JSON but whose values do not fit the type is now
+  422 with the violations, not 400. `req.bindWith` keeps the old behaviour.
+- Route methods (`get`, `post`, `ws`, `webtransport`... and the same on
+  groups) take `path` at compile time; `app.addRoute(method, path, handler)`
+  for a run-time path. Malformed patterns are refused. `anole.cached` on a
+  method other than GET or HEAD is a compile error.
+- The access log's JSON lines are the shared log record: `time` (RFC 3339)
+  replaces `ts`, and `level`, `scope` and `message` are added;
+  `AccessLog.Options.format` is null by default and follows the log format.
+  Without a `.file`, access lines go through the log sink (stderr, or the C
+  ABI's callback).
+- In test builds a route conflict is `error.RouteConflict` instead of a
+  panic.
+- `ServerOptions.listen_tls_http3`, `http.address`, `http.port`,
+  `http.proxy_protocol`, `https.address`, `https.proxy_protocol`,
+  `Listener.address`, `Listener.port` and `Listener.proxy_protocol` are
+  optional; null means the deployment's default (0.2's values when
+  standalone). Code that only sets them is unchanged; code that reads them
+  unwraps. JSON: `listeners[].address`, `port` and `proxy_protocol` default
+  to null.
+- `timeouts.keepalive` (`keepalive_ms`) defaults to 75 s, up from 60 s, so it
+  sits above the idle timeout of nginx and AWS load balancers.
+- `anole.db.System` has `nats` and `kafka`; an exhaustive `switch` on it
+  needs the two new cases.
+- WebSocket over HTTP/2 (RFC 8441) is off by default:
+  `http2.enable_connect_protocol` (Zig and the C ABI) defaults to false, so
+  the HTTP/2 engine no longer advertises extended CONNECT and clients open
+  WebSockets over HTTP/1.1. Measured on the x86 box, WebSocket over HTTP/2
+  served 38% fewer video-call users than HTTP/1.1 at 2.1x the CPU per
+  message (#91), and Firefox used it whenever it was offered. Set
+  `http2.enable_connect_protocol = true` to accept it again. RFC 9220 over
+  HTTP/3 (`http3.enable_connect_protocol`) stays on.
+
+### Config and modes
+
+- `anole.config.load(T, init, .{})`: typed settings from defaults,
+  per-environment defaults, a JSON or INI file, `.env` files and the
+  environment, every problem reported at once; `anole.Secret` never prints;
+  durations as `"30s"`. Adapted from zefir's confy.
+- `.env` files in development (`.env.development.local`, `.env.local`,
+  `.env.development`, `.env`), read once and used by every environment read
+  in Anole (`DATABASE_URL`, `REDIS_URL`, `OTEL_*`...); never in production or
+  tests unless named (`env_files`).
+- `environment` (`development` or `production`, `ANOLE_ENV`) and `deployment`
+  (`standalone`, `behind_proxy`, `anole_lb`, `platform`; `lambda` from 0.4;
+  `ANOLE_DEPLOYMENT`) options in Zig and the JSON config: defaults only,
+  every change printed at startup.
+- `proxy.trusted` (`ANOLE_PROXY_TRUSTED`): trusted proxies by address,
+  network or name; the client is the rightmost untrusted X-Forwarded-For
+  address; one warning for the first request that bypasses the proxy.
+- `error_detail`: 500 answers name the error in development.
+- Changed: X-Forwarded-For entries with a port give the address instead of
+  0.0.0.0.
+- Changed: with `proxy_protocol` on and no `proxy_protocol_from`, only
+  `proxy.trusted` peers may connect when `proxy.trusted` is set (any peer
+  otherwise, as before).
+
+### Validation and typed handlers
+
+- `anole.validate`: field rules on structs (`pub const field_rules`), about
+  190 rules, transforms and `v.rename`; the whole of zefir's validator.
+  `req.bind` checks them and answers 422 `application/problem+json` naming
+  every invalid field; `req.bindQuery`, `req.bindPath`, `req.bindHeaders`,
+  `req.invalid`, `res.problem`, and `anole.bindJson` for bytes without a
+  request ([validation.md](docs/validation.md)).
+- `anole.In(.{ .path, .query, .headers, .body })`: typed handler inputs, bound
+  before the handler runs and checked at compile time; typed outputs (a
+  result written as JSON, `anole.Created`, `anole.Accepted`,
+  `anole.WithStatus`) and `anole.routeInfo` for tools
+  ([routing.md](docs/routing.md#typed-handlers)).
+- Route paths are checked at compile time (a wildcard that is not last, a
+  parameter named twice, an empty name, `?` or `#`); `app.addRoute` for a
+  path known at run time.
+
+### Logging
+
+- JSON Lines logs (`ServerOptions.log`, `anole.log`, `req.log()`), JSON by
+  default in production; redaction by field name and by `anole_sensitive`
+  ([logging.md](docs/logging.md)).
+- Startup errors are two readable lines (what could not be done, why, the
+  way out), also in the C ABI's `anole_last_error`; the startup banner (the
+  anole, version, address) when a person is looking, off with
+  `ServerOptions.banner = false` or `ANOLE_NO_BANNER=1`; `anole new` shows it
+  too.
+
+### Testing
+
+- `anole.testing`: an in-memory client for routes and middleware, with
+  server-sent event streams and log capture
+  ([testing.md](docs/testing.md)).
+
+### Resilience
+
+- `anole.resilience`: retries with backoff and jitter, retry throttling and
+  circuit breakers, used by the HTTP client (`ClientOptions.retry`,
+  `.breaker`; `FetchOptions.retry`, `.idempotent`), gRPC channels
+  (`Channel.retry`, `.breaker`, `Channel.connect` with redial) and the
+  database connectors (`Options.breaker`, `Options.retry`,
+  `with(.{ .retry = true })`).
+- HTTP/2 and HTTP/3 client `Stream.unprocessed()`.
+- Changed: PostgreSQL, Redis and MongoDB calls fail fast with 503
+  (`lastError` code `circuit_open`) after 5 connection failures in a row,
+  for 5 s and then while probes fail (up to 60 s). Set `breaker = null`
+  (`"breaker": null`) for the old behaviour.
+
+### Messaging: NATS
+
+- `anole.nats` (`-Dnats`, on in `full`): NATS publish (never waits),
+  request/reply, handlers with queue groups, TLS, token, NKey and `.creds`
+  logins, and JetStream publish with ack and pull consumers. The client is
+  adapted from zefir (MIT). `app.nats(.{})`.
+- `Msg.bind(T)`: a message's JSON body bound and validated like `req.bind`.
+
+### Messaging: Kafka
+
+- `anole.kafka` (`-Dkafka`, on in `full`; needs `-Dcompression`): Anole's own
+  Kafka client on std.Io, no librdkafka. Produce (acks 0, 1 or all,
+  idempotent by default, batching, gzip/zstd/lz4, Java's partitioner),
+  consumer groups with offset commits and a dead letter topic, TLS and SASL
+  PLAIN/SCRAM. `send` queues and never waits; `produce` waits for the
+  acknowledgement. `app.kafka(.{})` reads `KAFKA_BOOTSTRAP_SERVERS`.
+- A record for a topic the cluster does not list yet (auto-create in
+  progress, Kafka 4.x answers UNKNOWN_TOPIC_OR_PARTITION meanwhile) waits for
+  it up to `producer.metadata_wait` (5 s, capped by the call's timeout; ABI
+  `metadata_wait_ms`) before failing with `UNKNOWN_TOPIC_OR_PARTITION`.
+
+### OpenAPI and CLI
+
+- OpenAPI 3.1 (`-Dopenapi`, on in `web` and `full`): `app.openapi(.{})`
+  serves /openapi.json and a Scalar page at /docs in development, built from
+  typed handlers, the validator's rules, middleware (JWT, API keys, RBAC, rate
+  limits, CSRF) and gRPC services (Connect forms and JSON transcoding);
+  `anole.doc(.{ .summary = ... }, handler)` gives a route texts and, for a
+  plain handler, types; `zig build openapi` writes openapi.json and `zig
+  build openapi-check` checks it (`addApp`). Adapted from zefir.
+- `error.OpenApiNameClash`, `OpenApiOutOfDate` and `OpenApiNotBuilt`.
+- `google/api/field_behavior.proto` is bundled (`REQUIRED`, `OUTPUT_ONLY`
+  show in the document).
+- Generated protobuf code carries the `.proto` comments as `_doc`
+  declarations (zig-protobuf pinned to xuckless/zig-protobuf e6de363).
+- The `anole` command line (`zig build cli`; binaries for five targets with
+  SHA256SUMS on each release): `anole new <dir>` and `anole init` make a
+  project from one of five templates (`minimal`, `rest-postgres`, `realtime`,
+  `grpc`, `full`), each with tests, an OpenAPI page and a ready `.env`;
+  `anole templates`, `anole version` ([templates.md](docs/templates.md)).
+- `zig build test -Dtest-filter=<text>` runs only the unit tests whose name
+  contains the text.
+- Fixed: `env.environment()` did not compile in a Debug build (`.Debug`).
+
+### Console
+
+- A live console: `anole console` attaches to a running app over a local
+  socket (logs with filters, per-route req/s and p50/p99, recent 5xx,
+  connections, databases, HTTP/3, runtime, resolved config, routes; `/reload`,
+  `/drain`, `/restart`, `/full-restart`). In development, `c` + Enter opens
+  it in the terminal the app runs in. `ServerOptions.console`, `-Dconsole`
+  ([console.md](docs/console.md)).
+- C ABI: `anole_console_open`, `anole_console_close`, `anole_console_attached`,
+  `anole_console_report`, `anole_console_log`, event 132
+  `ANOLE_EV_CONSOLE_CLOSED`, the `console` configuration group.
+- `anole console` in the CLI (`--list`, `--snapshot <view>`).
+- `RouteInfo` gains `index`; `anole_log.Context` gains `route`.
+
+### Runtime gauges
+
+- `/metrics` gains `anole_runtime_tasks`, `anole_runtime_run_queue`, `anole_runtime_stack_committed_bytes`, `anole_connections` and `anole_streams`, per executor, from zio's new `diagnostics` option.
+
+### C ABI
+
+- C ABI 0.9: the C ABI is now 0.9 (`ANOLE_ABI_VERSION`; before 1.0 a
+  binding needs the exact version). It adds the `environment` and
+  `deployment` keys and `anole_dotenv_read`; the brokers, NATS (events 64-69)
+  and Kafka (events 80-85), with handle kinds 8 and 9 and `ANOLE_E_BROKER`;
+  `ANOLE_DB_F_RETRY` and `"breaker"`/`"retry"` on databases; the `"log"`
+  callback format keys; `"banner"`; and the console calls with event 132.
+- `anole_dotenv_read`; JSON keys `environment`, `deployment`,
+  `error_detail` and `proxy.trusted`.
+- `"log": {"format", "service"}` and `"banner"` in the configuration;
+  `"access_log"`'s `"format"` gains `"auto"` (the default). With
+  `log.format` `"json"` (the default when `environment` is production) the
+  log callback's `msg` is the whole JSON record; access lines reach the
+  callback with scope `access`. A malformed route pattern is
+  `ANOLE_E_CONFIG` naming the route.
+- `"brokers"` in the configuration, `anole_nats_*`, events
+  `ANOLE_EV_NATS_MSG`, `_REPLY`, `_JS_MSG`, `_SUB_END`, `_STATUS` and
+  `_WRITABLE` (64-69), handle kinds for subscriptions and messages,
+  `ANOLE_E_BROKER`, `ANOLE_DB_F_RETRY`, `"breaker"` and `"retry"` on
+  databases. A NATS request or JetStream publish tied to an HTTP request
+  (`req`) answers `ANOLE_E_GONE` when that request ends first (aborted or
+  past its deadline); subscriptions end with `ANOLE_EV_NATS_SUB_END` when
+  the server stops.
+- Kafka: `"brokers"` entries with `"kafka"`, `anole_kafka_*` (produce,
+  flush, group subscribe with batches, assign/revoke, find/index), events
+  `ANOLE_EV_KAFKA_RECORDS`, `_DELIVERY`, `_ASSIGN`, `_REVOKE`, `_WRITABLE`
+  and `_GROUP_END` (80-85).
+
 ## 0.2.1 (2026-10-23)
 
 The relay pass: cross-task WebSocket sends, fan-out, TLS and HTTP/2

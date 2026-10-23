@@ -129,7 +129,8 @@ anything else gets a fresh ID. The JSON access log escapes IDs either way.
 `anole.observe.AccessLog` writes one line per request after the handler
 returns. Options:
 
-- `.format`: `.text` (default) or `.json`, one object per line.
+- `.format`: `.text` or `.json`, one object per line. Null by default: it
+  follows the log format (`ServerOptions.log.format`; JSON in production).
 - `.file`: a `std.Io.File` to write to; stderr when null.
 - `.exclude`: paths not logged (see [Wiring](#wiring)).
 - `.log_query`: also log the query string (false). Off by default, because
@@ -138,8 +139,9 @@ returns. Options:
   (`Logger.init(.{ .log_query = true })`).
 
 Each line is a single write, so lines from concurrent requests do not
-interleave. The line is written straight to the file, not through
-`std.log`, so log levels do not filter it.
+interleave. Without a `.file`, lines go where the logs go (stderr, or the C
+ABI's log callback, scope `access`), filtered by the runtime log level;
+with a `.file`, straight to the file.
 
 Text, from the example:
 
@@ -150,10 +152,12 @@ GET /users/7 200 123us 127.0.0.1:64505 id=c643e5d771c29ce8cc77181de02d0b2a trace
 JSON, from the example:
 
 ```json
-{"ts":1792333306429,"method":"GET","path":"/users/7","status":200,"duration_us":124,"client":"127.0.0.1:64388","route":"/users/:id","request_id":"9045897231062d793bd832ff5459f9e3","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"3d4c9f621d6f31cc"}
+{"time":"2026-10-23T09:41:07.415Z","level":"info","scope":"access","message":"GET /users/7 200","request_id":"9045897231062d793bd832ff5459f9e3","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","span_id":"3d4c9f621d6f31cc","method":"GET","path":"/users/7","route":"/users/:id","status":200,"duration_us":124,"client":"127.0.0.1:64388"}
 ```
 
-`ts` is Unix time in milliseconds. `path` is the raw target's path, the
+The line is the shared log record ([logging.md](logging.md)): `time`
+(RFC 3339 UTC; 0.2's `ts`, Unix milliseconds, is gone), `level`, `scope`
+and `message`, then the request's ids. `path` is the raw target's path, the
 query left out unless `log_query` is set. `route` appears only when a route matched. `request_id`,
 `trace_id` and `span_id` appear only when the RequestId and tracing
 middleware are installed. A handler that returns `error.NotFound` is logged
@@ -269,6 +273,24 @@ anole_http_request_duration_seconds_bucket{method="GET",route="/chain/:id",le="+
 anole_http_request_duration_seconds_sum{method="GET",route="/chain/:id"} 0.001288
 anole_http_request_duration_seconds_count{method="GET",route="/chain/:id"} 1
 ```
+
+### Runtime gauges
+
+`app.metrics` also serves gauges per executor, refreshed on every scrape:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `anole_runtime_tasks` | `executor` | Tasks alive (spawned minus finished). |
+| `anole_runtime_run_queue` | `executor` | Tasks waiting in the executor's run queue. |
+| `anole_runtime_stack_committed_bytes` | none | Memory held by coroutine stacks in use (a lower bound: stacks times their initial committed size). |
+| `anole_connections` | `executor` | Open connections. |
+| `anole_streams` | `executor`, `protocol` | Open HTTP/2 and HTTP/3 request streams. |
+
+The `anole_runtime_*` series come from zio's `diagnostics` option, which
+`anole.zio_options` turns on (one relaxed atomic add per task spawned and
+finished). A program that declares its own `zio_options` without it gets
+only `anole_connections` and `anole_streams`. A registry of your own gets
+them with `registry.runtime_gauges = true`.
 
 ## Tracing
 

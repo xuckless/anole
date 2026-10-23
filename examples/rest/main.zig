@@ -13,7 +13,9 @@
 //!   curl -H "X-Api-Key: $API_KEY" -X PUT -d '{"name":"Ada L.","email":"ada@example.com"}' localhost:3000/api/users/1
 //!   curl -H "X-Api-Key: $API_KEY" -X DELETE localhost:3000/api/users/1
 //!
-//! tests/rest_test.zig serves the same routes and checks each one.
+//! tests/rest_test.zig serves the same routes over a socket and checks each
+//! one; tests/rest_memory_test.zig does the same with anole.testing, no
+//! socket.
 const std = @import("std");
 const anole = @import("anole");
 
@@ -22,8 +24,21 @@ pub const std_options = anole.std_options;
 // A panic is logged (message and stack trace) before the process aborts.
 pub const panic = anole.panic;
 
+const v = anole.validate;
+
 const User = struct { id: u64, name: []const u8, email: []const u8 };
-const NewUser = struct { name: []const u8, email: []const u8 };
+
+/// What a request must carry. The rules are checked by `req.bind` and
+/// `anole.In`: a request that breaks them gets a 422 that names every field.
+const NewUser = struct {
+    name: []const u8,
+    email: []const u8,
+
+    pub const field_rules = .{
+        .name = .{ v.trim, v.notBlank, v.maxLength(100) },
+        .email = v.email,
+    };
+};
 
 /// Shared by every handler, on every executor: hence the lock.
 pub const Store = struct {
@@ -36,7 +51,6 @@ pub const Store = struct {
 
     /// Stores a copy of `in` under `id`: `in`'s strings die with the request.
     fn put(self: *Store, id: u64, in: NewUser) !User {
-        if (in.name.len == 0) return error.UnprocessableEntity;
         const name = try self.gpa.dupe(u8, in.name);
         errdefer self.gpa.free(name);
         const email = try self.gpa.dupe(u8, in.email);
@@ -76,18 +90,19 @@ fn get(store: *Store, req: *anole.Request, res: *anole.Response) !void {
     try res.json(store.users.get(try userId(req)) orelse return error.NotFound);
 }
 
-fn create(store: *Store, req: *anole.Request, res: *anole.Response) !void {
-    const in = try req.bind(NewUser); // no body, or not a NewUser: 400
+/// The body is the handler's last parameter: bound and checked before the
+/// handler runs (no body: 400; not a NewUser or a rule broken: 422).
+fn create(store: *Store, req: *anole.Request, res: *anole.Response, in: anole.In(.{ .body = NewUser })) !void {
     try store.mutex.lock(req.io);
     defer store.mutex.unlock(req.io);
-    const user = try store.put(store.next_id, in);
+    const user = try store.put(store.next_id, in.body);
     store.next_id += 1;
     res.status = .created;
     try res.json(user);
 }
 
 fn update(store: *Store, req: *anole.Request, res: *anole.Response) !void {
-    const in = try req.bind(NewUser);
+    const in = try req.bind(NewUser); // the same, from inside the handler
     const id = try userId(req);
     try store.mutex.lock(req.io);
     defer store.mutex.unlock(req.io);

@@ -23,11 +23,11 @@ pub const panic = std.debug.FullPanic(panicFn);
 
 fn panicFn(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @branchHint(.cold);
-    if (log_target.load(.acquire) != null) anole.logPanic(msg, first_trace_addr orelse @returnAddress());
+    if (anole.log.hasSink()) anole.logPanic(msg, first_trace_addr orelse @returnAddress());
     std.debug.defaultPanic(msg, first_trace_addr);
 }
 pub const std_options: std.Options = .{
-    .logFn = logFn,
+    .logFn = anole.logFn,
     .log_level = if (builtin.mode == .debug) .debug else .info,
     .log_scope_levels = &.{
         .{ .scope = .zio, .level = .info },
@@ -44,7 +44,6 @@ pub const std_options: std.Options = .{
 const LogTarget = struct { f: abi.LogFn, ud: ?*anyopaque };
 
 var log_target: std.atomic.Value(?*const LogTarget) = .init(null);
-var log_max: std.atomic.Value(u32) = .init(abi.LOG_INFO);
 
 fn levelOf(l: std.log.Level) u32 {
     return switch (l) {
@@ -55,18 +54,24 @@ fn levelOf(l: std.log.Level) u32 {
     };
 }
 
-fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
-    if (levelOf(level) > log_max.load(.monotonic)) return;
-    const t = log_target.load(.acquire) orelse return anole.logFn(level, scope, format, args);
-    var buf: [2048]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    w.print(format, args) catch {
-        // Cut short: what fits, marked.
-        @memcpy(buf[buf.len - 3 ..], "...");
-        w.end = buf.len;
+fn stdLevel(abi_level: u32) std.log.Level {
+    return switch (abi_level) {
+        abi.LOG_ERROR => .err,
+        abi.LOG_WARN => .warn,
+        abi.LOG_DEBUG => .debug,
+        else => .info,
     };
-    t.f(t.ud, levelOf(level), Str.of(@tagName(scope)), Str.of(w.buffered()));
 }
+
+/// Every log record (a std.log line, `anole.log`, the access log) goes to
+/// the binding's callback: in the JSON format the whole record, else the
+/// message.
+fn logSink(_: ?*anyopaque, level: std.log.Level, scope: []const u8, line: []const u8) void {
+    const t = log_target.load(.acquire) orelse return;
+    t.f(t.ud, levelOf(level), Str.of(scope), Str.of(line));
+}
+
+var log_callback: anole.log.Callback = .{ .func = logSink };
 
 // ---- the last error, per thread --------------------------------------------------
 
@@ -108,6 +113,7 @@ fn genericName(code: i32) []const u8 {
         abi.E_SYSTEM => "System",
         abi.E_TIMEOUT => "Timeout",
         abi.E_DB => "Database",
+        abi.E_BROKER => "Broker",
         else => "Unexpected",
     };
 }
@@ -127,6 +133,7 @@ fn failCode(code: i32) i32 {
         abi.E_SYSTEM => "the OS refused",
         abi.E_TIMEOUT => "the timeout passed",
         abi.E_DB => "the database refused the statement",
+        abi.E_BROKER => "the message broker refused the call or could not be reached",
         else => "error",
     }});
     last_error_name = genericName(code);
@@ -271,6 +278,9 @@ export fn anole_has_feature(name: Str) i32 {
         .{ "postgres", f.postgres },
         .{ "redis", f.redis },
         .{ "mongodb", f.mongodb },
+        .{ "nats", f.nats },
+        .{ "kafka", f.kafka },
+        .{ "console", f.console },
     };
     inline for (table) |entry| if (std.mem.eql(u8, n, entry[0])) return @intFromBool(entry[1]);
     return 0;
@@ -286,6 +296,7 @@ var atfork_registered: std.atomic.Value(bool) = .init(false);
 /// in the child by design).
 fn afterForkInChild() callconv(.c) void {
     engine.global = null;
+    anole.log.setSink(null);
     log_target.store(null, .release);
 }
 
@@ -309,25 +320,43 @@ export fn anole_server_create(options: ?*const abi.ServerOptions, out: ?*?*anyop
     const e = Engine.create(if (json.len == 0) "{}" else json, o.flags & abi.SERVER_F_SIGNALS != 0, &why) catch |err| switch (err) {
         error.Config => return named(abi.E_CONFIG, engine.config.last_problem, 0, "{s}", .{why.buffered()}),
         error.OutOfMemory => return fail(abi.E_NOMEM, "anole_server_create", err),
+        // The modes: ANOLE_ENV, ANOLE_DEPLOYMENT, PORT, ANOLE_PROXY_TRUSTED, "deployment": "lambda".
+        else => |other| return named(abi.E_CONFIG, engine.errorName(other), 0, "{s}", .{if (why.buffered().len > 0) why.buffered() else @errorName(other)}),
     };
-    log_max.store(if (o.log_level == 0) abi.LOG_INFO else o.log_level, .monotonic);
+    anole.log.setLevel(stdLevel(if (o.log_level == 0) abi.LOG_INFO else o.log_level));
     // This server's log callback, or stderr (a later server without one
     // does not inherit an earlier one's).
     if (o.log) |f| {
         if (std.heap.c_allocator.create(LogTarget)) |t| {
             t.* = .{ .f = f, .ud = o.log_ud };
             log_target.store(t, .release);
-        } else |_| log_target.store(null, .release);
-    } else log_target.store(null, .release);
+            anole.log.setSink(&log_callback);
+        } else |_| {
+            log_target.store(null, .release);
+            anole.log.setSink(null);
+        }
+    } else {
+        log_target.store(null, .release);
+        anole.log.setSink(null);
+    }
     dst.* = e;
     return abi.OK;
 }
 
 /// A start or open that failed, as an answer.
 fn startFailure(e: *Engine, err: anyerror, comptime what: []const u8) i32 {
+    const explained = e.explained[0..e.explained_len];
     // Which listener could not be bound, in the text.
     if (e.failed_listener) |i| if (i < e.listeners.len) {
         const l = &e.listeners[i];
+        // The log's own words: what could not be done, why, and the way out.
+        if (explained.len > 0) return named(
+            if (l.error_errno != 0) abi.E_SYSTEM else abi.E_CONFIG,
+            l.error_name,
+            l.error_errno,
+            "{s}",
+            .{explained},
+        );
         return named(
             if (l.error_errno != 0) abi.E_SYSTEM else abi.E_CONFIG,
             l.error_name,
@@ -344,7 +373,10 @@ fn startFailure(e: *Engine, err: anyerror, comptime what: []const u8) i32 {
         // such as metrics) that the router cannot tell apart.
         error.RouteConflict => return named(abi.E_CONFIG, "RouteConflict", 0, "routes: {s}", .{e.start_why[0..e.start_why_len]}),
         error.OutOfMemory => return fail(abi.E_NOMEM, what, err),
-        error.DatabaseUnavailable => return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), what ++ ": {t}", .{err}),
+        error.DatabaseUnavailable => {
+            if (explained.len > 0) return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), "{s}", .{explained});
+            return named(abi.E_SYSTEM, "DatabaseUnavailable", engine.errorErrno(err), what ++ ": {t}", .{err});
+        },
         else => {},
     }
     const token = engine.errorName(err);
@@ -374,6 +406,63 @@ export fn anole_server_set_ready(s: ?*anyopaque, check: Str, ready: u32) i32 {
     clearError();
     const e = engineOf(s) orelse return badPointer(s);
     e.setReady(check.slice(), ready != 0) catch return named(abi.E_INVALID, "UnknownCheck", 0, "observe.health.checks has no check \"{s}\"", .{check.slice()});
+    return abi.OK;
+}
+
+fn writeProblem(w: *std.Io.Writer, p: anole.config.Diagnostics.Problem, separator: bool) std.Io.Writer.Error!void {
+    if (separator) try w.writeAll("; ");
+    if (p.origin) |o| if (o.file) |file| {
+        if (o.line != 0) try w.print("{s}:{d}: ", .{ file, o.line }) else try w.print("{s}: ", .{file});
+    };
+    try w.writeAll(if (p.detail.len > 0) p.detail else "problem");
+}
+
+/// One `.env` variable, for `anole_dotenv_read`.
+pub const DotenvFn = *const fn (ud: ?*anyopaque, key: Str, value: Str, file: Str, line: u32) callconv(.c) void;
+
+export fn anole_dotenv_read(dir: Str, environment: Str, f: ?DotenvFn, ud: ?*anyopaque) i32 {
+    clearError();
+    const callback = f orelse return named(abi.E_INVALID, "Invalid", 0, "fn is NULL", .{});
+    const env_name = std.meta.stringToEnum(anole.Environment, environment.slice()) orelse
+        return named(abi.E_INVALID, "UnknownEnvironment", 0, "environment: \"development\" or \"production\"", .{});
+    const paths = anole.env.defaultFilesFor(env_name);
+    if (paths.len == 0) return abi.OK;
+    const tio = engine.threadedIo();
+    var scratch: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var opened: ?std.Io.Dir = null;
+    defer if (opened) |d| d.close(tio);
+    if (dir.slice().len > 0) {
+        opened = std.Io.Dir.cwd().openDir(tio, dir.slice(), .{}) catch |err|
+            return named(abi.E_CONFIG, "InvalidEnvFile", 0, "cannot open directory \"{s}\": {t}", .{ dir.slice(), err });
+    }
+    var diag: anole.config.Diagnostics = .init(a);
+    const files = anole.env.Files.load(a, tio, opened, paths, &diag) catch |err| switch (err) {
+        error.OutOfMemory => return fail(abi.E_NOMEM, "anole_dotenv_read", err),
+        error.InvalidEnvFile => {
+            // Every problem that fits, by file and line; never a value.
+            var w: std.Io.Writer = .fixed(&last_error_buf);
+            const n = diag.problems.items.len;
+            var shown: usize = 0;
+            for (diag.problems.items) |p| {
+                const before = w.end;
+                writeProblem(&w, p, shown > 0) catch {
+                    w.end = before;
+                    break;
+                };
+                shown += 1;
+            }
+            if (shown < n) w.print(" (and {d} more)", .{n - shown}) catch {};
+            last_error_len = w.end;
+            last_error_name = "InvalidEnvFile";
+            last_errno = 0;
+            return abi.E_CONFIG;
+        },
+    };
+    for (files.entries.keys(), files.entries.values()) |key, entry| {
+        callback(ud, Str.of(key), Str.of(entry.value), Str.of(entry.file), entry.line);
+    }
     return abi.OK;
 }
 
@@ -472,10 +561,85 @@ export fn anole_server_reload_tls(s: ?*anyopaque, flags: u32, cert: Str, key: St
     return abi.OK;
 }
 
+// ---- console -----------------------------------------------------------------------
+
+export fn anole_console_open(s: ?*anyopaque, flags: u32) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    if (flags != 0) return unknownFlag();
+    e.consoleOpen() catch |err| return switch (err) {
+        error.State => named(abi.E_STATE, "State", 0, "anole_console_open: the server is not running, or a console is open already", .{}),
+        error.Disabled => named(abi.E_CONFIG, "ConsoleOff", 0, "anole_console_open: the console is off (the \"console\" configuration group)", .{}),
+        error.NotATerminal, error.DumbTerminal, error.Unsupported => named(abi.E_UNSUPPORTED, "NoTerminal", 0, "anole_console_open: no terminal here (TERM=dumb, no /dev/tty, or Windows)", .{}),
+        error.OutOfMemory => fail(abi.E_NOMEM, "anole_console_open", err),
+        else => fail(abi.E_SYSTEM, "anole_console_open", err),
+    };
+    return abi.OK;
+}
+
+export fn anole_console_close(s: ?*anyopaque) i32 {
+    // The cleanup-call rule: ANOLE_OK, no error text, on one that is over.
+    const e = engineOf(s) orelse return abi.OK;
+    e.consoleClose();
+    return abi.OK;
+}
+
+export fn anole_console_attached(s: ?*anyopaque) i32 {
+    const e = engineOf(s) orelse return 0;
+    return e.consoleAttached();
+}
+
+export fn anole_console_report(s: ?*anyopaque, m: ?[*]const abi.ConsoleMetric, n: usize) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    if (n > 32) return named(abi.E_INVALID, "Invalid", 0, "anole_console_report: at most 32 metrics", .{});
+    if (n > 0 and m == null) return failCode(abi.E_INVALID);
+    var items: [32]anole.console.service.Metric = undefined;
+    for (0..n) |i| {
+        const x = m.?[i];
+        const name = x.name.slice();
+        if (name.len == 0 or name.len > 48) return named(abi.E_INVALID, "Invalid", 0, "anole_console_report: a name is 1 to 48 bytes of [a-z0-9_.]", .{});
+        for (name) |ch| {
+            if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '_' or ch == '.'))
+                return named(abi.E_INVALID, "Invalid", 0, "anole_console_report: a name is 1 to 48 bytes of [a-z0-9_.]", .{});
+        }
+        const unit: []const u8 = switch (x.unit) {
+            abi.UNIT_NONE => "",
+            abi.UNIT_BYTES => "bytes",
+            abi.UNIT_SECONDS => "seconds",
+            abi.UNIT_COUNT => "count",
+            abi.UNIT_PERCENT => "percent",
+            else => return named(abi.E_INVALID, "Invalid", 0, "anole_console_report: unknown unit", .{}),
+        };
+        items[i] = .{ .name = name, .value = x.value, .unit = unit };
+    }
+    e.consoleReport(items[0..n]) catch |err| return switch (err) {
+        error.State => named(abi.E_STATE, "State", 0, "anole_console_report: the server is not running", .{}),
+        else => fail(abi.E_NOMEM, "anole_console_report", err),
+    };
+    return abi.OK;
+}
+
+export fn anole_console_log(s: ?*anyopaque, level: u32, scope: Str, msg: Str, req: u64) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    _ = req;
+    const lvl: std.log.Level = switch (level) {
+        abi.LOG_ERROR => .err,
+        abi.LOG_WARN => .warn,
+        abi.LOG_INFO => .info,
+        abi.LOG_DEBUG => .debug,
+        else => return failCode(abi.E_INVALID),
+    };
+    e.consoleLog(lvl, scope.slice(), msg.slice());
+    return abi.OK;
+}
+
 export fn anole_server_destroy(s: ?*anyopaque) void {
     const e = engineOf(s) orelse return;
     e.destroy();
     // No log callback runs again.
+    anole.log.setSink(null);
     if (log_target.swap(null, .acq_rel)) |t| std.heap.c_allocator.destroy(@constCast(t));
 }
 
@@ -646,7 +810,7 @@ export fn anole_req_abort(r: u64) i32 {
 export fn anole_handle_release(h: u64) i32 {
     const kind = Handle.decode(h).kind;
     const valid = h != 0 and Handle.decode(h).gen != 0 and switch (kind) {
-        .request, .websocket, .grpc_call, .wt_session, .wt_stream, .db_tx => true,
+        .request, .websocket, .grpc_call, .wt_session, .wt_stream, .db_tx, .broker_sub, .broker_msg => true,
         else => false,
     };
     if (!valid) return wrongKind();
@@ -860,6 +1024,197 @@ export fn anole_wt_close(w: u64, code: u32, reason: Str) i32 {
     return abi.OK;
 }
 
+// ---- NATS ---------------------------------------------------------------------------
+
+const nats_mod = engine.nats;
+
+fn natsOf(n: ?*const anyopaque) ?*nats_mod.Broker {
+    const b: *nats_mod.Broker = @ptrCast(@alignCast(@constCast(n orelse return null)));
+    return if (engine.global == b.engine) b else null;
+}
+
+fn natsFailure(err: nats_mod.CallError) i32 {
+    return switch (err) {
+        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a subject, header, size, flag, or a consumer of another server or other than the request's)", .{}),
+        error.State => named(abi.E_STATE, "State", 0, "the server is not open, the broker is not connected, or no executor feeds this consumer", .{}),
+        error.Again => failCode(abi.E_AGAIN),
+        error.OutOfMemory => failCode(abi.E_NOMEM),
+        error.Unsupported => failCode(abi.E_UNSUPPORTED),
+        error.Gone => blk: {
+            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
+            break :blk named(abi.E_GONE, "Gone", 0, "the request, message or subscription it served is over", .{});
+        },
+    };
+}
+
+export fn anole_nats_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    const b = nats_mod.find(e, name.slice()) orelse {
+        return named(abi.E_INVALID, "Invalid", 0, "no NATS broker \"{s}\" in the configuration", .{name.slice()});
+    };
+    dst.* = b;
+    return abi.OK;
+}
+
+export fn anole_nats_index(n: ?*const anyopaque) u32 {
+    const b = natsOf(n) orelse return 0;
+    return b.index;
+}
+
+export fn anole_nats_publish(n: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi.NatsOut, flags: u32) i32 {
+    clearError();
+    const b = natsOf(n) orelse return badPointer(n);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    const out: abi.NatsOut = readSized(abi.NatsOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
+    const busy = nats_mod.publish(b, c, out, flags) catch |err| return natsFailure(err);
+    return if (busy) abi.BUSY else abi.OK;
+}
+
+export fn anole_nats_request(n: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi.NatsOut, opts: ?*const abi.NatsRequestOptions, user_data: u64) i32 {
+    clearError();
+    const b = natsOf(n) orelse return badPointer(n);
+    const c: ?*Consumer = if (c_ == null) null else (consumerOf(c_) orelse return badPointer(c_));
+    const out: abi.NatsOut = readSized(abi.NatsOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
+    const o: abi.NatsRequestOptions = if (opts) |p| readSized(abi.NatsRequestOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsRequestOptions) };
+    nats_mod.request(b, c, out, o, user_data) catch |err| return natsFailure(err);
+    return abi.OK;
+}
+
+export fn anole_nats_subscribe(n: ?*anyopaque, c_: ?*anyopaque, subject: Str, opts: ?*const abi.NatsSubscribeOptions, user_data: u64, out: ?*u64) i32 {
+    clearError();
+    const b = natsOf(n) orelse return badPointer(n);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    const o: abi.NatsSubscribeOptions = if (opts) |p| readSized(abi.NatsSubscribeOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsSubscribeOptions) };
+    dst.* = nats_mod.subscribe(b, c, subject.slice(), o, user_data) catch |err| return natsFailure(err);
+    return abi.OK;
+}
+
+export fn anole_nats_unsubscribe(sub: u64) i32 {
+    if (badKind(sub, .broker_sub)) return wrongKind();
+    const e = live() orelse return abi.OK;
+    nats_mod.unsubscribe(e, sub);
+    return abi.OK;
+}
+
+export fn anole_nats_js_publish(n: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi.NatsOut, opts: ?*const abi.NatsJsPublishOptions, user_data: u64) i32 {
+    clearError();
+    const b = natsOf(n) orelse return badPointer(n);
+    const c: ?*Consumer = if (c_ == null) null else (consumerOf(c_) orelse return badPointer(c_));
+    const out: abi.NatsOut = readSized(abi.NatsOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
+    const o: abi.NatsJsPublishOptions = if (opts) |p| readSized(abi.NatsJsPublishOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsJsPublishOptions) };
+    nats_mod.jsPublish(b, c, out, o, user_data) catch |err| return natsFailure(err);
+    return abi.OK;
+}
+
+export fn anole_nats_js_consume(n: ?*anyopaque, c_: ?*anyopaque, stream: Str, consumer: Str, opts: ?*const abi.NatsJsConsumeOptions, user_data: u64, out: ?*u64) i32 {
+    clearError();
+    const b = natsOf(n) orelse return badPointer(n);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    const o: abi.NatsJsConsumeOptions = if (opts) |p| readSized(abi.NatsJsConsumeOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.NatsJsConsumeOptions) };
+    dst.* = nats_mod.consume(b, c, stream.slice(), consumer.slice(), o, user_data) catch |err| return natsFailure(err);
+    return abi.OK;
+}
+
+export fn anole_nats_ack(m: u64, kind: u32, delay_ms: u32) i32 {
+    clearError();
+    if (badKind(m, .broker_msg)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    nats_mod.ack(e, m, kind, delay_ms) catch |err| return natsFailure(err);
+    return abi.OK;
+}
+
+// ---- Kafka --------------------------------------------------------------------------
+
+const kafka_mod = engine.kafka;
+
+fn kafkaOf(k: ?*const anyopaque) ?*kafka_mod.Broker {
+    const b: *kafka_mod.Broker = @ptrCast(@alignCast(@constCast(k orelse return null)));
+    return if (engine.global == b.engine) b else null;
+}
+
+fn kafkaFailure(err: kafka_mod.CallError) i32 {
+    return switch (err) {
+        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a topic, partition, flag, size, group or topic list, or a consumer of another server)", .{}),
+        error.State => named(abi.E_STATE, "State", 0, "the server is not open, the broker is not connected, or no executor feeds this consumer", .{}),
+        error.Again => failCode(abi.E_AGAIN),
+        error.OutOfMemory => failCode(abi.E_NOMEM),
+        error.Unsupported => failCode(abi.E_UNSUPPORTED),
+        error.Gone => blk: {
+            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
+            break :blk named(abi.E_GONE, "Gone", 0, "the batch it served is over", .{});
+        },
+    };
+}
+
+export fn anole_kafka_find(s: ?*anyopaque, name: Str, out: ?*?*anyopaque) i32 {
+    clearError();
+    const e = engineOf(s) orelse return badPointer(s);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    const b = kafka_mod.find(e, name.slice()) orelse {
+        return named(abi.E_INVALID, "Invalid", 0, "no Kafka broker \"{s}\" in the configuration", .{name.slice()});
+    };
+    dst.* = b;
+    return abi.OK;
+}
+
+export fn anole_kafka_index(k: ?*const anyopaque) u32 {
+    const b = kafkaOf(k) orelse return 0;
+    return b.index;
+}
+
+export fn anole_kafka_produce(k: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi.KafkaOut, user_data: u64) i32 {
+    clearError();
+    const b = kafkaOf(k) orelse return badPointer(k);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    const out: abi.KafkaOut = readSized(abi.KafkaOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
+    const busy = kafka_mod.produce(b, c, out, user_data) catch |err| return kafkaFailure(err);
+    return if (busy) abi.BUSY else abi.OK;
+}
+
+export fn anole_kafka_subscribe(k: ?*anyopaque, c_: ?*anyopaque, opts: ?*const abi.KafkaSubscribeOptions, user_data: u64, out: ?*u64) i32 {
+    clearError();
+    const b = kafkaOf(k) orelse return badPointer(k);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    const dst = out orelse return failCode(abi.E_INVALID);
+    const o: abi.KafkaSubscribeOptions = readSized(abi.KafkaSubscribeOptions, opts orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
+    dst.* = kafka_mod.subscribe(b, c, o, user_data) catch |err| return kafkaFailure(err);
+    return abi.OK;
+}
+
+export fn anole_kafka_batch_done(b: u64) i32 {
+    if (badKind(b, .broker_msg) or !kafka_mod.isKafka(b)) return wrongKind();
+    const e = live() orelse return abi.OK;
+    kafka_mod.batchDone(e, b);
+    return abi.OK;
+}
+
+export fn anole_kafka_batch_retry(b: u64, delay_ms: u32) i32 {
+    clearError();
+    if (badKind(b, .broker_msg) or !kafka_mod.isKafka(b)) return wrongKind();
+    const e = live() orelse return failCode(abi.E_GONE);
+    kafka_mod.batchRetry(e, b, delay_ms) catch |err| return kafkaFailure(err);
+    return abi.OK;
+}
+
+export fn anole_kafka_group_close(g: u64) i32 {
+    if (badKind(g, .broker_sub) or !kafka_mod.isKafka(g)) return wrongKind();
+    const e = live() orelse return abi.OK;
+    kafka_mod.groupClose(e, g);
+    return abi.OK;
+}
+
+export fn anole_kafka_flush(k: ?*anyopaque, c_: ?*anyopaque, user_data: u64) i32 {
+    clearError();
+    const b = kafkaOf(k) orelse return badPointer(k);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    kafka_mod.flush(b, c, user_data) catch |err| return kafkaFailure(err);
+    return abi.OK;
+}
+
 // ---- databases ---------------------------------------------------------------------
 
 const db_mod = engine.db;
@@ -888,7 +1243,7 @@ fn dbSubmit(verb: db_mod.Verb, d_: ?*anyopaque, c_: ?*anyopaque, sql: Str, param
     const ps: []const abi.DbValue = if (nparams == 0) &.{} else (params orelse return failCode(abi.E_INVALID))[0..nparams];
     for (ps) |p| if (p.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_db_value.reserved must be 0", .{});
     const o: abi.DbOptions = if (opts) |p| readSized(abi.DbOptions, p) catch |err| return sizedFailure(err) else .{ .size = @sizeOf(abi.DbOptions) };
-    if (o.flags & ~(abi.DB_F_WRITE | abi.DB_F_COALESCE | abi.DB_F_NO_PREPARE | abi.DB_F_DROP_EMPTY) != 0) return unknownFlag();
+    if (o.flags & ~(abi.DB_F_WRITE | abi.DB_F_COALESCE | abi.DB_F_NO_PREPARE | abi.DB_F_DROP_EMPTY | abi.DB_F_RETRY) != 0) return unknownFlag();
     if (o.reserved != 0) return named(abi.E_INVALID, "ReservedNotZero", 0, "anole_db_options.reserved must be 0", .{});
     db_mod.submit(d, c, verb, sql.slice(), ps, o, user_data) catch |err| return dbFailure(err);
     return abi.OK;

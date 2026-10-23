@@ -17,6 +17,22 @@ pub const Shade = enum(i32) {
     _,
 };
 
+/// Paint colours.
+pub const Color = enum(i32) {
+    COLOR_UNSPECIFIED = 0,
+    RED = 1,
+    GREEN = 2,
+    _,
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "Paint colours.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _value_docs = .{
+        .COLOR_UNSPECIFIED = "Not set.",
+    };
+};
+
 pub const Author = struct {
     name: []const u8 = &.{},
     born: i32 = 0,
@@ -642,10 +658,465 @@ pub const Empty = struct {
     }
 };
 
+/// A widget.
+pub const Widget = struct {
+    name: []const u8 = &.{},
+    etag: []const u8 = &.{},
+    secret: []const u8 = &.{},
+    old: []const u8 = &.{},
+    count: i32 = 0,
+    ucount: u32 = 0,
+    big: i64 = 0,
+    ubig: u64 = 0,
+    ratio: f64 = 0,
+    blob: []const u8 = &.{},
+    on: bool = false,
+    color: Color = @fromBackingInt(0),
+    labels: std.ArrayList([]const u8) = .empty,
+    scores: std.ArrayList(Widget.ScoresEntry) = .empty,
+    created: ?google_protobuf.Timestamp = null,
+    ttl: ?google_protobuf.Duration = null,
+    nick: ?google_protobuf.StringValue = null,
+    maybe: ?i32 = null,
+    pick: ?pick_union = null,
+
+    pub const _pick_case = enum {
+        a,
+        b,
+    };
+    pub const pick_union = union(_pick_case) {
+        a: []const u8,
+        b: i32,
+        pub const _desc_table = .{
+            .a = fdf(18, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .b = fd(19, .{ .scalar = .int32 }),
+        };
+    };
+
+    /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+    pub const _doc = "A widget.";
+
+    /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+    pub const _field_docs = .{
+        .name = "The widget's resource name.",
+    };
+
+    pub const _desc_table = .{
+        .name = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .etag = fdf(2, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .secret = fdf(3, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .old = fdf(4, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+        .count = fd(5, .{ .scalar = .int32 }),
+        .ucount = fd(6, .{ .scalar = .uint32 }),
+        .big = fd(7, .{ .scalar = .int64 }),
+        .ubig = fd(8, .{ .scalar = .uint64 }),
+        .ratio = fd(9, .{ .scalar = .double }),
+        .blob = fd(10, .{ .scalar = .bytes }),
+        .on = fd(11, .{ .scalar = .bool }),
+        .color = fd(12, .@"enum"),
+        .labels = fdf(13, .{ .repeated = .{ .scalar = .string } }, .{ .utf8_validation = .verify }),
+        .scores = fd(14, .{ .repeated = .submessage }),
+        .created = fd(15, .submessage),
+        .ttl = fd(16, .submessage),
+        .nick = fd(17, .submessage),
+        .maybe = fd(20, .{ .scalar = .int32 }),
+        .pick = fd(null, .{ .oneof = pick_union }),
+    };
+
+    /// Options of the fields that have some (`google.protobuf.FieldOptions`).
+    pub const _field_options = .{
+        .name = .{
+            .@"#raw" = "\xe2A\x01\x02",
+            .@"google.api.field_behavior" = .{.REQUIRED},
+        },
+        .etag = .{
+            .@"#raw" = "\xe2A\x01\x03",
+            .@"google.api.field_behavior" = .{.OUTPUT_ONLY},
+        },
+        .secret = .{
+            .@"#raw" = "\xe2A\x01\x04",
+            .@"google.api.field_behavior" = .{.INPUT_ONLY},
+        },
+        .old = .{
+            .@"#raw" = "\x18\x01",
+            .deprecated = true,
+        },
+    };
+
+    pub const ScoresEntry = struct {
+        key: []const u8 = &.{},
+        value: i32 = 0,
+
+        pub const _desc_table = .{
+            .key = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+            .value = fd(2, .{ .scalar = .int32 }),
+        };
+
+        /// Options of the message (`google.protobuf.MessageOptions`).
+        pub const _options = .{
+            .@"#raw" = "8\x01",
+            .map_entry = true,
+        };
+
+        /// Encodes the message to the writer
+        /// The allocator is used to generate submessages internally.
+        /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+        pub fn encode(
+            self: @This(),
+            writer: *std.Io.Writer,
+            allocator: std.mem.Allocator,
+        ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+            return protobuf.encode(writer, allocator, self);
+        }
+
+        /// Decodes the message from the bytes read from the reader.
+        pub fn decode(
+            reader: *std.Io.Reader,
+            allocator: std.mem.Allocator,
+        ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+            return protobuf.decode(@This(), reader, allocator);
+        }
+
+        /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+        /// field at a time without allocating. See `src/stream.zig`.
+        pub const StreamDecoder = protobuf.StreamDecoder(@This());
+
+        /// Deinitializes and frees the memory associated with the message.
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            return protobuf.deinit(allocator, self);
+        }
+
+        /// Duplicates the message.
+        pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+            return protobuf.dupe(@This(), self, allocator);
+        }
+
+        /// Decodes the message from the JSON string.
+        pub fn jsonDecode(
+            input: []const u8,
+            options: std.json.ParseOptions,
+            allocator: std.mem.Allocator,
+        ) !std.json.Parsed(@This()) {
+            return protobuf.json.decode(@This(), input, options, allocator);
+        }
+
+        /// Encodes the message to a JSON string.
+        pub fn jsonEncode(
+            self: @This(),
+            options: std.json.Stringify.Options,
+            pb_options: protobuf.json.Options,
+            allocator: std.mem.Allocator,
+        ) ![]const u8 {
+            return protobuf.json.encode(self, options, pb_options, allocator);
+        }
+
+        /// This method is used by std.json
+        /// internally for deserialization. DO NOT RENAME!
+        pub fn jsonParse(
+            allocator: std.mem.Allocator,
+            source: anytype,
+            options: std.json.ParseOptions,
+        ) !@This() {
+            return protobuf.json.parse(@This(), allocator, source, options);
+        }
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+pub const GetWidgetRequest = struct {
+    name: []const u8 = &.{},
+
+    pub const _desc_table = .{
+        .name = fdf(1, .{ .scalar = .string }, .{ .utf8_validation = .verify }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+pub const ListWidgetsRequest = struct {
+    page_size: i32 = 0,
+    filter: std.ArrayList([]const u8) = .empty,
+
+    pub const _desc_table = .{
+        .page_size = fd(1, .{ .scalar = .int32 }),
+        .filter = fdf(2, .{ .repeated = .{ .scalar = .string } }, .{ .utf8_validation = .verify }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
+pub const ListWidgetsResponse = struct {
+    widgets: std.ArrayList(Widget) = .empty,
+
+    pub const _desc_table = .{
+        .widgets = fd(1, .{ .repeated = .submessage }),
+    };
+
+    /// Encodes the message to the writer
+    /// The allocator is used to generate submessages internally.
+    /// Hence, an ArenaAllocator is a preferred choice if allocations are a bottleneck.
+    pub fn encode(
+        self: @This(),
+        writer: *std.Io.Writer,
+        allocator: std.mem.Allocator,
+    ) (std.Io.Writer.Error || std.mem.Allocator.Error)!void {
+        return protobuf.encode(writer, allocator, self);
+    }
+
+    /// Decodes the message from the bytes read from the reader.
+    pub fn decode(
+        reader: *std.Io.Reader,
+        allocator: std.mem.Allocator,
+    ) (protobuf.DecodingError || std.Io.Reader.Error || std.mem.Allocator.Error)!@This() {
+        return protobuf.decode(@This(), reader, allocator);
+    }
+
+    /// Streaming pull-decoder: walks a `std.Io.Reader` one wire
+    /// field at a time without allocating. See `src/stream.zig`.
+    pub const StreamDecoder = protobuf.StreamDecoder(@This());
+
+    /// Deinitializes and frees the memory associated with the message.
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        return protobuf.deinit(allocator, self);
+    }
+
+    /// Duplicates the message.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        return protobuf.dupe(@This(), self, allocator);
+    }
+
+    /// Decodes the message from the JSON string.
+    pub fn jsonDecode(
+        input: []const u8,
+        options: std.json.ParseOptions,
+        allocator: std.mem.Allocator,
+    ) !std.json.Parsed(@This()) {
+        return protobuf.json.decode(@This(), input, options, allocator);
+    }
+
+    /// Encodes the message to a JSON string.
+    pub fn jsonEncode(
+        self: @This(),
+        options: std.json.Stringify.Options,
+        pb_options: protobuf.json.Options,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        return protobuf.json.encode(self, options, pb_options, allocator);
+    }
+
+    /// This method is used by std.json
+    /// internally for deserialization. DO NOT RENAME!
+    pub fn jsonParse(
+        allocator: std.mem.Allocator,
+        source: anytype,
+        options: std.json.ParseOptions,
+    ) !@This() {
+        return protobuf.json.parse(@This(), allocator, source, options);
+    }
+};
+
 pub fn Library(comptime UserDataType: type, comptime ErrorSet: type) type {
     return struct {
         pub const package = "transcode";
         pub const service_name = "Library";
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _method_docs = .{
+            .GetBook = "Two bindings: a resource name with literals, and a short form.",
+            .CreateBook = "body: a named field; the rest from the query.",
+            .UpdateBook = "A nested field in the path, inside the body field.",
+            .ListBooks = "response_body: the repeated field alone, as a JSON array. The second\nbinding has a variable where another route has one of another name.",
+            .PublishBook = "A custom verb, after a variable; body \"*\".",
+            .StatBook = "A custom verb after a variable, on the route of GetBook's /v1/books/{name}.",
+            .BatchGet = "A custom verb after a literal.",
+            .GetFile = "** in a variable, and an anonymous *.",
+            .GetFileInfo = "** with a verb after it.",
+            .SearchBooks = "A custom HTTP method.",
+            .WatchBooks = "Server streaming: one JSON array.",
+            .UploadBooks = "Client streaming is not transcoded: 501.",
+            .Plain = "Not annotated: no REST route.",
+        };
 
         /// Options of the methods that have some (`google.protobuf.MethodOptions`).
         pub const _method_options = .{
@@ -777,5 +1248,56 @@ pub fn Library(comptime UserDataType: type, comptime ErrorSet: type) type {
         UploadBooks: *const fn (userdata: *UserDataType, reader_queue: *std.Io.Queue(Book)) ErrorSet!Book,
         /// Not annotated: no REST route.
         Plain: *const fn (userdata: *UserDataType, request: GetBookRequest) ErrorSet!Book,
+    };
+}
+
+/// Widgets of the shop.
+pub fn Widgets(comptime UserDataType: type, comptime ErrorSet: type) type {
+    return struct {
+        pub const package = "transcode";
+        pub const service_name = "Widgets";
+
+        /// Comment of the declaration in the .proto file, for tools (OpenAPI).
+        pub const _doc = "Widgets of the shop.";
+
+        /// Comments of the declarations in the .proto file, for tools (OpenAPI).
+        pub const _method_docs = .{
+            .GetWidget = "Gets a widget.\n\nIt must exist.",
+        };
+
+        /// Options of the methods that have some (`google.protobuf.MethodOptions`).
+        pub const _method_options = .{
+            .GetWidget = .{
+                .@"#raw" = "\x82\xd3\xe4\x93\x02\x16\x12\x14/v1/{name=widgets/*}",
+                .@"google.api.http" = .{
+                    .get = "/v1/{name=widgets/*}",
+                },
+            },
+            .ListWidgets = .{
+                .@"#raw" = "\x82\xd3\xe4\x93\x02\r\x12\x0b/v1/widgets",
+                .@"google.api.http" = .{
+                    .get = "/v1/widgets",
+                },
+            },
+            .Peek = .{
+                .@"#raw" = "\x90\x02\x01",
+                .idempotency_level = .NO_SIDE_EFFECTS,
+            },
+            .Watch = .{
+                .@"#raw" = "\x82\xd3\xe4\x93\x02\x12\x12\x10/v1/watch/{name}",
+                .@"google.api.http" = .{
+                    .get = "/v1/watch/{name}",
+                },
+            },
+        };
+        /// Gets a widget.
+        ///
+        /// It must exist.
+        GetWidget: *const fn (userdata: *UserDataType, request: GetWidgetRequest) ErrorSet!Widget,
+        ListWidgets: *const fn (userdata: *UserDataType, request: ListWidgetsRequest) ErrorSet!ListWidgetsResponse,
+        Peek: *const fn (userdata: *UserDataType, request: GetWidgetRequest) ErrorSet!Widget,
+        Make: *const fn (userdata: *UserDataType, request: Widget) ErrorSet!Widget,
+        Watch: *const fn (userdata: *UserDataType, request: GetWidgetRequest, writer_queue: *std.Io.Queue(Widget)) ErrorSet!void,
+        Upload: *const fn (userdata: *UserDataType, reader_queue: *std.Io.Queue(Widget)) ErrorSet!Empty,
     };
 }

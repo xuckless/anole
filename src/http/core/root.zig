@@ -22,6 +22,8 @@ pub const Ca = @import("tls_options.zig").Ca;
 pub const ClientAuth = @import("tls_options.zig").ClientAuth;
 /// A peer range for `Listener.proxy_protocol_from`.
 pub const ProxyNetwork = @import("proxy_protocol.zig").Network;
+pub const proxy_networks = @import("proxy_protocol.zig").networks;
+pub const isPublicAddress = @import("proxy_protocol.zig").isPublic;
 pub const Router = @import("router.zig").Router;
 pub const Action = @import("router.zig").Action;
 pub const RouteInfo = @import("router.zig").RouteInfo;
@@ -36,6 +38,9 @@ pub const Detached = @import("detach.zig").Detached;
 /// Task placement on zio's executors, for protocol engines outside the
 /// core (HTTP/3) that keep a connection's tasks on one executor.
 pub const placement = @import("placement.zig");
+/// Live connection and stream counts per executor.
+pub const gauges = @import("gauges.zig");
+pub const hooks = @import("hooks.zig");
 
 /// Tests that provoke `err` logs on purpose declare it here.
 pub const expect_log = @import("expect_log.zig");
@@ -64,6 +69,19 @@ pub const Headers = @import("http.zig").Headers;
 pub const Params = @import("http.zig").Params;
 pub const ContentType = @import("http.zig").ContentType;
 pub const MisuseError = @import("http.zig").MisuseError;
+pub const Violation = @import("http.zig").Violation;
+pub const Violations = @import("http.zig").Violations;
+pub const Problem = @import("http.zig").Problem;
+pub const bindJson = @import("bind.zig").bindJson;
+pub const BindOptions = @import("bind.zig").BindOptions;
+pub const BindResult = @import("bind.zig").BindResult;
+pub const UnknownFields = @import("bind.zig").UnknownFields;
+pub const route_pattern = @import("route_pattern.zig");
+/// The request mappers behind `req.bind*`, for tools that check types at compile time.
+pub const input = struct {
+    pub const strings = @import("bind_strings.zig");
+    pub const json = @import("bind.zig");
+};
 pub const ContentEncoding = @import("http.zig").ContentEncoding;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
@@ -92,6 +110,8 @@ pub const Chain = @import("middleware.zig").Chain;
 /// `error.Unauthorized`, request-body faults), or null for a 500: for
 /// middleware that records the status it will send.
 pub const errorStatus = @import("middleware.zig").errorStatus;
+/// `errorStatus` by error name, at compile time.
+pub const comptimeErrorStatus = @import("middleware.zig").comptimeErrorStatus;
 /// `errorStatus` with the default answer's text body.
 pub const clientError = @import("middleware.zig").clientError;
 /// The answer the server gives an error when nothing else does, for an
@@ -161,4 +181,9 @@ comptime {
     if (@import("build_options").use_http2) _ = @import("server/h2_test.zig");
     if (@import("build_options").use_brotli) _ = @import("brotli_io.zig");
     _ = @import("block_cache.zig");
+    _ = @import("bind.zig");
+    _ = @import("bind_strings.zig");
+    _ = @import("bind_violations.zig");
+    _ = @import("json_out.zig");
+    _ = @import("route_pattern.zig");
 }

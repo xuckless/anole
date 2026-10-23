@@ -85,6 +85,11 @@ pub const ClientStream = struct {
     host_len: usize = 0,
     read_buf: [16 * 1024]u8 = undefined,
     write_buf: [16 * 1024]u8 = undefined,
+    /// Bytes the socket accepted so far (TLS records on a TLS stream, the
+    /// handshake's among them). See `bytesSent`.
+    bytes_sent: u64 = 0,
+    /// `tcp_writer`'s own vtable, which `counting_vtable` wraps.
+    tcp_vtable: *const std.Io.Writer.VTable = undefined,
 
     /// The TLS side, allocated by the handshake so a plain stream does not
     /// carry it.
@@ -118,8 +123,43 @@ pub const ClientStream = struct {
         @memcpy(self.host_buf[0..opts.host.len], opts.host);
         self.tcp_reader = socket.reader(io, &self.read_buf);
         self.tcp_writer = socket.writer(io, &self.write_buf);
+        self.tcp_vtable = self.tcp_writer.interface.vtable;
+        self.tcp_writer.interface.vtable = &counting_vtable;
         if (opts.tls) |t| try deadline.run(handshake, .{ self, t });
         return self;
+    }
+
+    /// The socket writer's vtable with every write counted in `bytes_sent`.
+    const counting_vtable: std.Io.Writer.VTable = .{ .drain = countingDrain, .sendFile = countingSendFile };
+
+    fn fromTcpWriter(w: *std.Io.Writer) *ClientStream {
+        const tcp: *std.Io.net.Stream.Writer = @alignCast(@fieldParentPtr("interface", w));
+        return @alignCast(@fieldParentPtr("tcp_writer", tcp));
+    }
+
+    fn countingDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self = fromTcpWriter(w);
+        const buffered = w.end;
+        const n = try self.tcp_vtable.drain(w, data, splat);
+        // What the socket took: what left the buffer, then `n` of `data`.
+        self.bytes_sent += buffered - w.end + n;
+        return n;
+    }
+
+    fn countingSendFile(w: *std.Io.Writer, file_reader: *std.Io.File.Reader, limit: std.Io.Limit) std.Io.Writer.FileError!usize {
+        const self = fromTcpWriter(w);
+        const buffered = w.end;
+        const n = try self.tcp_vtable.sendFile(w, file_reader, limit);
+        self.bytes_sent += buffered - w.end + n;
+        return n;
+    }
+
+    /// How many bytes the socket has accepted since `connect` (on TLS, the
+    /// records, the handshake included). Unchanged across a failed write,
+    /// nothing of it left: a client may then run the request again on
+    /// another connection without the server ever seeing it twice.
+    pub fn bytesSent(self: *const ClientStream) u64 {
+        return self.bytes_sent;
     }
 
     fn dial(io: std.Io, opts: ConnectOptions) !std.Io.net.Stream {
@@ -370,8 +410,10 @@ test "ClientStream: plain TCP" {
     defer s.close();
     try testing.expect(!s.isTls());
     try testing.expect(s.serverCertificate() == null);
+    try testing.expectEqual(@as(u64, 0), s.bytesSent());
     try roundTrip(s, "hello\n");
     try roundTrip(s, "again\n");
+    try testing.expectEqual(@as(u64, 12), s.bytesSent());
 }
 
 test "ClientStream: TLS without TLS built in is refused" {

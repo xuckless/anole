@@ -13,6 +13,7 @@
 //! required scopes 403 `error="insufficient_scope"`.
 const std = @import("std");
 const dusty = @import("dusty");
+const declarations = @import("../openapi/declarations.zig");
 const jws = @import("jws.zig");
 const Keyring = @import("keyring.zig").Keyring;
 
@@ -70,6 +71,13 @@ pub const Options = struct {
 /// `policy` sets the required issuer and audience, leeway and `exp`
 /// rules (`anole.auth.Policy`).
 pub const RequireJwt = struct {
+    /// What the OpenAPI document says of a route behind it.
+    pub const openapi: declarations.MiddlewareDoc = .{
+        .security_schemes = &.{.{ .name = "bearerAuth", .kind = .{ .http = .{ .scheme = "bearer", .bearer_format = "JWT" } } }},
+        .security = .any,
+        .responses = .{ .unauthorized = .{ .description = "Missing, expired or invalid token" } },
+    };
+
     keys: Keys,
     policy: jws.Policy,
     options: Options = .{},

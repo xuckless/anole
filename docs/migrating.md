@@ -1,4 +1,49 @@
-# Migrating from 0.1 to 0.2
+# Migrating
+
+## 0.2 to 0.3
+
+0.3 adds settings, `.env` files, deployment modes, retries and circuit
+breakers, the NATS and Kafka clients, validation and typed handlers, JSON
+Lines logs, OpenAPI documents and a live console. Nothing you set is changed; the
+table lists what reads or behaves differently.
+
+| 0.2 | 0.3 |
+| --- | --- |
+| `opts.http.?.address` (read) | `opts.http.?.address orelse "127.0.0.1"` (null is the deployment's default) |
+| `listener.port` (read) | `listener.port orelse 8080` |
+| `.proxy = .{ .trusted_hops = 1 }` | unchanged and still works; `.deployment = .behind_proxy` (or `.proxy = .{ .trusted = &.{"private"} }`) is the recommended form: it ignores headers from peers that are not your proxy |
+| `"proxy_protocol": false` written in JSON to mean "default" | unchanged; leaving it out now means "the deployment's default" (false unless `anole_lb`) |
+| X-Forwarded-For `"1.2.3.4:5678"` gave 0.0.0.0 | gives 1.2.3.4 |
+| A Debug build read no `.env` | a Debug build is `development` and reads `.env` files from the working directory; `ANOLE_ENV=production` or `.env_files = &.{}` turns that off |
+| A Debug build's 500s said `Internal Server Error` | they name the error (`error_detail`, development); `.error_detail = false` keeps 0.2's |
+| `timeouts.keepalive` 60 s | 75 s (set `.timeouts = .{ .keepalive = .fromSeconds(60) }` for the old value) |
+| WebSockets over HTTP/2 (RFC 8441) accepted by default: Firefox opened them on the h2 connection | off: the HTTP/2 engine no longer advertises extended CONNECT, so clients open WebSockets over HTTP/1.1 (38% more video-call users, half the CPU per message, #91); `.http2 = .{ .enable_connect_protocol = true }` turns it back on. RFC 9220 over HTTP/3 is unchanged |
+| PostgreSQL, Redis and MongoDB calls tried to connect every time while the database was down | a circuit breaker is on by default: after 5 connection failures in a row calls fail at once with 503 (`lastError` code `circuit_open`); `.breaker = null` (`"breaker": null` in the C ABI) keeps 0.2's behaviour |
+| An exhaustive `switch` on `anole.db.System` | add the cases `.nats` and `.kafka` |
+| `req.bind(T)` on a body that is JSON but does not fit: 400 `{"error":"Bad Request"}` | 422 `application/problem+json` with `errors` naming each field; not JSON or no body stays 400. `req.bindWith(T, .{ .ignore_unknown_fields = true })` is the old behaviour |
+| `app.get(path, ...)` with a run-time `path` | the route methods take `comptime path`; use `app.addRoute(.get, path, handler)` |
+| A pattern with a wildcard before the end, a parameter named twice, an empty parameter name, or `?`/`#` | refused: a compile error, or a startup conflict (`ANOLE_E_CONFIG` through the C ABI) |
+| `anole.cached` on a POST route | a compile error (the cache keeps GET and HEAD answers only) |
+| Access log JSON: `{"ts":1792333306429,"method":...}` | the shared record: `{"time":"2026-10-23T09:41:07.415Z","level":"info","scope":"access","message":"GET /users/7 200",...,"method":...}`; `AccessLog.init(.{})` follows the log format (JSON in production), `.format = .text` keeps text |
+| A route conflict in a test build crashed the test binary | `run`, `listen` and `anole.testing.client` fail with `error.RouteConflict`; `app.routeConflict()` has the message |
+| C ABI: the log callback's `msg` was the message | with `log.format` `"json"` (the default when `environment` is production, which is what an unset `environment` gets) it is a whole JSON record; `"log": {"format": "text"}` keeps messages. Access log lines now reach the callback (scope `access`); `"access_log".format` defaults to `"auto"` |
+
+### C ABI JSON config (ABI 0.9)
+
+The C ABI moves to 0.9; rebuild against the new `anole.h` (`ANOLE_ABI_COMPATIBLE` asks for an exact match before 1.0).
+
+| 0.8 | 0.9 |
+| --- | --- |
+| `listeners[].address`, `port`, `proxy_protocol` defaulted to `"127.0.0.1"`, 8080, `false` | default `null`: the deployment's value (the same three under `standalone`) |
+| `timeouts.keepalive_ms` 60000 | 75000 |
+| `http2.enable_connect_protocol` true | false (`"http2": {"enable_connect_protocol": true}` for 0.8's behaviour) |
+| `proxy_protocol_from` empty: any peer | empty: `proxy.trusted` when set, else any peer |
+| the log callback's `msg` was the message | a whole JSON record when `log.format` resolves to `"json"` (an unset `environment` is production); `"log": {"format": "text"}` keeps messages; access lines reach the callback (scope `access`) |
+| a malformed route pattern was accepted | `ANOLE_E_CONFIG` naming the route |
+| PostgreSQL, Redis and MongoDB entries tried to connect on every call while the database was down | a breaker is on by default (503, `error_code` `circuit_open`); `"breaker": null` keeps 0.8's behaviour |
+| (none) | `environment`, `deployment`, `error_detail`, `proxy.trusted`, `log` (`format`, `service`), `banner`, `console`, `brokers` (`nats`, `kafka`); `databases[].breaker`, `retry`; `anole_dotenv_read`, `anole_nats_*`, `anole_kafka_*`, `anole_console_*`, `ANOLE_E_BROKER`, `ANOLE_DB_F_RETRY` |
+
+## 0.1 to 0.2
 
 0.2 batches the breaking changes of the API review. Each area has its section
 below; the changelog lists the rest. Before 1.0 there is no stability promise,

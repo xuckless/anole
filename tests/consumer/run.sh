@@ -2,7 +2,8 @@
 # tests/consumer as a user gets Anole: a copy of the project outside this
 # repository, with the path dependency replaced by `zig fetch --save` of a
 # git URL, then `zig build` (which generates the protobuf code) and `zig
-# build gen-proto` (the same into src/gen).
+# build gen-proto` (the same into src/gen), then `zig build openapi` and
+# `openapi-check`.
 #
 #   tests/consumer/run.sh [URL]
 #
@@ -41,4 +42,8 @@ PY
 test -x zig-out/bin/consumer
 "$zig" build gen-proto
 test -f src/gen/greeter.pb.zig
+# The OpenAPI document (addApp's steps): written, then checked, nothing binds.
+"$zig" build openapi
+test -s openapi.json
+"$zig" build openapi-check
 echo "consumer built against $url"

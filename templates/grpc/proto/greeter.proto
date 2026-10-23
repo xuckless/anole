@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package greeter;
+
+import "google/api/annotations.proto";
+import "google/api/field_behavior.proto";
+
+// Who to greet.
+message HelloRequest {
+  // The name to greet.
+  string name = 1 [(google.api.field_behavior) = REQUIRED];
+}
+
+message HelloReply {
+  string message = 1;
+}
+
+// Greets people. Every method is native gRPC, gRPC-Web and Connect.
+service Greeter {
+  // Says hello. Also REST by JSON transcoding: GET /v1/hello/Ada, or a POST
+  // with the request as its JSON body.
+  rpc SayHello(HelloRequest) returns (HelloReply) {
+    option (google.api.http) = {
+      get: "/v1/hello/{name}"
+      additional_bindings { post: "/v1/hello" body: "*" }
+    };
+  }
+
+  // Looks a greeting up without changing anything: Connect allows a GET.
+  rpc Lookup(HelloRequest) returns (HelloReply) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+}

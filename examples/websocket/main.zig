@@ -115,6 +115,10 @@ pub fn main(init: std.process.Init) !void {
         .http = .{ .port = port },
         // HTTPS with ALPN h2 and http/1.1: browsers use HTTP/2 here.
         .https = if (anole.features.tls != .none) .{ .port = tls_port, .cert = .dev_self_signed } else null,
+        // WebSocket over HTTP/2 (RFC 8441) is off by default (a WebSocket
+        // over HTTP/1.1 costs about half the CPU per message); this example
+        // shows both, so it turns it on.
+        .http2 = .{ .enable_connect_protocol = true },
         // Open sockets hold a graceful shutdown until they close or this
         // runs out (30 s by default); then they are cut.
         .timeouts = .{ .shutdown = .fromSeconds(5) },

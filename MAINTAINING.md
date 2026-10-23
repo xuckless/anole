@@ -15,7 +15,7 @@ that happens promptly.
 | BoringSSL | build.zig.zon | upstream commit tarball, compiled by `build/boringssl.zig` |
 | ngtcp2 1.25.0 | build.zig.zon | commit of the xuckless/ngtcp2 fork, branch `anole` (git URL) |
 | nghttp3 1.18.0 | build.zig.zon | commit of the xuckless/nghttp3 fork, branch `anole` (tarball) |
-| zlib-ng, zstd, Brotli, yyjson, hiredis | build.zig.zon | upstream release tag tarballs |
+| zlib-ng, zstd, Brotli, yyjson, hiredis, lz4 1.10.0 | build.zig.zon | upstream release tag tarballs (lz4: `-Dkafka`, built by `build/lz4.zig`) |
 | zig-protobuf | build.zig.zon | commit of the xuckless/zig-protobuf fork, branch `anole`; it pins protoc per platform |
 | websocket-zig, zig-jwt, zig-sqlite | build.zig.zon | commits of the xuckless forks, branch `anole` |
 | pg.zig | build.zig.zon | commit of the xuckless/pg.zig fork, branch `anole` (git URL) |
@@ -180,9 +180,29 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   continuations); keep it on every rebase.
 - **zig-protobuf**: upstream e9e18c7 plus security patches in the decoder
   (nesting depth bound, length-delimited fields checked against the input
-  before allocating, Timestamp validation). On an upstream move: merge it
-  into `anole`, run the fork's tests and conformance suite, re-pin, and
-  run Anole's gRPC tests and fuzz targets.
+  before allocating, Timestamp validation) plus the comment patch for the
+  OpenAPI document: the generator also emits a .proto comment as comptime
+  `_doc` (messages, enums, services), `_field_docs`, `_value_docs` and
+  `_method_docs` (about 90 lines in `bootstrapped-generator/main.zig`, test
+  in `tests/test_services.zig`). On an upstream move: merge it into
+  `anole`, re-apply that patch if the merge dropped it, run the fork's tests
+  and conformance suite, re-pin, regenerate the committed code with
+  `zig build gen-proto`, and run Anole's gRPC tests and fuzz targets.
+- **Scalar** (the OpenAPI page, `src/openapi/page.zig`): loaded by the
+  browser from jsDelivr, never bundled. To bump it, change `scalar.version`
+  and `scalar.integrity` together (the SRI hash of
+  `@scalar/api-reference@<version>/dist/browser/standalone.js`: fetch the
+  file and compute `sha384`).
+- **The templates** (`templates/<name>/`): embedded in the CLI through
+  `templates/index.zig`, which `python3 tools/anole/gen_index.py` regenerates
+  (rerun it when a file is added; `cli-test` fails on a file it doesn't list).
+  `tests/templates/run.sh` builds, tests and lints each template against this
+  checkout (CI job `templates`); a template uses only names that exist, so an
+  API change that breaks one fails there. The Scalar and OpenAPI lint pin
+  (`openapi-spec-validator==0.7.1`) is in that script.
+- **The `anole` CLI** (`tools/anole`): after tagging, `zig build cli-dist`
+  builds the five binaries and SHA256SUMS in `zig-out/dist`; attach them with
+  `gh release upload vX.Y.Z zig-out/dist/*`.
 - **pg.zig** (PostgreSQL, `-Dpostgres`): upstream master 4d63344 plus a
   read timeout, `Conn.cancel()` (CancelRequest), the automatic statement
   cache, pool `max_lifetime`/`idle_timeout`, `Pool.acquireOpts` keeping a
@@ -234,6 +254,32 @@ attribution header on every file and THIRD_PARTY_NOTICES part B current.
 - Upstream watch: look through lalinsky/dusty's commits since d3cb485 before
   each release and port the fixes that apply. The PRs open there from the
   fork (#263-#270) are left as they are.
+
+## The NATS client
+
+`src/nats/core` is adapted from zefir's `src/nats` (commit dbcc967, MIT) and
+is Anole's code now: changes land here directly. Watch zefir's `src/nats`
+for fixes and pick them by hand, as for the HTTP core. What Anole added to
+the copy: the `ClientStream` transport and TLS (`engine/Connection.zig`,
+`src/nats/transport.zig`), token, NKey and creds logins (`Options.Auth`,
+`src/nats/nkeys.zig`, `auth.zig`), `ServerAddress.tls`, `Outbound.tryPut` and
+`Client.publishNow` (a publish that never waits), and task placement
+(`Client.executor`, `placement.concurrent` in the manager). JetStream
+(`src/nats/jetstream.zig`) and the connector layer are Anole's own. Live
+tests: `tests/nats/run.sh` (a nats-server with `-js` in Docker).
+
+## The Kafka client
+
+`src/kafka` is Anole's own client (no upstream to track); the protocol
+follows Apache Kafka's message definitions, with the versions listed in
+`src/kafka/protocol.zig`. lz4 is the only C dependency: bump it like the
+other tarballs (step 2 above; lz4 is not yet in `tools/advisories.py`'s table
+or `tools/sanitize-c-libs.sh`, so check lz4's GitHub advisories by hand at a
+bump and add it to both when its tests are wired in). Live tests:
+`tests/kafka/run.sh` (Apache Kafka 4.x in KRaft mode and Redpanda, in Docker;
+CI job `kafka`). When Kafka releases a new major, run them against it before
+claiming support, and re-check the removed API versions (KIP-896 removed the
+oldest ones in 4.0).
 
 ## The docs site
 

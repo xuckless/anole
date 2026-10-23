@@ -518,3 +518,71 @@ test "redis: live app.redis: handlers, statuses, /readyz and /metrics" {
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
+
+/// What `redis.test_after_take` does to the next connection handed out, once.
+const Break = struct {
+    var mode: enum { none, before, after_bytes } = .none;
+
+    fn hook(s: *@import("../net/client_stream.zig").ClientStream) void {
+        const m = mode;
+        mode = .none;
+        switch (m) {
+            .none => return,
+            .before => {},
+            // A whole PING: bytes of the call left.
+            .after_bytes => {
+                s.writer().writeAll("*1\r\n$4\r\nPING\r\n") catch {};
+                s.writer().flush() catch {};
+            },
+        }
+        // The next write on it fails at once (EPIPE), sending nothing.
+        s.socket.shutdown(s.io, .send) catch {};
+    }
+};
+
+test "redis: live a call broken before sending on a pooled connection runs again; not once bytes left or on a fresh one" {
+    _ = try testUrl();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    redis.test_after_take = Break.hook;
+    defer redis.test_after_take = null;
+    defer Break.mode = .none;
+
+    {
+        // Fresh: the first call dials its connection, so it is not run again.
+        const r = try open(io, .{});
+        defer r.deinit();
+        const level = quiet();
+        defer testing.log_level = level;
+        Break.mode = .before;
+        try testing.expectError(error.ServiceUnavailable, r.incr(&c, "anole:test:resend"));
+    }
+
+    const r = try open(io, .{});
+    defer r.deinit();
+    _ = try r.del(&c, .{"anole:test:resend"});
+    defer _ = r.del(&c, .{"anole:test:resend"}) catch {};
+
+    // Pooled, nothing sent: run once more on another connection, once.
+    {
+        const level = quiet();
+        defer testing.log_level = level;
+        Break.mode = .before;
+        try testing.expectEqual(@as(i64, 1), try r.incr(&c, "anole:test:resend"));
+        try testing.expect(Break.mode == .none);
+    }
+    try testing.expectEqual(@as(i64, 1), try r.one(i64, &c, .{ "GET", "anole:test:resend" }));
+
+    // Pooled, bytes of the call already left: not run again.
+    {
+        const level = quiet();
+        defer testing.log_level = level;
+        Break.mode = .after_bytes;
+        try testing.expectError(error.ServiceUnavailable, r.incr(&c, "anole:test:resend"));
+    }
+    try testing.expectEqual(@as(i64, 1), try r.one(i64, &c, .{ "GET", "anole:test:resend" }));
+}

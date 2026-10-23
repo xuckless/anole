@@ -4,7 +4,7 @@
 const std = @import("std");
 
 pub const version_major: u32 = 0;
-pub const version_minor: u32 = 8;
+pub const version_minor: u32 = 9;
 pub const version: u32 = (version_major << 16) | version_minor;
 
 pub const Status = i32;
@@ -21,6 +21,7 @@ pub const E_TOOBIG: Status = -8;
 pub const E_SYSTEM: Status = -9;
 pub const E_TIMEOUT: Status = -10;
 pub const E_DB: Status = -11;
+pub const E_BROKER: Status = -12;
 
 pub const Str = extern struct {
     ptr: ?[*]const u8 = null,
@@ -112,6 +113,21 @@ pub const EventType = enum(u32) {
     ws_upgrade = 40,
     /// http-realtime: the drain started.
     draining = 41,
+    /// The in-process console closed (`anole_console_open`); 133-135 are
+    /// reserved for the console.
+    console_closed = 132,
+    nats_msg = 64,
+    nats_reply = 65,
+    nats_js_msg = 66,
+    nats_sub_end = 67,
+    nats_status = 68,
+    nats_writable = 69,
+    kafka_records = 80,
+    kafka_delivery = 81,
+    kafka_assign = 82,
+    kafka_revoke = 83,
+    kafka_writable = 84,
+    kafka_group_end = 85,
 };
 
 pub const Event = extern struct {
@@ -156,6 +172,32 @@ pub const AbortEvent = extern struct {
     ev: Event,
     reason: u16,
     status: u16,
+    reserved: u32 = 0,
+};
+
+/// ANOLE_EV_CONSOLE_CLOSED.
+pub const ConsoleClosedEvent = extern struct {
+    ev: Event,
+    reason: u32,
+    reserved: u32 = 0,
+};
+
+/// Why the in-process console closed (ConsoleClosedEvent.reason).
+pub const CONSOLE_QUIT: u32 = 0;
+pub const CONSOLE_INTERRUPT: u32 = 1;
+pub const CONSOLE_RESTARTING: u32 = 2;
+
+pub const UNIT_NONE: u32 = 0;
+pub const UNIT_BYTES: u32 = 1;
+pub const UNIT_SECONDS: u32 = 2;
+pub const UNIT_COUNT: u32 = 3;
+pub const UNIT_PERCENT: u32 = 4;
+
+/// One language metric `/runtime` shows (`anole_console_report`).
+pub const ConsoleMetric = extern struct {
+    name: Str,
+    value: f64,
+    unit: u32,
     reserved: u32 = 0,
 };
 
@@ -312,6 +354,7 @@ pub const DB_F_WRITE: u32 = 1;
 pub const DB_F_COALESCE: u32 = 2;
 pub const DB_F_NO_PREPARE: u32 = 4;
 pub const DB_F_DROP_EMPTY: u32 = 8;
+pub const DB_F_RETRY: u32 = 16;
 
 pub const DbOptions = extern struct {
     size: usize,
@@ -391,6 +434,260 @@ pub const DbCell = extern struct {
     /// PostgreSQL: the column's type OID; 0 otherwise.
     db_type: u32 = 0,
     v: extern union { i: i64, f: f64, s: Span },
+};
+
+// ---- Brokers (NATS) --------------------------------------------------------
+
+/// `anole_nats_request_options.flags`: retry NoResponders with the broker's "retry".
+pub const NATS_F_RETRY: u32 = 1;
+/// `anole_nats_js_publish_options.flags`: check `expected_last_seq` (allows 0).
+pub const NATS_JS_F_EXPECT_LAST_SEQ: u32 = 1;
+
+/// `anole_nats_subscribe_options.overflow`.
+pub const NATS_DROP_NEWEST: u32 = 0;
+pub const NATS_DROP_OLDEST: u32 = 1;
+pub const NATS_CLOSE: u32 = 2;
+
+/// `anole_nats_ack`'s kind.
+pub const NATS_ACK: u32 = 0;
+pub const NATS_NAK: u32 = 1;
+pub const NATS_TERM: u32 = 2;
+pub const NATS_PROGRESS: u32 = 3;
+
+/// `anole_nats_reply_event.op`.
+pub const NATS_OP_REQUEST: u8 = 0;
+pub const NATS_OP_JS_PUBLISH: u8 = 1;
+
+/// `anole_broker_end_event.reason`.
+pub const BROKER_END_CLOSED: u32 = 0;
+pub const BROKER_END_DRAINED: u32 = 1;
+pub const BROKER_END_SLOW: u32 = 2;
+pub const BROKER_END_DENIED: u32 = 3;
+pub const BROKER_END_FAILED: u32 = 4;
+
+/// `anole_broker_status_event.status`.
+pub const BROKER_CONNECTED: u32 = 0;
+pub const BROKER_DISCONNECTED: u32 = 1;
+pub const BROKER_RECONNECTED: u32 = 2;
+pub const BROKER_LAME_DUCK: u32 = 3;
+pub const BROKER_WRITABLE: u32 = 4;
+
+/// A message to publish or a request to send (`anole_nats_out`).
+pub const NatsOut = extern struct {
+    size: usize,
+    subject: Str = .{},
+    /// Empty: none.
+    reply: Str = .{},
+    headers: ?[*]const Header = null,
+    nheaders: usize = 0,
+    data: ?[*]const u8 = null,
+    len: usize = 0,
+};
+
+pub const NatsRequestOptions = extern struct {
+    size: usize,
+    flags: u32 = 0,
+    /// 0: the broker's timeout_ms; ANOLE_DB_TIMEOUT_NONE: none.
+    timeout_ms: u32 = 0,
+    /// The request or gRPC call this serves, or 0.
+    req: u64 = 0,
+};
+
+pub const NatsSubscribeOptions = extern struct {
+    size: usize,
+    queue: Str = .{},
+    max_messages: u32 = 0,
+    max_bytes: u32 = 0,
+    overflow: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const NatsJsPublishOptions = extern struct {
+    size: usize,
+    msg_id: Str = .{},
+    expected_stream: Str = .{},
+    expected_last_seq: u64 = 0,
+    timeout_ms: u32 = 0,
+    flags: u32 = 0,
+    req: u64 = 0,
+};
+
+pub const NatsJsConsumeOptions = extern struct {
+    size: usize,
+    max_inflight: u32 = 0,
+    expires_ms: u32 = 0,
+};
+
+/// ANOLE_EV_NATS_MSG and ANOLE_EV_NATS_JS_MSG. Followed by the headers
+/// (`headers_off`: `nheaders` name/value `anole_span` pairs) and the bytes
+/// the spans name.
+pub const NatsMsgEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    sub: u64,
+    subject: Span,
+    reply: Span,
+    headers_off: u32,
+    nheaders: u32,
+    payload: Span,
+    status: u16,
+    reserved16: u16,
+    reserved: u32,
+    stream_seq: u64,
+    consumer_seq: u64,
+    delivered: u64,
+    pending: u64,
+    timestamp_ns: i64,
+    stream: Span,
+    consumer: Span,
+};
+
+/// ANOLE_EV_NATS_REPLY: the answer to anole_nats_request or anole_nats_js_publish.
+pub const NatsReplyEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    op: u8,
+    subject: Span,
+    headers_off: u32,
+    nheaders: u32,
+    payload: Span,
+    msg_status: u16,
+    duplicate: u16,
+    reserved: u32,
+    seq: u64,
+    stream: Span,
+    @"error": Span,
+    error_code: Span,
+};
+
+/// ANOLE_EV_NATS_SUB_END.
+pub const BrokerEndEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    reason: u32,
+    reserved: u32,
+    dropped: u64,
+    @"error": Span,
+};
+
+/// ANOLE_EV_NATS_WRITABLE.
+pub const BrokerStatusEvent = extern struct {
+    ev: Event,
+    broker: u32,
+    status: u32,
+};
+
+// ---- Brokers (Kafka) -------------------------------------------------------
+
+/// `anole_kafka_out.flags`. Bit 0 stays ANOLE_BODY_BORROW, refused here.
+pub const KAFKA_F_NULL_KEY: u32 = 2;
+pub const KAFKA_F_NULL_VALUE: u32 = 4;
+pub const KAFKA_F_NO_REPORT: u32 = 8;
+
+/// `anole_kafka_subscribe_options.start`.
+pub const KAFKA_START_LATEST: u32 = 0;
+pub const KAFKA_START_EARLIEST: u32 = 1;
+/// `anole_kafka_subscribe_options.assignor`.
+pub const KAFKA_ASSIGN_RANGE: u32 = 0;
+pub const KAFKA_ASSIGN_ROUNDROBIN: u32 = 1;
+
+/// `anole_kafka_record.flags`.
+pub const KAFKA_REC_F_NULL_KEY: u32 = 1;
+pub const KAFKA_REC_F_NULL_VALUE: u32 = 2;
+
+/// A record to produce (`anole_kafka_out`).
+pub const KafkaOut = extern struct {
+    size: usize,
+    topic: Str = .{},
+    /// -1: by key (murmur2), sticky without a key.
+    partition: i32 = -1,
+    flags: u32 = 0,
+    key: Str = .{},
+    value: ?[*]const u8 = null,
+    len: usize = 0,
+    headers: ?[*]const Header = null,
+    nheaders: usize = 0,
+    /// 0: now.
+    timestamp_ms: i64 = 0,
+};
+
+pub const KafkaSubscribeOptions = extern struct {
+    size: usize,
+    group: Str = .{},
+    topics: ?[*]const Str = null,
+    ntopics: usize = 0,
+    instance_id: Str = .{},
+    start: u32 = 0,
+    assignor: u32 = 0,
+    max_batch: u32 = 0,
+    prefetch_bytes: u32 = 0,
+    session_timeout_ms: u32 = 0,
+    rebalance_timeout_ms: u32 = 0,
+    commit_interval_ms: u32 = 0,
+    reserved: u32 = 0,
+};
+
+/// One record of an ANOLE_EV_KAFKA_RECORDS. Its spans and `headers_off`
+/// count from the start of the event's record.
+pub const KafkaRecord = extern struct {
+    offset: i64,
+    timestamp_ms: i64,
+    key: Span,
+    value: Span,
+    headers_off: u32,
+    nheaders: u32,
+    flags: u32,
+    reserved: u32,
+};
+
+/// ANOLE_EV_KAFKA_RECORDS: the records of one partition, `nrecords`
+/// `anole_kafka_record`s at `records_off`, then the headers and bytes.
+pub const KafkaRecordsEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    group: u64,
+    topic: Span,
+    partition: i32,
+    nrecords: u32,
+    records_off: u32,
+    reserved: u32,
+    high_watermark: i64,
+};
+
+/// ANOLE_EV_KAFKA_DELIVERY: what became of a produced record, or (topic
+/// empty) of an `anole_kafka_flush`.
+pub const KafkaDeliveryEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    reserved: u8,
+    partition: i32,
+    reserved2: u32,
+    offset: i64,
+    timestamp_ms: i64,
+    topic: Span,
+    @"error": Span,
+    error_code: Span,
+};
+
+pub const KafkaPartition = extern struct {
+    topic: Span,
+    partition: i32,
+    reserved: u32,
+};
+
+/// ANOLE_EV_KAFKA_ASSIGN and ANOLE_EV_KAFKA_REVOKE: `nentries`
+/// `anole_kafka_partition`s at `entries_off`, then the topic names.
+pub const KafkaAssignEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    entries_off: u32,
+    nentries: u32,
 };
 
 pub const POLL_F_NOARM: u32 = 1;
@@ -479,6 +776,8 @@ comptime {
     std.debug.assert(@sizeOf(Span) == 8);
     std.debug.assert(@sizeOf(RequestEvent) == 128);
     std.debug.assert(@sizeOf(AbortEvent) == 24);
+    std.debug.assert(@sizeOf(ConsoleClosedEvent) == 24);
+    std.debug.assert(@sizeOf(ConsoleMetric) == 32);
     std.debug.assert(@sizeOf(ListenerInfo) == 72);
     std.debug.assert(@sizeOf(SentEvent) == 32);
     std.debug.assert(@sizeOf(WsMessageEvent) == 32);
@@ -496,6 +795,22 @@ comptime {
     std.debug.assert(@sizeOf(WtCodeEvent) == 24);
     std.debug.assert(@sizeOf(WtDatagramEvent) == 32);
     std.debug.assert(@sizeOf(WtCloseEvent) == 40);
+    std.debug.assert(@sizeOf(NatsOut) == 72);
+    std.debug.assert(@sizeOf(NatsRequestOptions) == 24);
+    std.debug.assert(@sizeOf(NatsSubscribeOptions) == 40);
+    std.debug.assert(@sizeOf(NatsJsPublishOptions) == 64);
+    std.debug.assert(@sizeOf(NatsJsConsumeOptions) == 16);
+    std.debug.assert(@sizeOf(NatsMsgEvent) == 128);
+    std.debug.assert(@sizeOf(NatsReplyEvent) == 96);
+    std.debug.assert(@sizeOf(BrokerEndEvent) == 48);
+    std.debug.assert(@sizeOf(BrokerStatusEvent) == 24);
+    std.debug.assert(@sizeOf(KafkaOut) == 88);
+    std.debug.assert(@sizeOf(KafkaSubscribeOptions) == 88);
+    std.debug.assert(@sizeOf(KafkaRecord) == 48);
+    std.debug.assert(@sizeOf(KafkaRecordsEvent) == 64);
+    std.debug.assert(@sizeOf(KafkaDeliveryEvent) == 80);
+    std.debug.assert(@sizeOf(KafkaPartition) == 16);
+    std.debug.assert(@sizeOf(KafkaAssignEvent) == 32);
 }
 
 /// Records are padded to this.
@@ -522,6 +837,8 @@ pub const records = .{
     .{ "anole_span", Span },
     .{ "anole_request_event", RequestEvent },
     .{ "anole_abort_event", AbortEvent },
+    .{ "anole_console_closed_event", ConsoleClosedEvent },
+    .{ "anole_console_metric", ConsoleMetric },
     .{ "anole_sent_event", SentEvent },
     .{ "anole_ws_message_event", WsMessageEvent },
     .{ "anole_ws_close_event", WsCloseEvent },
@@ -539,6 +856,22 @@ pub const records = .{
     .{ "anole_db_tx_options", DbTxOptions },
     .{ "anole_db_cell", DbCell },
     .{ "anole_db_result_event", DbResultEvent },
+    .{ "anole_nats_out", NatsOut },
+    .{ "anole_nats_request_options", NatsRequestOptions },
+    .{ "anole_nats_subscribe_options", NatsSubscribeOptions },
+    .{ "anole_nats_js_publish_options", NatsJsPublishOptions },
+    .{ "anole_nats_js_consume_options", NatsJsConsumeOptions },
+    .{ "anole_nats_msg_event", NatsMsgEvent },
+    .{ "anole_nats_reply_event", NatsReplyEvent },
+    .{ "anole_broker_end_event", BrokerEndEvent },
+    .{ "anole_broker_status_event", BrokerStatusEvent },
+    .{ "anole_kafka_out", KafkaOut },
+    .{ "anole_kafka_subscribe_options", KafkaSubscribeOptions },
+    .{ "anole_kafka_record", KafkaRecord },
+    .{ "anole_kafka_records_event", KafkaRecordsEvent },
+    .{ "anole_kafka_delivery_event", KafkaDeliveryEvent },
+    .{ "anole_kafka_partition", KafkaPartition },
+    .{ "anole_kafka_assign_event", KafkaAssignEvent },
 };
 
 /// A variable part of a record, reached through an offset or a span in it.
@@ -560,12 +893,18 @@ pub const arrays = [_]ArrayInfo{
     .{ .record = "anole_grpc_call_event", .name = "metadata", .at = "metadata_off", .item = "anole_span", .count = "2*nmetadata" },
     .{ .record = "anole_db_result_event", .name = "columns", .span = "columns", .item = "anole_span", .count = "ncolumns" },
     .{ .record = "anole_db_result_event", .name = "cells", .span = "cells", .item = "anole_db_cell", .count = "nrows*ncolumns" },
+    .{ .record = "anole_nats_msg_event", .name = "headers", .at = "headers_off", .item = "anole_span", .count = "2*nheaders" },
+    .{ .record = "anole_nats_reply_event", .name = "headers", .at = "headers_off", .item = "anole_span", .count = "2*nheaders" },
+    .{ .record = "anole_kafka_records_event", .name = "records", .at = "records_off", .item = "anole_kafka_record", .count = "nrecords" },
+    .{ .record = "anole_kafka_assign_event", .name = "entries", .at = "entries_off", .item = "anole_kafka_partition", .count = "nentries" },
 };
 
 pub const HandleKindInfo = struct { kind: u8, name: []const u8, c_type: []const u8 };
 
+/// (A Kafka group is a `broker_sub` and a Kafka batch a `broker_msg`; the
+/// c_type names the NATS use.)
 /// The kind lives in bits 28-31 of a handle (`engine.Handle`). 7 is
-/// reserved for a per-query handle; 8-15 are reserved.
+/// reserved for a per-query handle; 10-15 are reserved.
 pub const handle_kinds = [_]HandleKindInfo{
     .{ .kind = 1, .name = "request", .c_type = "anole_req" },
     .{ .kind = 2, .name = "websocket", .c_type = "anole_ws" },
@@ -573,6 +912,8 @@ pub const handle_kinds = [_]HandleKindInfo{
     .{ .kind = 4, .name = "wt_session", .c_type = "anole_wt" },
     .{ .kind = 5, .name = "wt_stream", .c_type = "anole_wt_stream" },
     .{ .kind = 6, .name = "db_tx", .c_type = "anole_db_tx" },
+    .{ .kind = 8, .name = "broker_sub", .c_type = "anole_nats_sub" },
+    .{ .kind = 9, .name = "broker_msg", .c_type = "anole_nats_msg" },
 };
 
 pub const EventInfo = struct {
@@ -610,6 +951,19 @@ pub const events = [_]EventInfo{
     .{ .type = 27, .name = "ANOLE_EV_WT_DATAGRAM", .record = "anole_wt_datagram_event", .handles = &.{"wt_session"} },
     .{ .type = 40, .name = "ANOLE_EV_WS_UPGRADE", .record = "anole_request_event", .handles = &.{"request"}, .obligation = "accept or answer" },
     .{ .type = 41, .name = "ANOLE_EV_DRAINING", .record = "anole_event" },
+    .{ .type = 132, .name = "ANOLE_EV_CONSOLE_CLOSED", .record = "anole_console_closed_event" },
+    .{ .type = 64, .name = "ANOLE_EV_NATS_MSG", .record = "anole_nats_msg_event", .handles = &.{"broker_sub"} },
+    .{ .type = 65, .name = "ANOLE_EV_NATS_REPLY", .record = "anole_nats_reply_event" },
+    .{ .type = 66, .name = "ANOLE_EV_NATS_JS_MSG", .record = "anole_nats_msg_event", .handles = &.{"broker_msg"}, .obligation = "ack" },
+    .{ .type = 67, .name = "ANOLE_EV_NATS_SUB_END", .record = "anole_broker_end_event", .handles = &.{"broker_sub"} },
+    .{ .type = 68, .name = "ANOLE_EV_NATS_STATUS", .record = "anole_broker_status_event" },
+    .{ .type = 69, .name = "ANOLE_EV_NATS_WRITABLE", .record = "anole_broker_status_event" },
+    .{ .type = 80, .name = "ANOLE_EV_KAFKA_RECORDS", .record = "anole_kafka_records_event", .handles = &.{"broker_msg"}, .obligation = "batch_done or batch_retry" },
+    .{ .type = 81, .name = "ANOLE_EV_KAFKA_DELIVERY", .record = "anole_kafka_delivery_event" },
+    .{ .type = 82, .name = "ANOLE_EV_KAFKA_ASSIGN", .record = "anole_kafka_assign_event", .handles = &.{"broker_sub"} },
+    .{ .type = 83, .name = "ANOLE_EV_KAFKA_REVOKE", .record = "anole_kafka_assign_event", .handles = &.{"broker_sub"} },
+    .{ .type = 84, .name = "ANOLE_EV_KAFKA_WRITABLE", .record = "anole_broker_status_event" },
+    .{ .type = 85, .name = "ANOLE_EV_KAFKA_GROUP_END", .record = "anole_broker_end_event", .handles = &.{"broker_sub"} },
 };
 
 pub const EventRange = struct { from: u32, to: u32, use: []const u8 };
@@ -637,6 +991,8 @@ pub const constant_groups = [_]ConstantGroup{
     .{ .prefix = "ANOLE_BUSY", .group = "status" },
     .{ .prefix = "ANOLE_EV_", .group = "event" },
     .{ .prefix = "ANOLE_ABORT_", .group = "abort_reason" },
+    .{ .prefix = "ANOLE_CONSOLE_", .group = "console_reason" },
+    .{ .prefix = "ANOLE_UNIT_", .group = "console_unit" },
     .{ .prefix = "ANOLE_LOG_", .group = "log_level" },
     .{ .prefix = "ANOLE_SERVER_F_", .group = "server_flag" },
     .{ .prefix = "ANOLE_CONSUMER_F_", .group = "consumer_flag" },
@@ -663,6 +1019,18 @@ pub const constant_groups = [_]ConstantGroup{
     .{ .prefix = "ANOLE_DB_TX_", .group = "db_tx_flag" },
     .{ .prefix = "ANOLE_DB_ISOLATION_", .group = "db_isolation" },
     .{ .prefix = "ANOLE_DB_TIMEOUT_", .group = "db_timeout" },
+    .{ .prefix = "ANOLE_NATS_F_", .group = "nats_flag" },
+    .{ .prefix = "ANOLE_NATS_JS_F_", .group = "nats_js_flag" },
+    .{ .prefix = "ANOLE_NATS_DROP_", .group = "nats_overflow" },
+    .{ .prefix = "ANOLE_NATS_CLOSE", .group = "nats_overflow" },
+    .{ .prefix = "ANOLE_NATS_OP_", .group = "nats_op" },
+    .{ .prefix = "ANOLE_NATS_", .group = "nats_ack" },
+    .{ .prefix = "ANOLE_KAFKA_REC_F_", .group = "kafka_record_flag" },
+    .{ .prefix = "ANOLE_KAFKA_F_", .group = "kafka_flag" },
+    .{ .prefix = "ANOLE_KAFKA_START_", .group = "kafka_start" },
+    .{ .prefix = "ANOLE_KAFKA_ASSIGN_", .group = "kafka_assignor" },
+    .{ .prefix = "ANOLE_BROKER_END_", .group = "broker_end" },
+    .{ .prefix = "ANOLE_BROKER_", .group = "broker_status" },
     .{ .prefix = "ANOLE_ABI_", .group = "abi" },
 };
 
@@ -674,6 +1042,7 @@ pub const error_names = [_][]const u8{
     "AddressInUse",
     "AddressNotAvailable",
     "Again",
+    "Broker",
     "Canceled",
     "CertificateFileUnreadable",
     "ClientCaFileUnreadable",
@@ -681,6 +1050,7 @@ pub const error_names = [_][]const u8{
     "ConsumerWithoutExecutor",
     "Database",
     "DatabaseUnavailable",
+    "DeploymentUnavailable",
     "DuplicateListenerName",
     "FileNotFound",
     "Gone",
@@ -693,6 +1063,8 @@ pub const error_names = [_][]const u8{
     "Invalid",
     "InvalidCertificate",
     "InvalidClientCa",
+    "InvalidEnvFile",
+    "InvalidEnvironmentVariable",
     "InvalidKey",
     "InvalidListenAddress",
     "InvalidListenerName",
@@ -708,7 +1080,11 @@ pub const error_names = [_][]const u8{
     "NoTlsListener",
     "NotRunning",
     "OneServerPerProcess",
+    "OpenApiNameClash",
+    "OpenApiNotBuilt",
+    "OpenApiOutOfDate",
     "OutOfMemory",
+    "ProxyProtocolNoPeers",
     "ReservedNotZero",
     "RouteConflict",
     "ServerAlreadyOnThread",
@@ -724,6 +1100,7 @@ pub const error_names = [_][]const u8{
     "TooManyOpenFiles",
     "Unexpected",
     "UnknownCheck",
+    "UnknownEnvironment",
     "UnknownField",
     "UnknownFlag",
     "UnknownKey",

@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{name}}</title>
+<style>
+  body { font: 16px system-ui; max-width: 40em; margin: 2em auto; padding: 0 1em }
+  #log { white-space: pre-wrap; border: 1px solid #8884; padding: .5em; min-height: 12em }
+</style>
+<h1>{{name}}</h1>
+<p>Room: <select id="room"><option>lobby</option><option>random</option></select></p>
+<div id="log"></div>
+<form id="f"><input id="m" autofocus autocomplete="off"> <button>Send</button></form>
+<script>
+  const log = (line) => document.getElementById("log").append(line + "\n");
+  const room = document.getElementById("room");
+  let ws;
+  function join() {
+    if (ws) ws.close();
+    document.getElementById("log").textContent = "";
+    const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(scheme + "//" + location.host + "/ws?room=" + room.value);
+    ws.onmessage = (e) => { const m = JSON.parse(e.data); log(m.room + ": " + m.text); };
+    ws.onclose = () => log("* closed");
+  }
+  room.onchange = join;
+  document.getElementById("f").onsubmit = (e) => {
+    e.preventDefault();
+    const m = document.getElementById("m");
+    if (m.value && ws.readyState === WebSocket.OPEN) ws.send(m.value);
+    m.value = "";
+  };
+  join();
+</script>

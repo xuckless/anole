@@ -976,3 +976,195 @@ test "gRPC: grpc-status survives concurrent unary calls on several executors" {
     try group.await(io);
     try std.testing.expectEqual(@as(usize, 0), bad.load(.monotonic));
 }
+
+// ---------------------------------------------------------------------------
+// The channel's retries, pushback and breaker. The server answers from a
+// script; every assertion counts what it saw.
+
+const Script = struct {
+    var hits: std.atomic.Value(u32) = .init(0);
+    var prev_attempts_max: std.atomic.Value(u32) = .init(0);
+    /// The first `fail_first` calls end with `code` (and `pushback`).
+    var fail_first: u32 = 0;
+    var code: grpc.Code = .unavailable;
+    var pushback: ?[]const u8 = null;
+    /// The first `slow_first` calls wait (until canceled) before answering.
+    var slow_first: u32 = 0;
+
+    fn reset(first: u32, c_: grpc.Code, pb_: ?[]const u8) void {
+        slow_first = 0;
+        hits.store(0, .monotonic);
+        prev_attempts_max.store(0, .monotonic);
+        fail_first = first;
+        code = c_;
+        pushback = pb_;
+    }
+
+    fn scripted(call: *grpc.Call, req: pb.EchoRequest) anyerror!pb.EchoResponse {
+        const n = hits.fetchAdd(1, .monotonic);
+        if (call.metadata("grpc-previous-rpc-attempts")) |v| {
+            const prev = std.fmt.parseInt(u32, v, 10) catch 0;
+            _ = prev_attempts_max.fetchMax(prev, .monotonic);
+        }
+        if (n < slow_first) try call.io.sleep(.fromSeconds(30), .awake);
+        if (n < fail_first) {
+            if (pushback) |p| try call.addTrailer("grpc-retry-pushback-ms", p);
+            return call.fail(code, "scripted");
+        }
+        return .{ .message = req.message, .index = 0 };
+    }
+};
+
+fn withScriptedServer(comptime body: fn (std.mem.Allocator, std.Io, u16) anyerror!void) !void {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Echo, .{
+        .Unary = Script.scripted,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    });
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+    try body(gpa, io, server.address.ip.getPort());
+}
+
+const fast_grpc_retry: @import("resilience_core").Retry = .{
+    .attempts = 4,
+    .backoff = .{ .base = .fromMilliseconds(1), .max = .fromMilliseconds(1), .jitter = .none },
+    .throttle = null,
+};
+
+test "grpc channel: UNAVAILABLE twice then OK is OK, and the server saw grpc-previous-rpc-attempts 2" {
+    Script.reset(2, .unavailable, null);
+    try withScriptedServer(struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
+            const channel = try grpc.Channel.connect(gpa, io, .{ .host = "127.0.0.1", .port = port }, .{ .retry = fast_grpc_retry });
+            defer channel.close();
+            const client: grpc.Client(Echo) = .{ .channel = channel };
+            var arena_state: std.heap.ArenaAllocator = .init(gpa);
+            defer arena_state.deinit();
+            const r = try client.unary("Unary", arena_state.allocator(), .{ .message = "x" }, .{});
+            try std.testing.expectEqual(grpc.Code.ok, r.status.code);
+            try std.testing.expectEqual(@as(u32, 3), Script.hits.load(.monotonic));
+            try std.testing.expectEqual(@as(u32, 2), Script.prev_attempts_max.load(.monotonic));
+        }
+    }.run);
+}
+
+test "grpc channel: INVALID_ARGUMENT is not retried" {
+    Script.reset(100, .invalid_argument, null);
+    try withScriptedServer(struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
+            const channel = try grpc.Channel.connect(gpa, io, .{ .host = "127.0.0.1", .port = port }, .{ .retry = fast_grpc_retry });
+            defer channel.close();
+            const client: grpc.Client(Echo) = .{ .channel = channel };
+            var arena_state: std.heap.ArenaAllocator = .init(gpa);
+            defer arena_state.deinit();
+            const r = try client.unary("Unary", arena_state.allocator(), .{ .message = "x" }, .{});
+            try std.testing.expectEqual(grpc.Code.invalid_argument, r.status.code);
+            try std.testing.expectEqual(@as(u32, 1), Script.hits.load(.monotonic));
+        }
+    }.run);
+}
+
+test "grpc channel: pushback -1 stops the retries; pushback 0 retries at once" {
+    try withScriptedServer(struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
+            const channel = try grpc.Channel.connect(gpa, io, .{ .host = "127.0.0.1", .port = port }, .{ .retry = fast_grpc_retry });
+            defer channel.close();
+            const client: grpc.Client(Echo) = .{ .channel = channel };
+            var arena_state: std.heap.ArenaAllocator = .init(gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            Script.reset(100, .unavailable, "-1");
+            const stopped = try client.unary("Unary", arena, .{ .message = "x" }, .{});
+            try std.testing.expectEqual(grpc.Code.unavailable, stopped.status.code);
+            try std.testing.expectEqual(@as(u32, 1), Script.hits.load(.monotonic));
+
+            Script.reset(2, .unavailable, "0");
+            const ok = try client.unary("Unary", arena, .{ .message = "x" }, .{});
+            try std.testing.expectEqual(grpc.Code.ok, ok.status.code);
+            try std.testing.expectEqual(@as(u32, 3), Script.hits.load(.monotonic));
+        }
+    }.run);
+}
+
+test "grpc channel: a pushback past max_retry_after returns that answer at once" {
+    Script.reset(100, .unavailable, "3600000");
+    try withScriptedServer(struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
+            var policy = fast_grpc_retry;
+            policy.max_retry_after = .fromSeconds(2);
+            const channel = try grpc.Channel.connect(gpa, io, .{ .host = "127.0.0.1", .port = port }, .{ .retry = policy });
+            defer channel.close();
+            const client: grpc.Client(Echo) = .{ .channel = channel };
+            var arena_state: std.heap.ArenaAllocator = .init(gpa);
+            defer arena_state.deinit();
+            const r = try client.unary("Unary", arena_state.allocator(), .{ .message = "x" }, .{});
+            try std.testing.expectEqual(grpc.Code.unavailable, r.status.code);
+            try std.testing.expectEqual(@as(u32, 1), Script.hits.load(.monotonic));
+        }
+    }.run);
+}
+
+test "grpc channel breaker: open answers UNAVAILABLE \"circuit open\" and opens no stream" {
+    Script.reset(1000, .unavailable, null);
+    try withScriptedServer(struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
+            const channel = try grpc.Channel.connect(gpa, io, .{ .host = "127.0.0.1", .port = port }, .{
+                .breaker = .{ .consecutive_failures = 2, .failure_ratio = 0 },
+            });
+            defer channel.close();
+            const client: grpc.Client(Echo) = .{ .channel = channel };
+            var arena_state: std.heap.ArenaAllocator = .init(gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            for (0..2) |_| {
+                const r = try client.unary("Unary", arena, .{ .message = "x" }, .{});
+                try std.testing.expectEqual(grpc.Code.unavailable, r.status.code);
+            }
+            const seen = Script.hits.load(.monotonic);
+            try std.testing.expectEqual(@as(u32, 2), seen);
+            const open = try client.unary("Unary", arena, .{ .message = "x" }, .{});
+            try std.testing.expectEqual(grpc.Code.unavailable, open.status.code);
+            try std.testing.expectEqualStrings("circuit open", open.status.message);
+            try std.testing.expectEqual(seen, Script.hits.load(.monotonic));
+        }
+    }.run);
+}
+
+test "grpc channel: Retry.attempt_timeout cuts a stuck attempt and the call is retried within its own timeout" {
+    try withScriptedServer(struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
+            var policy = fast_grpc_retry;
+            policy.attempt_timeout = .fromMilliseconds(100);
+            const channel = try grpc.Channel.connect(gpa, io, .{ .host = "127.0.0.1", .port = port }, .{
+                .retry = policy,
+                .retry_codes = &.{.deadline_exceeded},
+            });
+            defer channel.close();
+            const client: grpc.Client(Echo) = .{ .channel = channel };
+            var arena_state: std.heap.ArenaAllocator = .init(gpa);
+            defer arena_state.deinit();
+            // The first attempt never answers; the second does.
+            Script.reset(0, .ok, null);
+            Script.slow_first = 1;
+            const r = try client.unary("Unary", arena_state.allocator(), .{ .message = "x" }, .{ .timeout = .fromSeconds(30) });
+            try std.testing.expectEqual(grpc.Code.ok, r.status.code);
+            try std.testing.expectEqual(@as(u32, 2), Script.hits.load(.monotonic));
+        }
+    }.run);
+}

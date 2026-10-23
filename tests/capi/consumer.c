@@ -763,6 +763,12 @@ static void test_route_conflicts(void) {
       {LISTEN "\"routes\":[{\"path\":\"/assets\",\"static\":{\"dir\":\".\"}},"
               "{\"method\":\"GET\",\"path\":\"/assets/*rest\",\"handler\":1}]}",
        "/assets/*rest"},
+      /* a malformed pattern: a wildcard before the end */
+      {LISTEN "\"routes\":[{\"method\":\"GET\",\"path\":\"/a/*x/b\"," OK200 "}]}",
+       "a wildcard (*x) must be the last segment"},
+      /* a parameter named twice */
+      {LISTEN "\"routes\":[{\"method\":\"GET\",\"path\":\"/a/:id/b/:id\"," OK200 "}]}",
+       "names the parameter \"id\" twice"},
       /* a route on the metrics path, which Anole adds while starting */
       {LISTEN "\"observe\":{\"metrics\":{}},\"routes\":[{\"method\":\"GET\",\"path\":\"/metrics\"," OK200 "}]}",
        "/metrics"},
@@ -2406,7 +2412,8 @@ static void test_tls(void) {
       "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"always\"}}]}",
       "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"require\"}}]}",
       "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_ca_file\": \"ca.pem\"}}]}",
-      "{\"listeners\": [{\"proxy_protocol_from\": [\"10.0.0.0/8\"]}]}",
+      /* proxy_protocol null with a list passes: the deployment decides (on under anole_lb). */
+      "{\"listeners\": [{\"proxy_protocol\": false, \"proxy_protocol_from\": [\"10.0.0.0/8\"]}]}",
   };
   for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
     anole_server_options o = {sizeof o, {bad[i], strlen(bad[i])}, 0, 0, on_log, NULL};
@@ -3376,6 +3383,75 @@ static void test_listener_info(void) {
   printf("ok listener info: states, ports, flags\n");
 }
 
+/* anole_dotenv_read: the files, their order, ANOLE_ENV dropped, problems named. */
+struct dotenv_seen {
+  int calls;
+  char keys[8][16];
+  char values[8][16];
+  char files[8][32];
+};
+
+static void on_dotenv(void *ud, anole_str key, anole_str value, anole_str file, uint32_t line) {
+  struct dotenv_seen *d = ud;
+  (void)line;
+  if (d->calls < 8) {
+    snprintf(d->keys[d->calls], 16, "%.*s", (int)key.len, key.ptr);
+    snprintf(d->values[d->calls], 16, "%.*s", (int)value.len, value.ptr);
+    snprintf(d->files[d->calls], 32, "%.*s", (int)file.len, file.ptr);
+  }
+  d->calls++;
+}
+
+static void write_file(const char *dir, const char *name, const char *text) {
+  char path[512];
+  snprintf(path, sizeof path, "%s/%s", dir, name);
+  FILE *f = fopen(path, "w");
+  CHECK(f != NULL);
+  fputs(text, f);
+  fclose(f);
+}
+
+static void test_dotenv(void) {
+  char dir[] = "/tmp/anole-dotenv-XXXXXX";
+  CHECK(mkdtemp(dir) != NULL);
+  anole_str d = {dir, strlen(dir)};
+  write_file(dir, ".env", "A=1\nB=\"x\"\nANOLE_ENV=production\n");
+  write_file(dir, ".env.local", "A=2\n");
+  write_file(dir, ".env.development", "C='z'\n");
+
+  struct dotenv_seen seen = {0};
+  CHECK(anole_dotenv_read(d, LIT("development"), on_dotenv, &seen) == ANOLE_OK);
+  CHECK(seen.calls == 3);
+  CHECK(strcmp(seen.keys[0], "A") == 0 && strcmp(seen.values[0], "2") == 0 && strcmp(seen.files[0], ".env.local") == 0);
+  CHECK(strcmp(seen.keys[1], "C") == 0 && strcmp(seen.values[1], "z") == 0);
+  CHECK(strcmp(seen.keys[2], "B") == 0 && strcmp(seen.values[2], "x") == 0);
+
+  struct dotenv_seen none = {0};
+  CHECK(anole_dotenv_read(d, LIT("production"), on_dotenv, &none) == ANOLE_OK);
+  CHECK(none.calls == 0);
+
+  CHECK(anole_dotenv_read(d, LIT("staging"), on_dotenv, &none) == ANOLE_E_INVALID);
+  CHECK(name_is("UnknownEnvironment"));
+  CHECK(anole_dotenv_read(d, LIT("development"), NULL, NULL) == ANOLE_E_INVALID);
+
+  write_file(dir, ".env", "BAD LINE\n");
+  struct dotenv_seen bad = {0};
+  CHECK(anole_dotenv_read(d, LIT("development"), on_dotenv, &bad) == ANOLE_E_CONFIG);
+  CHECK(name_is("InvalidEnvFile"));
+  CHECK(bad.calls == 0);
+  anole_str why = anole_last_error();
+  CHECK(why.len > 0 && memmem(why.ptr, why.len, ".env:1", 6) != NULL);
+  CHECK(memmem(why.ptr, why.len, "LINE", 4) == NULL);
+
+  const char *names[] = {".env", ".env.local", ".env.development"};
+  for (int i = 0; i < 3; i++) {
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s", dir, names[i]);
+    unlink(path);
+  }
+  rmdir(dir);
+}
+
 static void test_open_before_start(void) {
   int have_sqlite = anole_has_feature(LIT("sqlite"));
   const char *json = have_sqlite
@@ -3478,6 +3554,32 @@ static void test_log_callback_per_server(void) {
   stop_polled(b);
   CHECK(atomic_load(&log_lines) == after_a);
   printf("ok the log callback belongs to its server\n");
+}
+
+/* log.format "json": every line the callback gets is one JSON record. */
+static atomic_int json_ok, json_bad;
+static void on_json_log(void *ud, uint32_t level, anole_str scope, anole_str msg) {
+  (void)ud;
+  (void)level;
+  (void)scope;
+  if (msg.len > 2 && msg.ptr[0] == '{' && msg.ptr[msg.len - 1] == '}' && memmem(msg.ptr, msg.len, "\"time\":\"", 8) != NULL &&
+      memmem(msg.ptr, msg.len, "\"service\":\"capi\"", 16) != NULL)
+    atomic_fetch_add(&json_ok, 1);
+  else
+    atomic_fetch_add(&json_bad, 1);
+}
+
+static void test_log_json_records(void) {
+  const char *json = "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"log\":{\"format\":\"json\",\"service\":\"capi\"}}";
+  anole_server_options o = {sizeof o, {json, strlen(json)}, 0, 0, on_json_log, NULL};
+  anole_server *s = NULL;
+  CHECK(anole_server_create(&o, &s) == ANOLE_OK);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  stop_polled(s);
+  /* the startup line was logged on the way, as a JSON record */
+  CHECK(atomic_load(&json_ok) > 0);
+  CHECK(atomic_load(&json_bad) == 0);
+  printf("ok log.format json: the callback gets whole JSON records\n");
 }
 
 static pthread_t sig_main;
@@ -3872,9 +3974,11 @@ static int run_tests(void) {
   test_abort_reasons();
   test_sent_once();
   test_listener_info();
+  test_dotenv();
   test_open_before_start();
   test_destroy_on_consumer_thread();
   test_log_callback_per_server();
+  test_log_json_records();
   test_signals_stay_off_anole_threads();
   test_fork_child();
   test_consumer_without_executor();

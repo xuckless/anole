@@ -597,8 +597,13 @@ const Scripted = struct {
     queue_buf: [256 * 1024]u8 = undefined,
     reader: std.Io.Reader,
     read_buf: [16 * 1024]u8 = undefined,
-    discarding: std.Io.Writer.Discarding,
+    /// The client's side of the connection: its bytes are kept in `sent`
+    /// (as far as it holds them) so a test can wait for a frame to go out.
+    sent_writer: std.Io.Writer,
     write_buf: [4096]u8 = undefined,
+    sent: [64 * 1024]u8 = undefined,
+    /// Bytes of `sent` filled; they never change after.
+    sent_len: std.atomic.Value(usize) = .init(0),
     listener: std.Io.net.Server,
     near: std.Io.net.Stream,
     far: std.Io.net.Stream,
@@ -610,14 +615,14 @@ const Scripted = struct {
             .io = io,
             .queue = undefined,
             .reader = .{ .buffer = &.{}, .seek = 0, .end = 0, .vtable = &.{ .stream = stream } },
-            .discarding = undefined,
+            .sent_writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } },
             .listener = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(io, .{}),
             .near = undefined,
             .far = undefined,
         };
         self.queue = .init(&self.queue_buf);
         self.reader.buffer = &self.read_buf;
-        self.discarding = .init(&self.write_buf);
+        self.sent_writer.buffer = &self.write_buf;
         self.near = try self.listener.socket.address.connect(io, .{ .mode = .stream });
         self.far = try self.listener.accept(io);
         // The server's connection preface: an empty SETTINGS.
@@ -633,11 +638,52 @@ const Scripted = struct {
     }
 
     fn adopt(self: *Scripted, gpa: std.mem.Allocator) !*h2.ClientConnection {
-        return h2.ClientConnection.adopt(gpa, self.io, &self.reader, &self.discarding.writer, self.near);
+        return h2.ClientConnection.adopt(gpa, self.io, &self.reader, &self.sent_writer, self.near);
     }
 
     fn send(self: *Scripted, bytes: []const u8) !void {
         try self.queue.putAll(self.io, bytes);
+    }
+
+    fn record(self: *Scripted, bytes: []const u8) void {
+        const len = self.sent_len.load(.monotonic);
+        const n = @min(bytes.len, self.sent.len - len);
+        @memcpy(self.sent[len..][0..n], bytes[0..n]);
+        self.sent_len.store(len + n, .release);
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Scripted = @alignCast(@fieldParentPtr("sent_writer", w));
+        self.record(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            self.record(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| self.record(last);
+        return n + last.len * splat;
+    }
+
+    /// Waits until the client has written the HEADERS of stream `id`, so
+    /// the stream is open on its side: a frame sent for it before that
+    /// would be on an idle stream, which is a connection error. Bounded
+    /// generously; nothing here is about time.
+    fn waitHeadersSent(self: *Scripted, id: u31) !void {
+        for (0..5000) |_| {
+            const bytes = self.sent[0..self.sent_len.load(.acquire)];
+            // After the 24-byte client preface, whole frames.
+            var at: usize = 24;
+            while (bytes.len >= at + 9) {
+                const len = std.mem.readInt(u24, bytes[at..][0..3], .big);
+                const stream_id = std.mem.readInt(u32, bytes[at + 5 ..][0..4], .big) & 0x7fff_ffff;
+                if (bytes[at + 3] == 0x1 and stream_id == id) return;
+                at += 9 + len;
+            }
+            try self.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        return error.TestHeadersNeverSent;
     }
 
     /// The client reads the end of the connection.
@@ -793,4 +839,59 @@ test "h2 client: informational responses before the final one, up to a limit" {
         for (0..6) |_| try peer.send(&frame(1, 0x4, 3, early));
         try std.testing.expectError(error.TooManyInterimResponses, s.waitHead());
     }
+}
+
+test "h2 client: a stream refused with REFUSED_STREAM is unprocessed; one reset with CANCEL is not" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    const refused = try request(conn, "/", .{});
+    defer refused.release();
+    const canceled = try request(conn, "/", .{});
+    defer canceled.release();
+    try std.testing.expectEqual(@as(i32, 1), refused.id);
+    try std.testing.expectEqual(@as(i32, 3), canceled.id);
+    try peer.waitHeadersSent(3);
+    // RST_STREAM: REFUSED_STREAM (7) for stream 1, CANCEL (8) for stream 3.
+    try peer.send(&frame(3, 0, 1, &.{ 0, 0, 0, 7 }));
+    try peer.send(&frame(3, 0, 3, &.{ 0, 0, 0, 8 }));
+    try std.testing.expect(std.meta.isError(refused.waitHead()));
+    try std.testing.expect(std.meta.isError(canceled.waitHead()));
+    try std.testing.expect(refused.unprocessed());
+    try std.testing.expect(!canceled.unprocessed());
+}
+
+test "h2 client: after GOAWAY(last=1) stream 3 is unprocessed and stream 1, which is answered, is not" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const peer = try Scripted.create(gpa, io);
+    defer peer.destroy(gpa);
+    const conn = try peer.adopt(gpa);
+    defer conn.close();
+    defer peer.end();
+
+    const first = try request(conn, "/", .{});
+    defer first.release();
+    const second = try request(conn, "/", .{});
+    defer second.release();
+    try std.testing.expectEqual(@as(i32, 1), first.id);
+    try std.testing.expectEqual(@as(i32, 3), second.id);
+    try peer.waitHeadersSent(3);
+    // GOAWAY: last stream 1, NO_ERROR; then stream 1's answer (:status 200).
+    try peer.send(&frame(7, 0, 0, &.{ 0, 0, 0, 1, 0, 0, 0, 0 }));
+    try peer.send(&frame(1, 0x5, 1, &.{0x88}));
+    try first.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), first.status);
+    try std.testing.expect(std.meta.isError(second.waitHead()));
+    try std.testing.expect(second.unprocessed());
+    try std.testing.expect(!first.unprocessed());
 }

@@ -105,7 +105,7 @@ extern "C" {
 #endif
 
 #define ANOLE_ABI_VERSION_MAJOR 0 /* breaking changes */
-#define ANOLE_ABI_VERSION_MINOR 8 /* additions (and, before 1.0, breaking changes; see CHANGELOG.md) */
+#define ANOLE_ABI_VERSION_MINOR 9 /* additions (and, before 1.0, breaking changes; see CHANGELOG.md) */
 #define ANOLE_ABI_VERSION ((ANOLE_ABI_VERSION_MAJOR << 16) | ANOLE_ABI_VERSION_MINOR)
 /* Whether a library reporting anole_abi_version() == v serves code built
    against this header. Before 1.0 both numbers must match (every 0.x minor
@@ -154,7 +154,9 @@ enum {
   ANOLE_E_TOOBIG = -8,      /* anole_poll: the next event does not fit */
   ANOLE_E_SYSTEM = -9,      /* the OS refused (threads, sockets, files) */
   ANOLE_E_TIMEOUT = -10,    /* a blocking call's timeout passed */
-  ANOLE_E_DB = -11          /* a database refused a statement (anole_db_result_event) */
+  ANOLE_E_DB = -11,         /* a database refused a statement (anole_db_result_event) */
+  ANOLE_E_BROKER = -12      /* a message broker refused a call or could not be reached
+                               (anole_nats_reply_event: error_class says why) */
 };
 
 /* The text of the last error on the calling thread, for logs: not API.
@@ -193,6 +195,10 @@ typedef uint64_t anole_grpc_call; /* one gRPC call: from ANOLE_EV_GRPC_CALL unti
 typedef uint64_t anole_wt;        /* one WebTransport session: from ANOLE_EV_WT_OPEN until ANOLE_EV_WT_CLOSE */
 typedef uint64_t anole_wt_stream; /* one of its streams: until anole_handle_release or the session's close */
 typedef uint64_t anole_db_tx;     /* one database transaction: from the answer to anole_db_begin until commit, rollback or release */
+typedef uint64_t anole_nats_sub;  /* a NATS subscription or JetStream consume: until ANOLE_EV_NATS_SUB_END */
+typedef uint64_t anole_nats_msg;  /* a JetStream message: until acked, nak'd, termed or released */
+typedef uint64_t anole_kafka_group; /* a Kafka group membership: until ANOLE_EV_KAFKA_GROUP_END */
+typedef uint64_t anole_kafka_batch; /* the records of one partition: until done, retried or released */
 typedef struct anole_server anole_server;     /* opaque */
 typedef struct anole_consumer anole_consumer; /* opaque */
 
@@ -218,7 +224,11 @@ typedef struct anole_server_options {
      possibly several at once; `scope` and `msg` are valid during the call
      only. Must not block and must not enter the language (append to a
      buffer the consumer flushes). NULL: stderr. Belongs to this server: a
-     later server without one logs to stderr. */
+     later server without one logs to stderr. With the configuration's
+     log.format "json" (the default when environment is production), `msg`
+     is the whole record as one JSON object with no newline, byte for byte
+     what stderr would get; in "text", the message. Access log lines (the
+     access_log middleware) come here too, with scope "access". */
   void (*log)(void *ud, uint32_t level, anole_str scope, anole_str msg);
   void *log_ud;
 } anole_server_options;
@@ -343,6 +353,29 @@ typedef struct anole_stats {
 /* Counters since start. Fills what out->size covers. */
 ANOLE_API anole_status anole_server_stats(anole_server *s, anole_stats *out);
 
+/* ---- environment ----------------------------------------------------------- */
+
+/* One variable of a .env file, for anole_dotenv_read. key, value and file
+   are valid during the call only (copy them). Values may be secrets: never
+   log them. */
+typedef void (*anole_dotenv_fn)(void *ud, anole_str key, anole_str value, anole_str file, uint32_t line);
+
+/* Reads the .env files Anole reads for `environment` in `dir` (empty: the
+   working directory) and calls fn once per variable, in the files' order of
+   precedence: "development" reads .env.development.local, .env.local,
+   .env.development and .env (missing files skipped; the first file that has
+   a key wins; ANOLE_ENV is never passed on); "production" reads none and
+   returns ANOLE_OK at once. The process environment is not touched: the
+   binding sets each variable that is not already set, in its language
+   (Node: process.env, Python: os.environ), before anole_server_create.
+   No server needed; any thread; not concurrently with itself.
+   ANOLE_E_INVALID ("UnknownEnvironment") for another environment, or a
+   NULL fn. ANOLE_E_CONFIG ("InvalidEnvFile"): a problem in a file (a line
+   without '=', a bad name, an unterminated quote, a key twice in one file,
+   a file over 1 MiB or unreadable); anole_last_error names every problem
+   by file and line (never a value), fn is not called at all. */
+ANOLE_API anole_status anole_dotenv_read(anole_str dir, anole_str environment, anole_dotenv_fn fn, void *ud);
+
 /* ---- consumers and events --------------------------------------------------- */
 
 /* Many threads poll this consumer (a WSGI thread pool) with anole_poll_wait;
@@ -425,10 +458,35 @@ enum anole_event_type {
                                     route with "accept": "consumer": answer it with anole_ws_accept,
                                     or refuse it with any answer to a request (anole_req_respond,
                                     anole_req_fail, anole_req_stream_*, anole_req_abort) */
-  ANOLE_EV_DRAINING = 41         /* anole_event, handle 0: anole_server_drain was called; once per
+  ANOLE_EV_DRAINING = 41,        /* anole_event, handle 0: anole_server_drain was called; once per
                                     consumer, before any WebSocket 1001 or abort. Long polls and
                                     event streams finish up while the drain's deadline
                                     (timeouts.shutdown_ms) runs */
+  ANOLE_EV_NATS_MSG = 64,        /* anole_nats_msg_event: a message of a subscription; handle:
+                                    anole_nats_sub */
+  ANOLE_EV_NATS_REPLY = 65,      /* anole_nats_reply_event: the answer to anole_nats_request or
+                                    anole_nats_js_publish; handle 0 (user_data) */
+  ANOLE_EV_NATS_JS_MSG = 66,     /* anole_nats_msg_event with the JetStream fields set; handle:
+                                    anole_nats_msg. Owes anole_nats_ack or anole_handle_release
+                                    (= NAK) */
+  ANOLE_EV_NATS_SUB_END = 67,    /* anole_broker_end_event; handle: anole_nats_sub, now over */
+  ANOLE_EV_NATS_STATUS = 68,     /* anole_broker_status_event: CONNECTED, DISCONNECTED,
+                                    RECONNECTED or LAME_DUCK; sent to every consumer */
+  ANOLE_EV_NATS_WRITABLE = 69,   /* anole_broker_status_event: a publish refused with
+                                    ANOLE_E_AGAIN (or advised with ANOLE_BUSY) would be taken now */
+  ANOLE_EV_KAFKA_RECORDS = 80,  /* anole_kafka_records_event; handle: anole_kafka_batch. Owes
+                                    anole_kafka_batch_done, anole_kafka_batch_retry or
+                                    anole_handle_release (= retry now) */
+  ANOLE_EV_KAFKA_DELIVERY = 81,  /* anole_kafka_delivery_event; handle 0 (user_data) */
+  ANOLE_EV_KAFKA_ASSIGN = 82,    /* anole_kafka_assign_event; handle: anole_kafka_group */
+  ANOLE_EV_KAFKA_REVOKE = 83,    /* anole_kafka_assign_event: finish those partitions' batches */
+  ANOLE_EV_KAFKA_WRITABLE = 84,  /* anole_broker_status_event: a produce refused with
+                                    ANOLE_E_AGAIN (or advised with ANOLE_BUSY) would be taken now */
+  ANOLE_EV_KAFKA_GROUP_END = 85, /* anole_broker_end_event; handle: anole_kafka_group, now over */
+  ANOLE_EV_CONSOLE_CLOSED = 132  /* anole_console_closed_event, handle 0: the in-process console
+                                    (anole_console_open) closed; the terminal is the binding's
+                                    again. Only after anole_console_open. 133-135 are reserved
+                                    for the console */
 };
 
 /* Every event starts with this. Records are 8-byte aligned and `len`
@@ -520,6 +578,57 @@ typedef struct anole_abort_event {
                         code for a gRPC call; 0 when nothing was sent */
   uint32_t reserved;
 } anole_abort_event; /* 24 */
+
+/* ---- Console (docs/console.md) ----
+   The live console: `anole console` attaches to the control socket the
+   "console" configuration group sets up, and anole_console_open shows the
+   same screen in this process's terminal. libanole never reads stdin: the
+   binding does, and calls anole_console_open when the user asks for it. */
+enum {
+  ANOLE_CONSOLE_QUIT = 0,       /* Esc or /quit: resume reading stdin */
+  ANOLE_CONSOLE_INTERRUPT = 1,  /* Ctrl-C: libanole raises SIGINT right after the event */
+  ANOLE_CONSOLE_RESTARTING = 2  /* /full-restart: the process execs right after */
+};
+typedef struct anole_console_closed_event {
+  anole_event ev;     /* type ANOLE_EV_CONSOLE_CLOSED, handle 0 */
+  uint32_t reason;    /* ANOLE_CONSOLE_* */
+  uint32_t reserved;
+} anole_console_closed_event; /* 24 */
+
+enum {
+  ANOLE_UNIT_NONE = 0,
+  ANOLE_UNIT_BYTES = 1,
+  ANOLE_UNIT_SECONDS = 2,
+  ANOLE_UNIT_COUNT = 3,
+  ANOLE_UNIT_PERCENT = 4
+};
+typedef struct anole_console_metric {
+  anole_str name;     /* [a-z0-9_.], 1 to 48 bytes */
+  double value;
+  uint32_t unit;      /* ANOLE_UNIT_* */
+  uint32_t reserved;
+} anole_console_metric; /* 32 */
+
+/* Opens the console in this process's terminal (/dev/tty), on a thread of
+   libanole's: stop reading stdin first, and resume after
+   ANOLE_EV_CONSOLE_CLOSED. flags: 0. ANOLE_E_STATE: the server is not
+   running, or a console is open already. ANOLE_E_UNSUPPORTED: no terminal,
+   TERM=dumb, or Windows. ANOLE_E_CONFIG: the console is off ("console"
+   group). */
+ANOLE_API anole_status anole_console_open(anole_server *s, uint32_t flags);
+/* Closes it (no event). ANOLE_OK when it was not open. */
+ANOLE_API anole_status anole_console_close(anole_server *s);
+/* Consoles attached now (in-process included), >= 0: report metrics only
+   while it is above 0. */
+ANOLE_API int32_t anole_console_attached(anole_server *s);
+/* Replaces the language metrics /runtime shows (at most 32; copied).
+   ANOLE_E_INVALID: more than 32, or a bad name or unit. */
+ANOLE_API anole_status anole_console_report(anole_server *s, const anole_console_metric *m, size_t n);
+/* A record from the binding's logger, for /logs only (nothing is written;
+   the binding writes its own). level: ANOLE_LOG_*. req: the request it
+   belongs to, or 0. ANOLE_OK also when nothing is kept (the console is off,
+   or the level is below what is kept). */
+ANOLE_API anole_status anole_console_log(anole_server *s, uint32_t level, anole_str scope, anole_str msg, uint64_t req);
 
 /* ANOLE_EV_SENT: Anole no longer reads the memory of a body passed with
    ANOLE_BODY_BORROW (to anole_req_respond or anole_req_stream_write on the request
@@ -904,7 +1013,8 @@ enum {
 
 /* Metadata (anole_header name/value pairs) a consumer sends: a lower-case
    key (letters, digits, '-', '_', '.'), not the protocols' own (grpc-*
-   except grpc-status-details-bin, connect-*, trailer-*, content-type, te,
+   except grpc-status-details-bin and grpc-retry-pushback-ms in trailers,
+   connect-*, trailer-*, content-type, te,
    HTTP's framing); a printable ASCII value, except under a key ending in
    "-bin", whose value is bytes (Anole base64-encodes them). Copied.
    ANOLE_E_INVALID otherwise. */
@@ -1078,11 +1188,16 @@ typedef struct anole_db_value {
    parameters) share one run, each caller getting its own answer.
    ANOLE_DB_F_NO_PREPARE: do not keep the prepared statement (SQL built at run
    time). ANOLE_DB_F_DROP_EMPTY: with a cache_ttl_ms, an answer with no row is
-   served but not kept (cache-aside). */
+   served but not kept (cache-aside). ANOLE_DB_F_RETRY: the query may run
+   again on a transient failure (the server unreachable, a connection lost),
+   with the database's "retry" configuration; only for statements safe to
+   repeat. Refused (ANOLE_E_INVALID) on anole_db_tx_*; SQLite and MongoDB
+   ignore it. */
 #define ANOLE_DB_F_WRITE 1u
 #define ANOLE_DB_F_COALESCE 2u
 #define ANOLE_DB_F_NO_PREPARE 4u
 #define ANOLE_DB_F_DROP_EMPTY 8u
+#define ANOLE_DB_F_RETRY 16u
 
 /* anole_db_options.timeout_ms: no bound for this query. */
 #define ANOLE_DB_TIMEOUT_NONE 0xFFFFFFFFu
@@ -1312,6 +1427,328 @@ typedef struct anole_db_result_event {
   anole_span constraint; /* the constraint that failed, when the database names it */
   anole_span table;      /* ABI 0.7: the table (or collection) the error names, when the database says */
 } anole_db_result_event; /* 104 bytes (was 96) */
+
+/* ---- NATS ------------------------------------------------------------------
+   The configuration's "brokers" with a "nats" key. Publishing never waits:
+   a frame is queued and the call returns (a send that blocks on the network
+   stalls whatever lock the caller holds). Deliveries come as events on the
+   consumer given to the call. */
+
+typedef struct anole_nats anole_nats; /* opaque; lives until anole_server_destroy */
+
+/* Looks up a broker by its "name"; ANOLE_E_INVALID when there is none, or it is not a NATS broker. */
+ANOLE_API anole_status anole_nats_find(anole_server *s, anole_str name, anole_nats **out);
+/* The broker's index in the configuration's "brokers": what
+   anole_broker_status_event.broker names. */
+ANOLE_API uint32_t anole_nats_index(const anole_nats *n);
+
+/* A message to publish, or a request to send. Everything is copied. */
+typedef struct anole_nats_out {
+  size_t size;               /* sizeof(anole_nats_out) */
+  anole_str subject;
+  anole_str reply;           /* {NULL,0}: none */
+  const anole_header *headers;
+  size_t nheaders;
+  const void *data;
+  size_t len;
+} anole_nats_out;            /* 72 bytes */
+
+/* Queues a message; copied at once; never blocks. ANOLE_OK; ANOLE_BUSY
+   (taken; the queue is past half its limit: wait for ANOLE_EV_NATS_WRITABLE
+   before sending much more); ANOLE_E_AGAIN (not taken: the queue, or the
+   reconnect buffer while disconnected, is full; ANOLE_EV_NATS_WRITABLE
+   follows to `c`); ANOLE_E_INVALID (subject, header, size over the server's
+   max_payload, a flag); ANOLE_E_STATE (before start, after the stop).
+   flags: 0 (ANOLE_BODY_BORROW is refused: the bytes are always copied). */
+ANOLE_API anole_status anole_nats_publish(anole_nats *n, anole_consumer *c, const anole_nats_out *m, uint32_t flags);
+
+#define ANOLE_NATS_F_RETRY 1u /* anole_nats_request: retry NoResponders with the broker's "retry" */
+
+typedef struct anole_nats_request_options {
+  size_t size;
+  uint32_t flags;      /* ANOLE_NATS_F_* */
+  uint32_t timeout_ms; /* 0: the broker's timeout_ms; ANOLE_DB_TIMEOUT_NONE: none */
+  uint64_t req;        /* the anole_req / anole_grpc_call it serves (as anole_db_options.req), or 0 */
+} anole_nats_request_options; /* 24 bytes */
+
+/* Sends a request; the first reply (or the failure) is ANOLE_EV_NATS_REPLY
+   to `c` (or to req's consumer) with user_data. Returns at once:
+   ANOLE_OK; ANOLE_E_AGAIN (outbound full, nothing sent); ANOLE_E_GONE
+   (stale req); ANOLE_E_INVALID; ANOLE_E_STATE. */
+ANOLE_API anole_status anole_nats_request(anole_nats *n, anole_consumer *c, const anole_nats_out *m,
+                                          const anole_nats_request_options *opts, uint64_t user_data);
+
+/* anole_nats_subscribe_options.overflow */
+#define ANOLE_NATS_DROP_NEWEST 0u
+#define ANOLE_NATS_DROP_OLDEST 1u
+#define ANOLE_NATS_CLOSE 2u
+typedef struct anole_nats_subscribe_options {
+  size_t size;
+  anole_str queue;        /* a queue group; {NULL,0}: none */
+  uint32_t max_messages;  /* held for the consumer before `overflow` drops; 0: limits.subscription_messages */
+  uint32_t max_bytes;     /* 0: limits.subscription_bytes */
+  uint32_t overflow;      /* ANOLE_NATS_DROP_* / ANOLE_NATS_CLOSE */
+  uint32_t reserved;      /* must be 0 */
+} anole_nats_subscribe_options; /* 40 bytes */
+
+/* Subscribes; messages come to `c` as ANOLE_EV_NATS_MSG (handle: *out,
+   user_data as given). Messages wait for room in `c`'s ring; while they
+   wait, `overflow` applies to the subscription's own queue (dropped counts
+   are in the SUB_END record). */
+ANOLE_API anole_status anole_nats_subscribe(anole_nats *n, anole_consumer *c, anole_str subject,
+                                            const anole_nats_subscribe_options *opts, uint64_t user_data,
+                                            anole_nats_sub *out);
+/* Cleanup: unsubscribes (or stops a JetStream consume); then
+   ANOLE_EV_NATS_SUB_END. ANOLE_OK on one that is over.
+   anole_handle_release does the same. */
+ANOLE_API anole_status anole_nats_unsubscribe(anole_nats_sub sub);
+
+/* JetStream publish: waits for the stream's ack (ANOLE_EV_NATS_REPLY with op
+   ANOLE_NATS_OP_JS_PUBLISH: stream, seq, duplicate). */
+#define ANOLE_NATS_OP_REQUEST 0u
+#define ANOLE_NATS_OP_JS_PUBLISH 1u
+#define ANOLE_NATS_JS_F_EXPECT_LAST_SEQ 1u /* check expected_last_seq (allows 0) */
+typedef struct anole_nats_js_publish_options {
+  size_t size;
+  anole_str msg_id;            /* Nats-Msg-Id; {NULL,0}: none */
+  anole_str expected_stream;
+  uint64_t expected_last_seq;  /* 0: not checked */
+  uint32_t timeout_ms;
+  uint32_t flags;              /* ANOLE_NATS_JS_F_* */
+  uint64_t req;
+} anole_nats_js_publish_options; /* 64 bytes */
+ANOLE_API anole_status anole_nats_js_publish(anole_nats *n, anole_consumer *c, const anole_nats_out *m,
+                                             const anole_nats_js_publish_options *opts, uint64_t user_data);
+
+typedef struct anole_nats_js_consume_options {
+  size_t size;
+  uint32_t max_inflight; /* delivered and not yet acked, at most; 0: 64 */
+  uint32_t expires_ms;   /* one pull's wait on the server; 0: 30000 */
+} anole_nats_js_consume_options; /* 16 bytes */
+/* Pull-consumes an existing durable consumer (from "jetstream" in the
+   configuration, or made with anole_nats_request on $JS.API...): each
+   message is ANOLE_EV_NATS_JS_MSG with its own anole_nats_msg handle. */
+ANOLE_API anole_status anole_nats_js_consume(anole_nats *n, anole_consumer *c, anole_str stream, anole_str consumer,
+                                             const anole_nats_js_consume_options *opts, uint64_t user_data,
+                                             anole_nats_sub *out);
+#define ANOLE_NATS_ACK 0u
+#define ANOLE_NATS_NAK 1u
+#define ANOLE_NATS_TERM 2u
+#define ANOLE_NATS_PROGRESS 3u
+/* Acknowledges: ACK, NAK (redeliver after delay_ms; 0: the consumer's
+   backoff), TERM (never again), PROGRESS (more time; the handle stays).
+   The others end the handle. ANOLE_E_GONE on a handle that is over. */
+ANOLE_API anole_status anole_nats_ack(anole_nats_msg m, uint32_t kind, uint32_t delay_ms);
+
+/* ANOLE_EV_NATS_MSG and ANOLE_EV_NATS_JS_MSG. Followed by the headers
+   (headers_off: nheaders name/value anole_span pairs) and the bytes the
+   spans name. */
+typedef struct anole_nats_msg_event {
+  anole_event ev;        /* NATS_MSG: handle the anole_nats_sub; JS_MSG: the anole_nats_msg */
+  uint64_t user_data;    /* the subscribe/consume call's */
+  uint64_t sub;          /* the anole_nats_sub */
+  anole_span subject;
+  anole_span reply;      /* NATS_MSG: where an answer goes; empty when none (JS: empty) */
+  uint32_t headers_off;
+  uint32_t nheaders;
+  anole_span payload;
+  uint16_t status;       /* a status line's code, 0 when none */
+  uint16_t reserved16;
+  uint32_t reserved;
+  uint64_t stream_seq;   /* JetStream only, else 0 */
+  uint64_t consumer_seq;
+  uint64_t delivered;
+  uint64_t pending;
+  int64_t timestamp_ns;
+  anole_span stream;
+  anole_span consumer;
+} anole_nats_msg_event;  /* 128 bytes */
+
+/* ANOLE_EV_NATS_REPLY: the answer to anole_nats_request or anole_nats_js_publish. */
+typedef struct anole_nats_reply_event {
+  anole_event ev;        /* handle 0 */
+  uint64_t user_data;
+  int32_t status;        /* ANOLE_OK; ANOLE_E_TIMEOUT; ANOLE_E_BROKER (error_class: ANOLE_DB_ERR_UNAVAILABLE
+                            for no responders or not connected, ANOLE_DB_ERR_OTHER for a refusal);
+                            ANOLE_E_GONE (its req ended) */
+  uint16_t http_status;  /* what Anole's handlers would answer: 503, 504, 500; 0 on success */
+  uint8_t error_class;   /* ANOLE_DB_ERR_* */
+  uint8_t op;            /* ANOLE_NATS_OP_* */
+  anole_span subject;
+  uint32_t headers_off;
+  uint32_t nheaders;
+  anole_span payload;
+  uint16_t msg_status;   /* the reply's status line, 0 none */
+  uint16_t duplicate;    /* JS_PUBLISH: 1 when the stream had it already */
+  uint32_t reserved;
+  uint64_t seq;          /* JS_PUBLISH: the stream sequence */
+  anole_span stream;     /* JS_PUBLISH */
+  anole_span error;      /* for logs */
+  anole_span error_code; /* "no_responders", "timeout", a JetStream err_code ("10071") */
+} anole_nats_reply_event; /* 96 bytes */
+
+/* ANOLE_EV_NATS_SUB_END: the handle is over. */
+#define ANOLE_BROKER_END_CLOSED 0u
+#define ANOLE_BROKER_END_DRAINED 1u
+#define ANOLE_BROKER_END_SLOW 2u
+#define ANOLE_BROKER_END_DENIED 3u
+#define ANOLE_BROKER_END_FAILED 4u
+typedef struct anole_broker_end_event {
+  anole_event ev;
+  uint64_t user_data;
+  uint32_t reason;       /* ANOLE_BROKER_END_* */
+  uint32_t reserved;
+  uint64_t dropped;      /* messages the overflow policy dropped */
+  anole_span error;
+} anole_broker_end_event; /* 48 bytes */
+
+/* ANOLE_EV_NATS_STATUS (CONNECTED, DISCONNECTED, RECONNECTED, LAME_DUCK) and
+   ANOLE_EV_NATS_WRITABLE (WRITABLE). */
+#define ANOLE_BROKER_CONNECTED 0u
+#define ANOLE_BROKER_DISCONNECTED 1u
+#define ANOLE_BROKER_RECONNECTED 2u
+#define ANOLE_BROKER_LAME_DUCK 3u
+#define ANOLE_BROKER_WRITABLE 4u
+typedef struct anole_broker_status_event {
+  anole_event ev;        /* handle 0 */
+  uint32_t broker;       /* anole_nats_index */
+  uint32_t status;       /* ANOLE_BROKER_* */
+} anole_broker_status_event; /* 24 bytes */
+
+/* ---- Kafka -----------------------------------------------------------------
+   The configuration's "brokers" with a "kafka" key. Producing never waits:
+   the record is copied and queued, and what became of it is one
+   ANOLE_EV_KAFKA_DELIVERY. A group member receives one partition's records
+   at a time as ANOLE_EV_KAFKA_RECORDS and answers each batch before the
+   next of that partition comes. */
+
+typedef struct anole_kafka anole_kafka; /* opaque; lives until anole_server_destroy */
+
+/* Looks up a broker by its "name"; ANOLE_E_INVALID when there is none, or it is not a Kafka broker. */
+ANOLE_API anole_status anole_kafka_find(anole_server *s, anole_str name, anole_kafka **out);
+/* The broker's index in the configuration's "brokers": what
+   anole_broker_status_event.broker names. */
+ANOLE_API uint32_t anole_kafka_index(const anole_kafka *k);
+
+typedef struct anole_kafka_out {
+  size_t size;           /* sizeof(anole_kafka_out) */
+  anole_str topic;
+  int32_t partition;     /* -1: by key (murmur2, as Java's producer), sticky without a key */
+  uint32_t flags;        /* ANOLE_KAFKA_F_* */
+  anole_str key;         /* with ANOLE_KAFKA_F_NULL_KEY ignored */
+  const void *value;
+  size_t len;            /* with ANOLE_KAFKA_F_NULL_VALUE: a tombstone */
+  const anole_header *headers;
+  size_t nheaders;
+  int64_t timestamp_ms;  /* 0: now */
+} anole_kafka_out;       /* 88 bytes */
+#define ANOLE_KAFKA_F_NULL_KEY 2u    /* bit 0 stays ANOLE_BODY_BORROW, refused here */
+#define ANOLE_KAFKA_F_NULL_VALUE 4u
+#define ANOLE_KAFKA_F_NO_REPORT 8u   /* no ANOLE_EV_KAFKA_DELIVERY; failures are logged */
+
+/* Queues a record; copied; never blocks. ANOLE_OK; ANOLE_BUSY (taken; past
+   half of producer.buffer_bytes); ANOLE_E_AGAIN (not taken: the buffer is
+   full; ANOLE_EV_KAFKA_WRITABLE follows to `c`); ANOLE_E_INVALID;
+   ANOLE_E_STATE. Unless NO_REPORT, its delivery (or failure) is one
+   ANOLE_EV_KAFKA_DELIVERY to `c` with user_data. Records of one broker are
+   handed to the producer in the order the calls were made. */
+ANOLE_API anole_status anole_kafka_produce(anole_kafka *k, anole_consumer *c, const anole_kafka_out *r,
+                                           uint64_t user_data);
+
+#define ANOLE_KAFKA_START_LATEST 0u
+#define ANOLE_KAFKA_START_EARLIEST 1u
+#define ANOLE_KAFKA_ASSIGN_RANGE 0u
+#define ANOLE_KAFKA_ASSIGN_ROUNDROBIN 1u
+typedef struct anole_kafka_subscribe_options {
+  size_t size;
+  anole_str group;
+  const anole_str *topics;
+  size_t ntopics;
+  anole_str instance_id;         /* static membership; {NULL,0}: none */
+  uint32_t start;                /* ANOLE_KAFKA_START_* */
+  uint32_t assignor;             /* ANOLE_KAFKA_ASSIGN_* */
+  uint32_t max_batch;            /* records per ANOLE_EV_KAFKA_RECORDS, at most; 0: 500 */
+  uint32_t prefetch_bytes;       /* per partition; 0: 1 MiB */
+  uint32_t session_timeout_ms;   /* 0: 45000 */
+  uint32_t rebalance_timeout_ms; /* 0: 300000; also how long a revoked batch may stay out */
+  uint32_t commit_interval_ms;   /* 0: 5000 */
+  uint32_t reserved;
+} anole_kafka_subscribe_options; /* 88 bytes */
+/* Joins `group` (one member). Records come to `c` as ANOLE_EV_KAFKA_RECORDS,
+   one partition per record, in order, at most one batch per partition
+   outstanding; ANOLE_EV_KAFKA_ASSIGN / _REVOKE say what this member has. */
+ANOLE_API anole_status anole_kafka_subscribe(anole_kafka *k, anole_consumer *c,
+                                             const anole_kafka_subscribe_options *opts, uint64_t user_data,
+                                             anole_kafka_group *out);
+/* The batch was processed: its offsets are committed with the next commit.
+   Cleanup-style: ANOLE_OK on one that is over (its partition was revoked
+   and the rebalance timeout passed: its offsets are not committed). */
+ANOLE_API anole_status anole_kafka_batch_done(anole_kafka_batch b);
+/* Deliver the same records again after delay_ms (the partition waits).
+   ANOLE_E_GONE when the batch is over. anole_handle_release = retry with 0. */
+ANOLE_API anole_status anole_kafka_batch_retry(anole_kafka_batch b, uint32_t delay_ms);
+/* Cleanup: leaves the group after committing done batches; outstanding
+   batches go stale; ANOLE_EV_KAFKA_GROUP_END follows. ANOLE_OK on one that is over. */
+ANOLE_API anole_status anole_kafka_group_close(anole_kafka_group g);
+/* Sends what is buffered now; ANOLE_EV_KAFKA_DELIVERY with user_data and
+   topic empty answers when everything queued before is acked or failed. */
+ANOLE_API anole_status anole_kafka_flush(anole_kafka *k, anole_consumer *c, uint64_t user_data);
+
+/* One record of an ANOLE_EV_KAFKA_RECORDS. Its spans and headers_off count
+   from the start of the event's record. */
+#define ANOLE_KAFKA_REC_F_NULL_KEY 1u
+#define ANOLE_KAFKA_REC_F_NULL_VALUE 2u
+typedef struct anole_kafka_record {
+  int64_t offset;
+  int64_t timestamp_ms;
+  anole_span key;
+  anole_span value;
+  uint32_t headers_off;  /* nheaders (name, value) anole_span pairs */
+  uint32_t nheaders;
+  uint32_t flags;        /* ANOLE_KAFKA_REC_F_* */
+  uint32_t reserved;
+} anole_kafka_record;    /* 48 bytes */
+typedef struct anole_kafka_records_event {
+  anole_event ev;        /* the anole_kafka_batch */
+  uint64_t user_data;    /* the subscribe call's */
+  uint64_t group;        /* the anole_kafka_group */
+  anole_span topic;
+  int32_t partition;
+  uint32_t nrecords;
+  uint32_t records_off;  /* nrecords anole_kafka_record */
+  uint32_t reserved;
+  int64_t high_watermark;
+} anole_kafka_records_event; /* 64 bytes */
+
+/* ANOLE_EV_KAFKA_DELIVERY. */
+typedef struct anole_kafka_delivery_event {
+  anole_event ev;        /* handle 0 */
+  uint64_t user_data;
+  int32_t status;        /* ANOLE_OK; ANOLE_E_BROKER; ANOLE_E_TIMEOUT (delivery_timeout) */
+  uint16_t http_status;  /* what Anole's handlers would answer: 503, 504, 500; 0 on success */
+  uint8_t error_class;   /* ANOLE_DB_ERR_* */
+  uint8_t reserved;
+  int32_t partition;
+  uint32_t reserved2;
+  int64_t offset;        /* -1 when the broker was not asked to acknowledge (acks none) */
+  int64_t timestamp_ms;
+  anole_span topic;      /* empty for the answer to anole_kafka_flush */
+  anole_span error;      /* for logs */
+  anole_span error_code; /* the Kafka error name: "MESSAGE_TOO_LARGE" */
+} anole_kafka_delivery_event; /* 80 bytes */
+
+typedef struct anole_kafka_partition {
+  anole_span topic;
+  int32_t partition;
+  uint32_t reserved;
+} anole_kafka_partition; /* 16 bytes */
+/* ANOLE_EV_KAFKA_ASSIGN and ANOLE_EV_KAFKA_REVOKE. */
+typedef struct anole_kafka_assign_event {
+  anole_event ev;        /* the anole_kafka_group */
+  uint64_t user_data;
+  uint32_t entries_off;  /* nentries anole_kafka_partition */
+  uint32_t nentries;
+} anole_kafka_assign_event; /* 32 bytes */
 
 #ifdef __cplusplus
 }

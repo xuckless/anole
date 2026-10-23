@@ -46,6 +46,7 @@ const BodySource = @import("parser.zig").BodySource;
 const Transport = @import("transport.zig").Transport;
 const Deadline = @import("deadline.zig").Deadline;
 const KeepAliveParams = @import("parser.zig").KeepAliveParams;
+const resilience = @import("resilience_core");
 const parseKeepAliveHeader = @import("parser.zig").parseKeepAliveHeader;
 
 /// Protocol type for HTTP/HTTPS connections.
@@ -157,7 +158,9 @@ pub const ClientOptions = struct {
     /// effective with an injected HTTP/2 client (the `h2_client` import);
     /// ignored without one, and for cleartext (http://) connections. A
     /// connection on which the server picks h2 carries one request at a time
-    /// and is pooled like an HTTP/1.1 one. Defaults off.
+    /// and is pooled like an HTTP/1.1 one. Defaults off for now: without
+    /// requests sharing a connection, h2 saves no connections, and its fixed
+    /// 64 KiB stream window slows large downloads. Sharing comes in 0.4.
     http2: bool = false,
     /// Decides every redirect before it is followed (within
     /// `max_redirects`). Without one, redirects are followed, except one
@@ -173,6 +176,15 @@ pub const ClientOptions = struct {
     /// the address actually connected to, so a name that resolves to such
     /// an address is refused too. Unix sockets are not checked.
     deny_private_addresses: bool = false,
+    /// Retries for fetches whose request may be repeated (see
+    /// `FetchOptions.idempotent`); null: none beyond the transparent retry
+    /// of a request lost on a reused connection, which stays. The
+    /// whole-fetch `timeout` bounds all attempts together.
+    retry: ?resilience.Retry = null,
+    /// Statuses a retry is made for.
+    retry_statuses: []const u16 = &.{ 408, 429, 502, 503, 504 },
+    /// A circuit breaker per scheme, host and port; null: none.
+    breaker: ?resilience.Breaker.Options = null,
 };
 
 /// A redirect about to be followed, as `RedirectPolicy.check` sees it.
@@ -246,6 +258,11 @@ pub const FetchOptions = struct {
     /// Useful for communicating with Docker Engine (e.g. "/var/run/docker.sock").
     /// The URL host and path are still used for the HTTP request line and Host header.
     unix_socket_path: ?[]const u8 = null,
+    /// `.inherit` (the client's), `.off`, or `.on` with a policy of its own.
+    retry: resilience.Choice = .inherit,
+    /// Whether this request may be sent twice. Null: by method (GET, HEAD,
+    /// OPTIONS, TRACE, QUERY) or an Idempotency-Key header.
+    idempotent: ?bool = null,
 };
 
 /// Options for a WebSocket upgrade request.
@@ -1236,6 +1253,11 @@ pub const Client = struct {
     tls_state: TlsState,
     tls_lock: std.Io.RwLock,
     tls_loaded: std.atomic.Value(bool),
+    /// `ClientOptions.breaker`: one per scheme, host and port.
+    _breakers: ?resilience.Breakers = null,
+    /// `ClientOptions.retry`'s throttle (gRPC A6), shared by the client.
+    _throttle: resilience.Throttle,
+    resilience_metrics: ?*const resilience.Metrics = null,
 
     /// TLS material shared by every HTTPS connection. Reading the trust store
     /// and deriving the client key are expensive, so both are loaded once on
@@ -1261,7 +1283,15 @@ pub const Client = struct {
             .tls_state = .{},
             .tls_lock = .init,
             .tls_loaded = std.atomic.Value(bool).init(false),
+            ._breakers = if (config.breaker) |o| resilience.Breakers.init(allocator, o, .http, 1024) else null,
+            ._throttle = .init(if (config.retry) |r| (r.throttle orelse .{}) else .{}),
         };
+    }
+
+    /// Reports breakers and retries through `m` (`anole.resilience.Binding`).
+    pub fn observeResilience(self: *Client, m: ?*const resilience.Metrics) void {
+        self.resilience_metrics = m;
+        if (self._breakers) |*b| b.observe(self.io, m);
     }
 
     fn ensureTlsState(self: *Client) !TlsRef {
@@ -1315,9 +1345,13 @@ pub const Client = struct {
         self.tls_state.ca_bundle.deinit(self.allocator);
         if (comptime has_trust_store) if (self.tls_state.trust) |*t| t.deinit();
         if (self.tls_state.client_cert) |*pair| pair.deinit(self.allocator);
+        if (self._breakers) |*b| b.deinit();
     }
 
-    /// Perform an HTTP request.
+    /// Perform an HTTP request. With `ClientOptions.retry` (or the
+    /// fetch's) and an idempotent request, a failure that may pass is
+    /// retried; with `ClientOptions.breaker`, a host that keeps failing
+    /// is `error.CircuitOpen` without a dial.
     pub fn fetch(
         self: *Client,
         url: []const u8,
@@ -1328,14 +1362,136 @@ pub const Client = struct {
         const max_redirects = options.max_redirects orelse self.config.max_redirects;
         // Pinned here, so every redirect and the body share one budget.
         const deadline: Deadline = .init(self.io, options.timeout orelse self.defaultTimeout());
-        return deadline.run(fetchFollowing, .{ self, FetchState{
+        const state: FetchState = .{
             .uri = uri,
             .port = info.port,
             .protocol = info.protocol,
             .options = options,
             .redirects_remaining = max_redirects,
-        } });
+        };
+        const retry: ?resilience.Retry = if (options.idempotent orelse isReplayable(options)) options.retry.resolve(self.config.retry) else null;
+        if (retry == null and self._breakers == null) return deadline.run(fetchFollowing, .{ self, state });
+
+        var key_buf: [300]u8 = undefined;
+        var breaker: ?*resilience.Breaker = null;
+        if (self._breakers) |*bs| {
+            const key = breakerKey(&key_buf, uri, info.protocol, info.port, options.unix_socket_path);
+            breaker = try bs.get(self.io, key);
+        }
+        var ctx: AttemptCtx = .{ .client = self, .state = state, .deadline = deadline, .attempt_timeout = if (retry) |r| r.attempt_timeout else null };
+        const policy: resilience.Policy = .{
+            .retry = retry,
+            .breaker = breaker,
+            .throttle = if (retry != null and retry.?.throttle != null) &self._throttle else null,
+            .deadline = switch (deadline.timeout) {
+                .deadline => |d| d,
+                else => null,
+            },
+            .metrics = self.resilience_metrics,
+            .kind = .http,
+        };
+        const attempt = try resilience.run(self.io, policy, &ctx, attemptFetch, FetchJudge);
+        return attempt.result;
     }
+
+    /// The breaker's key: scheme://host:port, lower-cased, of the first hop.
+    fn breakerKey(buf: *[300]u8, uri: Uri, protocol: Protocol, port: u16, unix_path: ?[]const u8) []const u8 {
+        if (unix_path) |p| return std.fmt.bufPrint(buf, "unix:{s}", .{p[0..@min(p.len, 290)]}) catch "unix:";
+        var host_buf: [255]u8 = undefined;
+        const host = uriHost(uri, &host_buf) catch "";
+        const scheme = switch (protocol) {
+            .http => "http",
+            .https => "https",
+        };
+        const key = std.fmt.bufPrint(buf, "{s}://{s}:{d}", .{ scheme, host[0..@min(host.len, 255)], port }) catch return "";
+        for (key) |*ch| ch.* = std.ascii.toLower(ch.*);
+        return key;
+    }
+
+    const FetchOut = Deadline.Result(fetchFollowing);
+
+    const AttemptCtx = struct {
+        client: *Client,
+        state: FetchState,
+        deadline: Deadline,
+        attempt_timeout: ?std.Io.Duration,
+    };
+
+    /// What one attempt leaves for the judge.
+    const Attempt = struct {
+        result: FetchOut,
+        statuses: []const u16,
+        /// Wall-clock seconds when the attempt ended (for Retry-After dates).
+        now_s: i64 = 0,
+    };
+
+    /// A `Retry-After` value: delta-seconds, or an HTTP date (IMF-fixdate)
+    /// counted from `now_s`; a date in the past is no wait.
+    pub fn retryAfterValue(value: []const u8, now_s: i64) ?std.Io.Duration {
+        const v = std.mem.trim(u8, value, " \t");
+        if (std.fmt.parseInt(u32, v, 10)) |secs| return .fromSeconds(secs) else |_| {}
+        const date = @import("server/static.zig").parseHttpDate(v) orelse return null;
+        const secs = @max(0, date - now_s);
+        return .fromSeconds(@min(secs, std.math.maxInt(u32)));
+    }
+
+    fn attemptFetch(ctx: *AttemptCtx, n: u32) Attempt {
+        _ = n;
+        var d = ctx.deadline;
+        if (ctx.attempt_timeout) |at| {
+            const own: Deadline = .init(ctx.client.io, .{ .duration = .{ .raw = at, .clock = .awake } });
+            d = switch (d.timeout) {
+                .none => own,
+                .deadline => |overall| switch (own.timeout) {
+                    .deadline => |mine| if (mine.raw.nanoseconds < overall.raw.nanoseconds) own else d,
+                    else => d,
+                },
+                else => d,
+            };
+        }
+        const result = d.run(fetchFollowing, .{ ctx.client, ctx.state });
+        return .{ .result = result, .statuses = ctx.client.config.retry_statuses, .now_s = std.Io.Clock.real.now(ctx.client.io).toSeconds() };
+    }
+
+    fn transportVerdict(name: []const u8) resilience.Verdict {
+        if (std.mem.eql(u8, name, "Canceled")) return .neutral;
+        // SocketUnconnected: std's name for a send on a socket whose peer
+        // or sending side is gone (EPIPE).
+        const transient = [_][]const u8{ "Timeout", "ConnectionRefused", "ConnectionResetByPeer", "ConnectionTimedOut", "EndOfStream", "BrokenPipe", "SocketUnconnected", "NetworkUnreachable", "HostUnreachable", "UnknownHostName", "TemporaryNameServerFailure", "NameServerFailure" };
+        for (transient) |t| if (std.mem.eql(u8, name, t)) return .transient;
+        return .failure;
+    }
+
+    const FetchJudge = struct {
+        pub fn verdict(a: *const Attempt) resilience.Verdict {
+            const resp = a.result catch |err| return transportVerdict(@errorName(err));
+            const code = @intFromEnum(resp.status());
+            for (a.statuses) |s| if (s == code) return if (code == 429) .retryable else .transient;
+            return switch (code) {
+                408, 500, 502, 503, 504 => .failure,
+                501, 505 => .neutral,
+                400...407, 409...499 => .neutral,
+                else => .success,
+            };
+        }
+        pub fn retryAfter(a: *const Attempt) ?std.Io.Duration {
+            const resp = a.result catch return null;
+            const code = @intFromEnum(resp.status());
+            if (code != 429 and code != 503) return null;
+            const value = resp.headers().get("Retry-After") orelse return null;
+            return retryAfterValue(value, a.now_s);
+        }
+        pub fn discard(a: *Attempt) void {
+            if (a.result) |*resp| {
+                var r = resp.*;
+                r.deinit();
+            } else |_| {}
+        }
+        pub fn reason(a: *const Attempt) []const u8 {
+            _ = a.result catch |err| return if (err == error.Timeout) "timeout" else "transport";
+            return "status";
+        }
+    };
 
     /// One request per hop, in a loop rather than a call per redirect, so
     /// the stack does not grow with `max_redirects`. A hop's URL and

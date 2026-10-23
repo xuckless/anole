@@ -95,6 +95,20 @@ pub const Ca = @import("http/root.zig").Ca;
 pub const ClientAuth = ServerOptions.ClientAuth;
 /// A length of time: `.fromSeconds(30)`.
 pub const Duration = @import("server.zig").Duration;
+/// Typed settings from a JSON or INI file, `.env` files and the
+/// environment: `try anole.config.load(Config, init, .{})`. docs/config.md.
+pub const config = @import("config/root.zig");
+/// A string that never prints (`{f}` writes `[REDACTED]`): for keys and
+/// passwords in a config struct. Read it with `expose()`.
+pub const Secret = config.Secret;
+/// The environment as Anole reads it, `.env` files included:
+/// `anole.env.get("DATABASE_URL")`, `anole.env.environment()`.
+pub const env = @import("env.zig");
+/// `development` or `production` (`ServerOptions.environment`, `ANOLE_ENV`).
+pub const Environment = @import("modes.zig").Environment;
+/// What sits in front of the server (`ServerOptions.deployment`,
+/// `ANOLE_DEPLOYMENT`): standalone, behind_proxy, anole_lb, platform, lambda.
+pub const Deployment = @import("modes.zig").Deployment;
 /// The outbound HTTP client's settings (`ServerOptions.client`).
 pub const ClientOptions = @import("http/root.zig").ClientOptions;
 /// Every way `init`, `listen`, `listenTls`, `run` and `waitReady` fail.
@@ -173,6 +187,44 @@ pub const Request = http.Request;
 /// What a handler writes: `res.status`, `res.body`, `res.json(value)`,
 /// `res.header(name, value)`, `res.fail(status, message)`.
 pub const Response = http.Response;
+/// Validation rules declared on structs (`pub const field_rules = .{ ... }`),
+/// checked by `req.bind`, `req.bindQuery` and `anole.In`; from
+/// vkiryakov/zefir. docs/validation.md. Usually `const v = anole.validate;`.
+pub const validate = @import("validate");
+/// Typed handler inputs, a handler's last parameter:
+/// `fn (req: *anole.Request, in: anole.In(.{ .path = P, .body = B })) !Out`.
+/// docs/routing.md.
+pub const In = @import("typed.zig").In;
+/// Typed handler outputs: 201 with a `Location`, 202, any 2xx.
+pub const Created = @import("typed.zig").Created;
+pub const Accepted = @import("typed.zig").Accepted;
+pub const WithStatus = @import("typed.zig").WithStatus;
+/// What a handler takes and returns, read from its signature (for tools
+/// such as OpenAPI): `anole.routeInfo(handler)`.
+pub const RouteInfo = @import("typed.zig").RouteInfo;
+pub const routeInfo = @import("typed.zig").routeInfo;
+
+/// A route's texts for the OpenAPI document (summary, tags, ...) and, for a
+/// plain (req, res) handler, its body and response types:
+/// `app.get("/health", anole.doc(.{ .summary = "Liveness" }, health));`
+/// Combines with `noWait` and `cached` in any order. Compiles (and is
+/// ignored) in builds without -Dopenapi.
+pub const doc = @import("handlers.zig").doc;
+/// One problem in a request's input; `req.violations()`.
+pub const Violation = http.Violation;
+pub const Violations = http.Violations;
+/// An RFC 9457 problem document: `res.problem(.{ ... })`.
+pub const Problem = http.Problem;
+/// JSON bytes as a `T` checked by its `field_rules`, with no request.
+pub const bindJson = http.bindJson;
+pub const BindResult = http.BindResult;
+pub const BindOptions = http.BindOptions;
+/// Structured logs, in text or JSON Lines: `anole.log.info("msg", .{ .k = v })`,
+/// `req.log()`. docs/logging.md.
+pub const log = @import("anole_log");
+/// An in-memory client for routes and middleware, no sockets:
+/// `var t = try anole.testing.client(&app);`. docs/testing.md.
+pub const testing = @import("testing/root.zig");
 /// The built-in middleware: the HTTP core's (`Cors`, `Compress`,
 /// `RequestId`, `Logger`) and `ResponseCache`. Sessions are
 /// `anole.session.Middleware`, rate limits `anole.ratelimit.Middleware`,
@@ -247,11 +299,22 @@ pub const json = if (features.json) @import("json/root.zig") else struct {};
 /// executor.
 pub const redis = if (features.redis) @import("redis/root.zig") else struct {};
 
+/// Kafka (`-Dkafka`): a client of Anole's own on `std.Io`. `state.kafka =
+/// try app.kafka(.{})` (KAFKA_BOOTSTRAP_SERVERS), then `send`/`produce` to
+/// publish and `consume` to handle a topic as a member of a group. See
+/// `anole.kafka` (src/kafka/root.zig).
+pub const kafka = if (features.kafka) @import("kafka/root.zig") else struct {};
+
 /// What the database connectors share: calls that take the request, a
 /// pool per executor, errors that are statuses (`NotFound` 404, `Conflict`
 /// 409...), `Time`, connection URLs from the environment, and the health,
 /// metrics and tracing hooks.
 pub const db = @import("db/root.zig");
+
+/// Retries with backoff, retry throttling and circuit breakers: the
+/// policies the HTTP and gRPC clients, the database connectors and the
+/// brokers share.
+pub const resilience = @import("resilience/root.zig");
 
 /// PostgreSQL (`-Dpostgres`): `state.db = try app.postgres(.{})`
 /// (DATABASE_URL), then `state.db.all(Post, req, sql, .{args})` and the other `anole.db` verbs,
@@ -267,6 +330,11 @@ pub const sqlite = if (features.sqlite) @import("sqlite/root.zig") else struct {
 /// sets, a pool per executor, CRUD, aggregation and cursors, retryable
 /// reads and writes. `app.mongodb(.{})` connects from `MONGODB_URI`.
 pub const mongodb = if (features.mongodb) @import("mongodb/root.zig") else struct {};
+
+/// A NATS client on std.Io (`-Dnats`): publish, request/reply, handlers,
+/// queue groups, TLS, token/NKey/creds auth and JetStream.
+/// `app.nats(.{})` connects from `NATS_URL`.
+pub const nats = if (features.nats) @import("nats/root.zig") else struct {};
 
 /// BSON (`-Dmongodb`): documents, the struct mapping, ObjectId, Decimal128
 /// and Extended JSON, as the MongoDB client reads and writes them.
@@ -300,6 +368,19 @@ pub const observe = @import("observe/root.zig");
 /// transcoding; `Call` for metadata, deadlines and status; and a client.
 pub const grpc = if (features.grpc) @import("grpc/root.zig") else struct {};
 
+/// OpenAPI 3.1 documents (`-Dopenapi`, on in the web and full profiles). In a
+/// build without it, only the declaration types are present, so
+/// `pub const openapi: anole.openapi.Doc(@This()) = ...` compiles in every
+/// profile. Types: `Doc`, `FieldDoc`, `Example`, `MiddlewareDoc`, `RouteDoc`.
+/// `app.openapi(.{})` serves /openapi.json and /docs in development;
+/// `zig build openapi` writes the file.
+pub const openapi = if (features.openapi) @import("openapi/root.zig") else @import("openapi/off.zig");
+
+/// The live console (`-Dconsole`, on in the web and full profiles): options,
+/// the control socket's service and the terminal UI behind `anole console`
+/// and `c` + Enter in development. docs/console.md.
+pub const console = @import("console/root.zig");
+
 /// Auth (`-Dauth`): JWT/JWKS verification and signing, OIDC, CSRF,
 /// passwords, API keys, roles.
 pub const auth = if (features.auth) @import("auth/root.zig") else struct {};
@@ -320,7 +401,11 @@ test {
     _ = @import("panic.zig");
     _ = @import("fuzz.zig");
     _ = @import("log.zig");
+    _ = @import("typed.zig");
+    _ = @import("banner.zig");
+    _ = testing;
     _ = http;
+    _ = resilience;
     _ = tls;
     _ = h2;
     _ = h3;
@@ -328,18 +413,23 @@ test {
     _ = webtransport;
     _ = compression;
     _ = grpc;
+    _ = openapi;
     _ = json;
     _ = redis;
     _ = sqlite;
     _ = db;
     _ = pg;
     _ = mongodb;
+    _ = nats;
     _ = @import("net/client_stream.zig");
+    _ = @import("net/scram.zig");
+    _ = kafka;
     _ = session;
     _ = early_data;
     _ = ratelimit;
     _ = auth;
     _ = observe;
+    _ = console;
     _ = capi;
 }
 

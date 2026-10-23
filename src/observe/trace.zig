@@ -127,6 +127,10 @@ pub const Span = struct {
         /// success.
         error_type: [32]u8 = undefined,
         error_type_len: u8 = 0,
+        /// A messaging span (NATS, Kafka): `system` is `messaging.system`,
+        /// `collection` the destination (`messaging.destination.name`) and
+        /// `operation` the `messaging.operation.type`.
+        messaging: bool = false,
 
         /// The attributes from their values, each cut to its field's size.
         pub fn init(system: []const u8, namespace: []const u8, operation: []const u8, collection: ?[]const u8, error_type: ?[]const u8) Db {
@@ -290,6 +294,20 @@ pub fn encode(arena: std.mem.Allocator, service: []const u8, spans: []const Span
         try w.print("{{\"traceId\":\"{s}\",\"spanId\":\"{s}\",", .{ &s.trace_id, &s.span_id });
         if (s.parent_span_id) |p| try w.print("\"parentSpanId\":\"{s}\",", .{&p});
         if (s.db) |d| {
+            if (d.messaging) {
+                const op = d.operation[0..d.operation_len];
+                const kind: u8 = if (std.mem.eql(u8, op, "publish")) 4 else if (std.mem.eql(u8, op, "process") or std.mem.eql(u8, op, "receive")) 5 else 3;
+                try w.print("\"name\":{f},\"kind\":{d},\"startTimeUnixNano\":\"{d}\",\"endTimeUnixNano\":\"{d}\",", .{ std.json.fmt(s.name[0..s.name_len], .{}), kind, s.start_ns, s.end_ns });
+                try w.print("\"attributes\":[{{\"key\":\"messaging.system\",\"value\":{{\"stringValue\":{f}}}}}", .{std.json.fmt(d.system[0..d.system_len], .{})});
+                const msg_attrs = [_]struct { []const u8, []const u8 }{
+                    .{ "messaging.destination.name", d.collection[0..d.collection_len] },
+                    .{ "messaging.operation.type", op },
+                    .{ "error.type", d.error_type[0..d.error_type_len] },
+                };
+                for (msg_attrs) |a| if (a[1].len > 0) try w.print(",{{\"key\":\"{s}\",\"value\":{{\"stringValue\":{f}}}}}", .{ a[0], std.json.fmt(a[1], .{}) });
+                try w.print("],\"status\":{{\"code\":{d}}}}}", .{@as(u8, if (d.error_type_len > 0) 2 else 0)});
+                continue;
+            }
             try w.print("\"name\":{f},\"kind\":3,\"startTimeUnixNano\":\"{d}\",\"endTimeUnixNano\":\"{d}\",", .{ std.json.fmt(s.name[0..s.name_len], .{}), s.start_ns, s.end_ns });
             try w.print("\"attributes\":[{{\"key\":\"db.system.name\",\"value\":{{\"stringValue\":{f}}}}}", .{std.json.fmt(d.system[0..d.system_len], .{})});
             const optional = [_]struct { []const u8, []const u8 }{

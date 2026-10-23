@@ -171,7 +171,9 @@ test "ResponseCache: what is kept, Vary, HEAD, expiry, invalidation and metrics"
     app.get("/broken", handlers.cached(ttl, Routes.broken));
     app.get("/plain", Routes.plain);
     app.get("/open", handlers.cached(.{ .ttl = .fromSeconds(60), .authenticated = true }, Routes.open));
-    app.post("/page", handlers.cached(ttl, Routes.post));
+    // anole.cached on a POST route is a compile error with app.post; addRoute
+    // (a run-time path) skips the check, to see that a POST is not the cache's.
+    app.addRoute(.post, "/page", handlers.cached(ttl, Routes.post));
     const pages = app.responseCache(.{ .name = "pages" });
     app.with(.{pages}).get("/shared/:n", Routes.shared);
 

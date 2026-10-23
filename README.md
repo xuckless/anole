@@ -63,6 +63,13 @@ Zig compiles every C dependency, so you install nothing but Zig. Each one
 sits behind a build flag, and whatever you switch off is never downloaded or
 compiled.
 
+## Start from a template
+
+`anole new my-api` makes a project (a JSON API, a PostgreSQL API, a chat, a gRPC
+service, or most of Anole in one app) with tests, an OpenAPI page at `/docs`
+and a ready `.env`; see [docs/templates.md](docs/templates.md) for the
+download. The sections below build the same thing by hand.
+
 ## Hello, World
 
 ```zig
@@ -152,8 +159,8 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
 - **TLS on BoringSSL:**
   - TLS 1.3 and 1.2, ALPN, mutual TLS (over HTTP/3 too), session tickets;
   - hot certificate reload on SIGHUP.
-- **WebSockets:** over HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220),
-  with permessage-deflate and a rooms helper for broadcast. It passes all
+- **WebSockets:** over HTTP/1.1, HTTP/2 (RFC 8441, opt-in) and HTTP/3
+  (RFC 9220), with permessage-deflate and a rooms helper for broadcast. It passes all
   517 Autobahn cases.
 - **WebTransport (draft-02):** streams both ways, datagrams, close codes and
   drain, on the same router, plus a client. It's checked against aioquic and
@@ -171,7 +178,12 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
   - sessions (memory, Redis or sealed cookies), CSRF, Argon2id, API keys,
     RBAC and rate limiting.
 - **Observability:** Prometheus `/metrics`, OpenTelemetry traces, structured
-  access logs, `/healthz` and `/readyz`.
+  access logs, `/healthz` and `/readyz`; JSON Lines logs by default in
+  production, `req.log()` with request and trace ids, and readable startup
+  errors.
+- **Input and tests:** validation with 422 `application/problem+json` that
+  names every field, typed handlers (`anole.In`) checked at compile time,
+  and in-memory tests (`anole.testing`) with no socket.
 - **Operations:**
   - graceful drain;
   - zero-downtime restart on SIGUSR2, where the new process inherits every
@@ -254,6 +266,7 @@ memory, so `-k` it. Pass other ports with `zig build run-full -- 9000 9443`.
 | `-Dpostgres=bool` | false | true | true | PostgreSQL client (pg.zig fork) |
 | `-Dsqlite=bool` | false | true | true | SQLite (amalgamation, zig-sqlite fork) |
 | `-Dmongodb=bool` | false | false | true | MongoDB client and BSON |
+| `-Dopenapi=bool` | false | true | true | OpenAPI 3.1 documents and the docs page (pure Zig) |
 
 Constraints:
 - gRPC needs HTTP/2, so `-Dhttp2=false` turns gRPC off. Asking for both

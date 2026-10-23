@@ -11,6 +11,8 @@
 const std = @import("std");
 const dusty = @import("dusty");
 const ResponseCache = @import("cache/response.zig").ResponseCache;
+const typed = @import("typed.zig");
+const declarations = @import("openapi/declarations.zig");
 
 /// `handler` as the router of a `Server(Ctx)` takes it: as it is when it
 /// already has that shape, or wrapped when it is a `(req, res)` handler on a
@@ -19,10 +21,13 @@ pub fn adapt(comptime Ctx: type, comptime handler: anytype) dusty.Router(Ctx).Ha
     const F = @TypeOf(handler);
     if (comptime isNoWait(F)) return adapt(Ctx, F.no_wait_handler);
     if (comptime isCached(F)) return adapt(Ctx, F.cached_handler);
+    if (comptime isDoc(F)) return adapt(Ctx, F.doc_handler);
     const info = switch (@typeInfo(F)) {
         .@"fn" => |f| f,
         else => @compileError("a handler is a function taking (*anole.Request, *anole.Response), not " ++ @typeName(F)),
     };
+    // Typed inputs or output (anole.In, a result type): see typed.zig.
+    if (comptime typed.shapeOf(F).typed) return typed.adapt(Ctx, handler);
     const want = if (Ctx == void) 2 else 3;
     if (info.param_types.len == want) return handler;
     if (Ctx != void and info.param_types.len == 2) return struct {
@@ -96,11 +101,83 @@ pub fn isCached(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "cached_handler");
 }
 
+/// `handler` with the texts of its route for the OpenAPI document (summary,
+/// tags, ...) and, for a plain `(req, res)` handler, its body and response
+/// types. Combines with `noWait` and `cached` in any order; the texts are
+/// ignored in a build without `-Dopenapi`.
+///
+///     app.get("/health", anole.doc(.{ .summary = "Liveness" }, health));
+pub fn doc(comptime texts: declarations.RouteDoc, comptime handler: anytype) Doc(texts, handler) {
+    return .{};
+}
+
+/// The type `doc` returns: a marker the route methods recognise.
+pub fn Doc(comptime texts: declarations.RouteDoc, comptime handler: anytype) type {
+    return struct {
+        pub const doc_handler = handler;
+        pub const route_doc: declarations.RouteDoc = texts;
+    };
+}
+
+/// Whether `T` is the type `doc` returns.
+pub fn isDoc(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "doc_handler");
+}
+
+/// The `RouteDoc` given to `doc` anywhere in the markers around `handler`
+/// (all defaults when none).
+pub fn routeDoc(comptime handler: anytype) declarations.RouteDoc {
+    const F = @TypeOf(handler);
+    if (comptime isDoc(F)) return F.route_doc;
+    if (comptime isNoWait(F)) return routeDoc(F.no_wait_handler);
+    if (comptime isCached(F)) return routeDoc(F.cached_handler);
+    return .{};
+}
+
+/// Whether any marker around `handler` is `noWait`.
+pub fn anyNoWait(comptime handler: anytype) bool {
+    const F = @TypeOf(handler);
+    if (comptime isNoWait(F)) return true;
+    if (comptime isCached(F)) return anyNoWait(F.cached_handler);
+    if (comptime isDoc(F)) return anyNoWait(F.doc_handler);
+    return false;
+}
+
+/// Whether any marker around `handler` is `cached`.
+pub fn anyCached(comptime handler: anytype) bool {
+    const F = @TypeOf(handler);
+    if (comptime isCached(F)) return true;
+    if (comptime isNoWait(F)) return anyCached(F.no_wait_handler);
+    if (comptime isDoc(F)) return anyCached(F.doc_handler);
+    return false;
+}
+
 /// The router options a handler as `Server` takes it implies.
 pub fn routeOptions(comptime handler: anytype) dusty.RouteOptions {
     const F = @TypeOf(handler);
     if (comptime isCached(F)) return routeOptions(F.cached_handler);
-    return .{ .no_wait = comptime isNoWait(F) };
+    if (comptime isDoc(F)) return routeOptions(F.doc_handler);
+    return .{ .no_wait = comptime isNoWait(F), .required_params = comptime typed.requiredParams(handler) };
+}
+
+/// The function type inside `noWait` and `cached` markers (`F` itself for
+/// a bare function).
+pub fn Unwrapped(comptime F: type) type {
+    if (isNoWait(F)) return Unwrapped(@TypeOf(F.no_wait_handler));
+    if (isCached(F)) return Unwrapped(@TypeOf(F.cached_handler));
+    if (isDoc(F)) return Unwrapped(@TypeOf(F.doc_handler));
+    return F;
+}
+
+/// The handler function inside `noWait` / `cached` markers, as a pointer
+/// to it: what tools that read a handler's signature (`anole.routeInfo`,
+/// OpenAPI) start from.
+pub fn unwrap(comptime handler: anytype) *const Unwrapped(@TypeOf(handler)) {
+    const F = @TypeOf(handler);
+    if (comptime isNoWait(F)) return unwrap(F.no_wait_handler);
+    if (comptime isCached(F)) return unwrap(F.cached_handler);
+    if (comptime isDoc(F)) return unwrap(F.doc_handler);
+    return &handler;
 }
 
 /// What a function middleware calls to run the rest of the chain (the
