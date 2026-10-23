@@ -649,3 +649,45 @@ test "anole.App: listenTls(\":0\") serves HTTP/3 to 127.0.0.1 and ::1 on one soc
     try app.listenTls(":0", .dev_self_signed);
     try checking.await(app.io());
 }
+
+test "route conflicts in a test build: run fails with RouteConflict and routeConflict() has the message" {
+    const expected_log = @import("errors.zig").expectLog();
+    defer expected_log.deinit();
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    app.get("/a/:id", AppRoutes.hello);
+    app.get("/a/:name", AppRoutes.hello);
+    const message = app.routeConflict() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, message, ":name conflicts with :id") != null);
+    try std.testing.expectError(error.RouteConflict, app.run());
+}
+
+test "addRoute takes a run-time path and checks it at registration" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    var good: []const u8 = "/dyn/:id";
+    var bad: []const u8 = "/x/*a/b";
+    std.mem.doNotOptimizeAway(&good);
+    std.mem.doNotOptimizeAway(&bad);
+    app.addRoute(.get, good, AppRoutes.hello);
+    try std.testing.expect(app.routeConflict() == null);
+    app.addRoute(null, bad, AppRoutes.hello);
+    const message = app.routeConflict() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("route ANY /x/*a/b: a wildcard (*a) must be the last segment", message);
+}
+
+test "In path fields under a group prefix are checked at registration" {
+    const anole = @import("root.zig");
+    const Ins = struct {
+        fn show(_: *Request, in: anole.In(.{ .path = struct { uid: u64 } })) !void {
+            _ = in;
+        }
+    };
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    const v1 = app.group("/v1", .{});
+    v1.get("/users/:id", Ins.show);
+    const message = app.routeConflict() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, message, "route GET /v1/users/:id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "\"uid\"") != null);
+}

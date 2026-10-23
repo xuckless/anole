@@ -1454,3 +1454,24 @@ test "config: modes keys" {
     try std.testing.expect(d.environment == null and d.deployment == null and d.error_detail == null);
     try std.testing.expectEqual(@as(?u32, 75_000), d.timeouts.keepalive_ms);
 }
+
+test "config: log.format and log.service parse; the access log's format defaults to auto" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [400]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    const c = try parse(a,
+        \\{"log": {"format": "json", "service": "api"}, "banner": true,
+        \\ "middleware": [{"access_log": {}}, {"access_log": {"format": "text"}}]}
+    , &why);
+    try std.testing.expectEqual(anole.log.Format.json, c.log.format);
+    try std.testing.expectEqualStrings("api", c.log.service.?);
+    try std.testing.expect(c.banner);
+    try std.testing.expect(c.middleware[0].access_log.format == .auto);
+    try std.testing.expect(c.middleware[1].access_log.format == .text);
+    const d = try parse(a, "{}", &why);
+    try std.testing.expectEqual(anole.log.Format.auto, d.log.format);
+    try std.testing.expect(d.log.service == null and !d.banner);
+    try std.testing.expect(std.mem.indexOf(u8, @import("anole_capi_schema").text, "\"log\"") != null);
+}

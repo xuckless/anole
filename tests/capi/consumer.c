@@ -763,6 +763,12 @@ static void test_route_conflicts(void) {
       {LISTEN "\"routes\":[{\"path\":\"/assets\",\"static\":{\"dir\":\".\"}},"
               "{\"method\":\"GET\",\"path\":\"/assets/*rest\",\"handler\":1}]}",
        "/assets/*rest"},
+      /* a malformed pattern: a wildcard before the end */
+      {LISTEN "\"routes\":[{\"method\":\"GET\",\"path\":\"/a/*x/b\"," OK200 "}]}",
+       "a wildcard (*x) must be the last segment"},
+      /* a parameter named twice */
+      {LISTEN "\"routes\":[{\"method\":\"GET\",\"path\":\"/a/:id/b/:id\"," OK200 "}]}",
+       "names the parameter \"id\" twice"},
       /* a route on the metrics path, which Anole adds while starting */
       {LISTEN "\"observe\":{\"metrics\":{}},\"routes\":[{\"method\":\"GET\",\"path\":\"/metrics\"," OK200 "}]}",
        "/metrics"},
