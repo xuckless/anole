@@ -9,6 +9,7 @@ const Diagnostics = @import("config/Diagnostics.zig");
 const dotenv = @import("config/parsers/dotenv.zig");
 
 const log = std.log.scoped(.anole);
+const errors = @import("errors.zig");
 
 pub const Environment = modes.Environment;
 
@@ -150,7 +151,8 @@ fn loadInto(io: std.Io, paths: []const []const u8, dir: ?std.Io.Dir) error{ OutO
     const files = Files.load(a, io, dir, paths, &diag) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidEnvFile => {
-            log.err("{f}", .{&diag});
+            // The caller gets the error too: a test can expect this one.
+            errors.log.err("{f}", .{&diag});
             return error.InvalidEnvFile;
         },
     };
