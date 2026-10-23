@@ -52,7 +52,9 @@ pub fn build(b: *std.Build) void {
 `addApp` makes the executable, gives it the `anole` module, installs it and
 adds `zig build run`. `-Doptimize` and `-Dtarget` work as usual, and
 `.profile = .web` leaves out HTTP/3, gRPC, MongoDB and Redis (the
-[build flags](../README.md#build-flags)).
+[build flags](../README.md#build-flags)); `.features = .{ .postgres = false }`
+turns single features on or off over the preset, like Anole's own
+`-D<feature>` flags.
 
 And `src/main.zig`:
 
