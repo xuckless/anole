@@ -543,6 +543,31 @@ jobs:
         timeout-minutes: 35
         run: REDIS_IMAGE=${{ matrix.image }} tests/redis/run.sh
 
+  # ---- p3/s3 ----
+  s3:
+    name: S3 (the client against MinIO, plain and TLS; fuzz target; the C ABI's storage tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: s3
+      # Zig fetches git dependencies itself on a cold cache, and its DNS
+      # lookups fail now and then on the runners (NameServerFailure).
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # The fake server tests (no Docker: "s3: ..." and "capi s3: ..."), the
+      # XML reader's fuzz target ("fuzz: s3 xml") on its seeds, then the same
+      # suite plus the live tests against a throwaway MinIO (the image is
+      # pinned by digest in the script), once over HTTP and once over TLS.
+      - name: Tests against a live server
+        timeout-minutes: 35
+        run: tests/s3/run.sh
+      - name: Fuzz the XML reader
+        run: zig build test -Dtest-filter="fuzz: s3 xml" -Dllvm=true --fuzz=200K
+  # ---- end p3/s3 ----
+
   postgres:
     name: PostgreSQL (live client tests, plain and verify-full TLS, scram-sha-256; the C ABI's suite)
     runs-on: ubuntu-latest

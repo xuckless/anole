@@ -163,10 +163,14 @@ pub const Call = struct {
         }
         const exporter = o.tracer orelse return;
         const req = internal.requestOf(c) orelse return;
+        // S3 spans carry the operation as the AWS conventions name it
+        // ("S3.GetObject"), cut to the field's size.
+        var op_buf: [24]u8 = undefined;
+        const op_name = if (o.system == .s3) (std.fmt.bufPrint(&op_buf, "S3.{s}", .{operation}) catch operation) else operation;
         var span_db: observe.trace.Span.Db = .init(
             @tagName(o.system),
             o.name,
-            operation,
+            op_name,
             target,
             if (err) |e| @errorName(e) else null,
         );

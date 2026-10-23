@@ -255,6 +255,14 @@ attribution header on every file and THIRD_PARTY_NOTICES part B current.
   each release and port the fixes that apply. The PRs open there from the
   fork (#263-#270) are left as they are.
 
+## The S3 client
+
+`anole.s3` (src/s3/) is Anole's own: the SigV4 signer is written from the specification (checked against the worked examples on AWS's S3 API reference pages, transcribed in `sigv4.zig`'s tests; the aws-sig-v4-test-suite is not vendored because its NOTICE gives no licence), and the XML reader handles the six response shapes S3 and STS use. Nothing to bump. What to watch:
+
+- The live tests (`tests/s3/run.sh`, CI job `s3`) run against MinIO. MinIO stopped publishing community images on Docker Hub and Quay in 2025, so the script pulls Chainguard's build by digest (`cgr.dev/chainguard/minio@sha256:...`, the `S3_IMAGE` default). If the digest goes away, take SeaweedFS's S3 gateway or Garage instead; the tests need only an S3 endpoint, a bucket and a key.
+- S3's checksum behaviour: the AWS SDKs began sending CRC32 trailers by default in 2025, and R2, B2 and older MinIO rejected them. Anole signs the body hash (or `UNSIGNED-PAYLOAD` over HTTPS) and sends no `x-amz-checksum-*` header. Re-check the providers' docs when one of them says it requires checksums.
+- Provider quirks live in `src/s3/endpoint.zig` (addressing, default regions) and `errors.zig` (codes to classes).
+
 ## The NATS client
 
 `src/nats/core` is adapted from zefir's `src/nats` (commit dbcc967, MIT) and

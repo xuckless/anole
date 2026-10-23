@@ -14,6 +14,21 @@ breaking changes are listed anyway.
 
 ### Added
 
+- `anole.s3` (`-Ds3`, in the `web` and `full` profiles): an S3-compatible
+  object storage client for AWS S3, Cloudflare R2, MinIO, Backblaze B2 and
+  Supabase Storage, in pure Zig on Anole's HTTP client with its own SigV4
+  signer. Streaming uploads (a pull form from a reader, a file or the
+  request, and a push form whose writes never wait for the network) and
+  downloads, multipart uploads with bounded memory, `serve` for answering a
+  request from an object, presigned URLs, listing, copying, and the AWS
+  credential chain (environment, shared file, web identity, ECS/EKS, EC2).
+  Retries are on by default (every call is idempotent). `app.s3(.{})`,
+  `anole.s3.testing.FakeServer` (verifies signatures), docs/storage.md.
+- C ABI: `"storage"` in the configuration and `anole_s3_*` (events 124 and
+  125, handle kind 16 for uploads and downloads, `ANOLE_E_SERVICE`, error
+  classes `NOT_FOUND`, `PRECONDITION` and `INVALID`). `serve` and `put_body`
+  move an object to and from a request without it entering the language.
+
 ### Changed
 
 - `anole.db.System` has `s3` and `smtp`, and `anole.resilience.Kind` too.
