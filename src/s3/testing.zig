@@ -52,6 +52,15 @@ pub const Fault = struct {
     date: ?[]const u8 = null,
 };
 
+/// An answer for a path outside S3 (a credentials endpoint, STS), sent
+/// before anything is verified.
+pub const Canned = struct {
+    method: ?[]const u8 = null,
+    path: []const u8,
+    status: u16 = 200,
+    body: []const u8 = "",
+};
+
 pub const Logged = struct {
     method: []const u8,
     target: []const u8,
@@ -68,6 +77,7 @@ pub const FakeServer = struct {
     objects: std.StringArrayHashMapUnmanaged(Object) = .empty,
     uploads: std.StringArrayHashMapUnmanaged(Upload) = .empty,
     faults: std.ArrayList(Fault) = .empty,
+    canned: std.ArrayList(Canned) = .empty,
     log: std.ArrayList(Logged) = .empty,
     next_upload: u32 = 1,
     /// The key and secret requests must be signed with.
@@ -115,6 +125,7 @@ pub const FakeServer = struct {
         self.objects.deinit(self.gpa);
         self.uploads.deinit(self.gpa);
         self.faults.deinit(self.gpa);
+        self.canned.deinit(self.gpa);
         self.log.deinit(self.gpa);
         const gpa = self.gpa;
         self.arena.deinit();
@@ -139,6 +150,13 @@ pub const FakeServer = struct {
         try self.lock();
         defer self.unlock();
         try self.faults.append(self.gpa, f);
+    }
+
+    /// Answers `path` (and `method`) with `status` and `body`, no signature needed.
+    pub fn answer(self: *FakeServer, c: Canned) !void {
+        try self.lock();
+        defer self.unlock();
+        try self.canned.append(self.gpa, c);
     }
 
     pub fn releaseParts(self: *FakeServer) void {
@@ -225,7 +243,7 @@ pub const FakeServer = struct {
         try self.log.append(self.gpa, .{
             .method = try self.arena.allocator().dupe(u8, @tagName(req.method)),
             .target = try self.arena.allocator().dupe(u8, req.url),
-            .status = @intFromEnum(res.status),
+            .status = @intCast(@intFromEnum(res.status)),
         });
     }
 
@@ -264,7 +282,18 @@ pub const FakeServer = struct {
         const query = try parseQuery(arena, raw_query);
         const method = @tagName(req.method);
 
-        // Scripted failures first.
+        // Canned answers, then scripted failures.
+        {
+            try self.lock();
+            defer self.unlock();
+            for (self.canned.items) |cn| {
+                if (cn.method) |m| if (!std.mem.eql(u8, m, method)) continue;
+                if (!std.mem.eql(u8, cn.path, raw_path)) continue;
+                res.status = dusty.Status.fromCode(cn.status) catch .ok;
+                res.body = try res.arena.dupe(u8, cn.body);
+                return;
+            }
+        }
         {
             try self.lock();
             defer self.unlock();

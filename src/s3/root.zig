@@ -216,7 +216,7 @@ pub const Source = struct { key: []const u8, bucket: ?[]const u8 = null, version
 pub const PresignMethod = enum { get, put, head, delete, upload_part };
 pub const PresignOptions = struct {
     /// 1 s .. 7 days.
-    expires: Duration = .fromMinutes(15),
+    expires: Duration = .fromSeconds(15 * 60),
     version_id: ?[]const u8 = null,
     /// PUT: signed, so the browser must send exactly this.
     content_type: ?[]const u8 = null,
@@ -1062,7 +1062,7 @@ pub const Client = struct {
         var keep = false;
         defer if (!keep) resp.deinit();
         if (self.bytes_up) |m| m.add(op.body.len);
-        const status: u16 = @intFromEnum(resp.status());
+        const status: u16 = @intCast(@intFromEnum(resp.status()));
         if (status >= 300 and !(status == 304 and op.allow_304)) {
             return self.errorAnswer(c, &resp, op, status);
         }
@@ -1076,8 +1076,10 @@ pub const Client = struct {
                 const bytes = r.interface.allocRemaining(arena, .limited(limit)) catch |err| switch (err) {
                     error.StreamTooLong => return self.failOur(c, .invalid, "object_too_large", "the object is larger than max_bytes; use open() to stream it"),
                     error.OutOfMemory => return error.OutOfMemory,
-                    error.Canceled => return error.Canceled,
-                    error.ReadFailed => return self.failOur(c, .unavailable, "transport", if (r.err) |e| @errorName(e) else "read failed"),
+                    error.ReadFailed => {
+                        if (r.err) |e| if (std.mem.eql(u8, @errorName(e), "Canceled")) return error.Canceled;
+                        return self.failOur(c, .unavailable, "transport", if (r.err) |e| @errorName(e) else "read failed");
+                    },
                 };
                 if (self.bytes_down) |m| m.add(bytes.len);
                 return .{ .meta = meta, .body = bytes };

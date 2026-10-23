@@ -43,10 +43,6 @@ const IdleReader = struct {
             error.EndOfStream => return error.EndOfStream,
             error.WriteFailed => return error.WriteFailed,
             error.ReadFailed => return error.ReadFailed,
-            else => {
-                self.err = err;
-                return error.ReadFailed;
-            },
         };
     }
 

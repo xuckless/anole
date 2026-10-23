@@ -684,7 +684,8 @@ pub fn open(b: Bucket, c: anytype, key: []const u8, opts: PutOptions, declared_l
     const cc = try a.alloc(root.Header, cond.len);
     for (cond.slice(), cc) |h, *out| out.* = .{ try a.dupe(u8, h[0]), try a.dupe(u8, h[1]) };
     self.conditional = cc;
-    try placement.concurrent(&self.group, cl.io, .local, Upload.driver, .{self});
+    placement.concurrent(&self.group, cl.io, .local, Upload.driver, .{self}) catch
+        return cl.failOur(c, .unavailable, "no_task", "no task could be started for the upload");
     _ = cl.uploads_live.fetchAdd(1, .acq_rel);
     return self;
 }
@@ -725,7 +726,7 @@ pub fn put(b: Bucket, c: anytype, key: []const u8, body: root.Body, opts: PutOpt
             return pump(b, c, key, opts, ReaderSource{ .reader = &fr.interface }, stat.size);
         },
         .request => {
-            if (comptime @TypeOf(c) != *anole.Request) @compileError("Body.request needs the request as the call's context");
+            if (comptime @TypeOf(c) != *anole.Request) return cl.failOur(c, .invalid, "no_request", "Body.request needs the request as the call's context");
             const req: *anole.Request = c;
             var rbuf: [16 * 1024]u8 = undefined;
             var rr = req.reader(&rbuf) catch |err| return requestErr(cl, c, err);
@@ -738,7 +739,7 @@ pub fn put(b: Bucket, c: anytype, key: []const u8, body: root.Body, opts: PutOpt
                 return singlePut(b, c, key, data, opts);
             };
             return pump(b, c, key, opts, ReaderSource{ .reader = &rr.interface }, declared) catch |err| {
-                if (@hasField(@TypeOf(rr), "err")) if (rr.err) |e| return requestErr(cl, c, e);
+                if (rr.err) |e| return requestErr(cl, c, e);
                 return err;
             };
         },
