@@ -169,7 +169,7 @@ const Client = struct {
     /// Queues one masked frame on the stream.
     fn sendFrame(self: *Client, opcode: wsc.Opcode, payload: []const u8) !void {
         var w: std.Io.Writer = .fixed(self.outgoing[self.out_len..]);
-        var copy: [2048]u8 = undefined;
+        var copy: [4096]u8 = undefined;
         @memcpy(copy[0..payload.len], payload);
         try wsc.writeFrame(&w, copy[0..payload.len], .{ .opcode = opcode });
         self.out_len += w.buffered().len;
