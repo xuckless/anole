@@ -119,7 +119,8 @@ pub const Session = struct {
     broken: bool = false,
     /// Taken idle from the pool.
     reused: bool = false,
-    /// The final "." of the current message may have reached the server.
+    /// The final "." of the current message was sent and no answer came:
+    /// the server may have kept the message.
     after_dot: bool = false,
     /// MAIL FROM of the current message was accepted.
     mail_accepted: bool = false,
@@ -380,6 +381,8 @@ pub const Session = struct {
         try stuffer.finish(w);
         try w.flush();
         const final = try self.read(ctx, map);
+        // The server answered: whatever it said, the outcome is known.
+        self.after_dot = false;
         if (final.code != 250) return self.refused(ctx, map, .body, final);
         self.messages += 1;
         return .{

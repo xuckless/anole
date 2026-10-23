@@ -31,9 +31,10 @@
 //!   checks every address and header, and returns once the server accepted
 //!   it for at least one recipient. `sendRaw` sends a message composed
 //!   elsewhere, as it is.
-//! - Retries are opt-in (`with(.{ .retry = true })`): a failure before the
-//!   final "." may be tried again, one after it never is, because the
-//!   server may have kept the message.
+//! - Retries are opt-in (`with(.{ .retry = true })`): a failure the server
+//!   told us about (a 4xx at any step, the answer to the final "." too) or
+//!   one before the final "." may be tried again; a connection lost after
+//!   the final "." never is, because the server may have kept the message.
 //! - Errors: a refused or unreachable server is `ServiceUnavailable`
 //!   (503), a timeout `GatewayTimeout` (504), a mistyped recipient or a
 //!   message too large `BadRequest` (400), a server that refuses our
