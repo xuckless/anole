@@ -80,5 +80,5 @@ if [ "${CAPI:-1}" != 0 ]; then
   # A library built with Redis and neither SQLite nor PostgreSQL still
   # answers anole_db_query (it used to refuse every call as unsupported).
   echo "== $IMAGE, the C ABI in a Redis-only build (-Dprofile=minimal -Dredis=true)"
-  "$ZIG" build capi-test --summary all -Dprofile=minimal -Dredis=true -Dredis-test-url="rediss://anole:$PASSWORD@localhost:$TLS_PORT/1?ssl_ca_certs=$CERTS/root.crt" "$@"
+  "$ZIG" build capi-test --summary all -Dprofile=minimal -Dredis=true -Dredis-test-url="redis://127.0.0.1:$PORT" "$@"
 fi

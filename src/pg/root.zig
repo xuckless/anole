@@ -948,6 +948,15 @@ pub const Client = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.WrongNumberOfParameters => return ctx.fail(self.errors, .{ .system = .postgresql, .class = .other, .message = "the statement's parameters ($1, $2...) and the arguments given differ in number" }),
             else => {
+                // A statement failed inside the transaction: the server would
+                // answer every later one with 25P02 until the rollback, and
+                // the driver refuses to send them, so say what it would.
+                if (err == error.ConnectionBusy and conn._state == .fail) if (tx) |t| if (t.state == .open) return ctx.fail(self.errors, .{
+                    .system = .postgresql,
+                    .class = classify("25P02"),
+                    .code = "25P02",
+                    .message = "current transaction is aborted, commands ignored until end of transaction block",
+                });
                 if (tx) |t| t.state = .broken;
                 if (brokenConnection(err)) return ctx.failf(self.errors, .unavailable, "the connection to {f} broke: {t}", .{ self.settings, err });
                 return ctx.failf(self.errors, .other, "{t}", .{err});

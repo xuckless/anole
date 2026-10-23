@@ -612,7 +612,10 @@ test "pg: .auto misses a role switch inside a function; .always resets it" {
         const setup = try open(io, .{ .max_connections = 1 });
         defer setup.deinit();
         _ = try setup.exec(&c, "DROP ROLE IF EXISTS anole_b", .{});
-        _ = try setup.exec(&c, "CREATE ROLE anole_b", .{});
+        // A superuser, like the test login: switching to a role that is not
+        // one flips `is_superuser`, which the server does report, and .auto
+        // would see that.
+        _ = try setup.exec(&c, "CREATE ROLE anole_b SUPERUSER", .{});
         _ = try setup.exec(&c, "CREATE OR REPLACE FUNCTION anole_pg_switch_role() RETURNS text LANGUAGE sql AS $$ SELECT set_config('role', 'anole_b', false) $$", .{});
     }
     defer {
