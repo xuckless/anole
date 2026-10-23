@@ -1077,7 +1077,7 @@ Limits:
 
 Anole runs on its own, but a load balancer or proxy can sit in front. Say
 what is there with `deployment` (`.deployment = .behind_proxy`, or
-`ANOLE_DEPLOYMENT=behind_proxy`; [config.md](config.md#deployment)) and Anole
+`ANOLE_DEPLOYMENT=behind_proxy`; [config.md](config.md#6-deployment)) and Anole
 trusts the right headers from the right peers. Two mechanisms carry the
 client address.
 

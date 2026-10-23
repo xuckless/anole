@@ -466,7 +466,7 @@ in the options). Give the process manager a little longer before it kills.
 `req.remote_address` is the client's address from `X-Forwarded-For` rather
 than the proxy's, read only from the proxy's address; on Render, Heroku, Fly.io
 or Cloud Run use `ANOLE_DEPLOYMENT=platform`, which also listens on `$PORT`
-([config.md](config.md#deployment), [server.md](server.md#behind-a-proxy)).
+([config.md](config.md#6-deployment), [server.md](server.md#behind-a-proxy)).
 Set `ANOLE_ENV=production` where the binary is a Debug build. Anole serves TLS, HTTP/2 and
 HTTP/3 itself, so a proxy is optional.
 
