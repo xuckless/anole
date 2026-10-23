@@ -2,6 +2,16 @@
 
 ## 0.3 to 0.4
 
+0.4 adds raw TCP and UDP servers ([net.md](net.md)), background jobs and
+cron ([jobs.md](jobs.md), [cron.md](cron.md)), webhooks
+([webhooks.md](webhooks.md)), SSE topics and `watch`
+([realtime.md](realtime.md)), gRPC over HTTP/3 and Unix sockets
+([grpc.md](grpc.md)), the S3 and SMTP clients ([storage.md](storage.md),
+[email.md](email.md)) and the Lambda deployment ([lambda.md](lambda.md)).
+They are new names and new build flags (`-Dnet`, `-Djobs`, `-Dwebhooks`,
+`-Ds3`, `-Dsmtp`, `-Dlambda`); an app that does not use them changes only as
+the table says.
+
 | 0.3 | 0.4 |
 | --- | --- |
 | An exhaustive `switch` on `anole.db.Class` | add the cases `.not_found`, `.precondition` and `.invalid` |
@@ -18,6 +28,11 @@
 | `error.DeploymentUnavailable` for `deployment = .lambda` | gone: `deployment = .lambda` serves AWS Lambda invocations (docs/lambda.md); an exhaustive `switch` on `anole.ServerError` drops `DeploymentUnavailable` and adds `LambdaRuntimeApiMissing`, `LambdaNotBuilt`, `LambdaRuntimeApiFailed` and `SnapStartUnsupported` |
 | A C consumer's `switch` over every event type | add `ANOLE_EV_SSE_SUBSCRIBE`, `ANOLE_EV_SSE_CLOSE`, `ANOLE_EV_WATCH_EVENT`, `ANOLE_EV_WATCH_STATUS` and `ANOLE_EV_WATCH_END` (a consumer without `sse` routes or `watches` never gets them); the new handle kinds are `anole_sse` and `anole_watch_sub` |
 | A `Response` held open by `res.adopt` for anything but a streamed 200 | the same: `adopt` serves a streamed 200 (an event stream); `anole.sse` and `app.sse` park such a response without holding a task |
+| A long-lived HTTP/3 response (a gRPC stream, SSE, WebSocket or WebTransport over HTTP/3) ended at the 30 s idle timeout when nothing moved | QUIC PINGs keep the connection open while a request is open; idle connections still close at the timeout |
+| A handler on HTTP/3 ran to the end after the client's RESET_STREAM | its task is canceled, as on HTTP/2 (the handler's next wait returns `error.Canceled`) |
+| `RequestId` replaced an ID the engine had already set | it keeps it (under Lambda, the invocation's request ID) |
+| The startup banner drew the lizard | it draws the word "anole"; the rules for when it shows, `banner = false` and `ANOLE_NO_BANNER=1` are unchanged |
+| `addApp(b, .{ .profile = .web })` with no way to change one feature | `.features = .{ .postgres = false }` turns single features on or off over the preset |
 
 ## 0.2 to 0.3
 

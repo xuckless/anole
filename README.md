@@ -32,18 +32,21 @@
 
 1. **REST:** HTTP/1.1, HTTP/2 and HTTP/3, one router for all three ([routing](https://xuckless.github.io/anole/routing/), [server](https://xuckless.github.io/anole/server/)).
 2. **WebSockets:** over HTTP/1.1, HTTP/2 and HTTP/3, with rooms and topics ([docs](https://xuckless.github.io/anole/websocket/)).
-3. **gRPC:** server and client over HTTP/2, plus gRPC-Web, Connect and JSON transcoding; HTTP/3 is coming in 0.4 ([docs](https://xuckless.github.io/anole/grpc/)).
+3. **gRPC:** server and client over HTTP/2, HTTP/3 and Unix sockets, plus gRPC-Web, Connect and JSON transcoding ([docs](https://xuckless.github.io/anole/grpc/)).
 4. **WebTransport:** over HTTP/3 (draft-02), streams and datagrams ([docs](https://xuckless.github.io/anole/webtransport/)).
-5. **Auth:** JWT and JWKS, OIDC sign-in, sessions, CSRF, API keys, RBAC and rate limits ([docs](https://xuckless.github.io/anole/auth/)).
-6. **Databases:** PostgreSQL, SQLite, MongoDB and Redis/Valkey, with request deadlines and transactions; MySQL/MariaDB is planned ([docs](https://xuckless.github.io/anole/database/)).
-7. **Caching built in:** request coalescing, a TTL result cache and an HTTP response cache ([docs](https://xuckless.github.io/anole/database/)).
-8. **TLS everywhere:** BoringSSL with mutual TLS, hot certificate reload and 0-RTT on HTTP/3 ([server](https://xuckless.github.io/anole/server/)).
-9. **Observability:** structured access logs, Prometheus metrics, OpenTelemetry tracing and health checks ([docs](https://xuckless.github.io/anole/observability/)).
-10. **Outbound clients:** HTTP/1.1, HTTP/2 and HTTP/3 clients on the same TLS stack ([docs](https://xuckless.github.io/anole/clients/)).
-11. **Operations:** graceful drain, zero-downtime restarts, systemd socket activation and the PROXY protocol ([server](https://xuckless.github.io/anole/server/)).
-12. **Node and Python:** a C ABI that lets Node and Python apps run on Anole's engine; the bindings, anole-node and anole-py, are on the way ([docs](https://xuckless.github.io/anole/c-abi/)).
-
-Coming next: typed config and `.env` files, validation, OpenAPI and `anole new` (0.3); SSE topics, background jobs and cron, webhooks, S3 and SMTP connectors, raw TCP/UDP servers and AWS Lambda (0.4).
+5. **Server-sent events:** topics published once to every subscriber, replay after a reconnect, and `watch` to stream database changes into SSE and WebSocket topics ([docs](https://xuckless.github.io/anole/realtime/)).
+6. **Raw TCP and UDP:** custom protocols on the same runtime, with TLS and the PROXY protocol ([docs](https://xuckless.github.io/anole/net/)).
+7. **Background work:** durable jobs with retries and delays, cron, and webhooks out (signed, retried) and in (Stripe, GitHub, Slack) ([jobs](https://xuckless.github.io/anole/jobs/), [cron](https://xuckless.github.io/anole/cron/), [webhooks](https://xuckless.github.io/anole/webhooks/)).
+8. **Auth:** JWT and JWKS, OIDC sign-in, sessions, CSRF, API keys, RBAC and rate limits ([docs](https://xuckless.github.io/anole/auth/)).
+9. **Databases:** PostgreSQL, SQLite, MongoDB and Redis/Valkey, with request deadlines and transactions; MySQL/MariaDB is planned ([docs](https://xuckless.github.io/anole/database/)).
+10. **Messaging and connectors:** NATS and Kafka, S3-compatible object storage and SMTP email ([messaging](https://xuckless.github.io/anole/messaging/), [storage](https://xuckless.github.io/anole/storage/), [email](https://xuckless.github.io/anole/email/)).
+11. **Caching built in:** request coalescing, a TTL result cache and an HTTP response cache ([docs](https://xuckless.github.io/anole/database/)).
+12. **TLS everywhere:** BoringSSL with mutual TLS, hot certificate reload and 0-RTT on HTTP/3 ([server](https://xuckless.github.io/anole/server/)).
+13. **Developer tools:** typed config and `.env` files, validation, OpenAPI, in-memory tests, `anole new` and a live console ([config](https://xuckless.github.io/anole/config/), [validation](https://xuckless.github.io/anole/validation/), [console](https://xuckless.github.io/anole/console/)).
+14. **Observability:** structured logs, Prometheus metrics, OpenTelemetry tracing and health checks ([docs](https://xuckless.github.io/anole/observability/)).
+15. **Outbound clients:** HTTP/1.1, HTTP/2 and HTTP/3 clients on the same TLS stack, with retries and circuit breakers ([docs](https://xuckless.github.io/anole/clients/)).
+16. **Operations:** graceful drain, zero-downtime restarts, systemd socket activation, the PROXY protocol, and the same app on AWS Lambda ([server](https://xuckless.github.io/anole/server/), [Lambda](https://xuckless.github.io/anole/lambda/)).
+17. **Node and Python:** a C ABI that lets Node and Python apps run on Anole's engine; the bindings, anole-node and anole-py, are on the way ([docs](https://xuckless.github.io/anole/c-abi/)).
 
 Anole doesn't reinvent the hard parts. It stands on libraries that have
 already survived the internet:
@@ -91,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
 That's the whole server. To try it:
 
 1. In a project made with `zig init`, run
-   `zig fetch --save git+https://github.com/xuckless/anole#v0.3.1`
+   `zig fetch --save git+https://github.com/xuckless/anole#v0.4.0`
    (or a later tag, or a commit).
 2. Make `build.zig` one call:
    `@import("anole").addApp(b, .{ .name = "api", .root_source_file = b.path("src/main.zig") })`.
@@ -105,6 +108,11 @@ app.grpc(pb.Greeter, .{ .SayHello = sayHello });          // gRPC, gRPC-Web, Con
 app.webtransport("/wt", session);                         // WebTransport
 try app.staticDir("/", "public", .{});                    // static files, ranges, ETags
 const db = try app.postgres(.{});                         // PostgreSQL from DATABASE_URL (also sqlite, mongodb, redis)
+const live = try app.sseTopics(.{});                      // server-sent events: publish once, replay on reconnect
+app.sse("/live", live, .{ .topics = &.{"news"} });
+const jobs = try app.jobs(.{ .store = .{ .postgres = db } }); // durable background jobs, cron and webhooks on top
+const files = try app.s3(.{});                            // S3, R2, MinIO (and app.smtp for email)
+try app.tcp(":7000", Echo, .{});                          // raw TCP (and app.udp) beside HTTP
 app.metrics(.{}); app.health(.{}); app.tracing(.{});      // Prometheus, health checks, OpenTelemetry
 try app.listenTls(":443", .fromFiles("cert.pem", "key.pem")); // HTTPS + HTTP/2 + HTTP/3
 ```
@@ -126,11 +134,20 @@ Where to go next:
 Anole is built to be fast and small: per-core event loops on io_uring or
 epoll, requests that arrive whole run without a task of their own, batched
 writes on every protocol, and idle connections that hold almost no memory.
-Rather than quote our own numbers, we're entering Anole in
-[HttpArena](https://github.com/MDA2AV/HttpArena), an independent benchmark
-that runs every framework on the same hardware with the same rules; its
-results will be linked here once they're published. Our own harness and raw
-results live in `bench/` on the
+Rather than quote my own numbers, I entered Anole in
+[HttpArena](https://www.http-arena.com/), an independent benchmark that runs
+every framework on the same hardware with the same rules. Its current ranks
+(the listed entry is an early release, v0.1.2):
+
+<p align="center">
+  <a href="https://www.http-arena.com/#scope=h1"><img alt="HttpArena HTTP/1.1" src="https://img.shields.io/endpoint?url=https://http-arena.com/badge/anole/h1.json&logo=zig"></a>
+  <a href="https://www.http-arena.com/#scope=h2"><img alt="HttpArena HTTP/2" src="https://img.shields.io/endpoint?url=https://http-arena.com/badge/anole/h2.json&logo=zig"></a>
+  <a href="https://www.http-arena.com/#scope=h3"><img alt="HttpArena HTTP/3" src="https://img.shields.io/endpoint?url=https://http-arena.com/badge/anole/h3.json&logo=zig"></a>
+  <a href="https://www.http-arena.com/#scope=grpc"><img alt="HttpArena gRPC" src="https://img.shields.io/endpoint?url=https://http-arena.com/badge/anole/grpc.json&logo=zig"></a>
+  <a href="https://www.http-arena.com/#scope=ws"><img alt="HttpArena WebSocket" src="https://img.shields.io/endpoint?url=https://http-arena.com/badge/anole/ws.json&logo=zig"></a>
+</p>
+
+My own harness and raw results live in `bench/` on the
 [`bench/suite`](https://github.com/xuckless/anole/tree/bench/suite/bench)
 branch.
 
@@ -166,7 +183,9 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
   drain, on the same router, plus a client. It's checked against aioquic and
   in the interop runner.
 - **gRPC:**
-  - server and client, all four call modes;
+  - server and client, all four call modes, over HTTP/2 and HTTP/3 (checked
+    against grpc-dotnet both ways), and over Unix sockets between processes
+    on one host;
   - gRPC-Web, Buf's Connect protocol, JSON transcoding from
     `google.api.http`, and `grpc.health.v1`.
 
@@ -190,8 +209,9 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
     socket, QUIC included;
   - systemd socket activation and `Type=notify`;
   - the PROXY protocol and `X-Forwarded-*`.
-- **Clients:** HTTP/1.1, HTTP/2 and HTTP/3 clients, plus Redis/Valkey, all
-  on the same TLS stack.
+- **Clients:** HTTP/1.1, HTTP/2 and HTTP/3 clients (HTTP/2 by default where
+  the server offers it, one shared connection per origin and core), plus
+  Redis/Valkey, all on the same TLS stack.
 - **Databases:** built-in connectors, so a handler can query without a
   third-party driver and without blocking its core:
   - PostgreSQL, on a fork of pg.zig moved to `std.Io`, over the same
@@ -208,6 +228,15 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
   - opt-in request coalescing and short-lived result caches, off unless
     asked for;
   - behind `-Dpostgres`, `-Dsqlite`, `-Dmongodb` and `-Dredis`.
+- **Messaging:** NATS (publish, request/reply, handlers, JetStream) and
+  Kafka (producer and consumer groups), Anole's own clients
+  ([messaging](docs/messaging.md)).
+- **Config and tooling:** typed settings from the environment and `.env`
+  files, deployment modes (standalone, behind a proxy, a platform such as
+  Cloud Run, AWS Lambda), OpenAPI 3.1 documents with a `/docs` page, the
+  `anole` command line with project templates, and a live console that
+  attaches to a running app ([config](docs/config.md),
+  [console](docs/console.md)).
 - **Object storage:** an S3 client for AWS S3, R2, MinIO, B2 and Supabase
   Storage, with presigned URLs and multipart uploads ([storage](docs/storage.md)).
 - **Email:** SMTP with STARTTLS or TLS, HTML, attachments and a pool per
@@ -225,10 +254,11 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
 - **AWS Lambda:** the same app served from the Lambda Runtime API with
   `deployment = .lambda` ([lambda](docs/lambda.md)).
 
-**Status: pre-1.0; the latest release is 0.3.1** ([CHANGELOG.md](CHANGELOG.md)).
+**Status: pre-1.0; the latest release is 0.4.0** ([CHANGELOG.md](CHANGELOG.md)).
 The API may still change before 1.0. Known issues and limitations are tracked in
-[Issues](https://github.com/xuckless/anole/issues). Next: a C ABI, then
-bindings for Python (ASGI) and Node (TypeScript).
+[Issues](https://github.com/xuckless/anole/issues). Next: the Node and
+Python bindings, anole-node (TypeScript) and anole-py (ASGI and WSGI), on the
+C ABI that ships today.
 
 ## Requirements
 
@@ -283,12 +313,29 @@ memory, so `-k` it. Pass other ports with `zig build run-full -- 9000 9443`.
 | `-Dsqlite=bool` | false | true | true | SQLite (amalgamation, zig-sqlite fork) |
 | `-Dmongodb=bool` | false | false | true | MongoDB client and BSON |
 | `-Dopenapi=bool` | false | true | true | OpenAPI 3.1 documents and the docs page (pure Zig) |
+| `-Dnats=bool` | false | false | true | NATS client (pure Zig) |
+| `-Dkafka=bool` | false | false | true | Kafka client, lz4; needs `-Dcompression` |
+| `-Dconsole=bool` | false | true | true | the live console (control socket and terminal UI) |
+| `-Dnet=bool` | false | true | true | raw TCP and UDP servers (pure Zig) |
+| `-Djobs=bool` | false | true | true | durable jobs and cron (pure Zig) |
+| `-Dwebhooks=bool` | false | true | true | webhooks out and the verify middleware; needs `-Djobs` |
+| `-Ds3=bool` | false | true | true | S3-compatible object storage client (pure Zig) |
+| `-Dsmtp=bool` | false | true | true | SMTP client for sending mail (pure Zig) |
+| `-Dlambda=bool` | true | true | true | the AWS Lambda adapter (pure Zig) |
 
 Constraints:
 - gRPC needs HTTP/2, so `-Dhttp2=false` turns gRPC off. Asking for both
   `-Dhttp2=false` and `-Dgrpc=true` is an error.
 - HTTP/3 needs TLS, so `-Dtls=none` turns HTTP/3 off. Asking for both
   `-Dtls=none` and `-Dhttp3=true` is an error.
+- Brotli and Kafka need `-Dcompression`, and webhooks need `-Djobs`, in the
+  same way: switching the first off switches them off, and asking for both
+  is an error.
+
+`-Ddefault-deployment` sets the deployment a build falls back on when neither
+the options nor `ANOLE_DEPLOYMENT` name one (`zig build lambda` builds with
+`lambda`). With `addApp`, `.features = .{ .kafka = false }` turns single
+features on or off over the preset.
 
 In code, the chosen flags are `anole.features`. A minimal build of
 Hello, World is about 1.3 MB; everything on is about 6 MB.
@@ -296,7 +343,7 @@ Hello, World is about 1.3 MB; everything on is about 6 MB.
 ## Using Anole as a dependency
 
 ```sh
-zig fetch --save git+https://github.com/xuckless/anole#v0.3.1
+zig fetch --save git+https://github.com/xuckless/anole#v0.4.0
 ```
 
 Any later tag (see the [releases](https://github.com/xuckless/anole/releases))
@@ -336,15 +383,24 @@ set up this way, and CI builds it from an empty cache on every push.
   generated from the source's doc comments. The same guides are in
   [`docs/`](docs/) and on the [wiki](https://github.com/xuckless/anole/wiki).
 - Guides: [getting started](docs/getting-started.md),
-  [routing](docs/routing.md), [the server](docs/server.md),
+  [routing](docs/routing.md), [validation](docs/validation.md), [the
+  server](docs/server.md), [config](docs/config.md),
   [WebSocket](docs/websocket.md), [WebTransport](docs/webtransport.md),
   [gRPC](docs/grpc.md), [clients](docs/clients.md),
-  [databases](docs/database.md), [auth](docs/auth.md),
-  [observability](docs/observability.md), [from Fiber](docs/from-fiber.md).
+  [databases](docs/database.md), [messaging](docs/messaging.md),
+  [storage](docs/storage.md), [email](docs/email.md), [server-sent
+  events](docs/realtime.md), [jobs](docs/jobs.md), [cron](docs/cron.md),
+  [webhooks](docs/webhooks.md), [TCP and UDP](docs/net.md),
+  [resilience](docs/resilience.md), [auth](docs/auth.md),
+  [observability](docs/observability.md), [logging](docs/logging.md), [the
+  console](docs/console.md), [testing](docs/testing.md),
+  [OpenAPI](docs/openapi.md), [templates](docs/templates.md), [AWS
+  Lambda](docs/lambda.md), [from Fiber](docs/from-fiber.md),
+  [migrating](docs/migrating.md) and [the C ABI](docs/c-abi.md).
 - Examples, each runnable with `zig build run-<name>`: `hello`, `rest`,
-  `websocket`, `grpc`, `auth`, `clients`, `observe`, `io`, `postgres`,
-  `sqlite`, `mongodb`, `redis`, and `full` (every listener and option
-  spelled out).
+  `websocket`, `net`, `grpc`, `auth`, `clients`, `observe`, `io`,
+  `postgres`, `sqlite`, `mongodb`, `redis`, `lambda`, and `full` (every
+  listener and option spelled out).
 - [CHANGELOG.md](CHANGELOG.md) and [MAINTAINING.md](MAINTAINING.md): pins,
   forks, the Zig version policy, releases.
 

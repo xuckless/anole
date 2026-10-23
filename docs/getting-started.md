@@ -31,10 +31,10 @@ nghttp2 and the rest) itself.
 mkdir api && cd api
 zig init
 rm src/root.zig
-zig fetch --save git+https://github.com/xuckless/anole#v0.3.1
+zig fetch --save git+https://github.com/xuckless/anole#v0.4.0
 ```
 
-(`#v0.3.1` is the latest release; a later tag or a commit works the same way.)
+(`#v0.4.0` is the latest release; a later tag or a commit works the same way.)
 
 Replace the `build.zig` that `zig init` wrote with this one:
 
@@ -485,7 +485,7 @@ Wants=network-online.target
 ExecStart=/usr/local/bin/api
 DynamicUser=yes
 Restart=on-failure
-# Longer than the drain (30 s by default).
+# Longer than the drain (10 s by default).
 TimeoutStopSec=40
 # For ports below 1024:
 # AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -528,6 +528,12 @@ package) cannot make outbound HTTPS calls.
 same process on the same listeners: `app.tcp(":7000", Handler, .{})` and
 `app.udp(":7001", Handler, .{})`. See [net.md](net.md).
 
+**AWS Lambda.** The same `main` runs as a Lambda function: add
+`.lambda = .{}` to `addApp` in `build.zig`, run `zig build lambda`, and
+upload `zig-out/lambda/api-arm64.zip` with the `provided.al2023` runtime.
+`listen` then serves invocations from the Lambda Runtime API instead of
+opening a port. See [lambda.md](lambda.md).
+
 ## Next
 
 - [routing.md](routing.md): routes, middleware, requests, responses,
@@ -540,4 +546,13 @@ same process on the same listeners: `app.tcp(":7000", Handler, .{})` and
   MongoDB, Redis), [auth.md](auth.md) (JWT, sessions, CSRF, API keys,
   rate limits), [observability.md](observability.md) (metrics, tracing,
   health checks).
-- [from-fiber.md](from-fiber.md): Fiber's API next to Anole's.
+- [realtime.md](realtime.md) (server-sent events and database changes),
+  [jobs.md](jobs.md), [cron.md](cron.md) and [webhooks.md](webhooks.md)
+  (work outside a request), [messaging.md](messaging.md) (NATS, Kafka),
+  [storage.md](storage.md) (S3) and [email.md](email.md) (SMTP).
+- [config.md](config.md), [validation.md](validation.md),
+  [testing.md](testing.md), [openapi.md](openapi.md) and
+  [console.md](console.md): settings, input checks, tests, API documents
+  and the live console.
+- [from-fiber.md](from-fiber.md): Fiber's API next to Anole's;
+  [migrating.md](migrating.md): what changes between releases.
