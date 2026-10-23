@@ -2548,3 +2548,139 @@ test "client breaker: 404 answers never open it" {
         }
     }.run);
 }
+
+/// A one-connection server that records the raw bytes of a chunked request
+/// (through its last chunk and trailers) and answers 202.
+const UploadServer = struct {
+    listener: std.Io.net.Server,
+    seen: [4096]u8 = undefined,
+    seen_len: usize = 0,
+
+    fn serve(self: *UploadServer, io: std.Io) void {
+        const stream = self.listener.accept(io) catch return;
+        defer stream.close(io);
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [256]u8 = undefined;
+        var reader = stream.reader(io, &rbuf);
+        var writer = stream.writer(io, &wbuf);
+        var in_head = true;
+        var in_trailers = false;
+        var chunk_left: ?usize = null;
+        while (true) {
+            if (chunk_left) |n| if (n > 0) {
+                const data = reader.interface.take(n + 2) catch return;
+                self.record(data);
+                chunk_left = null;
+                continue;
+            };
+            const line = reader.interface.takeDelimiterInclusive('\n') catch return;
+            self.record(line);
+            if (in_head) {
+                if (std.mem.eql(u8, line, "\r\n")) in_head = false;
+                continue;
+            }
+            if (in_trailers) {
+                if (std.mem.eql(u8, line, "\r\n")) break;
+                continue;
+            }
+            const size = std.fmt.parseInt(usize, std.mem.trimEnd(u8, line, "\r\n"), 16) catch return;
+            if (size == 0) in_trailers = true else chunk_left = size;
+        }
+        writer.interface.writeAll("HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n") catch return;
+        writer.interface.flush() catch return;
+        // Keeps the connection until the client closes it.
+        _ = reader.interface.takeByte() catch {};
+    }
+
+    fn record(self: *UploadServer, bytes: []const u8) void {
+        @memcpy(self.seen[self.seen_len..][0..bytes.len], bytes);
+        self.seen_len += bytes.len;
+    }
+};
+
+test "client: upload chunked with trailers" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var fake: UploadServer = .{ .listener = try addr.listen(io, .{ .reuse_address = true }) };
+    defer fake.listener.deinit(io);
+    var fake_future = try io.concurrent(UploadServer.serve, .{ &fake, io });
+    defer fake_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/stream", .{fake.listener.socket.address.getPort()});
+    var client = dusty.Client.init(std.testing.allocator, io, .{ .user_agent = "t" });
+    defer client.deinit();
+
+    var headers = try dusty.Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    try headers.put("Content-Type", "text/plain");
+    var up = try client.upload(url, .{ .headers = &headers, .trailer_names = &.{ "X-A", "X-B" } });
+    try up.writer.writeAll("hello");
+    try up.writer.flush();
+    try up.writer.writeAll(" world");
+    var trailers = try dusty.Headers.init(std.testing.allocator, 2);
+    defer trailers.deinit(std.testing.allocator);
+    try trailers.put("X-A", "1");
+    var response = try up.finish(&trailers);
+    defer response.deinit();
+    try std.testing.expectEqual(.accepted, response.status());
+
+    const raw = fake.seen[0..fake.seen_len];
+    try std.testing.expect(std.mem.startsWith(u8, raw, "POST /stream HTTP/1.1\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, raw, "Transfer-Encoding: chunked\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "Trailer: X-A, X-B\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "Content-Type: text/plain\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "Content-Length") == null);
+    try std.testing.expect(std.mem.endsWith(u8, raw, "\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\nX-A: 1\r\n\r\n"));
+}
+
+test "client: upload abort closes the connection, and closeIdle empties idle pools" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var fake: UploadServer = .{ .listener = try addr.listen(io, .{ .reuse_address = true }) };
+    defer fake.listener.deinit(io);
+    var fake_future = try io.concurrent(UploadServer.serve, .{ &fake, io });
+    defer fake_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{fake.listener.socket.address.getPort()});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    var up = try client.upload(url, .{});
+    try up.writer.writeAll("partial");
+    up.abort();
+    try std.testing.expectEqual(@as(usize, 0), client.pool().idle_len);
+}
+
+test "client: closeIdle closes idle pooled connections" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "OK";
+        }
+    }.handle);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{server.address.ip.getPort()});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    var held = try client.fetch(url, .{});
+    held.deinit();
+    try std.testing.expectEqual(@as(usize, 1), client.pool().idle_len);
+    client.closeIdle();
+    try std.testing.expectEqual(@as(usize, 0), client.pool().idle_len);
+    // The next fetch dials again.
+    var again = try client.fetch(url, .{});
+    again.deinit();
+    try std.testing.expectEqual(@as(u64, 2), client.dials.load(.monotonic));
+}
