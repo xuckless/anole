@@ -67,7 +67,7 @@ pub const Postgres = struct {
         const self = try gpa.create(Postgres);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .io = io, .client = client, .prefix = try gpa.dupe(u8, prefix), .notify = config.notify, .advisory = config.advisory_lock };
-        return .{ .ptr = self, .vt = &vtable, .transactional = true };
+        return .{ .ptr = self, .vt = &vtable, .transactional = true, .tx_kind = .postgres, .owner = client };
     }
 
     const vtable: store.VTable = .{
@@ -92,6 +92,8 @@ pub const Postgres = struct {
         .cronTick = cronTick,
         .leaderTake = leaderTake,
         .leaderRelease = leaderRelease,
+        .insertIn = insertIn,
+        .finishIn = finishInErased,
     };
 
     fn me(ptr: *anyopaque) *Postgres {
@@ -407,6 +409,16 @@ pub const Postgres = struct {
 
     pub fn finishIn(self: *Postgres, tx: anytype, ctx: *db.Ctx, f: store.Finish) !bool {
         return self.finishOn(tx, ctx, f);
+    }
+
+    fn insertIn(ptr: *anyopaque, txp: *anyopaque, ctx: *db.Ctx, now: Time, job: store.NewJob) anyerror!root.Enqueued {
+        const tx: *pg.Tx = @ptrCast(@alignCast(txp));
+        return me(ptr).insertOn(tx, ctx, now, job);
+    }
+
+    fn finishInErased(ptr: *anyopaque, txp: *anyopaque, ctx: *db.Ctx, f: store.Finish) anyerror!bool {
+        const tx: *pg.Tx = @ptrCast(@alignCast(txp));
+        return me(ptr).finishOn(tx, ctx, f);
     }
 
     fn finish(ptr: *anyopaque, f: store.Finish) anyerror!bool {
