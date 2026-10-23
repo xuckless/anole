@@ -48,6 +48,19 @@ Server options, TLS and errors (API hardening; see
 - Engine fields of `Request` and `Response` are marked internal with a
   leading `_` (`res.conn`, `req.parser`, `res.headers_written`, ...). Use
   `res.headersSent()`.
+- A route marked `anole.noWait` (or `RouteOptions.no_wait`, or a gRPC service
+  registered `no_wait`) behind middleware that may wait is now refused at
+  startup with a message naming both. Until now it registered and, under
+  load, a waiting middleware (a Redis rate limiter, a session store, a JWKS
+  fetch) stalled the whole HTTP/2 connection or every HTTP/3 connection on
+  the core. Your own struct middleware needs `pub const no_wait = true;` to
+  sit in front of `noWait` routes, and a function middleware
+  `app.use(anole.noWait(f))`.
+- `websocket.Socket`'s internals are `_`-prefixed (`ws.conn`, `ws.closed`,
+  ...): use `ws.httpVersion()` and `ws.isClosed()`. WebTransport's
+  non-waiting driver calls moved to `Session.Driver` and `Stream.Driver`.
+  `Rooms.init(allocator, options)` is the one constructor (`initOptions` is
+  gone).
 - The graceful drain now waits 10 s by default (was 30 s in Zig; the C ABI
   already used 10 s), the same as Docker's stop grace. Set
   `timeouts.shutdown` for longer.
@@ -74,6 +87,16 @@ Server options, TLS and errors (API hardening; see
 - `app.listen("3000")` (a bare port) listens on every interface, like
   `":3000"`. A listen address Anole cannot read is now logged with examples.
 - `app.rateLimit(.{ .limit = 100 })`, a one-line in-memory rate limiter.
+- `anole.websocket.UpgradeOptions.subprotocols` and `.headers`: an endpoint
+  that speaks graphql-ws, STOMP or MQTT now echoes the subprotocol the browser
+  asked for (browsers fail the connection without it), and the handshake can
+  carry a cookie or other headers. `Socket.subprotocol` says which was
+  selected. `anole.websocket.isUpgrade(req)` tells a handler it has a
+  handshake before it decides.
+- `req.paramDecoded(name)`: a route parameter percent-decoded
+  (`/users/J%C3%BCrgen` -> `Jürgen`). `req.params` stays raw, as before, and
+  now says so.
+- `ws.httpVersion()` and `ws.isClosed()`.
 - `req.readerLimited`, `req.setDeadline`, `res.headersSent()`.
 - `EventStream.comment` (heartbeats), `end` and `draining`.
 - `timeouts.write` (30 s) bounds each write once a stream or file body has
@@ -84,6 +107,12 @@ Server options, TLS and errors (API hardening; see
 
 ### Fixed
 
+- C ABI: two `anole_ws_publish` calls to the same topic could reach a
+  subscriber in the opposite order (they fanned out on different executors).
+  Publishes to one topic now arrive in the order they were made.
+- C ABI: a fixed-response route behind a JWKS `jwt` middleware ran inline on
+  the HTTP/2 reader, where the JWKS fetch could stall the connection; it now
+  keeps a task.
 - Event streams, streamed responses and file downloads are no longer cut at
   the request timeout (30 s in Zig, `request_ms` + 5 s through the C ABI over
   HTTP/1.1 and tasked HTTP/2 and HTTP/3 streams). Once the head is out, the
@@ -93,6 +122,19 @@ Server options, TLS and errors (API hardening; see
   250 to 100.
 - `app.tracing()` reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME`
   from the environment; it used to need `.process`.
+
+### Added (C ABI 0.7, HTTP and WebSocket)
+
+- WebSocket handshakes can be decided by the application: `"accept":
+  "consumer"` on a websocket route sends each handshake as
+  `ANOLE_EV_WS_UPGRADE`, answered with `anole_ws_accept` (a subprotocol,
+  extra headers) or refused like any request (401, 403, a body). A route may
+  take `handler` and such a `websocket` together, so one app sees every
+  request on a path. Auto routes take `"subprotocols"`, and
+  `ANOLE_EV_WS_OPEN` says which was selected in the request record's new
+  `subprotocol` span. This is what ASGI's `websocket.accept` and
+  `websocket.close`, Bun's `server.upgrade()` and graphql-ws clients need.
+- Publishes to one topic arrive in the order they were made.
 
 ### Breaking (C ABI 0.7)
 

@@ -109,6 +109,45 @@ pass it with `.fromPem`.
 | `middleware[].cors.max_age` | `max_age_ms` |
 | (none) | `timeouts.read_header_ms`, `write_ms`, `idle_park_ms`; `limits.max_head_size`, `max_header_count`, `max_param_count`, `max_query_count`, `max_form_count`, `max_multiform_count`, `max_requests_per_connection`; `proxy`, `request`, `response`, `http2`, `errors`; `http3.address`, `port`, `validate_address`, `prefer_v2`, `sockets`, `enable_connect_protocol`, `inline_no_wait`; `tls.client_ca_dir`, `client_ca_system` |
 
+## HTTP, WebSocket and WebTransport
+
+### Middleware and `noWait`
+
+A route marked `noWait` now takes only middleware that says it never waits.
+Each startup panic names the route and the middleware:
+
+- remove `noWait` from the route; or
+- add `pub const no_wait = true;` to a struct middleware of yours that truly
+  never waits (or `pub fn noWait(self: *const T) bool` when it depends on its
+  settings); a function middleware is registered `app.use(anole.noWait(f))`.
+
+The built-in middleware is marked (see docs/routing.md). Interfaces gained a
+flag your own implementations may set: `ratelimit.Limiter.never_waits`,
+`auth.apikey.Lookup.never_waits`, `session.Store.never_waits` (the memory
+implementations set it; a Redis or database one leaves it off, and a
+`noWait` route behind that middleware is refused).
+
+### WebSocket and WebTransport
+
+| 0.1 | 0.2 |
+| --- | --- |
+| `ws.conn == .h2`, `ws.conn.h1` | `ws.httpVersion() != .http1` (`.http1`, `.http2`, `.http3`) |
+| `ws.closed.load(.acquire)` | `ws.isClosed()` |
+| `Rooms.init(a)`, `Rooms.initOptions(a, o)` | `Rooms.init(a, .{})`, `Rooms.init(a, o)` |
+| `res.upgradeWebSocket(req)` | `anole.websocket.upgrade(req, res, .{})` (all three HTTP versions) |
+| `session.start(...)`, `tryAccept`, `tryOpen`, `takeDatagram`, `freeDatagram`, `trySendDatagram`, `generation`, `waitChange`, `wake` | `Session.Driver.<same>(session, ...)` (Anole's own drivers; not for handlers) |
+| `stream.tryRead`, `tryWrite`, `sendError`, `Stream.Poll` | `Stream.Driver.<same>`, `Stream.Driver.Poll` |
+| `req.params.get("name")` for an encoded segment | still raw; `try req.paramDecoded("name")` decodes |
+
+New and additive: `UpgradeOptions.subprotocols` and `.headers`,
+`websocket.isUpgrade(req)`, `ws.subprotocol`, `ws.httpVersion()`,
+`ws.isClosed()`.
+
+C ABI 0.7: `ANOLE_EV_WS_UPGRADE` and `anole_ws_accept` are opt-in
+(`"accept": "consumer"` on a websocket route); an existing config sees
+nothing new except the `subprotocol` span in request records (empty outside
+`ANOLE_EV_WS_OPEN`). Publishes to one topic are now ordered.
+
 ## The C ABI (0.6 to 0.7)
 
 The C ABI moves to version 0.7. Before 1.0 every minor may break, so a library

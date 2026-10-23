@@ -336,11 +336,17 @@ log, metrics and tracing ([observability.md](observability.md)).
 
 ## The request
 
+Fields starting with `_` (`req._parser`, `res._conn`, ...) and
+`X.internal` / `X.Driver` declarations are Anole's: the engines use them, and
+they change without notice. Ask `res.headersSent()` rather than reading
+`res._headers_written`; `ws.httpVersion()` and `ws.isClosed()` rather than a
+socket's internals.
+
 | Field or method | What it holds |
 | --- | --- |
 | `method`, `url` | The method, and the target with its query string. |
 | `version_major` | 1, 2 or 3. |
-| `params`, `query` | Path parameters and query values. |
+| `params`, `query` | Path parameters (raw, percent-encoded; `paramDecoded(name)` decodes) and query values (decoded). |
 | `headers.get(name)` | A header, case-insensitive. `:authority` fills `Host`. |
 | `host()` | `X-Forwarded-Host` from a trusted proxy, else `Host`. |
 | `remote_address`, `secure` | The client and whether its connection is TLS, after the PROXY protocol and trusted proxies. |
