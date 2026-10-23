@@ -16,6 +16,12 @@ pub const ServerError = error{
     InvalidEnvFile,
     DeploymentUnavailable,
     ProxyProtocolNoPeers,
+    // ---- p3/net ----
+    // ---- end p3/net ----
+
+    // ---- p3/lambda ----
+    // ---- end p3/lambda ----
+
     // The OpenAPI document (`app.openapi`, `zig build openapi`)
     OpenApiNameClash,
     OpenApiOutOfDate,
@@ -258,6 +264,12 @@ pub fn explain(err: ServerError, ctx: Context, w: *std.Io.Writer) std.Io.Writer.
             try w.writeAll("can't turn on the PROXY protocol: no peer is allowed to send the header.");
             try fix(w, "Name the load balancers in proxy.trusted or the listener's proxy_protocol_from.");
         },
+        // ---- p3/net ----
+        // ---- end p3/net ----
+
+        // ---- p3/lambda ----
+        // ---- end p3/lambda ----
+
         error.NoProtocols => {
             try w.writeAll("can't start a listener that speaks neither HTTP/1.1 nor HTTP/2.");
             try fix(w, "Turn http1 or http2 on for the listener.");

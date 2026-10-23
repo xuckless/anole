@@ -330,6 +330,27 @@ pub const Options = struct {
     /// CAs it trusts (`tls`), redirects and size limits.
     client: http.ClientOptions = .{},
 
+    // ---- p3/net ----
+    // ---- end p3/net ----
+
+    // ---- p3/jobs ----
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    // ---- end p3/lambda ----
+
     /// `Options.timeouts`. A duration is null for none.
     pub const Timeouts = struct {
         /// The whole request: reading it, the handler, the response (and
@@ -2689,6 +2710,27 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (self.extras.connectors_started) try k.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return k;
         }
+
+        // ---- p3/net ----
+        // ---- end p3/net ----
+
+        // ---- p3/jobs ----
+        // ---- end p3/jobs ----
+
+        // ---- p3/webhooks ----
+        // ---- end p3/webhooks ----
+
+        // ---- p3/realtime ----
+        // ---- end p3/realtime ----
+
+        // ---- p3/s3 ----
+        // ---- end p3/s3 ----
+
+        // ---- p3/smtp ----
+        // ---- end p3/smtp ----
+
+        // ---- p3/lambda ----
+        // ---- end p3/lambda ----
 
         /// Loads every TLS listener's certificate and key again (from their
         /// files, for `.files`) and their client CAs (`client_auth`, from

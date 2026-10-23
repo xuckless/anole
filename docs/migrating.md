@@ -1,5 +1,12 @@
 # Migrating
 
+## 0.3 to 0.4
+
+| 0.3 | 0.4 |
+| --- | --- |
+| An exhaustive `switch` on `anole.db.Class` | add the cases `.not_found`, `.precondition` and `.invalid` |
+| An exhaustive `switch` on `anole.db.System` or `anole.resilience.Kind` | add the cases `.s3` and `.smtp` |
+
 ## 0.2 to 0.3
 
 0.3 adds settings, `.env` files, deployment modes, retries and circuit

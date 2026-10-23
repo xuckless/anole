@@ -3,6 +3,27 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.0 (unreleased)
+
+### Breaking
+
+- `anole.db.Class` has three new cases, `not_found`, `precondition` and
+  `invalid` (and `anole.db.ErrorMap` the matching fields, answering 404,
+  409 and 400): an exhaustive `switch` on `Class` needs them. The object
+  storage and mail connectors use them; no database does.
+
+### Added
+
+### Changed
+
+- `anole.db.System` has `s3` and `smtp`, and `anole.resilience.Kind` too.
+- C ABI: a handle's kind takes five bits (28-32), so Kafka groups and
+  batches are kinds of their own (17 and 18): a NATS handle given to a
+  Kafka call is now `ANOLE_E_INVALID` (`WrongHandleKind`). Handles stay
+  opaque.
+
+### Fixed
+
 ## 0.3.0 (unreleased)
 
 Developer experience: settings, `.env` files and deployment modes, retries
