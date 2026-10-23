@@ -1352,6 +1352,45 @@ export fn anole_db_tx_release(tx: u64) i32 {
 // ---- end p3/jobs ----
 
 // ---- p3/webhooks ----
+const webhooks_mod = engine.webhooks;
+
+fn webhooksFailure(err: webhooks_mod.CallError) i32 {
+    return switch (err) {
+        error.Invalid => named(abi.E_INVALID, "Invalid", 0, "invalid argument (a type, a size field, data_json that is not JSON, or a consumer of another server)", .{}),
+        error.State => named(abi.E_STATE, "State", 0, "the server is draining or stopped, the transaction is not open, or no executor feeds this consumer", .{}),
+        error.OutOfMemory => failCode(abi.E_NOMEM),
+        error.Unsupported => named(abi.E_UNSUPPORTED, "Unsupported", 0, "the configuration has no \"webhooks\" (it needs \"jobs\"), or -Dwebhooks is off", .{}),
+        error.Gone => blk: {
+            if (live()) |e| _ = e.gone_count.fetchAdd(1, .monotonic);
+            break :blk named(abi.E_GONE, "Gone", 0, "the transaction it named is over", .{});
+        },
+    };
+}
+
+/// The `anole_jobs *` of `anole_jobs_get` is the address of the engine's
+/// jobs state.
+fn jobsEngineOf(j: ?*anyopaque) ?*Engine {
+    const p = j orelse return null;
+    const e = engine.global orelse return null;
+    return if (p == @as(*anyopaque, @ptrCast(&e.jobs_state))) e else null;
+}
+
+export fn anole_webhooks_publish(j: ?*anyopaque, c_: ?*anyopaque, m: ?*const abi.WebhookOut, user_data: u64) i32 {
+    clearError();
+    const e = jobsEngineOf(j) orelse return badPointer(j);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    const out: abi.WebhookOut = readSized(abi.WebhookOut, m orelse return failCode(abi.E_INVALID)) catch |err| return sizedFailure(err);
+    webhooks_mod.publish(e, c, out, user_data) catch |err| return webhooksFailure(err);
+    return abi.OK;
+}
+
+export fn anole_webhooks_watch(j: ?*anyopaque, c_: ?*anyopaque, user_data: u64) i32 {
+    clearError();
+    const e = jobsEngineOf(j) orelse return badPointer(j);
+    const c = consumerOf(c_) orelse return badPointer(c_);
+    webhooks_mod.watch(e, c, user_data) catch |err| return webhooksFailure(err);
+    return abi.OK;
+}
 // ---- end p3/webhooks ----
 
 // ---- p3/realtime ----

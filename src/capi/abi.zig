@@ -139,6 +139,8 @@ pub const EventType = enum(u32) {
     // ---- end p3/jobs ----
 
     // ---- p3/webhooks ----
+    webhook_published = 109,
+    webhook_status = 110,
     // ---- end p3/webhooks ----
 
     // ---- p3/realtime ----
@@ -724,6 +726,59 @@ pub const KafkaAssignEvent = extern struct {
 // ---- end p3/jobs ----
 
 // ---- p3/webhooks ----
+
+/// `anole_webhooks_publish`: one event, copied.
+pub const WebhookOut = extern struct {
+    size: usize,
+    /// Empty: "".
+    owner: Str = .{},
+    /// Required.
+    type: Str = .{},
+    /// A JSON value.
+    data_json: Str = .{},
+    /// Idempotency; empty: a new msg_ id.
+    id: Str = .{},
+    /// Only this endpoint; empty: every matching one of the owner.
+    endpoint: Str = .{},
+    /// 0: now.
+    timestamp_ms: i64 = 0,
+    /// An `anole_db_tx` to publish in, or 0.
+    tx: u64 = 0,
+    /// The request this serves, or 0.
+    req: u64 = 0,
+};
+
+/// ANOLE_EV_WEBHOOK_PUBLISHED: the answer to anole_webhooks_publish.
+pub const WebhookPublishedEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    duplicate: u8,
+    deliveries: u32,
+    reserved: u32 = 0,
+    message_id: Span,
+    @"error": Span,
+};
+
+/// ANOLE_WEBHOOK_*: WebhookStatusEvent.what.
+pub const WEBHOOK_DELIVERY_DEAD: u32 = 1;
+pub const WEBHOOK_ENDPOINT_DISABLED: u32 = 2;
+
+/// ANOLE_EV_WEBHOOK_STATUS: a delivery ran out of attempts, or an endpoint
+/// was disabled.
+pub const WebhookStatusEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    what: u32,
+    last_status: u16,
+    reserved: u16 = 0,
+    owner: Span,
+    endpoint: Span,
+    message: Span,
+    @"error": Span,
+};
 // ---- end p3/webhooks ----
 
 // ---- p3/realtime ----
@@ -928,6 +983,9 @@ pub const records = .{
     // ---- end p3/jobs ----
 
     // ---- p3/webhooks ----
+    .{ "anole_webhook_out", WebhookOut },
+    .{ "anole_webhook_published_event", WebhookPublishedEvent },
+    .{ "anole_webhook_status_event", WebhookStatusEvent },
     // ---- end p3/webhooks ----
 
     // ---- p3/realtime ----
@@ -1069,6 +1127,8 @@ pub const events = [_]EventInfo{
     // ---- end p3/jobs ----
 
     // ---- p3/webhooks ----
+    .{ .type = 109, .name = "ANOLE_EV_WEBHOOK_PUBLISHED", .record = "anole_webhook_published_event" },
+    .{ .type = 110, .name = "ANOLE_EV_WEBHOOK_STATUS", .record = "anole_webhook_status_event" },
     // ---- end p3/webhooks ----
 
     // ---- p3/realtime ----
@@ -1165,6 +1225,7 @@ pub const constant_groups = [_]ConstantGroup{
     // ---- end p3/jobs ----
 
     // ---- p3/webhooks ----
+    .{ .prefix = "ANOLE_WEBHOOK_", .group = "webhook_status" },
     // ---- end p3/webhooks ----
 
     // ---- p3/realtime ----

@@ -61,6 +61,9 @@ pub const Config = struct {
     // ---- end p3/jobs ----
 
     // ---- p3/webhooks ----
+    /// Webhooks out (-Dwebhooks; needs "jobs"): endpoints, signed deliveries
+    /// run as jobs, retries and the delivery log. See `anole_webhooks_*`.
+    webhooks: ?Webhooks = null,
     // ---- end p3/webhooks ----
 
     // ---- p3/realtime ----
@@ -615,6 +618,7 @@ pub const Config = struct {
         rate_limit: RateLimit,
 
         // ---- p3/webhooks ----
+        webhook_verify: WebhookVerify,
         // ---- end p3/webhooks ----
     };
 
@@ -852,6 +856,72 @@ pub const Config = struct {
     // ---- end p3/jobs (types) ----
 
     // ---- p3/webhooks (types) ----
+    pub const Webhooks = struct {
+        /// The jobs queue deliveries run on.
+        queue: []const u8 = "webhooks",
+        /// Deliveries at once in this process.
+        concurrency: u32 = 32,
+        timeout_ms: u32 = 15_000,
+        attempts: u16 = 10,
+        backoff: WebhookBackoff = .{},
+        /// Per endpoint origin; null: none.
+        breaker: ?Breaker = .{},
+        /// null: allowed in development, refused in production.
+        allow_private_addresses: ?bool = null,
+        /// null: not required in development, required in production.
+        require_https: ?bool = null,
+        user_agent: []const u8 = "Anole-Webhooks",
+        max_payload: u32 = 262_144,
+        response_kept: u32 = 4096,
+        keep_messages_ms: u32 = 2_592_000_000,
+        keep_attempts_ms: u32 = 2_592_000_000,
+        disable_after_ms: u32 = 432_000_000,
+        /// The environment variable holding the 32-byte base64 key that
+        /// encrypts stored secrets; "" for none.
+        secrets_key_env: []const u8 = "ANOLE_WEBHOOKS_KEY",
+        max_endpoints_per_owner: u16 = 100,
+    };
+
+    pub const WebhookBackoff = struct {
+        base_ms: u32 = 5_000,
+        max_ms: u32 = 86_400_000,
+        multiplier: f32 = 5.0,
+        jitter: Jitter = .equal,
+        pub const Jitter = enum { full, equal, none };
+    };
+
+    /// The `webhook_verify` middleware: checks an incoming webhook's signature
+    /// and drops duplicate deliveries.
+    pub const WebhookVerify = struct {
+        preset: Preset,
+        /// Exactly one of `secrets` and `secrets_env`.
+        secrets: ?[]const []const u8 = null,
+        /// An environment variable holding one secret, or several separated by spaces.
+        secrets_env: ?[]const u8 = null,
+        tolerance_ms: u32 = 300_000,
+        /// "memory", "none" or "redis:<databases[].name>".
+        dedup: []const u8 = "memory",
+        dedup_ttl_ms: u32 = 86_400_000,
+        on_store_error: OnStoreError = .reject,
+        /// With preset "hmac".
+        hmac: ?WebhookHmac = null,
+
+        pub const Preset = enum { standard, stripe, github, slack, hmac };
+        pub const OnStoreError = enum { reject, process };
+    };
+
+    pub const WebhookHmac = struct {
+        header: []const u8,
+        algorithm: Algorithm = .sha256,
+        encoding: Encoding = .hex,
+        /// Stripped from the header value first ("sha256=").
+        prefix: []const u8 = "",
+        /// A header with the delivery's id, for duplicates.
+        id_header: ?[]const u8 = null,
+
+        pub const Algorithm = enum { sha1, sha256, sha512 };
+        pub const Encoding = enum { hex, base64 };
+    };
     // ---- end p3/webhooks (types) ----
 
     // ---- p3/realtime (types) ----
@@ -1182,6 +1252,8 @@ fn checkMiddleware(list: []const Config.Middleware, where: []const u8, why: *std
             if (r.limit == 0 or r.window_ms <= 0) return fail(why, "{s}[{d}].rate_limit: limit and window_ms must be positive", .{ where, i });
         },
         .compress => if (comptime !features.compression) return fail(why, "{s}[{d}].compress: compression is not built in (-Dcompression)", .{ where, i }),
+        // p3/webhooks
+        .webhook_verify => |w| try @import("webhooks.zig").checkVerify(w, where, i, why),
         else => {},
     };
 }
@@ -1287,6 +1359,8 @@ pub fn middleware(app: *anole.App, arena: std.mem.Allocator, m: Config.Middlewar
                 .policy = .{ .limit = c.limit, .window = .fromMilliseconds(c.window_ms), .burst = c.burst },
             });
         },
+        // p3/webhooks
+        .webhook_verify => |c| return @import("webhooks.zig").verifyMiddleware(app, arena, c),
     }
 }
 

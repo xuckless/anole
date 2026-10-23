@@ -21,13 +21,15 @@ const declarations = @import("../openapi/declarations.zig");
 
 const log = std.log.scoped(.anole_webhooks);
 
+const Encoding = enum { hex, base64 };
+
 pub const Verify = struct {
     pub const Preset = enum { standard, stripe, github, slack, hmac };
 
     pub const Hmac = struct {
         header: []const u8,
         algorithm: enum { sha1, sha256, sha512 } = .sha256,
-        encoding: enum { hex, base64 } = .hex,
+        encoding: Encoding = .hex,
         /// Stripped from the header value first ("sha256=").
         prefix: []const u8 = "",
         /// A header with the delivery's id, for duplicates; null: none.
@@ -303,14 +305,14 @@ pub const Verify = struct {
 
 fn explain(buf: []u8, e: sign.VerifyError, ts: []const u8, now_s: i64) []const u8 {
     return switch (e) {
-        .MissingHeader => "missing header",
-        .BadTimestamp => "bad timestamp",
-        .Stale => blk: {
+        error.MissingHeader => "missing header",
+        error.BadTimestamp => "bad timestamp",
+        error.Stale => blk: {
             const t = std.fmt.parseInt(i64, ts, 10) catch 0;
             break :blk std.fmt.bufPrint(buf, "timestamp {d} s off", .{@abs(@as(i128, now_s) - t)}) catch "stale timestamp";
         },
-        .NoMatch => "no matching signature",
-        .InvalidSecret => "invalid secret",
+        error.NoMatch => "no matching signature",
+        error.InvalidSecret => "invalid secret",
     };
 }
 
@@ -321,7 +323,6 @@ pub fn inbound(req: *const dusty.Request) ?Inbound {
     return req.local(Inbound, "anole.webhook");
 }
 
-const Encoding = enum { hex, base64 };
 
 /// Whether `encoded` (hex or base64, exactly the digest's size) is `H`'s
 /// MAC of the concatenated `parts` under `key`; compared in constant time.

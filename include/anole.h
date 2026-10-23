@@ -501,6 +501,10 @@ enum anole_event_type {
   /* ---- end p3/jobs ---- */
 
   /* ---- p3/webhooks ---- */
+  ANOLE_EV_WEBHOOK_PUBLISHED = 109, /* anole_webhook_published_event: the answer to
+                                    anole_webhooks_publish; handle 0, or the anole_db_tx it ran in */
+  ANOLE_EV_WEBHOOK_STATUS = 110, /* anole_webhook_status_event: a delivery ran out of attempts, or an
+                                    endpoint was disabled; only after anole_webhooks_watch */
   /* ---- end p3/webhooks ---- */
 
   /* ---- p3/realtime ---- */
@@ -1793,6 +1797,57 @@ typedef struct anole_kafka_assign_event {
 /* ---- end p3/jobs ---- */
 
 /* ---- p3/webhooks ---- */
+/* ---- webhooks out ----
+   The configuration's "webhooks" (it needs "jobs"): endpoints, signed deliveries run as jobs,
+   retries and the delivery log. Endpoint management and replay go through anole_jobs_admin. */
+typedef struct anole_jobs anole_jobs;
+
+typedef struct anole_webhook_out {
+  size_t size;
+  anole_str owner;           /* {NULL,0}: "" */
+  anole_str type;            /* required */
+  anole_str data_json;       /* a JSON value */
+  anole_str id;              /* idempotency; {NULL,0}: a new msg_ id */
+  anole_str endpoint;        /* only this endpoint; {NULL,0}: every matching one of owner */
+  int64_t timestamp_ms;      /* 0: now */
+  uint64_t tx;               /* an anole_db_tx to enqueue the deliveries in, or 0 */
+  uint64_t req;              /* the request this serves, or 0 */
+} anole_webhook_out;         /* 112 bytes */
+
+/* Publishes one event (copied): ANOLE_EV_WEBHOOK_PUBLISHED answers. Returns at once:
+   ANOLE_OK; ANOLE_E_INVALID; ANOLE_E_UNSUPPORTED (no "webhooks"); ANOLE_E_GONE; ANOLE_E_STATE. */
+ANOLE_API anole_status anole_webhooks_publish(anole_jobs *j, anole_consumer *c, const anole_webhook_out *m, uint64_t user_data);
+/* From now on, ANOLE_EV_WEBHOOK_STATUS goes to `c` (delivery dead, endpoint disabled) with
+   user_data. Calling it again replaces the consumer. */
+ANOLE_API anole_status anole_webhooks_watch(anole_jobs *j, anole_consumer *c, uint64_t user_data);
+
+/* ANOLE_EV_WEBHOOK_PUBLISHED. */
+typedef struct anole_webhook_published_event {
+  anole_event ev;        /* handle 0, or the anole_db_tx */
+  uint64_t user_data;
+  int32_t status;        /* ANOLE_OK; ANOLE_E_INVALID (error says what); ANOLE_E_DB; ANOLE_E_TIMEOUT */
+  uint16_t http_status;  /* 200, 400, 404, 503... */
+  uint8_t error_class;   /* ANOLE_DB_ERR_* */
+  uint8_t duplicate;     /* 1: the id was published before; nothing new was enqueued */
+  uint32_t deliveries;   /* deliveries enqueued */
+  uint32_t reserved;
+  anole_span message_id;
+  anole_span error;
+} anole_webhook_published_event; /* 56 bytes */
+
+enum { ANOLE_WEBHOOK_DELIVERY_DEAD = 1, ANOLE_WEBHOOK_ENDPOINT_DISABLED = 2 };
+/* ANOLE_EV_WEBHOOK_STATUS. */
+typedef struct anole_webhook_status_event {
+  anole_event ev;        /* handle 0 */
+  uint64_t user_data;
+  uint32_t what;         /* ANOLE_WEBHOOK_* */
+  uint16_t last_status;  /* the endpoint's last HTTP status, 0 for a transport error */
+  uint16_t reserved;
+  anole_span owner;
+  anole_span endpoint;
+  anole_span message;
+  anole_span error;
+} anole_webhook_status_event; /* 64 bytes */
 /* ---- end p3/webhooks ---- */
 
 /* ---- p3/realtime ---- */
