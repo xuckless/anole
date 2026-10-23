@@ -23,7 +23,8 @@ pub fn parse(value: []const u8, origin_host: []const u8) Result {
         if (p.eof()) return .none;
         const proto = p.token() orelse return .none;
         if (!p.eat('=')) return .none;
-        const authority = p.quoted() orelse return .none;
+        var auth_buf: [256]u8 = undefined;
+        const authority = p.quoted(&auth_buf) orelse return .none;
         var ma: u32 = 86400;
         while (true) {
             p.skipWs();
@@ -31,7 +32,8 @@ pub fn parse(value: []const u8, origin_host: []const u8) Result {
             p.skipWs();
             const name = p.token() orelse return .none;
             if (!p.eat('=')) return .none;
-            const val = (if (p.peek() == '"') p.quoted() else p.token()) orelse return .none;
+            var val_buf: [256]u8 = undefined;
+            const val = (if (p.peek() == '"') p.quoted(&val_buf) else p.token()) orelse return .none;
             if (std.ascii.eqlIgnoreCase(name, "ma")) ma = std.fmt.parseInt(u32, val, 10) catch 86400;
         }
         if (std.mem.eql(u8, proto, "h3")) if (authorityPort(authority, origin_host)) |port|
@@ -57,8 +59,6 @@ fn authorityPort(authority: []const u8, origin_host: []const u8) ?u16 {
 const Parser = struct {
     s: []const u8,
     i: usize = 0,
-    /// The last quoted string, unescaped, lives here (authorities are short).
-    buf: [256]u8 = undefined,
 
     fn eof(p: *const Parser) bool {
         return p.i >= p.s.len;
@@ -84,24 +84,26 @@ const Parser = struct {
         };
         return if (p.i == start) null else p.s[start..p.i];
     }
-    fn quoted(p: *Parser) ?[]const u8 {
+    /// The quoted string at the cursor, unescaped into `buf` (each caller
+    /// passes its own, so a later parameter can't overwrite the authority).
+    fn quoted(p: *Parser, buf: []u8) ?[]const u8 {
         if (!p.eat('"')) return null;
         var n: usize = 0;
         while (p.i < p.s.len) {
             const ch = p.s[p.i];
             p.i += 1;
             switch (ch) {
-                '"' => return p.buf[0..n],
+                '"' => return buf[0..n],
                 '\\' => {
                     if (p.i >= p.s.len) return null;
-                    if (n >= p.buf.len) return null;
-                    p.buf[n] = p.s[p.i];
+                    if (n >= buf.len) return null;
+                    buf[n] = p.s[p.i];
                     n += 1;
                     p.i += 1;
                 },
                 else => {
-                    if (n >= p.buf.len) return null;
-                    p.buf[n] = ch;
+                    if (n >= buf.len) return null;
+                    buf[n] = ch;
                     n += 1;
                 },
             }
