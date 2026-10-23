@@ -201,38 +201,31 @@ pub const Request = struct {
     /// Clears the request for reuse on the same connection. Called by
     /// the server between requests; not for handlers.
     pub fn _reset(self: *Request) void {
-        const arena = self.arena;
-        const io = self.io;
-        const parser = self._parser;
-        const transport = self._transport;
-        const cfg = self._config;
-        const res = self._response;
-        const timeout_context = self._timeout_context;
-        const set_timeout = self._set_timeout;
-        // Belongs to the connection, not the request, so it outlives the
-        // reset the way the reader and the parser do.
-        const addr = self.remote_address;
-        const listener = self.listener;
-        const secure = self.secure;
-        const drain = self.drain;
-        const drain_hooks = self._drain_hooks;
-        const peer_certificate = self.peer_certificate;
-        self.* = .{
-            .arena = arena,
-            .io = io,
-            ._parser = parser,
-            ._transport = transport,
-            ._config = cfg,
-            ._response = res,
-            .remote_address = addr,
-            .listener = listener,
-            .secure = secure,
-            .drain = drain,
-            ._drain_hooks = drain_hooks,
-            .peer_certificate = peer_certificate,
-            ._timeout_context = timeout_context,
-            ._set_timeout = set_timeout,
+        // Field by field, rather than `self.* = .{...}`: a whole-struct
+        // store writes the session's 512-byte entry table (a memset per
+        // request), which `len = 0` makes unread anyway. The fields kept
+        // belong to the connection (the reader, the parser, the peer).
+        const info = @typeInfo(Request).@"struct";
+        inline for (info.field_names, info.field_types, info.field_attrs) |name, T, attrs| {
+            if (comptime keptOnReset(name)) continue;
+            if (comptime std.mem.eql(u8, name, "session")) {
+                self.session._empty();
+            } else {
+                @field(self, name) = comptime attrs.defaultValue(T) orelse
+                    @compileError("Request._reset: field " ++ name ++ " has no default; keep it or give it one");
+            }
+        }
+    }
+
+    fn keptOnReset(comptime name: []const u8) bool {
+        const kept = [_][]const u8{
+            "arena",          "io",       "_parser", "_transport", "_config",          "_response",
+            "remote_address", "listener", "secure",  "drain",      "_drain_hooks",     "peer_certificate",
+            "_timeout_context", "_set_timeout",
         };
+        @setEvalBranchQuota(10_000);
+        for (kept) |k| if (std.mem.eql(u8, k, name)) return true;
+        return false;
     }
 
     /// Fills `content_type`, `content_encoding` and `content_length` from
@@ -1058,6 +1051,32 @@ test "Request.peerCertificate: belongs to the connection, so it outlives reset" 
     req._reset();
     try std.testing.expectEqualStrings(der, req.peerCertificate().?);
     try std.testing.expectEqualStrings("", req.url);
+}
+
+test "Request._reset: per-request state back to its defaults, the session emptied, the connection's kept" {
+    var req: Request = .{
+        .arena = std.testing.allocator,
+        .io = std.testing.io,
+        ._parser = undefined,
+        ._transport = undefined,
+        .secure = true,
+    };
+    req.url = "/a";
+    req.id = "rid";
+    req.content_length = 5;
+    req._body_read = true;
+    req._violations_truncated = true;
+    try req.session.set("user", "ann");
+    req._reset();
+    try std.testing.expectEqualStrings("", req.url);
+    try std.testing.expectEqualStrings("", req.id);
+    try std.testing.expectEqual(@as(?usize, null), req.content_length);
+    try std.testing.expect(!req._body_read);
+    try std.testing.expect(!req._violations_truncated);
+    try std.testing.expectEqual(@as(usize, 0), req.session.items().len);
+    try std.testing.expect(!req.session.modified);
+    try std.testing.expect(req.session.get("user") == null);
+    try std.testing.expect(req.secure);
 }
 
 test "Request: no std.Io.Reader sentinel escapes the body-reading API" {

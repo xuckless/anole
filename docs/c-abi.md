@@ -651,7 +651,7 @@ Behind a proxy, `deployment` (`"behind_proxy"`, `"anole_lb"`, `"platform"`)
 and `proxy.trusted` (addresses, CIDR networks, `"loopback"`, `"private"`,
 `"link_local"`) say which peers' `X-Forwarded-For` to read: the client's
 address in `remote_addr` is the rightmost address in it that is not trusted
-([config.md](config.md#deployment)). `proxy.trusted_hops` is the fixed-count
+([config.md](config.md#6-deployment)). `proxy.trusted_hops` is the fixed-count
 alternative (how many proxies in front), with
 `proxy.trust_forwarded_proto` (default true: `X-Forwarded-Proto` decides
 `ANOLE_REQ_SECURE`) and `proxy.trust_forwarded_host` (default false). A

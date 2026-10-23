@@ -2652,7 +2652,10 @@ pub fn Server(comptime Ctx: type) type {
                 .peer_certificate = connection.peerCertificate(),
                 ._timeout_context = timer,
                 ._set_timeout = setRequestTimeout,
+                // Its entry table is never read past `len`: not zeroed.
+                .session = undefined,
             };
+            request.session._empty();
 
             var parser: RequestParser = undefined;
             try parser.init(&request);

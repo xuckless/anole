@@ -10,7 +10,7 @@ const c = @import("anole_h");
 const gen = @import("capi_abi_json");
 const schema_text = @import("anole_schema").text;
 const guide_text = @import("anole_guide").text;
-const header_text = @import("anole_header_text").text;
+const header_text_raw = @import("anole_header_text").text;
 const build_version = @import("anole_version").text;
 
 fn expectSameLayout(comptime Zig: type, comptime C: type) !void {
@@ -98,10 +98,22 @@ test "anole.h: every ANOLE_ constant in the header is in abi.zig, and the revers
     }
 }
 
+/// `text` with CRLF line ends as LF, in `a`: a Windows checkout may have
+/// turned the header's line ends into CRLF.
+fn lfOnly(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = try .initCapacity(a, text.len);
+    for (text, 0..) |ch, i| {
+        if (ch == '\r' and i + 1 < text.len and text[i + 1] == '\n') continue;
+        out.appendAssumeCapacity(ch);
+    }
+    return out.items;
+}
+
 /// The `NAME = value` entries of the C enum whose body starts right after
 /// `opening` in the header, comments skipped. The names live in `a` (an
 /// arena).
 fn headerEnum(a: std.mem.Allocator, opening: []const u8) !std.StringArrayHashMapUnmanaged(i64) {
+    const header_text = try lfOnly(a, header_text_raw);
     const at = std.mem.indexOf(u8, header_text, opening) orelse return error.EnumNotInHeader;
     const body_start = at + opening.len;
     const body_end = std.mem.indexOfPos(u8, header_text, body_start, "};") orelse return error.EnumNotClosed;
@@ -186,12 +198,12 @@ test "anole.h: a handle typedef for every handle kind, and no other" {
     for (abi.handle_kinds) |k| {
         const decl = try std.fmt.allocPrint(std.testing.allocator, "typedef uint64_t {s};", .{k.c_type});
         defer std.testing.allocator.free(decl);
-        if (std.mem.indexOf(u8, header_text, decl) == null) {
+        if (std.mem.indexOf(u8, header_text_raw, decl) == null) {
             std.debug.print("handle kind {s}: anole.h has no `{s}`\n", .{ k.name, decl });
             return error.MissingHandleType;
         }
     }
-    var rest: []const u8 = header_text;
+    var rest: []const u8 = header_text_raw;
     while (std.mem.indexOf(u8, rest, "typedef uint64_t ")) |at| {
         rest = rest[at + "typedef uint64_t ".len ..];
         const end = std.mem.indexOfScalar(u8, rest, ';') orelse break;
@@ -284,7 +296,7 @@ test "docs/c-abi.md names every event type and every anole_* function" {
     // The function names come from the header's text: touching a function
     // declaration of the translated header, even through @TypeOf, makes the
     // self-hosted backends link against the C symbol.
-    var rest: []const u8 = header_text;
+    var rest: []const u8 = header_text_raw;
     var count: usize = 0;
     while (std.mem.indexOf(u8, rest, "ANOLE_API ")) |at| {
         rest = rest[at + "ANOLE_API ".len ..];

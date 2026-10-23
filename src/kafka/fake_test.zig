@@ -368,3 +368,66 @@ test "fake broker: a metadata ping answers, and a dead address does not" {
     defer dead.deinit();
     try testing.expect(!dead.ping());
 }
+
+test "fake broker: a broker serving Produce 0-7 and ListOffsets 0-4 (Redpanda) is spoken to at those versions" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+
+    // A current broker gets the newest version.
+    {
+        const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+        defer broker.deinit();
+        const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+        defer client.deinit();
+        _ = try client.produce(&c, .{ .topic = "t", .value = "v" });
+        try testing.expectEqual(@as(i16, 8), broker.produce_version.load(.acquire));
+    }
+
+    // Redpanda's ranges: Produce v7 out and back, then a group reading from
+    // the start, which asks ListOffsets for the earliest offset.
+    {
+        const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1, .serves = &.{
+            .{ .key = 0, .min = 0, .max = 7 },
+            .{ .key = 2, .min = 0, .max = 4 },
+        } });
+        defer broker.deinit();
+        const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+        const a = try client.produce(&c, .{ .topic = "t", .key = "a", .value = "1" });
+        const b = try client.produce(&c, .{ .topic = "t", .key = "a", .value = "22" });
+        try testing.expectEqual(a.offset + 1, b.offset);
+        try testing.expectEqual(@as(i16, 7), broker.produce_version.load(.acquire));
+        try broker.preload("orders", 0, &.{
+            .{ .key = "a", .value = "1", .timestamp_ms = 1 },
+            .{ .key = "a", .value = "22", .timestamp_ms = 2 },
+        });
+        Reads.seen.store(0, .release);
+        Reads.sum.store(0, .release);
+        try client.consume({}, .{
+            .group = "g-old",
+            .topics = &.{"orders"},
+            .start = .earliest,
+            .heartbeat_interval = .fromMilliseconds(100),
+            .commit_interval = .fromMilliseconds(100),
+        }, Reads.on);
+        try client.start(null, null, null);
+        try waitCount(io, &Reads.seen, 2);
+        try testing.expectEqual(@as(u32, 1 + 2), Reads.sum.load(.acquire));
+        client.deinit();
+    }
+
+    // Produce 0-6 is below what the client speaks: the broker is refused.
+    {
+        const broker = try FakeBroker.start(gpa, io, .{ .serves = &.{.{ .key = 0, .min = 0, .max = 6 }} });
+        defer broker.deinit();
+        const client = try kafka.Client.init(gpa, io, opts(broker, .{}));
+        defer client.deinit();
+        const level = testing.log_level;
+        testing.log_level = .err;
+        defer testing.log_level = level;
+        try testing.expect(!client.ping());
+    }
+}

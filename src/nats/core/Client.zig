@@ -968,9 +968,12 @@ pub fn connect(client: *Client) ConnectError!void {
     }
     defer client.mutex.unlock(io);
     return switch (client.status) {
-        // The first connection was made; it may be lost again already.
+        // The first connection was made; it may be lost again already,
+        // and with reconnect off the client may have closed before this
+        // call looked: `wait` says why.
         .connected, .reconnecting, .draining => {},
-        .disconnected, .connecting, .closed => client.connect_error orelse error.ConnectionClosed,
+        .closed => if (client.ever_connected) {} else client.connect_error orelse error.ConnectionClosed,
+        .disconnected, .connecting => client.connect_error orelse error.ConnectionClosed,
     };
 }
 

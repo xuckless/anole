@@ -203,6 +203,18 @@ fn emit(
     fields: anytype,
 ) void {
     if (!enabled(level)) return;
+    // The formatting and its stack buffers stay out of line, so a caller
+    // that may log grows by a call, not by 1.5 KiB of frame.
+    @call(.never_inline, emitSlow, .{ level, scope, ctx, message, fields });
+}
+
+fn emitSlow(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    ctx: Context,
+    comptime message: []const u8,
+    fields: anytype,
+) void {
     comptime value.check(@TypeOf(fields));
     var small: [1024]u8 = undefined;
     var small_msg: [512]u8 = undefined;
@@ -297,6 +309,15 @@ pub fn fromStd(
     args: anytype,
 ) void {
     if (!enabled(level)) return;
+    @call(.never_inline, fromStdSlow, .{ level, scope, format, args });
+}
+
+fn fromStdSlow(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
     const f = currentFormat();
     const sink = sink_state.load(.acquire);
     if (f != .json and sink == null) {
