@@ -14,9 +14,11 @@ const testing_mod = @import("../testing/root.zig");
 const root = @import("root.zig");
 const document = @import("document.zig");
 const operation = @import("operation.zig");
-const tpb = @import("anole_transcode_pb");
-const proto = @import("proto.zig");
-const Widgets = tpb.Widgets(@import("../grpc/server.zig").Call, anyerror);
+const features = @import("build_options");
+const grpc_on = features.grpc;
+const tpb = if (grpc_on) @import("anole_transcode_pb") else struct {};
+const proto = if (grpc_on) @import("proto.zig") else struct {};
+const Widgets = if (grpc_on) tpb.Widgets(@import("../grpc/server.zig").Call, anyerror) else void;
 const v = @import("validate");
 
 const alloc = std.testing.allocator;
@@ -186,6 +188,7 @@ fn lookupKey(_: ?*anyopaque, _: std.mem.Allocator, _: auth.apikey.Digest) anyerr
 // ------------------------------------------------------------------ gRPC
 
 test "golden: Widgets gRPC service" {
+    if (comptime !grpc_on) return error.SkipZigTest;
     const ops = comptime proto.serviceOperations(Widgets);
     var entries: [ops.len]root.Entry = undefined;
     inline for (0..ops.len) |i| {
@@ -204,6 +207,7 @@ test "golden: Widgets gRPC service" {
 }
 
 test "gRPC forms by Options.grpc" {
+    if (comptime !grpc_on) return error.SkipZigTest;
     const ops = comptime proto.serviceOperations(Widgets);
     var entries: [ops.len]root.Entry = undefined;
     inline for (0..ops.len) |i| {
