@@ -126,6 +126,10 @@ pub const Udp = struct {
         /// Don't fragment, and probe the path MTU (Linux:
         /// IP_PMTUDISC_PROBE; elsewhere DONTFRAG).
         pmtu_probe: bool = true,
+        /// Linux: the kernel's count of datagrams it dropped for want of
+        /// receive buffer arrives with each datagram (SO_RXQ_OVFL), as
+        /// `Datagram.dropped`.
+        rxq_ovfl: bool = false,
     };
 
     /// HTTP/3 takes `.{}`: everything on.
@@ -150,6 +154,7 @@ pub const Udp = struct {
             if (wildcard) _ = setOption(fd, posix.IPPROTO.IP, posix.IP.PKTINFO, 1);
         }
         if (native_os == .linux) {
+            if (options.rxq_ovfl) _ = setOption(fd, posix.SOL.SOCKET, posix.SO.RXQ_OVFL, 1);
             // DF set, and the kernel's path MTU cache ignored: ngtcp2 probes.
             if (options.pmtu_probe) {
                 if (ip6)
@@ -193,6 +198,9 @@ pub const Udp = struct {
         /// last may be shorter).
         data: []u8,
         segment: usize,
+        /// With `Options.rxq_ovfl` (Linux): the kernel's running count of
+        /// datagrams dropped on this socket, as of this one.
+        dropped: u32 = 0,
 
         /// The datagrams one at a time.
         pub fn next(d: *Datagram) ?[]u8 {
@@ -251,6 +259,27 @@ pub const Udp = struct {
         return err orelse error.Unexpected;
     }
 
+    /// Receives into `msgs` (up to its length datagrams, in one `recvmmsg`
+    /// on Linux) with `controls[i]` as each one's control buffer; `buf` is
+    /// divided evenly among the messages, so a datagram larger than its
+    /// share comes back with the `trunc` flag. At least one datagram, or an
+    /// error. For raw UDP listeners, whose batch is not HTTP/3's.
+    pub fn receiveInto(self: *const Udp, io: std.Io, msgs: []std.Io.net.IncomingMessage, controls: []align(cmsg_align) Control, buf: []u8, timeout: std.Io.Timeout) ReceiveError!usize {
+        std.debug.assert(msgs.len == controls.len);
+        for (msgs, controls) |*m, *ctl| {
+            m.* = .init;
+            if (comptime has_control) m.control = ctl;
+        }
+        const err, const count = self.socket.receiveManyTimeout(io, msgs, buf, .{}, timeout);
+        if (count > 0) return count;
+        return err orelse error.Unexpected;
+    }
+
+    /// A received message as a `Datagram`.
+    pub fn datagramFrom(self: *const Udp, msg: *const std.Io.net.IncomingMessage) Datagram {
+        return self.datagramOf(msg);
+    }
+
     fn datagramOf(self: *const Udp, msg: *const std.Io.net.IncomingMessage) Datagram {
         var d: Datagram = .{ .from = msg.from, .local = null, .ecn = 0, .data = msg.data, .segment = msg.data.len };
         if (comptime !has_control) return d;
@@ -273,6 +302,8 @@ pub const Udp = struct {
                     const pi = std.mem.bytesToValue(std.c.in6_pktinfo, m.data[0..@sizeOf(std.c.in6_pktinfo)]);
                     d.local = .{ .ip6 = .{ .bytes = pi.addr, .port = self.socket.address.getPort() } };
                 }
+            } else if (native_os == .linux and level == posix.SOL.SOCKET and kind == posix.SO.RXQ_OVFL and m.data.len >= @sizeOf(u32)) {
+                d.dropped = std.mem.readInt(u32, m.data[0..@sizeOf(u32)], native_endian);
             } else if (native_os == .linux and level == posix.IPPROTO.UDP and kind == linux.UDP.GRO and m.data.len >= @sizeOf(c_int)) {
                 const size = std.mem.readInt(c_int, m.data[0..@sizeOf(c_int)], native_endian);
                 if (size > 0) d.segment = @intCast(size);

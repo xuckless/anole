@@ -14,6 +14,12 @@ pub const Server = @import("server.zig").Server;
 pub const Adopter = @import("server.zig").Adopter;
 /// One run of an `Adopter`: what it waits for input with, and how it ends.
 pub const Burst = @import("server.zig").Burst;
+/// A protocol that takes connections straight from a listener
+/// (`Listener.raw`), and what it is told (anole.net's raw TCP).
+pub const Raw = @import("server.zig").Raw;
+pub const RawInfo = @import("server.zig").RawInfo;
+/// One connection's reader, writer and TLS state.
+pub const Connection = @import("server.zig").Connection;
 pub const Address = @import("config.zig").Address;
 pub const Listener = @import("config.zig").Listener;
 pub const ServerConfig = @import("config.zig").ServerConfig;
