@@ -60,7 +60,16 @@ fn getUser(req: *anole.Request, res: *anole.Response) !void {
 `req.params.get` and `req.query.get`. `params` and `query` have `get`,
 `getInt`, `getFloat`, `count` and `iterator`; `getInt` and `getFloat` return null for a missing or malformed
 value. Path parameters are the raw bytes of the path, with percent-escapes
-left as they are. Query values are decoded (`%XX` and `+`).
+left as they are: matching runs on the raw path, so an encoded `/` (`%2F`)
+never splits a segment. `req.paramDecoded("name")` gives the decoded text
+(into the request's arena; `+` stays `+`), and `error.BadRequest` (400) for
+a `%` not followed by two hex digits. Query values are decoded (`%XX` and
+`+`).
+
+```zig
+// GET /users/J%C3%BCrgen
+const name = (try req.paramDecoded("name")).?; // "Jürgen"; req.params keeps "J%C3%BCrgen"
+```
 
 ## Groups
 
@@ -153,6 +162,13 @@ const Timing = struct {
 
 app.use(Timing{});
 ```
+
+A middleware that never waits (no I/O, no sleep, no lock or event another
+task releases) says so with `pub const no_wait = true;`, or with
+`pub fn noWait(self: *const T) bool` when that depends on how the value was
+set up (asked once, at registration); a function middleware says it by being
+wrapped, `app.use(anole.noWait(f))`. Routes marked `noWait` take only such
+middleware (see below).
 
 ### Built-in middleware
 
@@ -737,7 +753,24 @@ responses to one read go out in one write: about 1.7x the requests per core
 for small responses. Over HTTP/3 the same goes for a request that arrives
 whole in one packet: it runs where the endpoint reads the packet, and its
 response leaves with the rest of the batch. The promise covers every
-middleware that runs for the route too. A handler marked this way that
+middleware that runs for the route too, and it is checked: registering a
+`noWait` route (`anole.noWait(h)`, `RouteOptions.no_wait`, a gRPC service
+registered `no_wait`) behind middleware that does not say it never waits is
+a startup error naming both:
+
+```
+route GET /ping is marked noWait, but middleware anole.session.Middleware may wait (I/O, a lock, a sleep): drop noWait from the route, or mark the middleware if it never waits (pub const no_wait = true; anole.noWait(f) for a function middleware)
+```
+
+Either remove `noWait` from the route, or mark a middleware of yours that
+truly never waits. The built-in middleware that never waits is marked:
+`Cors`, `Compress`, `RequestId`, `Logger`, the cookie `Session`,
+`ResponseCache`, `AltSvc`, CSRF, RBAC, the access log, metrics, tracing,
+`app.rateLimit`, and (by how they are set up) `ratelimit.Middleware` on a
+memory limiter, `auth.RequireJwt` on static keys and no hook,
+`auth.apikey.Middleware` on an in-memory lookup (`Lookup.never_waits`) and
+`session.Middleware` on cookies or a memory store; a Redis limiter or
+store, a JWKS keyring or a database lookup may wait and are not. A handler marked this way that
 waits anyway still works, but holds up every other request on its
 connection (on HTTP/3, every connection of its endpoint) meanwhile and gets
 no request timeout, so leave the mark off anything that queries a database,

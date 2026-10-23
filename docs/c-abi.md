@@ -254,7 +254,7 @@ parameters, metadata) are reached through the offset stored in the record.
 | `ANOLE_EV_WT_STREAM_RESET` | `anole_wt_code_event`: the peer reset its sending side | `anole_wt_stream` | none |
 | `ANOLE_EV_WT_STREAM_STOP` | `anole_wt_code_event`: the peer asked this side to stop sending | `anole_wt_stream` | none |
 | `ANOLE_EV_WT_DATAGRAM` | `anole_wt_datagram_event`, then the bytes | `anole_wt` | none |
-| `ANOLE_EV_WS_UPGRADE` (40) | `anole_request_event`: a WebSocket upgrade the consumer accepts or refuses; only with `"accept": "consumer"` | `anole_req` | accept or a refusing answer |
+| `ANOLE_EV_WS_UPGRADE` (40) | `anole_request_event`: a WebSocket handshake the consumer accepts (`anole_ws_accept`) or refuses (any request answer); only on routes with `"accept": "consumer"` | `anole_req` | accept or a refusing answer |
 | `ANOLE_EV_DRAINING` (41) | `anole_event`: the drain started | 0 | none |
 
 The numbers are allocated once and frozen: 0 none; 1-11 core; 12-19 gRPC;
@@ -326,7 +326,7 @@ has not read, and is let go. It is the one call a finalizer needs.
 | `anole_version()`'s and `anole_last_error_name()`'s text | static |
 | `anole_listener_info`'s strings | Anole's, valid until `anole_server_destroy` |
 | a request handle | valid from `ANOLE_EV_REQUEST` until it is answered (`anole_req_respond`, `anole_req_respond_fd`, `anole_req_stream_end`, `anole_req_fail`, `anole_req_abort`, `anole_handle_release`), expires or is aborted |
-| a WebSocket handle | from `ANOLE_EV_WS_OPEN` until `ANOLE_EV_WS_CLOSE` |
+| a WebSocket handle | from `ANOLE_EV_WS_OPEN` (or the `anole_ws_accept` that returned it) until `ANOLE_EV_WS_CLOSE` |
 | a gRPC call handle | from `ANOLE_EV_GRPC_CALL` until `anole_grpc_finish` or abort |
 | a WebTransport session and its streams | the session from `ANOLE_EV_WT_OPEN` to `ANOLE_EV_WT_CLOSE`; a stream until `anole_handle_release` or its session's end |
 | a gRPC message passed with `ANOLE_BODY_BORROW` | the caller's, until `ANOLE_EV_SENT` |
@@ -417,6 +417,7 @@ marked (C): they answer `ANOLE_OK` on an object that is already over.
 | `anole_req_stream_end` | `ANOLE_E_INVALID` (trailer), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_req_fail` | `ANOLE_E_INVALID` (status, message), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_req_abort` (C) | `ANOLE_E_INVALID` (`WrongHandleKind`) |
+| `anole_ws_accept` | `ANOLE_E_STATE` (the request is no handshake), `ANOLE_E_INVALID` (subprotocol not offered, a header the handshake writes, flags, reserved, size), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_ws_send` | `ANOLE_BUSY`, `ANOLE_E_INVALID` (type, size, flags), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_ws_close` (C) | `ANOLE_E_INVALID` (code, reason), `ANOLE_E_NOMEM` |
 | `anole_ws_subscribe` | `ANOLE_E_INVALID` (topic), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
@@ -474,7 +475,8 @@ here and runs on Anole's threads:
 ```
 
 - A route has exactly one of `handler` (a consumer's route id), `respond` (a
-  fixed answer), `static` (files under a directory) or `websocket`.
+  fixed answer), `static` (files under a directory) or `websocket` (with
+  `"accept": "consumer"`, also `handler`).
   A `respond` answer's `headers` may not name `Connection` or
   `Transfer-Encoding`, which the server writes itself, and must be valid
   field names and values; the configuration is refused otherwise.
@@ -641,6 +643,21 @@ thread. A body past `limits.body_max` ends the request with 413.
   cut short. A cleanup call.
 - `anole_handle_release(h)`: the generic cleanup (see Handles).
 
+What borrowing saves, per call (Anole's own copies of the body before the
+protocol writes it):
+
+| Call | not borrowed | borrowed | `ANOLE_EV_SENT` for a borrow |
+| --- | --- | --- | --- |
+| `anole_req_respond`, HTTP/1.1 and HTTP/3 | 2 (into the slot, then the arena) | 0 | once the answer is written |
+| `anole_req_respond`, HTTP/2 | 2 | 1 (the arena) | as soon as the answer is applied |
+| `anole_req_stream_write` | 1 | 0 | once the chunk is written |
+| `anole_ws_send` | 1 | 0 | once the message is written |
+| `anole_wt_stream_write` | 1 | 1 (taken for the API's sake) | at once |
+
+HTTP/2 copies a borrowed whole body because its writer cuts DATA frames from
+the body after the call returns; zero-copy would need the request slot to
+live until the last frame. Borrowing never costs more than copying.
+
 `ANOLE_BODY_BORROW` is bit 0 of every send-type call's flags: a call that
 answers `>= 0` produces exactly one `ANOLE_EV_SENT` for that (data, len),
 zero length included, even when the client goes away first; a call that
@@ -656,24 +673,76 @@ returns, no borrowed memory is read and no `ANOLE_EV_SENT` comes.
 ## WebSocket
 
 A `websocket` route upgrades over HTTP/1.1, HTTP/2 (RFC 8441) and HTTP/3
-(RFC 9220). `ANOLE_EV_WS_OPEN` carries the upgrade request; each whole
-message (inflated, UTF-8 checked) is an `ANOLE_EV_WS_MESSAGE`; the end is
-`ANOLE_EV_WS_CLOSE` with the code (1005 without one, 1006 when the
-connection ended without a close). Messages waiting for a consumer that is
-behind are bounded per executor by bytes as well as by `limits.queue` (the
-larger of 16 x `limits.ws_high_water` and 2 x `limits.ws_max_message`):
-past that, the sockets feeding it are not read until it catches up. `anole_ws_send` queues a message
-(`ANOLE_BUSY` past `limits.ws_high_water`, then `ANOLE_EV_WRITABLE` with the
-socket as `ev.handle`),
-`anole_ws_close` sends a close. Topics are Anole's: `anole_ws_subscribe`,
-`anole_ws_unsubscribe`, and `anole_ws_publish(server, topic, ...)` fans out
-on Anole's threads without entering the language. A publish waits for no
-subscriber: each one has up to `limits.ws_high_water` bytes queued for it;
-past that, publishes skip it, and a subscriber whose send stays stuck that way
-for a second is closed. Publishes still being fanned out are bounded too (64
-per executor, and the larger of 16 x `limits.ws_high_water` and
-2 x `limits.ws_max_message` bytes): past the bound `anole_ws_publish` answers
-`ANOLE_E_AGAIN` and sends nothing. A drain closes sockets with 1001.
+(RFC 9220). Who answers the handshake is the route's `"accept"`.
+
+**Auto endpoints** (`"accept": "auto"`, the default). Anole answers the
+handshake: origins (`"origins"`, 403 otherwise), permessage-deflate, and
+subprotocols (`"subprotocols": ["graphql-transport-ws"]`, most preferred
+first; the first the client offered is selected and echoed).
+`ANOLE_EV_WS_OPEN` carries the upgrade request and the selected one in its
+`subprotocol` span. Each whole message (inflated, UTF-8 checked) is an
+`ANOLE_EV_WS_MESSAGE`; the end is `ANOLE_EV_WS_CLOSE` with the code (1005
+without one, 1006 when the connection ended without a close). Messages
+waiting for a consumer that is behind are bounded per executor by bytes as
+well as by `limits.queue` (the larger of 16 x `limits.ws_high_water` and
+2 x `limits.ws_max_message`): past that, the sockets feeding it are not read
+until it catches up. `anole_ws_send` queues a message (`ANOLE_BUSY` past
+`limits.ws_high_water`, then `ANOLE_EV_WRITABLE` with the socket as
+`ev.handle`), `anole_ws_close` sends a close.
+
+**Handshakes the application decides** (`"accept": "consumer"`). Anole
+checks it is a handshake and the route's `origins` (403 natively), then
+sends it as `ANOLE_EV_WS_UPGRADE`: an `anole_request_event` whose handle is
+an `anole_req`, under the route's `timeout_ms` (else `timeouts.request_ms`)
+and `limits.max_inflight`. Answer it with `anole_ws_accept` (a subprotocol
+the client offered, extra headers such as `Set-Cookie`), which returns the
+`anole_ws` handle at once, or with any answer a request takes
+(`anole_req_respond` 401 or 403 with a body, `anole_req_stream_*`,
+`anole_req_respond_fd`, `anole_req_fail`, `anole_req_abort`), which refuses
+the socket. After an accept there is no `ANOLE_EV_WS_OPEN` (the accept is
+the open): sends, closes and topic changes on the new handle work at once
+and wait until the handshake's answer is out; then come
+`ANOLE_EV_WS_MESSAGE`s and one `ANOLE_EV_WS_CLOSE`. If the answer cannot be
+written (the client left), the handle gets `ANOLE_EV_WS_CLOSE` with 1006
+and nothing else. No answer by the deadline: 504, the handle goes stale and
+a late accept answers `ANOLE_E_GONE`; the client leaving first gives
+`ANOLE_EV_ABORT`, as for any request.
+
+A route may also carry `handler`: plain requests go to it as
+`ANOLE_EV_REQUEST` and handshakes to `websocket.handler` as
+`ANOLE_EV_WS_UPGRADE`, so one app sees every request on a path (a catch-all
+`/*` route serves a whole app):
+
+```json
+{"path": "/graphql", "websocket": {"handler": 3, "subprotocols": ["graphql-transport-ws"]}}
+{"path": "/chat", "timeout_ms": 5000, "websocket": {"handler": 2, "accept": "consumer"}}
+{"path": "/*", "handler": 1, "websocket": {"handler": 1, "accept": "consumer", "origins": ["*"]}}
+```
+
+How the usual APIs map onto it:
+
+| API | ABI |
+| --- | --- |
+| ASGI `websocket.accept` (subprotocol, headers) | `anole_ws_accept` |
+| ASGI `websocket.close` before accept | `anole_req_respond` 403 |
+| ASGI `websocket.http.response.start` (denial response) | `anole_req_stream_start` |
+| Bun `server.upgrade(req, { headers })` | `anole_ws_accept` |
+| Bun `fetch` returning a `Response` instead | `anole_req_respond` |
+| `ws` `verifyClient` / `handleProtocols` | the decision before `anole_ws_accept` |
+
+Topics are Anole's: `anole_ws_subscribe`, `anole_ws_unsubscribe`, and
+`anole_ws_publish(server, topic, ...)` fans out on Anole's threads without
+entering the language. Publishes to one topic reach every subscriber in the
+order they were taken (from one thread: call order); publishes to different
+topics, and a publish against an `anole_ws_send` to the same socket, are
+not ordered against each other. A publish waits for no subscriber: each one
+has up to `limits.ws_high_water` bytes queued for it; past that, publishes
+skip it, and a subscriber whose send stays stuck that way for a second is
+closed. Publishes still being fanned out are bounded too (64 per executor,
+and the larger of 16 x `limits.ws_high_water` and 2 x `limits.ws_max_message`
+bytes): past the bound `anole_ws_publish` answers `ANOLE_E_AGAIN` and sends
+nothing (a caller that retries the refused publish before the next keeps
+the order). A drain closes sockets with 1001.
 
 ## WebTransport
 
