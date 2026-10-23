@@ -30,6 +30,14 @@ breaking changes are listed anyway.
 
 ### Changed
 
+- `anole.http.Client`: `ClientOptions.http2` is on by default. Requests to a
+  host whose server picks h2 share one connection per executor as
+  concurrent streams (one dial per origin, others wait for it; 1 MiB per
+  stream and 16 MiB per connection windows; a stream's buffer is sized by
+  the response's `Content-Length`), and a request the server provably did
+  not process is sent again on a new connection. `h2c_hosts` lists hosts
+  that speak cleartext HTTP/2 with prior knowledge. `http2 = false` restores
+  HTTP/1.1 over TLS.
 - HTTP/3: a client's RESET_STREAM (or STOP_SENDING with an error) cancels the
   handler's task, as on HTTP/2.
 - HTTP/3: while a request is open, QUIC PINGs keep the connection alive.

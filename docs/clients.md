@@ -7,7 +7,7 @@ a thread, and all of them use the same BoringSSL as the server.
 | Client | Protocol | Use it for |
 | --- | --- | --- |
 | `anole.client(req)` | as `anole.http.Client` | The server's own pooled client, from any handler: nothing to set up. |
-| `anole.http.Client` | HTTP/1.1, HTTPS, optionally HTTP/2 | Ordinary REST calls: one request at a time per connection, pooled keep-alive connections, redirects, decompression. |
+| `anole.http.Client` | HTTP/1.1, HTTPS with HTTP/2 where the server offers it | Ordinary REST calls: pooled keep-alive connections (HTTP/1.1: one request at a time each; HTTP/2: shared), redirects, decompression. |
 | `anole.h2.ClientConnection` | HTTP/2 (TLS or h2c) | Many concurrent requests over one connection, full-duplex streaming, trailers. |
 | `anole.h3.ClientConnection` | HTTP/3 over QUIC | The same as HTTP/2, over UDP. Same API. |
 | `anole.grpc.Client(Service)` | gRPC over HTTP/2 or HTTP/3 | Calling gRPC services from generated code. |
@@ -178,14 +178,27 @@ and unspecified addresses, IPv4 and IPv6, with `error.AddressNotAllowed`.
 The check is on the address the connection reached, after DNS, on every
 hop, before any byte of the request is sent.
 
-`ClientOptions.http2 = true` offers HTTP/2 ("h2", then "http/1.1") through
-ALPN on HTTPS connections. A server that picks it gets the request over
-HTTP/2, through `anole.h2`'s client underneath; `response.version().major`
-says which was used. Everything above works the same, but such a connection
-still carries one request at a time and goes back to the pool after it, so
-it buys the protocol, not concurrency: for many requests at once on one
-connection, use `anole.h2` directly. Cleartext (`http://`) requests and
-WebSocket upgrades stay on HTTP/1.1. It is off by default.
+`ClientOptions.http2` (on by default) offers HTTP/2 ("h2", then "http/1.1")
+through ALPN on HTTPS connections. A server that picks it gets the request
+over HTTP/2, through `anole.h2`'s client underneath; `response.version().major`
+says which was used. Everything above works the same, and requests to such a
+host now share connections: each executor keeps one HTTP/2 connection per
+origin and runs concurrent requests on it as streams, so fan-in to one
+upstream costs one connection and one handshake, not one per request in
+flight. The first dial for an origin is made once; requests that arrive
+meanwhile wait for it (an origin that turns out to speak only HTTP/1.1 is
+remembered for a minute, so its requests dial in parallel again). Each
+stream has a 1 MiB receive window and the connection 16 MiB; a response's
+buffer is sized by its `Content-Length`, so small answers stay small. A
+request the server provably did not process (`REFUSED_STREAM`, or past its
+GOAWAY) is sent again on a new connection whatever its method, once.
+`.http2 = false` keeps HTTPS on HTTP/1.1. WebSocket upgrades stay on
+HTTP/1.1.
+
+Cleartext (`http://`) requests use HTTP/1.1 unless the host is listed in
+`ClientOptions.h2c_hosts` (`&.{ "worker.internal", "10.0.0.5:8080" }`), which
+speaks HTTP/2 with prior knowledge there. A listed host that only speaks
+HTTP/1.1 fails its requests.
 
 ## HTTP/2
 
@@ -334,7 +347,7 @@ all of them trust the system store unless told otherwise:
 | A CA in memory | `.ca = .fromPem(ca_pem)` (one or more certificates) |
 | Skip verification (tests only) | `.insecure_skip_verify = true`, optionally `.ca = .none` |
 | Client certificate (mutual TLS) | `.client_certificate = .fromFiles("client.pem", "client.key")`, or `.fromPem(cert_pem, key_pem)` |
-| ALPN | `anole.http`: none, or "h2" and "http/1.1" with `.http2 = true`; `anole.h2`, `anole.h3`: "h2" or "h3", fixed |
+| ALPN | `anole.http`: "h2" and "http/1.1" (none with `.http2 = false`); `anole.h2`, `anole.h3`: "h2" or "h3", fixed |
 
 `ca` is an `anole.Ca`. `.none` without `insecure_skip_verify` fails
 with `error.NoCertificateAuthority`.
