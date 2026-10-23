@@ -170,20 +170,24 @@ pub fn main(init: std.process.Init) !void {
     defer rt.deinit();
     const io = rt.io();
     var h2_conn: ?*anole.h2.ClientConnection = null;
-    var h3_conn: ?*anole.h3.ClientConnection = null;
+    const H3Conn = if (anole.features.http3) anole.h3.ClientConnection else struct {
+        fn close(_: *@This()) void {}
+    };
+    var h3_conn: ?*H3Conn = null;
     defer if (h2_conn) |c| c.close();
     defer if (h3_conn) |c| c.close();
     var channel: grpc.Channel = .{ .authority = host, .scheme = if (ca_path != null) "https" else "http" };
     if (use_h3) {
-        if (comptime !anole.features.http3) return error.Http3NotBuilt;
-        const path = ca_path orelse return error.Http3NeedsTls;
-        h3_conn = try anole.h3.ClientConnection.connect(init.gpa, io, .{
-            .host = host,
-            .address = .{ .ip4 = .loopback(port) },
-            .port = port,
-            .tls = .{ .ca = .{ .file = path } },
-        });
-        channel.h3 = h3_conn;
+        if (comptime !anole.features.http3) return error.Http3NotBuilt else {
+            const path = ca_path orelse return error.Http3NeedsTls;
+            h3_conn = try anole.h3.ClientConnection.connect(init.gpa, io, .{
+                .host = host,
+                .address = .{ .ip4 = .loopback(port) },
+                .port = port,
+                .tls = .{ .ca = .{ .file = path } },
+            });
+            channel.h3 = h3_conn;
+        }
     } else {
         h2_conn = try anole.h2.ClientConnection.connect(init.gpa, io, .{
             .host = if (ca_path != null) host else "127.0.0.1",
