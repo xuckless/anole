@@ -2266,11 +2266,11 @@ static void wt_event(wt_state *st, const anole_event *ev) {
         CHECK(e->len == 6 && memcmp(e->got, "thanks", 6) == 0);
         n = snprintf(out, sizeof out, "thanked");
       }
-      /* Released before the answer: the client closes the session once it
-         has "thanked", and a stream is stale from its session's close on. */
+      /* Released after the answer: a release is a cleanup call, safe also
+         once the client has closed the session. */
       anole_wt session = e->session;
-      wt_forget(st, e);
       CHECK(anole_wt_send_datagram(session, out, (size_t)n, 0) == ANOLE_OK);
+      wt_forget(st, e);
     } else {
       anole_status rc = anole_wt_stream_write(ev->handle, d.ptr, d.len, fin ? ANOLE_WT_F_FIN : 0);
       CHECK(rc == ANOLE_OK || rc == ANOLE_BUSY);
@@ -3226,6 +3226,181 @@ static void test_ws_writable_and_sent(void) {
   printf("ok WebSocket: WRITABLE signals room, borrowed sends are reported once\n");
 }
 
+
+/* ---- WebSocket handshakes decided by the consumer, subprotocols, publish order ---------- */
+
+/* The handshake request, sent without reading the answer (the answer comes
+   when the consumer decides). */
+static void ws_handshake_send(conn_reader *c, uint16_t port, const char *path, const char *extra) {
+  c->fd = dial(port);
+  c->len = c->pos = 0;
+  char req[1024];
+  int n = snprintf(req, sizeof req,
+                   "GET %s HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                   "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n%s\r\n",
+                   path, extra);
+  CHECK(write(c->fd, req, (size_t)n) == n);
+}
+
+static void test_ws_accept(void) {
+  if (!have_websocket) return;
+  const char *json = "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"executors\":1,"
+                     "\"routes\":[{\"path\":\"/plain\",\"handler\":1},"
+                     "{\"path\":\"/up\",\"websocket\":{\"handler\":10,\"accept\":\"consumer\",\"origins\":[\"*\"]}}]}";
+  anole_consumer *c = NULL;
+  anole_server *s = polled_server(json, &c);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  uint16_t port = port_of(s, 0);
+
+  /* anole_ws_accept on a request that is no handshake: STATE, and the
+     request is still owed (and gets) its answer. */
+  pthread_t t;
+  async_req *a = start_get(port, "/plain", &t);
+  const anole_event *ev = next_event(c, ANOLE_EV_REQUEST);
+  anole_req plain = ev->handle;
+  anole_ws none = 0;
+  CHECK(anole_ws_accept(plain, NULL, &none) == ANOLE_E_STATE);
+  CHECK(str_has(anole_last_error(), "not a WebSocket handshake"));
+  CHECK(anole_req_respond(plain, 200, NULL, 0, "ok", 2, 0) == ANOLE_OK);
+  CHECK(finish_get(a, t, "ok") == 200);
+
+  /* a handshake offering a and b */
+  conn_reader cr;
+  ws_handshake_send(&cr, port, "/up", "Sec-WebSocket-Protocol: a, b\r\n");
+  ev = next_event(c, ANOLE_EV_WS_UPGRADE);
+  anole_req up = ev->handle;
+  {
+    const anole_request_event *r = (const anole_request_event *)ev;
+    CHECK(str_is(anole_event_str(r, r->path), "/up"));
+    CHECK(r->subprotocol.len == 0);
+  }
+  anole_ws w = 0;
+  /* a subprotocol the client did not offer */
+  anole_ws_accept_options bad = {sizeof bad, 0, 0, {"zzz", 3}, NULL, 0};
+  CHECK(anole_ws_accept(up, &bad, &w) == ANOLE_E_INVALID);
+  /* a header the handshake writes itself */
+  anole_header accept_hdr = {{"Sec-WebSocket-Accept", 20}, {"x", 1}};
+  anole_ws_accept_options bad_header = {sizeof bad_header, 0, 0, {NULL, 0}, &accept_hdr, 1};
+  CHECK(anole_ws_accept(up, &bad_header, &w) == ANOLE_E_INVALID);
+  /* flags and reserved must be 0 */
+  anole_ws_accept_options bad_flags = {sizeof bad_flags, 1, 0, {NULL, 0}, NULL, 0};
+  CHECK(anole_ws_accept(up, &bad_flags, &w) == ANOLE_E_INVALID);
+  /* an options struct larger than this header's, with a non-zero tail */
+  _Alignas(8) unsigned char big[sizeof(anole_ws_accept_options) + 16];
+  memset(big, 0, sizeof big);
+  ((anole_ws_accept_options *)big)->size = sizeof big;
+  big[sizeof big - 1] = 1;
+  CHECK(anole_ws_accept((anole_req)up, (const anole_ws_accept_options *)big, &w) == ANOLE_E_INVALID);
+  /* NULL out */
+  CHECK(anole_ws_accept(up, NULL, NULL) == ANOLE_E_INVALID);
+  /* none of those took the request: it accepts now */
+  anole_header cookie = {{"Set-Cookie", 10}, {"s=1", 3}};
+  anole_ws_accept_options good = {sizeof good, 0, 0, {"b", 1}, &cookie, 1};
+  CHECK(anole_ws_accept(up, &good, &w) == ANOLE_OK && w != 0);
+  /* the request handle is stale; the socket works at once */
+  CHECK(anole_req_respond(up, 200, NULL, 0, "", 0, 0) == ANOLE_E_GONE);
+  CHECK(anole_ws_send(w, ANOLE_WS_TEXT, "first", 5, 0) == ANOLE_OK);
+  response r;
+  response_init(&r);
+  read_response(&cr, &r, 1);
+  CHECK(r.status == 101);
+  CHECK(strcasestr(r.head, "sec-websocket-protocol: b") != NULL);
+  CHECK(strcasestr(r.head, "set-cookie: s=1") != NULL);
+  response_free(&r);
+  char out[128];
+  size_t len = 0;
+  CHECK(ws_read_frame(&cr, out, sizeof out, &len) == 1 && len == 5 && memcmp(out, "first", 5) == 0);
+  ws_send_frame(cr.fd, 1, "hello", 5);
+  const anole_ws_message_event *msg = (const anole_ws_message_event *)next_event(c, ANOLE_EV_WS_MESSAGE);
+  CHECK(msg->ev.handle == w);
+  CHECK(str_is(anole_event_str(msg, msg->data), "hello"));
+  ws_send_frame(cr.fd, 8, "\x03\xe8", 2);
+  const anole_ws_close_event *ce = (const anole_ws_close_event *)next_event(c, ANOLE_EV_WS_CLOSE);
+  CHECK(ce->ev.handle == w && ce->code == 1000);
+  close(cr.fd);
+
+  /* refused like any request: a 401 with a body; a second handshake with
+     options = NULL accepts without a subprotocol */
+  ws_handshake_send(&cr, port, "/up", "");
+  ev = next_event(c, ANOLE_EV_WS_UPGRADE);
+  CHECK(anole_req_respond(ev->handle, 401, text_plain, 1, "no thanks", 9, 0) == ANOLE_OK);
+  response_init(&r);
+  read_response(&cr, &r, 0);
+  CHECK(r.status == 401 && strstr(r.body, "no thanks") != NULL);
+  response_free(&r);
+  close(cr.fd);
+  ws_handshake_send(&cr, port, "/up", "Sec-WebSocket-Protocol: a\r\n");
+  ev = next_event(c, ANOLE_EV_WS_UPGRADE);
+  CHECK(anole_ws_accept(ev->handle, NULL, &w) == ANOLE_OK);
+  response_init(&r);
+  read_response(&cr, &r, 1);
+  CHECK(r.status == 101 && strcasestr(r.head, "sec-websocket-protocol") == NULL);
+  response_free(&r);
+  /* anole_handle_release closes it */
+  CHECK(anole_handle_release(w) == ANOLE_OK);
+  CHECK(ws_read_frame(&cr, out, sizeof out, &len) == 8);
+  close(cr.fd);
+  stop_polled(s);
+  printf("ok WebSocket: handshakes decided by the consumer (accept, refuse, argument checks)\n");
+}
+
+static void test_ws_subprotocols_auto(void) {
+  if (!have_websocket) return;
+  const char *json = "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"executors\":1,"
+                     "\"routes\":[{\"path\":\"/sp\",\"websocket\":{\"handler\":10,\"subprotocols\":[\"b\",\"a\"]}}]}";
+  anole_consumer *c = NULL;
+  anole_server *s = polled_server(json, &c);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  conn_reader cr;
+  ws_handshake_send(&cr, port_of(s, 0), "/sp", "Sec-WebSocket-Protocol: a, b\r\n");
+  const anole_event *ev = next_event(c, ANOLE_EV_WS_OPEN);
+  const anole_request_event *r = (const anole_request_event *)ev;
+  CHECK(str_is(anole_event_str(r, r->subprotocol), "b"));
+  response resp;
+  response_init(&resp);
+  read_response(&cr, &resp, 1);
+  CHECK(resp.status == 101 && strcasestr(resp.head, "sec-websocket-protocol: b") != NULL);
+  response_free(&resp);
+  close(cr.fd);
+  stop_polled(s);
+  printf("ok WebSocket: configured subprotocols are selected by the server's order\n");
+}
+
+static void test_publish_order(void) {
+  if (!have_websocket) return;
+  const char *json = "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"executors\":4,"
+                     "\"routes\":[{\"path\":\"/ws\",\"websocket\":{\"handler\":10}}]}";
+  anole_consumer *c = NULL;
+  anole_server *s = polled_server(json, &c);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  enum { CLIENTS = 3, N = 10000 };
+  static conn_reader cr[CLIENTS];
+  for (int i = 0; i < CLIENTS; i++) {
+    ws_connect(&cr[i], port_of(s, 0));
+    const anole_event *open = next_event(c, ANOLE_EV_WS_OPEN);
+    CHECK(anole_ws_subscribe(open->handle, LIT("seq")) == ANOLE_OK);
+  }
+  for (int i = 0; i < N; i++) {
+    char text[16];
+    int n = snprintf(text, sizeof text, "%d", i);
+    anole_status rc;
+    while ((rc = anole_ws_publish(s, LIT("seq"), ANOLE_WS_TEXT, text, (size_t)n, 0)) == ANOLE_E_AGAIN) usleep(200);
+    CHECK(rc == ANOLE_OK);
+  }
+  for (int i = 0; i < CLIENTS; i++) {
+    for (int want = 0; want < N; want++) {
+      char out[32], expect[16];
+      size_t len = 0;
+      CHECK(ws_read_frame(&cr[i], out, sizeof out, &len) == 1);
+      snprintf(expect, sizeof expect, "%d", want);
+      CHECK(strcmp(out, expect) == 0);
+    }
+    close(cr[i].fd);
+  }
+  stop_polled(s);
+  printf("ok WebSocket: publishes to one topic arrive in order\n");
+}
+
 /* A hang fails the run instead of holding CI until the job's timeout: the
    last "ok" line printed (stdout is line-buffered) names the last step that
    passed. abort() leaves a core where cores are kept. */
@@ -3271,6 +3446,9 @@ static int run_tests(void) {
   test_consumer_without_executor();
   test_set_wake();
   test_ws_writable_and_sent();
+  test_ws_accept();
+  test_ws_subprotocols_auto();
+  test_publish_order();
   printf("PASS\n");
   return 0;
 }
