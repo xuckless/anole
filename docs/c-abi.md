@@ -313,7 +313,7 @@ parameters, metadata) are reached through the offset stored in the record.
 | (119-123) | reserved for watch | | |
 | `ANOLE_EV_S3_RESULT` (124) | `anole_s3_result_event`: the answer to an `anole_s3_*` call (ABI 0.10, p3/s3) | 0, or the `anole_s3_transfer` it opens or ends | a transfer it opens: write and finish it, or read it to the end, or `anole_handle_release` |
 | `ANOLE_EV_S3_DATA` (125) | `anole_s3_data_event`: bytes of a download | `anole_s3_transfer` | none (FIN ends the handle) |
-| `ANOLE_EV_SMTP_RESULT` (126) | `anole_smtp_result_event`: the answer to `anole_smtp_send` (p3/smtp) | 0 | none |
+| `ANOLE_EV_SMTP_RESULT` (126) | `anole_smtp_result_event`: the answer to `anole_smtp_send` or `anole_smtp_send_raw`, then the rejected recipients and the spans' bytes (ABI 0.10, p3/smtp) | 0 | none |
 | (127-131) | reserved for storage and mail | | |
 | `ANOLE_EV_CONSOLE_CLOSED` (132) | `anole_console_closed_event`: the in-process console closed (`reason`: `ANOLE_CONSOLE_QUIT`, `_INTERRUPT`, `_RESTARTING`); only after `anole_console_open` | 0 | none: resume reading stdin |
 | (133-135) | reserved for the console | | |
@@ -1390,6 +1390,82 @@ and leaves the group; `ANOLE_EV_KAFKA_GROUP_END` says it is over
 its place in `"brokers"` (what `anole_broker_status_event.broker` names).
 The consumer reads none, gzip, zstd, lz4 and snappy batches. Transactions,
 the KIP-848 protocol and the admin API are not part of the ABI.
+
+## Mail
+
+The configuration's `"mail"` entries are SMTP servers (docs/email.md has
+the connector: `SMTP_URL`, STARTTLS and `smtps://`, AUTH PLAIN and LOGIN,
+MIME, pooled connections, retries). The library connects when the server
+starts and sends on its own executors; a send never waits on the caller's
+thread.
+
+```json
+{ "mail": [
+  { "name": "mail",
+    "smtp": { "url": "smtps://user:pass@smtp.postmarkapp.com:465",
+              "from": "App <hello@example.com>" },
+    "timeout_ms": 30000 } ] }
+```
+
+`url` null reads `SMTP_URL`, then falls back to Mailpit's
+`smtp://127.0.0.1:1025`, except in production (`"environment": "production"`,
+the ABI's default), where a missing `SMTP_URL` fails `anole_server_start`
+with `ANOLE_E_CONFIG` and the text "mail[0] "mail": SMTP_URL is not set;
+mail would go to a local test server...". The other keys are
+`anole.smtp.Options` in snake_case: `from` (or `SMTP_FROM`), `username`,
+`password`, `tls_mode` (`"auto"`, `"starttls"`, `"implicit"`, `"none"`),
+`ca_file`/`ca_pem` and the client certificate keys, `insecure_skip_verify`,
+`helo_name`, `max_connections`, `max_messages_per_connection`,
+`idle_timeout_ms`, `acquire_timeout_ms`, `connect_timeout_ms`,
+`min_throughput`, `max_message_bytes` and `readiness`; beside `smtp`, the
+entry has `timeout_ms`, `breaker`, `retry` (what `ANOLE_SMTP_F_RETRY` sends
+retry with: 3 attempts, 500 ms to 5 s) and `errors`, as a database does.
+
+`anole_smtp_find(server, name, &mail)` gives the handle (it works before
+the server starts), `anole_smtp_index(mail)` its place in `"mail"`.
+
+**`anole_smtp_send(mail, consumer, &message, &options, user_data)`**
+composes and sends a message (`anole_smtp_message`: `from`, `reply_to`,
+`to`/`cc`/`bcc` as `anole_str` arrays, `subject`, `text`, `html`, extra
+`headers`, `attachments`, `envelope_from`, `message_id`). Everything is
+copied before the call returns; an attachment's `path` is read while
+sending. Addresses, header values, attachment names and flags are checked
+**at the call**: `ANOLE_E_INVALID`, and `anole_last_error` names the field
+("to: "x" is not a mailbox ...", "no recipients"). Nothing else can fail
+the call except `ANOLE_E_STATE` (before start, after stop), `ANOLE_E_GONE`
+(a stale `req`) and `ANOLE_E_NOMEM`.
+
+`anole_smtp_options`: `flags` (`ANOLE_SMTP_F_RETRY`: try failures before the
+final "." again, never after it), `timeout_ms` (0 is the entry's;
+`ANOLE_DB_TIMEOUT_NONE` none) and `req` (the request or gRPC call the send
+serves: if it ends unanswered, the send is cut and its result is
+`ANOLE_E_GONE`).
+
+**`anole_smtp_send_raw(mail, consumer, envelope_from, recipients, n, bytes,
+len, &options, user_data)`** sends a message the language's own library
+composed (nodemailer's `MailComposer`, Python's `email`), as it is,
+dot-stuffed and with CRLF line ends. `envelope_from` of `{NULL,0}` is the
+null sender.
+
+The answer is one **`ANOLE_EV_SMTP_RESULT`** (`anole_smtp_result_event`) to
+the consumer, with the call's `user_data`:
+
+- `status`: `ANOLE_OK` (accepted for at least one recipient),
+  `ANOLE_E_SERVICE` (the server refused or could not be reached),
+  `ANOLE_E_TIMEOUT`, or `ANOLE_E_GONE`.
+- `http_status` and `error_class` (`ANOLE_DB_ERR_UNAVAILABLE`, `_INVALID`,
+  `_TIMEOUT`, `_OTHER`) as Anole's handlers would answer; `error` and
+  `error_code` ("recipient_rejected", "authentication_failed", "5.7.1")
+  say why, for logs.
+- `smtp_code` is the server's last reply code (250 on success).
+- `message_id` (without the angle brackets) and `response` (the answer to
+  the final ".", often a queue id) are spans in the record.
+- `nrejected` recipients the server refused while taking others:
+  `anole_smtp_rejected` at `rejected_off` (address, code, the server's
+  words).
+
+Like every send, a mail send returns once the call has copied the message;
+the network is never waited for on the caller's thread.
 
 ## gRPC
 

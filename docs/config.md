@@ -111,6 +111,7 @@ startup line says so.
 | `DATABASE_URL`, `PG*`, `REDIS_URL`, `MONGODB_URI` | the connectors | as before | yes |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME` | tracing | as before | yes |
 | `NATS_URL`, `KAFKA_BOOTSTRAP_SERVERS` (then `KAFKA_URL`) | the brokers | as before | yes |
+| `SMTP_URL`, `SMTP_FROM` | `anole.smtp` (docs/email.md) | Mailpit's `smtp://127.0.0.1:1025` outside production; in production a missing `SMTP_URL` stops `app.smtp` | yes |
 | `LISTEN_PID`, `LISTEN_FDS`, `LISTEN_FDNAMES`, `NOTIFY_SOCKET`, `ANOLE_READY_FD`, `ANOLE_H3_SECRET_FD` | process control from systemd or a predecessor | as before | never |
 
 Values are case-sensitive and lower case (`ANOLE_DEPLOYMENT=behind_proxy`).
