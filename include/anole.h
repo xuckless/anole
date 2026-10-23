@@ -2178,8 +2178,8 @@ typedef struct anole_jobs_result_event {
 /* ---- p3/webhooks ---- */
 /* ---- webhooks out ----
    The configuration's "webhooks" (it needs "jobs"): endpoints, signed deliveries run as jobs,
-   retries and the delivery log. Endpoint management and replay go through anole_jobs_admin. */
-typedef struct anole_jobs anole_jobs;
+   retries and the delivery log. Endpoint management and replay go through anole_jobs_admin
+   (anole_jobs is declared with the jobs functions). */
 
 typedef struct anole_webhook_out {
   size_t size;
@@ -2232,8 +2232,7 @@ typedef struct anole_webhook_status_event {
 /* ---- p3/realtime ---- */
 /* ---- Server-Sent Events ---------------------------------------------------- */
 
-typedef uint64_t anole_sse;       /* one subscriber a consumer accepted: until ANOLE_EV_SSE_CLOSE */
-typedef uint64_t anole_watch_sub; /* one watch listener: until ANOLE_EV_WATCH_END */
+/* anole_sse and anole_watch_sub are declared with the other handle types. */
 typedef struct anole_watch anole_watch; /* opaque; lives until anole_server_destroy */
 
 enum {
