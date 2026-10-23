@@ -2724,6 +2724,32 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         // ---- end p3/realtime ----
 
         // ---- p3/s3 ----
+        const s3_mod = if (features.s3) @import("s3/root.zig") else struct {
+            pub const Options = struct {};
+            pub const Client = void;
+        };
+
+        /// An S3-compatible object store for the handlers (AWS S3,
+        /// Cloudflare R2, MinIO, Backblaze B2, Supabase Storage), owned by
+        /// the server: `state.files = try app.s3(.{});` reads the AWS SDKs'
+        /// environment (AWS_ENDPOINT_URL_S3, AWS_REGION, AWS_ACCESS_KEY_ID,
+        /// AWS_SECRET_ACCESS_KEY...) and S3_BUCKET. Credentials are resolved
+        /// when serving starts (a start that finds none fails, naming every
+        /// source it tried). Once serving it reports to `app.metrics`,
+        /// `app.tracing` and, with `readiness`, `app.health`, and it is
+        /// drained and closed with the server. See `anole.s3`.
+        pub fn s3(self: *Self, config: s3_mod.Options) !*s3_mod.Client {
+            if (comptime !features.s3) @compileError("app.s3 needs the S3 client (-Ds3, on in the web and full profiles)");
+            var opts = config;
+            if (opts.environ == null) if (self.process) |p| {
+                opts.environ = p.environ;
+            };
+            const c = try s3_mod.Client.init(self.gpa, self.rt.io(), opts);
+            errdefer c.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(s3_mod.Client, c));
+            if (self.extras.connectors_started) try c.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            return c;
+        }
         // ---- end p3/s3 ----
 
         // ---- p3/smtp ----
