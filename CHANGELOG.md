@@ -3,6 +3,20 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.3.0 (unreleased)
+
+### Added
+
+- `anole.resilience`: retries with backoff and jitter, retry throttling and circuit breakers, used by the HTTP client (`ClientOptions.retry`, `.breaker`; `FetchOptions.retry`, `.idempotent`), gRPC channels (`Channel.retry`, `.breaker`, `Channel.connect` with redial) and the database connectors (`Options.breaker`, `Options.retry`, `with(.{ .retry = true })`).
+- HTTP/2 and HTTP/3 client `Stream.unprocessed()`.
+- `anole.nats` (`-Dnats`, on in `full`): NATS publish (never waits), request/reply, handlers with queue groups, TLS, token, NKey and `.creds` logins, and JetStream publish with ack and pull consumers. The client is adapted from zefir (MIT). `app.nats(.{})`.
+- C ABI: `"brokers"` in the configuration, `anole_nats_*`, events `ANOLE_EV_NATS_MSG`, `_REPLY`, `_JS_MSG`, `_SUB_END` and `_WRITABLE` (64-69), handle kinds for subscriptions and messages, `ANOLE_E_BROKER`, `ANOLE_DB_F_RETRY`, `"breaker"` and `"retry"` on databases.
+
+### Changed
+
+- PostgreSQL, Redis and MongoDB calls fail fast with 503 (`lastError` code `circuit_open`) after 5 connection failures in a row, for 5 s and then while probes fail (up to 60 s). Set `breaker = null` (`"breaker": null`) for the old behaviour.
+- `anole.db.System` has `nats` and `kafka`; an exhaustive `switch` on it needs the two new cases.
+
 ## Unreleased
 
 The relay pass: cross-task WebSocket sends, fan-out, TLS and HTTP/2

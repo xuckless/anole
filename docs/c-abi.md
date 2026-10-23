@@ -1446,3 +1446,8 @@ every minor may break (`ANOLE_ABI_COMPATIBLE` asks for an exact match).
 The freeze, ABI 1.0, comes after anole-node 0.1 and anole-py 0.1 ship on it.
 
 Auth beyond the configured `jwt` middleware comes later.
+
+
+## Breakers and retries (databases)
+
+Every `databases[]` entry of a network connector (PostgreSQL, Redis, MongoDB) takes `"breaker"` (an object with `consecutive_failures`, `failure_ratio`, `min_calls`, `window_ms`, `open_ms`, `max_open_ms`, `half_open_calls`; `null` turns it off; ignored for SQLite) and `"retry"` (`attempts`, `base_ms`, `max_ms`, `multiplier`, `attempt_timeout_ms`, `max_retry_after_ms`). `ANOLE_DB_F_RETRY` marks a query that may run again on a transient failure; it is refused (`ANOLE_E_INVALID`) on `anole_db_tx_query` and `anole_db_tx_exec`, and SQLite and MongoDB ignore it. An open breaker answers `ANOLE_EV_DB_RESULT` with `status = ANOLE_E_DB`, `error_class = ANOLE_DB_ERR_UNAVAILABLE`, `http_status = 503` and `error_code = "circuit_open"`.

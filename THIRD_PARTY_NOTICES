@@ -241,6 +241,18 @@ client, WebSocket, the HTTP/2 server engine, static files, assets)
             86d152f353c8ec029185e75ce5d2caf8d5756e59 (branch anole)
   Linked:   always
 
+src/nats/core/ (the NATS protocol engine and client: parser, encoder,
+connection, reconnect, subscriptions, requests, drain, its tests and fake
+server)
+  Adapted from zefir's src/nats, with TLS, token/NKey/creds logins,
+  placement on Anole's executors, a non-waiting publish and Anole's own
+  transport; every Zig file carries an attribution header and zefir's licence
+  is src/LICENSE.zefir.
+  Licence:  MIT. Copyright (c) 2026 vkiryakov
+  Source:   https://github.com/vkiryakov/zefir, commit
+            dbcc9677e6364997d1c897dc813985d76504e2b0
+  Linked:   -Dnats=true
+
 src/http/core/llhttp/ (llhttp 9.3.1, the HTTP/1.1 parser, as dusty
 vendored it; its licence is src/http/core/llhttp/LICENSE)
   Licence:  MIT. Copyright Fedor Indutny, 2018

@@ -235,6 +235,19 @@ attribution header on every file and THIRD_PARTY_NOTICES part B current.
   each release and port the fixes that apply. The PRs open there from the
   fork (#263-#270) are left as they are.
 
+## The NATS client
+
+`src/nats/core` is adapted from zefir's `src/nats` (commit dbcc967, MIT) and
+is Anole's code now: changes land here directly. Watch zefir's `src/nats`
+for fixes and pick them by hand, as for the HTTP core. What Anole added to
+the copy: the `ClientStream` transport and TLS (`engine/Connection.zig`,
+`src/nats/transport.zig`), token, NKey and creds logins (`Options.Auth`,
+`src/nats/nkeys.zig`, `auth.zig`), `ServerAddress.tls`, `Outbound.tryPut` and
+`Client.publishNow` (a publish that never waits), and task placement
+(`Client.executor`, `placement.concurrent` in the manager). JetStream
+(`src/nats/jetstream.zig`) and the connector layer are Anole's own. Live
+tests: `tests/nats/run.sh` (a nats-server with `-js` in Docker).
+
 ## The docs site
 
 https://xuckless.github.io/anole/ is `site/`, an Astro + Starlight project
