@@ -94,8 +94,39 @@ Set `.run = .manual` and an `anole.jobs.testing.FakeClock`; `jobs.step(ctx)`
 runs one round (leader, cron, stage, rescue, prune, then every due job) and
 returns a report. Nothing waits for time to pass: advance the clock.
 
+## Transactions
+
+On SQLite (and PostgreSQL, when its store lands) a job can be enqueued or
+completed inside your own transaction:
+
+```zig
+var tx = try app.db.begin(req, .{});
+defer tx.deinit();
+const id = try tx.one(i64, req, "INSERT INTO users (email) VALUES ($1) RETURNING id", .{email});
+_ = try app.jobs.enqueueIn(&tx, req, SendWelcome{ .user_id = id }, .{});
+try tx.commit(req);
+```
+
+The job exists only if the transaction commits. `jobs.completeIn(&tx, job)` inside
+a handler completes the job with the handler's own writes; if the transaction
+rolls back, the job runs again after its lease. The transaction must belong to
+the jobs store's own database (`error.InvalidJob` otherwise, with the reason in
+the log). A memory or Redis store has no transactions.
+
+## Metrics and traces
+
+With `app.metrics()` the queue reports `anole_jobs_enqueued_total`,
+`anole_jobs_duplicates_total`, `anole_jobs_finished_total{outcome}`,
+`anole_jobs_run_seconds`, `anole_jobs_running`, `anole_jobs_queued{state}` (the
+leader, every 15 s), `anole_jobs_rescued_total`, `anole_jobs_leader` and
+`anole_cron_enqueued_total`. `kind` and `name` take 256 distinct values; later
+ones read `other`.
+
+A job enqueued from a traced request, or from another job, keeps the
+`traceparent` in its `meta`; `job.traceparent()` returns it. Jobs make no spans
+of their own yet.
+
 ## Not built yet
 
-`enqueueIn`/`completeIn` (transactional enqueue), the PostgreSQL and Redis
-stores, metrics and traces for jobs, and most of the C ABI (`anole_jobs_get`
-exists; enqueue, workers and admin do not).
+The PostgreSQL and Redis stores (`app.jobs` refuses them with a message), and
+spans for job runs.

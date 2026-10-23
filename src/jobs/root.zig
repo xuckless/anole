@@ -89,6 +89,9 @@ pub const Options = struct {
     name: ?[]const u8 = null,
     /// Kinds known by name only (`enqueueRaw`, the ABI): their defaults.
     kinds: []const Kind = &.{},
+    /// Workers wait for this to open before they claim, and handlers may be
+    /// registered until it does (the C ABI: until the server starts).
+    gate: ?Gate = null,
     /// How long a server drain lets running jobs finish before they are put back.
     drain_timeout: Duration = .fromSeconds(10),
     /// Hook for every job that becomes dead (after its last attempt or a discard).
@@ -117,6 +120,8 @@ pub const Options = struct {
     };
     pub const DeadHook = struct { context: ?*anyopaque = null, call: *const fn (context: ?*anyopaque, info: *const JobInfo) void };
 };
+
+pub const Gate = struct { context: ?*anyopaque = null, is_open: *const fn (context: ?*anyopaque) bool };
 
 pub const Error = anole.db.Error || error{ Canceled, OutOfMemory, InvalidJob };
 
@@ -249,6 +254,13 @@ pub const Job = struct {
     cron_name: ?[]const u8 = null,
     /// Set by `completeIn`: the run already completed the job in its own transaction.
     completed_in: bool = false,
+    /// Set by the heartbeat when the job was cancelled through the admin API.
+    admin_cancelled: std.atomic.Value(bool) = .init(false),
+    /// Set while the run is going: the heartbeat lost it, or the drain put it back.
+    lost_flag: ?*const std.atomic.Value(bool) = null,
+    interrupted_flag: ?*const std.atomic.Value(bool) = null,
+    /// The run's time limit in ms, or null.
+    timeout_ms: ?u32 = null,
 
     pub const Outcome = struct {
         kind: enum { none, snooze, discard, retry_in } = .none,
@@ -306,6 +318,7 @@ pub const Job = struct {
 };
 
 pub const Client = @import("client.zig").Client;
+pub const store = @import("store.zig");
 
 /// The DDL for apps that migrate themselves (`migrate = false`).
 pub fn sql(comptime dialect: enum { postgresql, sqlite }, table_prefix: []const u8, arena: std.mem.Allocator) ![]const u8 {

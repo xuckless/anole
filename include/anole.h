@@ -498,6 +498,12 @@ enum anole_event_type {
   /* ---- end p3/net ---- */
 
   /* ---- p3/jobs ---- */
+  ANOLE_EV_JOB_ENQUEUED = 104,    /* anole_job_enqueued_event; handle 0 (user_data), or the anole_db_tx it ran on */
+  ANOLE_EV_JOB = 105,             /* anole_job_event; handle: anole_job; owes anole_job_finish
+                                     (anole_handle_release = retry now) */
+  ANOLE_EV_JOB_CANCEL = 106,      /* anole_job_cancel_event; handle: anole_job, now over */
+  ANOLE_EV_JOB_WORKER_END = 107,  /* anole_job_worker_end_event; handle: anole_job_worker, now over */
+  ANOLE_EV_JOBS_RESULT = 108,     /* anole_jobs_result_event: the answer to anole_jobs_admin */
   /* ---- end p3/jobs ---- */
 
   /* ---- p3/webhooks ---- */
@@ -1790,12 +1796,173 @@ typedef struct anole_kafka_assign_event {
 /* ---- end p3/net ---- */
 
 /* ---- p3/jobs ---- */
+/* Durable background jobs ("jobs" in the configuration): enqueued from any
+   thread, run by a worker of this consumer's language, retried with backoff,
+   kept in the configured database. A job runs at least once. */
+
 typedef struct anole_jobs anole_jobs; /* opaque; lives until anole_server_destroy */
 
-/* The configuration's "jobs" (the durable job queue). ANOLE_E_UNSUPPORTED when
-   the configuration has none or -Djobs is off. Enqueueing, workers and the
-   admin calls come with the rest of the jobs ABI. */
+/* The configuration's "jobs". ANOLE_E_UNSUPPORTED when the configuration has
+   none or -Djobs is off. From anole_server_open on. */
 ANOLE_API anole_status anole_jobs_get(anole_server *s, anole_jobs **out);
+
+/* anole_job_out.priority (0: the kind's) */
+enum { ANOLE_JOB_PRIORITY_DEFAULT = 0, ANOLE_JOB_PRIORITY_CRITICAL = 1, ANOLE_JOB_PRIORITY_HIGH = 2,
+       ANOLE_JOB_PRIORITY_NORMAL = 3, ANOLE_JOB_PRIORITY_LOW = 4 };
+/* anole_job_out.unique_scope (0: unfinished) */
+enum { ANOLE_JOB_UNIQUE_DEFAULT = 0, ANOLE_JOB_UNIQUE_PENDING = 1, ANOLE_JOB_UNIQUE_UNFINISHED = 2, ANOLE_JOB_UNIQUE_ANY = 3 };
+/* anole_job_out.flags: unique, by unique_key or by the args when it is empty
+   (bit 0 stays ANOLE_BODY_BORROW, refused) */
+enum { ANOLE_JOB_F_UNIQUE = 2 };
+
+/* One job to enqueue. Everything is copied. */
+typedef struct anole_job_out {
+  size_t size;               /* sizeof(anole_job_out) */
+  anole_str kind;            /* required */
+  anole_str args_json;       /* a JSON value; {NULL,0}: {} */
+  anole_str queue;           /* {NULL,0}: the kind's ("kinds"), else "default" */
+  anole_str unique_key;
+  anole_str meta_json;       /* a JSON object, or {NULL,0} */
+  int64_t run_at_ms;         /* Unix ms; 0: now (+ delay_ms) */
+  uint32_t delay_ms;         /* not with run_at_ms */
+  uint32_t flags;            /* ANOLE_JOB_F_* */
+  uint32_t unique_period_ms; /* 0: none */
+  uint16_t attempts;         /* 0: the kind's */
+  uint8_t priority;          /* ANOLE_JOB_PRIORITY_* */
+  uint8_t unique_scope;      /* ANOLE_JOB_UNIQUE_* */
+  uint32_t timeout_ms;       /* 0: the kind's; ANOLE_DB_TIMEOUT_NONE: none */
+  uint32_t reserved;
+} anole_job_out;             /* 120 bytes */
+
+typedef struct anole_jobs_enqueue_options {
+  size_t size;
+  uint32_t timeout_ms;       /* the store call; 0: the database's timeout_ms */
+  uint32_t reserved;
+  uint64_t tx;               /* an anole_db_tx on the jobs store's database (PostgreSQL, SQLite), or 0 */
+  uint64_t req;              /* the anole_req / anole_grpc_call it serves: picks its consumer's executor, or 0 */
+} anole_jobs_enqueue_options; /* 32 bytes */
+
+/* Queues 1..1000 jobs (copied), enqueued one after the other (not atomically
+   unless `tx` is given). One ANOLE_EV_JOB_ENQUEUED answers with an entry per
+   job in order. With `tx`, the inserts are calls on that transaction (in order
+   with its others) and commit with it; the answer is then the transaction's
+   usual ANOLE_EV_DB_RESULT, a table of the columns id and inserted. `c` may be
+   NULL with tx or req. Returns at once: ANOLE_OK; ANOLE_E_INVALID (a job: kind,
+   JSON, sizes, flags; tx on a Redis or memory store or on another database);
+   ANOLE_E_GONE (stale tx/req); ANOLE_E_STATE. */
+ANOLE_API anole_status anole_jobs_enqueue(anole_jobs *j, anole_consumer *c, const anole_job_out *jobs, size_t njobs,
+                                          const anole_jobs_enqueue_options *opts, uint64_t user_data);
+
+typedef struct anole_jobs_work_options {
+  size_t size;
+  anole_str queue;           /* {NULL,0}: "default"; must be in "jobs".queues */
+  const anole_str *kinds;    /* the kinds this worker runs; NULL/0: every kind of the queue */
+  size_t nkinds;
+  uint32_t concurrency;      /* jobs out at once; 0: the queue's concurrency */
+  uint32_t reserved;
+} anole_jobs_work_options;   /* 48 bytes */
+
+/* Runs `queue`'s jobs of `kinds` in the language: each is ANOLE_EV_JOB to `c`
+   with its own anole_job handle; at most `concurrency` are out at once. Before
+   the server starts (after anole_server_open). ANOLE_E_INVALID: an unknown
+   queue, a kind another worker already runs; ANOLE_E_STATE: after the start. */
+ANOLE_API anole_status anole_jobs_work(anole_jobs *j, anole_consumer *c, const anole_jobs_work_options *o,
+                                       uint64_t user_data, anole_job_worker *out);
+/* No more jobs for this worker (jobs handed to it later go back after a
+   second); jobs out still finish; then ANOLE_EV_JOB_WORKER_END. ANOLE_OK on one
+   that is over. */
+ANOLE_API anole_status anole_jobs_stop(anole_job_worker w);
+
+enum { ANOLE_JOB_DONE = 0, ANOLE_JOB_RETRY = 1, ANOLE_JOB_SNOOZE = 2, ANOLE_JOB_DISCARD = 3 };
+/* Ends the job's run. DONE: completed. RETRY: a failed attempt (`error` stored;
+   delay_ms 0: the kind's backoff); dead after the last. SNOOZE: run again after
+   delay_ms, the attempt not counted. DISCARD: dead now (`error` = the reason).
+   Returns at once; the store write follows (if it fails, the job runs again after
+   its lease: at-least-once). ANOLE_E_GONE: the job is over (canceled, timed out,
+   lease lost); ANOLE_E_INVALID: outcome, delay. */
+ANOLE_API anole_status anole_job_finish(anole_job job, uint32_t outcome, uint32_t delay_ms, anole_str error);
+/* Completes the job inside `tx` (the jobs store's database): a call on the
+   transaction, answered as ANOLE_EV_DB_RESULT (changes 1: it still held the
+   job) with user_data. The handle ends now; if the transaction rolls back, the
+   job runs again after its lease. */
+ANOLE_API anole_status anole_job_complete_in(anole_job job, anole_db_tx tx, uint64_t user_data);
+
+/* One JSON request, answered by ANOLE_EV_JOBS_RESULT with the JSON answer.
+   Operations (the "op" key): "jobs.get" {id}, "jobs.list" {state, queue, kind,
+   limit, before}, "jobs.counts", "jobs.retry" {id}, "jobs.cancel" {id},
+   "jobs.delete" {id}, "cron.list", "cron.trigger" {name}; and "webhooks.*" when
+   the configuration has webhooks. The shapes are the admin routes'. */
+ANOLE_API anole_status anole_jobs_admin(anole_jobs *j, anole_consumer *c, anole_str request_json, uint64_t user_data);
+
+/* ANOLE_EV_JOB_ENQUEUED */
+typedef struct anole_job_enqueued_entry { int64_t id; uint32_t inserted; uint32_t reserved; } anole_job_enqueued_entry; /* 16 bytes */
+typedef struct anole_job_enqueued_event {
+  anole_event ev;          /* handle 0 */
+  uint64_t user_data;
+  int32_t status;          /* ANOLE_OK; ANOLE_E_DB; ANOLE_E_TIMEOUT; ANOLE_E_GONE */
+  uint16_t http_status;
+  uint8_t error_class;     /* ANOLE_DB_ERR_* */
+  uint8_t reserved;
+  uint32_t entries_off;    /* nentries anole_job_enqueued_entry (0 on failure) */
+  uint32_t nentries;
+  anole_span error;
+  anole_span error_code;
+} anole_job_enqueued_event; /* 56 bytes */
+
+/* ANOLE_EV_JOB */
+typedef struct anole_job_event {
+  anole_event ev;          /* the anole_job */
+  uint64_t user_data;      /* the worker's */
+  uint64_t worker;
+  int64_t id;
+  anole_span kind;
+  anole_span queue;
+  anole_span args;         /* JSON */
+  anole_span meta;         /* JSON object */
+  anole_span errors;       /* JSON array of earlier attempts' {attempt, at, error, message} */
+  int64_t run_at_ms;
+  int64_t created_at_ms;
+  int64_t timeout_us;      /* the run's time limit; -1: none */
+  uint16_t attempt;        /* 1 on the first run */
+  uint16_t max_attempts;
+  uint8_t priority;        /* ANOLE_JOB_PRIORITY_CRITICAL..LOW */
+  uint8_t reserved8;
+  uint16_t reserved16;
+  anole_span cron;         /* the schedule's name, empty when none */
+  anole_span traceparent;  /* of the request that enqueued it, or empty */
+} anole_job_event;         /* 128 bytes */
+
+/* ANOLE_EV_JOB_CANCEL reasons */
+enum { ANOLE_JOB_CANCEL_TIMEOUT = 1, ANOLE_JOB_CANCEL_ADMIN = 2, ANOLE_JOB_CANCEL_LEASE_LOST = 3, ANOLE_JOB_CANCEL_DRAIN = 4 };
+typedef struct anole_job_cancel_event {
+  anole_event ev;          /* the anole_job */
+  uint64_t user_data;
+  int64_t id;
+  uint32_t reason;         /* ANOLE_JOB_CANCEL_*: TIMEOUT stored as a failed attempt; DRAIN put back unnumbered */
+  uint32_t reserved;
+} anole_job_cancel_event;  /* 40 bytes */
+
+/* ANOLE_EV_JOB_WORKER_END reasons */
+enum { ANOLE_JOB_WORKER_STOPPED = 0, ANOLE_JOB_WORKER_DRAINED = 1, ANOLE_JOB_WORKER_FAILED = 2 };
+typedef struct anole_job_worker_end_event {
+  anole_event ev;
+  uint64_t user_data;
+  uint32_t reason;
+  uint32_t reserved;
+  anole_span error;
+} anole_job_worker_end_event; /* 40 bytes */
+
+/* ANOLE_EV_JOBS_RESULT */
+typedef struct anole_jobs_result_event {
+  anole_event ev;
+  uint64_t user_data;
+  int32_t status;          /* ANOLE_OK; ANOLE_E_INVALID (a bad request: error says what); ANOLE_E_DB; ANOLE_E_TIMEOUT */
+  uint16_t http_status;    /* what the admin routes answer: 200, 404, 409, 400, 503... */
+  uint8_t error_class;
+  uint8_t reserved;
+  anole_span json;         /* the answer */
+  anole_span error;
+} anole_jobs_result_event; /* 48 bytes */
 /* ---- end p3/jobs ---- */
 
 /* ---- p3/webhooks ---- */

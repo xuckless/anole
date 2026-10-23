@@ -24,7 +24,14 @@ breaking changes are listed anyway.
   rules written down in docs/cron.md, and `jobs.cron(...)`, which enqueues
   one job per tick across instances.
 - `anole.pg.Client.session`: a connection of its own outside the pools.
-- C ABI: `"jobs"` in the configuration and `anole_jobs_get`.
+- `jobs.enqueueIn`, `enqueueRawIn` and `completeIn` on SQLite transactions,
+  jobs metrics, `traceparent` carried in job meta, and the queue draining when
+  the server does.
+- C ABI: `"jobs"` in the configuration (with native `sql` cron actions),
+  `anole_jobs_get`, `anole_jobs_enqueue` (optionally inside an
+  `anole_db_tx`), `anole_jobs_work` and `anole_jobs_stop`, `anole_job_finish`,
+  `anole_job_complete_in` and `anole_jobs_admin`; events 104-108, handle kinds
+  12 and 13.
 
 ### Changed
 

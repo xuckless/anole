@@ -865,6 +865,29 @@ pub const Config = struct {
         kinds: []const JobKind = &.{},
         keep: struct { completed_ms: u64 = 86_400_000, dead_ms: u64 = 2_592_000_000, cancelled_ms: u64 = 604_800_000 } = .{},
         leader: struct { method: []const u8 = "auto", ttl_ms: u32 = 15_000, renew_ms: u32 = 5000 } = .{},
+        /// How long a server drain lets running jobs finish before they are put back.
+        drain_ms: u32 = 10_000,
+        /// Schedules: each enqueues a job of `kind`, or runs a statement.
+        cron: []const JobCron = &.{},
+    };
+
+    pub const JobCron = struct {
+        name: []const u8,
+        schedule: []const u8,
+        tz: ?[]const u8 = null,
+        /// Exactly one of `kind` and `sql`.
+        kind: ?[]const u8 = null,
+        args: ?std.json.Value = null,
+        sql: ?JobSql = null,
+        /// "once", "skip" or "all".
+        missed: []const u8 = "once",
+        catch_up_ms: u32 = 86_400_000,
+    };
+
+    /// A statement run on a configured database at each tick, with no language involved.
+    pub const JobSql = struct {
+        database: []const u8,
+        statement: []const u8,
     };
 
     pub const JobQueue = struct {

@@ -45,6 +45,9 @@ const Queue = struct {
     signal: placement.Signal = .{},
     /// Kinds with a handler in this process.
     kinds: std.ArrayList([]const u8) = .empty,
+    /// Runs every kind of this queue that has no handler of its own (a
+    /// language worker for "every kind").
+    catch_all: ?Handler = null,
 };
 
 /// What a running job leaves behind for the heartbeat and the drain.
@@ -283,7 +286,7 @@ pub const Client = struct {
         try placement.concurrent(&self.group, self.io, .{ .executor = 0 }, maintenanceTask, .{self});
         try placement.concurrent(&self.group, self.io, .{ .executor = 0 }, heartbeatTask, .{self});
         for (self.queues, 0..) |*q, i| {
-            if (q.kinds.items.len == 0) continue;
+            if (q.kinds.items.len == 0 and q.catch_all == null and self.options.gate == null) continue;
             try placement.concurrent(&self.group, self.io, .{ .executor = i }, fetcherTask, .{ self, q });
         }
     }
@@ -398,26 +401,55 @@ pub const Client = struct {
             .postgres
         else
             @compileError(what ++ " takes the *Tx of anole.pg or anole.sqlite");
-        if (self.backend.tx_kind != kind or self.backend.vt.insertIn == null) {
-            log.warn("jobs: {s} needs a transaction of the jobs store's own database (PostgreSQL or SQLite)", .{what});
-            return error.InvalidJob;
-        }
-        if (@as(?*anyopaque, @ptrCast(tx.db)) != self.backend.owner) {
-            log.warn("jobs: {s}: the transaction is on another database than the jobs store", .{what});
-            return error.InvalidJob;
-        }
+        try self.checkTx(kind, @ptrCast(tx.db), what);
         return @ptrCast(tx);
     }
 
     fn enqueueInWith(self: *Client, tx: anytype, c: anytype, def: Kind, args_json: []const u8, opts: EnqueueOptions) Error!Enqueued {
         const txp = try self.txPointer(tx, "enqueueIn");
         const meta_opts = try self.withTrace(c, opts);
-        const nj = try self.newJob(c.arena, def, args_json, meta_opts);
-        var ctx: anole.db.Ctx = .{ .io = c.io, .arena = c.arena };
-        const r = self.backend.vt.insertIn.?(self.backend.ptr, txp, &ctx, self.now(), nj) catch |e| return self.storeError(c, e);
+        return self.insertInto(txp, c.io, c.arena, def, args_json, meta_opts);
+    }
+
+    fn insertInto(self: *Client, txp: *anyopaque, io: std.Io, arena: std.mem.Allocator, def: Kind, args_json: []const u8, opts: EnqueueOptions) Error!Enqueued {
+        const nj = try self.newJob(arena, def, args_json, opts);
+        var ctx: anole.db.Ctx = .{ .io = io, .arena = arena };
+        const r = self.backend.vt.insertIn.?(self.backend.ptr, txp, &ctx, self.now(), nj) catch |e| {
+            _ = self.storeError(&ctx, e) catch {};
+            return switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Canceled => error.Canceled,
+                else => error.Database,
+            };
+        };
         if (self.metrics) |mm| mm.onEnqueued(nj.queue, def.name, r.inserted);
         if (r.inserted) self.wakeQueue(nj.queue);
         return r;
+    }
+
+    /// For the C ABI: `enqueueRawIn` on a transaction known only by its
+    /// connector's kind and the erased `*Tx`. `owner` is the transaction's
+    /// `db` client.
+    pub fn enqueueRawInto(self: *Client, tx_kind: store.TxKind, txp: *anyopaque, owner: ?*anyopaque, ctx: *anole.db.Ctx, kind: []const u8, args_json: []const u8, opts: EnqueueOptions) Error!Enqueued {
+        try self.checkTx(tx_kind, owner, "enqueueIn");
+        return self.insertInto(txp, ctx.io, ctx.arena, self.kindDefaults(kind), args_json, opts);
+    }
+
+    /// For the C ABI: `completeIn` by job id and attempt.
+    pub fn completeInto(self: *Client, tx_kind: store.TxKind, txp: *anyopaque, owner: ?*anyopaque, ctx: *anole.db.Ctx, id: Id, attempt: u16) Error!bool {
+        try self.checkTx(tx_kind, owner, "completeIn");
+        return self.backend.vt.finishIn.?(self.backend.ptr, txp, ctx, .{ .id = id, .attempt = attempt, .to = .completed, .finished_at = self.now() }) catch |e| return self.storeError(ctx, e);
+    }
+
+    fn checkTx(self: *Client, tx_kind: store.TxKind, owner: ?*anyopaque, what: []const u8) Error!void {
+        if (self.backend.tx_kind != tx_kind or self.backend.vt.insertIn == null) {
+            log.warn("jobs: {s} needs a transaction of the jobs store's own database (PostgreSQL or SQLite)", .{what});
+            return error.InvalidJob;
+        }
+        if (owner != self.backend.owner) {
+            log.warn("jobs: {s}: the transaction is on another database than the jobs store", .{what});
+            return error.InvalidJob;
+        }
     }
 
     /// `opts` with the caller's `traceparent` added to its meta: a traced
@@ -455,6 +487,11 @@ pub const Client = struct {
         return out;
     }
     pub const Item = struct { kind: []const u8, args_json: []const u8, opts: EnqueueOptions = .{} };
+
+    /// The defaults a kind name gets (`Options.kinds`, a handler's).
+    pub fn kindDefaultsPublic(self: *Client, name: []const u8) Kind {
+        return self.kindDefaults(name);
+    }
 
     fn kindDefaults(self: *Client, name: []const u8) Kind {
         for (self.handlers.items) |h| if (std.mem.eql(u8, h.kind.name, name)) return h.kind;
@@ -567,7 +604,7 @@ pub const Client = struct {
 
     /// For code that has no server (tests, the C ABI): a handler with its own state.
     pub fn addHandler(self: *Client, kind: Kind, state: ?*anyopaque, run: *const fn (?*anyopaque, *Job) anyerror!void) !void {
-        if (self.started) {
+        if (!self.registrable()) {
             log.err("jobs: register handlers before serving starts (kind \"{s}\")", .{kind.name});
             return error.InvalidOptions;
         }
@@ -580,11 +617,45 @@ pub const Client = struct {
             return error.InvalidOptions;
         };
         try self.handlers.append(self.gpa, .{ .kind = kind, .state = state, .run = run });
+        // Added after `start` (behind a gate): the fetcher's filter learns it.
+        if (self.started) try self.queues[self.queueIndex(kind.queue).?].kinds.append(self.gpa, self.handlers.items[self.handlers.items.len - 1].kind.name);
     }
 
     fn handlerFor(self: *Client, kind: []const u8) ?*const Handler {
         for (self.handlers.items) |*h| if (std.mem.eql(u8, h.kind.name, kind)) return h;
         return null;
+    }
+
+    /// The handler for a claimed job: its kind's, else its queue's catch-all.
+    fn handlerOf(self: *Client, row: store.Row) ?*const Handler {
+        if (self.handlerFor(row.kind)) |h| return h;
+        if (self.queueIndex(row.queue)) |qi| if (self.queues[qi].catch_all != null) return &self.queues[qi].catch_all.?;
+        return null;
+    }
+
+    /// Runs every kind of `queue` that has no handler of its own with `run`.
+    pub fn addCatchAll(self: *Client, queue: []const u8, state: ?*anyopaque, run: *const fn (?*anyopaque, *Job) anyerror!void) !void {
+        if (!self.registrable()) return error.InvalidOptions;
+        const qi = self.queueIndex(queue) orelse return error.InvalidOptions;
+        if (self.queues[qi].catch_all != null) return error.InvalidOptions;
+        self.queues[qi].catch_all = .{ .kind = .{ .name = "*", .queue = self.queues[qi].name }, .state = state, .run = run };
+    }
+
+    /// Handlers may still be added: not started, or started behind a gate that has not opened.
+    fn registrable(self: *Client) bool {
+        if (!self.started) return true;
+        const g = self.options.gate orelse return false;
+        return !g.is_open(g.context);
+    }
+
+    fn gated(self: *Client) bool {
+        const g = self.options.gate orelse return false;
+        return !g.is_open(g.context);
+    }
+
+    /// Whether a handler (of this kind, or its queue's catch-all) exists.
+    pub fn hasHandler(self: *Client, kind: []const u8) bool {
+        return self.handlerFor(kind) != null;
     }
 
     // ---- running one job
@@ -596,8 +667,8 @@ pub const Client = struct {
         const row = box.row;
         const a = box.arena_state.allocator();
         box.started = .now(self.io, .awake);
-        const h = self.handlerFor(row.kind);
-        const def: Kind = if (h) |hh| hh.kind else self.kindDefaults(row.kind);
+        const h = self.handlerOf(row);
+        const def: Kind = if (self.handlerFor(row.kind)) |hh| hh.kind else self.kindDefaults(row.kind);
         var id_buf: [32]u8 = undefined;
         const id_text = a.dupe(u8, std.fmt.bufPrint(&id_buf, "job-{d}", .{row.id}) catch "job") catch "job";
         box.job = .{
@@ -618,6 +689,9 @@ pub const Client = struct {
             .client = self,
         };
         box.job.cron_name = cronNameOf(a, row.meta_json);
+        box.job.lost_flag = &box.lost;
+        box.job.interrupted_flag = &box.interrupted;
+        box.job.timeout_ms = row.timeout_ms;
         const job = &box.job;
         log.debug("{s} {s} started (attempt {d} of {d})", .{ id_text, row.kind, row.attempt, row.max_attempts });
 
@@ -766,6 +840,10 @@ pub const Client = struct {
 
     fn fetcherTask(self: *Client, q: *Queue) std.Io.Cancelable!void {
         while (!self.draining.load(.acquire)) {
+            if (self.gated() or (q.kinds.items.len == 0 and q.catch_all == null)) {
+                try self.waitSignal(&q.signal, self.options.poll_interval);
+                continue;
+            }
             const running = q.running.load(.acquire);
             const free = if (q.concurrency > running) q.concurrency - running else 0;
             var got: usize = 0;
@@ -774,7 +852,7 @@ pub const Client = struct {
                 defer arena.deinit();
                 const rows = self.backend.vt.claim(self.backend.ptr, arena.allocator(), .{
                     .queue = q.name,
-                    .kinds = q.kinds.items,
+                    .kinds = if (q.catch_all != null) null else q.kinds.items,
                     .limit = @min(free, 100),
                     .now = self.now(),
                     .lease_until = after(self.now(), self.options.lease),
@@ -868,6 +946,9 @@ pub const Client = struct {
         for (held) |h| {
             if (std.mem.indexOfScalar(Id, alive, h.id) != null) continue;
             const b = self.held.get(h.id) orelse continue;
+            if (self.backend.vt.get(self.backend.ptr, a, h.id) catch null) |row| {
+                if (row.state == .cancelled) b.job.admin_cancelled.store(true, .release);
+            }
             b.lost.store(true, .release);
             if (b.task) |t| placement.cancelTask(t);
         }
@@ -1122,12 +1203,12 @@ pub const Client = struct {
         while (again) {
             again = false;
             for (self.queues) |*q| {
-                if (q.kinds.items.len == 0) continue;
+                if (q.kinds.items.len == 0 and q.catch_all == null) continue;
                 var arena: std.heap.ArenaAllocator = .init(self.gpa);
                 defer arena.deinit();
                 const rows = self.backend.vt.claim(self.backend.ptr, arena.allocator(), .{
                     .queue = q.name,
-                    .kinds = q.kinds.items,
+                    .kinds = if (q.catch_all != null) null else q.kinds.items,
                     .limit = 100,
                     .now = self.now(),
                     .lease_until = after(self.now(), self.options.lease),

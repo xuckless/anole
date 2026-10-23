@@ -1391,6 +1391,71 @@ its place in `"brokers"` (what `anole_broker_status_event.broker` names).
 The consumer reads none, gzip, zstd, lz4 and snappy batches. Transactions,
 the KIP-848 protocol and the admin API are not part of the ABI.
 
+## Jobs
+
+Durable background jobs (`-Djobs`, ABI 0.10): `"jobs"` in the configuration
+names the store, the queues and the kinds; a consumer enqueues, and workers
+in the consumer's language run the jobs.
+
+```json
+"jobs": {
+  "store": "main",                       // a databases[].name (SQLite, PostgreSQL, Redis) or "memory"
+  "queues": [ { "name": "default", "concurrency": 10 }, { "name": "mail", "concurrency": 4 } ],
+  "lease_ms": 30000, "poll_ms": 1000, "migrate": true, "notify": true,
+  "table_prefix": "anole_", "key_prefix": "anole:",
+  "kinds": [ { "name": "email.welcome", "queue": "mail", "attempts": 8, "timeout_ms": 60000 } ],
+  "keep": { "completed_ms": 86400000, "dead_ms": 2592000000, "cancelled_ms": 604800000 },
+  "leader": { "method": "auto", "ttl_ms": 15000, "renew_ms": 5000 },
+  "drain_ms": 10000,
+  "cron": [
+    { "name": "nightly", "schedule": "0 3 * * *", "tz": "Europe/Berlin", "kind": "report.nightly", "args": {} },
+    { "name": "sweep", "schedule": "*/10 * * * *", "sql": { "database": "main", "statement": "DELETE FROM sessions WHERE expires_at < unixepoch()" } }
+  ]
+}
+```
+
+`anole_jobs_get` gives the `anole_jobs *` (`ANOLE_E_UNSUPPORTED` without
+`"jobs"`). A job runs at least once; `anole.jobs`' leases, heartbeats,
+timeouts, retries with backoff and the drain apply as they do for Zig
+handlers (docs/jobs.md). A `"sql"` schedule runs its statement on the named
+database with no language involved.
+
+**Enqueue.** `anole_jobs_enqueue` copies 1 to 1000 `anole_job_out` records
+and returns at once; `ANOLE_EV_JOB_ENQUEUED` answers with an
+`anole_job_enqueued_entry` (`id`, `inserted`) per job, in order. The jobs are
+inserted one after the other: use a transaction for all-or-nothing. With
+`opts.tx` (an `anole_db_tx` on the jobs store's database, SQLite or
+PostgreSQL) the inserts are calls on that transaction, in order with its
+others, and commit with it; the answer is then the transaction's
+`ANOLE_EV_DB_RESULT`, a table with the columns `id` and `inserted`. Unique
+jobs (`ANOLE_JOB_F_UNIQUE`, `unique_key`, `unique_period_ms`,
+`unique_scope`) answer the existing job's id with `inserted` 0. A request's
+`traceparent` is not carried (the ABI has no request context to read it from).
+
+**Workers.** `anole_jobs_work` (before the server starts) registers a worker
+for a queue and some kinds (none: every kind of the queue); no two workers
+run one kind. Each job it gets is an `ANOLE_EV_JOB` to the consumer with its
+own `anole_job` handle, at most `concurrency` out at once, owed one
+`anole_job_finish` (`ANOLE_JOB_DONE`, `_RETRY` with the error text and an
+optional delay, `_SNOOZE` to run again later without counting the attempt,
+`_DISCARD`) or `anole_job_complete_in` (the job completes inside a
+transaction of the jobs store's database; if that rolls back, the job runs
+again after its lease). `anole_handle_release` on a job is a retry now. The
+queue's lease, heartbeat and timeout run on Anole's threads: when one ends a
+run, `ANOLE_EV_JOB_CANCEL` says why (`ANOLE_JOB_CANCEL_TIMEOUT`, `_ADMIN`,
+`_LEASE_LOST`, `_DRAIN`) and the handle is over (`anole_job_finish` answers
+`ANOLE_E_GONE`). `anole_jobs_stop` ends a worker once its jobs are over
+(`ANOLE_EV_JOB_WORKER_END`; jobs it is handed meanwhile go back after a
+second); `anole_server_drain` stops them all (`ANOLE_JOB_WORKER_DRAINED`).
+
+**Admin.** `anole_jobs_admin` takes one JSON request and answers with
+`ANOLE_EV_JOBS_RESULT`, whose `json` is the answer and `http_status` what the
+admin routes would send. Operations (`"op"`): `jobs.get` and `jobs.retry`,
+`jobs.cancel`, `jobs.delete` (`{"id": 7}`), `jobs.list` (`state`, `queue`,
+`kind`, `limit`, `before`), `jobs.counts`, `cron.list`, `cron.trigger`
+(`{"name": ...}`), and the `webhooks.*` operations when the configuration has
+webhooks.
+
 ## gRPC
 
 A `"grpc"` section serves gRPC services whose methods the consumer

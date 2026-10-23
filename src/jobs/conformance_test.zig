@@ -445,6 +445,46 @@ fn Suite(comptime B: Backend) type {
             try std.testing.expectError(error.InvalidJob, fx.client.enqueueIn(&tx, &fx.ctx, Typed{ .n = 1 }, .{}));
         }
 
+        var child_id: root.Id = 0;
+        fn parentHandler(_: ?*anyopaque, job: *root.Job) anyerror!void {
+            const r = try job.client.enqueueRaw(job, "t.child", "{}", .{});
+            child_id = r.id;
+        }
+
+        test "jobs: a job enqueued from a job carries the traceparent of its parent" {
+            var fx: Fx = undefined;
+            Probe.reset();
+            try fx.init(&.{.{ .name = "default" }});
+            defer fx.deinit();
+            try fx.client.addHandler(plain, null, parentHandler);
+            try fx.client.start(null, null, null);
+            const tp = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+            _ = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{}", .{ .meta = "{\"traceparent\":\"" ++ tp ++ "\"}" });
+            _ = try fx.client.step(&fx.ctx);
+            const child = (try fx.client.get(&fx.ctx, child_id)).?;
+            try std.testing.expectEqualStrings(tp, child.meta.object.get("traceparent").?.string);
+        }
+
+        test "jobs: the series are rendered" {
+            var fx: Fx = undefined;
+            try setup(&fx);
+            defer fx.deinit();
+            var registry = anole.observe.metrics.Registry.init(std.testing.allocator, std.testing.io);
+            defer registry.deinit();
+            // `setup` started the client; a second client with a registry shows the series.
+            const c2 = try root.Client.init(std.testing.allocator, std.testing.io, .{ .store = .memory, .run = .manual });
+            defer c2.deinit();
+            try c2.addHandler(plain, null, Probe.run);
+            try c2.start(&registry, null, null);
+            _ = try c2.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":1}", .{});
+            _ = try c2.step(&fx.ctx);
+            var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer out.deinit();
+            try registry.render(&out.writer);
+            try std.testing.expect(std.mem.indexOf(u8, out.written(), "anole_jobs_enqueued_total{queue=\"default\",kind=\"t.plain\"} 1") != null);
+            try std.testing.expect(std.mem.indexOf(u8, out.written(), "anole_jobs_finished_total{queue=\"default\",kind=\"t.plain\",outcome=\"completed\"} 1") != null);
+        }
+
         var bg_event: std.Io.Event = .unset;
         fn bgRun(_: ?*anyopaque, job: *root.Job) anyerror!void {
             _ = job;

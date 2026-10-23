@@ -471,6 +471,44 @@ pub const kafka_options = [_]Entry{
 // ---- end p3/net ----
 
 // ---- p3/jobs ----
+/// `anole.jobs.Options` against `jobs`.
+pub const jobs_options = [_]Entry{
+    .{ .zig = "store", .json = "jobs.store", .kind = .custom, .note = "a databases[].name (SQLite, PostgreSQL or Redis), or \"memory\"" },
+    .{ .zig = "queues", .json = "jobs.queues", .kind = .custom, .note = "name and concurrency, as in Zig" },
+    .{ .zig = "run", .omitted = "the ABI always runs workers for the consumer's kinds (enqueue only under deployment lambda)" },
+    .{ .zig = "lease", .json = "jobs.lease_ms", .kind = .ms },
+    .{ .zig = "poll_interval", .json = "jobs.poll_ms", .kind = .ms },
+    .{ .zig = "keep", .json = "jobs.keep", .kind = .custom, .note = "completed_ms, dead_ms, cancelled_ms" },
+    .{ .zig = "table_prefix", .json = "jobs.table_prefix" },
+    .{ .zig = "key_prefix", .json = "jobs.key_prefix" },
+    .{ .zig = "migrate", .json = "jobs.migrate" },
+    .{ .zig = "notify", .json = "jobs.notify" },
+    .{ .zig = "leader", .json = "jobs.leader", .kind = .custom, .note = "method \"auto\"|\"advisory_lock\"|\"lease_row\", ttl_ms, renew_ms" },
+    .{ .zig = "clock", .omitted = "tests / Zig only" },
+    .{ .zig = "gate", .omitted = "the ABI's own: workers claim once the server runs" },
+    .{ .zig = "name", .omitted = "Anole names the process (hostname and pid)" },
+    .{ .zig = "kinds", .json = "jobs.kinds", .kind = .custom, .note = "name, queue, priority, attempts, timeout_ms" },
+    .{ .zig = "drain_timeout", .json = "jobs.drain_ms", .kind = .ms },
+    .{ .zig = "on_dead", .omitted = "Zig only; the admin ops list dead jobs" },
+};
+
+/// `anole.jobs.Kind` against `jobs.kinds[]`.
+pub const jobs_kind = [_]Entry{
+    .{ .zig = "name", .json = "jobs.kinds[].name" },
+    .{ .zig = "queue", .json = "jobs.kinds[].queue" },
+    .{ .zig = "priority", .json = "jobs.kinds[].priority", .kind = .custom, .note = "\"critical\"|\"high\"|\"normal\"|\"low\"" },
+    .{ .zig = "attempts", .json = "jobs.kinds[].attempts" },
+    .{ .zig = "backoff", .omitted = "the ABI's kinds use the default backoff (15 s doubling to 6 h, equal jitter); a worker's RETRY may name a delay" },
+    .{ .zig = "timeout", .json = "jobs.kinds[].timeout_ms", .kind = .ms },
+};
+
+/// `anole.jobs.CronOptions` against `jobs.cron[]`.
+pub const jobs_cron = [_]Entry{
+    .{ .zig = "tz", .json = "jobs.cron[].tz" },
+    .{ .zig = "missed", .json = "jobs.cron[].missed", .kind = .custom, .note = "\"once\"|\"skip\"|\"all\"" },
+    .{ .zig = "catch_up", .json = "jobs.cron[].catch_up_ms", .kind = .ms },
+    .{ .zig = "job", .omitted = "the schedule's job takes its kind's defaults" },
+};
 // ---- end p3/jobs ----
 
 // ---- p3/webhooks ----
