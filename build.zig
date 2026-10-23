@@ -496,6 +496,19 @@ pub fn build(b: *std.Build) void {
     // compile-tests: build the test binaries without running them.
     const compile_tests_step = b.step("compile-tests", "Compile the test binaries without running them");
     compile_tests_step.dependOn(&tests.step);
+    // The validator's and the logger's own tests: each is its own module
+    // (no imports), so the anole test binary does not collect them.
+    for ([_]struct { name: []const u8, mod: *std.Build.Module }{
+        .{ .name = "validate-test", .mod = core.validate },
+        .{ .name = "log-test", .mod = core.anole_log },
+    }) |t| {
+        const sub_tests = b.addTest(.{ .name = t.name, .root_module = t.mod, .use_llvm = use_llvm });
+        const run_sub = b.addRunArtifact(sub_tests);
+        run_sub.skip_foreign_checks = true;
+        test_step.dependOn(&run_sub.step);
+        compile_tests_step.dependOn(&sub_tests.step);
+        b.step(t.name, "Run the tests of the module alone").dependOn(&run_sub.step);
+    }
 
     // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
     // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
@@ -1433,6 +1446,12 @@ const Core = struct {
     /// src/resilience/core.zig (retries, breakers): imported as
     /// `resilience_core` by every HTTP core instance and by anole.
     resilience: *std.Build.Module,
+    /// src/validate (the validator, no imports): `validate` in the HTTP core
+    /// (`req.bind`) and in anole.
+    validate: *std.Build.Module,
+    /// src/logging (the JSON Lines logger, no imports): `anole_log` in the
+    /// HTTP core (`req.log()`) and in anole.
+    anole_log: *std.Build.Module,
 
     fn init(b: *std.Build, c_mods: CModules, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Core {
         // Pinned by default (zio's own default is work stealing), so a
@@ -1449,7 +1468,9 @@ const Core = struct {
             .imports = &.{.{ .name = "anole_boringssl_c", .module = bssl }},
         }) else null;
         const resilience = b.createModule(.{ .root_source_file = b.path("src/resilience/core.zig"), .target = target, .optimize = optimize });
-        var core: Core = .{ .resilience = resilience, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
+        const validate = b.createModule(.{ .root_source_file = b.path("src/validate/root.zig"), .target = target, .optimize = optimize });
+        const anole_log = b.createModule(.{ .root_source_file = b.path("src/logging/root.zig"), .target = target, .optimize = optimize });
+        var core: Core = .{ .resilience = resilience, .validate = validate, .anole_log = anole_log, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
@@ -1471,6 +1492,8 @@ const Core = struct {
                             optimize,
                         );
                         dusty_mod.addImport("resilience_core", resilience);
+                        dusty_mod.addImport("validate", validate);
+                        dusty_mod.addImport("anole_log", anole_log);
                         core.dusty_by[@intFromBool(tls)][@intFromBool(http2)][@intFromBool(compression)][@intFromBool(brotli)] = dusty_mod;
                         if (http2) core.h2_client_by[@intFromBool(tls)][1][@intFromBool(compression)][@intFromBool(brotli)] = h2ClientModule(
                             b,
@@ -1826,6 +1849,8 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addImport("zio", o.core.zio);
     mod.addImport("dusty", o.core.dusty(f));
     mod.addImport("resilience_core", o.core.resilience);
+    mod.addImport("validate", o.core.validate);
+    mod.addImport("anole_log", o.core.anole_log);
     if (f.http2) {
         mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
         mod.addImport("anole_h2_client", o.core.h2Client(f));
