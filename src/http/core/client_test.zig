@@ -2520,11 +2520,13 @@ test "client breaker: refused connects open it and the next fetch fails CircuitO
     var buf: [64]u8 = undefined;
     const url = try flakyUrl(&buf, port);
 
-    for (0..3) |_| try std.testing.expect(std.meta.isError(client.fetch(url, .{})));
-    const dials = client.dials.load(.monotonic);
-    try std.testing.expect(dials >= 3);
+    // Each refused connect is a breaker failure (design R9). `dials`
+    // counts connections opened, so refused ones leave it at 0.
+    for (0..3) |_| try std.testing.expectError(error.ConnectionRefused, client.fetch(url, .{}));
+    try std.testing.expectEqual(@as(u64, 0), client.dials.load(.monotonic));
+    // Open: the next fetch fails before any connect is tried.
     try std.testing.expectError(error.CircuitOpen, client.fetch(url, .{}));
-    try std.testing.expectEqual(dials, client.dials.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), client.dials.load(.monotonic));
 }
 
 test "client breaker: 404 answers never open it" {
