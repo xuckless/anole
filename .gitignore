@@ -42,3 +42,4 @@ __pycache__/
 *.actual.json
 
 SECURITY_REVIEW.md
+PERFORMANCE_AUDIT.md

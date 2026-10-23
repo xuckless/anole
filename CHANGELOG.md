@@ -146,6 +146,9 @@ breaking changes are listed anyway.
 - HTTP/3: while a request is open, QUIC PINGs keep the connection alive.
   Long-lived responses (gRPC streams, SSE, WebSocket and WebTransport over
   HTTP/3) no longer end at the 30 s idle timeout; idle connections still do.
+  On the client this builds on 0.3.1's `ConnectOptions.keep_alive` (one
+  mechanism): the PING comes after `keep_alive` or half the idle timeout,
+  whichever is shorter.
 - HTTP/3: gRPC and Connect streaming responses may hold 1 MiB unacknowledged
   per stream (was 64 KiB).
 - `anole.grpc` client: a stream reset maps to the status gRPC specifies for
@@ -170,6 +173,8 @@ breaking changes are listed anyway.
   (-13); events 96-126 and handle kinds 10-16 as listed above
   (docs/c-abi.md, "From ABI 0.9").
 
+## 0.3.1 (2026-10-23)
+
 ### Fixed
 
 - HTTP/3 client: a download could stall after a NAT rebinding moved the
@@ -177,9 +182,12 @@ breaking changes are listed anyway.
   sending to the old port and never heard from the new one) until the
   request timed out (#98). A new `ConnectOptions.keep_alive` (5 s, null for
   none) sends a PING after that long without traffic while a stream is
-  open, so the server sees the new address and follows it. It is the same
-  keep-alive that keeps quiet requests alive (above): the PING comes after
-  `keep_alive` or half the idle timeout, whichever is shorter.
+  open, so the server sees the new address and follows it.
+- Windows (development target): the CI job is green again. The console's
+  terminal-side tests are skipped on Windows (the console comes to Windows
+  later; one of them spun forever on the stub clock), its golden files keep
+  LF line endings on Windows checkouts, and an HTTP/2 stream-reset test waits
+  for its handler to start instead of sleeping 100 ms.
 
 ## 0.3.0 (2026-10-23)
 
