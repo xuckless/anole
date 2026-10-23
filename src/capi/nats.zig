@@ -627,6 +627,7 @@ fn pickExec(b: *Broker, c: ?*Consumer, req: u64) CallError!*Exec {
 
 /// `anole_nats_request`.
 pub fn request(b: *Broker, c: ?*Consumer, m: abi.NatsOut, opts: abi.NatsRequestOptions, user_data: u64) CallError!void {
+    if (comptime !features.nats) return error.Unsupported;
     try checkOpen(b);
     if (opts.flags & ~abi.NATS_F_RETRY != 0) return error.Invalid;
     const x = try pickExec(b, c, opts.req);
