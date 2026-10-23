@@ -949,6 +949,42 @@
         }
       ]
     },
+    "anole_ws_accept_options": {
+      "size": 48,
+      "align": 8,
+      "fields": [
+        {
+          "name": "size",
+          "offset": 0,
+          "type": "usize"
+        },
+        {
+          "name": "flags",
+          "offset": 8,
+          "type": "u32"
+        },
+        {
+          "name": "reserved",
+          "offset": 12,
+          "type": "u32"
+        },
+        {
+          "name": "subprotocol",
+          "offset": 16,
+          "type": "anole_str"
+        },
+        {
+          "name": "headers",
+          "offset": 32,
+          "type": "ptr"
+        },
+        {
+          "name": "nheaders",
+          "offset": 40,
+          "type": "usize"
+        }
+      ]
+    },
     "anole_grpc_call_event": {
       "size": 104,
       "align": 8,

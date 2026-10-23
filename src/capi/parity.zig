@@ -317,3 +317,19 @@ pub const server_options = [_]Entry{
     .{ .zig = "blocking", .omitted = "the ABI starts a pool when SQLite is configured; WSGI runs on anole-py's own threads" },
     .{ .zig = "client", .omitted = "no outbound client in the ABI v0" },
 };
+
+// ---------------------------------------------------------------------------
+// WebSocket routes
+
+/// `anole.websocket.UpgradeOptions` against `routes[].websocket`.
+pub const websocket_options = [_]Entry{
+    .{ .zig = "allowed_origins", .json = "routes[].websocket.origins", .kind = .custom, .note = "a list of origins; \"*\" for any; left out: the request's own host" },
+    .{ .zig = "max_message_size", .omitted = "limits.ws_max_message applies to every socket" },
+    .{ .zig = "timeout", .omitted = "sockets under the ABI have no deadline of their own: `anole_ws_close` ends one" },
+    .{ .zig = "compression", .json = "routes[].websocket.compression", .kind = .custom, .note = "on by default where -Dcompression is built in" },
+    .{ .zig = "deflate", .omitted = "permessage-deflate runs on its defaults" },
+    .{ .zig = "close_on_drain", .json = "routes[].websocket.close_on_drain" },
+    .{ .zig = "drain_reason", .omitted = "the drain's close carries the default reason" },
+    .{ .zig = "subprotocols", .json = "routes[].websocket.subprotocols", .note = "\"accept\": \"auto\" only; with \"consumer\" the application picks in anole_ws_accept" },
+    .{ .zig = "headers", .omitted = "Zig only: the consumer passes headers per accept (anole_ws_accept_options.headers)" },
+};

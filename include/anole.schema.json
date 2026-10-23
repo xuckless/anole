@@ -1186,7 +1186,7 @@
               "type": "integer",
               "minimum": 0,
               "maximum": 4294967295,
-              "description": "This route's request deadline (handler routes; at most 16 distinct values per server)."
+              "description": "This route's request deadline (handler routes, and websocket routes with \"accept\": \"consumer\": the decision's; at most 16 distinct values per server)."
             },
             {
               "type": "null"
@@ -1219,7 +1219,7 @@
       "required": [
         "path"
       ],
-      "description": "Exactly one of handler, respond, static, websocket, webtransport."
+      "description": "Exactly one of handler, respond, static, websocket, webtransport; handler and a websocket with \"accept\": \"consumer\" may go together."
     },
     "Fixed": {
       "type": "object",
@@ -1304,6 +1304,22 @@
           "minimum": 0,
           "maximum": 4294967295,
           "description": "The consumer's route id for this endpoint's events."
+        },
+        "accept": {
+          "enum": [
+            "auto",
+            "consumer"
+          ],
+          "default": "auto",
+          "description": "Who answers the handshake: \"auto\" (Anole: origins and subprotocols; the consumer hears ANOLE_EV_WS_OPEN) or \"consumer\" (ANOLE_EV_WS_UPGRADE, answered with anole_ws_accept or refused like any request). With \"consumer\" the route may also carry \"handler\": plain requests of the path go to it."
+        },
+        "subprotocols": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "\"auto\" only: the subprotocols this endpoint speaks, most preferred first; the first the client offered is selected and echoed (ANOLE_EV_WS_OPEN says which)."
         },
         "compression": {
           "type": "boolean",

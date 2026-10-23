@@ -32,3 +32,16 @@ test "parity: shutdown drains for 10 s by default, in Zig and in the JSON" {
     const cfg = try config.parse(arena.allocator(), "{}", &why);
     try std.testing.expectEqual(@as(?u32, 10_000), cfg.timeouts.shutdown_ms);
 }
+
+comptime {
+    if (anole.features.websocket) parity.checkCoverage(anole.websocket.UpgradeOptions, &parity.websocket_options);
+}
+
+test "parity: every WebSocket UpgradeOptions leaf has a C ABI key or a reason, and the keys are in the schema" {
+    if (comptime !anole.features.websocket) return error.SkipZigTest;
+    const text = @import("anole_capi_schema").text;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{});
+    try parity.checkSchemaAndDefaults(anole.websocket.UpgradeOptions, config.Config, &parity.websocket_options, root);
+}
