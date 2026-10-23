@@ -312,6 +312,13 @@ pub const ServerConfig = struct {
         /// 6.5 MB/s at 10 ms), while one that never reads holds only
         /// `stream_window`. No larger than `stream_window`: stays as is.
         stream_window_reading: u31 = 1024 * 1024,
+        /// The window (and body buffer) of a tunnel stream, an RFC 8441
+        /// extended CONNECT such as a WebSocket, from its first DATA: one
+        /// fixed window, with no raise to `stream_window_reading`. 128 KiB
+        /// holds a keyframe and at a 10 ms round trip is 12.8 MB/s per
+        /// socket, 25 times a 4 Mbit/s stream. Raise it for bulk uploads over
+        /// long round trips; each tunnel holds this much while it lives.
+        tunnel_window: u31 = 128 * 1024,
         /// The most memory the raised windows (`stream_window_reading`) of
         /// one connection's streams take at once: 16 streams reading at
         /// the default. A stream whose handler reads past it keeps

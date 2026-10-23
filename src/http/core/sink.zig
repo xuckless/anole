@@ -47,6 +47,10 @@ pub const Sink = struct {
         /// there is no body) without a body writer or queue. `parts` and
         /// what they point to stay valid until the request's arena is
         /// reset; the slice itself does not, so copy it.
+        appendParts: ?*const fn (ptr: *anyopaque, parts: []const []const u8, max_pending: usize, kick: bool) std.Io.Writer.Error!void = null,
+        /// With `appendParts`: tells the engine about the bytes appended
+        /// without a kick, once a run of them is in.
+        kickOut: ?*const fn (ptr: *anyopaque) void = null,
         complete: ?*const fn (ptr: *anyopaque, status: http.Status, headers: *const http.Headers, content_length: ?usize, parts: []const []const u8, trailers: ?*const http.Headers) std.Io.Writer.Error!void = null,
     };
 
@@ -67,6 +71,20 @@ pub const Sink = struct {
     }
     pub fn peerGone(self: Sink) bool {
         return self.vtable.peerGone(self.ptr);
+    }
+    /// Whether the sink takes a response body as parts appended to a queue
+    /// of its own (`appendParts`): an HTTP/2 tunnel's.
+    pub fn canAppend(self: Sink) bool {
+        return self.vtable.appendParts != null;
+    }
+    /// Appends `parts` to the body (one copy), waiting while more than
+    /// `max_pending` bytes are queued. `kick` false leaves the engine
+    /// unwoken until `kickOut`.
+    pub fn appendParts(self: Sink, parts: []const []const u8, max_pending: usize, kick: bool) std.Io.Writer.Error!void {
+        return self.vtable.appendParts.?(self.ptr, parts, max_pending, kick);
+    }
+    pub fn kickOut(self: Sink) void {
+        if (self.vtable.kickOut) |f| f(self.ptr);
     }
     pub fn canComplete(self: Sink) bool {
         return self.vtable.complete != null;

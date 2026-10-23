@@ -448,3 +448,79 @@ test "Rooms: a member closed for not keeping up is shut down, so its handler end
     }
     try std.testing.expect(left);
 }
+
+/// A member whose socket counts the writes that reach it.
+const Counting = struct {
+    interface: std.Io.Writer,
+    buf: [4096]u8 = undefined,
+    writes: std.atomic.Value(usize) = .init(0),
+    bytes: std.atomic.Value(usize) = .init(0),
+    reader: std.Io.Reader = .fixed(""),
+    ws: dusty.WebSocket = undefined,
+    socket: websocket.Socket = undefined,
+
+    fn init(self: *Counting, gpa: std.mem.Allocator, io: std.Io) void {
+        self.* = .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} } };
+        self.interface.buffer = &self.buf;
+        self.ws = dusty.WebSocket.init(io, .{ .writer = &self.interface, .reader = &self.reader }, gpa, 0);
+        self.socket = .{ ._conn = .{ .h1 = &self.ws }, ._allocator = gpa, .io = io, .max_message_size = 1024 };
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Counting = @alignCast(@fieldParentPtr("interface", w));
+        _ = self.writes.fetchAdd(1, .monotonic);
+        var n: usize = w.end;
+        w.end = 0;
+        var consumed: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| consumed += bytes.len;
+        consumed += data[data.len - 1].len * splat;
+        n += consumed;
+        _ = self.bytes.fetchAdd(n, .monotonic);
+        return consumed;
+    }
+};
+
+test "Rooms: a member with ten queued messages gets them in one write" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var r: websocket.Rooms = .init(gpa, .{});
+    defer r.deinit();
+
+    var member: Counting = undefined;
+    member.init(gpa, io);
+    defer member.ws.deinit();
+    try r.join("room", &member.socket);
+    defer r.leave("room", &member.socket);
+
+    // The sender task cannot run before this one yields: all ten are
+    // queued when it starts.
+    for (0..10) |_| try std.testing.expectEqual(@as(usize, 1), r.broadcast("room", .text, "hello", null));
+    var waited: usize = 0;
+    while (member.bytes.load(.monotonic) < 70 and waited < 5000) : (waited += 1) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 70), member.bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), member.writes.load(.monotonic));
+}
+
+test "Rooms: a member that leaves mid-drain gets nothing after leave returns and strands no bytes" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var r: websocket.Rooms = .init(gpa, .{});
+    defer r.deinit();
+
+    var member: Counting = undefined;
+    member.init(gpa, io);
+    defer member.ws.deinit();
+    try r.join("room", &member.socket);
+    for (0..20) |_| _ = r.broadcast("room", .text, "hello", null);
+    r.leave("room", &member.socket);
+    const after = member.bytes.load(.monotonic);
+    for (0..5) |_| try io.sleep(.fromMilliseconds(2), .awake);
+    try std.testing.expectEqual(after, member.bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), r.count("room"));
+}

@@ -143,6 +143,18 @@ pub const Transport = struct {
         return tls_reader.conn.endedWithoutCloseNotify();
     }
 
+    /// Whether bytes are already waiting beneath `reader`: ciphertext the TLS
+    /// layer has read, or plaintext it holds decoded. False on a plain
+    /// connection (the reader is the lowest layer) and on a TLS module that
+    /// does not say. A reading task uses it to tell that the rest of a
+    /// frame bigger than its window needs no wait for the peer.
+    pub fn bufferedBelow(self: Transport) bool {
+        if (!build_options.use_tls) return false;
+        const tls_reader = self.tls_reader orelse return false;
+        if (!@hasDecl(tls.Connection, "bufferedBelow")) return false;
+        return tls_reader.conn.bufferedBelow();
+    }
+
     /// The error type `getReadError` yields.
     pub const ReadError = @typeInfo(@TypeOf(checkReadError(undefined))).error_union.error_set;
 

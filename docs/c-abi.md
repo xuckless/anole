@@ -433,6 +433,7 @@ marked (C): they answer `ANOLE_OK` on an object that is already over.
 | `anole_wt_open_stream` | `ANOLE_E_INVALID` (flags), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_wt_stream_write` | `ANOLE_BUSY`, `ANOLE_E_INVALID` (flags, direction, after end), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_wt_stream_reset`, `anole_wt_stream_stop` (C) | `ANOLE_E_INVALID` (direction) |
+| `anole_wt_stream_set_priority` | `ANOLE_E_INVALID` (above 7, or a read-only stream), `ANOLE_E_GONE` |
 | `anole_wt_send_datagram` | `ANOLE_E_INVALID` (flags), `ANOLE_E_TOOBIG`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_wt_max_datagram` | `ANOLE_E_GONE` |
 | `anole_wt_close` (C) | `ANOLE_E_INVALID` (reason), `ANOLE_E_NOMEM` |
@@ -588,7 +589,7 @@ none.
 | `proxy.trusted_hops`, `trust_forwarded_proto`, `trust_forwarded_host` | 0, true, false | `proxy.*` |
 | `request.require_host`, `decompress`, `keep_buffers` | true, true, false | `request.*` |
 | `response.write_buffer_size`, `date`, `default_content_type`, `max_header_count`, `brotli_quality` | 16384, true, "text", 64, 5 | `response.*` (`default_content_type` by tag name; null: none) |
-| `http2.*` | 250 streams, ... | `http2.*` (`max_concurrent_streams`, `stream_window`, `stream_window_reading`, `reading_window_budget`, `connection_window`, `max_header_list_size`, `stream_reset_burst`, `stream_reset_rate`, `max_continuations`, `refused_stream_burst`, `refused_stream_rate`, `enable_connect_protocol`, `inline_no_wait`) |
+| `http2.*` | 250 streams, ... | `http2.*` (`max_concurrent_streams`, `stream_window`, `stream_window_reading`, `tunnel_window`, `reading_window_budget`, `connection_window`, `max_header_list_size`, `stream_reset_burst`, `stream_reset_rate`, `max_continuations`, `refused_stream_burst`, `refused_stream_rate`, `enable_connect_protocol`, `inline_no_wait`) |
 | `http3.address`, `port`, `max_streams_bidi`, `validate_address`, `idle_timeout_ms`, `alt_svc`, `early_data`, `prefer_v2`, `sockets`, `enable_connect_protocol`, `inline_no_wait` | null, null, 100, false, 30000, true, false, true, null, true, true | `http3.*` |
 | `errors` | "auto" | `errors` ("auto", "json", "text") |
 | `routes[].websocket.accept`, `subprotocols`, `compression`, `close_on_drain`, `origins` | "auto", [], true, true, [] | `websocket.UpgradeOptions` (`subprotocols`, `compression`, `close_on_drain`, `allowed_origins`); `accept` is the ABI's own: "consumer" hands each handshake to the application |
@@ -778,6 +779,7 @@ case ANOLE_EV_WT_CLOSE:     /* code, reason, which side; the session and its str
 anole_wt_stream s;
 anole_wt_open_stream(w, 0 /* or ANOLE_WT_F_UNI */, &s);   /* the handle is good at once */
 anole_wt_stream_write(s, data, len, ANOLE_WT_F_FIN);       /* ANOLE_BUSY: wait for ANOLE_EV_WRITABLE */
+anole_wt_stream_set_priority(s, 2);                   /* ABI 0.8: 0 most urgent .. 7 least; 3 by default */
 anole_handle_release(s);                              /* the end above still goes out */
 anole_wt_send_datagram(w, buf, n, 0);
 anole_wt_close(w, 0, (anole_str){"bye", 3});
@@ -794,6 +796,13 @@ anole_wt_close(w, 0, (anole_str){"bye", 3});
   binding's one borrowing helper works here as everywhere):
   `limits.stream_high_water` bytes waiting answers `ANOLE_BUSY`, then
   `ANOLE_EV_WRITABLE` comes for the stream.
+- `anole_wt_stream_set_priority(s, urgency)` (ABI 0.8) sets a stream's
+  RFC 9218 urgency, 0 (most urgent) to 7 (least); every stream starts at
+  3, and streams of one urgency take turns packet by packet. A more
+  urgent stream's bytes go out before any less urgent one's, so a busy
+  stream at a low number starves the higher ones: mark audio or control
+  2, not 0. A stream holds at most 1 MiB unacknowledged before a write
+  waits (`ANOLE_BUSY`), and a connection 4 MiB across its streams.
 - Every stream must be released (`anole_handle_release`) or go with
   its session: the peer may open a new stream only as earlier ones are
   released. A release resets a sending side not ended with
@@ -1322,6 +1331,8 @@ routes with native ones.
 
 ## From ABI 0.6
 
+ABI 0.8 only adds `anole_wt_stream_set_priority`; nothing from 0.7 changes.
+
 | 0.6 | 0.7 |
 | --- | --- |
 | `anole_respond(r, ...)` | `anole_req_respond(r, ...)` |
@@ -1358,7 +1369,8 @@ send-type call's flags `ANOLE_BODY_BORROW`, so `ANOLE_WT_F_FIN` moved from 1 to
 `anole_abi.json`'s generated parsers, one cleanup rule and
 `anole_handle_release`, the `anole_req_` names and the constant families,
 stable error tokens, `anole_server_open`, `anole_listener_info`, abort
-reasons, the SENT contract and a poll that never drops an event. Before 1.0
+reasons, the SENT contract and a poll that never drops an event. 0.8 adds
+`anole_wt_stream_set_priority`. Before 1.0
 every minor may break (`ANOLE_ABI_COMPATIBLE` asks for an exact match).
 The freeze, ABI 1.0, comes after anole-node 0.1 and anole-py 0.1 ship on it.
 

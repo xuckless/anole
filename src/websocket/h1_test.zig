@@ -10,6 +10,8 @@ var saw_draining: std.atomic.Value(bool) = .init(false);
 /// needed a flusher task of its own (`dusty.WebSocketBatch`).
 var closes_seen: std.atomic.Value(usize) = .init(0);
 var flusher_started: std.atomic.Value(bool) = .init(false);
+/// "park" messages whose socket's flusher sent the held echo and ended.
+var flusher_ended: std.atomic.Value(usize) = .init(0);
 
 fn echo(req: *dusty.Request, res: *dusty.Response) !void {
     var ws = (try websocket.upgrade(req, res, .{ .max_message_size = 8 })) orelse {
@@ -24,6 +26,19 @@ fn echo(req: *dusty.Request, res: *dusty.Response) !void {
                 // A handler that goes off to wait for something with the
                 // peer's next message unread (cut short by the server's
                 // shutdown, which closes the socket under it).
+                // "park" with more behind it: the echo is held, and the
+                // handler waits until the socket's flusher sent it and
+                // ended, as it does once its batch holds nothing more.
+                if (std.mem.eql(u8, msg.data, "park") and ws._conn == .h1) {
+                    try ws.send(msg.type, msg.data);
+                    const batch = &ws._conn.h1.batch;
+                    var polls: usize = 0;
+                    while ((batch.deferred.load(.monotonic) or batch.started) and polls < 2000) : (polls += 1) {
+                        req.io.sleep(.fromMilliseconds(1), .awake) catch return;
+                    }
+                    if (!batch.deferred.load(.monotonic) and !batch.started) _ = flusher_ended.fetchAdd(1, .acq_rel);
+                    continue;
+                }
                 const wait = std.mem.eql(u8, msg.data, "wait");
                 if (wait) {
                     ws.send(msg.type, msg.data) catch return;
@@ -286,6 +301,32 @@ test "WebSocket over HTTP/1.1: sockets share their executor's backstop, and one 
         }
     }
     try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
+}
+
+test "WebSocket over HTTP/1.1: a socket's flusher ends once its batch is sent, and the next batch starts another" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    var future = try startServer(&server, io);
+    defer future.cancel(io) catch {};
+    var buf: [16]u8 = undefined;
+
+    flusher_ended.store(0, .release);
+    var a: Raw = undefined;
+    try a.open(io, server.address.ip);
+    defer a.stream.close(io);
+    // Twice: the second echo goes out only if a new flusher starts.
+    for (0..2) |_| {
+        try a.queue(0x1, "park");
+        try a.queue(0x1, "x");
+        try a.writer.interface.flush();
+        try std.testing.expectEqualStrings("park", (try a.next(&buf)).payload);
+        try std.testing.expectEqualStrings("x", (try a.next(&buf)).payload);
+    }
+    try std.testing.expectEqual(@as(usize, 2), flusher_ended.load(.acquire));
 }
 
 const features = @import("build_options");

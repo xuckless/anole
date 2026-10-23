@@ -50,13 +50,15 @@ fn run(arena: std.mem.Allocator, input: []const u8, step: usize, buf_len: usize,
         } },
         .out = .{ .res = undefined, .interface = .fixed(out) },
         .in_buf = undefined,
-        .out_buf = undefined,
+        .out_buf = &.{},
+        .sink = null,
         .frames = .init(.{ .extension = if (compressed) .{ .permessage_deflate = .init } else null }),
         .max_message_size = max_message_size,
     };
     // A batch's flusher task (`H2Socket.deinit` would also end the
     // response, which has none here).
     defer sock.batch.deinit(std.testing.io);
+    defer sock.message.deinit(std.heap.c_allocator);
     var d: if (features.compression) deflate.Deflate else void = if (features.compression) .init(.{}, .{}, arena) else {};
     defer if (features.compression) d.deinit();
     var socket: websocket.Socket = .{
@@ -193,11 +195,13 @@ test "H2Socket: a ping or pong a handler sends over 125 bytes is refused" {
         .body = undefined,
         .out = .{ .res = undefined, .interface = .fixed(out) },
         .in_buf = undefined,
-        .out_buf = undefined,
+        .out_buf = &.{},
+        .sink = null,
         .frames = .init(.{}),
         .max_message_size = max_message_size,
     };
     defer sock.batch.deinit(std.testing.io);
+    defer sock.message.deinit(std.heap.c_allocator);
     const big: [126]u8 = @splat('p');
     try std.testing.expectError(error.LargeControlFrame, sock.sendMessage(.ping, &big, false));
     try std.testing.expectError(error.LargeControlFrame, sock.sendMessage(.pong, &big, false));

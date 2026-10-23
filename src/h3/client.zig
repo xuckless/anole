@@ -231,7 +231,11 @@ pub const ClientConnection = struct {
     /// Serializes every ngtcp2 and nghttp3 call and guards what follows.
     mutex: std.Io.Mutex = .init,
     /// Bumped on every change; the driver and waiting callers wait on it.
-    gen: std.atomic.Value(u32) = .init(0),
+    gen: bridge.Signal = .{},
+    /// Free 4 KiB blocks for the streams' queues, and what they hold
+    /// unacknowledged.
+    blocks: bridge.BlockPool,
+    budget: bridge.Budget,
     state: enum { handshaking, open, closed } = .handshaking,
     /// ngtcp2 ended the handshake for taking too long.
     handshake_timed_out: bool = false,
@@ -298,6 +302,8 @@ pub const ClientConnection = struct {
         errdefer gpa.destroy(self);
         self.* = .{
             .gpa = gpa,
+            .blocks = .init(gpa, 16),
+            .budget = .init(io, 4 << 20),
             .io = io,
             .udp = .init(socket),
             .local = .from(socket.address),
@@ -475,7 +481,7 @@ pub const ClientConnection = struct {
         self.kick();
         // The driver moves it, as the only task that sends.
         while (true) {
-            const gen = self.gen.load(.acquire);
+            const gen = self.gen.epoch();
             self.lock();
             const pending = self.rebind_to != null;
             const err = self.rebind_error;
@@ -547,7 +553,7 @@ pub const ClientConnection = struct {
 
     fn waitHandshake(self: *ClientConnection) !void {
         while (true) {
-            const gen = self.gen.load(.acquire);
+            const gen = self.gen.epoch();
             self.lock();
             const state = self.state;
             self.unlock();
@@ -559,7 +565,7 @@ pub const ClientConnection = struct {
                     return error.HandshakeFailed;
                 },
                 // ngtcp2's handshake timeout ends this.
-                .handshaking => try self.io.futexWait(u32, &self.gen.raw, gen),
+                .handshaking => try self.gen.wait(self.io, gen),
             }
         }
     }
@@ -597,6 +603,7 @@ pub const ClientConnection = struct {
         self.udp.socket.close(io);
         self.gpa.free(self.tx);
         self.gpa.free(self.rx);
+        self.blocks.deinit();
         self.gpa.destroy(self);
     }
 
@@ -614,14 +621,14 @@ pub const ClientConnection = struct {
         self.unlock();
         const deadline = now(io) + @min(@max(3 * pto, 100 * std.time.ns_per_ms), std.time.ns_per_s);
         while (true) {
-            const gen = self.gen.load(.acquire);
+            const gen = self.gen.epoch();
             self.lock();
             const waiting = self.state == .open and self.lingering();
             self.unlock();
             if (!waiting) return;
             const t = now(io);
             if (t >= deadline) return;
-            io.futexWaitTimeout(u32, &self.gen.raw, gen, .{ .duration = .{
+            self.gen.waitTimeout(io, gen, .{ .duration = .{
                 .raw = .fromNanoseconds(@intCast(deadline - t)),
                 .clock = .awake,
             } }) catch return;
@@ -652,8 +659,7 @@ pub const ClientConnection = struct {
     }
 
     fn kick(self: *ClientConnection) void {
-        _ = self.gen.fetchAdd(1, .release);
-        self.io.futexWake(u32, &self.gen.raw, std.math.maxInt(u32));
+        self.gen.notify(self.io);
     }
 
     /// How WebTransport's sessions and streams reach the connection.
@@ -672,11 +678,11 @@ pub const ClientConnection = struct {
                 of(ctx).kick();
             }
         };
-        return .{ .ctx = self, .gen = &self.gen, .lock_fn = S.lock, .unlock_fn = S.unlock, .kick_fn = S.kick };
+        return .{ .ctx = self, .gen = &self.gen, .pool = &self.blocks, .budget = &self.budget, .lock_fn = S.lock, .unlock_fn = S.unlock, .kick_fn = S.kick };
     }
 
     fn wait(self: *ClientConnection, gen: u32) std.Io.Cancelable!void {
-        try self.io.futexWait(u32, &self.gen.raw, gen);
+        try self.gen.wait(self.io, gen);
     }
 
     fn path(self: *ClientConnection) c.ngtcp2_path {
@@ -690,7 +696,7 @@ pub const ClientConnection = struct {
     /// Waits for the server's SETTINGS (which follow the handshake).
     pub fn waitSettings(self: *ClientConnection) !PeerSettings {
         while (true) {
-            const gen = self.gen.load(.acquire);
+            const gen = self.gen.epoch();
             self.lock();
             const settings = self.peer_settings;
             const closed = self.state == .closed;
@@ -803,7 +809,7 @@ pub const ClientConnection = struct {
             .flags = h.NGHTTP3_NV_FLAG_NONE,
         };
         while (true) {
-            const gen = self.gen.load(.acquire);
+            const gen = self.gen.epoch();
             self.lock();
             if (self.closing or self.state == .closed) {
                 self.unlock();
@@ -948,7 +954,7 @@ pub const ClientConnection = struct {
     fn drive(self: *ClientConnection) std.Io.Cancelable!void {
         const io = self.io;
         while (true) {
-            const gen = self.gen.load(.acquire);
+            const gen = self.gen.epoch();
             self.switchSocket();
             self.flush();
             self.lock();
@@ -973,7 +979,7 @@ pub const ClientConnection = struct {
                 .raw = .fromNanoseconds(@intCast(deadline - t)),
                 .clock = .awake,
             } };
-            try io.futexWaitTimeout(u32, &self.gen.raw, gen, timeout);
+            try self.gen.waitTimeout(io, gen, timeout);
         }
     }
 
@@ -1166,7 +1172,9 @@ pub const ClientConnection = struct {
 
     fn onExtendMaxLocalStreamsUni(_: ?*c.ngtcp2_conn, _: u64, user_data: ?*anyopaque) callconv(.c) c_int {
         // A WebTransport session waiting to open a stream may go on.
-        connOf(user_data).kick();
+        const self = connOf(user_data);
+        if (self.wt) |w| w.onStreamCredit();
+        self.kick();
         return 0;
     }
 
@@ -1179,8 +1187,11 @@ pub const ClientConnection = struct {
     }
 
     fn onExtendMaxLocalStreamsBidi(_: ?*c.ngtcp2_conn, _: u64, user_data: ?*anyopaque) callconv(.c) c_int {
-        // A request waiting for a stream may go on.
-        connOf(user_data).kick();
+        // A request, or a WebTransport session, waiting for a stream may go
+        // on.
+        const self = connOf(user_data);
+        if (self.wt) |w| w.onStreamCredit();
+        self.kick();
         return 0;
     }
 
@@ -1273,8 +1284,8 @@ pub const ClientConnection = struct {
 
     fn onH3AckedStreamData(_: ?*h.nghttp3_conn, _: i64, len: u64, _: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const s = streamOfUser(sud) orelse return 0;
-        s.out.acked += len;
-        // Room in the ring: a writer waiting may go on.
+        s.out.ack(&s.conn.blocks, &s.conn.budget, len);
+        // Room in the queue: a writer waiting may go on.
         s.conn.kick();
         return 0;
     }
@@ -1444,7 +1455,7 @@ pub const Stream = struct {
 
     has_body: bool,
     /// The request body until the server acknowledges it.
-    out: bridge.Ring = .{},
+    out: bridge.SendQueue = .{},
     out_writer: std.Io.Writer,
     send_closed: bool,
     /// The server sent STOP_SENDING.
@@ -1496,7 +1507,7 @@ pub const Stream = struct {
     fn free(self: *Stream) void {
         const gpa = self.conn.gpa;
         self.body.deinit(gpa);
-        self.out.deinit(gpa);
+        self.out.deinit(&self.conn.blocks, &self.conn.budget);
         self.arena.deinit();
         gpa.destroy(self);
     }
@@ -1534,7 +1545,7 @@ pub const Stream = struct {
     pub fn waitHead(self: *Stream) StreamError!void {
         const conn = self.conn;
         while (true) {
-            const gen = conn.gen.load(.acquire);
+            const gen = conn.gen.epoch();
             conn.lock();
             const ready = self.head_ready;
             const cause = self.cause;
@@ -1682,7 +1693,7 @@ pub const Stream = struct {
         const dest = limit.slice(try w.writableSliceGreedy(1));
         if (dest.len == 0) return 0;
         while (true) {
-            const gen = conn.gen.load(.acquire);
+            const gen = conn.gen.epoch();
             conn.lock();
             const avail = self.body.items[self.body_start..];
             if (avail.len > 0) {
@@ -1725,14 +1736,14 @@ pub const Stream = struct {
         if (!self.has_body) return error.WriteFailed;
         var rest = bytes;
         while (rest.len > 0) {
-            const gen = conn.gen.load(.acquire);
+            const gen = conn.gen.epoch();
             conn.lock();
             if (self.cause != null or self.send_stopped or conn.state == .closed) {
                 self.write_err = self.cause orelse if (self.send_stopped) error.StreamReset else error.ConnectionClosed;
                 conn.unlock();
                 return error.WriteFailed;
             }
-            const n = self.out.write(conn.gpa, rest) catch {
+            const n = self.out.write(&conn.blocks, &conn.budget, rest, 64 * 1024, false) catch {
                 conn.unlock();
                 return error.WriteFailed;
             };

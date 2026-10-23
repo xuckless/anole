@@ -115,8 +115,9 @@ pub fn accept(req: *dusty.Request, res: *dusty.Response, options: AcceptOptions)
         .ctx = self,
         .end_fn = ServerSession.end,
     }, .{
-        .drain = req.drain,
+        .drain_hooks = req._drain_hooks,
         .close_on_drain = options.close_on_drain,
+        .inline_capsules = true,
         .drain_reason = try req.arena.dupe(u8, options.drain_reason),
     });
     errdefer self.session.deinit();

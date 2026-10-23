@@ -20,9 +20,18 @@ pub const H2Socket = struct {
     arena: std.mem.Allocator,
     body: dusty.RequestBodyReader,
     out: dusty.StreamingBodyWriter,
-    in_buf: [buffer_len]u8,
-    out_buf: [buffer_len]u8,
+    in_buf: [in_buffer_len]u8,
+    /// The response writer's buffer: a few bytes when frames go straight to
+    /// the sink (`sink`), `buffer_len` otherwise.
+    out_buf: []u8,
+    /// The stream's sink, when it takes frames appended to a queue of its
+    /// own (an HTTP/2 tunnel): the frame header and payload go there in one
+    /// copy, with no writer buffer between.
+    sink: ?dusty.Sink,
     frames: codec.FrameHandler,
+    /// The message being assembled. The C allocator's, apart from the
+    /// request's arena, so a message bigger than `retained_message_max`
+    /// goes back after it (`receiveMessage`).
     message: std.ArrayList(u8) = .empty,
     max_message_size: usize,
     /// Sending is over: a close went out.
@@ -40,6 +49,16 @@ pub const H2Socket = struct {
     /// with a bigger payload straight to the stream.
     pub const buffer_len = 4 * 1024;
 
+    /// Reads from the stream: one per ordinary video frame or so.
+    const in_buffer_len = 16 * 1024;
+
+    /// The most message memory kept between messages.
+    const retained_message_max = 64 * 1024;
+
+    /// The most bytes queued for the peer before a send waits for it to read
+    /// (a message is always taken when nothing is queued).
+    const max_queued = 1024 * 1024;
+
     /// Answers the extended CONNECT and starts the socket on the request's
     /// body and a streamed response.
     pub fn accept(req: *dusty.Request, res: *dusty.Response, max_message_size: usize, deflate: bool) !*H2Socket {
@@ -50,7 +69,8 @@ pub const H2Socket = struct {
             .body = undefined,
             .out = undefined,
             .in_buf = undefined,
-            .out_buf = undefined,
+            .out_buf = &.{},
+            .sink = if (res._sink) |sk| (if (sk.canAppend()) sk else null) else null,
             // RSV1 is allowed once permessage-deflate is in use.
             .frames = .init(.{ .extension = if (deflate) .{ .permessage_deflate = .init } else null }),
             .max_message_size = max_message_size,
@@ -58,7 +78,8 @@ pub const H2Socket = struct {
         // A 200 accepts the extended CONNECT (RFC 8441 §5); the stream
         // stays open both ways.
         res.status = .ok;
-        self.out = try res.stream(&self.out_buf);
+        self.out_buf = try req.arena.alloc(u8, if (self.sink != null) 16 else buffer_len);
+        self.out = try res.stream(self.out_buf);
         // Out now, so the client may start sending frames.
         try self.out.interface.flush();
         // No lifetime cap on the stream: the message layer enforces
@@ -70,6 +91,8 @@ pub const H2Socket = struct {
     /// Ends the response stream. `Socket.deinit` calls it.
     pub fn deinit(self: *H2Socket) void {
         self.batch.deinit(self.io);
+        self.message.deinit(std.heap.c_allocator);
+        self.message = .empty;
         self.out.end() catch {};
     }
 
@@ -87,7 +110,9 @@ pub const H2Socket = struct {
     }
 
     fn receiveMessage(self: *H2Socket) !Message {
-        self.message.clearRetainingCapacity();
+        if (self.message.capacity > retained_message_max) {
+            self.message.clearAndFree(std.heap.c_allocator);
+        } else self.message.clearRetainingCapacity();
         const reader = &self.body.interface;
         while (true) {
             // Fed even when nothing is buffered: the end of a frame whose
@@ -124,7 +149,7 @@ pub const H2Socket = struct {
                     self.fail(.too_large);
                     return error.MessageTooLarge;
                 }
-                try self.message.appendSlice(self.arena, payload);
+                try self.message.appendSlice(std.heap.c_allocator, payload);
                 return null;
             },
             .data_end => |end| {
@@ -180,8 +205,33 @@ pub const H2Socket = struct {
         try self.writeFrameOpts(.{ .opcode = opcode, .compressed = compressed }, data, self.sendFlush());
     }
 
+    /// `sendMessage` that leaves the frame queued for the caller's `flush`,
+    /// which follows a run of them (`Rooms`, the C ABI's sender).
+    pub fn sendNoFlush(self: *H2Socket, msg_type: MessageType, data: []const u8, compressed: bool) !void {
+        const opcode: codec.Opcode = switch (msg_type) {
+            .text => .text,
+            .binary => .binary,
+            else => return error.InvalidOpcode,
+        };
+        try self.writeFrameOpts(.{ .opcode = opcode, .compressed = compressed }, data, .manual);
+    }
+
+    /// Sends what `sendNoFlush` left, and what a batch held.
+    pub fn flush(self: *H2Socket) !void {
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+        if (self.closed) return error.ConnectionClosed;
+        self.batch.flushing();
+        if (self.sink) |sink| return sink.kickOut();
+        self.out.interface.flush() catch return self.out.err orelse error.WriteFailed;
+    }
+
     fn sendFlush(self: *H2Socket) Flush {
-        return if (self.batch.holds(self.io)) .batch else .now;
+        if (self.batch.holds(self.io)) return .batch;
+        // A task in the middle of a batch of its own sending here: the frame
+        // waits for this socket's backstop (see the core's `WebSocket`).
+        if (dusty.WebSocketBatch.sendingFromBatch(self.io)) return .batch;
+        return .now;
     }
 
     /// Sends a ping. Fails with `error.LargeControlFrame` past 125 bytes.
@@ -220,6 +270,8 @@ pub const H2Socket = struct {
         now,
         /// Held for the reading task's batch.
         batch,
+        /// Left for `flush`, after a run of frames (`sendNoFlush`).
+        manual,
     };
 
     fn writeFrameOpts(self: *H2Socket, opts: codec.WriteFrameOptions, payload: []const u8, after: Flush) !void {
@@ -230,8 +282,27 @@ pub const H2Socket = struct {
         if (opts.opcode == .close) self.closed = true;
         // A frame cut short leaves the peer unable to find the next one.
         errdefer self.closed = true;
+        if (self.sink) |sink| {
+            // Header on the stack, then both parts to the stream's queue in
+            // one copy. The writer kicks when the queue was idle; a frame in
+            // a batch waits for the batch's flush.
+            std.debug.assert(!opts.opcode.isControl() or (!opts.compressed and payload.len <= codec.max_control_payload_len));
+            const header: codec.FrameHeader.Buffer = .init(.{
+                .opcode = opts.opcode,
+                .rsv = if (opts.compressed) .permessage_deflate else .empty,
+                .payload_len = payload.len,
+            });
+            const parts = [_][]const u8{ header.constSlice(), payload };
+            sink.appendParts(&parts, max_queued, after == .now) catch return sink.writeError() orelse error.WriteFailed;
+            if (after == .manual) return;
+            if (after == .batch and self.batch.hold(self.io, flushHeld)) return;
+            self.batch.flushing();
+            if (after == .batch) sink.kickOut();
+            return;
+        }
         const w = &self.out.interface;
         codec.writeFrame(w, payload, opts) catch return self.out.err orelse error.WriteFailed;
+        if (after == .manual) return;
         if (after == .batch and self.batch.hold(self.io, flushHeld)) return;
         self.batch.flushing();
         w.flush() catch return self.out.err orelse error.WriteFailed;
@@ -243,6 +314,7 @@ pub const H2Socket = struct {
         defer self.write_mutex.unlock(self.io);
         if (!self.batch.deferred.load(.monotonic) or self.closed) return;
         self.batch.flushing();
+        if (self.sink) |sink| return sink.kickOut();
         self.out.interface.flush() catch return self.out.err orelse error.WriteFailed;
     }
 

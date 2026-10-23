@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/xuckless/anole/blob/v0.2.0/include/anole.schema.json",
-  "x-anole-abi": "0.7",
+  "$id": "https://github.com/xuckless/anole/blob/v0.2.1/include/anole.schema.json",
+  "x-anole-abi": "0.8",
   "title": "Anole C ABI configuration",
   "description": "The JSON document anole_server_create takes (anole_server_options.config_json). Unknown keys are refused, with the line and column in anole_last_error (token UnknownKey).",
   "type": "object",
@@ -692,6 +692,13 @@
           "maximum": 2147483647,
           "default": 1048576,
           "description": "The stream's window from the handler's first read of the body."
+        },
+        "tunnel_window": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647,
+          "default": 131072,
+          "description": "The window (and body buffer) of a tunnel stream, a WebSocket over HTTP/2 (extended CONNECT): one fixed window, no raise."
         },
         "reading_window_budget": {
           "type": "integer",

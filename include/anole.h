@@ -105,7 +105,7 @@ extern "C" {
 #endif
 
 #define ANOLE_ABI_VERSION_MAJOR 0 /* breaking changes */
-#define ANOLE_ABI_VERSION_MINOR 7 /* additions (and, before 1.0, breaking changes; see CHANGELOG.md) */
+#define ANOLE_ABI_VERSION_MINOR 8 /* additions (and, before 1.0, breaking changes; see CHANGELOG.md) */
 #define ANOLE_ABI_VERSION ((ANOLE_ABI_VERSION_MAJOR << 16) | ANOLE_ABI_VERSION_MINOR)
 /* Whether a library reporting anole_abi_version() == v serves code built
    against this header. Before 1.0 both numbers must match (every 0.x minor
@@ -969,6 +969,14 @@ ANOLE_API anole_status anole_wt_open_stream(anole_wt w, uint32_t flags, anole_wt
    for a read-only stream or after its end; ANOLE_E_GONE once its sending
    side is over (reset, or stopped by the peer: ANOLE_EV_WT_STREAM_STOP). */
 ANOLE_API anole_status anole_wt_stream_write(anole_wt_stream s, const void *data, size_t len, uint32_t flags);
+/* Sets the stream's urgency, 0 (most urgent) to 7 (least); the default is 3
+   (RFC 9218). Data of a more urgent stream goes out before any less
+   urgent one's, and streams of one urgency take turns packet by packet. A
+   busy stream at a low number starves the higher ones: mark audio or
+   control 2, not 0. Takes effect for the next packet. ANOLE_E_INVALID above
+   7 and for a read-only stream, ANOLE_E_GONE once the stream is stale. Not
+   a cleanup call. (ABI 0.8) */
+ANOLE_API anole_status anole_wt_stream_set_priority(anole_wt_stream s, uint32_t urgency);
 /* Abandons sending (RESET_STREAM with the application code); what was
    queued is dropped. A cleanup call. */
 ANOLE_API anole_status anole_wt_stream_reset(anole_wt_stream s, uint32_t code);

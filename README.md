@@ -84,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
 That's the whole server. To try it:
 
 1. In a project made with `zig init`, run
-   `zig fetch --save git+https://github.com/xuckless/anole#v0.2.0`
+   `zig fetch --save git+https://github.com/xuckless/anole#v0.2.1`
    (or a later tag, or a commit).
 2. Make `build.zig` one call:
    `@import("anole").addApp(b, .{ .name = "api", .root_source_file = b.path("src/main.zig") })`.
@@ -267,7 +267,7 @@ Hello, World is about 1.3 MB; everything on is about 6 MB.
 ## Using Anole as a dependency
 
 ```sh
-zig fetch --save git+https://github.com/xuckless/anole#v0.2.0
+zig fetch --save git+https://github.com/xuckless/anole#v0.2.1
 ```
 
 Any later tag (see the [releases](https://github.com/xuckless/anole/releases))
