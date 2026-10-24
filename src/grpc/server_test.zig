@@ -581,7 +581,7 @@ test "gRPC-Web over HTTP/1.1: a deadline that cancels the handler is answered DE
     // deadline (an AutoCancel) and the connection's task then writes the
     // answer: a cancel swallowed there parks it on that write, which zio's
     // debug_cancel reports and the test runner fails (SAFETY.md C3). The
-    // deadline's own cancel is claimed instead (Request.claimTimeoutCancel).
+    // deadline's own cancel is claimed instead (Request._claimTimeoutCancel).
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();

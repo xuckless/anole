@@ -270,7 +270,7 @@ pub const Request = struct {
     /// out). False for a cancel from anyone else (the server stopping, the
     /// stream reset), which stays the task's: a handler that carries on
     /// from one re-arms it (`io.recancel()`, SAFETY.md C3).
-    pub fn claimTimeoutCancel(self: *Request) bool {
+    pub fn _claimTimeoutCancel(self: *Request) bool {
         const claim = self._claim_timeout orelse return false;
         return claim(self._timeout_context.?);
     }

@@ -670,7 +670,7 @@ pub fn finish(call: *Call, result: anyerror!void) !void {
     if (result) |_| {} else |err| switch (err) {
         error.GrpcStatus => {},
         error.Canceled => {
-            rearm = !call.req.claimTimeoutCancel();
+            rearm = !call.req._claimTimeoutCancel();
             if (call.deadlineExceeded()) {
                 call.status = .deadline_exceeded;
                 call.status_message = "deadline exceeded";
