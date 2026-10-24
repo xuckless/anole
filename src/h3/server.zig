@@ -3542,6 +3542,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             cb.delete_crypto_aead_ctx = c.ngtcp2_crypto_delete_crypto_aead_ctx_cb;
             cb.delete_crypto_cipher_ctx = c.ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
             cb.stream_stop_sending = onStreamStopSending;
+            cb.recv_stop_sending = onRecvStopSending;
             cb.version_negotiation = c.ngtcp2_crypto_version_negotiation_cb;
             cb.recv_tx_key = onRecvTxKey;
             cb.get_new_connection_id2 = onGetNewConnectionId;
@@ -3696,10 +3697,20 @@ pub fn Endpoint(comptime Ctx: type) type {
             return 0;
         }
 
-        fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, code: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        /// We stopped reading the stream (`ngtcp2_conn_shutdown_stream_read`;
+        /// ngtcp2 calls this as the STOP_SENDING goes out): nghttp3 is to
+        /// read no more of it either.
+        fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+            const conn = connOf(user_data);
+            if (conn.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
+            return 0;
+        }
+
+        /// The peer sent STOP_SENDING: it wants no more of what we send on
+        /// the stream (ngtcp2 has reset our sending side).
+        fn onRecvStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, code: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             if (conn.wt) |w| if (w.onStopSending(stream_id, code)) return 0;
-            if (conn.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             // The peer wants no more of the response.
             if (conn.streamOf(stream_id)) |s| {
                 s.reset = true;
@@ -3813,6 +3824,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (s.lingering) {
                 conn.consume(stream_id, len);
                 conn.lingered(s, len);
+                // The window update (or the STOP_SENDING) goes out.
+                conn.kick();
                 return 0;
             }
             // The peer cannot send past the stream's window, so this is

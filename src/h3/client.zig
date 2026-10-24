@@ -1168,6 +1168,7 @@ pub const ClientConnection = struct {
         cb.delete_crypto_aead_ctx = c.ngtcp2_crypto_delete_crypto_aead_ctx_cb;
         cb.delete_crypto_cipher_ctx = c.ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
         cb.stream_stop_sending = onStreamStopSending;
+        cb.recv_stop_sending = onRecvStopSending;
         cb.version_negotiation = c.ngtcp2_crypto_version_negotiation_cb;
         cb.recv_rx_key = onRecvRxKey;
         cb.get_new_connection_id2 = onGetNewConnectionId;
@@ -1289,13 +1290,22 @@ pub const ClientConnection = struct {
         return 0;
     }
 
-    fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, code: u64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
+    /// We stopped reading the stream (`ngtcp2_conn_shutdown_stream_read`;
+    /// ngtcp2 calls this as the STOP_SENDING goes out): nghttp3 is to read
+    /// no more of it either.
+    fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        const self = connOf(user_data);
+        if (self.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
+        return 0;
+    }
+
+    /// The server sent STOP_SENDING: it wants no more of the request body
+    /// (ngtcp2 has reset our sending side); its response may still come.
+    fn onRecvStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, code: u64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
         if (self.wt) |w| if (w.onStopSending(stream_id, code)) return 0;
-        if (self.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
-        // The server wants no more of the request body; its response may
-        // still come.
         if (streamOfUser(sud)) |s| s.send_stopped = true;
+        // A writer waiting for room in the stream's queue goes on, and fails.
         self.kick();
         return 0;
     }

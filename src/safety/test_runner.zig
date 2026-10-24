@@ -2,8 +2,9 @@
 //! Copyright (c) Zig contributors), with one change for SAFETY.md E1: the
 //! test allocator of a unit test is backed by `never_reuse.allocator`, so
 //! freed memory is never handed out again and a use after free faults at
-//! once; and a unit test fails when zio's `debug_cancel` reports a
-//! swallowed cancellation during it (C3). The fuzzing loops keep `std.heap.page_allocator` (an mprotect per
+//! once; a unit test fails when zio's `debug_cancel` reports a swallowed
+//! cancellation during it (C3); and a test that runs for 5 minutes is named
+//! and aborted (`watchdog`), so a hang says where it is. The fuzzing loops keep `std.heap.page_allocator` (an mprotect per
 //! bucket costs a fuzzer's throughput). Re-copy it when moving to the next
 //! Zig version and apply the change again (`ANOLE:` marks it).
 const builtin = @import("builtin");
@@ -28,11 +29,59 @@ fn swallowedCancels() u64 {
 }
 
 /// ANOLE: runs a test, failing it when zio reported a swallowed cancellation.
-fn runTest(test_fn: @TypeOf(builtin.test_functions[0])) anyerror!void {
+fn runTest(test_fn: @TypeOf(builtin.test_functions[0]), index: usize) anyerror!void {
+    watchdog.begin(index);
+    defer watchdog.end();
     const before = swallowedCancels();
     try test_fn.func();
     if (swallowedCancels() != before) return error.SwallowedCancel;
 }
+
+/// ANOLE: a unit test still running after `limit_s` seconds is taken for a
+/// hang: its name goes to stderr and the process aborts, so the build names
+/// the test (a hung binary otherwise says nothing until CI's timeout kills
+/// it). The slowest tests take seconds.
+const watchdog = struct {
+    const limit_s = 300;
+    const idle = std.math.maxInt(usize);
+    var current: std.atomic.Value(usize) = .init(idle);
+    var seq: std.atomic.Value(u32) = .init(0);
+    var started = false;
+
+    fn begin(index: usize) void {
+        if (!started) {
+            started = true;
+            // The runner's own thread, for the life of the process.
+            const t = std.Thread.spawn(.{}, run, .{}) catch return;
+            t.detach();
+        }
+        _ = seq.fetchAdd(1, .acq_rel);
+        current.store(index, .release);
+    }
+
+    fn end() void {
+        current.store(idle, .release);
+    }
+
+    fn run() void {
+        var last: u32 = 0;
+        var ticks: u32 = 0;
+        while (true) {
+            Io.sleep(runner_threaded_io, .fromSeconds(1), .awake) catch {};
+            const i = current.load(.acquire);
+            const s = seq.load(.acquire);
+            if (i == idle or s != last) {
+                last = s;
+                ticks = 0;
+                continue;
+            }
+            ticks += 1;
+            if (ticks < limit_s) continue;
+            std.debug.print("\ntest '{s}' has run for {d} s: taken for a hang, aborting\n", .{ builtin.test_functions[i].name, ticks });
+            std.process.abort();
+        }
+    }
+};
 
 pub const std_options: std.Options = .{
     .logFn = log,
@@ -165,7 +214,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 try server.serveStringMessage(.test_started, &.{});
 
                 const TestResults = std.zig.Server.Message.TestResults;
-                const status: TestResults.Status = if (runTest(test_fn)) |v| s: { // ANOLE
+                const status: TestResults.Status = if (runTest(test_fn, index)) |v| s: { // ANOLE
                     v;
                     break :s .pass;
                 } else |err| switch (err) {
@@ -317,7 +366,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             std.debug.print("{d}/{d} {s}...", .{ i + 1, test_fn_list.len, test_fn.name });
         }
         is_fuzz_test = false;
-        if (runTest(test_fn)) |_| { // ANOLE
+        if (runTest(test_fn, i)) |_| { // ANOLE
             ok_count += 1;
             test_node.end();
             if (!have_tty) std.debug.print("OK\n", .{});
