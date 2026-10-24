@@ -2567,6 +2567,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 timer.setClock(.fromStd(timeout), .fromStdTimeout(timeout));
             }
 
+            /// Whether the task's cancel was this timer's (consumed if so).
+            fn claimTimeout(context: *anyopaque) bool {
+                const timer: *zio.AutoCancel = @ptrCast(@alignCast(context));
+                return timer.check(error.Canceled);
+            }
+
             fn resetStream(s: *Stream, code: u64) void {
                 const conn = s.conn;
                 conn.lock();
@@ -2615,6 +2621,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     ._drain_hooks = &server.drain_hooks,
                     ._timeout_context = if (inline_mode) null else &timer,
                     ._set_timeout = if (inline_mode) null else setTimeout,
+                    ._claim_timeout = if (inline_mode) null else claimTimeout,
                     // Its entry table is never read past `len`: not zeroed.
                     .session = undefined,
                 };
@@ -2886,6 +2893,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             // A task's request timer lives on the task's stack.
             ex.request._timeout_context = null;
             ex.request._set_timeout = null;
+            ex.request._claim_timeout = null;
             d.request = &ex.request;
             d.response = &ex.response;
             return ex;

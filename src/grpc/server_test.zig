@@ -576,11 +576,12 @@ fn decodeChunks(arena: std.mem.Allocator, text: []const u8) ![]u8 {
     return out.items;
 }
 
-test "gRPC over HTTP/1.1: a deadline that cancels the handler is answered DEADLINE_EXCEEDED, its cancel consumed" {
+test "gRPC-Web over HTTP/1.1: a deadline that cancels the handler is answered DEADLINE_EXCEEDED, its cancel consumed" {
     // HTTP/1.1, where the request's timer cancels the handler at the call's
-    // deadline (an AutoCancel). The handler's error.Canceled becomes the
-    // status; that cancel is the deadline's, claimed, not swallowed (zio's
-    // debug_cancel and the test runner fail a swallowed one: SAFETY.md C3).
+    // deadline (an AutoCancel) and the connection's task then writes the
+    // answer: a cancel swallowed there parks it on that write, which zio's
+    // debug_cancel reports and the test runner fails (SAFETY.md C3). The
+    // deadline's own cancel is claimed instead (Request.claimTimeoutCancel).
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
@@ -606,7 +607,7 @@ test "gRPC over HTTP/1.1: a deadline that cancels the handler is answered DEADLI
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
     // One message, EchoRequest{ message: "slow" }: the handler sleeps 2 s.
-    const request = "POST /anole.test.Echo/Unary HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/grpc\r\nTE: trailers\r\n" ++
+    const request = "POST /anole.test.Echo/Unary HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/grpc-web+proto\r\n" ++
         "Grpc-Timeout: 100m\r\nContent-Length: 11\r\n\r\n" ++ "\x00\x00\x00\x00\x06\x0a\x04slow";
     var wbuf: [512]u8 = undefined;
     var w = stream.writer(io, &wbuf);
@@ -616,14 +617,14 @@ test "gRPC over HTTP/1.1: a deadline that cancels the handler is answered DEADLI
     var r = stream.reader(io, &rbuf);
     var got: std.ArrayList(u8) = .empty;
     defer got.deinit(gpa);
-    // Until the trailers (after the last chunk) and their blank line.
-    while (std.ascii.findIgnoreCase(got.items, "grpc-status") == null or !std.mem.endsWith(u8, got.items, "\r\n\r\n")) {
+    // Until the trailer frame (gRPC-Web carries the status in the body).
+    while (std.mem.indexOf(u8, got.items, "grpc-status:") == null) {
         r.interface.fillMore() catch break;
         try got.appendSlice(gpa, r.interface.buffered());
         r.interface.toss(r.interface.bufferedLen());
     }
     try std.testing.expect(std.mem.startsWith(u8, got.items, "HTTP/1.1 200"));
-    try std.testing.expect(std.ascii.findIgnoreCase(got.items, "grpc-status: 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got.items, "grpc-status:4") != null);
 }
 
 test "gRPC client: every call mode, an error status, a client deadline and metadata" {

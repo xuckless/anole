@@ -1352,6 +1352,7 @@ pub fn Engine(comptime Ctx: type) type {
                 ._drain_hooks = &server.drain_hooks,
                 ._timeout_context = if (inline_mode) null else &timer,
                 ._set_timeout = if (inline_mode) null else setTimeout,
+                ._claim_timeout = if (inline_mode) null else claimTimeout,
                 // Its entry table is never read past `len`: not zeroed.
                 .session = undefined,
             };
@@ -1514,6 +1515,7 @@ pub fn Engine(comptime Ctx: type) type {
             // A task's request timer lives on the task's stack.
             ex.request._timeout_context = null;
             ex.request._set_timeout = null;
+            ex.request._claim_timeout = null;
             d.request = &ex.request;
             d.response = &ex.response;
             return ex;
@@ -1768,6 +1770,11 @@ pub fn Engine(comptime Ctx: type) type {
         fn setTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) void {
             const timer: *Timer = @ptrCast(@alignCast(context));
             timer.set(io, timeout);
+        }
+
+        fn claimTimeout(context: *anyopaque) bool {
+            const timer: *Timer = @ptrCast(@alignCast(context));
+            return timer.fired();
         }
 
         fn parseMethod(name: []const u8) ?http.Method {
