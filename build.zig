@@ -1015,7 +1015,24 @@ pub fn build(b: *std.Build) void {
     // own build_options module; the C libraries in `c_mods` are shared, so each
     // compiles once per target.
     const flags_step = b.step("test-flags", "Build (and on a native target run) the tests for every preset and edge flag combination");
+    // CI spreads the combinations over parallel jobs.
+    const combos_only = b.option([]const u8, "flags-combos", "zig build test-flags: only these combinations, comma-separated (default: all)");
+    if (combos_only) |list| {
+        var it = std.mem.tokenizeScalar(u8, list, ',');
+        while (it.next()) |name| {
+            for (flag_combos) |combo| {
+                if (std.mem.eql(u8, combo.name, name)) break;
+            } else flags_step.dependOn(&b.addFail(b.fmt("-Dflags-combos: no combination named '{s}'", .{name})).step);
+        }
+    }
     for (flag_combos) |combo| {
+        if (combos_only) |list| {
+            var it = std.mem.tokenizeScalar(u8, list, ',');
+            const wanted = while (it.next()) |name| {
+                if (std.mem.eql(u8, combo.name, name)) break true;
+            } else false;
+            if (!wanted) continue;
+        }
         if (!combo.features.coveredBy(features)) {
             flags_step.dependOn(&b.addFail(b.fmt(
                 "test-flags needs every C dependency, but combo '{s}' needs one the current flags turned off; run it with the default -Dprofile=full and no feature overrides",

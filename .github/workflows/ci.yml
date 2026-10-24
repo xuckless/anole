@@ -56,9 +56,6 @@ jobs:
       - name: Unit and smoke tests (default profile, every feature on)
         timeout-minutes: 35
         run: zig build test --summary all
-      - name: Every preset and edge flag combination
-        timeout-minutes: 25
-        run: zig build test-flags --summary all
       # test-flags shares one full-profile configure, so it cannot catch a
       # feature that reads a C module its own flags never requested. These
       # configure each profile on its own, as a user would.
@@ -91,6 +88,33 @@ jobs:
         run: |
           zig build cli rest --summary all
           python3 -I tests/console/pty_test.py zig-out/bin/anole zig-out/bin/rest
+
+  # Every preset and edge flag combination, a third of them per job: the
+  # twelve full suites one after another outgrew one step's time on the
+  # macOS runner.
+  flags:
+    name: test-flags (${{ matrix.os }}, ${{ matrix.group.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        group:
+          - { name: full, combos: "full,full-no-compression,full-tls-none,minimal" }
+          - { name: trimmed, combos: "full-no-brotli,full-no-openapi,db-none,db-only" }
+          - { name: subsets, combos: "brokers-none,http2-no-grpc,web,minimal-no-lambda" }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: flags-${{ matrix.group.name }}
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: Preset and edge flag combinations (${{ matrix.group.combos }})
+        timeout-minutes: 25
+        run: zig build test-flags -Dflags-combos=${{ matrix.group.combos }} --summary all
 
   cross:
     name: cross (${{ matrix.target }}, compile and link only)
