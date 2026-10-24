@@ -109,6 +109,18 @@ fn writeType(jw: *Jw, comptime T: type) !void {
             .pointer => |p| if (@typeInfo(p.child) == .@"fn") jw.write("fnptr") else jw.write("ptr"),
             else => @compileError("unsupported optional"),
         },
+        // A fixed array of a scalar (anole_net_addr.addr): `{"array": {"type": "u8", "len": 16}}`.
+        .array => |a| {
+            try jw.beginObject();
+            try jw.objectField("array");
+            try jw.beginObject();
+            try jw.objectField("type");
+            try writeType(jw, a.child);
+            try jw.objectField("len");
+            try jw.write(a.len);
+            try jw.endObject();
+            try jw.endObject();
+        },
         .@"union" => |u| {
             try jw.beginObject();
             try jw.objectField("union");

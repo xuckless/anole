@@ -77,6 +77,7 @@ const resilience = @import("../resilience/root.zig");
 /// types (`Numeric`, `Cidr`) and `listener`.
 pub const driver = @import("anole_pg");
 const pg = driver;
+const NotifyHub = @import("../watch/pg.zig").NotifyHub;
 const dusty_tls = if (has_tls) @import("anole_dusty_tls") else struct {};
 
 const has_tls = features.tls == .boringssl;
@@ -475,6 +476,17 @@ const Lease = struct {
 /// before the call writes).
 pub var test_after_take: if (builtin.is_test) ?*const fn (*pg.Conn) void else void = if (builtin.is_test) null else {};
 
+/// A connection from `Client.session`.
+pub const Session = struct {
+    raw: *pg.Conn,
+    gpa: std.mem.Allocator,
+
+    pub fn close(self: *Session) void {
+        self.raw.deinit();
+        self.gpa.destroy(self.raw);
+    }
+};
+
 /// A PostgreSQL database: the handle in the App state. Its calls take the
 /// request (or an `anole.db.Ctx`) first; see `anole.db`.
 pub const Client = struct {
@@ -503,6 +515,10 @@ pub const Client = struct {
     store: if (has_tls) @FieldType(pg.TlsConfig, "store") else void = if (has_tls) null else {},
     /// The client certificate, when there is one.
     cert: if (has_tls) ?*dusty_tls.config.CertKeyPair else void = if (has_tls) null else {},
+    /// The one LISTEN connection of this client's `anole.watch`es, made on
+    /// first use (`_notifyHub`).
+    notify_hub: ?*NotifyHub = null,
+    notify_hub_mutex: std.Io.Mutex = .init,
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.postgres` calls it.
@@ -654,11 +670,45 @@ pub const Client = struct {
         return self;
     }
 
+    /// Closes the idle connections of every executor's pool; calls open
+    /// new ones as they need them (the pools keep their size). The Lambda
+    /// adapter calls it after a long freeze, when a NAT gateway may have
+    /// dropped them without telling either end. Done here the way pg.zig's
+    /// own idle expiry does it (`takeExpired`, `closeExpired`): the idle
+    /// connections are taken out under the pool's lock and closed outside
+    /// it, and their slots freed for waiters.
+    pub fn closeIdle(self: *Client) void {
+        for (self.pools.pools) |*shard| {
+            const pool = shard.pool;
+            const io = pool._io;
+            while (true) {
+                pool._mutex.lockUncancelable(io);
+                if (pool._available == 0) {
+                    pool._mutex.unlock(io);
+                    break;
+                }
+                // The bottom of the idle stack: idle the longest.
+                const conn = pool._conns[0];
+                const available = pool._available - 1;
+                std.mem.copyForwards(*pg.Conn, pool._conns[0..available], pool._conns[1 .. available + 1]);
+                pool._available = available;
+                pool._open -= 1;
+                pool._mutex.unlock(io);
+                conn.deinit();
+                pool._allocator.destroy(conn);
+                pool._cond.broadcast(io);
+            }
+            self.report(shard);
+        }
+    }
+
     /// Closes every connection: after the server has drained (`app`'s
     /// `deinit` does it then).
     pub fn deinit(self: *Client) void {
         const gpa = self.gpa;
-        // First: a statement still running for the cache holds a connection.
+        // First: the LISTEN connection and its tasks.
+        if (self.notify_hub) |h| h.destroy();
+        // A statement still running for the cache holds a connection.
         self.cache.deinit();
         self.guard.deinit();
         for (self.pools.pools) |*shard| shard.pool.deinit();
@@ -820,10 +870,39 @@ pub const Client = struct {
         return .{ .db = self, .io = c.io, .lease = lease, .raw = lease.conn };
     }
 
+    /// The shared LISTEN connection of `anole.watch` (internal): one per
+    /// client, made on first use.
+    pub fn _notifyHub(self: *Client) !*NotifyHub {
+        self.notify_hub_mutex.lockUncancelable(self.io);
+        defer self.notify_hub_mutex.unlock(self.io);
+        if (self.notify_hub) |h| return h;
+        const h = try NotifyHub.create(self);
+        self.notify_hub = h;
+        return h;
+    }
+
     /// A connection for `LISTEN`/`NOTIFY`, outside the pools (pg.zig's
     /// `Listener`): it waits for notifications as long as it is open.
     pub fn listener(self: *Client) !pg.Listener {
         return self.pools.pools[0].pool.newListener();
+    }
+
+    /// A connection of its own, outside the pools, with the pools' settings
+    /// (TLS, login): for session state that must outlive one call, such as
+    /// an advisory lock. `close` it.
+    pub fn session(self: *Client, c: anytype) Error!Session {
+        const pool = self.pools.pools[0].pool;
+        const conn = self.gpa.create(pg.Conn) catch return error.OutOfMemory;
+        errdefer self.gpa.destroy(conn);
+        conn.* = pg.Conn.openAndAuth(pool._io, pool._allocator, pool._opts.connect, pool._opts.auth) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            else => {
+                var ctx = erase(c);
+                return self.unavailable(&ctx, &self.pools.pools[0], err, null);
+            },
+        };
+        return .{ .raw = conn, .gpa = self.gpa };
     }
 
     /// True when the database answers `SELECT 1` within `ping_timeout`:

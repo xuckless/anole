@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/xuckless/anole/blob/v0.3.1/include/anole.schema.json",
-  "x-anole-abi": "0.9",
+  "x-anole-abi": "0.10",
   "title": "Anole C ABI configuration",
   "description": "The JSON document anole_server_create takes (anole_server_options.config_json). Unknown keys are refused, with the line and column in anole_last_error (token UnknownKey).",
   "type": "object",
@@ -183,9 +183,597 @@
         "$ref": "#/$defs/Broker"
       },
       "description": "Message brokers for anole_nats_*, opened at start."
+    },
+    "jobs": {
+      "$ref": "#/$defs/Jobs",
+      "description": "The durable job queue for anole_jobs_*."
+    },
+    "webhooks": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Webhooks"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Webhooks out (needs jobs)."
+    },
+    "storage": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Storage"
+      },
+      "description": "S3-compatible object stores for anole_s3_*, opened at start."
+    },
+    "mail": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Mail"
+      },
+      "description": "Mail servers for anole_smtp_*, opened at start."
+    },
+    "lambda": {
+      "$ref": "#/$defs/Lambda",
+      "description": "AWS Lambda (deployment \"lambda\"): where invocations come from and how answers go back. Ignored by other deployments. docs/lambda.md."
+    },
+    "sse": {
+      "$ref": "#/$defs/Sse"
+    },
+    "watches": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Watch"
+      },
+      "description": "Database changes fed into SSE topics and WebSocket rooms, or read by consumers (anole_watch_*)."
     }
   },
   "$defs": {
+    "Lambda": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "runtime_api": { "type": ["string", "null"], "default": null, "description": "The Runtime API, host:port; null: AWS_LAMBDA_RUNTIME_API. Set, it also wins over AWS_LAMBDA_HTTP_ENDPOINT." },
+        "invoke_mode": { "enum": ["buffered", "response_stream", null], "default": null, "description": "buffered or response_stream (a Function URL with RESPONSE_STREAM, a REST API with responseTransferMode STREAM); null: ANOLE_LAMBDA_INVOKE_MODE, else buffered." },
+        "concurrency": { "type": ["integer", "null"], "minimum": 1, "maximum": 4096, "default": null, "description": "Invocations served at once; null: AWS_LAMBDA_MAX_CONCURRENCY (Lambda Managed Instances), else 1." },
+        "event_path": { "type": ["string", "null"], "default": "/_lambda/event", "description": "Where events that are not HTTP requests are POSTed (the event as the JSON body); a 2xx answer's body is the result. null: such events fail the invocation." },
+        "base_path": { "type": ["string", "null"], "default": null, "description": "Taken off the front of every HTTP event's path (an API Gateway custom domain's base path); null: none." },
+        "keep_stage": { "type": "boolean", "default": false, "description": "Keep a named stage at the front of an HTTP API path." },
+        "context_headers": { "type": "boolean", "default": true, "description": "Send the invocation in x-amzn-request-context and x-amzn-lambda-context (a client's own copies are removed either way)." },
+        "deadline_margin_ms": { "type": "integer", "minimum": 0, "default": 100, "description": "A request still running this long before the invocation's deadline is canceled and answered 504." },
+        "idle_reset_ms": { "type": ["integer", "null"], "minimum": 0, "default": 300000, "description": "Close idle outbound and database connections when an invocation arrives this long after the last one ended; null: never." },
+        "sigterm": { "type": "boolean", "default": true, "description": "Register a no-op Lambda extension so that Lambda sends SIGTERM before it shuts the environment down." },
+        "shutdown_timeout_ms": { "type": "integer", "minimum": 1, "default": 400, "description": "The most the shutdown after SIGTERM may take." },
+        "flush_timeout_ms": { "type": "integer", "minimum": 0, "default": 500, "description": "The most that sending finished spans may hold up the next invocation." }
+      }
+    },
+    "Storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "description": "What anole_s3_find looks it up by: unique, 1-255 bytes."
+        },
+        "s3": {
+          "$ref": "#/$defs/S3"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 30000,
+          "description": "A bound on every call that has no timeout_ms of its own. 0: none."
+        },
+        "errors": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "unique": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "exclusion": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "foreign_key": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "not_null": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "check": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "serialization": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "deadlock": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "unavailable": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "service_unavailable"
+            },
+            "timeout": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "gateway_timeout"
+            },
+            "other": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "not_found": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "not_found"
+            },
+            "precondition": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "invalid": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "bad_request"
+            }
+          },
+          "description": "What status each class of database error becomes (anole.db.ErrorMap): a class name to the status it answers with."
+        },
+        "retry": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "attempts": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10,
+                  "default": 3,
+                  "description": "Attempts in all, the first included."
+                },
+                "base_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 100
+                },
+                "max_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 2000
+                },
+                "multiplier": {
+                  "type": "number",
+                  "minimum": 1,
+                  "default": 2.0
+                },
+                "attempt_timeout_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 0,
+                  "description": "A bound on each attempt; 0: none."
+                },
+                "max_retry_after_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 10000
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "breaker": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "consecutive_failures": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 5,
+                  "description": "Open after this many failures in a row; 0: not this rule."
+                },
+                "failure_ratio": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1,
+                  "default": 0.5,
+                  "description": "Open when failures / calls reaches this over window_ms, once min_calls calls are in it; 0: not this rule."
+                },
+                "min_calls": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 20
+                },
+                "window_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 10000,
+                  "description": "The failure ratio's sliding window."
+                },
+                "open_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 5000,
+                  "description": "The first open period; it doubles after each failed probe."
+                },
+                "max_open_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 60000
+                },
+                "half_open_calls": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 255,
+                  "default": 1,
+                  "description": "Calls let through at once while half-open."
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A circuit breaker: after repeated connection failures calls fail fast with ANOLE_E_DB, class UNAVAILABLE, error_code \"circuit_open\" and http_status 503. null: none. Ignored for SQLite."
+        }
+      }
+    },
+    "S3": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "endpoint": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "\"https://<account>.r2.cloudflarestorage.com\", \"http://127.0.0.1:9000\". Null: AWS_ENDPOINT_URL_S3, AWS_ENDPOINT_URL, else AWS."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "region": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "Null: AWS_REGION, AWS_DEFAULT_REGION, else the provider's."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bucket": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The default bucket; null: S3_BUCKET."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "access_key_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "Keys: both or neither (neither takes the AWS credential chain)."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "secret_access_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "anonymous": {
+          "type": "boolean",
+          "default": false,
+          "description": "Unsigned requests, for public buckets."
+        },
+        "provider": {
+          "enum": [
+            "auto",
+            "aws",
+            "r2",
+            "b2",
+            "supabase",
+            "minio",
+            "generic"
+          ],
+          "default": "auto"
+        },
+        "addressing": {
+          "enum": [
+            "auto",
+            "path",
+            "virtual_host"
+          ],
+          "default": "auto"
+        },
+        "payload_signing": {
+          "enum": [
+            "auto",
+            "signed",
+            "unsigned"
+          ],
+          "default": "auto",
+          "description": "auto hashes the body over plain HTTP only."
+        },
+        "ca_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ca_pem": {
+          "anyOf": [
+            {
+              "type": "string",
+              "description": "The same as PEM text."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_file": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_cert_pem": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "client_key_pem": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "insecure_skip_verify": {
+          "type": "boolean",
+          "default": false
+        },
+        "min_throughput": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1048576,
+          "description": "Bytes per second a call that moves a body is given on top of timeout_ms."
+        },
+        "connect_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000
+        },
+        "max_idle_connections": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 64
+        },
+        "part_size": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 8388608,
+          "description": "Multipart part size, 5 MiB .. 5 GiB."
+        },
+        "multipart_threshold": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "description": "A body of known length up to this size goes up as one PUT; null: part_size."
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 255,
+          "default": 2,
+          "description": "Parts of one upload in flight at once, 1..16."
+        },
+        "upload_memory": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 268435456,
+          "description": "Part buffers of every upload together."
+        },
+        "max_object_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 16777216,
+          "description": "A whole-body get larger than this fails with ANOLE_E_TOOBIG."
+        },
+        "readiness": {
+          "type": "boolean",
+          "default": false,
+          "description": "Add a HeadBucket check to /readyz."
+        }
+      }
+    },
     "Listener": {
       "type": "object",
       "additionalProperties": false,
@@ -283,6 +871,363 @@
           },
           "default": [],
           "description": "With proxy_protocol: the proxies allowed to send one (addresses or CIDR networks); empty: proxy.trusted when set, else any peer."
+        },
+        "tcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetTcp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Raw TCP instead of HTTP (needs a port or unix; not with http3)."
+        },
+        "udp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetUdp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "UDP instead of HTTP (needs a port; not with tls, unix or proxy_protocol)."
+        }
+      }
+    },
+    "NetFraming": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How input is cut into messages: exactly one of lines, length, varint. Left out: bytes as they arrive.",
+      "properties": {
+        "lines": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "max": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1073741824,
+                  "default": 65536,
+                  "description": "A line longer than this (without its end) closes the connection."
+                },
+                "strip_cr": {
+                  "type": "boolean",
+                  "default": true,
+                  "description": "Drop a \"\\r\" before the \"\\n\"."
+                },
+                "crlf": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "anole_net_write with ANOLE_NET_F_FRAME ends the line with \"\\r\\n\"."
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "length": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "bytes": {
+                  "type": "integer",
+                  "enum": [
+                    1,
+                    2,
+                    4
+                  ],
+                  "default": 4,
+                  "description": "Bytes of the length prefix."
+                },
+                "endian": {
+                  "type": "string",
+                  "enum": [
+                    "big",
+                    "little"
+                  ],
+                  "default": "big"
+                },
+                "includes_header": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "The length counts its own bytes."
+                },
+                "max": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1073741824,
+                  "default": 1048576,
+                  "description": "A frame longer than this closes the connection."
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "varint": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "max": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1073741824,
+                  "default": 1048576,
+                  "description": "A frame longer than this closes the connection."
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "NetTcp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "handler"
+      ],
+      "description": "A raw TCP listener: connections and their data go to the consumer as events (ANOLE_EV_NET_*), not HTTP.",
+      "properties": {
+        "handler": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Carried in the listener's records (handler_id); any number the consumer picks."
+        },
+        "framing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetFraming"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "half_open": {
+          "type": "boolean",
+          "default": false,
+          "description": "After the peer ends its side the connection stays open for writing until the consumer ends it (ANOLE_EV_NET_END)."
+        },
+        "no_delay": {
+          "type": "boolean",
+          "default": true,
+          "description": "TCP_NODELAY."
+        },
+        "keepalive_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 60000,
+          "description": "TCP keep-alive probes after this much silence; null: off."
+        },
+        "handshake_timeout_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 10000,
+          "description": "The PROXY header and the TLS handshake, together; null: the request timeout."
+        },
+        "idle_timeout_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "No input for this long closes the connection; null: never."
+        },
+        "lifetime_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The longest a connection may stay open; null: no limit."
+        },
+        "write_timeout_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 30000,
+          "description": "A flush the peer does not take for this long closes the connection; null: none."
+        },
+        "write_high_water": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 262144,
+          "description": "Past this many queued bytes anole_net_write answers ANOLE_BUSY."
+        },
+        "write_max": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 8388608,
+          "description": "Past this many it takes nothing (ANOLE_E_AGAIN)."
+        },
+        "read_window": {
+          "type": "integer",
+          "minimum": 4096,
+          "maximum": 65536,
+          "default": 16384,
+          "description": "The read buffer of each burst."
+        },
+        "read_ahead": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 262144,
+          "description": "Bytes of one connection posted and not yet polled, at most."
+        },
+        "max_connections": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Open connections on this listener, at most; null: the server's limit alone."
+        },
+        "log_connections": {
+          "type": "boolean",
+          "default": false,
+          "description": "One access-log line per closed connection."
+        }
+      }
+    },
+    "NetUdp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "handler"
+      ],
+      "description": "A raw UDP listener: datagrams go to the consumer in batches (ANOLE_EV_NET_DATAGRAMS). No TLS, unix socket or PROXY header.",
+      "properties": {
+        "handler": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Carried in the listener's records (handler_id)."
+        },
+        "sockets": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 255
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SO_REUSEPORT sockets (Linux), each on an executor; null: one per executor."
+        },
+        "max_datagram": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65507,
+          "default": 2048,
+          "description": "The largest datagram taken; a larger one is dropped and counted."
+        },
+        "batch": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 32,
+          "description": "Datagrams per receive call."
+        },
+        "send_queue": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 1048576,
+          "description": "Bytes waiting to go out per socket."
+        },
+        "receive_buffer": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SO_RCVBUF; null: the system's."
+        },
+        "send_buffer": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "SO_SNDBUF; null: the system's."
         }
       }
     },
@@ -518,6 +1463,13 @@
           "maximum": 4294967295,
           "default": 16777216,
           "description": "The largest database answer (its record's bytes); past it, ANOLE_E_TOOBIG."
+        },
+        "sse_max_event": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 1048576,
+          "description": "The largest event anole_sse_publish and anole_sse_send take."
         }
       }
     },
@@ -1180,6 +2132,137 @@
           "required": [
             "rate_limit"
           ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "webhook_verify": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Checks an incoming webhook's signature before the handler runs (400 when wrong) and drops duplicate deliveries (200 for one already processed, 409 while it is being processed).",
+              "properties": {
+                "preset": {
+                  "enum": [
+                    "standard",
+                    "stripe",
+                    "github",
+                    "slack",
+                    "hmac"
+                  ]
+                },
+                "secrets": {
+                  "anyOf": [
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "One or more (rotation). standard: whsec_<base64> (v1) or whpk_<base64> (v1a public key); stripe: the whsec_ text as it is; github, slack, hmac: the shared secret."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "secrets_env": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "description": "An environment variable holding one secret, or several separated by spaces."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "tolerance_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 300000,
+                  "description": "The timestamp window, both directions (standard, stripe, slack)."
+                },
+                "dedup": {
+                  "type": "string",
+                  "default": "memory",
+                  "pattern": "^(memory|none|redis:.+)$",
+                  "description": "\"memory\", \"none\" or \"redis:<databases[].name>\"."
+                },
+                "dedup_ttl_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 86400000
+                },
+                "on_store_error": {
+                  "enum": [
+                    "reject",
+                    "process"
+                  ],
+                  "default": "reject",
+                  "description": "When the duplicate store fails: answer 503, or run the handler without it."
+                },
+                "hmac": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "header": {
+                          "type": "string"
+                        },
+                        "algorithm": {
+                          "enum": [
+                            "sha1",
+                            "sha256",
+                            "sha512"
+                          ],
+                          "default": "sha256"
+                        },
+                        "encoding": {
+                          "enum": [
+                            "hex",
+                            "base64"
+                          ],
+                          "default": "hex"
+                        },
+                        "prefix": {
+                          "type": "string",
+                          "default": "",
+                          "description": "Stripped from the header value first (\"sha256=\")."
+                        },
+                        "id_header": {
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "description": "A header with the delivery's id, for duplicates."
+                        }
+                      },
+                      "required": [
+                        "header"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "With preset hmac."
+                }
+              },
+              "required": [
+                "preset"
+              ]
+            }
+          },
+          "required": [
+            "webhook_verify"
+          ]
         }
       ]
     },
@@ -1332,6 +2415,16 @@
             }
           ]
         },
+        "sse": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SseRoute"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "timeout_ms": {
           "anyOf": [
             {
@@ -1371,7 +2464,7 @@
       "required": [
         "path"
       ],
-      "description": "Exactly one of handler, respond, static, websocket, webtransport; handler and a websocket with \"accept\": \"consumer\" may go together."
+      "description": "Exactly one of handler, respond, static, websocket, webtransport, sse; handler and a websocket with \"accept\": \"consumer\" may go together."
     },
     "Fixed": {
       "type": "object",
@@ -1835,6 +2928,42 @@
                 "gateway_timeout"
               ],
               "default": "internal_server_error"
+            },
+            "not_found": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "not_found"
+            },
+            "precondition": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "invalid": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "bad_request"
             }
           },
           "description": "What status each class of database error becomes (anole.db.ErrorMap): a class name to the status it answers with."
@@ -2592,6 +3721,139 @@
       "required": [
         "name"
       ]
+    },
+    "Sse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "heartbeat_ms": { "type": ["integer", "null"], "minimum": 0, "default": 15000, "description": "A comment line to every subscriber idle this long; null: none." },
+        "retry_ms": { "type": ["integer", "null"], "minimum": 0, "default": null, "description": "Sent as retry: at the start of each stream; null: the browser's default." },
+        "replay": { "anyOf": [ { "$ref": "#/$defs/SseReplay" }, { "type": "null" } ], "description": "Null: no ids, no replay, no gap events." },
+        "max_queued_bytes": { "type": "integer", "minimum": 1, "default": 262144, "description": "Bytes waiting for one subscriber (each event counts 64 more)." },
+        "on_full": { "enum": ["close", "drop"], "default": "close", "description": "close: a subscriber that does not keep up is sent what is queued and its stream ends (the browser reconnects and resumes from the replay); drop: the event is skipped for it." },
+        "close_after_ms": { "type": "integer", "minimum": 0, "default": 1000, "description": "close: a sender stuck this long on a full subscriber aborts its stream." },
+        "leave_grace_ms": { "type": "integer", "minimum": 0, "default": 1000, "description": "How long a write under way may finish before it is canceled." },
+        "max_topics_per_subscriber": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 64 },
+        "gap_event": { "type": ["string", "null"], "default": "gap", "description": "The gap event's name; null sends no gap events." },
+        "drain_retry": { "anyOf": [ { "$ref": "#/$defs/SseRetry" }, { "type": "null" } ], "description": "The retry spread at the drain; null: streams just end." }
+      }
+    },
+    "SseReplay": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "events": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 256, "description": "Per topic." },
+        "bytes": { "type": "integer", "minimum": 1, "default": 262144, "description": "Per topic." },
+        "total_bytes": { "type": "integer", "minimum": 1, "default": 67108864, "description": "Every topic together; the globally oldest event goes first." },
+        "max_age_ms": { "type": "integer", "minimum": 0, "default": 300000 },
+        "max_per_resume": { "type": "integer", "minimum": 1, "default": 1024, "description": "One resume replays at most this many events, else it is a gap." }
+      }
+    },
+    "SseRetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "min_ms": { "type": "integer", "minimum": 0, "default": 500 },
+        "max_ms": { "type": "integer", "minimum": 0, "default": 5000 }
+      }
+    },
+    "SseRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "topics": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Topics a subscriber joins; {name} is the path's parameter name." },
+        "last": { "type": "integer", "minimum": 0, "maximum": 65535, "default": 0, "description": "Without Last-Event-ID: the newest this-many events of each topic." },
+        "handler": { "type": ["integer", "null"], "minimum": 0, "maximum": 4294967295, "default": null, "description": "A consumer route id: subscribe requests become ANOLE_EV_SSE_SUBSCRIBE, and the subscriber joins topics plus those of anole_sse_accept." }
+      }
+    },
+    "Watch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "database": { "type": "string", "description": "A databases entry of the matching kind." },
+        "postgres": { "anyOf": [ { "$ref": "#/$defs/WatchPostgres" }, { "type": "null" } ] },
+        "redis": { "anyOf": [ { "$ref": "#/$defs/WatchRedis" }, { "type": "null" } ] },
+        "redis_stream": { "anyOf": [ { "$ref": "#/$defs/WatchStream" }, { "type": "null" } ] },
+        "mongodb": { "anyOf": [ { "$ref": "#/$defs/WatchMongo" }, { "type": "null" } ] },
+        "to": { "type": "array", "items": { "$ref": "#/$defs/WatchTo" }, "default": [] },
+        "data": { "enum": ["auto", "document"], "default": "auto", "description": "MongoDB: document sends fullDocument alone." },
+        "reconnect": { "anyOf": [ { "$ref": "#/$defs/WatchReconnect" }, { "type": "null" } ] }
+      },
+      "required": ["name", "database"],
+      "description": "Exactly one of postgres, redis, redis_stream and mongodb."
+    },
+    "WatchPostgres": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "channels": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1, "maxLength": 63 } } },
+      "required": ["channels"]
+    },
+    "WatchRedis": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "channels": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "patterns": { "type": "array", "items": { "type": "string" }, "default": [], "description": "PSUBSCRIBE patterns (room:*); at least one channel or pattern." }
+      }
+    },
+    "WatchStream": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "keys": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string" } },
+        "start": { "description": "\"new\", \"all\" or {\"after\": [\"id\", ...]}, one entry ID per key." },
+        "count": { "type": "integer", "minimum": 1, "default": 128 },
+        "block_ms": { "type": "integer", "minimum": 1, "default": 10000 },
+        "group": { "anyOf": [ { "$ref": "#/$defs/WatchGroup" }, { "type": "null" } ] }
+      },
+      "required": ["keys"]
+    },
+    "WatchGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "consumer": { "type": ["string", "null"], "default": null },
+        "create": { "type": "boolean", "default": true },
+        "ack": { "enum": ["auto", "manual"], "default": "auto" }
+      },
+      "required": ["name"]
+    },
+    "WatchMongo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "database": { "type": ["string", "null"], "default": null },
+        "collection": { "type": ["string", "null"], "default": null },
+        "pipeline": { "description": "An Extended JSON array of stages after $changeStream." },
+        "full_document": { "enum": ["default", "update_lookup", "when_available", "required"], "default": "default" },
+        "full_document_before_change": { "enum": ["off", "when_available", "required"], "default": "off" },
+        "start": { "description": "\"now\", {\"resume_after\": token}, {\"start_after\": token} or {\"at\": {\"t\": n, \"i\": n}}." },
+        "max_await_ms": { "type": ["integer", "null"], "minimum": 0, "default": null },
+        "batch_size": { "type": ["integer", "null"], "minimum": 1, "default": null },
+        "show_expanded_events": { "type": "boolean", "default": false }
+      }
+    },
+    "WatchTo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sse": { "type": ["string", "null"], "default": null, "description": "A topic (a template: {channel}, {op}, {data.<field>}, and for MongoDB {db}, {collection}, {key})." },
+        "ws": { "type": ["string", "null"], "default": null, "description": "A room (a template)." },
+        "event": { "type": ["string", "null"], "default": null, "description": "sse: the event name." },
+        "type": { "enum": ["text", "binary"], "default": "text", "description": "ws: the message type." },
+        "gap_message": { "type": ["string", "null"], "default": null, "description": "ws: broadcast on a gap." }
+      },
+      "description": "Exactly one of sse and ws."
+    },
+    "WatchReconnect": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "base_ms": { "type": "integer", "minimum": 0, "default": 100 },
+        "max_ms": { "type": "integer", "minimum": 0, "default": 5000 }
+      }
     },
     "Broker": {
       "type": "object",
@@ -3433,6 +4695,42 @@
                 "gateway_timeout"
               ],
               "default": "internal_server_error"
+            },
+            "not_found": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "not_found"
+            },
+            "precondition": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "invalid": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "bad_request"
             }
           },
           "description": "What status each class of database error becomes (anole.db.ErrorMap): a class name to the status it answers with."
@@ -3480,6 +4778,767 @@
             }
           },
           "description": "What queries with ANOLE_DB_F_RETRY are retried with, on a transient failure (the server unreachable, a connection lost). Ignored for SQLite and MongoDB."
+        }
+      }
+    },
+    "Jobs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "store": { "type": "string", "default": "memory", "description": "A databases[].name (SQLite, PostgreSQL or Redis), or \"memory\" (lost on restart)." },
+        "queues": { "type": "array", "default": [{ "name": "default", "concurrency": 10 }], "items": { "$ref": "#/$defs/JobQueue" }, "description": "The queues this process works." },
+        "lease_ms": { "type": "integer", "minimum": 3000, "default": 30000, "description": "How long a claimed job is held without a heartbeat." },
+        "poll_ms": { "type": "integer", "minimum": 100, "maximum": 60000, "default": 1000, "description": "Staging, idle claims and rescue checks." },
+        "migrate": { "type": "boolean", "default": true, "description": "Create the tables at start." },
+        "notify": { "type": "boolean", "default": true, "description": "LISTEN/NOTIFY (PostgreSQL) or pub/sub (Redis) wakes; off behind PgBouncer transaction pooling." },
+        "table_prefix": { "type": "string", "default": "anole_", "maxLength": 32 },
+        "key_prefix": { "type": "string", "default": "anole:", "maxLength": 32 },
+        "kinds": { "type": "array", "default": [], "items": { "$ref": "#/$defs/JobKind" }, "description": "Kinds known by name: their defaults for anole_jobs_enqueue." },
+        "keep": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "completed_ms": { "type": "integer", "minimum": 0, "default": 86400000 },
+            "dead_ms": { "type": "integer", "minimum": 0, "default": 2592000000 },
+            "cancelled_ms": { "type": "integer", "minimum": 0, "default": 604800000 }
+          },
+          "description": "How long finished jobs are kept before the leader prunes them."
+        },
+        "leader": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "method": { "enum": ["auto", "advisory_lock", "lease_row"], "default": "auto" },
+            "ttl_ms": { "type": "integer", "minimum": 1, "default": 15000 },
+            "renew_ms": { "type": "integer", "minimum": 1, "default": 5000 }
+          },
+          "description": "Which instance runs schedules and maintenance."
+        },
+        "drain_ms": { "type": "integer", "minimum": 0, "default": 10000, "description": "How long a server drain lets running jobs finish before they are put back." },
+        "cron": { "type": "array", "default": [], "items": { "$ref": "#/$defs/JobCron" }, "description": "Schedules: each enqueues a job of kind, or runs a statement." }
+      }
+    },
+    "JobQueue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9_.-]{1,64}$" },
+        "concurrency": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 10 }
+      }
+    },
+    "JobKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "maxLength": 128, "description": "1-128 bytes of [A-Za-z0-9_.:-]; \"anole.\" is reserved." },
+        "queue": { "type": "string", "default": "default" },
+        "priority": { "enum": ["critical", "high", "normal", "low"], "default": "normal" },
+        "attempts": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 20 },
+        "timeout_ms": { "type": "integer", "minimum": 0, "default": 900000, "description": "0: no bound." }
+      }
+    },
+    "JobCron": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "schedule"],
+      "properties": {
+        "name": { "type": "string" },
+        "schedule": { "type": "string", "description": "Five fields, or six with seconds first; @daily and the like; @every 90s." },
+        "tz": { "type": ["string", "null"], "default": null, "description": "An IANA name, \"UTC\" or an offset; null: UTC." },
+        "kind": { "type": ["string", "null"], "default": null, "description": "The kind to enqueue; exactly one of kind and sql." },
+        "args": { "description": "The kind's arguments (a JSON value)." },
+        "sql": {
+          "type": ["object", "null"],
+          "default": null,
+          "additionalProperties": false,
+          "required": ["database", "statement"],
+          "properties": {
+            "database": { "type": "string" },
+            "statement": { "type": "string" }
+          },
+          "description": "A statement run on a configured database (SQLite or PostgreSQL) at each tick."
+        },
+        "missed": { "enum": ["once", "skip", "all"], "default": "once" },
+        "catch_up_ms": { "type": "integer", "minimum": 0, "default": 86400000 }
+      }
+    },
+    "Webhooks": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Webhooks out (-Dwebhooks; needs \"jobs\"): endpoints, signed deliveries run as jobs, retries with backoff and the delivery log. Endpoint management and replay go through anole_jobs_admin; anole_webhooks_publish sends events.",
+      "properties": {
+        "queue": {
+          "type": "string",
+          "default": "webhooks",
+          "description": "The jobs queue deliveries run on."
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 32,
+          "description": "Deliveries at once in this process."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 15000,
+          "description": "Per attempt."
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 10,
+          "description": "Every try, the first included."
+        },
+        "backoff": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "base_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 5000,
+              "description": "The first retry's ceiling."
+            },
+            "max_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 86400000
+            },
+            "multiplier": {
+              "type": "number",
+              "minimum": 1,
+              "default": 5,
+              "description": "Ceilings 5 s, 25 s, 2 min, 10 min, 52 min, 4.3 h, 21.7 h, 24 h."
+            },
+            "jitter": {
+              "enum": [
+                "full",
+                "equal",
+                "none"
+              ],
+              "default": "equal"
+            }
+          }
+        },
+        "breaker": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "consecutive_failures": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 5,
+                  "description": "Open after this many failures in a row; 0: not this rule."
+                },
+                "failure_ratio": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1,
+                  "default": 0.5,
+                  "description": "Open when failures / calls reaches this over window_ms, once min_calls calls are in it; 0: not this rule."
+                },
+                "min_calls": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 20
+                },
+                "window_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 10000,
+                  "description": "The failure ratio's sliding window."
+                },
+                "open_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 5000,
+                  "description": "The first open period; it doubles after each failed probe."
+                },
+                "max_open_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 60000
+                },
+                "half_open_calls": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 255,
+                  "default": 1,
+                  "description": "Calls let through at once while half-open."
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A circuit breaker per endpoint origin (scheme, host and port): while open, deliveries wait without an attempt. null: none."
+        },
+        "allow_private_addresses": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Deliver to loopback and private addresses. null: allowed in development, refused in production."
+        },
+        "require_https": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Refuse http:// endpoints. null: not required in development, required in production."
+        },
+        "user_agent": {
+          "type": "string",
+          "default": "Anole-Webhooks"
+        },
+        "max_payload": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 262144,
+          "description": "A larger data is refused (ANOLE_E_INVALID)."
+        },
+        "response_kept": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 4096,
+          "description": "Bytes of an endpoint's answer kept in the log."
+        },
+        "keep_messages_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 2592000000
+        },
+        "keep_attempts_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 2592000000
+        },
+        "disable_after_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 432000000,
+          "description": "An endpoint whose deliveries have all failed for this long is disabled."
+        },
+        "secrets_key_env": {
+          "type": "string",
+          "default": "ANOLE_WEBHOOKS_KEY",
+          "description": "The environment variable holding the 32-byte base64 key that encrypts stored secrets; \"\" for none."
+        },
+        "max_endpoints_per_owner": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 100
+        }
+      }
+    },
+    "Mail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "smtp"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "What anole_smtp_find looks it up by: unique, 1-255 bytes."
+        },
+        "smtp": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "url": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "smtp://user:pass@host:587 (STARTTLS), smtps://user:pass@host:465, smtp://127.0.0.1:1025?tls=none. Null: SMTP_URL, else Mailpit's smtp://127.0.0.1:1025 (not in production)."
+            },
+            "from": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The default From (\"App <hello@example.com>\"). Null: SMTP_FROM."
+            },
+            "username": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Overrides the URL's user name."
+            },
+            "password": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Overrides the URL's password."
+            },
+            "tls_mode": {
+              "enum": [
+                "auto",
+                "starttls",
+                "implicit",
+                "none"
+              ],
+              "default": "auto",
+              "description": "auto: smtps:// is implicit TLS, smtp:// to a public host requires STARTTLS, to loopback it uses STARTTLS when offered."
+            },
+            "ca_file": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "ca_pem": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "client_cert_file": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "client_key_file": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "client_cert_pem": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "client_key_pem": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "insecure_skip_verify": {
+              "type": "boolean",
+              "default": false
+            },
+            "helo_name": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The EHLO name. Null: the host name."
+            },
+            "max_connections": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4294967295
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Connections in all, split between executors. Null: 2 per executor."
+            },
+            "max_messages_per_connection": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295,
+              "default": 100,
+              "description": "A connection QUITs after this many messages."
+            },
+            "idle_timeout_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 30000,
+              "description": "Idle connections are closed after this; 0: never."
+            },
+            "acquire_timeout_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 5000
+            },
+            "connect_timeout_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 10000
+            },
+            "min_throughput": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1048576,
+              "description": "Bytes per second a send may take at the least, added to the timeout for the message's size."
+            },
+            "max_message_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 26214400,
+              "description": "Refused before connecting when the encoded message is larger."
+            },
+            "readiness": {
+              "type": "boolean",
+              "default": false,
+              "description": "Register a readiness check (/readyz): connect, EHLO, QUIT, cached 30 s."
+            }
+          },
+          "description": "An SMTP server, as anole.smtp.Options (docs/email.md)."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 30000,
+          "description": "A bound on every send that has no timeout_ms of its own, plus the message's size at min_throughput; 0: none."
+        },
+        "breaker": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "consecutive_failures": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 5,
+                  "description": "Open after this many failures in a row; 0: not this rule."
+                },
+                "failure_ratio": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1,
+                  "default": 0.5,
+                  "description": "Open when failures / calls reaches this over window_ms, once min_calls calls are in it; 0: not this rule."
+                },
+                "min_calls": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 20
+                },
+                "window_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 10000,
+                  "description": "The failure ratio's sliding window."
+                },
+                "open_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 5000,
+                  "description": "The first open period; it doubles after each failed probe."
+                },
+                "max_open_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "default": 60000
+                },
+                "half_open_calls": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 255,
+                  "default": 1,
+                  "description": "Calls let through at once while half-open."
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A circuit breaker: after repeated connection failures sends fail fast with ANOLE_E_SERVICE, class UNAVAILABLE, error_code \"circuit_open\" and http_status 503. null: none."
+        },
+        "retry": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "attempts": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 3,
+              "description": "Attempts in all, the first included."
+            },
+            "base_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 500
+            },
+            "max_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 5000
+            },
+            "multiplier": {
+              "type": "number",
+              "minimum": 1,
+              "default": 2.0
+            },
+            "attempt_timeout_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 0,
+              "description": "A bound on each attempt; 0: none."
+            },
+            "max_retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 10000
+            }
+          },
+          "description": "What sends with ANOLE_SMTP_F_RETRY are retried with, on a failure before the final \".\" (a failure after it is never retried)."
+        },
+        "errors": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "unique": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "exclusion": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "foreign_key": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "not_null": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "check": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "serialization": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "deadlock": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "unavailable": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "service_unavailable"
+            },
+            "timeout": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "gateway_timeout"
+            },
+            "other": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "internal_server_error"
+            },
+            "not_found": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "not_found"
+            },
+            "precondition": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "conflict"
+            },
+            "invalid": {
+              "enum": [
+                "bad_request",
+                "not_found",
+                "conflict",
+                "unprocessable_entity",
+                "internal_server_error",
+                "service_unavailable",
+                "gateway_timeout"
+              ],
+              "default": "bad_request"
+            }
+          },
+          "description": "What status each class of database error becomes (anole.db.ErrorMap): a class name to the status it answers with."
         }
       }
     }

@@ -14,6 +14,12 @@ pub const Server = @import("server.zig").Server;
 pub const Adopter = @import("server.zig").Adopter;
 /// One run of an `Adopter`: what it waits for input with, and how it ends.
 pub const Burst = @import("server.zig").Burst;
+/// A protocol that takes connections straight from a listener
+/// (`Listener.raw`), and what it is told (anole.net's raw TCP).
+pub const Raw = @import("server.zig").Raw;
+pub const RawInfo = @import("server.zig").RawInfo;
+/// One connection's reader, writer and TLS state.
+pub const Connection = @import("server.zig").Connection;
 pub const Address = @import("config.zig").Address;
 pub const Listener = @import("config.zig").Listener;
 pub const ServerConfig = @import("config.zig").ServerConfig;
@@ -35,6 +41,10 @@ pub const Sink = @import("sink.zig").Sink;
 /// A response finished after its handler returned, with no task waiting
 /// (`Response.detach`): HTTP/2 and HTTP/3 requests that ran on the reader.
 pub const Detached = @import("detach.zig").Detached;
+/// A streamed response no task holds (`Response._park`); internal, for `anole.sse`.
+pub const Parked = @import("parked.zig").Parked;
+/// `EventStream`'s encoder: one event as bytes.
+pub const writeEvent = @import("response.zig").writeEvent;
 /// Task placement on zio's executors, for protocol engines outside the
 /// core (HTTP/3) that keep a connection's tasks on one executor.
 pub const placement = @import("placement.zig");
@@ -124,6 +134,8 @@ pub const statusBody = @import("middleware.zig").statusBody;
 pub const checkAddressFree = @import("server.zig").checkAddressFree;
 /// A listening TCP socket, with IPV6_V6ONLY as asked (dual-stack `::`).
 pub const listenIp = @import("server.zig").listenIp;
+/// Sets the permission bits of a unix socket file (`Listener.unix_mode`).
+pub const setUnixMode = @import("server.zig").setUnixMode;
 /// `listenIp`'s options.
 pub const ListenIpOptions = @import("server.zig").ListenIpOptions;
 /// An IPv4-mapped IPv6 address as the IPv4 address it stands for.
@@ -143,6 +155,8 @@ pub const ClientOptions = @import("client.zig").ClientOptions;
 pub const TlsOptions = @import("client.zig").TlsOptions;
 pub const ClientResponse = @import("client.zig").ClientResponse;
 pub const FetchOptions = @import("client.zig").FetchOptions;
+pub const Upload = @import("client.zig").Upload;
+pub const UploadOptions = @import("client.zig").UploadOptions;
 pub const WebSocketClient = @import("client.zig").WebSocketClient;
 pub const WebSocketUpgradeOptions = @import("client.zig").WebSocketUpgradeOptions;
 pub const Redirect = @import("client.zig").Redirect;
@@ -157,6 +171,7 @@ test {
 // Import tests
 comptime {
     _ = @import("server_test.zig");
+    _ = @import("parked_test.zig");
     _ = @import("server/request_buffers.zig");
     _ = @import("drain_hooks.zig");
     _ = @import("websocket.zig");

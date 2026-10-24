@@ -44,6 +44,11 @@ pub const StreamError = @import("client.zig").StreamError;
 pub const SessionCache = @import("client.zig").SessionCache;
 /// What became of a client connection's 0-RTT (`ClientConnection.earlyData`).
 pub const EarlyData = @import("client.zig").EarlyData;
+/// The `h3` alternative of an `Alt-Svc` header field value (RFC 7838), for
+/// clients that switch to HTTP/3.
+pub const parseAltSvc = @import("alt_svc.zig").parse;
+/// What `parseAltSvc` found.
+pub const AltSvc = @import("alt_svc.zig").Result;
 /// How `ClientConnection.rebind` moves a connection to a new socket.
 pub const Rebind = @import("client.zig").Rebind;
 
@@ -217,4 +222,5 @@ test {
     _ = @import("percore_test.zig");
     _ = @import("session_cache.zig");
     _ = @import("quic_tls.zig");
+    _ = @import("alt_svc.zig");
 }

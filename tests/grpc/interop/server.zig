@@ -68,6 +68,11 @@ fn streamingInputCall(call: *Call, in: *std.Io.Queue(pb.StreamingInputCallReques
             error.Closed => break,
             else => |e| return e,
         };
+        // The probe of client_compressed_streaming: an uncompressed message
+        // that expects compression is refused at once, before the client
+        // half-closes (grpc-dotnet waits for the status without closing).
+        if (req.expect_compressed) |e| if (e.value and call.requestCompression() == .identity)
+            return call.fail(.invalid_argument, "expected a compressed request");
         if (req.payload) |p| total += @intCast(p.body.len);
     }
     return .{ .aggregated_payload_size = total };
@@ -116,6 +121,8 @@ pub fn main(init: std.process.Init) !void {
     var app = try anole.Server(void).init(init.gpa, if (cert_path) |cert| .{
         .http = null,
         .https = .{ .address = "127.0.0.1", .port = port, .cert = .{ .files = .{ .cert_path = cert, .key_path = key_path orelse return error.MissingKey } } },
+        // TLS serves HTTP/2 and HTTP/3 on one port number (TCP and UDP).
+        .http3 = if (anole.features.http3) .{} else null,
     } else .{
         .http = .{ .address = "127.0.0.1", .port = port, .h2c = true },
     }, {});
@@ -132,6 +139,6 @@ pub fn main(init: std.process.Init) !void {
         .HalfDuplexCall = halfDuplexCall,
         .UnimplementedCall = unimplemented,
     }, .{ .no_wait = true });
-    std.log.info("interop server on 127.0.0.1:{d} ({s})", .{ port, if (cert_path != null) "TLS" else "h2c" });
+    std.log.info("interop server on 127.0.0.1:{d} ({s})", .{ port, if (cert_path == null) "h2c" else if (anole.features.http3) "TLS + HTTP/3" else "TLS" });
     try app.run();
 }

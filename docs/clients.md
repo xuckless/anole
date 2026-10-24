@@ -7,10 +7,10 @@ a thread, and all of them use the same BoringSSL as the server.
 | Client | Protocol | Use it for |
 | --- | --- | --- |
 | `anole.client(req)` | as `anole.http.Client` | The server's own pooled client, from any handler: nothing to set up. |
-| `anole.http.Client` | HTTP/1.1, HTTPS, optionally HTTP/2 | Ordinary REST calls: one request at a time per connection, pooled keep-alive connections, redirects, decompression. |
+| `anole.http.Client` | HTTP/1.1, HTTPS with HTTP/2 where the server offers it | Ordinary REST calls: pooled keep-alive connections (HTTP/1.1: one request at a time each; HTTP/2: shared), redirects, decompression. |
 | `anole.h2.ClientConnection` | HTTP/2 (TLS or h2c) | Many concurrent requests over one connection, full-duplex streaming, trailers. |
 | `anole.h3.ClientConnection` | HTTP/3 over QUIC | The same as HTTP/2, over UDP. Same API. |
-| `anole.grpc.Client(Service)` | gRPC over HTTP/2 | Calling gRPC services from generated code. |
+| `anole.grpc.Client(Service)` | gRPC over HTTP/2 or HTTP/3 | Calling gRPC services from generated code. |
 
 `examples/clients` starts a server in-process and calls it with each client:
 
@@ -178,14 +178,27 @@ and unspecified addresses, IPv4 and IPv6, with `error.AddressNotAllowed`.
 The check is on the address the connection reached, after DNS, on every
 hop, before any byte of the request is sent.
 
-`ClientOptions.http2 = true` offers HTTP/2 ("h2", then "http/1.1") through
-ALPN on HTTPS connections. A server that picks it gets the request over
-HTTP/2, through `anole.h2`'s client underneath; `response.version().major`
-says which was used. Everything above works the same, but such a connection
-still carries one request at a time and goes back to the pool after it, so
-it buys the protocol, not concurrency: for many requests at once on one
-connection, use `anole.h2` directly. Cleartext (`http://`) requests and
-WebSocket upgrades stay on HTTP/1.1. It is off by default.
+`ClientOptions.http2` (on by default) offers HTTP/2 ("h2", then "http/1.1")
+through ALPN on HTTPS connections. A server that picks it gets the request
+over HTTP/2, through `anole.h2`'s client underneath; `response.version().major`
+says which was used. Everything above works the same, and requests to such a
+host now share connections: each executor keeps one HTTP/2 connection per
+origin and runs concurrent requests on it as streams, so fan-in to one
+upstream costs one connection and one handshake, not one per request in
+flight. The first dial for an origin is made once; requests that arrive
+meanwhile wait for it (an origin that turns out to speak only HTTP/1.1 is
+remembered for a minute, so its requests dial in parallel again). Each
+stream has a 1 MiB receive window and the connection 16 MiB; a response's
+buffer is sized by its `Content-Length`, so small answers stay small. A
+request the server provably did not process (`REFUSED_STREAM`, or past its
+GOAWAY) is sent again on a new connection whatever its method, once.
+`.http2 = false` keeps HTTPS on HTTP/1.1. WebSocket upgrades stay on
+HTTP/1.1.
+
+Cleartext (`http://`) requests use HTTP/1.1 unless the host is listed in
+`ClientOptions.h2c_hosts` (`&.{ "worker.internal", "10.0.0.5:8080" }`), which
+speaks HTTP/2 with prior knowledge there. A listed host that only speaks
+HTTP/1.1 fails its requests.
 
 ## HTTP/2
 
@@ -269,7 +282,8 @@ because an HTTP/3 stream's buffer grows as data arrives.
 `max_header_list_size` (64 KiB) and the limit of five informational
 responses are the same too (SETTINGS_MAX_FIELD_SECTION_SIZE over HTTP/3). Only HTTP/3 has
 `idle_timeout` (30 s, QUIC's idle timeout), `keep_alive` (5 s: while a
-stream is open, a PING after that long with nothing sent or received, so a
+stream is open, a PING after that long, or half the idle timeout if that is
+shorter, with nothing sent or received, so a
 download whose client's port a NAT rebinding moved resumes instead of
 stalling; null for none), `session_cache`, `early_data` and `webtransport`
 (below), and `RequestOptions.early`; `tls` is not optional. `anole.h3` exports the names `anole.h2` does:
@@ -336,7 +350,7 @@ all of them trust the system store unless told otherwise:
 | A CA in memory | `.ca = .fromPem(ca_pem)` (one or more certificates) |
 | Skip verification (tests only) | `.insecure_skip_verify = true`, optionally `.ca = .none` |
 | Client certificate (mutual TLS) | `.client_certificate = .fromFiles("client.pem", "client.key")`, or `.fromPem(cert_pem, key_pem)` |
-| ALPN | `anole.http`: none, or "h2" and "http/1.1" with `.http2 = true`; `anole.h2`, `anole.h3`: "h2" or "h3", fixed |
+| ALPN | `anole.http`: "h2" and "http/1.1" (none with `.http2 = false`); `anole.h2`, `anole.h3`: "h2" or "h3", fixed |
 
 `ca` is an `anole.Ca`. `.none` without `insecure_skip_verify` fails
 with `error.NoCertificateAuthority`.
@@ -459,6 +473,40 @@ On an error before `await`, cancel the sender instead. Flow control follows
 the reader: the server gets more window only as you take bytes, so a slow
 reader slows the server rather than filling memory.
 
+### Uploading as you go
+
+`client.upload(url, options)` starts a request whose body is written as it
+goes, with `Transfer-Encoding: chunked`. The head is sent at once, over
+HTTP/1.1 only (also for https), with no redirects, retries or breaker.
+`url` must be http or https.
+
+```zig
+var up = try client.upload(url, .{ .trailer_names = &.{"X-Checksum"} });
+try up.writer.writeAll("part one");
+try up.writer.flush(); // sends one chunk
+var trailers = try anole.http.Headers.init(gpa, 1);
+try trailers.put("X-Checksum", "abc");
+var response = try up.finish(&trailers);
+defer response.deinit();
+```
+
+`UploadOptions`: `method` (POST), `headers`, `trailer_names` (announced up
+front in a `Trailer` header), `timeout` (bounds opening the connection and
+sending the head, and in `finish` waiting for the response head; writing
+the body goes at your pace; null inherits the client's `timeout`, `.none`
+lifts it) and `unix_socket_path`. Each flush (and each drain of the
+writer's buffer) sends one chunk. `finish(trailers)` writes the last chunk
+and the trailers and returns the response as `fetch` does; `abort()` closes
+the connection instead of pooling it. The `Upload` is spent after either.
+
+### Closing idle connections
+
+`client.closeIdle()` closes the idle pooled connections of every
+executor's pool; connections in use are left alone, and the pools reconnect
+on the next request. It is for a process that was frozen and thawed, whose
+idle sockets the network may have dropped: the AWS Lambda adapter calls it
+when an invocation comes after a long gap (`lambda.idle_reset`).
+
 ## Trailers
 
 HTTP/2 and HTTP/3 responses can end with trailers. They are in `s.trailers`
@@ -469,7 +517,7 @@ const body = try s.reader().allocRemaining(gpa, .unlimited);
 const checksum = s.trailer("x-checksum"); // null if absent
 ```
 
-The client sends no request trailers. `anole.http.Client` exposes none either.
+The HTTP/2 and HTTP/3 clients send no request trailers. `anole.http.Client` sends them only with `client.upload` (see [Uploading as you go](#uploading-as-you-go)) and exposes none on responses.
 
 ## Many requests on one connection
 
@@ -510,13 +558,19 @@ suspends that request only; the executor serves others meanwhile.
 ## gRPC
 
 `anole.grpc.Client(Service)` calls a service from the code zig-protobuf
-generates, over an `anole.h2.ClientConnection`:
+generates, over an `anole.h2.ClientConnection` or an `anole.h3.ClientConnection`:
 
 ```zig
 var channel: anole.grpc.Channel = .{ .conn = conn, .authority = "localhost", .scheme = "https" };
 const health: anole.grpc.Client(anole.grpc.health.pb.Health(anole.grpc.Call, anyerror)) = .{ .channel = &channel };
 const result = try health.unary("Check", arena, .{ .service = "" }, .{ .timeout = .fromSeconds(2) });
 // result.status.code, result.message
+
+// HTTP/3: give the channel an anole.h3.ClientConnection, or let it own one.
+var h3_channel: anole.grpc.Channel = .{ .h3 = h3_conn, .authority = "localhost", .scheme = "https" };
+const auto = try anole.grpc.Channel.connect(gpa, io, .{ .host = "api.example", .port = 443, .tls = .{} }, .{ .http = .auto });
+// A Unix socket on this host: no TLS, authority "localhost".
+const ipc = try anole.grpc.Channel.connect(gpa, io, .{ .host = "unix:/run/app/worker.sock", .port = 0 }, .{});
 ```
 
 `unary` covers unary calls; `stream` covers the streaming kinds. `timeout` is

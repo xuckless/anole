@@ -3,6 +3,200 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.0 (unreleased)
+
+### Breaking
+
+- `anole.db.Class` has three new cases, `not_found`, `precondition` and
+  `invalid` (and `anole.db.ErrorMap` the matching fields, answering 404,
+  409 and 400): an exhaustive `switch` on `Class` needs them. The object
+  storage and mail connectors use them; no database does.
+- `anole.ServerError.DeploymentUnavailable` is gone: `deployment = .lambda`
+  works now. `ServerError` gains `LambdaRuntimeApiMissing`, `LambdaNotBuilt`,
+  `LambdaRuntimeApiFailed` and `SnapStartUnsupported`; an exhaustive
+  `switch` on it needs them.
+
+### Added
+
+- Raw TCP and UDP servers on Anole's runtime and listeners: `app.tcp(":7000", Handler, .{})`
+  (callbacks that park idle connections, or a task per connection) and
+  `app.udp(...)` (batched receive and send, one socket per core on Linux,
+  optional per-peer sessions); TLS with SNI, ALPN, mutual TLS and hot reload,
+  the PROXY protocol, per-listener connection caps, a drain callback, socket
+  activation and SIGUSR2 restarts, counters in `app.netStats()`. `tcp` and
+  `udp` on `.listeners`. `-Dnet` (on in `web` and `full`). See docs/net.md.
+- Framing for TCP: lines, length prefixes (1, 2 or 4 bytes) and varints, with
+  `conn.sendFrame` for the way out.
+- C ABI: the `"tcp"` and `"udp"` listener keys, `anole_net_write`,
+  `anole_net_close`, `anole_net_pause`, `anole_net_resume`,
+  `anole_net_set_idle_timeout`, `anole_net_udp_send`, `anole_net_udp_find`,
+  `anole_net_addr_format` and `anole_net_addr_parse`; events
+  `ANOLE_EV_NET_OPEN` (96) to `ANOLE_EV_NET_DATAGRAMS` (100); handle kinds
+  `anole_net_conn` and `anole_net_udp`; `anole_stats` net fields; listener
+  flags `ANOLE_LISTENER_F_TCP` and `_UDP`.
+- `anole.jobs` (`-Djobs`, on in the web and full profiles): background jobs
+  with retries and backoff, delays, priorities, unique jobs, leases with
+  heartbeats, an admin API and JSON routes, on the memory and SQLite stores
+  (PostgreSQL and Redis stores follow). Job kinds are types
+  (`pub const job: anole.jobs.Kind`), `app.jobs(...)` owns the queue.
+- `anole.cron`: cron expressions (5 or 6 fields, `L`, `5L`, `MON#2`,
+  nicknames, `@every`), time zones from the system's tzdata with the DST
+  rules written down in docs/cron.md, and `jobs.cron(...)`, which enqueues
+  one job per tick across instances.
+- `anole.pg.Client.session`: a connection of its own outside the pools.
+- `jobs.enqueueIn`, `enqueueRawIn` and `completeIn` on SQLite transactions,
+  jobs metrics, `traceparent` carried in job meta, and the queue draining when
+  the server does.
+- `jobs.Client.addQueue`: adds a queue the options did not list, before
+  `start` (a queue that exists is left as it is). `webhooks.register` adds
+  its delivery queue this way; an app's own module can too.
+- C ABI: `"jobs"` in the configuration (with native `sql` cron actions),
+  `anole_jobs_get`, `anole_jobs_enqueue` (optionally inside an
+  `anole_db_tx`), `anole_jobs_work` and `anole_jobs_stop`, `anole_job_finish`,
+  `anole_job_complete_in` and `anole_jobs_admin`; events 104-108, handle kinds
+  12 and 13.
+- Webhooks (`-Dwebhooks`, on in the web and full profiles; needs `-Djobs`):
+  `app.webhooks(.{ .jobs = jobs })` keeps endpoints, messages and a delivery
+  log in the jobs store, and `publish` sends an event to the owner's matching
+  endpoints as Standard Webhooks (`webhook-id`, `webhook-timestamp`,
+  `webhook-signature`). Each delivery is a job: retried with backoff for about
+  three days, refused for private addresses in production, behind a circuit
+  breaker per origin, with the attempts recorded. Endpoints get a `whsec_`
+  secret, rotation keeps the old one signing for a while, an endpoint failing
+  for five days is disabled, and `replay` and `recover` re-send. Secrets are
+  encrypted at rest when `ANOLE_WEBHOOKS_KEY` is set.
+- `app.webhookVerify(.{ .preset = .stripe, .secrets = &.{secret} })` checks
+  incoming webhooks (Standard Webhooks, Stripe, GitHub, Slack, or any HMAC
+  header) and drops duplicate deliveries (in memory, or in Redis).
+  `anole.webhooks.standard` has the signing and verifying functions.
+- C ABI: `anole_webhooks_publish` and `anole_webhooks_watch`, events 109 and
+  110, the `"webhooks"` configuration and the `webhook_verify` middleware.
+- `anole.s3` (`-Ds3`, in the `web` and `full` profiles): an S3-compatible
+  object storage client for AWS S3, Cloudflare R2, MinIO, Backblaze B2 and
+  Supabase Storage, in pure Zig on Anole's HTTP client with its own SigV4
+  signer. Streaming uploads (a pull form from a reader, a file or the
+  request, and a push form whose writes never wait for the network) and
+  downloads, multipart uploads with bounded memory, `serve` for answering a
+  request from an object, presigned URLs, listing, copying, and the AWS
+  credential chain (environment, shared file, web identity, ECS/EKS, EC2).
+  Retries are on by default (every call is idempotent). `app.s3(.{})`,
+  `anole.s3.testing.FakeServer` (verifies signatures), docs/storage.md.
+- C ABI: `"storage"` in the configuration and `anole_s3_*` (events 124 and
+  125, handle kind 16 for uploads and downloads, `ANOLE_E_SERVICE`, error
+  classes `NOT_FOUND`, `PRECONDITION` and `INVALID`). `serve` and `put_body`
+  move an object to and from a request without it entering the language.
+- `anole.smtp` (`-Dsmtp`): sending mail over SMTP with STARTTLS or TLS from
+  the first byte, AUTH PLAIN and LOGIN, MIME with HTML, attachments and
+  inline images, pooled connections per executor, and `sendRaw` for messages
+  composed elsewhere. `app.smtp(.{})` reads `SMTP_URL` and falls back to
+  Mailpit's port outside production; retries are opt-in, because a retry
+  after the final "." could send an email twice. `anole.smtp.testing.FakeServer`
+  is an SMTP server for tests. Pieces adapted from smtp_client.zig (MIT).
+  See docs/email.md.
+- C ABI: `"mail"` in the configuration, `anole_smtp_find`, `anole_smtp_index`,
+  `anole_smtp_send` and `anole_smtp_send_raw`, and `ANOLE_EV_SMTP_RESULT` (126).
+- gRPC over HTTP/3, server and client (gRFC G2). Services answer native gRPC
+  on the HTTP/3 listener with no change, the C ABI's too. The client takes
+  `Channel{ .h3 = conn }`, or `Channel.connect` with `.http = .h3` (prior
+  knowledge) or `.auto` (switches on Alt-Svc, falls back to HTTP/2).
+  Interop-tested against grpc-dotnet v2.84.0 in both directions.
+- `anole.h3.RequestOptions.send_buffer`; `anole.h2.Stream.resetCode()` and
+  `anole.h3.Stream.resetCode()`; `anole.h3.parseAltSvc`; `anole.h3`
+  `ClientConnection.isOpen()`.
+- gRPC between processes on one host over a Unix domain socket: a `unix`
+  listener serves h2c with gRPC; the client and `Channel` dial `unix:/path`,
+  `unix:///path` and (Linux) `unix-abstract:name`, with no TLS. The socket
+  file is created `0660`; `Listener.unix_mode` changes it. A leftover socket
+  file is replaced.
+- AWS Lambda: with `deployment = .lambda` (or `ANOLE_DEPLOYMENT=lambda`) the
+  same app serves Lambda invocations: API Gateway REST and HTTP APIs,
+  Function URLs (buffered or streamed), ALB and VPC Lattice through the
+  router and middleware, other events (SQS, EventBridge, ...) on
+  `POST /_lambda/event`. `zig build lambda` (addApp) writes
+  `provided.al2023` zips for arm64 and x86_64. Also Lambda Managed
+  Instances (concurrent invocations) and Web Functions. The C ABI's
+  `lambda` config group does the same for Node and Python apps. See
+  docs/lambda.md.
+- `anole.lambda.context(req)` and the `x-amzn-request-context` /
+  `x-amzn-lambda-context` request headers.
+- `client.upload`: requests whose body is written as it goes (chunked, with
+  trailers), over HTTP/1.1; `client.closeIdle()` closes the idle pooled
+  connections.
+- `Exporter.flush(timeout)`: sends the queued spans and waits for the
+  collector.
+- `-Dlambda` build flag (on in every profile), and `-Ddefault-deployment`
+  (the deployment a build falls back on; `zig build lambda` builds with
+  `lambda`).
+- SSE topics (`anole.sse.Topics`, `app.sse`): publish once to every subscriber over HTTP/1.1, HTTP/2 and HTTP/3, with no task per idle subscriber; `Last-Event-ID` resume from a replay buffer, heartbeats, a slow-subscriber policy and a reconnect spread at drain.
+- `app.watch`: PostgreSQL LISTEN/NOTIFY, Redis pub/sub and streams, and MongoDB change streams, straight into SSE and WebSocket topics, into handlers, or read from handlers.
+- MongoDB change streams: `Collection.watch`, `Database.watch`, `Client.watch`, with automatic resume.
+- C ABI: `"sse"` routes and config, `anole_sse_publish`, `anole_sse_gap`, `anole_sse_accept`/`_subscribe`/`_unsubscribe`/`_send`/`_close`; `"watches"` and `anole_watch_find`/`_listen`/`_unlisten`/`_ack`; events 112, 113, 116-118; handle kinds 14 and 15.
+
+### Changed
+
+- A new startup banner: the word "anole" drawn large in green with a yellow
+  O, replacing the lizard. Terminals of 110 columns or more get one of two
+  full-size drawings at random, narrower ones (55 or more) a half-height
+  version, narrower still only the version line. 24-bit colour when
+  `COLORTERM` says so, else the nearest 256 colours; uncoloured under
+  `NO_COLOR`. The rules for when it shows are unchanged. `anole version` and
+  `anole new` print it at a terminal, and the live console shows the small
+  version until the first log line.
+- A server that names only raw TCP/UDP listeners opens no HTTP listener.
+- `handoff.max_listeners` is 64 TCP listeners and 1024 UDP sockets.
+- `anole.http.Client`: `ClientOptions.http2` is on by default. Requests to a
+  host whose server picks h2 share one connection per executor as
+  concurrent streams (one dial per origin, others wait for it; 1 MiB per
+  stream and 16 MiB per connection windows; a stream's buffer is sized by
+  the response's `Content-Length`), and a request the server provably did
+  not process is sent again on a new connection. `h2c_hosts` lists hosts
+  that speak cleartext HTTP/2 with prior knowledge. `http2 = false` restores
+  HTTP/1.1 over TLS.
+- HTTP/3: a client's RESET_STREAM (or STOP_SENDING with an error) cancels the
+  handler's task, as on HTTP/2.
+- HTTP/3: while a request is open, QUIC PINGs keep the connection alive.
+  Long-lived responses (gRPC streams, SSE, WebSocket and WebTransport over
+  HTTP/3) no longer end at the 30 s idle timeout; idle connections still do.
+  On the client this builds on 0.3.1's `ConnectOptions.keep_alive` (one
+  mechanism): the PING comes after `keep_alive` or half the idle timeout,
+  whichever is shorter.
+- HTTP/3: gRPC and Connect streaming responses may hold 1 MiB unacknowledged
+  per stream (was 64 KiB).
+- `anole.grpc` client: a stream reset maps to the status gRPC specifies for
+  its code (INTERNAL for most, UNAVAILABLE only for a refused stream,
+  CANCELLED, RESOURCE_EXHAUSTED, PERMISSION_DENIED); it was always
+  UNAVAILABLE. `Channel.retry` therefore no longer repeats a call the server
+  reset with INTERNAL_ERROR.
+- `Response.abort` in a gRPC handler resets the stream (the client reads
+  CANCELLED) instead of answering UNKNOWN.
+- `anole.grpc.Channel.conn` is optional (`h3` is the other connection); code
+  that only sets it is unchanged, code that reads `channel.conn` unwraps it.
+- The `RequestId` middleware keeps an ID the engine set already (Lambda's
+  request ID) instead of generating another.
+- `deployment = .lambda` no longer fails with `DeploymentUnavailable`; that
+  error is gone.
+- `anole.db.System` has `s3` and `smtp`, and `anole.resilience.Kind` too.
+- C ABI 0.10: the C ABI is now 0.10 (`ANOLE_ABI_VERSION`, `x-anole-abi`;
+  before 1.0 a binding needs the exact version). A handle's kind takes five
+  bits (28-32), so Kafka groups and batches are kinds of their own (17 and
+  18): a NATS handle given to a Kafka call is now `ANOLE_E_INVALID`
+  (`WrongHandleKind`). Handles stay opaque. New status `ANOLE_E_SERVICE`
+  (-13); events 96-126 and handle kinds 10-16 as listed above
+  (docs/c-abi.md, "From ABI 0.9").
+
+### Fixed
+
+- Live console on macOS: no key reached it, Ctrl-C included, so the only way
+  out was killing the terminal. macOS's poll(2) does not support devices and
+  answers POLLNVAL for /dev/tty, which the console waited on; the run loop
+  ignored that and spun. The console now opens the terminal by its own name
+  (/dev/ttysNNN) when stdin, stderr or stdout is that terminal, and waits
+  with select(2) otherwise; a terminal that cannot be read ends the console
+  instead of spinning. Both `anole console` and `c` + Enter in a development
+  app are affected. `anole console` also restores the terminal on SIGINT
+  and on a panic. A pseudo-terminal test (tests/console/pty_test.py) runs in
+  CI on Linux and macOS.
+
 ## 0.3.1 (2026-10-23)
 
 ### Fixed

@@ -299,7 +299,7 @@ test "capi nats: a request for a req that is already over is refused with E_GONE
     try r.start("", true);
     defer r.deinit();
     // A forged request handle: never live.
-    const forged: u64 = (@as(u64, 0x7fffff) << 32) | 1;
+    const forged: u64 = (@as(u64, 0x7fffff) << 33) | 1;
     const got = engine.nats.request(r.broker(), r.c, out("no.answer", "?"), .{ .size = @sizeOf(abi.NatsRequestOptions), .req = forged }, 1);
     try std.testing.expect(std.meta.isError(got));
 }

@@ -28,6 +28,9 @@ const gpa = engine.gpa;
 
 const chunk_len = 256;
 const max_chunks = 4096;
+comptime {
+    std.debug.assert(chunk_len * max_chunks <= engine.max_slots);
+}
 
 const State = enum(u32) { free, open, reserved };
 

@@ -52,7 +52,9 @@ pub fn build(b: *std.Build) void {
 `addApp` makes the executable, gives it the `anole` module, installs it and
 adds `zig build run`. `-Doptimize` and `-Dtarget` work as usual, and
 `.profile = .web` leaves out HTTP/3, gRPC, MongoDB and Redis (the
-[build flags](../README.md#build-flags)).
+[build flags](../README.md#build-flags)); `.features = .{ .postgres = false }`
+turns single features on or off over the preset, like Anole's own
+`-D<feature>` flags.
 
 And `src/main.zig`:
 
@@ -522,13 +524,17 @@ or `stop_grace_period: 15s` in Compose). Kubernetes' default grace period
 (`distroless/cc` has them; `debian:*-slim` needs the `ca-certificates`
 package) cannot make outbound HTTPS calls.
 
+**Not HTTP?** A game server, a line protocol or a custom RPC can run in the
+same process on the same listeners: `app.tcp(":7000", Handler, .{})` and
+`app.udp(":7001", Handler, .{})`. See [net.md](net.md).
+
 ## Next
 
 - [routing.md](routing.md): routes, middleware, requests, responses,
   errors, limits.
 - [server.md](server.md): listeners, TLS, HTTP/2 and HTTP/3, draining,
   restarts.
-- [websocket.md](websocket.md), [webtransport.md](webtransport.md), [grpc.md](grpc.md),
+- [websocket.md](websocket.md), [webtransport.md](webtransport.md), [net.md](net.md) (raw TCP and UDP), [grpc.md](grpc.md),
   [clients.md](clients.md) (outbound HTTP from a handler with
   `anole.client(req)`), [database.md](database.md) (PostgreSQL, SQLite,
   MongoDB, Redis), [auth.md](auth.md) (JWT, sessions, CSRF, API keys,

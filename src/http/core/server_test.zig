@@ -2069,11 +2069,23 @@ fn expectIdleConnectionsClosedOnShutdown(timeout: dusty.ServerConfig.Timeout) !v
     const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
     try std.testing.expect(elapsed_ns < 1000 * std.time.ns_per_ms);
 
-    // Both were closed by the server, not abandoned to the cancel.
-    try std.testing.expectError(error.EndOfStream, reader.interface.fillMore());
+    // Both were closed by the server, not abandoned to the cancel (an
+    // abandoned one would never answer the read).
+    try expectClosedByPeer(reader.interface.fillMore());
     var fresh_buf: [64]u8 = undefined;
     var fresh_reader = fresh.reader(io, &fresh_buf);
-    try std.testing.expectError(error.EndOfStream, fresh_reader.interface.fillMore());
+    try expectClosedByPeer(fresh_reader.interface.fillMore());
+}
+
+/// The peer closed the connection: end of stream. On Windows, closing a
+/// socket with a receive still pending on it (a connection that never sent
+/// a byte) resets the connection instead of ending it, which a read sees
+/// as `ReadFailed`; that is a close by the peer too.
+fn expectClosedByPeer(result: std.Io.Reader.Error!void) !void {
+    if (result) |_| return error.TestExpectedError else |err| switch (err) {
+        error.EndOfStream => {},
+        error.ReadFailed => if (@import("builtin").os.tag != .windows) return err,
+    }
 }
 
 test "Server: a request arriving during the shutdown drain is refused, not served" {

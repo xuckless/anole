@@ -56,9 +56,6 @@ jobs:
       - name: Unit and smoke tests (default profile, every feature on)
         timeout-minutes: 35
         run: zig build test --summary all
-      - name: Every preset and edge flag combination
-        timeout-minutes: 25
-        run: zig build test-flags --summary all
       # test-flags shares one full-profile configure, so it cannot catch a
       # feature that reads a C module its own flags never requested. These
       # configure each profile on its own, as a user would.
@@ -83,6 +80,41 @@ jobs:
           fi
           echo "$out"
           grep -F "invalid Anole feature flags" <<<"$out"
+      # `anole console` and the in-process console (`c` + Enter) driven in a
+      # real pseudo-terminal: keys reach the TUI, every way out restores
+      # the terminal. (macOS: poll(2) cannot wait on /dev/tty.)
+      - name: Live console in a pseudo-terminal
+        timeout-minutes: 10
+        run: |
+          zig build cli rest --summary all
+          python3 -I tests/console/pty_test.py zig-out/bin/anole zig-out/bin/rest
+
+  # Every preset and edge flag combination, a third of them per job: the
+  # twelve full suites one after another outgrew one step's time on the
+  # macOS runner.
+  flags:
+    name: test-flags (${{ matrix.os }}, ${{ matrix.group.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        group:
+          - { name: full, combos: "full,full-no-compression,full-tls-none,minimal" }
+          - { name: trimmed, combos: "full-no-brotli,full-no-openapi,db-none,db-only" }
+          - { name: subsets, combos: "brokers-none,http2-no-grpc,web,minimal-no-lambda" }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: flags-${{ matrix.group.name }}
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: Preset and edge flag combinations (${{ matrix.group.combos }})
+        timeout-minutes: 25
+        run: zig build test-flags -Dflags-combos=${{ matrix.group.combos }} --summary all
 
   cross:
     name: cross (${{ matrix.target }}, compile and link only)
@@ -519,6 +551,34 @@ jobs:
       - name: grpc HTTP/2 server checks
         run: tests/grpc/interop/run-http2.sh ./zig-out/bin/grpc-interop-server
 
+  # ---- p3/grpc-h3 ----
+  grpc-h3-interop:
+    name: gRPC over HTTP/3 interop (grpc-dotnet v2.84.0 client and server, Anole native and C ABI servers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: grpc-h3-interop
+      # Zig fetches git and tarball dependencies itself on a cold cache;
+      # the runners' network fails now and then, so the fetch is retried.
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # The image (.NET 10 SDK, libmsquic, grpc-dotnet's interop programs)
+      # takes about 4-6 minutes to build; run.sh builds Anole's side for it.
+      - name: gRPC over HTTP/3 against grpc-dotnet
+        env:
+          ANOLE_GRPC_H3_WORK: ${{ runner.temp }}/grpc-h3
+        run: tests/grpc/h3/run.sh
+      - name: Logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 (v7.0.2)
+        with:
+          name: grpc-h3-logs
+          path: ${{ runner.temp }}/grpc-h3/logs
+  # ---- end p3/grpc-h3 ----
+
   redis:
     name: Redis and Valkey (live client, session store and rate limiter tests, plain and TLS; the C ABI's suite)
     runs-on: ubuntu-latest
@@ -542,6 +602,31 @@ jobs:
       - name: Tests against a live server
         timeout-minutes: 35
         run: REDIS_IMAGE=${{ matrix.image }} tests/redis/run.sh
+
+  # ---- p3/s3 ----
+  s3:
+    name: S3 (the client against MinIO, plain and TLS; fuzz target; the C ABI's storage tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: s3
+      # Zig fetches git dependencies itself on a cold cache, and its DNS
+      # lookups fail now and then on the runners (NameServerFailure).
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # The fake server tests (no Docker: "s3: ..." and "capi s3: ..."), the
+      # XML reader's fuzz target ("fuzz: s3 xml") on its seeds, then the same
+      # suite plus the live tests against a throwaway MinIO (the image is
+      # pinned by digest in the script), once over HTTP and once over TLS.
+      - name: Tests against a live server
+        timeout-minutes: 35
+        run: tests/s3/run.sh
+      - name: Fuzz the XML reader
+        run: 'zig build test -Dtest-filter="fuzz: s3 xml" -Dllvm=true --fuzz=200K'
+  # ---- end p3/s3 ----
 
   postgres:
     name: PostgreSQL (live client tests, plain and verify-full TLS, scram-sha-256; the C ABI's suite)
@@ -640,3 +725,25 @@ jobs:
       - name: Tests with a live server
         timeout-minutes: 35
         run: tests/mongodb/run.sh ${{ matrix.image }}
+
+  smtp:
+    name: "SMTP (live tests against Mailpit: plain, STARTTLS with AUTH, implicit TLS)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: smtp
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # Three Mailpit servers, one plain, one that requires STARTTLS and one
+      # with TLS on connect, the last two on a CA made for the run; what was
+      # sent is read back from each one's API. The image is pinned by digest
+      # (MAINTAINING.md lists the pins and how to bump them).
+      - name: Tests against live servers
+        timeout-minutes: 35
+        env:
+          # v1.32.0
+          MAILPIT_IMAGE: axllent/mailpit@sha256:0790692be935ea4420d085694f7985b1f692ca6a8771ab0e0bd8ba75ac180498
+        run: tests/smtp/run.sh

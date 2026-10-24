@@ -261,6 +261,15 @@ server)
             dbcc9677e6364997d1c897dc813985d76504e2b0
   Linked:   -Dnats=true
 
+src/cron/vectors_test.zig (cron next-time test vectors)
+  The expressions and expected fire times of the 5-field cases in
+  src/cron.zig's tests, adapted (6 and 7 field forms, `L<weekday>` and the
+  both-day-fields-must-match case are left out). Test code only.
+  Licence:  MIT. Copyright (c) 2023 Hanaasagi
+  Source:   https://github.com/dying-will-bullet/cron, commit
+            91ab895b5a910449e20a6e873cc01a8b27001ad6
+  Linked:   tests only
+
 src/http/core/llhttp/ (llhttp 9.3.1, the HTTP/1.1 parser, as dusty
 vendored it; its licence is src/http/core/llhttp/LICENSE)
   Licence:  MIT. Copyright Fedor Indutny, 2018
@@ -420,6 +429,33 @@ src/testing/root.zig
   Its request, response and stream API follows the shape of zefir's
   src/http/testing/Backend.zig (no code copied).
 
+src/smtp/core/ (the SMTP client's message encoding and protocol pieces)
+  Adapted from karlseguin/smtp_client.zig: the header value encoder
+  (RFC 2047 encoded words and quoting), the base64 line writer, boundary and
+  Message-ID generation, the RFC 5322 date writer, the reply parser, the EHLO
+  extension parsing and AUTH PLAIN/LOGIN. Its transport, single-connection
+  client and CRAM-MD5 are not taken. Every file carries an attribution
+  header; the licence is kept as src/LICENSE.smtp_client.
+  Licence:  MIT (text in part C). Copyright (c) 2024 Karl Seguin
+  Source:   https://github.com/karlseguin/smtp_client.zig, commit
+            538d0ddc064248b6c1431bfd68df2481f431c0fd
+  Linked:   -Dsmtp=true
+
+tests/lambda/events/*.json (sample AWS events for the Lambda adapter's tests)
+  Copied unchanged from aws-lambda-rust-runtime: lambda-http/tests/data
+  (the API Gateway REST and HTTP API, Function URL, ALB and VPC Lattice
+  requests) and lambda-events/src/fixtures (the SQS, S3, EventBridge and API
+  Gateway WebSocket events). Test data only; nothing of it is compiled into
+  a program. The adapter's code (src/lambda) is Anole's own and copies none
+  of the runtime's: only the rules it documents are followed (lambda_http's
+  type list for text bodies and its cookie handling, Hono's detection order).
+  NOTICE of the source repository:
+      AWS Lambda Rust Runtime
+      Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+  Licence:  Apache License 2.0 (text in part E)
+  Source:   https://github.com/aws/aws-lambda-rust-runtime, commit
+            7f89224ce954a0ad3998cc095e80539c3d110ab9
+
 C. MIT licence text (applies to every MIT component above)
 -----------------------------------------------------------
 
@@ -506,8 +542,8 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 
 
-E. Apache License 2.0 (BoringSSL, fiat-crypto, grpc-proto, googleapis, zig-jwt)
--------------------------------------------------------------------------------
+E. Apache License 2.0 (BoringSSL, fiat-crypto, grpc-proto, googleapis, zig-jwt, aws-lambda-rust-runtime sample events)
+-------------------------------------------------------------------------------------------------------------------------
 
 Copied verbatim from the LICENSE file of the pinned BoringSSL tree (commit
 22a0079b). That file also covers Go-licensed TLS test-suite code, which is
@@ -814,3 +850,10 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
 ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+src/webhooks/sign.zig: the test vector in it comes from the Standard Webhooks
+libraries' tests (https://github.com/standard-webhooks/standard-webhooks,
+Apache-2.0, libraries/python/tests/test_webhooks.py). The signing scheme is
+the Standard Webhooks specification (Apache-2.0), implemented here from the
+spec; no code is copied. The Apache-2.0 text is the one given for BoringSSL
+above.

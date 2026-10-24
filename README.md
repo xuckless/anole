@@ -208,6 +208,22 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
   - opt-in request coalescing and short-lived result caches, off unless
     asked for;
   - behind `-Dpostgres`, `-Dsqlite`, `-Dmongodb` and `-Dredis`.
+- **Object storage:** an S3 client for AWS S3, R2, MinIO, B2 and Supabase
+  Storage, with presigned URLs and multipart uploads ([storage](docs/storage.md)).
+- **Email:** SMTP with STARTTLS or TLS, HTML, attachments and a pool per
+  core ([email](docs/email.md)).
+- **Server-sent events:** topics published once to every subscriber, replay
+  after a reconnect, and `anole.watch` for database changes ([realtime](docs/realtime.md)).
+- **Background jobs:** queues with retries, backoff, delays and workers, in
+  memory or SQLite ([jobs](docs/jobs.md)).
+- **Cron:** schedules on the job queue, one job per tick across instances
+  ([cron](docs/cron.md)).
+- **Webhooks:** signed and retried delivery out, verification presets for
+  Stripe, GitHub and Slack in ([webhooks](docs/webhooks.md)).
+- **TCP and UDP servers:** raw protocols on the same runtime and listeners,
+  with TLS and the PROXY protocol ([net](docs/net.md)).
+- **AWS Lambda:** the same app served from the Lambda Runtime API with
+  `deployment = .lambda` ([lambda](docs/lambda.md)).
 
 **Status: pre-1.0; the latest release is 0.3.1** ([CHANGELOG.md](CHANGELOG.md)).
 The API may still change before 1.0. Known issues and limitations are tracked in

@@ -33,6 +33,15 @@ Python packages the protocol checks install are pinned with hashes in
 (the QUIC interop runner's, which follow its pinned commit): regenerate them
 with every file's SHA-256 from PyPI when either moves.
 
+The gRPC over HTTP/3 interop (`tests/grpc/h3/run.sh`) runs grpc-dotnet's
+interop programs (tag v2.84.0, cloned in `tests/grpc/h3/Dockerfile`) in a
+.NET SDK image with Microsoft's libmsquic. After the first green run, pin the
+base image by digest and libmsquic by version in the Dockerfile; bump the
+grpc-dotnet tag, rebuild (the image tag carries the Dockerfile's hash) and
+run it when the gRPC or HTTP/3 code changes in a way a second implementation
+should see. If libmsquic's newest version stops working with the pinned
+.NET image, hold the version back there, not in the test.
+
 ## Advisories
 
 `.github/workflows/advisories.yml` runs `tools/advisories.py` every Monday and
@@ -139,8 +148,8 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      rename one copy's symbols with `-D` macros or build one shared sfparse.
 4. Run everything CI runs: `zig build test`, `zig build test-flags`,
    the profile builds, h2spec, Autobahn, the gRPC
-   interop, `tests/h3/run.sh`, `tests/interop/run.sh` and
-   `tests/interop/webtransport/run.sh`.
+   interop, `tests/grpc/h3/run.sh`, `tests/h3/run.sh`, `tests/interop/run.sh`
+   and `tests/interop/webtransport/run.sh`.
 
 ## The forks
 
@@ -214,7 +223,11 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   release or only when the SQL may have changed the session:
   `Pool.Reset.auto`, `session.zig`), and for the C ABI parameters as a
   slice of tagged unions and `QueryOpts.text_results`
-  (branch `capi-dynamic`, generic, not offered upstream yet). The first four are
+  (branch `capi-dynamic`, generic, not offered upstream yet), and
+  `Listener.sendListen`/`sendUnlisten`/`sendPing`/`nextEvent`, which
+  `anole.watch` uses to LISTEN and UNLISTEN on a connection another task
+  waits on (branch `listener-nonblocking`, generic, merged into `anole`;
+  the fork's own test of it needs a PostgreSQL on 127.0.0.1:5432). The first four are
   also on branches based on upstream master (`upstream-read-timeout`,
   `upstream-cancel-request`, `upstream-statement-cache`,
   `upstream-pool-lifetimes`), open upstream as karlseguin/pg.zig
@@ -222,7 +235,12 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   swap stays in the fork. On an upstream move: merge master into `anole`,
   run the fork's `tests/run.sh` (a throwaway postgres:17, on std's
   Threaded Io and on zio, with and without TLS), re-pin, and run Anole's
-  `tests/postgres/run.sh` (plain and verify-full TLS).
+  `tests/postgres/run.sh` (plain and verify-full TLS). After a merge, check
+  that `src/listener.zig` still has the four non-blocking calls: `src/pg`
+  and `src/watch/pg.zig` call them, and `zig build test
+  -Dpostgres-test-url=... -Dtest-filter="watch live"` runs the LISTEN
+  hub against a live server (a killed backend, two channels on one
+  connection).
 - **zig-sqlite**: upstream's open Zig 0.17 port (vrischmann/zig-sqlite PR
   #215) plus the fork's build changes: bindings through the translate-c
   package, `sqlite3_initialize` in `Db.init` (Anole builds SQLite with
@@ -255,6 +273,14 @@ attribution header on every file and THIRD_PARTY_NOTICES part B current.
   each release and port the fixes that apply. The PRs open there from the
   fork (#263-#270) are left as they are.
 
+## The S3 client
+
+`anole.s3` (src/s3/) is Anole's own: the SigV4 signer is written from the specification (checked against the worked examples on AWS's S3 API reference pages, transcribed in `sigv4.zig`'s tests; the aws-sig-v4-test-suite is not vendored because its NOTICE gives no licence), and the XML reader handles the six response shapes S3 and STS use. Nothing to bump. What to watch:
+
+- The live tests (`tests/s3/run.sh`, CI job `s3`) run against MinIO. MinIO stopped publishing community images on Docker Hub and Quay in 2025, so the script pulls Chainguard's build by digest (`cgr.dev/chainguard/minio@sha256:...`, the `S3_IMAGE` default). If the digest goes away, take SeaweedFS's S3 gateway or Garage instead; the tests need only an S3 endpoint, a bucket and a key.
+- S3's checksum behaviour: the AWS SDKs began sending CRC32 trailers by default in 2025, and R2, B2 and older MinIO rejected them. Anole signs the body hash (or `UNSIGNED-PAYLOAD` over HTTPS) and sends no `x-amz-checksum-*` header. Re-check the providers' docs when one of them says it requires checksums.
+- Provider quirks live in `src/s3/endpoint.zig` (addressing, default regions) and `errors.zig` (codes to classes).
+
 ## The NATS client
 
 `src/nats/core` is adapted from zefir's `src/nats` (commit dbcc967, MIT) and
@@ -280,6 +306,21 @@ bump and add it to both when its tests are wired in). Live tests:
 CI job `kafka`). When Kafka releases a new major, run them against it before
 claiming support, and re-check the removed API versions (KIP-896 removed the
 oldest ones in 4.0).
+
+## The SMTP client
+
+`src/smtp/core` holds the pieces adapted from karlseguin/smtp_client.zig
+(commit 538d0ddc, MIT; its licence is `src/LICENSE.smtp_client`): the header
+value encoder, the base64 line writer, boundary and Message-ID generation, the
+date writer, the reply parser, EHLO parsing and AUTH PLAIN/LOGIN. The rest of
+`src/smtp` (transport, pool, MIME composition, the connector layer) is Anole's.
+That repository is a watch-list item like the HTTP core's: look at its commits
+at each release and pick fixes by hand. Live tests: `tests/smtp/run.sh` starts
+three Mailpit servers (plain, STARTTLS required, TLS on connect) in Docker and
+reads the messages back from their APIs (CI job `smtp`). The image is pinned by
+digest in `tests/smtp/run.sh` and the job (v1.32.0, `axllent/mailpit`, MIT):
+bump both together, from the manifest list's digest on Docker Hub, and check
+that the `MP_SMTP_*` variables in the script still exist (`mailpit --help`).
 
 ## The docs site
 

@@ -14,8 +14,26 @@ pub const ServerError = error{
     InvalidProxyNetwork,
     InvalidEnvironmentVariable,
     InvalidEnvFile,
-    DeploymentUnavailable,
     ProxyProtocolNoPeers,
+    // ---- p3/net ----
+    NetNotBuilt,
+    NetListenerNeedsPort,
+    NetListenerHttp3,
+    TcpAndUdp,
+    UdpWithTls,
+    UdpOnUnixSocket,
+    UdpWithProxyProtocol,
+    InvalidFraming,
+    NetHandlerContext,
+    // ---- end p3/net ----
+
+    // ---- p3/lambda ----
+    LambdaRuntimeApiMissing,
+    LambdaNotBuilt,
+    LambdaRuntimeApiFailed,
+    SnapStartUnsupported,
+    // ---- end p3/lambda ----
+
     // The OpenAPI document (`app.openapi`, `zig build openapi`)
     OpenApiNameClash,
     OpenApiOutOfDate,
@@ -131,6 +149,7 @@ pub fn posixErrno(name: anyerror) i32 {
 }
 
 test "errors: TlsLoadError is a subset of ServerError" {
+    @setEvalBranchQuota(100_000);
     inline for (@typeInfo(TlsLoadError).error_set.error_names.?) |m| {
         comptime var found = false;
         inline for (@typeInfo(ServerError).error_set.error_names.?) |s| {
@@ -250,14 +269,72 @@ pub fn explain(err: ServerError, ctx: Context, w: *std.Io.Writer) std.Io.Writer.
             try w.writeAll("can't read a .env file: it has a line that is not NAME=value.");
             try fix(w, "The log above says which file and line; comment it out with '#' or fix it.");
         },
-        error.DeploymentUnavailable => {
-            try w.writeAll("can't use this deployment mode: it is not available in this version.");
-            try fix(w, "Use standalone, behind_proxy, anole_lb or platform (ANOLE_DEPLOYMENT or the deployment option).");
-        },
         error.ProxyProtocolNoPeers => {
             try w.writeAll("can't turn on the PROXY protocol: no peer is allowed to send the header.");
             try fix(w, "Name the load balancers in proxy.trusted or the listener's proxy_protocol_from.");
         },
+        // ---- p3/net ----
+        error.NetNotBuilt => {
+            try w.writeAll("can't serve raw TCP or UDP: this build leaves it out.");
+            try fix(w, "Build with -Dnet (on in the web and full profiles).");
+        },
+        error.NetListenerNeedsPort => {
+            try w.writeAll("can't start a raw TCP or UDP listener: ");
+            try w.writeAll(ctx.detail orelse "it has no port");
+            try w.writeAll(".");
+            try fix(w, "Give it a port (0 picks a free one) or a unix socket path; a raw listener never takes $PORT or 8080.");
+        },
+        error.NetListenerHttp3 => {
+            try w.writeAll("can't serve HTTP/3 on a raw TCP or UDP listener.");
+            try fix(w, "Turn http3 off for that listener.");
+        },
+        error.TcpAndUdp => {
+            try w.writeAll("can't make one listener both TCP and UDP.");
+            try fix(w, "Use two listeners: one with tcp, one with udp.");
+        },
+        error.UdpWithTls => {
+            try w.writeAll("can't use TLS on a UDP listener: DTLS is not supported.");
+            try fix(w, "Leave tls out of the UDP listener, or serve the protocol over TCP.");
+        },
+        error.UdpOnUnixSocket => {
+            try w.writeAll("can't listen for UDP on a unix socket.");
+            try fix(w, "Give the UDP listener an address and a port.");
+        },
+        error.UdpWithProxyProtocol => {
+            try w.writeAll("can't read the PROXY protocol on a UDP listener.");
+            try fix(w, "Turn proxy_protocol off for the UDP listener.");
+        },
+        error.InvalidFraming => {
+            try w.writeAll("can't use these raw listener options: ");
+            try w.writeAll(ctx.detail orelse "a limit is out of range");
+            try w.writeAll(".");
+            try fix(w, "Length prefixes are 1, 2 or 4 bytes, a frame max 1 byte to 1 GiB, read_window 4 KiB to 64 KiB, batch 1 to 64, max_datagram up to 65507.");
+        },
+        error.NetHandlerContext => {
+            try w.writeAll("can't serve a raw listener built for another server state type.");
+            try fix(w, "Build the service with this server's Ctx (app.tcp and app.udp do).");
+        },
+        // ---- end p3/net ----
+
+        // ---- p3/lambda ----
+        error.LambdaRuntimeApiMissing => {
+            try w.writeAll("can't start in deployment \"lambda\": AWS_LAMBDA_RUNTIME_API is not set; Lambda sets it, and so does the Runtime Interface Emulator (docs/lambda.md, \"Running locally\").");
+            try fix(w, "Run it on Lambda or under the Runtime Interface Emulator, set lambda.runtime_api, or use another deployment.");
+        },
+        error.LambdaNotBuilt => {
+            try w.writeAll("can't start in deployment \"lambda\": this build leaves the Lambda adapter out (-Dlambda).");
+            try fix(w, "Build with -Dlambda (on in every profile), or use another deployment.");
+        },
+        error.LambdaRuntimeApiFailed => {
+            try w.print("can't go on with the Lambda Runtime API at {s}: {s}; exiting so Lambda starts a new environment.", .{ ctx.address orelse "AWS_LAMBDA_RUNTIME_API", ctx.detail orelse "it gave an answer the adapter cannot use" });
+            try fix(w, "Nothing to fix in the app; if it repeats, the function's logs before this line say why.");
+        },
+        error.SnapStartUnsupported => {
+            try w.writeAll("can't run under Lambda SnapStart: it is not supported yet (restored copies would share random-number state).");
+            try fix(w, "Publish the function without SnapStart.");
+        },
+        // ---- end p3/lambda ----
+
         error.NoProtocols => {
             try w.writeAll("can't start a listener that speaks neither HTTP/1.1 nor HTTP/2.");
             try fix(w, "Turn http1 or http2 on for the listener.");

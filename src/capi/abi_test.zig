@@ -195,9 +195,6 @@ test "anole.h: enum anole_event_type is abi.zig's event types, and the status en
 }
 
 test "anole.h: a handle typedef for every handle kind, and no other" {
-    // The Kafka handles are the broker kinds under their own C names
-    // (abi.handle_kinds).
-    const aliases = [_][]const u8{ "anole_kafka_group", "anole_kafka_batch" };
     for (abi.handle_kinds) |k| {
         const decl = try std.fmt.allocPrint(std.testing.allocator, "typedef uint64_t {s};", .{k.c_type});
         defer std.testing.allocator.free(decl);
@@ -213,8 +210,6 @@ test "anole.h: a handle typedef for every handle kind, and no other" {
         const name = rest[0..end];
         const known = for (abi.handle_kinds) |k| {
             if (std.mem.eql(u8, k.c_type, name)) break true;
-        } else for (aliases) |al| {
-            if (std.mem.eql(u8, al, name)) break true;
         } else false;
         if (!known) {
             std.debug.print("anole.h's handle type {s} is no kind in abi.handle_kinds\n", .{name});
@@ -263,10 +258,12 @@ test "abi.zig: the allocation table holds" {
             try std.testing.expect(known);
         }
     }
-    // Handle kinds named, ascending, no duplicates (7 is reserved).
-    try std.testing.expectEqual(@as(usize, 8), abi.handle_kinds.len);
+    // Handle kinds named, ascending, no duplicates (7 is reserved), and
+    // within the handle's five kind bits.
+    try std.testing.expectEqual(@as(usize, 17), abi.handle_kinds.len);
     for (abi.handle_kinds, 0..) |k, i| {
         try std.testing.expect(k.kind != 7);
+        try std.testing.expect(k.kind > 0 and k.kind < 32);
         if (i > 0) try std.testing.expect(k.kind > abi.handle_kinds[i - 1].kind);
         for (abi.handle_kinds[0..i]) |other| try std.testing.expect(!std.mem.eql(u8, other.name, k.name));
     }

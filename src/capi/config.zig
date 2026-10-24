@@ -57,6 +57,42 @@ pub const Config = struct {
     /// Message brokers for `anole_nats_*`, opened at start.
     brokers: []const Broker = &.{},
 
+    // ---- p3/jobs ----
+    /// The durable job queue for `anole_jobs_*` (-Djobs).
+    jobs: ?Jobs = null,
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    /// Webhooks out (-Dwebhooks; needs "jobs"): endpoints, signed deliveries
+    /// run as jobs, retries and the delivery log. See `anole_webhooks_*`.
+    webhooks: ?Webhooks = null,
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    /// Server-sent events: the settings of the topics `anole_sse_publish`
+    /// and the "sse" routes use.
+    sse: Sse = .{},
+    /// Database changes fed into topics, or read by consumers
+    /// (`anole_watch_*`).
+    watches: []const Watch = &.{},
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    /// S3-compatible object stores for `anole_s3_*`, opened at start.
+    storage: []const Storage = &.{},
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    /// Mail servers for `anole_smtp_*`, opened at start.
+    mail: []const Mail = &.{},
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    /// AWS Lambda (`"deployment": "lambda"`): where invocations come from
+    /// and how answers go back. Ignored by other deployments.
+    lambda: Lambda = .{},
+    // ---- end p3/lambda ----
+
     pub const Console = struct {
         /// The control socket. Null: on (off under deployment lambda, on
         /// Windows, with ANOLE_CONSOLE=0).
@@ -109,6 +145,15 @@ pub const Config = struct {
         /// or CIDR networks, "10.0.0.0/8"); empty: proxy.trusted when set,
         /// else any peer.
         proxy_protocol_from: []const []const u8 = &.{},
+
+        // ---- p3/net ----
+        /// Raw TCP instead of HTTP: connections and their data go to the
+        /// consumer as events. Needs a port or unix; not with http3.
+        tcp: ?NetTcp = null,
+        /// UDP instead of HTTP: datagrams go to the consumer in batches.
+        /// Needs a port; not with tls, unix or proxy_protocol.
+        udp: ?NetUdp = null,
+        // ---- end p3/net ----
     };
 
     pub const Tls = struct {
@@ -169,6 +214,11 @@ pub const Config = struct {
         /// The largest database answer, in bytes of its record: past it,
         /// the answer is ANOLE_E_TOOBIG.
         db_result_max: u32 = 16 << 20,
+
+        // ---- p3/realtime ----
+        /// The largest event `anole_sse_publish` and `anole_sse_send` take.
+        sse_max_event: u32 = 1 << 20,
+        // ---- end p3/realtime ----
     };
 
     pub const Database = struct {
@@ -589,6 +639,10 @@ pub const Config = struct {
         cors: Cors,
         jwt: Jwt,
         rate_limit: RateLimit,
+
+        // ---- p3/webhooks ----
+        webhook_verify: WebhookVerify,
+        // ---- end p3/webhooks ----
     };
 
     pub const RequestId = struct {
@@ -694,6 +748,12 @@ pub const Config = struct {
         cache: ?Cache = null,
         /// After the global ones.
         middleware: []const Middleware = &.{},
+
+        // ---- p3/realtime ----
+        /// a server-sent events endpoint (GET): topics from the path's
+        /// parameters, served natively, or decided by a consumer.
+        sse: ?SseRoute = null,
+        // ---- end p3/realtime ----
     };
     pub const Fixed = struct {
         status: u16 = 200,
@@ -813,6 +873,425 @@ pub const Config = struct {
         max_entries: u32 = 1024,
         max_bytes: u64 = 16 << 20,
     };
+
+    // Each area's own types.
+    // ---- p3/net (types) ----
+    /// How a raw TCP listener cuts input into messages: exactly one of
+    /// lines, length, varint (`anole.net.Framing`).
+    pub const NetFraming = struct {
+        lines: ?struct { max: u32 = 64 * 1024, strip_cr: bool = true, crlf: bool = false } = null,
+        length: ?struct { bytes: u8 = 4, endian: []const u8 = "big", includes_header: bool = false, max: u32 = 1 << 20 } = null,
+        varint: ?struct { max: u32 = 1 << 20 } = null,
+    };
+
+    /// `Listener.tcp`: `anole.net.Tcp.Options` with durations in ms.
+    pub const NetTcp = struct {
+        /// Carried in the listener's records (`handler_id`).
+        handler: u32,
+        framing: ?NetFraming = null,
+        half_open: bool = false,
+        no_delay: bool = true,
+        keepalive_ms: ?u32 = 60_000,
+        handshake_timeout_ms: ?u32 = 10_000,
+        idle_timeout_ms: ?u32 = null,
+        lifetime_ms: ?u32 = null,
+        write_timeout_ms: ?u32 = 30_000,
+        write_high_water: u32 = 256 * 1024,
+        write_max: u32 = 8 * 1024 * 1024,
+        read_window: u32 = 16 * 1024,
+        read_ahead: u32 = 256 * 1024,
+        max_connections: ?u32 = null,
+        log_connections: bool = false,
+    };
+
+    /// `Listener.udp`: `anole.net.Udp.Options` (no sessions: a binding keeps
+    /// its own map keyed by address).
+    pub const NetUdp = struct {
+        handler: u32,
+        sockets: ?u16 = null,
+        max_datagram: u16 = 2048,
+        batch: u8 = 32,
+        send_queue: u32 = 1 << 20,
+        receive_buffer: ?u32 = null,
+        send_buffer: ?u32 = null,
+    };
+    // ---- end p3/net (types) ----
+
+    // ---- p3/jobs (types) ----
+    pub const Jobs = struct {
+        /// A `databases[].name` (PostgreSQL, SQLite or Redis), or "memory".
+        store: []const u8 = "memory",
+        queues: []const JobQueue = &.{.{ .name = "default" }},
+        lease_ms: u32 = 30_000,
+        poll_ms: u32 = 1000,
+        migrate: bool = true,
+        notify: bool = true,
+        table_prefix: []const u8 = "anole_",
+        key_prefix: []const u8 = "anole:",
+        /// Kinds known by name: their defaults for `anole_jobs_enqueue`.
+        kinds: []const JobKind = &.{},
+        keep: struct { completed_ms: u64 = 86_400_000, dead_ms: u64 = 2_592_000_000, cancelled_ms: u64 = 604_800_000 } = .{},
+        leader: struct { method: []const u8 = "auto", ttl_ms: u32 = 15_000, renew_ms: u32 = 5000 } = .{},
+        /// How long a server drain lets running jobs finish before they are put back.
+        drain_ms: u32 = 10_000,
+        /// Schedules: each enqueues a job of `kind`, or runs a statement.
+        cron: []const JobCron = &.{},
+    };
+
+    pub const JobCron = struct {
+        name: []const u8,
+        schedule: []const u8,
+        tz: ?[]const u8 = null,
+        /// Exactly one of `kind` and `sql`.
+        kind: ?[]const u8 = null,
+        args: ?std.json.Value = null,
+        sql: ?JobSql = null,
+        /// "once", "skip" or "all".
+        missed: []const u8 = "once",
+        catch_up_ms: u32 = 86_400_000,
+    };
+
+    /// A statement run on a configured database at each tick, with no language involved.
+    pub const JobSql = struct {
+        database: []const u8,
+        statement: []const u8,
+    };
+
+    pub const JobQueue = struct {
+        name: []const u8,
+        concurrency: u32 = 10,
+    };
+
+    pub const JobKind = struct {
+        name: []const u8,
+        queue: []const u8 = "default",
+        priority: []const u8 = "normal",
+        attempts: u16 = 20,
+        timeout_ms: u64 = 900_000,
+    };
+    // ---- end p3/jobs (types) ----
+
+    // ---- p3/webhooks (types) ----
+    pub const Webhooks = struct {
+        /// The jobs queue deliveries run on.
+        queue: []const u8 = "webhooks",
+        /// Deliveries at once in this process.
+        concurrency: u32 = 32,
+        timeout_ms: u32 = 15_000,
+        attempts: u16 = 10,
+        backoff: WebhookBackoff = .{},
+        /// Per endpoint origin; null: none.
+        breaker: ?Breaker = .{},
+        /// null: allowed in development, refused in production.
+        allow_private_addresses: ?bool = null,
+        /// null: not required in development, required in production.
+        require_https: ?bool = null,
+        user_agent: []const u8 = "Anole-Webhooks",
+        max_payload: u32 = 262_144,
+        response_kept: u32 = 4096,
+        keep_messages_ms: u32 = 2_592_000_000,
+        keep_attempts_ms: u32 = 2_592_000_000,
+        disable_after_ms: u32 = 432_000_000,
+        /// The environment variable holding the 32-byte base64 key that
+        /// encrypts stored secrets; "" for none.
+        secrets_key_env: []const u8 = "ANOLE_WEBHOOKS_KEY",
+        max_endpoints_per_owner: u16 = 100,
+    };
+
+    pub const WebhookBackoff = struct {
+        base_ms: u32 = 5_000,
+        max_ms: u32 = 86_400_000,
+        multiplier: f32 = 5.0,
+        jitter: Jitter = .equal,
+        pub const Jitter = enum { full, equal, none };
+    };
+
+    /// The `webhook_verify` middleware: checks an incoming webhook's signature
+    /// and drops duplicate deliveries.
+    pub const WebhookVerify = struct {
+        preset: Preset,
+        /// Exactly one of `secrets` and `secrets_env`.
+        secrets: ?[]const []const u8 = null,
+        /// An environment variable holding one secret, or several separated by spaces.
+        secrets_env: ?[]const u8 = null,
+        tolerance_ms: u32 = 300_000,
+        /// "memory", "none" or "redis:<databases[].name>".
+        dedup: []const u8 = "memory",
+        dedup_ttl_ms: u32 = 86_400_000,
+        on_store_error: OnStoreError = .reject,
+        /// With preset "hmac".
+        hmac: ?WebhookHmac = null,
+
+        pub const Preset = enum { standard, stripe, github, slack, hmac };
+        pub const OnStoreError = enum { reject, process };
+    };
+
+    pub const WebhookHmac = struct {
+        header: []const u8,
+        algorithm: Algorithm = .sha256,
+        encoding: Encoding = .hex,
+        /// Stripped from the header value first ("sha256=").
+        prefix: []const u8 = "",
+        /// A header with the delivery's id, for duplicates.
+        id_header: ?[]const u8 = null,
+
+        pub const Algorithm = enum { sha1, sha256, sha512 };
+        pub const Encoding = enum { hex, base64 };
+    };
+    // ---- end p3/webhooks (types) ----
+
+    // ---- p3/realtime (types) ----
+    pub const Sse = struct {
+        /// A comment line to every subscriber idle this long; null: none.
+        heartbeat_ms: ?u32 = 15_000,
+        /// `retry:` at the start of each stream; null: the browser's default.
+        retry_ms: ?u32 = null,
+        /// null: no ids, no replay, no gap events.
+        replay: ?SseReplay = .{},
+        max_queued_bytes: u32 = 256 * 1024,
+        on_full: SseOnFull = .close,
+        close_after_ms: u32 = 1000,
+        leave_grace_ms: u32 = 1000,
+        max_topics_per_subscriber: u16 = 64,
+        gap_event: ?[]const u8 = "gap",
+        drain_retry: ?SseRetry = .{},
+    };
+    pub const SseOnFull = enum { close, drop };
+    pub const SseReplay = struct {
+        events: u32 = 256,
+        bytes: u32 = 256 * 1024,
+        total_bytes: u64 = 64 * 1024 * 1024,
+        max_age_ms: u32 = 300_000,
+        max_per_resume: u32 = 1024,
+    };
+    pub const SseRetry = struct { min_ms: u32 = 500, max_ms: u32 = 5000 };
+    pub const SseRoute = struct {
+        /// Topics a subscriber joins: `{name}` is the path's parameter.
+        topics: []const []const u8 = &.{},
+        /// Without Last-Event-ID: the newest `last` events of each topic.
+        last: u16 = 0,
+        /// A consumer route id: subscribe requests become ANOLE_EV_SSE_SUBSCRIBE
+        /// and the subscriber joins `topics` plus those of `anole_sse_accept`.
+        handler: ?u32 = null,
+    };
+
+    pub const Watch = struct {
+        /// 1-255 bytes, unique; `anole_watch_find` looks it up.
+        name: []const u8,
+        /// A "databases" entry of the matching kind.
+        database: []const u8,
+        /// Exactly one of these.
+        postgres: ?WatchPostgres = null,
+        redis: ?WatchRedis = null,
+        redis_stream: ?WatchStream = null,
+        mongodb: ?WatchMongo = null,
+        to: []const WatchTo = &.{},
+        data: WatchData = .auto,
+        reconnect: ?WatchReconnect = null,
+    };
+    pub const WatchData = enum { auto, document };
+    pub const WatchPostgres = struct { channels: []const []const u8 };
+    pub const WatchRedis = struct {
+        channels: []const []const u8 = &.{},
+        patterns: []const []const u8 = &.{},
+    };
+    pub const WatchStream = struct {
+        keys: []const []const u8,
+        /// "new", "all" or {"after": ["id", ...]}.
+        start: ?std.json.Value = null,
+        count: u32 = 128,
+        block_ms: u32 = 10_000,
+        group: ?WatchGroup = null,
+    };
+    pub const WatchGroup = struct {
+        name: []const u8,
+        consumer: ?[]const u8 = null,
+        create: bool = true,
+        /// "auto" or "manual".
+        ack: []const u8 = "auto",
+    };
+    pub const WatchMongo = struct {
+        database: ?[]const u8 = null,
+        collection: ?[]const u8 = null,
+        /// An Extended JSON array of stages after $changeStream.
+        pipeline: ?std.json.Value = null,
+        /// "default", "update_lookup", "when_available" or "required".
+        full_document: []const u8 = "default",
+        /// "off", "when_available" or "required".
+        full_document_before_change: []const u8 = "off",
+        /// "now", {"resume_after": token}, {"start_after": token} or {"at": {"t": n, "i": n}}.
+        start: ?std.json.Value = null,
+        max_await_ms: ?u32 = null,
+        batch_size: ?u32 = null,
+        show_expanded_events: bool = false,
+    };
+    /// Exactly one of `sse` and `ws`: the topic or room (a template).
+    pub const WatchTo = struct {
+        sse: ?[]const u8 = null,
+        ws: ?[]const u8 = null,
+        /// sse: the event name.
+        event: ?[]const u8 = null,
+        /// ws: "text" or "binary".
+        type: []const u8 = "text",
+        /// ws: broadcast on a gap.
+        gap_message: ?[]const u8 = null,
+    };
+    pub const WatchReconnect = struct { base_ms: u32 = 100, max_ms: u32 = 5000 };
+    // ---- end p3/realtime (types) ----
+
+    // ---- p3/s3 (types) ----
+    /// An object store (`anole.s3.Options` and the call defaults).
+    pub const Storage = struct {
+        /// What `anole_s3_find` looks it up by: unique, 1-255 bytes.
+        name: []const u8,
+        s3: S3,
+        /// A bound on every call that has no timeout_ms of its own; a call
+        /// that moves a body gets this plus bytes / min_throughput. 0: none.
+        timeout_ms: u32 = 30_000,
+        /// What status each class of error becomes, as `anole.db.ErrorMap`.
+        errors: anole.db.ErrorMap = .{},
+        /// What calls are retried with (all of S3's are idempotent, so on by
+        /// default); null: tried once.
+        retry: ?S3Retry = .{},
+        breaker: ?Breaker = .{},
+    };
+
+    /// `Retry` with S3's defaults (100 ms to 2 s).
+    pub const S3Retry = struct {
+        attempts: u8 = 3,
+        base_ms: u32 = 100,
+        max_ms: u32 = 2_000,
+        multiplier: f32 = 2.0,
+        attempt_timeout_ms: u32 = 0,
+        max_retry_after_ms: u32 = 10_000,
+    };
+
+    pub const S3 = struct {
+        /// "https://<account>.r2.cloudflarestorage.com", "http://127.0.0.1:9000".
+        /// Null: AWS_ENDPOINT_URL_S3, AWS_ENDPOINT_URL, else AWS.
+        endpoint: ?[]const u8 = null,
+        /// Null: AWS_REGION, AWS_DEFAULT_REGION, else the provider's.
+        region: ?[]const u8 = null,
+        /// The default bucket; null: S3_BUCKET.
+        bucket: ?[]const u8 = null,
+        /// Keys: both or neither (neither takes the AWS credential chain).
+        access_key_id: ?[]const u8 = null,
+        secret_access_key: ?[]const u8 = null,
+        session_token: ?[]const u8 = null,
+        /// Unsigned requests, for public buckets.
+        anonymous: bool = false,
+        /// "auto", "aws", "r2", "b2", "supabase", "minio" or "generic".
+        provider: []const u8 = "auto",
+        /// "auto", "path" or "virtual_host".
+        addressing: []const u8 = "auto",
+        /// "auto" (hash the body over plain HTTP only), "signed" or "unsigned".
+        payload_signing: []const u8 = "auto",
+        ca_file: ?[]const u8 = null,
+        ca_pem: ?[]const u8 = null,
+        client_cert_file: ?[]const u8 = null,
+        client_key_file: ?[]const u8 = null,
+        client_cert_pem: ?[]const u8 = null,
+        client_key_pem: ?[]const u8 = null,
+        insecure_skip_verify: bool = false,
+        min_throughput: u64 = 1024 * 1024,
+        connect_timeout_ms: u32 = 10_000,
+        max_idle_connections: u16 = 64,
+        part_size: u64 = 8 * 1024 * 1024,
+        multipart_threshold: ?u64 = null,
+        concurrency: u8 = 2,
+        upload_memory: u64 = 256 * 1024 * 1024,
+        max_object_bytes: u64 = 16 * 1024 * 1024,
+        readiness: bool = false,
+    };
+    // ---- end p3/s3 (types) ----
+
+    // ---- p3/smtp (types) ----
+    pub const Mail = struct {
+        /// What `anole_smtp_find` looks it up by: unique, 1-255 bytes.
+        name: []const u8,
+        smtp: Smtp,
+        /// A bound on every send that has no timeout_ms of its own (plus
+        /// the message's size at min_throughput). 0: none.
+        timeout_ms: u32 = 30_000,
+        /// A circuit breaker: after repeated connection failures sends fail
+        /// fast with ANOLE_E_SERVICE, class UNAVAILABLE, error_code
+        /// "circuit_open" and http_status 503. null: none.
+        breaker: ?Breaker = .{},
+        /// What sends with ANOLE_SMTP_F_RETRY are retried with.
+        retry: MailRetry = .{},
+        /// What status each class of error becomes, as `anole.db.ErrorMap`.
+        errors: anole.db.ErrorMap = .{},
+    };
+
+    pub const MailRetry = struct {
+        attempts: u8 = 3,
+        base_ms: u32 = 500,
+        max_ms: u32 = 5_000,
+        multiplier: f32 = 2.0,
+        attempt_timeout_ms: u32 = 0,
+        max_retry_after_ms: u32 = 10_000,
+    };
+
+    /// An SMTP server, as `anole.smtp.Options` (docs/email.md).
+    pub const Smtp = struct {
+        /// smtp://user:pass@host:587 (STARTTLS), smtps://user:pass@host:465,
+        /// smtp://127.0.0.1:1025?tls=none. Null: SMTP_URL, else Mailpit's
+        /// smtp://127.0.0.1:1025 (not in production).
+        url: ?[]const u8 = null,
+        /// The default From ("App <hello@example.com>"). Null: SMTP_FROM.
+        from: ?[]const u8 = null,
+        /// Override the URL's user name and password.
+        username: ?[]const u8 = null,
+        password: ?[]const u8 = null,
+        /// "auto", "starttls", "implicit" or "none".
+        tls_mode: []const u8 = "auto",
+        ca_file: ?[]const u8 = null,
+        ca_pem: ?[]const u8 = null,
+        client_cert_file: ?[]const u8 = null,
+        client_key_file: ?[]const u8 = null,
+        client_cert_pem: ?[]const u8 = null,
+        client_key_pem: ?[]const u8 = null,
+        insecure_skip_verify: bool = false,
+        /// The EHLO name. Null: the host name.
+        helo_name: ?[]const u8 = null,
+        /// Connections in all, split between executors. Null: 2 per executor.
+        max_connections: ?u32 = null,
+        max_messages_per_connection: u32 = 100,
+        idle_timeout_ms: u32 = 30_000,
+        acquire_timeout_ms: u32 = 5_000,
+        connect_timeout_ms: u32 = 10_000,
+        /// Bytes per second a send may take at the least, added to the
+        /// timeout for the message's size.
+        min_throughput: u64 = 1_048_576,
+        /// Refused before connecting when the encoded message is larger.
+        max_message_bytes: u64 = 26_214_400,
+        /// Register a readiness check (/readyz): off by default.
+        readiness: bool = false,
+    };
+    // ---- end p3/smtp (types) ----
+
+    // ---- p3/lambda (types) ----
+    /// `ServerOptions.lambda`, durations in milliseconds.
+    pub const Lambda = struct {
+        /// "host:port". Null: AWS_LAMBDA_RUNTIME_API.
+        runtime_api: ?[]const u8 = null,
+        /// "buffered" or "response_stream". Null: ANOLE_LAMBDA_INVOKE_MODE,
+        /// else buffered.
+        invoke_mode: ?anole.ServerOptions.Lambda.InvokeMode = null,
+        /// 1 to 4096. Null: AWS_LAMBDA_MAX_CONCURRENCY, else 1.
+        concurrency: ?u16 = null,
+        event_path: ?[]const u8 = "/_lambda/event",
+        base_path: ?[]const u8 = null,
+        keep_stage: bool = false,
+        context_headers: bool = true,
+        deadline_margin_ms: u32 = 100,
+        /// Null: never.
+        idle_reset_ms: ?u32 = 300_000,
+        sigterm: bool = true,
+        shutdown_timeout_ms: u32 = 400,
+        flush_timeout_ms: u32 = 500,
+    };
+    // ---- end p3/lambda (types) ----
 };
 
 pub const ClientAuth = enum { none, request, require };
@@ -916,6 +1395,9 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             if (l.tls == null) return fail(why, "listeners[{d}].http3 needs tls", .{i});
             http3_listeners += 1;
         }
+        // ---- p3/net ----
+        if (l.tcp != null or l.udp != null) try checkNet(l, i, why);
+        // ---- end p3/net ----
         if (l.name) |n| if (n.len == 0 or n.len > 255 or std.mem.indexOfScalar(u8, n, ':') != null)
             return fail(why, "listeners[{d}].name: 1-255 bytes, no ':'", .{i});
         for (cfg.listeners[0..i]) |other| if (l.name != null and other.name != null and std.mem.eql(u8, l.name.?, other.name.?))
@@ -923,6 +1405,28 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     }
     if (http3_listeners > 1) return fail(why, "listeners: http3 on one listener at most", .{});
     if (cfg.grpc) |g| try checkGrpc(g, why);
+    // ---- p3/s3 (check) ----
+    for (cfg.storage, 0..) |st, i| {
+        if (st.name.len == 0 or st.name.len > 255) return fail(why, "storage[{d}].name: 1-255 bytes", .{i});
+        for (cfg.storage[0..i]) |other| if (std.mem.eql(u8, st.name, other.name))
+            return fail(why, "storage[{d}].name \"{s}\" is taken", .{ i, st.name });
+        if (comptime !features.s3) return fail(why, "storage[{d}]: S3 is not built in (-Ds3)", .{i});
+        const c = st.s3;
+        if ((c.access_key_id == null) != (c.secret_access_key == null)) return fail(why, "storage[{d}].s3: access_key_id, secret_access_key: both or neither", .{i});
+        if (c.session_token != null and c.access_key_id == null) return fail(why, "storage[{d}].s3: session_token goes with access_key_id and secret_access_key", .{i});
+        if (c.anonymous and c.access_key_id != null) return fail(why, "storage[{d}].s3: anonymous or keys, not both", .{i});
+        if (!oneOf(c.provider, &.{ "auto", "aws", "r2", "b2", "supabase", "minio", "generic" })) return fail(why, "storage[{d}].s3.provider: auto, aws, r2, b2, supabase, minio or generic", .{i});
+        if (!oneOf(c.addressing, &.{ "auto", "path", "virtual_host" })) return fail(why, "storage[{d}].s3.addressing: auto, path or virtual_host", .{i});
+        if (!oneOf(c.payload_signing, &.{ "auto", "signed", "unsigned" })) return fail(why, "storage[{d}].s3.payload_signing: auto, signed or unsigned", .{i});
+        if (c.part_size < 5 * 1024 * 1024 or c.part_size > 5 * 1024 * 1024 * 1024) return fail(why, "storage[{d}].s3: part_size: 5 MiB .. 5 GiB", .{i});
+        if (c.concurrency < 1 or c.concurrency > 16) return fail(why, "storage[{d}].s3.concurrency: 1 .. 16", .{i});
+        if (c.upload_memory < c.part_size) return fail(why, "storage[{d}].s3.upload_memory: at least one part", .{i});
+        if (c.ca_file != null and c.ca_pem != null) return fail(why, "storage[{d}].s3: ca_file or ca_pem, not both", .{i});
+        try checkClientCert(c, "storage", "s3", i, why);
+        if (c.endpoint) |e| if (!(std.mem.startsWith(u8, e, "http://") or std.mem.startsWith(u8, e, "https://")))
+            return fail(why, "storage[{d}].s3.endpoint: an http:// or https:// URL", .{i});
+    }
+    // ---- end p3/s3 (check) ----
     for (cfg.databases, 0..) |d, i| {
         if (d.name.len == 0 or d.name.len > 255) return fail(why, "databases[{d}].name: 1-255 bytes", .{i});
         for (cfg.databases[0..i]) |other| if (std.mem.eql(u8, d.name, other.name))
@@ -1005,6 +1509,33 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             }
         }
     }
+    // ---- p3/smtp (validate) ----
+    for (cfg.mail, 0..) |m, i| {
+        if (comptime !features.smtp) return fail(why, "mail[{d}]: SMTP is not built in (-Dsmtp)", .{i});
+        if (m.name.len == 0 or m.name.len > 255) return fail(why, "mail[{d}].name: 1-255 bytes", .{i});
+        for (cfg.mail[0..i]) |other| if (std.mem.eql(u8, m.name, other.name))
+            return fail(why, "mail[{d}].name \"{s}\" is taken", .{ i, m.name });
+        const sm = m.smtp;
+        if (!oneOf(sm.tls_mode, &.{ "auto", "starttls", "implicit", "none" })) return fail(why, "mail[{d}].smtp.tls_mode: auto, starttls, implicit or none", .{i});
+        try checkClientCert(sm, "mail", "smtp", i, why);
+        if (sm.max_connections) |n| if (n == 0) return fail(why, "mail[{d}].smtp.max_connections: at least 1", .{i});
+        if (sm.max_messages_per_connection == 0) return fail(why, "mail[{d}].smtp.max_messages_per_connection: at least 1", .{i});
+        if (sm.min_throughput == 0) return fail(why, "mail[{d}].smtp.min_throughput: at least 1", .{i});
+        if (sm.password != null and sm.username == null and (sm.url == null or std.mem.indexOfScalar(u8, sm.url.?, '@') == null))
+            return fail(why, "mail[{d}].smtp: a password needs a username", .{i});
+        if (m.retry.attempts == 0 or m.retry.attempts > 10) return fail(why, "mail[{d}].retry.attempts: 1-10", .{i});
+    }
+    // ---- end p3/smtp (validate) ----
+    // ---- p3/lambda (validate) ----
+    {
+        const l = cfg.lambda;
+        if (l.concurrency) |n| if (n == 0 or n > 4096) return fail(why, "lambda.concurrency: 1 to 4096", .{});
+        if (l.runtime_api) |api| if (std.mem.lastIndexOfScalar(u8, api, ':') == null) return fail(why, "lambda.runtime_api: host:port", .{});
+        if (l.event_path) |p| if (p.len == 0 or p[0] != '/') return fail(why, "lambda.event_path: a path starting with '/'", .{});
+        if (l.base_path) |p| if (p.len == 0 or p[0] != '/') return fail(why, "lambda.base_path: a path starting with '/'", .{});
+        if (l.shutdown_timeout_ms == 0) return fail(why, "lambda.shutdown_timeout_ms: at least 1", .{});
+    }
+    // ---- end p3/lambda (validate) ----
     if (cfg.observe.health) |h| {
         if (h.checks.len > 16) return fail(why, "observe.health.checks: at most 16", .{});
         for (h.checks, 0..) |name, i| {
@@ -1024,12 +1555,12 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     timeouts[0] = cfg.timeouts.request_ms orelse std.math.maxInt(u32);
     for (cfg.routes, 0..) |r, i| {
         const kinds = @as(u8, @intFromBool(r.handler != null)) + @intFromBool(r.respond != null) +
-            @intFromBool(r.static != null) + @intFromBool(r.websocket != null) + @intFromBool(r.webtransport != null);
+            @intFromBool(r.static != null) + @intFromBool(r.websocket != null) + @intFromBool(r.webtransport != null) + @intFromBool(r.sse != null);
         const combined = r.handler != null and r.websocket != null and r.websocket.?.accept == .consumer and kinds == 2;
         if (kinds != 1 and !combined) {
             if (r.handler != null and r.websocket != null and kinds == 2)
                 return fail(why, "routes[{d}]: handler and websocket go together only with \"accept\": \"consumer\"", .{i});
-            return fail(why, "routes[{d}]: exactly one of handler, respond, static, websocket, webtransport", .{i});
+            return fail(why, "routes[{d}]: exactly one of handler, respond, static, websocket, webtransport, sse", .{i});
         }
         if (r.path.len == 0 or r.path[0] != '/') return fail(why, "routes[{d}].path must start with '/'", .{i});
         if (r.method) |m| if (methodOf(m) == null) return fail(why, "routes[{d}].method \"{s}\" is unknown", .{ i, m });
@@ -1065,8 +1596,8 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         if (r.static != null and r.method != null) return fail(why, "routes[{d}]: a static route takes no method (GET and HEAD)", .{i});
         if (r.cache != null and r.handler == null and r.respond == null) return fail(why, "routes[{d}].cache: on handler and respond routes", .{i});
         if (r.timeout_ms) |t| {
-            const decides = r.websocket != null and r.websocket.?.accept == .consumer;
-            if (r.handler == null and !decides) return fail(why, "routes[{d}].timeout_ms: on handler routes, and websocket routes whose handshakes the consumer decides", .{i});
+            const decides = (r.websocket != null and r.websocket.?.accept == .consumer) or (r.sse != null and r.sse.?.handler != null);
+            if (r.handler == null and !decides) return fail(why, "routes[{d}].timeout_ms: on handler routes, and websocket and sse routes whose handshakes the consumer decides", .{i});
             if (std.mem.indexOfScalar(u32, timeouts[0..ntimeouts], t) == null) {
                 if (ntimeouts == max_timeouts) return fail(why, "routes: at most {d} distinct timeout_ms values", .{max_timeouts});
                 timeouts[ntimeouts] = t;
@@ -1076,10 +1607,137 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
         var buf: [32]u8 = undefined;
         try checkMiddleware(r.middleware, std.fmt.bufPrint(&buf, "routes[{d}].middleware", .{i}) catch "routes[].middleware", why);
     }
+    try checkRealtime(cfg, why);
 }
+
+// ---- p3/realtime (checks) ----
+
+/// The SSE settings, the "sse" routes and the "watches".
+fn checkRealtime(cfg: Config, why: *std.Io.Writer) Problem!void {
+    const s = cfg.sse;
+    if (s.replay) |r| {
+        if (r.events == 0 or r.events > 65535) return fail(why, "sse.replay.events: 1 to 65535", .{});
+        if (r.bytes == 0 or r.total_bytes == 0) return fail(why, "sse.replay: bytes and total_bytes at least 1", .{});
+    }
+    if (s.max_queued_bytes == 0) return fail(why, "sse.max_queued_bytes: at least 1", .{});
+    if (s.max_topics_per_subscriber == 0) return fail(why, "sse.max_topics_per_subscriber: at least 1", .{});
+    if (s.gap_event) |g| if (std.mem.indexOfAny(u8, g, "\r\n") != null) return fail(why, "sse.gap_event: no CR or LF", .{});
+    if (s.drain_retry) |d| if (d.min_ms > d.max_ms) return fail(why, "sse.drain_retry: min_ms above max_ms", .{});
+    if (cfg.limits.sse_max_event == 0 or cfg.limits.sse_max_event > max_record_payload) return fail(why, "limits.sse_max_event: 1 to {d}", .{max_record_payload});
+    for (cfg.routes, 0..) |r, i| {
+        const sr = r.sse orelse continue;
+        if (r.method) |m| if (methodOf(m) != .get) return fail(why, "routes[{d}]: an sse route is GET", .{i});
+        if (sr.handler == null and sr.topics.len == 0) return fail(why, "routes[{d}].sse.topics: at least one (or a handler that picks them)", .{i});
+        if (sr.topics.len > s.max_topics_per_subscriber) return fail(why, "routes[{d}].sse.topics: more than sse.max_topics_per_subscriber", .{i});
+        for (sr.topics, 0..) |t, k| {
+            if (t.len == 0 or t.len > 255) return fail(why, "routes[{d}].sse.topics[{d}]: 1-255 bytes", .{ i, k });
+            if (!anole.sse.templatesMatch(r.path, .{ .topics = &.{t} }))
+                return fail(why, "routes[{d}].sse.topics[{d}] \"{s}\": a {{name}} that is not a parameter of the path \"{s}\"", .{ i, k, t, r.path });
+        }
+    }
+    for (cfg.watches, 0..) |w, i| {
+        if (w.name.len == 0 or w.name.len > 255) return fail(why, "watches[{d}].name: 1-255 bytes", .{i});
+        for (cfg.watches[0..i]) |other| if (std.mem.eql(u8, other.name, w.name))
+            return fail(why, "watches[{d}].name \"{s}\" is taken", .{ i, w.name });
+        const kinds = @as(u8, @intFromBool(w.postgres != null)) + @intFromBool(w.redis != null) + @intFromBool(w.redis_stream != null) + @intFromBool(w.mongodb != null);
+        if (kinds != 1) return fail(why, "watches[{d}]: exactly one of postgres, redis, redis_stream, mongodb", .{i});
+        var found: ?Config.Database = null;
+        for (cfg.databases) |d| if (std.mem.eql(u8, d.name, w.database)) {
+            found = d;
+        };
+        const db_cfg = found orelse return fail(why, "watches[{d}]: database \"{s}\" is not in databases", .{ i, w.database });
+        if (w.postgres != null and db_cfg.postgres == null) return fail(why, "watches[{d}]: database \"{s}\" is not PostgreSQL, which a postgres watch needs", .{ i, w.database });
+        if ((w.redis != null or w.redis_stream != null) and db_cfg.redis == null) return fail(why, "watches[{d}]: database \"{s}\" is not Redis, which a redis watch needs", .{ i, w.database });
+        if (w.mongodb != null and db_cfg.mongodb == null) return fail(why, "watches[{d}]: database \"{s}\" is not MongoDB, which a mongodb watch needs", .{ i, w.database });
+        if (db_cfg.sqlite != null) return fail(why, "watches[{d}]: database \"{s}\" is SQLite, which has no change feed", .{ i, w.database });
+        if (w.postgres) |p| {
+            if (p.channels.len == 0) return fail(why, "watches[{d}].postgres.channels: at least one", .{i});
+            for (p.channels) |c| if (c.len == 0 or c.len > 63) return fail(why, "watches[{d}].postgres.channels: 1-63 bytes each", .{i});
+        }
+        if (w.redis) |r| if (r.channels.len + r.patterns.len == 0) return fail(why, "watches[{d}].redis: at least one channel or pattern", .{i});
+        if (w.redis_stream) |r| {
+            if (r.keys.len == 0 or r.keys.len > 16) return fail(why, "watches[{d}].redis_stream.keys: 1 to 16", .{i});
+            if (r.count == 0) return fail(why, "watches[{d}].redis_stream.count: at least 1", .{i});
+            if (r.group) |g| if (!oneOf(g.ack, &.{ "auto", "manual" })) return fail(why, "watches[{d}].redis_stream.group.ack: auto or manual", .{i});
+        }
+        if (w.mongodb) |m| {
+            if (m.collection != null and m.database == null) {}
+            if (!oneOf(m.full_document, &.{ "default", "update_lookup", "when_available", "required" })) return fail(why, "watches[{d}].mongodb.full_document: default, update_lookup, when_available or required", .{i});
+            if (!oneOf(m.full_document_before_change, &.{ "off", "when_available", "required" })) return fail(why, "watches[{d}].mongodb.full_document_before_change: off, when_available or required", .{i});
+            if (m.pipeline) |p| if (p != .array) return fail(why, "watches[{d}].mongodb.pipeline: an array of stage documents", .{i});
+        }
+        for (w.to, 0..) |t, k| {
+            if ((t.sse == null) == (t.ws == null)) return fail(why, "watches[{d}].to[{d}]: exactly one of sse and ws", .{ i, k });
+            if (t.ws != null and !oneOf(t.type, &.{ "text", "binary" })) return fail(why, "watches[{d}].to[{d}].type: text or binary", .{ i, k });
+            const text = t.sse orelse t.ws.?;
+            if (text.len == 0 or text.len > 255) return fail(why, "watches[{d}].to[{d}]: the topic or room is 1-255 bytes", .{ i, k });
+            var scratch: [8192]u8 = undefined;
+            var fba: std.heap.FixedBufferAllocator = .init(&scratch);
+            _ = anole.watch.template.Template.parse(fba.allocator(), text, w.mongodb != null) catch |err| switch (err) {
+                error.OutOfMemory => {},
+                else => return fail(why, "watches[{d}].to[{d}]: the template \"{s}\" is not valid: use {{channel}}, {{op}}, {{data.<field>}} and, for MongoDB, {{db}}, {{collection}} and {{key}}", .{ i, k, text }),
+            };
+        }
+    }
+}
+// ---- end p3/realtime (checks) ----
 
 /// The client certificate and key of a database: files or text, a
 /// certificate with its key, and not with `insecure_skip_verify` and a CA.
+// ---- p3/net ----
+/// A raw listener's keys (design-net.md §6.2).
+fn checkNet(l: Config.Listener, i: usize, why: *std.Io.Writer) Problem!void {
+    if (l.tcp != null and l.udp != null) return fail(why, "listeners[{d}]: tcp and udp together", .{i});
+    if (comptime !features.net) return fail(why, "listeners[{d}].{s}: raw TCP is not built in (-Dnet)", .{ i, if (l.tcp != null) "tcp" else "udp" });
+    if (l.http3) return fail(why, "listeners[{d}]: http3 on a raw listener", .{i});
+    if (l.port == null and l.unix == null) return fail(why, "listeners[{d}]: a raw listener needs a port (0 for a free one) or unix", .{i});
+    if (l.udp) |u| {
+        if (l.tls != null) return fail(why, "listeners[{d}].udp: with tls (DTLS is not supported)", .{i});
+        if (l.unix != null) return fail(why, "listeners[{d}].udp: on a unix socket", .{i});
+        if (l.proxy_protocol == true) return fail(why, "listeners[{d}].udp: with proxy_protocol", .{i});
+        if (u.sockets) |n| if (n == 0 or n > 255) return fail(why, "listeners[{d}].udp.sockets: 1 to 255", .{i});
+        if (u.max_datagram == 0 or u.max_datagram > 65507) return fail(why, "listeners[{d}].udp.max_datagram: 1 to 65507", .{i});
+        if (u.batch == 0 or u.batch > 64) return fail(why, "listeners[{d}].udp.batch: 1 to 64", .{i});
+        if (u.send_queue == 0) return fail(why, "listeners[{d}].udp.send_queue: at least 1", .{i});
+    }
+    if (l.tcp) |t| {
+        if (t.read_window < 4096 or t.read_window > 65536) return fail(why, "listeners[{d}].tcp.read_window: 4096 to 65536", .{i});
+        if (t.write_high_water == 0 or t.write_max < t.write_high_water) return fail(why, "listeners[{d}].tcp: write_max is below write_high_water", .{i});
+        if (t.read_ahead == 0) return fail(why, "listeners[{d}].tcp.read_ahead: at least 1", .{i});
+        if (t.max_connections) |n| if (n == 0) return fail(why, "listeners[{d}].tcp.max_connections: at least 1", .{i});
+        if (t.framing) |f| {
+            const n = @as(u8, @intFromBool(f.lines != null)) + @intFromBool(f.length != null) + @intFromBool(f.varint != null);
+            if (n != 1) return fail(why, "listeners[{d}].tcp.framing: exactly one of lines, length, varint", .{i});
+            if (f.length) |len| {
+                if (len.bytes != 1 and len.bytes != 2 and len.bytes != 4) return fail(why, "listeners[{d}].tcp.framing.length.bytes: 1, 2 or 4", .{i});
+                if (!std.mem.eql(u8, len.endian, "big") and !std.mem.eql(u8, len.endian, "little")) return fail(why, "listeners[{d}].tcp.framing.length.endian: \"big\" or \"little\"", .{i});
+            }
+            const max: u32 = if (f.lines) |x| x.max else if (f.length) |x| x.max else f.varint.?.max;
+            if (max == 0 or max > 1 << 30) return fail(why, "listeners[{d}].tcp.framing: max 1 to 1073741824", .{i});
+        }
+    }
+}
+
+/// The Zig framing a listener's `tcp.framing` stands for.
+pub fn netFraming(f: ?Config.NetFraming) anole.net.Framing {
+    const fr = f orelse return .none;
+    if (fr.lines) |x| return .{ .lines = .{ .max = x.max, .strip_cr = x.strip_cr, .crlf = x.crlf } };
+    if (fr.length) |x| return .{ .length = .{
+        .bytes = x.bytes,
+        .endian = if (std.mem.eql(u8, x.endian, "little")) .little else .big,
+        .includes_header = x.includes_header,
+        .max = x.max,
+    } };
+    if (fr.varint) |x| return .{ .varint = .{ .max = x.max } };
+    return .none;
+}
+
+/// A duration given in milliseconds.
+pub fn netMs(ms: ?u32) ?std.Io.Duration {
+    return if (ms) |v| std.Io.Duration.fromMilliseconds(v) else null;
+}
+// ---- end p3/net ----
+
 fn checkClientCert(c: anytype, comptime root: []const u8, comptime kind: []const u8, i: usize, why: *std.Io.Writer) Problem!void {
     const files = c.client_cert_file != null or c.client_key_file != null;
     const pem = c.client_cert_pem != null or c.client_key_pem != null;
@@ -1130,6 +1788,8 @@ fn checkMiddleware(list: []const Config.Middleware, where: []const u8, why: *std
             if (r.limit == 0 or r.window_ms <= 0) return fail(why, "{s}[{d}].rate_limit: limit and window_ms must be positive", .{ where, i });
         },
         .compress => if (comptime !features.compression) return fail(why, "{s}[{d}].compress: compression is not built in (-Dcompression)", .{ where, i }),
+        // p3/webhooks
+        .webhook_verify => |w| try @import("webhooks.zig").checkVerify(w, where, i, why),
         else => {},
     };
 }
@@ -1235,6 +1895,8 @@ pub fn middleware(app: *anole.App, arena: std.mem.Allocator, m: Config.Middlewar
                 .policy = .{ .limit = c.limit, .window = .fromMilliseconds(c.window_ms), .burst = c.burst },
             });
         },
+        // p3/webhooks
+        .webhook_verify => |c| return @import("webhooks.zig").verifyMiddleware(app, arena, c),
     }
 }
 

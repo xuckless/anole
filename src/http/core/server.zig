@@ -183,6 +183,15 @@ fn warnUntrustedPeerProxy(peer: std.Io.net.IpAddress) bool {
     return true;
 }
 
+/// Sets the permission bits of a unix socket's file. A failure is
+/// logged, not fatal: the socket still works for its owner.
+pub fn setUnixMode(io: std.Io, address: std.Io.net.UnixAddress, mode: u16) void {
+    if (comptime builtin.os.tag == .windows or std.posix.mode_t == u0) return;
+    if (address.isAbstract()) return;
+    std.Io.Dir.cwd().setFilePermissions(io, address.path, .fromMode(mode), .{}) catch |err|
+        log.warn("could not set mode {o} on {s}: {t}", .{ mode, address.path, err });
+}
+
 pub fn resetUntrustedWarningForTest() void {
     warned_untrusted.store(false, .monotonic);
 }
@@ -411,6 +420,8 @@ pub const Connection = struct {
     /// the proxy.
     proxied_peer: ?std.Io.net.IpAddress = null,
     proxied_secure: bool = false,
+    /// The address the PROXY header says the client connected to.
+    proxied_local: ?std.Io.net.IpAddress = null,
     /// What took the connection over after an upgrade (`Response.adopt`).
     adopter: ?*Adopter = null,
     /// Where the writer takes a buffer from when a response first writes
@@ -712,6 +723,15 @@ pub const Connection = struct {
         return if (self.tls_conn) |c| c.alpn_protocol else null;
     }
 
+    /// The name the client asked for in its TLS ClientHello (SNI), or null
+    /// for a plain connection, no name, or a TLS module that does not say.
+    /// Valid for the connection's life.
+    pub fn serverName(self: *const Connection) ?[]const u8 {
+        if (!build_options.use_tls) return null;
+        if (comptime !@hasDecl(tls.Connection, "serverName")) return null;
+        return if (self.tls_conn) |*c| c.serverName() else null;
+    }
+
     /// The client's certificate (the leaf, DER) on a TLS connection whose
     /// handshake verified one, when the TLS module exposes it
     /// (`tls.Connection.peerCertificate`); null otherwise. Owned by the TLS
@@ -972,6 +992,17 @@ pub fn unmapIpv4(address: std.Io.net.IpAddress) std.Io.net.IpAddress {
 /// starts: "https://127.0.0.1:8443 (HTTP/2, HTTP/1.1, HTTP/3)".
 pub fn describeListener(w: *std.Io.Writer, cfg: *const Listener, address: Address) std.Io.Writer.Error!void {
     const secure = cfg.tls != null;
+    if (cfg.raw != null) {
+        switch (address) {
+            .ip => |ip| try w.print("{s}://{f}", .{ if (secure) "tls" else "tcp", ip }),
+            .unix => |unix| try w.print("unix:{s}", .{unix.path}),
+        }
+        try w.writeAll(" (raw TCP");
+        for (cfg.extra_protocols) |p| try w.print(", {s}", .{p});
+        if (address == .ip and address.ip == .ip6 and cfg.ipv6_only == false) try w.writeAll("; IPv6 and IPv4");
+        if (cfg.proxy_protocol) try w.writeAll("; PROXY protocol");
+        return w.writeAll(")");
+    }
     switch (address) {
         .ip => |ip| try w.print("{s}://{f}", .{ if (secure) "https" else "http", ip }),
         .unix => |unix| try w.print("unix:{s}", .{unix.path}),
@@ -1002,6 +1033,37 @@ fn setRequestTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) v
     const timer: *Timer = @ptrCast(@alignCast(context));
     timer.set(io, timeout);
 }
+
+fn claimRequestTimeout(context: *anyopaque) bool {
+    const timer: *Timer = @ptrCast(@alignCast(context));
+    return timer.fired();
+}
+
+/// A protocol that takes connections straight from a listener
+/// (`Listener.raw`): the application's own, never parsed as HTTP.
+pub const Raw = struct {
+    /// On the connection's task, on its executor, once it is ready (its
+    /// PROXY header read, its TLS handshake done). Returns what serves it
+    /// from now on (its `serve` runs at once on this task, its `release`
+    /// when the connection closes), or null to close it.
+    start: *const fn (raw: *const Raw, connection: *Connection, info: *const RawInfo) anyerror!?*Adopter,
+};
+
+/// What `Raw.start` is told about the connection's place.
+pub const RawInfo = struct {
+    listener: *const Listener,
+    io: std.Io,
+    /// The server's drain: set once, never reset.
+    draining: *std.Io.Event,
+    /// Hooks run when the drain starts (`DrainHooks.Hook`).
+    drain_hooks: *DrainHooks,
+    /// The executor this connection's task runs on (0 where there is one).
+    executor: usize,
+    /// The group of every connection task: helpers of the connection that
+    /// must end with the server (a writer task) are spawned into it, on
+    /// the connection's executor.
+    group: *std.Io.Group,
+};
 
 /// A protocol that takes an HTTP/1.1 connection over once a request
 /// upgraded it (`Response.adopt`), such as a WebSocket served through
@@ -1183,6 +1245,9 @@ pub fn Server(comptime Ctx: type) type {
             /// `reloadTls` replaces it, so it is read through `acquireTls`,
             /// under `tls_lock`.
             tls_material: ?*TlsMaterial = null,
+            /// Connections open on this listener, counted only when it has
+            /// its own cap (`Listener.max_connections`).
+            active: std.atomic.Value(u32) = .init(0),
 
             fn freeTls(l: *ActiveListener, allocator: std.mem.Allocator) void {
                 if (build_options.use_tls) if (l.tls_material) |m| {
@@ -1432,7 +1497,8 @@ pub fn Server(comptime Ctx: type) type {
 
             self.addresses = addresses;
             defer self.addresses = &.{};
-            self.address = addresses[0];
+            // None without listeners (`default_listener` false).
+            if (addresses.len > 0) self.address = addresses[0];
             self.ready.set(self.io);
             self.settled.set(self.io);
 
@@ -1551,6 +1617,12 @@ pub fn Server(comptime Ctx: type) type {
             return shelves;
         }
 
+        /// Whether idle connections park without a task on this platform
+        /// (not on Windows, a development target, where they keep theirs).
+        pub fn parksIdle(_: *const Self) bool {
+            return park.supported;
+        }
+
         /// How many connections are parked right now (`timeout.idle_park`).
         pub fn parkedConnections(self: *const Self) usize {
             var n: usize = 0;
@@ -1649,7 +1721,7 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         fn configuredListeners(self: *const Self) []const Listener {
-            return if (self.config.listeners.len == 0) &default_listeners else self.config.listeners;
+            return if (self.config.listeners.len == 0 and self.config.default_listener) &default_listeners else self.config.listeners;
         }
 
         /// Loads the listener's TLS material and binds its socket.
@@ -1657,7 +1729,7 @@ pub fn Server(comptime Ctx: type) type {
             var l: ActiveListener = .{ .config = cfg, .address = cfg.address, .server = undefined };
             errdefer l.freeTls(self.allocator);
 
-            if (!cfg.http1 and (!build_options.use_http2 or (cfg.tls == null and !cfg.http2_prior_knowledge))) {
+            if (cfg.raw == null and !cfg.http1 and (!build_options.use_http2 or (cfg.tls == null and !cfg.http2_prior_knowledge))) {
                 log.err("{f} serves neither HTTP/1.x (http1 is off) nor HTTP/2 (needs use_http2, and http2_prior_knowledge on a cleartext listener)", .{cfg.address});
                 return error.NoProtocols;
             }
@@ -1704,6 +1776,7 @@ pub fn Server(comptime Ctx: type) type {
             };
             errdefer l.server.deinit(self.io);
             if (cfg.address == .ip) l.address = .{ .ip = l.server.socket.address };
+            if (cfg.address == .unix) if (cfg.unix_mode) |mode| setUnixMode(self.io, cfg.address.unix, mode);
 
             if (cfg.socket_per_acceptor and acceptor_count > 1) {
                 const extra = try self.allocator.alloc(std.Io.net.Server, acceptor_count - 1);
@@ -1807,6 +1880,7 @@ pub fn Server(comptime Ctx: type) type {
 
             while (true) {
                 try self.waitForConnectionSlot();
+                try self.waitForListenerSlot(l);
 
                 const stream = socket.accept(self.io) catch |err| switch (err) {
                     // One connection went away between its SYN and our
@@ -1865,11 +1939,17 @@ pub fn Server(comptime Ctx: type) type {
                     stream.close(self.io);
                     return err;
                 };
+                self.reserveListenerSlot(l) catch |err| {
+                    self.releaseConnectionSlot();
+                    stream.close(self.io);
+                    return err;
+                };
                 _ = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
                 // On the executor that accepted it, for its whole life.
                 placement.concurrent(connections, self.io, .local, handleConnectionWrapper, .{ self, l, stream }) catch |err| {
                     log.err("Failed to spawn connection handler: {}", .{err});
                     self.finishRequest();
+                    self.releaseListenerSlot(l);
                     self.releaseConnectionSlot();
                     stream.close(self.io);
                     continue;
@@ -1994,6 +2074,39 @@ pub fn Server(comptime Ctx: type) type {
                     return;
                 };
             }
+        }
+
+        /// Blocks while the listener's own cap (`Listener.max_connections`)
+        /// is reached; what arrives meanwhile waits in the kernel's accept
+        /// queue.
+        fn waitForListenerSlot(self: *Self, l: *ActiveListener) std.Io.Cancelable!void {
+            const max = l.config.max_connections orelse return;
+            while (true) {
+                const active = l.active.load(.acquire);
+                if (active < max) return;
+                try self.io.futexWait(u32, &l.active.raw, active);
+            }
+        }
+
+        /// Takes a slot of the listener's own cap, as `reserveConnectionSlot`
+        /// does the server's.
+        fn reserveListenerSlot(self: *Self, l: *ActiveListener) std.Io.Cancelable!void {
+            const max = l.config.max_connections orelse return;
+            var active = l.active.load(.acquire);
+            while (true) {
+                if (active >= max) {
+                    try self.io.futexWait(u32, &l.active.raw, active);
+                    active = l.active.load(.acquire);
+                    continue;
+                }
+                active = l.active.cmpxchgWeak(active, active + 1, .acq_rel, .acquire) orelse return;
+            }
+        }
+
+        fn releaseListenerSlot(self: *Self, l: *ActiveListener) void {
+            const max = l.config.max_connections orelse return;
+            const was = l.active.fetchSub(1, .acq_rel);
+            if (was >= max) self.io.futexWake(u32, &l.active.raw, std.math.maxInt(u32));
         }
 
         /// Wakes every accept loop waiting for a slot. Waking one is not
@@ -2217,6 +2330,7 @@ pub fn Server(comptime Ctx: type) type {
             defer if (busy) self.finishRequest();
 
             const conn = self.allocator.create(Conn) catch |err| {
+                self.releaseListenerSlot(l);
                 self.releaseConnectionSlot();
                 stream.close(self.io);
                 return err;
@@ -2258,10 +2372,13 @@ pub fn Server(comptime Ctx: type) type {
                     return .close;
                 }
                 defer timer.clear(self.io);
-                self.armDeadline(timer, earlier(
-                    deadlineAfter(conn.accepted_at, self.config.timeout.read_header),
-                    deadlineAfter(conn.accepted_at, self.config.timeout.request),
-                ));
+                if (l.config.raw != null)
+                    self.armDeadline(timer, deadlineAfter(conn.accepted_at, l.config.handshake_timeout))
+                else
+                    self.armDeadline(timer, earlier(
+                        deadlineAfter(conn.accepted_at, self.config.timeout.read_header),
+                        deadlineAfter(conn.accepted_at, self.config.timeout.request),
+                    ));
                 proxied = proxy_protocol.read(self.io, stream) catch |err| switch (err) {
                     error.Canceled => return error.Canceled,
                     else => {
@@ -2290,7 +2407,7 @@ pub fn Server(comptime Ctx: type) type {
                     // slow request, which is bounded.
                     {
                         defer timer.clear(self.io);
-                        self.armTimer(timer, self.config.timeout.request);
+                        self.armTimer(timer, if (l.config.raw != null) l.config.handshake_timeout else self.config.timeout.request);
 
                         connection.initTls(self.allocator, self.io, stream, &m.auth, m.clientAuth(), l.config.tls.?.alpn_protocols) catch |err| {
                             // tls.zig only saw the ciphertext reader or
@@ -2326,6 +2443,8 @@ pub fn Server(comptime Ctx: type) type {
 
                     connection.proxied_peer = proxied.source;
                     connection.proxied_secure = proxied.ssl;
+                    connection.proxied_local = proxied.destination;
+                    if (l.config.raw) |raw| return self.startRaw(conn, raw, timer, busy);
                     connection.write_pool = &self.request_buffers;
                     if (build_options.use_http2) {
                         if (connection.negotiatedProtocol()) |p| if (std.mem.eql(u8, p, "h2")) {
@@ -2349,7 +2468,31 @@ pub fn Server(comptime Ctx: type) type {
             try connection.initPlain(self.allocator, self.io, stream);
             connection.proxied_peer = proxied.source;
             connection.proxied_secure = proxied.ssl;
+            connection.proxied_local = proxied.destination;
+            if (l.config.raw) |raw| return self.startRaw(conn, raw, timer, busy);
             connection.write_pool = &self.request_buffers;
+            return self.serveRequests(conn, timer, busy);
+        }
+
+        /// Hands a ready connection of a raw listener (`Listener.raw`) to
+        /// its protocol, which serves it from then on: in flight for the
+        /// drain until it closes, as an adopted WebSocket is.
+        fn startRaw(self: *Self, conn: *Conn, raw: *const Raw, timer: *Timer, busy: *bool) !Outcome {
+            timer.clear(self.io);
+            const info: RawInfo = .{
+                .listener = conn.listener.config,
+                .io = self.io,
+                .draining = &self.draining,
+                .drain_hooks = &self.drain_hooks,
+                .executor = placement.currentExecutor(self.io) orelse 0,
+                .group = self.connections_group orelse return .close,
+            };
+            const a = (try raw.start(raw, &conn.connection, &info)) orelse return .close;
+            conn.connection.adopter = a;
+            // In flight until it closes, the connection's count rather than
+            // a task's.
+            conn.counted = busy.*;
+            busy.* = false;
             return self.serveRequests(conn, timer, busy);
         }
 
@@ -2441,7 +2584,9 @@ pub fn Server(comptime Ctx: type) type {
             conn.connection.stream.close(self.io);
             if (conn.material) |m| m.release(self.allocator);
             const counted = conn.counted;
+            const listener = conn.listener;
             self.allocator.destroy(conn);
+            self.releaseListenerSlot(listener);
             self.releaseConnectionSlot();
             if (counted) self.finishRequest();
         }
@@ -2518,6 +2663,15 @@ pub fn Server(comptime Ctx: type) type {
         /// other than the HTTP/1.x loop.
         pub fn applyForwarded(self: *const Self, request: *Request, connection: *const Connection) void {
             applyForwardedFn(request, connection.peerAddress(), .of(&self.config));
+        }
+
+        /// `Request.id` from `config.request_id_header`, when the request
+        /// carries it.
+        pub fn applyRequestIdHeader(self: *const Self, request: *Request) void {
+            const name = self.config.request_id_header orelse return;
+            if (request.headers.get(name)) |v| if (v.len > 0) {
+                request.id = v;
+            };
         }
 
         /// `applyForwarded` for an engine with no `Connection` (HTTP/3 over
@@ -2652,6 +2806,7 @@ pub fn Server(comptime Ctx: type) type {
                 .peer_certificate = connection.peerCertificate(),
                 ._timeout_context = timer,
                 ._set_timeout = setRequestTimeout,
+                ._claim_timeout = claimRequestTimeout,
                 // Its entry table is never read past `len`: not zeroed.
                 .session = undefined,
             };
@@ -2848,6 +3003,7 @@ pub fn Server(comptime Ctx: type) type {
                 // request's forwarded address.
                 request.secure = (build_options.use_tls and l.config.tls != null) or connection.proxied_secure;
                 applyForwardedFn(&request, connection.peerAddress(), .of(&self.config));
+                self.applyRequestIdHeader(&request);
 
                 var response = try Response._init(request.arena, connection, self.config.response.max_header_count);
                 self.configureResponse(&response);
@@ -2985,7 +3141,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 if (!response.keepalive) {
                     // Input after a 101 belongs to the upgraded protocol.
-                    if (response.status != .switching_protocols and hasUnreadInput(connection, &parser)) {
+                    if (response.status != .switching_protocols and !response._parked and hasUnreadInput(connection, &parser)) {
                         try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                     }
                     if (connection.adopter != null) {

@@ -58,6 +58,9 @@ fn Table(comptime T: type) type {
         const chunk_len = 256;
         const max_chunks = 4096;
         const Chunk = [chunk_len]T;
+        comptime {
+            std.debug.assert(chunk_len * max_chunks <= engine.max_slots);
+        }
 
         chunks: [max_chunks]std.atomic.Value(?*Chunk) = @splat(.init(null)),
         nchunks: u32 = 0,

@@ -35,6 +35,8 @@ const ngtcp2 = @import("ngtcp2.zig");
 const nghttp3 = @import("nghttp3.zig");
 const quic_tls = @import("quic_tls.zig");
 const net = @import("net.zig");
+const udp_net = @import("../net/udp.zig");
+const Udp = udp_net.Udp;
 const bridge = @import("bridge.zig");
 const webtransport = @import("webtransport.zig");
 pub const SessionCache = @import("session_cache.zig").SessionCache;
@@ -87,8 +89,11 @@ pub const ConnectOptions = struct {
     /// lost, the server never hears from the new address, and the stream
     /// stalls until a timeout. The PING comes from the new address, which
     /// the server then validates and follows. It also keeps a quiet
-    /// stream's NAT mapping, and the idle timeout, from running out. Null
-    /// for none.
+    /// stream's NAT mapping, and the idle timeout, from running out: the
+    /// PING comes at most half the smaller idle timeout (at least 1 s)
+    /// after the last packet. With no stream open nothing is sent, so an
+    /// idle connection still closes at `idle_timeout`. Null for none (a
+    /// call then quiet for the idle timeout ends with the connection).
     keep_alive: ?std.Io.Duration = .fromSeconds(5),
     /// For `connect`: resolving `host` and the QUIC handshake. Null for no
     /// limit. Past it, `connect` fails with `error.Timeout`.
@@ -226,7 +231,7 @@ pub const Rebind = enum {
 pub const ClientConnection = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    udp: net.Udp,
+    udp: Udp,
     /// The socket's address; every path uses it as is, so the connection
     /// never looks migrated.
     local: Addr,
@@ -256,6 +261,10 @@ pub const ClientConnection = struct {
     /// The stream ID of the server's GOAWAY: requests at or above it were
     /// not processed (`Stream.unprocessed`).
     goaway_id: i64 = std.math.maxInt(i64),
+    /// Our QUIC idle timeout, and whether ngtcp2's keep-alive is armed
+    /// (a request stream is live and the handshake is done).
+    idle_ns: u64 = 30 * std.time.ns_per_s,
+    keep_alive_on: bool = false,
     last_error: c.ngtcp2_ccerr = undefined,
     /// The reader and the driver.
     group: std.Io.Group = .init,
@@ -278,10 +287,9 @@ pub const ClientConnection = struct {
     peer_settings: ?PeerSettings = null,
     /// `ConnectOptions.max_header_list_size`.
     max_header_list_size: u32 = 64 * 1024,
-    /// `ConnectOptions.keep_alive` in nanoseconds (0: none), and whether
-    /// ngtcp2's keep-alive timer is on: while a stream is open (`drive`).
+    /// `ConnectOptions.keep_alive` in nanoseconds (0: none; armed by
+    /// `updateKeepAlive`).
     keep_alive: u64 = 0,
-    keep_alive_on: bool = false,
 
     /// What the server's SETTINGS allow (`waitSettings`).
     pub const PeerSettings = struct {
@@ -322,12 +330,13 @@ pub const ClientConnection = struct {
             .blocks = .init(gpa, 16),
             .budget = .init(io, 4 << 20),
             .io = io,
-            .udp = .init(socket),
+            .udp = .init(socket, .{}),
             .local = .from(socket.address),
             .remote = .from(remote_ip),
             .tx = tx,
             .rx = rx,
             .timeout = timeoutFrom(options.timeout),
+            .idle_ns = std.math.lossyCast(u64, options.idle_timeout.toNanoseconds()),
             .max_header_list_size = options.max_header_list_size,
             .keep_alive = if (options.keep_alive) |d| std.math.lossyCast(u64, @max(1, d.toNanoseconds())) else 0,
         };
@@ -536,7 +545,7 @@ pub const ClientConnection = struct {
             self.local = local;
         }
         const old = self.udp.socket;
-        self.udp = .init(next.socket);
+        self.udp = .init(next.socket, .{});
         const udp = self.udp;
         self.unlock();
         // What arrives on the old socket from here on is lost, as it would
@@ -676,8 +685,50 @@ pub const ClientConnection = struct {
         self.mutex.unlock(self.io);
     }
 
+    /// Whether new requests may still go out: the handshake has not
+    /// failed, no GOAWAY, no `close`.
+    pub fn isOpen(self: *ClientConnection) bool {
+        self.lock();
+        defer self.unlock();
+        return !self.closing and self.state != .closed;
+    }
+
     fn kick(self: *ClientConnection) void {
         self.gen.notify(self.io);
+    }
+
+    /// Whether QUIC keep-alive is armed: a request is live. For tests.
+    pub fn keepAliveArmed(self: *ClientConnection) bool {
+        self.lock();
+        defer self.unlock();
+        return self.keep_alive_on;
+    }
+
+    /// Arms ngtcp2's keep-alive while a request stream is live and
+    /// disarms it when the last goes (`ConnectOptions.keep_alive`; never
+    /// with it null). The PING comes after `keep_alive` of silence, or
+    /// sooner, half the smaller idle timeout but at least 1 s, so a quiet
+    /// call outlives the idle timeout and a download whose port a NAT
+    /// rebinding moved is heard from the new address. Locked.
+    fn updateKeepAlive(self: *ClientConnection) void {
+        if (self.state == .closed) {
+            self.keep_alive_on = false;
+            return;
+        }
+        const want = self.keep_alive != 0 and self.live.first != null and self.state == .open;
+        if (want == self.keep_alive_on) return;
+        self.keep_alive_on = want;
+        var interval: u64 = std.math.maxInt(u64);
+        if (want) {
+            var idle = self.idle_ns;
+            if (c.ngtcp2_conn_get_remote_transport_params2(self.q)) |p| {
+                const peer = p.*.max_idle_timeout;
+                if (peer != 0 and peer < idle) idle = peer;
+            }
+            interval = @min(self.keep_alive, @max(idle / 2, std.time.ns_per_s));
+        }
+        c.ngtcp2_conn_set_keep_alive_timeout(self.q, interval);
+        self.kick();
     }
 
     /// How WebTransport's sessions and streams reach the connection.
@@ -809,6 +860,10 @@ pub const ClientConnection = struct {
         /// handshake, null decides by method (GET, HEAD and OPTIONS go).
         /// Only what is harmless to repeat belongs in early data.
         early: ?bool = null,
+        /// HTTP/3 only. How much request body may wait unacknowledged
+        /// before a write waits (the stream's send buffer). Null: 64 KiB.
+        /// The connection's budget still bounds all streams together.
+        send_buffer: ?usize = null,
     };
 
     /// Opens a request stream, waiting while the server's stream limit is
@@ -817,6 +872,7 @@ pub const ClientConnection = struct {
     pub fn request(self: *ClientConnection, headers: []const Header, options: RequestOptions) !*Stream {
         const stream = try Stream.create(self, options.body, .init(self.io, options.timeout orelse self.timeout));
         errdefer stream.destroy();
+        if (options.send_buffer) |n| stream.send_cap = n;
         const nva = try self.gpa.alloc(h.nghttp3_nv, headers.len);
         defer self.gpa.free(nva);
         for (headers, nva) |f, *nv| nv.* = .{
@@ -922,8 +978,8 @@ pub const ClientConnection = struct {
 
     // -- In: the reader task -------------------------------------------------
 
-    fn readerLoop(self: *ClientConnection, udp: net.Udp) std.Io.Cancelable!void {
-        var control: net.Udp.Control align(std.Io.net.cmsg_align) = undefined;
+    fn readerLoop(self: *ClientConnection, udp: Udp) std.Io.Cancelable!void {
+        var control: Udp.Control align(std.Io.net.cmsg_align) = undefined;
         while (true) {
             var dg = udp.receive(self.io, self.rx, &control, .none) catch |err| switch (err) {
                 error.Canceled => |e| return e,
@@ -979,12 +1035,6 @@ pub const ClientConnection = struct {
             if (self.state == .closed) {
                 self.unlock();
                 return;
-            }
-            // Keep-alive while a stream is open (`ConnectOptions.keep_alive`).
-            const keep_alive = self.keep_alive != 0 and self.live.first != null;
-            if (keep_alive != self.keep_alive_on) {
-                self.keep_alive_on = keep_alive;
-                c.ngtcp2_conn_set_keep_alive_timeout(self.q, if (keep_alive) self.keep_alive else 0);
             }
             const t = now(io);
             const deadline = c.ngtcp2_conn_get_expiry2(self.q);
@@ -1118,6 +1168,7 @@ pub const ClientConnection = struct {
         cb.delete_crypto_aead_ctx = c.ngtcp2_crypto_delete_crypto_aead_ctx_cb;
         cb.delete_crypto_cipher_ctx = c.ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
         cb.stream_stop_sending = onStreamStopSending;
+        cb.recv_stop_sending = onRecvStopSending;
         cb.version_negotiation = c.ngtcp2_crypto_version_negotiation_cb;
         cb.recv_rx_key = onRecvRxKey;
         cb.get_new_connection_id2 = onGetNewConnectionId;
@@ -1139,7 +1190,10 @@ pub const ClientConnection = struct {
 
     fn onHandshakeCompleted(_: ?*c.ngtcp2_conn, user_data: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
-        if (self.state == .handshaking) self.state = .open;
+        if (self.state == .handshaking) {
+            self.state = .open;
+            self.updateKeepAlive();
+        }
         // BoringSSL says so as soon as the server's answer arrives (and
         // `onEarlyDataRejected` has run); this is for any other way.
         if (self.early == .pending and c.SSL_early_data_accepted(self.ssl) == 0) {
@@ -1229,20 +1283,29 @@ pub const ClientConnection = struct {
         if (self.wt) |w| if (w.onReset(stream_id, code)) return 0;
         if (self.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
         if (streamOfUser(sud)) |s| {
-            if (s.reset_code == 0) s.reset_code = code;
+            if (s.reset_code == null) s.reset_code = code;
             s.endEarly(error.StreamReset);
         }
         self.kick();
         return 0;
     }
 
-    fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, code: u64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
+    /// We stopped reading the stream (`ngtcp2_conn_shutdown_stream_read`;
+    /// ngtcp2 calls this as the STOP_SENDING goes out): nghttp3 is to read
+    /// no more of it either.
+    fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        const self = connOf(user_data);
+        if (self.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
+        return 0;
+    }
+
+    /// The server sent STOP_SENDING: it wants no more of the request body
+    /// (ngtcp2 has reset our sending side); its response may still come.
+    fn onRecvStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, code: u64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
         const self = connOf(user_data);
         if (self.wt) |w| if (w.onStopSending(stream_id, code)) return 0;
-        if (self.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
-        // The server wants no more of the request body; its response may
-        // still come.
         if (streamOfUser(sud)) |s| s.send_stopped = true;
+        // A writer waiting for room in the stream's queue goes on, and fails.
         self.kick();
         return 0;
     }
@@ -1278,7 +1341,7 @@ pub const ClientConnection = struct {
         const rv = bridge.closeStream(self.side(), flags, stream_id, rx_code, tx_code);
         if (rv != 0) return rv;
         if (streamOfUser(sud)) |s| {
-            if (s.reset_code == 0) s.reset_code = rx_code;
+            if (s.reset_code == null and flags & c.NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET != 0) s.reset_code = rx_code;
             s.endEarly(error.StreamReset);
             s.protocol_done = true;
             s.maybeFree();
@@ -1475,8 +1538,11 @@ pub const Stream = struct {
     /// (the writing task's).
     read_err: ?StreamError = null,
     write_err: ?StreamError = null,
-    /// The application error code the server reset the stream with (0: none).
-    reset_code: u64 = 0,
+    /// The application error code the server reset the stream with.
+    reset_code: ?u64 = null,
+    /// How much request body may wait unacknowledged
+    /// (`RequestOptions.send_buffer`).
+    send_cap: usize = 64 * 1024,
 
     /// Response body bytes not yet read.
     body: std.ArrayList(u8) = .empty,
@@ -1522,6 +1588,7 @@ pub const Stream = struct {
         if (has_body) self.out_writer.buffer = try a.alloc(u8, 16 * 1024);
         conn.lock();
         conn.live.append(&self.node);
+        conn.updateKeepAlive();
         conn.unlock();
         return self;
     }
@@ -1531,6 +1598,7 @@ pub const Stream = struct {
         const conn = self.conn;
         conn.lock();
         conn.live.remove(&self.node);
+        conn.updateKeepAlive();
         conn.unlock();
         self.free();
     }
@@ -1547,6 +1615,7 @@ pub const Stream = struct {
     fn maybeFree(self: *Stream) void {
         if (!(self.user_done and self.protocol_done)) return;
         self.conn.live.remove(&self.node);
+        self.conn.updateKeepAlive();
         self.free();
     }
 
@@ -1572,12 +1641,19 @@ pub const Stream = struct {
         try list.append(a, .{ .name = try a.dupe(u8, name), .value = try a.dupe(u8, value) });
     }
 
+    /// The application error code of the server's RESET_STREAM (or of the
+    /// close that ended the stream), if it reset the stream; null
+    /// otherwise.
+    pub fn resetCode(self: *const Stream) ?u64 {
+        return self.reset_code;
+    }
+
     /// True when the server provably did not process the request: it
     /// rejected the stream (H3_REQUEST_REJECTED) or its GOAWAY's stream ID
     /// is at or below this stream's. Such a request can be sent again on
     /// another connection whatever its method.
     pub fn unprocessed(self: *const Stream) bool {
-        if (self.reset_code == h.NGHTTP3_H3_REQUEST_REJECTED) return true;
+        if (self.reset_code) |code| if (code == h.NGHTTP3_H3_REQUEST_REJECTED) return true;
         return self.id >= self.conn.goaway_id and self.status == 0;
     }
 
@@ -1783,7 +1859,7 @@ pub const Stream = struct {
                 conn.unlock();
                 return error.WriteFailed;
             }
-            const n = self.out.write(&conn.blocks, &conn.budget, rest, 64 * 1024, false) catch {
+            const n = self.out.write(&conn.blocks, &conn.budget, rest, self.send_cap, false) catch {
                 conn.unlock();
                 return error.WriteFailed;
             };

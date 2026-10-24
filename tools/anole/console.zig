@@ -358,6 +358,9 @@ fn installSignalHandlers() void {
     };
     std.posix.sigaction(.TERM, &act, null);
     std.posix.sigaction(.HUP, &act, null);
+    // Raw mode turns Ctrl-C into a key (handled by the TUI); a SIGINT sent
+    // from elsewhere still restores the terminal on its way out.
+    std.posix.sigaction(.INT, &act, null);
 }
 
 test "console args" {

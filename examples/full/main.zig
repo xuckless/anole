@@ -49,6 +49,20 @@ pub const panic = anole.panic;
 // every executor spinning in SafeAllocator, and as a recursive-lock abort in
 // zio's TaskPool. Debug output stays on std's blocking Io.
 
+/// Raw TCP and UDP echo, for tests/restart/run.sh: listeners of the other
+/// kind are handed over by name too.
+const TcpEcho = struct {
+    pub fn data(conn: *anole.net.Conn, bytes: []const u8) !void {
+        _ = try conn.send(bytes);
+    }
+};
+
+const UdpEcho = struct {
+    pub fn datagram(d: *anole.net.Datagram) !void {
+        try d.reply(d.data);
+    }
+};
+
 fn setThreadHeader(res: *anole.Response) !void {
     const tid = std.Thread.getCurrentId();
     try res.header("X-Thread", try std.fmt.allocPrint(res.arena, "{d}", .{tid}));
@@ -100,22 +114,41 @@ pub fn main(init: std.process.Init) !void {
     var h2c_port: ?u16 = null;
     if (args.next()) |p| h1_tls_port = try std.fmt.parseInt(u16, p, 10);
     if (args.next()) |p| h2c_port = try std.fmt.parseInt(u16, p, 10);
+    // Optional fifth and sixth: a raw TCP echo and a UDP echo listener.
+    var raw_tcp_port: ?u16 = null;
+    var raw_udp_port: ?u16 = null;
+    if (args.next()) |p| raw_tcp_port = try std.fmt.parseInt(u16, p, 10);
+    if (args.next()) |p| raw_udp_port = try std.fmt.parseInt(u16, p, 10);
     const tls = anole.features.tls != .none;
 
     // Four ports: a listener each, named (socket activation and SIGUSR2
     // restarts match sockets by name). The certificate is made once.
     const four = tls and anole.features.http2 and h1_tls_port != null and h2c_port != null;
-    const listeners = [_]anole.Listener{
+    const base = [_]anole.Listener{
         .{ .name = "http", .port = port },
         .{ .name = "https", .port = tls_port, .tls = .{ .cert = .dev_self_signed }, .http3 = anole.features.http3 },
         .{ .name = "https-h1", .port = h1_tls_port orelse 0, .tls = .{ .cert = .dev_self_signed }, .http2 = false },
         .{ .name = "h2c", .port = h2c_port orelse 0, .http1 = false },
     };
+    var listener_buf: [6]anole.Listener = undefined;
+    var nlisteners: usize = base.len;
+    @memcpy(listener_buf[0..base.len], &base);
+    if (anole.features.net) {
+        if (raw_tcp_port) |p| {
+            listener_buf[nlisteners] = .{ .name = "echo-tcp", .port = p, .tcp = anole.net.tcp(void, TcpEcho, .{}) };
+            nlisteners += 1;
+        }
+        if (raw_udp_port) |p| {
+            listener_buf[nlisteners] = .{ .name = "echo-udp", .port = p, .udp = anole.net.udp(void, UdpEcho, .{}) };
+            nlisteners += 1;
+        }
+    }
+    const listeners = listener_buf[0..nlisteners];
 
     // The runtime (one executor per CPU, pinned), an HTTP listener with h2c,
     // and an HTTPS one with ALPN h2/http1.1 on a fresh in-memory certificate.
     var app = try anole.Server(void).init(init.gpa, if (four) .{
-        .listeners = &listeners,
+        .listeners = listeners,
         .process = init.minimal,
     } else .{
         .http = .{ .port = port },

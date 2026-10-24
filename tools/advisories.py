@@ -26,6 +26,7 @@ VERSIONED = {
     "zlib-ng": ("zlib-ng/zlib-ng", "2.3.3", r"zlib-ng/archive/refs/tags/2\.3\.3\.tar"),
     "zstd": ("facebook/zstd", "1.5.7", r"zstd/archive/refs/tags/v1\.5\.7\.tar"),
     "brotli": ("google/brotli", "1.2.0", r"brotli/archive/refs/tags/v1\.2\.0\.tar"),
+    "lz4": ("lz4/lz4", "1.10.0", r"lz4/archive/refs/tags/v1\.10\.0\.tar"),
     "yyjson": ("ibireme/yyjson", "0.13.0", r"yyjson/archive/refs/tags/0\.13\.0\.tar"),
     "hiredis": ("redis/hiredis", "1.5.0", r"hiredis/archive/refs/tags/v1\.5\.0\.tar"),
 }

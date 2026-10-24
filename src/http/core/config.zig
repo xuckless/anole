@@ -71,6 +71,11 @@ pub const Listener = struct {
     /// `SOMAXCONN` elsewhere, as Go does. The kernel caps a larger value
     /// to that silently.
     kernel_backlog: ?u31 = null,
+    /// Permission bits for the socket file of a unix listener, set right
+    /// after the bind (a connection needs write permission on the file).
+    /// Null leaves what the umask gave it. Ignored for IP listeners,
+    /// abstract sockets and on Windows.
+    unix_mode: ?u16 = null,
     /// Sets SO_REUSEADDR (and SO_REUSEPORT on POSIX) on an IP listener.
     /// Ignored on Windows, where SO_REUSEADDR would let another socket
     /// bind the same port.
@@ -149,6 +154,17 @@ pub const Listener = struct {
     /// server, such as HTTP/3 on the UDP port of the same number, named
     /// after its own in the line logged when it starts listening.
     extra_protocols: []const []const u8 = &.{},
+    /// The application's own protocol instead of HTTP: once a connection is
+    /// accepted, its PROXY header read and its TLS handshake done, it is
+    /// handed to `raw.start` and never parsed as HTTP. `http1` and
+    /// `http2_prior_knowledge` are ignored. See `server.Raw`.
+    raw: ?*const @import("server.zig").Raw = null,
+    /// Open connections on this listener at most (on top of
+    /// `ServerConfig.max_connections`). Null: none of its own.
+    max_connections: ?u32 = null,
+    /// A raw listener's own limit for the PROXY header and the TLS
+    /// handshake together. Null: the HTTP timeouts (`Timeout.request`).
+    handshake_timeout: ?std.Io.Duration = null,
 
     /// The number of accept loops, with `cpu_count` standing in for the
     /// CPUs the process may use when `acceptors` is null.
@@ -207,6 +223,10 @@ pub const ServerConfig = struct {
     /// the server's life, and requests point back into it through
     /// `Request.listener`.
     listeners: []const Listener = &default_listeners,
+    /// Whether an empty `listeners` falls back to 127.0.0.1:8080. Anole
+    /// names every listener itself and sets it false: an app with only
+    /// UDP listeners serves no TCP at all.
+    default_listener: bool = true,
     /// Number of reverse-proxy hops between the server and the client. Zero
     /// reports the socket peer and ignores `X-Forwarded-For`. A positive
     /// value selects that address from the right of the forwarding chain:
@@ -233,6 +253,10 @@ pub const ServerConfig = struct {
     /// redirects and cache keys are built from. Turn it on only when the
     /// nearest proxy sets the header on every request.
     trust_forwarded_host: bool = false,
+    /// A request header whose value becomes `Request.id` when present and
+    /// non-empty (`lambda-web-request-id` under an AWS Lambda web
+    /// function); the RequestId middleware keeps it. Null: none.
+    request_id_header: ?[]const u8 = null,
     /// The peers whose X-Forwarded-* headers are read (and who may send a
     /// PROXY header on a listener with an empty `proxy_protocol_from`).
     /// Null: no gate; `trusted_proxy_hops` alone decides, as before.

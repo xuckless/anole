@@ -26,6 +26,7 @@ const dynamic_mod = @import("dynamic.zig");
 
 const observe = @import("../observe/root.zig");
 const coll_mod = @import("collection.zig");
+const change_stream = @import("change_stream.zig");
 
 const Connection = conn_mod.Connection;
 pub const Database = coll_mod.Database;
@@ -410,6 +411,12 @@ pub const Client = struct {
     }
 
     /// A database: `client.db("app").collection("users")`.
+    /// A change stream over the whole deployment (`allChangesForCluster`);
+    /// see `Collection.watch`.
+    pub fn watch(self: *Client, comptime T: type, c: anytype, pipeline: anytype, opts: change_stream.ChangeStreamOptions) Error!change_stream.ChangeStream(T) {
+        return .{ .raw = try change_stream.open(self, c, .cluster, pipeline, opts) };
+    }
+
     pub fn db(self: *Client, name: []const u8) Database {
         return .{ .client = self, .name = name };
     }
@@ -778,6 +785,35 @@ pub const Client = struct {
                 };
             };
         }
+    }
+
+    /// Closes the idle pooled connections of every server and executor;
+    /// calls open new ones as they need them, and the monitors reconnect
+    /// on their own. The Lambda adapter calls it after a long freeze, when
+    /// a NAT gateway may have dropped them without telling either end.
+    pub fn closeIdle(self: *Client) void {
+        const io = self.io;
+        self.mutex.lockUncancelable(io);
+        const servers = self.gpa.dupe(*Server, self.servers.items) catch {
+            self.mutex.unlock(io);
+            return;
+        };
+        self.mutex.unlock(io);
+        defer self.gpa.free(servers);
+        for (servers) |s| for (s.pools.pools) |*p| {
+            while (true) {
+                p.mutex.lockUncancelable(io);
+                const c = p.idle.pop() orelse {
+                    p.mutex.unlock(io);
+                    break;
+                };
+                p.total -= 1;
+                p.cond.signal(io);
+                p.mutex.unlock(io);
+                self.observer.connections(-1, 0);
+                c.close();
+            }
+        };
     }
 
     fn stale(self: *Client, s: *Server, c: *Connection, io: std.Io) bool {

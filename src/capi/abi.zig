@@ -4,7 +4,7 @@
 const std = @import("std");
 
 pub const version_major: u32 = 0;
-pub const version_minor: u32 = 9;
+pub const version_minor: u32 = 10;
 pub const version: u32 = (version_major << 16) | version_minor;
 
 pub const Status = i32;
@@ -22,6 +22,9 @@ pub const E_SYSTEM: Status = -9;
 pub const E_TIMEOUT: Status = -10;
 pub const E_DB: Status = -11;
 pub const E_BROKER: Status = -12;
+/// An object store or mail server refused a call or could not be reached
+/// (the record's error_class, http_status and error_code say why).
+pub const E_SERVICE: Status = -13;
 
 pub const Str = extern struct {
     ptr: ?[*]const u8 = null,
@@ -75,6 +78,15 @@ pub const Stats = extern struct {
     ws_messages_out: u64 = 0,
     wt_sessions: u64 = 0,
     wt_datagrams_dropped: u64 = 0,
+    // ---- p3/net ----
+    /// Raw TCP connections open now, and the bytes they moved (summed as each closes).
+    net_connections: u64 = 0,
+    net_bytes_in: u64 = 0,
+    net_bytes_out: u64 = 0,
+    udp_datagrams_in: u64 = 0,
+    udp_datagrams_out: u64 = 0,
+    udp_datagrams_dropped: u64 = 0,
+    // ---- end p3/net ----
 };
 
 pub const CONSUMER_F_SHARED: u32 = 1;
@@ -128,6 +140,50 @@ pub const EventType = enum(u32) {
     kafka_revoke = 83,
     kafka_writable = 84,
     kafka_group_end = 85,
+
+    // ---- p3/net ----
+    net_open = 96,
+    net_data = 97,
+    net_end = 98,
+    net_close = 99,
+    net_datagrams = 100,
+    // ---- end p3/net ----
+
+    // ---- p3/jobs ----
+    job_enqueued = 104,
+    job = 105,
+    job_cancel = 106,
+    job_worker_end = 107,
+    jobs_result = 108,
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    webhook_published = 109,
+    webhook_status = 110,
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    /// A consumer SSE route's request: accept (`anole_sse_accept`) or answer it.
+    sse_subscribe = 112,
+    /// A subscriber the consumer accepted has ended.
+    sse_close = 113,
+    watch_event = 116,
+    watch_status = 117,
+    watch_end = 118,
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    s3_result = 124,
+    s3_data = 125,
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    /// p3/smtp: the answer to anole_smtp_send.
+    smtp_result = 126,
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    // ---- end p3/lambda ----
 };
 
 pub const Event = extern struct {
@@ -207,6 +263,8 @@ pub const LISTENER_F_HTTP2: u32 = 4;
 pub const LISTENER_F_HTTP3: u32 = 8;
 pub const LISTENER_F_UNIX: u32 = 16;
 pub const LISTENER_F_PROXY_PROTOCOL: u32 = 32;
+pub const LISTENER_F_TCP: u32 = 64;
+pub const LISTENER_F_UDP: u32 = 128;
 pub const LISTENER_PENDING: u32 = 0;
 pub const LISTENER_LISTENING: u32 = 1;
 pub const LISTENER_FAILED: u32 = 2;
@@ -406,6 +464,9 @@ pub const DbErrorClass = enum(u8) {
     unavailable = 8,
     timeout = 9,
     other = 10,
+    not_found = 11,
+    precondition = 12,
+    invalid = 13,
 };
 
 pub const DbResultEvent = extern struct {
@@ -690,6 +751,737 @@ pub const KafkaAssignEvent = extern struct {
     nentries: u32,
 };
 
+// ---- p3/net ----
+/// An IP address and port, binary. family 4: addr[0..4]; 6: addr[0..16]; 0: none.
+pub const NetAddr = extern struct {
+    family: u16 = 0,
+    port: u16 = 0,
+    scope_id: u32 = 0,
+    addr: [16]u8 = @splat(0),
+};
+
+pub const NET_OPEN_F_TLS: u32 = 1;
+pub const NET_OPEN_F_PEER_CERT: u32 = 2;
+pub const NET_OPEN_F_PROXIED: u32 = 4;
+pub const NET_OPEN_F_SECURE: u32 = 8;
+pub const NET_OPEN_F_UNIX: u32 = 16;
+pub const NET_FRAMING_NONE: u32 = 0;
+pub const NET_FRAMING_LINES: u32 = 1;
+pub const NET_FRAMING_LENGTH: u32 = 2;
+pub const NET_FRAMING_VARINT: u32 = 3;
+
+/// ANOLE_EV_NET_OPEN: a connection on a "tcp" listener, ready. The spans
+/// point into the record, after the struct.
+pub const NetOpenEvent = extern struct {
+    ev: Event,
+    handler_id: u32,
+    flags: u32,
+    remote: NetAddr,
+    local: NetAddr,
+    listener: Span,
+    remote_text: Span,
+    alpn: Span,
+    server_name: Span,
+    peer_cert: Span,
+    framing: u32,
+    reserved: u32 = 0,
+};
+
+pub const NET_DATA_F_FRAMES: u32 = 1;
+
+/// ANOLE_EV_NET_DATA: what one read burst brought; at `frames_off`,
+/// `anole_span frames[nframes]` and the bytes they point into.
+pub const NetDataEvent = extern struct {
+    ev: Event,
+    flags: u32,
+    nframes: u32,
+    frames_off: u32,
+    reserved: u32 = 0,
+};
+
+pub const NET_CLOSED_PEER: u32 = 0;
+pub const NET_CLOSED_LOCAL: u32 = 1;
+pub const NET_CLOSED_RESET: u32 = 2;
+pub const NET_CLOSED_FAILED: u32 = 3;
+pub const NET_CLOSED_IDLE: u32 = 4;
+pub const NET_CLOSED_WRITE_TIMEOUT: u32 = 5;
+pub const NET_CLOSED_LIFETIME: u32 = 6;
+pub const NET_CLOSED_FRAME: u32 = 7;
+pub const NET_CLOSED_DRAIN: u32 = 8;
+pub const NET_CLOSED_SERVER: u32 = 9;
+
+/// ANOLE_EV_NET_CLOSE: the connection is over; its handle is stale.
+pub const NetCloseEvent = extern struct {
+    ev: Event,
+    reason: u32,
+    error_errno: i32,
+    bytes_in: u64,
+    bytes_out: u64,
+    duration_ms: u64,
+    @"error": Span,
+};
+
+/// One datagram of an ANOLE_EV_NET_DATAGRAMS.
+pub const NetDatagramIn = extern struct {
+    remote: NetAddr,
+    local: NetAddr,
+    data: Span,
+    reserved: u64 = 0,
+};
+
+/// ANOLE_EV_NET_DATAGRAMS: one receive batch of a "udp" listener's socket,
+/// followed at `datagrams_off` by `anole_net_datagram_in datagrams[]`.
+pub const NetDatagramsEvent = extern struct {
+    ev: Event,
+    handler_id: u32,
+    ndatagrams: u32,
+    datagrams_off: u32,
+    dropped: u32,
+};
+
+/// `anole_net_write` flags (bit 0 is ANOLE_BODY_BORROW).
+pub const NET_F_END: u32 = 2;
+pub const NET_F_FRAME: u32 = 4;
+pub const NET_CLOSE_GRACEFUL: u32 = 0;
+pub const NET_CLOSE_RESET: u32 = 1;
+
+/// One datagram to send (`anole_net_udp_send`).
+pub const NetDatagram = extern struct {
+    to: NetAddr,
+    from: NetAddr,
+    data: ?*const anyopaque,
+    len: usize,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(NetAddr) == 24);
+    std.debug.assert(@sizeOf(NetOpenEvent) == 120);
+    std.debug.assert(@offsetOf(NetOpenEvent, "remote") == 24);
+    std.debug.assert(@offsetOf(NetOpenEvent, "local") == 48);
+    std.debug.assert(@offsetOf(NetOpenEvent, "listener") == 72);
+    std.debug.assert(@offsetOf(NetOpenEvent, "peer_cert") == 104);
+    std.debug.assert(@offsetOf(NetOpenEvent, "framing") == 112);
+    std.debug.assert(@sizeOf(NetDataEvent) == 32);
+    std.debug.assert(@sizeOf(NetCloseEvent) == 56);
+    std.debug.assert(@offsetOf(NetCloseEvent, "bytes_in") == 24);
+    std.debug.assert(@offsetOf(NetCloseEvent, "error") == 48);
+    std.debug.assert(@sizeOf(NetDatagramIn) == 64);
+    std.debug.assert(@sizeOf(NetDatagramsEvent) == 32);
+    std.debug.assert(@sizeOf(NetDatagram) == 64);
+}
+// ---- end p3/net ----
+
+// ---- p3/jobs ----
+/// Priorities of `JobOut.priority` (0: the kind's).
+pub const JOB_PRIORITY_DEFAULT: u8 = 0;
+pub const JOB_PRIORITY_CRITICAL: u8 = 1;
+pub const JOB_PRIORITY_HIGH: u8 = 2;
+pub const JOB_PRIORITY_NORMAL: u8 = 3;
+pub const JOB_PRIORITY_LOW: u8 = 4;
+/// `JobOut.unique_scope` (0: unfinished).
+pub const JOB_UNIQUE_DEFAULT: u8 = 0;
+pub const JOB_UNIQUE_PENDING: u8 = 1;
+pub const JOB_UNIQUE_UNFINISHED: u8 = 2;
+pub const JOB_UNIQUE_ANY: u8 = 3;
+/// `JobOut.flags`: unique by `unique_key`, or by the args when it is empty
+/// (bit 0 stays ANOLE_BODY_BORROW, refused).
+pub const JOB_F_UNIQUE: u32 = 2;
+/// `anole_job_finish` outcomes.
+pub const JOB_DONE: u32 = 0;
+pub const JOB_RETRY: u32 = 1;
+pub const JOB_SNOOZE: u32 = 2;
+pub const JOB_DISCARD: u32 = 3;
+/// `JobCancelEvent.reason`.
+pub const JOB_CANCEL_TIMEOUT: u32 = 1;
+pub const JOB_CANCEL_ADMIN: u32 = 2;
+pub const JOB_CANCEL_LEASE_LOST: u32 = 3;
+pub const JOB_CANCEL_DRAIN: u32 = 4;
+/// `JobWorkerEndEvent.reason`.
+pub const JOB_WORKER_STOPPED: u32 = 0;
+pub const JOB_WORKER_DRAINED: u32 = 1;
+pub const JOB_WORKER_FAILED: u32 = 2;
+
+/// One job to enqueue (`anole_job_out`).
+pub const JobOut = extern struct {
+    size: usize,
+    kind: Str = .{},
+    args_json: Str = .{},
+    queue: Str = .{},
+    unique_key: Str = .{},
+    meta_json: Str = .{},
+    run_at_ms: i64 = 0,
+    delay_ms: u32 = 0,
+    flags: u32 = 0,
+    unique_period_ms: u32 = 0,
+    attempts: u16 = 0,
+    priority: u8 = 0,
+    unique_scope: u8 = 0,
+    timeout_ms: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const JobsEnqueueOptions = extern struct {
+    size: usize,
+    timeout_ms: u32 = 0,
+    reserved: u32 = 0,
+    tx: u64 = 0,
+    req: u64 = 0,
+};
+
+pub const JobsWorkOptions = extern struct {
+    size: usize,
+    queue: Str = .{},
+    kinds: ?[*]const Str = null,
+    nkinds: usize = 0,
+    concurrency: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const JobEnqueuedEntry = extern struct {
+    id: i64,
+    inserted: u32,
+    reserved: u32,
+};
+
+/// ANOLE_EV_JOB_ENQUEUED.
+pub const JobEnqueuedEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    reserved: u8,
+    entries_off: u32,
+    nentries: u32,
+    @"error": Span,
+    error_code: Span,
+};
+
+/// ANOLE_EV_JOB.
+pub const JobEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    worker: u64,
+    id: i64,
+    kind: Span,
+    queue: Span,
+    args: Span,
+    meta: Span,
+    errors: Span,
+    run_at_ms: i64,
+    created_at_ms: i64,
+    timeout_us: i64,
+    attempt: u16,
+    max_attempts: u16,
+    priority: u8,
+    reserved8: u8,
+    reserved16: u16,
+    cron: Span,
+    traceparent: Span,
+};
+
+/// ANOLE_EV_JOB_CANCEL.
+pub const JobCancelEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    id: i64,
+    reason: u32,
+    reserved: u32,
+};
+
+/// ANOLE_EV_JOB_WORKER_END.
+pub const JobWorkerEndEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    reason: u32,
+    reserved: u32,
+    @"error": Span,
+};
+
+/// ANOLE_EV_JOBS_RESULT.
+pub const JobsResultEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    reserved: u8,
+    json: Span,
+    @"error": Span,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(JobOut) == 120);
+    std.debug.assert(@sizeOf(JobsEnqueueOptions) == 32);
+    std.debug.assert(@sizeOf(JobsWorkOptions) == 48);
+    std.debug.assert(@sizeOf(JobEnqueuedEntry) == 16);
+    std.debug.assert(@sizeOf(JobEnqueuedEvent) == 56);
+    std.debug.assert(@sizeOf(JobEvent) == 128);
+    std.debug.assert(@sizeOf(JobCancelEvent) == 40);
+    std.debug.assert(@sizeOf(JobWorkerEndEvent) == 40);
+    std.debug.assert(@sizeOf(JobsResultEvent) == 48);
+}
+// ---- end p3/jobs ----
+
+// ---- p3/webhooks ----
+
+/// `anole_webhooks_publish`: one event, copied.
+pub const WebhookOut = extern struct {
+    size: usize,
+    /// Empty: "".
+    owner: Str = .{},
+    /// Required.
+    type: Str = .{},
+    /// A JSON value.
+    data_json: Str = .{},
+    /// Idempotency; empty: a new msg_ id.
+    id: Str = .{},
+    /// Only this endpoint; empty: every matching one of the owner.
+    endpoint: Str = .{},
+    /// 0: now.
+    timestamp_ms: i64 = 0,
+    /// An `anole_db_tx` to publish in, or 0.
+    tx: u64 = 0,
+    /// The request this serves, or 0.
+    req: u64 = 0,
+};
+
+/// ANOLE_EV_WEBHOOK_PUBLISHED: the answer to anole_webhooks_publish.
+pub const WebhookPublishedEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    duplicate: u8,
+    deliveries: u32,
+    reserved: u32 = 0,
+    message_id: Span,
+    @"error": Span,
+};
+
+/// ANOLE_WEBHOOK_*: WebhookStatusEvent.what.
+pub const WEBHOOK_DELIVERY_DEAD: u32 = 1;
+pub const WEBHOOK_ENDPOINT_DISABLED: u32 = 2;
+
+/// ANOLE_EV_WEBHOOK_STATUS: a delivery ran out of attempts, or an endpoint
+/// was disabled.
+pub const WebhookStatusEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    what: u32,
+    last_status: u16,
+    reserved: u16 = 0,
+    owner: Span,
+    endpoint: Span,
+    message: Span,
+    @"error": Span,
+};
+// ---- end p3/webhooks ----
+
+// ---- p3/realtime ----
+/// `anole_sse_publish`'s flag: not kept for `Last-Event-ID` resume.
+pub const SSE_F_NO_REPLAY: u32 = 1;
+/// `anole_sse_gap`'s flag: every topic starting with the name.
+pub const SSE_F_PREFIX: u32 = 1;
+
+/// `anole_sse_accept`'s options.
+pub const SseAcceptOptions = extern struct {
+    size: usize,
+    topics: ?[*]const Str = null,
+    ntopics: usize = 0,
+    headers: ?[*]const Header = null,
+    nheaders: usize = 0,
+    last: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const SSE_CLOSED_CLIENT_GONE: u32 = 0;
+pub const SSE_CLOSED_SLOW: u32 = 1;
+pub const SSE_CLOSED_DRAIN: u32 = 2;
+pub const SSE_CLOSED_CLOSED: u32 = 3;
+pub const SSE_CLOSED_SERVER: u32 = 4;
+
+pub const SseCloseEvent = extern struct {
+    ev: Event,
+    route_id: u32,
+    reason: u32,
+};
+
+pub const WATCH_NATIVE: u32 = 0;
+pub const WATCH_JSON: u32 = 1;
+
+pub const WatchListenOptions = extern struct {
+    size: usize,
+    max_events: u32 = 0,
+    max_bytes: u32 = 0,
+    format: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const WATCH_SRC_POSTGRES: u32 = 1;
+pub const WATCH_SRC_REDIS: u32 = 2;
+pub const WATCH_SRC_REDIS_STREAM: u32 = 3;
+pub const WATCH_SRC_MONGODB: u32 = 4;
+
+pub const WATCH_OP_MESSAGE: u32 = 0;
+pub const WATCH_OP_ENTRY: u32 = 1;
+pub const WATCH_OP_INSERT: u32 = 2;
+pub const WATCH_OP_UPDATE: u32 = 3;
+pub const WATCH_OP_REPLACE: u32 = 4;
+pub const WATCH_OP_DELETE: u32 = 5;
+pub const WATCH_OP_DROP: u32 = 6;
+pub const WATCH_OP_RENAME: u32 = 7;
+pub const WATCH_OP_DROP_DATABASE: u32 = 8;
+pub const WATCH_OP_INVALIDATE: u32 = 9;
+pub const WATCH_OP_OTHER: u32 = 10;
+
+pub const WATCH_FMT_TEXT: u32 = 0;
+pub const WATCH_FMT_JSON: u32 = 1;
+pub const WATCH_FMT_BSON: u32 = 2;
+pub const WATCH_FMT_FIELDS: u32 = 3;
+
+/// ANOLE_EV_WATCH_EVENT. FIELDS: `Span fields[2 * nfields]` (name, value)
+/// at `fields_off`; the bytes the spans point into follow.
+pub const WatchEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    watch: u32,
+    source: u16,
+    op: u16,
+    format: u32,
+    pg_pid: i32,
+    channel: Span,
+    pattern: Span,
+    op_name: Span,
+    position: Span,
+    data: Span,
+    nfields: u32,
+    fields_off: u32,
+};
+
+pub const WATCH_CONNECTED: u32 = 1;
+pub const WATCH_DISCONNECTED: u32 = 2;
+pub const WATCH_GAP: u32 = 3;
+pub const WATCH_INVALIDATED: u32 = 4;
+
+pub const WatchStatusEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    watch: u32,
+    status: u32,
+    dropped: u64,
+    detail: Span,
+};
+
+pub const WATCH_END_UNLISTENED: u32 = 1;
+pub const WATCH_END_DRAINED: u32 = 2;
+pub const WATCH_END_FAILED: u32 = 3;
+
+pub const WatchEndEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    watch: u32,
+    reason: u32,
+    detail: Span,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(SseAcceptOptions) == 48);
+    std.debug.assert(@sizeOf(SseCloseEvent) == 24);
+    std.debug.assert(@sizeOf(WatchListenOptions) == 24);
+    std.debug.assert(@sizeOf(WatchEvent) == 88);
+    std.debug.assert(@sizeOf(WatchStatusEvent) == 48);
+    std.debug.assert(@sizeOf(WatchEndEvent) == 40);
+    std.debug.assert(@offsetOf(WatchEvent, "channel") == 40);
+    std.debug.assert(@offsetOf(WatchEvent, "nfields") == 80);
+}
+// ---- end p3/realtime ----
+
+// ---- p3/s3 ----
+/// `anole_s3_*` call flags.
+pub const S3_F_STREAM: u32 = 1;
+pub const S3_F_RANGE: u32 = 2;
+pub const S3_F_NO_RETRY: u32 = 4;
+pub const S3_F_IF_ABSENT: u32 = 8;
+pub const S3_F_REPLACE_METADATA: u32 = 16;
+pub const S3_F_LENGTH: u32 = 32;
+pub const S3_F_PASS_NOT_FOUND: u32 = 64;
+pub const S3_F_REPORT: u32 = 128;
+
+pub const S3_OP_GET: u8 = 1;
+pub const S3_OP_HEAD: u8 = 2;
+pub const S3_OP_PUT: u8 = 3;
+pub const S3_OP_PUT_BODY: u8 = 4;
+pub const S3_OP_DELETE: u8 = 5;
+pub const S3_OP_DELETE_MANY: u8 = 6;
+pub const S3_OP_LIST: u8 = 7;
+pub const S3_OP_COPY: u8 = 8;
+pub const S3_OP_UPLOAD_OPEN: u8 = 9;
+pub const S3_OP_UPLOAD_FINISH: u8 = 10;
+pub const S3_OP_SERVE: u8 = 11;
+pub const S3_OP_MULTIPART_CREATE: u8 = 12;
+pub const S3_OP_MULTIPART_COMPLETE: u8 = 13;
+pub const S3_OP_MULTIPART_ABORT: u8 = 14;
+
+pub const S3_RES_F_TRUNCATED: u16 = 1;
+pub const S3_RES_F_DELETE_MARKER: u16 = 2;
+pub const S3_DATA_F_FIN: u32 = 1;
+
+pub const S3_PRESIGN_GET: u32 = 0;
+pub const S3_PRESIGN_PUT: u32 = 1;
+pub const S3_PRESIGN_HEAD: u32 = 2;
+pub const S3_PRESIGN_DELETE: u32 = 3;
+pub const S3_PRESIGN_UPLOAD_PART: u32 = 4;
+pub const S3_PRESIGN_F_CONTENT_LENGTH: u32 = 1;
+
+pub const S3Options = extern struct {
+    size: usize = @sizeOf(S3Options),
+    flags: u32 = 0,
+    timeout_ms: u32 = 0,
+    req: u64 = 0,
+    bucket: Str = .{},
+    version_id: Str = .{},
+};
+
+pub const S3GetOptions = extern struct {
+    size: usize = @sizeOf(S3GetOptions),
+    flags: u32 = 0,
+    timeout_ms: u32 = 0,
+    req: u64 = 0,
+    bucket: Str = .{},
+    version_id: Str = .{},
+    range_start: u64 = 0,
+    range_end: u64 = std.math.maxInt(u64),
+    if_none_match: Str = .{},
+    if_match: Str = .{},
+    if_modified_since_ms: i64 = 0,
+    max_bytes: u32 = 0,
+    window: u32 = 0,
+    response_content_type: Str = .{},
+    response_cache_control: Str = .{},
+    response_content_disposition: Str = .{},
+};
+
+pub const S3PutOptions = extern struct {
+    size: usize = @sizeOf(S3PutOptions),
+    flags: u32 = 0,
+    timeout_ms: u32 = 0,
+    req: u64 = 0,
+    bucket: Str = .{},
+    content_type: Str = .{},
+    cache_control: Str = .{},
+    content_disposition: Str = .{},
+    content_encoding: Str = .{},
+    metadata: ?[*]const Header = null,
+    nmetadata: usize = 0,
+    storage_class: Str = .{},
+    if_match: Str = .{},
+    content_length: u64 = 0,
+};
+
+pub const S3ListOptions = extern struct {
+    size: usize = @sizeOf(S3ListOptions),
+    flags: u32 = 0,
+    timeout_ms: u32 = 0,
+    req: u64 = 0,
+    bucket: Str = .{},
+    prefix: Str = .{},
+    delimiter: Str = .{},
+    start_after: Str = .{},
+    continuation: Str = .{},
+    max_keys: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const S3PresignOptions = extern struct {
+    size: usize = @sizeOf(S3PresignOptions),
+    flags: u32 = 0,
+    expires_s: u32 = 0,
+    bucket: Str = .{},
+    version_id: Str = .{},
+    content_type: Str = .{},
+    content_length: u64 = 0,
+    response_content_type: Str = .{},
+    response_content_disposition: Str = .{},
+    upload_id: Str = .{},
+    part_number: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const S3Part = extern struct {
+    number: u32,
+    reserved: u32 = 0,
+    etag: Str,
+};
+
+pub const S3ResultEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    op: u8,
+    s3_status: u16,
+    flags: u16,
+    nentries: u32,
+    content_length: u64,
+    object_size: u64,
+    range_start: u64,
+    last_modified_ms: i64,
+    etag: Span,
+    version_id: Span,
+    content_type: Span,
+    cache_control: Span,
+    content_disposition: Span,
+    content_encoding: Span,
+    metadata_off: u32,
+    nmetadata: u32,
+    body: Span,
+    entries_off: u32,
+    prefixes_off: u32,
+    nprefixes: u32,
+    parts: u32,
+    next: Span,
+    upload_id: Span,
+    @"error": Span,
+    error_code: Span,
+    request_id: Span,
+};
+
+pub const S3Entry = extern struct {
+    key: Span,
+    etag: Span,
+    storage_class: Span,
+    size: u64,
+    last_modified_ms: i64,
+};
+
+pub const S3Failure = extern struct {
+    key: Span,
+    code: Span,
+    message: Span,
+};
+
+pub const S3DataEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    flags: u32,
+    offset: u64,
+    data: Span,
+    @"error": Span,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(S3Options) == 56);
+    std.debug.assert(@sizeOf(S3GetOptions) == 168);
+    std.debug.assert(@sizeOf(S3PutOptions) == 160);
+    std.debug.assert(@sizeOf(S3ListOptions) == 112);
+    std.debug.assert(@sizeOf(S3PresignOptions) == 128);
+    std.debug.assert(@sizeOf(S3Part) == 24);
+    std.debug.assert(@sizeOf(S3ResultEvent) == 192);
+    std.debug.assert(@sizeOf(S3Entry) == 40);
+    std.debug.assert(@sizeOf(S3Failure) == 24);
+    std.debug.assert(@sizeOf(S3DataEvent) == 56);
+}
+// ---- end p3/s3 ----
+
+// ---- p3/smtp ----
+
+// ---- Mail (SMTP) -----------------------------------------------------------
+
+/// `anole_smtp_options.flags`: retry transient failures before the final
+/// "." (a failure after it is never retried).
+pub const SMTP_F_RETRY: u32 = 1;
+/// `anole_smtp_attachment.flags`: an inline part (with `content_id`).
+pub const SMTP_ATTACH_F_INLINE: u32 = 1;
+
+/// One attachment of an `anole_smtp_message`: `data` (copied) or `path` (a
+/// file read while sending).
+pub const SmtpAttachment = extern struct {
+    size: usize,
+    filename: Str = .{},
+    content_type: Str = .{},
+    data: ?[*]const u8 = null,
+    len: usize = 0,
+    path: Str = .{},
+    content_id: Str = .{},
+    flags: u32 = 0,
+    reserved: u32 = 0,
+};
+
+/// A message for Anole to compose (`anole_smtp_send`).
+pub const SmtpMessage = extern struct {
+    size: usize,
+    from: Str = .{},
+    reply_to: Str = .{},
+    to: ?[*]const Str = null,
+    nto: usize = 0,
+    cc: ?[*]const Str = null,
+    ncc: usize = 0,
+    bcc: ?[*]const Str = null,
+    nbcc: usize = 0,
+    subject: Str = .{},
+    text: Str = .{},
+    html: Str = .{},
+    headers: ?[*]const Header = null,
+    nheaders: usize = 0,
+    attachments: ?[*]const SmtpAttachment = null,
+    nattachments: usize = 0,
+    envelope_from: Str = .{},
+    message_id: Str = .{},
+};
+
+pub const SmtpOptions = extern struct {
+    size: usize,
+    flags: u32 = 0,
+    /// 0: the mail entry's timeout_ms; DB_TIMEOUT_NONE: none.
+    timeout_ms: u32 = 0,
+    /// The request this send serves (0: none): the send is cut with it.
+    req: u64 = 0,
+};
+
+/// ANOLE_EV_SMTP_RESULT: the answer to anole_smtp_send or
+/// anole_smtp_send_raw. `rejected_off` counts from the start of the record.
+pub const SmtpResultEvent = extern struct {
+    ev: Event,
+    user_data: u64,
+    status: i32,
+    http_status: u16,
+    error_class: u8,
+    reserved8: u8,
+    smtp_code: u16,
+    reserved16: u16,
+    nrejected: u32,
+    message_id: Span,
+    response: Span,
+    rejected_off: u32,
+    reserved: u32,
+    @"error": Span,
+    error_code: Span,
+};
+
+pub const SmtpRejected = extern struct {
+    address: Span,
+    code: u16,
+    reserved: u16,
+    reserved2: u32,
+    message: Span,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(SmtpAttachment) == 96);
+    std.debug.assert(@sizeOf(SmtpMessage) == 200);
+    std.debug.assert(@sizeOf(SmtpOptions) == 24);
+    std.debug.assert(@sizeOf(SmtpResultEvent) == 80);
+    std.debug.assert(@sizeOf(SmtpRejected) == 24);
+}
+// ---- end p3/smtp ----
+
+// ---- p3/lambda ----
+// ---- end p3/lambda ----
+
 pub const POLL_F_NOARM: u32 = 1;
 pub const BODY_BORROW: u32 = 1;
 
@@ -872,6 +1664,67 @@ pub const records = .{
     .{ "anole_kafka_delivery_event", KafkaDeliveryEvent },
     .{ "anole_kafka_partition", KafkaPartition },
     .{ "anole_kafka_assign_event", KafkaAssignEvent },
+
+    // ---- p3/net ----
+    .{ "anole_net_addr", NetAddr },
+    .{ "anole_net_open_event", NetOpenEvent },
+    .{ "anole_net_data_event", NetDataEvent },
+    .{ "anole_net_close_event", NetCloseEvent },
+    .{ "anole_net_datagram_in", NetDatagramIn },
+    .{ "anole_net_datagrams_event", NetDatagramsEvent },
+    .{ "anole_net_datagram", NetDatagram },
+    // ---- end p3/net ----
+
+    // ---- p3/jobs ----
+    .{ "anole_job_out", JobOut },
+    .{ "anole_jobs_enqueue_options", JobsEnqueueOptions },
+    .{ "anole_jobs_work_options", JobsWorkOptions },
+    .{ "anole_job_enqueued_entry", JobEnqueuedEntry },
+    .{ "anole_job_enqueued_event", JobEnqueuedEvent },
+    .{ "anole_job_event", JobEvent },
+    .{ "anole_job_cancel_event", JobCancelEvent },
+    .{ "anole_job_worker_end_event", JobWorkerEndEvent },
+    .{ "anole_jobs_result_event", JobsResultEvent },
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    .{ "anole_webhook_out", WebhookOut },
+    .{ "anole_webhook_published_event", WebhookPublishedEvent },
+    .{ "anole_webhook_status_event", WebhookStatusEvent },
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    .{ "anole_sse_accept_options", SseAcceptOptions },
+    .{ "anole_sse_close_event", SseCloseEvent },
+    .{ "anole_watch_listen_options", WatchListenOptions },
+    .{ "anole_watch_event", WatchEvent },
+    .{ "anole_watch_status_event", WatchStatusEvent },
+    .{ "anole_watch_end_event", WatchEndEvent },
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    .{ "anole_s3_options", S3Options },
+    .{ "anole_s3_get_options", S3GetOptions },
+    .{ "anole_s3_put_options", S3PutOptions },
+    .{ "anole_s3_list_options", S3ListOptions },
+    .{ "anole_s3_presign_options", S3PresignOptions },
+    .{ "anole_s3_part", S3Part },
+    .{ "anole_s3_result_event", S3ResultEvent },
+    .{ "anole_s3_entry", S3Entry },
+    .{ "anole_s3_failure", S3Failure },
+    .{ "anole_s3_data_event", S3DataEvent },
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    .{ "anole_smtp_attachment", SmtpAttachment },
+    .{ "anole_smtp_message", SmtpMessage },
+    .{ "anole_smtp_options", SmtpOptions },
+    .{ "anole_smtp_result_event", SmtpResultEvent },
+    .{ "anole_smtp_rejected", SmtpRejected },
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    // ---- end p3/lambda ----
 };
 
 /// A variable part of a record, reached through an offset or a span in it.
@@ -897,14 +1750,41 @@ pub const arrays = [_]ArrayInfo{
     .{ .record = "anole_nats_reply_event", .name = "headers", .at = "headers_off", .item = "anole_span", .count = "2*nheaders" },
     .{ .record = "anole_kafka_records_event", .name = "records", .at = "records_off", .item = "anole_kafka_record", .count = "nrecords" },
     .{ .record = "anole_kafka_assign_event", .name = "entries", .at = "entries_off", .item = "anole_kafka_partition", .count = "nentries" },
+
+    // ---- p3/net ----
+    .{ .record = "anole_net_data_event", .name = "frames", .at = "frames_off", .item = "anole_span", .count = "nframes" },
+    .{ .record = "anole_net_datagrams_event", .name = "datagrams", .at = "datagrams_off", .item = "anole_net_datagram_in", .count = "ndatagrams" },
+    // ---- end p3/net ----
+
+    // ---- p3/jobs ----
+    .{ .record = "anole_job_enqueued_event", .name = "entries", .at = "entries_off", .item = "anole_job_enqueued_entry", .count = "nentries" },
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    .{ .record = "anole_watch_event", .name = "fields", .at = "fields_off", .item = "anole_span", .count = "2*nfields" },
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    .{ .record = "anole_s3_result_event", .name = "metadata", .at = "metadata_off", .item = "anole_span", .count = "2*nmetadata" },
+    .{ .record = "anole_s3_result_event", .name = "entries", .at = "entries_off", .item = "anole_s3_entry", .count = "nentries" },
+    .{ .record = "anole_s3_result_event", .name = "prefixes", .at = "prefixes_off", .item = "anole_span", .count = "nprefixes" },
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    .{ .record = "anole_smtp_result_event", .name = "rejected", .at = "rejected_off", .item = "anole_smtp_rejected", .count = "nrejected" },
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    // ---- end p3/lambda ----
 };
 
 pub const HandleKindInfo = struct { kind: u8, name: []const u8, c_type: []const u8 };
 
-/// (A Kafka group is a `broker_sub` and a Kafka batch a `broker_msg`; the
-/// c_type names the NATS use.)
-/// The kind lives in bits 28-31 of a handle (`engine.Handle`). 7 is
-/// reserved for a per-query handle; 10-15 are reserved.
+/// The kind lives in bits 28-32 of a handle (`engine.Handle`). 7 is
+/// reserved for a per-query handle; 19-31 are free.
 pub const handle_kinds = [_]HandleKindInfo{
     .{ .kind = 1, .name = "request", .c_type = "anole_req" },
     .{ .kind = 2, .name = "websocket", .c_type = "anole_ws" },
@@ -914,6 +1794,15 @@ pub const handle_kinds = [_]HandleKindInfo{
     .{ .kind = 6, .name = "db_tx", .c_type = "anole_db_tx" },
     .{ .kind = 8, .name = "broker_sub", .c_type = "anole_nats_sub" },
     .{ .kind = 9, .name = "broker_msg", .c_type = "anole_nats_msg" },
+    .{ .kind = 10, .name = "net_conn", .c_type = "anole_net_conn" },
+    .{ .kind = 11, .name = "net_udp", .c_type = "anole_net_udp" },
+    .{ .kind = 12, .name = "job_worker", .c_type = "anole_job_worker" },
+    .{ .kind = 13, .name = "job", .c_type = "anole_job" },
+    .{ .kind = 14, .name = "sse", .c_type = "anole_sse" },
+    .{ .kind = 15, .name = "watch_sub", .c_type = "anole_watch_sub" },
+    .{ .kind = 16, .name = "transfer", .c_type = "anole_s3_transfer" },
+    .{ .kind = 17, .name = "kafka_group", .c_type = "anole_kafka_group" },
+    .{ .kind = 18, .name = "kafka_batch", .c_type = "anole_kafka_batch" },
 };
 
 pub const EventInfo = struct {
@@ -931,8 +1820,8 @@ pub const events = [_]EventInfo{
     .{ .type = 1, .name = "ANOLE_EV_REQUEST", .record = "anole_request_event", .handles = &.{"request"}, .obligation = "answer" },
     .{ .type = 2, .name = "ANOLE_EV_BODY", .record = "anole_event", .handles = &.{"request"} },
     .{ .type = 3, .name = "ANOLE_EV_ABORT", .record = "anole_abort_event", .handles = &.{ "request", "grpc_call" } },
-    .{ .type = 4, .name = "ANOLE_EV_WRITABLE", .record = "anole_event", .handles = &.{ "request", "grpc_call", "websocket", "wt_stream" } },
-    .{ .type = 5, .name = "ANOLE_EV_SENT", .record = "anole_sent_event", .handles = &.{ "request", "websocket", "grpc_call", "wt_stream", "wt_session" } },
+    .{ .type = 4, .name = "ANOLE_EV_WRITABLE", .record = "anole_event", .handles = &.{ "request", "grpc_call", "websocket", "wt_stream", "net_conn", "net_udp", "sse", "transfer" } },
+    .{ .type = 5, .name = "ANOLE_EV_SENT", .record = "anole_sent_event", .handles = &.{ "request", "websocket", "grpc_call", "wt_stream", "wt_session", "net_conn" } },
     .{ .type = 6, .name = "ANOLE_EV_WS_OPEN", .record = "anole_request_event", .handles = &.{"websocket"} },
     .{ .type = 7, .name = "ANOLE_EV_WS_MESSAGE", .record = "anole_ws_message_event", .handles = &.{"websocket"} },
     .{ .type = 8, .name = "ANOLE_EV_WS_CLOSE", .record = "anole_ws_close_event", .handles = &.{"websocket"} },
@@ -958,12 +1847,53 @@ pub const events = [_]EventInfo{
     .{ .type = 67, .name = "ANOLE_EV_NATS_SUB_END", .record = "anole_broker_end_event", .handles = &.{"broker_sub"} },
     .{ .type = 68, .name = "ANOLE_EV_NATS_STATUS", .record = "anole_broker_status_event" },
     .{ .type = 69, .name = "ANOLE_EV_NATS_WRITABLE", .record = "anole_broker_status_event" },
-    .{ .type = 80, .name = "ANOLE_EV_KAFKA_RECORDS", .record = "anole_kafka_records_event", .handles = &.{"broker_msg"}, .obligation = "batch_done or batch_retry" },
+    .{ .type = 80, .name = "ANOLE_EV_KAFKA_RECORDS", .record = "anole_kafka_records_event", .handles = &.{"kafka_batch"}, .obligation = "batch_done or batch_retry" },
     .{ .type = 81, .name = "ANOLE_EV_KAFKA_DELIVERY", .record = "anole_kafka_delivery_event" },
-    .{ .type = 82, .name = "ANOLE_EV_KAFKA_ASSIGN", .record = "anole_kafka_assign_event", .handles = &.{"broker_sub"} },
-    .{ .type = 83, .name = "ANOLE_EV_KAFKA_REVOKE", .record = "anole_kafka_assign_event", .handles = &.{"broker_sub"} },
+    .{ .type = 82, .name = "ANOLE_EV_KAFKA_ASSIGN", .record = "anole_kafka_assign_event", .handles = &.{"kafka_group"} },
+    .{ .type = 83, .name = "ANOLE_EV_KAFKA_REVOKE", .record = "anole_kafka_assign_event", .handles = &.{"kafka_group"} },
     .{ .type = 84, .name = "ANOLE_EV_KAFKA_WRITABLE", .record = "anole_broker_status_event" },
-    .{ .type = 85, .name = "ANOLE_EV_KAFKA_GROUP_END", .record = "anole_broker_end_event", .handles = &.{"broker_sub"} },
+    .{ .type = 85, .name = "ANOLE_EV_KAFKA_GROUP_END", .record = "anole_broker_end_event", .handles = &.{"kafka_group"} },
+
+    // ---- p3/net ----
+    .{ .type = 96, .name = "ANOLE_EV_NET_OPEN", .record = "anole_net_open_event", .handles = &.{"net_conn"} },
+    .{ .type = 97, .name = "ANOLE_EV_NET_DATA", .record = "anole_net_data_event", .handles = &.{"net_conn"} },
+    .{ .type = 98, .name = "ANOLE_EV_NET_END", .record = "anole_event", .handles = &.{"net_conn"}, .obligation = "with half_open: end this side when done (ANOLE_NET_F_END or close)" },
+    .{ .type = 99, .name = "ANOLE_EV_NET_CLOSE", .record = "anole_net_close_event", .handles = &.{"net_conn"} },
+    .{ .type = 100, .name = "ANOLE_EV_NET_DATAGRAMS", .record = "anole_net_datagrams_event", .handles = &.{"net_udp"} },
+    // ---- end p3/net ----
+
+    // ---- p3/jobs ----
+    .{ .type = 104, .name = "ANOLE_EV_JOB_ENQUEUED", .record = "anole_job_enqueued_event" },
+    .{ .type = 105, .name = "ANOLE_EV_JOB", .record = "anole_job_event", .handles = &.{"job"}, .obligation = "anole_job_finish (or release = retry)" },
+    .{ .type = 106, .name = "ANOLE_EV_JOB_CANCEL", .record = "anole_job_cancel_event", .handles = &.{"job"} },
+    .{ .type = 107, .name = "ANOLE_EV_JOB_WORKER_END", .record = "anole_job_worker_end_event", .handles = &.{"job_worker"} },
+    .{ .type = 108, .name = "ANOLE_EV_JOBS_RESULT", .record = "anole_jobs_result_event" },
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    .{ .type = 109, .name = "ANOLE_EV_WEBHOOK_PUBLISHED", .record = "anole_webhook_published_event" },
+    .{ .type = 110, .name = "ANOLE_EV_WEBHOOK_STATUS", .record = "anole_webhook_status_event" },
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    .{ .type = 112, .name = "ANOLE_EV_SSE_SUBSCRIBE", .record = "anole_request_event", .handles = &.{"request"}, .obligation = "accept or answer" },
+    .{ .type = 113, .name = "ANOLE_EV_SSE_CLOSE", .record = "anole_sse_close_event", .handles = &.{"sse"} },
+    .{ .type = 116, .name = "ANOLE_EV_WATCH_EVENT", .record = "anole_watch_event", .handles = &.{"watch_sub"}, .obligation = "ack (a stream group with manual ack)" },
+    .{ .type = 117, .name = "ANOLE_EV_WATCH_STATUS", .record = "anole_watch_status_event", .handles = &.{"watch_sub"} },
+    .{ .type = 118, .name = "ANOLE_EV_WATCH_END", .record = "anole_watch_end_event", .handles = &.{"watch_sub"} },
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    .{ .type = 124, .name = "ANOLE_EV_S3_RESULT", .record = "anole_s3_result_event", .handles = &.{"transfer"}, .obligation = "for a transfer it opens: write/finish/read_more until done, or release" },
+    .{ .type = 125, .name = "ANOLE_EV_S3_DATA", .record = "anole_s3_data_event", .handles = &.{"transfer"} },
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    .{ .type = 126, .name = "ANOLE_EV_SMTP_RESULT", .record = "anole_smtp_result_event" },
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    // ---- end p3/lambda ----
 };
 
 pub const EventRange = struct { from: u32, to: u32, use: []const u8 };
@@ -976,7 +1906,15 @@ pub const event_ranges = [_]EventRange{
     .{ .from = 30, .to = 39, .use = "database" },
     .{ .from = 40, .to = 49, .use = "HTTP and WebSocket additions" },
     .{ .from = 50, .to = 63, .use = "core additions" },
-    .{ .from = 64, .to = 255, .use = "new areas, a block of 16 per area" },
+    .{ .from = 64, .to = 79, .use = "NATS" },
+    .{ .from = 80, .to = 95, .use = "Kafka" },
+    .{ .from = 96, .to = 103, .use = "raw TCP and UDP (net; 101-103 reserved)" },
+    .{ .from = 104, .to = 111, .use = "jobs and webhooks (111 reserved)" },
+    .{ .from = 112, .to = 115, .use = "SSE (114-115 reserved)" },
+    .{ .from = 116, .to = 123, .use = "watch (119-123 reserved)" },
+    .{ .from = 124, .to = 131, .use = "storage and mail: S3 124-125, SMTP 126 (127-131 reserved)" },
+    .{ .from = 132, .to = 135, .use = "console (133-135 reserved)" },
+    .{ .from = 136, .to = 255, .use = "new areas" },
     .{ .from = 256, .to = 0x7FFFFFFF, .use = "never used" },
     .{ .from = 0x80000000, .to = 0xFFFFFFFF, .use = "never used by Anole: free for a binding's own synthetic events" },
 };
@@ -1031,13 +1969,70 @@ pub const constant_groups = [_]ConstantGroup{
     .{ .prefix = "ANOLE_KAFKA_ASSIGN_", .group = "kafka_assignor" },
     .{ .prefix = "ANOLE_BROKER_END_", .group = "broker_end" },
     .{ .prefix = "ANOLE_BROKER_", .group = "broker_status" },
+
+    // ---- p3/net ----
+    .{ .prefix = "ANOLE_NET_OPEN_F_", .group = "net_open_flag" },
+    .{ .prefix = "ANOLE_NET_FRAMING_", .group = "net_framing" },
+    .{ .prefix = "ANOLE_NET_DATA_F_", .group = "net_data_flag" },
+    .{ .prefix = "ANOLE_NET_CLOSED_", .group = "net_closed_by" },
+    .{ .prefix = "ANOLE_NET_F_", .group = "net_write_flag" },
+    .{ .prefix = "ANOLE_NET_CLOSE_", .group = "net_close_mode" },
+    // ---- end p3/net ----
+
+    // ---- p3/jobs ----
+    .{ .prefix = "ANOLE_JOB_PRIORITY_", .group = "job_priority" },
+    .{ .prefix = "ANOLE_JOB_UNIQUE_", .group = "job_unique" },
+    .{ .prefix = "ANOLE_JOB_CANCEL_", .group = "job_cancel" },
+    .{ .prefix = "ANOLE_JOB_WORKER_", .group = "job_worker" },
+    .{ .prefix = "ANOLE_JOB_F_", .group = "job_flag" },
+    .{ .prefix = "ANOLE_JOB_", .group = "job_outcome" },
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    .{ .prefix = "ANOLE_WEBHOOK_", .group = "webhook_status" },
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    .{ .prefix = "ANOLE_SSE_F_PREFIX", .group = "sse_gap_flag" },
+    .{ .prefix = "ANOLE_SSE_F_", .group = "sse_publish_flag" },
+    .{ .prefix = "ANOLE_SSE_CLOSED_", .group = "sse_closed" },
+    .{ .prefix = "ANOLE_WATCH_NATIVE", .group = "watch_listen_format" },
+    .{ .prefix = "ANOLE_WATCH_JSON", .group = "watch_listen_format" },
+    .{ .prefix = "ANOLE_WATCH_SRC_", .group = "watch_source" },
+    .{ .prefix = "ANOLE_WATCH_OP_", .group = "watch_op" },
+    .{ .prefix = "ANOLE_WATCH_FMT_", .group = "watch_format" },
+    .{ .prefix = "ANOLE_WATCH_END_", .group = "watch_end" },
+    .{ .prefix = "ANOLE_WATCH_", .group = "watch_status" },
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    .{ .prefix = "ANOLE_S3_F_", .group = "s3_flag" },
+    .{ .prefix = "ANOLE_S3_OP_", .group = "s3_op" },
+    .{ .prefix = "ANOLE_S3_RES_F_", .group = "s3_result_flag" },
+    .{ .prefix = "ANOLE_S3_DATA_F_", .group = "s3_data_flag" },
+    .{ .prefix = "ANOLE_S3_PRESIGN_F_", .group = "s3_presign_flag" },
+    .{ .prefix = "ANOLE_S3_PRESIGN_", .group = "s3_presign_method" },
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    .{ .prefix = "ANOLE_SMTP_ATTACH_F_", .group = "smtp_attach_flag" },
+    .{ .prefix = "ANOLE_SMTP_F_", .group = "smtp_flag" },
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    // ---- end p3/lambda ----
+
     .{ .prefix = "ANOLE_ABI_", .group = "abi" },
 };
 
 /// The tokens `anole_last_error_name` returns (sorted). Tokens are only
 /// ever added. The member names of `anole.ServerError` and
-/// `anole.TlsLoadError` are tokens verbatim.
-pub const error_names = [_][]const u8{
+/// `anole.TlsLoadError` are tokens verbatim. Each area of pass 3 lists its
+/// own in its block below (any order); `error_names` is them all, sorted.
+pub const error_names = sortedNames(&(base_error_names ++ net_error_names ++ jobs_error_names ++ webhooks_error_names ++
+    realtime_error_names ++ s3_error_names ++ smtp_error_names ++ lambda_error_names));
+
+const base_error_names = [_][]const u8{
     "AccessDenied",
     "AddressInUse",
     "AddressNotAvailable",
@@ -1050,7 +2045,6 @@ pub const error_names = [_][]const u8{
     "ConsumerWithoutExecutor",
     "Database",
     "DatabaseUnavailable",
-    "DeploymentUnavailable",
     "DuplicateListenerName",
     "FileNotFound",
     "Gone",
@@ -1088,6 +2082,7 @@ pub const error_names = [_][]const u8{
     "ReservedNotZero",
     "RouteConflict",
     "ServerAlreadyOnThread",
+    "Service",
     "SeveralHttp3Listeners",
     "State",
     "SyntaxError",
@@ -1107,3 +2102,56 @@ pub const error_names = [_][]const u8{
     "Unsupported",
     "WrongHandleKind",
 };
+
+// ---- p3/net ----
+const net_error_names = [_][]const u8{
+    "Ended",
+    "InvalidFraming",
+    "NetHandlerContext",
+    "NetListenerHttp3",
+    "NetListenerNeedsPort",
+    "NetNotBuilt",
+    "TcpAndUdp",
+    "UdpOnUnixSocket",
+    "UdpWithProxyProtocol",
+    "UdpWithTls",
+    "UnknownListener",
+};
+// ---- end p3/net ----
+
+// ---- p3/jobs ----
+const jobs_error_names = [_][]const u8{};
+// ---- end p3/jobs ----
+
+// ---- p3/webhooks ----
+const webhooks_error_names = [_][]const u8{};
+// ---- end p3/webhooks ----
+
+// ---- p3/realtime ----
+const realtime_error_names = [_][]const u8{ "NotSse", "WrongWatchKind" };
+// ---- end p3/realtime ----
+
+// ---- p3/s3 ----
+const s3_error_names = [_][]const u8{"NoCredentials"};
+// ---- end p3/s3 ----
+
+// ---- p3/smtp ----
+const smtp_error_names = [_][]const u8{};
+// ---- end p3/smtp ----
+
+// ---- p3/lambda ----
+const lambda_error_names = [_][]const u8{ "LambdaRuntimeApiMissing", "LambdaNotBuilt", "LambdaRuntimeApiFailed", "SnapStartUnsupported" };
+// ---- end p3/lambda ----
+
+fn sortedNames(comptime in: []const []const u8) [in.len][]const u8 {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        var out: [in.len][]const u8 = in[0..in.len].*;
+        std.sort.insertion([]const u8, &out, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        return out;
+    }
+}

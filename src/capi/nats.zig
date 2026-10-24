@@ -115,8 +115,8 @@ pub fn Table(comptime T: type) type {
                 e.value = value;
                 return .{ .index = i, .gen = e.gen };
             }
-            // Bit 23 of a slot marks a Kafka handle (src/capi/kafka.zig).
-            if (t.entries.items.len >= (1 << 23)) return error.TooMany;
+            // A handle names 2^23 slots.
+            if (t.entries.items.len >= engine.max_slots) return error.TooMany;
             try t.entries.append(gpa, .{ .gen = @max(1, t.first_gen), .live = true, .value = value });
             const i: u32 = @intCast(t.entries.items.len - 1);
             return .{ .index = i, .gen = t.entries.items[i].gen };

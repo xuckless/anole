@@ -27,10 +27,15 @@
         // HTTP core (adapted from lalinsky/dusty) is in src/http/core, not a
         // dependency.
         // Plus `diagnostics` (88f6d69): comptime-gated per-executor task
-        // counters and stack stats for the runtime gauges on /metrics.
+        // counters and stack stats for the runtime gauges on /metrics. Plus
+        // SAFETY.md's checks: `debug_held_locks` (4a2dd7c), a task that
+        // suspends holding a counted lock panics (L2), and a count of
+        // `debug_cancel` reports (3accc88, exported in 42f97ae), on which
+        // the test runner fails a test (C3), and no report for a cancel an
+        // AutoCancel consumed as its timeout (812eac3).
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#88f6d6985c78deac16d937a0a8d95e7c649eba6d",
-            .hash = "zio-0.19.0-xHbVVFndLQBjQr_KxPh7mRuZ-dllPXBf8YBFu6FX-mok",
+            .url = "git+https://github.com/xuckless/zio#812eac300e20c7d042403a5df7e59f4a913159b6",
+            .hash = "zio-0.19.0-xHbVVBPwLQBsgh4wHD9aXWugD40WWDN5m2zGfdKe9110",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
@@ -153,8 +158,8 @@
         // bytes the socket accepted (Conn.bytesSent: when a failed call
         // may run again).
         .pg = .{
-            .url = "git+https://github.com/xuckless/pg.zig#6327fc61f3a3e90aa5b014af21e12bbb073e0fcc",
-            .hash = "pg-0.0.0-Wp_7gU5jCQD89Co7vWWqcTa2s4vhSZ85OldH348fzrP4",
+            .url = "git+https://github.com/xuckless/pg.zig#4abc2caf582dd9965340bd3e4cabcfbb5f74a054",
+            .hash = "pg-0.0.0-Wp_7gVtzCQChogRE8uzrNYv1eqywmg0Vc_7aM7sr6sGT",
             .lazy = true,
         },
         // Tests only, fetched only when Anole is the root build: the BSON

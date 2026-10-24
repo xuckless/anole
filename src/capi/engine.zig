@@ -74,6 +74,15 @@ pub const pipe = pipe_mod;
 pub const db = @import("db.zig");
 pub const nats = @import("nats.zig");
 pub const kafka = @import("kafka.zig");
+/// Pass 3's areas (ABI 0.10): each a module with fixed hooks, called from
+/// here in one order (`openAreas`, `closeAreas`, ...).
+pub const net = @import("net.zig");
+pub const jobs = @import("jobs.zig");
+pub const webhooks = @import("webhooks.zig");
+pub const sse = @import("sse.zig");
+pub const watch = @import("watch.zig");
+pub const s3 = @import("s3.zig");
+pub const smtp = @import("smtp.zig");
 pub const config = config_mod;
 
 const log = std.log.scoped(.anole_capi);
@@ -125,15 +134,17 @@ pub fn stateOf(word: u64) SlotState {
 /// A handle as the consumer sees it: which executor, which slot, which
 /// generation of it, and which kind of thing (a function given a handle of
 /// another kind answers `ANOLE_E_GONE`, never acts on the wrong object).
+/// Bits 0-27 the generation, 28-32 the kind, 33-55 the slot, 56-63 the
+/// executor (ABI 0.10).
 pub const Handle = packed struct(u64) {
     gen: u28,
     kind: Kind,
-    slot: u24,
+    slot: u23,
     exec: u8,
 
-    /// Room for what ABI 0.x adds before it freezes: gRPC calls, WebTransport
-    /// sessions and streams, database queries.
-    pub const Kind = enum(u4) {
+    /// Room for what ABI 0.x adds before it freezes; 7 is reserved and
+    /// 19-31 are free.
+    pub const Kind = enum(u5) {
         request = 1,
         websocket = 2,
         grpc_call = 3,
@@ -147,6 +158,24 @@ pub const Handle = packed struct(u64) {
         broker_sub = 8,
         /// A JetStream message (`anole_nats_msg`).
         broker_msg = 9,
+        /// A raw TCP connection (`anole_net_conn`).
+        net_conn = 10,
+        /// A raw UDP socket of a listener (`anole_net_udp`).
+        net_udp = 11,
+        /// A jobs worker (`anole_job_worker`).
+        job_worker = 12,
+        /// A job a worker holds (`anole_job`).
+        job = 13,
+        /// An SSE subscriber a consumer accepted (`anole_sse`).
+        sse = 14,
+        /// A watch listener (`anole_watch_sub`).
+        watch_sub = 15,
+        /// An S3 upload or download (`anole_s3_transfer`).
+        transfer = 16,
+        /// A Kafka group membership (`anole_kafka_group`).
+        kafka_group = 17,
+        /// The records of one Kafka partition (`anole_kafka_batch`).
+        kafka_batch = 18,
         _,
     };
 
@@ -158,8 +187,26 @@ pub const Handle = packed struct(u64) {
     }
 };
 
+test "Handle: the kind in bits 28-32; every kind, the last slot and the last generation round-trip" {
+    try std.testing.expectEqual(@as(u64, 18) << 28, Handle.encode(.{ .gen = 0, .kind = .kafka_batch, .slot = 0, .exec = 0 }));
+    try std.testing.expectEqual(@as(u64, 1) << 33, Handle.encode(.{ .gen = 0, .kind = @fromBackingInt(@as(u5, 0)), .slot = 1, .exec = 0 }));
+    for (1..19) |k| {
+        const h: Handle = .{ .gen = std.math.maxInt(u28), .kind = @fromBackingInt(@as(u5, @intCast(k))), .slot = max_slots - 1, .exec = 255 };
+        const back = Handle.decode(Handle.encode(h));
+        try std.testing.expectEqual(h.kind, back.kind);
+        try std.testing.expectEqual(@as(u23, max_slots - 1), back.slot);
+        try std.testing.expectEqual(@as(u28, std.math.maxInt(u28)), back.gen);
+        try std.testing.expectEqual(@as(u8, 255), back.exec);
+    }
+}
+
 /// Generations count 1..max_gen and wrap to 1 (0 is never valid).
 pub const max_gen: u32 = std.math.maxInt(u28);
+
+/// Slots per executor a handle can name: every slot table stays below it
+/// (a comptime check where its bound is static, a start-time one where the
+/// configuration sets it).
+pub const max_slots: u32 = 1 << 23;
 
 pub fn nextGen(gen: u32) u32 {
     return if (gen >= max_gen) 1 else gen + 1;
@@ -174,7 +221,7 @@ var next_first_gen: u32 = 1;
 
 pub const ReplyHeader = struct { name_off: u32, name_len: u32, value_off: u32, value_len: u32 };
 
-const Reply = enum { respond, fail, abort, fd, ws_accept };
+const Reply = enum { respond, fail, abort, fd, ws_accept, sse_accept };
 
 pub const Slot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
@@ -261,6 +308,11 @@ pub const Slot = struct {
     /// the `queued` store and read by `poll` after its CAS).
     ws_upgrade: bool = false,
     ws_slot: u32 = no_slot,
+    /// A server-sent events route the consumer decides
+    /// (ANOLE_EV_SSE_SUBSCRIBE); `ws_slot` is then its SSE slot, and
+    /// `anole_sse_accept` stores the topics after the headers (p3/realtime).
+    sse_subscribe: bool = false,
+    sse_last: u32 = 0,
     /// `anole_ws_accept`: the extra headers are stored as a response's are,
     /// the accepted subprotocol's bytes follow them in `bytes`.
     subprotocol_off: u32 = 0,
@@ -453,6 +505,13 @@ pub const Exec = struct {
     db: db.ExecState = .{},
     nats: nats.ExecState = .{},
     kafka: kafka.ExecState = .{},
+    net: net.ExecState = .{},
+    jobs: jobs.ExecState = .{},
+    webhooks: webhooks.ExecState = .{},
+    sse: sse.ExecState = .{},
+    watch: watch.ExecState = .{},
+    s3: s3.ExecState = .{},
+    smtp: smtp.ExecState = .{},
 
     /// The capi task is asleep for a whole request timeout: wakes it, as a
     /// deadline (or a lost doorbell) now needs watching.
@@ -526,6 +585,7 @@ pub const Exec = struct {
         s.body_error = null;
         s.claims = "";
         s.ws_upgrade = false;
+        s.sse_subscribe = false;
         s.ws_slot = no_slot;
         s.subprotocol_off = 0;
         s.subprotocol_len = 0;
@@ -698,6 +758,15 @@ pub const Exec = struct {
         const ev: *abi.Event = @ptrCast(rec.ptr);
         ev.handle = handle;
         x.postRecord(rec, false);
+    }
+
+    /// A record from any thread or task, in the order posted: onto the
+    /// overflow list, never the ring (so a record from the executor's own
+    /// task cannot pass one from another thread). The consumer is woken.
+    pub fn postRemote(x: *Exec, rec: []align(8) u8) void {
+        const c = x.consumer orelse return freeRecord(rec.ptr);
+        x.pushOverflow(rec);
+        c.wake();
     }
 
     pub fn post(x: *Exec, cmd: *Command) void {
@@ -881,6 +950,16 @@ pub const Route = struct {
     ws: if (features.websocket) ?anole.websocket.UpgradeOptions else void = if (features.websocket) null else {},
     /// A WebTransport endpoint's settings.
     wt: if (features.http3) ?wt.Options else void = if (features.http3) null else {},
+    /// A server-sent events endpoint (p3/realtime): its topic templates.
+    sse: ?SseRoute = null,
+};
+
+/// An `"sse"` route's settings (`sse.handler`, `sse.nativeHandler`).
+pub const SseRoute = struct {
+    topics: []const []const u8,
+    last: u16,
+    /// The consumer decides (`ANOLE_EV_SSE_SUBSCRIBE`).
+    consumer: bool,
 };
 
 // ---------------------------------------------------------------------------
@@ -1015,6 +1094,14 @@ pub const Engine = struct {
     /// The Kafka ones (`anole_kafka *`), and their handles.
     kafka_brokers: []kafka.Broker = &.{},
     kafka_state: kafka.State = .{},
+    /// Pass 3's areas, engine-wide.
+    net_state: net.State = .{},
+    jobs_state: jobs.State = .{},
+    webhooks_state: webhooks.State = .{},
+    sse_state: sse.State = .{},
+    watch_state: watch.State = .{},
+    s3_state: s3.State = .{},
+    smtp_state: smtp.State = .{},
     /// WebSocket topics, shared by every executor.
     rooms: if (features.websocket) anole.websocket.Rooms else void = if (features.websocket) .init(gpa, .{}) else {},
     /// gRPC services, methods, descriptors and health.
@@ -1062,12 +1149,20 @@ pub const Engine = struct {
             ki += 1;
         };
         e.kafka_state.init(e.first_gen);
+        e.net_state.init(e.first_gen);
+        e.jobs_state.init(e.first_gen);
+        e.webhooks_state.init(e.first_gen);
+        e.sse_state.init(e.first_gen);
+        e.watch_state.init(e.first_gen);
+        e.s3_state.init(e.first_gen);
+        e.smtp_state.init(e.first_gen);
+        try sse.create(e, why);
         // The modes (docs/config.md): resolved once, here, so a binding sees
         // $PORT and the filled addresses before it starts.
         var opts = try e.serverOptions(a);
         const vars = _test_vars orelse modes.Vars.process;
         const env_res = try modes.resolveEnvironment(cfg.environment, vars, .abi, why);
-        e.resolved = try modes.resolve(a, &opts, env_res.environment, env_res.source, null, vars, why);
+        e.resolved = try modes.resolve(a, &opts, env_res.environment, env_res.source, null, vars, .abi, why);
         try modes.fillListeners(a, &opts, &e.resolved);
         e.options = opts;
         e.listeners = try a.alloc(ListenerState, opts.listeners.len);
@@ -1094,6 +1189,9 @@ pub const Engine = struct {
     pub fn needsConsumer(e: *const Engine) bool {
         for (e.config.routes) |r| if (r.handler != null or r.websocket != null or r.webtransport != null) return true;
         if (e.config.grpc) |g| if (g.services.len > 0) return true;
+        // ---- p3/net ----
+        for (e.config.listeners) |l| if (l.tcp != null or l.udp != null) return true;
+        // ---- end p3/net ----
         return false;
     }
 
@@ -1186,6 +1284,10 @@ pub const Engine = struct {
         db.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         nats.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
         kafka.open(e, &app) catch |err| return e.failStartDeinit(&app, err);
+        e.openAreas(&app) catch |err| {
+            e.closeAreas();
+            return e.failStartDeinit(&app, err);
+        };
         for (e.execs, 0..) |*x, i| placement.concurrent(&e.tasks, app.io(), .{ .executor = i }, capiTask, .{ e, x }) catch |err| {
             e.tasks.cancel(app.io());
             return e.failStartDeinit(&app, err);
@@ -1196,6 +1298,7 @@ pub const Engine = struct {
         app.startConnectors() catch |err| {
             e.explained_len = app.explainStart(&e.explained, error.DatabaseUnavailable).len;
             e.tasks.cancel(app.io());
+            e.closeAreas();
             db.close(e);
             nats.close(e);
             kafka.close(e);
@@ -1209,6 +1312,7 @@ pub const Engine = struct {
         if (!e.abandon.load(.acquire)) {
             watcher = app.io().concurrent(watchReady, .{ e, &app }) catch |err| {
                 e.tasks.cancel(app.io());
+                e.closeAreas();
                 db.close(e);
                 nats.close(e);
                 kafka.close(e);
@@ -1217,7 +1321,8 @@ pub const Engine = struct {
             // Control calls may reach the server from here until `run` returns.
             _ = e.ctl.fetchAnd(~ctl_closed, .release);
             e.phase.store(.running, .release);
-            result = app.run();
+            // The watches start with serving (`anole_server_start`).
+            result = if (watch.start(e, &app)) |_| app.run() else |err| err;
         }
         e.closeControl(app.io());
         if (watcher) |*w| w.cancel(app.io());
@@ -1226,6 +1331,8 @@ pub const Engine = struct {
         for (e.execs) |*x| x.db.cancel(app.io());
         for (e.execs) |*x| x.nats.cancel(app.io());
         for (e.execs) |*x| x.kafka.cancel(app.io());
+        for (e.execs) |*x| cancelAreas(x, app.io());
+        e.closeAreas();
         db.close(e);
         nats.close(e);
         kafka.close(e);
@@ -1265,7 +1372,7 @@ pub const Engine = struct {
             };
             break :blk .fromMilliseconds(@as(i64, longest) + 5000);
         } else null;
-        const listeners = try buildListeners(a, cfg);
+        const listeners = try e.buildListeners(a, cfg);
         return .{
             .listeners = listeners,
             .executors = if (cfg.executors == 0) .auto else .exact(@intCast(cfg.executors)),
@@ -1288,6 +1395,22 @@ pub const Engine = struct {
                 .max_routes = cfg.console.max_routes,
             },
             ._console_runtime = cfg.console.runtime,
+            // ---- p3/lambda ----
+            .lambda = .{
+                .runtime_api = cfg.lambda.runtime_api,
+                .invoke_mode = cfg.lambda.invoke_mode,
+                .concurrency = cfg.lambda.concurrency,
+                .event_path = cfg.lambda.event_path,
+                .base_path = cfg.lambda.base_path,
+                .keep_stage = cfg.lambda.keep_stage,
+                .context_headers = cfg.lambda.context_headers,
+                .deadline_margin = .fromMilliseconds(cfg.lambda.deadline_margin_ms),
+                .idle_reset = if (cfg.lambda.idle_reset_ms) |ms| .fromMilliseconds(ms) else null,
+                .sigterm = cfg.lambda.sigterm,
+                .shutdown_timeout = .fromMilliseconds(cfg.lambda.shutdown_timeout_ms),
+                .flush_timeout = .fromMilliseconds(cfg.lambda.flush_timeout_ms),
+            },
+            // ---- end p3/lambda ----
             .timeouts = .{
                 .request = request,
                 .read_header = msOrNull(cfg.timeouts.read_header_ms),
@@ -1340,7 +1463,7 @@ pub const Engine = struct {
         return false;
     }
 
-    fn buildListeners(a: std.mem.Allocator, cfg: Config) ![]const anole.ServerOptions.Listener {
+    fn buildListeners(e: *Engine, a: std.mem.Allocator, cfg: Config) ![]const anole.ServerOptions.Listener {
         const out = try a.alloc(anole.ServerOptions.Listener, cfg.listeners.len);
         for (cfg.listeners, out) |l, *o| {
             o.* = .{
@@ -1353,6 +1476,10 @@ pub const Engine = struct {
                 .http3 = l.http3,
                 .proxy_protocol = l.proxy_protocol,
                 .proxy_protocol_from = l.proxy_protocol_from,
+                // ---- p3/net ----
+                .tcp = if (l.tcp) |t| try net.tcpService(e, a, t) else null,
+                .udp = if (l.udp) |u| try net.udpService(e, a, u) else null,
+                // ---- end p3/net ----
             };
             if (l.tls) |t| {
                 if (comptime features.tls != .boringssl) return error.Unsupported;
@@ -1451,6 +1578,18 @@ pub const Engine = struct {
                     .data = route,
                     .no_wait = if (plain) |pr| pr.detachable else false,
                 });
+            } else if (rc.sse) |sc| {
+                // p3/realtime: parked event streams; an idle subscriber holds
+                // no task. The consumer decides the subscription (or not).
+                const route = try a.create(Route);
+                route.* = .{
+                    .engine = e,
+                    .id = sc.handler orelse 0,
+                    .list = e.listFor(rc.timeout_ms),
+                    .detachable = false,
+                    .sse = .{ .topics = sc.topics, .last = sc.last, .consumer = sc.handler != null },
+                };
+                group.inner.addRouteWith(.get, rc.path, sse.handler, .{ .data = route });
             } else if (rc.handler) |id| {
                 const route = try a.create(Route);
                 route.* = .{
@@ -1509,7 +1648,9 @@ pub const Engine = struct {
             e.started.set(threadedIo());
             return;
         };
-        for (app.addresses(), 0..) |addr, i| {
+        for (app.addresses(), 0..) |addr, core_i| {
+            // The core's listeners leave out the UDP ones.
+            const i = net.configIndex(e, core_i);
             if (i >= e.listeners.len) break;
             const l = &e.listeners[i];
             var w: std.Io.Writer = .fixed(&l.bound_buf);
@@ -1526,6 +1667,7 @@ pub const Engine = struct {
         if (app.http3Address()) |q| for (e.config.listeners, e.listeners) |lc, *l| {
             if (lc.http3) l.udp_port = q.getPort();
         };
+        net.opened(e, app);
         for (e.listeners) |*l| l.state.store(abi.LISTENER_LISTENING, .release);
         e.started.set(threadedIo());
     }
@@ -1533,7 +1675,8 @@ pub const Engine = struct {
     /// A start that failed binding listener `index` (or none known): its
     /// state turns FAILED with the reason.
     fn noteFailedListener(e: *Engine, index: ?usize, err: anyerror) void {
-        const i = index orelse return;
+        // The core's index: its listeners leave out the UDP ones.
+        const i = net.configIndex(e, index orelse return);
         if (i >= e.listeners.len) return;
         e.failed_listener = i;
         const l = &e.listeners[i];
@@ -1558,6 +1701,8 @@ pub const Engine = struct {
 
     fn setupExecs(e: *Engine, n: usize) !void {
         const per = e.config.limits.max_inflight;
+        // Request slots are named by a handle's 23-bit slot.
+        if (per == 0 or per > max_slots) return error.InvalidValue;
         const queue = if (e.config.limits.queue > 0) e.config.limits.queue else per * 2;
         e.execs = try gpa.alloc(Exec, n);
         var made: usize = 0;
@@ -1629,6 +1774,11 @@ pub const Engine = struct {
         if (e.phase.cmpxchgStrong(.running, .draining, .acq_rel, .acquire) == null) {
             e.notifyDraining();
             kafka.draining(e);
+            jobs.draining(e);
+            webhooks.draining(e);
+            watch.draining(e);
+            s3.draining(e);
+            smtp.draining(e);
         }
         app.stop();
     }
@@ -1725,7 +1875,7 @@ pub const Engine = struct {
         if (e.consumers.items.len == 0 or e.consumers.items[0].execs.items.len == 0) return;
         const rec = newRecord(@sizeOf(abi.ConsoleClosedEvent), .console_closed, 0) catch return;
         const ev: *abi.ConsoleClosedEvent = @ptrCast(rec.ptr);
-        ev.reason = @intFromEnum(reason);
+        ev.reason = @backingInt(reason);
         e.consumers.items[0].execs.items[0].postRecord(rec, false);
     }
 
@@ -1754,9 +1904,13 @@ pub const Engine = struct {
         for (e.execs) |*x| {
             for (x.slots) |*s| last = @max(last, genOf(s.word.load(.acquire)));
             last = @max(last, x.ws.maxGen(), x.wt.maxGen(), x.db.maxGen());
+            last = @max(last, x.net.maxGen(), x.jobs.maxGen(), x.webhooks.maxGen(), x.sse.maxGen());
+            last = @max(last, x.watch.maxGen(), x.s3.maxGen(), x.smtp.maxGen());
         }
         last = @max(last, e.nats_state.maxGen());
         last = @max(last, e.kafka_state.maxGen());
+        last = @max(last, e.net_state.maxGen(), e.jobs_state.maxGen(), e.webhooks_state.maxGen(), e.sse_state.maxGen());
+        last = @max(last, e.watch_state.maxGen(), e.s3_state.maxGen(), e.smtp_state.maxGen());
         next_first_gen = nextGen(last);
         if (global == e) global = null;
         for (e.execs) |*x| {
@@ -1786,7 +1940,15 @@ pub const Engine = struct {
             x.db.deinit();
             x.nats.deinit();
             x.kafka.deinit();
+            x.net.deinit();
+            x.jobs.deinit();
+            x.webhooks.deinit();
+            x.sse.deinit();
+            x.watch.deinit();
+            x.s3.deinit();
+            x.smtp.deinit();
         }
+        e.destroyAreas();
         e.nats_state.deinit();
         kafka.destroy(e);
         e.kafka_state.deinit();
@@ -1811,7 +1973,7 @@ pub const Engine = struct {
             wakes += c.wakes.load(.monotonic);
             rewakes += c.rewakes.load(.monotonic);
         }
-        return .{
+        var out: abi.Stats = .{
             .size = @sizeOf(abi.Stats),
             .requests = e.requests.load(.monotonic),
             .detached = e.detached_count.load(.monotonic),
@@ -1828,6 +1990,45 @@ pub const Engine = struct {
             .wt_sessions = e.wt_sessions.load(.monotonic),
             .wt_datagrams_dropped = e.wt_datagrams_dropped.load(.monotonic),
         };
+        net.stats(e, &out);
+        return out;
+    }
+
+    /// Pass 3's `open` hooks (R42's order), after `db`, `nats` and `kafka`.
+    fn openAreas(e: *Engine, app: *anole.App) !void {
+        try s3.open(e, app);
+        try smtp.open(e, app);
+        try jobs.open(e, app);
+        try webhooks.open(e, app);
+        try watch.open(e, app);
+    }
+
+    /// Their `close` hooks, in the reverse order.
+    fn closeAreas(e: *Engine) void {
+        net.close(e);
+        watch.close(e);
+        webhooks.close(e);
+        jobs.close(e);
+        smtp.close(e);
+        s3.close(e);
+        sse.close(e);
+    }
+
+    /// Their `destroy` hooks, in the reverse order, then their states.
+    fn destroyAreas(e: *Engine) void {
+        watch.destroy(e);
+        webhooks.destroy(e);
+        jobs.destroy(e);
+        smtp.destroy(e);
+        s3.destroy(e);
+        sse.destroy(e);
+        e.smtp_state.deinit();
+        e.s3_state.deinit();
+        e.watch_state.deinit();
+        e.sse_state.deinit();
+        e.webhooks_state.deinit();
+        e.jobs_state.deinit();
+        e.net_state.deinit();
     }
 
     /// `anole_server_set_ready`.
@@ -1877,11 +2078,15 @@ fn listenerState(a: std.mem.Allocator, l: anole.ServerOptions.Listener) !Listene
     if (l.http3) flags |= abi.LISTENER_F_HTTP3;
     if (l.unix != null) flags |= abi.LISTENER_F_UNIX;
     if (l.proxy_protocol orelse false) flags |= abi.LISTENER_F_PROXY_PROTOCOL;
-    const scheme = if (l.tls != null) "https" else "http";
+    if (l.tcp != null) flags |= abi.LISTENER_F_TCP;
+    if (l.udp != null) flags |= abi.LISTENER_F_UDP;
+    const scheme = if (l.udp != null) "udp" else if (l.tcp != null) "tcp" else if (l.tls != null) "https" else "http";
     const name: []const u8 = l.name orelse if (l.unix) |path|
         try std.fmt.allocPrint(a, "unix-{s}", .{path})
+    else if (l.port) |p|
+        try std.fmt.allocPrint(a, "{s}-{d}", .{ scheme, p })
     else
-        try std.fmt.allocPrint(a, "{s}-{d}", .{ scheme, l.port.? });
+        try std.fmt.allocPrint(a, "{s}", .{scheme});
     // "127.0.0.1:8080", "[::]:8443", "unix:/run/app.sock".
     const address: []const u8 = if (l.unix) |path|
         try std.fmt.allocPrint(a, "unix:{s}", .{path})
@@ -2013,7 +2218,13 @@ fn consumerHandler(req: *http.Request, res: *http.Response) anyerror!void {
 /// A WebSocket handshake being decided by the consumer: the WebSocket slot
 /// reserved for it, and what the answer was.
 pub const Upgrade = struct {
+    /// A WebSocket slot, or (`sse`) an SSE slot.
     ws_slot: u32,
+    /// An SSE subscription (ANOLE_EV_SSE_SUBSCRIBE), not a WebSocket upgrade.
+    sse: bool = false,
+    /// `sse`, accepted: the topics and `last` the consumer chose.
+    sse_topics: []const []const u8 = &.{},
+    sse_last: u32 = 0,
     accepted: bool = false,
     /// `accepted`: the subprotocol and extra headers the consumer chose,
     /// copied into the request's arena.
@@ -2090,7 +2301,8 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
     s.claims = claimsOf(r);
     s.detached = d;
     s.body = "";
-    s.ws_upgrade = up != null;
+    s.ws_upgrade = up != null and !up.?.sse;
+    s.sse_subscribe = up != null and up.?.sse;
     s.ws_slot = if (up) |u| u.ws_slot else no_slot;
     s.event.reset();
     s.pump_event.reset();
@@ -2118,7 +2330,10 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
         .refused => unreachable,
     }
     s.word.store(pack(gen, .queued), .release);
-    x.link(si, route.list, std.Io.Clock.awake.now(io).nanoseconds + e.timeouts[route.list]);
+    // The earlier of the route's deadline and one the engine set before
+    // dispatch (AWS Lambda: the invocation's deadline less the margin), so
+    // `timeout_us` reports the one that applies.
+    x.link(si, route.list, @min(std.Io.Clock.awake.now(io).nanoseconds + e.timeouts[route.list], handlerDeadlineNs(req)));
 
     // Hand over. A full ring (the consumer far behind) is backpressure:
     // wait for room, up to the deadline; on a reader, refuse instead.
@@ -2243,6 +2458,33 @@ fn waitForAnswer(x: *Exec, si: u32, gen: u32, req: *http.Request, res: *http.Res
             if (canceled) io.recancel();
             x.unlink(si);
             defer x.release(si);
+            if (s.reply == .sse_accept) {
+                // The subscription is accepted: the topics (packed after the
+                // headers in `bytes`, `u16` length first), `last` and the
+                // headers the consumer chose, out of the slot before it is
+                // freed.
+                const u = up.?;
+                const bytes = s.bytes.items;
+                const list = try req.arena.alloc(std.http.Header, s.headers.items.len);
+                for (s.headers.items, list) |h, *out| out.* = .{
+                    .name = try req.arena.dupe(u8, bytes[h.name_off..][0..h.name_len]),
+                    .value = try req.arena.dupe(u8, bytes[h.value_off..][0..h.value_len]),
+                };
+                u.headers = list;
+                var topics: std.ArrayList([]const u8) = .empty;
+                var at: usize = s.subprotocol_off;
+                const end = at + s.subprotocol_len;
+                while (at + 2 <= end) {
+                    const n = std.mem.readInt(u16, bytes[at..][0..2], .little);
+                    at += 2;
+                    try topics.append(req.arena, try req.arena.dupe(u8, bytes[at..][0..n]));
+                    at += n;
+                }
+                u.sse_topics = topics.items;
+                u.sse_last = s.sse_last;
+                u.accepted = true;
+                return;
+            }
             if (s.reply == .ws_accept) {
                 // The handshake is accepted: what the consumer chose, out
                 // of the slot before it is freed.
@@ -2313,7 +2555,7 @@ fn applyAnswer(x: *Exec, si: u32, req: *http.Request, res: *http.Response) !void
             };
             s.fd = -1;
         },
-        .fail, .abort, .ws_accept => unreachable,
+        .fail, .abort, .ws_accept, .sse_accept => unreachable,
     }
 }
 
@@ -2789,6 +3031,13 @@ fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
 /// What `timeouts.request_ms: null` stands for in the deadline lists: a day.
 const no_deadline: i96 = 24 * 3600 * std.time.ns_per_s;
 
+/// `req._handler_deadline` on the awake clock, in nanoseconds; the largest
+/// value when there is none.
+fn handlerDeadlineNs(req: *const http.Request) i96 {
+    const d = req._handler_deadline orelse return std.math.maxInt(i96);
+    return d.raw.nanoseconds;
+}
+
 fn msOrNull(ms: ?u32) ?std.Io.Duration {
     return if (ms) |v| std.Io.Duration.fromMilliseconds(v) else null;
 }
@@ -2982,6 +3231,10 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                     @memcpy(out[pos..][0..ev.len], rec[0..ev.len]);
                     pos += ev.len;
                     const len = ev.len;
+                    // ---- p3/net ----
+                    if (ev.type == @backingInt(abi.EventType.net_data)) net.polled(e, ev.handle, len);
+                    // ---- end p3/net ----
+                    if (ev.type == @backingInt(abi.EventType.watch_event)) watch.polled(e, @ptrCast(@alignCast(rec)));
                     freeRecord(rec);
                     x.ring.pop();
                     popped = true;
@@ -3009,7 +3262,7 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                     c.next_exec = (c.next_exec + i) % c.execs.items.len;
                     break :outer;
                 }
-                pos += if (is_grpc) grpc.encodeRecord(s, entry.handle, out[pos..][0..size], now) else headOf(s, now).encode(if (s.ws_upgrade) .ws_upgrade else .request, entry.handle, out[pos..][0..size]);
+                pos += if (is_grpc) grpc.encodeRecord(s, entry.handle, out[pos..][0..size], now) else headOf(s, now).encode(if (s.ws_upgrade) .ws_upgrade else if (s.sse_subscribe) .sse_subscribe else .request, entry.handle, out[pos..][0..size]);
                 s.word.store(pack(h.gen, .out), .release);
                 x.ring.pop();
                 popped = true;
@@ -3031,6 +3284,10 @@ fn pollLocked(c: *Consumer, out: []u8, arm: bool, one: bool, need: *u32) PollErr
                 }
                 @memcpy(out[pos..][0..ev.len], rec[0..ev.len]);
                 pos += ev.len;
+                // ---- p3/net ----
+                if (ev.type == @backingInt(abi.EventType.net_data)) net.polled(e, ev.handle, ev.len);
+                // ---- end p3/net ----
+                if (ev.type == @backingInt(abi.EventType.watch_event)) watch.polled(e, @ptrCast(@alignCast(rec)));
                 x.ovf_head = linkOf(rec).*;
                 if (x.ovf_head == null) x.ovf_tail = null;
                 freeRecord(rec);
@@ -3280,6 +3537,55 @@ pub fn wsAccept(e: *Engine, hv: u64, subprotocol: []const u8, headers: []const C
     return handle;
 }
 
+/// `anole_sse_accept`: the consumer accepts the subscription `hv` (an
+/// `ANOLE_EV_SSE_SUBSCRIBE`). Returns the subscriber's handle, open at once;
+/// the stream's head goes out from the request's task. `topics` are packed
+/// (`u16` length, bytes) after the headers.
+pub fn sseAccept(e: *Engine, hv: u64, topics: []const []const u8, headers: []const CHeader, last: u32) AnswerError!u64 {
+    _ = try checkHeaders(headers);
+    for (headers) |h| {
+        const n = h.name.slice();
+        // The stream's own framing and type.
+        if (std.ascii.eqlIgnoreCase(n, "content-type") or std.ascii.eqlIgnoreCase(n, "cache-control") or
+            std.ascii.eqlIgnoreCase(n, "connection") or std.ascii.eqlIgnoreCase(n, "x-accel-buffering")) return error.Invalid;
+    }
+    var packed_len: usize = 0;
+    for (topics) |t| {
+        if (t.len == 0 or t.len > 255) return error.Invalid;
+        packed_len += 2 + t.len;
+    }
+    const x, const s, const h = try claim(e, hv);
+    errdefer s.word.store(pack(h.gen, .out), .release);
+    if (!s.sse_subscribe) return error.State;
+    try storeHeaders(&s.headers, &s.bytes, headers, packed_len);
+    s.subprotocol_off = @intCast(s.bytes.items.len);
+    s.subprotocol_len = @intCast(packed_len);
+    for (topics) |t| {
+        var len: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len, @intCast(t.len), .little);
+        s.bytes.appendSliceAssumeCapacity(&len);
+        s.bytes.appendSliceAssumeCapacity(t);
+    }
+    s.sse_last = last;
+    s.reply = .sse_accept;
+    s.status = 200;
+    // Cannot fail: the slot was reserved for this request.
+    const handle = sse.openReserved(x, s.ws_slot);
+    handBack(x, s, h, .done);
+    return handle;
+}
+
+/// Pass 3's per-executor tasks, canceled at the stop.
+fn cancelAreas(x: *Exec, io: std.Io) void {
+    x.net.cancel(io);
+    x.jobs.cancel(io);
+    x.webhooks.cancel(io);
+    x.sse.cancel(io);
+    x.watch.cancel(io);
+    x.s3.cancel(io);
+    x.smtp.cancel(io);
+}
+
 /// `anole_handle_release`: ends whatever the handle is, the way the
 /// application giving up would. A cleanup call.
 pub fn handleRelease(e: *Engine, hv: u64) AnswerError!void {
@@ -3322,17 +3628,27 @@ pub fn handleRelease(e: *Engine, hv: u64) AnswerError!void {
         // A NATS subscription or JetStream consume ends; a JetStream message
         // is NAK'd (cleanup calls).
         .broker_sub => {
-            if (kafka.isKafka(hv)) kafka.groupClose(e, hv) else nats.unsubscribe(e, hv);
+            nats.unsubscribe(e, hv);
             return error.Over;
         },
         .broker_msg => {
-            if (kafka.isKafka(hv)) {
-                kafka.batchRetry(e, hv, 0) catch return error.Over;
-                return;
-            }
             nats.ack(e, hv, abi.NATS_NAK, 0) catch return error.Over;
             return;
         },
+        // A Kafka group leaves; a batch is retried now (cleanup calls).
+        .kafka_group => {
+            kafka.groupClose(e, hv);
+            return error.Over;
+        },
+        .kafka_batch => {
+            kafka.batchRetry(e, hv, 0) catch return error.Over;
+            return;
+        },
+        .net_conn, .net_udp => return net.release(e, hv),
+        .job_worker, .job => return jobs.release(e, hv),
+        .sse => return sse.release(e, hv),
+        .watch_sub => return watch.release(e, hv),
+        .transfer => return s3.release(e, hv),
         .db_query, _ => return error.WrongKind,
     }
 }
@@ -3522,4 +3838,11 @@ test {
     _ = @import("nats_test.zig");
     _ = @import("parity_test.zig");
     if (features.grpc) _ = grpc;
+    _ = net;
+    _ = jobs;
+    _ = webhooks;
+    _ = sse;
+    _ = watch;
+    _ = s3;
+    _ = smtp;
 }

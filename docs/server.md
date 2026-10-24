@@ -185,7 +185,7 @@ interface), `":3000"`, or `"127.0.0.1:3000"` (this machine only).
 | `env_files` | null | The `.env` files read at `init`. Null: the environment's (development: four files in the working directory; production: none); `&.{}`: none. |
 | `error_detail` | null | A 500 for an error with no status of its own names the error. Null: on in development. |
 | `log` | `.{}` | Logging, process-wide: `format` (`.auto`: JSON Lines in production, else text), `level` and `service`; see [logging.md](logging.md). |
-| `banner` | true | The startup banner (the anole, the version and the address), only when stderr is a terminal, the logs are text and the process is not run by systemd; `ANOLE_NO_BANNER=1` turns it off. |
+| `banner` | true | The startup banner (the word "anole" drawn large, the version and the address), only when stderr is a terminal, the logs are text and the process is not run by systemd; `ANOLE_NO_BANNER=1` turns it off. A terminal of 110 columns or more gets one of two full-size drawings at random, a narrower one (55 or more) a half-height one, a narrower one still only the version line. 24-bit colour when `COLORTERM` is `truecolor` or `24bit`, else the nearest 256 colours; `NO_COLOR` draws it uncoloured. |
 | `timeouts` | see below | The request, head, write, keep-alive and drain deadlines. |
 | `limits` | see below | Body, head and connection limits. |
 | `proxy` | none trusted | Trust in proxies in front: `trusted`, `X-Forwarded-*`. |
@@ -315,6 +315,7 @@ or instead of those two. Each has:
 | `http3` | false | HTTP/3 on the same port number over UDP, with `Options.http3`'s settings. TLS only, one listener per server. |
 | `proxy_protocol` | null | Every connection starts with a PROXY protocol header. Null: on under `anole_lb`, else off. |
 | `proxy_protocol_from` | `&.{}` | With `proxy_protocol`: the peers allowed to send it, in CIDR notation; others are closed unread. Empty: `proxy.trusted` when set, else any peer. |
+| `tcp`, `udp` | null | Raw TCP or UDP instead of HTTP: `anole.net.tcp(...)` / `anole.net.udp(...)` (or `app.tcp`, `app.udp`; see [net.md](net.md)). A raw listener needs a `port` (0 for a free one) or `unix`, never takes `$PORT` or 8080, and ignores `http1`/`http2`; `http3` is refused. UDP takes no `tls`, `unix` or `proxy_protocol`. Without a `tcp`/`udp` it is named `tcp-<port>` or `udp-<port>`. |
 
 A TLS listener offers by ALPN the protocols it speaks: `h2` and `http/1.1`,
 or one of them. One with `http2 = false` gives a client that offers `h2`
@@ -362,6 +363,10 @@ A unix socket file that a stopped server left behind is replaced when
 nothing listens on it; one that something answers on is `AddressInUse`.
 Anole never removes the file itself, since a restarted server may still be
 serving it.
+
+A server that names listeners of any kind opens no others: the implicit
+127.0.0.1:8080 appears only when nothing at all is named, so `app.tcp(...)`
+and `app.run()` serve the raw listener alone.
 
 `listeners` alone, without `http` or `https`, is set up by `run` (or by
 `listen` and `listenTls`, which add theirs in front), not by `init`; with
@@ -554,12 +559,18 @@ listener whose port could not be bound. The C ABI reports the same names
 | `ListenersAlreadySet` | `listen` or `listenTls` on a server whose options name listeners. | Serve them with `run`, or leave `http` and `https` out of the options. |
 | `InvalidListenerName`, `DuplicateListenerName` | A listener name that is empty, longer than 255 bytes, holds `:`, or is taken. | Give each listener its own short name. |
 | `InvalidProxyNetwork` | A `proxy_protocol_from`, `proxy.trusted` or `ANOLE_PROXY_TRUSTED` entry that is not an address, a CIDR network or `loopback`, `private`, `link_local`. | Write `"10.0.0.0/8"` or `"192.0.2.7"`. |
-| `InvalidEnvironmentVariable` | `ANOLE_ENV`, `ANOLE_DEPLOYMENT` or (platform) `PORT` holds a value Anole can't use; the log names it. | Set one of the listed values. |
+| `InvalidEnvironmentVariable` | `ANOLE_ENV`, `ANOLE_DEPLOYMENT`, (platform) `PORT`, or (lambda) `AWS_LAMBDA_RUNTIME_API`, `AWS_LAMBDA_HTTP_ENDPOINT`, `ANOLE_LAMBDA_INVOKE_MODE` or `AWS_LAMBDA_MAX_CONCURRENCY` holds a value Anole can't use; the log names it. | Set one of the listed values. |
 | `InvalidEnvFile` | A `.env` file has a problem; every problem is logged with its file and line. | Fix the lines; values are never printed. |
-| `DeploymentUnavailable` | `deployment = .lambda` before Anole 0.4. | Use `platform` or wait for the Lambda adapter. |
+| `LambdaRuntimeApiMissing` | `deployment = .lambda` with no `lambda.runtime_api`, no `AWS_LAMBDA_RUNTIME_API` and no `AWS_LAMBDA_HTTP_ENDPOINT`. | Run it on Lambda or under the Runtime Interface Emulator, set `lambda.runtime_api`, or use another deployment. |
+| `LambdaNotBuilt` | `deployment = .lambda` in a `-Dlambda=false` build. | Build with `-Dlambda` (on in every profile), or use another deployment. |
+| `LambdaRuntimeApiFailed` | The Runtime API answered 500, or asking it for the next invocation failed three times in a row. | Nothing to fix in the app: the process exits so Lambda starts a new environment. If it repeats, the lines before it say why. |
+| `SnapStartUnsupported` | `AWS_LAMBDA_INITIALIZATION_TYPE=snap-start`: restored copies would share random-number state. | Publish the function without SnapStart. |
 | `ProxyProtocolNoPeers` | `proxy_protocol` on with `proxy.trusted` empty and no `proxy_protocol_from`. | Name the load balancers. |
 | `NoProtocols`, `SeveralHttp3Listeners`, `Http3NeedsTls`, `Http3NeedsHttps` | A listener that speaks nothing; HTTP/3 on several listeners, or on one without TLS. | One TLS listener serves HTTP/3. |
-| `TooManyListeners` | More listeners than a restart can hand over. | Fewer listeners, or no `process`. |
+| `TooManyListeners` | More listeners than a restart can hand over (64 TCP ones, raw TCP included, and 1024 UDP sockets). | Fewer listeners, or no `process`. |
+| `NetNotBuilt`, `NetListenerNeedsPort`, `NetListenerHttp3`, `TcpAndUdp` | A raw listener on a build without `-Dnet`; a raw listener with no port or `unix`; HTTP/3 asked of one; or `tcp` and `udp` on one listener. | Build with `-Dnet`; give it a port; use two listeners. |
+| `UdpWithTls`, `UdpOnUnixSocket`, `UdpWithProxyProtocol` | A UDP listener with TLS (DTLS is not supported), a unix socket or a PROXY header. | Leave them off the UDP listener. |
+| `InvalidFraming`, `NetHandlerContext` | A raw listener's option out of range (a length prefix of 1, 2 or 4 bytes, a `max` of 1 byte to 1 GiB, `read_window` 4 to 64 KiB, `batch` 1 to 64, `max_datagram` up to 65507); or a service built for another state type. | The error's text names the listener and the limit. |
 | `RouteConflict` | Two routes (or a helper route) on one path. | Rename one of them. |
 | `HqInteropNotAllowed` | The QUIC interop runner's mode, off in programs that did not ask for it. | Leave `http3.hq_interop_root` out. |
 | `TlsNotBuilt`, `Http2NotBuilt`, `Http3NotBuilt` | A listener asks for what this build left out. | Build with `-Dtls`, `-Dhttp2` or `-Dhttp3`. |
@@ -1140,6 +1151,18 @@ On platforms (`deployment = platform`), Cloud Run's "Use HTTP/2
 end-to-end" and Fly's `h2_backend = true` send h2c with prior knowledge.
 The default cleartext listener serves it as it is; gRPC needs it there, and
 on Cloud Run it also lifts the 32 MiB request size limit of HTTP/1.1.
+
+## AWS Lambda
+
+The same `main` runs as a Lambda function. With `deployment = .lambda` (or
+`ANOLE_DEPLOYMENT=lambda`, or a `zig build lambda` build, whose default it
+is), `run`, `listen` and `listenTls` serve invocations from the Lambda
+Runtime API instead of opening listeners: each API Gateway, Function URL,
+ALB or VPC Lattice event goes through the router and middleware as a
+request, and other events (SQS, EventBridge, S3) are POSTed to
+`/_lambda/event`. Listeners named in the options are set aside, and one
+startup line says which. `zig build lambda` writes `provided.al2023` zips
+for arm64 and x86_64. See [lambda.md](lambda.md).
 
 ## Build flags
 

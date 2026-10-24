@@ -153,6 +153,7 @@ typedef struct {
   anole_grpc_call call;
   int method;
   uint64_t total;                 /* StreamingInputCall */
+  int compressed;                 /* the client compresses its messages */
   unsigned char trailing[256];    /* x-grpc-test-echo-trailing-bin, as bytes */
   size_t trailing_len;
   int has_trailing;
@@ -251,6 +252,7 @@ static void on_call(const anole_grpc_call_event *ev) {
   call_state *st = state_of(c, 1);
   CHECK(st);
   st->method = ev->method_id;
+  st->compressed = (ev->flags & ANOLE_GRPC_CALL_COMPRESSED) != 0;
   anole_str initial = md_of(ev, "x-grpc-test-echo-initial");
   if (initial.ptr) {
     anole_header h[1] = {{S("x-grpc-test-echo-initial"), initial}};
@@ -320,6 +322,20 @@ static void on_message(const anole_grpc_message_event *ev) {
       pbr r = reader(data.ptr, data.len);
       pbf f;
       while (next(&r, &f)) {
+        /* expect_compressed (BoolValue): client_compressed_streaming's probe
+           is refused at once, before the client half-closes. */
+        if (f.field == 2 && f.wire == 2) {
+          pbr b = reader(f.data, f.len);
+          pbf g;
+          int expect = 0;
+          while (next(&b, &g))
+            if (g.field == 1 && g.wire == 0) expect = g.v != 0;
+          if (expect && !st->compressed) {
+            finish(st, ANOLE_GRPC_STATUS_INVALID_ARGUMENT, (const unsigned char *)"expected a compressed request", 29);
+            return;
+          }
+          continue;
+        }
         if (f.field != 1 || f.wire != 2) continue;
         pbr pr = reader(f.data, f.len);
         pbf g;
@@ -367,7 +383,7 @@ int main(int argc, char **argv) {
   out_buf = malloc(4 << 20);
   CHECK(out_buf);
   char tls[1024] = "";
-  if (argc >= 4) snprintf(tls, sizeof tls, ", \"tls\": {\"cert_file\": \"%s\", \"key_file\": \"%s\"}", argv[2], argv[3]);
+  if (argc >= 4) snprintf(tls, sizeof tls, ", \"tls\": {\"cert_file\": \"%s\", \"key_file\": \"%s\"}, \"http3\": true", argv[2], argv[3]);
   char json[4096];
   snprintf(json, sizeof json,
            "{\"listeners\": [{\"address\": \"127.0.0.1\", \"port\": %d%s}],"
@@ -387,7 +403,7 @@ int main(int argc, char **argv) {
   anole_consumer_options co = {sizeof co, NULL, NULL, ANOLE_CONSUMER_F_SHARED};
   CHECK(anole_consumer_attach(s, &co, &consumer) == ANOLE_OK);
   CHECK(anole_server_start(s) == ANOLE_OK);
-  fprintf(stderr, "capi grpc interop server on 127.0.0.1:%s (%s)\n", argv[1], argc >= 4 ? "TLS" : "h2c");
+  fprintf(stderr, "capi grpc interop server on 127.0.0.1:%s (%s)\n", argv[1], argc >= 4 ? "TLS + HTTP/3" : "h2c");
   static _Alignas(8) unsigned char buf[2 << 20];
   for (;;) {
     int64_t n = anole_poll_wait(consumer, buf, sizeof buf, 1000);

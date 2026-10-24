@@ -285,11 +285,16 @@ pub const server_options = [_]Entry{
     .{ .zig = "listeners[].address", .json = "listeners[].address" },
     .{ .zig = "listeners[].port", .json = "listeners[].port" },
     .{ .zig = "listeners[].unix", .json = "listeners[].unix" },
+    .{ .zig = "listeners[].unix_mode", .omitted = "the socket file mode (0o660 default) is not in the ABI config yet; a later key can add it" },
     .{ .zig = "listeners[].http1", .json = "listeners[].http1" },
     .{ .zig = "listeners[].http2", .json = "listeners[].http2", .kind = .custom, .note = "Zig defaults to whether -Dhttp2 is built in; the schema and Config say true" },
     .{ .zig = "listeners[].http3", .json = "listeners[].http3" },
     .{ .zig = "listeners[].proxy_protocol", .json = "listeners[].proxy_protocol" },
     .{ .zig = "listeners[].proxy_protocol_from", .json = "listeners[].proxy_protocol_from" },
+    // ---- p3/net ----
+    .{ .zig = "listeners[].tcp", .json = "listeners[].tcp", .kind = .custom, .note = "the keys of `anole.net.Tcp.Options` (net_tcp below) plus handler, the number carried in the listener's records" },
+    .{ .zig = "listeners[].udp", .json = "listeners[].udp", .kind = .custom, .note = "the keys of `anole.net.Udp.Options` (net_udp below) plus handler" },
+    // ---- end p3/net ----
     .{ .zig = "listeners[].tls", .json = "listeners[].tls", .kind = .custom, .note = "cert: cert_file + key_file, cert_pem + key_pem or self_signed; client_auth: client_auth + one of client_ca_file, client_ca_pem, client_ca_dir, client_ca_system; alpn: alpn" },
     .{ .zig = "http3", .json = "http3", .kind = .same },
     .{ .zig = "http3.idle_timeout", .json = "http3.idle_timeout_ms", .kind = .ms },
@@ -328,6 +333,13 @@ pub const server_options = [_]Entry{
     .{ .zig = "_console_runtime", .omitted = "internal: the ABI's console.runtime" },
     .{ .zig = "env_files", .omitted = "the binding reads .env files into its language's environment (anole_dotenv_read)" },
     .{ .zig = "_resolved", .omitted = "internal: the C ABI resolves the modes at create" },
+    // ---- p3/lambda ----
+    .{ .zig = "lambda", .json = "lambda", .kind = .same },
+    .{ .zig = "lambda.deadline_margin", .json = "lambda.deadline_margin_ms", .kind = .ms },
+    .{ .zig = "lambda.idle_reset", .json = "lambda.idle_reset_ms", .kind = .ms },
+    .{ .zig = "lambda.shutdown_timeout", .json = "lambda.shutdown_timeout_ms", .kind = .ms },
+    .{ .zig = "lambda.flush_timeout", .json = "lambda.flush_timeout_ms", .kind = .ms },
+    // ---- end p3/lambda ----
 };
 
 // ---------------------------------------------------------------------------
@@ -466,3 +478,249 @@ pub const kafka_options = [_]Entry{
     .{ .zig = "readiness", .omitted = "always on in the ABI (/readyz includes the broker)" },
     .{ .zig = "environ", .omitted = "the process environment, as the other connectors" },
 };
+
+// ---- p3/net ----
+/// `anole.net.Tcp.Options` against `listeners[].tcp`.
+pub const net_tcp = [_]Entry{
+    .{ .zig = "framing", .json = "listeners[].tcp.framing", .kind = .custom, .note = "an object with exactly one of lines {max, strip_cr, crlf}, length {bytes, endian, includes_header, max}, varint {max}; left out: none" },
+    .{ .zig = "half_open", .json = "listeners[].tcp.half_open" },
+    .{ .zig = "no_delay", .json = "listeners[].tcp.no_delay" },
+    .{ .zig = "keepalive", .json = "listeners[].tcp.keepalive_ms", .kind = .ms },
+    .{ .zig = "handshake_timeout", .json = "listeners[].tcp.handshake_timeout_ms", .kind = .ms },
+    .{ .zig = "idle_timeout", .json = "listeners[].tcp.idle_timeout_ms", .kind = .ms },
+    .{ .zig = "lifetime", .json = "listeners[].tcp.lifetime_ms", .kind = .ms },
+    .{ .zig = "write_timeout", .json = "listeners[].tcp.write_timeout_ms", .kind = .ms },
+    .{ .zig = "write_high_water", .json = "listeners[].tcp.write_high_water" },
+    .{ .zig = "write_max", .json = "listeners[].tcp.write_max" },
+    .{ .zig = "read_window", .json = "listeners[].tcp.read_window" },
+    .{ .zig = "read_ahead", .json = "listeners[].tcp.read_ahead" },
+    .{ .zig = "max_connections", .json = "listeners[].tcp.max_connections" },
+    .{ .zig = "log_connections", .json = "listeners[].tcp.log_connections" },
+};
+
+/// `anole.net.Udp.Options` against `listeners[].udp`.
+pub const net_udp = [_]Entry{
+    .{ .zig = "sockets", .json = "listeners[].udp.sockets" },
+    .{ .zig = "max_datagram", .json = "listeners[].udp.max_datagram" },
+    .{ .zig = "batch", .json = "listeners[].udp.batch" },
+    .{ .zig = "send_queue", .json = "listeners[].udp.send_queue" },
+    .{ .zig = "receive_buffer", .json = "listeners[].udp.receive_buffer" },
+    .{ .zig = "send_buffer", .json = "listeners[].udp.send_buffer" },
+    .{ .zig = "sessions", .omitted = "per-peer state is the binding's: a Map or dict keyed by address" },
+};
+// ---- end p3/net ----
+
+// ---- p3/jobs ----
+/// `anole.jobs.Options` against `jobs`.
+pub const jobs_options = [_]Entry{
+    .{ .zig = "store", .json = "jobs.store", .kind = .custom, .note = "a databases[].name (SQLite, PostgreSQL or Redis), or \"memory\"" },
+    .{ .zig = "queues", .json = "jobs.queues", .kind = .custom, .note = "name and concurrency, as in Zig" },
+    .{ .zig = "run", .omitted = "the ABI always runs workers for the consumer's kinds (enqueue only under deployment lambda)" },
+    .{ .zig = "lease", .json = "jobs.lease_ms", .kind = .ms },
+    .{ .zig = "poll_interval", .json = "jobs.poll_ms", .kind = .ms },
+    .{ .zig = "keep", .json = "jobs.keep", .kind = .custom, .note = "completed_ms, dead_ms, cancelled_ms" },
+    .{ .zig = "table_prefix", .json = "jobs.table_prefix" },
+    .{ .zig = "key_prefix", .json = "jobs.key_prefix" },
+    .{ .zig = "migrate", .json = "jobs.migrate" },
+    .{ .zig = "notify", .json = "jobs.notify" },
+    .{ .zig = "leader", .json = "jobs.leader", .kind = .custom, .note = "method \"auto\"|\"advisory_lock\"|\"lease_row\", ttl_ms, renew_ms" },
+    .{ .zig = "clock", .omitted = "tests / Zig only" },
+    .{ .zig = "gate", .omitted = "the ABI's own: workers claim once the server runs" },
+    .{ .zig = "name", .omitted = "Anole names the process (hostname and pid)" },
+    .{ .zig = "kinds", .json = "jobs.kinds", .kind = .custom, .note = "name, queue, priority, attempts, timeout_ms" },
+    .{ .zig = "drain_timeout", .json = "jobs.drain_ms", .kind = .ms },
+    .{ .zig = "on_dead", .omitted = "Zig only; the admin ops list dead jobs" },
+};
+
+/// `anole.jobs.Kind` against `jobs.kinds[]`.
+pub const jobs_kind = [_]Entry{
+    .{ .zig = "name", .json = "jobs.kinds[].name" },
+    .{ .zig = "queue", .json = "jobs.kinds[].queue" },
+    .{ .zig = "priority", .json = "jobs.kinds[].priority", .kind = .custom, .note = "\"critical\"|\"high\"|\"normal\"|\"low\"" },
+    .{ .zig = "attempts", .json = "jobs.kinds[].attempts" },
+    .{ .zig = "backoff", .omitted = "the ABI's kinds use the default backoff (15 s doubling to 6 h, equal jitter); a worker's RETRY may name a delay" },
+    .{ .zig = "timeout", .json = "jobs.kinds[].timeout_ms", .kind = .ms },
+};
+
+/// `anole.jobs.CronOptions` against `jobs.cron[]`.
+pub const jobs_cron = [_]Entry{
+    .{ .zig = "tz", .json = "jobs.cron[].tz" },
+    .{ .zig = "missed", .json = "jobs.cron[].missed", .kind = .custom, .note = "\"once\"|\"skip\"|\"all\"" },
+    .{ .zig = "catch_up", .json = "jobs.cron[].catch_up_ms", .kind = .ms },
+    .{ .zig = "job", .omitted = "the schedule's job takes its kind's defaults" },
+};
+// ---- end p3/jobs ----
+
+// ---- p3/webhooks ----
+
+/// `anole.webhooks.Options` against `webhooks`.
+pub const webhooks_options = [_]Entry{
+    .{ .zig = "jobs", .omitted = "the ABI's \"jobs\" configuration is the one jobs client" },
+    .{ .zig = "queue", .json = "webhooks.queue" },
+    .{ .zig = "timeout", .json = "webhooks.timeout_ms", .kind = .ms },
+    .{ .zig = "attempts", .json = "webhooks.attempts" },
+    .{ .zig = "backoff", .json = "webhooks.backoff", .kind = .custom, .note = "base_ms, max_ms, multiplier and jitter (\"full\", \"equal\", \"none\")" },
+    .{ .zig = "breaker", .json = "webhooks.breaker", .kind = .custom, .note = "an object as databases[].breaker, or null" },
+    .{ .zig = "allow_private_addresses", .json = "webhooks.allow_private_addresses" },
+    .{ .zig = "require_https", .json = "webhooks.require_https" },
+    .{ .zig = "user_agent", .json = "webhooks.user_agent" },
+    .{ .zig = "max_payload", .json = "webhooks.max_payload" },
+    .{ .zig = "response_kept", .json = "webhooks.response_kept" },
+    .{ .zig = "keep_messages", .json = "webhooks.keep_messages_ms", .kind = .ms },
+    .{ .zig = "keep_attempts", .json = "webhooks.keep_attempts_ms", .kind = .ms },
+    .{ .zig = "disable_after", .json = "webhooks.disable_after_ms", .kind = .ms },
+    .{ .zig = "secrets_key", .json = "webhooks.secrets_key_env", .kind = .custom, .note = "the name of an environment variable that holds the key" },
+    .{ .zig = "max_endpoints_per_owner", .json = "webhooks.max_endpoints_per_owner" },
+    .{ .zig = "on_event", .omitted = "anole_webhooks_watch delivers ANOLE_EV_WEBHOOK_STATUS" },
+    .{ .zig = "clock", .omitted = "tests / Zig only" },
+};
+
+/// `anole.webhooks.Verify.Options` against the `webhook_verify` middleware.
+pub const webhook_verify_options = [_]Entry{
+    .{ .zig = "preset", .json = "middleware[].webhook_verify.preset" },
+    .{ .zig = "secrets", .json = "middleware[].webhook_verify.secrets", .kind = .custom, .note = "secrets, or secrets_env naming a variable with one secret or several separated by spaces" },
+    .{ .zig = "tolerance", .json = "middleware[].webhook_verify.tolerance_ms", .kind = .ms },
+    .{ .zig = "dedup", .json = "middleware[].webhook_verify.dedup", .kind = .custom, .note = "\"memory\", \"none\" or \"redis:<database>\"; dedup_ttl_ms is the ttl" },
+    .{ .zig = "on_store_error", .json = "middleware[].webhook_verify.on_store_error" },
+    .{ .zig = "hmac", .json = "middleware[].webhook_verify.hmac", .kind = .custom, .note = "header, algorithm, encoding, prefix, id_header" },
+    .{ .zig = "clock", .omitted = "tests / Zig only" },
+};
+// ---- end p3/webhooks ----
+
+// ---- p3/realtime ----
+/// `anole.sse.Topics.Options` against `sse`.
+pub const sse_options = [_]Entry{
+    .{ .zig = "heartbeat", .json = "sse.heartbeat_ms", .kind = .ms },
+    .{ .zig = "retry", .json = "sse.retry_ms", .kind = .ms },
+    .{ .zig = "replay.events", .json = "sse.replay.events" },
+    .{ .zig = "replay.bytes", .json = "sse.replay.bytes" },
+    .{ .zig = "replay.total_bytes", .json = "sse.replay.total_bytes" },
+    .{ .zig = "replay.max_age", .json = "sse.replay.max_age_ms", .kind = .ms },
+    .{ .zig = "replay.max_per_resume", .json = "sse.replay.max_per_resume" },
+    .{ .zig = "max_queued_bytes", .json = "sse.max_queued_bytes" },
+    .{ .zig = "on_full", .json = "sse.on_full" },
+    .{ .zig = "close_after", .json = "sse.close_after_ms", .kind = .ms },
+    .{ .zig = "leave_grace", .json = "sse.leave_grace_ms", .kind = .ms },
+    .{ .zig = "max_topics_per_subscriber", .json = "sse.max_topics_per_subscriber" },
+    .{ .zig = "gap_event", .json = "sse.gap_event" },
+    .{ .zig = "drain_retry.min", .json = "sse.drain_retry.min_ms", .kind = .ms },
+    .{ .zig = "drain_retry.max", .json = "sse.drain_retry.max_ms", .kind = .ms },
+    .{ .zig = "_manual_ticks", .omitted = "tests only" },
+};
+
+/// `anole.sse.RouteOptions` against `routes[].sse`.
+pub const sse_route_options = [_]Entry{
+    .{ .zig = "topics", .json = "routes[].sse.topics" },
+    .{ .zig = "last", .json = "routes[].sse.last" },
+};
+
+/// `anole.watch.Options` against `watches[]`.
+pub const watch_options = [_]Entry{
+    .{ .zig = "name", .json = "watches[].name", .kind = .custom, .note = "required in the ABI" },
+    .{ .zig = "to", .json = "watches[].to", .kind = .custom, .note = "each target is {\"sse\": topic, \"event\": name} or {\"ws\": room, \"type\", \"gap_message\"}; the topics and rooms are those of the server" },
+    .{ .zig = "data", .json = "watches[].data" },
+    .{ .zig = "reconnect", .json = "watches[].reconnect", .kind = .custom, .note = "base_ms and max_ms (100 ms, 5 s); multiplier and jitter are the Zig defaults" },
+};
+
+/// `anole.watch.Postgres` against `watches[].postgres`.
+pub const watch_postgres = [_]Entry{
+    .{ .zig = "client", .json = "watches[].database", .kind = .custom, .note = "the databases entry's name" },
+    .{ .zig = "channels", .json = "watches[].postgres.channels" },
+};
+
+/// `anole.watch.Redis` against `watches[].redis`.
+pub const watch_redis = [_]Entry{
+    .{ .zig = "client", .json = "watches[].database", .kind = .custom, .note = "the databases entry's name" },
+    .{ .zig = "channels", .json = "watches[].redis.channels" },
+    .{ .zig = "patterns", .json = "watches[].redis.patterns" },
+};
+
+/// `anole.watch.RedisStream` against `watches[].redis_stream`.
+pub const watch_redis_stream = [_]Entry{
+    .{ .zig = "client", .json = "watches[].database", .kind = .custom, .note = "the databases entry's name" },
+    .{ .zig = "keys", .json = "watches[].redis_stream.keys" },
+    .{ .zig = "start", .json = "watches[].redis_stream.start", .kind = .custom, .note = "\"new\", \"all\" or {\"after\": [ids]}" },
+    .{ .zig = "group.name", .json = "watches[].redis_stream.group.name" },
+    .{ .zig = "group.consumer", .json = "watches[].redis_stream.group.consumer" },
+    .{ .zig = "group.create", .json = "watches[].redis_stream.group.create" },
+    .{ .zig = "group.ack", .json = "watches[].redis_stream.group.ack" },
+    .{ .zig = "count", .json = "watches[].redis_stream.count" },
+    .{ .zig = "block", .json = "watches[].redis_stream.block_ms", .kind = .ms },
+};
+
+/// `anole.watch.MongoDb` against `watches[].mongodb`.
+pub const watch_mongodb = [_]Entry{
+    .{ .zig = "client", .json = "watches[].database", .kind = .custom, .note = "the databases entry's name" },
+    .{ .zig = "database", .json = "watches[].mongodb.database" },
+    .{ .zig = "collection", .json = "watches[].mongodb.collection" },
+    .{ .zig = "pipeline", .json = "watches[].mongodb.pipeline", .kind = .custom, .note = "a JSON array of stages, not text" },
+    .{ .zig = "full_document", .json = "watches[].mongodb.full_document" },
+    .{ .zig = "full_document_before_change", .json = "watches[].mongodb.full_document_before_change" },
+    .{ .zig = "start", .json = "watches[].mongodb.start", .kind = .custom, .note = "\"now\", {\"resume_after\": token}, {\"start_after\": token} or {\"at\": {\"t\", \"i\"}}" },
+    .{ .zig = "max_await", .json = "watches[].mongodb.max_await_ms", .kind = .ms },
+    .{ .zig = "batch_size", .json = "watches[].mongodb.batch_size" },
+    .{ .zig = "show_expanded_events", .json = "watches[].mongodb.show_expanded_events" },
+};
+// ---- end p3/realtime ----
+
+// ---- p3/s3 ----
+const s3_tls_note = "ca_file or ca_pem; client_cert_file + client_key_file or client_cert_pem + client_key_pem; insecure_skip_verify";
+
+/// `anole.s3.Options` against `storage[]`.
+pub const s3_options = [_]Entry{
+    .{ .zig = "endpoint", .json = "storage[].s3.endpoint" },
+    .{ .zig = "region", .json = "storage[].s3.region" },
+    .{ .zig = "bucket", .json = "storage[].s3.bucket" },
+    .{ .zig = "credentials", .json = "storage[].s3.access_key_id", .kind = .custom, .note = "access_key_id + secret_access_key (+ session_token), or anonymous; neither takes the AWS credential chain" },
+    .{ .zig = "provider", .json = "storage[].s3.provider", .kind = .custom, .note = "by name: \"auto\", \"aws\", \"r2\", \"b2\", \"supabase\", \"minio\", \"generic\"" },
+    .{ .zig = "addressing", .json = "storage[].s3.addressing", .kind = .custom, .note = "\"auto\", \"path\" or \"virtual_host\"" },
+    .{ .zig = "payload_signing", .json = "storage[].s3.payload_signing", .kind = .custom, .note = "\"auto\", \"signed\" or \"unsigned\"" },
+    .{ .zig = "name", .json = "storage[].name", .kind = .custom, .note = "the store's name" },
+    .{ .zig = "tls", .json = "storage[].s3.ca_file", .kind = .custom, .note = s3_tls_note },
+    .{ .zig = "timeout", .json = "storage[].timeout_ms", .kind = .ms, .note = "0 is none" },
+    .{ .zig = "min_throughput", .json = "storage[].s3.min_throughput" },
+    .{ .zig = "connect_timeout", .json = "storage[].s3.connect_timeout_ms", .kind = .ms },
+    .{ .zig = "max_idle_connections", .json = "storage[].s3.max_idle_connections" },
+    .{ .zig = "part_size", .json = "storage[].s3.part_size" },
+    .{ .zig = "multipart_threshold", .json = "storage[].s3.multipart_threshold" },
+    .{ .zig = "concurrency", .json = "storage[].s3.concurrency" },
+    .{ .zig = "upload_memory", .json = "storage[].s3.upload_memory" },
+    .{ .zig = "max_object_bytes", .json = "storage[].s3.max_object_bytes" },
+    .{ .zig = "errors", .json = "storage[].errors", .kind = .same },
+    .{ .zig = "retry", .json = "storage[].retry", .kind = .custom, .note = "an object (attempts, base_ms, max_ms, multiplier, attempt_timeout_ms, max_retry_after_ms), or null for none; on by default (every S3 call is idempotent); ANOLE_S3_F_NO_RETRY tries one call once" },
+    .{ .zig = "breaker", .json = "storage[].breaker", .kind = .custom, .note = "an object (consecutive_failures, failure_ratio, min_calls, window_ms, open_ms, max_open_ms, half_open_calls), or null for none" },
+    .{ .zig = "readiness", .json = "storage[].s3.readiness" },
+    .{ .zig = "environ", .omitted = "the process environment, as the other connectors" },
+};
+// ---- end p3/s3 ----
+
+// ---- p3/smtp ----
+/// `anole.smtp.Options` against `mail[].smtp`.
+pub const smtp_options = [_]Entry{
+    .{ .zig = "url", .json = "mail[].smtp.url" },
+    .{ .zig = "from", .json = "mail[].smtp.from" },
+    .{ .zig = "username", .json = "mail[].smtp.username" },
+    .{ .zig = "password", .json = "mail[].smtp.password" },
+    .{ .zig = "tls_mode", .json = "mail[].smtp.tls_mode", .kind = .custom, .note = "\"auto\", \"starttls\", \"implicit\" or \"none\"" },
+    .{ .zig = "tls", .json = "mail[].smtp.ca_file", .kind = .custom, .note = "ca_file or ca_pem; client_cert_file + client_key_file or client_cert_pem + client_key_pem; insecure_skip_verify" },
+    .{ .zig = "helo_name", .json = "mail[].smtp.helo_name" },
+    .{ .zig = "name", .json = "mail[].name", .kind = .custom, .note = "the mail server's name" },
+    .{ .zig = "max_connections", .json = "mail[].smtp.max_connections" },
+    .{ .zig = "max_messages_per_connection", .json = "mail[].smtp.max_messages_per_connection" },
+    .{ .zig = "idle_timeout", .json = "mail[].smtp.idle_timeout_ms", .kind = .ms, .note = "0 is never" },
+    .{ .zig = "acquire_timeout", .json = "mail[].smtp.acquire_timeout_ms", .kind = .ms },
+    .{ .zig = "connect_timeout", .json = "mail[].smtp.connect_timeout_ms", .kind = .ms },
+    .{ .zig = "timeout", .json = "mail[].timeout_ms", .kind = .ms, .note = "0 is none" },
+    .{ .zig = "min_throughput", .json = "mail[].smtp.min_throughput" },
+    .{ .zig = "max_message_bytes", .json = "mail[].smtp.max_message_bytes" },
+    .{ .zig = "errors", .json = "mail[].errors", .kind = .same },
+    .{ .zig = "retry", .json = "mail[].retry", .kind = .custom, .note = "an object (attempts, base_ms, max_ms, multiplier, attempt_timeout_ms, max_retry_after_ms): what `ANOLE_SMTP_F_RETRY` sends retry with" },
+    .{ .zig = "breaker", .json = "mail[].breaker", .kind = .custom, .note = "an object (consecutive_failures, failure_ratio, min_calls, window_ms, open_ms, max_open_ms, half_open_calls), or null for none" },
+    .{ .zig = "readiness", .json = "mail[].smtp.readiness" },
+    .{ .zig = "environment", .omitted = "the server's environment (`environment` in the configuration)" },
+    .{ .zig = "environ", .omitted = "the process environment, as the other connectors" },
+};
+// ---- end p3/smtp ----
+
+// ---- p3/lambda ----
+// ---- end p3/lambda ----

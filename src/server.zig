@@ -36,6 +36,8 @@ const handoff = @import("handoff.zig");
 const errors = @import("errors.zig");
 const modes = @import("modes.zig");
 const env_mod = @import("env.zig");
+const net_mod = @import("net/root.zig");
+const lambda_serve = if (features.lambda) @import("lambda/serve.zig") else struct {};
 /// SIGUSR2 (restart) and SIGHUP (certificate reload): not on Windows.
 const unix_signals = builtin.os.tag != .windows;
 
@@ -83,7 +85,7 @@ const address_mod = @import("address.zig");
 const handlers = @import("handlers.zig");
 const typed = @import("typed.zig");
 const openapi_mod = if (features.openapi) @import("openapi/root.zig") else @import("openapi/off.zig");
-const banner_mod = @import("banner.zig");
+const banner_mod = @import("anole_banner");
 const console = @import("console/root.zig");
 const console_host = @import("console/host.zig");
 const anole_log = @import("anole_log");
@@ -92,6 +94,15 @@ const route_pattern = @import("dusty").route_pattern;
 
 /// The compile-time pattern check of a route that is not an ordinary
 /// handler route (WebSocket, WebTransport).
+/// The `(req, res)` handler of an `app.sse` route with these options.
+fn sseHandlerFor(comptime route_options: sse_mod.RouteOptions) fn (*http.Request, *http.Response) anyerror!void {
+    return struct {
+        fn handle(req: *http.Request, res: *http.Response) anyerror!void {
+            return sse_mod.serveRoute(req, res, route_options);
+        }
+    }.handle;
+}
+
 fn checkPattern(comptime method: []const u8, comptime path: []const u8) void {
     if (route_pattern.problem(path)) |p| @compileError("anole: route " ++ method ++ " " ++ path ++ ": " ++ route_pattern.comptimeMessage(p));
 }
@@ -120,6 +131,8 @@ const nats_mod = if (features.nats) @import("nats/root.zig") else struct {
     pub const Client = struct {};
 };
 const resilience_mod = @import("resilience/root.zig");
+const sse_mod = @import("sse/root.zig");
+const watch_mod = @import("watch/root.zig");
 const redis_mod = if (features.redis) @import("redis/root.zig") else struct {
     pub const Options = struct {};
     pub const Client = void;
@@ -140,8 +153,9 @@ const grpc_mod = if (features.grpc) @import("grpc/root.zig") else struct {
 /// `fast_accept`: an accept loop takes the connections waiting in its
 /// backlog directly, and the accept and spawn budgets grow with the run
 /// queue, so new connections, parked ones waking and new HTTP/2 streams are
-/// not left behind thousands of busy connections.
-pub const zio_options: zio.Options = .{ .scheduling = .pinned, .fast_accept = true, .diagnostics = true };
+/// not left behind thousands of busy connections. `debug_held_locks`, in
+/// Debug: a task that suspends while it holds a lock panics (SAFETY.md L2).
+pub const zio_options: zio.Options = .{ .scheduling = .pinned, .fast_accept = true, .diagnostics = true, .debug_held_locks = @import("builtin").mode == .debug };
 
 /// Anole's own build of zio is pinned by default (build.zig), so a program
 /// that declares no `zio_options` gets it; one that declares them must not
@@ -329,6 +343,89 @@ pub const Options = struct {
     /// 1024 per executor; `idle_timeout`, 90 s), its timeout (30 s), the
     /// CAs it trusts (`tls`), redirects and size limits.
     client: http.ClientOptions = .{},
+
+    // ---- p3/net ----
+    // ---- end p3/net ----
+
+    // ---- p3/jobs ----
+    // ---- end p3/jobs ----
+
+    // ---- p3/webhooks ----
+    // ---- end p3/webhooks ----
+
+    // ---- p3/realtime ----
+    // ---- end p3/realtime ----
+
+    // ---- p3/s3 ----
+    // ---- end p3/s3 ----
+
+    // ---- p3/smtp ----
+    // ---- end p3/smtp ----
+
+    // ---- p3/lambda ----
+    /// AWS Lambda (`deployment = .lambda`): where invocations come from
+    /// and how answers go back. Ignored by other deployments.
+    /// docs/lambda.md.
+    lambda: Lambda = .{},
+    // ---- end p3/lambda ----
+
+    // ---- p3/lambda ----
+    /// `Options.lambda` (also `anole.lambda.Options`).
+    pub const Lambda = struct {
+        /// The Runtime API, "host:port". Null: AWS_LAMBDA_RUNTIME_API, which
+        /// Lambda sets (and so does the Runtime Interface Emulator for local
+        /// runs). Set, it also wins over AWS_LAMBDA_HTTP_ENDPOINT.
+        runtime_api: ?[]const u8 = null,
+        /// How the function is invoked: `.buffered` (Invoke, API Gateway,
+        /// ALB, a Function URL with BUFFERED) or `.response_stream` (a
+        /// Function URL with RESPONSE_STREAM, or a REST API integration with
+        /// responseTransferMode STREAM). Null: ANOLE_LAMBDA_INVOKE_MODE, else
+        /// buffered. ALB, HTTP API and VPC Lattice events are always answered
+        /// buffered.
+        invoke_mode: ?InvokeMode = null,
+        /// Invocations served at once. Null: AWS_LAMBDA_MAX_CONCURRENCY
+        /// (Lambda Managed Instances), else 1.
+        concurrency: ?u16 = null,
+        /// Where events that are not HTTP requests go (SQS, SNS, S3,
+        /// EventBridge, schedules, DynamoDB streams, API Gateway WebSocket):
+        /// POSTed to this path, the event as a JSON body. A 2xx answer's body
+        /// is the invocation's result; any other status fails the invocation.
+        /// An HTTP request for this path gets 404. Null: such events fail the
+        /// invocation (Runtime.UnsupportedEvent).
+        event_path: ?[]const u8 = "/_lambda/event",
+        /// Taken off the front of every HTTP event's path: the base path of an
+        /// API Gateway custom domain mapping ("/v1"). Null: none.
+        base_path: ?[]const u8 = null,
+        /// Keep a named stage at the front of an HTTP API path
+        /// ("/prod/users"). Off: the app sees "/users", as locally.
+        keep_stage: bool = false,
+        /// Handlers get the invocation in the `x-amzn-request-context` and
+        /// `x-amzn-lambda-context` headers (as AWS Lambda Web Adapter sends
+        /// them). A client's own copies are removed either way.
+        context_headers: bool = true,
+        /// A request still running this long before the invocation's deadline
+        /// is canceled and answered 504, before Lambda's timeout ends the
+        /// environment.
+        deadline_margin: Duration = .fromMilliseconds(100),
+        /// Close idle outbound and database connections when an invocation
+        /// arrives this long after the last one ended: a frozen environment's
+        /// connections may have been dropped silently (a NAT gateway forgets
+        /// idle TCP after 350 s). Null: never.
+        idle_reset: ?Duration = .fromSeconds(300),
+        /// Register a no-op Lambda extension so that Lambda sends SIGTERM
+        /// (and allows 500 ms) before it shuts the environment down; without
+        /// any extension the process is killed with no warning. Not used on
+        /// Lambda Managed Instances.
+        sigterm: bool = true,
+        /// The most the shutdown after SIGTERM may take.
+        shutdown_timeout: Duration = .fromMilliseconds(400),
+        /// The most that sending finished spans may hold up the next
+        /// invocation (after the answer is sent, so clients don't wait).
+        flush_timeout: Duration = .fromMilliseconds(500),
+
+        pub const InvokeMode = enum { buffered, response_stream };
+    };
+    // ---- end p3/lambda ----
 
     /// `Options.timeouts`. A duration is null for none.
     pub const Timeouts = struct {
@@ -534,6 +631,11 @@ pub const Options = struct {
         /// `port`. A socket file left behind by a server that is gone is
         /// replaced; one that something still listens on is an error.
         unix: ?[]const u8 = null,
+        /// Permission bits for the socket file of a `unix` listener
+        /// (owner and group may connect; others may not). A client needs
+        /// write permission on the file. `0o666` opens it to every local
+        /// user; ignored on Windows and for abstract sockets.
+        unix_mode: u16 = 0o660,
         /// TLS with this certificate, or null for cleartext.
         tls: ?Tls = null,
         /// HTTP/1.1 (and 1.0).
@@ -551,6 +653,15 @@ pub const Options = struct {
         proxy_protocol: ?bool = null,
         /// As `Http.proxy_protocol_from`.
         proxy_protocol_from: []const []const u8 = &.{},
+        // ---- p3/net ----
+        /// Raw TCP instead of HTTP: `anole.net.tcp(Ctx, Handler, .{...})`, or
+        /// `app.tcp`. `http1`/`http2` are ignored; `http3 = true` is refused.
+        /// Needs a port (0: a free one) or `unix`. See docs/net.md.
+        tcp: ?net_mod.TcpService = null,
+        /// UDP instead of HTTP: `anole.net.udp(...)`, or `app.udp`. Not with
+        /// `tls`, `unix` or `proxy_protocol`.
+        udp: ?net_mod.UdpService = null,
+        // ---- end p3/net ----
 
         /// `Listener.tls`.
         pub const Tls = struct {
@@ -593,7 +704,7 @@ fn coreConfig(opts: Options, mode: *const modes.Resolved) http.ServerConfig {
             .keepalive = opts.timeouts.keepalive,
             .request_count = if (opts.limits.max_requests_per_connection) |n| n else null,
             .idle_park = opts.timeouts.idle_park,
-            .shutdown = opts.timeouts.shutdown,
+            .shutdown = if (webFunction(mode)) capDuration(opts.timeouts.shutdown, .fromMilliseconds(900)) else opts.timeouts.shutdown,
         },
         .request = .{
             .max_body_size = opts.limits.body_max,
@@ -612,6 +723,9 @@ fn coreConfig(opts: Options, mode: *const modes.Resolved) http.ServerConfig {
         .response = opts.response,
         .http2 = opts.http2,
         .listeners = &.{},
+        // Anole names every listener (127.0.0.1:8080 is its own default):
+        // an app with only UDP listeners has no TCP one.
+        .default_listener = false,
         .trusted_proxy_hops = opts.proxy.trusted_hops,
         .trusted_proxies = mode.trusted,
         .warn_untrusted_peer = mode.warn_untrusted_peer,
@@ -624,7 +738,21 @@ fn coreConfig(opts: Options, mode: *const modes.Resolved) http.ServerConfig {
             opts.limits.max_connections,
         .errors = opts.errors,
         .error_handler = opts.error_handler,
+        // A Lambda web function: Lambda names the request in this header.
+        .request_id_header = if (webFunction(mode)) "lambda-web-request-id" else null,
     };
+}
+
+/// `deployment = lambda` as a Lambda web function (AWS_LAMBDA_HTTP_ENDPOINT).
+fn webFunction(mode: *const modes.Resolved) bool {
+    const l = mode.lambda orelse return false;
+    return l.sub_mode == .web_function;
+}
+
+/// `d` at most `cap`; none becomes `cap`.
+fn capDuration(d: ?Duration, cap: Duration) ?Duration {
+    const v = d orelse return cap;
+    return if (v.nanoseconds > cap.nanoseconds) cap else v;
 }
 
 /// `Server(void)` with `init(gpa, options)`: a server without state, for
@@ -706,6 +834,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// listening sockets to pass on.
         process: ?std.process.Init.Minimal = null,
         held: []const handoff.Listener = &.{},
+        // ---- p3/net ----
+        /// The raw TCP listeners' services and the UDP listeners' sockets
+        /// (docs/net.md), freed with the server.
+        net_tcp: std.ArrayList(*net_mod.TcpListener) = .empty,
+        net_udp: std.ArrayList(*net_mod.UdpGroup) = .empty,
+        /// Why a raw listener's options were refused (the startup error's text).
+        net_why: ?[]const u8 = null,
+        /// A UDP listener's run failed.
+        net_failed: ?anyerror = null,
+        // ---- end p3/net ----
         restart_timeout: Duration = .fromSeconds(10),
         /// `Options.signals`.
         signals: bool = true,
@@ -730,6 +868,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         last_successor_pid: i32 = 0,
         /// `listenTls` set up the TLS listener (for the startup line).
         used_listen_tls: bool = false,
+        // ---- p3/lambda ----
+        /// When `init` began (real clock, ns): the Lambda adapter's
+        /// "ready in" is measured from it.
+        init_started_ns: i96 = 0,
+        /// `Options.lambda`.
+        lambda_options: Options.Lambda = .{},
+        /// Why the Lambda Runtime API failed (the startup error's text).
+        lambda_failure: ?[]const u8 = null,
+        // ---- end p3/lambda ----
         /// The TLS listeners' certificates, one per distinct source, for
         /// `reloadCertificates`; empty without a TLS listener.
         certs: []const *CertState = &.{},
@@ -770,6 +917,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             dirs: std.ArrayList(std.Io.Dir) = .empty,
             /// A WebTransport route exists: the HTTP/3 listener speaks it.
             webtransport: bool = false,
+            /// `app.sse` routes (for the plain-HTTP note at startup).
+            sse_routes: u32 = 0,
             /// The database connectors and response caches made here
             /// (`postgres`, `sqlite`, `mongodb`, `redis`, `responseCache`),
             /// in order.
@@ -801,10 +950,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// Writes the console's `/db` entry fields ("system", "name",
             /// "target", "pools") without the braces.
             describe: *const fn (context: *anyopaque, name: []const u8, w: *std.Io.Writer) anyerror!void,
+            /// Closes the connector's idle connections (under AWS Lambda,
+            /// after a long freeze); null when it has no pool to close.
+            closeIdle: ?*const fn (context: *anyopaque) void = null,
 
             fn systemOf(comptime T: type) []const u8 {
                 const n = @typeName(T);
-                inline for (.{ "postgres:pg", "sqlite:sqlite", "mongodb:mongodb", "redis:redis", "nats:nats", "kafka:kafka" }) |pair| {
+                inline for (.{ "postgres:pg", "sqlite:sqlite", "mongodb:mongodb", "redis:redis", "nats:nats", "kafka:kafka", "smtp:smtp", "s3:s3" }) |pair| {
                     const colon = comptime std.mem.indexOfScalar(u8, pair, ':').?;
                     if (std.mem.find(u8, n, pair[colon + 1 ..]) != null) return pair[0..colon];
                 }
@@ -827,7 +979,20 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         try w.print("\"system\":\"{s}\",\"name\":\"{s}\",\"target\":\"\",\"pools\":[]", .{ name, name });
                     }
                 };
-                return .{ .context = value, .start = Hooks.start, .deinit = Hooks.deinit, .describe = Hooks.describe, .name = comptime systemOf(T) };
+                const Idle = struct {
+                    fn closeIdle(context: *anyopaque) void {
+                        const v: *T = @ptrCast(@alignCast(context));
+                        _ = v.closeIdle();
+                    }
+                };
+                return .{
+                    .context = value,
+                    .start = Hooks.start,
+                    .deinit = Hooks.deinit,
+                    .describe = Hooks.describe,
+                    .name = comptime systemOf(T),
+                    .closeIdle = if (comptime @hasDecl(T, "closeIdle")) Idle.closeIdle else null,
+                };
             }
         };
 
@@ -977,6 +1142,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // zio binds the runtime to this thread (its first executor), and
             // a second runtime would take the thread over from the first.
             if (server_on_thread) return error.ServerAlreadyOnThread;
+            const init_started_ns = std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
             // systemd's notify socket is this process's to use, not its
             // children's: kept, and taken out of the environment.
             if (opts.process) |p| sd_notify.take(p.environ);
@@ -1020,8 +1186,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
             const console_config_text: []const u8 = if (features.console and console_resolved.enabled) renderConsoleConfig(a, &opts, mode) catch "" else "";
 
+            // Under AWS Lambda at one invocation at a time, one executor:
+            // one thread, the least memory, the fastest init.
+            var executors = opts.executors;
+            if (executors == .auto) if (mode.lambda) |l| if (l.executors) |n| {
+                executors = .exact(@intCast(n));
+            };
             const rt = try zio.Runtime.init(gpa, .{
-                .executors = opts.executors,
+                .executors = executors,
                 .stack_pool = .{
                     .maximum_size = opts.max_stack_size,
                     .committed_size = @min(opts.max_stack_size, 256 * 1024),
@@ -1084,13 +1256,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .blocking_pool = pool,
                 .extras = extras,
                 .mode = mode,
+                .init_started_ns = init_started_ns,
+                .lambda_options = opts.lambda,
             };
             // RFC 8470 §5.1: unsafe requests taken in early data (marked
             // `Early-Data: 1`, by the HTTP/3 endpoint or a proxy in front)
             // get 425 Too Early, on every route, with HTTP/3 or without:
             // a TLS-terminating proxy can forward the mark to any listener.
             // Now, before any route.
-            const h3_possible = features.http3 and (opts.http3 != null or mode.listen_tls_http3 or anyHttp3(opts.listeners));
+            const h3_possible = features.http3 and mode.deployment != .lambda and (opts.http3 != null or mode.listen_tls_http3 or anyHttp3(opts.listeners));
             {
                 const guard = try a.create(early_data.Guard);
                 guard.* = .{};
@@ -1098,7 +1272,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
             // Neither `http` nor `https`: `listen`, `listenTls` or `run`
             // sets up the listeners, `listeners` among them.
-            if (opts.http == null and opts.https == null) {
+            if ((opts.http == null and opts.https == null) or mode.deployment == .lambda) {
+                // Under AWS Lambda nothing opens here: `run` serves the
+                // invocations (or the web function's one listener).
                 self.pending = opts;
                 // `listenTls` turns HTTP/3 on once routes exist, when no
                 // middleware can be added any more: its `Alt-Svc` goes in
@@ -1136,7 +1312,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     return err;
                 };
             }
-            return modes.resolve(a, opts, e.environment, e.source, files, .process, why);
+            return modes.resolve(a, opts, e.environment, e.source, files, .process, .current, why);
         }
 
         /// `development` or `production`, as resolved at `init`.
@@ -1182,15 +1358,21 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             } });
             for (opts.listeners) |l0| {
                 var l = l0;
+                // A raw listener never takes the HTTP default port, and a
+                // UDP one no PROXY header.
+                const raw = l.tcp != null or l.udp != null;
                 if (l.unix == null) {
                     l.address = l.address orelse m.default_address;
-                    l.port = l.port orelse m.default_port;
-                    l.proxy_protocol = l.proxy_protocol orelse m.proxy_protocol_default;
+                    if (!raw) l.port = l.port orelse m.default_port;
+                    if (l.udp == null) l.proxy_protocol = l.proxy_protocol orelse m.proxy_protocol_default;
                 }
+                const kind: []const u8 = if (l.udp != null) "udp" else if (l.tcp != null) "tcp" else if (l.tls != null) "https" else "http";
                 var name = l.name orelse if (l.unix) |path|
                     try std.fmt.allocPrint(a, "unix-{s}", .{path})
+                else if (l.port) |p|
+                    try std.fmt.allocPrint(a, "{s}-{d}", .{ kind, p })
                 else
-                    try std.fmt.allocPrint(a, "{s}-{d}", .{ if (l.tls != null) "https" else "http", l.port.? });
+                    try std.fmt.allocPrint(a, "{s}", .{kind});
                 // A made-up name taken already (two on port 0): made unique.
                 if (l.name == null) for (specs.items) |other| {
                     if (std.mem.eql(u8, other.name, name)) {
@@ -1228,6 +1410,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         return error.InvalidProxyNetwork;
                     };
                 }
+                // ---- p3/net ----
+                if (l.tcp != null or l.udp != null) {
+                    try checkRaw(spec, why);
+                    continue;
+                }
+                // ---- end p3/net ----
                 if (!l.http1 and !l.http2) {
                     try why.print("listener \"{s}\" speaks neither HTTP/1.1 nor HTTP/2", .{spec.name});
                     return error.NoProtocols;
@@ -1262,6 +1450,62 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
         }
 
+        // ---- p3/net ----
+        /// A raw listener's options (`tcp`/`udp`): one kind, a port, no
+        /// HTTP/3, and for UDP no TLS, unix socket or PROXY header.
+        fn checkRaw(spec: Spec, why: *std.Io.Writer) !void {
+            const l = spec.listener;
+            if (l.tcp != null and l.udp != null) {
+                try why.print("listener \"{s}\" is both TCP and UDP; use two listeners", .{spec.name});
+                return error.TcpAndUdp;
+            }
+            if (comptime !features.net) {
+                try why.print("listener \"{s}\" is a raw TCP/UDP listener, which this build leaves out (-Dnet)", .{spec.name});
+                return error.NetNotBuilt;
+            }
+            if (l.http3) {
+                try why.print("listener \"{s}\": HTTP/3 cannot run on a raw TCP or UDP listener", .{spec.name});
+                return error.NetListenerHttp3;
+            }
+            if (l.port == null and l.unix == null) {
+                try why.print("listener \"{s}\" has no port; a raw listener never takes $PORT or the 8080 default", .{spec.name});
+                return error.NetListenerNeedsPort;
+            }
+            if (l.udp) |svc| {
+                if (l.tls != null) {
+                    try why.print("listener \"{s}\": UDP with TLS (DTLS) is not supported", .{spec.name});
+                    return error.UdpWithTls;
+                }
+                if (l.unix != null) {
+                    try why.print("listener \"{s}\": UDP cannot listen on a unix socket", .{spec.name});
+                    return error.UdpOnUnixSocket;
+                }
+                if (l.proxy_protocol == true) {
+                    try why.print("listener \"{s}\": the PROXY protocol does not apply to UDP", .{spec.name});
+                    return error.UdpWithProxyProtocol;
+                }
+                svc.options.check() catch {
+                    try why.print("listener \"{s}\": batch must be 1 to 64, max_datagram 1 to 65507, sockets 1 to 255", .{spec.name});
+                    return error.InvalidFraming;
+                };
+                if (!std.mem.eql(u8, svc.ctx_type, @typeName(Ctx))) {
+                    try why.print("listener \"{s}\": the UDP service was built for {s}, this server's state is {s}", .{ spec.name, svc.ctx_type, @typeName(Ctx) });
+                    return error.NetHandlerContext;
+                }
+            }
+            if (l.tcp) |svc| {
+                svc.options.check() catch {
+                    try why.print("listener \"{s}\": a framing max is 1 byte to 1 GiB, length prefixes are 1, 2 or 4 bytes, read_window 4 KiB to 64 KiB", .{spec.name});
+                    return error.InvalidFraming;
+                };
+                if (!std.mem.eql(u8, svc.ctx_type, @typeName(Ctx))) {
+                    try why.print("listener \"{s}\": the TCP service was built for {s}, this server's state is {s}", .{ spec.name, svc.ctx_type, @typeName(Ctx) });
+                    return error.NetHandlerContext;
+                }
+            }
+        }
+        // ---- end p3/net ----
+
         /// Whether a listener in `listeners` asks for HTTP/3.
         fn anyHttp3(listeners: []const Options.Listener) bool {
             for (listeners) |l| if (l.http3) return true;
@@ -1292,6 +1536,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 var why: std.Io.Writer = .fixed(&why_buf);
                 checkSpecs(specs, opts, self.mode, &why) catch |err| {
                     errors.log.err("{s}", .{why.buffered()});
+                    // The startup error's text says which listener.
+                    self.net_why = a.dupe(u8, why.buffered()) catch null;
                     return err;
                 };
             }
@@ -1303,12 +1549,24 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // Not on Windows (`handoff.supported`): there `process` only
             // carries the environment, and dusty binds as usual.
             const handoff_mode = opts.process != null and handoff.supported;
-            if (handoff_mode and specs.len > handoff.max_tcp_listeners) return error.TooManyListeners;
+            if (handoff_mode) {
+                var tcp_specs: usize = 0;
+                for (specs) |sp| tcp_specs += @intFromBool(sp.listener.udp == null);
+                if (tcp_specs > handoff.max_tcp_listeners) return error.TooManyListeners;
+            }
             const per_core_sockets = builtin.os.tag == .linux and !handoff_mode;
             const inherited = if (opts.process) |p| handoff.inherited(p.environ) else null;
             var held: std.ArrayList(handoff.Listener) = .empty;
             // Fixed now: the certificates and Alt-Svc point into it.
-            const listeners = try a.alloc(http.Listener, specs.len);
+            // UDP listeners are not the core's: it accepts TCP only.
+            var core_count: usize = 0;
+            for (specs) |sp| {
+                if (sp.listener.udp == null) core_count += 1;
+            }
+            const listeners = try a.alloc(http.Listener, core_count);
+            var core_next: usize = 0;
+            var h3_core: usize = 0;
+            const ctx_state: ?*anyopaque = if (Ctx == void) null else @ptrCast(server.ctx);
             // The certificates are read here, files included, and handed
             // to dusty (and HTTP/3) as PEM: a reload reads them again the
             // same way.
@@ -1318,8 +1576,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // Whether "" (every interface) can be one dual-stack socket:
             // asked once, when a listener names it.
             var dual: DualStack = .{};
-            for (specs, listeners, 0..) |spec, *out, i| {
+            for (specs, 0..) |spec, i| {
                 const l = spec.listener;
+                if (l.udp != null) {
+                    try self.openUdp(spec, ctx_state, &dual, &inherited, handoff_mode, &held);
+                    continue;
+                }
+                const out = &listeners[core_next];
+                core_next += 1;
                 var ipv6_only: ?bool = null;
                 const address: http.Address = if (l.unix) |path|
                     .{ .unix = try std.Io.net.UnixAddress.init(path) }
@@ -1346,15 +1610,37 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     };
                     try cs.listeners.append(a, out);
                     config = .{
-                        .alpn_protocols = t.alpn orelse defaultAlpn(l),
+                        // A raw listener offers ALPN only when told to.
+                        .alpn_protocols = t.alpn orelse if (l.tcp != null) &.{} else defaultAlpn(l),
                         .client_auth = t.client_auth,
                         .pem = .{ .cert = cs.pem.cert, .key = cs.pem.key },
                     };
                 }
-                if (l.http3) h3_at = i;
+                if (l.http3) {
+                    h3_at = i;
+                    h3_core = core_next - 1;
+                }
                 if (address == .unix and !handoff_mode) try clearStaleUnixSocket(rt_io, address.unix);
-                const fd = try listenerFd(rt_io, inherited, handoff_mode, spec.name, i, address, ipv6_only);
+                const fd = try listenerFd(rt_io, inherited, handoff_mode, spec.name, core_next - 1, address, ipv6_only, l.unix_mode);
                 if (fd) |f| try held.append(a, .{ .fd = f, .name = spec.name });
+                // ---- p3/net ----
+                var raw: ?*net_mod.TcpListener = null;
+                var raw_protocols: []const []const u8 = &.{};
+                if (l.tcp) |svc0| {
+                    var svc = svc0;
+                    if (svc.state == null) svc.state = ctx_state;
+                    const tl = try net_mod.TcpListener.create(gpa, rt_io, svc);
+                    errdefer tl.destroy();
+                    try self.net_tcp.append(a, tl);
+                    raw = tl;
+                    raw_protocols = switch (svc.options.framing) {
+                        .none => &.{},
+                        .lines => &.{"lines"},
+                        .length => &.{"length-prefixed"},
+                        .varint => &.{"varint-prefixed"},
+                    };
+                }
+                // ---- end p3/net ----
                 out.* = .{
                     .address = address,
                     .name = spec.name,
@@ -1362,6 +1648,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .http2_prior_knowledge = l.tls == null and l.http2 and features.http2,
                     .socket_per_acceptor = per_core_sockets and address == .ip,
                     .ipv6_only = ipv6_only,
+                    .unix_mode = if (address == .unix) l.unix_mode else null,
                     // Null only on a unix socket: the modes' default is for TCP listeners.
                     .proxy_protocol = l.proxy_protocol orelse false,
                     .proxy_protocol_from = from: {
@@ -1371,7 +1658,17 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     },
                     .tls = config,
                     .fd = fd,
+                    // ---- p3/net ----
+                    .raw = if (raw) |tl| &tl.raw else null,
+                    .max_connections = if (l.tcp) |svc| svc.options.max_connections else null,
+                    .handshake_timeout = if (l.tcp) |svc| svc.options.handshake_timeout else null,
+                    .extra_protocols = raw_protocols,
+                    // ---- end p3/net ----
                 };
+                if (l.tcp != null) {
+                    out.http1 = false;
+                    out.http2_prior_knowledge = false;
+                }
             }
 
             server.config.listeners = listeners;
@@ -1381,11 +1678,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (comptime features.http3) if (h3_at) |at| {
                 const q = opts.http3 orelse Options.Http3{};
                 const l = specs[at].listener;
-                const tcp = &listeners[at];
+                const tcp_listener = &listeners[h3_core];
                 const cs = for (certs.items) |cs| {
-                    if (std.mem.indexOfScalar(*http.Listener, cs.listeners.items, tcp) != null) break cs;
+                    if (std.mem.indexOfScalar(*http.Listener, cs.listeners.items, tcp_listener) != null) break cs;
                 } else unreachable;
-                cs.h3_listener = tcp;
+                cs.h3_listener = tcp_listener;
                 const client_auth = l.tls.?.client_auth;
                 // Mutual TLS: the same CAs and mode as the TCP listener,
                 // loaded once more here (dusty loads its own when it
@@ -1431,14 +1728,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     else
                         std.math.maxInt(u32),
                 }) catch |err| {
-                    failed_listener_index = at;
+                    failed_listener_index = h3_core;
                     return err;
                 };
                 errdefer ep.deinit();
                 endpoint = ep;
                 // Named in the TLS listener's startup line.
                 const udp_port = ep.address().getPort();
-                tcp.extra_protocols = if (udp_port == tcp.address.ip.getPort())
+                tcp_listener.extra_protocols = if (udp_port == tcp_listener.address.ip.getPort())
                     &.{"HTTP/3"}
                 else
                     try a.dupe([]const u8, &.{try std.fmt.allocPrint(a, "HTTP/3 on UDP port {d}", .{udp_port})});
@@ -1447,7 +1744,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 if (q.alt_svc) {
                     const alt = self.alt_svc orelse self.addAltSvc();
                     self.alt_svc = alt;
-                    alt.listener = tcp;
+                    alt.listener = tcp_listener;
                     alt.value = try std.fmt.allocPrint(a, "h3=\":{d}\"; ma=86400", .{udp_port});
                 }
             };
@@ -1455,6 +1752,44 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.h3 = endpoint;
             self.certs = certs.items;
         }
+
+        // ---- p3/net ----
+        /// Binds (or adopts) a UDP listener's sockets, in the order they are
+        /// handed over in.
+        fn openUdp(
+            self: *Self,
+            spec: Spec,
+            ctx_state: ?*anyopaque,
+            dual: *DualStack,
+            inherited: *const ?handoff.Inherited,
+            handoff_mode: bool,
+            held: *std.ArrayList(handoff.Listener),
+        ) !void {
+            const a = self.arena.allocator();
+            const l = spec.listener;
+            var svc = l.udp.?;
+            if (svc.state == null) svc.state = ctx_state;
+            const bind = try address_mod.resolve(l.address.?, l.port.?, l.address.?.len == 0 and dual.get());
+            // Sockets passed in by name only: a UDP socket is never found by
+            // its position among the TCP ones.
+            var fd_buf: [handoff.max_udp_sockets]handoff.Fd = undefined;
+            const fds: []const handoff.Fd = if (inherited.*) |*inh| inh.findAll(spec.name, std.math.maxInt(usize), &fd_buf) else &.{};
+            for (fds) |fd| handoff.checkInherited(fd, .datagram, true) catch |err| {
+                errors.log.err("inherited fd {any} for listener \"{s}\" is not a UDP socket", .{ fd, spec.name });
+                return err;
+            };
+            const g = try net_mod.UdpGroup.create(self.gpa, self.rt.io(), svc, spec.name, .{
+                .address = bind.ip,
+                .ipv6_only = bind.ipv6_only,
+                .fds = fds,
+                .executors = self.rt.executors.items.len,
+            });
+            errdefer g.destroy();
+            try self.net_udp.append(a, g);
+            if (handoff_mode) for (0..g.sockets.len) |j| try held.append(a, .{ .fd = g.socketFd(j), .name = spec.name });
+            std.log.scoped(.anole).info("listening on udp://{f} ({d} socket{s})", .{ g.address(), g.sockets.len, if (g.sockets.len == 1) "" else "s" });
+        }
+        // ---- end p3/net ----
 
         /// `address_mod.dualStackAvailable`, asked at most once.
         const DualStack = struct {
@@ -1483,7 +1818,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// The socket for one listener in hand-off mode: inherited if one
         /// was passed in under `name` (or at `index`), else opened here.
         /// Null outside hand-off mode (the core binds).
-        fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: http.Address, ipv6_only: ?bool) !?handoff.Fd {
+        fn listenerFd(io_: std.Io, inherited: ?handoff.Inherited, handoff_mode: bool, name: []const u8, index: usize, address: http.Address, ipv6_only: ?bool, mode: u16) !?handoff.Fd {
             if (!handoff_mode) return null;
             if (inherited) |inh| if (inh.find(name, index)) |fd| {
                 handoff.checkInherited(fd, .listener, address == .ip) catch |err| {
@@ -1502,6 +1837,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .unix => |unix| {
                     try clearStaleUnixSocket(io_, unix);
                     const s = try unix.listen(io_, .{});
+                    http.setUnixMode(io_, unix, mode);
                     return s.socket.handle;
                 },
             }
@@ -1537,6 +1873,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (extras.exporter) |e| e.deinit();
             if (comptime features.http3) if (self.h3) |ep| ep.deinit();
             self.server.deinit();
+            // ---- p3/net ----
+            for (self.net_udp.items) |g| g.destroy();
+            for (self.net_tcp.items) |t| t.destroy();
+            // ---- end p3/net ----
             // The databases, once nothing uses them: last made, first closed.
             var c = extras.connectors.items.len;
             while (c > 0) {
@@ -1591,6 +1931,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 errors.log.err("listen(\"{s}\"): not an address to listen on; use a port (\"3000\", every interface), \":3000\", or \"127.0.0.1:3000\" (this machine only)", .{address});
                 return err;
             };
+            if (self.mode.deployment == .lambda) {
+                self.mode.set_aside.listen = address;
+                try self.configure(opts);
+                return self.runInner();
+            }
             opts.http = .{ .address = at.host, .port = at.port };
             self.warnPlatformPort("listen", address, at.port);
             try self.configure(opts);
@@ -1614,6 +1959,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 errors.log.err("listenTls(\"{s}\"): not an address to listen on; use a port (\"443\", every interface), \":443\", or \"127.0.0.1:8443\" (this machine only)", .{address});
                 return err;
             };
+            if (self.mode.deployment == .lambda) {
+                self.mode.set_aside.listen_tls = address;
+                try self.configure(opts);
+                return self.runInner();
+            }
             opts.https = .{ .address = at.host, .port = at.port, .cert = cert };
             // Unless a listener in `listeners` serves HTTP/3 already.
             self.warnPlatformPort("listenTls", address, at.port);
@@ -1646,6 +1996,30 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// `waitReady`.
         fn configure(self: *Self, opts: Options) !void {
             self.pending = null;
+            if (self.mode.lambda) |l| {
+                // Lambda accepts no connections: what the options named is
+                // set aside (one startup line says what).
+                const sa = &self.mode.set_aside;
+                sa.http = opts.http != null;
+                sa.https = opts.https != null;
+                sa.http3 = opts.http3 != null;
+                for (opts.listeners) |li| {
+                    if (li.tcp != null) {
+                        sa.tcp += 1;
+                    } else if (li.udp != null) {
+                        sa.udp += 1;
+                    } else sa.listeners += 1;
+                }
+                if (l.sub_mode == .runtime_api) return;
+                // A web function: one HTTP/1.1 listener at the endpoint.
+                var web = opts;
+                web.http = .{ .address = self.mode.default_address, .port = self.mode.default_port, .h2c = false };
+                web.https = null;
+                web.http3 = null;
+                web.listeners = &.{};
+                self.listenOn(web) catch |err| return self.failStart(errors.toServerError(err));
+                return;
+            }
             self.listenOn(opts) catch |err| return self.failStart(errors.toServerError(err));
         }
 
@@ -1695,6 +2069,18 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 ctx.cause = self.extras.failed_cause;
             }
             if (err == error.RouteConflict) ctx.detail = self.router.conflict;
+            // ---- p3/lambda ----
+            if (err == error.LambdaRuntimeApiFailed) {
+                if (self.mode.lambda) |l| ctx.address = l.endpoint;
+                ctx.detail = self.lambda_failure;
+            }
+            // ---- end p3/lambda ----
+            // ---- p3/net ----
+            switch (err) {
+                error.NetNotBuilt, error.NetListenerNeedsPort, error.NetListenerHttp3, error.TcpAndUdp, error.UdpWithTls, error.UdpOnUnixSocket, error.UdpWithProxyProtocol, error.InvalidFraming, error.NetHandlerContext => ctx.detail = self.net_why,
+                else => {},
+            }
+            // ---- end p3/net ----
             return ctx;
         }
 
@@ -2170,6 +2556,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 g.server.enableWebTransport();
                 g.inner.get(path, webtransport_mod.route(Ctx, handler, accept));
             }
+            // ---- p3/realtime ----
+            /// `Server.sse` under this group (the group's prefix goes before `path`).
+            pub fn sse(g: Group, comptime path: []const u8, topics: *sse_mod.Topics, comptime route_options: sse_mod.RouteOptions) void {
+                if (comptime path.len > 0) comptime checkPattern("GET", path);
+                const data = g.server.arena.allocator().create(sse_mod.RouteData) catch @panic("OOM");
+                data.* = .{ .topics = topics };
+                g.server.extras.sse_routes += 1;
+                g.inner.addRouteWith(.get, path, Self.route(sseHandlerFor(route_options)), .{ .data = data });
+            }
+            // ---- end p3/realtime ----
             /// `Server.addRoute` under this group.
             pub fn addRoute(g: Group, method: ?http.Method, path: []const u8, comptime handler: anytype) void {
                 g.server.register(g.inner, method, path, handler);
@@ -2665,6 +3061,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             };
             const n = try nats_mod.Client.init(self.gpa, self.rt.io(), opts);
             errdefer n.deinit();
+            n.suppress_consumers = self.mode.deployment == .lambda;
             try self.extras.connectors.append(self.arena.allocator(), .of(nats_mod.Client, n));
             return n;
         }
@@ -2685,10 +3082,319 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             };
             const k = try kafka_mod.Client.init(self.gpa, self.rt.io(), opts);
             errdefer k.deinit();
+            k.suppress_consumers = self.mode.deployment == .lambda;
             try self.extras.connectors.append(self.arena.allocator(), .of(kafka_mod.Client, k));
             if (self.extras.connectors_started) try k.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return k;
         }
+
+        // ---- p3/net ----
+        /// Serves `handler` (callbacks or `fn (*Conn) !void`) on raw TCP at
+        /// `address` (":7000", "127.0.0.1:7000"), beside whatever else the
+        /// server serves. Before `listen`/`listenTls`/`run`, on a server
+        /// whose init named no listener (else `error.ListenersAlreadySet`:
+        /// put it in `.listeners`). See docs/net.md.
+        ///
+        ///     try app.tcp(":7000", Echo, .{});
+        pub fn tcp(self: *Self, address: []const u8, comptime handler: anytype, comptime opts: net_mod.Tcp.Options) errors.ServerError!void {
+            return self.addRaw("tcp", address, .{ .tcp = net_mod.tcp(Ctx, handler, opts) });
+        }
+
+        /// `tcp` with a whole listener (name, TLS, PROXY, unix socket); its
+        /// `tcp` and `udp` fields must be null.
+        pub fn tcpOn(self: *Self, listener: Options.Listener, comptime handler: anytype, comptime opts: net_mod.Tcp.Options) errors.ServerError!void {
+            var l = listener;
+            l.tcp = net_mod.tcp(Ctx, handler, opts);
+            return self.addRawListener("tcpOn", l);
+        }
+
+        /// Serves UDP datagrams to `handler` at `address`: one socket per
+        /// core on Linux, batched both ways. Handlers run inline and must
+        /// not wait. See docs/net.md.
+        pub fn udp(self: *Self, address: []const u8, comptime handler: type, comptime opts: net_mod.Udp.Options) errors.ServerError!void {
+            return self.addRaw("udp", address, .{ .udp = net_mod.udp(Ctx, handler, opts) });
+        }
+
+        pub fn udpOn(self: *Self, listener: Options.Listener, comptime handler: type, comptime opts: net_mod.Udp.Options) errors.ServerError!void {
+            var l = listener;
+            l.udp = net_mod.udp(Ctx, handler, opts);
+            return self.addRawListener("udpOn", l);
+        }
+
+        const RawKind = struct { tcp: ?net_mod.TcpService = null, udp: ?net_mod.UdpService = null };
+
+        fn addRaw(self: *Self, comptime what: []const u8, address: []const u8, kind: RawKind) errors.ServerError!void {
+            const at = address_mod.parse(address) catch {
+                errors.log.err(what ++ "(\"{s}\"): not an address to listen on; use \":7000\" (every interface) or \"127.0.0.1:7000\" (this machine only)", .{address});
+                return error.InvalidListenAddress;
+            };
+            return self.addRawListener(what, .{ .address = at.host, .port = at.port, .tcp = kind.tcp, .udp = kind.udp });
+        }
+
+        fn addRawListener(self: *Self, comptime what: []const u8, l: Options.Listener) errors.ServerError!void {
+            if (comptime !features.net) @compileError("app." ++ what ++ " needs raw TCP and UDP servers (-Dnet, on in the web and full profiles)");
+            const opts = &(self.pending orelse {
+                errors.log.err(what ++ "(): this server's listeners come from its init options (http, https); add it to .listeners, or leave both out of init", .{});
+                return error.ListenersAlreadySet;
+            });
+            const a = self.arena.allocator();
+            const list = a.alloc(Options.Listener, opts.listeners.len + 1) catch return error.OutOfMemory;
+            @memcpy(list[0..opts.listeners.len], opts.listeners);
+            list[opts.listeners.len] = l;
+            opts.listeners = list;
+        }
+
+        /// A UDP listener's first socket, for sends from elsewhere; null
+        /// before serving or for no such UDP listener.
+        pub fn udpSocket(self: *Self, listener: []const u8) ?*net_mod.UdpSocket {
+            for (self.net_udp.items) |g| if (std.mem.eql(u8, g.name, listener)) return &g.sockets[0];
+            return null;
+        }
+
+        /// Counters over every raw listener.
+        pub fn netStats(self: *const Self) net_mod.Stats {
+            var st: net_mod.Stats = .{};
+            for (self.net_tcp.items) |t| {
+                st.connections += t.stats.open.load(.monotonic);
+                st.connections_total += t.stats.total.load(.monotonic);
+                st.bytes_in += t.stats.bytes_in.load(.monotonic);
+                st.bytes_out += t.stats.bytes_out.load(.monotonic);
+            }
+            for (self.net_udp.items) |g| {
+                const t = g.totals();
+                st.datagrams_in += t.datagrams_in;
+                st.datagrams_out += t.datagrams_out;
+                st.datagrams_dropped += t.dropped;
+                st.sessions += t.sessions;
+            }
+            return st;
+        }
+        // ---- end p3/net ----
+
+        // ---- p3/jobs ----
+        const jobs_mod = if (features.jobs) @import("jobs/root.zig") else struct {
+            pub const Options = struct {};
+            pub const Client = void;
+        };
+
+        /// A durable job queue for the handlers, owned by the server
+        /// (`anole.jobs`): its store is a connector made with `postgres`,
+        /// `sqlite` or `redis` (or `.memory`, lost on restart). It starts
+        /// with serving, after its store, and is drained and closed with the
+        /// server. Register handlers with `jobs.handle(&app, Args, .{}, fn)`
+        /// before `run`. Under `deployment = lambda` it only enqueues.
+        pub fn jobs(self: *Self, config: jobs_mod.Options) !*jobs_mod.Client {
+            if (comptime !features.jobs) @compileError("app.jobs needs jobs (-Djobs, on in the web and full profiles)");
+            switch (config.store) {
+                .memory => {},
+                inline else => |store_client| {
+                    var known = false;
+                    for (self.extras.connectors.items) |k| {
+                        if (k.context == @as(*anyopaque, @ptrCast(store_client))) known = true;
+                    }
+                    if (!known) {
+                        std.log.scoped(.anole).err("jobs.store: a client made by this app (app.postgres, app.sqlite or app.redis)", .{});
+                        return error.InvalidOptions;
+                    }
+                },
+            }
+            const j = try jobs_mod.Client.init(self.gpa, self.rt.io(), config);
+            errdefer j.deinit();
+            j.suppress_workers = self.mode.deployment == .lambda;
+            j.drain_event = &self.server.draining;
+            try self.extras.connectors.append(self.arena.allocator(), .of(jobs_mod.Client, j));
+            if (self.extras.connectors_started) try j.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            return j;
+        }
+        // ---- end p3/jobs ----
+
+        // ---- p3/webhooks ----
+        /// Webhooks out: endpoints, signed deliveries run as jobs, retries,
+        /// and the delivery log, on `options.jobs`' store. Owned by the
+        /// server (started and freed with it). See `anole.webhooks`.
+        ///
+        ///     const hooks = try app.webhooks(.{ .jobs = jobs });
+        ///     _ = try hooks.publish(req, .{ .owner = "acme", .type = "invoice.paid" }, .{ .id = 7 });
+        pub fn webhooks(self: *Self, config: @import("webhooks/root.zig").Options) !*@import("webhooks/root.zig").Client {
+            if (comptime !features.webhooks) @compileError("app.webhooks needs webhooks (-Dwebhooks, on in the web and full profiles)");
+            const wh = @import("webhooks/root.zig");
+            const w = try wh.Client.init(self.gpa, self.rt.io(), config);
+            errdefer w.deinit();
+            try w.register(self);
+            try self.extras.connectors.append(self.arena.allocator(), .of(wh.Client, w));
+            if (self.extras.connectors_started) try w.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            return w;
+        }
+
+        /// A middleware that checks the signature of an incoming webhook
+        /// and drops duplicate deliveries; freed with the server. Panics
+        /// with the reason when the options are invalid (startup code).
+        ///
+        ///     const hook = app.webhookVerify(.{ .preset = .stripe, .secrets = &.{secret} });
+        ///     app.with(.{hook}).post("/hooks/stripe", stripeHook);
+        pub fn webhookVerify(self: *Self, config: @import("webhooks/root.zig").Verify.Options) *@import("webhooks/root.zig").Verify {
+            if (comptime !features.webhooks) @compileError("app.webhookVerify needs webhooks (-Dwebhooks, on in the web and full profiles)");
+            const wh = @import("webhooks/root.zig");
+            const v = wh.Verify.init(self.gpa, self.rt.io(), config) catch |err| @panic(@errorName(err));
+            self.extras.connectors.append(self.arena.allocator(), .of(wh.Verify, v)) catch @panic("OOM");
+            return v;
+        }
+        // ---- end p3/webhooks ----
+
+        // ---- p3/realtime ----
+        /// A set of server-sent-event topics owned by the server: metrics
+        /// (with `app.metrics`), the drain (every subscriber gets a
+        /// `retry:` and its stream ends), freed with the server. Serve it
+        /// with `app.sse` or `topics.serve` in a handler, and publish with
+        /// `topics.publish`. See `anole.sse`.
+        ///
+        ///     const live = try app.sseTopics(.{});
+        ///     app.sse("/orders/live", live, .{ .topics = &.{"orders"} });
+        pub fn sseTopics(self: *Self, topic_options: sse_mod.Topics.Options) !*sse_mod.Topics {
+            const topics = try sse_mod.Topics.create(self.gpa, topic_options);
+            errdefer topics.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(sse_mod.Topics, topics));
+            topics._registerDrain(self.rt.io(), &self.server.drain_hooks);
+            if (self.extras.connectors_started) try topics.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            return topics;
+        }
+
+        /// GET `path`: an event stream subscribed to `options.topics`,
+        /// where a `{name}` is the route parameter `name`
+        /// (`"room:{room}"` on `/rooms/:room/events`; a name the path
+        /// lacks is a compile error). Over HTTP/1.1 and HTTP/2 an idle
+        /// subscriber holds no task. A handler that decides the topics
+        /// itself calls `topics.serve`.
+        ///
+        ///     app.sse("/rooms/:room/events", live, .{ .topics = &.{ "news", "room:{room}" } });
+        pub fn sse(self: *Self, comptime path: []const u8, topics: *sse_mod.Topics, comptime route_options: sse_mod.RouteOptions) void {
+            comptime checkPattern("GET", path);
+            comptime if (!sse_mod.templatesMatch(path, route_options)) @compileError("anole: app.sse " ++ path ++ ": a {name} in the topics is not a parameter of the path");
+            const data = self.arena.allocator().create(sse_mod.RouteData) catch @panic("OOM");
+            data.* = .{ .topics = topics };
+            self.extras.sse_routes += 1;
+            if (comptime features.openapi) self.recordRoute(self.router, .get, path, sseHandlerFor(route_options));
+            self.router.addRouteWith(.get, path, route(sseHandlerFor(route_options)), .{ .data = data });
+        }
+
+        /// A development run with `app.sse` routes and only plain
+        /// listeners: browsers speak HTTP/2 only over TLS, so each tab's
+        /// stream uses one of its six HTTP/1.1 connections per host.
+        fn sseNote(self: *const Self) void {
+            if (self.extras.sse_routes == 0 or self.certs.len > 0 or self.mode.environment != .development) return;
+            std.log.scoped(.anole).info("server-sent events are served over plain HTTP/1.1 here: browsers use HTTP/2 only over TLS (listenTls), and HTTP/1.1 allows six connections per host, one per open tab's stream", .{});
+        }
+
+        /// Watches `source` for changes (PostgreSQL LISTEN/NOTIFY, Redis
+        /// pub/sub or a stream, MongoDB change streams) and feeds SSE and
+        /// WebSocket topics with them, with no handler in between. The
+        /// server starts it when serving starts, after the database clients
+        /// it reads, stops it at the drain, and frees it. See `anole.watch`.
+        ///
+        ///     _ = try app.watch(.{ .postgres = .{ .client = db, .channels = &.{"orders"} } }, .{
+        ///         .to = &.{.{ .sse = .{ .topics = live, .topic = "orders" } }},
+        ///     });
+        pub fn watch(self: *Self, source: watch_mod.Source, watch_options: watch_mod.Options) !*watch_mod.Watch {
+            const w = try watch_mod.Watch.init(self.gpa, self.rt.io(), source, watch_options);
+            errdefer w.deinit();
+            if (self.mode.deployment == .lambda) {
+                w.disabled = true;
+                std.log.scoped(.anole).info("watch \"{s}\": not started under the lambda deployment (a function holds no long-lived connection to a database)", .{w.name});
+            }
+            try self.extras.connectors.append(self.arena.allocator(), .of(watch_mod.Watch, w));
+            w._registerDrain(&self.server.drain_hooks);
+            if (self.extras.connectors_started) try w.start(self.extras.metrics, null, null);
+            return w;
+        }
+        // ---- end p3/realtime ----
+
+        // ---- p3/s3 ----
+        const s3_mod = if (features.s3) @import("s3/root.zig") else struct {
+            pub const Options = struct {};
+            pub const Client = void;
+        };
+
+        /// An S3-compatible object store for the handlers (AWS S3,
+        /// Cloudflare R2, MinIO, Backblaze B2, Supabase Storage), owned by
+        /// the server: `state.files = try app.s3(.{});` reads the AWS SDKs'
+        /// environment (AWS_ENDPOINT_URL_S3, AWS_REGION, AWS_ACCESS_KEY_ID,
+        /// AWS_SECRET_ACCESS_KEY...) and S3_BUCKET. Credentials are resolved
+        /// when serving starts (a start that finds none fails, naming every
+        /// source it tried). Once serving it reports to `app.metrics`,
+        /// `app.tracing` and, with `readiness`, `app.health`, and it is
+        /// drained and closed with the server. See `anole.s3`.
+        pub fn s3(self: *Self, config: s3_mod.Options) !*s3_mod.Client {
+            if (comptime !features.s3) @compileError("app.s3 needs the S3 client (-Ds3, on in the web and full profiles)");
+            var opts = config;
+            if (opts.environ == null) if (self.process) |p| {
+                opts.environ = p.environ;
+            };
+            const c = try s3_mod.Client.init(self.gpa, self.rt.io(), opts);
+            errdefer c.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(s3_mod.Client, c));
+            if (self.extras.connectors_started) try c.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            return c;
+        }
+        // ---- end p3/s3 ----
+
+        // ---- p3/smtp ----
+        const smtp_mod = if (features.smtp) @import("smtp/root.zig") else struct {
+            pub const Options = struct {};
+            pub const Client = struct {};
+        };
+
+        /// An SMTP client for sending mail, owned by the server:
+        /// `state.mail = try app.smtp(.{});` reads `SMTP_URL`
+        /// (`smtp://user:pass@host:587` for STARTTLS, `smtps://` for TLS from
+        /// the first byte), else sends to Mailpit's `smtp://127.0.0.1:1025`
+        /// outside production; in production a missing `SMTP_URL` is
+        /// `error.InvalidOptions`. Nothing connects before the first send.
+        /// Once serving, it reports to `app.metrics`, `app.tracing` and
+        /// `app.health` when the app has them, and is drained and closed with
+        /// the server. See `anole.smtp`.
+        pub fn smtp(self: *Self, config: smtp_mod.Options) !*smtp_mod.Client {
+            if (comptime !features.smtp) @compileError("app.smtp needs SMTP (-Dsmtp, on in the web and full profiles)");
+            var opts = config;
+            if (opts.environ == null) if (self.process) |p| {
+                opts.environ = p.environ;
+            };
+            if (opts.environment == null) opts.environment = self.environment();
+            const m = try smtp_mod.Client.init(self.gpa, self.rt.io(), opts);
+            errdefer m.deinit();
+            try self.extras.connectors.append(self.arena.allocator(), .of(smtp_mod.Client, m));
+            if (self.extras.connectors_started) try m.start(self.extras.metrics, self.extras.exporter, self.extras.health);
+            return m;
+        }
+        // ---- end p3/smtp ----
+
+        // ---- p3/lambda ----
+        /// For the Lambda adapter: what `run` does before serving (the
+        /// helper routes, the OpenAPI document, the conflict check, the
+        /// connectors), returning the error rather than logging it, so the
+        /// adapter can report it to Lambda first.
+        pub fn _lambdaPrepare(self: *Self) !void {
+            self.addHelperRoutes();
+            if (comptime features.openapi) if (self.extras.openapi_failed) |err| return err;
+            if (self.router.conflict != null) return error.RouteConflict;
+            self.startConnectors() catch return error.DatabaseUnavailable;
+        }
+
+        /// Closes the idle connections of the outbound client and of every
+        /// connector that has a pool (the Lambda adapter, after a freeze).
+        pub fn closeIdleConnections(self: *Self) void {
+            self.extras.client.closeIdle();
+            for (self.extras.connectors.items) |c| if (c.closeIdle) |f| f(c.context);
+        }
+
+        /// The line naming what `deployment = lambda` set aside, if anything.
+        fn logSetAside(self: *const Self) void {
+            var buf: [512]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            modes.writeSetAside(self.mode, &w) catch return;
+            const line = std.mem.trimEnd(u8, w.buffered(), "\n");
+            if (line.len > 0) std.log.scoped(.anole).info("{s}", .{line});
+        }
+        // ---- end p3/lambda ----
 
         /// Loads every TLS listener's certificate and key again (from their
         /// files, for `.files`) and their client CAs (`client_auth`, from
@@ -2768,8 +3474,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             var quic: if (features.http3) ?h3.TlsContext else void = if (features.http3) null else {};
             if (comptime features.http3) if (self.h3) |ep| {
                 for (self.certs, next) |cs, n| {
-                    const tcp = cs.h3_listener orelse continue;
-                    const client_auth = tcp.tls.?.client_auth;
+                    const tcp_listener = cs.h3_listener orelse continue;
+                    const client_auth = tcp_listener.tls.?.client_auth;
                     var client_ca: ?std.crypto.Certificate.Bundle = null;
                     defer if (client_ca) |*b| b.deinit(gpa);
                     if (client_auth) |ca| client_ca = try ca.ca.load(gpa, self.rt.io());
@@ -2983,8 +3689,22 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 const env = self.openapiEnv();
                 if (env.out != null or env.check != null) return self.openapiTool(env);
             }
+            // ---- p3/lambda ----
+            if (self.mode.lambda) |l| {
+                self.logSetAside();
+                if (l.sub_mode == .runtime_api) {
+                    if (comptime !features.lambda) unreachable;
+                    // Lambda's INIT phase: no banner (nothing listens); the
+                    // adapter writes the deployment line once it is ready.
+                    self.logModes();
+                    logBuildMode(self.mode.debug_production);
+                    return lambda_serve.serve(Ctx, self);
+                }
+            }
+            // ---- end p3/lambda ----
             self.printBanner();
             self.logModes();
+            self.sseNote();
             logBuildMode(self.mode.debug_production);
             self.addHelperRoutes();
             if (comptime features.openapi) if (self.extras.openapi_failed) |err| {
@@ -3006,8 +3726,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 h3: anyerror!void,
                 reload: anyerror!void,
                 restart_cmd: anyerror!void,
+                net: anyerror!void,
             };
-            var done_buf: [8]Done = undefined;
+            var done_buf: [9]Done = undefined;
             var sel = std.Io.Select(Done).init(rt_io, &done_buf);
             if (self.signals) {
                 try sel.concurrent(.int, waitForSignal, .{.interrupt});
@@ -3016,6 +3737,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             try sel.concurrent(.stop, waitStopped, .{ self.stopped, rt_io });
             // The live console: its socket and rings, and what it may ask of
             // this loop (/restart).
+            // ---- p3/net ----
+            self.attachNetMetrics();
+            // ---- end p3/net ----
             self.startConsole();
             defer if (self.console != null) self.stopConsole(false);
             if (self.console != null) {
@@ -3027,6 +3751,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             defer if (announce) |*f| f.cancel(rt_io);
             try sel.concurrent(.served, serve, .{self.server});
             if (comptime features.http3) if (self.h3) |ep| try sel.concurrent(.h3, serveH3, .{ep});
+            if (self.net_udp.items.len > 0) try sel.concurrent(.net, serveNet, .{self});
             // Windows has neither SIGUSR2 nor SIGHUP (zio maps Ctrl-C to
             // `.interrupt` and closing the console to `.terminate`): no
             // restart, and certificates reload by `reloadCertificates` only.
@@ -3067,13 +3792,14 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // The console says goodbye before the drain, and the terminal is
             // back for what the drain logs.
             switch (first) {
-                .served, .h3 => self.stopConsole(false),
+                .served, .h3, .net => self.stopConsole(false),
                 else => self.stopConsole(true),
             }
             if (first == .restart or first == .restart_cmd) {
                 // HTTP/3 cannot drain beside the successor on one UDP
                 // socket: its connections close now and it stops reading.
                 if (comptime features.http3) if (self.h3) |ep| ep.handOver();
+                for (self.net_udp.items) |g| g.handOver();
             } else if (self.process) |p| {
                 sd_notify.stopping(p.environ);
             }
@@ -3082,7 +3808,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // Cancels the server's run, which drains, then the watchers.
             sel.cancelDiscard();
             switch (first) {
-                .served, .h3 => |r| return r,
+                .served, .h3, .net => |r| return r,
                 .reload => unreachable,
                 .int, .term => log.info("signal received ({t}); drained and stopped", .{first}),
                 .restart, .restart_cmd => log.info("handed over to the new process; drained and stopped", .{}),
@@ -3190,29 +3916,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .unix => {},
                 }
             }
-            var buf: [1024]u8 = undefined;
-            var w: std.Io.Writer = .fixed(&buf);
-            banner_mod.write(&w, info, banner_mod.styleFor(terminalColumns(dbg_io), env)) catch return;
+            const style = banner_mod.styleFor(banner_mod.terminalColumns(dbg_io, std.Io.File.stderr()), env, banner_mod.coin(dbg_io));
             const prev = dbg_io.swapCancelProtection(.blocked);
             defer _ = dbg_io.swapCancelProtection(prev);
-            var lock_buf: [64]u8 = undefined;
+            // Straight to stderr under its lock: the blocks are ~5 KiB.
+            var lock_buf: [1024]u8 = undefined;
             const t = std.debug.lockStderr(&lock_buf).terminal();
             defer std.debug.unlockStderr();
-            t.writer.writeAll(w.buffered()) catch return;
+            banner_mod.write(t.writer, info, style) catch return;
             t.writer.flush() catch {};
-        }
-
-        /// The width of the terminal on stderr, or null when unknown.
-        fn terminalColumns(dbg_io: std.Io) ?usize {
-            if (comptime builtin.os.tag == .windows) return null;
-            var size: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-            const result = (dbg_io.operate(.{ .device_io_control = .{
-                .file = std.Io.File.stderr(),
-                .code = std.posix.T.IOCGWINSZ,
-                .arg = &size,
-            } }) catch return null).device_io_control;
-            if (result < 0 or size.col == 0) return null;
-            return size.col;
         }
 
         /// The startup lines about the environment and deployment
@@ -3271,6 +3983,53 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         fn serve(server: *http.Server(Ctx)) anyerror!void {
             return server.run();
         }
+
+        // ---- p3/net ----
+        /// The raw listeners' Prometheus series, when the app has metrics
+        /// (`app.metrics`): one label set per listener.
+        fn attachNetMetrics(self: *Self) void {
+            const registry = self.extras.metrics orelse return;
+            for (self.net_tcp.items, 0..) |t, i| {
+                if (t.series != null) continue;
+                t.series = net_mod.metrics.TcpSeries.init(registry, self.arena.allocator(), self.tcpName(i)) catch null;
+            }
+            for (self.net_udp.items) |g| {
+                if (g.series != null) continue;
+                g.series = net_mod.metrics.UdpSeries.init(registry, self.arena.allocator(), g.name) catch null;
+            }
+        }
+
+        /// The name of the `i`th raw TCP listener.
+        fn tcpName(self: *const Self, i: usize) []const u8 {
+            var n: usize = 0;
+            for (self.server.config.listeners) |l| if (l.raw != null) {
+                if (n == i) return l.name;
+                n += 1;
+            };
+            return "tcp";
+        }
+
+        /// Every UDP listener's tasks, until canceled; a listener that fails
+        /// to run ends the server with that error.
+        fn serveNet(self: *Self) anyerror!void {
+            const rt_io = self.rt.io();
+            var tasks: std.Io.Group = .init;
+            defer tasks.cancel(rt_io);
+            for (self.net_udp.items) |g| tasks.concurrent(rt_io, runUdp, .{ self, g }) catch return error.SystemResources;
+            tasks.await(rt_io) catch return error.Canceled;
+            if (self.net_failed) |err| return err;
+        }
+
+        fn runUdp(self: *Self, g: *net_mod.UdpGroup) std.Io.Cancelable!void {
+            g.run() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => {
+                    std.log.scoped(.anole).err("udp listener \"{s}\" stopped: {t}", .{ g.name, err });
+                    self.net_failed = err;
+                },
+            };
+        }
+        // ---- end p3/net ----
 
         fn serveH3(ep: if (features.http3) *h3.Endpoint(Ctx) else void) anyerror!void {
             if (comptime features.http3) return ep.run();
@@ -4032,10 +4791,17 @@ test "anole.Server: several listeners: h1 + h2c, TLS h1 only, h2c only, TLS h2 +
             var name_buf: [128]u8 = undefined;
             try std.testing.expect(std.mem.endsWith(u8, resp, try std.fmt.bufPrint(&name_buf, "on unix-{s}", .{path})));
 
-            // TLS, HTTP/2 only: a client that offers HTTP/1.1 alone (as
-            // the HTTP client does by default) is not served.
+            // TLS, HTTP/2 only: a client that offers HTTP/1.1 alone is not
+            // served; the HTTP client offers h2 by default and is.
             const h2tls = addrs[6].ip.getPort();
-            try std.testing.expect(std.meta.isError(client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{h2tls}), .{})));
+            {
+                var h1_only = http.Client.init(alloc, io_, .{ .tls = .{ .ca = ca }, .http2 = false });
+                defer h1_only.deinit();
+                try std.testing.expect(std.meta.isError(h1_only.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{h2tls}), .{})));
+                var r = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{h2tls}), .{});
+                defer r.deinit();
+                try std.testing.expectEqualStrings("on h2tls", (try r.body()).?);
+            }
             try expectH2(try h2c.ClientConnection.connect(alloc, io_, .{
                 .host = "localhost",
                 .port = h2tls,
@@ -4148,7 +4914,7 @@ fn testMode(a: std.mem.Allocator, opts: Options) !*const modes.Resolved {
     var buf: [512]u8 = undefined;
     var why: std.Io.Writer = .fixed(&buf);
     const m = try a.create(modes.Resolved);
-    m.* = try modes.resolve(a, &opts, .production, .tests, null, .process, &why);
+    m.* = try modes.resolve(a, &opts, .production, .tests, null, .process, .current, &why);
     return m;
 }
 

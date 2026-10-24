@@ -576,6 +576,57 @@ fn decodeChunks(arena: std.mem.Allocator, text: []const u8) ![]u8 {
     return out.items;
 }
 
+test "gRPC-Web over HTTP/1.1: a deadline that cancels the handler is answered DEADLINE_EXCEEDED, its cancel consumed" {
+    // HTTP/1.1, where the request's timer cancels the handler at the call's
+    // deadline (an AutoCancel) and the connection's task then writes the
+    // answer: a cancel swallowed there parks it on that write, which zio's
+    // debug_cancel reports and the test runner fails (SAFETY.md C3). The
+    // deadline's own cancel is claimed instead (Request._claimTimeoutCancel).
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }},
+    }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Echo, .{
+        .Unary = unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    });
+    var server_future = try io.concurrent(struct {
+        fn run(srv: *dusty.Server(void)) !void {
+            try srv.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    // One message, EchoRequest{ message: "slow" }: the handler sleeps 2 s.
+    const request = "POST /anole.test.Echo/Unary HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/grpc-web+proto\r\n" ++
+        "Grpc-Timeout: 100m\r\nContent-Length: 11\r\n\r\n" ++ "\x00\x00\x00\x00\x06\x0a\x04slow";
+    var wbuf: [512]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll(request);
+    try w.interface.flush();
+    var rbuf: [4096]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(gpa);
+    // Until the trailer frame (gRPC-Web carries the status in the body).
+    while (std.mem.indexOf(u8, got.items, "grpc-status:") == null) {
+        r.interface.fillMore() catch break;
+        try got.appendSlice(gpa, r.interface.buffered());
+        r.interface.toss(r.interface.bufferedLen());
+    }
+    try std.testing.expect(std.mem.startsWith(u8, got.items, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.indexOf(u8, got.items, "grpc-status:4") != null);
+}
+
 test "gRPC client: every call mode, an error status, a client deadline and metadata" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });

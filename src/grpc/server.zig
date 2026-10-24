@@ -1,4 +1,4 @@
-//! Serving zig-protobuf services over HTTP/2: `register` turns a service's
+//! Serving zig-protobuf services over HTTP/2 and HTTP/3: `register` turns a service's
 //! generated method table, instantiated with `Call` as its user data,
 //!
 //!     const Echo = echo_pb.Echo(anole.grpc.Call, anyerror);
@@ -75,7 +75,7 @@ pub const RegisterOptions = struct {
     /// send on every call whether or not they compress themselves.
     response_compression: ResponseCompression = .mirror,
     /// The unary methods' handlers never wait (see `anole.noWait`): no
-    /// database, cache or other service, no sleeping. Over HTTP/2 a call
+    /// database, cache or other service, no sleeping. Over HTTP/2 and HTTP/3 a call
     /// that arrives whole in one read then runs right where the connection
     /// reads it, without a task, and its `grpc-timeout` is not enforced
     /// (it has nothing to wait for). Streaming methods keep their tasks.
@@ -263,7 +263,7 @@ pub const Call = struct {
     }
 
     /// The client went away (reset the stream or closed the connection),
-    /// or the deadline passed. On HTTP/2 under zio the handler is canceled
+    /// or the deadline passed. On HTTP/2 and HTTP/3 under zio the handler is canceled
     /// then anyway (its next wait returns `error.Canceled`); this is for
     /// work that does not wait, and for other runtimes and protocols.
     pub fn cancelled(self: *Call) bool {
@@ -300,9 +300,10 @@ pub const MethodKind = enum { unary, server_streaming, client_streaming, bidi_st
 
 /// The protocols one route serves, told apart by the content type.
 pub const Protocol = enum {
-    /// gRPC over HTTP/2: length-prefixed messages, status in trailers.
+    /// gRPC over HTTP/2 or HTTP/3 (gRFC G2): length-prefixed messages,
+    /// status in trailers.
     grpc,
-    /// gRPC-Web (HTTP/1.1 or 2): the status in a final body frame.
+    /// gRPC-Web (HTTP/1.1, 2 or 3): the status in a final body frame.
     grpc_web,
     /// gRPC-Web with the body base64-encoded.
     grpc_web_text,
@@ -485,8 +486,9 @@ pub fn begin(
         res.status = .unsupported_media_type;
         return error.Answered;
     };
-    // gRPC proper needs HTTP/2's trailers; gRPC-Web and Connect do not.
-    if (kind.protocol == .grpc and req.version_major != 2) {
+    // gRPC proper needs trailers: HTTP/2 or HTTP/3 (gRFC G2). gRPC-Web and
+    // Connect do not.
+    if (kind.protocol == .grpc and req.version_major < 2) {
         res.status = .http_version_not_supported;
         return error.Answered;
     }
@@ -658,11 +660,17 @@ fn acceptEncoding() []const u8 {
 /// one this maps (a canceled call, a message over the limit, a frame that
 /// does not decode...), UNKNOWN for any other.
 pub fn finish(call: *Call, result: anyerror!void) !void {
+    // A cancel the call's deadline did not make (the server stopping, the
+    // stream reset) stays the task's: re-armed once the status is out
+    // (SAFETY.md C3). The deadline's own is consumed: the call answers it.
+    var rearm = false;
+    defer if (rearm) call.io.recancel();
     const protection = call.io.swapCancelProtection(.blocked);
     defer _ = call.io.swapCancelProtection(protection);
     if (result) |_| {} else |err| switch (err) {
         error.GrpcStatus => {},
         error.Canceled => {
+            rearm = !call.req._claimTimeoutCancel();
             if (call.deadlineExceeded()) {
                 call.status = .deadline_exceeded;
                 call.status_message = "deadline exceeded";
@@ -697,6 +705,8 @@ pub fn finish(call: *Call, result: anyerror!void) !void {
             call.status = .unimplemented;
             call.status_message = "more than one request message for a unary method";
         },
+        // `Response.abort`: the stream is reset, with no status to send.
+        error.ResponseAborted => return err,
         // The peer is gone: nothing can be told.
         error.ConnectionResetByPeer, error.BrokenPipe => return,
         else => {

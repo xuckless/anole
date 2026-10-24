@@ -43,6 +43,9 @@
 //! - `middleware`, `func` and `Next`: built-in and hand-written middleware.
 //! - `websocket`, `webtransport`, `grpc`: the other protocols.
 //! - `db` and the connectors `pg`, `sqlite`, `mongodb`, `redis`.
+//! - `nats` and `kafka` (brokers), `s3` and `smtp` (storage and mail),
+//!   `jobs`, `cron` and `webhooks` (background work), `sse` and `watch`
+//!   (live updates), `net` (raw TCP and UDP), `lambda` (AWS Lambda).
 //! - `auth`, `session`, `ratelimit`, `early_data`: access control.
 //! - `observe`: metrics, traces, access logs and health checks.
 //! - `client`, `h2`, `h3`: outbound HTTP; `tls`: certificates.
@@ -340,14 +343,44 @@ pub const nats = if (features.nats) @import("nats/root.zig") else struct {};
 /// and Extended JSON, as the MongoDB client reads and writes them.
 pub const bson = if (features.mongodb) @import("bson") else struct {};
 
-/// Outbound connections for the database clients: `ClientStream`, TCP or
-/// a Unix socket, plain or TLS on BoringSSL.
-pub const net = struct {
-    /// A connected stream: `connect`, then its reader and writer.
-    pub const ClientStream = @import("net/client_stream.zig").ClientStream;
-    /// Where and how `ClientStream.connect` connects.
-    pub const ConnectOptions = @import("net/client_stream.zig").ConnectOptions;
+/// Raw network I/O: outbound connections for the database clients
+/// (`ClientStream`, TCP or a Unix socket, plain or TLS on BoringSSL), and
+/// with `-Dnet` raw TCP and UDP servers beside HTTP.
+pub const net = @import("net/root.zig");
+
+/// Durable background jobs (`-Djobs`): retries, delays, unique jobs and
+/// workers, stored in memory, SQLite, PostgreSQL or Redis.
+pub const jobs = if (features.jobs) @import("jobs/root.zig") else struct {};
+
+/// Cron schedules (`-Djobs`), with or without a jobs store.
+pub const cron = if (features.jobs) @import("cron/root.zig") else struct {};
+
+/// Webhooks (`-Dwebhooks`): signed deliveries out, as jobs, and the
+/// `Verify` middleware for incoming ones.
+pub const webhooks = if (features.webhooks) @import("webhooks/root.zig") else struct {};
+
+/// S3-compatible object storage (`-Ds3`): AWS S3, R2, MinIO, B2, Supabase.
+pub const s3 = if (features.s3) @import("s3/root.zig") else struct {};
+
+/// Sending mail over SMTP (`-Dsmtp`).
+pub const smtp = if (features.smtp) @import("smtp/root.zig") else struct {};
+
+/// The AWS Lambda adapter (`-Dlambda`): `deployment = lambda`.
+pub const lambda = if (features.lambda) @import("lambda/root.zig") else struct {
+    pub const Options = ServerOptions.Lambda;
+    /// Always null in a build without the adapter.
+    pub fn context(req: *const http.Request) ?*const anyopaque {
+        _ = req;
+        return null;
+    }
 };
+
+/// Server-sent events with topics, heartbeats and `Last-Event-ID` replay.
+pub const sse = @import("sse/root.zig");
+
+/// Database changes (PostgreSQL, Redis, MongoDB) fed into SSE and
+/// WebSocket topics or handlers.
+pub const watch = @import("watch/root.zig");
 
 /// Sessions: server-side stores (memory, Redis) or an encrypted cookie.
 pub const session = @import("session/root.zig");
@@ -402,7 +435,6 @@ test {
     _ = @import("fuzz.zig");
     _ = @import("log.zig");
     _ = @import("typed.zig");
-    _ = @import("banner.zig");
     _ = testing;
     _ = http;
     _ = resilience;
@@ -421,8 +453,15 @@ test {
     _ = pg;
     _ = mongodb;
     _ = nats;
-    _ = @import("net/client_stream.zig");
-    _ = @import("net/scram.zig");
+    _ = net;
+    _ = jobs;
+    _ = cron;
+    _ = webhooks;
+    _ = s3;
+    _ = smtp;
+    _ = lambda;
+    _ = sse;
+    _ = watch;
     _ = kafka;
     _ = session;
     _ = early_data;
@@ -436,6 +475,7 @@ test {
 test "feature constraints hold" {
     if (features.grpc) try std.testing.expect(features.http2);
     if (features.http3) try std.testing.expect(features.tls != .none);
+    if (features.webhooks) try std.testing.expect(features.jobs);
 }
 
 test "anole.h2 and anole.h3 export the same client names" {

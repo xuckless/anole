@@ -127,10 +127,31 @@ pub const Span = struct {
         /// success.
         error_type: [32]u8 = undefined,
         error_type_len: u8 = 0,
-        /// A messaging span (NATS, Kafka): `system` is `messaging.system`,
-        /// `collection` the destination (`messaging.destination.name`) and
-        /// `operation` the `messaging.operation.type`.
-        messaging: bool = false,
+        /// Which conventions the span follows.
+        kind: Kind = .database,
+        /// An RPC span's object key (`aws.s3.key`), or a mail span's
+        /// `smtp.message_id`; empty when unknown.
+        detail: [128]u8 = undefined,
+        detail_len: u8 = 0,
+        /// A mail span's `smtp.recipients`.
+        count: u32 = 0,
+
+        pub const Kind = enum {
+            /// `db.*` attributes.
+            database,
+            /// NATS, Kafka: `system` is `messaging.system`, `collection`
+            /// the destination (`messaging.destination.name`) and
+            /// `operation` the `messaging.operation.type`.
+            messaging,
+            /// S3 (OpenTelemetry's AWS SDK conventions): span `S3.<operation>`,
+            /// `rpc.system` "aws-api", `rpc.service` "S3", `rpc.method` the
+            /// operation, `aws.s3.bucket` the collection, `aws.s3.key` the
+            /// detail.
+            rpc,
+            /// SMTP (no OpenTelemetry convention; Anole's names): span
+            /// "smtp <operation>", `smtp.recipients`, `smtp.message_id`.
+            mail,
+        };
 
         /// The attributes from their values, each cut to its field's size.
         pub fn init(system: []const u8, namespace: []const u8, operation: []const u8, collection: ?[]const u8, error_type: ?[]const u8) Db {
@@ -141,6 +162,11 @@ pub const Span = struct {
             d.collection_len = put(&d.collection, collection orelse "");
             d.error_type_len = put(&d.error_type, error_type orelse "");
             return d;
+        }
+
+        /// Sets `detail` (an object key, a Message-ID), cut to fit.
+        pub fn setDetail(d: *Db, detail: []const u8) void {
+            d.detail_len = put(&d.detail, detail);
         }
 
         fn put(dst: []u8, src: []const u8) u8 {
@@ -185,6 +211,16 @@ pub const Exporter = struct {
     task: ?std.Io.Future(void) = null,
     /// Set by `deinit`: wakes the task from its pause between batches.
     closing: std.Io.Event = .unset,
+    /// Set by `flush` and `deinit`: cuts the task's pause short. Only the
+    /// task waits on it and resets it.
+    kick: std.Io.Event = .unset,
+    /// Set by the task after each batch; `flush` waits on it.
+    progress: std.Io.Event = .unset,
+    flush_lock: std.Io.Mutex = .init,
+    /// Spans queued, and spans the task has finished with (sent or
+    /// dropped): `flush` waits until `finished` reaches what `queued` was.
+    queued: std.atomic.Value(u64) = .init(0),
+    finished: std.atomic.Value(u64) = .init(0),
     /// Spans dropped: the queue was full, or the collector did not take
     /// them.
     dropped: std.atomic.Value(u64) = .init(0),
@@ -207,9 +243,30 @@ pub const Exporter = struct {
     /// Sends what is queued and stops the task.
     pub fn deinit(self: *Exporter) void {
         self.closing.set(self.io);
+        self.kick.set(self.io);
         self.queue.close(self.io);
         if (self.task) |*t| t.await(self.io);
         self.gpa.free(self.buffer);
+    }
+
+    /// Sends the spans queued so far and waits until the collector has
+    /// answered for them, or `timeout` passes (they are not lost then; the
+    /// task keeps going). For a process that may be frozen after this call
+    /// (AWS Lambda between invocations). One caller at a time; others wait
+    /// their turn. Does nothing before `start`.
+    pub fn flush(self: *Exporter, timeout: std.Io.Duration) void {
+        if (self.task == null) return;
+        self.flush_lock.lockUncancelable(self.io);
+        defer self.flush_lock.unlock(self.io);
+        const target = self.queued.load(.acquire);
+        const deadline = std.Io.Timeout{ .deadline = .{ .raw = std.Io.Clock.awake.now(self.io).addDuration(timeout), .clock = .awake } };
+        while (self.finished.load(.acquire) < target) {
+            self.progress.reset();
+            self.kick.set(self.io);
+            // The task may have finished between the check and the reset.
+            if (self.finished.load(.acquire) >= target) return;
+            self.progress.waitTimeout(self.io, deadline) catch return;
+        }
     }
 
     /// Queues a client span for a call made while serving `req` (a
@@ -223,10 +280,15 @@ pub const Exporter = struct {
         randomHex(req.io, &span.span_id);
         span.parent_span_id = req.span_id[0..16].*;
         const collection = db.collection[0..db.collection_len];
-        const name = std.fmt.bufPrint(&span.name, "{s} {s}", .{
-            db.operation[0..db.operation_len],
-            if (collection.len > 0) collection else db.namespace[0..db.namespace_len],
-        }) catch span.name[0..0];
+        const operation = db.operation[0..db.operation_len];
+        const name = switch (db.kind) {
+            .rpc => std.fmt.bufPrint(&span.name, "{s}.{s}", .{ rpcService(db.system[0..db.system_len]), operation }),
+            .mail => std.fmt.bufPrint(&span.name, "{s} {s}", .{ db.system[0..db.system_len], operation }),
+            .database, .messaging => std.fmt.bufPrint(&span.name, "{s} {s}", .{
+                operation,
+                if (collection.len > 0) collection else db.namespace[0..db.namespace_len],
+            }),
+        } catch span.name[0..0];
         span.name_len = @intCast(std.mem.trimEnd(u8, name, " ").len);
         span.start_ns = start_ns;
         span.end_ns = end_ns;
@@ -237,9 +299,9 @@ pub const Exporter = struct {
         self.submit(span);
     }
 
-    fn submit(self: *Exporter, span: Span) void {
+    pub fn submit(self: *Exporter, span: Span) void {
         const n = self.queue.putUncancelable(self.io, &.{span}, 0) catch 0;
-        if (n == 0) _ = self.dropped.fetchAdd(1, .monotonic);
+        if (n == 0) _ = self.dropped.fetchAdd(1, .monotonic) else _ = self.queued.fetchAdd(1, .release);
     }
 
     fn run(self: *Exporter) void {
@@ -254,14 +316,18 @@ pub const Exporter = struct {
                 return;
             };
             self.send(batch[0..n]);
-            // A pause before the next batch, cut short by `deinit`.
-            if (n < batch.len) self.closing.waitTimeout(self.io, .{ .duration = .{
+            _ = self.finished.fetchAdd(n, .release);
+            self.progress.set(self.io);
+            // A pause before the next batch, cut short by `deinit` and
+            // `flush`.
+            if (n < batch.len) self.kick.waitTimeout(self.io, .{ .duration = .{
                 .raw = self.options.interval,
                 .clock = .awake,
             } }) catch |err| switch (err) {
                 error.Timeout => {},
                 error.Canceled => return,
             };
+            if (!self.closing.isSet()) self.kick.reset();
         }
     }
 
@@ -282,6 +348,11 @@ pub const Exporter = struct {
     }
 };
 
+/// `rpc.service` (and the span name's prefix) for an RPC span's system.
+fn rpcService(system: []const u8) []const u8 {
+    return if (std.mem.eql(u8, system, "s3")) "S3" else system;
+}
+
 /// OTLP/HTTP JSON (opentelemetry-proto's JSON mapping: IDs in hex, times
 /// as decimal strings).
 pub fn encode(arena: std.mem.Allocator, service: []const u8, spans: []const Span) ![]const u8 {
@@ -294,7 +365,33 @@ pub fn encode(arena: std.mem.Allocator, service: []const u8, spans: []const Span
         try w.print("{{\"traceId\":\"{s}\",\"spanId\":\"{s}\",", .{ &s.trace_id, &s.span_id });
         if (s.parent_span_id) |p| try w.print("\"parentSpanId\":\"{s}\",", .{&p});
         if (s.db) |d| {
-            if (d.messaging) {
+            if (d.kind == .rpc or d.kind == .mail) {
+                try w.print("\"name\":{f},\"kind\":3,\"startTimeUnixNano\":\"{d}\",\"endTimeUnixNano\":\"{d}\",", .{ std.json.fmt(s.name[0..s.name_len], .{}), s.start_ns, s.end_ns });
+                const system = d.system[0..d.system_len];
+                const detail = d.detail[0..d.detail_len];
+                if (d.kind == .rpc) {
+                    const aws = std.mem.eql(u8, system, "s3");
+                    try w.print("\"attributes\":[{{\"key\":\"rpc.system\",\"value\":{{\"stringValue\":{f}}}}}", .{std.json.fmt(if (aws) "aws-api" else system, .{})});
+                    const rpc_attrs = [_]struct { []const u8, []const u8 }{
+                        .{ "rpc.service", rpcService(system) },
+                        .{ "rpc.method", d.operation[0..d.operation_len] },
+                        .{ if (aws) "aws.s3.bucket" else "rpc.target", d.collection[0..d.collection_len] },
+                        .{ if (aws) "aws.s3.key" else "rpc.detail", detail },
+                        .{ "error.type", d.error_type[0..d.error_type_len] },
+                    };
+                    for (rpc_attrs) |a| if (a[1].len > 0) try w.print(",{{\"key\":\"{s}\",\"value\":{{\"stringValue\":{f}}}}}", .{ a[0], std.json.fmt(a[1], .{}) });
+                } else {
+                    try w.print("\"attributes\":[{{\"key\":\"smtp.recipients\",\"value\":{{\"intValue\":\"{d}\"}}}}", .{d.count});
+                    const mail_attrs = [_]struct { []const u8, []const u8 }{
+                        .{ "smtp.message_id", detail },
+                        .{ "error.type", d.error_type[0..d.error_type_len] },
+                    };
+                    for (mail_attrs) |a| if (a[1].len > 0) try w.print(",{{\"key\":\"{s}\",\"value\":{{\"stringValue\":{f}}}}}", .{ a[0], std.json.fmt(a[1], .{}) });
+                }
+                try w.print("],\"status\":{{\"code\":{d}}}}}", .{@as(u8, if (d.error_type_len > 0) 2 else 0)});
+                continue;
+            }
+            if (d.kind == .messaging) {
                 const op = d.operation[0..d.operation_len];
                 const kind: u8 = if (std.mem.eql(u8, op, "publish")) 4 else if (std.mem.eql(u8, op, "process") or std.mem.eql(u8, op, "receive")) 5 else 3;
                 try w.print("\"name\":{f},\"kind\":{d},\"startTimeUnixNano\":\"{d}\",\"endTimeUnixNano\":\"{d}\",", .{ std.json.fmt(s.name[0..s.name_len], .{}), kind, s.start_ns, s.end_ns });

@@ -290,12 +290,40 @@ parameters, metadata) are reached through the offset stored in the record.
 | `ANOLE_EV_KAFKA_WRITABLE` (84) | `anole_broker_status_event`: a produce refused with `ANOLE_E_AGAIN` (or advised with `ANOLE_BUSY`) would be taken now | 0 | none |
 | `ANOLE_EV_KAFKA_GROUP_END` (85) | `anole_broker_end_event`: the group membership is over (`reason`) | `anole_kafka_group` | ends it |
 | (86-95) | reserved for Kafka | | |
-| `ANOLE_EV_CONSOLE_CLOSED` (132) | `anole_console_closed_event`: the in-process console closed (`reason`: `ANOLE_CONSOLE_QUIT`, `_INTERRUPT`, `_RESTARTING`); only after `anole_console_open`. 133-135 are reserved for the console | 0 | none: resume reading stdin |
+| `ANOLE_EV_NET_OPEN` (96) | `anole_net_open_event`: a raw TCP connection opened (ABI 0.10, p3/net) | `anole_net_conn` | none (the connection runs until CLOSE) |
+| `ANOLE_EV_NET_DATA` (97) | `anole_net_data_event`: bytes or frames of a connection | `anole_net_conn` | none |
+| `ANOLE_EV_NET_END` (98) | `anole_event`: the peer ended its side | `anole_net_conn` | with `half_open`: end this side when done |
+| `ANOLE_EV_NET_CLOSE` (99) | `anole_net_close_event`: the connection is over | `anole_net_conn` | ends it |
+| `ANOLE_EV_NET_DATAGRAMS` (100) | `anole_net_datagrams_event`: a batch of datagrams of a UDP socket | `anole_net_udp` | none |
+| (101-103) | reserved for raw TCP and UDP | | |
+| `ANOLE_EV_JOB_ENQUEUED` (104) | `anole_job_enqueued_event`: the answer to `anole_jobs_enqueue` (ABI 0.10, p3/jobs) | 0, or the `anole_db_tx` | none |
+| `ANOLE_EV_JOB` (105) | `anole_job_event`: a job for a worker | `anole_job` | `anole_job_finish` (or `anole_handle_release` = retry) |
+| `ANOLE_EV_JOB_CANCEL` (106) | `anole_job_cancel_event`: a held job was canceled | `anole_job` | ends it |
+| `ANOLE_EV_JOB_WORKER_END` (107) | `anole_job_worker_end_event`: the worker stopped | `anole_job_worker` | ends it |
+| `ANOLE_EV_JOBS_RESULT` (108) | `anole_jobs_result_event`: the answer to an admin call | 0 | none |
+| `ANOLE_EV_WEBHOOK_PUBLISHED` (109) | `anole_webhook_published_event`: the answer to `anole_webhooks_publish` without a transaction (p3/webhooks; with `tx`, the answer is `ANOLE_EV_DB_RESULT` on the transaction) | 0 | none |
+| `ANOLE_EV_WEBHOOK_STATUS` (110) | `anole_webhook_status_event`: a delivery ran out of attempts, or an endpoint was disabled; only after `anole_webhooks_watch` | 0 | none |
+| (111) | reserved for jobs and webhooks | | |
+| `ANOLE_EV_SSE_SUBSCRIBE` (112) | `anole_request_event`: a subscriber on a consumer's SSE route (ABI 0.10, p3/realtime) | `anole_req` | `anole_sse_accept`, or any request answer (a refusal) |
+| `ANOLE_EV_SSE_CLOSE` (113) | `anole_sse_close_event`: the subscriber is gone | `anole_sse` | ends it |
+| (114-115) | reserved for SSE | | |
+| `ANOLE_EV_WATCH_EVENT` (116) | `anole_watch_event`: a change a watch saw | `anole_watch_sub` | `anole_watch_ack` for a stream group with `"ack": "manual"` |
+| `ANOLE_EV_WATCH_STATUS` (117) | `anole_watch_status_event` | `anole_watch_sub` | none |
+| `ANOLE_EV_WATCH_END` (118) | `anole_watch_end_event`: the watch is over | `anole_watch_sub` | ends it |
+| (119-123) | reserved for watch | | |
+| `ANOLE_EV_S3_RESULT` (124) | `anole_s3_result_event`: the answer to an `anole_s3_*` call (ABI 0.10, p3/s3) | 0, or the `anole_s3_transfer` it opens or ends | a transfer it opens: write and finish it, or read it to the end, or `anole_handle_release` |
+| `ANOLE_EV_S3_DATA` (125) | `anole_s3_data_event`: bytes of a download | `anole_s3_transfer` | none (FIN ends the handle) |
+| `ANOLE_EV_SMTP_RESULT` (126) | `anole_smtp_result_event`: the answer to `anole_smtp_send` or `anole_smtp_send_raw`, then the rejected recipients and the spans' bytes (ABI 0.10, p3/smtp) | 0 | none |
+| (127-131) | reserved for storage and mail | | |
+| `ANOLE_EV_CONSOLE_CLOSED` (132) | `anole_console_closed_event`: the in-process console closed (`reason`: `ANOLE_CONSOLE_QUIT`, `_INTERRUPT`, `_RESTARTING`); only after `anole_console_open` | 0 | none: resume reading stdin |
+| (133-135) | reserved for the console | | |
 | `ANOLE_EV_DRAINING` (41) | `anole_event`: `anole_server_drain` was called; once per consumer, before sockets get 1001 or requests are cut: finish long polls and event streams | 0 | none |
 
 The numbers are allocated once and frozen: 0 none; 1-11 core; 12-19 gRPC;
 20-29 WebTransport; 30-39 database; 40-49 HTTP and WebSocket additions;
-50-63 core additions; 64-255 new areas, sixteen per area; 256 and up are
+50-63 core additions; 64-79 NATS; 80-95 Kafka; 96-103 raw TCP and UDP;
+104-111 jobs and webhooks; 112-115 SSE; 116-123 watch; 124-131 storage and
+mail; 132-135 the console; 136-255 new areas; 256 and up are
 never used by Anole (0x80000000 and up are free for a binding's own
 synthetic events in its dispatch loop). Three rules go with them: a consumer
 **skips types it does not know** (`ev.len`); an event that creates an
@@ -336,9 +364,32 @@ was answered, expired, aborted or made up gets `ANOLE_E_GONE`, never another
 request; a cleanup call gets `ANOLE_OK`; a handle that is 0 or of another
 kind than the call takes gets `ANOLE_E_INVALID` (rule 10). Treat the bits as
 opaque; 0 is never a handle. The kinds (published in `anole.abi.json` for
-diagnostics) are: 1 request, 2 websocket, 3 grpc_call, 4 wt_session,
-5 wt_stream, 6 db_tx (a database transaction; `anole_handle_release` rolls an
-open one back), 7 reserved for a per-query handle, 8-15 reserved.
+diagnostics) are:
+
+| Kind | Name | C type |
+| --- | --- | --- |
+| 1 | request | `anole_req` |
+| 2 | websocket | `anole_ws` |
+| 3 | grpc_call | `anole_grpc_call` |
+| 4 | wt_session | `anole_wt` |
+| 5 | wt_stream | `anole_wt_stream` |
+| 6 | db_tx | `anole_db_tx` (`anole_handle_release` rolls an open one back) |
+| 7 | reserved for a per-query handle | |
+| 8 | broker_sub | `anole_nats_sub` |
+| 9 | broker_msg | `anole_nats_msg` |
+| 10 | net_conn | `anole_net_conn` |
+| 11 | net_udp | `anole_net_udp` |
+| 12 | job_worker | `anole_job_worker` |
+| 13 | job | `anole_job` |
+| 14 | sse | `anole_sse` |
+| 15 | watch_sub | `anole_watch_sub` |
+| 16 | transfer | `anole_s3_transfer` |
+| 17 | kafka_group | `anole_kafka_group` |
+| 18 | kafka_batch | `anole_kafka_batch` |
+
+19-31 are free. Since ABI 0.10 a Kafka group and batch are kinds of their
+own (before, NATS's kinds with a marker bit), so a NATS handle given to a
+Kafka call is the wrong kind.
 
 `anole_handle_release(h)` ends any handle, whatever its kind, the way the
 application giving up would: an unanswered request gets
@@ -392,13 +443,15 @@ when it did not come from the OS):
 | `ANOLE_E_TIMEOUT` | a blocking call's timeout passed (a query's `timeout_ms`, in its answer) |
 | `ANOLE_E_DB` | in a query's answer: the database refused the statement (`error_class`) |
 | `ANOLE_E_BROKER` | in a broker call's answer: the broker refused it or could not be reached (`error_class`) |
+| `ANOLE_E_SERVICE` | in an object store's or mail server's answer: it refused the call or could not be reached (`error_class`, `http_status`, `error_code`) |
 
 ### Error tokens
 
 `anole_last_error_name()` is a stable token for the same error: a specific
 name from this table (also `error_names` in `anole.abi.json`), or, when
 there is none, the code's own name (`Invalid`, `Gone`, `Again`, `NoMemory`,
-`Config`, `State`, `Unsupported`, `TooBig`, `System`, `Timeout`, `Database`).
+`Config`, `State`, `Unsupported`, `TooBig`, `System`, `Timeout`, `Database`,
+`Broker`, `Service`).
 Bindings may switch on it; tokens are only ever added.
 
 | Token | Code | From |
@@ -411,7 +464,11 @@ Bindings may switch on it; tokens are only ever added.
 | `NoConsumer`, `ConsumerWithoutExecutor` | `ANOLE_E_STATE` | `anole_server_open` / `anole_server_start` |
 | `NotRunning`, `NoTlsListener` | `ANOLE_E_STATE` | reload, publish |
 | `UnknownCheck` | `ANOLE_E_INVALID` | `anole_server_set_ready` |
-| `InvalidEnvironmentVariable`, `DeploymentUnavailable`, `ProxyProtocolNoPeers` | `ANOLE_E_CONFIG` | `anole_server_create` (`ANOLE_ENV`, `ANOLE_DEPLOYMENT`, `PORT`; `deployment` lambda; `proxy_protocol` with an empty `proxy.trusted`) |
+| `InvalidEnvironmentVariable`, `ProxyProtocolNoPeers` | `ANOLE_E_CONFIG` | `anole_server_create` (`ANOLE_ENV`, `ANOLE_DEPLOYMENT`, `PORT`, `AWS_LAMBDA_*`, `ANOLE_LAMBDA_INVOKE_MODE`; `proxy_protocol` with an empty `proxy.trusted`) |
+| `LambdaRuntimeApiMissing`, `LambdaNotBuilt` | `ANOLE_E_CONFIG` | `anole_server_create` (`deployment` lambda with no Runtime API, or a build without `-Dlambda`) |
+| `SnapStartUnsupported` | `ANOLE_E_CONFIG` | `anole_server_start` (a function published with SnapStart) |
+| `LambdaRuntimeApiFailed` | `ANOLE_E_SYSTEM` | `anole_server_start` / `anole_server_wait` (the Runtime API failed; Lambda starts a new environment) |
+| `NotSse`, `WrongWatchKind`, `UnknownWatch` | `ANOLE_E_STATE`, `ANOLE_E_STATE`, `ANOLE_E_INVALID` | `anole_sse_accept` on a request that is no SSE subscription; `anole_watch_ack` on a watch that is not a Redis stream group with manual acks; `anole_watch_find` |
 | `UnknownEnvironment`, `InvalidEnvFile` | `ANOLE_E_INVALID`, `ANOLE_E_CONFIG` | `anole_dotenv_read` |
 | `AddressInUse`, `AddressNotAvailable`, `AccessDenied`, `TooManyOpenFiles`, `SystemResources` | `ANOLE_E_SYSTEM` | binds, threads, files (errno set) |
 | `CertificateFileUnreadable`, `KeyFileUnreadable`, `ClientCaFileUnreadable` | `ANOLE_E_SYSTEM` | TLS files (errno set) |
@@ -463,6 +520,15 @@ marked (C): they answer `ANOLE_OK` on an object that is already over.
 | `anole_ws_subscribe` | `ANOLE_E_INVALID` (topic), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_ws_unsubscribe` (C) | `ANOLE_E_INVALID` (topic), `ANOLE_E_NOMEM` |
 | `anole_ws_publish` | `ANOLE_E_INVALID`, `ANOLE_E_AGAIN`, `ANOLE_E_STATE` (`NotRunning`), `ANOLE_E_NOMEM` |
+| `anole_sse_publish`, `anole_sse_gap` | `ANOLE_E_INVALID` (topic, event name, size, flags), `ANOLE_E_AGAIN` (publish only), `ANOLE_E_STATE` (`NotRunning`), `ANOLE_E_NOMEM` |
+| `anole_sse_accept` | `ANOLE_E_STATE` (`NotSse`), `ANOLE_E_INVALID` (topic, header, reserved, size), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_sse_subscribe` | `ANOLE_E_INVALID` (topic), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_sse_unsubscribe`, `anole_sse_close` (C) | `ANOLE_E_INVALID` (topic, handle kind) |
+| `anole_sse_send` | `ANOLE_BUSY`, `ANOLE_E_AGAIN` (the queue is full; `ANOLE_EV_WRITABLE` follows), `ANOLE_E_INVALID` (event name, size, flags), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
+| `anole_watch_find` | `ANOLE_E_INVALID` (`UnknownWatch`) |
+| `anole_watch_listen` | `ANOLE_E_STATE` (not running, the watch stopped), `ANOLE_E_INVALID` (format, reserved, size), `ANOLE_E_NOMEM` |
+| `anole_watch_unlisten` (C) | `ANOLE_E_INVALID` (handle kind) |
+| `anole_watch_ack` | `ANOLE_E_STATE` (`WrongWatchKind`), `ANOLE_E_INVALID` (position), `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_grpc_send_headers` | `ANOLE_E_INVALID` (metadata), `ANOLE_E_STATE`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_grpc_send` | `ANOLE_BUSY`, `ANOLE_E_INVALID`, `ANOLE_E_STATE`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
 | `anole_grpc_send_wait` | `ANOLE_E_TIMEOUT`, `ANOLE_E_GONE`, `ANOLE_E_NOMEM` |
@@ -615,7 +681,8 @@ in the process environment, else production and standalone. libanole reads
 no `.env` file itself and treats a build without `environment` as
 production, so a binding that leaves it out gets JSON records in its log
 callback. Resolution failures are `ANOLE_E_CONFIG` from `anole_server_create`
-(`InvalidEnvironmentVariable`, `InvalidProxyNetwork`, `DeploymentUnavailable`),
+(`InvalidEnvironmentVariable`, `InvalidProxyNetwork`, `LambdaRuntimeApiMissing`,
+`LambdaNotBuilt`),
 with the reason in `anole_last_error`. `anole_server_listener` reports the
 filled address and port before start, so a binding sees `$PORT` at once.
 
@@ -665,6 +732,7 @@ none.
 | `proxy.trusted`, `trusted_hops`, `trust_forwarded_proto`, `trust_forwarded_host` | null, 0, true, false | `proxy.*` |
 | `environment`, `deployment`, `error_detail` | null, null, null | `environment`, `deployment`, `error_detail` (null: `ANOLE_ENV` else production; `ANOLE_DEPLOYMENT` else standalone; on in development) |
 | `listeners[].address`, `port`, `proxy_protocol` | null, null, null | `Listener.*` (null: the deployment's default: `127.0.0.1`, 8080 or `$PORT`, off or on under `anole_lb`) |
+| `listeners[].tcp`, `listeners[].udp` | null | the raw TCP and UDP listener options (`anole.net.Tcp.Options`, `Udp.Options`, durations as `_ms`); see [Raw TCP and UDP](#raw-tcp-and-udp) |
 | `request.require_host`, `decompress`, `keep_buffers` | true, true, false | `request.*` |
 | `response.write_buffer_size`, `date`, `default_content_type`, `max_header_count`, `brotli_quality` | 16384, true, "text", 64, 5 | `response.*` (`default_content_type` by tag name; null: none) |
 | `http2.*` | 250 streams, ..., `enable_connect_protocol` false | `http2.*` (`max_concurrent_streams`, `stream_window`, `stream_window_reading`, `tunnel_window`, `reading_window_budget`, `connection_window`, `max_header_list_size`, `stream_reset_burst`, `stream_reset_rate`, `max_continuations`, `refused_stream_burst`, `refused_stream_rate`, `enable_connect_protocol`, `inline_no_wait`) |
@@ -674,6 +742,7 @@ none.
 | `executors` | 0 | `executors` (0 is `.auto`, n is `.exact(n)`) |
 | `databases[].timeout_ms` | 30000 | the connectors' `timeout` (0 is null: none); also a transaction's bound when its `timeout_ms` is 0 |
 | `databases[].mongodb.max_connections`, `databases[].sqlite.ping_timeout_ms` | null (100), 2000 | `mongodb.Options.max_connections`, `sqlite.Options.ping_timeout` |
+| `lambda.*` | see [Lambda](#lambda) | `lambda.*` (durations as `_ms`) |
 
 Keys with no Zig option: `limits.inline_body_max`, `max_inflight`, `queue`,
 `stream_high_water`, `ws_high_water`, `db_result_max`; `timeouts.rewake_ms`;
@@ -834,6 +903,84 @@ and the larger of 16 x `limits.ws_high_water` and 2 x `limits.ws_max_message`
 bytes): past the bound `anole_ws_publish` answers `ANOLE_E_AGAIN` and sends
 nothing (a caller that retries the refused publish before the next keeps
 the order). A drain closes sockets with 1001.
+
+## Server-sent events
+
+An `sse` route is a GET endpoint whose responses are event streams. Anole
+parks each stream: an idle subscriber holds no task, only a small object, and
+a publish fans out on Anole's threads without entering the language
+(`anole_sse_publish`). Every event gets an ID, `<epoch>-<seq>`, one sequence
+across all topics; a browser that reconnects sends the last one it saw as
+`Last-Event-ID`, and Anole replays what it missed from the topics' replay
+buffers (`sse.replay`: 256 events or 256 KiB per topic, 64 MiB in all, five
+minutes), or sends one `gap` event (`sse.gap_event`) when the buffers no
+longer cover it. A heartbeat comment goes to every subscriber idle for
+`sse.heartbeat_ms`. A subscriber that does not keep up (`sse.max_queued_bytes`)
+gets its stream ended (`sse.on_full` `"close"`; the browser reconnects and
+resumes from the replay) or misses the event (`"drop"`). At the drain every
+subscriber is told when to come back (`retry:`, spread over
+`sse.drain_retry`), then its stream ends.
+
+```json
+{ "sse": { "heartbeat_ms": 15000, "replay": { "events": 256 }, "on_full": "close" },
+  "limits": { "sse_max_event": 1048576 },
+  "routes": [
+    { "path": "/news", "sse": { "topics": ["news"] } },
+    { "path": "/rooms/:room/events", "sse": { "topics": ["news", "room:{room}"], "last": 0 } },
+    { "path": "/me/events", "sse": { "handler": 7 } } ] }
+```
+
+`{name}` in a route's `topics` is replaced by the path parameter `name`
+(percent-decoded); a name the path lacks is a configuration error. With
+`"handler"`, the subscription is the consumer's to decide: it arrives as
+`ANOLE_EV_SSE_SUBSCRIBE` (an `anole_request_event` with the request's
+headers, `Last-Event-ID` among them, and the claims of the authentication
+middleware), and `anole_sse_accept` answers it (any other answer to a request
+refuses it). The accept returns the subscriber's handle at once;
+`anole_sse_subscribe`, `anole_sse_unsubscribe`, `anole_sse_send` and
+`anole_sse_close` act on it, and `ANOLE_EV_SSE_CLOSE` says when it is over.
+
+`anole_sse_send` sends one event to one subscriber (no ID, never replayed).
+Like every send it returns once the event is queued: `ANOLE_BUSY` when more
+than half of `sse.max_queued_bytes` waits, `ANOLE_E_AGAIN` (nothing taken)
+past the whole of it, and `ANOLE_EV_WRITABLE` when the queue has drained
+below a quarter. `anole_sse_gap` tells the subscribers of a topic that the
+application lost events it would have published.
+
+## Watches
+
+A watch turns a database's changes into events: PostgreSQL `LISTEN`/`NOTIFY`,
+Redis pub/sub, a Redis stream (with or without a consumer group) or a MongoDB
+change stream (a replica set is needed). Each is declared in `"watches"` and
+read from `anole_server_start` until the drain; all watches of one database
+share one connection (PostgreSQL, Redis pub/sub).
+
+```json
+{ "databases": [ { "name": "main", "postgres": { "url": "postgres://..." } } ],
+  "watches": [
+    { "name": "orders", "database": "main", "postgres": { "channels": ["orders"] },
+      "to": [ { "sse": "orders" }, { "ws": "orders", "type": "text", "gap_message": null } ] } ] }
+```
+
+`to` feeds topics and rooms natively: `sse` names a topic (or a template) and
+`ws` a room; templates take `{channel}`, `{op}`, `{data.<field>}` (a top-level
+member of a JSON payload) and, for MongoDB, `{db}`, `{collection}` and
+`{key}`; an event a template cannot be filled for is skipped for that target.
+PostgreSQL and Redis pub/sub are at most once, so a reconnect is a **gap**;
+a Redis stream resumes from the last entry it read; a MongoDB stream resumes
+by its resume token. A gap reaches the SSE topics as the `gap` event, and a
+listener as an `ANOLE_EV_WATCH_STATUS` with `ANOLE_WATCH_GAP`.
+
+A consumer that wants the events too listens with `anole_watch_find` and
+`anole_watch_listen`; every event arrives as `ANOLE_EV_WATCH_EVENT` (the
+channel, the operation, the data as text, as JSON or as BSON, a stream entry's
+fields, the position to resume from), and `anole_watch_unlisten` (or
+`anole_handle_release`) ends it with `ANOLE_EV_WATCH_END`. A listener holds at
+most `max_events` / `max_bytes` waiting for the consumer; past that events are
+dropped, and one status with how many follows. A Redis stream group with
+`"ack": "manual"` owes `anole_watch_ack` for each entry.
+`anole_watch_index` is the watch's index in `"watches"` (the `watch` field of
+its records).
 
 ## WebTransport
 
@@ -1338,6 +1485,306 @@ its place in `"brokers"` (what `anole_broker_status_event.broker` names).
 The consumer reads none, gzip, zstd, lz4 and snappy batches. Transactions,
 the KIP-848 protocol and the admin API are not part of the ABI.
 
+<!-- p3/net -->
+## Raw TCP and UDP
+
+A `"tcp"` or `"udp"` key on a listener serves that listener's connections or
+datagrams to the consumer as events, instead of HTTP (`-Dnet`,
+`anole_has_feature("net")`; ABI 0.10). The listener keeps everything Anole's
+listeners have: one accept loop per executor, TLS with `alpn`, mutual TLS and
+`anole_server_reload_tls`, `proxy_protocol`, `unix` sockets, the connection
+caps, the drain and `SIGUSR2` restarts. What you get is the bytes, cut by the
+listener's `framing`. See [net.md](net.md) for the same servers in Zig.
+
+```json
+"listeners": [
+  { "name": "chat", "port": 7000, "tls": { "self_signed": true, "alpn": ["chat/1"] },
+    "tcp": { "handler": 2, "framing": { "lines": { "max": 8192 } },
+             "half_open": false, "idle_timeout_ms": 60000, "write_high_water": 262144 } },
+  { "name": "game", "port": 7001, "udp": { "handler": 3, "max_datagram": 1400 } }
+]
+```
+
+`handler` is any number the consumer picks; it comes back as `handler_id`.
+`framing` is exactly one of `{"lines": {max, strip_cr, crlf}}`, `{"length":
+{bytes, endian, includes_header, max}}` and `{"varint": {max}}`; left out, bytes
+come as they arrive. Every other key is the Zig option of the same name (a
+duration as `<name>_ms`), listed with its default in the schema. A raw
+listener needs `port` (0 for a free one) or `unix`, and never takes `$PORT`.
+UDP takes no `tls`, `unix` or `proxy_protocol`.
+
+**Events.** `ANOLE_EV_NET_OPEN` (`anole_net_open_event`) when a connection is
+ready (PROXY header read, TLS done): both addresses in binary
+(`anole_net_addr`) and as text, the ALPN protocol, the SNI name and the
+client certificate. `ANOLE_EV_NET_DATA` (`anole_net_data_event`) brings what
+one read burst held: without framing one span (up to 64 KiB per record), with
+framing every whole frame of the burst, so one crossing carries many
+messages. `ANOLE_EV_NET_END` is the peer's FIN; with `half_open` the
+consumer ends its side when done, without it Anole does. `ANOLE_EV_NET_CLOSE`
+(`anole_net_close_event`) ends the connection: why (`ANOLE_NET_CLOSED_*`),
+bytes each way, how long. For UDP, `ANOLE_EV_NET_DATAGRAMS`
+(`anole_net_datagrams_event`) is one receive batch of one socket, with each
+datagram's remote and local address (`anole_net_datagram_in`) and the count
+the kernel dropped since the last record. A peer's datagrams always come
+through the same socket (`anole_net_udp`), in order.
+
+**Writing never waits for the peer.** `anole_net_write(c, data, len, flags)`
+queues the bytes (copied, or borrowed with `ANOLE_BODY_BORROW`: `ANOLE_EV_SENT`
+follows) and returns. `ANOLE_BUSY`: taken, but more than
+`tcp.write_high_water` bytes wait, so write no more until
+`ANOLE_EV_WRITABLE` on `c`. `ANOLE_E_AGAIN`: not taken, past `tcp.write_max`
+(`ANOLE_EV_WRITABLE` follows). `ANOLE_NET_F_FRAME` adds the listener's
+framing around the bytes; `ANOLE_NET_F_END` ends this side after them (`len`
+may be 0), with TLS close_notify and a FIN. After this side ended, a write is
+`ANOLE_E_INVALID` ("Ended"). `anole_net_close(c, how)` closes gracefully
+(`ANOLE_NET_CLOSE_GRACEFUL`: what is queued goes out, input is dropped until
+the peer ends, at most 2 s) or with a reset (`ANOLE_NET_CLOSE_RESET`: now);
+`anole_handle_release` on a connection is the graceful close.
+`anole_net_pause` and `anole_net_resume` stop and restart reading (the input
+waits in the kernel, so TCP slows the peer); `anole_net_set_idle_timeout`
+replaces `tcp.idle_timeout_ms` for one connection.
+
+**Read credit.** A connection posts at most `tcp.read_ahead` bytes the
+consumer has not polled yet; the rest waits in the kernel. One fast peer and a
+slow consumer cannot fill a core's ring.
+
+**UDP.** `anole_net_udp_send(u, datagrams, n, 0)` queues `n`
+`anole_net_datagram`s on a socket, all or none, sent together
+(`sendmmsg`). `from.family` 0 lets the system pick the source; a received
+datagram's `local` answers from the address it reached. `ANOLE_BUSY` means the
+queue is past half full; `ANOLE_E_AGAIN` that none was taken
+(`ANOLE_EV_WRITABLE` on `u` follows). `anole_net_udp_find(s, "game", &u)` gives
+the first socket of a UDP listener, to send without having received. Datagrams
+are unreliable: one the kernel refuses is dropped and counted in
+`anole_stats.udp_datagrams_dropped`.
+
+**Addresses.** `anole_net_addr_format` writes `"203.0.113.9:4711"` or
+`"[2001:db8::1]:443"` (64 bytes always fit); `anole_net_addr_parse` reads a
+literal address and port (names are not resolved).
+
+**Language bindings.** The calls map one to one onto `node:net` and
+`node:dgram` (`write()` returning false is `ANOLE_BUSY`, `'drain'` is
+`ANOLE_EV_WRITABLE`, `socket.pause()` is `anole_net_pause`, `'end'` is
+`ANOLE_EV_NET_END`, `allowHalfOpen` is `half_open`) and asyncio's `Protocol`
+and `DatagramProtocol` (`pause_writing()`/`resume_writing()`,
+`eof_received()`, `connection_lost()`). An idle connection has no task in
+Anole and none in the language: one consumer thread drains every
+connection's events with one `anole_poll` per wake.
+
+New error tokens: `NetNotBuilt`, `NetListenerNeedsPort`, `NetListenerHttp3`,
+`TcpAndUdp`, `UdpWithTls`, `UdpOnUnixSocket`, `UdpWithProxyProtocol`,
+`InvalidFraming`, `NetHandlerContext`, `UnknownListener` and `Ended`.
+`anole_stats` gained `net_connections`, `net_bytes_in`, `net_bytes_out`,
+`udp_datagrams_in`, `udp_datagrams_out` and `udp_datagrams_dropped`; listener
+flags `ANOLE_LISTENER_F_TCP` and `ANOLE_LISTENER_F_UDP` mark the kinds (a
+UDP listener's `port` is 0 and `udp_port` its bound port).
+<!-- end p3/net -->
+
+## Jobs
+
+Durable background jobs (`-Djobs`, ABI 0.10): `"jobs"` in the configuration
+names the store, the queues and the kinds; a consumer enqueues, and workers
+in the consumer's language run the jobs.
+
+```json
+"jobs": {
+  "store": "main",                       // a databases[].name (SQLite, PostgreSQL, Redis) or "memory"
+  "queues": [ { "name": "default", "concurrency": 10 }, { "name": "mail", "concurrency": 4 } ],
+  "lease_ms": 30000, "poll_ms": 1000, "migrate": true, "notify": true,
+  "table_prefix": "anole_", "key_prefix": "anole:",
+  "kinds": [ { "name": "email.welcome", "queue": "mail", "attempts": 8, "timeout_ms": 60000 } ],
+  "keep": { "completed_ms": 86400000, "dead_ms": 2592000000, "cancelled_ms": 604800000 },
+  "leader": { "method": "auto", "ttl_ms": 15000, "renew_ms": 5000 },
+  "drain_ms": 10000,
+  "cron": [
+    { "name": "nightly", "schedule": "0 3 * * *", "tz": "Europe/Berlin", "kind": "report.nightly", "args": {} },
+    { "name": "sweep", "schedule": "*/10 * * * *", "sql": { "database": "main", "statement": "DELETE FROM sessions WHERE expires_at < unixepoch()" } }
+  ]
+}
+```
+
+`anole_jobs_get` gives the `anole_jobs *` (`ANOLE_E_UNSUPPORTED` without
+`"jobs"`). A job runs at least once; `anole.jobs`' leases, heartbeats,
+timeouts, retries with backoff and the drain apply as they do for Zig
+handlers (docs/jobs.md). A `"sql"` schedule runs its statement on the named
+database with no language involved.
+
+**Enqueue.** `anole_jobs_enqueue` copies 1 to 1000 `anole_job_out` records
+and returns at once; `ANOLE_EV_JOB_ENQUEUED` answers with an
+`anole_job_enqueued_entry` (`id`, `inserted`) per job, in order. The jobs are
+inserted one after the other: use a transaction for all-or-nothing. With
+`opts.tx` (an `anole_db_tx` on the jobs store's database, SQLite or
+PostgreSQL) the inserts are calls on that transaction, in order with its
+others, and commit with it; the answer is then the transaction's
+`ANOLE_EV_DB_RESULT`, a table with the columns `id` and `inserted`. Unique
+jobs (`ANOLE_JOB_F_UNIQUE`, `unique_key`, `unique_period_ms`,
+`unique_scope`) answer the existing job's id with `inserted` 0. A request's
+`traceparent` is not carried (the ABI has no request context to read it from).
+
+**Workers.** `anole_jobs_work` (before the server starts) registers a worker
+for a queue and some kinds (none: every kind of the queue); no two workers
+run one kind. Each job it gets is an `ANOLE_EV_JOB` to the consumer with its
+own `anole_job` handle, at most `concurrency` out at once, owed one
+`anole_job_finish` (`ANOLE_JOB_DONE`, `_RETRY` with the error text and an
+optional delay, `_SNOOZE` to run again later without counting the attempt,
+`_DISCARD`) or `anole_job_complete_in` (the job completes inside a
+transaction of the jobs store's database; if that rolls back, the job runs
+again after its lease). `anole_handle_release` on a job is a retry now. The
+queue's lease, heartbeat and timeout run on Anole's threads: when one ends a
+run, `ANOLE_EV_JOB_CANCEL` says why (`ANOLE_JOB_CANCEL_TIMEOUT`, `_ADMIN`,
+`_LEASE_LOST`, `_DRAIN`) and the handle is over (`anole_job_finish` answers
+`ANOLE_E_GONE`). `anole_jobs_stop` ends a worker once its jobs are over
+(`ANOLE_EV_JOB_WORKER_END`; jobs it is handed meanwhile go back after a
+second); `anole_server_drain` stops them all (`ANOLE_JOB_WORKER_DRAINED`).
+
+**Admin.** `anole_jobs_admin` takes one JSON request and answers with
+`ANOLE_EV_JOBS_RESULT`, whose `json` is the answer and `http_status` what the
+admin routes would send. Operations (`"op"`): `jobs.get` and `jobs.retry`,
+`jobs.cancel`, `jobs.delete` (`{"id": 7}`), `jobs.list` (`state`, `queue`,
+`kind`, `limit`, `before`), `jobs.counts`, `cron.list`, `cron.trigger`
+(`{"name": ...}`), and the `webhooks.*` operations below when the configuration
+has webhooks.
+
+The `webhooks.*` operations are `anole.webhooks.Client`'s methods, with the
+request's keys named after the Zig parameters and struct fields (snake_case)
+and the answers being the Zig structs as JSON (times RFC 3339):
+
+| `"op"` | Request keys | Answer |
+|---|---|---|
+| `webhooks.endpoint.create` | `url` (required), `owner`, `types` (patterns such as `"invoice.*"`), `description`, `secret` (null: a new `whsec_` one), `metadata` (an object) | `{"endpoint": {...}, "secret": "whsec_..."}` |
+| `webhooks.endpoint.update` | `id`, and any of `url`, `types`, `description`, `metadata` | the endpoint |
+| `webhooks.endpoint.delete` | `id` | `{"ok": true}` |
+| `webhooks.endpoint.get` | `id` | the endpoint (`id`, `owner`, `url`, `types`, `description`, `enabled`, `disabled_reason`, `failing_since`, `created_at`, `updated_at`, `metadata`) |
+| `webhooks.endpoint.list` | `owner` (default `""`) | `{"endpoints": [...]}` |
+| `webhooks.endpoint.rotate_secret` | `id`, `keep_old_ms` (default 86400000: the old secret keeps signing for 24 h) | `{"secret": "whsec_..."}` |
+| `webhooks.endpoint.enable` | `id` | `{"ok": true}` |
+| `webhooks.replay` | `message_id`, `endpoint` (null: every endpoint it went to) | `{"deliveries": n}` |
+| `webhooks.recover` | `endpoint`, `since` (RFC 3339 or Unix milliseconds) | `{"deliveries": n}` |
+| `webhooks.attempts` | `endpoint`, `message`, `limit` (50, at most 500), `before` (an attempt id) | `{"attempts": [...], "next": <id or null>}` |
+| `webhooks.messages` | `owner`, `type`, `limit`, `before` (a message id) | `{"messages": [...], "next": <id or null>}` |
+
+An unknown endpoint or message answers `http_status` 404 (`status` OK), a URL,
+event type, owner or metadata the client refuses (or an owner past
+`max_endpoints_per_owner`) 400 (`ANOLE_E_INVALID`), a conflict the store
+reports 409, and a missing or mistyped key or a request that is not JSON 400
+(`ANOLE_E_INVALID`). Error answers are `{"error": "..."}`.
+
+<!-- p3/s3 -->
+## Object storage (S3)
+
+Object stores are configured under `"storage"` (one object per store, with a `"name"` and an `"s3"` object that has `anole.s3.Options`' keys in snake_case) and used through `anole_s3_*` calls. Built with `-Ds3` (`anole_has_feature("s3")`); see [storage.md](storage.md) for what the calls mean.
+
+```json
+"storage": [
+  { "name": "files",
+    "s3": { "endpoint": "https://acct.r2.cloudflarestorage.com", "bucket": "uploads",
+            "access_key_id": "...", "secret_access_key": "...",
+            "part_size": 8388608, "concurrency": 2 },
+    "timeout_ms": 30000, "retry": { "attempts": 3 }, "breaker": {} }
+]
+```
+
+Without `access_key_id` and `secret_access_key` the AWS credential chain runs when the server starts; a start that finds no credentials fails with `ANOLE_E_CONFIG`, name `NoCredentials`, and the sources tried in `anole_last_error`. `retry` is on by default (every S3 call is idempotent; `null` turns it off, `ANOLE_S3_F_NO_RETRY` tries one call once); `readiness` is off by default.
+
+`anole_s3_find` looks a store up by name and `anole_s3_index` gives its place in `"storage"`. Every call returns at once; the answer is one `ANOLE_EV_S3_RESULT` (event 124, `anole_s3_result_event`) to the consumer named in the call, or to the consumer of `opts->req`'s request, with the call's `user_data`. A failure is `ANOLE_E_SERVICE` (-13) with `error_class` (`ANOLE_DB_ERR_NOT_FOUND` 11, `_PRECONDITION` 12, `_INVALID` 13, `_UNAVAILABLE`, `_TIMEOUT`, `_OTHER`), `http_status` (what Anole's handlers answer), S3's code in `error_code` and its message in `error`. `ANOLE_E_TIMEOUT` is a call past its bound; `ANOLE_E_TOOBIG` a whole `anole_s3_get` over `max_bytes`; `ANOLE_E_GONE` a call tied to a request (`opts->req`) that ended first.
+
+| Call | Op in the result | Notes |
+| --- | --- | --- |
+| `anole_s3_get`, `anole_s3_head` | `GET`, `HEAD` | the head and (get) the whole body; a 304 is `ANOLE_OK` with `s3_status` 304 |
+| `anole_s3_get` with `ANOLE_S3_F_STREAM` | `GET`, then `ANOLE_EV_S3_DATA` | see below |
+| `anole_s3_put` | `PUT` | `data` is copied; one PUT or multipart |
+| `anole_s3_delete`, `anole_s3_delete_many` | `DELETE`, `DELETE_MANY` | failures in `entries_off` as `anole_s3_failure` |
+| `anole_s3_list` | `LIST` | `anole_s3_entry` records, `prefixes_off` spans, `next`; `ANOLE_S3_RES_F_TRUNCATED` |
+| `anole_s3_copy` | `COPY` | up to 5 GiB |
+| `anole_s3_multipart_create`, `anole_s3_multipart_complete`, `anole_s3_multipart_abort` | `MULTIPART_CREATE`, `MULTIPART_COMPLETE`, `MULTIPART_ABORT` | for browsers uploading parts with presigned URLs |
+| `anole_s3_presign` | none | synchronous; returns the URL's length, written into `buf` when it fits |
+| `anole_s3_serve`, `anole_s3_put_body` | `SERVE`, `PUT_BODY` | the request's body or answer never enters the language |
+
+**Uploads (push).** `anole_s3_upload_open` answers with a result (op `UPLOAD_OPEN`) whose `ev.handle` is an `anole_s3_transfer` (handle kind 16). `anole_s3_upload_write(t, data, len, 0)` copies the bytes (`len` at most `part_size`; `ANOLE_BODY_BORROW` is refused) and **never blocks**: `ANOLE_OK`; `ANOLE_BUSY` (taken, but more than `concurrency * part_size` is buffered); `ANOLE_E_AGAIN` (nothing taken: a part more is buffered, or `upload_memory` is used up). After BUSY or AGAIN an `ANOLE_EV_WRITABLE` arrives on the handle once the buffered bytes fall to half of `concurrency * part_size`. `anole_s3_upload_finish(t, user_data)` sends the rest; the answer is a result with op `UPLOAD_FINISH`, `ev.handle` = `t` and the finish call's `user_data`. A failed upload (a part past its retries) answers the same event with the error, and later writes are `ANOLE_E_GONE`. `anole_handle_release(t)` aborts it.
+
+**Downloads (streamed).** `anole_s3_get` with `ANOLE_S3_F_STREAM` answers with a result that carries the head and a transfer handle in `ev.handle`; `ANOLE_EV_S3_DATA` records (event 125, `anole_s3_data_event`, at most 64 KiB each) follow in order, up to `window` bytes (default 256 KiB) ahead of what the consumer has credited. `anole_s3_read_more(t, bytes)` adds credit. The last record has `ANOLE_S3_DATA_F_FIN`; a failure is a record with a non-zero `status` and FIN. `anole_handle_release(t)` stops it.
+
+**serve and put_body.** `anole_s3_serve(s3, req, key, opts, user_data)` answers the request itself (Range and `If-*` from the request, status and headers passed through, the body streamed by Anole). With `ANOLE_S3_F_PASS_NOT_FOUND` a missing key leaves the request owed and posts a result (op `SERVE`, class NOT_FOUND) so the consumer can answer with its own 404; `ANOLE_S3_F_REPORT` posts a result when the serve is done. `anole_s3_put_body(s3, req, key, opts, user_data)` stores the request's body (inline or streamed) without it passing through the consumer; the request stays owed and the consumer answers it after the `PUT_BODY` result.
+
+Records: `anole_s3_options`, `anole_s3_get_options`, `anole_s3_put_options`, `anole_s3_list_options`, `anole_s3_presign_options` and `anole_s3_part` take a leading `size` like the database options; `anole_s3_result_event`, `anole_s3_entry`, `anole_s3_failure` and `anole_s3_data_event` are in [anole.h](../include/anole.h). Server drain stops new uploads; those in flight finish. The stop aborts every upload and ends no more events.
+<!-- end p3/s3 -->
+
+## Mail
+
+The configuration's `"mail"` entries are SMTP servers (docs/email.md has
+the connector: `SMTP_URL`, STARTTLS and `smtps://`, AUTH PLAIN and LOGIN,
+MIME, pooled connections, retries). The library connects when the server
+starts and sends on its own executors; a send never waits on the caller's
+thread.
+
+```json
+{ "mail": [
+  { "name": "mail",
+    "smtp": { "url": "smtps://user:pass@smtp.postmarkapp.com:465",
+              "from": "App <hello@example.com>" },
+    "timeout_ms": 30000 } ] }
+```
+
+`url` null reads `SMTP_URL`, then falls back to Mailpit's
+`smtp://127.0.0.1:1025`, except in production (`"environment": "production"`,
+the ABI's default), where a missing `SMTP_URL` fails `anole_server_start`
+with `ANOLE_E_CONFIG` and the text "mail[0] "mail": SMTP_URL is not set;
+mail would go to a local test server...". The other keys are
+`anole.smtp.Options` in snake_case: `from` (or `SMTP_FROM`), `username`,
+`password`, `tls_mode` (`"auto"`, `"starttls"`, `"implicit"`, `"none"`),
+`ca_file`/`ca_pem` and the client certificate keys, `insecure_skip_verify`,
+`helo_name`, `max_connections`, `max_messages_per_connection`,
+`idle_timeout_ms`, `acquire_timeout_ms`, `connect_timeout_ms`,
+`min_throughput`, `max_message_bytes` and `readiness`; beside `smtp`, the
+entry has `timeout_ms`, `breaker`, `retry` (what `ANOLE_SMTP_F_RETRY` sends
+retry with: 3 attempts, 500 ms to 5 s) and `errors`, as a database does.
+
+`anole_smtp_find(server, name, &mail)` gives the handle (it works before
+the server starts), `anole_smtp_index(mail)` its place in `"mail"`.
+
+**`anole_smtp_send(mail, consumer, &message, &options, user_data)`**
+composes and sends a message (`anole_smtp_message`: `from`, `reply_to`,
+`to`/`cc`/`bcc` as `anole_str` arrays, `subject`, `text`, `html`, extra
+`headers`, `attachments`, `envelope_from`, `message_id`). Everything is
+copied before the call returns; an attachment's `path` is read while
+sending. Addresses, header values, attachment names and flags are checked
+**at the call**: `ANOLE_E_INVALID`, and `anole_last_error` names the field
+("to: "x" is not a mailbox ...", "no recipients"). Nothing else can fail
+the call except `ANOLE_E_STATE` (before start, after stop), `ANOLE_E_GONE`
+(a stale `req`) and `ANOLE_E_NOMEM`.
+
+`anole_smtp_options`: `flags` (`ANOLE_SMTP_F_RETRY`: try failures before the
+final "." again, never after it), `timeout_ms` (0 is the entry's;
+`ANOLE_DB_TIMEOUT_NONE` none) and `req` (the request or gRPC call the send
+serves: if it ends unanswered, the send is cut and its result is
+`ANOLE_E_GONE`).
+
+**`anole_smtp_send_raw(mail, consumer, envelope_from, recipients, n, bytes,
+len, &options, user_data)`** sends a message the language's own library
+composed (nodemailer's `MailComposer`, Python's `email`), as it is,
+dot-stuffed and with CRLF line ends. `envelope_from` of `{NULL,0}` is the
+null sender.
+
+The answer is one **`ANOLE_EV_SMTP_RESULT`** (`anole_smtp_result_event`) to
+the consumer, with the call's `user_data`:
+
+- `status`: `ANOLE_OK` (accepted for at least one recipient),
+  `ANOLE_E_SERVICE` (the server refused or could not be reached),
+  `ANOLE_E_TIMEOUT`, or `ANOLE_E_GONE`.
+- `http_status` and `error_class` (`ANOLE_DB_ERR_UNAVAILABLE`, `_INVALID`,
+  `_TIMEOUT`, `_OTHER`) as Anole's handlers would answer; `error` and
+  `error_code` ("recipient_rejected", "authentication_failed", "5.7.1")
+  say why, for logs.
+- `smtp_code` is the server's last reply code (250 on success).
+- `message_id` (without the angle brackets) and `response` (the answer to
+  the final ".", often a queue id) are spans in the record.
+- `nrejected` recipients the server refused while taking others:
+  `anole_smtp_rejected` at `rejected_off` (address, code, the server's
+  words).
+
+Like every send, a mail send returns once the call has copied the message;
+the network is never waited for on the caller's thread.
+
 ## gRPC
 
 A `"grpc"` section serves gRPC services whose methods the consumer
@@ -1553,6 +2000,31 @@ server in C and its client in Zig (`tests/capi/wt_client.zig`, built with
 the suite and passed to it), since C has no WebTransport client. `tests/capi/bench.sh` compares consumer
 routes with native ones.
 
+## From ABI 0.9
+
+ABI 0.10 comes with Anole 0.4.0. A 0.9 binding rebuilds against the new
+`anole.h` (`ANOLE_ABI_COMPATIBLE` asks for an exact match before 1.0). What it
+notices:
+
+- A handle's kind takes five bits (28-32): Kafka groups and batches are
+  kinds 17 and 18 (`anole_kafka_group`, `anole_kafka_batch`), no longer NATS
+  kinds with a marker bit, so a NATS handle given to a Kafka call (or the
+  reverse) is `ANOLE_E_INVALID` (`WrongHandleKind`). Handles stay opaque.
+- One new status, `ANOLE_E_SERVICE` (-13), for the object store and mail
+  calls.
+- New event types, each sent only to a consumer that configures its area:
+  raw TCP/UDP 96-100, jobs 104-108, webhooks 109-110, SSE 112-113, watch
+  116-118, S3 124-125, SMTP 126; and handle kinds 10-16 (`anole_net_conn`,
+  `anole_net_udp`, `anole_job_worker`, `anole_job`, `anole_sse`,
+  `anole_watch_sub`, `anole_s3_transfer`). A `switch` over every event type
+  needs the new names; a default case keeps working.
+- `anole_stats` has six more `u64` fields at the end (the raw TCP/UDP
+  counters); a caller that passes its `size` gets the fields it knows.
+- New configuration keys: `"tcp"`/`"udp"` listeners, `"jobs"`,
+  `"webhooks"`, `"storage"`, `"mail"`, `"sse"` (and `"sse"` routes),
+  `"watches"`, `"lambda"`, and `"deployment": "lambda"`, which no longer
+  fails with `DeploymentUnavailable`.
+
 ## From ABI 0.6
 
 ABI 0.8 only adds `anole_wt_stream_set_priority`; nothing from 0.7 changes.
@@ -1608,7 +2080,9 @@ reasons, the SENT contract and a poll that never drops an event. 0.8 adds
 `anole_wt_stream_set_priority`. 0.9 is the developer-experience release:
 environment and deployment modes with `.env` files, the NATS and Kafka
 brokers, breakers and retries on databases, JSON Lines logs, the banner and
-the live console. Before 1.0
+the live console. 0.10 adds raw TCP and UDP listeners, jobs and webhooks,
+SSE topics and watches, S3 and SMTP, gRPC over HTTP/3 for services in the
+language, and AWS Lambda, with five bits for a handle's kind. Before 1.0
 every minor may break (`ANOLE_ABI_COMPATIBLE` asks for an exact match).
 The freeze, ABI 1.0, comes after anole-node 0.1 and anole-py 0.1 ship on it.
 
@@ -1618,3 +2092,105 @@ Auth beyond the configured `jwt` middleware comes later.
 ## Breakers and retries (databases)
 
 Every `databases[]` entry of a network connector (PostgreSQL, Redis, MongoDB) takes `"breaker"` (an object with `consecutive_failures`, `failure_ratio`, `min_calls`, `window_ms`, `open_ms`, `max_open_ms`, `half_open_calls`; `null` turns it off; ignored for SQLite) and `"retry"` (`attempts`, `base_ms`, `max_ms`, `multiplier`, `attempt_timeout_ms`, `max_retry_after_ms`). `ANOLE_DB_F_RETRY` marks a query that may run again on a transient failure; it is refused (`ANOLE_E_INVALID`) on `anole_db_tx_query` and `anole_db_tx_exec`, and SQLite and MongoDB ignore it. An open breaker answers `ANOLE_EV_DB_RESULT` with `status = ANOLE_E_DB`, `error_class = ANOLE_DB_ERR_UNAVAILABLE`, `http_status = 503` and `error_code = "circuit_open"`.
+
+## Webhooks
+
+Two things, both native: sending signed webhooks to your customers' endpoints, and checking the ones you receive. Neither needs your language except to say what happened.
+
+### Out (`-Dwebhooks`, needs `"jobs"`)
+
+The `"webhooks"` configuration turns on endpoints, signed deliveries and the delivery log. Each delivery runs as a job: signed as [Standard Webhooks](https://www.standardwebhooks.com) (`webhook-id`, `webhook-timestamp`, `webhook-signature`), sent through a client that refuses private addresses in production, retried with backoff for about three days (5 s, 25 s, 2 min, 10 min, 52 min, 4.3 h, 21.7 h, 24 h), and recorded. A `410` disables the endpoint. An endpoint whose deliveries all failed for `disable_after_ms` (5 days) is disabled. Secrets are encrypted at rest with XChaCha20-Poly1305 when the variable named by `secrets_key_env` holds a 32-byte base64 key.
+
+- `anole_webhooks_publish(jobs, consumer, &out, user_data)` sends one event (copied) to the owner's matching endpoints. It returns at once; `ANOLE_EV_WEBHOOK_PUBLISHED` answers with the message id, the number of deliveries and `duplicate` (the `id` was published before: nothing new is enqueued). `anole_webhook_out.tx` names an open `anole_db_tx`: the deliveries are enqueued in that transaction, so they exist only if it commits, and the answer is `ANOLE_EV_DB_RESULT` on the transaction (`rows_affected` is the number of deliveries).
+- `anole_webhooks_watch(jobs, consumer, user_data)` sends `ANOLE_EV_WEBHOOK_STATUS` to that consumer when a delivery is dead or an endpoint was disabled, so your app can tell its customer. Calling it again replaces the consumer.
+- Endpoints (create, update, delete, get, list, rotate the secret, enable), replaying or recovering messages and reading the delivery log go through `anole_jobs_admin` (the `webhooks.*` operations under Jobs, "Admin").
+
+A send returns once the event is buffered; a slow endpoint never blocks the caller.
+
+### In (`webhook_verify`)
+
+A native middleware, on the whole server or a route:
+
+```json
+{ "webhook_verify": { "preset": "stripe", "secrets_env": "STRIPE_WEBHOOK_SECRET" } }
+```
+
+Presets: `standard` (v1 HMAC and v1a Ed25519), `stripe`, `github`, `slack`, `hmac` (a header, algorithm, encoding and prefix of your choice). The signature is checked over the body as received; several secrets are tried (rotation). A missing or wrong signature, or a timestamp outside `tolerance_ms` (5 minutes), answers 400 with no detail. A delivery id seen before answers 200 without reaching your handler; one still being processed answers 409 with `Retry-After`. `dedup` is `"memory"` (the default), `"none"` or `"redis:<database>"`. Read the body with the request's body and parse that, never a re-serialized copy.
+
+## Lambda
+
+With `"deployment": "lambda"` (or `ANOLE_DEPLOYMENT=lambda` in the
+environment) the same configuration serves AWS Lambda invocations: libanole
+polls the Lambda Runtime API at `AWS_LAMBDA_RUNTIME_API`, turns each HTTP
+event (API Gateway REST and HTTP APIs, Function URLs, ALB, VPC Lattice) into
+a request through the router and the native routes, and posts the answer
+back. Events that are not HTTP requests (SQS, SNS, EventBridge, schedules)
+arrive as a `POST` to `lambda.event_path` with the event as the body; a 2xx
+answer's body is the invocation's result. No new functions, events or
+handle kinds: a consumer sees ordinary `ANOLE_EV_REQUEST` records. Built with
+`-Dlambda`, on in every profile (`anole_has_feature("lambda")`). What the
+mapping does is in [lambda.md](lambda.md).
+
+**The binding contract.**
+
+- The binding's process runs as the function's runtime, with
+  `ANOLE_DEPLOYMENT=lambda` in its environment, its handlers attached as
+  usual. At concurrency 1 (classic Lambda) one consumer is enough.
+- On the managed Node.js or Python runtime, set `AWS_LAMBDA_EXEC_WRAPPER`
+  to the binding's wrapper script and the handler setting to the app's entry
+  file; the script does `export ANOLE_DEPLOYMENT=lambda; exec node
+  "$LAMBDA_TASK_ROOT/$_HANDLER"` (Python: `exec python3 ...`) and ignores
+  the runtime client it was given. On `provided.al2023` with the language in
+  a layer, `bootstrap` is the same script.
+- Embedded mode installs no signal handlers. With `lambda.sigterm` on,
+  Lambda sends SIGTERM before it shuts the environment down; the binding
+  calls `anole_server_drain`, which stops polling and ends the run within
+  `lambda.shutdown_timeout_ms`.
+- A request record's `listener` is `"lambda"` and its `remote_addr`
+  `"<client ip>:0"` (`"0.0.0.0:0"` when the event names no client).
+  `anole_server_listener` reports the configured listeners with port 0:
+  nothing is bound.
+- The invocation arrives in two request headers, as AWS Lambda Web Adapter
+  sends them: `x-amzn-request-context` (the event's `requestContext` as
+  JSON) and `x-amzn-lambda-context` (`request_id`, `deadline`,
+  `invoked_function_arn`, `xray_trace_id`, `client_context`, `identity`,
+  `env_config`). A client's own copies are removed first.
+- `timeout_us` follows the invocation: it is the earlier of the route's
+  deadline and the invocation's deadline less `lambda.deadline_margin_ms`.
+  Past it the request is answered 504 before Lambda's own timeout ends the
+  environment.
+- To give the AWS SDKs their per-invocation trace ID, a binding sets its
+  language-level `_X_AMZN_TRACE_ID` from `x-amzn-lambda-context`'s
+  `xray_trace_id` when a request starts (safe at concurrency 1 only).
+- Lambda web functions (`AWS_LAMBDA_HTTP_ENDPOINT` set, and no
+  `lambda.runtime_api`): the same `ANOLE_DEPLOYMENT=lambda` makes libanole
+  listen on that endpoint, HTTP/1.1 only, and set aside every other
+  listener.
+
+**Keys** (`"lambda": { ... }`; ignored by other deployments):
+
+| Key | Default | Zig |
+| --- | --- | --- |
+| `runtime_api` | null | `lambda.runtime_api` ("host:port"; null: `AWS_LAMBDA_RUNTIME_API`) |
+| `invoke_mode` | null | `lambda.invoke_mode` ("buffered" or "response_stream"; null: `ANOLE_LAMBDA_INVOKE_MODE`, else buffered) |
+| `concurrency` | null | `lambda.concurrency` (1 to 4096; null: `AWS_LAMBDA_MAX_CONCURRENCY`, else 1) |
+| `event_path` | "/_lambda/event" | `lambda.event_path` (null: other events fail with `Runtime.UnsupportedEvent`) |
+| `base_path` | null | `lambda.base_path` |
+| `keep_stage` | false | `lambda.keep_stage` |
+| `context_headers` | true | `lambda.context_headers` |
+| `deadline_margin_ms` | 100 | `lambda.deadline_margin` |
+| `idle_reset_ms` | 300000 | `lambda.idle_reset` (null: never) |
+| `sigterm` | true | `lambda.sigterm` |
+| `shutdown_timeout_ms` | 400 | `lambda.shutdown_timeout` |
+| `flush_timeout_ms` | 500 | `lambda.flush_timeout` |
+
+- `anole_nats_subscribe`, `anole_nats_js_consume` and `anole_kafka_subscribe`
+  answer `ANOLE_E_STATE` under `deployment = lambda`: the process is frozen
+  between invocations, so nothing would deliver. Publishing and producing
+  work; an event source mapping delivers queue and stream messages to the
+  event path.
+
+Errors: `LambdaRuntimeApiMissing` and `LambdaNotBuilt` from
+`anole_server_create`, `SnapStartUnsupported` from `anole_server_start`, and
+`LambdaRuntimeApiFailed` when the Runtime API fails (the run ends; Lambda
+starts a new environment). See [Status codes](#status-codes).

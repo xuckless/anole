@@ -105,7 +105,7 @@ extern "C" {
 #endif
 
 #define ANOLE_ABI_VERSION_MAJOR 0 /* breaking changes */
-#define ANOLE_ABI_VERSION_MINOR 9 /* additions (and, before 1.0, breaking changes; see CHANGELOG.md) */
+#define ANOLE_ABI_VERSION_MINOR 10 /* additions (and, before 1.0, breaking changes; see CHANGELOG.md) */
 #define ANOLE_ABI_VERSION ((ANOLE_ABI_VERSION_MAJOR << 16) | ANOLE_ABI_VERSION_MINOR)
 /* Whether a library reporting anole_abi_version() == v serves code built
    against this header. Before 1.0 both numbers must match (every 0.x minor
@@ -155,8 +155,11 @@ enum {
   ANOLE_E_SYSTEM = -9,      /* the OS refused (threads, sockets, files) */
   ANOLE_E_TIMEOUT = -10,    /* a blocking call's timeout passed */
   ANOLE_E_DB = -11,         /* a database refused a statement (anole_db_result_event) */
-  ANOLE_E_BROKER = -12      /* a message broker refused a call or could not be reached
+  ANOLE_E_BROKER = -12,     /* a message broker refused a call or could not be reached
                                (anole_nats_reply_event: error_class says why) */
+  ANOLE_E_SERVICE = -13     /* ABI 0.10: an object store or mail server refused a call or could not be
+                               reached (the record's error_class, http_status and error_code
+                               say why) */
 };
 
 /* The text of the last error on the calling thread, for logs: not API.
@@ -168,7 +171,7 @@ ANOLE_API anole_str anole_last_error(void);
    "AddressInUse", "KeyMismatch", "UnknownField", "WrongHandleKind"; or, when
    there is none, the code's own name: "Invalid", "Gone", "Again",
    "NoMemory", "Config", "State", "Unsupported", "TooBig", "System",
-   "Timeout", "Database". Static storage. API: bindings may switch on it,
+   "Timeout", "Database", "Broker", "Service". Static storage. API: bindings may switch on it,
    and tokens are only ever added. */
 ANOLE_API anole_str anole_last_error_name(void);
 /* The OS error behind the last error on this thread: errno on POSIX, the
@@ -181,14 +184,15 @@ ANOLE_API uint32_t anole_abi_version(void);
 ANOLE_API anole_str anole_version(void);
 /* 1 when `name` is built in, else 0: "tls", "http2", "http3",
    "webtransport" (with http3), "websocket", "compression", "brotli",
-   "auth", "grpc", "sqlite", "postgres", "redis", "mongodb". */
+   "auth", "grpc", "sqlite", "postgres", "redis", "mongodb", "nats", "kafka",
+   "console", "net", "jobs", "webhooks", "s3", "smtp", "lambda". */
 ANOLE_API int32_t anole_has_feature(anole_str name);
 
 /* 64-bit, generation-checked; 0 is never valid. Each handle has a kind
-   (a request, a WebSocket, a gRPC call, a WebTransport session or stream, a
-   database transaction), and a function given a handle of another
-   kind, or 0, answers ANOLE_E_INVALID. The bits are Anole's: treat them as
-   opaque. */
+   (one typedef below each), and a function given a handle of another kind,
+   or 0, answers ANOLE_E_INVALID. The bits are Anole's: treat them as opaque
+   (since ABI 0.10 the kind has five bits, so Kafka groups and batches are
+   kinds of their own). */
 typedef uint64_t anole_req;       /* one request: from ANOLE_EV_REQUEST until answered */
 typedef uint64_t anole_ws;        /* one WebSocket: from ANOLE_EV_WS_OPEN until ANOLE_EV_WS_CLOSE */
 typedef uint64_t anole_grpc_call; /* one gRPC call: from ANOLE_EV_GRPC_CALL until finished or aborted */
@@ -197,6 +201,13 @@ typedef uint64_t anole_wt_stream; /* one of its streams: until anole_handle_rele
 typedef uint64_t anole_db_tx;     /* one database transaction: from the answer to anole_db_begin until commit, rollback or release */
 typedef uint64_t anole_nats_sub;  /* a NATS subscription or JetStream consume: until ANOLE_EV_NATS_SUB_END */
 typedef uint64_t anole_nats_msg;  /* a JetStream message: until acked, nak'd, termed or released */
+typedef uint64_t anole_net_conn;   /* one raw TCP connection: from ANOLE_EV_NET_OPEN until ANOLE_EV_NET_CLOSE */
+typedef uint64_t anole_net_udp;    /* one UDP socket of a raw listener: from start until ANOLE_EV_STOPPED */
+typedef uint64_t anole_job_worker; /* a jobs worker: until ANOLE_EV_JOB_WORKER_END */
+typedef uint64_t anole_job;        /* one job a worker holds: until finished, released or ANOLE_EV_JOB_CANCEL */
+typedef uint64_t anole_sse;        /* one SSE subscriber a consumer accepted: until ANOLE_EV_SSE_CLOSE */
+typedef uint64_t anole_watch_sub;  /* one watch listener: until ANOLE_EV_WATCH_END */
+typedef uint64_t anole_s3_transfer; /* an S3 upload or download: until finished, failed or released */
 typedef uint64_t anole_kafka_group; /* a Kafka group membership: until ANOLE_EV_KAFKA_GROUP_END */
 typedef uint64_t anole_kafka_batch; /* the records of one partition: until done, retried or released */
 typedef struct anole_server anole_server;     /* opaque */
@@ -270,6 +281,8 @@ ANOLE_API anole_status anole_server_set_ready(anole_server *s, anole_str check, 
 #define ANOLE_LISTENER_F_HTTP3 8u
 #define ANOLE_LISTENER_F_UNIX 16u
 #define ANOLE_LISTENER_F_PROXY_PROTOCOL 32u
+#define ANOLE_LISTENER_F_TCP 64u  /* a raw TCP listener ("tcp" in the configuration) */
+#define ANOLE_LISTENER_F_UDP 128u /* a UDP listener ("udp"): port is 0, udp_port is the bound port */
 enum {
   ANOLE_LISTENER_PENDING = 0,   /* not bound yet (before start, or start under way) */
   ANOLE_LISTENER_LISTENING = 1, /* bound and accepting */
@@ -349,6 +362,14 @@ typedef struct anole_stats {
   uint64_t ws_messages_out;
   uint64_t wt_sessions;          /* WebTransport sessions open now */
   uint64_t wt_datagrams_dropped; /* outgoing datagrams dropped: past datagram_queue, or too large */
+  /* ---- p3/net ---- */
+  uint64_t net_connections;       /* raw TCP connections open now */
+  uint64_t net_bytes_in;          /* bytes read from raw TCP connections (added as each closes) */
+  uint64_t net_bytes_out;
+  uint64_t udp_datagrams_in;
+  uint64_t udp_datagrams_out;
+  uint64_t udp_datagrams_dropped; /* received but lost (kernel buffer, too large) or refused to send */
+  /* ---- end p3/net ---- */
 } anole_stats;
 /* Counters since start. Fills what out->size covers. */
 ANOLE_API anole_status anole_server_stats(anole_server *s, anole_stats *out);
@@ -429,8 +450,9 @@ enum anole_event_type {
                               its answer (the client went away, its deadline passed, its body broke
                               a limit, the drain cut it); nothing more is owed, and answer calls on
                               it get ANOLE_E_GONE */
-  ANOLE_EV_WRITABLE = 4,   /* anole_event: a streamed response, gRPC call, WebSocket or WebTransport
-                              stream that took ANOLE_BUSY has room (ev.handle) */
+  ANOLE_EV_WRITABLE = 4,   /* anole_event: a streamed response, gRPC call, WebSocket, WebTransport
+                              stream, raw TCP connection or UDP socket that took ANOLE_BUSY (or
+                              was refused with ANOLE_E_AGAIN) has room (ev.handle) */
   ANOLE_EV_SENT = 5,       /* anole_sent_event: a borrowed body is no longer read */
   ANOLE_EV_WS_OPEN = 6,    /* anole_request_event (the upgrade request; subprotocol set); handle:
                               anole_ws. Routes with "accept": "auto" only (the default) */
@@ -483,6 +505,62 @@ enum anole_event_type {
   ANOLE_EV_KAFKA_WRITABLE = 84,  /* anole_broker_status_event: a produce refused with
                                     ANOLE_E_AGAIN (or advised with ANOLE_BUSY) would be taken now */
   ANOLE_EV_KAFKA_GROUP_END = 85, /* anole_broker_end_event; handle: anole_kafka_group, now over */
+  /* ---- p3/net ---- */
+  ANOLE_EV_NET_OPEN = 96,        /* anole_net_open_event; handle: anole_net_conn, until
+                                    ANOLE_EV_NET_CLOSE */
+  ANOLE_EV_NET_DATA = 97,        /* anole_net_data_event; handle: anole_net_conn */
+  ANOLE_EV_NET_END = 98,         /* anole_event: the peer ended its side. With tcp.half_open,
+                                    end this side when done (ANOLE_NET_F_END or a close) */
+  ANOLE_EV_NET_CLOSE = 99,       /* anole_net_close_event: the connection is over; its handle
+                                    is stale */
+  ANOLE_EV_NET_DATAGRAMS = 100,  /* anole_net_datagrams_event; handle: anole_net_udp */
+  /* ---- end p3/net ---- */
+
+  /* ---- p3/jobs ---- */
+  ANOLE_EV_JOB_ENQUEUED = 104,    /* anole_job_enqueued_event; handle 0 (user_data), or the anole_db_tx it ran on */
+  ANOLE_EV_JOB = 105,             /* anole_job_event; handle: anole_job; owes anole_job_finish
+                                     (anole_handle_release = retry now) */
+  ANOLE_EV_JOB_CANCEL = 106,      /* anole_job_cancel_event; handle: anole_job, now over */
+  ANOLE_EV_JOB_WORKER_END = 107,  /* anole_job_worker_end_event; handle: anole_job_worker, now over */
+  ANOLE_EV_JOBS_RESULT = 108,     /* anole_jobs_result_event: the answer to anole_jobs_admin */
+  /* ---- end p3/jobs ---- */
+
+  /* ---- p3/webhooks ---- */
+  ANOLE_EV_WEBHOOK_PUBLISHED = 109, /* anole_webhook_published_event: the answer to
+                                    anole_webhooks_publish; handle 0, or the anole_db_tx it ran in */
+  ANOLE_EV_WEBHOOK_STATUS = 110, /* anole_webhook_status_event: a delivery ran out of attempts, or an
+                                    endpoint was disabled; only after anole_webhooks_watch */
+  /* ---- end p3/webhooks ---- */
+
+  /* ---- p3/realtime ---- */
+  ANOLE_EV_SSE_SUBSCRIBE = 112,  /* anole_request_event; handle: anole_req. A subscription on a route
+                                    with "sse": {"handler": ...}: answer it with anole_sse_accept, or
+                                    refuse it with any answer to a request (anole_req_respond,
+                                    anole_req_fail, anole_req_abort) */
+  ANOLE_EV_SSE_CLOSE = 113,      /* anole_sse_close_event; handle: anole_sse, now over */
+  ANOLE_EV_WATCH_EVENT = 116,    /* anole_watch_event; handle: anole_watch_sub. A stream group with
+                                    "ack": "manual" owes anole_watch_ack for it */
+  ANOLE_EV_WATCH_STATUS = 117,   /* anole_watch_status_event; handle: anole_watch_sub */
+  ANOLE_EV_WATCH_END = 118,      /* anole_watch_end_event; handle: anole_watch_sub, now over */
+  /* ---- end p3/realtime ---- */
+
+  /* ---- p3/s3 ---- */
+  ANOLE_EV_S3_RESULT = 124,  /* anole_s3_result_event: the answer of an anole_s3_* call. Handle: 0, or
+                                the anole_s3_transfer it opens (anole_s3_upload_open, a streamed
+                                anole_s3_get: owes write/finish/read_more until done, or
+                                anole_handle_release) or ends (UPLOAD_FINISH) */
+  ANOLE_EV_S3_DATA = 125,    /* anole_s3_data_event: the next bytes of a streamed download
+                                (handle: the download; its FIN ends the handle) */
+  /* ---- end p3/s3 ---- */
+
+  /* ---- p3/smtp ---- */
+  ANOLE_EV_SMTP_RESULT = 126,    /* anole_smtp_result_event: the answer to anole_smtp_send or
+                                    anole_smtp_send_raw; handle 0 (user_data) */
+  /* ---- end p3/smtp ---- */
+
+  /* ---- p3/lambda ---- */
+  /* ---- end p3/lambda ---- */
+
   ANOLE_EV_CONSOLE_CLOSED = 132  /* anole_console_closed_event, handle 0: the in-process console
                                     (anole_console_open) closed; the terminal is the binding's
                                     again. Only after anole_console_open. 133-135 are reserved
@@ -847,7 +925,8 @@ ANOLE_API int64_t anole_req_read(anole_req r, void *buf, size_t cap, int32_t tim
 
 /* ---- responses ------------------------------------------------------------------ */
 
-/* Body flags. ANOLE_BODY_BORROW: Anole reads the bytes where they are
+/* Body flags. ANOLE_BODY_BORROW (also for anole_net_write: borrowing pays for
+   large writes on plain TCP): Anole reads the bytes where they are
    instead of copying them; they must stay valid and unchanged until
    ANOLE_EV_SENT for them. With ANOLE_BODY_BORROW, a call that answers >= 0
    (OK or BUSY) produces exactly one ANOLE_EV_SENT for that (data, len),
@@ -930,6 +1009,8 @@ ANOLE_API anole_status anole_req_abort(anole_req r);
                       let go (the peer may open another)
      database         an open transaction is rolled back
      transaction
+     raw TCP          closed gracefully (anole_net_close): what is queued goes
+     connection       out, this side ends; a UDP socket: nothing (ANOLE_OK)
    A cleanup call: ANOLE_OK also when the object is already over, from any
    thread, before or after the server is destroyed. ANOLE_E_INVALID for 0
    or a value that is no handle kind. */
@@ -1362,7 +1443,11 @@ enum {
   ANOLE_DB_ERR_DEADLOCK = 7,
   ANOLE_DB_ERR_UNAVAILABLE = 8,   /* no connection, or busy past its timeout */
   ANOLE_DB_ERR_TIMEOUT = 9,
-  ANOLE_DB_ERR_OTHER = 10         /* syntax, a wrong parameter count, ... */
+  ANOLE_DB_ERR_OTHER = 10,        /* syntax, a wrong parameter count, ... */
+  ANOLE_DB_ERR_NOT_FOUND = 11,    /* the object, bucket or upload does not exist (S3 404) */
+  ANOLE_DB_ERR_PRECONDITION = 12, /* a condition the call set did not hold (S3 412, 409) */
+  ANOLE_DB_ERR_INVALID = 13       /* the service refused the input: a range past the end, a
+                                     key too long, every mail recipient refused */
 };
 
 /* One cell of a row. Text and blobs are spans in the record.
@@ -1749,6 +1834,931 @@ typedef struct anole_kafka_assign_event {
   uint32_t entries_off;  /* nentries anole_kafka_partition */
   uint32_t nentries;
 } anole_kafka_assign_event; /* 32 bytes */
+
+/* ---- p3/net ---- */
+/* ---- raw TCP and UDP ----
+   A "tcp" or "udp" key on a listener in the configuration serves that
+   listener's connections (TCP, optionally with TLS, PROXY protocol and a
+   framing) or datagrams (UDP) to the consumer as events, instead of HTTP.
+   Writes never wait for the peer: a write returns once the bytes are
+   queued (ANOLE_BUSY past tcp.write_high_water, ANOLE_E_AGAIN past
+   tcp.write_max with nothing taken), and ANOLE_EV_WRITABLE says when to go
+   on. A connection posts at most tcp.read_ahead bytes the consumer has not
+   polled; the rest waits in the kernel (TCP flow control). */
+
+/* An IP address and port, binary (no parsing on the hot path). family 4:
+   addr[0..4]; 6: addr[0..16] (IPv4 peers of a dual-stack socket come as 4);
+   0: none (a unix socket). */
+typedef struct anole_net_addr {
+  uint16_t family;
+  uint16_t port;
+  uint32_t scope_id;   /* IPv6 link-local zone, else 0 */
+  uint8_t addr[16];
+} anole_net_addr;      /* 24 bytes */
+
+/* "203.0.113.9:4711", "[2001:db8::1]:443": bytes written (no NUL), or
+   ANOLE_E_TOOBIG when cap is short (64 always fits), ANOLE_E_INVALID for
+   family 0 or another. No server needed. */
+ANOLE_API int64_t anole_net_addr_format(const anole_net_addr *a, char *buf, size_t cap);
+/* The reverse, for a literal address and a port ("[::1]:53", "10.0.0.1:53").
+   ANOLE_E_INVALID for anything else (names are not resolved). */
+ANOLE_API anole_status anole_net_addr_parse(anole_str text, anole_net_addr *out);
+
+/* anole_net_open_event.flags */
+#define ANOLE_NET_OPEN_F_TLS 1u       /* TLS on this listener */
+#define ANOLE_NET_OPEN_F_PEER_CERT 2u /* mutual TLS: see peer_cert */
+#define ANOLE_NET_OPEN_F_PROXIED 4u   /* remote and local come from a PROXY header */
+#define ANOLE_NET_OPEN_F_SECURE 8u    /* TLS here, or the PROXY v2 SSL TLV */
+#define ANOLE_NET_OPEN_F_UNIX 16u
+enum {
+  ANOLE_NET_FRAMING_NONE = 0,
+  ANOLE_NET_FRAMING_LINES = 1,
+  ANOLE_NET_FRAMING_LENGTH = 2,
+  ANOLE_NET_FRAMING_VARINT = 3
+};
+
+/* ANOLE_EV_NET_OPEN: a connection on a "tcp" listener, ready (PROXY header
+   read, TLS handshake done). Data, END and CLOSE follow on this consumer.
+   The spans point into the record, after the struct. */
+typedef struct anole_net_open_event {
+  anole_event ev;          /*   0 handle: anole_net_conn */
+  uint32_t handler_id;     /*  16 the listener's tcp.handler */
+  uint32_t flags;          /*  20 ANOLE_NET_OPEN_F_* */
+  anole_net_addr remote;   /*  24 the client (the PROXY source when proxied) */
+  anole_net_addr local;    /*  48 */
+  anole_span listener;     /*  72 */
+  anole_span remote_text;  /*  80 "ip:port" ("[ip]:port"); empty on a unix socket */
+  anole_span alpn;         /*  88 the protocol ALPN chose, empty when none */
+  anole_span server_name;  /*  96 SNI */
+  anole_span peer_cert;    /* 104 DER, with ANOLE_NET_OPEN_F_PEER_CERT */
+  uint32_t framing;        /* 112 ANOLE_NET_FRAMING_* of the listener */
+  uint32_t reserved;       /* 116 */
+} anole_net_open_event;    /* 120 bytes */
+
+#define ANOLE_NET_DATA_F_FRAMES 1u /* each span is one whole frame (prefix or line end removed) */
+/* ANOLE_EV_NET_DATA: what one read burst brought, followed at frames_off by
+   `anole_span frames[nframes]` and the bytes. Without framing: one span, the
+   bytes as they came (up to 64 KiB per record). With framing: every whole
+   frame of the burst, in order (a frame larger than 64 KiB comes in a record
+   of its own). Each record's bytes count against the connection's read_ahead
+   until polled. */
+typedef struct anole_net_data_event {
+  anole_event ev;          /*  0 handle: anole_net_conn */
+  uint32_t flags;          /* 16 ANOLE_NET_DATA_F_* */
+  uint32_t nframes;        /* 20 */
+  uint32_t frames_off;     /* 24 */
+  uint32_t reserved;       /* 28 */
+} anole_net_data_event;    /* 32 bytes */
+
+enum {
+  ANOLE_NET_CLOSED_PEER = 0,
+  ANOLE_NET_CLOSED_LOCAL = 1,
+  ANOLE_NET_CLOSED_RESET = 2,
+  ANOLE_NET_CLOSED_FAILED = 3,
+  ANOLE_NET_CLOSED_IDLE = 4,
+  ANOLE_NET_CLOSED_WRITE_TIMEOUT = 5,
+  ANOLE_NET_CLOSED_LIFETIME = 6,
+  ANOLE_NET_CLOSED_FRAME = 7,
+  ANOLE_NET_CLOSED_DRAIN = 8,
+  ANOLE_NET_CLOSED_SERVER = 9
+};
+/* ANOLE_EV_NET_CLOSE: the connection is over; its handle is stale. */
+typedef struct anole_net_close_event {
+  anole_event ev;          /*  0 */
+  uint32_t reason;         /* 16 ANOLE_NET_CLOSED_* */
+  int32_t error_errno;     /* 20 the OS error behind FAILED or RESET, else 0 */
+  uint64_t bytes_in;       /* 24 */
+  uint64_t bytes_out;      /* 32 */
+  uint64_t duration_ms;    /* 40 */
+  anole_span error;        /* 48 a token for logs ("ConnectionReset", "InvalidFrame"), empty when none */
+} anole_net_close_event;   /* 56 bytes */
+
+/* One datagram of an ANOLE_EV_NET_DATAGRAMS. */
+typedef struct anole_net_datagram_in {
+  anole_net_addr remote;   /*  0 */
+  anole_net_addr local;    /* 24 the address it was sent to (family 0 when the socket is not wildcard-bound) */
+  anole_span data;         /* 48 */
+  uint64_t reserved;       /* 56 */
+} anole_net_datagram_in;   /* 64 bytes */
+/* ANOLE_EV_NET_DATAGRAMS: one receive batch of a "udp" listener's socket
+   (ev.handle; reply through it), followed at datagrams_off by
+   `anole_net_datagram_in datagrams[ndatagrams]` and the bytes. A peer's
+   datagrams always come through the same socket, in order. */
+typedef struct anole_net_datagrams_event {
+  anole_event ev;          /*  0 handle: anole_net_udp */
+  uint32_t handler_id;     /* 16 */
+  uint32_t ndatagrams;     /* 20 */
+  uint32_t datagrams_off;  /* 24 */
+  uint32_t dropped;        /* 28 datagrams lost on this socket since its last record (the kernel's
+                                  receive buffer overflowed, or one was too large) */
+} anole_net_datagrams_event; /* 32 bytes */
+
+/* anole_net_write flags (bit 0 is ANOLE_BODY_BORROW) */
+#define ANOLE_NET_F_END 2u   /* after these bytes (len may be 0), end this side: TLS close_notify, then FIN */
+#define ANOLE_NET_F_FRAME 4u /* frame the bytes by the listener's framing (prefix, or line end) */
+
+/* Queues bytes (copied, or borrowed with ANOLE_BODY_BORROW: ANOLE_EV_SENT
+   follows; a framed write is always copied); never blocks, never waits for
+   the peer. ANOLE_OK; ANOLE_BUSY: taken, but past tcp.write_high_water bytes
+   wait (write no more until ANOLE_EV_WRITABLE on c); ANOLE_E_AGAIN: not
+   taken, past tcp.write_max (ANOLE_EV_WRITABLE follows); ANOLE_E_INVALID: a
+   flag, ANOLE_NET_F_FRAME on a listener without framing or over its max, or
+   after this side ended ("Ended"); ANOLE_E_GONE once closed. */
+ANOLE_API anole_status anole_net_write(anole_net_conn c, const void *data, size_t len, uint32_t flags);
+
+enum { ANOLE_NET_CLOSE_GRACEFUL = 0, ANOLE_NET_CLOSE_RESET = 1 };
+/* GRACEFUL: what is queued goes out, this side ends, input is dropped until
+   the peer ends (at most 2 s), then ANOLE_EV_NET_CLOSE (LOCAL). RESET: now,
+   with an RST; queued bytes are dropped (borrowed ones get their SENT). A
+   cleanup call; anole_handle_release is GRACEFUL. */
+ANOLE_API anole_status anole_net_close(anole_net_conn c, uint32_t how);
+/* Stops reading c (its input waits in the kernel: TCP slows the peer) until
+   anole_net_resume. Data already read may still come. Answer calls:
+   ANOLE_E_GONE once closed. */
+ANOLE_API anole_status anole_net_pause(anole_net_conn c);
+ANOLE_API anole_status anole_net_resume(anole_net_conn c);
+/* Replaces the listener's tcp.idle_timeout_ms for c (0: none). */
+ANOLE_API anole_status anole_net_set_idle_timeout(anole_net_conn c, uint32_t ms);
+
+/* One datagram to send. from.family 0: the system picks the source. */
+typedef struct anole_net_datagram {
+  anole_net_addr to;       /*  0 */
+  anole_net_addr from;     /* 24 a received datagram's `local`, to answer from the address it reached */
+  const void *data;        /* 48 */
+  size_t len;              /* 56 */
+} anole_net_datagram;      /* 64 bytes */
+/* Queues n datagrams on u (all copied), sent together; never blocks. All or
+   none: ANOLE_OK; ANOLE_BUSY (taken, past half of udp.send_queue);
+   ANOLE_E_AGAIN (none taken: the queue is full; ANOLE_EV_WRITABLE on u
+   follows); ANOLE_E_INVALID (a datagram over 65507 bytes or the socket's
+   max_datagram, an address of the wrong family, n 0, flags != 0);
+   ANOLE_E_GONE after the stop. Datagrams are unreliable: one the kernel
+   refuses is dropped and counted. */
+ANOLE_API anole_status anole_net_udp_send(anole_net_udp u, const anole_net_datagram *d, size_t n, uint32_t flags);
+/* The first socket of the "udp" listener named `listener`, to send without
+   having received (any socket of a listener sends from its port). After
+   anole_server_start. ANOLE_E_INVALID ("UnknownListener"). */
+ANOLE_API anole_status anole_net_udp_find(anole_server *s, anole_str listener, anole_net_udp *out);
+/* ---- end p3/net ---- */
+
+/* ---- p3/jobs ---- */
+/* Durable background jobs ("jobs" in the configuration): enqueued from any
+   thread, run by a worker of this consumer's language, retried with backoff,
+   kept in the configured database. A job runs at least once. */
+
+typedef struct anole_jobs anole_jobs; /* opaque; lives until anole_server_destroy */
+
+/* The configuration's "jobs". ANOLE_E_UNSUPPORTED when the configuration has
+   none or -Djobs is off. From anole_server_open on. */
+ANOLE_API anole_status anole_jobs_get(anole_server *s, anole_jobs **out);
+
+/* anole_job_out.priority (0: the kind's) */
+enum { ANOLE_JOB_PRIORITY_DEFAULT = 0, ANOLE_JOB_PRIORITY_CRITICAL = 1, ANOLE_JOB_PRIORITY_HIGH = 2,
+       ANOLE_JOB_PRIORITY_NORMAL = 3, ANOLE_JOB_PRIORITY_LOW = 4 };
+/* anole_job_out.unique_scope (0: unfinished) */
+enum { ANOLE_JOB_UNIQUE_DEFAULT = 0, ANOLE_JOB_UNIQUE_PENDING = 1, ANOLE_JOB_UNIQUE_UNFINISHED = 2, ANOLE_JOB_UNIQUE_ANY = 3 };
+/* anole_job_out.flags: unique, by unique_key or by the args when it is empty
+   (bit 0 stays ANOLE_BODY_BORROW, refused) */
+enum { ANOLE_JOB_F_UNIQUE = 2 };
+
+/* One job to enqueue. Everything is copied. */
+typedef struct anole_job_out {
+  size_t size;               /* sizeof(anole_job_out) */
+  anole_str kind;            /* required */
+  anole_str args_json;       /* a JSON value; {NULL,0}: {} */
+  anole_str queue;           /* {NULL,0}: the kind's ("kinds"), else "default" */
+  anole_str unique_key;
+  anole_str meta_json;       /* a JSON object, or {NULL,0} */
+  int64_t run_at_ms;         /* Unix ms; 0: now (+ delay_ms) */
+  uint32_t delay_ms;         /* not with run_at_ms */
+  uint32_t flags;            /* ANOLE_JOB_F_* */
+  uint32_t unique_period_ms; /* 0: none */
+  uint16_t attempts;         /* 0: the kind's */
+  uint8_t priority;          /* ANOLE_JOB_PRIORITY_* */
+  uint8_t unique_scope;      /* ANOLE_JOB_UNIQUE_* */
+  uint32_t timeout_ms;       /* 0: the kind's; ANOLE_DB_TIMEOUT_NONE: none */
+  uint32_t reserved;
+} anole_job_out;             /* 120 bytes */
+
+typedef struct anole_jobs_enqueue_options {
+  size_t size;
+  uint32_t timeout_ms;       /* the store call; 0: the database's timeout_ms */
+  uint32_t reserved;
+  uint64_t tx;               /* an anole_db_tx on the jobs store's database (PostgreSQL, SQLite), or 0 */
+  uint64_t req;              /* the anole_req / anole_grpc_call it serves: picks its consumer's executor, or 0 */
+} anole_jobs_enqueue_options; /* 32 bytes */
+
+/* Queues 1..1000 jobs (copied), enqueued one after the other (not atomically
+   unless `tx` is given). One ANOLE_EV_JOB_ENQUEUED answers with an entry per
+   job in order. With `tx`, the inserts are calls on that transaction (in order
+   with its others) and commit with it; the answer is then the transaction's
+   usual ANOLE_EV_DB_RESULT, a table of the columns id and inserted. `c` may be
+   NULL with tx or req. Returns at once: ANOLE_OK; ANOLE_E_INVALID (a job: kind,
+   JSON, sizes, flags; tx on a Redis or memory store or on another database);
+   ANOLE_E_GONE (stale tx/req); ANOLE_E_STATE. */
+ANOLE_API anole_status anole_jobs_enqueue(anole_jobs *j, anole_consumer *c, const anole_job_out *jobs, size_t njobs,
+                                          const anole_jobs_enqueue_options *opts, uint64_t user_data);
+
+typedef struct anole_jobs_work_options {
+  size_t size;
+  anole_str queue;           /* {NULL,0}: "default"; must be in "jobs".queues */
+  const anole_str *kinds;    /* the kinds this worker runs; NULL/0: every kind of the queue */
+  size_t nkinds;
+  uint32_t concurrency;      /* jobs out at once; 0: the queue's concurrency */
+  uint32_t reserved;
+} anole_jobs_work_options;   /* 48 bytes */
+
+/* Runs `queue`'s jobs of `kinds` in the language: each is ANOLE_EV_JOB to `c`
+   with its own anole_job handle; at most `concurrency` are out at once. Before
+   the server starts (after anole_server_open). ANOLE_E_INVALID: an unknown
+   queue, a kind another worker already runs; ANOLE_E_STATE: after the start. */
+ANOLE_API anole_status anole_jobs_work(anole_jobs *j, anole_consumer *c, const anole_jobs_work_options *o,
+                                       uint64_t user_data, anole_job_worker *out);
+/* No more jobs for this worker (jobs handed to it later go back after a
+   second); jobs out still finish; then ANOLE_EV_JOB_WORKER_END. ANOLE_OK on one
+   that is over. */
+ANOLE_API anole_status anole_jobs_stop(anole_job_worker w);
+
+enum { ANOLE_JOB_DONE = 0, ANOLE_JOB_RETRY = 1, ANOLE_JOB_SNOOZE = 2, ANOLE_JOB_DISCARD = 3 };
+/* Ends the job's run. DONE: completed. RETRY: a failed attempt (`error` stored;
+   delay_ms 0: the kind's backoff); dead after the last. SNOOZE: run again after
+   delay_ms, the attempt not counted. DISCARD: dead now (`error` = the reason).
+   Returns at once; the store write follows (if it fails, the job runs again after
+   its lease: at-least-once). ANOLE_E_GONE: the job is over (canceled, timed out,
+   lease lost); ANOLE_E_INVALID: outcome, delay. */
+ANOLE_API anole_status anole_job_finish(anole_job job, uint32_t outcome, uint32_t delay_ms, anole_str error);
+/* Completes the job inside `tx` (the jobs store's database): a call on the
+   transaction, answered as ANOLE_EV_DB_RESULT (changes 1: it still held the
+   job) with user_data. The handle ends now; if the transaction rolls back, the
+   job runs again after its lease. */
+ANOLE_API anole_status anole_job_complete_in(anole_job job, anole_db_tx tx, uint64_t user_data);
+
+/* One JSON request, answered by ANOLE_EV_JOBS_RESULT with the JSON answer.
+   Operations (the "op" key): "jobs.get" {id}, "jobs.list" {state, queue, kind,
+   limit, before}, "jobs.counts", "jobs.retry" {id}, "jobs.cancel" {id},
+   "jobs.delete" {id}, "cron.list", "cron.trigger" {name}; and, when the
+   configuration has webhooks, "webhooks.endpoint.create" / ".update" /
+   ".delete" / ".get" / ".list" / ".rotate_secret" / ".enable",
+   "webhooks.replay", "webhooks.recover", "webhooks.attempts" and
+   "webhooks.messages" (keys and answers: docs/c-abi.md, Jobs, "Admin").
+   The jobs shapes are the admin routes'. */
+ANOLE_API anole_status anole_jobs_admin(anole_jobs *j, anole_consumer *c, anole_str request_json, uint64_t user_data);
+
+/* ANOLE_EV_JOB_ENQUEUED */
+typedef struct anole_job_enqueued_entry { int64_t id; uint32_t inserted; uint32_t reserved; } anole_job_enqueued_entry; /* 16 bytes */
+typedef struct anole_job_enqueued_event {
+  anole_event ev;          /* handle 0 */
+  uint64_t user_data;
+  int32_t status;          /* ANOLE_OK; ANOLE_E_DB; ANOLE_E_TIMEOUT; ANOLE_E_GONE */
+  uint16_t http_status;
+  uint8_t error_class;     /* ANOLE_DB_ERR_* */
+  uint8_t reserved;
+  uint32_t entries_off;    /* nentries anole_job_enqueued_entry (0 on failure) */
+  uint32_t nentries;
+  anole_span error;
+  anole_span error_code;
+} anole_job_enqueued_event; /* 56 bytes */
+
+/* ANOLE_EV_JOB */
+typedef struct anole_job_event {
+  anole_event ev;          /* the anole_job */
+  uint64_t user_data;      /* the worker's */
+  uint64_t worker;
+  int64_t id;
+  anole_span kind;
+  anole_span queue;
+  anole_span args;         /* JSON */
+  anole_span meta;         /* JSON object */
+  anole_span errors;       /* JSON array of earlier attempts' {attempt, at, error, message} */
+  int64_t run_at_ms;
+  int64_t created_at_ms;
+  int64_t timeout_us;      /* the run's time limit; -1: none */
+  uint16_t attempt;        /* 1 on the first run */
+  uint16_t max_attempts;
+  uint8_t priority;        /* ANOLE_JOB_PRIORITY_CRITICAL..LOW */
+  uint8_t reserved8;
+  uint16_t reserved16;
+  anole_span cron;         /* the schedule's name, empty when none */
+  anole_span traceparent;  /* of the request that enqueued it, or empty */
+} anole_job_event;         /* 128 bytes */
+
+/* ANOLE_EV_JOB_CANCEL reasons */
+enum { ANOLE_JOB_CANCEL_TIMEOUT = 1, ANOLE_JOB_CANCEL_ADMIN = 2, ANOLE_JOB_CANCEL_LEASE_LOST = 3, ANOLE_JOB_CANCEL_DRAIN = 4 };
+typedef struct anole_job_cancel_event {
+  anole_event ev;          /* the anole_job */
+  uint64_t user_data;
+  int64_t id;
+  uint32_t reason;         /* ANOLE_JOB_CANCEL_*: TIMEOUT stored as a failed attempt; DRAIN put back unnumbered */
+  uint32_t reserved;
+} anole_job_cancel_event;  /* 40 bytes */
+
+/* ANOLE_EV_JOB_WORKER_END reasons */
+enum { ANOLE_JOB_WORKER_STOPPED = 0, ANOLE_JOB_WORKER_DRAINED = 1, ANOLE_JOB_WORKER_FAILED = 2 };
+typedef struct anole_job_worker_end_event {
+  anole_event ev;
+  uint64_t user_data;
+  uint32_t reason;
+  uint32_t reserved;
+  anole_span error;
+} anole_job_worker_end_event; /* 40 bytes */
+
+/* ANOLE_EV_JOBS_RESULT */
+typedef struct anole_jobs_result_event {
+  anole_event ev;
+  uint64_t user_data;
+  int32_t status;          /* ANOLE_OK; ANOLE_E_INVALID (a bad request: error says what); ANOLE_E_DB; ANOLE_E_TIMEOUT */
+  uint16_t http_status;    /* what the admin routes answer: 200, 404, 409, 400, 503... */
+  uint8_t error_class;
+  uint8_t reserved;
+  anole_span json;         /* the answer */
+  anole_span error;
+} anole_jobs_result_event; /* 48 bytes */
+/* ---- end p3/jobs ---- */
+
+/* ---- p3/webhooks ---- */
+/* ---- webhooks out ----
+   The configuration's "webhooks" (it needs "jobs"): endpoints, signed deliveries run as jobs,
+   retries and the delivery log. Endpoint management and replay go through anole_jobs_admin
+   (anole_jobs is declared with the jobs functions). */
+
+typedef struct anole_webhook_out {
+  size_t size;
+  anole_str owner;           /* {NULL,0}: "" */
+  anole_str type;            /* required */
+  anole_str data_json;       /* a JSON value */
+  anole_str id;              /* idempotency; {NULL,0}: a new msg_ id */
+  anole_str endpoint;        /* only this endpoint; {NULL,0}: every matching one of owner */
+  int64_t timestamp_ms;      /* 0: now */
+  uint64_t tx;               /* an anole_db_tx to enqueue the deliveries in, or 0 */
+  uint64_t req;              /* the request this serves, or 0 */
+} anole_webhook_out;         /* 112 bytes */
+
+/* Publishes one event (copied): ANOLE_EV_WEBHOOK_PUBLISHED answers. Returns at once:
+   ANOLE_OK; ANOLE_E_INVALID; ANOLE_E_UNSUPPORTED (no "webhooks"); ANOLE_E_GONE; ANOLE_E_STATE. */
+ANOLE_API anole_status anole_webhooks_publish(anole_jobs *j, anole_consumer *c, const anole_webhook_out *m, uint64_t user_data);
+/* From now on, ANOLE_EV_WEBHOOK_STATUS goes to `c` (delivery dead, endpoint disabled) with
+   user_data. Calling it again replaces the consumer. */
+ANOLE_API anole_status anole_webhooks_watch(anole_jobs *j, anole_consumer *c, uint64_t user_data);
+
+/* ANOLE_EV_WEBHOOK_PUBLISHED. */
+typedef struct anole_webhook_published_event {
+  anole_event ev;        /* handle 0, or the anole_db_tx */
+  uint64_t user_data;
+  int32_t status;        /* ANOLE_OK; ANOLE_E_INVALID (error says what); ANOLE_E_DB; ANOLE_E_TIMEOUT */
+  uint16_t http_status;  /* 200, 400, 404, 503... */
+  uint8_t error_class;   /* ANOLE_DB_ERR_* */
+  uint8_t duplicate;     /* 1: the id was published before; nothing new was enqueued */
+  uint32_t deliveries;   /* deliveries enqueued */
+  uint32_t reserved;
+  anole_span message_id;
+  anole_span error;
+} anole_webhook_published_event; /* 56 bytes */
+
+enum { ANOLE_WEBHOOK_DELIVERY_DEAD = 1, ANOLE_WEBHOOK_ENDPOINT_DISABLED = 2 };
+/* ANOLE_EV_WEBHOOK_STATUS. */
+typedef struct anole_webhook_status_event {
+  anole_event ev;        /* handle 0 */
+  uint64_t user_data;
+  uint32_t what;         /* ANOLE_WEBHOOK_* */
+  uint16_t last_status;  /* the endpoint's last HTTP status, 0 for a transport error */
+  uint16_t reserved;
+  anole_span owner;
+  anole_span endpoint;
+  anole_span message;
+  anole_span error;
+} anole_webhook_status_event; /* 64 bytes */
+/* ---- end p3/webhooks ---- */
+
+/* ---- p3/realtime ---- */
+/* ---- Server-Sent Events ---------------------------------------------------- */
+
+/* anole_sse and anole_watch_sub are declared with the other handle types. */
+typedef struct anole_watch anole_watch; /* opaque; lives until anole_server_destroy */
+
+enum {
+  ANOLE_SSE_F_NO_REPLAY = 1 /* anole_sse_publish: not kept for Last-Event-ID resume */
+};
+enum {
+  ANOLE_SSE_F_PREFIX = 1 /* anole_sse_gap: every topic starting with `topic` */
+};
+
+/* Queues one event for every subscriber of `topic` (1-255 bytes, copied),
+   fanned out on Anole's threads; returns at once. `event`: the event name,
+   {NULL,0} for none (no CR or LF); `data`: UTF-8, CR/LF/CRLF split it into
+   data lines; copied (ANOLE_BODY_BORROW is refused). Publishes to one topic
+   reach every subscriber in the order they were taken (from one thread: call
+   order); one subscriber sees all its events in one order. Each event gets
+   the ID "<epoch>-<seq>", one sequence across topics, which a browser sends
+   back as Last-Event-ID to get what it missed from the topic's replay
+   buffer ("sse.replay"). ANOLE_E_INVALID: topic length, a CR/LF in event,
+   len > limits.sse_max_event, unknown flags. ANOLE_E_AGAIN: too many
+   publishes still being fanned out (64 per executor, and the larger of
+   16 x sse.max_queued_bytes and 2 x limits.sse_max_event bytes); nothing
+   queued, no event follows. ANOLE_E_STATE ("NotRunning"): the server is not
+   running. */
+ANOLE_API anole_status anole_sse_publish(anole_server *s, anole_str topic, anole_str event, const void *data,
+                                         size_t len, uint32_t flags);
+/* Sends the gap event ("sse.gap_event") to the topic's subscribers
+   (ANOLE_SSE_F_PREFIX: to every topic starting with `topic`) and starts its
+   replay afresh: call it when the application lost events it would have
+   published. */
+ANOLE_API anole_status anole_sse_gap(anole_server *s, anole_str topic, uint32_t flags);
+
+typedef struct anole_sse_accept_options {
+  size_t size;                 /* sizeof(anole_sse_accept_options) */
+  const anole_str *topics;     /* joined besides the route's "topics"; copied */
+  size_t ntopics;
+  const anole_header *headers; /* extra response headers (Set-Cookie...); not Content-Type,
+                                  Cache-Control, Content-Length, Transfer-Encoding, Connection */
+  size_t nheaders;
+  uint32_t last;               /* without Last-Event-ID: the newest `last` events per topic */
+  uint32_t reserved;           /* must be 0 */
+} anole_sse_accept_options;    /* 48 bytes */
+
+/* Accepts the subscription r (an ANOLE_EV_SSE_SUBSCRIBE): Anole answers 200
+   with an event stream, replays what Last-Event-ID missed, and *out is the
+   subscriber's handle, usable at once; r is stale from here.
+   ANOLE_EV_SSE_CLOSE follows when it ends. If the client left meanwhile,
+   ANOLE_EV_SSE_CLOSE (CLIENT_GONE) follows alone. ANOLE_E_STATE ("NotSse"):
+   r is not an SSE subscription. ANOLE_E_INVALID: a bad topic or header,
+   reserved != 0, NULL out. Nothing is taken on a negative answer (r is still
+   owed one). */
+ANOLE_API anole_status anole_sse_accept(anole_req r, const anole_sse_accept_options *options, anole_sse *out);
+/* Joins a topic (copied); `last` as in the accept options. A publish called
+   after this returns reaches it. ANOLE_E_GONE once the subscriber is over. */
+ANOLE_API anole_status anole_sse_subscribe(anole_sse s, anole_str topic, uint32_t last);
+/* Leaves a topic. A cleanup call. */
+ANOLE_API anole_status anole_sse_unsubscribe(anole_sse s, anole_str topic);
+/* One event to this subscriber only (no id; never replayed); copied.
+   ANOLE_OK; ANOLE_BUSY (taken; more than half of sse.max_queued_bytes
+   waits: wait for ANOLE_EV_WRITABLE); ANOLE_E_AGAIN (not taken: the queue is
+   full; ANOLE_EV_WRITABLE follows); ANOLE_E_GONE once it ended. flags: 0. */
+ANOLE_API anole_status anole_sse_send(anole_sse s, anole_str event, const void *data, size_t len, uint32_t flags);
+/* Ends the stream after what is queued; ANOLE_EV_SSE_CLOSE (CLOSED) follows.
+   A cleanup call. */
+ANOLE_API anole_status anole_sse_close(anole_sse s);
+
+enum {
+  ANOLE_SSE_CLOSED_CLIENT_GONE = 0,
+  ANOLE_SSE_CLOSED_SLOW = 1,   /* it did not keep up (sse.on_full "close") */
+  ANOLE_SSE_CLOSED_DRAIN = 2,  /* the server's drain; the browser was told when to come back */
+  ANOLE_SSE_CLOSED_CLOSED = 3, /* anole_sse_close or anole_handle_release */
+  ANOLE_SSE_CLOSED_SERVER = 4  /* the stream could not be set up */
+};
+typedef struct anole_sse_close_event {
+  anole_event ev;    /* handle: the anole_sse, now stale */
+  uint32_t route_id; /* the route's "handler" */
+  uint32_t reason;   /* ANOLE_SSE_CLOSED_* */
+} anole_sse_close_event; /* 24 bytes */
+
+/* ---- watch ------------------------------------------------------------------ */
+
+/* The watch named `name` in "watches" (after anole_server_create);
+   ANOLE_E_INVALID when there is none. */
+ANOLE_API anole_status anole_watch_find(anole_server *s, anole_str name, anole_watch **out);
+ANOLE_API uint32_t anole_watch_index(const anole_watch *w);
+
+enum { ANOLE_WATCH_NATIVE = 0, ANOLE_WATCH_JSON = 1 }; /* anole_watch_listen_options.format */
+typedef struct anole_watch_listen_options {
+  size_t size;         /* sizeof(anole_watch_listen_options) */
+  uint32_t max_events; /* held for the consumer, at most; 0: 1024 */
+  uint32_t max_bytes;  /* 0: 4 MiB */
+  uint32_t format;     /* ANOLE_WATCH_NATIVE: PostgreSQL/Redis text, stream fields, MongoDB BSON;
+                          ANOLE_WATCH_JSON: stream entries and MongoDB events as JSON */
+  uint32_t reserved;   /* 0 */
+} anole_watch_listen_options; /* 24 bytes */
+
+/* Events of the watch from now on, to `c` as ANOLE_EV_WATCH_EVENT (handle
+   *out, user_data). Never holds the watch up: past max_events/max_bytes
+   waiting for the consumer, events are dropped and one ANOLE_EV_WATCH_STATUS
+   (GAP, with how many) comes before the next. ANOLE_E_STATE before the
+   server runs or after the watch stopped. */
+ANOLE_API anole_status anole_watch_listen(anole_watch *w, anole_consumer *c, const anole_watch_listen_options *opts,
+                                          uint64_t user_data, anole_watch_sub *out);
+/* Stops listening; events already queued still come, then ANOLE_EV_WATCH_END
+   (UNLISTENED). A cleanup call. */
+ANOLE_API anole_status anole_watch_unlisten(anole_watch_sub l);
+/* Redis stream group with "ack": "manual": XACK the entry `position` (as the
+   event carried it). ANOLE_E_STATE ("WrongWatchKind") on another kind of
+   watch. Never blocks. */
+ANOLE_API anole_status anole_watch_ack(anole_watch_sub l, anole_str position);
+
+enum { ANOLE_WATCH_SRC_POSTGRES = 1, ANOLE_WATCH_SRC_REDIS = 2, ANOLE_WATCH_SRC_REDIS_STREAM = 3,
+       ANOLE_WATCH_SRC_MONGODB = 4 };
+enum { ANOLE_WATCH_OP_MESSAGE = 0, ANOLE_WATCH_OP_ENTRY = 1, ANOLE_WATCH_OP_INSERT = 2,
+       ANOLE_WATCH_OP_UPDATE = 3, ANOLE_WATCH_OP_REPLACE = 4, ANOLE_WATCH_OP_DELETE = 5,
+       ANOLE_WATCH_OP_DROP = 6, ANOLE_WATCH_OP_RENAME = 7, ANOLE_WATCH_OP_DROP_DATABASE = 8,
+       ANOLE_WATCH_OP_INVALIDATE = 9, ANOLE_WATCH_OP_OTHER = 10 };
+enum { ANOLE_WATCH_FMT_TEXT = 0, ANOLE_WATCH_FMT_JSON = 1, ANOLE_WATCH_FMT_BSON = 2,
+       ANOLE_WATCH_FMT_FIELDS = 3 };
+/* ANOLE_EV_WATCH_EVENT. FIELDS: `anole_span fields[2 * nfields]` (name, value)
+   at fields_off; the bytes the spans point into follow. */
+typedef struct anole_watch_event {
+  anole_event ev;       /*  0 handle: the anole_watch_sub */
+  uint64_t user_data;   /* 16 */
+  uint32_t watch;       /* 24 the watch's index in "watches" */
+  uint16_t source;      /* 28 ANOLE_WATCH_SRC_* */
+  uint16_t op;          /* 30 ANOLE_WATCH_OP_* */
+  uint32_t format;      /* 32 ANOLE_WATCH_FMT_* of `data` */
+  int32_t pg_pid;       /* 36 PostgreSQL: the notifying backend; else 0 */
+  anole_span channel;   /* 40 channel, stream key, or "db.collection" */
+  anole_span pattern;   /* 48 Redis: the pattern matched; else empty */
+  anole_span op_name;   /* 56 as the source named it */
+  anole_span position;  /* 64 entry ID or resume token (canonical Extended JSON); else empty */
+  anole_span data;      /* 72 */
+  uint32_t nfields;     /* 80 */
+  uint32_t fields_off;  /* 84 */
+} anole_watch_event;    /* 88 bytes */
+
+enum { ANOLE_WATCH_CONNECTED = 1, ANOLE_WATCH_DISCONNECTED = 2, ANOLE_WATCH_GAP = 3,
+       ANOLE_WATCH_INVALIDATED = 4 };
+typedef struct anole_watch_status_event {
+  anole_event ev;      /*  0 */
+  uint64_t user_data;  /* 16 */
+  uint32_t watch;      /* 24 */
+  uint32_t status;     /* 28 ANOLE_WATCH_CONNECTED... */
+  uint64_t dropped;    /* 32 GAP: events this listener lost to its own limits (0: the source's gap) */
+  anole_span detail;   /* 40 text for logs */
+} anole_watch_status_event; /* 48 bytes */
+
+enum { ANOLE_WATCH_END_UNLISTENED = 1, ANOLE_WATCH_END_DRAINED = 2, ANOLE_WATCH_END_FAILED = 3 };
+typedef struct anole_watch_end_event {
+  anole_event ev;      /*  0 */
+  uint64_t user_data;  /* 16 */
+  uint32_t watch;      /* 24 */
+  uint32_t reason;     /* 28 ANOLE_WATCH_END_* */
+  anole_span detail;   /* 32 FAILED: why (anole_last_error-style text) */
+} anole_watch_end_event; /* 40 bytes */
+/* ---- end p3/realtime ---- */
+
+/* ---- p3/s3 ---- */
+/* ---- p3/s3 ---- */
+/* ---- Object storage (S3, R2, MinIO, B2, Supabase) --------------------------- */
+
+typedef struct anole_s3 anole_s3; /* opaque; lives until anole_server_destroy */
+
+/* Looks up a store by its "name" in the configuration's "storage". */
+ANOLE_API anole_status anole_s3_find(anole_server *s, anole_str name, anole_s3 **out);
+/* Its place in "storage". */
+ANOLE_API uint32_t anole_s3_index(const anole_s3 *s3);
+
+/* Call flags (a flag a call does not take: ANOLE_E_INVALID). */
+#define ANOLE_S3_F_STREAM 1u            /* anole_s3_get: stream the body (ANOLE_EV_S3_DATA) */
+#define ANOLE_S3_F_RANGE 2u             /* get, serve: range_start..range_end */
+#define ANOLE_S3_F_NO_RETRY 4u          /* any call: tried once */
+#define ANOLE_S3_F_IF_ABSENT 8u         /* put, upload_open, put_body, copy: create only (If-None-Match: *) */
+#define ANOLE_S3_F_REPLACE_METADATA 16u /* copy: use these options' metadata */
+#define ANOLE_S3_F_LENGTH 32u           /* upload_open: content_length is the total */
+#define ANOLE_S3_F_PASS_NOT_FOUND 64u   /* serve: on 404 leave the request unanswered and report */
+#define ANOLE_S3_F_REPORT 128u          /* serve: post ANOLE_EV_S3_RESULT (op SERVE) when done */
+
+/* anole_s3_result_event.op. */
+enum {
+  ANOLE_S3_OP_GET = 1,
+  ANOLE_S3_OP_HEAD = 2,
+  ANOLE_S3_OP_PUT = 3,
+  ANOLE_S3_OP_PUT_BODY = 4,
+  ANOLE_S3_OP_DELETE = 5,
+  ANOLE_S3_OP_DELETE_MANY = 6,
+  ANOLE_S3_OP_LIST = 7,
+  ANOLE_S3_OP_COPY = 8,
+  ANOLE_S3_OP_UPLOAD_OPEN = 9,
+  ANOLE_S3_OP_UPLOAD_FINISH = 10,
+  ANOLE_S3_OP_SERVE = 11,
+  ANOLE_S3_OP_MULTIPART_CREATE = 12,
+  ANOLE_S3_OP_MULTIPART_COMPLETE = 13,
+  ANOLE_S3_OP_MULTIPART_ABORT = 14
+};
+
+/* anole_s3_result_event.flags. */
+#define ANOLE_S3_RES_F_TRUNCATED 1u    /* LIST: more pages (next is set) */
+#define ANOLE_S3_RES_F_DELETE_MARKER 2u
+
+/* anole_s3_data_event.flags. */
+#define ANOLE_S3_DATA_F_FIN 1u
+
+/* head, delete, delete_many, multipart_complete and multipart_abort. */
+typedef struct anole_s3_options {
+  size_t size;          /* sizeof(anole_s3_options) */
+  uint32_t flags;       /* ANOLE_S3_F_NO_RETRY */
+  uint32_t timeout_ms;  /* 0: the storage's timeout_ms; ANOLE_DB_TIMEOUT_NONE: none */
+  uint64_t req;         /* the anole_req / anole_grpc_call it serves (as anole_db_options.req), or 0 */
+  anole_str bucket;     /* {NULL,0}: the configured bucket */
+  anole_str version_id;
+} anole_s3_options; /* 56 bytes */
+
+typedef struct anole_s3_get_options {
+  size_t size;
+  uint32_t flags;          /* ANOLE_S3_F_STREAM, _RANGE, _NO_RETRY; serve: _PASS_NOT_FOUND, _REPORT */
+  uint32_t timeout_ms;
+  uint64_t req;
+  anole_str bucket;
+  anole_str version_id;
+  uint64_t range_start;
+  uint64_t range_end;      /* inclusive; UINT64_MAX: to the end */
+  anole_str if_none_match;
+  anole_str if_match;
+  int64_t if_modified_since_ms; /* 0: none */
+  uint32_t max_bytes;      /* whole get: a larger body answers ANOLE_E_TOOBIG; 0: max_object_bytes */
+  uint32_t window;         /* STREAM: bytes delivered before anole_s3_read_more is needed; 0: 262144 */
+  anole_str response_content_type;        /* serve: overrides the object's */
+  anole_str response_cache_control;
+  anole_str response_content_disposition;
+} anole_s3_get_options; /* 168 bytes */
+
+typedef struct anole_s3_put_options {
+  size_t size;
+  uint32_t flags;          /* ANOLE_S3_F_IF_ABSENT, _NO_RETRY, _REPLACE_METADATA (copy), _LENGTH (upload_open) */
+  uint32_t timeout_ms;
+  uint64_t req;
+  anole_str bucket;
+  anole_str content_type;  /* {NULL,0}: from the key's extension */
+  anole_str cache_control;
+  anole_str content_disposition;
+  anole_str content_encoding;
+  const anole_header *metadata; /* x-amz-meta-<name>, name without the prefix; copied */
+  size_t nmetadata;
+  anole_str storage_class;
+  anole_str if_match;
+  uint64_t content_length; /* upload_open with ANOLE_S3_F_LENGTH: the total */
+} anole_s3_put_options; /* 160 bytes */
+
+typedef struct anole_s3_list_options {
+  size_t size;
+  uint32_t flags;          /* ANOLE_S3_F_NO_RETRY */
+  uint32_t timeout_ms;
+  uint64_t req;
+  anole_str bucket;
+  anole_str prefix;
+  anole_str delimiter;
+  anole_str start_after;
+  anole_str continuation;  /* the previous answer's `next` */
+  uint32_t max_keys;       /* 1..1000; 0: 1000 */
+  uint32_t reserved;
+} anole_s3_list_options; /* 112 bytes */
+
+#define ANOLE_S3_PRESIGN_F_CONTENT_LENGTH 1u /* sign content_length (PUT) */
+enum {
+  ANOLE_S3_PRESIGN_GET = 0,
+  ANOLE_S3_PRESIGN_PUT = 1,
+  ANOLE_S3_PRESIGN_HEAD = 2,
+  ANOLE_S3_PRESIGN_DELETE = 3,
+  ANOLE_S3_PRESIGN_UPLOAD_PART = 4
+};
+
+typedef struct anole_s3_presign_options {
+  size_t size;
+  uint32_t flags;
+  uint32_t expires_s;      /* 0: 900; at most 604800 */
+  anole_str bucket;
+  anole_str version_id;
+  anole_str content_type;  /* PUT: signed */
+  uint64_t content_length; /* PUT with ANOLE_S3_PRESIGN_F_CONTENT_LENGTH */
+  anole_str response_content_type;
+  anole_str response_content_disposition;
+  anole_str upload_id;     /* UPLOAD_PART */
+  uint32_t part_number;    /* UPLOAD_PART: 1..10000 */
+  uint32_t reserved;
+} anole_s3_presign_options; /* 128 bytes */
+
+typedef struct anole_s3_part {
+  uint32_t number;
+  uint32_t reserved;
+  anole_str etag;
+} anole_s3_part; /* 24 bytes */
+
+/* ANOLE_EV_S3_RESULT. */
+typedef struct anole_s3_result_event {
+  anole_event ev;          /*   0 */
+  uint64_t user_data;      /*  16 */
+  int32_t status;          /*  24 ANOLE_OK; ANOLE_E_SERVICE (error_class says why); ANOLE_E_TIMEOUT;
+                                  ANOLE_E_GONE (its req ended); ANOLE_E_TOOBIG (whole GET over
+                                  max_bytes); ANOLE_E_NOMEM */
+  uint16_t http_status;    /*  28 what Anole's handlers answer for this failure (404, 409, 400, 503,
+                                  504, 500); 0 on success */
+  uint8_t error_class;     /*  30 ANOLE_DB_ERR_* */
+  uint8_t op;              /*  31 ANOLE_S3_OP_* */
+  uint16_t s3_status;      /*  32 the service's HTTP status (200, 206, 304, 404, ...) */
+  uint16_t flags;          /*  34 ANOLE_S3_RES_F_* */
+  uint32_t nentries;       /*  36 LIST: anole_s3_entry; DELETE_MANY: anole_s3_failure */
+  uint64_t content_length; /*  40 GET/HEAD: of this answer (a range's length); PUT/UPLOAD_FINISH/COPY: stored */
+  uint64_t object_size;    /*  48 the whole object (from Content-Range on a 206) */
+  uint64_t range_start;    /*  56 */
+  int64_t last_modified_ms;/*  64 0: unknown */
+  anole_span etag;         /*  72 */
+  anole_span version_id;   /*  80 */
+  anole_span content_type; /*  88 */
+  anole_span cache_control;        /*  96 */
+  anole_span content_disposition;  /* 104 */
+  anole_span content_encoding;     /* 112 */
+  uint32_t metadata_off;   /* 120 nmetadata (name, value) anole_span pairs */
+  uint32_t nmetadata;      /* 124 */
+  anole_span body;         /* 128 whole GET */
+  uint32_t entries_off;    /* 136 LIST: nentries anole_s3_entry; DELETE_MANY: nentries anole_s3_failure */
+  uint32_t prefixes_off;   /* 140 nprefixes anole_span (LIST with a delimiter) */
+  uint32_t nprefixes;      /* 144 */
+  uint32_t parts;          /* 148 PUT/UPLOAD_FINISH: parts used (0: one PUT) */
+  anole_span next;         /* 152 LIST: the continuation token */
+  anole_span upload_id;    /* 160 MULTIPART_CREATE */
+  anole_span error;        /* 168 for logs */
+  anole_span error_code;   /* 176 S3's Code ("NoSuchKey") or Anole's ("object_too_large") */
+  anole_span request_id;   /* 184 x-amz-request-id */
+} anole_s3_result_event; /* 192 bytes */
+
+typedef struct anole_s3_entry {
+  anole_span key;
+  anole_span etag;
+  anole_span storage_class;
+  uint64_t size;
+  int64_t last_modified_ms;
+} anole_s3_entry; /* 40 bytes */
+
+typedef struct anole_s3_failure {
+  anole_span key;
+  anole_span code;
+  anole_span message;
+} anole_s3_failure; /* 24 bytes */
+
+/* ANOLE_EV_S3_DATA: the next bytes of a download (at most 64 KiB), in order. */
+typedef struct anole_s3_data_event {
+  anole_event ev;          /*  0 the download */
+  uint64_t user_data;      /* 16 the get call's */
+  int32_t status;          /* 24 ANOLE_OK; else the download failed here (ANOLE_E_SERVICE,
+                                 ANOLE_E_TIMEOUT), always with FIN */
+  uint32_t flags;          /* 28 ANOLE_S3_DATA_F_FIN: the last; the handle is over */
+  uint64_t offset;         /* 32 of these bytes in the answer's body */
+  anole_span data;         /* 40 */
+  anole_span error;        /* 48 */
+} anole_s3_data_event; /* 56 bytes */
+
+/* Reads an object. Without ANOLE_S3_F_STREAM: one ANOLE_EV_S3_RESULT (op GET) with the head and the
+   whole body (up to max_bytes). With it: the RESULT carries the head and, in ev.handle, a download;
+   then ANOLE_EV_S3_DATA records in order, up to `window` bytes ahead of the consumer, the last one
+   with ANOLE_S3_DATA_F_FIN. A 304 (if_none_match) is status ANOLE_OK with s3_status 304 and no
+   handle. `c` and `req` as for anole_db_query. Returns at once: ANOLE_OK; ANOLE_E_INVALID (key,
+   options); ANOLE_E_GONE (stale req); ANOLE_E_STATE (before start, after the stop). */
+ANOLE_API anole_status anole_s3_get(anole_s3 *s3, anole_consumer *c, anole_str key, const anole_s3_get_options *opts,
+                                    uint64_t user_data);
+/* More credit for a download: Anole delivers up to `bytes` more. ANOLE_E_GONE when it is over. */
+ANOLE_API anole_status anole_s3_read_more(anole_s3_transfer t, uint32_t bytes);
+ANOLE_API anole_status anole_s3_head(anole_s3 *s3, anole_consumer *c, anole_str key, const anole_s3_get_options *opts,
+                                     uint64_t user_data);
+/* Answers the request r from the object: Range and If-* from r unless the options set them, status
+   and headers passed through, the body streamed by Anole. Finishes r (an answer call) unless
+   ANOLE_S3_F_PASS_NOT_FOUND and the object does not exist: then r stays owed and an
+   ANOLE_EV_S3_RESULT (op SERVE, error_class NOT_FOUND) goes to r's consumer. ANOLE_E_GONE (r is
+   over); ANOLE_E_STATE (r is already answering). */
+ANOLE_API anole_status anole_s3_serve(anole_s3 *s3, anole_req r, anole_str key, const anole_s3_get_options *opts,
+                                      uint64_t user_data);
+/* Stores `data` (copied before return) as one object: one PUT up to multipart_threshold, else
+   multipart. Answer: ANOLE_EV_S3_RESULT op PUT (etag, version_id). */
+ANOLE_API anole_status anole_s3_put(anole_s3 *s3, anole_consumer *c, anole_str key, const void *data, size_t len,
+                                    const anole_s3_put_options *opts, uint64_t user_data);
+/* Stores the body of request r (unread, ANOLE_REQ_BODY_STREAM, or an inline body) without it passing
+   through the consumer. r stays owed: the answer is an ANOLE_EV_S3_RESULT (op PUT_BODY) to r's
+   consumer, after which the consumer answers r. ANOLE_E_STATE when r's body was already read. */
+ANOLE_API anole_status anole_s3_put_body(anole_s3 *s3, anole_req r, anole_str key, const anole_s3_put_options *opts,
+                                         uint64_t user_data);
+/* Opens a push upload: answered by ANOLE_EV_S3_RESULT (op UPLOAD_OPEN) whose ev.handle is the upload. */
+ANOLE_API anole_status anole_s3_upload_open(anole_s3 *s3, anole_consumer *c, anole_str key,
+                                            const anole_s3_put_options *opts, uint64_t user_data);
+/* Copies bytes into the upload; never blocks. ANOLE_OK; ANOLE_BUSY (taken; more than
+   concurrency * part_size is buffered: wait for ANOLE_EV_WRITABLE on t); ANOLE_E_AGAIN (nothing
+   taken: a part more is buffered, or the storage's upload_memory is used up; ANOLE_EV_WRITABLE on t
+   follows); ANOLE_E_INVALID (len over part_size, or a flag: ANOLE_BODY_BORROW is refused, the bytes
+   are always copied); ANOLE_E_GONE (the upload failed or was released: its ANOLE_EV_S3_RESULT says why). */
+ANOLE_API anole_status anole_s3_upload_write(anole_s3_transfer t, const void *data, size_t len, uint32_t flags);
+/* Sends the rest and completes. Answered by ANOLE_EV_S3_RESULT (op UPLOAD_FINISH, ev.handle t,
+   user_data this call's). */
+ANOLE_API anole_status anole_s3_upload_finish(anole_s3_transfer t, uint64_t user_data);
+ANOLE_API anole_status anole_s3_delete(anole_s3 *s3, anole_consumer *c, anole_str key, const anole_s3_options *opts,
+                                       uint64_t user_data);
+/* Any number of keys (copied), sent 1000 per request. Answer: op DELETE_MANY, `nentries` failures as
+   anole_s3_failure. */
+ANOLE_API anole_status anole_s3_delete_many(anole_s3 *s3, anole_consumer *c, const anole_str *keys, size_t n,
+                                            const anole_s3_options *opts, uint64_t user_data);
+/* One page: op LIST, entries (anole_s3_entry), prefixes (anole_span), `next` (empty on the last page). */
+ANOLE_API anole_status anole_s3_list(anole_s3 *s3, anole_consumer *c, const anole_s3_list_options *opts,
+                                     uint64_t user_data);
+/* CopyObject (up to 5 GiB): src_bucket {NULL,0} is opts->bucket. */
+ANOLE_API anole_status anole_s3_copy(anole_s3 *s3, anole_consumer *c, anole_str src_bucket, anole_str src_key,
+                                     anole_str dst_key, const anole_s3_put_options *opts, uint64_t user_data);
+/* A presigned URL, computed at once (no request). Writes it into buf when it fits and returns its
+   length (> cap: nothing written; call again with a larger buf), or a negative status:
+   ANOLE_E_INVALID, ANOLE_E_STATE (before start, or no credentials yet: name "NoCredentials"). */
+ANOLE_API int64_t anole_s3_presign(anole_s3 *s3, uint32_t method, anole_str key, const anole_s3_presign_options *opts,
+                                   char *buf, size_t cap);
+/* Multipart for browser uploads with presigned UPLOAD_PART URLs. Answers: op MULTIPART_CREATE
+   (upload_id), MULTIPART_COMPLETE (etag), MULTIPART_ABORT. */
+ANOLE_API anole_status anole_s3_multipart_create(anole_s3 *s3, anole_consumer *c, anole_str key,
+                                                 const anole_s3_put_options *opts, uint64_t user_data);
+ANOLE_API anole_status anole_s3_multipart_complete(anole_s3 *s3, anole_consumer *c, anole_str key, anole_str upload_id,
+                                                   const anole_s3_part *parts, size_t nparts,
+                                                   const anole_s3_options *opts, uint64_t user_data);
+ANOLE_API anole_status anole_s3_multipart_abort(anole_s3 *s3, anole_consumer *c, anole_str key, anole_str upload_id,
+                                                const anole_s3_options *opts, uint64_t user_data);
+/* anole_handle_release(t): an upload aborts (AbortMultipartUpload), parts in flight canceled, not
+   answered; a download stops reading and closes the connection, no more DATA. A cleanup call. */
+/* ---- end p3/s3 ---- */
+
+/* ---- p3/smtp ---- */
+/* Mail. The configuration's "mail" entries are SMTP servers (smtp:// with
+   STARTTLS, smtps:// with TLS from the first byte), pooled per executor.
+   A send is a command for an executor, which composes and sends it; the
+   answer is ANOLE_EV_SMTP_RESULT. Nothing waits on the caller's thread, and
+   everything passed is copied before the call returns (an attachment's
+   `path` is read while sending). */
+
+typedef struct anole_smtp anole_smtp; /* opaque; lives until anole_server_destroy */
+
+/* Looks up a mail server by its "name"; ANOLE_E_INVALID when there is none. */
+ANOLE_API anole_status anole_smtp_find(anole_server *s, anole_str name, anole_smtp **out);
+/* Its place in the configuration's "mail". */
+ANOLE_API uint32_t anole_smtp_index(const anole_smtp *m);
+
+#define ANOLE_SMTP_F_RETRY 1u         /* retry transient failures before the final "." (never after it) */
+#define ANOLE_SMTP_ATTACH_F_INLINE 1u /* with content_id: an inline part (cid:) */
+
+typedef struct anole_smtp_attachment {
+  size_t size;            /* sizeof(anole_smtp_attachment) */
+  anole_str filename;
+  anole_str content_type; /* {NULL,0}: from the filename */
+  const void *data;       /* copied */
+  size_t len;
+  anole_str path;         /* instead of data: a file read while sending */
+  anole_str content_id;   /* set: inline, referenced from the HTML as cid:<content_id> */
+  uint32_t flags;         /* ANOLE_SMTP_ATTACH_F_* */
+  uint32_t reserved;
+} anole_smtp_attachment;  /* 96 bytes */
+
+typedef struct anole_smtp_message {
+  size_t size;             /* sizeof(anole_smtp_message) */
+  anole_str from;          /* "Name <a@b>" or "a@b"; {NULL,0}: the configured from */
+  anole_str reply_to;
+  const anole_str *to;  size_t nto;
+  const anole_str *cc;  size_t ncc;
+  const anole_str *bcc; size_t nbcc;
+  anole_str subject;
+  anole_str text;          /* {NULL,0}: none */
+  anole_str html;
+  const anole_header *headers; size_t nheaders;
+  const anole_smtp_attachment *attachments; size_t nattachments;
+  anole_str envelope_from; /* {NULL,0}: from's address */
+  anole_str message_id;    /* {NULL,0}: generated */
+} anole_smtp_message;      /* 200 bytes */
+
+typedef struct anole_smtp_options {
+  size_t size;         /* sizeof(anole_smtp_options) */
+  uint32_t flags;      /* ANOLE_SMTP_F_* */
+  uint32_t timeout_ms; /* 0: the mail entry's timeout_ms; ANOLE_DB_TIMEOUT_NONE: none */
+  uint64_t req;        /* the anole_req / anole_grpc_call it serves (as anole_db_options.req), or 0 */
+} anole_smtp_options;  /* 24 bytes */
+
+/* Composes the message and sends it. Everything is copied before return;
+   addresses, headers and sizes are checked now (ANOLE_E_INVALID, and
+   anole_last_error says which). The answer is ANOLE_EV_SMTP_RESULT to `c`
+   (or to req's consumer) with user_data. ANOLE_E_GONE: a stale req;
+   ANOLE_E_STATE: before start or after the stop. */
+ANOLE_API anole_status anole_smtp_send(anole_smtp *m, anole_consumer *c, const anole_smtp_message *msg,
+                                       const anole_smtp_options *opts, uint64_t user_data);
+/* A message composed by the language's own library (nodemailer's
+   MailComposer, Python's email): sent as it is, dot-stuffed, line ends made
+   CRLF, to `recipients`. `envelope_from` {NULL,0} is the null sender. */
+ANOLE_API anole_status anole_smtp_send_raw(anole_smtp *m, anole_consumer *c, anole_str envelope_from,
+                                           const anole_str *recipients, size_t n, const void *message, size_t len,
+                                           const anole_smtp_options *opts, uint64_t user_data);
+
+/* ANOLE_EV_SMTP_RESULT. */
+typedef struct anole_smtp_result_event {
+  anole_event ev;          /* handle 0 */
+  uint64_t user_data;
+  int32_t status;          /* ANOLE_OK (accepted for at least one recipient); ANOLE_E_SERVICE;
+                              ANOLE_E_TIMEOUT; ANOLE_E_GONE (its req ended first) */
+  uint16_t http_status;    /* what Anole's handlers would answer: 400, 500, 503, 504; 0 on success */
+  uint8_t error_class;     /* ANOLE_DB_ERR_* */
+  uint8_t reserved8;
+  uint16_t smtp_code;      /* the server's last reply code (250 on success) */
+  uint16_t reserved16;
+  uint32_t nrejected;      /* recipients the server refused while others were taken */
+  anole_span message_id;   /* without the angle brackets */
+  anole_span response;     /* the answer to the final "." (often a queue id) */
+  uint32_t rejected_off;   /* nrejected anole_smtp_rejected, from the start of the record */
+  uint32_t reserved;
+  anole_span error;        /* for logs; never sent to a client */
+  anole_span error_code;   /* "authentication_failed", "recipient_rejected", "5.7.1" */
+} anole_smtp_result_event; /* 80 bytes */
+
+typedef struct anole_smtp_rejected {
+  anole_span address;
+  uint16_t code;
+  uint16_t reserved;
+  uint32_t reserved2;
+  anole_span message;
+} anole_smtp_rejected;     /* 24 bytes */
+/* ---- end p3/smtp ---- */
+
+/* ---- p3/lambda ---- */
+/* ---- end p3/lambda ---- */
 
 #ifdef __cplusplus
 }

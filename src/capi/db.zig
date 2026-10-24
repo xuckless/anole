@@ -13,6 +13,8 @@ const dusty = @import("dusty");
 const engine = @import("engine.zig");
 const abi = @import("abi.zig");
 const config_mod = @import("config.zig");
+const jobs = @import("jobs.zig");
+const webhooks = @import("webhooks.zig");
 
 const features = anole.features;
 const placement = dusty.placement;
@@ -571,7 +573,7 @@ fn postAnswer(x: *Exec, a: *const Answer, handle: u64) void {
 }
 
 /// What goes into the record.
-const Answer = struct {
+pub const Answer = struct {
     user_data: u64,
     status: i32 = abi.OK,
     http_status: u16 = 0,
@@ -833,11 +835,25 @@ fn packTx(gen: u32, state: TxState) u64 {
 
 const tx_chunk_len = 64;
 const tx_max_chunks = 1024;
+comptime {
+    std.debug.assert(tx_chunk_len * tx_max_chunks <= engine.max_slots);
+}
 
-pub const TxWhat = enum { query, exec, commit, rollback };
+pub const TxWhat = enum {
+    query,
+    exec,
+    commit,
+    rollback,
+    /// `anole_jobs_enqueue` with a transaction (jobs.zig).
+    job_enqueue,
+    /// `anole_job_complete_in` with a transaction (jobs.zig).
+    job_complete,
+    /// `anole_webhooks_publish` with a transaction (webhooks.zig).
+    webhook_publish,
+};
 
 /// A call on an open transaction, from the consumer.
-const TxOp = struct {
+pub const TxOp = struct {
     cmd: Command = .{ .run = run },
     next: ?*TxOp = null,
     slot: u32,
@@ -989,7 +1005,7 @@ pub const TxTable = struct {
 };
 
 /// The two SQL connectors' transactions behind one type.
-const AnyTx = union(enum) {
+pub const AnyTx = union(enum) {
     sqlite: sqlite.Tx,
     postgres: pg.Tx,
 
@@ -1159,6 +1175,8 @@ fn runOp(any: *AnyTx, ctx: *db.Ctx, op: *const TxOp, answer: *Answer) anyerror!v
         .exec => answer.changes = try any.run(ctx, op.sql, op.params, o),
         .commit => try any.commit(ctx),
         .rollback => try any.rollback(ctx),
+        .job_enqueue, .job_complete => try jobs.txOp(any, ctx, op, answer),
+        .webhook_publish => try webhooks.txOp(any, ctx, op, answer),
     }
 }
 

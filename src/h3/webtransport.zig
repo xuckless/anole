@@ -418,8 +418,14 @@ pub const Core = struct {
     pub fn onReset(core: *Core, stream_id: i64, code: u64) bool {
         const s = core.streams.get(stream_id) orelse return false;
         if (s.recv_err == null and !s.in_fin) {
-            s.recv_err = error.StreamReset;
-            s.reset_code = fromHttp3Error(code);
+            if (code == error_session_gone) {
+                // The peer ended the session and is resetting its streams;
+                // its close may come after this.
+                s.recv_err = error.SessionClosed;
+            } else {
+                s.recv_err = error.StreamReset;
+                s.reset_code = fromHttp3Error(code);
+            }
         }
         // Reset before it said its session: no use to anyone. Refused
         // both ways, so QUIC closes it and it is freed.
@@ -433,8 +439,15 @@ pub const Core = struct {
     pub fn onStopSending(core: *Core, stream_id: i64, code: u64) bool {
         const s = core.streams.get(stream_id) orelse return false;
         if (s.send_err == null) {
-            s.send_err = error.StreamStopped;
-            s.stop_code = fromHttp3Error(code);
+            if (code == error_session_gone) {
+                // As for a reset: the session is gone, whichever of this and
+                // its close arrives first (webtransport-go waits for the
+                // close to report the same).
+                s.send_err = error.SessionClosed;
+            } else {
+                s.send_err = error.StreamStopped;
+                s.stop_code = fromHttp3Error(code);
+            }
         }
         s.dequeue();
         s.wakeAll();

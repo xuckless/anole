@@ -955,7 +955,7 @@ static void test_main_server(void) {
     CHECK(anole_req_respond(0, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_INVALID); /* 0 is no handle */
     CHECK(anole_req_respond(h + 1, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
     CHECK(anole_req_respond(h ^ (1ull << 60), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
-    CHECK(anole_req_respond(h | (0xffffffull << 32), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+    CHECK(anole_req_respond(h | (0x7fffffull << 33), 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
     CHECK(anole_req_respond(h, 200, NULL, 0, NULL, 0, 2) == ANOLE_E_INVALID);
     /* Every error answer sets its own text: none is left over from an earlier call. */
     CHECK(str_has(anole_last_error(), "flag"));
@@ -3065,7 +3065,7 @@ static void test_cleanup_rules(void) {
   CHECK(anole_ws_send(h, ANOLE_WS_TEXT, "x", 1, 0) == (anole_has_feature(LIT("websocket")) ? ANOLE_E_INVALID : ANOLE_E_UNSUPPORTED));
   if (anole_has_feature(LIT("websocket"))) CHECK(name_is("WrongHandleKind"));
   CHECK(anole_handle_release(0) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
-  CHECK(anole_handle_release(((uint64_t)15 << 28) | 1) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
+  CHECK(anole_handle_release(((uint64_t)31 << 28) | 1) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
   CHECK(anole_req_abort(0) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
   CHECK(anole_req_fail(0, 500, (anole_str){0}) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
   CHECK(gone_count(s) == gone);
@@ -3899,6 +3899,167 @@ static void test_ws_subprotocols_auto(void) {
   printf("ok WebSocket: configured subprotocols are selected by the server's order\n");
 }
 
+#define NET_STR(lit) ((anole_str){(lit), sizeof(lit) - 1})
+
+/* ---- raw TCP and UDP listeners (p3/net) -------------------------------------------------- */
+
+/* Polls until `done()` says so, handing every event to `on_ev`. */
+typedef struct {
+  anole_net_conn conn;
+  int opened, closed;
+  int nframes;
+  char frames[8][64];
+  size_t frame_len[8];
+  uint32_t close_reason;
+  int ndatagrams;
+  anole_net_udp udp;
+  anole_net_addr from;
+  char dgram[8][64];
+  size_t dgram_len[8];
+  int writable;
+} net_seen;
+
+static void net_collect(anole_consumer *c, net_seen *seen, int (*done)(const net_seen *)) {
+  static _Alignas(8) unsigned char buf[256 * 1024];
+  for (int i = 0; i < 100 && !done(seen); i++) {
+    int64_t n = anole_poll_wait(c, buf, sizeof buf, 100);
+    CHECK(n >= 0);
+    for (int64_t off = 0; off < n;) {
+      const anole_event *ev = (const anole_event *)(buf + off);
+      if (ev->type == ANOLE_EV_NET_OPEN) {
+        const anole_net_open_event *o = (const anole_net_open_event *)ev;
+        CHECK(o->handler_id == 5 && o->framing == ANOLE_NET_FRAMING_LINES);
+        CHECK(o->remote.family == 4 && o->remote.addr[0] == 127);
+        char text[64];
+        CHECK(anole_net_addr_format(&o->remote, text, sizeof text) > 0);
+        CHECK(memcmp(text, "127.0.0.1:", 10) == 0);
+        seen->conn = ev->handle;
+        seen->opened = 1;
+      } else if (ev->type == ANOLE_EV_NET_DATA) {
+        const anole_net_data_event *d = (const anole_net_data_event *)ev;
+        CHECK(d->flags & ANOLE_NET_DATA_F_FRAMES);
+        const anole_span *sp = (const anole_span *)((const char *)ev + d->frames_off);
+        for (uint32_t k = 0; k < d->nframes; k++) {
+          CHECK(seen->nframes < 8 && sp[k].len < 64);
+          memcpy(seen->frames[seen->nframes], (const char *)ev + sp[k].off, sp[k].len);
+          seen->frame_len[seen->nframes++] = sp[k].len;
+        }
+      } else if (ev->type == ANOLE_EV_NET_CLOSE) {
+        seen->closed = 1;
+        seen->close_reason = ((const anole_net_close_event *)ev)->reason;
+      } else if (ev->type == ANOLE_EV_NET_DATAGRAMS) {
+        const anole_net_datagrams_event *d = (const anole_net_datagrams_event *)ev;
+        CHECK(d->handler_id == 6);
+        const anole_net_datagram_in *in = (const anole_net_datagram_in *)((const char *)ev + d->datagrams_off);
+        for (uint32_t k = 0; k < d->ndatagrams; k++) {
+          CHECK(seen->ndatagrams < 8 && in[k].data.len < 64);
+          memcpy(seen->dgram[seen->ndatagrams], (const char *)ev + in[k].data.off, in[k].data.len);
+          seen->dgram_len[seen->ndatagrams++] = in[k].data.len;
+          seen->from = in[k].remote;
+        }
+        seen->udp = ev->handle;
+      } else if (ev->type == ANOLE_EV_WRITABLE) {
+        seen->writable = 1;
+      }
+      off += ev->len;
+    }
+  }
+}
+
+static int two_frames(const net_seen *s) { return s->opened && s->nframes >= 2; }
+static int is_closed(const net_seen *s) { return s->closed; }
+static int got_datagram(const net_seen *s) { return s->ndatagrams >= 1; }
+
+static void test_net(void) {
+  if (!anole_has_feature(NET_STR("net"))) return;
+  /* addresses */
+  anole_net_addr a;
+  CHECK(anole_net_addr_parse(NET_STR("[2001:db8::1]:443"), &a) == ANOLE_OK);
+  CHECK(a.family == 6 && a.port == 443);
+  char text[64];
+  int64_t n = anole_net_addr_format(&a, text, sizeof text);
+  CHECK(n == 17 && memcmp(text, "[2001:db8::1]:443", 17) == 0);
+  CHECK(anole_net_addr_format(&a, text, 4) == ANOLE_E_TOOBIG);
+  CHECK(anole_net_addr_parse(NET_STR("example.com:80"), &a) == ANOLE_E_INVALID);
+
+  const char *json = "{\"executors\":1,\"timeouts\":{\"shutdown_ms\":500},\"listeners\":["
+                     "{\"name\":\"chat\",\"address\":\"127.0.0.1\",\"port\":0,"
+                     "\"tcp\":{\"handler\":5,\"framing\":{\"lines\":{}}}},"
+                     "{\"name\":\"game\",\"address\":\"127.0.0.1\",\"port\":0,\"udp\":{\"handler\":6}}]}";
+  anole_consumer *c = NULL;
+  anole_server *s = polled_server(json, &c);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  anole_listener_info li = {sizeof li};
+  CHECK(anole_server_listener(s, 0, &li) == ANOLE_OK);
+  CHECK((li.flags & ANOLE_LISTENER_F_TCP) && li.port != 0);
+  anole_listener_info ui = {sizeof ui};
+  CHECK(anole_server_listener(s, 1, &ui) == ANOLE_OK);
+  CHECK((ui.flags & ANOLE_LISTENER_F_UDP) && ui.port == 0 && ui.udp_port != 0);
+
+  /* TCP: two lines in, two framed replies out, then the end */
+  int fd = dial(li.port);
+  CHECK(write(fd, "hello\nworld\n", 12) == 12);
+  net_seen seen = {0};
+  net_collect(c, &seen, two_frames);
+  CHECK(seen.nframes == 2 && seen.frame_len[0] == 5 && memcmp(seen.frames[0], "hello", 5) == 0);
+  CHECK(memcmp(seen.frames[1], "world", 5) == 0);
+  CHECK(anole_net_write(seen.conn, "HELLO", 5, ANOLE_NET_F_FRAME) == ANOLE_OK);
+  CHECK(anole_net_write(seen.conn, "WORLD", 5, ANOLE_NET_F_FRAME | ANOLE_NET_F_END) == ANOLE_OK);
+  char in[32];
+  size_t got = 0;
+  while (got < 12) {
+    ssize_t k = read(fd, in + got, sizeof in - got);
+    CHECK(k > 0);
+    got += (size_t)k;
+  }
+  CHECK(got == 12 && memcmp(in, "HELLO\nWORLD\n", 12) == 0);
+  CHECK(read(fd, in, sizeof in) == 0); /* this side ended */
+  CHECK(anole_net_write(seen.conn, "late", 4, 0) == ANOLE_E_INVALID && name_is("Ended"));
+  close(fd);
+  net_collect(c, &seen, is_closed);
+  CHECK(seen.closed && seen.close_reason == ANOLE_NET_CLOSED_PEER);
+  CHECK(anole_net_write(seen.conn, "x", 1, 0) == ANOLE_E_GONE);
+  CHECK(anole_handle_release(seen.conn) == ANOLE_OK);
+  CHECK(anole_net_write(0, "x", 1, 0) == ANOLE_E_INVALID);
+
+  /* UDP: one datagram in, one out through anole_net_udp_send, found by name */
+  int ufd = socket(AF_INET, SOCK_DGRAM, 0);
+  CHECK(ufd >= 0);
+  struct sockaddr_in to = {0};
+  to.sin_family = AF_INET;
+  to.sin_port = htons(ui.udp_port);
+  to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  CHECK(sendto(ufd, "ping", 4, 0, (struct sockaddr *)&to, sizeof to) == 4);
+  net_seen us = {0};
+  net_collect(c, &us, got_datagram);
+  CHECK(us.ndatagrams == 1 && us.dgram_len[0] == 4 && memcmp(us.dgram[0], "ping", 4) == 0);
+  anole_net_datagram reply = {0};
+  reply.to = us.from;
+  reply.data = "pong";
+  reply.len = 4;
+  CHECK(anole_net_udp_send(us.udp, &reply, 1, 0) == ANOLE_OK);
+  char dg[16];
+  struct pollfd pfd = {ufd, POLLIN, 0};
+  CHECK(poll(&pfd, 1, 5000) == 1);
+  CHECK(recv(ufd, dg, sizeof dg, 0) == 4 && memcmp(dg, "pong", 4) == 0);
+  anole_net_udp found = 0;
+  CHECK(anole_net_udp_find(s, NET_STR("game"), &found) == ANOLE_OK && found != 0);
+  CHECK(anole_net_udp_find(s, NET_STR("nope"), &found) == ANOLE_E_INVALID && name_is("UnknownListener"));
+  close(ufd);
+
+  /* The out counter moves once the send returns on the executor, which can
+     be after the peer already has the datagram: wait for it. */
+  anole_stats st = {.size = sizeof st};
+  for (int i = 0; i < 1000; i++) {
+    CHECK(anole_server_stats(s, &st) == ANOLE_OK);
+    if (st.udp_datagrams_in >= 1 && st.udp_datagrams_out >= 1) break;
+    usleep(2000);
+  }
+  CHECK(st.udp_datagrams_in >= 1 && st.udp_datagrams_out >= 1);
+  stop_polled(s);
+  printf("ok raw TCP and UDP: framed lines, FIN, stale handles, datagrams, addresses\n");
+}
+
 static void test_publish_order(void) {
   if (!have_websocket) return;
   const char *json = "{\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],\"executors\":4,"
@@ -3987,6 +4148,7 @@ static int run_tests(void) {
   test_ws_accept();
   test_ws_subprotocols_auto();
   test_publish_order();
+  test_net();
   printf("PASS\n");
   return 0;
 }

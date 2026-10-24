@@ -184,6 +184,10 @@ pub const Client = struct {
     consumers_mutex: std.Io.Mutex = .init,
     started: bool = false,
     drained: bool = false,
+    /// Set by `app.kafka` under `deployment = lambda`: consumer groups are
+    /// not joined (the process is frozen between invocations); producing
+    /// works.
+    suppress_consumers: bool = false,
 
     /// Validates the options and prepares the connections; nothing connects
     /// before the first call (unless `connect_at_start`).
@@ -323,7 +327,9 @@ pub const Client = struct {
         }
         self.consumers_mutex.lockUncancelable(self.io);
         defer self.consumers_mutex.unlock(self.io);
-        for (self.consumers.items) |c| try c.start();
+        if (self.suppress_consumers) {
+            if (self.consumers.items.len > 0) log.info("kafka \"{s}\": lambda deployment joins no consumer groups here; producing works", .{self.name});
+        } else for (self.consumers.items) |c| try c.start();
     }
 
     fn pingFn(context: *anyopaque, _: std.Io) bool {
@@ -534,7 +540,7 @@ pub const Client = struct {
         self.consumers_mutex.lockUncancelable(self.io);
         defer self.consumers_mutex.unlock(self.io);
         try self.consumers.append(self.gpa, c);
-        if (self.started) try c.start();
+        if (self.started and !self.suppress_consumers) try c.start();
     }
 
     /// `consume` for callers that bring their own function pointers (the C
@@ -546,7 +552,7 @@ pub const Client = struct {
         self.consumers_mutex.lockUncancelable(self.io);
         defer self.consumers_mutex.unlock(self.io);
         try self.consumers.append(self.gpa, c);
-        if (self.started) try c.start();
+        if (self.started and !self.suppress_consumers) try c.start();
         return c;
     }
 

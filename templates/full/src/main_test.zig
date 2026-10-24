@@ -14,6 +14,8 @@ fn start(state: *app_main.App) !Server {
     state.* = .{
         .db = undefined,
         .rooms = .init(alloc, .{}),
+        .live = undefined,
+        .jobs = undefined,
         .jwt_keys = .{.{ .kid = "demo", .alg = .HS256, .material = .{ .hmac = secret } }},
         .api_key_digest = undefined,
         .session_key = @splat(7),
@@ -27,6 +29,7 @@ fn start(state: *app_main.App) !Server {
     defer arena.deinit();
     var c: anole.db.Ctx = .{ .io = app.io(), .arena = arena.allocator() };
     try state.db.execScript(&c, app_main.schema);
+    try app_main.services(&app, state);
     try app_main.routes(&app, state);
     return app;
 }
@@ -76,11 +79,17 @@ test "server-sent events" {
     var t = try anole.testing.client(&app);
     defer t.deinit();
 
-    const stream = try t.open(.get, "/events?count=2&interval_ms=0", .{});
+    const stream = try t.open(.get, "/events", .{});
     defer stream.deinit();
-    const first = (try stream.nextEvent()).?;
-    try std.testing.expectEqualStrings("tick", first.event.?);
-    try std.testing.expectEqualStrings("0", first.data);
+    var created = try t.post("/todos", .{ .json = .{ .title = "watch me" } });
+    defer created.deinit();
+    try created.expectStatus(.created);
+    // The open line (`id:` alone) comes first.
+    var e = (try stream.nextEvent()).?;
+    if (e.data.len == 0) e = (try stream.nextEvent()).?;
+    try std.testing.expectEqualStrings("created", e.event.?);
+    try std.testing.expect(std.mem.indexOf(u8, e.data, "\"watch me\"") != null);
+    try std.testing.expect(e.id != null);
 }
 
 test "sessions: a POST without the CSRF token is refused" {

@@ -257,6 +257,10 @@ pub const Client = struct {
     /// Delivery and message tasks.
     group: std.Io.Group = .init,
     started: bool = false,
+    /// Set by `app.nats` under `deployment = lambda`: handlers and
+    /// JetStream consumers do not start (the process is frozen between
+    /// invocations); publishing, requests and `subscribe` by hand work.
+    suppress_consumers: bool = false,
     closing: std.atomic.Value(bool) = .init(false),
     rr: std.atomic.Value(usize) = .init(0),
 
@@ -371,6 +375,11 @@ pub const Client = struct {
                 return err;
             };
         }
+        if (self.suppress_consumers) {
+            if (self.handlers.items.len > 0) log.info("nats \"{s}\": lambda deployment starts no subscriptions here; publishing works", .{self.label});
+            if (self.hooks.items.len > 0) log.info("nats \"{s}\": lambda deployment starts no JetStream consumers here; publishing works", .{self.label});
+            return;
+        }
         for (self.handlers.items) |h| try h.begin();
         for (self.hooks.items) |hook| try hook.begin(hook.context);
     }
@@ -385,7 +394,7 @@ pub const Client = struct {
 
     pub fn addHook(self: *Client, hook: Hook) !void {
         try self.hooks.append(self.gpa, hook);
-        if (self.started) try hook.begin(hook.context);
+        if (self.started and !self.suppress_consumers) try hook.begin(hook.context);
     }
 
     /// Stops handlers (subscriptions drain: messages taken are finished),
@@ -529,7 +538,7 @@ pub const Client = struct {
         };
         if (opts.queue) |q| h.opts.queue = try a.dupe(u8, q);
         try self.handlers.append(self.gpa, h);
-        if (self.started) try h.begin();
+        if (self.started and !self.suppress_consumers) try h.begin();
     }
 
     // -- errors ------------------------------------------------------------
@@ -804,7 +813,7 @@ const Handler = struct {
 /// micro error headers.
 fn handlerFailed(cl: *Client, msg: *Msg, err: anyerror) void {
     const status = dusty.errorStatus(err);
-    const code: u16 = if (status) |s| @intCast(@intFromEnum(s)) else 500;
+    const code: u16 = if (status) |s| @intCast(@backingInt(s)) else 500;
     if (code >= 500) log.warn("{s} handler for {s} failed: {t}", .{ msg.id, msg.subject, err }) else log.debug("{s} handler for {s} failed: {t}", .{ msg.id, msg.subject, err });
     const to = msg.reply_to orelse return;
     var code_text: [8]u8 = undefined;
