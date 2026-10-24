@@ -43,3 +43,5 @@ __pycache__/
 
 SECURITY_REVIEW.md
 PERFORMANCE_AUDIT.md
+SAFETY.md
+TESTING.md
