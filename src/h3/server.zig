@@ -2101,6 +2101,36 @@ pub fn Endpoint(comptime Ctx: type) type {
                 bridge.consume(conn.q, stream_id, n);
             }
 
+            /// How much of a request body nobody wants is read and dropped
+            /// before the peer is asked to stop (`lingerRead`).
+            const linger_max: u64 = 256 * 1024;
+
+            /// The answer is done before the request body: the rest is not
+            /// wanted (RFC 9114 §4.1). It is read and dropped, up to
+            /// `linger_max`, rather than refused at once with STOP_SENDING:
+            /// a peer still sending when STOP_SENDING arrives can fail the
+            /// whole call though its response came complete (.NET's HTTP/3
+            /// client did, in the gRPC interop's early-status cases). Past
+            /// `linger_max`, STOP_SENDING (H3_NO_ERROR). Locked.
+            fn lingerRead(conn: *Conn, s: *Stream) void {
+                if (s.lingering) return;
+                s.lingering = true;
+                // What the handler left unread: dropped, its credit given
+                // back so the peer can send the rest and end the stream.
+                const left = s.body.len;
+                s.body.deinit(&conn.ep.blocks);
+                if (left > 0) conn.consume(s.id, left);
+                conn.lingered(s, left);
+            }
+
+            /// `n` more bytes of an unwanted body were dropped. Locked.
+            fn lingered(conn: *Conn, s: *Stream, n: u64) void {
+                s.lingered += n;
+                if (s.lingered <= linger_max or s.read_stopped) return;
+                s.read_stopped = true;
+                _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
+            }
+
             /// The client's Finished has arrived: what it sent can no longer
             /// be a replay. Locked.
             fn handshakeDone(conn: *Conn) bool {
@@ -2295,6 +2325,12 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// capsules parsed as they arrive (`Session.Options.inline_capsules`).
             wt_session: ?*webtransport.Session = null,
             body_done: bool = false,
+            /// The answer is done before the body: what is left is read and
+            /// dropped (`lingerRead`), `lingered` bytes so far.
+            lingering: bool = false,
+            lingered: u64 = 0,
+            /// STOP_SENDING went out: the peer is to send no more.
+            read_stopped: bool = false,
             /// The peer reset the stream, or the connection is gone.
             reset: bool = false,
             /// The task running the handler, published for `cancelHandler`;
@@ -2466,8 +2502,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     if (s.parked == null or !s.parked.?.bursting) s.task = null;
                     // A handler done before the request body is: the rest
                     // is not wanted (RFC 9114 §4.1).
-                    if (!s.body_done and !s.reset)
-                        _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
+                    if (!s.body_done and !s.reset) conn.lingerRead(s);
                     s.release(.handler);
                     conn.unlock();
                     conn.kick();
@@ -2897,8 +2932,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return;
             }
             s.detached = null;
-            if (!s.body_done and !s.reset)
-                _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
+            if (!s.body_done and !s.reset) conn.lingerRead(s);
             if (!s.in_handler) s.release(.handler);
             conn.unlock();
             conn.kick();
@@ -3077,7 +3111,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     s.wakeAll();
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, s.id, h.NGHTTP3_H3_REQUEST_CANCELLED);
                 } else if (!s.body_done and !s.reset and s.refs.quic) {
-                    _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
+                    conn.lingerRead(s);
                 }
                 s.parked = null;
                 s.detached = null;
@@ -3773,6 +3807,12 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (s.wt_session) |session| {
                 session.onCapsuleBytes(data[0..len]);
                 conn.consume(stream_id, len);
+                return 0;
+            }
+            // Nobody wants the rest of this body: dropped, its credit back.
+            if (s.lingering) {
+                conn.consume(stream_id, len);
+                conn.lingered(s, len);
                 return 0;
             }
             // The peer cannot send past the stream's window, so this is

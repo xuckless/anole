@@ -27,10 +27,15 @@
         // HTTP core (adapted from lalinsky/dusty) is in src/http/core, not a
         // dependency.
         // Plus `diagnostics` (88f6d69): comptime-gated per-executor task
-        // counters and stack stats for the runtime gauges on /metrics.
+        // counters and stack stats for the runtime gauges on /metrics. Plus
+        // SAFETY.md's checks: `debug_held_locks` (4a2dd7c), a task that
+        // suspends holding a counted lock panics (L2), and a count of
+        // `debug_cancel` reports (3accc88, exported in 42f97ae), on which
+        // the test runner fails a test (C3), and no report for a cancel an
+        // AutoCancel consumed as its timeout (812eac3).
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#4a2dd7c829b18c69ec12da94a93a4b4f59c6df1b",
-            .hash = "zio-0.19.0-xHbVVAboLQC_N4FyIipRdgbSpC7kr-x1nJoAROWpP7QK",
+            .url = "git+https://github.com/xuckless/zio#812eac300e20c7d042403a5df7e59f4a913159b6",
+            .hash = "zio-0.19.0-xHbVVBPwLQBsgh4wHD9aXWugD40WWDN5m2zGfdKe9110",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{

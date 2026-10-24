@@ -2,7 +2,8 @@
 //! Copyright (c) Zig contributors), with one change for SAFETY.md E1: the
 //! test allocator of a unit test is backed by `never_reuse.allocator`, so
 //! freed memory is never handed out again and a use after free faults at
-//! once. The fuzzing loops keep `std.heap.page_allocator` (an mprotect per
+//! once; and a unit test fails when zio's `debug_cancel` reports a
+//! swallowed cancellation during it (C3). The fuzzing loops keep `std.heap.page_allocator` (an mprotect per
 //! bucket costs a fuzzer's throughput). Re-copy it when moving to the next
 //! Zig version and apply the change again (`ANOLE:` marks it).
 const builtin = @import("builtin");
@@ -16,6 +17,22 @@ const panic = std.debug.panic;
 const fuzz_abi = std.Build.abi.fuzz;
 // ANOLE: the test allocator's backing allocator.
 const never_reuse = @import("never_reuse.zig");
+
+/// ANOLE: zio's count of swallowed cancellations (`debug_cancel`); a test
+/// during which it rises fails (SAFETY.md C3). build.zig gives every test
+/// binary this import (src/safety/test_hooks.zig, or a stub without zio).
+const hooks = @import("anole_test_hooks");
+
+fn swallowedCancels() u64 {
+    return hooks.swallowedCancels();
+}
+
+/// ANOLE: runs a test, failing it when zio reported a swallowed cancellation.
+fn runTest(test_fn: @TypeOf(builtin.test_functions[0])) anyerror!void {
+    const before = swallowedCancels();
+    try test_fn.func();
+    if (swallowedCancels() != before) return error.SwallowedCancel;
+}
 
 pub const std_options: std.Options = .{
     .logFn = log,
@@ -148,7 +165,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 try server.serveStringMessage(.test_started, &.{});
 
                 const TestResults = std.zig.Server.Message.TestResults;
-                const status: TestResults.Status = if (test_fn.func()) |v| s: {
+                const status: TestResults.Status = if (runTest(test_fn)) |v| s: { // ANOLE
                     v;
                     break :s .pass;
                 } else |err| switch (err) {
@@ -300,7 +317,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             std.debug.print("{d}/{d} {s}...", .{ i + 1, test_fn_list.len, test_fn.name });
         }
         is_fuzz_test = false;
-        if (test_fn.func()) |_| {
+        if (runTest(test_fn)) |_| { // ANOLE
             ok_count += 1;
             test_node.end();
             if (!have_tty) std.debug.print("OK\n", .{});
