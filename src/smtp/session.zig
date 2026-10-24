@@ -148,7 +148,9 @@ pub const Session = struct {
             .host = s.host,
             .port = s.port,
             .tls = if (s.tls_mode == .implicit) s.tls else null,
-            .connect_timeout = s.connect_timeout,
+            // `Client.dial` bounds the whole opening with `connect_timeout`;
+            // a second timer of the same length here would fire with it.
+            .connect_timeout = null,
         });
         errdefer stream.close();
         const self = try gpa.create(Session);
