@@ -1413,12 +1413,23 @@ pub const Subscriber = struct {
             else => error.OutOfMemory,
         };
         defer p.release(hub.gpa);
-        return sub._sendPayload(p);
+        return sub._sendPayload(p, .capped);
     }
+
+    /// Whether `_sendPayload` refuses past `max_queued_bytes`.
+    pub const Admission = enum {
+        /// `error.Full` past `max_queued_bytes` of everything queued.
+        capped,
+        /// Already admitted by the caller's own count of this subscriber's
+        /// events (the C ABI's `anole_sse_send`): queued regardless of the
+        /// open line, replay and topic events ahead of it, so an event the
+        /// caller was told is taken is never dropped.
+        admitted,
+    };
 
     /// `send` for a payload already encoded (`Topics._encode`; the caller
     /// keeps its reference).
-    pub fn _sendPayload(sub: *Subscriber, p: *Payload) SendError!void {
+    pub fn _sendPayload(sub: *Subscriber, p: *Payload, admission: Admission) SendError!void {
         const hub = sub.hub;
         const io = hub.io;
         var launch = false;
@@ -1426,7 +1437,7 @@ pub const Subscriber = struct {
             hub.mutex.lockUncancelable(io);
             defer hub.mutex.unlock(io);
             if (sub.left or sub.ending or sub.broken or sub.gone.load(.acquire)) return error.Closed;
-            if (sub.queued_bytes > 0 and sub.queued_bytes + p.cost() > hub.options.max_queued_bytes) return error.Full;
+            if (admission == .capped and sub.queued_bytes > 0 and sub.queued_bytes + p.cost() > hub.options.max_queued_bytes) return error.Full;
             sub.queue.append(hub.gpa, p) catch return error.OutOfMemory;
             p.retain();
             sub.queued_bytes += p.cost();

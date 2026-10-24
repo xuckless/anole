@@ -26,6 +26,23 @@ pub const FrameIterator = framing_mod.FrameIterator;
 const placement = dusty.placement;
 const Duration = std.Io.Duration;
 const native_os = builtin.os.tag;
+
+/// Winsock calls made directly (Windows, a development target): a shutdown
+/// or a socket option is one synchronous call there as on POSIX, never an
+/// Io wait, so it is no cancelation point and works from a consumer thread.
+const ws = if (native_os == .windows) struct {
+    const windows = @import("zio").os.windows;
+    const SD_RECEIVE: i32 = 0;
+    const SD_SEND: i32 = 1;
+    const SD_BOTH: i32 = 2;
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_LINGER: u32 = 0x0080;
+    const Linger = extern struct { onoff: u16, linger: u16 };
+
+    fn socket(fd: std.posix.fd_t) windows.SOCKET {
+        return @ptrCast(fd);
+    }
+} else struct {};
 const log = std.log.scoped(.anole);
 
 /// How a connection ended.
@@ -722,6 +739,10 @@ const TcpConn = struct {
     task_window: []u8 = &.{},
     task_frames_at: usize = 0,
     task_writer: TaskWriter = undefined,
+    /// Windows: the task in `serve`, under `lock`. A shutdown there does
+    /// not end a receive already waiting, so ending the connection from
+    /// elsewhere also cancels this task (as `parked.zig` does).
+    reader_task: if (native_os == .windows) ?placement.Task else void = if (native_os == .windows) null else {},
 
     const linger: Duration = .fromSeconds(2);
 
@@ -1042,7 +1063,10 @@ const TcpConn = struct {
             t.dead = true;
             t.ended = true;
         }
-        if (comptime native_os != .windows) {
+        if (comptime native_os == .windows) {
+            const lg: ws.Linger = .{ .onoff = 1, .linger = 0 };
+            _ = ws.windows.setsockopt(ws.socket(t.connection.stream.socket.handle), ws.SOL_SOCKET, ws.SO_LINGER, @ptrCast(&lg), @sizeOf(ws.Linger));
+        } else {
             const lg: std.c.linger = .{ .onoff = 1, .linger = 0 };
             _ = std.c.setsockopt(t.connection.stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, &lg, @sizeOf(@TypeOf(lg)));
         }
@@ -1071,7 +1095,13 @@ const TcpConn = struct {
 
     fn shutdownSocket(t: *TcpConn, how: std.Io.net.ShutdownHow) void {
         if (comptime native_os == .windows) {
-            t.connection.stream.shutdown(t.io, how) catch {};
+            const h: i32 = switch (how) {
+                .recv => ws.SD_RECEIVE,
+                .send => ws.SD_SEND,
+                .both => ws.SD_BOTH,
+            };
+            _ = ws.windows.shutdown(ws.socket(t.connection.stream.socket.handle), h);
+            if (how != .send) t.cancelReader();
             return;
         }
         const h: c_int = switch (how) {
@@ -1080,6 +1110,17 @@ const TcpConn = struct {
             .both => std.posix.SHUT.RDWR,
         };
         _ = std.c.shutdown(t.connection.stream.socket.handle, h);
+    }
+
+    /// Windows: wakes the reading task out of a receive the shutdown left
+    /// waiting, unless it is the caller. Under `lock`, which `serve` takes
+    /// to clear the task before it returns, so the task is still running.
+    fn cancelReader(t: *TcpConn) void {
+        if (comptime native_os != .windows) return;
+        const me = placement.currentTask(t.io);
+        t.spinLock();
+        defer t.lock.unlock();
+        if (t.reader_task) |task| if (me == null or me.? != task) placement.cancelTask(task);
     }
 
     // -- Writing: the responsible party ---------------------------------------
@@ -1366,13 +1407,19 @@ const TcpConn = struct {
     /// and for a graceful close the wait for the peer's side to end.
     fn finishOutput(t: *TcpConn) void {
         const io = t.io;
-        t.connection.closeNotify() catch {};
+        // A cancel (the server stopping) ends the wait for the peer early
+        // and stays pending for the flusher's caller.
+        var canceled = false;
+        t.connection.closeNotify() catch {
+            canceled = true;
+        };
         t.shutdownSocket(.send);
         t.endFinished();
+        if (canceled) io.recancel();
         if (!t.close_graceful.load(.acquire)) return;
         // The reading side drops input until the peer ends: a bound on it.
-        if (t.over.load(.acquire) == 0) {
-            io.futexWaitTimeout(u32, &t.over.raw, 0, .{ .duration = .{ .raw = linger, .clock = .awake } }) catch {};
+        if (!canceled and t.over.load(.acquire) == 0) {
+            io.futexWaitTimeout(u32, &t.over.raw, 0, .{ .duration = .{ .raw = linger, .clock = .awake } }) catch io.recancel();
         }
         if (t.over.load(.acquire) == 0) {
             t.shutdownSocket(.both);
@@ -1445,6 +1492,17 @@ const TcpConn = struct {
     fn serve(a: *dusty.Adopter, burst: *dusty.Burst) anyerror!dusty.Burst.End {
         const t: *TcpConn = @alignCast(@fieldParentPtr("adopter", a));
         if (t.ending) return .close;
+        if (comptime native_os == .windows) {
+            const me = placement.currentTask(t.io);
+            t.spinLock();
+            t.reader_task = me;
+            t.lock.unlock();
+        }
+        defer if (comptime native_os == .windows) {
+            t.spinLock();
+            t.reader_task = null;
+            t.lock.unlock();
+        };
         if (t.task_form) return t.serveTask(burst);
         const w = t.service.options.read_window;
         if (w <= 4096) return t.serveCallbacks(4096, burst);
@@ -1768,8 +1826,15 @@ const TaskWriter = struct {
 };
 
 fn socketName(fd: std.posix.fd_t) ?std.Io.net.IpAddress {
-    if (comptime native_os == .windows) return null;
     var storage: std.Io.Threaded.PosixAddress = undefined;
+    if (comptime native_os == .windows) {
+        // zio sets SO_UPDATE_ACCEPT_CONTEXT on accepted sockets, which
+        // getsockname needs.
+        var wlen: i32 = @sizeOf(std.Io.Threaded.PosixAddress);
+        if (ws.windows.getsockname(ws.socket(fd), @ptrCast(&storage.any), &wlen) != 0) return null;
+        if (storage.any.family != std.posix.AF.INET and storage.any.family != std.posix.AF.INET6) return null;
+        return dusty.unmapIpv4(std.Io.Threaded.addressFromPosix(&storage));
+    }
     var len: std.posix.socklen_t = @sizeOf(std.Io.Threaded.PosixAddress);
     if (std.c.getsockname(fd, &storage.any, &len) != 0) return null;
     if (storage.any.family != std.posix.AF.INET and storage.any.family != std.posix.AF.INET6) return null;

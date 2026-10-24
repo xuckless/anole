@@ -193,6 +193,16 @@ pub const FakeServer = struct {
         return o.bytes;
     }
 
+    /// The stored object's ETag, as the fake answers it.
+    pub fn getEtag(self: *FakeServer, bucket: []const u8, key: []const u8) ?[]const u8 {
+        self.lock() catch return null;
+        defer self.unlock();
+        var buf: [1200]u8 = undefined;
+        const k = std.fmt.bufPrint(&buf, "{s}/{s}", .{ bucket, key }) catch return null;
+        const o = self.objects.get(k) orelse return null;
+        return o.etag;
+    }
+
     /// Requests seen so far with `method` (null: all) whose target contains `contains`.
     pub fn count(self: *FakeServer, method: ?[]const u8, contains: []const u8) usize {
         self.lock() catch return 0;

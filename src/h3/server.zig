@@ -2101,6 +2101,36 @@ pub fn Endpoint(comptime Ctx: type) type {
                 bridge.consume(conn.q, stream_id, n);
             }
 
+            /// How much of a request body nobody wants is read and dropped
+            /// before the peer is asked to stop (`lingerRead`).
+            const linger_max: u64 = 256 * 1024;
+
+            /// The answer is done before the request body: the rest is not
+            /// wanted (RFC 9114 §4.1). It is read and dropped, up to
+            /// `linger_max`, rather than refused at once with STOP_SENDING:
+            /// a peer still sending when STOP_SENDING arrives can fail the
+            /// whole call though its response came complete (.NET's HTTP/3
+            /// client did, in the gRPC interop's early-status cases). Past
+            /// `linger_max`, STOP_SENDING (H3_NO_ERROR). Locked.
+            fn lingerRead(conn: *Conn, s: *Stream) void {
+                if (s.lingering) return;
+                s.lingering = true;
+                // What the handler left unread: dropped, its credit given
+                // back so the peer can send the rest and end the stream.
+                const left = s.body.len;
+                s.body.deinit(&conn.ep.blocks);
+                if (left > 0) conn.consume(s.id, left);
+                conn.lingered(s, left);
+            }
+
+            /// `n` more bytes of an unwanted body were dropped. Locked.
+            fn lingered(conn: *Conn, s: *Stream, n: u64) void {
+                s.lingered += n;
+                if (s.lingered <= linger_max or s.read_stopped) return;
+                s.read_stopped = true;
+                _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
+            }
+
             /// The client's Finished has arrived: what it sent can no longer
             /// be a replay. Locked.
             fn handshakeDone(conn: *Conn) bool {
@@ -2295,6 +2325,12 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// capsules parsed as they arrive (`Session.Options.inline_capsules`).
             wt_session: ?*webtransport.Session = null,
             body_done: bool = false,
+            /// The answer is done before the body: what is left is read and
+            /// dropped (`lingerRead`), `lingered` bytes so far.
+            lingering: bool = false,
+            lingered: u64 = 0,
+            /// STOP_SENDING went out: the peer is to send no more.
+            read_stopped: bool = false,
             /// The peer reset the stream, or the connection is gone.
             reset: bool = false,
             /// The task running the handler, published for `cancelHandler`;
@@ -2466,8 +2502,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     if (s.parked == null or !s.parked.?.bursting) s.task = null;
                     // A handler done before the request body is: the rest
                     // is not wanted (RFC 9114 §4.1).
-                    if (!s.body_done and !s.reset)
-                        _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
+                    if (!s.body_done and !s.reset) conn.lingerRead(s);
                     s.release(.handler);
                     conn.unlock();
                     conn.kick();
@@ -2532,6 +2567,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 timer.setClock(.fromStd(timeout), .fromStdTimeout(timeout));
             }
 
+            /// Whether the task's cancel was this timer's (consumed if so).
+            fn claimTimeout(context: *anyopaque) bool {
+                const timer: *zio.AutoCancel = @ptrCast(@alignCast(context));
+                return timer.check(error.Canceled);
+            }
+
             fn resetStream(s: *Stream, code: u64) void {
                 const conn = s.conn;
                 conn.lock();
@@ -2580,6 +2621,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     ._drain_hooks = &server.drain_hooks,
                     ._timeout_context = if (inline_mode) null else &timer,
                     ._set_timeout = if (inline_mode) null else setTimeout,
+                    ._claim_timeout = if (inline_mode) null else claimTimeout,
                     // Its entry table is never read past `len`: not zeroed.
                     .session = undefined,
                 };
@@ -2851,6 +2893,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             // A task's request timer lives on the task's stack.
             ex.request._timeout_context = null;
             ex.request._set_timeout = null;
+            ex.request._claim_timeout = null;
             d.request = &ex.request;
             d.response = &ex.response;
             return ex;
@@ -2897,8 +2940,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return;
             }
             s.detached = null;
-            if (!s.body_done and !s.reset)
-                _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
+            if (!s.body_done and !s.reset) conn.lingerRead(s);
             if (!s.in_handler) s.release(.handler);
             conn.unlock();
             conn.kick();
@@ -3077,7 +3119,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     s.wakeAll();
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, s.id, h.NGHTTP3_H3_REQUEST_CANCELLED);
                 } else if (!s.body_done and !s.reset and s.refs.quic) {
-                    _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
+                    conn.lingerRead(s);
                 }
                 s.parked = null;
                 s.detached = null;
@@ -3508,6 +3550,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             cb.delete_crypto_aead_ctx = c.ngtcp2_crypto_delete_crypto_aead_ctx_cb;
             cb.delete_crypto_cipher_ctx = c.ngtcp2_crypto_delete_crypto_cipher_ctx_cb;
             cb.stream_stop_sending = onStreamStopSending;
+            cb.recv_stop_sending = onRecvStopSending;
             cb.version_negotiation = c.ngtcp2_crypto_version_negotiation_cb;
             cb.recv_tx_key = onRecvTxKey;
             cb.get_new_connection_id2 = onGetNewConnectionId;
@@ -3662,10 +3705,20 @@ pub fn Endpoint(comptime Ctx: type) type {
             return 0;
         }
 
-        fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, code: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+        /// We stopped reading the stream (`ngtcp2_conn_shutdown_stream_read`;
+        /// ngtcp2 calls this as the STOP_SENDING goes out): nghttp3 is to
+        /// read no more of it either.
+        fn onStreamStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, _: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
+            const conn = connOf(user_data);
+            if (conn.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
+            return 0;
+        }
+
+        /// The peer sent STOP_SENDING: it wants no more of what we send on
+        /// the stream (ngtcp2 has reset our sending side).
+        fn onRecvStopSending(_: ?*c.ngtcp2_conn, stream_id: i64, code: u64, user_data: ?*anyopaque, _: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             if (conn.wt) |w| if (w.onStopSending(stream_id, code)) return 0;
-            if (conn.h3) |hc| if (h.nghttp3_conn_shutdown_stream_read(hc, stream_id) != 0) return c.NGTCP2_ERR_CALLBACK_FAILURE;
             // The peer wants no more of the response.
             if (conn.streamOf(stream_id)) |s| {
                 s.reset = true;
@@ -3773,6 +3826,14 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (s.wt_session) |session| {
                 session.onCapsuleBytes(data[0..len]);
                 conn.consume(stream_id, len);
+                return 0;
+            }
+            // Nobody wants the rest of this body: dropped, its credit back.
+            if (s.lingering) {
+                conn.consume(stream_id, len);
+                conn.lingered(s, len);
+                // The window update (or the STOP_SENDING) goes out.
+                conn.kick();
                 return 0;
             }
             // The peer cannot send past the stream's window, so this is

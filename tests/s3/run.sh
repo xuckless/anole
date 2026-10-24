@@ -24,6 +24,9 @@ SECRET=anole-secret-1
 BUCKET=anole-test
 
 CERTS=$(mktemp -d)
+# mktemp makes the directory 0700: MinIO runs as an unprivileged user in its
+# container, and without access it finds no certificate and serves plain HTTP.
+chmod 755 "$CERTS"
 cleanup() {
   docker rm -f "$NAME-plain" "$NAME-tls" >/dev/null 2>&1 || true
   rm -rf "$CERTS"
@@ -51,14 +54,14 @@ start() { # name port [certs]
   docker run "${args[@]}" "$IMAGE" server /data --address :9000 ${certs:+--certs-dir /certs} >/dev/null
 }
 
-wait_ready() { # url [curl args]
-  local url=$1; shift
+wait_ready() { # name url [curl args]
+  local name=$1 url=$2; shift 2
   for _ in $(seq 1 60); do
     if curl -fsS "$@" "$url/minio/health/live" >/dev/null 2>&1; then return 0; fi
     sleep 1
   done
   echo "MinIO did not come up at $url" >&2
-  docker logs "$NAME-plain" 2>&1 | tail -5 >&2 || true
+  docker logs "$name" 2>&1 | tail -5 >&2 || true
   return 1
 }
 
@@ -71,12 +74,12 @@ export ANOLE_S3_TEST_KEY=$KEY ANOLE_S3_TEST_SECRET=$SECRET ANOLE_S3_TEST_BUCKET=
 
 echo "== MinIO over plain HTTP"
 start "$NAME-plain" "$PORT"
-wait_ready "http://127.0.0.1:$PORT"
+wait_ready "$NAME-plain" "http://127.0.0.1:$PORT"
 make_bucket "http://127.0.0.1:$PORT"
 "$ZIG" build test-s3 "-Ds3-test-url=http://127.0.0.1:$PORT" "$@"
 
 echo "== MinIO over TLS"
 start "$NAME-tls" "$TLS_PORT" "$CERTS"
-wait_ready "https://localhost:$TLS_PORT" --cacert "$CERTS/ca.crt"
+wait_ready "$NAME-tls" "https://localhost:$TLS_PORT" --cacert "$CERTS/ca.crt"
 make_bucket "https://localhost:$TLS_PORT" --cacert "$CERTS/ca.crt"
 ANOLE_S3_TEST_CA="$CERTS/ca.crt" "$ZIG" build test-s3 "-Ds3-test-url=https://localhost:$TLS_PORT" "$@"

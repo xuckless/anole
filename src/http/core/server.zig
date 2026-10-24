@@ -1034,6 +1034,11 @@ fn setRequestTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) v
     timer.set(io, timeout);
 }
 
+fn claimRequestTimeout(context: *anyopaque) bool {
+    const timer: *Timer = @ptrCast(@alignCast(context));
+    return timer.fired();
+}
+
 /// A protocol that takes connections straight from a listener
 /// (`Listener.raw`): the application's own, never parsed as HTTP.
 pub const Raw = struct {
@@ -1610,6 +1615,12 @@ pub fn Server(comptime Ctx: type) type {
             }
             self.shelves = shelves;
             return shelves;
+        }
+
+        /// Whether idle connections park without a task on this platform
+        /// (not on Windows, a development target, where they keep theirs).
+        pub fn parksIdle(_: *const Self) bool {
+            return park.supported;
         }
 
         /// How many connections are parked right now (`timeout.idle_park`).
@@ -2795,6 +2806,7 @@ pub fn Server(comptime Ctx: type) type {
                 .peer_certificate = connection.peerCertificate(),
                 ._timeout_context = timer,
                 ._set_timeout = setRequestTimeout,
+                ._claim_timeout = claimRequestTimeout,
                 // Its entry table is never read past `len`: not zeroed.
                 .session = undefined,
             };

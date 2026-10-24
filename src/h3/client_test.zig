@@ -55,6 +55,11 @@ fn earlyPost(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = if (early_data.isEarly(req)) "early" else "late";
 }
 
+/// POST /answer-first: answers without reading the request body.
+fn answerFirst(_: *dusty.Request, res: *dusty.Response) !void {
+    res.body = "first";
+}
+
 /// GET /port: the client's port, as the request reports it.
 fn port(req: *dusty.Request, res: *dusty.Response) !void {
     try res.print(.text, "{d}", .{req.remote_address.getPort()});
@@ -263,6 +268,7 @@ const Fixture = struct {
         http.router.get("/abort", aborted);
         http.router.get("/early", early);
         http.router.post("/early-post", earlyPost);
+        http.router.post("/answer-first", answerFirst);
         http.router.get("/port", port);
         http.router.get("/download", download);
         http.router.get("/huge-head", hugeHead);
@@ -1717,6 +1723,55 @@ test "h3 client: send_buffer = 1 MiB queues a 1 MiB body before the server reads
     const echoed = try s.reader().allocRemaining(gpa, .unlimited);
     defer gpa.free(echoed);
     try std.testing.expectEqualSlices(u8, body, echoed);
+}
+
+test "h3 server: an answer before the request body ends lets the client finish sending it; past 256 KiB more it is stopped" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const head: []const client.Header = &.{
+        .{ .name = ":method", .value = "POST" },   .{ .name = ":path", .value = "/answer-first" },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    };
+    var chunk: [4096]u8 = @splat('x');
+    // Within the bound: the rest of the body is read and dropped, and the
+    // client ends its stream normally. A STOP_SENDING here raced a client
+    // still sending (.NET's HTTP/3 client failed whole gRPC calls on it).
+    {
+        const s = try conn.request(head, .{ .body = true, .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } } });
+        defer s.release();
+        try s.writer().writeAll(&chunk);
+        try s.writer().flush();
+        try s.waitHead();
+        const got = try s.reader().allocRemaining(gpa, .unlimited);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings("first", got);
+        for (0..16) |_| try s.writer().writeAll(&chunk);
+        try s.closeSend();
+        try std.testing.expectEqual(@as(?client.StreamError, null), s.writeError());
+    }
+    // Past it: the server asks the client to stop (STOP_SENDING).
+    {
+        const s = try conn.request(head, .{ .body = true, .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } } });
+        defer s.release();
+        try s.writer().writeAll(&chunk);
+        try s.writer().flush();
+        try s.waitHead();
+        const got = try s.reader().allocRemaining(gpa, .unlimited);
+        defer gpa.free(got);
+        var sent: usize = 0;
+        while (sent < 4 << 20) : (sent += chunk.len) {
+            s.writer().writeAll(&chunk) catch break;
+            s.writer().flush() catch break;
+        }
+        try std.testing.expect(sent < 4 << 20);
+        try std.testing.expectEqual(@as(?client.StreamError, error.StreamReset), s.writeError());
+    }
 }
 
 fn keepAliveOn(conn: *client.ClientConnection) bool {

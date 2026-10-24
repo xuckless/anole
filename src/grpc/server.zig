@@ -660,11 +660,17 @@ fn acceptEncoding() []const u8 {
 /// one this maps (a canceled call, a message over the limit, a frame that
 /// does not decode...), UNKNOWN for any other.
 pub fn finish(call: *Call, result: anyerror!void) !void {
+    // A cancel the call's deadline did not make (the server stopping, the
+    // stream reset) stays the task's: re-armed once the status is out
+    // (SAFETY.md C3). The deadline's own is consumed: the call answers it.
+    var rearm = false;
+    defer if (rearm) call.io.recancel();
     const protection = call.io.swapCancelProtection(.blocked);
     defer _ = call.io.swapCancelProtection(protection);
     if (result) |_| {} else |err| switch (err) {
         error.GrpcStatus => {},
         error.Canceled => {
+            rearm = !call.req._claimTimeoutCancel();
             if (call.deadlineExceeded()) {
                 call.status = .deadline_exceeded;
                 call.status_message = "deadline exceeded";

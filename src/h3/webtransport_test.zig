@@ -29,6 +29,8 @@ var last_close: struct {
 var handlers_done: std.atomic.Value(u32) = .init(0);
 /// The code of the last reset an echoed stream's read saw.
 var last_reset_code: std.atomic.Value(u32) = .init(std.math.maxInt(u32));
+/// The code of the last STOP_SENDING that failed an echoed stream's write.
+var last_stop_code: std.atomic.Value(u32) = .init(std.math.maxInt(u32));
 
 /// Echoes: each bidirectional stream back on itself, each unidirectional
 /// stream back on one of its own, each datagram back. A datagram "open"
@@ -61,13 +63,23 @@ fn echoBidi(session: *wt.Session, io: std.Io) std.Io.Cancelable!void {
     }
 }
 
+/// Echoes a stream back on itself, each piece as it arrives.
 fn echoStream(stream: *wt.Stream) std.Io.Cancelable!void {
     defer stream.release();
-    _ = stream.reader().streamRemaining(stream.writer()) catch {
-        if (stream.readError()) |e| if (e == error.StreamReset) if (stream.resetCode()) |code| last_reset_code.store(code, .release);
-        return;
-    };
+    while (true) {
+        _ = stream.reader().stream(stream.writer(), .unlimited) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return noteStreamError(stream),
+        };
+        stream.writer().flush() catch return noteStreamError(stream);
+    }
     stream.closeSend() catch {};
+}
+
+/// The codes a peer's reset or STOP_SENDING carried, for the tests.
+fn noteStreamError(stream: *wt.Stream) void {
+    if (stream.readError()) |e| if (e == error.StreamReset) if (stream.resetCode()) |code| last_reset_code.store(code, .release);
+    if (stream.writeError()) |e| if (e == error.StreamStopped) if (stream.stopCode()) |code| last_stop_code.store(code, .release);
 }
 
 fn echoUni(session: *wt.Session, io: std.Io) std.Io.Cancelable!void {
@@ -741,6 +753,45 @@ test "WebTransport: the connection going ends the session and its streams on bot
     stopped = true;
     try std.testing.expectError(error.SessionClosed, session.acceptStream());
     try std.testing.expectError(error.ReadFailed, s.reader().allocRemaining(gpa, .unlimited));
+}
+
+test "WebTransport: stopSending stops only the peer's writes, which fail with its code; one's own writes go on" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/wt" });
+    defer session.deinit();
+    const s = try session.openStream();
+    defer s.release();
+    last_stop_code.store(std.math.maxInt(u32), .release);
+    try s.writer().writeAll("hello");
+    try s.writer().flush();
+    var echoed: [5]u8 = undefined;
+    try s.reader().readSliceAll(&echoed);
+    try std.testing.expectEqualStrings("hello", &echoed);
+    // We stop reading and keep writing, our side open. Our own writes go
+    // on (our STOP_SENDING once failed our own sending side); the server's
+    // echo of them fails with our code once our STOP_SENDING arrives (the
+    // peer's STOP_SENDING once never reached the server's stream). Having
+    // failed, the server lets go and stops our side in turn (code 0): a
+    // write may fail then, only after the server saw our code.
+    s.stopSending(9);
+    var tries: usize = 0;
+    while (last_stop_code.load(.acquire) != 9) : (tries += 1) {
+        if (tries > 300) return error.Timeout;
+        s.writer().writeAll("more") catch {};
+        s.writer().flush() catch {};
+        if (s.writeError()) |e| {
+            if (last_stop_code.load(.acquire) == 9) break;
+            return e;
+        }
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
 }
 
 test "WebSocket over HTTP/3 (RFC 9220): echo, ping, close" {

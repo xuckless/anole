@@ -278,11 +278,20 @@ pub const ClientStream = struct {
         self.socket.shutdown(self.io, .both) catch {};
     }
 
-    /// Sends TLS close_notify (best effort), closes the socket and frees
-    /// the stream.
+    /// Sends TLS close_notify (best effort, and only on a stream whose reads
+    /// and writes have not failed), closes the socket and frees the stream.
+    /// Not a cancelation point: a cancel that ended the last call stays
+    /// pending for the caller.
     pub fn close(self: *ClientStream) void {
+        // `self` is freed below: the protection is restored through a copy.
+        const io = self.io;
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
         if (comptime has_tls) if (self.secure) |s| {
-            s.conn.close();
+            // A stream cut off mid-call (a timeout, a cancel, a reset) is
+            // broken: close_notify could only wait on a socket nobody reads,
+            // as hiredis and rustls skip it there too.
+            if (self.tcp_reader.err == null and self.tcp_writer.err == null) s.conn.close();
             s.conn.deinit();
             self.gpa.destroy(s);
         };

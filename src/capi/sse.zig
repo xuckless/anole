@@ -441,7 +441,9 @@ fn applyCmd(e: *Engine, s: *SseSlot, c: *SseCmd) void {
         .unsubscribe => sub.leave(c.topic),
         .send => {
             const p = c.payload.?;
-            sub._sendPayload(p) catch {
+            // `send` admitted it against `pending_bytes`; only a stream
+            // that is over refuses it now.
+            sub._sendPayload(p, .admitted) catch {
                 _ = s.pending_bytes.fetchSub(p.cost(), .acq_rel);
             };
         },

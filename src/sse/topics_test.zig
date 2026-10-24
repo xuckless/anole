@@ -443,6 +443,20 @@ test "sse: Subscriber.send reaches one subscriber, with no id; Full past the cap
     try std.testing.expect(full);
 }
 
+test "sse: an event the caller already admitted is queued past the cap, where a capped one is refused" {
+    const h = try Harness.init(.{ .max_queued_bytes = 300 });
+    defer h.deinit();
+    const f = try h.addHeld(&.{"t"});
+    f.held.wait(io) catch unreachable;
+    const sub = h.subAt(0);
+    const data: [200]u8 = @splat('x');
+    const p = try sub.hub._encode(.{ .data = &data });
+    defer p.release(sub.hub.gpa);
+    try sub._sendPayload(p, .capped);
+    try std.testing.expectError(error.Full, sub._sendPayload(p, .capped));
+    try sub._sendPayload(p, .admitted);
+}
+
 test "sse: the peer gone with events queued: leaves every topic, on_close(client_gone)" {
     const h = try Harness.init(.{});
     defer h.deinit();
