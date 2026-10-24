@@ -466,12 +466,20 @@ fn slowCheck(a: *SseConsumer, port: u16, io: std.Io) !void {
     defer alloc.free(buf);
     const want = taken * (16 * 1024 + 8);
     var got: usize = 0;
-    var first = true;
+    var events_started = false;
     while (got < want) {
         const ck = (try c.chunk(buf)) orelse return error.EndedEarly;
-        // The open line is the first chunk.
-        if (first) first = false else got += ck.len;
+        // The open line comes first, in its own chunk or sharing one with
+        // the first events (sends taken before the stream opened go out
+        // with it).
+        if (events_started) {
+            got += ck.len;
+        } else if (std.mem.indexOf(u8, ck, "data: ")) |at| {
+            events_started = true;
+            got += ck.len - at;
+        }
     }
+    try std.testing.expectEqual(want, got);
     try waitAtLeast(io, &a.writables, w0 + 1);
 }
 
