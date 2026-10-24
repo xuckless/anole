@@ -141,6 +141,7 @@ pub const Request = struct {
     // module does not depend on the server's backend-specific timer type.
     _timeout_context: ?*anyopaque = null,
     _set_timeout: ?*const fn (*anyopaque, std.Io, std.Io.Timeout) void = null,
+    _claim_timeout: ?*const fn (*anyopaque) bool = null,
     /// The last deadline the handler set with `setTimeout`, on the awake
     /// clock; null for none (or `.none`). The rest of an unread body is
     /// drained no later than this.
@@ -221,7 +222,7 @@ pub const Request = struct {
         const kept = [_][]const u8{
             "arena",          "io",       "_parser", "_transport", "_config",          "_response",
             "remote_address", "listener", "secure",  "drain",      "_drain_hooks",     "peer_certificate",
-            "_timeout_context", "_set_timeout",
+            "_timeout_context", "_set_timeout",   "_claim_timeout",
         };
         @setEvalBranchQuota(10_000);
         for (kept) |k| if (std.mem.eql(u8, k, name)) return true;
@@ -261,6 +262,17 @@ pub const Request = struct {
     pub fn setDeadline(self: *Request, deadline: std.Io.Timeout) void {
         self._deadline_from_handler = true;
         self._applyDeadline(deadline);
+    }
+
+    /// Whether the `error.Canceled` the handler just got came from the
+    /// request's timeout (`setTimeout`, `setDeadline`); if so it is
+    /// consumed, so the handler may go on (to answer that the time ran
+    /// out). False for a cancel from anyone else (the server stopping, the
+    /// stream reset), which stays the task's: a handler that carries on
+    /// from one re-arms it (`io.recancel()`, SAFETY.md C3).
+    pub fn claimTimeoutCancel(self: *Request) bool {
+        const claim = self._claim_timeout orelse return false;
+        return claim(self._timeout_context.?);
     }
 
     /// The deadline in place, without marking it the handler's.
