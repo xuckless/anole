@@ -1898,15 +1898,31 @@ fn addSafeTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Co
     if (m.import_table.get("anole_test_hooks") == null) {
         const zio_mod: ?*std.Build.Module = m.import_table.get("zio") orelse
             if (m.import_table.get("anole")) |a| a.import_table.get("zio") else null;
+        // The binary's own never_reuse module if anole_safety is in it.
+        const never_reuse = findImport(m, "anole_never_reuse", 4) orelse Core.neverReuseModule(b, m.resolved_target, m.optimize);
         const hooks = if (zio_mod) |z| b.createModule(.{
             .root_source_file = b.path("src/safety/test_hooks.zig"),
             .target = m.resolved_target,
             .optimize = m.optimize,
-            .imports = &.{.{ .name = "zio", .module = z }},
-        }) else b.createModule(.{ .root_source_file = b.path("src/safety/test_hooks_none.zig"), .target = m.resolved_target, .optimize = m.optimize });
+            .imports = &.{ .{ .name = "zio", .module = z }, .{ .name = "anole_never_reuse", .module = never_reuse } },
+        }) else b.createModule(.{
+            .root_source_file = b.path("src/safety/test_hooks_none.zig"),
+            .target = m.resolved_target,
+            .optimize = m.optimize,
+            .imports = &.{.{ .name = "anole_never_reuse", .module = never_reuse }},
+        });
         m.addImport("anole_test_hooks", hooks);
     }
     return b.addTest(o);
+}
+
+/// The module imported as `name` by `m` or, within `depth` levels, by its
+/// imports.
+fn findImport(m: *std.Build.Module, name: []const u8, depth: u8) ?*std.Build.Module {
+    if (m.import_table.get(name)) |found| return found;
+    if (depth == 0) return null;
+    for (m.import_table.values()) |sub| if (findImport(sub, name, depth - 1)) |found| return found;
+    return null;
 }
 
 const Core = struct {
@@ -2055,8 +2071,18 @@ const Core = struct {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .imports = &.{.{ .name = "zio", .module = zio_mod }},
+            .imports = &.{
+                .{ .name = "zio", .module = zio_mod },
+                .{ .name = "anole_never_reuse", .module = neverReuseModule(b, target, optimize) },
+            },
         });
+    }
+
+    /// src/safety/never_reuse.zig alone: the test allocator's backing
+    /// allocator, shared by anole_safety and the test runner (a file is in
+    /// one module per compilation).
+    fn neverReuseModule(b: *std.Build, target: ?std.Build.ResolvedTarget, optimize: ?std.builtin.OptimizeMode) *std.Build.Module {
+        return b.createModule(.{ .root_source_file = b.path("src/safety/never_reuse.zig"), .target = target, .optimize = optimize, .link_libc = true });
     }
 
     /// The HTTP core (src/http/core, adapted from lalinsky/dusty) for one

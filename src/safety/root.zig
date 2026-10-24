@@ -27,7 +27,7 @@ pub const heldLocks = lock.heldLocks;
 const ctx = @import("ctx.zig");
 pub const toCtx = ctx.toCtx;
 pub const fromCtx = ctx.fromCtx;
-pub const never_reuse_allocator = @import("never_reuse.zig").allocator;
+pub const never_reuse_allocator = @import("anole_never_reuse").allocator;
 
 test {
     std.testing.refAllDecls(@This());
@@ -35,5 +35,5 @@ test {
     _ = @import("owner.zig");
     _ = @import("lock.zig");
     _ = @import("ctx.zig");
-    _ = @import("never_reuse.zig");
+    _ = @import("anole_never_reuse");
 }

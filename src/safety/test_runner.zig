@@ -17,7 +17,7 @@ const assert = std.debug.assert;
 const panic = std.debug.panic;
 const fuzz_abi = std.Build.abi.fuzz;
 // ANOLE: the test allocator's backing allocator.
-const never_reuse = @import("never_reuse.zig");
+const never_reuse = @import("anole_test_hooks").never_reuse;
 
 /// ANOLE: zio's count of swallowed cancellations (`debug_cancel`); a test
 /// during which it rises fails (SAFETY.md C3). build.zig gives every test
