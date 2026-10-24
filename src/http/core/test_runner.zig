@@ -190,7 +190,8 @@ pub fn main(init: std.process.Init) !void {
         test_index += 1;
 
         current_test = friendly_name;
-        std.testing.allocator_instance = if (comptime @hasDecl(std.heap, "SafeAllocator")) .init(std.heap.page_allocator, .{}) else .{};
+        // Backed by memory that is never handed out again (SAFETY.md E1).
+        std.testing.allocator_instance = if (comptime @hasDecl(std.heap, "SafeAllocator")) .init(@import("anole_safety").never_reuse_allocator, .{}) else .{};
         std.testing.io_instance = .init(gpa, .{
             .argv0 = .init(init.minimal.args),
             .environ = init.minimal.environ,

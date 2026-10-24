@@ -153,8 +153,9 @@ const grpc_mod = if (features.grpc) @import("grpc/root.zig") else struct {
 /// `fast_accept`: an accept loop takes the connections waiting in its
 /// backlog directly, and the accept and spawn budgets grow with the run
 /// queue, so new connections, parked ones waking and new HTTP/2 streams are
-/// not left behind thousands of busy connections.
-pub const zio_options: zio.Options = .{ .scheduling = .pinned, .fast_accept = true, .diagnostics = true };
+/// not left behind thousands of busy connections. `debug_held_locks`, in
+/// Debug: a task that suspends while it holds a lock panics (SAFETY.md L2).
+pub const zio_options: zio.Options = .{ .scheduling = .pinned, .fast_accept = true, .diagnostics = true, .debug_held_locks = @import("builtin").mode == .debug };
 
 /// Anole's own build of zio is pinned by default (build.zig), so a program
 /// that declares no `zio_options` gets it; one that declares them must not

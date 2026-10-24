@@ -29,8 +29,8 @@
         // Plus `diagnostics` (88f6d69): comptime-gated per-executor task
         // counters and stack stats for the runtime gauges on /metrics.
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#88f6d6985c78deac16d937a0a8d95e7c649eba6d",
-            .hash = "zio-0.19.0-xHbVVFndLQBjQr_KxPh7mRuZ-dllPXBf8YBFu6FX-mok",
+            .url = "git+https://github.com/xuckless/zio#4a2dd7c829b18c69ec12da94a93a4b4f59c6df1b",
+            .hash = "zio-0.19.0-xHbVVAboLQC_N4FyIipRdgbSpC7kr-x1nJoAROWpP7QK",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{

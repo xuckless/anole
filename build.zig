@@ -758,7 +758,7 @@ pub fn build(b: *std.Build) void {
     // `zig build test -Dtest-filter="WebSocket over HTTP/2"` runs only the
     // main suite's tests whose names contain the text (repeatable).
     const test_filters = b.option([]const []const u8, "test-filter", "Run only the main suite's tests whose names contain this text (repeatable; zig build test -Dtest-filter=golden)") orelse &.{};
-    const tests = b.addTest(.{
+    const tests = b.addTest(.{ .test_runner = safetyTestRunner(b),
         .name = "anole-test",
         .filters = test_filters,
         .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url, .nats_test_url = nats_test_url, .kafka_test_url = kafka_test_url, .s3_test_url = s3_test_url, .smtp_test_url = smtp_test_url, .mailpit_api_url = mailpit_api_url }),
@@ -777,7 +777,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "log-test", .mod = core.anole_log },
         .{ .name = "banner-test", .mod = core.banner },
     }) |t| {
-        const sub_tests = b.addTest(.{ .name = t.name, .root_module = t.mod, .use_llvm = use_llvm });
+        const sub_tests = b.addTest(.{ .test_runner = safetyTestRunner(b), .name = t.name, .root_module = t.mod, .use_llvm = use_llvm });
         const run_sub = b.addRunArtifact(sub_tests);
         run_sub.skip_foreign_checks = true;
         test_step.dependOn(&run_sub.step);
@@ -786,11 +786,26 @@ pub fn build(b: *std.Build) void {
     }
 
     // ---- p3/lambda ----
+    // `zig build lint`: SAFETY.md E2, tools/safety_lint.zig over src (and
+    // its own tests). CI runs it; `-Dlint-tests` includes test code.
+    {
+        const lint_mod = b.createModule(.{ .root_source_file = b.path("tools/safety_lint.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+        const lint_exe = b.addExecutable(.{ .name = "safety-lint", .root_module = lint_mod });
+        const run_lint = b.addRunArtifact(lint_exe);
+        run_lint.setCwd(b.path("."));
+        if (b.option(bool, "lint-tests", "zig build lint: check test code too") orelse false) run_lint.addArg("--tests");
+        run_lint.addArg("src");
+        const lint_step = b.step("lint", "Check the sources against SAFETY.md (T1, U1, U3, C3)");
+        lint_step.dependOn(&run_lint.step);
+        const lint_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("tools/safety_lint.zig"), .target = b.graph.host, .optimize = .Debug }) });
+        lint_step.dependOn(&b.addRunArtifact(lint_tests).step);
+    }
+
     // tools/lambda_zip.zig: the std-only zip writer of `zig build lambda`
     // (the addApp wiring comes with the rest of the adapter). Its tests are
     // part of `test`; `lambda-zip` builds the tool for the host.
     {
-        const zip_test = b.addTest(.{
+        const zip_test = b.addTest(.{ .test_runner = safetyTestRunner(b),
             .name = "lambda-zip-test",
             .root_module = b.createModule(.{ .root_source_file = b.path("tools/lambda_zip.zig"), .target = target, .optimize = optimize }),
             .use_llvm = use_llvm,
@@ -848,7 +863,7 @@ pub fn build(b: *std.Build) void {
     // restart logic. Imported as "anole_console_ui" into the anole module
     // (and so libanole) and the CLI. Its own tests run here.
     {
-        const ui_tests = b.addTest(.{
+        const ui_tests = b.addTest(.{ .test_runner = safetyTestRunner(b),
             .name = "console-ui-test",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/console/ui/root.zig"),
@@ -872,7 +887,7 @@ pub fn build(b: *std.Build) void {
     // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
     // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
     if (features.postgres) {
-        const pg_tests = b.addTest(.{ .name = "anole-test-pg", .root_module = tests.root_module, .filters = &.{"pg:"}, .use_llvm = use_llvm });
+        const pg_tests = b.addTest(.{ .test_runner = safetyTestRunner(b), .name = "anole-test-pg", .root_module = tests.root_module, .filters = &.{"pg:"}, .use_llvm = use_llvm });
         const run_pg_tests = b.addRunArtifact(pg_tests);
         run_pg_tests.has_side_effects = postgres_test_url != null;
         b.step("test-postgres", "Run the PostgreSQL tests (live with -Dpostgres-test-url=postgres://...)").dependOn(&run_pg_tests.step);
@@ -881,13 +896,13 @@ pub fn build(b: *std.Build) void {
     if (c_mods.sqlite_build_test) |run| test_step.dependOn(&run.step);
     // test-sqlite: the SQLite tests alone ("sqlite: ...").
     if (features.sqlite) {
-        const sqlite_tests = b.addTest(.{ .name = "anole-test-sqlite", .root_module = tests.root_module, .filters = &.{"sqlite:"}, .use_llvm = use_llvm });
+        const sqlite_tests = b.addTest(.{ .test_runner = safetyTestRunner(b), .name = "anole-test-sqlite", .root_module = tests.root_module, .filters = &.{"sqlite:"}, .use_llvm = use_llvm });
         b.step("test-sqlite", "Run the SQLite tests").dependOn(&b.addRunArtifact(sqlite_tests).step);
     }
     // test-mongodb: the MongoDB client's tests alone (src/mongodb); with
     // -Dmongodb-test-url, against that server (tests/mongodb/run.sh).
     if (features.mongodb) {
-        const mongo_tests = b.addTest(.{ .name = "anole-test-mongodb", .root_module = tests.root_module, .filters = &.{"mongodb."}, .use_llvm = use_llvm });
+        const mongo_tests = b.addTest(.{ .test_runner = safetyTestRunner(b), .name = "anole-test-mongodb", .root_module = tests.root_module, .filters = &.{"mongodb."}, .use_llvm = use_llvm });
         const run_mongo_tests = b.addRunArtifact(mongo_tests);
         run_mongo_tests.has_side_effects = mongodb_test_url != null;
         b.step("test-mongodb", "Run the MongoDB client's tests (live with -Dmongodb-test-url=mongodb://...)").dependOn(&run_mongo_tests.step);
@@ -897,7 +912,7 @@ pub fn build(b: *std.Build) void {
     // and the rate limiter's among them; with -Dredis-test-url (or
     // -Dredis-test-port), against that server (tests/redis/run.sh).
     if (features.redis) {
-        const redis_tests = b.addTest(.{ .name = "anole-test-redis", .root_module = tests.root_module, .filters = &.{"redis:"}, .use_llvm = use_llvm });
+        const redis_tests = b.addTest(.{ .test_runner = safetyTestRunner(b), .name = "anole-test-redis", .root_module = tests.root_module, .filters = &.{"redis:"}, .use_llvm = use_llvm });
         const run_redis_tests = b.addRunArtifact(redis_tests);
         run_redis_tests.has_side_effects = redis_test_url != null or redis_test_port != null;
         b.step("test-redis", "Run the Redis tests (live with -Dredis-test-url=redis://...)").dependOn(&run_redis_tests.step);
@@ -908,7 +923,7 @@ pub fn build(b: *std.Build) void {
     // storage tests ("capi s3: ..."); with -Ds3-test-url, also against that
     // server (tests/s3/run.sh).
     if (features.s3) {
-        const s3_tests = b.addTest(.{ .name = "anole-test-s3", .root_module = tests.root_module, .filters = if (test_filters.len > 0) test_filters else &.{ "s3: ", "capi s3: " }, .use_llvm = use_llvm });
+        const s3_tests = b.addTest(.{ .test_runner = safetyTestRunner(b), .name = "anole-test-s3", .root_module = tests.root_module, .filters = if (test_filters.len > 0) test_filters else &.{ "s3: ", "capi s3: " }, .use_llvm = use_llvm });
         const run_s3_tests = b.addRunArtifact(s3_tests);
         run_s3_tests.has_side_effects = s3_test_url != null;
         b.step("test-s3", "Run the S3 tests (live with -Ds3-test-url=http://...)").dependOn(&run_s3_tests.step);
@@ -918,20 +933,20 @@ pub fn build(b: *std.Build) void {
     // test-capi-engine: the C ABI engine's Zig tests alone (HTTP/2 and
     // HTTP/3 detached answers, the configuration parser).
     {
-        const capi_engine_tests = b.addTest(.{ .name = "anole-test-capi", .root_module = tests.root_module, .filters = &.{ "capi engine", "parse: " }, .use_llvm = use_llvm });
+        const capi_engine_tests = b.addTest(.{ .test_runner = safetyTestRunner(b), .name = "anole-test-capi", .root_module = tests.root_module, .filters = &.{ "capi engine", "parse: " }, .use_llvm = use_llvm });
         b.step("test-capi-engine", "Run the C ABI engine's Zig tests").dependOn(&b.addRunArtifact(capi_engine_tests).step);
     }
     // test-net: the raw TCP and UDP tests alone (framing, sessions, the
     // servers over loopback, the C ABI's).
     if (features.net) {
-        const net_tests = b.addTest(.{ .name = "anole-test-net", .root_module = tests.root_module, .filters = &.{ "net tcp", "net udp", "framing:", "sessions:", "fuzz: net", "capi net" }, .use_llvm = use_llvm });
+        const net_tests = b.addTest(.{ .test_runner = safetyTestRunner(b), .name = "anole-test-net", .root_module = tests.root_module, .filters = &.{ "net tcp", "net udp", "framing:", "sessions:", "fuzz: net", "capi net" }, .use_llvm = use_llvm });
         b.step("test-net", "Run the raw TCP and UDP tests (anole.net, the C ABI's anole_net_*)").dependOn(&b.addRunArtifact(net_tests).step);
         b.step("test-net-build", "Build the raw TCP and UDP test binary (zig-out/bin/anole-test-net) without running it").dependOn(&b.addInstallArtifact(net_tests, .{}).step);
     }
     // test-grpc: the gRPC tests alone (the native server and client, JSON
     // transcoding, and the C ABI's gRPC server).
     if (features.grpc) {
-        const grpc_tests = b.addTest(.{ .name = "anole-test-grpc", .root_module = tests.root_module, .filters = &.{ "gRPC", "transcoding", "capi grpc" }, .use_llvm = use_llvm });
+        const grpc_tests = b.addTest(.{ .test_runner = safetyTestRunner(b), .name = "anole-test-grpc", .root_module = tests.root_module, .filters = &.{ "gRPC", "transcoding", "capi grpc" }, .use_llvm = use_llvm });
         b.step("test-grpc", "Run the gRPC tests (native, transcoding, the C ABI's)").dependOn(&b.addRunArtifact(grpc_tests).step);
     }
 
@@ -952,7 +967,9 @@ pub fn build(b: *std.Build) void {
         });
         var imports = core_full.import_table.iterator();
         while (imports.next()) |e| test_mod.addImport(e.key_ptr.*, e.value_ptr.*);
-        test_mod.addAnonymousImport("zio", .{ .root_source_file = b.path("src/http/core/zio_stub.zig") });
+        const zio_stub = b.createModule(.{ .root_source_file = b.path("src/http/core/zio_stub.zig"), .target = target, .optimize = optimize });
+        test_mod.addImport("zio", zio_stub);
+        test_mod.addImport("anole_safety", Core.safetyModule(b, zio_stub, target, optimize));
         // And the stub HTTP/2 client: Anole's would import these sources a
         // second time.
         test_mod.addAnonymousImport("h2_client", .{ .root_source_file = b.path("src/http/core/h2_client_stub.zig") });
@@ -984,7 +1001,7 @@ pub fn build(b: *std.Build) void {
         // Its "fuzz:" targets again, under Zig's own test runner, which is
         // what drives the fuzzer (the core's runner has none): `zig build
         // test --fuzz` fuzzes them with Anole's.
-        const core_fuzz = b.addTest(.{
+        const core_fuzz = b.addTest(.{ .test_runner = safetyTestRunner(b),
             .name = "core-fuzz",
             .root_module = test_mod,
             .filters = &.{"fuzz:"},
@@ -1006,7 +1023,7 @@ pub fn build(b: *std.Build) void {
             )).step);
             continue;
         }
-        const t = b.addTest(.{
+        const t = b.addTest(.{ .test_runner = safetyTestRunner(b),
             .name = b.fmt("anole-test-{s}", .{combo.name}),
             .root_module = anoleModule(b, .{ .features = combo.features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true }),
         });
@@ -1021,7 +1038,7 @@ pub fn build(b: *std.Build) void {
     // module "fuzz".
     if (features.mongodb) {
         const bson = bson_mod;
-        const bson_tests = b.addTest(.{
+        const bson_tests = b.addTest(.{ .test_runner = safetyTestRunner(b),
             .name = "bson-test",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/bson/root.zig"),
@@ -1042,7 +1059,7 @@ pub fn build(b: *std.Build) void {
         if (mongodb_specs) |specs| {
             const files = b.addWriteFiles();
             _ = files.addCopyDirectory(specs.path("source/bson-corpus/tests"), "corpus", .{ .include_extensions = &.{".json"} });
-            const corpus_tests = b.addTest(.{
+            const corpus_tests = b.addTest(.{ .test_runner = safetyTestRunner(b),
                 .name = "bson-corpus",
                 .root_module = b.createModule(.{
                     .root_source_file = files.addCopyFile(b.path("tests/bson/corpus_test.zig"), "corpus_test.zig"),
@@ -1059,7 +1076,7 @@ pub fn build(b: *std.Build) void {
 
             // src/mongodb/spec_test.zig reads the spec's JSON test files at
             // run time, from the specification's `source` directory.
-            const spec_tests = b.addTest(.{
+            const spec_tests = b.addTest(.{ .test_runner = safetyTestRunner(b),
                 .name = "mongodb-spec-test",
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("src/mongodb/spec_test.zig"),
@@ -1116,7 +1133,7 @@ pub fn build(b: *std.Build) void {
         if (std.mem.eql(u8, ex.name, "rest")) {
             // tests/rest_test.zig serves the example's routes and calls
             // each one.
-            const rest_test = b.addTest(.{
+            const rest_test = b.addTest(.{ .test_runner = safetyTestRunner(b),
                 .name = "rest-test",
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("tests/rest_test.zig"),
@@ -1130,7 +1147,7 @@ pub fn build(b: *std.Build) void {
             test_step.dependOn(&run_rest_test.step);
             compile_tests_step.dependOn(&rest_test.step);
             // The same scenario through anole.testing, no socket.
-            const rest_memory_test = b.addTest(.{
+            const rest_memory_test = b.addTest(.{ .test_runner = safetyTestRunner(b),
                 .name = "rest-memory-test",
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("tests/rest_memory_test.zig"),
@@ -1145,7 +1162,7 @@ pub fn build(b: *std.Build) void {
             compile_tests_step.dependOn(&rest_memory_test.step);
         }
         if (std.mem.eql(u8, ex.name, "sqlite")) {
-            const sqlite_test = b.addTest(.{
+            const sqlite_test = b.addTest(.{ .test_runner = safetyTestRunner(b),
                 .name = "sqlite-example-test",
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("tests/sqlite_example_test.zig"),
@@ -1338,7 +1355,7 @@ pub fn build(b: *std.Build) void {
             const header_text_mod = b.createModule(.{ .root_source_file = embed.add("header.zig", "pub const text = @embedFile(\"anole.h\");\n") });
             const version_mod = b.createModule(.{ .root_source_file = embed.add("version.zig", b.fmt("pub const text = \"{s}\";\n", .{@import("build.zig.zon").version})) });
             const abi_for_test = b.createModule(.{ .root_source_file = b.path("src/capi/abi.zig"), .target = target, .optimize = optimize });
-            const abi_test = b.addTest(.{
+            const abi_test = b.addTest(.{ .test_runner = safetyTestRunner(b),
                 .name = "capi-abi-test",
                 // The test inspects every declaration of the translated
                 // header; the self-hosted x86_64 backend writes debug info
@@ -1682,7 +1699,7 @@ pub fn build(b: *std.Build) void {
         const install_cli = b.addInstallArtifact(cli, .{});
         b.step("cli", "Build and install the anole command line (zig-out/bin/anole)").dependOn(&install_cli.step);
 
-        const cli_tests = b.addTest(.{ .name = "anole-cli-test", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize, null) });
+        const cli_tests = b.addTest(.{ .test_runner = safetyTestRunner(b), .name = "anole-cli-test", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize, null) });
         b.step("cli-test", "Run the anole command line's unit tests").dependOn(&b.addRunArtifact(cli_tests).step);
 
         const dist = b.step("cli-dist", "Cross-build the anole binaries for five targets and SHA256SUMS into zig-out/dist");
@@ -1868,8 +1885,17 @@ const LlHttp = struct {
     }
 };
 
+/// src/safety/test_runner.zig: Zig's default test runner with the test
+/// allocator backed by memory that is never reused (SAFETY.md E1).
+fn safetyTestRunner(b: *std.Build) std.Build.Step.Compile.TestRunner {
+    return .{ .path = b.path("src/safety/test_runner.zig"), .mode = .server };
+}
+
 const Core = struct {
     zio: *std.Build.Module,
+    /// src/safety (SAFETY.md's debug-build checks) over that zio:
+    /// `anole_safety` in every HTTP core instance, the HTTP/2 client and anole.
+    safety: *std.Build.Module,
     llhttp: LlHttp,
     /// dusty instances by [tls][http2][compression][brotli]. One exists for
     /// each combination this build can satisfy: TLS needs BoringSSL in the
@@ -1904,7 +1930,10 @@ const Core = struct {
         // anole.Server refuses to compile with work stealing declared. And
         // `fast_accept` (see `anole.zio_options`), so a program whose own
         // `zio_options` leave it out still has it.
-        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .diagnostics = true }).module("zio");
+        // `debug_held_locks`: in Debug, a task that suspends holding a lock
+        // panics (SAFETY.md L2; src/safety counts the locks).
+        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .diagnostics = true, .debug_held_locks = optimize == .debug }).module("zio");
+        const safety = safetyModule(b, zio_mod, target, optimize);
         const seam: ?*std.Build.Module = if (c_mods.boringssl) |bssl| b.createModule(.{
             .root_source_file = b.path("src/tls/dusty_tls.zig"),
             .target = target,
@@ -1917,7 +1946,7 @@ const Core = struct {
         const anole_log = b.createModule(.{ .root_source_file = b.path("src/logging/root.zig"), .target = target, .optimize = optimize });
         const banner = b.createModule(.{ .root_source_file = b.path("src/banner/root.zig"), .target = target, .optimize = optimize });
         const console_ui = b.createModule(.{ .root_source_file = b.path("src/console/ui/root.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "anole_banner", .module = banner }} });
-        var core: Core = .{ .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
+        var core: Core = .{ .safety = safety, .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
@@ -1939,6 +1968,7 @@ const Core = struct {
                             optimize,
                         );
                         dusty_mod.addImport("resilience_core", resilience);
+                        dusty_mod.addImport("anole_safety", safety);
                         dusty_mod.addImport("validate", validate);
                         dusty_mod.addImport("anole_log", anole_log);
                         core.dusty_by[@intFromBool(tls)][@intFromBool(http2)][@intFromBool(compression)][@intFromBool(brotli)] = dusty_mod;
@@ -1947,6 +1977,7 @@ const Core = struct {
                             dusty_mod,
                             c_mods.nghttp2.?,
                             if (tls) seam else null,
+                            safety,
                             target,
                             optimize,
                         );
@@ -1973,6 +2004,7 @@ const Core = struct {
         dusty_mod: *std.Build.Module,
         nghttp2: *std.Build.Module,
         tls: ?*std.Build.Module,
+        safety: *std.Build.Module,
         target: std.Build.ResolvedTarget,
         optimize: std.builtin.OptimizeMode,
     ) *std.Build.Module {
@@ -1987,9 +2019,22 @@ const Core = struct {
         mod.addOptions("anole_h2_options", opts);
         mod.addImport("anole_nghttp2_c", nghttp2);
         mod.addImport("dusty", dusty_mod);
+        mod.addImport("anole_safety", safety);
         if (tls) |m| mod.addImport("anole_dusty_tls", m);
         dusty_mod.addImport("h2_client", mod);
         return mod;
+    }
+
+    /// src/safety over `zio_mod` (the real zio, or the core's stub for its
+    /// own tests).
+    fn safetyModule(b: *std.Build, zio_mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+        return b.createModule(.{
+            .root_source_file = b.path("src/safety/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zio", .module = zio_mod }},
+        });
     }
 
     /// The HTTP core (src/http/core, adapted from lalinsky/dusty) for one
@@ -2308,6 +2353,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     const mod = if (o.public) b.addModule("anole", create) else b.createModule(create);
     mod.addOptions("build_options", options);
     mod.addImport("zio", o.core.zio);
+    mod.addImport("anole_safety", o.core.safety);
     mod.addImport("dusty", o.core.dusty(f));
     mod.addImport("resilience_core", o.core.resilience);
     mod.addImport("validate", o.core.validate);
