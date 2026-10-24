@@ -1617,6 +1617,12 @@ pub fn Server(comptime Ctx: type) type {
             return shelves;
         }
 
+        /// Whether idle connections park without a task on this platform
+        /// (not on Windows, a development target, where they keep theirs).
+        pub fn parksIdle(_: *const Self) bool {
+            return park.supported;
+        }
+
         /// How many connections are parked right now (`timeout.idle_park`).
         pub fn parkedConnections(self: *const Self) usize {
             var n: usize = 0;

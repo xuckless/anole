@@ -137,9 +137,10 @@ test "app.sse over HTTP/1.1: the connection parks with no task; events and a hea
             try eventually(io, &h, Hub.oneSubscriber);
 
             // Parked: the connection's task is gone, nothing waits for the
-            // subscriber.
+            // subscriber. Where idle connections keep their task (Windows),
+            // the rest still holds.
             try std.testing.expect(baseline > 0);
-            {
+            if (a.server.parksIdle()) {
                 const tw: TaskWatch = .{ .io = io, .want = baseline };
                 try eventually(io, &tw, TaskWatch.back);
             }

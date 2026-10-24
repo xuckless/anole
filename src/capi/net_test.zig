@@ -405,7 +405,9 @@ test "capi net: datagrams batch, udp_send replies in one call, udp_find, listene
     _ = try engine.net.udpSend(rig.e, handle, &replies, 0);
     for (texts) |t| {
         var buf: [16]u8 = undefined;
-        const msg = try c.receiveTimeout(io, &buf, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+        // No timeout: std.Io.Threaded has none for a receive on Windows
+        // (ConcurrencyUnavailable); the test runner's watchdog bounds a hang.
+        const msg = try c.receive(io, &buf);
         try std.testing.expectEqualStrings(t, msg.data);
     }
     // Found by name: the listener's first socket, the one the datagrams
@@ -415,7 +417,9 @@ test "capi net: datagrams batch, udp_send replies in one call, udp_find, listene
     _ = try engine.net.udpSend(rig.e, found, replies[0..1], 0);
     {
         var buf: [16]u8 = undefined;
-        const msg = try c.receiveTimeout(io, &buf, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+        // No timeout: std.Io.Threaded has none for a receive on Windows
+        // (ConcurrencyUnavailable); the test runner's watchdog bounds a hang.
+        const msg = try c.receive(io, &buf);
         try std.testing.expectEqualStrings("r0", msg.data);
     }
     // Invalid sizes.

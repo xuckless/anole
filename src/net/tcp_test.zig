@@ -540,6 +540,7 @@ const Parked = struct {
 test "net tcp: idle callback connections hold no task, and each still echoes" {
     var app = try App.init(alloc, .{ .executors = .exact(1), .timeouts = .{ .idle_park = .fromMilliseconds(5) } });
     defer app.deinit();
+    if (!app.server.parksIdle()) return error.SkipZigTest;
     try app.tcp("127.0.0.1:0", Parked, .{});
     try serveWith(&app, struct {
         fn run(a: *App) !void {
