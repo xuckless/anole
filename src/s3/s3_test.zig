@@ -214,6 +214,9 @@ test "s3: put of 11 MiB goes up as three parts, completed in order" {
     const data = try pattern(env.ctx.arena, 11 * mib, 7);
     const stored = try env.client.put(env.c(), "big/multi.bin", .{ .bytes = data }, .{});
     try testing.expectEqual(@as(u32, 3), stored.parts);
+    // The result outlives the upload: its strings are the caller's, not the
+    // upload's arena (freed when put returns; the test allocator poisons it).
+    try testing.expectEqualStrings(env.fake.getEtag("b", "big/multi.bin").?, stored.etag);
     try testing.expectEqual(@as(usize, 3), env.fake.count("PUT", "partNumber="));
     try testing.expectEqual(@as(usize, 1), env.fake.count("POST", "uploads"));
     try testing.expectEqual(@as(usize, 1), env.fake.count("POST", "uploadId="));

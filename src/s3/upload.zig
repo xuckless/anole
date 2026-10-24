@@ -245,7 +245,9 @@ pub const Upload = struct {
         self.finishing = true;
     }
 
-    /// Waits for the driver to end, then returns its result.
+    /// Waits for the driver to end, then returns its result, its strings
+    /// copied into the call's arena: the result outlives the upload, whose
+    /// arena `deinit` frees (SAFETY.md M4).
     pub fn awaitDone(self: *Upload, c: anytype) Error!Stored {
         while (true) {
             const seen = self.progress.seen();
@@ -255,12 +257,23 @@ pub const Upload = struct {
             const res = self.result;
             self.unlock();
             if (f) |fl| return self.replay(c, fl);
-            if (done) return res orelse self.client.failOur(c, .other, "upload_over", "the upload ended without a result");
+            if (done) {
+                const stored = res orelse return self.client.failOur(c, .other, "upload_over", "the upload ended without a result");
+                return dupeStored(c.arena, stored);
+            }
             try self.progress.wait(self.io, seen);
         }
     }
 
-    /// The result once done, or the failure; null while running.
+    fn dupeStored(a: std.mem.Allocator, s: Stored) error{OutOfMemory}!Stored {
+        var out = s;
+        out.etag = try a.dupe(u8, s.etag);
+        if (s.version_id) |v| out.version_id = try a.dupe(u8, v);
+        return out;
+    }
+
+    /// The result once done, or the failure; null while running. The
+    /// result's strings are the upload's: valid until `deinit`.
     pub fn poll(self: *Upload) ?(Error!Stored) {
         self.lock();
         defer self.unlock();
