@@ -325,7 +325,10 @@ pub const Console = struct {
     }
 
     /// The server is draining: consoles get `bye`, the terminal comes back
-    /// before the last log lines, the socket file goes.
+    /// before the last log lines, the socket file goes. The log tap and the
+    /// request hook are removed, but their memory stays until `release`:
+    /// the drain that follows still logs and ends requests on executors
+    /// that may have loaded them just before.
     pub fn stop(self: *Console, reason_drain: bool) void {
         if (self.keys) |k| k.stop();
         self.keys = null;
@@ -334,7 +337,13 @@ pub const Console = struct {
         stats.uninstall();
         if (self.logs) |lr| lr.uninstall();
         panic_mod.before_panic = null;
-        self.service.deinit();
+        self.service.stop();
+    }
+
+    /// Frees the console after `stop`, once no executor runs (the runtime
+    /// is gone) and no C ABI call can still hold it.
+    pub fn release(self: *Console) void {
+        self.service.destroy();
         if (self.logs) |lr| {
             lr.deinit();
             self.gpa.destroy(lr);

@@ -494,3 +494,46 @@ test "service: language metrics show in the runtime snapshot" {
     try std.testing.expectEqualStrings("event_loop_lag_p99", data.language[0].name);
     try std.testing.expect(data.rss_bytes > 0);
 }
+
+// ------------------------------------------------------------- lifetime
+
+test "console: a tap and the request counters taken before stop stay usable until release (the drain still logs and answers)" {
+    if (!os.supported) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &dir_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/c.sock", .{dir_buf[0..dir_len]});
+    var why_buf: [128]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const none: FakeVars = .{};
+    const resolved = try root.resolve(.{ .enabled = true, .socket = path, .log_buffer = 256 * 1024 }, none.vars(), .production, .standalone, runtime_build, &why);
+    var fake: Fake = .{};
+    const c = try root.Console.start(.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .resolved = resolved,
+        .host = .{ .ctx = &fake, .executors = 2, .reload = Fake.reload, .stop = Fake.stop, .route_meta = Fake.routeMeta, .routes = Fake.routes },
+        .executors = 2,
+        .environment = "production",
+        .deployment = "standalone",
+        .features = &.{},
+        .has_tls = false,
+        .restart_unavailable = null,
+        .vars = none.vars(),
+        .embedded = true,
+    });
+    // An executor that loaded the tap before the stop uninstalled it
+    // (the drain runs after the console stopped, and logs).
+    const tap = &c.logs.?.tap;
+    const st = stats_mod.global.?;
+    try st.ensureTables();
+    tap.func(tap.ud, .warn, "anole", .{}, false, "draining");
+    c.stop(false);
+    try std.testing.expect(stats_mod.global == null);
+    tap.func(tap.ud, .warn, "anole", .{}, false, "Shutdown timed out with 1 request(s) still in flight");
+    st.count(0, 0, 504, 1000);
+    c.release();
+}

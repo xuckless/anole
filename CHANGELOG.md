@@ -196,6 +196,14 @@ breaking changes are listed anyway.
   app are affected. `anole console` also restores the terminal on SIGINT
   and on a panic. A pseudo-terminal test (tests/console/pty_test.py) runs in
   CI on Linux and macOS.
+- Live console (since 0.3.0): use after free at shutdown. The console
+  stopped before the drain and freed its log rings and request counters at
+  once, while the drain's executors could still write a warning into the
+  rings or count a 504 into the counters, and the C ABI's
+  `anole_console_report` could still reach the freed service. The console
+  now stops at the same point but is freed only after the runtime is gone.
+  It showed as a rare crash at shutdown with the console on (the default in
+  production).
 
 ## 0.3.1 (2026-10-23)
 
