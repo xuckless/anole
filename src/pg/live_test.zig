@@ -378,6 +378,38 @@ test "pg: live a timeout or a cancel stops the statement on the server" {
     try testing.expectEqual(@as(i64, 1), try d.one(i64, &c, "SELECT 1::int8", .{}));
 }
 
+test "pg: live the console's /db entry: the target and every executor's pool" {
+    _ = try testUrl();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const d = try open(io, .{ .max_connections = 4 });
+    defer d.deinit();
+    const Check = struct {
+        // On a task of the runtime, as the console's collector calls it.
+        fn run(db_: *pg.Client) !void {
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            defer out.deinit();
+            try out.writer.writeByte('{');
+            try db_.consoleInfo(&out.writer);
+            try out.writer.writeByte('}');
+            const v = try std.json.parseFromSlice(std.json.Value, gpa, out.written(), .{});
+            defer v.deinit();
+            const o = v.value.object;
+            try testing.expectEqualStrings("postgres", o.get("system").?.string);
+            try testing.expect(o.get("target").?.string.len > 0);
+            const pools = o.get("pools").?.array.items;
+            try testing.expectEqual(@as(usize, 2), pools.len);
+            for (pools) |p| {
+                try testing.expectEqual(@as(i64, 2), p.object.get("max").?.integer);
+                try testing.expectEqual(@as(i64, 0), p.object.get("in_use").?.integer);
+            }
+        }
+    };
+    var f = try io.concurrent(Check.run, .{d});
+    try f.await(io);
+}
+
 test "pg: live a pool per executor" {
     _ = try testUrl();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
