@@ -203,7 +203,7 @@ fn heapPush(x: *Exec, i: u32) void {
     x.slots[i].grpc.heap_pos = pos;
     st.len += 1;
     heapUp(x, pos);
-    if (x.slots[i].grpc.heap_pos == 0) x.kick.set(x.engine.io);
+    if (x.slots[i].grpc.heap_pos == 0) x.setEvent(&x.kick);
 }
 
 fn heapRemove(x: *Exec, i: u32) void {
@@ -820,7 +820,7 @@ fn readFailed(x: *Exec, si: u32, gen: u32, err: anyerror) void {
     const s = &x.slots[si];
     if (genOf(s.word.load(.acquire)) != gen) return;
     s.grpc.read_error = err;
-    s.event.set(x.engine.io);
+    x.setEvent(&s.event);
 }
 
 fn newRecord(size: usize, typ: abi.EventType, handle: u64) ![]align(8) u8 {
@@ -1049,7 +1049,7 @@ pub fn sweep(x: *Exec, now: i96) ?i96 {
                 // The task writing it ends it.
                 heapRemove(x, si);
                 s.grpc.timed_out = true;
-                s.event.set(x.engine.io);
+                x.setEvent(&s.event);
             },
             // The consumer is in a call on it: look again shortly.
             .polling, .responding => return now + std.time.ns_per_ms,
@@ -1107,7 +1107,7 @@ pub fn abandon(x: *Exec, si: u32, w: u64) void {
                 s.grpc.call.status = .unavailable;
                 s.grpc.call.status_message = "the server is stopping";
                 s.grpc.read_error = error.GrpcStatus;
-                s.event.set(x.engine.io);
+                x.setEvent(&s.event);
             }
         },
         .streaming => if (!s.abandoned) {
@@ -1115,7 +1115,7 @@ pub fn abandon(x: *Exec, si: u32, w: u64) void {
             s.grpc.call.status = .unavailable;
             s.grpc.call.status_message = "the server is stopping";
             s.grpc.read_error = error.GrpcStatus;
-            s.event.set(x.engine.io);
+            x.setEvent(&s.event);
         },
         else => {},
     }
@@ -1321,7 +1321,7 @@ pub fn send(e: *Engine, hv: u64, msg: []const u8, borrow: bool, finish_ok: bool)
     const wake = s.out.exec_waiting;
     s.out.exec_waiting = false;
     s.out.release();
-    if (wake) s.event.set(e.io);
+    if (wake) x0.setEvent(&s.event);
     if (msg.len == 0) if (sent) |r| x0.postSentRec(hv, r);
     return busy and !finish_ok;
 }
@@ -1358,7 +1358,7 @@ pub fn finish(e: *Engine, hv: u64, code: u32, message: []const u8, trailers: []c
     if (code > 16) return error.Invalid;
     try checkMetadata(trailers, .trailer);
     if (message.len > 64 * 1024) return error.Invalid;
-    _, const s0, const h0 = slotOf(e, hv) catch |err| return e.badHandle(err);
+    const x0, const s0, const h0 = slotOf(e, hv) catch |err| return e.badHandle(err);
     if (s0.out.gen == h0.gen) {
         // Streaming: the status goes after the messages.
         const s = s0;
@@ -1375,7 +1375,7 @@ pub fn finish(e: *Engine, hv: u64, code: u32, message: []const u8, trailers: []c
         const wake = s.out.exec_waiting;
         s.out.exec_waiting = false;
         s.out.release();
-        if (wake) s.event.set(e.io);
+        if (wake) x0.setEvent(&s.event);
         return;
     }
     const x, const s, const h = claim(e, hv) catch |err| {
@@ -1421,7 +1421,7 @@ pub fn release(e: *Engine, hv: u64) AnswerError!void {
 
 /// The consumer takes `n` more request messages.
 pub fn read(e: *Engine, hv: u64, n: u32) AnswerError!void {
-    _, const s, const h = slotOf(e, hv) catch |err| return e.badHandle(err);
+    const x, const s, const h = slotOf(e, hv) catch |err| return e.badHandle(err);
     const w = s.word.load(.acquire);
     if (genOf(w) != h.gen) return e.gone();
     switch (stateOf(w)) {
@@ -1431,7 +1431,7 @@ pub fn read(e: *Engine, hv: u64, n: u32) AnswerError!void {
     const kind = s.grpc.method.kind;
     if (kind != .client_streaming and kind != .bidi_streaming) return error.State;
     _ = s.grpc.credit.fetchAdd(n, .acq_rel);
-    if (s.grpc.reader_waiting.load(.seq_cst)) s.pump_event.set(e.io);
+    if (s.grpc.reader_waiting.load(.seq_cst)) x.setEvent(&s.pump_event);
 }
 
 // ---------------------------------------------------------------------------

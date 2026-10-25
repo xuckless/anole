@@ -613,7 +613,7 @@ fn topicChangeDone(e: *Engine) void {
     // Once stopped, the commands left are run by `destroy`, with no task
     // left to wake (nor a runtime to wake it with).
     if (e.phase.load(.acquire) == .stopped) return;
-    e.io.futexWake(u32, &e.topic_changes_done.raw, std.math.maxInt(u32));
+    e.wakeFutex(&e.topic_changes_done);
 }
 
 /// Waits until every `subscribe` taken before `want` was counted is

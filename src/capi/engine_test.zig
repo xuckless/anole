@@ -1042,6 +1042,59 @@ test "capi engine: a reload from another thread holds the server's stop until it
     try e.drain();
 }
 
+/// Holds one thread's wake inside an executor's `IoGate`
+/// (`engine.test_io_hook`) until the test lets it go; other threads pass.
+const WakeHold = struct {
+    var thread: std.atomic.Value(std.Thread.Id) = .init(0);
+    var entered: std.Io.Event = .unset;
+    var go: std.Io.Event = .unset;
+
+    fn hook() void {
+        if (std.Thread.getCurrentId() != thread.load(.acquire)) return;
+        entered.set(engine.threadedIo());
+        go.waitUncancelable(engine.threadedIo());
+    }
+
+    /// A consumer thread's wake of executor 0 (as an answer makes).
+    fn wake(e: *engine.Engine) void {
+        thread.store(std.Thread.getCurrentId(), .release);
+        const x = &e.execs[0];
+        x.setEvent(&x.kick);
+    }
+};
+
+test "capi engine: a wake from a consumer thread under way holds the server's stop until it returns" {
+    const json =
+        \\{"executors": 1, "timeouts": {"shutdown_ms": 200},
+        \\ "listeners": [{"address": "127.0.0.1", "port": 0}]}
+    ;
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = try engine.Engine.create(json, false, &why);
+    defer e.destroy();
+    _ = try e.attach(null, null, true);
+    try e.start();
+    const tio = engine.threadedIo();
+    WakeHold.entered = .unset;
+    WakeHold.go = .unset;
+    engine.test_io_hook = &WakeHold.hook;
+    defer engine.test_io_hook = null;
+    const t = try std.Thread.spawn(.{}, WakeHold.wake, .{e});
+    // The wake is inside the gate, about to call into the runtime.
+    WakeHold.entered.waitUncancelable(tio);
+    try e.drain();
+    // Had the stop not waited for it, the run thread would free the runtime
+    // the wake is about to use, and set `stopped`.
+    try std.testing.expect(!e.wait(400));
+    WakeHold.go.set(tio);
+    t.join();
+    try std.testing.expect(e.wait(5000));
+    // After the stop: a wake is skipped, never followed into the freed
+    // runtime.
+    const x = &e.execs[0];
+    x.setEvent(&x.kick);
+}
+
 const Racer = struct {
     e: *engine.Engine,
     stop: *std.atomic.Value(bool),

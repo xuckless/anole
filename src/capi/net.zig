@@ -514,7 +514,7 @@ fn onClose(state: ?*anyopaque, conn: *net.Conn, reason: net.CloseReason) void {
     slot.release();
     conn.context = null;
     slot.credit_wait.store(0, .seq_cst);
-    e.io.futexWake(u32, &slot.credit_wait.raw, std.math.maxInt(u32));
+    slot.exec.wakeFutex(&slot.credit_wait);
     slot.unpolled.store(0, .monotonic);
     slot.next_free = x.net.free_head;
     x.net.free_head = slot.index;
@@ -548,7 +548,7 @@ pub fn polled(e: *Engine, hv: u64, len: u32) void {
     }
     if (slot.credit_wait.load(.seq_cst) != 0) {
         slot.credit_wait.store(0, .seq_cst);
-        e.io.futexWake(u32, &slot.credit_wait.raw, std.math.maxInt(u32));
+        slot.exec.wakeFutex(&slot.credit_wait);
     }
 }
 

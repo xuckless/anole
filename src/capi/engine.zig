@@ -458,6 +458,55 @@ const DeadlineList = struct {
     tail: u32 = no_slot,
 };
 
+/// Guards the runtime's wakes made from threads that are not the runtime's
+/// (a consumer's answer, a send, a poll): the run thread closes it before it
+/// frees the runtime and waits for the wakes under way, and a wake after
+/// that is skipped (the runtime's tasks are canceled as it ends, so nothing
+/// waits for it). The `ctl` scheme, for the hot path: one per executor, on
+/// the line its inbox already shares with consumers.
+pub const IoGate = struct {
+    word: std.atomic.Value(u32) = .init(0),
+
+    const closed: u32 = 1 << 31;
+
+    pub fn enter(g: *IoGate) bool {
+        const prev = g.word.fetchAdd(1, .acquire);
+        if (prev & closed != 0) {
+            _ = g.word.fetchSub(1, .release);
+            return false;
+        }
+        if (comptime builtin.is_test) if (test_io_hook) |f| f();
+        return true;
+    }
+
+    pub fn leave(g: *IoGate) void {
+        _ = g.word.fetchSub(1, .release);
+    }
+
+    /// On the run thread, before the runtime goes: no wake enters from now
+    /// on, and those inside have left when this returns. They are a few
+    /// instructions long.
+    pub fn close(g: *IoGate) void {
+        _ = g.word.fetchOr(closed, .acq_rel);
+        while (g.word.load(.acquire) & ~closed != 0) std.Thread.yield() catch {};
+    }
+
+    pub fn setEvent(g: *IoGate, io: std.Io, ev: *std.Io.Event) void {
+        if (!g.enter()) return;
+        defer g.leave();
+        ev.set(io);
+    }
+
+    pub fn wakeFutex(g: *IoGate, io: std.Io, word: *const std.atomic.Value(u32)) void {
+        if (!g.enter()) return;
+        defer g.leave();
+        io.futexWake(u32, &word.raw, std.math.maxInt(u32));
+    }
+};
+
+/// Tests: runs inside every `IoGate` once it is entered, before the wake.
+pub var test_io_hook: ?*const fn () void = null;
+
 pub const Exec = struct {
     engine: *Engine,
     index: u8,
@@ -480,6 +529,8 @@ pub const Exec = struct {
     done_head: std.atomic.Value(u32) = .init(no_slot),
     /// Commands (WebSocket sends, publishes), likewise.
     inbox: std.atomic.Value(?*Command) = .init(null),
+    /// Wakes of this executor's tasks from any thread (`IoGate`).
+    io_gate: IoGate = .{},
     /// Bytes of built records (WebSocket messages and the like) in the
     /// ring: added by the executor, taken off by `poll`. Bounded by
     /// `record_budget`, so a consumer that falls behind holds back the
@@ -518,8 +569,18 @@ pub const Exec = struct {
     pub fn wakeIfIdle(x: *Exec) void {
         if (x.idle) {
             x.idle = false;
-            x.kick.set(x.engine.io);
+            x.setEvent(&x.kick);
         }
+    }
+
+    /// Sets an event a task of this executor may wait on, from any thread.
+    pub fn setEvent(x: *Exec, ev: *std.Io.Event) void {
+        x.io_gate.setEvent(x.engine.io, ev);
+    }
+
+    /// Wakes every task of this executor waiting on `word`, from any thread.
+    pub fn wakeFutex(x: *Exec, word: *const std.atomic.Value(u32)) void {
+        x.io_gate.wakeFutex(x.engine.io, word);
     }
 
     fn link(x: *Exec, i: u32, list: u8, deadline: i96) void {
@@ -680,7 +741,7 @@ pub const Exec = struct {
     pub fn signalRoom(x: *Exec) void {
         if (x.room_waiters.load(.seq_cst) != 0) {
             _ = x.room.fetchAdd(1, .release);
-            x.engine.io.futexWake(u32, &x.room.raw, std.math.maxInt(u32));
+            x.wakeFutex(&x.room);
         }
     }
 
@@ -775,7 +836,7 @@ pub const Exec = struct {
             cmd.next = old;
             old = x.inbox.cmpxchgWeak(old, cmd, .release, .monotonic) orelse break;
         }
-        if (old == null) x.kick.set(x.engine.io);
+        if (old == null) x.setEvent(&x.kick);
     }
 
     pub fn handleOf(x: *const Exec, i: u32, gen: u32) u64 {
@@ -1030,8 +1091,11 @@ pub const Engine = struct {
     /// The generation its slots start at (`next_first_gen` at create).
     first_gen: u32 = 1,
     /// The runtime's Io, for waking executor tasks from consumer threads
-    /// (zio's wakes work from any thread).
+    /// (zio's wakes work from any thread; through an `IoGate`).
     io: std.Io = undefined,
+    /// Wakes of engine-wide state (topic changes, broker groups) from any
+    /// thread; the executors' wakes go through their own gate.
+    io_gate: IoGate = .{},
     /// The configuration's listeners, in order.
     listeners: []ListenerState = &.{},
     /// The server's options as the configuration gives them, with the modes
@@ -1239,7 +1303,7 @@ pub const Engine = struct {
             else => return error.State,
         }
         if (e.phase.cmpxchgStrong(.open, .starting, .acq_rel, .acquire) != null) return error.State;
-        e.go.set(e.io);
+        e.setEvent(&e.go);
         e.started.waitUncancelable(threadedIo());
         if (e.start_error) |err| {
             e.thread.?.join();
@@ -1350,6 +1414,7 @@ pub const Engine = struct {
             if (st == abi.LISTENER_LISTENING or st == abi.LISTENER_PENDING) l.state.store(abi.LISTENER_CLOSED, .release);
         }
         e.app = null;
+        e.closeIo();
         app.deinit();
         if (comptime features.websocket) e.rooms.deinit();
         // Every consumer hears of the stop (ANOLE_EV_STOPPED).
@@ -1695,6 +1760,7 @@ pub const Engine = struct {
 
     fn failStartDeinit(e: *Engine, app: *anole.App, err: anyerror) void {
         e.app = null;
+        e.closeIo();
         app.deinit();
         e.failStart(err);
     }
@@ -1757,6 +1823,23 @@ pub const Engine = struct {
         while (e.ctl.load(.acquire) & ~ctl_closed != 0) {
             io.sleep(.fromMilliseconds(1), .awake) catch std.Thread.yield() catch {};
         }
+    }
+
+    /// Sets an event of engine-wide state from any thread (`IoGate`).
+    pub fn setEvent(e: *Engine, ev: *std.Io.Event) void {
+        e.io_gate.setEvent(e.io, ev);
+    }
+
+    /// Wakes the runtime's tasks waiting on `word`, from any thread.
+    pub fn wakeFutex(e: *Engine, word: *const std.atomic.Value(u32)) void {
+        e.io_gate.wakeFutex(e.io, word);
+    }
+
+    /// On the run thread, right before the runtime goes: every wake from
+    /// another thread that is under way finishes, later ones are skipped.
+    fn closeIo(e: *Engine) void {
+        for (e.execs) |*x| x.io_gate.close();
+        e.io_gate.close();
     }
 
     pub fn drain(e: *Engine) !void {
@@ -1885,14 +1968,14 @@ pub const Engine = struct {
                 // Opened, never started: the main thread skips `run`.
                 .open => {
                     e.abandon.store(true, .release);
-                    e.go.set(e.io);
+                    e.setEvent(&e.go);
                 },
                 // Not drained: what consumers still owe is answered 503 at
                 // once (the capi tasks), so this does not wait for answers
                 // that cannot come (it may run on a consumer's own thread).
                 .running, .draining => {
                     e.abandon.store(true, .release);
-                    for (e.execs) |*x| x.kick.set(e.io);
+                    for (e.execs) |*x| x.setEvent(&x.kick);
                     e.drain() catch {};
                 },
                 else => {},
@@ -2755,7 +2838,7 @@ fn failBody(x: *Exec, si: u32, gen: u32, status: http.Status) void {
     if (notify) x.postEvent(.body, x.handleOf(si, gen));
     if (genOf(s.word.load(.acquire)) == gen) {
         s.body_error = status;
-        s.event.set(x.engine.io);
+        x.setEvent(&s.event);
     }
 }
 
@@ -3397,7 +3480,7 @@ pub fn handBack(x: *Exec, s: *Slot, h: Handle, state: SlotState) void {
         s.next_done = old;
         old = x.done_head.cmpxchgWeak(old, h.slot, .release, .monotonic) orelse break;
     }
-    if (old == no_slot) x.kick.set(x.engine.io);
+    if (old == no_slot) x.setEvent(&x.kick);
 }
 
 pub fn checkHeaders(headers: []const CHeader) error{Invalid}!usize {
@@ -3494,7 +3577,7 @@ pub fn abort(e: *Engine, hv: u64) AnswerError!void {
             const wake = s.out.exec_waiting;
             s.out.exec_waiting = false;
             s.out.release();
-            if (wake) s.event.set(e.io);
+            if (wake) x.setEvent(&s.event);
             return;
         }
         s.out.release();
@@ -3738,7 +3821,7 @@ pub fn streamWrite(e: *Engine, hv: u64, data: []const u8, borrow: bool) AnswerEr
     const wake = s.out.exec_waiting;
     s.out.exec_waiting = false;
     s.out.release();
-    if (wake) s.event.set(e.io);
+    if (wake) x.setEvent(&s.event);
     return busy;
 }
 
@@ -3768,7 +3851,7 @@ pub fn streamWriteWait(e: *Engine, hv: u64, data: []const u8, timeout_ms: i32) A
 
 pub fn streamEnd(e: *Engine, hv: u64, trailers: []const CHeader) AnswerError!void {
     _ = try checkHeaders(trailers);
-    _, const s, const h = slotOf(e, hv) catch |err| return e.badHandle(err);
+    const x, const s, const h = slotOf(e, hv) catch |err| return e.badHandle(err);
     s.out.acquire();
     if (!s.out.live(h.gen) or s.out.ended or s.out.failed) {
         s.out.release();
@@ -3782,7 +3865,7 @@ pub fn streamEnd(e: *Engine, hv: u64, trailers: []const CHeader) AnswerError!voi
     const wake = s.out.exec_waiting;
     s.out.exec_waiting = false;
     s.out.release();
-    if (wake) s.event.set(e.io);
+    if (wake) x.setEvent(&s.event);
 }
 
 /// Copies request body bytes out; 0 at the end. `error.Again` with
@@ -3818,10 +3901,9 @@ pub fn reqRead(e: *Engine, hv: u64, out: []u8, timeout_ms: i32) AnswerError!usiz
         if (wake) s.in.exec_waiting = false;
         if (n == 0 and !ended and timeout_ms == 0) s.in.want_event = true;
         s.in.release();
-        if (wake) s.pump_event.set(e.io);
+        if (wake) x.setEvent(&s.pump_event);
         if (n > 0) return n;
         if (ended) return 0;
-        _ = x;
         if (timeout_ms == 0) return error.Again;
         _ = s.in.blocked.fetchAdd(1, .acq_rel);
         defer _ = s.in.blocked.fetchSub(1, .acq_rel);
