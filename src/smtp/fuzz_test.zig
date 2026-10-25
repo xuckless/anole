@@ -111,5 +111,6 @@ test "fuzz: smtp mailbox" {
         "Zoë <zoe@exämple.com>",
         "a@b@c",
         "\"unclosed",
+        "ocal\"@example.com>\xd1 local\"@e",
     });
 }

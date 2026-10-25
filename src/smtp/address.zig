@@ -129,10 +129,24 @@ pub fn checkAddress(address: []const u8) error{InvalidAddress}!void {
     try checkDomain(domain);
 }
 
+/// RFC 5321's Local-part: a Dot-string (atoms joined by dots, no quote) or
+/// one Quoted-string that is the whole part, never a mix (a quote inside a
+/// dot-string would hide '>' and spaces from a server that reads it as a
+/// dot-string).
 fn checkLocal(local: []const u8) error{InvalidAddress}!void {
     if (local.len == 0 or local.len > max_local) return error.InvalidAddress;
     if (local[0] == '"') {
-        if (local.len < 2 or local[local.len - 1] != '"') return error.InvalidAddress;
+        if (local.len < 3 or local[local.len - 1] != '"') return error.InvalidAddress;
+        const inner = local[1 .. local.len - 1];
+        var i: usize = 0;
+        while (i < inner.len) : (i += 1) switch (inner[i]) {
+            '"' => return error.InvalidAddress,
+            '\\' => {
+                i += 1;
+                if (i >= inner.len) return error.InvalidAddress;
+            },
+            else => {},
+        };
         return;
     }
     if (local[0] == '.' or local[local.len - 1] == '.') return error.InvalidAddress;
@@ -142,7 +156,10 @@ fn checkLocal(local: []const u8) error{InvalidAddress}!void {
             if (prev_dot) return error.InvalidAddress;
             prev_dot = true;
         } else prev_dot = false;
-        if (b == '[' or b == ']') return error.InvalidAddress;
+        switch (b) {
+            '"', '\\', '[', ']' => return error.InvalidAddress,
+            else => {},
+        }
     }
 }
 
@@ -238,6 +255,22 @@ test "address: header and command injection, and plain mistakes, are refused" {
     try expectInvalid("\"unclosed <ada@example.com>");
     try expectInvalid(repeat("a", 65) ++ "@example.com");
     try expectInvalid("ada@" ++ repeat("a", 64) ++ ".com");
+}
+
+test "address: a local part is a dot-string or one quoted string, never a mix" {
+    // A quote inside a dot-string hid '>' and a space: the path would end
+    // early in MAIL FROM/RCPT TO and the rest read as parameters.
+    try expectInvalid("ocal\"@example.com>\xd1 local\"@e");
+    try expectInvalid("a\"@x.com> BODY=8BITMIME\"@example.com");
+    try expectInvalid("a\"b\"@example.com");
+    try expectInvalid("\"a\"x\"b\"@example.com");
+    try expectInvalid("\"a\".b@example.com");
+    try expectInvalid("\"a\\\"@example.com");
+    try expectInvalid("\"\"@example.com");
+    try expectInvalid("Ada <a\"b c\"@example.com>");
+    try expectMailbox("\"a b\"@example.com", null, "\"a b\"@example.com");
+    try expectMailbox("\"a\\\"b\"@example.com", null, "\"a\\\"b\"@example.com");
+    try expectMailbox("\"a@b>c\"@example.com", null, "\"a@b>c\"@example.com");
 }
 
 test "address: SMTPUTF8 is needed for a non-ASCII address only" {
