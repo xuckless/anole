@@ -3,6 +3,18 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.1 (unreleased)
+
+### Fixed
+
+- Jobs: a job that finished while the server drained could run a second
+  time. A drain past its deadline cancels the runs still going, and the
+  cancel could land on a finished run's state write (logged as "finished
+  but its state could not be saved: Canceled"), or mark a run interrupted
+  after its handler had returned, which put it back. The write now runs to
+  its end (at most 5 s, or until the drain stops waiting for canceled runs,
+  3 s past its deadline), and a handler that returned keeps its outcome.
+
 ## 0.4.0 (2026-10-25)
 
 ### Breaking

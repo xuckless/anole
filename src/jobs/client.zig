@@ -35,6 +35,13 @@ const StepReport = root.StepReport;
 
 const max_args = 1 << 20;
 
+/// The longest a run's outcome write may take once the run is over (it
+/// runs to its end whatever cancels the job's task).
+const settle_limit: Duration = .fromSeconds(5);
+/// How long the drain waits for the runs it canceled past its deadline;
+/// their outcome writes fit in it.
+const cancel_grace: Duration = .fromSeconds(3);
+
 pub const Handler = struct {
     kind: Kind,
     state: ?*anyopaque,
@@ -106,6 +113,9 @@ pub const Client = struct {
     last_gauges: i64 = 0,
     /// Set before the tasks are canceled (drain, deinit).
     closing: std.atomic.Value(bool) = .init(false),
+    /// When the drain stops waiting for the runs it canceled (awake clock,
+    /// ns); maxInt while not draining. Bounds the outcome writes.
+    drain_gives_up_ns: std.atomic.Value(i64) = .init(std.math.maxInt(i64)),
 
     /// `app.jobs(options)` calls it; outside an app, `init`, `start`, `drain`, `deinit`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
@@ -380,6 +390,10 @@ pub const Client = struct {
     pub fn drain(self: *Client, deadline: std.Io.Clock.Timestamp) void {
         self.closing.store(true, .release);
         if (self.draining.swap(true, .acq_rel)) return;
+        // On the awake clock, whatever clock the deadline is on.
+        const to_deadline = std.Io.Clock.Timestamp.now(self.io, deadline.clock).durationTo(deadline);
+        const gives_up = std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = to_deadline.raw, .clock = .awake }).addDuration(.{ .raw = cancel_grace, .clock = .awake });
+        self.drain_gives_up_ns.store(@intCast(@min(gives_up.raw.nanoseconds, std.math.maxInt(i64))), .release);
         for (self.queues) |*q| q.signal.set(self.io);
         self.maint_signal.set(self.io);
         while (self.runningTotal() > 0) {
@@ -394,8 +408,12 @@ pub const Client = struct {
                 if (b.task) |t| placement.cancelTask(t);
             }
             self.held_mutex.unlock(self.io);
-            var spins: u32 = 0;
-            while (self.runningTotal() > 0 and spins < 300) : (spins += 1) self.io.sleep(.fromMilliseconds(10), .awake) catch break;
+            // The canceled runs settle: a finished one's write still lands.
+            while (self.runningTotal() > 0) {
+                const grace_left = std.Io.Clock.Timestamp.now(self.io, .awake).durationTo(.{ .raw = .{ .nanoseconds = self.drain_gives_up_ns.load(.acquire) }, .clock = .awake });
+                if (grace_left.raw.nanoseconds <= 0) break;
+                self.io.sleep(.fromMilliseconds(10), .awake) catch break;
+            }
         }
         if (self.is_leader.load(.acquire)) {
             self.backend.vt.leaderRelease(self.backend.ptr, self.worker_name) catch {};
@@ -796,7 +814,10 @@ pub const Client = struct {
             log.info("{s}: no longer held (cancelled, or its lease expired); its run was stopped", .{job.id_text});
             return .lost;
         }
-        if (interrupted) {
+        // A handler that returned before the drain's cancel reached it has
+        // finished: its outcome stands.
+        const failed = if (result) |_| false else |_| true;
+        if (interrupted and failed) {
             plan = .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .available, .attempt_delta = -1, .run_at = t }, .outcome = .interrupted };
             log.info("{s} interrupted by shutdown; put back", .{job.id_text});
         } else if (result) |_| {
@@ -815,18 +836,13 @@ pub const Client = struct {
             }
         }
 
-        var tries: u32 = 0;
-        while (tries < 3) : (tries += 1) {
-            const ok = self.backend.vt.finish(self.backend.ptr, plan.f) catch |e| {
-                log.warn("{s} finished but its state could not be saved: {t}; it will run again after its lease", .{ job.id_text, e });
-                self.io.sleep(.fromMilliseconds(@as(i64, 50) << @intCast(tries)), .awake) catch return plan.outcome;
-                continue;
-            };
-            if (!ok) {
+        switch (self.writeOutcome(plan.f, job.id_text)) {
+            .saved => {},
+            .not_held => {
                 log.info("{s}: no longer held; its result was dropped", .{job.id_text});
                 return .lost;
-            }
-            break;
+            },
+            .failed => return plan.outcome,
         }
         if (self.metrics) |mm| {
             const label: metrics_mod.Outcome = if (result) |_| switch (plan.outcome) {
@@ -855,6 +871,52 @@ pub const Client = struct {
             log.warn("{s} {s} failed (attempt {d} of {d}); next try scheduled", .{ job.id_text, row.kind, row.attempt, row.max_attempts });
         }
         return plan.outcome;
+    }
+
+    const Written = enum { saved, not_held, failed };
+
+    /// The outcome's write, run to its end whatever cancels the job's task:
+    /// a drain past its deadline cancels it, and a write cut short would
+    /// make a finished job run again after its lease. A task of its own,
+    /// awaited with the cancel held off, bounded by `settle_limit` or the
+    /// moment the drain stops waiting, whichever is nearer.
+    fn writeOutcome(self: *Client, f: store.Finish, id_text: []const u8) Written {
+        const io = self.io;
+        const prev = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(prev);
+        const limit = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = settle_limit, .clock = .awake });
+        const gives_up: std.Io.Clock.Timestamp = .{ .raw = .{ .nanoseconds = self.drain_gives_up_ns.load(.acquire) }, .clock = .awake };
+        const deadline = if (gives_up.raw.nanoseconds < limit.raw.nanoseconds) gives_up else limit;
+        var out: Written = .failed;
+        var group: std.Io.Group = .init;
+        placement.concurrent(&group, io, .local, writeOutcomeTask, .{ self, f, id_text, deadline, &out }) catch {
+            writeOutcomeTask(self, f, id_text, deadline, &out);
+            return out;
+        };
+        group.await(io) catch {};
+        return out;
+    }
+
+    fn writeOutcomeTask(self: *Client, f: store.Finish, id_text: []const u8, deadline: std.Io.Clock.Timestamp, out: *Written) void {
+        const d: dusty.Deadline = .init(self.io, .{ .deadline = deadline });
+        out.* = d.run(finishRetrying, .{ self, f, id_text }) catch |e| {
+            log.warn("{s} finished but its state could not be saved: {t}; it will run again after its lease", .{ id_text, e });
+            out.* = .failed;
+            return;
+        };
+    }
+
+    fn finishRetrying(self: *Client, f: store.Finish, id_text: []const u8) anyerror!Written {
+        var tries: u32 = 0;
+        while (true) : (tries += 1) {
+            const ok = self.backend.vt.finish(self.backend.ptr, f) catch |e| {
+                if (e == error.Canceled or tries == 2) return e;
+                log.warn("{s}: saving its state failed ({t}); trying again", .{ id_text, e });
+                try self.io.sleep(.fromMilliseconds(@as(i64, 50) << @intCast(tries)), .awake);
+                continue;
+            };
+            return if (ok) .saved else .not_held;
+        }
     }
 
     fn planSnooze(self: *Client, row: store.Row, t: Time, delay: Duration) Plan {
