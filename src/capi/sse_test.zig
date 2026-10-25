@@ -449,7 +449,12 @@ fn slowCheck(a: *SseConsumer, port: u16, io: std.Io) !void {
     var busy = false;
     var again = false;
     var taken: usize = 0;
+    // WRITABLEs counted before the send that answers AGAIN: the WRITABLE
+    // that AGAIN promises is counted after this was read, however early
+    // the socket takes the queue (Linux grows send buffers on its own).
+    var w0: u32 = 0;
     for (0..4000) |_| {
+        w0 = a.writables.load(.acquire);
         const b = engine.sse.send(e, h, "", &data) catch |err| {
             try std.testing.expectEqual(error.Again, err);
             again = true;
@@ -460,9 +465,8 @@ fn slowCheck(a: *SseConsumer, port: u16, io: std.Io) !void {
         // Let the executor write what it can.
         if (!busy) try io.sleep(.fromMilliseconds(0), .awake);
     }
-    try std.testing.expect(again);
-    try std.testing.expect(busy);
-    const w0 = a.writables.load(.acquire);
+    if (!again) return error.NeverAgain;
+    if (!busy) return error.NeverBusy;
     // The client reads everything that was taken (each event is
     // "data: " + 16 KiB + "\n\n"), and the WRITABLE follows.
     const buf = try alloc.alloc(u8, 2 << 20);
