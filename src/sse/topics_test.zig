@@ -85,6 +85,20 @@ const Harness = struct {
         while (f.writes_done.load(.acquire) < n) io.sleep(.fromMilliseconds(1), .awake) catch return;
     }
 
+    /// Waits until subscriber `i` is armed and its sender has finished
+    /// (`last_write_ms` set by its last write, under the hub's lock).
+    fn waitSettled(h: *Harness, i: usize) error{NeverSettled}!void {
+        const sub = h.subAt(i);
+        for (0..5000) |_| {
+            h.hub.mutex.lockUncancelable(io);
+            const settled = sub.armed and !sub.running;
+            h.hub.mutex.unlock(io);
+            if (settled) return;
+            io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        return error.NeverSettled;
+    }
+
     fn waitClosed(h: *Harness, n: u32) void {
         while (h.closed.load(.acquire) < n) io.sleep(.fromMilliseconds(1), .awake) catch return;
     }
@@ -343,12 +357,22 @@ test "sse: a heartbeat tick writes a comment only to subscribers idle for the in
     const h = try Harness.init(.{ .heartbeat = .fromSeconds(10) });
     defer h.deinit();
     const idle = try h.add(&.{"t"}, null);
-    Harness.waitWrites(idle, 1);
+    // The open line's write is over and stamped at 1000 before a tick
+    // moves the made-up clock (a sender still running would stamp it with
+    // the tick's time).
+    try h.waitSettled(0);
     // Not yet: 5 s after the last write.
     _ = h.hub._tick(0, 1000 + 5_000);
-    try std.testing.expect(std.mem.indexOf(u8, Harness.text(idle), ":\n\n") == null);
+    try std.testing.expectEqual(@as(u32, 1), idle.writes_done.load(.acquire));
     _ = h.hub._tick(0, 1000 + 10_000);
-    while (std.mem.indexOf(u8, Harness.text(idle), ":\n\n") == null) io.sleep(.fromMilliseconds(1), .awake) catch return;
+    for (0..5000) |_| {
+        idle.mutex.lockUncancelable(io);
+        const beat = std.mem.indexOf(u8, Harness.text(idle), ":\n\n") != null;
+        idle.mutex.unlock(io);
+        if (beat) return;
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    return error.NoHeartbeat;
 }
 
 test "sse: on_full=close: what is queued goes out, then the stream ends (slow)" {
