@@ -295,6 +295,8 @@ Other errors map to a status too:
 - a request message over the registration's limit (4 MiB by default) becomes
   RESOURCE_EXHAUSTED;
 - a message that does not decode becomes INTERNAL;
+- `call.res.abort()` (`Response.abort`) resets the stream, and the client
+  reads CANCELLED;
 - any other error becomes UNKNOWN with the message "Application error
   processing RPC" (grpc-java's wording). The error's name stays on the
   server: it is logged at `warn` in scope `anole_grpc`, with the path and the
@@ -318,8 +320,9 @@ When the client resets the stream (RST_STREAM), or the connection is lost,
 the handler is canceled the same way: its next wait on `call.io` returns
 `error.Canceled`, so a call blocked in a sleep, a database query or an
 outbound request ends at once. The call ends as CANCELLED, which a client
-that reset its stream no longer reads. This holds for HTTP/2 under Anole's
-zio runtime, which is what `anole.Server` runs. A connection that ends
+that reset its stream no longer reads. This holds for HTTP/2 and HTTP/3
+(RESET_STREAM, or STOP_SENDING with an error) under Anole's zio runtime,
+which is what `anole.Server` runs. A connection that ends
 cleanly may be only half-closed, so the server first checks with a PING
 (every 500 ms) whether the client is gone before canceling handlers whose
 request was complete.
@@ -605,8 +608,9 @@ This service is separate from the HTTP `/healthz` and `/readyz` in
 
 ## The client
 
-`anole.grpc.Client(Service)` makes typed calls over an
-`anole.h2.ClientConnection`. Pass it the same generated service type the
+`anole.grpc.Client(Service)` makes typed calls over a `Channel`, which
+holds an `anole.h2.ClientConnection` (`.conn`) or an
+`anole.h3.ClientConnection` (`.h3`, see [HTTP/3](#http3)). Pass it the same generated service type the
 server uses; only its names and message types matter.
 
 ```zig

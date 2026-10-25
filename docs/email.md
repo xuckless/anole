@@ -152,9 +152,10 @@ Retries are **opt-in**: `app.mail.with(.{ .retry = true }).send(req, msg)`
 tries a failure again (`Options.retry`: 3 attempts, 500 ms to 5 s) when the
 server could not be reached, said "try later" (any 4xx, the answer to the
 final "." included), or the attempt timed out. A connection lost **after**
-the final "." is never retried: the server may have kept the message, and a
-duplicate email is something a user sees. If you accept that risk (a job
-that is retried anyway), use `.retry = true` there.
+the final "." is never retried, `.retry = true` or not: the server may have
+kept the message, and a duplicate email is something a user sees. A job
+that sends mail repeats the whole job after such a loss, which is the one
+place a duplicate can come from.
 
 A circuit breaker is on by default (`Options.breaker`): after repeated
 connection failures sends fail at once with `circuit_open` until the server
@@ -169,16 +170,18 @@ class, a code and the server's own words (never sent to a client).
 
 | Cause | Error | Status | Class | Code |
 | --- | --- | --- | --- | --- |
-| Cannot connect, TLS fails, 421, any 4xx | `ServiceUnavailable` | 503 | `unavailable` | `connect_failed`, `connect_timeout`, `service_unavailable`, `4.x.x` or the number, `starttls_unavailable`, `recipients_deferred`, `pool_timeout`, `circuit_open`, `draining` |
+| Cannot connect, TLS fails, the connection is lost, 421, any 4xx | `ServiceUnavailable` | 503 | `unavailable` | `connect_failed`, `connect_timeout`, `connection_failed`, `connection_closed`, `service_unavailable`, `4.x.x` or the number, `starttls_unavailable`, `starttls_failed`, `auth_temporary` (a 4xx during AUTH), `recipients_deferred`, `pool_timeout`, `circuit_open`, `draining` |
 | The send ran past its timeout | `GatewayTimeout` | 504 | `timeout` | `timeout` |
-| Our credentials refused (535, 534, 530) | `Database` | 500 | `other` | `authentication_failed` |
-| No AUTH mechanism we speak | `Database` | 500 | `other` | `auth_unsupported` |
+| The credentials refused (535, 534, 530) | `Database` | 500 | `other` | `authentication_failed` |
+| No AUTH mechanism Anole speaks | `Database` | 500 | `other` | `auth_unsupported` |
+| Credentials over a connection without TLS | `Database` | 500 | `other` | `insecure_auth` |
 | Every recipient refused (5xx) | `BadRequest` | 400 | `invalid` | `recipient_rejected` |
 | Some recipients refused | none: `Sent.rejected` | | | |
 | A malformed address, header or file name | `BadRequest` | 400 | `invalid` | `invalid_address`, `invalid_header` |
-| Message over the limit or the server's SIZE | `BadRequest` | 400 | `invalid` | `message_too_large` |
+| Message over the limit or the server's SIZE, or 552 (5.3.4) after DATA | `BadRequest` | 400 | `invalid` | `message_too_large` |
+| More than 100 recipients in one message | `BadRequest` | 400 | `invalid` | `too_many_recipients` |
 | The server needs SMTPUTF8 and does not offer it | `BadRequest` | 400 | `invalid` | `smtputf8_unsupported` |
-| 552 or 554 after DATA | `Database` | 500 | `other` | the enhanced status ("5.7.1") or the number |
+| Another 5xx after DATA (554, say) | `Database` | 500 | `other` | the enhanced status ("5.7.1") or the number |
 | An attachment file cannot be read | `Database` | 500 | `other` | `attachment_unreadable` |
 
 `Options.errors` (an `anole.db.ErrorMap`) moves classes to other statuses.
@@ -188,9 +191,10 @@ class, a code and the server's own words (never sent to a client).
 A password-reset mail does not need to hold up the response. Send it in a
 background task with an `anole.db.Ctx` (docs/database.md), or, when it must
 survive a restart, as a job (docs/jobs.md): the job context works like a
-request, so `app.mail.send(job, msg)` is the whole call, and `.retry = true`
-is right there because the job's own retry already accepts the risk of a
-duplicate.
+request, so `app.mail.send(job, msg)` is the whole call. `.retry = true`
+suits it too: it repeats only failures before the final "." and "try later"
+answers, so it never sends twice; a connection lost after the "." fails the
+job, and the job's own retry is what may send a duplicate.
 
 ## There is no DKIM
 

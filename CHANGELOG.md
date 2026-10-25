@@ -13,8 +13,15 @@ breaking changes are listed anyway.
   storage and mail connectors use them; no database does.
 - `anole.ServerError.DeploymentUnavailable` is gone: `deployment = .lambda`
   works now. `ServerError` gains `LambdaRuntimeApiMissing`, `LambdaNotBuilt`,
-  `LambdaRuntimeApiFailed` and `SnapStartUnsupported`; an exhaustive
-  `switch` on it needs them.
+  `LambdaRuntimeApiFailed` and `SnapStartUnsupported`, and for the raw
+  listeners `NetNotBuilt`, `NetListenerNeedsPort`, `NetListenerHttp3`,
+  `TcpAndUdp`, `UdpWithTls`, `UdpOnUnixSocket`, `UdpWithProxyProtocol`,
+  `InvalidFraming` and `NetHandlerContext`; an exhaustive `switch` on it
+  needs them.
+- `anole.db.System` and `anole.resilience.Kind` gain `s3` and `smtp`; an
+  exhaustive `switch` on either needs them.
+- C ABI 0.10 (see Changed): a binding built against 0.9 rebuilds against the
+  new `anole.h`.
 
 ### Added
 
@@ -36,15 +43,15 @@ breaking changes are listed anyway.
   flags `ANOLE_LISTENER_F_TCP` and `_UDP`.
 - `anole.jobs` (`-Djobs`, on in the web and full profiles): background jobs
   with retries and backoff, delays, priorities, unique jobs, leases with
-  heartbeats, an admin API and JSON routes, on the memory and SQLite stores
-  (PostgreSQL and Redis stores follow). Job kinds are types
+  heartbeats, an admin API and JSON routes, on the memory, SQLite, PostgreSQL
+  (LISTEN/NOTIFY wake-ups) and Redis (pub/sub wake-ups) stores. Job kinds are types
   (`pub const job: anole.jobs.Kind`), `app.jobs(...)` owns the queue.
 - `anole.cron`: cron expressions (5 or 6 fields, `L`, `5L`, `MON#2`,
   nicknames, `@every`), time zones from the system's tzdata with the DST
   rules written down in docs/cron.md, and `jobs.cron(...)`, which enqueues
   one job per tick across instances.
 - `anole.pg.Client.session`: a connection of its own outside the pools.
-- `jobs.enqueueIn`, `enqueueRawIn` and `completeIn` on SQLite transactions,
+- `jobs.enqueueIn`, `enqueueRawIn` and `completeIn` on SQLite and PostgreSQL transactions,
   jobs metrics, `traceparent` carried in job meta, and the queue draining when
   the server does.
 - `jobs.Client.addQueue`: adds a queue the options did not list, before
@@ -127,6 +134,11 @@ breaking changes are listed anyway.
 - `-Dlambda` build flag (on in every profile), and `-Ddefault-deployment`
   (the deployment a build falls back on; `zig build lambda` builds with
   `lambda`).
+- `addApp`'s `AppOptions.features`: single features on or off over the
+  preset (`.features = .{ .postgres = false }`), forwarded to Anole's
+  dependency like its own `-D<feature>` flags, the Lambda zips included.
+- `anole.h3.Stats.connections_open`: the connections an HTTP/3 endpoint
+  holds now (a gauge; the live console's `/h3` view shows it).
 - SSE topics (`anole.sse.Topics`, `app.sse`): publish once to every subscriber over HTTP/1.1, HTTP/2 and HTTP/3, with no task per idle subscriber; `Last-Event-ID` resume from a replay buffer, heartbeats, a slow-subscriber policy and a reconnect spread at drain.
 - `app.watch`: PostgreSQL LISTEN/NOTIFY, Redis pub/sub and streams, and MongoDB change streams, straight into SSE and WebSocket topics, into handlers, or read from handlers.
 - MongoDB change streams: `Collection.watch`, `Database.watch`, `Client.watch`, with automatic resume.
@@ -173,9 +185,6 @@ breaking changes are listed anyway.
   that only sets it is unchanged, code that reads `channel.conn` unwraps it.
 - The `RequestId` middleware keeps an ID the engine set already (Lambda's
   request ID) instead of generating another.
-- `deployment = .lambda` no longer fails with `DeploymentUnavailable`; that
-  error is gone.
-- `anole.db.System` has `s3` and `smtp`, and `anole.resilience.Kind` too.
 - C ABI 0.10: the C ABI is now 0.10 (`ANOLE_ABI_VERSION`, `x-anole-abi`;
   before 1.0 a binding needs the exact version). A handle's kind takes five
   bits (28-32), so Kafka groups and batches are kinds of their own (17 and

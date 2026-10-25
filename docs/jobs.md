@@ -15,7 +15,7 @@ try state.jobs.handle(&app, SendWelcome, .{}, sendWelcome);
 
 fn sendWelcome(app: *App, job: *anole.jobs.Job, args: SendWelcome) !void { ... }
 
-_ = try app.jobs.enqueue(req, SendWelcome{ .user_id = 7 }, .{ .delay = .fromSeconds(30) });
+_ = try state.jobs.enqueue(req, SendWelcome{ .user_id = 7 }, .{ .delay = .fromSeconds(30) });
 ```
 
 ## What a job is
@@ -35,9 +35,11 @@ timeout, declared on the args type), JSON arguments, and a state:
 | --- | --- |
 | `.memory` | in this process only; lost on restart. Tests and single-process apps. |
 | `.{ .sqlite = client }` | durable; the tables are created at start (`migrate = false` and `anole.jobs.sql(.sqlite, prefix, arena)` if you migrate yourself). |
-| `.{ .postgres = client }`, `.{ .redis = client }` | not built yet in this build; `app.jobs` refuses them with a message. |
+| `.{ .postgres = client }` | durable; the tables are created at start (or `anole.jobs.sql(.postgresql, prefix, arena)`). Workers wake through LISTEN/NOTIFY (`notify = false` behind PgBouncer's transaction pooling), and the cron leader holds an advisory lock. |
+| `.{ .redis = client }` | durable as far as Redis persists; keys under `key_prefix` (`"anole:"`), one Lua script per state change, a single Redis node, no transactions. Workers wake through pub/sub. |
 
-The store client must come from the same app (`app.sqlite(...)`).
+The store client must come from the same app (`app.postgres(...)`,
+`app.sqlite(...)` or `app.redis(...)`); `app.jobs` refuses another one.
 
 ## Handlers
 
@@ -96,8 +98,8 @@ returns a report. Nothing waits for time to pass: advance the clock.
 
 ## Transactions
 
-On SQLite (and PostgreSQL, when its store lands) a job can be enqueued or
-completed inside your own transaction:
+On SQLite and PostgreSQL a job can be enqueued or completed inside your own
+transaction:
 
 ```zig
 var tx = try app.db.begin(req, .{});
@@ -128,5 +130,4 @@ of their own yet.
 
 ## Not built yet
 
-The PostgreSQL and Redis stores (`app.jobs` refuses them with a message), and
-spans for job runs.
+Spans for job runs.

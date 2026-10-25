@@ -111,7 +111,8 @@ domain contains `.lambda-url.`), `httpMethod` with a `requestContext` and no
 - **Host.** An event without a `host` header gets the API's domain name.
 - **Body.** Base64 bodies are decoded before the handler sees them.
 - **Secure.** `req.secure` is true for every front door but ALB, which
-  reports it in `X-Forwarded-Proto`.
+  reports it in `X-Forwarded-Proto`; VPC Lattice also follows
+  `X-Forwarded-Proto` when it is present.
 - **Spoofing.** A client's own `x-amzn-request-context`,
   `x-amzn-lambda-context` and `Expect` headers are removed.
 - **Client address.** What the front door computed. With `proxy.trusted`
@@ -206,7 +207,7 @@ app.post(anole.lambda.default_event_path, onQueue);
 
 fn onQueue(req: *anole.Request, res: *anole.Response) !void {
     const Batch = struct { Records: []const struct { messageId: []const u8, body: []const u8 } };
-    const batch = try req.json(Batch);
+    const batch = try req.bind(Batch);
     const Failure = struct { itemIdentifier: []const u8 };
     var failed: std.ArrayList(Failure) = .empty;
     for (batch.Records) |m| {
@@ -323,11 +324,12 @@ layer and point `OTEL_EXPORTER_OTLP_ENDPOINT` at it
 (`http://127.0.0.1:4318`); the spans join X-Ray's trace through the
 `traceparent` above and are flushed between invocations.
 
-The first lines say what the mode does:
+The log says what the mode does: first which listeners are set aside, and,
+once the adapter is ready, what it serves:
 
 ```
-deployment lambda (lambda build): invocations from the Lambda Runtime API at 127.0.0.1:9001, 1 at a time on 1 executor; buffered answers; other events to POST /_lambda/event; SIGTERM through a no-op extension; ready in 3.4 ms
 deployment lambda: no listener opens here, so listen(":3000") is set aside; requests come from Lambda
+deployment lambda (lambda build): invocations from the Lambda Runtime API at 127.0.0.1:9001, 1 at a time on 1 executor; buffered answers; other events to POST /_lambda/event; SIGTERM through a no-op extension; ready in 3.4 ms
 ```
 
 The source in parentheses is `options`, `ANOLE_DEPLOYMENT`,
@@ -338,7 +340,7 @@ The source in parentheses is `options`, `ANOLE_DEPLOYMENT`,
 
 Every listener the options name (`http`, `https`, `listeners`, `http3`,
 `listen`, `listenTls`, raw TCP and UDP listeners) is set aside, and the
-second line names them: Lambda accepts no inbound connections, and the
+first line names them: Lambda accepts no inbound connections, and the
 point of the mode is that the same `main` runs in both places.
 
 A server in the standalone default that sees Lambda's variables says so:
@@ -364,8 +366,9 @@ always empty. The errors of the mode itself:
 | `LambdaRuntimeApiMissing` | `can't start in deployment "lambda": AWS_LAMBDA_RUNTIME_API is not set; Lambda sets it, and so does the Runtime Interface Emulator (docs/lambda.md, "Running locally")` |
 | `LambdaNotBuilt` | `can't start in deployment "lambda": this build leaves the Lambda adapter out (-Dlambda)` |
 | `LambdaRuntimeApiFailed` | the Runtime API answered 500, or asking it for the next invocation failed three times in a row: `can't go on with the Lambda Runtime API at <api>: <what>; exiting so Lambda starts a new environment` |
-| `SnapStartUnsupported` | see [SnapStart](#snapstart) |
-| `InvalidEnvironmentVariable` | `AWS_LAMBDA_RUNTIME_API` or `AWS_LAMBDA_HTTP_ENDPOINT` that is not `host:port` (`AWS_LAMBDA_RUNTIME_API="localhost": use host:port`), `ANOLE_LAMBDA_INVOKE_MODE` that is not `buffered` or `response_stream`, `AWS_LAMBDA_MAX_CONCURRENCY` outside 1 to 4096 |
+| `SnapStartUnsupported` | `can't run under Lambda SnapStart: it is not supported yet (restored copies would share random-number state)`; see [SnapStart](#snapstart) |
+| `InvalidEnvironmentVariable` | `AWS_LAMBDA_RUNTIME_API` or `AWS_LAMBDA_HTTP_ENDPOINT` that is not `host:port` (`AWS_LAMBDA_RUNTIME_API="localhost": use host:port`), `ANOLE_LAMBDA_INVOKE_MODE` that is not `buffered` or `response_stream`, `AWS_LAMBDA_MAX_CONCURRENCY` or `lambda.concurrency` outside 1 to 4096 |
+| `InvalidListenAddress` | `lambda.runtime_api` that is not `host:port` (`lambda.runtime_api="localhost": use host:port`) |
 
 ## Options
 
@@ -407,7 +410,9 @@ the deployment table is in [config.md](config.md#6-deployment).
 - **Broker subscriptions** (NATS subscriptions, JetStream consumers, Kafka
   groups) do not start; publishing works. Use Lambda's event source
   mappings to consume.
-- **Database watches** do not run between invocations.
+- **Database watches** never start: each logs `watch "<name>": not started
+  under the lambda deployment` (a function holds no long-lived connection
+  to a database).
 - **`anole.blocking`** works, one invocation at a time.
 - **The live console** is off.
 
@@ -488,6 +493,8 @@ SnapStart is not supported yet. Restored copies of one snapshot would share
 every user-space random generator (BoringSSL's per-thread state, the QUIC
 secret, ticket keys, session and request IDs), so duplicate secrets would
 appear across clones. With `AWS_LAMBDA_INITIALIZATION_TYPE=snap-start` the
-adapter fails init with `Function.SnapStartUnsupported`: "lambda: SnapStart
-is not supported yet (restored copies would share random-number state)".
+adapter reports the init error `Function.SnapStartUnsupported` to Lambda
+("lambda: SnapStart is not supported yet (restored copies would share
+random-number state); publish without SnapStart") and exits with
+`SnapStartUnsupported`.
 Publish the function without SnapStart.

@@ -309,6 +309,7 @@ or instead of those two. Each has:
 | `name` | made up | What the listener is called: `LISTEN_FDNAMES` for socket activation and restarts, and `req.listener.name` for handlers. Unique, at most 255 bytes, no `:`. Without one: `http-<port>`, `https-<port>` or `unix-<path>`. |
 | `address`, `port` | null | Where it listens. Null: the deployment's default (`127.0.0.1`, 8080; `""` for `anole_lb` and `platform`, and `$PORT` for `platform`). |
 | `unix` | `null` | A unix domain socket at this path instead. |
+| `unix_mode` | `0o660` | Permission bits of a `unix` listener's socket file: owner and group may connect (a client needs write permission). `0o666` opens it to every local user; ignored on Windows and for abstract sockets. The C ABI has no key for it and always uses `0660`. |
 | `tls` | `null` | `.{ .cert = ... }` for TLS, with optional `alpn` and `client_auth`. Listeners that name the same certificate (the same files, the same PEM) share one copy of it. |
 | `http1` | true | HTTP/1.1 (and 1.0). |
 | `http2` | true | HTTP/2: by ALPN over TLS, by prior knowledge (h2c) on cleartext. |
@@ -776,7 +777,15 @@ GSO/GRO on Linux, a GOAWAY drain, mutual TLS (the `https` listener's
 restarts (see
 [below](#zero-downtime-restart-and-socket-activation)), WebSockets (RFC 9220,
 see [websocket.md](websocket.md)) and WebTransport (draft-02, see
-[webtransport.md](webtransport.md)). Not yet: gRPC over HTTP/3.
+[webtransport.md](webtransport.md)), and gRPC (see
+[grpc.md](grpc.md)).
+
+While a request is open, QUIC PINGs keep its connection alive (every half
+idle timeout, at least once a second), so a long response, such as a gRPC
+stream, SSE or a WebSocket, outlives `idle_timeout`; an idle connection
+still closes at it. A client's RESET_STREAM, or STOP_SENDING with an error,
+cancels the handler's task as on HTTP/2: its next wait on `req.io` returns
+`error.Canceled`.
 
 ### 0-RTT
 
@@ -854,7 +863,8 @@ the socket of its first), a socket group without the program (a kernel older
 than 4.5: logged as a warning, and everything still works, one hop slower),
 and sockets inherited in another order than they were bound in. Each
 endpoint counts what it handled, passed on and accepted
-(`anole.h3.EndpointStats`).
+(`anole.h3.EndpointStats`), and `connections_open` is how many connections
+it holds now (the live console's `/h3` view shows it).
 
 The endpoints share one TLS context, so a session ticket from one resumes,
 with 0-RTT, on any other, and a certificate reload switches them all; one

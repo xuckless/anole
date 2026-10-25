@@ -2,7 +2,7 @@
 
 `anole.s3` (`-Ds3`, on in the `web` and `full` profiles) is a client for S3-compatible object stores: AWS S3, Cloudflare R2, MinIO, Backblaze B2 and Supabase Storage. It is pure Zig on Anole's HTTP client (per-executor pools, BoringSSL, deadlines), with its own SigV4 signer. I built it rather than adopting a library: the candidates are on `std.http` (which hard-codes std's TLS), carry no presigning, or pull in a C++ SDK with its own event loop.
 
-The shape is the one the database connectors have: a handle in your App state, every call takes the request first, errors are `anole.db.Error` (a handler's `try` gives the right status), `Options.errors` moves classes to other statuses, `lastError(req)` has the detail.
+The shape is the one the database connectors have: a handle in your App state, every call takes the request first, errors are `anole.db.Error` (a handler's `try` gives the right status), `Options.errors` moves classes to other statuses, `anole.db.lastError(req)` has the detail.
 
 ```zig
 const files = try app.s3(.{});    // AWS_* variables, S3_BUCKET
@@ -48,7 +48,7 @@ Without keys in the options, the chain is: the environment, then the shared cred
 
 A start that finds no credentials fails and names every source it tried:
 
-    s3 "s3": no credentials (environment: AWS_ACCESS_KEY_ID not set; ~/.aws/credentials: no file; web identity: AWS_WEB_IDENTITY_TOKEN_FILE not set; container: not set; EC2 metadata: no answer in 1 s)
+    s3 "s3": no credentials (environment: AWS_ACCESS_KEY_ID not set; /home/app/.aws/credentials: no file; web identity: AWS_WEB_IDENTITY_TOKEN_FILE not set; container: not set; EC2 metadata: no answer in 1 s)
 
 ## Calls
 
@@ -104,12 +104,12 @@ Retries are **on** by default (3 attempts, 100 ms to 2 s): every operation Anole
 | --- | --- | --- |
 | 404 `NoSuchKey`, `NoSuchBucket`, `NoSuchUpload`, `NoSuchVersion` | `not_found` | 404 |
 | 412 `PreconditionFailed`, 409 `ConditionalRequestConflict` | `precondition` | 409 |
-| 416 `InvalidRange`, `KeyTooLongError`, `InvalidArgument`, `EntityTooSmall`, `InvalidPart`, `InvalidPartOrder`; our `invalid_key`, `object_too_large`, `too_many_parts`, `short_body` | `invalid` | 400 |
-| transport errors, 500, 502, 503, 504, `SlowDown`, `ServiceUnavailable` | `unavailable` | 503 |
+| 416 `InvalidRange`, `KeyTooLongError`, `InvalidArgument`, `EntityTooSmall`, `EntityTooLarge`, `InvalidPart`, `InvalidPartOrder`, `InvalidBucketName`, `MissingContentLength`; Anole's `invalid_key`, `object_too_large`, `too_many_parts`, `short_body` and the other checks of a call's arguments | `invalid` | 400 |
+| transport errors, 500, 502, 503, 504, `SlowDown`, `ServiceUnavailable`, `InternalError`, `RequestTimeout` (a 400), `ThrottlingException`, `RequestLimitExceeded`, `Throttling` | `unavailable` | 503 |
 | past the timeout | `timeout` | 504 |
 | everything else (403 `AccessDenied`, `SignatureDoesNotMatch`, `InvalidAccessKeyId`, 301 `PermanentRedirect`...) | `other` | 500 |
 
-A wrong region or a bad key is the server's misconfiguration, so it answers 500 with a clear log line; a `PermanentRedirect` names the bucket's region. `lastError(req).code` is S3's `<Code>` (or ours: `no_bucket`, `invalid_key`, `object_too_large`, `too_many_parts`, `short_body`, `upload_full`, `draining`, `circuit_open`). `Options.errors` moves any class to another status.
+A wrong region or a bad key is the server's misconfiguration, so it answers 500 with a clear log line; a `PermanentRedirect` names the bucket's region. `anole.db.lastError(req).?.code` is S3's `<Code>`, or Anole's own: among them `no_bucket`, `no_credentials`, `invalid_key`, `object_too_large`, `too_many_parts`, `short_body`, `body_too_big`, `file_not_found`, `invalid_expires`, `upload_full`, `upload_over`, `transport`, `bad_response`, `write_timeout`, `draining` and `circuit_open`. `Options.errors` moves any class to another status.
 
 ## Shutdown
 
@@ -126,6 +126,15 @@ const files = try anole.s3.Client.init(gpa, io, .{ .endpoint = fake.url(), .buck
 ```
 
 It starts on a zio runtime (`dusty.Server` wants one). The live tests run against MinIO with `tests/s3/run.sh` (plain and TLS).
+
+## The C ABI
+
+Node and Python apps get the same client through the C ABI: `"storage"` in
+the configuration, and `anole_s3_put`, `anole_s3_get`, `anole_s3_serve`,
+`anole_s3_presign`, the streamed uploads and downloads, multipart, listing,
+copying and deleting. `serve` and `put_body` move an object to and from a
+request without it entering the language. See
+[c-abi.md](c-abi.md#object-storage-s3).
 
 ## What v1 leaves out
 

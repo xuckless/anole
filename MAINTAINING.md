@@ -46,7 +46,7 @@ should see. If libmsquic's newest version stops working with the pinned
 
 `.github/workflows/advisories.yml` runs `tools/advisories.py` every Monday and
 whenever build.zig.zon changes. It checks nghttp2, ngtcp2, nghttp3, zlib-ng,
-zstd, Brotli, yyjson and hiredis against their GitHub security advisories, the
+zstd, Brotli, yyjson, hiredis and lz4 against their GitHub security advisories, the
 BoringSSL commit against OSV, and SQLite against NVD's CVE list (SQLite
 publishes no GitHub advisories; `NVD_IGNORE` lists CVEs NVD matches to every
 SQLite version only because SQLite is the platform of the vulnerable product). A failure means a pinned version is affected:
@@ -299,9 +299,8 @@ tests: `tests/nats/run.sh` (a nats-server with `-js` in Docker).
 `src/kafka` is Anole's own client (no upstream to track); the protocol
 follows Apache Kafka's message definitions, with the versions listed in
 `src/kafka/protocol.zig`. lz4 is the only C dependency: bump it like the
-other tarballs (step 2 above; lz4 is not yet in `tools/advisories.py`'s table
-or `tools/sanitize-c-libs.sh`, so check lz4's GitHub advisories by hand at a
-bump and add it to both when its tests are wired in). Live tests:
+other tarballs (step 2 above; it is in `tools/advisories.py`'s table and
+`tools/sanitize-c-libs.sh`, which runs its block and frame fuzzers). Live tests:
 `tests/kafka/run.sh` (Apache Kafka 4.x in KRaft mode and Redpanda, in Docker;
 CI job `kafka`). When Kafka releases a new major, run them against it before
 claiming support, and re-check the removed API versions (KIP-896 removed the
@@ -393,7 +392,8 @@ by hand.
    the same version in build.zig.zon's `.version` and in the MongoDB
    client's handshake metadata (`driver_version` in
    src/mongodb/connection.zig), and point the install snippets (README.md,
-   docs/getting-started.md) at the new tag. Set the new tag in
+   docs/getting-started.md) and README's "latest release" status line at
+   the new tag. Set the new tag in
    `include/anole.schema.json`'s `$id` (`.../blob/vX.Y.Z/...`; a test checks
    it against `.version`) and run `zig build capi-abi-json` when the C ABI
    changed (`include/anole.abi.json` is checked fresh by `capi-test`).
