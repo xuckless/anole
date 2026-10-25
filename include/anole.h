@@ -704,8 +704,10 @@ ANOLE_API int32_t anole_console_attached(anole_server *s);
 ANOLE_API anole_status anole_console_report(anole_server *s, const anole_console_metric *m, size_t n);
 /* A record from the binding's logger, for /logs only (nothing is written;
    the binding writes its own). level: ANOLE_LOG_*. req: the request it
-   belongs to, or 0. ANOLE_OK also when nothing is kept (the console is off,
-   or the level is below what is kept). */
+   belongs to, or 0: the record carries that request's id and route pattern
+   (for /logs' route= filter); a handle no longer owed, or a gRPC call's,
+   tags nothing. ANOLE_OK also when nothing is kept (the console is off, or
+   the level is below what is kept). */
 ANOLE_API anole_status anole_console_log(anole_server *s, uint32_t level, anole_str scope, anole_str msg, uint64_t req);
 
 /* ANOLE_EV_SENT: Anole no longer reads the memory of a body passed with

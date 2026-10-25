@@ -102,8 +102,10 @@ are captured and show in `/logs` as `stdout` and `stderr`.
 | `anole_console_report` | `ANOLE_E_INVALID` (more than 32, a bad name or unit) |
 | `anole_console_log` | `ANOLE_OK`, also when nothing is kept |
 
-`anole_console_log` keeps the record for `/logs` only; the request handle
-argument is accepted and not yet used to attach the request id.
+`anole_console_log` keeps the record for `/logs` only. Given a request's
+handle, the record carries that request's id and route pattern, so `/logs`
+shows the id and its `route=` filter finds it; a handle no longer owed, or a
+gRPC call's, tags nothing.
 
 ## Rules
 

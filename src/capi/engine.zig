@@ -246,6 +246,14 @@ pub const Slot = struct {
     remote: [64]u8 = undefined,
     remote_len: u8 = 0,
     claims: []const u8 = "",
+    /// The request's id (cut at 64 bytes) and route pattern (the router's,
+    /// which lives as long as the server), for `anole_console_log` from any
+    /// thread: `requestTag` reads them under a generation check, so a slot
+    /// reused meanwhile is noticed and its bytes dropped.
+    rid: [64]u8 = undefined,
+    rid_len: u8 = 0,
+    route_ptr: usize = 0,
+    route_len: usize = 0,
 
     // The answer: written by the consumer while `responding`, read by the
     // executor once `done` or `streaming`. Owned by the slot (the
@@ -1861,11 +1869,15 @@ pub const Engine = struct {
         try c.service.setMetrics(items);
     }
 
-    pub fn consoleLog(e: *Engine, level: std.log.Level, scope: []const u8, msg: []const u8) void {
+    /// `req`: the request the record belongs to (0: none); a handle that
+    /// is no longer a request's tags nothing.
+    pub fn consoleLog(e: *Engine, level: std.log.Level, scope: []const u8, msg: []const u8, req: u64) void {
         const app = e.enter() orelse return;
         defer e.leave();
         const c = app.console orelse return;
-        c.logRecord(level, scope, "", "", msg);
+        var buf: [64]u8 = undefined;
+        const tag = if (req != 0) requestTag(e, req, &buf) else null;
+        c.logRecord(level, scope, if (tag) |t| t.rid else "", if (tag) |t| t.route else "", msg);
     }
 
     /// On the console's thread: event 132 to consumer 0.
@@ -2299,6 +2311,14 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
     s.content_length = if (r.content_length) |l| l else std.math.maxInt(u64);
     s.remote_len = remoteText(r, &s.remote);
     s.claims = claimsOf(r);
+    {
+        const n: u8 = @intCast(@min(r.id.len, s.rid.len));
+        for (r.id[0..n], 0..) |b, k| @atomicStore(u8, &s.rid[k], b, .monotonic);
+        @atomicStore(u8, &s.rid_len, n, .monotonic);
+        const path: []const u8 = if (r.route) |rt| rt.path else "";
+        @atomicStore(usize, &s.route_ptr, @intFromPtr(path.ptr), .monotonic);
+        @atomicStore(usize, &s.route_len, path.len, .monotonic);
+    }
     s.detached = d;
     s.body = "";
     s.ws_upgrade = up != null and !up.?.sse;
@@ -3357,6 +3377,23 @@ pub const CHeader = abi.Header;
 
 fn slotOf(e: *Engine, hv: u64) HandleError!struct { *Exec, *Slot, Handle } {
     return slotOfKind(e, hv, .request);
+}
+
+/// What `anole_console_log` tags a record with: request `hv`'s id (into
+/// `buf`) and route pattern, or null when the handle is not an HTTP
+/// request's (gRPC calls are not tagged yet) or its slot moved on. Any thread: the generation is read before and after
+/// the copy (a seqlock), so bytes of a later request are never returned.
+pub fn requestTag(e: *Engine, hv: u64, buf: *[64]u8) ?struct { rid: []const u8, route: []const u8 } {
+    _, const s, const h = slotOf(e, hv) catch return null;
+    const w0 = s.word.load(.acquire);
+    if (genOf(w0) != h.gen or stateOf(w0) == .free) return null;
+    const n = @min(@atomicLoad(u8, &s.rid_len, .acquire), buf.len);
+    for (buf[0..n], 0..) |*b, k| b.* = @atomicLoad(u8, &s.rid[k], .acquire);
+    const ptr = @atomicLoad(usize, &s.route_ptr, .acquire);
+    const len = @atomicLoad(usize, &s.route_len, .acquire);
+    if (genOf(s.word.load(.acquire)) != h.gen) return null;
+    const route: []const u8 = if (len == 0) "" else @as([*]const u8, @ptrFromInt(ptr))[0..len];
+    return .{ .rid = buf[0..n], .route = route };
 }
 
 /// The slot a handle of `kind` names, if it could be one: the generation
