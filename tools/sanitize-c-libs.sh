@@ -145,9 +145,14 @@ for lib in "${libs[@]}"; do
       fetch lz4 "lz4/archive"
       # The block and frame fuzzers (Kafka batches use the frame format),
       # for a bounded time, as its own test-fuzzer/test-frametest do.
-      make -C tests -j"$jobs" fuzzer frametest CFLAGS="$san" LDFLAGS="-fsanitize=address,undefined" >/dev/null
-      ./tests/fuzzer -T60s
-      ./tests/frametest -T60s
+      # pointer-overflow is reported but not fatal, as in lz4's own usan
+      # target: its fuzzer places a block at 0x10000 on purpose, and
+      # `base = source - startIndex` (lz4.c) then reaches the null pointer.
+      make -C tests -j"$jobs" fuzzer frametest CFLAGS="$san -fsanitize-recover=pointer-overflow" LDFLAGS="-fsanitize=address,undefined" >/dev/null
+      # halt_on_error=0 lets only that recoverable check through; every
+      # other check stays fatal (-fno-sanitize-recover=undefined).
+      UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=0 ./tests/fuzzer -T60s
+      UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=0 ./tests/frametest -T60s
       ;;
     *)
       echo "unknown library: $lib" >&2
