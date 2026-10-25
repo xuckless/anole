@@ -3,8 +3,9 @@
 //! test allocator of a unit test is backed by `never_reuse.allocator`, so
 //! freed memory is never handed out again and a use after free faults at
 //! once; a unit test fails when zio's `debug_cancel` reports a swallowed
-//! cancellation during it (C3); and a test that runs for 5 minutes is named
-//! and aborted (`watchdog`), so a hang says where it is. The fuzzing loops keep `std.heap.page_allocator` (an mprotect per
+//! cancellation during it (C3); a test that runs for 5 minutes is named
+//! and aborted (`watchdog`), so a hang says where it is; and a failed test
+//! names its error (the server-mode runner printed only the trace). The fuzzing loops keep `std.heap.page_allocator` (an mprotect per
 //! bucket costs a fuzzer's throughput). Re-copy it when moving to the next
 //! Zig version and apply the change again (`ANOLE:` marks it).
 const builtin = @import("builtin");
@@ -220,6 +221,10 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 } else |err| switch (err) {
                     error.SkipZigTest => .skip,
                     else => s: {
+                        // ANOLE: the error's name, which the trace alone
+                        // does not say (a bare `expect` is
+                        // TestUnexpectedResult; a bounded wait TimedOut).
+                        std.debug.print("failed with error.{t}\n", .{err});
                         if (@errorReturnTrace()) |trace| {
                             std.debug.dumpErrorReturnTrace(trace);
                         }
