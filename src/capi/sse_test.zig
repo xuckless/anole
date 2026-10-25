@@ -159,15 +159,18 @@ pub const SseConsumer = struct {
         const ev: *const abi.Event = @ptrCast(@alignCast(rec.ptr));
         switch (@as(abi.EventType, @fromBackingInt(@intCast(ev.type)))) {
             .sse_subscribe => {
-                const i = self.subscribes.fetchAdd(1, .monotonic);
+                // The handle is stored before the count moves: a waiter on
+                // `subscribes` reads it set.
                 const sh = try engine.sseAccept(self.e, ev.handle, &.{self.topic}, &.{}, 0);
+                const i = self.subscribes.load(.monotonic);
                 if (i < self.handles.len) self.handles[i].store(sh, .release);
+                self.subscribes.store(i + 1, .release);
             },
             .sse_close => {
                 const c: *const abi.SseCloseEvent = @ptrCast(@alignCast(rec.ptr));
                 self.last_close_reason.store(c.reason, .release);
                 self.last_close_handle.store(ev.handle, .release);
-                _ = self.closes.fetchAdd(1, .monotonic);
+                _ = self.closes.fetchAdd(1, .release);
             },
             .writable => _ = self.writables.fetchAdd(1, .monotonic),
             else => {},

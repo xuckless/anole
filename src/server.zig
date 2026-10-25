@@ -861,6 +861,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// shows.
         console_resolved: console.Resolved,
         console: ?*console.Console = null,
+        /// The console after its stop, freed by `deinit` once the runtime
+        /// is gone: the drain's executors may still reach its log rings and
+        /// request counters.
+        console_stopped: ?*console.Console = null,
         console_restart: *std.Io.Event,
         console_config_text: []const u8 = "",
         console_runtime: ?[]const u8 = null,
@@ -1901,6 +1905,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             for (self.certs) |cs| cs.deinit();
             if (self.blocking_pool) |p| p.deinit();
             self.rt.deinit();
+            if (comptime features.console) if (self.console_stopped) |stopped| stopped.release();
             server_on_thread = false;
             self.arena.deinit();
             self.gpa.destroy(self.arena);
@@ -3563,6 +3568,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         fn startConsole(self: *Self) void {
             if (comptime !features.console) return;
             if (!self.console_resolved.enabled) return;
+            // A console from an earlier run: that run and its drain are over.
+            if (self.console_stopped) |c| {
+                self.console_stopped = null;
+                c.release();
+            }
             const executors: u32 = @intCast(self.rt.executors.items.len);
             self.console = console.Console.start(.{
                 .gpa = self.gpa,
@@ -3623,6 +3633,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             const c = self.console orelse return;
             self.console = null;
             c.stop(drain);
+            self.console_stopped = c;
         }
 
         /// The bound address of each listener (`http`, `https`, then

@@ -132,6 +132,8 @@ pub const Service = struct {
     acceptor: ?std.Thread = null,
     stop_pipe: [2]sys.fd_t = .{ -1, -1 },
     stopping: std.atomic.Value(bool) = .init(false),
+    /// `stop` ran (the owner's thread only).
+    stopped: bool = false,
     bye_reason: std.atomic.Value(u8) = .init(0),
 
     lock: std.atomic.Mutex = .unlocked,
@@ -189,9 +191,19 @@ pub const Service = struct {
         return self.attached.load(.monotonic);
     }
 
-    /// Stops the threads, closes every client (with `bye`) and removes the
-    /// socket file.
+    /// `stop`, then `destroy`.
     pub fn deinit(self: *Service) void {
+        self.stop();
+        self.destroy();
+    }
+
+    /// Stops the threads, closes every client (with `bye`) and removes the
+    /// socket file. The memory stays for callers that still hold the
+    /// service (`setMetrics`, `attachedCount` from the C ABI's threads)
+    /// until `destroy`.
+    pub fn stop(self: *Service) void {
+        if (self.stopped) return;
+        self.stopped = true;
         self.stopping.store(true, .release);
         _ = sys.write(self.stop_pipe[1], "x") catch {};
         if (self.acceptor) |t| t.join();
@@ -214,6 +226,10 @@ pub const Service = struct {
         }
         sys.close(self.stop_pipe[0]);
         sys.close(self.stop_pipe[1]);
+    }
+
+    /// Frees the service, once nothing can reach it any more (after `stop`).
+    pub fn destroy(self: *Service) void {
         self.metric_arena.deinit();
         self.gpa.destroy(self);
     }
