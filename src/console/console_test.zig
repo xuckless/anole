@@ -537,3 +537,23 @@ test "console: a tap and the request counters taken before stop stay usable unti
     st.count(0, 0, 504, 1000);
     c.release();
 }
+
+// ----------------------------------------------------------- fixtures
+
+test "console: the /h3 fixture of the UI's golden test has the fields the host sends" {
+    const features = @import("build_options");
+    if (comptime !features.http3) return error.SkipZigTest; // no /h3 without HTTP/3
+    const Stats = @import("../h3/server.zig").Stats;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("ui/golden/h3_snapshot.json"), .{});
+    defer parsed.deinit();
+    const endpoints = parsed.value.object.get("endpoints").?.array.items;
+    try std.testing.expect(endpoints.len > 0);
+    // As `host.zig` writes it: `index`, then the stats' fields in order.
+    const names = comptime std.meta.fieldNames(Stats);
+    for (endpoints) |ep| {
+        const keys = ep.object.keys();
+        try std.testing.expectEqual(names.len + 1, keys.len);
+        try std.testing.expectEqualStrings("index", keys[0]);
+        for (names, keys[1..]) |name, key| try std.testing.expectEqualStrings(name, key);
+    }
+}

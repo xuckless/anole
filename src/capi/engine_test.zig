@@ -2040,6 +2040,7 @@ test {
     _ = @import("jobs_test.zig");
     _ = @import("webhooks_test.zig");
     _ = @import("sse_test.zig");
+    _ = @import("console_test.zig");
     _ = @import("watch_test.zig");
     _ = @import("s3_test.zig");
     _ = @import("smtp_test.zig");

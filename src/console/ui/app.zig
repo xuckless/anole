@@ -126,6 +126,9 @@ pub const App = struct {
     lines_head: usize = 0,
     dropped: u64 = 0,
     scroll: usize = 0,
+    /// The columns after the first that a wide table hides (Left/Right);
+    /// the drawing clamps it to what the table needs.
+    hcol: usize = 0,
     log_filter_storage: [5]?[]u8 = @splat(null), // level scope route id grep
     errors: std.ArrayList(ErrorLine) = .empty,
     err_sel: usize = 0,
@@ -464,6 +467,8 @@ pub const App = struct {
                     self.popup_sel += 1;
                 } else self.historyMove(1);
             },
+            .left => self.hcol -|= 1,
+            .right => self.hcol +|= 1,
             .page_up => self.scrollBy(-1),
             .page_down => self.scrollBy(1),
             .home => self.scrollTo(true),
@@ -802,6 +807,7 @@ pub const App = struct {
     fn switchView(self: *App, v: ViewId) void {
         self.view = v;
         self.scroll = 0;
+        self.hcol = 0;
         self.last_snap_ms = -1_000_000; // refresh at the next tick
         if (v != .errors and v != .db and v != .routes) {
             if (self.route_filter) |s| self.gpa.free(s);

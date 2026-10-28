@@ -180,32 +180,56 @@ const Col = struct { title: []const u8, w: u16 = 0, right: bool = false };
 
 /// Header at `y`, rows below; `skip` rows are scrolled off the top; `sel`
 /// highlights one row (an index into `rows`, before skipping).
-fn drawTable(scr: *Screen, x: u16, y: u16, w: u16, h: u16, cols: []const Col, rows: []const []const []const u8, skip: usize, sel: ?usize, row_style: ?[]const Style) void {
+/// A table wider than `w` keeps its first column and hides `hcol.*`
+/// columns after it (Left/Right move it, as htop's process list scrolls
+/// sideways); `hcol.*` is clamped to what the table needs, and ‹ and ›
+/// in the header mark hidden columns.
+fn drawTable(scr: *Screen, x: u16, y: u16, w: u16, h: u16, cols: []const Col, rows: []const []const []const u8, skip: usize, hcol: *usize, sel: ?usize, row_style: ?[]const Style) void {
     if (h == 0 or cols.len == 0) return;
-    var widths: [16]u16 = undefined;
+    var widths: [32]u16 = undefined;
+    const n = @min(cols.len, widths.len);
     const gap: u16 = 2;
     var fixed: u16 = 0;
     var flex: u16 = 0;
-    for (cols, 0..) |c, i| {
-        if (i >= widths.len) break;
+    for (cols[0..n]) |c| {
         if (c.w > 0) fixed += c.w else flex += 1;
     }
-    const gaps: u16 = gap * @as(u16, @intCast(cols.len -| 1));
+    const gaps: u16 = gap * @as(u16, @intCast(n -| 1));
     const rest = w -| fixed -| gaps;
     const flex_w: u16 = if (flex > 0) @max(rest / flex, 6) else 0;
-    for (cols, 0..) |c, i| {
-        if (i >= widths.len) break;
+    var total: u16 = gaps;
+    for (cols[0..n], 0..) |c, i| {
         widths[i] = if (c.w > 0) c.w else flex_w;
+        total +|= widths[i];
     }
+    // Hide columns after the first until the rest fits, at most as many as
+    // asked for.
+    var most: usize = 0;
+    while (most + 2 < n and total > w) : (most += 1) total -|= widths[1 + most] + gap;
+    const hidden = @min(hcol.*, most);
+    hcol.* = hidden;
+    const shown = struct {
+        fn f(i: usize, hid: usize) bool {
+            return i == 0 or i > hid;
+        }
+    }.f;
     // Header.
     var cx = x;
-    for (cols, 0..) |c, i| {
-        if (i >= widths.len) break;
+    var cut_right = false;
+    for (cols[0..n], 0..) |c, i| {
+        if (!shown(i, hidden)) continue;
+        if (cx >= x +| w) {
+            cut_right = true;
+            break;
+        }
         const end = @min(cx +| widths[i], x +| w);
+        if (cx +| widths[i] > x +| w) cut_right = true;
         if (c.right) scr.printRight(end, y, cx, c.title, s_head) else _ = scr.print(cx, y, end, c.title, s_head);
+        if (i == 0 and hidden > 0 and end < x +| w) _ = scr.print(end, y, end + 1, "\u{2039}", s_dim);
         cx = end +| gap;
-        if (cx >= x +| w) break;
     }
+    // In the margin right of the table (every caller leaves one), not over a title.
+    if (cut_right) _ = scr.print(x +| w, y, x +| w +| 1, "\u{203a}", s_dim);
     var r: u16 = 0;
     while (r + 1 < h and skip + r < rows.len) : (r += 1) {
         const idx = skip + r;
@@ -214,13 +238,13 @@ fn drawTable(scr: *Screen, x: u16, y: u16, w: u16, h: u16, cols: []const Col, ro
         const base: Style = if (is_sel) s_sel else if (row_style) |rs| (if (idx < rs.len) rs[idx] else .{}) else .{};
         if (is_sel) scr.fill(x, y + 1 + r, w, 1, ' ', base);
         cx = x;
-        for (cols, 0..) |c, i| {
-            if (i >= widths.len) break;
+        for (cols[0..n], 0..) |c, i| {
+            if (!shown(i, hidden)) continue;
+            if (cx >= x +| w) break;
             const end = @min(cx +| widths[i], x +| w);
             const cell = if (i < row.len) row[i] else "";
             if (c.right) scr.printRight(end, y + 1 + r, cx, cell, base) else _ = scr.print(cx, y + 1 + r, end, cell, base);
             cx = end +| gap;
-            if (cx >= x +| w) break;
         }
     }
 }
@@ -384,7 +408,7 @@ fn drawRequests(app: *App, scr: *Screen, x: u16, y: u16, w: u16, h: u16) void {
     tot[6] = fmtRate(app, tot5);
     table.append(a, tot) catch {};
     const cols = [_]Col{ .{ .title = "METHOD", .w = 7 }, .{ .title = "ROUTE" }, .{ .title = "REQ/S", .w = 8, .right = true }, .{ .title = "P50", .w = 9, .right = true }, .{ .title = "P99", .w = 9, .right = true }, .{ .title = "4XX/S", .w = 7, .right = true }, .{ .title = "5XX/S", .w = 7, .right = true } };
-    drawTable(scr, x + 1, y + 1, w -| 2, h -| 1, &cols, table.items, app.scroll, null, null);
+    drawTable(scr, x + 1, y + 1, w -| 2, h -| 1, &cols, table.items, app.scroll, &app.hcol, null, null);
 }
 
 // ------------------------------------------------------------------ errors
@@ -421,7 +445,7 @@ fn drawErrors(app: *App, scr: *Screen, x: u16, y: u16, w: u16, h: u16) void {
     if (sel_row) |s| {
         if (s >= visible) skip = s + 1 - visible;
     }
-    drawTable(scr, x + 1, y, w -| 2, h, &cols, table.items, skip, sel_row, null);
+    drawTable(scr, x + 1, y, w -| 2, h, &cols, table.items, skip, &app.hcol, sel_row, null);
 }
 
 // ------------------------------------------------------------------- conns
@@ -453,7 +477,7 @@ fn drawConns(app: *App, scr: *Screen, x: u16, y: u16, w: u16, h: u16) void {
     }
     const cols = [_]Col{ .{ .title = "EXEC", .w = 5 }, .{ .title = "CONNS", .w = 7, .right = true }, .{ .title = "H1", .w = 6, .right = true }, .{ .title = "H2", .w = 6, .right = true }, .{ .title = "H3", .w = 6, .right = true }, .{ .title = "WS", .w = 6, .right = true }, .{ .title = "WT", .w = 6, .right = true }, .{ .title = "GRPC", .w = 6, .right = true }, .{ .title = "TASKS", .w = 7, .right = true }, .{ .title = "RUNQ", .w = 6, .right = true } };
     const used: u16 = @intCast(@min(table.items.len + 1, h));
-    drawTable(scr, x + 1, y, w -| 2, used, &cols, table.items, 0, null, null);
+    drawTable(scr, x + 1, y, w -| 2, used, &cols, table.items, 0, &app.hcol, null, null);
     var row: u16 = used + 1;
     if (d.stack_committed_bytes) |b| {
         if (row < h) _ = scr.print(x + 1, y + row, x + w, fmt(app, "stack memory committed: {s}", .{fmtBytes(app, b)}), .{});
@@ -523,7 +547,7 @@ fn drawDb(app: *App, scr: *Screen, x: u16, y: u16, w: u16, h: u16) void {
         table.append(a, cells) catch break;
     }
     const cols = [_]Col{ .{ .title = "SYSTEM", .w = 11 }, .{ .title = "NAME", .w = 10 }, .{ .title = "TARGET" }, .{ .title = "MAX", .w = 5, .right = true }, .{ .title = "OPEN", .w = 5, .right = true }, .{ .title = "IDLE", .w = 5, .right = true }, .{ .title = "USED", .w = 5, .right = true }, .{ .title = "WAIT", .w = 5, .right = true }, .{ .title = "CALLS/S", .w = 8, .right = true }, .{ .title = "P50", .w = 8, .right = true }, .{ .title = "P99", .w = 8, .right = true } };
-    drawTable(scr, x + 1, y, w -| 2, h, &cols, table.items, app.scroll, null, null);
+    drawTable(scr, x + 1, y, w -| 2, h, &cols, table.items, app.scroll, &app.hcol, null, null);
 }
 
 // ---------------------------------------------------------------------- ws
@@ -559,7 +583,7 @@ fn drawWs(app: *App, scr: *Screen, x: u16, y: u16, w: u16, h: u16) void {
         return;
     }
     const cols = [_]Col{ .{ .title = "KIND", .w = 6 }, .{ .title = "NAME" }, .{ .title = "MEMBERS", .w = 8, .right = true }, .{ .title = "QUEUED", .w = 11, .right = true }, .{ .title = "CLOSED SLOW", .w = 11, .right = true } };
-    drawTable(scr, x + 1, y + 2, w -| 2, h -| 2, &cols, table.items, app.scroll, null, null);
+    drawTable(scr, x + 1, y + 2, w -| 2, h -| 2, &cols, table.items, app.scroll, &app.hcol, null, null);
 }
 
 // ---------------------------------------------------------------------- h3
@@ -577,7 +601,7 @@ fn drawH3(app: *App, scr: *Screen, x: u16, y: u16, w: u16, h: u16) void {
     const cols = a.alloc(Col, d.headers.len) catch return;
     for (cols, d.headers) |*c, hd| c.* = .{ .title = hd, .w = @intCast(@min(@max(hd.len + 1, 8), 16)), .right = true };
     if (cols.len > 0) cols[0].right = false;
-    drawTable(scr, x + 1, y, w -| 2, h, cols, d.rows, app.scroll, null, null);
+    drawTable(scr, x + 1, y, w -| 2, h, cols, d.rows, app.scroll, &app.hcol, null, null);
 }
 
 // ----------------------------------------------------------------- runtime
@@ -674,7 +698,7 @@ fn drawRoutes(app: *App, scr: *Screen, x: u16, y: u16, w: u16, h: u16) void {
         return;
     }
     const cols = [_]Col{ .{ .title = "METHOD", .w = 7 }, .{ .title = "PATTERN" }, .{ .title = "FLAGS", .w = 20 }, .{ .title = "MIDDLEWARE", .w = 10, .right = true } };
-    drawTable(scr, x + 1, y, w -| 2, h, &cols, table.items, app.scroll, null, null);
+    drawTable(scr, x + 1, y, w -| 2, h, &cols, table.items, app.scroll, &app.hcol, null, null);
 }
 
 // -------------------------------------------------------------------- help
@@ -758,8 +782,8 @@ fn drawFooter(app: *App, scr: *Screen) void {
         return;
     }
     const hint = if (app.mode == .in_process)
-        "Esc back to plain logs \u{00b7} Tab complete \u{00b7} \u{2191}\u{2193} history \u{00b7} PgUp/PgDn scroll \u{00b7} Ctrl-C stop the server"
+        "Esc back to plain logs \u{00b7} Tab complete \u{00b7} \u{2191}\u{2193} history \u{00b7} PgUp/PgDn \u{2190}\u{2192} scroll \u{00b7} Ctrl-C stop the server"
     else
-        "Tab complete \u{00b7} \u{2191}\u{2193} history \u{00b7} PgUp/PgDn scroll \u{00b7} /quit or Ctrl-C leave (the app keeps running)";
+        "Tab complete \u{00b7} \u{2191}\u{2193} history \u{00b7} PgUp/PgDn \u{2190}\u{2192} scroll \u{00b7} /quit or Ctrl-C leave (the app keeps running)";
     _ = scr.print(1, y, scr.cols, hint, s_dim);
 }

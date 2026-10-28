@@ -7,9 +7,19 @@ const placement = @import("placement.zig");
 /// Executors counted; any beyond this share the last slot.
 pub const max_executors = 64;
 
-pub const Kind = enum { connections, h2_streams, h3_streams };
+pub const Kind = enum {
+    connections,
+    h2_streams,
+    h3_streams,
+    /// Open WebSockets, by the protocol underneath (RFC 6455, 8441, 9220).
+    ws_h1,
+    ws_h2,
+    ws_h3,
+    /// Open WebTransport sessions a server accepted.
+    wt_sessions,
+};
 
-var counts: [3][max_executors]std.atomic.Value(i64) = @splat(@splat(.init(0)));
+var counts: [@typeInfo(Kind).@"enum".field_names.len][max_executors]std.atomic.Value(i64) = @splat(@splat(.init(0)));
 
 fn slot(io: std.Io) usize {
     return @min(placement.currentExecutor(io) orelse 0, max_executors - 1);

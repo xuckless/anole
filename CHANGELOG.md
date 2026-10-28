@@ -12,6 +12,21 @@ breaking changes are listed anyway.
   stop could free the runtime while that wake was still under way. The stop
   now waits for wakes under way before it frees the runtime, and a wake
   after that is skipped.
+- Console: log records from bindings (`anole_console_log`) carry their
+  request's id and route; the `req` argument was ignored.
+- Console: `/ws` shows the open WebSockets by protocol, accepted WebTransport
+  sessions, the rooms (members, queued bytes, members closed as slow) and
+  the SSE topics; `/db` shows PostgreSQL's target and every executor's pool.
+  Both are collected by a task on the runtime, under the runtime's locks,
+  which the console's own threads must not take.
+- Console: text in most scripts lines up. Character widths come from a table
+  generated from Unicode 16.0.0 (`tools/gen-width-table.py`); the
+  hand-picked subset missed the combining marks of Bengali, Tamil and other
+  scripts.
+- Console: a table wider than the terminal scrolls sideways with Left/Right,
+  a column at a time, keeping its first column; ‹ and › mark hidden
+  columns. `/h3` showed 8 of its 15 columns at 100 columns wide, with no
+  sign that more existed (#119).
 
 ## 0.4.0 (2026-10-25)
 

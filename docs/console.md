@@ -42,7 +42,7 @@ terminal, 8 not available on this OS.
 | `/errors [route=]` | the last 256 5xx answers; Enter jumps to `/logs id=...` |
 | `/conns` | per executor: connections, streams, tasks, run queue; listeners |
 | `/db [name]` | per database: pool size, open, idle, in use |
-| `/ws` | WebSocket counts (not collected yet: shows a notice) |
+| `/ws` | open WebSockets by protocol, WebTransport sessions, rooms (members, queued bytes, members closed as slow), SSE topics (subscribers) |
 | `/h3` | per HTTP/3 endpoint counters |
 | `/runtime` | RSS, CPU, threads, descriptors, versions, the binding's language metrics |
 | `/config` | resolved environment and deployment, options (secrets redacted), `.env` files (names and counts), features |
@@ -55,7 +55,9 @@ terminal, 8 not available on this OS.
 | `/help`, `/quit`, `/exit` | |
 
 Keys: Enter runs, Tab completes, Esc closes the popup then clears the input,
-Up/Down history, PgUp/PgDn/Home/End scroll, Ctrl-L redraws, Ctrl-Z suspends.
+Up/Down history, PgUp/PgDn/Home/End scroll, Left/Right scroll a table wider
+than the terminal by a column (the first column stays; ‹ and › in its header
+mark hidden columns), Ctrl-L redraws, Ctrl-Z suspends.
 `NO_COLOR` turns colour off; `TERM=dumb` refuses the interactive console.
 
 ## What is collected, and what it costs
@@ -68,8 +70,15 @@ Up/Down history, PgUp/PgDn/Home/End scroll, Ctrl-L redraws, Ctrl-Z suspends.
 - Per-route numbers (counts, status classes, a 98-bucket latency histogram)
   are collected only while a console shows `/requests`: one relaxed load per
   request otherwise. Latency of a 5xx kept while nobody collects is 0.
-- Connections, streams, tasks and run queues come from the runtime's
-  always-on gauges; database pools are read when `/db` asks.
+- Connections, streams, open WebSockets and WebTransport sessions, tasks and
+  run queues come from the runtime's always-on gauges.
+- Rooms, SSE topics and database pools are read when `/ws` or `/db` asks, by
+  a task of the server's runtime under the locks they live behind (the
+  console's own threads never take the runtime's locks); a room or hub busy
+  at that moment is skipped until the next refresh, and a runtime too busy
+  to answer within 200 ms shows the view as unavailable for that refresh.
+  PostgreSQL pools show their size, open, idle and in use (pg counts no
+  waiters).
 
 ## The control socket
 

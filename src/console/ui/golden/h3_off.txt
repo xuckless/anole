@@ -27,4 +27,4 @@
                                                                                                     
 ────────────────────────────────────────────────────────────────────────────────────────────────────
  >                                                                                                  
- Tab complete · ↑↓ history · PgUp/PgDn scroll · /quit or Ctrl-C leave (the app keeps running)       
+ Tab complete · ↑↓ history · PgUp/PgDn ←→ scroll · /quit or Ctrl-C leave (the app keeps running)    
