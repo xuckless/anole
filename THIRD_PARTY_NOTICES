@@ -23,11 +23,13 @@ A. Fetched packages
 zio (async runtime)
   Licence:  MIT. Copyright (c) 2025 Lukas Lalinsky
   Source:   https://github.com/lalinsky/zio, used through Anole's fork
-            https://github.com/xuckless/zio (branch anole:
-            upstream main 035d245 plus Anole's accept, spawn-cache,
-            idle-stack, recvmmsg-with-control and Windows patches; some are
-            open upstream as lalinsky/zio #837, #838 and #850)
-  Pinned:   commit b4974873565677327cb45f8731b4f393ff637bad of the fork
+            https://github.com/xuckless/zio (branch anole-diag: branch
+            anole, which is upstream main 035d245 plus Anole's accept,
+            spawn-cache, idle-stack, recvmmsg-with-control, Windows,
+            diagnostics, held-lock and swallowed-cancel patches, some open
+            upstream as lalinsky/zio #837, #838 and #850; plus the task dump
+            and the executor stall watchdog, src/diag.zig)
+  Pinned:   commit 1dbfd100eee25b52d6bf4d6bf7fc590f33ee06cb of the fork
   Linked:   always
 
 nghttp2 1.70.0 (HTTP/2)

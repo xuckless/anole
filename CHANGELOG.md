@@ -55,6 +55,17 @@ breaking changes are listed anyway.
   test held the build until the runner's own 300 s limit, and the report
   said nothing about where it hung. `zig build hang-probe` shows a dump
   (`ANOLE_TEST_DUMP_AFTER` sets the threshold in seconds).
+- Tests: the hang dump also lists every live zio task after the thread
+  backtraces, with each suspended task's stack. A task waiting forever is on
+  no thread's stack, so the backtraces alone showed only executors parked
+  in their event loops. zio (the fork's `anole-diag` branch) keeps a list of
+  the live tasks per executor and a registry of its runtimes in Debug and
+  test builds, and walks each suspended task's saved frame pointers.
+- Debug and test builds: an executor that has not passed its scheduler for
+  200 ms while tasks wait in its run queue is reported once per stall (at
+  most 5 reports a minute per runtime), with what it runs and, on Linux and
+  macOS, that code's stack, taken with SIGURG. A warning only; nothing
+  fails on it. Release builds have neither the watchdog nor the task list.
 - Tests: a passing test's log lines are not printed. The runner holds a
   test's log lines and prints them only when the test fails, leaks, logs
   an error or crashes (a panic, SIGSEGV, SIGBUS, SIGILL, SIGFPE or SIGABRT),
