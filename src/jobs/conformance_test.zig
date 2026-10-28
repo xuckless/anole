@@ -601,6 +601,9 @@ fn Suite(comptime B: Backend) type {
             _ = try producer.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":1}", .{});
             try wait.waitAtLeast(io, "the woken worker ran the job", &wake_hits, 1);
             try std.testing.expectEqual(@as(u32, 1), wake_hits.load(.acquire));
+            // The run alone could be the startup kick's claim finding the
+            // job: the insert's NOTIFY or PUBLISH must have arrived too.
+            try wait.waitAtLeast(io, "the enqueue's wake reached the worker", &worker.wake_kicks, 2);
         }
 
         test "jobs: adminRoutes registers on a group" {
