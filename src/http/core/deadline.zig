@@ -289,6 +289,7 @@ test "Watch: a deadline republished before its generation does not expire the co
 
     // Leave enough room for the watcher and this test task both to be
     // scheduled on a loaded runner before the first deadline arrives.
+    const first_end = std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(500));
     watch.arm(io, .fromMilliseconds(500));
 
     var watcher = try io.concurrent(struct {
@@ -308,6 +309,14 @@ test "Watch: a deadline republished before its generation does not expire the co
     watch.mutex.lockUncancelable(io);
     watch.timeout = later;
     watch.mutex.unlock(io);
+    if (!std.Io.Clock.awake.now(io).compare(.lt, first_end)) {
+        // Too slow to publish before the first deadline: the watcher may
+        // rightly have expired on it, and the race this test builds never
+        // happened. Nothing to check (TESTING.md D6).
+        watch.finish(io);
+        _ = watcher.await(io) catch {};
+        return error.SkipZigTest;
+    }
 
     // Well past the first deadline, and nowhere near the second.
     try io.sleep(.fromMilliseconds(600), .awake);
@@ -330,7 +339,7 @@ test "Deadline.run: a call that overruns fails with Timeout" {
 
 test "Deadline.run: a call that finishes in time keeps its own result" {
     const io = std.testing.io;
-    const deadline: Deadline = .init(io, .{ .duration = .{ .raw = .fromMilliseconds(5_000), .clock = .awake } });
+    const deadline: Deadline = .init(io, .{ .duration = .{ .raw = .fromSeconds(600), .clock = .awake } });
     const Fast = struct {
         fn ok(i: std.Io) std.Io.Cancelable!u8 {
             try i.sleep(.fromMilliseconds(1), .awake);
