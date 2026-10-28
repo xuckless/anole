@@ -5,8 +5,10 @@
 //! once; a unit test fails when zio's `debug_cancel` reports a swallowed
 //! cancellation during it (C3); a test that runs past 110 s is named and
 //! every thread's backtrace is dumped before the build runner's
-//! `--test-timeout` kills it (`watchdog`, TESTING.md D2), so a hang says
-//! where it is; a test's log lines are printed only when it fails or
+//! `--test-timeout` kills it (`watchdog`, TESTING.md D2), followed by
+//! every live zio task and the stack of each suspended one
+//! (`zio.dumpTasks`), so a hang says where it is; a test's log lines are
+//! printed only when it fails or
 //! crashes (`captured`, flushed by the panic handler, `debug.handleSegfault`
 //! and a SIGABRT handler); a failed test names its error (the
 //! server-mode runner printed only the trace); and a run with
@@ -170,11 +172,15 @@ const watchdog = struct {
         }
     }
 
-    /// The test's name, its log so far, then every thread's backtrace.
+    /// The test's name, its log so far, every thread's backtrace, then
+    /// every zio task's (`dumpTasks`).
     fn dump(name: []const u8, elapsed: u64) void {
         std.debug.print("\ntest '{s}' has run for {d} s: taken for a hang\n", .{ name, elapsed / std.time.ns_per_s });
         captured.show("its log so far");
-        if (comptime !can_dump) return;
+        if (comptime !can_dump) {
+            dumpTasks();
+            return;
+        }
         dieOnSigterm();
         const pid = getpid();
         var pid_buf: [16]u8 = undefined;
@@ -202,7 +208,26 @@ const watchdog = struct {
         endDump(name);
     }
 
+    /// The thread backtraces show what each executor thread runs; a task
+    /// suspended in a wait is on no thread's stack, so a hang that is a task
+    /// waiting forever shows only here. zio keeps a registry of its runtimes
+    /// (the `diagnostics` option, Debug and test builds) and walks each
+    /// suspended task's saved frame pointers (`zio.dumpTasks`; it waits at
+    /// most 2 s for any of its locks). Written with the runner's own Io
+    /// straight to stderr, not through std.debug's stderr lock, which a hung
+    /// test may hold. The symbolizer's own lock (std.debug.SelfInfo) is
+    /// still taken; the raw addresses go out before it, on each task's line.
+    fn dumpTasks() void {
+        var buf: [4096]u8 = undefined;
+        var fw = Io.File.stderr().writerStreaming(runner_threaded_io, &buf);
+        hooks.dumpTasks(&fw.interface);
+        fw.interface.flush() catch {};
+    }
+
     fn endDump(name: []const u8) void {
+        // After the debugger has detached: the dump reads task stacks
+        // while the threads run again.
+        dumpTasks();
         std.debug.print("hang dump of '{s}' ends here; --test-timeout (SIGTERM) or the {d} s backstop ends the test\n", .{ name, abort_after_ns / std.time.ns_per_s });
     }
 

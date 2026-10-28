@@ -9,7 +9,7 @@ that happens promptly.
 
 | Component | Pinned in | Form |
 | --- | --- | --- |
-| zio | build.zig.zon | commit of the xuckless/zio fork, branch `anole` |
+| zio | build.zig.zon | commit of the xuckless/zio fork, branch `anole` (for now `anole-diag`, see below) |
 | HTTP core (from dusty) | src/http/core | Anole code since 2026-10-20; see "The HTTP core" below |
 | nghttp2 1.70.0 | build.zig.zon | commit of the xuckless/nghttp2 fork, branch `anole` (tarball) |
 | BoringSSL | build.zig.zon | upstream commit tarball, compiled by `build/boringssl.zig` |
@@ -175,6 +175,19 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   in lalinsky/zio#837, which Anole turns on in `build.zig` and
   `anole.zio_options`. The bench suite's `conns` and `raw` scenarios measure
   them.
+  Anole pins the fork's `anole-diag` branch for now: `anole` plus the task
+  dump and the executor stall watchdog (src/diag.zig in the fork), behind
+  `diagnostics` and compiled only in Debug and test builds. Every task is
+  on its spawn executor's list from `AnyTask.create` until it finishes;
+  `zio.dumpTasks` walks each suspended task's saved frame pointers, and the
+  test runner prints it after the thread backtraces of a hang dump
+  (src/safety/test_hooks.zig). A watchdog thread per runtime reports an
+  executor that has not passed its scheduler (`getNextTask`) for
+  `RuntimeOptions.stall_watchdog.threshold` (200 ms) while its run queue
+  holds tasks, taking the stack with SIGURG on Linux and macOS. Run the
+  fork's suite with `--diagnostics` too (`./check.sh --diagnostics` and
+  `./check.sh --scheduling pinned --diagnostics`). Fork only, not offered
+  upstream (user, 2026-10-28).
   Anole requires the fork's declarations and fails to compile without them
   (src/http/core/placement.zig, top): `Placement`, `Group` (with
   `spawnInto`), `AutoCancel` (with its `task` field), `currentTask`, `Event`,

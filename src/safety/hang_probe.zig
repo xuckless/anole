@@ -5,12 +5,16 @@
 //! shows the hung test by name, its log, every thread's backtrace (the main
 //! thread and a helper, both in `blockForever`), the build runner's timeout
 //! report; then the same for a test whose teardown hangs (the test Io's
-//! deinit waits for a task it left behind); and then the last test passing
-//! in a new process. The hung test
+//! deinit waits for a task it left behind); then a test whose hang is a zio
+//! task suspended forever in a wait, which no thread backtrace shows: the
+//! zio task dump after the backtraces lists it with its stack, down to
+//! `probeTaskWaitsForever`; and then the last test passing in a new
+//! process. The hung test
 //! ignores SIGTERM, as a hung server test holding zio's drain handler
 //! would: the runner must still die on the build runner's SIGTERM, or the
 //! build waits for the 300 s backstop.
 const std = @import("std");
+const zio = @import("zio");
 
 /// Never changes, so a futex wait on it never returns.
 var never: u32 = 0;
@@ -43,6 +47,22 @@ test "hang probe: a hang in the test's teardown is dumped too" {
     // `testing.io_instance.deinit()` after the test waits for it forever,
     // still inside the build runner's per-test limit.
     _ = try std.testing.io.concurrent(blockForever, .{});
+}
+
+/// Waits on an event nobody sets. Not inlined, so the dump names it.
+noinline fn probeTaskWaitsForever(event: *zio.Event) !void {
+    try event.wait();
+}
+
+test "hang probe: a zio task suspended forever is in the task dump with its stack" {
+    std.log.warn("hang probe: the zio task dump after the thread backtraces shows probeTaskWaitsForever", .{});
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var event: zio.Event = .init;
+    var handle = try rt.spawn(probeTaskWaitsForever, .{&event});
+    // The main thread parks in its executor's event loop; the task waits
+    // in `event.wait()` on its own stack.
+    try handle.join();
 }
 
 test "hang probe: the run goes on with the next test" {

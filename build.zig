@@ -798,10 +798,12 @@ pub fn build(b: *std.Build) void {
     // The hang probe (src/safety/hang_probe.zig): a test that never returns,
     // to see the runner's hang dump work. `-Dhang-probe=true` adds it to
     // `test`; `zig build hang-probe` runs it alone. Both fail by design.
+    // It imports Anole's zio for the test whose hang is a task suspended
+    // forever, which the runner finds through zio's task dump.
     {
         const probe = addSafeTest(b, .{
             .name = "hang-probe",
-            .root_module = b.createModule(.{ .root_source_file = b.path("src/safety/hang_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+            .root_module = b.createModule(.{ .root_source_file = b.path("src/safety/hang_probe.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "zio", .module = core.zio }} }),
             .use_llvm = use_llvm,
         });
         const run_probe = b.addRunArtifact(probe);
@@ -2015,6 +2017,9 @@ fn addSafeTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Co
     var o = options;
     o.test_runner = .{ .path = b.path("src/safety/test_runner.zig"), .mode = .server };
     const m = o.root_module;
+    // Frame pointers in every mode (Debug keeps them anyway): the hang
+    // dump's task stacks (zio.dumpTasks) and zio's stall reports walk them.
+    if (m.omit_frame_pointer == null) m.omit_frame_pointer = false;
     if (m.import_table.get("anole_test_hooks") == null) {
         const zio_mod: ?*std.Build.Module = m.import_table.get("zio") orelse
             if (m.import_table.get("anole")) |a| a.import_table.get("zio") else null;
