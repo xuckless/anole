@@ -2806,22 +2806,26 @@ static void test_db_request_tie(void) {
   on_h.req = h;
   CHECK(anole_db_query(db, c, some, NULL, 0, &on_h, 2) == ANOLE_OK); /* the request's own consumer, named */
   CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
+  /* a stale request: GONE from the call as soon as it is answered (its
+     executor has yet to write the answer and free the slot), and after,
+     nothing queued */
+  CHECK(anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, &on_h, 3) == ANOLE_E_GONE && name_is("Gone"));
   CHECK(finish_get(a, t, NULL) == 200);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 2 && r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 20000);
-
-  /* a stale request: GONE from the call, nothing queued. Its executor
-     frees the slot once the answer is written, which can be after the
-     client has it: until then the call is still taken (its result is
-     read here). */
-  int st;
-  for (double until = wait_until(); (st = anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, &on_h, 3)) == ANOLE_OK;) {
-    r = db_next(c, rec, sizeof rec);
-    CHECK(r->user_data == 3);
-    CHECK(now_ms() < until);
-    usleep(1000);
-  }
-  CHECK(st == ANOLE_E_GONE && name_is("Gone"));
+  CHECK(anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, &on_h, 3) == ANOLE_E_GONE && name_is("Gone"));
+  CHECK(count_events(c, ANOLE_EV_DB_RESULT, 100) == 0);
+  /* a streamed answer: owed until its end, GONE from then on */
+  a = start_get(port, "/hold", &t);
+  h = next_request(c);
+  on_h.req = h;
+  CHECK(anole_req_stream_start(h, 200, NULL, 0) == ANOLE_OK);
+  CHECK(anole_db_query(db, NULL, LIT("SELECT 8"), NULL, 0, &on_h, 8) == ANOLE_OK);
+  r = db_next(c, rec, sizeof rec);
+  CHECK(r->user_data == 8 && r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 8);
+  CHECK(anole_req_stream_end(h, NULL, 0) == ANOLE_OK);
+  CHECK(anole_db_query(db, NULL, LIT("SELECT 9"), NULL, 0, &on_h, 9) == ANOLE_E_GONE && name_is("Gone"));
+  CHECK(finish_get(a, t, NULL) == 200);
   CHECK(count_events(c, ANOLE_EV_DB_RESULT, 100) == 0);
   /* another kind of handle, and a NULL consumer without a request */
   anole_db_options on_ws = {sizeof on_ws};
@@ -2854,16 +2858,9 @@ static void test_db_request_tie(void) {
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 11 && r->status == ANOLE_OK);
   CHECK(finish_get(a, t, NULL) == 504);
-  /* The transaction ends on its executor after the 504 is written: until
-     then a statement is still taken (and rolled back with it). */
-  int st2;
-  for (double until = wait_until(); (st2 = anole_db_tx_exec(tx, LIT("INSERT INTO tt VALUES (2)"), NULL, 0, NULL, 12)) == ANOLE_OK;) {
-    r = db_next(c, rec, sizeof rec);
-    CHECK(r->user_data == 12);
-    CHECK(now_ms() < until);
-    usleep(1000);
-  }
-  CHECK(st2 == ANOLE_E_GONE);
+  /* its request ended before the 504 went out: GONE at once, though its
+     task may not have rolled it back yet */
+  CHECK(anole_db_tx_exec(tx, LIT("INSERT INTO tt VALUES (2)"), NULL, 0, NULL, 12) == ANOLE_E_GONE);
   CHECK(db_count(db, c, "tt", 13) == 0);
 
   /* ... and survives the request's answer, bounded by its own timeout */
