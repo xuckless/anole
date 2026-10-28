@@ -10,8 +10,10 @@ breaking changes are listed anyway.
 - S3: `put(c, key, .request, opts)` with a request body larger than
   `limits.body_max` answered 400; it now fails with `error.BodyTooBig`, a
   413 Content Too Large (RFC 9110 §15.5.14), as the server's own body
-  readers answer it. `anole.db.lastError(req)` still says `body_too_big`,
-  and the connection closes after the answer since the body is unread.
+  readers answer it. `anole.db.lastError(req)` still says `body_too_big`.
+  Over HTTP/1.1 the rest of the body is then drained, or the connection
+  closed when it is too long to drain; over HTTP/2 and HTTP/3 the stream is
+  reset.
 - S3: the C ABI's `anole_s3_serve` ignored the request's
   If-Unmodified-Since; it now forwards it as the Zig `serve` does, so an
   object changed since that date answers 412 (RFC 9110 §13.2.2; a true

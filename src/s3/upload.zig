@@ -780,9 +780,10 @@ fn requestErr(cl: *Client, c: anytype, err: anyerror) root.PutError {
         error.Canceled => error.Canceled,
         error.OutOfMemory => error.OutOfMemory,
         // The request's fault, answered as the core answers a body over
-        // its limit: 413 (RFC 9110 15.5.14), and the connection closes
-        // after it since the rest of the body is unread. `lastError` still
-        // says why.
+        // its limit: 413 (RFC 9110 15.5.14). The core then drains the rest
+        // of the body over HTTP/1.1 or closes the connection when it is too
+        // long to drain; HTTP/2 and HTTP/3 reset the stream. `lastError`
+        // still says why.
         error.BodyTooBig => {
             cl.failOur(c, .invalid, "body_too_big", "the request body is larger than limits.body_max") catch {};
             return error.BodyTooBig;
