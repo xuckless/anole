@@ -78,8 +78,24 @@ Instances need synchronized clocks (NTP); every time written comes from
 ## Drain
 
 At shutdown the workers stop claiming; running jobs get the drain
-deadline, then are put back as available with the attempt not counted.
-Under `deployment = lambda` the queue only enqueues.
+deadline (`drain_timeout`, 10 s), then their tasks are canceled and they are
+put back as available with the attempt not counted. The queue waits its own
+`drain_timeout` even when the HTTP side has finished draining sooner. A run
+that finished before the cancel keeps its outcome: its state write goes on
+for up to 3 s past the deadline. Under `deployment = lambda` the queue only
+enqueues.
+
+The cancel reaches a handler at its next wait (a database call, a request,
+a sleep). A handler that catches `error.Canceled` and returns success anyway
+is recorded as completed, so let the error go up, or return it.
+
+The longest stop is the longer of `timeouts.shutdown` (the HTTP drain) and
+`drain_timeout` + 3 s. Give the service manager more than that before it
+kills the process: `TimeoutStopSec` in systemd (see
+[server.md](server.md#zero-downtime-restart-and-socket-activation)), `terminationGracePeriodSeconds` in
+Kubernetes (30 s by default), the stop timeout of `docker stop` (10 s by
+default, `--time`). A process killed earlier leaves its running jobs held
+until their lease lapses; they then run again.
 
 ## Admin
 
@@ -120,7 +136,9 @@ the log). A memory or Redis store has no transactions.
 With `app.metrics()` the queue reports `anole_jobs_enqueued_total`,
 `anole_jobs_duplicates_total`, `anole_jobs_finished_total{outcome}`,
 `anole_jobs_run_seconds`, `anole_jobs_running`, `anole_jobs_queued{state}` (the
-leader, every 15 s), `anole_jobs_rescued_total`, `anole_jobs_leader` and
+leader, every 15 s), `anole_jobs_rescued_total`,
+`anole_jobs_outcome_unsaved_total` (runs that finished but whose state could
+not be saved: they run again after their lease), `anole_jobs_leader` and
 `anole_cron_enqueued_total`. `kind` and `name` take 256 distinct values; later
 ones read `other`.
 

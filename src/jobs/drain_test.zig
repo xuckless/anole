@@ -146,3 +146,123 @@ test "jobs: a run that returned before the drain marked it interrupted keeps its
     var f = try io.concurrent(lateDrainCheck, .{io});
     try f.await(io);
 }
+
+/// A job that runs until canceled, in an App whose HTTP side has nothing
+/// to drain: `run` returns at once, and the queue's own drain must still
+/// give the job its `drain_timeout`.
+const UntilCanceled = struct {
+    var io: std.Io = undefined;
+    var started: std.atomic.Value(bool) = .init(false);
+    var stopped_at: std.atomic.Value(i64) = .init(0);
+    var canceled_after_ns: std.atomic.Value(i64) = .init(-1);
+    var never: std.Io.Event = .unset;
+
+    fn run(job: *root.Job) anyerror!void {
+        _ = job;
+        started.store(true, .release);
+        never.wait(io) catch |err| {
+            const now: i64 = @intCast(std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds);
+            canceled_after_ns.store(now - stopped_at.load(.acquire), .release);
+            return err;
+        };
+    }
+
+    fn check(a: *anole.App) !void {
+        defer {
+            stopped_at.store(@intCast(std.Io.Clock.Timestamp.now(a.io(), .awake).raw.nanoseconds), .release);
+            a.stop();
+        }
+        try a.waitReady();
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var ctx: anole.db.Ctx = .{ .io = a.io(), .arena = arena.allocator() };
+        _ = try jc.enqueueRaw(&ctx, kind.name, "{}", .{});
+        try waitFor(a.io(), isStarted, .{});
+    }
+
+    fn isStarted() bool {
+        return started.load(.acquire);
+    }
+
+    var jc: *root.Client = undefined;
+};
+
+test "jobs: with no connection to drain, a running job still gets the queue's drain_timeout" {
+    var app = try anole.App.init(gpa, .{ .executors = .exact(2), .listen_tls_http3 = false });
+    UntilCanceled.io = app.io();
+    UntilCanceled.started.store(false, .release);
+    UntilCanceled.canceled_after_ns.store(-1, .release);
+    UntilCanceled.never = .unset;
+    UntilCanceled.jc = try app.jobs(.{ .store = .memory, .drain_timeout = .fromSeconds(1) });
+    try UntilCanceled.jc.handleRaw(&app, kind, .{}, UntilCanceled.run);
+    var checking = try app.io().concurrent(UntilCanceled.check, .{&app});
+    try app.listen("127.0.0.1:0");
+    try checking.await(app.io());
+    app.deinit();
+    const after = UntilCanceled.canceled_after_ns.load(.acquire);
+    // Canceled, and not before the drain_timeout ran out.
+    try std.testing.expect(after >= 0);
+    try std.testing.expect(after >= 900 * std.time.ns_per_ms);
+}
+
+/// The store's `finish` always fails.
+const FailingFinish = struct {
+    var orig: *const store.VTable = undefined;
+    var vt: store.VTable = undefined;
+    var runs: std.atomic.Value(u32) = .init(0);
+
+    fn install(client: *root.Client) void {
+        runs.store(0, .release);
+        orig = client.backend.vt;
+        vt = orig.*;
+        vt.finish = finish;
+        client.backend.vt = &vt;
+    }
+
+    fn finish(_: *anyopaque, _: store.Finish) anyerror!bool {
+        return error.ConnectionRefused;
+    }
+
+    fn run(_: ?*anyopaque, _: *root.Job) anyerror!void {
+        _ = runs.fetchAdd(1, .acq_rel);
+    }
+};
+
+fn unsavedCount(registry: *anole.observe.metrics.Registry) u64 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    registry.render(&out.writer) catch return 0;
+    const needle = "anole_jobs_outcome_unsaved_total{queue=\"default\",kind=\"t.drain\"} ";
+    const at = std.mem.indexOf(u8, out.written(), needle) orelse return 0;
+    const rest = out.written()[at + needle.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    return std.fmt.parseInt(u64, rest[0..end], 10) catch 0;
+}
+
+fn unsavedCheck(io: std.Io) !void {
+    var registry: anole.observe.metrics.Registry = .init(gpa, io);
+    defer registry.deinit();
+    const client = try root.Client.init(gpa, io, .{ .store = .memory });
+    defer client.deinit();
+    FailingFinish.install(client);
+    try client.addHandler(kind, null, FailingFinish.run);
+    try client.start(&registry, null, null);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var ctx: anole.db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    _ = try client.enqueueRaw(&ctx, kind.name, "{}", .{});
+    // Three tries, 50 + 100 ms apart, then the run counts as unsaved.
+    for (0..10_000) |_| {
+        if (unsavedCount(&registry) >= 1) break;
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    } else return error.NeverCounted;
+    try std.testing.expectEqual(@as(u64, 1), unsavedCount(&registry));
+}
+
+test "jobs: a run whose outcome could not be saved is counted in anole_jobs_outcome_unsaved_total" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(unsavedCheck, .{io});
+    try f.await(io);
+}

@@ -18,6 +18,7 @@ pub const Series = struct {
     running: *m.Family(m.Gauge),
     queued: *m.Family(m.Gauge),
     rescued: *m.Family(m.Counter),
+    unsaved: *m.Family(m.Counter),
     leader: *m.Family(m.Gauge),
     cron_enqueued: *m.Family(m.Counter),
     lock: std.atomic.Mutex = .unlocked,
@@ -35,6 +36,7 @@ pub const Series = struct {
             .running = try registry.gauge("anole_jobs_running", "Jobs running in this process.", &.{"queue"}),
             .queued = try registry.gauge("anole_jobs_queued", "Jobs in the store by state (the leader reports).", &.{ "queue", "state" }),
             .rescued = try registry.counter("anole_jobs_rescued_total", "Jobs put back after their lease lapsed.", &.{"queue"}),
+            .unsaved = try registry.counter("anole_jobs_outcome_unsaved_total", "Runs whose outcome could not be saved; they run again after their lease.", &.{ "queue", "kind" }),
             .leader = try registry.gauge("anole_jobs_leader", "1 while this process leads schedules and maintenance.", &.{}),
             .cron_enqueued = try registry.counter("anole_cron_enqueued_total", "Jobs enqueued by cron schedules.", &.{"name"}),
         };
@@ -70,6 +72,10 @@ pub const Series = struct {
         const k = self.cap(&self.kinds, kind);
         self.finished.with(&.{ queue, k, @tagName(outcome) }).inc();
         self.run_seconds.with(&.{ queue, k }).observeDuration(took);
+    }
+
+    pub fn onUnsaved(self: *Series, queue: []const u8, kind: []const u8) void {
+        self.unsaved.with(&.{ queue, self.cap(&self.kinds, kind) }).inc();
     }
 
     pub fn onCron(self: *Series, name: []const u8) void {

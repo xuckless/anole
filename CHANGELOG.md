@@ -14,6 +14,14 @@ breaking changes are listed anyway.
   after its handler had returned, which put it back. The write now runs to
   its end (at most 5 s, or until the drain stops waiting for canceled runs,
   3 s past its deadline), and a handler that returned keeps its outcome.
+- Jobs: in an app, running jobs lost their `drain_timeout` when the HTTP
+  side finished draining first (with no connection open, at once): the
+  app's teardown canceled the queue's drain. A drain under way is now
+  waited for.
+- Jobs: `anole_jobs_outcome_unsaved_total{queue,kind}` counts runs that
+  finished but whose state could not be saved (they run again after their
+  lease). docs/jobs.md gives the longest stop to plan the service manager's
+  stop timeout around.
 
 ## 0.4.0 (2026-10-25)
 

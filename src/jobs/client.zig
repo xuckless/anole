@@ -100,6 +100,8 @@ pub const Client = struct {
     group: std.Io.Group = .init,
     maint_signal: placement.Signal = .{},
     draining: std.atomic.Value(bool) = .init(false),
+    /// Set when the drain has ended; a later `drain` waits for it.
+    drained: std.Io.Event = .unset,
     started: bool = false,
     is_leader: std.atomic.Value(bool) = .init(false),
     rr: std.atomic.Value(usize) = .init(0),
@@ -165,7 +167,8 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         self.closing.store(true, .release);
-        if (self.started and !self.draining.load(.acquire)) {
+        // A drain under way (the server's) is waited for, not cut short.
+        if (self.started) {
             self.drain(std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = .fromSeconds(10), .clock = .awake }));
         }
         self.group.cancel(self.io);
@@ -386,10 +389,15 @@ pub const Client = struct {
         return n;
     }
 
-    /// Stops claiming; running jobs finish by `deadline`, then are put back (J14).
+    /// Stops claiming; running jobs finish by `deadline`, then are put back
+    /// (J14). A call while a drain runs waits for that one to end.
     pub fn drain(self: *Client, deadline: std.Io.Clock.Timestamp) void {
         self.closing.store(true, .release);
-        if (self.draining.swap(true, .acq_rel)) return;
+        if (self.draining.swap(true, .acq_rel)) {
+            self.drained.waitUncancelable(self.io);
+            return;
+        }
+        defer self.drained.set(self.io);
         // On the awake clock, whatever clock the deadline is on.
         const to_deadline = std.Io.Clock.Timestamp.now(self.io, deadline.clock).durationTo(deadline);
         const gives_up = std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = to_deadline.raw, .clock = .awake }).addDuration(.{ .raw = cancel_grace, .clock = .awake });
@@ -842,7 +850,10 @@ pub const Client = struct {
                 log.info("{s}: no longer held; its result was dropped", .{job.id_text});
                 return .lost;
             },
-            .failed => return plan.outcome,
+            .failed => {
+                if (self.metrics) |mm| mm.onUnsaved(row.queue, row.kind);
+                return plan.outcome;
+            },
         }
         if (self.metrics) |mm| {
             const label: metrics_mod.Outcome = if (result) |_| switch (plan.outcome) {
