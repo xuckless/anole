@@ -219,9 +219,9 @@ test "app golden: /h3" {
         gpa.destroy(f);
     }
     _ = f.line("/h3");
-    f.snapshot(.h3,
-        \\{"enabled":true,"endpoints":[{"socket":0,"connections_open":4,"accepted":10,"packets_in":1200,"dropped":0},{"socket":1,"connections_open":2,"accepted":6,"packets_in":800,"dropped":3}]}
-    );
+    // The host's own shape (`index`, then every field of the endpoint's
+    // stats); console_test.zig checks the file against the real fields.
+    f.snapshot(.h3, std.mem.trimEnd(u8, @embedFile("golden/h3_snapshot.json"), "\n"));
     try expectGolden("h3", &f.app);
 }
 

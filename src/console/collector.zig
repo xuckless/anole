@@ -48,6 +48,12 @@ pub const Collector = struct {
 
     /// After the console stopped (no thread of its asks any more).
     pub fn stop(c: *Collector) void {
+        // An ask wakes the runtime from a console thread (`ask.set`), which
+        // is safe only while the runtime lives: `Console.stop` joins every
+        // such thread before this, and this runs before the runtime goes.
+        // A thread still inside `snapshot` holds `serial`.
+        if (std.debug.runtime_safety and !c.serial.tryLock())
+            @panic("console collector: stopped while a console thread is still asking");
         if (c.task) |*t| t.cancel(c.io);
         c.task = null;
         c.out.deinit(c.gpa);

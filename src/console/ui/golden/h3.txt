@@ -1,8 +1,8 @@
  api · pid 48213 · development · up 4m12s   843 req/s   p99 120 us   90 err/min   conns 37   ● live 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
- socket    connections_open   accepted   packets_in   dropped                                       
- 0                        4         10         1200         0                                       
- 1                        2          6          800         3                                       
+ index      packets   forwarded_in   forwarded_out   dropped   accepted  connections_open   retries 
+ 0             1200             40              12         0         10                 4         1 
+ 1              800             12              40         3          6                 2         0 
                                                                                                     
                                                                                                     
                                                                                                     

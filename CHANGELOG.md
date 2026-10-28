@@ -3,6 +3,22 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.1 (unreleased)
+
+### Fixed
+
+- Console: log records from bindings (`anole_console_log`) carry their
+  request's id and route; the `req` argument was ignored.
+- Console: `/ws` shows the open WebSockets by protocol, accepted WebTransport
+  sessions, the rooms (members, queued bytes, members closed as slow) and
+  the SSE topics; `/db` shows PostgreSQL's target and every executor's pool.
+  Both are collected by a task on the runtime, under the runtime's locks,
+  which the console's own threads must not take.
+- Console: text in most scripts lines up. Character widths come from a table
+  generated from Unicode 16.0.0 (`tools/gen-width-table.py`); the
+  hand-picked subset missed the combining marks of Bengali, Tamil and other
+  scripts.
+
 ## 0.4.0 (2026-10-25)
 
 ### Breaking
