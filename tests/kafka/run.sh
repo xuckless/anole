@@ -10,6 +10,9 @@
 # Only the plain listener is exercised here; SASL SCRAM and TLS are covered by
 # the fake broker's tests (a SASL + TLS listener for the live run is a
 # follow-up).
+#
+# ANOLE_KEEP_CONTAINERS=1 leaves the containers when the script ends (CI
+# collects their logs and states after a failure, then removes them).
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -17,12 +20,12 @@ ZIG=${ZIG:-zig}
 FLAVOR=${KAFKA_FLAVOR:-kafka}
 PORT=${KAFKA_PORT:-59092}
 NAME=anole-kafka-test-$$
-trap 'docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
+trap '[ -n "${ANOLE_KEEP_CONTAINERS:-}" ] || docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
 
 case "$FLAVOR" in
   kafka)
     IMAGE=${KAFKA_IMAGE:-apache/kafka:4.1.0}
-    docker run -d --rm --name "$NAME" -p "127.0.0.1:$PORT:$PORT" \
+    docker run -d --name "$NAME" -p "127.0.0.1:$PORT:$PORT" \
       -e KAFKA_NODE_ID=1 \
       -e KAFKA_PROCESS_ROLES=broker,controller \
       -e KAFKA_LISTENERS="PLAINTEXT://:$PORT,CONTROLLER://:9093" \
@@ -39,7 +42,7 @@ case "$FLAVOR" in
     ;;
   redpanda)
     IMAGE=${KAFKA_IMAGE:-redpandadata/redpanda:v25.2.1}
-    docker run -d --rm --name "$NAME" -p "127.0.0.1:$PORT:$PORT" "$IMAGE" \
+    docker run -d --name "$NAME" -p "127.0.0.1:$PORT:$PORT" "$IMAGE" \
       redpanda start --mode dev-container --smp 1 --memory 1G \
       --kafka-addr "internal://0.0.0.0:$PORT" \
       --advertise-kafka-addr "internal://127.0.0.1:$PORT" >/dev/null

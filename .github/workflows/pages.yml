@@ -42,6 +42,7 @@ jobs:
   build:
     name: Build the site
     runs-on: ubuntu-latest
+    # ceil(2 x p95) + 5 from the last 30 green runs (2026-10-28).
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
@@ -55,6 +56,7 @@ jobs:
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       # The default (full) profile, so every namespace is documented.
       - name: API reference (zig build docs)
+        timeout-minutes: 12
         run: zig build docs --summary all
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 (v7.1.0)
         with:

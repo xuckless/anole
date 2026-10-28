@@ -9,12 +9,17 @@
 #   tests/mongodb/run.sh                 # mongo:8.0
 #   tests/mongodb/run.sh mongo:7.0       # another image
 #   KEEP=1 tests/mongodb/run.sh          # leave the container running
+#   tests/mongodb/run.sh mongo:7.0 --test-timeout 120s   # extra zig build arguments
+#
+# ANOLE_KEEP_CONTAINERS=1 leaves the container too (CI collects its log and
+# state after a failure, then removes it).
 #
 # Each run checks SCRAM-SHA-256 (negotiated), SCRAM-SHA-1 and TLS, then the
 # C ABI's suite over TLS.
 set -euo pipefail
 
 image="${1:-mongo:8.0}"
+shift || true
 zig="${ZIG:-zig}"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 port="${PORT:-27217}"
@@ -28,7 +33,7 @@ cleanup() {
         echo "-- $image log (last 60 lines) --" >&2
         docker logs --tail 60 "$name" >&2 2>&1 || true
     fi
-    if [ -z "${KEEP:-}" ]; then docker rm -f "$name" >/dev/null 2>&1 || true; fi
+    if [ -z "${KEEP:-}${ANOLE_KEEP_CONTAINERS:-}" ]; then docker rm -f "$name" >/dev/null 2>&1 || true; fi
     rm -rf "$work"
     exit "$status"
 }
@@ -101,15 +106,15 @@ for target in \
     "mongodb://sha1:$password@localhost:$port/?replicaSet=rs0&authSource=admin&authMechanism=SCRAM-SHA-1" \
     "$base&tls=true&tlsCAFile=$work/ca.pem"; do
     echo "== $(echo "$target" | sed -E 's#//([^:]+):[^@]+@#//\1:***@#')"
-    "$zig" build test-mongodb --summary line "-Dmongodb-test-url=$target"
+    "$zig" build test-mongodb --summary line "-Dmongodb-test-url=$target" "$@"
 done
 # The C ABI's suite (tests/capi/consumer.c), its MongoDB part included,
 # over TLS; CAPI=0 skips it.
 if [ "${CAPI:-1}" != 0 ]; then
     echo "== the C ABI (TLS)"
-    "$zig" build capi-test --summary line "-Dmongodb-test-url=$base&tls=true&tlsCAFile=$work/ca.pem"
+    "$zig" build capi-test --summary line "-Dmongodb-test-url=$base&tls=true&tlsCAFile=$work/ca.pem" "$@"
     # A library built with MongoDB and neither SQLite nor PostgreSQL still
     # answers anole_db_query.
     echo "== the C ABI in a MongoDB-only build (-Dprofile=minimal -Dmongodb=true)"
-    "$zig" build capi-test --summary line -Dprofile=minimal -Dmongodb=true "-Dmongodb-test-url=$base"
+    "$zig" build capi-test --summary line -Dprofile=minimal -Dmongodb=true "-Dmongodb-test-url=$base" "$@"
 fi

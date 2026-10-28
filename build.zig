@@ -767,6 +767,41 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     run_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_tests.step);
+    // The hang probe (src/safety/hang_probe.zig): a test that never returns,
+    // to see the runner's hang dump work. `-Dhang-probe=true` adds it to
+    // `test`; `zig build hang-probe` runs it alone. Both fail by design.
+    {
+        const probe = addSafeTest(b, .{
+            .name = "hang-probe",
+            .root_module = b.createModule(.{ .root_source_file = b.path("src/safety/hang_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+            .use_llvm = use_llvm,
+        });
+        const run_probe = b.addRunArtifact(probe);
+        run_probe.skip_foreign_checks = true;
+        b.step("hang-probe", "Run a deliberately hanging test to see the hang dump (use --test-timeout; fails by design)").dependOn(&run_probe.step);
+        if (b.option(bool, "hang-probe", "Add the deliberately hanging test to `zig build test` (fails by design)") orelse false) test_step.dependOn(&run_probe.step);
+    }
+    // The crash probe (src/safety/crash_probe.zig): a test that segfaults
+    // and one that aborts, each in its own binary run without the build
+    // runner's protocol; passes when each died of SIGABRT (the segfault
+    // handler ends in abort) and its stderr shows the line it logged.
+    {
+        const crash_step = b.step("crash-probe", "Check that a crashing test's held log lines are printed");
+        for ([_][]const u8{ "segfault", "abort" }) |what| {
+            const probe = addSafeTest(b, .{
+                .name = b.fmt("crash-probe-{s}", .{what}),
+                .root_module = b.createModule(.{ .root_source_file = b.path("src/safety/crash_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+                .filters = &.{b.fmt("crash probe: {s}", .{what})},
+                .use_llvm = use_llvm,
+            });
+            const run_probe = std.Build.Step.Run.create(b, b.fmt("run crash-probe-{s}", .{what}));
+            run_probe.addArtifactArg(probe);
+            run_probe.skip_foreign_checks = true;
+            run_probe.expectStdErrMatch(b.fmt("crash probe: held line before the {s}", .{what}));
+            run_probe.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
+            crash_step.dependOn(&run_probe.step);
+        }
+    }
     // compile-tests: build the test binaries without running them.
     const compile_tests_step = b.step("compile-tests", "Compile the test binaries without running them");
     compile_tests_step.dependOn(&tests.step);

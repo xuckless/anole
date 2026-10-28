@@ -12,6 +12,9 @@
 #   tests/redis/run.sh                                  # redis:7 on ports 56379/56380
 #   REDIS_IMAGE=valkey/valkey:8 REDIS_PORT=56381 ZIG=zig tests/redis/run.sh
 #   tests/redis/run.sh -Doptimize=ReleaseSafe           # extra zig build arguments
+#
+# ANOLE_KEEP_CONTAINERS=1 leaves the containers when the script ends (CI
+# collects their logs and states after a failure, then removes them).
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -28,7 +31,7 @@ esac
 
 CERTS=$(mktemp -d)
 cleanup() {
-  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  [ -n "${ANOLE_KEEP_CONTAINERS:-}" ] || docker rm -f "$NAME" >/dev/null 2>&1 || true
   rm -rf "$CERTS"
 }
 trap cleanup EXIT
