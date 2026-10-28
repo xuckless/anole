@@ -9,6 +9,8 @@ const std = @import("std");
 const anole = @import("../root.zig");
 const dedup_mod = @import("dedup.zig");
 
+const log = std.log.scoped(.anole_webhooks);
+
 pub const Error = anole.db.Error || error{ Canceled, OutOfMemory };
 
 /// A stored delivery attempt: its id (for paging) and the JSON text.
@@ -66,12 +68,19 @@ pub const Store = struct {
         msg_put: []const u8 = "",
         msg_get: []const u8 = "",
         msg_idem: []const u8 = "",
+        /// One owner's messages, and every owner's (two statements, so
+        /// the one-owner listing can use the (owner, id DESC) index).
         msg_list: []const u8 = "",
+        msg_list_all: []const u8 = "",
         att_add: []const u8 = "",
         att_list: []const u8 = "",
         prune_msgs: []const u8 = "",
         prune_atts: []const u8 = "",
         ddl: []const []const u8 = &.{},
+        /// PostgreSQL: per table, a query counting its id columns whose
+        /// collation is not "C", and the ALTER that moves them to it.
+        collation_check: []const []const u8 = &.{},
+        collation_fix: []const []const u8 = &.{},
     };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, jobs_store: anole.jobs.Store, table_prefix: []const u8, redis_prefix: []const u8) !*Store {
@@ -115,10 +124,23 @@ pub const Store = struct {
     }
 
     /// Creates the tables (SQL backends). Idempotent.
+    ///
+    /// PostgreSQL: the paged and indexed ids are `COLLATE "C"`, so they
+    /// order by bytes as on SQLite and in memory, whatever the database's
+    /// collation. Tables made before 0.4.2 took the database's default; the
+    /// first start finds that in the catalog and ALTERs the columns once
+    /// (their indexes are rebuilt under an ACCESS EXCLUSIVE lock). Later
+    /// starts only read the catalog. It runs before the DDL so the indexes
+    /// created there are built once, on the new collation.
     pub fn migrate(self: *Store, c: anytype) Error!void {
         switch (self.backend) {
-            .postgres => |p| for (self.sql.ddl) |stmt| {
-                _ = try p.exec(c, stmt, .{});
+            .postgres => |p| {
+                for (self.sql.collation_check, self.sql.collation_fix) |check, fix| {
+                    if ((try p.one(CountRow, c, check, .{})).n == 0) continue;
+                    log.info("webhooks: moving ids to the C collation, once: {s}", .{fix});
+                    _ = try p.exec(c, fix, .{});
+                }
+                for (self.sql.ddl) |stmt| _ = try p.exec(c, stmt, .{});
             },
             .sqlite => |s| for (self.sql.ddl) |stmt| {
                 _ = try s.exec(c, stmt, .{});
@@ -264,10 +286,17 @@ pub const Store = struct {
         // No `before`: every id (SQL: '' turns the bound off; "\xff" is not
         // valid UTF-8 for PostgreSQL's text).
         const b = before orelse "";
+        const lim64: i64 = limit;
         switch (self.backend) {
             .memory => |m| return m.msgList(c.arena, o, all_owners, before orelse "\xff", limit),
-            .postgres => |p| return bodies(c.arena, try p.all(BodyRow, c, self.sql.msg_list, .{ o, all_owners, b, @as(i64, limit) })),
-            .sqlite => |s| return bodies(c.arena, try s.all(BodyRow, c, self.sql.msg_list, .{ o, @as(i64, @intFromBool(all_owners)), b, @as(i64, limit) })),
+            .postgres => |p| return bodies(c.arena, try if (all_owners)
+                p.all(BodyRow, c, self.sql.msg_list_all, .{ b, lim64 })
+            else
+                p.all(BodyRow, c, self.sql.msg_list, .{ o, b, lim64 })),
+            .sqlite => |s| return bodies(c.arena, try if (all_owners)
+                s.all(BodyRow, c, self.sql.msg_list_all, .{ b, lim64 })
+            else
+                s.all(BodyRow, c, self.sql.msg_list, .{ o, b, lim64 })),
             .redis => |r| {
                 const zk = try self.key(c, "msgs:", o);
                 var lim_buf: [8]u8 = undefined;
@@ -383,11 +412,13 @@ fn attRows(arena: std.mem.Allocator, rows: []AttSqlRow) std.mem.Allocator.Error!
 const Dialect = enum { postgres, sqlite };
 
 fn freeSql(gpa: std.mem.Allocator, s: Store.Sql) void {
-    for ([_][]const u8{ s.ep_put, s.ep_get, s.ep_list, s.ep_del, s.ep_count, s.msg_put, s.msg_get, s.msg_idem, s.msg_list, s.att_add, s.att_list, s.prune_msgs, s.prune_atts }) |v| {
+    for ([_][]const u8{ s.ep_put, s.ep_get, s.ep_list, s.ep_del, s.ep_count, s.msg_put, s.msg_get, s.msg_idem, s.msg_list, s.msg_list_all, s.att_add, s.att_list, s.prune_msgs, s.prune_atts }) |v| {
         if (v.len > 0) gpa.free(v);
     }
-    for (s.ddl) |d| gpa.free(d);
-    if (s.ddl.len > 0) gpa.free(s.ddl);
+    for ([_][]const []const u8{ s.ddl, s.collation_check, s.collation_fix }) |list| {
+        for (list) |d| gpa.free(d);
+        if (list.len > 0) gpa.free(list);
+    }
 }
 
 /// `$n` placeholders become `?n` for SQLite.
@@ -411,10 +442,8 @@ fn buildSql(gpa: std.mem.Allocator, d: Dialect, p: []const u8) !Store.Sql {
     s.msg_put = try fmt(gpa, d, p, "INSERT INTO {0s}webhook_messages (id, owner, idempotency, created_ms, body) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING");
     s.msg_get = try fmt(gpa, d, p, "SELECT body FROM {0s}webhook_messages WHERE id = $1");
     s.msg_idem = try fmt(gpa, d, p, "SELECT body FROM {0s}webhook_messages WHERE (owner = $1 AND idempotency = $2 AND $2 <> '') OR id = $3 LIMIT 1");
-    s.msg_list = switch (d) {
-        .postgres => try fmt(gpa, d, p, "SELECT body FROM {0s}webhook_messages WHERE ($2 OR owner = $1) AND ($3 = '' OR id < $3) ORDER BY id DESC LIMIT $4"),
-        .sqlite => try fmt(gpa, d, p, "SELECT body FROM {0s}webhook_messages WHERE ($2 <> 0 OR owner = $1) AND ($3 = '' OR id < $3) ORDER BY id DESC LIMIT $4"),
-    };
+    s.msg_list = try fmt(gpa, d, p, "SELECT body FROM {0s}webhook_messages WHERE owner = $1 AND ($2 = '' OR id < $2) ORDER BY id DESC LIMIT $3");
+    s.msg_list_all = try fmt(gpa, d, p, "SELECT body FROM {0s}webhook_messages WHERE ($1 = '' OR id < $1) ORDER BY id DESC LIMIT $2");
     s.att_add = try fmt(gpa, d, p, "INSERT INTO {0s}webhook_attempts (message_id, endpoint_id, at_ms, body) VALUES ($1, $2, $3, $4)");
     s.att_list = try fmt(gpa, d, p, "SELECT id, body FROM {0s}webhook_attempts WHERE ($1 = '' OR endpoint_id = $1) AND ($2 = '' OR message_id = $2) AND ($3 = 0 OR id < $3) ORDER BY id DESC LIMIT $4");
     s.prune_msgs = try fmt(gpa, d, p, "DELETE FROM {0s}webhook_messages WHERE created_ms < $1");
@@ -423,6 +452,11 @@ fn buildSql(gpa: std.mem.Allocator, d: Dialect, p: []const u8) !Store.Sql {
         .postgres => "bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY",
         .sqlite => "INTEGER PRIMARY KEY AUTOINCREMENT",
     };
+    // Ids compare by bytes (SQLite's default BINARY collation already does).
+    const c_text = switch (d) {
+        .postgres => "text COLLATE \"C\"",
+        .sqlite => "text",
+    };
     var ddl: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (ddl.items) |x| gpa.free(x);
@@ -430,14 +464,41 @@ fn buildSql(gpa: std.mem.Allocator, d: Dialect, p: []const u8) !Store.Sql {
     }
     try ddl.append(gpa, try fmt(gpa, d, p, "CREATE TABLE IF NOT EXISTS {0s}webhook_endpoints (id text PRIMARY KEY, owner text NOT NULL, body text NOT NULL)"));
     try ddl.append(gpa, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_endpoints_owner ON {0s}webhook_endpoints (owner)"));
-    try ddl.append(gpa, try fmt(gpa, d, p, "CREATE TABLE IF NOT EXISTS {0s}webhook_messages (id text PRIMARY KEY, owner text NOT NULL, idempotency text NOT NULL DEFAULT '', created_ms bigint NOT NULL, body text NOT NULL)"));
+    try ddl.append(gpa, try std.fmt.allocPrint(gpa, "CREATE TABLE IF NOT EXISTS {s}webhook_messages (id {s} PRIMARY KEY, owner text NOT NULL, idempotency text NOT NULL DEFAULT '', created_ms bigint NOT NULL, body text NOT NULL)", .{ p, c_text }));
     try ddl.append(gpa, try fmt(gpa, d, p, "CREATE UNIQUE INDEX IF NOT EXISTS {0s}webhook_messages_idem ON {0s}webhook_messages (owner, idempotency) WHERE idempotency <> ''"));
     try ddl.append(gpa, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_messages_created ON {0s}webhook_messages (created_ms)"));
-    const att = try std.fmt.allocPrint(gpa, "CREATE TABLE IF NOT EXISTS {s}webhook_attempts (id {s}, message_id text NOT NULL, endpoint_id text NOT NULL, at_ms bigint NOT NULL, body text NOT NULL)", .{ p, id_col });
+    // One owner's page (Svix's ix_message_per_app).
+    try ddl.append(gpa, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_messages_owner ON {0s}webhook_messages (owner, id DESC)"));
+    const att = try std.fmt.allocPrint(gpa, "CREATE TABLE IF NOT EXISTS {0s}webhook_attempts (id {1s}, message_id {2s} NOT NULL, endpoint_id {2s} NOT NULL, at_ms bigint NOT NULL, body text NOT NULL)", .{ p, id_col, c_text });
     try ddl.append(gpa, att);
     try ddl.append(gpa, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_attempts_endpoint ON {0s}webhook_attempts (endpoint_id, id)"));
     try ddl.append(gpa, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_attempts_message ON {0s}webhook_attempts (message_id, id)"));
     s.ddl = try ddl.toOwnedSlice(gpa);
+    if (d == .postgres) {
+        // Tables made before 0.4.2 (see `Store.migrate`). A table that does
+        // not exist yet counts none (to_regclass is null).
+        const not_c = "SELECT count(*) AS n FROM pg_attribute WHERE attrelid = to_regclass('{0s}{1s}') AND attname IN ({2s}) AND attcollation <> (SELECT oid FROM pg_collation WHERE collname = 'C' AND collnamespace = 'pg_catalog'::regnamespace)";
+        const tables = [_]struct { []const u8, []const u8, []const u8 }{
+            .{ "webhook_messages", "'id'", "ALTER COLUMN id TYPE text COLLATE \"C\"" },
+            .{ "webhook_attempts", "'message_id', 'endpoint_id'", "ALTER COLUMN message_id TYPE text COLLATE \"C\", ALTER COLUMN endpoint_id TYPE text COLLATE \"C\"" },
+        };
+        var checks: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (checks.items) |x| gpa.free(x);
+            checks.deinit(gpa);
+        }
+        var fixes: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (fixes.items) |x| gpa.free(x);
+            fixes.deinit(gpa);
+        }
+        for (tables) |t| {
+            try checks.append(gpa, try std.fmt.allocPrint(gpa, not_c, .{ p, t[0], t[1] }));
+            try fixes.append(gpa, try std.fmt.allocPrint(gpa, "ALTER TABLE {s}{s} {s}", .{ p, t[0], t[2] }));
+        }
+        s.collation_check = try checks.toOwnedSlice(gpa);
+        s.collation_fix = try fixes.toOwnedSlice(gpa);
+    }
     return s;
 }
 

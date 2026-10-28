@@ -3,6 +3,20 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.2 (unreleased)
+
+### Fixed
+
+- Webhooks: on PostgreSQL, `hooks.messages` paged in the database's
+  collation order (en_US, ICU) instead of by bytes, so caller-supplied ids
+  such as `msg_D` and `msg_c` came back in a different order than on SQLite
+  and in memory. The message id and the attempts' `message_id` and
+  `endpoint_id` columns are now `COLLATE "C"`. Tables made by an earlier
+  version are changed once at the first start (an `ALTER TABLE` that
+  rebuilds their indexes under an exclusive lock; see
+  [webhooks](docs/webhooks.md#storage)), and later starts only read the
+  catalog. One owner's listing has its own `(owner, id DESC)` index (#109).
+
 ## 0.4.1 (2026-10-28)
 
 ### Fixed

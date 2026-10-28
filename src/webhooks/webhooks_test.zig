@@ -24,6 +24,41 @@ test "Client: publish keeps one message per idempotency key" {
     try std.testing.expect(!std.mem.eql(u8, rotated, made.secret));
 }
 
+test "webhooks: messages on SQLite page by bytes, newest first, for one owner and for all" {
+    if (comptime !anole.features.sqlite) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const sq = try anole.sqlite.Client.init(gpa, std.testing.io, .{ .path = ":memory:" });
+    defer sq.deinit();
+    const jc = try anole.jobs.Client.init(gpa, std.testing.io, .{ .store = .{ .sqlite = sq }, .table_prefix = "whtest_" });
+    defer jc.deinit();
+    const c = try wh.Client.init(gpa, std.testing.io, .{ .jobs = jc, .allow_private_addresses = true, .require_https = false });
+    defer c.deinit();
+    try c.start(null, null, null);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var cx: anole.db.Ctx = .{ .io = std.testing.io, .arena = arena.allocator() };
+    // Even ones to "acme", odd ones to "globex".
+    for ([_][]const u8{ "msg_a", "msg_B", "msg_c", "msg_D" }, 0..) |id, i| {
+        _ = try c.publish(&cx, .{ .owner = if (i % 2 == 0) "acme" else "globex", .type = "t", .id = id }, .{});
+    }
+    const Case = struct { owner: ?[]const u8, want: []const []const u8 };
+    for ([_]Case{
+        .{ .owner = null, .want = &.{ "msg_c", "msg_a", "msg_D", "msg_B" } },
+        .{ .owner = "acme", .want = &.{ "msg_c", "msg_a" } },
+        .{ .owner = "globex", .want = &.{ "msg_D", "msg_B" } },
+    }) |case| {
+        var got: std.ArrayList([]const u8) = .empty;
+        var before: ?[]const u8 = null;
+        while (got.items.len <= 4) { // more than every id: a page repeated
+            const page = try c.messages(&cx, .{ .owner = case.owner, .before = before, .limit = 1 });
+            if (page.len == 0) break;
+            try got.append(cx.arena, page[0].id);
+            before = page[0].id;
+        }
+        try std.testing.expectEqualDeep(case.want, got.items);
+    }
+}
+
 // ---- delivery end to end: a real server receives, the job queue delivers,
 // the delivery log records it, and the pruning job empties the log.
 // Memory store always; PostgreSQL too with -Dpostgres-test-url.

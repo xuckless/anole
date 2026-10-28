@@ -74,6 +74,31 @@ they are unless `secrets_key` (or `ANOLE_WEBHOOKS_KEY`, 32 bytes of base64) is
 set: then they are encrypted with XChaCha20-Poly1305. The HMAC needs the plain
 secret, so hashing is not an option.
 
+### Storage
+
+Endpoints, messages and the delivery log live in the jobs store's database
+(tables `<table_prefix>webhook_endpoints`, `_messages` and `_attempts`, made at
+start unless the jobs client has `migrate = false`), or in memory. `hooks.messages` pages by
+message id, newest first: pass the last id of a page as `before` for the next.
+Ids compare by bytes on every store (`msg_D` sorts below `msg_c`). Generated
+ids (`msg_` and a ULID) sort by time; your own `EventHead.id`s sort as text.
+
+On PostgreSQL the id columns are `COLLATE "C"`, whatever the database's
+collation. Tables made before 0.4.2 took the database's default collation (often
+`en_US.UTF-8` or ICU), which pages in a different order. The first start of
+0.4.2 or later finds that in `pg_attribute` and runs, once per table,
+
+```sql
+ALTER TABLE anole_webhook_messages ALTER COLUMN id TYPE text COLLATE "C";
+ALTER TABLE anole_webhook_attempts ALTER COLUMN message_id TYPE text COLLATE "C",
+                                   ALTER COLUMN endpoint_id TYPE text COLLATE "C";
+```
+
+The table is not rewritten, but its indexes are rebuilt under an `ACCESS
+EXCLUSIVE` lock, so publishing and listing wait until it is done. To pick the
+moment yourself, run those statements before upgrading; later starts only read
+the catalog.
+
 ## Receiving
 
 ```zig

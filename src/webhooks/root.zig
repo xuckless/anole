@@ -905,4 +905,5 @@ test {
     _ = verify;
     _ = store;
     _ = @import("webhooks_test.zig");
+    _ = @import("pg_live_test.zig");
 }
