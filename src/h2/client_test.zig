@@ -344,6 +344,7 @@ test "h2 engine: a peer's GOAWAY ends the connection with a FIN, and what it sen
     try w.interface.writeAll("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
     try w.interface.writeAll(&.{ 0, 0, 0, 4, 0, 0, 0, 0, 0 }); // SETTINGS
     // GOAWAY, last stream 0, an unknown error code.
+    const goaway_sent: std.Io.Clock.Timestamp = .now(io, .awake);
     try w.interface.writeAll(&.{ 0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff });
     try w.interface.flush();
     // Time for the session to end. Read what the server sent (its SETTINGS
@@ -361,10 +362,14 @@ test "h2 engine: a peer's GOAWAY ends the connection with a FIN, and what it sen
     // Time for a wrong reset to arrive (as above: it can only be missed).
     try io.sleep(.fromMilliseconds(50), .awake);
 
-    // Then the end of the stream, which the server sent without waiting
-    // for the peer (it would wait for ever otherwise: the test's socket
-    // stays open); a reset fails the read.
+    // Then the end of the stream; a reset fails the read. The server shuts
+    // its side as the session ends, then lingers (reading and dropping what
+    // comes) for up to linger_timeout, 1 s, while the test's side stays
+    // open. A FIN held back until the linger is over is still a clean end,
+    // only late: only test-timing tells it apart, as it comes a full
+    // linger_timeout after the GOAWAY.
     _ = rd.interface.discardRemaining() catch return rd.err orelse error.Unexpected;
+    if (wait.timing()) try std.testing.expect(goaway_sent.durationTo(.now(io, .awake)).raw.toMilliseconds() < 900);
 }
 
 test "h2 client: request timeouts, for the head and for the body, and the connection carries on" {
