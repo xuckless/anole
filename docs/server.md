@@ -1042,7 +1042,8 @@ ExecStop=/bin/sh -c 'kill -TERM $MAINPID; while kill -0 $MAINPID 2>/dev/null; do
 # The default: a stop signals every process of the service, an old one
 # still draining after a restart too.
 KillMode=control-group
-# Longer than the drain (timeouts.shutdown, 10 s).
+# Longer than the drain (timeouts.shutdown, 10 s; with a job queue, also
+# longer than its drain_timeout + 3 s, see jobs.md).
 TimeoutStopSec=20
 Sockets=anole-http.socket anole-https.socket anole-h3.socket
 
