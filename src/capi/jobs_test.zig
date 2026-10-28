@@ -142,7 +142,7 @@ const Rig = struct {
     fn deinit(r: *Rig) void {
         r.ev.deinit();
         r.e.drain() catch {};
-        _ = r.e.wait(5000);
+        _ = r.e.wait(@intCast(wait.deadlineMs()));
         r.e.destroy();
         alloc.free(r.json);
     }

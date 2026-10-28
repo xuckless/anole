@@ -251,11 +251,16 @@ test "redis: live pub/sub on a connection of its own" {
     try testing.expect(msg.pattern == null);
 
     try sub.psubscribe(&c, "anole:test:room:*");
-    // Its confirmation comes first; `next` skips it.
-    for (0..50) |_| {
-        if (try r.publish(&c, "anole:test:room:1", "pattern") == 1) break;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    // Its confirmation comes first; `next` skips it. Published until the
+    // server counts the pattern's subscriber.
+    const Publish = struct {
+        r: *redis.Client,
+        c: *db.Ctx,
+        fn reached(p: @This()) !bool {
+            return try p.r.publish(p.c, "anole:test:room:1", "pattern") == 1;
+        }
+    };
+    try wait.waitUntil(io, "the pattern subscription counted by the server", Publish{ .r = r, .c = &c }, Publish.reached);
     msg = (try sub.next(&c)).?;
     try testing.expectEqualStrings("anole:test:room:*", msg.pattern.?);
     try testing.expectEqualStrings("anole:test:room:1", msg.channel);
@@ -272,6 +277,8 @@ test "redis: live pub/sub on a connection of its own" {
         }
     };
     var waiting = try io.concurrent(Waiter.run, .{ sub, io });
+    // Time for the waiter to be waiting (a sensitivity sleep: a publish
+    // before it waits is still read by its `next`).
     try io.sleep(.fromMilliseconds(20), .awake);
     _ = try r.publish(&c, "anole:test:news", "late");
     try testing.expectEqualStrings("late", try waiting.await(io));
@@ -325,8 +332,25 @@ test "redis: live a timeout or a cancel closes the connection, and the next call
             _ = try cl.command(&ctx, .{ "BLPOP", "anole:test:empty", 10 });
         }
     };
+    // Canceled once the server holds the BLPOP (another client asks it).
+    const watcher = try open(io, .{});
+    defer watcher.deinit();
     var task = try io.concurrent(Blocker.run, .{ r, io });
-    try io.sleep(.fromMilliseconds(100), .awake);
+    const Blocked = struct {
+        w: *redis.Client,
+        c: *db.Ctx,
+        fn held(b: @This()) !bool {
+            const info = try b.w.one([]const u8, b.c, .{ "INFO", "clients" });
+            const at = std.mem.indexOf(u8, info, "blocked_clients:") orelse return error.TestUnexpectedResult;
+            const rest = info[at + "blocked_clients:".len ..];
+            const end = std.mem.indexOfAny(u8, rest, "\r\n") orelse rest.len;
+            return (try std.fmt.parseInt(u32, rest[0..end], 10)) >= 1;
+        }
+    };
+    wait.waitUntil(io, "the server holds the BLPOP", Blocked{ .w = watcher, .c = &c }, Blocked.held) catch |err| {
+        _ = task.cancel(io) catch {};
+        return err;
+    };
     try testing.expectError(error.Canceled, task.cancel(io));
     try testing.expect(try r.one(i64, &c, .{ "CLIENT", "ID" }) != second);
     try testing.expectEqual(@as(usize, 1), r.pools.pools[0].open);
@@ -504,10 +528,14 @@ test "redis: live app.redis: handlers, statuses, /readyz and /metrics" {
             // drains, well before the drain's 30 s deadline.
             var streaming = try io.concurrent(fetch, .{ io, arena, http.Method.get, try at(arena, port, "/events") });
             var c: db.Ctx = .{ .io = io, .arena = arena };
-            for (0..200) |_| {
-                if (try cache.publish(&c, "anole:test:events", "hi") == 1) break;
-                try io.sleep(.fromMilliseconds(10), .awake);
-            } else return error.TestUnexpectedResult;
+            const Publish = struct {
+                r: *redis.Client,
+                c: *db.Ctx,
+                fn reached(p: @This()) !bool {
+                    return try p.r.publish(p.c, "anole:test:events", "hi") == 1;
+                }
+            };
+            try wait.waitUntil(io, "the event stream's subscription counted by the server", Publish{ .r = cache, .c = &c }, Publish.reached);
             const stopping: std.Io.Clock.Timestamp = .now(io, .awake);
             a.stop();
             const got = try streaming.await(io);

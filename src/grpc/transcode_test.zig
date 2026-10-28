@@ -9,6 +9,7 @@ const grpc = @import("root.zig");
 const transcode = @import("transcode.zig");
 const grpc_server = @import("server.zig");
 const features = @import("build_options");
+const test_wait = @import("anole_test_wait");
 
 const Library = pb.Library(grpc.Call, anyerror);
 const Capture = transcode.Capture;
@@ -604,7 +605,7 @@ test "transcoding: the body is read under the request timeout, and must be JSON"
         // ends the request.
         const answer = try slowExchange(gpa, io, port, &.{
             "POST /v1/shelves/1/books HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"title\"",
-        }, .zero, "\r\n\r\n", .fromSeconds(5));
+        }, .zero, "\r\n\r\n");
         gpa.free(answer);
     }
     for ([_]struct { []const u8, []const u8 }{
@@ -616,7 +617,7 @@ test "transcoding: the body is read under the request timeout, and must be JSON"
     }) |case| {
         var buf: [256]u8 = undefined;
         const request = try std.fmt.bufPrint(&buf, "POST /v1/shelves/1/books HTTP/1.1\r\nHost: x\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ case[0], book.len, book });
-        const answer = try slowExchange(gpa, io, port, &.{request}, .zero, "\r\n\r\n", .fromSeconds(5));
+        const answer = try slowExchange(gpa, io, port, &.{request}, .zero, "\r\n\r\n");
         defer gpa.free(answer);
         if (!std.mem.startsWith(u8, answer, "HTTP/1.1 ") or !std.mem.startsWith(u8, answer[9..], case[1])) {
             std.debug.print("{s}: {s}\n", .{ case[0], answer });
@@ -626,9 +627,11 @@ test "transcoding: the body is read under the request timeout, and must be JSON"
 }
 
 /// Sends `parts` over a new connection, waiting `pause` before each one
-/// after the first, then reads until `needle` arrives or the peer closes.
-/// Fails with `error.Timeout` when neither happens within `wait`.
-pub fn slowExchange(gpa: std.mem.Allocator, io: std.Io, port: u16, parts: []const []const u8, pause: std.Io.Duration, needle: []const u8, wait: std.Io.Duration) ![]u8 {
+/// after the first (a slow peer on purpose: the pauses are lower bounds),
+/// then reads until `needle` arrives or the peer closes. Fails with
+/// `error.Timeout` when neither happens within the wait helper's deadline
+/// (a hang guard).
+pub fn slowExchange(gpa: std.mem.Allocator, io: std.Io, port: u16, parts: []const []const u8, pause: std.Io.Duration, needle: []const u8) ![]u8 {
     const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
     var stream = try addr.connect(io, .{ .mode = .stream });
     defer stream.close(io);
@@ -651,7 +654,7 @@ pub fn slowExchange(gpa: std.mem.Allocator, io: std.Io, port: u16, parts: []cons
             }
         }
     }.until;
-    const bound: dusty.Deadline = .init(io, .{ .duration = .{ .raw = wait, .clock = .awake } });
+    const bound: dusty.Deadline = .init(io, .{ .duration = .{ .raw = test_wait.deadline(), .clock = .awake } });
     try bound.run(read, .{ &reader.interface, needle });
     return gpa.dupe(u8, reader.interface.buffered());
 }

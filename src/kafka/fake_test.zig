@@ -8,6 +8,7 @@ const db = @import("../db/root.zig");
 const kafka = @import("root.zig");
 const records = @import("records.zig");
 const FakeBroker = @import("testing.zig").FakeBroker;
+const wait = @import("anole_test_wait");
 
 const testing = std.testing;
 const gpa = testing.allocator;
@@ -22,19 +23,16 @@ fn opts(broker: *const FakeBroker, producer: kafka.Options.Producer) kafka.Optio
 }
 
 fn waitCount(io: std.Io, v: *std.atomic.Value(u32), want: u32) !void {
-    for (0..500) |_| {
-        if (v.load(.acquire) >= want) return;
-        try io.sleep(.fromMilliseconds(20), .awake);
-    }
-    return error.TimedOut;
+    try wait.waitAtLeast(io, "the count reached what the test wants", v, want);
 }
 
 fn waitCommitted(io: std.Io, broker: *FakeBroker, group: []const u8, topic: []const u8, partition: i32, want: i64) !void {
-    for (0..500) |_| {
-        if ((broker.committed(group, topic, partition) orelse -1) >= want) return;
-        try io.sleep(.fromMilliseconds(20), .awake);
-    }
-    return error.TimedOut;
+    const Ctx = struct { broker: *FakeBroker, group: []const u8, topic: []const u8, partition: i32, want: i64 };
+    try wait.waitUntil(io, "the broker has the committed offset", Ctx{ .broker = broker, .group = group, .topic = topic, .partition = partition, .want = want }, struct {
+        fn committed(c: Ctx) bool {
+            return (c.broker.committed(c.group, c.topic, c.partition) orelse -1) >= c.want;
+        }
+    }.committed);
 }
 
 test "fake broker: produce with every codec, keys keep their partition, send and flush" {

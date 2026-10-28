@@ -251,20 +251,22 @@ test "publish cap: past outbound_bytes a publish is ServiceUnavailable (outbound
     const payload = try testing.allocator.alloc(u8, 1024 * 1024);
     defer testing.allocator.free(payload);
     @memset(payload, 'x');
-    // The fake reads nothing: the sockets fill, then the queue. The loop
-    // ends at the first refusal (bounded); no timing is asserted.
-    var attempts: u32 = 0;
-    while (attempts < 100_000) : (attempts += 1) {
-        if (r.client.publish(&ctx, "capped", payload)) |_| {
-            try r.rt.io().sleep(.fromMilliseconds(1), .awake);
-        } else |err| {
-            try testing.expectEqual(error.ServiceUnavailable, err);
-            try testing.expectEqualStrings("outbound_full", db.lastError(&ctx).?.code);
-            try testing.expect(!r.client.writable(&ctx));
-            return;
+    // The fake reads nothing: the sockets fill, then the queue. The wait
+    // ends at the first refusal; no timing is asserted.
+    const Fill = struct {
+        r: *Rig,
+        ctx: *db.Ctx,
+        payload: []const u8,
+        fn refused(f: @This()) !bool {
+            if (f.r.client.publish(f.ctx, "capped", f.payload)) |_| return false else |err| {
+                try testing.expectEqual(error.ServiceUnavailable, err);
+                return true;
+            }
         }
-    }
-    return error.TestNeverFull;
+    };
+    try @import("anole_test_wait").waitUntil(r.rt.io(), "a publish refused past outbound_bytes", Fill{ .r = &r, .ctx = &ctx, .payload = payload }, Fill.refused);
+    try testing.expectEqualStrings("outbound_full", db.lastError(&ctx).?.code);
+    try testing.expect(!r.client.writable(&ctx));
 }
 
 fn pickOn(c: *nats.Client, out: *?*nats.core.Client) void {

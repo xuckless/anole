@@ -2146,16 +2146,20 @@ test "Client: the request deadline covers the body, unless it is streamed" {
         var peer: StallingServer = undefined;
         try peer.start(io, head);
         defer peer.stop(io);
-        // Room for the head on a loaded runner, and well past by the time
-        // the body is read.
-        var client = dusty.Client.init(std.testing.allocator, io, .{ .timeout = .fromMilliseconds(500) });
+        // Room for the head on a loaded machine (scaled by the timeout
+        // factor), and the body read only once the whole timeout has passed
+        // since the fetch began (a lower bound, however long the head took).
+        const timeout: std.Io.Duration = .fromMilliseconds(@as(i64, 1000) * wait.timeoutFactor());
+        var client = dusty.Client.init(std.testing.allocator, io, .{ .timeout = timeout });
         defer client.deinit();
 
+        const began = std.Io.Clock.awake.now(io);
         var response = try client.fetch(try peer.url(), .{ .stream = true });
         defer response.deinit();
         try std.testing.expectEqual(.ok, response.status());
 
-        try io.sleep(.fromMilliseconds(800), .awake);
+        const past = timeout.nanoseconds + 200 * std.time.ns_per_ms - began.untilNow(io, .awake).nanoseconds;
+        if (past > 0) try io.sleep(.fromNanoseconds(past), .awake);
         var buf: [64]u8 = undefined;
         var reader = try response.reader(&buf);
         try std.testing.expectEqualStrings("hello", try reader.interface.take(5));
@@ -2196,7 +2200,8 @@ test "Client: redirects share the request's budget" {
     defer client.deinit();
     try std.testing.expectError(error.Timeout, client.fetch(url, .{}));
 
-    var patient = dusty.Client.init(std.testing.allocator, io, .{ .timeout = .fromMilliseconds(2000) });
+    // The wait helper's deadline: a hang guard, not a claim on speed.
+    var patient = dusty.Client.init(std.testing.allocator, io, .{ .timeout = wait.deadline() });
     defer patient.deinit();
     var response = try patient.fetch(url, .{});
     defer response.deinit();

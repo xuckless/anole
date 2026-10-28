@@ -667,14 +667,29 @@ test "sqlite: with one executor, the server keeps running while SQLite works" {
     var ticks: std.atomic.Value(u32) = .init(0);
     var ticker = try io.concurrent(Ticker.tick, .{ io, &ticks });
     defer ticker.cancel(io) catch {};
-    // A read (blocking pool) and a write (the writer thread), each long
-    // enough for the ticker to run beside them.
-    const count = "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < 300000) SELECT count(*) FROM r";
-    try testing.expectEqual(@as(i64, 300000), try db.one(i64, &s.ctx, count, .{}));
-    const after_read = ticks.load(.monotonic);
-    try testing.expect(after_read >= 3);
-    try testing.expectEqual(@as(i64, 300000), try db.with(.{ .write = true }).one(i64, &s.ctx, count, .{}));
-    try testing.expect(ticks.load(.monotonic) - after_read >= 3);
+    // A read (blocking pool) and a write (the writer thread) that never end
+    // on their own: the ticker, on the only executor, ticks on beside each
+    // (were the executor held by SQLite, it could not), then the statement
+    // is canceled (interrupted). No claim on how long a statement takes.
+    const Forever = struct {
+        fn run(q: sqlite.Query, io_: std.Io) sqlite.Error!i64 {
+            var sc: Scratch = undefined;
+            sc.init(io_);
+            defer sc.deinit();
+            return q.one(i64, &sc.ctx, forever, .{});
+        }
+    };
+    for ([_]bool{ false, true }) |write| {
+        var running = try io.concurrent(Forever.run, .{ db.with(.{ .write = write }), io });
+        const before = ticks.load(.monotonic);
+        wait.waitAtLeast(io, "the ticker ticks beside the statement", &ticks, before + 10) catch |err| {
+            _ = running.cancel(io) catch {};
+            return err;
+        };
+        try testing.expectError(error.Canceled, running.cancel(io));
+    }
+    // The connection serves the next statement.
+    try testing.expectEqual(@as(i64, 3), try db.one(i64, &s.ctx, "SELECT 1 + 2", .{}));
 }
 
 test "sqlite: transactions: commit, rollback, deinit, and transaction() retried past SQLITE_BUSY" {

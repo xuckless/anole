@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
+const wait = @import("anole_test_wait");
 const dusty = @import("dusty");
 const anole_tls = @import("../tls/root.zig");
 const client = @import("client.zig");
@@ -218,11 +219,11 @@ test "h3 per-core: WebTransport turned on after init reaches every endpoint; one
 }
 
 fn waitTicket(io: std.Io, cache: *client.SessionCache) !void {
-    for (0..200) |_| {
-        if (cache.count() > 0) return;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
-    return error.NoTicket;
+    try wait.waitUntil(io, "the session cache holds a ticket", cache, struct {
+        fn held(c: *client.SessionCache) bool {
+            return c.count() > 0;
+        }
+    }.held);
 }
 
 test "h3 per-core: without the program, packets that land on another endpoint's socket are passed on to it" {
@@ -258,11 +259,11 @@ test "h3 per-core: without the program, packets that land on another endpoint's 
     for (conns) |conn| _ = try f.served(conn, gpa);
     // A packet passed on last (a late ACK, say) can still sit in its
     // owner's inbox: forwarded_in counts it when the owner takes it.
-    for (0..200) |_| {
-        if (f.sum("forwarded_in") == f.sum("forwarded_out")) break;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
-    try std.testing.expectEqual(f.sum("forwarded_out"), f.sum("forwarded_in"));
+    try wait.waitUntil(io, "every packet passed on was taken by its owner", &f, struct {
+        fn taken(fx: *Fixture) bool {
+            return fx.sum("forwarded_in") == fx.sum("forwarded_out");
+        }
+    }.taken);
     try std.testing.expectEqual(@as(u64, 0), f.sum("dropped"));
     try f.expectNoForeign();
 }

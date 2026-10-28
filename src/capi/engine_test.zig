@@ -1015,16 +1015,22 @@ test "capi engine: a reload from another thread holds the server's stop until it
     ControlHold.entered.waitUncancelable(tio);
     engine.test_control_hook = null;
     try e.drain();
-    // Give the stop time to finish, had it not waited for the reload: the
-    // run thread would free the server and exit (its stack, which held the
-    // server, with it).
-    try std.Io.sleep(tio, .fromMilliseconds(400), .awake);
+    // Had the stop not waited for the reload, the run thread would free
+    // the server and exit (its stack, which held the server, with it)
+    // within the 200 ms shutdown: it must still be running past that. A
+    // slow machine can only make this miss the bug, never fail.
+    const held = wait.expectStays(tio, "the stop waits while the reload holds the server", &e.stopped, struct {
+        fn unset(ev: *std.Io.Event) bool {
+            return !ev.isSet();
+        }
+    }.unset, .fromMilliseconds(400));
     if (e.stopped.isSet()) {
         e.thread.?.join();
         e.thread = null;
     }
     ControlHold.go.set(tio);
     t.join();
+    try held;
     // The reload ran on the live server (a self-signed listener reloads in
     // place), and the stop went on after it.
     try std.testing.expectEqual(@as(?anyerror, null), result);
@@ -1091,6 +1097,8 @@ const Racer = struct {
     e: *engine.Engine,
     stop: *std.atomic.Value(bool),
     which: u8,
+    /// Calls this racer has made.
+    calls: *std.atomic.Value(u64),
 
     fn run(r: Racer) void {
         var n: usize = 0;
@@ -1100,8 +1108,20 @@ const Racer = struct {
                 1 => r.e.setCertificate(.dev_self_signed) catch {},
                 else => if (n % 64 == 63) r.e.drain() catch {} else r.e.reloadCertificates() catch {},
             }
+            _ = r.calls.fetchAdd(1, .release);
         }
     }
+
+    /// The racers' call counts, and where they stood at the stop.
+    const Past = struct {
+        calls: *const [3]std.atomic.Value(u64),
+        at: [3]u64,
+        /// Every racer has made a call it started after `at` was taken.
+        fn passed(c: Past) bool {
+            for (c.calls, c.at) |*n, at| if (n.load(.acquire) < at + 2) return false;
+            return true;
+        }
+    };
 };
 
 test "capi engine: drain and reloads from other threads race the stop, many times over" {
@@ -1118,15 +1138,23 @@ test "capi engine: drain and reloads from other threads race the stop, many time
         defer e.destroy();
         try e.start();
         var stop: std.atomic.Value(bool) = .init(false);
+        var calls: [3]std.atomic.Value(u64) = @splat(.init(0));
         var threads: [3]std.Thread = undefined;
-        for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Racer.run, .{Racer{ .e = e, .stop = &stop, .which = @intCast(i) }});
+        for (&threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Racer.run, .{Racer{ .e = e, .stop = &stop, .which = @intCast(i), .calls = &calls[i] }});
         // The stop lands at a different point of the racers' calls each
-        // round.
+        // round (load spread on purpose, no claim on time).
         try std.Io.sleep(tio, .fromMicroseconds(@intCast(round * 400)), .awake);
         try e.drain();
         try std.testing.expect(e.wait(stopWaitMs()));
-        // Past the stop the calls are refused; let them run into that too.
-        try std.Io.sleep(tio, .fromMilliseconds(2), .awake);
+        // Past the stop the calls are refused: each racer makes one whole
+        // call that began after the stop (two counted past this point).
+        var at: [3]u64 = undefined;
+        for (&at, &calls) |*a, *n| a.* = n.load(.acquire);
+        wait.waitUntil(tio, "every racer called past the stop", Racer.Past{ .calls = &calls, .at = at }, Racer.Past.passed) catch |err| {
+            stop.store(true, .release);
+            for (threads) |t| t.join();
+            return err;
+        };
         stop.store(true, .release);
         for (threads) |t| t.join();
         try std.testing.expectError(error.State, e.reloadCertificates());
@@ -1755,16 +1783,17 @@ test "capi engine: two publishes to one topic from one thread never swap, on 4 e
             while (i < 2000) : (i += 1) {
                 var b0: [16]u8 = undefined;
                 const text = try std.fmt.bufPrint(&b0, "{d}", .{i});
-                while (true) {
-                    engine.ws.publish(e_, "seq", abi.WS_TEXT, text, 0) catch |err| switch (err) {
-                        error.Again => {
-                            try io_.sleep(.fromMilliseconds(1), .awake);
-                            continue;
-                        },
-                        else => return err,
-                    };
-                    break;
-                }
+                // Back-pressure (Again) is retried until the topic takes it.
+                const Pub = struct { e: *engine.Engine, text: []const u8 };
+                try wait.waitUntil(io_, "the topic took the message", Pub{ .e = e_, .text = text }, struct {
+                    fn published(p: Pub) !bool {
+                        engine.ws.publish(p.e, "seq", abi.WS_TEXT, p.text, 0) catch |err| switch (err) {
+                            error.Again => return false,
+                            else => return err,
+                        };
+                        return true;
+                    }
+                }.published);
             }
             var buf: [64]u8 = undefined;
             var want: u32 = 0;

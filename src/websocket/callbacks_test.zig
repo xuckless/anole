@@ -6,6 +6,7 @@ const zio = @import("zio");
 const dusty = @import("dusty");
 const websocket = @import("root.zig");
 const features = @import("build_options");
+const wait = @import("anole_test_wait");
 const have_tls = features.tls == .boringssl;
 const tls = if (have_tls) @import("anole_dusty_tls") else struct {};
 const tls_root = if (have_tls) @import("../tls/root.zig") else struct {};
@@ -22,6 +23,8 @@ var last_end_error: std.atomic.Value(bool) = .init(false);
 var last_socket: std.atomic.Value(?*websocket.Socket) = .init(null);
 /// Tasks the callbacks started, joined by the test.
 var background: std.Io.Group = .init;
+/// Set by the test once the socket parked: `sendLater` sends then.
+var later_go: std.Io.Event = .unset;
 
 fn resetCounts() void {
     opened.store(0, .release);
@@ -71,7 +74,7 @@ const Echo = struct {
     }
 
     fn sendLater(ws: *websocket.Socket) std.Io.Cancelable!void {
-        try ws.io.sleep(.fromMilliseconds(150), .awake);
+        try later_go.wait(ws.io);
         ws.send(.text, "later!") catch {};
     }
 };
@@ -244,30 +247,27 @@ const Fixture = struct {
     }
 
     fn waitParked(self: *Fixture, n: usize) !void {
-        for (0..200) |_| {
-            if (self.server.parkedConnections() == n) return;
-            try self.io.sleep(.fromMilliseconds(5), .awake);
-        }
-        std.debug.print("parked: {d}, want {d}\n", .{ self.server.parkedConnections(), n });
-        return error.TestUnexpectedResult;
+        const Ctx = struct { f: *Fixture, n: usize };
+        wait.waitUntil(self.io, "the server parked the connections", Ctx{ .f = self, .n = n }, struct {
+            fn parked(c: Ctx) bool {
+                return c.f.server.parkedConnections() == c.n;
+            }
+        }.parked) catch |err| {
+            std.debug.print("parked: {d}, want {d}\n", .{ self.server.parkedConnections(), n });
+            return err;
+        };
     }
 
-    /// Waits up to two seconds for the server to hold `n` connections.
+    /// Waits for the server to hold `n` connections.
     fn waitConnections(self: *Fixture, n: u32) !void {
-        for (0..400) |_| {
-            if (self.server.active_connections.load(.acquire) == n) return;
-            try self.io.sleep(.fromMilliseconds(5), .awake);
-        }
-        std.debug.print("connections: {d}, want {d}\n", .{ self.server.active_connections.load(.acquire), n });
-        return error.TestUnexpectedResult;
+        wait.waitEqual(self.io, "the server holds the connections", &self.server.active_connections, n) catch |err| {
+            std.debug.print("connections: {d}, want {d}\n", .{ self.server.active_connections.load(.acquire), n });
+            return err;
+        };
     }
 
     fn waitClosed(self: *Fixture, n: u32) !void {
-        for (0..400) |_| {
-            if (closed.load(.acquire) == n) return;
-            try self.io.sleep(.fromMilliseconds(5), .awake);
-        }
-        return error.TestUnexpectedResult;
+        try wait.waitEqual(self.io, "the close callbacks ran", &closed, n);
     }
 };
 
@@ -345,7 +345,11 @@ test "WebSocket callbacks: messages, ping and close across parking, over TLS" {
     try messagesAcrossParking(true);
 }
 
-test "WebSocket callbacks: a busy socket keeps its task; one woken after a long park parks again once answered" {
+test "WebSocket callbacks: a busy socket keeps its task; one woken after a long park parks again once answered [timing]" {
+    // Messages 50 ms apart against a 200 ms park delay, and "parked again
+    // within the delay": elapsed-time claims (on a loaded machine the gap
+    // itself can pass the delay; TESTING.md D6), as idle park's own.
+    try wait.requireTiming();
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;
     try f.start(gpa, false, .{ .timeout = .{ .idle_park = .fromMilliseconds(200) } });
@@ -406,8 +410,10 @@ test "WebSocket callbacks: another task sends to a parked socket" {
     try last_socket.load(.acquire).?.send(.text, "pushed");
     try c.expectText("pushed");
     // From a task a callback started, which sends once the socket parked.
+    later_go = .unset;
     try c.send(0x1, "later");
     try f.waitParked(1);
+    later_go.set(f.io);
     try c.expectText("later!");
     try f.waitParked(1);
     try c.send(0x1, "x");

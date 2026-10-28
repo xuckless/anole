@@ -3,6 +3,7 @@
 //! listener, and handle kinds.
 
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
 const sse_test = @import("sse_test.zig");
@@ -44,11 +45,11 @@ const Rx = struct {
                 const r = rx.recs.items[rx.next_at];
                 rx.next_at += 1;
                 const ev: *const abi.Event = @ptrCast(@alignCast(r.ptr));
-                if (ev.type == @intFromEnum(abi.EventType.watch_status)) {
+                if (ev.type == @backingInt(abi.EventType.watch_status)) {
                     const st: *const abi.WatchStatusEvent = @ptrCast(@alignCast(r.ptr));
                     if (st.status == abi.WATCH_CONNECTED or st.status == abi.WATCH_DISCONNECTED) continue;
                 }
-                if (ev.type == @intFromEnum(abi.EventType.watch_event) or ev.type == @intFromEnum(abi.EventType.watch_status) or ev.type == @intFromEnum(abi.EventType.watch_end)) return r;
+                if (ev.type == @backingInt(abi.EventType.watch_event) or ev.type == @backingInt(abi.EventType.watch_status) or ev.type == @backingInt(abi.EventType.watch_end)) return r;
             }
             try rx.pump(25);
         }
@@ -105,7 +106,7 @@ test "capi engine: a watch listener over a fake source: records parse, overflow 
     for (0..2) |i| {
         const r = try rx.next();
         const ev: *const abi.WatchEvent = @ptrCast(@alignCast(r.ptr));
-        try std.testing.expectEqual(@as(u32, @intFromEnum(abi.EventType.watch_event)), ev.ev.type);
+        try std.testing.expectEqual(@as(u32, @backingInt(abi.EventType.watch_event)), ev.ev.type);
         try std.testing.expectEqual(@as(u64, 77), ev.user_data);
         try std.testing.expectEqual(@as(u16, abi.WATCH_SRC_REDIS), ev.source);
         try std.testing.expectEqual(@as(u16, abi.WATCH_OP_MESSAGE), ev.op);
@@ -119,7 +120,7 @@ test "capi engine: a watch listener over a fake source: records parse, overflow 
     {
         const r = try rx.next();
         const st: *const abi.WatchStatusEvent = @ptrCast(@alignCast(r.ptr));
-        try std.testing.expectEqual(@as(u32, @intFromEnum(abi.EventType.watch_status)), st.ev.type);
+        try std.testing.expectEqual(@as(u32, @backingInt(abi.EventType.watch_status)), st.ev.type);
         try std.testing.expectEqual(abi.WATCH_GAP, st.status);
         try std.testing.expectEqual(@as(u64, 3), st.dropped);
         const r2 = try rx.next();
@@ -168,7 +169,7 @@ test "capi engine: a watch listener over a fake source: records parse, overflow 
     {
         const r = try rx.next();
         const en: *const abi.WatchEndEvent = @ptrCast(@alignCast(r.ptr));
-        try std.testing.expectEqual(@as(u32, @intFromEnum(abi.EventType.watch_end)), en.ev.type);
+        try std.testing.expectEqual(@as(u32, @backingInt(abi.EventType.watch_end)), en.ev.type);
         try std.testing.expectEqual(abi.WATCH_END_UNLISTENED, en.reason);
         try std.testing.expectEqual(hf, en.ev.handle);
     }
@@ -180,13 +181,13 @@ test "capi engine: a watch listener over a fake source: records parse, overflow 
     while (ended < 2) {
         const r = try rx.next();
         const ev: *const abi.Event = @ptrCast(@alignCast(r.ptr));
-        if (ev.type != @intFromEnum(abi.EventType.watch_end)) continue;
+        if (ev.type != @backingInt(abi.EventType.watch_end)) continue;
         const en: *const abi.WatchEndEvent = @ptrCast(@alignCast(r.ptr));
         try std.testing.expectEqual(abi.WATCH_END_DRAINED, en.reason);
         try std.testing.expect(ev.handle == h or ev.handle == hj);
         ended += 1;
     }
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }
 
 test "capi engine: handle kinds: an sse handle given to ws_send, a watch handle to sse_send: Invalid; release works on both" {
@@ -216,7 +217,7 @@ test "capi engine: handle kinds: an sse handle given to ws_send, a watch handle 
     var f = try io.concurrent(kindsCheck, .{ &a, e.port(0), io, wh });
     try f.await(io);
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }
 
 fn kindsCheck(a: *sse_test.SseConsumer, port: u16, io: std.Io, wh: u64) !void {
@@ -224,12 +225,8 @@ fn kindsCheck(a: *sse_test.SseConsumer, port: u16, io: std.Io, wh: u64) !void {
     var cl: sse_test.RawSse = undefined;
     try cl.open(io, port, "/me", "");
     defer cl.close(io);
-    for (0..2500) |_| {
-        if (a.subscribes.load(.acquire) >= 1 and a.handles[0].load(.acquire) != 0) break;
-        try io.sleep(.fromMilliseconds(2), .awake);
-    }
-    const sh = a.handles[0].load(.acquire);
-    try std.testing.expect(sh != 0);
+    try wait.waitAtLeast(io, "the consumer saw the subscribe", &a.subscribes, 1);
+    const sh = try wait.waitNonZero(io, "the consumer stored the subscriber's handle", &a.handles[0]);
     try std.testing.expectError(error.WrongKind, engine.ws.send(e, sh, abi.WS_TEXT, "x", false));
     try std.testing.expectError(error.WrongKind, engine.sse.send(e, wh, "", "x"));
     // Release works for both kinds.

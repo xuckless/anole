@@ -30,15 +30,21 @@ test "TLS: one connection read and written at once (one executor, tasks interlea
 test "TLS: one connection read and written at once from different threads (4 pinned executors)" {
     // A lost or reordered record shows up as a wrong byte, but a corrupted
     // TLS state can also leave both sides waiting forever: fail instead.
+    // The limit is a hang guard: 60 s times ANOLE_TEST_TIMEOUT_FACTOR, on
+    // the clock (not counted in sleeps).
     const Watchdog = struct {
         var done: std.atomic.Value(bool) = .init(false);
         fn watch() void {
-            for (0..600) |_| {
-                if (done.load(.acquire)) return;
-                std.testing.io.sleep(.fromMilliseconds(100), .awake) catch {};
+            const io = std.testing.io;
+            const limit_s: i64 = @as(i64, 60) * @import("anole_test_wait").timeoutFactor();
+            const start = std.Io.Clock.awake.now(io);
+            while (!done.load(.acquire)) {
+                if (start.untilNow(io, .awake).toSeconds() >= limit_s) {
+                    std.debug.print("TLS full-duplex check: no progress after {d} s\n", .{limit_s});
+                    std.process.exit(1);
+                }
+                io.sleep(.fromMilliseconds(100), .awake) catch {};
             }
-            std.debug.print("TLS full-duplex check: no progress after 60 s\n", .{});
-            std.process.exit(1);
         }
     };
     Watchdog.done.store(false, .release);

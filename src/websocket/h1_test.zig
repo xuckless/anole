@@ -37,11 +37,17 @@ fn echo(req: *dusty.Request, res: *dusty.Response) !void {
                 if (std.mem.eql(u8, msg.data, "park") and ws._conn == .h1) {
                     try ws.send(msg.type, msg.data);
                     const batch = &ws._conn.h1.batch;
-                    var polls: usize = 0;
-                    while ((batch.deferred.load(.monotonic) or batch.started) and polls < 2000) : (polls += 1) {
-                        req.io.sleep(.fromMilliseconds(1), .awake) catch return;
-                    }
-                    if (!batch.deferred.load(.monotonic) and !batch.started) _ = flusher_ended.fetchAdd(1, .acq_rel);
+                    const B = @TypeOf(batch);
+                    test_wait.waitUntil(req.io, "the socket's flusher sent the echo and ended", batch, struct {
+                        fn ended(b: B) bool {
+                            return !b.deferred.load(.monotonic) and !b.started;
+                        }
+                    }.ended) catch |err| switch (err) {
+                        error.Canceled => return,
+                        // Not counted: the test's check fails.
+                        error.WaitTimedOut => continue,
+                    };
+                    _ = flusher_ended.fetchAdd(1, .acq_rel);
                     continue;
                 }
                 // "wait": its echo is held for the batch while the handler
@@ -404,11 +410,7 @@ test "WebSocket over HTTP/1.1: permessage-deflate keeps its buffers out of the r
     const status = try answerHead(io, server.address.ip, "GET /deflate HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n", &line);
     try std.testing.expect(std.mem.startsWith(u8, status, "HTTP/1.1 101"));
-    for (0..1000) |_| {
-        if (deflate_apart.load(.acquire)) break;
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
-    try std.testing.expect(deflate_apart.load(.acquire));
+    try test_wait.waitFlag(io, "the deflate handler saw its buffers apart from the arena", &deflate_apart);
 }
 
 test "WebSocket over HTTP/1.1: the handshake needs a GET, a proper key and, from a browser, the same origin" {

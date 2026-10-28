@@ -312,19 +312,22 @@ test "capi nats: past the outbound limit a publish is E_AGAIN; when the server r
     // BUSY answers come before the queue refuses depends on how much the
     // sockets take, so the count is kept rather than assumed.
     var asked: usize = 0;
-    var again = false;
-    for (0..100_000) |_| {
-        if (engine.nats.publish(r.broker(), r.c, out("stalled", payload), 0)) |busy| {
-            if (busy) asked += 1;
-            try Io.sleep(tio, .fromMilliseconds(1), .awake);
-        } else |err| {
-            try std.testing.expectEqual(error.Again, err);
-            asked += 1;
-            again = true;
-            break;
+    const Fill = struct {
+        r: *Rig,
+        payload: []const u8,
+        asked: *usize,
+        fn refused(f: @This()) !bool {
+            if (engine.nats.publish(f.r.broker(), f.r.c, out("stalled", f.payload), 0)) |busy| {
+                if (busy) f.asked.* += 1;
+                return false;
+            } else |err| {
+                try std.testing.expectEqual(error.Again, err);
+                f.asked.* += 1;
+                return true;
+            }
         }
-    }
-    try std.testing.expect(again);
+    };
+    try wait.waitUntil(tio, "the outbound queue refused a publish", Fill{ .r = &r, .payload = payload, .asked = &asked }, Fill.refused);
     try r.ev.pump(0);
     const refused_at = r.ev.list.items.len;
     // The server reads again: the consumer that was refused is told.

@@ -629,10 +629,12 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
 
     const sync = struct {
         var slow_started: std.Io.Event = .unset;
+        var slow_finished: std.atomic.Value(bool) = .init(false);
     };
     sync.slow_started = .unset;
+    sync.slow_finished.store(false, .release);
 
-    // Short enough to expire long before the 2s handler finishes, so the
+    // Short enough to expire long before the handler finishes, so the
     // drain has to give up rather than wait it out.
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = loopback,
@@ -650,7 +652,10 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
     server.router.get("/slow", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
             sync.slow_started.set(req.io);
-            try req.io.sleep(.fromMilliseconds(2000), .awake);
+            // Runs until canceled (the wait helper's deadline is a hang
+            // guard): a drain that waited it out would see it finish.
+            try req.io.sleep(wait.deadline(), .awake);
+            sync.slow_finished.store(true, .release);
             res.body = "slow";
         }
     }.handle);
@@ -684,9 +689,7 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
     }
 
     // Wait until the server has fully torn down that connection.
-    while (server.active_connections.load(.acquire) != 0) {
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
+    try wait.waitEqual(io, "the server tore down the first connection", &server.active_connections, 0);
 
     // Park a slow handler so shutdown has an active connection to drain.
     const slow_stream = try server.address.ip.connect(io, .{ .mode = .stream });
@@ -701,13 +704,14 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
     try sync.slow_started.wait(io);
 
     // Graceful shutdown: the drain must block, and give up when its budget
-    // runs out rather than wait out the 2s handler. The elapsed time is what
-    // shows that -- before the fix the drain spun hot until the handler
-    // finished, which took the full two seconds. `listen` reports the
+    // runs out rather than wait out the handler: the shutdown is over while
+    // the handler has not finished on its own (before the fix the drain
+    // spun hot until the handler finished). `listen` reports the
     // cancellation either way; the drain no longer reports how it went.
     const start = std.Io.Timestamp.now(io, .awake);
     try std.testing.expectError(error.Canceled, server_future.cancel(io));
     const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
+    try std.testing.expect(!sync.slow_finished.load(.acquire));
     if (wait.timing()) try std.testing.expect(elapsed_ns < 1500 * std.time.ns_per_ms);
 }
 
@@ -1972,30 +1976,33 @@ test "Server: graceful shutdown waits for a connection that finishes in time" {
 
     const sync = struct {
         var started: std.Io.Event = .unset;
-        var finished: bool = false;
+        var release: std.Io.Event = .unset;
+        var finished: std.atomic.Value(bool) = .init(false);
     };
     sync.started = .unset;
-    sync.finished = false;
+    sync.release = .unset;
+    sync.finished.store(false, .release);
 
-    // Comfortably longer than the handler, so the drain has no reason to
-    // give up on it.
+    // The wait helper's deadline, a hang guard: the drain has no reason to
+    // give up on the handler, which the test lets go once the drain began.
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = loopback,
-        .timeout = .{ .shutdown = .fromMilliseconds(5000) },
+        .timeout = .{ .shutdown = wait.deadline() },
     }, {});
     defer server.deinit();
 
     server.router.get("/slow", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
             sync.started.set(req.io);
-            try req.io.sleep(.fromMilliseconds(200), .awake);
-            sync.finished = true;
+            try sync.release.wait(req.io);
+            sync.finished.store(true, .release);
             res.body = "slow";
         }
     }.handle);
 
     var server_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(void)) !void {
+        // Spelled out so the future can be named below.
+        fn run(s: *dusty.Server(void)) anyerror!void {
             try s.run();
         }
     }.run, .{&server});
@@ -2014,14 +2021,31 @@ test "Server: graceful shutdown waits for a connection that finishes in time" {
 
     try sync.started.wait(io);
 
-    const start = std.Io.Timestamp.now(io, .awake);
-    try std.testing.expectError(error.Canceled, server_future.cancel(io));
-    const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
-
-    // Waited for the handler rather than abandoning it, and stopped as soon
-    // as it was done rather than sitting out the rest of the budget.
-    try std.testing.expect(sync.finished);
-    try std.testing.expect(elapsed_ns >= 100 * std.time.ns_per_ms);
+    // The drain blocks on the held handler, so it runs on a task of its own.
+    var shutdown_future = try io.concurrent(struct {
+        fn run(f: *std.Io.Future(anyerror!void), _io: std.Io) !void {
+            try std.testing.expectError(error.Canceled, f.cancel(_io));
+        }
+    }.run, .{ &server_future, io });
+    defer shutdown_future.cancel(io) catch {};
+    try wait.waitUntil(io, "the server is draining", &server, struct {
+        fn draining(srv: *dusty.Server(void)) bool {
+            return srv.busy.load(.acquire).draining;
+        }
+    }.draining);
+    // Waits for the handler rather than abandoning it...
+    try wait.expectStays(io, "the shutdown waits for the held handler", &server, struct {
+        fn running(srv: *dusty.Server(void)) bool {
+            return srv.active_connections.load(.acquire) == 1;
+        }
+    }.running, wait.short_window);
+    const released = std.Io.Timestamp.now(io, .awake);
+    sync.release.set(io);
+    try shutdown_future.await(io);
+    const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - released.nanoseconds;
+    // ...which finished, and the shutdown ended once it was done rather than
+    // sitting out the rest of the budget (a speed claim: test-timing only).
+    try std.testing.expect(sync.finished.load(.acquire));
     if (wait.timing()) try std.testing.expect(elapsed_ns < 2000 * std.time.ns_per_ms);
 }
 /// Leaves one connection idle after a request and one that never sent any,
@@ -2147,9 +2171,7 @@ test "Server: a request arriving during the shutdown drain is refused, not serve
     // machine can take that long to accept it).
     const idle = try server.address.ip.connect(io, .{ .mode = .stream });
     defer idle.close(io);
-    while (server.active_connections.load(.acquire) < 2) {
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
+    try wait.waitAtLeast(io, "the server accepted the idle connection", &server.active_connections, 2);
 
     // The drain blocks on the slow handler, so it runs on a task of its own.
     var shutdown_future = try io.concurrent(struct {
@@ -2158,9 +2180,11 @@ test "Server: a request arriving during the shutdown drain is refused, not serve
         }
     }.run, .{ &server_future, io });
     defer shutdown_future.cancel(io) catch {};
-    while (!server.busy.load(.acquire).draining) {
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
+    try wait.waitUntil(io, "the server is draining", &server, struct {
+        fn draining(srv: *dusty.Server(void)) bool {
+            return srv.busy.load(.acquire).draining;
+        }
+    }.draining);
 
     var write_buf: [256]u8 = undefined;
     var writer = idle.writer(io, &write_buf);
@@ -2549,28 +2573,33 @@ test "Server: graceful shutdown waits for a request in flight on a later listene
 
     const sync = struct {
         var started: std.Io.Event = .unset;
-        var finished: bool = false;
+        var release: std.Io.Event = .unset;
+        var finished: std.atomic.Value(bool) = .init(false);
     };
     sync.started = .unset;
-    sync.finished = false;
+    sync.release = .unset;
+    sync.finished.store(false, .release);
 
+    // The shutdown budget is the wait helper's deadline, a hang guard: the
+    // handler is let go once the drain began.
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = &.{ .{ .address = loopback_addr }, .{ .address = loopback_addr } },
-        .timeout = .{ .shutdown = .fromMilliseconds(5000) },
+        .timeout = .{ .shutdown = wait.deadline() },
     }, {});
     defer server.deinit();
 
     server.router.get("/slow", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
             sync.started.set(req.io);
-            try req.io.sleep(.fromMilliseconds(200), .awake);
-            sync.finished = true;
+            try sync.release.wait(req.io);
+            sync.finished.store(true, .release);
             res.body = "slow";
         }
     }.handle);
 
     var server_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(void)) !void {
+        // Spelled out so the future can be named below.
+        fn run(s: *dusty.Server(void)) anyerror!void {
             try s.run();
         }
     }.run, .{&server});
@@ -2588,8 +2617,20 @@ test "Server: graceful shutdown waits for a request in flight on a later listene
     try writer.interface.flush();
 
     try sync.started.wait(io);
-    try std.testing.expectError(error.Canceled, server_future.cancel(io));
-    try std.testing.expect(sync.finished);
+    var shutdown_future = try io.concurrent(struct {
+        fn run(f: *std.Io.Future(anyerror!void), _io: std.Io) !void {
+            try std.testing.expectError(error.Canceled, f.cancel(_io));
+        }
+    }.run, .{ &server_future, io });
+    defer shutdown_future.cancel(io) catch {};
+    try wait.waitUntil(io, "the server is draining", &server, struct {
+        fn draining(srv: *dusty.Server(void)) bool {
+            return srv.busy.load(.acquire).draining;
+        }
+    }.draining);
+    sync.release.set(io);
+    try shutdown_future.await(io);
+    try std.testing.expect(sync.finished.load(.acquire));
 
     var read_buf: [1024]u8 = undefined;
     var reader = stream.reader(io, &read_buf);
@@ -2846,13 +2887,13 @@ test "Server: a peer that will not hang up after a 431 is hung up on anyway" {
             // Keep the connection open and keep sending: a write is taken
             // while the server is still draining, and refused once the
             // drain deadline has passed and the server has closed.
-            var probes: usize = 0;
-            while (probes < 100) : (probes += 1) {
-                try _io.sleep(.fromMilliseconds(50), .awake);
-                writer.interface.writeByte('B') catch break;
-                writer.interface.flush() catch break;
-            }
-            try std.testing.expect(probes < 100);
+            try wait.waitUntil(_io, "a write refused once the server closed", &writer.interface, struct {
+                fn refused(w: *std.Io.Writer) bool {
+                    w.writeByte('B') catch return true;
+                    w.flush() catch return true;
+                    return false;
+                }
+            }.refused);
         }
     }.run, .{ &server, io });
 
@@ -3138,7 +3179,11 @@ test "Server: a slot freed on one listener reaches a connection waiting on anoth
     var second_served: std.atomic.Value(bool) = .init(false);
     var second = try io.concurrent(Get.run, .{ server.addresses[1], io, &second_served, null });
     defer second.cancel(io) catch {};
-    try io.sleep(.fromMilliseconds(100), .awake);
+    try wait.expectStays(io, "the second connection waits while the slot is taken", &second_served, struct {
+        fn unserved(v: *const std.atomic.Value(bool)) bool {
+            return !v.load(.acquire);
+        }
+    }.unserved, wait.short_window);
 
     release_first.set(io);
     try first.await(io);
@@ -3428,7 +3473,8 @@ test "Server: a head that does not arrive within read_header closes the connecti
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = loopback,
-        .timeout = .{ .request = .fromSeconds(5), .read_header = .fromMilliseconds(200) },
+        // The request deadline only as a hang guard (the wait helper's).
+        .timeout = .{ .request = wait.deadline(), .read_header = .fromMilliseconds(200) },
     }, {});
     defer server.deinit();
     server.router.post("/echo", struct {
@@ -3466,6 +3512,7 @@ test "Server: a head that does not arrive within read_header closes the connecti
         var w = stream.writer(io, &wbuf);
         try w.interface.writeAll("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nConnection: close\r\n\r\n");
         try w.interface.flush();
+        // Slower than read_header on purpose (a lower bound).
         try io.sleep(.fromMilliseconds(400), .awake);
         try w.interface.writeAll("late");
         try w.interface.flush();
@@ -4177,7 +4224,8 @@ test "stream: an event stream outlives timeouts.request" {
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = loopback,
-        .timeout = .{ .request = .fromMilliseconds(300), .write = .fromSeconds(5) },
+        // The write deadline only as a hang guard (the wait helper's).
+        .timeout = .{ .request = .fromMilliseconds(300), .write = wait.deadline() },
     }, {});
     defer server.deinit();
     server.router.get("/slow", struct {

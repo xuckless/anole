@@ -931,6 +931,8 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "fuzz", .module = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig"), .target = target, .optimize = optimize }) },
                     .{ .name = "anole_banner", .module = b.createModule(.{ .root_source_file = b.path("src/banner/root.zig"), .target = target, .optimize = optimize }) },
+                    // Its tests' waits (test blocks only: the module stays std-only).
+                    .{ .name = "anole_test_wait", .module = testWaitModule(b, target, optimize) },
                 },
             }),
             .use_llvm = use_llvm,
@@ -1672,7 +1674,11 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("tests/h3/client.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "anole", .module = anole_mod }},
+                .imports = &.{
+                    .{ .name = "anole", .module = anole_mod },
+                    // The one the anole module has (a file lives in one module).
+                    .{ .name = "anole_test_wait", .module = core.test_wait },
+                },
             }),
         });
         b.step("h3-test-client", "Build the HTTP/3 test client (tests/h3/run.sh drives it against aioquic)").dependOn(&b.addInstallArtifact(h3_client, .{}).step);
