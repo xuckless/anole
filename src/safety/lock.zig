@@ -14,9 +14,10 @@
 //! acquisition and of every lock held, symbolized, before it panics. Outside
 //! debug builds none of this is compiled in.
 //!
-//! The global order, outer first (SAFETY.md L4). A lock of rank `leaf`, the
-//! default, is held alone: no other lock while it is held, and it is not
-//! taken while another is.
+//! The global order, outer first (SAFETY.md L4): `table`, `protocol`, `tls`,
+//! then `leaf`. A lock of rank `leaf` (most locks) is the innermost level:
+//! it may be taken while holding any lock above it, but nothing is taken
+//! while it is held, not even another leaf.
 const std = @import("std");
 const zio = @import("zio");
 const enabled = @import("root.zig").enabled;
@@ -28,7 +29,8 @@ pub const Rank = enum(u8) {
     protocol = 20,
     /// The per-connection TLS spin lock.
     tls = 30,
-    /// Held alone (most locks).
+    /// The innermost level (most locks): taken under any other rank, and
+    /// no lock is taken while it is held.
     leaf = 255,
 };
 
@@ -61,7 +63,11 @@ fn acquired(rank: Rank, site: usize) void {
     if (!enabled) return;
     if (held_len > 0) {
         const top = held[held_len - 1].rank;
-        if (rank == .leaf or top == .leaf or @backingInt(rank) <= @backingInt(top))
+        // Ranks rise strictly. `leaf` is the highest, so a leaf may be taken
+        // under any other rank, and nothing (not even a leaf) under a leaf.
+        if (top == .leaf)
+            report(site, "SAFETY.md L4: taking a {s} lock while holding a leaf lock: no lock is taken under a leaf lock", .{@tagName(rank)}, rank, "taken")
+        else if (@backingInt(rank) <= @backingInt(top))
             report(site, "SAFETY.md L4: taking a {s} lock while holding a {s} lock breaks the lock order", .{ @tagName(rank), @tagName(top) }, rank, "taken");
         if (held_len == max_held) report(site, "SAFETY.md L4: more than {d} locks held", .{max_held}, rank, "taken");
     }
@@ -254,6 +260,17 @@ test "lock: ranks taken in order nest" {
     try std.testing.expectEqual(@as(usize, 0), heldLocks());
 }
 
+test "lock: a leaf lock may be taken while holding a table lock" {
+    var t: SpinLock(.table) = .init;
+    var l: SpinLock(.leaf) = .init;
+    t.lock();
+    l.lock();
+    if (enabled) try std.testing.expectEqual(@as(usize, 2), heldLocks());
+    l.unlock();
+    t.unlock();
+    try std.testing.expectEqual(@as(usize, 0), heldLocks());
+}
+
 test "lock: tryLock of a held mutex fails and counts nothing" {
     var m: Mutex(.leaf) = .init;
     try std.testing.expect(m.tryLock());
@@ -286,6 +303,17 @@ fn orderViolation(run: bool) [2]u32 {
     if (run) t.lock();
     const inner = @src().line + 1;
     if (run) p.lock();
+    return .{ outer, inner };
+}
+
+/// Takes a leaf lock, then a table lock under it, at the lines it returns.
+fn underLeaf(run: bool) [2]u32 {
+    var l: SpinLock(.leaf) = .init;
+    var t: SpinLock(.table) = .init;
+    const outer = @src().line + 1;
+    if (run) l.lock();
+    const inner = @src().line + 1;
+    if (run) t.lock();
     return .{ outer, inner };
 }
 
@@ -330,6 +358,18 @@ test "lock: waiting while holding names where both locks were taken" {
     defer std.testing.allocator.free(out);
     const lines = waitWhileHolding(false);
     try std.testing.expect(std.mem.indexOf(u8, out, "SAFETY.md L2: waiting for a protocol lock while holding a table lock") != null);
+    try expectSite(out, lines[0]);
+    try expectSite(out, lines[1]);
+}
+
+test "lock: a lock taken while holding a leaf names where both were taken" {
+    if (!enabled) return error.SkipZigTest;
+    const key = "a lock taken while holding a leaf names where both were taken";
+    if (child.isChild(key)) _ = underLeaf(true);
+    const out = try child.runPanicking(std.testing.allocator, key);
+    defer std.testing.allocator.free(out);
+    const lines = underLeaf(false);
+    try std.testing.expect(std.mem.indexOf(u8, out, "SAFETY.md L4: taking a table lock while holding a leaf lock") != null);
     try expectSite(out, lines[0]);
     try expectSite(out, lines[1]);
 }
