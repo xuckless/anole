@@ -322,8 +322,18 @@ test "observe: the exporter stops at once, not after its interval" {
     _ = exporter.queue.putUncancelable(io, &.{span}, 1) catch unreachable;
     _ = try wait.waitNonZero(io, "the exporter dropped a span", &exporter.dropped);
 
+    // deinit on a task of its own: it must end within the wait deadline
+    // (10 s), far inside the 60 s interval it would otherwise wait out.
     const start: std.Io.Clock.Timestamp = .now(io, .awake);
-    exporter.deinit();
+    var stopped: std.atomic.Value(bool) = .init(false);
+    var stopper = try io.concurrent(struct {
+        fn run(e: *observe.trace.Exporter, done: *std.atomic.Value(bool)) void {
+            e.deinit();
+            done.store(true, .release);
+        }
+    }.run, .{ &exporter, &stopped });
+    defer stopper.await(io);
+    try wait.waitFlag(io, "the exporter's deinit returned", &stopped);
     if (wait.timing()) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
 }
 
