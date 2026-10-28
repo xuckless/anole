@@ -13,6 +13,10 @@ const websocket = @import("root.zig");
 const observe = @import("../observe/root.zig");
 
 var saw_draining: std.atomic.Value(bool) = .init(false);
+/// The "wait" handler: set by the test once the echo it holds arrived;
+/// whether the handler gave up waiting for that (the echo came late).
+var wait_release: std.Io.Event = .unset;
+var wait_gave_up: std.atomic.Value(bool) = .init(false);
 
 fn echo(req: *dusty.Request, res: *dusty.Response) !void {
     var ws = (try websocket.upgrade(req, res, .{})) orelse {
@@ -31,10 +35,16 @@ fn echo(req: *dusty.Request, res: *dusty.Response) !void {
                 // A handler that goes off to wait for something with the
                 // peer's next message unread (cut short by the server's
                 // shutdown, which closes the socket under it).
+                // "wait": its echo is held for the batch while the handler
+                // waits for the test, which releases it once the echo has
+                // arrived (a hang guard aside: `wait_gave_up` says so).
                 const wait = std.mem.eql(u8, msg.data, "wait");
                 if (wait) {
                     ws.send(msg.type, msg.data) catch return;
-                    req.io.sleep(.fromSeconds(10), .awake) catch return;
+                    wait_release.waitTimeout(req.io, .{ .duration = .{ .raw = test_wait.deadline(), .clock = .awake } }) catch |err| switch (err) {
+                        error.Timeout => wait_gave_up.store(true, .release),
+                        error.Canceled => {},
+                    };
                     return;
                 }
                 try ws.send(msg.type, msg.data);
@@ -687,12 +697,18 @@ test "WebSocket over HTTP/2: an answer held for a batch goes out while the handl
     try client.init(io, server.address.ip);
     defer client.deinit();
     try client.open();
+    // The handler waits for this test with "x" unread: the echo of "wait"
+    // comes while it waits, not once it returns.
+    wait_release.reset();
+    wait_gave_up.store(false, .release);
+    defer wait_release.set(io);
     try client.sendFrame(.text, "wait");
     try client.sendFrame(.text, "x");
     const start: std.Io.Clock.Timestamp = .now(io, .awake);
     var op: wsc.Opcode = undefined;
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("wait", try client.nextFrame(&op, &buf));
+    try std.testing.expect(!wait_gave_up.load(.acquire));
     if (test_wait.timing()) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
 }
 

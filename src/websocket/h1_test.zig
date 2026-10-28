@@ -7,6 +7,10 @@ const dusty = @import("dusty");
 const websocket = @import("root.zig");
 
 var saw_draining: std.atomic.Value(bool) = .init(false);
+/// The "wait" handler: set by the test once the echo it holds arrived;
+/// whether the handler gave up waiting for that (the echo came late).
+var wait_release: std.Io.Event = .unset;
+var wait_gave_up: std.atomic.Value(bool) = .init(false);
 /// Closes the echo handler has seen, and whether any of those sockets
 /// needed a flusher task of its own (`dusty.WebSocketBatch`).
 var closes_seen: std.atomic.Value(usize) = .init(0);
@@ -40,10 +44,16 @@ fn echo(req: *dusty.Request, res: *dusty.Response) !void {
                     if (!batch.deferred.load(.monotonic) and !batch.started) _ = flusher_ended.fetchAdd(1, .acq_rel);
                     continue;
                 }
+                // "wait": its echo is held for the batch while the handler
+                // waits for the test, which releases it once the echo has
+                // arrived (a hang guard aside: `wait_gave_up` says so).
                 const wait = std.mem.eql(u8, msg.data, "wait");
                 if (wait) {
                     ws.send(msg.type, msg.data) catch return;
-                    req.io.sleep(.fromSeconds(10), .awake) catch return;
+                    wait_release.waitTimeout(req.io, .{ .duration = .{ .raw = test_wait.deadline(), .clock = .awake } }) catch |err| switch (err) {
+                        error.Timeout => wait_gave_up.store(true, .release),
+                        error.Canceled => {},
+                    };
                     return;
                 }
                 try ws.send(msg.type, msg.data);
@@ -235,13 +245,18 @@ test "WebSocket over HTTP/1.1: an answer held for a batch goes out while the han
     try a.open(io, server.address.ip);
     defer a.stream.close(io);
     // "wait" with "x" behind it: the echo of "wait" is held for the batch,
-    // and the handler then sleeps with "x" unread.
+    // and the handler then waits for this test with "x" unread. The echo
+    // comes while it waits, not once it returns.
+    wait_release.reset();
+    wait_gave_up.store(false, .release);
+    defer wait_release.set(io);
     try a.queue(0x1, "wait");
     try a.queue(0x1, "x");
     try a.writer.interface.flush();
     const start: std.Io.Clock.Timestamp = .now(io, .awake);
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("wait", (try a.next(&buf)).payload);
+    try std.testing.expect(!wait_gave_up.load(.acquire));
     if (test_wait.timing()) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
 }
 
@@ -276,8 +291,12 @@ test "WebSocket over HTTP/1.1: sockets share their executor's backstop, and one 
     try std.testing.expectEqual(@as(usize, 2), closes_seen.load(.acquire));
     try std.testing.expect(!flusher_started.load(.acquire));
 
-    // "wait" with "x" behind it: its handler sleeps with the echo held, and
-    // the backstop has that socket's flusher send it.
+    // "wait" with "x" behind it: its handler waits for this test with the
+    // echo held, and the backstop has that socket's flusher send it (while
+    // the handler still waits).
+    wait_release.reset();
+    wait_gave_up.store(false, .release);
+    defer wait_release.set(io);
     var w: Raw = undefined;
     try w.open(io, server.address.ip);
     defer w.stream.close(io);
@@ -286,6 +305,7 @@ test "WebSocket over HTTP/1.1: sockets share their executor's backstop, and one 
     try w.writer.interface.flush();
     const start: std.Io.Clock.Timestamp = .now(io, .awake);
     try std.testing.expectEqualStrings("wait", (try w.next(&buf)).payload);
+    try std.testing.expect(!wait_gave_up.load(.acquire));
 
     // Meanwhile the others on the executor are answered as ever.
     var others: [4]Raw = undefined;
@@ -300,6 +320,8 @@ test "WebSocket over HTTP/1.1: sockets share their executor's backstop, and one 
             for (0..4) |_| try std.testing.expectEqualStrings("y", (try o.next(&buf)).payload);
         }
     }
+    // All of it while that handler still waited.
+    try std.testing.expect(!wait_gave_up.load(.acquire));
     if (test_wait.timing()) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
 }
 
