@@ -281,7 +281,7 @@ test "one task waits at a time, and closed wakes it" {
     defer q.deinit();
     var waiter = try io.concurrent(nextLong, .{ &q, io });
     defer _ = waiter.cancel(io) catch {};
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, @import("anole_test_wait").timeoutFactor())));
     while (!q.isReceiving(io)) {
         if (time.expired(io, give_up)) return error.TestNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);

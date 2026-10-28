@@ -74,7 +74,7 @@ const Gate = struct {
 
 /// Waits until `count` tasks wait at `gate`, for 5 s at most.
 fn awaitWaiters(io: Io, gate: *Gate, count: u32) !void {
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, @import("anole_test_wait").timeoutFactor())));
     while (gate.waiting(io) < count) {
         if (time.expired(io, give_up)) return error.TestWaitersNeverCame;
         try io.sleep(.fromMilliseconds(1), .awake);

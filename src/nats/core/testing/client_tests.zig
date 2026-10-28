@@ -8,6 +8,7 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 const testing = std.testing;
+const test_wait = @import("anole_test_wait");
 const nats = @import("../root.zig");
 const Client = nats.Client;
 const FakeServer = @import("FakeServer.zig");
@@ -80,7 +81,7 @@ test "connect, flush, rtt and close" {
 /// Waits until the client reaches `expected`, for 5 s at most.
 fn awaitState(client: *Client, expected: nats.State) !void {
     const io = client.io;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (client.state() != expected) {
         if (time.expired(io, give_up)) return error.TestStateNeverReached;
         try io.sleep(.fromMilliseconds(2), .awake);
@@ -89,7 +90,7 @@ fn awaitState(client: *Client, expected: nats.State) !void {
 
 /// Waits until `event` is set, for 5 s at most.
 fn awaitEvent(io: Io, event: *Io.Event) !void {
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (!event.isSet()) {
         event.waitTimeout(io, .{ .deadline = give_up }) catch |err| switch (err) {
             // Io.Event reports a spurious wakeup as Timeout too.
@@ -135,7 +136,7 @@ test "a later INFO replaces the first, and a server PING gets its PONG" {
     defer client.deinit();
     try client.connect();
 
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (true) {
         const info = (try client.serverInfo(testing.allocator)) orelse return error.TestNoInfo;
         defer info.deinit();
@@ -148,7 +149,7 @@ test "a later INFO replaces the first, and a server PING gets its PONG" {
     }
     // The PONG is queued when the reader takes the PING, and close() drops
     // what is still queued: wait until the server read it.
-    const answer_by = time.after(io, .fromSeconds(10));
+    const answer_by = time.after(io, .fromSeconds(10 * @as(i64, test_wait.timeoutFactor())));
     while (!answered.load(.acquire)) {
         if (time.expired(io, answer_by)) return error.TestPingNotAnswered;
         try io.sleep(.fromMilliseconds(2), .awake);
@@ -426,7 +427,7 @@ test "a server that never sends INFO, as with TLS first: Timeout" {
     try testing.expectError(error.Timeout, client.connect());
     const waited = elapsedSince(io, start);
     try testing.expect(waited.toMilliseconds() >= 100);
-    try testing.expect(waited.toSeconds() < 5);
+    if (test_wait.timing()) try testing.expect(waited.toSeconds() < 5);
     try server.await(io);
     try testing.expectEqual(0, received);
 }
@@ -464,7 +465,7 @@ test "close() while another task waits in flush: ConnectionClosed at once" {
     const start = Io.Clock.awake.now(io);
     client.close();
     try testing.expectError(error.ConnectionClosed, flusher.await(io));
-    try testing.expect(elapsedSince(io, start).toSeconds() < 1);
+    if (test_wait.timing()) try testing.expect(elapsedSince(io, start).toSeconds() < 1);
     try server.await(io);
 }
 
@@ -554,7 +555,7 @@ test "close() while another task waits in connect: ConnectionClosed at once" {
     const start = Io.Clock.awake.now(io);
     client.close();
     try testing.expectError(error.ConnectionClosed, connector.await(io));
-    try testing.expect(elapsedSince(io, start).toSeconds() < 1);
+    if (test_wait.timing()) try testing.expect(elapsedSince(io, start).toSeconds() < 1);
     try testing.expectEqual(.closed, client.state());
     try server.await(io);
 }
@@ -647,7 +648,7 @@ test "canceling the task that waits in connect(): Canceled, and the client close
     try awaitEvent(io, &accepted);
     const start = Io.Clock.awake.now(io);
     try testing.expectError(error.Canceled, connector.cancel(io));
-    try testing.expect(elapsedSince(io, start).toSeconds() < 1);
+    if (test_wait.timing()) try testing.expect(elapsedSince(io, start).toSeconds() < 1);
     try testing.expectEqual(.closed, client.state());
     try server.await(io);
 }

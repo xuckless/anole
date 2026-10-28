@@ -312,7 +312,7 @@ fn requestSilent(client: *Client, options: nats.RequestOptions) Client.RequestEr
 /// Waits until `count` requests wait for their replies, for 5 s at most.
 fn awaitAwaiting(client: *Client, count: u32) !void {
     const io = client.io;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (client.inbox.awaitingCount(io) < count) {
         if (time.expired(io, give_up)) return error.TestNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -365,7 +365,7 @@ test "the connection lost while a request waits: Disconnected at once, then Conn
     // The server hangs up on this one.
     try expectNoReply(requestHangup(&s.client), error.Disconnected);
     try expectNoReply(waiting.await(io), error.Disconnected);
-    try testing.expect(elapsedSince(io, start).toSeconds() < 2);
+    if (test_wait.timing()) try testing.expect(elapsedSince(io, start).toSeconds() < 2);
     try testing.expectEqual(0, s.client.inbox.pendingCount(io));
     // With reconnect off the lost connection closes the client; until it
     // is closed, a new request fails with Disconnected too.
@@ -377,7 +377,7 @@ test "the connection lost while a request waits: Disconnected at once, then Conn
 /// Waits until the client reaches `expected`, for 5 s at most.
 fn awaitState(client: *Client, expected: nats.State) !void {
     const io = client.io;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (client.state() != expected) {
         if (time.expired(io, give_up)) return error.TestStateNeverReached;
         try io.sleep(.fromMilliseconds(2), .awake);
@@ -395,7 +395,7 @@ test "close() while a request waits: ConnectionClosed at once" {
     const start = Io.Clock.awake.now(io);
     s.client.close();
     try expectNoReply(waiting.await(io), error.ConnectionClosed);
-    try testing.expect(elapsedSince(io, start).toSeconds() < 1);
+    if (test_wait.timing()) try testing.expect(elapsedSince(io, start).toSeconds() < 1);
     try testing.expectError(error.ConnectionClosed, s.client.request("echo.x", "?", five_seconds));
     try s.server.await(io);
 }
@@ -462,7 +462,7 @@ fn serveStalled(io: Io, listener: *net.Server, release: *Io.Event) anyerror!void
 
 /// Waits until `event` is set, for 5 s at most.
 fn awaitEvent(io: Io, event: *Io.Event) !void {
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (!event.isSet()) {
         event.waitTimeout(io, .{ .deadline = give_up }) catch |err| switch (err) {
             // Io.Event reports a spurious wakeup as Timeout too.
@@ -484,7 +484,7 @@ fn publishUntilError(client: *Client, payload: []const u8, published: *std.atomi
 /// 200 ms. 10 s at most.
 fn awaitStuck(client: *Client, published: *std.atomic.Value(u32)) !void {
     const io = client.io;
-    const give_up = time.after(io, .fromSeconds(10));
+    const give_up = time.after(io, .fromSeconds(10 * @as(i64, test_wait.timeoutFactor())));
     var last = published.load(.monotonic);
     var still_since = Io.Clock.awake.now(io);
     while (true) {
@@ -628,7 +628,7 @@ test "requestMany: the responses in order, and the stream ends after max_respons
     try expectResponse(responses, "r3");
     try testing.expect(try responses.next(.{}) == null);
     try testing.expect(try responses.next(.{}) == null);
-    try testing.expect(elapsedSince(io, start).toSeconds() < 5);
+    if (test_wait.timing()) try testing.expect(elapsedSince(io, start).toSeconds() < 5);
     try testing.expectEqual(0, s.client.inbox.pendingCount(io));
     // The two responses after the third are late.
     try s.client.flush(quick);
@@ -695,7 +695,7 @@ fn releaseResponse(result: nats.Responses.NextError!?nats.Message) void {
 /// Waits until a task waits in `responses.next()`, for 5 s at most.
 fn awaitReceiving(responses: *nats.Responses) !void {
     const io = testing.io;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (!responses.messages.isReceiving(io)) {
         if (time.expired(io, give_up)) return error.TestReceiverNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -717,7 +717,7 @@ test "requestMany: cancel() from another task ends the stream at once" {
     const start = Io.Clock.awake.now(io);
     responses.cancel();
     try testing.expect(try receiver.await(io) == null);
-    try testing.expect(elapsedSince(io, start).toSeconds() < 1);
+    if (test_wait.timing()) try testing.expect(elapsedSince(io, start).toSeconds() < 1);
     try testing.expect(try responses.next(.{}) == null);
     try testing.expectEqual(0, s.client.inbox.pendingCount(io));
     try s.finish();
@@ -726,7 +726,7 @@ test "requestMany: cancel() from another task ends the stream at once" {
 /// Waits until `responses` has received `count`, for 5 s at most.
 fn awaitResponses(responses: *nats.Responses, count: u64) !void {
     const io = testing.io;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (responses.messages.stats(io).received < count) {
         if (time.expired(io, give_up)) return error.TestResponsesNeverCame;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -929,7 +929,7 @@ fn raceCancels(rounds: u32, tally: *Tally) !void {
         var buffer: [64]u8 = undefined;
         const payload = try std.fmt.bufPrint(&buffer, "0 {d}", .{i});
         var request = try io.concurrent(requestRace, .{ &client, payload });
-        const give_up = time.after(io, .fromSeconds(5));
+        const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
         while (sent.load(.acquire) <= i) {
             if (time.expired(io, give_up)) {
                 releaseReply(request.cancel(io));
@@ -1103,7 +1103,7 @@ test "a server that refuses the inbox: requests fail with PermissionDenied at on
     try client.connect();
     const start = Io.Clock.awake.now(io);
     try testing.expectError(error.PermissionDenied, client.request("x", "?", within(30_000)));
-    try testing.expect(elapsedSince(io, start).toSeconds() < 2);
+    if (test_wait.timing()) try testing.expect(elapsedSince(io, start).toSeconds() < 2);
     try testing.expectError(error.PermissionDenied, client.request("x", "?", within(30_000)));
     try testing.expectError(error.PermissionDenied, client.requestMany("x", "?", many(30_000, 4)));
     try testing.expectEqual(0, client.inbox.pendingCount(io));

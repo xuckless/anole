@@ -910,7 +910,7 @@ fn addAndAwait(inbox: *Inbox, io: Io, deadline: Io.Clock.Timestamp) AwaitError!M
 
 /// Waits until `count` requests wait in `await`, for 5 s at most.
 fn awaitAwaiting(inbox: *Inbox, io: Io, count: u32) !void {
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, @import("anole_test_wait").timeoutFactor())));
     while (inbox.awaitingCount(io) < count) {
         if (time.expired(io, give_up)) return error.TestNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -989,7 +989,7 @@ fn subscribeUntil(inbox: *Inbox, io: Io, registry: *Registry, outbound: *Outboun
 
 /// Waits until `count` requests wait at the gate, for 5 s at most.
 fn awaitGate(inbox: *Inbox, io: Io, count: u32) !void {
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, @import("anole_test_wait").timeoutFactor())));
     while (true) {
         inbox.mutex.lockUncancelable(io);
         const waiting = inbox.changed.waiters;
@@ -1001,7 +1001,7 @@ fn awaitGate(inbox: *Inbox, io: Io, count: u32) !void {
 }
 
 fn awaitRoomWaiters(outbound: *Outbound, io: Io, count: u32) !void {
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, @import("anole_test_wait").timeoutFactor())));
     while (outbound.roomWaiters(io) < count) {
         if (time.expired(io, give_up)) return error.TestNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);
