@@ -13,7 +13,9 @@
 # Needs Docker and Zig. Everything runs inside one container on its
 # loopback, so UDP behaves the same on CI (x86_64) and on a Mac (aarch64
 # Docker). ANOLE_GRPC_H3_WORK sets the work directory (logs in logs/).
-# Exits non-zero when any case fails.
+# ANOLE_KEEP_CONTAINERS=1 leaves the container when it ends (CI collects
+# its log and state after a failure, then removes it). Exits non-zero when
+# any case fails.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
@@ -34,7 +36,9 @@ fi
 (cd "$root" && "${ZIG:-zig}" build grpc-interop-server grpc-interop-client capi-grpc \
   -Dtarget=$arch-linux-gnu -Doptimize=ReleaseSafe --prefix "$work/out")
 
-docker run --rm \
+rm_flag=--rm
+[ -z "${ANOLE_KEEP_CONTAINERS:-}" ] || rm_flag=
+docker run $rm_flag --name "anole-grpc-h3-$$" \
   -v "$work/out/bin:/anole:ro" \
   -v "$root/tests/grpc/interop/cert.sh:/scripts/cert.sh:ro" \
   -v "$here/inside.sh:/scripts/inside.sh:ro" \
