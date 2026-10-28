@@ -397,7 +397,11 @@ test "Server: an upgraded connection keeps what came with the handshake, and its
     const body = try r.take(big_len);
     for (body, 0..) |b, i| try std.testing.expectEqual(@as(u8, @truncate(i)), b);
     // The handler checks the head after the echo, so wait for it.
-    while (!@atomicLoad(bool, &ctx.echoed, .acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    try wait.waitUntil(io, "the handler checked the head", &ctx.echoed, struct {
+        fn set(b: *const bool) bool {
+            return @atomicLoad(bool, b, .acquire);
+        }
+    }.set);
     try std.testing.expect(ctx.url_ok);
 }
 
@@ -3124,7 +3128,10 @@ test "Server: a slot freed on one listener reaches a connection waiting on anoth
     var release_first: std.Io.Event = .unset;
     var first = try io.concurrent(Get.run, .{ server.addresses[0], io, &first_served, &release_first });
     defer first.cancel(io) catch {};
-    while (!first_served.load(.acquire)) try io.sleep(.fromMilliseconds(10), .awake);
+    try wait.waitFlag(io, "the first connection was served", &first_served);
+    // Sensitivity only: the first listener's accept loop goes to wait for
+    // a slot; on a slow machine it may not be there yet, which can only
+    // hide the bug, never fail the test.
     try io.sleep(.fromMilliseconds(100), .awake);
 
     // Accepted on the second listener, and held there until a slot frees.
@@ -3136,11 +3143,7 @@ test "Server: a slot freed on one listener reaches a connection waiting on anoth
     release_first.set(io);
     try first.await(io);
 
-    var waited: usize = 0;
-    while (!second_served.load(.acquire) and waited < 200) : (waited += 1) {
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
-    try std.testing.expect(second_served.load(.acquire));
+    try wait.waitFlag(io, "the second connection was served once the slot freed", &second_served);
     try second.await(io);
 }
 
@@ -3862,8 +3865,9 @@ test "Server: a request body with broken framing is a 400, and the connection cl
 }
 
 /// Sends `request` and reads until the server closes. False when it has
-/// not within `limit_ms` (the socket is then shut down to end the read).
-fn closedWithin(io: std.Io, address: std.Io.net.IpAddress, request: []const u8, limit_ms: u64) !bool {
+/// not within the wait helper's deadline (the socket is then shut down to
+/// end the read).
+fn closedWithin(io: std.Io, address: std.Io.net.IpAddress, request: []const u8) !bool {
     const stream = try address.connect(io, .{ .mode = .stream });
     defer stream.close(io);
     var wbuf: [512]u8 = undefined;
@@ -3879,8 +3883,10 @@ fn closedWithin(io: std.Io, address: std.Io.net.IpAddress, request: []const u8, 
             flag.store(true, .release);
         }
     }.run, .{ stream, io, &done });
-    var waited: u64 = 0;
-    while (!done.load(.acquire) and waited < limit_ms) : (waited += 10) try io.sleep(.fromMilliseconds(10), .awake);
+    wait.waitFlag(io, "the server closed the connection", &done) catch |err| switch (err) {
+        error.WaitTimedOut => {},
+        error.Canceled => |e| return e,
+    };
     const closed = done.load(.acquire);
     if (!closed) stream.shutdown(io, .both) catch {};
     reader.await(io);
@@ -3918,8 +3924,8 @@ test "Server: an unread body left after the request timed out or lifted its time
     try server.waitReady(io);
 
     // A body declared at 1000 bytes of which 10 come, then nothing.
-    try std.testing.expect(try closedWithin(io, server.address.ip, "POST /swallow HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n0123456789", 3000));
-    try std.testing.expect(try closedWithin(io, server.address.ip, "POST /unbounded HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n0123456789", 3000));
+    try std.testing.expect(try closedWithin(io, server.address.ip, "POST /swallow HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n0123456789"));
+    try std.testing.expect(try closedWithin(io, server.address.ip, "POST /unbounded HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n0123456789"));
 }
 
 test "Server: forwarding headers are ignored without trusted hops" {

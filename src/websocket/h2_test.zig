@@ -904,7 +904,11 @@ test "WebSocket over HTTP/2: a message from another connection's task goes out w
     try std.testing.expectEqual(@as(u16, 200), b.status);
 
     // The parked handler has run once its 200 is in.
-    while (parked_socket.load(.acquire) == null) try io.sleep(.fromMilliseconds(1), .awake);
+    try test_wait.waitUntil(io, "the parked handler ran", {}, struct {
+        fn ran(_: void) bool {
+            return parked_socket.load(.acquire) != null;
+        }
+    }.ran);
 
     var back: [256]u8 = undefined;
     var op: wsc.Opcode = undefined;

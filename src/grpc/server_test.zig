@@ -960,7 +960,7 @@ test "gRPC: the client's RST_STREAM cancels the handler" {
         defer s.deinit();
         try s.send(.{ .message = "sleep" });
         try s.closeSend();
-        while (!Sleeper.started.load(.acquire)) try io.sleep(.fromMilliseconds(5), .awake);
+        try wait.waitFlag(io, "the sleeping handler started", &Sleeper.started);
         const reset_at: std.Io.Clock.Timestamp = .now(io, .awake);
         s.cancel();
         // A 10 s sleep, over well inside a second.

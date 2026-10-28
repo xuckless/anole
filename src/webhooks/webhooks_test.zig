@@ -2,6 +2,7 @@
 //! (Delivery itself runs inside the jobs worker; it is exercised by the
 //! test round once the jobs engine is merged.)
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const wh = @import("root.zig");
 
@@ -71,31 +72,40 @@ const E2E = struct {
         const p2 = try hooks.publish(&cx, .{ .owner = owner, .type = "user.created" }, .{ .id = 8 });
         try std.testing.expectEqual(@as(u32, 0), p2.deliveries);
 
-        var waited: u32 = 0;
-        while (got.load(.acquire) == 0 and waited < 200) : (waited += 1) try io.sleep(.fromMilliseconds(50), .awake);
+        _ = try wait.waitNonZero(io, "the webhook arrived", &got);
         try std.testing.expectEqual(@as(u32, 1), got.load(.acquire));
         try std.testing.expectEqual(@as(u32, 0), bad.load(.acquire));
         // The attempt is logged once the response is read.
+        const Logged = struct {
+            hooks: *wh.Client,
+            cx: *anole.db.Ctx,
+            message: []const u8,
+            att: *[]wh.Attempt,
+            fn some(l: @This()) !bool {
+                l.att.* = try l.hooks.attempts(l.cx, .{ .message = l.message });
+                return l.att.len > 0;
+            }
+        };
         var att: []wh.Attempt = &.{};
-        waited = 0;
-        while (waited < 200) : (waited += 1) {
-            att = try hooks.attempts(&cx, .{ .message = p.message_id });
-            if (att.len > 0) break;
-            try io.sleep(.fromMilliseconds(50), .awake);
-        }
+        try wait.waitUntil(io, "the delivery attempt is logged", Logged{ .hooks = hooks, .cx = &cx, .message = p.message_id, .att = &att }, Logged.some);
         try std.testing.expectEqual(@as(usize, 1), att.len);
         try std.testing.expectEqualStrings("delivered", att[0].outcome);
         try std.testing.expectEqual(@as(u16, 200), att[0].status);
         try std.testing.expectEqual(@as(usize, 2), (try hooks.messages(&cx, .{ .owner = owner })).len);
 
-        // Pruning through its job (keep is 1 s here): both messages and the attempt go.
+        // Pruning through its job (keep is 1 s here): both messages and the
+        // attempt go. The sleep only lets them age (a lower bound).
         try io.sleep(.fromMilliseconds(1100), .awake);
         _ = try jc.enqueueRaw(&cx, "anole.webhook.prune", "{}", .{ .queue = "webhooks" });
-        waited = 0;
-        while (waited < 200) : (waited += 1) {
-            if ((try hooks.messages(&cx, .{ .owner = owner })).len == 0) break;
-            try io.sleep(.fromMilliseconds(50), .awake);
-        }
+        const Pruned = struct {
+            hooks: *wh.Client,
+            cx: *anole.db.Ctx,
+            owner: []const u8,
+            fn gone(c: @This()) !bool {
+                return (try c.hooks.messages(c.cx, .{ .owner = c.owner })).len == 0;
+            }
+        };
+        try wait.waitUntil(io, "the prune job removed the messages", Pruned{ .hooks = hooks, .cx = &cx, .owner = owner }, Pruned.gone);
         try std.testing.expectEqual(@as(usize, 0), (try hooks.messages(&cx, .{ .owner = owner })).len);
         try std.testing.expectEqual(@as(usize, 0), (try hooks.attempts(&cx, .{ .message = p.message_id })).len);
     }

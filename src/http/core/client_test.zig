@@ -688,9 +688,11 @@ test "Client: idle connections close after idle_timeout" {
     try std.testing.expectEqual(2, client.pool().idle_len);
 
     // The pool's own task closes them, with no request to notice.
-    var waited: usize = 0;
-    while (client.pool().idle_len != 0 and waited < 100) : (waited += 1) try io.sleep(.fromMilliseconds(10), .awake);
-    try std.testing.expectEqual(0, client.pool().idle_len);
+    try wait.waitUntil(io, "the pool closed its idle connections", &client, struct {
+        fn empty(c: *dusty.Client) bool {
+            return c.pool().idle_len == 0;
+        }
+    }.empty);
 
     // And the next request dials again.
     var r = try client.fetch(url, .{});

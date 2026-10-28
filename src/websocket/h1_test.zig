@@ -272,8 +272,7 @@ test "WebSocket over HTTP/1.1: sockets share their executor's backstop, and one 
         try a.send(0x8, &.{ 0x03, 0xe8 });
         _ = try a.expectClose(1000, &buf);
     }
-    var polls: usize = 0;
-    while (closes_seen.load(.acquire) < 2 and polls < 2000) : (polls += 1) try io.sleep(.fromMilliseconds(1), .awake);
+    try test_wait.waitAtLeast(io, "both closes seen", &closes_seen, 2);
     try std.testing.expectEqual(@as(usize, 2), closes_seen.load(.acquire));
     try std.testing.expect(!flusher_started.load(.acquire));
 
