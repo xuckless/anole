@@ -27,6 +27,17 @@ breaking changes are listed anyway.
   a column at a time, keeping its first column; ‹ and › mark hidden
   columns. `/h3` showed 8 of its 15 columns at 100 columns wide, with no
   sign that more existed (#119).
+- Console: `/errors` names the error a handler returned. The column was
+  empty for every 5xx the server answered itself, which is nearly all of
+  them: the 5xx ring got the request after the error had become the error
+  response.
+- Console: `/db` shows SQLite databases with their name, file and
+  connections (the writer and the readers: open, idle, in use, waiting);
+  they showed as "sqlite" with no target and no pool. SSE topics, the
+  response cache, jobs, webhooks and watches no longer show there as
+  "connector" rows with nothing in them.
+- Console: `/routes` gives WebSocket, WebTransport and gRPC routes their
+  kind (`ws`, `wt`, `grpc`); every route said `http`.
 - Jobs: a job that finished while the server drained could run a second
   time. A drain past its deadline cancels the runs still going, and the
   cancel could land on a finished run's state write (logged as "finished

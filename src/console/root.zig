@@ -298,7 +298,7 @@ pub const Console = struct {
     /// `anole_console_log`).
     pub fn logRecord(self: *Console, level: std.log.Level, scope: []const u8, rid: []const u8, route: []const u8, text: []const u8) void {
         const lr = self.logs orelse return;
-        if (@intFromEnum(level) > lr.tap.min_level.load(.monotonic)) return;
+        if (@backingInt(level) > lr.tap.min_level.load(.monotonic)) return;
         lr.push(level, scope, rid, route, false, text);
     }
 
@@ -370,4 +370,5 @@ test {
     _ = keys_dev;
     _ = @import("console_test.zig");
     _ = @import("collector_test.zig");
+    _ = @import("live_test.zig");
 }
