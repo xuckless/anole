@@ -5,6 +5,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const placement = @import("placement.zig");
+const test_wait = @import("anole_test_wait");
 
 /// Whether the injected `zio` can arm a timer against the running task. The
 /// stub says so by declaring `is_stub`; the real package does not.
@@ -292,19 +293,23 @@ test "Watch: a deadline republished before its generation does not expire the co
     const first_end = std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(500));
     watch.arm(io, .fromMilliseconds(500));
 
+    var entered: std.atomic.Value(bool) = .init(false);
     var watcher = try io.concurrent(struct {
-        fn go(w: *Watch, i: std.Io) (std.Io.Cancelable || std.Io.Timeout.Error)!void {
+        fn go(w: *Watch, i: std.Io, in: *std.atomic.Value(bool)) (std.Io.Cancelable || std.Io.Timeout.Error)!void {
+            in.store(true, .release);
             return w.wait(i);
         }
-    }.go, .{ &watch, io });
+    }.go, .{ &watch, io, &entered });
     defer watcher.cancel(io) catch {};
 
-    // The watcher is now asleep holding the first deadline. Publish a later
-    // one the way `arm` does, but stop short of the generation bump -- the
-    // window between its store and its wake.
-    try io.sleep(.fromMilliseconds(25), .awake);
+    // The watcher is on its way to sleep holding the first deadline. Publish
+    // a later one the way `arm` does, but stop short of the generation bump
+    // -- the window between its store and its wake. (A watcher that reads
+    // the later one first never builds the race: that can only hide a bug.)
+    try test_wait.waitFlag(io, "the watcher entered its wait", &entered);
+    // Far enough out that no stall reaches it (TESTING.md D6).
     const later: std.Io.Timeout = .{
-        .deadline = .fromNow(io, .{ .raw = .fromMilliseconds(5_000), .clock = .awake }),
+        .deadline = .fromNow(io, .{ .raw = .fromSeconds(600), .clock = .awake }),
     };
     watch.mutex.lockUncancelable(io);
     watch.timeout = later;
