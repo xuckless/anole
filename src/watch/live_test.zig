@@ -3,6 +3,7 @@
 //! (`-Dmongodb-test-url`, a replica set). Without the option each skips.
 
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const features = @import("build_options");
 const zio = @import("zio");
 const db = @import("../db/root.zig");
@@ -86,29 +87,30 @@ const Collector = struct {
 
     /// Waits (a guard against a hang, not a timing claim) until a line holds `needle`.
     fn waitFor(c: *Collector, io: std.Io, needle: []const u8) !void {
-        for (0..4000) |_| {
-            if (c.count(needle) > 0) return;
-            try io.sleep(.fromMilliseconds(5), .awake);
-        }
-        std.debug.print("waiting for \"{s}\" timed out\n", .{needle});
-        return error.TimedOut;
+        const Has = struct {
+            c: *Collector,
+            needle: []const u8,
+            fn seen(h: @This()) bool {
+                return h.c.count(h.needle) > 0;
+            }
+        };
+        wait.waitUntil(io, "a collected line holds the text", Has{ .c = c, .needle = needle }, Has.seen) catch |err| {
+            std.debug.print("waiting for \"{s}\" failed\n", .{needle});
+            return err;
+        };
     }
 };
 
 fn waitConnected(w: *Watch, io: std.Io) !void {
-    for (0..4000) |_| {
-        if (w.status() == .connected) return;
-        try io.sleep(.fromMilliseconds(5), .awake);
-    }
-    return error.TimedOut;
+    try wait.waitUntil(io, "the watch is connected", w, struct {
+        fn connected(wt: *Watch) bool {
+            return wt.status() == .connected;
+        }
+    }.connected);
 }
 
 fn waitGaps(c: *Collector, io: std.Io, n: u32) !void {
-    for (0..4000) |_| {
-        if (c.gaps.load(.monotonic) >= n) return;
-        try io.sleep(.fromMilliseconds(5), .awake);
-    }
-    return error.TimedOut;
+    try wait.waitAtLeast(io, "the collector saw the gaps", &c.gaps, n);
 }
 
 // ---------------------------------------------------------------------------

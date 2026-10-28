@@ -2,6 +2,7 @@
 //! every signature and models what S3 checks. All deterministic: nothing
 //! here depends on a task being scheduled within a time window.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const dusty = @import("dusty");
 const anole = @import("../root.zig");
 const db = @import("../db/root.zig");
@@ -355,7 +356,11 @@ test "s3: deinit before finish aborts the multipart upload" {
     const data = try pattern(env.ctx.arena, 6 * mib, 4);
     _ = try up.write(env.c(), data);
     // A part request means the server knows the upload and so do we.
-    while (env.fake.count("PUT", "partNumber=") == 0) try tio().sleep(.fromMilliseconds(5), .awake);
+    try wait.waitUntil(tio(), "a part request reached the server", env.fake, struct {
+        fn sent(fake: *FakeServer) bool {
+            return fake.count("PUT", "partNumber=") != 0;
+        }
+    }.sent);
     up.deinit();
     try testing.expectEqual(@as(usize, 0), env.fake.openUploads());
     try testing.expectEqual(@as(usize, 1), env.fake.count("DELETE", "uploadId="));

@@ -3,6 +3,7 @@
 //! exports call), and Anole's own clients check what goes out. The C suite
 //! (tests/capi/consumer.c) covers HTTP/1.1 and the exported API.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const builtin = @import("builtin");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
@@ -270,7 +271,7 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
                 defer s.release();
                 try std.testing.expectEqual(@as(u16, 200), status);
                 try std.testing.expectEqual(@as(usize, Answerer.big.len), body.len);
-                try waitFor(io, &a.sent, sent0 + 1);
+                try wait.waitAtLeast(io, "the borrowed body reported SENT", &a.sent, sent0 + 1);
             }
 
             step = "deadline";
@@ -286,10 +287,7 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
                 const h = try waitHeld(io, &a.held);
                 try std.testing.expectError(error.Gone, engine.respond(a.e, h, 200, &.{}, "", false));
                 // The consumer hears why: the deadline, with the 504 sent.
-                for (0..1000) |_| {
-                    if (a.last_abort.load(.acquire) == h) break;
-                    try io.sleep(.fromMilliseconds(2), .awake);
-                } else return error.TimedOut;
+                try wait.waitEqual(io, "the consumer heard the held request's ABORT", &a.last_abort, h);
                 try std.testing.expectEqual(@as(u32, abi.ABORT_DEADLINE), a.last_abort_reason.load(.acquire));
                 try std.testing.expectEqual(@as(u32, 504), a.last_abort_status.load(.acquire));
             }
@@ -319,32 +317,15 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
                     .{ .name = ":method", .value = "GET" },                                 .{ .name = ":path", .value = "/hold" },
                     .{ .name = ":scheme", .value = if (proto == .h2) "http" else "https" }, .{ .name = ":authority", .value = "localhost" },
                 }, .{});
-                var held: u64 = 0;
-                for (0..500) |_| {
-                    held = a.held.load(.acquire);
-                    if (held != 0) break;
-                    try io.sleep(.fromMilliseconds(2), .awake);
-                }
-                try std.testing.expect(held != 0);
+                const held = try wait.waitNonZero(io, "the consumer holds the request", &a.held);
                 s.cancel();
                 s.release();
                 // Wait for this stream's ABORT: a late one from an earlier
                 // step can arrive first.
-                for (0..1000) |_| {
-                    if (a.last_abort.load(.acquire) == held) break;
-                    try io.sleep(.fromMilliseconds(2), .awake);
-                } else return error.TimedOut;
+                try wait.waitEqual(io, "the consumer heard the reset stream's ABORT", &a.last_abort, held);
                 try std.testing.expectError(error.Gone, engine.respond(a.e, held, 200, &.{}, "", false));
                 try std.testing.expectEqual(@as(u32, abi.ABORT_CLIENT), a.last_abort_reason.load(.acquire));
             }
-        }
-
-        fn waitFor(io: std.Io, v: *std.atomic.Value(u32), n: u32) !void {
-            for (0..1000) |_| {
-                if (v.load(.acquire) >= n) return;
-                try io.sleep(.fromMilliseconds(2), .awake);
-            }
-            return error.TimedOut;
         }
 
         fn run() !void {
@@ -390,7 +371,7 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
             try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
 
             try e.drain();
-            try std.testing.expect(e.wait(5000));
+            try std.testing.expect(e.wait(stopWaitMs()));
             try std.testing.expectEqual(@as(u64, 0), e.stats().inflight);
         }
     };
@@ -675,11 +656,7 @@ fn writeAll(s: *anole.webtransport.Stream, data: []const u8) !void {
 }
 
 fn waitAtLeast(io: std.Io, v: *std.atomic.Value(u32), n: u32) !void {
-    for (0..2500) |_| {
-        if (v.load(.acquire) >= n) return;
-        try io.sleep(.fromMilliseconds(2), .awake);
-    }
-    return error.TimedOut;
+    try wait.waitAtLeast(io, "the counter reached its count", v, n);
 }
 
 fn wtEnd(session: *anole.webtransport.Session, conn: *anole.h3.ClientConnection) void {
@@ -728,7 +705,7 @@ test "capi engine: WebTransport sessions, streams both ways, datagrams, close, d
     try std.testing.expect(a.drains.load(.acquire) >= 1);
     var end = try io.concurrent(wtEnd, .{ second.?, conn.? });
     end.await(io);
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(stopWaitMs()));
     try std.testing.expectEqual(@as(u64, 0), e.stats().wt_sessions);
     try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
 }
@@ -821,17 +798,21 @@ const TlsCheck = struct {
         return s.reader().allocRemaining(alloc, .unlimited);
     }
 
-    /// Waits (up to 3 s) until the TCP listener at `port` serves the
-    /// certificate `ca` names.
+    /// Waits until the TCP listener at `port` serves the certificate `ca`
+    /// names.
     fn waitServes(io: std.Io, port: u16, ca: []const u8, client: *const anole.tls.Pem) !void {
-        for (0..300) |_| {
-            if (h2Get(io, port, ca, client)) |body| {
+        const C = struct {
+            io: std.Io,
+            port: u16,
+            ca: []const u8,
+            client: *const anole.tls.Pem,
+            fn serves(c: @This()) bool {
+                const body = h2Get(c.io, c.port, c.ca, c.client) catch return false;
                 alloc.free(body);
-                return;
-            } else |_| {}
-            try io.sleep(.fromMilliseconds(10), .awake);
-        }
-        return error.NotReloaded;
+                return true;
+            }
+        };
+        try wait.waitUntil(io, "the listener serves the reloaded certificate", C{ .io = io, .port = port, .ca = ca, .client = client }, C.serves);
     }
 
     fn run(e: *engine.Engine, io: std.Io, server: *const anole.tls.Pem, client: *const anole.tls.Pem, next: *const anole.tls.Pem, dir_path: []const u8) !void {
@@ -982,17 +963,17 @@ test "capi engine: mutual TLS (require, request, HTTP/3), the client certificate
     try f.await(io);
     try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(stopWaitMs()));
 }
 
-/// The handle a consumer stored in `held`, once it has (bounded).
+/// The handle a consumer stored in `held`, once it has.
+/// How long a test waits for an engine to stop: the wait helper's deadline.
+fn stopWaitMs() i32 {
+    return @intCast(wait.deadlineMs());
+}
+
 fn waitHeld(io: std.Io, held: *std.atomic.Value(u64)) !u64 {
-    for (0..2500) |_| {
-        const h = held.load(.acquire);
-        if (h != 0) return h;
-        try io.sleep(.fromMilliseconds(2), .awake);
-    }
-    return error.TimedOut;
+    return wait.waitNonZero(io, "the consumer holds the request", held);
 }
 
 /// Holds a control call inside the engine (`engine.test_control_hook`)
@@ -1047,7 +1028,7 @@ test "capi engine: a reload from another thread holds the server's stop until it
     // The reload ran on the live server (a self-signed listener reloads in
     // place), and the stop went on after it.
     try std.testing.expectEqual(@as(?anyerror, null), result);
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(stopWaitMs()));
     // After the stop: refused, never followed into a freed server.
     try std.testing.expectError(error.State, e.reloadCertificates());
     try e.drain();
@@ -1099,7 +1080,7 @@ test "capi engine: a wake from a consumer thread under way holds the server's st
     try std.testing.expect(!e.wait(400));
     WakeHold.go.set(tio);
     t.join();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(stopWaitMs()));
     // After the stop: a wake is skipped, never followed into the freed
     // runtime.
     const x = &e.execs[0];
@@ -1143,7 +1124,7 @@ test "capi engine: drain and reloads from other threads race the stop, many time
         // round.
         try std.Io.sleep(tio, .fromMicroseconds(@intCast(round * 400)), .awake);
         try e.drain();
-        try std.testing.expect(e.wait(5000));
+        try std.testing.expect(e.wait(stopWaitMs()));
         // Past the stop the calls are refused; let them run into that too.
         try std.Io.sleep(tio, .fromMilliseconds(2), .awake);
         stop.store(true, .release);
@@ -1189,7 +1170,7 @@ test "parse: proxy, request, response, http2, errors groups reach ServerOptions"
     try std.testing.expectEqual(@as(u32, 7), cfg.http2.max_concurrent_streams);
     try std.testing.expectEqual(anole.http.ErrorFormat.text, cfg.errors);
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(stopWaitMs()));
 }
 
 // ---------------------------------------------------------------------------
@@ -1216,28 +1197,32 @@ fn ringEngine(comptime queue: u32) !struct { *engine.Engine, *engine.Consumer } 
 }
 
 /// Counts what a poll returns, by event type.
-fn drainCounts(c: *engine.Consumer, counts: *[64]u32, want: u32, timeout_ms: u64) !void {
-    var buf: [64 * 1024]u8 align(8) = undefined;
-    var need: u32 = 0;
-    var total: u32 = 0;
-    const tio = engine.threadedIo();
-    var waited: u64 = 0;
-    while (total < want) {
-        const n = engine.poll(c, &buf, true, &need) catch return error.TooBig;
-        if (n == 0) {
-            if (waited >= timeout_ms) return error.TimedOut;
-            try std.Io.sleep(tio, .fromMilliseconds(5), .awake);
-            waited += 5;
-            continue;
+fn drainCounts(c: *engine.Consumer, counts: *[64]u32, want: u32) !void {
+    const Drain = struct {
+        c: *engine.Consumer,
+        counts: *[64]u32,
+        want: u32,
+        total: u32 = 0,
+        buf: [64 * 1024]u8 align(8) = undefined,
+
+        /// One poll, counted; done once `want` events came.
+        fn more(d: *@This()) error{TooBig}!bool {
+            var need: u32 = 0;
+            const n = engine.poll(d.c, &d.buf, true, &need) catch return error.TooBig;
+            var off: usize = 0;
+            while (off < n) {
+                const ev: *const abi.Event = @ptrCast(@alignCast(&d.buf[off]));
+                if (ev.type < d.counts.len) d.counts[ev.type] += 1;
+                d.total += 1;
+                off += ev.len;
+            }
+            return d.total >= d.want;
         }
-        var off: usize = 0;
-        while (off < n) {
-            const ev: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
-            if (ev.type < counts.len) counts[ev.type] += 1;
-            total += 1;
-            off += ev.len;
-        }
-    }
+    };
+    const d = try alloc.create(Drain);
+    defer alloc.destroy(d);
+    d.* = .{ .c = c, .counts = counts, .want = want };
+    try wait.waitUntil(engine.threadedIo(), "the consumer polled every event it waits for", d, Drain.more);
 }
 
 fn postMany(x: *engine.Exec, n: u32, posted: *std.atomic.Value(u32)) std.Io.Cancelable!void {
@@ -1257,17 +1242,20 @@ test "capi engine: a full ring parks the executor on the room futex" {
     var f = try e.io.concurrent(postMany, .{ x, 8, &posted });
     // The consumer does not poll: two fit the ring, and the task waits for
     // room (announced on the room futex), so no third goes in.
-    const tio = engine.threadedIo();
-    for (0..5000) |_| {
-        if (posted.load(.acquire) == 2 and x.room_waiters.load(.seq_cst) == 1) break;
-        try std.Io.sleep(tio, .fromMilliseconds(1), .awake);
-    } else return error.TimedOut;
+    const Parked = struct {
+        posted: *std.atomic.Value(u32),
+        x: *engine.Exec,
+        fn waiting(p: @This()) bool {
+            return p.posted.load(.acquire) == 2 and p.x.room_waiters.load(.seq_cst) == 1;
+        }
+    };
+    try wait.waitUntil(engine.threadedIo(), "two posted, and the poster waits for room", Parked{ .posted = &posted, .x = x }, Parked.waiting);
     try std.testing.expectEqual(@as(u32, 2), posted.load(.acquire));
     // Parked on the futex, not spinning on a yield (that gave thousands).
     try std.testing.expect(x.room_wakeups.load(.monotonic) < 10);
     // Polling makes room, and all eight arrive.
     var counts: [64]u32 = @splat(0);
-    try drainCounts(c, &counts, 8, 3000);
+    try drainCounts(c, &counts, 8);
     try f.await(e.io);
     try std.testing.expectEqual(@as(u32, 8), counts[@backingInt(abi.EventType.writable)]);
 }
@@ -1288,7 +1276,7 @@ test "capi engine: advisory events are never dropped" {
     // From another thread too: the overflow list takes it.
     x.postEvent(.writable, 300);
     var counts: [64]u32 = @splat(0);
-    try drainCounts(c, &counts, 9, 3000);
+    try drainCounts(c, &counts, 9);
     try f.await(e.io);
     try std.testing.expectEqual(@as(u32, 2), counts[@backingInt(abi.EventType.body)]);
     try std.testing.expectEqual(@as(u32, 4), counts[@backingInt(abi.EventType.abort)]);
@@ -1307,11 +1295,11 @@ test "capi engine: SENT is never lost to a full ring" {
     defer e.destroy();
     const x = &e.execs[0];
     var f = try e.io.concurrent(postSentMany, .{ x, 64 });
-    // The consumer does not poll while all 64 are posted.
-    try std.Io.sleep(engine.threadedIo(), .fromMilliseconds(200), .awake);
+    // The consumer does not poll while all 64 are posted (the poster never
+    // waits for room: SENT records go around the ring).
     try f.await(e.io);
     var counts: [64]u32 = @splat(0);
-    try drainCounts(c, &counts, 64, 3000);
+    try drainCounts(c, &counts, 64);
     try std.testing.expectEqual(@as(u32, 64), counts[@backingInt(abi.EventType.sent)]);
 }
 
@@ -1363,7 +1351,7 @@ test "capi engine: /readyz honours readiness checks and the health listener" {
     var f = try io.concurrent(readyzCheck, .{ io, e });
     try f.await(io);
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(stopWaitMs()));
 }
 
 test "capi engine: a request cut by the drain's deadline aborts with reason DRAIN" {
@@ -1390,7 +1378,7 @@ test "capi engine: a request cut by the drain's deadline aborts with reason DRAI
     const io = rt.io();
     var f = try io.concurrent(drainCheck, .{ &a, e, e.port(0), io });
     try f.await(io);
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(stopWaitMs()));
 }
 
 fn drainCheck(a: *Answerer, e: *engine.Engine, port: u16, io: std.Io) !void {
@@ -1402,19 +1390,10 @@ fn drainCheck(a: *Answerer, e: *engine.Engine, port: u16, io: std.Io) !void {
         .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
     }, .{});
     defer s.release();
-    var held: u64 = 0;
-    for (0..500) |_| {
-        held = a.held.load(.acquire);
-        if (held != 0) break;
-        try io.sleep(.fromMilliseconds(2), .awake);
-    }
-    try std.testing.expect(held != 0);
+    const held = try wait.waitNonZero(io, "the consumer holds the request", &a.held);
     // The drain's deadline (shutdown_ms) cuts the request nobody answered.
     try e.drain();
-    for (0..1500) |_| {
-        if (a.last_abort.load(.acquire) == held) break;
-        try io.sleep(.fromMilliseconds(2), .awake);
-    } else return error.TimedOut;
+    try wait.waitEqual(io, "the consumer heard the held request's ABORT", &a.last_abort, held);
     try std.testing.expectEqual(@as(u32, abi.ABORT_DRAIN), a.last_abort_reason.load(.acquire));
 }
 
@@ -1692,7 +1671,7 @@ test "capi engine: WebSocket handshakes decided by the consumer: accept with a s
     try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
     try std.testing.expect(a.upgrades.load(.acquire) >= 5);
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(stopWaitMs()));
 }
 
 test "capi engine: two publishes to one topic from one thread never swap, on 4 executors, 2000 rounds" {
@@ -1782,7 +1761,7 @@ test "capi engine: two publishes to one topic from one thread never swap, on 4 e
     try f.await(io);
     try std.testing.expectEqual(@as(u32, 0), sub.failures.load(.acquire));
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(stopWaitMs()));
 }
 
 test "capi engine: ANOLE_EV_DRAINING reaches every consumer once when the drain starts, before ANOLE_EV_STOPPED" {
@@ -1792,10 +1771,10 @@ test "capi engine: ANOLE_EV_DRAINING reaches every consumer once when the drain 
     // A second drain call tells nobody.
     try e.drain();
     var counts: [64]u32 = @splat(0);
-    try drainCounts(c, &counts, 2, 5000);
+    try drainCounts(c, &counts, 2);
     try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.draining)]);
     try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.stopped)]);
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(stopWaitMs()));
 }
 
 // ---------------------------------------------------------------------------
@@ -1978,7 +1957,7 @@ test "capi engine: a streamed answer outlives request_ms + 5 s on every protocol
     try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
     try std.testing.expectEqual(@as(u32, 4), a.started.load(.acquire));
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(stopWaitMs()));
 }
 
 test "capi engine: a fixed route behind a JWKS jwt middleware is not run inline; behind none it is" {
@@ -2012,7 +1991,7 @@ test "capi engine: a fixed route behind a JWKS jwt middleware is not run inline;
         // `has_no_wait`: some route promised not to wait.
         try std.testing.expectEqual(case.inline_ok, e.app.?.router.has_no_wait);
         try e.drain();
-        try std.testing.expect(e.wait(5000));
+        try std.testing.expect(e.wait(stopWaitMs()));
     }
 }
 

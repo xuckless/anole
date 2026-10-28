@@ -2,6 +2,7 @@
 //! wait is on bytes arriving, an event or a counter; nothing asserts a
 //! latency or a short timing window.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const features = @import("build_options");
 const server_mod = @import("../server.zig");
 const net = @import("root.zig");
@@ -72,7 +73,7 @@ const Echo = struct {
 /// Waits (yielding to the runtime, which may have one executor) until
 /// `counter` reaches `value`.
 fn waitFor(io: std.Io, counter: *std.atomic.Value(u32), value: u32) !void {
-    while (counter.load(.acquire) < value) try io.sleep(.fromMilliseconds(1), .awake);
+    try wait.waitAtLeast(io, "the callback counter reached its count", counter, value);
 }
 
 test "net tcp: callbacks echo; open, data, close in order, close reason peer" {
@@ -497,8 +498,11 @@ test "net tcp: the listener's max_connections holds a second connection in the b
             try s2.writer().writeAll("two");
             try s2.writer().flush();
             // The second waits in the kernel: only one connection is open.
-            try a.io().sleep(.fromMilliseconds(100), .awake);
-            try std.testing.expectEqual(@as(u64, 1), a.netStats().connections);
+            try wait.expectStays(a.io(), "only one connection is open", a, struct {
+                fn one(ap: *App) bool {
+                    return ap.netStats().connections == 1;
+                }
+            }.one, wait.short_window);
             s1.close();
             try expectRead(s2, "two");
         }
@@ -555,7 +559,14 @@ test "net tcp: idle callback connections hold no task, and each still echoes" {
                 try expectRead(s.*, "a");
             }
             // Parked, with no timing bound asserted: poll until all are.
-            while (a.server.parkedConnections() < streams.len) try a.io().sleep(.fromMilliseconds(2), .awake);
+            const AllParked = struct {
+                a: *App,
+                n: usize,
+                fn all(p: @This()) bool {
+                    return p.a.server.parkedConnections() >= p.n;
+                }
+            };
+            try wait.waitUntil(a.io(), "every connection parked", AllParked{ .a = a, .n = streams.len }, AllParked.all);
             for (streams) |s| {
                 try s.writer().writeAll("b");
                 try s.writer().flush();
@@ -597,7 +608,11 @@ test "net tcp: drain runs the handler's drain, and the connections left open clo
             defer s1.close();
             const s2 = try connect(a, portOf(a));
             defer s2.close();
-            while (a.netStats().connections < 2) try a.io().sleep(.fromMilliseconds(2), .awake);
+            try wait.waitUntil(a.io(), "both connections accepted", a, struct {
+                fn two(ap: *App) bool {
+                    return ap.netStats().connections >= 2;
+                }
+            }.two);
             a.stop();
             // Both said goodbye (the callback ran for both).
             try expectRead(s1, "bye");
@@ -628,21 +643,25 @@ test "net tcp: metrics count connections and bytes per listener" {
 
         fn waitUntil(a: *App, needle: []const u8) !void {
             const registry_ = a.extras.metrics.?;
-            for (0..2000) |_| {
-                var out: std.Io.Writer.Allocating = .init(alloc);
-                defer out.deinit();
-                try registry_.render(&out.writer);
-                const text = out.written();
-                if (std.mem.indexOf(u8, text, needle) != null) {
-                    try std.testing.expect(std.mem.indexOf(u8, text, "anole_net_connections_total{listener=\"tcp-0\"} 1") != null);
-                    try std.testing.expect(std.mem.indexOf(u8, text, "anole_net_bytes_received_total{listener=\"tcp-0\"} 5") != null);
-                    try std.testing.expect(std.mem.indexOf(u8, text, "anole_net_bytes_sent_total{listener=\"tcp-0\"} 5") != null);
-                    try std.testing.expect(std.mem.indexOf(u8, text, "anole_net_connections_open{listener=\"tcp-0\"} 0") != null);
-                    return;
+            const Rendered = struct {
+                registry: *@import("../observe/root.zig").metrics.Registry,
+                needle: []const u8,
+                fn has(r: @This()) !bool {
+                    var out: std.Io.Writer.Allocating = .init(alloc);
+                    defer out.deinit();
+                    try r.registry.render(&out.writer);
+                    return std.mem.indexOf(u8, out.written(), r.needle) != null;
                 }
-                try a.io().sleep(.fromMilliseconds(2), .awake);
-            }
-            return error.TimedOut;
+            };
+            try wait.waitUntil(a.io(), "the metrics show the close", Rendered{ .registry = registry_, .needle = needle }, Rendered.has);
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try registry_.render(&out.writer);
+            const text = out.written();
+            try std.testing.expect(std.mem.indexOf(u8, text, "anole_net_connections_total{listener=\"tcp-0\"} 1") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text, "anole_net_bytes_received_total{listener=\"tcp-0\"} 5") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text, "anole_net_bytes_sent_total{listener=\"tcp-0\"} 5") != null);
+            try std.testing.expect(std.mem.indexOf(u8, text, "anole_net_connections_open{listener=\"tcp-0\"} 0") != null);
         }
     }.run);
     _ = registry;

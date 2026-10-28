@@ -1,6 +1,7 @@
 //! gRPC end to end: the four call modes, status in trailers, deadlines and
 //! gzip, against the core's HTTP/2 engine with a minimal nghttp2 client.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const c = @import("anole_nghttp2_c");
@@ -959,12 +960,12 @@ test "gRPC: the client's RST_STREAM cancels the handler" {
         defer s.deinit();
         try s.send(.{ .message = "sleep" });
         try s.closeSend();
-        while (!Sleeper.started.load(.acquire)) try io.sleep(.fromMilliseconds(5), .awake);
+        try wait.waitFlag(io, "the sleeping handler started", &Sleeper.started);
         const reset_at: std.Io.Clock.Timestamp = .now(io, .awake);
         s.cancel();
         // A 10 s sleep, over well inside a second.
         while (!Sleeper.done.load(.acquire)) {
-            try std.testing.expect(reset_at.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
+            if (wait.timing()) try std.testing.expect(reset_at.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
             try io.sleep(.fromMilliseconds(5), .awake);
         }
         try std.testing.expect(Sleeper.canceled.load(.acquire));

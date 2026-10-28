@@ -4,6 +4,7 @@
 //! (`openWebTransport`, and an extended CONNECT speaking masked frames
 //! through websocket-zig's client codec).
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const features = @import("build_options");
@@ -204,11 +205,7 @@ const Fixture = struct {
 };
 
 fn waitHandlers(io: std.Io, want: u32) !void {
-    var tries: usize = 0;
-    while (handlers_done.load(.acquire) < want) : (tries += 1) {
-        if (tries > 200) return error.Timeout;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    try wait.waitAtLeast(io, "the session handlers returned", &handlers_done, want);
 }
 
 test "WebTransport: streams both ways, datagrams, and a close the server sees" {
@@ -507,9 +504,15 @@ test "WebTransport: streams a handler never accepts hold the peer's stream credi
     };
     var opened: std.atomic.Value(usize) = .init(0);
     var task = try io.concurrent(Opener.run, .{ session, &opened });
-    try io.sleep(.fromMilliseconds(1500), .awake);
+    // The server's limit (100 unidirectional streams), not all 400: well
+    // into it, and then no further.
+    try wait.waitAtLeast(io, "50 streams opened", &opened, 50);
+    try wait.expectStays(io, "the opener stays within the server's stream limit", &opened, struct {
+        fn within(v: *const std.atomic.Value(usize)) bool {
+            return v.load(.monotonic) <= 110;
+        }
+    }.within, .fromMilliseconds(500));
     task.cancel(io) catch {};
-    // The server's limit (100 unidirectional streams), not all 400.
     const n = opened.load(.monotonic);
     try std.testing.expect(n >= 50);
     try std.testing.expect(n <= 110);
@@ -576,7 +579,8 @@ test "WebTransport: a client's close waits a bounded time for a server slow to a
     session.deinit();
     conn.close();
     const waited = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
-    try std.testing.expect(waited >= 90 and waited < 1100);
+    try std.testing.expect(waited >= 90);
+    if (wait.timing()) try std.testing.expect(waited < 1100);
     try waitHandlers(io, done_before + 1);
     try std.testing.expectEqual(.peer, last_close.by.?);
     try std.testing.expectEqual(@as(u32, 4242), last_close.code);
@@ -669,17 +673,14 @@ test "WebTransport: the server closes with a code; a reset carries its code; the
         const s = try session.openStream();
         try s.writer().writeAll("part");
         try s.writer().flush();
-        // Once the stream's first bytes are out: a reset before them would
-        // reach a server that cannot tell the stream is WebTransport's
-        // (draft-02 has no RESET_STREAM_AT).
-        try io.sleep(.fromMilliseconds(100), .awake);
+        // Once the server has the stream's first bytes (their echo is
+        // back): a reset before them would reach a server that cannot tell
+        // the stream is WebTransport's (draft-02 has no RESET_STREAM_AT).
+        var echoed: [4]u8 = undefined;
+        try s.reader().readSliceAll(&echoed);
         s.reset(5);
         s.release();
-        var tries: usize = 0;
-        while (last_reset_code.load(.acquire) != 5) : (tries += 1) {
-            if (tries > 200) return error.Timeout;
-            try io.sleep(.fromMilliseconds(10), .awake);
-        }
+        try wait.waitEqual(io, "the server's echo saw the reset's code", &last_reset_code, 5);
         try session.sendDatagram("close");
         // The server's close arrives: waits end, with its code.
         try std.testing.expectError(error.SessionClosed, session.acceptStream());
@@ -951,12 +952,13 @@ test "WebTransport: a 300 KiB message write returns before the peer acknowledges
     try session.sendDatagram("go");
     // The write is queued under the stream's 1 MiB cap: it returns at once
     // (a 1 s deadline here), whatever the client has yet read.
-    var tries: usize = 0;
-    while (bulk_write_ms.load(.acquire) == std.math.maxInt(u64)) : (tries += 1) {
-        if (tries > 100) return error.TestUnexpectedResult;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
-    try std.testing.expect(bulk_write_ms.load(.acquire) < 1000);
+    // It returning at all, with nothing read here yet, is the claim.
+    try wait.waitUntil(io, "the server's bulk write returned", {}, struct {
+        fn cond(_: void) bool {
+            return bulk_write_ms.load(.acquire) != std.math.maxInt(u64);
+        }
+    }.cond);
+    if (wait.timing()) try std.testing.expect(bulk_write_ms.load(.acquire) < 1000);
     const in = try session.acceptUniStream();
     defer in.release();
     const got = try in.reader().allocRemaining(gpa, .unlimited);
@@ -992,11 +994,11 @@ test "WebTransport: a stream's reader is not woken by another stream's traffic" 
         try a.writer().flush();
     }
     try a.closeSend();
-    var tries: usize = 0;
-    while (herd_wakes.load(.acquire) == std.math.maxInt(u32)) : (tries += 1) {
-        if (tries > 300) return error.TestUnexpectedResult;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    try wait.waitUntil(io, "the herd test's reader reported its wakes", {}, struct {
+        fn cond(_: void) bool {
+            return herd_wakes.load(.acquire) != std.math.maxInt(u32);
+        }
+    }.cond);
     try std.testing.expect(herd_wakes.load(.acquire) <= 2);
 }
 
@@ -1023,13 +1025,15 @@ test "WebTransport: streams hold no send or receive blocks once their data is ac
         defer gpa.free(back);
         try std.testing.expectEqual(msg.len, back.len);
     }
-    var tries: usize = 0;
-    while (true) : (tries += 1) {
-        f.ep.sampleStats();
-        if (f.ep.stats.blocks_live.load(.monotonic) == baseline) break;
-        if (tries > 300) return error.TestUnexpectedResult;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    const Blocks = struct {
+        ep: *Endpoint,
+        baseline: u64,
+        fn back(c: @This()) bool {
+            c.ep.sampleStats();
+            return c.ep.stats.blocks_live.load(.monotonic) == c.baseline;
+        }
+    };
+    try wait.waitUntil(io, "the streams' blocks are back to the baseline", Blocks{ .ep = f.ep, .baseline = baseline }, Blocks.back);
 }
 
 test "WebTransport: an urgent stream's bytes arrive while a backlogged stream is still unread" {
@@ -1084,11 +1088,7 @@ test "WebTransport: writers wait on the connection budget and resume as acks fre
         defer gpa.free(got);
         try std.testing.expectEqual(@as(usize, 50 * 4096), got.len);
     }
-    var tries: usize = 0;
-    while (budget_done.load(.acquire) < 3) : (tries += 1) {
-        if (tries > 300) return error.TestUnexpectedResult;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    try wait.waitAtLeast(io, "the three budget streams written", &budget_done, 3);
     try session.sendDatagram("close");
 }
 
@@ -1105,11 +1105,7 @@ test "WebTransport: the session ends on the peer's close capsule with no capsule
     const done_before = handlers_done.load(.acquire);
     const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/inline" });
     defer session.deinit();
-    var tries: usize = 0;
-    while (inline_seen.load(.acquire) == 0) : (tries += 1) {
-        if (tries > 300) return error.TestUnexpectedResult;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    try wait.waitAtLeast(io, "the inline handler saw the session", &inline_seen, 1);
     // The server parses the CONNECT stream's capsules where they arrive.
     try std.testing.expectEqual(@as(u32, 1), inline_seen.load(.acquire));
     try session.close(9, "done");

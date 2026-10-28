@@ -4,6 +4,7 @@
 //! subscriber. Waits are on results; a bounded poll only guards a hang.
 
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const features = @import("build_options");
 const zio = @import("zio");
 const server_mod = @import("../server.zig");
@@ -13,14 +14,10 @@ const h2 = if (features.http2) @import("../h2/root.zig") else struct {};
 const App = server_mod.App;
 const alloc = std.testing.allocator;
 
-/// Polls `cond` every millisecond for up to 10 s (a hang guard, not a
+/// Waits until `cond(ctx)` holds (anole_test_wait: a hang guard, not a
 /// latency bound).
 fn eventually(io: std.Io, ctx: anytype, comptime cond: fn (@TypeOf(ctx)) bool) !void {
-    var i: usize = 0;
-    while (!cond(ctx)) : (i += 1) {
-        if (i > 10_000) return error.Timeout;
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
+    try wait.waitUntil(io, "the SSE test's condition (" ++ @typeName(@TypeOf(cond)) ++ ")", ctx, cond);
 }
 
 fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {

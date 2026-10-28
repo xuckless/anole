@@ -71,6 +71,20 @@ breaking changes are listed anyway.
   during the call (so a request answered right after still passes it on;
   one already answered adds none). Nothing is copied for requests that
   never enqueue.
+- Jobs: stopping a client while its maintenance round or heartbeat was in
+  a store call (PostgreSQL, Redis, SQLite) took the cancel for a failed
+  call: the round went on to its next store call through the teardown.
+  The cancel now ends the task.
+- C ABI: a request (or gRPC call) is stale as soon as it is answered, as
+  `anole.h` says ("until answered"): `anole_db_query`, `_exec`, `_begin` and
+  the S3, SMTP, NATS and jobs calls given an answered request as `req`
+  return `ANOLE_E_GONE` at once. They accepted it, and ran the call, until
+  the executor had written the answer and freed the slot. A streamed answer
+  is owed until `anole_req_stream_end` (or `anole_grpc_finish`).
+- C ABI: a transaction its request ended (aborted, past its deadline), or
+  that timed out, refuses `anole_db_tx_query`, `_exec`, `_commit` and
+  `_rollback` with `ANOLE_E_GONE` at once, as documented. They were taken
+  until the transaction's task had rolled it back.
 
 ### Changed
 
@@ -81,6 +95,13 @@ breaking changes are listed anyway.
   `error.type` (`Timeout` when its timeout expired) and an ERROR status, a
   run interrupted by a drain or lost has neither. Handlers see it as
   `job.trace_id`/`job.span_id`, and jobs they enqueue carry it.
+- Tests: Anole's tests no longer assume a fast machine. Waits go through one
+  helper (`src/testing/wait.zig`) with a 10 s deadline, scaled by
+  `ANOLE_TEST_TIMEOUT_FACTOR`, that names what it waited for when it times
+  out; sleeps that stood in for "it has happened" wait on the condition
+  itself, and elapsed-time upper bounds, in the Zig suites and the C ABI
+  suite alike, are checked only by a new local-only step,
+  `zig build test-timing` (MAINTAINING.md, "Waiting in tests").
 - Tests: a hung unit test says where it hangs. CI runs every unit test step
   with `--test-timeout 120s`; a test still running at 110 s, its teardown
   (the test Io's and allocator's deinit) included, is named and every

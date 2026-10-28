@@ -9,6 +9,7 @@ const features = @import("build_options");
 const have_tls = features.tls == .boringssl;
 const tls = if (have_tls) @import("anole_dusty_tls") else struct {};
 const tls_root = if (have_tls) @import("../tls/root.zig") else struct {};
+const wait = @import("anole_test_wait");
 
 const Server = dusty.Server(void);
 const loopback: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
@@ -17,8 +18,13 @@ fn hello(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = "hello";
 }
 
+/// GET /slow: counts itself in, then answers once the test sets
+/// `slow_gate`.
+var slow_entered: std.atomic.Value(u32) = .init(0);
+var slow_gate: std.Io.Event = .unset;
 fn slow(req: *dusty.Request, res: *dusty.Response) !void {
-    try req.io.sleep(.fromMilliseconds(300), .awake);
+    _ = slow_entered.fetchAdd(1, .release);
+    try slow_gate.wait(req.io);
     res.body = "slow";
 }
 
@@ -155,22 +161,27 @@ const Fixture = struct {
         return self.server.address.ip;
     }
 
-    /// Waits up to a second for `n` connections to be parked.
+    /// Waits for `n` connections to be parked.
     fn waitParked(self: *Fixture, n: usize) !void {
-        for (0..200) |_| {
-            if (self.server.parkedConnections() == n) return;
-            try self.io.sleep(.fromMilliseconds(5), .awake);
-        }
-        std.debug.print("parked: {d}, want {d}\n", .{ self.server.parkedConnections(), n });
-        return error.TestUnexpectedResult;
+        const C = struct {
+            f: *Fixture,
+            n: usize,
+            fn parked(c: @This()) bool {
+                return c.f.server.parkedConnections() == c.n;
+            }
+        };
+        wait.waitUntil(self.io, "the connections parked", C{ .f = self, .n = n }, C.parked) catch |err| {
+            std.debug.print("parked: {d}, want {d}\n", .{ self.server.parkedConnections(), n });
+            return err;
+        };
     }
 
     fn waitClosed(self: *Fixture) !void {
-        for (0..400) |_| {
-            if (self.server.active_connections.load(.acquire) == 0) return;
-            try self.io.sleep(.fromMilliseconds(5), .awake);
-        }
-        return error.TestUnexpectedResult;
+        try wait.waitUntil(self.io, "the server has no connections", self, struct {
+            fn f(fx: *Fixture) bool {
+                return fx.server.active_connections.load(.acquire) == 0;
+            }
+        }.f);
     }
 };
 
@@ -209,7 +220,10 @@ test "idle park: connections park on the executor that accepted them" {
     try parkAndResume(true, 2);
 }
 
-test "idle park: a connection busier than the park delay keeps its task" {
+test "idle park: a connection busier than the park delay keeps its task [timing]" {
+    // Requests 20 ms apart against a 200 ms delay: on a loaded machine the
+    // gap itself can pass the delay (TESTING.md D6).
+    try wait.requireTiming();
     const gpa = std.testing.allocator;
     var f: Fixture = undefined;
     try f.start(gpa, 1, false, .{ .idle_park = .fromMilliseconds(200) });
@@ -255,7 +269,9 @@ fn reparkAfterLongPark(secure: bool) !void {
     try f.waitParked(1);
 }
 
-test "idle park: a connection woken after a long park parks again once answered" {
+test "idle park: a connection woken after a long park parks again once answered [timing]" {
+    // "Within the delay" and "for the delay" are elapsed-time claims.
+    try wait.requireTiming();
     try reparkAfterLongPark(false);
     try reparkAfterLongPark(true);
 }
@@ -309,14 +325,19 @@ fn keepAliveDeadline(secure: bool) !void {
     var c: Client = undefined;
     try c.open(f.io, f.addr(), secure);
     defer c.close(f.io);
+    // Before the request: the wait for the next one starts after this, so
+    // the keep-alive deadline (600 ms from that start, never swept early)
+    // is at least 600 ms from here, however slow the machine.
+    const before = std.Io.Timestamp.now(f.io, .awake);
     try std.testing.expectEqual(200, try c.get("/"));
     try f.waitParked(1);
     const parked_at = std.Io.Timestamp.now(f.io, .awake);
     try std.testing.expect(c.hungUp());
+    // Not closed as it parked: closed at its deadline.
+    try std.testing.expect(before.untilNow(f.io, .awake).toMilliseconds() >= 600);
+    // Not much later than it (the sweep's second): a timing claim.
     const waited = parked_at.untilNow(f.io, .awake).toMilliseconds();
-    // The keep-alive deadline (600 ms from the wait's start), give or take
-    // the sweep's second.
-    try std.testing.expect(waited >= 400 and waited < 2_500);
+    if (wait.timing()) try std.testing.expect(waited < 2_500);
     try f.waitClosed();
     try std.testing.expectEqual(0, f.server.parkedConnections());
 }
@@ -372,22 +393,30 @@ test "idle park: the drain answers a parked connection's request 503, and the st
     for (&idle) |*c| try std.testing.expectEqual(200, try c.get("/"));
     try f.waitParked(idle.len);
 
-    // A request the drain waits for, then the drain.
+    // A request the drain waits for (held until the test lets it go), then
+    // the drain.
+    slow_gate = .unset;
+    defer slow_gate.set(f.io);
+    const entered = slow_entered.load(.acquire);
     var busy: Client = undefined;
     try busy.open(f.io, f.addr(), false);
     defer busy.close(f.io);
     try busy.send("GET /slow HTTP/1.1\r\nHost: x\r\n\r\n");
-    try f.io.sleep(.fromMilliseconds(50), .awake);
+    try wait.waitAtLeast(f.io, "the slow request in its handler", &slow_entered, entered + 1);
     var stopper = try f.io.concurrent(struct {
         fn run(fx: *Fixture) void {
             fx.future.cancel(fx.io) catch {};
         }
     }.run, .{&f});
-    try f.io.sleep(.fromMilliseconds(50), .awake);
-    try std.testing.expect(f.server.draining.isSet());
+    try wait.waitUntil(f.io, "the server draining", &f, struct {
+        fn draining(fx: *Fixture) bool {
+            return fx.server.draining.isSet();
+        }
+    }.draining);
 
     // A parked connection woken during the drain is refused.
     try std.testing.expectEqual(503, try idle[0].get("/"));
+    slow_gate.set(f.io);
     try std.testing.expectEqualStrings("slow", (try busy.response()).body);
     stopper.await(f.io);
     // The other parked ones were closed when the server stopped.
@@ -428,8 +457,11 @@ test "idle park: off, a connection keeps its task" {
     try c.open(f.io, f.addr(), false);
     defer c.close(f.io);
     try std.testing.expectEqual(200, try c.get("/"));
-    try f.io.sleep(.fromMilliseconds(100), .awake);
-    try std.testing.expectEqual(0, f.server.parkedConnections());
+    try wait.expectStays(f.io, "no connection parks", &f, struct {
+        fn noneParked(fx: *Fixture) bool {
+            return fx.server.parkedConnections() == 0;
+        }
+    }.noneParked, wait.short_window);
     try std.testing.expectEqual(200, try c.get("/"));
 }
 

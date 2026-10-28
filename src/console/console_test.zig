@@ -1,6 +1,7 @@
 //! Tests of the console's server side: resolution, the service over
 //! socketpairs and a real socket file, back-pressure.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const ui = @import("anole_console_ui");
 const logging = @import("anole_log");
 const modes = @import("../modes.zig");
@@ -145,16 +146,17 @@ const Harness = struct {
         try self.svc.adopt(pair[0], false);
         var c = ui.client.Conn.init(self.gpa, pair[1], pair[1]);
         errdefer c.deinit();
-        try c.handshake("test", 10_000, sys.monotonicMs);
+        try c.handshake("test", @intCast(wait.deadlineMs()), sys.monotonicMs);
         return c;
     }
 };
 
 const Wanted = enum { res, log, dropped, stats, error5xx, bye, restarting };
 
-/// Reads frames until one of kind `want` arrives (or ~10 s pass: a failure).
+/// Reads frames until one of kind `want` arrives (or the wait helper's
+/// deadline passes: a failure).
 fn waitFor(c: *ui.client.Conn, arena: std.mem.Allocator, want: Wanted) !protocol.Frame {
-    const deadline = sys.monotonicMs() + 10_000;
+    const deadline = sys.monotonicMs() + wait.deadlineMs();
     while (sys.monotonicMs() < deadline) {
         while (try c.nextFrame(arena)) |f| {
             switch (f) {
@@ -469,7 +471,7 @@ test "service: the socket file is 0600 in a 0700 directory and goes away with th
         c.close();
         c.deinit();
     }
-    try c.handshake("test", 10_000, sys.monotonicMs);
+    try c.handshake("test", @intCast(wait.deadlineMs()), sys.monotonicMs);
     try std.testing.expectEqual(@as(u32, 1), h.svc.attachedCount());
 }
 

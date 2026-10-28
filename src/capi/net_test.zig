@@ -2,6 +2,7 @@
 //! listeners through the engine, the way libanole's exports drive it.
 //! Deterministic: every wait is on a record arriving or bytes read.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const builtin = @import("builtin");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
@@ -58,7 +59,7 @@ const Rig = struct {
         r.stop.store(true, .release);
         r.thread.join();
         r.e.drain() catch {};
-        _ = r.e.wait(5000);
+        _ = r.e.wait(@intCast(wait.deadlineMs()));
         r.e.destroy();
         for (r.recs.items) |x| alloc.free(x.bytes);
         r.recs.deinit(alloc);

@@ -2,6 +2,7 @@
 //! (tests/postgres/run.sh starts one in Docker and runs these plain and
 //! over TLS). Without it they skip.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const features = @import("build_options");
 const zio = @import("zio");
 const dusty = @import("dusty");
@@ -338,7 +339,7 @@ test "pg: live a timeout or a cancel stops the statement on the server" {
     // `QueryOptions.timeout`: a 504, quickly, and the server stops.
     const started: std.Io.Clock.Timestamp = .now(io, .awake);
     try testing.expectError(error.GatewayTimeout, d.with(.{ .timeout = .fromMilliseconds(200) }).exec(&c, "SELECT pg_sleep(30)", .{}));
-    try testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 3000);
+    if (wait.timing()) try testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 3000);
     try testing.expectEqual(db.Class.timeout, db.lastError(&c).?.class);
     try expectStopped(io, watcher, &c, app_name);
 

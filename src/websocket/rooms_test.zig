@@ -4,6 +4,7 @@ const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const websocket = @import("root.zig");
+const wait = @import("anole_test_wait");
 
 var rooms: websocket.Rooms = undefined;
 
@@ -151,9 +152,12 @@ test "Rooms: a stalled member holds up neither other rooms nor joins, and leaves
             done.store(true, .release);
         }
     }.run, .{ &r, &stalled.socket, &left });
-    while (r.count("slow") != 0) try io.sleep(.fromMilliseconds(1), .awake);
-    try io.sleep(.fromMilliseconds(20), .awake);
-    try std.testing.expect(!left.load(.acquire));
+    try wait.waitUntil(io, "the leaver is out of the room's list", &r, struct {
+        fn f(rooms_: *websocket.Rooms) bool {
+            return rooms_.count("slow") == 0;
+        }
+    }.f);
+    try wait.expectStays(io, "leave waits for the send under way", &left, notSet, wait.short_window);
     try std.testing.expectEqual(@as(usize, 1), r.broadcast("fast", .text, "still", null));
 
     stalled.release.set(io);
@@ -185,13 +189,8 @@ test "Rooms: joining twice is one membership, and one leave ends it" {
     try std.testing.expectEqual(@as(usize, 0), r.broadcast("lobby", .text, "anyone?", null));
 }
 
-/// Waits (up to a second) for `done`, without blocking the runtime.
-fn eventually(io: std.Io, done: *const std.atomic.Value(bool)) !bool {
-    for (0..1000) |_| {
-        if (done.load(.acquire)) return true;
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
-    return done.load(.acquire);
+fn notSet(flag: *const std.atomic.Value(bool)) bool {
+    return !flag.load(.acquire);
 }
 
 test "Rooms: a broadcast does not wait for a member that stopped reading, and a full member is closed" {
@@ -224,7 +223,7 @@ test "Rooms: a broadcast does not wait for a member that stopped reading, and a 
             return rooms_.broadcast("room", .text, "one", null);
         }
     }.run, .{ &r, &done });
-    try std.testing.expect(try eventually(io, &done));
+    try wait.waitFlag(io, "the first broadcast returned", &done);
     try std.testing.expectEqual(@as(usize, 2), first.await(io));
     try stalled.entered.wait(io);
 
@@ -238,19 +237,17 @@ test "Rooms: a broadcast does not wait for a member that stopped reading, and a 
         try io.sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expect(reached_all < 40);
+    // Time passing on purpose: past `close_after_ms` (a sleep never ends
+    // early, so a slow machine only makes it longer).
     try io.sleep(.fromMilliseconds(60), .awake);
     try std.testing.expectEqual(@as(usize, 1), r.broadcast("room", .binary, &msg, null));
     try std.testing.expectEqual(@as(usize, 1), r.broadcast("room", .binary, &msg, null));
     // Its send was canceled: its sending side is over.
-    var closed: std.atomic.Value(bool) = .init(false);
-    for (0..1000) |_| {
-        if (stalled.ws.closed) {
-            closed.store(true, .release);
-            break;
+    try wait.waitUntil(io, "the stalled member's sending side closed", &stalled, struct {
+        fn f(st: *Stalled) bool {
+            return st.ws.closed;
         }
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
-    try std.testing.expect(closed.load(.acquire));
+    }.f);
 
     r.leave("room", &stalled.socket);
     r.leave("room", &other.socket);
@@ -279,15 +276,7 @@ test "Rooms: with on_full = drop, a full member skips messages and stays" {
     try std.testing.expectEqual(@as(usize, 2), reached);
     slow.release.set(io);
     // Room again once the queue drains.
-    var sent: std.atomic.Value(bool) = .init(false);
-    for (0..1000) |_| {
-        if (slow.written.load(.acquire) >= 3 * msg.len) {
-            sent.store(true, .release);
-            break;
-        }
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
-    try std.testing.expect(sent.load(.acquire));
+    try wait.waitAtLeast(io, "the three queued messages written", &slow.written, 3 * msg.len);
     try std.testing.expectEqual(@as(usize, 1), r.broadcast("room", .binary, &msg, null));
     r.leave("room", &slow.socket);
 }
@@ -345,13 +334,13 @@ fn joinOnly(req: *dusty.Request, res: *dusty.Response) !void {
     while (try ws.next()) |_| {}
 }
 
-/// Polls `rooms.count(room)` until it is `want`, for up to `ms`.
-fn countBecomes(io: std.Io, rooms_: *websocket.Rooms, room: []const u8, want: usize, ms: usize) !bool {
-    for (0..ms) |_| {
-        if (rooms_.count(room) == want) return true;
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
-    return rooms_.count(room) == want;
+/// Waits until the lobby of `auto_rooms` has `want` members.
+fn lobbyCountBecomes(io: std.Io, comptime want: usize) !void {
+    try wait.waitUntil(io, std.fmt.comptimePrint("the lobby has {d} member(s)", .{want}), {}, struct {
+        fn f(_: void) bool {
+            return auto_rooms.count("lobby") == want;
+        }
+    }.f);
 }
 
 const loopback: []const dusty.Listener = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }};
@@ -397,12 +386,12 @@ test "Rooms: a socket whose handler ends without leave leaves its rooms" {
     // is gone with it.
     try a.close(.normal, "");
     _ = try a.receive(); // the close echo
-    try std.testing.expect(try countBecomes(io, &auto_rooms, "lobby", 1, 2000));
+    try lobbyCountBecomes(io, 1);
     try std.testing.expectEqual(@as(usize, 1), auto_rooms.broadcast("lobby", .text, "to b", null));
     try std.testing.expectEqualStrings("to b", (try b.receive()).data);
     try b.close(.normal, "");
     _ = try b.receive();
-    try std.testing.expect(try countBecomes(io, &auto_rooms, "lobby", 0, 2000));
+    try lobbyCountBecomes(io, 0);
 }
 
 test "Rooms: a member closed for not keeping up is shut down, so its handler ends and it leaves" {
@@ -434,19 +423,13 @@ test "Rooms: a member closed for not keeping up is shut down, so its handler end
     const msg = try gpa.alloc(u8, 64 * 1024);
     defer gpa.free(msg);
     @memset(msg, 'm');
-    // By the clock, not a count of sleeps: a 1 ms sleep takes about 10 ms on
-    // Windows.
-    const start: std.Io.Clock.Timestamp = .now(io, .awake);
-    var left = false;
-    while (start.untilNow(io).raw.toMilliseconds() < 10_000) {
-        _ = auto_rooms.broadcast("lobby", .binary, msg, null);
-        try io.sleep(.fromMilliseconds(1), .awake);
-        if (auto_rooms.count("lobby") == 0) {
-            left = true;
-            break;
+    // Each poll broadcasts once more, until the member is gone.
+    try wait.waitUntil(io, "the member that stopped reading left the lobby", msg, struct {
+        fn f(m: []const u8) bool {
+            _ = auto_rooms.broadcast("lobby", .binary, m, null);
+            return auto_rooms.count("lobby") == 0;
         }
-    }
-    try std.testing.expect(left);
+    }.f);
 }
 
 /// A member whose socket counts the writes that reach it.
@@ -497,10 +480,7 @@ test "Rooms: a member with ten queued messages gets them in one write" {
     // The sender task cannot run before this one yields: all ten are
     // queued when it starts.
     for (0..10) |_| try std.testing.expectEqual(@as(usize, 1), r.broadcast("room", .text, "hello", null));
-    var waited: usize = 0;
-    while (member.bytes.load(.monotonic) < 70 and waited < 5000) : (waited += 1) {
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
+    try wait.waitAtLeast(io, "the ten messages written", &member.bytes, 70);
     try std.testing.expectEqual(@as(usize, 70), member.bytes.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 1), member.writes.load(.monotonic));
 }
@@ -519,8 +499,13 @@ test "Rooms: a member that leaves mid-drain gets nothing after leave returns and
     try r.join("room", &member.socket);
     for (0..20) |_| _ = r.broadcast("room", .text, "hello", null);
     r.leave("room", &member.socket);
-    const after = member.bytes.load(.monotonic);
-    for (0..5) |_| try io.sleep(.fromMilliseconds(2), .awake);
-    try std.testing.expectEqual(after, member.bytes.load(.monotonic));
+    const Unchanged = struct {
+        member: *Counting,
+        after: usize,
+        fn f(c: @This()) bool {
+            return c.member.bytes.load(.monotonic) == c.after;
+        }
+    };
+    try wait.expectStays(io, "no bytes reach the member after leave returned", Unchanged{ .member = &member, .after = member.bytes.load(.monotonic) }, Unchanged.f, wait.short_window);
     try std.testing.expectEqual(@as(usize, 0), r.count("room"));
 }

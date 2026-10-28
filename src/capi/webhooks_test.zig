@@ -1,5 +1,6 @@
 //! C ABI tests for p3/webhooks, imported from engine_test.zig.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const abi = @import("abi.zig");
 const config = @import("config.zig");
@@ -100,7 +101,7 @@ const AdminRig = struct {
 
     fn deinit(r: *AdminRig) void {
         r.e.drain() catch {};
-        _ = r.e.wait(5000);
+        _ = r.e.wait(@intCast(wait.deadlineMs()));
         r.e.destroy();
         alloc.free(r.json);
     }
