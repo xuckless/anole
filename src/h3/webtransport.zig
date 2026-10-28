@@ -772,6 +772,9 @@ pub const Session = struct {
     core: *Core,
     /// The CONNECT stream's ID.
     id: i64,
+    /// Counted in the open-session gauge (a session a server accepted,
+    /// `anole.webtransport.accept`); `deinit` takes it off.
+    gauged: bool = false,
     channel: Channel,
     /// Under the connection's mutex:
     state: enum { open, closed } = .open,
@@ -909,6 +912,10 @@ pub const Session = struct {
     /// go of every stream (those the handler did not release are reset).
     /// Streams must not be used after.
     pub fn deinit(self: *Session) void {
+        if (self.gauged) {
+            self.gauged = false;
+            dusty.gauges.add(self.core.io, .wt_sessions, -1);
+        }
         self.close(0, "") catch {};
         if (self.drain_watch.hooks) |hooks| hooks.remove(self.core.io, &self.drain_watch.hook);
         self.drain_watch.sender.cancel(self.core.io);

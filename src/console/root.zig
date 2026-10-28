@@ -15,6 +15,7 @@ const panic_mod = @import("../panic.zig");
 pub const os = @import("os.zig");
 pub const stats = @import("stats.zig");
 pub const logring = @import("logring.zig");
+pub const collector = @import("collector.zig");
 pub const procinfo = @import("procinfo.zig");
 pub const reexec = @import("reexec.zig");
 pub const supervisor = @import("supervisor.zig");
@@ -368,4 +369,5 @@ test {
     _ = inprocess;
     _ = keys_dev;
     _ = @import("console_test.zig");
+    _ = @import("collector_test.zig");
 }

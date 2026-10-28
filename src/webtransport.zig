@@ -121,6 +121,8 @@ pub fn accept(req: *dusty.Request, res: *dusty.Response, options: AcceptOptions)
         .drain_reason = try req.arena.dupe(u8, options.drain_reason),
     });
     errdefer self.session.deinit();
+    self.session.gauged = true;
+    dusty.gauges.add(req.io, .wt_sessions, 1);
     // The 200 out now: the client opens streams once it has it.
     try self.out.interface.flush();
     req.setDeadline(options.timeout);

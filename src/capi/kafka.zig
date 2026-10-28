@@ -779,7 +779,7 @@ pub fn groupClose(e: *Engine, hv: u64) void {
     const entry = st.groups.get(h) orelse return;
     const g = entry.value;
     g.closing.store(true, .release);
-    g.wake.set(e.io);
+    e.setEvent(&g.wake);
 }
 
 /// The drain started: every group finishes up and ends with
@@ -792,7 +792,7 @@ pub fn draining(e: *Engine) void {
         if (!entry.live) continue;
         entry.value.draining.store(true, .release);
         entry.value.closing.store(true, .release);
-        entry.value.wake.set(e.io);
+        e.setEvent(&entry.value.wake);
     }
 }
 
@@ -941,7 +941,7 @@ pub fn batchDone(e: *Engine, hv: u64) void {
     if (w.resolved) return;
     w.retry = false;
     w.resolved = true;
-    w.event.set(e.io);
+    e.setEvent(&w.event);
 }
 
 /// `anole_kafka_batch_retry` and releasing a batch handle (= retry now).
@@ -956,7 +956,7 @@ pub fn batchRetry(e: *Engine, hv: u64, delay_ms: u32) CallError!void {
     w.retry = true;
     w.delay_ms = delay_ms;
     w.resolved = true;
-    w.event.set(e.io);
+    e.setEvent(&w.event);
 }
 
 // ---------------------------------------------------------------------------

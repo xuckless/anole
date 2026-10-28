@@ -865,6 +865,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         /// is gone: the drain's executors may still reach its log rings and
         /// request counters.
         console_stopped: ?*console.Console = null,
+        /// Makes the console's snapshots that need the runtime's locks
+        /// (`/ws`, `/db`): from the console's start to just after its stop.
+        console_collector: console.collector.Collector = undefined,
+        console_collector_on: bool = false,
         console_restart: *std.Io.Event,
         console_config_text: []const u8 = "",
         console_runtime: ?[]const u8 = null,
@@ -3574,6 +3578,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 c.release();
             }
             const executors: u32 = @intCast(self.rt.executors.items.len);
+            self.console_collector = .{ .gpa = self.gpa, .io = self.rt.io(), .ctx = self, .collect = console_host.Of(Self).collect };
+            self.console_collector.start() catch |err| {
+                std.log.scoped(.anole).warn("console: not available: {t}", .{err});
+                return;
+            };
+            self.console_collector_on = true;
             self.console = console.Console.start(.{
                 .gpa = self.gpa,
                 .io = self.rt.io(),
@@ -3589,8 +3599,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 .embedded = self.console_embedded,
             }) catch |err| {
                 std.log.scoped(.anole).warn("console: not available: {t}", .{err});
+                self.stopCollector();
                 return;
             };
+        }
+
+        fn stopCollector(self: *Self) void {
+            if (!self.console_collector_on) return;
+            self.console_collector_on = false;
+            self.console_collector.stop();
         }
 
         /// Once the listeners are up: the console's startup lines, and the
@@ -3634,6 +3651,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.console = null;
             c.stop(drain);
             self.console_stopped = c;
+            // The console's threads are joined: nothing asks any more.
+            self.stopCollector();
         }
 
         /// The bound address of each listener (`http`, `https`, then

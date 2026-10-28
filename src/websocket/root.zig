@@ -273,6 +273,9 @@ pub const Socket = struct {
     subprotocol: ?[]const u8 = null,
     /// `httpVersion`.
     _http_version: HttpVersion = .http1,
+    /// Counted in the open-WebSocket gauge of `_http_version` (sockets
+    /// `upgrade` opened; `deinit` takes it off).
+    _gauged: bool = false,
     /// The application's, for state it keeps per socket: a callback socket
     /// (`callbacks`) sets it in `open` and frees what it points at in
     /// `close`. See `contextAs`.
@@ -466,6 +469,10 @@ pub const Socket = struct {
         // First, so nothing sends on the socket once it is gone: no room
         // keeps it, and no broadcast is still sending to it.
         Rooms.leaveEvery(self);
+        if (self._gauged) {
+            self._gauged = false;
+            dusty.gauges.add(self.io, gaugeOf(self._http_version), -1);
+        }
         if (self._drain_watch) |w| w.stop();
         if (comptime features.compression) if (self._deflate) |d| d.deinit();
         switch (self._conn) {
@@ -658,7 +665,17 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         hooks.add(req.io, &watch.hook);
         socket._drain_watch = watch;
     };
+    socket._gauged = true;
+    dusty.gauges.add(req.io, gaugeOf(socket._http_version), 1);
     return socket;
+}
+
+fn gaugeOf(v: HttpVersion) dusty.gauges.Kind {
+    return switch (v) {
+        .http1 => .ws_h1,
+        .http2 => .ws_h2,
+        .http3 => .ws_h3,
+    };
 }
 
 /// Deinitializes `socket` and frees what `openSocket` took from `owner`.
@@ -983,6 +1000,15 @@ pub const Rooms = struct {
     /// Signalled when a member that left has no sender running.
     idle: std.Io.Condition = .init,
     rooms: std.StringHashMapUnmanaged(std.ArrayList(*Member)) = .empty,
+    /// Members each room closed for not keeping up, while the room lives;
+    /// keyed by the room's own name in `rooms`. Under the mutex.
+    slow: std.StringHashMapUnmanaged(u64) = .empty,
+    /// In `registry` (from the first join to `deinit`). Under the mutex.
+    registered: bool = false,
+
+    /// Every `Rooms` a socket has joined, for the live console's `/ws`.
+    var registry: std.ArrayList(*Rooms) = .empty;
+    var registry_lock: std.atomic.Mutex = .unlocked;
 
     pub const Options = struct {
         /// The most broadcast bytes that may wait for one member (each
@@ -1143,6 +1169,17 @@ pub const Rooms = struct {
     /// Frees every room. Call it once no broadcast is under way; a socket
     /// still in a room is taken out of it (it must still be alive).
     pub fn deinit(self: *Rooms) void {
+        if (self.registered) {
+            self.registered = false;
+            while (!registry_lock.tryLock()) std.atomic.spinLoopHint();
+            defer registry_lock.unlock();
+            for (registry.items, 0..) |r, i| if (r == self) {
+                _ = registry.swapRemove(i);
+                break;
+            };
+            if (registry.items.len == 0) registry.clearAndFree(std.heap.page_allocator);
+        }
+        self.slow.deinit(self.allocator);
         var it = self.rooms.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -1153,6 +1190,34 @@ pub const Rooms = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.rooms.deinit(self.allocator);
+    }
+
+    /// The live console's rows for every `Rooms` a socket has joined:
+    /// `{"name","members","queued_bytes","closed_slow"}` objects, comma
+    /// separated after `first`. On a task of the runtime. A `Rooms` whose
+    /// mutex is held right now is skipped this time (a blocking lock could
+    /// suspend the task while it holds the registry's spin lock).
+    pub fn _consoleRows(w: *std.Io.Writer, first: *bool) !void {
+        while (!registry_lock.tryLock()) std.atomic.spinLoopHint();
+        defer registry_lock.unlock();
+        for (registry.items) |r| {
+            const io = r.bound() orelse continue;
+            if (!r.mutex.tryLock()) continue;
+            defer r.mutex.unlock(io);
+            var it = r.rooms.iterator();
+            while (it.next()) |entry| {
+                var queued: u64 = 0;
+                for (entry.value_ptr.items) |m| queued += m.queued_bytes;
+                if (!first.*) try w.writeByte(',');
+                first.* = false;
+                try w.print("{{\"name\":{f},\"members\":{d},\"queued_bytes\":{d},\"closed_slow\":{d}}}", .{
+                    std.json.fmt(entry.key_ptr.*, .{}),
+                    entry.value_ptr.items.len,
+                    queued,
+                    r.slow.get(entry.key_ptr.*) orelse 0,
+                });
+            }
+        }
     }
 
     fn lockMemberships(socket: *Socket) void {
@@ -1232,6 +1297,7 @@ pub const Rooms = struct {
             };
             if (members.items.len == 0) {
                 const key = self.rooms.getKey(m.room).?;
+                _ = self.slow.remove(key);
                 members.deinit(self.allocator);
                 _ = self.rooms.remove(m.room);
                 self.allocator.free(key);
@@ -1299,6 +1365,12 @@ pub const Rooms = struct {
         const io = self.bind(socket.io);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        if (!self.registered) {
+            while (!registry_lock.tryLock()) std.atomic.spinLoopHint();
+            defer registry_lock.unlock();
+            // The console's list is best effort: no room in it is no error.
+            if (registry.append(std.heap.page_allocator, self)) |_| self.registered = true else |_| {}
+        }
         const entry = try self.rooms.getOrPut(self.allocator, room);
         if (!entry.found_existing) {
             entry.key_ptr.* = self.allocator.dupe(u8, room) catch |err| {
@@ -1458,6 +1530,12 @@ pub const Rooms = struct {
         // socket stays alive meanwhile (`leave` waits).
         if (m.overflowed and !m.left) {
             m.overflowed = false;
+            if (self.rooms.getKey(m.room)) |key| {
+                if (self.slow.getOrPut(self.allocator, key)) |gop| {
+                    if (!gop.found_existing) gop.value_ptr.* = 0;
+                    gop.value_ptr.* += 1;
+                } else |_| {}
+            }
             self.mutex.unlock(io);
             abortConnection(m.socket);
             self.mutex.lockUncancelable(io);

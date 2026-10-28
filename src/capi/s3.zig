@@ -1469,7 +1469,7 @@ const BodyReader = struct {
             const wake = s.in.exec_waiting and n > 0;
             if (wake) s.in.exec_waiting = false;
             s.in.release();
-            if (wake) s.pump_event.set(self.x.engine.io);
+            if (wake) self.x.setEvent(&s.pump_event);
             if (n > 0) {
                 w.writeAll(tmp[0..n]) catch return error.WriteFailed;
                 return n;

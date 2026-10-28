@@ -27,4 +27,4 @@
   /requests       req/s, p50 and p99 per route                                                      
   /restart        hand over to a new process without dropping connections                           
  > /re                                                                                              
- Tab complete · ↑↓ history · PgUp/PgDn scroll · /quit or Ctrl-C leave (the app keeps running)       
+ Tab complete · ↑↓ history · PgUp/PgDn ←→ scroll · /quit or Ctrl-C leave (the app keeps running)    

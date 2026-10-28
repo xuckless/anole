@@ -881,6 +881,26 @@ pub const Client = struct {
         return h;
     }
 
+    /// The console's `/db` entry, with each executor's pool. On a task of
+    /// the runtime (the console's collector): `Pool.stats` takes the pool's
+    /// lock. pg.zig counts no waiters.
+    pub fn consoleInfo(self: *Client, w: *std.Io.Writer) !void {
+        const st = self.settings;
+        try w.print("\"system\":\"postgres\",\"name\":{f},\"target\":", .{std.json.fmt(self.name, .{})});
+        var tbuf: [320]u8 = undefined;
+        const target = if (st.unix_path) |u|
+            std.fmt.bufPrint(&tbuf, "unix:{s}/{s}", .{ u, st.database }) catch u
+        else
+            std.fmt.bufPrint(&tbuf, "{s}:{d}/{s}", .{ st.host, st.port, st.database }) catch st.host;
+        try w.print("{f},\"pools\":[", .{std.json.fmt(target, .{})});
+        for (self.pools.pools, 0..) |*shard, i| {
+            if (i > 0) try w.writeByte(',');
+            const ps = shard.pool.stats();
+            try w.print("{{\"max\":{d},\"open\":{d},\"idle\":{d},\"in_use\":{d},\"waiting\":0}}", .{ ps.size, ps.size - ps.missing, ps.available, ps.in_use });
+        }
+        try w.writeByte(']');
+    }
+
     /// A connection for `LISTEN`/`NOTIFY`, outside the pools (pg.zig's
     /// `Listener`): it waits for notifications as long as it is open.
     pub fn listener(self: *Client) !pg.Listener {

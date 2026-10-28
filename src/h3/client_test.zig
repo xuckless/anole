@@ -980,10 +980,14 @@ test "h3 client: connect_timeout bounds a handshake nobody answers" {
     try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
 }
 
-/// A UDP relay between a client and a server, which can hold the client's
-/// packets back once the server has answered (so 0-RTT requests are sure to
-/// be handled before the handshake completes) and record what the client
-/// sent (to replay it).
+/// A UDP relay between a client and a server, which can hold the server's
+/// answer back until the server has seen what the test waits for (so 0-RTT
+/// requests are sure to be sent, and handled, before the handshake
+/// completes) and record what the client sent (to replay it).
+///
+/// It works per datagram and decides by what a datagram carries or by what
+/// the server reports, never by how many reads it took: its sockets have
+/// GRO off, and a client's flight may leave in one GSO send or several.
 pub const Relay = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -991,7 +995,7 @@ pub const Relay = struct {
     front: Udp,
     /// Toward the server.
     back: Udp,
-    /// Toward the server after a NAT rebinding (`rebind_after_up`).
+    /// Toward the server after a NAT rebinding (`rebind_on_answer`).
     back2: Udp,
     server: std.Io.net.IpAddress,
     mutex: std.Io.Mutex = .init,
@@ -1005,25 +1009,36 @@ pub const Relay = struct {
     /// The server's next datagram, and so all after it, waits this long,
     /// once.
     hold_down_ms: u32 = 0,
-    /// After this many of the client's datagrams (0: never), the NAT
-    /// rebinds: the client's datagrams leave from another port, and the
-    /// server's to the old one are lost.
-    rebind_after_up: u32 = 0,
+    /// When set, the NAT rebinds as the server first answers: that answer
+    /// is lost, as is everything else the server sends to the old port, and
+    /// the client's datagrams from then on leave from another port.
+    rebind_on_answer: bool = false,
     rebound: bool = false,
     recording: bool = false,
+    /// What the client sent while recording, one datagram each.
     recorded: std.ArrayList([]u8) = .empty,
+    /// While set (`armGated`), the server's datagrams wait for `openDown`:
+    /// the client hears nothing from the server, so it has no handshake
+    /// keys, and every request it makes meanwhile goes in 0-RTT packets.
+    gate_down: bool = false,
+    gate: std.Io.Event = .unset,
+    /// The datagrams recorded before the gate opened: the first flight.
+    first_flight: usize = 0,
     group: std.Io.Group = .init,
 
     pub fn start(gpa: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress) !*Relay {
         const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        // One datagram per read and per send: GRO would merge a flight
+        // into one read, and the decisions below are per datagram.
+        const opts: Udp.Options = .{ .gro = false, .gso = false };
         const r = try gpa.create(Relay);
         errdefer gpa.destroy(r);
         r.* = .{
             .gpa = gpa,
             .io = io,
-            .front = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), .{}),
-            .back = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), .{}),
-            .back2 = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), .{}),
+            .front = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), opts),
+            .back = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), opts),
+            .back2 = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), opts),
             .server = server,
         };
         try r.group.concurrent(io, up, .{r});
@@ -1058,6 +1073,49 @@ pub const Relay = struct {
         r.hold_ms = hold_ms;
     }
 
+    /// `arm`, with the server's datagrams held until `openDown`: the first
+    /// flight is whatever the client sends until then.
+    fn armGated(r: *Relay) void {
+        r.arm(0);
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        r.gate_down = true;
+        r.gate = .unset;
+        r.first_flight = 0;
+    }
+
+    /// The server's datagrams go on; what was recorded so far is the
+    /// first flight.
+    fn openDown(r: *Relay) void {
+        r.mutex.lockUncancelable(r.io);
+        r.first_flight = r.recorded.items.len;
+        r.gate_down = false;
+        r.mutex.unlock(r.io);
+        r.gate.set(r.io);
+    }
+
+    /// Opens the gate once the server has handled the client's early
+    /// requests (`want_served` early GETs served, `want_held` early POSTs held for
+    /// the handshake): they reached it in 0-RTT, so they are in the
+    /// recorded first flight, and the handshake can't have completed (the
+    /// client hasn't heard the server yet). It waits on the server's own
+    /// counters, not on the relay's traffic: how a client spreads its
+    /// requests over datagrams is its business.
+    fn openDownWhenEarly(r: *Relay, io: std.Io, ep: *Endpoint, want_served: u64, want_held: u64) !void {
+        const Early = struct {
+            ep: *Endpoint,
+            served: u64,
+            held: u64,
+            fn seen(self: *const @This()) bool {
+                return self.ep.early_served.load(.monotonic) >= self.served and
+                    self.ep.early_held.load(.monotonic) >= self.held;
+            }
+        };
+        const counts: Early = .{ .ep = ep, .served = want_served, .held = want_held };
+        try eventually(io, 10, Early.seen, &counts);
+        r.openDown();
+    }
+
     /// The client's next datagram, and so all after it, waits `ms` once:
     /// whatever the client sends meanwhile reaches the server together.
     pub fn holdNext(r: *Relay, ms: u32) void {
@@ -1083,43 +1141,31 @@ pub const Relay = struct {
                 error.Canceled => |e| return e,
                 else => continue,
             };
-            r.mutex.lockUncancelable(r.io);
-            r.client = dg.from;
-            // Per datagram, not per read: on Linux one read can bring a
-            // GRO batch of several.
-            var drop: u32 = 0;
-            if (r.drop_up > 0) {
-                var batch = dg;
-                var n: u32 = 0;
-                while (batch.next()) |_| n += 1;
-                drop = @min(n, r.drop_up);
-                r.drop_up -= drop;
-                if (drop == n) {
-                    r.mutex.unlock(r.io);
-                    continue;
-                }
-            }
-            const hold = if (r.answered) r.hold_ms else 0;
-            if (hold > 0) r.hold_ms = 0;
-            if (r.recording) {
-                const copy = r.gpa.dupe(u8, dg.data) catch null;
-                if (copy) |d| r.recorded.append(r.gpa, d) catch r.gpa.free(d);
-            }
-            const via = if (r.rebound) &r.back2 else &r.back;
-            if (r.rebind_after_up > 0) {
-                r.rebind_after_up -= 1;
-                if (r.rebind_after_up == 0) r.rebound = true;
-            }
-            r.mutex.unlock(r.io);
-            if (hold > 0) try r.io.sleep(.fromMilliseconds(hold), .awake);
-            while (dg.next()) |d| {
-                if (drop > 0) {
-                    drop -= 1;
-                    continue;
-                }
-                via.send(r.io, r.server, null, 0, d, d.len);
-            }
+            // GRO is off, so this is one datagram; `next` would still walk
+            // a batch one by one.
+            while (dg.next()) |d| try r.forwardUp(dg.from, d);
         }
+    }
+
+    /// One of the client's datagrams, toward the server (or lost).
+    fn forwardUp(r: *Relay, from: std.Io.net.IpAddress, d: []const u8) std.Io.Cancelable!void {
+        r.mutex.lockUncancelable(r.io);
+        r.client = from;
+        if (r.drop_up > 0) {
+            r.drop_up -= 1;
+            r.mutex.unlock(r.io);
+            return;
+        }
+        const hold = if (r.answered) r.hold_ms else 0;
+        if (hold > 0) r.hold_ms = 0;
+        if (r.recording) {
+            const copy = r.gpa.dupe(u8, d) catch null;
+            if (copy) |c| r.recorded.append(r.gpa, c) catch r.gpa.free(c);
+        }
+        const via = if (r.rebound) &r.back2 else &r.back;
+        r.mutex.unlock(r.io);
+        if (hold > 0) try r.io.sleep(.fromMilliseconds(hold), .awake);
+        via.send(r.io, r.server, null, 0, d, d.len);
     }
 
     fn down(r: *Relay, second: bool) std.Io.Cancelable!void {
@@ -1133,10 +1179,20 @@ pub const Relay = struct {
                 else => continue,
             };
             r.mutex.lockUncancelable(r.io);
+            if (!second and r.rebind_on_answer) {
+                // The NAT rebinds now: this answer, to the old port, is lost.
+                r.rebind_on_answer = false;
+                r.rebound = true;
+            }
             if (r.rebound != second) {
                 // To a binding the NAT no longer has: lost.
                 r.mutex.unlock(r.io);
                 continue;
+            }
+            if (r.gate_down) {
+                r.mutex.unlock(r.io);
+                try r.gate.wait(r.io);
+                r.mutex.lockUncancelable(r.io);
             }
             r.answered = true;
             const to = r.client;
@@ -1159,20 +1215,97 @@ pub const Relay = struct {
         for (r.recorded.items) |d| attacker.send(r.io, r.server, null, 0, d, d.len);
     }
 
-    /// As `replay`, with the first two recorded datagrams sent as one (as
-    /// clients that coalesce their first flight send it).
+    /// The first flight (`armGated`) again as one datagram, as clients
+    /// that coalesce their first flight send it: its Initial packets in
+    /// order (a post-quantum ClientHello spans two), then every 0-RTT
+    /// packet, so the requests are in the server's first datagram.
     fn replayCoalesced(r: *Relay) !void {
         const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
         var sender: Udp = .init(try lo.bind(r.io, .{ .mode = .dgram, .protocol = .udp }), .{});
         defer sender.socket.close(r.io);
         r.mutex.lockUncancelable(r.io);
         defer r.mutex.unlock(r.io);
-        const items = r.recorded.items;
-        if (items.len < 2) return error.TooFewDatagrams;
-        const joined = try std.mem.concat(r.gpa, u8, &.{ items[0], items[1] });
-        defer r.gpa.free(joined);
-        sender.send(r.io, r.server, null, 0, joined, joined.len);
-        for (items[2..]) |d| sender.send(r.io, r.server, null, 0, d, d.len);
+        if (r.first_flight == 0) return error.NoFirstFlight;
+        var initials: std.ArrayList([]const u8) = .empty;
+        defer initials.deinit(r.gpa);
+        var zero_rtt: std.ArrayList([]const u8) = .empty;
+        defer zero_rtt.deinit(r.gpa);
+        for (r.recorded.items[0..r.first_flight]) |d| {
+            var it: LongPackets = .{ .data = d };
+            while (it.next()) |pkt| switch (pkt.kind) {
+                .initial => try initials.append(r.gpa, pkt.bytes),
+                .zero_rtt => try zero_rtt.append(r.gpa, pkt.bytes),
+                else => {},
+            };
+        }
+        if (zero_rtt.items.len == 0) return error.NoEarlyData;
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(r.gpa);
+        if (initials.items.len == 0) return error.NoInitial;
+        for (initials.items) |pkt| try joined.appendSlice(r.gpa, pkt);
+        for (zero_rtt.items) |pkt| try joined.appendSlice(r.gpa, pkt);
+        sender.send(r.io, r.server, null, 0, joined.items, joined.items.len);
+    }
+};
+
+/// The long-header packets at the start of a datagram, each whole (RFC 9000
+/// §17.2; the type bits are not header-protected). A short-header packet,
+/// or anything unreadable, ends them.
+const LongPackets = struct {
+    data: []const u8,
+    at: usize = 0,
+
+    const Kind = enum { initial, zero_rtt, handshake, retry };
+
+    fn kindOf(first: u8, version: u32) ?Kind {
+        const bits: u2 = @truncate(first >> 4);
+        return switch (version) {
+            0x00000001 => switch (bits) {
+                0 => .initial,
+                1 => .zero_rtt,
+                2 => .handshake,
+                3 => .retry,
+            },
+            // QUIC v2 (RFC 9369) numbers them differently.
+            0x6b3343cf => switch (bits) {
+                1 => .initial,
+                2 => .zero_rtt,
+                3 => .handshake,
+                0 => .retry,
+            },
+            else => null,
+        };
+    }
+
+    fn varint(d: []const u8, p: *usize) ?usize {
+        if (p.* >= d.len) return null;
+        const n = @as(usize, 1) << @intCast(d[p.*] >> 6);
+        if (p.* + n > d.len) return null;
+        var v: usize = d[p.*] & 0x3f;
+        for (d[p.* + 1 .. p.* + n]) |b| v = (v << 8) | b;
+        p.* += n;
+        return v;
+    }
+
+    fn next(it: *LongPackets) ?struct { kind: Kind, bytes: []const u8 } {
+        const d = it.data;
+        const start = it.at;
+        if (start + 7 > d.len or d[start] & 0x80 == 0) return null;
+        const kind = kindOf(d[start], std.mem.readInt(u32, d[start + 1 ..][0..4], .big)) orelse return null;
+        if (kind == .retry) return null;
+        var p = start + 5;
+        p += 1 + @as(usize, d[p]);
+        if (p >= d.len) return null;
+        p += 1 + @as(usize, d[p]);
+        if (kind == .initial) {
+            // The token: its length moves `p` past the length's own bytes.
+            const token_len = varint(d, &p) orelse return null;
+            p += token_len;
+        }
+        const len = varint(d, &p) orelse return null;
+        if (p + len > d.len) return null;
+        it.at = p + len;
+        return .{ .kind = kind, .bytes = d[start..it.at] };
     }
 };
 
@@ -1210,6 +1343,14 @@ fn noConnections(ep: *Endpoint) bool {
     return ep.conns.count() == 0;
 }
 
+/// The server's closed connections are gone: each one's closing or
+/// draining period is cut short as it enters it (`testExpirePeriods`), so
+/// this waits for the server to see the close, not for three PTOs.
+fn connectionsGone(ep: *Endpoint) bool {
+    ep.testExpirePeriods();
+    return noConnections(ep);
+}
+
 test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a replayed POST never runs" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
@@ -1235,16 +1376,19 @@ test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a repl
     }
 
     // The second: resumed, its requests in 0-RTT. The relay holds the
-    // client's Finished back, so the server handles both before the
-    // handshake completes.
+    // server's answer until the server has run the GET and held the POST,
+    // so both went in 0-RTT (the client had no handshake keys) and were
+    // handled before the handshake completed; they are in the recorded
+    // first flight, which the replay below sends again.
     const posts = early_posts.load(.monotonic);
-    relay.arm(300);
+    relay.armGated();
     {
         const conn = try f.connectResuming(gpa, io, &cache, true, relay);
         defer conn.close();
         try std.testing.expectEqual(client.EarlyData.pending, conn.earlyData());
         const get_early = try request(conn, "GET", "/early", .{});
         const post_early = try request(conn, "POST", "/early-post", .{ .early = true });
+        try relay.openDownWhenEarly(io, f.ep, 1, 1);
         const g = try finish(get_early, gpa);
         defer gpa.free(g);
         const p = try finish(post_early, gpa);
@@ -1264,16 +1408,14 @@ test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a repl
     // An attacker replays that flight once the connection is gone: the
     // server takes the 0-RTT again (nothing in TLS stops it), runs the GET
     // and holds the POST for a handshake that never completes.
-    // Its draining period is three PTOs, long after a handshake that took
-    // the relay's 300 ms.
-    try eventually(io, 10, noConnections, f.ep);
+    try eventually(io, 10, connectionsGone, f.ep);
     try relay.replay();
     const Held = struct {
         fn two(ep: *Endpoint) bool {
             return ep.early_held.load(.monotonic) == 2;
         }
     };
-    try eventually(io, 2, Held.two, f.ep);
+    try eventually(io, 10, Held.two, f.ep);
     try io.sleep(.fromMilliseconds(300), .awake);
     try std.testing.expectEqual(posts + 1, early_posts.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), f.ep.early_served.load(.monotonic));
@@ -1298,22 +1440,26 @@ test "h3: a new connection given up after its first packet started a 0-RTT reque
         try eventually(io, 2, hasTicket, &cache);
     }
     // A resumed connection whose first flight carries a request that
-    // waits (a POST held for the handshake): recorded.
-    relay.arm(300);
+    // waits (a POST held for the handshake): recorded. The server's answer
+    // waits until the server holds the POST, so the request went in 0-RTT
+    // and is in the first flight.
+    relay.armGated();
     {
         const conn = try f.connectResuming(gpa, io, &cache, true, relay);
         defer conn.close();
-        const p = try finish(try request(conn, "POST", "/early-post", .{ .early = true }), gpa);
+        const post_early = try request(conn, "POST", "/early-post", .{ .early = true });
+        try relay.openDownWhenEarly(io, f.ep, 0, 1);
+        const p = try finish(post_early, gpa);
         gpa.free(p);
         relay.disarm();
     }
-    try eventually(io, 10, noConnections, f.ep);
+    try eventually(io, 10, connectionsGone, f.ep);
     // The same flight again, and the server gives the new connection up
     // right after reading its first packet.
     f.ep.test_fail_accept = true;
     try relay.replayCoalesced();
-    // It did start a request before it was given up (a busy machine may
-    // take a while over the handshake's first packet).
+    // It did start a request before it was given up (its first packet
+    // carries the request; a busy machine may take a while over it).
     const GivenUp = struct {
         fn once(ep: *Endpoint) bool {
             return ep.test_given_up_with_tasks.load(.acquire) == 1;
@@ -1480,14 +1626,14 @@ test "h3 server: a NAT rebinding during the handshake: the server follows the cl
     defer f.stop(gpa, io);
     const relay = try Relay.start(gpa, io, f.ep.address());
     defer relay.stop();
-    // The client's first flight (its ClientHello spans two Initials)
-    // leaves from one port; the NAT then rebinds, so the server's answer
-    // to that port is lost and the client's retransmission comes from
-    // another: the interop runner's rebind-port case when the first
-    // rebind falls inside the handshake. Before the xuckless/ngtcp2 patch
-    // the server ignored the new port until the handshake timed out.
+    // The client's first flight leaves from one port; the NAT rebinds as
+    // the server answers, so that answer is lost and the client's
+    // retransmission comes from another: the interop runner's rebind-port
+    // case when the first rebind falls inside the handshake. Before the
+    // xuckless/ngtcp2 patch the server ignored the new port until the
+    // handshake timed out.
     relay.mutex.lockUncancelable(io);
-    relay.rebind_after_up = 2;
+    relay.rebind_on_answer = true;
     relay.mutex.unlock(io);
     const conn = try client.ClientConnection.connect(gpa, io, .{
         .host = "localhost",

@@ -8,6 +8,9 @@ const zio = @import("zio");
 const dusty = @import("dusty");
 const features = @import("build_options");
 const service = @import("service.zig");
+const collector = @import("collector.zig");
+const websocket = if (features.websocket) @import("../websocket/root.zig") else struct {};
+const sse = @import("../sse/root.zig");
 
 fn jsonStr(w: *std.Io.Writer, s: []const u8) !void {
     try w.print("{f}", .{std.json.fmt(s, .{})});
@@ -25,6 +28,7 @@ pub fn Of(comptime S: type) type {
                 .route_meta = routeMeta,
                 .listeners = listeners,
                 .databases = databases,
+                .ws = ws,
                 .h3 = if (features.http3) h3 else null,
                 .routes = routes,
                 .config = config,
@@ -118,8 +122,45 @@ pub fn Of(comptime S: type) type {
             return false;
         }
 
+        /// On the console's thread: the collector makes it on the runtime
+        /// (a connector's pool numbers are under the runtime's locks).
         fn databases(ctx: *anyopaque, w: *std.Io.Writer) anyerror!void {
-            const s = of(ctx);
+            return of(ctx).console_collector.snapshot(.db, w);
+        }
+
+        /// On the console's thread: the collector makes it on the runtime
+        /// (rooms and topics are under the runtime's locks).
+        fn ws(ctx: *anyopaque, w: *std.Io.Writer) anyerror!void {
+            return of(ctx).console_collector.snapshot(.ws, w);
+        }
+
+        /// The collector's snapshots, on its task of the runtime.
+        pub fn collect(ctx: *anyopaque, what: collector.What, w: *std.Io.Writer) anyerror!void {
+            switch (what) {
+                .db => try collectDatabases(of(ctx), w),
+                .ws => try collectWs(w),
+            }
+        }
+
+        fn gaugeSum(kind: dusty.gauges.Kind) u64 {
+            var n: i64 = 0;
+            for (0..dusty.gauges.max_executors) |i| n += dusty.gauges.get(kind, i);
+            return @intCast(@max(n, 0));
+        }
+
+        fn collectWs(w: *std.Io.Writer) !void {
+            try w.print("{{\"sockets\":{{\"h1\":{d},\"h2\":{d},\"h3\":{d}}},\"webtransport\":{d},\"rooms\":[", .{
+                gaugeSum(.ws_h1), gaugeSum(.ws_h2), gaugeSum(.ws_h3), gaugeSum(.wt_sessions),
+            });
+            var first = true;
+            if (comptime features.websocket) try websocket.Rooms._consoleRows(w, &first);
+            try w.writeAll("],\"topics\":[");
+            first = true;
+            try sse.Topics._consoleRows(w, &first);
+            try w.writeAll("]}");
+        }
+
+        fn collectDatabases(s: *S, w: *std.Io.Writer) !void {
             try w.writeByte('[');
             for (s.extras.connectors.items, 0..) |c, i| {
                 if (i > 0) try w.writeByte(',');

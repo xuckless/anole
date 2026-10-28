@@ -71,7 +71,15 @@ test "net udp: echo, the replies of a batch go out together" {
                 seen[n] = true;
             }
             for (seen) |s| try std.testing.expect(s);
-            const st = a.netStats();
+            // A batch's replies are counted once their send returns, which
+            // can be after they arrived here: wait for the count (10 s at
+            // most), don't read it once.
+            var st = a.netStats();
+            var waited: u32 = 0;
+            while (st.datagrams_out < 20 and waited < 10_000) : (waited += 1) {
+                try io.sleep(.fromMilliseconds(1), .awake);
+                st = a.netStats();
+            }
             try std.testing.expectEqual(@as(u64, 20), st.datagrams_in);
             try std.testing.expectEqual(@as(u64, 20), st.datagrams_out);
             // UDP only: no TCP listener either (the core's 127.0.0.1:8080

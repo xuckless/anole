@@ -642,7 +642,6 @@ export fn anole_console_report(s: ?*anyopaque, m: ?[*]const abi.ConsoleMetric, n
 export fn anole_console_log(s: ?*anyopaque, level: u32, scope: Str, msg: Str, req: u64) i32 {
     clearError();
     const e = engineOf(s) orelse return badPointer(s);
-    _ = req;
     const lvl: std.log.Level = switch (level) {
         abi.LOG_ERROR => .err,
         abi.LOG_WARN => .warn,
@@ -650,7 +649,7 @@ export fn anole_console_log(s: ?*anyopaque, level: u32, scope: Str, msg: Str, re
         abi.LOG_DEBUG => .debug,
         else => return failCode(abi.E_INVALID),
     };
-    e.consoleLog(lvl, scope.slice(), msg.slice());
+    e.consoleLog(lvl, scope.slice(), msg.slice(), req);
     return abi.OK;
 }
 

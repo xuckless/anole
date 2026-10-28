@@ -107,6 +107,8 @@ pub const Topics = struct {
     n_gaps: std.atomic.Value(u64) = .init(0),
     /// Made by `create` (the server's): `deinit` frees it too.
     heap_owned: bool = false,
+    /// In `registry` (made by `create`, until `deinit`).
+    registered: bool = false,
     metrics: ?Metrics = null,
     closed_by: [5]std.atomic.Value(u64) = .{ .init(0), .init(0), .init(0), .init(0), .init(0) },
     /// Called after a sender wrote `bytes` of a subscriber's own `send`s
@@ -197,12 +199,50 @@ pub const Topics = struct {
         errdefer gpa.destroy(t);
         t.* = try init(gpa, options);
         t.heap_owned = true;
+        while (!hub_registry_lock.tryLock()) std.atomic.spinLoopHint();
+        defer hub_registry_lock.unlock();
+        // The console's list is best effort: no room in it is no error.
+        if (hub_registry.append(std.heap.page_allocator, t)) |_| t.registered = true else |_| {}
         return t;
+    }
+
+    /// Every hub `create` made, for the live console's `/ws`.
+    var hub_registry: std.ArrayList(*Topics) = .empty;
+    var hub_registry_lock: std.atomic.Mutex = .unlocked;
+
+    /// The live console's rows for every hub: `{"name","subscribers"}`
+    /// objects, comma separated after `first`. On a task of the runtime. A
+    /// hub whose mutex is held right now is skipped this time (a blocking
+    /// lock could suspend the task while it holds the registry's spin lock).
+    pub fn _consoleRows(w: *std.Io.Writer, first: *bool) !void {
+        while (!hub_registry_lock.tryLock()) std.atomic.spinLoopHint();
+        defer hub_registry_lock.unlock();
+        for (hub_registry.items) |hub| {
+            const io = hub.bound() orelse continue;
+            if (!hub.mutex.tryLock()) continue;
+            defer hub.mutex.unlock(io);
+            var it = hub.topics.iterator();
+            while (it.next()) |entry| {
+                if (!first.*) try w.writeByte(',');
+                first.* = false;
+                try w.print("{{\"name\":{f},\"subscribers\":{d}}}", .{ std.json.fmt(entry.key_ptr.*, .{}), entry.value_ptr.*.members.items.len });
+            }
+        }
     }
 
     /// After the server stopped (no subscriber left). The drain hook is not
     /// taken out of the registry it was added to: that outlives nothing here.
     pub fn deinit(self: *Topics) void {
+        if (self.registered) {
+            self.registered = false;
+            while (!hub_registry_lock.tryLock()) std.atomic.spinLoopHint();
+            defer hub_registry_lock.unlock();
+            for (hub_registry.items, 0..) |t, i| if (t == self) {
+                _ = hub_registry.swapRemove(i);
+                break;
+            };
+            if (hub_registry.items.len == 0) hub_registry.clearAndFree(std.heap.page_allocator);
+        }
         if (self.io_set.load(.acquire)) {
             self.tickers.cancel(self.io);
             self.ends.cancel(self.io);
