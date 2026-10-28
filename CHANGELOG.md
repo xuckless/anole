@@ -86,7 +86,10 @@ breaking changes are listed anyway.
   and in a hang dump; before, a passing test's warnings showed up under the
   next failing test or under a misleading "failed command:" line. Text
   printed straight to stderr (`std.debug.print`, C code) still shows.
-  `zig build crash-probe` checks the crash case.
+  A panic never waits for the held lines: when it comes while a log line
+  is being stored (on the panicking thread, say), the lines are reported
+  lost and the panic goes on. `zig build crash-probe` checks the crash
+  cases.
 - CI: every job and long step has a time limit sized from the last 30 green
   runs, and jobs with Docker containers keep the containers' logs and states
   as an artifact when they fail (the interop runners' jobs upload the

@@ -796,23 +796,30 @@ pub fn build(b: *std.Build) void {
         b.step("hang-probe", "Run a deliberately hanging test to see the hang dump (use --test-timeout; fails by design)").dependOn(&run_probe.step);
         if (b.option(bool, "hang-probe", "Add the deliberately hanging test to `zig build test` (fails by design)") orelse false) test_step.dependOn(&run_probe.step);
     }
-    // The crash probe (src/safety/crash_probe.zig): a test that segfaults
-    // and one that aborts, each in its own binary run without the build
-    // runner's protocol; passes when each died of SIGABRT (the segfault
-    // handler ends in abort) and its stderr shows the line it logged.
+    // The crash probe (src/safety/crash_probe.zig): a test that segfaults,
+    // one that aborts and one that panics with the log lock held, each in
+    // its own binary run without the build runner's protocol; passes when
+    // each died of SIGABRT (the segfault handler and a panic end in abort)
+    // and its stderr shows the line it logged (or, under the lock, that
+    // the lines were lost: the panic never waits for the lock).
     {
         const crash_step = b.step("crash-probe", "Check that a crashing test's held log lines are printed");
-        for ([_][]const u8{ "segfault", "abort" }) |what| {
+        for ([_]struct { []const u8, []const u8, []const u8 }{
+            .{ "segfault", "segfault", "crash probe: held line before the segfault" },
+            .{ "abort", "abort", "crash probe: held line before the abort" },
+            .{ "locked-panic", "panic under the log lock", "the test's held log lines are lost" },
+        }) |probe_case| {
+            const name, const what, const expect = probe_case;
             const probe = addSafeTest(b, .{
-                .name = b.fmt("crash-probe-{s}", .{what}),
+                .name = b.fmt("crash-probe-{s}", .{name}),
                 .root_module = b.createModule(.{ .root_source_file = b.path("src/safety/crash_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }),
                 .filters = &.{b.fmt("crash probe: {s}", .{what})},
                 .use_llvm = use_llvm,
             });
-            const run_probe = std.Build.Step.Run.create(b, b.fmt("run crash-probe-{s}", .{what}));
+            const run_probe = std.Build.Step.Run.create(b, b.fmt("run crash-probe-{s}", .{name}));
             run_probe.addArtifactArg(probe);
             run_probe.skip_foreign_checks = true;
-            run_probe.expectStdErrMatch(b.fmt("crash probe: held line before the {s}", .{what}));
+            run_probe.expectStdErrMatch(expect);
             run_probe.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
             crash_step.dependOn(&run_probe.step);
         }
