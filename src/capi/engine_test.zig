@@ -1211,6 +1211,9 @@ fn drainCounts(c: *engine.Consumer, counts: *[64]u32, want: u32) !void {
             const n = engine.poll(d.c, &d.buf, true, &need) catch return error.TooBig;
             var off: usize = 0;
             while (off < n) {
+                // SAFETY: `poll` writes whole records into `buf` (8-aligned),
+                // each starting with an Event header and `len` a multiple of
+                // 8, so every `off` reached here starts an aligned Event.
                 const ev: *const abi.Event = @ptrCast(@alignCast(&d.buf[off]));
                 if (ev.type < d.counts.len) d.counts[ev.type] += 1;
                 d.total += 1;
@@ -1283,6 +1286,11 @@ test "capi engine: advisory events are never dropped" {
     defer e.destroy();
     const x = &e.execs[0];
     var f = try e.io.concurrent(postAdvisory, .{x});
+    // A failed drain collects the poster before the engine goes; after the
+    // await below this does nothing. The poster never waits for room (the
+    // two records fit the empty ring of 2, and the advisory events take the
+    // overflow list when it is full), so the cancel cannot be swallowed.
+    defer f.cancel(e.io) catch {};
     // From another thread too: the overflow list takes it.
     x.postEvent(.writable, 300);
     var counts: [64]u32 = @splat(0);
