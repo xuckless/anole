@@ -3,10 +3,45 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
-## 0.4.2 (unreleased)
+## 0.4.1 (unreleased)
 
 ### Fixed
 
+- C ABI: a crash when a binding thread answered, sent or polled while the
+  server stopped. The call wakes an executor through the runtime, and the
+  stop could free the runtime while that wake was still under way. The stop
+  now waits for wakes under way before it frees the runtime, and a wake
+  after that is skipped.
+- Console: log records from bindings (`anole_console_log`) carry their
+  request's id and route; the `req` argument was ignored.
+- Console: `/ws` shows the open WebSockets by protocol, accepted WebTransport
+  sessions, the rooms (members, queued bytes, members closed as slow) and
+  the SSE topics; `/db` shows PostgreSQL's target and every executor's pool.
+  Both are collected by a task on the runtime, under the runtime's locks,
+  which the console's own threads must not take.
+- Console: text in most scripts lines up. Character widths come from a table
+  generated from Unicode 16.0.0 (`tools/gen-width-table.py`); the
+  hand-picked subset missed the combining marks of Bengali, Tamil and other
+  scripts.
+- Console: a table wider than the terminal scrolls sideways with Left/Right,
+  a column at a time, keeping its first column; ‹ and › mark hidden
+  columns. `/h3` showed 8 of its 15 columns at 100 columns wide, with no
+  sign that more existed (#119).
+- Jobs: a job that finished while the server drained could run a second
+  time. A drain past its deadline cancels the runs still going, and the
+  cancel could land on a finished run's state write (logged as "finished
+  but its state could not be saved: Canceled"), or mark a run interrupted
+  after its handler had returned, which put it back. The write now runs to
+  its end (at most 5 s, or until the drain stops waiting for canceled runs,
+  3 s past its deadline), and a handler that returned keeps its outcome.
+- Jobs: in an app, running jobs lost their `drain_timeout` when the HTTP
+  side finished draining first (with no connection open, at once): the
+  app's teardown canceled the queue's drain. A drain under way is now
+  waited for.
+- Jobs: `anole_jobs_outcome_unsaved_total{queue,kind}` counts runs that
+  finished but whose state could not be saved (they run again after their
+  lease). docs/jobs.md gives the longest stop to plan the service manager's
+  stop timeout around.
 - S3: `put(c, key, .request, opts)` with a request body larger than
   `limits.body_max` answered 400; it now fails with `error.BodyTooBig`, a
   413 Content Too Large (RFC 9110 §15.5.14), as the server's own body
@@ -46,46 +81,6 @@ breaking changes are listed anyway.
   `error.type` (`Timeout` when its timeout expired) and an ERROR status, a
   run interrupted by a drain or lost has neither. Handlers see it as
   `job.trace_id`/`job.span_id`, and jobs they enqueue carry it.
-
-## 0.4.1 (2026-10-28)
-
-### Fixed
-
-- C ABI: a crash when a binding thread answered, sent or polled while the
-  server stopped. The call wakes an executor through the runtime, and the
-  stop could free the runtime while that wake was still under way. The stop
-  now waits for wakes under way before it frees the runtime, and a wake
-  after that is skipped.
-- Console: log records from bindings (`anole_console_log`) carry their
-  request's id and route; the `req` argument was ignored.
-- Console: `/ws` shows the open WebSockets by protocol, accepted WebTransport
-  sessions, the rooms (members, queued bytes, members closed as slow) and
-  the SSE topics; `/db` shows PostgreSQL's target and every executor's pool.
-  Both are collected by a task on the runtime, under the runtime's locks,
-  which the console's own threads must not take.
-- Console: text in most scripts lines up. Character widths come from a table
-  generated from Unicode 16.0.0 (`tools/gen-width-table.py`); the
-  hand-picked subset missed the combining marks of Bengali, Tamil and other
-  scripts.
-- Console: a table wider than the terminal scrolls sideways with Left/Right,
-  a column at a time, keeping its first column; ‹ and › mark hidden
-  columns. `/h3` showed 8 of its 15 columns at 100 columns wide, with no
-  sign that more existed (#119).
-- Jobs: a job that finished while the server drained could run a second
-  time. A drain past its deadline cancels the runs still going, and the
-  cancel could land on a finished run's state write (logged as "finished
-  but its state could not be saved: Canceled"), or mark a run interrupted
-  after its handler had returned, which put it back. The write now runs to
-  its end (at most 5 s, or until the drain stops waiting for canceled runs,
-  3 s past its deadline), and a handler that returned keeps its outcome.
-- Jobs: in an app, running jobs lost their `drain_timeout` when the HTTP
-  side finished draining first (with no connection open, at once): the
-  app's teardown canceled the queue's drain. A drain under way is now
-  waited for.
-- Jobs: `anole_jobs_outcome_unsaved_total{queue,kind}` counts runs that
-  finished but whose state could not be saved (they run again after their
-  lease). docs/jobs.md gives the longest stop to plan the service manager's
-  stop timeout around.
 
 ## 0.4.0 (2026-10-25)
 
