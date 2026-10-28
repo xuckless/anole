@@ -362,16 +362,20 @@ const Handlers = struct {
         try req.io.sleep(.fromMilliseconds(300), .awake);
         res.body = "slow but whole";
     }
-    /// Answers once the test sets `held_gate`.
+    /// Answers once the test sets `held_gate`; counts itself in first.
     fn held(req: *dusty.Request, res: *dusty.Response) !void {
+        _ = held_entered.fetchAdd(1, .acq_rel);
         try held_gate.wait(req.io);
         res.body = "held but whole";
     }
     var held_gate: std.Io.Event = .unset;
+    var held_entered: std.atomic.Value(u32) = .init(0);
     fn slower(req: *dusty.Request, res: *dusty.Response) !void {
+        _ = slower_entered.fetchAdd(1, .acq_rel);
         try req.io.sleep(.fromMilliseconds(900), .awake);
         res.body = "slower but whole";
     }
+    var slower_entered: std.atomic.Value(u32) = .init(0);
     /// A streamed body far past the client's 64 KiB stream window.
     fn big(_: *dusty.Request, res: *dusty.Response) !void {
         var buf: [4096]u8 = undefined;
@@ -414,6 +418,7 @@ const Handlers = struct {
     }
     /// The body's length and checksum.
     fn sum(req: *dusty.Request, res: *dusty.Response) !void {
+        _ = sum_entered.fetchAdd(1, .acq_rel);
         var in_buf: [4096]u8 = undefined;
         var body = try req.reader(&in_buf);
         var hash: std.hash.Wyhash = .init(0);
@@ -429,6 +434,9 @@ const Handlers = struct {
         }
         try res.print(.text, "{d} {x}", .{ n, hash.final() });
     }
+    /// `sum` handlers started (the ones before have all answered by the
+    /// time a test reads it).
+    var sum_entered: std.atomic.Value(u32) = .init(0);
 };
 
 const Fixture = struct {
@@ -590,11 +598,12 @@ test "HTTP/2: a no_wait request with a body runs inline when it came whole, else
     try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(big).body.items);
 
     // Reset with its body half sent: let go, and the connection carries on.
+    const sums = Handlers.sum_entered.load(.acquire);
     const cut = try client.request("POST", "/nw/sum", body[0..1000]);
     client.get(cut).keep_open = true;
     try client.sendPending();
-    // The server has the stream (its handler waits for the rest).
-    try wait.waitUntil(io, "the half-sent request in flight on the server", &fx.server, inFlight);
+    // The server has the stream: its handler runs (and waits for the rest).
+    try wait.waitAtLeast(io, "the half-sent request's handler runs", &Handlers.sum_entered, sums + 1);
     _ = c.nghttp2_submit_rst_stream(client.session, c.NGHTTP2_FLAG_NONE, cut, c.NGHTTP2_CANCEL);
     const after = try client.request("POST", "/nw/sum", body[0..10]);
     try client.run();
@@ -895,11 +904,6 @@ fn awaitStreamsFreed(server: *dusty.Server(void), io: std.Io) !void {
     }.f);
 }
 
-/// A request is in flight on the server.
-fn inFlight(server: *dusty.Server(void)) bool {
-    return server.busy.load(.acquire).count > 0;
-}
-
 /// Sets `gate` once `client` has taken a GOAWAY: a response held until the
 /// drain's notice reached the client is in flight through the drain,
 /// however slow the machine.
@@ -961,9 +965,10 @@ test "HTTP/2: a drain with a stream in flight sends a two-phase GOAWAY and finis
     // Start a request held until the drain's notice reached the client,
     // then shut down while it runs.
     Handlers.held_gate = .unset;
+    const helds = Handlers.held_entered.load(.acquire);
     const id = try client.request("GET", "/held", null);
     try client.sendPending();
-    try wait.waitUntil(io, "the held request in flight on the server", &fx.server, inFlight);
+    try wait.waitAtLeast(io, "the held request's handler runs", &Handlers.held_entered, helds + 1);
     var releaser = try io.concurrent(releaseOnGoaway, .{ io, &client, &Handlers.held_gate });
     defer releaser.cancel(io) catch {};
     var stopper = try io.concurrent(stopFixture, .{ &fx, io });
@@ -1006,9 +1011,10 @@ test "HTTP/2: a drain waits for a response that is taken from the session but no
 
     h2.test_before_flush = holdFlush;
     defer h2.test_before_flush = null;
+    const slowers = Handlers.slower_entered.load(.acquire);
     const id = try client.request("GET", "/slower", null);
     try client.sendPending();
-    try wait.waitUntil(io, "the slower request in flight on the server", &fx.server, inFlight);
+    try wait.waitAtLeast(io, "the slower request's handler runs", &Handlers.slower_entered, slowers + 1);
     var stopper = try io.concurrent(stopFixture, .{ &fx, io });
     defer stopper.await(io);
 
@@ -1423,11 +1429,13 @@ test "HTTP/2: a finished response the peer never takes is reset at the request t
     // A stream window of zero: the server may send the head, never the body.
     const zero = [_]c.nghttp2_settings_entry{.{ .settings_id = c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, .value = 0 }};
     if (c.nghttp2_submit_settings(client.session, c.NGHTTP2_FLAG_NONE, &zero, zero.len) != 0) return error.Http2Init;
-    // Nothing else would end the stream: without the timeout `run` waits
-    // for ever.
+    // The request timeout (300 ms) ends the stream; without it, only the
+    // keep-alive timeout (60 s) would, which only test-timing tells apart.
+    const started: std.Io.Clock.Timestamp = .now(io, .awake);
     const id = try client.request("GET", "/whole", null);
     try client.run();
     try std.testing.expectEqual(@as(u32, c.NGHTTP2_CANCEL), client.get(id).error_code);
+    if (wait.timing()) try std.testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 3000);
     try awaitStreamsFreed(&server, io);
 }
 
