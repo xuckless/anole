@@ -956,13 +956,16 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// "postgres", "redis"...; "connector" for the rest.
             name: []const u8 = "connector",
             /// Writes the console's `/db` entry fields ("system", "name",
-            /// "target", "pools") without the braces.
-            describe: *const fn (context: *anyopaque, name: []const u8, w: *std.Io.Writer) anyerror!void,
+            /// "target", "pools") without the braces. Null for what is not
+            /// a database or an outside service (SSE topics, the response
+            /// cache, jobs, webhooks, watches): `/db` leaves it out.
+            describe: ?*const fn (context: *anyopaque, name: []const u8, w: *std.Io.Writer) anyerror!void,
             /// Closes the connector's idle connections (under AWS Lambda,
             /// after a long freeze); null when it has no pool to close.
             closeIdle: ?*const fn (context: *anyopaque) void = null,
 
             fn systemOf(comptime T: type) []const u8 {
+                @setEvalBranchQuota(20_000);
                 const n = @typeName(T);
                 inline for (.{ "postgres:pg", "sqlite:sqlite", "mongodb:mongodb", "redis:redis", "nats:nats", "kafka:kafka", "smtp:smtp", "s3:s3" }) |pair| {
                     const colon = comptime std.mem.indexOfScalar(u8, pair, ':').?;
@@ -972,6 +975,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             }
 
             fn of(comptime T: type, value: *T) Connector {
+                const system = comptime systemOf(T);
                 const Hooks = struct {
                     fn start(context: *anyopaque, metrics_: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health_: ?*observe.Health) anyerror!void {
                         const v: *T = @ptrCast(@alignCast(context));
@@ -997,8 +1001,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .context = value,
                     .start = Hooks.start,
                     .deinit = Hooks.deinit,
-                    .describe = Hooks.describe,
-                    .name = comptime systemOf(T),
+                    .describe = if (comptime @hasDecl(T, "consoleInfo") or !std.mem.eql(u8, system, "connector")) Hooks.describe else null,
+                    .name = system,
                     .closeIdle = if (comptime @hasDecl(T, "closeIdle")) Idle.closeIdle else null,
                 };
             }

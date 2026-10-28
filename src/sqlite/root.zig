@@ -169,6 +169,9 @@ pub const Client = struct {
     readiness: db.Readiness,
     /// Connections in use (readers taken, the writer held), for the gauges.
     in_use: std.atomic.Value(i64) = .init(0),
+    /// Calls waiting for a reader or for the writer, for the gauges and
+    /// the console's `/db`.
+    waiting: std.atomic.Value(i64) = .init(0),
     /// Calls with `.coalesce` or `.cache` (`with`), and `invalidate` for
     /// cached results: `app.db.cache.invalidate(.{ .tag = "notes" })`.
     cache: db.QueryCache,
@@ -263,6 +266,18 @@ pub const Client = struct {
         if (tracer) |t| self.observer.tracer = t;
         if (health) |h| try self.readiness.register(h, self.name);
         try self.cache.observe(registry);
+    }
+
+    /// The console's `/db` entry: the database's name, its file, and its
+    /// connections as one pool (the writer and the readers, all open from
+    /// `init` on). From any thread: the counts are atomics, no lock.
+    pub fn consoleInfo(self: *Client, w: *std.Io.Writer) !void {
+        const total: i64 = @intCast(self.readers.conns.len + 1);
+        const in_use = std.math.clamp(self.in_use.load(.monotonic), 0, total);
+        const waiting = @max(self.waiting.load(.monotonic), 0);
+        try w.print("\"system\":\"sqlite\",\"name\":{f},\"target\":{f},\"pools\":[{{\"max\":{d},\"open\":{d},\"idle\":{d},\"in_use\":{d},\"waiting\":{d}}}]", .{
+            std.json.fmt(self.name, .{}), std.json.fmt(self.path, .{}), total, total, total - in_use, in_use, waiting,
+        });
     }
 
     /// Runs `sql`, one or more statements with no parameters, on the
@@ -382,8 +397,8 @@ pub const Client = struct {
         try r.mutex.lock(io);
         defer r.mutex.unlock(io);
         if (r.free_len == 0) {
-            self.observer.waiting(1);
-            defer self.observer.waiting(-1);
+            self.waits(1);
+            defer self.waits(-1);
             while (r.free_len == 0) try r.changed.wait(io, &r.mutex);
         }
         r.free_len -= 1;
@@ -405,8 +420,8 @@ pub const Client = struct {
     fn lockWriter(self: *Client, io: std.Io) error{Canceled}!void {
         const started: std.Io.Clock.Timestamp = .now(io, .awake);
         if (!self.writer.lock.tryLock()) {
-            self.observer.waiting(1);
-            defer self.observer.waiting(-1);
+            self.waits(1);
+            defer self.waits(-1);
             try self.writer.lock.lock(io);
         }
         self.taken(started.durationTo(.now(io, .awake)).raw);
@@ -415,6 +430,11 @@ pub const Client = struct {
     fn unlockWriter(self: *Client, io: std.Io) void {
         self.writer.lock.unlock(io);
         self.given();
+    }
+
+    fn waits(self: *Client, delta: i64) void {
+        _ = self.waiting.fetchAdd(delta, .monotonic);
+        self.observer.waiting(delta);
     }
 
     fn taken(self: *Client, waited: std.Io.Duration) void {
