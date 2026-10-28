@@ -22,6 +22,7 @@ image="${1:-mongo:8.0}"
 shift || true
 zig="${ZIG:-zig}"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/lib/wait.sh"
 port="${PORT:-27217}"
 name="anole-mongodb-test-$$"
 work="$(mktemp -d)"
@@ -73,29 +74,25 @@ docker run -d --name "$name" -p "127.0.0.1:$port:$port" \
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = "true" ]; }
 mongosh() { docker exec "$name" mongosh --quiet --port "$port" -u root -p "$password" --authenticationDatabase admin "$@"; }
 # The entrypoint starts mongod once to create the user, then again for good.
-ready=""
-for _ in $(seq 1 90); do
-    if ! running; then
-        if docker logs "$name" 2>&1 | grep SERVER-121912 >/dev/null; then
-            echo "$image refuses to start on this host's Linux kernel ($(uname -r)): MongoDB 8.0.21+ and 9.x" >&2
-            echo "exit at startup on kernels 6.19 to 7.0.13 (TCMalloc and rseq; https://jira.mongodb.org/browse/SERVER-125742)." >&2
-            echo "Use a host with a kernel before 6.19 or from 7.0.14, or mongo:7.0." >&2
-        else
-            echo "mongod exited during startup" >&2
-        fi
-        exit 1
+# Answering, or no longer running (then the wait ends at once and says why).
+answers_or_exited() { ! running || mongosh --eval 'db.adminCommand({ping: 1}).ok' >/dev/null 2>&1; }
+if ! wait_until 90 "mongod to answer" answers_or_exited; then
+    echo "mongod did not answer in time" >&2
+    exit 1
+fi
+if ! running; then
+    if docker logs "$name" 2>&1 | grep SERVER-121912 >/dev/null; then
+        echo "$image refuses to start on this host's Linux kernel ($(uname -r)): MongoDB 8.0.21+ and 9.x" >&2
+        echo "exit at startup on kernels 6.19 to 7.0.13 (TCMalloc and rseq; https://jira.mongodb.org/browse/SERVER-125742)." >&2
+        echo "Use a host with a kernel before 6.19 or from 7.0.14, or mongo:7.0." >&2
+    else
+        echo "mongod exited during startup" >&2
     fi
-    if mongosh --eval 'db.adminCommand({ping: 1}).ok' >/dev/null 2>&1; then ready=1; break; fi
-    sleep 1
-done
-[ -n "$ready" ] || { echo "mongod did not answer within 90 s" >&2; exit 1; }
+    exit 1
+fi
 mongosh --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:$port'}]})" >/dev/null
-ready=""
-for _ in $(seq 1 60); do
-    if [ "$(mongosh --eval 'db.hello().isWritablePrimary' 2>/dev/null)" = "true" ]; then ready=1; break; fi
-    sleep 1
-done
-[ -n "$ready" ] || { echo "the replica set has no primary after 60 s" >&2; exit 1; }
+primary() { [ "$(mongosh --eval 'db.hello().isWritablePrimary' 2>/dev/null)" = "true" ]; }
+wait_until 60 "the replica set to elect a primary" primary || { echo "the replica set has no primary" >&2; exit 1; }
 mongosh --eval "db.getSiblingDB('admin').createUser({user: 'sha1', pwd: '$password', roles: ['root'], mechanisms: ['SCRAM-SHA-1']})" >/dev/null
 echo "$image ready on localhost:$port (replica set rs0)"
 

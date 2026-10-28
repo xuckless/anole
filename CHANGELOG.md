@@ -70,6 +70,14 @@ breaking changes are listed anyway.
   itself, and elapsed-time upper bounds, in the Zig suites and the C ABI
   suite alike, are checked only by a new local-only step,
   `zig build test-timing` (MAINTAINING.md, "Waiting in tests").
+- Tests: the shell runners (tests/*/run.sh: Kafka, NATS, PostgreSQL,
+  Redis, MongoDB, S3, SMTP, HTTP/3, restart, Autobahn, h2spec, gRPC
+  interop) wait for what they need instead of a fixed time: a port that
+  accepts, a log line (the broker's or the server's own "ready" line), a
+  process gone, or a command that succeeds, through `tests/lib/wait.sh`,
+  bounded by the same `ANOLE_TEST_TIMEOUT_FACTOR`. The copied NATS client's
+  tests check their elapsed-time bounds under `zig build test-timing` only
+  and scale their hang guards by the factor.
 - Tests: a hung unit test says where it hangs. CI runs every unit test step
   with `--test-timeout 120s`; a test still running at 110 s, its teardown
   (the test Io's and allocator's deinit) included, is named and every

@@ -18,6 +18,7 @@
 # removes them).
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/../lib/wait.sh"
 bin=${1:-zig-out/bin/autobahn-echo}
 mode=${2:-loop}
 image=crossbario/autobahn-testsuite@sha256:519915fb568b04c9383f70a1c405ae3ff44ab9e35835b085239c258b6fac3074
@@ -36,7 +37,10 @@ while :; do
   echo "reports: $reports (attempt $attempt)"
   "$bin" 9001 "$mode" >"$reports/server.log" 2>&1 &
   pid=$!
-  sleep 1
+  if ! wait_until 30 "the echo peer to listen on 9001" port_open 127.0.0.1 9001; then
+    tail -30 "$reports/server.log" >&2 || true
+    exit 1
+  fi
   client=anole-autobahn-client-$$-$attempt
   # Memory every 5 s while the client runs.
   (

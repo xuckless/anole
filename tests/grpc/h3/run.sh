@@ -42,5 +42,7 @@ docker run $rm_flag --name "anole-grpc-h3-$$" \
   -v "$work/out/bin:/anole:ro" \
   -v "$root/tests/grpc/interop/cert.sh:/scripts/cert.sh:ro" \
   -v "$here/inside.sh:/scripts/inside.sh:ro" \
+  -v "$root/tests/lib/wait.sh:/scripts/wait.sh:ro" \
+  -e ANOLE_TEST_TIMEOUT_FACTOR="${ANOLE_TEST_TIMEOUT_FACTOR:-1}" \
   -v "$work/logs:/logs" \
   "$tag" bash /scripts/inside.sh

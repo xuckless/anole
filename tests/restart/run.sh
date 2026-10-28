@@ -21,6 +21,7 @@
 set -eu
 server_bin=${1:-zig-out/bin/full}
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/../lib/wait.sh"
 work=$(mktemp -d)
 pids=""
 trap 'for p in $pids; do kill -9 $p 2>/dev/null || true; done; rm -rf "$work"' EXIT
@@ -35,11 +36,11 @@ raw_tcp_port=18584
 raw_udp_port=18585
 
 fail() { echo "FAIL $1"; ps -o pid,ppid,stat,command -ax | grep "[f]ull $port" || true; echo "--- notify:"; cat "$work/notify.log"; echo "--- server:"; tail -30 "$work/server.log"; exit 1; }
-# Waits up to 10 s for a line matching $1 in the notification log, after
-# its first $2 lines.
+# Waits for a line matching $1 in the notification log, after its first $2
+# lines.
+notified() { tail -n +$((${2:-0} + 1)) "$work/notify.log" | grep -qE "$1"; }
 await_notify() {
-  for i in $(seq 1 200); do tail -n +$((${2:-0} + 1)) "$work/notify.log" | grep -qE "$1" && return 0; sleep 0.05; done
-  fail "no '$1' notification"
+  wait_until 30 "the notification '$1'" notified "$1" "${2:-0}" || fail "no '$1' notification"
 }
 check_all() {
   out=$(curl -s "http://127.0.0.1:$port/") || fail "http ($1)"
@@ -78,7 +79,7 @@ PY
 : >"$work/notify.log"
 $py "$here/notify.py" "$work/notify" "$work/notify.log" &
 pids="$!"
-sleep 0.5
+wait_until 30 "the notification socket" test -S "$work/notify" || fail "notify.py did not bind its socket"
 NOTIFY_SOCKET="$work/notify" "$server_bin" $port $tls_port $h1_tls_port $h2c_port $raw_tcp_port $raw_udp_port >"$work/server.log" 2>&1 &
 first=$!
 pids="$pids $first"
@@ -100,8 +101,7 @@ restart() {
   $py "$here/across.py" 127.0.0.1 $tls_port "$work/go" >"$work/across" 2>&1 &
   across=$!
   pids="$pids $across"
-  for i in $(seq 1 100); do grep -q "before 200" "$work/across" && break; sleep 0.05; done
-  grep -q "before 200" "$work/across" || fail "across: $(cat "$work/across")"
+  wait_until 30 "the HTTP/3 connection to be open" log_has "$work/across" "before 200" || fail "across: $(cat "$work/across")"
   lines=$(wc -l <"$work/notify.log")
   kill -USR2 $old
   await_notify "^RELOADING=1 MONOTONIC_USEC=[0-9]+$" $lines
@@ -112,8 +112,7 @@ restart() {
   touch "$work/go"
   wait $across || fail "the HTTP/3 connection across the restart: $(cat "$work/across")"
   grep -q "closed 0x100" "$work/across" || fail "across: $(cat "$work/across")"
-  for i in $(seq 1 200); do kill -0 $old 2>/dev/null || break; sleep 0.05; done
-  kill -0 $old 2>/dev/null && fail "process $old still running after handing over"
+  wait_until 30 "process $old to exit" gone $old || fail "process $old still running after handing over"
   tail -n +$((lines + 1)) "$work/notify.log" | grep -q STOPPING && fail "STOPPING=1 from a hand-over"
   check_all "after restarting $old"
   echo "PASS restart $old -> $new: RELOADING=1, MAINPID=$new READY=1, HTTP/3 closed (H3_NO_ERROR) and served by $new"
@@ -126,8 +125,7 @@ third=$new
 lines=$(wc -l <"$work/notify.log")
 kill -TERM $third
 await_notify "^STOPPING=1$" $lines
-for i in $(seq 1 200); do kill -0 $third 2>/dev/null || break; sleep 0.05; done
-kill -0 $third 2>/dev/null && fail "still running after SIGTERM"
+wait_until 30 "the last process to exit" gone $third || fail "still running after SIGTERM"
 grep -qiE "leaked|panic" "$work/server.log" && fail "leak or panic in the server log"
 echo "PASS STOPPING=1 and a clean exit on SIGTERM"
 echo "all restart checks passed"

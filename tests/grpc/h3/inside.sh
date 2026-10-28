@@ -2,6 +2,7 @@
 # Runs inside the image of run.sh: the four directions, one test case at a
 # time. Logs go to /logs.
 set -u
+. /scripts/wait.sh
 work=$(mktemp -d)
 sh /scripts/cert.sh "$work"
 ca=$work/cert.pem
@@ -60,7 +61,13 @@ pids+=($!)
 # *.test.google.fr), HTTP/2 on 10083 and HTTP/3 on 10084.
 (cd /opt/server && dotnet InteropTestsWebsite.dll --port 10083 --port_http3 10084 --use_tls true) >/logs/cd-server.log 2>&1 &
 pids+=($!)
-sleep 5
+# Each server's TCP and UDP (HTTP/3) sockets bound, not a fixed time.
+for port in 10081 10082 10083; do
+  wait_until 60 "a server to listen on TCP $port" port_open 127.0.0.1 $port || exit 1
+done
+for port in 10081 10082 10084; do
+  wait_until 60 "a server to bind UDP $port" udp_bound $port || exit 1
+done
 
 run_dotnet a 10081
 run_dotnet b 10082
