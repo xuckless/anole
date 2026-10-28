@@ -782,6 +782,19 @@ pub fn build(b: *std.Build) void {
         run_timing.has_side_effects = true;
         timing_step.dependOn(&run_timing.step);
     }
+    // test-stress: the main suite again, the same binary run with
+    // ANOLE_TEST_STRESS=1 (src/testing/wait.zig): the stress and load
+    // tests (`requireStress`, named "[stress]") run too. TESTING.md W3:
+    // they never run in `zig build test`; the loop that repeats them in
+    // parallel comes with the W3 step (TODO S1.5).
+    const stress_step = b.step("test-stress", "Run the stress and load tests too (TESTING.md W3; not part of `test`)");
+    {
+        const run_stress = b.addRunArtifact(tests);
+        run_stress.setEnvironmentVariable("ANOLE_TEST_STRESS", "1");
+        run_stress.skip_foreign_checks = true;
+        run_stress.has_side_effects = true;
+        stress_step.dependOn(&run_stress.step);
+    }
     // The hang probe (src/safety/hang_probe.zig): a test that never returns,
     // to see the runner's hang dump work. `-Dhang-probe=true` adds it to
     // `test`; `zig build hang-probe` runs it alone. Both fail by design.

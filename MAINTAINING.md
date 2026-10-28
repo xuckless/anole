@@ -295,6 +295,11 @@ Anole's own tests wait through `src/testing/wait.zig` (the module
   `zig build test-timing` runs the main and the HTTP core's suites and the
   C ABI suite again with `ANOLE_TEST_TIMING=1`, which turns them on: locally
   (the Mac and the x86 box) on an idle machine, never in CI.
+- A stress or load test (TESTING.md W3: never in the unit suite) starts with
+  `try wait.requireStress();` and ends its name with "[stress]".
+  `zig build test-stress` runs the main suite again with
+  `ANOLE_TEST_STRESS=1`, which turns them on. Its claim must hold on any
+  machine; it is kept out of `zig build test` for its cost.
 - `waitEqual`, `waitNonZero` and `deadlineMs()` (the deadline for an API
   that takes milliseconds) cover the rest; the C consumer
   (tests/capi/consumer.c) has `wait_until()` with the same deadline, and

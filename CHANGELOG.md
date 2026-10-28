@@ -111,7 +111,8 @@ breaking changes are listed anyway.
   out; sleeps that stood in for "it has happened" wait on the condition
   itself, and elapsed-time upper bounds, in the Zig suites and the C ABI
   suite alike, are checked only by a new local-only step,
-  `zig build test-timing` (MAINTAINING.md, "Waiting in tests").
+  `zig build test-timing` (MAINTAINING.md, "Waiting in tests"). Stress
+  tests run only in another step, `zig build test-stress`.
 - Tests: a hung unit test says where it hangs. CI runs every unit test step
   with `--test-timeout 120s`; a test still running at 110 s, its teardown
   (the test Io's and allocator's deinit) included, is named and every

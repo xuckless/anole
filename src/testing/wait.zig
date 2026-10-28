@@ -70,6 +70,26 @@ pub fn requireTiming() error{SkipZigTest}!void {
     if (!timing()) return error.SkipZigTest;
 }
 
+/// `zig build test-stress` (`ANOLE_TEST_STRESS=1` in the environment, read
+/// once): stress and load tests (TESTING.md W3: never part of the unit
+/// suite) run only there. A stress test calls `requireStress` first and
+/// is named with " [stress]". Its claim holds on any machine; it is kept
+/// out of `zig build test` for its cost, not for timing (K1).
+pub fn stress() bool {
+    const cached = stress_cache.load(.monotonic);
+    if (cached != 0) return cached == 2;
+    const on = parseTiming(readEnv("ANOLE_TEST_STRESS"));
+    stress_cache.store(if (on) 2 else 1, .monotonic);
+    return on;
+}
+
+var stress_cache: std.atomic.Value(u8) = .init(0);
+
+/// Skips the calling test unless it is built for `zig build test-stress`.
+pub fn requireStress() error{SkipZigTest}!void {
+    if (!stress()) return error.SkipZigTest;
+}
+
 var factor_cache: std.atomic.Value(u32) = .init(0);
 
 /// `ANOLE_TEST_TIMEOUT_FACTOR` (a whole number >= 1), read once; 1 when
