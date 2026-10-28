@@ -108,7 +108,7 @@ const second_info = "INFO {\"server_id\":\"second\",\"version\":\"2.15.1\",\"pro
 /// INFO number two right after the first PONG and a PING of its own; then
 /// PONGs for the client's PINGs. The client must have answered the PING
 /// by the time it hangs up.
-fn serveSecondInfo(io: Io, listener: *net.Server) !void {
+fn serveSecondInfo(io: Io, listener: *net.Server, answered: *std.atomic.Value(bool)) !void {
     var peer: FakeServer.Peer = undefined;
     try peer.accept(io, listener);
     defer peer.close();
@@ -116,19 +116,19 @@ fn serveSecondInfo(io: Io, listener: *net.Server) !void {
     _ = try peer.readLine();
     try peer.expectLine("PING");
     try peer.send(golden.pong ++ second_info ++ golden.ping);
-    var answered = false;
     while (try peer.nextLine()) |line| {
         if (std.mem.eql(u8, line, "PING")) try peer.send(golden.pong);
-        if (std.mem.eql(u8, line, "PONG")) answered = true;
+        if (std.mem.eql(u8, line, "PONG")) answered.store(true, .release);
     }
-    if (!answered) return error.TestPingNotAnswered;
+    if (!answered.load(.acquire)) return error.TestPingNotAnswered;
 }
 
 test "a later INFO replaces the first, and a server PING gets its PONG" {
     const io = testing.io;
     var listener = try FakeServer.listen(io);
     defer listener.deinit(io);
-    var server = try io.concurrent(serveSecondInfo, .{ io, &listener });
+    var answered: std.atomic.Value(bool) = .init(false);
+    var server = try io.concurrent(serveSecondInfo, .{ io, &listener, &answered });
     defer server.cancel(io) catch {};
     var url: [64]u8 = undefined;
     var client: Client = try .init(testing.allocator, io, .{ .servers = &.{try FakeServer.url(&listener, &url)} });
@@ -146,8 +146,13 @@ test "a later INFO replaces the first, and a server PING gets its PONG" {
         if (time.expired(io, give_up)) return error.TestInfoNeverReplaced;
         try io.sleep(.fromMilliseconds(2), .awake);
     }
-    // The PONG to the server's PING goes out before this flush returns.
-    try client.flush(quick);
+    // The PONG is queued when the reader takes the PING, and close() drops
+    // what is still queued: wait until the server read it.
+    const answer_by = time.after(io, .fromSeconds(10));
+    while (!answered.load(.acquire)) {
+        if (time.expired(io, answer_by)) return error.TestPingNotAnswered;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
     client.close();
     try server.await(io);
 }
@@ -303,9 +308,9 @@ fn answerThenHangUp(io: Io, listener: *net.Server) !void {
         var peer: FakeServer.Peer = undefined;
         try peer.accept(io, listener);
         defer peer.close();
-        handshake(&peer) catch continue;
-        const line = (peer.nextLine() catch null) orelse continue;
-        if (std.mem.eql(u8, line, "PING")) peer.send(golden.pong) catch {};
+        handshake(&peer) catch |err| if (peer.canceled(err)) return error.Canceled else continue;
+        const line = (peer.nextLine() catch |err| if (peer.canceled(err)) return error.Canceled else null) orelse continue;
+        if (std.mem.eql(u8, line, "PING")) peer.send(golden.pong) catch |err| if (peer.canceled(err)) return error.Canceled;
     }
 }
 

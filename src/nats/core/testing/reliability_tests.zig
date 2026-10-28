@@ -2173,7 +2173,7 @@ const Flapping = struct {
                 if (f.count < f.times.len) f.times[f.count] = Io.Clock.awake.now(io);
                 f.count += 1;
             }
-            handshake(&peer, golden.info_default) catch {};
+            handshake(&peer, golden.info_default) catch |err| if (peer.canceled(err)) return error.Canceled;
         }
     }
 
@@ -2228,8 +2228,8 @@ const LameDuckEveryTime = struct {
             defer peer.close();
             _ = d.accepted.fetchAdd(1, .monotonic);
             var info: [256]u8 = undefined;
-            handshake(&peer, try std.fmt.bufPrint(&info, "INFO {{\"server_id\":\"A\",\"proto\":1,\"headers\":true,\"ldm\":true,\"connect_urls\":[\"127.0.0.1:{d}\"]}} \r\n", .{other_port})) catch continue;
-            while (peer.nextLine() catch null) |_| {}
+            handshake(&peer, try std.fmt.bufPrint(&info, "INFO {{\"server_id\":\"A\",\"proto\":1,\"headers\":true,\"ldm\":true,\"connect_urls\":[\"127.0.0.1:{d}\"]}} \r\n", .{other_port})) catch |err| if (peer.canceled(err)) return error.Canceled else continue;
+            while (peer.nextLine() catch |err| if (peer.canceled(err)) return error.Canceled else null) |_| {}
         }
     }
 };
@@ -2323,13 +2323,48 @@ fn serveHangUpThenServe(io: Io, listener: *net.Server, accepted: *std.atomic.Val
         try peer.accept(io, listener);
         defer peer.close();
         _ = accepted.fetchAdd(1, .monotonic);
-        handshake(&peer, golden.info_default) catch continue;
+        handshake(&peer, golden.info_default) catch |err| if (peer.canceled(err)) return error.Canceled else continue;
         if (first) {
             first = false;
             continue;
         }
-        answerPings(&peer) catch {};
+        answerPings(&peer) catch |err| if (peer.canceled(err)) return error.Canceled;
     }
+}
+
+/// A client's side of the handshake, by hand: INFO in, CONNECT and PING
+/// out, PONG in.
+fn rawHandshake(io: Io, address: net.IpAddress) !net.Stream {
+    const stream = try address.connect(io, .{ .mode = .stream });
+    errdefer stream.close(io);
+    var read_buffer: [4096]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    var write_buffer: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buffer);
+    _ = try reader.interface.takeDelimiterInclusive('\n');
+    try writer.interface.writeAll("CONNECT {}\r\nPING\r\n");
+    try writer.interface.flush();
+    const pong = try reader.interface.takeDelimiterInclusive('\n');
+    if (!std.mem.startsWith(u8, pong, "PONG")) return error.TestNoPong;
+    return stream;
+}
+
+test "a fake server canceled while it serves a client ends, and doesn't go back to accept" {
+    const io = testing.io;
+    var listener = try FakeServer.listen(io);
+    defer listener.deinit(io);
+    var accepted: std.atomic.Value(u32) = .init(0);
+    var server = try io.concurrent(serveHangUpThenServe, .{ io, &listener, &accepted });
+    // The first connection is hung up after its handshake; the second is
+    // served: the server now waits for the client's next line.
+    const first = try rawHandshake(io, listener.socket.address);
+    first.close(io);
+    const second = try rawHandshake(io, listener.socket.address);
+    defer second.close(io);
+    // The cancel reaches the server's read. When the server took it for
+    // the client hanging up, it went back to accept for good, and this
+    // cancel never returned.
+    try testing.expectError(error.Canceled, server.cancel(io));
 }
 
 fn holdSlot(io: Io, release: *Io.Event) void {
@@ -2381,8 +2416,26 @@ test "an io out of concurrency during a reconnect is one more failed attempt: th
         f.await(cio);
         slot.* = null;
     };
-    try awaitState(&client, .connected);
-    try client.flush(quick);
+    // The slots are free again a moment after `await` returns:
+    // `Io.Threaded` counts a task's slot until its worker thread has left
+    // it. An attempt in that moment finds no room for the reader and
+    // writer either, and is one more failed attempt (what this test is
+    // about), so the first `.connected` may be dropped at once. What must
+    // hold is that the client ends up with a connection that works.
+    try awaitWorkingConnection(&client);
+}
+
+/// The client is connected and a flush goes through, within 10 s: a
+/// connection dropped as it came up (`Disconnected`) is waited out.
+fn awaitWorkingConnection(client: *Client) !void {
+    const give_up = time.after(client.io, .fromSeconds(10));
+    while (true) {
+        try awaitState(client, .connected);
+        if (client.flush(quick)) |_| return else |err| switch (err) {
+            error.Disconnected => if (time.expired(client.io, give_up)) return err,
+            else => return err,
+        }
+    }
 }
 
 test "a client closed after a lost connection reports no uptime" {
