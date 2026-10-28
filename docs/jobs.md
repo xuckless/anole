@@ -150,7 +150,7 @@ request's span when the app traces it, else the caller's `traceparent`
 header as it came; from a running job it is that run's span. A `meta` that
 sets its own `traceparent` is left alone. Through the C ABI,
 `anole_jobs_enqueue` with `opts.req` takes that request's context the same
-way.
+way, read during the call (before the request is answered).
 
 With `app.tracing()`, each run is one span, `process <queue>`, of kind
 CONSUMER. It is **linked** to the enqueuer's context, not a child of it, as
@@ -169,7 +169,7 @@ a trace of its own, with these attributes:
 | `anole.job.kind` | the kind |
 | `anole.job.attempt`, `anole.job.max_attempts` | the attempt (1 on the first run), and how many the job gets |
 | `anole.job.outcome` | `completed`, `retried`, `dead`, `snoozed`, `interrupted` or `lost` |
-| `error.type` | the handler's error (`Timeout` past the timeout); the span's status is then ERROR |
+| `error.type` | the handler's error (`Timeout` when the run's timeout expired); the span's status is then ERROR. None for a run interrupted by a drain or lost (its lease expired, or it was cancelled): the cancel it got is not a failure |
 
 Handlers see the span as `job.trace_id` and `job.span_id`, and a job they
 enqueue carries it. With `.sample_all = false` a run is recorded only when

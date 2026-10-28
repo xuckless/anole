@@ -827,16 +827,26 @@ pub const Client = struct {
             .attempt = row.attempt,
             .max_attempts = row.max_attempts,
             .outcome = @tagName(outcome),
-            .error_type = if (result) |_| "" else |err| errorType(err),
+            .error_type = spanErrorType(outcome, result),
             .link = link,
             .link_state = if (link != null) (job.tracestate() orelse "") else "",
         });
         return outcome;
     }
 
-    /// A failed run's `error.type`, as its stored error names it.
+    /// A failed run's stored error name.
     fn errorType(err: anyerror) []const u8 {
         return if (err == error.Timeout or err == error.Canceled) "Timeout" else @errorName(err);
+    }
+
+    /// A run's span's `error.type`: the handler's error, `Timeout` only
+    /// when its own deadline expired (`dusty.Deadline` fails with
+    /// `error.Timeout`). Empty when it succeeded, and when it was stopped
+    /// from outside (interrupted by a drain, or lost with its lease or to a
+    /// cancel): the cancel it got is not the handler failing.
+    fn spanErrorType(outcome: Outcome, result: anyerror!void) []const u8 {
+        if (outcome == .interrupted or outcome == .lost) return "";
+        if (result) |_| return "" else |err| return @errorName(err);
     }
 
     fn invoke(h: *const Handler, job: *Job) anyerror!void {

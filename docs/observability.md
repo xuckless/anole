@@ -370,8 +370,9 @@ and the caller's unset flag (`-00`) for one passed on unrecorded. Clients
 do not add it on their own.
 
 `anole.observe.trace.current(req, &buf)` is the same context for work the
-request hands on rather than calls: its span when it is traced here, else
-the caller's `traceparent` as it came (null when there is neither), and
+request hands on rather than calls: its span when it is recorded here, else
+the caller's `traceparent` as it came, every trace flag kept (W3C Level 2's
+random flag too; null when there is neither), and
 `trace.currentState(req)` the caller's `tracestate` beside it. A job
 enqueued from a request keeps both.
 

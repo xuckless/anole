@@ -90,16 +90,18 @@ pub fn recording(req: *const dusty.Request) bool {
 }
 
 /// The `traceparent` of the context `req` runs in, for work it hands on
-/// (a job it enqueues): its span when traced here (`outgoing`, flags
-/// kept), else the caller's context as it came, so an app or a binding
-/// with no tracing of its own still passes it on. Null when there is
-/// neither.
+/// (a job it enqueues): its span when it is recorded here (`outgoing`),
+/// else the caller's `traceparent` as it came, every trace flag kept (W3C
+/// Level 2's random flag too), so an app or a binding with no tracing of
+/// its own, or a request passed on unrecorded, still hands it on
+/// unchanged. A later version's header is written as version 00 with its
+/// IDs and flags. Null when there is neither.
 pub fn current(req: *const dusty.Request, buf: *[55]u8) ?[]const u8 {
-    if (outgoing(req, buf)) |tp| return tp;
-    const caller = Context.parse(req.headers.get("traceparent") orelse return null) orelse return null;
-    var w: std.Io.Writer = .fixed(buf);
-    caller.format(&w) catch return null;
-    return w.buffered();
+    if (recording(req)) return outgoing(req, buf);
+    const header = std.mem.trim(u8, req.headers.get("traceparent") orelse return null, " \t");
+    const caller = Context.parse(header) orelse return null;
+    const flags = header[53..55];
+    return std.fmt.bufPrint(buf, "00-{s}-{s}-{c}{c}", .{ &caller.trace_id, &caller.span_id, std.ascii.toLower(flags[0]), std.ascii.toLower(flags[1]) }) catch null;
 }
 
 /// The caller's `tracestate` to keep with `current`'s context: only

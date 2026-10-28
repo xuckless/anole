@@ -19,9 +19,11 @@ breaking changes are listed anyway.
   `if_unmodified_since` for `get`, `open` and `head`.
 - Jobs: a job enqueued from a request kept `traceparent` with the sampled
   flag always set (`-01`), so a caller's unsampled context came back
-  sampled; the flags are now kept as they came, and the caller's
-  `tracestate` is kept beside it. Without the tracing middleware the
-  caller's `traceparent` header is kept as it came.
+  sampled. A request recorded here now passes its own span on (`-01`);
+  one passed on unrecorded, or served without the tracing middleware,
+  passes the caller's `traceparent` header on as it came, every trace flag
+  kept (`-00`, and W3C Level 2's random flag in `-03`). The caller's
+  `tracestate` is kept beside it.
 - C ABI: `anole_jobs_enqueue` with `opts.req` ignored the request's trace
   context; the jobs now carry its `traceparent` and `tracestate`, read
   during the call (so a request answered right after still passes it on;
@@ -33,8 +35,10 @@ breaking changes are listed anyway.
 - Jobs: with `app.tracing()`, each run of a job is a CONSUMER span
   `process <queue>`, linked (not parented) to the context it was enqueued
   from, with OpenTelemetry's messaging attributes and `anole.job.kind`,
-  `attempt`, `max_attempts` and `outcome` (docs/jobs.md). Handlers see it
-  as `job.trace_id`/`job.span_id`, and jobs they enqueue carry it.
+  `attempt`, `max_attempts` and `outcome` (docs/jobs.md); a failed run has
+  `error.type` (`Timeout` when its timeout expired) and an ERROR status, a
+  run interrupted by a drain or lost has neither. Handlers see it as
+  `job.trace_id`/`job.span_id`, and jobs they enqueue carry it.
 
 ## 0.4.1 (2026-10-28)
 
