@@ -325,6 +325,8 @@ test "blocking.Pool: a canceled caller gets error.Canceled after its job finishe
             return n;
         }
         fn seen(context: ?*anyopaque) void {
+            // SAFETY: context is the *Job passed as on_cancel.context in
+            // call(); it lives on the test frame until the caller is collected.
             const job: *@This() = @ptrCast(@alignCast(context.?));
             job.cancel_seen.store(true, .release);
         }
@@ -384,8 +386,10 @@ test "blocking.Pool: a canceled caller gets error.Canceled after its job finishe
         _ = third.cancel(io) catch 0;
     }
     try test_wait.waitUntil(io, "one job runs and one waits for the slot", &pool, Held.oneRunsOneWaits);
-    pool_open = false;
     var closer = try io.concurrent(Pool.deinit, .{&pool});
+    // From here the closer ends the pool (a failed spawn above leaves it to
+    // the errdefer).
+    pool_open = false;
     defer {
         go.store(true, .release);
         closer.await(io);
