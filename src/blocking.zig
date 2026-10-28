@@ -93,7 +93,7 @@ pub const Pool = struct {
         const io = self.rt.io();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        @atomicStore(bool, &self.closed, true, .release); // read by jobs spinning in its tests
+        @atomicStore(bool, &self.closed, true, .release); // a test's held job reads it unlocked
         self.changed.broadcast(io);
         while (self.running > 0 or self.waiting > 0) self.changed.waitUncancelable(io, &self.mutex);
     }
@@ -244,6 +244,17 @@ fn spinUntilTicks(io: std.Io, ticks: *const std.atomic.Value(u32), want: u32) u3
     return n;
 }
 
+/// Keeps a thread busy, without yielding, until `flag` is set (or the wait
+/// helper's deadline passes, so a flag never set fails a test's check
+/// instead of hanging it).
+fn spinUntilSet(io: std.Io, flag: *const std.atomic.Value(bool)) void {
+    const start = std.Io.Clock.awake.now(io);
+    while (!flag.load(.acquire)) {
+        if (start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds >= test_wait.deadline().nanoseconds) return;
+        std.atomic.spinLoopHint();
+    }
+}
+
 fn fails() error{Nope}!u8 {
     return error.Nope;
 }
@@ -292,6 +303,10 @@ test "blocking.Pool: a canceled caller gets error.Canceled after its job finishe
     const io = rt.io();
     var pool: Pool = undefined;
     try pool.init(rt, .{ .threads = 1 });
+    // A failed wait must not leave a job spinning: the pool's end lets
+    // `Held` go, and waits for whatever runs.
+    var pool_open = true;
+    errdefer if (pool_open) pool.deinit();
 
     // A job that runs until its caller's cancel has arrived (the cancel
     // hook only tells it so), then a little longer.
@@ -302,7 +317,9 @@ test "blocking.Pool: a canceled caller gets error.Canceled after its job finishe
 
         fn work(job: *@This(), _io: std.Io) u32 {
             job.started.store(true, .release);
-            while (!job.cancel_seen.load(.acquire)) std.atomic.spinLoopHint();
+            // Bounded: a hook that never runs fails the test below
+            // instead of hanging it.
+            spinUntilSet(_io, &job.cancel_seen);
             const n = spin(_io, 20);
             job.finished.store(true, .release);
             return n;
@@ -319,7 +336,9 @@ test "blocking.Pool: a canceled caller gets error.Canceled after its job finishe
     var caller = try io.concurrent(Job.call, .{ &pool, io, &job });
     try test_wait.waitFlag(io, "the job started on the pool", &job.started);
     try std.testing.expectError(error.Canceled, caller.cancel(io));
-    // The job was not cut short: cancel returned only once it had finished.
+    // The hook told the job, and the job was not cut short: cancel
+    // returned only once it had finished.
+    try std.testing.expect(job.cancel_seen.load(.acquire));
     try std.testing.expect(job.finished.load(.acquire));
 
     // With the one slot busy, the other job waits; deinit waits for the
@@ -327,8 +346,13 @@ test "blocking.Pool: a canceled caller gets error.Canceled after its job finishe
     // one is refused.
     const Held = struct {
         fn work(p: *const Pool, finished: *std.atomic.Value(bool)) u32 {
+            const pio = p.rt.io();
+            const start = std.Io.Clock.awake.now(pio);
             var n: u32 = 0;
-            while (!@atomicLoad(bool, &p.closed, .acquire)) : (n +%= 1) std.atomic.spinLoopHint();
+            // Until the pool is closing (bounded, as `spinUntilSet`).
+            while (!@atomicLoad(bool, &p.closed, .acquire)) : (n +%= 1) {
+                if (start.durationTo(std.Io.Clock.awake.now(pio)).nanoseconds >= test_wait.deadline().nanoseconds) break;
+            }
             finished.store(true, .release);
             return n;
         }
@@ -347,6 +371,7 @@ test "blocking.Pool: a canceled caller gets error.Canceled after its job finishe
     var second = try io.concurrent(Held.call, .{ &pool, io, &finished2 });
     var third = try io.concurrent(Held.call, .{ &pool, io, &finished3 });
     try test_wait.waitUntil(io, "one job runs and one waits for the slot", &pool, Held.oneRunsOneWaits);
+    pool_open = false;
     pool.deinit();
     // Whatever ran had finished by the time deinit returned.
     const done = [_]bool{ finished2.load(.acquire), finished3.load(.acquire) };
@@ -383,10 +408,9 @@ test "blocking.runWith: on_cancel asks a running job to stop, and the caller get
         stop: std.atomic.Value(bool) = .init(false),
         hooks: std.atomic.Value(u32) = .init(0),
 
-        fn work(self: *@This()) error{Interrupted}!u32 {
+        fn work(self: *@This(), _io: std.Io) error{Interrupted}!u32 {
             self.started.store(true, .release);
-            var n: u32 = 0;
-            while (!self.stop.load(.acquire)) n +%= 1;
+            spinUntilSet(_io, &self.stop);
             return error.Interrupted;
         }
         fn interrupt(context: ?*anyopaque) void {
@@ -395,7 +419,7 @@ test "blocking.runWith: on_cancel asks a running job to stop, and the caller get
             self.stop.store(true, .release);
         }
         fn call(self: *@This(), _io: std.Io) !u32 {
-            return runWith(_io, .{ .on_cancel = .{ .context = self, .call = interrupt } }, work, .{self});
+            return runWith(_io, .{ .on_cancel = .{ .context = self, .call = interrupt } }, work, .{ self, _io });
         }
     };
     var job: Interruptible = .{};
