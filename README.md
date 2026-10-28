@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
 That's the whole server. To try it:
 
 1. In a project made with `zig init`, run
-   `zig fetch --save git+https://github.com/xuckless/anole#v0.4.0`
+   `zig fetch --save git+https://github.com/xuckless/anole#v0.4.1`
    (or a later tag, or a commit).
 2. Make `build.zig` one call:
    `@import("anole").addApp(b, .{ .name = "api", .root_source_file = b.path("src/main.zig") })`.
@@ -254,7 +254,7 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
 - **AWS Lambda:** the same app served from the Lambda Runtime API with
   `deployment = .lambda` ([lambda](docs/lambda.md)).
 
-**Status: pre-1.0; the latest release is 0.4.0** ([CHANGELOG.md](CHANGELOG.md)).
+**Status: pre-1.0; the latest release is 0.4.1** ([CHANGELOG.md](CHANGELOG.md)).
 The API may still change before 1.0. Known issues and limitations are tracked in
 [Issues](https://github.com/xuckless/anole/issues). Next: the Node and
 Python bindings, anole-node (TypeScript) and anole-py (ASGI and WSGI), on the
@@ -343,7 +343,7 @@ Hello, World is about 1.3 MB; everything on is about 6 MB.
 ## Using Anole as a dependency
 
 ```sh
-zig fetch --save git+https://github.com/xuckless/anole#v0.4.0
+zig fetch --save git+https://github.com/xuckless/anole#v0.4.1
 ```
 
 Any later tag (see the [releases](https://github.com/xuckless/anole/releases))
