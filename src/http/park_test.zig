@@ -325,14 +325,19 @@ fn keepAliveDeadline(secure: bool) !void {
     var c: Client = undefined;
     try c.open(f.io, f.addr(), secure);
     defer c.close(f.io);
+    // Before the request: the wait for the next one starts after this, so
+    // the keep-alive deadline (600 ms from that start, never swept early)
+    // is at least 600 ms from here, however slow the machine.
+    const before = std.Io.Timestamp.now(f.io, .awake);
     try std.testing.expectEqual(200, try c.get("/"));
     try f.waitParked(1);
     const parked_at = std.Io.Timestamp.now(f.io, .awake);
     try std.testing.expect(c.hungUp());
+    // Not closed as it parked: closed at its deadline.
+    try std.testing.expect(before.untilNow(f.io, .awake).toMilliseconds() >= 600);
+    // Not much later than it (the sweep's second): a timing claim.
     const waited = parked_at.untilNow(f.io, .awake).toMilliseconds();
-    // The keep-alive deadline (600 ms from the wait's start), give or take
-    // the sweep's second: when it was closed is a timing claim.
-    if (wait.timing()) try std.testing.expect(waited >= 400 and waited < 2_500);
+    if (wait.timing()) try std.testing.expect(waited < 2_500);
     try f.waitClosed();
     try std.testing.expectEqual(0, f.server.parkedConnections());
 }
