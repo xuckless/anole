@@ -354,12 +354,8 @@ const Hold = struct {
 
     fn begin(h: *Hold, e: *engine.Engine) !void {
         e.execs[0].post(&h.cmd);
-        for (0..10_000_000) |_| {
-            if (h.started.load(.acquire)) return;
-            std.Thread.yield() catch {};
-        }
-        h.end();
-        return error.NeverHeld;
+        errdefer h.end();
+        try wait.waitFlag(engine.threadedIo(), "executor 0 runs the hold", &h.started);
     }
 
     fn end(h: *Hold) void {
@@ -389,10 +385,7 @@ const H2Get = struct {
         }, .{});
         defer s.release();
         if (g.reset) {
-            for (0..10_000) |_| {
-                if (g.answered.load(.acquire)) break;
-                try io.sleep(.fromMilliseconds(1), .awake);
-            } else return error.NeverAnswered;
+            try wait.waitFlag(io, "the consumer answered", &g.answered);
             s.cancel();
             g.reset_sent.store(true, .release);
             return;
@@ -435,10 +428,7 @@ fn enqueueThenRespond(comptime proto: enum { h1, h2 }, reset: bool) !void {
         try engine.respond(r.e, req, 200, &.{}, "ok", false);
         if (reset) {
             g.answered.store(true, .release);
-            for (0..10_000_000) |_| {
-                if (g.reset_sent.load(.acquire)) break;
-                std.Thread.yield() catch {};
-            } else return error.NeverReset;
+            try wait.waitFlag(engine.threadedIo(), "the client reset the stream", &g.reset_sent);
         }
     }
     hold.end();

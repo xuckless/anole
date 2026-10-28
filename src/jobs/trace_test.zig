@@ -239,10 +239,7 @@ fn interruptedCheck(io: std.Io) !void {
     try client.start(null, &exporter, null);
     var ctx: anole.db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
     _ = try client.enqueueRaw(&ctx, "mail.send", "{}", .{});
-    for (0..5000) |_| {
-        if (Waits.started.load(.acquire)) break;
-        io.sleep(.fromMilliseconds(1), .awake) catch {};
-    } else return error.NeverRan;
+    try wait.waitFlag(io, "the job's run started", &Waits.started);
     // A drain whose deadline has passed: the run is canceled and put back.
     client.drain(std.Io.Clock.Timestamp.now(io, .awake));
     var spans: [4]trace.Span = undefined;
