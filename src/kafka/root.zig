@@ -475,15 +475,17 @@ pub const Client = struct {
     }
 
     /// The record's headers, plus `traceparent` when the call is made in a
-    /// traced request that did not set one.
+    /// traced request that did not set one (`observe.trace.outgoing`: a
+    /// caller's unsampled context passed on unrecorded stays `-00`).
     fn withTrace(self: *Client, c: anytype, record: Record) Error![]const Header {
         _ = self;
         const req = internal.requestOf(c) orelse return record.headers;
-        if (req.trace_id.len != 32 or req.span_id.len != 16) return record.headers;
+        var buf: [55]u8 = undefined;
+        const tp = observe.trace.outgoing(req, &buf) orelse return record.headers;
         for (record.headers) |h| if (std.ascii.eqlIgnoreCase(h.key, "traceparent")) return record.headers;
         const out = try c.arena.alloc(Header, record.headers.len + 1);
         @memcpy(out[0..record.headers.len], record.headers);
-        out[record.headers.len] = .{ .key = "traceparent", .value = try std.fmt.allocPrint(c.arena, "00-{s}-{s}-01", .{ req.trace_id, req.span_id }) };
+        out[record.headers.len] = .{ .key = "traceparent", .value = try c.arena.dupe(u8, tp) };
         return out;
     }
 

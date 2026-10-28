@@ -4,6 +4,7 @@
 //! live_test.zig covers real brokers.
 const std = @import("std");
 const zio = @import("zio");
+const dusty = @import("dusty");
 const db = @import("../db/root.zig");
 const kafka = @import("root.zig");
 const records = @import("records.zig");
@@ -69,6 +70,37 @@ test "fake broker: produce with every codec, keys keep their partition, send and
         try testing.expectEqualStrings("v", stored[0].headers[0].value.?);
         try testing.expectEqualStrings("m19", stored[21].value.?);
     }
+}
+
+test "fake broker: a record produced from a request that passes an unsampled caller on keeps traceparent -00" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    // As the tracing middleware leaves a request it does not record
+    // (`sample_all` off, caller unsampled): the caller's IDs, as they came.
+    var keys: [1][]const u8 = undefined;
+    var values: [1][]const u8 = undefined;
+    var hashes: [1]u8 = undefined;
+    var req: dusty.Request = .{ .arena = arena.allocator(), .io = io, ._parser = undefined, ._transport = undefined };
+    req.headers = .{ .keys = &keys, .values = &values, .hashes = &hashes };
+    const caller = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00";
+    try req.headers.add("traceparent", caller);
+    req.trace_id = "0af7651916cd43dd8448eb211c80319c";
+    req.span_id = "b7ad6b7169203331";
+    _ = try client.produce(&req, .{ .topic = "traced", .value = "v" });
+    const stored = try broker.stored(arena.allocator(), "traced", 0);
+    try testing.expectEqual(@as(usize, 1), stored.len);
+    var got: ?[]const u8 = null;
+    for (stored[0].headers) |h| if (std.mem.eql(u8, h.key, "traceparent")) {
+        got = h.value;
+    };
+    try testing.expectEqualStrings(caller, got orelse return error.NoTraceparent);
 }
 
 test "fake broker: a retriable error is retried, a lost reply is not duplicated" {

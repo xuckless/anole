@@ -670,7 +670,8 @@ fn copyReply(c: anytype, m: core.Message) Error!Reply {
 }
 
 /// The core's header list: the call's, the message's, and `traceparent`
-/// when `c` is a traced request.
+/// when `c` is a traced request (`observe.trace.outgoing`: a caller's
+/// unsampled context passed on unrecorded stays `-00`).
 fn coreHeaders(c: anytype, buf: *[32]core.Headers.Header, call_headers: []const Header, msg_headers: []const Header) ![]const core.Headers.Header {
     var n: usize = 0;
     for ([_][]const Header{ call_headers, msg_headers }) |list| {
@@ -681,11 +682,12 @@ fn coreHeaders(c: anytype, buf: *[32]core.Headers.Header, call_headers: []const 
         }
     }
     if (internal.requestOf(c)) |req| {
-        if (req.trace_id.len == 32 and req.span_id.len == 16 and n < buf.len) {
-            const text = std.fmt.allocPrint(c.arena, "00-{s}-{s}-01", .{ req.trace_id, req.span_id }) catch return error.OutOfMemory;
+        var tp_buf: [55]u8 = undefined;
+        if (observe.trace.outgoing(req, &tp_buf)) |tp| if (n < buf.len) {
+            const text = c.arena.dupe(u8, tp) catch return error.OutOfMemory;
             buf[n] = .{ .name = "traceparent", .value = text };
             n += 1;
-        }
+        };
     }
     return buf[0..n];
 }

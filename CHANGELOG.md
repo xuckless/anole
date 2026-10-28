@@ -26,6 +26,11 @@ breaking changes are listed anyway.
   passes the caller's `traceparent` header on as it came, every trace flag
   kept (`-00`, and W3C Level 2's random flag in `-03`). The caller's
   `tracestate` is kept beside it.
+- Kafka and NATS: a produce or publish from a request passed on
+  unrecorded (a caller's unsampled context, `sample_all` off) sent
+  `traceparent` with the sampled flag set (`-01`); it now takes
+  `trace.outgoing`'s, so the caller's `-00` stays, as outbound HTTP calls
+  already did.
 - C ABI: `anole_jobs_enqueue` with `opts.req` ignored the request's trace
   context; the jobs now carry its `traceparent` and `tracestate`, read
   during the call (so a request answered right after still passes it on;
