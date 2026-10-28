@@ -6,6 +6,7 @@ const zio = @import("zio");
 const dusty = @import("dusty");
 const features = @import("build_options");
 const h2 = @import("anole_h2_client");
+const wait = @import("anole_test_wait");
 
 fn hello(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = "hello over h2";
@@ -231,8 +232,8 @@ test "h2 client: over TLS with ALPN h2" {
     try std.testing.expectEqualStrings("hello over h2", body);
 }
 
-/// A handler that sleeps for 10 s unless it is canceled, and says how it
-/// ended.
+/// A handler that sleeps for 60 s unless it is canceled, and says how it
+/// ended: done and canceled means a cancel ended it, whatever the time.
 const Sleeper = struct {
     var started: std.atomic.Value(bool) = .init(false);
     var canceled: std.atomic.Value(bool) = .init(false);
@@ -241,7 +242,7 @@ const Sleeper = struct {
     fn handle(req: *dusty.Request, res: *dusty.Response) !void {
         defer done.store(true, .release);
         started.store(true, .release);
-        req.io.sleep(.fromSeconds(10), .awake) catch |err| {
+        req.io.sleep(.fromSeconds(60), .awake) catch |err| {
             canceled.store(true, .release);
             return err;
         };
@@ -255,15 +256,13 @@ const Sleeper = struct {
     }
 
     fn waitStarted(io: std.Io) !void {
-        while (!started.load(.acquire)) try io.sleep(.fromMilliseconds(5), .awake);
+        try wait.waitFlag(io, "the sleeping handler started", &started);
     }
 
-    /// The handler ended, canceled, within `ms` of `since`.
-    fn expectCanceledWithin(io: std.Io, since: std.Io.Clock.Timestamp, ms: i64) !void {
-        while (!done.load(.acquire)) {
-            try std.testing.expect(since.durationTo(.now(io, .awake)).raw.toMilliseconds() < ms);
-            try io.sleep(.fromMilliseconds(5), .awake);
-        }
+    /// The handler ended, and a cancel ended it (its sleep is far longer
+    /// than the wait).
+    fn expectCanceled(io: std.Io) !void {
+        try wait.waitFlag(io, "the sleeping handler ended", &done);
         try std.testing.expect(canceled.load(.acquire));
     }
 };
@@ -298,9 +297,8 @@ test "h2 engine: a client's RST_STREAM or a lost connection cancels the stream's
         const s = try conn.request(&sleep_request, .{});
         defer s.release();
         try Sleeper.waitStarted(io);
-        const reset_at: std.Io.Clock.Timestamp = .now(io, .awake);
         s.cancel();
-        try Sleeper.expectCanceledWithin(io, reset_at, 1000);
+        try Sleeper.expectCanceled(io);
         const body = try get(conn, "/hello", gpa);
         defer gpa.free(body);
         try std.testing.expectEqualStrings("hello over h2", body);
@@ -323,9 +321,8 @@ test "h2 engine: a client's RST_STREAM or a lost connection cancels the stream's
         try w.interface.writeAll(block);
         try w.interface.flush();
         try Sleeper.waitStarted(io);
-        const closed_at: std.Io.Clock.Timestamp = .now(io, .awake);
         socket.close(io);
-        try Sleeper.expectCanceledWithin(io, closed_at, 3000);
+        try Sleeper.expectCanceled(io);
     }
 }
 
@@ -349,8 +346,9 @@ test "h2 engine: a peer's GOAWAY ends the connection with a FIN, and what it sen
     // GOAWAY, last stream 0, an unknown error code.
     try w.interface.writeAll(&.{ 0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff });
     try w.interface.flush();
-    // The session has ended by now. Read what the server sent (its
-    // SETTINGS frames), so a reset is not hidden behind buffered data.
+    // Time for the session to end. Read what the server sent (its SETTINGS
+    // frames), so a reset is not hidden behind buffered data. A slow
+    // machine can only hide a wrong reset here, never fail a right FIN.
     try io.sleep(.fromMilliseconds(100), .awake);
     var rbuf: [1024]u8 = undefined;
     var rd = socket.reader(io, &rbuf);
@@ -360,13 +358,13 @@ test "h2 engine: a peer's GOAWAY ends the connection with a FIN, and what it sen
     // server lingers, and draws a reset if the server closed at once.
     try w.interface.writeAll(&([_]u8{ 0, 0, 8, 6, 0, 0, 0, 0, 0 } ++ "h2spec  ".*)); // PING
     try w.interface.flush();
+    // Time for a wrong reset to arrive (as above: it can only be missed).
     try io.sleep(.fromMilliseconds(50), .awake);
 
     // Then the end of the stream, which the server sent without waiting
-    // for the peer; a reset fails the read.
-    const started: std.Io.Clock.Timestamp = .now(io, .awake);
+    // for the peer (it would wait for ever otherwise: the test's socket
+    // stays open); a reset fails the read.
     _ = rd.interface.discardRemaining() catch return rd.err orelse error.Unexpected;
-    try std.testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 500);
 }
 
 test "h2 client: request timeouts, for the head and for the body, and the connection carries on" {
@@ -381,13 +379,12 @@ test "h2 client: request timeouts, for the head and for the body, and the connec
     const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = srv.port(), .timeout = .fromMilliseconds(300) });
     defer conn.close();
 
-    const started = std.Io.Clock.awake.now(io);
+    // The handler takes 5 s: a head before that is the timeout's doing.
     {
         const s = try request(conn, "/slow", .{});
         defer s.release();
         try std.testing.expectError(error.Timeout, s.waitHead());
     }
-    try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
 
     // The head in time, the body not: the read fails, and says why.
     {
@@ -439,7 +436,8 @@ test "h2 client: connect_timeout bounds a TLS handshake that never answers" {
         .tls = .{ .insecure_skip_verify = true },
         .connect_timeout = .fromMilliseconds(200),
     }));
-    try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
+    // 200 ms, not the 10 s default: a bound only test-timing checks.
+    if (wait.timing) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
 }
 
 test "h2 client: the system trust store by default, a CA in memory, mutual TLS from memory and from files" {
@@ -722,6 +720,10 @@ const Scripted = struct {
     sent: [64 * 1024]u8 = undefined,
     /// Bytes of `sent` filled; they never change after.
     sent_len: std.atomic.Value(usize) = .init(0),
+    /// Bytes the test queued (`send`) and bytes the client took from the
+    /// queue (`stream`).
+    given: std.atomic.Value(usize) = .init(0),
+    taken: std.atomic.Value(usize) = .init(0),
     listener: std.Io.net.Server,
     near: std.Io.net.Stream,
     far: std.Io.net.Stream,
@@ -761,6 +763,23 @@ const Scripted = struct {
 
     fn send(self: *Scripted, bytes: []const u8) !void {
         try self.queue.putAll(self.io, bytes);
+        _ = self.given.fetchAdd(bytes.len, .release);
+    }
+
+    /// Waits until the client has taken every byte sent so far, or its
+    /// session has ended (it reads nothing more then).
+    fn waitTaken(self: *Scripted, conn: *h2.ClientConnection) !void {
+        const C = struct {
+            p: *Scripted,
+            conn: *h2.ClientConnection,
+            fn f(c: @This()) bool {
+                if (c.p.taken.load(.acquire) == c.p.given.load(.acquire)) return true;
+                c.conn.mutex.lockUncancelable(c.p.io);
+                defer c.conn.mutex.unlock(c.p.io);
+                return c.conn.dead;
+            }
+        };
+        try wait.waitUntil(self.io, "the client read every frame sent, or ended its session", C{ .p = self, .conn = conn }, C.f);
     }
 
     fn record(self: *Scripted, bytes: []const u8) void {
@@ -786,22 +805,25 @@ const Scripted = struct {
 
     /// Waits until the client has written the HEADERS of stream `id`, so
     /// the stream is open on its side: a frame sent for it before that
-    /// would be on an idle stream, which is a connection error. Bounded
-    /// generously; nothing here is about time.
+    /// would be on an idle stream, which is a connection error.
     fn waitHeadersSent(self: *Scripted, id: u31) !void {
-        for (0..5000) |_| {
-            const bytes = self.sent[0..self.sent_len.load(.acquire)];
-            // After the 24-byte client preface, whole frames.
-            var at: usize = 24;
-            while (bytes.len >= at + 9) {
-                const len = std.mem.readInt(u24, bytes[at..][0..3], .big);
-                const stream_id = std.mem.readInt(u32, bytes[at + 5 ..][0..4], .big) & 0x7fff_ffff;
-                if (bytes[at + 3] == 0x1 and stream_id == id) return;
-                at += 9 + len;
+        const C = struct {
+            p: *Scripted,
+            id: u31,
+            fn sent(c: @This()) bool {
+                const bytes = c.p.sent[0..c.p.sent_len.load(.acquire)];
+                // After the 24-byte client preface, whole frames.
+                var at: usize = 24;
+                while (bytes.len >= at + 9) {
+                    const len = std.mem.readInt(u24, bytes[at..][0..3], .big);
+                    const stream_id = std.mem.readInt(u32, bytes[at + 5 ..][0..4], .big) & 0x7fff_ffff;
+                    if (bytes[at + 3] == 0x1 and stream_id == c.id) return true;
+                    at += 9 + len;
+                }
+                return false;
             }
-            try self.io.sleep(.fromMilliseconds(1), .awake);
-        }
-        return error.TestHeadersNeverSent;
+        };
+        try wait.waitUntil(self.io, "the client sent the stream's HEADERS", C{ .p = self, .id = id }, C.sent);
     }
 
     /// The client reads the end of the connection.
@@ -813,6 +835,7 @@ const Scripted = struct {
         const self: *Scripted = @alignCast(@fieldParentPtr("reader", r));
         const dest = limit.slice(try w.writableSliceGreedy(1));
         const n = self.queue.get(self.io, dest, 1) catch return error.EndOfStream;
+        _ = self.taken.fetchAdd(n, .release);
         w.advance(n);
         return n;
     }
@@ -830,11 +853,11 @@ fn frame(comptime kind: u8, comptime flags: u8, comptime id: u31, comptime paylo
 }
 
 fn waitClosing(conn: *h2.ClientConnection, io: std.Io) !void {
-    var tries: usize = 0;
-    while (conn.isOpen()) : (tries += 1) {
-        if (tries > 400) return error.TestTimeout;
-        try io.sleep(.fromMilliseconds(5), .awake);
-    }
+    try wait.waitUntil(io, "the client took the GOAWAY (no new streams)", conn, struct {
+        fn f(c: *h2.ClientConnection) bool {
+            return !c.isOpen();
+        }
+    }.f);
 }
 
 test "h2 client: a stream released after a graceful GOAWAY stays valid until the server ends it" {
@@ -849,7 +872,7 @@ test "h2 client: a stream released after a graceful GOAWAY stays valid until the
 
     const s = try request(conn, "/", .{});
     // Its HEADERS go out before the GOAWAY comes.
-    try io.sleep(.fromMilliseconds(20), .awake);
+    try peer.waitHeadersSent(1);
     // GOAWAY, last stream 1, NO_ERROR: stream 1 is still the server's to
     // answer.
     try peer.send(&frame(7, 0, 0, &.{ 0, 0, 0, 1, 0, 0, 0, 0 }));
@@ -859,7 +882,9 @@ test "h2 client: a stream released after a graceful GOAWAY stays valid until the
     // with END_STREAM.
     try peer.send(&frame(1, 0x4, 1, &.{0x88}));
     try peer.send(&frame(0, 0x1, 1, "late"));
-    try io.sleep(.fromMilliseconds(50), .awake);
+    // The client reads the answer to the released stream (or has ended the
+    // session for good) before the end.
+    try peer.waitTaken(conn);
     peer.end();
 }
 
@@ -876,12 +901,11 @@ test "h2 client: a graceful GOAWAY lets the streams it covers finish" {
 
     const s = try request(conn, "/", .{});
     defer s.release();
-    try io.sleep(.fromMilliseconds(20), .awake);
+    try peer.waitHeadersSent(1);
     try peer.send(&frame(7, 0, 0, &.{ 0, 0, 0, 1, 0, 0, 0, 0 }));
+    // The client has acted on the GOAWAY before the answer comes.
     try waitClosing(conn, io);
     try std.testing.expectError(error.ConnectionClosed, request(conn, "/", .{}));
-    // Give the client time to act on the GOAWAY before the answer comes.
-    try io.sleep(.fromMilliseconds(20), .awake);
     try peer.send(&frame(1, 0x4, 1, &.{0x88}));
     try peer.send(&frame(0, 0x1, 1, "finished"));
     try s.waitHead();
@@ -904,7 +928,7 @@ test "h2 client: a response head past the header list limit resets the stream" {
 
     const s = try request(conn, "/", .{});
     defer s.release();
-    try io.sleep(.fromMilliseconds(20), .awake);
+    try peer.waitHeadersSent(1);
     // :status 200, one 100-byte field added to the dynamic table, then 600
     // one-byte references to it: about 80 KB decoded from 700 bytes.
     const head = [_]u8{ 0x88, 0x40, 5 } ++ "x-big" ++ [_]u8{100} ++ @as([100]u8, @splat('v')) ++ @as([600]u8, @splat(0xbe));
@@ -914,7 +938,7 @@ test "h2 client: a response head past the header list limit resets the stream" {
     // The connection carries on.
     const t = try request(conn, "/", .{});
     defer t.release();
-    try io.sleep(.fromMilliseconds(20), .awake);
+    try peer.waitHeadersSent(3);
     try peer.send(&frame(1, 0x5, 3, &.{0x88}));
     try t.waitHead();
     try std.testing.expectEqual(@as(u16, 200), t.status);
@@ -937,7 +961,7 @@ test "h2 client: informational responses before the final one, up to a limit" {
         // Five, then the response: its head and fields, not theirs.
         const s = try request(conn, "/", .{});
         defer s.release();
-        try io.sleep(.fromMilliseconds(20), .awake);
+        try peer.waitHeadersSent(1);
         for (0..5) |_| try peer.send(&frame(1, 0x4, 1, early));
         try peer.send(&frame(1, 0x4, 1, [_]u8{ 0x88, 0x00, 1 } ++ "x" ++ [_]u8{1} ++ "y"));
         try peer.send(&frame(0, 0x1, 1, "ok"));
@@ -953,7 +977,7 @@ test "h2 client: informational responses before the final one, up to a limit" {
         // Six is one too many.
         const s = try request(conn, "/", .{});
         defer s.release();
-        try io.sleep(.fromMilliseconds(20), .awake);
+        try peer.waitHeadersSent(3);
         for (0..6) |_| try peer.send(&frame(1, 0x4, 3, early));
         try std.testing.expectError(error.TooManyInterimResponses, s.waitHead());
     }
