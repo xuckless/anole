@@ -18,6 +18,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # ceil(2 x p95) + 5 from the green runs so far (3, 2026-10-28).
+    timeout-minutes: 23
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -25,4 +27,5 @@ jobs:
           version: 0.17.0
           cache-key: network
       - name: zig build tls-public-check
-        run: zig build tls-public-check
+        timeout-minutes: 22
+        run: zig build tls-public-check --test-timeout 120s

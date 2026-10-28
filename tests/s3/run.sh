@@ -11,6 +11,9 @@
 #   tests/s3/run.sh                                  # ports 59000/59001
 #   S3_PORT=59100 ZIG=zig tests/s3/run.sh
 #   tests/s3/run.sh -Doptimize=ReleaseSafe           # extra zig build arguments
+#
+# ANOLE_KEEP_CONTAINERS=1 leaves the containers when the script ends (CI
+# collects their logs and states after a failure, then removes them).
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -28,7 +31,7 @@ CERTS=$(mktemp -d)
 # container, and without access it finds no certificate and serves plain HTTP.
 chmod 755 "$CERTS"
 cleanup() {
-  docker rm -f "$NAME-plain" "$NAME-tls" >/dev/null 2>&1 || true
+  [ -n "${ANOLE_KEEP_CONTAINERS:-}" ] || docker rm -f "$NAME-plain" "$NAME-tls" >/dev/null 2>&1 || true
   rm -rf "$CERTS"
 }
 trap cleanup EXIT

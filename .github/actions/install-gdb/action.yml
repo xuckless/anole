@@ -1,0 +1,18 @@
+name: gdb for hang dumps
+description: >-
+  Installs gdb on a Linux runner, so that a hung unit test's dump (the test
+  runner, src/safety/test_runner.zig) carries every thread's backtrace. A
+  failed install only warns: the hung test is still named.
+runs:
+  using: composite
+  steps:
+    - name: Install gdb
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        if command -v gdb >/dev/null; then gdb --version | head -1; exit 0; fi
+        if sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gdb; then
+          gdb --version | head -1
+        else
+          echo "::warning::gdb could not be installed: a hung test is named, but without backtraces"
+        fi

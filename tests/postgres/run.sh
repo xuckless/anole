@@ -12,6 +12,9 @@
 #   tests/postgres/run.sh                       # postgres:17 on port 55432
 #   PG_IMAGE=postgres:18 PG_PORT=55433 ZIG=zig tests/postgres/run.sh
 #   tests/postgres/run.sh -Doptimize=ReleaseSafe   # extra zig build arguments
+#
+# ANOLE_KEEP_CONTAINERS=1 leaves the containers when the script ends (CI
+# collects their logs and states after a failure, then removes them).
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -23,7 +26,7 @@ PASSWORD=anole-test-pw
 
 CERTS=$(mktemp -d)
 cleanup() {
-  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  [ -n "${ANOLE_KEEP_CONTAINERS:-}" ] || docker rm -f "$NAME" >/dev/null 2>&1 || true
   rm -rf "$CERTS"
 }
 trap cleanup EXIT
@@ -43,7 +46,7 @@ trap cleanup EXIT
   chmod 644 server.key
 )
 
-docker run -d --rm --name "$NAME" -p "127.0.0.1:$PORT:5432" \
+docker run -d --name "$NAME" -p "127.0.0.1:$PORT:5432" \
   -e POSTGRES_PASSWORD="$PASSWORD" \
   -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 \
   -e POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 \
