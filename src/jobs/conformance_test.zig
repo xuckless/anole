@@ -586,8 +586,9 @@ fn Suite(comptime B: Backend) type {
                 else => unreachable,
             };
             wake_hits.store(0, .release);
-            // A poll far past any wait here: only the wake can run the job.
-            const worker = try root.Client.init(std.testing.allocator, io, .{ .store = st, .table_prefix = "jtest_", .key_prefix = "jtest:", .poll_interval = .fromSeconds(3600), .name = "worker" });
+            // The longest poll allowed (60 s), far past the wait deadline
+            // (10 s): only the wake can run the job in time.
+            const worker = try root.Client.init(std.testing.allocator, io, .{ .store = st, .table_prefix = "jtest_", .key_prefix = "jtest:", .poll_interval = .fromSeconds(60), .name = "worker" });
             defer worker.deinit();
             try worker.addHandler(plain, null, wakeRun);
             try worker.start(null, null, null);
