@@ -76,12 +76,13 @@ const watchdog = struct {
     const debugger_limit_arg = std.fmt.comptimePrint("{d}", .{debugger_limit_s});
     const own_deadline_ns: u64 = (debugger_limit_s + 15) * std.time.ns_per_s;
     /// `sh -c supervise sh LIMIT CMD...`: runs CMD and SIGKILLs it after
-    /// LIMIT seconds; exits with CMD's status (137 when killed). The timer's
-    /// subshell has no stdio, so a leftover `sleep` holds no pipe open.
+    /// LIMIT seconds; exits with CMD's status (137 when killed). When CMD
+    /// ends first the timer subshell ends its `sleep` too; it has no stdio,
+    /// so nothing it leaves holds our stderr pipe open.
     const supervise =
         \\limit=$1; shift
         \\"$@" & p=$!
-        \\( sleep "$limit"; kill -9 "$p" ) </dev/null >/dev/null 2>&1 & w=$!
+        \\( sleep "$limit" & t=$!; trap 'kill "$t"; exit 0' TERM; wait "$t"; kill -9 "$p" ) </dev/null >/dev/null 2>&1 & w=$!
         \\wait "$p"; s=$?
         \\kill "$w" 2>/dev/null
         \\exit "$s"
