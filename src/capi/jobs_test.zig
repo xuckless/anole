@@ -329,3 +329,132 @@ test "capi jobs: enqueue with opts.req carries the request's traceparent, flags 
     try std.testing.expectEqualStrings("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00", r.ev.span(ji, job.traceparent));
     try std.testing.expect(std.mem.indexOf(u8, r.ev.span(ji, job.meta), "\"tracestate\":\"congo=t61rcWkgMzE\"") != null);
 }
+
+/// Holds executor 0 (its capi task, so every task on it) until `end`:
+/// what the consumer does meanwhile has all landed when it runs again,
+/// as when a consumer enqueues and answers back to back before the
+/// executor wakes.
+const Hold = struct {
+    cmd: engine.Command = .{ .run = run },
+    started: std.atomic.Value(bool) = .init(false),
+    released: std.atomic.Value(bool) = .init(false),
+
+    fn run(cmd: *engine.Command, _: *engine.Exec) void {
+        const h: *Hold = @fieldParentPtr("cmd", cmd);
+        h.started.store(true, .release);
+        while (!h.released.load(.acquire)) std.Thread.yield() catch {};
+    }
+
+    fn begin(h: *Hold, e: *engine.Engine) !void {
+        e.execs[0].post(&h.cmd);
+        for (0..10_000_000) |_| {
+            if (h.started.load(.acquire)) return;
+            std.Thread.yield() catch {};
+        }
+        h.end();
+        return error.NeverHeld;
+    }
+
+    fn end(h: *Hold) void {
+        h.released.store(true, .release);
+    }
+};
+
+const tp_unsampled = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00";
+
+/// An HTTP/2 (h2c) GET of /x carrying a trace context the server does not
+/// record; with `reset`, the stream is reset once `answered` is set (the
+/// consumer has answered), and `reset_sent` says it went out.
+const H2Get = struct {
+    port: u16,
+    reset: bool = false,
+    answered: std.atomic.Value(bool) = .init(false),
+    reset_sent: std.atomic.Value(bool) = .init(false),
+    status: u16 = 0,
+
+    fn run(g: *H2Get, io: std.Io) anyerror!void {
+        const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = g.port });
+        defer conn.close();
+        const s = try conn.request(&.{
+            .{ .name = ":method", .value = "GET" },     .{ .name = ":path", .value = "/x" },
+            .{ .name = ":scheme", .value = "http" },    .{ .name = ":authority", .value = "localhost" },
+            .{ .name = "traceparent", .value = tp_unsampled }, .{ .name = "tracestate", .value = "congo=t61rcWkgMzE" },
+        }, .{});
+        defer s.release();
+        if (g.reset) {
+            for (0..10_000) |_| {
+                if (g.answered.load(.acquire)) break;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            } else return error.NeverAnswered;
+            s.cancel();
+            g.reset_sent.store(true, .release);
+            return;
+        }
+        try s.waitHead();
+        g.status = s.status;
+    }
+};
+
+/// Enqueue with `opts.req`, then answer the request at once, both landing
+/// before the request's executor runs again; with `reset`, the client
+/// resets the HTTP/2 stream after the answer, also before then.
+fn enqueueThenRespond(comptime proto: enum { h1, h2 }, reset: bool) !void {
+    if (comptime !features.jobs) return error.SkipZigTest;
+    if (comptime proto == .h2 and !features.http2) return error.SkipZigTest;
+    // Workers only: the test thread polls the consumer.
+    const rt = try anole.zio.Runtime.init(alloc, .{ .executors = .exact(1), .enable_main_executor = false });
+    defer rt.deinit();
+    var r: Rig = undefined;
+    try r.createRouted(", \"kinds\": [{\"name\": \"t.work\"}]", "{\"path\": \"/x\", \"handler\": 1, \"timeout_ms\": 20000}");
+    defer r.deinit();
+    _ = try engine.jobs.work(r.e, r.c, .{ .size = @sizeOf(abi.JobsWorkOptions) }, 5);
+    try r.start();
+    const io = rt.io();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{r.e.port(0)});
+    var res: HttpResult = .{};
+    var g: H2Get = .{ .port = r.e.port(0), .reset = reset };
+    var f1: ?std.Io.Future(anyerror!void) = null;
+    var f2: ?std.Io.Future(anyerror!void) = null;
+    if (proto == .h1) f1 = try io.concurrent(fetchTraced, .{ io, url, &res }) else f2 = try io.concurrent(H2Get.run, .{ &g, io });
+    const ri = try r.ev.waitFor(.request, 0, 10000);
+    const req = r.ev.list.items[ri].handle;
+
+    var hold: Hold = .{};
+    try hold.begin(r.e);
+    {
+        errdefer hold.end();
+        try engine.jobs.enqueue(r.e, r.c, &.{jobOut("t.work", "{}")}, .{ .size = @sizeOf(abi.JobsEnqueueOptions), .req = req }, 11);
+        try engine.respond(r.e, req, 200, &.{}, "ok", false);
+        if (reset) {
+            g.answered.store(true, .release);
+            for (0..10_000_000) |_| {
+                if (g.reset_sent.load(.acquire)) break;
+                std.Thread.yield() catch {};
+            } else return error.NeverReset;
+        }
+    }
+    hold.end();
+
+    const ji = try r.ev.waitFor(.job, 0, 10000);
+    const job = r.ev.as(abi.JobEvent, ji);
+    // Answered before anything is checked, so a failure ends cleanly.
+    try engine.jobs.finish(r.e, r.ev.list.items[ji].handle, abi.JOB_DONE, 0, "");
+    if (f1) |*f| try f.await(io);
+    if (f2) |*f| try f.await(io);
+    if (!reset) try std.testing.expectEqual(@as(u16, 200), if (proto == .h1) res.status else g.status);
+    try std.testing.expectEqualStrings(tp_unsampled, r.ev.span(ji, job.traceparent));
+    try std.testing.expect(std.mem.indexOf(u8, r.ev.span(ji, job.meta), "\"tracestate\":\"congo=t61rcWkgMzE\"") != null);
+}
+
+test "capi jobs: enqueue with opts.req, then the answer at once: the job carries the context (HTTP/1.1)" {
+    try enqueueThenRespond(.h1, false);
+}
+
+test "capi jobs: enqueue with opts.req, then the answer at once: the job carries the context (HTTP/2)" {
+    try enqueueThenRespond(.h2, false);
+}
+
+test "capi jobs: enqueue with opts.req, the answer, then the client resets the HTTP/2 stream: nothing reads the request after" {
+    try enqueueThenRespond(.h2, true);
+}

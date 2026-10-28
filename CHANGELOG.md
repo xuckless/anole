@@ -23,7 +23,10 @@ breaking changes are listed anyway.
   `tracestate` is kept beside it. Without the tracing middleware the
   caller's `traceparent` header is kept as it came.
 - C ABI: `anole_jobs_enqueue` with `opts.req` ignored the request's trace
-  context; the jobs now carry its `traceparent` and `tracestate`.
+  context; the jobs now carry its `traceparent` and `tracestate`, read
+  during the call (so a request answered right after still passes it on;
+  one already answered adds none). Nothing is copied for requests that
+  never enqueue.
 
 ### Changed
 

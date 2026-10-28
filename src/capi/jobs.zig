@@ -691,8 +691,9 @@ const EnqReq = struct {
     user_data: u64,
     items: []Wire,
     arena: std.heap.ArenaAllocator,
-    /// `opts.req`: the request whose trace context the jobs carry (0: none).
-    req: u64 = 0,
+    /// `opts.req`'s trace context, read when the call was made (the
+    /// request may be answered and gone before this runs).
+    trace: engine.TraceContext = .{},
 
     fn free(q: *EnqReq) void {
         var arena = q.arena;
@@ -721,9 +722,8 @@ const EnqReq = struct {
         var class: u8 = 0;
         var message: []const u8 = "";
         var n: usize = 0;
-        const trace = requestTrace(x, q.req, a);
         for (q.items) |wi| {
-            const o = if (trace.traceparent) |tp| J.Client.addTrace(a, optionsOf(wi), tp, trace.tracestate) catch optionsOf(wi) else optionsOf(wi);
+            const o = if (q.trace.traceparent) |tp| J.Client.addTrace(a, optionsOf(wi), tp, q.trace.tracestate) catch optionsOf(wi) else optionsOf(wi);
             const r = client.enqueueRaw(&ctx, wi.kind, wi.args_json, o) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 status = if (err == error.InvalidJob) abi.E_INVALID else abi.E_DB;
@@ -753,24 +753,6 @@ const EnqReq = struct {
         x.postRecord(rec, false);
     }
 };
-
-/// The trace context of request `hv` (0: none), copied into `a`: read on
-/// the request's executor `x` before anything suspends, while the slot's
-/// generation is still the handle's (as `engine.requestTag` checks it; the
-/// slot only moves on to another request on this executor). Nothing for a
-/// request that has ended.
-fn requestTrace(x: *Exec, hv: u64, a: std.mem.Allocator) struct { traceparent: ?[]const u8 = null, tracestate: ?[]const u8 = null } {
-    if (hv == 0) return .{};
-    const h = Handle.decode(hv);
-    if (!db.slotLive(x, h)) return .{};
-    const req = x.slots[h.slot].req;
-    var buf: [55]u8 = undefined;
-    const tp = anole.observe.trace.current(req, &buf) orelse return .{};
-    return .{
-        .traceparent = a.dupe(u8, tp) catch return .{},
-        .tracestate = if (anole.observe.trace.currentState(req)) |ts| a.dupe(u8, ts) catch null else null,
-    };
-}
 
 /// `anole_jobs_enqueue`.
 pub fn enqueue(e: *Engine, c: ?*Consumer, outs: []const abi.JobOut, opts: abi.JobsEnqueueOptions, user_data: u64) CallError!void {
@@ -808,8 +790,11 @@ pub fn enqueue(e: *Engine, c: ?*Consumer, outs: []const abi.JobOut, opts: abi.Jo
         if (cc.execs.items.len == 0) return error.State;
         break :blk cc.execs.items[cc.next_db.fetchAdd(1, .monotonic) % cc.execs.items.len];
     };
+    // The request's context now, on this thread, while the request is
+    // still owed its answer: by the time the command runs it may be gone.
+    const trace: engine.TraceContext = if (opts.req != 0) try engine.requestTrace(e, opts.req, a) else .{};
     const q = a.create(EnqReq) catch return error.OutOfMemory;
-    q.* = .{ .e = e, .user_data = user_data, .items = items, .arena = arena, .req = opts.req };
+    q.* = .{ .e = e, .user_data = user_data, .items = items, .arena = arena, .trace = trace };
     x.post(&q.cmd);
 }
 

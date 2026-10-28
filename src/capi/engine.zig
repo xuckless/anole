@@ -3511,6 +3511,36 @@ pub fn requestTag(e: *Engine, hv: u64, buf: *[64]u8) ?struct { rid: []const u8, 
     return .{ .rid = buf[0..n], .route = route };
 }
 
+/// A request's trace context, as work it hands on keeps it.
+pub const TraceContext = struct {
+    traceparent: ?[]const u8 = null,
+    tracestate: ?[]const u8 = null,
+};
+
+/// Request (or gRPC call) `hv`'s trace context (`observe.trace.current`
+/// and `currentState`), copied into `a` on the caller's thread: what
+/// `anole_jobs_enqueue` with `opts.req` stores with its jobs. The request
+/// is pinned while it is read, as `poll` pins it to copy its head: `out`
+/// goes to `polling` and back, and meanwhile its task waits (HTTP/1.1) or
+/// a detached request's abort spins (HTTP/2, HTTP/3), so its memory
+/// stays. Nothing is copied at dispatch: requests that hand nothing on pay
+/// nothing. Empty when the request carries no context or is no longer owed
+/// an answer (answered, ended, or an answer call overlaps this one: rule 2
+/// of the ABI's threads).
+pub fn requestTrace(e: *Engine, hv: u64, a: std.mem.Allocator) error{OutOfMemory}!TraceContext {
+    const h = Handle.decode(hv);
+    if (h.kind != .request and h.kind != .grpc_call) return .{};
+    _, const s, _ = slotOfKind(e, hv, h.kind) catch return .{};
+    if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .polling), .acquire, .monotonic) != null) return .{};
+    defer s.word.store(pack(h.gen, .out), .release);
+    const req = s.req;
+    var buf: [55]u8 = undefined;
+    const tp = anole.observe.trace.current(req, &buf) orelse return .{};
+    const ts = anole.observe.trace.currentState(req);
+    const tp_copy = try a.dupe(u8, tp);
+    return .{ .traceparent = tp_copy, .tracestate = if (ts) |t| try a.dupe(u8, t) else null };
+}
+
 /// The slot a handle of `kind` names, if it could be one: the generation
 /// is the caller's to check (a stale handle finds its slot moved on).
 pub fn slotOfKind(e: *Engine, hv: u64, kind: Handle.Kind) HandleError!struct { *Exec, *Slot, Handle } {
