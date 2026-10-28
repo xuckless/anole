@@ -21,6 +21,10 @@ breaking changes are listed anyway.
   an error (and in a hang dump); before, a passing test's warnings showed up
   under the next failing test or under a misleading "failed command:" line.
   Text printed straight to stderr (`std.debug.print`, C code) still shows.
+- CI: every job and long step has a time limit sized from the last 30 green
+  runs, jobs with Docker containers keep the containers' logs and states as
+  an artifact when they fail, and the interop jobs install tshark from cached
+  packages, or else Ubuntu's own, when the Wireshark PPA is down (#54).
 
 ## 0.4.1 (2026-10-28)
 

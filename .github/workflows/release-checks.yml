@@ -15,11 +15,14 @@ on:
 permissions:
   contents: read
 
+# Time limits as in ci.yml: ceil(2 x p95) + 5 from the green runs so far
+# (8, 2026-10-28); unit test steps pass --test-timeout 120s.
+
 jobs:
   h2spec:
     name: h2spec (ReleaseFast)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 22
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -29,6 +32,7 @@ jobs:
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Build examples/full
+        timeout-minutes: 18
         run: zig build full -Doptimize=ReleaseFast --summary all
       - name: Fetch h2spec 2.6.0, pinned by SHA-256
         run: |
@@ -41,7 +45,7 @@ jobs:
   autobahn:
     name: Autobahn (ReleaseFast)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 37
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -51,9 +55,16 @@ jobs:
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Build the echo peer
+        timeout-minutes: 18
         run: zig build autobahn-echo -Doptimize=ReleaseFast --summary all
       - name: Autobahn fuzzing client
+        timeout-minutes: 21
         run: tests/autobahn/run.sh ./zig-out/bin/autobahn-echo
+      - name: Container logs and states
+        if: failure()
+        uses: ./.github/actions/docker-logs
+        with:
+          name: containers-${{ github.job }}-${{ strategy.job-index }}
 
   h3:
     name: HTTP/3 against aioquic, and restarts (ReleaseFast, ${{ matrix.os }})
@@ -62,7 +73,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 33
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -72,6 +83,7 @@ jobs:
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Build the HTTP/3 test server and client
+        timeout-minutes: 23
         run: zig build h3-test-server h3-test-client -Doptimize=ReleaseFast --summary all
       - name: Server and client against aioquic
         run: tests/h3/run.sh ./zig-out/bin/h3-test-server ./zig-out/bin/h3-test-client
@@ -83,7 +95,7 @@ jobs:
   quic-interop:
     name: QUIC interop runner (ReleaseFast)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 26
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -92,25 +104,33 @@ jobs:
           cache-key: release-quic-interop
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # As in ci.yml (#54): the PPA, else the cached packages, else Ubuntu's.
+      - name: tshark packages of the last good install
+        id: tshark-week
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6 (v6.1.0)
+        with:
+          path: ~/tshark-debs
+          key: tshark-debs-${{ runner.os }}-${{ steps.tshark-week.outputs.week }}
+          restore-keys: tshark-debs-${{ runner.os }}-
       - name: Install tshark
-        run: |
-          for i in 1 2 3 4 5; do
-            sudo add-apt-repository -y ppa:wireshark-dev/nightly &&
-              sudo apt-get update -qq &&
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends tshark &&
-              exit 0
-            sleep $((i * 15))
-          done
-          exit 1
+        timeout-minutes: 10
+        run: tests/interop/install-tshark.sh ~/tshark-debs
       # The interop server built here in ReleaseFast; run.sh would build it
       # ReleaseSafe.
       - name: Build the interop server
+        timeout-minutes: 19
         run: zig build h3-interop-server -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast --prefix "$RUNNER_TEMP/fast" --summary all
       - name: tests/interop/run.sh
         run: tests/interop/run.sh ngtcp2,quic-go
         env:
           ANOLE_INTEROP_WORK: ${{ runner.temp }}/interop
           ANOLE_INTEROP_BIN: ${{ runner.temp }}/fast/bin/h3-interop-server
+      - name: Container logs and states
+        if: failure()
+        uses: ./.github/actions/docker-logs
+        with:
+          name: containers-${{ github.job }}-${{ strategy.job-index }}
       - name: Keep the logs of a failure
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 (v7.0.2)
@@ -122,7 +142,7 @@ jobs:
   grpc-interop:
     name: gRPC interop (ReleaseFast)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -135,6 +155,7 @@ jobs:
         with:
           go-version: stable
       - name: Build the interop server and client
+        timeout-minutes: 18
         run: zig build grpc-interop-server grpc-interop-client -Doptimize=ReleaseFast --summary all
       - name: Interop test cases (grpc-go client, Anole server)
         run: tests/grpc/interop/run.sh ./zig-out/bin/grpc-interop-server
@@ -154,17 +175,19 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 39
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
           cache-key: release-capi
+      - uses: ./.github/actions/install-gdb
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: anole.h layout, the C suite, the engine over HTTP/2 and HTTP/3
-        run: zig build capi-test test-capi-engine -Doptimize=ReleaseFast --summary all
+        timeout-minutes: 32
+        run: zig build capi-test test-capi-engine -Doptimize=ReleaseFast --test-timeout 120s --summary all
 
   # The C libraries' own test suites under ASan and UBSan, from the pinned
   # tarballs (the Sanitizers workflow, run for the release too).

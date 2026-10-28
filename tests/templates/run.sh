@@ -10,6 +10,8 @@
 # against the first template.
 # ZIG picks the compiler; OPENAPI_LINT=0 skips the document lint (it needs
 # pip: openapi-spec-validator==0.7.1, installed into a virtual environment).
+# ANOLE_TEST_TIMEOUT (e.g. 120s) is passed to each template's `zig build
+# test` as --test-timeout, as CI does.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -38,7 +40,7 @@ for t in "${templates[@]}"; do
   (
     cd "$dir"
     "$zig" build
-    "$zig" build test
+    "$zig" build test ${ANOLE_TEST_TIMEOUT:+--test-timeout "$ANOLE_TEST_TIMEOUT"}
     "$zig" build openapi
     test -s openapi.json
     "$zig" build openapi-check

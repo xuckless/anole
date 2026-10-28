@@ -382,6 +382,10 @@ Moving to the next minor version (0.18):
 - Other library releases: bump before each Anole release, not one by one.
 - Zig: move when the next minor version is released and every Zig dependency
   supports it.
+- CI time limits: before each release, resize every job's and long step's
+  `timeout-minutes` to ceil(2 x p95) + 5 minutes over the last 30 green runs
+  (`gh run list --workflow ci.yml --status success`, then `gh run view
+  <id> --json jobs` for the job and step times).
 
 ## The wiki
 

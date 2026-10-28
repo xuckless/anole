@@ -17,7 +17,8 @@ jobs:
   testssl:
     name: testssl.sh against the TLS listener
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # ceil(2 x p95) + 5 from the last 30 green runs (2026-10-28).
+    timeout-minutes: 26
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -25,6 +26,7 @@ jobs:
           version: 0.17.0
           cache-key: testssl
       - name: Build examples/full
+        timeout-minutes: 24
         run: zig build full -Doptimize=ReleaseSafe --prefix "$RUNNER_TEMP/anole"
       - name: Start the server
         run: |
