@@ -35,7 +35,11 @@ permissions:
 # test runner dumps every thread's backtrace at 110 s (gdb on Linux; lldb,
 # else sample, on macOS; src/safety/test_runner.zig). Jobs with Docker
 # containers save the containers' logs and states as an artifact when they
-# fail.
+# fail: their scripts keep the containers (named anole-*) under
+# ANOLE_KEEP_CONTAINERS=1 and an always() step removes them afterwards. The
+# interop runners own their containers (docker compose); each test's
+# output.txt in their uploaded logs holds every container's output, and the
+# containers of the last test are still there for the artifact.
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -322,11 +326,16 @@ jobs:
       - name: Autobahn fuzzing client
         timeout-minutes: 23
         run: tests/autobahn/run.sh ./zig-out/bin/autobahn-echo
+        env:
+          ANOLE_KEEP_CONTAINERS: "1"
       - name: Container logs and states
         if: failure()
         uses: ./.github/actions/docker-logs
         with:
           name: containers-${{ github.job }}-${{ strategy.job-index }}
+      - name: Remove the containers
+        if: always()
+        run: ids=$(docker ps -aq --filter name=^anole-); [ -z "$ids" ] || docker rm -f $ids
 
   h3:
     name: HTTP/3 server and client against aioquic (${{ matrix.os }})
@@ -376,7 +385,7 @@ jobs:
       # The runner reads its traces with pyshark and wants tshark 4.5.0 or
       # newer: the Wireshark nightly PPA (its own CI's source), else the
       # packages of the last good install kept in the cache (a weekly key),
-      # else Ubuntu's older tshark with a warning (#54).
+      # else no tshark: the interop steps are skipped with a warning (#54).
       - name: tshark packages of the last good install
         id: tshark-week
         run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
@@ -426,7 +435,7 @@ jobs:
       # The runner reads its traces with pyshark and wants tshark 4.5.0 or
       # newer: the Wireshark nightly PPA (its own CI's source), else the
       # packages of the last good install kept in the cache (a weekly key),
-      # else Ubuntu's older tshark with a warning (#54).
+      # else no tshark: the interop steps are skipped with a warning (#54).
       - name: tshark packages of the last good install
         id: tshark-week
         run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
@@ -636,6 +645,7 @@ jobs:
         timeout-minutes: 32
         env:
           ANOLE_GRPC_H3_WORK: ${{ runner.temp }}/grpc-h3
+          ANOLE_KEEP_CONTAINERS: "1"
         run: tests/grpc/h3/run.sh
       - name: Logs
         if: failure()
@@ -649,6 +659,9 @@ jobs:
         uses: ./.github/actions/docker-logs
         with:
           name: containers-${{ github.job }}-${{ strategy.job-index }}
+      - name: Remove the containers
+        if: always()
+        run: ids=$(docker ps -aq --filter name=^anole-); [ -z "$ids" ] || docker rm -f $ids
   # ---- end p3/grpc-h3 ----
 
   redis:

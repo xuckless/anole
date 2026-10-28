@@ -60,11 +60,16 @@ jobs:
       - name: Autobahn fuzzing client
         timeout-minutes: 21
         run: tests/autobahn/run.sh ./zig-out/bin/autobahn-echo
+        env:
+          ANOLE_KEEP_CONTAINERS: "1"
       - name: Container logs and states
         if: failure()
         uses: ./.github/actions/docker-logs
         with:
           name: containers-${{ github.job }}-${{ strategy.job-index }}
+      - name: Remove the containers
+        if: always()
+        run: ids=$(docker ps -aq --filter name=^anole-); [ -z "$ids" ] || docker rm -f $ids
 
   h3:
     name: HTTP/3 against aioquic, and restarts (ReleaseFast, ${{ matrix.os }})
@@ -104,7 +109,8 @@ jobs:
           cache-key: release-quic-interop
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
-      # As in ci.yml (#54): the PPA, else the cached packages, else Ubuntu's.
+      # As in ci.yml (#54): the PPA, else the cached packages; with neither
+      # the release checks fail (--required).
       - name: tshark packages of the last good install
         id: tshark-week
         run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
