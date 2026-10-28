@@ -2,6 +2,7 @@
 //! design-jobs.md §14). `FakeClock` and `run = .manual` with `step` make the
 //! tests deterministic: nothing here waits for time to pass.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const root = @import("root.zig");
 const Time = root.Time;
 const anole = @import("../root.zig");
@@ -585,7 +586,8 @@ fn Suite(comptime B: Backend) type {
                 else => unreachable,
             };
             wake_hits.store(0, .release);
-            const worker = try root.Client.init(std.testing.allocator, io, .{ .store = st, .table_prefix = "jtest_", .key_prefix = "jtest:", .poll_interval = .fromSeconds(60), .name = "worker" });
+            // A poll far past any wait here: only the wake can run the job.
+            const worker = try root.Client.init(std.testing.allocator, io, .{ .store = st, .table_prefix = "jtest_", .key_prefix = "jtest:", .poll_interval = .fromSeconds(3600), .name = "worker" });
             defer worker.deinit();
             try worker.addHandler(plain, null, wakeRun);
             try worker.start(null, null, null);
@@ -593,11 +595,11 @@ fn Suite(comptime B: Backend) type {
             const producer = try root.Client.init(std.testing.allocator, io, .{ .store = st, .table_prefix = "jtest_", .key_prefix = "jtest:", .run = .enqueue_only, .name = "producer" });
             defer producer.deinit();
             try producer.start(null, null, null);
-            // The worker's first claim found nothing; its fetcher now waits for a wake or the 60 s poll.
-            try io.sleep(.fromMilliseconds(1500), .awake);
+            // The worker's listener listens (it kicks once when it starts);
+            // a NOTIFY or publish from now on reaches it.
+            try wait.waitAtLeast(io, "the worker's wake listener listens", &worker.wake_kicks, 1);
             _ = try producer.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":1}", .{});
-            var waited: u32 = 0;
-            while (wake_hits.load(.acquire) == 0 and waited < 100) : (waited += 1) try io.sleep(.fromMilliseconds(50), .awake);
+            try wait.waitAtLeast(io, "the woken worker ran the job", &wake_hits, 1);
             try std.testing.expectEqual(@as(u32, 1), wake_hits.load(.acquire));
         }
 

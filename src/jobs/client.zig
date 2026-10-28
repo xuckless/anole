@@ -118,6 +118,9 @@ pub const Client = struct {
     /// When the drain stops waiting for the runs it canceled (awake clock,
     /// ns); maxInt while not draining. Bounds the outcome writes.
     drain_gives_up_ns: std.atomic.Value(i64) = .init(std.math.maxInt(i64)),
+    /// Wake-ups from the store's listener, the one it sends once it listens
+    /// included: a test waits for the first before it counts on a wake.
+    wake_kicks: std.atomic.Value(u32) = .init(0),
 
     /// `app.jobs(options)` calls it; outside an app, `init`, `start`, `drain`, `deinit`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
@@ -348,6 +351,7 @@ pub const Client = struct {
 
     fn kickFromStore(context: ?*anyopaque, queue: []const u8) void {
         const self: *Client = @ptrCast(@alignCast(context.?));
+        _ = self.wake_kicks.fetchAdd(1, .release);
         if (queue.len == 0) {
             for (self.queues) |*q| q.signal.set(self.io);
         } else self.wakeQueue(queue);
