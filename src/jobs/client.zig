@@ -1055,12 +1055,12 @@ pub const Client = struct {
         const every = Duration.fromNanoseconds(@divFloor(self.options.lease.nanoseconds, 3));
         while (true) {
             self.io.sleep(every, .awake) catch return error.Canceled;
-            self.heartbeatOnce();
+            try self.heartbeatOnce();
             if (self.draining.load(.acquire) and self.runningTotal() == 0) return;
         }
     }
 
-    fn heartbeatOnce(self: *Client) void {
+    fn heartbeatOnce(self: *Client) std.Io.Cancelable!void {
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1073,6 +1073,7 @@ pub const Client = struct {
         self.held_mutex.unlock(self.io);
         if (held.len == 0) return;
         const alive = self.backend.vt.heartbeat(self.backend.ptr, a, after(self.now(), self.options.lease), held) catch |e| {
+            try passCancel(e);
             log.warn("jobs: heartbeat failed: {t}", .{e});
             return;
         };
@@ -1081,7 +1082,11 @@ pub const Client = struct {
         for (held) |h| {
             if (std.mem.indexOfScalar(Id, alive, h.id) != null) continue;
             const b = self.held.get(h.id) orelse continue;
-            if (self.backend.vt.get(self.backend.ptr, a, h.id) catch null) |row| {
+            const got = self.backend.vt.get(self.backend.ptr, a, h.id) catch |e| blk: {
+                try passCancel(e);
+                break :blk null;
+            };
+            if (got) |row| {
                 if (row.state == .cancelled) b.job.admin_cancelled.store(true, .release);
             }
             b.lost.store(true, .release);
@@ -1089,36 +1094,55 @@ pub const Client = struct {
         }
     }
 
+    /// A store call's failure, in a task that carries on after one: a
+    /// cancel (the teardown's) is passed on, never taken for a failure that
+    /// the task logs and goes past, or its next wait parks with the cancel
+    /// gone (SAFETY.md).
+    fn passCancel(err: anyerror) std.Io.Cancelable!void {
+        if (err == error.Canceled) return error.Canceled;
+    }
+
     fn maintenanceTask(self: *Client) std.Io.Cancelable!void {
         while (!self.draining.load(.acquire)) {
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
             defer arena.deinit();
             var report: StepReport = .{};
-            self.maintain(arena.allocator(), &report);
+            try self.maintain(arena.allocator(), &report);
             try self.waitSignal(&self.maint_signal, self.options.poll_interval);
         }
     }
 
     /// One maintenance round (§3.4): leader, cron, stage, rescue, prune.
-    fn maintain(self: *Client, arena: std.mem.Allocator, report: *StepReport) void {
+    /// A store call's failure is logged or skipped, but a cancel (the
+    /// teardown's) ends the round and the task.
+    fn maintain(self: *Client, arena: std.mem.Allocator, report: *StepReport) std.Io.Cancelable!void {
         const t = self.now();
         const was = self.is_leader.load(.acquire);
-        const lead = self.backend.vt.leaderTake(self.backend.ptr, self.worker_name, t, self.options.leader.ttl) catch false;
+        const lead = self.backend.vt.leaderTake(self.backend.ptr, self.worker_name, t, self.options.leader.ttl) catch |e| blk: {
+            try passCancel(e);
+            break :blk false;
+        };
         self.is_leader.store(lead, .release);
         if (self.metrics) |mm| mm.leader.with(&.{}).set(@intFromBool(lead));
         if (lead and !was) log.info("jobs: this process leads schedules and maintenance", .{});
         if (!lead and was) log.info("jobs: this process no longer leads schedules and maintenance", .{});
 
-        if (lead) self.cronRound(arena, t, report);
+        if (lead) try self.cronRound(arena, t, report);
 
-        const staged = self.backend.vt.stage(self.backend.ptr, t) catch 0;
+        const staged = self.backend.vt.stage(self.backend.ptr, t) catch |e| blk: {
+            try passCancel(e);
+            break :blk 0;
+        };
         if (staged > 0) for (self.queues) |*q| q.signal.set(self.io);
 
         const ms = @divFloor(t.us, 1000);
         const rescue_every = @divFloor(self.options.lease.nanoseconds, 2 * std.time.ns_per_ms);
         if (ms - self.last_rescue >= rescue_every) {
             self.last_rescue = ms;
-            const rescued = self.backend.vt.rescue(self.backend.ptr, arena, t) catch &[_]store.Rescued{};
+            const rescued = self.backend.vt.rescue(self.backend.ptr, arena, t) catch |e| blk: {
+                try passCancel(e);
+                break :blk &[_]store.Rescued{};
+            };
             report.rescued += @intCast(rescued.len);
             if (self.metrics) |mm| mm.rescued.with(&.{"*"}).add(rescued.len);
             for (rescued) |r| log.info("job-{d}: its lease expired; {s}", .{ r.id, if (r.dead) "dead" else "put back" });
@@ -1126,18 +1150,21 @@ pub const Client = struct {
         }
         if (lead and self.metrics != null and ms - self.last_gauges >= 15_000) {
             self.last_gauges = ms;
-            self.reportGauges(arena);
+            try self.reportGauges(arena);
         }
         if (lead and ms - self.last_prune >= 60_000) {
             self.last_prune = ms;
-            report.pruned += self.backend.vt.prune(self.backend.ptr, t, self.options.keep) catch 0;
+            report.pruned += self.backend.vt.prune(self.backend.ptr, t, self.options.keep) catch |e| blk: {
+                try passCancel(e);
+                break :blk 0;
+            };
         }
     }
 
     /// The leader reports queue depth by state (§7.1).
-    fn reportGauges(self: *Client, arena: std.mem.Allocator) void {
+    fn reportGauges(self: *Client, arena: std.mem.Allocator) std.Io.Cancelable!void {
         const mm = self.metrics orelse return;
-        const rows = self.backend.vt.counts(self.backend.ptr, arena) catch return;
+        const rows = self.backend.vt.counts(self.backend.ptr, arena) catch |e| return passCancel(e);
         // States that have no row now read zero.
         for (self.queues) |q| inline for (.{ "scheduled", "available", "running", "retrying", "dead" }) |st| mm.queued.with(&.{ q.name, st }).set(0);
         for (rows) |r| mm.queued.with(&.{ r.queue, @tagName(r.state) }).set(@intCast(r.n));
@@ -1197,9 +1224,12 @@ pub const Client = struct {
         return nj;
     }
 
-    fn cronRound(self: *Client, arena: std.mem.Allocator, t: Time, report: *StepReport) void {
+    fn cronRound(self: *Client, arena: std.mem.Allocator, t: Time, report: *StepReport) std.Io.Cancelable!void {
         for (self.crons.items) |e| {
-            self.cronOne(arena, e, t, report) catch |err| log.warn("cron \"{s}\": {t}", .{ e.name, err });
+            self.cronOne(arena, e, t, report) catch |err| {
+                try passCancel(err);
+                log.warn("cron \"{s}\": {t}", .{ e.name, err });
+            };
         }
     }
 
@@ -1331,7 +1361,7 @@ pub const Client = struct {
     pub fn step(self: *Client, c: anytype) Error!StepReport {
         var report: StepReport = .{};
         if (!self.started) self.start(null, null, null) catch return error.ServiceUnavailable;
-        self.maintain(c.arena, &report);
+        try self.maintain(c.arena, &report);
         // maintain's stage ran before the cron jobs; stage again so a tick that is due now runs now.
         _ = self.backend.vt.stage(self.backend.ptr, self.now()) catch 0;
         var again = true;

@@ -276,3 +276,53 @@ test "jobs: a run whose outcome could not be saved is counted in anole_jobs_outc
     var f = try io.concurrent(unsavedCheck, .{io});
     try f.await(io);
 }
+
+/// The store's `rescue`, held in a cancelable wait (as a store's round trip
+/// is) until the client's teardown cancels the maintenance task in it; its
+/// `prune`, the round's next call, waits on the network too (briefly).
+const HeldRescue = struct {
+    var io: std.Io = undefined;
+    var vt: store.VTable = undefined;
+    var entered: std.atomic.Value(bool) = .init(false);
+
+    fn install(client: *root.Client, rio: std.Io) void {
+        io = rio;
+        entered.store(false, .release);
+        vt = client.backend.vt.*;
+        vt.rescue = rescue;
+        vt.prune = prune;
+        client.backend.vt = &vt;
+    }
+
+    fn prune(_: *anyopaque, _: root.Time, _: root.Options.Keep) anyerror!u32 {
+        try io.sleep(.fromMilliseconds(1), .awake);
+        return 0;
+    }
+
+    fn rescue(_: *anyopaque, _: std.mem.Allocator, _: root.Time) anyerror![]store.Rescued {
+        entered.store(true, .release);
+        // Far past any test: only the cancel ends it.
+        try io.sleep(.fromSeconds(600), .awake);
+        return &.{};
+    }
+};
+
+fn maintenanceCancelCheck(io: std.Io) !void {
+    const client = try root.Client.init(gpa, io, .{ .store = .memory });
+    HeldRescue.install(client, io);
+    try client.start(null, null, null);
+    try wait.waitFlag(io, "the maintenance round is in the store's rescue", &HeldRescue.entered);
+    // The teardown cancels the maintenance task inside the store call. The
+    // cancel must end the task, not be taken for a failed rescue: a round
+    // that carries on goes back to the store with its cancel gone, and
+    // waits there (zio's debug_cancel fails the test: SwallowedCancel).
+    client.deinit();
+}
+
+test "jobs: the teardown's cancel inside a maintenance store call ends the maintenance task" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(maintenanceCancelCheck, .{io});
+    try f.await(io);
+}
