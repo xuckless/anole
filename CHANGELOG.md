@@ -69,8 +69,11 @@ breaking changes are listed anyway.
 - C ABI: `anole_jobs_enqueue` with `opts.req` ignored the request's trace
   context; the jobs now carry its `traceparent` and `tracestate`, read
   during the call (so a request answered right after still passes it on;
-  one already answered adds none). Nothing is copied for requests that
-  never enqueue.
+  one already answered adds none). Calls on the request from other
+  threads meanwhile (its answer, `anole_handle_release`, a query or S3,
+  SMTP, NATS or jobs call given it as `req`) wait for that read, a copy of
+  a few hundred bytes, instead of answering `ANOLE_E_GONE`. Nothing is
+  copied for requests that never enqueue.
 - Jobs: stopping a client while its maintenance round or heartbeat was in
   a store call (PostgreSQL, Redis, SQLite) took the cancel for a failed
   call: the round went on to its next store call through the teardown.

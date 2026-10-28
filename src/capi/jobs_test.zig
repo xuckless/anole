@@ -122,12 +122,18 @@ const Rig = struct {
 
     /// `create` with `routes` (the "routes" array's items).
     fn createRouted(r: *Rig, jobs_extra: []const u8, routes: []const u8) !void {
+        return r.createWith(jobs_extra, routes, "");
+    }
+
+    /// `createRouted` with `top` spliced into the top-level object (after
+    /// the jobs: `, "databases": [...]`).
+    fn createWith(r: *Rig, jobs_extra: []const u8, routes: []const u8, top: []const u8) !void {
         r.json = try std.fmt.allocPrint(alloc,
             \\{{"executors": 1, "timeouts": {{"shutdown_ms": 200}},
             \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
             \\ "routes": [{s}],
-            \\ "jobs": {{"store": "memory", "poll_ms": 100{s}}}}}
-        , .{ routes, jobs_extra });
+            \\ "jobs": {{"store": "memory", "poll_ms": 100{s}}}{s}}}
+        , .{ routes, jobs_extra, top });
         errdefer alloc.free(r.json);
         var why_buf: [512]u8 = undefined;
         var why: Io.Writer = .fixed(&why_buf);
@@ -377,8 +383,8 @@ const H2Get = struct {
         const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = g.port });
         defer conn.close();
         const s = try conn.request(&.{
-            .{ .name = ":method", .value = "GET" },     .{ .name = ":path", .value = "/x" },
-            .{ .name = ":scheme", .value = "http" },    .{ .name = ":authority", .value = "localhost" },
+            .{ .name = ":method", .value = "GET" },            .{ .name = ":path", .value = "/x" },
+            .{ .name = ":scheme", .value = "http" },           .{ .name = ":authority", .value = "localhost" },
             .{ .name = "traceparent", .value = tp_unsampled }, .{ .name = "tracestate", .value = "congo=t61rcWkgMzE" },
         }, .{});
         defer s.release();
@@ -466,4 +472,275 @@ test "capi jobs: enqueue with opts.req, the answer, then the client resets the H
 fn pastDeadline(started: std.Io.Timestamp, ms: u32) bool {
     const limit: i64 = @max(ms, wait.deadlineMs());
     return started.untilNow(engine.threadedIo(), .awake).toMilliseconds() >= limit;
+}
+
+// ---------------------------------------------------------------------------
+// enqueue(opts.req) pins the request while it copies its trace context:
+// calls on the handle from other threads wait the pin out, never GONE.
+
+/// `engine.jobs.enqueue` with `opts.req = req`, on a thread of its own,
+/// its pin on the request held open by `engine.test_pin` until a call that
+/// meets the pin (or `end`) lets it go.
+const PinnedEnqueue = struct {
+    r: *Rig,
+    req: u64,
+    pin: engine.TestPin = .{},
+    done: std.atomic.Value(bool) = .init(false),
+    result: ?anyerror = null,
+    thread: ?std.Thread = null,
+
+    fn run(p: *PinnedEnqueue) void {
+        engine.jobs.enqueue(p.r.e, p.r.c, &.{jobOut("t.work", "{}")}, .{ .size = @sizeOf(abi.JobsEnqueueOptions), .req = p.req }, 12) catch |err| {
+            p.result = err;
+        };
+        p.done.store(true, .release);
+    }
+
+    fn pinnedOrDone(p: *const PinnedEnqueue) bool {
+        return p.pin.held.load(.acquire) or p.done.load(.acquire);
+    }
+
+    /// Starts the enqueue; returns once it holds the pin.
+    fn begin(p: *PinnedEnqueue) !void {
+        engine.test_pin = &p.pin;
+        p.thread = try std.Thread.spawn(.{}, run, .{p});
+        errdefer p.end();
+        try wait.waitUntil(engine.threadedIo(), "the enqueue pins the request", p, pinnedOrDone);
+        if (!p.pin.held.load(.acquire)) return p.result orelse error.NeverPinned;
+    }
+
+    /// Lets the pin go (when nothing met it) and joins the enqueue.
+    fn end(p: *PinnedEnqueue) void {
+        p.pin.release.store(true, .release);
+        if (p.thread) |t| t.join();
+        p.thread = null;
+        engine.test_pin = null;
+    }
+};
+
+test "capi jobs: while enqueue(opts.req) on another thread reads the request, a tied query and the answer are taken, not GONE" {
+    if (comptime !features.jobs) return error.SkipZigTest;
+    // Workers only: the test thread polls the consumer.
+    const rt = try anole.zio.Runtime.init(alloc, .{ .executors = .exact(1), .enable_main_executor = false });
+    defer rt.deinit();
+    var r: Rig = undefined;
+    const dbs = if (features.sqlite) ", \"databases\": [{\"name\": \"main\", \"sqlite\": {\"path\": \":memory:\"}}]" else "";
+    try r.createWith(", \"kinds\": [{\"name\": \"t.work\"}]", "{\"path\": \"/x\", \"handler\": 1, \"timeout_ms\": 20000}", dbs);
+    defer r.deinit();
+    try r.start();
+    const io = rt.io();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{r.e.port(0)});
+    var res: HttpResult = .{};
+    var f = try io.concurrent(fetchTraced, .{ io, url, &res });
+    defer f.cancel(io) catch {};
+    const req = r.ev.list.items[try r.ev.waitFor(.request, 0, 10000)].handle;
+
+    var pe: PinnedEnqueue = .{ .r = &r, .req = req };
+    try pe.begin();
+    defer pe.end();
+    // A call tied to the request (anole_db_query with opts.req): the
+    // request is still owed its answer.
+    if (comptime features.sqlite) {
+        try engine.db.submit(engine.db.find(r.e, "main").?, r.c, .query, "SELECT 1", &.{}, .{ .size = @sizeOf(abi.DbOptions), .req = req }, 21);
+    }
+    // The answer meets the pin, and waits it out.
+    try engine.respond(r.e, req, 200, &.{}, "ok", false);
+    pe.end();
+    try std.testing.expectEqual(@as(?anyerror, null), pe.result);
+    try f.await(io);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    // The job still carries the request's context.
+    const ei = try r.ev.waitFor(.job_enqueued, 0, 10000);
+    try std.testing.expectEqual(abi.OK, r.ev.as(abi.JobEnqueuedEvent, ei).status);
+}
+
+const pb = if (features.grpc) @import("anole_test_pb") else struct {};
+
+/// One unary anole.test.Echo/Unary call over h2c; its status in `code`.
+fn grpcUnary(io: std.Io, port: u16, code: *std.atomic.Value(u32)) anyerror!void {
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = port });
+    defer conn.close();
+    var channel: anole.grpc.Channel = .{ .conn = conn, .authority = "localhost" };
+    const client: anole.grpc.Client(pb.Echo(anole.grpc.Call, anyerror)) = .{ .channel = &channel };
+    const reply = try client.unary("Unary", arena_state.allocator(), .{ .message = "hi" }, .{ .metadata = &.{
+        .{ .name = "traceparent", .value = tp_unsampled },
+    } });
+    code.store(@backingInt(reply.status.code), .release);
+}
+
+test "capi jobs: while enqueue(opts.req) on another thread reads a gRPC call, its answer is taken, not GONE" {
+    if (comptime !features.jobs or !features.grpc or !features.http2) return error.SkipZigTest;
+    const set = @import("anole_test_descriptors").set;
+    const b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(set.len));
+    defer alloc.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, set);
+    const top = try std.fmt.allocPrint(alloc, ", \"grpc\": {{\"descriptor_set\": \"{s}\", \"services\": [{{\"name\": \"anole.test.Echo\", \"handler\": 10}}]}}", .{b64});
+    defer alloc.free(top);
+    const rt = try anole.zio.Runtime.init(alloc, .{ .executors = .exact(1), .enable_main_executor = false });
+    defer rt.deinit();
+    var r: Rig = undefined;
+    try r.createWith(", \"kinds\": [{\"name\": \"t.work\"}]", "", top);
+    defer r.deinit();
+    try r.start();
+    const io = rt.io();
+    var code: std.atomic.Value(u32) = .init(std.math.maxInt(u32));
+    var f = try io.concurrent(grpcUnary, .{ io, r.e.port(0), &code });
+    defer f.cancel(io) catch {};
+    const call = r.ev.list.items[try r.ev.waitFor(.grpc_call, 0, 10000)].handle;
+
+    var pe: PinnedEnqueue = .{ .r = &r, .req = call };
+    try pe.begin();
+    defer pe.end();
+    // The answer (an empty EchoResponse, then OK) meets the pin, and
+    // waits it out.
+    _ = try engine.grpc.send(r.e, call, "", false, true);
+    pe.end();
+    try std.testing.expectEqual(@as(?anyerror, null), pe.result);
+    try f.await(io);
+    try std.testing.expectEqual(@as(u32, 0), code.load(.acquire));
+}
+
+/// Handles handed by the polling thread, in order, to the two racing
+/// threads.
+const Handed = struct {
+    handles: []u64,
+    published: std.atomic.Value(usize) = .init(0),
+    /// No more handles come.
+    stopped: std.atomic.Value(bool) = .init(false),
+
+    /// Handle `i`, once published; null once stopped short of it, or
+    /// past the wait helper's deadline.
+    fn get(hd: *Handed, i: usize) ?u64 {
+        const started = std.Io.Clock.awake.now(engine.threadedIo());
+        var spins: usize = 0;
+        while (hd.published.load(.acquire) <= i) : (spins += 1) {
+            if (hd.stopped.load(.acquire) and hd.published.load(.acquire) <= i) return null;
+            if (spins % 1024 == 1023 and pastDeadline(started, 0)) return null;
+            std.Thread.yield() catch {};
+        }
+        return hd.handles[i];
+    }
+
+    fn stop(hd: *Handed) void {
+        hd.stopped.store(true, .release);
+    }
+};
+
+const Racer = struct {
+    r: *Rig,
+    hd: *Handed,
+    enqueuer: bool,
+    gone: u32 = 0,
+    failed: ?anyerror = null,
+
+    fn run(rc: *Racer) void {
+        for (0..rc.hd.handles.len) |i| {
+            const h = rc.hd.get(i) orelse {
+                rc.failed = error.NeverPublished;
+                return;
+            };
+            if (rc.enqueuer) {
+                engine.jobs.enqueue(rc.r.e, rc.r.c, &.{jobOut("t.work", "{}")}, .{ .size = @sizeOf(abi.JobsEnqueueOptions), .req = h }, 13) catch |err| switch (err) {
+                    // The answer came first: the request is over.
+                    error.Gone => rc.gone += 1,
+                    else => if (rc.failed == null) {
+                        rc.failed = err;
+                    },
+                };
+                continue;
+            }
+            // A GONE answer is the bug: counted, then the answer is given
+            // again so the request still ends.
+            const started = std.Io.Clock.awake.now(engine.threadedIo());
+            while (true) {
+                engine.respond(rc.r.e, h, 200, &.{}, "ok", false) catch |err| switch (err) {
+                    error.Gone => {
+                        rc.gone += 1;
+                        if (pastDeadline(started, 0)) break;
+                        std.Thread.yield() catch {};
+                        continue;
+                    },
+                    else => if (rc.failed == null) {
+                        rc.failed = err;
+                    },
+                };
+                break;
+            }
+        }
+    }
+};
+
+/// `n` traced GETs of /x, one after another on one connection.
+fn fetchMany(io: std.Io, url: []const u8, n: usize, ok: *std.atomic.Value(usize)) anyerror!void {
+    var http = dusty.Client.init(alloc, io, .{});
+    defer http.deinit();
+    for (0..n) |_| {
+        var keys: [2][]const u8 = undefined;
+        var values: [2][]const u8 = undefined;
+        var hashes: [2]u8 = undefined;
+        var h: dusty.Headers = .{ .keys = &keys, .values = &values, .hashes = &hashes };
+        try h.add("traceparent", tp_unsampled);
+        try h.add("tracestate", "congo=t61rcWkgMzE");
+        var resp = try http.fetch(url, .{ .headers = &h });
+        defer resp.deinit();
+        if (resp.status() == .ok) _ = ok.fetchAdd(1, .monotonic);
+    }
+}
+
+test "capi jobs: enqueue(opts.req) and the answer racing on two threads, many requests: no answer is GONE" {
+    if (comptime !features.jobs) return error.SkipZigTest;
+    const clients = 4;
+    const each = 50;
+    const total = clients * each;
+    const rt = try anole.zio.Runtime.init(alloc, .{ .executors = .exact(2), .enable_main_executor = false });
+    defer rt.deinit();
+    var r: Rig = undefined;
+    try r.createRouted(", \"kinds\": [{\"name\": \"t.work\"}]", "{\"path\": \"/x\", \"handler\": 1, \"timeout_ms\": 20000}");
+    defer r.deinit();
+    try r.start();
+    const io = rt.io();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{r.e.port(0)});
+
+    var handles: [total]u64 = undefined;
+    var hd: Handed = .{ .handles = &handles };
+    var enq_racer: Racer = .{ .r = &r, .hd = &hd, .enqueuer = true };
+    var resp_racer: Racer = .{ .r = &r, .hd = &hd, .enqueuer = false };
+    var ok: std.atomic.Value(usize) = .init(0);
+    var fetches: [clients]std.Io.Future(anyerror!void) = undefined;
+    var spawned: usize = 0;
+    defer for (fetches[0..spawned]) |*fu| fu.cancel(io) catch {};
+    {
+        const t1 = try std.Thread.spawn(.{}, Racer.run, .{&enq_racer});
+        const t2 = std.Thread.spawn(.{}, Racer.run, .{&resp_racer}) catch |err| {
+            hd.stop();
+            t1.join();
+            return err;
+        };
+        // Both racers are done before anything is checked.
+        defer {
+            hd.stop();
+            t1.join();
+            t2.join();
+        }
+        for (&fetches) |*fu| {
+            fu.* = try io.concurrent(fetchMany, .{ io, url, each, &ok });
+            spawned += 1;
+        }
+        var seen: usize = 0;
+        while (seen < total) {
+            const i = try r.ev.waitFor(.request, seen, 10000);
+            handles[seen] = r.ev.list.items[i].handle;
+            seen += 1;
+            hd.published.store(seen, .release);
+        }
+    }
+    for (&fetches) |*fu| try fu.await(io);
+    try std.testing.expectEqual(@as(?anyerror, null), resp_racer.failed);
+    try std.testing.expectEqual(@as(?anyerror, null), enq_racer.failed);
+    try std.testing.expectEqual(@as(u32, 0), resp_racer.gone);
+    try std.testing.expectEqual(@as(usize, total), ok.load(.acquire));
 }

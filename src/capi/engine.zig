@@ -3523,22 +3523,75 @@ pub const TraceContext = struct {
 /// is pinned while it is read, as `poll` pins it to copy its head: `out`
 /// goes to `polling` and back, and meanwhile its task waits (HTTP/1.1) or
 /// a detached request's abort spins (HTTP/2, HTTP/3), so its memory
-/// stays. Nothing is copied at dispatch: requests that hand nothing on pay
-/// nothing. Empty when the request carries no context or is no longer owed
-/// an answer (answered, ended, or an answer call overlaps this one: rule 2
-/// of the ABI's threads).
+/// stays; calls on the handle from other consumer threads wait the pin
+/// out (`claimOut`). The pin only copies into stack buffers (SAFETY.md
+/// L5: an executor may spin on it, so it never allocates or waits); the
+/// copies go into `a` after it. Nothing is copied at dispatch: requests
+/// that hand nothing on pay nothing. Empty when the request carries no
+/// context or is no longer owed an answer (answered, or ended).
 pub fn requestTrace(e: *Engine, hv: u64, a: std.mem.Allocator) error{OutOfMemory}!TraceContext {
     const h = Handle.decode(hv);
     if (h.kind != .request and h.kind != .grpc_call) return .{};
     _, const s, _ = slotOfKind(e, hv, h.kind) catch return .{};
-    if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .polling), .acquire, .monotonic) != null) return .{};
-    defer s.word.store(pack(h.gen, .out), .release);
-    const req = s.req;
-    var buf: [55]u8 = undefined;
-    const tp = anole.observe.trace.current(req, &buf) orelse return .{};
-    const ts = anole.observe.trace.currentState(req);
-    const tp_copy = try a.dupe(u8, tp);
-    return .{ .traceparent = tp_copy, .tracestate = if (ts) |t| try a.dupe(u8, t) else null };
+    // SAFETY: written by the copies below before their first `[0..len]` read.
+    var tp_buf: [55]u8 = undefined;
+    // SAFETY: as `tp_buf`.
+    var tp_out: [55]u8 = undefined;
+    // SAFETY: as `tp_buf`.
+    var ts_buf: [anole.observe.trace.max_trace_state]u8 = undefined;
+    var tp_len: usize = 0;
+    var ts_len: usize = 0;
+    {
+        if (claimOut(s, h.gen, .polling) != null) return .{};
+        defer s.word.store(pack(h.gen, .out), .release);
+        if (builtin.is_test) testPinHold();
+        const req = s.req;
+        const tp = anole.observe.trace.current(req, &tp_buf) orelse return .{};
+        @memcpy(tp_out[0..tp.len], tp);
+        tp_len = tp.len;
+        if (anole.observe.trace.currentState(req)) |ts| {
+            @memcpy(ts_buf[0..ts.len], ts);
+            ts_len = ts.len;
+        }
+    }
+    return .{
+        .traceparent = try a.dupe(u8, tp_out[0..tp_len]),
+        .tracestate = if (ts_len > 0) try a.dupe(u8, ts_buf[0..ts_len]) else null,
+    };
+}
+
+/// Moves slot `s` of generation `gen` from `out` to `to` (`responding` for
+/// an answer, `polling` for a pin), waiting out a pin under way: a
+/// consumer-held handle is `polling` only while `requestTrace` on another
+/// thread copies from its request, a few hundred bytes with nothing that
+/// allocates or waits (L5), so the wait is a short spin, as a seqlock
+/// reader's retry. A pinned live handle is never taken for over. Null when
+/// moved; else the word that refused it (another state or generation).
+pub fn claimOut(s: *Slot, gen: u32, to: SlotState) ?u64 {
+    const pinned = pack(gen, .polling);
+    while (true) {
+        const w = s.word.cmpxchgStrong(pack(gen, .out), pack(gen, to), .acquire, .monotonic) orelse return null;
+        if (w != pinned) return w;
+        if (builtin.is_test) if (test_pin) |p| p.release.store(true, .release);
+        std.atomic.spinLoopHint();
+    }
+}
+
+/// A test hook (test builds only, as h3's `test_fail_accept`): while set,
+/// `requestTrace` holds its pin open until `release` is set, by the test or
+/// by the first call that meets the pin, so a test can overlap the pin
+/// with other calls on the handle without counting on timing.
+pub const TestPin = struct {
+    /// `requestTrace` is inside the pin.
+    held: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+};
+pub var test_pin: if (builtin.is_test) ?*TestPin else void = if (builtin.is_test) null else {};
+
+fn testPinHold() void {
+    const p = test_pin orelse return;
+    p.held.store(true, .release);
+    while (!p.release.load(.acquire)) std.Thread.yield() catch {};
 }
 
 /// The slot a handle of `kind` names, if it could be one: the generation
@@ -3554,11 +3607,11 @@ pub fn slotOfKind(e: *Engine, hv: u64, kind: Handle.Kind) HandleError!struct { *
     return .{ x, s, h };
 }
 
-/// Claims slot `hv` for an answer: `out` to `responding`. `Over` when it is
-/// no longer owed.
+/// Claims slot `hv` for an answer: `out` to `responding`, waiting out a
+/// pin (`claimOut`). `Over` when it is no longer owed.
 fn claimOrOver(e: *Engine, hv: u64) HandleError!struct { *Exec, *Slot, Handle } {
     const x, const s, const h = try slotOf(e, hv);
-    if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .responding), .acquire, .monotonic) != null) return error.Over;
+    if (claimOut(s, h.gen, .responding) != null) return error.Over;
     return .{ x, s, h };
 }
 
@@ -3681,7 +3734,7 @@ pub fn abort(e: *Engine, hv: u64) AnswerError!void {
         }
         s.out.release();
     }
-    if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .responding), .acquire, .monotonic) != null) return error.Over;
+    if (claimOut(s, h.gen, .responding) != null) return error.Over;
     s.reply = .abort;
     s.headers.clearRetainingCapacity();
     s.bytes.clearRetainingCapacity();

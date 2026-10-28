@@ -151,7 +151,9 @@ pub fn slotLive(x: *Exec, h: Handle) bool {
 /// (`anole_req_respond`, `_stream_end`, `anole_grpc_finish` returned) is
 /// GONE at once, as a second answer is (`engine.claim`). `responding` is a
 /// request's answer being stored, so over; on a gRPC call it is also its
-/// metadata being stored, which goes back to `out`.
+/// metadata being stored, which goes back to `out`. `polling` on a handle
+/// a consumer holds is `out` pinned by `requestTrace` on another thread
+/// (`poll` pins only handles not yet delivered), going back to `out`.
 fn stillOwed(x: *Exec, h: Handle) bool {
     if (h.slot >= x.slots.len) return false;
     const sl = &x.slots[h.slot];
@@ -159,7 +161,7 @@ fn stillOwed(x: *Exec, h: Handle) bool {
     const w = sl.word.load(.acquire);
     if (engine.genOf(w) != h.gen) return false;
     return switch (engine.stateOf(w)) {
-        .out => true,
+        .out, .polling => true,
         .responding => h.kind == .grpc_call,
         // The head is out: owed until the body's end.
         .streaming => blk: {
