@@ -4105,7 +4105,11 @@ static void test_publish_order(void) {
     char text[16];
     int n = snprintf(text, sizeof text, "%d", i);
     anole_status rc;
-    while ((rc = anole_ws_publish(s, LIT("seq"), ANOLE_WS_TEXT, text, (size_t)n, 0)) == ANOLE_E_AGAIN) usleep(200);
+    /* AGAIN: the executor's queue is full for now; back off, within the deadline. */
+    for (double until = wait_until(); (rc = anole_ws_publish(s, LIT("seq"), ANOLE_WS_TEXT, text, (size_t)n, 0)) == ANOLE_E_AGAIN;) {
+      CHECK(now_ms() < until);
+      usleep(200);
+    }
     CHECK(rc == ANOLE_OK);
   }
   for (int i = 0; i < CLIENTS; i++) {
