@@ -444,8 +444,9 @@ scram-sha-256. Against a server of your own:
 zig build test-postgres -Dpostgres-test-url='postgres://postgres:pw@127.0.0.1:5433/postgres'
 ```
 
-The role needs to create databases: the webhook store's tests make one with an
-ICU collation (PostgreSQL 15 or later) and drop it again.
+The role needs to create databases: the webhook store's tests make their own
+(one with an ICU collation, PostgreSQL 15 or later; one with libc "C") and
+drop them again.
 
 ## SQLite
 

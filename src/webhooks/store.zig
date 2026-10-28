@@ -81,6 +81,8 @@ pub const Store = struct {
         /// collation is not "C", and the ALTER that moves them to it.
         collation_check: []const []const u8 = &.{},
         collation_fix: []const []const u8 = &.{},
+        /// PostgreSQL: the migration's advisory lock.
+        migrate_key: i64 = 0,
     };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, jobs_store: anole.jobs.Store, table_prefix: []const u8, redis_prefix: []const u8) !*Store {
@@ -127,26 +129,59 @@ pub const Store = struct {
     ///
     /// PostgreSQL: the paged and indexed ids are `COLLATE "C"`, so they
     /// order by bytes as on SQLite and in memory, whatever the database's
-    /// collation. Tables made before 0.4.2 took the database's default; the
+    /// collation. Tables made before 0.4.1 took the database's default; the
     /// first start finds that in the catalog and ALTERs the columns once
-    /// (their indexes are rebuilt under an ACCESS EXCLUSIVE lock). Later
-    /// starts only read the catalog. It runs before the DDL so the indexes
-    /// created there are built once, on the new collation.
+    /// (their indexes are rebuilt under an ACCESS EXCLUSIVE lock), unless
+    /// that default is libc "C" or "POSIX", which already orders by bytes.
+    /// It runs before the DDL so the indexes created there are built once,
+    /// on the new collation.
+    ///
+    /// It all runs in one transaction holding an advisory lock of its own
+    /// (as the jobs store's migration does), so instances starting together
+    /// take turns, with no bound on its length (an index build on a large
+    /// table takes as long as it takes). Each lock it waits for (not the
+    /// advisory lock) is bounded by `lock_timeout`: past it the start fails
+    /// with a log line saying what to do, instead of queueing every publish
+    /// behind a lock it cannot get.
     pub fn migrate(self: *Store, c: anytype) Error!void {
         switch (self.backend) {
-            .postgres => |p| {
-                for (self.sql.collation_check, self.sql.collation_fix) |check, fix| {
-                    if ((try p.one(CountRow, c, check, .{})).n == 0) continue;
-                    log.info("webhooks: moving ids to the C collation, once: {s}", .{fix});
-                    _ = try p.exec(c, fix, .{});
-                }
-                for (self.sql.ddl) |stmt| _ = try p.exec(c, stmt, .{});
-            },
+            .postgres => |p| if (comptime anole.features.postgres) {
+                p.transaction(c, .{ .timeout = .max }, migratePg, .{ c, @as(*const Sql, &self.sql) }) catch |err| {
+                    if (anole.db.lastError(c)) |d| if (std.mem.eql(u8, d.code, "55P03")) logLockTimeout(d.message);
+                    return switch (err) {
+                        // Only a bound on the transaction ends in it, and it has none.
+                        error.Timeout => error.GatewayTimeout,
+                        else => |e| e,
+                    };
+                };
+            } else unreachable,
             .sqlite => |s| for (self.sql.ddl) |stmt| {
                 _ = try s.exec(c, stmt, .{});
             },
             else => {},
         }
+    }
+
+    /// How long the PostgreSQL migration waits for each table lock.
+    pub const lock_timeout = "10s";
+
+    fn migratePg(tx: *anole.pg.Tx, c: anytype, sql: *const Sql) Error!void {
+        _ = try tx.table(c, "SELECT pg_advisory_xact_lock($1::bigint)", &.{.{ .int = sql.migrate_key }});
+        // After the advisory lock: an instance waiting its turn waits for
+        // the other's whole migration, which is not a stuck lock.
+        _ = try tx.exec(c, "SET LOCAL lock_timeout = '" ++ lock_timeout ++ "'", .{});
+        for (sql.collation_check, sql.collation_fix) |check, fix| {
+            if ((try tx.one(CountRow, c, check, .{})).n == 0) continue;
+            log.info("webhooks: moving ids to the C collation, once: {s}", .{fix});
+            _ = try tx.exec(c, fix, .{});
+        }
+        for (sql.ddl) |stmt| _ = try tx.exec(c, stmt, .{});
+    }
+
+    fn logLockTimeout(message: []const u8) void {
+        if (@import("dusty").expect_log.swallow()) return;
+        log.err("webhooks: can't migrate the webhook tables: a lock on one of them was held by another session for " ++ lock_timeout ++ " ({s})." ++
+            "\n  End that session's transaction (pg_stat_activity shows it) and start again, or run the statements in docs/webhooks.md (\"Storage\") yourself first.", .{message});
     }
 
     // ---- endpoints
@@ -475,9 +510,18 @@ fn buildSql(gpa: std.mem.Allocator, d: Dialect, p: []const u8) !Store.Sql {
     try ddl.append(gpa, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_attempts_message ON {0s}webhook_attempts (message_id, id)"));
     s.ddl = try ddl.toOwnedSlice(gpa);
     if (d == .postgres) {
-        // Tables made before 0.4.2 (see `Store.migrate`). A table that does
-        // not exist yet counts none (to_regclass is null).
-        const not_c = "SELECT count(*) AS n FROM pg_attribute WHERE attrelid = to_regclass('{0s}{1s}') AND attname IN ({2s}) AND attcollation <> (SELECT oid FROM pg_collation WHERE collname = 'C' AND collnamespace = 'pg_catalog'::regnamespace)";
+        // Tables made before 0.4.1 (see `Store.migrate`). A table that does
+        // not exist yet counts none (to_regclass is null). A column on the
+        // database's default collation is fine when that is libc "C" or
+        // "POSIX" (datlocprovider is read through to_jsonb because it only
+        // exists from PostgreSQL 15 on; before, every database is libc).
+        const not_c =
+            \\SELECT count(*) AS n FROM pg_attribute WHERE attrelid = to_regclass('{0s}{1s}') AND attname IN ({2s})
+            \\  AND attcollation <> (SELECT oid FROM pg_collation WHERE collname = 'C' AND collnamespace = 'pg_catalog'::regnamespace)
+            \\  AND NOT (attcollation = (SELECT oid FROM pg_collation WHERE collname = 'default' AND collnamespace = 'pg_catalog'::regnamespace)
+            \\    AND EXISTS (SELECT 1 FROM pg_database d WHERE d.datname = current_database()
+            \\      AND coalesce(to_jsonb(d) ->> 'datlocprovider', 'c') = 'c' AND d.datcollate IN ('C', 'POSIX')))
+        ;
         const tables = [_]struct { []const u8, []const u8, []const u8 }{
             .{ "webhook_messages", "'id'", "ALTER COLUMN id TYPE text COLLATE \"C\"" },
             .{ "webhook_attempts", "'message_id', 'endpoint_id'", "ALTER COLUMN message_id TYPE text COLLATE \"C\", ALTER COLUMN endpoint_id TYPE text COLLATE \"C\"" },
@@ -498,8 +542,20 @@ fn buildSql(gpa: std.mem.Allocator, d: Dialect, p: []const u8) !Store.Sql {
         }
         s.collation_check = try checks.toOwnedSlice(gpa);
         s.collation_fix = try fixes.toOwnedSlice(gpa);
+        s.migrate_key = advisoryKey("anole.webhooks.migrate:", p);
     }
     return s;
+}
+
+/// The i64 of the first 8 bytes of SHA-256(`label ++ prefix`), as the jobs
+/// store derives its migration's advisory lock key (src/jobs/store_pg.zig).
+fn advisoryKey(label: []const u8, prefix: []const u8) i64 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(label);
+    h.update(prefix);
+    var d: [32]u8 = undefined;
+    h.final(&d);
+    return std.mem.readInt(i64, d[0..8], .big);
 }
 
 /// In this process only.
