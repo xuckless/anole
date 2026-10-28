@@ -402,7 +402,7 @@ fn freeCmd(c: *SseCmd) void {
 fn changeDone(e: *Engine) void {
     _ = e.sse_state.topic_changes_done.fetchAdd(1, .acq_rel);
     if (e.phase.load(.acquire) == .stopped) return;
-    e.io.futexWake(u32, &e.sse_state.topic_changes_done.raw, std.math.maxInt(u32));
+    e.wakeFutex(&e.sse_state.topic_changes_done);
 }
 
 fn run(cmd: *Command, x: *Exec) void {

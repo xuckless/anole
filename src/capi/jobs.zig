@@ -596,7 +596,7 @@ pub fn finish(e: *Engine, hv: u64, outcome: u32, delay_ms: u32, text: []const u8
     slot.delay_ms = delay_ms;
     slot.text = copy;
     t.release();
-    slot.event.set(e.io);
+    e.setEvent(&slot.event);
 }
 
 /// `anole_handle_release` for the kinds `job_worker` and `job` (a cleanup call: a handle that is
@@ -878,7 +878,7 @@ fn endSlot(e: *Engine, hv: u64, ok: bool) void {
     slot.outcome = abi.JOB_DONE;
     if (ok) slot.job.completed_in = true;
     t.release();
-    slot.event.set(e.io);
+    e.setEvent(&slot.event);
 }
 
 // ---------------------------------------------------------------------------

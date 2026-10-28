@@ -1113,5 +1113,5 @@ pub fn ack(e: *Engine, hv: u64, kind: u32, delay_ms: u32) CallError!void {
     w.kind = kind;
     w.delay_ms = delay_ms;
     w.resolved = true;
-    w.event.set(e.io);
+    e.setEvent(&w.event);
 }

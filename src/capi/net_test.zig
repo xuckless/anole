@@ -29,8 +29,11 @@ const Rig = struct {
     c: *engine.Consumer,
     thread: std.Thread,
     stop: std.atomic.Value(bool) = .init(false),
-    /// Set: the thread leaves polling to the test.
+    /// Set: the thread leaves polling to the test (`takeOver`).
     manual: std.atomic.Value(bool) = .init(false),
+    /// Set by the thread once it saw `manual`, out of its poll: one consumer
+    /// is polled by one thread at a time.
+    parked: std.atomic.Value(bool) = .init(false),
     lock: std.atomic.Mutex = .unlocked,
     recs: std.ArrayList(Rec) = .empty,
 
@@ -62,6 +65,17 @@ const Rig = struct {
         alloc.destroy(r);
     }
 
+    /// The test polls from now on: returns once the thread has left its
+    /// poll (a poll still under way would overlap the test's).
+    fn takeOver(r: *Rig) !void {
+        r.manual.store(true, .release);
+        for (0..5000) |_| {
+            if (r.parked.load(.acquire)) return;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        return error.TimedOut;
+    }
+
     fn lockIt(r: *Rig) void {
         while (!r.lock.tryLock()) std.atomic.spinLoopHint();
     }
@@ -71,6 +85,7 @@ const Rig = struct {
         var need: u32 = 0;
         while (!r.stop.load(.acquire)) {
             if (r.manual.load(.acquire)) {
+                r.parked.store(true, .release);
                 std.testing.io.sleep(.fromMilliseconds(2), .awake) catch {};
                 continue;
             }
@@ -320,7 +335,7 @@ test "capi net: a connection never has more than read_ahead unpolled" {
     const json = "{\"executors\": 2, \"timeouts\": {\"shutdown_ms\": 500}, \"listeners\": [{\"name\": \"flood\", \"address\": \"127.0.0.1\", \"port\": 0, \"tcp\": {\"handler\": 1, \"read_ahead\": 4096, \"read_window\": 4096}}]}";
     const rig = try Rig.create(json);
     defer rig.destroy();
-    rig.manual.store(true, .release);
+    try rig.takeOver();
     const s = try rig.client();
     defer s.close();
     const chunk: [1024]u8 = @splat('q');

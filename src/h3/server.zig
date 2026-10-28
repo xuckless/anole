@@ -1118,6 +1118,29 @@ pub fn Endpoint(comptime Ctx: type) type {
             return true;
         }
 
+        /// Tests only: every connection in its closing or draining period
+        /// ends it now, as if its three PTOs (RFC 9000 §10.2) had passed,
+        /// so a test that waits for a closed connection to be gone doesn't
+        /// wait for a period that grows with the RTTs it saw. Production
+        /// periods are untouched.
+        pub fn testExpirePeriods(self: *Self) void {
+            if (!builtin.is_test) @compileError("tests only");
+            const live = self.liveConns();
+            defer self.gpa.free(live);
+            for (live) |conn| {
+                conn.lock();
+                switch (conn.state) {
+                    .closing, .draining => {
+                        conn.period_end = 0;
+                        conn.kick();
+                    },
+                    .open, .closed => {},
+                }
+                conn.unlock();
+                conn.unref();
+            }
+        }
+
         /// Each live connection once, with a reference each.
         fn liveConns(self: *Self) []*Conn {
             self.map_mutex.lockUncancelable(self.io);

@@ -7,6 +7,11 @@ breaking changes are listed anyway.
 
 ### Fixed
 
+- C ABI: a crash when a binding thread answered, sent or polled while the
+  server stopped. The call wakes an executor through the runtime, and the
+  stop could free the runtime while that wake was still under way. The stop
+  now waits for wakes under way before it frees the runtime, and a wake
+  after that is skipped.
 - Console: log records from bindings (`anole_console_log`) carry their
   request's id and route; the `req` argument was ignored.
 - Console: `/ws` shows the open WebSockets by protocol, accepted WebTransport

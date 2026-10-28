@@ -281,8 +281,9 @@ fn Harness(comptime proto: enum { h2, h3 }) type {
                 const status, _, const s = try get(conn, arena, "GET", "/short", null);
                 defer s.release();
                 try std.testing.expectEqual(@as(u16, 504), status);
-                const h = a.held.load(.acquire);
-                try std.testing.expect(h != 0);
+                // The consumer may take the request after its deadline
+                // answered (a busy machine): wait for it.
+                const h = try waitHeld(io, &a.held);
                 try std.testing.expectError(error.Gone, engine.respond(a.e, h, 200, &.{}, "", false));
                 // The consumer hears why: the deadline, with the 504 sent.
                 for (0..1000) |_| {
@@ -984,6 +985,16 @@ test "capi engine: mutual TLS (require, request, HTTP/3), the client certificate
     try std.testing.expect(e.wait(5000));
 }
 
+/// The handle a consumer stored in `held`, once it has (bounded).
+fn waitHeld(io: std.Io, held: *std.atomic.Value(u64)) !u64 {
+    for (0..2500) |_| {
+        const h = held.load(.acquire);
+        if (h != 0) return h;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    return error.TimedOut;
+}
+
 /// Holds a control call inside the engine (`engine.test_control_hook`)
 /// until the test lets it go.
 const ControlHold = struct {
@@ -1040,6 +1051,59 @@ test "capi engine: a reload from another thread holds the server's stop until it
     // After the stop: refused, never followed into a freed server.
     try std.testing.expectError(error.State, e.reloadCertificates());
     try e.drain();
+}
+
+/// Holds one thread's wake inside an executor's `IoGate`
+/// (`engine.test_io_hook`) until the test lets it go; other threads pass.
+const WakeHold = struct {
+    var thread: std.atomic.Value(std.Thread.Id) = .init(0);
+    var entered: std.Io.Event = .unset;
+    var go: std.Io.Event = .unset;
+
+    fn hook() void {
+        if (std.Thread.getCurrentId() != thread.load(.acquire)) return;
+        entered.set(engine.threadedIo());
+        go.waitUncancelable(engine.threadedIo());
+    }
+
+    /// A consumer thread's wake of executor 0 (as an answer makes).
+    fn wake(e: *engine.Engine) void {
+        thread.store(std.Thread.getCurrentId(), .release);
+        const x = &e.execs[0];
+        x.setEvent(&x.kick);
+    }
+};
+
+test "capi engine: a wake from a consumer thread under way holds the server's stop until it returns" {
+    const json =
+        \\{"executors": 1, "timeouts": {"shutdown_ms": 200},
+        \\ "listeners": [{"address": "127.0.0.1", "port": 0}]}
+    ;
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = try engine.Engine.create(json, false, &why);
+    defer e.destroy();
+    _ = try e.attach(null, null, true);
+    try e.start();
+    const tio = engine.threadedIo();
+    WakeHold.entered = .unset;
+    WakeHold.go = .unset;
+    engine.test_io_hook = &WakeHold.hook;
+    defer engine.test_io_hook = null;
+    const t = try std.Thread.spawn(.{}, WakeHold.wake, .{e});
+    // The wake is inside the gate, about to call into the runtime.
+    WakeHold.entered.waitUncancelable(tio);
+    try e.drain();
+    // Had the stop not waited for it, the run thread would free the runtime
+    // the wake is about to use, and set `stopped`.
+    try std.testing.expect(!e.wait(400));
+    WakeHold.go.set(tio);
+    t.join();
+    try std.testing.expect(e.wait(5000));
+    // After the stop: a wake is skipped, never followed into the freed
+    // runtime.
+    const x = &e.execs[0];
+    x.setEvent(&x.kick);
 }
 
 const Racer = struct {
@@ -1191,9 +1255,13 @@ test "capi engine: a full ring parks the executor on the room futex" {
     var posted: std.atomic.Value(u32) = .init(0);
     // One executor: the task runs on it.
     var f = try e.io.concurrent(postMany, .{ x, 8, &posted });
-    // The consumer does not poll: two fit the ring, the task waits.
+    // The consumer does not poll: two fit the ring, and the task waits for
+    // room (announced on the room futex), so no third goes in.
     const tio = engine.threadedIo();
-    try std.Io.sleep(tio, .fromMilliseconds(300), .awake);
+    for (0..5000) |_| {
+        if (posted.load(.acquire) == 2 and x.room_waiters.load(.seq_cst) == 1) break;
+        try std.Io.sleep(tio, .fromMilliseconds(1), .awake);
+    } else return error.TimedOut;
     try std.testing.expectEqual(@as(u32, 2), posted.load(.acquire));
     // Parked on the futex, not spinning on a yield (that gave thousands).
     try std.testing.expect(x.room_wakeups.load(.monotonic) < 10);
@@ -1557,8 +1625,9 @@ fn wsDecideCheck(a: *WsDecider, port: u16, io: std.Io) !void {
         try c.open(io, port, "/decide?silent", "");
         defer c.close(io);
         try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 504"));
-        const h = a.held.load(.acquire);
-        try std.testing.expect(h != 0);
+        // The consumer may take the handshake after its deadline answered
+        // (a busy machine): wait for it.
+        const h = try waitHeld(io, &a.held);
         // The decision came late: the handle is stale.
         try std.testing.expectError(error.Gone, engine.wsAccept(a.e, h, "", &.{}));
     }
@@ -1647,6 +1716,9 @@ test "capi engine: two publishes to one topic from one thread never swap, on 4 e
         c: *engine.Consumer,
         stop: std.atomic.Value(bool) = .init(false),
         failures: std.atomic.Value(u32) = .init(0),
+        /// Subscribes that returned: a publish made after one reaches it
+        /// (publishes wait for the topic changes before them).
+        subscribed: std.atomic.Value(u32) = .init(0),
         fn run(self: *@This()) void {
             var buf: [64 * 1024]u8 align(8) = undefined;
             var need: u32 = 0;
@@ -1656,9 +1728,11 @@ test "capi engine: two publishes to one topic from one thread never swap, on 4 e
                 while (off < n) {
                     const ev: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
                     if (ev.type == @backingInt(abi.EventType.ws_open)) {
-                        engine.ws.subscribe(self.e, ev.handle, "seq", true) catch {
+                        if (engine.ws.subscribe(self.e, ev.handle, "seq", true)) |_| {
+                            _ = self.subscribed.fetchAdd(1, .release);
+                        } else |_| {
                             _ = self.failures.fetchAdd(1, .monotonic);
-                        };
+                        }
                     }
                     off += ev.len;
                 }
@@ -1675,12 +1749,11 @@ test "capi engine: two publishes to one topic from one thread never swap, on 4 e
     defer rt.deinit();
     const io = rt.io();
     const Body = struct {
-        fn run(e_: *engine.Engine, port: u16, io_: std.Io) !void {
+        fn run(e_: *engine.Engine, port: u16, io_: std.Io, subscribed: *std.atomic.Value(u32)) !void {
             var client: RawWs = undefined;
             try client.open(io_, port, "/ws", "");
             defer client.close(io_);
-            // Let the subscription land.
-            try io_.sleep(.fromMilliseconds(200), .awake);
+            try waitAtLeast(io_, subscribed, 1);
             var i: u32 = 0;
             while (i < 2000) : (i += 1) {
                 var b0: [16]u8 = undefined;
@@ -1705,7 +1778,7 @@ test "capi engine: two publishes to one topic from one thread never swap, on 4 e
             }
         }
     };
-    var f = try io.concurrent(Body.run, .{ e, e.port(0), io });
+    var f = try io.concurrent(Body.run, .{ e, e.port(0), io, &sub.subscribed });
     try f.await(io);
     try std.testing.expectEqual(@as(u32, 0), sub.failures.load(.acquire));
     try e.drain();
