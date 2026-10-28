@@ -81,9 +81,6 @@ breaking changes are listed anyway.
   `error.type` (`Timeout` when its timeout expired) and an ERROR status, a
   run interrupted by a drain or lost has neither. Handlers see it as
   `job.trace_id`/`job.span_id`, and jobs they enqueue carry it.
-
-### Changed
-
 - Tests: a hung unit test says where it hangs. CI runs every unit test step
   with `--test-timeout 120s`; a test still running at 110 s, its teardown
   (the test Io's and allocator's deinit) included, is named and every
