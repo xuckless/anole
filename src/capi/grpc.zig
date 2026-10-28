@@ -358,7 +358,7 @@ pub fn buildRoutes(e: *Engine, app: *anole.App, global_ok: bool) !void {
         for (svc.methods) |*m| {
             const whole = m.kind == .unary or m.kind == .server_streaming;
             m.detachable = whole and svc.cfg.no_wait and svc_ok;
-            const route_options: dusty.RouteOptions = .{ .data = m, .no_wait = m.detachable };
+            const route_options: dusty.RouteOptions = .{ .data = m, .no_wait = m.detachable, .kind = .grpc };
             group.inner.addRouteWith(.post, m.path, handler, route_options);
             if (noSideEffects(m)) group.inner.addRouteWith(.get, m.path, handler, route_options);
             // google.api.http, with descriptors.

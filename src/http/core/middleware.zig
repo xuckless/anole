@@ -114,6 +114,9 @@ pub fn Chain(comptime Ctx: type) type {
         /// `ServerConfig.error_handler`, for an app whose context has no
         /// `uncaughtError`.
         error_handler: ?ErrorHandler = null,
+        /// The error `run` answered with an error response (and so did not
+        /// return): what the live console's 5xx ring names.
+        answered: ?anyerror = null,
 
         /// Runs the chain from the start. Called by the router.
         pub fn run(self: *Self) !void {
@@ -146,6 +149,7 @@ pub fn Chain(comptime Ctx: type) type {
                         return err;
                     }
                     self.handleError(err);
+                    self.answered = err;
                     // By what it was answered with, which an `uncaughtError`
                     // or `error_handler` may have chosen: a 4xx is the
                     // request's fault, a 5xx the server's.

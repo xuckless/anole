@@ -9,7 +9,10 @@ const std = @import("std");
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 
-pub const RequestEnd = *const fn (req: *Request, res: *Response, err: ?anyerror, start_ns: u64) void;
+/// `err` is the error the chain returned (the answer's status follows from
+/// it while the head is unsent); `answered`, one the chain answered with an
+/// error response itself (the status is the response's).
+pub const RequestEnd = *const fn (req: *Request, res: *Response, err: ?anyerror, answered: ?anyerror, start_ns: u64) void;
 
 /// Set once by the console before the server serves; null: no console.
 pub var request_end: ?RequestEnd = null;
@@ -30,9 +33,10 @@ pub inline fn begin(io: std.Io) u64 {
     return now(io);
 }
 
-/// After the handler chain ran: `result` is what it returned. `start_ns`
-/// is `begin`'s: non-zero only while a console collects.
-pub inline fn end(req: *Request, res: *Response, result: anytype, start_ns: u64) void {
+/// After the handler chain ran: `result` is what it returned, `answered`
+/// the error it turned into an error response instead (`Chain.answered`).
+/// `start_ns` is `begin`'s: non-zero only while a console collects.
+pub inline fn end(req: *Request, res: *Response, result: anytype, answered: ?anyerror, start_ns: u64) void {
     // Nobody collecting and no possible 5xx: the common path, before
     // anything else is loaded. A detached response left here keeps its
     // `console_start_ns` of 0, which is `start_ns`.
@@ -43,7 +47,7 @@ pub inline fn end(req: *Request, res: *Response, result: anytype, start_ns: u64)
         return;
     }
     const f = request_end orelse return;
-    f(req, res, if (result) |_| null else |e| e, start_ns);
+    f(req, res, if (result) |_| null else |e| e, answered, start_ns);
 }
 
 /// A detached response's answer is known (`Detached.finish`, after its
@@ -52,7 +56,7 @@ pub inline fn finished(d: anytype, result: anyerror!void) void {
     const start_ns: u64 = d.console_start_ns;
     if (start_ns == 0 and !mayBe5xx(d.response, result)) return;
     const f = request_end orelse return;
-    f(d.request, d.response, if (result) |_| null else |e| e, start_ns);
+    f(d.request, d.response, if (result) |_| null else |e| e, null, start_ns);
 }
 
 inline fn mayBe5xx(res: *const Response, result: anytype) bool {

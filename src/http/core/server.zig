@@ -2706,7 +2706,7 @@ pub fn Server(comptime Ctx: type) type {
             };
             const t0 = hooks.begin(req.io);
             const result = executor.run();
-            hooks.end(req, res, result, t0);
+            hooks.end(req, res, result, executor.answered, t0);
             return result;
         }
 
@@ -3095,7 +3095,7 @@ pub fn Server(comptime Ctx: type) type {
                 };
                 const t0 = hooks.begin(self.io);
                 const run_result = executor.run();
-                hooks.end(&request, &response, run_result, t0);
+                hooks.end(&request, &response, run_result, executor.answered, t0);
                 run_result catch |err| switch (err) {
                     error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
                     error.WriteFailed => return connection.getWriteError() orelse error.Unexpected,

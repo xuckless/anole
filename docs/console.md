@@ -78,7 +78,10 @@ mark hidden columns), Ctrl-L redraws, Ctrl-Z suspends.
   at that moment is skipped until the next refresh, and a runtime too busy
   to answer within 200 ms shows the view as unavailable for that refresh.
   PostgreSQL pools show their size, open, idle and in use (pg counts no
-  waiters).
+  waiters); a SQLite database shows its writer and readers as one pool,
+  with the calls waiting for one. `/db` lists databases and outside
+  services (Redis, MongoDB, NATS, Kafka, S3, SMTP), not SSE topics, caches,
+  jobs or webhooks.
 
 ## The control socket
 

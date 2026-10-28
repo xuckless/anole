@@ -77,7 +77,7 @@ pub fn Of(comptime S: type) type {
                 try jsonStr(w, if (r.method) |m| m.name() else "ANY");
                 try w.writeAll(",\"pattern\":");
                 try jsonStr(w, r.info.path);
-                try w.print(",\"no_wait\":{},\"cached\":false,\"kind\":\"http\",\"middleware\":{d}}}", .{ r.no_wait, r.middlewares.len });
+                try w.print(",\"no_wait\":{},\"cached\":false,\"kind\":\"{t}\",\"middleware\":{d}}}", .{ r.no_wait, r.kind, r.middlewares.len });
             }
             try w.writeByte(']');
         }
@@ -162,10 +162,13 @@ pub fn Of(comptime S: type) type {
 
         fn collectDatabases(s: *S, w: *std.Io.Writer) !void {
             try w.writeByte('[');
+            var first = true;
             for (s.extras.connectors.items, 0..) |c, i| {
-                if (i > 0) try w.writeByte(',');
+                const describe = c.describe orelse continue;
+                if (!first) try w.writeByte(',');
+                first = false;
                 try w.print("{{\"i\":{d},", .{i});
-                try c.describe(c.context, c.name, w);
+                try describe(c.context, c.name, w);
                 try w.writeByte('}');
             }
             try w.writeByte(']');
