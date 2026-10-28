@@ -1,5 +1,5 @@
 //! Zig 0.17.0's default test runner (lib/compiler/test_runner.zig, MIT,
-//! Copyright (c) Zig contributors), with one change for SAFETY.md E1: the
+//! Copyright (c) Zig contributors), with changes for SAFETY.md E1: the
 //! test allocator of a unit test is backed by `never_reuse.allocator`, so
 //! freed memory is never handed out again and a use after free faults at
 //! once; a unit test fails when zio's `debug_cancel` reports a swallowed
@@ -8,9 +8,12 @@
 //! `--test-timeout` kills it (`watchdog`, TESTING.md D2), so a hang says
 //! where it is; a test's log lines are printed only when it fails or
 //! crashes (`captured`, flushed by the panic handler, `debug.handleSegfault`
-//! and a SIGABRT handler); and a failed test names its error (the
-//! server-mode runner printed only the trace). The fuzzing loops keep `std.heap.page_allocator`
-//! (an mprotect per bucket costs a fuzzer's throughput). Re-copy it when moving to the next
+//! and a SIGABRT handler); a failed test names its error (the
+//! server-mode runner printed only the trace); and a run with
+//! ANOLE_TEST_CHILD set runs only the tests whose names contain it
+//! (src/safety/child.zig, for tests whose claim is a panic). The fuzzing
+//! loops keep `std.heap.page_allocator` (an mprotect per bucket costs a
+//! fuzzer's throughput). Re-copy it when moving to the next
 //! Zig version and apply the change again (`ANOLE:` marks it).
 const builtin = @import("builtin");
 
@@ -835,8 +838,15 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
     });
     const have_tty = Io.File.stderr().isTty(runner_threaded_io) catch unreachable;
 
+    // ANOLE: a child run of one test (src/safety/child.zig): only the tests
+    // whose names contain ANOLE_TEST_CHILD.
+    // `getAlloc` maps the whole environment first, hence page_allocator
+    // and not the small `fba`.
+    const only: ?[]const u8 = init.environ.getAlloc(std.heap.page_allocator, "ANOLE_TEST_CHILD") catch null;
+
     var leaks: usize = 0;
     for (test_fn_list, 0..) |test_fn, i| {
+        if (only) |o| if (std.mem.indexOf(u8, test_fn.name, o) == null) continue; // ANOLE
         testing.allocator_instance = .init(never_reuse.allocator, .{ // ANOLE
             .canary = 0xc3a701ba,
             .check_write_after_free = true,

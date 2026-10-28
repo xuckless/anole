@@ -34,6 +34,7 @@ test {
     _ = @import("teardown.zig");
     _ = @import("owner.zig");
     _ = @import("lock.zig");
+    _ = @import("child.zig");
     _ = @import("ctx.zig");
     _ = @import("anole_never_reuse");
 }
