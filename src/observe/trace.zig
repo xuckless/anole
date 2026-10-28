@@ -144,8 +144,11 @@ pub const Span = struct {
     /// fields above are unused. Null for the request's own span.
     db: ?Db = null,
     /// Set for a job's run (a CONSUMER span, `Exporter.job`), when the
-    /// HTTP fields above are unused. Owner: the exporter (M1), which
-    /// frees it once the span is sent or dropped (`Exporter.release`).
+    /// HTTP fields above are unused. A span is copied by value, but this
+    /// is owned by one copy at a time: `Exporter.job` makes it,
+    /// `Exporter.submit` takes it, and the exporter frees it once the span
+    /// is sent or dropped (`Exporter.release`); a test that takes spans
+    /// off the queue owns them through `Exporter.takeQueued`.
     job: ?*JobRun = null,
 
     /// One run of a job: OpenTelemetry's messaging attributes for a
@@ -154,6 +157,11 @@ pub const Span = struct {
     /// `messaging.message.id`) and Anole's `anole.job.*`, and the link to
     /// the context that enqueued it (otelriver, opentelemetry_oban and
     /// the Sidekiq instrumentation link by default).
+    ///
+    /// owner: the Exporter (SAFETY.md M1), through the span that carries
+    /// it. M2 class: child of the exporter (on its allocator), freed by
+    /// `Exporter.release` exactly once: when the span is sent, dropped,
+    /// left over at `close`, or given back by a test's `Taken.deinit`.
     pub const JobRun = struct {
         queue: []const u8,
         kind: []const u8,
@@ -484,16 +492,40 @@ pub const Exporter = struct {
         return owned;
     }
 
+    /// Spans a test took off the queue (`takeQueued`): owned by this
+    /// value until `deinit` releases them, once.
+    pub const Taken = struct {
+        exporter: *Exporter,
+        spans: []Span,
+
+        /// Releases every span (what each owns); afterwards `spans` is
+        /// empty, so a second call releases nothing.
+        pub fn deinit(t: *Taken) void {
+            for (t.spans) |span| t.exporter.release(span);
+            t.spans = &.{};
+        }
+    };
+
+    /// For tests: up to `buf.len` queued spans, taken off the queue
+    /// without waiting, owned by the result (`defer taken.deinit()`), so a
+    /// test can neither leak a job run nor release one twice.
+    pub fn takeQueued(self: *Exporter, buf: []Span) std.Io.QueueClosedError!Taken {
+        const n = try self.queue.getUncancelable(self.io, buf, 0);
+        return .{ .exporter = self, .spans = buf[0..n] };
+    }
+
     /// Frees what `span` owns (a job run's attributes): once it is sent,
-    /// dropped, left over at `close`, or taken off the queue by a test.
+    /// dropped, left over at `close`, or given back by `Taken.deinit`.
     pub fn release(self: *Exporter, span: Span) void {
         const attrs = span.job orelse return;
         self.gpa.free(attrs._block);
         self.gpa.destroy(attrs);
     }
 
-    /// Queues `span`. After `close` the span is dropped (counted) and what
-    /// it owns (`span.job`) freed at once.
+    /// Queues `span`, taking what it owns (`span.job`): the exporter frees
+    /// it once the span is sent or dropped, so the caller's copy must not
+    /// be released or submitted again. After `close` the span is dropped
+    /// (counted) and what it owns freed at once.
     pub fn submit(self: *Exporter, span: Span) void {
         if (!self.taking()) {
             self.release(span);

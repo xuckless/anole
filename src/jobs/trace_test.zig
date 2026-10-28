@@ -46,10 +46,10 @@ const Fx = struct {
 
     /// The spans queued so far, encoded as the collector gets them.
     fn sent(fx: *Fx, spans: []trace.Span) ![]const u8 {
-        const n = try fx.exporter.queue.get(testing.io, spans, 0);
-        defer for (spans[0..n]) |s| fx.exporter.release(s);
-        if (n == 0) return "";
-        return trace.encode(fx.ctx.arena, "t", spans[0..n]);
+        var taken = try fx.exporter.takeQueued(spans);
+        defer taken.deinit();
+        if (taken.spans.len == 0) return "";
+        return trace.encode(fx.ctx.arena, "t", taken.spans);
     }
 };
 
@@ -81,14 +81,14 @@ test "jobs: a run is one CONSUMER span 'process <queue>', linked to the enqueuer
     _ = try fx.client.step(&fx.ctx);
 
     var spans: [4]trace.Span = undefined;
-    const n = try fx.exporter.queue.get(testing.io, &spans, 0);
-    defer for (spans[0..n]) |s| fx.exporter.release(s);
-    try testing.expectEqual(@as(usize, 1), n);
-    const s = spans[0];
+    var taken = try fx.exporter.takeQueued(&spans);
+    defer taken.deinit();
+    try testing.expectEqual(@as(usize, 1), taken.spans.len);
+    const s = taken.spans[0];
     // A trace of its own: the enqueuer is a link, not the parent.
     try testing.expect(s.parent_span_id == null);
     try testing.expect(!std.mem.eql(u8, &s.trace_id, "0af7651916cd43dd8448eb211c80319c"));
-    const body = try trace.encode(fx.ctx.arena, "t", spans[0..1]);
+    const body = try trace.encode(fx.ctx.arena, "t", taken.spans);
     try testing.expect(has(body, "\"name\":\"process mail\",\"kind\":5,"));
     try testing.expect(has(body, "\"links\":[{\"traceId\":\"0af7651916cd43dd8448eb211c80319c\",\"spanId\":\"b7ad6b7169203331\",\"traceState\":\"congo=t61rcWkgMzE\",\"flags\":1}]"));
     try testing.expect(has(body, "{\"key\":\"messaging.system\",\"value\":{\"stringValue\":\"anole\"}}"));
@@ -124,13 +124,13 @@ test "jobs: a job enqueued from a traced run carries the run's span as its trace
     _ = try fx.client.enqueueRaw(&fx.ctx, "mail.send", "{}", .{ .meta = "{\"traceparent\":\"" ++ enqueuer ++ "\"}" });
     _ = try fx.client.step(&fx.ctx);
     var spans: [4]trace.Span = undefined;
-    const n = try fx.exporter.queue.get(testing.io, &spans, 0);
-    defer for (spans[0..n]) |s| fx.exporter.release(s);
+    var taken = try fx.exporter.takeQueued(&spans);
+    defer taken.deinit();
     // The parent's run and the child's.
-    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(usize, 2), taken.spans.len);
     const child = (try fx.client.get(&fx.ctx, child_id)).?;
-    const want = try std.fmt.allocPrint(fx.ctx.arena, "00-{s}-{s}-01", .{ &spans[0].trace_id, &parent_span });
-    try testing.expectEqualStrings(&parent_span, &spans[0].span_id);
+    const want = try std.fmt.allocPrint(fx.ctx.arena, "00-{s}-{s}-01", .{ &taken.spans[0].trace_id, &parent_span });
+    try testing.expectEqualStrings(&parent_span, &taken.spans[0].span_id);
     try testing.expectEqualStrings(want, child.meta.object.get("traceparent").?.string);
 }
 
@@ -142,10 +142,10 @@ test "jobs: with sample_all off, a run whose enqueuer was not sampled has no spa
     _ = try fx.client.enqueueRaw(&fx.ctx, "mail.send", "{}", .{ .meta = "{\"traceparent\":\"" ++ enqueuer ++ "\"}" });
     _ = try fx.client.step(&fx.ctx);
     var spans: [4]trace.Span = undefined;
-    const n = try fx.exporter.queue.get(testing.io, &spans, 0);
-    defer for (spans[0..n]) |s| fx.exporter.release(s);
-    try testing.expectEqual(@as(usize, 1), n);
-    try testing.expectEqual(true, spans[0].job.?.link.?.sampled);
+    var taken = try fx.exporter.takeQueued(&spans);
+    defer taken.deinit();
+    try testing.expectEqual(@as(usize, 1), taken.spans.len);
+    try testing.expectEqual(true, taken.spans[0].job.?.link.?.sampled);
 }
 
 test "jobs: enqueued from a request whose caller is not sampled, the job keeps the unsampled flag" {
@@ -246,10 +246,10 @@ fn interruptedCheck(io: std.Io) !void {
     // A drain whose deadline has passed: the run is canceled and put back.
     client.drain(std.Io.Clock.Timestamp.now(io, .awake));
     var spans: [4]trace.Span = undefined;
-    const n = try exporter.queue.get(io, &spans, 0);
-    defer for (spans[0..n]) |sp| exporter.release(sp);
-    try testing.expectEqual(@as(usize, 1), n);
-    const body = try trace.encode(ctx.arena, "t", spans[0..n]);
+    var taken = try exporter.takeQueued(&spans);
+    defer taken.deinit();
+    try testing.expectEqual(@as(usize, 1), taken.spans.len);
+    const body = try trace.encode(ctx.arena, "t", taken.spans);
     try testing.expect(has(body, "{\"key\":\"anole.job.outcome\",\"value\":{\"stringValue\":\"interrupted\"}}"));
     // Stopped from outside: the handler did not fail.
     try testing.expect(!has(body, "error.type"));
