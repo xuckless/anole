@@ -225,6 +225,45 @@ test "app golden: /h3" {
     try expectGolden("h3", &f.app);
 }
 
+test "app golden: /h3 scrolled right keeps the first column" {
+    const f = try fixture(.attach, true);
+    defer {
+        f.deinit();
+        gpa.destroy(f);
+    }
+    _ = f.line("/h3");
+    f.snapshot(.h3, std.mem.trimEnd(u8, @embedFile("golden/h3_snapshot.json"), "\n"));
+    for (0..3) |_| _ = f.app.key(.right);
+    try expectGolden("h3_right", &f.app);
+}
+
+fn drawn(a: *App) !void {
+    var scr = try screen.Screen.init(gpa, cols, rows);
+    defer scr.deinit(gpa);
+    a.draw(&scr);
+}
+
+test "app: Left after Right past the last column moves back at once" {
+    const f = try fixture(.attach, true);
+    defer {
+        f.deinit();
+        gpa.destroy(f);
+    }
+    _ = f.line("/h3");
+    f.snapshot(.h3, std.mem.trimEnd(u8, @embedFile("golden/h3_snapshot.json"), "\n"));
+    for (0..50) |_| _ = f.app.key(.right);
+    try drawn(&f.app);
+    const most = f.app.hcol;
+    // Clamped to what the table needs, so one Left shows one column more.
+    try std.testing.expect(most > 0 and most < 50);
+    _ = f.app.key(.left);
+    try drawn(&f.app);
+    try std.testing.expectEqual(most - 1, f.app.hcol);
+    // Another view starts at its first column.
+    _ = f.line("/runtime");
+    try std.testing.expectEqual(@as(usize, 0), f.app.hcol);
+}
+
 test "app golden: /h3 off" {
     const f = try fixture(.attach, true);
     defer {

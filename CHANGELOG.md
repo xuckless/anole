@@ -18,6 +18,10 @@ breaking changes are listed anyway.
   generated from Unicode 16.0.0 (`tools/gen-width-table.py`); the
   hand-picked subset missed the combining marks of Bengali, Tamil and other
   scripts.
+- Console: a table wider than the terminal scrolls sideways with Left/Right,
+  a column at a time, keeping its first column; ‹ and › mark hidden
+  columns. `/h3` showed 8 of its 15 columns at 100 columns wide, with no
+  sign that more existed (#119).
 
 ## 0.4.0 (2026-10-25)
 

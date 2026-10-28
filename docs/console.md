@@ -55,7 +55,9 @@ terminal, 8 not available on this OS.
 | `/help`, `/quit`, `/exit` | |
 
 Keys: Enter runs, Tab completes, Esc closes the popup then clears the input,
-Up/Down history, PgUp/PgDn/Home/End scroll, Ctrl-L redraws, Ctrl-Z suspends.
+Up/Down history, PgUp/PgDn/Home/End scroll, Left/Right scroll a table wider
+than the terminal by a column (the first column stays; ‹ and › in its header
+mark hidden columns), Ctrl-L redraws, Ctrl-Z suspends.
 `NO_COLOR` turns colour off; `TERM=dumb` refuses the interactive console.
 
 ## What is collected, and what it costs
