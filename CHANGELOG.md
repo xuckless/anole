@@ -42,9 +42,77 @@ breaking changes are listed anyway.
   finished but whose state could not be saved (they run again after their
   lease). docs/jobs.md gives the longest stop to plan the service manager's
   stop timeout around.
+- S3: `put(c, key, .request, opts)` with a request body larger than
+  `limits.body_max` answered 400; it now fails with `error.BodyTooBig`, a
+  413 Content Too Large (RFC 9110 §15.5.14), as the server's own body
+  readers answer it. `anole.db.lastError(req)` still says `body_too_big`.
+  Over HTTP/1.1 the rest of the body is then drained, or the connection
+  closed when it is too long to drain; over HTTP/2 and HTTP/3 the stream is
+  reset.
+- S3: the C ABI's `anole_s3_serve` ignored the request's
+  If-Unmodified-Since; it now forwards it as the Zig `serve` does, so an
+  object changed since that date answers 412 (RFC 9110 §13.2.2; a true
+  If-Match still wins, as S3 orders them). `GetOptions` gains
+  `if_unmodified_since` for `get`, `open` and `head`.
+- Jobs: a job enqueued from a request kept `traceparent` with the sampled
+  flag always set (`-01`), so a caller's unsampled context came back
+  sampled. A request recorded here now passes its own span on (`-01`);
+  one passed on unrecorded, or served without the tracing middleware,
+  passes the caller's `traceparent` header on as it came, every trace flag
+  kept (`-00`, and W3C Level 2's random flag in `-03`). The caller's
+  `tracestate` is kept beside it.
+- Kafka and NATS: a produce or publish from a request passed on
+  unrecorded (a caller's unsampled context, `sample_all` off) sent
+  `traceparent` with the sampled flag set (`-01`); it now takes
+  `trace.outgoing`'s, so the caller's `-00` stays, as outbound HTTP calls
+  already did.
+- C ABI: `anole_jobs_enqueue` with `opts.req` ignored the request's trace
+  context; the jobs now carry its `traceparent` and `tracestate`, read
+  during the call (so a request answered right after still passes it on;
+  one already answered or ended adds none, and so does one whose answer
+  has started streaming or that another thread's call is answering at
+  that moment, such as a gRPC `send_headers`). Calls on the request from
+  other threads meanwhile (its answer, `anole_handle_release`, a query or
+  S3, SMTP, NATS or jobs call given it as `req`) wait for that read, a copy
+  of a few hundred bytes, instead of answering `ANOLE_E_GONE`. Nothing is
+  copied for requests that never enqueue.
+- Jobs: stopping a client while its maintenance round or heartbeat was in
+  a store call (PostgreSQL, Redis, SQLite) took the cancel for a failed
+  call: the round went on to its next store call through the teardown.
+  The cancel now ends the task.
+- C ABI: a request (or gRPC call) is stale as soon as it is answered, as
+  `anole.h` says ("until answered"): `anole_db_query`, `_exec`, `_begin` and
+  the S3, SMTP, NATS and jobs calls given an answered request as `req`
+  return `ANOLE_E_GONE` at once. They accepted it, and ran the call, until
+  the executor had written the answer and freed the slot. A streamed answer
+  is owed until `anole_req_stream_end` (or `anole_grpc_finish`).
+- C ABI: a transaction its request ended (aborted, past its deadline), or
+  that timed out, refuses `anole_db_tx_query`, `_exec`, `_commit` and
+  `_rollback` with `ANOLE_E_GONE` at once, as documented. They were taken
+  until the transaction's task had rolled it back.
 
 ### Changed
 
+- Jobs: with `app.tracing()`, each run of a job is a CONSUMER span
+  `process <queue>`, linked (not parented) to the context it was enqueued
+  from, with OpenTelemetry's messaging attributes and `anole.job.kind`,
+  `attempt`, `max_attempts` and `outcome` (docs/jobs.md); a failed run has
+  `error.type` (`Timeout` when its timeout expired) and an ERROR status, a
+  run interrupted by a drain or lost has neither. Handlers see it as
+  `job.trace_id`/`job.span_id`, and jobs they enqueue carry it.
+  `observe.trace.Exporter` gains `close` (OpenTelemetry's Shutdown):
+  `App.deinit` closes the app's exporter first, so a job run or database,
+  S3 or SMTP call that settles during the rest of the teardown has its
+  span dropped and counted in `dropped`, with nothing allocated; its
+  memory goes last. `deinit` still closes an exporter not closed yet.
+- Tests: Anole's tests no longer assume a fast machine. Waits go through one
+  helper (`src/testing/wait.zig`) with a 10 s deadline, scaled by
+  `ANOLE_TEST_TIMEOUT_FACTOR`, that names what it waited for when it times
+  out; sleeps that stood in for "it has happened" wait on the condition
+  itself, and elapsed-time upper bounds, in the Zig suites and the C ABI
+  suite alike, are checked only by a new local-only step,
+  `zig build test-timing` (MAINTAINING.md, "Waiting in tests"). Stress
+  tests run only in another step, `zig build test-stress`.
 - Tests: a hung unit test says where it hangs. CI runs every unit test step
   with `--test-timeout 120s`; a test still running at 110 s, its teardown
   (the test Io's and allocator's deinit) included, is named and every

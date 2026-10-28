@@ -144,14 +144,43 @@ pub fn slotLive(x: *Exec, h: Handle) bool {
     };
 }
 
-/// The executor of the request or gRPC call `hv`, which must be live; `c`,
-/// when given, must be its consumer.
+/// On the consumer's side: whether the request or call `h` is still owed
+/// its answer (anole.h: a request is valid "until answered"). Stricter than
+/// `slotLive`, which the executor uses and which holds until the slot is
+/// freed, after the answer is written: a call made once the answer is in
+/// (`anole_req_respond`, `_stream_end`, `anole_grpc_finish` returned) is
+/// GONE at once, as a second answer is (`engine.claim`). `responding` is a
+/// request's answer being stored, so over; on a gRPC call it is also its
+/// metadata being stored, which goes back to `out`. `polling` on a handle
+/// a consumer holds is `out` pinned by `requestTrace` on another thread
+/// (`poll` pins only handles not yet delivered), going back to `out`.
+fn stillOwed(x: *Exec, h: Handle) bool {
+    if (h.slot >= x.slots.len) return false;
+    const sl = &x.slots[h.slot];
+    if (sl.kind.load(.acquire) != @backingInt(h.kind)) return false;
+    const w = sl.word.load(.acquire);
+    if (engine.genOf(w) != h.gen) return false;
+    return switch (engine.stateOf(w)) {
+        .out, .polling => true,
+        .responding => h.kind == .grpc_call,
+        // The head is out: owed until the body's end.
+        .streaming => blk: {
+            sl.out.acquire();
+            defer sl.out.release();
+            break :blk sl.out.live(h.gen) and !sl.out.ended and !sl.out.failed;
+        },
+        else => false,
+    };
+}
+
+/// The executor of the request or gRPC call `hv`, which must still be owed
+/// its answer (`stillOwed`); `c`, when given, must be its consumer.
 pub fn resolveReq(e: *Engine, hv: u64, c: ?*Consumer) QueryError!*Exec {
     const h = Handle.decode(hv);
     if (h.gen == 0 or (h.kind != .request and h.kind != .grpc_call)) return error.Invalid;
     if (h.exec >= e.execs.len) return error.Gone;
     const x = &e.execs[h.exec];
-    if (!slotLive(x, h)) return error.Gone;
+    if (!stillOwed(x, h)) return error.Gone;
     const xc = x.consumer orelse return error.State;
     if (c) |cc| if (cc != xc) return error.Invalid;
     return x;
@@ -1286,6 +1315,9 @@ pub fn txSubmit(e: *Engine, hv: u64, what: TxWhat, sql: []const u8, params: []co
     const t = txSlotOf(e, h) orelse return error.Gone;
     const w = t.word.load(.acquire);
     if (@as(u32, @intCast(w >> 32)) != h.gen or @as(TxState, @fromBackingInt(@intCast(w & 0xFFFFFFFF))) != .open) return error.Gone;
+    // Ending (its request cut it, its timeout passed): its task has yet to
+    // roll it back, and takes nothing more.
+    if (t.endNow() != .none) return error.Gone;
     if (e.phase.load(.acquire) == .stopped) return error.Gone;
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -1325,6 +1357,8 @@ pub fn txFinish(e: *Engine, hv: u64, what: TxWhat, user_data: u64) QueryError!vo
     var w = t.word.load(.acquire);
     while (true) {
         if (@as(u32, @intCast(w >> 32)) != h.gen or @as(TxState, @fromBackingInt(@intCast(w & 0xFFFFFFFF))) != .open) return error.Gone;
+        // Ending already (as `txSubmit`): its task rolls it back.
+        if (t.endNow() != .none) return error.Gone;
         w = t.word.cmpxchgWeak(w, packTx(h.gen, .closing), .acq_rel, .acquire) orelse break;
     }
     if (e.phase.load(.acquire) == .stopped) return error.Gone;

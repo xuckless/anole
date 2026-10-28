@@ -1211,11 +1211,12 @@ fn slotOf(e: *Engine, hv: u64) engine.HandleError!struct { *Exec, *Slot, Handle 
     return engine.slotOfKind(e, hv, .grpc_call);
 }
 
-/// `out` to `responding`; `error.Gone` when the call is over (or was never
-/// this), `error.State` when its answer is streaming.
+/// `out` to `responding`, waiting out a pin (`engine.claimOut`);
+/// `error.Gone` when the call is over (or was never this), `error.State`
+/// when its answer is streaming.
 fn claim(e: *Engine, hv: u64) AnswerError!struct { *Exec, *Slot, Handle } {
     const x, const s, const h = slotOf(e, hv) catch |err| return e.badHandle(err);
-    if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .responding), .acquire, .monotonic)) |w| {
+    if (engine.claimOut(s, h.gen, .responding)) |w| {
         if (genOf(w) == h.gen and stateOf(w) == .streaming) return error.State;
         return e.gone();
     }

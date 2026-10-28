@@ -553,8 +553,13 @@ pub const FakeServer = struct {
                 return errorXml(res, .not_found, "NoSuchKey", "The specified key does not exist.");
             };
         }
-        if (req.headers.get("If-Match")) |im| if (!std.mem.eql(u8, im, o.etag))
+        if (req.headers.get("If-Match")) |im| {
+            if (!std.mem.eql(u8, im, o.etag))
+                return errorXml(res, .precondition_failed, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+        } else if (req.headers.get("If-Unmodified-Since")) |ius| if (util.parseHttpDate(ius)) |t| if (o.modified > t) {
+            // Only without If-Match, as S3 and RFC 9110 13.2.2 order them.
             return errorXml(res, .precondition_failed, "PreconditionFailed", "At least one of the pre-conditions you specified did not hold");
+        };
         try res.header("ETag", o.etag);
         var date: [29]u8 = undefined;
         try res.header("Last-Modified", try res.arena.dupe(u8, util.formatHttpDate(&date, o.modified)));

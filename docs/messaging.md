@@ -119,7 +119,9 @@ publishes and never wait. Key-value and the object store are later.
 
 ### Tracing and metrics
 
-A publish from a traced request carries `traceparent`; calls make
+A publish from a traced request carries `traceparent`
+(`trace.outgoing`'s: `-01` for a recorded request, the caller's `-00` for
+one passed on unrecorded); calls make
 `messaging` spans (`publish`, `request`, `process`) with
 `messaging.system = "nats"`. Breaker and retry metrics are in
 [resilience.md](resilience.md).
@@ -226,7 +228,9 @@ labels (below).
 
 ### Tracing and metrics
 
-A produce from a traced request carries `traceparent`; calls make
+A produce from a traced request carries `traceparent` (`trace.outgoing`'s:
+`-01` for a recorded request, the caller's `-00` for one passed on
+unrecorded); calls make
 `messaging` spans with `messaging.system = "kafka"`, the topic as
 `messaging.destination.name`, and for consumed records the offset and group.
 Record keys are not put in spans (they can be personal data). Metrics:

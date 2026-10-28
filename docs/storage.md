@@ -68,19 +68,19 @@ A start that finds no credentials fails and names every source it tried:
 | `multipart()` | `create`, `complete`, `abort` for browsers uploading parts |
 | `bucket(name)`, `with(.{ .timeout, .retry })` | the same calls on another bucket, or with call options |
 
-Reads take `range`, `version_id`, `if_none_match`, `if_match` and `if_modified_since`; a `304` is an `Object` with `meta.not_modified`. Writes take `content_type` (from the key's extension by default), `cache_control`, `content_disposition`, `content_encoding`, `metadata` (`x-amz-meta-*`), `storage_class`, `if_absent` (create only: `If-None-Match: *`) and `if_match`.
+Reads take `range`, `version_id`, `if_none_match`, `if_match`, `if_modified_since` and `if_unmodified_since` (a `412`, class `precondition`, when the object changed after it; S3 ignores it when `if_match` is set, as RFC 9110 §13.2.2 orders them); a `304` is an `Object` with `meta.not_modified`. Writes take `content_type` (from the key's extension by default), `cache_control`, `content_disposition`, `content_encoding`, `metadata` (`x-amz-meta-*`), `storage_class`, `if_absent` (create only: `If-None-Match: *`) and `if_match`.
 
 Keys are 1 to 1024 bytes of UTF-8. They are encoded for the URL and the signature as SigV4 asks, so spaces, `+`, `&` and non-ASCII are fine.
 
 ### serve
 
-`serve` forwards `Range`, `If-None-Match`, `If-Match` and `If-Modified-Since` from the request (an `If-Range` drops the `Range`: the whole object is sent, as RFC 9110 allows), passes 200, 206, 304, 412 and 416 through with `Content-Type`, `Content-Length`, `Content-Range`, `ETag`, `Last-Modified`, `Accept-Ranges`, `Cache-Control`, `Content-Disposition` and `Content-Encoding`, and streams the body without holding it. A `HEAD` request uses HeadObject. A missing key is `error.NotFound` before anything is sent, so the handler can answer with its own 404 page.
+`serve` (and the C ABI's `anole_s3_serve`) forwards `Range`, `If-None-Match`, `If-Match`, `If-Modified-Since` and `If-Unmodified-Since` from the request (an `If-Range` drops the `Range`: the whole object is sent, as RFC 9110 allows), passes 200, 206, 304, 412 and 416 through with `Content-Type`, `Content-Length`, `Content-Range`, `ETag`, `Last-Modified`, `Accept-Ranges`, `Cache-Control`, `Content-Disposition` and `Content-Encoding`, and streams the body without holding it. A `HEAD` request uses HeadObject. A missing key is `error.NotFound` before anything is sent, so the handler can answer with its own 404 page.
 
 ### Uploads
 
 An upload never holds a whole object. Up to `multipart_threshold` (default `part_size`, 8 MiB) a body of known length is one PutObject; above it, or when the length is not known, it goes up as a multipart upload with `part_size` parts (raised to `ceil(length / 10000)` so 10,000 parts always suffice; all parts have the same size, which R2 requires), at most `concurrency` (default 2) in flight. One upload holds at most `(concurrency + 1) * part_size` in memory, and all of a client's uploads together at most `upload_memory` (256 MiB).
 
-`put(c, key, .request, .{})` is the pull form: it reads the request's body at its own pace and sends it on (`limits.body_max` applies). `upload(c, key, opts)` is the push form for code that produces bytes: `write(c, bytes)` copies them into the part buffers and **returns at once**. It never waits for the network:
+`put(c, key, .request, .{})` is the pull form: it reads the request's body at its own pace and sends it on (`limits.body_max` applies: a larger body fails with `error.BodyTooBig`, a 413 Content Too Large as the server's own body readers answer it, `lastError` code `body_too_big`; over HTTP/1.1 the rest of the body is then drained, or the connection closed when it is too long to drain, and over HTTP/2 and HTTP/3 the stream is reset). `upload(c, key, opts)` is the push form for code that produces bytes: `write(c, bytes)` copies them into the part buffers and **returns at once**. It never waits for the network:
 
 - `.ok`: taken, room for more;
 - `.busy`: taken, but more than `concurrency * part_size` is buffered; wait with `waitWritable(c, timeout)` before writing more;
@@ -109,7 +109,7 @@ Retries are **on** by default (3 attempts, 100 ms to 2 s): every operation Anole
 | past the timeout | `timeout` | 504 |
 | everything else (403 `AccessDenied`, `SignatureDoesNotMatch`, `InvalidAccessKeyId`, 301 `PermanentRedirect`...) | `other` | 500 |
 
-A wrong region or a bad key is the server's misconfiguration, so it answers 500 with a clear log line; a `PermanentRedirect` names the bucket's region. `anole.db.lastError(req).?.code` is S3's `<Code>`, or Anole's own: among them `no_bucket`, `no_credentials`, `invalid_key`, `object_too_large`, `too_many_parts`, `short_body`, `body_too_big`, `file_not_found`, `invalid_expires`, `upload_full`, `upload_over`, `transport`, `bad_response`, `write_timeout`, `draining` and `circuit_open`. `Options.errors` moves any class to another status.
+A wrong region or a bad key is the server's misconfiguration, so it answers 500 with a clear log line; a `PermanentRedirect` names the bucket's region. `anole.db.lastError(req).?.code` is S3's `<Code>`, or Anole's own: among them `no_bucket`, `no_credentials`, `invalid_key`, `object_too_large`, `too_many_parts`, `short_body`, `body_too_big`, `file_not_found`, `invalid_expires`, `upload_full`, `upload_over`, `transport`, `bad_response`, `write_timeout`, `draining` and `circuit_open`. `Options.errors` moves any class to another status (`body_too_big` is the request's fault and always a 413).
 
 ## Shutdown
 

@@ -240,6 +240,30 @@ test "msg: a Msg is a context for connector calls and error recording" {
     try testing.expectEqualStrings("no_responders", db.lastError(&msg).?.code);
 }
 
+test "publish: from a request that passes an unsampled caller on, traceparent stays -00" {
+    var r: Rig = undefined;
+    try r.start(&.{}, 1, .{});
+    defer r.deinit();
+    try r.client.start(null, null, null);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    // As the tracing middleware leaves a request it does not record
+    // (`sample_all` off, caller unsampled): the caller's IDs, as they came.
+    var keys: [1][]const u8 = undefined;
+    var values: [1][]const u8 = undefined;
+    var hashes: [1]u8 = undefined;
+    var req: dusty.Request = .{ .arena = arena_state.allocator(), .io = r.rt.io(), ._parser = undefined, ._transport = undefined };
+    req.headers = .{ .keys = &keys, .values = &values, .hashes = &hashes };
+    const caller = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00";
+    try req.headers.add("traceparent", caller);
+    req.trace_id = "0af7651916cd43dd8448eb211c80319c";
+    req.span_id = "b7ad6b7169203331";
+    try r.client.publish(&req, "audit", "x");
+    try waitServer(&r);
+    try testing.expect(std.mem.startsWith(u8, r.transcript.items, "HPUB audit "));
+    try testing.expect(std.mem.indexOf(u8, r.transcript.items, "traceparent: " ++ caller ++ "\r\n") != null);
+}
+
 test "publish cap: past outbound_bytes a publish is ServiceUnavailable (outbound_full) at once and writable is false" {
     var r: Rig = undefined;
     try r.startWith(.{ .stall = true, .transcript = undefined }, .{ .limits = .{ .outbound_bytes = 1 } });

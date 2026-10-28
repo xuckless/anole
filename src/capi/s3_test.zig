@@ -2,6 +2,7 @@
 //! driven through the engine's Zig entry points as in nats_test.zig. Waits poll
 //! the consumer with generous bounds; no assertion is about time.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const dusty = @import("dusty");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
@@ -34,24 +35,23 @@ const Events = struct {
 
     /// The first record of `typ` at or after `from` (polling up to `ms`).
     fn waitFor(ev: *Events, typ: abi.EventType, from: usize, ms: u32) !usize {
-        var waited: u32 = 0;
+        const started = std.Io.Clock.awake.now(engine.threadedIo());
         while (true) {
             for (ev.list.items[from..], from..) |r, i| if (r.typ == @backingInt(typ)) return i;
-            if (waited >= ms) return error.TimedOut;
+            if (pastDeadline(started, ms)) return error.TimedOut;
             try ev.pump(50);
-            waited += 50;
         }
     }
 
     /// The S3 result with `user_data`.
     fn result(ev: *Events, user_data: u64) !*const abi.S3ResultEvent {
-        var waited: u32 = 0;
+        const started = std.Io.Clock.awake.now(engine.threadedIo());
         while (true) {
             for (ev.list.items) |r| if (r.typ == @backingInt(abi.EventType.s3_result)) {
                 const rec: *const abi.S3ResultEvent = @ptrCast(@alignCast(r.bytes.ptr));
                 if (rec.user_data == user_data) return rec;
             };
-            if (waited >= 15000) {
+            if (pastDeadline(started, 15000)) {
                 for (ev.list.items) |r| if (r.typ == @backingInt(abi.EventType.s3_result)) {
                     const rec: *const abi.S3ResultEvent = @ptrCast(@alignCast(r.bytes.ptr));
                     std.debug.print("result user_data {d} op {d} status {d} class {d}: {s} ({s})\n", .{ rec.user_data, rec.op, rec.status, rec.error_class, text(rec, rec.@"error"), text(rec, rec.error_code) });
@@ -59,7 +59,6 @@ const Events = struct {
                 return error.TimedOut;
             }
             try ev.pump(50);
-            waited += 50;
         }
     }
 
@@ -244,9 +243,16 @@ test "capi s3: get STREAM with a 128 KiB window delivers DATA up to the window, 
     }
     try std.testing.expect(fin);
     try std.testing.expectEqualSlices(u8, data, got.items);
-    // The handle is over.
-    sleepMs(50);
-    try std.testing.expectError(error.Gone, engine.s3.readMore(r.e, handle, 1));
+    // The handle is over (it goes once the FIN is out).
+    const Over = struct {
+        e: *engine.Engine,
+        h: u64,
+        fn gone(o: @This()) bool {
+            _ = engine.s3.readMore(o.e, o.h, 1) catch |err| return err == error.Gone;
+            return false;
+        }
+    };
+    try wait.waitUntil(engine.threadedIo(), "the finished download's handle is gone", Over{ .e = r.e, .h = handle }, Over.gone);
 }
 
 test "capi s3: a push upload: write OK, BORROW refused, finish answers UPLOAD_FINISH with parts" {
@@ -301,13 +307,18 @@ test "capi s3: releasing an upload aborts it" {
     defer alloc.free(chunk);
     pattern(chunk, 5);
     for (0..6) |_| _ = try engine.s3.uploadWrite(r.e, t, chunk, 0);
-    var waited: u32 = 0;
-    while (r.fake.count("PUT", "partNumber=") == 0 and waited < 15000) : (waited += 20) sleepMs(20);
-    try std.testing.expect(r.fake.count("PUT", "partNumber=") >= 1);
+    const tio = engine.threadedIo();
+    try wait.waitUntil(tio, "a part reached the fake server", r.fake, struct {
+        fn f(fake: *anole.s3.testing.FakeServer) bool {
+            return fake.count("PUT", "partNumber=") >= 1;
+        }
+    }.f);
     try engine.s3.release(r.e, t);
-    waited = 0;
-    while (r.fake.openUploads() != 0 and waited < 15000) : (waited += 20) sleepMs(20);
-    try std.testing.expectEqual(@as(usize, 0), r.fake.openUploads());
+    try wait.waitUntil(tio, "the released upload aborted on the server", r.fake, struct {
+        fn f(fake: *anole.s3.testing.FakeServer) bool {
+            return fake.openUploads() == 0;
+        }
+    }.f);
     try std.testing.expect(r.fake.getObject("b", "gone.bin") == null);
 }
 
@@ -333,8 +344,60 @@ fn fetchTask(io: std.Io, url: []const u8, method: dusty.Method, body: ?[]const u
     defer http.deinit();
     var resp = try http.fetch(url, .{ .method = method, .body = body, .decompress = false });
     defer resp.deinit();
-    out.status = @intCast(@intFromEnum(resp.status()));
+    out.status = @intCast(@backingInt(resp.status()));
     if (method != .head) out.body = try alloc.dupe(u8, (try resp.body()) orelse "");
+}
+
+/// A GET with conditional headers (`names[i]: values[i]`).
+fn fetchIfTask(io: std.Io, url: []const u8, names: []const []const u8, values_in: []const []const u8, out: *HttpResult) anyerror!void {
+    var http = dusty.Client.init(alloc, io, .{});
+    defer http.deinit();
+    var keys: [4][]const u8 = undefined;
+    var values: [4][]const u8 = undefined;
+    var hashes: [4]u8 = undefined;
+    var h: dusty.Headers = .{ .keys = &keys, .values = &values, .hashes = &hashes };
+    for (names, values_in) |n, v| try h.add(n, v);
+    var resp = try http.fetch(url, .{ .headers = &h, .decompress = false });
+    defer resp.deinit();
+    out.status = @intCast(@intFromEnum(resp.status()));
+    out.body = try alloc.dupe(u8, (try resp.body()) orelse "");
+}
+
+/// What a conditional GET of "obj.bin" (put now) is served with.
+const Conditional = enum { if_unmodified_since_old, if_match_and_if_unmodified_since_old };
+
+/// Serves "obj.bin" (put now) to one GET carrying the headers `which`
+/// names; the status.
+fn serveConditional(which: Conditional) !u16 {
+    var r: Rig = undefined;
+    try r.start(true);
+    defer r.deinit();
+    try r.fake.putObject("b", "obj.bin", "conditional", "text/plain");
+    const old_date = "Sun, 06 Nov 1994 08:49:37 GMT";
+    const names: []const []const u8, const values: []const []const u8 = switch (which) {
+        .if_unmodified_since_old => .{ &.{"If-Unmodified-Since"}, &.{old_date} },
+        .if_match_and_if_unmodified_since_old => .{ &.{ "If-Match", "If-Unmodified-Since" }, &.{ r.fake.getEtag("b", "obj.bin").?, old_date } },
+    };
+    const io = r.rt.io();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/f/obj", .{r.e.port(0)});
+    var res: HttpResult = .{};
+    defer alloc.free(res.body);
+    var f = try io.concurrent(fetchIfTask, .{ io, url, names, values, &res });
+    const i = try r.ev.waitFor(.request, 0, 15000);
+    try engine.s3.serve(r.store(), r.ev.list.items[i].handle, .of("obj.bin"), .{}, 23);
+    try f.await(io);
+    return res.status;
+}
+
+test "capi s3: serve forwards If-Unmodified-Since: older than the object answers 412" {
+    if (comptime !features.s3 or !features.http2) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u16, 412), try serveConditional(.if_unmodified_since_old));
+}
+
+test "capi s3: serve: a true If-Match wins over a false If-Unmodified-Since (200)" {
+    if (comptime !features.s3 or !features.http2) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u16, 200), try serveConditional(.if_match_and_if_unmodified_since_old));
 }
 
 test "capi s3: serve answers the request from the object; the body never enters the consumer" {
@@ -438,4 +501,12 @@ test "capi s3: config: storage parses, validates and maps every Options leaf" {
     const schema_text = @import("anole_capi_schema").text;
     const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), schema_text, .{});
     try parity.checkSchemaAndDefaults(anole.s3.Options, config.Config, &parity.s3_options, root);
+}
+
+/// Whether a wait that began at `started` has passed `ms`, or the wait
+/// helper's deadline (10 s times ANOLE_TEST_TIMEOUT_FACTOR) if that is later:
+/// a hang guard counted on the clock, not in polls.
+fn pastDeadline(started: std.Io.Timestamp, ms: u32) bool {
+    const limit: i64 = @max(ms, wait.deadlineMs());
+    return started.untilNow(engine.threadedIo(), .awake).toMilliseconds() >= limit;
 }

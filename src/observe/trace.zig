@@ -15,6 +15,7 @@
 //! Handlers see `req.trace_id` and `req.span_id`; `outgoing(req, &buf)`
 //! makes the `traceparent` to pass downstream.
 const std = @import("std");
+const builtin = @import("builtin");
 const dusty = @import("dusty");
 const common = @import("common.zig");
 const Client = @import("../client.zig").Client;
@@ -89,6 +90,40 @@ pub fn recording(req: *const dusty.Request) bool {
     return !std.mem.eql(u8, &p.span_id, req.span_id);
 }
 
+/// The `traceparent` of the context `req` runs in, for work it hands on
+/// (a job it enqueues): its span when it is recorded here (`outgoing`),
+/// else the caller's `traceparent` as it came, every trace flag kept (W3C
+/// Level 2's random flag too), so an app or a binding with no tracing of
+/// its own, or a request passed on unrecorded, still hands it on
+/// unchanged. A later version's header is written as version 00 with its
+/// IDs and flags. Null when there is neither.
+pub fn current(req: *const dusty.Request, buf: *[55]u8) ?[]const u8 {
+    if (recording(req)) return outgoing(req, buf);
+    const header = std.mem.trim(u8, req.headers.get("traceparent") orelse return null, " \t");
+    const caller = Context.parse(header) orelse return null;
+    const flags = header[53..55];
+    return std.fmt.bufPrint(buf, "00-{s}-{s}-{c}{c}", .{ &caller.trace_id, &caller.span_id, std.ascii.toLower(flags[0]), std.ascii.toLower(flags[1]) }) catch null;
+}
+
+/// The caller's `tracestate` to keep with `current`'s context: only
+/// beside a valid `traceparent` (W3C Trace Context §3.3), trimmed, and
+/// null past `max_trace_state` bytes or when empty.
+pub fn currentState(req: *const dusty.Request) ?[]const u8 {
+    if (Context.parse(req.headers.get("traceparent") orelse return null) == null) return null;
+    const ts = std.mem.trim(u8, req.headers.get("tracestate") orelse return null, " \t");
+    if (ts.len == 0 or ts.len > max_trace_state) return null;
+    return ts;
+}
+
+/// The longest `tracestate` a link keeps (W3C asks vendors to pass on
+/// at least 512 bytes; a longer one is left off rather than cut).
+pub const max_trace_state = 512;
+
+/// A new trace ID or span ID (`out.len` 32 or 16), in hex.
+pub fn newId(io: std.Io, out: []u8) void {
+    randomHex(io, out);
+}
+
 /// A finished span, as the exporter queues it.
 pub const Span = struct {
     trace_id: [32]u8,
@@ -108,6 +143,44 @@ pub const Span = struct {
     /// span, child of the request's; `Exporter.child`), when the HTTP
     /// fields above are unused. Null for the request's own span.
     db: ?Db = null,
+    /// Set for a job's run (a CONSUMER span, `Exporter.job`), when the
+    /// HTTP fields above are unused. A span is copied by value, but this
+    /// is owned by one copy at a time: `Exporter.job` makes it,
+    /// `Exporter.submit` takes it, and the exporter frees it once the span
+    /// is sent or dropped (`Exporter.release`); a test that takes spans
+    /// off the queue owns them through `Exporter.takeQueued`.
+    job: ?*JobRun = null,
+
+    /// One run of a job: OpenTelemetry's messaging attributes for a
+    /// process span (`messaging.system` "anole", the queue as
+    /// `messaging.destination.name`, the job's id as
+    /// `messaging.message.id`) and Anole's `anole.job.*`, and the link to
+    /// the context that enqueued it (otelriver, opentelemetry_oban and
+    /// the Sidekiq instrumentation link by default).
+    ///
+    /// owner: the Exporter (SAFETY.md M1), through the span that carries
+    /// it. M2 class: child of the exporter (on its allocator), freed by
+    /// `Exporter.release` exactly once: when the span is sent, dropped,
+    /// left over at `close`, or given back by a test's `Taken.deinit`.
+    pub const JobRun = struct {
+        queue: []const u8,
+        kind: []const u8,
+        id: i64,
+        attempt: u16,
+        max_attempts: u16,
+        /// `anole.job.outcome`: completed, retried, dead, snoozed,
+        /// interrupted, lost.
+        outcome: []const u8,
+        /// `error.type` when the handler failed (the span's status is
+        /// then ERROR); empty otherwise.
+        error_type: []const u8 = "",
+        /// The enqueuer's context: a link, not the parent.
+        link: ?Context = null,
+        /// The enqueuer's `tracestate`, kept on the link.
+        link_state: []const u8 = "",
+        /// The exporter's copy of the strings above (`Exporter.job`).
+        _block: []u8 = &.{},
+    };
 
     /// OpenTelemetry's database attributes, cut to fit.
     pub const Db = struct {
@@ -201,6 +274,16 @@ pub const Options = struct {
 /// task of its own, through `client`. A full queue drops spans rather than
 /// slow requests. `app.tracing(.{})` makes one owned by the server,
 /// already started.
+///
+/// owner: whoever made it (`App` for `app.tracing`). M2 class:
+/// process-wide. Teardown (M5) runs in two steps, as the OpenTelemetry
+/// SDK's Shutdown: `close` sends what is queued and stops the task (it
+/// needs `client`'s server still running), after which `submit`, `job`
+/// and `child` are no-ops that allocate nothing and count the span as
+/// dropped ("after Shutdown, subsequent calls ... SHOULD be ignored");
+/// `deinit` then frees its memory, once nothing can call it any more. A
+/// database, S3, SMTP or jobs observer that settles a call between the
+/// two (the App closes its exporter first) has its span dropped.
 pub const Exporter = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -226,6 +309,11 @@ pub const Exporter = struct {
     dropped: std.atomic.Value(u64) = .init(0),
     /// Spans the collector accepted.
     exported: std.atomic.Value(u64) = .init(0),
+    /// M5's teardown state: alive, then closed (`close`), then dead
+    /// (`deinit`).
+    state: std.atomic.Value(State) = .init(.alive),
+
+    pub const State = enum(u8) { alive, closed, dead };
 
     /// An exporter with its queue allocated, sending through `client` (the
     /// server's, `app.client()`). Nothing is sent until `start`. `client`'s
@@ -240,13 +328,53 @@ pub const Exporter = struct {
         self.task = try self.io.concurrent(run, .{self});
     }
 
-    /// Sends what is queued and stops the task.
-    pub fn deinit(self: *Exporter) void {
+    /// Sends what is queued and stops the task, then takes no more spans:
+    /// from here on `submit`, `job` and `child` drop theirs (counted in
+    /// `dropped`) and allocate nothing, and `flush` returns at once. The
+    /// memory stays until `deinit`. Once only (a second close panics in
+    /// debug builds).
+    pub fn close(self: *Exporter) void {
+        if (self.state.cmpxchgStrong(.alive, .closed, .acq_rel, .acquire)) |was| {
+            if (builtin.mode == .debug) std.debug.panic("trace.Exporter.close on an exporter already {t}", .{was});
+            return;
+        }
         self.closing.set(self.io);
         self.kick.set(self.io);
         self.queue.close(self.io);
         if (self.task) |*t| t.await(self.io);
+        self.task = null;
+        // What was never sent (no `start`, or past the task's last batch):
+        // its job runs are freed. No span can be queued after the close.
+        var rest: [16]Span = undefined;
+        while (true) {
+            const n = self.queue.getUncancelable(self.io, &rest, 0) catch break;
+            if (n == 0) break;
+            for (rest[0..n]) |span| self.release(span);
+        }
+    }
+
+    /// `close`, when not done yet, then frees the queue. Nothing may use
+    /// the exporter afterwards (a use panics in debug builds).
+    pub fn deinit(self: *Exporter) void {
+        if (self.state.load(.acquire) == .alive) self.close();
+        const was = self.state.swap(.dead, .acq_rel);
+        if (was == .dead) {
+            if (builtin.mode == .debug) @panic("trace.Exporter.deinit twice");
+            return;
+        }
         self.gpa.free(self.buffer);
+    }
+
+    /// Whether spans are still taken; past `close`, the span is counted as
+    /// dropped. A use after `deinit` panics in debug builds.
+    fn taking(self: *Exporter) bool {
+        switch (self.state.load(.acquire)) {
+            .alive => return true,
+            .closed => {},
+            .dead => if (builtin.mode == .debug) @panic("trace.Exporter used after deinit"),
+        }
+        _ = self.dropped.fetchAdd(1, .monotonic);
+        return false;
     }
 
     /// Sends the spans queued so far and waits until the collector has
@@ -255,7 +383,7 @@ pub const Exporter = struct {
     /// (AWS Lambda between invocations). One caller at a time; others wait
     /// their turn. Does nothing before `start`.
     pub fn flush(self: *Exporter, timeout: std.Io.Duration) void {
-        if (self.task == null) return;
+        if (self.state.load(.acquire) != .alive or self.task == null) return;
         self.flush_lock.lockUncancelable(self.io);
         defer self.flush_lock.unlock(self.io);
         const target = self.queued.load(.acquire);
@@ -272,9 +400,10 @@ pub const Exporter = struct {
     /// Queues a client span for a call made while serving `req` (a
     /// database query), as a child of the request's span, from
     /// `start_ns` to `end_ns` (real clock). Nothing when the request is
-    /// not recorded (`recording`).
+    /// not recorded (`recording`); after `close`, counted as dropped.
     pub fn child(self: *Exporter, req: *const dusty.Request, start_ns: i96, end_ns: i96, db: Span.Db) void {
         if (!recording(req)) return;
+        if (!self.taking()) return;
         var span: Span = undefined;
         @memcpy(&span.trace_id, req.trace_id[0..32]);
         randomHex(req.io, &span.span_id);
@@ -296,12 +425,117 @@ pub const Exporter = struct {
         span.route_len = 0;
         span.status_code = 0;
         span.db = db;
+        span.job = null;
         self.submit(span);
     }
 
+    /// Queues the CONSUMER span of one run of a job, `process <queue>`,
+    /// from `start_ns` to `end_ns` (real clock): a root of trace
+    /// `trace_id` (the run's own, `newId`) with `span_id`, linked to
+    /// `run.link` (OpenTelemetry's messaging conventions: the process span
+    /// SHOULD link to the creation context, a parent is NOT RECOMMENDED by
+    /// default). `run`'s slices are copied. Recorded when the exporter
+    /// records every request (`sample_all`), or when the enqueuer's
+    /// context was sampled (`recordsJob`). After `close`, counted as
+    /// dropped, with nothing allocated.
+    pub fn job(self: *Exporter, trace_id: [32]u8, span_id: [16]u8, start_ns: i96, end_ns: i96, attrs: Span.JobRun) void {
+        if (!self.taking()) return;
+        const owned = self.ownJob(attrs) catch {
+            _ = self.dropped.fetchAdd(1, .monotonic);
+            return;
+        };
+        // SAFETY: every field the encoder reads for a job span is set below (`method`, `route` stay unread at length 0).
+        var span: Span = undefined;
+        span.trace_id = trace_id;
+        span.span_id = span_id;
+        span.parent_span_id = null;
+        const name = std.fmt.bufPrint(&span.name, "process {s}", .{owned.queue}) catch span.name[0..0];
+        span.name_len = @intCast(name.len);
+        span.start_ns = start_ns;
+        span.end_ns = end_ns;
+        span.method_len = 0;
+        span.route_len = 0;
+        span.status_code = 0;
+        span.db = null;
+        span.job = owned;
+        self.submit(span);
+    }
+
+    /// Whether a run of a job whose enqueuer's context is `link` is
+    /// recorded: always under `sample_all`, else when that context was
+    /// sampled, as the middleware records a request.
+    pub fn recordsJob(self: *const Exporter, link: ?Context) bool {
+        if (self.options.sample_all) return true;
+        return if (link) |l| l.sampled else false;
+    }
+
+    fn ownJob(self: *Exporter, attrs: Span.JobRun) !*Span.JobRun {
+        const total = attrs.queue.len + attrs.kind.len + attrs.outcome.len + attrs.error_type.len + attrs.link_state.len;
+        const bytes = try self.gpa.alloc(u8, total);
+        errdefer self.gpa.free(bytes);
+        const owned = try self.gpa.create(Span.JobRun);
+        var at: usize = 0;
+        const copy = struct {
+            fn f(dst: []u8, pos: *usize, src: []const u8) []const u8 {
+                @memcpy(dst[pos.*..][0..src.len], src);
+                defer pos.* += src.len;
+                return dst[pos.*..][0..src.len];
+            }
+        }.f;
+        owned.* = attrs;
+        owned.queue = copy(bytes, &at, attrs.queue);
+        owned.kind = copy(bytes, &at, attrs.kind);
+        owned.outcome = copy(bytes, &at, attrs.outcome);
+        owned.error_type = copy(bytes, &at, attrs.error_type);
+        owned.link_state = copy(bytes, &at, attrs.link_state);
+        owned._block = bytes;
+        return owned;
+    }
+
+    /// Spans a test took off the queue (`takeQueued`): owned by this
+    /// value until `deinit` releases them, once.
+    pub const Taken = struct {
+        exporter: *Exporter,
+        spans: []Span,
+
+        /// Releases every span (what each owns); afterwards `spans` is
+        /// empty, so a second call releases nothing.
+        pub fn deinit(t: *Taken) void {
+            for (t.spans) |span| t.exporter.release(span);
+            t.spans = &.{};
+        }
+    };
+
+    /// For tests: up to `buf.len` queued spans, taken off the queue
+    /// without waiting, owned by the result (`defer taken.deinit()`), so a
+    /// test can neither leak a job run nor release one twice.
+    pub fn takeQueued(self: *Exporter, buf: []Span) std.Io.QueueClosedError!Taken {
+        const n = try self.queue.getUncancelable(self.io, buf, 0);
+        return .{ .exporter = self, .spans = buf[0..n] };
+    }
+
+    /// Frees what `span` owns (a job run's attributes): once it is sent,
+    /// dropped, left over at `close`, or given back by `Taken.deinit`.
+    pub fn release(self: *Exporter, span: Span) void {
+        const attrs = span.job orelse return;
+        self.gpa.free(attrs._block);
+        self.gpa.destroy(attrs);
+    }
+
+    /// Queues `span`, taking what it owns (`span.job`): the exporter frees
+    /// it once the span is sent or dropped, so the caller's copy must not
+    /// be released or submitted again. After `close` the span is dropped
+    /// (counted) and what it owns freed at once.
     pub fn submit(self: *Exporter, span: Span) void {
+        if (!self.taking()) {
+            self.release(span);
+            return;
+        }
         const n = self.queue.putUncancelable(self.io, &.{span}, 0) catch 0;
-        if (n == 0) _ = self.dropped.fetchAdd(1, .monotonic) else _ = self.queued.fetchAdd(1, .release);
+        if (n == 0) {
+            self.release(span);
+            _ = self.dropped.fetchAdd(1, .monotonic);
+        } else _ = self.queued.fetchAdd(1, .release);
     }
 
     fn run(self: *Exporter) void {
@@ -313,9 +547,11 @@ pub const Exporter = struct {
                 // Closed: one last drain of what is left.
                 const rest = self.queue.getUncancelable(self.io, batch, 0) catch 0;
                 if (rest > 0) self.send(batch[0..rest]);
+                for (batch[0..rest]) |span| self.release(span);
                 return;
             };
             self.send(batch[0..n]);
+            for (batch[0..n]) |span| self.release(span);
             _ = self.finished.fetchAdd(n, .release);
             self.progress.set(self.io);
             // A pause before the next batch, cut short by `deinit` and
@@ -364,6 +600,10 @@ pub fn encode(arena: std.mem.Allocator, service: []const u8, spans: []const Span
         if (i > 0) try w.writeByte(',');
         try w.print("{{\"traceId\":\"{s}\",\"spanId\":\"{s}\",", .{ &s.trace_id, &s.span_id });
         if (s.parent_span_id) |p| try w.print("\"parentSpanId\":\"{s}\",", .{&p});
+        if (s.job) |j| {
+            try encodeJob(w, s, j);
+            continue;
+        }
         if (s.db) |d| {
             if (d.kind == .rpc or d.kind == .mail) {
                 try w.print("\"name\":{f},\"kind\":3,\"startTimeUnixNano\":\"{d}\",\"endTimeUnixNano\":\"{d}\",", .{ std.json.fmt(s.name[0..s.name_len], .{}), s.start_ns, s.end_ns });
@@ -428,6 +668,32 @@ pub fn encode(arena: std.mem.Allocator, service: []const u8, spans: []const Span
     return out.written();
 }
 
+/// A job run's span: CONSUMER, its link, the messaging and `anole.job.*`
+/// attributes, ERROR with `error.type` when the handler failed.
+fn encodeJob(w: *std.Io.Writer, s: Span, j: *const Span.JobRun) !void {
+    try w.print("\"name\":{f},\"kind\":5,\"startTimeUnixNano\":\"{d}\",\"endTimeUnixNano\":\"{d}\",", .{ std.json.fmt(s.name[0..s.name_len], .{}), s.start_ns, s.end_ns });
+    if (j.link) |l| {
+        try w.print("\"links\":[{{\"traceId\":\"{s}\",\"spanId\":\"{s}\",", .{ &l.trace_id, &l.span_id });
+        if (j.link_state.len > 0) try w.print("\"traceState\":{f},", .{std.json.fmt(j.link_state, .{})});
+        // The W3C trace flags (OTLP's low byte).
+        try w.print("\"flags\":{d}}}],", .{@as(u8, @intFromBool(l.sampled))});
+    }
+    const strings = [_]struct { []const u8, []const u8 }{
+        .{ "messaging.system", "anole" },
+        .{ "messaging.destination.name", j.queue },
+        .{ "messaging.operation.type", "process" },
+        .{ "anole.job.kind", j.kind },
+        .{ "anole.job.outcome", j.outcome },
+        .{ "error.type", j.error_type },
+    };
+    try w.writeAll("\"attributes\":[");
+    try w.print("{{\"key\":\"messaging.message.id\",\"value\":{{\"stringValue\":\"{d}\"}}}}", .{j.id});
+    try w.print(",{{\"key\":\"anole.job.attempt\",\"value\":{{\"intValue\":\"{d}\"}}}}", .{j.attempt});
+    try w.print(",{{\"key\":\"anole.job.max_attempts\",\"value\":{{\"intValue\":\"{d}\"}}}}", .{j.max_attempts});
+    for (strings) |a| if (a[1].len > 0) try w.print(",{{\"key\":\"{s}\",\"value\":{{\"stringValue\":{f}}}}}", .{ a[0], std.json.fmt(a[1], .{}) });
+    try w.print("],\"status\":{{\"code\":{d}}}}}", .{@as(u8, if (j.error_type.len > 0) 2 else 0)});
+}
+
 /// Starts a span for each request (continuing the caller's trace), sets
 /// `req.trace_id`/`span_id`, and queues the span when the response is done.
 pub const Middleware = struct {
@@ -456,6 +722,7 @@ pub const Middleware = struct {
         };
         var span: Span = undefined;
         span.db = null;
+        span.job = null;
         if (parent) |p| span.trace_id = p.trace_id else randomHex(req.io, &span.trace_id);
         randomHex(req.io, &span.span_id);
         span.parent_span_id = if (parent) |p| p.span_id else null;

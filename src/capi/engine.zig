@@ -285,6 +285,14 @@ pub const Slot = struct {
     /// streamed answer's body (consumer to executor).
     in: Pipe = .{},
     out: Pipe = .{},
+    /// A detached request's memory went (`detachedAborted` met another
+    /// thread's call on it and orphaned the slot): `requestTrace` must not
+    /// read `req` any more, though the slot may be `out` again once that
+    /// call hands it back. Set by the executor, read by a consumer under
+    /// its pin, both `.seq_cst` (a Dekker handshake with the word: either
+    /// the executor sees the pin and waits it out, or the pin sees this).
+    /// Reset with `orphan` when the slot is released.
+    gone: std.atomic.Value(bool) = .init(false),
 
     // Executor-local from here.
     /// The request's response is detached (HTTP/2, HTTP/3): no task waits.
@@ -662,6 +670,7 @@ pub const Exec = struct {
         }
         s.detached = null;
         s.orphan = false;
+        s.gone.store(false, .monotonic);
         s.abandoned = false;
         s.body_error = null;
         s.claims = "";
@@ -2922,9 +2931,20 @@ pub fn detachedAborted(ctx: *anyopaque) void {
             .polling => std.atomic.spinLoopHint(),
             // The consumer is answering, or has: the capi task frees it.
             // The request body may live in the request's memory, which
-            // goes once this returns: reads of it end now.
+            // goes once this returns: reads of it end now. A call still
+            // `responding` may hand the slot back to `out` (a gRPC
+            // send_headers, an answer call that failed), where
+            // `requestTrace` could pin it: `gone` tells the pin the
+            // memory went, and a pin taken before this saw it is waited
+            // out (SAFETY.md M3, T4: never a freed pointer).
             .responding, .done, .streaming => {
                 s.orphan = true;
+                s.gone.store(true, .seq_cst);
+                while (true) {
+                    const now_w = s.word.load(.seq_cst);
+                    if (genOf(now_w) != gen or stateOf(now_w) != .polling) break;
+                    std.atomic.spinLoopHint();
+                }
                 x.closePipe(&s.in, gen, si);
                 return;
             },
@@ -3511,6 +3531,110 @@ pub fn requestTag(e: *Engine, hv: u64, buf: *[64]u8) ?struct { rid: []const u8, 
     return .{ .rid = buf[0..n], .route = route };
 }
 
+/// A request's trace context, as work it hands on keeps it.
+pub const TraceContext = struct {
+    traceparent: ?[]const u8 = null,
+    tracestate: ?[]const u8 = null,
+};
+
+/// Request (or gRPC call) `hv`'s trace context (`observe.trace.current`
+/// and `currentState`), copied into `a` on the caller's thread: what
+/// `anole_jobs_enqueue` with `opts.req` stores with its jobs. The request
+/// is pinned while it is read, as `poll` pins it to copy its head: `out`
+/// goes to `polling` and back, and meanwhile its task waits (HTTP/1.1) or
+/// a detached request's abort spins (HTTP/2, HTTP/3), so its memory
+/// stays; calls on the handle from other consumer threads wait the pin
+/// out (`claimOut`). A detached request whose stream ended while another
+/// thread's call held it (`Slot.gone`, set by `detachedAborted`) has no
+/// memory left to read, even once that call hands it back to `out`: the
+/// pin sees `gone` and reads nothing. The pin only copies into stack
+/// buffers (SAFETY.md L5: an executor may spin on it, so it never
+/// allocates or waits); the copies go into `a` after it. Nothing is
+/// copied at dispatch: requests that hand nothing on pay nothing (the
+/// header scan stays off the hot path).
+///
+/// Empty (no context) when the request carries none, when it is no
+/// longer owed an answer (answered, or ended), and whenever its slot is
+/// not `out` at the call: once its answer has started streaming
+/// (`anole_req_stream`, a gRPC server stream after its first message), or
+/// while another thread's call is storing part of its answer (a gRPC
+/// send_headers or non-final send). The jobs are still enqueued.
+pub fn requestTrace(e: *Engine, hv: u64, a: std.mem.Allocator) error{OutOfMemory}!TraceContext {
+    const h = Handle.decode(hv);
+    if (h.kind != .request and h.kind != .grpc_call) return .{};
+    _, const s, _ = slotOfKind(e, hv, h.kind) catch return .{};
+    // SAFETY: written by the copies below before their first `[0..len]` read.
+    var tp_buf: [55]u8 = undefined;
+    // SAFETY: as `tp_buf`.
+    var tp_out: [55]u8 = undefined;
+    // SAFETY: as `tp_buf`.
+    var ts_buf: [anole.observe.trace.max_trace_state]u8 = undefined;
+    var tp_len: usize = 0;
+    var ts_len: usize = 0;
+    {
+        if (claimOut(s, h.gen, .polling) != null) return .{};
+        defer s.word.store(pack(h.gen, .out), .release);
+        if (builtin.is_test) if (test_pin) |p| testHold(p);
+        // After the pin, `.seq_cst` as `detachedAborted`'s store: the
+        // request's memory went while another call held the slot.
+        if (s.gone.load(.seq_cst)) return .{};
+        const req = s.req;
+        const tp = anole.observe.trace.current(req, &tp_buf) orelse return .{};
+        @memcpy(tp_out[0..tp.len], tp);
+        tp_len = tp.len;
+        if (anole.observe.trace.currentState(req)) |ts| {
+            @memcpy(ts_buf[0..ts.len], ts);
+            ts_len = ts.len;
+        }
+    }
+    return .{
+        .traceparent = try a.dupe(u8, tp_out[0..tp_len]),
+        .tracestate = if (ts_len > 0) try a.dupe(u8, ts_buf[0..ts_len]) else null,
+    };
+}
+
+/// Moves slot `s` of generation `gen` from `out` to `to` (`responding` for
+/// an answer, `polling` for a pin), waiting out a pin under way: a
+/// consumer-held handle is `polling` only while `requestTrace` on another
+/// thread copies from its request, a few hundred bytes with nothing that
+/// allocates or waits (L5), so the wait is a short spin, as a seqlock
+/// reader's retry. A pinned live handle is never taken for over. Null when
+/// moved; else the word that refused it (another state or generation).
+/// The move is `.seq_cst`: a pin's half of `Slot.gone`'s handshake.
+pub fn claimOut(s: *Slot, gen: u32, to: SlotState) ?u64 {
+    const pinned = pack(gen, .polling);
+    while (true) {
+        const w = s.word.cmpxchgStrong(pack(gen, .out), pack(gen, to), .seq_cst, .monotonic) orelse {
+            if (builtin.is_test and to == .responding) if (test_answer_hold) |p| testHold(p);
+            return null;
+        };
+        if (w != pinned) return w;
+        if (builtin.is_test) if (test_pin) |p| p.release.store(true, .release);
+        std.atomic.spinLoopHint();
+    }
+}
+
+/// A test hook (test builds only, as h3's `test_fail_accept`): while set,
+/// `requestTrace` holds its pin open until `release` is set, by the test or
+/// by the first call that meets the pin, so a test can overlap the pin
+/// with other calls on the handle without counting on timing.
+pub const TestPin = struct {
+    /// The hooked call is inside its hold.
+    held: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+};
+pub var test_pin: if (builtin.is_test) ?*TestPin else void = if (builtin.is_test) null else {};
+/// A test hook (test builds only): while set, the next answer call's
+/// claim (`claimOut` to `responding`) holds the slot in `responding` until
+/// the test sets `release`, so a test can end a detached request's stream
+/// while another thread's call is on it.
+pub var test_answer_hold: if (builtin.is_test) ?*TestPin else void = if (builtin.is_test) null else {};
+
+fn testHold(p: *TestPin) void {
+    p.held.store(true, .release);
+    while (!p.release.load(.acquire)) std.Thread.yield() catch {};
+}
+
 /// The slot a handle of `kind` names, if it could be one: the generation
 /// is the caller's to check (a stale handle finds its slot moved on).
 pub fn slotOfKind(e: *Engine, hv: u64, kind: Handle.Kind) HandleError!struct { *Exec, *Slot, Handle } {
@@ -3524,11 +3648,11 @@ pub fn slotOfKind(e: *Engine, hv: u64, kind: Handle.Kind) HandleError!struct { *
     return .{ x, s, h };
 }
 
-/// Claims slot `hv` for an answer: `out` to `responding`. `Over` when it is
-/// no longer owed.
+/// Claims slot `hv` for an answer: `out` to `responding`, waiting out a
+/// pin (`claimOut`). `Over` when it is no longer owed.
 fn claimOrOver(e: *Engine, hv: u64) HandleError!struct { *Exec, *Slot, Handle } {
     const x, const s, const h = try slotOf(e, hv);
-    if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .responding), .acquire, .monotonic) != null) return error.Over;
+    if (claimOut(s, h.gen, .responding) != null) return error.Over;
     return .{ x, s, h };
 }
 
@@ -3651,7 +3775,7 @@ pub fn abort(e: *Engine, hv: u64) AnswerError!void {
         }
         s.out.release();
     }
-    if (s.word.cmpxchgStrong(pack(h.gen, .out), pack(h.gen, .responding), .acquire, .monotonic) != null) return error.Over;
+    if (claimOut(s, h.gen, .responding) != null) return error.Over;
     s.reply = .abort;
     s.headers.clearRetainingCapacity();
     s.bytes.clearRetainingCapacity();

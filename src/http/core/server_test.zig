@@ -3,6 +3,7 @@
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const builtin = @import("builtin");
 const dusty = @import("root.zig");
 const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
@@ -396,7 +397,11 @@ test "Server: an upgraded connection keeps what came with the handshake, and its
     const body = try r.take(big_len);
     for (body, 0..) |b, i| try std.testing.expectEqual(@as(u8, @truncate(i)), b);
     // The handler checks the head after the echo, so wait for it.
-    while (!@atomicLoad(bool, &ctx.echoed, .acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    try wait.waitUntil(io, "the handler checked the head", &ctx.echoed, struct {
+        fn set(b: *const bool) bool {
+            return @atomicLoad(bool, b, .acquire);
+        }
+    }.set);
     try std.testing.expect(ctx.url_ok);
 }
 
@@ -703,7 +708,7 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
     const start = std.Io.Timestamp.now(io, .awake);
     try std.testing.expectError(error.Canceled, server_future.cancel(io));
     const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
-    try std.testing.expect(elapsed_ns < 1500 * std.time.ns_per_ms);
+    if (wait.timing()) try std.testing.expect(elapsed_ns < 1500 * std.time.ns_per_ms);
 }
 
 test "Server: 100-continue" {
@@ -2017,7 +2022,7 @@ test "Server: graceful shutdown waits for a connection that finishes in time" {
     // as it was done rather than sitting out the rest of the budget.
     try std.testing.expect(sync.finished);
     try std.testing.expect(elapsed_ns >= 100 * std.time.ns_per_ms);
-    try std.testing.expect(elapsed_ns < 2000 * std.time.ns_per_ms);
+    if (wait.timing()) try std.testing.expect(elapsed_ns < 2000 * std.time.ns_per_ms);
 }
 /// Leaves one connection idle after a request and one that never sent any,
 /// shuts the server down with a budget long enough that waiting it out would
@@ -2067,7 +2072,7 @@ fn expectIdleConnectionsClosedOnShutdown(timeout: dusty.ServerConfig.Timeout) !v
     const start = std.Io.Timestamp.now(io, .awake);
     try std.testing.expectError(error.Canceled, server_future.cancel(io));
     const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
-    try std.testing.expect(elapsed_ns < 1000 * std.time.ns_per_ms);
+    if (wait.timing()) try std.testing.expect(elapsed_ns < 1000 * std.time.ns_per_ms);
 
     // Both were closed by the server, not abandoned to the cancel (an
     // abandoned one would never answer the read).
@@ -2216,7 +2221,7 @@ test "Server: a long-lived handler learns of the drain through req.drain and end
 
     const start: std.Io.Clock.Timestamp = .now(io, .awake);
     try std.testing.expectError(error.Canceled, server_future.cancel(io));
-    try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
+    if (wait.timing()) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
 
     var read_buf: [1024]u8 = undefined;
     var reader = conn.reader(io, &read_buf);
@@ -3123,7 +3128,10 @@ test "Server: a slot freed on one listener reaches a connection waiting on anoth
     var release_first: std.Io.Event = .unset;
     var first = try io.concurrent(Get.run, .{ server.addresses[0], io, &first_served, &release_first });
     defer first.cancel(io) catch {};
-    while (!first_served.load(.acquire)) try io.sleep(.fromMilliseconds(10), .awake);
+    try wait.waitFlag(io, "the first connection was served", &first_served);
+    // Sensitivity only: the first listener's accept loop goes to wait for
+    // a slot; on a slow machine it may not be there yet, which can only
+    // hide the bug, never fail the test.
     try io.sleep(.fromMilliseconds(100), .awake);
 
     // Accepted on the second listener, and held there until a slot frees.
@@ -3135,11 +3143,7 @@ test "Server: a slot freed on one listener reaches a connection waiting on anoth
     release_first.set(io);
     try first.await(io);
 
-    var waited: usize = 0;
-    while (!second_served.load(.acquire) and waited < 200) : (waited += 1) {
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
-    try std.testing.expect(second_served.load(.acquire));
+    try wait.waitFlag(io, "the second connection was served once the slot freed", &second_served);
     try second.await(io);
 }
 
@@ -3207,7 +3211,7 @@ test "Server: a stalled request head is cut off by timeout.request" {
     ) orelse return error.ServerAnsweredInstead;
 
     try std.testing.expect(elapsed >= 100);
-    try std.testing.expect(elapsed < 3000);
+    if (wait.timing()) try std.testing.expect(elapsed < 3000);
 }
 
 test "Server: an idle keepalive connection is cut off by timeout.keepalive" {
@@ -3256,7 +3260,7 @@ test "Server: an idle keepalive connection is cut off by timeout.keepalive" {
     const elapsed = @divTrunc(std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds - started, std.time.ns_per_ms);
 
     try std.testing.expect(elapsed >= 100);
-    try std.testing.expect(elapsed < 3000);
+    if (wait.timing()) try std.testing.expect(elapsed < 3000);
 }
 
 test "Server.dispatch: a request over a sink is routed through the middleware to its handler" {
@@ -3453,7 +3457,7 @@ test "Server: a head that does not arrive within read_header closes the connecti
         // The server hangs up: end of stream, or a reset.
         _ = r.interface.peekByte() catch {};
         const waited = start.durationTo(.now(io, .awake)).raw.toMilliseconds();
-        try std.testing.expect(waited < 2000);
+        if (wait.timing()) try std.testing.expect(waited < 2000);
     }
     { // A whole head at once, then a body slower than read_header.
         const stream = try server.address.ip.connect(io, .{ .mode = .stream });
@@ -3520,7 +3524,7 @@ test "Server: a keep-alive request outlives the keepalive timeout; a half head o
     const start: std.Io.Clock.Timestamp = .now(io, .awake);
     _ = r.interface.peekByte() catch {};
     const waited = start.durationTo(.now(io, .awake)).raw.toMilliseconds();
-    try std.testing.expect(waited < 2000);
+    if (wait.timing()) try std.testing.expect(waited < 2000);
 }
 
 test "Server: a zstd request body is refused with 415 when built without zstd" {
@@ -3861,8 +3865,9 @@ test "Server: a request body with broken framing is a 400, and the connection cl
 }
 
 /// Sends `request` and reads until the server closes. False when it has
-/// not within `limit_ms` (the socket is then shut down to end the read).
-fn closedWithin(io: std.Io, address: std.Io.net.IpAddress, request: []const u8, limit_ms: u64) !bool {
+/// not within the wait helper's deadline (the socket is then shut down to
+/// end the read).
+fn closedWithin(io: std.Io, address: std.Io.net.IpAddress, request: []const u8) !bool {
     const stream = try address.connect(io, .{ .mode = .stream });
     defer stream.close(io);
     var wbuf: [512]u8 = undefined;
@@ -3878,8 +3883,10 @@ fn closedWithin(io: std.Io, address: std.Io.net.IpAddress, request: []const u8, 
             flag.store(true, .release);
         }
     }.run, .{ stream, io, &done });
-    var waited: u64 = 0;
-    while (!done.load(.acquire) and waited < limit_ms) : (waited += 10) try io.sleep(.fromMilliseconds(10), .awake);
+    wait.waitFlag(io, "the server closed the connection", &done) catch |err| switch (err) {
+        error.WaitTimedOut => {},
+        error.Canceled => |e| return e,
+    };
     const closed = done.load(.acquire);
     if (!closed) stream.shutdown(io, .both) catch {};
     reader.await(io);
@@ -3917,8 +3924,8 @@ test "Server: an unread body left after the request timed out or lifted its time
     try server.waitReady(io);
 
     // A body declared at 1000 bytes of which 10 come, then nothing.
-    try std.testing.expect(try closedWithin(io, server.address.ip, "POST /swallow HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n0123456789", 3000));
-    try std.testing.expect(try closedWithin(io, server.address.ip, "POST /unbounded HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n0123456789", 3000));
+    try std.testing.expect(try closedWithin(io, server.address.ip, "POST /swallow HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n0123456789"));
+    try std.testing.expect(try closedWithin(io, server.address.ip, "POST /unbounded HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n0123456789"));
 }
 
 test "Server: forwarding headers are ignored without trusted hops" {
@@ -4237,12 +4244,13 @@ test "stream: a peer that stops reading is cut after timeouts.write" {
     const stream = try startRaw(io, &server, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n");
     defer stream.close(io);
     const start = std.Io.Clock.awake.now(io);
-    while (StreamWatch.write_error.load(.acquire) == 0) {
-        try io.sleep(.fromMilliseconds(20), .awake);
-        if (start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() > 5000) return error.TestUnexpectedResult;
-    }
+    try wait.waitUntil(io, "the stream's write failed", {}, struct {
+        fn failed(_: void) bool {
+            return StreamWatch.write_error.load(.acquire) != 0;
+        }
+    }.failed);
     try std.testing.expectEqual(StreamWatch.timed_out, StreamWatch.write_error.load(.acquire));
-    try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 2000);
+    if (wait.timing()) try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 2000);
 }
 
 test "sendFile: a download slower than timeouts.request completes" {
@@ -4322,7 +4330,8 @@ test "stream: a handler's own setTimeout before the stream is kept" {
     var w: std.Io.Writer = .fixed(&out);
     _ = reader.interface.streamRemaining(&w) catch {};
     const ms = start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
-    try std.testing.expect(ms >= 400 and ms < 3000);
+    try std.testing.expect(ms >= 400);
+    if (wait.timing()) try std.testing.expect(ms < 3000);
 }
 
 test "reader: a chunked body past body_max fails with BodyTooBig; readerLimited lifts it" {

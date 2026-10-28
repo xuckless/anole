@@ -1341,6 +1341,11 @@ fn serveTask(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!v
     if (go.if_modified_since == null) if (req.headers.get("If-Modified-Since")) |v| if (@import("../s3/util.zig").parseHttpDate(v)) |t| {
         go.if_modified_since = db.Time.fromSeconds(t);
     };
+    // S3 applies RFC 9110 13.2.2's order itself (If-Unmodified-Since only
+    // without If-Match), so both go on as the Zig path's `serve` sends them.
+    if (go.if_unmodified_since == null) if (req.headers.get("If-Unmodified-Since")) |v| if (@import("../s3/util.zig").parseHttpDate(v)) |t| {
+        go.if_unmodified_since = db.Time.fromSeconds(t);
+    };
     var r: Res = .{ .user_data = c.user_data, .op = abi.S3_OP_SERVE };
     var hl: CHeaders = .{};
     if (is_head) {

@@ -1877,8 +1877,10 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn deinit(self: *Self) void {
             const extras = self.extras;
             // First: it sends what is queued through the client, on the
-            // runtime.
-            if (extras.exporter) |e| e.deinit();
+            // runtime. Closed, it drops (and counts) the spans of what
+            // settles during the rest of the teardown (jobs runs, database
+            // calls), allocating nothing; its memory goes at the end.
+            if (extras.exporter) |e| e.close();
             if (comptime features.http3) if (self.h3) |ep| ep.deinit();
             self.server.deinit();
             // ---- p3/net ----
@@ -1909,6 +1911,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             for (self.certs) |cs| cs.deinit();
             if (self.blocking_pool) |p| p.deinit();
             self.rt.deinit();
+            // Nothing can reach it any more: every task has stopped.
+            if (extras.exporter) |e| e.deinit();
             if (comptime features.console) if (self.console_stopped) |stopped| stopped.release();
             server_on_thread = false;
             self.arena.deinit();

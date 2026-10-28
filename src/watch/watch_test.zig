@@ -2,6 +2,7 @@
 //! shared-connection source hands them over.
 
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const root = @import("root.zig");
 const sse = @import("../sse/root.zig");
 
@@ -28,14 +29,17 @@ fn newWatch(topics: *sse.Topics, topic: []const u8, extra: []const root.Target) 
     return w;
 }
 
-fn waitFor(fake: *sse.out_mod.Fake, needle: []const u8) void {
-    while (true) {
-        fake.mutex.lockUncancelable(io);
-        const found = std.mem.indexOf(u8, fake.bytes.items, needle) != null;
-        fake.mutex.unlock(io);
-        if (found) return;
-        io.sleep(.fromMilliseconds(1), .awake) catch return;
-    }
+fn waitFor(fake: *sse.out_mod.Fake, needle: []const u8) !void {
+    const C = struct {
+        fake: *sse.out_mod.Fake,
+        needle: []const u8,
+        fn found(c: @This()) bool {
+            c.fake.mutex.lockUncancelable(io);
+            defer c.fake.mutex.unlock(io);
+            return std.mem.indexOf(u8, c.fake.bytes.items, c.needle) != null;
+        }
+    };
+    try wait.waitUntil(io, "the subscriber's output holds the text", C{ .fake = fake, .needle = needle }, C.found);
 }
 
 const Closed = struct {
@@ -55,14 +59,14 @@ test "watch: a fake source publishes to SSE topics, templates {channel}, {op}, {
     Closed.n.store(0, .release);
     const sub = try topics._attach(io, fake.out(), .{ .topics = &.{"room:lobby"}, .on_close = Closed.onClose }, null);
     w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = "{\"room\":\"lobby\",\"n\":1}" });
-    waitFor(&fake, "\"n\":1");
+    try waitFor(&fake, "\"n\":1");
     // Another room: not this subscriber. A payload without the field: skipped.
     w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = "{\"room\":\"other\"}" });
     w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = "{\"x\":1}" });
     try std.testing.expectEqual(@as(u64, 1), w.n_template_skipped.load(.monotonic));
     try std.testing.expect(std.mem.indexOf(u8, fake.bytes.items, "other") == null);
     sse.Topics._gone(sub);
-    while (Closed.n.load(.acquire) < 1) io.sleep(.fromMilliseconds(1), .awake) catch return;
+    try wait.waitAtLeast(io, "the subscriber closed", &Closed.n, 1);
 }
 
 test "watch: a gap reaches a fixed topic, a templated one by prefix" {
@@ -80,14 +84,14 @@ test "watch: a gap reaches a fixed topic, a templated one by prefix" {
     const s1 = try topics._attach(io, fixed.out(), .{ .topics = &.{"orders"}, .on_close = Closed.onClose }, null);
     const s2 = try topics._attach(io, templated.out(), .{ .topics = &.{"room:a"}, .on_close = Closed.onClose }, null);
     w1.gapped("test");
-    waitFor(&fixed, "event: gap");
+    try waitFor(&fixed, "event: gap");
     try std.testing.expect(std.mem.indexOf(u8, fixed.bytes.items, "{\"topics\":[\"orders\"]}") != null);
     w2.gapped("test");
-    waitFor(&templated, "event: gap");
+    try waitFor(&templated, "event: gap");
     try std.testing.expect(std.mem.indexOf(u8, templated.bytes.items, "{\"topics\":[\"room:a\"]}") != null);
     sse.Topics._gone(s1);
     sse.Topics._gone(s2);
-    while (Closed.n.load(.acquire) < 2) io.sleep(.fromMilliseconds(1), .awake) catch return;
+    try wait.waitAtLeast(io, "both subscribers closed", &Closed.n, 2);
 }
 
 const Ctx = struct {
@@ -151,7 +155,7 @@ test "watch: a handler runs events in order; a failing one is logged and the nex
         var buf: [8]u8 = undefined;
         w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = std.fmt.bufPrint(&buf, "e{d}", .{i}) catch unreachable });
     }
-    while (Seen.count.load(.acquire) < 4) io.sleep(.fromMilliseconds(1), .awake) catch return;
+    try wait.waitAtLeast(io, "the handler saw four events", &Seen.count, 4);
     for (0..4) |i| {
         var buf: [8]u8 = undefined;
         const want = std.fmt.bufPrint(&buf, "e{d}", .{i}) catch unreachable;
@@ -213,13 +217,16 @@ test "watch mongo: history lost -> a gap, then the stream reopens from now" {
     defer sse.Topics._gone(sub);
     defer w.stop();
 
-    while (true) {
-        out.mutex.lockUncancelable(rio);
-        const have = std.mem.indexOf(u8, out.bytes.items, "event: gap") != null and std.mem.indexOf(u8, out.bytes.items, "\"x\":20") != null;
-        out.mutex.unlock(rio);
-        if (have) break;
-        try rio.sleep(.fromMilliseconds(2), .awake);
-    }
+    const GapThenNew = struct {
+        out: *sse.out_mod.Fake,
+        rio: std.Io,
+        fn have(c: @This()) bool {
+            c.out.mutex.lockUncancelable(c.rio);
+            defer c.out.mutex.unlock(c.rio);
+            return std.mem.indexOf(u8, c.out.bytes.items, "event: gap") != null and std.mem.indexOf(u8, c.out.bytes.items, "\"x\":20") != null;
+        }
+    };
+    try wait.waitUntil(rio, "a gap, then the stream from now", GapThenNew{ .out = &out, .rio = rio }, GapThenNew.have);
     // Aggregate, getMore (history lost), aggregate again: from now.
     try std.testing.expect(fake.commandCount(rio) >= 3);
     const again = fake.command(rio, 2);
@@ -289,15 +296,14 @@ test "watch: auto-ack: after the handler succeeded, never after it failed (handl
     try std.testing.expectEqual(root.Outcome.deferred, w.deliver(entry("good", "3-0")));
     try std.testing.expectEqual(root.Outcome.deferred, w.deliver(entry("bad", "4-0")));
     try std.testing.expectEqual(root.Outcome.deferred, w.deliver(entry("good", "5-0")));
-    var polls: usize = 0;
-    while (true) : (polls += 1) {
-        w.slots.mutex.lockUncancelable(io);
-        const busy = w.slots.in_use;
-        w.slots.mutex.unlock(io);
-        if (busy == 0 and Acks.handled.load(.acquire) == 3) break;
-        if (polls > 10_000) return error.Timeout;
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
+    const Settled = struct {
+        fn done(wt: *Watch) bool {
+            wt.slots.mutex.lockUncancelable(io);
+            defer wt.slots.mutex.unlock(io);
+            return wt.slots.in_use == 0 and Acks.handled.load(.acquire) == 3;
+        }
+    };
+    try wait.waitUntil(io, "the three events handled and their slots free", w, Settled.done);
     try std.testing.expect(Acks.has("3-0"));
     try std.testing.expect(Acks.has("5-0"));
     try std.testing.expect(!Acks.has("4-0"));
@@ -350,7 +356,7 @@ test "watch: stop: a running handler finishes, a listener ends after what it has
     try std.testing.expectEqual(root.Status.stopped, w.status());
     // The handler was not canceled by the stop: it ends its event.
     Gate.open.set(io);
-    while (!Gate.finished.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    try wait.waitFlag(io, "the handler finished its event", &Gate.finished);
     // The listener still has both events, then the end.
     try std.testing.expectEqualStrings("a", (try l.next(&c)).?.data);
     try std.testing.expectEqualStrings("b", (try l.next(&c)).?.data);

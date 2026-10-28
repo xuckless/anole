@@ -1618,8 +1618,14 @@ PostgreSQL) the inserts are calls on that transaction, in order with its
 others, and commit with it; the answer is then the transaction's
 `ANOLE_EV_DB_RESULT`, a table with the columns `id` and `inserted`. Unique
 jobs (`ANOLE_JOB_F_UNIQUE`, `unique_key`, `unique_period_ms`,
-`unique_scope`) answer the existing job's id with `inserted` 0. A request's
-`traceparent` is not carried (the ABI has no request context to read it from).
+`unique_scope`) answer the existing job's id with `inserted` 0. With
+`opts.req` the jobs carry that request's trace context in their `meta`: its
+span when the server traces it, else the caller's `traceparent` header as it
+came (every trace flag kept), and the caller's `tracestate`, unless a job's
+`meta_json` sets its own `traceparent`; `ANOLE_EV_JOB` hands it back as
+`traceparent`. The context is read during the call, so enqueue before
+answering: a request already answered (or answered by an overlapping call,
+rule 2) adds none. Nothing is copied for requests that never enqueue.
 
 **Workers.** `anole_jobs_work` (before the server starts) registers a worker
 for a queue and some kinds (none: every kind of the queue); no two workers

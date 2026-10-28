@@ -1,6 +1,7 @@
 //! The drain against runs that have finished: what a job's handler did is
 //! saved, whatever the drain's cancel reaches (#108).
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const zio = @import("zio");
 const anole = @import("../root.zig");
 const root = @import("root.zig");
@@ -23,12 +24,13 @@ fn interruptedRun(client: *root.Client, io: std.Io) bool {
     return false;
 }
 
-fn waitFor(io: std.Io, comptime cond: anytype, args: anytype) error{TimedOut}!void {
-    for (0..5000) |_| {
-        if (@call(.auto, cond, args)) return;
-        io.sleep(.fromMilliseconds(1), .awake) catch {};
-    }
-    return error.TimedOut;
+fn waitFor(io: std.Io, comptime cond: anytype, args: anytype) !void {
+    const C = struct {
+        fn holds(a: @TypeOf(args)) bool {
+            return @call(.auto, cond, a);
+        }
+    };
+    try wait.waitUntil(io, "the drain test's condition (" ++ @typeName(@TypeOf(cond)) ++ ")", args, C.holds);
 }
 
 /// The store's `finish`, held for the first completion until the test lets
@@ -102,16 +104,21 @@ const LateDrain = struct {
     var io: std.Io = undefined;
     var client: *root.Client = undefined;
     var drain_task: ?std.Io.Future(void) = null;
+    /// Set once `drain_task` is: the test waits on this, not on the optional.
+    var started_drain: bool = false;
     var runs: std.atomic.Value(u32) = .init(0);
 
     fn run(_: ?*anyopaque, job: *root.Job) anyerror!void {
         _ = runs.fetchAdd(1, .acq_rel);
         // The work is done. Now the drain, past its deadline.
         drain_task = try io.concurrent(drainNow, .{ client, io });
-        for (0..5000) |_| {
-            if (job.interrupted_flag.?.load(.acquire)) break;
-            io.sleep(.fromMilliseconds(1), .awake) catch {};
-        } else return error.NeverInterrupted;
+        @atomicStore(bool, &started_drain, true, .release);
+        // The drain cancels this task: the wait runs with cancel
+        // protection, so it ends on the flag, not on the cancel (which is
+        // delivered at the next cancellation point after it).
+        const prev = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(prev);
+        wait.waitFlag(io, "the run was interrupted", job.interrupted_flag.?) catch return error.NeverInterrupted;
     }
 };
 
@@ -121,6 +128,7 @@ fn lateDrainCheck(io: std.Io) !void {
     LateDrain.io = io;
     LateDrain.client = client;
     LateDrain.drain_task = null;
+    LateDrain.started_drain = false;
     LateDrain.runs.store(0, .release);
     try client.addHandler(kind, null, LateDrain.run);
     try client.start(null, null, null);
@@ -128,10 +136,11 @@ fn lateDrainCheck(io: std.Io) !void {
     defer arena.deinit();
     var ctx: anole.db.Ctx = .{ .io = io, .arena = arena.allocator() };
     const e = try client.enqueueRaw(&ctx, kind.name, "{}", .{});
-    for (0..5000) |_| {
-        if (LateDrain.drain_task != null) break;
-        io.sleep(.fromMilliseconds(1), .awake) catch {};
-    } else return error.NeverRan;
+    wait.waitUntil(io, "the job ran and started the drain", {}, struct {
+        fn f(_: void) bool {
+            return @atomicLoad(bool, &LateDrain.started_drain, .acquire);
+        }
+    }.f) catch return error.NeverRan;
     LateDrain.drain_task.?.await(io);
     const info = (try client.get(&ctx, e.id)).?;
     // Completed, not put back to run again.
@@ -252,10 +261,11 @@ fn unsavedCheck(io: std.Io) !void {
     var ctx: anole.db.Ctx = .{ .io = io, .arena = arena.allocator() };
     _ = try client.enqueueRaw(&ctx, kind.name, "{}", .{});
     // Three tries, 50 + 100 ms apart, then the run counts as unsaved.
-    for (0..10_000) |_| {
-        if (unsavedCount(&registry) >= 1) break;
-        io.sleep(.fromMilliseconds(1), .awake) catch {};
-    } else return error.NeverCounted;
+    wait.waitUntil(io, "the unsaved outcome counted", &registry, struct {
+        fn f(r: *anole.observe.metrics.Registry) bool {
+            return unsavedCount(r) >= 1;
+        }
+    }.f) catch return error.NeverCounted;
     try std.testing.expectEqual(@as(u64, 1), unsavedCount(&registry));
 }
 
@@ -264,5 +274,55 @@ test "jobs: a run whose outcome could not be saved is counted in anole_jobs_outc
     defer rt.deinit();
     const io = rt.io();
     var f = try io.concurrent(unsavedCheck, .{io});
+    try f.await(io);
+}
+
+/// The store's `rescue`, held in a cancelable wait (as a store's round trip
+/// is) until the client's teardown cancels the maintenance task in it; its
+/// `prune`, the round's next call, waits on the network too (briefly).
+const HeldRescue = struct {
+    var io: std.Io = undefined;
+    var vt: store.VTable = undefined;
+    var entered: std.atomic.Value(bool) = .init(false);
+
+    fn install(client: *root.Client, rio: std.Io) void {
+        io = rio;
+        entered.store(false, .release);
+        vt = client.backend.vt.*;
+        vt.rescue = rescue;
+        vt.prune = prune;
+        client.backend.vt = &vt;
+    }
+
+    fn prune(_: *anyopaque, _: root.Time, _: root.Options.Keep) anyerror!u32 {
+        try io.sleep(.fromMilliseconds(1), .awake);
+        return 0;
+    }
+
+    fn rescue(_: *anyopaque, _: std.mem.Allocator, _: root.Time) anyerror![]store.Rescued {
+        entered.store(true, .release);
+        // Far past any test: only the cancel ends it.
+        try io.sleep(.fromSeconds(600), .awake);
+        return &.{};
+    }
+};
+
+fn maintenanceCancelCheck(io: std.Io) !void {
+    const client = try root.Client.init(gpa, io, .{ .store = .memory });
+    HeldRescue.install(client, io);
+    try client.start(null, null, null);
+    try wait.waitFlag(io, "the maintenance round is in the store's rescue", &HeldRescue.entered);
+    // The teardown cancels the maintenance task inside the store call. The
+    // cancel must end the task, not be taken for a failed rescue: a round
+    // that carries on goes back to the store with its cancel gone, and
+    // waits there (zio's debug_cancel fails the test: SwallowedCancel).
+    client.deinit();
+}
+
+test "jobs: the teardown's cancel inside a maintenance store call ends the maintenance task" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(maintenanceCancelCheck, .{io});
     try f.await(io);
 }
