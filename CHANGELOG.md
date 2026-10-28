@@ -3,6 +3,25 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.2 (unreleased)
+
+### Changed
+
+- Tests: a hung unit test says where it hangs. CI runs every unit test step
+  with `--test-timeout 120s`; a test still running at 110 s is named and
+  every thread's backtrace goes into the timeout report (gdb on Linux, lldb
+  or `sample` on macOS), then the run goes on with the next test. The test
+  runner dies on the timeout's SIGTERM even when the hung test holds a
+  SIGTERM handler; before, such a test held the build until the runner's own
+  300 s limit, and the report said nothing about where it hung.
+  `zig build hang-probe` shows a dump (`ANOLE_TEST_DUMP_AFTER` sets the
+  threshold in seconds).
+- Tests: a passing test's log lines are not printed. The runner holds a
+  test's log lines and prints them only when the test fails, leaks or logs
+  an error (and in a hang dump); before, a passing test's warnings showed up
+  under the next failing test or under a misleading "failed command:" line.
+  Text printed straight to stderr (`std.debug.print`, C code) still shows.
+
 ## 0.4.1 (2026-10-28)
 
 ### Fixed

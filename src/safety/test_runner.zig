@@ -3,10 +3,13 @@
 //! test allocator of a unit test is backed by `never_reuse.allocator`, so
 //! freed memory is never handed out again and a use after free faults at
 //! once; a unit test fails when zio's `debug_cancel` reports a swallowed
-//! cancellation during it (C3); a test that runs for 5 minutes is named
-//! and aborted (`watchdog`), so a hang says where it is; and a failed test
-//! names its error (the server-mode runner printed only the trace). The fuzzing loops keep `std.heap.page_allocator` (an mprotect per
-//! bucket costs a fuzzer's throughput). Re-copy it when moving to the next
+//! cancellation during it (C3); a test that runs past 110 s is named and
+//! every thread's backtrace is dumped before the build runner's
+//! `--test-timeout` kills it (`watchdog`, TESTING.md D2), so a hang says
+//! where it is; a test's log lines are printed only when it fails
+//! (`captured`); and a failed test names its error (the server-mode runner
+//! printed only the trace). The fuzzing loops keep `std.heap.page_allocator`
+//! (an mprotect per bucket costs a fuzzer's throughput). Re-copy it when moving to the next
 //! Zig version and apply the change again (`ANOLE:` marks it).
 const builtin = @import("builtin");
 
@@ -15,7 +18,8 @@ const Io = std.Io;
 const fatal = std.process.fatal;
 const testing = std.testing;
 const assert = std.debug.assert;
-const panic = std.debug.panic;
+// ANOLE: `panic` is the root panic handler below (it shows held log lines).
+const panicf = std.debug.panic;
 const fuzz_abi = std.Build.abi.fuzz;
 // ANOLE: the test allocator's backing allocator.
 const never_reuse = @import("anole_test_hooks").never_reuse;
@@ -30,7 +34,10 @@ fn swallowedCancels() u64 {
 }
 
 /// ANOLE: runs a test, failing it when zio reported a swallowed cancellation.
+/// Its log lines are held back (`captured`) until the caller knows whether
+/// the test failed.
 fn runTest(test_fn: @TypeOf(builtin.test_functions[0]), index: usize) anyerror!void {
+    captured.begin();
     watchdog.begin(index);
     defer watchdog.end();
     const before = swallowedCancels();
@@ -38,16 +45,66 @@ fn runTest(test_fn: @TypeOf(builtin.test_functions[0]), index: usize) anyerror!v
     if (swallowedCancels() != before) return error.SwallowedCancel;
 }
 
-/// ANOLE: a unit test still running after `limit_s` seconds is taken for a
-/// hang: its name goes to stderr and the process aborts, so the build names
-/// the test (a hung binary otherwise says nothing until CI's timeout kills
-/// it). The slowest tests take seconds.
+/// ANOLE: hang detection (TESTING.md D2). A unit test still running after
+/// `dump_after_ns` (110 s, or `ANOLE_TEST_DUMP_AFTER` seconds) is taken for a
+/// hang: the watchdog thread names it, prints what it has logged so far and
+/// every thread's backtrace (gdb on Linux, lldb on macOS) to stderr. That is
+/// before the build runner's `--test-timeout 120s` (CI) fires: Zig 0.17's
+/// runner (lib/compiler/Maker/Step/Run.zig) takes the child's stderr as it
+/// stands at the timeout, reports "'<test>' timed out after ... with
+/// stderr:", then SIGTERMs the child and blocks in wait4 until it exits, and
+/// goes on with the next test in a new process. So the dump must already be
+/// written when the limit hits, and the runner must die on that SIGTERM:
+/// SIGTERM is reset to its default action at startup and again before a dump
+/// (a hung server test may hold zio's SIGTERM handler, which drains instead
+/// of exiting), and the watchdog thread never blocks it. Without
+/// `--test-timeout` (a local run), the process aborts after 300 s.
+/// Prior art: Go's test alarm (every goroutine's stack, then a panic),
+/// CPython's faulthandler.dump_traceback_later, nextest's SIGTERM.
 const watchdog = struct {
-    const limit_s = 300;
     const idle = std.math.maxInt(usize);
+    const default_dump_after_ns: u64 = 110 * std.time.ns_per_s;
+    const abort_after_ns: u64 = 300 * std.time.ns_per_s;
+    /// gdb or lldb gets this long, then SIGKILL (which detaches it).
+    const debugger_limit_ns: u64 = 60 * std.time.ns_per_s;
+    const can_dump = switch (builtin.os.tag) {
+        .linux, .macos => true,
+        else => false,
+    };
+
+    var dump_after_ns: u64 = default_dump_after_ns;
+    /// For finding the debugger on PATH.
+    var environ: std.process.Environ = undefined;
     var current: std.atomic.Value(usize) = .init(idle);
     var seq: std.atomic.Value(u32) = .init(0);
+    var started_ns: std.atomic.Value(u64) = .init(0);
     var started = false;
+
+    /// At runner start: the dump threshold, permission for a debugger child
+    /// to attach (Linux's Yama `ptrace_scope=1`, Ubuntu's default, lets a
+    /// process trace only its descendants; this test binary only, never
+    /// libanole), and SIGTERM's default action.
+    fn setup(env: std.process.Environ) void {
+        if (comptime !can_dump) return;
+        environ = env;
+        if (env.getPosix("ANOLE_TEST_DUMP_AFTER")) |v| {
+            if (std.fmt.parseUnsigned(u32, v, 10)) |secs| {
+                dump_after_ns = @as(u64, secs) * std.time.ns_per_s;
+            } else |_| {
+                std.debug.print("ANOLE_TEST_DUMP_AFTER={s} is not a number of seconds; dumping hung tests after {d} s\n", .{ v, default_dump_after_ns / std.time.ns_per_s });
+            }
+        }
+        if (comptime builtin.os.tag == .linux) {
+            // EINVAL without Yama: nothing to allow (Breakpad and Crashpad
+            // ignore the failure the same way).
+            _ = std.os.linux.prctl(@backingInt(std.os.linux.PR.SET_PTRACER), std.os.linux.PR.SET_PTRACER_ANY, 0, 0, 0);
+        }
+        dieOnSigterm();
+    }
+
+    fn now() u64 {
+        return @intCast(Io.Clock.awake.now(runner_threaded_io).nanoseconds);
+    }
 
     fn begin(index: usize) void {
         if (!started) {
@@ -56,8 +113,9 @@ const watchdog = struct {
             const t = std.Thread.spawn(.{}, run, .{}) catch return;
             t.detach();
         }
-        _ = seq.fetchAdd(1, .acq_rel);
+        started_ns.store(now(), .release);
         current.store(index, .release);
+        _ = seq.fetchAdd(1, .acq_rel);
     }
 
     fn end() void {
@@ -65,24 +123,259 @@ const watchdog = struct {
     }
 
     fn run() void {
-        var last: u32 = 0;
-        var ticks: u32 = 0;
+        if (comptime can_dump) dieOnSigterm();
+        var dumped_seq: ?u32 = null;
         while (true) {
-            Io.sleep(runner_threaded_io, .fromSeconds(1), .awake) catch {};
-            const i = current.load(.acquire);
+            Io.sleep(runner_threaded_io, .fromMilliseconds(250), .awake) catch {};
             const s = seq.load(.acquire);
-            if (i == idle or s != last) {
-                last = s;
-                ticks = 0;
-                continue;
+            const i = current.load(.acquire);
+            if (i == idle) continue;
+            const elapsed = now() -| started_ns.load(.acquire);
+            // A test that began after `s` was read: next round.
+            if (seq.load(.acquire) != s) continue;
+            const name = builtin.test_functions[i].name;
+            if (elapsed >= dump_after_ns and dumped_seq != s) {
+                dumped_seq = s;
+                dump(name, elapsed);
             }
-            ticks += 1;
-            if (ticks < limit_s) continue;
-            std.debug.print("\ntest '{s}' has run for {d} s: taken for a hang, aborting\n", .{ builtin.test_functions[i].name, ticks });
-            std.process.abort();
+            if (elapsed >= abort_after_ns) {
+                if (dumped_seq != s) dump(name, elapsed);
+                std.debug.print("\ntest '{s}' has run for {d} s: taken for a hang, aborting\n", .{ name, elapsed / std.time.ns_per_s });
+                std.process.abort();
+            }
         }
     }
+
+    /// The test's name, its log so far, then every thread's backtrace.
+    fn dump(name: []const u8, elapsed: u64) void {
+        std.debug.print("\ntest '{s}' has run for {d} s: taken for a hang\n", .{ name, elapsed / std.time.ns_per_s });
+        captured.show("its log so far");
+        if (comptime !can_dump) return;
+        dieOnSigterm();
+        const pid = getpid();
+        var pid_buf: [16]u8 = undefined;
+        const pid_s = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch unreachable;
+        std.debug.print("all threads' backtraces (pid {d}):\n", .{pid});
+        switch (builtin.os.tag) {
+            .linux => _ = runDebugger("gdb", &.{ "gdb", "-batch", "-nx", "-iex", "set debuginfod enabled off", "-p", pid_s, "-ex", "thread apply all bt" }),
+            .macos => {
+                // lldb needs the right to debug: an interactive session or
+                // Developer Mode, or root (GitHub's macOS runners have
+                // passwordless sudo). `sample`, which needs neither for a
+                // process of the same user, gives every thread's call graph
+                // when lldb cannot attach.
+                const lldb = [_][]const u8{ "lldb", "--batch", "-p", pid_s, "-o", "thread backtrace all" };
+                if (runDebugger("lldb", &lldb)) return endDump(name);
+                std.debug.print("hang dump: trying again with sudo -n\n", .{});
+                if (runDebugger("sudo -n lldb", &(.{ "sudo", "-n" } ++ lldb))) return endDump(name);
+                std.debug.print("hang dump: lldb could not attach; sampling every thread's stack for 1 s instead\n", .{});
+                _ = runDebugger("sample", &.{ "/usr/bin/sample", pid_s, "1", "-mayDie", "-file", "/dev/stderr" });
+            },
+            else => comptime unreachable,
+        }
+        endDump(name);
+    }
+
+    fn endDump(name: []const u8) void {
+        std.debug.print("hang dump of '{s}' ends here; --test-timeout (SIGTERM) or the {d} s backstop ends the test\n", .{ name, abort_after_ns / std.time.ns_per_s });
+    }
+
+    /// Runs a debugger with its output on our stderr (stdout is the build
+    /// runner's protocol pipe); false when it could not run or failed.
+    fn runDebugger(what: []const u8, argv: []const []const u8) bool {
+        // The runner's single-threaded Io has no allocator, which a spawn
+        // needs (argv, the PATH search).
+        var spawn_io: Io.Threaded = .init(std.heap.page_allocator, .{ .environ = environ });
+        defer spawn_io.deinit();
+        const child = std.process.spawn(spawn_io.io(), .{
+            .argv = argv,
+            .stdin = .ignore,
+            .stdout = .{ .file = Io.File.stderr() },
+            .stderr = .inherit,
+        }) catch |err| {
+            switch (err) {
+                error.FileNotFound => std.debug.print("hang dump: {s} is not installed (not on PATH), so no backtraces; install it to get them\n", .{argv[0]}),
+                else => std.debug.print("hang dump: could not start {s}: {t}\n", .{ what, err }),
+            }
+            return false;
+        };
+        const pid = child.id.?;
+        const deadline = now() + debugger_limit_ns;
+        while (true) {
+            if (reap(pid, false)) |status| {
+                if (exitedWith(status)) |code| {
+                    if (code == 0) return true;
+                    std.debug.print("hang dump: {s} exited with status {d}\n", .{ what, code });
+                } else {
+                    std.debug.print("hang dump: {s} ended by a signal\n", .{what});
+                }
+                return false;
+            }
+            if (now() >= deadline) {
+                std.posix.kill(pid, .KILL) catch {};
+                _ = reap(pid, true);
+                std.debug.print("hang dump: {s} took more than {d} s and was killed\n", .{ what, debugger_limit_ns / std.time.ns_per_s });
+                return false;
+            }
+            Io.sleep(runner_threaded_io, .fromMilliseconds(100), .awake) catch {};
+        }
+    }
+
+    /// The wait status of `pid` once it has exited (waiting for it when
+    /// `block`), or null while it runs.
+    fn reap(pid: std.posix.pid_t, block: bool) ?u32 {
+        const flags: u32 = if (block) 0 else std.posix.W.NOHANG;
+        while (true) {
+            if (builtin.link_libc) {
+                var status: c_int = 0;
+                const rc = std.c.waitpid(pid, &status, @intCast(flags));
+                if (rc == pid) return @bitCast(status);
+                if (rc == 0) return null;
+                if (std.c.errno(rc) == .INTR) continue;
+                return 0; // ECHILD: gone already
+            } else {
+                var status: i32 = 0;
+                const rc = std.os.linux.waitpid(pid, &status, flags);
+                switch (std.os.linux.errno(rc)) {
+                    .SUCCESS => return if (rc == 0) null else @bitCast(status),
+                    .INTR => continue,
+                    else => return 0,
+                }
+            }
+        }
+    }
+
+    fn exitedWith(status: u32) ?u8 {
+        return if (std.posix.W.IFEXITED(status)) std.posix.W.EXITSTATUS(status) else null;
+    }
+
+    fn getpid() std.posix.pid_t {
+        return if (builtin.link_libc) std.c.getpid() else std.os.linux.getpid();
+    }
+
+    /// SIGTERM back to its default action (the process ends), and unblocked
+    /// on the calling thread so that it is always deliverable.
+    fn dieOnSigterm() void {
+        const dfl: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.TERM, &dfl, null);
+        var set = std.posix.sigemptyset();
+        std.posix.sigaddset(&set, .TERM);
+        std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &set, null);
+    }
 };
+
+/// ANOLE: quiet logs. A test's log lines are held here while it runs and
+/// printed only when it fails, leaks or logs an error (Rust's libtest and
+/// Go's t.Log do the same), so a passing test prints nothing: the build
+/// runner keeps a passing test's stderr and shows it under the next failure,
+/// or under "failed command:" at the end (ziglang/zig#31077, "working as
+/// designed: unit tests should avoid printing to stderr in success cases").
+/// A ring of the last 256 KiB; what `std.debug.print` and C code write
+/// goes straight to stderr as before. A panic prints the held lines first.
+const captured = struct {
+    const size = 256 * 1024;
+    var ring: [size]u8 = undefined;
+    /// For `show` while the test runs: the ring, copied under the lock.
+    var copy: [size]u8 = undefined;
+    /// Bytes written since `begin`; the ring holds the last `size`.
+    var total: usize = 0;
+    var on: std.atomic.Value(bool) = .init(false);
+    /// Guards `ring`, `total` and `on`'s changes: a spin lock around a
+    /// bounded memcpy (SAFETY.md L5); nothing under it prints or waits.
+    var lock: std.atomic.Value(bool) = .init(false);
+
+    fn acquire() void {
+        @disableInstrumentation();
+        while (lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+
+    fn release() void {
+        @disableInstrumentation();
+        lock.store(false, .release);
+    }
+
+    fn active() bool {
+        @disableInstrumentation();
+        return on.load(.acquire);
+    }
+
+    fn begin() void {
+        acquire();
+        defer release();
+        total = 0;
+        on.store(true, .release);
+    }
+
+    /// Appends `bytes` when a test is capturing; false when not (the caller
+    /// prints them).
+    fn append(bytes: []const u8) bool {
+        @disableInstrumentation();
+        acquire();
+        defer release();
+        if (!on.load(.monotonic)) return false;
+        // Only the last `size` bytes of `bytes` can survive.
+        const tail = bytes[bytes.len -| size..];
+        var pos = (total + (bytes.len - tail.len)) % size;
+        var rest = tail;
+        while (rest.len > 0) {
+            const n = @min(rest.len, size - pos);
+            @memcpy(ring[pos..][0..n], rest[0..n]);
+            rest = rest[n..];
+            pos = (pos + n) % size;
+        }
+        total += bytes.len;
+        return true;
+    }
+
+    /// Ends the capture; prints what was held when `show_it`.
+    fn end(show_it: bool) void {
+        @disableInstrumentation();
+        acquire();
+        const was_on = on.load(.monotonic);
+        on.store(false, .release);
+        release();
+        // No writer touches the ring once `on` is false.
+        if (was_on and show_it) print(&ring, total, "its log");
+    }
+
+    /// Prints what the running test has logged so far, and keeps capturing
+    /// (the hang dump).
+    fn show(what: []const u8) void {
+        acquire();
+        const was_on = on.load(.monotonic);
+        const n = total;
+        if (was_on) @memcpy(&copy, &ring);
+        release();
+        if (was_on) print(&copy, n, what);
+    }
+
+    fn print(buf: *const [size]u8, n: usize, what: []const u8) void {
+        @disableInstrumentation();
+        if (n == 0) return;
+        if (n <= size) {
+            std.debug.print("--- {s}:\n{s}--- end of {s}\n", .{ what, buf[0..n], what });
+            return;
+        }
+        // The ring wrapped: start after the oldest whole line.
+        const pos = n % size;
+        const old = buf[pos..];
+        const skip = if (std.mem.findScalar(u8, old, '\n')) |nl| nl + 1 else old.len;
+        std.debug.print("--- {s} (the first {d} bytes dropped):\n{s}{s}--- end of {s}\n", .{ what, n - size + skip, old[skip..], buf[0..pos], what });
+    }
+};
+
+/// ANOLE: a panic prints the test's held log lines first.
+pub const panic = std.debug.FullPanic(panicWithLog);
+
+fn panicWithLog(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold);
+    captured.end(true);
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
 
 pub const std_options: std.Options = .{
     .logFn = log,
@@ -117,10 +410,10 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 
     if (need_simple) {
-        return mainSimple() catch |err| panic("test failure: {t}", .{err});
+        return mainSimple() catch |err| panicf("test failure: {t}", .{err});
     }
 
-    const args = init.args.toSlice(fba.allocator()) catch |err| panic("unable to parse command line args: {t}", .{err});
+    const args = init.args.toSlice(fba.allocator()) catch |err| panicf("unable to parse command line args: {t}", .{err});
 
     var listen = false;
     var opt_cache_dir: ?[]const u8 = null;
@@ -134,7 +427,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         } else if (std.mem.startsWith(u8, arg, "--cache-dir")) {
             opt_cache_dir = arg["--cache-dir=".len..];
         } else {
-            panic("unrecognized command line argument: {s}", .{arg});
+            panicf("unrecognized command line argument: {s}", .{arg});
         }
     }
 
@@ -143,8 +436,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         fuzz_abi.fuzzer_init(.fromSlice(cache_dir));
     }
 
+    watchdog.setup(init.environ); // ANOLE
+
     if (listen) {
-        return mainServer(init) catch |err| panic("internal test runner failure: {t}", .{err});
+        return mainServer(init) catch |err| panicf("internal test runner failure: {t}", .{err});
     } else {
         return mainTerminal(init);
     }
@@ -221,6 +516,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 } else |err| switch (err) {
                     error.SkipZigTest => .skip,
                     else => s: {
+                        captured.end(true); // ANOLE
                         // ANOLE: the error's name, which the trace alone
                         // does not say (a bare `expect` is
                         // TestUnexpectedResult; a bounded wait TimedOut).
@@ -233,6 +529,9 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 };
                 testing.io_instance.deinit();
                 const leak_count = testing.allocator_instance.deinit();
+                // ANOLE: the build runner shows stderr for a leak or an
+                // error logged too; held lines go with it, else nowhere.
+                captured.end(leak_count != 0 or log_err_count != 0);
                 try server.serveTestResults(.{
                     .index = index,
                     .flags = .{
@@ -309,7 +608,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                                 break;
                             }
                         } else {
-                            panic("fuzz test {s} no longer exists", .{name});
+                            panicf("fuzz test {s} no longer exists", .{name});
                         }
 
                         if (main_instance) {
@@ -371,6 +670,8 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             std.debug.print("{d}/{d} {s}...", .{ i + 1, test_fn_list.len, test_fn.name });
         }
         is_fuzz_test = false;
+        const errs_before = log_err_count; // ANOLE
+        defer captured.end(log_err_count != errs_before); // ANOLE
         if (runTest(test_fn, i)) |_| { // ANOLE
             ok_count += 1;
             test_node.end();
@@ -387,6 +688,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             },
             else => {
                 fail_count += 1;
+                captured.end(true); // ANOLE
                 if (have_tty) {
                     std.debug.print("{d}/{d} {s}...FAIL ({t})\n", .{
                         i + 1, test_fn_list.len, test_fn.name, err,
@@ -433,10 +735,21 @@ pub fn log(
         log_err_count +|= 1;
     }
     if (@backingInt(message_level) <= @backingInt(testing.log_level)) {
-        std.debug.print(
-            "[" ++ @tagName(scope) ++ "] (" ++ @tagName(message_level) ++ "): " ++ format ++ "\n",
-            args,
-        );
+        const line_format = "[" ++ @tagName(scope) ++ "] (" ++ @tagName(message_level) ++ "): " ++ format ++ "\n";
+        // ANOLE: held while a test runs (`captured`), at most 4 KiB a line.
+        if (captured.active()) {
+            var line: [4096]u8 = undefined;
+            var w: Io.Writer = .fixed(&line);
+            w.print(line_format, args) catch {
+                const mark = "...(cut at 4 KiB)\n";
+                @memcpy(line[line.len - mark.len ..], mark);
+                w.end = line.len;
+            };
+            if (captured.append(w.buffered())) return;
+            std.debug.print("{s}", .{w.buffered()});
+            return;
+        }
+        std.debug.print(line_format, args);
     }
 }
 
@@ -511,7 +824,7 @@ var fuzz_runner: if (builtin.fuzz) struct {
         @disableInstrumentation();
 
         fuzz_runner.server.serveU32Message(.fuzz_test_change, i) catch |e| switch (e) {
-            error.WriteFailed => panic("failed to write to stdout: {t}", .{stdout_writer.err.?}),
+            error.WriteFailed => panicf("failed to write to stdout: {t}", .{stdout_writer.err.?}),
         };
 
         testing.allocator_instance = .init(std.heap.page_allocator, .{
@@ -551,7 +864,7 @@ var fuzz_runner: if (builtin.fuzz) struct {
         @disableInstrumentation();
         const bytes = bytes_slice.toSlice();
         fuzz_runner.server.serveBroadcastFuzzInputMessage(test_i, bytes) catch |e| switch (e) {
-            error.WriteFailed => panic("failed to write to stdout: {t}", .{stdout_writer.err.?}),
+            error.WriteFailed => panicf("failed to write to stdout: {t}", .{stdout_writer.err.?}),
         };
     }
 
@@ -588,7 +901,7 @@ var fuzz_runner: if (builtin.fuzz) struct {
             error.Canceled => |e| return e,
             error.ReadFailed => {
                 if (stdin_reader.err.? == error.Canceled) return error.Canceled;
-                panic("failed to read from stdin: {t}", .{stdin_reader.err.?});
+                panicf("failed to read from stdin: {t}", .{stdin_reader.err.?});
             },
             error.EndOfStream => @panic("unexpected end of stdin"),
         }
@@ -602,7 +915,7 @@ var fuzz_runner: if (builtin.fuzz) struct {
         while (true) {
             const hdr = try server.receiveMessage();
             if (hdr.tag != .new_fuzz_input) {
-                panic("unexpected message: {x}\n", .{@backingInt(hdr.tag)});
+                panicf("unexpected message: {x}\n", .{@backingInt(hdr.tag)});
             }
             const test_i = try server.receiveBody_u32();
             const input_len = hdr.bytes_len - 4;

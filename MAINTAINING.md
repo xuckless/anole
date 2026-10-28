@@ -367,6 +367,13 @@ Moving to the next minor version (0.18):
    README's requirements, and the CI workflows' `version:`.
 3. Re-run the `@bitCast`, `@cImport`/translate-c and `std.Io` audits the 0.17
    move needed (see the release notes of the new version).
+4. Re-copy `src/safety/test_runner.zig` from the new
+   `lib/compiler/test_runner.zig` and apply the `ANOLE:` changes again. Check
+   that the build runner's `--test-timeout` still works the way the hang dump
+   assumes (`lib/compiler/Maker/Step/Run.zig` in 0.17): at the limit it
+   reports the child's stderr as it stands, SIGTERMs the child, waits for it
+   and goes on with the next test. Then run `zig build hang-probe
+   --test-timeout 20s` with `ANOLE_TEST_DUMP_AFTER=5` on Linux and macOS.
 
 ## Cadence
 
