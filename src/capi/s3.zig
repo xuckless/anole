@@ -556,6 +556,10 @@ fn postGone(x: *Exec, user_data: u64, op: u8, message: []const u8) void {
     post(x, &.{ .user_data = user_data, .op = op, .status = abi.E_GONE, .message = message });
 }
 
+fn postNoMemory(x: *Exec, user_data: u64, op: u8) void {
+    post(x, &.{ .user_data = user_data, .op = op, .status = abi.E_NOMEM, .message = "out of memory" });
+}
+
 fn postWritable(x: *Exec, handle: u64) void {
     const rec = engine.newRecord(@sizeOf(abi.Event), .writable, handle) catch return;
     x.postRecord(rec, true);
@@ -1320,6 +1324,9 @@ const CHeaders = struct {
 
 fn serveTask(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!void {
     const s = slotOfReq(x, c.req) orelse return postGone(x, c.user_data, abi.S3_OP_SERVE, "the request ended first");
+    // The request's memory may go at any suspension below (its stream
+    // reset, its deadline): what is read of it is copied first (M3).
+    const a = ctx.arena;
     const req = s.req;
     const is_head = req.method == .head;
     // The request's own conditional headers, unless the options set them.
@@ -1336,8 +1343,12 @@ fn serveTask(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!v
             };
         }
     }
-    if (go.if_none_match == null) go.if_none_match = req.headers.get("If-None-Match");
-    if (go.if_match == null) go.if_match = req.headers.get("If-Match");
+    if (go.if_none_match == null) if (req.headers.get("If-None-Match")) |v| {
+        go.if_none_match = a.dupe(u8, v) catch return postNoMemory(x, c.user_data, abi.S3_OP_SERVE);
+    };
+    if (go.if_match == null) if (req.headers.get("If-Match")) |v| {
+        go.if_match = a.dupe(u8, v) catch return postNoMemory(x, c.user_data, abi.S3_OP_SERVE);
+    };
     if (go.if_modified_since == null) if (req.headers.get("If-Modified-Since")) |v| if (@import("../s3/util.zig").parseHttpDate(v)) |t| {
         go.if_modified_since = db.Time.fromSeconds(t);
     };
@@ -1453,13 +1464,16 @@ const BodyReader = struct {
         const self: *BodyReader = @alignCast(@fieldParentPtr("interface", r));
         const s = self.slot;
         var tmp: [16 * 1024]u8 = undefined;
-        const want = @min(tmp.len, @intFromEnum(limit));
+        const want = @min(tmp.len, @backingInt(limit));
         if (want == 0) return 0;
         while (true) {
             s.in.acquire();
             const word = s.word.load(.acquire);
             const state = engine.stateOf(word);
-            const mine = engine.genOf(word) == self.gen and state != .free and state != .expired and state != .done;
+            // Orphaned: the stream went while a consumer call held the
+            // slot, and with it what the pipe held (executor-local, read
+            // on the executor).
+            const mine = engine.genOf(word) == self.gen and state != .free and state != .expired and state != .done and !s.orphan;
             if (!mine or s.in.failed) {
                 s.in.release();
                 self.failed = true;
@@ -1496,12 +1510,25 @@ fn putBodyTask(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket, r: *Res) std.Io.C
     };
     const h = Handle.decode(c.req);
     var po = c.putOptions();
-    if (po.content_type == null) po.content_type = s.req.headers.get("Content-Type");
+    // The request's memory may go at any suspension below (its stream
+    // reset, its deadline): what is read of it is copied first (M3).
+    if (po.content_type == null) if (s.req.headers.get("Content-Type")) |v| {
+        po.content_type = ctx.arena.dupe(u8, v) catch {
+            r.status = abi.E_NOMEM;
+            return;
+        };
+    };
     s.in.acquire();
     const streamed = s.in.live(h.gen);
     s.in.release();
     const result: anyerror!s3.Stored = blk: {
-        if (!streamed) break :blk b.put(ctx, c.key, .{ .bytes = s.body }, po);
+        if (!streamed) {
+            const body = ctx.arena.dupe(u8, s.body) catch {
+                r.status = abi.E_NOMEM;
+                return;
+            };
+            break :blk b.put(ctx, c.key, .{ .bytes = body }, po);
+        }
         const buffer = ctx.arena.alloc(u8, 16 * 1024) catch {
             r.status = abi.E_NOMEM;
             return;
@@ -1538,7 +1565,7 @@ pub fn presign(st: *Store, method: u32, key: abi.Str, o: abi.S3PresignOptions, b
     var fba: std.heap.FixedBufferAllocator = undefined;
     var ctx = scratchCtx(&scratch, &fba);
     const bucket = if (o.bucket.len > 0) o.bucket.slice() else (cl.default_bucket orelse return abi.E_INVALID);
-    const url = cl.presignUrl(&ctx, bucket, @enumFromInt(method), key.slice(), .{
+    const url = cl.presignUrl(&ctx, bucket, @fromBackingInt(@intCast(method)), key.slice(), .{
         .expires = std.Io.Duration.fromSeconds(if (o.expires_s == 0) 900 else o.expires_s),
         .version_id = if (o.version_id.len > 0) o.version_id.slice() else null,
         .content_type = if (o.content_type.len > 0) o.content_type.slice() else null,

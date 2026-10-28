@@ -20,9 +20,20 @@ const Events = struct {
     list: std.ArrayList(struct { typ: u32, handle: u64, bytes: []align(8) u8 }) = .empty,
 
     fn pump(ev: *Events, ms: i32) !void {
-        var buf: [256 * 1024]u8 align(8) = undefined;
+        var stack: [256 * 1024]u8 align(8) = undefined;
+        var heap: []align(8) u8 = &.{};
+        defer alloc.free(heap);
         var need: u32 = 0;
-        const n = try engine.pollWait(ev.c, &buf, ms, &need);
+        var buf: []align(8) u8 = &stack;
+        const n = engine.pollWait(ev.c, buf, ms, &need) catch |err| switch (err) {
+            // A record larger than the stack buffer (a request with a big
+            // inline body): once more into one that fits it.
+            error.TooBig => blk: {
+                heap = try alloc.alignedAlloc(u8, .@"8", need);
+                buf = heap;
+                break :blk try engine.pollWait(ev.c, buf, 0, &need);
+            },
+        };
         var off: usize = 0;
         while (off < n) {
             const head: *const abi.Event = @ptrCast(@alignCast(&buf[off]));
@@ -81,25 +92,44 @@ const Rig = struct {
     ev: Events,
     json: []u8,
 
+    /// What a test changes in the rig's configuration.
+    const Tuning = struct {
+        /// `limits.inline_body_max` (0: the default).
+        inline_body_max: u32 = 0,
+        /// The storage's `concurrency`.
+        concurrency: u8 = 2,
+        /// The storage's `retry.attempts`.
+        attempts: u8 = 1,
+    };
+
     fn start(r: *Rig, route: bool) !void {
+        return r.startWith(route, .{});
+    }
+
+    fn startWith(r: *Rig, route: bool, t: Tuning) !void {
         // Workers only: the test thread polls the consumer and must not be an executor the fake needs.
         r.rt = try zio.Runtime.init(alloc, .{ .executors = .exact(2), .enable_main_executor = false });
         errdefer r.rt.deinit();
         r.fake = try anole.s3.testing.FakeServer.start(alloc, r.rt.io());
         errdefer r.fake.stop();
+        var inline_buf: [48]u8 = undefined;
+        const inline_max = if (t.inline_body_max == 0) "" else try std.fmt.bufPrint(&inline_buf, ", \"inline_body_max\": {d}", .{t.inline_body_max});
         r.json = try std.fmt.allocPrint(alloc,
             \\{{"executors": 2, "timeouts": {{"shutdown_ms": 200}},
             \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
-            \\ "limits": {{"body_max": 33554432}},
+            \\ "limits": {{"body_max": 33554432{s}}},
             \\ "routes": [{s}],
             \\ "storage": [{{"name": "files", "s3": {{"endpoint": "{s}", "bucket": "b",
-            \\   "access_key_id": "{s}", "secret_access_key": "{s}", "part_size": 5242880}},
-            \\   "retry": {{"attempts": 1}}}}]}}
+            \\   "access_key_id": "{s}", "secret_access_key": "{s}", "part_size": 5242880, "concurrency": {d}}},
+            \\   "retry": {{"attempts": {d}, "base_ms": 1}}}}]}}
         , .{
+            inline_max,
             if (route) "{\"path\": \"/f/obj\", \"handler\": 1, \"timeout_ms\": 20000}, {\"path\": \"/f/up\", \"method\": \"POST\", \"handler\": 1, \"timeout_ms\": 20000}" else "",
             r.fake.url(),
             anole.s3.testing.access_key_id,
             anole.s3.testing.secret_access_key,
+            t.concurrency,
+            t.attempts,
         });
         errdefer alloc.free(r.json);
         var why_buf: [512]u8 = undefined;
@@ -359,7 +389,7 @@ fn fetchIfTask(io: std.Io, url: []const u8, names: []const []const u8, values_in
     for (names, values_in) |n, v| try h.add(n, v);
     var resp = try http.fetch(url, .{ .headers = &h, .decompress = false });
     defer resp.deinit();
-    out.status = @intCast(@intFromEnum(resp.status()));
+    out.status = @intCast(@backingInt(resp.status()));
     out.body = try alloc.dupe(u8, (try resp.body()) orelse "");
 }
 
@@ -468,6 +498,127 @@ test "capi s3: put_body stores the request body without the consumer reading it;
     try engine.respond(r.e, req, 201, &.{}, "stored", false);
     try f.await(io);
     try std.testing.expectEqual(@as(u16, 201), res.status);
+}
+
+/// One request over h2c (a detached request in the engine), whose stream
+/// the client resets once `go` is set.
+const H2Reset = struct {
+    port: u16,
+    method: []const u8,
+    path: []const u8,
+    /// One more request header (a conditional one the serve reads).
+    extra: ?anole.h2.Header = null,
+    body: ?[]const u8 = null,
+    go: std.atomic.Value(bool) = .init(false),
+
+    fn run(g: *H2Reset, io: std.Io) anyerror!void {
+        const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = g.port });
+        defer conn.close();
+        var headers: [5]anole.h2.Header = .{
+            .{ .name = ":method", .value = g.method }, .{ .name = ":path", .value = g.path },
+            .{ .name = ":scheme", .value = "http" },   .{ .name = ":authority", .value = "localhost" },
+            undefined,
+        };
+        var n: usize = 4;
+        if (g.extra) |x| {
+            headers[4] = x;
+            n = 5;
+        }
+        const s = try conn.request(headers[0..n], .{ .body_bytes = g.body, .timeout = .none });
+        defer s.release();
+        try wait.waitFlag(io, "the test lets the client reset its stream", &g.go);
+        s.cancel();
+    }
+};
+
+/// `engine.sseAccept` on a plain request, on a thread of its own: it claims
+/// the request, then fails (`error.State`, not a subscription) and hands
+/// the slot back to `out`.
+const FailedAccept = struct {
+    r: *Rig,
+    req: u64,
+    result: ?anyerror = null,
+
+    fn run(fa: *FailedAccept) void {
+        _ = engine.sseAccept(fa.r.e, fa.req, &.{}, &.{}, 0) catch |err| {
+            fa.result = err;
+        };
+    }
+};
+
+test "capi s3: serve on a request reset while a failed answer call held it answers GONE and reads nothing of the request" {
+    if (comptime !features.s3 or !features.http2) return error.SkipZigTest;
+    var r: Rig = undefined;
+    try r.start(true);
+    defer r.deinit();
+    try r.fake.putObject("b", "obj.bin", "served", "text/plain");
+    const io = r.rt.io();
+    const tio = engine.threadedIo();
+    var g: H2Reset = .{ .port = r.e.port(0), .method = "GET", .path = "/f/obj", .extra = .{ .name = "if-none-match", .value = "\"an-etag\"" } };
+    var f = try io.concurrent(H2Reset.run, .{ &g, io });
+    defer f.cancel(io) catch {};
+    const req = r.ev.list.items[try r.ev.waitFor(.request, 0, 15000)].handle;
+    const aborted = r.e.aborted_count.load(.monotonic);
+
+    // An answer call holds the request in `responding` while the client
+    // resets the stream: the executor lets the request's memory go and
+    // leaves the slot to that call, which fails and hands it back to `out`.
+    var hold: engine.TestPin = .{};
+    engine.test_answer_hold = &hold;
+    var fa: FailedAccept = .{ .r = &r, .req = req };
+    var t: ?std.Thread = try std.Thread.spawn(.{}, FailedAccept.run, .{&fa});
+    defer if (t) |th| {
+        hold.release.store(true, .release);
+        th.join();
+        engine.test_answer_hold = null;
+    };
+    try wait.waitFlag(tio, "the answer call holds the request", &hold.held);
+    g.go.store(true, .release);
+    try wait.waitAtLeast(tio, "the executor lets the reset request go", &r.e.aborted_count, aborted + 1);
+    hold.release.store(true, .release);
+    t.?.join();
+    t = null;
+    engine.test_answer_hold = null;
+    try std.testing.expectEqual(@as(?anyerror, error.State), fa.result);
+
+    // The serve finds no request to read or answer.
+    try engine.s3.serve(r.store(), req, .of("obj.bin"), .{}, 30);
+    const rep = try r.ev.result(30);
+    try std.testing.expectEqual(abi.E_GONE, rep.status);
+    // The consumer's answer ends the orphaned request (nobody hears it).
+    try engine.respond(r.e, req, 200, &.{}, "", false);
+}
+
+test "capi s3: put_body stores the whole inline body when the client resets the stream during the upload" {
+    if (comptime !features.s3 or !features.http2) return error.SkipZigTest;
+    var r: Rig = undefined;
+    // An inline body of two parts, uploaded one part at a time: the second
+    // part is read from the body only after the first is stored.
+    try r.startWith(true, .{ .inline_body_max = 6 * mib, .concurrency = 1 });
+    defer r.deinit();
+    const body = try alloc.alloc(u8, 5 * mib + 256 * 1024);
+    defer alloc.free(body);
+    pattern(body, 9);
+    r.fake.hold_parts = true;
+    const io = r.rt.io();
+    const tio = engine.threadedIo();
+    var g: H2Reset = .{ .port = r.e.port(0), .method = "POST", .path = "/f/up", .body = body };
+    var f = try io.concurrent(H2Reset.run, .{ &g, io });
+    defer f.cancel(io) catch {};
+    const i = try r.ev.waitFor(.request, 0, 15000);
+    const req = r.ev.list.items[i].handle;
+    const rec: *const abi.RequestEvent = @ptrCast(@alignCast(r.ev.list.items[i].bytes.ptr));
+    try std.testing.expect(rec.flags & abi.REQ_BODY_INLINE != 0);
+    const aborted = r.e.aborted_count.load(.monotonic);
+    try engine.s3.putBody(r.store(), req, .of("posted.bin"), .{}, 31);
+    // The first part is at the storage; the request ends under the upload.
+    try wait.waitAtLeast(tio, "the first part reaches the storage", &r.fake.held_parts, 1);
+    g.go.store(true, .release);
+    try wait.waitAtLeast(tio, "the executor lets the reset request go", &r.e.aborted_count, aborted + 1);
+    r.fake.releaseParts();
+    const rep = try r.ev.result(31);
+    try std.testing.expectEqual(abi.OK, rep.status);
+    try std.testing.expectEqualSlices(u8, body, r.fake.getObject("b", "posted.bin").?);
 }
 
 test "capi s3: config: storage parses, validates and maps every Options leaf" {
