@@ -112,9 +112,12 @@ pub const Client = struct {
     /// The server's drain event: set by `app.jobs`, so the queue drains when serving does.
     drain_event: ?*std.Io.Event = null,
     metrics: ?*metrics_mod.Series = null,
-    /// The app's exporter (`start`): a span per run. Process-wide (M2):
-    /// the app frees it after the runtime has stopped; a run that ends
-    /// after its `deinit` has its span dropped (counted).
+    /// The app's exporter (`start`): a span per run. Process-wide (M2),
+    /// owned by the app, which closes it first in `App.deinit` (it sends
+    /// through the server's client) and frees it last, after the runtime
+    /// has stopped. A run that settles in between (the drain cancels it)
+    /// calls `job` on a closed exporter: the span is dropped and counted,
+    /// with nothing allocated (`Exporter.close`).
     tracer: ?*observe.trace.Exporter = null,
     last_gauges: i64 = 0,
     /// Set before the tasks are canceled (drain, deinit).

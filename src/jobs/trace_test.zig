@@ -5,6 +5,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
+const wait = @import("anole_test_wait");
 const root = @import("root.zig");
 const anole = @import("../root.zig");
 const trace = anole.observe.trace;
@@ -264,5 +265,45 @@ test "jobs: a run interrupted by a drain has no error.type and an OK status" {
     defer rt.deinit();
     const io = rt.io();
     var f = try io.concurrent(interruptedCheck, .{io});
+    try f.await(io);
+}
+
+/// App.deinit's order: the exporter is closed first (it sends through the
+/// server's client), then the server and the jobs client stop, a run
+/// settling on the way, and the exporter's memory goes last.
+fn appOrderCheck(io: std.Io) !void {
+    var http = dusty.Client.init(gpa, io, .{});
+    defer http.deinit();
+    // Counts what the exporter allocates.
+    var counting: std.testing.FailingAllocator = .init(gpa, .{});
+    var exporter = try trace.Exporter.init(counting.allocator(), io, .{ .http = &http }, .{ .endpoint = "http://127.0.0.1:9", .service_name = "t", .sample_all = true });
+    defer exporter.deinit();
+    const client = try root.Client.init(gpa, io, .{ .store = .memory, .queues = &.{.{ .name = "mail" }} });
+    defer client.deinit();
+    try client.addHandler(kind, null, Waits.run);
+    try client.start(null, &exporter, null);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var ctx: anole.db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    _ = try client.enqueueRaw(&ctx, "mail.send", "{}", .{});
+    try wait.waitFlag(io, "the job's run started", &Waits.started);
+
+    exporter.close();
+    const allocations = counting.allocations;
+    // The drain cancels the run, which settles on the closed exporter.
+    client.drain(std.Io.Clock.Timestamp.now(io, .awake));
+    try testing.expectEqual(@as(u64, 1), exporter.dropped.load(.acquire));
+    try testing.expectEqual(allocations, counting.allocations);
+}
+
+test "jobs: a run settling after the app has closed its exporter drops its span, counted, allocating nothing" {
+    Waits.reset();
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(appOrderCheck, .{io});
     try f.await(io);
 }

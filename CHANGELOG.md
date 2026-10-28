@@ -98,6 +98,11 @@ breaking changes are listed anyway.
   `error.type` (`Timeout` when its timeout expired) and an ERROR status, a
   run interrupted by a drain or lost has neither. Handlers see it as
   `job.trace_id`/`job.span_id`, and jobs they enqueue carry it.
+  `observe.trace.Exporter` gains `close` (OpenTelemetry's Shutdown):
+  `App.deinit` closes the app's exporter first, so a job run or database,
+  S3 or SMTP call that settles during the rest of the teardown has its
+  span dropped and counted in `dropped`, with nothing allocated; its
+  memory goes last. `deinit` still closes an exporter not closed yet.
 - Tests: Anole's tests no longer assume a fast machine. Waits go through one
   helper (`src/testing/wait.zig`) with a 10 s deadline, scaled by
   `ANOLE_TEST_TIMEOUT_FACTOR`, that names what it waited for when it times

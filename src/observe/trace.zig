@@ -15,6 +15,7 @@
 //! Handlers see `req.trace_id` and `req.span_id`; `outgoing(req, &buf)`
 //! makes the `traceparent` to pass downstream.
 const std = @import("std");
+const builtin = @import("builtin");
 const dusty = @import("dusty");
 const common = @import("common.zig");
 const Client = @import("../client.zig").Client;
@@ -265,6 +266,16 @@ pub const Options = struct {
 /// task of its own, through `client`. A full queue drops spans rather than
 /// slow requests. `app.tracing(.{})` makes one owned by the server,
 /// already started.
+///
+/// owner: whoever made it (`App` for `app.tracing`). M2 class:
+/// process-wide. Teardown (M5) runs in two steps, as the OpenTelemetry
+/// SDK's Shutdown: `close` sends what is queued and stops the task (it
+/// needs `client`'s server still running), after which `submit`, `job`
+/// and `child` are no-ops that allocate nothing and count the span as
+/// dropped ("after Shutdown, subsequent calls ... SHOULD be ignored");
+/// `deinit` then frees its memory, once nothing can call it any more. A
+/// database, S3, SMTP or jobs observer that settles a call between the
+/// two (the App closes its exporter first) has its span dropped.
 pub const Exporter = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -290,6 +301,11 @@ pub const Exporter = struct {
     dropped: std.atomic.Value(u64) = .init(0),
     /// Spans the collector accepted.
     exported: std.atomic.Value(u64) = .init(0),
+    /// M5's teardown state: alive, then closed (`close`), then dead
+    /// (`deinit`).
+    state: std.atomic.Value(State) = .init(.alive),
+
+    pub const State = enum(u8) { alive, closed, dead };
 
     /// An exporter with its queue allocated, sending through `client` (the
     /// server's, `app.client()`). Nothing is sent until `start`. `client`'s
@@ -304,20 +320,53 @@ pub const Exporter = struct {
         self.task = try self.io.concurrent(run, .{self});
     }
 
-    /// Sends what is queued and stops the task.
-    pub fn deinit(self: *Exporter) void {
+    /// Sends what is queued and stops the task, then takes no more spans:
+    /// from here on `submit`, `job` and `child` drop theirs (counted in
+    /// `dropped`) and allocate nothing, and `flush` returns at once. The
+    /// memory stays until `deinit`. Once only (a second close panics in
+    /// debug builds).
+    pub fn close(self: *Exporter) void {
+        if (self.state.cmpxchgStrong(.alive, .closed, .acq_rel, .acquire)) |was| {
+            if (builtin.mode == .debug) std.debug.panic("trace.Exporter.close on an exporter already {t}", .{was});
+            return;
+        }
         self.closing.set(self.io);
         self.kick.set(self.io);
         self.queue.close(self.io);
         if (self.task) |*t| t.await(self.io);
-        // What was never sent (no `start`): its job runs are freed.
+        self.task = null;
+        // What was never sent (no `start`, or past the task's last batch):
+        // its job runs are freed. No span can be queued after the close.
         var rest: [16]Span = undefined;
         while (true) {
             const n = self.queue.getUncancelable(self.io, &rest, 0) catch break;
             if (n == 0) break;
             for (rest[0..n]) |span| self.release(span);
         }
+    }
+
+    /// `close`, when not done yet, then frees the queue. Nothing may use
+    /// the exporter afterwards (a use panics in debug builds).
+    pub fn deinit(self: *Exporter) void {
+        if (self.state.load(.acquire) == .alive) self.close();
+        const was = self.state.swap(.dead, .acq_rel);
+        if (was == .dead) {
+            if (builtin.mode == .debug) @panic("trace.Exporter.deinit twice");
+            return;
+        }
         self.gpa.free(self.buffer);
+    }
+
+    /// Whether spans are still taken; past `close`, the span is counted as
+    /// dropped. A use after `deinit` panics in debug builds.
+    fn taking(self: *Exporter) bool {
+        switch (self.state.load(.acquire)) {
+            .alive => return true,
+            .closed => {},
+            .dead => if (builtin.mode == .debug) @panic("trace.Exporter used after deinit"),
+        }
+        _ = self.dropped.fetchAdd(1, .monotonic);
+        return false;
     }
 
     /// Sends the spans queued so far and waits until the collector has
@@ -326,7 +375,7 @@ pub const Exporter = struct {
     /// (AWS Lambda between invocations). One caller at a time; others wait
     /// their turn. Does nothing before `start`.
     pub fn flush(self: *Exporter, timeout: std.Io.Duration) void {
-        if (self.task == null) return;
+        if (self.state.load(.acquire) != .alive or self.task == null) return;
         self.flush_lock.lockUncancelable(self.io);
         defer self.flush_lock.unlock(self.io);
         const target = self.queued.load(.acquire);
@@ -343,9 +392,10 @@ pub const Exporter = struct {
     /// Queues a client span for a call made while serving `req` (a
     /// database query), as a child of the request's span, from
     /// `start_ns` to `end_ns` (real clock). Nothing when the request is
-    /// not recorded (`recording`).
+    /// not recorded (`recording`); after `close`, counted as dropped.
     pub fn child(self: *Exporter, req: *const dusty.Request, start_ns: i96, end_ns: i96, db: Span.Db) void {
         if (!recording(req)) return;
+        if (!self.taking()) return;
         var span: Span = undefined;
         @memcpy(&span.trace_id, req.trace_id[0..32]);
         randomHex(req.io, &span.span_id);
@@ -378,8 +428,10 @@ pub const Exporter = struct {
     /// SHOULD link to the creation context, a parent is NOT RECOMMENDED by
     /// default). `run`'s slices are copied. Recorded when the exporter
     /// records every request (`sample_all`), or when the enqueuer's
-    /// context was sampled (`recordsJob`).
+    /// context was sampled (`recordsJob`). After `close`, counted as
+    /// dropped, with nothing allocated.
     pub fn job(self: *Exporter, trace_id: [32]u8, span_id: [16]u8, start_ns: i96, end_ns: i96, attrs: Span.JobRun) void {
+        if (!self.taking()) return;
         const owned = self.ownJob(attrs) catch {
             _ = self.dropped.fetchAdd(1, .monotonic);
             return;
@@ -433,14 +485,20 @@ pub const Exporter = struct {
     }
 
     /// Frees what `span` owns (a job run's attributes): once it is sent,
-    /// dropped, or taken off the queue by a test.
+    /// dropped, left over at `close`, or taken off the queue by a test.
     pub fn release(self: *Exporter, span: Span) void {
         const attrs = span.job orelse return;
         self.gpa.free(attrs._block);
         self.gpa.destroy(attrs);
     }
 
+    /// Queues `span`. After `close` the span is dropped (counted) and what
+    /// it owns (`span.job`) freed at once.
     pub fn submit(self: *Exporter, span: Span) void {
+        if (!self.taking()) {
+            self.release(span);
+            return;
+        }
         const n = self.queue.putUncancelable(self.io, &.{span}, 0) catch 0;
         if (n == 0) {
             self.release(span);
