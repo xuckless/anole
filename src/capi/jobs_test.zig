@@ -4,6 +4,7 @@
 //! points on the memory store. Waits poll the consumer with generous bounds;
 //! no assertion is about time.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
 const parity = @import("parity.zig");
@@ -73,16 +74,15 @@ const Events = struct {
 
     /// The index of the `nth` (0-based) record of `typ`, polling for up to `ms`.
     fn waitFor(ev: *Events, typ: abi.EventType, nth: usize, ms: u32) !usize {
-        var waited: u32 = 0;
+        const started = std.Io.Clock.awake.now(engine.threadedIo());
         while (true) {
             var seen: usize = 0;
             for (ev.list.items, 0..) |r, i| if (r.typ == @backingInt(typ)) {
                 if (seen == nth) return i;
                 seen += 1;
             };
-            if (waited >= ms) return error.TimedOut;
+            if (pastDeadline(started, ms)) return error.TimedOut;
             try ev.pump(50);
-            waited += 50;
         }
     }
 
@@ -230,6 +230,7 @@ test "capi jobs: admin answers JSON, and a discarded job is dead with the reason
     var user: u64 = 100;
     // Poll until the store write lands: the job turns dead.
     var tries: usize = 0;
+    const started = std.Io.Clock.awake.now(engine.threadedIo());
     while (true) : (tries += 1) {
         user += 1;
         try engine.jobs.admin(r.e, r.c, "{\"op\":\"jobs.list\",\"state\":\"dead\"}", user);
@@ -238,7 +239,7 @@ test "capi jobs: admin answers JSON, and a discarded job is dead with the reason
         try std.testing.expectEqual(abi.OK, rec.status);
         const json = r.ev.span(i, rec.json);
         if (std.mem.indexOf(u8, json, "not today") != null) break;
-        if (tries > 400) return error.TimedOut;
+        if (pastDeadline(started, 0)) return error.TimedOut;
         try Io.sleep(engine.threadedIo(), .fromMilliseconds(20), .awake);
     }
     try engine.jobs.admin(r.e, r.c, "{\"op\":\"jobs.nope\"}", 1);
@@ -274,4 +275,12 @@ test "capi jobs: stopping a worker with nothing out ends it" {
     try std.testing.expectEqual(wh, r.ev.list.items[i].handle);
     // Over: a second stop is quiet.
     engine.jobs.stop(r.e, wh);
+}
+
+/// Whether a wait that began at `started` has passed `ms`, or the wait
+/// helper's deadline (10 s times ANOLE_TEST_TIMEOUT_FACTOR) if that is later:
+/// a hang guard counted on the clock, not in polls.
+fn pastDeadline(started: std.Io.Timestamp, ms: u32) bool {
+    const limit: i64 = @max(ms, wait.deadlineMs());
+    return started.untilNow(engine.threadedIo(), .awake).toMilliseconds() >= limit;
 }

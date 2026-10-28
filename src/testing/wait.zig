@@ -84,6 +84,12 @@ pub fn deadline() std.Io.Duration {
     return .fromSeconds(@as(i64, default_deadline_s) * timeoutFactor());
 }
 
+/// `deadline()` in milliseconds, for an API that takes a timeout in them
+/// (a stop's wait, a poll).
+pub fn deadlineMs() u32 {
+    return @intCast(@min(deadline().toMilliseconds(), std.math.maxInt(i32)));
+}
+
 /// Waits until `cond(ctx)` holds, polling with a back-off from 1 ms to
 /// 50 ms, for `deadline()` at most. On a timeout it logs (at warn) "timed out after
 /// Ns waiting for: <what>" and returns `error.WaitTimedOut`. `cond` returns
@@ -146,6 +152,30 @@ pub fn waitAtLeast(io: std.Io, comptime what: []const u8, v: anytype, n: @TypeOf
         }
     };
     return waitUntil(io, what, Ctx{ .v = v, .n = n }, Ctx.reached);
+}
+
+/// Waits until the atomic `v` holds exactly `value`.
+pub fn waitEqual(io: std.Io, comptime what: []const u8, v: anytype, value: @TypeOf(v.raw)) WaitError!void {
+    const Ctx = struct {
+        v: @TypeOf(v),
+        value: @TypeOf(v.raw),
+        fn holds(c: @This()) bool {
+            return c.v.load(.acquire) == c.value;
+        }
+    };
+    return waitUntil(io, what, Ctx{ .v = v, .value = value }, Ctx.holds);
+}
+
+/// Waits until the atomic `v` is not zero, and returns what it holds.
+pub fn waitNonZero(io: std.Io, comptime what: []const u8, v: anytype) WaitError!@TypeOf(v.raw) {
+    const Ctx = struct {
+        v: @TypeOf(v),
+        fn set(c: @This()) bool {
+            return c.v.load(.acquire) != 0;
+        }
+    };
+    try waitUntil(io, what, Ctx{ .v = v }, Ctx.set);
+    return v.load(.acquire);
 }
 
 /// Waits until the atomic flag `v` is set.
@@ -216,6 +246,18 @@ test "wait: waitAtLeast waits for a counter, not for a fixed time" {
     defer t.join();
     try waitAtLeast(testing.io, "three increments", &n, 3);
     try testing.expect(n.load(.acquire) >= 3);
+}
+
+test "wait: waitEqual and waitNonZero wait for a value another thread stores" {
+    var v: std.atomic.Value(u64) = .init(0);
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(x: *std.atomic.Value(u64)) void {
+            x.store(42, .release);
+        }
+    }.run, .{&v});
+    defer t.join();
+    try testing.expectEqual(@as(u64, 42), try waitNonZero(testing.io, "the value stored", &v));
+    try waitEqual(testing.io, "the value is 42", &v, 42);
 }
 
 test "wait: expectStays passes while the condition holds for the window" {

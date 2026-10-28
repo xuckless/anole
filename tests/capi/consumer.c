@@ -49,6 +49,15 @@ static double now_ms(void) {
   return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
 }
 
+/* The end of a wait that starts now: 10 s times ANOLE_TEST_TIMEOUT_FACTOR,
+   as src/testing/wait.zig. A hang guard, never a latency bound. */
+static double wait_until(void) {
+  const char *f = getenv("ANOLE_TEST_TIMEOUT_FACTOR");
+  long n = f ? strtol(f, NULL, 10) : 1;
+  if (n < 1) n = 1;
+  return now_ms() + 10000.0 * (double)n;
+}
+
 static atomic_int log_lines;
 static void on_log(void *ud, uint32_t level, anole_str scope, anole_str msg) {
   (void)ud;
@@ -695,7 +704,7 @@ static void *hammer(void *arg) {
 }
 
 static int wait_for(atomic_int *v, int n) {
-  for (int i = 0; i < 1000 && atomic_load(v) < n; i++) usleep(2000);
+  for (double until = wait_until(); atomic_load(v) < n && now_ms() < until;) usleep(2000);
   return atomic_load(v) >= n;
 }
 
@@ -1035,7 +1044,7 @@ static void test_main_server(void) {
     close(fd);
     /* This request's own ABORT: the deadline checks above may still have
        theirs in flight. */
-    for (int i = 0; i < 1000 && atomic_load(&cs.last_abort) != cs.held[0]; i++) usleep(2000);
+    for (double until = wait_until(); atomic_load(&cs.last_abort) != cs.held[0] && now_ms() < until;) usleep(2000);
     CHECK(atomic_load(&cs.last_abort) == cs.held[0]);
     CHECK(anole_req_respond(cs.held[0], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
   }
@@ -1083,7 +1092,7 @@ static void test_main_server(void) {
       int frames = ws_flood(c.fd, 1000 * 1024, 200, &accepted, &cs.paused);
       CHECK(accepted < (size_t)48 << 20);
       CHECK(wait_for(&cs.ws_open, 3));
-      for (int i = 0; i < 1000 && atomic_load(&cs.ws_big) < big0 + frames; i++) usleep(5000);
+      for (double until = wait_until(); atomic_load(&cs.ws_big) < big0 + frames && now_ms() < until;) usleep(5000);
       CHECK(atomic_load(&cs.ws_big) == big0 + frames);
       close(c.fd);
       CHECK(wait_for(&cs.ws_closes, 3));
@@ -1285,7 +1294,7 @@ static void test_shared_consumer(void) {
   response_init(&b.r);
   CHECK(pthread_create(&t1, NULL, async_get, &a) == 0);
   CHECK(pthread_create(&t2, NULL, async_get, &b) == 0);
-  for (int i = 0; i < 1000 && atomic_load(&cs[0].nheld) + atomic_load(&cs[1].nheld) < 2; i++) usleep(2000);
+  for (double until = wait_until(); atomic_load(&cs[0].nheld) + atomic_load(&cs[1].nheld) < 2 && now_ms() < until;) usleep(2000);
   request(port, "GET", "/hello", NULL, &r);
   CHECK(r.status == 503);
   double t0 = now_ms();
@@ -2789,9 +2798,18 @@ static void test_db_request_tie(void) {
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 2 && r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 20000);
 
-  /* a stale request: GONE from the call, nothing queued */
-  usleep(100 * 1000);
-  CHECK(anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, &on_h, 3) == ANOLE_E_GONE && name_is("Gone"));
+  /* a stale request: GONE from the call, nothing queued. Its executor
+     frees the slot once the answer is written, which can be after the
+     client has it: until then the call is still taken (its result is
+     read here). */
+  int st;
+  for (double until = wait_until(); (st = anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, &on_h, 3)) == ANOLE_OK;) {
+    r = db_next(c, rec, sizeof rec);
+    CHECK(r->user_data == 3);
+    CHECK(now_ms() < until);
+    usleep(1000);
+  }
+  CHECK(st == ANOLE_E_GONE && name_is("Gone"));
   CHECK(count_events(c, ANOLE_EV_DB_RESULT, 100) == 0);
   /* another kind of handle, and a NULL consumer without a request */
   anole_db_options on_ws = {sizeof on_ws};
@@ -2824,8 +2842,16 @@ static void test_db_request_tie(void) {
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 11 && r->status == ANOLE_OK);
   CHECK(finish_get(a, t, NULL) == 504);
-  usleep(100 * 1000);
-  CHECK(anole_db_tx_exec(tx, LIT("INSERT INTO tt VALUES (2)"), NULL, 0, NULL, 12) == ANOLE_E_GONE);
+  /* The transaction ends on its executor after the 504 is written: until
+     then a statement is still taken (and rolled back with it). */
+  int st2;
+  for (double until = wait_until(); (st2 = anole_db_tx_exec(tx, LIT("INSERT INTO tt VALUES (2)"), NULL, 0, NULL, 12)) == ANOLE_OK;) {
+    r = db_next(c, rec, sizeof rec);
+    CHECK(r->user_data == 12);
+    CHECK(now_ms() < until);
+    usleep(1000);
+  }
+  CHECK(st2 == ANOLE_E_GONE);
   CHECK(db_count(db, c, "tt", 13) == 0);
 
   /* ... and survives the request's answer, bounded by its own timeout */
@@ -3051,7 +3077,8 @@ static void test_cleanup_rules(void) {
   anole_req h = next_request(c);
   CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
   CHECK(finish_get(a, t, NULL) == 200);
-  usleep(50 * 1000);
+  /* Answered: a second answer is GONE at once, whatever the executor has
+     freed yet. */
   uint64_t gone = gone_count(s);
   CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_E_GONE && name_is("Gone"));
   CHECK(anole_handle_release(h) == ANOLE_OK);
@@ -3206,7 +3233,7 @@ static void test_error_identity(void) {
     CHECK(write(fd, head, (size_t)n) == n);
     static _Alignas(8) unsigned char small[64], whole[64 * 1024];
     int64_t rc = 0;
-    for (int i = 0; i < 400; i++) {
+    for (double until = wait_until(); now_ms() < until;) {
       rc = anole_poll(c, small, sizeof small, 0);
       if (rc != 0) break;
       usleep(5000);
@@ -4050,7 +4077,7 @@ static void test_net(void) {
   /* The out counter moves once the send returns on the executor, which can
      be after the peer already has the datagram: wait for it. */
   anole_stats st = {.size = sizeof st};
-  for (int i = 0; i < 1000; i++) {
+  for (double until = wait_until(); now_ms() < until;) {
     CHECK(anole_server_stats(s, &st) == ANOLE_OK);
     if (st.udp_datagrams_in >= 1 && st.udp_datagrams_out >= 1) break;
     usleep(2000);

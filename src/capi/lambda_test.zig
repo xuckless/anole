@@ -4,6 +4,7 @@
 //! through Lambda, `timeout_us` following the invocation, and
 //! `anole_server_drain` during a held `/next`.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
 const config = @import("config.zig");
@@ -213,7 +214,7 @@ test "capi lambda: a consumer route and a fixed route answered through the Runti
     // The listener in the configuration is set aside: it reports port 0.
     try std.testing.expectEqual(@as(u16, 0), e.listeners[0].port);
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }
 
 test "capi lambda: timeout_us follows the invocation's deadline, not the longer route timeout" {
@@ -233,7 +234,7 @@ test "capi lambda: timeout_us follows the invocation's deadline, not the longer 
     try engine.respond(e, r.ev.handle, 204, &.{}, "", false);
     try waitPosts(&f, 1);
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }
 
 test "capi lambda: anole_server_drain during a held /next ends with ANOLE_EV_STOPPED" {
@@ -261,5 +262,5 @@ test "capi lambda: anole_server_drain during a held /next ends with ANOLE_EV_STO
         }
     }
     try std.testing.expect(stopped);
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }
