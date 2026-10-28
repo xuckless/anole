@@ -96,7 +96,10 @@ pub const Observer = struct {
     tracer: ?*observe.trace.Exporter = null,
 
     /// `registry` and `tracer` are the app's, when it has them
-    /// (`app.metrics`, `app.tracing`); `name` must outlive them.
+    /// (`app.metrics`, `app.tracing`); `name` must outlive them. A call
+    /// that ends after the app has closed its exporter (`App.deinit`
+    /// closes it first) has its span dropped and counted
+    /// (`Exporter.close`).
     pub fn init(system: db.System, name: []const u8, registry: ?*metrics.Registry, tracer: ?*observe.trace.Exporter) !Observer {
         return .{
             .system = system,

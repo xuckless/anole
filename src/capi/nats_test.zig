@@ -4,6 +4,7 @@
 //! The engine is driven through its Zig entry points, as in engine_test.zig.
 //! Waits poll the consumer with generous bounds; no assertion is about time.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
 const abi = engine.abi;
@@ -107,12 +108,11 @@ const Events = struct {
     /// The index of the first record of `typ` at or after `from`, polling
     /// for up to `ms`.
     fn waitFor(ev: *Events, typ: abi.EventType, from: usize, ms: u32) !usize {
-        var waited: u32 = 0;
+        const started = std.Io.Clock.awake.now(engine.threadedIo());
         while (true) {
             for (ev.list.items[from..], from..) |r, i| if (r.typ == @backingInt(typ)) return i;
-            if (waited >= ms) return error.TimedOut;
+            if (pastDeadline(started, ms)) return error.TimedOut;
             try ev.pump(50);
-            waited += 50;
         }
     }
 
@@ -188,7 +188,7 @@ const Rig = struct {
     fn deinit(r: *Rig) void {
         r.ev.deinit();
         r.e.drain() catch {};
-        _ = r.e.wait(5000);
+        _ = r.e.wait(@intCast(wait.deadlineMs()));
         r.e.destroy();
         r.fake.stop(std.testing.io);
         alloc.free(r.json);
@@ -200,12 +200,7 @@ fn out(subject: []const u8, payload: []const u8) abi.NatsOut {
 }
 
 fn waitAtLeast(v: *std.atomic.Value(u32), n: u32) !void {
-    const tio = engine.threadedIo();
-    for (0..2000) |_| {
-        if (v.load(.acquire) >= n) return;
-        try Io.sleep(tio, .fromMilliseconds(5), .awake);
-    }
-    return error.TimedOut;
+    try wait.waitAtLeast(engine.threadedIo(), "the fake server's counter reached its count", v, n);
 }
 
 test "capi nats: publish is taken (OK) and reaches the server" {
@@ -342,4 +337,12 @@ test "capi nats: past the outbound limit a publish is E_AGAIN; when the server r
     try r.ev.pump(0);
     const writable = r.ev.count(.nats_writable);
     try std.testing.expect(writable >= 1 and writable <= asked);
+}
+
+/// Whether a wait that began at `started` has passed `ms`, or the wait
+/// helper's deadline (10 s times ANOLE_TEST_TIMEOUT_FACTOR) if that is later:
+/// a hang guard counted on the clock, not in polls.
+fn pastDeadline(started: std.Io.Timestamp, ms: u32) bool {
+    const limit: i64 = @max(ms, wait.deadlineMs());
+    return started.untilNow(engine.threadedIo(), .awake).toMilliseconds() >= limit;
 }

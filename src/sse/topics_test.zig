@@ -4,6 +4,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const out_mod = @import("out.zig");
+const wait = @import("anole_test_wait");
 const replay = @import("replay.zig");
 
 const Topics = root.Topics;
@@ -37,7 +38,7 @@ const Harness = struct {
 
     fn onClose(sub: *Subscriber, reason: root.CloseReason) void {
         const rec: *Rec = @ptrCast(@alignCast(sub.context.?));
-        rec.h.last_reason.store(@intFromEnum(reason), .release);
+        rec.h.last_reason.store(@backingInt(reason), .release);
         rec.done.store(true, .release);
         _ = rec.h.closed.fetchAdd(1, .release);
     }
@@ -70,37 +71,55 @@ const Harness = struct {
         return h.recs.items[i].sub;
     }
 
-    /// Waits until `f` has written `n` bytes (polling; no deadline).
-    fn waitBytes(f: *Fake, n: usize) void {
-        while (true) {
-            f.mutex.lockUncancelable(io);
-            const have = f.bytes.items.len;
-            f.mutex.unlock(io);
-            if (have >= n) return;
-            io.sleep(.fromMilliseconds(1), .awake) catch return;
-        }
+    /// Waits until `f` has written `n` bytes.
+    fn waitBytes(f: *Fake, n: usize) !void {
+        const C = struct {
+            f: *Fake,
+            n: usize,
+            fn have(c: @This()) bool {
+                c.f.mutex.lockUncancelable(io);
+                defer c.f.mutex.unlock(io);
+                return c.f.bytes.items.len >= c.n;
+            }
+        };
+        try wait.waitUntil(io, "the subscriber's bytes written", C{ .f = f, .n = n }, C.have);
     }
 
-    fn waitWrites(f: *Fake, n: usize) void {
-        while (f.writes_done.load(.acquire) < n) io.sleep(.fromMilliseconds(1), .awake) catch return;
+    /// Waits until `f`'s output holds `needle` (read under its lock).
+    fn waitText(f: *Fake, needle: []const u8) !void {
+        const C = struct {
+            f: *Fake,
+            needle: []const u8,
+            fn has(c: @This()) bool {
+                c.f.mutex.lockUncancelable(io);
+                defer c.f.mutex.unlock(io);
+                return std.mem.indexOf(u8, c.f.bytes.items, c.needle) != null;
+            }
+        };
+        try wait.waitUntil(io, "the subscriber's output holds the text", C{ .f = f, .needle = needle }, C.has);
+    }
+
+    fn waitWrites(f: *Fake, n: usize) !void {
+        try wait.waitAtLeast(io, "the subscriber's writes done", &f.writes_done, @intCast(n));
     }
 
     /// Waits until subscriber `i` is armed and its sender has finished
     /// (`last_write_ms` set by its last write, under the hub's lock).
-    fn waitSettled(h: *Harness, i: usize) error{NeverSettled}!void {
-        const sub = h.subAt(i);
-        for (0..5000) |_| {
-            h.hub.mutex.lockUncancelable(io);
-            const settled = sub.armed and !sub.running;
-            h.hub.mutex.unlock(io);
-            if (settled) return;
-            io.sleep(.fromMilliseconds(1), .awake) catch {};
-        }
-        return error.NeverSettled;
+    fn waitSettled(h: *Harness, i: usize) !void {
+        const C = struct {
+            h: *Harness,
+            sub: *Subscriber,
+            fn settled(c: @This()) bool {
+                c.h.hub.mutex.lockUncancelable(io);
+                defer c.h.hub.mutex.unlock(io);
+                return c.sub.armed and !c.sub.running;
+            }
+        };
+        try wait.waitUntil(io, "the subscriber armed and its sender finished", C{ .h = h, .sub = h.subAt(i) }, C.settled);
     }
 
-    fn waitClosed(h: *Harness, n: u32) void {
-        while (h.closed.load(.acquire) < n) io.sleep(.fromMilliseconds(1), .awake) catch return;
+    fn waitClosed(h: *Harness, n: u32) !void {
+        try wait.waitAtLeast(io, "the subscribers closed", &h.closed, n);
     }
 
     fn text(f: *Fake) []const u8 {
@@ -118,7 +137,8 @@ const Harness = struct {
                 Topics._gone(rec.sub);
             }
         }
-        h.waitClosed(base + open);
+        // A teardown cannot fail the test; a hang here is a bug.
+        h.waitClosed(base + open) catch |err| std.debug.panic("sse test teardown: {t}", .{err});
         h.hub.deinit();
         for (h.fakes.items) |f| {
             f.open();
@@ -154,7 +174,7 @@ test "sse: publish reaches every subscriber once, in publish order" {
         try expect.writer.print("id: {x:0>8}-{d}\ndata: {s}\n\n", .{ h.hub.epoch, i + 1, d });
     }
     for ([_]*Fake{ a, b, c }) |f| {
-        Harness.waitBytes(f, expect.written().len);
+        try Harness.waitBytes(f, expect.written().len);
         try std.testing.expectEqualStrings(expect.written(), Harness.text(f));
     }
 }
@@ -170,7 +190,7 @@ test "sse: events queued behind a write go out in one write" {
         _ = try h.hub.publish("t", .{ .data = try std.fmt.bufPrint(&data, "{d}", .{i}) });
     }
     f.open();
-    Harness.waitWrites(f, 2);
+    try Harness.waitWrites(f, 2);
     f.mutex.lockUncancelable(io);
     defer f.mutex.unlock(io);
     try std.testing.expectEqual(@as(usize, 2), f.writes.items.len);
@@ -195,7 +215,7 @@ test "sse: ids are <epoch>-<seq>, one sequence across topics" {
     try w.writer.print("{s}data: 1\n\n", .{h.expectId(&buf1, 1)});
     try w.writer.print("{s}event: named\ndata: 2\n\n", .{h.expectId(&buf2, 2)});
     try w.writer.print("{s}data: 3\n\n", .{h.expectId(&buf3, 3)});
-    Harness.waitBytes(f, w.written().len);
+    try Harness.waitBytes(f, w.written().len);
     try std.testing.expectEqualStrings(w.written(), Harness.text(f));
 }
 
@@ -205,7 +225,7 @@ test "sse: the open line carries retry when set" {
     const f = try h.add(&.{"t"}, null);
     var want: [64]u8 = undefined;
     const open = try std.fmt.bufPrint(&want, "retry: 2500\nid: {x:0>8}-0\n\n", .{h.hub.epoch});
-    Harness.waitBytes(f, open.len);
+    try Harness.waitBytes(f, open.len);
     try std.testing.expectEqualStrings(open, Harness.text(f));
 }
 
@@ -224,7 +244,7 @@ test "sse: resume replays exactly the missed events of two topics, merged by seq
     _ = try h.hub.publish("b", .{ .data = "b4" }); // 4
     var buf: [40]u8 = undefined;
     const f = try h.add(&.{ "a", "b" }, idOf(h, 2, &buf));
-    Harness.waitBytes(f, 1);
+    try Harness.waitBytes(f, 1);
     // Open line, then 3 and 4 in order.
     var want: std.Io.Writer.Allocating = .init(gpa);
     defer want.deinit();
@@ -232,7 +252,7 @@ test "sse: resume replays exactly the missed events of two topics, merged by seq
     var b2: [40]u8 = undefined;
     try want.writer.print("id: {x:0>8}-4\n\n", .{h.hub.epoch});
     try want.writer.print("{s}data: a3\n\n{s}data: b4\n\n", .{ h.expectId(&b1, 3), h.expectId(&b2, 4) });
-    Harness.waitBytes(f, want.written().len);
+    try Harness.waitBytes(f, want.written().len);
     try std.testing.expectEqualStrings(want.written(), Harness.text(f));
 }
 
@@ -254,7 +274,7 @@ test "sse: a resume older than the ring is one gap event, other topics replay" {
     try want.writer.print("id: {x:0>8}-6\n\n", .{h.hub.epoch});
     try want.writer.print("{s}data: b\n\n", .{h.expectId(&b1, 6)});
     try want.writer.print("event: gap\nid: {x:0>8}-6\ndata: {{\"topics\":[\"a\"]}}\n\n", .{h.hub.epoch});
-    Harness.waitBytes(f, want.written().len);
+    try Harness.waitBytes(f, want.written().len);
     try std.testing.expectEqualStrings(want.written(), Harness.text(f));
 }
 
@@ -266,8 +286,8 @@ test "sse: another epoch or a malformed id is a gap for every topic" {
     const f = try h.add(&.{ "a", "b" }, "ffffffff-1");
     const g = try h.add(&.{ "a", "b" }, "garbage");
     for ([_]*Fake{ f, g }) |fk| {
-        Harness.waitBytes(fk, 1);
-        while (std.mem.count(u8, Harness.text(fk), "event: gap") == 0) io.sleep(.fromMilliseconds(1), .awake) catch return;
+        try Harness.waitBytes(fk, 1);
+        try Harness.waitText(fk, "event: gap");
         try std.testing.expect(std.mem.indexOf(u8, Harness.text(fk), "{\"topics\":[\"a\",\"b\"]}") != null);
         try std.testing.expect(std.mem.indexOf(u8, Harness.text(fk), "data: x") == null);
     }
@@ -280,7 +300,7 @@ test "sse: a resume over max_per_resume is a gap" {
     for (0..5) |_| _ = try h.hub.publish("t", .{ .data = "x" });
     var buf: [40]u8 = undefined;
     const f = try h.add(&.{"t"}, idOf(h, 0, &buf));
-    while (std.mem.count(u8, Harness.text(f), "event: gap") == 0) io.sleep(.fromMilliseconds(1), .awake) catch return;
+    try Harness.waitText(f, "event: gap");
     try std.testing.expect(std.mem.indexOf(u8, Harness.text(f), "data: x") == null);
 }
 
@@ -291,7 +311,7 @@ test "sse: a topic outlives its last member by max_age; after the sweep a resume
     _ = f;
     _ = try h.hub.publish("t", .{ .data = "one" });
     Topics._gone(h.subAt(0));
-    h.waitClosed(1);
+    try h.waitClosed(1);
     // Within max_age: the topic still records, and a resume is exact.
     try std.testing.expectEqual(@as(usize, 0), try h.hub.publish("t", .{ .data = "two" }));
     var buf: [40]u8 = undefined;
@@ -300,16 +320,16 @@ test "sse: a topic outlives its last member by max_age; after the sweep a resume
     defer want.deinit();
     var b1: [40]u8 = undefined;
     try want.writer.print("id: {x:0>8}-2\n\n{s}data: two\n\n", .{ h.hub.epoch, h.expectId(&b1, 2) });
-    Harness.waitBytes(g, want.written().len);
+    try Harness.waitBytes(g, want.written().len);
     try std.testing.expectEqualStrings(want.written(), Harness.text(g));
     // The last member goes again; past max_age the sweep removes the topic.
     Topics._gone(h.subAt(1));
-    h.waitClosed(2);
+    try h.waitClosed(2);
     _ = h.hub._tick(0, 1000 + 61_000);
     try std.testing.expectEqual(@as(usize, 0), h.hub.stats().topics);
     // A client that last saw seq 1 missed seq 2, which the swept topic forgot.
     const k = try h.add(&.{"t"}, idOf(h, 1, &buf));
-    while (std.mem.count(u8, Harness.text(k), "event: gap") == 0) io.sleep(.fromMilliseconds(1), .awake) catch return;
+    try Harness.waitText(k, "event: gap");
 }
 
 test "sse: events with replay=false are delivered, never replayed; replay=null sends no ids" {
@@ -318,19 +338,19 @@ test "sse: events with replay=false are delivered, never replayed; replay=null s
         defer h.deinit();
         const live = try h.add(&.{"t"}, null);
         _ = try h.hub.publish("t", .{ .data = "typing", .replay = false });
-        Harness.waitBytes(live, 40);
+        try Harness.waitBytes(live, 40);
         try std.testing.expect(std.mem.indexOf(u8, Harness.text(live), "data: typing") != null);
         var buf: [40]u8 = undefined;
         const late = try h.add(&.{"t"}, idOf(h, 0, &buf));
         // seq 1 is not in the ring, and the ring cannot say it is complete.
-        while (std.mem.count(u8, Harness.text(late), "event: gap") == 0) io.sleep(.fromMilliseconds(1), .awake) catch return;
+        try Harness.waitText(late, "event: gap");
     }
     {
         const h = try Harness.init(.{ .replay = null });
         defer h.deinit();
         const f = try h.add(&.{"t"}, null);
         _ = try h.hub.publish("t", .{ .data = "x" });
-        Harness.waitBytes(f, "data: x\n\n".len);
+        try Harness.waitBytes(f, "data: x\n\n".len);
         try std.testing.expectEqualStrings("data: x\n\n", Harness.text(f));
     }
 }
@@ -349,7 +369,7 @@ test "sse: last=N gives the newest N per topic, merged by seq" {
     var b2: [40]u8 = undefined;
     // Newest one of each: b2 (seq 2) and a3 (seq 3).
     try want.writer.print("id: {x:0>8}-3\n\n{s}data: b2\n\n{s}data: a3\n\n", .{ h.hub.epoch, h.expectId(&b1, 2), h.expectId(&b2, 3) });
-    Harness.waitBytes(f, want.written().len);
+    try Harness.waitBytes(f, want.written().len);
     try std.testing.expectEqualStrings(want.written(), Harness.text(f));
 }
 
@@ -365,14 +385,7 @@ test "sse: a heartbeat tick writes a comment only to subscribers idle for the in
     _ = h.hub._tick(0, 1000 + 5_000);
     try std.testing.expectEqual(@as(u32, 1), idle.writes_done.load(.acquire));
     _ = h.hub._tick(0, 1000 + 10_000);
-    for (0..5000) |_| {
-        idle.mutex.lockUncancelable(io);
-        const beat = std.mem.indexOf(u8, Harness.text(idle), ":\n\n") != null;
-        idle.mutex.unlock(io);
-        if (beat) return;
-        io.sleep(.fromMilliseconds(1), .awake) catch {};
-    }
-    return error.NoHeartbeat;
+    try Harness.waitText(idle, ":\n\n");
 }
 
 test "sse: on_full=close: what is queued goes out, then the stream ends (slow)" {
@@ -388,8 +401,8 @@ test "sse: on_full=close: what is queued goes out, then the stream ends (slow)" 
     for (0..20) |_| took += try h.hub.publish("t", .{ .data = "more" });
     try std.testing.expect(took >= 1 and took < 20);
     f.open();
-    h.waitClosed(1);
-    try std.testing.expectEqual(@as(u32, @intFromEnum(root.CloseReason.slow)), h.last_reason.load(.acquire));
+    try h.waitClosed(1);
+    try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.slow)), h.last_reason.load(.acquire));
     try std.testing.expect(f.ended);
     try std.testing.expectEqual(@as(u64, 1), h.hub.stats().closed_slow);
     // What was queued went out before the end.
@@ -405,10 +418,10 @@ test "sse: on_full=drop: the full subscriber misses the event, the others get it
     slow.held.wait(io) catch unreachable;
     // One at a time, each waited for on the fast one, so only the held one
     // fills up (the fast one has the same cap).
-    Harness.waitBytes(fast, "data: first\n\n".len);
+    try Harness.waitBytes(fast, "data: first\n\n".len);
     for (1..21) |i| {
         _ = try h.hub.publish("t", .{ .data = "more" });
-        Harness.waitBytes(fast, "data: first\n\n".len + i * "data: more\n\n".len);
+        try Harness.waitBytes(fast, "data: first\n\n".len + i * "data: more\n\n".len);
     }
     try std.testing.expect(h.hub.stats().dropped > 0);
     try std.testing.expectEqual(@as(usize, 20), std.mem.count(u8, Harness.text(fast), "data: more"));
@@ -434,14 +447,7 @@ test "sse: an event queued while the sender ends its burst still goes out" {
     // The open line was written before the hook was set: one more event
     // makes a burst whose end runs the hook.
     if (already) try h.subAt(0).send(.{ .data = "first" });
-    for (0..5000) |_| {
-        f.mutex.lockUncancelable(io);
-        const sent = std.mem.indexOf(u8, Harness.text(f), "data: late\n\n") != null;
-        f.mutex.unlock(io);
-        if (sent) return;
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
-    return error.LateEventNeverSent;
+    try Harness.waitText(f, "data: late\n\n");
 }
 
 test "sse: Subscriber.send reaches one subscriber, with no id; Full past the cap" {
@@ -449,10 +455,10 @@ test "sse: Subscriber.send reaches one subscriber, with no id; Full past the cap
     defer h.deinit();
     const a = try h.add(&.{"t"}, null);
     const b = try h.add(&.{"t"}, null);
-    Harness.waitWrites(a, 1);
-    Harness.waitWrites(b, 1);
+    try Harness.waitWrites(a, 1);
+    try Harness.waitWrites(b, 1);
     try h.subAt(0).send(.{ .data = "private", .event = "dm" });
-    while (std.mem.indexOf(u8, Harness.text(a), "event: dm\ndata: private\n\n") == null) io.sleep(.fromMilliseconds(1), .awake) catch return;
+    try Harness.waitText(a, "event: dm\ndata: private\n\n");
     try std.testing.expect(std.mem.indexOf(u8, Harness.text(b), "private") == null);
     // Full: a held writer so the queue fills.
     const f = try h.addHeld(&.{"t"});
@@ -490,8 +496,8 @@ test "sse: the peer gone with events queued: leaves every topic, on_close(client
     _ = try h.hub.publish("b", .{ .data = "y" });
     Topics._gone(h.subAt(0));
     f.open();
-    h.waitClosed(1);
-    try std.testing.expectEqual(@as(u32, @intFromEnum(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
+    try h.waitClosed(1);
+    try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), h.hub.count("a"));
     try std.testing.expectEqual(@as(usize, 0), h.hub.stats().subscribers);
     try std.testing.expect(f.released);
@@ -503,19 +509,19 @@ test "sse: the drain gives each subscriber a retry from the spread, then ends th
     const a = try h.add(&.{"t"}, null);
     const b = try h.add(&.{"t"}, null);
     h.hub._drainNow();
-    h.waitClosed(2);
+    try h.waitClosed(2);
     for ([_]*Fake{ a, b }) |f| {
         try std.testing.expect(f.ended);
         try std.testing.expect(std.mem.indexOf(u8, Harness.text(f), "retry: ") != null);
     }
-    try std.testing.expectEqual(@as(u32, @intFromEnum(root.CloseReason.drain)), h.last_reason.load(.acquire));
+    try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.drain)), h.last_reason.load(.acquire));
     // The spread differs between the two (indexes 0 and 1).
     const ta = Harness.text(a);
     const tb = Harness.text(b);
     try std.testing.expect(!std.mem.eql(u8, ta[std.mem.indexOf(u8, ta, "retry: ").?..], tb[std.mem.indexOf(u8, tb, "retry: ").?..]));
     // A subscribe during the drain: open line, retry, end.
     const late = try h.add(&.{"t"}, null);
-    h.waitClosed(3);
+    try h.waitClosed(3);
     try std.testing.expect(late.ended);
 }
 
@@ -535,13 +541,13 @@ test "sse: Subscriber.join and leave: events after the call" {
     const h = try Harness.init(.{});
     defer h.deinit();
     const f = try h.add(&.{"a"}, null);
-    Harness.waitWrites(f, 1);
+    try Harness.waitWrites(f, 1);
     try std.testing.expectEqual(@as(usize, 0), try h.hub.publish("b", .{ .data = "before" }));
     try h.subAt(0).join("b", .{});
     try std.testing.expectEqual(@as(usize, 1), try h.hub.publish("b", .{ .data = "after-join" }));
     h.subAt(0).leave("b");
     try std.testing.expectEqual(@as(usize, 0), try h.hub.publish("b", .{ .data = "after-leave" }));
-    while (std.mem.indexOf(u8, Harness.text(f), "after-join") == null) io.sleep(.fromMilliseconds(1), .awake) catch return;
+    try Harness.waitText(f, "after-join");
     try std.testing.expect(std.mem.indexOf(u8, Harness.text(f), "after-leave") == null);
 }
 
@@ -550,13 +556,13 @@ test "sse: a write error ends the subscriber (client_gone)" {
     defer h.deinit();
     const f = try h.add(&.{"t"}, null);
     _ = f;
-    h.waitClosed(0);
+    try h.waitClosed(0);
     // The first write (the open line) may already be done: fail the next.
-    Harness.waitWrites(h.fakes.items[0], 1);
+    try Harness.waitWrites(h.fakes.items[0], 1);
     h.fakes.items[0].fail_with = error.Gone;
     _ = try h.hub.publish("t", .{ .data = "x" });
-    h.waitClosed(1);
-    try std.testing.expectEqual(@as(u32, @intFromEnum(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
+    try h.waitClosed(1);
+    try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
 }
 
 test "sse: routes: templates are checked against the path" {
@@ -577,7 +583,7 @@ const ZioCase = struct {
 
     fn onClose(sub: *Subscriber, reason: root.CloseReason) void {
         const c: *ZioCase = @ptrCast(@alignCast(sub.context.?));
-        c.reason.store(@intFromEnum(reason), .release);
+        c.reason.store(@backingInt(reason), .release);
         _ = c.closed.fetchAdd(1, .release);
     }
 
@@ -595,8 +601,8 @@ const ZioCase = struct {
         return c.hub._attach(rio, c.f.out(), .{ .topics = &.{"t"}, .context = c, .on_close = onClose }, null);
     }
 
-    fn waitClosed(c: *ZioCase) void {
-        while (c.closed.load(.acquire) == 0) c.rt.io().sleep(.fromMilliseconds(1), .awake) catch return;
+    fn waitClosed(c: *ZioCase) !void {
+        try wait.waitAtLeast(c.rt.io(), "the subscriber closed", &c.closed, 1);
     }
 
     fn deinit(c: *ZioCase) void {
@@ -622,8 +628,8 @@ test "sse: on_full=close with a stuck sender: the tick past close_after aborts t
     try std.testing.expectEqual(@as(u32, 0), c.closed.load(.acquire));
     // Past it: the sender is canceled and the stream aborted.
     _ = c.hub._tick(0, 1000 + 1_500);
-    c.waitClosed();
-    try std.testing.expectEqual(@as(u32, @intFromEnum(root.CloseReason.slow)), c.reason.load(.acquire));
+    try c.waitClosed();
+    try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.slow)), c.reason.load(.acquire));
     try std.testing.expect(c.f.aborted);
     try std.testing.expect(!c.f.ended);
     try std.testing.expectEqual(@as(u32, 0), c.f.writes_done.load(.acquire));
@@ -637,8 +643,8 @@ test "sse: leave while a write is under way: nothing is written after the end re
     _ = try c.hub.publish("t", .{ .data = "x" });
     c.f.held.wait(rio) catch unreachable;
     Topics._gone(sub);
-    c.waitClosed();
-    try std.testing.expectEqual(@as(u32, @intFromEnum(root.CloseReason.client_gone)), c.reason.load(.acquire));
+    try c.waitClosed();
+    try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.client_gone)), c.reason.load(.acquire));
     try std.testing.expect(c.f.released);
     // The held write was canceled: letting it go writes nothing.
     c.f.open();

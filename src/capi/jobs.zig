@@ -691,6 +691,9 @@ const EnqReq = struct {
     user_data: u64,
     items: []Wire,
     arena: std.heap.ArenaAllocator,
+    /// `opts.req`'s trace context, read when the call was made (the
+    /// request may be answered and gone before this runs).
+    trace: engine.TraceContext = .{},
 
     fn free(q: *EnqReq) void {
         var arena = q.arena;
@@ -720,7 +723,8 @@ const EnqReq = struct {
         var message: []const u8 = "";
         var n: usize = 0;
         for (q.items) |wi| {
-            const r = client.enqueueRaw(&ctx, wi.kind, wi.args_json, optionsOf(wi)) catch |err| {
+            const o = if (q.trace.traceparent) |tp| J.Client.addTrace(a, optionsOf(wi), tp, q.trace.tracestate) catch optionsOf(wi) else optionsOf(wi);
+            const r = client.enqueueRaw(&ctx, wi.kind, wi.args_json, o) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 status = if (err == error.InvalidJob) abi.E_INVALID else abi.E_DB;
                 http = switch (err) {
@@ -786,8 +790,11 @@ pub fn enqueue(e: *Engine, c: ?*Consumer, outs: []const abi.JobOut, opts: abi.Jo
         if (cc.execs.items.len == 0) return error.State;
         break :blk cc.execs.items[cc.next_db.fetchAdd(1, .monotonic) % cc.execs.items.len];
     };
+    // The request's context now, on this thread, while the request is
+    // still owed its answer: by the time the command runs it may be gone.
+    const trace: engine.TraceContext = if (opts.req != 0) try engine.requestTrace(e, opts.req, a) else .{};
     const q = a.create(EnqReq) catch return error.OutOfMemory;
-    q.* = .{ .e = e, .user_data = user_data, .items = items, .arena = arena };
+    q.* = .{ .e = e, .user_data = user_data, .items = items, .arena = arena, .trace = trace };
     x.post(&q.cmd);
 }
 

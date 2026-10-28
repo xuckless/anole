@@ -1,6 +1,7 @@
 //! Raw UDP servers over loopback (design-net.md §8.4). Deterministic: waits
 //! are on datagrams arriving or counters; nothing asserts a latency.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const builtin = @import("builtin");
 const server_mod = @import("../server.zig");
 const net = @import("root.zig");
@@ -111,9 +112,9 @@ test "net udp: a datagram over max_datagram is dropped and counted" {
             const big: [200]u8 = @splat('x');
             try c.send(io, &to, &big);
             try c.send(io, &to, "small");
-            while (Counting.seen.load(.acquire) < 1) try io.sleep(.fromMilliseconds(1), .awake);
-            // The small one was handled; the big one never was.
-            try io.sleep(.fromMilliseconds(20), .awake);
+            try wait.waitAtLeast(io, "the small datagram was handled", &Counting.seen, 1);
+            // The small one was handled; the big one, sent before it, never
+            // was (one socket reads in order: it was dropped first).
             try std.testing.expectEqual(@as(u32, 1), Counting.seen.load(.acquire));
             try std.testing.expectEqual(@as(u64, 1), a.netStats().datagrams_dropped);
         }
@@ -160,7 +161,7 @@ test "net udp: sessions open, carry state, and close on idle" {
             try expectDatagram(io, c, "m#2");
             try std.testing.expectEqual(@as(u32, 1), Game.opened.load(.acquire));
             // Silent: the session ends by idle (waits for the event).
-            while (Game.closed.load(.acquire) < 1) try io.sleep(.fromMilliseconds(5), .awake);
+            try wait.waitAtLeast(io, "the idle session ended", &Game.closed, 1);
             try std.testing.expectEqual(@backingInt(net.Session.EndReason.idle), Game.close_reason.load(.acquire));
             // A new datagram opens a new session, with fresh state.
             try c.send(io, &to, "m");

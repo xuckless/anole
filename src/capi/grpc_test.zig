@@ -4,6 +4,7 @@
 //! gRPC client, HTTP/1.1 client and h2 client check what goes out. The C
 //! suite (tests/capi/grpc.c) covers the exported API over gRPC-Web.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const dusty = @import("dusty");
 const engine = @import("engine.zig");
@@ -185,13 +186,13 @@ const Consumer = struct {
     }
 };
 
+/// What `v` holds once it is `want` (or, with no `want`, not zero).
 fn waitUntil(io: std.Io, v: *std.atomic.Value(u64), want: ?u64) !u64 {
-    for (0..2500) |_| {
-        const got = v.load(.acquire);
-        if (if (want) |w| got == w else got != 0) return got;
-        try io.sleep(.fromMilliseconds(2), .awake);
+    if (want) |w| {
+        try wait.waitEqual(io, "the consumer heard the held request's ABORT", v, w);
+        return w;
     }
-    return error.TimedOut;
+    return wait.waitNonZero(io, "the consumer holds the request", v);
 }
 
 const Http1 = struct { status: u16, body: []const u8 };
@@ -373,11 +374,13 @@ fn check(a: *Consumer, port: u16, io: std.Io) !void {
         try std.testing.expectEqual(grpc.Code.ok, r.status.code);
         try std.testing.expectEqual(grpc.health.ServingStatus.SERVING, r.message.?.status);
         try grpc_capi.healthSet(a.e, "anole.test.Echo", abi.GRPC_HEALTH_NOT_SERVING);
-        for (0..500) |_| {
+        const started = std.Io.Clock.awake.now(io);
+        while (true) {
             const again = try hc.unary("Check", arena, .{ .service = "anole.test.Echo" }, .{});
             if (again.message.?.status == .NOT_SERVING) break;
+            if (started.untilNow(io, .awake).nanoseconds >= wait.deadline().nanoseconds) return error.TimedOut;
             try io.sleep(.fromMilliseconds(2), .awake);
-        } else return error.TimedOut;
+        }
     }
 }
 
@@ -422,7 +425,7 @@ test "capi grpc: every call mode over h2c, status and metadata, deadlines, cance
     try f.await(io);
     try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
     try std.testing.expectEqual(@as(u64, 0), e.stats().inflight);
 }
 
@@ -543,7 +546,7 @@ test "capi grpc over HTTP/3: detached unary, server stream, bidi, status and tra
     try f.await(io);
     try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
     try std.testing.expectEqual(@as(u64, 0), e.stats().inflight);
 }
 

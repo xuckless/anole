@@ -419,15 +419,20 @@ const captured = struct {
         else => false,
     };
 
-    /// At a fatal signal (`signal` names it): ends the capture and writes
-    /// what was held with write(2), which a signal handler may call
-    /// (std.debug.print takes stderr's lock, which the crashing thread may
-    /// hold). The lock is tried once, never waited for: the crash may be
-    /// inside `append` on this very thread. A second call (the segfault
-    /// handler ends in abort) finds the capture over and writes nothing.
+    /// Set by the first `crashFlush`: the process is ending.
+    var crash_flushed: std.atomic.Value(bool) = .init(false);
+
+    /// At a panic or a fatal signal (`signal` names it): ends the capture
+    /// and writes what was held with write(2), which a signal handler may
+    /// call (std.debug.print takes stderr's lock, which the crashing thread
+    /// may hold). The lock is tried once, never waited for: the crash may
+    /// be inside `append` on this very thread. Only the first call writes
+    /// (a panic and the segfault handler end in abort, which calls it
+    /// again).
     fn crashFlush(signal: []const u8) void {
         @disableInstrumentation();
         if (comptime !can_flush_on_crash) return;
+        if (crash_flushed.swap(true, .acq_rel)) return;
         if (lock.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {
             rawWrite("\n--- the test's held log lines are lost: a log line was being stored when it crashed\n");
             return;
@@ -447,6 +452,24 @@ const captured = struct {
         rawWrite(h.first);
         rawWrite(h.second);
         rawWrite("--- end of its log\n");
+    }
+
+    /// At a panic: `crashFlush` where fatal signals reach it; elsewhere
+    /// (Windows) the same try-once take, printed with std.debug.print as
+    /// the panic's own report is.
+    fn panicFlush() void {
+        @disableInstrumentation();
+        if (comptime can_flush_on_crash) return crashFlush("panic");
+        if (lock.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {
+            std.debug.print("\n--- the test's held log lines are lost: a log line was being stored when it panicked\n", .{});
+            return;
+        }
+        const was_on = on.load(.monotonic);
+        on.store(false, .release);
+        const n = total;
+        release();
+        // No writer touches the ring once `on` is false.
+        if (was_on) print(&ring, n, "its log");
     }
 
     /// write(2) to stderr until done or an error other than EINTR.
@@ -516,12 +539,23 @@ pub const debug = struct {
     }
 };
 
+/// ANOLE: for `zig build crash-probe` only (src/safety/crash_probe.zig):
+/// takes the capture's lock and keeps it, as a thread that panics inside
+/// `captured.append` does.
+pub const crash_probe = struct {
+    pub fn holdCaptureLock() void {
+        captured.acquire();
+    }
+};
+
 /// ANOLE: a panic prints the test's held log lines first.
 pub const panic = std.debug.FullPanic(panicWithLog);
 
 fn panicWithLog(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @branchHint(.cold);
-    captured.end(true);
+    // Never `end`, which waits for the lock: the panic may come from
+    // inside `append` on this thread, which holds it.
+    captured.panicFlush();
     std.debug.defaultPanic(msg, first_trace_addr);
 }
 

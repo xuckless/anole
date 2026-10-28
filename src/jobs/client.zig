@@ -112,12 +112,22 @@ pub const Client = struct {
     /// The server's drain event: set by `app.jobs`, so the queue drains when serving does.
     drain_event: ?*std.Io.Event = null,
     metrics: ?*metrics_mod.Series = null,
+    /// The app's exporter (`start`): a span per run. Process-wide (M2),
+    /// owned by the app, which closes it first in `App.deinit` (it sends
+    /// through the server's client) and frees it last, after the runtime
+    /// has stopped. A run that settles in between (the drain cancels it)
+    /// calls `job` on a closed exporter: the span is dropped and counted,
+    /// with nothing allocated (`Exporter.close`).
+    tracer: ?*observe.trace.Exporter = null,
     last_gauges: i64 = 0,
     /// Set before the tasks are canceled (drain, deinit).
     closing: std.atomic.Value(bool) = .init(false),
     /// When the drain stops waiting for the runs it canceled (awake clock,
     /// ns); maxInt while not draining. Bounds the outcome writes.
     drain_gives_up_ns: std.atomic.Value(i64) = .init(std.math.maxInt(i64)),
+    /// Wake-ups from the store's listener, the one it sends once it listens
+    /// included: a test waits for the first before it counts on a wake.
+    wake_kicks: std.atomic.Value(u32) = .init(0),
 
     /// `app.jobs(options)` calls it; outside an app, `init`, `start`, `drain`, `deinit`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
@@ -280,10 +290,10 @@ pub const Client = struct {
 
     /// Migrates, loads cron state, starts fetchers, heartbeat, wakes, leader (per `run`).
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
-        _ = tracer;
         _ = health;
         if (self.started) return;
         self.started = true;
+        self.tracer = tracer;
         if (registry) |r| {
             const mm = try self.gpa.create(metrics_mod.Series);
             errdefer self.gpa.destroy(mm);
@@ -348,6 +358,7 @@ pub const Client = struct {
 
     fn kickFromStore(context: ?*anyopaque, queue: []const u8) void {
         const self: *Client = @ptrCast(@alignCast(context.?));
+        _ = self.wake_kicks.fetchAdd(1, .release);
         if (queue.len == 0) {
             for (self.queues) |*q| q.signal.set(self.io);
         } else self.wakeQueue(queue);
@@ -536,18 +547,32 @@ pub const Client = struct {
         }
     }
 
-    /// `opts` with the caller's `traceparent` added to its meta: a traced
-    /// request's span, or the one the running job came with.
+    /// `opts` with the caller's trace context added to its meta: a
+    /// request's (`observe.trace.current`: its span when traced here, the
+    /// caller's as it came otherwise; the trace flags kept), or a running
+    /// job's (its own span when traced, else the context it came with).
     fn withTrace(self: *Client, c: anytype, opts: EnqueueOptions) Error!EnqueueOptions {
         _ = self;
-        const arena = c.arena;
-        var tp: ?[]const u8 = null;
+        var buf: [55]u8 = undefined;
         if (internal.requestOf(c)) |req| {
-            if (req.trace_id.len == 32 and req.span_id.len == 16) tp = std.fmt.allocPrint(arena, "00-{s}-{s}-01", .{ req.trace_id, req.span_id }) catch return error.OutOfMemory;
+            const tp = observe.trace.current(req, &buf) orelse return opts;
+            return addTrace(c.arena, opts, tp, observe.trace.currentState(req));
         } else if (comptime @typeInfo(@TypeOf(c)) == .pointer and @typeInfo(@TypeOf(c)).pointer.child == Job) {
-            tp = c.traceparent();
+            if (c.span_id.len == 16 and c.trace_id.len == 32) {
+                // Recorded, so sampled; the run's trace has no tracestate of its own.
+                const tp = std.fmt.bufPrint(&buf, "00-{s}-{s}-01", .{ c.trace_id, c.span_id }) catch return opts;
+                return addTrace(c.arena, opts, tp, null);
+            }
+            return addTrace(c.arena, opts, c.traceparent() orelse return opts, c.tracestate());
         }
-        const t = tp orelse return opts;
+        return opts;
+    }
+
+    /// `opts` with `traceparent` (and `tracestate` when given) added to its
+    /// meta, unless the meta sets its own (or is not a JSON object). For
+    /// the C ABI, whose enqueue reads its request's context on the
+    /// request's executor.
+    pub fn addTrace(arena: std.mem.Allocator, opts: EnqueueOptions, traceparent: []const u8, tracestate: ?[]const u8) Error!EnqueueOptions {
         var obj: std.json.ObjectMap = .empty;
         if (opts.meta) |m| {
             const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, m, .{}) catch return opts;
@@ -555,7 +580,8 @@ pub const Client = struct {
             obj = parsed.object;
         }
         if (obj.contains("traceparent")) return opts;
-        obj.put(arena, "traceparent", .{ .string = t }) catch return error.OutOfMemory;
+        obj.put(arena, "traceparent", .{ .string = traceparent }) catch return error.OutOfMemory;
+        if (tracestate) |ts| if (!obj.contains("tracestate")) obj.put(arena, "tracestate", .{ .string = ts }) catch return error.OutOfMemory;
         var out = opts;
         out.meta = std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = obj }, .{}) catch return error.OutOfMemory;
         return out;
@@ -779,13 +805,55 @@ pub const Client = struct {
         const job = &box.job;
         log.debug("{s} {s} started (attempt {d} of {d})", .{ id_text, row.kind, row.attempt, row.max_attempts });
 
+        // A span per run, linked to the enqueuer's context (not its child).
+        const link: ?observe.trace.Context = if (job.traceparent()) |tp| observe.trace.Context.parse(tp) else null;
+        var span: ?struct { trace_id: [32]u8, span_id: [16]u8, start_ns: i96 } = null;
+        if (self.tracer) |t| if (t.recordsJob(link)) {
+            var trace_id: [32]u8 = undefined;
+            var span_id: [16]u8 = undefined;
+            observe.trace.newId(self.io, &trace_id);
+            observe.trace.newId(self.io, &span_id);
+            // In the run's arena, which the job lives in (M4).
+            job.trace_id = a.dupe(u8, &trace_id) catch "";
+            job.span_id = a.dupe(u8, &span_id) catch "";
+            span = .{ .trace_id = trace_id, .span_id = span_id, .start_ns = std.Io.Clock.real.now(self.io).nanoseconds };
+        };
+
         var result: anyerror!void = error.NoHandler;
         if (h) |hh| {
             const timeout: std.Io.Timeout = if (row.timeout_ms) |ms| .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } } else .none;
             const d: dusty.Deadline = .init(self.io, timeout);
             result = d.run(invoke, .{ hh, job }) catch |e| e;
         }
-        return self.settle(box, def, result);
+        const end_ns = if (span != null) std.Io.Clock.real.now(self.io).nanoseconds else 0;
+        const outcome = self.settle(box, def, result);
+        if (span) |sp| self.tracer.?.job(sp.trace_id, sp.span_id, sp.start_ns, end_ns, .{
+            .queue = row.queue,
+            .kind = row.kind,
+            .id = row.id,
+            .attempt = row.attempt,
+            .max_attempts = row.max_attempts,
+            .outcome = @tagName(outcome),
+            .error_type = spanErrorType(outcome, result),
+            .link = link,
+            .link_state = if (link != null) (job.tracestate() orelse "") else "",
+        });
+        return outcome;
+    }
+
+    /// A failed run's stored error name.
+    fn errorType(err: anyerror) []const u8 {
+        return if (err == error.Timeout or err == error.Canceled) "Timeout" else @errorName(err);
+    }
+
+    /// A run's span's `error.type`: the handler's error, `Timeout` only
+    /// when its own deadline expired (`dusty.Deadline` fails with
+    /// `error.Timeout`). Empty when it succeeded, and when it was stopped
+    /// from outside (interrupted by a drain, or lost with its lease or to a
+    /// cancel): the cancel it got is not the handler failing.
+    fn spanErrorType(outcome: Outcome, result: anyerror!void) []const u8 {
+        if (outcome == .interrupted or outcome == .lost) return "";
+        if (result) |_| return "" else |err| return @errorName(err);
     }
 
     fn invoke(h: *const Handler, job: *Job) anyerror!void {
@@ -836,7 +904,7 @@ pub const Client = struct {
                 .retry_in => plan = self.planFailure(row, def, t, "RetryRequested", o.explanation, o.delay),
             }
         } else |err| {
-            const err_name: []const u8 = if (err == error.Timeout or err == error.Canceled) "Timeout" else @errorName(err);
+            const err_name = errorType(err);
             switch (o.kind) {
                 .discard => plan = .{ .f = .{ .id = row.id, .attempt = row.attempt, .to = .dead, .finished_at = t, .add_error = .{ .attempt = row.attempt, .at = t, .@"error" = err_name, .message = if (o.reason.len > 0) o.reason else o.explanation } }, .outcome = .dead },
                 .snooze => plan = self.planSnooze(row, t, o.delay),
@@ -1026,20 +1094,11 @@ pub const Client = struct {
 
     fn jobTask(box: *JobBox) std.Io.Cancelable!void {
         const self = box.client;
-        {
-            self.held_mutex.lockUncancelable(self.io);
-            defer self.held_mutex.unlock(self.io);
-            box.task = placement.currentTask(self.io);
-            self.held.put(self.gpa, box.row.id, box) catch {};
-        }
+        self.hold(box);
         if (self.metrics) |mm| mm.running.with(&.{box.queue.name}).add(1);
         _ = self.runJob(box);
         if (self.metrics) |mm| mm.running.with(&.{box.queue.name}).add(-1);
-        {
-            self.held_mutex.lockUncancelable(self.io);
-            defer self.held_mutex.unlock(self.io);
-            _ = self.held.swapRemove(box.row.id);
-        }
+        self.unhold(box);
         const q = box.queue;
         box.arena_state.deinit();
         self.gpa.destroy(box);
@@ -1047,16 +1106,32 @@ pub const Client = struct {
         q.signal.set(self.io);
     }
 
+    /// A run's start, on its own task: from here on the heartbeat renews
+    /// its lease and the drain may interrupt it.
+    fn hold(self: *Client, box: *JobBox) void {
+        self.held_mutex.lockUncancelable(self.io);
+        defer self.held_mutex.unlock(self.io);
+        box.task = placement.currentTask(self.io);
+        self.held.put(self.gpa, box.row.id, box) catch {};
+    }
+
+    /// A run's end: neither the heartbeat nor the drain sees it any more.
+    fn unhold(self: *Client, box: *JobBox) void {
+        self.held_mutex.lockUncancelable(self.io);
+        defer self.held_mutex.unlock(self.io);
+        _ = self.held.swapRemove(box.row.id);
+    }
+
     fn heartbeatTask(self: *Client) std.Io.Cancelable!void {
         const every = Duration.fromNanoseconds(@divFloor(self.options.lease.nanoseconds, 3));
         while (true) {
             self.io.sleep(every, .awake) catch return error.Canceled;
-            self.heartbeatOnce();
+            try self.heartbeatOnce();
             if (self.draining.load(.acquire) and self.runningTotal() == 0) return;
         }
     }
 
-    fn heartbeatOnce(self: *Client) void {
+    fn heartbeatOnce(self: *Client) std.Io.Cancelable!void {
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1069,20 +1144,46 @@ pub const Client = struct {
         self.held_mutex.unlock(self.io);
         if (held.len == 0) return;
         const alive = self.backend.vt.heartbeat(self.backend.ptr, a, after(self.now(), self.options.lease), held) catch |e| {
+            try passCancel(e);
             log.warn("jobs: heartbeat failed: {t}", .{e});
             return;
         };
-        self.held_mutex.lockUncancelable(self.io);
-        defer self.held_mutex.unlock(self.io);
+        // The runs no longer held. The store is asked why with the lock
+        // released (SAFETY.md L2, L3): every run's start and end takes it.
+        var lost: std.ArrayList(store.Held) = .empty;
         for (held) |h| {
             if (std.mem.indexOfScalar(Id, alive, h.id) != null) continue;
+            lost.append(a, h) catch return;
+        }
+        if (lost.items.len == 0) return;
+        const cancelled = a.alloc(bool, lost.items.len) catch return;
+        for (lost.items, cancelled) |h, *c| {
+            const got = self.backend.vt.get(self.backend.ptr, a, h.id) catch |e| blk: {
+                try passCancel(e);
+                break :blk null;
+            };
+            c.* = if (got) |row| row.state == .cancelled else false;
+        }
+        // A run may have ended during the calls: each is looked up again by
+        // id and attempt (M3), never kept from before them.
+        self.held_mutex.lockUncancelable(self.io);
+        defer self.held_mutex.unlock(self.io);
+        for (lost.items, cancelled) |h, c| {
             const b = self.held.get(h.id) orelse continue;
-            if (self.backend.vt.get(self.backend.ptr, a, h.id) catch null) |row| {
-                if (row.state == .cancelled) b.job.admin_cancelled.store(true, .release);
-            }
+            if (b.row.attempt != h.attempt) continue;
+            // Set before `lost`, which the run may see and return on.
+            if (c) b.job.admin_cancelled.store(true, .release);
             b.lost.store(true, .release);
             if (b.task) |t| placement.cancelTask(t);
         }
+    }
+
+    /// A store call's failure, in a task that carries on after one: a
+    /// cancel (the teardown's) is passed on, never taken for a failure that
+    /// the task logs and goes past, or its next wait parks with the cancel
+    /// gone (SAFETY.md).
+    fn passCancel(err: anyerror) std.Io.Cancelable!void {
+        if (err == error.Canceled) return error.Canceled;
     }
 
     fn maintenanceTask(self: *Client) std.Io.Cancelable!void {
@@ -1090,31 +1191,42 @@ pub const Client = struct {
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
             defer arena.deinit();
             var report: StepReport = .{};
-            self.maintain(arena.allocator(), &report);
+            try self.maintain(arena.allocator(), &report);
             try self.waitSignal(&self.maint_signal, self.options.poll_interval);
         }
     }
 
     /// One maintenance round (§3.4): leader, cron, stage, rescue, prune.
-    fn maintain(self: *Client, arena: std.mem.Allocator, report: *StepReport) void {
+    /// A store call's failure is logged or skipped, but a cancel (the
+    /// teardown's) ends the round and the task.
+    fn maintain(self: *Client, arena: std.mem.Allocator, report: *StepReport) std.Io.Cancelable!void {
         const t = self.now();
         const was = self.is_leader.load(.acquire);
-        const lead = self.backend.vt.leaderTake(self.backend.ptr, self.worker_name, t, self.options.leader.ttl) catch false;
+        const lead = self.backend.vt.leaderTake(self.backend.ptr, self.worker_name, t, self.options.leader.ttl) catch |e| blk: {
+            try passCancel(e);
+            break :blk false;
+        };
         self.is_leader.store(lead, .release);
         if (self.metrics) |mm| mm.leader.with(&.{}).set(@intFromBool(lead));
         if (lead and !was) log.info("jobs: this process leads schedules and maintenance", .{});
         if (!lead and was) log.info("jobs: this process no longer leads schedules and maintenance", .{});
 
-        if (lead) self.cronRound(arena, t, report);
+        if (lead) try self.cronRound(arena, t, report);
 
-        const staged = self.backend.vt.stage(self.backend.ptr, t) catch 0;
+        const staged = self.backend.vt.stage(self.backend.ptr, t) catch |e| blk: {
+            try passCancel(e);
+            break :blk 0;
+        };
         if (staged > 0) for (self.queues) |*q| q.signal.set(self.io);
 
         const ms = @divFloor(t.us, 1000);
         const rescue_every = @divFloor(self.options.lease.nanoseconds, 2 * std.time.ns_per_ms);
         if (ms - self.last_rescue >= rescue_every) {
             self.last_rescue = ms;
-            const rescued = self.backend.vt.rescue(self.backend.ptr, arena, t) catch &[_]store.Rescued{};
+            const rescued = self.backend.vt.rescue(self.backend.ptr, arena, t) catch |e| blk: {
+                try passCancel(e);
+                break :blk &[_]store.Rescued{};
+            };
             report.rescued += @intCast(rescued.len);
             if (self.metrics) |mm| mm.rescued.with(&.{"*"}).add(rescued.len);
             for (rescued) |r| log.info("job-{d}: its lease expired; {s}", .{ r.id, if (r.dead) "dead" else "put back" });
@@ -1122,18 +1234,21 @@ pub const Client = struct {
         }
         if (lead and self.metrics != null and ms - self.last_gauges >= 15_000) {
             self.last_gauges = ms;
-            self.reportGauges(arena);
+            try self.reportGauges(arena);
         }
         if (lead and ms - self.last_prune >= 60_000) {
             self.last_prune = ms;
-            report.pruned += self.backend.vt.prune(self.backend.ptr, t, self.options.keep) catch 0;
+            report.pruned += self.backend.vt.prune(self.backend.ptr, t, self.options.keep) catch |e| blk: {
+                try passCancel(e);
+                break :blk 0;
+            };
         }
     }
 
     /// The leader reports queue depth by state (§7.1).
-    fn reportGauges(self: *Client, arena: std.mem.Allocator) void {
+    fn reportGauges(self: *Client, arena: std.mem.Allocator) std.Io.Cancelable!void {
         const mm = self.metrics orelse return;
-        const rows = self.backend.vt.counts(self.backend.ptr, arena) catch return;
+        const rows = self.backend.vt.counts(self.backend.ptr, arena) catch |e| return passCancel(e);
         // States that have no row now read zero.
         for (self.queues) |q| inline for (.{ "scheduled", "available", "running", "retrying", "dead" }) |st| mm.queued.with(&.{ q.name, st }).set(0);
         for (rows) |r| mm.queued.with(&.{ r.queue, @tagName(r.state) }).set(@intCast(r.n));
@@ -1193,9 +1308,12 @@ pub const Client = struct {
         return nj;
     }
 
-    fn cronRound(self: *Client, arena: std.mem.Allocator, t: Time, report: *StepReport) void {
+    fn cronRound(self: *Client, arena: std.mem.Allocator, t: Time, report: *StepReport) std.Io.Cancelable!void {
         for (self.crons.items) |e| {
-            self.cronOne(arena, e, t, report) catch |err| log.warn("cron \"{s}\": {t}", .{ e.name, err });
+            self.cronOne(arena, e, t, report) catch |err| {
+                try passCancel(err);
+                log.warn("cron \"{s}\": {t}", .{ e.name, err });
+            };
         }
     }
 
@@ -1327,7 +1445,7 @@ pub const Client = struct {
     pub fn step(self: *Client, c: anytype) Error!StepReport {
         var report: StepReport = .{};
         if (!self.started) self.start(null, null, null) catch return error.ServiceUnavailable;
-        self.maintain(c.arena, &report);
+        try self.maintain(c.arena, &report);
         // maintain's stage ran before the cron jobs; stage again so a tick that is due now runs now.
         _ = self.backend.vt.stage(self.backend.ptr, self.now()) catch 0;
         var again = true;
@@ -1395,4 +1513,93 @@ pub fn rowToInfo(arena: std.mem.Allocator, r: store.Row) !root.JobInfo {
         .errors = r.errors,
         .timeout_ms = r.timeout_ms,
     };
+}
+
+test "jobs: a heartbeat waiting on the store does not hold up a run's start" {
+    // A store whose heartbeat holds nothing (so every held run is lost and
+    // looked up), and whose `get` waits until the test lets it go (a
+    // cancelable wait, as a store's round trip is).
+    const HeldGetStore = struct {
+        var store_io: ?std.Io = null;
+        var in_get: std.atomic.Value(bool) = .init(false);
+        var release: std.Io.Event = .unset;
+
+        fn heartbeat(_: *anyopaque, _: std.mem.Allocator, _: Time, _: []const store.Held) anyerror![]Id {
+            return &.{};
+        }
+
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: Id) anyerror!?store.Row {
+            in_get.store(true, .release);
+            try release.wait(store_io.?);
+            return null;
+        }
+
+        fn row(id: Id) store.Row {
+            return .{ .id = id, .queue = "default", .kind = "t", .state = .running, .priority = .normal, .attempt = 1, .max_attempts = 3, .args_json = "{}", .meta_json = "{}", .run_at = .fromMillis(0), .created_at = .fromMillis(0) };
+        }
+
+        fn check(io_: std.Io) !void {
+            const wait = @import("anole_test_wait");
+            const gpa = std.testing.allocator;
+            const client = try Client.init(gpa, io_, .{ .store = .memory });
+            defer client.deinit();
+            const store_vt = client.backend.vt;
+            var vt = store_vt.*;
+            vt.heartbeat = heartbeat;
+            vt.get = get;
+            client.backend.vt = &vt;
+            // Before the client's teardown, which calls the store's own deinit.
+            defer client.backend.vt = store_vt;
+            store_io = io_;
+            in_get.store(false, .release);
+            release = .unset;
+            // A failed check lets the heartbeat out of the store before it is
+            // collected below.
+            defer release.set(io_);
+
+            // A run the heartbeat will find lost (no task of its own to cancel).
+            var lost: JobBox = .{ .client = client, .queue = &client.queues[0], .arena_state = .init(gpa), .row = row(1) };
+            defer lost.arena_state.deinit();
+            {
+                client.held_mutex.lockUncancelable(io_);
+                defer client.held_mutex.unlock(io_);
+                try client.held.put(gpa, lost.row.id, &lost);
+            }
+            defer client.unhold(&lost);
+
+            var beat = try io_.concurrent(Client.heartbeatOnce, .{client});
+            defer beat.cancel(io_) catch {};
+            try wait.waitFlag(io_, "the heartbeat is in the store's get for the lost run", &in_get);
+
+            // While the heartbeat waits on the store, a new run starts.
+            const Start = struct {
+                fn run(c: *Client, box: *JobBox, done: *std.atomic.Value(bool)) void {
+                    c.hold(box);
+                    done.store(true, .release);
+                }
+            };
+            var next: JobBox = .{ .client = client, .queue = &client.queues[0], .arena_state = .init(gpa), .row = row(2) };
+            defer next.arena_state.deinit();
+            var started: std.atomic.Value(bool) = .init(false);
+            var start = try io_.concurrent(Start.run, .{ client, &next, &started });
+            // On a failed wait the heartbeat is let go first: the start may be
+            // waiting for the lock the heartbeat holds.
+            defer {
+                release.set(io_);
+                start.cancel(io_);
+                client.unhold(&next);
+            }
+            try wait.waitFlag(io_, "the new run started while the heartbeat waited on the store", &started);
+            release.set(io_);
+            try beat.await(io_);
+            // The lookup was the lost run's: the heartbeat marked it lost.
+            try std.testing.expect(lost.lost.load(.acquire));
+        }
+    };
+    const zio = @import("zio");
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(HeldGetStore.check, .{io});
+    try f.await(io);
 }

@@ -3,6 +3,7 @@
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const dusty = @import("root.zig");
 const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
 const loopback: []const dusty.Listener = &.{.{ .address = loopback_addr }};
@@ -687,9 +688,11 @@ test "Client: idle connections close after idle_timeout" {
     try std.testing.expectEqual(2, client.pool().idle_len);
 
     // The pool's own task closes them, with no request to notice.
-    var waited: usize = 0;
-    while (client.pool().idle_len != 0 and waited < 100) : (waited += 1) try io.sleep(.fromMilliseconds(10), .awake);
-    try std.testing.expectEqual(0, client.pool().idle_len);
+    try wait.waitUntil(io, "the pool closed its idle connections", &client, struct {
+        fn empty(c: *dusty.Client) bool {
+            return c.pool().idle_len == 0;
+        }
+    }.empty);
 
     // And the next request dials again.
     var r = try client.fetch(url, .{});
@@ -2077,7 +2080,7 @@ test "Client: a response head that never arrives is cut off by ClientOptions.tim
     try std.testing.expectError(error.Timeout, client.fetch(try peer.url(), .{}));
     const elapsed = millisSince(io, started);
     try std.testing.expect(elapsed >= 150);
-    try std.testing.expect(elapsed < 3000);
+    if (wait.timing()) try std.testing.expect(elapsed < 3000);
 
     // A request cut short leaves nothing behind to be reused.
     try std.testing.expectEqual(0, client.pool().idle_len);

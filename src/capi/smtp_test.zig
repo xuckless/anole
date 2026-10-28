@@ -3,6 +3,7 @@
 //! through its Zig entry points as in engine_test.zig. Waits poll the
 //! consumer with generous bounds; no assertion is about time.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
 const config = @import("config.zig");
@@ -32,12 +33,11 @@ const Events = struct {
     }
 
     fn waitFor(ev: *Events, typ: abi.EventType, from: usize, ms: u32) !usize {
-        var waited: u32 = 0;
+        const started = std.Io.Clock.awake.now(engine.threadedIo());
         while (true) {
             for (ev.list.items[from..], from..) |r, i| if (r.typ == @backingInt(typ)) return i;
-            if (waited >= ms) return error.TimedOut;
+            if (pastDeadline(started, ms)) return error.TimedOut;
             try ev.pump(50);
-            waited += 50;
         }
     }
 
@@ -92,7 +92,7 @@ const Rig = struct {
     fn deinit(r: *Rig) void {
         r.ev.deinit();
         r.e.drain() catch {};
-        _ = r.e.wait(5000);
+        _ = r.e.wait(@intCast(wait.deadlineMs()));
         r.e.destroy();
         r.fake.deinit();
         alloc.free(r.json);
@@ -284,4 +284,12 @@ test "capi config: mail parses with its defaults; bad entries say which key" {
         try std.testing.expectError(error.Config, config.parse(arena.allocator(), case.json, &w));
         try std.testing.expect(std.mem.indexOf(u8, w.buffered(), case.needle) != null);
     }
+}
+
+/// Whether a wait that began at `started` has passed `ms`, or the wait
+/// helper's deadline (10 s times ANOLE_TEST_TIMEOUT_FACTOR) if that is later:
+/// a hang guard counted on the clock, not in polls.
+fn pastDeadline(started: std.Io.Timestamp, ms: u32) bool {
+    const limit: i64 = @max(ms, wait.deadlineMs());
+    return started.untilNow(engine.threadedIo(), .awake).toMilliseconds() >= limit;
 }

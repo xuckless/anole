@@ -18,6 +18,7 @@
 //! It also lets one task cancel another single task of a group (`Task`),
 //! which `std.Io` has no call for: groups are canceled as a whole.
 const std = @import("std");
+const test_wait = @import("anole_test_wait");
 const zio = @import("zio");
 
 /// The core's own tests build against a stub of zio.
@@ -212,9 +213,11 @@ test "Signal: a set wakes the waiter, and a reset makes it wait again" {
             }
         }
     }.run, .{ &signal, io, &woke });
+    // A failed wait must not leave the waiter on this frame's signal.
+    defer waiter.cancel(io) catch {};
     signal.set(io);
-    while (woke.load(.acquire) == 0) try io.sleep(.fromMilliseconds(1), .awake);
+    try test_wait.waitAtLeast(io, "the waiter woke once", &woke, 1);
     signal.set(io);
-    while (woke.load(.acquire) < 2) try io.sleep(.fromMilliseconds(1), .awake);
+    try test_wait.waitAtLeast(io, "the waiter woke again", &woke, 2);
     try std.testing.expectError(error.Canceled, waiter.cancel(io));
 }

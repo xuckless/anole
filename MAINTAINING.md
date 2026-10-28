@@ -273,6 +273,38 @@ attribution header on every file and THIRD_PARTY_NOTICES part B current.
   each release and port the fixes that apply. The PRs open there from the
   fork (#263-#270) are left as they are.
 
+## Waiting in tests
+
+Anole's own tests wait through `src/testing/wait.zig` (the module
+`anole_test_wait` in every test binary), never with a sleep standing in for
+"it has happened" (TESTING.md D1, D6):
+
+- `wait.waitUntil(io, "what", ctx, cond)` polls `cond(ctx)` with a back-off
+  from 1 ms to 50 ms until it holds, for 10 s times
+  `ANOLE_TEST_TIMEOUT_FACTOR` (an environment variable, default 1; raise it
+  under sanitizers or on a crowded machine). On a timeout it logs "timed
+  out after Ns waiting for: what" and returns `error.WaitTimedOut`. The
+  deadline is a hang guard, never a latency bound. `waitAtLeast` and
+  `waitFlag` wrap it for an atomic counter or flag; prefer a counter or an
+  event of the code under test over polling anything else.
+- `wait.expectStays(io, "what", ctx, cond, wait.short_window)` checks that a
+  condition keeps holding for 100 ms, for "X never happens".
+- An elapsed-time bound beside a test's real claim is checked only
+  `if (wait.timing())`; a test whose whole claim is about speed starts with
+  `try wait.requireTiming();` and ends its name with "[timing]".
+  `zig build test-timing` runs the main and the HTTP core's suites and the
+  C ABI suite again with `ANOLE_TEST_TIMING=1`, which turns them on: locally
+  (the Mac and the x86 box) on an idle machine, never in CI.
+- A stress or load test (TESTING.md W3: never in the unit suite) starts with
+  `try wait.requireStress();` and ends its name with "[stress]".
+  `zig build test-stress` runs the main suite again with
+  `ANOLE_TEST_STRESS=1`, which turns them on. Its claim must hold on any
+  machine; it is kept out of `zig build test` for its cost.
+- `waitEqual`, `waitNonZero` and `deadlineMs()` (the deadline for an API
+  that takes milliseconds) cover the rest; the C consumer
+  (tests/capi/consumer.c) has `wait_until()` with the same deadline, and
+  `timing()` for its elapsed-time bounds (`CHECK(!timing() || ...)`).
+
 ## The S3 client
 
 `anole.s3` (src/s3/) is Anole's own: the SigV4 signer is written from the specification (checked against the worked examples on AWS's S3 API reference pages, transcribed in `sigv4.zig`'s tests; the aws-sig-v4-test-suite is not vendored because its NOTICE gives no licence), and the XML reader handles the six response shapes S3 and STS use. Nothing to bump. What to watch:

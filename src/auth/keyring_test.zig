@@ -5,6 +5,7 @@ const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const Keyring = @import("keyring.zig").Keyring;
+const wait = @import("anole_test_wait");
 
 const Ed = std.crypto.sign.Ed25519;
 const b64 = std.base64.url_safe_no_pad;
@@ -17,6 +18,8 @@ var delay_ms: std.atomic.Value(u32) = .init(0);
 var fetches: std.atomic.Value(usize) = .init(0);
 /// The endpoint answers 503 while set (the provider is down).
 var down: std.atomic.Value(bool) = .init(false);
+/// While set, a fetch waits for it before answering.
+var gate: std.atomic.Value(?*std.Io.Event) = .init(null);
 
 fn jwks(req: *dusty.Request, res: *dusty.Response) !void {
     _ = fetches.fetchAdd(1, .monotonic);
@@ -26,6 +29,7 @@ fn jwks(req: *dusty.Request, res: *dusty.Response) !void {
         return;
     }
     try req.io.sleep(.fromMilliseconds(delay_ms.load(.monotonic)), .awake);
+    if (gate.load(.acquire)) |g| try g.wait(req.io);
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(res.arena, "{\"keys\":[");
     for (keys[0..served.load(.monotonic)], 0..) |kp, i| {
@@ -112,13 +116,28 @@ test "Keyring: one fetch for concurrent verifiers, and known keys never wait on 
     try std.testing.expectEqual(@as(usize, 0), failed.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 1), fetches.load(.monotonic));
 
-    // The provider rotates in k2, slowly. Four k2 tokens share one refetch;
-    // a k1 token meanwhile verifies at once with the keys in hand.
+    // The provider rotates in k2, and its answer is held. Four k2 tokens
+    // share one refetch; a k1 token meanwhile verifies with the keys in
+    // hand, while the refetch is still held: it never waits on it.
     served.store(2, .monotonic);
-    delay_ms.store(400, .monotonic);
+    delay_ms.store(0, .monotonic);
+    var held: std.Io.Event = .unset;
+    gate.store(&held, .release);
+    defer gate.store(null, .release);
     for (0..4) |_| try group.concurrent(io, Verifier.run, .{ &keyring, io, t2, "u2", &failed });
-    while (fetches.load(.monotonic) < 2) try io.sleep(.fromMilliseconds(5), .awake);
-    try std.testing.expect(try verifyTimed(&keyring, io, t1, "u1") < 200);
+    try wait.waitAtLeast(io, "the k2 refetch reached the endpoint", &fetches, 2);
+    const Known = struct {
+        fn run(k: *Keyring, io_: std.Io, tok: []const u8, done: *std.atomic.Value(bool)) !void {
+            _ = try verifyTimed(k, io_, tok, "u1");
+            done.store(true, .release);
+        }
+    };
+    var known_done: std.atomic.Value(bool) = .init(false);
+    var known = try io.concurrent(Known.run, .{ &keyring, io, t1, &known_done });
+    defer known.cancel(io) catch {};
+    try wait.waitFlag(io, "the k1 token verified while the refetch is held", &known_done);
+    try known.await(io);
+    held.set(io);
     try group.await(io);
     try std.testing.expectEqual(@as(usize, 0), failed.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 2), fetches.load(.monotonic));

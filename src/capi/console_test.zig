@@ -1,5 +1,6 @@
 //! The live console through the C ABI: `anole_console_log` records.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
 const abi = engine.abi;
@@ -129,5 +130,5 @@ test "capi engine: anole_console_log tags a record with its request's id and rou
     if (!tagged) return error.NoTaggedRecord;
     if (!late) return error.NoLateRecord;
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }

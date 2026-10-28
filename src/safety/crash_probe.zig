@@ -13,9 +13,20 @@ test "crash probe: segfault" {
     // A page with no access: the store faults like a use after free under
     // never_reuse does (SIGSEGV; SIGBUS on some macOS mappings).
     const page = try std.posix.mmap(null, std.heap.pageSize(), .{}, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    // SAFETY: page.ptr is a live, page-aligned mapping of at least one
+    // byte; a u8 needs no alignment. The store through it faults on purpose.
     const p: *volatile u8 = @ptrCast(page.ptr);
     p.* = 1;
     unreachable;
+}
+
+test "crash probe: panic under the log lock" {
+    std.log.warn("crash probe: held line before the panic", .{});
+    // As a panic inside the runner's log store on this thread: the lock
+    // the held lines are under is taken and never let go. The panic must
+    // still end the process (it reports the lines lost), not wait for it.
+    @import("root").crash_probe.holdCaptureLock();
+    @panic("crash probe: panic under the log lock");
 }
 
 test "crash probe: abort" {

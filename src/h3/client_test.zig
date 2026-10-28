@@ -4,6 +4,7 @@
 //! a server that closes, resumption and 0-RTT (and a replay of it), and a
 //! client that moves to a new port.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const anole_tls = @import("../tls/root.zig");
@@ -439,15 +440,19 @@ test "h3 client: certificate checks, and a server that goes away" {
     // The server drains: GOAWAY, then CONNECTION_CLOSE. New requests fail.
     f.stop(gpa, io);
     stopped = true;
-    var tries: usize = 0;
-    while (tries < 100) : (tries += 1) {
-        const b = get(conn, "/hello", gpa) catch |err| {
-            try std.testing.expect(err == error.ConnectionClosed or err == error.StreamReset);
-            break;
-        };
-        gpa.free(b);
-        try io.sleep(.fromMilliseconds(20), .awake);
-    } else return error.TestUnexpectedResult;
+    const Refused = struct {
+        conn: *client.ClientConnection,
+        gpa: std.mem.Allocator,
+        fn cond(c: @This()) !bool {
+            const b = get(c.conn, "/hello", c.gpa) catch |err| {
+                try std.testing.expect(err == error.ConnectionClosed or err == error.StreamReset);
+                return true;
+            };
+            c.gpa.free(b);
+            return false;
+        }
+    };
+    try wait.waitUntil(io, "a request on the draining connection fails", Refused{ .conn = conn, .gpa = gpa }, Refused.cond);
 }
 
 /// POSTs `body` to `path` and returns the response body.
@@ -560,7 +565,8 @@ test "h3 server: long-header packets with a connection ID over 20 bytes are drop
     pkt[5] = 21;
     pkt[6 + 21] = 0;
     raw.send(io, f.ep.address(), null, 0, pkt[0..28], 28);
-    try io.sleep(.fromMilliseconds(50), .awake);
+    // No wait: the endpoint reads its socket in order, so they are behind
+    // it before the connection's Initial.
 
     const conn = try f.connect(gpa, io);
     defer conn.close();
@@ -760,9 +766,9 @@ test "h3 server: a request that outlives timeout.request is reset" {
         .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
     }, .{});
     defer s.release();
+    // The handler takes 5 s: no head before that is the timeout's doing.
     if (s.waitHead()) |_| return error.ServedPastTheTimeout else |_| {}
-    const took = started.durationTo(std.Io.Clock.awake.now(io));
-    try std.testing.expect(took.toMilliseconds() < 3000);
+    if (wait.timing()) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
 
     // The connection carries on.
     const body = try get(conn, "/hello", gpa);
@@ -872,7 +878,14 @@ test "h3 server: a hand-over closes the connections at once and leaves the socke
     var old_stopped = false;
     defer if (!old_stopped) old.stop(gpa, io);
 
-    const conn = try old.connect(gpa, io);
+    // An idle timeout no run reaches: only the hand-over can end it.
+    const conn = try client.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = old.ep.address(),
+        .port = old.ep.address().getPort(),
+        .tls = .{ .ca = .{ .pem = old.pem.cert } },
+        .idle_timeout = .fromSeconds(3600),
+    });
     defer conn.close();
     const body = try get(conn, "/hello", gpa);
     gpa.free(body);
@@ -901,7 +914,9 @@ test "h3 server: a hand-over closes the connections at once and leaves the socke
         gpa.free(b);
         return error.ServedAfterHandOver;
     } else |err| try std.testing.expect(err == error.ConnectionClosed or err == error.StreamReset);
-    try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 2000);
+    // The client's idle timeout is an hour: the close came from the
+    // hand-over, whenever it arrived.
+    if (wait.timing()) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 2000);
 
     // Every new connection reaches the successor.
     for (0..5) |_| {
@@ -939,7 +954,8 @@ test "h3 client: request timeouts, for the head and for the body, and the connec
         defer s.release();
         try std.testing.expectError(error.Timeout, s.waitHead());
     }
-    try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
+    // The handler takes 5 s: Timeout before that is the timeout's doing.
+    if (wait.timing()) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
     {
         const s = try conn.request(&.{
             .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/stall" },
@@ -977,7 +993,8 @@ test "h3 client: connect_timeout bounds a handshake nobody answers" {
         .tls = .{ .insecure_skip_verify = true },
         .connect_timeout = .fromMilliseconds(300),
     }));
-    try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
+    // 300 ms, not the 10 s default: a bound only test-timing checks.
+    if (wait.timing()) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
 }
 
 /// A UDP relay between a client and a server, which can hold the server's
@@ -1112,7 +1129,7 @@ pub const Relay = struct {
             }
         };
         const counts: Early = .{ .ep = ep, .served = want_served, .held = want_held };
-        try eventually(io, 10, Early.seen, &counts);
+        try wait.waitUntil(io, "Early.seen", &counts, Early.seen);
         r.openDown();
     }
 
@@ -1324,15 +1341,6 @@ fn finish(s: *client.Stream, gpa: std.mem.Allocator) ![]u8 {
     return s.reader().allocRemaining(gpa, .unlimited);
 }
 
-/// Waits until `cond(arg)` holds, for `seconds` at most.
-fn eventually(io: std.Io, seconds: u32, cond: anytype, arg: anytype) !void {
-    for (0..seconds * 100) |_| {
-        if (cond(arg)) return;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
-    return error.TimedOut;
-}
-
 fn hasTicket(cache: *client.SessionCache) bool {
     return cache.count() > 0;
 }
@@ -1372,7 +1380,7 @@ test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a repl
         const b = try finish(try request(conn, "GET", "/early", .{}), gpa);
         defer gpa.free(b);
         try std.testing.expectEqualStrings("late", b);
-        try eventually(io, 2, hasTicket, &cache);
+        try wait.waitUntil(io, "hasTicket", &cache, hasTicket);
     }
 
     // The second: resumed, its requests in 0-RTT. The relay holds the
@@ -1408,15 +1416,22 @@ test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a repl
     // An attacker replays that flight once the connection is gone: the
     // server takes the 0-RTT again (nothing in TLS stops it), runs the GET
     // and holds the POST for a handshake that never completes.
-    try eventually(io, 10, connectionsGone, f.ep);
+    try wait.waitUntil(io, "connectionsGone", f.ep, connectionsGone);
     try relay.replay();
     const Held = struct {
         fn two(ep: *Endpoint) bool {
             return ep.early_held.load(.monotonic) == 2;
         }
     };
-    try eventually(io, 10, Held.two, f.ep);
-    try io.sleep(.fromMilliseconds(300), .awake);
+    try wait.waitUntil(io, "Held.two", f.ep, Held.two);
+    // The POST never runs: its handshake never completes.
+    const Unrun = struct {
+        posts: u32,
+        fn cond(c: @This()) bool {
+            return early_posts.load(.monotonic) == c.posts;
+        }
+    };
+    try wait.expectStays(io, "the replayed POST is not run", Unrun{ .posts = posts + 1 }, Unrun.cond, .fromMilliseconds(300));
     try std.testing.expectEqual(posts + 1, early_posts.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), f.ep.early_served.load(.monotonic));
 }
@@ -1437,7 +1452,7 @@ test "h3: a new connection given up after its first packet started a 0-RTT reque
         defer conn.close();
         const b = try finish(try request(conn, "GET", "/early", .{}), gpa);
         defer gpa.free(b);
-        try eventually(io, 2, hasTicket, &cache);
+        try wait.waitUntil(io, "hasTicket", &cache, hasTicket);
     }
     // A resumed connection whose first flight carries a request that
     // waits (a POST held for the handshake): recorded. The server's answer
@@ -1453,7 +1468,7 @@ test "h3: a new connection given up after its first packet started a 0-RTT reque
         gpa.free(p);
         relay.disarm();
     }
-    try eventually(io, 10, connectionsGone, f.ep);
+    try wait.waitUntil(io, "connectionsGone", f.ep, connectionsGone);
     // The same flight again, and the server gives the new connection up
     // right after reading its first packet.
     f.ep.test_fail_accept = true;
@@ -1465,7 +1480,7 @@ test "h3: a new connection given up after its first packet started a 0-RTT reque
             return ep.test_given_up_with_tasks.load(.acquire) == 1;
         }
     };
-    try eventually(io, 10, GivenUp.once, f.ep);
+    try wait.waitUntil(io, "GivenUp.once", f.ep, GivenUp.once);
     try std.testing.expect(!f.ep.test_fail_accept);
     // The endpoint still serves.
     const conn = try f.connect(gpa, io);
@@ -1489,7 +1504,7 @@ test "h3: 0-RTT carries on across a certificate reload" {
         defer conn.close();
         const b = try finish(try request(conn, "GET", "/hello", .{}), gpa);
         gpa.free(b);
-        try eventually(io, 2, hasTicket, &cache);
+        try wait.waitUntil(io, "hasTicket", &cache, hasTicket);
     }
     // A new TLS context (the same certificate, so the client still trusts
     // it): the ticket keys carry over, and 0-RTT with them.
@@ -1519,7 +1534,7 @@ test "h3: 0-RTT the server refuses goes again after the handshake" {
         defer conn.close();
         const b = try finish(try request(conn, "GET", "/hello", .{}), gpa);
         gpa.free(b);
-        try eventually(io, 2, hasTicket, &cache);
+        try wait.waitUntil(io, "hasTicket", &cache, hasTicket);
     }
 
     // The same address and certificate, but a new process's ticket keys:
@@ -1742,7 +1757,7 @@ test "h3 server: a reload that changes the client CAs stops earlier sessions fro
         defer conn.close();
         const body = try get(conn, "/peer", gpa);
         gpa.free(body);
-        try eventually(io, 2, hasTicket, &cache);
+        try wait.waitUntil(io, "hasTicket", &cache, hasTicket);
     }
     // The same client CAs: the session resumes.
     f.ep.useTls(try f.ep.loadTls(f.pem.cert, f.pem.key, .{ .ca_der = f.bundle.bytes.items, .mode = .request }));
@@ -1752,7 +1767,7 @@ test "h3 server: a reload that changes the client CAs stops earlier sessions fro
         try std.testing.expect(conn.resumed());
         const body = try get(conn, "/peer", gpa);
         gpa.free(body);
-        try eventually(io, 2, hasTicket, &cache);
+        try wait.waitUntil(io, "hasTicket", &cache, hasTicket);
     }
     // Other client CAs, which do not cover the client's certificate.
     f.ep.useTls(try f.ep.loadTls(f.pem.cert, f.pem.key, .{ .ca_der = other_bundle.bytes.items, .mode = .request }));
@@ -1781,13 +1796,12 @@ test "h3 server: a response streamed past its send buffer completes and leaves n
     try std.testing.expectEqual(@as(usize, 4 << 20), body.len);
     // Once the request is over and acknowledged, the stream holds nothing
     // but the one block it keeps in the stream pool for its next response.
-    var tries: usize = 0;
-    while (true) : (tries += 1) {
-        f.ep.sampleStats();
-        if (f.ep.stats.blocks_live.load(.monotonic) <= 1) break;
-        if (tries > 200) return error.TestUnexpectedResult;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    try wait.waitUntil(io, "the stream keeps one block at most", f.ep, struct {
+        fn cond(ep: *Endpoint) bool {
+            ep.sampleStats();
+            return ep.stats.blocks_live.load(.monotonic) <= 1;
+        }
+    }.cond);
 }
 
 test "h3 client: unprocessed is true after H3_REQUEST_REJECTED and for a request the GOAWAY did not reach" {
@@ -1854,7 +1868,7 @@ test "h3 client: send_buffer = 1 MiB queues a 1 MiB body before the server reads
     const conn = try f.connect(gpa, io);
     defer conn.close();
     const s = try conn.request(&.{
-        .{ .name = ":method", .value = "POST" },   .{ .name = ":path", .value = "/gated" },
+        .{ .name = ":method", .value = "POST" },  .{ .name = ":path", .value = "/gated" },
         .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
     }, .{ .body = true, .send_buffer = 1 << 20 });
     defer s.release();
@@ -1881,7 +1895,7 @@ test "h3 server: an answer before the request body ends lets the client finish s
     const conn = try f.connect(gpa, io);
     defer conn.close();
     const head: []const client.Header = &.{
-        .{ .name = ":method", .value = "POST" },   .{ .name = ":path", .value = "/answer-first" },
+        .{ .name = ":method", .value = "POST" },  .{ .name = ":path", .value = "/answer-first" },
         .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
     };
     var chunk: [4096]u8 = @splat('x');
@@ -1946,11 +1960,11 @@ test "h3 client: keep-alive is armed while a request is open and disarmed after"
     try std.testing.expect(f.ep.stats.keep_alive_arms.load(.monotonic) >= 1);
     s.release();
     // The stream is freed once QUIC has closed it; then it disarms.
-    var tries: usize = 0;
-    while (keepAliveOn(conn)) : (tries += 1) {
-        if (tries > 1000) return error.StillArmed;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    try wait.waitUntil(io, "the client's keep-alive disarmed", conn, struct {
+        fn off(cn: *client.ClientConnection) bool {
+            return !keepAliveOn(cn);
+        }
+    }.off);
 }
 
 test "h3 server: a peer RESET_STREAM cancels a REST handler's wait" {
@@ -2093,7 +2107,7 @@ test "parked h3: a handler that waited first parks; bursts arrive; end finishes 
     const hello_body = try get(conn, "/hello", gpa);
     defer gpa.free(hello_body);
     try std.testing.expectEqualStrings("hello over h3", hello_body);
-    try eventually(io, 10, noServerStreams, f.ep);
+    try wait.waitUntil(io, "noServerStreams", f.ep, noServerStreams);
 }
 
 test "parked h3: a stream reset tells the owner once; release frees the stream" {
@@ -2122,7 +2136,7 @@ test "parked h3: a stream reset tells the owner once; release frees the stream" 
     const hello_body = try get(conn, "/hello", gpa);
     defer gpa.free(hello_body);
     try std.testing.expectEqualStrings("hello over h3", hello_body);
-    try eventually(io, 10, noServerStreams, f.ep);
+    try wait.waitUntil(io, "noServerStreams", f.ep, noServerStreams);
     try std.testing.expectEqual(@as(u32, 1), H3Park.gone_calls.load(.monotonic));
 }
 
@@ -2150,7 +2164,7 @@ test "parked h3: a no_wait route parks on the endpoint task; the connection clos
     try std.testing.expect(!noConnections(f.ep));
     try H3Park.on(io, .begin_fails);
     try H3Park.on(io, .release);
-    try eventually(io, 10, noConnections, f.ep);
+    try wait.waitUntil(io, "noConnections", f.ep, noConnections);
 }
 
 /// A park that fails inside the handler (the peer reset the stream first):
@@ -2211,7 +2225,7 @@ test "parked h3: a park that fails on a reset stream lets go of the stream once"
     try FailedPark.started.wait(io);
     s.cancel();
     s.release();
-    try eventually(io, 10, FailedPark.isDone, {});
+    try wait.waitUntil(io, "FailedPark.isDone", {}, FailedPark.isDone);
     try std.testing.expectEqual(@as(?anyerror, error.WriteFailed), FailedPark.result);
 
     // The connection serves on (a double release would have broken its
@@ -2219,7 +2233,7 @@ test "parked h3: a park that fails on a reset stream lets go of the stream once"
     const hello_body = try get(conn, "/hello", gpa);
     defer gpa.free(hello_body);
     try std.testing.expectEqualStrings("hello over h3", hello_body);
-    try eventually(io, 10, noServerStreams, f.ep);
+    try wait.waitUntil(io, "noServerStreams", f.ep, noServerStreams);
     try std.testing.expectEqual(@as(u32, 0), H3Park.gone_calls.load(.monotonic));
 }
 
@@ -2264,6 +2278,6 @@ test "parked h3: a no_wait handler that ends and releases its park before it ret
     const hello_body = try get(conn, "/hello", gpa);
     defer gpa.free(hello_body);
     try std.testing.expectEqualStrings("hello over h3", hello_body);
-    try eventually(io, 10, noServerStreams, f.ep);
+    try wait.waitUntil(io, "noServerStreams", f.ep, noServerStreams);
     try std.testing.expectEqual(@as(u32, 0), H3Park.gone_calls.load(.monotonic));
 }

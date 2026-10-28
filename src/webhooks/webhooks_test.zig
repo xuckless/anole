@@ -2,6 +2,7 @@
 //! (Delivery itself runs inside the jobs worker; it is exercised by the
 //! test round once the jobs engine is merged.)
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const wh = @import("root.zig");
 
@@ -22,6 +23,41 @@ test "Client: publish keeps one message per idempotency key" {
     try std.testing.expectError(error.InvalidJob, c.createEndpoint(&cx, .{ .url = "ftp://x" }));
     const rotated = try c.rotateSecret(&cx, made.endpoint.id, .fromSeconds(60));
     try std.testing.expect(!std.mem.eql(u8, rotated, made.secret));
+}
+
+test "webhooks: messages on SQLite page by bytes, newest first, for one owner and for all" {
+    if (comptime !anole.features.sqlite) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const sq = try anole.sqlite.Client.init(gpa, std.testing.io, .{ .path = ":memory:" });
+    defer sq.deinit();
+    const jc = try anole.jobs.Client.init(gpa, std.testing.io, .{ .store = .{ .sqlite = sq }, .table_prefix = "whtest_" });
+    defer jc.deinit();
+    const c = try wh.Client.init(gpa, std.testing.io, .{ .jobs = jc, .allow_private_addresses = true, .require_https = false });
+    defer c.deinit();
+    try c.start(null, null, null);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var cx: anole.db.Ctx = .{ .io = std.testing.io, .arena = arena.allocator() };
+    // Even ones to "acme", odd ones to "globex".
+    for ([_][]const u8{ "msg_a", "msg_B", "msg_c", "msg_D" }, 0..) |id, i| {
+        _ = try c.publish(&cx, .{ .owner = if (i % 2 == 0) "acme" else "globex", .type = "t", .id = id }, .{});
+    }
+    const Case = struct { owner: ?[]const u8, want: []const []const u8 };
+    for ([_]Case{
+        .{ .owner = null, .want = &.{ "msg_c", "msg_a", "msg_D", "msg_B" } },
+        .{ .owner = "acme", .want = &.{ "msg_c", "msg_a" } },
+        .{ .owner = "globex", .want = &.{ "msg_D", "msg_B" } },
+    }) |case| {
+        var got: std.ArrayList([]const u8) = .empty;
+        var before: ?[]const u8 = null;
+        while (got.items.len <= 4) { // more than every id: a page repeated
+            const page = try c.messages(&cx, .{ .owner = case.owner, .before = before, .limit = 1 });
+            if (page.len == 0) break;
+            try got.append(cx.arena, page[0].id);
+            before = page[0].id;
+        }
+        try std.testing.expectEqualDeep(case.want, got.items);
+    }
 }
 
 // ---- delivery end to end: a real server receives, the job queue delivers,
@@ -71,31 +107,40 @@ const E2E = struct {
         const p2 = try hooks.publish(&cx, .{ .owner = owner, .type = "user.created" }, .{ .id = 8 });
         try std.testing.expectEqual(@as(u32, 0), p2.deliveries);
 
-        var waited: u32 = 0;
-        while (got.load(.acquire) == 0 and waited < 200) : (waited += 1) try io.sleep(.fromMilliseconds(50), .awake);
+        _ = try wait.waitNonZero(io, "the webhook arrived", &got);
         try std.testing.expectEqual(@as(u32, 1), got.load(.acquire));
         try std.testing.expectEqual(@as(u32, 0), bad.load(.acquire));
         // The attempt is logged once the response is read.
+        const Logged = struct {
+            hooks: *wh.Client,
+            cx: *anole.db.Ctx,
+            message: []const u8,
+            att: *[]wh.Attempt,
+            fn some(l: @This()) !bool {
+                l.att.* = try l.hooks.attempts(l.cx, .{ .message = l.message });
+                return l.att.len > 0;
+            }
+        };
         var att: []wh.Attempt = &.{};
-        waited = 0;
-        while (waited < 200) : (waited += 1) {
-            att = try hooks.attempts(&cx, .{ .message = p.message_id });
-            if (att.len > 0) break;
-            try io.sleep(.fromMilliseconds(50), .awake);
-        }
+        try wait.waitUntil(io, "the delivery attempt is logged", Logged{ .hooks = hooks, .cx = &cx, .message = p.message_id, .att = &att }, Logged.some);
         try std.testing.expectEqual(@as(usize, 1), att.len);
         try std.testing.expectEqualStrings("delivered", att[0].outcome);
         try std.testing.expectEqual(@as(u16, 200), att[0].status);
         try std.testing.expectEqual(@as(usize, 2), (try hooks.messages(&cx, .{ .owner = owner })).len);
 
-        // Pruning through its job (keep is 1 s here): both messages and the attempt go.
+        // Pruning through its job (keep is 1 s here): both messages and the
+        // attempt go. The sleep only lets them age (a lower bound).
         try io.sleep(.fromMilliseconds(1100), .awake);
         _ = try jc.enqueueRaw(&cx, "anole.webhook.prune", "{}", .{ .queue = "webhooks" });
-        waited = 0;
-        while (waited < 200) : (waited += 1) {
-            if ((try hooks.messages(&cx, .{ .owner = owner })).len == 0) break;
-            try io.sleep(.fromMilliseconds(50), .awake);
-        }
+        const Pruned = struct {
+            hooks: *wh.Client,
+            cx: *anole.db.Ctx,
+            owner: []const u8,
+            fn gone(c: @This()) !bool {
+                return (try c.hooks.messages(c.cx, .{ .owner = c.owner })).len == 0;
+            }
+        };
+        try wait.waitUntil(io, "the prune job removed the messages", Pruned{ .hooks = hooks, .cx = &cx, .owner = owner }, Pruned.gone);
         try std.testing.expectEqual(@as(usize, 0), (try hooks.messages(&cx, .{ .owner = owner })).len);
         try std.testing.expectEqual(@as(usize, 0), (try hooks.attempts(&cx, .{ .message = p.message_id })).len);
     }

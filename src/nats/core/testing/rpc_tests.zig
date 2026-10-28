@@ -16,6 +16,7 @@ const FakeServer = @import("FakeServer.zig");
 const Inbox = @import("../engine/Inbox.zig");
 const golden = @import("../protocol/golden.zig");
 const time = @import("../engine/time.zig");
+const test_wait = @import("anole_test_wait");
 
 const quick: nats.FlushOptions = .{ .timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } } };
 
@@ -528,7 +529,8 @@ test "a request that waits for room in the outbound queue ends at its deadline" 
     const start = Io.Clock.awake.now(io);
     try testing.expectError(error.Timeout, client.request("echo.x", "?", within(100)));
     const took = elapsedSince(io, start).toMilliseconds();
-    try testing.expect(took >= 100 and took < 2000);
+    try testing.expect(took >= 100);
+    if (test_wait.timing()) try testing.expect(took < 2000);
     try testing.expectEqual(0, client.inbox.pendingCount(io));
     try testing.expect(client.isConnected());
 }
@@ -1324,7 +1326,8 @@ test "a request whose PUB waits for room in the outbound queue ends at its deadl
     const start = Io.Clock.awake.now(io);
     try testing.expectError(error.Timeout, client.request("echo.x", "?", within(100)));
     const took = elapsedSince(io, start).toMilliseconds();
-    try testing.expect(took >= 100 and took < 2000);
+    try testing.expect(took >= 100);
+    if (test_wait.timing()) try testing.expect(took < 2000);
     try testing.expectEqual(0, client.inbox.pendingCount(io));
     try testing.expect(client.isConnected());
 }

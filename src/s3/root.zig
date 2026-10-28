@@ -39,6 +39,9 @@ pub const Header = [2][]const u8;
 /// What a call can fail with: `anole.db.Error` (so a handler's `try` gives
 /// the right status), a cancel, memory.
 pub const Error = db.Error || error{ Canceled, OutOfMemory };
+/// `put`'s errors: `Error`, and `BodyTooBig` (a 413, as the core answers
+/// it) when a `Body.request` is larger than `limits.body_max`.
+pub const PutError = Error || error{BodyTooBig};
 
 pub const Provider = endpoint.Provider;
 pub const Addressing = endpoint.Addressing;
@@ -119,6 +122,9 @@ pub const GetOptions = struct {
     /// A 412 is `precondition` (409).
     if_match: ?[]const u8 = null,
     if_modified_since: ?db.Time = null,
+    /// A 412 (`precondition`) when the object changed after it; S3 skips
+    /// it when `if_match` is set (RFC 9110 13.2.2).
+    if_unmodified_since: ?db.Time = null,
     /// `get`: the whole-body bound; null: Options.max_object_bytes.
     max_bytes: ?u64 = null,
 };
@@ -327,7 +333,7 @@ pub const Bucket = struct {
         return true;
     }
 
-    pub fn put(self: Bucket, c: anytype, key: []const u8, body: Body, opts: PutOptions) Error!Stored {
+    pub fn put(self: Bucket, c: anytype, key: []const u8, body: Body, opts: PutOptions) PutError!Stored {
         return upload_.put(self, c, key, body, opts);
     }
 
@@ -871,7 +877,7 @@ pub const Client = struct {
     pub fn exists(self: *Client, c: anytype, key: []const u8) Error!bool {
         return self.dflt().exists(c, key);
     }
-    pub fn put(self: *Client, c: anytype, key: []const u8, body: Body, opts: PutOptions) Error!Stored {
+    pub fn put(self: *Client, c: anytype, key: []const u8, body: Body, opts: PutOptions) PutError!Stored {
         return self.dflt().put(c, key, body, opts);
     }
     pub fn upload(self: *Client, c: anytype, key: []const u8, opts: PutOptions) Error!*Upload {
@@ -1183,6 +1189,10 @@ pub const Client = struct {
         if (opts.if_modified_since) |t| {
             var buf: [29]u8 = undefined;
             hl.add("If-Modified-Since", try c.arena.dupe(u8, util.formatHttpDate(&buf, t.toSeconds()))) catch return error.OutOfMemory;
+        }
+        if (opts.if_unmodified_since) |t| {
+            var buf: [29]u8 = undefined;
+            hl.add("If-Unmodified-Since", try c.arena.dupe(u8, util.formatHttpDate(&buf, t.toSeconds()))) catch return error.OutOfMemory;
         }
     }
 

@@ -905,4 +905,6 @@ test {
     _ = verify;
     _ = store;
     _ = @import("webhooks_test.zig");
+    // Its fixture names anole.pg.Client, which -Dpostgres=false leaves out.
+    if (anole.features.postgres) _ = @import("pg_live_test.zig");
 }

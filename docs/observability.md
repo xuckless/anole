@@ -369,6 +369,21 @@ that. The header carries the sampled flag (`-01`) for a recorded request,
 and the caller's unset flag (`-00`) for one passed on unrecorded. Clients
 do not add it on their own.
 
+`anole.observe.trace.current(req, &buf)` is the same context for work the
+request hands on rather than calls: its span when it is recorded here, else
+the caller's `traceparent` as it came, every trace flag kept (W3C Level 2's
+random flag too; null when there is neither), and
+`trace.currentState(req)` the caller's `tracestate` beside it. A job
+enqueued from a request keeps both.
+
+### Jobs
+
+With `app.jobs` beside `app.tracing()`, every run of a job is a CONSUMER
+span `process <queue>`, in a trace of its own, **linked** to the context the
+job was enqueued from (its stored `traceparent` and `tracestate`) rather
+than a child of it. The attributes and the sampling rule are in
+[Jobs](jobs.md#metrics-and-traces).
+
 ## Health and readiness
 
 `Health.registerOn` serves two routes:

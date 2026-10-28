@@ -432,6 +432,7 @@ fn unsupported(comptime Out: type, comptime Args: type) void {
 
 const testing = std.testing;
 const zio = @import("zio");
+const wait = @import("anole_test_wait");
 
 const Row = struct { id: i64, sql: []const u8, tags: []const []const u8 };
 
@@ -444,13 +445,17 @@ const TestCtx = struct {
     last_source: ?db.Source = null,
 };
 
-/// A connector that counts its statements, takes `delay_ms` for each, and
-/// returns two rows built from the statement and its first argument.
+/// A connector that counts its statements, takes `delay_ms` for each (or,
+/// with a `gate`, runs until the test sets it), and returns two rows built
+/// from the statement and its first argument.
 const Fake = struct {
     calls: *std.atomic.Value(u32),
     canceled: *std.atomic.Value(u32),
     plain: *std.atomic.Value(u32),
     delay_ms: i64 = 20,
+    /// Set: the statement runs until the test sets it, so calls that
+    /// should join it find it in flight however slow the machine is.
+    gate: ?*std.Io.Event = null,
     fail: bool = false,
     /// No rows at all: an empty result.
     empty: bool = false,
@@ -460,7 +465,8 @@ const Fake = struct {
     pub fn run(self: Fake, ctx: anytype, sql: []const u8, args: anytype) ReadError![]Row {
         _ = self.calls.fetchAdd(1, .monotonic);
         if (@TypeOf(ctx) == *TestCtx) _ = self.plain.fetchAdd(1, .monotonic);
-        ctx.io.sleep(.fromMilliseconds(self.delay_ms), .awake) catch {
+        const waited = if (self.gate) |g| g.wait(ctx.io) else ctx.io.sleep(.fromMilliseconds(self.delay_ms), .awake);
+        waited catch {
             _ = self.canceled.fetchAdd(1, .monotonic);
             return error.Canceled;
         };
@@ -482,7 +488,29 @@ const Harness = struct {
     fn fake(h: *Harness, delay_ms: i64) Fake {
         return .{ .calls = &h.calls, .canceled = &h.canceled, .plain = &h.plain, .delay_ms = delay_ms };
     }
+
+    /// A statement that runs until `gate` is set.
+    fn held(h: *Harness, gate: *std.Io.Event) Fake {
+        return .{ .calls = &h.calls, .canceled = &h.canceled, .plain = &h.plain, .gate = gate };
+    }
+
+    /// Waits until `n` statements have started.
+    fn waitCalls(h: *Harness, io: std.Io, n: u32) !void {
+        try wait.waitAtLeast(io, "the statement started", &h.calls, n);
+    }
 };
+
+/// Waits until `n` calls in all have joined one in flight.
+fn waitCoalesced(cache: *Cache, io: std.Io, n: u64) !void {
+    const C = struct {
+        cache: *Cache,
+        n: u64,
+        fn f(c: @This()) bool {
+            return c.cache.stats().coalesced >= c.n;
+        }
+    };
+    try wait.waitUntil(io, "the identical calls joined the one in flight", C{ .cache = cache, .n = n }, C.f);
+}
 
 /// One caller: reads with `opts` into an arena of its own, checks the rows
 /// are its own copy, and counts what it got.
@@ -518,7 +546,12 @@ test "db cache: N identical calls in flight on each of 4 executors run one state
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     const per_executor = 16;
-    for (0..4 * per_executor) |i| try placement.concurrent(&group, io, .{ .executor = i % 4 }, caller, .{ &cache, io, h.fake(50), .{ .coalesce = true }, 7, &ok, &errors });
+    // Each executor's statement runs until all its callers have joined.
+    var gate: std.Io.Event = .unset;
+    defer gate.set(io);
+    for (0..4 * per_executor) |i| try placement.concurrent(&group, io, .{ .executor = i % 4 }, caller, .{ &cache, io, h.held(&gate), .{ .coalesce = true }, 7, &ok, &errors });
+    try waitCoalesced(&cache, io, 4 * (per_executor - 1));
+    gate.set(io);
     try group.await(io);
     try testing.expectEqual(@as(u32, 4 * per_executor), ok.load(.monotonic));
     try testing.expectEqual(@as(u32, 0), errors.load(.monotonic));
@@ -546,14 +579,18 @@ test "db cache: the first caller canceled, the others still get the rows; all go
     var errors: std.atomic.Value(u32) = .init(0);
 
     // The leader starts the statement, and is canceled while it runs.
+    var gate: std.Io.Event = .unset;
+    defer gate.set(io);
     var leader: std.Io.Group = .init;
-    try placement.concurrent(&leader, io, .{ .executor = 1 }, caller, .{ &cache, io, h.fake(100), .{ .coalesce = true }, 1, &ok, &errors });
-    try io.sleep(.fromMilliseconds(20), .awake);
+    defer leader.cancel(io);
+    try placement.concurrent(&leader, io, .{ .executor = 1 }, caller, .{ &cache, io, h.held(&gate), .{ .coalesce = true }, 1, &ok, &errors });
+    try h.waitCalls(io, 1);
     var followers: std.Io.Group = .init;
     defer followers.cancel(io);
-    for (0..3) |_| try placement.concurrent(&followers, io, .{ .executor = 1 }, caller, .{ &cache, io, h.fake(100), .{ .coalesce = true }, 1, &ok, &errors });
-    try io.sleep(.fromMilliseconds(10), .awake);
+    for (0..3) |_| try placement.concurrent(&followers, io, .{ .executor = 1 }, caller, .{ &cache, io, h.held(&gate), .{ .coalesce = true }, 1, &ok, &errors });
+    try waitCoalesced(&cache, io, 3);
     leader.cancel(io);
+    gate.set(io);
     try followers.await(io);
     try testing.expectEqual(@as(u32, 3), ok.load(.monotonic));
     try testing.expectEqual(@as(u32, 1), errors.load(.monotonic));
@@ -561,12 +598,14 @@ test "db cache: the first caller canceled, the others still get the rows; all go
     try testing.expectEqual(@as(u32, 0), h.canceled.load(.monotonic));
 
     // Every caller gone before the end: the statement is canceled.
+    var never: std.Io.Event = .unset;
     var all: std.Io.Group = .init;
-    for (0..3) |_| try placement.concurrent(&all, io, .{ .executor = 1 }, caller, .{ &cache, io, h.fake(5_000), .{ .coalesce = true }, 2, &ok, &errors });
-    try io.sleep(.fromMilliseconds(30), .awake);
+    defer all.cancel(io);
+    for (0..3) |_| try placement.concurrent(&all, io, .{ .executor = 1 }, caller, .{ &cache, io, h.held(&never), .{ .coalesce = true }, 2, &ok, &errors });
+    try h.waitCalls(io, 2);
+    try waitCoalesced(&cache, io, 3 + 2);
     all.cancel(io);
-    var waited: u32 = 0;
-    while (h.canceled.load(.monotonic) == 0 and waited < 200) : (waited += 1) try io.sleep(.fromMilliseconds(5), .awake);
+    try wait.waitAtLeast(io, "the abandoned statement canceled", &h.canceled, 1);
     try testing.expectEqual(@as(u32, 1), h.canceled.load(.monotonic));
     try testing.expectEqual(@as(u32, 2), h.calls.load(.monotonic));
 }
@@ -585,11 +624,16 @@ test "db cache: a caller's own timeout ends its wait alone" {
     testing.log_level = .err;
     defer testing.log_level = level;
 
+    // The statement runs until the second caller has timed out.
+    var gate: std.Io.Event = .unset;
+    defer gate.set(io);
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    try placement.concurrent(&group, io, .{ .executor = 0 }, caller, .{ &cache, io, h.fake(150), .{ .coalesce = true }, 3, &ok, &errors });
-    try io.sleep(.fromMilliseconds(10), .awake);
-    try placement.concurrent(&group, io, .{ .executor = 0 }, caller, .{ &cache, io, h.fake(150), .{ .coalesce = true, .timeout = .fromMilliseconds(20) }, 3, &ok, &errors });
+    try placement.concurrent(&group, io, .{ .executor = 0 }, caller, .{ &cache, io, h.held(&gate), .{ .coalesce = true }, 3, &ok, &errors });
+    try h.waitCalls(io, 1);
+    try placement.concurrent(&group, io, .{ .executor = 0 }, caller, .{ &cache, io, h.held(&gate), .{ .coalesce = true, .timeout = .fromMilliseconds(20) }, 3, &ok, &errors });
+    try wait.waitAtLeast(io, "the second caller's timeout", &errors, 1);
+    gate.set(io);
     try group.await(io);
     try testing.expectEqual(@as(u32, 1), ok.load(.monotonic));
     try testing.expectEqual(@as(u32, 1), errors.load(.monotonic));
@@ -615,12 +659,16 @@ test "db cache: errors reach every caller with their detail, and are not kept" {
             };
         }
     };
-    var failing = h.fake(20);
+    var gate: std.Io.Event = .unset;
+    defer gate.set(io);
+    var failing = h.held(&gate);
     failing.fail = true;
     var conflicts: std.atomic.Value(u32) = .init(0);
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     for (0..3) |_| try placement.concurrent(&group, io, .{ .executor = 0 }, Run.one, .{ &cache, io, failing, &conflicts });
+    try waitCoalesced(&cache, io, 2);
+    gate.set(io);
     try group.await(io);
     try testing.expectEqual(@as(u32, 3), conflicts.load(.monotonic));
     try testing.expectEqual(@as(u32, 1), h.calls.load(.monotonic));
@@ -648,49 +696,58 @@ test "db cache: kept for its ttl, then read again; invalidation by tag, by query
     var cache: Cache = try .init(gpa, io, .postgresql, "test", .{});
     defer cache.deinit();
     var h: Harness = .{};
-    const opts: db.QueryOptions = .{ .cache = .{ .ttl = .fromMilliseconds(80), .tag = "posts" } };
+    // A ttl no run of this test outlives, so the hits below never depend
+    // on how fast the machine is.
+    const opts: db.QueryOptions = .{ .cache = .{ .ttl = .fromSeconds(600), .tag = "posts" } };
 
     try once(&cache, io, h.fake(1), opts, 1);
     try once(&cache, io, h.fake(1), opts, 1);
     try once(&cache, io, h.fake(1), opts, 1);
     try testing.expectEqual(@as(u32, 1), h.calls.load(.monotonic));
     try testing.expectEqual(@as(u64, 2), cache.stats().hits);
-    // Past the ttl.
-    try io.sleep(.fromMilliseconds(100), .awake);
-    try once(&cache, io, h.fake(1), opts, 1);
+    // Past the ttl: time passing on purpose (a sleep never ends early).
+    const short: db.QueryOptions = .{ .cache = .{ .ttl = .fromMilliseconds(80), .tag = "posts" } };
+    try once(&cache, io, h.fake(1), short, 3);
     try testing.expectEqual(@as(u32, 2), h.calls.load(.monotonic));
+    try io.sleep(.fromMilliseconds(100), .awake);
+    try once(&cache, io, h.fake(1), short, 3);
+    try testing.expectEqual(@as(u32, 3), h.calls.load(.monotonic));
 
     // Another tag leaves it; its own tag drops it.
     cache.invalidate(.{ .tag = "users" });
     try once(&cache, io, h.fake(1), opts, 1);
-    try testing.expectEqual(@as(u32, 2), h.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 3), h.calls.load(.monotonic));
     cache.invalidate(.{ .tag = "posts" });
     try once(&cache, io, h.fake(1), opts, 1);
-    try testing.expectEqual(@as(u32, 3), h.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 4), h.calls.load(.monotonic));
 
     // By the statement and its arguments, whatever the width of the integer.
     cache.invalidateQuery("SELECT id FROM t WHERE id = $1", .{@as(i64, 2)});
     try once(&cache, io, h.fake(1), opts, 1);
-    try testing.expectEqual(@as(u32, 3), h.calls.load(.monotonic));
-    cache.invalidateQuery("SELECT id FROM t WHERE id = $1", .{1});
-    try once(&cache, io, h.fake(1), opts, 1);
     try testing.expectEqual(@as(u32, 4), h.calls.load(.monotonic));
-
-    cache.invalidate(.all);
+    cache.invalidateQuery("SELECT id FROM t WHERE id = $1", .{1});
     try once(&cache, io, h.fake(1), opts, 1);
     try testing.expectEqual(@as(u32, 5), h.calls.load(.monotonic));
 
+    cache.invalidate(.all);
+    try once(&cache, io, h.fake(1), opts, 1);
+    try testing.expectEqual(@as(u32, 6), h.calls.load(.monotonic));
+
     // An invalidation while the statement runs: its result is not kept.
+    var gate: std.Io.Event = .unset;
+    defer gate.set(io);
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     var ok: std.atomic.Value(u32) = .init(0);
     var errors: std.atomic.Value(u32) = .init(0);
-    try placement.concurrent(&group, io, .{ .executor = 0 }, caller, .{ &cache, io, h.fake(50), opts, 4, &ok, &errors });
-    try io.sleep(.fromMilliseconds(10), .awake);
+    try placement.concurrent(&group, io, .{ .executor = 0 }, caller, .{ &cache, io, h.held(&gate), opts, 4, &ok, &errors });
+    try h.waitCalls(io, 7);
     cache.invalidate(.{ .tag = "posts" });
+    gate.set(io);
     try group.await(io);
+    try testing.expectEqual(@as(u32, 1), ok.load(.monotonic));
     try once(&cache, io, h.fake(1), opts, 4);
-    try testing.expectEqual(@as(u32, 7), h.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 8), h.calls.load(.monotonic));
 }
 
 /// One call on executor 0 with a context of its own: how many rows came
@@ -784,9 +841,13 @@ test "db cache: lastSource says where each answer came from" {
     var second: ?db.Source = null;
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    try placement.concurrent(&group, io, .{ .executor = 0 }, Join.run, .{ &cache, io, h.fake(50), &first });
-    try io.sleep(.fromMilliseconds(10), .awake);
-    try placement.concurrent(&group, io, .{ .executor = 0 }, Join.run, .{ &cache, io, h.fake(50), &second });
+    var gate: std.Io.Event = .unset;
+    defer gate.set(io);
+    try placement.concurrent(&group, io, .{ .executor = 0 }, Join.run, .{ &cache, io, h.held(&gate), &first });
+    try h.waitCalls(io, 3);
+    try placement.concurrent(&group, io, .{ .executor = 0 }, Join.run, .{ &cache, io, h.held(&gate), &second });
+    try waitCoalesced(&cache, io, 1);
+    gate.set(io);
     try group.await(io);
     try testing.expectEqual(@as(?db.Source, .database), first);
     try testing.expectEqual(@as(?db.Source, .coalesced), second);
