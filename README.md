@@ -284,6 +284,15 @@ zig build run-io        # handlers waiting on timers, files and outbound request
 zig build docs          # the API reference (Zig autodoc) in zig-out/docs
 ```
 
+A passing test's log lines stay hidden; a test that fails, leaks, logs an
+error or crashes (a panic, SIGSEGV, SIGBUS, SIGILL, SIGFPE or SIGABRT) shows
+them. CI runs the tests with `--test-timeout 120s`: a test still running at
+110 s, its teardown included, is taken for a hang, and the test runner prints
+its name and every thread's backtrace (gdb on Linux, lldb or `sample` on
+macOS) before the limit ends it. `zig build hang-probe --test-timeout 20s`
+with `ANOLE_TEST_DUMP_AFTER=5` shows what that looks like; `zig build
+crash-probe` checks that a crashing test's lines are printed.
+
 `examples/full` speaks HTTP/1.1 and HTTP/2 on both ports and HTTP/3 on 8443
 over UDP:
 - `curl --http2-prior-knowledge localhost:8080/` and `curl -k --http2 https://localhost:8443/` both return `hello`;

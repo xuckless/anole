@@ -43,6 +43,35 @@ breaking changes are listed anyway.
   lease). docs/jobs.md gives the longest stop to plan the service manager's
   stop timeout around.
 
+### Changed
+
+- Tests: a hung unit test says where it hangs. CI runs every unit test step
+  with `--test-timeout 120s`; a test still running at 110 s, its teardown
+  (the test Io's and allocator's deinit) included, is named and every
+  thread's backtrace goes into the timeout report (gdb on Linux, lldb or
+  `sample` on macOS, each killed from outside the process after 60 s), then
+  the run goes on with the next test. The test runner dies on the timeout's
+  SIGTERM even when the hung test holds a SIGTERM handler; before, such a
+  test held the build until the runner's own 300 s limit, and the report
+  said nothing about where it hung. `zig build hang-probe` shows a dump
+  (`ANOLE_TEST_DUMP_AFTER` sets the threshold in seconds).
+- Tests: a passing test's log lines are not printed. The runner holds a
+  test's log lines and prints them only when the test fails, leaks, logs
+  an error or crashes (a panic, SIGSEGV, SIGBUS, SIGILL, SIGFPE or SIGABRT),
+  and in a hang dump; before, a passing test's warnings showed up under the
+  next failing test or under a misleading "failed command:" line. Text
+  printed straight to stderr (`std.debug.print`, C code) still shows.
+  `zig build crash-probe` checks the crash case.
+- CI: every job and long step has a time limit sized from the last 30 green
+  runs, and jobs with Docker containers keep the containers' logs and states
+  as an artifact when they fail (the interop runners' jobs upload the
+  runner's per-test logs, which hold every container's output). The interop
+  jobs install tshark from cached packages when the Wireshark PPA is down,
+  with every PPA attempt bounded so the fallback runs within the step's
+  10 minutes. With neither, the interop steps are skipped with a warning
+  that names the outage, instead of failing as if a test had (Ubuntu's own
+  tshark is too old for the runner); the release checks still fail (#54).
+
 ## 0.4.0 (2026-10-25)
 
 ### Breaking

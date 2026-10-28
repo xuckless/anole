@@ -12,6 +12,10 @@
 # peer was still alive and how it exited, the memory samples taken every
 # 5 s (echo peer RSS, client container, host), and the kernel log's tail.
 #   tests/autobahn/run.sh [path-to-echo-binary [loop|callbacks]]
+#
+# ANOLE_KEEP_CONTAINERS=1 leaves each attempt's client container when the
+# script ends (CI collects their logs and states after a failure, then
+# removes them).
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 bin=${1:-zig-out/bin/autobahn-echo}
@@ -33,7 +37,7 @@ while :; do
   "$bin" 9001 "$mode" >"$reports/server.log" 2>&1 &
   pid=$!
   sleep 1
-  client=autobahn-client-$$-$attempt
+  client=anole-autobahn-client-$$-$attempt
   # Memory every 5 s while the client runs.
   (
     while :; do
@@ -65,7 +69,7 @@ while :; do
   kill $sampler 2>/dev/null || true
   wait $sampler 2>/dev/null || true
   client_state=$(docker inspect -f '{{json .State}}' "$client" 2>/dev/null || echo unknown)
-  docker rm -f "$client" >/dev/null 2>&1 || true
+  [ -n "${ANOLE_KEEP_CONTAINERS:-}" ] || docker rm -f "$client" >/dev/null 2>&1 || true
   if kill -0 $pid 2>/dev/null; then
     echo_state="alive; peak RSS $(awk '/VmHWM/{print $2 " " $3}' "/proc/$pid/status" 2>/dev/null || echo unknown)"
     kill $pid 2>/dev/null || true

@@ -15,6 +15,9 @@
 #   tests/smtp/run.sh                                  # axllent/mailpit on ports 51025.. and 58025..
 #   MAILPIT_IMAGE=axllent/mailpit@sha256:... ZIG=zig tests/smtp/run.sh
 #   tests/smtp/run.sh -Doptimize=ReleaseSafe           # extra zig build arguments
+#
+# ANOLE_KEEP_CONTAINERS=1 leaves the containers when the script ends (CI
+# collects their logs and states after a failure, then removes them).
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -32,7 +35,7 @@ NAMES="anole-mailpit-plain-$SUFFIX anole-mailpit-starttls-$SUFFIX anole-mailpit-
 CERTS=$(mktemp -d)
 cleanup() {
   # shellcheck disable=SC2086
-  docker rm -f $NAMES >/dev/null 2>&1 || true
+  [ -n "${ANOLE_KEEP_CONTAINERS:-}" ] || docker rm -f $NAMES >/dev/null 2>&1 || true
   rm -rf "$CERTS"
 }
 trap cleanup EXIT
