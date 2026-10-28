@@ -337,6 +337,58 @@ fn fetchTask(io: std.Io, url: []const u8, method: dusty.Method, body: ?[]const u
     if (method != .head) out.body = try alloc.dupe(u8, (try resp.body()) orelse "");
 }
 
+/// A GET with conditional headers (`names[i]: values[i]`).
+fn fetchIfTask(io: std.Io, url: []const u8, names: []const []const u8, values_in: []const []const u8, out: *HttpResult) anyerror!void {
+    var http = dusty.Client.init(alloc, io, .{});
+    defer http.deinit();
+    var keys: [4][]const u8 = undefined;
+    var values: [4][]const u8 = undefined;
+    var hashes: [4]u8 = undefined;
+    var h: dusty.Headers = .{ .keys = &keys, .values = &values, .hashes = &hashes };
+    for (names, values_in) |n, v| try h.add(n, v);
+    var resp = try http.fetch(url, .{ .headers = &h, .decompress = false });
+    defer resp.deinit();
+    out.status = @intCast(@intFromEnum(resp.status()));
+    out.body = try alloc.dupe(u8, (try resp.body()) orelse "");
+}
+
+/// What a conditional GET of "obj.bin" (put now) is served with.
+const Conditional = enum { if_unmodified_since_old, if_match_and_if_unmodified_since_old };
+
+/// Serves "obj.bin" (put now) to one GET carrying the headers `which`
+/// names; the status.
+fn serveConditional(which: Conditional) !u16 {
+    var r: Rig = undefined;
+    try r.start(true);
+    defer r.deinit();
+    try r.fake.putObject("b", "obj.bin", "conditional", "text/plain");
+    const old_date = "Sun, 06 Nov 1994 08:49:37 GMT";
+    const names: []const []const u8, const values: []const []const u8 = switch (which) {
+        .if_unmodified_since_old => .{ &.{"If-Unmodified-Since"}, &.{old_date} },
+        .if_match_and_if_unmodified_since_old => .{ &.{ "If-Match", "If-Unmodified-Since" }, &.{ r.fake.getEtag("b", "obj.bin").?, old_date } },
+    };
+    const io = r.rt.io();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/f/obj", .{r.e.port(0)});
+    var res: HttpResult = .{};
+    defer alloc.free(res.body);
+    var f = try io.concurrent(fetchIfTask, .{ io, url, names, values, &res });
+    const i = try r.ev.waitFor(.request, 0, 15000);
+    try engine.s3.serve(r.store(), r.ev.list.items[i].handle, .of("obj.bin"), .{}, 23);
+    try f.await(io);
+    return res.status;
+}
+
+test "capi s3: serve forwards If-Unmodified-Since: older than the object answers 412" {
+    if (comptime !features.s3 or !features.http2) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u16, 412), try serveConditional(.if_unmodified_since_old));
+}
+
+test "capi s3: serve: a true If-Match wins over a false If-Unmodified-Since (200)" {
+    if (comptime !features.s3 or !features.http2) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u16, 200), try serveConditional(.if_match_and_if_unmodified_since_old));
+}
+
 test "capi s3: serve answers the request from the object; the body never enters the consumer" {
     if (comptime !features.s3 or !features.http2) return error.SkipZigTest;
     var r: Rig = undefined;

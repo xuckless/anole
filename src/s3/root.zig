@@ -122,6 +122,9 @@ pub const GetOptions = struct {
     /// A 412 is `precondition` (409).
     if_match: ?[]const u8 = null,
     if_modified_since: ?db.Time = null,
+    /// A 412 (`precondition`) when the object changed after it; S3 skips
+    /// it when `if_match` is set (RFC 9110 13.2.2).
+    if_unmodified_since: ?db.Time = null,
     /// `get`: the whole-body bound; null: Options.max_object_bytes.
     max_bytes: ?u64 = null,
 };
@@ -1186,6 +1189,10 @@ pub const Client = struct {
         if (opts.if_modified_since) |t| {
             var buf: [29]u8 = undefined;
             hl.add("If-Modified-Since", try c.arena.dupe(u8, util.formatHttpDate(&buf, t.toSeconds()))) catch return error.OutOfMemory;
+        }
+        if (opts.if_unmodified_since) |t| {
+            var buf: [29]u8 = undefined;
+            hl.add("If-Unmodified-Since", try c.arena.dupe(u8, util.formatHttpDate(&buf, t.toSeconds()))) catch return error.OutOfMemory;
         }
     }
 

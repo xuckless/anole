@@ -12,6 +12,11 @@ breaking changes are listed anyway.
   413 Content Too Large (RFC 9110 §15.5.14), as the server's own body
   readers answer it. `anole.db.lastError(req)` still says `body_too_big`,
   and the connection closes after the answer since the body is unread.
+- S3: the C ABI's `anole_s3_serve` ignored the request's
+  If-Unmodified-Since; it now forwards it as the Zig `serve` does, so an
+  object changed since that date answers 412 (RFC 9110 §13.2.2; a true
+  If-Match still wins, as S3 orders them). `GetOptions` gains
+  `if_unmodified_since` for `get`, `open` and `head`.
 
 ## 0.4.1 (2026-10-28)
 
