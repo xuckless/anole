@@ -469,11 +469,14 @@ pub const IoGate = struct {
 
     const closed: u32 = 1 << 31;
 
+    /// A compare-and-swap that never counts a wake once the gate is
+    /// closed (libuv's `uv_async_send` has the same shape), so a stream of
+    /// late wakes can't keep `close` waiting.
     pub fn enter(g: *IoGate) bool {
-        const prev = g.word.fetchAdd(1, .acquire);
-        if (prev & closed != 0) {
-            _ = g.word.fetchSub(1, .release);
-            return false;
+        var cur = g.word.load(.monotonic);
+        while (true) {
+            if (cur & closed != 0) return false;
+            cur = g.word.cmpxchgWeak(cur, cur + 1, .acquire, .monotonic) orelse break;
         }
         if (comptime builtin.is_test) if (test_io_hook) |f| f();
         return true;
@@ -488,7 +491,16 @@ pub const IoGate = struct {
     /// instructions long.
     pub fn close(g: *IoGate) void {
         _ = g.word.fetchOr(closed, .acq_rel);
-        while (g.word.load(.acquire) & ~closed != 0) std.Thread.yield() catch {};
+        // Spin first, then yield, as libuv's `uv__async_spin` does: a wake
+        // in flight is done within a few hundred cycles unless its thread
+        // was preempted.
+        var spins: u32 = 0;
+        while (g.word.load(.acquire) & ~closed != 0) {
+            if (spins < 1000) {
+                spins += 1;
+                std.atomic.spinLoopHint();
+            } else std.Thread.yield() catch {};
+        }
     }
 
     pub fn setEvent(g: *IoGate, io: std.Io, ev: *std.Io.Event) void {
@@ -1838,8 +1850,28 @@ pub const Engine = struct {
     /// On the run thread, right before the runtime goes: every wake from
     /// another thread that is under way finishes, later ones are skipped.
     fn closeIo(e: *Engine) void {
+        e.assertNoTasks();
         for (e.execs) |*x| x.io_gate.close();
         e.io_gate.close();
+    }
+
+    /// Debug and test builds: every task group of the engine is empty when
+    /// the gates close. A wake skipped after `closeIo` is harmless only
+    /// because no task is left to wait for it; a task still in a group
+    /// would wait forever (and `app.deinit` with it).
+    fn assertNoTasks(e: *Engine) void {
+        if (comptime !(builtin.mode == .debug or builtin.is_test)) return;
+        std.debug.assert(e.tasks.token.load(.acquire) == null);
+        for (e.execs) |*x| inline for (comptime std.meta.fieldNames(Exec)) |area| {
+            const T = @FieldType(Exec, area);
+            if (comptime @typeInfo(T) != .@"struct") continue;
+            inline for (.{ "work", "sender" }) |name| {
+                if (comptime @hasField(T, name) and @FieldType(T, name) == std.Io.Group) {
+                    const g = &@field(@field(x, area), name);
+                    if (g.token.load(.acquire) != null) std.debug.panic("capi: executor {d}'s {s}.{s} still has tasks when the runtime's wakes close", .{ x.index, area, name });
+                }
+            }
+        };
     }
 
     pub fn drain(e: *Engine) !void {
