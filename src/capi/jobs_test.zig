@@ -593,6 +593,97 @@ test "capi jobs: while enqueue(opts.req) on another thread reads a gRPC call, it
     try std.testing.expectEqual(@as(u32, 0), code.load(.acquire));
 }
 
+/// A unary anole.test.Echo/Unary call over h2c carrying a traceparent,
+/// whose stream the client resets once `go` is set.
+const GrpcReset = struct {
+    port: u16,
+    go: std.atomic.Value(bool) = .init(false),
+
+    fn run(g: *GrpcReset, io: std.Io) anyerror!void {
+        const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = g.port });
+        defer conn.close();
+        // An empty EchoRequest in one gRPC frame.
+        const s = try conn.request(&.{
+            .{ .name = ":method", .value = "POST" },                  .{ .name = ":path", .value = "/anole.test.Echo/Unary" },
+            .{ .name = ":scheme", .value = "http" },                  .{ .name = ":authority", .value = "localhost" },
+            .{ .name = "content-type", .value = "application/grpc" }, .{ .name = "te", .value = "trailers" },
+            .{ .name = "traceparent", .value = tp_unsampled },
+        }, .{ .body_bytes = &.{ 0, 0, 0, 0, 0 } });
+        defer s.release();
+        try wait.waitFlag(io, "the answer call holds the call", &g.go);
+        s.cancel();
+    }
+};
+
+/// `engine.grpc.sendHeaders` on a thread of its own.
+const SendHeaders = struct {
+    r: *Rig,
+    call: u64,
+    result: ?anyerror = null,
+
+    fn run(sh: *SendHeaders) void {
+        engine.grpc.sendHeaders(sh.r.e, sh.call, &.{}) catch |err| {
+            sh.result = err;
+        };
+    }
+};
+
+test "capi jobs: enqueue(opts.req) on a gRPC call reset while send_headers held it: the job has no context, the freed call is not read" {
+    if (comptime !features.jobs or !features.grpc or !features.http2) return error.SkipZigTest;
+    const set = @import("anole_test_descriptors").set;
+    const b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(set.len));
+    defer alloc.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, set);
+    const top = try std.fmt.allocPrint(alloc, ", \"grpc\": {{\"descriptor_set\": \"{s}\", \"services\": [{{\"name\": \"anole.test.Echo\", \"handler\": 10}}]}}", .{b64});
+    defer alloc.free(top);
+    const rt = try anole.zio.Runtime.init(alloc, .{ .executors = .exact(1), .enable_main_executor = false });
+    defer rt.deinit();
+    var r: Rig = undefined;
+    try r.createWith(", \"kinds\": [{\"name\": \"t.work\"}]", "", top);
+    defer r.deinit();
+    _ = try engine.jobs.work(r.e, r.c, .{ .size = @sizeOf(abi.JobsWorkOptions) }, 5);
+    try r.start();
+    const io = rt.io();
+    const tio = engine.threadedIo();
+    var g: GrpcReset = .{ .port = r.e.port(0) };
+    var f = try io.concurrent(GrpcReset.run, .{ &g, io });
+    defer f.cancel(io) catch {};
+    const call = r.ev.list.items[try r.ev.waitFor(.grpc_call, 0, 10000)].handle;
+    const aborted = r.e.aborted_count.load(.monotonic);
+
+    // Another thread's send_headers holds the call in `responding` while
+    // the client resets the stream: the executor lets the call's memory
+    // go and leaves the slot to that call, which then hands it back to
+    // `out`.
+    var hold: engine.TestPin = .{};
+    engine.test_answer_hold = &hold;
+    var sh: SendHeaders = .{ .r = &r, .call = call };
+    var t: ?std.Thread = try std.Thread.spawn(.{}, SendHeaders.run, .{&sh});
+    defer if (t) |th| {
+        hold.release.store(true, .release);
+        th.join();
+        engine.test_answer_hold = null;
+    };
+    try wait.waitFlag(tio, "send_headers holds the call", &hold.held);
+    g.go.store(true, .release);
+    try wait.waitAtLeast(tio, "the executor lets the reset call go", &r.e.aborted_count, aborted + 1);
+    hold.release.store(true, .release);
+    t.?.join();
+    t = null;
+    engine.test_answer_hold = null;
+    try std.testing.expectEqual(@as(?anyerror, null), sh.result);
+
+    // The call is still owed its answer, but its memory is gone: the job
+    // is enqueued without the call's context.
+    try engine.jobs.enqueue(r.e, r.c, &.{jobOut("t.work", "{}")}, .{ .size = @sizeOf(abi.JobsEnqueueOptions), .req = call }, 14);
+    const ji = try r.ev.waitFor(.job, 0, 10000);
+    const job = r.ev.as(abi.JobEvent, ji);
+    try engine.jobs.finish(r.e, r.ev.list.items[ji].handle, abi.JOB_DONE, 0, "");
+    // The consumer's answer ends the orphaned call (nobody hears it).
+    _ = try engine.grpc.send(r.e, call, "", false, true);
+    try std.testing.expectEqualStrings("", r.ev.span(ji, job.traceparent));
+}
+
 /// Handles handed by the polling thread, in order, to the two racing
 /// threads.
 const Handed = struct {

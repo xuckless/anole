@@ -285,6 +285,14 @@ pub const Slot = struct {
     /// streamed answer's body (consumer to executor).
     in: Pipe = .{},
     out: Pipe = .{},
+    /// A detached request's memory went (`detachedAborted` met another
+    /// thread's call on it and orphaned the slot): `requestTrace` must not
+    /// read `req` any more, though the slot may be `out` again once that
+    /// call hands it back. Set by the executor, read by a consumer under
+    /// its pin, both `.seq_cst` (a Dekker handshake with the word: either
+    /// the executor sees the pin and waits it out, or the pin sees this).
+    /// Reset with `orphan` when the slot is released.
+    gone: std.atomic.Value(bool) = .init(false),
 
     // Executor-local from here.
     /// The request's response is detached (HTTP/2, HTTP/3): no task waits.
@@ -662,6 +670,7 @@ pub const Exec = struct {
         }
         s.detached = null;
         s.orphan = false;
+        s.gone.store(false, .monotonic);
         s.abandoned = false;
         s.body_error = null;
         s.claims = "";
@@ -2922,9 +2931,20 @@ pub fn detachedAborted(ctx: *anyopaque) void {
             .polling => std.atomic.spinLoopHint(),
             // The consumer is answering, or has: the capi task frees it.
             // The request body may live in the request's memory, which
-            // goes once this returns: reads of it end now.
+            // goes once this returns: reads of it end now. A call still
+            // `responding` may hand the slot back to `out` (a gRPC
+            // send_headers, an answer call that failed), where
+            // `requestTrace` could pin it: `gone` tells the pin the
+            // memory went, and a pin taken before this saw it is waited
+            // out (SAFETY.md M3, T4: never a freed pointer).
             .responding, .done, .streaming => {
                 s.orphan = true;
+                s.gone.store(true, .seq_cst);
+                while (true) {
+                    const now_w = s.word.load(.seq_cst);
+                    if (genOf(now_w) != gen or stateOf(now_w) != .polling) break;
+                    std.atomic.spinLoopHint();
+                }
                 x.closePipe(&s.in, gen, si);
                 return;
             },
@@ -3524,11 +3544,21 @@ pub const TraceContext = struct {
 /// goes to `polling` and back, and meanwhile its task waits (HTTP/1.1) or
 /// a detached request's abort spins (HTTP/2, HTTP/3), so its memory
 /// stays; calls on the handle from other consumer threads wait the pin
-/// out (`claimOut`). The pin only copies into stack buffers (SAFETY.md
-/// L5: an executor may spin on it, so it never allocates or waits); the
-/// copies go into `a` after it. Nothing is copied at dispatch: requests
-/// that hand nothing on pay nothing. Empty when the request carries no
-/// context or is no longer owed an answer (answered, or ended).
+/// out (`claimOut`). A detached request whose stream ended while another
+/// thread's call held it (`Slot.gone`, set by `detachedAborted`) has no
+/// memory left to read, even once that call hands it back to `out`: the
+/// pin sees `gone` and reads nothing. The pin only copies into stack
+/// buffers (SAFETY.md L5: an executor may spin on it, so it never
+/// allocates or waits); the copies go into `a` after it. Nothing is
+/// copied at dispatch: requests that hand nothing on pay nothing (the
+/// header scan stays off the hot path).
+///
+/// Empty (no context) when the request carries none, when it is no
+/// longer owed an answer (answered, or ended), and whenever its slot is
+/// not `out` at the call: once its answer has started streaming
+/// (`anole_req_stream`, a gRPC server stream after its first message), or
+/// while another thread's call is storing part of its answer (a gRPC
+/// send_headers or non-final send). The jobs are still enqueued.
 pub fn requestTrace(e: *Engine, hv: u64, a: std.mem.Allocator) error{OutOfMemory}!TraceContext {
     const h = Handle.decode(hv);
     if (h.kind != .request and h.kind != .grpc_call) return .{};
@@ -3544,7 +3574,10 @@ pub fn requestTrace(e: *Engine, hv: u64, a: std.mem.Allocator) error{OutOfMemory
     {
         if (claimOut(s, h.gen, .polling) != null) return .{};
         defer s.word.store(pack(h.gen, .out), .release);
-        if (builtin.is_test) testPinHold();
+        if (builtin.is_test) if (test_pin) |p| testHold(p);
+        // After the pin, `.seq_cst` as `detachedAborted`'s store: the
+        // request's memory went while another call held the slot.
+        if (s.gone.load(.seq_cst)) return .{};
         const req = s.req;
         const tp = anole.observe.trace.current(req, &tp_buf) orelse return .{};
         @memcpy(tp_out[0..tp.len], tp);
@@ -3567,10 +3600,14 @@ pub fn requestTrace(e: *Engine, hv: u64, a: std.mem.Allocator) error{OutOfMemory
 /// allocates or waits (L5), so the wait is a short spin, as a seqlock
 /// reader's retry. A pinned live handle is never taken for over. Null when
 /// moved; else the word that refused it (another state or generation).
+/// The move is `.seq_cst`: a pin's half of `Slot.gone`'s handshake.
 pub fn claimOut(s: *Slot, gen: u32, to: SlotState) ?u64 {
     const pinned = pack(gen, .polling);
     while (true) {
-        const w = s.word.cmpxchgStrong(pack(gen, .out), pack(gen, to), .acquire, .monotonic) orelse return null;
+        const w = s.word.cmpxchgStrong(pack(gen, .out), pack(gen, to), .seq_cst, .monotonic) orelse {
+            if (builtin.is_test and to == .responding) if (test_answer_hold) |p| testHold(p);
+            return null;
+        };
         if (w != pinned) return w;
         if (builtin.is_test) if (test_pin) |p| p.release.store(true, .release);
         std.atomic.spinLoopHint();
@@ -3582,14 +3619,18 @@ pub fn claimOut(s: *Slot, gen: u32, to: SlotState) ?u64 {
 /// by the first call that meets the pin, so a test can overlap the pin
 /// with other calls on the handle without counting on timing.
 pub const TestPin = struct {
-    /// `requestTrace` is inside the pin.
+    /// The hooked call is inside its hold.
     held: std.atomic.Value(bool) = .init(false),
     release: std.atomic.Value(bool) = .init(false),
 };
 pub var test_pin: if (builtin.is_test) ?*TestPin else void = if (builtin.is_test) null else {};
+/// A test hook (test builds only): while set, the next answer call's
+/// claim (`claimOut` to `responding`) holds the slot in `responding` until
+/// the test sets `release`, so a test can end a detached request's stream
+/// while another thread's call is on it.
+pub var test_answer_hold: if (builtin.is_test) ?*TestPin else void = if (builtin.is_test) null else {};
 
-fn testPinHold() void {
-    const p = test_pin orelse return;
+fn testHold(p: *TestPin) void {
     p.held.store(true, .release);
     while (!p.release.load(.acquire)) std.Thread.yield() catch {};
 }
