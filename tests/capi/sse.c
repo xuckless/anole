@@ -51,6 +51,22 @@ static void sleep_ms(int ms) {
   nanosleep(&ts, NULL);
 }
 
+/* Hang guards, as src/testing/wait.zig: 10 s times ANOLE_TEST_TIMEOUT_FACTOR
+   (a whole number, default 1), counted on the clock. Never a latency bound. */
+static long timeout_factor(void) {
+  const char *f = getenv("ANOLE_TEST_TIMEOUT_FACTOR");
+  long n = f ? strtol(f, NULL, 10) : 1;
+  return n < 1 ? 1 : n;
+}
+
+static double now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+static double wait_until(void) { return now_ms() + 10000.0 * (double)timeout_factor(); }
+
 static void on_log(void *ud, uint32_t level, anole_str scope, anole_str msg) {
   (void)ud;
   if (level <= ANOLE_LOG_WARN || getenv("CAPI_LOG"))
@@ -144,13 +160,13 @@ static const char *read_until(int fd, char *buf, size_t cap, size_t *len, const 
 }
 
 static void wait_for(atomic_int *v, int at_least) {
-  for (int i = 0; i < 5000 && atomic_load(v) < at_least; i++) sleep_ms(2);
+  for (double until = wait_until(); atomic_load(v) < at_least && now_ms() < until;) sleep_ms(2);
   CHECK(atomic_load(v) >= at_least);
 }
 
 int main(void) {
   signal(SIGALRM, on_watchdog);
-  alarm(120);
+  alarm(120 * (unsigned)timeout_factor());
   setvbuf(stdout, NULL, _IOLBF, 0);
   const char *json =
       "{\"executors\": 2, \"sse\": {\"heartbeat_ms\": null}, \"limits\": {\"sse_max_event\": 1024},"

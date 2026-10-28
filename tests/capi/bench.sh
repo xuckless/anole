@@ -24,6 +24,7 @@ dur=${1:-10}
 conns=${2:-256}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
+. "$here/../lib/wait.sh"
 zig=${ZIG:-zig}
 out=$root/zig-out/capi-bench
 mkdir -p "$out"
@@ -55,7 +56,7 @@ start() { # executors port
   "$out/consumer" serve "$1" "$2" 1 <"$fifo" 2>"$out/serve.$2.log" &
   pid=$!
   exec 3>"$fifo"
-  sleep 1
+  wait_until 30 "the consumer to listen on $2" port_open 127.0.0.1 "$2" || { cat "$out/serve.$2.log" >&2; exit 1; }
 }
 stop() {
   exec 3>&-
