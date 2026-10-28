@@ -2967,23 +2967,23 @@ static void test_db_postgres_tx(void) {
   CHECK(anole_db_begin(db, c, NULL, 30) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   anole_db_tx tr = r->ev.handle;
-  CHECK(anole_db_tx_query(tr, LIT("SELECT pg_sleep(10)"), NULL, 0, NULL, 31) == ANOLE_OK);
+  CHECK(anole_db_tx_query(tr, LIT("SELECT pg_sleep(600)"), NULL, 0, NULL, 31) == ANOLE_OK);
   usleep(200 * 1000);
   double t0 = now_ms();
   CHECK(anole_db_tx_release(tr) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 31 && r->status == ANOLE_E_GONE);
   CHECK(!timing() || now_ms() - t0 < 1500);
-  anole_str sleepers = LIT("SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(10)%' AND pid <> pg_backend_pid()");
+  anole_str sleepers = LIT("SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(600)%' AND pid <> pg_backend_pid()");
   int64_t left = -1;
-  for (int i = 0; i < 20 && left != 0; i++) {
-    CHECK(anole_db_query(db, c, sleepers, NULL, 0, NULL, 40 + i) == ANOLE_OK);
+  for (double until = wait_until(); left != 0;) {
+    CHECK(now_ms() < until);
+    CHECK(anole_db_query(db, c, sleepers, NULL, 0, NULL, 40) == ANOLE_OK);
     r = db_next(c, rec, sizeof rec);
     CHECK(r->status == ANOLE_OK);
     left = db_cell(r, 0, 0)->v.i;
-    if (left != 0) usleep(100 * 1000);
+    if (left != 0) usleep(10 * 1000);
   }
-  CHECK(left == 0);
 
   /* a query tied to a request sends CancelRequest at the request's deadline */
   pthread_t t;
@@ -2991,18 +2991,18 @@ static void test_db_postgres_tx(void) {
   anole_req h = next_request(c);
   anole_db_options on = {sizeof on};
   on.req = h;
-  CHECK(anole_db_query(db, NULL, LIT("SELECT pg_sleep(10)"), NULL, 0, &on, 60) == ANOLE_OK);
+  CHECK(anole_db_query(db, NULL, LIT("SELECT pg_sleep(600)"), NULL, 0, &on, 60) == ANOLE_OK);
   CHECK(finish_get(a, t, NULL) == 504);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 60 && r->status == ANOLE_E_GONE);
   left = -1;
-  for (int i = 0; i < 20 && left != 0; i++) {
-    CHECK(anole_db_query(db, c, sleepers, NULL, 0, NULL, 70 + i) == ANOLE_OK);
+  for (double until = wait_until(); left != 0;) {
+    CHECK(now_ms() < until);
+    CHECK(anole_db_query(db, c, sleepers, NULL, 0, NULL, 70) == ANOLE_OK);
     r = db_next(c, rec, sizeof rec);
     left = db_cell(r, 0, 0)->v.i;
-    if (left != 0) usleep(100 * 1000);
+    if (left != 0) usleep(10 * 1000);
   }
-  CHECK(left == 0);
 
   CHECK(anole_db_exec(db, c, LIT("DROP TABLE anole_capi_fk_child, anole_capi_fk_parent, anole_capi_acct"), NULL, 0, NULL, 99) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
