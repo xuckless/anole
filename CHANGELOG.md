@@ -3,18 +3,7 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
-## 0.4.2 (unreleased)
-
-### Changed
-
-- Tests: Anole's tests no longer assume a fast machine. Waits go through one
-  helper (`src/testing/wait.zig`) with a 10 s deadline, scaled by
-  `ANOLE_TEST_TIMEOUT_FACTOR`, that names what it waited for when it times
-  out; sleeps that stood in for "it has happened" wait on the condition
-  itself, and elapsed-time bounds move to a new local-only step,
-  `zig build test-timing` (MAINTAINING.md, "Waiting in tests").
-
-## 0.4.1 (2026-10-28)
+## 0.4.1 (unreleased)
 
 ### Fixed
 
@@ -53,6 +42,26 @@ breaking changes are listed anyway.
   finished but whose state could not be saved (they run again after their
   lease). docs/jobs.md gives the longest stop to plan the service manager's
   stop timeout around.
+- C ABI: a request (or gRPC call) is stale as soon as it is answered, as
+  `anole.h` says ("until answered"): `anole_db_query`, `_exec`, `_begin` and
+  the S3, SMTP, NATS and jobs calls given an answered request as `req`
+  return `ANOLE_E_GONE` at once. They accepted it, and ran the call, until
+  the executor had written the answer and freed the slot. A streamed answer
+  is owed until `anole_req_stream_end` (or `anole_grpc_finish`).
+- C ABI: a transaction its request ended (aborted, past its deadline), or
+  that timed out, refuses `anole_db_tx_query`, `_exec`, `_commit` and
+  `_rollback` with `ANOLE_E_GONE` at once, as documented. They were taken
+  until the transaction's task had rolled it back.
+
+### Changed
+
+- Tests: Anole's tests no longer assume a fast machine. Waits go through one
+  helper (`src/testing/wait.zig`) with a 10 s deadline, scaled by
+  `ANOLE_TEST_TIMEOUT_FACTOR`, that names what it waited for when it times
+  out; sleeps that stood in for "it has happened" wait on the condition
+  itself, and elapsed-time upper bounds, in the Zig suites and the C ABI
+  suite alike, are checked only by a new local-only step,
+  `zig build test-timing` (MAINTAINING.md, "Waiting in tests").
 
 ## 0.4.0 (2026-10-25)
 
