@@ -767,6 +767,25 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     run_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_tests.step);
+    // test-timing: the main and the HTTP core's suites again, built with
+    // `timing` on (src/testing/wait.zig): the elapsed-time bounds a test
+    // checks only `if (wait.timing)`, and the tests whose whole claim is
+    // about speed (`requireTiming`, named "[timing]"), run too. Local only
+    // (the Mac and the x86 box), never in CI: nothing in CI may depend on
+    // speed (TESTING.md D6). Run it on an otherwise idle machine.
+    const timing_step = b.step("test-timing", "Run the speed and elapsed-time tests (local only, never in CI; on an idle machine)");
+    {
+        const timing_tests = addSafeTest(b, .{
+            .name = "anole-test-timing",
+            .filters = test_filters,
+            .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .test_wait = testWaitModule(b, true, target, optimize) }),
+            .use_llvm = use_llvm,
+        });
+        const run_timing = b.addRunArtifact(timing_tests);
+        run_timing.skip_foreign_checks = true;
+        run_timing.has_side_effects = true;
+        timing_step.dependOn(&run_timing.step);
+    }
     // compile-tests: build the test binaries without running them.
     const compile_tests_step = b.step("compile-tests", "Compile the test binaries without running them");
     compile_tests_step.dependOn(&tests.step);
@@ -776,6 +795,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "validate-test", .mod = core.validate },
         .{ .name = "log-test", .mod = core.anole_log },
         .{ .name = "banner-test", .mod = core.banner },
+        .{ .name = "wait-test", .mod = core.test_wait },
     }) |t| {
         const sub_tests = addSafeTest(b, .{ .name = t.name, .root_module = t.mod, .use_llvm = use_llvm });
         const run_sub = b.addRunArtifact(sub_tests);
@@ -958,23 +978,29 @@ pub fn build(b: *std.Build) void {
         // A second instance of the same sources and imports, but with the
         // core's zio stub: its tests run on std.testing.io, and the real
         // zio's timers need a zio task.
-        const core_root = core_full.root_source_file.?;
-        const test_mod = b.createModule(.{
-            .root_source_file = core_root,
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        var imports = core_full.import_table.iterator();
-        while (imports.next()) |e| test_mod.addImport(e.key_ptr.*, e.value_ptr.*);
-        const zio_stub = b.createModule(.{ .root_source_file = b.path("src/http/core/zio_stub.zig"), .target = target, .optimize = optimize });
-        test_mod.addImport("zio", zio_stub);
-        test_mod.addImport("anole_safety", Core.safetyModule(b, zio_stub, target, optimize));
-        // And the stub HTTP/2 client: Anole's would import these sources a
-        // second time.
-        test_mod.addAnonymousImport("h2_client", .{ .root_source_file = b.path("src/http/core/h2_client_stub.zig") });
-        test_mod.include_dirs.appendSlice(b.allocator, core_full.include_dirs.items) catch @panic("OOM");
-        test_mod.link_objects.appendSlice(b.allocator, core_full.link_objects.items) catch @panic("OOM");
+        const core_test_mod = struct {
+            fn make(bb: *std.Build, full: *std.Build.Module, wait: *std.Build.Module, t: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode) *std.Build.Module {
+                const m = bb.createModule(.{
+                    .root_source_file = full.root_source_file.?,
+                    .target = t,
+                    .optimize = opt,
+                    .link_libc = true,
+                });
+                var imports = full.import_table.iterator();
+                while (imports.next()) |e| m.addImport(e.key_ptr.*, e.value_ptr.*);
+                const zio_stub = bb.createModule(.{ .root_source_file = bb.path("src/http/core/zio_stub.zig"), .target = t, .optimize = opt });
+                m.addImport("zio", zio_stub);
+                m.addImport("anole_safety", Core.safetyModule(bb, zio_stub, t, opt));
+                m.addImport("anole_test_wait", wait);
+                // And the stub HTTP/2 client: Anole's would import these
+                // sources a second time.
+                m.addAnonymousImport("h2_client", .{ .root_source_file = bb.path("src/http/core/h2_client_stub.zig") });
+                m.include_dirs.appendSlice(bb.allocator, full.include_dirs.items) catch @panic("OOM");
+                m.link_objects.appendSlice(bb.allocator, full.link_objects.items) catch @panic("OOM");
+                return m;
+            }
+        }.make;
+        const test_mod = core_test_mod(b, core_full, core.test_wait, target, optimize);
         // The core's test runner (some tests log at err on purpose).
         const core_tests = b.addTest(.{
             .name = "core-test",
@@ -996,8 +1022,23 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "anole", .module = anole_mod }},
             }),
         }));
-        run_core_tests.setCwd(make_cert.addOutputDirectoryArg("certs").dirname());
+        const certs_dir = make_cert.addOutputDirectoryArg("certs").dirname();
+        run_core_tests.setCwd(certs_dir);
         test_step.dependOn(&run_core_tests.step);
+        // test-timing: the core's tests again, built with `timing` on (see
+        // test-timing above).
+        {
+            const timing_tests = b.addTest(.{
+                .name = "core-test-timing",
+                .root_module = core_test_mod(b, core_full, testWaitModule(b, true, target, optimize), target, optimize),
+                .test_runner = .{ .path = b.path("src/http/core/test_runner.zig"), .mode = .simple },
+                .use_llvm = use_llvm,
+            });
+            const run_timing = b.addRunArtifact(timing_tests);
+            run_timing.setCwd(certs_dir);
+            run_timing.has_side_effects = true;
+            timing_step.dependOn(&run_timing.step);
+        }
         // Its "fuzz:" targets again, under Zig's own test runner, which is
         // what drives the fuzzer (the core's runner has none): `zig build
         // test --fuzz` fuzzes them with Anole's.
@@ -1947,6 +1988,10 @@ const Core = struct {
     /// src/safety (SAFETY.md's debug-build checks) over that zio:
     /// `anole_safety` in every HTTP core instance, the HTTP/2 client and anole.
     safety: *std.Build.Module,
+    /// src/testing/wait.zig (TESTING.md D1/D2/D6), `anole_test_wait` in every
+    /// HTTP core instance and in anole, with `timing` off; only test code
+    /// uses it. `zig build test-timing` builds its own with `timing` on.
+    test_wait: *std.Build.Module,
     llhttp: LlHttp,
     /// dusty instances by [tls][http2][compression][brotli]. One exists for
     /// each combination this build can satisfy: TLS needs BoringSSL in the
@@ -2001,7 +2046,8 @@ const Core = struct {
         const anole_log = b.createModule(.{ .root_source_file = b.path("src/logging/root.zig"), .target = target, .optimize = optimize });
         const banner = b.createModule(.{ .root_source_file = b.path("src/banner/root.zig"), .target = target, .optimize = optimize });
         const console_ui = b.createModule(.{ .root_source_file = b.path("src/console/ui/root.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "anole_banner", .module = banner }} });
-        var core: Core = .{ .safety = safety, .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
+        const test_wait = testWaitModule(b, false, target, optimize);
+        var core: Core = .{ .safety = safety, .test_wait = test_wait, .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
             for ([_]bool{ false, true }) |http2| {
@@ -2026,6 +2072,7 @@ const Core = struct {
                         dusty_mod.addImport("anole_safety", safety);
                         dusty_mod.addImport("validate", validate);
                         dusty_mod.addImport("anole_log", anole_log);
+                        dusty_mod.addImport("anole_test_wait", test_wait);
                         core.dusty_by[@intFromBool(tls)][@intFromBool(http2)][@intFromBool(compression)][@intFromBool(brotli)] = dusty_mod;
                         if (http2) core.h2_client_by[@intFromBool(tls)][1][@intFromBool(compression)][@intFromBool(brotli)] = h2ClientModule(
                             b,
@@ -2363,7 +2410,20 @@ const AnoleModuleOptions = struct {
     mailpit_api_url: ?[]const u8 = null,
     /// src/bson as a module, for -Dmongodb.
     bson: ?*std.Build.Module = null,
+    /// `anole_test_wait` with `timing` on (`zig build test-timing`); null:
+    /// the core's, with `timing` off.
+    test_wait: ?*std.Build.Module = null,
 };
+
+/// src/testing/wait.zig as the module `anole_test_wait`, with its option
+/// `timing` (the tests of `zig build test-timing` skip without it).
+fn testWaitModule(b: *std.Build, timing: bool, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const opts = b.addOptions();
+    opts.addOption(bool, "timing", timing);
+    const m = b.createModule(.{ .root_source_file = b.path("src/testing/wait.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    m.addOptions("anole_test_wait_options", opts);
+    return m;
+}
 
 /// src/root.zig with its own build_options and only the binding modules its
 /// features need.
@@ -2425,6 +2485,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addImport("anole_log", o.core.anole_log);
     mod.addImport("anole_console_ui", o.core.console_ui);
     mod.addImport("anole_banner", o.core.banner);
+    mod.addImport("anole_test_wait", o.test_wait orelse o.core.test_wait);
     if (f.http2) {
         mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
         mod.addImport("anole_h2_client", o.core.h2Client(f));

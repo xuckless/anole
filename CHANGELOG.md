@@ -3,6 +3,17 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.2 (unreleased)
+
+### Changed
+
+- Tests: Anole's tests no longer assume a fast machine. Waits go through one
+  helper (`src/testing/wait.zig`) with a 10 s deadline, scaled by
+  `ANOLE_TEST_TIMEOUT_FACTOR`, that names what it waited for when it times
+  out; sleeps that stood in for "it has happened" wait on the condition
+  itself, and elapsed-time bounds move to a new local-only step,
+  `zig build test-timing` (MAINTAINING.md, "Waiting in tests").
+
 ## 0.4.1 (2026-10-28)
 
 ### Fixed
