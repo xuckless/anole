@@ -466,6 +466,14 @@ fn fmt(gpa: std.mem.Allocator, d: Dialect, prefix: []const u8, comptime tmpl: []
     return text;
 }
 
+/// Appends `text` to `list`, taking ownership of it: when the append fails
+/// the text is freed here, so `try takeInto(gpa, &list, try allocPrint(..))`
+/// never leaves a string that neither the caller nor the list frees.
+fn takeInto(gpa: std.mem.Allocator, list: *std.ArrayList([]const u8), text: []const u8) std.mem.Allocator.Error!void {
+    errdefer gpa.free(text);
+    try list.append(gpa, text);
+}
+
 fn buildSql(gpa: std.mem.Allocator, d: Dialect, p: []const u8) !Store.Sql {
     var s: Store.Sql = .{};
     errdefer freeSql(gpa, s);
@@ -497,17 +505,17 @@ fn buildSql(gpa: std.mem.Allocator, d: Dialect, p: []const u8) !Store.Sql {
         for (ddl.items) |x| gpa.free(x);
         ddl.deinit(gpa);
     }
-    try ddl.append(gpa, try fmt(gpa, d, p, "CREATE TABLE IF NOT EXISTS {0s}webhook_endpoints (id text PRIMARY KEY, owner text NOT NULL, body text NOT NULL)"));
-    try ddl.append(gpa, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_endpoints_owner ON {0s}webhook_endpoints (owner)"));
-    try ddl.append(gpa, try std.fmt.allocPrint(gpa, "CREATE TABLE IF NOT EXISTS {s}webhook_messages (id {s} PRIMARY KEY, owner text NOT NULL, idempotency text NOT NULL DEFAULT '', created_ms bigint NOT NULL, body text NOT NULL)", .{ p, c_text }));
-    try ddl.append(gpa, try fmt(gpa, d, p, "CREATE UNIQUE INDEX IF NOT EXISTS {0s}webhook_messages_idem ON {0s}webhook_messages (owner, idempotency) WHERE idempotency <> ''"));
-    try ddl.append(gpa, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_messages_created ON {0s}webhook_messages (created_ms)"));
+    try takeInto(gpa, &ddl, try fmt(gpa, d, p, "CREATE TABLE IF NOT EXISTS {0s}webhook_endpoints (id text PRIMARY KEY, owner text NOT NULL, body text NOT NULL)"));
+    try takeInto(gpa, &ddl, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_endpoints_owner ON {0s}webhook_endpoints (owner)"));
+    try takeInto(gpa, &ddl, try std.fmt.allocPrint(gpa, "CREATE TABLE IF NOT EXISTS {s}webhook_messages (id {s} PRIMARY KEY, owner text NOT NULL, idempotency text NOT NULL DEFAULT '', created_ms bigint NOT NULL, body text NOT NULL)", .{ p, c_text }));
+    try takeInto(gpa, &ddl, try fmt(gpa, d, p, "CREATE UNIQUE INDEX IF NOT EXISTS {0s}webhook_messages_idem ON {0s}webhook_messages (owner, idempotency) WHERE idempotency <> ''"));
+    try takeInto(gpa, &ddl, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_messages_created ON {0s}webhook_messages (created_ms)"));
     // One owner's page (Svix's ix_message_per_app).
-    try ddl.append(gpa, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_messages_owner ON {0s}webhook_messages (owner, id DESC)"));
+    try takeInto(gpa, &ddl, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_messages_owner ON {0s}webhook_messages (owner, id DESC)"));
     const att = try std.fmt.allocPrint(gpa, "CREATE TABLE IF NOT EXISTS {0s}webhook_attempts (id {1s}, message_id {2s} NOT NULL, endpoint_id {2s} NOT NULL, at_ms bigint NOT NULL, body text NOT NULL)", .{ p, id_col, c_text });
-    try ddl.append(gpa, att);
-    try ddl.append(gpa, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_attempts_endpoint ON {0s}webhook_attempts (endpoint_id, id)"));
-    try ddl.append(gpa, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_attempts_message ON {0s}webhook_attempts (message_id, id)"));
+    try takeInto(gpa, &ddl, att);
+    try takeInto(gpa, &ddl, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_attempts_endpoint ON {0s}webhook_attempts (endpoint_id, id)"));
+    try takeInto(gpa, &ddl, try fmt(gpa, d, p, "CREATE INDEX IF NOT EXISTS {0s}webhook_attempts_message ON {0s}webhook_attempts (message_id, id)"));
     s.ddl = try ddl.toOwnedSlice(gpa);
     if (d == .postgres) {
         // Tables made before 0.4.1 (see `Store.migrate`). A table that does
@@ -537,8 +545,8 @@ fn buildSql(gpa: std.mem.Allocator, d: Dialect, p: []const u8) !Store.Sql {
             fixes.deinit(gpa);
         }
         for (tables) |t| {
-            try checks.append(gpa, try std.fmt.allocPrint(gpa, not_c, .{ p, t[0], t[1] }));
-            try fixes.append(gpa, try std.fmt.allocPrint(gpa, "ALTER TABLE {s}{s} {s}", .{ p, t[0], t[2] }));
+            try takeInto(gpa, &checks, try std.fmt.allocPrint(gpa, not_c, .{ p, t[0], t[1] }));
+            try takeInto(gpa, &fixes, try std.fmt.allocPrint(gpa, "ALTER TABLE {s}{s} {s}", .{ p, t[0], t[2] }));
         }
         s.collation_check = try checks.toOwnedSlice(gpa);
         s.collation_fix = try fixes.toOwnedSlice(gpa);
@@ -797,4 +805,30 @@ test "memory store: endpoints, messages with idempotency, attempts" {
     try std.testing.expectEqualStrings("a2", atts[0].body);
     const page = try st.attList(&c, .{ .endpoint = "ep_2", .before = atts[0].id });
     try std.testing.expectEqual(@as(usize, 1), page.len);
+}
+
+fn buildAndFreeSql(gpa: std.mem.Allocator, d: Dialect) !void {
+    freeSql(gpa, try buildSql(gpa, d, "anole_"));
+}
+
+/// The test allocator with every resize and remap refused. The test
+/// allocator grows a block in place only while it is the last one in its
+/// bucket, so whether `toOwnedSlice` or a growing `allocPrint` allocates
+/// again depends on what ran before; checkAllAllocationFailures needs the
+/// same count on every run.
+const no_resize_allocator: std.mem.Allocator = .{
+    // SAFETY: the vtable never reads its context pointer.
+    .ptr = undefined,
+    .vtable = &.{ .alloc = noResizeAlloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = noResizeFree },
+};
+fn noResizeAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+    return std.testing.allocator.rawAlloc(len, alignment, ra);
+}
+fn noResizeFree(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+    std.testing.allocator.rawFree(memory, alignment, ra);
+}
+
+test "webhooks store: building the SQL leaks nothing when any allocation fails" {
+    try std.testing.checkAllAllocationFailures(no_resize_allocator, buildAndFreeSql, .{.postgres});
+    try std.testing.checkAllAllocationFailures(no_resize_allocator, buildAndFreeSql, .{.sqlite});
 }
