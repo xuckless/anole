@@ -30,6 +30,10 @@ Each subsystem had its own lifetime scheme. They were five dialects of the same 
   - topic fan-out across executors;
   - the C libraries' sessions (nghttp2, ngtcp2/nghttp3, BoringSSL), shared by several tasks.
 
+## Scope
+
+These rules bind product code (everything linked into an Anole server or libanole) and test code that runs on zio tasks. Test tooling that runs on plain OS threads or in signal handlers (src/safety/test_runner.zig, the probes in src/safety/, test-only helpers) follows §6a instead where the two differ.
+
 ## 1. Memory: every object has exactly one owner
 
 **M1. A single, named owner.** Every heap object has exactly one owner, named in its type's doc comment (`/// owner: Connection`). A transfer of ownership is explicit in the function name (`take…`, `give…`, `into…`). Shared ownership is the exception, and it is allowed only through M2's fourth class.
@@ -44,6 +48,10 @@ Each subsystem had its own lifetime scheme. They were five dialects of the same 
 | Shared, or detached from its owner | C ABI requests, parked responses, topic subscribers across executors | Generation-checked handles in a per-executor table (as the C ABI already does). A stale handle gives `error.Gone`, never a freed pointer. |
 
 Every object belongs to exactly one class, and the class is named in its doc comment next to the owner.
+
+"Freed" includes torn down. A process-wide object's `deinit` or `close` (queues closed, buffers freed, tasks joined) also waits until every executor has stopped, or until every holder that may still call it has been joined. A process-wide service that must close earlier (the trace exporter sends through the server's client, so it closes before the server) has an explicit `close` state (M5). After it, every call is a documented, counted no-op that allocates nothing, and the service's memory stays until the end of its owner's teardown. A test covers a call after `close`.
+
+A pin (a handle's state word moved to a busy state, such as `polling`, while another thread reads the object) is a spin lock under L5. The pinned section only copies into memory the caller already has and never allocates. Every path that meets the busy state, on the executor side and in answer calls, waits it out or retries. A pinned, live handle is never reported as `Gone`.
 
 **M3. No pointer across a suspension point** (the most important rule). A pointer may be held across an await, I/O call, yield, lock wait or anything else that can suspend the task only if what it points to is one of:
 - owned by the current task;
@@ -96,6 +104,7 @@ Lock order (outer first), to be filled in by the retrofit audit:
 1. process-wide tables (handle tables, topic registries)
 2. per-connection protocol locks (HTTP/2 session, HTTP/3 connection)
 3. per-connection TLS spin lock
+4. leaf locks: locks under which no other lock is taken and nothing is called out (the C ABI's Pipe spin lock, the test runner's log ring). A leaf lock may be taken while holding any lock above.
 
 **L5. Spin locks only for short, bounded sections.** A spin lock may guard only a short, fixed-length section that never allocates, waits or calls C code that may block.
 
@@ -135,12 +144,22 @@ The lint enforces this against an allowlist.
 
 **Parked:** Valgrind or ASan runs of the Zig test binaries (user, 2026-10-23), and ThreadSanitizer (likely confused by zio's stack switching). Revisit after the retrofit.
 
+## 6a. Test tooling
+
+Where these differ from the rules above, they apply to test tooling (see Scope).
+
+- **T1, T4:** a test-only OS thread that lives for the whole test process (the runner's watchdog) may be detached. Any thread or task a test spawns is joined or canceled on every exit path, failure paths included: `defer group.cancel(io)` (or `future.cancel`) directly after the group or future is declared, because a failing `try wait.*` returns while the tasks still run against the test's frame.
+- **U1:** test tooling may call libc and the OS directly (`waitpid`, `write`, `prctl`, `sigaction`, `getenv`) through `std.c` and `std.posix`.
+- **L5, L6:** the test runner may use a spin lock on a raw atomic when it guards only a bounded copy, is a leaf (L4), and every path reachable from a signal or panic handler tries it once and never waits for it.
+- **Signal handlers** call only async-signal-safe functions (`write(2)`, `sigaction`, `sigprocmask`, `raise`): no lock waits, no allocation, no `std.debug.print`.
+
 ## 7. Decisions (user, 2026-10-23)
 
 - **Enforcement:** debug-build checks and lint. Valgrind is parked.
 - **Timing:** the rules apply to new code now, including the 0.4.0 fixes. The retrofit audit comes after S1 and before S2, so the HTTP/2 takeover is designed under them.
 - **New HTTP/2 engine:** single owner. One task owns the protocol state; stream tasks and the writer talk to it by message; there is no session mutex.
 - **Fire-and-forget tasks:** banned. Detached work goes through handles.
+- **Amendments (user, 2026-10-28):** the Scope section, §6a for test tooling, the leaf level in L4's order, and M2's rules for process-wide teardown and for pins, from the review of the S1 changes.
 
 ## 8. Retrofit order
 
