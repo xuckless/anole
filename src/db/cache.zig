@@ -582,6 +582,7 @@ test "db cache: the first caller canceled, the others still get the rows; all go
     var gate: std.Io.Event = .unset;
     defer gate.set(io);
     var leader: std.Io.Group = .init;
+    defer leader.cancel(io);
     try placement.concurrent(&leader, io, .{ .executor = 1 }, caller, .{ &cache, io, h.held(&gate), .{ .coalesce = true }, 1, &ok, &errors });
     try h.waitCalls(io, 1);
     var followers: std.Io.Group = .init;
@@ -599,6 +600,7 @@ test "db cache: the first caller canceled, the others still get the rows; all go
     // Every caller gone before the end: the statement is canceled.
     var never: std.Io.Event = .unset;
     var all: std.Io.Group = .init;
+    defer all.cancel(io);
     for (0..3) |_| try placement.concurrent(&all, io, .{ .executor = 1 }, caller, .{ &cache, io, h.held(&never), .{ .coalesce = true }, 2, &ok, &errors });
     try h.waitCalls(io, 2);
     try waitCoalesced(&cache, io, 3 + 2);

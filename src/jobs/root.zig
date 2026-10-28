@@ -368,6 +368,7 @@ test {
     _ = @import("conformance_test.zig");
     _ = @import("drain_test.zig");
     _ = @import("trace_test.zig");
+    _ = @import("client.zig");
     _ = @import("unique.zig");
     _ = @import("../cron/root.zig");
 }

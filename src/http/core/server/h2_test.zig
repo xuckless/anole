@@ -1655,6 +1655,9 @@ test "parked h2: the connection closing with a burst blocked on a full outbox: t
     };
     var w: Writer = .{};
     var writing = try io.concurrent(Writer.run, .{ &w, ParkProbe.parked.? });
+    // A failed wait ends the burst (its write is cancelable) before `w`
+    // goes; after the await below this does nothing.
+    defer writing.cancel(io);
     // 1 MiB + 64 KiB fills the outbox and the window: wait until most of it
     // is written, then close the connection under the waiting burst.
     try wait.waitAtLeast(io, "most of the burst written", &w.written, 66);

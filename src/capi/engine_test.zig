@@ -1211,6 +1211,9 @@ fn drainCounts(c: *engine.Consumer, counts: *[64]u32, want: u32) !void {
             const n = engine.poll(d.c, &d.buf, true, &need) catch return error.TooBig;
             var off: usize = 0;
             while (off < n) {
+                // SAFETY: `poll` writes whole records into `buf` (8-aligned),
+                // each starting with an Event header and `len` a multiple of
+                // 8, so every `off` reached here starts an aligned Event.
                 const ev: *const abi.Event = @ptrCast(@alignCast(&d.buf[off]));
                 if (ev.type < d.counts.len) d.counts[ev.type] += 1;
                 d.total += 1;
@@ -1225,8 +1228,11 @@ fn drainCounts(c: *engine.Consumer, counts: *[64]u32, want: u32) !void {
     try wait.waitUntil(engine.threadedIo(), "the consumer polled every event it waits for", d, Drain.more);
 }
 
-fn postMany(x: *engine.Exec, n: u32, posted: *std.atomic.Value(u32)) std.Io.Cancelable!void {
+fn postMany(x: *engine.Exec, n: u32, posted: *std.atomic.Value(u32), stop: *const std.atomic.Value(bool)) std.Io.Cancelable!void {
     for (0..n) |_| {
+        // A canceled wait for room ends only that post: the test's stop
+        // ends the loop.
+        if (stop.load(.acquire)) return;
         const rec = engine.newRecord(@sizeOf(abi.Event), .writable, 7) catch return;
         x.postRecord(rec, true);
         _ = posted.fetchAdd(1, .release);
@@ -1238,8 +1244,15 @@ test "capi engine: a full ring parks the executor on the room futex" {
     defer e.destroy();
     const x = &e.execs[0];
     var posted: std.atomic.Value(u32) = .init(0);
+    var stop: std.atomic.Value(bool) = .init(false);
     // One executor: the task runs on it.
-    var f = try e.io.concurrent(postMany, .{ x, 8, &posted });
+    var f = try e.io.concurrent(postMany, .{ x, 8, &posted, &stop });
+    // A failed wait stops the poster before the engine goes; after the
+    // await below this does nothing.
+    defer {
+        stop.store(true, .release);
+        f.cancel(e.io) catch {};
+    }
     // The consumer does not poll: two fit the ring, and the task waits for
     // room (announced on the room futex), so no third goes in.
     const Parked = struct {
@@ -1273,6 +1286,11 @@ test "capi engine: advisory events are never dropped" {
     defer e.destroy();
     const x = &e.execs[0];
     var f = try e.io.concurrent(postAdvisory, .{x});
+    // A failed drain collects the poster before the engine goes; after the
+    // await below this does nothing. The poster never waits for room (the
+    // two records fit the empty ring of 2, and the advisory events take the
+    // overflow list when it is full), so the cancel cannot be swallowed.
+    defer f.cancel(e.io) catch {};
     // From another thread too: the overflow list takes it.
     x.postEvent(.writable, 300);
     var counts: [64]u32 = @splat(0);

@@ -213,6 +213,8 @@ test "Signal: a set wakes the waiter, and a reset makes it wait again" {
             }
         }
     }.run, .{ &signal, io, &woke });
+    // A failed wait must not leave the waiter on this frame's signal.
+    defer waiter.cancel(io) catch {};
     signal.set(io);
     try test_wait.waitAtLeast(io, "the waiter woke once", &woke, 1);
     signal.set(io);

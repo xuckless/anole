@@ -1094,25 +1094,32 @@ pub const Client = struct {
 
     fn jobTask(box: *JobBox) std.Io.Cancelable!void {
         const self = box.client;
-        {
-            self.held_mutex.lockUncancelable(self.io);
-            defer self.held_mutex.unlock(self.io);
-            box.task = placement.currentTask(self.io);
-            self.held.put(self.gpa, box.row.id, box) catch {};
-        }
+        self.hold(box);
         if (self.metrics) |mm| mm.running.with(&.{box.queue.name}).add(1);
         _ = self.runJob(box);
         if (self.metrics) |mm| mm.running.with(&.{box.queue.name}).add(-1);
-        {
-            self.held_mutex.lockUncancelable(self.io);
-            defer self.held_mutex.unlock(self.io);
-            _ = self.held.swapRemove(box.row.id);
-        }
+        self.unhold(box);
         const q = box.queue;
         box.arena_state.deinit();
         self.gpa.destroy(box);
         _ = q.running.fetchSub(1, .acq_rel);
         q.signal.set(self.io);
+    }
+
+    /// A run's start, on its own task: from here on the heartbeat renews
+    /// its lease and the drain may interrupt it.
+    fn hold(self: *Client, box: *JobBox) void {
+        self.held_mutex.lockUncancelable(self.io);
+        defer self.held_mutex.unlock(self.io);
+        box.task = placement.currentTask(self.io);
+        self.held.put(self.gpa, box.row.id, box) catch {};
+    }
+
+    /// A run's end: neither the heartbeat nor the drain sees it any more.
+    fn unhold(self: *Client, box: *JobBox) void {
+        self.held_mutex.lockUncancelable(self.io);
+        defer self.held_mutex.unlock(self.io);
+        _ = self.held.swapRemove(box.row.id);
     }
 
     fn heartbeatTask(self: *Client) std.Io.Cancelable!void {
@@ -1141,18 +1148,31 @@ pub const Client = struct {
             log.warn("jobs: heartbeat failed: {t}", .{e});
             return;
         };
-        self.held_mutex.lockUncancelable(self.io);
-        defer self.held_mutex.unlock(self.io);
+        // The runs no longer held. The store is asked why with the lock
+        // released (SAFETY.md L2, L3): every run's start and end takes it.
+        var lost: std.ArrayList(store.Held) = .empty;
         for (held) |h| {
             if (std.mem.indexOfScalar(Id, alive, h.id) != null) continue;
-            const b = self.held.get(h.id) orelse continue;
+            lost.append(a, h) catch return;
+        }
+        if (lost.items.len == 0) return;
+        const cancelled = a.alloc(bool, lost.items.len) catch return;
+        for (lost.items, cancelled) |h, *c| {
             const got = self.backend.vt.get(self.backend.ptr, a, h.id) catch |e| blk: {
                 try passCancel(e);
                 break :blk null;
             };
-            if (got) |row| {
-                if (row.state == .cancelled) b.job.admin_cancelled.store(true, .release);
-            }
+            c.* = if (got) |row| row.state == .cancelled else false;
+        }
+        // A run may have ended during the calls: each is looked up again by
+        // id and attempt (M3), never kept from before them.
+        self.held_mutex.lockUncancelable(self.io);
+        defer self.held_mutex.unlock(self.io);
+        for (lost.items, cancelled) |h, c| {
+            const b = self.held.get(h.id) orelse continue;
+            if (b.row.attempt != h.attempt) continue;
+            // Set before `lost`, which the run may see and return on.
+            if (c) b.job.admin_cancelled.store(true, .release);
             b.lost.store(true, .release);
             if (b.task) |t| placement.cancelTask(t);
         }
@@ -1493,4 +1513,93 @@ pub fn rowToInfo(arena: std.mem.Allocator, r: store.Row) !root.JobInfo {
         .errors = r.errors,
         .timeout_ms = r.timeout_ms,
     };
+}
+
+test "jobs: a heartbeat waiting on the store does not hold up a run's start" {
+    // A store whose heartbeat holds nothing (so every held run is lost and
+    // looked up), and whose `get` waits until the test lets it go (a
+    // cancelable wait, as a store's round trip is).
+    const HeldGetStore = struct {
+        var store_io: ?std.Io = null;
+        var in_get: std.atomic.Value(bool) = .init(false);
+        var release: std.Io.Event = .unset;
+
+        fn heartbeat(_: *anyopaque, _: std.mem.Allocator, _: Time, _: []const store.Held) anyerror![]Id {
+            return &.{};
+        }
+
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: Id) anyerror!?store.Row {
+            in_get.store(true, .release);
+            try release.wait(store_io.?);
+            return null;
+        }
+
+        fn row(id: Id) store.Row {
+            return .{ .id = id, .queue = "default", .kind = "t", .state = .running, .priority = .normal, .attempt = 1, .max_attempts = 3, .args_json = "{}", .meta_json = "{}", .run_at = .fromMillis(0), .created_at = .fromMillis(0) };
+        }
+
+        fn check(io_: std.Io) !void {
+            const wait = @import("anole_test_wait");
+            const gpa = std.testing.allocator;
+            const client = try Client.init(gpa, io_, .{ .store = .memory });
+            defer client.deinit();
+            const store_vt = client.backend.vt;
+            var vt = store_vt.*;
+            vt.heartbeat = heartbeat;
+            vt.get = get;
+            client.backend.vt = &vt;
+            // Before the client's teardown, which calls the store's own deinit.
+            defer client.backend.vt = store_vt;
+            store_io = io_;
+            in_get.store(false, .release);
+            release = .unset;
+            // A failed check lets the heartbeat out of the store before it is
+            // collected below.
+            defer release.set(io_);
+
+            // A run the heartbeat will find lost (no task of its own to cancel).
+            var lost: JobBox = .{ .client = client, .queue = &client.queues[0], .arena_state = .init(gpa), .row = row(1) };
+            defer lost.arena_state.deinit();
+            {
+                client.held_mutex.lockUncancelable(io_);
+                defer client.held_mutex.unlock(io_);
+                try client.held.put(gpa, lost.row.id, &lost);
+            }
+            defer client.unhold(&lost);
+
+            var beat = try io_.concurrent(Client.heartbeatOnce, .{client});
+            defer beat.cancel(io_) catch {};
+            try wait.waitFlag(io_, "the heartbeat is in the store's get for the lost run", &in_get);
+
+            // While the heartbeat waits on the store, a new run starts.
+            const Start = struct {
+                fn run(c: *Client, box: *JobBox, done: *std.atomic.Value(bool)) void {
+                    c.hold(box);
+                    done.store(true, .release);
+                }
+            };
+            var next: JobBox = .{ .client = client, .queue = &client.queues[0], .arena_state = .init(gpa), .row = row(2) };
+            defer next.arena_state.deinit();
+            var started: std.atomic.Value(bool) = .init(false);
+            var start = try io_.concurrent(Start.run, .{ client, &next, &started });
+            // On a failed wait the heartbeat is let go first: the start may be
+            // waiting for the lock the heartbeat holds.
+            defer {
+                release.set(io_);
+                start.cancel(io_);
+                client.unhold(&next);
+            }
+            try wait.waitFlag(io_, "the new run started while the heartbeat waited on the store", &started);
+            release.set(io_);
+            try beat.await(io_);
+            // The lookup was the lost run's: the heartbeat marked it lost.
+            try std.testing.expect(lost.lost.load(.acquire));
+        }
+    };
+    const zio = @import("zio");
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(HeldGetStore.check, .{io});
+    try f.await(io);
 }

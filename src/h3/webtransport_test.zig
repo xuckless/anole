@@ -504,6 +504,8 @@ test "WebTransport: streams a handler never accepts hold the peer's stream credi
     };
     var opened: std.atomic.Value(usize) = .init(0);
     var task = try io.concurrent(Opener.run, .{ session, &opened });
+    // A failed wait must not leave the opener on the session.
+    defer task.cancel(io) catch {};
     // The server's limit (100 unidirectional streams), not all 400: well
     // into it, and then no further.
     try wait.waitAtLeast(io, "50 streams opened", &opened, 50);

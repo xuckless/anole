@@ -80,6 +80,10 @@ breaking changes are listed anyway.
   a store call (PostgreSQL, Redis, SQLite) took the cancel for a failed
   call: the round went on to its next store call through the teardown.
   The cancel now ends the task.
+- Jobs: while the heartbeat looked up a run it no longer held (a store
+  round trip), no job could start or finish on any executor: the lookup
+  ran under the lock every run's start and end takes. The lookups now run
+  with the lock released.
 - C ABI: a request (or gRPC call) is stale as soon as it is answered, as
   `anole.h` says ("until answered"): `anole_db_query`, `_exec`, `_begin` and
   the S3, SMTP, NATS and jobs calls given an answered request as `req`
@@ -146,7 +150,10 @@ breaking changes are listed anyway.
   and in a hang dump; before, a passing test's warnings showed up under the
   next failing test or under a misleading "failed command:" line. Text
   printed straight to stderr (`std.debug.print`, C code) still shows.
-  `zig build crash-probe` checks the crash case.
+  A panic never waits for the held lines: when it comes while a log line
+  is being stored (on the panicking thread, say), the lines are reported
+  lost and the panic goes on. `zig build crash-probe` checks the crash
+  cases.
 - CI: every job and long step has a time limit sized from the last 30 green
   runs, and jobs with Docker containers keep the containers' logs and states
   as an artifact when they fail (the interop runners' jobs upload the
