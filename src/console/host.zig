@@ -77,7 +77,7 @@ pub fn Of(comptime S: type) type {
                 try jsonStr(w, if (r.method) |m| m.name() else "ANY");
                 try w.writeAll(",\"pattern\":");
                 try jsonStr(w, r.info.path);
-                try w.print(",\"no_wait\":{},\"cached\":false,\"kind\":\"http\",\"middleware\":{d}}}", .{ r.no_wait, r.middlewares.len });
+                try w.print(",\"no_wait\":{},\"cached\":false,\"kind\":\"{t}\",\"middleware\":{d}}}", .{ r.no_wait, r.kind, r.middlewares.len });
             }
             try w.writeByte(']');
         }

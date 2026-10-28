@@ -1662,6 +1662,7 @@ pub const Engine = struct {
                 group.inner.addRouteWith(if (plain != null) method else .get, rc.path, ws.handler, .{
                     .data = route,
                     .no_wait = if (plain) |pr| pr.detachable else false,
+                    .kind = .ws,
                 });
             } else if (rc.sse) |sc| {
                 // p3/realtime: parked event streams; an idle subscriber holds
@@ -1695,7 +1696,7 @@ pub const Engine = struct {
                     .datagram_queue = wc.datagram_queue,
                 } };
                 // Extended CONNECT is routed as GET.
-                group.inner.addRouteWith(.get, rc.path, wt.handler, .{ .data = route });
+                group.inner.addRouteWith(.get, rc.path, wt.handler, .{ .data = route, .kind = .wt });
             }
         }
     }

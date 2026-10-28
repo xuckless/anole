@@ -34,6 +34,7 @@ pub const Router = @import("router.zig").Router;
 pub const Action = @import("router.zig").Action;
 pub const RouteInfo = @import("router.zig").RouteInfo;
 pub const RouteOptions = @import("router.zig").RouteOptions;
+pub const RouteKind = @import("router.zig").RouteKind;
 pub const Request = @import("request.zig").Request;
 pub const Response = @import("response.zig").Response;
 /// Where a response goes when a protocol engine (HTTP/2) frames it; see `Response.initSink`.

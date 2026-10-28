@@ -2343,7 +2343,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn wsWith(self: *Self, comptime path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
             if (comptime !features.websocket) @compileError("app.ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
             comptime checkPattern("GET", path);
-            self.router.get(path, websocket.route(Ctx, handler, upgrade));
+            self.router.addRouteWith(.get, path, websocket.route(Ctx, handler, upgrade), .{ .kind = .ws });
         }
 
         /// A WebSocket endpoint at `path` served through callbacks:
@@ -2366,7 +2366,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         pub fn wsCallbacksWith(self: *Self, comptime path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
             if (comptime !features.websocket) @compileError("app.wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
             comptime checkPattern("GET", path);
-            self.router.get(path, websocket.callbacks(Ctx, Handlers, upgrade));
+            self.router.addRouteWith(.get, path, websocket.callbacks(Ctx, Handlers, upgrade), .{ .kind = .ws });
         }
 
         /// A WebTransport endpoint at `path` (draft-02, what Chrome and
@@ -2395,7 +2395,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (comptime !features.http3) @compileError("app.webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
             comptime checkPattern("GET", path);
             self.enableWebTransport();
-            self.router.get(path, webtransport_mod.route(Ctx, handler, accept));
+            self.router.addRouteWith(.get, path, webtransport_mod.route(Ctx, handler, accept), .{ .kind = .wt });
         }
 
         /// The HTTP/3 listener speaks WebTransport, now or once it is set
@@ -2546,7 +2546,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             pub fn wsWith(g: Group, comptime path: []const u8, comptime handler: anytype, comptime upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("ws needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
                 if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
-                g.inner.get(path, websocket.route(Ctx, handler, upgrade));
+                g.inner.addRouteWith(.get, path, websocket.route(Ctx, handler, upgrade), .{ .kind = .ws });
             }
             /// `Server.wsCallbacks` under this group.
             pub fn wsCallbacks(g: Group, comptime path: []const u8, comptime Handlers: type) void {
@@ -2556,7 +2556,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             pub fn wsCallbacksWith(g: Group, comptime path: []const u8, comptime Handlers: type, comptime upgrade: websocket.UpgradeOptions) void {
                 if (comptime !features.websocket) @compileError("wsCallbacks needs WebSocket support (-Dwebsocket, on in the web and full profiles)");
                 if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
-                g.inner.get(path, websocket.callbacks(Ctx, Handlers, upgrade));
+                g.inner.addRouteWith(.get, path, websocket.callbacks(Ctx, Handlers, upgrade), .{ .kind = .ws });
             }
             /// `Server.webtransport` under this group.
             pub fn webtransport(g: Group, comptime path: []const u8, comptime handler: anytype) void {
@@ -2567,7 +2567,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 if (comptime !features.http3) @compileError("webtransport needs HTTP/3 (-Dhttp3, on in the full profile)");
                 if (comptime path.len > 0) comptime checkPattern("GET", path); // "": the group's own path
                 g.server.enableWebTransport();
-                g.inner.get(path, webtransport_mod.route(Ctx, handler, accept));
+                g.inner.addRouteWith(.get, path, webtransport_mod.route(Ctx, handler, accept), .{ .kind = .wt });
             }
             // ---- p3/realtime ----
             /// `Server.sse` under this group (the group's prefix goes before `path`).

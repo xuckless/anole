@@ -388,7 +388,7 @@ pub fn registerWith(comptime Ctx: type, target: anytype, comptime Service: type,
                 return Adapter.run(ctx, req, res);
             }
         }.h;
-        const route_options: dusty.RouteOptions = .{ .data = registration, .no_wait = options.no_wait and M.kind == .unary };
+        const route_options: dusty.RouteOptions = .{ .data = registration, .no_wait = options.no_wait and M.kind == .unary, .kind = .grpc };
         addRoute(Ctx, target, .post, path, route, route_options);
         if (M.kind == .unary and comptime hasNoSideEffects(Service, name)) addRoute(Ctx, target, .get, path, route, route_options);
         if (comptime transcode.annotated(Service, name)) {
