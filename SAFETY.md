@@ -108,7 +108,15 @@ Lock order (outer first), to be filled in by the retrofit audit:
 
 **L5. Spin locks only for short, bounded sections.** A spin lock may guard only a short, fixed-length section that never allocates, waits or calls C code that may block.
 
-**L6. Atomics through a few wrappers.** Atomics are used only through a few wrappers: counters, flags, generations, the SPSC ring. The existing lock-free structures (the C ABI rings, the HTTP/3 kick list) get dedicated multi-thread stress tests. No new lock-free structures without the user's approval.
+**L6. Atomics through a few wrappers.** Atomics are used only through a few wrappers: counters, flags, generations, the SPSC ring. The existing lock-free structures (the C ABI rings, the HTTP/3 kick list) get dedicated multi-thread stress tests.
+
+**L7. Atomics instead of a lock where they remove a bug class or win in numbers.** A lock is replaced by atomics when that removes a deadlock or use-after-free class, removes real technical debt, or gives a measured performance win (an A/B on the box). Never for style alone. Only these patterns, each through a wrapper with a multi-thread stress test:
+- **Read-mostly data** (routes, config, certificates, ticket keys): readers load an atomic pointer and take no lock; a writer builds a new copy and swaps the pointer. The old copy is freed only after every executor has passed a scheduler pass since the swap (quiescent-state reclamation, as userspace RCU's QSBR flavour and Seastar do), never while a reader may hold it. Readers do not keep the pointer across a suspension point (M3).
+- **Counters and gauges:** one per executor, written only by its executor, summed when read (`/metrics`, the console), so no cache line moves between cores.
+- **Hand-offs between executors or threads:** the existing SPSC ring and the atomic push list (the done lists), each with one documented owner on the consuming side (T3).
+- **State machines on a handle:** a generation-checked state word changed by compare-and-swap (M2's fourth class, including pins).
+
+Any other lock-free structure needs the user's approval.
 
 ## 5. Unsafe code and C
 
@@ -159,6 +167,7 @@ Where these differ from the rules above, they apply to test tooling (see Scope).
 - **Timing:** the rules apply to new code now, including the 0.4.0 fixes. The retrofit audit comes after S1 and before S2, so the HTTP/2 takeover is designed under them.
 - **New HTTP/2 engine:** single owner. One task owns the protocol state; stream tasks and the writer talk to it by message; there is no session mutex.
 - **Fire-and-forget tasks:** banned. Detached work goes through handles.
+- **Atomics (user, 2026-10-28):** atomics wherever they reduce technical debt, deadlocks or use-after-free, or give genuine performance gains (L7). The S1.5 retrofit classifies every lock (removable by executor ownership, needed for a C library session, or an L7 candidate) and converts the candidates.
 - **Amendments (user, 2026-10-28):** the Scope section, §6a for test tooling, the leaf level in L4's order, and M2's rules for process-wide teardown and for pins, from the review of the S1 changes.
 
 ## 8. Retrofit order
