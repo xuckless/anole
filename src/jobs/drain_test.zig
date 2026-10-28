@@ -81,6 +81,12 @@ fn writeCanceledCheck(io: std.Io) !void {
     // The handler returned; its outcome's write is under way.
     try waitFor(io, HeldFinish.isIn, .{});
     var d = try io.concurrent(drainNow, .{ client, io });
+    // A failed wait lets the held write go and waits for the drain before
+    // the client goes; after the await below this does nothing.
+    defer {
+        HeldFinish.release.set(io);
+        d.await(io);
+    }
     try waitFor(io, interruptedRun, .{ client, io });
     // The drain's cancel has been sent; the write goes on.
     HeldFinish.release.set(io);

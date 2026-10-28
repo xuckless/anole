@@ -136,6 +136,12 @@ test "Rooms: a stalled member holds up neither other rooms nor joins, and leaves
             return rooms_.broadcast("slow", .text, "hello", null);
         }
     }.run, .{&r});
+    // A failed check lets the stalled send end, then collects the
+    // broadcast; after the await below this does nothing.
+    defer {
+        stalled.release.set(io);
+        _ = stuck.cancel(io);
+    }
     try stalled.entered.wait(io);
 
     // Another room, and joins and counts, go on meanwhile.
@@ -152,6 +158,10 @@ test "Rooms: a stalled member holds up neither other rooms nor joins, and leaves
             done.store(true, .release);
         }
     }.run, .{ &r, &stalled.socket, &left });
+    defer {
+        stalled.release.set(io);
+        leaving.cancel(io);
+    }
     try wait.waitUntil(io, "the leaver is out of the room's list", &r, struct {
         fn f(rooms_: *websocket.Rooms) bool {
             return rooms_.count("slow") == 0;
@@ -223,6 +233,8 @@ test "Rooms: a broadcast does not wait for a member that stopped reading, and a 
             return rooms_.broadcast("room", .text, "one", null);
         }
     }.run, .{ &r, &done });
+    // A failed wait must not leave the broadcast on this frame's rooms.
+    defer _ = first.cancel(io);
     try wait.waitFlag(io, "the first broadcast returned", &done);
     try std.testing.expectEqual(@as(usize, 2), first.await(io));
     try stalled.entered.wait(io);

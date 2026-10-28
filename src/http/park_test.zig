@@ -408,6 +408,12 @@ test "idle park: the drain answers a parked connection's request 503, and the st
             fx.future.cancel(fx.io) catch {};
         }
     }.run, .{&f});
+    // A failed wait lets the held request go and waits for the stop before
+    // the fixture goes; after the await below this does nothing.
+    defer {
+        slow_gate.set(f.io);
+        stopper.await(f.io);
+    }
     try wait.waitUntil(f.io, "the server draining", &f, struct {
         fn draining(fx: *Fixture) bool {
             return fx.server.draining.isSet();
