@@ -332,7 +332,7 @@ fn keepAliveDeadline(secure: bool) !void {
     const waited = parked_at.untilNow(f.io, .awake).toMilliseconds();
     // The keep-alive deadline (600 ms from the wait's start), give or take
     // the sweep's second: when it was closed is a timing claim.
-    if (wait.timing) try std.testing.expect(waited >= 400 and waited < 2_500);
+    if (wait.timing()) try std.testing.expect(waited >= 400 and waited < 2_500);
     try f.waitClosed();
     try std.testing.expectEqual(0, f.server.parkedConnections());
 }

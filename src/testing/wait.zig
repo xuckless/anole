@@ -6,8 +6,9 @@
 //! environment, default 1; raise it under sanitizers or on a crowded
 //! machine). The deadline is a hang guard, never a latency bound: a test
 //! that passes only because something happened quickly is wrong (D6). Such
-//! bounds are checked only `if (timing)`, which `zig build test-timing`
-//! (local, never CI) turns on; a test whose whole claim is speed calls
+//! bounds are checked only `if (timing())`, which `zig build test-timing`
+//! (local, never CI) turns on by running the same test binaries with
+//! `ANOLE_TEST_TIMING=1`; a test whose whole claim is speed calls
 //! `requireTiming`.
 //!
 //! `expectStays` checks that a condition keeps holding for a short window,
@@ -25,15 +26,29 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const options = @import("anole_test_wait_options");
 
 // At warn, not err: the wait's error already fails the test, and a test
 // that expects a timeout must not fail on the log line.
 const log = std.log.scoped(.anole_test);
 
-/// `zig build test-timing`: tests that measure speed or bound elapsed time
-/// run only there (local, never in CI; TESTING.md D6).
-pub const timing: bool = options.timing;
+/// `zig build test-timing` (`ANOLE_TEST_TIMING=1` in the environment, read
+/// once): tests that measure speed or bound elapsed time run only there
+/// (local, never in CI; TESTING.md D6). One test binary serves both runs,
+/// so the HTTP core and anole, which share this module, agree.
+pub fn timing() bool {
+    const cached = timing_cache.load(.monotonic);
+    if (cached != 0) return cached == 2;
+    const on = parseTiming(readEnv("ANOLE_TEST_TIMING"));
+    timing_cache.store(if (on) 2 else 1, .monotonic);
+    return on;
+}
+
+var timing_cache: std.atomic.Value(u8) = .init(0);
+
+fn parseTiming(text: ?[]const u8) bool {
+    const t = std.mem.trim(u8, text orelse return false, " \t\r\n");
+    return t.len > 0 and !std.mem.eql(u8, t, "0");
+}
 
 /// The default deadline before the factor, as in gRPC-go and Envoy.
 pub const default_deadline_s = 10;
@@ -50,9 +65,9 @@ const max_backoff_ns: i96 = 50 * std.time.ns_per_ms;
 /// Skips the calling test unless it is built for `zig build test-timing`.
 /// Call it first in a test whose whole claim is about speed, and name the
 /// test with " [timing]". A test with a logical claim and an elapsed-time
-/// bound beside it checks the bound only `if (wait.timing)`.
+/// bound beside it checks the bound only `if (wait.timing())`.
 pub fn requireTiming() error{SkipZigTest}!void {
-    if (!timing) return error.SkipZigTest;
+    if (!timing()) return error.SkipZigTest;
 }
 
 var factor_cache: std.atomic.Value(u32) = .init(0);
@@ -62,14 +77,14 @@ var factor_cache: std.atomic.Value(u32) = .init(0);
 pub fn timeoutFactor() u32 {
     const cached = factor_cache.load(.monotonic);
     if (cached != 0) return cached;
-    const f = parseFactor(readFactorEnv());
+    const f = parseFactor(readEnv("ANOLE_TEST_TIMEOUT_FACTOR"));
     factor_cache.store(f, .monotonic);
     return f;
 }
 
-fn readFactorEnv() ?[]const u8 {
+fn readEnv(comptime name: [:0]const u8) ?[]const u8 {
     if (comptime !builtin.link_libc) return null;
-    const v = std.c.getenv("ANOLE_TEST_TIMEOUT_FACTOR") orelse return null;
+    const v = std.c.getenv(name) orelse return null;
     return std.mem.span(v);
 }
 
@@ -288,4 +303,12 @@ test "wait: the timeout factor parses whole numbers and falls back to 1" {
     try testing.expectEqual(@as(u32, 1), parseFactor("0"));
     try testing.expectEqual(@as(u32, 1), parseFactor("fast"));
     try testing.expect(deadline().toSeconds() >= default_deadline_s);
+}
+
+test "wait: ANOLE_TEST_TIMING is on when set to anything but empty or 0" {
+    try testing.expect(!parseTiming(null));
+    try testing.expect(!parseTiming(""));
+    try testing.expect(!parseTiming("0"));
+    try testing.expect(parseTiming("1"));
+    try testing.expect(parseTiming(" yes\n"));
 }

@@ -290,11 +290,14 @@ Anole's own tests wait through `src/testing/wait.zig` (the module
 - `wait.expectStays(io, "what", ctx, cond, wait.short_window)` checks that a
   condition keeps holding for 100 ms, for "X never happens".
 - An elapsed-time bound beside a test's real claim is checked only
-  `if (wait.timing)`; a test whose whole claim is about speed starts with
+  `if (wait.timing())`; a test whose whole claim is about speed starts with
   `try wait.requireTiming();` and ends its name with "[timing]".
-  `zig build test-timing` builds the main and the HTTP core's suites with
-  `timing` on and runs them: locally (the Mac and the x86 box) on an idle
-  machine, never in CI.
+  `zig build test-timing` runs the main and the HTTP core's suites again
+  with `ANOLE_TEST_TIMING=1`, which turns them on: locally (the Mac and the
+  x86 box) on an idle machine, never in CI.
+- `waitEqual`, `waitNonZero` and `deadlineMs()` (the deadline for an API
+  that takes milliseconds) cover the rest; the C consumer
+  (tests/capi/consumer.c) has `wait_until()` with the same deadline.
 
 ## The S3 client
 

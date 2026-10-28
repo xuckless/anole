@@ -437,7 +437,7 @@ test "h2 client: connect_timeout bounds a TLS handshake that never answers" {
         .connect_timeout = .fromMilliseconds(200),
     }));
     // 200 ms, not the 10 s default: a bound only test-timing checks.
-    if (wait.timing) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
+    if (wait.timing()) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
 }
 
 test "h2 client: the system trust store by default, a CA in memory, mutual TLS from memory and from files" {

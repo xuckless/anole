@@ -708,7 +708,7 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
     const start = std.Io.Timestamp.now(io, .awake);
     try std.testing.expectError(error.Canceled, server_future.cancel(io));
     const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
-    if (wait.timing) try std.testing.expect(elapsed_ns < 1500 * std.time.ns_per_ms);
+    if (wait.timing()) try std.testing.expect(elapsed_ns < 1500 * std.time.ns_per_ms);
 }
 
 test "Server: 100-continue" {
@@ -2022,7 +2022,7 @@ test "Server: graceful shutdown waits for a connection that finishes in time" {
     // as it was done rather than sitting out the rest of the budget.
     try std.testing.expect(sync.finished);
     try std.testing.expect(elapsed_ns >= 100 * std.time.ns_per_ms);
-    if (wait.timing) try std.testing.expect(elapsed_ns < 2000 * std.time.ns_per_ms);
+    if (wait.timing()) try std.testing.expect(elapsed_ns < 2000 * std.time.ns_per_ms);
 }
 /// Leaves one connection idle after a request and one that never sent any,
 /// shuts the server down with a budget long enough that waiting it out would
@@ -2072,7 +2072,7 @@ fn expectIdleConnectionsClosedOnShutdown(timeout: dusty.ServerConfig.Timeout) !v
     const start = std.Io.Timestamp.now(io, .awake);
     try std.testing.expectError(error.Canceled, server_future.cancel(io));
     const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
-    if (wait.timing) try std.testing.expect(elapsed_ns < 1000 * std.time.ns_per_ms);
+    if (wait.timing()) try std.testing.expect(elapsed_ns < 1000 * std.time.ns_per_ms);
 
     // Both were closed by the server, not abandoned to the cancel (an
     // abandoned one would never answer the read).
@@ -2221,7 +2221,7 @@ test "Server: a long-lived handler learns of the drain through req.drain and end
 
     const start: std.Io.Clock.Timestamp = .now(io, .awake);
     try std.testing.expectError(error.Canceled, server_future.cancel(io));
-    if (wait.timing) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
+    if (wait.timing()) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
 
     var read_buf: [1024]u8 = undefined;
     var reader = conn.reader(io, &read_buf);
@@ -3211,7 +3211,7 @@ test "Server: a stalled request head is cut off by timeout.request" {
     ) orelse return error.ServerAnsweredInstead;
 
     try std.testing.expect(elapsed >= 100);
-    if (wait.timing) try std.testing.expect(elapsed < 3000);
+    if (wait.timing()) try std.testing.expect(elapsed < 3000);
 }
 
 test "Server: an idle keepalive connection is cut off by timeout.keepalive" {
@@ -3260,7 +3260,7 @@ test "Server: an idle keepalive connection is cut off by timeout.keepalive" {
     const elapsed = @divTrunc(std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds - started, std.time.ns_per_ms);
 
     try std.testing.expect(elapsed >= 100);
-    if (wait.timing) try std.testing.expect(elapsed < 3000);
+    if (wait.timing()) try std.testing.expect(elapsed < 3000);
 }
 
 test "Server.dispatch: a request over a sink is routed through the middleware to its handler" {
@@ -4250,7 +4250,7 @@ test "stream: a peer that stops reading is cut after timeouts.write" {
         }
     }.failed);
     try std.testing.expectEqual(StreamWatch.timed_out, StreamWatch.write_error.load(.acquire));
-    if (wait.timing) try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 2000);
+    if (wait.timing()) try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 2000);
 }
 
 test "sendFile: a download slower than timeouts.request completes" {

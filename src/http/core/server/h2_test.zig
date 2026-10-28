@@ -942,7 +942,7 @@ test "HTTP/2: a drain closes an idle connection with GOAWAY at once" {
     try client.runUntilClosed();
     try std.testing.expect(client.goaway_count >= 1);
     try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), client.goaways[0]);
-    if (wait.timing) try std.testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 900);
+    if (wait.timing()) try std.testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 900);
 }
 
 test "HTTP/2: a drain with a stream in flight sends a two-phase GOAWAY and finishes the stream" {

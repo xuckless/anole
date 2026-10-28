@@ -767,21 +767,17 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     run_tests.skip_foreign_checks = true;
     test_step.dependOn(&run_tests.step);
-    // test-timing: the main and the HTTP core's suites again, built with
-    // `timing` on (src/testing/wait.zig): the elapsed-time bounds a test
-    // checks only `if (wait.timing)`, and the tests whose whole claim is
-    // about speed (`requireTiming`, named "[timing]"), run too. Local only
-    // (the Mac and the x86 box), never in CI: nothing in CI may depend on
-    // speed (TESTING.md D6). Run it on an otherwise idle machine.
+    // test-timing: the main and the HTTP core's suites again, the same
+    // binaries run with ANOLE_TEST_TIMING=1 (src/testing/wait.zig): the
+    // elapsed-time bounds a test checks only `if (wait.timing())`, and the
+    // tests whose whole claim is about speed (`requireTiming`, named
+    // "[timing]"), run too. Local only (the Mac and the x86 box), never in
+    // CI: nothing in CI may depend on speed (TESTING.md D6). Run it on an
+    // otherwise idle machine.
     const timing_step = b.step("test-timing", "Run the speed and elapsed-time tests (local only, never in CI; on an idle machine)");
     {
-        const timing_tests = addSafeTest(b, .{
-            .name = "anole-test-timing",
-            .filters = test_filters,
-            .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .test_wait = testWaitModule(b, true, target, optimize) }),
-            .use_llvm = use_llvm,
-        });
-        const run_timing = b.addRunArtifact(timing_tests);
+        const run_timing = b.addRunArtifact(tests);
+        run_timing.setEnvironmentVariable("ANOLE_TEST_TIMING", "1");
         run_timing.skip_foreign_checks = true;
         run_timing.has_side_effects = true;
         timing_step.dependOn(&run_timing.step);
@@ -1025,16 +1021,11 @@ pub fn build(b: *std.Build) void {
         const certs_dir = make_cert.addOutputDirectoryArg("certs").dirname();
         run_core_tests.setCwd(certs_dir);
         test_step.dependOn(&run_core_tests.step);
-        // test-timing: the core's tests again, built with `timing` on (see
-        // test-timing above).
+        // test-timing: the core's tests again, with ANOLE_TEST_TIMING=1
+        // (see test-timing above).
         {
-            const timing_tests = b.addTest(.{
-                .name = "core-test-timing",
-                .root_module = core_test_mod(b, core_full, testWaitModule(b, true, target, optimize), target, optimize),
-                .test_runner = .{ .path = b.path("src/http/core/test_runner.zig"), .mode = .simple },
-                .use_llvm = use_llvm,
-            });
-            const run_timing = b.addRunArtifact(timing_tests);
+            const run_timing = b.addRunArtifact(core_tests);
+            run_timing.setEnvironmentVariable("ANOLE_TEST_TIMING", "1");
             run_timing.setCwd(certs_dir);
             run_timing.has_side_effects = true;
             timing_step.dependOn(&run_timing.step);
@@ -1989,8 +1980,7 @@ const Core = struct {
     /// `anole_safety` in every HTTP core instance, the HTTP/2 client and anole.
     safety: *std.Build.Module,
     /// src/testing/wait.zig (TESTING.md D1/D2/D6), `anole_test_wait` in every
-    /// HTTP core instance and in anole, with `timing` off; only test code
-    /// uses it. `zig build test-timing` builds its own with `timing` on.
+    /// HTTP core instance and in anole; only test code uses it.
     test_wait: *std.Build.Module,
     llhttp: LlHttp,
     /// dusty instances by [tls][http2][compression][brotli]. One exists for
@@ -2046,7 +2036,7 @@ const Core = struct {
         const anole_log = b.createModule(.{ .root_source_file = b.path("src/logging/root.zig"), .target = target, .optimize = optimize });
         const banner = b.createModule(.{ .root_source_file = b.path("src/banner/root.zig"), .target = target, .optimize = optimize });
         const console_ui = b.createModule(.{ .root_source_file = b.path("src/console/ui/root.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "anole_banner", .module = banner }} });
-        const test_wait = testWaitModule(b, false, target, optimize);
+        const test_wait = testWaitModule(b, target, optimize);
         var core: Core = .{ .safety = safety, .test_wait = test_wait, .resilience = resilience, .validate = validate, .anole_log = anole_log, .console_ui = console_ui, .banner = banner, .zio = zio_mod, .llhttp = LlHttp.init(b, target, optimize), .dusty_by = @splat(@splat(@splat(@splat(null)))), .h2_client_by = @splat(@splat(@splat(@splat(null)))), .tls_seam = seam };
         for ([_]bool{ false, true }) |tls| {
             if (tls and seam == null) continue;
@@ -2410,19 +2400,12 @@ const AnoleModuleOptions = struct {
     mailpit_api_url: ?[]const u8 = null,
     /// src/bson as a module, for -Dmongodb.
     bson: ?*std.Build.Module = null,
-    /// `anole_test_wait` with `timing` on (`zig build test-timing`); null:
-    /// the core's, with `timing` off.
-    test_wait: ?*std.Build.Module = null,
 };
 
-/// src/testing/wait.zig as the module `anole_test_wait`, with its option
-/// `timing` (the tests of `zig build test-timing` skip without it).
-fn testWaitModule(b: *std.Build, timing: bool, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    const opts = b.addOptions();
-    opts.addOption(bool, "timing", timing);
-    const m = b.createModule(.{ .root_source_file = b.path("src/testing/wait.zig"), .target = target, .optimize = optimize, .link_libc = true });
-    m.addOptions("anole_test_wait_options", opts);
-    return m;
+/// src/testing/wait.zig as the module `anole_test_wait` (libc for its
+/// environment reads: ANOLE_TEST_TIMEOUT_FACTOR, ANOLE_TEST_TIMING).
+fn testWaitModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("src/testing/wait.zig"), .target = target, .optimize = optimize, .link_libc = true });
 }
 
 /// src/root.zig with its own build_options and only the binding modules its
@@ -2485,7 +2468,7 @@ fn anoleModule(b: *std.Build, o: AnoleModuleOptions) *std.Build.Module {
     mod.addImport("anole_log", o.core.anole_log);
     mod.addImport("anole_console_ui", o.core.console_ui);
     mod.addImport("anole_banner", o.core.banner);
-    mod.addImport("anole_test_wait", o.test_wait orelse o.core.test_wait);
+    mod.addImport("anole_test_wait", o.core.test_wait);
     if (f.http2) {
         mod.addImport("anole_nghttp2_c", o.c.nghttp2.?);
         mod.addImport("anole_h2_client", o.core.h2Client(f));

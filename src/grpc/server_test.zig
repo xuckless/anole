@@ -965,7 +965,7 @@ test "gRPC: the client's RST_STREAM cancels the handler" {
         s.cancel();
         // A 10 s sleep, over well inside a second.
         while (!Sleeper.done.load(.acquire)) {
-            if (wait.timing) try std.testing.expect(reset_at.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
+            if (wait.timing()) try std.testing.expect(reset_at.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
             try io.sleep(.fromMilliseconds(5), .awake);
         }
         try std.testing.expect(Sleeper.canceled.load(.acquire));

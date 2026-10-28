@@ -957,7 +957,7 @@ test "WebTransport: a 300 KiB message write returns before the peer acknowledges
             return bulk_write_ms.load(.acquire) != std.math.maxInt(u64);
         }
     }.cond);
-    if (wait.timing) try std.testing.expect(bulk_write_ms.load(.acquire) < 1000);
+    if (wait.timing()) try std.testing.expect(bulk_write_ms.load(.acquire) < 1000);
     const in = try session.acceptUniStream();
     defer in.release();
     const got = try in.reader().allocRemaining(gpa, .unlimited);

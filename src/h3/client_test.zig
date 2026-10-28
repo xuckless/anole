@@ -768,7 +768,7 @@ test "h3 server: a request that outlives timeout.request is reset" {
     defer s.release();
     // The handler takes 5 s: no head before that is the timeout's doing.
     if (s.waitHead()) |_| return error.ServedPastTheTimeout else |_| {}
-    if (wait.timing) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
+    if (wait.timing()) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
 
     // The connection carries on.
     const body = try get(conn, "/hello", gpa);
@@ -916,7 +916,7 @@ test "h3 server: a hand-over closes the connections at once and leaves the socke
     } else |err| try std.testing.expect(err == error.ConnectionClosed or err == error.StreamReset);
     // The client's idle timeout is an hour: the close came from the
     // hand-over, whenever it arrived.
-    if (wait.timing) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 2000);
+    if (wait.timing()) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 2000);
 
     // Every new connection reaches the successor.
     for (0..5) |_| {
@@ -955,7 +955,7 @@ test "h3 client: request timeouts, for the head and for the body, and the connec
         try std.testing.expectError(error.Timeout, s.waitHead());
     }
     // The handler takes 5 s: Timeout before that is the timeout's doing.
-    if (wait.timing) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
+    if (wait.timing()) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
     {
         const s = try conn.request(&.{
             .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/stall" },
@@ -994,7 +994,7 @@ test "h3 client: connect_timeout bounds a handshake nobody answers" {
         .connect_timeout = .fromMilliseconds(300),
     }));
     // 300 ms, not the 10 s default: a bound only test-timing checks.
-    if (wait.timing) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
+    if (wait.timing()) try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 3000);
 }
 
 /// A UDP relay between a client and a server, which can hold the server's

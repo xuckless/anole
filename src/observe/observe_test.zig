@@ -324,7 +324,7 @@ test "observe: the exporter stops at once, not after its interval" {
 
     const start: std.Io.Clock.Timestamp = .now(io, .awake);
     exporter.deinit();
-    if (wait.timing) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
+    if (wait.timing()) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
 }
 
 test "observe: exclude keeps probes out of metrics and traces" {

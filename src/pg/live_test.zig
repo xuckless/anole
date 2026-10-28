@@ -339,7 +339,7 @@ test "pg: live a timeout or a cancel stops the statement on the server" {
     // `QueryOptions.timeout`: a 504, quickly, and the server stops.
     const started: std.Io.Clock.Timestamp = .now(io, .awake);
     try testing.expectError(error.GatewayTimeout, d.with(.{ .timeout = .fromMilliseconds(200) }).exec(&c, "SELECT pg_sleep(30)", .{}));
-    if (wait.timing) try testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 3000);
+    if (wait.timing()) try testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 3000);
     try testing.expectEqual(db.Class.timeout, db.lastError(&c).?.class);
     try expectStopped(io, watcher, &c, app_name);
 

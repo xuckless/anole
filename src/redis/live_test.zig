@@ -311,7 +311,7 @@ test "redis: live a timeout or a cancel closes the connection, and the next call
     const first = try r.one(i64, &c, .{ "CLIENT", "ID" });
     const started: std.Io.Clock.Timestamp = .now(io, .awake);
     try testing.expectError(error.GatewayTimeout, r.with(.{ .timeout = .fromMilliseconds(100) }).command(&c, .{ "BLPOP", "anole:test:empty", 10 }));
-    if (wait.timing) try testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 3000);
+    if (wait.timing()) try testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 3000);
     try testing.expectEqual(db.Class.timeout, db.lastError(&c).?.class);
     const second = try r.one(i64, &c, .{ "CLIENT", "ID" });
     try testing.expect(second != first);
@@ -511,7 +511,7 @@ test "redis: live app.redis: handlers, statuses, /readyz and /metrics" {
             const stopping: std.Io.Clock.Timestamp = .now(io, .awake);
             a.stop();
             const got = try streaming.await(io);
-            if (wait.timing) try testing.expect(stopping.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
+            if (wait.timing()) try testing.expect(stopping.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
             try testing.expectEqualStrings("data: hi\n\n", got[1]);
         }
     };
