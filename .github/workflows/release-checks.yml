@@ -22,7 +22,7 @@ jobs:
   h2spec:
     name: h2spec (ReleaseFast)
     runs-on: ubuntu-latest
-    timeout-minutes: 22
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -45,7 +45,7 @@ jobs:
   autobahn:
     name: Autobahn (ReleaseFast)
     runs-on: ubuntu-latest
-    timeout-minutes: 37
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -73,7 +73,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 33
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -95,7 +95,7 @@ jobs:
   quic-interop:
     name: QUIC interop runner (ReleaseFast)
     runs-on: ubuntu-latest
-    timeout-minutes: 26
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -115,7 +115,7 @@ jobs:
           restore-keys: tshark-debs-${{ runner.os }}-
       - name: Install tshark
         timeout-minutes: 10
-        run: tests/interop/install-tshark.sh ~/tshark-debs
+        run: tests/interop/install-tshark.sh --required ~/tshark-debs
       # The interop server built here in ReleaseFast; run.sh would build it
       # ReleaseSafe.
       - name: Build the interop server
@@ -142,7 +142,7 @@ jobs:
   grpc-interop:
     name: gRPC interop (ReleaseFast)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -175,7 +175,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 39
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1

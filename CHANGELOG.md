@@ -24,7 +24,10 @@ breaking changes are listed anyway.
 - CI: every job and long step has a time limit sized from the last 30 green
   runs, jobs with Docker containers keep the containers' logs and states as
   an artifact when they fail, and the interop jobs install tshark from cached
-  packages, or else Ubuntu's own, when the Wireshark PPA is down (#54).
+  packages when the Wireshark PPA is down. With neither, the interop steps
+  are skipped with a warning that names the outage, instead of failing as if
+  a test had (Ubuntu's own tshark is too old for the runner); the release
+  checks still fail (#54).
 
 ## 0.4.1 (2026-10-28)
 

@@ -27,9 +27,10 @@ on:
 permissions:
   contents: read
 
-# Time limits: every job and every long step has `timeout-minutes`, sized
+# Time limits: every job and every long step has `timeout-minutes`, at least
 # ceil(2 x p95) + 5 from the last 30 green runs (2026-10-28; review them each
-# release), so a hang costs minutes. Every unit test step passes
+# release), never below the limit a step had before (cold caches), so a hang
+# costs minutes. Every unit test step passes
 # `--test-timeout 120s`: a test running that long is named and ended, and the
 # test runner dumps every thread's backtrace at 110 s (gdb on Linux; lldb,
 # else sample, on macOS; src/safety/test_runner.zig). Jobs with Docker
@@ -49,7 +50,7 @@ jobs:
         # macos-latest is Apple silicon (arm64).
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 99
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -68,7 +69,7 @@ jobs:
       # feature that reads a C module its own flags never requested. These
       # configure each profile on its own, as a user would.
       - name: Profile minimal (no C library besides llhttp)
-        timeout-minutes: 9
+        timeout-minutes: 15
         run: zig build test -Dprofile=minimal --test-timeout 120s --summary all
       - name: Profile web (BoringSSL + nghttp2, no HTTP/3)
         timeout-minutes: 23
@@ -92,7 +93,7 @@ jobs:
       # real pseudo-terminal: keys reach the TUI, every way out restores
       # the terminal. (macOS: poll(2) cannot wait on /dev/tty.)
       - name: Live console in a pseudo-terminal
-        timeout-minutes: 6
+        timeout-minutes: 10
         run: |
           zig build cli rest --summary all
           python3 -I tests/console/pty_test.py zig-out/bin/anole zig-out/bin/rest
@@ -111,7 +112,7 @@ jobs:
           - { name: trimmed, combos: "full-no-brotli,full-no-openapi,db-none,db-only" }
           - { name: subsets, combos: "brokers-none,http2-no-grpc,web,minimal-no-lambda" }
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 53
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -178,17 +179,17 @@ jobs:
         timeout-minutes: 27
         run: zig build capi --summary all
       - name: anole.h layout, the C suite, the engine over HTTP/2 and HTTP/3
-        timeout-minutes: 9
+        timeout-minutes: 20
         run: zig build capi-test test-capi-engine --test-timeout 120s --summary all
       - name: The C suite under ASan and UBSan (system cc)
-        timeout-minutes: 7
+        timeout-minutes: 20
         run: zig build capi-test-asan --test-timeout 120s --summary all
       - name: The same, against a ReleaseSafe libanole
         timeout-minutes: 22
         run: zig build capi-test -Doptimize=ReleaseSafe --test-timeout 120s --summary all
       - name: anole.h and the Zig side of libanole for Windows
         if: runner.os == 'Linux'
-        timeout-minutes: 19
+        timeout-minutes: 20
         run: |
           for t in x86_64-windows-gnu aarch64-windows-gnu; do
             zig cc -target $t -std=c99 -Wall -Wextra -Werror -Iinclude -c tests/capi/layout.c -o /tmp/layout-$t.o
@@ -204,7 +205,7 @@ jobs:
     # Unix-only parts (per-core SO_REUSEPORT sockets, HTTP/3 steering and
     # UDP batching, listener hand-off and SIGUSR2, LISTEN_FDS, sd_notify,
     # idle parking) are compiled out there and their tests skipped.
-    timeout-minutes: 56
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash
@@ -225,10 +226,10 @@ jobs:
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
       - name: Unit and smoke tests (default profile, every feature on)
-        timeout-minutes: 51
+        timeout-minutes: 60
         run: zig build test --test-timeout 120s --summary all
       - name: Build and install the examples
-        timeout-minutes: 6
+        timeout-minutes: 20
         run: zig build hello rest websocket grpc auth clients observe postgres sqlite mongodb redis io full --summary all
       # Two examples serve requests: hello over HTTP/1.1, and full (every
       # listener, `process` set, so the Unix-only hand-off is skipped)
@@ -385,9 +386,11 @@ jobs:
           key: tshark-debs-${{ runner.os }}-${{ steps.tshark-week.outputs.week }}
           restore-keys: tshark-debs-${{ runner.os }}-
       - name: Install tshark
+        id: tshark
         timeout-minutes: 10
         run: tests/interop/install-tshark.sh ~/tshark-debs
       - name: tests/interop/run.sh
+        if: steps.tshark.outputs.available == 'true'
         timeout-minutes: 20
         run: tests/interop/run.sh ngtcp2,quic-go
         env:
@@ -433,9 +436,11 @@ jobs:
           key: tshark-debs-${{ runner.os }}-${{ steps.tshark-week.outputs.week }}
           restore-keys: tshark-debs-${{ runner.os }}-
       - name: Install tshark
+        id: tshark
         timeout-minutes: 10
         run: tests/interop/install-tshark.sh ~/tshark-debs
       - name: tests/interop/webtransport/run.sh flupke-webtransport
+        if: steps.tshark.outputs.available == 'true'
         timeout-minutes: 21
         run: tests/interop/webtransport/run.sh flupke-webtransport
         env:
@@ -443,6 +448,7 @@ jobs:
       # Not a gate yet: the browser images have not been run against Anole
       # (they are x86_64 only, and were built on an arm64 Mac).
       - name: tests/interop/webtransport/run.sh chrome,firefox
+        if: steps.tshark.outputs.available == 'true'
         continue-on-error: true
         run: tests/interop/webtransport/run.sh chrome,firefox
         env:
@@ -471,7 +477,7 @@ jobs:
         # slow part of the Linux run).
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 52
+    timeout-minutes: 90
     # rest-postgres runs its database tests against this server on Linux.
     services:
       postgres:
@@ -648,7 +654,7 @@ jobs:
   redis:
     name: Redis and Valkey (live client, session store and rate limiter tests, plain and TLS; the C ABI's suite)
     runs-on: ubuntu-latest
-    timeout-minutes: 33
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -668,7 +674,7 @@ jobs:
       # server's certificate: the script starts the server itself, with a
       # CA made for the run.
       - name: Tests against a live server
-        timeout-minutes: 29
+        timeout-minutes: 35
         run: REDIS_IMAGE=${{ matrix.image }} tests/redis/run.sh --test-timeout 120s
         env:
           ANOLE_KEEP_CONTAINERS: "1"
@@ -702,7 +708,7 @@ jobs:
       # suite plus the live tests against a throwaway MinIO (the image is
       # pinned by digest in the script), once over HTTP and once over TLS.
       - name: Tests against a live server
-        timeout-minutes: 16
+        timeout-minutes: 35
         run: tests/s3/run.sh --test-timeout 120s
         env:
           ANOLE_KEEP_CONTAINERS: "1"
@@ -722,7 +728,7 @@ jobs:
   postgres:
     name: PostgreSQL (live client tests, plain and verify-full TLS, scram-sha-256; the C ABI's suite)
     runs-on: ubuntu-latest
-    timeout-minutes: 33
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -742,7 +748,7 @@ jobs:
       # server's certificate: the script starts the server itself, with a
       # CA made for the run.
       - name: Tests against a live server
-        timeout-minutes: 30
+        timeout-minutes: 35
         run: PG_IMAGE=${{ matrix.image }} tests/postgres/run.sh --test-timeout 120s
         env:
           ANOLE_KEEP_CONTAINERS: "1"
@@ -852,7 +858,7 @@ jobs:
       # A replica set of one with authentication and failCommand, plain and
       # over TLS on a CA made for the run; SCRAM-SHA-256 and SCRAM-SHA-1.
       - name: Tests with a live server
-        timeout-minutes: 32
+        timeout-minutes: 35
         run: tests/mongodb/run.sh ${{ matrix.image }} --test-timeout 120s
         env:
           ANOLE_KEEP_CONTAINERS: "1"
@@ -883,7 +889,7 @@ jobs:
       # sent is read back from each one's API. The image is pinned by digest
       # (MAINTAINING.md lists the pins and how to bump them).
       - name: Tests against live servers
-        timeout-minutes: 33
+        timeout-minutes: 35
         env:
           # v1.32.0
           MAILPIT_IMAGE: axllent/mailpit@sha256:0790692be935ea4420d085694f7985b1f692ca6a8771ab0e0bd8ba75ac180498

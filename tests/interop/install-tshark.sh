@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs tshark for the interop runners on an Ubuntu CI runner (#54).
 #
-#   tests/interop/install-tshark.sh DEBS_DIR
+#   tests/interop/install-tshark.sh [--required] DEBS_DIR
 #
 # The runner reads its traces with pyshark and documents Wireshark 4.5.0 or
 # newer; Ubuntu 24.04's own tshark is 4.2. So, in order:
@@ -10,11 +10,17 @@
 #      actions/cache;
 #   2. when Launchpad is down: the .deb files of the last good install from
 #      DEBS_DIR;
-#   3. when there are none: Ubuntu's tshark, with a warning that it is older
-#      than the runner asks for (version-dependent checks may then fail).
+#   3. when there are none: no tshark. Ubuntu's own is too old for the
+#      runner, and its checks would fail as if a test had failed. The script
+#      writes `available=false` to $GITHUB_OUTPUT, so the interop steps are
+#      skipped with a notice (an infrastructure failure reported as one);
+#      with --required (release checks) it fails instead.
 set -uo pipefail
 
-debs=${1:?usage: install-tshark.sh DEBS_DIR}
+required=
+if [ "${1:-}" = --required ]; then required=1; shift; fi
+debs=${1:?usage: install-tshark.sh [--required] DEBS_DIR}
+out=${GITHUB_OUTPUT:-/dev/null}
 ppa=ppa:wireshark-dev/nightly
 mkdir -p "$debs"
 
@@ -56,13 +62,13 @@ if [ -z "$installed" ] && ls "$debs"/*.deb >/dev/null 2>&1; then
 fi
 
 if [ -z "$installed" ]; then
-  echo "::warning::the Wireshark PPA is unreachable and no cached packages exist; installing Ubuntu's own tshark, older than the 4.5.0 the interop runner documents"
-  drop_ppa
-  if apt install -y -qq --no-install-recommends tshark; then installed=distro; fi
-fi
-
-if [ -z "$installed" ]; then
-  echo "::error::no tshark could be installed (PPA, cache and Ubuntu's archive all failed): an infrastructure failure, not a test failure"
-  exit 1
+  if [ -n "$required" ]; then
+    echo "::error::no tshark could be installed (the PPA failed and no cached packages exist): an infrastructure failure, not a test failure"
+    exit 1
+  fi
+  echo "::warning::the Wireshark PPA is unreachable and no cached packages exist: the interop checks are skipped (Ubuntu's own tshark is older than the 4.5.0 the runner needs). An infrastructure failure, not a test failure; rerun once Launchpad is back."
+  echo "available=false" >>"$out"
+  exit 0
 fi
 echo "tshark from the $installed: $(version_line)"
+echo "available=true" >>"$out"
