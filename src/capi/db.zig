@@ -887,7 +887,7 @@ pub const TxOp = struct {
         }
         if (t.tail) |tail| tail.next = op else t.head = op;
         t.tail = op;
-        t.event.set(x.engine.io);
+        x.setEvent(&t.event);
     }
 };
 
@@ -933,7 +933,7 @@ pub const TxSlot = struct {
 
     /// On the executor: wakes the task out of whatever it waits in.
     fn wake(t: *TxSlot) void {
-        t.event.set(t.exec.engine.io);
+        t.exec.setEvent(&t.event);
         if (t.task) |tk| placement.cancelTask(tk);
     }
 };

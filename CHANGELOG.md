@@ -3,6 +3,16 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.1 (unreleased)
+
+### Fixed
+
+- C ABI: a crash when a binding thread answered, sent or polled while the
+  server stopped. The call wakes an executor through the runtime, and the
+  stop could free the runtime while that wake was still under way. The stop
+  now waits for wakes under way before it frees the runtime, and a wake
+  after that is skipped.
+
 ## 0.4.0 (2026-10-25)
 
 ### Breaking
