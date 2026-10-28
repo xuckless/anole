@@ -80,7 +80,7 @@ Keys are 1 to 1024 bytes of UTF-8. They are encoded for the URL and the signatur
 
 An upload never holds a whole object. Up to `multipart_threshold` (default `part_size`, 8 MiB) a body of known length is one PutObject; above it, or when the length is not known, it goes up as a multipart upload with `part_size` parts (raised to `ceil(length / 10000)` so 10,000 parts always suffice; all parts have the same size, which R2 requires), at most `concurrency` (default 2) in flight. One upload holds at most `(concurrency + 1) * part_size` in memory, and all of a client's uploads together at most `upload_memory` (256 MiB).
 
-`put(c, key, .request, .{})` is the pull form: it reads the request's body at its own pace and sends it on (`limits.body_max` applies). `upload(c, key, opts)` is the push form for code that produces bytes: `write(c, bytes)` copies them into the part buffers and **returns at once**. It never waits for the network:
+`put(c, key, .request, .{})` is the pull form: it reads the request's body at its own pace and sends it on (`limits.body_max` applies: a larger body fails with `error.BodyTooBig`, a 413 Content Too Large as the server's own body readers answer it, `lastError` code `body_too_big`, and the connection closes after the answer since the rest of the body is unread). `upload(c, key, opts)` is the push form for code that produces bytes: `write(c, bytes)` copies them into the part buffers and **returns at once**. It never waits for the network:
 
 - `.ok`: taken, room for more;
 - `.busy`: taken, but more than `concurrency * part_size` is buffered; wait with `waitWritable(c, timeout)` before writing more;
@@ -109,7 +109,7 @@ Retries are **on** by default (3 attempts, 100 ms to 2 s): every operation Anole
 | past the timeout | `timeout` | 504 |
 | everything else (403 `AccessDenied`, `SignatureDoesNotMatch`, `InvalidAccessKeyId`, 301 `PermanentRedirect`...) | `other` | 500 |
 
-A wrong region or a bad key is the server's misconfiguration, so it answers 500 with a clear log line; a `PermanentRedirect` names the bucket's region. `anole.db.lastError(req).?.code` is S3's `<Code>`, or Anole's own: among them `no_bucket`, `no_credentials`, `invalid_key`, `object_too_large`, `too_many_parts`, `short_body`, `body_too_big`, `file_not_found`, `invalid_expires`, `upload_full`, `upload_over`, `transport`, `bad_response`, `write_timeout`, `draining` and `circuit_open`. `Options.errors` moves any class to another status.
+A wrong region or a bad key is the server's misconfiguration, so it answers 500 with a clear log line; a `PermanentRedirect` names the bucket's region. `anole.db.lastError(req).?.code` is S3's `<Code>`, or Anole's own: among them `no_bucket`, `no_credentials`, `invalid_key`, `object_too_large`, `too_many_parts`, `short_body`, `body_too_big`, `file_not_found`, `invalid_expires`, `upload_full`, `upload_over`, `transport`, `bad_response`, `write_timeout`, `draining` and `circuit_open`. `Options.errors` moves any class to another status (`body_too_big` is the request's fault and always a 413).
 
 ## Shutdown
 

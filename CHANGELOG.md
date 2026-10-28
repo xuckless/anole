@@ -3,6 +3,16 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.2 (unreleased)
+
+### Fixed
+
+- S3: `put(c, key, .request, opts)` with a request body larger than
+  `limits.body_max` answered 400; it now fails with `error.BodyTooBig`, a
+  413 Content Too Large (RFC 9110 §15.5.14), as the server's own body
+  readers answer it. `anole.db.lastError(req)` still says `body_too_big`,
+  and the connection closes after the answer since the body is unread.
+
 ## 0.4.1 (2026-10-28)
 
 ### Fixed

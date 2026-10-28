@@ -39,6 +39,9 @@ pub const Header = [2][]const u8;
 /// What a call can fail with: `anole.db.Error` (so a handler's `try` gives
 /// the right status), a cancel, memory.
 pub const Error = db.Error || error{ Canceled, OutOfMemory };
+/// `put`'s errors: `Error`, and `BodyTooBig` (a 413, as the core answers
+/// it) when a `Body.request` is larger than `limits.body_max`.
+pub const PutError = Error || error{BodyTooBig};
 
 pub const Provider = endpoint.Provider;
 pub const Addressing = endpoint.Addressing;
@@ -327,7 +330,7 @@ pub const Bucket = struct {
         return true;
     }
 
-    pub fn put(self: Bucket, c: anytype, key: []const u8, body: Body, opts: PutOptions) Error!Stored {
+    pub fn put(self: Bucket, c: anytype, key: []const u8, body: Body, opts: PutOptions) PutError!Stored {
         return upload_.put(self, c, key, body, opts);
     }
 
@@ -871,7 +874,7 @@ pub const Client = struct {
     pub fn exists(self: *Client, c: anytype, key: []const u8) Error!bool {
         return self.dflt().exists(c, key);
     }
-    pub fn put(self: *Client, c: anytype, key: []const u8, body: Body, opts: PutOptions) Error!Stored {
+    pub fn put(self: *Client, c: anytype, key: []const u8, body: Body, opts: PutOptions) PutError!Stored {
         return self.dflt().put(c, key, body, opts);
     }
     pub fn upload(self: *Client, c: anytype, key: []const u8, opts: PutOptions) Error!*Upload {

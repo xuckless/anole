@@ -606,6 +606,9 @@ test "s3: bad options are refused at init" {
 
 const Gateway = struct {
     files: *s3.Client,
+    /// The `lastError` code of the last failed upload.
+    last_code: [32]u8 = undefined,
+    last_code_len: usize = 0,
 
     fn serve(self: *Gateway, req: *dusty.Request, res: *dusty.Response) !void {
         _ = self.files.serve(req, res, req.params.get("rest") orelse "", .{}) catch |err| {
@@ -619,7 +622,14 @@ const Gateway = struct {
     }
 
     fn upload(self: *Gateway, req: *dusty.Request, res: *dusty.Response) !void {
-        const stored = try self.files.put(req, "uploaded.bin", .request, .{});
+        const stored = self.files.put(req, "uploaded.bin", .request, .{}) catch |err| {
+            if (db.lastError(req)) |d| {
+                const n = @min(d.code.len, self.last_code.len);
+                @memcpy(self.last_code[0..n], d.code[0..n]);
+                self.last_code_len = n;
+            }
+            return err;
+        };
         res.body = stored.etag;
     }
 };
@@ -713,6 +723,34 @@ test "s3: put(.request) sends the request body to the object without the handler
     try testing.expectEqual(@as(u16, 200), code(&resp));
     try testing.expectEqualSlices(u8, body, env.fake.getObject("b", "uploaded.bin").?);
     try testing.expect(env.fake.count("PUT", "partNumber=") >= 3);
+}
+
+test "s3: put(.request) with a body over body_max answers 413; lastError is body_too_big" {
+    const env = try Env.init(.{});
+    defer env.deinit();
+    var gw: Gateway = .{ .files = env.client };
+    const loopback: []const dusty.Listener = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }};
+    var server = dusty.Server(Gateway).init(testing.allocator, tio(), .{ .listeners = loopback, .request = .{ .max_body_size = 1024 } }, &gw);
+    defer server.deinit();
+    server.router.post("/upload", Gateway.upload);
+    var fut = try tio().concurrent(runGateway, .{&server});
+    defer _ = fut.cancel(tio()) catch {};
+    try server.waitReady(tio());
+
+    // Small enough for the loopback socket to take whole before the
+    // answer, and for the server's lingering close to throw away (the
+    // core closes after a body left unread over the limit; its own test).
+    const body = try pattern(env.ctx.arena, 8 * 1024, 12);
+    var http = dusty.Client.init(testing.allocator, tio(), .{});
+    defer http.deinit();
+    const url = try std.fmt.allocPrint(env.ctx.arena, "http://127.0.0.1:{d}/upload", .{server.address.ip.getPort()});
+    const quiet = Quiet.on();
+    defer quiet.done();
+    var resp = try http.fetch(url, .{ .method = .post, .body = body, .decompress = false });
+    defer resp.deinit();
+    try testing.expectEqual(@as(u16, 413), code(&resp));
+    try testing.expectEqualStrings("body_too_big", gw.last_code[0..gw.last_code_len]);
+    try testing.expect(env.fake.getObject("b", "uploaded.bin") == null);
 }
 
 // ---- Credentials against the fake ------------------------------------------------

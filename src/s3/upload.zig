@@ -722,7 +722,7 @@ pub fn open(b: Bucket, c: anytype, key: []const u8, opts: PutOptions, declared_l
 // ---------------------------------------------------------------------------
 // `put`
 
-pub fn put(b: Bucket, c: anytype, key: []const u8, body: root.Body, opts: PutOptions) Error!Stored {
+pub fn put(b: Bucket, c: anytype, key: []const u8, body: root.Body, opts: PutOptions) root.PutError!Stored {
     const cl = b.client;
     if (!endpoint.validKey(key)) return cl.failOur(c, .invalid, "invalid_key", "a key must be 1 to 1024 bytes of UTF-8");
     switch (body) {
@@ -775,11 +775,18 @@ pub fn put(b: Bucket, c: anytype, key: []const u8, body: root.Body, opts: PutOpt
     }
 }
 
-fn requestErr(cl: *Client, c: anytype, err: anyerror) Error {
+fn requestErr(cl: *Client, c: anytype, err: anyerror) root.PutError {
     return switch (err) {
         error.Canceled => error.Canceled,
         error.OutOfMemory => error.OutOfMemory,
-        error.BodyTooBig => cl.failOur(c, .invalid, "body_too_big", "the request body is larger than limits.body_max"),
+        // The request's fault, answered as the core answers a body over
+        // its limit: 413 (RFC 9110 15.5.14), and the connection closes
+        // after it since the rest of the body is unread. `lastError` still
+        // says why.
+        error.BodyTooBig => {
+            cl.failOur(c, .invalid, "body_too_big", "the request body is larger than limits.body_max") catch {};
+            return error.BodyTooBig;
+        },
         else => cl.failOur(c, .invalid, "bad_body", @errorName(err)),
     };
 }
