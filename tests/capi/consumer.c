@@ -58,6 +58,18 @@ static double wait_until(void) {
   return now_ms() + 10000.0 * (double)n;
 }
 
+/* Elapsed-time upper bounds hold only on a machine that is not stalled:
+   checked under `zig build test-timing` (ANOLE_TEST_TIMING set and not "0"),
+   as src/testing/wait.zig's timing(); never in CI. */
+static int timing(void) {
+  const char *t = getenv("ANOLE_TEST_TIMING");
+  if (!t) return 0;
+  size_t a = 0, b = strlen(t);
+  while (a < b && strchr(" \t\r\n", t[a])) a++;
+  while (b > a && strchr(" \t\r\n", t[b - 1])) b--;
+  return b > a && !(b - a == 1 && t[a] == '0');
+}
+
 static atomic_int log_lines;
 static void on_log(void *ud, uint32_t level, anole_str scope, anole_str msg) {
   (void)ud;
@@ -1304,7 +1316,7 @@ static void test_shared_consumer(void) {
   CHECK(a.r.eof || a.r.status >= 500);
   CHECK(anole_server_wait(s, -1) == ANOLE_OK);
   double took = now_ms() - t0;
-  CHECK(took < 2000);
+  CHECK(!timing() || took < 2000);
   for (int i = 0; i < 2; i++) {
     atomic_store(&cs[i].stopped, 1);
     pthread_join(cs[i].thread, NULL);
@@ -1516,7 +1528,7 @@ static void test_db(void) {
   CHECK(anole_db_query(db, c, slow, NULL, 0, &quick, 30) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_E_TIMEOUT && r->http_status == 504 && r->error_class == ANOLE_DB_ERR_TIMEOUT);
-  CHECK(now_ms() - t0 < 2000);
+  CHECK(!timing() || now_ms() - t0 < 2000);
 
   /* an answer past limits.db_result_max */
   anole_str huge = LIT("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 10000) SELECT x FROM n");
@@ -1706,7 +1718,7 @@ static void test_db_postgres(void) {
   CHECK(anole_db_query(db, c, slow, NULL, 0, &quick, 30) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_E_TIMEOUT && r->http_status == 504 && r->error_class == ANOLE_DB_ERR_TIMEOUT);
-  CHECK(now_ms() - t0 < 3000);
+  CHECK(!timing() || now_ms() - t0 < 3000);
   CHECK(anole_db_query(db, c, count, NULL, 0, NULL, 31) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 2);
@@ -1846,7 +1858,7 @@ static void test_db_redis(void) {
   CHECK(anole_db_query(db, c, blpop, bv, 2, &quick, 30) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_E_TIMEOUT && r->http_status == 504);
-  CHECK(now_ms() - t0 < 3000);
+  CHECK(!timing() || now_ms() - t0 < 3000);
 
   /* an answer past limits.db_result_max */
   anole_str setrange = LIT("SETRANGE");
@@ -2160,7 +2172,7 @@ static void test_db_mongodb(void) {
   CHECK(anole_db_query(db, c, find, p, 1, &quick, 30) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->status == ANOLE_E_TIMEOUT && r->http_status == 504);
-  CHECK(now_ms() - t0 < 2500);
+  CHECK(!timing() || now_ms() - t0 < 2500);
 
   /* an answer past limits.db_result_max */
   static char big[70000];
@@ -2720,7 +2732,7 @@ static void test_db_tx(void) {
     r = db_next(c, rec, sizeof rec);
     CHECK(r->user_data == (uint64_t)(401 + i) && r->status == ANOLE_E_GONE && r->http_status == 0);
   }
-  CHECK(now_ms() - t0 < 3000);
+  CHECK(!timing() || now_ms() - t0 < 3000);
   CHECK(db_count(db, c, "acct", 404) == 4); /* the writer is free and nothing was kept */
 
   /* its timeout rolls it back: idle, the next call is GONE; with a statement running, TIMEOUT */
@@ -2822,7 +2834,7 @@ static void test_db_request_tie(void) {
   CHECK(anole_db_query(db, c, slow, NULL, 0, NULL, 6) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 6 && r->status == ANOLE_E_TIMEOUT && r->http_status == 504);
-  CHECK(now_ms() - t0 < 6000);
+  CHECK(!timing() || now_ms() - t0 < 6000);
   anole_db_options none = {sizeof none};
   none.timeout_ms = ANOLE_DB_TIMEOUT_NONE;
   CHECK(anole_db_query(db, c, LIT("SELECT 1"), NULL, 0, &none, 7) == ANOLE_OK);
@@ -2964,7 +2976,7 @@ static void test_db_postgres_tx(void) {
   CHECK(anole_db_tx_release(tr) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 31 && r->status == ANOLE_E_GONE);
-  CHECK(now_ms() - t0 < 1500);
+  CHECK(!timing() || now_ms() - t0 < 1500);
   anole_str sleepers = LIT("SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(10)%' AND pid <> pg_backend_pid()");
   int64_t left = -1;
   for (int i = 0; i < 20 && left != 0; i++) {
@@ -3550,7 +3562,7 @@ static void test_destroy_on_consumer_thread(void) {
   pthread_t t;
   CHECK(pthread_create(&t, NULL, destroy_thread, s) == 0);
   pthread_join(t, NULL);
-  CHECK(now_ms() - t0 < 2000);
+  CHECK(!timing() || now_ms() - t0 < 2000);
   response r1;
   response_init(&r1);
   read_response(&c1, &r1, 0);

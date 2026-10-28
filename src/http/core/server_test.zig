@@ -3457,7 +3457,7 @@ test "Server: a head that does not arrive within read_header closes the connecti
         // The server hangs up: end of stream, or a reset.
         _ = r.interface.peekByte() catch {};
         const waited = start.durationTo(.now(io, .awake)).raw.toMilliseconds();
-        try std.testing.expect(waited < 2000);
+        if (wait.timing()) try std.testing.expect(waited < 2000);
     }
     { // A whole head at once, then a body slower than read_header.
         const stream = try server.address.ip.connect(io, .{ .mode = .stream });
@@ -3524,7 +3524,7 @@ test "Server: a keep-alive request outlives the keepalive timeout; a half head o
     const start: std.Io.Clock.Timestamp = .now(io, .awake);
     _ = r.interface.peekByte() catch {};
     const waited = start.durationTo(.now(io, .awake)).raw.toMilliseconds();
-    try std.testing.expect(waited < 2000);
+    if (wait.timing()) try std.testing.expect(waited < 2000);
 }
 
 test "Server: a zstd request body is refused with 415 when built without zstd" {
@@ -4330,7 +4330,8 @@ test "stream: a handler's own setTimeout before the stream is kept" {
     var w: std.Io.Writer = .fixed(&out);
     _ = reader.interface.streamRemaining(&w) catch {};
     const ms = start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
-    try std.testing.expect(ms >= 400 and ms < 3000);
+    try std.testing.expect(ms >= 400);
+    if (wait.timing()) try std.testing.expect(ms < 3000);
 }
 
 test "reader: a chunked body past body_max fails with BodyTooBig; readerLimited lifts it" {

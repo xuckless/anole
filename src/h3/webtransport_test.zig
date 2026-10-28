@@ -579,7 +579,8 @@ test "WebTransport: a client's close waits a bounded time for a server slow to a
     session.deinit();
     conn.close();
     const waited = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
-    try std.testing.expect(waited >= 90 and waited < 1100);
+    try std.testing.expect(waited >= 90);
+    if (wait.timing()) try std.testing.expect(waited < 1100);
     try waitHandlers(io, done_before + 1);
     try std.testing.expectEqual(.peer, last_close.by.?);
     try std.testing.expectEqual(@as(u32, 4242), last_close.code);

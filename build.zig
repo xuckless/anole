@@ -1465,6 +1465,20 @@ pub fn build(b: *std.Build) void {
             if (redis_test_url) |url| run_consumer.setEnvironmentVariable("ANOLE_TEST_REDIS_URL", url);
             if (mongodb_test_url) |url| run_consumer.setEnvironmentVariable("ANOLE_TEST_MONGODB_URL", url);
             capi_test_step.dependOn(&run_consumer.step);
+            // test-timing: the C suite again, its elapsed-time bounds on
+            // (checked only with ANOLE_TEST_TIMING, as in the Zig suites).
+            {
+                const run_timing = b.addRunArtifact(consumer);
+                run_timing.addArg("test");
+                if (wt_client) |wc| run_timing.addArtifactArg(wc);
+                run_timing.stdio = .inherit;
+                run_timing.has_side_effects = true;
+                run_timing.setEnvironmentVariable("ANOLE_TEST_TIMING", "1");
+                if (postgres_test_url) |url| run_timing.setEnvironmentVariable("ANOLE_TEST_POSTGRES_URL", url);
+                if (redis_test_url) |url| run_timing.setEnvironmentVariable("ANOLE_TEST_REDIS_URL", url);
+                if (mongodb_test_url) |url| run_timing.setEnvironmentVariable("ANOLE_TEST_MONGODB_URL", url);
+                timing_step.dependOn(&run_timing.step);
+            }
             b.step("capi-consumer", "Build the C consumer (tests/capi/consumer.c: `test`, or `serve` for benchmarks)").dependOn(&b.addInstallArtifact(consumer, .{}).step);
 
             // The gRPC suite (tests/capi/grpc.c): its own process, as one
