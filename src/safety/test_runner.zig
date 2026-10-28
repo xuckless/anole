@@ -6,9 +6,10 @@
 //! cancellation during it (C3); a test that runs past 110 s is named and
 //! every thread's backtrace is dumped before the build runner's
 //! `--test-timeout` kills it (`watchdog`, TESTING.md D2), so a hang says
-//! where it is; a test's log lines are printed only when it fails
-//! (`captured`); and a failed test names its error (the server-mode runner
-//! printed only the trace). The fuzzing loops keep `std.heap.page_allocator`
+//! where it is; a test's log lines are printed only when it fails or
+//! crashes (`captured`, flushed by the panic handler, `debug.handleSegfault`
+//! and a SIGABRT handler); and a failed test names its error (the
+//! server-mode runner printed only the trace). The fuzzing loops keep `std.heap.page_allocator`
 //! (an mprotect per bucket costs a fuzzer's throughput). Re-copy it when moving to the next
 //! Zig version and apply the change again (`ANOLE:` marks it).
 const builtin = @import("builtin");
@@ -35,11 +36,11 @@ fn swallowedCancels() u64 {
 
 /// ANOLE: runs a test, failing it when zio reported a swallowed cancellation.
 /// Its log lines are held back (`captured`) until the caller knows whether
-/// the test failed.
-fn runTest(test_fn: @TypeOf(builtin.test_functions[0]), index: usize) anyerror!void {
+/// the test failed. The caller arms `watchdog` around this and the test's
+/// teardown (the test Io's and allocator's deinit), which the build runner
+/// charges to the test too.
+fn runTest(test_fn: @TypeOf(builtin.test_functions[0])) anyerror!void {
     captured.begin();
-    watchdog.begin(index);
-    defer watchdog.end();
     const before = swallowedCancels();
     try test_fn.func();
     if (swallowedCancels() != before) return error.SwallowedCancel;
@@ -65,8 +66,27 @@ const watchdog = struct {
     const idle = std.math.maxInt(usize);
     const default_dump_after_ns: u64 = 110 * std.time.ns_per_s;
     const abort_after_ns: u64 = 300 * std.time.ns_per_s;
-    /// gdb or lldb gets this long, then SIGKILL (which detaches it).
-    const debugger_limit_ns: u64 = 60 * std.time.ns_per_s;
+    /// gdb, lldb or sample gets this long, then SIGKILL (which detaches
+    /// it). An attach stops every thread of this process, the watchdog's
+    /// own included, so the limit is enforced from another process:
+    /// coreutils' `timeout` on Linux, a /bin/sh supervisor on macOS
+    /// (`supervise`). The watchdog's own deadline, a little later, covers
+    /// a debugger that never attached.
+    const debugger_limit_s = 60;
+    const debugger_limit_arg = std.fmt.comptimePrint("{d}", .{debugger_limit_s});
+    const own_deadline_ns: u64 = (debugger_limit_s + 15) * std.time.ns_per_s;
+    /// `sh -c supervise sh LIMIT CMD...`: runs CMD and SIGKILLs it after
+    /// LIMIT seconds; exits with CMD's status (137 when killed). The timer's
+    /// subshell has no stdio, so a leftover `sleep` holds no pipe open.
+    const supervise =
+        \\limit=$1; shift
+        \\"$@" & p=$!
+        \\( sleep "$limit"; kill -9 "$p" ) </dev/null >/dev/null 2>&1 & w=$!
+        \\wait "$p"; s=$?
+        \\kill "$w" 2>/dev/null
+        \\exit "$s"
+    ;
+    const sh_supervise = [_][]const u8{ "/bin/sh", "-c", supervise, "sh", debugger_limit_arg };
     const can_dump = switch (builtin.os.tag) {
         .linux, .macos => true,
         else => false,
@@ -157,19 +177,21 @@ const watchdog = struct {
         const pid_s = std.fmt.bufPrint(&pid_buf, "{d}", .{pid}) catch unreachable;
         std.debug.print("all threads' backtraces (pid {d}):\n", .{pid});
         switch (builtin.os.tag) {
-            .linux => _ = runDebugger("gdb", &.{ "gdb", "-batch", "-nx", "-iex", "set debuginfod enabled off", "-p", pid_s, "-ex", "thread apply all bt" }),
+            .linux => _ = runDebugger("gdb", &.{ "timeout", "-s", "KILL", debugger_limit_arg, "gdb", "-batch", "-nx", "-iex", "set debuginfod enabled off", "-p", pid_s, "-ex", "thread apply all bt" }),
             .macos => {
                 // lldb needs the right to debug: an interactive session or
                 // Developer Mode, or root (GitHub's macOS runners have
                 // passwordless sudo). `sample`, which needs neither for a
                 // process of the same user, gives every thread's call graph
                 // when lldb cannot attach.
-                const lldb = [_][]const u8{ "lldb", "--batch", "-p", pid_s, "-o", "thread backtrace all" };
+                // Under sudo the supervisor runs as root too, so its
+                // SIGKILL reaches a root lldb.
+                const lldb = sh_supervise ++ [_][]const u8{ "lldb", "--batch", "-p", pid_s, "-o", "thread backtrace all" };
                 if (runDebugger("lldb", &lldb)) return endDump(name);
                 std.debug.print("hang dump: trying again with sudo -n\n", .{});
                 if (runDebugger("sudo -n lldb", &(.{ "sudo", "-n" } ++ lldb))) return endDump(name);
                 std.debug.print("hang dump: lldb could not attach; sampling every thread's stack for 1 s instead\n", .{});
-                _ = runDebugger("sample", &.{ "/usr/bin/sample", pid_s, "1", "-mayDie", "-file", "/dev/stderr" });
+                _ = runDebugger("sample", &(sh_supervise ++ [_][]const u8{ "/usr/bin/sample", pid_s, "1", "-mayDie", "-file", "/dev/stderr" }));
             },
             else => comptime unreachable,
         }
@@ -200,12 +222,21 @@ const watchdog = struct {
             return false;
         };
         const pid = child.id.?;
-        const deadline = now() + debugger_limit_ns;
+        const deadline = now() + own_deadline_ns;
         while (true) {
             if (reap(pid, false)) |status| {
                 if (exitedWith(status)) |code| {
                     if (code == 0) return true;
+                    // 137 = 128 + SIGKILL: the supervisor's `wait` status.
+                    if (code == 137 or code == 124) {
+                        std.debug.print("hang dump: {s} took more than {d} s and was killed\n", .{ what, debugger_limit_s });
+                        return false;
+                    }
                     std.debug.print("hang dump: {s} exited with status {d}\n", .{ what, code });
+                } else if (std.posix.W.IFSIGNALED(status) and (status & 0x7f) == 9) { // SIGKILL (Linux and macOS)
+                    // `timeout -s KILL` sends the signal to its process
+                    // group, itself included.
+                    std.debug.print("hang dump: {s} took more than {d} s and was killed\n", .{ what, debugger_limit_s });
                 } else {
                     std.debug.print("hang dump: {s} ended by a signal\n", .{what});
                 }
@@ -214,7 +245,7 @@ const watchdog = struct {
             if (now() >= deadline) {
                 std.posix.kill(pid, .KILL) catch {};
                 _ = reap(pid, true);
-                std.debug.print("hang dump: {s} took more than {d} s and was killed\n", .{ what, debugger_limit_ns / std.time.ns_per_s });
+                std.debug.print("hang dump: {s} took more than {d} s and was killed\n", .{ what, own_deadline_ns / std.time.ns_per_s });
                 return false;
             }
             Io.sleep(runner_threaded_io, .fromMilliseconds(100), .awake) catch {};
@@ -275,7 +306,11 @@ const watchdog = struct {
 /// or under "failed command:" at the end (ziglang/zig#31077, "working as
 /// designed: unit tests should avoid printing to stderr in success cases").
 /// A ring of the last 256 KiB; what `std.debug.print` and C code write
-/// goes straight to stderr as before. A panic prints the held lines first.
+/// goes straight to stderr as before. A panic prints the held lines first;
+/// so do a fatal signal (SIGSEGV, SIGBUS, SIGILL and SIGFPE through the root
+/// `debug.handleSegfault`, which zio's stack-fault handler chains to as
+/// well; SIGABRT through `onAbort`, for a C assert or `std.process.abort`)
+/// with `crashFlush`, before the default handling.
 const captured = struct {
     const size = 256 * 1024;
     var ring: [size]u8 = undefined;
@@ -353,18 +388,130 @@ const captured = struct {
         if (was_on) print(&copy, n, what);
     }
 
-    fn print(buf: *const [size]u8, n: usize, what: []const u8) void {
+    /// What `n` bytes written into `buf` leave to print, oldest first: when
+    /// the ring wrapped, from after the oldest whole line.
+    const Held = struct { dropped: usize, first: []const u8, second: []const u8 };
+
+    fn held(buf: *const [size]u8, n: usize) Held {
         @disableInstrumentation();
-        if (n == 0) return;
-        if (n <= size) {
-            std.debug.print("--- {s}:\n{s}--- end of {s}\n", .{ what, buf[0..n], what });
-            return;
-        }
-        // The ring wrapped: start after the oldest whole line.
+        if (n <= size) return .{ .dropped = 0, .first = buf[0..n], .second = "" };
         const pos = n % size;
         const old = buf[pos..];
         const skip = if (std.mem.findScalar(u8, old, '\n')) |nl| nl + 1 else old.len;
-        std.debug.print("--- {s} (the first {d} bytes dropped):\n{s}{s}--- end of {s}\n", .{ what, n - size + skip, old[skip..], buf[0..pos], what });
+        return .{ .dropped = n - size + skip, .first = old[skip..], .second = buf[0..pos] };
+    }
+
+    fn print(buf: *const [size]u8, n: usize, what: []const u8) void {
+        @disableInstrumentation();
+        if (n == 0) return;
+        const h = held(buf, n);
+        if (h.dropped == 0) {
+            std.debug.print("--- {s}:\n{s}{s}--- end of {s}\n", .{ what, h.first, h.second, what });
+        } else {
+            std.debug.print("--- {s} (the first {d} bytes dropped):\n{s}{s}--- end of {s}\n", .{ what, h.dropped, h.first, h.second, what });
+        }
+    }
+
+    /// Fatal signals reach `crashFlush` on these (`onAbort`, write(2)).
+    const can_flush_on_crash = switch (builtin.os.tag) {
+        .linux, .macos => true,
+        else => false,
+    };
+
+    /// At a fatal signal (`signal` names it): ends the capture and writes
+    /// what was held with write(2), which a signal handler may call
+    /// (std.debug.print takes stderr's lock, which the crashing thread may
+    /// hold). The lock is tried once, never waited for: the crash may be
+    /// inside `append` on this very thread. A second call (the segfault
+    /// handler ends in abort) finds the capture over and writes nothing.
+    fn crashFlush(signal: []const u8) void {
+        @disableInstrumentation();
+        if (comptime !can_flush_on_crash) return;
+        if (lock.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {
+            rawWrite("\n--- the test's held log lines are lost: a log line was being stored when it crashed\n");
+            return;
+        }
+        const was_on = on.load(.monotonic);
+        on.store(false, .release);
+        const n = total;
+        release();
+        // No writer touches the ring once `on` is false.
+        if (!was_on or n == 0) return;
+        const h = held(&ring, n);
+        var head: [160]u8 = undefined;
+        rawWrite(if (h.dropped == 0)
+            std.fmt.bufPrint(&head, "\n--- its log (held when it crashed: {s}):\n", .{signal}) catch "--- its log:\n"
+        else
+            std.fmt.bufPrint(&head, "\n--- its log (held when it crashed: {s}; the first {d} bytes dropped):\n", .{ signal, h.dropped }) catch "--- its log:\n");
+        rawWrite(h.first);
+        rawWrite(h.second);
+        rawWrite("--- end of its log\n");
+    }
+
+    /// write(2) to stderr until done or an error other than EINTR.
+    fn rawWrite(bytes: []const u8) void {
+        @disableInstrumentation();
+        var rest = bytes;
+        while (rest.len > 0) {
+            if (builtin.link_libc) {
+                const rc = std.c.write(std.posix.STDERR_FILENO, rest.ptr, rest.len);
+                if (rc < 0) {
+                    if (std.c.errno(rc) == .INTR) continue;
+                    return;
+                }
+                if (rc == 0) return;
+                rest = rest[@intCast(rc)..];
+            } else {
+                const rc = std.os.linux.write(std.posix.STDERR_FILENO, rest.ptr, rest.len);
+                switch (std.os.linux.errno(rc)) {
+                    .SUCCESS => {
+                        if (rc == 0) return;
+                        rest = rest[rc..];
+                    },
+                    .INTR => continue,
+                    else => return,
+                }
+            }
+        }
+    }
+
+    /// At runner start: SIGABRT flushes the held lines, then kills the
+    /// process as it would have (`onAbort`).
+    fn setup() void {
+        if (comptime !can_flush_on_crash) return;
+        const act: std.posix.Sigaction = .{
+            .handler = .{ .handler = onAbort },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.ONSTACK,
+        };
+        std.posix.sigaction(.ABRT, &act, null);
+    }
+
+    /// The held lines, then SIGABRT again with its default action (so the
+    /// process still dies of SIGABRT, with a core dump where enabled), as
+    /// CPython's faulthandler and Breakpad do after writing their report.
+    fn onAbort(_: std.posix.SIG) callconv(.c) void {
+        @disableInstrumentation();
+        crashFlush("SIGABRT");
+        const dfl: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(.ABRT, &dfl, null);
+        var set = std.posix.sigemptyset();
+        std.posix.sigaddset(&set, .ABRT);
+        std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &set, null);
+        std.posix.raise(.ABRT) catch {};
+    }
+};
+
+/// ANOLE: a fatal signal (SIGSEGV, SIGBUS, SIGILL, SIGFPE) prints the test's
+/// held log lines first, then Zig's default report (which ends in abort).
+pub const debug = struct {
+    pub fn handleSegfault(addr: ?usize, name: []const u8, opt_ctx: ?std.debug.CpuContextPtr) noreturn {
+        captured.crashFlush(name);
+        std.debug.defaultHandleSegfault(addr, name, opt_ctx);
     }
 };
 
@@ -437,6 +584,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
 
     watchdog.setup(init.environ); // ANOLE
+    captured.setup(); // ANOLE
 
     if (listen) {
         return mainServer(init) catch |err| panicf("internal test runner failure: {t}", .{err});
@@ -508,9 +656,12 @@ fn mainServer(init: std.process.Init.Minimal) !void {
 
                 // let the build server know we're starting the test now
                 try server.serveStringMessage(.test_started, &.{});
+                // ANOLE: from here to the results, as the build runner's
+                // per-test limit counts it.
+                watchdog.begin(index);
 
                 const TestResults = std.zig.Server.Message.TestResults;
-                const status: TestResults.Status = if (runTest(test_fn, index)) |v| s: { // ANOLE
+                const status: TestResults.Status = if (runTest(test_fn)) |v| s: { // ANOLE
                     v;
                     break :s .pass;
                 } else |err| switch (err) {
@@ -532,6 +683,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 // ANOLE: the build runner shows stderr for a leak or an
                 // error logged too; held lines go with it, else nowhere.
                 captured.end(leak_count != 0 or log_err_count != 0);
+                watchdog.end(); // ANOLE
                 try server.serveTestResults(.{
                     .index = index,
                     .flags = .{
@@ -658,9 +810,17 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             .argv0 = .init(init.args),
             .environ = init.environ,
         });
+        // ANOLE: the watchdog covers the teardown too, and the capture ends
+        // after it, so a leak shows the test's held lines (as in server
+        // mode).
+        watchdog.begin(i);
+        const errs_before = log_err_count;
         defer {
             testing.io_instance.deinit();
-            if (testing.allocator_instance.deinit() != 0) leaks += 1;
+            const leaked = testing.allocator_instance.deinit() != 0;
+            if (leaked) leaks += 1;
+            captured.end(leaked or log_err_count != errs_before);
+            watchdog.end();
         }
         testing.log_level = .warn;
         testing.environ = init.environ;
@@ -670,9 +830,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             std.debug.print("{d}/{d} {s}...", .{ i + 1, test_fn_list.len, test_fn.name });
         }
         is_fuzz_test = false;
-        const errs_before = log_err_count; // ANOLE
-        defer captured.end(log_err_count != errs_before); // ANOLE
-        if (runTest(test_fn, i)) |_| { // ANOLE
+        if (runTest(test_fn)) |_| { // ANOLE
             ok_count += 1;
             test_node.end();
             if (!have_tty) std.debug.print("OK\n", .{});

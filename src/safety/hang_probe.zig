@@ -4,7 +4,9 @@
 //! alone. With `ANOLE_TEST_DUMP_AFTER=5` and `--test-timeout 20s` the output
 //! shows the hung test by name, its log, every thread's backtrace (the main
 //! thread and a helper, both in `blockForever`), the build runner's timeout
-//! report, and then the next test passing in a new process. The hung test
+//! report; then the same for a test whose teardown hangs (the test Io's
+//! deinit waits for a task it left behind); and then the last test passing
+//! in a new process. The hung test
 //! ignores SIGTERM, as a hung server test holding zio's drain handler
 //! would: the runner must still die on the build runner's SIGTERM, or the
 //! build waits for the 300 s backstop.
@@ -33,6 +35,14 @@ test "hang probe: a test that never returns is named and dumped, then ended by -
     const helper = try std.Thread.spawn(.{}, helperThread, .{});
     helper.detach();
     blockForever();
+}
+
+test "hang probe: a hang in the test's teardown is dumped too" {
+    std.log.warn("hang probe: this teardown line shows in the dump too", .{});
+    // Returns at once, leaving a task that never ends: the runner's
+    // `testing.io_instance.deinit()` after the test waits for it forever,
+    // still inside the build runner's per-test limit.
+    _ = try std.testing.io.concurrent(blockForever, .{});
 }
 
 test "hang probe: the run goes on with the next test" {

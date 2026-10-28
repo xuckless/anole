@@ -372,8 +372,10 @@ Moving to the next minor version (0.18):
    that the build runner's `--test-timeout` still works the way the hang dump
    assumes (`lib/compiler/Maker/Step/Run.zig` in 0.17): at the limit it
    reports the child's stderr as it stands, SIGTERMs the child, waits for it
-   and goes on with the next test. Then run `zig build hang-probe
-   --test-timeout 20s` with `ANOLE_TEST_DUMP_AFTER=5` on Linux and macOS.
+   and goes on with the next test. Check that `std.debug.handleSegfault`
+   still defers to `root.debug.handleSegfault` (the crash flush). Then run
+   `zig build hang-probe --test-timeout 20s` with `ANOLE_TEST_DUMP_AFTER=5`
+   and `zig build crash-probe` on Linux and macOS.
 
 ## Cadence
 
