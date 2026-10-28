@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs anole.pg's tests (`zig build test-postgres`) against a throwaway
+# Runs the PostgreSQL tests (`zig build test-postgres`: anole.pg's and the
+# webhook store's, which make databases of their own) against a throwaway
 # PostgreSQL in Docker: once in plain text and once over TLS with
 # sslmode=verify-full, logging in with scram-sha-256 both times; then the C
 # ABI's suite (`zig build capi-test`) over TLS.

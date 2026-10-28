@@ -74,6 +74,61 @@ they are unless `secrets_key` (or `ANOLE_WEBHOOKS_KEY`, 32 bytes of base64) is
 set: then they are encrypted with XChaCha20-Poly1305. The HMAC needs the plain
 secret, so hashing is not an option.
 
+### Storage
+
+Endpoints, messages and the delivery log live in the jobs store's database
+(tables `<table_prefix>webhook_endpoints`, `_messages` and `_attempts`, made at
+start unless the jobs client has `migrate = false`), or in memory. `hooks.messages` pages by
+message id, newest first: pass the last id of a page as `before` for the next.
+Ids compare by bytes on every store (`msg_D` sorts below `msg_c`). Generated
+ids (`msg_` and a ULID) sort by time; your own `EventHead.id`s sort as text.
+
+On PostgreSQL the id columns are `COLLATE "C"`, whatever the database's
+collation. Tables made by 0.4.0 took the database's default collation (often
+`en_US.UTF-8` or ICU), which pages in a different order. The first start of
+0.4.1 or later finds that in `pg_attribute` and runs, once per table,
+
+```sql
+ALTER TABLE anole_webhook_messages ALTER COLUMN id TYPE text COLLATE "C";
+ALTER TABLE anole_webhook_attempts ALTER COLUMN message_id TYPE text COLLATE "C",
+                                   ALTER COLUMN endpoint_id TYPE text COLLATE "C";
+```
+
+The table is not rewritten, but its indexes are rebuilt under an `ACCESS
+EXCLUSIVE` lock, so publishing and listing wait until it is done. A database
+whose default collation is libc `C` or `POSIX` already orders by bytes; its
+columns are left as they are.
+
+The same start also builds one owner's listing index, if it is missing:
+
+```sql
+CREATE INDEX IF NOT EXISTS anole_webhook_messages_owner ON anole_webhook_messages (owner, id DESC);
+```
+
+A plain `CREATE INDEX` holds a `SHARE` lock on the messages table for the
+whole build, so publishing and pruning wait for it too. On a large table,
+pick the moment yourself: before upgrading, run the two `ALTER TABLE`
+statements above and
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS anole_webhook_messages_owner ON anole_webhook_messages (owner, id DESC);
+```
+
+(outside a transaction; it does not block writes). The start then finds the
+columns on `C` and the index in place and has nothing to build.
+
+The migration runs in one transaction under an advisory lock, so instances
+starting together take turns, and it has no time limit of its own (the
+client's `timeout` does not apply). Each table lock it needs is waited for
+at most 10 s (`lock_timeout`); when another session holds one longer, the
+start fails with a log line saying so, rather than queueing every publish
+behind the waiting migration. End that session's transaction
+(`pg_stat_activity` shows it) or run the statements above yourself, then
+start again. Every start reads the catalog for the collation check, and its
+`CREATE INDEX IF NOT EXISTS` statements take a brief `SHARE` lock on each
+table even when the index exists, so a start also waits for (at most
+`lock_timeout`) writes in progress.
+
 ## Receiving
 
 ```zig

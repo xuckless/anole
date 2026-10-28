@@ -90,6 +90,23 @@ breaking changes are listed anyway.
   that timed out, refuses `anole_db_tx_query`, `_exec`, `_commit` and
   `_rollback` with `ANOLE_E_GONE` at once, as documented. They were taken
   until the transaction's task had rolled it back.
+- Webhooks: on PostgreSQL, `hooks.messages` paged in the database's
+  collation order (en_US, ICU) instead of by bytes, so caller-supplied ids
+  such as `msg_D` and `msg_c` came back in a different order than on SQLite
+  and in memory. The message id and the attempts' `message_id` and
+  `endpoint_id` columns are now `COLLATE "C"`. Tables made by 0.4.0 are
+  changed once at the first start (an `ALTER TABLE` that rebuilds their
+  indexes under an exclusive lock), unless the database's default collation
+  is libc `C` or `POSIX`. One owner's listing has its own `(owner, id DESC)`
+  index, which that start builds with a plain `CREATE INDEX` (writes to the
+  messages table wait for it); to choose the moment, run the `ALTER TABLE`
+  statements and `CREATE INDEX CONCURRENTLY IF NOT EXISTS
+  anole_webhook_messages_owner ON anole_webhook_messages (owner, id DESC)`
+  before upgrading (see [webhooks](docs/webhooks.md#storage)). The
+  migration runs in one transaction under an advisory lock, so instances
+  starting together take turns; it has no time limit, and each table lock it
+  waits for is bounded by a 10 s `lock_timeout`, past which the start fails
+  with a log line saying what to do (#109).
 
 ### Changed
 
