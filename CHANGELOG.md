@@ -46,6 +46,10 @@ breaking changes are listed anyway.
   a store call (PostgreSQL, Redis, SQLite) took the cancel for a failed
   call: the round went on to its next store call through the teardown.
   The cancel now ends the task.
+- Jobs: while the heartbeat looked up a run it no longer held (a store
+  round trip), no job could start or finish on any executor: the lookup
+  ran under the lock every run's start and end takes. The lookups now run
+  with the lock released.
 - C ABI: a request (or gRPC call) is stale as soon as it is answered, as
   `anole.h` says ("until answered"): `anole_db_query`, `_exec`, `_begin` and
   the S3, SMTP, NATS and jobs calls given an answered request as `req`

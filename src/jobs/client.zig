@@ -1077,18 +1077,31 @@ pub const Client = struct {
             log.warn("jobs: heartbeat failed: {t}", .{e});
             return;
         };
-        self.held_mutex.lockUncancelable(self.io);
-        defer self.held_mutex.unlock(self.io);
+        // The runs no longer held. The store is asked why with the lock
+        // released (SAFETY.md L2, L3): every run's start and end takes it.
+        var lost: std.ArrayList(store.Held) = .empty;
         for (held) |h| {
             if (std.mem.indexOfScalar(Id, alive, h.id) != null) continue;
-            const b = self.held.get(h.id) orelse continue;
+            lost.append(a, h) catch return;
+        }
+        if (lost.items.len == 0) return;
+        const cancelled = a.alloc(bool, lost.items.len) catch return;
+        for (lost.items, cancelled) |h, *c| {
             const got = self.backend.vt.get(self.backend.ptr, a, h.id) catch |e| blk: {
                 try passCancel(e);
                 break :blk null;
             };
-            if (got) |row| {
-                if (row.state == .cancelled) b.job.admin_cancelled.store(true, .release);
-            }
+            c.* = if (got) |row| row.state == .cancelled else false;
+        }
+        // A run may have ended during the calls: each is looked up again by
+        // id and attempt (M3), never kept from before them.
+        self.held_mutex.lockUncancelable(self.io);
+        defer self.held_mutex.unlock(self.io);
+        for (lost.items, cancelled) |h, c| {
+            const b = self.held.get(h.id) orelse continue;
+            if (b.row.attempt != h.attempt) continue;
+            // Set before `lost`, which the run may see and return on.
+            if (c) b.job.admin_cancelled.store(true, .release);
             b.lost.store(true, .release);
             if (b.task) |t| placement.cancelTask(t);
         }
