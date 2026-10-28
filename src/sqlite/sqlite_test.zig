@@ -2,6 +2,7 @@
 //! std.Io.Threaded and on zio (pinned, with a blocking pool), and served by
 //! `anole.Server` through `app.sqlite`.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const anole_db = @import("../db/root.zig");
@@ -382,9 +383,9 @@ test "sqlite: a file on 4 pinned executors: reads beside an open write transacti
         defer tx.deinit();
         _ = try tx.exec(ctx, "INSERT INTO notes (title) VALUES ('in tx')", .{});
         try testing.expectEqual(@as(i64, 2), try tx.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
-        const started: std.Io.Clock.Timestamp = .now(io, .awake);
+        // A read that waited for the writer would wait for this task's own
+        // commit below: it would never return, not return late.
         try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
-        try testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
         try tx.commit(ctx);
     }
     try testing.expectEqual(@as(i64, 2), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
@@ -462,11 +463,11 @@ test "sqlite: coalesced and cached reads on 4 executors; invalidation after a wr
     defer group.cancel(io);
     for (0..32) |n| try dusty.placement.concurrent(&group, io, .{ .executor = n % 4 }, Worker.run, .{ db, io, &failures });
     // 7 of the 8 callers on each executor join its statement.
-    var waited: usize = 0;
-    while (db.cache.stats().coalesced < 28) : (waited += 1) {
-        if (waited == 1000) return error.TimedOut;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    try wait.waitUntil(io, "7 of the 8 callers on each executor joined its statement", db, struct {
+        fn f(d: *sqlite.Client) bool {
+            return d.cache.stats().coalesced >= 28;
+        }
+    }.f);
     for (holds[0..held]) |*h| h.deinit();
     held = 0;
     try group.await(io);
@@ -596,9 +597,8 @@ test "sqlite: a timeout or a cancel interrupts a long query within milliseconds,
     const Case = struct { db: *sqlite.Client, write: bool };
     for ([_]Case{ .{ .db = file_db, .write = false }, .{ .db = file_db, .write = true }, .{ .db = memory_db, .write = false } }) |case| {
         const q = case.db.with(.{ .timeout = .fromMilliseconds(50), .write = case.write });
-        const started: std.Io.Clock.Timestamp = .now(io, .awake);
+        // The statement never ends: GatewayTimeout is the timeout's doing.
         try testing.expectError(error.GatewayTimeout, q.one(i64, ctx, forever, .{}));
-        try testing.expect(started.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
         try testing.expectEqual(anole_db.Class.timeout, anole_db.lastError(ctx).?.class);
         // The connection serves the next query.
         try testing.expectEqual(@as(i64, 3), try case.db.with(.{ .write = case.write }).one(i64, ctx, "SELECT 1 + 2", .{}));
@@ -613,10 +613,12 @@ test "sqlite: a timeout or a cancel interrupts a long query within milliseconds,
             }
         };
         var long = try io.concurrent(Long.run, .{ case.db.with(.{ .write = case.write }), io });
+        // Time for the statement to start: a slow machine can only cancel
+        // it before it runs, which passes too (and misses the interrupt).
         try io.sleep(.fromMilliseconds(30), .awake);
-        const cancel_at: std.Io.Clock.Timestamp = .now(io, .awake);
+        // The statement never ends: the cancel returning at all is the
+        // interrupt's doing.
         try testing.expectError(error.Canceled, long.cancel(io));
-        try testing.expect(cancel_at.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
         try testing.expectEqual(@as(i64, 4), try case.db.with(.{ .write = case.write }).one(i64, ctx, "SELECT 2 + 2", .{}));
     }
     // A write canceled while waiting for the writer never runs.
@@ -632,6 +634,8 @@ test "sqlite: a timeout or a cancel interrupts a long query within milliseconds,
             }
         };
         var waiting = try io.concurrent(Write.run, .{ file_db, io });
+        // Time to queue for the writer (canceled sooner, it never runs
+        // either).
         try io.sleep(.fromMilliseconds(20), .awake);
         try testing.expectError(error.Canceled, waiting.cancel(io));
         try tx.commit(ctx);
