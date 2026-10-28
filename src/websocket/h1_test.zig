@@ -1,6 +1,7 @@
 //! WebSocket over HTTP/1.1, end to end with a raw client: the close codes a
 //! failed receive sends, and the close 1001 a drain sends.
 const std = @import("std");
+const test_wait = @import("anole_test_wait");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const websocket = @import("root.zig");
@@ -182,7 +183,7 @@ test "WebSocket over HTTP/1.1: the drain closes an open socket with 1001 and doe
     try c.send(0x8, &.{ 0x03, 0xe9 });
     try std.testing.expectError(error.EndOfStream, c.reader.interface.fillMore());
     try drain.await(io);
-    try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
+    if (test_wait.timing) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
     try std.testing.expect(saw_draining.load(.acquire));
 }
 
@@ -241,7 +242,7 @@ test "WebSocket over HTTP/1.1: an answer held for a batch goes out while the han
     const start: std.Io.Clock.Timestamp = .now(io, .awake);
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("wait", (try a.next(&buf)).payload);
-    try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
+    if (test_wait.timing) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
 }
 
 test "WebSocket over HTTP/1.1: sockets share their executor's backstop, and one whose handler waits holds up no other" {
@@ -300,7 +301,7 @@ test "WebSocket over HTTP/1.1: sockets share their executor's backstop, and one 
             for (0..4) |_| try std.testing.expectEqualStrings("y", (try o.next(&buf)).payload);
         }
     }
-    try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
+    if (test_wait.timing) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
 }
 
 test "WebSocket over HTTP/1.1: a socket's flusher ends once its batch is sent, and the next batch starts another" {

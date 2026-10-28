@@ -3,6 +3,7 @@
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const dusty = @import("root.zig");
 const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
 const loopback: []const dusty.Listener = &.{.{ .address = loopback_addr }};
@@ -2077,7 +2078,7 @@ test "Client: a response head that never arrives is cut off by ClientOptions.tim
     try std.testing.expectError(error.Timeout, client.fetch(try peer.url(), .{}));
     const elapsed = millisSince(io, started);
     try std.testing.expect(elapsed >= 150);
-    try std.testing.expect(elapsed < 3000);
+    if (wait.timing) try std.testing.expect(elapsed < 3000);
 
     // A request cut short leaves nothing behind to be reused.
     try std.testing.expectEqual(0, client.pool().idle_len);

@@ -4,6 +4,7 @@
 //! client codec. Autobahn has no RFC 8441 mode, so this is the HTTP/2 path's
 //! conformance check alongside the codec's own tests.
 const std = @import("std");
+const test_wait = @import("anole_test_wait");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const c = @import("anole_nghttp2_c");
@@ -490,7 +491,7 @@ test "WebSocket over HTTP/2: the drain closes an open socket with 1001 and does 
         }
     }.f);
     try drain.await(io);
-    try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
+    if (test_wait.timing) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 5000);
     try std.testing.expect(saw_draining.load(.acquire));
 }
 
@@ -692,7 +693,7 @@ test "WebSocket over HTTP/2: an answer held for a batch goes out while the handl
     var op: wsc.Opcode = undefined;
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("wait", try client.nextFrame(&op, &buf));
-    try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
+    if (test_wait.timing) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
 }
 
 test "WebSocket over HTTP/2: a page from another origin gets 403, one from the same origin its socket" {

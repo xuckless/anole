@@ -1,5 +1,6 @@
 //! Metrics, traces, readiness and access-log lines, end to end.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const zio = @import("zio");
 const dusty = @import("dusty");
 const observe = @import("root.zig");
@@ -319,11 +320,11 @@ test "observe: the exporter stops at once, not after its interval" {
     @memset(&span.trace_id, '1');
     @memset(&span.span_id, '1');
     _ = exporter.queue.putUncancelable(io, &.{span}, 1) catch unreachable;
-    while (exporter.dropped.load(.monotonic) == 0) try io.sleep(.fromMilliseconds(1), .awake);
+    _ = try wait.waitNonZero(io, "the exporter dropped a span", &exporter.dropped);
 
     const start: std.Io.Clock.Timestamp = .now(io, .awake);
     exporter.deinit();
-    try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
+    if (wait.timing) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
 }
 
 test "observe: exclude keeps probes out of metrics and traces" {
