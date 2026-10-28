@@ -42,6 +42,10 @@ breaking changes are listed anyway.
   finished but whose state could not be saved (they run again after their
   lease). docs/jobs.md gives the longest stop to plan the service manager's
   stop timeout around.
+- Jobs: stopping a client while its maintenance round or heartbeat was in
+  a store call (PostgreSQL, Redis, SQLite) took the cancel for a failed
+  call: the round went on to its next store call through the teardown.
+  The cancel now ends the task.
 - C ABI: a request (or gRPC call) is stale as soon as it is answered, as
   `anole.h` says ("until answered"): `anole_db_query`, `_exec`, `_begin` and
   the S3, SMTP, NATS and jobs calls given an answered request as `req`
