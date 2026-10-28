@@ -120,7 +120,7 @@ The lint enforces this against an allowlist.
 **E1. Debug-build checks** (Debug and test builds only, no cost in ReleaseFast):
 - executor ownership (T3);
 - a lock held across a suspension point (L2), which needs a held-lock counter per task (a small zio hook, offered upstream);
-- lock order (L4);
+- lock order (L4); a violation, and a wait for a lock while one is held (L2), names where the new lock is taken and where each held lock was taken (as lockdep and Abseil do);
 - the teardown state (M5);
 - poisoned freed memory in tests: an allocator that poisons and never reuses freed memory, so a use-after-free crashes at once instead of only under CI load;
 - the leak check (`std.testing.allocator`), as today.
