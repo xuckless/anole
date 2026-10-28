@@ -309,6 +309,7 @@ test "observe: the exporter stops at once, not after its interval" {
     try exporter.start();
     var span: observe.trace.Span = undefined;
     span.db = null;
+    span.job = null;
     span.name_len = 0;
     span.method_len = 0;
     span.route_len = 0;
@@ -468,6 +469,7 @@ test "trace: flush sends queued spans before it returns" {
     collected_len = 0;
     var span: observe.trace.Span = undefined;
     span.db = null;
+    span.job = null;
     span.name_len = 0;
     span.method_len = 0;
     span.route_len = 0;

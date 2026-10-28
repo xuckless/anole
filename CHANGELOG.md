@@ -17,6 +17,21 @@ breaking changes are listed anyway.
   object changed since that date answers 412 (RFC 9110 §13.2.2; a true
   If-Match still wins, as S3 orders them). `GetOptions` gains
   `if_unmodified_since` for `get`, `open` and `head`.
+- Jobs: a job enqueued from a request kept `traceparent` with the sampled
+  flag always set (`-01`), so a caller's unsampled context came back
+  sampled; the flags are now kept as they came, and the caller's
+  `tracestate` is kept beside it. Without the tracing middleware the
+  caller's `traceparent` header is kept as it came.
+- C ABI: `anole_jobs_enqueue` with `opts.req` ignored the request's trace
+  context; the jobs now carry its `traceparent` and `tracestate`.
+
+### Changed
+
+- Jobs: with `app.tracing()`, each run of a job is a CONSUMER span
+  `process <queue>`, linked (not parented) to the context it was enqueued
+  from, with OpenTelemetry's messaging attributes and `anole.job.kind`,
+  `attempt`, `max_attempts` and `outcome` (docs/jobs.md). Handlers see it
+  as `job.trace_id`/`job.span_id`, and jobs they enqueue carry it.
 
 ## 0.4.1 (2026-10-28)
 

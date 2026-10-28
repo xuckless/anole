@@ -151,7 +151,8 @@ pub const EnqueueOptions = struct {
     attempts: ?u16 = null,
     timeout: ?Duration = null,
     unique: ?Unique = null,
-    /// A JSON object kept with the job (`job.meta`); Anole adds `traceparent`, `cron`, `tick`.
+    /// A JSON object kept with the job (`job.meta`); Anole adds `traceparent`
+    /// (and `tracestate`), `cron`, `tick`.
     meta: ?[]const u8 = null,
 };
 
@@ -261,6 +262,11 @@ pub const Job = struct {
     interrupted_flag: ?*const std.atomic.Value(bool) = null,
     /// The run's time limit in ms, or null.
     timeout_ms: ?u32 = null,
+    /// The run's own span (`process <queue>`) when it is traced, as a
+    /// request's: what a job enqueued from it carries as `traceparent`.
+    /// Empty when the run is not traced.
+    trace_id: []const u8 = "",
+    span_id: []const u8 = "",
 
     pub const Outcome = struct {
         kind: enum { none, snooze, discard, retry_in } = .none,
@@ -306,9 +312,16 @@ pub const Job = struct {
     }
     /// The `traceparent` of the request (or job) that enqueued it, or null.
     pub fn traceparent(self: *const Job) ?[]const u8 {
+        return self.metaString("traceparent");
+    }
+    /// The `tracestate` kept beside `traceparent`, or null.
+    pub fn tracestate(self: *const Job) ?[]const u8 {
+        return self.metaString("tracestate");
+    }
+    fn metaString(self: *const Job, name: []const u8) ?[]const u8 {
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.arena, self.meta_json, .{}) catch return null;
         if (parsed != .object) return null;
-        const v = parsed.object.get("traceparent") orelse return null;
+        const v = parsed.object.get(name) orelse return null;
         return if (v == .string) v.string else null;
     }
     /// The cron schedule that made it, or null.
@@ -354,6 +367,7 @@ pub const testing = struct {
 test {
     _ = @import("conformance_test.zig");
     _ = @import("drain_test.zig");
+    _ = @import("trace_test.zig");
     _ = @import("unique.zig");
     _ = @import("../cron/root.zig");
 }

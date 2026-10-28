@@ -4,6 +4,7 @@
 //! points on the memory store. Waits poll the consumer with generous bounds;
 //! no assertion is about time.
 const std = @import("std");
+const dusty = @import("dusty");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
 const parity = @import("parity.zig");
@@ -116,11 +117,17 @@ const Rig = struct {
 
     /// `jobs_extra` is spliced into the "jobs" object after the store.
     fn create(r: *Rig, jobs_extra: []const u8) !void {
+        return r.createRouted(jobs_extra, "");
+    }
+
+    /// `create` with `routes` (the "routes" array's items).
+    fn createRouted(r: *Rig, jobs_extra: []const u8, routes: []const u8) !void {
         r.json = try std.fmt.allocPrint(alloc,
             \\{{"executors": 1, "timeouts": {{"shutdown_ms": 200}},
             \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
+            \\ "routes": [{s}],
             \\ "jobs": {{"store": "memory", "poll_ms": 100{s}}}}}
-        , .{jobs_extra});
+        , .{ routes, jobs_extra });
         errdefer alloc.free(r.json);
         var why_buf: [512]u8 = undefined;
         var why: Io.Writer = .fixed(&why_buf);
@@ -274,4 +281,51 @@ test "capi jobs: stopping a worker with nothing out ends it" {
     try std.testing.expectEqual(wh, r.ev.list.items[i].handle);
     // Over: a second stop is quiet.
     engine.jobs.stop(r.e, wh);
+}
+
+const HttpResult = struct { status: u16 = 0 };
+
+/// A GET carrying a trace context the server does not record (no tracing
+/// in the engine): `traceparent` unsampled, and a `tracestate`.
+fn fetchTraced(io: std.Io, url: []const u8, out: *HttpResult) anyerror!void {
+    var http = dusty.Client.init(alloc, io, .{});
+    defer http.deinit();
+    var keys: [2][]const u8 = undefined;
+    var values: [2][]const u8 = undefined;
+    var hashes: [2]u8 = undefined;
+    var h: dusty.Headers = .{ .keys = &keys, .values = &values, .hashes = &hashes };
+    try h.add("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00");
+    try h.add("tracestate", "congo=t61rcWkgMzE");
+    var resp = try http.fetch(url, .{ .headers = &h });
+    defer resp.deinit();
+    out.status = @intCast(@backingInt(resp.status()));
+}
+
+test "capi jobs: enqueue with opts.req carries the request's traceparent, flags kept, and its tracestate" {
+    if (comptime !features.jobs) return error.SkipZigTest;
+    // Workers only: the test thread polls the consumer.
+    const rt = try anole.zio.Runtime.init(alloc, .{ .executors = .exact(1), .enable_main_executor = false });
+    defer rt.deinit();
+    var r: Rig = undefined;
+    try r.createRouted(", \"kinds\": [{\"name\": \"t.work\"}]", "{\"path\": \"/x\", \"handler\": 1, \"timeout_ms\": 20000}");
+    defer r.deinit();
+    _ = try engine.jobs.work(r.e, r.c, .{ .size = @sizeOf(abi.JobsWorkOptions) }, 5);
+    try r.start();
+    const io = rt.io();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{r.e.port(0)});
+    var res: HttpResult = .{};
+    var f = try io.concurrent(fetchTraced, .{ io, url, &res });
+    const ri = try r.ev.waitFor(.request, 0, 10000);
+    const req = r.ev.list.items[ri].handle;
+    try engine.jobs.enqueue(r.e, r.c, &.{jobOut("t.work", "{}")}, .{ .size = @sizeOf(abi.JobsEnqueueOptions), .req = req }, 11);
+    const ji = try r.ev.waitFor(.job, 0, 10000);
+    const job = r.ev.as(abi.JobEvent, ji);
+    // Both answered before anything is checked, so a failure ends cleanly.
+    try engine.jobs.finish(r.e, r.ev.list.items[ji].handle, abi.JOB_DONE, 0, "");
+    try engine.respond(r.e, req, 200, &.{}, "ok", false);
+    try f.await(io);
+    try std.testing.expectEqual(@as(u16, 200), res.status);
+    try std.testing.expectEqualStrings("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00", r.ev.span(ji, job.traceparent));
+    try std.testing.expect(std.mem.indexOf(u8, r.ev.span(ji, job.meta), "\"tracestate\":\"congo=t61rcWkgMzE\"") != null);
 }
