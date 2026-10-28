@@ -60,6 +60,21 @@ pub const Peer = struct {
         peer.stream.close(peer.io);
     }
 
+    /// Whether `err`, from this peer's reads or writes (or a step built on
+    /// them), is the server task's cancellation. On `Io.Threaded` it comes
+    /// wrapped: `ReadFailed` or `WriteFailed`, with `error.Canceled` in the
+    /// reader's or writer's `err`. A server that serves client after client
+    /// returns on it: going back to `accept` would wait there for good, its
+    /// cancel spent, and the test's `cancel` with it (SAFETY.md C3).
+    pub fn canceled(peer: *const Peer, err: anyerror) bool {
+        return switch (err) {
+            error.Canceled => true,
+            error.ReadFailed => if (peer.reader.err) |e| e == error.Canceled else false,
+            error.WriteFailed => if (peer.writer.err) |e| e == error.Canceled else false,
+            else => false,
+        };
+    }
+
     /// Writes `bytes` at once.
     pub fn send(peer: *Peer, bytes: []const u8) !void {
         try peer.writer.interface.writeAll(bytes);
