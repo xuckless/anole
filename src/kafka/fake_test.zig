@@ -967,3 +967,26 @@ test "kafka: [stress] produce from four executors to two nodes with retries, tim
         if (k == .failed) try testing.expect(n <= 1) else try testing.expectEqual(@as(u32, 1), n);
     };
 }
+
+test "kafka: a broker connection's round trip canceled while it waits for the answer ends in Canceled" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    // A listener that never answers: the connect completes in its backlog.
+    const at: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var silent = try at.listen(io, .{});
+    defer silent.deinit(io);
+    var cache: @import("../net/scram.zig").Cache = .{};
+    const settings: kafka.cluster.Settings = .{ .client_id = "t", .scram_cache = &cache, .request_timeout = .fromSeconds(60) };
+    var hold: TestHold = .{ .point = .request_written };
+    hold.arm();
+    defer hold_mod.test_hold.store(null, .release);
+    // Conn.open asks ApiVersions: the request is written, then the open
+    // waits for an answer that never comes.
+    var future = try io.concurrent(kafka.cluster.Conn.open, .{ gpa, io, settings, "127.0.0.1", silent.socket.address.getPort(), -1 });
+    try wait.waitFlag(io, "the round trip's request is written", &hold.held);
+    hold.let(io);
+    const conn = future.cancel(io) catch |err| return testing.expectEqual(error.Canceled, err);
+    conn.close();
+    return error.TestUnexpectedResult;
+}

@@ -21,6 +21,9 @@ pub const TestPoint = enum {
     send_request,
     /// A sender, between taking the producer id and numbering its batches.
     ids_taken,
+    /// A broker connection's round trip, its request written, before the
+    /// answer is read.
+    request_written,
     /// Right after a consumer member task was spawned (the same yield as
     /// `sender_spawned`).
     member_spawned,

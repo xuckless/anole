@@ -10,6 +10,7 @@
 const std = @import("std");
 const dusty = @import("dusty");
 const safety = @import("anole_safety");
+const testHold = @import("test_hold.zig").testHold;
 const protocol = @import("protocol.zig");
 const sasl = @import("sasl.zig");
 const scram = @import("../net/scram.zig");
@@ -211,6 +212,7 @@ pub const Conn = struct {
         w.writeAll(e.bytesWritten()) catch return error.ConnectionLost;
         w.flush() catch return error.ConnectionLost;
         if (!want_reply) return "";
+        testHold(self.io, .request_written);
         const r = self.stream.reader();
         var len_buf: [4]u8 = undefined;
         r.readSliceAll(&len_buf) catch return error.ConnectionLost;
