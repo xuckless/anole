@@ -1379,6 +1379,10 @@ const RoomCancel = struct {
 test "capi engine: a poster canceled while it waits for ring room still delivers its record" {
     const e, const c = try ringEngine(2);
     defer e.destroy();
+    // The poster's uncancelable wait outlasts this test's own polling
+    // deadline: the claim must not depend on polling within 1 s (D6).
+    engine.test_cancel_post_wait_ns = wait.deadline().nanoseconds;
+    defer engine.test_cancel_post_wait_ns = null;
     var r: RoomCancel.Run = .{ .e = e };
     defer _ = r.finish() catch {};
     try r.start();

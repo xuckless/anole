@@ -742,7 +742,8 @@ pub const Exec = struct {
                 io.recancel();
                 const prot = io.swapCancelProtection(.blocked);
                 defer _ = io.swapCancelProtection(prot);
-                const until = std.Io.Clock.awake.now(io).nanoseconds + cancel_post_wait_ns;
+                const bound = if (comptime builtin.is_test) test_cancel_post_wait_ns orelse cancel_post_wait_ns else cancel_post_wait_ns;
+                const until = std.Io.Clock.awake.now(io).nanoseconds + bound;
                 while (!x.hasRoom(need)) x.waitRoom(need, until) catch |e| switch (e) {
                     error.Timeout => return freeRecord(rec.ptr),
                     error.Canceled => unreachable, // protection is blocked
@@ -3663,6 +3664,11 @@ pub var test_answer_hold: if (builtin.is_test) ?*TestPin else void = if (builtin
 /// ends the poster's wait for ring room, so a test knows the cancel landed
 /// while the poster was parked.
 pub var test_room_canceled: if (builtin.is_test) ?*const fn () void else void = if (builtin.is_test) null else {};
+
+/// A test hook (test builds only): replaces `cancel_post_wait_ns`, so a
+/// test whose consumer polls only after the cancel does not depend on
+/// polling within 1 s (TESTING.md D6).
+pub var test_cancel_post_wait_ns: if (builtin.is_test) ?i96 else void = if (builtin.is_test) null else {};
 
 fn testHold(p: *TestPin) void {
     p.held.store(true, .release);
