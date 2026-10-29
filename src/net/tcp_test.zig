@@ -742,3 +742,295 @@ test "net tcp: mutual TLS gives the handler the peer certificate" {
     try app.run();
     try checking.await(app.io());
 }
+
+/// The `*Conn` contract (docs/net.md §1): application threads use a
+/// connection under the application's own lock, and `close` takes it out
+/// under that lock.
+const LateSend = struct {
+    var lock: std.atomic.Mutex = .unlocked;
+    var conn: ?*net.Conn = null;
+    var io: std.Io = undefined;
+    var sends: std.atomic.Value(u32) = .init(0);
+    var reset_done: std.atomic.Value(bool) = .init(false);
+    var closed_after_reset: std.atomic.Value(u32) = .init(0);
+    var ok_after_reset: std.atomic.Value(u32) = .init(0);
+    var other: std.atomic.Value(u32) = .init(0);
+    var closed: std.atomic.Value(u32) = .init(0);
+
+    fn lockIt() void {
+        while (!lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn reset() void {
+        conn = null;
+        sends.store(0, .monotonic);
+        reset_done.store(false, .monotonic);
+        closed_after_reset.store(0, .monotonic);
+        ok_after_reset.store(0, .monotonic);
+        other.store(0, .monotonic);
+        closed.store(0, .monotonic);
+    }
+
+    pub fn open(c: *net.Conn) !void {
+        lockIt();
+        defer lock.unlock();
+        conn = c;
+    }
+    pub fn data(c: *net.Conn, _: []const u8) !void {
+        // Sends from the thread are under way (taken, queued) ...
+        try wait.waitAtLeast(io, "the thread sent", &sends, 1);
+        c.reset();
+        reset_done.store(true, .release);
+        // ... and go on after the reset, while the connection still lives.
+        try wait.waitAtLeast(io, "a send after the reset", &closed_after_reset, 1);
+    }
+    pub fn close(_: *net.Conn, _: net.CloseReason) void {
+        lockIt();
+        conn = null;
+        lock.unlock();
+        _ = closed.fetchAdd(1, .release);
+    }
+
+    /// Sends until the connection is gone from the table.
+    fn thread() void {
+        const payload: [4096]u8 = @splat('z');
+        while (true) {
+            lockIt();
+            const c = conn orelse {
+                lock.unlock();
+                if (closed.load(.acquire) > 0) return;
+                std.Thread.yield() catch {};
+                continue;
+            };
+            const after = reset_done.load(.acquire);
+            if (c.send(&payload)) |_| {
+                if (after) _ = ok_after_reset.fetchAdd(1, .release);
+            } else |err| switch (err) {
+                error.Closed => if (after) {
+                    _ = closed_after_reset.fetchAdd(1, .release);
+                },
+                error.QueueFull => {},
+                else => _ = other.fetchAdd(1, .release),
+            }
+            lock.unlock();
+            _ = sends.fetchAdd(1, .release);
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+test "net tcp: a send from another thread after close answers Closed and leaks nothing" {
+    LateSend.reset();
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    LateSend.io = app.io();
+    try app.tcp("127.0.0.1:0", LateSend, .{});
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            const th = try std.Thread.spawn(.{}, LateSend.thread, .{});
+            defer th.join();
+            try wait.waitUntil(a.io(), "the connection registered", {}, struct {
+                fn registered(_: void) bool {
+                    LateSend.lockIt();
+                    defer LateSend.lock.unlock();
+                    return LateSend.conn != null;
+                }
+            }.registered);
+            try s.writer().writeAll("x");
+            try s.writer().flush();
+            try waitFor(a.io(), &LateSend.closed, 1);
+        }
+    }.run);
+    // Taken before the reset: queued, then dropped and freed by it (the
+    // test allocator checks); after it: Closed, never taken.
+    try std.testing.expectEqual(@as(u32, 0), LateSend.ok_after_reset.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), LateSend.other.load(.acquire));
+    try std.testing.expect(LateSend.closed_after_reset.load(.acquire) >= 1);
+}
+
+/// `[stress]`: application threads sending to live connections while the
+/// handler ends, closes or resets them and clients vanish.
+const Storm = struct {
+    const conns = 500;
+    const wave = 50;
+    const threads = 8;
+    const Action = enum { end, close, reset, vanish };
+
+    const Entry = struct {
+        conn: ?*net.Conn = null,
+        /// Bytes taken by sends (ok or busy).
+        accepted: u64 = 0,
+        registered: std.atomic.Value(bool) = .init(false),
+        closed: std.atomic.Value(bool) = .init(false),
+        action: Action = .vanish,
+    };
+
+    var lock: std.atomic.Mutex = .unlocked;
+    var entries: [conns]Entry = undefined;
+    /// Live wave: entries [base, base + wave).
+    var base: std.atomic.Value(u32) = .init(0);
+    var stop: std.atomic.Value(bool) = .init(false);
+    var bad: std.atomic.Value(u32) = .init(0);
+    var mismatched: std.atomic.Value(u32) = .init(0);
+    var results: [5]std.atomic.Value(u64) = @splat(.init(0));
+    var seed: u64 = 0;
+
+    fn lockIt() void {
+        while (!lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn init(s: u64) void {
+        seed = s;
+        var prng: std.Random.DefaultPrng = .init(s);
+        for (&entries) |*e| e.* = .{ .action = prng.random().enumValue(Action) };
+        base.store(0, .monotonic);
+        stop.store(false, .monotonic);
+        bad.store(0, .monotonic);
+        mismatched.store(0, .monotonic);
+        for (&results) |*r| r.store(0, .monotonic);
+    }
+
+    pub const State = struct { idx: ?u32 = null };
+
+    pub fn message(conn: *net.Conn, line: []const u8) !void {
+        const st = conn.contextAs(State);
+        if (std.mem.startsWith(u8, line, "go ")) {
+            const i = try std.fmt.parseInt(u32, line[3..], 10);
+            st.idx = i;
+            lockIt();
+            entries[i].conn = conn;
+            lock.unlock();
+            entries[i].registered.store(true, .release);
+            return;
+        }
+        const i = st.idx orelse return;
+        switch (entries[i].action) {
+            .end => conn.end(),
+            .close => conn.close(),
+            .reset => conn.reset(),
+            .vanish => {},
+        }
+    }
+
+    pub fn close(conn: *net.Conn, _: net.CloseReason) void {
+        const i = conn.contextAs(State).idx orelse return;
+        lockIt();
+        entries[i].conn = null;
+        lock.unlock();
+        entries[i].closed.store(true, .release);
+    }
+
+    fn sender(k: u32) void {
+        var prng: std.Random.DefaultPrng = .init(seed +% 0x9e37 +% k);
+        const r = prng.random();
+        const payload: [64 * 1024]u8 = @splat('s');
+        while (!stop.load(.acquire)) {
+            const i = base.load(.acquire) + r.uintLessThan(u32, wave);
+            const n = 1 + r.uintLessThan(usize, payload.len);
+            lockIt();
+            if (entries[i].conn) |c| {
+                if (c.send(payload[0..n])) |sent| {
+                    entries[i].accepted += n;
+                    _ = results[@intFromBool(sent == .busy)].fetchAdd(1, .monotonic);
+                } else |err| switch (err) {
+                    error.QueueFull => _ = results[2].fetchAdd(1, .monotonic),
+                    error.Closed => _ = results[3].fetchAdd(1, .monotonic),
+                    error.Ended => _ = results[4].fetchAdd(1, .monotonic),
+                    else => _ = bad.fetchAdd(1, .monotonic),
+                }
+            }
+            lock.unlock();
+            std.Thread.yield() catch {};
+        }
+    }
+
+    /// One client: registers, lets the senders reach it, then acts.
+    fn client(a: *App, i: u32) std.Io.Cancelable!void {
+        clientRun(a, i) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {
+                std.debug.print("storm seed {d}: client {d}: {t}\n", .{ seed, i, err });
+                _ = bad.fetchAdd(1, .monotonic);
+            },
+        };
+    }
+
+    fn clientRun(a: *App, i: u32) !void {
+        const s = try connect(a, portOf(a));
+        defer s.close();
+        var line: [32]u8 = undefined;
+        try s.writer().writeAll(try std.fmt.bufPrint(&line, "go {d}\n", .{i}));
+        try s.writer().flush();
+        try wait.waitFlag(a.io(), "the connection registered", &entries[i].registered);
+        try wait.waitUntil(a.io(), "a send reached the connection", i, struct {
+            fn reached(idx: u32) bool {
+                lockIt();
+                defer lock.unlock();
+                return entries[idx].accepted > 0 or entries[idx].conn == null;
+            }
+        }.reached);
+        const action = entries[i].action;
+        if (action == .vanish) return;
+        try s.writer().writeAll("act\n");
+        try s.writer().flush();
+        var received: u64 = 0;
+        var buf: [16 * 1024]u8 = undefined;
+        while (true) {
+            const n = s.reader().readSliceShort(&buf) catch break;
+            if (n == 0) break;
+            received += n;
+        }
+        if (action == .reset) return;
+        // This side ends too, so the server's connection ends.
+        halfClose(s);
+        // Ended or closed: every byte a send took arrived before the EOF.
+        try wait.waitFlag(a.io(), "the connection closed", &entries[i].closed);
+        lockIt();
+        const accepted = entries[i].accepted;
+        lock.unlock();
+        if (accepted != received) {
+            std.debug.print("storm seed {d}: client {d} ({t}): {d} bytes taken, {d} received\n", .{ seed, i, action, accepted, received });
+            _ = mismatched.fetchAdd(1, .monotonic);
+        }
+    }
+};
+
+test "net tcp: [stress] sends from eight threads racing close, end and reset" {
+    try wait.requireStress();
+    Storm.init(0x5707_0001);
+    var app = try App.init(alloc, .{ .executors = .exact(2) });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", Storm, .{ .framing = .{ .lines = .{} }, .write_high_water = 16 * 1024, .write_max = 256 * 1024 });
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            var threads: [Storm.threads]std.Thread = undefined;
+            var started: usize = 0;
+            defer {
+                Storm.stop.store(true, .release);
+                for (threads[0..started]) |t| t.join();
+            }
+            for (&threads, 0..) |*t, k| {
+                t.* = try std.Thread.spawn(.{}, Storm.sender, .{@as(u32, @intCast(k))});
+                started += 1;
+            }
+            var w: u32 = 0;
+            while (w < Storm.conns) : (w += Storm.wave) {
+                Storm.base.store(w, .release);
+                var clients: std.Io.Group = .init;
+                defer clients.cancel(a.io());
+                for (w..w + Storm.wave) |i| try clients.concurrent(a.io(), Storm.client, .{ a, @as(u32, @intCast(i)) });
+                try clients.await(a.io());
+            }
+            try wait.waitUntil(a.io(), "every connection closed", a, struct {
+                fn none(server: *App) bool {
+                    return server.netStats().connections == 0;
+                }
+            }.none);
+            try std.testing.expectEqual(@as(u64, Storm.conns), a.netStats().connections_total);
+        }
+    }.run);
+    try std.testing.expectEqual(@as(u32, 0), Storm.bad.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), Storm.mismatched.load(.acquire));
+}

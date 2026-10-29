@@ -210,9 +210,7 @@ test "net udp: send from another thread" {
 }
 
 test "net udp: a send racing the stop is refused, not accepted and lost" {
-    // The test allocator, not `alloc`: the claim is the race with the stop
-    // (L5 under the queue's lock is the test above's).
-    var app = try App.init(std.testing.allocator, .{ .executors = .exact(1) });
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
     defer app.deinit();
     try app.udp("127.0.0.1:0", Pong, .{});
     var hold: udp_service.TestHold = .{};
@@ -321,4 +319,85 @@ test "net udp: a dual-stack listener answers an IPv4 peer (replies leave in mapp
             try expectDatagram(io, c, "queued");
         }
     }.run);
+}
+
+/// `[stress]`: application threads sending while the server stops.
+const StopStorm = struct {
+    const threads = 8;
+    var ok: std.atomic.Value(u64) = .init(0);
+    var full: std.atomic.Value(u64) = .init(0);
+    var closed: std.atomic.Value(u64) = .init(0);
+    var other: std.atomic.Value(u64) = .init(0);
+
+    fn reset() void {
+        ok.store(0, .monotonic);
+        full.store(0, .monotonic);
+        closed.store(0, .monotonic);
+        other.store(0, .monotonic);
+    }
+
+    /// Sends until the socket answers Closed (the stop).
+    fn sender(s: *net.UdpSocket, to: std.Io.net.IpAddress, seed: u64) void {
+        var prng: std.Random.DefaultPrng = .init(seed);
+        const payload: [1200]u8 = @splat('u');
+        while (true) {
+            const n = 1 + prng.random().uintLessThan(usize, payload.len);
+            if (s.send(to, null, payload[0..n])) |_| {
+                _ = ok.fetchAdd(1, .monotonic);
+            } else |err| switch (err) {
+                error.QueueFull => _ = full.fetchAdd(1, .monotonic),
+                error.Closed => {
+                    _ = closed.fetchAdd(1, .monotonic);
+                    return;
+                },
+                else => {
+                    _ = other.fetchAdd(1, .monotonic);
+                    return;
+                },
+            }
+        }
+    }
+
+    const Ctl = struct {
+        fn run(a: *App, seed: u64, th: *[threads]std.Thread, started: *usize, to: std.Io.net.IpAddress) !void {
+            defer a.stop();
+            try a.waitReady();
+            const sock = a.udpSocket("udp-0").?;
+            for (th, 0..) |*t, k| {
+                t.* = try std.Thread.spawn(.{}, sender, .{ sock, to, seed +% k });
+                started.* += 1;
+            }
+            // Under way: the stop lands among the sends.
+            try wait.waitAtLeast(a.io(), "sends taken", &ok, 2_000);
+        }
+    };
+};
+
+test "net udp: [stress] sends from eight threads racing the stop" {
+    try wait.requireStress();
+    for (0..20) |round| {
+        StopStorm.reset();
+        var app = try App.init(alloc, .{ .executors = .exact(2) });
+        defer app.deinit();
+        try app.udp("127.0.0.1:0", Counting, .{ .send_queue = 64 * 1024 });
+        const io = app.io();
+        const c = try client(io);
+        defer c.close(io);
+        var th: [StopStorm.threads]std.Thread = undefined;
+        var started: usize = 0;
+        defer for (th[0..started]) |t| t.join();
+        var ctl = try io.concurrent(StopStorm.Ctl.run, .{ &app, 0x0d90_0000 + round * 16, &th, &started, c.address });
+        defer ctl.cancel(io) catch {};
+        try app.run();
+        try ctl.await(io);
+        for (th[0..started]) |t| t.join();
+        started = 0;
+        // Every send was either taken and sent (counted out), refused as
+        // full (counted dropped) or refused as Closed; none taken and lost.
+        const st = app.netStats();
+        try std.testing.expectEqual(@as(u64, 0), StopStorm.other.load(.acquire));
+        try std.testing.expectEqual(@as(u64, StopStorm.threads), StopStorm.closed.load(.acquire));
+        try std.testing.expectEqual(StopStorm.ok.load(.acquire), st.datagrams_out);
+        try std.testing.expectEqual(StopStorm.full.load(.acquire), st.datagrams_dropped);
+    }
 }
