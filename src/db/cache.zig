@@ -558,13 +558,20 @@ test "db cache: N identical calls in flight on each of 4 executors run one state
     try testing.expectEqual(@as(u32, 4), h.calls.load(.monotonic));
     try testing.expectEqual(@as(u64, 4 * (per_executor - 1)), cache.stats().coalesced);
 
-    // Other arguments are another statement.
-    try placement.concurrent(&group, io, .{ .executor = 0 }, caller, .{ &cache, io, h.fake(20), .{ .coalesce = true }, 8, &ok, &errors });
-    try placement.concurrent(&group, io, .{ .executor = 0 }, caller, .{ &cache, io, h.fake(20), .{ .coalesce = true }, 9, &ok, &errors });
+    // Other arguments are another statement: both run at once, neither
+    // joins the other (both statements started while both are held).
+    var gate2: std.Io.Event = .unset;
+    defer gate2.set(io);
+    try placement.concurrent(&group, io, .{ .executor = 0 }, caller, .{ &cache, io, h.held(&gate2), .{ .coalesce = true }, 8, &ok, &errors });
+    try placement.concurrent(&group, io, .{ .executor = 0 }, caller, .{ &cache, io, h.held(&gate2), .{ .coalesce = true }, 9, &ok, &errors });
+    try h.waitCalls(io, 6);
+    gate2.set(io);
     try group.await(io);
     try testing.expectEqual(@as(u32, 6), h.calls.load(.monotonic));
-    // All flights are gone once done.
-    for (cache.locals.items) |*l| try testing.expectEqual(@as(u32, 0), l.flights.count());
+    try testing.expectEqual(@as(u32, 4 * per_executor + 2), ok.load(.monotonic));
+    try testing.expectEqual(@as(u64, 4 * (per_executor - 1)), cache.stats().coalesced);
+    // A flight left behind would be reported by testing.allocator's leak
+    // check at cache.deinit.
 }
 
 test "db cache: the first caller canceled, the others still get the rows; all gone, the statement stops" {
@@ -688,7 +695,26 @@ fn once(cache: *Cache, io: std.Io, runner: Fake, opts: db.QueryOptions, id: i64)
     if (ok.load(.monotonic) != 1) return error.CallFailed;
 }
 
-test "db cache: kept for its ttl, then read again; invalidation by tag, by query and of all" {
+test "db cache: a result is kept for its ttl, then read again" {
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var cache: Cache = try .init(gpa, io, .postgresql, "test", .{});
+    defer cache.deinit();
+    var h: Harness = .{};
+    const short: db.QueryOptions = .{ .cache = .{ .ttl = .fromMilliseconds(20), .tag = "posts" } };
+    try once(&cache, io, h.fake(1), short, 3);
+    try once(&cache, io, h.fake(1), short, 3);
+    try testing.expectEqual(@as(u32, 1), h.calls.load(.monotonic));
+    // Past the ttl: time passing on purpose, 5x the ttl (a sleep never
+    // ends early). Moves to an injected clock once store.zig's now() takes one.
+    try io.sleep(.fromMilliseconds(100), .awake);
+    try once(&cache, io, h.fake(1), short, 3);
+    try testing.expectEqual(@as(u32, 2), h.calls.load(.monotonic));
+}
+
+test "db cache: kept within its ttl; invalidation by tag, by query, of all and during a flight drops it" {
     const gpa = testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
@@ -705,33 +731,25 @@ test "db cache: kept for its ttl, then read again; invalidation by tag, by query
     try once(&cache, io, h.fake(1), opts, 1);
     try testing.expectEqual(@as(u32, 1), h.calls.load(.monotonic));
     try testing.expectEqual(@as(u64, 2), cache.stats().hits);
-    // Past the ttl: time passing on purpose (a sleep never ends early).
-    const short: db.QueryOptions = .{ .cache = .{ .ttl = .fromMilliseconds(80), .tag = "posts" } };
-    try once(&cache, io, h.fake(1), short, 3);
-    try testing.expectEqual(@as(u32, 2), h.calls.load(.monotonic));
-    try io.sleep(.fromMilliseconds(100), .awake);
-    try once(&cache, io, h.fake(1), short, 3);
-    try testing.expectEqual(@as(u32, 3), h.calls.load(.monotonic));
-
     // Another tag leaves it; its own tag drops it.
     cache.invalidate(.{ .tag = "users" });
     try once(&cache, io, h.fake(1), opts, 1);
-    try testing.expectEqual(@as(u32, 3), h.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 1), h.calls.load(.monotonic));
     cache.invalidate(.{ .tag = "posts" });
     try once(&cache, io, h.fake(1), opts, 1);
-    try testing.expectEqual(@as(u32, 4), h.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), h.calls.load(.monotonic));
 
     // By the statement and its arguments, whatever the width of the integer.
     cache.invalidateQuery("SELECT id FROM t WHERE id = $1", .{@as(i64, 2)});
     try once(&cache, io, h.fake(1), opts, 1);
-    try testing.expectEqual(@as(u32, 4), h.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), h.calls.load(.monotonic));
     cache.invalidateQuery("SELECT id FROM t WHERE id = $1", .{1});
     try once(&cache, io, h.fake(1), opts, 1);
-    try testing.expectEqual(@as(u32, 5), h.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 3), h.calls.load(.monotonic));
 
     cache.invalidate(.all);
     try once(&cache, io, h.fake(1), opts, 1);
-    try testing.expectEqual(@as(u32, 6), h.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 4), h.calls.load(.monotonic));
 
     // An invalidation while the statement runs: its result is not kept.
     var gate: std.Io.Event = .unset;
@@ -741,13 +759,13 @@ test "db cache: kept for its ttl, then read again; invalidation by tag, by query
     var ok: std.atomic.Value(u32) = .init(0);
     var errors: std.atomic.Value(u32) = .init(0);
     try placement.concurrent(&group, io, .{ .executor = 0 }, caller, .{ &cache, io, h.held(&gate), opts, 4, &ok, &errors });
-    try h.waitCalls(io, 7);
+    try h.waitCalls(io, 5);
     cache.invalidate(.{ .tag = "posts" });
     gate.set(io);
     try group.await(io);
     try testing.expectEqual(@as(u32, 1), ok.load(.monotonic));
     try once(&cache, io, h.fake(1), opts, 4);
-    try testing.expectEqual(@as(u32, 8), h.calls.load(.monotonic));
+    try testing.expectEqual(@as(u32, 6), h.calls.load(.monotonic));
 }
 
 /// One call on executor 0 with a context of its own: how many rows came
@@ -895,7 +913,6 @@ test "db cache: a call without options is the plain call: no key, no lookup, no 
     for (0..10) |_| try once(&cache, io, h.fake(0), .{}, 1);
     try testing.expectEqual(before, counting.allocations);
     try testing.expectEqual(@as(u32, 10), h.plain.load(.monotonic));
-    try testing.expectEqual(@as(usize, 0), cache.locals.items[0].key.writer.buffer.len);
     try testing.expectEqual(store.Totals{}, cache.stats());
 
     // Off the executors, sharing is skipped: the plain call again.

@@ -229,8 +229,9 @@ test "Readiness: one ping per ttl, the answer kept in between" {
     fake.up = false;
     try testing.expect(Readiness.check(&ready));
     try testing.expectEqual(@as(u32, 1), fake.pings);
-    // Then a 50 ms ttl, and time passes on purpose past it (a lower bound).
-    ready.ttl = .fromMilliseconds(50);
+    // Then a 10 ms ttl, and time passes on purpose past it, 6x the ttl
+    // (a lower bound). An injected clock replaces it if Readiness gets one.
+    ready.ttl = .fromMilliseconds(10);
     try testing.io.sleep(.fromMilliseconds(60), .awake);
     try testing.expect(!Readiness.check(&ready));
     try testing.expectEqual(@as(u32, 2), fake.pings);
