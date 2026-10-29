@@ -2558,6 +2558,11 @@ pub const TestHold = struct {
     }
 
     fn stay(h: *TestHold, io: std.Io) void {
+        // A hold stands for a point that can't be canceled (zio's spawn
+        // yield is `.no_cancel`), and the caller may be a task `release`
+        // cancels meanwhile (the flusher): the wait must not swallow it.
+        const prot = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(prot);
         h.held.store(true, .release);
         const start = std.Io.Clock.awake.now(io);
         const on_task = placement.currentExecutor(io) != null;
