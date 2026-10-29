@@ -13,8 +13,9 @@ out=$(mktemp -d)
 "$server_bin" 18080 18443 18081 18082 >"$out/server.log" 2>&1 &
 server=$!
 trap 'kill -INT "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true' EXIT
-# Every listener is bound by the time one accepts.
-wait_until 30 "examples/full to listen" port_open 127.0.0.1 18443 || { tail -n 40 "$out/server.log"; exit 1; }
+for p in 18080 18443 18081 18082; do
+  wait_until 30 "examples/full to listen on $p" port_open 127.0.0.1 $p || { tail -n 40 "$out/server.log"; exit 1; }
+done
 # h2spec's own per-case timeout (seconds), scaled as the waits are.
 case_timeout=$((3 * $(wait_factor)))
 
