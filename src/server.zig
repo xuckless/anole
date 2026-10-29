@@ -5271,3 +5271,32 @@ test "anole.Server: a .env file with a problem is InvalidEnvFile" {
         .executors = .exact(1),
     }, {}));
 }
+
+test "console: a connector type whose name contains \"pg\" is not reported as PostgreSQL" {
+    const Upgrade = struct {
+        fn start(_: *@This(), _: ?*observe.metrics.Registry, _: ?*observe.trace.Exporter, _: ?*observe.Health) anyerror!void {}
+        fn deinit(_: *@This()) void {}
+    };
+    var u: Upgrade = .{};
+    const c = Server(void).Connector.of(Upgrade, &u);
+    try std.testing.expectEqualStrings("connector", c.name);
+    try std.testing.expect(c.describe == null);
+}
+
+test "console: each database and service connector keeps its /db system name" {
+    const S = Server(void);
+    const Name = struct {
+        fn of(comptime T: type) []const u8 {
+            var v: T = undefined;
+            return S.Connector.of(T, &v).name;
+        }
+    };
+    if (features.postgres) try std.testing.expectEqualStrings("postgres", Name.of(pg_mod.Client));
+    if (features.sqlite) try std.testing.expectEqualStrings("sqlite", Name.of(sqlite_mod.Client));
+    if (features.mongodb) try std.testing.expectEqualStrings("mongodb", Name.of(mongodb_mod.Client));
+    if (features.redis) try std.testing.expectEqualStrings("redis", Name.of(redis_mod.Client));
+    if (features.nats) try std.testing.expectEqualStrings("nats", Name.of(nats_mod.Client));
+    if (features.kafka) try std.testing.expectEqualStrings("kafka", Name.of(kafka_mod.Client));
+    if (features.s3) try std.testing.expectEqualStrings("s3", Name.of(@import("s3/root.zig").Client));
+    if (features.smtp) try std.testing.expectEqualStrings("smtp", Name.of(@import("smtp/root.zig").Client));
+}
