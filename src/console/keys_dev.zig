@@ -108,9 +108,17 @@ fn main(self: *KeyReader) void {
     }
 }
 
-test "keys_dev: gating" {
+test "keys_dev: c + Enter is offered only in development on two terminals outside systemd, CI and containers; an explicit setting still needs the terminals" {
     const base: Gate = .{ .enabled = true, .development = true, .is_test = false, .stdin_tty = true, .stderr_tty = true, .term = "xterm-256color", .invocation_id = false, .journal_stream = false, .ci = false, .container = false };
-    if (!os.supported) return error.SkipZigTest;
+    if (!os.supported) {
+        // Windows: the console is not available yet (docs/console.md), so
+        // the hotkey is never offered, not even when set explicitly.
+        try std.testing.expect(!allowed(base));
+        var e = base;
+        e.explicit = true;
+        try std.testing.expect(!allowed(e));
+        return;
+    }
     try std.testing.expect(allowed(base));
     var g = base;
     g.development = false;
@@ -148,9 +156,10 @@ test "keys_dev: gating" {
     try std.testing.expect(!allowed(g));
 }
 
-test "keys_dev: lines" {
+test "keys_dev: `c` opens the console, `help` or `?` gives the hint, other lines are ignored" {
     try std.testing.expect(parseLine("c\n") == .open);
     try std.testing.expect(parseLine(" C ") == .open);
     try std.testing.expect(parseLine("help") == .hint);
+    try std.testing.expect(parseLine("?\n") == .hint);
     try std.testing.expect(parseLine("hello") == .ignore);
 }

@@ -91,7 +91,7 @@ const Fake = struct {
     }
 };
 
-test "supervisor: detection table" {
+test "supervisor: systemd, pm2, supervisord, containers and launchd are told apart by their variables and files" {
     var buf: [256]u8 = undefined;
     const T = std.testing;
     {
