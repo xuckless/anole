@@ -381,9 +381,10 @@ test "h2 engine: a peer's GOAWAY ends the connection with a FIN, and what it sen
     // frames) to the end of the stream; a reset fails the read. The
     // server shuts its side as the session ends, then lingers (reading and
     // dropping what comes) for up to linger_timeout, 1 s. A FIN held back
-    // until the linger is over is still a clean end, only late: only
-    // test-timing tells it apart, as it comes a full linger_timeout after
-    // the GOAWAY.
+    // until the linger is over fails here too, not only under test-timing:
+    // by the time it is read the server has closed, so the PING below
+    // draws a reset. test-timing also checks the FIN came well within the
+    // linger.
     var rbuf: [1024]u8 = undefined;
     var rd = socket.reader(io, &rbuf);
     _ = rd.interface.discardRemaining() catch return rd.err orelse error.Unexpected;

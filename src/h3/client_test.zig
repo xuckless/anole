@@ -91,12 +91,12 @@ fn slow(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = "too late";
 }
 
-/// An event every 50 ms for 300 ms: a stream that outlives a short
-/// request timeout (50 ms, a sixth of it).
+/// An event every 50 ms for 600 ms: a stream that outlives a short
+/// request timeout (100 ms, a sixth of it).
 fn ticks(req: *dusty.Request, res: *dusty.Response) !void {
     var buf: [256]u8 = undefined;
     var events = try res.startEventStream(&buf);
-    for (0..6) |_| {
+    for (0..12) |_| {
         try events.send("tick", .{});
         try req.io.sleep(.fromMilliseconds(50), .awake);
     }
@@ -596,8 +596,11 @@ test "h3 server: a no_wait response far past the ring completes" {
 
     // Written at once, far past the ring: the rest waits for the peer's
     // acknowledgments without the endpoint task waiting for them.
+    const inline_before = f.ep.stats.served_inline.load(.monotonic);
     const b = try get(conn, "/nw/big", gpa);
     defer gpa.free(b);
+    // It ran inline (it came whole with its head).
+    try std.testing.expect(f.ep.stats.served_inline.load(.monotonic) >= inline_before + 1);
     try std.testing.expectEqual(@as(usize, big_body_len), b.len);
     for (b, 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(i *% 13)), byte);
 }
@@ -612,9 +615,12 @@ test "h3 server: a no_wait handler that waits still answers" {
     const conn = try f.connect(gpa, io);
     defer conn.close();
 
+    const inline_before = f.ep.stats.served_inline.load(.monotonic);
     const b = try get(conn, "/nw/slow", gpa);
     defer gpa.free(b);
     try std.testing.expectEqualStrings("slow but whole", b);
+    // It ran inline, and its wait did not keep it from answering.
+    try std.testing.expect(f.ep.stats.served_inline.load(.monotonic) >= inline_before + 1);
 }
 
 test "h3 server: no_wait request bodies of 0 bytes to 2 MiB reach the handler whole" {
@@ -650,6 +656,7 @@ test "h3 server: HEAD on a no_wait route gets the status and no body" {
     const conn = try f.connect(gpa, io);
     defer conn.close();
 
+    const inline_before = f.ep.stats.served_inline.load(.monotonic);
     const s = try request(conn, "HEAD", "/nw/hello", .{});
     defer s.release();
     try s.waitHead();
@@ -657,6 +664,8 @@ test "h3 server: HEAD on a no_wait route gets the status and no body" {
     const none = try s.reader().allocRemaining(gpa, .unlimited);
     defer gpa.free(none);
     try std.testing.expectEqual(@as(usize, 0), none.len);
+    // It ran inline (it came whole with its head).
+    try std.testing.expect(f.ep.stats.served_inline.load(.monotonic) >= inline_before + 1);
 }
 
 test "h3 server: long-header packets with a connection ID over 20 bytes are dropped, and the endpoint carries on" {
@@ -928,14 +937,17 @@ test "h3 server: an event stream outlives timeouts.request" {
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     const io = rt.io();
-    // The stream runs 300 ms, six times the request timeout.
-    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{}, .timeout = .{ .request = .fromMilliseconds(50), .write = .fromSeconds(5) } }, .{});
+    // The stream runs 600 ms, six times the request timeout. The timer
+    // starts before the handler runs, so a handler late by under 100 ms in
+    // reaching its event stream (a loaded runner, a Debug build) still
+    // makes it.
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{}, .timeout = .{ .request = .fromMilliseconds(100), .write = .fromSeconds(5) } }, .{});
     defer f.stop(gpa, io);
     const conn = try f.connect(gpa, io);
     defer conn.close();
     const body = try get(conn, "/ticks", gpa);
     defer gpa.free(body);
-    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, body, "data: tick"));
+    try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, body, "data: tick"));
 }
 
 test "h3 server: mutual TLS in request mode, and the client certificate in handlers (PEM or files)" {
@@ -1635,9 +1647,15 @@ test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a repl
     // server takes the 0-RTT again (nothing in TLS stops it), runs the GET
     // and holds the POST for a handshake that never completes.
     try wait.waitUntil(io, "connectionsGone", f.ep, connectionsGone);
+    const held = f.ep.early_held.load(.monotonic);
     try relay.replay();
     // The replayed GET runs, from early data.
     try wait.waitEqual(io, "the replayed GET ran", &early_gets, gets + 2);
+    // The replayed POST reached the server and is held for the handshake
+    // (the endpoint's own count, as `openDownWhenEarly` reads it): without
+    // this the check below would also pass on a flight that never
+    // delivered the POST.
+    try wait.waitAtLeast(io, "the replayed POST is held", &f.ep.early_held, held + 1);
     // The POST never runs: its handshake never completes.
     const Unrun = struct {
         posts: u32,
@@ -2192,6 +2210,14 @@ test "h3: keep-alive is armed while a request is open and lets the connection id
         try wait.waitEvent(io, "the /wait handler started", &wait_started);
         // A request opened on an idle connection: the server arms its side.
         try std.testing.expect(f.ep.stats.keep_alive_arms.load(.monotonic) >= 1);
+        // Keep-alive is armed while the request is open: the connection
+        // outlives its 300 ms idle timeout twice over with nothing else
+        // sent (the handler waits 30 s).
+        try wait.expectStays(io, "the connection with a request open stays up past its idle timeout", conn, struct {
+            fn open(cn: *client.ClientConnection) bool {
+                return cn.isOpen();
+            }
+        }.open, .fromMilliseconds(600));
     }
     // The request is done: nothing keeps the connection alive any more,
     // and it closes at its idle timeout.
