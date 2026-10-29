@@ -13,6 +13,7 @@ const test_wait = @import("anole_test_wait");
 const nats = @import("../root.zig");
 const Client = nats.Client;
 const FakeServer = @import("FakeServer.zig");
+const probe = @import("probe.zig");
 const golden = @import("../protocol/golden.zig");
 const time = @import("../engine/time.zig");
 
@@ -160,7 +161,7 @@ test "start connects, shutdown drains, wait returns {}" {
     try server.await(io);
 }
 
-test "a drain that cannot finish: shutdown returns Timeout by deadline − r and the client is closed" {
+test "a drain that cannot finish: shutdown returns Timeout and the client is closed" {
     const io = testing.io;
     var listener = try FakeServer.listen(io);
     defer listener.deinit(io);
@@ -173,9 +174,12 @@ test "a drain that cannot finish: shutdown returns Timeout by deadline − r and
 
     const deadline = inMs(io, 600);
     try testing.expectError(error.Timeout, client.shutdown(io, deadline));
+    // Not before deadline − r (r = 250 ms): the drain gives up at its own
+    // deadline, never early; a slow machine only makes it later.
+    try testing.expect(msPast(io, deadline) >= -250 - 1);
     // By deadline − r; the close after the drain may take a while on a
-    // busy runner.
-    try testing.expect(msPast(io, deadline) <= -250 + 200);
+    // busy runner. An elapsed-time bound (D6): local timing runs only.
+    if (test_wait.timing()) try testing.expect(msPast(io, deadline) <= -250 + 200);
     try testing.expectEqual(.closed, client.state());
     try testing.expectEqual(.drain_failed, client.close_reason.?);
     // A drain that ran out of time is no failure of the client.
@@ -203,6 +207,36 @@ test "wait returns ConnectionLost when the server goes and reconnect is off" {
     try testing.expectError(error.ConnectionLost, try waiter.end());
     try testing.expectEqual(.closed, client.state());
     try testing.expectEqual(.connection_lost, client.close_reason.?);
+}
+
+/// For every client: a handshake, then a hang-up at once; until canceled.
+fn serveThenGoForever(io: Io, listener: *net.Server) !void {
+    while (true) {
+        var peer: FakeServer.Peer = undefined;
+        try peer.accept(io, listener);
+        defer peer.close();
+        handshake(&peer) catch |err| if (peer.canceled(err)) return error.Canceled else continue;
+    }
+}
+
+test "connect() returns {} when the first connection is made and lost before it looks (reconnect off) [stress]" {
+    // Regression test of e30d337: the server hangs up right after the
+    // handshake, and the manager may close the client (reconnect off)
+    // before connect() looks at the state; connect() then returned
+    // ConnectionClosed though the connection was made. A race, so a loop.
+    try test_wait.requireStress();
+    const io = testing.io;
+    var listener = try FakeServer.listen(io);
+    defer listener.deinit(io);
+    var server = try io.concurrent(serveThenGoForever, .{ io, &listener });
+    defer server.cancel(io) catch {};
+    var url: [64]u8 = undefined;
+    const servers: []const []const u8 = &.{try FakeServer.url(&listener, &url)};
+    for (0..500) |_| {
+        var client: Client = try .init(testing.allocator, io, .{ .servers = servers, .reconnect = .{ .enabled = false } });
+        defer client.deinit();
+        try client.start(io);
+    }
 }
 
 test "wait returns ReconnectFailed after max_attempts" {
@@ -249,7 +283,8 @@ test "a shutdown while the client reconnects closes it and returns {}" {
 
     const deadline = inMs(io, 5000);
     try client.shutdown(io, deadline);
-    try testing.expect(msPast(io, deadline) < -4000);
+    // At once, not at the deadline: an elapsed-time bound (D6).
+    if (test_wait.timing()) try testing.expect(msPast(io, deadline) < -4000);
     try testing.expectEqual(.closed, client.state());
     try testing.expectEqual(.closed, client.close_reason.?);
     try (try waiter.end());
@@ -268,7 +303,8 @@ test "a shutdown that loses the connection during the drain returns {}" {
 
     const deadline = inMs(io, 1000);
     try client.shutdown(io, deadline);
-    try testing.expect(msPast(io, deadline) <= -250);
+    // Before deadline − r: an elapsed-time bound (D6).
+    if (test_wait.timing()) try testing.expect(msPast(io, deadline) <= -250);
     try testing.expectEqual(.closed, client.state());
     try testing.expectEqual(.connection_lost, client.close_reason.?);
 }
@@ -285,22 +321,15 @@ test "canceling wait leaves the client running" {
     try client.start(io);
 
     var task = try io.concurrent(Client.wait, .{ &client, io });
+    // Canceled and awaited on every way out (SAFETY.md T1).
+    var task_done = false;
+    defer if (!task_done) task.cancel(io) catch {};
     // Once the task waits, its cancelation ends the wait.
-    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
-    while (waiting(&client) == 0) {
-        if (time.expired(io, give_up)) return error.TestNeverWaited;
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
+    try test_wait.waitUntil(io, "the wait() task waits for a change", &client, probe.stateWaitersAtLeastOne);
+    task_done = true;
     try testing.expectError(error.Canceled, task.cancel(io));
     try testing.expectEqual(.connected, client.state());
     try client.flush(.{ .timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } } });
     try client.shutdown(io, inMs(io, 5000));
     try server.await(io);
-}
-
-/// The tasks waiting for a change of the client's state.
-fn waiting(client: *Client) u32 {
-    client.mutex.lockUncancelable(client.io);
-    defer client.mutex.unlock(client.io);
-    return client.changed.waiters;
 }

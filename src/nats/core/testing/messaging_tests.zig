@@ -13,6 +13,7 @@ const test_wait = @import("anole_test_wait");
 const nats = @import("../root.zig");
 const Client = nats.Client;
 const FakeServer = @import("FakeServer.zig");
+const StallingIo = @import("StallingIo.zig");
 const golden = @import("../protocol/golden.zig");
 const time = @import("../engine/time.zig");
 
@@ -198,8 +199,7 @@ test "a line of 4096 argument bytes passes, one more is InvalidSubject" {
         "PING\r\n", r.transcript.items);
 }
 
-/// A handshake, then nothing is read until `release` is set: the client's
-/// writes back up in the socket.
+/// A handshake, then nothing is read until `release` is set.
 fn serveStalled(io: Io, listener: *net.Server, release: *Io.Event) !void {
     var peer: FakeServer.Peer = undefined;
     try peer.accept(io, listener);
@@ -225,36 +225,25 @@ fn elapsedSince(io: Io, start: Io.Timestamp) Io.Duration {
     return start.durationTo(Io.Clock.awake.now(io));
 }
 
-/// Publishes `payload` until a publish fails; counts the ones that went in.
-fn publishUntilError(client: *Client, payload: []const u8, published: *std.atomic.Value(u32)) Client.PublishError!void {
-    while (true) {
-        try client.publish("stalled", payload);
-        _ = published.fetchAdd(1, .monotonic);
-    }
+/// Publishes `payload` until a publish fails.
+fn publishUntilError(client: *Client, payload: []const u8) Client.PublishError!void {
+    while (true) try client.publish("stalled", payload);
 }
 
-/// Waits until a publish is stuck: it waits for room, and none went in for
-/// 200 ms. How much the sockets take first differs by system; 10 s at most.
-fn awaitStuck(client: *Client, published: *std.atomic.Value(u32)) !void {
-    const io = client.io;
-    const give_up = time.after(io, .fromSeconds(10 * @as(i64, test_wait.timeoutFactor())));
-    var last = published.load(.monotonic);
-    var still_since = Io.Clock.awake.now(io);
-    while (true) {
-        try io.sleep(.fromMilliseconds(10), .awake);
-        const now = published.load(.monotonic);
-        if (now != last or client.outbound.roomWaiters(io) == 0) {
-            last = now;
-            still_since = Io.Clock.awake.now(io);
-        } else if (elapsedSince(io, still_since).toMilliseconds() >= 200) {
-            return;
+/// Waits until a publish is stuck: the writer is blocked on its socket
+/// write (the stall) and a put waits for room behind it.
+fn awaitStuck(client: *Client) !void {
+    try test_wait.waitFlag(testing.io, "the client's socket write stalled", StallingIo.blocked());
+    try test_wait.waitUntil(testing.io, "a put waits for room", client, struct {
+        fn waits(c: *Client) bool {
+            return c.outbound.roomWaiters(testing.io) >= 1;
         }
-        if (time.expired(io, give_up)) return error.TestPublishNeverWaited;
-    }
+    }.waits);
 }
 
-/// A client whose server does not read: frames of 1 MiB back up in the
-/// sockets until a publish waits for room in the outbound queue.
+/// A client whose writer blocks on its first socket write after the
+/// handshake (StallingIo): with an outbound limit of 1 byte, the frame it
+/// writes fills the queue, and the next waits for room.
 const Stalled = struct {
     listener: net.Server,
     release: Io.Event = .unset,
@@ -262,7 +251,6 @@ const Stalled = struct {
     url: [64]u8 = undefined,
     client: Client,
     payload: []u8,
-    published: std.atomic.Value(u32) = .init(0),
 
     fn start(s: *Stalled) !void {
         const io = testing.io;
@@ -274,21 +262,28 @@ const Stalled = struct {
             s.release.set(io);
             s.server.cancel(io) catch {};
         }
-        s.client = try .init(testing.allocator, io, .{
+        s.client = try .init(testing.allocator, StallingIo.io(), .{
             .servers = &.{try FakeServer.url(&s.listener, &s.url)},
             .limits = .{ .outbound_bytes = 1 },
         });
         errdefer s.client.deinit();
         try s.client.connect();
-        s.payload = try testing.allocator.alloc(u8, 1024 * 1024);
+        s.payload = try testing.allocator.alloc(u8, 64);
         @memset(s.payload, 'b');
-        s.published = .init(0);
+        StallingIo.arm();
+    }
+
+    /// The writer's socket write goes on, and the server reads again.
+    fn unstall(s: *Stalled) void {
+        StallingIo.release();
+        s.release.set(testing.io);
     }
 
     fn deinit(s: *Stalled) void {
         const io = testing.io;
-        s.release.set(io);
+        s.unstall();
         s.client.deinit();
+        StallingIo.reset();
         s.server.cancel(io) catch {};
         s.listener.deinit(io);
         testing.allocator.free(s.payload);
@@ -304,9 +299,9 @@ test "a publish that waits for room in the outbound queue can be canceled" {
     var s: Stalled = undefined;
     try s.start();
     defer s.deinit();
-    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload, &s.published });
+    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload });
     defer publisher.cancel(io) catch {};
-    try awaitStuck(&s.client, &s.published);
+    try awaitStuck(&s.client);
     try testing.expectError(error.Canceled, publisher.cancel(io));
     try testing.expect(s.client.isConnected());
 }
@@ -316,9 +311,9 @@ test "close() while a publish waits for room: ConnectionClosed at once" {
     var s: Stalled = undefined;
     try s.start();
     defer s.deinit();
-    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload, &s.published });
+    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload });
     defer publisher.cancel(io) catch {};
-    try awaitStuck(&s.client, &s.published);
+    try awaitStuck(&s.client);
     const start = Io.Clock.awake.now(io);
     s.client.close();
     try testing.expectError(error.ConnectionClosed, publisher.await(io));
@@ -334,9 +329,9 @@ test "publishMessageTimeout gives up waiting for room at its timeout, and the cl
     var s: Stalled = undefined;
     try s.start();
     defer s.deinit();
-    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload, &s.published });
+    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload });
     defer publisher.cancel(io) catch {};
-    try awaitStuck(&s.client, &s.published);
+    try awaitStuck(&s.client);
     const out = s.client.stats().messages_out;
     const start = Io.Clock.awake.now(io);
     try testing.expectError(error.Timeout, s.client.publishMessageTimeout(.{ .subject = "stalled", .payload = "late" }, waitFor(.fromMilliseconds(100))));
@@ -358,9 +353,9 @@ test "publishMessageTimeout waiting for room can be canceled" {
     var s: Stalled = undefined;
     try s.start();
     defer s.deinit();
-    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload, &s.published });
+    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload });
     defer publisher.cancel(io) catch {};
-    try awaitStuck(&s.client, &s.published);
+    try awaitStuck(&s.client);
     var timed = try io.concurrent(publishWithin, .{ &s.client, waitFor(.fromSeconds(60)) });
     defer timed.cancel(io) catch {};
     try awaitRoomWaiters(&s.client, 2);
@@ -403,9 +398,9 @@ test "a subscribe waiting for room behind a publish: close() ends both, nothing 
     var s: Stalled = undefined;
     try s.start();
     defer s.deinit();
-    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload, &s.published });
+    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload });
     defer publisher.cancel(io) catch {};
-    try awaitStuck(&s.client, &s.published);
+    try awaitStuck(&s.client);
     var subscriber = try io.concurrent(subscribeOnce, .{&s.client});
     defer subscriber.cancel(io) catch {};
     try awaitRoomWaiters(&s.client, 2);
@@ -420,9 +415,9 @@ test "a subscribe waiting for room can be canceled, and is not registered" {
     var s: Stalled = undefined;
     try s.start();
     defer s.deinit();
-    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload, &s.published });
+    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload });
     defer publisher.cancel(io) catch {};
-    try awaitStuck(&s.client, &s.published);
+    try awaitStuck(&s.client);
     var subscriber = try io.concurrent(subscribeOnce, .{&s.client});
     defer subscriber.cancel(io) catch {};
     try awaitRoomWaiters(&s.client, 2);
@@ -436,9 +431,9 @@ test "a subscribe with a timeout gives up waiting for room at it, and is not reg
     var s: Stalled = undefined;
     try s.start();
     defer s.deinit();
-    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload, &s.published });
+    var publisher = try io.concurrent(publishUntilError, .{ &s.client, s.payload });
     defer publisher.cancel(io) catch {};
-    try awaitStuck(&s.client, &s.published);
+    try awaitStuck(&s.client);
     const start = Io.Clock.awake.now(io);
     try testing.expectError(error.Timeout, s.client.subscribe("late.sub", .{ .timeout = waitFor(.fromMilliseconds(100)) }));
     const took = elapsedSince(io, start);
@@ -1170,14 +1165,11 @@ test "publishNow past the outbound limit is Full at once: nothing queued, nobody
     var s: Stalled = undefined;
     try s.start();
     defer s.deinit();
-    // The server reads nothing: the sockets fill, then the queue. No
-    // timing is relied on; the loop ends at the first Full (bounded).
-    var attempts: u32 = 0;
-    const full = while (attempts < 100_000) : (attempts += 1) {
-        _ = s.client.publishNow(.{ .subject = "stalled", .payload = s.payload }) catch |err| break err;
-        try io.sleep(.fromMilliseconds(1), .awake);
-    } else return error.TestNeverFull;
-    try testing.expectEqual(error.Full, full);
+    // The writer takes the first frame and blocks on the socket (the
+    // stall): the frame fills the queue's 1 byte until it is written.
+    _ = try s.client.publishNow(.{ .subject = "stalled", .payload = s.payload });
+    try test_wait.waitFlag(io, "the client's socket write stalled", StallingIo.blocked());
+    try testing.expectError(error.Full, s.client.publishNow(.{ .subject = "stalled", .payload = s.payload }));
     try testing.expect(!s.client.writable());
     const out = s.client.stats().messages_out;
     try testing.expectError(error.Full, s.client.publishNow(.{ .subject = "stalled", .payload = "late" }));
@@ -1185,12 +1177,13 @@ test "publishNow past the outbound limit is Full at once: nothing queued, nobody
     try testing.expectEqual(@as(u32, 0), s.client.outbound.roomWaiters(io));
     try testing.expect(s.client.isConnected());
 
-    // The server reads again: room comes back, and the next publish is taken.
-    s.release.set(io);
+    // The write goes on: room comes back, and the next publish is taken
+    // (.busy: one frame is past half of the 1-byte limit, Outbound.tryPut).
+    s.unstall();
     try test_wait.waitUntil(io, "room in the outbound queue", &s, struct {
         fn room(st: *Stalled) bool {
             return st.client.writable();
         }
     }.room);
-    _ = try s.client.publishNow(.{ .subject = "stalled", .payload = "again" });
+    try testing.expectEqual(.busy, try s.client.publishNow(.{ .subject = "stalled", .payload = "again" }));
 }

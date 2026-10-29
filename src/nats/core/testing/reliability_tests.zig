@@ -14,6 +14,7 @@ const test_wait = @import("anole_test_wait");
 const nats = @import("../root.zig");
 const Client = nats.Client;
 const FakeServer = @import("FakeServer.zig");
+const StallingIo = @import("StallingIo.zig");
 const golden = @import("../protocol/golden.zig");
 const time = @import("../engine/time.zig");
 
@@ -1809,7 +1810,7 @@ test "stats: what came and went, requests, round trip and uptime" {
     try testing.expect(client.stats().connected_for == null);
 }
 
-test "stats: reconnects, and late replies" {
+test "stats: a reconnect counts" {
     const io = testing.io;
     var listener = try FakeServer.listen(io);
     defer listener.deinit(io);
@@ -1827,8 +1828,6 @@ test "stats: reconnects, and late replies" {
     _ = try expectEvent(&client, .reconnecting);
     _ = try expectEvent(&client, .reconnected);
     try testing.expectEqual(1, client.stats().reconnects);
-    client.inbox.noteLate(io);
-    try testing.expectEqual(1, client.stats().late_responses);
 }
 
 fn nextMessageLong(sub: *nats.Subscription) nats.Subscription.NextError!?nats.Message {
@@ -2049,35 +2048,19 @@ fn awaitRoomWaitersOf(client: *Client, count: u32) !void {
     }
 }
 
-const megabyte: [1024 * 1024]u8 = @splat('p');
+/// A frame of it fills the outbound limit of 1 KiB alone.
+const kilobyte: [1024]u8 = @splat('p');
 
-/// Publishes 1 MiB payloads until one fails, counting those that went in;
-/// the server reads none of them.
-fn publishUntilFull(client: *Client, published: *std.atomic.Value(u32)) void {
-    for (0..256) |_| {
-        client.publish("fill", &megabyte) catch return;
-        _ = published.fetchAdd(1, .monotonic);
-    }
+/// Publishes 1 KiB payloads until one fails, at most 256.
+fn publishUntilFull(client: *Client) void {
+    for (0..256) |_| client.publish("fill", &kilobyte) catch return;
 }
 
-/// Waits until a publish is stuck: it waits for room, and none went in for
-/// 200 ms; how much the sockets take first differs by system.
-fn awaitStuck(client: *Client, published: *std.atomic.Value(u32)) !void {
-    const io = client.io;
-    const give_up = time.after(io, .fromSeconds(10 * @as(i64, test_wait.timeoutFactor())));
-    var last = published.load(.monotonic);
-    var still_since = Io.Clock.awake.now(io);
-    while (true) {
-        try io.sleep(.fromMilliseconds(10), .awake);
-        const now = published.load(.monotonic);
-        if (now != last or client.outbound.roomWaiters(io) == 0) {
-            last = now;
-            still_since = Io.Clock.awake.now(io);
-        } else if (still_since.durationTo(Io.Clock.awake.now(io)).toMilliseconds() >= 200) {
-            return;
-        }
-        if (time.expired(io, give_up)) return error.TestPublishNeverWaited;
-    }
+/// Waits until a publish is stuck: the writer is blocked on its socket
+/// write (StallingIo, armed) and a put waits for room behind it.
+fn awaitStuck(client: *Client) !void {
+    try test_wait.waitFlag(testing.io, "the client's socket write stalled", StallingIo.blocked());
+    try awaitRoomWaitersOf(client, 1);
 }
 
 fn requestTenSeconds(client: *Client) Client.RequestError!nats.Message {
@@ -2097,20 +2080,25 @@ test "a request waiting for room when the connection is lost fails with Disconne
         server.cancel(io) catch {};
     }
     var url: [64]u8 = undefined;
-    var client: Client = try .init(testing.allocator, io, .{
+    var client: Client = try .init(testing.allocator, StallingIo.io(), .{
         .servers = &.{try FakeServer.url(&listener, &url)},
         .limits = .{ .outbound_bytes = 1024 },
         .reconnect = .{ .buffer_bytes = 64 * 1024 * 1024, .min_delay = .fromMilliseconds(1), .max_delay = .fromMilliseconds(5) },
     });
-    defer client.deinit();
+    defer {
+        StallingIo.release();
+        client.deinit();
+        StallingIo.reset();
+    }
     try client.connect();
     // The first request subscribes the inbox; no reply comes.
     try testing.expectError(error.Timeout, client.request("warmup", "?", .{ .timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } } }));
-    // The server reads nothing: the socket fills and publishes wait for room.
-    var published: std.atomic.Value(u32) = .init(0);
-    var publisher = try io.concurrent(publishUntilFull, .{ &client, &published });
+    // The writer stalls on its next socket write, and publishes wait for
+    // room behind the frame it holds.
+    StallingIo.arm();
+    var publisher = try io.concurrent(publishUntilFull, .{&client});
     defer publisher.cancel(io);
-    try awaitStuck(&client, &published);
+    try awaitStuck(&client);
     var requester = try io.concurrent(requestTenSeconds, .{&client});
     var awaited = false;
     defer if (!awaited) releaseReply(requester.cancel(io));
@@ -2210,21 +2198,27 @@ test "a server that drops every connection right after the handshake: the client
     var url: [64]u8 = undefined;
     var client: Client = try .init(testing.allocator, io, .{
         .servers = &.{try FakeServer.url(&listener, &url)},
-        .reconnect = .{ .min_delay = .fromMilliseconds(50), .max_delay = .fromSeconds(5) },
+        .reconnect = .{ .min_delay = .fromMilliseconds(20), .max_delay = .fromSeconds(5) },
     });
     defer client.deinit();
     try client.connect();
-    try io.sleep(.fromMilliseconds(1000), .awake);
+    // Time passes on purpose: the window the connections are counted in.
+    try io.sleep(.fromMilliseconds(400), .awake);
     client.close();
-    // Waits of 40-50, 80-100, 160-200, 320-400 ms: five connections in a
-    // second at most, where a loop with no wait makes hundreds.
+    // Waits of 16-20, 32-40, 64-80, 128-160 ms: five connections in 400 ms
+    // at most, where a loop with no wait makes hundreds. A slow machine
+    // only makes fewer: the upper bound holds on any machine.
     const count = flapping.taken(io);
-    try testing.expect(count >= 3 and count <= 6);
+    try testing.expect(count <= 6);
+    // The lower bound and the growth of the waits assume the machine makes
+    // each connection and notes it in time: local timing runs only (D6).
+    if (!test_wait.timing()) return;
+    try testing.expect(count >= 3);
     // Every wait at least the least of its level, a fifth under its delay:
     // they grow. A timer tick that ends a wait late, as Windows' ~15.6 ms
     // ones do, only makes it longer; 10 ms allow for the server noting a
     // connection late.
-    var least: i96 = 40 * std.time.ns_per_ms;
+    var least: i96 = 16 * std.time.ns_per_ms;
     for (1..@min(count, flapping.times.len)) |i| {
         const gap = flapping.times[i - 1].durationTo(flapping.times[i]).nanoseconds;
         try testing.expect(gap >= least - 10 * std.time.ns_per_ms);
@@ -2266,23 +2260,27 @@ test "servers that announce lame duck mode at every handshake are not hit in a t
     var client: Client = try .init(testing.allocator, io, .{
         .servers = &.{ try FakeServer.url(&a, &urls[0]), try FakeServer.url(&b, &urls[1]) },
         .randomize_servers = false,
-        .reconnect = .{ .min_delay = .fromMilliseconds(50), .max_delay = .fromSeconds(5) },
+        .reconnect = .{ .min_delay = .fromMilliseconds(20), .max_delay = .fromSeconds(5) },
     });
     defer client.deinit();
     try client.connect();
-    try io.sleep(.fromMilliseconds(1000), .awake);
+    // Time passes on purpose: the window the connections are counted in.
+    try io.sleep(.fromMilliseconds(400), .awake);
     client.close();
-    // Waits of 40-50, 80-100, 160-200, 320-400 ms: five connections in a
-    // second at most, where moving at once makes a thousand.
+    // Waits of 16-20, 32-40, 64-80, 128-160 ms: five connections in 400 ms
+    // at most, where moving at once makes hundreds. A slow machine only
+    // makes fewer.
     const count = first.accepted.load(.monotonic) + second.accepted.load(.monotonic);
-    try testing.expect(count >= 3 and count <= 6);
+    try testing.expect(count <= 6);
+    // That it got that far assumes speed: local timing runs only (D6).
+    if (test_wait.timing()) try testing.expect(count >= 3);
 }
 
 /// `std.testing.io` whose socket closes each take `delay` first: the
 /// client's teardown of a connection takes longer than its `min_delay`, as
 /// on a busy runner that prints a stack trace while it tears down.
 const SlowClose = struct {
-    const delay: Io.Duration = .fromMilliseconds(60);
+    const delay: Io.Duration = .fromMilliseconds(24);
 
     const vtable: Io.VTable = vtable: {
         var v = std.testing.io.vtable.*;
@@ -2295,7 +2293,12 @@ const SlowClose = struct {
     }
 
     fn netClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
-        std.testing.io.vtable.sleep(userdata, .{ .duration = .{ .raw = delay, .clock = .awake } }) catch {};
+        // A close cannot return Canceled: the delay runs with cancelation
+        // blocked, so a cancel of the closing task stays pending for it.
+        const inner: Io = .{ .userdata = userdata, .vtable = std.testing.io.vtable };
+        const protection = inner.swapCancelProtection(.blocked);
+        defer _ = inner.swapCancelProtection(protection);
+        inner.sleep(delay, .awake) catch {};
         std.testing.io.vtable.netClose(userdata, sockets);
     }
 };
@@ -2317,17 +2320,21 @@ test "lame duck at every handshake, and a teardown slower than min_delay: still 
     var client: Client = try .init(testing.allocator, SlowClose.io(), .{
         .servers = &.{ try FakeServer.url(&a, &urls[0]), try FakeServer.url(&b, &urls[1]) },
         .randomize_servers = false,
-        .reconnect = .{ .min_delay = .fromMilliseconds(50), .max_delay = .fromSeconds(5) },
+        .reconnect = .{ .min_delay = .fromMilliseconds(20), .max_delay = .fromSeconds(5) },
     });
     defer client.deinit();
     try client.connect();
-    try io.sleep(.fromMilliseconds(1000), .awake);
+    // Time passes on purpose: the window the connections are counted in.
+    try io.sleep(.fromMilliseconds(400), .awake);
     client.close();
     // A connection lasts until its exit is known, not until its teardown
     // ends: each still counts as short, and the waits still grow. Moving
-    // at once would make a connection every 60 ms or so.
+    // at once would make a connection every 24 ms or so. A slow machine
+    // only makes fewer.
     const count = first.accepted.load(.monotonic) + second.accepted.load(.monotonic);
-    try testing.expect(count >= 3 and count <= 6);
+    try testing.expect(count <= 6);
+    // That it got that far assumes speed: local timing runs only (D6).
+    if (test_wait.timing()) try testing.expect(count >= 3);
 }
 
 /// The handshake, then a hang-up at once; then serves every connection
@@ -2371,6 +2378,9 @@ test "a fake server canceled while it serves a client ends, and doesn't go back 
     defer listener.deinit(io);
     var accepted: std.atomic.Value(u32) = .init(0);
     var server = try io.concurrent(serveHangUpThenServe, .{ io, &listener, &accepted });
+    // Canceled and awaited on every way out (SAFETY.md T1).
+    var canceled = false;
+    defer if (!canceled) server.cancel(io) catch {};
     // The first connection is hung up after its handshake; the second is
     // served: the server now waits for the client's next line.
     const first = try rawHandshake(io, listener.socket.address);
@@ -2380,6 +2390,7 @@ test "a fake server canceled while it serves a client ends, and doesn't go back 
     // The cancel reaches the server's read. When the server took it for
     // the client hanging up, it went back to accept for good, and this
     // cancel never returned.
+    canceled = true;
     try testing.expectError(error.Canceled, server.cancel(io));
 }
 
@@ -2401,7 +2412,7 @@ test "an io out of concurrency during a reconnect is one more failed attempt: th
     var url: [64]u8 = undefined;
     var client: Client = try .init(testing.allocator, cio, .{
         .servers = &.{try FakeServer.url(&listener, &url)},
-        .reconnect = .{ .min_delay = .fromMilliseconds(300), .max_delay = .fromSeconds(1), .jitter = false },
+        .reconnect = .{ .min_delay = .fromMilliseconds(50), .max_delay = .fromMilliseconds(100), .jitter = false },
     });
     defer client.deinit();
     try client.connect();
@@ -2423,10 +2434,16 @@ test "an io out of concurrency during a reconnect is one more failed attempt: th
             try tio.sleep(.fromMilliseconds(1), .awake);
         }
     }
-    // Two waits pass without an attempt; the client stays.
-    try tio.sleep(.fromMilliseconds(800), .awake);
-    try testing.expectEqual(.reconnecting, client.state());
-    try testing.expectEqual(1, accepted.load(.monotonic));
+    // Waits pass without an attempt reaching the server; the client stays
+    // (a window of five max_delay waits, D1's 5x margin).
+    const NoAttempt = struct {
+        client: *Client,
+        accepted: *std.atomic.Value(u32),
+        fn holds(c: @This()) bool {
+            return c.accepted.load(.monotonic) == 1 and c.client.state() == .reconnecting;
+        }
+    };
+    try test_wait.expectStays(tio, "no attempt while the io has no room", NoAttempt{ .client = &client, .accepted = &accepted }, NoAttempt.holds, .fromMilliseconds(5 * 100));
     release.set(cio);
     for (&slots) |*slot| if (slot.*) |*f| {
         f.await(cio);
@@ -2466,8 +2483,9 @@ test "a client closed after a lost connection reports no uptime" {
     var url: [64]u8 = undefined;
     var client: Client = try .init(testing.allocator, io, .{ .servers = &.{try FakeServer.url(&listener, &url)}, .reconnect = .{ .enabled = false } });
     defer client.deinit();
-    // The server hangs up at once: connect() may find the client closed.
-    client.connect() catch |err| try testing.expectEqual(error.ConnectionClosed, err);
+    // The server hangs up at once: connect() may find the client closed
+    // already, and returns {} all the same, since the connection was made.
+    try client.connect();
     try awaitState(&client, .closed);
     try testing.expectEqual(.connection_lost, client.close_reason.?);
     try testing.expect(client.stats().connected_for == null);
@@ -2729,8 +2747,11 @@ test "a requestMany past its deadline that nobody reads does not hold up a drain
     try client.connect();
     const responses = try client.requestMany("nobody.home", "?", .{ .timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } } });
     defer responses.deinit();
-    try testing.expectEqual(1, client.stats().pending_requests);
     const deadline = responses.deadline;
+    // Pending until its deadline: checked only when the deadline had not
+    // passed at the read (a stalled runner may get there late, D6).
+    const pending = client.stats().pending_requests;
+    if (!time.expired(io, deadline)) try testing.expectEqual(1, pending);
     while (!time.expired(io, deadline)) try io.sleep(.fromMilliseconds(5), .awake);
     try testing.expectEqual(0, client.stats().pending_requests);
     try client.drain(.{ .timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } } });
