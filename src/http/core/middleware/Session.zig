@@ -16,6 +16,7 @@ const std = @import("std");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 const SessionCookieOpts = @import("../cookie.zig").SessionCookieOpts;
+const expect_log = @import("../expect_log.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const base64url = std.base64.url_safe_no_pad;
@@ -134,7 +135,7 @@ const Session = @This();
 /// the cookie.
 pub fn init(config: Options) error{ WeakSessionKey, CookiePrefixMismatch }!Session {
     if (!strongKey(config.secret_key)) {
-        log.err("session: secret_key must be at least 32 random bytes from your secret store, not shorter and not all zeros", .{});
+        if (!expect_log.swallow()) log.err("session: secret_key must be at least 32 random bytes from your secret store, not shorter and not all zeros", .{});
         return error.WeakSessionKey;
     }
     config.cookie_opts.checkPrefix(config.cookie_name) catch |err| {
