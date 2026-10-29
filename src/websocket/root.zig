@@ -69,6 +69,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const placement = dusty.placement;
 const features = @import("build_options");
 const codec = @import("anole_websocket_codec").server;
@@ -1220,7 +1221,8 @@ const UpgradedWindow = struct {
 const read_block_len = 16 * 1024 + 512;
 
 /// The blocks `ReadWindow` reads into, kept per thread for reuse, and
-/// beyond `cap` given back to malloc. None of the HTTP core's pools fits:
+/// beyond `cap` given back to `safety.process_gpa` (`smp_allocator` in
+/// release builds; never reused in tests). None of the HTTP core's pools fits:
 /// its write buffers are `response.write_buffer_size` long (configurable,
 /// 16384 by default: no room for a frame's tail ahead of a whole record),
 /// `block_cache` serves 64 KiB and more, and the TLS module's ciphertext
@@ -1243,7 +1245,7 @@ const read_blocks = struct {
         const b: []u8 = if (free_len > 0) blk: {
             free_len -= 1;
             break :blk free[free_len][0..read_block_len];
-        } else std.heap.c_allocator.alloc(u8, read_block_len) catch return null;
+        } else safety.process_gpa.alloc(u8, read_block_len) catch return null;
         _ = held.fetchAdd(1, .monotonic);
         return b;
     }
@@ -1251,15 +1253,15 @@ const read_blocks = struct {
     fn give(b: []u8) void {
         std.debug.assert(b.len == read_block_len);
         _ = held.fetchSub(1, .monotonic);
-        // SAFETY.md M6: poisoned in Debug, so a reader left pointing at a
-        // returned block reads garbage at once rather than old frames.
-        if (builtin.mode == .debug) @memset(b, undefined);
+        // SAFETY.md M6: poisoned in Debug and test builds, so a reader left
+        // pointing at a returned block reads 0xDD rather than old frames.
+        safety.poison(b);
         if (free_len < cap) {
             free[free_len] = b.ptr;
             free_len += 1;
             return;
         }
-        std.heap.c_allocator.free(b);
+        safety.process_gpa.free(b);
     }
 };
 

@@ -276,6 +276,26 @@ breaking changes are listed anyway.
   10 minutes. With neither, the interop steps are skipped with a warning
   that names the outage, instead of failing as if a test had (Ubuntu's own
   tshark is too old for the runner); the release checks still fail (#54).
+- `zig build lint` (SAFETY.md E2) checks the sources against a ratchet
+  baseline, `tools/safety_lint.baseline.tsv`: a per file and rule count of
+  today's hits that may only go down. `-Dlint-update` lowers it; a new CI
+  job runs the check. The lint now parses with `std.zig.Ast` and adds two
+  rules: raw locks outside `src/safety/` (L2/L4) and runtime wakes in the C
+  ABI outside an `IoGate` (T5).
+- Debug builds: a request's arena is freed after each request (HTTP/1.1,
+  HTTP/2, HTTP/3) and the memory it and the request buffer pools give back
+  is filled with 0xDD, so a slice kept past its request (SAFETY.md M4)
+  reads 0xDD or faults instead of the old request's bytes. Release builds
+  keep the arena's memory for the next request, as before.
+- Debug builds: a task that suspends while it holds one of Anole's ranked
+  locks panics naming where each held lock was taken, as the lock-order
+  reports do (zio's own panic gave only the count).
+- C ABI, Debug builds: libanole allocates through std's `SafeAllocator`
+  instead of `DebugAllocator` (deprecated in Zig 0.17); leaks left when
+  the server stops are still logged with where they were made.
+- Tests: the test allocator never reuses freed memory on macOS too, and
+  test binaries built with `-Doptimize=ReleaseSafe` check a lock held
+  across a suspension and swallowed cancellations, as Debug ones do.
 
 ## 0.4.0 (2026-10-25)
 

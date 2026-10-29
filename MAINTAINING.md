@@ -188,6 +188,14 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   fork's suite with `--diagnostics` too (`./check.sh --diagnostics` and
   `./check.sh --scheduling pinned --diagnostics`). Fork only, not offered
   upstream (user, 2026-10-28).
+  The branch also carries SAFETY.md's zio checks, fork only as well:
+  `debug_held_locks` (a task that suspends while `zio.held_locks` counts a
+  lock panics; `held_locks.report`, a function pointer src/safety/lock.zig
+  sets, names where each held lock was taken before the panic) and
+  `debug_cancel` with its report count (the test runner fails a test on
+  it). Re-apply them on every upstream merge, and run the suite once with
+  both on (check.sh has no switch for them: `zig build test
+  -Dscheduling=pinned -Ddebug_held_locks=true -Ddebug_cancel=true`).
   Anole requires the fork's declarations and fails to compile without them
   (src/http/core/placement.zig, top): `Placement`, `Group` (with
   `spawnInto`), `AutoCancel` (with its `task` field), `currentTask`, `Event`,

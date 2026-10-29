@@ -30,6 +30,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const placement = @import("../placement.zig");
+const safety = @import("anole_safety");
 
 /// A set is aligned to this, so that its first page is the first 4 KiB of
 /// it (or more of it, with bigger pages).
@@ -79,12 +80,24 @@ pub const RequestBuffers = struct {
     /// Empties the arena for the next request, keeping only its first
     /// chunk: the second goes back to the set, and what the arena took
     /// beyond it to `pool.allocator`, so a big request does not leave the
-    /// set bigger for the ordinary ones after it.
+    /// set bigger for the ordinary ones after it. In Debug and test builds
+    /// the first chunk goes back too, poisoned (`safety.resetArena`), so a
+    /// slice kept past its request reads 0xDD rather than its old bytes
+    /// (SAFETY.md M4, M6).
     pub fn resetArena(self: *RequestBuffers) void {
-        _ = self.arena.reset(if (self.first_chunk.len > arena_node_headroom)
+        _ = safety.resetArena(&self.arena, self.retainMode());
+    }
+
+    /// `resetArena` as release builds do it, keeping the first chunk.
+    fn resetArenaRetaining(self: *RequestBuffers) void {
+        _ = self.arena.reset(self.retainMode());
+    }
+
+    fn retainMode(self: *const RequestBuffers) std.heap.ArenaAllocator.ResetMode {
+        return if (self.first_chunk.len > arena_node_headroom)
             .{ .retain_with_limit = self.first_chunk.len - arena_node_headroom }
         else
-            .retain_capacity);
+            .retain_capacity;
     }
 
     /// The arena's allocator: the set's two chunks first, as the arena's
@@ -134,6 +147,7 @@ pub const RequestBuffers = struct {
         const self: *RequestBuffers = @ptrCast(@alignCast(ctx));
         if (self.chunkOf(memory)) |chunk| {
             if (chunk.ptr == self.first_chunk.ptr) self.first_taken = false else self.second_taken = false;
+            safety.poison(chunk);
             return;
         }
         if (self.releasing) releasePages(memory);
@@ -325,6 +339,7 @@ pub const RequestBuffersPool = struct {
     /// Gives a set back to the shard it was taken from, its arena reset.
     pub fn release(self: *RequestBuffersPool, buffers: *RequestBuffers) void {
         buffers.resetArena();
+        safety.poison(buffers.read_buffer);
         if (self.local()) |list| {
             list.free.push(buffers);
             return;
@@ -359,6 +374,7 @@ pub const RequestBuffersPool = struct {
 
     /// As `release` gives back a set.
     pub fn giveWriteBuffer(self: *RequestBuffersPool, w: *WriteBuffer) void {
+        safety.poison(self.writeBytes(w));
         if (self.local()) |list| {
             list.writes.push(w);
             return;
@@ -495,7 +511,7 @@ pub const RequestBuffersPool = struct {
             self.cool(buffers);
             return err;
         };
-        buffers.resetArena();
+        buffers.resetArenaRetaining();
         return buffers;
     }
 
@@ -630,12 +646,22 @@ test "RequestBuffersPool: the header, the arena's first chunk and the head share
     const big = try arena.alloc(u8, 64 * 1024);
     try std.testing.expect(@intFromPtr(big.ptr) + big.len <= base or @intFromPtr(big.ptr) >= base + pool.setLen());
 
-    // Reset, the arena is back to its first chunk alone, and the next
-    // request's allocations land there again.
-    b.resetArena();
+    // Reset as release builds do, the arena is back to its first chunk
+    // alone, and the next request's allocations land there again.
+    b.resetArenaRetaining();
     try std.testing.expect(b.first_taken and !b.second_taken);
     const again = try arena.alloc(u8, 1500);
     try std.testing.expectEqual(small.ptr, again.ptr);
+}
+
+test "RequestBuffers: what a request kept of its arena reads poison after the reset (test builds)" {
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 64, 256);
+    defer pool.deinit();
+    const b = try pool.acquire(1);
+    defer pool.release(b);
+    const kept = try b.arena.allocator().dupe(u8, "a request's bytes");
+    b.resetArena();
+    try std.testing.expect(std.mem.allEqual(u8, kept, safety.poison_byte));
 }
 
 test "RequestBuffersPool: a write buffer given back is the next one taken" {

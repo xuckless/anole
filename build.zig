@@ -883,17 +883,26 @@ pub fn build(b: *std.Build) void {
     }
 
     // ---- p3/lambda ----
-    // `zig build lint`: SAFETY.md E2, tools/safety_lint.zig over src (and
-    // its own tests). CI runs it; `-Dlint-tests` includes test code.
+    // `zig build lint`: SAFETY.md E2, tools/safety_lint.zig over src
+    // against the ratchet baseline tools/safety_lint.baseline.tsv (and the
+    // tool's own tests). CI's `lint` job runs the same check with `zig run`
+    // (no dependency fetch). `-Dlint-update` lowers the baseline to today's
+    // counts (never raises it); `-Dlint-tests` includes test code and runs
+    // without the baseline.
     {
         const lint_mod = b.createModule(.{ .root_source_file = b.path("tools/safety_lint.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
         const lint_exe = b.addExecutable(.{ .name = "safety-lint", .root_module = lint_mod });
         const run_lint = b.addRunArtifact(lint_exe);
         run_lint.setCwd(b.path("."));
-        if (b.option(bool, "lint-tests", "zig build lint: check test code too") orelse false) run_lint.addArg("--tests");
-        if (b.option([]const u8, "lint-rules", "zig build lint: report only these rules (comma-separated, e.g. DOC)")) |r| run_lint.addArg(b.fmt("--rules={s}", .{r}));
+        const lint_update = b.option(bool, "lint-update", "zig build lint: lower tools/safety_lint.baseline.tsv to today's counts (never raises one)") orelse false;
+        if (b.option(bool, "lint-tests", "zig build lint: check test code too (without the baseline)") orelse false) {
+            run_lint.addArg("--tests");
+        } else {
+            run_lint.addArgs(&.{ if (lint_update) "--update-baseline" else "--baseline", "tools/safety_lint.baseline.tsv" });
+        }
+        if (b.option([]const u8, "lint-rules", "zig build lint: check only these rules (comma-separated, e.g. DOC)")) |r| run_lint.addArg(b.fmt("--rules={s}", .{r}));
         run_lint.addArg("src");
-        const lint_step = b.step("lint", "Check the sources against SAFETY.md (T1, U1, U3, C3) and doc-comment names (DOC)");
+        const lint_step = b.step("lint", "Check the sources against SAFETY.md (T1, T5, U1, U3, C3, L2) and doc-comment names (DOC), with the ratchet baseline");
         lint_step.dependOn(&run_lint.step);
         const lint_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("tools/safety_lint.zig"), .target = b.graph.host, .optimize = .Debug }) });
         lint_step.dependOn(&b.addRunArtifact(lint_tests).step);
@@ -2135,8 +2144,9 @@ fn addSafeTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Co
     // dump's task stacks (zio.dumpTasks) and zio's stall reports walk them.
     if (m.omit_frame_pointer == null) m.omit_frame_pointer = false;
     if (m.import_table.get("anole_test_hooks") == null) {
-        const zio_mod: ?*std.Build.Module = m.import_table.get("zio") orelse
-            if (m.import_table.get("anole")) |a| a.import_table.get("zio") else null;
+        // Any zio in the binary, which then reads the runner's `zio_options`
+        // from test_hooks.zig: a zio left to the stub would fail to compile.
+        const zio_mod: ?*std.Build.Module = findImport(m, "zio", 4);
         // The binary's own never_reuse module if anole_safety is in it.
         const never_reuse = findImport(m, "anole_never_reuse", 4) orelse Core.neverReuseModule(b, m.resolved_target, m.optimize);
         const hooks = if (zio_mod) |z| b.createModule(.{
@@ -2210,7 +2220,10 @@ const Core = struct {
         // panics (SAFETY.md L2; src/safety counts the locks); `debug_cancel`,
         // a task that parks after swallowing error.Canceled is reported (C3),
         // and the test runner fails the test. These are the defaults of a
-        // binary with no `zio_options` of its own: the test binaries.
+        // binary with no `zio_options` of its own. Test binaries have both
+        // on in every optimize mode: their root, the safety test runner,
+        // declares `zio_options` (src/safety/test_hooks.zig), so a
+        // ReleaseSafe test binary checks suspensions as it counts locks.
         const debug = optimize == .debug;
         const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .diagnostics = true, .debug_held_locks = debug, .debug_cancel = debug }).module("zio");
         const safety = safetyModule(b, zio_mod, target, optimize);

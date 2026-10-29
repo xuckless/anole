@@ -1,19 +1,27 @@
 //! E1: a page allocator that never hands out an address twice, the backing
 //! allocator of the test allocator (`std.heap.SafeAllocator`, which then
-//! never reuses memory either). Freed pages are given back to the kernel
-//! (`MADV_DONTNEED`) and made inaccessible (`PROT_NONE`), so a use after
-//! free faults at once instead of reading whatever reused the memory, the
-//! way it did only under CI load.
+//! never reuses memory either). Freed pages are replaced by a fresh
+//! inaccessible mapping (`mmap(MAP_FIXED, PROT_NONE)`: one call that gives
+//! the pages back to the kernel and leaves the addresses reserved), so a
+//! use after free faults at once instead of reading whatever reused the
+//! memory, the way it did only under CI load.
 //!
 //! One large range of address space is reserved up front (inaccessible,
-//! nothing committed) and handed out upwards. Linux only; elsewhere, and
-//! when the range is used up, this is `std.heap.page_allocator`.
+//! nothing committed) and handed out upwards. Linux and macOS; elsewhere
+//! (Windows: `VirtualAlloc(MEM_RESERVE)` + `VirtualFree(MEM_DECOMMIT)`
+//! would do it, TODO), and when the range is used up, this is
+//! `std.heap.page_allocator`.
 const std = @import("std");
 const builtin = @import("builtin");
 const Alignment = std.mem.Alignment;
-const linux = std.os.linux;
 
-const supported = builtin.os.tag == .linux and builtin.link_libc;
+const supported = (builtin.os.tag == .linux or builtin.os.tag == .macos) and builtin.link_libc;
+
+/// The flags of the reservation and of each freed range's new mapping:
+/// private, anonymous, nothing committed. Linux needs `NORESERVE` so the
+/// reservation isn't charged against overcommit; Darwin's `PROT_NONE`
+/// mappings commit nothing anyway.
+const reserve_flags: std.c.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = builtin.os.tag == .linux };
 
 // SAFETY: the vtable never reads its context pointer.
 pub const allocator: std.mem.Allocator = if (supported) .{ .ptr = undefined, .vtable = &vtable } else std.heap.page_allocator;
@@ -34,7 +42,7 @@ fn reserve() void {
     if (reserved.load(.acquire)) return;
     // 1 TiB, then smaller where address space is limited.
     for ([_]usize{ 1 << 40, 1 << 36, 1 << 32 }) |size| {
-        const r = std.posix.mmap(null, size, .{}, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .NORESERVE = true }, -1, 0) catch continue;
+        const r = std.posix.mmap(null, size, .{}, reserve_flags, -1, 0) catch continue;
         base = @intFromPtr(r.ptr);
         limit = base + r.len;
         next.store(base, .release);
@@ -85,11 +93,16 @@ fn free(_: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void
     const size = pageLen(memory.len);
     // SAFETY: the memory came from alloc above: page-aligned, in the range.
     const p: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(memory.ptr));
-    // The pages go back to the kernel; the addresses stay reserved, and
-    // inaccessible. Past the kernel's mapping limit (vm.max_map_count) the
-    // mprotect can fail: then the memory reads as zeros, still never reused.
-    _ = std.c.madvise(p, size, linux.MADV.DONTNEED);
-    _ = std.c.mprotect(p, size, .{});
+    // A new inaccessible mapping over the range: the pages go back to the
+    // kernel and the addresses stay reserved. It fails only past the
+    // kernel's mapping limit (Linux's vm.max_map_count; freed ranges merge
+    // with their neighbours, so it is live allocations that count), and
+    // then loudly: memory that silently stayed readable would hide the use
+    // after free this allocator is for.
+    var fixed = reserve_flags;
+    fixed.FIXED = true;
+    if (std.c.mmap(p, size, .{}, fixed, -1, 0) == std.c.MAP_FAILED)
+        std.debug.panic("never_reuse: remapping a freed range PROT_NONE failed (errno {d}); on Linux raise vm.max_map_count", .{std.c._errno().*});
 }
 
 test "never_reuse: a freed range is not handed out again" {

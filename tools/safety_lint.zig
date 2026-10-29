@@ -1,5 +1,10 @@
-//! `zig build lint`: SAFETY.md E2, a token-level check of the Zig sources
-//! for the rules a grep can see.
+//! `zig build lint`: SAFETY.md E2, a check of the Zig sources on
+//! `std.zig.Ast` (the parser `zig fmt` uses). The tree gives each token its
+//! context: test code (`test` declarations), its function, its statement.
+//! Comments are not in the tree, so `// SAFETY:` reasons are read from the
+//! source lines: on the hit's line, or in the comment lines just above the
+//! hit's line or its statement's first line. A file that does not parse is
+//! a PARSE hit.
 //!
 //! - T1: a task spawned outside a group. `placement.concurrent` (a group,
 //!   placed) is the way; a Future from `io.concurrent`/`io.async` is allowed
@@ -13,21 +18,40 @@
 //!   write-before-read idiom and allowed.
 //! - C3: an `error.Canceled` caught and then carried on from, neither
 //!   returned nor re-armed (`recancel`).
+//! - L2 (L2/L4): a raw lock (`std.Io.Mutex`, `std.atomic.Mutex`,
+//!   `std.Io.Condition`, `std.Io.RwLock`) named outside `src/safety/`. The
+//!   debug checks see only the ranked `safety.Mutex/SpinLock/Condition`.
+//! - T5: in `src/capi/` and in files with an `export fn` (code foreign
+//!   threads call), a wake of a runtime task (`.set(io)` on an Event,
+//!   `futexWake`, `.signal`/`.broadcast`/`.unlock(io)`, `put`/`putOne` on
+//!   a Queue) outside `IoGate`, unless the enclosing function's doc comment
+//!   starts with the thread it runs on ("On the executor", "On the capi
+//!   task", "Run by the capi task", "On the run thread"). Wakes through
+//!   `Threaded` io wake consumer threads and are exempt.
+//!
+//! Any hit but DOC and PARSE is also allowed with a `// SAFETY:` reason.
 //!
 //! - DOC: a public doc comment (`///`, `//!`) that names dusty or the
 //!   core's build options (`use_http2`, `use_tls`); attribution lines and
 //!   identifiers that still carry the name are allowed. Checked in every
 //!   file, test files included.
 //!
-//! Usage: safety_lint [--tests] [--rules=R1,R2] <dir>...   (exit 1 on any hit)
-//! `--rules` reports only the named rules (CI runs `--rules=DOC` until the
-//! retrofit clears the T1/U1/U3/C3 backlog).
-//! Without --tests, test code is skipped: `test` blocks, `*_test.zig`,
-//! `*_tests.zig`, `testing.zig`, files under a `testing/` directory and the
-//! test runners.
+//! Usage: safety_lint [--tests] [--rules=R1,R2]
+//!            [--baseline|--update-baseline|--init-baseline <tsv>] <dir>...
+//! - Plain: every hit, exit 1 on any.
+//! - `--baseline tools/safety_lint.baseline.tsv` (CI, `zig build lint`): the
+//!   ratchet (see `ratchet`); exit 1 on a (file, rule) count above or below
+//!   its line.
+//! - `--update-baseline` (`zig build lint -Dlint-update`): lowers the lines
+//!   to today's counts and drops zeros; never raises one or adds one.
+//! - `--init-baseline`: writes a new baseline; refuses if the file exists.
+//! `--rules` checks only the named rules. Without `--tests`, test code is
+//! skipped: `test` blocks, `*_test.zig`, `*_tests.zig`, `testing.zig`,
+//! files under a `testing/` directory and the test runners. `--tests` runs
+//! without a baseline (test code follows SAFETY.md §6a and the test audit).
 const std = @import("std");
+const Ast = std.zig.Ast;
 const Token = std.zig.Token;
-const Tokenizer = std.zig.Tokenizer;
 
 /// U1: the C binding modules and the files allowed to import them. A
 /// library called from more than one file is a named set (an exception to
@@ -35,7 +59,7 @@ const Tokenizer = std.zig.Tokenizer;
 const c_libs = [_]struct { modules: []const []const u8, files: []const []const u8 }{
     .{ .modules = &.{ "anole_nghttp2_c", "nghttp2" }, .files = &.{ "src/http/core/server/h2.zig", "src/http/core/client.zig", "src/h2/root.zig", "src/h2/client.zig" } },
     .{ .modules = &.{"anole_boringssl_c"}, .files = &.{ "src/tls/root.zig", "src/tls/dusty_tls.zig", "src/h3/root.zig" } },
-    .{ .modules = &.{ "anole_ngtcp2_c", "anole_nghttp3_c" }, .files = &.{ "src/h3/root.zig", "src/h3/ngtcp2.zig", "src/h3/nghttp3.zig", "src/h3/quic_tls.zig", "src/h3/client.zig", "src/h3/session_cache.zig", "src/h3/server.zig", "src/h3/bridge.zig", "src/h3/webtransport.zig", "src/h3/net.zig" } },
+    .{ .modules = &.{ "anole_ngtcp2_c", "anole_nghttp3_c" }, .files = &.{ "src/h3/root.zig", "src/h3/layout.zig", "src/h3/ngtcp2.zig", "src/h3/nghttp3.zig", "src/h3/quic_tls.zig", "src/h3/client.zig", "src/h3/session_cache.zig", "src/h3/server.zig", "src/h3/bridge.zig", "src/h3/webtransport.zig", "src/h3/net.zig" } },
     .{ .modules = &.{"anole_yyjson_c"}, .files = &.{"src/json/root.zig"} },
     .{ .modules = &.{"anole_hiredis_c"}, .files = &.{"src/redis/root.zig"} },
     .{ .modules = &.{"anole_upb_c"}, .files = &.{"src/capi/grpc_schema.zig"} },
@@ -52,22 +76,36 @@ const unsafe_modules = [_][]const u8{"src/safety/"};
 
 const Hit = struct { path: []const u8, line: usize, rule: []const u8, msg: []const u8 };
 
+const Mode = enum { plain, check, update, init };
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
     var tests = false;
     var rules: ?[]const u8 = null;
+    var mode: Mode = .plain;
+    var baseline_path: []const u8 = "";
     var dirs: std.ArrayList([]const u8) = .empty;
-    for (args[1..]) |a| {
+    var k: usize = 1;
+    while (k < args.len) : (k += 1) {
+        const a = args[k];
         if (std.mem.eql(u8, a, "--tests")) {
             tests = true;
         } else if (std.mem.startsWith(u8, a, "--rules=")) {
             rules = a["--rules=".len..];
-        } else try dirs.append(arena, a);
+        } else if (std.mem.eql(u8, a, "--baseline") or std.mem.eql(u8, a, "--update-baseline") or std.mem.eql(u8, a, "--init-baseline")) {
+            if (k + 1 >= args.len) usage();
+            mode = if (a[2] == 'b') .check else if (a[2] == 'u') .update else .init;
+            k += 1;
+            baseline_path = args[k];
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            usage();
+        } else try dirs.append(arena, std.mem.trimEnd(u8, if (std.mem.startsWith(u8, a, "./")) a[2..] else a, "/"));
     }
-    if (dirs.items.len == 0) {
-        std.debug.print("usage: safety_lint [--tests] [--rules=R1,R2] <dir>...\n", .{});
+    if (dirs.items.len == 0) usage();
+    if (tests and mode != .plain) {
+        std.debug.print("safety_lint: the baseline covers product code; --tests runs without one\n", .{});
         std.process.exit(2);
     }
     var hits: std.ArrayList(Hit) = .empty;
@@ -80,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
         defer walker.deinit();
         while (try walker.next(io)) |e| {
             if (e.kind != .file or !std.mem.endsWith(u8, e.basename, ".zig")) continue;
-            const p = try std.fmt.allocPrint(arena, "{s}/{s}", .{ std.mem.trimEnd(u8, d, "/"), e.path });
+            const p = try std.fmt.allocPrint(arena, "{s}/{s}", .{ d, e.path });
             std.mem.replaceScalar(u8, p, '\\', '/');
             try files.append(arena, p);
         }
@@ -92,9 +130,7 @@ pub fn main(init: std.process.Init) !void {
     }.lt);
     for (files.items) |p| {
         const src = try cwd.readFileAllocOptions(io, p, arena, .unlimited, .of(u8), 0);
-        try docNames(arena, p, src, &hits);
-        if (!tests and isTestFile(p)) continue;
-        try lintFile(arena, p, src, tests, &hits);
+        try lintSource(arena, p, src, tests, &hits);
     }
     if (rules) |list| {
         var kept: usize = 0;
@@ -108,21 +144,208 @@ pub fn main(init: std.process.Init) !void {
     var buf: [4096]u8 = undefined;
     var out: std.Io.File.Writer = .init(.stdout(), io, &buf);
     const w = &out.interface;
-    var counts: std.StringArrayHashMapUnmanaged(usize) = .empty;
-    for (hits.items) |h| {
-        try w.print("{s}:{d}: {s}: {s}\n", .{ h.path, h.line, h.rule, h.msg });
-        const gop = try counts.getOrPut(arena, h.rule);
+    switch (mode) {
+        .plain => {
+            for (hits.items) |h| try w.print("{s}:{d}: {s}: {s}\n", .{ h.path, h.line, h.rule, h.msg });
+            if (hits.items.len > 0) {
+                try w.print("\n{d} hit(s):", .{hits.items.len});
+                const counts = try countByRule(arena, hits.items);
+                for (counts.keys(), counts.values()) |r, n| try w.print(" {s} {d}", .{ r, n });
+                try w.writeAll(" (SAFETY.md E2)\n");
+            }
+            try w.flush();
+            if (hits.items.len > 0) std.process.exit(1);
+        },
+        .init => {
+            if (cwd.access(io, baseline_path, .{})) |_| {
+                std.debug.print("safety_lint: {s} exists; --init-baseline only starts a new one (lower it with --update-baseline)\n", .{baseline_path});
+                std.process.exit(2);
+            } else |_| {}
+            const text = try renderBaseline(arena, try countHits(arena, hits.items));
+            try cwd.writeFile(io, .{ .sub_path = baseline_path, .data = text });
+            try w.print("safety_lint: wrote {s} ({d} hit(s))\n", .{ baseline_path, hits.items.len });
+            try w.flush();
+        },
+        .check, .update => {
+            const old = cwd.readFileAlloc(io, baseline_path, arena, .unlimited) catch |err| {
+                std.debug.print("safety_lint: cannot read the baseline {s}: {t}\n", .{ baseline_path, err });
+                std.process.exit(2);
+            };
+            const r = ratchet(arena, w, hits.items, old, rules, mode == .update) catch |err| switch (err) {
+                error.BadBaseline => std.process.exit(2),
+                else => return err,
+            };
+            if (r.new_text) |text| if (!std.mem.eql(u8, text, old)) {
+                try cwd.writeFile(io, .{ .sub_path = baseline_path, .data = text });
+                try w.print("safety_lint: lowered {s}\n", .{baseline_path});
+            };
+            try w.flush();
+            if (r.failed) std.process.exit(1);
+        },
+    }
+}
+
+fn usage() noreturn {
+    std.debug.print(
+        \\usage: safety_lint [--tests] [--rules=R1,R2] [--baseline|--update-baseline|--init-baseline <tsv>] <dir>...
+        \\
+    , .{});
+    std.process.exit(2);
+}
+
+// The ratchet (SAFETY.md E2): a per (file, rule) count of the hits allowed
+// today, in a TSV that may only go down. A file over its count fails and
+// prints every hit of that file and rule (it can't tell which one is new);
+// a file under its count fails too (a stale entry: lower the baseline), so
+// the ratchet tightens as code is fixed. `--update-baseline` lowers each
+// entry to what is found and drops zeros; it never raises a count or adds
+// a line. Raising one is a hand edit, reviewed with its reason (E3).
+
+const baseline_header = "# SAFETY.md E2 ratchet: counts may only go down; regenerate with zig build lint -Dlint-update\n";
+
+/// "path\x00rule" -> count.
+const Counts = std.StringArrayHashMapUnmanaged(usize);
+
+fn key(arena: std.mem.Allocator, path: []const u8, rule: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}\x00{s}", .{ path, rule });
+}
+
+fn countHits(arena: std.mem.Allocator, hits: []const Hit) !Counts {
+    var c: Counts = .empty;
+    for (hits) |h| {
+        const gop = try c.getOrPut(arena, try key(arena, h.path, h.rule));
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
     }
-    if (hits.items.len > 0) {
-        try w.print("\n{d} hit(s):", .{hits.items.len});
-        var it = counts.iterator();
-        while (it.next()) |e| try w.print(" {s} {d}", .{ e.key_ptr.*, e.value_ptr.* });
-        try w.writeAll(" (SAFETY.md E2)\n");
+    return c;
+}
+
+fn countByRule(arena: std.mem.Allocator, hits: []const Hit) !Counts {
+    var c: Counts = .empty;
+    for (hits) |h| {
+        const gop = try c.getOrPut(arena, h.rule);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
     }
-    try w.flush();
-    if (hits.items.len > 0) std.process.exit(1);
+    return c;
+}
+
+fn parseBaseline(arena: std.mem.Allocator, text: []const u8) !Counts {
+    var c: Counts = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| {
+        n += 1;
+        if (line.len == 0 or line[0] == '#') continue;
+        var f = std.mem.splitScalar(u8, line, '\t');
+        const path = f.next() orelse "";
+        const rule = f.next() orelse "";
+        const count_text = f.next() orelse "";
+        const count = std.fmt.parseInt(usize, count_text, 10) catch 0;
+        if (path.len == 0 or rule.len == 0 or count == 0 or f.next() != null) {
+            std.debug.print("safety_lint: baseline line {d} is not path<TAB>rule<TAB>count (count > 0): {s}\n", .{ n, line });
+            return error.BadBaseline;
+        }
+        const gop = try c.getOrPut(arena, try key(arena, path, rule));
+        if (gop.found_existing) {
+            std.debug.print("safety_lint: baseline line {d} repeats {s} {s}\n", .{ n, path, rule });
+            return error.BadBaseline;
+        }
+        gop.value_ptr.* = count;
+    }
+    return c;
+}
+
+/// The TSV: the header, then path<TAB>rule<TAB>count sorted by path and
+/// rule, zero counts left out.
+fn renderBaseline(arena: std.mem.Allocator, counts: Counts) ![]u8 {
+    const keys = try arena.dupe([]const u8, counts.keys());
+    std.mem.sort([]const u8, keys, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.writeAll(baseline_header);
+    for (keys) |kk| {
+        const n = counts.get(kk).?;
+        if (n == 0) continue;
+        const sep = std.mem.indexOfScalar(u8, kk, 0).?;
+        try out.writer.print("{s}\t{s}\t{d}\n", .{ kk[0..sep], kk[sep + 1 ..], n });
+    }
+    return out.written();
+}
+
+const RatchetResult = struct { failed: bool, new_text: ?[]u8 };
+
+/// Compares the hits with the baseline text and reports to `w`. With
+/// `update`, also returns the lowered baseline.
+fn ratchet(arena: std.mem.Allocator, w: *std.Io.Writer, hits: []const Hit, baseline: []const u8, rules: ?[]const u8, update: bool) !RatchetResult {
+    const allowed = try parseBaseline(arena, baseline);
+    const found = try countHits(arena, hits);
+    var failed = false;
+    // Over: every hit of the (file, rule), in file order.
+    for (found.keys(), found.values()) |kk, n| {
+        const a = allowed.get(kk) orelse 0;
+        if (n <= a) continue;
+        failed = true;
+        const sep = std.mem.indexOfScalar(u8, kk, 0).?;
+        const path = kk[0..sep];
+        const rule = kk[sep + 1 ..];
+        for (hits) |h| if (std.mem.eql(u8, h.path, path) and std.mem.eql(u8, h.rule, rule))
+            try w.print("{s}:{d}: {s}: {s}\n", .{ h.path, h.line, h.rule, h.msg });
+        try w.print("{s}: {s}: {d} allowed, {d} found: fix the new hit or give it a // SAFETY: reason (a renamed file: move its baseline lines by hand)\n\n", .{ path, rule, a, n });
+    }
+    // Under (stale): lowered with `update`, a failure otherwise.
+    var lowered: Counts = .empty;
+    for (allowed.keys(), allowed.values()) |kk, a| {
+        const sep = std.mem.indexOfScalar(u8, kk, 0).?;
+        const rule = kk[sep + 1 ..];
+        const n = found.get(kk) orelse 0;
+        const in_scope = if (rules) |list| ruleListed(list, rule) else true;
+        try lowered.put(arena, kk, if (in_scope) @min(a, n) else a);
+        if (!in_scope or n >= a) continue;
+        if (update) continue;
+        failed = true;
+        try w.print("{s}: {s}: the baseline allows {d}, {d} found: lower the baseline: zig build lint -Dlint-update\n", .{ kk[0..sep], rule, a, n });
+    }
+    // The summary: found and allowed per rule, and the baseline total.
+    var by_rule: std.StringArrayHashMapUnmanaged([2]usize) = .empty;
+    var total_found: usize = 0;
+    var total_allowed: usize = 0;
+    for (found.keys(), found.values()) |kk, n| {
+        const gop = try by_rule.getOrPut(arena, kk[std.mem.indexOfScalar(u8, kk, 0).? + 1 ..]);
+        if (!gop.found_existing) gop.value_ptr.* = .{ 0, 0 };
+        gop.value_ptr[0] += n;
+        total_found += n;
+    }
+    const after = if (update) lowered else allowed;
+    for (after.keys(), after.values()) |kk, a| {
+        const rule = kk[std.mem.indexOfScalar(u8, kk, 0).? + 1 ..];
+        if (rules) |list| if (!ruleListed(list, rule)) continue;
+        const gop = try by_rule.getOrPut(arena, rule);
+        if (!gop.found_existing) gop.value_ptr.* = .{ 0, 0 };
+        gop.value_ptr[1] += a;
+        total_allowed += a;
+    }
+    by_rule.sort(struct {
+        keys: []const []const u8,
+        pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+            return std.mem.lessThan(u8, c.keys[a], c.keys[b]);
+        }
+    }{ .keys = by_rule.keys() });
+    try w.writeAll("safety lint (SAFETY.md E2), found/allowed:");
+    for (by_rule.keys(), by_rule.values()) |r, v| try w.print(" {s} {d}/{d}", .{ r, v[0], v[1] });
+    try w.print("; total {d}, baseline total {d}\n", .{ total_found, total_allowed });
+    return .{ .failed = failed, .new_text = if (update) try renderBaseline(arena, lowered) else null };
+}
+
+/// Every rule over one file: DOC everywhere, the SAFETY.md rules outside
+/// test files.
+fn lintSource(arena: std.mem.Allocator, path: []const u8, src: [:0]const u8, tests: bool, hits: *std.ArrayList(Hit)) !void {
+    try docNames(arena, path, src, hits);
+    if (!tests and isTestFile(path)) return;
+    try lintFile(arena, path, src, tests, hits);
 }
 
 /// DOC: public doc comments speak Anole's names, not the HTTP core's
@@ -172,35 +395,56 @@ fn isWrapper(p: []const u8) bool {
     return startsWithAny(p, &unsafe_modules);
 }
 
-const Ctx = enum { container, fn_body, block, test_block, init_list, error_set };
+const none = std.math.maxInt(u32);
 
+/// One file's syntax tree plus, for each token, the context the rules ask
+/// about: whether it is in a test, its innermost function, its innermost
+/// statement (a block statement or a container member).
 const Lint = struct {
     arena: std.mem.Allocator,
     path: []const u8,
     src: [:0]const u8,
-    toks: []const Token,
+    tree: *const Ast,
+    tags: []const Token.Tag,
+    starts: []const u32,
     hits: *std.ArrayList(Hit),
-    /// The context of each token: the innermost brace it is in.
-    ctx: []const Ctx,
-    /// Whether each token is inside a test block (at any depth).
+    line_starts: []const u32,
     in_test: []const bool,
-    /// For each token, the index of the l_brace of its innermost function
-    /// body, or null at container level.
-    fn_start: []const ?usize,
-    /// For each l_brace, the index of its r_brace.
-    match: []const usize,
+    /// The innermost `fn_decl` holding each token's body, or `none`.
+    fn_of: []const u32,
+    /// The innermost statement holding each token, or `none`.
+    stmt_of: []const u32,
+    /// T5 applies: a C ABI file, or one with an `export fn`.
+    t5: bool,
+    /// Tokens inside `IoGate` (T5's one place for foreign wakes).
+    in_gate: []const bool,
 
     fn text(self: *const Lint, i: usize) []const u8 {
-        const t = self.toks[i];
-        return self.src[t.loc.start..t.loc.end];
+        return self.tree.tokenSlice(@intCast(i));
     }
 
     fn tag(self: *const Lint, i: usize) Token.Tag {
-        return if (i < self.toks.len) self.toks[i].tag else .eof;
+        return if (i < self.tags.len) self.tags[i] else .eof;
+    }
+
+    fn first(self: *const Lint, n: Node) u32 {
+        return self.tree.firstToken(n);
+    }
+
+    fn last(self: *const Lint, n: Node) u32 {
+        return self.tree.lastToken(n);
     }
 
     fn lineOf(self: *const Lint, i: usize) usize {
-        return std.mem.count(u8, self.src[0..self.toks[i].loc.start], "\n") + 1;
+        const pos = self.starts[i];
+        // The number of line starts at or before pos.
+        var lo: usize = 0;
+        var hi: usize = self.line_starts.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (self.line_starts[mid] <= pos) lo = mid + 1 else hi = mid;
+        }
+        return lo;
     }
 
     fn hit(self: *Lint, i: usize, rule: []const u8, msg: []const u8) !void {
@@ -214,13 +458,21 @@ const Lint = struct {
         return .{ .start = s, .end = e };
     }
 
+    /// The first token of the statement holding token i (i itself at
+    /// container level outside any member).
+    fn stmtStart(self: *const Lint, i: usize) usize {
+        const s = self.stmt_of[i];
+        return if (s == none) i else self.first(@fromBackingInt(@intCast(s)));
+    }
+
     /// A `// SAFETY:` comment on the token's line, or in the comment lines
-    /// just above the line of `stmt` (the statement's first token).
-    fn hasSafetyComment(self: *const Lint, i: usize, stmt: usize) bool {
-        const l = self.lineAt(self.toks[i].loc.start);
+    /// just above the token's line or its statement's first line. Comments
+    /// are not in the tree, so this reads the source lines.
+    fn hasSafetyComment(self: *const Lint, i: usize) bool {
+        const l = self.lineAt(self.starts[i]);
         if (std.mem.indexOf(u8, self.src[l.start..l.end], "// SAFETY:") != null) return true;
-        for ([_]usize{ i, stmt }) |anchor| {
-            var ls = self.lineAt(self.toks[anchor].loc.start).start;
+        for ([_]usize{ i, self.stmtStart(i) }) |anchor| {
+            var ls = self.lineAt(self.starts[anchor]).start;
             while (ls > 0) {
                 const prev = self.lineAt(ls - 1);
                 const line = std.mem.trim(u8, self.src[prev.start..prev.end], " \t\r");
@@ -232,119 +484,118 @@ const Lint = struct {
         return false;
     }
 
-    /// The first token of the statement or declaration holding token i.
-    fn stmtStart(self: *const Lint, i: usize) usize {
-        var depth: i32 = 0;
-        var j = i;
-        while (j > 0) {
-            const t = self.tag(j - 1);
-            switch (t) {
-                .r_paren, .r_bracket => depth += 1,
-                .l_paren, .l_bracket => {
-                    if (depth == 0) return j;
-                    depth -= 1;
-                },
-                .r_brace => if (depth == 0) return j,
-                .l_brace, .semicolon => if (depth == 0) return j,
-                .comma => if (depth == 0 and self.ctx[j - 1] != .fn_body and self.ctx[j - 1] != .block and self.ctx[j - 1] != .test_block) return j,
-                else => {},
-            }
-            j -= 1;
+    /// The tokens of a node's subtree.
+    fn tokensOf(self: *const Lint, n: Node) struct { u32, u32 } {
+        return .{ self.first(n), self.last(n) };
+    }
+
+    /// An identifier token in [a, b] named `name`, followed by `.` and one
+    /// of `fields`.
+    fn mentionsField(self: *const Lint, a: u32, b: u32, name: []const u8, fields: []const []const u8) bool {
+        var k = a;
+        while (k + 2 <= b) : (k += 1) {
+            if (self.tags[k] != .identifier or self.tags[k + 1] != .period or self.tags[k + 2] != .identifier) continue;
+            if (!std.mem.eql(u8, self.text(k), name)) continue;
+            for (fields) |f| if (std.mem.eql(u8, self.text(k + 2), f)) return true;
         }
-        return 0;
+        return false;
     }
 };
 
+const Node = Ast.Node.Index;
+const Span = struct { node: u32, first: u32, last: u32 };
+
+/// Writes each span's node over its tokens, outer spans first, so a token
+/// ends up with its innermost span.
+fn paint(dst: []u32, spans: []Span) void {
+    std.mem.sort(Span, spans, {}, struct {
+        fn lt(_: void, a: Span, b: Span) bool {
+            return a.last - a.first > b.last - b.first;
+        }
+    }.lt);
+    for (spans) |s| @memset(dst[s.first .. s.last + 1], s.node);
+}
+
 fn lintFile(arena: std.mem.Allocator, path: []const u8, src: [:0]const u8, tests: bool, hits: *std.ArrayList(Hit)) !void {
-    var toks: std.ArrayList(Token) = .empty;
-    var tz: Tokenizer = .init(src);
-    while (true) {
-        const t = tz.next();
-        if (t.tag == .eof) break;
-        if (t.tag == .doc_comment or t.tag == .container_doc_comment) continue;
-        try toks.append(arena, t);
+    const tree = try arena.create(Ast);
+    tree.* = try Ast.parse(arena, src, .{});
+    if (tree.errors.len > 0) {
+        const t = tree.errors[0].token;
+        const line = std.mem.count(u8, src[0..tree.tokens.items(.start)[t]], "\n") + 1;
+        try hits.append(arena, .{ .path = path, .line = line, .rule = "PARSE", .msg = "the file does not parse, so the lint cannot check it" });
+        return;
     }
-    const n = toks.items.len;
-    const ctx = try arena.alloc(Ctx, n);
-    const in_test = try arena.alloc(bool, n);
-    const fn_start = try arena.alloc(?usize, n);
-    const match = try arena.alloc(usize, n);
-    @memset(match, 0);
+    const ntok = tree.tokens.len;
+    var line_starts: std.ArrayList(u32) = .empty;
+    try line_starts.append(arena, 0);
+    for (src, 0..) |c, k| if (c == '\n') try line_starts.append(arena, @intCast(k + 1));
+
+    const in_test = try arena.alloc(bool, ntok);
+    @memset(in_test, false);
+    const fn_of = try arena.alloc(u32, ntok);
+    @memset(fn_of, none);
+    const stmt_of = try arena.alloc(u32, ntok);
+    @memset(stmt_of, none);
     {
-        const Frame = struct { ctx: Ctx, tok: usize, in_test: bool, fn_start: ?usize };
-        var stack: std.ArrayList(Frame) = .empty;
-        var pending_fn = false; // saw `fn`, its body brace is next at paren depth 0
-        var pending_test = false;
-        var paren: i32 = 0;
-        var paren_opener: std.ArrayList(Token.Tag) = .empty; // the tag before each open paren
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const t = toks.items[i].tag;
-            const top: Frame = if (stack.items.len > 0) stack.items[stack.items.len - 1] else .{ .ctx = .container, .tok = 0, .in_test = false, .fn_start = null };
-            ctx[i] = top.ctx;
-            in_test[i] = top.in_test;
-            fn_start[i] = top.fn_start;
-            switch (t) {
-                .keyword_fn => pending_fn = true,
-                .keyword_test => pending_test = true,
-                .l_paren => {
-                    try paren_opener.append(arena, if (i > 0) toks.items[i - 1].tag else .invalid);
-                    paren += 1;
-                },
-                .r_paren => {
-                    if (paren > 0) paren -= 1;
-                    _ = paren_opener.pop();
-                },
-                .semicolon => if (paren == 0) {
-                    pending_fn = false;
-                },
-                .l_brace => {
-                    const prev: Token.Tag = if (i > 0) toks.items[i - 1].tag else .invalid;
-                    var c: Ctx = .block;
-                    if (prev == .keyword_struct or prev == .keyword_enum or prev == .keyword_union or prev == .keyword_opaque) {
-                        c = .container;
-                    } else if (prev == .keyword_error) {
-                        c = .error_set;
-                    } else if (prev == .period) {
-                        c = .init_list;
-                    } else if (prev == .r_paren and parenOpenerIsContainer(toks.items, i - 1)) {
-                        c = .container;
-                    } else if (pending_test and paren == 0) {
-                        c = .test_block;
-                        pending_test = false;
-                    } else if (pending_fn and paren == 0) {
-                        c = .fn_body;
-                        pending_fn = false;
-                    } else if (isTypedInit(toks.items, i)) {
-                        c = .init_list;
-                    }
-                    try stack.append(arena, .{
-                        .ctx = c,
-                        .tok = i,
-                        .in_test = top.in_test or c == .test_block,
-                        .fn_start = if (c == .fn_body) i else top.fn_start,
-                    });
-                },
-                .r_brace => {
-                    if (stack.pop()) |f| match[f.tok] = i;
+        var fns: std.ArrayList(Span) = .empty;
+        var stmts: std.ArrayList(Span) = .empty;
+        var buf2: [2]Node = undefined;
+        for (0..tree.nodes.len) |k| {
+            const n: Node = @fromBackingInt(@intCast(k));
+            switch (tree.nodeTag(n)) {
+                .test_decl => @memset(in_test[tree.firstToken(n) .. tree.lastToken(n) + 1], true),
+                .fn_decl => {
+                    const body = tree.nodeData(n).node_and_node[1];
+                    try fns.append(arena, .{ .node = @intCast(k), .first = tree.firstToken(body), .last = tree.lastToken(body) });
                 },
                 else => {},
             }
+            const members: []const Node = if (tree.blockStatements(&buf2, n)) |s| s else if (tree.fullContainerDecl(&buf2, n)) |c| c.ast.members else &.{};
+            for (members) |m| try stmts.append(arena, .{ .node = @backingInt(m), .first = tree.firstToken(m), .last = tree.lastToken(m) });
         }
+        paint(fn_of, fns.items);
+        paint(stmt_of, stmts.items);
     }
-    var lint: Lint = .{ .arena = arena, .path = path, .src = src, .toks = toks.items, .hits = hits, .ctx = ctx, .in_test = in_test, .fn_start = fn_start, .match = match };
+
+    const in_gate = try arena.alloc(bool, ntok);
+    @memset(in_gate, false);
+    for (0..tree.nodes.len) |k| {
+        const n: Node = @fromBackingInt(@intCast(k));
+        const vd = tree.fullVarDecl(n) orelse continue;
+        if (std.mem.eql(u8, tree.tokenSlice(vd.ast.mut_token + 1), "IoGate")) @memset(in_gate[tree.firstToken(n) .. tree.lastToken(n) + 1], true);
+    }
+    var t5 = std.mem.startsWith(u8, path, "src/capi/");
+    for (tree.tokens.items(.tag), 0..) |t, k| {
+        if (t == .keyword_export and k + 1 < ntok and tree.tokens.items(.tag)[k + 1] == .keyword_fn) t5 = true;
+    }
+
+    var lint: Lint = .{
+        .arena = arena,
+        .path = path,
+        .src = src,
+        .tree = tree,
+        .tags = tree.tokens.items(.tag),
+        .starts = tree.tokens.items(.start),
+        .hits = hits,
+        .line_starts = line_starts.items,
+        .in_test = in_test,
+        .fn_of = fn_of,
+        .stmt_of = stmt_of,
+        .t5 = t5,
+        .in_gate = in_gate,
+    };
     const wrapper = isWrapper(path);
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
+
+    // Token rules: U3, U1, L2 (raw locks).
+    for (0..ntok) |i| {
         if (!tests and in_test[i]) continue;
-        const t = toks.items[i];
         const s = lint.text(i);
-        switch (t.tag) {
+        switch (lint.tags[i]) {
             .builtin => {
                 if (std.mem.eql(u8, s, "@ptrCast") or std.mem.eql(u8, s, "@alignCast") or std.mem.eql(u8, s, "@ptrFromInt") or std.mem.eql(u8, s, "@intFromPtr")) {
                     // `@ptrCast(@alignCast(x))` is one cast.
                     if (std.mem.eql(u8, s, "@alignCast") and i >= 2 and lint.tag(i - 1) == .l_paren and std.mem.eql(u8, lint.text(i - 2), "@ptrCast")) continue;
-                    if (!wrapper and !lint.hasSafetyComment(i, lint.stmtStart(i)))
+                    if (!wrapper and !lint.hasSafetyComment(i))
                         try lint.hit(i, "U3", try std.fmt.allocPrint(arena, "{s} without a // SAFETY: reason (or safety.fromCtx/toCtx)", .{s}));
                 } else if (std.mem.eql(u8, s, "@import") and lint.tag(i + 1) == .l_paren and lint.tag(i + 2) == .string_literal) {
                     const name = std.mem.trim(u8, lint.text(i + 2), "\"");
@@ -362,215 +613,303 @@ fn lintFile(arena: std.mem.Allocator, path: []const u8, src: [:0]const u8, tests
                 if (lint.tag(i + 1) == .keyword_struct or lint.tag(i + 1) == .keyword_union or lint.tag(i + 1) == .keyword_enum) continue;
                 if (!wrapper) try lint.hit(i, "U1", "an extern declaration outside a wrapper module");
             },
-            .identifier => {
-                if (std.mem.eql(u8, s, "undefined")) {
-                    if (wrapper) continue;
-                    const st = lint.stmtStart(i);
-                    if (isLocalArrayDecl(&lint, st, i)) continue;
-                    if (lint.hasSafetyComment(i, st)) continue;
-                    try lint.hit(i, "U3", "undefined outside a local array declaration, without a // SAFETY: reason");
-                } else if ((std.mem.eql(u8, s, "concurrent") or std.mem.eql(u8, s, "async")) and i > 0 and lint.tag(i - 1) == .period and lint.tag(i + 1) == .l_paren) {
-                    try checkSpawn(&lint, i);
-                } else if (std.mem.eql(u8, s, "spawnInto") and lint.tag(i + 1) == .l_paren) {
-                    if (!std.mem.eql(u8, path, "src/http/core/placement.zig")) try lint.hit(i, "T1", "zio spawnInto outside placement.zig: use placement.concurrent");
-                } else if (std.mem.eql(u8, s, "spawn") and i >= 2 and lint.tag(i - 1) == .period and std.mem.eql(u8, lint.text(i - 2), "Thread") and lint.tag(i + 1) == .l_paren) {
-                    try checkThread(&lint, i);
-                } else if (std.mem.eql(u8, s, "Canceled") and i >= 2 and lint.tag(i - 1) == .period and std.mem.eql(u8, lint.text(i - 2), "error")) {
-                    try checkCanceled(&lint, i);
-                }
+            .identifier => if (std.mem.eql(u8, s, "undefined")) {
+                if (wrapper) continue;
+                if (isLocalArrayDecl(&lint, i)) continue;
+                if (lint.hasSafetyComment(i)) continue;
+                try lint.hit(i, "U3", "undefined outside a local array declaration, without a // SAFETY: reason");
+            } else if (rawLock(&lint, i)) |what| {
+                if (startsWithAny(path, &unsafe_modules) or lint.hasSafetyComment(i)) continue;
+                try lint.hit(i + 2, "L2", try std.fmt.allocPrint(arena, "a raw {s}: use safety.Mutex/SpinLock/Condition with a rank (L2/L4)", .{what}));
             },
             else => {},
         }
     }
-}
 
-/// `enum(u8) {`, `union(enum) {`, `packed struct(u32) {`: the paren group
-/// ending at r_paren `rp` was opened right after a container keyword.
-fn parenOpenerIsContainer(toks: []const Token, rp: usize) bool {
-    var depth: i32 = 0;
-    var j = rp;
-    while (true) {
-        switch (toks[j].tag) {
-            .r_paren => depth += 1,
-            .l_paren => {
-                depth -= 1;
-                if (depth == 0) {
-                    if (j == 0) return false;
-                    const t = toks[j - 1].tag;
-                    return t == .keyword_enum or t == .keyword_union or t == .keyword_struct;
-                }
-            },
-            else => {},
+    // Node rules: T1, T5, C3.
+    var buf1: [1]Node = undefined;
+    for (0..tree.nodes.len) |k| {
+        const n: Node = @fromBackingInt(@intCast(k));
+        if (!tests and in_test[tree.nodeMainToken(n)]) continue;
+        if (tree.fullCall(&buf1, n)) |call| {
+            try checkCall(&lint, n, call);
+        } else if (tree.fullSwitchCase(n)) |case| {
+            for (case.ast.values) |v| {
+                if (!isCanceled(&lint, v)) continue;
+                try checkCanceled(&lint, tree.lastToken(v), case.ast.target_expr);
+            }
+        } else if (tree.fullIf(n)) |f| {
+            if (canceledComparison(&lint, f.ast.cond_expr)) |tok| try checkCanceled(&lint, tok, f.ast.then_expr);
         }
-        if (j == 0) return false;
-        j -= 1;
     }
 }
 
-/// `T{ ... }`, `[_]u8{ ... }`, `std.ArrayList(u8){}`: a typed literal (an
-/// identifier, a `]` of an array type, or a call's `)` that is not a
-/// control-flow header).
-fn isTypedInit(toks: []const Token, lb: usize) bool {
-    if (lb == 0) return false;
-    const prev = toks[lb - 1].tag;
-    if (prev == .identifier) {
-        // `else {`, `blk: {`, `=> |x| {` are not literals; an identifier right
-        // before `{` is a type name only when no keyword precedes it.
-        if (lb >= 2 and (toks[lb - 2].tag == .period or toks[lb - 2].tag == .equal or toks[lb - 2].tag == .l_paren or toks[lb - 2].tag == .comma or toks[lb - 2].tag == .keyword_return))
-            return true;
+/// L2/L4: `Io.Mutex`, `Io.Condition`, `Io.RwLock` or `atomic.Mutex` at
+/// token i (`Io`/`atomic`, the `std.` before it optional): the lock's name,
+/// or null.
+fn rawLock(l: *const Lint, i: usize) ?[]const u8 {
+    if (l.tag(i + 1) != .period or l.tag(i + 2) != .identifier) return null;
+    const ns = l.text(i);
+    const name = l.text(i + 2);
+    if (std.mem.eql(u8, ns, "Io")) {
+        for ([_][]const u8{ "Mutex", "Condition", "RwLock" }) |n| if (std.mem.eql(u8, name, n)) return switch (n[0]) {
+            'M' => "std.Io.Mutex",
+            'C' => "std.Io.Condition",
+            else => "std.Io.RwLock",
+        };
+    } else if (std.mem.eql(u8, ns, "atomic") and std.mem.eql(u8, name, "Mutex")) return "std.atomic.Mutex";
+    return null;
+}
+
+/// The thread names a C ABI function's doc comment starts with when it
+/// runs on the runtime's side (T5).
+const runtime_side = [_][]const u8{ "On the executor", "On the capi task", "Run by the capi task", "On the run thread" };
+
+/// T5: in a C ABI file (or one with an `export fn`), a wake of a runtime
+/// task goes through an `IoGate`, unless the function says it runs on the
+/// runtime's side. Wakes through `Threaded` io wake consumer threads.
+fn checkWake(l: *Lint, call: Ast.full.Call, name_tok: u32, recv: ?Node) !void {
+    const name = l.text(name_tok);
+    const params = call.ast.params;
+    const io_node: ?Node = if (std.mem.eql(u8, name, "futexWake"))
+        recv
+    else if (recv == null)
+        null
+    else if (std.mem.eql(u8, name, "set") or std.mem.eql(u8, name, "unlock"))
+        (if (params.len == 1) params[0] else null)
+    else if (std.mem.eql(u8, name, "signal") or std.mem.eql(u8, name, "broadcast") or std.mem.eql(u8, name, "putOne") or std.mem.eql(u8, name, "put"))
+        (if (params.len >= 1) params[0] else null)
+    else
+        null;
+    const io = io_node orelse return;
+    switch (ioKind(l, io)) {
+        .none, .threaded => return,
+        .runtime => {},
     }
+    if (l.in_gate[name_tok]) return;
+    if (runtimeSide(l, name_tok)) return;
+    if (l.hasSafetyComment(name_tok)) return;
+    try l.hit(name_tok, "T5", try std.fmt.allocPrint(l.arena, "a runtime wake (.{s}) outside an IoGate, in a function whose doc comment does not say it runs on the executor", .{name}));
+}
+
+const IoKind = enum { none, runtime, threaded };
+
+/// Whether an expression is an `std.Io`: `io`, `rt_io`, `self.io`,
+/// `app.io()`; through `threadedIo()` or `Threaded` it is a consumer's.
+fn ioKind(l: *const Lint, n: Node) IoKind {
+    const a, const b = l.tokensOf(n);
+    const txt = l.src[l.starts[a] .. l.starts[b] + l.text(b).len];
+    if (std.mem.indexOf(u8, txt, "threadedIo") != null or std.mem.indexOf(u8, txt, "Threaded") != null) return .threaded;
+    // `x.io()`: the name before a final empty call.
+    var e = b;
+    if (l.tags[e] == .r_paren and e >= 1 and l.tags[e - 1] == .l_paren and e >= 2) e -= 2;
+    if (l.tags[e] != .identifier) return .none;
+    const id = l.text(e);
+    if (std.mem.eql(u8, id, "io") or std.mem.endsWith(u8, id, "_io") or std.mem.endsWith(u8, id, "Io")) return .runtime;
+    return .none;
+}
+
+/// The function holding token i has a doc comment starting with one of
+/// `runtime_side`.
+fn runtimeSide(l: *const Lint, i: u32) bool {
+    const f = l.fn_of[i];
+    if (f == none) return false;
+    var t = l.first(@fromBackingInt(@intCast(f)));
+    // The doc comment's first line is the earliest doc_comment token
+    // before the declaration.
+    var top: ?u32 = null;
+    while (t > 0 and l.tags[t - 1] == .doc_comment) : (t -= 1) top = t - 1;
+    const d = top orelse return false;
+    const line = std.mem.trim(u8, l.text(d)["///".len..], " ");
+    for (runtime_side) |p| if (std.mem.startsWith(u8, line, p)) return true;
     return false;
 }
 
-/// `var|const name: [..]T = undefined` with `undefined` the whole initializer.
-fn isLocalArrayDecl(l: *const Lint, st: usize, u: usize) bool {
-    var j = st;
-    if (l.tag(j) == .keyword_pub) j += 1;
-    if (l.tag(j) == .keyword_threadlocal) j += 1;
-    if (l.tag(j) != .keyword_var and l.tag(j) != .keyword_const) return false;
-    if (l.tag(j + 1) != .identifier or l.tag(j + 2) != .colon) return false;
-    if (l.tag(j + 3) != .l_bracket) return false;
-    if (l.tag(u - 1) != .equal) return false;
-    if (l.tag(u + 1) != .semicolon) return false;
-    return l.fn_start[u] != null;
+/// `var|const name: [..]T = undefined` in a function, with `undefined` the
+/// whole initializer.
+fn isLocalArrayDecl(l: *const Lint, u: usize) bool {
+    if (l.fn_of[u] == none) return false;
+    const s = l.stmt_of[u];
+    if (s == none) return false;
+    const vd = l.tree.fullVarDecl(@fromBackingInt(@intCast(s))) orelse return false;
+    const init = vd.ast.init_node.unwrap() orelse return false;
+    if (l.tree.nodeMainToken(init) != u or l.tree.nodeTag(init) != .identifier) return false;
+    const ty = vd.ast.type_node.unwrap() orelse return false;
+    return l.tag(l.first(ty)) == .l_bracket;
+}
+
+/// `error.Canceled` as a node.
+fn isCanceled(l: *const Lint, n: Node) bool {
+    return l.tree.nodeTag(n) == .error_value and std.mem.eql(u8, l.text(l.last(n)), "Canceled");
+}
+
+/// The `Canceled` token of an `x == error.Canceled` (either side) anywhere
+/// in an `if` condition.
+fn canceledComparison(l: *const Lint, cond: Node) ?u32 {
+    const a, const b = l.tokensOf(cond);
+    var k = a;
+    while (k + 3 <= b) : (k += 1) {
+        if (l.tags[k] == .equal_equal and l.tags[k + 1] == .keyword_error and l.tags[k + 2] == .period and std.mem.eql(u8, l.text(k + 3), "Canceled")) return k + 3;
+        if (l.tags[k] == .keyword_error and l.tags[k + 1] == .period and std.mem.eql(u8, l.text(k + 2), "Canceled") and l.tags[k + 3] == .equal_equal) return k + 2;
+    }
+    return null;
+}
+
+/// T1 over one call: `.concurrent(`/`.async(`, `spawnInto`, `Thread.spawn`.
+fn checkCall(l: *Lint, call_node: Node, call: Ast.full.Call) !void {
+    const tree = l.tree;
+    const callee = call.ast.fn_expr;
+    const name_tok: u32, const recv: ?Node = switch (tree.nodeTag(callee)) {
+        .field_access => .{ tree.nodeData(callee).node_and_token[1], tree.nodeData(callee).node_and_token[0] },
+        .identifier => .{ tree.nodeMainToken(callee), null },
+        else => return,
+    };
+    const name = l.text(name_tok);
+    if (l.t5) try checkWake(l, call, name_tok, recv);
+    if (std.mem.eql(u8, name, "spawnInto")) {
+        if (!std.mem.eql(u8, l.path, "src/http/core/placement.zig")) try l.hit(name_tok, "T1", "zio spawnInto outside placement.zig: use placement.concurrent");
+        return;
+    }
+    const r = recv orelse return;
+    if (std.mem.eql(u8, name, "concurrent") or std.mem.eql(u8, name, "async")) {
+        try checkSpawn(l, call_node, name_tok, r);
+    } else if (std.mem.eql(u8, name, "spawn") and std.mem.eql(u8, l.text(l.last(r)), "Thread")) {
+        try checkThread(l, name_tok);
+    }
 }
 
 /// T1. `placement.concurrent(...)` is the way. Otherwise the spawn must be
 /// function-local: its Future kept in a local (declared in this function),
 /// or its receiver a Group or Select local to this function, and the
 /// function cancels or awaits that local.
-fn checkSpawn(l: *Lint, i: usize) !void {
-    if (i >= 2 and std.mem.eql(u8, l.text(i - 2), "placement")) return;
+fn checkSpawn(l: *Lint, call_node: Node, i: u32, recv: Node) !void {
+    if (std.mem.eql(u8, l.text(l.last(recv)), "placement")) return;
     // Inside placement.zig, the one place that wraps the std call.
     if (std.mem.eql(u8, l.path, "src/http/core/placement.zig")) return;
     // `x.concurrent(` with x a simple name: a local Group or Select.
-    if (i >= 2 and l.tag(i - 2) == .identifier and (i < 3 or l.tag(i - 3) != .period)) {
-        const recv = l.text(i - 2);
-        if (declaredLocal(l, i, recv) and localFutureEnded(l, i, recv)) return;
+    if (l.tree.nodeTag(recv) == .identifier) {
+        const name = l.text(l.tree.nodeMainToken(recv));
+        if (declaredLocal(l, i, name) and localFutureEnded(l, i, name)) return;
     }
-    // `const f = ....concurrent(` or `f = ....concurrent(`: a local Future.
-    const st = l.stmtStart(i);
-    var j = st;
-    if (l.tag(j) == .keyword_var or l.tag(j) == .keyword_const) j += 1;
-    if (l.tag(j) == .identifier and (l.tag(j + 1) == .equal or l.tag(j + 1) == .colon)) {
-        const name = l.text(j);
+    // `const f = [try] ....concurrent(` or `f = [try] ....concurrent(`: a
+    // local Future.
+    if (futureName(l, i, call_node)) |name| {
         if (declaredLocal(l, i, name) and localFutureEnded(l, i, name)) return;
         return l.hit(i, "T1", "a Future this function does not cancel or await, or one kept outside it: use placement.concurrent with the owner's group");
     }
     try l.hit(i, "T1", "a spawn outside placement.concurrent and outside a function-local Future, Group or Select");
 }
 
-/// `name` is declared (`var name` / `const name`) in the function holding
-/// token i, before it.
-fn declaredLocal(l: *const Lint, i: usize, name: []const u8) bool {
-    const fs = l.fn_start[i] orelse return false;
-    var k = fs;
-    while (k + 1 < i) : (k += 1) {
-        if ((l.tag(k) == .keyword_var or l.tag(k) == .keyword_const) and l.tag(k + 1) == .identifier and std.mem.eql(u8, l.text(k + 1), name)) return true;
+/// The name a statement stores the call's Future in: the statement is a
+/// declaration or a plain assignment to a name, and its value is the call
+/// (or `try` of it).
+fn futureName(l: *const Lint, i: u32, call_node: Node) ?[]const u8 {
+    const tree = l.tree;
+    const s = l.stmt_of[i];
+    if (s == none) return null;
+    const stmt: Node = @fromBackingInt(@intCast(s));
+    var value: Node = undefined; // SAFETY: set on every path that reaches its read
+    var name: []const u8 = undefined; // SAFETY: as value
+    if (tree.fullVarDecl(stmt)) |vd| {
+        value = vd.ast.init_node.unwrap() orelse return null;
+        name = l.text(vd.ast.mut_token + 1);
+    } else if (tree.nodeTag(stmt) == .assign) {
+        const lhs, value = tree.nodeData(stmt).node_and_node;
+        if (tree.nodeTag(lhs) != .identifier) return null;
+        name = l.text(tree.nodeMainToken(lhs));
+    } else return null;
+    return if (holdsCall(l, value, call_node)) name else null;
+}
+
+/// The value is the call itself, through `try`, `catch` (its left side) and
+/// the branches of an `if`.
+fn holdsCall(l: *const Lint, value: Node, call_node: Node) bool {
+    const tree = l.tree;
+    if (value == call_node) return true;
+    switch (tree.nodeTag(value)) {
+        .@"try" => return holdsCall(l, tree.nodeData(value).node, call_node),
+        .@"catch", .@"orelse" => return holdsCall(l, tree.nodeData(value).node_and_node[0], call_node),
+        else => {},
+    }
+    if (tree.fullIf(value)) |f| {
+        if (holdsCall(l, f.ast.then_expr, call_node)) return true;
+        if (f.ast.else_expr.unwrap()) |e| return holdsCall(l, e, call_node);
     }
     return false;
 }
 
-/// The function holding token i mentions `name.cancel(` or `name.await(`.
-fn localFutureEnded(l: *const Lint, i: usize, name: []const u8) bool {
-    const fs = l.fn_start[i] orelse return false;
-    const end = l.match[fs];
-    var k = fs;
-    while (k + 3 < end) : (k += 1) {
-        if (l.tag(k) == .identifier and std.mem.eql(u8, l.text(k), name) and l.tag(k + 1) == .period and l.tag(k + 2) == .identifier) {
-            const m = l.text(k + 2);
-            if (std.mem.eql(u8, m, "cancel") or std.mem.eql(u8, m, "await")) return true;
-        }
+/// `name` is declared (`var name` / `const name`) in the function holding
+/// token i, before it.
+fn declaredLocal(l: *const Lint, i: u32, name: []const u8) bool {
+    const f = l.fn_of[i];
+    if (f == none) return false;
+    const body = l.tree.nodeData(@fromBackingInt(@intCast(f))).node_and_node[1];
+    var k = l.first(body);
+    while (k + 1 < i) : (k += 1) {
+        if ((l.tags[k] == .keyword_var or l.tags[k] == .keyword_const) and l.tags[k + 1] == .identifier and std.mem.eql(u8, l.text(k + 1), name)) return true;
+    }
+    return false;
+}
+
+/// The function holding token i mentions `name.cancel` or `name.await`.
+fn localFutureEnded(l: *const Lint, i: u32, name: []const u8) bool {
+    const f = l.fn_of[i];
+    if (f == none) return false;
+    const body = l.tree.nodeData(@fromBackingInt(@intCast(f))).node_and_node[1];
+    const a = l.first(body);
+    const b = l.last(body);
+    if (l.mentionsField(a, b, name, &.{ "cancel", "await" })) return true;
+    // An optional Future: `if (name) |*x| x.cancel(io)`.
+    var k = a;
+    while (k + 6 <= b) : (k += 1) {
+        if (l.tags[k] != .keyword_if or l.tags[k + 1] != .l_paren or l.tags[k + 2] != .identifier or l.tags[k + 3] != .r_paren or l.tags[k + 4] != .pipe) continue;
+        if (!std.mem.eql(u8, l.text(k + 2), name)) continue;
+        const cap = if (l.tags[k + 5] == .asterisk) k + 6 else k + 5;
+        if (l.tags[cap] != .identifier) continue;
+        if (l.mentionsField(cap + 1, @min(b, cap + 8), l.text(cap), &.{ "cancel", "await" })) return true;
     }
     return false;
 }
 
 /// T1 for OS threads: the handle is kept and joined in the same file, never
 /// detached.
-fn checkThread(l: *Lint, i: usize) !void {
+fn checkThread(l: *Lint, i: u32) !void {
     // A detach in the same statement.
+    const s = l.stmt_of[i];
+    const end = if (s == none) i else l.last(@fromBackingInt(@intCast(s)));
     var k = i;
-    while (k < l.toks.len and l.tag(k) != .semicolon) : (k += 1) {
-        if (l.tag(k) == .identifier and std.mem.eql(u8, l.text(k), "detach")) return l.hit(i, "T1", "a detached thread: keep the handle and join it in its owner's teardown");
+    while (k <= end) : (k += 1) {
+        if (l.tags[k] == .identifier and std.mem.eql(u8, l.text(k), "detach")) return l.hit(i, "T1", "a detached thread: keep the handle and join it in its owner's teardown");
     }
-    for (l.toks, 0..) |t, m| {
-        if (t.tag == .identifier and std.mem.eql(u8, l.text(m), "join") and m > 0 and l.tag(m - 1) == .period) return;
+    for (l.tags, 0..) |t, m| {
+        if (t == .identifier and m > 0 and l.tags[m - 1] == .period and std.mem.eql(u8, l.text(m), "join")) return;
     }
     try l.hit(i, "T1", "a thread that this file never joins");
 }
 
-/// C3: a prong or branch on `error.Canceled` that carries on: it neither
-/// returns (or breaks out with) an error nor calls `recancel`.
-fn checkCanceled(l: *Lint, i: usize) !void {
-    // Only where it is handled: a switch prong item (after `{` or `,`) or a
-    // comparison; `return error.Canceled`, `=> error.Canceled` hand it on.
-    const before = if (i >= 3) l.tag(i - 3) else .invalid;
-    if (before != .l_brace and before != .comma and before != .equal_equal and before != .bang_equal) return;
-    // Find the handling body: a switch prong `error.Canceled[, ...] => body`
-    // or `if (... == error.Canceled) body`.
-    var k = i + 1;
-    while (k < l.toks.len and (l.tag(k) == .comma or l.tag(k) == .period or l.tag(k) == .identifier or l.tag(k) == .keyword_error)) : (k += 1) {}
-    var body_start: usize = undefined;
-    if (l.tag(k) == .equal_angle_bracket_right) {
-        body_start = k + 1;
-    } else if (l.tag(i - 3) == .equal_equal or l.tag(k) == .r_paren) {
-        if (l.tag(i - 3) != .equal_equal) return;
-        // `if (err == error.Canceled)`: the body follows the `)`.
-        var depth: i32 = 0;
-        while (k < l.toks.len) : (k += 1) {
-            if (l.tag(k) == .l_paren) depth += 1;
-            if (l.tag(k) == .r_paren) {
-                if (depth == 0) break;
-                depth -= 1;
-            }
-        }
-        body_start = k + 1;
-    } else return;
-    // The body: a block, or tokens up to the prong's `,` / statement's `;`.
-    var end: usize = body_start;
-    if (l.tag(body_start) == .pipe) {
-        // `=> |e| ...`
-        end = body_start + 1;
-        while (end < l.toks.len and l.tag(end) != .pipe) : (end += 1) {}
-        end += 1;
-    }
-    const start = end;
-    if (l.tag(start) == .l_brace) {
-        end = l.match[start];
-    } else {
-        var depth: i32 = 0;
-        while (end < l.toks.len) : (end += 1) {
-            switch (l.tag(end)) {
-                .l_paren, .l_bracket, .l_brace => depth += 1,
-                .r_paren, .r_bracket => depth -= 1,
-                .r_brace => {
-                    if (depth == 0) break;
-                    depth -= 1;
-                },
-                .comma, .semicolon => if (depth == 0) break,
-                else => {},
-            }
-        }
-    }
-    // `=> error.Canceled,` or `=> err,`: the prong's value is the error
+/// C3: a prong or branch on `error.Canceled` (token i) whose body carries
+/// on: it neither returns (or breaks out with) an error nor calls
+/// `recancel`.
+fn checkCanceled(l: *Lint, i: u32, body: Node) !void {
+    const tree = l.tree;
+    // `=> error.Canceled,` or `=> cause,`: the prong's value is the error
     // itself, handed on by the switch's `return`/`break`.
-    if (l.tag(start) == .keyword_error and l.tag(start + 2) == .identifier and std.mem.eql(u8, l.text(start + 2), "Canceled")) return;
-    // `=> cause,`: the prong's value is the error being switched on.
-    if (l.tag(start) == .identifier and (l.tag(start + 1) == .comma or l.tag(start + 1) == .r_brace)) return;
-    var m = start;
-    while (m <= end and m < l.toks.len) : (m += 1) {
-        switch (l.tag(m)) {
+    if (isCanceled(l, body) or tree.nodeTag(body) == .identifier) return;
+    const a, const b = l.tokensOf(body);
+    var m = a;
+    while (m <= b) : (m += 1) {
+        switch (l.tags[m]) {
             .keyword_return, .keyword_try, .keyword_unreachable => return,
             .identifier => if (std.mem.eql(u8, l.text(m), "recancel") or std.mem.eql(u8, l.text(m), "panic")) return,
             .keyword_break => {
                 // `break :blk error.Canceled` hands it on.
                 var q = m;
-                while (q <= end and q < l.toks.len) : (q += 1) if (l.tag(q) == .keyword_error) return;
+                while (q <= b) : (q += 1) if (l.tags[q] == .keyword_error) return;
             },
             else => {},
         }
     }
-    if (l.hasSafetyComment(i, l.stmtStart(i))) return;
+    if (l.hasSafetyComment(i)) return;
     try l.hit(i, "C3", "error.Canceled caught and carried on from: return it, or call io.recancel()");
 }
 
@@ -579,4 +918,183 @@ test "ruleListed: --rules matches whole rule names in a comma list" {
     try std.testing.expect(ruleListed("U3, DOC", "DOC"));
     try std.testing.expect(!ruleListed("DOC", "U3"));
     try std.testing.expect(!ruleListed("DO", "DOC"));
+}
+
+// Self-tests (TESTING.md Q5): each fixture under safety_lint/fixtures/ names
+// the path it is linted as on its first line (`// lint-path: src/...`) and
+// marks every line that must hit with `// expect: RULE [RULE...]`. A line
+// without a mark must not hit.
+
+const LineRule = struct {
+    line: usize,
+    rule: []const u8,
+
+    fn lessThan(_: void, a: LineRule, b: LineRule) bool {
+        if (a.line != b.line) return a.line < b.line;
+        return std.mem.lessThan(u8, a.rule, b.rule);
+    }
+};
+
+fn expectFixture(comptime name: []const u8) !void {
+    const src: [:0]const u8 = @embedFile("safety_lint/fixtures/" ++ name ++ ".zig");
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const first = src[0 .. std.mem.indexOfScalar(u8, src, '\n') orelse src.len];
+    const tag = "// lint-path: ";
+    if (!std.mem.startsWith(u8, first, tag)) return error.FixtureWithoutPath;
+    const path = first[tag.len..];
+
+    var want: std.ArrayList(LineRule) = .empty;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| {
+        n += 1;
+        const at = std.mem.indexOf(u8, line, "// expect: ") orelse continue;
+        var rules = std.mem.tokenizeScalar(u8, line[at + "// expect: ".len ..], ' ');
+        while (rules.next()) |r| try want.append(arena, .{ .line = n, .rule = r });
+    }
+    var hits: std.ArrayList(Hit) = .empty;
+    try lintSource(arena, path, src, false, &hits);
+    var got: std.ArrayList(LineRule) = .empty;
+    for (hits.items) |h| try got.append(arena, .{ .line = h.line, .rule = h.rule });
+    std.mem.sort(LineRule, want.items, {}, LineRule.lessThan);
+    std.mem.sort(LineRule, got.items, {}, LineRule.lessThan);
+    var same = want.items.len == got.items.len;
+    if (same) for (want.items, got.items) |a, b| {
+        if (a.line != b.line or !std.mem.eql(u8, a.rule, b.rule)) same = false;
+    };
+    if (same) return;
+    std.debug.print("fixture {s}: want", .{name});
+    for (want.items) |w| std.debug.print(" {d}:{s}", .{ w.line, w.rule });
+    std.debug.print("\n  got:", .{});
+    for (hits.items) |h| std.debug.print("\n    {d}: {s}: {s}", .{ h.line, h.rule, h.msg });
+    std.debug.print("\n", .{});
+    return error.FixtureMismatch;
+}
+
+fn ratchetFor(arena: std.mem.Allocator, hits: []const Hit, baseline: []const u8, update: bool) !struct { RatchetResult, []const u8 } {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const r = try ratchet(arena, &out.writer, hits, baseline, null, update);
+    return .{ r, out.written() };
+}
+
+const ratchet_hits = [_]Hit{
+    .{ .path = "src/a.zig", .line = 3, .rule = "U3", .msg = "m" },
+    .{ .path = "src/a.zig", .line = 9, .rule = "U3", .msg = "m" },
+    .{ .path = "src/b.zig", .line = 1, .rule = "T1", .msg = "m" },
+};
+
+test "ratchet: counts at their baseline pass" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const r, const out = try ratchetFor(arena.allocator(), &ratchet_hits, baseline_header ++ "src/a.zig\tU3\t2\nsrc/b.zig\tT1\t1\n", false);
+    try std.testing.expect(!r.failed);
+    try std.testing.expect(std.mem.indexOf(u8, out, "total 3, baseline total 3") != null);
+}
+
+test "ratchet: a count over its baseline fails and prints every hit of that file and rule" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const r, const out = try ratchetFor(arena.allocator(), &ratchet_hits, baseline_header ++ "src/a.zig\tU3\t1\n", false);
+    try std.testing.expect(r.failed);
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/a.zig:3: U3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/a.zig:9: U3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/a.zig: U3: 1 allowed, 2 found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/b.zig: T1: 0 allowed, 1 found") != null);
+}
+
+test "ratchet: a count under its baseline (stale) fails and says to lower it" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const r, const out = try ratchetFor(arena.allocator(), &ratchet_hits, baseline_header ++ "src/a.zig\tU3\t2\nsrc/b.zig\tT1\t1\nsrc/gone.zig\tC3\t4\n", false);
+    try std.testing.expect(r.failed);
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/gone.zig: C3: the baseline allows 4, 0 found: lower the baseline") != null);
+}
+
+test "ratchet: update lowers, drops zeros, and never raises or adds a line" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const r, _ = try ratchetFor(arena.allocator(), &ratchet_hits, baseline_header ++ "src/a.zig\tU3\t5\nsrc/c.zig\tU3\t1\n", true);
+    // src/b.zig's T1 is new: still a failure, and not written.
+    try std.testing.expect(r.failed);
+    try std.testing.expectEqualStrings(baseline_header ++ "src/a.zig\tU3\t2\n", r.new_text.?);
+}
+
+test "ratchet: a malformed baseline line is refused" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.BadBaseline, ratchetFor(arena.allocator(), &ratchet_hits, "src/a.zig U3 2\n", false));
+}
+
+test "lint: U3 casts, with and without a SAFETY reason" {
+    try expectFixture("u3_casts");
+}
+
+test "lint: U3 undefined, the local-array exemption" {
+    try expectFixture("u3_undefined");
+}
+
+test "lint: U3 is off in a wrapper module" {
+    try expectFixture("u3_wrapper");
+}
+
+test "lint: U1 C bindings and externs outside their wrapper" {
+    try expectFixture("u1");
+}
+
+test "lint: U1 a wrapper may import its binding" {
+    try expectFixture("u1_wrapper");
+}
+
+test "lint: T1 spawns, local Futures and Groups" {
+    try expectFixture("t1_spawn");
+}
+
+test "lint: T1 placement.zig wraps the std call" {
+    try expectFixture("t1_placement");
+}
+
+test "lint: T1 a detached or never-joined thread" {
+    try expectFixture("t1_thread");
+}
+
+test "lint: T1 a thread the file joins" {
+    try expectFixture("t1_thread_joined");
+}
+
+test "lint: U1 src/h3/layout.zig is part of the ngtcp2/nghttp3 wrapper" {
+    try expectFixture("u1_layout");
+}
+
+test "lint: L2 raw locks outside src/safety" {
+    try expectFixture("l2_raw_lock");
+}
+
+test "lint: L2 the ranked wrappers may hold raw locks" {
+    try expectFixture("l2_safety");
+}
+
+test "lint: T5 runtime wakes in the C ABI go through IoGate" {
+    try expectFixture("t5_capi");
+}
+
+test "lint: T5 applies to a file with an export fn" {
+    try expectFixture("t5_export");
+}
+
+test "lint: T5 does not apply elsewhere" {
+    try expectFixture("t5_outside");
+}
+
+test "lint: C3 swallowed and handed-on cancels" {
+    try expectFixture("c3");
+}
+
+test "lint: DOC names in doc comments" {
+    try expectFixture("doc");
+}
+
+test "lint: a test file gets DOC only" {
+    try expectFixture("skipped_test");
 }

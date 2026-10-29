@@ -78,9 +78,11 @@ A spawn outside a group is banned, and so are fire-and-forget tasks. Work that m
 
 **T2. Children never free upward or sideways.** A child task never frees its parent or a sibling. Results flow up as a return value, through a queue the parent reads, or by a handle the parent resolves.
 
-**T3. One executor per object.** Every object with mutable state belongs to one executor. Debug builds assert it (`assertOwnerExecutor`). Other executors and threads reach it only by sending a message (a ring or queue) or through a handle, never by writing through a shared pointer.
+**T3. One executor per object.** Every object with mutable state belongs to one executor. Debug builds assert it (`safety.Owner`: `Owner.check`). Other executors and threads reach it only by sending a message (a ring or queue) or through a handle, never by writing through a shared pointer.
 
 **T4. Detached work goes through handles.** Parked connections, C ABI requests, detached HTTP/2 and HTTP/3 replies, timers and sweepers refer to their target only by handle. They resolve the handle each time they run.
+
+**T5. Threads that may outlive the runtime wake it only through an `IoGate`.** A thread that may outlive the runtime (a C ABI consumer) wakes runtime tasks only through an `IoGate`; threads the runtime's owner joins first (SQLite writer, console, run thread) may wake directly. In C ABI code, a function that wakes runtime tasks directly starts its doc comment with the thread it runs on: "On the executor", "On the capi task", "Run by the capi task" or "On the run thread".
 
 ## 3. Cancellation
 
@@ -136,17 +138,21 @@ The lint enforces this against an allowlist.
 
 **E1. Debug-build checks** (Debug and test builds only, no cost in ReleaseFast):
 - executor ownership (T3);
-- a lock held across a suspension point (L2), which needs a held-lock counter per task (a small zio hook, offered upstream);
-- lock order (L4); a violation, and a wait for a lock while one is held (L2), names where the new lock is taken and where each held lock was taken (as lockdep and Abseil do);
+- a lock held across a suspension point (L2), which needs a held-lock counter per task (a small zio hook, kept in Anole's zio fork, not offered upstream);
+- lock order (L4); a violation, a wait for a lock while one is held (L2), and a suspension while one is held (L2) name where the new lock is taken or the task suspends and where each held lock was taken (as lockdep and Abseil do);
 - the teardown state (M5);
-- poisoned freed memory in tests: an allocator that poisons and never reuses freed memory, so a use-after-free crashes at once instead of only under CI load;
+- poisoned freed memory in tests: an allocator that poisons and never reuses freed memory, on Linux and macOS, so a use-after-free crashes at once instead of only under CI load (`safety.process_gpa` for memory outside a test's scope); pools poison what they take back with `safety.poison`, and request arenas are reset with `safety.resetArena` (M6);
 - the leak check (`std.testing.allocator`), as today.
 
-**E2. Lint** (a CI step and `zig build lint`), a grep against an allowlist for:
+**E2. Lint** (`tools/safety_lint.zig` on `std.zig.Ast`: the CI job `lint` and `zig build lint`) for:
 - a spawn outside a task group (T1);
+- a runtime wake outside an `IoGate` in C ABI code, unless the function's doc comment names a runtime-side thread (T5);
 - an unsafe operation outside a wrapper module without a `// SAFETY:` comment (U3);
 - C calls outside wrapper modules (U1);
-- `error.Canceled` caught without `recancel` (C3).
+- `error.Canceled` caught without `recancel` (C3);
+- a raw lock (`std.Io.Mutex`, `std.atomic.Mutex`, `std.Io.Condition`, `std.Io.RwLock`) outside `src/safety/`, reported as L2: the L2/L4 checks of E1 see only the ranked `safety.Mutex/SpinLock/Condition`.
+
+The hits that existed when a rule came are counted in a ratchet baseline, `tools/safety_lint.baseline.tsv`: one count per file and rule, product code only. CI fails when a count rises above its line (a new hit: fix it or give it a `// SAFETY:` reason) and when one falls below it (lower the line with `zig build lint -Dlint-update`, which never raises a count or adds a line). Raising a count is a hand edit, with its reason in the PR (E3). Each retrofit step lowers the baseline.
 
 **E3. Review.** Every change that adds a task, a lock, a shared object or a C call states which rules apply and how they hold. The checklist is the rule IDs in this file.
 
@@ -157,6 +163,7 @@ The lint enforces this against an allowlist.
 Where these differ from the rules above, they apply to test tooling (see Scope).
 
 - **T1, T4:** a test-only OS thread that lives for the whole test process (the runner's watchdog) may be detached. Any thread or task a test spawns is joined or canceled on every exit path, failure paths included: `defer group.cancel(io)` (or `future.cancel`) directly after the group or future is declared, because a failing `try wait.*` returns while the tasks still run against the test's frame.
+- **T5:** a test thread may wake a runtime task through a runtime `std.Io.Event`.
 - **U1:** test tooling may call libc and the OS directly (`waitpid`, `write`, `prctl`, `sigaction`, `getenv`) through `std.c` and `std.posix`.
 - **L5, L6:** the test runner may use a spin lock on a raw atomic when it guards only a bounded copy, is a leaf (L4), and every path reachable from a signal or panic handler tries it once and never waits for it.
 - **Signal handlers** call only async-signal-safe functions (`write(2)`, `sigaction`, `sigprocmask`, `raise`): no lock waits, no allocation, no `std.debug.print`.

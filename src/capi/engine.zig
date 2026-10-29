@@ -32,6 +32,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const anole = @import("../root.zig");
+const safety = @import("anole_safety");
 const dusty = @import("dusty");
 pub const abi = @import("abi.zig");
 const config_mod = @import("config.zig");
@@ -88,9 +89,12 @@ pub const config = config_mod;
 const log = std.log.scoped(.anole_capi);
 
 /// The allocator for everything here: thread-safe, since consumers and
-/// executors both use it.
-pub const gpa = if (builtin.mode == .debug) debug_gpa.allocator() else std.heap.smp_allocator;
-var debug_gpa: std.heap.DebugAllocator(.{ .thread_safe = true, .stack_trace_frames = 8 }) = .init;
+/// executors both use it. A `safety.ProcessAllocator` of its own (SAFETY.md
+/// E1): in test builds freed memory is never reused, so a late access from
+/// a consumer thread faults at once; in Debug its leaks are checked when
+/// the engine goes (`destroy`); in release builds it is `smp_allocator`.
+pub const gpa = gpa_state.allocator();
+var gpa_state: safety.ProcessAllocator = .init(0xca61a11c);
 
 /// The `std.Io` for consumer threads that block (`poll_wait`, blocking
 /// reads and writes) and for `start`/`wait`, outside the runtime.
@@ -2187,9 +2191,10 @@ pub const Engine = struct {
         e.consumers.deinit(gpa);
         e.arena.deinit();
         gpa.destroy(e);
-        // Debug builds: everything the engine allocated is freed by now
-        // (the leaks, with where they were made, go to the log).
-        if (builtin.mode == .debug) if (debug_gpa.detectLeaks() > 0) log.err("the C ABI engine leaked memory", .{});
+        // Debug and test builds: everything the engine allocated is freed by
+        // now (the leaks, with where they were made, go to the log, and are
+        // freed so the next engine starts clean).
+        if (gpa_state.reset() > 0) log.err("the C ABI engine leaked memory", .{});
     }
 
     pub fn stats(e: *Engine) abi.Stats {
@@ -3133,10 +3138,10 @@ fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
     x.release(si);
 }
 
-/// `destroy` on a server not drained: every request and call a consumer
-/// still owes is answered at once (503, UNAVAILABLE; streams are cut) and
-/// the consumer hears nothing more. Run by the capi task while `abandon`
-/// is set.
+/// Run by the capi task while `abandon` is set (`destroy` on a server not
+/// drained): every request and call a consumer still owes is answered at
+/// once (503, UNAVAILABLE; streams are cut) and the consumer hears nothing
+/// more.
 fn abandonAll(x: *Exec) void {
     const io = x.engine.io;
     for (x.slots, 0..) |*s, i| {
@@ -3175,8 +3180,8 @@ fn abandonAll(x: *Exec) void {
 // ---------------------------------------------------------------------------
 // The capi task: one per executor.
 
-/// Hands answers to their requests, runs commands, enforces deadlines and
-/// rings lost doorbells again.
+/// On the capi task (this is it): hands answers to their requests, runs
+/// commands, enforces deadlines and rings lost doorbells again.
 fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
     const io = e.io;
     while (true) {

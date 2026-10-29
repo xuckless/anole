@@ -40,6 +40,7 @@
 //! the xuckless/dusty fork).
 const std = @import("std");
 const zio = @import("zio");
+const safety = @import("anole_safety");
 const dusty = @import("dusty");
 const ngtcp2 = @import("ngtcp2.zig");
 const nghttp3 = @import("nghttp3.zig");
@@ -2456,9 +2457,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const st = s.arena.state;
                 const single = st.free_list == null and (st.used_list == null or st.used_list.?.next == null);
                 if (single and s.arena.queryCapacity() <= arena_keep) {
-                    _ = s.arena.reset(.retain_capacity);
+                    _ = safety.resetArena(&s.arena, .retain_capacity);
                 } else {
-                    _ = s.arena.reset(.{ .retain_with_limit = arena_keep });
+                    _ = safety.resetArena(&s.arena, .{ .retain_with_limit = arena_keep });
                 }
                 if (!ep.keepStream(s)) s.destroy(gpa, &ep.blocks);
             }
