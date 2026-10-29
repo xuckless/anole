@@ -728,6 +728,7 @@ const Driver = struct {
                 it = n.next;
                 const s = KickSlot.of(n);
                 s.kicked.store(false, .seq_cst);
+                testHold(d.io, .driver_turn);
                 const t = s.conn orelse continue;
                 t.serviceKick();
                 // Nothing of `t` after this: the service may have suspended
@@ -1978,7 +1979,9 @@ const TcpConn = struct {
             const e = t.epoch.load(.seq_cst);
             if (t.flags.load(.seq_cst) & (Flag.closed | Flag.dead) != 0) return error.Closed;
             if (t.queued.load(.seq_cst) < below) return;
+            if (builtin.is_test) _ = test_write_waits.fetchAdd(1, .release);
             try t.io.futexWait(u32, &t.epoch.raw, e);
+            testHold(t.io, .waiter_woken);
         }
     }
 
@@ -2135,6 +2138,7 @@ const TcpConn = struct {
     fn waitResumed(t: *TcpConn) !void {
         while (t.paused.load(.acquire) != 0 and t.over.load(.acquire) == 0) {
             if (builtin.is_test) _ = test_paused_waits.fetchAdd(1, .release);
+            testHold(t.io, .paused_wait);
             try t.io.futexWait(u32, &t.paused.raw, 1);
         }
     }
@@ -2400,8 +2404,16 @@ pub const TestPoint = enum {
     /// yield).
     driver_start,
     /// `reserve`: a send found the queue full and has not yet asked for
-    /// WRITABLE.
+    /// WRITABLE. Never armed from a C ABI test: under `anole_net_write` it
+    /// sits inside the slot's spin lock.
     queue_full,
+    /// `waitResumed`: the paused task looked at `paused` and `over` and has
+    /// not yet waited.
+    paused_wait,
+    /// `Driver.run`: a kick slot taken off the list, not yet resolved.
+    driver_turn,
+    /// `waitUnder`: a writer's wait returned, before its next look.
+    waiter_woken,
 };
 
 /// One stop: armed through `test_hold`, taken once by the first caller at
@@ -2440,6 +2452,8 @@ pub const TestHold = struct {
 pub var test_hold: if (builtin.is_test) std.atomic.Value(?*TestHold) else void = if (builtin.is_test) .init(null) else {};
 /// Waits of a paused connection's task for `resumeReading` (test builds only).
 pub var test_paused_waits: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {};
+/// Waits of a writer in `waitUnder` (test builds only).
+pub var test_write_waits: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {};
 /// Driver tasks started (test builds only).
 pub var test_driver_runs: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {};
 

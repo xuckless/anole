@@ -1350,3 +1350,198 @@ test "net tcp: a steady echo on one connection allocates no new send chunk after
     Run.count = &counting;
     try serveWith(&app, Run.run);
 }
+
+// -- Second review (s15/net).
+
+/// The paused task has looked (paused, not over) and not yet waited; the
+/// connection is reset from one place and paused again from another.
+const PausedRace = struct {
+    var conn: std.atomic.Value(?*net.Conn) = .init(null);
+    var closed: std.atomic.Value(u32) = .init(0);
+    var hold: tcp.TestHold = .{ .point = .paused_wait };
+
+    pub fn data(c: *net.Conn, _: []const u8) !void {
+        c.pauseReading();
+        conn.store(c, .release);
+    }
+    pub fn close(_: *net.Conn, _: net.CloseReason) void {
+        _ = closed.fetchAdd(1, .release);
+    }
+};
+
+test "net tcp: a pause after the end of a paused connection does not keep it open" {
+    PausedRace.conn.store(null, .monotonic);
+    PausedRace.closed.store(0, .monotonic);
+    PausedRace.hold = .{ .point = .paused_wait };
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    defer tcp.test_hold.store(null, .release);
+    try app.tcp("127.0.0.1:0", PausedRace, .{});
+    tcp.test_hold.store(&PausedRace.hold, .release);
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            try s.writer().writeAll("a");
+            try s.writer().flush();
+            const c = try waitConn(a.io(), "the connection paused", &PausedRace.conn);
+            try s.writer().writeAll("b");
+            try s.writer().flush();
+            try wait.waitFlag(a.io(), "the task looked and is held before its wait", &PausedRace.hold.held);
+            c.reset();
+            c.pauseReading();
+            PausedRace.hold.let(a.io());
+            try waitFor(a.io(), &PausedRace.closed, 1);
+        }
+    }.run);
+}
+
+/// WRITABLE's callback waits (until canceled) when the server stops: the
+/// connection closes at the shutdown deadline with reason drain.
+const BlockedWritable = struct {
+    var io: std.Io = undefined;
+    var entered: std.atomic.Value(bool) = .init(false);
+    var closed: std.atomic.Value(u32) = .init(0);
+    var reason: std.atomic.Value(u32) = .init(99);
+    const big: [8 * 1024]u8 = @splat('b');
+
+    pub fn data(conn: *net.Conn, _: []const u8) !void {
+        _ = try conn.send(&big);
+    }
+    pub fn writable(_: *net.Conn) !void {
+        entered.store(true, .release);
+        var never: std.Io.Event = .unset;
+        try never.wait(io);
+    }
+    pub fn close(_: *net.Conn, r: net.CloseReason) void {
+        reason.store(@backingInt(r), .release);
+        _ = closed.fetchAdd(1, .release);
+    }
+};
+
+test "net tcp: a connection released while its writable callback waits keeps its own close reason" {
+    BlockedWritable.entered.store(false, .monotonic);
+    BlockedWritable.closed.store(0, .monotonic);
+    BlockedWritable.reason.store(99, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1), .timeouts = .{ .shutdown = .fromMilliseconds(200) } });
+    defer app.deinit();
+    BlockedWritable.io = app.io();
+    try app.tcp("127.0.0.1:0", BlockedWritable, .{ .write_high_water = 4096 });
+    const Run = struct {
+        fn run(a: *App) !void {
+            try a.waitReady();
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            try s.writer().writeAll("x");
+            try s.writer().flush();
+            var buf: [8 * 1024]u8 = undefined;
+            var got: usize = 0;
+            while (got < buf.len) got += try readSome(s, buf[got..]);
+            try wait.waitFlag(a.io(), "the writable callback is waiting", &BlockedWritable.entered);
+            // The client stays open (a FIN would close it as peer): the
+            // stop closes it at the shutdown deadline.
+            a.stop();
+            try waitFor(a.io(), &BlockedWritable.closed, 1);
+        }
+    };
+    var checking = try app.io().concurrent(Run.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
+    try app.run();
+    try checking.await(app.io());
+    try std.testing.expectEqual(@as(u32, 1), BlockedWritable.closed.load(.acquire));
+    try std.testing.expectEqual(@backingInt(net.CloseReason.drain), BlockedWritable.reason.load(.acquire));
+}
+
+/// One send over `write_max` can never be taken.
+const Oversized = struct {
+    var conn: std.atomic.Value(?*net.Conn) = .init(null);
+    pub fn open(c: *net.Conn) !void {
+        conn.store(c, .release);
+    }
+    pub fn data(_: *net.Conn, _: []const u8) !void {}
+    pub fn close(_: *net.Conn, _: net.CloseReason) void {
+        conn.store(null, .release);
+    }
+};
+
+test "net tcp: a send over write_max on an idle connection answers TooLarge, not QueueFull" {
+    Oversized.conn.store(null, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", Oversized, .{ .write_high_water = 4096, .write_max = 4096 });
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            const c = try waitConn(a.io(), "the connection opened", &Oversized.conn);
+            const big: [4097]u8 = @splat('o');
+            try std.testing.expectError(error.TooLarge, c.send(&big));
+            // At the limit it is taken.
+            _ = try c.send(big[0..4096]);
+            try expectRead(s, big[0..4096]);
+        }
+    }.run);
+}
+
+/// A task outside the connection blocked in `waitWritable` when the
+/// connection is released: it wakes (held there by the test) and goes on
+/// only after the release is done. Under the never-reuse allocator a touch
+/// of the freed connection faults.
+const LateWaiter = struct {
+    var io: std.Io = undefined;
+    var conn: std.atomic.Value(?*net.Conn) = .init(null);
+    var closed: std.atomic.Value(u32) = .init(0);
+    var driver_hold: tcp.TestHold = .{ .point = .driver_turn };
+    var waiter_hold: tcp.TestHold = .{ .point = .waiter_woken };
+    // 0: not returned yet; 1: room; 2: Closed; 3: another error.
+    var result: std.atomic.Value(u8) = .init(0);
+    const big: [8 * 1024]u8 = @splat('l');
+
+    pub fn open(c: *net.Conn) !void {
+        conn.store(c, .release);
+    }
+    pub fn data(_: *net.Conn, _: []const u8) !void {}
+    pub fn close(_: *net.Conn, _: net.CloseReason) void {
+        _ = closed.fetchAdd(1, .release);
+        waiter_hold.let(io);
+        driver_hold.let(io);
+    }
+
+    fn waiter(c: *net.Conn) void {
+        if (c.waitWritable()) |_| result.store(1, .release) else |err| result.store(if (err == error.Closed) 2 else 3, .release);
+    }
+};
+
+test "net tcp: a task waiting in waitWritable when the connection is released answers Closed" {
+    LateWaiter.conn.store(null, .monotonic);
+    LateWaiter.closed.store(0, .monotonic);
+    LateWaiter.result.store(0, .monotonic);
+    LateWaiter.driver_hold = .{ .point = .driver_turn };
+    LateWaiter.waiter_hold = .{ .point = .waiter_woken };
+    tcp.test_write_waits.store(0, .monotonic);
+    // Every allocation its own pages, made inaccessible when freed.
+    var app = try App.init(safety.never_reuse_allocator, .{ .executors = .exact(1) });
+    defer app.deinit();
+    defer tcp.test_hold.store(null, .release);
+    LateWaiter.io = app.io();
+    try app.tcp("127.0.0.1:0", LateWaiter, .{ .write_high_water = 4096 });
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            const c = try waitConn(a.io(), "the connection opened", &LateWaiter.conn);
+            // The driver stops before it writes: the bytes stay queued.
+            tcp.test_hold.store(&LateWaiter.driver_hold, .release);
+            _ = try c.send(&LateWaiter.big);
+            try wait.waitFlag(a.io(), "the driver is held", &LateWaiter.driver_hold.held);
+            var w = try a.io().concurrent(LateWaiter.waiter, .{c});
+            defer w.cancel(a.io());
+            try wait.waitAtLeast(a.io(), "the task waits for room", &tcp.test_write_waits, 1);
+            tcp.test_hold.store(&LateWaiter.waiter_hold, .release);
+            c.reset();
+            try waitFor(a.io(), &LateWaiter.closed, 1);
+            w.await(a.io());
+            try std.testing.expectEqual(@as(u8, 2), LateWaiter.result.load(.acquire));
+        }
+    }.run);
+}

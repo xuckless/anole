@@ -485,3 +485,23 @@ test "net udp: a send refused as full while the queue drains gets WRITABLE or is
     try app.run();
     try ctl.await(app.io());
 }
+
+test "net udp: datagrams over send_queue together answer TooLarge, not QueueFull" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.udp("127.0.0.1:0", Pong, .{ .send_queue = 4096 });
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const sock = a.udpSocket("udp-0").?;
+            const peer = try client(a.io());
+            defer peer.close(a.io());
+            const bytes: [3000]u8 = @splat('t');
+            const two: [2]net.UdpSocket.Outgoing = .{ .{ .to = peer.address, .from = null, .bytes = &bytes }, .{ .to = peer.address, .from = null, .bytes = &bytes } };
+            try std.testing.expectError(error.TooLarge, sock.sendMany(&two));
+            const one: [5000]u8 = @splat('t');
+            try std.testing.expectError(error.TooLarge, sock.send(peer.address, null, &one));
+            // One that fits is taken.
+            try sock.sendMany(two[0..1]);
+        }
+    }.run);
+}

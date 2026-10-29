@@ -773,3 +773,17 @@ test "capi net: writes refused after F_END free their chunks after the slot lock
         try std.testing.expectEqualStrings("Ended", engine.net.invalid_token);
     }
 }
+
+test "capi net: a write over tcp.write_max on an idle connection is TOOBIG, not AGAIN" {
+    if (comptime !features.net) return error.SkipZigTest;
+    const rig = try Rig.create("{\"executors\": 1, \"timeouts\": {\"shutdown_ms\": 500}, \"listeners\": [{\"name\": \"chat\", \"address\": \"127.0.0.1\", \"port\": 0, \"tcp\": {\"handler\": 7, \"write_high_water\": 4096, \"write_max\": 4096}}]}");
+    defer rig.destroy();
+    const s = try rig.client();
+    defer s.close();
+    try s.writer().writeAll("x");
+    try s.writer().flush();
+    const open = try rig.take(.net_open);
+    defer free(open);
+    const big: [4097]u8 = @splat('o');
+    try std.testing.expectError(error.TooBig, engine.net.write(rig.e, open.handle, &big, 0));
+}
