@@ -42,9 +42,14 @@ fn peer(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = req.peerCertificate() orelse "none";
 }
 
+/// How often GET /early ran from early data.
+var early_gets: std.atomic.Value(u32) = .init(0);
+
 /// GET /early: whether the request may be a replay of 0-RTT data.
 fn early(req: *dusty.Request, res: *dusty.Response) !void {
-    res.body = if (early_data.isEarly(req)) "early" else "late";
+    const is_early = early_data.isEarly(req);
+    if (is_early) _ = early_gets.fetchAdd(1, .monotonic);
+    res.body = if (is_early) "early" else "late";
 }
 
 /// How often POST /early-post ran.
@@ -86,14 +91,14 @@ fn slow(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = "too late";
 }
 
-/// An event every 100 ms for 1.2 s: a stream that outlives a short
-/// request timeout.
+/// An event every 50 ms for 300 ms: a stream that outlives a short
+/// request timeout (50 ms, a sixth of it).
 fn ticks(req: *dusty.Request, res: *dusty.Response) !void {
     var buf: [256]u8 = undefined;
     var events = try res.startEventStream(&buf);
-    for (0..12) |_| {
+    for (0..6) |_| {
         try events.send("tick", .{});
-        try req.io.sleep(.fromMilliseconds(100), .awake);
+        try req.io.sleep(.fromMilliseconds(50), .awake);
     }
     try events.end();
 }
@@ -166,14 +171,21 @@ fn fields(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = out.items;
 }
 
-/// GET /hold: runs for a second, counting the handlers running at once.
+/// GET /hold: holds until the test opens `hold_gate`, deaf to a cancel
+/// (a canceled request's handler still runs to its end), counting the
+/// handlers started and running at once.
+var hold_started: std.atomic.Value(u32) = .init(0);
 var holding_now: std.atomic.Value(u32) = .init(0);
 var holding_peak: std.atomic.Value(u32) = .init(0);
+var hold_gate: std.Io.Event = .unset;
 fn holdHandler(req: *dusty.Request, res: *dusty.Response) !void {
+    const prev = req.io.swapCancelProtection(.blocked);
+    defer _ = req.io.swapCancelProtection(prev);
+    _ = hold_started.fetchAdd(1, .acq_rel);
     const n = holding_now.fetchAdd(1, .acq_rel) + 1;
     defer _ = holding_now.fetchSub(1, .acq_rel);
     _ = holding_peak.fetchMax(n, .acq_rel);
-    req.io.sleep(.fromSeconds(1), .awake) catch {};
+    try hold_gate.wait(req.io);
     res.body = "held";
 }
 
@@ -335,80 +347,155 @@ const Fixture = struct {
     }
 };
 
-test "h3 client: GET, a large streamed echo, trailers and 40 concurrent streams" {
+test "h3 client: a GET returns the handler's body" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     const io = rt.io();
     var f = try Fixture.start(gpa, io);
     defer f.stop(gpa, io);
-
     const conn = try f.connect(gpa, io);
     defer conn.close();
 
     const body = try get(conn, "/hello", gpa);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("hello over h3", body);
+}
 
-    {
-        // 3 MiB up and back: many windows and rings' worth each way.
-        const big = try gpa.alloc(u8, 3 << 20);
-        defer gpa.free(big);
-        for (big, 0..) |*b, i| b.* = @truncate(i *% 31);
-        const s = try conn.request(&.{
-            .{ .name = ":method", .value = "POST" },  .{ .name = ":path", .value = "/echo" },
-            .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
-        }, .{ .body = true });
-        defer s.release();
-        var sender = try io.concurrent(struct {
-            fn send(st: *client.Stream, data: []const u8) !void {
-                try st.writer().writeAll(data);
-                try st.closeSend();
-            }
-        }.send, .{ s, big });
-        try s.waitHead();
-        const back = try s.reader().allocRemaining(gpa, .unlimited);
-        defer gpa.free(back);
-        try sender.await(io);
-        try std.testing.expect(std.mem.eql(u8, big, back));
-    }
-    {
-        const s = try conn.request(&.{
-            .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/trailers" },
-            .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
-        }, .{});
-        defer s.release();
-        try s.waitHead();
-        const b = try s.reader().allocRemaining(gpa, .unlimited);
-        defer gpa.free(b);
-        try std.testing.expectEqualStrings("body", b);
-        try std.testing.expectEqualStrings("abc", s.trailer("x-checksum").?);
-    }
-    {
-        // Forty tasks, one connection, a server limit of 8 streams at once:
-        // requests wait for stream credit.
-        var group: std.Io.Group = .init;
-        defer group.cancel(io);
-        var ok: std.atomic.Value(usize) = .init(0);
-        for (0..40) |_| try group.concurrent(io, struct {
-            fn one(cn: *client.ClientConnection, a: std.mem.Allocator, count: *std.atomic.Value(usize)) std.Io.Cancelable!void {
-                const b = get(cn, "/hello", a) catch return;
-                defer a.free(b);
-                if (std.mem.eql(u8, b, "hello over h3")) _ = count.fetchAdd(1, .monotonic);
-            }
-        }.one, .{ conn, gpa, &ok });
-        try group.await(io);
-        try std.testing.expectEqual(@as(usize, 40), ok.load(.monotonic));
-    }
+test "h3 client: a 3 MiB body streams up and back past the windows and the ring" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    // 3 MiB up and back: many windows and rings' worth each way.
+    const big = try gpa.alloc(u8, 3 << 20);
+    defer gpa.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "POST" },  .{ .name = ":path", .value = "/echo" },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{ .body = true });
+    defer s.release();
+    var sender = try io.concurrent(struct {
+        fn send(st: *client.Stream, data: []const u8) !void {
+            try st.writer().writeAll(data);
+            try st.closeSend();
+        }
+    }.send, .{ s, big });
+    defer sender.cancel(io) catch {};
+    try s.waitHead();
+    const back = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(back);
+    try sender.await(io);
+    try std.testing.expect(std.mem.eql(u8, big, back));
+}
+
+test "h3 client: trailers arrive after the body" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const s = try request(conn, "GET", "/trailers", .{});
+    defer s.release();
+    try s.waitHead();
+    const b = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(b);
+    try std.testing.expectEqualStrings("body", b);
+    try std.testing.expectEqualStrings("abc", s.trailer("x-checksum").?);
+}
+
+test "h3 client: 40 requests on one connection wait for stream credit under max_streams_bidi 8" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    // Forty tasks, one connection, a server limit of 8 streams at once:
+    // requests wait for stream credit.
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    var ok: std.atomic.Value(usize) = .init(0);
+    for (0..40) |_| try group.concurrent(io, struct {
+        fn one(cn: *client.ClientConnection, a: std.mem.Allocator, count: *std.atomic.Value(usize)) std.Io.Cancelable!void {
+            const b = get(cn, "/hello", a) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                // Not counted: the wait below fails and says so.
+                else => return,
+            };
+            defer a.free(b);
+            if (std.mem.eql(u8, b, "hello over h3")) _ = count.fetchAdd(1, .monotonic);
+        }
+    }.one, .{ conn, gpa, &ok });
+    // Bounded: a stream credit that leaks would hold the group forever.
+    try wait.waitAtLeast(io, "40 GETs answered", &ok, 40);
+    try group.await(io);
+    try std.testing.expectEqual(@as(usize, 40), ok.load(.monotonic));
+}
+
+test "h3 server: the outbox sends several datagrams per flush under a bulk transfer" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    // 3 MiB down: thousands of packets.
+    const n = 3 << 20;
+    const body = try get(conn, std.fmt.comptimePrint("/download?n={d}", .{n}), gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqual(@as(usize, n), body.len);
     // Every packet went out through the endpoint's outbox, and its sends
-    // carried several at a time: the 3 MiB alone is thousands of packets.
+    // carried several at a time.
     const stats = &f.ep.stats;
     const datagrams = stats.datagrams_out.load(.monotonic);
     try std.testing.expect(datagrams > 2000);
     try std.testing.expect(stats.tx_flushes.load(.monotonic) < datagrams);
 }
 
-test "h3 client: certificate checks, and a server that goes away" {
+test "h3 client: an untrusted certificate or a wrong name fails the handshake" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+
+    // No trust in the server's certificate, or the wrong name. The
+    // connect timeout is only a hang guard: the handshake fails on its
+    // own, however slowly, and a timeout would read as Timeout instead.
+    try std.testing.expectError(error.HandshakeFailed, client.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = f.ep.address(),
+        .port = f.ep.address().getPort(),
+        .connect_timeout = wait.deadline(),
+    }));
+    try std.testing.expectError(error.HandshakeFailed, client.ClientConnection.connect(gpa, io, .{
+        .host = "example.com",
+        .address = f.ep.address(),
+        .port = f.ep.address().getPort(),
+        .tls = .{ .ca = .{ .pem = f.pem.cert } },
+        .connect_timeout = wait.deadline(),
+    }));
+}
+
+test "h3 client: requests on a connection whose server drained fail" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
@@ -416,21 +503,6 @@ test "h3 client: certificate checks, and a server that goes away" {
     var f = try Fixture.start(gpa, io);
     var stopped = false;
     defer if (!stopped) f.stop(gpa, io);
-
-    // No trust in the server's certificate, or the wrong name.
-    try std.testing.expectError(error.HandshakeFailed, client.ClientConnection.connect(gpa, io, .{
-        .host = "localhost",
-        .address = f.ep.address(),
-        .port = f.ep.address().getPort(),
-        .connect_timeout = .fromSeconds(2),
-    }));
-    try std.testing.expectError(error.HandshakeFailed, client.ClientConnection.connect(gpa, io, .{
-        .host = "example.com",
-        .address = f.ep.address(),
-        .port = f.ep.address().getPort(),
-        .tls = .{ .ca = .{ .pem = f.pem.cert } },
-        .connect_timeout = .fromSeconds(2),
-    }));
 
     const conn = try f.connect(gpa, io);
     defer conn.close();
@@ -468,6 +540,7 @@ fn post(conn: *client.ClientConnection, io: std.Io, path: []const u8, body: []co
             try st.closeSend();
         }
     }.send, .{ s, body });
+    defer sender.cancel(io) catch {};
     try s.waitHead();
     const back = try s.reader().allocRemaining(gpa, .unlimited);
     errdefer gpa.free(back);
@@ -476,7 +549,20 @@ fn post(conn: *client.ClientConnection, io: std.Io, path: []const u8, body: []co
     return back;
 }
 
-test "h3 server: no_wait routes run inline, past the ring, beside tasks; one that waits still answers" {
+/// GETs `path` and counts the answers that are `want` (a task of a group).
+const Check = struct {
+    fn one(cn: *client.ClientConnection, a: std.mem.Allocator, path: []const u8, want: []const u8, count: *std.atomic.Value(usize)) std.Io.Cancelable!void {
+        const b = get(cn, path, a) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            // Not counted: the test's wait fails and says so.
+            else => return,
+        };
+        defer a.free(b);
+        if (std.mem.eql(u8, b, want)) _ = count.fetchAdd(1, .monotonic);
+    }
+};
+
+test "h3 server: no_wait GETs run inline, beside requests on tasks" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
@@ -489,18 +575,24 @@ test "h3 server: no_wait routes run inline, past the ring, beside tasks; one tha
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     var ok: std.atomic.Value(usize) = .init(0);
-    const Check = struct {
-        fn one(cn: *client.ClientConnection, a: std.mem.Allocator, path: []const u8, want: []const u8, count: *std.atomic.Value(usize)) std.Io.Cancelable!void {
-            const b = get(cn, path, a) catch return;
-            defer a.free(b);
-            if (std.mem.eql(u8, b, want)) _ = count.fetchAdd(1, .monotonic);
-        }
-    };
     for (0..20) |_| try group.concurrent(io, Check.one, .{ conn, gpa, "/nw/hello?x=1", "hello over h3", &ok });
     try group.concurrent(io, Check.one, .{ conn, gpa, "/hello", "hello over h3", &ok });
-    try group.concurrent(io, Check.one, .{ conn, gpa, "/nw/slow", "slow but whole", &ok });
+    try wait.waitAtLeast(io, "21 GETs answered", &ok, 21);
     try group.await(io);
-    try std.testing.expectEqual(@as(usize, 22), ok.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 21), ok.load(.monotonic));
+    // The twenty no_wait GETs ran inline (each came whole with its head).
+    try std.testing.expect(f.ep.stats.served_inline.load(.monotonic) >= 20);
+}
+
+test "h3 server: a no_wait response far past the ring completes" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
 
     // Written at once, far past the ring: the rest waits for the peer's
     // acknowledgments without the endpoint task waiting for them.
@@ -508,6 +600,32 @@ test "h3 server: no_wait routes run inline, past the ring, beside tasks; one tha
     defer gpa.free(b);
     try std.testing.expectEqual(@as(usize, big_body_len), b.len);
     for (b, 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(i *% 13)), byte);
+}
+
+test "h3 server: a no_wait handler that waits still answers" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const b = try get(conn, "/nw/slow", gpa);
+    defer gpa.free(b);
+    try std.testing.expectEqualStrings("slow but whole", b);
+}
+
+test "h3 server: no_wait request bodies of 0 bytes to 2 MiB reach the handler whole" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
 
     // A body: inline when it came whole with the head, on a task when it
     // takes many packets.
@@ -520,21 +638,25 @@ test "h3 server: no_wait routes run inline, past the ring, beside tasks; one tha
         defer gpa.free(got);
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ n, std.hash.Wyhash.hash(0, body[0..n]) }), got);
     }
+}
 
-    const s = try conn.request(&.{
-        .{ .name = ":method", .value = "HEAD" },  .{ .name = ":path", .value = "/nw/hello" },
-        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
-    }, .{});
+test "h3 server: HEAD on a no_wait route gets the status and no body" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const s = try request(conn, "HEAD", "/nw/hello", .{});
     defer s.release();
     try s.waitHead();
     try std.testing.expectEqual(@as(u16, 200), s.status);
     const none = try s.reader().allocRemaining(gpa, .unlimited);
     defer gpa.free(none);
     try std.testing.expectEqual(@as(usize, 0), none.len);
-
-    // The twenty, the slow one, the big one and the HEAD at least; most of
-    // the bodies too.
-    try std.testing.expect(f.ep.stats.served_inline.load(.monotonic) >= 23);
 }
 
 test "h3 server: long-header packets with a connection ID over 20 bytes are dropped, and the endpoint carries on" {
@@ -698,29 +820,50 @@ test "h3 server: requests the client cancels keep their stream credit until thei
     const io = rt.io();
     var f = try Fixture.start(gpa, io);
     defer f.stop(gpa, io);
+    hold_started.store(0, .monotonic);
+    holding_now.store(0, .monotonic);
+    holding_peak.store(0, .monotonic);
+    hold_gate = .unset;
+    // On every exit, before the fixture stops: no handler left holding.
+    defer hold_gate.set(io);
     const conn = try f.connect(gpa, io);
     defer conn.close();
-    holding_peak.store(0, .monotonic);
 
-    // Forty requests, each canceled once its handler has started: the
-    // server's limit is 8 streams at once, handlers included.
+    // Eight requests, the server's limit of streams at once, all in their
+    // handlers; then the client cancels them. Their handlers run on.
+    var first: [8]*client.Stream = undefined;
+    var opened: usize = 0;
+    defer for (first[0..opened]) |st| st.release();
+    for (&first) |*st| {
+        st.* = try request(conn, "GET", "/hold", .{});
+        opened += 1;
+    }
+    try wait.waitEqual(io, "8 handlers holding", &holding_now, 8);
+    for (first) |st| st.release();
+    opened = 0;
+
+    // Eight more: they get no stream credit while the canceled eight's
+    // handlers still run, so none of their handlers starts.
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    for (0..40) |_| try group.concurrent(io, struct {
-        fn one(cn: *client.ClientConnection, i: std.Io) std.Io.Cancelable!void {
-            const st = request(cn, "GET", "/hold", .{}) catch return;
-            // Time for the handler to start before the cancel (a
-            // sensitivity sleep: on a slow machine more requests are
-            // canceled before their handlers run, which only makes the
-            // cap easier to keep, never fails a right server).
-            try i.sleep(.fromMilliseconds(30), .awake);
-            st.release();
+    var ok: std.atomic.Value(usize) = .init(0);
+    for (0..8) |_| try group.concurrent(io, Check.one, .{ conn, gpa, "/hold", "held", &ok });
+    const Credit = struct {
+        fn held(_: void) bool {
+            return holding_now.load(.acquire) <= 8 and hold_started.load(.acquire) == 8;
         }
-    }.one, .{ conn, io });
+    };
+    try wait.expectStays(io, "no handler starts past the 8 streams the canceled requests still hold", {}, Credit.held, wait.short_window);
+
+    // The canceled eight end; the next eight get their credit, run and
+    // answer.
+    hold_gate.set(io);
+    try wait.waitAtLeast(io, "the second 8 requests answered", &ok, 8);
     try group.await(io);
+    try std.testing.expectEqual(@as(u32, 16), hold_started.load(.monotonic));
     try std.testing.expect(holding_peak.load(.monotonic) <= 8);
 
-    // The connection carries on once they are done.
+    // The connection carries on.
     const body = try get(conn, "/hello", gpa);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("hello over h3", body);
@@ -785,13 +928,14 @@ test "h3 server: an event stream outlives timeouts.request" {
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     const io = rt.io();
-    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{}, .timeout = .{ .request = .fromMilliseconds(300), .write = .fromSeconds(5) } }, .{});
+    // The stream runs 300 ms, six times the request timeout.
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{}, .timeout = .{ .request = .fromMilliseconds(50), .write = .fromSeconds(5) } }, .{});
     defer f.stop(gpa, io);
     const conn = try f.connect(gpa, io);
     defer conn.close();
     const body = try get(conn, "/ticks", gpa);
     defer gpa.free(body);
-    try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, body, "data: tick"));
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, body, "data: tick"));
 }
 
 test "h3 server: mutual TLS in request mode, and the client certificate in handlers (PEM or files)" {
@@ -1027,9 +1171,21 @@ pub const Relay = struct {
     answered: bool = false,
     /// The client's next this many datagrams are lost.
     drop_up: u32 = 0,
-    /// The server's next datagram, and so all after it, waits this long,
-    /// once.
-    hold_down_ms: u32 = 0,
+    /// While set (`holdDownUntilResend`), the server's datagrams wait until
+    /// the client has sent its first flight's token-less Initials again
+    /// (its PTO resend): whatever the server answered first reaches the
+    /// client only after the resend reached the server.
+    hold_down_until_resend: bool = false,
+    /// Token-less Initial datagrams the client sent (lost ones included).
+    tokenless_initials: u32 = 0,
+    /// The ones sent before the server first answered: the first flight;
+    /// zero until then.
+    first_flight_initials: u32 = 0,
+    resend_seen: std.Io.Event = .unset,
+    /// While set (`holdUp`), the client's datagrams (its ACKs among them)
+    /// wait for `releaseUp`, in order.
+    hold_up: bool = false,
+    up_gate: std.Io.Event = .unset,
     /// When set, the NAT rebinds as the server first answers: that answer
     /// is lost, as is everything else the server sends to the old port, and
     /// the client's datagrams from then on leave from another port.
@@ -1172,6 +1328,13 @@ pub const Relay = struct {
     fn forwardUp(r: *Relay, from: std.Io.net.IpAddress, d: []const u8) std.Io.Cancelable!void {
         r.mutex.lockUncancelable(r.io);
         r.client = from;
+        var resent = false;
+        if (tokenlessInitial(d)) {
+            r.tokenless_initials += 1;
+            // The first flight once more: the server hears it before the
+            // held answer is let go (below, once this one is sent).
+            resent = r.first_flight_initials > 0 and r.tokenless_initials >= 2 * r.first_flight_initials;
+        }
         if (r.drop_up > 0) {
             r.drop_up -= 1;
             r.mutex.unlock(r.io);
@@ -1184,9 +1347,40 @@ pub const Relay = struct {
             if (copy) |c| r.recorded.append(r.gpa, c) catch r.gpa.free(c);
         }
         const via = if (r.rebound) &r.back2 else &r.back;
+        const held = r.hold_up;
         r.mutex.unlock(r.io);
+        if (held) try r.up_gate.wait(r.io);
         if (hold > 0) try r.io.sleep(.fromMilliseconds(hold), .awake);
         via.send(r.io, r.server, null, 0, d, d.len);
+        if (resent) r.resend_seen.set(r.io);
+    }
+
+    /// Holds every datagram the client sends from now on, in order, until
+    /// `releaseUp`: the server hears nothing from it, no ACK either.
+    pub fn holdUp(r: *Relay) void {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        r.up_gate = .unset;
+        r.hold_up = true;
+    }
+
+    /// The held datagrams go on, and so does everything after them.
+    pub fn releaseUp(r: *Relay) void {
+        r.mutex.lockUncancelable(r.io);
+        r.hold_up = false;
+        r.mutex.unlock(r.io);
+        r.up_gate.set(r.io);
+    }
+
+    /// Holds the server's datagrams until the client resends its first
+    /// flight's token-less Initials (`hold_down_until_resend`).
+    fn holdDownUntilResend(r: *Relay) void {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        r.hold_down_until_resend = true;
+        r.tokenless_initials = 0;
+        r.first_flight_initials = 0;
+        r.resend_seen = .unset;
     }
 
     fn down(r: *Relay, second: bool) std.Io.Cancelable!void {
@@ -1215,12 +1409,19 @@ pub const Relay = struct {
                 try r.gate.wait(r.io);
                 r.mutex.lockUncancelable(r.io);
             }
+            if (r.hold_down_until_resend) {
+                // The server's first answer: what the client sent so far
+                // is its first flight.
+                if (r.first_flight_initials == 0) r.first_flight_initials = r.tokenless_initials;
+                r.mutex.unlock(r.io);
+                // No deadline here: the test's connect bounds it.
+                try r.resend_seen.wait(r.io);
+                r.mutex.lockUncancelable(r.io);
+                r.hold_down_until_resend = false;
+            }
             r.answered = true;
             const to = r.client;
-            const hold = r.hold_down_ms;
-            r.hold_down_ms = 0;
             r.mutex.unlock(r.io);
-            if (hold > 0) try r.io.sleep(.fromMilliseconds(hold), .awake);
             if (to) |a| while (dg.next()) |d| r.front.send(r.io, a, null, 0, d, d.len);
         }
     }
@@ -1268,6 +1469,20 @@ pub const Relay = struct {
         sender.send(r.io, r.server, null, 0, joined.items, joined.items.len);
     }
 };
+
+/// Whether the datagram starts with an Initial packet with no token: a
+/// client's first flight, or its resend before it acted on a Retry.
+fn tokenlessInitial(d: []const u8) bool {
+    if (d.len < 7 or d[0] & 0x80 == 0) return false;
+    const kind = LongPackets.kindOf(d[0], std.mem.readInt(u32, d[1..5], .big)) orelse return false;
+    if (kind != .initial) return false;
+    var p: usize = 5;
+    p += 1 + @as(usize, d[p]);
+    if (p >= d.len) return false;
+    p += 1 + @as(usize, d[p]);
+    const token_len = LongPackets.varint(d, &p) orelse return false;
+    return token_len == 0;
+}
 
 /// The long-header packets at the start of a datagram, each whole (RFC 9000
 /// §17.2; the type bits are not header-protected). A short-header packet,
@@ -1350,9 +1565,7 @@ fn hasTicket(cache: *client.SessionCache) bool {
 }
 
 fn noConnections(ep: *Endpoint) bool {
-    ep.map_mutex.lockUncancelable(ep.io);
-    defer ep.map_mutex.unlock(ep.io);
-    return ep.conns.count() == 0;
+    return ep.stats.connections_open.load(.monotonic) == 0;
 }
 
 /// The server's closed connections are gone: each one's closing or
@@ -1393,6 +1606,7 @@ test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a repl
     // handled before the handshake completed; they are in the recorded
     // first flight, which the replay below sends again.
     const posts = early_posts.load(.monotonic);
+    const gets = early_gets.load(.monotonic);
     relay.armGated();
     {
         const conn = try f.connectResuming(gpa, io, &cache, true, relay);
@@ -1411,9 +1625,9 @@ test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a repl
         try std.testing.expectEqualStrings("late", p);
         try std.testing.expectEqual(client.EarlyData.accepted, conn.earlyData());
         try std.testing.expect(conn.resumed());
+        // Each ran once: the GET from early data, the POST after.
         try std.testing.expectEqual(posts + 1, early_posts.load(.monotonic));
-        try std.testing.expectEqual(@as(u64, 1), f.ep.early_served.load(.monotonic));
-        try std.testing.expectEqual(@as(u64, 1), f.ep.early_held.load(.monotonic));
+        try std.testing.expectEqual(gets + 1, early_gets.load(.monotonic));
         relay.disarm();
     }
 
@@ -1422,12 +1636,8 @@ test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a repl
     // and holds the POST for a handshake that never completes.
     try wait.waitUntil(io, "connectionsGone", f.ep, connectionsGone);
     try relay.replay();
-    const Held = struct {
-        fn two(ep: *Endpoint) bool {
-            return ep.early_held.load(.monotonic) == 2;
-        }
-    };
-    try wait.waitUntil(io, "Held.two", f.ep, Held.two);
+    // The replayed GET runs, from early data.
+    try wait.waitEqual(io, "the replayed GET ran", &early_gets, gets + 2);
     // The POST never runs: its handshake never completes.
     const Unrun = struct {
         posts: u32,
@@ -1437,7 +1647,7 @@ test "h3: resumption and 0-RTT; early GET runs at once, early POST waits, a repl
     };
     try wait.expectStays(io, "the replayed POST is not run", Unrun{ .posts = posts + 1 }, Unrun.cond, .fromMilliseconds(300));
     try std.testing.expectEqual(posts + 1, early_posts.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 2), f.ep.early_served.load(.monotonic));
+    try std.testing.expectEqual(gets + 2, early_gets.load(.monotonic));
 }
 
 test "h3: a new connection given up after its first packet started a 0-RTT request is freed safely" {
@@ -1610,13 +1820,15 @@ test "h3 server: a ClientHello resent before the client acted on our Retry gets 
     defer relay.stop();
     // The ClientHello (with its post-quantum key share) spans two
     // Initials; the first is lost, so the server sees a later piece first
-    // and answers with a Retry. That Retry is held up past the client's
-    // PTO, so the client resends its whole ClientHello, still without a
-    // token, before it acts on the Retry: the runner's handshakecorruption
-    // case with neqo, whose first Initial leads with a later piece.
+    // and answers with a Retry. That Retry is held until the client's PTO
+    // has resent its whole ClientHello, still without a token, so the
+    // server sees the resend before the client acts on the Retry: the
+    // runner's handshakecorruption case with neqo, whose first Initial
+    // leads with a later piece. No time decides it: the relay goes by the
+    // packets' types.
+    relay.holdDownUntilResend();
     relay.mutex.lockUncancelable(io);
     relay.drop_up = 1;
-    relay.hold_down_ms = 1500;
     relay.mutex.unlock(io);
     const conn = try client.ClientConnection.connect(gpa, io, .{
         .host = "localhost",
@@ -1854,7 +2066,9 @@ test "h3 client: resetCode reports the server's RESET_STREAM code" {
         .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
     }, .{});
     defer s.release();
-    s.waitHead() catch {};
+    // A reset is the expected end, before or after the head; a cancel of
+    // this task is not.
+    s.waitHead() catch |err| if (err == error.Canceled) return err;
     _ = s.reader().allocRemaining(gpa, .unlimited) catch |err| switch (err) {
         error.ReadFailed, error.OutOfMemory, error.StreamTooLong => {},
     };
@@ -1869,18 +2083,28 @@ test "h3 client: send_buffer = 1 MiB queues a 1 MiB body before the server reads
     gate = .unset;
     var f = try Fixture.start(gpa, io);
     defer f.stop(gpa, io);
+    // On every exit, before the fixture stops: the handler reads on.
+    defer gate.set(io);
     const conn = try f.connect(gpa, io);
     defer conn.close();
-    const s = try conn.request(&.{
-        .{ .name = ":method", .value = "POST" },  .{ .name = ":path", .value = "/gated" },
-        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
-    }, .{ .body = true, .send_buffer = 1 << 20 });
+    const s = try request(conn, "POST", "/gated", .{ .body = true, .send_buffer = 1 << 20 });
     defer s.release();
     const body = try gpa.alloc(u8, 1 << 20);
     defer gpa.free(body);
     for (body, 0..) |*b, i| b.* = @truncate(i *% 7);
-    try s.writer().writeAll(body);
-    try s.writer().flush();
+    // The write and flush, in a task: if they waited for the server to
+    // read, they would wait for the gate, and the wait below fails.
+    var written: std.atomic.Value(bool) = .init(false);
+    var writer = try io.concurrent(struct {
+        fn write(st: *client.Stream, data: []const u8, done: *std.atomic.Value(bool)) !void {
+            try st.writer().writeAll(data);
+            try st.writer().flush();
+            done.store(true, .release);
+        }
+    }.write, .{ s, body, &written });
+    defer writer.cancel(io) catch {};
+    try wait.waitFlag(io, "the 1 MiB body queued before the server read", &written);
+    try writer.await(io);
     gate.set(io);
     try s.closeSend();
     try s.waitHead();
@@ -1938,11 +2162,7 @@ test "h3 server: an answer before the request body ends lets the client finish s
     }
 }
 
-fn keepAliveOn(conn: *client.ClientConnection) bool {
-    return conn.keepAliveArmed();
-}
-
-test "h3 client: keep-alive is armed while a request is open and disarmed after" {
+test "h3: keep-alive is armed while a request is open and lets the connection idle out after" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
@@ -1951,24 +2171,31 @@ test "h3 client: keep-alive is armed while a request is open and disarmed after"
     wait_canceled = .unset;
     var f = try Fixture.start(gpa, io);
     defer f.stop(gpa, io);
-    const conn = try f.connect(gpa, io);
+    // A short idle timeout, and keep-alive well inside it: a connection
+    // whose keep-alive stayed armed would never idle out.
+    const conn = try client.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = f.ep.address(),
+        .port = f.ep.address().getPort(),
+        .tls = .{ .ca = .{ .pem = f.pem.cert } },
+        .idle_timeout = .fromMilliseconds(300),
+        .keep_alive = .fromMilliseconds(50),
+    });
     defer conn.close();
-    try std.testing.expect(!keepAliveOn(conn));
-    const s = try conn.request(&.{
-        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/wait" },
-        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
-    }, .{});
-    try wait_started.wait(io);
-    try std.testing.expect(keepAliveOn(conn));
-    // The server arms its side the same way.
-    try std.testing.expect(f.ep.stats.keep_alive_arms.load(.monotonic) >= 1);
-    s.release();
-    // The stream is freed once QUIC has closed it; then it disarms.
-    try wait.waitUntil(io, "the client's keep-alive disarmed", conn, struct {
-        fn off(cn: *client.ClientConnection) bool {
-            return !keepAliveOn(cn);
+    {
+        const s = try request(conn, "GET", "/wait", .{});
+        defer s.release();
+        try wait.waitEvent(io, "the /wait handler started", &wait_started);
+        // A request opened on an idle connection: the server arms its side.
+        try std.testing.expect(f.ep.stats.keep_alive_arms.load(.monotonic) >= 1);
+    }
+    // The request is done: nothing keeps the connection alive any more,
+    // and it closes at its idle timeout.
+    try wait.waitUntil(io, "the idle connection closed", conn, struct {
+        fn closed(cn: *client.ClientConnection) bool {
+            return !cn.isOpen();
         }
-    }.off);
+    }.closed);
 }
 
 test "h3 server: a peer RESET_STREAM cancels a REST handler's wait" {
@@ -1987,9 +2214,9 @@ test "h3 server: a peer RESET_STREAM cancels a REST handler's wait" {
         .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
     }, .{});
     defer s.release();
-    try wait_started.wait(io);
+    try wait.waitEvent(io, "the /wait handler started", &wait_started);
     s.cancel();
-    try wait_canceled.wait(io);
+    try wait.waitEvent(io, "the handler's wait was canceled", &wait_canceled);
 }
 
 /// A parked response (`Response._park`, design-realtime §3.4): the handler
@@ -2127,12 +2354,12 @@ test "parked h3: a stream reset tells the owner once; release frees the stream" 
     defer conn.close();
 
     const s = try request(conn, "GET", "/live", .{});
-    try H3Park.opened.wait(io);
+    try wait.waitEvent(io, "the handler parked", &H3Park.opened);
     try H3Park.on(io, .{ .burst = .{ .parts = &.{"data: a\n\n"}, .end = false } });
     try s.waitHead();
     s.cancel();
     s.release();
-    try H3Park.gone.wait(io);
+    try wait.waitEvent(io, "the park's owner told the stream is gone", &H3Park.gone);
     try std.testing.expectEqual(@as(u32, 1), H3Park.gone_calls.load(.monotonic));
     try H3Park.on(io, .begin_fails);
     try H3Park.on(io, .release);
@@ -2154,15 +2381,20 @@ test "parked h3: a no_wait route parks on the endpoint task; the connection clos
     defer f.stop(gpa, io);
     f.http.router.addRouteWith(.get, "/nw/live", H3Park.park, .{ .no_wait = true });
     const conn = try f.connect(gpa, io);
+    var closed = false;
+    defer if (!closed) conn.close();
 
-    const s = try request(conn, "GET", "/nw/live", .{});
-    try H3Park.opened.wait(io);
-    try H3Park.on(io, .{ .burst = .{ .parts = &.{"data: a\n\n"}, .end = false } });
-    try s.waitHead();
-    try std.testing.expectEqual(@as(u16, 200), s.status);
-    s.release();
+    {
+        const s = try request(conn, "GET", "/nw/live", .{});
+        defer s.release();
+        try wait.waitEvent(io, "the handler parked", &H3Park.opened);
+        try H3Park.on(io, .{ .burst = .{ .parts = &.{"data: a\n\n"}, .end = false } });
+        try s.waitHead();
+        try std.testing.expectEqual(@as(u16, 200), s.status);
+    }
     conn.close();
-    try H3Park.gone.wait(io);
+    closed = true;
+    try wait.waitEvent(io, "the park's owner told the connection is gone", &H3Park.gone);
     try std.testing.expectEqual(@as(u32, 1), H3Park.gone_calls.load(.monotonic));
     // The connection is not freed before the owner lets go.
     try std.testing.expect(!noConnections(f.ep));
