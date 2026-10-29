@@ -217,6 +217,12 @@ test "Signal: a set wakes the waiter, and a reset makes it wait again" {
     defer waiter.cancel(io) catch {};
     signal.set(io);
     try test_wait.waitAtLeast(io, "the waiter woke once", &woke, 1);
+    // After its reset the waiter blocks: no further wake without a set.
+    try test_wait.expectStays(io, "the waiter waits after reset", &woke, struct {
+        fn once(n: *const std.atomic.Value(u32)) bool {
+            return n.load(.acquire) == 1;
+        }
+    }.once, test_wait.short_window);
     signal.set(io);
     try test_wait.waitAtLeast(io, "the waiter woke again", &woke, 2);
     try std.testing.expectError(error.Canceled, waiter.cancel(io));

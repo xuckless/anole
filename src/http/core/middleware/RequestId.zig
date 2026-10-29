@@ -85,10 +85,42 @@ test "incoming: only IDs made of letters, digits and . _ : -" {
     try std.testing.expect(!validIncoming(&@as([129]u8, @splat('a'))));
 }
 
+const NextStub = struct {
+    called: bool = false,
+
+    fn call(self: *NextStub) !void {
+        self.called = true;
+    }
+};
+
 test "preset: an ID the engine set is kept, an empty one is replaced" {
-    var req: Request = undefined;
-    req.id = "abc-123";
-    try std.testing.expectEqualStrings("abc-123", preset(&req).?);
-    req.id = "";
-    try std.testing.expect(preset(&req) == null);
+    const Connection = @import("../server.zig").Connection;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [256]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    const mw = RequestId.init(.{});
+
+    // Set by the engine: kept, and echoed.
+    {
+        var req: Request = .{ .arena = arena.allocator(), ._transport = undefined, ._parser = undefined, .io = std.testing.io, .id = "abc-123" };
+        var res = try Response._init(arena.allocator(), &connection, 32);
+        var next: NextStub = .{};
+        try mw.execute(&req, &res, &next);
+        try std.testing.expect(next.called);
+        try std.testing.expectEqualStrings("abc-123", req.id);
+        try std.testing.expectEqualStrings("abc-123", res.headers.get("X-Request-Id").?);
+    }
+    // Empty: replaced by a fresh 128-bit ID in lowercase hex, and echoed.
+    {
+        var req: Request = .{ .arena = arena.allocator(), ._transport = undefined, ._parser = undefined, .io = std.testing.io, .id = "" };
+        var res = try Response._init(arena.allocator(), &connection, 32);
+        var next: NextStub = .{};
+        try mw.execute(&req, &res, &next);
+        try std.testing.expectEqual(@as(usize, 32), req.id.len);
+        for (req.id) |ch| try std.testing.expect(std.ascii.isDigit(ch) or (ch >= 'a' and ch <= 'f'));
+        try std.testing.expectEqualStrings(req.id, res.headers.get("X-Request-Id").?);
+    }
 }

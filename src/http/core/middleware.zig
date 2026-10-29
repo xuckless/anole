@@ -489,6 +489,16 @@ fn makeTestResponse(conn: *Connection) Response {
     };
 }
 
+/// A handler that records its call in the same tracker as the middlewares.
+const TrackingHandler = struct {
+    var tracker: ?*CallTracker = null;
+
+    fn handle(_: *Request, res: *Response) !void {
+        tracker.?.append(9);
+        res.body = "handler called";
+    }
+};
+
 test "Middleware: multiple middlewares execute in order" {
     var tracker = CallTracker{};
 
@@ -511,16 +521,16 @@ test "Middleware: multiple middlewares execute in order" {
         .req = &req,
         .res = &res,
         .ctx = {},
-        .action = testHandler,
+        .action = TrackingHandler.handle,
         .middlewares = &middlewares,
     };
 
+    TrackingHandler.tracker = &tracker;
+    defer TrackingHandler.tracker = null;
     try chain.call();
 
-    try std.testing.expectEqual(3, tracker.len);
-    try std.testing.expectEqual(1, tracker.items()[0]);
-    try std.testing.expectEqual(2, tracker.items()[1]);
-    try std.testing.expectEqual(3, tracker.items()[2]);
+    // The middlewares in order, then the handler (9).
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 9 }, tracker.items());
     try std.testing.expectEqualStrings("handler called", res.body);
 }
 
@@ -675,7 +685,7 @@ test "Executor: a peer-shaped error of the handler's own is still a 500" {
 
     // Nothing failed on this connection, so the error came from elsewhere:
     // a file, an upstream call, a std helper at the end of the body.
-    chain.run() catch {};
+    try chain.run();
     try std.testing.expectEqual(.internal_server_error, res.status);
 }
 
@@ -760,7 +770,7 @@ test "Executor: custom notFound handler" {
         .middlewares = &.{},
     };
 
-    chain.run() catch {};
+    try chain.run();
 
     try std.testing.expect(ctx.not_found_called);
     try std.testing.expectEqual(.not_found, res.status);
@@ -782,7 +792,7 @@ test "Executor: custom uncaughtError handler" {
         .middlewares = &.{},
     };
 
-    chain.run() catch {};
+    try chain.run();
 
     try std.testing.expect(ctx.uncaught_error_called);
     try std.testing.expectEqual(error.CustomError, ctx.last_error.?);
@@ -829,7 +839,7 @@ test "Executor: middleware error triggers custom uncaughtError" {
         .middlewares = &middlewares,
     };
 
-    chain.run() catch {};
+    try chain.run();
 
     try std.testing.expect(ctx.uncaught_error_called);
     try std.testing.expectEqual(error.MiddlewareError, ctx.last_error.?);
