@@ -116,10 +116,12 @@ breaking changes are listed anyway.
   more) ends such waits at once, so it does not wait for room that no poll
   will make; the same goes for an HTTP/1.1 request (503) and a client- or
   bidirectional-streaming gRPC call (UNAVAILABLE) still waiting to be
-  handed over, which held `destroy` until the request's deadline, or for
-  ever. Such a gRPC call whose deadline passed in that wait now ends with
-  DEADLINE_EXCEEDED; it was ended as a cancel the task never got, which
-  could trip zio's re-arm assertion.
+  handed over, which held `destroy` until the earlier of the request's
+  deadline and `timeouts.shutdown_ms` (for ever only with an unbounded
+  shutdown). Such a gRPC call whose deadline passed in that wait still
+  ends with DEADLINE_EXCEEDED, but no longer re-arms a cancel that was
+  never delivered (a zio assertion in Debug and ReleaseSafe, a phantom
+  pending cancel at the task's next wait in ReleaseFast).
 - Webhooks: on PostgreSQL, `hooks.messages` paged in the database's
   collation order (en_US, ICU) instead of by bytes, so caller-supplied ids
   such as `msg_D` and `msg_c` came back in a different order than on SQLite
