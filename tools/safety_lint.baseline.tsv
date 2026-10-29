@@ -32,7 +32,6 @@ src/capi/nats.zig	L2	2
 src/capi/nats.zig	U3	10
 src/capi/net.zig	L2	1
 src/capi/net.zig	U3	16
-src/capi/pipe.zig	L2	1
 src/capi/s3.zig	L2	2
 src/capi/s3.zig	U3	16
 src/capi/smtp.zig	L2	1
@@ -263,5 +262,5 @@ src/websocket/h2_socket.zig	L2	1
 src/websocket/h2_socket.zig	U3	4
 src/websocket/root.zig	C3	3
 src/websocket/root.zig	L2	6
-src/websocket/root.zig	U3	11
+src/websocket/root.zig	U3	10
 src/webtransport.zig	U3	6
