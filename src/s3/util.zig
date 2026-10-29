@@ -80,7 +80,7 @@ test "util: HTTP dates round-trip" {
     try testing.expectEqual(@as(?i64, null), parseHttpDate("nonsense"));
 }
 
-test "util: Content-MD5" {
+test "util: Content-MD5 is the base64 of the MD5 digest" {
     var buf: [24]u8 = undefined;
     try testing.expectEqualStrings("1B2M2Y8AsgTpgAmY7PhCfg==", contentMd5(&buf, ""));
 }

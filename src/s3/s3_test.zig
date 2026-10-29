@@ -309,10 +309,30 @@ test "s3: push upload: waitWritable returns after a part completes" {
     const stored = try up.finish(env.c());
     try testing.expectEqual(@as(u32, 2), stored.parts);
     try testing.expectEqual(6 * mib, env.fake.getObject("b", "push2.bin").?.len);
-    up.deinit();
-    // Every part buffer was given back.
-    try testing.expectEqual(@as(u64, 0), env.client.memory_used.load(.acquire));
-    up = try env.client.upload(env.c(), "again", .{});
+}
+
+test "s3: a finished upload gives all of its upload_memory back (c65fb0b)" {
+    // upload_memory holds two parts: a multipart upload with a partial last
+    // part takes both, and after it a new upload must get a full part again.
+    const env = try Env.init(.{ .part_size = 5 * mib, .concurrency = 1, .upload_memory = 10 * mib });
+    defer env.deinit();
+    const chunk = try pattern(env.ctx.arena, mib, 6);
+    {
+        var up = try env.client.upload(env.c(), "first.bin", .{});
+        defer up.deinit();
+        for (0..6) |_| {
+            if (try up.write(env.c(), chunk) == .busy) try up.waitWritable(env.c(), null);
+        }
+        const stored = try up.finish(env.c());
+        try testing.expectEqual(@as(u32, 2), stored.parts);
+    }
+    var again = try env.client.upload(env.c(), "again.bin", .{});
+    defer again.deinit();
+    for (0..10) |_| {
+        if (try again.write(env.c(), chunk) == .busy) try again.waitWritable(env.c(), null);
+    }
+    const stored = try again.finish(env.c());
+    try testing.expectEqual(@as(u32, 2), stored.parts);
 }
 
 test "s3: a part failing three times aborts the upload; later writes fail with its error" {
@@ -329,7 +349,9 @@ test "s3: a part failing three times aborts the upload; later writes fail with i
         if (up.write(env.c(), chunk)) |w| {
             if (w == .busy) {
                 // Wait for the first part to be given up on, or for room.
-                up.waitWritable(env.c(), null) catch {
+                up.waitWritable(env.c(), null) catch |err| {
+                    if (err == error.Canceled) return err;
+                    try testing.expectEqual(error.ServiceUnavailable, err);
                     failed = true;
                     break;
                 };
@@ -405,12 +427,13 @@ test "s3: retry: 503 SlowDown twice then 200 is three requests; with retry false
 test "s3: RequestTimeTooSkewed teaches the clock and the call is repeated once" {
     const env = try Env.init(.{});
     defer env.deinit();
-    var buf: [29]u8 = undefined;
-    const ahead = util.formatHttpDate(&buf, util.nowSeconds(tio()) + 3600);
-    try env.fake.addFault(.{ .remaining = 1, .status = 403, .code = "RequestTimeTooSkewed", .date = ahead });
+    // The fake's clock is an hour ahead: the first request is refused and
+    // repeated with the learned offset; the next call is right the first time.
+    env.fake.clock_offset_s = 3600;
     _ = try env.client.put(env.c(), "skew", .{ .bytes = "v" }, .{});
     try testing.expectEqual(@as(usize, 2), env.fake.count("PUT", "/b/skew"));
-    try testing.expect(env.client.clock_offset.load(.monotonic) > 3000);
+    _ = try env.client.put(env.c(), "skew2", .{ .bytes = "v" }, .{});
+    try testing.expectEqual(@as(usize, 1), env.fake.count("PUT", "/b/skew2"));
 }
 
 test "s3: refused connects open the breaker; the next call is ServiceUnavailable circuit_open with no dial" {
@@ -552,11 +575,14 @@ test "s3: the download idle bound: a server that stops sending mid-body fails th
     const data = try pattern(env.ctx.arena, 200_000, 8);
     try env.fake.putObject("b", "stall.bin", data, "application/octet-stream");
     env.fake.stall_gets = true;
-    var dl = try env.client.open(env.c(), "stall.bin", .{});
+    defer env.fake.releaseStall();
+    // The request phase is unbounded (call timeout .max), so only the idle
+    // bound (the client's 100 ms timeout, kept by the body reader) can fail
+    // the read: a slow runner cannot fail open() itself.
+    var dl = try env.client.with(.{ .timeout = .max }).open(env.c(), "stall.bin", .{});
     defer dl.deinit();
     var sink: std.Io.Writer.Allocating = .init(env.ctx.arena);
     try testing.expectError(error.GatewayTimeout, dl.pipe(&sink.writer));
-    env.fake.releaseStall();
 }
 
 test "s3: the bound of a call that moves a body is timeout + bytes / min_throughput" {
