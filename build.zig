@@ -883,17 +883,26 @@ pub fn build(b: *std.Build) void {
     }
 
     // ---- p3/lambda ----
-    // `zig build lint`: SAFETY.md E2, tools/safety_lint.zig over src (and
-    // its own tests). CI runs it; `-Dlint-tests` includes test code.
+    // `zig build lint`: SAFETY.md E2, tools/safety_lint.zig over src
+    // against the ratchet baseline tools/safety_lint.baseline.tsv (and the
+    // tool's own tests). CI's `lint` job runs the same check with `zig run`
+    // (no dependency fetch). `-Dlint-update` lowers the baseline to today's
+    // counts (never raises it); `-Dlint-tests` includes test code and runs
+    // without the baseline.
     {
         const lint_mod = b.createModule(.{ .root_source_file = b.path("tools/safety_lint.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
         const lint_exe = b.addExecutable(.{ .name = "safety-lint", .root_module = lint_mod });
         const run_lint = b.addRunArtifact(lint_exe);
         run_lint.setCwd(b.path("."));
-        if (b.option(bool, "lint-tests", "zig build lint: check test code too") orelse false) run_lint.addArg("--tests");
-        if (b.option([]const u8, "lint-rules", "zig build lint: report only these rules (comma-separated, e.g. DOC)")) |r| run_lint.addArg(b.fmt("--rules={s}", .{r}));
+        const lint_update = b.option(bool, "lint-update", "zig build lint: lower tools/safety_lint.baseline.tsv to today's counts (never raises one)") orelse false;
+        if (b.option(bool, "lint-tests", "zig build lint: check test code too (without the baseline)") orelse false) {
+            run_lint.addArg("--tests");
+        } else {
+            run_lint.addArgs(&.{ if (lint_update) "--update-baseline" else "--baseline", "tools/safety_lint.baseline.tsv" });
+        }
+        if (b.option([]const u8, "lint-rules", "zig build lint: check only these rules (comma-separated, e.g. DOC)")) |r| run_lint.addArg(b.fmt("--rules={s}", .{r}));
         run_lint.addArg("src");
-        const lint_step = b.step("lint", "Check the sources against SAFETY.md (T1, U1, U3, C3) and doc-comment names (DOC)");
+        const lint_step = b.step("lint", "Check the sources against SAFETY.md (T1, T5, U1, U3, C3, L2) and doc-comment names (DOC), with the ratchet baseline");
         lint_step.dependOn(&run_lint.step);
         const lint_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("tools/safety_lint.zig"), .target = b.graph.host, .optimize = .Debug }) });
         lint_step.dependOn(&b.addRunArtifact(lint_tests).step);

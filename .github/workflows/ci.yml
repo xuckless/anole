@@ -64,6 +64,24 @@ jobs:
       - name: Live-test coverage
         run: python3 -I tools/live_coverage.py
 
+  lint:
+    # K2: catches a new SAFETY.md E2 hit (T1, T5, U1, U3, C3, raw locks,
+    # doc-comment names) or a stale count, against the ratchet baseline
+    # tools/safety_lint.baseline.tsv, in seconds. `zig run` skips build.zig's
+    # configure pass, so no dependency is fetched; `zig build lint` runs the
+    # same check locally and `-Dlint-update` lowers the baseline.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+      - name: Safety lint against the baseline
+        run: zig run tools/safety_lint.zig -- --baseline tools/safety_lint.baseline.tsv src
+      - name: The lint's own tests
+        run: zig test tools/safety_lint.zig
+
   test:
     # K2: catches the suite on the two first-class platforms (epoll/io_uring vs kqueue); the configure paths of the minimal profile; compile-only for web, tls=none, h3-without-h2.
     name: test (${{ matrix.os }})
@@ -108,14 +126,6 @@ jobs:
       # The core's tests on the core without TLS, HTTP/2 or compression:
       # no other step builds core-test there, so the tests that skip when
       # TLS or zlib/zstd is on run only here.
-      # The doc-comment name check (DOC) left the test suite for
-      # tools/safety_lint.zig; only DOC gates CI until the SAFETY.md
-      # retrofit clears the T1/U1/U3/C3 backlog (zig build lint alone
-      # still exits 1 on it).
-      - name: Lint (doc-comment names)
-        if: runner.os == 'Linux'
-        timeout-minutes: 5
-        run: zig build lint -Dlint-rules=DOC --summary all
       - name: HTTP core without TLS or compression
         if: runner.os == 'Linux'
         timeout-minutes: 15

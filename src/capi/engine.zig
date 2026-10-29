@@ -3133,10 +3133,10 @@ fn endDetached(x: *Exec, si: u32, w: u64, abandoning: bool) void {
     x.release(si);
 }
 
-/// `destroy` on a server not drained: every request and call a consumer
-/// still owes is answered at once (503, UNAVAILABLE; streams are cut) and
-/// the consumer hears nothing more. Run by the capi task while `abandon`
-/// is set.
+/// Run by the capi task while `abandon` is set (`destroy` on a server not
+/// drained): every request and call a consumer still owes is answered at
+/// once (503, UNAVAILABLE; streams are cut) and the consumer hears nothing
+/// more.
 fn abandonAll(x: *Exec) void {
     const io = x.engine.io;
     for (x.slots, 0..) |*s, i| {
@@ -3175,8 +3175,8 @@ fn abandonAll(x: *Exec) void {
 // ---------------------------------------------------------------------------
 // The capi task: one per executor.
 
-/// Hands answers to their requests, runs commands, enforces deadlines and
-/// rings lost doorbells again.
+/// On the capi task (this is it): hands answers to their requests, runs
+/// commands, enforces deadlines and rings lost doorbells again.
 fn capiTask(e: *Engine, x: *Exec) std.Io.Cancelable!void {
     const io = e.io;
     while (true) {
