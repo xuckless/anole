@@ -148,11 +148,6 @@ test "errors: JSON answers for a client that takes JSON, or a server that speaks
     try std.testing.expect(std.mem.startsWith(u8, c, "HTTP/1.1 409 "));
     try std.testing.expectEqualStrings("{\"error\":\"name \\\"x\\\" taken\"}", bodyOf(c));
 
-    // `fail` replaces what was written before it; text by default.
-    const d = try running.send("GET /fail HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
-    try std.testing.expect(std.mem.startsWith(u8, d, "HTTP/1.1 403 "));
-    try std.testing.expectEqualStrings("no entry", bodyOf(d));
-
     var json_server: Running(void) = undefined;
     try startErrorServer(&json_server, .{ .listeners = loopback, .errors = .json });
     defer json_server.stop();
@@ -162,6 +157,17 @@ test "errors: JSON answers for a client that takes JSON, or a server that speaks
     const f = try json_server.send("POST /unauthorized HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, f, "HTTP/1.1 405 "));
     try std.testing.expectEqualStrings("{\"error\":\"Method Not Allowed\"}", bodyOf(f));
+}
+
+test "Response.fail: replaces a body written before it, as text by default" {
+    var running: Running(void) = undefined;
+    try startErrorServer(&running, .{ .listeners = loopback });
+    defer running.stop();
+    var out: [2048]u8 = undefined;
+
+    const d = try running.send("GET /fail HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, d, "HTTP/1.1 403 "));
+    try std.testing.expectEqualStrings("no entry", bodyOf(d));
 }
 
 fn teapotOrDefault(req: *dusty.Request, res: *dusty.Response, err: anyerror) void {
@@ -218,7 +224,7 @@ test "errors: an uncaughtError can fall back to defaultError" {
     try std.testing.expectEqual(@as(usize, 1), app.seen);
 }
 
-test "bind: unknown fields ignored, a missing or malformed body is 400" {
+test "bind over HTTP/1.1: unknown fields ignored; empty or non-JSON body 400; JSON that does not fit 422 problem+json" {
     var running: Running(void) = undefined;
     try startErrorServer(&running, .{ .listeners = loopback });
     defer running.stop();
@@ -270,15 +276,37 @@ test "locals: a middleware hands typed values to the handler, per request" {
     try std.testing.expectEqualStrings("acme 3 true", bodyOf(a));
 }
 
+const SetWhenAsked = struct {
+    pub fn execute(_: *const SetWhenAsked, req: *dusty.Request, _: *dusty.Response, next: anytype) !void {
+        if (std.mem.eql(u8, req.headers.get("X-Set") orelse "", "1")) try req.setLocal("k", @as(u32, 1));
+        return next.call();
+    }
+};
+
 test "locals: reset with the request on a keep-alive connection" {
-    var req: dusty.Request = .{ .arena = std.testing.allocator, ._parser = undefined, ._transport = undefined };
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    req.arena = arena.allocator();
-    try req.setLocal("k", @as(u32, 1));
-    try std.testing.expectEqual(@as(u32, 1), req.local(u32, "k").?);
-    req._reset();
-    try std.testing.expect(req.local(u32, "k") == null);
+    var running: Running(void) = .{ .server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = loopback }, {}) };
+    var mw: SetWhenAsked = .{};
+    running.server.router.use(dusty.Middleware(void).init(&mw));
+    running.server.router.get("/k", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            res.body = if (req.local(u32, "k") != null) "yes" else "no";
+        }
+    }.handle);
+    try running.start();
+    defer running.stop();
+
+    // Two requests on one connection: the first sets the local, the
+    // second must not see it.
+    var out: [2048]u8 = undefined;
+    const both = try running.send(
+        "GET /k HTTP/1.1\r\nHost: x\r\nX-Set: 1\r\n\r\n" ++
+            "GET /k HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        &out,
+    );
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, both, "HTTP/1.1 200 "));
+    const yes = std.mem.indexOf(u8, both, "\r\n\r\nyes") orelse return error.TestUnexpectedResult;
+    const no = std.mem.indexOf(u8, both, "\r\n\r\nno") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(yes < no);
 }
 
 fn ok(_: *dusty.Request, res: *dusty.Response) !void {
@@ -489,6 +517,7 @@ test "port in use: not tripped by the connections a stopped server left in TIME_
 }
 
 test "port in use: per-acceptor SO_REUSEPORT sockets of one server still bind" {
+    // socket_per_acceptor is Linux-only by design (AGENTS: SO_REUSEPORT per acceptor on Linux).
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const port = try freePort();
     var running: Running(void) = .{ .server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{

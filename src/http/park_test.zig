@@ -28,6 +28,11 @@ fn slow(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = "slow";
 }
 
+/// GET /exec: the index of the executor serving the request.
+fn exec(req: *dusty.Request, res: *dusty.Response) !void {
+    try res.print(.text, "{d}", .{dusty.placement.currentExecutor(req.io) orelse return error.NoExecutor});
+}
+
 /// A client connection, plain or TLS, that writes requests and reads
 /// responses with `Content-Length` bodies.
 const Client = struct {
@@ -142,6 +147,7 @@ const Fixture = struct {
         self.server = Server.init(gpa, self.io, .{ .listeners = &self.listeners, .timeout = timeout }, {});
         self.server.router.get("/", hello);
         self.server.router.get("/slow", slow);
+        self.server.router.get("/exec", exec);
         self.future = try self.io.concurrent(struct {
             fn run(s: *Server) anyerror!void {
                 try s.run();
@@ -215,9 +221,39 @@ test "idle park: a TLS connection parks and is served again" {
     try parkAndResume(true, 1);
 }
 
+/// With two executors, each connection is served on the executor that
+/// accepted it, before and after every park.
+fn parkOnAcceptingExecutor(secure: bool) !void {
+    if (secure and !have_tls) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(gpa, 2, secure, .{ .idle_park = .fromMilliseconds(30) });
+    defer f.stop(gpa);
+
+    var clients: [8]Client = undefined;
+    var opened: usize = 0;
+    defer for (clients[0..opened]) |*c| c.close(f.io);
+    for (&clients) |*c| {
+        try c.open(f.io, f.addr(), secure);
+        opened += 1;
+    }
+    var first: [clients.len]u8 = undefined;
+    for (&clients, &first) |*c, *e| {
+        try c.send("GET /exec HTTP/1.1\r\nHost: x\r\n\r\n");
+        e.* = (try c.response()).body[0];
+    }
+    for (0..3) |_| {
+        try f.waitParked(clients.len);
+        for (&clients, first) |*c, e| {
+            try c.send("GET /exec HTTP/1.1\r\nHost: x\r\n\r\n");
+            try std.testing.expectEqual(e, (try c.response()).body[0]);
+        }
+    }
+}
+
 test "idle park: connections park on the executor that accepted them" {
-    try parkAndResume(false, 2);
-    try parkAndResume(true, 2);
+    try parkOnAcceptingExecutor(false);
+    try parkOnAcceptingExecutor(true);
 }
 
 test "idle park: a connection busier than the park delay keeps its task [timing]" {
@@ -257,14 +293,16 @@ fn reparkAfterLongPark(secure: bool) !void {
     try f.io.sleep(.fromMilliseconds(250), .awake);
     // Parked long: answered, and parked again well within the delay.
     try std.testing.expectEqual(200, try c.get("/"));
-    const parked_again = for (0..20) |_| {
-        if (f.server.parkedConnections() == 1) break true;
-        try f.io.sleep(.fromMilliseconds(5), .awake);
-    } else false;
-    try std.testing.expect(parked_again);
-    // Back after a short park: the task stays for the delay.
+    // Within a fifth of the delay (TESTING.md D1's 5x margin).
+    try wait.waitUntilFor(f.io, "the connection parked again", .fromMilliseconds(40), &f, struct {
+        fn one(fx: *Fixture) bool {
+            return fx.server.parkedConnections() == 1;
+        }
+    }.one);
+    // Back after a short park: the task stays for the delay (checked at a
+    // sixth of it).
     try std.testing.expectEqual(200, try c.get("/"));
-    try f.io.sleep(.fromMilliseconds(60), .awake);
+    try f.io.sleep(.fromMilliseconds(30), .awake);
     try std.testing.expectEqual(0, f.server.parkedConnections());
     try f.waitParked(1);
 }
@@ -307,17 +345,22 @@ fn racePark(secure: bool) !void {
     }
 }
 
-test "idle park: requests arriving as the connection parks" {
+test "idle park: requests arriving as the connection parks [stress]" {
+    // A race hunt: 80 seeded rounds, ~2 s (TESTING.md W3, K1).
+    try wait.requireStress();
     try racePark(false);
 }
 
-test "idle park: requests arriving as a TLS connection parks" {
+test "idle park: requests arriving as a TLS connection parks [stress]" {
+    try wait.requireStress();
     try racePark(true);
 }
 
 fn keepAliveDeadline(secure: bool) !void {
     if (secure and !have_tls) return error.SkipZigTest;
     const gpa = std.testing.allocator;
+    Server.setParkSweepIntervalForTest(.fromMilliseconds(50));
+    defer Server.setParkSweepIntervalForTest(null);
     var f: Fixture = undefined;
     try f.start(gpa, 1, secure, .{ .idle_park = .fromMilliseconds(30), .keepalive = .fromMilliseconds(600) });
     defer f.stop(gpa);
@@ -327,7 +370,9 @@ fn keepAliveDeadline(secure: bool) !void {
     defer c.close(f.io);
     // Before the request: the wait for the next one starts after this, so
     // the keep-alive deadline (600 ms from that start, never swept early)
-    // is at least 600 ms from here, however slow the machine.
+    // is at least 600 ms from here, however slow the machine. The deadline
+    // stays well past the 30 ms park so the parked gauge has a wide window
+    // to be seen in; the 50 ms sweep keeps the close prompt after it.
     const before = std.Io.Timestamp.now(f.io, .awake);
     try std.testing.expectEqual(200, try c.get("/"));
     try f.waitParked(1);
@@ -335,7 +380,7 @@ fn keepAliveDeadline(secure: bool) !void {
     try std.testing.expect(c.hungUp());
     // Not closed as it parked: closed at its deadline.
     try std.testing.expect(before.untilNow(f.io, .awake).toMilliseconds() >= 600);
-    // Not much later than it (the sweep's second): a timing claim.
+    // Not much later than it (the sweep's 50 ms): a timing claim.
     const waited = parked_at.untilNow(f.io, .awake).toMilliseconds();
     if (wait.timing()) try std.testing.expect(waited < 2_500);
     try f.waitClosed();
@@ -352,6 +397,8 @@ test "idle park: a parked TLS connection gets a close_notify at its keep-alive d
 
 test "idle park: a connection that never sends a request parks under the request deadline" {
     const gpa = std.testing.allocator;
+    Server.setParkSweepIntervalForTest(.fromMilliseconds(50));
+    defer Server.setParkSweepIntervalForTest(null);
     var f: Fixture = undefined;
     try f.start(gpa, 1, false, .{ .idle_park = .fromMilliseconds(30), .request = .fromMilliseconds(500) });
     defer f.stop(gpa);
@@ -438,17 +485,20 @@ test "idle park: stopping the server with many parked connections closes them al
         if (!secure or have_tls) {
             var f: Fixture = undefined;
             try f.start(gpa, 2, secure, .{ .idle_park = .fromMilliseconds(20) });
+            defer f.stop(gpa);
             var clients: [16]Client = undefined;
-            for (&clients) |*c| try c.open(f.io, f.addr(), secure);
+            var opened: usize = 0;
+            defer for (clients[0..opened]) |*c| c.close(f.io);
+            for (&clients) |*c| {
+                try c.open(f.io, f.addr(), secure);
+                opened += 1;
+            }
             for (&clients) |*c| try std.testing.expectEqual(200, try c.get("/"));
             try f.waitParked(clients.len);
             f.future.cancel(f.io) catch {};
+            f.stopped = true;
             try std.testing.expectEqual(0, f.server.active_connections.load(.acquire));
             for (&clients) |*c| try std.testing.expect(c.hungUp());
-            for (&clients) |*c| c.close(f.io);
-            f.server.deinit();
-            if (comptime have_tls) if (f.pem) |*p| p.deinit(gpa);
-            f.rt.deinit();
         }
     }
 }

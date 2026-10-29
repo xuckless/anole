@@ -56,6 +56,6 @@ test "parse: capped to what listen takes" {
     try std.testing.expectEqual(@as(?u31, std.math.maxInt(u31)), parse("4294967295\n"));
 }
 
-test "somaxconn: positive" {
+test "somaxconn: the backlog read here (or the platform fallback) is at least 1" {
     try std.testing.expect(try somaxconn(std.testing.io) > 0);
 }

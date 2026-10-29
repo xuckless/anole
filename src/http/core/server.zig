@@ -1694,6 +1694,13 @@ pub fn Server(comptime Ctx: type) type {
             return park.supported;
         }
 
+        /// Test builds only: idle-park shelves started after this sweep for
+        /// expired deadlines every `interval` instead of every second (null
+        /// restores it).
+        pub fn setParkSweepIntervalForTest(interval: ?std.Io.Duration) void {
+            park.setSweepIntervalForTest(interval);
+        }
+
         /// How many connections are parked right now (`timeout.idle_park`).
         pub fn parkedConnections(self: *const Self) usize {
             var n: usize = 0;
@@ -3577,33 +3584,31 @@ test "forwarded: rightmost untrusted" {
 test "forwarded: an untrusted peer's headers are ignored, with one warning" {
     resetUntrustedWarningForTest();
     defer resetUntrustedWarningForTest();
-    const nets = proxy_protocol.networks.private;
+    var server = Server(void).init(std.testing.allocator, std.testing.io, .{
+        .trusted_proxies = &proxy_protocol.networks.private,
+        .warn_untrusted_peer = true,
+    }, {});
+    defer server.deinit();
+    var headers = try Headers.init(std.testing.allocator, 2);
+    defer headers.deinit(std.testing.allocator);
+    try xff(&headers, "198.51.100.1");
+
+    // A peer outside proxy.trusted is the client, whatever it forwards.
     const stranger = try std.Io.net.IpAddress.parse("203.0.113.9", 0);
-    try std.testing.expect(!proxy_protocol.containsAny(&nets, stranger));
-    try std.testing.expect(warnUntrustedPeer(stranger));
+    try std.testing.expectEqual([4]u8{ 203, 0, 113, 9 }, server.clientAddress(stranger, &headers).ip4.bytes);
+    // That call logged the one warning: no further one, for either path.
     try std.testing.expect(!warnUntrustedPeer(stranger));
     try std.testing.expect(!warnUntrustedPeerProxy(stranger));
-    // An IPv4-mapped peer of a proxy on the private network is trusted.
-    try std.testing.expect(proxy_protocol.containsAny(&nets, try std.Io.net.IpAddress.parse("::ffff:10.0.0.2", 0)));
+    try std.testing.expectEqual([4]u8{ 203, 0, 113, 9 }, server.clientAddress(stranger, &headers).ip4.bytes);
 }
 
-test "forwarded: 0.2 hops, entries with a port" {
+test "forwarded: with trusted_proxy_hops, X-Forwarded-For entries with ports select the address" {
     var headers = try Headers.init(std.testing.allocator, 2);
     defer headers.deinit(std.testing.allocator);
     try xff(&headers, "203.0.113.9:4711, 198.51.100.2:80");
     const peer = try std.Io.net.IpAddress.parse("127.0.0.1", 1);
     try std.testing.expectEqual([4]u8{ 198, 51, 100, 2 }, remoteAddress(peer, &headers, 1).ip4.bytes);
     try std.testing.expectEqual([4]u8{ 203, 0, 113, 9 }, remoteAddress(peer, &headers, 2).ip4.bytes);
-}
-
-test "proxy protocol: the gate falls back to proxy.trusted" {
-    const trusted = proxy_protocol.networks.private;
-    const own = [_]proxy_protocol.Network{try .parse("192.0.2.0/24")};
-    const inside = try std.Io.net.IpAddress.parse("10.1.2.3", 0);
-    const outside = try std.Io.net.IpAddress.parse("203.0.113.9", 0);
-    try std.testing.expect(proxy_protocol.trustedPeer(&trusted, inside));
-    try std.testing.expect(!proxy_protocol.trustedPeer(&trusted, outside));
-    try std.testing.expect(!proxy_protocol.trustedPeer(&own, inside));
 }
 
 test "fuzz: parseForwardedEntry and rightmostUntrusted" {

@@ -3785,6 +3785,41 @@ test "Server: a PROXY protocol listener with proxy_protocol_from serves only tho
     }
 }
 
+test "Server: a PROXY protocol listener without proxy_protocol_from falls back to proxy.trusted" {
+    const io = std.testing.io;
+    const request = "PROXY TCP4 192.0.2.7 198.51.100.2 56324 443\r\nGET /who HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    var out: [2048]u8 = undefined;
+    const elsewhere = [_]dusty.ProxyNetwork{try .parse("192.0.2.0/24")};
+    for ([_][]const dusty.ProxyNetwork{ &elsewhere, &dusty.proxy_networks.loopback }, 0..) |trusted, i| {
+        var server = dusty.Server(void).init(std.testing.allocator, io, .{
+            .listeners = &.{.{ .address = loopback_addr, .proxy_protocol = true }},
+            .trusted_proxies = trusted,
+        }, {});
+        defer server.deinit();
+        server.router.get("/who", WhoHandler.handle);
+        var future = try io.concurrent(struct {
+            fn run(s: *dusty.Server(void)) !void {
+                try s.run();
+            }
+        }.run, .{&server});
+        defer future.cancel(io) catch {};
+        try server.waitReady(io);
+
+        if (i == 0) {
+            // 127.0.0.1 is not in proxy.trusted: closed unanswered.
+            if (rawAllTo(io, server.addresses[0].ip, request, &out)) |none| {
+                try std.testing.expectEqual(@as(usize, 0), none.len);
+            } else |err| switch (err) {
+                error.ReadFailed => {},
+                else => |e| return e,
+            }
+        } else {
+            const ok = try rawAllTo(io, server.addresses[0].ip, request, &out);
+            try std.testing.expect(std.mem.endsWith(u8, ok, "192.0.2.7:56324 secure=false host=example.com"));
+        }
+    }
+}
+
 test "Server: X-Forwarded-Proto and X-Forwarded-Host from a trusted proxy" {
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback, .trusted_proxy_hops = 1, .trust_forwarded_host = true }, {});
