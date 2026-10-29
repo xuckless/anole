@@ -116,10 +116,14 @@ any time. Bytes leave in the order sends were made.
 - It answers `.ok`, or `.busy` once more than `write_high_water` (256 KiB)
   bytes are queued: the bytes were taken, but stop sending until `writable`
   is called, or call `conn.waitWritable()` from a task of your own.
+  `waitWritable` may be called until the `close` callback returns; one still
+  waiting then returns `error.Closed`, and the connection is freed only after
+  it has left. After `error.Closed` do not touch the `Conn` again: a call that
+  starts after the close callback returned uses freed memory.
 - Past `write_max` (8 MiB) it takes nothing and returns `error.QueueFull`;
   `writable` follows once the outbox drains under half the high-water mark.
-  One send larger than `write_max` returns `error.TooLarge`: it can never be
-  taken, so no `writable` follows for it.
+  One send larger than `write_max` (with its framing) returns
+  `error.TooLarge`: it can never be taken, so no `writable` follows for it.
 - `error.Closed` and `error.Ended` say the connection is over, or that this
   side was ended.
 
@@ -145,7 +149,9 @@ destroy the last bytes. `conn.reset()` closes now with a reset.
 ## 4. Reading control and timeouts
 
 `pauseReading()` and `resumeReading()` stop and restart reading; Anole leaves
-the input in the kernel, and TCP flow control slows the peer. Timeouts, all
+the input in the kernel, and TCP flow control slows the peer. A paused
+connection keeps its task and never idles out (`idle_timeout` counts input it
+reads); `lifetime`, a close, a reset or the server's stop still end it. Timeouts, all
 in `Tcp.Options`:
 
 | Option | Default | Closes with |

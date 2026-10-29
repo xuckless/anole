@@ -61,7 +61,10 @@ pub const NetSlot = struct {
     /// otherwise in Debug and tests); its kick is made after it.
     lock: safety.SpinLock(.leaf) = .init,
     conn: ?*net.Conn = null,
-    state: *TcpState = undefined,
+    /// Its listener's: set at the open (before the OPEN record is posted),
+    /// read by `write` before it takes the lock (an atomic, as a reused
+    /// slot's is written while a stale handle's call may read it).
+    state: std.atomic.Value(?*TcpState) = .init(null),
     /// Bytes of this connection posted and not yet polled.
     unpolled: std.atomic.Value(u32) = .init(0),
     /// A futex word: 1 while the connection's task waits for credit.
@@ -150,6 +153,10 @@ pub const TcpState = struct {
     handler_id: u32,
     read_ahead: u32,
     framing: u32,
+    /// The listener's `write_max` and framing: `write` refuses a payload
+    /// over the max before it allocates for it.
+    write_max: u32,
+    net_framing: net.Framing,
 };
 
 /// A "udp" listener's settings, the `state` of its service.
@@ -217,7 +224,14 @@ fn framingConst(f: ?config_mod.Config.NetFraming) u32 {
 /// The service of a "tcp" listener.
 pub fn tcpService(e: *Engine, a: std.mem.Allocator, t: config_mod.Config.NetTcp) !net.TcpService {
     const st = try a.create(TcpState);
-    st.* = .{ .engine = e, .handler_id = t.handler, .read_ahead = t.read_ahead, .framing = framingConst(t.framing) };
+    st.* = .{
+        .engine = e,
+        .handler_id = t.handler,
+        .read_ahead = t.read_ahead,
+        .framing = framingConst(t.framing),
+        .write_max = t.write_max,
+        .net_framing = config_mod.netFraming(t.framing),
+    };
     return .{
         .table = &tcp_table,
         .options = .{
@@ -348,7 +362,7 @@ fn onOpen(state: ?*anyopaque, conn: *net.Conn) anyerror!void {
     slot.acquire();
     slot.conn = conn;
     slot.release();
-    slot.state = st;
+    slot.state.store(st, .release);
     slot.unpolled.store(0, .monotonic);
     slot.credit_wait.store(0, .monotonic);
     conn.context = slot;
@@ -423,7 +437,7 @@ fn postData(x: *Exec, slot: *NetSlot, g: u32, frames: []const []const u8, framed
         at += f.len;
     }
     const len: u32 = @intCast(rec.len);
-    awaitCredit(e, slot, len, slot.state.read_ahead) catch {
+    awaitCredit(e, slot, len, slot.state.load(.monotonic).?.read_ahead) catch {
         engine.freeRecord(rec.ptr);
         return error.Canceled;
     };
@@ -594,6 +608,23 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
     // A framed or empty write is copied (there is nothing to borrow): its
     // SENT follows at once, when the call took it.
     const copy = frame or data.len == 0;
+    // Over the listener's write_max: refused before anything is allocated
+    // (a stale handle's slot may be another listener's by now: GONE then).
+    if (s.state.load(.acquire)) |st| {
+        var want: usize = data.len;
+        if (frame) {
+            var pbuf: [net.Framing.max_prefix]u8 = undefined;
+            const p = st.net_framing.prefix(data.len, &pbuf) catch |err| {
+                if (s.gen() != g) return e.gone();
+                return writeError(e, err);
+            };
+            want += p.len + st.net_framing.suffix().len;
+        }
+        if (want > st.write_max) {
+            if (s.gen() != g) return e.gone();
+            return writeError(e, error.TooLarge);
+        }
+    }
     // The SENT record first: a call that fails takes nothing.
     const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
     errdefer if (sent) |r| engine.freeRecord(r.ptr);

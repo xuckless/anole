@@ -448,9 +448,12 @@ pub const Conn = struct {
     }
 
     /// Waits until fewer than half `write_high_water` bytes are queued.
-    /// `error.Closed` when it closes meanwhile. Any task, until the `close`
-    /// callback returns; one still waiting then answers Closed (the
-    /// connection's memory lasts until it has left).
+    /// `error.Closed` when it closes meanwhile. Any task may call it until
+    /// the `close` callback returns; one still waiting then answers Closed
+    /// (the connection is freed only after it left). After Closed the
+    /// caller must not touch the `Conn` again, and a call that starts after
+    /// the close callback returned is a use-after-free (the caller's side
+    /// of the contract).
     pub fn waitWritable(c: *Conn) error{ Closed, Canceled }!void {
         return c.tc().waitUnder(c.tc().service.options.write_high_water / 2);
     }
@@ -515,7 +518,9 @@ pub const Conn = struct {
 
     /// Stops reading (Anole leaves the input in the kernel: TCP flow
     /// control slows the peer) until `resumeReading`. Holds the connection's
-    /// task while paused. After the connection ended, nothing.
+    /// task while paused, and a paused connection never idles out
+    /// (`idle_timeout` counts input it reads; `lifetime`, a reset, a close
+    /// or the stop still end it). After the connection ended, nothing.
     pub fn pauseReading(c: *Conn) void {
         _ = c.tc().paused.cmpxchgStrong(Paused.reading, Paused.paused, .acq_rel, .monotonic);
     }
@@ -601,8 +606,10 @@ fn sendToWrite(err: Conn.SendError) Conn.WriteError {
         error.Closed => error.Closed,
         error.Ended => error.Ended,
         error.OutOfMemory => error.OutOfMemory,
-        // Past write_max after waiting under the high-water mark: a single
-        // message bigger than the room.
+        // Full although the task waited under the high-water mark: sends
+        // from other tasks or threads filled the queue in between (a race
+        // with a foreign send), reported as WriteTimeout. A message that
+        // can never fit is TooLarge.
         error.QueueFull => error.WriteTimeout,
         error.TooLarge => error.TooLarge,
         error.FrameTooLarge, error.NoFraming => error.Closed,
@@ -859,6 +866,9 @@ pub const OutChunk = struct {
     /// The payload's size (`payload`).
     cap: usize,
     owned: bool,
+    /// Made by `fresh` (an owner-executor send): the only kind kept as a
+    /// connection's spare, since only that path takes it back.
+    local: bool = false,
     /// Borrowed: the `sent` token.
     token: u64 = 0,
 
@@ -868,13 +878,15 @@ pub const OutChunk = struct {
     /// payload (plus the header and the frame room), so a 16 KiB message
     /// fits one.
     pub const standard_room = 16 * 1024;
+    /// Its region (what `fresh` is asked for).
+    const standard_region = Framing.max_prefix + standard_room + max_suffix;
     /// The largest chunk a connection keeps as its spare, by region size:
     /// the listener's high-water mark, at least a standard chunk, at most
     /// 64 KiB. A message bigger than the high-water mark makes the
     /// connection busy by itself, and past 64 KiB the copy costs more than
     /// the allocation, while every busy connection may hold one spare.
     pub fn spareMax(write_high_water: u32) usize {
-        return @min(64 * 1024, @max(Framing.max_prefix + standard_room + max_suffix, write_high_water));
+        return @min(64 * 1024, @max(standard_region, write_high_water));
     }
 
     /// An owned chunk whose payload (`payload()`, `payload_len` bytes) the
@@ -883,10 +895,13 @@ pub const OutChunk = struct {
         return make(gpa, payload_len, Framing.max_prefix, payload_len);
     }
 
-    /// An empty owned chunk with room for `room` bytes from its start (the
-    /// owner executor's sends, coalesced into it).
+    /// An empty owned chunk with room for `room_len` bytes from its start
+    /// (the owner executor's sends, coalesced into it): its region is
+    /// `room_len` bytes (at least the frame room).
     fn fresh(gpa: std.mem.Allocator, room_len: usize) error{OutOfMemory}!*OutChunk {
-        return make(gpa, room_len, 0, 0);
+        const c = try make(gpa, room_len -| (Framing.max_prefix + max_suffix), 0, 0);
+        c.local = true;
+        return c;
     }
 
     fn make(gpa: std.mem.Allocator, cap: usize, off: usize, len: usize) error{OutOfMemory}!*OutChunk {
@@ -1000,7 +1015,6 @@ const Flag = struct {
     const cancel_reader: u32 = 1 << 5;
 };
 
-/// `TcpConn.sched`: who is responsible for the outbox.
 /// `TcpConn.paused`. `ended` is sticky: set when the connection ends, it
 /// makes a later `pauseReading` change nothing, so the task waiting for a
 /// resume (`waitResumed`), which looked at `over` before it waits on this
@@ -1012,6 +1026,7 @@ const Paused = struct {
     const ended: u32 = 2;
 };
 
+/// `TcpConn.sched`: who is responsible for the outbox.
 const Sched = struct {
     const none: u8 = 0;
     /// Kicked: the driver, on its next round.
@@ -1071,12 +1086,13 @@ const TcpConn = struct {
     /// The batch being written (the responsible party's).
     inflight: Fifo = .{},
     /// One written chunk kept for the next sends (an echo then allocates
-    /// nothing): the biggest seen, up to `OutChunk.spareMax`. owner: the
-    /// connection (M2), its executor only, no atomics; freed when it parks
-    /// and at `release`. A chunk written while it is parked can become the
-    /// spare again, so a parked connection may hold one until it wakes or
-    /// is released. Sends from other threads make their own chunks.
+    /// nothing): the biggest an owner send made, up to `OutChunk.spareMax`.
+    /// owner: the connection (M2), its executor only, no atomics; freed
+    /// when it parks (and not refilled while parked) and at `release`.
+    /// Sends from other threads and the C ABI make their own chunks.
     spare: ?*OutChunk = null,
+    /// Parked: no task, no spare (its executor only).
+    parked: bool = false,
     /// The helper tasks (flusher, writable, drain): children of the
     /// connection (T1), canceled and joined by `release`.
     group: std.Io.Group = .init,
@@ -1091,10 +1107,7 @@ const TcpConn = struct {
     over: std.atomic.Value(u32) = .init(0),
     /// `Paused`; a futex word for the task waiting for `resumeReading`.
     paused: std.atomic.Value(u32) = .init(Paused.reading),
-    /// References to this memory: `release`'s, and one per writer in
-    /// `waitUnder` (which may be a task outside the connection's, still
-    /// there when it is released). The last `unhold` frees it.
-    holds: std.atomic.Value(u32) = .init(1),
+
     /// 0: none yet; else `CloseReason` + 1.
     reason: std.atomic.Value(u8) = .init(0),
     errno_value: std.atomic.Value(i32) = .init(0),
@@ -1246,14 +1259,16 @@ const TcpConn = struct {
         }
         t.decoder.deinit();
         t.frames.deinit(t.gpa);
-        // Freed now, or by the last writer still in `waitUnder`.
-        t.unhold();
-    }
-
-    fn unhold(t: *TcpConn) void {
-        if (t.holds.fetchSub(1, .acq_rel) != 1) return;
-        const gpa = t.gpa;
-        gpa.destroy(t);
+        // Writers still in `waitUnder` (a task outside the connection's,
+        // woken above by `wakeWaiters`) leave before the memory goes (M2:
+        // the owner frees after the join). Uncancelable, and short: they
+        // are awake and only look at the flags on their way out.
+        while (true) {
+            const w = t.waiters.load(.seq_cst);
+            if (w == 0) break;
+            io.futexWaitUncancelable(u32, &t.waiters.raw, w);
+        }
+        t.gpa.destroy(t);
     }
 
     fn logClosed(t: *TcpConn, reason: CloseReason, bytes_out: u64) void {
@@ -1437,8 +1452,8 @@ const TcpConn = struct {
 
     /// The owner executor's send: into the last chunk when it has room
     /// (many small sends cost one allocation), else into the spare when it
-    /// is big enough, else into a fresh chunk of 16 KiB (`standard_room`)
-    /// or the send's size if larger, whatever `write_high_water` is: the
+    /// is big enough, else into a fresh chunk of 16 KiB (`standard_room`,
+    /// its region `standard_region`) or exactly the send's size if larger, whatever `write_high_water` is: the
     /// limits count bytes queued, not chunk room, so a listener with a
     /// small high-water mark needs nothing; a connection with output
     /// pending holds 16 KiB at least.
@@ -1447,7 +1462,7 @@ const TcpConn = struct {
         if (token != 0) {
             fresh = try OutChunk.borrowed(t.gpa, parts[0], token);
         } else if (t.out.tail == null or t.out.tail.?.room() < total) {
-            fresh = t.takeSpare(total) orelse try OutChunk.fresh(t.gpa, @max(total, OutChunk.standard_room));
+            fresh = t.takeSpare(total) orelse try OutChunk.fresh(t.gpa, @max(total, OutChunk.standard_region));
         }
         const busy = t.reserve(total) catch {
             if (fresh) |c| t.recycle(c);
@@ -1829,11 +1844,13 @@ const TcpConn = struct {
         t.recycle(c);
     }
 
-    /// Keeps an owned chunk up to `spareMax` as the spare when there is
-    /// none or it is bigger than the one there (that one is freed), else
-    /// frees it. The connection's executor only.
+    /// Keeps a chunk an owner send made (`local`), up to `spareMax`, as the
+    /// spare when there is none or it is bigger than the one there (that
+    /// one is freed), unless the connection is parked; else frees it.
+    /// Other threads' and the C ABI's chunks are never kept: only the
+    /// owner path takes the spare back. The connection's executor only.
     fn recycle(t: *TcpConn, c: *OutChunk) void {
-        if (c.owned and c.capacity() <= OutChunk.spareMax(t.service.options.write_high_water)) {
+        if (c.local and !t.parked and c.capacity() <= OutChunk.spareMax(t.service.options.write_high_water)) {
             const old = t.spare;
             if (old == null or old.?.capacity() < c.capacity()) {
                 c.reset();
@@ -1855,9 +1872,8 @@ const TcpConn = struct {
         return null;
     }
 
-    /// Frees the spare: the connection parks (an idle one should hold no
-    /// buffer; one written after the park can come back, see `spare`) or
-    /// is released.
+    /// Frees the spare: the connection parks (an idle one holds no buffer;
+    /// `recycle` keeps none while parked) or is released.
     fn dropSpare(t: *TcpConn) void {
         if (t.spare) |c| {
             t.spare = null;
@@ -1940,6 +1956,10 @@ const TcpConn = struct {
     fn setOver(t: *TcpConn) void {
         t.over.store(1, .release);
         t.wakeAll(&t.over);
+        // A paused reader waits on `paused`, not `over`: every end moves it
+        // to `ended` (a graceful close's end after its wait for the peer
+        // included).
+        t.unpause();
     }
 
     // -- The flusher task ------------------------------------------------------
@@ -1986,6 +2006,7 @@ const TcpConn = struct {
                     // connection's own reason (idle, lifetime, ...), not the
                     // flusher's. Else the server stops: the connection task
                     // ends it.
+                    io.recancel();
                     if (t.isClosed()) return;
                     t.abort(.drain);
                 },
@@ -2046,14 +2067,11 @@ const TcpConn = struct {
     /// `epoch`, which every change it waits for moves (`wakeWaiters`), read
     /// before the looks: a change after them makes the wait return.
     fn waitUnder(t: *TcpConn, below: u32) error{ Closed, Canceled }!void {
-        // A writer outside the connection's tasks may still be here when
-        // it is released (woken, about to look): it keeps the memory until
-        // it leaves. Taken before `release` can run (the caller's `Conn`
-        // is valid until the close callback returns), dropped last.
-        _ = t.holds.fetchAdd(1, .monotonic);
-        defer t.unhold();
+        // Counted before `release` can run (the caller's `Conn` is valid
+        // until the close callback returns); `release` waits for the count
+        // to reach 0 before it frees the connection.
         _ = t.waiters.fetchAdd(1, .seq_cst);
-        defer _ = t.waiters.fetchSub(1, .seq_cst);
+        defer t.leaveWait();
         while (true) {
             const e = t.epoch.load(.seq_cst);
             if (t.flags.load(.seq_cst) & (Flag.closed | Flag.dead) != 0) return error.Closed;
@@ -2062,6 +2080,17 @@ const TcpConn = struct {
             try t.io.futexWait(u32, &t.epoch.raw, e);
             testHold(t.io, .waiter_woken);
         }
+    }
+
+    /// A writer leaves `waitUnder`. Its decrement is its last touch of
+    /// `t`: at 0 `release` may free it. The wake after it uses only the
+    /// word's address, taken before: zio's futex keys waiters by address
+    /// and never reads it, so a wake that finds nobody, or a task waiting
+    /// on memory reused at that address, is a spurious wake at most.
+    fn leaveWait(t: *TcpConn) void {
+        const io = t.io;
+        const word = &t.waiters.raw;
+        if (t.waiters.fetchSub(1, .seq_cst) == 1) io.futexWake(u32, word, 1);
     }
 
     fn waitOpen(t: *TcpConn, high: u32) Conn.WriteError!void {
@@ -2098,6 +2127,7 @@ const TcpConn = struct {
     /// stops (drain), as the flusher does. Else the connection fails.
     fn callbackFailed(t: *TcpConn, comptime what: []const u8, err: anyerror) void {
         if (err == error.Canceled) {
+            t.io.recancel();
             if (t.isClosed()) return;
             return t.abort(.drain);
         }
@@ -2128,6 +2158,7 @@ const TcpConn = struct {
 
     fn serve(a: *dusty.Adopter, burst: *dusty.Burst) anyerror!dusty.Burst.End {
         const t: *TcpConn = @alignCast(@fieldParentPtr("adopter", a));
+        t.parked = false;
         if (t.ending) return .close;
         if (comptime native_os == .windows) t.reader_task = placement.currentTask(t.io);
         defer if (comptime native_os == .windows) {
@@ -2171,6 +2202,7 @@ const TcpConn = struct {
             burst.armDeadline();
             if (input == .idle) {
                 t.adopter.deadline = sooner(t.lifetimeAt(), t.idleAt());
+                t.parked = true;
                 t.dropSpare();
                 return .park;
             }
@@ -2310,6 +2342,7 @@ const TcpConn = struct {
             };
             if (input == .idle) {
                 t.adopter.deadline = burst.deadline;
+                t.parked = true;
                 t.dropSpare();
                 return .park;
             }
