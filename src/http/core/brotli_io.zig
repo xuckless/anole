@@ -49,9 +49,23 @@ fn brotliFree(_: ?*anyopaque, address: ?*anyopaque) callconv(.c) void {
 
 pub const State = c.BrotliEncoderState;
 
+/// Tests only: the encoders this thread made and has not freed, a leak
+/// signal for state that comes from `block_cache` rather than the testing
+/// allocator. Signed: an encoder freed on another thread than the one that
+/// made it moves both counts, and neither may trap.
+threadlocal var live_for_test: isize = 0;
+
+/// Tests only: how many encoders made on this thread are still alive
+/// (`init` without `deinit` or `destroy`).
+pub fn liveForTest() isize {
+    if (!@import("builtin").is_test) @compileError("liveForTest is for tests");
+    return live_for_test;
+}
+
 /// Frees an encoder whose `Compress` is gone (`Compress.state`).
 pub fn destroy(state: *State) void {
     c.BrotliEncoderDestroyInstance(state);
+    if (@import("builtin").is_test) live_for_test -= 1;
 }
 
 pub const Compress = struct {
@@ -86,11 +100,12 @@ pub const Compress = struct {
             if (c.BrotliEncoderSetParameter(state, c.BROTLI_PARAM_SIZE_HINT, hint) == c.BROTLI_FALSE) return error.CompressFailed;
         }
         self.state = state;
+        if (@import("builtin").is_test) live_for_test += 1;
     }
 
     /// Frees the encoder. Safe to call twice, and after a failed `init`.
     pub fn deinit(self: *Compress) void {
-        if (self.state) |state| c.BrotliEncoderDestroyInstance(state);
+        if (self.state) |state| destroy(state);
         self.state = null;
     }
 

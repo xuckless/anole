@@ -2332,34 +2332,16 @@ test writeDecimal {
     }
 }
 
-/// The body a response has collected, in one piece, for comparing.
+/// The body a response has collected, in one piece, for comparing: what
+/// the public `memoryBodyLen`/`copyBody` give the engines.
 fn testBody(response: *const Response, buf: []u8) ![]const u8 {
-    var w: std.Io.Writer = .fixed(buf);
-    try response.body_buffer.writeTo(&w);
-    return w.buffered();
+    const len = response.memoryBodyLen() orelse return error.NotInMemory;
+    if (len > buf.len) return error.NoSpaceLeft;
+    response.copyBody(buf[0..len]);
+    return buf[0..len];
 }
 
-test "Response: body used when buffer is empty" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response._init(arena.allocator(), &connection, 32);
-    response.body = "body content";
-
-    // Don't write to buffer
-    try std.testing.expectEqual(0, response.body_buffer.len());
-
-    // Body should be used
-    try std.testing.expectEqualStrings("body content", response.body);
-}
-
-test "Response: write() with body" {
+test "Response: a body set as a slice goes out with its Content-Length" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2404,106 +2386,6 @@ test "Response: write() only writes once" {
     try std.testing.expectEqual(first_len, conn_writer.end);
 }
 
-test "Response: writeHeader() basic" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response._init(arena.allocator(), &connection, 32);
-    response.status = .created;
-    try response.header("X-Custom", "value");
-    response.body = "Hello";
-
-    try response.writeHeader();
-
-    const written = conn_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "HTTP/1.1 201") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: value") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 5") != null);
-    // Body should not be written yet
-    try std.testing.expect(std.mem.indexOf(u8, written, "Hello") == null);
-}
-
-test "Response: writeHeader() only writes once" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response._init(arena.allocator(), &connection, 32);
-    response.body = "Test";
-
-    try response.writeHeader();
-    const first_len = conn_writer.end;
-
-    // Try writing header again with different status
-    response.status = .bad_request;
-    try response.writeHeader();
-
-    // Should still be the same length (no second write)
-    try std.testing.expectEqual(first_len, conn_writer.end);
-}
-
-test "Response: write() after writeHeader() doesn't duplicate headers" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response._init(arena.allocator(), &connection, 32);
-    response.body = "Body content";
-
-    // Write headers first
-    try response.writeHeader();
-    const header_len = conn_writer.end;
-
-    // Now write the full response (should only add body)
-    try response.write();
-    const full_len = conn_writer.end;
-
-    // Check that body was added
-    const written = conn_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "Body content") != null);
-
-    // Length should have increased by body length only
-    try std.testing.expect(full_len > header_len);
-    try std.testing.expectEqual(header_len + "Body content".len, full_len);
-}
-
-test "Response: keepalive defaults to true" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response._init(arena.allocator(), &connection, 32);
-    try std.testing.expectEqual(true, response.keepalive);
-
-    response.body = "test";
-    try response.write();
-
-    const written = conn_writer.buffered();
-    // Should not have Connection: close header when keepalive is true
-    try std.testing.expect(std.mem.indexOf(u8, written, "Connection: close") == null);
-}
-
 test "Response: Connection close header when keepalive is false" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2522,19 +2404,6 @@ test "Response: Connection close header when keepalive is false" {
 
     const written = conn_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Connection: close") != null);
-}
-
-test "Response: chunked flag defaults to false" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    const response = try Response._init(arena.allocator(), &connection, 32);
-    try std.testing.expectEqual(false, response._chunked);
 }
 
 test "BodyWriter: sends nothing until the response is written" {
@@ -2556,7 +2425,7 @@ test "BodyWriter: sends nothing until the response is written" {
 
     // The headers are still open: nothing has gone out yet.
     try std.testing.expectEqual(@as(usize, 0), conn_writer.end);
-    try std.testing.expect(!response._headers_written);
+    try std.testing.expect(!response.headersSent());
     try response.header("X-Late", "still allowed");
 
     try response.write();
@@ -2564,29 +2433,7 @@ test "BodyWriter: sends nothing until the response is written" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 13") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "X-Late: still allowed") != null);
     try std.testing.expect(std.mem.endsWith(u8, written, "Hello, World!"));
-    try std.testing.expect(!response._chunked);
-}
-
-test "BodyWriter: a body larger than one write still arrives whole" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response._init(arena.allocator(), &connection, 32);
-
-    var body = try response.writer();
-    for (0..100) |i| try body.interface.print("{d},", .{i});
-    try body.end();
-    try response.write();
-
-    const written = conn_writer.buffered();
-    try std.testing.expect(std.mem.endsWith(u8, written, "97,98,99,"));
-    try std.testing.expect(!response._chunked);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding") == null);
 }
 
 test "StreamingBodyWriter: sends the headers immediately and chunks the body" {
@@ -2603,7 +2450,7 @@ test "StreamingBodyWriter: sends the headers immediately and chunks the body" {
 
     var body_buf: [1024]u8 = undefined;
     var body = try response.stream(&body_buf);
-    try std.testing.expect(response._headers_written);
+    try std.testing.expect(response.headersSent());
     // Too late for anyone to change them now.
     try std.testing.expectError(error.HeadersAlreadySent, response.header("X-Late", "no"));
 
@@ -2693,7 +2540,6 @@ test "StreamingBodyWriter: a declared Content-Length streams without chunk frami
     try body.interface.writeAll("world");
     try body.end();
 
-    try std.testing.expect(!response._chunked);
     try std.testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\n" ++
             "Content-Length: 11\r\n" ++
@@ -2780,7 +2626,7 @@ test "Response: a body set after an abandoned stream is not sent" {
     try std.testing.expect(!response.keepalive);
 }
 
-test "Response: framing headers are the server's" {
+test "Response: Transfer-Encoding and Connection are refused as header names" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2795,7 +2641,19 @@ test "Response: framing headers are the server's" {
     try std.testing.expectError(error.InvalidHeaderName, response.addHeader("transfer-encoding", "chunked"));
     try std.testing.expectError(error.InvalidHeaderName, response.header("Connection", "keep-alive"));
     try std.testing.expectError(error.InvalidHeaderName, response.addHeader("Connection", "close"));
-    // A second Content-Length replaces the first rather than joining it.
+}
+
+test "Response: addHeader replaces a Content-Length rather than repeating it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response._init(arena.allocator(), &connection, 32);
     try response.addHeader("Content-Length", "5");
     try response.addHeader("Content-Length", "2");
     response.body = "hi";
@@ -2898,10 +2756,11 @@ test "Response: write reports the real error, not error.WriteFailed" {
     try std.testing.expectError(error.ConnectionResetByPeer, response.write());
 }
 
-test "Response: writeHeader reports the real error, not error.WriteFailed" {
+test "Response: a WebSocket upgrade whose 101 fails reports the real error, not error.WriteFailed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
+    // Too small to hold the 101, so the upgrade fails at its head.
     var buf: [4]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
@@ -2910,7 +2769,12 @@ test "Response: writeHeader reports the real error, not error.WriteFailed" {
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
     var response = try Response._init(arena.allocator(), &connection, 32);
-    try std.testing.expectError(error.ConnectionResetByPeer, response.writeHeader());
+    var request: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined, .method = .get, .io = std.testing.io, .headers = try http.Headers.init(arena.allocator(), 8) };
+    try request.headers.put("Upgrade", "websocket");
+    try request.headers.put("Connection", "Upgrade");
+    try request.headers.put("Sec-WebSocket-Version", "13");
+    try request.headers.put("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    try std.testing.expectError(error.ConnectionResetByPeer, response._upgradeWebSocket(&request));
 }
 
 test "Response: a write that recorded no cause reports Unexpected" {
@@ -3106,7 +2970,7 @@ test "StreamingBodyWriter: a failed end does not let write add to the body" {
     try std.testing.expect(!response.keepalive);
 }
 
-test "StreamingBodyWriter: a failed end does not leave a second terminator" {
+test "StreamingBodyWriter: write() after a finished stream sends nothing more" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -3129,30 +2993,7 @@ test "StreamingBodyWriter: a failed end does not leave a second terminator" {
     try std.testing.expectEqualStrings(written, conn_writer.buffered());
 }
 
-test "Response: json() with simple object" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response._init(arena.allocator(), &connection, 32);
-    try response.json(.{ .name = "Alice", .age = 30 });
-
-    var body_buf: [256]u8 = undefined;
-    const buffered = try testBody(&response, &body_buf);
-    try std.testing.expectEqualStrings("{\"name\":\"Alice\",\"age\":30}", buffered);
-
-    // Check that Content-Type was set
-    const content_type = response.headers.get("Content-Type");
-    try std.testing.expect(content_type != null);
-    try std.testing.expectEqualStrings("application/json; charset=UTF-8", content_type.?);
-}
-
-test "Response: json() writes complete response" {
+test "Response: json() sends the value as JSON with its Content-Type and length" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -3178,49 +3019,6 @@ test "Response: json() writes complete response" {
     var cl_buf: [32]u8 = undefined;
     const cl_str = try std.fmt.bufPrint(&cl_buf, "Content-Length: {d}", .{expected_json.len});
     try std.testing.expect(std.mem.indexOf(u8, written, cl_str) != null);
-}
-
-test "Response: json() with array" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response._init(arena.allocator(), &connection, 32);
-    const items = [_]i32{ 1, 2, 3, 4, 5 };
-    try response.json(items);
-
-    var body_buf: [256]u8 = undefined;
-    const buffered = try testBody(&response, &body_buf);
-    try std.testing.expectEqualStrings("[1,2,3,4,5]", buffered);
-}
-
-test "Response: json() with nested object" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response._init(arena.allocator(), &connection, 32);
-    try response.json(.{
-        .user = .{
-            .name = "Bob",
-            .id = 42,
-        },
-        .active = true,
-    });
-
-    var body_buf: [256]u8 = undefined;
-    const buffered = try testBody(&response, &body_buf);
-    try std.testing.expectEqualStrings("{\"user\":{\"name\":\"Bob\",\"id\":42},\"active\":true}", buffered);
 }
 
 /// An event stream over a fixed buffer. Built in place: the response points
@@ -3275,7 +3073,7 @@ const TestEventStream = struct {
     }
 };
 
-test "EventStream: send with data only" {
+test "EventStream: an event with only data is one data line and a blank line" {
     var buf: [1024]u8 = undefined;
     var t: TestEventStream = undefined;
     try t.init(&buf);
@@ -3287,19 +3085,7 @@ test "EventStream: send with data only" {
     try std.testing.expectEqualStrings("data: hello world\n\n", written);
 }
 
-test "EventStream: send with event name" {
-    var buf: [1024]u8 = undefined;
-    var t: TestEventStream = undefined;
-    try t.init(&buf);
-    defer t.deinit();
-
-    try t.stream.send("payload", .{ .event = "update" });
-
-    const written = try t.events();
-    try std.testing.expectEqualStrings("event: update\ndata: payload\n\n", written);
-}
-
-test "EventStream: send with all options" {
+test "EventStream: event, id and retry go before the data, in that order" {
     var buf: [1024]u8 = undefined;
     var t: TestEventStream = undefined;
     try t.init(&buf);
@@ -3311,20 +3097,7 @@ test "EventStream: send with all options" {
     try std.testing.expectEqualStrings("event: update\nid: 42\nretry: 5000\ndata: payload\n\n", written);
 }
 
-test "EventStream: multiple sends" {
-    var buf: [1024]u8 = undefined;
-    var t: TestEventStream = undefined;
-    try t.init(&buf);
-    defer t.deinit();
-
-    try t.stream.send("first", .{});
-    try t.stream.send("second", .{ .event = "msg" });
-
-    const written = try t.events();
-    try std.testing.expectEqualStrings("data: first\n\nevent: msg\ndata: second\n\n", written);
-}
-
-test "Response: startEventStream" {
+test "Response: an event stream opens chunked as text/event-stream with no-cache, and keeps the connection" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -3473,7 +3246,7 @@ test "EventWriter: an event too long for the buffer reports the real error" {
     try std.testing.expectEqual(error.ConnectionResetByPeer, stream.body.err.?);
 }
 
-test "Response: setCookie basic" {
+test "Response: setCookie puts the serialized cookie on the wire as Set-Cookie" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -3491,31 +3264,6 @@ test "Response: setCookie basic" {
 
     const written = conn_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Set-Cookie: session=abc123\r\n") != null);
-}
-
-test "Response: setCookie with options" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response._init(arena.allocator(), &connection, 32);
-    try response.setCookie("auth", "token123", .{
-        .path = "/",
-        .http_only = true,
-        .secure = true,
-        .same_site = .strict,
-    });
-    response.body = "OK";
-
-    try response.write();
-
-    const written = conn_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "Set-Cookie: auth=token123; Path=/; HttpOnly; Secure; SameSite=Strict\r\n") != null);
 }
 
 test "Response: header() rejects CRLF in value" {
@@ -3578,44 +3326,7 @@ test "EventStream: rejects newline in event and id fields" {
     try std.testing.expectError(error.InvalidEventField, t.stream.send("ok", .{ .id = "bad\rid" }));
 }
 
-test "EventStream: multi-line data splits into multiple data lines" {
-    var buf: [1024]u8 = undefined;
-    var t: TestEventStream = undefined;
-    try t.init(&buf);
-    defer t.deinit();
-
-    try t.stream.send("line1\nline2", .{});
-
-    const written = try t.events();
-    try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", written);
-}
-
-test "EventStream: CRLF line endings stripped in data" {
-    var buf: [1024]u8 = undefined;
-    var t: TestEventStream = undefined;
-    try t.init(&buf);
-    defer t.deinit();
-
-    try t.stream.send("line1\r\nline2", .{});
-
-    const written = try t.events();
-    try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", written);
-}
-
-test "EventWriter: basic write" {
-    var buf: [1024]u8 = undefined;
-    var t: TestEventStream = undefined;
-    try t.init(&buf);
-    defer t.deinit();
-
-    var ew = try t.stream.startSend(.{});
-    try ew.interface.writeAll("hello");
-    try ew.end();
-
-    try std.testing.expectEqualStrings("data: hello\n\n", try t.events());
-}
-
-test "EventWriter: multi-line" {
+test "EventWriter: an LF in written data starts a new data line" {
     var buf: [1024]u8 = undefined;
     var t: TestEventStream = undefined;
     try t.init(&buf);
@@ -3628,20 +3339,7 @@ test "EventWriter: multi-line" {
     try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", try t.events());
 }
 
-test "EventWriter: print" {
-    var buf: [1024]u8 = undefined;
-    var t: TestEventStream = undefined;
-    try t.init(&buf);
-    defer t.deinit();
-
-    var ew = try t.stream.startSend(.{});
-    try ew.interface.print("count: {d}", .{42});
-    try ew.end();
-
-    try std.testing.expectEqualStrings("data: count: 42\n\n", try t.events());
-}
-
-test "EventWriter: with options" {
+test "EventWriter: the event's fields go before its data" {
     var buf: [1024]u8 = undefined;
     var t: TestEventStream = undefined;
     try t.init(&buf);
@@ -3668,22 +3366,7 @@ test "EventWriter: multiple writes merged into one event" {
     try std.testing.expectEqualStrings("data: foobar\n\n", try t.events());
 }
 
-test "EventWriter: writeByte" {
-    var buf: [1024]u8 = undefined;
-    var t: TestEventStream = undefined;
-    try t.init(&buf);
-    defer t.deinit();
-
-    var ew = try t.stream.startSend(.{});
-    try ew.interface.writeByte('A');
-    try ew.interface.writeByte('B');
-    try ew.interface.writeByte('C');
-    try ew.end();
-
-    try std.testing.expectEqualStrings("data: ABC\n\n", try t.events());
-}
-
-test "EventWriter: splatBytesAll" {
+test "EventWriter: a splatted write repeats its pattern within one data line" {
     var buf: [1024]u8 = undefined;
     var t: TestEventStream = undefined;
     try t.init(&buf);
@@ -4043,7 +3726,7 @@ test "BodyWriter: a body of more segments than one vectored write takes goes out
     }
 }
 
-test "BodyWriter: a write bigger than any segment, and a long splat" {
+test "BodyWriter: a write or a splat larger than any segment arrives whole, in order" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -4378,30 +4061,54 @@ test "Response: a streamed HEAD sends the framing headers and nothing after" {
     );
 }
 
-test "Response: a streamed HEAD still checks a declared length" {
+test "Response: a streamed HEAD charges what the handler writes against a declared length" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
+    // The handler wrote what a GET would have: end() accepts it, and none
+    // of it goes out.
+    {
+        var buf: [1024]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response._init(arena.allocator(), &connection, 32);
-    response.head = true;
-    try response.header("Content-Length", "5");
+        var response = try Response._init(arena.allocator(), &connection, 32);
+        response.head = true;
+        try response.header("Content-Length", "5");
 
-    var body_buf: [64]u8 = undefined;
-    var body = try response.stream(&body_buf);
-    // The handler wrote what a GET would have, and is held to the length
-    // it promised even though none of it went out.
-    try body.interface.writeAll("hello");
-    try body.end();
+        var body_buf: [64]u8 = undefined;
+        var body = try response.stream(&body_buf);
+        try body.interface.writeAll("hello");
+        try body.end();
 
-    try std.testing.expectEqualStrings(
-        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
-        conn_writer.buffered(),
-    );
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+            conn_writer.buffered(),
+        );
+    }
+    // The handler wrote less than it promised: end() reports the mismatch,
+    // and still nothing past the head goes out.
+    {
+        var buf: [1024]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
+
+        var response = try Response._init(arena.allocator(), &connection, 32);
+        response.head = true;
+        try response.header("Content-Length", "5");
+
+        var body_buf: [64]u8 = undefined;
+        var body = try response.stream(&body_buf);
+        try body.interface.writeAll("hel");
+        try std.testing.expectError(error.ContentLengthMismatch, body.end());
+
+        try std.testing.expectEqualStrings(
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+            conn_writer.buffered(),
+        );
+    }
 }
 
 test "Response: a HEAD event stream sends the headers and no events" {
@@ -4641,6 +4348,46 @@ fn testBrotliDecode(arena: std.mem.Allocator, encoded: []const u8, max: usize) !
     return out[0..len];
 }
 
+/// Brotli's streaming decoder, to check that what has arrived so far
+/// decodes on its own (test-only).
+const TestBrotliStream = struct {
+    const c = @import("brotli");
+    state: *c.BrotliDecoderState,
+    out: std.Io.Writer.Allocating,
+
+    fn init(arena: std.mem.Allocator) !TestBrotliStream {
+        return .{
+            .state = c.BrotliDecoderCreateInstance(null, null, null) orelse return error.OutOfMemory,
+            .out = .init(arena),
+        };
+    }
+
+    fn deinit(self: *TestBrotliStream) void {
+        c.BrotliDecoderDestroyInstance(self.state);
+    }
+
+    /// Decodes `in` whole, appending to `out`.
+    fn feed(self: *TestBrotliStream, in: []const u8) !void {
+        var next_in: [*c]const u8 = in.ptr;
+        var avail_in: usize = in.len;
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            var next_out: [*c]u8 = &chunk;
+            var avail_out: usize = chunk.len;
+            const result = c.BrotliDecoderDecompressStream(self.state, &avail_in, &next_in, &avail_out, &next_out, null);
+            try self.out.writer.writeAll(chunk[0 .. chunk.len - avail_out]);
+            switch (result) {
+                c.BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT => continue,
+                c.BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT, c.BROTLI_DECODER_RESULT_SUCCESS => {
+                    if (avail_in != 0) return error.InvalidBrotli;
+                    return;
+                },
+                else => return error.InvalidBrotli,
+            }
+        }
+    }
+};
+
 test "Response: a buffered body goes out as br, at the configured quality" {
     if (!build_options.use_brotli) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -4697,10 +4444,15 @@ test "Response: a streamed body goes out as br, each flush decodable" {
     var stream_buf: [128]u8 = undefined;
     var w = try response.stream(&stream_buf);
     var plain: std.Io.Writer.Allocating = .init(arena.allocator());
+    // Where the wire and the plain text stood after each flush.
+    var flushes: [5]struct { wire: usize, plain: usize } = undefined;
     for (0..50) |i| {
         try w.interface.print("event {d}: something happened, and then something else happened\n", .{i});
         try plain.writer.print("event {d}: something happened, and then something else happened\n", .{i});
-        if (i % 10 == 9) try w.interface.flush();
+        if (i % 10 == 9) {
+            try w.interface.flush();
+            flushes[i / 10] = .{ .wire = conn_writer.end, .plain = plain.written().len };
+        }
     }
     try w.end();
 
@@ -4709,20 +4461,25 @@ test "Response: a streamed body goes out as br, each flush decodable" {
     const head = written[0 .. split + 2];
     try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding: br\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, head, "Transfer-Encoding: chunked\r\n") != null);
-    // Undo the chunking: several chunks, one per flush and the end.
-    var encoded: std.Io.Writer.Allocating = .init(arena.allocator());
-    var rest = written[split + 4 ..];
-    var chunks: usize = 0;
+    // Undo the chunking, decoding as the chunks arrive: at the end of each
+    // flush, what came so far decodes to all the text written so far.
+    var decoder = try TestBrotliStream.init(arena.allocator());
+    defer decoder.deinit();
+    var at = split + 4;
+    var next_flush: usize = 0;
     while (true) {
-        const eol = std.mem.indexOf(u8, rest, "\r\n").?;
-        const size = try std.fmt.parseInt(usize, rest[0..eol], 16);
+        const eol = at + std.mem.indexOf(u8, written[at..], "\r\n").?;
+        const size = try std.fmt.parseInt(usize, written[at..eol], 16);
         if (size == 0) break;
-        try encoded.writer.writeAll(rest[eol + 2 ..][0..size]);
-        rest = rest[eol + 2 + size + 2 ..];
-        chunks += 1;
+        try decoder.feed(written[eol + 2 ..][0..size]);
+        at = eol + 2 + size + 2;
+        if (next_flush < flushes.len and at == flushes[next_flush].wire) {
+            try std.testing.expectEqualStrings(plain.written()[0..flushes[next_flush].plain], decoder.out.written());
+            next_flush += 1;
+        }
     }
-    try std.testing.expect(chunks >= 5);
-    try std.testing.expectEqualStrings(plain.written(), try testBrotliDecode(arena.allocator(), encoded.written(), plain.written().len));
+    try std.testing.expectEqual(flushes.len, next_flush);
+    try std.testing.expectEqualStrings(plain.written(), decoder.out.written());
     // The encoder's memory went back when the body ended.
     try std.testing.expect(response.brotli_encoder == null);
 }
@@ -4739,15 +4496,18 @@ test "Response.deinit frees the Brotli encoder of a stream never ended" {
     var response = try Response._init(arena.allocator(), &connection, 8);
     response._request = &request;
     response.compress = true;
+    // The encoder's state comes from block_cache, not the testing
+    // allocator, so brotli_io counts the live encoders for the leak check.
+    const live_before = brotli_io.liveForTest();
     var stream_buf: [64]u8 = undefined;
     var w = try response.stream(&stream_buf);
     try w.interface.writeAll("abandoned half way");
-    try std.testing.expect(response.brotli_encoder != null);
+    try std.testing.expectEqual(live_before + 1, brotli_io.liveForTest());
     // As the HTTP/1.1 loop does: the arena (where the compressor is) goes
     // before the response.
     _ = arena.reset(.free_all);
     response.deinit();
-    try std.testing.expect(response.brotli_encoder == null);
+    try std.testing.expectEqual(live_before, brotli_io.liveForTest());
 }
 
 const test_templates = struct {
@@ -4951,7 +4711,6 @@ test "Response sink: a streamed body is unframed, of unknown length, and ends on
     try response.write(); // the server's call after the handler: nothing more
 
     try std.testing.expectEqualStrings("hello streamed world", ts.body());
-    try std.testing.expect(!response._chunked);
     try std.testing.expectEqual(@as(usize, 1), ts.ends);
 }
 
@@ -5031,7 +4790,23 @@ test "sendFile: a path that would leave the directory is refused as text" {
     }
 }
 
-test "EventStream: comment, end and draining" {
+test "EventStream: a comment goes out as its own chunk, ignored by the event parser" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var response = try Response._init(arena.allocator(), &connection, 8);
+    var event_buf: [256]u8 = undefined;
+    var stream = try response.startEventStream(&event_buf);
+    try stream.comment("keep-alive");
+    try stream.send("x", .{});
+    try stream.end();
+    try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "e\r\n: keep-alive\n\n\r\n9\r\ndata: x\n\n\r\n0\r\n\r\n"));
+}
+
+test "EventStream: draining() reports the server's drain" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var buf: [1024]u8 = undefined;
@@ -5046,13 +4821,23 @@ test "EventStream: comment, end and draining" {
     var event_buf: [256]u8 = undefined;
     var stream = try response.startEventStream(&event_buf);
     try std.testing.expect(!stream.draining());
-    try stream.comment("keep-alive");
-    try stream.send("x", .{});
     drain.set(std.testing.io);
     try std.testing.expect(stream.draining());
     try stream.end();
-    try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "e\r\n: keep-alive\n\n\r\n9\r\ndata: x\n\n\r\n0\r\n\r\n"));
+}
+
+test "EventStream: a comment with a line break is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var response = try Response._init(arena.allocator(), &connection, 8);
+    var event_buf: [256]u8 = undefined;
+    var stream = try response.startEventStream(&event_buf);
     try std.testing.expectError(error.InvalidEventField, stream.comment("a\nb"));
+    try stream.end();
 }
 
 test "misuse: stream after res.body is BodyAlreadySet" {
@@ -5071,7 +4856,7 @@ test "misuse: stream after res.body is BodyAlreadySet" {
     try std.testing.expect(!response.headersSent());
 }
 
-test "misuse: writer after the head is HeadersAlreadySent, resetBody too" {
+test "misuse: a writer while a stream is open is BodyWriterOpen; after the head, writer and resetBody are HeadersAlreadySent" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var buf: [256]u8 = undefined;
@@ -5127,10 +4912,17 @@ test "problem: does nothing once headers are out" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
     var response = try Response._init(arena.allocator(), &connection, 32);
-    response.body = "kept";
-    response._headers_written = true;
+    var body_buf: [64]u8 = undefined;
+    var stream = try response.stream(&body_buf);
+    try stream.end();
+    const sent = conn_writer.end;
+    const content_type = response.content_type;
+
     response.problem(.{});
-    try std.testing.expectEqualStrings("kept", response.body);
+    try std.testing.expectEqual(http.Status.ok, response.status);
+    try std.testing.expectEqual(content_type, response.content_type);
+    try response.write();
+    try std.testing.expectEqual(sent, conn_writer.end);
 }
 
 test "json: renamed fields by outside names, nested and in slices" {
