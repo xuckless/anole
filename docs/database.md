@@ -423,9 +423,11 @@ With `app.metrics`, the series below appear, labelled `system="postgresql"`
 and `db` (`Options.name`); with `app.tracing`, every call in a traced
 request is a client span (`db.system.name`, `db.namespace`,
 `db.operation.name`); with `app.health`, `/readyz` fails while the
-database does not answer `SELECT 1` (checked at most once a second). The
-order of `app.postgres`, `app.metrics`, `app.tracing` and `app.health`
-does not matter.
+database does not answer `SELECT 1` (checked at most once a second). While
+a ping runs, other probes answer with the last result, and a ping canceled
+with its request is not kept; this holds for every connector's readiness
+check. The order of `app.postgres`, `app.metrics`, `app.tracing` and
+`app.health` does not matter.
 
 - `anole_db_query_duration_seconds` (histogram)
 - `anole_db_errors_total{error}` (`Conflict`, `NotFound`, ...)
@@ -624,7 +626,8 @@ has, whatever the order of the calls: `anole_db_*` metrics with
 `acquire(req)` holds the writer connection for SQLite's own API through
 zig-sqlite (user functions, blobs, backups): `conn.run(func, args)` runs
 `func(driver_db, args...)` on the writer thread; `conn.release()` gives it
-back. `anole.sqlite.c` is the C API.
+back once (a second call does nothing; don't call anything on it after
+`release()`). `anole.sqlite.c` is the C API.
 
 ## MongoDB
 
@@ -919,7 +922,7 @@ the typed calls, which read it into your type:
 | `optional(T, req, args)` | the reply as a `T`, or null |
 | `all(T, req, args)` | an array reply as `[]T` |
 | `pipeline(req, .{ cmd1, cmd2 })` | every reply, in one round trip |
-| `acquire(req)` | one connection for several calls, given back with `release()` |
+| `acquire(req)` | one connection for several calls, given back with `release()` (once: a second call does nothing; don't call anything on it after) |
 | `subscribe(req, channels)`, `psubscribe` | a pub/sub connection of its own |
 | `with(.{ .timeout })` | the same calls, bounded |
 | `with(.{ .coalesce = true })`, `with(.{ .cache = .{ .ttl, .tag, .keep_empty } })` | reads shared or kept ([Caching](#caching)) |
