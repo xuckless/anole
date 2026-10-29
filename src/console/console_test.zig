@@ -535,7 +535,7 @@ test "console: a tap and the request counters taken before stop stay usable unti
     tap.func(tap.ud, .warn, "anole", .{}, false, "draining");
     c.stop(false);
     try std.testing.expect(stats_mod.global == null);
-    tap.func(tap.ud, .warn, "anole", .{}, false, "Shutdown timed out with 1 request(s) still in flight");
+    tap.func(tap.ud, .warn, "anole", .{}, false, "Shutdown timed out with 1 request(s) or connection(s) still in flight");
     st.count(0, 0, 504, 1000);
     c.release();
 }

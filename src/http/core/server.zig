@@ -2041,7 +2041,8 @@ pub fn Server(comptime Ctx: type) type {
             // notice now, the final one a round trip later, when the PING
             // sent with the notice comes back, or after `h2_notice_wait` for
             // a peer that does not answer. Each holds the drain open until
-            // its final GOAWAY is out.
+            // it has closed: the final GOAWAY, then the lingering close (up
+            // to `linger_timeout` for a peer that keeps its side open).
             var notice_deadline: ?std.Io.Clock.Timestamp = null;
             if (comptime build_options.use_http2) {
                 if (self.h2_conns.beginDrain())
@@ -2064,7 +2065,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 if (timeout.toTimestamp(self.io)) |deadline| {
                     if (std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, deadline)) {
-                        log.warn("Shutdown timed out with {d} request(s) still in flight", .{remaining});
+                        log.warn("Shutdown timed out with {d} request(s) or connection(s) still in flight", .{remaining});
                         return;
                     }
                 }
@@ -2080,7 +2081,7 @@ pub fn Server(comptime Ctx: type) type {
                     wait = if (timeout.toTimestamp(self.io)) |d| (if (d.compare(.lt, nd)) timeout else nd_timeout) else nd_timeout;
                 }
 
-                log.info("Waiting for {} in-flight request(s) to finish", .{remaining});
+                log.info("Waiting for {} in-flight request(s) or connection(s) to finish", .{remaining});
                 // Wakes when a request finishes, or when the deadline
                 // arrives; the loop above decides which happened. Spurious
                 // wakeups just re-read the count.
