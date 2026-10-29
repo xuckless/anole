@@ -403,3 +403,77 @@ const AfterHttp = struct {
 test "jobs: a run still going after the HTTP drain ends before a connector made after the queue is freed" {
     if (comptime anole.features.webhooks) try AfterHttp.body() else return error.SkipZigTest;
 }
+
+/// SAFETY.md M2's teardown with runs in flight on every executor, at seeded
+/// points; TESTING.md W3 keeps it out of the unit suite (`zig build
+/// test-stress`). The deterministic claim is the test above.
+const TeardownLoad = struct {
+    const wh = @import("../webhooks/root.zig");
+    const Plan = struct { mode: u8, yields: u16 };
+    var jc: *root.Client = undefined;
+    var hooks: *wh.Client = undefined;
+    var started: std.atomic.Value(u32) = .init(0);
+    var never: std.Io.Event = .unset;
+
+    /// Mode 0: yields, then uses the webhooks client; 1: the same, then
+    /// waits until the drain's cancel ends it; 2: returns at once.
+    fn run(job: *root.Job) anyerror!void {
+        _ = started.fetchAdd(1, .acq_rel);
+        const p = try job.args(Plan);
+        if (p.mode == 2) return;
+        for (0..p.yields) |_| try zio.yield();
+        _ = try hooks.listEndpoints(job, "nobody");
+        if (p.mode == 1) try never.wait(job.io);
+    }
+
+    fn startedAtLeast(n: u32) bool {
+        return started.load(.acquire) >= n;
+    }
+
+    fn check(a: *anole.App, plan: []const Plan, stop_at: u32, extra_yields: u32) !void {
+        defer a.stop();
+        try a.waitReady();
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var ctx: anole.db.Ctx = .{ .io = a.io(), .arena = arena.allocator() };
+        for (plan) |p| {
+            var buf: [48]u8 = undefined;
+            const args = try std.fmt.bufPrint(&buf, "{{\"mode\":{d},\"yields\":{d}}}", .{ p.mode, p.yields });
+            _ = try jc.enqueueRaw(&ctx, kind.name, args, .{});
+        }
+        try waitFor(a.io(), startedAtLeast, .{stop_at});
+        for (0..extra_yields) |_| try zio.yield();
+    }
+
+    fn round(prng: *std.Random.DefaultPrng) !void {
+        const r = prng.random();
+        var plan: [64]Plan = undefined;
+        for (&plan, 0..) |*p, i| p.* = .{ .mode = @intCast(i % 3), .yields = r.uintAtMost(u16, 200) };
+        r.shuffle(Plan, &plan);
+        const stop_at = 1 + r.uintLessThan(u32, 4);
+        const extra_yields = r.uintLessThan(u32, 64);
+        var app = try anole.App.init(gpa, .{ .executors = .exact(4), .listen_tls_http3 = false });
+        defer app.deinit();
+        started.store(0, .release);
+        jc = try app.jobs(.{ .store = .memory, .drain_timeout = .fromMilliseconds(20) });
+        hooks = try app.webhooks(.{ .jobs = jc });
+        try jc.handleRaw(&app, kind, .{}, run);
+        var checking = try app.io().concurrent(check, .{ &app, @as([]const Plan, &plan), stop_at, extra_yields });
+        defer checking.cancel(app.io()) catch {};
+        try app.listen("127.0.0.1:0");
+        try checking.await(app.io());
+    }
+
+    fn body() !void {
+        try wait.requireStress();
+        const lvl = std.testing.log_level;
+        std.testing.log_level = .err;
+        defer std.testing.log_level = lvl;
+        var prng: std.Random.DefaultPrng = .init(0x7e4d0007);
+        for (0..200) |_| try round(&prng);
+    }
+};
+
+test "jobs: [stress] app teardown with runs in flight on four executors never frees a connector a run still uses" {
+    if (comptime anole.features.webhooks) try TeardownLoad.body() else return error.SkipZigTest;
+}

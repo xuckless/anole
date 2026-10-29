@@ -128,3 +128,60 @@ test "jobs metrics: a new kind label is recorded without allocating under the la
     try registry.render(&out.writer);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "anole_jobs_enqueued_total{queue=\"default\",kind=\"k1\"} 1") != null);
 }
+
+/// Adds every `anole_jobs_finished_total` sample in `text` to `sum`, and
+/// counts the distinct kind labels other than "other".
+fn finishedSamples(text: []const u8, sum: *u64, kinds: *u32, other: *bool) !void {
+    const prefix = "anole_jobs_finished_total{queue=\"default\",kind=\"";
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, prefix)) continue;
+        const rest = line[prefix.len..];
+        const q = std.mem.indexOfScalar(u8, rest, '"') orelse return error.BadSample;
+        const sp = std.mem.lastIndexOfScalar(u8, rest, ' ') orelse return error.BadSample;
+        sum.* += try std.fmt.parseInt(u64, rest[sp + 1 ..], 10);
+        if (std.mem.eql(u8, rest[0..q], "other")) other.* = true else kinds.* += 1;
+    }
+}
+
+// SAFETY.md L5's multi-thread stress test of the label cap; TESTING.md W3
+// keeps it out of the unit suite (`zig build test-stress`).
+test "jobs metrics: [stress] eight threads recording 512 kinds keep at most 256 labels and count every event" {
+    try @import("anole_test_wait").requireStress();
+    var registry: m.Registry = .init(std.testing.allocator, std.testing.io);
+    defer registry.deinit();
+    var checked: safety.SpinCheckedAllocator = .init(std.testing.allocator);
+    var s = try Series.init(checked.allocator(), &registry);
+    defer s.deinit();
+    const Worker = struct {
+        const each = 10_000;
+        fn run(series: *Series, seed: u64) void {
+            var prng: std.Random.DefaultPrng = .init(seed);
+            const r = prng.random();
+            for (0..each) |_| {
+                var buf: [16]u8 = undefined;
+                const k = std.fmt.bufPrint(&buf, "k{d}", .{r.uintLessThan(u32, 512)}) catch unreachable;
+                series.onFinished("default", k, .completed, .fromMilliseconds(1));
+            }
+        }
+    };
+    var threads: [8]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |t| t.join();
+    for (&threads, 0..) |*t, i| {
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{ &s, 0x5eed_0700 + i });
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |t| t.join();
+    spawned = 0;
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    var sum: u64 = 0;
+    var kinds: u32 = 0;
+    var other = false;
+    try finishedSamples(out.written(), &sum, &kinds, &other);
+    try std.testing.expect(kinds <= max_labels);
+    try std.testing.expect(other);
+    try std.testing.expectEqual(@as(u64, 8 * Worker.each), sum);
+}
