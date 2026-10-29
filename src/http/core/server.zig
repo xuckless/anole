@@ -1678,6 +1678,13 @@ pub fn Server(comptime Ctx: type) type {
             return park.supported;
         }
 
+        /// Test builds only: idle-park shelves started after this sweep for
+        /// expired deadlines every `interval` instead of every second (null
+        /// restores it).
+        pub fn setParkSweepIntervalForTest(interval: ?std.Io.Duration) void {
+            park.setSweepIntervalForTest(interval);
+        }
+
         /// How many connections are parked right now (`timeout.idle_park`).
         pub fn parkedConnections(self: *const Self) usize {
             var n: usize = 0;
