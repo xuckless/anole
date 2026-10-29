@@ -910,7 +910,7 @@ test "field_behavior, deprecated and comments" {
     try contains(text, "\"description\": \"A widget.\"");
 }
 
-test "template paths" {
+test "templatePath: HttpRule variables become {name} parameters, multi-segment captures split into numbered ones, ** marks the rest of the path" {
     const T = transcode.Template;
     const a = comptime templatePath(T.parse("/v1/{name}") catch unreachable);
     try testing.expectEqualStrings("/v1/{name}", a.path);

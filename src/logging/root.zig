@@ -475,7 +475,7 @@ test "fromStd: a std.log call in json format is a record with the formatted mess
     try std.testing.expect(std.mem.indexOf(u8, T.buf[0..T.len], "\"scope\":\"anole\",\"message\":\"listening on 0.0.0.0:3000\"") != null);
 }
 
-test "re-entrant log from a field's format uses the fallback buffer" {
+test "a log call made while formatting a field is delivered, and so is the outer record" {
     const Loud = struct {
         pub fn format(_: @This(), w: *std.Io.Writer) !void {
             info("inner", .{});

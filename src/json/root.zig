@@ -334,7 +334,9 @@ test "parse: a whole float at the edge of an integer type's range" {
     try std.testing.expectEqual(@as(i8, -128), try parse(i8, arena, "-128.0", .{}));
 }
 
-test "parse: a type that contains itself nests at most max_depth deep" {
+// Regression test (0d7dc06): mapping a type that contains itself nested
+// without bound.
+test "json: a type that contains itself nests at most max_depth deep" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -350,8 +352,15 @@ test "parse: a type that contains itself nests at most max_depth deep" {
     try text.appendSlice(arena, "{}");
     for (0..63) |_| try text.appendSlice(arena, "]}");
     _ = try parse(Tree, arena, text.items, .{});
-    // In-place parsing is not used, so a read-only input is fine.
-    _ = try parse(Tree, arena, "{\"children\":[{}]}", .{ .flags = c.YYJSON_READ_INSITU });
+}
+
+// Regression test (0d7dc06): YYJSON_READ_INSITU made yyjson write into the
+// caller's read-only input.
+test "json: YYJSON_READ_INSITU is ignored, so a read-only input parses" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const Tree = struct { children: []const @This() = &.{} };
+    _ = try parse(Tree, arena_state.allocator(), "{\"children\":[{}]}", .{ .flags = c.YYJSON_READ_INSITU });
 }
 
 test "readBody: bind's contract, answered 400 by the server" {

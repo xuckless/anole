@@ -11,6 +11,7 @@
 //! was filled under are current, so an invalidation reaches every
 //! executor's entries at once, those still being filled included.
 const std = @import("std");
+const builtin = @import("builtin");
 const dusty = @import("dusty");
 const observe = @import("../observe/root.zig");
 const placement = dusty.placement;
@@ -20,8 +21,17 @@ const Counter = std.atomic.Value(u64);
 
 /// The awake clock in nanoseconds: what expiry is measured on.
 pub fn now(io: std.Io) i96 {
+    if (builtin.is_test) {
+        const frozen = test_clock.load(.monotonic);
+        if (frozen != 0) return frozen;
+    }
     return std.Io.Timestamp.now(io, .awake).nanoseconds;
 }
+
+/// Tests only: while non-zero, `now` returns it (nanoseconds on the awake
+/// clock), so a test moves expiry forward without sleeping (TESTING.md D4).
+/// Set it from `now`, advance it, and store 0 again when done.
+pub var test_clock: if (builtin.is_test) std.atomic.Value(i64) else void = if (builtin.is_test) .init(0) else {};
 
 /// Counters an invalidation bumps, shared by every executor: one for
 /// everything, one per tag (hashed into a slot) and one per key (hashed
@@ -417,14 +427,15 @@ test "Store: least recently used goes first, by entries and by bytes" {
     try testing.expectEqual(@as(u64, 3), store.stats.entries.load(.monotonic));
 
     // By bytes: room for about two entries of 1000.
-    var small: Store = .init(testing.allocator, 100, 2 * (1000 + @sizeOf(Store.Entry) + 16));
+    const max_bytes = 2 * (1000 + @sizeOf(Store.Entry) + 16);
+    var small: Store = .init(testing.allocator, 100, max_bytes);
     defer small.deinit();
     try put(&small, &gens, "x", 1000, 100);
     try put(&small, &gens, "y", 1000, 100);
     try put(&small, &gens, "z", 1000, 100);
     try testing.expect(small.get("x", 0, &gens) == null);
     try testing.expect(small.get("z", 0, &gens) != null);
-    try testing.expect(small.bytes <= small.max_bytes);
+    try testing.expect(small.stats.bytes.load(.monotonic) <= max_bytes);
     // Larger than the whole store: not created.
     try testing.expectError(error.TooBig, put(&small, &gens, "w", 1 << 20, 100));
 }
@@ -435,11 +446,11 @@ test "Store: an entry of the same key replaces the old one; expired and invalida
     defer store.deinit();
     try put(&store, &gens, "k", 8, 100);
     try put(&store, &gens, "k", 16, 100);
-    try testing.expectEqual(@as(u32, 1), store.map.count());
+    try testing.expectEqual(@as(u64, 1), store.stats.entries.load(.monotonic));
     try testing.expectEqual(@as(usize, 16), store.get("k", 0, &gens).?.value_len);
     // Expired at 100.
     try testing.expect(store.get("k", 100, &gens) == null);
-    try testing.expectEqual(@as(u32, 0), store.map.count());
+    try testing.expectEqual(@as(u64, 0), store.stats.entries.load(.monotonic));
 
     // Invalidation by key slot, by tag and of everything.
     const e = store.create("t", 8, .of(u64), 100, gens.stamp(Generations.tagSlot("posts"), 7)).?;

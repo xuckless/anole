@@ -49,6 +49,26 @@ test "printing never shows the value" {
     try std.testing.expectEqualStrings("s3cret", config.password.expose());
 }
 
-test "the anole_sensitive marker is set, so the logger writes [REDACTED]" {
-    try std.testing.expect(@hasDecl(Secret, "anole_sensitive") and Secret.anole_sensitive);
+test "the logger writes a Secret field as [REDACTED]" {
+    const log = @import("anole_log");
+    const T = struct {
+        var buf: [512]u8 = undefined;
+        var len: usize = 0;
+        fn f(_: ?*anyopaque, _: std.log.Level, _: []const u8, line: []const u8) void {
+            len = @min(line.len, buf.len);
+            @memcpy(buf[0..len], line[0..len]);
+        }
+    };
+    var cb: log.Callback = .{ .func = T.f };
+    log.setSink(&cb);
+    log.setFormat(.json);
+    defer {
+        log.setSink(null);
+        log.setFormat(.text);
+    }
+    // `token` is not a secret name, so only the type can redact it.
+    log.info("m", .{ .token = Secret.init("s3cret") });
+    const line = T.buf[0..T.len];
+    try std.testing.expect(std.mem.find(u8, line, "\"token\":\"[REDACTED]\"") != null);
+    try std.testing.expect(std.mem.find(u8, line, "s3cret") == null);
 }

@@ -113,8 +113,16 @@ test "metrics: target labels capped at 256, then other" {
         const t = try std.fmt.bufPrint(&buf, "h{d}", .{i});
         hooks.on_rejected(hooks.context, .http, t);
     }
-    try testing.expectEqualStrings("other", binding.label(.http, "h300"));
-    try testing.expectEqualStrings("h1", binding.label(.http, "h1"));
     // Another client has its own budget.
-    try testing.expectEqualStrings("x", binding.label(.grpc, "x"));
+    hooks.on_rejected(hooks.context, .grpc, "x");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    const text = out.written();
+    try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_rejected_total{client=\"http\",target=\"other\"} 5") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_rejected_total{client=\"http\",target=\"h1\"} 1") != null);
+    // The first target past the cap (h256) and the last one (h260) get no series of their own.
+    try testing.expect(std.mem.indexOf(u8, text, "target=\"h256\"") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "target=\"h260\"") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_rejected_total{client=\"grpc\",target=\"x\"} 1") != null);
 }

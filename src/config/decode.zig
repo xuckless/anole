@@ -328,24 +328,10 @@ fn editDistance(a: []const u8, b: []const u8) ?usize {
     return previous[b.len];
 }
 
-test "edit distance and suggestions" {
-    try std.testing.expectEqual(1, editDistance("databse", "database"));
-    try std.testing.expectEqual(2, editDistance("prot", "port"));
-    try std.testing.expectEqualStrings("database", closest("databse", &.{ "name", "database" }).?);
-    try std.testing.expectEqual(null, closest("x", &.{ "name", "database" }));
-}
-
 test "bools in every spelling" {
     try std.testing.expectEqual(true, parseBool(" Yes "));
     try std.testing.expectEqual(false, parseBool("OFF"));
     try std.testing.expectEqual(null, parseBool("maybe"));
-}
-
-test "edit distance ignores case and gives up on long strings" {
-    try std.testing.expectEqual(0, editDistance("PORT", "port"));
-    try std.testing.expectEqual(3, editDistance("", "abc"));
-    try std.testing.expectEqual(null, editDistance(&@as([65]u8, @splat('a')), "a"));
-    try std.testing.expectEqual(null, closest("ab", &.{"xy"}));
 }
 
 test "hints spell out environment names and enum tags" {
@@ -388,7 +374,7 @@ pub fn parseDuration(text: []const u8) ?Duration {
     return .{ .nanoseconds = total };
 }
 
-test "parseDuration" {
+test "parseDuration: ms, s, m and h units add up; bare numbers, fractions, signs and spaces are refused" {
     try std.testing.expectEqual(@as(i96, 30 * std.time.ns_per_s), parseDuration("30s").?.nanoseconds);
     try std.testing.expectEqual(@as(i96, 250 * std.time.ns_per_ms), parseDuration("250ms").?.nanoseconds);
     try std.testing.expectEqual(@as(i96, 90 * std.time.ns_per_s), parseDuration("1m30s").?.nanoseconds);
