@@ -313,8 +313,7 @@ pub const Client = struct {
     /// this for you): metrics, spans for calls in traced requests, the
     /// `/readyz` check. Also starts the consumers registered so far.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
-        if (self.started) return;
-        self.started = true;
+        if (self.isStarted()) return;
         self.observer = try db.Observer.init(.kafka, self.name, registry, tracer);
         if (registry) |r| {
             self.telemetry = try Telemetry.init(r, self.name);
@@ -330,11 +329,45 @@ pub const Client = struct {
                 return error.KafkaUnavailable;
             };
         }
+        // The consumers added before `started` is set are started here, the
+        // ones after it by `consume`: each by exactly one of the two. A start
+        // spawns (and may suspend), and the log line may wait: both after
+        // the lock (L2, L3).
+        const n = blk: {
+            self.consumers_mutex.lockUncancelable(self.io);
+            defer self.consumers_mutex.unlock(self.io);
+            self.started = true;
+            break :blk self.consumers.items.len;
+        };
+        if (self.suppress_consumers) {
+            if (n > 0) log.info("kafka \"{s}\": lambda deployment joins no consumer groups here; producing works", .{self.name});
+            return;
+        }
+        // The list only grows until `deinit`: an index read under the lock
+        // names a live consumer.
+        for (0..n) |i| {
+            const c = blk: {
+                self.consumers_mutex.lockUncancelable(self.io);
+                defer self.consumers_mutex.unlock(self.io);
+                break :blk self.consumers.items[i];
+            };
+            try c.start();
+        }
+    }
+
+    fn isStarted(self: *Client) bool {
         self.consumers_mutex.lockUncancelable(self.io);
         defer self.consumers_mutex.unlock(self.io);
-        if (self.suppress_consumers) {
-            if (self.consumers.items.len > 0) log.info("kafka \"{s}\": lambda deployment joins no consumer groups here; producing works", .{self.name});
-        } else for (self.consumers.items) |c| try c.start();
+        return self.started;
+    }
+
+    /// Adds a consumer; true when it is to be started now (serving has
+    /// started), which the caller does after the lock.
+    fn addConsumer(self: *Client, c: *consumer_mod.Consumer) !bool {
+        self.consumers_mutex.lockUncancelable(self.io);
+        defer self.consumers_mutex.unlock(self.io);
+        try self.consumers.append(self.gpa, c);
+        return self.started and !self.drained and !self.suppress_consumers;
     }
 
     fn pingFn(context: *anyopaque, _: std.Io) bool {
@@ -543,11 +576,13 @@ pub const Client = struct {
         };
         const context: ?*anyopaque = if (comptime params.len == 2) appOf(server) else null;
         const c = try consumer_mod.Consumer.create(self.host(), opts, Thunk.call, context);
-        errdefer c.destroy();
-        self.consumers_mutex.lockUncancelable(self.io);
-        defer self.consumers_mutex.unlock(self.io);
-        try self.consumers.append(self.gpa, c);
-        if (self.started and !self.suppress_consumers) try c.start();
+        const start_now = self.addConsumer(c) catch |err| {
+            c.destroy();
+            return err;
+        };
+        // In the list from here on: the client frees it, a failed start
+        // included.
+        if (start_now) try c.start();
     }
 
     /// `consume` for callers that bring their own function pointers (the C
@@ -555,11 +590,13 @@ pub const Client = struct {
     /// already has). It lives, stopped or not, until the client is freed.
     pub fn consumeRaw(self: *Client, opts: ConsumeOptions, handler: consumer_mod.HandlerFn, context: ?*anyopaque) !*consumer_mod.Consumer {
         const c = try consumer_mod.Consumer.create(self.host(), opts, handler, context);
-        errdefer c.destroy();
-        self.consumers_mutex.lockUncancelable(self.io);
-        defer self.consumers_mutex.unlock(self.io);
-        try self.consumers.append(self.gpa, c);
-        if (self.started and !self.suppress_consumers) try c.start();
+        const start_now = self.addConsumer(c) catch |err| {
+            c.destroy();
+            return err;
+        };
+        // In the list from here on: the client frees it, a failed start
+        // included.
+        if (start_now) try c.start();
         return c;
     }
 
