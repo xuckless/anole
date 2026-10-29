@@ -116,7 +116,29 @@ fn waitGaps(c: *Collector, io: std.Io, n: u32) !void {
 // ---------------------------------------------------------------------------
 // PostgreSQL
 
-test "watch live: postgres: two channels share the hub connection; the listener's backend killed: a gap, LISTEN again, a later NOTIFY arrives" {
+/// Sends `sql` (a NOTIFY) until `col` holds `needle`: the hub reports
+/// connected before the server has answered its LISTEN, so one NOTIFY
+/// right after `waitConnected` can arrive before anyone listens.
+fn notifyUntilHeard(io: std.Io, client: *pg.Client, c: *db.Ctx, col: *Collector, sql: []const u8, needle: []const u8) !void {
+    const Notify = struct {
+        col: *Collector,
+        client: *pg.Client,
+        c: *db.Ctx,
+        sql: []const u8,
+        needle: []const u8,
+        fn heard(n: @This()) !bool {
+            if (n.col.count(n.needle) != 0) return true;
+            _ = try n.client.exec(n.c, n.sql, .{});
+            return false;
+        }
+    };
+    wait.waitUntil(io, "a NOTIFY heard once the LISTEN is in place", Notify{ .col = col, .client = client, .c = c, .sql = sql, .needle = needle }, Notify.heard) catch |err| {
+        std.debug.print("waiting for \"{s}\" failed\n", .{needle});
+        return err;
+    };
+}
+
+test "watch live: postgres: two watches on one hub hear only their own channels" {
     if (comptime !features.postgres) return error.SkipZigTest;
     const url = features.postgres_test_url orelse return error.SkipZigTest;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
@@ -147,33 +169,40 @@ test "watch live: postgres: two channels share the hub connection; the listener'
     try waitConnected(wa, io);
     try waitConnected(wb, io);
 
-    // The right watch hears the right channel.
-    _ = try client.exec(&c, "NOTIFY anole_wa, 'one'", .{});
-    try ca.waitFor(io, "|anole_wa|one|");
-    _ = try client.exec(&c, "NOTIFY anole_wb, 'two'", .{});
-    try cb.waitFor(io, "|anole_wb|two|");
+    try notifyUntilHeard(io, client, &c, &ca, "NOTIFY anole_wa, 'one'", "|anole_wa|one|");
+    try notifyUntilHeard(io, client, &c, &cb, "NOTIFY anole_wb, 'two'", "|anole_wb|two|");
     try std.testing.expectEqual(@as(usize, 0), ca.count("two"));
     try std.testing.expectEqual(@as(usize, 0), cb.count("one"));
+}
 
-    // The backend that holds the LISTENs is terminated: events may have
-    // been lost (a gap), the connection is made again, and a later NOTIFY
-    // is delivered.
+test "watch live: postgres: a killed LISTEN backend gives a gap and the watch hears later NOTIFYs" {
+    if (comptime !features.postgres) return error.SkipZigTest;
+    const url = features.postgres_test_url orelse return error.SkipZigTest;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const client = try pg.Client.init(gpa, io, .{ .url = url, .environ = .empty });
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+
+    const w = try Watch.init(gpa, io, .{ .postgres = .{ .client = client, .channels = &.{"anole_wk"} } }, .{});
+    defer w.deinit();
+    var col: Collector = undefined;
+    col.init();
+    defer col.deinit();
+    w.addSink(&col.sink);
+    try w.start(null, null, null);
+    defer w.stop();
+    try waitConnected(w, io);
+    // The LISTEN is in place (and its backend's last query is the LISTEN).
+    try notifyUntilHeard(io, client, &c, &col, "NOTIFY anole_wk, 'before'", "|anole_wk|before|");
+
     _ = try client.all(bool, &c, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE query ILIKE 'LISTEN %' AND pid <> pg_backend_pid()", .{});
-    try waitGaps(&ca, io, 1);
-    try waitGaps(&cb, io, 1);
+    try waitGaps(&col, io, 1);
     // The LISTEN may not be back yet: notify until it is heard.
-    const Notify = struct {
-        col: *Collector,
-        client: *pg.Client,
-        c: *db.Ctx,
-        fn heard(n: @This()) !bool {
-            if (n.col.count("|anole_wa|three|") != 0) return true;
-            _ = try n.client.exec(n.c, "NOTIFY anole_wa, 'three'", .{});
-            return false;
-        }
-    };
-    try wait.waitUntil(io, "a NOTIFY heard once the LISTEN is back", Notify{ .col = &ca, .client = client, .c = &c }, Notify.heard);
-    try waitConnected(wa, io);
+    try notifyUntilHeard(io, client, &c, &col, "NOTIFY anole_wk, 'after'", "|anole_wk|after|");
 }
 
 // ---------------------------------------------------------------------------
@@ -249,7 +278,7 @@ test "watch live: redis: a stream without a group resumes after the last ID when
     try std.testing.expectEqual(@as(usize, 1), col.count("e2"));
 }
 
-test "watch live: redis: a group redelivers its pending entries before new ones, and a manual ack settles one" {
+test "watch live: redis: a group redelivers its pending entries before new ones" {
     if (comptime !features.redis) return error.SkipZigTest;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
@@ -296,7 +325,6 @@ test "watch live: redis: a group redelivers its pending entries before new ones,
         try w.start(null, null, null);
         defer w.stop();
         try col.waitFor(io, "n3");
-        var buf: [256]u8 = undefined;
         try std.testing.expect(col.total() >= 3);
         try std.testing.expect(col.count("p1") == 1 and col.count("p2") == 1 and col.count("n3") == 1);
         // Order: the pending ones come first.
@@ -306,25 +334,58 @@ test "watch live: redis: a group redelivers its pending entries before new ones,
         col.lock.unlock();
         try std.testing.expect(std.mem.indexOf(u8, first, "p1") != null);
         try std.testing.expect(std.mem.indexOf(u8, third, "n3") != null);
-        // Manual ack: XACK of p1's position settles it.
-        const line = col.find("p1", &buf).?;
-        var parts = std.mem.splitScalar(u8, line, '|');
-        _ = parts.next();
-        _ = parts.next();
-        _ = parts.next();
-        _ = parts.next();
-        const position = parts.next().?;
-        try w.ackEntry("anole_stream_g", position);
-        // Wait for the XACK to be sent: the pending count falls to 2.
-        const Pending = struct {
-            r: *redis.Client,
-            c: *db.Ctx,
-            fn two(p: @This()) !bool {
-                return pendingCount(try p.r.command(p.c, .{ "XPENDING", "anole_stream_g", "g1" })) == 2;
-            }
-        };
-        try wait.waitUntil(io, "the XACK settled p1 (two pending)", Pending{ .r = r, .c = &c }, Pending.two);
     }
+}
+
+test "watch live: redis: a manual ack settles one entry" {
+    if (comptime !features.redis) return error.SkipZigTest;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const r = try redis_live.open(io, .{});
+    defer r.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    _ = try r.command(&c, .{ "DEL", "anole_stream_m" });
+    defer _ = r.command(&c, .{ "DEL", "anole_stream_m" }) catch {};
+
+    const w = try Watch.init(gpa, io, .{ .redis_stream = .{
+        .client = r,
+        .keys = &.{"anole_stream_m"},
+        .block = .fromMilliseconds(200),
+        .group = .{ .name = "g1", .consumer = "c1", .ack = .manual },
+    } }, .{});
+    defer w.deinit();
+    var col: Collector = undefined;
+    col.init();
+    defer col.deinit();
+    w.addSink(&col.sink);
+    try w.start(null, null, null);
+    defer w.stop();
+    try waitConnected(w, io);
+    _ = try r.command(&c, .{ "XADD", "anole_stream_m", "*", "n", "p1" });
+    _ = try r.command(&c, .{ "XADD", "anole_stream_m", "*", "n", "p2" });
+    try col.waitFor(io, "p2");
+    // Both read, neither acked: XACK of p1's position settles it alone.
+    var buf: [256]u8 = undefined;
+    const line = col.find("p1", &buf).?;
+    var parts = std.mem.splitScalar(u8, line, '|');
+    _ = parts.next();
+    _ = parts.next();
+    _ = parts.next();
+    _ = parts.next();
+    const position = parts.next().?;
+    try w.ackEntry("anole_stream_m", position);
+    // Wait for the XACK to be sent: the pending count falls to 1.
+    const Pending = struct {
+        r: *redis.Client,
+        c: *db.Ctx,
+        fn one(p: @This()) !bool {
+            return pendingCount(try p.r.command(p.c, .{ "XPENDING", "anole_stream_m", "g1" })) == 1;
+        }
+    };
+    try wait.waitUntil(io, "the XACK settled p1 (one pending)", Pending{ .r = r, .c = &c }, Pending.one);
 }
 
 fn pendingCount(reply: redis.Reply) i64 {
@@ -351,7 +412,8 @@ test "watch live: redis: entries deleted after the position are a gap (Redis 7)"
     defer _ = r.command(&c, .{ "DEL", "anole_stream_x" }) catch {};
     _ = try r.command(&c, .{ "XADD", "anole_stream_x", "1-1", "n", "a" });
     _ = try r.command(&c, .{ "XADD", "anole_stream_x", "2-1", "n", "b" });
-    _ = r.command(&c, .{ "XDEL", "anole_stream_x", "2-1" }) catch {};
+    // CI's servers (redis:7, valkey:8) all keep max-deleted-entry-id: no version skip.
+    _ = try r.command(&c, .{ "XDEL", "anole_stream_x", "2-1" });
 
     const w = try Watch.init(gpa, io, .{ .redis_stream = .{
         .client = r,
@@ -373,57 +435,95 @@ test "watch live: redis: entries deleted after the position are a gap (Redis 7)"
 // ---------------------------------------------------------------------------
 // MongoDB
 
-test "watch live: mongodb: insert, update and delete arrive with fullDocument; a dropped collection ends the stream and the watch follows the re-created one" {
+const mongodb = @import("../mongodb/root.zig");
+
+/// A live MongoDB client, a fresh collection (seeded, so it exists for the
+/// stream to follow across a drop) and a started watch on it.
+const MongoFx = struct {
+    rt: *zio.Runtime,
+    client: *mongodb.Client,
+    arena_state: std.heap.ArenaAllocator,
+    c: db.Ctx,
+    name_buf: [32]u8,
+    name: []const u8,
+    w: *Watch,
+    col: Collector,
+
+    fn setup(fx: *MongoFx, url: []const u8) !void {
+        fx.rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+        errdefer fx.rt.deinit();
+        const io = fx.rt.io();
+        fx.client = try mongodb.Client.init(gpa, io, .{ .url = url, .database = "anole_test", .server_selection_timeout = .fromSeconds(10) });
+        errdefer fx.client.deinit();
+        fx.arena_state = .init(gpa);
+        errdefer fx.arena_state.deinit();
+        fx.c = .{ .io = io, .arena = fx.arena_state.allocator() };
+        var random: [4]u8 = undefined;
+        io.random(&random);
+        fx.name = try std.fmt.bufPrint(&fx.name_buf, "w_{x}", .{std.mem.readInt(u32, &random, .little)});
+        const coll = fx.client.collection(fx.name);
+        _ = try coll.insertOne(&fx.c, .{ .name = "seed", .n = 0 });
+        errdefer coll.drop(&fx.c) catch {};
+        fx.w = try Watch.init(gpa, io, .{ .mongodb = .{
+            .client = fx.client,
+            .collection = fx.name,
+            .full_document = .update_lookup,
+            .max_await = .fromMilliseconds(200),
+        } }, .{});
+        errdefer fx.w.deinit();
+        fx.col.init();
+        errdefer fx.col.deinit();
+        fx.w.addSink(&fx.col.sink);
+        try fx.w.start(null, null, null);
+        errdefer fx.w.stop();
+        try waitConnected(fx.w, io);
+    }
+
+    fn deinit(fx: *MongoFx) void {
+        fx.w.stop();
+        fx.client.collection(fx.name).drop(&fx.c) catch {};
+        fx.w.deinit();
+        fx.col.deinit();
+        fx.arena_state.deinit();
+        fx.client.deinit();
+        fx.rt.deinit();
+    }
+};
+
+test "watch live: mongodb: insert, update and delete arrive with fullDocument" {
     if (comptime !features.mongodb) return error.SkipZigTest;
     const url = features.mongodb_test_url orelse return error.SkipZigTest;
-    const mongodb = @import("../mongodb/root.zig");
-    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
-    defer rt.deinit();
-    const io = rt.io();
-    const client = try mongodb.Client.init(gpa, io, .{ .url = url, .database = "anole_test", .server_selection_timeout = .fromSeconds(10) });
-    defer client.deinit();
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
-    var random: [4]u8 = undefined;
-    io.random(&random);
-    var name_buf: [32]u8 = undefined;
-    const name = try std.fmt.bufPrint(&name_buf, "w_{x}", .{std.mem.readInt(u32, &random, .little)});
-    const coll = client.collection(name);
-    // The collection has to exist for the stream to follow it across a drop.
-    _ = try coll.insertOne(&c, .{ .name = "seed", .n = 0 });
-    defer coll.drop(&c) catch {};
+    var fx: MongoFx = undefined;
+    try fx.setup(url);
+    defer fx.deinit();
+    const io = fx.rt.io();
+    const coll = fx.client.collection(fx.name);
 
-    const w = try Watch.init(gpa, io, .{ .mongodb = .{
-        .client = client,
-        .collection = name,
-        .full_document = .update_lookup,
-        .max_await = .fromMilliseconds(200),
-    } }, .{});
-    defer w.deinit();
-    var col: Collector = undefined;
-    col.init();
-    defer col.deinit();
-    w.addSink(&col.sink);
-    try w.start(null, null, null);
-    defer w.stop();
-    try waitConnected(w, io);
-
-    _ = try coll.insertOne(&c, .{ .name = "ada", .n = 1 });
-    try col.waitFor(io, "insert|");
-    _ = try coll.updateOne(&c, .{ .name = "ada" }, .{ .@"$set" = .{ .n = 2 } }, .{});
-    try col.waitFor(io, "update|");
+    _ = try coll.insertOne(&fx.c, .{ .name = "ada", .n = 1 });
+    try fx.col.waitFor(io, "insert|");
+    _ = try coll.updateOne(&fx.c, .{ .name = "ada" }, .{ .@"$set" = .{ .n = 2 } }, .{});
+    try fx.col.waitFor(io, "update|");
     var buf: [1024]u8 = undefined;
     // update_lookup: the whole document with the new value.
-    try std.testing.expect(std.mem.indexOf(u8, col.find("update|", &buf).?, "\"name\"") != null);
-    _ = try coll.deleteOne(&c, .{ .name = "ada" }, .{});
-    try col.waitFor(io, "delete|");
+    try std.testing.expect(std.mem.indexOf(u8, fx.col.find("update|", &buf).?, "\"name\"") != null);
+    _ = try coll.deleteOne(&fx.c, .{ .name = "ada" }, .{});
+    try fx.col.waitFor(io, "delete|");
+}
+
+test "watch live: mongodb: a dropped collection ends the stream and the watch follows the re-created one" {
+    if (comptime !features.mongodb) return error.SkipZigTest;
+    const url = features.mongodb_test_url orelse return error.SkipZigTest;
+    var fx: MongoFx = undefined;
+    try fx.setup(url);
+    defer fx.deinit();
+    const io = fx.rt.io();
+    const coll = fx.client.collection(fx.name);
 
     // The collection goes away: drop, then invalidate; the watch reopens
     // after the invalidate and hears the re-created collection.
-    try coll.drop(&c);
-    try col.waitFor(io, "drop|");
-    try col.waitFor(io, "invalidate|");
+    try coll.drop(&fx.c);
+    try fx.col.waitFor(io, "drop|");
+    try fx.col.waitFor(io, "invalidate|");
     // The stream may not be open again yet: insert until it is heard.
     const Insert = struct {
         col: *Collector,
@@ -435,5 +535,5 @@ test "watch live: mongodb: insert, update and delete arrive with fullDocument; a
             return false;
         }
     };
-    try wait.waitUntil(io, "an insert heard once the stream reopened", Insert{ .col = &col, .coll = &coll, .c = &c }, Insert.heard);
+    try wait.waitUntil(io, "an insert heard once the stream reopened", Insert{ .col = &fx.col, .coll = &coll, .c = &fx.c }, Insert.heard);
 }

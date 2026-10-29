@@ -91,25 +91,15 @@ fn Suite(comptime B: Backend) type {
 
         const Probe = struct {
             var runs: u32 = 0;
-            var order: [16]u8 = undefined;
-            var n: usize = 0;
             var fail_times: u32 = 0;
             var mode: enum { ok, snooze, discard, retry_in } = .ok;
             fn reset() void {
                 runs = 0;
-                n = 0;
                 fail_times = 0;
                 mode = .ok;
             }
             fn run(_: ?*anyopaque, job: *root.Job) anyerror!void {
                 runs += 1;
-                if (n < order.len) {
-                    var at = std.mem.indexOf(u8, job.args_json, ":").? + 1;
-                    // jsonb writes `{"a": 1}`: skip the blank.
-                    while (job.args_json[at] == ' ') at += 1;
-                    order[n] = job.args_json[at];
-                    n += 1;
-                }
                 if (fail_times > 0) {
                     fail_times -= 1;
                     return error.Boom;
@@ -162,14 +152,27 @@ fn Suite(comptime B: Backend) type {
             var fx: Fx = undefined;
             try setup(&fx);
             defer fx.deinit();
-            _ = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":\"L\"}", .{ .priority = .low });
-            _ = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":\"N\"}", .{});
-            _ = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":\"C\"}", .{ .priority = .critical });
-            _ = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":\"H\"}", .{ .priority = .high });
-            _ = try fx.client.step(&fx.ctx);
-            try std.testing.expectEqual(@as(usize, 4), Probe.n);
-            // Args are `{"a":"X"}`: the probe records the byte after the colon, a quote; use the letter after it.
-            try std.testing.expectEqualStrings("\"\"\"\"", Probe.order[0..4]);
+            const be = fx.client.backend;
+            const l = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":1}", .{ .priority = .low });
+            const n1 = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":2}", .{});
+            const c = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":3}", .{ .priority = .critical });
+            const h = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":4}", .{ .priority = .high });
+            // The same priority and run_at as n1: the lower id goes first.
+            const n2 = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":5}", .{});
+            // The same priority, later run_ats; d2 has the higher id but the earlier run_at.
+            const d1 = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":6}", .{ .delay = .fromSeconds(20) });
+            const d2 = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":7}", .{ .delay = .fromSeconds(10) });
+            fx.clock.advance(.fromSeconds(30));
+            const now = Time.fromSeconds(1_800_000_030);
+            _ = try be.vt.stage(be.ptr, now);
+            // One claim at a time: the store's claim order is the contract (a
+            // batch's RETURNING order is not, on PostgreSQL and SQLite).
+            const expected = [_]root.Id{ c.id, h.id, n1.id, n2.id, d2.id, d1.id, l.id };
+            for (expected) |want| {
+                const got = try be.vt.claim(be.ptr, fx.ctx.arena, .{ .queue = "default", .kinds = null, .limit = 1, .now = now, .lease_until = .{ .us = now.us + 30_000_000 }, .worker = "w1" });
+                try std.testing.expectEqual(@as(usize, 1), got.len);
+                try std.testing.expectEqual(want, got[0].id);
+            }
         }
 
         test "jobs: an error retries with backoff and the last attempt makes it dead" {
@@ -197,28 +200,38 @@ fn Suite(comptime B: Backend) type {
             try std.testing.expectEqualStrings("Boom", info.errors[0].@"error");
         }
 
-        test "jobs: snooze keeps the attempt, discard is dead, retryIn uses its delay" {
+        test "jobs: snooze reschedules without counting an attempt" {
             var fx: Fx = undefined;
             try setup(&fx);
             defer fx.deinit();
             Probe.mode = .snooze;
             const a = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":1}", .{});
             _ = try fx.client.step(&fx.ctx);
-            var info = (try fx.client.get(&fx.ctx, a.id)).?;
+            const info = (try fx.client.get(&fx.ctx, a.id)).?;
             try std.testing.expectEqual(root.State.scheduled, info.state);
             try std.testing.expectEqual(@as(u16, 0), info.attempt);
+        }
 
+        test "jobs: discard makes the job dead with its message" {
+            var fx: Fx = undefined;
+            try setup(&fx);
+            defer fx.deinit();
             Probe.mode = .discard;
             const b = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":2}", .{});
             _ = try fx.client.step(&fx.ctx);
-            info = (try fx.client.get(&fx.ctx, b.id)).?;
+            const info = (try fx.client.get(&fx.ctx, b.id)).?;
             try std.testing.expectEqual(root.State.dead, info.state);
             try std.testing.expectEqualStrings("no thanks", info.errors[0].message);
+        }
 
+        test "jobs: retryIn schedules the retry after its delay" {
+            var fx: Fx = undefined;
+            try setup(&fx);
+            defer fx.deinit();
             Probe.mode = .retry_in;
             const c = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":3}", .{});
             _ = try fx.client.step(&fx.ctx);
-            info = (try fx.client.get(&fx.ctx, c.id)).?;
+            const info = (try fx.client.get(&fx.ctx, c.id)).?;
             try std.testing.expectEqual(root.State.retrying, info.state);
             try std.testing.expectEqual(fx.clock.ms.load(.acquire) + 7_000, @divFloor(info.run_at.us, 1000));
         }
@@ -246,6 +259,11 @@ fn Suite(comptime B: Backend) type {
             _ = try fx.client.step(&fx.ctx);
             const again = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":1}", .{ .unique = u });
             try std.testing.expect(!again.inserted);
+            // Past keep.completed (one day by default) the leader's prune removes the job and its key.
+            fx.clock.advance(.fromSeconds(86400 + 60));
+            try std.testing.expectEqual(@as(u32, 1), (try fx.client.step(&fx.ctx)).pruned);
+            const after = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":1}", .{ .unique = u });
+            try std.testing.expect(after.inserted);
         }
 
         test "jobs: unique period: the next window inserts" {
@@ -307,7 +325,7 @@ fn Suite(comptime B: Backend) type {
             try std.testing.expectEqual(root.State.available, (try fx.client.get(&fx.ctx, other.id)).?.state);
         }
 
-        test "jobs: enqueueMany with duplicates" {
+        test "jobs: enqueueMany inserts each unique job once and gives duplicates the first one's id" {
             var fx: Fx = undefined;
             try setup(&fx);
             defer fx.deinit();
@@ -350,7 +368,6 @@ fn Suite(comptime B: Backend) type {
             const e = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":1}", .{});
             _ = try fx.client.step(&fx.ctx);
             fx.clock.advance(.fromSeconds(90000));
-            fx.client.last_prune = 0;
             const rep = try fx.client.step(&fx.ctx);
             try std.testing.expectEqual(@as(u32, 1), rep.pruned);
             try std.testing.expect((try fx.client.get(&fx.ctx, e.id)) == null);
@@ -412,24 +429,25 @@ fn Suite(comptime B: Backend) type {
             try std.testing.expectEqual(@as(u32, 1), rep.cron_enqueued);
         }
 
-        test "cron: missed skip enqueues none; missed all enqueues each tick inside catch_up" {
-            // One fixture at a time: the live stores' fixtures each own a zio
-            // runtime, and a thread can only use the one it made last.
-            {
-                var a: Fx = undefined;
-                try cronFx(&a, .skip);
-                defer a.deinit();
-                _ = try a.client.step(&a.ctx);
-                a.clock.advance(.fromSeconds(7620));
-                try std.testing.expectEqual(@as(u32, 0), (try a.client.step(&a.ctx)).cron_enqueued);
-            }
+        test "cron: missed skip enqueues none of the missed ticks" {
+            var a: Fx = undefined;
+            try cronFx(&a, .skip);
+            defer a.deinit();
+            _ = try a.client.step(&a.ctx);
+            a.clock.advance(.fromSeconds(7620));
+            try std.testing.expectEqual(@as(u32, 0), (try a.client.step(&a.ctx)).cron_enqueued);
+        }
+
+        test "cron: missed all enqueues each missed tick inside catch_up" {
             var b: Fx = undefined;
             try cronFx(&b, .all);
             defer b.deinit();
             _ = try b.client.step(&b.ctx);
+            // The fake clock starts on a 10-minute boundary: an hour later
+            // six ticks of */10 are due, all inside the default one-day catch_up.
             b.clock.advance(.fromSeconds(3600));
             const rep = try b.client.step(&b.ctx);
-            try std.testing.expect(rep.cron_enqueued >= 5 and rep.cron_enqueued <= 7);
+            try std.testing.expectEqual(@as(u32, 6), rep.cron_enqueued);
         }
 
         test "cron: two clients sharing nothing still record one job per tick through the store" {
@@ -538,53 +556,6 @@ fn Suite(comptime B: Backend) type {
             try std.testing.expectEqualStrings(tp, child.meta.object.get("traceparent").?.string);
         }
 
-        test "jobs: the series are rendered" {
-            var fx: Fx = undefined;
-            try setup(&fx);
-            defer fx.deinit();
-            var registry = anole.observe.metrics.Registry.init(std.testing.allocator, std.testing.io);
-            defer registry.deinit();
-            // `setup` started the client; a second client with a registry shows the series.
-            const c2 = try root.Client.init(std.testing.allocator, std.testing.io, .{ .store = .memory, .run = .manual });
-            defer c2.deinit();
-            try c2.addHandler(plain, null, Probe.run);
-            try c2.start(&registry, null, null);
-            _ = try c2.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":1}", .{});
-            _ = try c2.step(&fx.ctx);
-            var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-            defer out.deinit();
-            try registry.render(&out.writer);
-            try std.testing.expect(std.mem.indexOf(u8, out.written(), "anole_jobs_enqueued_total{queue=\"default\",kind=\"t.plain\"} 1") != null);
-            try std.testing.expect(std.mem.indexOf(u8, out.written(), "anole_jobs_finished_total{queue=\"default\",kind=\"t.plain\",outcome=\"completed\"} 1") != null);
-        }
-
-        var bg_event: std.Io.Event = .unset;
-        fn bgRun(_: ?*anyopaque, job: *root.Job) anyerror!void {
-            _ = job;
-            bg_event.set(std.testing.io);
-        }
-
-        test "jobs: the background runner claims and runs an enqueued job, and drains" {
-            const io = std.testing.io;
-            bg_event = .unset;
-            const lvl = std.testing.log_level;
-            std.testing.log_level = .err;
-            defer std.testing.log_level = lvl;
-            const client = try root.Client.init(std.testing.allocator, io, .{ .store = .memory });
-            defer client.deinit();
-            try client.addHandler(plain, null, bgRun);
-            try client.start(null, null, null);
-            var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-            defer arena.deinit();
-            var ctx: Ctx = .{ .io = io, .arena = arena.allocator() };
-            const e = try client.enqueueRaw(&ctx, "t.plain", "{\"a\":1}", .{});
-            try bg_event.wait(io);
-            // The state write follows the handler's return; drain waits for the task.
-            client.drain(std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromSeconds(5), .clock = .awake }));
-            const info = (try client.get(&ctx, e.id)).?;
-            try std.testing.expectEqual(root.State.completed, info.state);
-        }
-
         var wake_hits: std.atomic.Value(u32) = .init(0);
         fn wakeRun(_: ?*anyopaque, _: *root.Job) anyerror!void {
             _ = wake_hits.fetchAdd(1, .acq_rel);
@@ -624,19 +595,86 @@ fn Suite(comptime B: Backend) type {
             try wait.waitAtLeast(io, "the enqueue's wake reached the worker", &worker.wake_kicks, 2);
         }
 
-        test "jobs: adminRoutes registers on a group" {
+        test "jobs: the admin routes list jobs and answer 404 for an unknown id" {
             // The live stores run on a runtime of their own; the server wants the thread for itself.
             if (B == .postgres or B == .redis) return error.SkipZigTest;
             const gpa = std.testing.allocator;
             var state: struct {} = .{};
-            var app = try anole.Server(@TypeOf(state)).init(gpa, .{}, &state);
+            var app = try anole.Server(@TypeOf(state)).init(gpa, .{ .executors = .exact(1) }, &state);
             defer app.deinit();
             var fx: Fx = undefined;
             try setup(&fx);
             defer fx.deinit();
             fx.client.adminRoutes(app.group("/admin", .{}));
+            const e = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":1}", .{});
+            var t = try testing_mod.client(&app);
+            defer t.deinit();
+
+            var listed = try t.get("/admin/jobs", .{});
+            defer listed.deinit();
+            try listed.expectStatus(.ok);
+            const List = struct { jobs: []const struct { id: root.Id } };
+            const body = try listed.json(List);
+            try std.testing.expectEqual(@as(usize, 1), body.jobs.len);
+            try std.testing.expectEqual(e.id, body.jobs[0].id);
+
+            var missing = try t.get("/admin/jobs/999999", .{});
+            defer missing.deinit();
+            try missing.expectStatus(.not_found);
         }
     };
+}
+
+test "jobs: enqueue and finish counters appear in the metrics registry" {
+    const plain: root.Kind = .{ .name = "t.plain", .attempts = 3, .timeout = .max };
+    const Noop = struct {
+        fn run(_: ?*anyopaque, _: *root.Job) anyerror!void {}
+    };
+    var registry = anole.observe.metrics.Registry.init(std.testing.allocator, std.testing.io);
+    defer registry.deinit();
+    const c = try root.Client.init(std.testing.allocator, std.testing.io, .{ .store = .memory, .run = .manual });
+    defer c.deinit();
+    try c.addHandler(plain, null, Noop.run);
+    try c.start(&registry, null, null);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx: anole.db.Ctx = .{ .io = std.testing.io, .arena = arena.allocator() };
+    _ = try c.enqueueRaw(&ctx, "t.plain", "{\"a\":1}", .{});
+    _ = try c.step(&ctx);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "anole_jobs_enqueued_total{queue=\"default\",kind=\"t.plain\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "anole_jobs_finished_total{queue=\"default\",kind=\"t.plain\",outcome=\"completed\"} 1") != null);
+}
+
+const Background = struct {
+    var ran: std.atomic.Value(bool) = .init(false);
+    fn run(_: ?*anyopaque, _: *root.Job) anyerror!void {
+        ran.store(true, .release);
+    }
+};
+
+test "jobs: the background runner claims and runs an enqueued job, and drains" {
+    const io = std.testing.io;
+    const plain: root.Kind = .{ .name = "t.plain", .attempts = 3, .timeout = .max };
+    Background.ran.store(false, .release);
+    const lvl = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = lvl;
+    const client = try root.Client.init(std.testing.allocator, io, .{ .store = .memory });
+    defer client.deinit();
+    try client.addHandler(plain, null, Background.run);
+    try client.start(null, null, null);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var ctx: anole.db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    const e = try client.enqueueRaw(&ctx, "t.plain", "{\"a\":1}", .{});
+    try wait.waitFlag(io, "the background runner ran the job", &Background.ran);
+    // The state write follows the handler's return; drain waits for the task.
+    client.drain(std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromSeconds(5), .clock = .awake }));
+    const info = (try client.get(&ctx, e.id)).?;
+    try std.testing.expectEqual(root.State.completed, info.state);
 }
 
 test {
