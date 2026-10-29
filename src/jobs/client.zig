@@ -128,6 +128,8 @@ pub const Client = struct {
     /// Wake-ups from the store's listener, the one it sends once it listens
     /// included: a test waits for the first before it counts on a wake.
     wake_kicks: std.atomic.Value(u32) = .init(0),
+    /// Tests only: runs on a run's task right after `hold` has published it.
+    test_after_hold: if (builtin.is_test) ?*const fn (*Client, *JobBox) void else void = if (builtin.is_test) null else {},
 
     /// `app.jobs(options)` calls it; outside an app, `init`, `start`, `drain`, `deinit`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
@@ -1095,6 +1097,7 @@ pub const Client = struct {
     fn jobTask(box: *JobBox) std.Io.Cancelable!void {
         const self = box.client;
         self.hold(box);
+        if (builtin.is_test) if (self.test_after_hold) |f| f(self, box);
         if (self.metrics) |mm| mm.running.with(&.{box.queue.name}).add(1);
         _ = self.runJob(box);
         if (self.metrics) |mm| mm.running.with(&.{box.queue.name}).add(-1);
@@ -1602,4 +1605,159 @@ test "jobs: a heartbeat waiting on the store does not hold up a run's start" {
     const io = rt.io();
     var f = try io.concurrent(HeldGetStore.check, .{io});
     try f.await(io);
+}
+
+/// A stub store for the held-runs tests: the heartbeat records the runs it
+/// was sent and renews those in `renew`; `get` answers with a row in `state`.
+const HeldStub = struct {
+    var sent: std.ArrayList(store.Held) = .empty;
+    var renew: []const store.Held = &.{};
+    var state: store.State = .running;
+
+    fn heartbeat(_: *anyopaque, arena: std.mem.Allocator, _: Time, held: []const store.Held) anyerror![]Id {
+        sent.clearRetainingCapacity();
+        try sent.appendSlice(std.testing.allocator, held);
+        var out: std.ArrayList(Id) = .empty;
+        for (renew) |r| try out.append(arena, r.id);
+        return out.items;
+    }
+
+    fn get(_: *anyopaque, _: std.mem.Allocator, id: Id) anyerror!?store.Row {
+        var r = row(id, 1);
+        r.state = state;
+        return r;
+    }
+
+    fn row(id: Id, attempt: u16) store.Row {
+        return .{ .id = id, .queue = "default", .kind = "t", .state = .running, .priority = .normal, .attempt = attempt, .max_attempts = 3, .args_json = "{}", .meta_json = "{}", .run_at = .fromMillis(0), .created_at = .fromMillis(0) };
+    }
+
+    /// A client on the memory store with the stub's heartbeat and get; the
+    /// store's own table is put back by `restore` before `deinit`.
+    fn client(io: std.Io, vt: *store.VTable) !*Client {
+        sent.clearRetainingCapacity();
+        renew = &.{};
+        state = .running;
+        const c = try Client.init(std.testing.allocator, io, .{ .store = .memory });
+        vt.* = c.backend.vt.*;
+        vt.heartbeat = heartbeat;
+        vt.get = get;
+        return c;
+    }
+
+    fn run(comptime check: fn (std.Io) anyerror!void) !void {
+        defer {
+            sent.deinit(std.testing.allocator);
+            sent = .empty;
+        }
+        const zio = @import("zio");
+        const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+        defer rt.deinit();
+        const io = rt.io();
+        var f = try io.concurrent(check, .{io});
+        try f.await(io);
+    }
+};
+
+test "jobs: an admin cancel the heartbeat finds at a run's start reaches the run" {
+    const T = struct {
+        var seen: ?bool = null;
+
+        fn afterHold(c: *Client, _: *JobBox) void {
+            c.heartbeatOnce() catch |e| std.debug.panic("heartbeat: {t}", .{e});
+        }
+
+        fn handler(_: ?*anyopaque, job: *Job) anyerror!void {
+            seen = job.admin_cancelled.load(.acquire);
+            return job.io.checkCancel();
+        }
+
+        fn check(io: std.Io) anyerror!void {
+            var vt: store.VTable = undefined;
+            const client = try HeldStub.client(io, &vt);
+            defer client.deinit();
+            const store_vt = client.backend.vt;
+            client.backend.vt = &vt;
+            defer client.backend.vt = store_vt;
+            // The store holds the run no longer: an admin cancelled it.
+            HeldStub.state = .cancelled;
+            try client.addHandler(.{ .name = "t" }, null, handler);
+            client.test_after_hold = afterHold;
+            seen = null;
+
+            const q = &client.queues[0];
+            const box = try std.testing.allocator.create(JobBox);
+            box.* = .{ .client = client, .queue = q, .arena_state = .init(std.testing.allocator), .row = HeldStub.row(7, 1) };
+            // As `spawnJob` does; the run's end takes it back.
+            _ = q.running.fetchAdd(1, .acq_rel);
+            var run = try io.concurrent(Client.jobTask, .{box});
+            try run.await(io);
+            try std.testing.expectEqual(@as(?bool, true), seen);
+        }
+    };
+    try HeldStub.run(T.check);
+}
+
+test "jobs: a run's end leaves a newer run of the same job held" {
+    const T = struct {
+        fn check(io: std.Io) anyerror!void {
+            const gpa = std.testing.allocator;
+            var vt: store.VTable = undefined;
+            const client = try HeldStub.client(io, &vt);
+            defer client.deinit();
+            const store_vt = client.backend.vt;
+            client.backend.vt = &vt;
+            defer client.backend.vt = store_vt;
+            const q = &client.queues[0];
+
+            var old: JobBox = .{ .client = client, .queue = q, .arena_state = .init(gpa), .row = HeldStub.row(7, 1) };
+            defer old.arena_state.deinit();
+            var new: JobBox = .{ .client = client, .queue = q, .arena_state = .init(gpa), .row = HeldStub.row(7, 2) };
+            defer new.arena_state.deinit();
+            client.hold(&old);
+            client.hold(&new);
+            defer client.unhold(&new);
+            // Renewed: the heartbeat finds nothing lost (whose task, this
+            // one, it would cancel).
+            HeldStub.renew = &[_]store.Held{.{ .id = 7, .attempt = 2 }};
+            // The old run ends after the job was claimed again.
+            client.unhold(&old);
+            try client.heartbeatOnce();
+            try std.testing.expectEqualSlices(store.Held, &[_]store.Held{.{ .id = 7, .attempt = 2 }}, HeldStub.sent.items);
+        }
+    };
+    try HeldStub.run(T.check);
+}
+
+test "jobs: the heartbeat stops a lost run whose job was claimed again" {
+    const T = struct {
+        fn check(io: std.Io) anyerror!void {
+            const gpa = std.testing.allocator;
+            var vt: store.VTable = undefined;
+            const client = try HeldStub.client(io, &vt);
+            defer client.deinit();
+            const store_vt = client.backend.vt;
+            client.backend.vt = &vt;
+            defer client.backend.vt = store_vt;
+            const q = &client.queues[0];
+
+            var old: JobBox = .{ .client = client, .queue = q, .arena_state = .init(gpa), .row = HeldStub.row(7, 1) };
+            defer old.arena_state.deinit();
+            var new: JobBox = .{ .client = client, .queue = q, .arena_state = .init(gpa), .row = HeldStub.row(7, 2) };
+            defer new.arena_state.deinit();
+            client.hold(&old);
+            defer client.unhold(&old);
+            client.hold(&new);
+            defer client.unhold(&new);
+            // Neither run has a task of its own to cancel (`hold` took this one).
+            old.task = null;
+            new.task = null;
+            // The store renews only the newer claim.
+            HeldStub.renew = &[_]store.Held{.{ .id = 7, .attempt = 2 }};
+            try client.heartbeatOnce();
+            try std.testing.expect(old.lost.load(.acquire));
+            try std.testing.expect(!new.lost.load(.acquire));
+        }
+    };
+    try HeldStub.run(T.check);
 }
