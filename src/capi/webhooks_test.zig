@@ -187,7 +187,6 @@ test "capi webhooks: endpoints are created, listed, updated, rotated and deleted
     try std.testing.expect(std.mem.startsWith(u8, fresh, "whsec_"));
     try std.testing.expect(!std.mem.eql(u8, fresh, secret));
 
-
     const del_req = try std.fmt.allocPrint(arena, "{{\"op\":\"webhooks.endpoint.delete\",\"id\":\"{s}\"}}", .{id});
     const deleted = try r.call(arena, del_req);
     try std.testing.expectEqual(@as(u16, 200), deleted.http);
