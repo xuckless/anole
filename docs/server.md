@@ -791,6 +791,21 @@ still closes at it. A client's RESET_STREAM, or STOP_SENDING with an error,
 cancels the handler's task as on HTTP/2: its next wait on `req.io` returns
 `error.Canceled`.
 
+### Response buffering
+
+A handler's write returns once its bytes are queued, and waits only while
+the response has as much queued as its cap allows (a `no_wait` handler on
+the endpoint task never waits). Bytes stay queued until the client
+acknowledges them, so the cap follows the connection's path rather than a
+fixed size: what is in flight, plus up to one congestion window of bytes
+not yet sent (or less, when the client's flow-control credit for the
+stream is smaller), at least 64 KiB and at most 3 MiB. A download moves as
+fast as the path allows, as over TCP, while a client that stops reading
+leaves its response holding 64 KiB. All of a connection's responses
+together hold at most 4 MiB. Message streams (WebSockets, the WebTransport
+session's stream, gRPC and Connect streaming calls) keep a fixed 1 MiB
+each, so a send there returns once buffered up to it.
+
 ### 0-RTT
 
 A client that resumes a session can send its first requests with the

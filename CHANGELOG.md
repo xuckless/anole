@@ -7,6 +7,16 @@ breaking changes are listed anyway.
 
 ### Fixed
 
+- HTTP/3: a response could hold at most 64 KiB unacknowledged, so a
+  download moved 64 KiB per round trip whatever the path allowed (1.2 MB/s
+  at 50 ms RTT, against 14-38 MB/s over HTTP/1.1). A response's buffer now
+  follows the connection's congestion window: what is in flight plus up to
+  one window not yet sent (less when the client's flow-control credit is
+  smaller), at least 64 KiB and at most 3 MiB, within the connection's
+  unchanged 4 MiB. A client that stops reading still leaves 64 KiB queued.
+  The HTTP/3 client's request bodies had the same 64 KiB ceiling and now
+  follow the path the same way when `RequestOptions.send_buffer` is null.
+  Message streams keep their fixed 1 MiB (#151).
 - SSE: an event written through `EventStream.startSend` (the streaming
   `EventWriter`) now encodes its data as `send` does. Data ending in a CR or
   LF kept its last line break off the wire, so browsers delivered `"hi"` for

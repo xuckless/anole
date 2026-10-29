@@ -861,7 +861,10 @@ pub const ClientConnection = struct {
         /// Only what is harmless to repeat belongs in early data.
         early: ?bool = null,
         /// HTTP/3 only. How much request body may wait unacknowledged
-        /// before a write waits (the stream's send buffer). Null: 64 KiB.
+        /// before a write waits (the stream's send buffer). Null: it
+        /// follows the path, as the server's responses do: what is in
+        /// flight plus up to a congestion window (or the server's credit)
+        /// unsent, at least 64 KiB, at most 3 MiB (`bridge.pathCap`).
         /// The connection's budget still bounds all streams together.
         send_buffer: ?usize = null,
     };
@@ -1506,6 +1509,13 @@ pub const ClientConnection = struct {
             return 0;
         }
         const count = s.out.take(vec, veccnt);
+        // Taken bytes leave room under the unsent part of the cap
+        // (`bridge.pathCap`): a writer waiting for it goes on now, not at
+        // the next acknowledgement (which may be a round trip away).
+        if (count > 0 and s.wants_room) {
+            s.wants_room = false;
+            s.conn.kick();
+        }
         if (s.send_closed and s.out.allSent()) pflags.* |= h.NGHTTP3_DATA_FLAG_EOF;
         return @intCast(count);
     }
@@ -1541,8 +1551,8 @@ pub const Stream = struct {
     /// The application error code the server reset the stream with.
     reset_code: ?u64 = null,
     /// How much request body may wait unacknowledged
-    /// (`RequestOptions.send_buffer`).
-    send_cap: usize = 64 * 1024,
+    /// (`RequestOptions.send_buffer`); null follows the path.
+    send_cap: ?usize = null,
 
     /// Response body bytes not yet read.
     body: std.ArrayList(u8) = .empty,
@@ -1559,6 +1569,9 @@ pub const Stream = struct {
     send_stopped: bool = false,
     /// nghttp3 asked for body and got none: resume it on the next write.
     deferred: bool = false,
+    /// A writer found no room under the cap: the next bytes nghttp3 takes
+    /// (`readData`) wake it, as well as acknowledgements.
+    wants_room: bool = false,
 
     /// Both the caller (`release`) and QUIC (stream close) are done.
     user_done: bool = false,
@@ -1868,13 +1881,16 @@ pub const Stream = struct {
                 conn.unlock();
                 return error.WriteFailed;
             }
-            const n = self.out.write(&conn.blocks, &conn.budget, rest, self.send_cap, false) catch {
+            const cap = self.send_cap orelse bridge.pathCapOf(conn.q, self.id, &self.out, conn.budget.max, rest.len);
+            const n = self.out.write(&conn.blocks, &conn.budget, rest, cap, false) catch {
                 conn.unlock();
                 return error.WriteFailed;
             };
             if (n > 0) {
                 rest = rest[n..];
                 self.resumeLocked();
+            } else {
+                self.wants_room = true;
             }
             conn.unlock();
             // Kick only for new bytes; see the server's StreamSink.put.
