@@ -105,6 +105,8 @@ pub const Client = struct {
     /// The runs going on (`held`) and `next_seq`. A leaf: nothing is taken
     /// under it. It also keeps each `JobBox.task` valid while a holder
     /// cancels it: a run leaves `held` (`unhold`) before its task ends.
+    /// Every section (hold, unhold, heartbeatOnce, drain, the tests' interruptedRun)
+    /// takes no other lock, calls no store and never suspends; cancelTask only flags.
     held_mutex: safety.Mutex(.leaf) = .init,
     /// The runs going on, by `JobBox.seq`.
     held: std.AutoArrayHashMapUnmanaged(u64, *JobBox) = .empty,
@@ -208,6 +210,9 @@ pub const Client = struct {
         if (builtin.is_test) if (self.test_on_stop) |f| f(self);
         self.closing.store(true, .release);
         // A drain under way (the server's) is waited for, not cut short.
+        // Pre-existing: if drainWatcher has not started the server's drain
+        // yet, this one wins and uses 10 s, not drain_timeout. On the owner's
+        // thread (no executor), so nothing here yields.
         if (self.started) {
             self.drain(std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = .fromSeconds(10), .clock = .awake }));
         }
@@ -216,6 +221,7 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         self.teardown.begin();
+        // stopWork's assertNotDead accepts .closing, the state begin() set.
         self.stopWork();
         self.backend.vt.deinit(self.backend.ptr);
         for (self.queues) |*q| q.kinds.deinit(self.gpa);
@@ -1125,6 +1131,8 @@ pub const Client = struct {
         };
         _ = q.running.fetchAdd(1, .acq_rel);
         const exec = self.rr.fetchAdd(1, .monotonic);
+        // zio d4b3ba6 registerTask yields for backpressure only after the task is
+        // queued and cannot fail then: this catch runs only when no task exists.
         placement.concurrent(&self.group, self.io, .{ .executor = exec }, jobTask, .{box}) catch {
             _ = q.running.fetchSub(1, .acq_rel);
             box.arena_state.deinit();
@@ -1275,7 +1283,15 @@ pub const Client = struct {
         const t = self.now();
         const was = self.is_leader.load(.acquire);
         const lead = self.backend.vt.leaderTake(self.backend.ptr, self.worker_name, t, self.options.leader.ttl) catch |e| blk: {
-            try passCancel(e);
+            if (e == error.Canceled) {
+                // The store dropped what it held for the leader with the
+                // failed call (PostgreSQL closes the advisory session): not
+                // leading, in the flag and the gauge, before the cancel goes on.
+                self.is_leader.store(false, .release);
+                if (self.metrics) |mm| mm.leader.with(&.{}).set(0);
+                if (was) log.info("jobs: this process no longer leads schedules and maintenance", .{});
+                return error.Canceled;
+            }
             break :blk false;
         };
         self.is_leader.store(lead, .release);

@@ -86,6 +86,8 @@ pub const Series = struct {
         else if (set.count() >= max_labels)
             "other"
         else blk: {
+            // Never grows: capacity max_labels was reserved in init, the count
+            // check above is under the lock, and nothing is ever removed.
             set.putAssumeCapacityNoClobber(owned, {});
             kept = true;
             break :blk owned;

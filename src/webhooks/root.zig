@@ -204,6 +204,7 @@ pub const Client = struct {
     key: ?[32]u8 = null,
     allow_private: bool,
     require_https: bool,
+    /// No operation calls assertAlive: it catches a second deinit only.
     teardown: safety.Teardown = .init,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {

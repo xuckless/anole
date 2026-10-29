@@ -191,12 +191,21 @@ breaking changes are listed anyway.
 - Jobs: a job still running after the server stopped could use a connector
   the app had already freed (`app.webhooks`, or any connector made after
   `app.jobs`), crashing the process at shutdown; a webhook delivery in
-  flight was enough. The app now ends every job run before it frees any
-  connector. Outside an app, `jobs.Client.stopWork` does the same before
-  you free what the handlers use.
+  flight was enough, and so was a send on `app.udpSocket`. The app now
+  ends every job run before it frees anything a handler may use (the
+  connectors, the raw TCP/UDP listeners, the HTTP/3 endpoint). Connectors
+  made after `app.jobs` therefore stay open, and their own tasks running,
+  for the whole jobs drain at shutdown. Outside an app,
+  `jobs.Client.stopWork` ends the runs before you free what the handlers
+  use. `app.jobs` and `app.webhooks` failing to start while the app is
+  serving no longer leave the freed client in the app's list, which the
+  teardown freed again.
 - Jobs: with the PostgreSQL store, a cancel during the leader's
   advisory-lock query was taken for "not the leader", so a canceled
-  maintenance round carried on until its next poll.
+  maintenance round carried on until its next poll. The cancel now ends
+  the round, and the process reports it no longer leads
+  (`anole_jobs_leader` 0), since the failed query closed the session that
+  held the lock.
 - Jobs: the metrics no longer allocate under a spin lock when they see a
   new job kind.
 
