@@ -148,7 +148,6 @@ test "errors: JSON answers for a client that takes JSON, or a server that speaks
     try std.testing.expect(std.mem.startsWith(u8, c, "HTTP/1.1 409 "));
     try std.testing.expectEqualStrings("{\"error\":\"name \\\"x\\\" taken\"}", bodyOf(c));
 
-
     var json_server: Running(void) = undefined;
     try startErrorServer(&json_server, .{ .listeners = loopback, .errors = .json });
     defer json_server.stop();
