@@ -1667,8 +1667,9 @@ const HeldStub = struct {
         return .{ .id = id, .queue = "default", .kind = "t", .state = .running, .priority = .normal, .attempt = attempt, .max_attempts = 3, .args_json = "{}", .meta_json = "{}", .run_at = .fromMillis(0), .created_at = .fromMillis(0) };
     }
 
-    /// A client on the memory store with the stub's heartbeat and get; the
-    /// store's own table is put back by `restore` before `deinit`.
+    /// A client on the memory store with the stub's heartbeat and get, filled
+    /// into `vt`; the caller swaps `vt` in and restores the store's own
+    /// vtable with an inline defer before `deinit`.
     fn client(io: std.Io, vt: *store.VTable) !*Client {
         sent.clearRetainingCapacity();
         renew = &.{};
@@ -1752,8 +1753,11 @@ test "jobs: a run's end leaves a newer run of the same job held" {
             try client.hold(&old);
             try client.hold(&new);
             defer client.unhold(&new);
-            // Renewed: the heartbeat finds nothing lost (whose task, this
-            // one, it would cancel).
+            // The newer run has no task of its own to cancel (`hold` took
+            // this one): a regression fails on the assertion below instead
+            // of canceling the test's task.
+            new.task = null;
+            // Renewed: the heartbeat finds nothing lost.
             HeldStub.renew = &[_]store.Held{.{ .id = 7, .attempt = 2 }};
             // The old run ends after the job was claimed again.
             client.unhold(&old);
