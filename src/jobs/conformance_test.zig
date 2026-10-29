@@ -595,7 +595,7 @@ fn Suite(comptime B: Backend) type {
             try wait.waitAtLeast(io, "the enqueue's wake reached the worker", &worker.wake_kicks, 2);
         }
 
-        test "jobs: the admin routes list and act on jobs" {
+        test "jobs: the admin routes list jobs and answer 404 for an unknown id" {
             // The live stores run on a runtime of their own; the server wants the thread for itself.
             if (B == .postgres or B == .redis) return error.SkipZigTest;
             const gpa = std.testing.allocator;
