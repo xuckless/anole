@@ -225,6 +225,97 @@ test "Client redirects: check_redirect follows, stops or fails each one" {
     try std.testing.expectError(error.RedirectRefused, client.fetch(try url(&buf, a.port(), "/same?x=1"), .{}));
 }
 
+/// "/dir/start": 302 to the relative "landed"; "/dir/sub/dots": 302 to
+/// "../up/./landed?x=1"; anything else is 200.
+fn relative(_: *Peer, head: []const u8, out: *std.Io.Writer) !void {
+    const target = head[std.mem.indexOfScalar(u8, head, ' ').? + 1 ..];
+    if (std.mem.startsWith(u8, target, "/dir/start ")) {
+        try out.writeAll("HTTP/1.1 302 Found\r\nLocation: landed\r\nContent-Length: 0\r\n\r\n");
+    } else if (std.mem.startsWith(u8, target, "/dir/sub/dots ")) {
+        try out.writeAll("HTTP/1.1 302 Found\r\nLocation: ../up/./landed?x=1\r\nContent-Length: 0\r\n\r\n");
+    } else {
+        try out.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nlanded");
+    }
+}
+
+test "Client redirects: a relative Location resolves against the request's path, dot segments removed" {
+    const io = std.testing.io;
+    const a = try Peer.start(io, relative);
+    defer a.stop(io);
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+    var buf: [128]u8 = undefined;
+    {
+        var resp = try client.fetch(try url(&buf, a.port(), "/dir/start"), .{});
+        defer resp.deinit();
+        try std.testing.expectEqual(dusty.Status.ok, resp.status());
+        try std.testing.expect(std.mem.startsWith(u8, a.lastHead(), "GET /dir/landed HTTP/1.1\r\n"));
+    }
+    {
+        var resp = try client.fetch(try url(&buf, a.port(), "/dir/sub/dots"), .{});
+        defer resp.deinit();
+        try std.testing.expectEqual(dusty.Status.ok, resp.status());
+        try std.testing.expect(std.mem.startsWith(u8, a.lastHead(), "GET /dir/up/landed?x=1 HTTP/1.1\r\n"));
+    }
+}
+
+test "Client redirects: the Referer leaves out the URL's userinfo and fragment" {
+    const io = std.testing.io;
+    const a = try Peer.start(io, redirector);
+    defer a.stop(io);
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+    var buf: [128]u8 = undefined;
+    const start = try std.fmt.bufPrint(&buf, "http://user:pass@127.0.0.1:{d}/same?token=1#frag", .{a.port()});
+    var resp = try client.fetch(start, .{});
+    defer resp.deinit();
+    try std.testing.expectEqual(dusty.Status.ok, resp.status());
+    var want: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(try url(&want, a.port(), "/same?token=1"), header(a.lastHead(), "Referer").?);
+}
+
+/// "/start": 302 to "/back" on the other peer by the name "localhost" (a
+/// different host from 127.0.0.1); "/back": 302 to "/landed" on the other
+/// peer at 127.0.0.1; anything else is 200.
+fn hostHop(peer: *Peer, head: []const u8, out: *std.Io.Writer) !void {
+    const target = head[std.mem.indexOfScalar(u8, head, ' ').? + 1 ..];
+    if (std.mem.startsWith(u8, target, "/start ")) {
+        try out.print("HTTP/1.1 302 Found\r\nLocation: http://localhost:{d}/back\r\nContent-Length: 0\r\n\r\n", .{peer.other_port});
+    } else if (std.mem.startsWith(u8, target, "/back ")) {
+        try out.print("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{d}/landed\r\nContent-Length: 0\r\n\r\n", .{peer.other_port});
+    } else {
+        try out.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nlanded");
+    }
+}
+
+test "Client redirects: credentials stripped on a hop to another host stay stripped back on the first host" {
+    const io = std.testing.io;
+    const a = try Peer.start(io, hostHop);
+    defer a.stop(io);
+    const b = try Peer.start(io, hostHop);
+    defer b.stop(io);
+    a.other_port = b.port();
+    b.other_port = a.port();
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+    var headers = try dusty.Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    try headers.put("Authorization", "Bearer secret");
+    try headers.put("Cookie", "session=abc");
+    try headers.put("X-Custom", "keep-me");
+    var buf: [128]u8 = undefined;
+    var resp = try client.fetch(try url(&buf, a.port(), "/start"), .{ .headers = &headers });
+    defer resp.deinit();
+    try std.testing.expectEqual(dusty.Status.ok, resp.status());
+    try std.testing.expectEqual(@as(usize, 1), b.requests);
+    try std.testing.expectEqual(@as(usize, 2), a.requests);
+    // The last request is back on 127.0.0.1, the first hop's host.
+    try std.testing.expect(std.mem.startsWith(u8, a.lastHead(), "GET /landed HTTP/1.1\r\n"));
+    try std.testing.expect(header(a.lastHead(), "Authorization") == null);
+    try std.testing.expect(header(a.lastHead(), "Cookie") == null);
+    try std.testing.expectEqualStrings("keep-me", header(a.lastHead(), "X-Custom").?);
+}
+
 /// "/N" redirects to "/N-1" until "/0", which is 200.
 fn countdown(_: *Peer, head: []const u8, out: *std.Io.Writer) !void {
     const target = head[std.mem.indexOfScalar(u8, head, ' ').? + 2 ..];
@@ -265,7 +356,7 @@ test "Client: deny_private_addresses refuses a loopback server" {
     try std.testing.expectEqual(@as(usize, 0), a.requests);
 }
 
-test "isPrivateAddress" {
+test "isPrivateAddress: loopback, private, link-local, CGNAT, multicast, unspecified and mapped/NAT64/6to4 forms are private; public addresses are not" {
     const private = [_][]const u8{
         "127.0.0.1",  "10.1.2.3", "172.16.0.1",         "172.31.255.255",         "192.168.1.1", "169.254.169.254",
         "100.64.0.1", "0.0.0.0",  "224.0.0.1",          "255.255.255.255",        "198.18.0.1",  "192.0.0.8",
