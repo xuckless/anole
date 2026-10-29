@@ -61,6 +61,7 @@
 //! tuple for `?` (or `?NNN`) in order, of the same types; a `Time` is
 //! stored as text in SQLite's own format (`2026-10-21 09:30:00.25`, UTC).
 const std = @import("std");
+const safety = @import("anole_safety");
 const sqlite = @import("anole_sqlite");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
@@ -1060,10 +1061,10 @@ const Writer = struct {
     thread: std.Thread,
     /// Held by a writing call, a transaction or an `acquire`, in arrival
     /// order; the holder alone hands the thread jobs.
-    lock: std.Io.Mutex = .init,
+    lock: safety.Mutex(.leaf) = .init,
     /// Guards the fields below.
-    mutex: std.Io.Mutex = .init,
-    ready: std.Io.Condition = .init,
+    mutex: safety.Mutex(.leaf) = .init,
+    ready: safety.Condition = .init,
     /// The job handed over and not yet started.
     next: ?*Job = null,
     /// The job running: a cancel may interrupt it.
@@ -1096,8 +1097,8 @@ const Readers = struct {
     /// The connections not taken, `free[0..free_len]`.
     free: []*Connection = &.{},
     free_len: usize = 0,
-    mutex: std.Io.Mutex = .init,
-    changed: std.Io.Condition = .init,
+    mutex: safety.Mutex(.leaf) = .init,
+    changed: safety.Condition = .init,
 };
 
 // ---------------------------------------------------------------------------

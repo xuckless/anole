@@ -4,6 +4,7 @@
 //! and the observer; this is the shared state and the parts that only
 //! touch it.
 const std = @import("std");
+const safety = @import("anole_safety");
 const db = @import("../db/root.zig");
 const session_mod = @import("session.zig");
 
@@ -11,9 +12,9 @@ const Session = session_mod.Session;
 
 /// The pool of one executor.
 pub const Pool = struct {
-    mutex: std.Io.Mutex = .init,
+    mutex: safety.Mutex(.leaf) = .init,
     /// Signalled when a session goes back, or a place frees up.
-    returned: std.Io.Condition = .init,
+    returned: safety.Condition = .init,
     /// `max` slots; the first `idle_len` hold idle sessions.
     idle: []*Session,
     idle_len: usize = 0,

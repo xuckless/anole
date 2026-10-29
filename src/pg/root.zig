@@ -65,6 +65,7 @@
 //!   HTTP/2 reset, `QueryOptions.timeout`) sends a CancelRequest so the
 //!   server stops the statement, and the connection is closed.
 const std = @import("std");
+const safety = @import("anole_safety");
 const builtin = @import("builtin");
 const features = @import("build_options");
 const dusty = @import("dusty");
@@ -521,7 +522,9 @@ pub const Client = struct {
     /// The one LISTEN connection of this client's `anole.watch`es, made on
     /// first use (`_notifyHub`).
     notify_hub: ?*NotifyHub = null,
-    notify_hub_mutex: std.Io.Mutex = .init,
+    /// Init-once guard of `notify_hub`: held only to read it or make it
+    /// (an allocation).
+    notify_hub_mutex: safety.Mutex(.leaf) = .init,
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.postgres` calls it.

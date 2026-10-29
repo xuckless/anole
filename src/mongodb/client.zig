@@ -12,6 +12,7 @@
 //! timeout bounds it and becomes `maxTimeMS`).
 const std = @import("std");
 const builtin = @import("builtin");
+const safety = @import("anole_safety");
 const bson = @import("bson");
 const dusty = @import("dusty");
 const shared = @import("../db/root.zig");
@@ -109,8 +110,8 @@ pub const default_url = "mongodb://localhost:27017";
 /// A connection pool for one server on one executor (CMAP, without the
 /// background thread: connections open when a call needs one).
 const Pool = struct {
-    mutex: std.Io.Mutex = .init,
-    cond: std.Io.Condition = .init,
+    mutex: safety.Mutex(.leaf) = .init,
+    cond: safety.Condition = .init,
     /// Most recently used last.
     idle: std.ArrayList(*Connection) = .empty,
     /// Open, checked out, or being opened.
@@ -188,7 +189,7 @@ pub const Session = struct {
 };
 
 const SessionPool = struct {
-    mutex: std.Io.Mutex = .init,
+    mutex: safety.Mutex(.leaf) = .init,
     list: std.ArrayList(*Session) = .empty,
 };
 
@@ -225,9 +226,9 @@ pub const Client = struct {
     readiness: shared.Readiness = undefined,
 
     /// Guards the topology and the server list.
-    mutex: std.Io.Mutex = .init,
+    mutex: safety.Mutex(.leaf) = .init,
     /// Broadcast when the topology changes (selection waits on it).
-    changed: std.Io.Condition = .init,
+    changed: safety.Condition = .init,
     topology: sdam.Topology,
     servers: std.ArrayList(*Server) = .empty,
     /// Monitors.

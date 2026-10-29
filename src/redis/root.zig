@@ -81,6 +81,7 @@
 const std = @import("std");
 const features = @import("build_options");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const hiredis = @import("anole_hiredis_c");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
@@ -321,9 +322,9 @@ pub var test_after_take: if (builtin.is_test) ?*const fn (*ClientStream) void el
 
 /// The pool of one executor: idle connections, and how many are open.
 const Pool = struct {
-    mutex: std.Io.Mutex = .init,
+    mutex: safety.Mutex(.leaf) = .init,
     /// Signalled when a connection goes back, or a place frees up.
-    returned: std.Io.Condition = .init,
+    returned: safety.Condition = .init,
     /// `max` slots; the first `idle_len` hold idle connections.
     idle: []*Connection,
     idle_len: usize = 0,
@@ -448,7 +449,9 @@ pub const Client = struct {
     /// The one SUBSCRIBE connection of this client's `anole.watch`es, made
     /// on first use (`_pubsubHub`).
     pubsub_hub: ?*PubSubHub = null,
-    pubsub_hub_mutex: std.Io.Mutex = .init,
+    /// Init-once guard of `pubsub_hub`: held only to read it or make it
+    /// (an allocation).
+    pubsub_hub_mutex: safety.Mutex(.leaf) = .init,
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.redis` calls it.
