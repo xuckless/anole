@@ -967,10 +967,13 @@ pub fn build(b: *std.Build) void {
         b.step("console-ui-test", "Run the live console's std-only module tests (protocol, keys, screen, app, restart plan)").dependOn(&run_ui_tests.step);
     }
 
-    // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
-    // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
+    // test-postgres: the PostgreSQL tests alone ("pg: ...", the jobs
+    // conformance suite's PostgreSQL instance, watch's and webhooks' live
+    // tests); with -Dpostgres-test-url, against that server
+    // (tests/postgres/run.sh). tools/live_coverage.py (CI) fails when a test
+    // that reads a service's URL matches no CI step's filters.
     if (features.postgres) {
-        const pg_tests = addSafeTest(b, .{ .name = "anole-test-pg", .root_module = tests.root_module, .filters = &.{"pg:"}, .use_llvm = use_llvm });
+        const pg_tests = addSafeTest(b, .{ .name = "anole-test-pg", .root_module = tests.root_module, .filters = &.{ "pg:", "jobs.conformance_test.Suite(.postgres)", "watch live: postgres", "on PostgreSQL (live)" }, .use_llvm = use_llvm });
         const run_pg_tests = b.addRunArtifact(pg_tests);
         run_pg_tests.has_side_effects = postgres_test_url != null;
         b.step("test-postgres", "Run the PostgreSQL tests (live with -Dpostgres-test-url=postgres://...)").dependOn(&run_pg_tests.step);
@@ -985,7 +988,7 @@ pub fn build(b: *std.Build) void {
     // test-mongodb: the MongoDB client's tests alone (src/mongodb); with
     // -Dmongodb-test-url, against that server (tests/mongodb/run.sh).
     if (features.mongodb) {
-        const mongo_tests = addSafeTest(b, .{ .name = "anole-test-mongodb", .root_module = tests.root_module, .filters = &.{"mongodb."}, .use_llvm = use_llvm });
+        const mongo_tests = addSafeTest(b, .{ .name = "anole-test-mongodb", .root_module = tests.root_module, .filters = &.{ "mongodb.", "watch live: mongodb" }, .use_llvm = use_llvm });
         const run_mongo_tests = b.addRunArtifact(mongo_tests);
         run_mongo_tests.has_side_effects = mongodb_test_url != null;
         b.step("test-mongodb", "Run the MongoDB client's tests (live with -Dmongodb-test-url=mongodb://...)").dependOn(&run_mongo_tests.step);
@@ -995,7 +998,7 @@ pub fn build(b: *std.Build) void {
     // and the rate limiter's among them; with -Dredis-test-url (or
     // -Dredis-test-port), against that server (tests/redis/run.sh).
     if (features.redis) {
-        const redis_tests = addSafeTest(b, .{ .name = "anole-test-redis", .root_module = tests.root_module, .filters = &.{"redis:"}, .use_llvm = use_llvm });
+        const redis_tests = addSafeTest(b, .{ .name = "anole-test-redis", .root_module = tests.root_module, .filters = &.{ "redis:", "jobs.conformance_test.Suite(.redis)" }, .use_llvm = use_llvm });
         const run_redis_tests = b.addRunArtifact(redis_tests);
         run_redis_tests.has_side_effects = redis_test_url != null or redis_test_port != null;
         b.step("test-redis", "Run the Redis tests (live with -Dredis-test-url=redis://...)").dependOn(&run_redis_tests.step);

@@ -74,6 +74,13 @@ jobs:
         with:
           version: 0.17.0
       - uses: ./.github/actions/install-gdb
+      # Every test that reads a service's URL option (-Dpostgres-test-url
+      # and the like) must match the filters of a CI step that passes it,
+      # or it skips everywhere (TESTING.md W2). Python only, no build.
+      - name: Live tests reach a CI step
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        run: python3 -I tools/live_coverage.py
       # Zig fetches git and tarball dependencies itself on a cold cache;
       # the runners' network fails now and then (NameServerFailure,
       # HttpConnectionClosing), so the fetch is retried before building.
