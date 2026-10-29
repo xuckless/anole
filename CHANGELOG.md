@@ -195,6 +195,10 @@ breaking changes are listed anyway.
 - C ABI config: a watch on a SQLite database is refused with "is SQLite,
   which has no change feed"; it said the database was not PostgreSQL (or
   Redis, MongoDB), which hid the reason.
+- Lambda: a buffered answer whose body the handler streamed (`res.stream`)
+  was encoded from a part list that pointed into a returned function's
+  stack, so the answer could carry garbage or crash; it now lives in the
+  sink. Seen as a crash in ReleaseSafe test builds.
 
 ### Changed
 
