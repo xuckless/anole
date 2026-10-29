@@ -266,8 +266,12 @@ test "Deflate: messages round-trip, with and without context takeover" {
             try std.testing.expectEqualStrings(m, try rx.decompress(wire, 1 << 20));
         }
     }
-    // A large, very compressible message inflates to far more than the first
-    // buffer: the output still pending inside zlib must not be lost.
+}
+
+test "Deflate: a message that inflates far past the first buffer loses no pending output" {
+    // A large, very compressible message: the output still pending inside
+    // zlib must not be lost.
+    const gpa = std.testing.allocator;
     {
         var tx: Deflate = .init(.{}, .{}, gpa);
         defer tx.deinit();
@@ -281,7 +285,12 @@ test "Deflate: messages round-trip, with and without context takeover" {
         try std.testing.expect(wire.len < 1024);
         try std.testing.expectEqualSlices(u8, big, try rx.decompress(wire, 1 << 20));
     }
-    // An echo: the message just inflated is compressed straight back out.
+}
+
+test "Deflate: an echo, inflated and compressed straight back, is intact" {
+    // The message just inflated is compressed straight back out (the
+    // compressor and the decompressor share no buffer).
+    const gpa = std.testing.allocator;
     {
         var server: Deflate = .init(.{}, .{}, gpa);
         defer server.deinit();
@@ -295,7 +304,11 @@ test "Deflate: messages round-trip, with and without context takeover" {
         defer gpa.free(back);
         try std.testing.expectEqualStrings(text, try client.decompress(back, 1 << 20));
     }
-    // RFC 7692 §7.2.3.1: "Hello" compressed by hand.
+}
+
+test "Deflate: RFC 7692 §7.2.3.1 'Hello' inflates; past the limit is MessageTooLarge" {
+    // "Hello" compressed by hand.
+    const gpa = std.testing.allocator;
     var rx: Deflate = .init(.{}, .{}, gpa);
     defer rx.deinit();
     try std.testing.expectEqualStrings("Hello", try rx.decompress(&.{ 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 }, 100));

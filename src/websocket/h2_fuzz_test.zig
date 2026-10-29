@@ -183,10 +183,8 @@ test "H2Socket: RSV1 only on a compressed message's first frame, never on a cont
     }
 }
 
-test "H2Socket: a ping or pong a handler sends over 125 bytes is refused" {
-    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+/// An H2Socket over a fixed output buffer, for the send-side checks.
+fn sendSocket(arena: std.mem.Allocator) !*H2Socket {
     const sock = try arena.create(H2Socket);
     const out = try arena.alloc(u8, 1024);
     sock.* = .{
@@ -200,6 +198,13 @@ test "H2Socket: a ping or pong a handler sends over 125 bytes is refused" {
         .frames = .init(.{}),
         .max_message_size = max_message_size,
     };
+    return sock;
+}
+
+test "H2Socket: a ping or pong a handler sends over 125 bytes is refused" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const sock = try sendSocket(arena_state.allocator());
     defer sock.batch.deinit(std.testing.io);
     defer sock.message.deinit(std.heap.c_allocator);
     const big: [126]u8 = @splat('p');
@@ -207,7 +212,15 @@ test "H2Socket: a ping or pong a handler sends over 125 bytes is refused" {
     try std.testing.expectError(error.LargeControlFrame, sock.sendMessage(.pong, &big, false));
     try std.testing.expectError(error.LargeControlFrame, sock.ping(&big));
     try std.testing.expectError(error.LargeControlFrame, sock.sendMessage(.ping, "x", true));
-    // A close goes out once, however often it is asked for.
+}
+
+test "H2Socket: a close goes out once, and a send after it is refused" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const sock = try sendSocket(arena_state.allocator());
+    defer sock.batch.deinit(std.testing.io);
+    defer sock.message.deinit(std.heap.c_allocator);
+    // However often it is asked for.
     try sock.close(.normal, "");
     try sock.close(.going_away, "");
     try std.testing.expectEqualStrings("\x88\x02\x03\xe8", sock.out.interface.buffered());

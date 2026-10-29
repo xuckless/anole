@@ -218,6 +218,9 @@ pub const Shelf = struct {
     long_park: std.Io.Duration,
     /// The tasks serving adopted connections on this executor (`Watch`).
     watches: std.DoublyLinkedList = .{},
+    /// Test builds only: connections ended by `sweep` because their
+    /// deadline passed while they were parked (not by the stop).
+    test_deadline_expired: if (@import("builtin").is_test) std.atomic.Value(u32) else void = if (@import("builtin").is_test) .init(0) else {},
 
     /// Registers the calling task, on the shelf's executor, for idle
     /// detection while it serves a connection: `unwatch` before it is done
@@ -318,6 +321,7 @@ pub const Shelf = struct {
         while (self.timed.first) |n| {
             const p: *Parked = @alignCast(@fieldParentPtr("node", n));
             if (p.deadline.?.nanoseconds > now.nanoseconds) break;
+            if (@import("builtin").is_test) _ = self.test_deadline_expired.fetchAdd(1, .monotonic);
             self.expire(p);
         }
     }

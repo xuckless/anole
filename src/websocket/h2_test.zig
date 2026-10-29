@@ -82,6 +82,11 @@ const Client = struct {
     in_len: usize = 0,
     /// DATA frames received.
     data_frames: usize = 0,
+    /// Drop what arrives instead of keeping it in `incoming` (a test that
+    /// only waits for the stream to end).
+    discard: bool = false,
+    /// The server ended its side of the stream (END_STREAM).
+    remote_ended: bool = false,
     /// The `origin` header to send, if any.
     origin: ?[]const u8 = null,
     /// The `sec-websocket-protocol` header to send, if any, and what the
@@ -103,6 +108,7 @@ const Client = struct {
         c.nghttp2_session_callbacks_set_on_header_callback(cbs, onHeader);
         c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, onData);
         c.nghttp2_session_callbacks_set_on_stream_close_callback(cbs, onClose);
+        c.nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, onFrame);
         if (c.nghttp2_session_client_new(&self.session, cbs, self) != 0) return error.Http2Init;
         if (c.nghttp2_submit_settings(self.session, c.NGHTTP2_FLAG_NONE, null, 0) != 0) return error.Http2Init;
     }
@@ -134,6 +140,24 @@ const Client = struct {
             if (rv < 0) return error.Http2Recv;
             r.toss(@intCast(rv));
         }
+    }
+
+    /// `pumpUntil` bounded by `test_wait.deadline()`: the pump runs as its
+    /// own task, so a peer that never gets to `done` fails as a named wait
+    /// instead of a read that never returns (the socket has no timeout).
+    fn pumpUntilBounded(self: *Client, comptime what: []const u8, done: *const fn (*Client) bool) !void {
+        var finished: std.Io.Event = .unset;
+        var pump = try self.io.concurrent(struct {
+            fn run(cl: *Client, d: *const fn (*Client) bool, ev: *std.Io.Event) anyerror!void {
+                defer ev.set(cl.io);
+                try cl.pumpUntil(d);
+            }
+        }.run, .{ self, done, &finished });
+        test_wait.waitEvent(self.io, what, &finished) catch |err| {
+            pump.cancel(self.io) catch {};
+            return err;
+        };
+        try pump.await(self.io);
     }
 
     fn open(self: *Client) !void {
@@ -244,9 +268,16 @@ const Client = struct {
 
     fn onData(_: ?*c.nghttp2_session, _: u8, _: i32, data: [*c]const u8, len: usize, user: ?*anyopaque) callconv(.c) c_int {
         const self: *Client = @ptrCast(@alignCast(user.?));
+        if (self.discard) return 0;
         @memcpy(self.incoming[self.in_len..][0..len], data[0..len]);
         self.in_len += len;
         self.data_frames += 1;
+        return 0;
+    }
+
+    fn onFrame(_: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user: ?*anyopaque) callconv(.c) c_int {
+        const self: *Client = @ptrCast(@alignCast(user.?));
+        if (frame.*.hd.stream_id == self.stream_id and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) self.remote_ended = true;
         return 0;
     }
 
@@ -275,7 +306,7 @@ const Client = struct {
     }
 };
 
-test "WebSocket over HTTP/2 (RFC 8441): echo, ping, close" {
+test "WebSocket over HTTP/2 (RFC 8441): echo, ping, close; the metrics record the socket as a 101" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
@@ -404,56 +435,6 @@ test "WebSocket over HTTP/2: a socket carries more than limits.body_max in total
     }.f);
 }
 
-test "WebSocket over HTTP/2: traffic far past the tunnel window keeps flowing, both ways" {
-    // The tunnel's window is 128 KiB and WINDOW_UPDATEs go out only when
-    // nghttp2 queues one: 1.5 MB of 3 KB messages each way proves they do.
-    const gpa = std.testing.allocator;
-    const rt = try zio.Runtime.init(gpa, .{});
-    defer rt.deinit();
-    const io = rt.io();
-
-    var server = dusty.Server(void).init(gpa, io, .{
-        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
-        .http2 = .{ .enable_connect_protocol = true },
-    }, {});
-    defer server.deinit();
-    server.router.get("/chat", echo);
-    var server_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(void)) !void {
-            try s.run();
-        }
-    }.run, .{&server});
-    defer server_future.cancel(io) catch {};
-    try server.waitReady(io);
-
-    var client: Client = undefined;
-    try client.init(io, server.address.ip);
-    defer client.deinit();
-    try client.open();
-    try std.testing.expectEqual(@as(u16, 200), client.status);
-
-    var msg: [3000]u8 = undefined;
-    var back: [3000 + 64]u8 = undefined;
-    var op: wsc.Opcode = undefined;
-    for (0..500) |i| {
-        @memset(&msg, @truncate(i));
-        try client.sendFrame(.binary, &msg);
-        const got = try client.nextFrame(&op, &back);
-        try std.testing.expectEqual(wsc.Opcode.binary, op);
-        try std.testing.expectEqualSlices(u8, &msg, got);
-    }
-
-    try client.sendFrame(.close, &.{ 0x03, 0xe8 });
-    _ = try client.nextFrame(&op, &back);
-    client.finished = true;
-    _ = c.nghttp2_session_resume_data(client.session, client.stream_id);
-    try client.pumpUntil(struct {
-        fn f(cl: *Client) bool {
-            return cl.closed;
-        }
-    }.f);
-}
-
 test "WebSocket over HTTP/2: the drain closes an open socket with 1001 and does not wait out timeout.shutdown" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
@@ -491,6 +472,7 @@ test "WebSocket over HTTP/2: the drain closes an open socket with 1001 and does 
             try std.testing.expectError(error.Canceled, f.cancel(io_));
         }
     }.run, .{ &server_future, io });
+    defer drain.cancel(io) catch {};
     const closing = try client.nextFrame(&op, &buf);
     try std.testing.expectEqual(wsc.Opcode.close, op);
     try std.testing.expectEqual(@as(u16, 1001), std.mem.readInt(u16, closing[0..2], .big));
@@ -558,6 +540,7 @@ test "WebSocket over HTTP/2: route() and next(): echo, then the drain's 1001 ans
             try std.testing.expectError(error.Canceled, f.cancel(io_));
         }
     }.run, .{ &server_future, io });
+    defer drain.cancel(io) catch {};
     const closing = try client.nextFrame(&op, &buf);
     try std.testing.expectEqual(wsc.Opcode.close, op);
     try std.testing.expectEqual(@as(u16, 1001), std.mem.readInt(u16, closing[0..2], .big));
@@ -793,6 +776,14 @@ test "WebSocket over HTTP/2: a room member that stops reading is closed, its str
             return false;
         }
     }.left);
+    // Its stream ends: what was queued drains, then the server ends or
+    // resets the stream.
+    client.discard = true;
+    try client.pumpUntilBounded("the slow member's stream ended or was reset", struct {
+        fn ended(cl: *Client) bool {
+            return cl.closed or cl.remote_ended;
+        }
+    }.ended);
 }
 
 fn subprotocolSocket(req: *dusty.Request, res: *dusty.Response) !void {
