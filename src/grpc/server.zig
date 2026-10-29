@@ -1022,10 +1022,8 @@ fn percentEncode(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 /// they are decoded into the call's arena (the client's too).
 pub const scratch = if (@import("builtin").is_test)
     std.testing.allocator
-else if (@import("builtin").single_threaded)
-    std.heap.page_allocator
 else
-    std.heap.smp_allocator;
+    @import("anole_safety").process_gpa;
 
 /// What a request message counts against `max_received_bytes` beyond its
 /// size: decoding allocates even for an empty one.
