@@ -4,8 +4,9 @@
 //! demand, on a leader error, and after `metadata_max_age`.
 //!
 //! A `Conn` is used by one component at a time (a producer sender, a
-//! consumer's coordinator, one fetcher), so a long fetch never holds up a
-//! produce or a heartbeat; the mutex only keeps accidental sharing safe.
+//! consumer's coordinator, one fetcher, the metadata refresh round holding
+//! the turn), so a long fetch never holds up a produce or a heartbeat; its
+//! I/O lock only keeps accidental sharing safe.
 const std = @import("std");
 const dusty = @import("dusty");
 const safety = @import("anole_safety");
@@ -45,6 +46,8 @@ pub fn parseHostPort(text: []const u8) HostPort {
 
 const max_response = 256 * 1024 * 1024;
 
+/// owner: the component that opened it (a sender task, the refresh round
+/// holding the turn, a consumer task); `close` is the owner's.
 pub const Conn = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -230,18 +233,26 @@ const TopicInfo = struct {
 
 const BrokerInfo = struct { host: []u8, port: u16 };
 
+/// owner: Client. M2 process-wide: `deinit` runs after the producer and the
+/// consumers are torn down (every task that calls it is joined first).
+/// Shared by every executor under `mutex` (L1: real cross-thread state).
 pub const Cluster = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     settings: Settings,
     /// "host:port" strings, owned.
     bootstrap: [][]u8,
-    /// Over `brokers` and `topics`. A leaf (L4).
+    teardown: safety.Teardown = .init,
+    /// Over `brokers`, `topics` and `refresh_busy`. A leaf (L4): nothing
+    /// waits, calls out or takes another lock while it is held.
     mutex: safety.Mutex(.leaf) = .init,
     brokers: std.AutoHashMapUnmanaged(i32, BrokerInfo) = .empty,
     topics: std.StringHashMapUnmanaged(TopicInfo) = .empty,
-    /// Serialises metadata refreshes and owns `meta_conn`.
-    refresh_mutex: safety.IoLock = .init,
+    /// One metadata refresh at a time (the keyring shape: a flag and a
+    /// condition under `mutex`, never a lock held across the round trip).
+    /// The round that holds the turn owns `meta_conn`.
+    refresh_busy: bool = false,
+    refresh_done: safety.Condition = .init,
     meta_conn: ?*Conn = null,
     closing: std.atomic.Value(bool) = .init(false),
 
@@ -264,7 +275,9 @@ pub const Cluster = struct {
     }
 
     pub fn deinit(self: *Cluster) void {
+        self.teardown.begin();
         self.closing.store(true, .release);
+        // No round holds the turn: every caller is joined.
         if (self.meta_conn) |c| c.close();
         var bi = self.brokers.iterator();
         while (bi.next()) |e| self.gpa.free(e.value_ptr.host);
@@ -277,6 +290,7 @@ pub const Cluster = struct {
         self.topics.deinit(self.gpa);
         for (self.bootstrap) |s| self.gpa.free(s);
         self.gpa.free(self.bootstrap);
+        self.teardown.end();
         self.gpa.destroy(self);
     }
 
@@ -341,10 +355,12 @@ pub const Cluster = struct {
     }
 
     /// Fetches the metadata of `topics` (just the brokers when empty) and
-    /// updates the cache.
+    /// updates the cache. One round at a time: a caller waits for the turn
+    /// (cancelable), then runs its own round holding no lock.
     pub fn refresh(self: *Cluster, topics: []const []const u8, allow_auto_create: bool) ConnError!void {
-        try self.refresh_mutex.lock(self.io);
-        defer self.refresh_mutex.unlock(self.io);
+        try self.takeRefreshTurn();
+        // C2: the turn goes back on every exit, a cancel included.
+        defer self.giveRefreshTurn();
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -363,6 +379,20 @@ pub const Cluster = struct {
         };
         const md = protocol.decodeMetadata(arena, body) catch return error.ProtocolError;
         try self.apply(md);
+    }
+
+    fn takeRefreshTurn(self: *Cluster) std.Io.Cancelable!void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        while (self.refresh_busy) try self.refresh_done.wait(self.io, &self.mutex);
+        self.refresh_busy = true;
+    }
+
+    fn giveRefreshTurn(self: *Cluster) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.refresh_busy = false;
+        self.refresh_done.broadcast(self.io);
     }
 
     fn apply(self: *Cluster, md: protocol.Metadata) ConnError!void {
