@@ -60,6 +60,21 @@ const log = std.log.scoped(.anole_h2);
 pub var test_before_flush: if (@import("builtin").is_test) ?*const fn (std.Io) std.Io.Cancelable!void else void =
     if (@import("builtin").is_test) null else {};
 
+/// Tests only: runs in the reader just before it waits for more input,
+/// so a test can hold the reader there with the peer's next frames unread
+/// (h2_test.zig). Nothing outside tests.
+pub var test_before_fill: if (@import("builtin").is_test) ?*const fn (std.Io, FillProbe) std.Io.Cancelable!void else void =
+    if (@import("builtin").is_test) null else {};
+
+/// What `test_before_fill` is told about the connection.
+pub const FillProbe = struct {
+    /// The drain's final GOAWAY (or the one a draining server sends a new
+    /// stream) is submitted.
+    goaway_sent: bool,
+    /// The connection's socket.
+    socket: std.Io.net.Socket.Handle,
+};
+
 /// The client connection preface (RFC 9113 §3.4).
 pub const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -982,6 +997,12 @@ pub fn Engine(comptime Ctx: type) type {
                     } else timer.clear(conn.io);
                 } else timer.clear(conn.io);
 
+                if (comptime @import("builtin").is_test) if (test_before_fill) |hook| {
+                    conn.lock();
+                    const probe: FillProbe = .{ .goaway_sent = conn.goaway_sent, .socket = conn.connection.stream.socket.handle };
+                    conn.unlock();
+                    try hook(conn.io, probe);
+                };
                 reader.fillMore() catch |err| switch (err) {
                     error.EndOfStream => return .eof,
                     error.ReadFailed => return conn.connection.getReadError() orelse error.Unexpected,
