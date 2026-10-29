@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs anole.nats's live tests (`zig build test -Dnats-test-url=...`) against
+# Runs anole.nats's live tests (`zig build test-nats -Dnats-test-url=...`) against
 # a throwaway nats-server in Docker with JetStream on.
 #
 #   tests/nats/run.sh                         # nats:2.11 on port 54222
@@ -20,4 +20,4 @@ trap '[ -n "${ANOLE_KEEP_CONTAINERS:-}" ] || docker rm -f "$NAME" >/dev/null 2>&
 
 docker run -d --name "$NAME" -p "127.0.0.1:$PORT:4222" "$IMAGE" -js >/dev/null
 wait_until 60 "nats-server to listen" port_open 127.0.0.1 "$PORT" || { docker logs "$NAME" 2>&1 | tail -30 >&2; exit 1; }
-"$ZIG" build test -Dnats-test-url="nats://127.0.0.1:$PORT" "$@"
+"$ZIG" build test-nats -Dnats-test-url="nats://127.0.0.1:$PORT" "$@"

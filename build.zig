@@ -795,6 +795,17 @@ pub fn build(b: *std.Build) void {
         run_stress.has_side_effects = true;
         stress_step.dependOn(&run_stress.step);
     }
+    // fuzz: only the "fuzz:" targets, for CI's fuzz job
+    // (`zig build fuzz -Dllvm=true --fuzz=200K`): the main suite filtered to
+    // them, the HTTP core's and BSON's (added where those are defined). The
+    // unit tests are not repeated here (research/s15/test-audit.md T1).
+    const fuzz_step = b.step("fuzz", "Run only the fuzz targets (\"fuzz:\" tests; pass --fuzz=N with -Dllvm=true to fuzz them)");
+    {
+        const main_fuzz = addSafeTest(b, .{ .name = "anole-fuzz", .root_module = tests.root_module, .filters = &.{"fuzz:"}, .use_llvm = use_llvm });
+        const run_main_fuzz = b.addRunArtifact(main_fuzz);
+        run_main_fuzz.skip_foreign_checks = true;
+        fuzz_step.dependOn(&run_main_fuzz.step);
+    }
     // The hang probe (src/safety/hang_probe.zig): a test that never returns,
     // to see the runner's hang dump work. `-Dhang-probe=true` adds it to
     // `test`; `zig build hang-probe` runs it alone. Both fail by design.
@@ -964,7 +975,7 @@ pub fn build(b: *std.Build) void {
     // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
     // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
     if (features.postgres) {
-        const pg_tests = addSafeTest(b, .{ .name = "anole-test-pg", .root_module = tests.root_module, .filters = &.{"pg:"}, .use_llvm = use_llvm });
+        const pg_tests = addSafeTest(b, .{ .name = "anole-test-pg", .root_module = tests.root_module, .filters = &.{ "pg:", "jobs.conformance_test.Suite(.postgres)", "watch live: postgres", "on PostgreSQL (live)" }, .use_llvm = use_llvm });
         const run_pg_tests = b.addRunArtifact(pg_tests);
         run_pg_tests.has_side_effects = postgres_test_url != null;
         b.step("test-postgres", "Run the PostgreSQL tests (live with -Dpostgres-test-url=postgres://...)").dependOn(&run_pg_tests.step);
@@ -979,7 +990,7 @@ pub fn build(b: *std.Build) void {
     // test-mongodb: the MongoDB client's tests alone (src/mongodb); with
     // -Dmongodb-test-url, against that server (tests/mongodb/run.sh).
     if (features.mongodb) {
-        const mongo_tests = addSafeTest(b, .{ .name = "anole-test-mongodb", .root_module = tests.root_module, .filters = &.{"mongodb."}, .use_llvm = use_llvm });
+        const mongo_tests = addSafeTest(b, .{ .name = "anole-test-mongodb", .root_module = tests.root_module, .filters = &.{ "mongodb.", "watch live: mongodb" }, .use_llvm = use_llvm });
         const run_mongo_tests = b.addRunArtifact(mongo_tests);
         run_mongo_tests.has_side_effects = mongodb_test_url != null;
         b.step("test-mongodb", "Run the MongoDB client's tests (live with -Dmongodb-test-url=mongodb://...)").dependOn(&run_mongo_tests.step);
@@ -989,10 +1000,27 @@ pub fn build(b: *std.Build) void {
     // and the rate limiter's among them; with -Dredis-test-url (or
     // -Dredis-test-port), against that server (tests/redis/run.sh).
     if (features.redis) {
-        const redis_tests = addSafeTest(b, .{ .name = "anole-test-redis", .root_module = tests.root_module, .filters = &.{"redis:"}, .use_llvm = use_llvm });
+        const redis_tests = addSafeTest(b, .{ .name = "anole-test-redis", .root_module = tests.root_module, .filters = &.{ "redis:", "jobs.conformance_test.Suite(.redis)" }, .use_llvm = use_llvm });
         const run_redis_tests = b.addRunArtifact(redis_tests);
         run_redis_tests.has_side_effects = redis_test_url != null or redis_test_port != null;
         b.step("test-redis", "Run the Redis tests (live with -Dredis-test-url=redis://...)").dependOn(&run_redis_tests.step);
+    }
+
+    // test-nats and test-kafka: the live tests alone (nats/live_test.zig,
+    // kafka/live_test.zig); with -Dnats-test-url / -Dkafka-test-url, against
+    // that server (tests/nats/run.sh, tests/kafka/run.sh). CI's two jobs run
+    // only these: the unit suite is the test job's.
+    if (features.nats) {
+        const nats_tests = addSafeTest(b, .{ .name = "anole-test-nats", .root_module = tests.root_module, .filters = &.{"nats.live_test"}, .use_llvm = use_llvm });
+        const run_nats_tests = b.addRunArtifact(nats_tests);
+        run_nats_tests.has_side_effects = nats_test_url != null;
+        b.step("test-nats", "Run the NATS live tests (live with -Dnats-test-url=nats://...)").dependOn(&run_nats_tests.step);
+    }
+    if (features.kafka) {
+        const kafka_tests = addSafeTest(b, .{ .name = "anole-test-kafka", .root_module = tests.root_module, .filters = &.{"kafka.live_test"}, .use_llvm = use_llvm });
+        const run_kafka_tests = b.addRunArtifact(kafka_tests);
+        run_kafka_tests.has_side_effects = kafka_test_url != null;
+        b.step("test-kafka", "Run the Kafka live tests (live with -Dkafka-test-url=host:port)").dependOn(&run_kafka_tests.step);
     }
 
     // ---- p3/s3 ----
@@ -1101,6 +1129,7 @@ pub fn build(b: *std.Build) void {
             .use_llvm = use_llvm,
         });
         test_step.dependOn(&b.addRunArtifact(core_fuzz).step);
+        fuzz_step.dependOn(&b.addRunArtifact(core_fuzz).step);
         b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng, zstd and Brotli").dependOn(&run_core_tests.step);
     }
 
@@ -1161,6 +1190,11 @@ pub fn build(b: *std.Build) void {
         const run_bson_tests = b.addRunArtifact(bson_tests);
         run_bson_tests.skip_foreign_checks = true;
         test_step.dependOn(&run_bson_tests.step);
+        // Its "fuzz:" targets alone, for `zig build fuzz`.
+        const bson_fuzz = addSafeTest(b, .{ .name = "bson-fuzz", .root_module = bson_tests.root_module, .filters = &.{"fuzz:"}, .use_llvm = use_llvm });
+        const run_bson_fuzz = b.addRunArtifact(bson_fuzz);
+        run_bson_fuzz.skip_foreign_checks = true;
+        fuzz_step.dependOn(&run_bson_fuzz.step);
         const bson_step = b.step("bson-test", "Run the BSON codec's tests and the bson-corpus (src/bson, tests/bson)");
         bson_step.dependOn(&run_bson_tests.step);
         const mongodb_spec_step = b.step("mongodb-spec-test", "Run the MongoDB client's spec tests (connection string, URI options, auth, SDAM) from mongodb/specifications");

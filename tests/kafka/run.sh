@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs anole.kafka's live tests (`zig build test -Dkafka-test-url=...`) against
+# Runs anole.kafka's live tests (`zig build test-kafka -Dkafka-test-url=...`) against
 # a throwaway single-node broker in Docker: Apache Kafka (KRaft) or Redpanda.
 #
 #   tests/kafka/run.sh                              # apache/kafka:4.1.0 on port 59092
@@ -66,4 +66,4 @@ if ! wait_until 120 "the broker to start" docker_log_has "$NAME" "$READY" ||
   docker logs "$NAME" 2>&1 | tail -30 >&2
   exit 1
 fi
-"$ZIG" build test -Dkafka-test-url="127.0.0.1:$PORT" "$@"
+"$ZIG" build test-kafka -Dkafka-test-url="127.0.0.1:$PORT" "$@"
