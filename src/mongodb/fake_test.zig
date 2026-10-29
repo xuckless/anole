@@ -35,6 +35,13 @@ const Fake = struct {
     /// waits for it before answering.
     finds: std.atomic.Value(u32) = .init(0),
     find_gate: std.atomic.Value(?*std.Io.Event) = .init(null),
+    /// S-3: the other member. A primary with `alternate` lists itself
+    /// alone and itself with `peer` on alternate hellos; a `secondary`
+    /// lists `peer` (the primary) and itself.
+    peer: ?*Fake = null,
+    alternate: bool = false,
+    secondary: bool = false,
+    hellos: std.atomic.Value(u32) = .init(0),
 
     fn init(f: *Fake, io: std.Io) !void {
         const listen_at: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -56,6 +63,9 @@ const Fake = struct {
         while (true) {
             const conn = f.listener.accept(io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
+                // A client that gave up before the accept (a monitor
+                // canceled mid-connect): the next one is still served.
+                error.ConnectionAborted => continue,
                 else => return,
             };
             f.group.concurrent(io, serve, .{ f, io, conn }) catch conn.close(io);
@@ -88,15 +98,21 @@ const Fake = struct {
         var it = msg.body.iterator();
         const command = it.next().?.name;
         if (std.mem.eql(u8, command, "isMaster") or std.mem.eql(u8, command, "hello")) {
+            const n = f.hellos.fetchAdd(1, .acq_rel);
             try b.append("helloOk", .{ .boolean = true });
-            try b.append("isWritablePrimary", .{ .boolean = true });
+            try b.append("isWritablePrimary", .{ .boolean = !f.secondary });
+            if (f.secondary) try b.append("secondary", .{ .boolean = true });
             try b.append("setName", .{ .string = "rs0" });
             try b.beginArray("hosts");
+            if (f.secondary) try b.append("", .{ .string = f.peer.?.addr() });
             try b.append("", .{ .string = f.addr() });
+            if (f.alternate and n % 2 == 1) try b.append("", .{ .string = f.peer.?.addr() });
             try b.end();
             try b.append("me", .{ .string = f.addr() });
-            try b.append("setVersion", .{ .int32 = 1 });
-            try b.append("electionId", .{ .object_id = try .parse("7fffffff0000000000000001") });
+            if (!f.secondary) {
+                try b.append("setVersion", .{ .int32 = 1 });
+                try b.append("electionId", .{ .object_id = try .parse("7fffffff0000000000000001") });
+            }
             try b.append("minWireVersion", .{ .int32 = 0 });
             try b.append("maxWireVersion", .{ .int32 = 21 });
             try b.append("logicalSessionTimeoutMinutes", .{ .int32 = 30 });
@@ -621,4 +637,74 @@ test "mongodb: closing the client while a monitor ends frees the monitor's conne
     try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, MonitorEnd.close, .{client});
     try group.await(io);
     try testing.expect(MonitorEnd.closed.load(.acquire));
+}
+
+/// S-3: one task's finds on a client of the two fakes.
+const Finder = struct {
+    fn run(client: *mongodb.Client, io: std.Io, finds: u32, failures: *std.atomic.Value(u32)) void {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+        const users = client.collection("users");
+        for (0..finds) |_| {
+            _ = arena.reset(.retain_capacity);
+            _ = users.findOne(Row, &c, .{}, .{}) catch {
+                _ = failures.fetchAdd(1, .monotonic);
+            };
+        }
+    }
+};
+
+const HelloWait = struct {
+    fake: *Fake,
+    from: u32,
+
+    fn twiceMore(w: HelloWait) bool {
+        return w.fake.hellos.load(.acquire) >= w.from + 2;
+    }
+};
+
+test "mongodb: [stress] servers joining and leaving while calls run and the client closes" {
+    try wait.requireStress();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var a: Fake = undefined;
+    try a.init(io);
+    defer a.deinit(io);
+    var b: Fake = undefined;
+    try b.init(io);
+    defer b.deinit(io);
+    // A's hellos list A alone, then A and B, and so on: B's monitor
+    // starts when it joins and stops when it leaves.
+    a.peer = &b;
+    a.alternate = true;
+    b.peer = &a;
+    b.secondary = true;
+
+    const seed: u64 = 0x53_0d1e;
+    errdefer std.debug.print("mongodb stress: seed 0x{x}\n", .{seed});
+    var prng: std.Random.DefaultPrng = .init(seed);
+    const random = prng.random();
+    var failures: std.atomic.Value(u32) = .init(0);
+    for (0..100) |_| {
+        // Server selection waits up to the hang guard: the claim is that a
+        // find always finds the primary, not how soon on a loaded machine.
+        var url_buf: [96]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "mongodb://{s}/app?replicaSet=rs0&heartbeatFrequencyMS=500", .{a.addr()});
+        const client = try mongodb.Client.init(gpa, io, .{ .url = url, .server_selection_timeout = wait.deadline() });
+        defer client.deinit();
+        const from = a.hellos.load(.acquire);
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        for (0..4) |t| try dusty.placement.concurrent(&group, io, .{ .executor = t % 2 }, Finder.run, .{ client, io, random.intRangeAtMost(u32, 1, 40), &failures });
+        // Half the rounds last until A answered two more hellos, so its
+        // monitor's next check (a heartbeat later) moves B in or out
+        // while the calls run; the rest close at once.
+        if (random.boolean()) try wait.waitUntil(io, "two more hellos from A", HelloWait{ .fake = &a, .from = from }, HelloWait.twiceMore);
+        try group.await(io);
+    }
+    // A stays the primary throughout: every find succeeds. The rest of the
+    // claim is no fault and no leak (the test allocator).
+    try testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
 }

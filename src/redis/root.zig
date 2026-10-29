@@ -2306,6 +2306,10 @@ fn nested(comptime depth: usize) []const u8 {
 const Fake = struct {
     listener: std.Io.net.Server,
     accepted: std.atomic.Value(u32) = .init(0),
+    /// Sessions open now (+1 at accept, -1 when one ends), and the most
+    /// open at once.
+    live: std.atomic.Value(u32) = .init(0),
+    most_live: std.atomic.Value(u32) = .init(0),
     /// GETs and INCRs answered; while `shared_gate` is set to an event, a
     /// GET of "shared" waits for it first.
     gets: std.atomic.Value(u32) = .init(0),
@@ -2326,13 +2330,23 @@ const Fake = struct {
         var group: std.Io.Group = .init;
         defer group.cancel(io);
         while (true) {
-            const conn = try self.listener.accept(io);
+            const conn = self.listener.accept(io) catch |err| switch (err) {
+                // A client that gave up before the accept: the next one is
+                // still served.
+                error.ConnectionAborted => continue,
+                else => return err,
+            };
             _ = self.accepted.fetchAdd(1, .monotonic);
-            group.concurrent(io, session, .{ self, conn, io }) catch conn.close(io);
+            _ = self.most_live.fetchMax(self.live.fetchAdd(1, .acq_rel) + 1, .acq_rel);
+            group.concurrent(io, session, .{ self, conn, io }) catch {
+                conn.close(io);
+                _ = self.live.fetchSub(1, .acq_rel);
+            };
         }
     }
 
     fn session(self: *Fake, conn: std.Io.net.Stream, io: std.Io) void {
+        defer _ = self.live.fetchSub(1, .acq_rel);
         defer conn.close(io);
         var rbuf: [4096]u8 = undefined;
         var wbuf: [4096]u8 = undefined;
@@ -2762,6 +2776,129 @@ test "redis: a readiness probe canceled mid-ping leaves no answer behind" {
     gate.set(io);
     try testing.expect(db.Readiness.check(&client.readiness));
     try testing.expectEqual(@as(u32, 2), fake.pings.load(.monotonic));
+}
+
+/// One task's rounds of calls and checkouts on a shared client.
+const PoolStress = struct {
+    client: *Client,
+    io: std.Io,
+    /// Calls that failed or answered wrong: nothing breaks a connection
+    /// here, so any failure, a reply of the wrong type or a broken
+    /// connection, comes from two holders on one connection.
+    failures: std.atomic.Value(u32) = .init(0),
+
+    fn task(p: *PoolStress, seed: u64, rounds: usize) void {
+        var prng: std.Random.DefaultPrng = .init(seed);
+        const random = prng.random();
+        var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena_state.deinit();
+        var c: db.Ctx = .{ .io = p.io, .arena = arena_state.allocator() };
+        for (0..rounds) |_| {
+            _ = arena_state.reset(.retain_capacity);
+            switch (random.uintLessThan(u8, 3)) {
+                0 => if (p.client.incr(&c, "n")) |n| {
+                    if (n != 42) p.fail();
+                } else |err| p.failed(err),
+                1 => if (p.client.get(&c, "k")) |v| {
+                    if (v == null or !std.mem.eql(u8, v.?, "value")) p.fail();
+                } else |err| p.failed(err),
+                else => {
+                    var conn = p.client.acquire(&c) catch |err| {
+                        p.failed(err);
+                        continue;
+                    };
+                    if (conn.incr(&c, "n")) |n| {
+                        if (n != 42) p.fail();
+                    } else |err| p.failed(err);
+                    if (conn.get(&c, "k")) |v| {
+                        if (v == null or !std.mem.eql(u8, v.?, "value")) p.fail();
+                    } else |err| p.failed(err);
+                    conn.release();
+                    // A tenth released twice: the second does nothing.
+                    if (random.uintLessThan(u8, 10) == 0) conn.release();
+                },
+            }
+        }
+    }
+
+    fn failed(p: *PoolStress, err: anyerror) void {
+        std.debug.print("redis stress: {t}\n", .{err});
+        p.fail();
+    }
+
+    fn fail(p: *PoolStress) void {
+        _ = p.failures.fetchAdd(1, .monotonic);
+    }
+
+    /// Holds two connections of its executor's pool until `go`.
+    fn hold(p: *PoolStress, go: *std.Io.Event, held: *std.atomic.Value(u32)) void {
+        var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena_state.deinit();
+        var c: db.Ctx = .{ .io = p.io, .arena = arena_state.allocator() };
+        const a = p.client.acquire(&c) catch return p.fail();
+        defer a.release();
+        const b = p.client.acquire(&c) catch return p.fail();
+        defer b.release();
+        if (a.conn == b.conn) p.fail();
+        _ = held.fetchAdd(2, .acq_rel);
+        go.wait(p.io) catch {};
+    }
+};
+
+test "redis: [stress] calls, acquire and double release from four executors never share a connection" {
+    const wait = @import("anole_test_wait");
+    try wait.requireStress();
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 8, .acquire_timeout = wait.deadline() });
+    defer client.deinit();
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    const seed: u64 = 0x5_2ed15;
+    errdefer std.debug.print("redis stress: seed 0x{x}\n", .{seed});
+    var p: PoolStress = .{ .client = client, .io = io };
+    {
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        for (0..16) |t| try dusty.placement.concurrent(&group, io, .{ .executor = t % 4 }, PoolStress.task, .{ &p, seed +% t, 400 });
+        try group.await(io);
+    }
+    try testing.expectEqual(@as(u32, 0), p.failures.load(.monotonic));
+    // No more sessions at the server than the pools' 8 at any time (none
+    // closes here, so a session ends only with the test).
+    try testing.expect(fake.most_live.load(.acquire) <= 8);
+    // Every connection came back once: each pool holds no more than its
+    // share, all of it idle.
+    for (client.pools.pools) |*pool| {
+        try testing.expect(pool.open <= pool.max);
+        try testing.expectEqual(pool.open, pool.idle_len);
+    }
+    // All 8 held at once, two per executor: none was lost to a count
+    // that drifted.
+    var go: std.Io.Event = .unset;
+    var held: std.atomic.Value(u32) = .init(0);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..4) |e| try dusty.placement.concurrent(&group, io, .{ .executor = e }, PoolStress.hold, .{ &p, &go, &held });
+    try wait.waitEqual(io, "8 connections held", &held, 8);
+    go.set(io);
+    try group.await(io);
+    try testing.expectEqual(@as(u32, 0), p.failures.load(.monotonic));
 }
 
 test "redis: a server that cannot be reached is a 503, and /readyz says so" {

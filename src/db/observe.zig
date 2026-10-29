@@ -304,6 +304,85 @@ test "db readiness: probes during a ping answer with the last result" {
     try testing.expectEqual(@as(u32, 1), fake.pings.load(.monotonic));
 }
 
+/// S-4's ping: yields a seeded number of times instead of waiting for a
+/// gate, counting how many run at once.
+const YieldingPing = struct {
+    pings: std.atomic.Value(u32) = .init(0),
+    running: std.atomic.Value(u32) = .init(0),
+    most: std.atomic.Value(u32) = .init(0),
+    answer: std.atomic.Value(bool) = .init(true),
+    yields: std.atomic.Value(u32) = .init(0),
+
+    fn ping(context: *anyopaque, _: std.Io) std.Io.Cancelable!bool {
+        const zio = @import("zio");
+        const self = safety.fromCtx(YieldingPing, context);
+        _ = self.pings.fetchAdd(1, .monotonic);
+        const now = self.running.fetchAdd(1, .acq_rel) + 1;
+        defer _ = self.running.fetchSub(1, .acq_rel);
+        _ = self.most.fetchMax(now, .monotonic);
+        for (0..self.yields.load(.monotonic)) |_| try zio.yield();
+        return self.answer.load(.monotonic);
+    }
+};
+
+/// One probe of an S-4 wave: its task (for a cancel), then the check, then
+/// a wait for the wave's end, so it is alive until canceled or released.
+const WaveProbe = struct {
+    task: std.atomic.Value(?dusty.placement.Task) = .init(null),
+    started: *std.atomic.Value(u32),
+
+    fn run(p: *WaveProbe, io: std.Io, ready: *Readiness, end: *std.Io.Event) std.Io.Cancelable!void {
+        p.task.store(dusty.placement.currentTask(io), .release);
+        _ = p.started.fetchAdd(1, .acq_rel);
+        _ = Readiness.check(ready);
+        try end.wait(io);
+    }
+};
+
+test "db readiness: [stress] probes from four executors with cancels ping one at a time and keep no canceled answer" {
+    const wait = @import("anole_test_wait");
+    try wait.requireStress();
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
+    defer rt.deinit();
+    const io = rt.io();
+    const seed: u64 = 0x5e84_d1a0;
+    errdefer std.debug.print("db readiness stress: seed 0x{x}\n", .{seed});
+    var prng: std.Random.DefaultPrng = .init(seed);
+    const random = prng.random();
+
+    var fake: YieldingPing = .{};
+    // ttl 0: every probe pings unless a ping already runs.
+    var ready: Readiness = .{ .io = io, .context = safety.toCtx(&fake), .ping = YieldingPing.ping, .ttl = .{ .nanoseconds = 0 } };
+    const probes_per_wave = 16;
+    for (0..300) |_| {
+        const answer = random.boolean();
+        fake.answer.store(answer, .monotonic);
+        fake.yields.store(random.uintLessThan(u32, 8), .monotonic);
+        var started: std.atomic.Value(u32) = .init(0);
+        var probes: [probes_per_wave]WaveProbe = @splat(.{ .started = &started });
+        var end: std.Io.Event = .unset;
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        for (&probes, 0..) |*p, i| try dusty.placement.concurrent(&group, io, .{ .executor = i % 4 }, WaveProbe.run, .{ p, io, &ready, &end });
+        try wait.waitEqual(io, "every probe of the wave started", &started, probes_per_wave);
+        // A seeded few canceled, wherever they are: in the ping, waiting
+        // for the wave's end, or about to check.
+        var canceled: u32 = 0;
+        for (&probes) |*p| if (random.uintLessThan(u8, 4) == 0) {
+            dusty.placement.cancelTask(p.task.load(.acquire).?);
+            canceled += 1;
+        };
+        end.set(io);
+        group.await(io) catch {};
+        try testing.expect(fake.most.load(.monotonic) <= 1);
+        try testing.expect(!ready.pinging.load(.acquire));
+        if (canceled == 0) try testing.expectEqual(answer, ready.ready.load(.monotonic));
+    }
+    try testing.expectEqual(@as(u32, 1), fake.most.load(.monotonic));
+}
+
 test "Observer: metrics shared by two databases, and a child span in a traced request" {
     const gpa = testing.allocator;
     var registry = metrics.Registry.init(gpa, testing.io);
