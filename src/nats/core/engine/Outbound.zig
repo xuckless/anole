@@ -1391,7 +1391,7 @@ fn exercise(gpa: Allocator) !void {
 }
 
 test "nothing leaks when an allocation fails" {
-    try testing.checkAllAllocationFailures(testing.allocator, exercise, .{});
+    try testing.checkAllAllocationFailures(@import("../../../testing/no_resize.zig").allocator, exercise, .{});
 }
 
 test "a PING answered before its connection ended is answered, whenever its waiter looks" {
@@ -1848,7 +1848,7 @@ fn exerciseSettle(gpa: Allocator) !void {
 }
 
 test "nothing leaks when an allocation fails while settling and restoring" {
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseSettle, .{});
+    try testing.checkAllAllocationFailures(@import("../../../testing/no_resize.zig").allocator, exerciseSettle, .{});
 }
 
 /// A ticket that admits its frame, or not, as `admit` says, and notes the

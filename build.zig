@@ -764,9 +764,15 @@ pub fn build(b: *std.Build) void {
         .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url, .nats_test_url = nats_test_url, .kafka_test_url = kafka_test_url, .s3_test_url = s3_test_url, .smtp_test_url = smtp_test_url, .mailpit_api_url = mailpit_api_url }),
         .use_llvm = use_llvm,
     });
-    const run_tests = b.addRunArtifact(tests);
-    run_tests.skip_foreign_checks = true;
-    test_step.dependOn(&run_tests.step);
+    // `-Dtest-shards=N` runs the main suite as N processes of the same
+    // binary in parallel (ANOLE_TEST_SHARD=i/N, src/safety/test_runner.zig)
+    // and the HTTP core's as N/2; each shard's tests are its index modulo N.
+    const test_shards = b.option(u32, "test-shards", "Run anole-test as N parallel shards and core-test as N/2 (default 1)") orelse 1;
+    if (test_shards == 0) @panic("-Dtest-shards must be at least 1");
+    for (addShardedRuns(b, tests, test_shards)) |run_tests| {
+        run_tests.skip_foreign_checks = true;
+        test_step.dependOn(&run_tests.step);
+    }
     // test-timing: the main and the HTTP core's suites again, the same
     // binaries run with ANOLE_TEST_TIMING=1 (src/testing/wait.zig): the
     // elapsed-time bounds a test checks only `if (wait.timing())`, and the
@@ -961,10 +967,13 @@ pub fn build(b: *std.Build) void {
         b.step("console-ui-test", "Run the live console's std-only module tests (protocol, keys, screen, app, restart plan)").dependOn(&run_ui_tests.step);
     }
 
-    // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
-    // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
+    // test-postgres: the PostgreSQL tests alone ("pg: ...", the jobs
+    // conformance suite's PostgreSQL instance, watch's and webhooks' live
+    // tests); with -Dpostgres-test-url, against that server
+    // (tests/postgres/run.sh). tools/live_coverage.py (CI) fails when a test
+    // that reads a service's URL matches no CI step's filters.
     if (features.postgres) {
-        const pg_tests = addSafeTest(b, .{ .name = "anole-test-pg", .root_module = tests.root_module, .filters = &.{"pg:"}, .use_llvm = use_llvm });
+        const pg_tests = addSafeTest(b, .{ .name = "anole-test-pg", .root_module = tests.root_module, .filters = &.{ "pg:", "jobs.conformance_test.Suite(.postgres)", "watch live: postgres", "on PostgreSQL (live)" }, .use_llvm = use_llvm });
         const run_pg_tests = b.addRunArtifact(pg_tests);
         run_pg_tests.has_side_effects = postgres_test_url != null;
         b.step("test-postgres", "Run the PostgreSQL tests (live with -Dpostgres-test-url=postgres://...)").dependOn(&run_pg_tests.step);
@@ -979,7 +988,7 @@ pub fn build(b: *std.Build) void {
     // test-mongodb: the MongoDB client's tests alone (src/mongodb); with
     // -Dmongodb-test-url, against that server (tests/mongodb/run.sh).
     if (features.mongodb) {
-        const mongo_tests = addSafeTest(b, .{ .name = "anole-test-mongodb", .root_module = tests.root_module, .filters = &.{"mongodb."}, .use_llvm = use_llvm });
+        const mongo_tests = addSafeTest(b, .{ .name = "anole-test-mongodb", .root_module = tests.root_module, .filters = &.{ "mongodb.", "watch live: mongodb" }, .use_llvm = use_llvm });
         const run_mongo_tests = b.addRunArtifact(mongo_tests);
         run_mongo_tests.has_side_effects = mongodb_test_url != null;
         b.step("test-mongodb", "Run the MongoDB client's tests (live with -Dmongodb-test-url=mongodb://...)").dependOn(&run_mongo_tests.step);
@@ -989,7 +998,7 @@ pub fn build(b: *std.Build) void {
     // and the rate limiter's among them; with -Dredis-test-url (or
     // -Dredis-test-port), against that server (tests/redis/run.sh).
     if (features.redis) {
-        const redis_tests = addSafeTest(b, .{ .name = "anole-test-redis", .root_module = tests.root_module, .filters = &.{"redis:"}, .use_llvm = use_llvm });
+        const redis_tests = addSafeTest(b, .{ .name = "anole-test-redis", .root_module = tests.root_module, .filters = &.{ "redis:", "jobs.conformance_test.Suite(.redis)" }, .use_llvm = use_llvm });
         const run_redis_tests = b.addRunArtifact(redis_tests);
         run_redis_tests.has_side_effects = redis_test_url != null or redis_test_port != null;
         b.step("test-redis", "Run the Redis tests (live with -Dredis-test-url=redis://...)").dependOn(&run_redis_tests.step);
@@ -1065,7 +1074,7 @@ pub fn build(b: *std.Build) void {
             .test_runner = .{ .path = b.path("src/http/core/test_runner.zig"), .mode = .simple },
             .use_llvm = use_llvm,
         });
-        const run_core_tests = b.addRunArtifact(core_tests);
+        const core_runs = addShardedRuns(b, core_tests, @max(1, test_shards / 2));
         compile_tests_step.dependOn(&core_tests.step);
         // The TLS tests open certs/cert.pem and certs/key.pem from where
         // they run: a certificate made now by tests/test_cert.zig, so no
@@ -1080,8 +1089,12 @@ pub fn build(b: *std.Build) void {
             }),
         }));
         const certs_dir = make_cert.addOutputDirectoryArg("certs").dirname();
-        run_core_tests.setCwd(certs_dir);
-        test_step.dependOn(&run_core_tests.step);
+        const core_test_step = b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng, zstd and Brotli");
+        for (core_runs) |run_core_tests| {
+            run_core_tests.setCwd(certs_dir);
+            test_step.dependOn(&run_core_tests.step);
+            core_test_step.dependOn(&run_core_tests.step);
+        }
         // test-timing: the core's tests again, with ANOLE_TEST_TIMING=1
         // (see test-timing above).
         {
@@ -1101,7 +1114,22 @@ pub fn build(b: *std.Build) void {
             .use_llvm = use_llvm,
         });
         test_step.dependOn(&b.addRunArtifact(core_fuzz).step);
-        b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng, zstd and Brotli").dependOn(&run_core_tests.step);
+        // core-test-bare: the core's tests on the core without TLS, HTTP/2
+        // or compression (the minimal profile's core), so the tests that
+        // run only there (`if (use_tls) return error.SkipZigTest` and the
+        // like) run somewhere. Not part of `test`; one CI step runs it
+        // (research/s15/audit/lead-decisions.md item 3).
+        if (core.dusty_by[0][0][0][0]) |core_bare| {
+            const bare_tests = b.addTest(.{
+                .name = "core-test-bare",
+                .root_module = core_test_mod(b, core_bare, core.test_wait, target, optimize),
+                .test_runner = .{ .path = b.path("src/http/core/test_runner.zig"), .mode = .simple },
+                .use_llvm = use_llvm,
+            });
+            const run_bare = b.addRunArtifact(bare_tests);
+            run_bare.setCwd(certs_dir);
+            b.step("core-test-bare", "Run the HTTP core's own tests on the core without TLS, HTTP/2 or compression").dependOn(&run_bare.step);
+        }
     }
 
     // test-flags: one test binary per preset and edge combination. Each gets its
@@ -2012,6 +2040,25 @@ const LlHttp = struct {
         return .{ .mod = tc.createModule(), .lib = lib };
     }
 };
+
+/// One run of `tests` per shard (`-Dtest-shards`): each gets
+/// ANOLE_TEST_SHARD=i/n, which both test runners read, so the shards run in
+/// parallel as separate processes of one binary. With
+/// ANOLE_TEST_DURATIONS set (tools/test_durations.py) the runs always run,
+/// as a cached result would record nothing.
+fn addShardedRuns(b: *std.Build, tests: *std.Build.Step.Compile, n: u32) []const *std.Build.Step.Run {
+    const runs = b.allocator.alloc(*std.Build.Step.Run, n) catch @panic("OOM");
+    const want_durations = if (b.graph.environ_map.get("ANOLE_TEST_DURATIONS")) |p| p.len > 0 else false;
+    for (runs, 0..) |*r, i| {
+        r.* = b.addRunArtifact(tests);
+        if (n > 1) {
+            r.*.setName(b.fmt("run test {s} {d}/{d}", .{ tests.name, i, n }));
+            r.*.setEnvironmentVariable("ANOLE_TEST_SHARD", b.fmt("{d}/{d}", .{ i, n }));
+        }
+        if (want_durations) r.*.has_side_effects = true;
+    }
+    return runs;
+}
 
 /// `b.addTest` with src/safety/test_runner.zig: Zig's default test runner
 /// with the test allocator backed by memory that is never reused, failing a

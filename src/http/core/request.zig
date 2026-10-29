@@ -1152,14 +1152,14 @@ test "Request.body: built without zlib, a coded body is refused" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
     try parseHeaders(&reader, &parser);
 
     try std.testing.expectError(error.UnsupportedContentEncoding, req.body());

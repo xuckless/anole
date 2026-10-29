@@ -98,7 +98,7 @@ fn dupeAndFree(gpa: Allocator) !void {
 }
 
 test "dupe copies every slice and free releases them" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, dupeAndFree, .{});
+    try std.testing.checkAllAllocationFailures(@import("../testing/no_resize.zig").allocator, dupeAndFree, .{});
 }
 
 const Lists = struct {
@@ -124,7 +124,7 @@ fn dupeAndFreeLists(gpa: Allocator) !void {
 }
 
 test "dupe and free handle lists of structs, lists of secrets and optional lists" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, dupeAndFreeLists, .{});
+    try std.testing.checkAllAllocationFailures(@import("../testing/no_resize.zig").allocator, dupeAndFreeLists, .{});
 }
 
 test "wipe zeroes the bytes of a secret" {

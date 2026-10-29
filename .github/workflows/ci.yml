@@ -74,6 +74,13 @@ jobs:
         with:
           version: 0.17.0
       - uses: ./.github/actions/install-gdb
+      # Every test that reads a service's URL option (-Dpostgres-test-url
+      # and the like) must match the filters of a CI step that passes it,
+      # or it skips everywhere (TESTING.md W2). Python only, no build.
+      - name: Live tests reach a CI step
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        run: python3 -I tools/live_coverage.py
       # Zig fetches git and tarball dependencies itself on a cold cache;
       # the runners' network fails now and then (NameServerFailure,
       # HttpConnectionClosing), so the fetch is retried before building.
@@ -97,6 +104,13 @@ jobs:
       - name: HTTP/3 without HTTP/2 (nghttp3 without nghttp2)
         timeout-minutes: 31
         run: zig build test -Dhttp2=false -Dhttp3=true --test-timeout 120s --summary all
+      # The core's tests on the core without TLS, HTTP/2 or compression:
+      # no other step builds core-test there, so the tests that skip when
+      # TLS or zlib/zstd is on run only here.
+      - name: HTTP core without TLS or compression
+        if: runner.os == 'Linux'
+        timeout-minutes: 15
+        run: zig build core-test-bare --summary all
       - name: Invalid flag combination is rejected
         shell: bash
         run: |

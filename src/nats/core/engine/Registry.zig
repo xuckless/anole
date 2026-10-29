@@ -392,7 +392,7 @@ fn createAndDestroy(gpa: Allocator) !void {
 }
 
 test "nothing leaks when an allocation fails" {
-    try testing.checkAllAllocationFailures(testing.allocator, createAndDestroy, .{});
+    try testing.checkAllAllocationFailures(@import("../../../testing/no_resize.zig").allocator, createAndDestroy, .{});
 }
 
 test "deny ends the oldest open subscription with the subject and queue the server names" {

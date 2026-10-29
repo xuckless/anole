@@ -189,5 +189,5 @@ fn initAndDeinit(gpa: Allocator) !void {
 }
 
 test "init frees everything when memory runs out" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, initAndDeinit, .{});
+    try std.testing.checkAllAllocationFailures(@import("../testing/no_resize.zig").allocator, initAndDeinit, .{});
 }

@@ -979,7 +979,7 @@ fn exercise(gpa: Allocator) !void {
 }
 
 test "nothing leaks when an allocation fails" {
-    try testing.checkAllAllocationFailures(testing.allocator, exercise, .{});
+    try testing.checkAllAllocationFailures(@import("../../../testing/no_resize.zig").allocator, exercise, .{});
 }
 
 /// A request's side of the gate.
