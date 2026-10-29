@@ -191,6 +191,11 @@ breaking changes are listed anyway.
 
 ### Changed
 
+- Test utilities: `anole.s3.testing.FakeServer` answers a header-signed
+  request whose `x-amz-date` is more than 15 minutes off its clock with
+  403 `RequestTimeTooSkewed`, as S3 does (`clock_offset_s` moves its
+  clock); `anole.console.inprocess.drainLines`, documented as for tests and
+  used by none, is removed.
 - WebSocket over TLS (#85): one TLS read now returns every whole record
   already received, and a busy HTTP/1.1 WebSocket reads through a larger
   window: `upgrade()`/`next()` sockets widen their reader over the
