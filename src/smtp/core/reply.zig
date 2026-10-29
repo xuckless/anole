@@ -125,15 +125,25 @@ test "parseLine: codes, separators and malformed lines" {
 test "read: a single line, and a multi-line reply across fragments" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    var r: std.Io.Reader = .fixed("220 mail.example.com ESMTP\r\n250-mail.example.com\r\n250-PIPELINING\r\n250 SIZE 35882577\r\n");
-    const greeting = try read(&r, arena.allocator());
+    // The bytes arrive in fragments cut inside lines and inside the CRLF, at most 3
+    // bytes per fill, so the multi-line reply spans many fills.
+    var buf: [64]u8 = undefined;
+    var fr: std.testing.Reader = .init(&buf, &.{
+        .{ .buffer = "220 mail.exam" },
+        .{ .buffer = "ple.com ESMTP\r" },
+        .{ .buffer = "\n250-mail.example.com\r\n250-PIPE" },
+        .{ .buffer = "LINING\r\n250 SIZE 35882577\r\n" },
+    });
+    fr.artificial_limit = .limited(3);
+    const r = &fr.interface;
+    const greeting = try read(r, arena.allocator());
     try testing.expectEqual(@as(u16, 220), greeting.code);
     try testing.expectEqualStrings("mail.example.com ESMTP", greeting.first());
-    const ehlo = try read(&r, arena.allocator());
+    const ehlo = try read(r, arena.allocator());
     try testing.expectEqual(@as(u16, 250), ehlo.code);
     try testing.expectEqual(@as(usize, 3), ehlo.lines.len);
     try testing.expectEqualStrings("SIZE 35882577", ehlo.lines[2]);
-    try testing.expectError(error.EndOfStream, read(&r, arena.allocator()));
+    try testing.expectError(error.EndOfStream, read(r, arena.allocator()));
 }
 
 test "read: a code that changes inside a reply, and a reply cut short, are errors" {
@@ -141,7 +151,7 @@ test "read: a code that changes inside a reply, and a reply cut short, are error
     try expectReadError(error.EndOfStream, "250-a\r\n");
 }
 
-test "enhanced status codes" {
+test "reply: an enhanced status code is class.subject.detail at the start of the text (class 2, 4 or 5), else none" {
     try testing.expectEqualStrings("5.7.1", enhancedOf("5.7.1 Relaying denied").?);
     try testing.expectEqualStrings("2.0.0", enhancedOf("2.0.0").?);
     try testing.expect(enhancedOf("Relaying denied") == null);

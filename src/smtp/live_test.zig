@@ -154,7 +154,7 @@ test "mailpit: text, html, an attachment and an inline image arrive as composed"
     }.run);
 }
 
-test "mailpit: twenty messages over one connection, pipelined" {
+test "mailpit: twenty messages sent in a row with max_connections 1 all arrive" {
     const target = try plain();
     try withRuntime(target, struct {
         fn run(io: std.Io, t: Target) !void {

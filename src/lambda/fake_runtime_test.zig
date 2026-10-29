@@ -45,6 +45,8 @@ pub const Fake = struct {
     /// The script is over and a `/next` is held.
     drained: std.atomic.Value(bool) = .init(false),
     registered: std.atomic.Value(bool) = .init(false),
+    /// A `/next` came before the extension registered.
+    next_before_register: std.atomic.Value(bool) = .init(false),
     /// What `/response` posts are answered with.
     response_status: dusty.Status = .accepted,
     /// Never set: held requests wait on it until the fake stops.
@@ -118,6 +120,7 @@ pub const Fake = struct {
     }
 
     fn next(f: *Fake, req: *dusty.Request, res: *dusty.Response) !void {
+        if (!f.registered.load(.acquire)) f.next_before_register.store(true, .release);
         f.lock();
         if (f.index < f.script.len) {
             const inv = f.script[f.index];
@@ -181,6 +184,19 @@ fn stopAfter(app: *anole.App, f: *Fake, n: usize) anyerror!void {
             return c.f.postCount() >= c.n and c.f.drained.load(.acquire);
         }
     }.done);
+}
+
+/// As `stopAfter`, and runs `check(ctx)` on the app's runtime once the posts
+/// are recorded, before the app stops.
+fn stopAfterCheck(app: *anole.App, f: *Fake, n: usize, check: *const fn (*anyopaque) anyerror!void, ctx: *anyopaque) anyerror!void {
+    defer app.stop();
+    const Ctx = struct { f: *Fake, n: usize };
+    try @import("anole_test_wait").waitUntil(app.io(), "the Runtime API got the posts and was drained", Ctx{ .f = f, .n = n }, struct {
+        fn done(c: Ctx) bool {
+            return c.f.postCount() >= c.n and c.f.drained.load(.acquire);
+        }
+    }.done);
+    try check(ctx);
 }
 
 /// Runs `app` against `f` until `n` posts are recorded.
@@ -329,7 +345,7 @@ test "lambda: non-HTTP events go to the event path; a non-2xx answer fails the i
     try std.testing.expect(has(q.body, "queue broke"));
 }
 
-test "lambda: with event_path null nothing is reserved and non-HTTP events are refused; an unreadable event" {
+test "lambda: with event_path null a web request to /_lambda/event is an ordinary request and non-HTTP events fail Runtime.UnsupportedEvent" {
     var f: Fake = undefined;
     const reserved =
         \\{"version":"2.0","rawPath":"/_lambda/event","rawQueryString":"","headers":{"host":"h"},
@@ -338,17 +354,26 @@ test "lambda: with event_path null nothing is reserved and non-HTTP events are r
     try f.start(&.{
         .{ .request_id = "r-reserved", .event = reserved },
         .{ .request_id = "r-sqs", .event = sqs_event },
-        .{ .request_id = "r-bad", .event = "not json" },
     });
     defer f.stop();
     var app = try lambdaApp(&f, .{ .sigterm = false, .event_path = null });
     defer app.deinit();
     app.post("/_lambda/event", onQueue);
-    try serveUntil(&app, &f, 3);
-    // No event path: a web request to that path is an ordinary request.
+    try serveUntil(&app, &f, 2);
     try std.testing.expect(has(f.post(0).body, "\"statusCode\":200"));
     try std.testing.expectEqualStrings("Runtime.UnsupportedEvent", f.post(1).error_type);
-    try std.testing.expectEqualStrings("Runtime.InvalidEvent", f.post(2).error_type);
+}
+
+test "lambda: an event that is not JSON fails the invocation with Runtime.InvalidEvent" {
+    var f: Fake = undefined;
+    try f.start(&.{.{ .request_id = "r-bad", .event = "not json" }});
+    defer f.stop();
+    var app = try lambdaApp(&f, .{ .sigterm = false });
+    defer app.deinit();
+    app.get("/hello", hello);
+    try serveUntil(&app, &f, 1);
+    try std.testing.expectEqualStrings("/2018-06-01/runtime/invocation/r-bad/error", f.post(0).path);
+    try std.testing.expectEqualStrings("Runtime.InvalidEvent", f.post(0).error_type);
 }
 
 test "lambda: streaming Function URL" {
@@ -410,7 +435,7 @@ test "lambda: a Runtime API 500 ends run" {
     try std.testing.expectError(error.LambdaRuntimeApiFailed, app.run());
 }
 
-test "lambda: SIGTERM extension is registered before the first /next" {
+test "lambda: the SIGTERM extension is registered before the first /next" {
     var f: Fake = undefined;
     try f.start(&.{.{ .request_id = "r-ext", .event = http_api_get }});
     defer f.stop();
@@ -419,41 +444,119 @@ test "lambda: SIGTERM extension is registered before the first /next" {
     app.get("/hello", hello);
     try serveUntil(&app, &f, 1);
     try std.testing.expect(f.registered.load(.acquire));
+    try std.testing.expect(!f.next_before_register.load(.acquire));
 }
 
-test "lambda: listen() is set aside, and idle connections close after a long gap" {
+test "lambda: listen() is set aside under lambda (nothing bound, recorded in mode.set_aside)" {
+    var f: Fake = undefined;
+    try f.start(&.{.{ .request_id = "r-1", .event = http_api_get }});
+    defer f.stop();
+    var app = try lambdaApp(&f, .{ .sigterm = false });
+    defer app.deinit();
+    app.get("/hello", hello);
+    var stopper = try app.io().concurrent(stopAfter, .{ &app, &f, 1 });
+    app.listen(":0") catch |err| {
+        stopper.cancel(app.io()) catch {};
+        return err;
+    };
+    try stopper.await(app.io());
+    try std.testing.expectEqual(@as(usize, 0), app.addresses().len);
+    // The startup line names it (modes.writeSetAside); the test runner's
+    // log does not go through anole's sink, so the record is checked.
+    try std.testing.expectEqualStrings(":0", app.mode.set_aside.listen.?);
+}
+
+const smtp_mod = @import("../smtp/root.zig");
+
+/// The SMTP client the idle-connection test's handler sends with.
+var idle_test_mail: ?*smtp_mod.Client = null;
+
+fn sendMail(req: *anole.Request, res: *anole.Response) !void {
+    _ = try idle_test_mail.?.send(req, .{ .to = &.{"ada@example.com"}, .subject = "Hi", .text = "Hello" });
+    res.body = "sent";
+}
+
+test "lambda: idle outbound connections are closed after a gap past idle_reset" {
+    if (comptime !anole.features.smtp) return error.SkipZigTest;
+    // Each invocation sends a mail over a pooled SMTP connection. The gap
+    // before the second is made longer than idle_reset (time injection), so
+    // the first connection is closed and the second send opens another.
+    const fake = try smtp_mod.testing.FakeServer.init(gpa, tio, .{});
+    defer fake.deinit();
     var f: Fake = undefined;
     try f.start(&.{
         .{ .request_id = "r-1", .event = http_api_get },
         .{ .request_id = "r-2", .event = http_api_get },
     });
     defer f.stop();
-    serve_mod._test_close_idle_count.store(0, .monotonic);
     serve_mod._test_clock_offset_ms.store(301_000, .monotonic);
     defer serve_mod._test_clock_offset_ms.store(0, .monotonic);
     var app = try lambdaApp(&f, .{ .sigterm = false });
     defer app.deinit();
-    app.get("/hello", hello);
-    var stopper = try app.io().concurrent(stopAfter, .{ &app, &f, 2 });
-    try app.listen(":0");
-    try stopper.await(app.io());
-    try std.testing.expectEqual(@as(usize, 0), app.addresses().len);
-    try std.testing.expectEqual(@as(u32, 1), serve_mod._test_close_idle_count.load(.monotonic));
-    // The startup line names it (modes.writeSetAside); the test runner's
-    // log does not go through anole's sink, so the record is checked.
-    try std.testing.expectEqualStrings(":0", app.mode.set_aside.listen.?);
+    var url_buf: [160]u8 = undefined;
+    idle_test_mail = try app.smtp(.{ .url = fake.url(&url_buf), .from = "app@example.com", .environment = .development });
+    defer idle_test_mail = null;
+    app.get("/hello", sendMail);
+    try serveUntil(&app, &f, 2);
+    try std.testing.expect(has(f.post(0).body, "\"statusCode\":200"));
+    try std.testing.expect(has(f.post(1).body, "\"statusCode\":200"));
+    try std.testing.expectEqual(@as(usize, 2), fake.messageCount());
+    try std.testing.expectEqual(@as(u32, 2), fake.connections.load(.acquire));
 }
 
-test "lambda: under lambda, jobs only enqueue (R14 lines)" {
+const LambdaJob = struct {
+    pub const job: anole.jobs.Kind = .{ .name = "t.lambda" };
+    n: u32 = 1,
+
+    var client: ?*anole.jobs.Client = null;
+    var id: ?anole.jobs.Id = null;
+    var ran: std.atomic.Value(bool) = .init(false);
+
+    fn run(_: *anole.jobs.Job, _: LambdaJob) !void {
+        ran.store(true, .release);
+    }
+
+    fn enqueue(req: *anole.Request, res: *anole.Response) !void {
+        id = (try client.?.enqueue(req, LambdaJob{}, .{})).id;
+        res.body = "queued";
+    }
+
+    /// On the app's runtime, before it stops: the job is still waiting.
+    fn stillAvailable(opaque_app: *anyopaque) anyerror!void {
+        const app: *anole.App = @ptrCast(@alignCast(opaque_app));
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var ctx: anole.db.Ctx = .{ .io = app.io(), .arena = arena.allocator() };
+        const info = (try client.?.get(&ctx, id.?)).?;
+        try std.testing.expectEqual(anole.jobs.State.available, info.state);
+    }
+};
+
+test "lambda: under lambda jobs are only enqueued, never run here" {
     if (comptime !anole.features.jobs) return error.SkipZigTest;
     var f: Fake = undefined;
     try f.start(&.{.{ .request_id = "r-jobs", .event = http_api_get }});
     defer f.stop();
     var app = try lambdaApp(&f, .{ .sigterm = false });
     defer app.deinit();
-    app.get("/hello", hello);
+    app.get("/hello", LambdaJob.enqueue);
     const j = try app.jobs(.{ .store = .memory });
-    try serveUntil(&app, &f, 1);
+    try j.handle(&app, LambdaJob, .{}, LambdaJob.run);
+    LambdaJob.client = j;
+    LambdaJob.id = null;
+    LambdaJob.ran.store(false, .release);
+    defer LambdaJob.client = null;
+    var stopper = try app.io().concurrent(stopAfterCheck, .{ &app, &f, 1, LambdaJob.stillAvailable, @as(*anyopaque, @ptrCast(&app)) });
+    app.run() catch |err| {
+        stopper.cancel(app.io()) catch {};
+        return err;
+    };
+    try stopper.await(app.io());
+    try std.testing.expect(has(f.post(0).body, "\"statusCode\":200"));
+    // The stop joined whatever workers there were: a run would be done by now.
+    try std.testing.expect(!LambdaJob.ran.load(.acquire));
+    // Neither observable can prove a worker would never pick the job up
+    // later, so the switch that keeps the workers off is checked too.
     try std.testing.expect(j.suppress_workers);
 }
 
@@ -472,6 +575,15 @@ test "lambda: the event path is reserved for events" {
     try std.testing.expect(has(f.post(0).body, "\"statusCode\":404"));
 }
 
+const WatchCheck = struct {
+    /// On the app's runtime, before it stops: the watch never left starting
+    /// (a started one would be reconnecting to port 1, or connected).
+    fn notStarted(opaque_watch: *anyopaque) anyerror!void {
+        const w: *anole.watch.Watch = @ptrCast(@alignCast(opaque_watch));
+        try std.testing.expectEqual(anole.watch.Status.starting, w.status());
+    }
+};
+
 test "lambda: a watch is not started under lambda; invocations are served" {
     if (comptime !anole.features.redis) return error.SkipZigTest;
     var f: Fake = undefined;
@@ -483,7 +595,11 @@ test "lambda: a watch is not started under lambda; invocations are served" {
     // Nothing listens on port 1: a started watch would keep reconnecting.
     const rc = try app.redis(.{ .url = "redis://127.0.0.1:1", .environ = .empty });
     const w = try app.watch(.{ .redis = .{ .client = rc, .channels = &.{"orders"} } }, .{});
-    try serveUntil(&app, &f, 1);
-    try std.testing.expect(w.disabled and !w.started);
+    var stopper = try app.io().concurrent(stopAfterCheck, .{ &app, &f, 1, WatchCheck.notStarted, @as(*anyopaque, @ptrCast(w)) });
+    app.run() catch |err| {
+        stopper.cancel(app.io()) catch {};
+        return err;
+    };
+    try stopper.await(app.io());
     try std.testing.expect(has(f.post(0).body, "\"statusCode\":200"));
 }

@@ -274,7 +274,7 @@ test "lambda runtime: error trailers carry the type and the base64 message" {
     try testing.expectEqualStrings("ZGVhZGxpbmUgcGFzc2Vk", t.get("Lambda-Runtime-Function-Error-Body").?);
 }
 
-test "lambda runtime: status mapping" {
+test "lambda runtime: a Runtime API 2xx is ok, 400 InvalidInvocationId, 413 PayloadTooLarge, any other failure RuntimeApiFailed" {
     try statusResult(.accepted);
     try testing.expectError(error.InvalidInvocationId, statusResult(.bad_request));
     try testing.expectError(error.PayloadTooLarge, statusResult(.payload_too_large));
