@@ -271,13 +271,13 @@ pub const Redis = struct {
         return @intCast(@max(0, asInt(r)));
     }
 
-    fn heartbeat(ptr: *anyopaque, arena: std.mem.Allocator, until: Time, held: []const store.Held) anyerror![]Id {
+    fn heartbeat(ptr: *anyopaque, arena: std.mem.Allocator, until: Time, held: []const store.Held) anyerror![]store.Held {
         const self = me(ptr);
         var sc: Scratch = undefined;
         sc.start(self);
         defer sc.deinit();
         const a = sc.ctx.arena;
-        var out: std.ArrayList(Id) = .empty;
+        var out: std.ArrayList(store.Held) = .empty;
         var i: usize = 0;
         while (i < held.len) : (i += 1000) {
             const chunk = held[i..@min(held.len, i + 1000)];
@@ -287,7 +287,11 @@ pub const Redis = struct {
                 try args.append(a, try num(a, h.id));
                 try args.append(a, try num(a, h.attempt));
             }
-            for (items(try self.call(&sc.ctx, "heartbeat", args.items))) |r| try out.append(arena, asInt(r));
+            // The renewed runs as id, attempt pairs.
+            const got = items(try self.call(&sc.ctx, "heartbeat", args.items));
+            if (got.len % 2 != 0) return error.Database;
+            var k: usize = 0;
+            while (k < got.len) : (k += 2) try out.append(arena, .{ .id = asInt(got[k]), .attempt = @intCast(asInt(got[k + 1])) });
         }
         return out.items;
     }

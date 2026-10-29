@@ -355,13 +355,13 @@ pub const Postgres = struct {
         return @intCast(int(t.rows[0][0]));
     }
 
-    fn heartbeat(ptr: *anyopaque, arena: std.mem.Allocator, until: Time, held: []const store.Held) anyerror![]Id {
+    fn heartbeat(ptr: *anyopaque, arena: std.mem.Allocator, until: Time, held: []const store.Held) anyerror![]store.Held {
         const self = me(ptr);
         var sc: Scratch = undefined;
         sc.start(self);
         defer sc.deinit();
         const a = sc.ctx.arena;
-        var out: std.ArrayList(Id) = .empty;
+        var out: std.ArrayList(store.Held) = .empty;
         var i: usize = 0;
         while (i < held.len) : (i += 1000) {
             const chunk = held[i..@min(held.len, i + 1000)];
@@ -373,11 +373,11 @@ pub const Postgres = struct {
             const stmt = try std.fmt.allocPrint(
                 a,
                 "UPDATE {s}jobs j SET lease_until = " ++ ts("1") ++ " FROM (VALUES {s}) AS h(id, attempt) " ++
-                    "WHERE j.id = h.id AND j.attempt = h.attempt AND j.state = 'running' RETURNING j.id",
+                    "WHERE j.id = h.id AND j.attempt = h.attempt AND j.state = 'running' RETURNING j.id, j.attempt::bigint",
                 .{ self.prefix, values.items },
             );
             const t = try self.client.with(.{ .prepare = false }).table(&sc.ctx, stmt, &.{V{ .int = ms(until) }});
-            for (t.rows) |r| try out.append(arena, int(r[0]));
+            for (t.rows) |r| try out.append(arena, .{ .id = int(r[0]), .attempt = @intCast(int(r[1])) });
         }
         return out.items;
     }

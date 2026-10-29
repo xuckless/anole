@@ -249,16 +249,16 @@ pub const Memory = struct {
         return n;
     }
 
-    fn heartbeat(ptr: *anyopaque, arena: std.mem.Allocator, until: Time, held: []const store.Held) anyerror![]Id {
+    fn heartbeat(ptr: *anyopaque, arena: std.mem.Allocator, until: Time, held: []const store.Held) anyerror![]store.Held {
         const self = me(ptr);
         self.lock();
         defer self.unlock();
-        var out: std.ArrayList(Id) = .empty;
+        var out: std.ArrayList(store.Held) = .empty;
         for (held) |h| {
             const r = self.rows.get(h.id) orelse continue;
             if (r.state != .running or r.attempt != h.attempt) continue;
             r.lease_until = until;
-            try out.append(arena, h.id);
+            try out.append(arena, h);
         }
         return out.items;
     }
