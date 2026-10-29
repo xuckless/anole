@@ -885,6 +885,22 @@ fn sendServiceUnavailable(w: *std.Io.Writer) std.Io.Writer.Error!void {
 /// within a round trip, and the request deadline may be off.
 pub const linger_limit: usize = 64 * 1024;
 pub const linger_timeout: std.Io.Duration = .fromSeconds(1);
+
+/// Tests only: a shorter `linger_timeout` for the HTTP/1.x lingering close
+/// while non-zero, so a test of a peer that will not hang up need not sit
+/// out the whole second. Set it before the connection and put it back to 0
+/// after the test. Absent outside test builds.
+pub const test_linger_timeout_ms = if (builtin.is_test) struct {
+    pub var ms: std.atomic.Value(u32) = .init(0);
+} else struct {};
+
+fn lingerTimeout() std.Io.Duration {
+    if (builtin.is_test) {
+        const ms = test_linger_timeout_ms.ms.load(.acquire);
+        if (ms != 0) return .fromMilliseconds(ms);
+    }
+    return linger_timeout;
+}
 /// How long an unread request body is drained for when `timeout.keepalive`
 /// is off.
 const drain_timeout_fallback: std.Io.Duration = .fromSeconds(10);
@@ -2334,8 +2350,8 @@ pub fn Server(comptime Ctx: type) type {
                 error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return,
                 else => |e| return e,
             };
-            if (!timer.canBound()) return self.io.sleep(linger_timeout, .awake);
-            timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
+            if (!timer.canBound()) return self.io.sleep(lingerTimeout(), .awake);
+            timer.set(self.io, .{ .duration = .{ .raw = lingerTimeout(), .clock = .awake } });
             defer timer.clear(self.io);
             _ = connection.reader.discardShort(linger_limit) catch {
                 const cause = connection.getReadError() orelse error.Unexpected;
@@ -2352,7 +2368,7 @@ pub fn Server(comptime Ctx: type) type {
         fn closeNotify(self: *Self, connection: *Connection, timer: *Timer) std.Io.Cancelable!void {
             if (connection.tls_conn == null or connection.close_notify_sent) return;
             const bounded = timer.canBound();
-            if (bounded) timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
+            if (bounded) timer.set(self.io, .{ .duration = .{ .raw = lingerTimeout(), .clock = .awake } });
             defer if (bounded) timer.clear(self.io);
             return connection.closeNotify();
         }
@@ -2369,7 +2385,7 @@ pub fn Server(comptime Ctx: type) type {
                 error.Canceled => return error.Canceled,
                 else => return,
             };
-            timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
+            timer.set(self.io, .{ .duration = .{ .raw = lingerTimeout(), .clock = .awake } });
             defer timer.clear(self.io);
             var buf: [512]u8 = undefined;
             var r = stream.reader(self.io, &buf);
