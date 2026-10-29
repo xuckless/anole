@@ -204,7 +204,7 @@ pub fn isSendableValue(key: []const u8, value: []const u8) bool {
     return true;
 }
 
-test "metadata: isSendableKey" {
+test "metadata: a handler may send application keys, and grpc-status-details-bin and grpc-retry-pushback-ms only in trailers" {
     const t = std.testing;
     try t.expect(isSendableKey("x-tag", .header));
     try t.expect(!isSendableKey("grpc-status-details-bin", .header));

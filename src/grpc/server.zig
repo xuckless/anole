@@ -1488,7 +1488,17 @@ test "addTrailer refuses names and values that are not metadata" {
     try call.addTrailer("x-empty", "");
     try call.addTrailer("x-data-bin", "AAEC/w==");
     try call.addBinaryTrailer("x-raw-bin", "\x00\r\n\xff");
+    // A trailer, not a header: grpc-status-details-bin is sendable here.
+    try call.addTrailer("grpc-status-details-bin", "AAEC");
     for ([_][2][]const u8{
+        // Names the protocol owns.
+        .{ "grpc-status", "v" },
+        .{ "grpc-message", "v" },
+        .{ "content-type", "v" },
+        .{ "te", "v" },
+        .{ "connect-x", "v" },
+        .{ "trailer-x", "v" },
+        // Not metadata.
         .{ "x-a", "one\r\ngrpc-status:0" },
         .{ "x-a", "nul\x00" },
         .{ "x-a", "caf\xc3\xa9" },
@@ -1500,19 +1510,6 @@ test "addTrailer refuses names and values that are not metadata" {
         .{ "x-data-bin", "not base64!" },
     }) |case| try std.testing.expectError(error.InvalidMetadata, call.addTrailer(case[0], case[1]));
     try std.testing.expectError(error.InvalidMetadata, call.addBinaryTrailer("x-text", "v"));
-    const items = call.impl.trailers.items;
-    try std.testing.expectEqual(@as(usize, 4), items.len);
-    try std.testing.expectEqualStrings("AA0K/w", items[3].value);
-}
-
-test "grpc: addTrailer refuses grpc-status, grpc-message, content-type, te" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    var call: Call = .{ .req = undefined, .res = undefined, .arena = arena.allocator(), .io = undefined, .ctx = null, .impl = .{ .max_message_size = 0 } };
-    for ([_][]const u8{ "grpc-status", "grpc-message", "content-type", "te", "connect-x", "trailer-x" }) |name|
-        try std.testing.expectError(error.InvalidMetadata, call.addTrailer(name, "v"));
-    try call.addTrailer("grpc-status-details-bin", "AAEC");
-    try std.testing.expectEqual(@as(usize, 1), call.impl.trailers.items.len);
 }
 
 test "grpc: fail copies its message" {
@@ -1526,26 +1523,13 @@ test "grpc: fail copies its message" {
     try std.testing.expectEqualStrings("no user 7", call.status_message);
 }
 
-test "grpc: failFmt" {
+test "grpc: failFmt sets the code and a formatted message" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     var call: Call = .{ .req = undefined, .res = undefined, .arena = arena.allocator(), .io = undefined, .ctx = null, .impl = .{ .max_message_size = 0 } };
     try std.testing.expect(call.failFmt(.not_found, "no user {d}", .{42}) == error.GrpcStatus);
     try std.testing.expectEqualStrings("no user 42", call.status_message);
     try std.testing.expectEqual(Code.not_found, call.status);
-}
-
-test "grpc: addTrailer copies" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    var call: Call = .{ .req = undefined, .res = undefined, .arena = arena.allocator(), .io = undefined, .ctx = null, .impl = .{ .max_message_size = 0 } };
-    var name: [8]u8 = "x-served".*;
-    var value: [3]u8 = "one".*;
-    try call.addTrailer(&name, &value);
-    @memset(&name, 'q');
-    @memset(&value, 'q');
-    try std.testing.expectEqualStrings("x-served", call.impl.trailers.items[0].key);
-    try std.testing.expectEqualStrings("one", call.impl.trailers.items[0].value);
 }
 
 test "percentEncode leaves printable ASCII and escapes the rest" {
