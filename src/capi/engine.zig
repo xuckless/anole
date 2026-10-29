@@ -354,6 +354,11 @@ pub const no_slot = std.math.maxInt(u32);
 /// Records up to this size never wait for `Exec.record_bytes` to fall.
 const small_record = 1024;
 
+/// How long a poster canceled while it waits for ring room still waits,
+/// uncancelably, for its record's place (`Exec.postRecord`): the drain's
+/// other per-connection bounds (linger, the HTTP/2 notice) are 1 s too.
+const cancel_post_wait_ns: i96 = 1 * std.time.ns_per_s;
+
 fn closeFd(fd: c_int) void {
     if (comptime builtin.os.tag == .windows) return;
     _ = std.c.close(fd);
@@ -710,8 +715,12 @@ pub const Exec = struct {
     /// while the ring is full (a large record also while the records
     /// already queued pass `record_budget` bytes: one always fits in an
     /// empty ring). Everywhere else (another thread, or no `wait` and a
-    /// full ring) it goes onto the overflow list: nothing is ever dropped,
-    /// and nothing spins.
+    /// full ring) it goes onto the overflow list: nothing is dropped, and
+    /// nothing spins. One exception: a waiter canceled while it waits for
+    /// room keeps waiting, uncancelably, for at most `cancel_post_wait_ns`,
+    /// so the record keeps its place behind the ones before it; the record
+    /// is freed only if the consumer still hasn't made room by then. The
+    /// cancel is re-armed for the caller's next cancelation point.
     pub fn postRecord(x: *Exec, rec: []align(8) u8, wait: bool) void {
         const c = x.consumer orelse return freeRecord(rec.ptr);
         if (!x.onThisExecutor()) {
@@ -721,8 +730,24 @@ pub const Exec = struct {
         if (wait) {
             const need: usize = if (rec.len > small_record) rec.len else 0;
             while (!x.hasRoom(need)) x.waitRoom(need, null) catch {
+                // C3: the cancel goes back to the caller's next wait. C2/U4:
+                // the record (often the end of something: ws_close,
+                // net_close) still takes its place in the ring,
+                // uncancelably, for at most `cancel_post_wait_ns`; past
+                // that the consumer is not polling and it is freed. Not the
+                // overflow list: `poll` drains it after the ring, so a later
+                // record that found ring room would overtake this one.
+                const io = x.engine.io;
                 if (comptime builtin.is_test) if (test_room_canceled) |h| h();
-                return freeRecord(rec.ptr);
+                io.recancel();
+                const prot = io.swapCancelProtection(.blocked);
+                defer _ = io.swapCancelProtection(prot);
+                const until = std.Io.Clock.awake.now(io).nanoseconds + cancel_post_wait_ns;
+                while (!x.hasRoom(need)) x.waitRoom(need, until) catch |e| switch (e) {
+                    error.Timeout => return freeRecord(rec.ptr),
+                    error.Canceled => unreachable, // protection is blocked
+                };
+                break;
             };
             _ = x.record_bytes.fetchAdd(rec.len, .monotonic);
             const pushed = x.ring.push(.{ .handle = 0, .rec = rec.ptr });

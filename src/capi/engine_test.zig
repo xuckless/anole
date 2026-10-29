@@ -1258,8 +1258,8 @@ fn drainCounts(c: *engine.Consumer, counts: *[64]u32, want: u32) !void {
 
 fn postMany(x: *engine.Exec, n: u32, posted: *std.atomic.Value(u32), stop: *const std.atomic.Value(bool)) std.Io.Cancelable!void {
     for (0..n) |_| {
-        // A canceled wait for room ends only that post: the test's stop
-        // ends the loop.
+        // A canceled poster still waits for room, up to 1 s per record
+        // (`postRecord`): the test's stop ends the loop at once.
         if (stop.load(.acquire)) return;
         const rec = engine.newRecord(@sizeOf(abi.Event), .writable, 7) catch return;
         x.postRecord(rec, true);

@@ -105,6 +105,14 @@ breaking changes are listed anyway.
   that timed out, refuses `anole_db_tx_query`, `_exec`, `_commit` and
   `_rollback` with `ANOLE_E_GONE` at once, as documented. They were taken
   until the transaction's task had rolled it back.
+- C ABI: an executor task canceled while it waited for room in a full ring
+  (the consumer behind) dropped the event it was posting and swallowed the
+  cancel. Those posts include the terminal events (a WebSocket's,
+  WebTransport session's or raw connection's close), so the binding could
+  keep a handle that never ended, and the task's next wait missed its
+  cancel. The task now keeps waiting for room, uncancelably and for at most
+  1 s, so the event still arrives in order, and its cancel is passed on to
+  its next wait (#125).
 - Webhooks: on PostgreSQL, `hooks.messages` paged in the database's
   collation order (en_US, ICU) instead of by bytes, so caller-supplied ids
   such as `msg_D` and `msg_c` came back in a different order than on SQLite
