@@ -329,7 +329,7 @@ pub const Client = struct {
     /// Returns how many it closed.
     pub fn closeIdle(self: *Client) usize {
         var n: usize = 0;
-        for (self.pools.pools) |*p| n += p.closeIdle(self.gpa, self.io, &self.observer, null);
+        for (self.pools.pools) |*p| n += p.closeIdle(self.io, &self.observer, null);
         return n;
     }
 
@@ -364,7 +364,7 @@ pub const Client = struct {
     /// What the live console's /db entry shows.
     pub fn consoleInfo(self: *Client, w: *std.Io.Writer) !void {
         var open: usize = 0;
-        for (self.pools.pools) |*p| open += p.open;
+        for (self.pools.pools) |*p| open += p.openCount(self.io);
         try w.print("\"system\":\"smtp\",\"name\":\"{s}\",\"target\":\"{s}:{d}\",\"pools\":[{{\"open\":{d}}}]", .{ self.name, self.settings.host, self.settings.port, open });
     }
 
@@ -372,7 +372,7 @@ pub const Client = struct {
         const every: Duration = .{ .nanoseconds = @max(std.time.ns_per_s, @divTrunc(self.idle_timeout.nanoseconds, 2)) };
         while (true) {
             try self.io.sleep(every, .awake);
-            for (self.pools.pools) |*p| _ = p.closeIdle(self.gpa, self.io, &self.observer, self.idle_timeout);
+            for (self.pools.pools) |*p| _ = p.closeIdle(self.io, &self.observer, self.idle_timeout);
         }
     }
 
