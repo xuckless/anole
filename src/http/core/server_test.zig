@@ -4285,7 +4285,10 @@ test "sendFile: a download slower than timeouts.request completes" {
     const request_ms = 60;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const size: u64 = 8 * 1024 * 1024;
+    // Well above what loopback socket buffers can hold (tcp_wmem max 4 MiB
+    // here, and the client's receive buffer is capped below), so the server
+    // is still writing the body long after the request deadline.
+    const size: u64 = 32 * 1024 * 1024;
     {
         const file = try tmp.dir.createFile(io, "big.bin", .{});
         defer file.close(io);
@@ -4307,13 +4310,19 @@ test "sendFile: a download slower than timeouts.request completes" {
 
     const stream = try startRaw(io, &server, "GET /files/big.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
     defer stream.close(io);
+    if (builtin.os.tag != .windows) {
+        // A small receive buffer stops autotuning from soaking up the file,
+        // so the server cannot finish before the deadline.
+        const rcvbuf: c_int = 64 * 1024;
+        _ = std.c.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &rcvbuf, @sizeOf(c_int));
+    }
     var read_buf: [64 * 1024]u8 = undefined;
     var reader = stream.reader(io, &read_buf);
     const start = std.Io.Clock.awake.now(io);
     var total: u64 = 0;
     var scratch: [1024 * 1024]u8 = undefined;
     while (true) {
-        // 1 MiB per 40 ms: the whole file takes over 5x the request timeout.
+        // 1 MiB per 40 ms: the whole file takes about 20x the request timeout.
         const n = reader.interface.readSliceShort(&scratch) catch break;
         total += n;
         if (n < scratch.len) break;
