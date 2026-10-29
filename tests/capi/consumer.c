@@ -3701,6 +3701,10 @@ static void test_abi07_rules(void) {
   CHECK(!ANOLE_ABI_COMPATIBLE(ANOLE_ABI_VERSION + 1));
   CHECK(!ANOLE_ABI_COMPATIBLE(ANOLE_ABI_VERSION - 1));
 
+  /* the library's version string export starts with a digit */
+  anole_str v = anole_version();
+  CHECK(v.len > 0 && v.ptr[0] >= '0' && v.ptr[0] <= '9');
+
   int have_sqlite = anole_has_feature(LIT("sqlite"));
   const char *json = have_sqlite
                          ? "{\"listeners\":[{\"port\":0}],\"databases\":[{\"name\":\"d\",\"sqlite\":{\"path\":\":memory:\"}}]}"
