@@ -441,7 +441,8 @@ pub const CallOptions = struct {
 
 /// What `Client.unary` returns: the status, and the response message when
 /// the status is OK. A failed call is a status, not an error; errors are
-/// for the call not being made at all.
+/// for the call not being made at all, and `error.Canceled` when the
+/// calling task is canceled (the call is then reset).
 pub fn UnaryResult(comptime Resp: type) type {
     return struct {
         status: Status,
