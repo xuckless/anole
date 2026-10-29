@@ -219,7 +219,7 @@ fn pipelineStage(cmd: bson.Document, n: usize) bson.Document {
     unreachable;
 }
 
-test "change stream: the aggregate carries the options, user stages and batch size; getMore its maxTimeMS; tokens are cached" {
+test "change stream: the aggregate and getMore carry the options, stages, batch size and maxTimeMS" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
@@ -250,6 +250,37 @@ test "change stream: the aggregate carries the options, user stages and batch si
     try testing.expectEqualStrings("insert", pipelineStage(agg, 1).getPath("$match.operationType").?.string);
     try testing.expectEqual(@as(i32, 5), agg.getPath("cursor.batchSize").?.int32);
 
+    // The third event comes from the getMore.
+    for (0..3) |_| _ = (try s.next()).?;
+    const more = fake.command(io, 1);
+    try testing.expectEqual(@as(i64, 250), more.get("maxTimeMS").?.int64);
+    try testing.expectEqualStrings("users", more.get("collection").?.string);
+}
+
+test "change stream: the resume token is the last event's _id, then the batch's postBatchResumeToken once the next read starts" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io, &.{
+        .{ .batch = .{ .ids = &.{ 1, 2 }, .pbrt = "p1" } },
+        .{ .batch = .{ .ids = &.{3}, .pbrt = "p2" } },
+        .{ .batch = .{ .ids = &.{}, .pbrt = "p3" } },
+    });
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+
+    var s = try client.collection("users").watch(cs.ChangeEvent, &c, .{.{ .@"$match" = .{ .operationType = "insert" } }}, .{
+        .full_document = .update_lookup,
+        .batch_size = 5,
+        .max_await = .fromMilliseconds(250),
+    });
+    defer s.deinit();
+
     // The _id of each event is the token, the batch's postBatchResumeToken
     // takes over at the end of the batch.
     const e1 = (try s.next()).?;
@@ -263,9 +294,6 @@ test "change stream: the aggregate carries the options, user stages and batch si
     // when the next read starts: the getMore.
     const e3 = (try s.next()).?;
     try testing.expectEqualStrings("t3", tokenData(e3._id));
-    const more = fake.command(io, 1);
-    try testing.expectEqual(@as(i64, 250), more.get("maxTimeMS").?.int64);
-    try testing.expectEqualStrings("users", more.get("collection").?.string);
     try testing.expect((try s.tryNext()) == null);
     tok = (try s.resumeToken(arena.allocator())).?;
     try testing.expectEqualStrings("p3", tokenData(tok));

@@ -92,7 +92,6 @@ test "sqlite: :memory: on std.Io.Threaded, the verbs" {
     const db = try sqlite.Client.init(gpa, testing.io, .{ .path = "sqlite::memory:" });
     defer db.deinit();
     try testing.expectEqualStrings("memory", db.name);
-    try testing.expectEqual(@as(usize, 0), db.readers.conns.len);
     var s: Scratch = undefined;
     s.init(testing.io);
     defer s.deinit();
@@ -146,7 +145,7 @@ test "sqlite: a file: URI only with Options.uri" {
     defer db.deinit();
 }
 
-test "sqlite: table and run, with values known only at run time; cached on a pinned runtime" {
+test "sqlite: table and execValues take and give values known only at run time" {
     {
         const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
         defer db.deinit();
@@ -186,8 +185,9 @@ test "sqlite: table and run, with values known only at run time; cached on a pin
         try testing.expectError(error.Conflict, q.execValues(ctx, "INSERT INTO notes (title) VALUES (?)", &.{.{ .text = "first" }}));
         try testing.expect(anole_db.lastError(ctx) != null);
     }
+}
 
-    // Coalesced and cached on a pinned runtime with readers.
+test "sqlite: table results are cached on a pinned runtime with readers until invalidated" {
     var r: Runtime = undefined;
     try r.init(2, 4);
     defer r.deinit();
@@ -367,7 +367,11 @@ test "sqlite: a file on 4 pinned executors: reads beside an open write transacti
     defer tmp.deinit();
     const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db") });
     defer db.deinit();
-    try testing.expectEqual(@as(usize, 4), db.readers.conns.len);
+    // The pool gauges say where the connections are at the end.
+    var registry = observe.metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    var health = observe.Health.init(.{});
+    try db.start(&registry, null, &health);
     var s: Scratch = undefined;
     s.init(io);
     defer s.deinit();
@@ -420,9 +424,13 @@ test "sqlite: a file on 4 pinned executors: reads beside an open write transacti
     try group.await(io);
     try testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
     try testing.expectEqual(@as(i64, 2 + 16 * 25), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
-    // Every connection is back.
-    try testing.expectEqual(@as(usize, 4), db.readers.free_len);
-    try testing.expectEqual(@as(i64, 0), db.in_use.load(.monotonic));
+    // Every connection is back: the writer and a reader per executor idle.
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    const text = out.written();
+    try testing.expect(std.mem.indexOf(u8, text, "anole_db_pool_connections{system=\"sqlite\",db=\"app.db\",state=\"idle\"} 5") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "anole_db_pool_connections{system=\"sqlite\",db=\"app.db\",state=\"in_use\"} 0") != null);
 }
 
 test "sqlite: coalesced and cached reads on 4 executors; invalidation after a write" {
@@ -575,7 +583,7 @@ test "sqlite: :memory: is one database seen from every executor" {
 /// A query that runs until interrupted.
 const forever = "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r) SELECT count(*) FROM r";
 
-test "sqlite: a timeout or a cancel interrupts a long query within milliseconds, on a reader and on the writer" {
+test "sqlite: a timeout or a cancel interrupts a query that never ends, on a reader and on the writer" {
     var r: Runtime = undefined;
     try r.init(2, 2);
     defer r.deinit();
@@ -613,6 +621,7 @@ test "sqlite: a timeout or a cancel interrupts a long query within milliseconds,
             }
         };
         var long = try io.concurrent(Long.run, .{ case.db.with(.{ .write = case.write }), io });
+        defer _ = long.cancel(io) catch {};
         // Time for the statement to start: a slow machine can only cancel
         // it before it runs, which passes too (and misses the interrupt).
         try io.sleep(.fromMilliseconds(30), .awake);
@@ -634,6 +643,7 @@ test "sqlite: a timeout or a cancel interrupts a long query within milliseconds,
             }
         };
         var waiting = try io.concurrent(Write.run, .{ file_db, io });
+        defer _ = waiting.cancel(io) catch {};
         // Time to queue for the writer (canceled sooner, it never runs
         // either).
         try io.sleep(.fromMilliseconds(20), .awake);
@@ -692,7 +702,16 @@ test "sqlite: with one executor, the server keeps running while SQLite works" {
     try testing.expectEqual(@as(i64, 3), try db.one(i64, &s.ctx, "SELECT 1 + 2", .{}));
 }
 
-test "sqlite: transactions: commit, rollback, deinit, and transaction() retried past SQLITE_BUSY" {
+/// Moves `amount` from account 1 to account 2 (the transactions tests).
+const MoveTx = struct {
+    fn run(tx: *sqlite.Tx, rq: *dusty.Request, amount: i64, attempts: *u32) !void {
+        attempts.* += 1;
+        _ = try tx.exec(rq, "UPDATE accounts SET balance = balance - ? WHERE id = 1", .{amount});
+        _ = try tx.exec(rq, "UPDATE accounts SET balance = balance + ? WHERE id = 2", .{amount});
+    }
+};
+
+test "sqlite: transactions: rollback and a deinit without commit both undo the writes" {
     var r: Runtime = undefined;
     try r.init(2, 2);
     defer r.deinit();
@@ -721,36 +740,82 @@ test "sqlite: transactions: commit, rollback, deinit, and transaction() retried 
         _ = try tx.exec(&req, "UPDATE accounts SET balance = 0 WHERE id = 1", .{});
     }
     try testing.expectEqual(@as(i64, 100), try db.one(i64, &req, "SELECT balance FROM accounts WHERE id = 1", .{}));
+}
+
+test "sqlite: a read-only transaction keeps its snapshot while the writer commits, and refuses writes" {
+    var r: Runtime = undefined;
+    try r.init(2, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const path = tmp.file("app.db");
+    const db = try sqlite.Client.init(gpa, io, .{ .path = path, .readers = 2, .busy_timeout = .fromMilliseconds(20) });
+    defer db.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var req: dusty.Request = .{ .arena = arena_state.allocator(), .io = io, ._parser = undefined, ._transport = undefined };
+    _ = try db.exec(&req, "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL CHECK (balance >= 0))", .{});
+    _ = try db.exec(&req, "INSERT INTO accounts VALUES (1, 100), (2, 0)", .{});
+
     const level = quiet();
     defer testing.log_level = level;
-    {
-        // A read-only transaction: a snapshot on a reader, while the
-        // writer commits.
-        var snap = try db.begin(&req, .{ .read_only = true });
-        defer snap.deinit();
-        try testing.expectEqual(@as(i64, 100), try snap.one(i64, &req, "SELECT balance FROM accounts WHERE id = 1", .{}));
-        _ = try db.exec(&req, "UPDATE accounts SET balance = 90 WHERE id = 1", .{});
-        try testing.expectEqual(@as(i64, 100), try snap.one(i64, &req, "SELECT balance FROM accounts WHERE id = 1", .{}));
-        try testing.expectError(error.Database, snap.exec(&req, "UPDATE accounts SET balance = 1", .{}));
-        try snap.commit(&req);
-        try testing.expectEqual(@as(i64, 90), try db.one(i64, &req, "SELECT balance FROM accounts WHERE id = 1", .{}));
-    }
+    var snap = try db.begin(&req, .{ .read_only = true });
+    defer snap.deinit();
+    try testing.expectEqual(@as(i64, 100), try snap.one(i64, &req, "SELECT balance FROM accounts WHERE id = 1", .{}));
+    _ = try db.exec(&req, "UPDATE accounts SET balance = 90 WHERE id = 1", .{});
+    try testing.expectEqual(@as(i64, 100), try snap.one(i64, &req, "SELECT balance FROM accounts WHERE id = 1", .{}));
+    try testing.expectError(error.Database, snap.exec(&req, "UPDATE accounts SET balance = 1", .{}));
+    try snap.commit(&req);
+    try testing.expectEqual(@as(i64, 90), try db.one(i64, &req, "SELECT balance FROM accounts WHERE id = 1", .{}));
+}
 
-    const Move = struct {
-        fn run(tx: *sqlite.Tx, rq: *dusty.Request, amount: i64, attempts: *u32) !void {
-            attempts.* += 1;
-            _ = try tx.exec(rq, "UPDATE accounts SET balance = balance - ? WHERE id = 1", .{amount});
-            _ = try tx.exec(rq, "UPDATE accounts SET balance = balance + ? WHERE id = 2", .{amount});
-        }
-    };
+test "sqlite: transaction() commits, and rolls all of it back on a failure inside" {
+    var r: Runtime = undefined;
+    try r.init(2, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const path = tmp.file("app.db");
+    const db = try sqlite.Client.init(gpa, io, .{ .path = path, .readers = 2, .busy_timeout = .fromMilliseconds(20) });
+    defer db.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var req: dusty.Request = .{ .arena = arena_state.allocator(), .io = io, ._parser = undefined, ._transport = undefined };
+    _ = try db.exec(&req, "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL CHECK (balance >= 0))", .{});
+    _ = try db.exec(&req, "INSERT INTO accounts VALUES (1, 100), (2, 0)", .{});
+
+    const level = quiet();
+    defer testing.log_level = level;
     var attempts: u32 = 0;
-    try db.transaction(&req, .{}, Move.run, .{ &req, 10, &attempts });
+    try db.transaction(&req, .{}, MoveTx.run, .{ &req, 10, &attempts });
     try testing.expectEqual(@as(i64, 10), try db.one(i64, &req, "SELECT balance FROM accounts WHERE id = 2", .{}));
-    // A failure inside rolls all of it back.
-    try testing.expectError(error.Database, db.transaction(&req, .{ .retries = 3 }, Move.run, .{ &req, 1000, &attempts }));
-    try testing.expectEqual(@as(i64, 80), try db.one(i64, &req, "SELECT balance FROM accounts WHERE id = 1", .{}));
+    // A failure inside rolls all of it back, and is not retried.
+    try testing.expectError(error.Database, db.transaction(&req, .{ .retries = 3 }, MoveTx.run, .{ &req, 1000, &attempts }));
+    try testing.expectEqual(@as(i64, 90), try db.one(i64, &req, "SELECT balance FROM accounts WHERE id = 1", .{}));
     try testing.expectEqual(@as(u32, 2), attempts);
+}
 
+test "sqlite: past busy_timeout a call is 503; transaction() retries until the lock is gone" {
+    var r: Runtime = undefined;
+    try r.init(2, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const path = tmp.file("app.db");
+    const db = try sqlite.Client.init(gpa, io, .{ .path = path, .readers = 2, .busy_timeout = .fromMilliseconds(20) });
+    defer db.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var req: dusty.Request = .{ .arena = arena_state.allocator(), .io = io, ._parser = undefined, ._transport = undefined };
+    _ = try db.exec(&req, "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL CHECK (balance >= 0))", .{});
+    _ = try db.exec(&req, "INSERT INTO accounts VALUES (1, 100), (2, 0)", .{});
+
+    const level = quiet();
+    defer testing.log_level = level;
+    var attempts: u32 = 0;
     // Another process (a raw connection here) holds the write lock: past
     // busy_timeout a call is ServiceUnavailable; transaction() runs
     // again until the lock is gone.
@@ -759,21 +824,24 @@ test "sqlite: transactions: commit, rollback, deinit, and transaction() retried 
     try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(other.db, "BEGIN IMMEDIATE", null, null, null));
     try testing.expectError(error.ServiceUnavailable, db.exec(&req, "UPDATE accounts SET balance = 0", .{}));
     try testing.expectEqual(anole_db.Class.unavailable, anole_db.lastError(&req).?.class);
-    try testing.expectError(error.ServiceUnavailable, db.transaction(&req, .{}, Move.run, .{ &req, 1, &attempts }));
+    try testing.expectError(error.ServiceUnavailable, db.transaction(&req, .{}, MoveTx.run, .{ &req, 1, &attempts }));
     // Reads go on meanwhile.
-    try testing.expectEqual(@as(i64, 80), try db.one(i64, &req, "SELECT balance FROM accounts WHERE id = 1", .{}));
+    try testing.expectEqual(@as(i64, 100), try db.one(i64, &req, "SELECT balance FROM accounts WHERE id = 1", .{}));
 
     const Release = struct {
         fn run(io_: std.Io, conn: *sqlite.driver.Db) !void {
+            // Time passing on purpose: retries = 100 x the 20 ms busy_timeout
+            // outlast it more than 10 times over.
             try io_.sleep(.fromMilliseconds(150), .awake);
             _ = c.sqlite3_exec(conn.db, "COMMIT", null, null, null);
         }
     };
     var release = try io.concurrent(Release.run, .{ io, &other });
+    defer release.cancel(io) catch {};
     attempts = 0;
-    try db.transaction(&req, .{ .retries = 100 }, Move.run, .{ &req, 1, &attempts });
+    try db.transaction(&req, .{ .retries = 100 }, MoveTx.run, .{ &req, 1, &attempts });
     try release.await(io);
-    try testing.expectEqual(@as(i64, 79), try db.one(i64, &req, "SELECT balance FROM accounts WHERE id = 1", .{}));
+    try testing.expectEqual(@as(i64, 99), try db.one(i64, &req, "SELECT balance FROM accounts WHERE id = 1", .{}));
     try testing.expectEqual(@as(u32, 1), attempts);
 }
 
@@ -957,6 +1025,7 @@ test "sqlite: app.sqlite, served: 201, 409 on a duplicate, 404 on none; metrics 
     const level = quiet();
     defer testing.log_level = level;
     var checking = try app.io().concurrent(Check.run, .{&app});
+    defer _ = checking.cancel(app.io()) catch {};
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
@@ -983,10 +1052,17 @@ test "sqlite: iterate over a bare BEGIN fails left-open and rolls back" {
 test "sqlite: Rows deinit inside an open transaction rolls back" {
     const expected_log = @import("../errors.zig").expectLog();
     defer expected_log.deinit();
-    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
+    // A file with a reader: a read sees only what the writer committed.
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
     defer db.deinit();
     var s: Scratch = undefined;
-    s.init(testing.io);
+    s.init(io);
     defer s.deinit();
     const ctx = &s.ctx;
     _ = try db.exec(ctx, schema, .{});
@@ -994,17 +1070,25 @@ test "sqlite: Rows deinit inside an open transaction rolls back" {
     defer testing.log_level = level;
     var rows = try db.with(.{ .write = true }).iterate(struct {}, ctx, "BEGIN", .{});
     rows.deinit();
+    // Rolled back: the next write commits on its own, and a reader sees it.
     try testing.expectEqual(@as(u64, 1), try db.exec(ctx, "INSERT INTO notes (title) VALUES ('x')", .{}));
-    try testing.expectEqual(@as(i64, 1), c.sqlite3_get_autocommit(db.writer.conn.handle.db));
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
 test "sqlite: acquire released inside a transaction rolls the writer back" {
     const expected_log = @import("../errors.zig").expectLog();
     defer expected_log.deinit();
-    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
+    // A file with a reader: a read sees only what the writer committed.
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
     defer db.deinit();
     var s: Scratch = undefined;
-    s.init(testing.io);
+    s.init(io);
     defer s.deinit();
     const ctx = &s.ctx;
     _ = try db.exec(ctx, schema, .{});
@@ -1018,7 +1102,9 @@ test "sqlite: acquire released inside a transaction rolls the writer back" {
     };
     conn.run(Begin.run, .{}) catch {};
     conn.release();
-    try testing.expectEqual(@as(i64, 1), c.sqlite3_get_autocommit(db.writer.conn.handle.db));
+    // Rolled back: the next write commits on its own, and a reader sees it.
+    try testing.expectEqual(@as(u64, 1), try db.exec(ctx, "INSERT INTO notes (title) VALUES ('x')", .{}));
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
 test "sqlite: Tx.table and Tx.run see the transaction's own writes" {

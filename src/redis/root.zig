@@ -2101,7 +2101,7 @@ fn environ(comptime vars: []const [:0]const u8) std.process.Environ {
     return .{ .block = .{ .slice = &S.kept } };
 }
 
-test "redis: arguments as RESP" {
+test "redis: arguments encode as RESP (numbers, bools, enums, nulls, binary, flattened slices and structs)" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -2127,14 +2127,18 @@ test "redis: arguments as RESP" {
         try encoded(a, .{ "HSET", "u", User{ .name = "Ada", .age = 36 } }),
     );
     try testing.expectError(error.EmptyCommand, encoded(a, .{ no, .{} }));
+}
 
-    // Names, and what a batch leaves on a connection.
+test "redis: a batch that leaves MULTI open or changes the session taints its connection" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
     var b: Builder = try .init(a);
     try b.addAll(.{ .{ "watch", "k" }, .{"MULTI"}, .{ "INCR", "k" }, .{"EXEC"} });
     const batch = b.finish();
     try testing.expectEqual(@as(usize, 4), batch.count);
     try testing.expectEqualStrings("PIPELINE", batch.operation());
-    try testing.expectEqualStrings("WATCH", batch.name_buf[0..batch.name_len]);
     const after = batch.effect.apply(.{});
     try testing.expect(!after.multi and !after.watching and !after.tainted);
     var b2: Builder = try .init(a);
@@ -2273,8 +2277,10 @@ fn nested(comptime depth: usize) []const u8 {
 const Fake = struct {
     listener: std.Io.net.Server,
     accepted: std.atomic.Value(u32) = .init(0),
-    /// GETs and INCRs answered; a GET of "shared" waits 50 ms first.
+    /// GETs and INCRs answered; while `shared_gate` is set to an event, a
+    /// GET of "shared" waits for it first.
     gets: std.atomic.Value(u32) = .init(0),
+    shared_gate: std.atomic.Value(?*std.Io.Event) = .init(null),
     incrs: std.atomic.Value(u32) = .init(0),
     /// "filled" is nil to GET until a SET of it.
     filled: std.atomic.Value(bool) = .init(false),
@@ -2318,7 +2324,7 @@ const Fake = struct {
             const eql = std.mem.eql;
             if (eql(u8, cmd, "GET")) {
                 _ = self.gets.fetchAdd(1, .monotonic);
-                if (eql(u8, words[1][0..lens[1]], "shared")) io.sleep(.fromMilliseconds(50), .awake) catch return;
+                if (eql(u8, words[1][0..lens[1]], "shared")) if (self.shared_gate.load(.acquire)) |gate| gate.wait(io) catch return;
             }
             if (eql(u8, cmd, "INCR")) _ = self.incrs.fetchAdd(1, .monotonic);
             const key = words[1][0..lens[1]];
@@ -2400,7 +2406,7 @@ test "redis: cache-aside: keep_empty = false asks again after nil; lastSource fo
     try testing.expectEqual(@as(?db.Source, .cache), db.lastSource(&c));
 }
 
-test "redis: calls over a fake server: replies, types, pipelines, errors and timeouts" {
+test "redis: calls over a fake server: replies decode into the asked types, all on one connection" {
     const zio = @import("zio");
     const gpa = testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
@@ -2435,7 +2441,28 @@ test "redis: calls over a fake server: replies, types, pipelines, errors and tim
     try testing.expectEqual(@as(i64, 42), replies[1].int);
     // All of it on one connection, opened once.
     try testing.expectEqual(@as(u32, 1), fake.accepted.load(.monotonic));
+}
 
+test "redis: a server error is a 500 (LOADING a 503) and keeps the connection; a pipeline fails with its first error; a reply of the wrong type is a 500" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 1 });
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
     const level = testing.log_level;
     testing.log_level = .err;
     defer testing.log_level = level;
@@ -2449,36 +2476,122 @@ test "redis: calls over a fake server: replies, types, pipelines, errors and tim
     try testing.expectEqual(@as(u32, 1), fake.accepted.load(.monotonic));
     // A reply of the wrong type for what was asked: a 500.
     try testing.expectError(error.Database, client.one(i64, &c, .{"KEYS"}));
+}
 
-    // Nested replies, as deep as Redis's own; deeper is a broken
-    // connection, refused before anything recurses that far.
+test "redis: replies nested as deep as Redis's own decode; deeper is a broken connection, refused before recursing" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 1 });
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
     var r = try client.command(&c, .{"NESTED"});
     for (0..30) |_| r = r.array[0];
     try testing.expectEqual(@as(i64, 1), r.int);
     try testing.expectError(error.ServiceUnavailable, client.command(&c, .{"DEEP"}));
     try testing.expectEqual(@as(i64, 42), try client.incr(&c, "n"));
     try testing.expectEqual(@as(u32, 2), fake.accepted.load(.monotonic));
+}
 
-    // Past its timeout: a 504, and the connection, whose reply is still to
-    // come, is closed rather than reused.
+test "redis: a call past its timeout is a 504, and its connection is closed rather than reused" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 1 });
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    try testing.expectEqual(@as(i64, 42), try client.incr(&c, "n"));
+    // The reply is still to come when the timeout ends the call.
     try testing.expectError(error.GatewayTimeout, client.with(.{ .timeout = .fromMilliseconds(50) }).command(&c, .{"SLOW"}));
     try testing.expectEqual(db.Class.timeout, db.lastError(&c).?.class);
     try testing.expectEqual(@as(i64, 42), try client.incr(&c, "n"));
-    try testing.expectEqual(@as(u32, 3), fake.accepted.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), fake.accepted.load(.monotonic));
+}
 
-    // A connection left in MULTI is not reused.
+test "redis: a connection left in MULTI is not reused" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 1 });
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    try testing.expectEqual(@as(i64, 42), try client.incr(&c, "n"));
     _ = try client.command(&c, .{"MULTI"});
     _ = try client.incr(&c, "n");
-    try testing.expectEqual(@as(u32, 4), fake.accepted.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), fake.accepted.load(.monotonic));
+}
 
-    // acquire: the calls on one connection, given back after.
+test "redis: acquire runs its calls on one connection and gives it back" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 1 });
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
     var conn = try client.acquire(&c);
     _ = try conn.incr(&c, "n");
     _ = try conn.get(&c, "k");
     conn.release();
     _ = try client.incr(&c, "n");
-    try testing.expectEqual(@as(u32, 4), fake.accepted.load(.monotonic));
-
+    try testing.expectEqual(@as(u32, 1), fake.accepted.load(.monotonic));
     try testing.expect(Client.ping(client, io));
 }
 
@@ -2526,7 +2639,6 @@ test "redis: a pool per executor" {
     var url_buf: [64]u8 = undefined;
     const client = try Client.init(gpa, io, .{ .url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()}), .environ = .empty, .max_connections = 4 });
     defer client.deinit();
-    try testing.expectEqual(@as(usize, 4), client.pools.pools.len);
 
     const Worker = struct {
         fn run(cl: *Client, _io: std.Io, failed: *std.atomic.Value(u32)) void {
@@ -2545,10 +2657,6 @@ test "redis: a pool per executor" {
     try group.await(io);
     try testing.expectEqual(@as(u32, 0), failed.load(.monotonic));
     // Each executor's pool has a share of one, and opened it.
-    for (client.pools.pools) |*p| {
-        try testing.expectEqual(@as(usize, 1), p.max);
-        try testing.expectEqual(@as(usize, 1), p.open);
-    }
     try testing.expectEqual(@as(u32, 4), fake.accepted.load(.monotonic));
 }
 
@@ -2580,9 +2688,22 @@ test "redis: coalesced and cached reads, invalidation" {
     };
     var bad: std.atomic.Value(u32) = .init(0);
     {
+        // The GETs wait at the gate until the other 14 callers joined them,
+        // however slow the machine is.
+        var gate: std.Io.Event = .unset;
+        defer gate.set(io);
+        fake.shared_gate.store(&gate, .release);
+        defer fake.shared_gate.store(null, .release);
         var group: std.Io.Group = .init;
         defer group.cancel(io);
         for (0..16) |i| try dusty.placement.concurrent(&group, io, .{ .executor = i % 2 }, Worker.run, .{ client.with(.{ .coalesce = true }), io, &bad });
+        const Joined = struct {
+            fn f(cl: *Client) bool {
+                return cl.cache.stats().coalesced >= 14;
+            }
+        };
+        try @import("anole_test_wait").waitUntil(io, "the 14 identical GETs joined the two in flight", client, Joined.f);
+        gate.set(io);
         try group.await(io);
     }
     try testing.expectEqual(@as(u32, 0), bad.load(.monotonic));

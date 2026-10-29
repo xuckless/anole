@@ -31,7 +31,7 @@ pub fn mongoHashedPassword(arena: std.mem.Allocator, username: []const u8, passw
     return arena.dupe(u8, &hex);
 }
 
-test "MongoDB's hashed password (auth.md)" {
+test "SCRAM-SHA-1 over MongoDB's hashed password matches the auth spec's vector" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

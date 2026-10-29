@@ -2066,8 +2066,7 @@ fn environ(comptime vars: []const [:0]const u8) std.process.Environ {
     return .{ .block = .{ .slice = &S.kept } };
 }
 
-test "pg: settings from a URL, the PG* variables and the defaults" {
-    if (@TypeOf(std.process.Environ.empty.block) != std.process.Environ.PosixBlock) return error.SkipZigTest;
+test "pg: settings: libpq's defaults, a full URL and a Unix socket; the password stays out of the printed URL" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2105,15 +2104,30 @@ test "pg: settings from a URL, the PG* variables and the defaults" {
     try testing.expectEqualStrings("worker", sock.database);
     try testing.expectEqualStrings("postgres://worker@/var/run/postgresql/.s.PGSQL.5433/worker", try std.fmt.bufPrint(&buf, "{f}", .{sock}));
 
+    // sslmode and its need for TLS.
+    try testing.expect(!SslMode.prefer.needsTls() and SslMode.require.needsTls() and SslMode.verify_full.needsTls());
+}
+
+test "pg: settings: with a CA given in code the URL cannot turn the check off" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cw: Settings.Why = .{ .arena = arena };
+
     // A CA given in code: the URL cannot turn the check off.
     const ca: Options.Tls = .{ .ca = .system };
-    var cw: Settings.Why = .{ .arena = arena };
     try testing.expectEqual(SslMode.verify_full, (try Settings.parse(arena, .{ .environ = .empty, .url = "postgres://localhost/d", .tls = ca }, &cw)).sslmode);
     try testing.expectEqual(SslMode.verify_ca, (try Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d?sslmode=require", .tls = ca }, &cw)).sslmode);
     inline for (.{ "disable", "allow", "prefer" }) |mode| {
         try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d?sslmode=" ++ mode, .tls = ca }, &cw));
-        try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = environ(&.{"PGSSLMODE=" ++ mode}), .tls = ca }, &cw));
     }
+}
+
+test "pg: settings: insecure_skip_verify is TLS without checking, refused with a CA or an sslmode that verifies or disables" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cw: Settings.Why = .{ .arena = arena };
 
     // insecure_skip_verify: TLS without checking; refused with a CA or with
     // an sslmode that verifies or disables.
@@ -2121,6 +2135,12 @@ test "pg: settings from a URL, the PG* variables and the defaults" {
     try testing.expectEqual(SslMode.require, (try Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d", .tls = skip }, &cw)).sslmode);
     try testing.expectError(error.InvalidOptions, Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d", .tls = .{ .ca = .system, .insecure_skip_verify = true } }, &cw));
     try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = .empty, .url = "postgres://h/d?sslmode=verify-full", .tls = skip }, &cw));
+}
+
+test "pg: settings: the default sslmode and auth methods by host, and Options.sslmode under the URL's" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
     // No sslmode: verify-full for another host, prefer for this machine;
     // and the password goes in clear text or as MD5 only to a verified
@@ -2145,25 +2165,50 @@ test "pg: settings from a URL, the PG* variables and the defaults" {
         try testing.expectEqual(case[2], m.password and m.md5);
         try testing.expect(m.scram_sha_256 and m.none);
     }
-    try testing.expectEqual(SslMode.disable, (try Settings.resolve(arena, .{ .environ = environ(&.{"PGSSLMODE=disable"}), .url = "postgres://db.example.com/d" })).sslmode);
-    // Options.sslmode: over PGSSLMODE, under the URL's.
-    try testing.expectEqual(SslMode.require, (try Settings.resolve(arena, .{ .environ = environ(&.{"PGSSLMODE=disable"}), .url = "postgres://db.example.com/d", .sslmode = .require })).sslmode);
+    // Options.sslmode: under the URL's.
     try testing.expectEqual(SslMode.verify_ca, (try Settings.resolve(arena, .{ .environ = .empty, .url = "postgres://db.example.com/d?sslmode=verify-ca", .sslmode = .disable })).sslmode);
     try testing.expectEqual(SslMode.disable, (try Settings.resolve(arena, .{ .environ = .empty, .url = "postgres://db.example.com/d", .sslmode = .disable })).sslmode);
+}
+
+test "pg: settings: require_auth and channel_binding from the URL; require with a root certificate checks the chain" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
     // require_auth and channel_binding, from the URL or the variables
     const strict = try Settings.resolve(arena, .{ .environ = .empty, .url = "postgres://db.example.com/d?sslmode=prefer&require_auth=scram-sha-256&channel_binding=require" });
     try testing.expectEqual(pg.Conn.AuthMethods{ .none = false, .password = false, .md5 = false, .scram_sha_256 = true }, strict.authMethods());
     try testing.expectEqual(pg.Conn.ChannelBinding.require, strict.channel_binding);
     try testing.expectEqual(@as(usize, 0), strict.parameters.len);
-    const allowed = try Settings.resolve(arena, .{ .environ = environ(&.{ "PGREQUIREAUTH=md5", "PGCHANNELBINDING=disable" }), .url = "postgres://db.example.com/d?sslmode=require" });
-    try testing.expect(allowed.authMethods().md5 and !allowed.authMethods().scram_sha_256);
-    try testing.expectEqual(pg.Conn.ChannelBinding.disable, allowed.channel_binding);
 
     // require with a root certificate checks the chain, as in libpq.
     try testing.expectEqual(SslMode.verify_ca, (try Settings.resolve(arena, .{ .environ = .empty, .url = "postgres://h/d?sslmode=require&sslrootcert=ca.pem" })).sslmode);
     try testing.expect((try Settings.resolve(arena, .{ .environ = .empty, .url = "postgres://h/d?sslnegotiation=direct" })).direct_tls);
     try testing.expectEqualStrings("::1", (try Settings.resolve(arena, .{ .environ = .empty, .url = "postgres://[::1]:7/d" })).host);
+}
+
+test "pg: settings: the PG* variables fill in what the URL leaves out, DATABASE_URL is the URL" {
+    // Windows: std.process.Environ is not a POSIX block there, and environ()
+    // builds one (TODO: a Windows block builder for this test).
+    if (@TypeOf(std.process.Environ.empty.block) != std.process.Environ.PosixBlock) return error.SkipZigTest;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buf: [256]u8 = undefined;
+
+    // A CA in code: PGSSLMODE cannot turn the check off either.
+    const ca: Options.Tls = .{ .ca = .system };
+    var cw: Settings.Why = .{ .arena = arena };
+    inline for (.{ "disable", "allow", "prefer" }) |mode| {
+        try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = environ(&.{"PGSSLMODE=" ++ mode}), .tls = ca }, &cw));
+    }
+    // PGSSLMODE under Options.sslmode and the URL.
+    try testing.expectEqual(SslMode.disable, (try Settings.resolve(arena, .{ .environ = environ(&.{"PGSSLMODE=disable"}), .url = "postgres://db.example.com/d" })).sslmode);
+    try testing.expectEqual(SslMode.require, (try Settings.resolve(arena, .{ .environ = environ(&.{"PGSSLMODE=disable"}), .url = "postgres://db.example.com/d", .sslmode = .require })).sslmode);
+    // require_auth and channel_binding from the variables.
+    const allowed = try Settings.resolve(arena, .{ .environ = environ(&.{ "PGREQUIREAUTH=md5", "PGCHANNELBINDING=disable" }), .url = "postgres://db.example.com/d?sslmode=require" });
+    try testing.expect(allowed.authMethods().md5 and !allowed.authMethods().scram_sha_256);
+    try testing.expectEqual(pg.Conn.ChannelBinding.disable, allowed.channel_binding);
 
     // The variables fill in what the URL leaves out; DATABASE_URL is the URL.
     const env = environ(&.{ "PGHOST=pg.local", "PGPORT=6000", "PGUSER=svc", "PGPASSWORD=secret", "PGSSLMODE=require", "PGAPPNAME=batch" });
@@ -2178,6 +2223,17 @@ test "pg: settings from a URL, the PG* variables and the defaults" {
     try testing.expectEqual(SslMode.disable, mixed.sslmode);
     const url_env = try Settings.resolve(arena, .{ .environ = environ(&.{"DATABASE_URL=postgres://u:pw@from-env:5544/x"}) });
     try testing.expectEqualStrings("postgres://u@from-env:5544/x", try std.fmt.bufPrint(&buf, "{f}", .{url_env}));
+
+    // A bad variable is refused with its reason.
+    var why: Settings.Why = .{ .arena = arena };
+    try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = environ(&.{"PGPORT=x"}) }, &why));
+    try testing.expectEqualStrings("PGPORT \"x\" is not a port number", why.text.?);
+}
+
+test "pg: settings: a bad URL is refused with its reason, the password never in it" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
     // Refused, with the reason (logged by `resolve`).
     const Bad = struct { []const u8, []const u8 };
@@ -2199,9 +2255,6 @@ test "pg: settings from a URL, the PG* variables and the defaults" {
         try testing.expect(std.mem.indexOf(u8, why.text.?, bad[1]) != null);
         try testing.expect(std.mem.indexOf(u8, why.text.?, "hunter2") == null);
     }
-    var why: Settings.Why = .{ .arena = arena };
-    try testing.expectError(error.InvalidDatabaseUrl, Settings.parse(arena, .{ .environ = environ(&.{"PGPORT=x"}) }, &why));
-    try testing.expectEqualStrings("PGPORT \"x\" is not a port number", why.text.?);
 }
 
 test "pg: SQLSTATEs to classes" {
@@ -2299,20 +2352,21 @@ test "pg: column values into Zig types" {
     try testing.expectEqualSlices(i32, &.{ 7, 8 }, try decode([]i32, V.of(&array), 1007, arena));
 }
 
-test "pg: parameters, operation names, BEGIN" {
-    const P = Params(@TypeOf(.{ @as(i64, 1), db.Time.fromSeconds(1), @as(?db.Time, null), "x" }));
-    try testing.expect(@typeInfo(P).@"struct".field_types[1] == i64);
-    try testing.expect(@typeInfo(P).@"struct".field_types[2] == ?i64);
+test "pg: params binds a Time as microseconds" {
     const p = params(.{ @as(i64, 1), db.Time.fromSeconds(1), @as(?db.Time, db.Time.fromMicros(5)), "x" });
     try testing.expectEqual(@as(i64, 1_000_000), p[1]);
     try testing.expectEqual(@as(?i64, 5), p[2]);
     _ = params(.{});
+}
 
+test "pg: the operation name for metrics and spans is the first keyword, upper-case; QUERY after a comment" {
     var buf: [16]u8 = undefined;
     try testing.expectEqualStrings("SELECT", operation(&buf, "  select id FROM posts"));
     try testing.expectEqualStrings("WITH", operation(&buf, "\n(with x AS (SELECT 1) SELECT * FROM x)"));
     try testing.expectEqualStrings("QUERY", operation(&buf, "-- comment\nSELECT 1"));
+}
 
+test "pg: BEGIN carries the isolation level and READ ONLY" {
     var sql: [96]u8 = undefined;
     try testing.expectEqualStrings("BEGIN", beginSql(&sql, .{}));
     try testing.expectEqualStrings("BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY", beginSql(&sql, .{ .isolation = .serializable, .read_only = true }));
@@ -2331,10 +2385,8 @@ test "pg: no connection before a call, and a refused one is a 503 with its reaso
     // Port 1: nothing listens there.
     const d = try Client.init(gpa, io, .{ .url = "postgres://u@127.0.0.1:1/x?sslmode=disable", .environ = .empty, .max_connections = 3 });
     defer d.deinit();
-    try testing.expectEqual(@as(usize, 2), d.pools.pools.len);
-    try testing.expectEqual(@as(usize, 2), d.pools.pools[0].pool._conns.len);
-    try testing.expectEqual(@as(usize, 1), d.pools.pools[1].pool._conns.len);
-    for (d.pools.pools) |*s| try testing.expectEqual(@as(usize, 0), s.pool.stats().in_use);
+    // A pool per executor, 3 connections split 2 + 1, none opened yet.
+    try expectPools(d, io, &.{ .{ .max = 2, .open = 0, .in_use = 0 }, .{ .max = 1, .open = 0, .in_use = 0 } });
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -2345,9 +2397,33 @@ test "pg: no connection before a call, and a refused one is a 503 with its reaso
     try testing.expectStringStartsWith(detail.message, "cannot connect to postgres://u@127.0.0.1:1/x: ");
     try testing.expectError(error.ServiceUnavailable, d.one(i64, &c, "SELECT $1::int8", .{@as(i64, 1)}));
     // The slots the failed connects reserved were given back.
-    for (d.pools.pools) |*s| try testing.expectEqual(@as(usize, 0), s.pool.stats().in_use);
+    try expectPools(d, io, &.{ .{ .max = 2, .open = 0, .in_use = 0 }, .{ .max = 1, .open = 0, .in_use = 0 } });
     try testing.expect(!Client.ping(d, io));
+}
 
-    // Without TLS built in, `init` refuses these (and logs why).
-    try testing.expect(!SslMode.prefer.needsTls() and SslMode.require.needsTls() and SslMode.verify_full.needsTls());
+const PoolView = struct { max: i64, open: i64, in_use: i64 };
+
+/// The pools as the console's /db entry shows them (`consoleInfo`).
+fn expectPools(d: *Client, io: std.Io, want: []const PoolView) !void {
+    const Check = struct {
+        fn run(db_: *Client, want_: []const PoolView) !void {
+            var out: std.Io.Writer.Allocating = .init(testing.allocator);
+            defer out.deinit();
+            try out.writer.writeByte('{');
+            try db_.consoleInfo(&out.writer);
+            try out.writer.writeByte('}');
+            const v = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+            defer v.deinit();
+            const pools = v.value.object.get("pools").?.array.items;
+            try testing.expectEqual(want_.len, pools.len);
+            for (pools, want_) |p, w| {
+                try testing.expectEqual(w.max, p.object.get("max").?.integer);
+                try testing.expectEqual(w.open, p.object.get("open").?.integer);
+                try testing.expectEqual(w.in_use, p.object.get("in_use").?.integer);
+            }
+        }
+    };
+    // On a task of the runtime, as the console's collector calls it.
+    var f = try io.concurrent(Check.run, .{ d, want });
+    try f.await(io);
 }

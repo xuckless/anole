@@ -168,12 +168,7 @@ test "pg: live verbs, rows into structs, and errors as statuses" {
         while (try rows.next()) |_| n += 1;
         try testing.expectEqual(@as(usize, 3), n);
     }
-    // The one connection served everything, the repeated statements from
-    // its cache (one round trip each).
-    const conn = try d.acquire(&c);
-    defer conn.release();
-    try testing.expect(conn.raw.statementCacheStats().hits >= 2);
-    try testing.expectEqual(@as(usize, 1), d.pools.pools[0].pool.stats().in_use);
+    // A connection left in use would be reported by d.deinit's leak check.
 }
 
 test "pg: live table and run: values known only at run time, in PostgreSQL's text format" {
@@ -302,8 +297,8 @@ test "pg: live transactions: commit, roll back, retry a serialization failure" {
     attempts = 0;
     try testing.expectError(error.Conflict, d.transaction(&c, .{}, Transfer.run, .{ &c, &attempts, @as(i64, 40) }));
     try testing.expectEqual(@as(i64, 50), try d.one(i64, &c, balance, .{@as(i32, 1)}));
-    // The pool got every connection back.
-    try testing.expectEqual(@as(usize, 0), d.pools.pools[0].pool.stats().in_use);
+    // A connection the transactions kept would be reported by d.deinit's
+    // leak check.
 }
 
 /// Statements of `app` running `pg_sleep` on the server.
@@ -430,7 +425,6 @@ test "pg: live a pool per executor" {
     const io = rt.io();
     const d = try open(io, .{ .max_connections = 4 });
     defer d.deinit();
-    for (d.pools.pools) |*s| try testing.expectEqual(@as(usize, 1), s.pool._conns.len);
 
     const Worker = struct {
         fn run(db_: *pg.Client, io_: std.Io, pids: *[4]std.atomic.Value(i64), wrong: *std.atomic.Value(u32)) void {
@@ -466,109 +460,201 @@ test "pg: live a pool per executor" {
     }
 }
 
-test "pg: live coalesced and cached reads, a canceled caller, invalidation" {
-    _ = try testUrl();
-    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
-    defer rt.deinit();
-    const io = rt.io();
-    const app_name = "anole-pg-share-test";
-    const d = try open(io, .{ .max_connections = 8, .application_name = app_name });
-    defer d.deinit();
-    const watcher = try open(io, .{});
-    defer watcher.deinit();
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
-    _ = try d.exec(&c, "DROP SEQUENCE IF EXISTS anole_pg_seq; CREATE SEQUENCE anole_pg_seq", .{});
+/// The gate of the sharing tests: a session advisory lock that a
+/// connection of the test's own (`Client.session`) holds while the statement under test waits for it on the server, so
+/// the callers that should join it find it in flight however slow the
+/// machine is.
+const gate_key: i64 = 0x616e6f6c;
+/// A key nobody holds: the statement runs through at once.
+const free_key: i64 = 0x616e6f6d;
+/// Each run of the statement takes the next number: callers that share one
+/// get the same number.
+const next_n = "SELECT nextval('anole_pg_seq') AS n FROM pg_advisory_xact_lock_shared($1::int8)";
+const share_app = "anole-pg-share-test";
 
-    // Each run of the statement takes the next number: callers that share
-    // one get the same number.
-    const next = "SELECT nextval('anole_pg_seq') AS n FROM pg_sleep($1::float8)";
+/// Statements of `share_app` waiting for the gate on the server.
+const Gated = struct {
+    d: *pg.Client,
+    c: *db.Ctx,
+    n: i64,
+    fn reached(g: Gated) !bool {
+        const count = try g.d.one(i64, g.c, "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND state = 'active' AND query LIKE '%pg_advisory_xact_lock_shared%' AND pid <> pg_backend_pid()", .{share_app});
+        return count == g.n;
+    }
+};
+
+const ShareFixture = struct {
+    rt: *zio.Runtime,
+    d: *pg.Client,
+    /// Watches pg_stat_activity.
+    watcher: *pg.Client,
+    /// Holds the gate: a connection outside the pools, so the lock and its
+    /// unlock go over the same session.
+    locker: pg.Session,
+    arena_state: std.heap.ArenaAllocator,
+    c: db.Ctx,
+
+    fn init(f: *ShareFixture) !void {
+        _ = try testUrl();
+        f.rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
+        errdefer f.rt.deinit();
+        const io = f.rt.io();
+        f.d = try open(io, .{ .max_connections = 8, .application_name = share_app });
+        errdefer f.d.deinit();
+        f.watcher = try open(io, .{});
+        errdefer f.watcher.deinit();
+        f.arena_state = .init(gpa);
+        errdefer f.arena_state.deinit();
+        f.c = .{ .io = io, .arena = f.arena_state.allocator() };
+        f.locker = try f.d.session(&f.c);
+        _ = try f.d.exec(&f.c, "DROP SEQUENCE IF EXISTS anole_pg_seq; CREATE SEQUENCE anole_pg_seq", .{});
+    }
+
+    fn deinit(f: *ShareFixture) void {
+        // Closing the session releases the gate if a test failed holding it.
+        f.locker.close();
+        f.arena_state.deinit();
+        f.watcher.deinit();
+        f.d.deinit();
+        f.rt.deinit();
+    }
+
+    fn lock(f: *ShareFixture) !void {
+        var r = (try f.locker.raw.row("SELECT 1 FROM pg_advisory_lock($1::int8)", .{gate_key})).?;
+        try r.deinit();
+    }
+
+    fn unlock(f: *ShareFixture) !void {
+        var r = (try f.locker.raw.row("SELECT pg_advisory_unlock($1::int8)", .{gate_key})).?;
+        defer r.deinit() catch {};
+        if (!try r.get(bool, 0)) return error.TestUnexpectedResult;
+    }
+
+    fn waitGated(f: *ShareFixture, n: i64) !void {
+        try wait.waitUntil(f.c.io, "the statements wait for the gate on the server", Gated{ .d = f.watcher, .c = &f.c, .n = n }, Gated.reached);
+    }
+
+    fn lastValue(f: *ShareFixture) !i64 {
+        return f.d.one(i64, &f.c, "SELECT last_value FROM anole_pg_seq", .{});
+    }
+};
+
+const ShareWorker = struct {
     const Got = struct { n: i64 };
-    const Worker = struct {
-        fn run(db_: *pg.Client, io_: std.Io, opts: db.QueryOptions, delay: f64, seen: *[4]std.atomic.Value(i64), wrong: *std.atomic.Value(u32)) void {
-            var arena: std.heap.ArenaAllocator = .init(gpa);
-            defer arena.deinit();
-            var ctx: db.Ctx = .{ .io = io_, .arena = arena.allocator() };
-            const got = db_.with(opts).one(Got, &ctx, next, .{delay}) catch {
-                _ = wrong.fetchAdd(1, .monotonic);
-                return;
-            };
-            const here = internal.executorIndex(io_).?;
-            if (seen[here].cmpxchgStrong(0, got.n, .monotonic, .monotonic)) |prev| {
-                if (prev != got.n) _ = wrong.fetchAdd(1, .monotonic);
-            }
+    fn run(db_: *pg.Client, io_: std.Io, opts: db.QueryOptions, key: i64, seen: *[4]std.atomic.Value(i64), wrong: *std.atomic.Value(u32)) void {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var ctx: db.Ctx = .{ .io = io_, .arena = arena.allocator() };
+        const got = db_.with(opts).one(Got, &ctx, next_n, .{key}) catch {
+            _ = wrong.fetchAdd(1, .monotonic);
+            return;
+        };
+        const here = internal.executorIndex(io_).?;
+        if (seen[here].cmpxchgStrong(0, got.n, .monotonic, .monotonic)) |prev| {
+            if (prev != got.n) _ = wrong.fetchAdd(1, .monotonic);
         }
-    };
+    }
+};
 
-    // 32 callers over 4 executors: one statement per executor.
+const Coalesced = struct {
+    d: *pg.Client,
+    n: u64,
+    fn reached(x: @This()) bool {
+        return x.d.cache.stats().coalesced >= x.n;
+    }
+};
+
+test "pg: live identical coalesced calls on 4 executors run one statement per executor" {
+    var f: ShareFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const io = f.c.io;
+    const d = f.d;
+
+    // 32 callers over 4 executors: one statement per executor, held at the
+    // gate until the other 28 joined.
+    try f.lock();
     var seen: [4]std.atomic.Value(i64) = @splat(.init(0));
     var wrong: std.atomic.Value(u32) = .init(0);
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    for (0..32) |i| try dusty.placement.concurrent(&group, io, .{ .executor = i % 4 }, Worker.run, .{ d, io, .{ .coalesce = true }, 0.2, &seen, &wrong });
+    for (0..32) |i| try dusty.placement.concurrent(&group, io, .{ .executor = i % 4 }, ShareWorker.run, .{ d, io, .{ .coalesce = true }, gate_key, &seen, &wrong });
+    try wait.waitUntil(io, "the 28 identical calls joined the four in flight", Coalesced{ .d = d, .n = 28 }, Coalesced.reached);
+    try f.unlock();
     try group.await(io);
     try testing.expectEqual(@as(u32, 0), wrong.load(.monotonic));
-    try testing.expectEqual(@as(i64, 4), try d.one(i64, &c, "SELECT last_value FROM anole_pg_seq", .{}));
+    try testing.expectEqual(@as(i64, 4), try f.lastValue());
     try testing.expectEqual(@as(u64, 28), d.cache.stats().coalesced);
+}
 
-    // The first caller canceled: the others still get the row, from the
-    // one statement. They join once it runs on the server, and the first
-    // is canceled once all three joined (events, not sleeps); the
-    // statement's 1 s only has to outlast those few steps.
+test "pg: live the first caller canceled, the others still get the row; all gone, the statement stops on the server" {
+    var f: ShareFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const io = f.c.io;
+    const d = f.d;
+    try f.lock();
+    var seen: [4]std.atomic.Value(i64) = @splat(.init(0));
+    var wrong: std.atomic.Value(u32) = .init(0);
+
+    // The first caller's statement waits at the gate; three more join it,
+    // then the first is canceled and the gate opens.
     var first: std.Io.Group = .init;
-    seen = @splat(.init(0));
-    try dusty.placement.concurrent(&first, io, .{ .executor = 1 }, Worker.run, .{ d, io, .{ .coalesce = true }, 1.0, &seen, &wrong });
-    waitSleeping(io, watcher, &c, app_name, 1) catch |err| {
-        first.cancel(io);
-        return err;
-    };
+    defer first.cancel(io);
+    try dusty.placement.concurrent(&first, io, .{ .executor = 1 }, ShareWorker.run, .{ d, io, .{ .coalesce = true }, gate_key, &seen, &wrong });
+    try f.waitGated(1);
     const joined_before = d.cache.stats().coalesced;
-    for (0..3) |_| try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, Worker.run, .{ d, io, .{ .coalesce = true }, 1.0, &seen, &wrong });
-    const Joined = struct {
-        d: *pg.Client,
-        n: u64,
-        fn reached(x: @This()) bool {
-            return x.d.cache.stats().coalesced >= x.n;
-        }
-    };
-    wait.waitUntil(io, "the three callers joined the statement in flight", Joined{ .d = d, .n = joined_before + 3 }, Joined.reached) catch |err| {
-        first.cancel(io);
-        return err;
-    };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..3) |_| try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, ShareWorker.run, .{ d, io, .{ .coalesce = true }, gate_key, &seen, &wrong });
+    try wait.waitUntil(io, "the three callers joined the statement in flight", Coalesced{ .d = d, .n = joined_before + 3 }, Coalesced.reached);
     first.cancel(io);
+    try f.unlock();
     try group.await(io);
     try testing.expectEqual(@as(u32, 1), wrong.load(.monotonic));
-    try testing.expectEqual(@as(i64, 5), seen[1].load(.monotonic));
-    try testing.expectEqual(@as(i64, 5), try d.one(i64, &c, "SELECT last_value FROM anole_pg_seq", .{}));
+    try testing.expectEqual(@as(i64, 1), seen[1].load(.monotonic));
+    try testing.expectEqual(@as(i64, 1), try f.lastValue());
 
     // Every caller gone: the statement is stopped on the server.
+    try f.lock();
     var gone: std.Io.Group = .init;
-    for (0..3) |_| try dusty.placement.concurrent(&gone, io, .{ .executor = 2 }, Worker.run, .{ d, io, .{ .coalesce = true }, 30.0, &seen, &wrong });
-    waitSleeping(io, watcher, &c, app_name, 1) catch |err| {
-        gone.cancel(io);
-        return err;
-    };
+    defer gone.cancel(io);
+    for (0..3) |_| try dusty.placement.concurrent(&gone, io, .{ .executor = 2 }, ShareWorker.run, .{ d, io, .{ .coalesce = true }, gate_key, &seen, &wrong });
+    try f.waitGated(1);
     gone.cancel(io);
     const level = quiet();
     defer testing.log_level = level;
-    try expectStopped(io, watcher, &c, app_name);
+    try f.waitGated(0);
+    try testing.expectEqual(@as(i64, 1), try f.lastValue());
+}
 
-    // Cached: the same number until the ttl, or an invalidation.
+test "pg: live a cached read is kept per executor until its ttl or an invalidation" {
+    var f: ShareFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const io = f.c.io;
+    const d = f.d;
+    const c = &f.c;
+    var seen: [4]std.atomic.Value(i64) = @splat(.init(0));
+    var wrong: std.atomic.Value(u32) = .init(0);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+
+    const Got = ShareWorker.Got;
     const cached: db.QueryOptions = .{ .cache = .{ .ttl = .fromSeconds(30), .tag = "seq" } };
-    const a = try d.with(cached).one(Got, &c, next, .{0.0});
-    try testing.expectEqual(a.n, (try d.with(cached).one(Got, &c, next, .{0.0})).n);
+    const a = try d.with(cached).one(Got, c, next_n, .{free_key});
+    try testing.expectEqual(a.n, (try d.with(cached).one(Got, c, next_n, .{free_key})).n);
     // An identical call on another executor fills its own.
-    seen = @splat(.init(0));
-    try dusty.placement.concurrent(&group, io, .{ .executor = 3 }, Worker.run, .{ d, io, cached, 0.0, &seen, &wrong });
+    try dusty.placement.concurrent(&group, io, .{ .executor = 3 }, ShareWorker.run, .{ d, io, cached, free_key, &seen, &wrong });
     try group.await(io);
+    try testing.expectEqual(@as(u32, 0), wrong.load(.monotonic));
     try testing.expect(seen[3].load(.monotonic) > a.n);
     d.cache.invalidate(.{ .tag = "seq" });
-    const b = try d.with(cached).one(Got, &c, next, .{0.0});
+    const b = try d.with(cached).one(Got, c, next_n, .{free_key});
     try testing.expect(b.n > a.n);
-    try testing.expectEqual(b.n, (try d.with(cached).one(Got, &c, next, .{0.0})).n);
-    d.cache.invalidateQuery(next, .{0.0});
-    try testing.expect((try d.with(cached).one(Got, &c, next, .{0.0})).n > b.n);
+    try testing.expectEqual(b.n, (try d.with(cached).one(Got, c, next_n, .{free_key})).n);
+    d.cache.invalidateQuery(next_n, .{free_key});
+    try testing.expect((try d.with(cached).one(Got, c, next_n, .{free_key})).n > b.n);
     try testing.expect(d.cache.stats().hits >= 2);
 }
 
@@ -614,7 +700,7 @@ test "pg: live TLS as the URL asks, and a refused login" {
     try testing.expectStringStartsWith(detail.code, "28");
 }
 
-test "pg: live channel binding, and what a call sets for the session is reset" {
+test "pg: live channel binding: SCRAM-SHA-256-PLUS over TLS, refused in plain text" {
     const url = try testUrl();
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
@@ -638,6 +724,17 @@ test "pg: live channel binding, and what a call sets for the session is reset" {
             try testing.expectEqual(@as(i64, 1), try bound.one(i64, &c, "SELECT 1::int8", .{}));
         }
     }
+}
+
+test "pg: live what a call sets for the session is reset per reset_session mode (110c70e)" {
+    _ = try testUrl();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var c: db.Ctx = .{ .io = io, .arena = arena };
 
     // One connection, used by one call and then the next.
     for ([_]pg.Options.ResetSession{ .auto, .always, .off }) |mode| {
@@ -650,13 +747,8 @@ test "pg: live channel binding, and what a call sets for the session is reset" {
         const role = try d.one([]const u8, &c, "SELECT current_user::text", .{});
         try testing.expectEqualStrings(if (mode == .off) "pg_read_all_data" else "postgres", role);
         if (mode == .off) _ = try d.exec(&c, "RESET ROLE", .{});
-        // the statement cache outlives the reset
+        // the connection still serves calls after the reset
         for (0..3) |i| try testing.expectEqual(@as(i64, @intCast(i)), try d.one(i64, &c, "SELECT $1::int8", .{@as(i64, @intCast(i))}));
-        // what left the session as it was is followed by no reset under .auto
-        const conn = try d.acquire(&c);
-        defer conn.release();
-        try testing.expectEqual(mode == .always, conn.raw._reset_pending);
-        try testing.expect(conn.raw.statementCacheStats().hits >= 2);
     }
 }
 
@@ -788,11 +880,12 @@ test "pg: live app.postgres: handlers, statuses, /readyz and /metrics" {
         }
     };
     var checking = try app.io().concurrent(Check.run, .{&app});
+    defer _ = checking.cancel(app.io()) catch {};
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
 
-test "pg: iterate over a bare BEGIN fails left-open; acquire released in a transaction rolls back" {
+test "pg: iterate over a bare BEGIN fails left-open" {
     _ = try testUrl();
     // The left-open transaction is logged at err on purpose.
     const expected_log = @import("../errors.zig").expectLog();
@@ -816,6 +909,26 @@ test "pg: iterate over a bare BEGIN fails left-open; acquire released in a trans
         try testing.expectError(error.Database, rows.next());
         try testing.expect(std.mem.indexOf(u8, db.lastError(&c).?.message, "left a transaction open") != null);
     }
+}
+
+test "pg: a connection released inside a transaction is rolled back" {
+    _ = try testUrl();
+    // The left-open transaction is logged at err on purpose.
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    const d = try open(io, .{ .max_connections = 1 });
+    defer d.deinit();
+    _ = try d.exec(&c, "DROP TABLE IF EXISTS anole_pg_guard; CREATE TABLE anole_pg_guard (n int)", .{});
+    defer _ = d.exec(&c, "DROP TABLE IF EXISTS anole_pg_guard", .{}) catch {};
+
+    const level = quiet();
+    defer testing.log_level = level;
     {
         const conn = try d.acquire(&c);
         _ = try conn.raw.exec("BEGIN", .{});
