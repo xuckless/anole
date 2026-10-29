@@ -90,7 +90,7 @@ fn exchange(io: std.Io, addr: std.Io.net.IpAddress, request: []const u8, out: []
     return fw.buffered();
 }
 
-/// A dusty server on a loopback port with the /big and /echo routes.
+/// An HTTP core server on a loopback port with the /big and /echo routes.
 fn startServer(io: std.Io, server: *dusty.Server(void)) !std.Io.Future(anyerror!void) {
     server.router.get("/big", bigHandler);
     server.router.post("/echo", echoHandler);
