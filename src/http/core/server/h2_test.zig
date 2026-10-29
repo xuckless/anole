@@ -968,6 +968,11 @@ const CountingAllocator = struct {
 
 test "HTTP/2: a warm connection serves requests without allocating" {
     const io = std.testing.io;
+    // The release behaviour: a spare stream keeps its arena's memory (a
+    // test build frees it to poison it, an allocation per stream).
+    const safety = @import("anole_safety");
+    safety.arena_poisoning.store(false, .monotonic);
+    defer safety.arena_poisoning.store(true, .monotonic);
     var counting: CountingAllocator = .{ .inner = std.testing.allocator };
     var server = dusty.Server(void).init(counting.allocator(), io, .{
         .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},

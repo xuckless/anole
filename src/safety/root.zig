@@ -12,6 +12,9 @@
 //!   which never hands out an address twice, so a use after free faults.
 //! - `process_gpa`, `ProcessAllocator`: the checked allocator for code that
 //!   can't take `std.testing.allocator` (process-wide pools, the C ABI).
+//! - `poison`, `resetArena`: pool memory taken back and request arenas
+//!   reset are poisoned (M6), so memory kept past its owner reads 0xDD or
+//!   faults.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -86,6 +89,35 @@ var process_state: ProcessAllocator = .init(0x9e0c55a1);
 /// The process-wide `ProcessAllocator`, for process-wide pools whose memory
 /// is never all given back at one point (no leak check).
 pub const process_gpa: std.mem.Allocator = process_state.allocator();
+
+/// The byte freed pool memory is filled with (MSVC's "dead memory" byte):
+/// distinct from SafeAllocator's 0x55 and Zig's `undefined` 0xAA, so a crash
+/// says which mechanism freed it.
+pub const poison_byte: u8 = 0xDD;
+
+/// SAFETY.md M6: fills memory a pool takes back with `poison_byte`, so a
+/// pointer kept past its owner reads 0xDD rather than the old contents.
+/// Nothing outside Debug and test builds.
+pub inline fn poison(bytes: []u8) void {
+    if (enabled) @memset(bytes, poison_byte);
+}
+
+/// SAFETY.md M4/M6: resets a request or batch arena. In Debug and test
+/// builds every chunk goes back to the arena's child allocator
+/// (`.free_all`), which poisons it or makes it inaccessible, so a slice
+/// kept past its request reads poison or faults; otherwise `mode` as
+/// given (the retained capacity is the point of it in production).
+pub inline fn resetArena(arena: *std.heap.ArenaAllocator, mode: std.heap.ArenaAllocator.ResetMode) bool {
+    const free_all = enabled and (!builtin.is_test or arena_poisoning.load(.monotonic));
+    return arena.reset(if (free_all) .free_all else mode);
+}
+
+/// Test builds: whether `resetArena` frees the arena (on by default). A
+/// test whose claim is the release behaviour, such as a warm path that
+/// allocates nothing, turns it off for its run and back on after: freeing
+/// is an allocation per request there. Debug builds always free; release
+/// builds never look at it.
+pub var arena_poisoning: std.atomic.Value(bool) = .init(true);
 
 test {
     std.testing.refAllDecls(@This());

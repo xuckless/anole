@@ -1253,9 +1253,9 @@ const read_blocks = struct {
     fn give(b: []u8) void {
         std.debug.assert(b.len == read_block_len);
         _ = held.fetchSub(1, .monotonic);
-        // SAFETY.md M6: poisoned in Debug, so a reader left pointing at a
-        // returned block reads garbage at once rather than old frames.
-        if (builtin.mode == .debug) @memset(b, undefined);
+        // SAFETY.md M6: poisoned in Debug and test builds, so a reader left
+        // pointing at a returned block reads 0xDD rather than old frames.
+        safety.poison(b);
         if (free_len < cap) {
             free[free_len] = b.ptr;
             free_len += 1;

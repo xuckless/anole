@@ -918,6 +918,65 @@ test "Server: keepalive with request buffers given back between requests" {
     try std.testing.expectEqualStrings("third", resp3.body);
 }
 
+/// A handler that keeps a slice of its request's arena past its response,
+/// against SAFETY.md M4, and one on the next request that looks at it.
+const ArenaEscapeCtx = struct {
+    kept: ?[]const u8 = null,
+
+    const secret = "the first request's bytes";
+
+    fn keep(ctx: *ArenaEscapeCtx, req: *dusty.Request, res: *dusty.Response) !void {
+        ctx.kept = try req.arena.dupe(u8, secret);
+        res.body = "kept";
+    }
+
+    /// Whether the kept slice still reads the old request's bytes. In a
+    /// test build it reads the pool's poison (0xDD), or what this request
+    /// has put there since: the arena no longer lays out the same way.
+    fn look(ctx: *ArenaEscapeCtx, _: *dusty.Request, res: *dusty.Response) !void {
+        const kept = ctx.kept orelse return error.NothingKept;
+        res.body = if (std.mem.eql(u8, kept, secret)) "stale" else "gone";
+    }
+};
+
+test "Server: a slice of a request's arena kept past its response does not read that request's bytes on the next one" {
+    const io = std.testing.io;
+    var ctx: ArenaEscapeCtx = .{};
+    var server = dusty.Server(ArenaEscapeCtx).init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
+    defer server.deinit();
+    server.router.get("/keep", ArenaEscapeCtx.keep);
+    server.router.get("/look", ArenaEscapeCtx.look);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(ArenaEscapeCtx)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    const w = &writer.interface;
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const r = &reader.interface;
+    var status: [64]u8 = undefined;
+    var body: [32]u8 = undefined;
+
+    try w.writeAll("GET /keep HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.flush();
+    try std.testing.expectEqualStrings("kept", (try readResponse(r, &status, &body)).body);
+
+    // The same connection, so the same request buffers and arena.
+    try w.writeAll("GET /look HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.flush();
+    try std.testing.expectEqualStrings("gone", (try readResponse(r, &status, &body)).body);
+}
+
 /// Serves `/a`, `/b` and `/c` with their names, `/b` from its request body
 /// and `/a` for any method without reading one. What a pipelining test
 /// needs: enough routes to tell the responses apart, and bodies read and
