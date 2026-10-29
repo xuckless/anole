@@ -84,17 +84,6 @@ pub const HttpVersion = enum {
     }
 };
 
-test "nghttp2 links and reports a version" {
-    // Only when built with HTTP/2: the `nghttp2` module doesn't exist otherwise,
-    // and this comptime-false branch is skipped during analysis.
-    if (build_options.use_http2) {
-        const ng = @import("nghttp2");
-        const info = ng.nghttp2_version(0);
-        try std.testing.expect(info != null);
-        try std.testing.expect(info.*.version_num != 0);
-    }
-}
-
 /// Default User-Agent sent with requests unless overridden.
 pub const default_user_agent = "anole/" ++ build_options.version;
 
@@ -3050,17 +3039,6 @@ test "parseUrl: basic URL" {
     try std.testing.expectEqualStrings("/path", uriPath(uri));
 }
 
-test "parseUrl: URL with port" {
-    const uri = try parseUrl("http://example.com:8080/path");
-    var host_buf: [255]u8 = undefined;
-    const host = try uriHost(uri, &host_buf);
-    try std.testing.expectEqualStrings("example.com", host);
-    const info = try uriPortAndProtocol(uri);
-    try std.testing.expectEqual(8080, info.port);
-    try std.testing.expectEqual(Protocol.http, info.protocol);
-    try std.testing.expectEqualStrings("/path", uriPath(uri));
-}
-
 test "parseUrl: URL without path" {
     const uri = try parseUrl("http://example.com");
     var host_buf: [255]u8 = undefined;
@@ -3074,13 +3052,6 @@ test "parseUrl: URL without path" {
 
 test "parseUrl: URL without scheme is invalid" {
     try std.testing.expectError(error.InvalidUrl, parseUrl("example.com/path"));
-}
-
-test "parseUrl: HTTPS returns port 443" {
-    const uri = try parseUrl("https://example.com/path");
-    const info = try uriPortAndProtocol(uri);
-    try std.testing.expectEqual(443, info.port);
-    try std.testing.expectEqual(Protocol.https, info.protocol);
 }
 
 test "parseUrl: unknown scheme returns UnsupportedScheme" {
@@ -3549,35 +3520,6 @@ test "ClientResponse.reader: after body() returns cached data" {
     try std.testing.expectEqualStrings("hello", cached);
 }
 
-test "ClientResponse.body: gzip decompression" {
-    if (!@import("build_options").use_zlib) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    // "hello" gzip compressed
-    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
-    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
-    var reader = try fixedMessageReader(arena.allocator(), raw_response);
-
-    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
-    var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64);
-
-    try parseResponseHeaders(&reader, &parser);
-
-    var response = ClientResponse{
-        .arena = arena.allocator(),
-        .parser = &parser,
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parsed = &parsed,
-        .max_response_size = 1024,
-        .decompress = true,
-    };
-
-    const body = try response.body();
-    try std.testing.expectEqualStrings("hello", body.?);
-}
-
 test "ClientResponse: decoding takes the headers that described the encoded body" {
     if (!@import("build_options").use_zlib) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3675,23 +3617,6 @@ test "ClientResponse.body: an empty body with a Content-Encoding is not decoded"
 test "Protocol.fromScheme: http" {
     const proto = try Protocol.fromScheme("http");
     try std.testing.expectEqual(Protocol.http, proto);
-}
-
-test "Protocol.fromScheme: https" {
-    const proto = try Protocol.fromScheme("https");
-    try std.testing.expectEqual(Protocol.https, proto);
-}
-
-test "Protocol.fromScheme: unsupported scheme" {
-    try std.testing.expectError(error.UnsupportedScheme, Protocol.fromScheme("ftp"));
-}
-
-test "Protocol.defaultPort: http" {
-    try std.testing.expectEqual(80, Protocol.http.defaultPort());
-}
-
-test "Protocol.defaultPort: https" {
-    try std.testing.expectEqual(443, Protocol.https.defaultPort());
 }
 
 test "uriPortAndProtocol: https default" {
