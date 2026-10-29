@@ -60,8 +60,14 @@ overflow: OverflowPolicy,
 /// The queue finishes once this many messages came; null: never.
 last: ?u64,
 /// Guards everything below.
+// SAFETY: NATS engine lock, outside the ranked wrappers until a single-owner
+// connection replaces the nesting (research/s15/retrofit-9-rest.md Q1): order
+// Outbound.mutex -> {Inbox.mutex, Registry.mutex} -> MessageQueue.mutex, never
+// the other way; held across no suspension but an inner lock's wait and its
+// own condition's wait.
 mutex: Io.Mutex = .init,
 /// Signaled when a message comes or the queue ends.
+// SAFETY: the condition of the NATS engine lock above (same order and rule).
 not_empty: Io.Condition = .init,
 /// The messages, oldest first.
 messages: std.Deque(Message) = .empty,

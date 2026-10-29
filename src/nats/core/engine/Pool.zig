@@ -91,13 +91,38 @@ pub fn count(pool: *Pool, io: Io) usize {
     return pool.len;
 }
 
+/// A change `update` made to the pool.
+pub const Change = struct {
+    kind: enum { discovered, removed },
+    address: ServerAddress,
+};
+
+/// The most changes one `update` makes: every discovered server removed,
+/// and as many discovered.
+pub const max_changes = 2 * Options.max_servers;
+
+/// What one `update` did.
+pub const Updated = struct {
+    /// In the caller's buffer, in order.
+    changes: []Change,
+    /// Servers named for the first time that found the pool full.
+    skipped: usize = 0,
+};
+
 /// Takes the `connect_urls` of an INFO: servers it names for the first
 /// time join the pool, as long as there is room, and discovered servers it
 /// no longer names leave, but the current one. An empty list changes
-/// nothing: a server outside a cluster sends none. `sink` hears of each
-/// change: `sink.discovered(address)` and `sink.removed(address)`.
-pub fn update(pool: *Pool, io: Io, urls: []const []const u8, sink: anytype) void {
-    if (urls.len == 0) return;
+/// nothing: a server outside a cluster sends none. Each change is noted in
+/// `changes` (`max_changes` long), for the caller to act on with the
+/// pool's lock let go (SAFETY.md L3).
+pub fn update(pool: *Pool, io: Io, urls: []const []const u8, changes: []Change) Updated {
+    std.debug.assert(changes.len >= max_changes);
+    var updated: Updated = .{ .changes = changes[0..0] };
+    if (urls.len == 0) return updated;
+    for (urls) |url| {
+        _ = ServerAddress.parse(url) catch log.debug("ignoring a server the cluster announced that is no address: {f}", .{server_error.printable(url)});
+    }
+    var n: usize = 0;
     pool.mutex.lockUncancelable(io);
     defer pool.mutex.unlock(io);
 
@@ -114,30 +139,31 @@ pub fn update(pool: *Pool, io: Io, urls: []const []const u8, sink: anytype) void
         if (pool.current) |c| {
             if (c > index) pool.current = c - 1;
         }
-        sink.removed(entry.address);
+        changes[n] = .{ .kind = .removed, .address = entry.address };
+        n += 1;
     }
 
     var added = false;
     for (urls) |url| {
-        const address = ServerAddress.parse(url) catch {
-            log.debug("ignoring a server the cluster announced that is no address: {f}", .{server_error.printable(url)});
-            continue;
-        };
+        const address = ServerAddress.parse(url) catch continue;
         if (pool.find(&address) != null) continue;
         if (pool.len == pool.entries.len) {
-            log.debug("the pool holds {d} servers: {f} not added", .{ pool.len, address });
+            updated.skipped += 1;
             continue;
         }
         pool.entries[pool.len] = .{ .address = address, .explicit = false };
         pool.len += 1;
         added = true;
-        sink.discovered(address);
+        changes[n] = .{ .kind = .discovered, .address = address };
+        n += 1;
     }
     if (added and pool.randomize) {
         const current = if (pool.current) |c| pool.entries[c].address else null;
         pool.shuffle(io);
         if (current) |address| pool.current = pool.find(&address);
     }
+    updated.changes = changes[0..n];
+    return updated;
 }
 
 /// Copies the servers the cluster announced into `buffer`, as many as fit.
@@ -153,14 +179,6 @@ pub fn discovered(pool: *Pool, io: Io, buffer: []ServerAddress) []ServerAddress 
     }
     return buffer[0..filled];
 }
-
-/// A sink that ignores the changes of `update`.
-pub const ignore_changes: IgnoreChanges = .{};
-
-pub const IgnoreChanges = struct {
-    pub fn discovered(_: IgnoreChanges, _: ServerAddress) void {}
-    pub fn removed(_: IgnoreChanges, _: ServerAddress) void {}
-};
 
 fn find(pool: *const Pool, address: *const ServerAddress) ?usize {
     for (pool.entries[0..pool.len], 0..) |*entry, index| {
@@ -218,6 +236,24 @@ fn parsedAll(comptime texts: []const []const u8) [texts.len]ServerAddress {
     for (texts, &result) |text, *a| a.* = parsed(text);
     return result;
 }
+
+/// `update`, with each change handed to `sink.discovered(address)` or
+/// `sink.removed(address)`.
+fn applyUpdate(pool: *Pool, io: Io, urls: []const []const u8, sink: anytype) void {
+    var changes: [max_changes]Change = undefined;
+    for (pool.update(io, urls, &changes).changes) |c| switch (c.kind) {
+        .discovered => sink.discovered(c.address),
+        .removed => sink.removed(c.address),
+    };
+}
+
+/// A sink that ignores the changes of `update`.
+const ignore_changes: IgnoreChanges = .{};
+
+const IgnoreChanges = struct {
+    fn discovered(_: *const IgnoreChanges, _: ServerAddress) void {}
+    fn removed(_: *const IgnoreChanges, _: ServerAddress) void {}
+};
 
 /// Records the changes of `update`, as `+host:port` and `-host:port`.
 const Recorder = struct {
@@ -296,24 +332,24 @@ test "INFO adds the servers it names and removes the discovered ones it no longe
     defer recorder.deinit();
 
     _ = pool.next(io);
-    pool.update(io, &.{ "127.0.0.1:14226", "127.0.0.1:14227", "127.0.0.1:14228", "[::1]:14229" }, &recorder);
+    applyUpdate(&pool, io, &.{ "127.0.0.1:14226", "127.0.0.1:14227", "127.0.0.1:14228", "[::1]:14229" }, &recorder);
     try expectPool(&pool, "127.0.0.1:14226 127.0.0.1:14227* 127.0.0.1:14228* [::1]:14229* ");
     try testing.expectEqualStrings("+127.0.0.1:14227 +127.0.0.1:14228 +[::1]:14229 ", recorder.text.items);
 
     // The same servers again, written otherwise: nothing changes.
     recorder.text.clearRetainingCapacity();
-    pool.update(io, &.{ "127.0.0.1:14227", "127.0.0.1:14228", "[0:0::1]:14229" }, &recorder);
+    applyUpdate(&pool, io, &.{ "127.0.0.1:14227", "127.0.0.1:14228", "[0:0::1]:14229" }, &recorder);
     try expectPool(&pool, "127.0.0.1:14226 127.0.0.1:14227* 127.0.0.1:14228* [::1]:14229* ");
     try testing.expectEqualStrings("", recorder.text.items);
 
     // A node left the cluster; the explicit server stays though unnamed.
-    pool.update(io, &.{ "127.0.0.1:14227", "[::1]:14229" }, &recorder);
+    applyUpdate(&pool, io, &.{ "127.0.0.1:14227", "[::1]:14229" }, &recorder);
     try expectPool(&pool, "127.0.0.1:14226 127.0.0.1:14227* [::1]:14229* ");
     try testing.expectEqualStrings("-127.0.0.1:14228 ", recorder.text.items);
 
     // An empty list, as from a server outside a cluster, removes nothing.
     recorder.text.clearRetainingCapacity();
-    pool.update(io, &.{}, &recorder);
+    applyUpdate(&pool, io, &.{}, &recorder);
     try expectPool(&pool, "127.0.0.1:14226 127.0.0.1:14227* [::1]:14229* ");
     try testing.expectEqualStrings("", recorder.text.items);
 }
@@ -323,14 +359,14 @@ test "the server of the current connection stays, though INFO no longer names it
     const servers = parsedAll(&.{"a:1"});
     var pool: Pool = try .init(testing.allocator, io, &servers, false);
     defer pool.deinit(testing.allocator);
-    pool.update(io, &.{ "b:2", "c:3" }, &ignore_changes);
+    applyUpdate(&pool, io, &.{ "b:2", "c:3" }, &ignore_changes);
     _ = pool.next(io);
     try testing.expectEqualStrings("b", pool.next(io).host());
     // A lame duck announces the others only.
-    pool.update(io, &.{"c:3"}, &ignore_changes);
+    applyUpdate(&pool, io, &.{"c:3"}, &ignore_changes);
     try expectPool(&pool, "a:1 b:2* c:3* ");
     try testing.expectEqualStrings("c", pool.next(io).host());
-    pool.update(io, &.{"c:3"}, &ignore_changes);
+    applyUpdate(&pool, io, &.{"c:3"}, &ignore_changes);
     try expectPool(&pool, "a:1 c:3* ");
     try testing.expectEqualStrings("c", pool.currentServer(io).?.host());
     try testing.expectEqualStrings("a", pool.next(io).host());
@@ -345,7 +381,7 @@ test "the pool holds 64 servers at most; addresses that do not parse are skipped
     var urls: [Options.max_servers + 10][]const u8 = undefined;
     for (&urls, &texts, 0..) |*u, *t, i| u.* = try std.fmt.bufPrint(t, "h{d}", .{i});
     urls[3] = "ws://h3";
-    pool.update(io, &urls, &ignore_changes);
+    applyUpdate(&pool, io, &urls, &ignore_changes);
     try testing.expectEqual(Options.max_servers, pool.count(io));
     try testing.expect(pool.find(&parsed("h3")) == null);
 }
@@ -357,7 +393,7 @@ test "discovered servers fill as much of a buffer as there is" {
     defer pool.deinit(testing.allocator);
     var buffer: [4]ServerAddress = undefined;
     try testing.expectEqual(0, pool.discovered(io, &buffer).len);
-    pool.update(io, &.{ "b:2", "c:3", "d:4" }, &ignore_changes);
+    applyUpdate(&pool, io, &.{ "b:2", "c:3", "d:4" }, &ignore_changes);
     const all = pool.discovered(io, &buffer);
     try testing.expectEqual(3, all.len);
     try testing.expectEqualStrings("b", all[0].host());
@@ -374,7 +410,7 @@ test "with randomize_servers new servers join anywhere, and the current one stay
     var texts: [40][8]u8 = undefined;
     var urls: [40][]const u8 = undefined;
     for (&urls, &texts, 0..) |*u, *t, i| u.* = try std.fmt.bufPrint(t, "n{d}", .{i});
-    pool.update(io, &urls, &ignore_changes);
+    applyUpdate(&pool, io, &urls, &ignore_changes);
     try testing.expectEqual(42, pool.count(io));
     try testing.expect(same(&pool.currentServer(io).?, &first));
 }

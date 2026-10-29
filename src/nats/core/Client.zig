@@ -602,13 +602,14 @@ pub fn drain(client: *Client, options: DrainOptions) DrainError!void {
             if (client.exit) |exit| if (exit == .lame_duck and !client.exit_taken) {
                 client.exit = null;
             };
-            log.debug("draining the client", .{});
             client.status = .draining;
             client.drain_phase = .subscriptions;
             client.changed.wake(io);
         }
         break :begin status;
     };
+    // Logged with no lock held (SAFETY.md L3).
+    if (status == .connected) log.debug("draining the client", .{});
     switch (status) {
         .connected => {},
         .draining => return error.ConnectionDraining,
@@ -1068,16 +1069,24 @@ fn closeWith(client: *Client, reason: CloseReason) void {
     const io = client.io;
     client.lifecycle.lockUncancelable(io);
     defer client.lifecycle.unlock(io);
-    client.mutex.lockUncancelable(io);
-    if (client.status != .closed) log.debug("closing the client", .{});
-    client.status = .closed;
-    if (client.close_reason == null) client.close_reason = reason;
-    if (client.exit == null) client.exit = .closed;
-    // Under the lock: the attempt lives on the manager's stack until it is
-    // untracked.
-    if (client.attempt) |attempt| attempt.stop(io);
-    client.changed.wake(io);
-    client.mutex.unlock(io);
+    const was_open, const attempt, const attempt_stream = under: {
+        client.mutex.lockUncancelable(io);
+        defer client.mutex.unlock(io);
+        const was_open = client.status != .closed;
+        client.status = .closed;
+        if (client.close_reason == null) client.close_reason = reason;
+        if (client.exit == null) client.exit = .closed;
+        // Under the lock: the attempt lives on the manager's stack until it
+        // is untracked, and `untrack` waits for the shutdown begun here.
+        const attempt = client.attempt;
+        const stream = if (attempt) |a| a.beginStop() else null;
+        client.changed.wake(io);
+        break :under .{ was_open, attempt, stream };
+    };
+    // With no lock held (SAFETY.md L2, L3): the log line, and the shutdown
+    // of the attempt's socket, a zio I/O call.
+    if (was_open) log.debug("closing the client", .{});
+    if (attempt_stream) |stream| attempt.?.finishStop(io, stream);
     // Before the outbound queue wakes them, requests learn why. After a
     // drain, the streams of requestMany keep what they received.
     if (reason == .drained) client.inbox.endDrained(io) else client.inbox.end(io, .closed);
