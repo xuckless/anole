@@ -269,7 +269,7 @@ const TestClient = struct {
         if (frame.*.hd.type == c.NGHTTP2_GOAWAY) self.goaway_error = frame.*.goaway.error_code;
         if (frame.*.hd.type == c.NGHTTP2_GOAWAY and self.goaway_count < self.goaways.len) {
             self.goaways[self.goaway_count] = frame.*.goaway.last_stream_id;
-            // Read by a test's helper thread (`releaseOnGoaway`).
+            // Read by a test's helper thread (`releaseOnFinalGoaway`).
             @atomicStore(usize, &self.goaway_count, self.goaway_count + 1, .release);
         }
         return 0;
@@ -923,14 +923,17 @@ fn awaitStreamsFreed(server: *dusty.Server(void), io: std.Io) !void {
     }.f);
 }
 
-/// Sets `gate` once `client` has taken a GOAWAY: a response held until the
-/// drain's notice reached the client is in flight through the drain,
-/// however slow the machine.
-fn releaseOnGoaway(io: std.Io, client: *const TestClient, gate: *std.Io.Event) std.Io.Cancelable!void {
+/// Sets `gate` once `client` has taken both of the drain's GOAWAYs: a
+/// response held until then is in flight through the whole drain, however
+/// slow the machine. Not on the first: the test client's nghttp2 session
+/// stops reading once it has a GOAWAY and no open stream
+/// (`nghttp2_session_want_read`), so a response that closed the stream
+/// before the final GOAWAY arrived would have that GOAWAY dropped unread.
+fn releaseOnFinalGoaway(io: std.Io, client: *const TestClient, gate: *std.Io.Event) std.Io.Cancelable!void {
     defer gate.set(io);
-    wait.waitUntil(io, "the client took the drain's GOAWAY notice", client, struct {
+    wait.waitUntil(io, "the client took the drain's final GOAWAY", client, struct {
         fn f(cl: *const TestClient) bool {
-            return @atomicLoad(usize, &cl.goaway_count, .acquire) >= 1;
+            return @atomicLoad(usize, &cl.goaway_count, .acquire) >= 2;
         }
     }.f) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
@@ -981,14 +984,14 @@ test "HTTP/2: a drain with a stream in flight sends a two-phase GOAWAY and finis
     try client.run();
     try std.testing.expectEqual(@as(u16, 200), client.get(warm).status);
 
-    // Start a request held until the drain's notice reached the client,
-    // then shut down while it runs.
+    // Start a request held until both of the drain's GOAWAYs reached the
+    // client, then shut down while it runs.
     Handlers.held_gate = .unset;
     const helds = Handlers.held_entered.load(.acquire);
     const id = try client.request("GET", "/held", null);
     try client.sendPending();
     try wait.waitAtLeast(io, "the held request's handler runs", &Handlers.held_entered, helds + 1);
-    var releaser = try io.concurrent(releaseOnGoaway, .{ io, &client, &Handlers.held_gate });
+    var releaser = try io.concurrent(releaseOnFinalGoaway, .{ io, &client, &Handlers.held_gate });
     defer releaser.cancel(io) catch {};
     var stopper = try io.concurrent(stopFixture, .{ &fx, io });
     defer stopper.await(io);
