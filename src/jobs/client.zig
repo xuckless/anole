@@ -102,7 +102,10 @@ pub const Client = struct {
     queues: []Queue,
     handlers: std.ArrayList(Handler) = .empty,
     crons: std.ArrayList(*CronEntry) = .empty,
-    held_mutex: std.Io.Mutex = .init,
+    /// The runs going on (`held`) and `next_seq`. A leaf: nothing is taken
+    /// under it. It also keeps each `JobBox.task` valid while a holder
+    /// cancels it: a run leaves `held` (`unhold`) before its task ends.
+    held_mutex: safety.Mutex(.leaf) = .init,
     /// The runs going on, by `JobBox.seq`.
     held: std.AutoArrayHashMapUnmanaged(u64, *JobBox) = .empty,
     /// The last `JobBox.seq` given out; under `held_mutex`.

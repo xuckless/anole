@@ -6,6 +6,7 @@
 //! Every call takes `c` (a request, a `*Job` or an `anole.db.Ctx`): it
 //! carries `io` and the `arena` that results live in.
 const std = @import("std");
+const safety = @import("anole_safety");
 const anole = @import("../root.zig");
 const dedup_mod = @import("dedup.zig");
 
@@ -570,7 +571,8 @@ fn advisoryKey(label: []const u8, prefix: []const u8) i64 {
 pub const Memory = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    mutex: std.Io.Mutex = .init,
+    /// Endpoints, messages and attempts. A leaf: nothing is taken under it.
+    mutex: safety.Mutex(.leaf) = .init,
     eps: std.StringArrayHashMapUnmanaged(Ep) = .empty,
     msgs: std.StringArrayHashMapUnmanaged(Msg) = .empty,
     atts: std.ArrayList(Att) = .empty,
