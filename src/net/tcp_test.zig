@@ -1673,3 +1673,35 @@ test "net tcp: a parked connection keeps no spare chunk after an owner send" {
         }
     }.run);
 }
+
+/// A connection paused for good, with a lifetime: the lifetime still ends
+/// it, with its reason.
+const PausedLife = struct {
+    var reason: std.atomic.Value(u32) = .init(99);
+    var closed: std.atomic.Value(u32) = .init(0);
+    pub fn data(c: *net.Conn, _: []const u8) !void {
+        c.pauseReading();
+    }
+    pub fn close(_: *net.Conn, r: net.CloseReason) void {
+        reason.store(@backingInt(r), .release);
+        _ = closed.fetchAdd(1, .release);
+    }
+};
+
+test "net tcp: a paused connection still ends at its lifetime, with reason lifetime" {
+    PausedLife.closed.store(0, .monotonic);
+    PausedLife.reason.store(99, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", PausedLife, .{ .lifetime = .fromMilliseconds(50) });
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            try s.writer().writeAll("a");
+            try s.writer().flush();
+            try waitFor(a.io(), &PausedLife.closed, 1);
+            try std.testing.expectEqual(@backingInt(net.CloseReason.lifetime), PausedLife.reason.load(.acquire));
+        }
+    }.run);
+}
