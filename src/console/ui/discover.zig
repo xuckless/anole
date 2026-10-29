@@ -180,7 +180,7 @@ test "discover: names sanitized" {
     try std.testing.expectEqual(@as(usize, max_name), sanitizeName(&buf, &long).len);
 }
 
-test "discover: default directories" {
+test "discover: the socket directory is XDG_RUNTIME_DIR/anole, /run/anole for root, else /tmp/anole-<uid>, TMPDIR/anole on macOS" {
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("/run/user/1000/anole", try defaultDir(&buf, .{ .xdg_runtime_dir = "/run/user/1000/", .uid = 1000 }));
     try std.testing.expectEqualStrings("/run/anole", try defaultDir(&buf, .{ .uid = 0 }));
@@ -202,7 +202,7 @@ test "discover: path fits 103 bytes" {
     try std.testing.expectError(error.DirTooLong, socketPath(&buf, &longdir, "api", 1));
 }
 
-test "discover: parseTarget" {
+test "discover: a target is a pid when all digits, a path when it has a slash or ends in .sock, else a name" {
     try std.testing.expect(parseTarget(null) == .any);
     try std.testing.expect(parseTarget("") == .any);
     try std.testing.expectEqual(@as(i32, 4821), parseTarget("4821").pid);

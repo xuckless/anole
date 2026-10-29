@@ -278,7 +278,7 @@ fn frame(t: i64, n: u32, s5: u32, hist: []const [2]u32) protocol.Stats {
     return .{ .mono_ms = t, .routes = routes, .conns = .{ .total = 5 } };
 }
 
-test "stats_window: bucket bounds" {
+test "stats_window: bucket 1 spans 16 to 20 us, bucket 96 ends at 2^28 us, and a bucket's midpoint lies halfway between its bounds" {
     try std.testing.expectEqual(@as(u64, 16), bucketBounds(1).lo_us);
     try std.testing.expectEqual(@as(u64, 20), bucketBounds(1).hi_us);
     try std.testing.expectEqual(@as(u64, 1) << 28, bucketBounds(96).hi_us);

@@ -190,7 +190,7 @@ fn fakeNow() i64 {
     return 0;
 }
 
-test "client: handshake, requests and frames over pipes" {
+test "client: the handshake reads the hello; requests carry increasing ids and their fields; garbage lines between frames are skipped" {
     // The console's terminal side is not on Windows yet (design D15): no pipes, no clock.
     if (!sys.supported) return error.SkipZigTest;
     const gpa = std.testing.allocator;

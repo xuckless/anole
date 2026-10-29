@@ -362,7 +362,11 @@ test "screen: full redraw after resize" {
     var w: std.Io.Writer = .fixed(&buf);
     try r.render(&next, true, false, &w);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "\x1b[H\x1b[J") != null);
-    try std.testing.expectEqual(@as(u16, 3), r.prev.cols);
+    // The renderer adopted the new size: the same screen again draws
+    // nothing but the frame marks.
+    var w2: std.Io.Writer = .fixed(&buf);
+    try r.render(&next, true, false, &w2);
+    try std.testing.expectEqualStrings("\x1b[?2026h\x1b[?25l\x1b[?2026l", w2.buffered());
 }
 
 test "screen: NO_COLOR frame has no colour SGR" {

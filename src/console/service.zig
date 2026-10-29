@@ -1036,8 +1036,8 @@ fn isoMsStatic(ms: i64) []const u8 {
 
 // ------------------------------------------------------------------ tests
 
-test "service: iso time" {
+test "service: isoMs writes UTC ISO 8601 with milliseconds that the client's parseIso reads" {
     var b: [32]u8 = undefined;
     try std.testing.expectEqualStrings("2026-10-23T09:41:07.415Z", isoMs(&b, 1792748467415));
-    try std.testing.expect(ui.app.parseIso("2026-10-23T09:41:07.415Z") != null);
+    try std.testing.expectEqual(@as(i64, 1792748467415), ui.app.parseIso("2026-10-23T09:41:07.415Z").?);
 }

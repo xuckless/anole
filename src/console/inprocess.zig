@@ -270,66 +270,36 @@ fn emitLine(self: *InProcess, scope: []const u8, line: []const u8) void {
     if (self.logs) |lr| lr.push(.info, scope, "", "", false, trimmed);
 }
 
-// ------------------------------------------------------- testable pieces
+// ------------------------------------------------------------------ tests
 
-/// For tests: captures lines written to `pipe_fd` the way the capture thread
-/// does, without touching descriptors 1 and 2.
-pub fn drainLines(gpa: std.mem.Allocator, logs: *logring.LogRing, scope: []const u8, pipe_fd: sys.fd_t) void {
-    var acc: std.ArrayList(u8) = .empty;
-    defer acc.deinit(gpa);
-    var buf: [1024]u8 = undefined;
-    while (true) {
-        const n = sys.read(pipe_fd, &buf) catch break;
-        if (n == 0) break;
-        var rest: []const u8 = buf[0..n];
-        while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
-            acc.appendSlice(gpa, rest[0..nl]) catch {};
-            logs.push(.info, scope, "", "", false, acc.items);
-            acc.clearRetainingCapacity();
-            rest = rest[nl + 1 ..];
-        }
-        acc.appendSlice(gpa, rest) catch {};
-    }
-}
-
-test "inprocess: dup2 over two pipes captures writes and restores them" {
-    if (!os.supported) return error.SkipZigTest;
-    // Two temporary descriptors stand in for 1 and 2; the real ones are
-    // never touched.
-    const a = try sys.pipe();
-    const target = try sys.pipe();
-    defer {
-        sys.close(a[0]);
-        sys.close(a[1]);
-        sys.close(target[0]);
-        sys.close(target[1]);
-    }
-    const saved = os.dup(target[1]);
-    defer sys.close(saved);
-    os.dup2(a[1], target[1]); // writes to target[1] now land in `a`
-    _ = try sys.write(target[1], "captured line\n");
-    os.dup2(saved, target[1]); // restored
-    _ = try sys.write(target[1], "after\n");
-    sys.setNonblock(a[0]);
-    sys.setNonblock(target[0]);
-    var buf: [64]u8 = undefined;
-    const n = try sys.read(a[0], &buf);
-    try std.testing.expectEqualStrings("captured line\n", buf[0..n]);
-    const m = try sys.read(target[0], &buf);
-    try std.testing.expectEqualStrings("after\n", buf[0..m]);
-
-    var lr = logring.LogRing.init(std.testing.allocator, 16 * 1024);
+test "inprocess: captured output becomes one log record per line, CR trimmed, empty lines skipped, a line over the log limit cut" {
+    const gpa = std.testing.allocator;
+    var lr = logring.LogRing.init(gpa, 1024 * 1024);
     defer lr.deinit();
-    var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_s = std.heap.ArenaAllocator.init(gpa);
     defer arena_s.deinit();
     var cur: logring.Cursors = undefined;
     lr.attachAtEnd(&cur);
-    _ = try sys.write(a[1], "one\ntwo\n");
-    drainLines(std.testing.allocator, &lr, "stdout", a[0]);
+    // The capture thread's line splitter (feedLines/emitLine), fed the way
+    // captureMain feeds it: reads that split lines anywhere.
+    var self: InProcess = .{ .gpa = gpa, .service = undefined, .logs = &lr, .on_closed = null, .ctx = null };
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(gpa);
+    feedLines(&self, &acc, "stdout", "one\r\ntw");
+    feedLines(&self, &acc, "stdout", "o\n\n\r\n");
+    const long = try gpa.alloc(u8, logring.max_text + 10);
+    defer gpa.free(long);
+    @memset(long, 'x');
+    feedLines(&self, &acc, "stderr", long);
+    try std.testing.expectEqual(@as(usize, 0), acc.items.len);
+
     var out: std.ArrayList(logring.Rec) = .empty;
     var dropped: u64 = 0;
     try lr.readNew(arena_s.allocator(), &cur, &out, &dropped);
-    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqual(@as(usize, 3), out.items.len);
     try std.testing.expectEqualStrings("stdout", out.items[0].scope);
+    try std.testing.expectEqualStrings("one", out.items[0].text);
     try std.testing.expectEqualStrings("two", out.items[1].text);
+    try std.testing.expectEqualStrings("stderr", out.items[2].scope);
+    try std.testing.expectEqual(@as(usize, logring.max_text), out.items[2].text.len);
 }

@@ -344,7 +344,21 @@ test "logring: a long record is cut at 16 KiB and one too big for the ring is sk
     var out: std.ArrayList(Rec) = .empty;
     var dropped: u64 = 0;
     try lr.readNew(a, &cur, &out, &dropped);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
     try std.testing.expectEqual(@as(usize, max_text), out.items[0].text.len);
+
+    // A ring whose share per executor is below one cut record: the record
+    // is skipped, not stored or counted as dropped.
+    var small = LogRing.init(std.testing.allocator, ring_count * 1024);
+    defer small.deinit();
+    var small_cur: Cursors = undefined;
+    small.attachAtEnd(&small_cur);
+    small.push(.err, "s", "", "", false, big);
+    var small_out: std.ArrayList(Rec) = .empty;
+    var small_dropped: u64 = 0;
+    try small.readNew(a, &small_cur, &small_out, &small_dropped);
+    try std.testing.expectEqual(@as(usize, 0), small_out.items.len);
+    try std.testing.expectEqual(@as(u64, 0), small_dropped);
 }
 
 test "logring: the tap keeps warn and error until a console watches, then every level" {
@@ -381,7 +395,7 @@ test "logring: the tap keeps warn and error until a console watches, then every 
     try std.testing.expectEqualStrings("now kept", out.items[0].text);
 }
 
-test "logring: filters" {
+test "logring: a filter matches by minimum level, scope, case-insensitive grep, route pattern and request id" {
     const r: Rec = .{ .time_ns = 0, .level = .warn, .json = false, .scope = "billing", .rid = "r1", .route = "/charges/:id", .text = "Retrying charge" };
     try std.testing.expect((Filter{ .level = .warn }).matches(r));
     try std.testing.expect(!(Filter{ .level = .err }).matches(r));

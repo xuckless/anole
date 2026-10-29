@@ -194,7 +194,7 @@ test "app golden: /db" {
     }
     _ = f.line("/db");
     f.snapshot(.db,
-        \\{"databases":[{"i":0,"system":"postgresql","name":"main","target":"db.internal:5432/app","pools":[{"max":8,"open":6,"idle":3,"in_use":3,"waiting":0},{"max":8,"open":8,"idle":0,"in_use":8,"waiting":2}]}]}
+        \\{"databases":[{"i":0,"system":"postgres","name":"main","target":"db.internal:5432/app","pools":[{"max":8,"open":6,"idle":3,"in_use":3,"waiting":0},{"max":8,"open":8,"idle":0,"in_use":8,"waiting":2}]}]}
     );
     try expectGolden("db", &f.app);
 }
@@ -379,7 +379,7 @@ test "app golden: not answering" {
     try expectGolden("not_answering", &f.app);
 }
 
-test "app golden: too small" {
+test "app: a window under 60x12 asks to be made larger" {
     const f = try fixture(.attach, true);
     defer {
         f.deinit();
@@ -394,7 +394,7 @@ test "app golden: too small" {
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "make the window at least 60x12") != null);
 }
 
-test "app: completion" {
+test "app: /re offers matching commands, Down moves the selection, Tab completes, a space closes the popup" {
     const f = try fixture(.attach, true);
     defer {
         f.deinit();
@@ -414,7 +414,7 @@ test "app: completion" {
     try std.testing.expectEqual(@as(usize, 0), f.app.popupItems().len);
 }
 
-test "app: history" {
+test "app: Up and Down walk the command history and end on an empty line" {
     const f = try fixture(.attach, true);
     defer {
         f.deinit();

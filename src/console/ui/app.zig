@@ -936,7 +936,7 @@ pub fn parseIso(s: []const u8) ?i64 {
     return ((days * 24 + h) * 60 + mi) * 60_000 + se * 1000 + ms;
 }
 
-test "app: parseIso" {
+test "app: parseIso reads UTC ISO 8601 timestamps to epoch milliseconds" {
     try std.testing.expectEqual(@as(i64, 0), parseIso("1970-01-01T00:00:00.000Z").?);
     try std.testing.expectEqual(@as(i64, 1_000_000_123), parseIso("1970-01-12T13:46:40.123Z").?);
     try std.testing.expectEqual(@as(i64, 1_792_748_222_004), parseIso("2026-10-23T09:37:02.004Z").?);
