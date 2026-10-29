@@ -7,6 +7,11 @@ breaking changes are listed anyway.
 
 ### Fixed
 
+- SSE: an event written through `EventStream.startSend` (the streaming
+  `EventWriter`) now encodes its data as `send` does. Data ending in a CR or
+  LF kept its last line break off the wire, so browsers delivered `"hi"` for
+  `"hi\n"`, and an event with no data wrote no `data:` line, so browsers
+  never dispatched it (#137).
 - C ABI: a crash when a binding thread answered, sent or polled while the
   server stopped. The call wakes an executor through the runtime, and the
   stop could free the runtime while that wake was still under way. The stop

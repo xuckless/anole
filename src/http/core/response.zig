@@ -117,7 +117,12 @@ pub const EventWriter = struct {
     fn finish(self: *EventWriter) std.Io.Writer.Error!void {
         try self.interface.flush();
         const out = &self.body.interface;
-        if (self.line_in_progress) try out.writeAll("\n");
+        // The last line ends the event. When nothing was written, or the
+        // last byte was a line break, that line is empty and still goes out,
+        // as `writeEvent` writes it: the peer then keeps the trailing break
+        // (WHATWG HTML 9.2.6), and dispatches an event with no data at all
+        // rather than dropping it.
+        try out.writeAll(if (self.line_in_progress) "\n" else "data: \n");
         try out.writeAll("\n");
         return out.flush();
     }
@@ -212,7 +217,8 @@ pub const EventStream = struct {
 /// The fields must not hold CR or LF (`EventStream.Options.validate`).
 pub fn writeEvent(w: *std.Io.Writer, data: []const u8, opts: EventStream.Options) std.Io.Writer.Error!void {
     try EventStream.sendFields(w, opts);
-    // A line per CR, LF or CRLF in `data`, as `EventWriter` splits it.
+    // A line per CR, LF or CRLF in `data`, as `EventWriter` splits it, and
+    // the last one even when empty, as `EventWriter.end` writes it.
     var rest = data;
     while (std.mem.indexOfAny(u8, rest, "\r\n")) |idx| {
         try w.print("data: {s}\n", .{rest[0..idx]});
