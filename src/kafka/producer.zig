@@ -936,8 +936,11 @@ pub const Producer = struct {
                     },
                 }
             }
+            // In the same section as the requeues: a sender that takes the
+            // next id afterwards numbers from zero.
+            if (reinit) self.resetPidLocked(generation);
         }
-        if (reinit) self.resetPid(generation);
+        if (reinit) testHold(self.io, .pid_reset);
         if (stale) {
             for (work, verdicts, 0..) |w, v, i| {
                 if (v != .retry or !v.retry) continue;
@@ -1095,19 +1098,16 @@ pub const Producer = struct {
         return .{ .id = r.id, .epoch = r.epoch };
     }
 
-    /// The producer id is no good (or its sequences are): ask for a new one
-    /// at the next send, and renumber every partition from zero. Ignored
-    /// when `seen` is not the current generation (someone already did).
-    fn resetPid(self: *Producer, seen: u32) void {
-        {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            if (self.generation != seen or self.pid < 0) return;
-            self.pid = -1;
-        }
-        testHold(self.io, .pid_reset);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+    /// Under `mutex`. The producer id is no good (or its sequences are):
+    /// ask for a new one at the next send and renumber every partition
+    /// from zero, in one step, so no sender numbers a batch under the new
+    /// id from the old sequence (franz-go resets the sequences under the
+    /// lock that installs the id; the Java producer's epoch bump is one
+    /// synchronized step). Ignored when `seen` is not the current
+    /// generation (someone already did).
+    fn resetPidLocked(self: *Producer, seen: u32) void {
+        if (self.generation != seen or self.pid < 0) return;
+        self.pid = -1;
         var ti = self.topics.valueIterator();
         while (ti.next()) |t| for (t.*.parts) |maybe| if (maybe) |a| {
             a.next_seq = 0;
