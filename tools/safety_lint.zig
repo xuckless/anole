@@ -18,6 +18,18 @@
 //!   write-before-read idiom and allowed.
 //! - C3: an `error.Canceled` caught and then carried on from, neither
 //!   returned nor re-armed (`recancel`).
+//! - L2 (L2/L4): a raw lock (`std.Io.Mutex`, `std.atomic.Mutex`,
+//!   `std.Io.Condition`, `std.Io.RwLock`) named outside `src/safety/`. The
+//!   debug checks see only the ranked `safety.Mutex/SpinLock/Condition`.
+//! - T5: in `src/capi/` and in files with an `export fn` (code foreign
+//!   threads call), a wake of a runtime task (`.set(io)` on an Event,
+//!   `futexWake`, `.signal`/`.broadcast`/`.unlock(io)`, `put`/`putOne` on
+//!   a Queue) outside `IoGate`, unless the enclosing function's doc comment
+//!   starts with the thread it runs on ("On the executor", "On the capi
+//!   task", "Run by the capi task", "On the run thread"). Wakes through
+//!   `Threaded` io wake consumer threads and are exempt.
+//!
+//! Any hit but DOC and PARSE is also allowed with a `// SAFETY:` reason.
 //!
 //! - DOC: a public doc comment (`///`, `//!`) that names dusty or the
 //!   core's build options (`use_http2`, `use_tls`); attribution lines and
@@ -40,7 +52,7 @@ const Token = std.zig.Token;
 const c_libs = [_]struct { modules: []const []const u8, files: []const []const u8 }{
     .{ .modules = &.{ "anole_nghttp2_c", "nghttp2" }, .files = &.{ "src/http/core/server/h2.zig", "src/http/core/client.zig", "src/h2/root.zig", "src/h2/client.zig" } },
     .{ .modules = &.{"anole_boringssl_c"}, .files = &.{ "src/tls/root.zig", "src/tls/dusty_tls.zig", "src/h3/root.zig" } },
-    .{ .modules = &.{ "anole_ngtcp2_c", "anole_nghttp3_c" }, .files = &.{ "src/h3/root.zig", "src/h3/ngtcp2.zig", "src/h3/nghttp3.zig", "src/h3/quic_tls.zig", "src/h3/client.zig", "src/h3/session_cache.zig", "src/h3/server.zig", "src/h3/bridge.zig", "src/h3/webtransport.zig", "src/h3/net.zig" } },
+    .{ .modules = &.{ "anole_ngtcp2_c", "anole_nghttp3_c" }, .files = &.{ "src/h3/root.zig", "src/h3/layout.zig", "src/h3/ngtcp2.zig", "src/h3/nghttp3.zig", "src/h3/quic_tls.zig", "src/h3/client.zig", "src/h3/session_cache.zig", "src/h3/server.zig", "src/h3/bridge.zig", "src/h3/webtransport.zig", "src/h3/net.zig" } },
     .{ .modules = &.{"anole_yyjson_c"}, .files = &.{"src/json/root.zig"} },
     .{ .modules = &.{"anole_hiredis_c"}, .files = &.{"src/redis/root.zig"} },
     .{ .modules = &.{"anole_upb_c"}, .files = &.{"src/capi/grpc_schema.zig"} },
@@ -202,6 +214,10 @@ const Lint = struct {
     fn_of: []const u32,
     /// The innermost statement holding each token, or `none`.
     stmt_of: []const u32,
+    /// T5 applies: a C ABI file, or one with an `export fn`.
+    t5: bool,
+    /// Tokens inside `IoGate` (T5's one place for foreign wakes).
+    in_gate: []const bool,
 
     fn text(self: *const Lint, i: usize) []const u8 {
         return self.tree.tokenSlice(@intCast(i));
@@ -341,6 +357,18 @@ fn lintFile(arena: std.mem.Allocator, path: []const u8, src: [:0]const u8, tests
         paint(stmt_of, stmts.items);
     }
 
+    const in_gate = try arena.alloc(bool, ntok);
+    @memset(in_gate, false);
+    for (0..tree.nodes.len) |k| {
+        const n: Node = @fromBackingInt(@intCast(k));
+        const vd = tree.fullVarDecl(n) orelse continue;
+        if (std.mem.eql(u8, tree.tokenSlice(vd.ast.mut_token + 1), "IoGate")) @memset(in_gate[tree.firstToken(n) .. tree.lastToken(n) + 1], true);
+    }
+    var t5 = std.mem.startsWith(u8, path, "src/capi/");
+    for (tree.tokens.items(.tag), 0..) |t, k| {
+        if (t == .keyword_export and k + 1 < ntok and tree.tokens.items(.tag)[k + 1] == .keyword_fn) t5 = true;
+    }
+
     var lint: Lint = .{
         .arena = arena,
         .path = path,
@@ -353,10 +381,12 @@ fn lintFile(arena: std.mem.Allocator, path: []const u8, src: [:0]const u8, tests
         .in_test = in_test,
         .fn_of = fn_of,
         .stmt_of = stmt_of,
+        .t5 = t5,
+        .in_gate = in_gate,
     };
     const wrapper = isWrapper(path);
 
-    // Token rules: U3, U1.
+    // Token rules: U3, U1, L2 (raw locks).
     for (0..ntok) |i| {
         if (!tests and in_test[i]) continue;
         const s = lint.text(i);
@@ -388,12 +418,15 @@ fn lintFile(arena: std.mem.Allocator, path: []const u8, src: [:0]const u8, tests
                 if (isLocalArrayDecl(&lint, i)) continue;
                 if (lint.hasSafetyComment(i)) continue;
                 try lint.hit(i, "U3", "undefined outside a local array declaration, without a // SAFETY: reason");
+            } else if (rawLock(&lint, i)) |what| {
+                if (startsWithAny(path, &unsafe_modules) or lint.hasSafetyComment(i)) continue;
+                try lint.hit(i + 2, "L2", try std.fmt.allocPrint(arena, "a raw {s}: use safety.Mutex/SpinLock/Condition with a rank (L2/L4)", .{what}));
             },
             else => {},
         }
     }
 
-    // Node rules: T1, C3.
+    // Node rules: T1, T5, C3.
     var buf1: [1]Node = undefined;
     for (0..tree.nodes.len) |k| {
         const n: Node = @fromBackingInt(@intCast(k));
@@ -409,6 +442,87 @@ fn lintFile(arena: std.mem.Allocator, path: []const u8, src: [:0]const u8, tests
             if (canceledComparison(&lint, f.ast.cond_expr)) |tok| try checkCanceled(&lint, tok, f.ast.then_expr);
         }
     }
+}
+
+/// L2/L4: `Io.Mutex`, `Io.Condition`, `Io.RwLock` or `atomic.Mutex` at
+/// token i (`Io`/`atomic`, the `std.` before it optional): the lock's name,
+/// or null.
+fn rawLock(l: *const Lint, i: usize) ?[]const u8 {
+    if (l.tag(i + 1) != .period or l.tag(i + 2) != .identifier) return null;
+    const ns = l.text(i);
+    const name = l.text(i + 2);
+    if (std.mem.eql(u8, ns, "Io")) {
+        for ([_][]const u8{ "Mutex", "Condition", "RwLock" }) |n| if (std.mem.eql(u8, name, n)) return switch (n[0]) {
+            'M' => "std.Io.Mutex",
+            'C' => "std.Io.Condition",
+            else => "std.Io.RwLock",
+        };
+    } else if (std.mem.eql(u8, ns, "atomic") and std.mem.eql(u8, name, "Mutex")) return "std.atomic.Mutex";
+    return null;
+}
+
+/// The thread names a C ABI function's doc comment starts with when it
+/// runs on the runtime's side (T5).
+const runtime_side = [_][]const u8{ "On the executor", "On the capi task", "Run by the capi task", "On the run thread" };
+
+/// T5: in a C ABI file (or one with an `export fn`), a wake of a runtime
+/// task goes through an `IoGate`, unless the function says it runs on the
+/// runtime's side. Wakes through `Threaded` io wake consumer threads.
+fn checkWake(l: *Lint, call: Ast.full.Call, name_tok: u32, recv: ?Node) !void {
+    const name = l.text(name_tok);
+    const params = call.ast.params;
+    const io_node: ?Node = if (std.mem.eql(u8, name, "futexWake"))
+        recv
+    else if (recv == null)
+        null
+    else if (std.mem.eql(u8, name, "set") or std.mem.eql(u8, name, "unlock"))
+        (if (params.len == 1) params[0] else null)
+    else if (std.mem.eql(u8, name, "signal") or std.mem.eql(u8, name, "broadcast") or std.mem.eql(u8, name, "putOne") or std.mem.eql(u8, name, "put"))
+        (if (params.len >= 1) params[0] else null)
+    else
+        null;
+    const io = io_node orelse return;
+    switch (ioKind(l, io)) {
+        .none, .threaded => return,
+        .runtime => {},
+    }
+    if (l.in_gate[name_tok]) return;
+    if (runtimeSide(l, name_tok)) return;
+    if (l.hasSafetyComment(name_tok)) return;
+    try l.hit(name_tok, "T5", try std.fmt.allocPrint(l.arena, "a runtime wake (.{s}) outside an IoGate, in a function whose doc comment does not say it runs on the executor", .{name}));
+}
+
+const IoKind = enum { none, runtime, threaded };
+
+/// Whether an expression is an `std.Io`: `io`, `rt_io`, `self.io`,
+/// `app.io()`; through `threadedIo()` or `Threaded` it is a consumer's.
+fn ioKind(l: *const Lint, n: Node) IoKind {
+    const a, const b = l.tokensOf(n);
+    const txt = l.src[l.starts[a] .. l.starts[b] + l.text(b).len];
+    if (std.mem.indexOf(u8, txt, "threadedIo") != null or std.mem.indexOf(u8, txt, "Threaded") != null) return .threaded;
+    // `x.io()`: the name before a final empty call.
+    var e = b;
+    if (l.tags[e] == .r_paren and e >= 1 and l.tags[e - 1] == .l_paren and e >= 2) e -= 2;
+    if (l.tags[e] != .identifier) return .none;
+    const id = l.text(e);
+    if (std.mem.eql(u8, id, "io") or std.mem.endsWith(u8, id, "_io") or std.mem.endsWith(u8, id, "Io")) return .runtime;
+    return .none;
+}
+
+/// The function holding token i has a doc comment starting with one of
+/// `runtime_side`.
+fn runtimeSide(l: *const Lint, i: u32) bool {
+    const f = l.fn_of[i];
+    if (f == none) return false;
+    var t = l.first(@fromBackingInt(@intCast(f)));
+    // The doc comment's first line is the earliest doc_comment token
+    // before the declaration.
+    var top: ?u32 = null;
+    while (t > 0 and l.tags[t - 1] == .doc_comment) : (t -= 1) top = t - 1;
+    const d = top orelse return false;
+    const line = std.mem.trim(u8, l.text(d)["///".len..], " ");
+    for (runtime_side) |p| if (std.mem.startsWith(u8, line, p)) return true;
+    return false;
 }
 
 /// `var|const name: [..]T = undefined` in a function, with `undefined` the
@@ -451,6 +565,7 @@ fn checkCall(l: *Lint, call_node: Node, call: Ast.full.Call) !void {
         else => return,
     };
     const name = l.text(name_tok);
+    if (l.t5) try checkWake(l, call, name_tok, recv);
     if (std.mem.eql(u8, name, "spawnInto")) {
         if (!std.mem.eql(u8, l.path, "src/http/core/placement.zig")) try l.hit(name_tok, "T1", "zio spawnInto outside placement.zig: use placement.concurrent");
         return;
@@ -692,6 +807,30 @@ test "lint: T1 a detached or never-joined thread" {
 
 test "lint: T1 a thread the file joins" {
     try expectFixture("t1_thread_joined");
+}
+
+test "lint: U1 src/h3/layout.zig is part of the ngtcp2/nghttp3 wrapper" {
+    try expectFixture("u1_layout");
+}
+
+test "lint: L2 raw locks outside src/safety" {
+    try expectFixture("l2_raw_lock");
+}
+
+test "lint: L2 the ranked wrappers may hold raw locks" {
+    try expectFixture("l2_safety");
+}
+
+test "lint: T5 runtime wakes in the C ABI go through IoGate" {
+    try expectFixture("t5_capi");
+}
+
+test "lint: T5 applies to a file with an export fn" {
+    try expectFixture("t5_export");
+}
+
+test "lint: T5 does not apply elsewhere" {
+    try expectFixture("t5_outside");
 }
 
 test "lint: C3 swallowed and handed-on cancels" {
