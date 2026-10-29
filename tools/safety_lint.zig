@@ -92,9 +92,7 @@ pub fn main(init: std.process.Init) !void {
     }.lt);
     for (files.items) |p| {
         const src = try cwd.readFileAllocOptions(io, p, arena, .unlimited, .of(u8), 0);
-        try docNames(arena, p, src, &hits);
-        if (!tests and isTestFile(p)) continue;
-        try lintFile(arena, p, src, tests, &hits);
+        try lintSource(arena, p, src, tests, &hits);
     }
     if (rules) |list| {
         var kept: usize = 0;
@@ -123,6 +121,14 @@ pub fn main(init: std.process.Init) !void {
     }
     try w.flush();
     if (hits.items.len > 0) std.process.exit(1);
+}
+
+/// Every rule over one file: DOC everywhere, the SAFETY.md rules outside
+/// test files.
+fn lintSource(arena: std.mem.Allocator, path: []const u8, src: [:0]const u8, tests: bool, hits: *std.ArrayList(Hit)) !void {
+    try docNames(arena, path, src, hits);
+    if (!tests and isTestFile(path)) return;
+    try lintFile(arena, path, src, tests, hits);
 }
 
 /// DOC: public doc comments speak Anole's names, not the HTTP core's
@@ -579,4 +585,105 @@ test "ruleListed: --rules matches whole rule names in a comma list" {
     try std.testing.expect(ruleListed("U3, DOC", "DOC"));
     try std.testing.expect(!ruleListed("DOC", "U3"));
     try std.testing.expect(!ruleListed("DO", "DOC"));
+}
+
+// Self-tests (TESTING.md Q5): each fixture under safety_lint/fixtures/ names
+// the path it is linted as on its first line (`// lint-path: src/...`) and
+// marks every line that must hit with `// expect: RULE [RULE...]`. A line
+// without a mark must not hit.
+
+const LineRule = struct {
+    line: usize,
+    rule: []const u8,
+
+    fn lessThan(_: void, a: LineRule, b: LineRule) bool {
+        if (a.line != b.line) return a.line < b.line;
+        return std.mem.lessThan(u8, a.rule, b.rule);
+    }
+};
+
+fn expectFixture(comptime name: []const u8) !void {
+    const src: [:0]const u8 = @embedFile("safety_lint/fixtures/" ++ name ++ ".zig");
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const first = src[0 .. std.mem.indexOfScalar(u8, src, '\n') orelse src.len];
+    const tag = "// lint-path: ";
+    if (!std.mem.startsWith(u8, first, tag)) return error.FixtureWithoutPath;
+    const path = first[tag.len..];
+
+    var want: std.ArrayList(LineRule) = .empty;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| {
+        n += 1;
+        const at = std.mem.indexOf(u8, line, "// expect: ") orelse continue;
+        var rules = std.mem.tokenizeScalar(u8, line[at + "// expect: ".len ..], ' ');
+        while (rules.next()) |r| try want.append(arena, .{ .line = n, .rule = r });
+    }
+    var hits: std.ArrayList(Hit) = .empty;
+    try lintSource(arena, path, src, false, &hits);
+    var got: std.ArrayList(LineRule) = .empty;
+    for (hits.items) |h| try got.append(arena, .{ .line = h.line, .rule = h.rule });
+    std.mem.sort(LineRule, want.items, {}, LineRule.lessThan);
+    std.mem.sort(LineRule, got.items, {}, LineRule.lessThan);
+    var same = want.items.len == got.items.len;
+    if (same) for (want.items, got.items) |a, b| {
+        if (a.line != b.line or !std.mem.eql(u8, a.rule, b.rule)) same = false;
+    };
+    if (same) return;
+    std.debug.print("fixture {s}: want", .{name});
+    for (want.items) |w| std.debug.print(" {d}:{s}", .{ w.line, w.rule });
+    std.debug.print("\n  got:", .{});
+    for (hits.items) |h| std.debug.print("\n    {d}: {s}: {s}", .{ h.line, h.rule, h.msg });
+    std.debug.print("\n", .{});
+    return error.FixtureMismatch;
+}
+
+test "lint: U3 casts, with and without a SAFETY reason" {
+    try expectFixture("u3_casts");
+}
+
+test "lint: U3 undefined, the local-array exemption" {
+    try expectFixture("u3_undefined");
+}
+
+test "lint: U3 is off in a wrapper module" {
+    try expectFixture("u3_wrapper");
+}
+
+test "lint: U1 C bindings and externs outside their wrapper" {
+    try expectFixture("u1");
+}
+
+test "lint: U1 a wrapper may import its binding" {
+    try expectFixture("u1_wrapper");
+}
+
+test "lint: T1 spawns, local Futures and Groups" {
+    try expectFixture("t1_spawn");
+}
+
+test "lint: T1 placement.zig wraps the std call" {
+    try expectFixture("t1_placement");
+}
+
+test "lint: T1 a detached or never-joined thread" {
+    try expectFixture("t1_thread");
+}
+
+test "lint: T1 a thread the file joins" {
+    try expectFixture("t1_thread_joined");
+}
+
+test "lint: C3 swallowed and handed-on cancels" {
+    try expectFixture("c3");
+}
+
+test "lint: DOC names in doc comments" {
+    try expectFixture("doc");
+}
+
+test "lint: a test file gets DOC only" {
+    try expectFixture("skipped_test");
 }
