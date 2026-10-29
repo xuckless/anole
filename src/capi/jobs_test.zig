@@ -323,6 +323,9 @@ test "capi jobs: enqueue with opts.req carries the request's traceparent, flags 
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{r.e.port(0)});
     var res: HttpResult = .{};
     var f = try io.concurrent(fetchTraced, .{ io, url, &res });
+    // A failure below must not leave the fetch running against this frame
+    // after the engine is gone; after the await this does nothing.
+    defer f.cancel(io) catch {};
     const ri = try r.ev.waitFor(.request, 0, 10000);
     const req = r.ev.list.items[ri].handle;
     try engine.jobs.enqueue(r.e, r.c, &.{jobOut("t.work", "{}")}, .{ .size = @sizeOf(abi.JobsEnqueueOptions), .req = req }, 11);
@@ -417,6 +420,10 @@ fn enqueueThenRespond(comptime proto: enum { h1, h2 }, reset: bool) !void {
     var f1: ?std.Io.Future(anyerror!void) = null;
     var f2: ?std.Io.Future(anyerror!void) = null;
     if (proto == .h1) f1 = try io.concurrent(fetchTraced, .{ io, url, &res }) else f2 = try io.concurrent(H2Get.run, .{ &g, io });
+    // A failure below must not leave the client running against this
+    // frame after the engine is gone; after the awaits these do nothing.
+    defer if (f1) |*f| f.cancel(io) catch {};
+    defer if (f2) |*f| f.cancel(io) catch {};
     const ri = try r.ev.waitFor(.request, 0, 10000);
     const req = r.ev.list.items[ri].handle;
 

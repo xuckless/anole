@@ -15,6 +15,7 @@
 //! the slot's executor as a command and applied there, in order; before
 //! the stream exists the commands wait in the slot.
 const std = @import("std");
+const builtin = @import("builtin");
 const anole = @import("../root.zig");
 const dusty = @import("dusty");
 const abi = @import("abi.zig");
@@ -635,6 +636,25 @@ fn awaitTopicChanges(e: *Engine, want: u32) std.Io.Cancelable!void {
     }
 }
 
+/// A test hook (test builds only): while `test_lane_hold` is set, every
+/// publish lane waits before it fans a publish out, until the test calls
+/// `release`, so a test can fill the lanes to their limit
+/// (`publishLimits`) without counting on timing.
+pub const LaneHold = struct {
+    released: std.atomic.Value(u32) = .init(0),
+
+    fn wait(h: *LaneHold, e: *Engine) std.Io.Cancelable!void {
+        while (h.released.load(.acquire) == 0) try e.io.futexWait(u32, &h.released.raw, 0);
+    }
+
+    /// Lets every held lane go (from any thread).
+    pub fn release(h: *LaneHold, e: *Engine) void {
+        h.released.store(1, .release);
+        e.wakeFutex(&h.released);
+    }
+};
+pub var test_lane_hold: if (builtin.is_test) ?*LaneHold else void = if (builtin.is_test) null else {};
+
 fn publishLane(e: *Engine, x: *Exec) std.Io.Cancelable!void {
     const st = &x.sse;
     const hub = e.sse_state.topics orelse return;
@@ -646,6 +666,11 @@ fn publishLane(e: *Engine, x: *Exec) std.Io.Cancelable!void {
         st.lane_head = p.next;
         if (st.lane_head == null) st.lane_tail = null;
         defer p.free();
+        if (comptime builtin.is_test) if (test_lane_hold) |h| h.wait(e) catch |err| {
+            st.lane_running = false;
+            st.dropLane();
+            return err;
+        };
         awaitTopicChanges(e, p.after) catch |err| {
             st.lane_running = false;
             st.dropLane();
