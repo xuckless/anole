@@ -22,13 +22,17 @@ pub const Series = struct {
     unsaved: *m.Family(m.Counter),
     leader: *m.Family(m.Gauge),
     cron_enqueued: *m.Family(m.Counter),
+    /// Guards `kinds` and `names`. A leaf spin lock: nothing is allocated
+    /// under it (SAFETY.md L5).
     lock: safety.SpinLock(.leaf) = .init,
+    /// Label sets: at most `max_labels` names each, sized at `init`, so a
+    /// put under `lock` never grows them. The names live until `deinit`.
     kinds: std.StringHashMapUnmanaged(void) = .empty,
     names: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, registry: *m.Registry) !Series {
         const buckets = [_]f64{ 0.01, 0.05, 0.1, 0.5, 1, 5, 30, 120, 600 };
-        return .{
+        var s: Series = .{
             .gpa = gpa,
             .enqueued = try registry.counter("anole_jobs_enqueued_total", "Jobs enqueued.", &.{ "queue", "kind" }),
             .duplicates = try registry.counter("anole_jobs_duplicates_total", "Enqueues answered with an existing unique job.", &.{ "queue", "kind" }),
@@ -41,6 +45,10 @@ pub const Series = struct {
             .leader = try registry.gauge("anole_jobs_leader", "1 while this process leads schedules and maintenance.", &.{}),
             .cron_enqueued = try registry.counter("anole_cron_enqueued_total", "Jobs enqueued by cron schedules.", &.{"name"}),
         };
+        try s.kinds.ensureTotalCapacity(gpa, max_labels);
+        errdefer s.kinds.deinit(gpa);
+        try s.names.ensureTotalCapacity(gpa, max_labels);
+        return s;
     }
 
     pub fn deinit(self: *Series) void {
@@ -51,17 +59,40 @@ pub const Series = struct {
         }
     }
 
-    fn cap(self: *Series, set: *std.StringHashMapUnmanaged(void), value: []const u8) []const u8 {
+    const Lookup = union(enum) { found: []const u8, full, missing };
+
+    fn lookup(self: *Series, set: *std.StringHashMapUnmanaged(void), value: []const u8) Lookup {
         self.lock.lock();
         defer self.lock.unlock();
-        if (set.getKey(value)) |k| return k;
-        if (set.count() >= max_labels) return "other";
+        if (set.getKey(value)) |k| return .{ .found = k };
+        if (set.count() >= max_labels) return .full;
+        return .missing;
+    }
+
+    /// The label for `value`: its own name while the set has room, else
+    /// "other". The name returned lives until `deinit`.
+    fn cap(self: *Series, set: *std.StringHashMapUnmanaged(void), value: []const u8) []const u8 {
+        switch (self.lookup(set, value)) {
+            .found => |k| return k,
+            .full => return "other",
+            .missing => {},
+        }
+        // A new label: copied before the lock is taken again (L5).
         const owned = self.gpa.dupe(u8, value) catch return "other";
-        set.put(self.gpa, owned, {}) catch {
-            self.gpa.free(owned);
-            return "other";
+        var kept = false;
+        self.lock.lock();
+        const out: []const u8 = if (set.getKey(value)) |k|
+            k // another thread added it meanwhile
+        else if (set.count() >= max_labels)
+            "other"
+        else blk: {
+            set.putAssumeCapacityNoClobber(owned, {});
+            kept = true;
+            break :blk owned;
         };
-        return owned;
+        self.lock.unlock();
+        if (!kept) self.gpa.free(owned);
+        return out;
     }
 
     pub fn onEnqueued(self: *Series, queue: []const u8, kind: []const u8, inserted: bool) void {
