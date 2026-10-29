@@ -593,73 +593,107 @@ test "Middleware: 429 with Retry-After once the bucket is empty" {
     try std.testing.expect(std.mem.indexOf(u8, last[0..last_len], "RateLimit-Remaining: 0") != null);
 }
 
-test "Middleware: a key of the request's choosing, and on_error" {
+/// A limiter whose every take fails, and a key function by the X-User header.
+const Broken = struct {
+    fn take(_: *anyopaque, _: []const u8, _: u32, _: Policy) anyerror!Result {
+        return error.ConnectionRefused;
+    }
+    fn byUser(req: *dusty.Request, _: []u8) []const u8 {
+        return req.headers.get("X-User") orelse "anonymous";
+    }
+};
+
+/// Static: the server keeps the slice past the fixture's `start`.
+const loopback_listeners = [_]dusty.Listener{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }};
+
+/// A server with /user/ (one request a minute per X-User, in memory),
+/// /allow/ (a failing limiter, default on_error) and /deny/ (a failing
+/// limiter, on_error = .deny).
+const KeyFixture = struct {
+    rt: *@import("zio").Runtime,
+    limiter: MemoryLimiter,
+    dummy: u8 = 0,
+    per_user: Middleware,
+    allow: Middleware,
+    deny: Middleware,
+    server: dusty.Server(void),
+    future: std.Io.Future(anyerror!void),
+
+    fn ok(_: *dusty.Request, res: *dusty.Response) !void {
+        res.body = "ok";
+    }
+
+    fn serve(s: *dusty.Server(void)) anyerror!void {
+        try s.run();
+    }
+
+    fn start(f: *KeyFixture, gpa: std.mem.Allocator) !void {
+        f.rt = try @import("zio").Runtime.init(gpa, .{});
+        errdefer f.rt.deinit();
+        const io = f.rt.io();
+        f.limiter = MemoryLimiter.init(gpa, io, .{});
+        errdefer f.limiter.deinit();
+        f.dummy = 0;
+        const broken: Limiter = .{ .ptr = &f.dummy, .vtable = &.{ .take = Broken.take } };
+        f.per_user = Middleware.init(f.limiter.limiter(), .{ .limit = 1, .key = Broken.byUser });
+        f.allow = Middleware.init(broken, .{});
+        f.deny = Middleware.init(broken, .{ .on_error = .deny });
+        f.server = dusty.Server(void).init(gpa, io, .{ .listeners = &loopback_listeners }, {});
+        errdefer f.server.deinit();
+        const M = dusty.Middleware(void);
+        f.server.router.group("/user", &[_]M{.init(&f.per_user)}).get("/", ok);
+        f.server.router.group("/allow", &[_]M{.init(&f.allow)}).get("/", ok);
+        f.server.router.group("/deny", &[_]M{.init(&f.deny)}).get("/", ok);
+        f.future = try io.concurrent(serve, .{&f.server});
+        errdefer f.future.cancel(io) catch {};
+        try f.server.waitReady(io);
+    }
+
+    fn deinit(f: *KeyFixture) void {
+        f.future.cancel(f.rt.io()) catch {};
+        f.server.deinit();
+        f.limiter.deinit();
+        f.rt.deinit();
+    }
+
+    /// The status of a GET of `path` as `user`.
+    fn status(f: *KeyFixture, path: []const u8, user: []const u8) !u16 {
+        const io = f.rt.io();
+        const stream = try f.server.address.ip.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        var wbuf: [256]u8 = undefined;
+        var w = stream.writer(io, &wbuf);
+        try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nX-User: {s}\r\nConnection: close\r\n\r\n", .{ path, user });
+        try w.interface.flush();
+        var rbuf: [1024]u8 = undefined;
+        var r = stream.reader(io, &rbuf);
+        var out: [1024]u8 = undefined;
+        var fw: std.Io.Writer = .fixed(&out);
+        _ = r.interface.streamRemaining(&fw) catch {};
+        return std.fmt.parseInt(u16, fw.buffered()[9..12], 10);
+    }
+};
+
+test "ratelimit.Middleware: a key function gives each user a bucket of their own" {
+    var f: KeyFixture = undefined;
+    try f.start(std.testing.allocator);
+    defer f.deinit();
+    // One a minute per user.
+    try std.testing.expectEqual(@as(u16, 200), try f.status("/user/", "alice"));
+    try std.testing.expectEqual(@as(u16, 429), try f.status("/user/", "alice"));
+    try std.testing.expectEqual(@as(u16, 200), try f.status("/user/", "bob"));
+}
+
+test "ratelimit.Middleware: a failing limiter lets requests through by default and answers 503 with on_error = .deny" {
     // The failing limiter's warnings are expected here.
     const level = std.testing.log_level;
     std.testing.log_level = .err;
     defer std.testing.log_level = level;
-    const zio = @import("zio");
-    const gpa = std.testing.allocator;
-    const rt = try zio.Runtime.init(gpa, .{});
-    defer rt.deinit();
-    const io = rt.io();
-    var limiter = MemoryLimiter.init(gpa, io, .{});
-    defer limiter.deinit();
-    const Broken = struct {
-        fn take(_: *anyopaque, _: []const u8, _: u32, _: Policy) anyerror!Result {
-            return error.ConnectionRefused;
-        }
-        fn byUser(req: *dusty.Request, _: []u8) []const u8 {
-            return req.headers.get("X-User") orelse "anonymous";
-        }
-    };
-    var dummy: u8 = 0;
-    const broken: Limiter = .{ .ptr = &dummy, .vtable = &.{ .take = Broken.take } };
-    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
-    defer server.deinit();
-    var per_user = Middleware.init(limiter.limiter(), .{ .limit = 1, .key = Broken.byUser });
-    var allow = Middleware.init(broken, .{});
-    var deny = Middleware.init(broken, .{ .on_error = .deny });
-    const M = dusty.Middleware(void);
-    const ok = struct {
-        fn h(_: *dusty.Request, res: *dusty.Response) !void {
-            res.body = "ok";
-        }
-    }.h;
-    server.router.group("/user", &[_]M{.init(&per_user)}).get("/", ok);
-    server.router.group("/allow", &[_]M{.init(&allow)}).get("/", ok);
-    server.router.group("/deny", &[_]M{.init(&deny)}).get("/", ok);
-    var future = try io.concurrent(struct {
-        fn r(s: *dusty.Server(void)) !void {
-            try s.run();
-        }
-    }.r, .{&server});
-    defer future.cancel(io) catch {};
-    try server.waitReady(io);
-
-    const Get = struct {
-        fn status(s: *dusty.Server(void), io_: std.Io, path: []const u8, user: []const u8) !u16 {
-            const stream = try s.address.ip.connect(io_, .{ .mode = .stream });
-            defer stream.close(io_);
-            var wbuf: [256]u8 = undefined;
-            var w = stream.writer(io_, &wbuf);
-            try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nX-User: {s}\r\nConnection: close\r\n\r\n", .{ path, user });
-            try w.interface.flush();
-            var rbuf: [1024]u8 = undefined;
-            var r = stream.reader(io_, &rbuf);
-            var out: [1024]u8 = undefined;
-            var fw: std.Io.Writer = .fixed(&out);
-            _ = r.interface.streamRemaining(&fw) catch {};
-            return std.fmt.parseInt(u16, fw.buffered()[9..12], 10);
-        }
-    };
-    // One a minute per user: each user has a bucket of their own.
-    try std.testing.expectEqual(@as(u16, 200), try Get.status(&server, io, "/user/", "alice"));
-    try std.testing.expectEqual(@as(u16, 429), try Get.status(&server, io, "/user/", "alice"));
-    try std.testing.expectEqual(@as(u16, 200), try Get.status(&server, io, "/user/", "bob"));
-    // A limiter that fails: let through by default, 503 with `.deny`.
-    try std.testing.expectEqual(@as(u16, 200), try Get.status(&server, io, "/allow/", "alice"));
-    try std.testing.expectEqual(@as(u16, 503), try Get.status(&server, io, "/deny/", "alice"));
+    var f: KeyFixture = undefined;
+    try f.start(std.testing.allocator);
+    defer f.deinit();
+    try std.testing.expectEqual(@as(u16, 200), try f.status("/allow/", "alice"));
+    try std.testing.expectEqual(@as(u16, 503), try f.status("/deny/", "alice"));
 }
 
 test "redis: live rate limiter (RedisLimiter)" {
