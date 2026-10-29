@@ -695,7 +695,7 @@ fn once(cache: *Cache, io: std.Io, runner: Fake, opts: db.QueryOptions, id: i64)
     if (ok.load(.monotonic) != 1) return error.CallFailed;
 }
 
-test "db cache: a result is kept for its ttl, then read again" {
+test "db cache: a result past its ttl is read again" {
     const gpa = testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
@@ -704,7 +704,9 @@ test "db cache: a result is kept for its ttl, then read again" {
     defer cache.deinit();
     var h: Harness = .{};
     const short: db.QueryOptions = .{ .cache = .{ .ttl = .fromMilliseconds(20), .tag = "posts" } };
-    try once(&cache, io, h.fake(1), short, 3);
+    // The hit within a ttl is shown by the invalidation test under a ttl no
+    // run outlives; this one checks only the expiry, so it has no upper bound
+    // on how fast the machine is.
     try once(&cache, io, h.fake(1), short, 3);
     try testing.expectEqual(@as(u32, 1), h.calls.load(.monotonic));
     // Past the ttl: time passing on purpose, 5x the ttl (a sleep never
