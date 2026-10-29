@@ -19,7 +19,9 @@
 //!   identifiers that still carry the name are allowed. Checked in every
 //!   file, test files included.
 //!
-//! Usage: safety_lint [--tests] <dir>...   (exit 1 on any hit)
+//! Usage: safety_lint [--tests] [--rules=R1,R2] <dir>...   (exit 1 on any hit)
+//! `--rules` reports only the named rules (CI runs `--rules=DOC` until the
+//! retrofit clears the T1/U1/U3/C3 backlog).
 //! Without --tests, test code is skipped: `test` blocks, `*_test.zig`,
 //! `*_tests.zig`, `testing.zig`, files under a `testing/` directory and the
 //! test runners.
@@ -55,12 +57,17 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
     var tests = false;
+    var rules: ?[]const u8 = null;
     var dirs: std.ArrayList([]const u8) = .empty;
     for (args[1..]) |a| {
-        if (std.mem.eql(u8, a, "--tests")) tests = true else try dirs.append(arena, a);
+        if (std.mem.eql(u8, a, "--tests")) {
+            tests = true;
+        } else if (std.mem.startsWith(u8, a, "--rules=")) {
+            rules = a["--rules=".len..];
+        } else try dirs.append(arena, a);
     }
     if (dirs.items.len == 0) {
-        std.debug.print("usage: safety_lint [--tests] <dir>...\n", .{});
+        std.debug.print("usage: safety_lint [--tests] [--rules=R1,R2] <dir>...\n", .{});
         std.process.exit(2);
     }
     var hits: std.ArrayList(Hit) = .empty;
@@ -88,6 +95,15 @@ pub fn main(init: std.process.Init) !void {
         try docNames(arena, p, src, &hits);
         if (!tests and isTestFile(p)) continue;
         try lintFile(arena, p, src, tests, &hits);
+    }
+    if (rules) |list| {
+        var kept: usize = 0;
+        for (hits.items) |h| {
+            if (!ruleListed(list, h.rule)) continue;
+            hits.items[kept] = h;
+            kept += 1;
+        }
+        hits.shrinkRetainingCapacity(kept);
     }
     var buf: [4096]u8 = undefined;
     var out: std.Io.File.Writer = .init(.stdout(), io, &buf);
@@ -125,6 +141,12 @@ fn docNames(arena: std.mem.Allocator, path: []const u8, src: []const u8, hits: *
         for (allowed) |a| if (std.mem.indexOf(u8, line, a) != null) continue :next;
         try hits.append(arena, .{ .path = path, .line = n, .rule = "DOC", .msg = "a public doc comment names dusty or a core build option" });
     }
+}
+
+fn ruleListed(list: []const u8, rule: []const u8) bool {
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |r| if (std.mem.eql(u8, std.mem.trim(u8, r, " "), rule)) return true;
+    return false;
 }
 
 fn isTestFile(p: []const u8) bool {
@@ -550,4 +572,11 @@ fn checkCanceled(l: *Lint, i: usize) !void {
     }
     if (l.hasSafetyComment(i, l.stmtStart(i))) return;
     try l.hit(i, "C3", "error.Canceled caught and carried on from: return it, or call io.recancel()");
+}
+
+test "ruleListed: --rules matches whole rule names in a comma list" {
+    try std.testing.expect(ruleListed("DOC", "DOC"));
+    try std.testing.expect(ruleListed("U3, DOC", "DOC"));
+    try std.testing.expect(!ruleListed("DOC", "U3"));
+    try std.testing.expect(!ruleListed("DO", "DOC"));
 }

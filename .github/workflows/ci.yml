@@ -108,6 +108,14 @@ jobs:
       # The core's tests on the core without TLS, HTTP/2 or compression:
       # no other step builds core-test there, so the tests that skip when
       # TLS or zlib/zstd is on run only here.
+      # The doc-comment name check (DOC) left the test suite for
+      # tools/safety_lint.zig; only DOC gates CI until the SAFETY.md
+      # retrofit clears the T1/U1/U3/C3 backlog (zig build lint alone
+      # still exits 1 on it).
+      - name: Lint (doc-comment names)
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        run: zig build lint -Dlint-rules=DOC --summary all
       - name: HTTP core without TLS or compression
         if: runner.os == 'Linux'
         timeout-minutes: 15
