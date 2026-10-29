@@ -25,15 +25,22 @@ pub const Binding = struct {
     rejected: *metrics.Family(metrics.Counter),
     retries: *metrics.Family(metrics.Counter),
     throttled: *metrics.Family(metrics.Counter),
+    /// Over `seen`: a lookup or an insert into room made beforehand, never
+    /// an allocation (SAFETY.md L5).
     lock: safety.SpinLock(.leaf) = .init,
-    /// Targets seen per client kind.
+    /// Targets seen per client kind, each with room for `max_targets`
+    /// from `init` on.
     seen: [8]std.StringHashMapUnmanaged(void) = @splat(.empty),
     hooks: core.Metrics = .{},
 
     pub fn init(gpa: std.mem.Allocator, registry: *metrics.Registry) !Binding {
         const labels = &.{ "client", "target" };
+        var seen: [8]std.StringHashMapUnmanaged(void) = @splat(.empty);
+        errdefer for (&seen) |*m| m.deinit(gpa);
+        for (&seen) |*m| try m.ensureTotalCapacity(gpa, max_targets);
         return .{
             .gpa = gpa,
+            .seen = seen,
             .state = try registry.gauge("anole_breaker_state", "Circuit breaker state: 0 closed, 1 half-open, 2 open.", labels),
             .opened = try registry.counter("anole_breaker_opened_total", "Times a circuit breaker opened.", labels),
             .rejected = try registry.counter("anole_breaker_rejected_total", "Calls a circuit breaker rejected.", labels),
@@ -62,18 +69,28 @@ pub const Binding = struct {
         return &self.hooks;
     }
 
+    /// The `target` label of `target`: its own until `max_targets` are
+    /// taken, then "other". The copy of a new one is made and, when another
+    /// thread put it first, freed with the lock let go.
     fn label(self: *Binding, kind: core.Kind, target: []const u8) []const u8 {
         const set = &self.seen[@backingInt(kind)];
-        self.lock.lock();
-        defer self.lock.unlock();
-        if (set.contains(target)) return set.getKey(target).?;
-        if (set.count() >= max_targets) return "other";
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (set.getKey(target)) |k| return k;
+            if (set.count() >= max_targets) return "other";
+        }
         const owned = self.gpa.dupe(u8, target) catch return "other";
-        set.put(self.gpa, owned, {}) catch {
-            self.gpa.free(owned);
-            return "other";
+        const kept: ?[]const u8 = kept: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (set.getKey(target)) |k| break :kept k;
+            if (set.count() >= max_targets) break :kept null;
+            set.putAssumeCapacityNoClobber(owned, {});
+            return owned;
         };
-        return owned;
+        self.gpa.free(owned);
+        return kept orelse "other";
     }
 
     fn cast(ctx: ?*anyopaque) *Binding {
