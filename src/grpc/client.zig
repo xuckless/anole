@@ -134,7 +134,13 @@ pub const Channel = struct {
         options: h2.ConnectOptions,
         http: Http,
         http3: Http3,
+        /// Guards the fields below; never held across a dial (SAFETY.md L2).
         mutex: safety.Mutex(.leaf) = .init,
+        /// `activeH2`/`activeH3` are dialing (single flight: a channel uses
+        /// one of them; `.auto`'s HTTP/3 dial is `h3_dialing`, which never
+        /// makes a call wait). Calls that need the dial wait on `dialed`.
+        redialing: bool = false,
+        dialed: safety.Condition = .init,
         /// Connections replaced by a redial: they may still carry calls,
         /// so they close with the channel.
         retired: std.ArrayList(*h2.ClientConnection) = .empty,
@@ -276,23 +282,36 @@ pub const Channel = struct {
     }
 
     /// The HTTP/2 connection of an owned channel: a fresh one when the
-    /// current has gone.
+    /// current has gone. One dial at a time, with no lock held across it
+    /// (SAFETY.md L2): the calls that find it running wait for it, then
+    /// look again; a failed dial fails only its own call.
     fn activeH2(self: *Channel) !*h2.ClientConnection {
         const owned = self._owned orelse return self.conn.?;
         if (self.conn) |c| if (c.isOpen()) return c;
         const io_ = self.runtime();
         owned.mutex.lockUncancelable(io_);
         defer owned.mutex.unlock(io_);
-        // Another call may have redialed while this one waited.
-        if (self.conn) |c| if (c.isOpen()) return c;
-        const fresh = try h2.ClientConnection.connect(owned.gpa, io_, owned.options);
+        while (true) {
+            // Another call may have redialed while this one waited.
+            if (self.conn) |c| if (c.isOpen()) return c;
+            if (!owned.redialing) break;
+            owned.dialed.waitUncancelable(io_, &owned.mutex);
+        }
+        owned.redialing = true;
+        owned.mutex.unlock(io_);
+        const dial = h2.ClientConnection.connect(owned.gpa, io_, owned.options);
+        owned.mutex.lockUncancelable(io_);
+        owned.redialing = false;
+        owned.dialed.broadcast(io_);
+        const fresh = try dial;
         errdefer fresh.close();
         if (self.conn) |old| try owned.retired.append(owned.gpa, old);
         self.conn = fresh;
         return fresh;
     }
 
-    /// The HTTP/3 connection of a `.h3` channel, redialed when it has gone.
+    /// The HTTP/3 connection of a `.h3` channel, redialed when it has gone,
+    /// as `activeH2` does.
     fn activeH3(self: *Channel) !*H3Connection {
         if (comptime !features.http3) unreachable;
         const owned = self._owned.?;
@@ -300,8 +319,18 @@ pub const Channel = struct {
         const io_ = self.runtime();
         owned.mutex.lockUncancelable(io_);
         defer owned.mutex.unlock(io_);
-        if (self.h3) |c| if (c.isOpen()) return c;
-        const fresh = try dialH3(owned, io_, owned.h3_port);
+        while (true) {
+            if (self.h3) |c| if (c.isOpen()) return c;
+            if (!owned.redialing) break;
+            owned.dialed.waitUncancelable(io_, &owned.mutex);
+        }
+        owned.redialing = true;
+        owned.mutex.unlock(io_);
+        const dial = dialH3(owned, io_, owned.h3_port);
+        owned.mutex.lockUncancelable(io_);
+        owned.redialing = false;
+        owned.dialed.broadcast(io_);
+        const fresh = try dial;
         errdefer fresh.close();
         owned.h3_dials += 1;
         if (self.h3) |old| try owned.retired3.append(owned.gpa, old);
