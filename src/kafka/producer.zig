@@ -980,24 +980,27 @@ pub const Producer = struct {
         s.owner.check(self.io);
         if (s.conn == null) s.conn = try self.cluster.connectBroker(s.id);
         const conn = s.conn.?;
-        var pid: i64 = -1;
-        var epoch: i16 = -1;
-        var generation: u32 = 0;
-        if (self.cfg.idempotent) {
-            const ids = try self.ensurePid(conn, arena);
-            pid = ids.id;
-            epoch = ids.epoch;
-            generation = ids.generation;
-            testHold(self.io, .ids_taken);
-        }
         std.mem.sort(Work, work, {}, struct {
             fn lt(_: void, a: Work, b: Work) bool {
                 return std.mem.lessThan(u8, a.accum.topic, b.accum.topic);
             }
         }.lt);
-        // Sequence numbers: assigned at the first send, kept for retries.
-        if (self.cfg.idempotent) {
+        var pid: i64 = -1;
+        var epoch: i16 = -1;
+        var generation: u32 = 0;
+        // Sequence numbers: assigned at the first send under an id, kept for
+        // retries. The ids and the sequences are of one generation: when the
+        // id was reset after `ensurePid` returned (its next section), the
+        // sender takes the new one first.
+        if (self.cfg.idempotent) while (true) {
+            const ids = try self.ensurePid(conn, arena);
+            testHold(self.io, .ids_taken);
             self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.pid != ids.id or self.generation != ids.generation) continue;
+            pid = ids.id;
+            epoch = ids.epoch;
+            generation = ids.generation;
             for (work) |w| {
                 if (w.batch.sequence == null or w.batch.generation != generation) {
                     const n: i32 = @intCast(w.batch.recs.items.len);
@@ -1006,8 +1009,8 @@ pub const Producer = struct {
                     w.accum.next_seq = (w.accum.next_seq +% n) & 0x7fffffff;
                 }
             }
-            self.mutex.unlock(self.io);
-        }
+            break;
+        };
         const topics = try arena.alloc(protocol.ProduceTopic, work.len);
         const parts = try arena.alloc(protocol.ProducePartition, work.len);
         var n_topics: usize = 0;
