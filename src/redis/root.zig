@@ -2683,6 +2683,45 @@ test "redis: a connection released twice is never handed to two holders" {
     y.release();
 }
 
+test "redis: a connection released twice after it broke reads no freed memory" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 1 });
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+
+    const first = try client.acquire(&c);
+    // Out of step with the server: the first release closes it.
+    first.conn.broken = true;
+    first.release();
+    // The second release finds the checkout over and gives nothing back.
+    first.release();
+    const pool = &client.pools.pools[0];
+    try testing.expectEqual(@as(usize, 0), pool.open);
+    // The one place is free: the next acquire dials and works.
+    var next = try client.acquire(&c);
+    _ = try next.incr(&c, "n");
+    next.release();
+    try testing.expectEqual(@as(usize, 1), pool.open);
+    try testing.expectEqual(@as(usize, 1), pool.idle_len);
+}
+
 /// A probe of `/readyz` on its own task: the task it runs on, the answer,
 /// and whether it ended.
 const ReadyProbe = struct {
