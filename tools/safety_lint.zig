@@ -36,12 +36,19 @@
 //!   identifiers that still carry the name are allowed. Checked in every
 //!   file, test files included.
 //!
-//! Usage: safety_lint [--tests] [--rules=R1,R2] <dir>...   (exit 1 on any hit)
-//! `--rules` reports only the named rules (CI runs `--rules=DOC` until the
-//! retrofit clears the T1/U1/U3/C3 backlog).
-//! Without --tests, test code is skipped: `test` blocks, `*_test.zig`,
-//! `*_tests.zig`, `testing.zig`, files under a `testing/` directory and the
-//! test runners.
+//! Usage: safety_lint [--tests] [--rules=R1,R2]
+//!            [--baseline|--update-baseline|--init-baseline <tsv>] <dir>...
+//! - Plain: every hit, exit 1 on any.
+//! - `--baseline tools/safety_lint.baseline.tsv` (CI, `zig build lint`): the
+//!   ratchet (see `ratchet`); exit 1 on a (file, rule) count above or below
+//!   its line.
+//! - `--update-baseline` (`zig build lint -Dlint-update`): lowers the lines
+//!   to today's counts and drops zeros; never raises one or adds one.
+//! - `--init-baseline`: writes a new baseline; refuses if the file exists.
+//! `--rules` checks only the named rules. Without `--tests`, test code is
+//! skipped: `test` blocks, `*_test.zig`, `*_tests.zig`, `testing.zig`,
+//! files under a `testing/` directory and the test runners. `--tests` runs
+//! without a baseline (test code follows SAFETY.md §6a and the test audit).
 const std = @import("std");
 const Ast = std.zig.Ast;
 const Token = std.zig.Token;
@@ -69,22 +76,36 @@ const unsafe_modules = [_][]const u8{"src/safety/"};
 
 const Hit = struct { path: []const u8, line: usize, rule: []const u8, msg: []const u8 };
 
+const Mode = enum { plain, check, update, init };
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
     var tests = false;
     var rules: ?[]const u8 = null;
+    var mode: Mode = .plain;
+    var baseline_path: []const u8 = "";
     var dirs: std.ArrayList([]const u8) = .empty;
-    for (args[1..]) |a| {
+    var k: usize = 1;
+    while (k < args.len) : (k += 1) {
+        const a = args[k];
         if (std.mem.eql(u8, a, "--tests")) {
             tests = true;
         } else if (std.mem.startsWith(u8, a, "--rules=")) {
             rules = a["--rules=".len..];
-        } else try dirs.append(arena, a);
+        } else if (std.mem.eql(u8, a, "--baseline") or std.mem.eql(u8, a, "--update-baseline") or std.mem.eql(u8, a, "--init-baseline")) {
+            if (k + 1 >= args.len) usage();
+            mode = if (a[2] == 'b') .check else if (a[2] == 'u') .update else .init;
+            k += 1;
+            baseline_path = args[k];
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            usage();
+        } else try dirs.append(arena, std.mem.trimEnd(u8, if (std.mem.startsWith(u8, a, "./")) a[2..] else a, "/"));
     }
-    if (dirs.items.len == 0) {
-        std.debug.print("usage: safety_lint [--tests] [--rules=R1,R2] <dir>...\n", .{});
+    if (dirs.items.len == 0) usage();
+    if (tests and mode != .plain) {
+        std.debug.print("safety_lint: the baseline covers product code; --tests runs without one\n", .{});
         std.process.exit(2);
     }
     var hits: std.ArrayList(Hit) = .empty;
@@ -97,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
         defer walker.deinit();
         while (try walker.next(io)) |e| {
             if (e.kind != .file or !std.mem.endsWith(u8, e.basename, ".zig")) continue;
-            const p = try std.fmt.allocPrint(arena, "{s}/{s}", .{ std.mem.trimEnd(u8, d, "/"), e.path });
+            const p = try std.fmt.allocPrint(arena, "{s}/{s}", .{ d, e.path });
             std.mem.replaceScalar(u8, p, '\\', '/');
             try files.append(arena, p);
         }
@@ -123,21 +144,200 @@ pub fn main(init: std.process.Init) !void {
     var buf: [4096]u8 = undefined;
     var out: std.Io.File.Writer = .init(.stdout(), io, &buf);
     const w = &out.interface;
-    var counts: std.StringArrayHashMapUnmanaged(usize) = .empty;
-    for (hits.items) |h| {
-        try w.print("{s}:{d}: {s}: {s}\n", .{ h.path, h.line, h.rule, h.msg });
-        const gop = try counts.getOrPut(arena, h.rule);
+    switch (mode) {
+        .plain => {
+            for (hits.items) |h| try w.print("{s}:{d}: {s}: {s}\n", .{ h.path, h.line, h.rule, h.msg });
+            if (hits.items.len > 0) {
+                try w.print("\n{d} hit(s):", .{hits.items.len});
+                const counts = try countByRule(arena, hits.items);
+                for (counts.keys(), counts.values()) |r, n| try w.print(" {s} {d}", .{ r, n });
+                try w.writeAll(" (SAFETY.md E2)\n");
+            }
+            try w.flush();
+            if (hits.items.len > 0) std.process.exit(1);
+        },
+        .init => {
+            if (cwd.access(io, baseline_path, .{})) |_| {
+                std.debug.print("safety_lint: {s} exists; --init-baseline only starts a new one (lower it with --update-baseline)\n", .{baseline_path});
+                std.process.exit(2);
+            } else |_| {}
+            const text = try renderBaseline(arena, try countHits(arena, hits.items));
+            try cwd.writeFile(io, .{ .sub_path = baseline_path, .data = text });
+            try w.print("safety_lint: wrote {s} ({d} hit(s))\n", .{ baseline_path, hits.items.len });
+            try w.flush();
+        },
+        .check, .update => {
+            const old = cwd.readFileAlloc(io, baseline_path, arena, .unlimited) catch |err| {
+                std.debug.print("safety_lint: cannot read the baseline {s}: {t}\n", .{ baseline_path, err });
+                std.process.exit(2);
+            };
+            const r = ratchet(arena, w, hits.items, old, rules, mode == .update) catch |err| switch (err) {
+                error.BadBaseline => std.process.exit(2),
+                else => return err,
+            };
+            if (r.new_text) |text| if (!std.mem.eql(u8, text, old)) {
+                try cwd.writeFile(io, .{ .sub_path = baseline_path, .data = text });
+                try w.print("safety_lint: lowered {s}\n", .{baseline_path});
+            };
+            try w.flush();
+            if (r.failed) std.process.exit(1);
+        },
+    }
+}
+
+fn usage() noreturn {
+    std.debug.print(
+        \\usage: safety_lint [--tests] [--rules=R1,R2] [--baseline|--update-baseline|--init-baseline <tsv>] <dir>...
+        \\
+    , .{});
+    std.process.exit(2);
+}
+
+// The ratchet (SAFETY.md E2): a per (file, rule) count of the hits allowed
+// today, in a TSV that may only go down. A file over its count fails and
+// prints every hit of that file and rule (it can't tell which one is new);
+// a file under its count fails too (a stale entry: lower the baseline), so
+// the ratchet tightens as code is fixed. `--update-baseline` lowers each
+// entry to what is found and drops zeros; it never raises a count or adds
+// a line. Raising one is a hand edit, reviewed with its reason (E3).
+
+const baseline_header = "# SAFETY.md E2 ratchet: counts may only go down; regenerate with zig build lint -Dlint-update\n";
+
+/// "path\x00rule" -> count.
+const Counts = std.StringArrayHashMapUnmanaged(usize);
+
+fn key(arena: std.mem.Allocator, path: []const u8, rule: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}\x00{s}", .{ path, rule });
+}
+
+fn countHits(arena: std.mem.Allocator, hits: []const Hit) !Counts {
+    var c: Counts = .empty;
+    for (hits) |h| {
+        const gop = try c.getOrPut(arena, try key(arena, h.path, h.rule));
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
     }
-    if (hits.items.len > 0) {
-        try w.print("\n{d} hit(s):", .{hits.items.len});
-        var it = counts.iterator();
-        while (it.next()) |e| try w.print(" {s} {d}", .{ e.key_ptr.*, e.value_ptr.* });
-        try w.writeAll(" (SAFETY.md E2)\n");
+    return c;
+}
+
+fn countByRule(arena: std.mem.Allocator, hits: []const Hit) !Counts {
+    var c: Counts = .empty;
+    for (hits) |h| {
+        const gop = try c.getOrPut(arena, h.rule);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
     }
-    try w.flush();
-    if (hits.items.len > 0) std.process.exit(1);
+    return c;
+}
+
+fn parseBaseline(arena: std.mem.Allocator, text: []const u8) !Counts {
+    var c: Counts = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| {
+        n += 1;
+        if (line.len == 0 or line[0] == '#') continue;
+        var f = std.mem.splitScalar(u8, line, '\t');
+        const path = f.next() orelse "";
+        const rule = f.next() orelse "";
+        const count_text = f.next() orelse "";
+        const count = std.fmt.parseInt(usize, count_text, 10) catch 0;
+        if (path.len == 0 or rule.len == 0 or count == 0 or f.next() != null) {
+            std.debug.print("safety_lint: baseline line {d} is not path<TAB>rule<TAB>count (count > 0): {s}\n", .{ n, line });
+            return error.BadBaseline;
+        }
+        const gop = try c.getOrPut(arena, try key(arena, path, rule));
+        if (gop.found_existing) {
+            std.debug.print("safety_lint: baseline line {d} repeats {s} {s}\n", .{ n, path, rule });
+            return error.BadBaseline;
+        }
+        gop.value_ptr.* = count;
+    }
+    return c;
+}
+
+/// The TSV: the header, then path<TAB>rule<TAB>count sorted by path and
+/// rule, zero counts left out.
+fn renderBaseline(arena: std.mem.Allocator, counts: Counts) ![]u8 {
+    const keys = try arena.dupe([]const u8, counts.keys());
+    std.mem.sort([]const u8, keys, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.writeAll(baseline_header);
+    for (keys) |kk| {
+        const n = counts.get(kk).?;
+        if (n == 0) continue;
+        const sep = std.mem.indexOfScalar(u8, kk, 0).?;
+        try out.writer.print("{s}\t{s}\t{d}\n", .{ kk[0..sep], kk[sep + 1 ..], n });
+    }
+    return out.written();
+}
+
+const RatchetResult = struct { failed: bool, new_text: ?[]u8 };
+
+/// Compares the hits with the baseline text and reports to `w`. With
+/// `update`, also returns the lowered baseline.
+fn ratchet(arena: std.mem.Allocator, w: *std.Io.Writer, hits: []const Hit, baseline: []const u8, rules: ?[]const u8, update: bool) !RatchetResult {
+    const allowed = try parseBaseline(arena, baseline);
+    const found = try countHits(arena, hits);
+    var failed = false;
+    // Over: every hit of the (file, rule), in file order.
+    for (found.keys(), found.values()) |kk, n| {
+        const a = allowed.get(kk) orelse 0;
+        if (n <= a) continue;
+        failed = true;
+        const sep = std.mem.indexOfScalar(u8, kk, 0).?;
+        const path = kk[0..sep];
+        const rule = kk[sep + 1 ..];
+        for (hits) |h| if (std.mem.eql(u8, h.path, path) and std.mem.eql(u8, h.rule, rule))
+            try w.print("{s}:{d}: {s}: {s}\n", .{ h.path, h.line, h.rule, h.msg });
+        try w.print("{s}: {s}: {d} allowed, {d} found: fix the new hit or give it a // SAFETY: reason (a renamed file: move its baseline lines by hand)\n\n", .{ path, rule, a, n });
+    }
+    // Under (stale): lowered with `update`, a failure otherwise.
+    var lowered: Counts = .empty;
+    for (allowed.keys(), allowed.values()) |kk, a| {
+        const sep = std.mem.indexOfScalar(u8, kk, 0).?;
+        const rule = kk[sep + 1 ..];
+        const n = found.get(kk) orelse 0;
+        const in_scope = if (rules) |list| ruleListed(list, rule) else true;
+        try lowered.put(arena, kk, if (in_scope) @min(a, n) else a);
+        if (!in_scope or n >= a) continue;
+        if (update) continue;
+        failed = true;
+        try w.print("{s}: {s}: the baseline allows {d}, {d} found: lower the baseline: zig build lint -Dlint-update\n", .{ kk[0..sep], rule, a, n });
+    }
+    // The summary: found and allowed per rule, and the baseline total.
+    var by_rule: std.StringArrayHashMapUnmanaged([2]usize) = .empty;
+    var total_found: usize = 0;
+    var total_allowed: usize = 0;
+    for (found.keys(), found.values()) |kk, n| {
+        const gop = try by_rule.getOrPut(arena, kk[std.mem.indexOfScalar(u8, kk, 0).? + 1 ..]);
+        if (!gop.found_existing) gop.value_ptr.* = .{ 0, 0 };
+        gop.value_ptr[0] += n;
+        total_found += n;
+    }
+    const after = if (update) lowered else allowed;
+    for (after.keys(), after.values()) |kk, a| {
+        const rule = kk[std.mem.indexOfScalar(u8, kk, 0).? + 1 ..];
+        if (rules) |list| if (!ruleListed(list, rule)) continue;
+        const gop = try by_rule.getOrPut(arena, rule);
+        if (!gop.found_existing) gop.value_ptr.* = .{ 0, 0 };
+        gop.value_ptr[1] += a;
+        total_allowed += a;
+    }
+    by_rule.sort(struct {
+        keys: []const []const u8,
+        pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+            return std.mem.lessThan(u8, c.keys[a], c.keys[b]);
+        }
+    }{ .keys = by_rule.keys() });
+    try w.writeAll("safety lint (SAFETY.md E2), found/allowed:");
+    for (by_rule.keys(), by_rule.values()) |r, v| try w.print(" {s} {d}/{d}", .{ r, v[0], v[1] });
+    try w.print("; total {d}, baseline total {d}\n", .{ total_found, total_allowed });
+    return .{ .failed = failed, .new_text = if (update) try renderBaseline(arena, lowered) else null };
 }
 
 /// Every rule over one file: DOC everywhere, the SAFETY.md rules outside
@@ -771,6 +971,60 @@ fn expectFixture(comptime name: []const u8) !void {
     for (hits.items) |h| std.debug.print("\n    {d}: {s}: {s}", .{ h.line, h.rule, h.msg });
     std.debug.print("\n", .{});
     return error.FixtureMismatch;
+}
+
+fn ratchetFor(arena: std.mem.Allocator, hits: []const Hit, baseline: []const u8, update: bool) !struct { RatchetResult, []const u8 } {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const r = try ratchet(arena, &out.writer, hits, baseline, null, update);
+    return .{ r, out.written() };
+}
+
+const ratchet_hits = [_]Hit{
+    .{ .path = "src/a.zig", .line = 3, .rule = "U3", .msg = "m" },
+    .{ .path = "src/a.zig", .line = 9, .rule = "U3", .msg = "m" },
+    .{ .path = "src/b.zig", .line = 1, .rule = "T1", .msg = "m" },
+};
+
+test "ratchet: counts at their baseline pass" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const r, const out = try ratchetFor(arena.allocator(), &ratchet_hits, baseline_header ++ "src/a.zig\tU3\t2\nsrc/b.zig\tT1\t1\n", false);
+    try std.testing.expect(!r.failed);
+    try std.testing.expect(std.mem.indexOf(u8, out, "total 3, baseline total 3") != null);
+}
+
+test "ratchet: a count over its baseline fails and prints every hit of that file and rule" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const r, const out = try ratchetFor(arena.allocator(), &ratchet_hits, baseline_header ++ "src/a.zig\tU3\t1\n", false);
+    try std.testing.expect(r.failed);
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/a.zig:3: U3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/a.zig:9: U3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/a.zig: U3: 1 allowed, 2 found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/b.zig: T1: 0 allowed, 1 found") != null);
+}
+
+test "ratchet: a count under its baseline (stale) fails and says to lower it" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const r, const out = try ratchetFor(arena.allocator(), &ratchet_hits, baseline_header ++ "src/a.zig\tU3\t2\nsrc/b.zig\tT1\t1\nsrc/gone.zig\tC3\t4\n", false);
+    try std.testing.expect(r.failed);
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/gone.zig: C3: the baseline allows 4, 0 found: lower the baseline") != null);
+}
+
+test "ratchet: update lowers, drops zeros, and never raises or adds a line" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const r, _ = try ratchetFor(arena.allocator(), &ratchet_hits, baseline_header ++ "src/a.zig\tU3\t5\nsrc/c.zig\tU3\t1\n", true);
+    // src/b.zig's T1 is new: still a failure, and not written.
+    try std.testing.expect(r.failed);
+    try std.testing.expectEqualStrings(baseline_header ++ "src/a.zig\tU3\t2\n", r.new_text.?);
+}
+
+test "ratchet: a malformed baseline line is refused" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.BadBaseline, ratchetFor(arena.allocator(), &ratchet_hits, "src/a.zig U3 2\n", false));
 }
 
 test "lint: U3 casts, with and without a SAFETY reason" {
