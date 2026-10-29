@@ -3469,7 +3469,7 @@ test "string lengths, byte counts and dates contradict by the largest lower and 
     try expect("validator: Dto.field_rules.x[]: min_length(10) and max_length(5)" ++ tail, comptime contradictionText(each_rule.inner, S, where ++ "[]").?);
 }
 
-test "equal bounds, every digit of a fraction, and bounds of different measures or forms on strings" {
+test "equal string, byte and date bounds do not contradict; date-time bounds compare every fraction digit" {
     const r = root;
     const S = []const u8;
     try std.testing.expectEqual(null, comptime contradiction(&.{ r.minLength(5), r.maxLength(5) }, S));
@@ -3733,7 +3733,7 @@ test "every rule name a hint mentions is exported" {
     try std.testing.expectEqualStrings("nonEmpty", comptime unknownHintName(&texts).?);
 }
 
-test "hint for a constructor used without a call" {
+test "a constructor used without a call gets a hint with an example call that fits its parameter" {
     const S = struct {
         const Options = struct { strict: bool = false };
         const Algorithm = enum { md5, sha1 };
@@ -3793,7 +3793,7 @@ test "every transform is exported under its public name, the camelCase of its ki
     }
 }
 
-test "hint for a predicate used as a rule" {
+test "a predicate used as a rule gets a hint naming the exported rule, called when it takes arguments" {
     const S = struct {
         const Options = struct { strict: bool = false };
         const Algorithm = enum { md5, sha1 };

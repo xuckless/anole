@@ -427,7 +427,7 @@ test "a literal escapes the syntax characters of ECMA-262 and nothing else" {
     try testing.expectEqualStrings("-/,:@#\"' é\n", comptime literal("-/,:@#\"' é\n"));
 }
 
-test "repetition counts" {
+test "a repetition is written {n}, {min,max} or {min,}" {
     try testing.expectEqualStrings("{3}", comptime repetition(3, 3));
     try testing.expectEqualStrings("{1,4}", comptime repetition(1, 4));
     try testing.expectEqualStrings("{2,}", comptime repetition(2, null));

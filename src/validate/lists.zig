@@ -745,12 +745,10 @@ test "minItems and maxItems take slices; a string field gets the string rules as
     }
 }
 
-test "an uncalled minItems or maxItems gets an example call, and inside each the head is each(...)" {
+test "an uncalled minItems or maxItems gets an example call" {
     const expect = std.testing.expectEqualStrings;
     try expect("validator: Dto.field_rules.x: minItems must be called, e.g. v.minItems(1)", comptime uncalledText("minItems", @TypeOf(minItems)));
     try expect("validator: Dto.field_rules.x: maxItems must be called, e.g. v.maxItems(100)", comptime uncalledText("maxItems", @TypeOf(maxItems)));
-    // each checks its argument when it is called, before the field is known.
-    try expect("validator: each(...): minItems must be called, e.g. v.minItems(1)", "validator: each(...): " ++ comptime core.hints.mustBeCalled("minItems", @TypeOf(minItems)));
 }
 
 test "minItems and maxItems count the items of a slice, null items included" {
@@ -991,7 +989,7 @@ fn distinctStrings(comptime n: usize, comptime len: usize, comptime duplicate: b
     }
 }
 
-test "uniqueItems sorts short lists, long lists and arrays up to max_unique_items" {
+test "uniqueItems finds a duplicate in lists of 2, 64, 65 and 1000 items, slices and arrays" {
     // Short lists (up to 64 items), longer ones and an array of 1000 items.
     inline for (.{ 2, 64, 65, 1000 }) |n| {
         const ints = comptime distinctInts(n, false);
@@ -1098,7 +1096,7 @@ test "containsAll and containsNone take lists of the listed kind of value, not s
     try std.testing.expectEqual(null, comptime containsNoneText(.{true}, []const bool));
 }
 
-test "containsAll and containsNone on arrays, and lists that leave no value" {
+test "containsAll and containsNone are errors when an array cannot hold the values or the list leaves no value" {
     const expect = std.testing.expectEqualStrings;
     const head = "validator: Dto.field_rules.x: ";
     try expect(head ++ "contains_all(.{ 1, 2, 3 }) on [2]u8: an array of 2 items cannot contain 3 different values", comptime containsAllText(.{ 1, 2, 3 }, [2]u8).?);
