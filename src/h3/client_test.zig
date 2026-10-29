@@ -1809,7 +1809,11 @@ test "h3: a client offering QUIC v2 moves to it only when the server prefers v2"
     }
 }
 
-test "h3 server: a ClientHello resent before the client acted on our Retry gets a Retry again, not a second connection" {
+test "h3 server: a ClientHello resent before the client acted on our Retry gets a Retry again, not a second connection [slow]" {
+    // The client's first PTO (about 1 s) is the scenario's one wait: over
+    // the unit suite's 1 s budget (TESTING.md K1), so it runs in
+    // test-stress.
+    try wait.requireStress();
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
