@@ -2144,8 +2144,9 @@ fn addSafeTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Co
     // dump's task stacks (zio.dumpTasks) and zio's stall reports walk them.
     if (m.omit_frame_pointer == null) m.omit_frame_pointer = false;
     if (m.import_table.get("anole_test_hooks") == null) {
-        const zio_mod: ?*std.Build.Module = m.import_table.get("zio") orelse
-            if (m.import_table.get("anole")) |a| a.import_table.get("zio") else null;
+        // Any zio in the binary, which then reads the runner's `zio_options`
+        // from test_hooks.zig: a zio left to the stub would fail to compile.
+        const zio_mod: ?*std.Build.Module = findImport(m, "zio", 4);
         // The binary's own never_reuse module if anole_safety is in it.
         const never_reuse = findImport(m, "anole_never_reuse", 4) orelse Core.neverReuseModule(b, m.resolved_target, m.optimize);
         const hooks = if (zio_mod) |z| b.createModule(.{
@@ -2219,7 +2220,10 @@ const Core = struct {
         // panics (SAFETY.md L2; src/safety counts the locks); `debug_cancel`,
         // a task that parks after swallowing error.Canceled is reported (C3),
         // and the test runner fails the test. These are the defaults of a
-        // binary with no `zio_options` of its own: the test binaries.
+        // binary with no `zio_options` of its own. Test binaries have both
+        // on in every optimize mode: their root, the safety test runner,
+        // declares `zio_options` (src/safety/test_hooks.zig), so a
+        // ReleaseSafe test binary checks suspensions as it counts locks.
         const debug = optimize == .debug;
         const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .diagnostics = true, .debug_held_locks = debug, .debug_cancel = debug }).module("zio");
         const safety = safetyModule(b, zio_mod, target, optimize);

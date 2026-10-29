@@ -33,6 +33,7 @@
 //! (MIT, github.com/fanyang89/grpc-lite, db3c400, src/server.zig).
 const std = @import("std");
 const build_options = @import("build_options");
+const safety = @import("anole_safety");
 
 const c = @import("nghttp2");
 const http = @import("../http.zig");
@@ -708,7 +709,7 @@ pub fn Engine(comptime Ctx: type) type {
                 if (conn.spare_streams.items.len < max_spare_streams) {
                     // Trimmed now, not on reuse: the budget above is given
                     // back, so a spare must not keep a raised body window.
-                    _ = stream.arena.reset(.{ .retain_with_limit = arena_retain_limit });
+                    _ = safety.resetArena(&stream.arena, .{ .retain_with_limit = arena_retain_limit });
                     if (conn.spare_streams.append(conn.allocator, stream)) |_| return else |_| {}
                 }
                 stream.destroy(conn.allocator);

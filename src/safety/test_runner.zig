@@ -593,6 +593,12 @@ pub const std_options: std.Options = .{
     .logFn = log,
 };
 
+/// ANOLE: zio reads its options from the root, the runner in a test binary:
+/// SAFETY.md's zio checks on in every test build, Debug or not (see
+/// src/safety/test_hooks.zig). Only a binary with zio reads it, and only
+/// those get `test_hooks.zig`, which declares it.
+pub const zio_options = hooks.zio_options;
+
 /// ANOLE: test sharding (Bazel's TEST_SHARD_INDEX/TEST_TOTAL_SHARDS,
 /// adapted). With ANOLE_TEST_SHARD=i/n the binary runs only the tests whose
 /// index in `builtin.test_functions` is i modulo n: in server mode its
