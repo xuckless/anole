@@ -251,7 +251,7 @@ fn roundTrip(in: []const u8, out: []const u8) !void {
     try testing.expectEqualStrings(out, (try parse(in)).toString(&buf));
 }
 
-test "parse and print" {
+test "Decimal128: a string parses to the canonical form; inexact, overflowing and malformed strings are refused" {
     try roundTrip("0", "0");
     try roundTrip("-0", "-0");
     try roundTrip("12.70", "12.70");
@@ -274,7 +274,7 @@ test "parse and print" {
     try testing.expectError(error.InvalidDecimal, parse("0sNaN"));
 }
 
-test "fromInt" {
+test "Decimal128: fromInt prints every i64 exactly, minInt included" {
     var buf: [max_string_len]u8 = undefined;
     try testing.expectEqualStrings("-42", fromInt(-42).toString(&buf));
     try testing.expectEqualStrings("-9223372036854775808", fromInt(std.math.minInt(i64)).toString(&buf));

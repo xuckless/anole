@@ -67,7 +67,7 @@ pub fn eql(a: ObjectId, b: ObjectId) bool {
     return std.mem.eql(u8, &a.bytes, &b.bytes);
 }
 
-test "parse and print" {
+test "ObjectId: hex in either case parses and prints lower-case; a wrong length or a non-hex digit is refused" {
     const id = try parse("56E1FC72e0c917e9c4714161");
     try std.testing.expectEqualStrings("56e1fc72e0c917e9c4714161", &id.toHex());
     try std.testing.expectEqual(0x56e1fc72, id.timestamp());

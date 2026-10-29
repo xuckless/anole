@@ -263,7 +263,7 @@ test "Time: format, and parse back" {
     }
 }
 
-test "Time: numbers beyond the range" {
+test "Time: out-of-range numbers are OutOfRange in the checked constructors and saturate in the others" {
     const max = std.math.maxInt(i64);
     const min = std.math.minInt(i64);
     try testing.expectError(error.OutOfRange, Time.fromSecondsChecked(max));

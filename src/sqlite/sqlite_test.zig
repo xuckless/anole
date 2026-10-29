@@ -575,7 +575,7 @@ test "sqlite: :memory: is one database seen from every executor" {
 /// A query that runs until interrupted.
 const forever = "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r) SELECT count(*) FROM r";
 
-test "sqlite: a timeout or a cancel interrupts a long query within milliseconds, on a reader and on the writer" {
+test "sqlite: a timeout or a cancel interrupts a query that never ends, on a reader and on the writer" {
     var r: Runtime = undefined;
     try r.init(2, 2);
     defer r.deinit();

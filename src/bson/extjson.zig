@@ -629,7 +629,7 @@ fn expectJson(expected: []const u8, bson: []const u8, mode: Mode) !void {
     try testing.expectEqualStrings(expected, out);
 }
 
-test "canonical and relaxed output" {
+test "Extended JSON: canonical wraps every number and date, relaxed writes plain numbers and ISO dates, regex options sorted" {
     const bytes = try @import("mapping.zig").encode(testing.allocator, .{
         .i = 1,
         .l = @as(i64, 2),
