@@ -887,7 +887,16 @@ const StressTask = struct {
                 },
                 else => {
                     t.kinds[i] = try sendOne(t.client, &c, record);
-                    try t.client.with(.{ .timeout = .fromSeconds(30) }).flush(&c);
+                    // A flush waits until nothing is pending, the other
+                    // tasks' records included: under their load it may time
+                    // out (delivery_pending), which is its contract.
+                    t.client.with(.{ .timeout = .fromSeconds(1) }).flush(&c) catch |err| switch (err) {
+                        error.Canceled => return error.Canceled,
+                        else => {
+                            const e = db.lastError(&c) orelse return err;
+                            if (!std.mem.eql(u8, e.code, "delivery_pending")) return err;
+                        },
+                    };
                 },
             }
         }
