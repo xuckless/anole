@@ -269,7 +269,11 @@ const SlowLink = struct {
     }
 };
 
-test "a live server behind a long backlog on a slow link is not dropped: PINGs that wait behind it do not count" {
+test "a live server behind a long backlog on a slow link is not dropped: PINGs that wait behind it do not count [timing]" {
+    // Speed-bound (D6): the fake server reads at ~8 MB/s; a slower machine
+    // makes a PING wait more than two intervals and a correct client drops
+    // the connection. The scale is set by the kernel's socket buffers.
+    try test_wait.requireTiming();
     const io = testing.io;
     var listener = try FakeServer.listen(io);
     defer listener.deinit(io);

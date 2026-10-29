@@ -892,7 +892,15 @@ fn raceTimeoutsTask(rounds: u32, tally: *Tally, failure: *?anyerror) void {
     };
 }
 
-test "a reply that comes at the moment of the timeout, 1000 times: the reply or Timeout, never both" {
+test "a reply that comes at the moment of the timeout: the reply or Timeout, never both" {
+    // One pair, 13 rounds: every shift (-2 to +1 ms in 250 us steps) once.
+    var tally: Tally = .{};
+    try raceTimeouts(13, &tally);
+    try testing.expectEqual(13, tally.replies + tally.ended);
+}
+
+test "a reply that comes at the moment of the timeout, 1000 times: the reply or Timeout, never both [stress]" {
+    try test_wait.requireStress();
     const io = testing.io;
     const pairs = 10;
     var tallies: [pairs]Tally = @splat(.{});
