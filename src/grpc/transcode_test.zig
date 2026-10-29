@@ -794,8 +794,24 @@ test "transcoding: off for a registration, only the gRPC routes serve" {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const rest = try http1(gpa, arena, io, port, .{ .method = .get, .path = "/v1/books/one" });
-    try std.testing.expectEqual(@as(u16, 404), rest.status);
+    // One request per REST binding kind (GET, POST, PATCH, PUT, DELETE,
+    // the custom SEARCH and a custom verb): none of them is routed.
+    const bindings = [_]Exchange{
+        .{ .method = .get, .path = "/v1/books/one" },
+        .{ .method = .post, .path = "/v1/shelves/s2/books?bookId=b9", .body = "{\"title\":\"Dune\"}" },
+        .{ .method = .patch, .path = "/v1/shelves/s/books/b?mask=isbn", .body = "{\"title\":\"T\"}" },
+        .{ .method = .put, .path = "/v1/shelves/s/books/b", .body = "{\"book\":{\"title\":\"U\"},\"mask\":\"m\"}" },
+        .{ .method = .delete, .path = "/v1/shelves/s/books/b" },
+        .{ .method = .search, .path = "/v1/books", .body = "{\"view\":\"S\"}" },
+        .{ .method = .post, .path = "/v1/shelves/s/books/b:publish", .body = "{\"view\":\"V\"}" },
+    };
+    for (bindings) |x| {
+        const rest = try http1(gpa, arena, io, port, x);
+        std.testing.expectEqual(@as(u16, 404), rest.status) catch |err| {
+            std.debug.print("{s} {s}\n", .{ @tagName(x.method), x.path });
+            return err;
+        };
+    }
     const rpc = try http1(gpa, arena, io, port, .{ .method = .post, .path = "/transcode.Library/GetBook", .body = "{\"name\":\"c\"}" });
     try std.testing.expectEqual(@as(u16, 200), rpc.status);
 }

@@ -36,10 +36,12 @@ fn unary(call: *grpc.Call, req: pb.EchoRequest) anyerror!pb.EchoResponse {
     }
     if (std.mem.eql(u8, req.message, "bin-trailer")) try call.addBinaryTrailer("x-raw-bin", "\x00\r\n\xff");
     if (std.mem.eql(u8, req.message, "reused-buffer")) {
-        // The value lives in a buffer the handler overwrites before it
-        // returns: the trailer must be a copy.
+        // The name and the value live in buffers the handler overwrites
+        // before it returns: the trailer must copy both.
+        var name_buf: [16]u8 = undefined;
         var buf: [16]u8 = undefined;
-        try call.addTrailer("x-formatted", try std.fmt.bufPrint(&buf, "value {d}", .{7}));
+        try call.addTrailer(try std.fmt.bufPrint(&name_buf, "x-formatted", .{}), try std.fmt.bufPrint(&buf, "value {d}", .{7}));
+        @memset(&name_buf, 'q');
         @memset(&buf, 'q');
     }
     try call.addTrailer("x-echoed", "yes");
@@ -443,7 +445,7 @@ test "grpc: addBinaryTrailer sends its value as unpadded base64" {
     }.run);
 }
 
-test "grpc: a trailer added from a buffer the handler reuses arrives intact" {
+test "grpc: a trailer added from name and value buffers the handler reuses arrives intact" {
     try withEchoServer(.{}, struct {
         fn run(env: *EchoEnv) !void {
             try std.testing.expectEqualStrings("grpc-status:0\r\nx-formatted:value 7\r\nx-echoed:yes\r\n", try webTrailers(env, "reused-buffer"));

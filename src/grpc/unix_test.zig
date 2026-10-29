@@ -23,7 +23,7 @@ fn newArena() std.heap.ArenaAllocator {
 /// behind by a server that is gone sits at the path first.
 fn withUnixServer(comptime body: fn (*Server(void), []const u8, []const u8) anyerror!void) !void {
     // Windows: no AF_UNIX listener yet (docs/grpc.md: "Windows needs
-    // `AF_UNIX` support and comes after 0.4"); tracked in TODO.md.
+    // `AF_UNIX` support and comes after 0.4").
     if (comptime builtin.os.tag == .windows or !features.http2 or !features.grpc) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
