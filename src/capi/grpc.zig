@@ -598,17 +598,28 @@ fn start(x: *Exec, m: *const Method, call: *Call, message: []const u8, timeout_n
     var canceled = false;
     while (!x.ring.push(.{ .handle = x.handleOf(si, gen), .rec = null })) {
         std.debug.assert(d == null);
-        x.waitRoom(0, g.deadline) catch |err| switch (err) {
-            error.Canceled => {
-                canceled = true;
-                break;
-            },
-            error.Timeout => {
+        const ended: anyerror = ended: {
+            x.waitRoom(0, g.deadline) catch |err| switch (err) {
+                error.Canceled => {
+                    canceled = true;
+                    break;
+                },
                 // The call's deadline passed while the consumer was behind.
-                canceled = true;
-                break;
-            },
+                error.Timeout => {
+                    _ = e.expired_count.fetchAdd(1, .monotonic);
+                    break :ended call.fail(.deadline_exceeded, "deadline exceeded");
+                },
+                // `destroy`: the consumer will never make room.
+                error.Abandoned => break :ended call.fail(.unavailable, "the server is stopping"),
+            };
+            continue;
         };
+        // Never handed over, so the consumer knows nothing of it: the call
+        // ends here, with its status. Neither end is a cancel (none was
+        // delivered), so neither may go through `serving.finish` as
+        // `error.Canceled`: its re-arm (`io.recancel()`) needs one (C3).
+        x.release(si);
+        return serving.finish(call, ended);
     }
     x.consumer.?.wake();
     if (d != null) {

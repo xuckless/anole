@@ -1258,8 +1258,8 @@ fn drainCounts(c: *engine.Consumer, counts: *[64]u32, want: u32) !void {
 
 fn postMany(x: *engine.Exec, n: u32, posted: *std.atomic.Value(u32), stop: *const std.atomic.Value(bool)) std.Io.Cancelable!void {
     for (0..n) |_| {
-        // A canceled wait for room ends only that post: the test's stop
-        // ends the loop.
+        // A canceled poster still waits for room, up to 1 s per record
+        // (`postRecord`): the test's stop ends the loop at once.
         if (stop.load(.acquire)) return;
         const rec = engine.newRecord(@sizeOf(abi.Event), .writable, 7) catch return;
         x.postRecord(rec, true);
@@ -1299,6 +1299,232 @@ test "capi engine: a full ring parks the executor on the room futex" {
     try drainCounts(c, &counts, 8);
     try f.await(e.io);
     try std.testing.expectEqual(@as(u32, 8), counts[@backingInt(abi.EventType.writable)]);
+}
+
+/// A poster that is canceled while it waits for ring room: three records
+/// with `wait` into a ring of 2 (the third parks), then the poster's next
+/// cancelation point.
+const RoomCancel = struct {
+    const PostFuture = std.Io.Future(std.Io.Cancelable!void);
+
+    /// Set by `engine.test_room_canceled`: the cancel ended the wait.
+    var landed: std.atomic.Value(bool) = .init(false);
+
+    fn hook() void {
+        landed.store(true, .release);
+    }
+
+    fn post(x: *engine.Exec, posted: *std.atomic.Value(u32)) std.Io.Cancelable!void {
+        for (0..3) |_| {
+            const rec = engine.newRecord(@sizeOf(abi.Event), .writable, 7) catch return;
+            x.postRecord(rec, true);
+            _ = posted.fetchAdd(1, .release);
+        }
+        try x.engine.io.checkCancel();
+    }
+
+    /// The canceler task: what the poster returned once canceled.
+    fn cancel(io: std.Io, f: *PostFuture) std.Io.Cancelable!void {
+        return f.cancel(io);
+    }
+
+    const Parked = struct {
+        posted: *std.atomic.Value(u32),
+        x: *engine.Exec,
+        fn waiting(p: @This()) bool {
+            return p.posted.load(.acquire) == 2 and p.x.room_waiters.load(.seq_cst) == 1;
+        }
+    };
+
+    fn hasLanded(_: void) bool {
+        return landed.load(.acquire);
+    }
+
+    /// Runs the poster until it is parked for room, cancels it from a
+    /// second task and waits until the cancel reached `postRecord`. The
+    /// caller drains and then awaits `canceler`.
+    const Run = struct {
+        e: *engine.Engine,
+        posted: std.atomic.Value(u32) = .init(0),
+        poster: ?PostFuture = null,
+        canceler: ?PostFuture = null,
+
+        fn start(r: *Run) !void {
+            landed.store(false, .release);
+            engine.test_room_canceled = &hook;
+            const x = &r.e.execs[0];
+            r.poster = try r.e.io.concurrent(post, .{ x, &r.posted });
+            try wait.waitUntil(engine.threadedIo(), "two posted, and the poster waits for room", Parked{ .posted = &r.posted, .x = x }, Parked.waiting);
+            r.canceler = try r.e.io.concurrent(cancel, .{ r.e.io, &r.poster.? });
+            try wait.waitUntil(engine.threadedIo(), "the cancel reached the poster's wait for room", {}, hasLanded);
+        }
+
+        /// Collects both tasks (once, whichever way the test ended) and
+        /// returns what the poster returned.
+        fn finish(r: *Run) std.Io.Cancelable!void {
+            defer engine.test_room_canceled = null;
+            if (r.canceler) |*g| {
+                defer r.canceler = null;
+                defer r.poster = null;
+                return g.await(r.e.io);
+            }
+            if (r.poster) |*f| {
+                defer r.poster = null;
+                return f.cancel(r.e.io);
+            }
+        }
+    };
+};
+
+test "capi engine: a poster canceled while it waits for ring room still delivers its record" {
+    const e, const c = try ringEngine(2);
+    defer e.destroy();
+    // The poster's uncancelable wait outlasts this test's own polling
+    // deadline: the claim must not depend on polling within 1 s (D6).
+    engine.test_cancel_post_wait_ns = wait.deadline().nanoseconds;
+    defer engine.test_cancel_post_wait_ns = null;
+    var r: RoomCancel.Run = .{ .e = e };
+    defer _ = r.finish() catch {};
+    try r.start();
+    // The consumer makes room: the third record (posted before the cancel)
+    // still arrives, in its place behind the first two.
+    var counts: [64]u32 = @splat(0);
+    try drainCounts(c, &counts, 3);
+    try std.testing.expectEqual(@as(u32, 3), counts[@backingInt(abi.EventType.writable)]);
+}
+
+test "capi engine: a poster canceled while it waits for ring room passes the cancel on" {
+    const e, const c = try ringEngine(2);
+    defer e.destroy();
+    var r: RoomCancel.Run = .{ .e = e };
+    defer _ = r.finish() catch {};
+    try r.start();
+    // Room for the third record; then the poster reaches its next
+    // cancelation point, where the cancel must still be pending.
+    var counts: [64]u32 = @splat(0);
+    try drainCounts(c, &counts, 2);
+    try std.testing.expectError(error.Canceled, r.finish());
+}
+
+/// `destroy` on a thread of its own, so the test can wait for it under the
+/// hang guard.
+pub const Destroyer = struct {
+    e: *engine.Engine,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(d: *Destroyer) void {
+        d.e.destroy();
+        d.done.store(true, .release);
+    }
+
+    fn finished(d: *Destroyer) bool {
+        return d.done.load(.acquire);
+    }
+
+    /// Destroys `e`, which has a task parked for ring room (nobody polls),
+    /// and waits for it on `io` under the hang guard. The caller's
+    /// `timeouts.shutdown_ms` outlasts the guard, so a destroy that waits
+    /// for the parked task fails here; the destroy still ends once that
+    /// bound has passed (its drain cancels what is left), and the join
+    /// waits for it. Nothing polls meanwhile: the engine may be freed under
+    /// a poll.
+    pub fn withTaskParked(io: std.Io, e: *engine.Engine, comptime what: []const u8) !void {
+        var d: Destroyer = .{ .e = e };
+        const t = try std.Thread.spawn(.{}, run, .{&d});
+        defer t.join();
+        try wait.waitUntil(io, "destroy finished with " ++ what ++ " parked for ring room", &d, finished);
+    }
+};
+
+test "capi engine: destroy does not wait for a canceled poster's ring room" {
+    const e, _ = try ringEngine(2);
+    // The poster's own bound outlasts the hang guard below: while nobody
+    // polls, only `destroy` can end its wait in time.
+    engine.test_cancel_post_wait_ns = 3 * wait.deadline().nanoseconds;
+    defer engine.test_cancel_post_wait_ns = null;
+    RoomCancel.landed.store(false, .release);
+    engine.test_room_canceled = &RoomCancel.hook;
+    defer engine.test_room_canceled = null;
+    const x = &e.execs[0];
+    var posted: std.atomic.Value(u32) = .init(0);
+    var poster: ?RoomCancel.PostFuture = null;
+    // Until the canceler owns the poster, a failure cancels it (with the
+    // plain 1 s bound) and destroys the engine here.
+    var handed = false;
+    defer if (!handed) {
+        engine.test_cancel_post_wait_ns = null;
+        if (poster) |*f| _ = f.cancel(e.io) catch {};
+        e.destroy();
+    };
+    poster = try e.io.concurrent(RoomCancel.post, .{ x, &posted });
+    try wait.waitUntil(engine.threadedIo(), "two posted, and the poster waits for room", RoomCancel.Parked{ .posted = &posted, .x = x }, RoomCancel.Parked.waiting);
+    // The canceler runs in the engine's own task group, as the tasks that
+    // post do: the teardown waits for it, and so for the poster.
+    try e.tasks.concurrent(e.io, RoomCancel.cancel, .{ e.io, &poster.? });
+    handed = true;
+    try wait.waitUntil(engine.threadedIo(), "the cancel reached the poster's wait for room", {}, RoomCancel.hasLanded);
+    // Nobody polls: `destroy` (the consumer hears nothing more) must not
+    // wait for room the consumer will never make.
+    var d: Destroyer = .{ .e = e };
+    const t = try std.Thread.spawn(.{}, Destroyer.run, .{&d});
+    defer t.join();
+    try wait.waitUntil(engine.threadedIo(), "destroy finished with the canceled poster parked", &d, Destroyer.finished);
+    try std.testing.expectEqual(@as(u32, 3), posted.load(.acquire));
+}
+
+/// A task of executor `x` waits for ring room.
+fn roomWaited(x: *engine.Exec) bool {
+    return x.room_waiters.load(.seq_cst) == 1;
+}
+
+test "capi engine: destroy ends an HTTP/1.1 request parked for ring room" {
+    // The route's deadline and the drain's bound both outlast the hang
+    // guard: while nobody polls, only `destroy` ending the parked wait at
+    // once makes it in time (a drain that gives up and cancels the task
+    // would not).
+    const json = try std.fmt.allocPrint(alloc,
+        \\{{"executors": 1, "limits": {{"queue": 2}}, "timeouts": {{"request_ms": {d}, "shutdown_ms": {d}}},
+        \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
+        \\ "routes": [{{"path": "/x", "handler": 1}}]}}
+    , .{ 3 * @as(u64, wait.deadlineMs()), 2 * @as(u64, wait.deadlineMs()) });
+    defer alloc.free(json);
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    var destroying = false;
+    defer if (!destroying) e.destroy();
+    _ = try e.attach(null, null, false);
+    try e.start();
+    const io = engine.threadedIo();
+    var conns: [3]?std.Io.net.Stream = @splat(null);
+    defer for (conns) |s| if (s) |st| st.close(io);
+    // Nobody polls: two requests fill the ring, the third's task waits for
+    // room (HTTP/1.1 does not detach).
+    for (&conns) |*slot| {
+        const s = try (try std.Io.net.IpAddress.parse("127.0.0.1", e.port(0))).connect(io, .{ .mode = .stream });
+        slot.* = s;
+        var wbuf: [128]u8 = undefined;
+        var w = s.writer(io, &wbuf);
+        try w.interface.writeAll("GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+        try w.interface.flush();
+    }
+    try wait.waitUntil(io, "a request's task waits for ring room", &e.execs[0], roomWaited);
+    destroying = true;
+    try Destroyer.withTaskParked(io, e, "an HTTP/1.1 request");
+    // The parked request (whichever of the three) was answered, not
+    // dropped; the two handed over end the same way.
+    for (&conns) |*slot| {
+        const s = slot.*.?;
+        var rbuf: [512]u8 = undefined;
+        var r = s.reader(io, &rbuf);
+        const got = try r.interface.allocRemaining(alloc, .limited(4096));
+        defer alloc.free(got);
+        try std.testing.expectStringStartsWith(got, "HTTP/1.1 503 ");
+        try std.testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nthe server is stopping"));
+    }
 }
 
 fn postAdvisory(x: *engine.Exec) std.Io.Cancelable!void {
