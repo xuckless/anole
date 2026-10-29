@@ -290,7 +290,7 @@ test "metadata append is atomic at every allocation failure" {
 
 test "metadata handles every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        @import("../testing/no_resize.zig").allocator,
         testMetadataAllocations,
         .{},
     );

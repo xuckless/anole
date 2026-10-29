@@ -570,7 +570,7 @@ test "load frees everything when memory runs out" {
     defer environ.deinit();
     try environ.put("APP_LOG_LEVEL", "warn");
 
-    try testing.checkAllAllocationFailures(testing.allocator, loadEverything, .{ tmp.dir, &environ });
+    try testing.checkAllAllocationFailures(@import("../testing/no_resize.zig").allocator, loadEverything, .{ tmp.dir, &environ });
 }
 
 /// Loads a `T` and expects exactly the `expected` problems.

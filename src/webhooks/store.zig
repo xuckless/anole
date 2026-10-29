@@ -811,24 +811,7 @@ fn buildAndFreeSql(gpa: std.mem.Allocator, d: Dialect) !void {
     freeSql(gpa, try buildSql(gpa, d, "anole_"));
 }
 
-/// The test allocator with every resize and remap refused. The test
-/// allocator grows a block in place only while it is the last one in its
-/// bucket, so whether `toOwnedSlice` or a growing `allocPrint` allocates
-/// again depends on what ran before; checkAllAllocationFailures needs the
-/// same count on every run.
-const no_resize_allocator: std.mem.Allocator = .{
-    // SAFETY: the vtable never reads its context pointer.
-    .ptr = undefined,
-    .vtable = &.{ .alloc = noResizeAlloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = noResizeFree },
-};
-fn noResizeAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
-    return std.testing.allocator.rawAlloc(len, alignment, ra);
-}
-fn noResizeFree(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
-    std.testing.allocator.rawFree(memory, alignment, ra);
-}
-
 test "webhooks store: building the SQL leaks nothing when any allocation fails" {
-    try std.testing.checkAllAllocationFailures(no_resize_allocator, buildAndFreeSql, .{.postgres});
-    try std.testing.checkAllAllocationFailures(no_resize_allocator, buildAndFreeSql, .{.sqlite});
+    try std.testing.checkAllAllocationFailures(@import("../testing/no_resize.zig").allocator, buildAndFreeSql, .{.postgres});
+    try std.testing.checkAllAllocationFailures(@import("../testing/no_resize.zig").allocator, buildAndFreeSql, .{.sqlite});
 }

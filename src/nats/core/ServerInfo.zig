@@ -121,5 +121,5 @@ fn parseAndFree(gpa: std.mem.Allocator, json: []const u8) !void {
 }
 
 test "no leaks when an allocation fails" {
-    try testing.checkAllAllocationFailures(testing.allocator, parseAndFree, .{golden.info_cluster_json});
+    try testing.checkAllAllocationFailures(@import("../../testing/no_resize.zig").allocator, parseAndFree, .{golden.info_cluster_json});
 }

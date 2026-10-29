@@ -132,7 +132,7 @@ fn initAndDeinit(gpa: Allocator, options: Options) !void {
 }
 
 test "nothing leaks when an allocation fails" {
-    try testing.checkAllAllocationFailures(testing.allocator, initAndDeinit, .{Options{
+    try testing.checkAllAllocationFailures(@import("../../../testing/no_resize.zig").allocator, initAndDeinit, .{Options{
         .servers = &.{ "a:1", "b:2" },
         .name = "n",
         .auth = .{ .user_password = .{ .username = "u", .password = "p" } },
