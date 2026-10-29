@@ -2595,6 +2595,62 @@ test "redis: acquire runs its calls on one connection and gives it back" {
     try testing.expect(Client.ping(client, io));
 }
 
+/// What `test_after_take` does to the next connection handed out, once,
+/// when armed: shuts its sending side, so the call's first write fails at
+/// once (EPIPE) with nothing sent (live_test.zig's `Break.before`).
+const BreakNext = struct {
+    var armed: std.atomic.Value(bool) = .init(false);
+
+    fn hook(s: *ClientStream) void {
+        if (!armed.swap(false, .acq_rel)) return;
+        s.socket.shutdown(s.io, .send) catch {};
+    }
+};
+
+test "redis: a pooled connection that breaks before sending, while the server is gone, fails the call and is freed once" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    var listening = true;
+    defer if (listening) fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    var served = true;
+    defer if (served) serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 1 });
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    // One idle connection in the pool.
+    try testing.expectEqual(@as(i64, 42), try client.incr(&c, "n"));
+
+    // The server goes away: its sessions end and new dials are refused.
+    served = false;
+    serving.cancel(io) catch {};
+    listening = false;
+    fake.listener.deinit(io);
+
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    test_after_take = BreakNext.hook;
+    defer test_after_take = null;
+    BreakNext.armed.store(true, .release);
+    // The idle connection fails before sending, so the call runs once more
+    // on a new one, which cannot be dialed: a 503, and the first
+    // connection was closed and freed once.
+    try testing.expectError(error.ServiceUnavailable, client.incr(&c, "n"));
+    try testing.expect(!BreakNext.armed.load(.acquire));
+}
+
 test "redis: a server that cannot be reached is a 503, and /readyz says so" {
     const zio = @import("zio");
     const gpa = testing.allocator;
