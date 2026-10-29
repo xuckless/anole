@@ -19,6 +19,10 @@ type ramp struct {
 	base, transport, cgroup, out string
 	clip                         *clip
 	step, maxTime, collapse      time.Duration
+	hold                         time.Duration
+	stopBelow                    float64
+	fastTo, fastBatch            int
+	settle                       time.Duration
 	videoDeadline, audioDeadline time.Duration
 	chatEvery                    time.Duration
 	maxUsers, batch              int
@@ -101,6 +105,11 @@ type vuser struct {
 	vseq    atomic.Uint32
 	aseq    atomic.Uint32
 	closing atomic.Bool
+
+	// Per user, for the fairness file (per_user.jsonl): counts since the
+	// hold began (or the start) and the worst one-way latency in that time.
+	nVideo, nShown, nAudio atomic.Int64
+	maxLatUS               atomic.Int64
 }
 
 // chain tracks one sender's video at this receiver: a frame shows only if it
@@ -141,6 +150,10 @@ func (r *ramp) run() error {
 	stepWin := &window{}
 	stepStart := r.start
 	collapsedFor, refusedFor := 0, 0
+	held := false
+	lowSteps := 0
+	settled := false
+	fast := r.fastTo > 0 && r.fastTo <= r.maxUsers
 	reason := ""
 	nextUser := r.start
 	tick := time.NewTicker(time.Second)
@@ -153,13 +166,42 @@ func (r *ramp) run() error {
 			n := r.count()
 			if n > 0 {
 				writeJSON(stepF, r.summary(stepWin, n, now.Sub(stepStart), cg, load, true))
+				if r.stopBelow > 0 && stepWin.VSent > 0 && ratio(stepWin.VShown, stepWin.VSent) < r.stopBelow {
+					lowSteps++
+				} else {
+					lowSteps = 0
+				}
+				if lowSteps >= 2 {
+					reason = fmt.Sprintf("video under %.0f%% for 2 steps", 100*r.stopBelow)
+					break
+				}
 			}
 			stepWin, stepStart = &window{}, now
+			if fast && n >= r.fastTo && !settled {
+				// At the fast start's target: one step of the same users,
+				// -settle long, before the normal steps.
+				settled = true
+				nextUser = now.Add(r.settle)
+				fmt.Printf("settling %d users for %s\n", n, r.settle)
+				continue
+			}
 			if n >= r.maxUsers {
+				if r.hold > 0 && !held {
+					// One more step of the same users, -hold long.
+					held = true
+					r.resetPerUser()
+					nextUser = now.Add(r.hold)
+					fmt.Printf("holding %d users for %s\n", n, r.hold)
+					continue
+				}
 				reason = "max users"
 				break
 			}
-			for i := 0; i < r.batch; i++ {
+			b := r.batch
+			if fast && n < r.fastTo {
+				b = min(r.fastBatch, r.fastTo-n)
+			}
+			for i := 0; i < b; i++ {
 				if i == 2 && n == 0 {
 					// Users 0 and 1 are the probe call: let them pair
 					// before the rest of the first batch joins the lobby.
@@ -226,6 +268,7 @@ func (r *ramp) run() error {
 	json.NewEncoder(f).Encode(sum)
 	f.Close()
 	fmt.Printf("stopped: %s at %d users after %s\n", reason, r.count(), time.Since(r.start).Round(time.Second))
+	r.writePerUser()
 	r.mu.Lock()
 	for _, u := range r.users {
 		u.closing.Store(true)
@@ -235,6 +278,34 @@ func (r *ramp) run() error {
 	}
 	r.mu.Unlock()
 	return nil
+}
+
+// resetPerUser starts the per-user counts over (at the hold).
+func (r *ramp) resetPerUser() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, u := range r.users {
+		u.nVideo.Store(0)
+		u.nShown.Store(0)
+		u.nAudio.Store(0)
+		u.maxLatUS.Store(0)
+	}
+}
+
+// writePerUser writes per_user.jsonl: what each user received (from its peer).
+func (r *ramp) writePerUser() {
+	f, err := os.Create(filepath.Join(r.out, "per_user.jsonl"))
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, u := range r.users {
+		enc.Encode(map[string]any{"user": u.idx, "in_call": u.inCall.Load(), "video_recv": u.nVideo.Load(),
+			"video_shown": u.nShown.Load(), "audio_recv": u.nAudio.Load(), "max_lat_ms": float64(u.maxLatUS.Load()) / 1000})
+	}
 }
 
 func (r *ramp) count() int {
@@ -446,6 +517,12 @@ func (u *vuser) onMedia(b []byte) {
 		shown := onTime && !ch.broken
 		ch.lastSeq = int64(h.Seq)
 		u.mu.Unlock()
+		u.nVideo.Add(1)
+		if shown {
+			u.nShown.Add(1)
+		}
+		for m := u.maxLatUS.Load(); lat > m && !u.maxLatUS.CompareAndSwap(m, lat); m = u.maxLatUS.Load() {
+		}
 		r.add(func(w *window) {
 			w.VRecv++
 			w.RxBytes += int64(len(b))
@@ -462,6 +539,7 @@ func (u *vuser) onMedia(b []byte) {
 		})
 	} else {
 		onTime := ok && lat <= r.audioDeadline.Microseconds()
+		u.nAudio.Add(1)
 		r.add(func(w *window) {
 			w.ARecv++
 			w.RxBytes += int64(len(b))

@@ -1,0 +1,19 @@
+22:39:49 ramp epoll r1 a: good 860 users, reached 940 (collapsed (under 10% of video frames shown for 30s)), peak mem 608 MB {"container":"running exit=0 oom=false"}
+23:05:59 ramp epoll r1 b: 3000 users held 5.0 s: 12.50 µs CPU/msg (0.806 cores, 64,496 msg/s), video p50/p99 275091.1/592260.5 ms, audio p99 735747.8 ms, video ok 33.49%, mem 1748 MB, errors 0 {"container":"running exit=0 oom=false"}
+23:32:10 ramp epoll r1 c: good 790 users, reached 3000 (max users), peak mem 1825 MB {"container":"running exit=0 oom=false"}
+23:40:36 ramp uring r1 a: good 830 users, reached 870 (video under 40% for 2 steps), peak mem 519 MB {"container":"running exit=0 oom=false"}
+23:50:27 ramp uring r1 b: good 810 users, reached 1040 (video under 40% for 2 steps), peak mem 601 MB {"container":"running exit=0 oom=false"}
+00:00:22 ramp uring r1 c: good 780 users, reached 1050 (video under 40% for 2 steps), peak mem 621 MB {"container":"running exit=0 oom=false"}
+00:18:49 prof-epoll a: 950 in call, held 5.0 s: served 89%, starved 0%, video recv per receiver min/p10/med/max 4.95/5.97/13.97/23.00, worst latency med/max 3115/3441 ms, audio p50/p99 601.2/934.4 ms, video ok 1.2%, 11.56 µs/msg, RSS 578 MB, 0.38 reads/in, 1.00 writes/relayed
+00:18:49 prof-epoll a: 1 samples, memcpy/memmove self 0.0%, in TLS stacks 0.0%; top self: 
+00:19:16 (the prof-epoll a line above is void: vcload's collapse rule ended it before the hold; rerun with -collapse 24h)
+00:23:41 prof-epoll a: 950 in call, held 61.7 s: served 0%, starved 100%, video recv per receiver min/p10/med/max 0.87/0.91/0.96/1.04, worst latency med/max 8505/11884 ms, audio p50/p99 10506.2/20687.0 ms, video ok 0.0%, 11.74 µs/msg, RSS 611 MB, 0.37 reads/in, 1.01 writes/relayed
+00:23:41 prof-epoll a: 14981 samples, memcpy/memmove self 11.9%, in TLS stacks 82.2%; top self: compiler_rt.memcpy.memcpyFast 10.9%, nft_do_chain 5.2%, _copy_to_iter 4.9%, compiler_rt.fastMemset 3.4%, aes_gcm_enc_update_vaes_avx2 3.1%
+00:27:58 prof-epoll b: 950 in call, held 60.6 s: served 33%, starved 58%, video recv per receiver min/p10/med/max 0.77/0.90/1.00/1.22, worst latency med/max 10394/24917 ms, audio p50/p99 4947.1/28919.5 ms, video ok 37.2%, 10.80 µs/msg, RSS 520 MB, 1.22 reads/in, 0.85 writes/relayed
+00:27:58 prof-epoll b: 14986 samples, memcpy/memmove self 11.0%, in TLS stacks 76.4%; top self: compiler_rt.memcpy.memcpyFast 10.4%, nft_do_chain 5.6%, _copy_to_iter 4.2%, compiler_rt.fastMemset 3.4%, aes_gcm_enc_update_vaes_avx2 3.2%
+00:27:58 done
+00:32:16 fair-epoll a: 950 in call, held 61.7 s: served 0%, starved 100%, video recv per receiver min/p10/med/max 0.91/0.95/0.98/1.04, worst latency med/max 6909/10364 ms, audio p50/p99 7473.8/15253.4 ms, video ok 0.0%, 11.26 µs/msg, RSS 606 MB, 0.37 reads/in, 1.01 writes/relayed
+00:36:33 fair-epoll b: 950 in call, held 60.7 s: served 29%, starved 63%, video recv per receiver min/p10/med/max 0.67/0.90/1.00/1.25, worst latency med/max 11191/26971 ms, audio p50/p99 6270.3/34268.5 ms, video ok 32.0%, 10.90 µs/msg, RSS 531 MB, 1.22 reads/in, 0.86 writes/relayed
+00:40:51 fair-epoll d: 950 in call, held 61.7 s: served 0%, starved 100%, video recv per receiver min/p10/med/max 0.91/0.94/0.97/1.03, worst latency med/max 7156/9904 ms, audio p50/p99 7684.0/16628.8 ms, video ok 0.0%, 11.49 µs/msg, RSS 614 MB, 0.37 reads/in, 1.01 writes/relayed
+00:45:09 fair-epoll e: 950 in call, held 60.7 s: served 32%, starved 57%, video recv per receiver min/p10/med/max 0.75/0.89/1.00/1.18, worst latency med/max 10237/24095 ms, audio p50/p99 4840.4/29474.1 ms, video ok 38.1%, 11.02 µs/msg, RSS 537 MB, 1.17 reads/in, 0.81 writes/relayed
+00:49:28 fair-epoll f: 950 in call, held 61.7 s: served 0%, starved 100%, video recv per receiver min/p10/med/max 0.90/0.93/0.96/1.06, worst latency med/max 8243/11668 ms, audio p50/p99 10394.6/20096.2 ms, video ok 0.0%, 11.67 µs/msg, RSS 620 MB, 0.39 reads/in, 1.01 writes/relayed

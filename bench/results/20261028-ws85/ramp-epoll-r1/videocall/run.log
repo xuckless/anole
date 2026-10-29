@@ -1,0 +1,6 @@
+22:32:01 a ws: ramp
+22:39:49 a ws: stopped: collapsed (under 10% of video frames shown for 30s) at 940 users after 7m47s [running exit=0 oom=false]
+22:40:59 b ws: ramp
+23:05:59 b ws: stopped: max users at 3000 users after 25m0s [running exit=0 oom=false]
+23:07:10 c ws: ramp
+23:32:10 c ws: stopped: max users at 3000 users after 25m0s [running exit=0 oom=false]

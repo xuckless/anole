@@ -1,0 +1,164 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 14K of event 'cpu_core/cycles/P'
+# Event count (approx.): 72700411294
+#
+# Overhead  Symbol                                                                                                                                                                                                                                                                                                                                     
+# ........  ...........................................................................................................................................................................................................................................................................................................................................
+#
+    10.89%  [.] compiler_rt.memcpy.memcpyFast
+     5.29%  [k] nft_do_chain
+     4.96%  [k] _copy_to_iter
+     3.40%  [.] compiler_rt.fastMemset
+     3.08%  [.] aes_gcm_enc_update_vaes_avx2
+     3.08%  [.] aes_gcm_dec_update_vaes_avx2
+     2.31%  [.] runtime.Executor.switchOut
+     2.26%  [k] clear_highpages_kasan_tagged
+     2.01%  [.] websocket.applyMask
+     1.60%  [k] __nf_conntrack_find_get
+     1.48%  [.] websocket.root.Socket.send
+     1.42%  [.] dusty_tls.Connection.Reader.stream
+     1.37%  [k] fdget
+     1.22%  [k] __inet_lookup_established
+     1.19%  [.] bssl::tls_open_app_data(bssl::SSLImpl*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+     1.16%  [.] heap.ArenaAllocator.reset
+     1.10%  [.] main.Session.media
+     1.05%  [k] check_heap_object
+     1.00%  [k] nft_meta_get_eval
+     0.91%  [.] utils.local_run_queue.LocalRunQueue(utils.wait_queue.WaitNode,false).fillFromOverflow
+     0.90%  [k] ep_poll_callback
+     0.89%  [k] __wake_up_common
+     0.86%  [k] _copy_from_iter
+     0.80%  [.] SSL_has_pending
+     0.80%  [.] aes_hw_encrypt
+     0.69%  [k] sock_has_perm
+     0.65%  [.] 0x00000000000a067e
+     0.62%  [k] tcp_sendmsg_locked
+     0.62%  [k] sized_strscpy
+     0.59%  [k] __skb_datagram_iter
+     0.59%  [k] nft_meta_store_ifname
+     0.59%  [.] bssl::CRYPTO_gcm128_init_ctx(bssl::gcm128_key_st const*, bssl::GCM128_CONTEXT*, unsigned char const*, unsigned long)
+     0.56%  [k] tcp_ack
+     0.54%  [k] tcp_recvmsg_locked
+     0.52%  [.] websocket.WebSocket.writeFrameRsv
+     0.52%  [.] dusty_tls.Connection.Writer.writeAll
+     0.51%  [k] __raw_spin_lock_irqsave
+     0.51%  [k] __list_add_valid_or_report
+     0.49%  [.] SSL_write
+     0.49%  [k] __pi_memcpy
+     0.49%  [k] tcp_v4_rcv
+     0.48%  [.] compiler_rt.memmove.memmoveFast
+     0.47%  [.] cfree
+     0.46%  [k] sock_def_readable
+     0.45%  [.] bssl::tls_open_record(bssl::SSLImpl*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+     0.44%  [.] bssl::tls_write_app_data(bssl::SSLImpl*, bool*, unsigned long*, bssl::Span<unsigned char const, 18446744073709551615ul>)
+     0.44%  [k] __sys_sendto
+     0.43%  [k] tcp_rcv_established
+     0.43%  [k] skb_release_data
+     0.43%  [k] expr_call_ops_eval
+     0.41%  [.] main.wsConnect
+     0.37%  [.] BIO_read
+     0.37%  [.] bssl::SSLAEADContext::Open(bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned char, unsigned short, unsigned long, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<unsigned char, 18446744073709551615ul>)
+     0.37%  [.] ssl_read_impl(bssl::SSLImpl*)
+     0.36%  [k] selinux_socket_recvmsg
+     0.36%  [k] selinux_socket_sock_rcv_skb
+     0.35%  [k] strnlen
+     0.34%  [.] EVP_AEAD_CTX_sealv
+     0.34%  [.] CRYPTO_memcmp
+     0.33%  [.] ERR_clear_error
+     0.32%  [.] bssl::SSLAEADContext::ExplicitNonceLen() const
+     0.32%  [.] heap.ArenaAllocator.alloc
+     0.31%  [k] skb_defer_free_flush
+     0.31%  [k] __pi_memset
+     0.31%  [.] Io.Reader.readVec
+     0.30%  [.] BIO_write_ex
+     0.30%  [.] io.operateInner
+     0.29%  [.] malloc
+     0.29%  [.] gcm_gmult_vpclmulqdq_avx2
+     0.29%  [.] Io.net.Stream.Reader.readVec
+     0.27%  [k] nft_do_chain_inet
+     0.26%  [k] ktime_get
+     0.26%  [k] __tcp_transmit_skb
+     0.25%  [.] Io.Reader.readSliceShort
+     0.25%  [.] dusty_tls.Connection.Writer.drain
+     0.25%  [k] tcp_rcv_space_adjust
+     0.25%  [.] Io.net.Stream.Writer.drain
+     0.24%  [.] dusty_tls.Shared.fill
+     0.24%  [k] kfree
+     0.24%  [k] nft_rhash_lookup
+     0.24%  [k] nft_immediate_eval
+     0.23%  [k] tcp_established_options
+     0.23%  [k] tcp_write_xmit
+     0.23%  [k] __sys_recvfrom
+     0.23%  [k] _raw_spin_lock_bh
+     0.22%  [k] tcp_skb_can_collapse
+     0.22%  [.] server.Connection.releaseWriteBuffer
+     0.22%  [k] kmem_cache_free
+     0.22%  [.] ev.sockreg.submitIo__func_1633
+     0.22%  [.] bssl::ssl_open_app_data(bssl::SSLImpl*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+     0.22%  [.] dusty_tls.Shared.sendPending
+     0.22%  [k] nf_hook_slow
+     0.21%  [.] ev.completion.NetSend.getResult
+     0.21%  [k] nft_match_eval
+     0.21%  [.] check_iovec_alias(bssl::Span<crypto_iovec_st const, 18446744073709551615ul>, bssl::Span<crypto_ivec_st const, 18446744073709551615ul>, unsigned char const*, unsigned long, unsigned char const*, unsigned long, unsigned char const*, unsigned long)
+     0.21%  [k] tcp_event_new_data_sent
+     0.20%  [k] __ip_queue_xmit
+     0.20%  [.] bssl::CRYPTO_gcm128_decrypt(bssl::gcm128_key_st const*, bssl::GCM128_CONTEXT*, unsigned char const*, unsigned char*, unsigned long)
+     0.20%  [.] free@plt
+     0.20%  [k] prep_compound_page
+     0.19%  [k] nft_ct_get_fast_eval
+     0.19%  [k] loopback_xmit
+     0.18%  [k] try_charge_memcg
+     0.18%  [.] os.net.send
+     0.17%  [.] bssl::parse_message(bssl::SSLImpl const*, bssl::SSLMessage*, unsigned long*)
+     0.17%  [.] bssl::CRYPTO_gcm128_aad(bssl::gcm128_key_st const*, bssl::GCM128_CONTEXT*, unsigned char const*, unsigned long)
+     0.17%  [k] dst_release
+     0.16%  [.] EVP_AEAD_CTX_openv_detached
+     0.16%  [.] Io.Reader.defaultReadVec
+     0.16%  [.] dusty_tls.bioRead
+     0.16%  [.] bssl::SSLAEADContext::SealScatter(unsigned char*, unsigned char*, unsigned char*, unsigned char, unsigned short, unsigned long, bssl::Span<unsigned char const, 18446744073709551615ul>, unsigned char const*, unsigned long, unsigned char const*, unsigned long)
+     0.15%  [.] bssl::CRYPTO_gcm128_encrypt(bssl::gcm128_key_st const*, bssl::GCM128_CONTEXT*, unsigned char const*, unsigned char*, unsigned long)
+     0.15%  [k] nf_conntrack_in
+     0.15%  [k] detach_if_pending
+     0.15%  [k] kmem_cache_alloc_node_noprof
+     0.15%  [k] skb_page_frag_refill
+     0.15%  [k] nft_do_chain_ipv4
+     0.15%  [k] __virt_addr_valid
+     0.15%  [.] bssl::do_seal_record(bssl::SSLImpl*, unsigned char*, unsigned char*, unsigned char*, unsigned char, unsigned char const*, unsigned long)
+     0.14%  [k] nft_lookup_eval
+     0.14%  [k] ip_finish_output2
+     0.14%  [k] __sk_mem_raise_allocated
+     0.14%  [k] __mod_timer
+     0.13%  [.] 0x00000000000a1ff6
+     0.13%  [.] server.Connection.lendWriteBuffer
+     0.13%  [.] bssl::ssl_handle_open_record(bssl::SSLImpl*, bool*, bssl::ssl_open_record_t, unsigned long, unsigned char)
+     0.13%  [k] __siphash_unaligned
+     0.13%  [k] _find_next_bit
+     0.13%  [k] nf_conntrack_tcp_packet
+     0.13%  [.] io.operateImpl
+     0.13%  [.] bssl::SSLBuffer::EnsureCap(unsigned long, unsigned long)
+     0.12%  [.] bssl::SSLAEADContext::MaxOverhead() const
+     0.12%  [k] __list_del_entry_valid_or_report
+     0.12%  [k] selinux_ip_postroute
+     0.12%  [k] nf_confirm
+     0.12%  [.] SSL_read
+     0.12%  [k] nft_set_do_lookup
+     0.12%  [k] __rcu_read_unlock
+     0.12%  [k] entry_SYSRETQ_unsafe_stack
+     0.11%  [.] Io.Writer.writeAll
+     0.11%  [k] __rcu_read_lock
+     0.11%  [.] ev.loop.Loop.addInternal
+     0.11%  [k] __tcp_select_window
+     0.11%  [k] tcp_current_mss
+     0.11%  [k] nft_counter_eval
+     0.11%  [k] conntrack_mt_v3
+     0.11%  [k] avc_lookup
+     0.10%  [k] skb_clone
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

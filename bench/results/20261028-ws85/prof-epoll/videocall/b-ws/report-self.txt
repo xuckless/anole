@@ -1,0 +1,1959 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 14K of event 'cpu_core/cycles/P'
+# Event count (approx.): 72688439495
+#
+# Overhead  Command    Shared Object      Symbol                                                                                                                                                                                                                                                                                                                                     
+# ........  .........  .................  ...........................................................................................................................................................................................................................................................................................................................................
+#
+    10.38%  videocall  videocall          [.] compiler_rt.memcpy.memcpyFast
+            |          
+             --10.35%--compiler_rt.memcpy.memcpyFast
+                       |          
+                       |--3.07%--dusty_tls.bioRead
+                       |          BIO_read
+                       |          bssl::ssl_read_buffer_extend_to(bssl::SSLImpl*, unsigned long)
+                       |          bssl::ssl_handle_open_record(bssl::SSLImpl*, bool*, bssl::ssl_open_record_t, unsigned long, unsigned char)
+                       |          ssl_read_impl(bssl::SSLImpl*)
+                       |          SSL_peek
+                       |          SSL_read
+                       |          dusty_tls.Connection.Reader.stream
+                       |          Io.Reader.defaultReadVec
+                       |          Io.Reader.readVec
+                       |          Io.Reader.readSliceShort
+                       |          main.wsConnect
+                       |          middleware.Chain(main.App).call
+                       |          middleware.Chain(main.App).run
+                       |          server.Server(main.App).handleRequests
+                       |          server.Server(main.App).serveRequests
+                       |          server.Server(main.App).handleConnectionWrapper
+                       |          group.Group.spawnInto__func_2377.Wrapper.start
+                       |          task.AnyTask.startFn
+                       |          coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       |          0
+                       |          
+                       |--2.17%--dusty_tls.bioWrite
+                       |          BIO_write_ex
+                       |          bssl::ssl_write_buffer_flush(bssl::SSLImpl*)
+                       |          bssl::do_tls_write(bssl::SSLImpl*, unsigned long*, unsigned char, bssl::Span<unsigned char const, 18446744073709551615ul>)
+                       |          bssl::tls_write_app_data(bssl::SSLImpl*, bool*, unsigned long*, bssl::Span<unsigned char const, 18446744073709551615ul>)
+                       |          SSL_write
+                       |          dusty_tls.Connection.Writer.writeAll
+                       |          dusty_tls.Connection.Writer.drain
+                       |          |          
+                       |          |--1.29%--Io.Writer.defaultFlush
+                       |          |          websocket.WebSocket.writeFrameRsv
+                       |          |          websocket.root.Socket.send
+                       |          |          main.Session.media
+                       |          |          main.wsConnect
+                       |          |          middleware.Chain(main.App).call
+                       |          |          middleware.Chain(main.App).run
+                       |          |          server.Server(main.App).handleRequests
+                       |          |          server.Server(main.App).serveRequests
+                       |          |          server.Server(main.App).handleConnectionWrapper
+                       |          |          group.Group.spawnInto__func_2377.Wrapper.start
+                       |          |          task.AnyTask.startFn
+                       |          |          coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       |          |          0
+                       |          |          
+                       |           --0.88%--Io.Writer.writeAll
+                       |                     |          
+                       |                      --0.84%--websocket.WebSocket.writeFrameRsv
+                       |                                websocket.root.Socket.send
+                       |                                main.Session.media
+                       |                                main.wsConnect
+                       |                                middleware.Chain(main.App).call
+                       |                                middleware.Chain(main.App).run
+                       |                                server.Server(main.App).handleRequests
+                       |                                server.Server(main.App).serveRequests
+                       |                                server.Server(main.App).handleConnectionWrapper
+                       |                                group.Group.spawnInto__func_2377.Wrapper.start
+                       |                                task.AnyTask.startFn
+                       |                                coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       |                                0
+                       |          
+                       |--1.94%--Io.Writer.writeAll
+                       |          websocket.WebSocket.writeFrameRsv
+                       |          websocket.root.Socket.send
+                       |          main.Session.media
+                       |          main.wsConnect
+                       |          middleware.Chain(main.App).call
+                       |          middleware.Chain(main.App).run
+                       |          server.Server(main.App).handleRequests
+                       |          server.Server(main.App).serveRequests
+                       |          server.Server(main.App).handleConnectionWrapper
+                       |          group.Group.spawnInto__func_2377.Wrapper.start
+                       |          task.AnyTask.startFn
+                       |          coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       |          0
+                       |          
+                       |--1.70%--SSL_peek
+                       |          SSL_read
+                       |          dusty_tls.Connection.Reader.stream
+                       |          Io.Reader.defaultReadVec
+                       |          Io.Reader.readVec
+                       |          Io.Reader.readSliceShort
+                       |          main.wsConnect
+                       |          middleware.Chain(main.App).call
+                       |          middleware.Chain(main.App).run
+                       |          server.Server(main.App).handleRequests
+                       |          server.Server(main.App).serveRequests
+                       |          server.Server(main.App).handleConnectionWrapper
+                       |          group.Group.spawnInto__func_2377.Wrapper.start
+                       |          task.AnyTask.startFn
+                       |          coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       |          0
+                       |          
+                       |--0.94%--Io.Reader.readSliceShort
+                       |          main.wsConnect
+                       |          middleware.Chain(main.App).call
+                       |          middleware.Chain(main.App).run
+                       |          server.Server(main.App).handleRequests
+                       |          server.Server(main.App).serveRequests
+                       |          server.Server(main.App).handleConnectionWrapper
+                       |          group.Group.spawnInto__func_2377.Wrapper.start
+                       |          task.AnyTask.startFn
+                       |          coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       |          0
+                       |          
+                        --0.34%--dusty_tls.Connection.Writer.drain
+                                  Io.Writer.writeAll
+                                  websocket.WebSocket.writeFrameRsv
+                                  websocket.root.Socket.send
+                                  main.Session.media
+                                  main.wsConnect
+                                  middleware.Chain(main.App).call
+                                  middleware.Chain(main.App).run
+                                  server.Server(main.App).handleRequests
+                                  server.Server(main.App).serveRequests
+                                  server.Server(main.App).handleConnectionWrapper
+                                  group.Group.spawnInto__func_2377.Wrapper.start
+                                  task.AnyTask.startFn
+                                  coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                  0
+
+     5.66%  videocall  [kernel.kallsyms]  [k] nft_do_chain
+            |          
+             --5.52%--nft_do_chain
+                       |          
+                       |--4.00%--nft_do_chain_inet
+                       |          nf_hook_slow
+                       |          |          
+                       |          |--3.33%--ip_rcv
+                       |          |          __netif_receive_skb_one_core
+                       |          |          process_backlog
+                       |          |          __napi_poll
+                       |          |          net_rx_action
+                       |          |          handle_softirqs
+                       |          |          |          
+                       |          |           --3.29%--do_softirq.part.0
+                       |          |                     __local_bh_enable_ip
+                       |          |                     |          
+                       |          |                      --3.27%--__dev_queue_xmit
+                       |          |                                ip_finish_output2
+                       |          |                                ip_output
+                       |          |                                __ip_queue_xmit
+                       |          |                                __tcp_transmit_skb
+                       |          |                                |          
+                       |          |                                |--2.60%--tcp_write_xmit
+                       |          |                                |          __tcp_push_pending_frames
+                       |          |                                |          tcp_sendmsg_locked
+                       |          |                                |          tcp_sendmsg
+                       |          |                                |          __sys_sendto
+                       |          |                                |          __x64_sys_sendto
+                       |          |                                |          do_syscall_64
+                       |          |                                |          entry_SYSCALL_64_after_hwframe
+                       |          |                                |          os.net.send
+                       |          |                                |          ev.backends.linux.epoll.checkCompletion
+                       |          |                                |          ev.sockreg.submitIo__func_1633
+                       |          |                                |          common.waitForIo
+                       |          |                                |          io.netWriteOpImpl
+                       |          |                                |          io.operateInner
+                       |          |                                |          io.operateImpl
+                       |          |                                |          Io.net.Stream.Writer.drain
+                       |          |                                |          Io.Writer.writeAll
+                       |          |                                |          dusty_tls.Shared.sendPending
+                       |          |                                |          |          
+                       |          |                                |           --2.58%--dusty_tls.Connection.Writer.drain
+                       |          |                                |                     |          
+                       |          |                                |                     |--1.38%--Io.Writer.defaultFlush
+                       |          |                                |                     |          |          
+                       |          |                                |                     |           --1.13%--websocket.WebSocket.writeFrameRsv
+                       |          |                                |                     |                     websocket.root.Socket.send
+                       |          |                                |                     |                     main.Session.media
+                       |          |                                |                     |                     main.wsConnect
+                       |          |                                |                     |                     middleware.Chain(main.App).call
+                       |          |                                |                     |                     middleware.Chain(main.App).run
+                       |          |                                |                     |                     server.Server(main.App).handleRequests
+                       |          |                                |                     |                     server.Server(main.App).serveRequests
+                       |          |                                |                     |                     server.Server(main.App).handleConnectionWrapper
+                       |          |                                |                     |                     group.Group.spawnInto__func_2377.Wrapper.start
+                       |          |                                |                     |                     task.AnyTask.startFn
+                       |          |                                |                     |                     coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       |          |                                |                     |                     0
+                       |          |                                |                     |          
+                       |          |                                |                      --1.21%--Io.Writer.writeAll
+                       |          |                                |                                |          
+                       |          |                                |                                 --0.99%--websocket.WebSocket.writeUnbuffered
+                       |          |                                |                                           websocket.WebSocket.writeFrameRsv
+                       |          |                                |                                           websocket.root.Socket.send
+                       |          |                                |                                           |          
+                       |          |                                |                                            --0.97%--main.Session.media
+                       |          |                                |                                                      main.wsConnect
+                       |          |                                |                                                      middleware.Chain(main.App).call
+                       |          |                                |                                                      middleware.Chain(main.App).run
+                       |          |                                |                                                      server.Server(main.App).handleRequests
+                       |          |                                |                                                      server.Server(main.App).serveRequests
+                       |          |                                |                                                      server.Server(main.App).handleConnectionWrapper
+                       |          |                                |                                                      group.Group.spawnInto__func_2377.Wrapper.start
+                       |          |                                |                                                      task.AnyTask.startFn
+                       |          |                                |                                                      coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       |          |                                |                                                      0
+                       |          |                                |          
+                       |          |                                 --0.67%--tcp_recvmsg_locked
+                       |          |                                           tcp_recvmsg
+                       |          |                                           sock_recvmsg
+                       |          |                                           __sys_recvfrom
+                       |          |                                           __x64_sys_recvfrom
+                       |          |                                           do_syscall_64
+                       |          |                                           entry_SYSCALL_64_after_hwframe
+                       |          |                                           os.net.recv
+                       |          |                                           ev.backends.linux.epoll.checkCompletion
+                       |          |                                           |          
+                       |          |                                            --0.39%--ev.sockreg.submitIo__func_1633
+                       |          |                                                      common.waitForIo
+                       |          |                                                      io.netReadOpImpl
+                       |          |                                                      io.operateInner
+                       |          |                                                      io.operateImpl
+                       |          |                                                      Io.net.Stream.Reader.readVec
+                       |          |                                                      dusty_tls.Shared.fill
+                       |          |                                                      dusty_tls.Connection.Reader.stream
+                       |          |                                                      Io.Reader.defaultReadVec
+                       |          |                                                      Io.Reader.readVec
+                       |          |                                                      Io.Reader.readSliceShort
+                       |          |                                                      main.wsConnect
+                       |          |                                                      middleware.Chain(main.App).call
+                       |          |                                                      middleware.Chain(main.App).run
+                       |          |                                                      server.Server(main.App).handleRequests
+                       |          |                                                      server.Server(main.App).serveRequests
+                       |          |                                                      server.Server(main.App).handleConnectionWrapper
+                       |          |                                                      group.Group.spawnInto__func_2377.Wrapper.start
+                       |          |                                                      task.AnyTask.startFn
+                       |          |                                                      coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       |          |                                                      0
+                       |          |          
+                       |           --0.38%--ip_local_deliver
+                       |                     __netif_receive_skb_one_core
+                       |                     process_backlog
+                       |                     __napi_poll
+                       |                     net_rx_action
+                       |                     handle_softirqs
+                       |                     |          
+                       |                      --0.37%--do_softirq.part.0
+                       |                                __local_bh_enable_ip
+                       |                                __dev_queue_xmit
+                       |                                ip_finish_output2
+                       |                                ip_output
+                       |                                __ip_queue_xmit
+                       |                                __tcp_transmit_skb
+                       |          
+                       |--0.87%--nft_do_chain_ipv4
+                       |          nf_hook_slow
+                       |          |          
+                       |          |--0.51%--ip_local_deliver
+                       |          |          __netif_receive_skb_one_core
+                       |          |          process_backlog
+                       |          |          __napi_poll
+                       |          |          net_rx_action
+                       |          |          handle_softirqs
+                       |          |          do_softirq.part.0
+                       |          |          __local_bh_enable_ip
+                       |          |          __dev_queue_xmit
+                       |          |          ip_finish_output2
+                       |          |          ip_output
+                       |          |          __ip_queue_xmit
+                       |          |          __tcp_transmit_skb
+                       |          |          |          
+                       |          |           --0.43%--tcp_write_xmit
+                       |          |                     __tcp_push_pending_frames
+                       |          |                     tcp_sendmsg_locked
+                       |          |                     tcp_sendmsg
+                       |          |                     __sys_sendto
+                       |          |                     __x64_sys_sendto
+                       |          |                     do_syscall_64
+                       |          |                     entry_SYSCALL_64_after_hwframe
+                       |          |                     os.net.send
+                       |          |                     ev.backends.linux.epoll.checkCompletion
+                       |          |                     ev.sockreg.submitIo__func_1633
+                       |          |                     common.waitForIo
+                       |          |                     io.netWriteOpImpl
+                       |          |                     io.operateInner
+                       |          |                     io.operateImpl
+                       |          |                     Io.net.Stream.Writer.drain
+                       |          |                     Io.Writer.writeAll
+                       |          |                     dusty_tls.Shared.sendPending
+                       |          |                     |          
+                       |          |                      --0.42%--dusty_tls.Connection.Writer.drain
+                       |          |          
+                       |           --0.35%--ip_rcv
+                       |                     __netif_receive_skb_one_core
+                       |                     process_backlog
+                       |                     __napi_poll
+                       |                     net_rx_action
+                       |                     handle_softirqs
+                       |                     |          
+                       |                      --0.35%--do_softirq.part.0
+                       |                                __local_bh_enable_ip
+                       |                                __dev_queue_xmit
+                       |                                ip_finish_output2
+                       |                                ip_output
+                       |                                __ip_queue_xmit
+                       |                                __tcp_transmit_skb
+                       |                                |          
+                       |                                 --0.31%--tcp_write_xmit
+                       |                                           __tcp_push_pending_frames
+                       |                                           tcp_sendmsg_locked
+                       |                                           tcp_sendmsg
+                       |                                           __sys_sendto
+                       |                                           __x64_sys_sendto
+                       |                                           do_syscall_64
+                       |                                           entry_SYSCALL_64_after_hwframe
+                       |                                           os.net.send
+                       |                                           ev.backends.linux.epoll.checkCompletion
+                       |                                           ev.sockreg.submitIo__func_1633
+                       |                                           common.waitForIo
+                       |                                           io.netWriteOpImpl
+                       |                                           io.operateInner
+                       |                                           io.operateImpl
+                       |                                           Io.net.Stream.Writer.drain
+                       |                                           Io.Writer.writeAll
+                       |                                           dusty_tls.Shared.sendPending
+                       |                                           dusty_tls.Connection.Writer.drain
+                       |          
+                        --0.65%--nf_route_table_hook4
+                                  |          
+                                   --0.52%--nf_route_table_inet
+                                             nf_hook_slow
+                                             __ip_local_out
+                                             ip_local_out
+                                             __ip_queue_xmit
+                                             __tcp_transmit_skb
+                                             |          
+                                              --0.39%--tcp_write_xmit
+                                                        __tcp_push_pending_frames
+                                                        |          
+                                                         --0.38%--tcp_sendmsg_locked
+                                                                   tcp_sendmsg
+                                                                   __sys_sendto
+                                                                   __x64_sys_sendto
+                                                                   do_syscall_64
+                                                                   entry_SYSCALL_64_after_hwframe
+                                                                   os.net.send
+                                                                   ev.backends.linux.epoll.checkCompletion
+                                                                   ev.sockreg.submitIo__func_1633
+                                                                   common.waitForIo
+                                                                   io.netWriteOpImpl
+                                                                   io.operateInner
+                                                                   io.operateImpl
+                                                                   Io.net.Stream.Writer.drain
+                                                                   Io.Writer.writeAll
+                                                                   dusty_tls.Shared.sendPending
+                                                                   |          
+                                                                    --0.37%--dusty_tls.Connection.Writer.drain
+
+     4.18%  videocall  [kernel.kallsyms]  [k] _copy_to_iter
+            |          
+             --4.17%--_copy_to_iter
+                       __skb_datagram_iter
+                       skb_copy_datagram_iter
+                       tcp_recvmsg_locked
+                       tcp_recvmsg
+                       sock_recvmsg
+                       __sys_recvfrom
+                       __x64_sys_recvfrom
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       os.net.recv
+                       ev.backends.linux.epoll.checkCompletion
+                       |          
+                        --4.03%--ev.sockreg.submitIo__func_1633
+                                  common.waitForIo
+                                  io.netReadOpImpl
+                                  io.operateInner
+                                  io.operateImpl
+                                  Io.net.Stream.Reader.readVec
+                                  dusty_tls.Shared.fill
+                                  dusty_tls.Connection.Reader.stream
+                                  Io.Reader.defaultReadVec
+                                  Io.Reader.readVec
+                                  Io.Reader.readSliceShort
+                                  main.wsConnect
+                                  middleware.Chain(main.App).call
+                                  middleware.Chain(main.App).run
+                                  server.Server(main.App).handleRequests
+                                  server.Server(main.App).serveRequests
+                                  server.Server(main.App).handleConnectionWrapper
+                                  group.Group.spawnInto__func_2377.Wrapper.start
+                                  task.AnyTask.startFn
+                                  coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                  0
+
+     3.37%  videocall  videocall          [.] compiler_rt.fastMemset
+            |          
+             --3.36%--compiler_rt.fastMemset
+                       |          
+                       |--2.52%--main.wsConnect
+                       |          middleware.Chain(main.App).call
+                       |          middleware.Chain(main.App).run
+                       |          server.Server(main.App).handleRequests
+                       |          server.Server(main.App).serveRequests
+                       |          server.Server(main.App).handleConnectionWrapper
+                       |          group.Group.spawnInto__func_2377.Wrapper.start
+                       |          task.AnyTask.startFn
+                       |          coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       |          0
+                       |          
+                        --0.65%--dusty_tls.bioWrite
+                                  BIO_write_ex
+                                  bssl::ssl_write_buffer_flush(bssl::SSLImpl*)
+                                  bssl::do_tls_write(bssl::SSLImpl*, unsigned long*, unsigned char, bssl::Span<unsigned char const, 18446744073709551615ul>)
+                                  bssl::tls_write_app_data(bssl::SSLImpl*, bool*, unsigned long*, bssl::Span<unsigned char const, 18446744073709551615ul>)
+                                  SSL_write
+                                  dusty_tls.Connection.Writer.writeAll
+                                  dusty_tls.Connection.Writer.drain
+                                  |          
+                                   --0.48%--Io.Writer.writeAll
+                                             |          
+                                              --0.33%--websocket.WebSocket.writeUnbuffered
+                                                        websocket.WebSocket.writeFrameRsv
+                                                        websocket.root.Socket.send
+                                                        |          
+                                                         --0.33%--main.Session.media
+                                                                   main.wsConnect
+                                                                   middleware.Chain(main.App).call
+                                                                   middleware.Chain(main.App).run
+                                                                   server.Server(main.App).handleRequests
+                                                                   server.Server(main.App).serveRequests
+                                                                   server.Server(main.App).handleConnectionWrapper
+                                                                   group.Group.spawnInto__func_2377.Wrapper.start
+                                                                   task.AnyTask.startFn
+                                                                   coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                                                   0
+
+     3.20%  videocall  videocall          [.] aes_gcm_enc_update_vaes_avx2
+            |          
+             --3.19%--aes_gcm_enc_update_vaes_avx2
+                       aead_aes_gcm_sealv_impl((anonymous namespace)::aead_aes_gcm_ctx const*, bssl::Span<crypto_iovec_st const, 18446744073709551615ul>, bssl::Span<unsigned char, 18446744073709551615ul>, unsigned long*, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<crypto_ivec_st const, 18446744073709551615ul>, unsigned long)
+                       aead_aes_gcm_tls13_sealv(evp_aead_ctx_st const*, bssl::Span<crypto_iovec_st const, 18446744073709551615ul>, bssl::Span<unsigned char, 18446744073709551615ul>, unsigned long*, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<crypto_ivec_st const, 18446744073709551615ul>)
+                       EVP_AEAD_CTX_sealv
+                       EVP_AEAD_CTX_seal_scatter
+                       bssl::SSLAEADContext::SealScatter(unsigned char*, unsigned char*, unsigned char*, unsigned char, unsigned short, unsigned long, bssl::Span<unsigned char const, 18446744073709551615ul>, unsigned char const*, unsigned long, unsigned char const*, unsigned long)
+                       bssl::do_seal_record(bssl::SSLImpl*, unsigned char*, unsigned char*, unsigned char*, unsigned char, unsigned char const*, unsigned long)
+                       bssl::tls_seal_record(bssl::SSLImpl*, unsigned char*, unsigned long*, unsigned long, unsigned char, unsigned char const*, unsigned long)
+                       bssl::do_tls_write(bssl::SSLImpl*, unsigned long*, unsigned char, bssl::Span<unsigned char const, 18446744073709551615ul>)
+                       bssl::tls_write_app_data(bssl::SSLImpl*, bool*, unsigned long*, bssl::Span<unsigned char const, 18446744073709551615ul>)
+                       SSL_write
+                       dusty_tls.Connection.Writer.writeAll
+                       dusty_tls.Connection.Writer.drain
+                       |          
+                       |--2.30%--Io.Writer.defaultFlush
+                       |          |          
+                       |           --2.26%--websocket.WebSocket.writeFrameRsv
+                       |                     websocket.root.Socket.send
+                       |                     main.Session.media
+                       |                     main.wsConnect
+                       |                     middleware.Chain(main.App).call
+                       |                     middleware.Chain(main.App).run
+                       |                     server.Server(main.App).handleRequests
+                       |                     server.Server(main.App).serveRequests
+                       |                     server.Server(main.App).handleConnectionWrapper
+                       |                     group.Group.spawnInto__func_2377.Wrapper.start
+                       |                     task.AnyTask.startFn
+                       |                     coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       |                     0
+                       |          
+                        --0.89%--Io.Writer.writeAll
+                                  |          
+                                   --0.85%--websocket.WebSocket.writeFrameRsv
+                                             websocket.root.Socket.send
+                                             main.Session.media
+                                             main.wsConnect
+                                             middleware.Chain(main.App).call
+                                             middleware.Chain(main.App).run
+                                             server.Server(main.App).handleRequests
+                                             server.Server(main.App).serveRequests
+                                             server.Server(main.App).handleConnectionWrapper
+                                             group.Group.spawnInto__func_2377.Wrapper.start
+                                             task.AnyTask.startFn
+                                             coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                             0
+
+     2.77%  videocall  videocall          [.] aes_gcm_dec_update_vaes_avx2
+            |          
+             --2.76%--aes_gcm_dec_update_vaes_avx2
+                       aead_aes_gcm_openv_detached_impl((anonymous namespace)::aead_aes_gcm_ctx const*, bssl::Span<crypto_iovec_st const, 18446744073709551615ul>, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<crypto_ivec_st const, 18446744073709551615ul>, unsigned long)
+                       EVP_AEAD_CTX_openv_detached
+                       EVP_AEAD_CTX_open
+                       bssl::SSLAEADContext::Open(bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned char, unsigned short, unsigned long, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<unsigned char, 18446744073709551615ul>)
+                       bssl::tls_open_record(bssl::SSLImpl*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+                       bssl::tls_open_app_data(bssl::SSLImpl*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+                       bssl::ssl_open_app_data(bssl::SSLImpl*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+                       ssl_read_impl(bssl::SSLImpl*)
+                       SSL_peek
+                       SSL_read
+                       dusty_tls.Connection.Reader.stream
+                       Io.Reader.defaultReadVec
+                       Io.Reader.readVec
+                       Io.Reader.readSliceShort
+                       main.wsConnect
+                       middleware.Chain(main.App).call
+                       middleware.Chain(main.App).run
+                       server.Server(main.App).handleRequests
+                       server.Server(main.App).serveRequests
+                       server.Server(main.App).handleConnectionWrapper
+                       group.Group.spawnInto__func_2377.Wrapper.start
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     2.00%  videocall  [kernel.kallsyms]  [k] clear_highpages_kasan_tagged
+            |          
+             --1.98%--clear_highpages_kasan_tagged
+                       post_alloc_hook
+                       get_page_from_freelist
+                       __alloc_frozen_pages_noprof
+                       alloc_pages_mpol
+                       alloc_pages_noprof
+                       skb_page_frag_refill
+                       sk_page_frag_refill
+                       tcp_sendmsg_locked
+                       tcp_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       os.net.send
+                       ev.backends.linux.epoll.checkCompletion
+                       ev.sockreg.submitIo__func_1633
+                       common.waitForIo
+                       io.netWriteOpImpl
+                       io.operateInner
+                       io.operateImpl
+                       Io.net.Stream.Writer.drain
+                       Io.Writer.writeAll
+                       dusty_tls.Shared.sendPending
+                       |          
+                        --1.88%--dusty_tls.Connection.Writer.drain
+                                  |          
+                                  |--1.44%--Io.Writer.defaultFlush
+                                  |          |          
+                                  |           --1.44%--websocket.WebSocket.writeFrameRsv
+                                  |                     websocket.root.Socket.send
+                                  |                     main.Session.media
+                                  |                     main.wsConnect
+                                  |                     middleware.Chain(main.App).call
+                                  |                     middleware.Chain(main.App).run
+                                  |                     server.Server(main.App).handleRequests
+                                  |                     server.Server(main.App).serveRequests
+                                  |                     server.Server(main.App).handleConnectionWrapper
+                                  |                     group.Group.spawnInto__func_2377.Wrapper.start
+                                  |                     task.AnyTask.startFn
+                                  |                     coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                  |                     0
+                                  |          
+                                   --0.44%--Io.Writer.writeAll
+                                             |          
+                                              --0.41%--websocket.WebSocket.writeFrameRsv
+                                                        websocket.root.Socket.send
+                                                        main.Session.media
+                                                        main.wsConnect
+                                                        middleware.Chain(main.App).call
+                                                        middleware.Chain(main.App).run
+                                                        server.Server(main.App).handleRequests
+                                                        server.Server(main.App).serveRequests
+                                                        server.Server(main.App).handleConnectionWrapper
+                                                        group.Group.spawnInto__func_2377.Wrapper.start
+                                                        task.AnyTask.startFn
+                                                        coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                                        0
+
+     1.91%  videocall  videocall          [.] runtime.Executor.switchOut
+            |          
+             --1.90%--runtime.Executor.switchOut
+                       |          
+                        --1.73%--task.AnyTask.yield__func_1829
+                                  common.Waiter.wait__func_1138
+                                  |          
+                                   --1.61%--common.waitForIo
+                                             |          
+                                             |--0.83%--io.netWriteOpImpl
+                                             |          io.operateInner
+                                             |          io.operateImpl
+                                             |          Io.net.Stream.Writer.drain
+                                             |          Io.Writer.writeAll
+                                             |          dusty_tls.Shared.sendPending
+                                             |          dusty_tls.Connection.Writer.drain
+                                             |          |          
+                                             |          |--0.45%--Io.Writer.writeAll
+                                             |          |          |          
+                                             |          |           --0.35%--websocket.WebSocket.writeUnbuffered
+                                             |          |                     websocket.WebSocket.writeFrameRsv
+                                             |          |                     websocket.root.Socket.send
+                                             |          |                     main.Session.media
+                                             |          |                     main.wsConnect
+                                             |          |                     middleware.Chain(main.App).call
+                                             |          |                     middleware.Chain(main.App).run
+                                             |          |                     server.Server(main.App).handleRequests
+                                             |          |                     server.Server(main.App).serveRequests
+                                             |          |                     server.Server(main.App).handleConnectionWrapper
+                                             |          |                     group.Group.spawnInto__func_2377.Wrapper.start
+                                             |          |                     task.AnyTask.startFn
+                                             |          |                     coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                             |          |                     0
+                                             |          |          
+                                             |           --0.39%--Io.Writer.defaultFlush
+                                             |                     |          
+                                             |                      --0.31%--websocket.WebSocket.writeFrameRsv
+                                             |                                websocket.root.Socket.send
+                                             |                                main.Session.media
+                                             |                                main.wsConnect
+                                             |                                middleware.Chain(main.App).call
+                                             |                                middleware.Chain(main.App).run
+                                             |                                server.Server(main.App).handleRequests
+                                             |                                server.Server(main.App).serveRequests
+                                             |                                server.Server(main.App).handleConnectionWrapper
+                                             |                                group.Group.spawnInto__func_2377.Wrapper.start
+                                             |                                task.AnyTask.startFn
+                                             |                                coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                             |                                0
+                                             |          
+                                              --0.77%--io.netReadOpImpl
+                                                        io.operateInner
+                                                        io.operateImpl
+                                                        Io.net.Stream.Reader.readVec
+                                                        dusty_tls.Shared.fill
+                                                        dusty_tls.Connection.Reader.stream
+                                                        Io.Reader.defaultReadVec
+                                                        Io.Reader.readVec
+                                                        Io.Reader.readSliceShort
+                                                        main.wsConnect
+                                                        middleware.Chain(main.App).call
+                                                        middleware.Chain(main.App).run
+                                                        server.Server(main.App).handleRequests
+                                                        server.Server(main.App).serveRequests
+                                                        server.Server(main.App).handleConnectionWrapper
+                                                        group.Group.spawnInto__func_2377.Wrapper.start
+                                                        task.AnyTask.startFn
+                                                        coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                                        0
+
+     1.84%  videocall  videocall          [.] websocket.applyMask
+            |
+            ---websocket.applyMask
+               main.wsConnect
+               middleware.Chain(main.App).call
+               middleware.Chain(main.App).run
+               server.Server(main.App).handleRequests
+               server.Server(main.App).serveRequests
+               server.Server(main.App).handleConnectionWrapper
+               group.Group.spawnInto__func_2377.Wrapper.start
+               task.AnyTask.startFn
+               coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+               0
+
+     1.56%  videocall  [kernel.kallsyms]  [k] __nf_conntrack_find_get
+            |          
+             --1.55%--__nf_conntrack_find_get
+                       resolve_normal_ct
+                       nf_conntrack_in
+                       nf_hook_slow
+                       __ip_local_out
+                       ip_local_out
+                       __ip_queue_xmit
+                       __tcp_transmit_skb
+                       |          
+                        --1.22%--tcp_write_xmit
+                                  __tcp_push_pending_frames
+                                  |          
+                                   --1.20%--tcp_sendmsg_locked
+                                             tcp_sendmsg
+                                             __sys_sendto
+                                             __x64_sys_sendto
+                                             do_syscall_64
+                                             entry_SYSCALL_64_after_hwframe
+                                             os.net.send
+                                             ev.backends.linux.epoll.checkCompletion
+                                             ev.sockreg.submitIo__func_1633
+                                             common.waitForIo
+                                             io.netWriteOpImpl
+                                             io.operateInner
+                                             io.operateImpl
+                                             Io.net.Stream.Writer.drain
+                                             Io.Writer.writeAll
+                                             dusty_tls.Shared.sendPending
+                                             dusty_tls.Connection.Writer.drain
+                                             |          
+                                             |--0.62%--Io.Writer.writeAll
+                                             |          |          
+                                             |           --0.52%--websocket.WebSocket.writeUnbuffered
+                                             |                     websocket.WebSocket.writeFrameRsv
+                                             |                     websocket.root.Socket.send
+                                             |                     main.Session.media
+                                             |                     main.wsConnect
+                                             |                     middleware.Chain(main.App).call
+                                             |                     middleware.Chain(main.App).run
+                                             |                     server.Server(main.App).handleRequests
+                                             |                     server.Server(main.App).serveRequests
+                                             |                     server.Server(main.App).handleConnectionWrapper
+                                             |                     group.Group.spawnInto__func_2377.Wrapper.start
+                                             |                     task.AnyTask.startFn
+                                             |                     coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                             |                     0
+                                             |          
+                                              --0.58%--Io.Writer.defaultFlush
+                                                        |          
+                                                         --0.52%--websocket.WebSocket.writeFrameRsv
+                                                                   websocket.root.Socket.send
+                                                                   main.Session.media
+                                                                   main.wsConnect
+                                                                   middleware.Chain(main.App).call
+                                                                   middleware.Chain(main.App).run
+                                                                   server.Server(main.App).handleRequests
+                                                                   server.Server(main.App).serveRequests
+                                                                   server.Server(main.App).handleConnectionWrapper
+                                                                   group.Group.spawnInto__func_2377.Wrapper.start
+                                                                   task.AnyTask.startFn
+                                                                   coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                                                   0
+
+     1.40%  videocall  libc.so.6          [.] 0x00000000000a067e
+            |
+            ---0x7f64a6cba682
+
+     1.39%  videocall  [kernel.kallsyms]  [k] fdget
+            |
+            ---fdget
+               |          
+               |--0.76%--__sys_sendto
+               |          __x64_sys_sendto
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |          os.net.send
+               |          ev.backends.linux.epoll.checkCompletion
+               |          ev.sockreg.submitIo__func_1633
+               |          common.waitForIo
+               |          io.netWriteOpImpl
+               |          io.operateInner
+               |          io.operateImpl
+               |          Io.net.Stream.Writer.drain
+               |          Io.Writer.writeAll
+               |          dusty_tls.Shared.sendPending
+               |          |          
+               |           --0.75%--dusty_tls.Connection.Writer.drain
+               |                     |          
+               |                     |--0.42%--Io.Writer.writeAll
+               |                     |          |          
+               |                     |           --0.33%--websocket.WebSocket.writeUnbuffered
+               |                     |                     websocket.WebSocket.writeFrameRsv
+               |                     |                     websocket.root.Socket.send
+               |                     |                     main.Session.media
+               |                     |                     main.wsConnect
+               |                     |                     middleware.Chain(main.App).call
+               |                     |                     middleware.Chain(main.App).run
+               |                     |                     server.Server(main.App).handleRequests
+               |                     |                     server.Server(main.App).serveRequests
+               |                     |                     server.Server(main.App).handleConnectionWrapper
+               |                     |                     group.Group.spawnInto__func_2377.Wrapper.start
+               |                     |                     task.AnyTask.startFn
+               |                     |                     coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+               |                     |                     0
+               |                     |          
+               |                      --0.33%--Io.Writer.defaultFlush
+               |          
+                --0.63%--__sys_recvfrom
+                          __x64_sys_recvfrom
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          os.net.recv
+                          ev.backends.linux.epoll.checkCompletion
+                          |          
+                           --0.59%--ev.sockreg.submitIo__func_1633
+                                     common.waitForIo
+                                     io.netReadOpImpl
+                                     io.operateInner
+                                     io.operateImpl
+                                     Io.net.Stream.Reader.readVec
+                                     dusty_tls.Shared.fill
+                                     dusty_tls.Connection.Reader.stream
+                                     Io.Reader.defaultReadVec
+                                     Io.Reader.readVec
+                                     Io.Reader.readSliceShort
+                                     main.wsConnect
+                                     middleware.Chain(main.App).call
+                                     middleware.Chain(main.App).run
+                                     server.Server(main.App).handleRequests
+                                     server.Server(main.App).serveRequests
+                                     server.Server(main.App).handleConnectionWrapper
+                                     group.Group.spawnInto__func_2377.Wrapper.start
+                                     task.AnyTask.startFn
+                                     coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                     0
+
+     1.24%  videocall  videocall          [.] websocket.root.Socket.send
+            |          
+             --1.24%--websocket.root.Socket.send
+                       |          
+                        --1.22%--main.Session.media
+                                  main.wsConnect
+                                  middleware.Chain(main.App).call
+                                  middleware.Chain(main.App).run
+                                  server.Server(main.App).handleRequests
+                                  server.Server(main.App).serveRequests
+                                  server.Server(main.App).handleConnectionWrapper
+                                  group.Group.spawnInto__func_2377.Wrapper.start
+                                  task.AnyTask.startFn
+                                  coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                  0
+
+     1.14%  videocall  [kernel.kallsyms]  [k] __inet_lookup_established
+            |
+            ---__inet_lookup_established
+               __inet_lookup_skb
+               tcp_v4_rcv
+               ip_protocol_deliver_rcu
+               ip_local_deliver_finish
+               __netif_receive_skb_one_core
+               process_backlog
+               __napi_poll
+               net_rx_action
+               handle_softirqs
+               |          
+                --1.11%--do_softirq.part.0
+                          __local_bh_enable_ip
+                          __dev_queue_xmit
+                          ip_finish_output2
+                          ip_output
+                          __ip_queue_xmit
+                          __tcp_transmit_skb
+                          |          
+                           --0.92%--tcp_write_xmit
+                                     __tcp_push_pending_frames
+                                     tcp_sendmsg_locked
+                                     tcp_sendmsg
+                                     __sys_sendto
+                                     __x64_sys_sendto
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+                                     os.net.send
+                                     ev.backends.linux.epoll.checkCompletion
+                                     ev.sockreg.submitIo__func_1633
+                                     common.waitForIo
+                                     io.netWriteOpImpl
+                                     io.operateInner
+                                     io.operateImpl
+                                     Io.net.Stream.Writer.drain
+                                     Io.Writer.writeAll
+                                     dusty_tls.Shared.sendPending
+                                     |          
+                                      --0.91%--dusty_tls.Connection.Writer.drain
+                                                |          
+                                                |--0.48%--Io.Writer.writeAll
+                                                |          |          
+                                                |           --0.39%--websocket.WebSocket.writeUnbuffered
+                                                |                     websocket.WebSocket.writeFrameRsv
+                                                |                     websocket.root.Socket.send
+                                                |                     |          
+                                                |                      --0.36%--main.Session.media
+                                                |                                main.wsConnect
+                                                |                                middleware.Chain(main.App).call
+                                                |                                middleware.Chain(main.App).run
+                                                |                                server.Server(main.App).handleRequests
+                                                |                                server.Server(main.App).serveRequests
+                                                |                                server.Server(main.App).handleConnectionWrapper
+                                                |                                group.Group.spawnInto__func_2377.Wrapper.start
+                                                |                                task.AnyTask.startFn
+                                                |                                coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                                |                                0
+                                                |          
+                                                 --0.43%--Io.Writer.defaultFlush
+                                                           |          
+                                                            --0.39%--websocket.WebSocket.writeFrameRsv
+                                                                      websocket.root.Socket.send
+                                                                      main.Session.media
+                                                                      main.wsConnect
+                                                                      middleware.Chain(main.App).call
+                                                                      middleware.Chain(main.App).run
+                                                                      server.Server(main.App).handleRequests
+                                                                      server.Server(main.App).serveRequests
+                                                                      server.Server(main.App).handleConnectionWrapper
+                                                                      group.Group.spawnInto__func_2377.Wrapper.start
+                                                                      task.AnyTask.startFn
+                                                                      coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                                                      0
+
+     1.14%  videocall  [kernel.kallsyms]  [k] nft_meta_get_eval
+            |          
+             --1.07%--nft_meta_get_eval
+                       nft_do_chain
+                       |          
+                        --0.87%--nft_do_chain_inet
+                                  nf_hook_slow
+                                  |          
+                                   --0.80%--ip_rcv
+                                             __netif_receive_skb_one_core
+                                             process_backlog
+                                             __napi_poll
+                                             net_rx_action
+                                             handle_softirqs
+                                             |          
+                                              --0.78%--do_softirq.part.0
+                                                        __local_bh_enable_ip
+                                                        __dev_queue_xmit
+                                                        ip_finish_output2
+                                                        ip_output
+                                                        __ip_queue_xmit
+                                                        __tcp_transmit_skb
+                                                        |          
+                                                         --0.60%--tcp_write_xmit
+                                                                   __tcp_push_pending_frames
+                                                                   tcp_sendmsg_locked
+                                                                   tcp_sendmsg
+                                                                   __sys_sendto
+                                                                   __x64_sys_sendto
+                                                                   do_syscall_64
+                                                                   entry_SYSCALL_64_after_hwframe
+                                                                   os.net.send
+                                                                   ev.backends.linux.epoll.checkCompletion
+                                                                   ev.sockreg.submitIo__func_1633
+                                                                   common.waitForIo
+                                                                   io.netWriteOpImpl
+                                                                   io.operateInner
+                                                                   io.operateImpl
+                                                                   Io.net.Stream.Writer.drain
+                                                                   Io.Writer.writeAll
+                                                                   dusty_tls.Shared.sendPending
+                                                                   |          
+                                                                    --0.58%--dusty_tls.Connection.Writer.drain
+                                                                              |          
+                                                                               --0.35%--Io.Writer.defaultFlush
+
+     1.06%  videocall  [kernel.kallsyms]  [k] check_heap_object
+            |          
+             --1.04%--check_heap_object
+                       __check_object_size
+                       |          
+                        --1.00%--simple_copy_to_iter
+                                  __skb_datagram_iter
+                                  skb_copy_datagram_iter
+                                  tcp_recvmsg_locked
+                                  tcp_recvmsg
+                                  sock_recvmsg
+                                  __sys_recvfrom
+                                  __x64_sys_recvfrom
+                                  do_syscall_64
+                                  entry_SYSCALL_64_after_hwframe
+                                  os.net.recv
+                                  ev.backends.linux.epoll.checkCompletion
+                                  |          
+                                   --0.93%--ev.sockreg.submitIo__func_1633
+                                             common.waitForIo
+                                             io.netReadOpImpl
+                                             io.operateInner
+                                             io.operateImpl
+                                             Io.net.Stream.Reader.readVec
+                                             dusty_tls.Shared.fill
+                                             dusty_tls.Connection.Reader.stream
+                                             Io.Reader.defaultReadVec
+                                             Io.Reader.readVec
+                                             Io.Reader.readSliceShort
+                                             main.wsConnect
+                                             middleware.Chain(main.App).call
+                                             middleware.Chain(main.App).run
+                                             server.Server(main.App).handleRequests
+                                             server.Server(main.App).serveRequests
+                                             server.Server(main.App).handleConnectionWrapper
+                                             group.Group.spawnInto__func_2377.Wrapper.start
+                                             task.AnyTask.startFn
+                                             coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                             0
+
+     0.88%  videocall  [kernel.kallsyms]  [k] __wake_up_common
+            |
+            ---__wake_up_common
+               |          
+                --0.72%--__wake_up_sync_key
+                          sock_def_readable
+                          |          
+                           --0.43%--tcp_data_queue
+                                     tcp_rcv_established
+                                     tcp_v4_do_rcv
+                                     |          
+                                      --0.39%--tcp_v4_rcv
+                                                ip_protocol_deliver_rcu
+                                                ip_local_deliver_finish
+                                                __netif_receive_skb_one_core
+                                                process_backlog
+                                                __napi_poll
+                                                net_rx_action
+                                                handle_softirqs
+                                                do_softirq.part.0
+                                                __local_bh_enable_ip
+                                                __dev_queue_xmit
+                                                ip_finish_output2
+                                                ip_output
+                                                __ip_queue_xmit
+                                                __tcp_transmit_skb
+                                                tcp_write_xmit
+                                                __tcp_push_pending_frames
+                                                tcp_sendmsg_locked
+                                                tcp_sendmsg
+                                                __sys_sendto
+                                                __x64_sys_sendto
+                                                do_syscall_64
+                                                entry_SYSCALL_64_after_hwframe
+                                                os.net.send
+                                                ev.backends.linux.epoll.checkCompletion
+                                                ev.sockreg.submitIo__func_1633
+                                                common.waitForIo
+                                                io.netWriteOpImpl
+                                                io.operateInner
+                                                io.operateImpl
+                                                Io.net.Stream.Writer.drain
+                                                Io.Writer.writeAll
+                                                dusty_tls.Shared.sendPending
+                                                dusty_tls.Connection.Writer.drain
+
+     0.86%  videocall  videocall          [.] main.Session.media
+            |          
+             --0.85%--main.Session.media
+                       main.wsConnect
+                       middleware.Chain(main.App).call
+                       middleware.Chain(main.App).run
+                       server.Server(main.App).handleRequests
+                       server.Server(main.App).serveRequests
+                       server.Server(main.App).handleConnectionWrapper
+                       group.Group.spawnInto__func_2377.Wrapper.start
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     0.84%  videocall  [kernel.kallsyms]  [k] _copy_from_iter
+            |          
+             --0.82%--_copy_from_iter
+                       skb_do_copy_data_nocache
+                       tcp_sendmsg_locked
+                       tcp_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       os.net.send
+                       ev.backends.linux.epoll.checkCompletion
+                       ev.sockreg.submitIo__func_1633
+                       common.waitForIo
+                       io.netWriteOpImpl
+                       io.operateInner
+                       io.operateImpl
+                       Io.net.Stream.Writer.drain
+                       Io.Writer.writeAll
+                       dusty_tls.Shared.sendPending
+                       |          
+                        --0.79%--dusty_tls.Connection.Writer.drain
+                                  |          
+                                   --0.62%--Io.Writer.defaultFlush
+                                             websocket.WebSocket.writeFrameRsv
+                                             websocket.root.Socket.send
+                                             main.Session.media
+                                             main.wsConnect
+                                             middleware.Chain(main.App).call
+                                             middleware.Chain(main.App).run
+                                             server.Server(main.App).handleRequests
+                                             server.Server(main.App).serveRequests
+                                             server.Server(main.App).handleConnectionWrapper
+                                             group.Group.spawnInto__func_2377.Wrapper.start
+                                             task.AnyTask.startFn
+                                             coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                             0
+
+     0.83%  videocall  videocall          [.] bssl::tls_open_app_data(bssl::SSLImpl*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+            |          
+             --0.81%--bssl::tls_open_app_data(bssl::SSLImpl*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+                       bssl::ssl_open_app_data(bssl::SSLImpl*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+                       ssl_read_impl(bssl::SSLImpl*)
+                       SSL_peek
+                       SSL_read
+                       dusty_tls.Connection.Reader.stream
+                       Io.Reader.defaultReadVec
+                       Io.Reader.readVec
+                       Io.Reader.readSliceShort
+                       main.wsConnect
+                       middleware.Chain(main.App).call
+                       middleware.Chain(main.App).run
+                       server.Server(main.App).handleRequests
+                       server.Server(main.App).serveRequests
+                       server.Server(main.App).handleConnectionWrapper
+                       group.Group.spawnInto__func_2377.Wrapper.start
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     0.78%  videocall  videocall          [.] aes_hw_encrypt
+            |
+            ---aes_hw_encrypt
+               |          
+               |--0.42%--aead_aes_gcm_sealv_impl((anonymous namespace)::aead_aes_gcm_ctx const*, bssl::Span<crypto_iovec_st const, 18446744073709551615ul>, bssl::Span<unsigned char, 18446744073709551615ul>, unsigned long*, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<crypto_ivec_st const, 18446744073709551615ul>, unsigned long)
+               |          aead_aes_gcm_tls13_sealv(evp_aead_ctx_st const*, bssl::Span<crypto_iovec_st const, 18446744073709551615ul>, bssl::Span<unsigned char, 18446744073709551615ul>, unsigned long*, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<crypto_ivec_st const, 18446744073709551615ul>)
+               |          EVP_AEAD_CTX_sealv
+               |          EVP_AEAD_CTX_seal_scatter
+               |          bssl::SSLAEADContext::SealScatter(unsigned char*, unsigned char*, unsigned char*, unsigned char, unsigned short, unsigned long, bssl::Span<unsigned char const, 18446744073709551615ul>, unsigned char const*, unsigned long, unsigned char const*, unsigned long)
+               |          bssl::do_seal_record(bssl::SSLImpl*, unsigned char*, unsigned char*, unsigned char*, unsigned char, unsigned char const*, unsigned long)
+               |          bssl::tls_seal_record(bssl::SSLImpl*, unsigned char*, unsigned long*, unsigned long, unsigned char, unsigned char const*, unsigned long)
+               |          bssl::do_tls_write(bssl::SSLImpl*, unsigned long*, unsigned char, bssl::Span<unsigned char const, 18446744073709551615ul>)
+               |          bssl::tls_write_app_data(bssl::SSLImpl*, bool*, unsigned long*, bssl::Span<unsigned char const, 18446744073709551615ul>)
+               |          SSL_write
+               |          dusty_tls.Connection.Writer.writeAll
+               |          dusty_tls.Connection.Writer.drain
+               |          
+                --0.37%--aead_aes_gcm_openv_detached_impl((anonymous namespace)::aead_aes_gcm_ctx const*, bssl::Span<crypto_iovec_st const, 18446744073709551615ul>, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<crypto_ivec_st const, 18446744073709551615ul>, unsigned long)
+                          EVP_AEAD_CTX_openv_detached
+                          EVP_AEAD_CTX_open
+                          bssl::SSLAEADContext::Open(bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned char, unsigned short, unsigned long, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<unsigned char, 18446744073709551615ul>)
+                          bssl::tls_open_record(bssl::SSLImpl*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+                          bssl::tls_open_app_data(bssl::SSLImpl*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+                          bssl::ssl_open_app_data(bssl::SSLImpl*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+                          ssl_read_impl(bssl::SSLImpl*)
+                          SSL_peek
+                          SSL_read
+                          dusty_tls.Connection.Reader.stream
+                          Io.Reader.defaultReadVec
+                          Io.Reader.readVec
+                          Io.Reader.readSliceShort
+                          main.wsConnect
+                          middleware.Chain(main.App).call
+                          middleware.Chain(main.App).run
+                          server.Server(main.App).handleRequests
+                          server.Server(main.App).serveRequests
+                          server.Server(main.App).handleConnectionWrapper
+                          group.Group.spawnInto__func_2377.Wrapper.start
+                          task.AnyTask.startFn
+                          coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                          0
+
+     0.77%  videocall  [kernel.kallsyms]  [k] nft_meta_store_ifname
+            |          
+             --0.59%--nft_meta_store_ifname
+                       nft_do_chain
+                       |          
+                        --0.58%--nft_do_chain_inet
+                                  nf_hook_slow
+                                  ip_rcv
+                                  __netif_receive_skb_one_core
+                                  process_backlog
+                                  __napi_poll
+                                  net_rx_action
+                                  handle_softirqs
+                                  |          
+                                   --0.57%--do_softirq.part.0
+                                             __local_bh_enable_ip
+                                             __dev_queue_xmit
+                                             ip_finish_output2
+                                             ip_output
+                                             __ip_queue_xmit
+                                             __tcp_transmit_skb
+                                             |          
+                                              --0.39%--tcp_write_xmit
+                                                        __tcp_push_pending_frames
+                                                        tcp_sendmsg_locked
+                                                        tcp_sendmsg
+                                                        __sys_sendto
+                                                        __x64_sys_sendto
+                                                        do_syscall_64
+                                                        entry_SYSCALL_64_after_hwframe
+                                                        os.net.send
+                                                        ev.backends.linux.epoll.checkCompletion
+                                                        ev.sockreg.submitIo__func_1633
+                                                        common.waitForIo
+                                                        io.netWriteOpImpl
+                                                        io.operateInner
+                                                        io.operateImpl
+                                                        Io.net.Stream.Writer.drain
+                                                        Io.Writer.writeAll
+                                                        dusty_tls.Shared.sendPending
+                                                        dusty_tls.Connection.Writer.drain
+
+     0.77%  videocall  videocall          [.] main.wsConnect
+            |          
+             --0.75%--main.wsConnect
+                       middleware.Chain(main.App).call
+                       middleware.Chain(main.App).run
+                       server.Server(main.App).handleRequests
+                       server.Server(main.App).serveRequests
+                       server.Server(main.App).handleConnectionWrapper
+                       group.Group.spawnInto__func_2377.Wrapper.start
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     0.75%  videocall  [kernel.kallsyms]  [k] sized_strscpy
+            |          
+             --0.69%--sized_strscpy
+                       nft_meta_store_ifname
+                       nft_do_chain
+                       |          
+                        --0.67%--nft_do_chain_inet
+                                  nf_hook_slow
+                                  ip_rcv
+                                  __netif_receive_skb_one_core
+                                  process_backlog
+                                  __napi_poll
+                                  net_rx_action
+                                  handle_softirqs
+                                  |          
+                                   --0.67%--do_softirq.part.0
+                                             __local_bh_enable_ip
+                                             __dev_queue_xmit
+                                             ip_finish_output2
+                                             ip_output
+                                             __ip_queue_xmit
+                                             __tcp_transmit_skb
+                                             |          
+                                              --0.47%--tcp_write_xmit
+                                                        __tcp_push_pending_frames
+                                                        tcp_sendmsg_locked
+                                                        tcp_sendmsg
+                                                        __sys_sendto
+                                                        __x64_sys_sendto
+                                                        do_syscall_64
+                                                        entry_SYSCALL_64_after_hwframe
+                                                        os.net.send
+                                                        ev.backends.linux.epoll.checkCompletion
+                                                        ev.sockreg.submitIo__func_1633
+                                                        common.waitForIo
+                                                        io.netWriteOpImpl
+                                                        io.operateInner
+                                                        io.operateImpl
+                                                        Io.net.Stream.Writer.drain
+                                                        Io.Writer.writeAll
+                                                        dusty_tls.Shared.sendPending
+                                                        dusty_tls.Connection.Writer.drain
+
+     0.69%  videocall  [kernel.kallsyms]  [k] ep_poll_callback
+            |          
+             --0.68%--ep_poll_callback
+                       __wake_up_common
+                       |          
+                        --0.67%--__wake_up_sync_key
+                                  sock_def_readable
+                                  |          
+                                   --0.42%--tcp_data_queue
+                                             tcp_rcv_established
+                                             tcp_v4_do_rcv
+                                             |          
+                                              --0.39%--tcp_v4_rcv
+                                                        ip_protocol_deliver_rcu
+                                                        ip_local_deliver_finish
+                                                        __netif_receive_skb_one_core
+                                                        process_backlog
+                                                        __napi_poll
+                                                        net_rx_action
+                                                        handle_softirqs
+                                                        do_softirq.part.0
+                                                        __local_bh_enable_ip
+                                                        __dev_queue_xmit
+                                                        ip_finish_output2
+                                                        ip_output
+                                                        __ip_queue_xmit
+                                                        __tcp_transmit_skb
+                                                        tcp_write_xmit
+                                                        __tcp_push_pending_frames
+                                                        tcp_sendmsg_locked
+                                                        tcp_sendmsg
+                                                        __sys_sendto
+                                                        __x64_sys_sendto
+                                                        do_syscall_64
+                                                        entry_SYSCALL_64_after_hwframe
+                                                        os.net.send
+                                                        ev.backends.linux.epoll.checkCompletion
+                                                        ev.sockreg.submitIo__func_1633
+                                                        common.waitForIo
+                                                        io.netWriteOpImpl
+                                                        io.operateInner
+                                                        io.operateImpl
+                                                        Io.net.Stream.Writer.drain
+                                                        Io.Writer.writeAll
+                                                        dusty_tls.Shared.sendPending
+                                                        dusty_tls.Connection.Writer.drain
+                                                        |          
+                                                         --0.30%--Io.Writer.defaultFlush
+
+     0.65%  videocall  [kernel.kallsyms]  [k] __raw_spin_lock_irqsave
+            |          
+             --0.64%--__raw_spin_lock_irqsave
+
+     0.65%  videocall  [kernel.kallsyms]  [k] __skb_datagram_iter
+            |          
+             --0.64%--__skb_datagram_iter
+                       skb_copy_datagram_iter
+                       tcp_recvmsg_locked
+                       tcp_recvmsg
+                       sock_recvmsg
+                       __sys_recvfrom
+                       __x64_sys_recvfrom
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       os.net.recv
+                       ev.backends.linux.epoll.checkCompletion
+                       |          
+                        --0.58%--ev.sockreg.submitIo__func_1633
+                                  common.waitForIo
+                                  io.netReadOpImpl
+                                  io.operateInner
+                                  io.operateImpl
+                                  Io.net.Stream.Reader.readVec
+                                  dusty_tls.Shared.fill
+                                  dusty_tls.Connection.Reader.stream
+                                  Io.Reader.defaultReadVec
+                                  Io.Reader.readVec
+                                  Io.Reader.readSliceShort
+                                  main.wsConnect
+                                  middleware.Chain(main.App).call
+                                  middleware.Chain(main.App).run
+                                  server.Server(main.App).handleRequests
+                                  server.Server(main.App).serveRequests
+                                  server.Server(main.App).handleConnectionWrapper
+                                  group.Group.spawnInto__func_2377.Wrapper.start
+                                  task.AnyTask.startFn
+                                  coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                  0
+
+     0.62%  videocall  videocall          [.] ev.sockreg.service__func_1159
+            |
+            ---ev.sockreg.service__func_1159
+               ev.backends.linux.epoll.poll
+               ev.loop.Loop.poll
+               runtime.Executor.run
+               task.AnyTask.yield__func_1829
+               common.Waiter.wait__func_1138
+               sync.Futex.wait
+               sync.Futex.waitTimeoutClock
+               io.futexWaitImpl
+               Io.Condition.waitTimeout
+               Io.TypeErasedQueue.getLocked
+               Io.TypeErasedQueue.get
+               server.ServerOf(main.App,false).runInner
+               main
+               0x7f64a6c43ca8
+
+     0.59%  videocall  [kernel.kallsyms]  [k] sock_has_perm
+            |          
+             --0.58%--sock_has_perm
+                       selinux_socket_sendmsg
+                       security_socket_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       os.net.send
+                       ev.backends.linux.epoll.checkCompletion
+                       ev.sockreg.submitIo__func_1633
+                       common.waitForIo
+                       io.netWriteOpImpl
+                       io.operateInner
+                       io.operateImpl
+                       Io.net.Stream.Writer.drain
+                       Io.Writer.writeAll
+                       dusty_tls.Shared.sendPending
+                       |          
+                        --0.57%--dusty_tls.Connection.Writer.drain
+                                  |          
+                                   --0.31%--Io.Writer.defaultFlush
+
+     0.58%  videocall  [kernel.kallsyms]  [k] selinux_socket_recvmsg
+            |
+            ---selinux_socket_recvmsg
+               security_socket_recvmsg
+               sock_recvmsg
+               __sys_recvfrom
+               __x64_sys_recvfrom
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               os.net.recv
+               ev.backends.linux.epoll.checkCompletion
+               |          
+                --0.49%--ev.sockreg.submitIo__func_1633
+                          common.waitForIo
+                          io.netReadOpImpl
+                          io.operateInner
+                          io.operateImpl
+                          Io.net.Stream.Reader.readVec
+                          dusty_tls.Shared.fill
+                          dusty_tls.Connection.Reader.stream
+                          Io.Reader.defaultReadVec
+                          Io.Reader.readVec
+                          Io.Reader.readSliceShort
+                          main.wsConnect
+                          middleware.Chain(main.App).call
+                          middleware.Chain(main.App).run
+                          server.Server(main.App).handleRequests
+                          server.Server(main.App).serveRequests
+                          server.Server(main.App).handleConnectionWrapper
+                          group.Group.spawnInto__func_2377.Wrapper.start
+                          task.AnyTask.startFn
+                          coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                          0
+
+     0.56%  videocall  videocall          [.] heap.ArenaAllocator.alloc
+            |
+            ---heap.ArenaAllocator.alloc
+               |          
+                --0.55%--main.wsConnect
+                          middleware.Chain(main.App).call
+                          middleware.Chain(main.App).run
+                          server.Server(main.App).handleRequests
+                          server.Server(main.App).serveRequests
+                          server.Server(main.App).handleConnectionWrapper
+                          group.Group.spawnInto__func_2377.Wrapper.start
+                          task.AnyTask.startFn
+                          coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                          0
+
+     0.54%  videocall  [kernel.kallsyms]  [k] expr_call_ops_eval
+            |          
+             --0.37%--expr_call_ops_eval
+                       nft_do_chain
+
+     0.53%  videocall  [kernel.kallsyms]  [k] tcp_recvmsg_locked
+            |          
+             --0.51%--tcp_recvmsg_locked
+                       tcp_recvmsg
+                       sock_recvmsg
+                       __sys_recvfrom
+                       __x64_sys_recvfrom
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       os.net.recv
+                       ev.backends.linux.epoll.checkCompletion
+                       |          
+                        --0.48%--ev.sockreg.submitIo__func_1633
+                                  common.waitForIo
+                                  io.netReadOpImpl
+                                  io.operateInner
+                                  io.operateImpl
+                                  Io.net.Stream.Reader.readVec
+                                  dusty_tls.Shared.fill
+                                  dusty_tls.Connection.Reader.stream
+                                  Io.Reader.defaultReadVec
+                                  Io.Reader.readVec
+                                  Io.Reader.readSliceShort
+                                  main.wsConnect
+                                  middleware.Chain(main.App).call
+                                  middleware.Chain(main.App).run
+                                  server.Server(main.App).handleRequests
+                                  server.Server(main.App).serveRequests
+                                  server.Server(main.App).handleConnectionWrapper
+                                  group.Group.spawnInto__func_2377.Wrapper.start
+                                  task.AnyTask.startFn
+                                  coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                                  0
+
+     0.50%  videocall  videocall          [.] SSL_has_pending
+            |          
+             --0.49%--SSL_has_pending
+                       dusty_tls.Connection.Reader.stream
+                       Io.Reader.defaultReadVec
+                       Io.Reader.readVec
+                       Io.Reader.readSliceShort
+                       main.wsConnect
+                       middleware.Chain(main.App).call
+                       middleware.Chain(main.App).run
+                       server.Server(main.App).handleRequests
+                       server.Server(main.App).serveRequests
+                       server.Server(main.App).handleConnectionWrapper
+                       group.Group.spawnInto__func_2377.Wrapper.start
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     0.49%  videocall  videocall          [.] ssl_read_impl(bssl::SSLImpl*)
+            |          
+             --0.44%--ssl_read_impl(bssl::SSLImpl*)
+                       SSL_peek
+                       SSL_read
+                       dusty_tls.Connection.Reader.stream
+                       Io.Reader.defaultReadVec
+                       Io.Reader.readVec
+                       Io.Reader.readSliceShort
+                       main.wsConnect
+                       middleware.Chain(main.App).call
+                       middleware.Chain(main.App).run
+                       server.Server(main.App).handleRequests
+                       server.Server(main.App).serveRequests
+                       server.Server(main.App).handleConnectionWrapper
+                       group.Group.spawnInto__func_2377.Wrapper.start
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     0.49%  videocall  videocall          [.] dusty_tls.Connection.Reader.stream
+            |          
+             --0.47%--dusty_tls.Connection.Reader.stream
+                       Io.Reader.defaultReadVec
+                       Io.Reader.readVec
+                       Io.Reader.readSliceShort
+                       main.wsConnect
+                       middleware.Chain(main.App).call
+                       middleware.Chain(main.App).run
+                       server.Server(main.App).handleRequests
+                       server.Server(main.App).serveRequests
+                       server.Server(main.App).handleConnectionWrapper
+                       group.Group.spawnInto__func_2377.Wrapper.start
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     0.49%  videocall  [kernel.kallsyms]  [k] tcp_sendmsg_locked
+            |          
+             --0.43%--tcp_sendmsg_locked
+                       tcp_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       os.net.send
+                       ev.backends.linux.epoll.checkCompletion
+                       ev.sockreg.submitIo__func_1633
+                       common.waitForIo
+                       io.netWriteOpImpl
+                       io.operateInner
+                       io.operateImpl
+                       Io.net.Stream.Writer.drain
+                       Io.Writer.writeAll
+                       dusty_tls.Shared.sendPending
+                       |          
+                        --0.42%--dusty_tls.Connection.Writer.drain
+
+     0.48%  videocall  [kernel.kallsyms]  [k] tcp_v4_rcv
+            |          
+             --0.46%--tcp_v4_rcv
+                       ip_protocol_deliver_rcu
+                       ip_local_deliver_finish
+                       __netif_receive_skb_one_core
+                       process_backlog
+                       __napi_poll
+                       net_rx_action
+                       handle_softirqs
+                       |          
+                        --0.46%--do_softirq.part.0
+                                  __local_bh_enable_ip
+                                  __dev_queue_xmit
+                                  ip_finish_output2
+                                  ip_output
+                                  __ip_queue_xmit
+                                  __tcp_transmit_skb
+                                  |          
+                                   --0.41%--tcp_write_xmit
+                                             __tcp_push_pending_frames
+                                             tcp_sendmsg_locked
+                                             tcp_sendmsg
+                                             __sys_sendto
+                                             __x64_sys_sendto
+                                             do_syscall_64
+                                             entry_SYSCALL_64_after_hwframe
+                                             os.net.send
+                                             ev.backends.linux.epoll.checkCompletion
+                                             ev.sockreg.submitIo__func_1633
+                                             common.waitForIo
+                                             io.netWriteOpImpl
+                                             io.operateInner
+                                             io.operateImpl
+                                             Io.net.Stream.Writer.drain
+                                             Io.Writer.writeAll
+                                             dusty_tls.Shared.sendPending
+                                             |          
+                                              --0.41%--dusty_tls.Connection.Writer.drain
+
+     0.48%  videocall  libc.so.6          [.] cfree
+            |          
+             --0.41%--cfree
+
+     0.47%  videocall  videocall          [.] SSL_write
+            |          
+             --0.46%--SSL_write
+                       dusty_tls.Connection.Writer.writeAll
+                       dusty_tls.Connection.Writer.drain
+
+     0.46%  videocall  [kernel.kallsyms]  [k] tcp_rcv_established
+            |          
+             --0.45%--tcp_rcv_established
+                       tcp_v4_do_rcv
+                       |          
+                        --0.44%--tcp_v4_rcv
+                                  ip_protocol_deliver_rcu
+                                  ip_local_deliver_finish
+                                  __netif_receive_skb_one_core
+                                  process_backlog
+                                  __napi_poll
+                                  net_rx_action
+                                  handle_softirqs
+                                  |          
+                                   --0.42%--do_softirq.part.0
+                                             __local_bh_enable_ip
+                                             __dev_queue_xmit
+                                             ip_finish_output2
+                                             ip_output
+                                             __ip_queue_xmit
+                                             __tcp_transmit_skb
+                                             |          
+                                              --0.39%--tcp_write_xmit
+                                                        __tcp_push_pending_frames
+                                                        tcp_sendmsg_locked
+                                                        tcp_sendmsg
+                                                        __sys_sendto
+                                                        __x64_sys_sendto
+                                                        do_syscall_64
+                                                        entry_SYSCALL_64_after_hwframe
+                                                        os.net.send
+                                                        ev.backends.linux.epoll.checkCompletion
+                                                        ev.sockreg.submitIo__func_1633
+                                                        common.waitForIo
+                                                        io.netWriteOpImpl
+                                                        io.operateInner
+                                                        io.operateImpl
+                                                        Io.net.Stream.Writer.drain
+                                                        Io.Writer.writeAll
+                                                        dusty_tls.Shared.sendPending
+                                                        dusty_tls.Connection.Writer.drain
+
+     0.44%  videocall  videocall          [.] websocket.WebSocket.writeFrameRsv
+            |          
+             --0.40%--websocket.WebSocket.writeFrameRsv
+                       websocket.root.Socket.send
+                       main.Session.media
+                       main.wsConnect
+                       middleware.Chain(main.App).call
+                       middleware.Chain(main.App).run
+                       server.Server(main.App).handleRequests
+                       server.Server(main.App).serveRequests
+                       server.Server(main.App).handleConnectionWrapper
+                       group.Group.spawnInto__func_2377.Wrapper.start
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     0.43%  videocall  videocall          [.] dusty_tls.Connection.Writer.writeAll
+            |          
+             --0.41%--dusty_tls.Connection.Writer.writeAll
+                       dusty_tls.Connection.Writer.drain
+                       |          
+                        --0.32%--Io.Writer.defaultFlush
+
+     0.42%  videocall  videocall          [.] bssl::tls_open_record(bssl::SSLImpl*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+            |          
+             --0.36%--bssl::tls_open_record(bssl::SSLImpl*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+                       bssl::tls_open_app_data(bssl::SSLImpl*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+                       bssl::ssl_open_app_data(bssl::SSLImpl*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+                       ssl_read_impl(bssl::SSLImpl*)
+                       SSL_peek
+                       SSL_read
+                       dusty_tls.Connection.Reader.stream
+                       Io.Reader.defaultReadVec
+                       Io.Reader.readVec
+                       Io.Reader.readSliceShort
+                       main.wsConnect
+                       middleware.Chain(main.App).call
+                       middleware.Chain(main.App).run
+                       server.Server(main.App).handleRequests
+                       server.Server(main.App).serveRequests
+                       server.Server(main.App).handleConnectionWrapper
+                       group.Group.spawnInto__func_2377.Wrapper.start
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     0.42%  videocall  [kernel.kallsyms]  [k] sock_rfree
+            |
+            ---sock_rfree
+               tcp_recvmsg_locked
+               tcp_recvmsg
+               sock_recvmsg
+               __sys_recvfrom
+               __x64_sys_recvfrom
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               os.net.recv
+               ev.backends.linux.epoll.checkCompletion
+               |          
+                --0.41%--ev.sockreg.submitIo__func_1633
+                          common.waitForIo
+                          io.netReadOpImpl
+                          io.operateInner
+                          io.operateImpl
+                          Io.net.Stream.Reader.readVec
+                          dusty_tls.Shared.fill
+                          dusty_tls.Connection.Reader.stream
+                          Io.Reader.defaultReadVec
+                          Io.Reader.readVec
+                          Io.Reader.readSliceShort
+                          main.wsConnect
+                          middleware.Chain(main.App).call
+                          middleware.Chain(main.App).run
+                          server.Server(main.App).handleRequests
+                          server.Server(main.App).serveRequests
+                          server.Server(main.App).handleConnectionWrapper
+                          group.Group.spawnInto__func_2377.Wrapper.start
+                          task.AnyTask.startFn
+                          coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                          0
+
+     0.41%  videocall  [kernel.kallsyms]  [k] skb_release_data
+            |          
+             --0.41%--skb_release_data
+
+     0.41%  videocall  videocall          [.] heap.ArenaAllocator.reset
+            |
+            ---heap.ArenaAllocator.reset
+               |          
+                --0.40%--main.wsConnect
+                          middleware.Chain(main.App).call
+                          middleware.Chain(main.App).run
+                          server.Server(main.App).handleRequests
+                          server.Server(main.App).serveRequests
+                          server.Server(main.App).handleConnectionWrapper
+                          group.Group.spawnInto__func_2377.Wrapper.start
+                          task.AnyTask.startFn
+                          coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                          0
+
+     0.40%  videocall  videocall          [.] utils.local_run_queue.LocalRunQueue(utils.wait_queue.WaitNode,false).fillFromOverflow
+            |
+            ---utils.local_run_queue.LocalRunQueue(utils.wait_queue.WaitNode,false).fillFromOverflow
+               runtime.Executor.run
+               task.AnyTask.yield__func_1829
+               common.Waiter.wait__func_1138
+               sync.Futex.wait
+               sync.Futex.waitTimeoutClock
+               io.futexWaitImpl
+               Io.Condition.waitTimeout
+               Io.TypeErasedQueue.getLocked
+               Io.TypeErasedQueue.get
+               server.ServerOf(main.App,false).runInner
+               main
+               0x7f64a6c43ca8
+
+     0.40%  videocall  [kernel.kallsyms]  [k] skb_defer_free_flush
+            |          
+             --0.39%--skb_defer_free_flush
+                       net_rx_action
+                       handle_softirqs
+                       do_softirq.part.0
+                       __local_bh_enable_ip
+                       __dev_queue_xmit
+                       ip_finish_output2
+                       ip_output
+                       __ip_queue_xmit
+                       __tcp_transmit_skb
+                       |          
+                        --0.34%--tcp_write_xmit
+                                  __tcp_push_pending_frames
+                                  tcp_sendmsg_locked
+                                  tcp_sendmsg
+                                  __sys_sendto
+                                  __x64_sys_sendto
+                                  do_syscall_64
+                                  entry_SYSCALL_64_after_hwframe
+                                  os.net.send
+                                  ev.backends.linux.epoll.checkCompletion
+                                  ev.sockreg.submitIo__func_1633
+                                  common.waitForIo
+                                  io.netWriteOpImpl
+                                  io.operateInner
+                                  io.operateImpl
+                                  Io.net.Stream.Writer.drain
+                                  Io.Writer.writeAll
+                                  dusty_tls.Shared.sendPending
+                                  dusty_tls.Connection.Writer.drain
+
+     0.39%  videocall  videocall          [.] CRYPTO_memcmp
+            |
+            ---CRYPTO_memcmp
+               aead_aes_gcm_openv_detached_impl((anonymous namespace)::aead_aes_gcm_ctx const*, bssl::Span<crypto_iovec_st const, 18446744073709551615ul>, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<crypto_ivec_st const, 18446744073709551615ul>, unsigned long)
+               EVP_AEAD_CTX_openv_detached
+               EVP_AEAD_CTX_open
+               bssl::SSLAEADContext::Open(bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned char, unsigned short, unsigned long, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<unsigned char, 18446744073709551615ul>)
+               bssl::tls_open_record(bssl::SSLImpl*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+               bssl::tls_open_app_data(bssl::SSLImpl*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+               bssl::ssl_open_app_data(bssl::SSLImpl*, bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned long*, unsigned char*, bssl::Span<unsigned char, 18446744073709551615ul>)
+               ssl_read_impl(bssl::SSLImpl*)
+               SSL_peek
+               SSL_read
+               dusty_tls.Connection.Reader.stream
+               Io.Reader.defaultReadVec
+               Io.Reader.readVec
+               Io.Reader.readSliceShort
+               main.wsConnect
+               middleware.Chain(main.App).call
+               middleware.Chain(main.App).run
+               server.Server(main.App).handleRequests
+               server.Server(main.App).serveRequests
+               server.Server(main.App).handleConnectionWrapper
+               group.Group.spawnInto__func_2377.Wrapper.start
+               task.AnyTask.startFn
+               coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+               0
+
+     0.39%  videocall  [kernel.kallsyms]  [k] strnlen
+            |          
+             --0.31%--strnlen
+                       nft_meta_store_ifname
+                       nft_do_chain
+
+     0.38%  videocall  [kernel.kallsyms]  [k] __tcp_transmit_skb
+            |          
+             --0.37%--__tcp_transmit_skb
+
+     0.38%  videocall  [kernel.kallsyms]  [k] __pi_memcpy
+            |          
+             --0.36%--__pi_memcpy
+                       |          
+                        --0.35%--nft_do_chain
+                                  |          
+                                   --0.31%--nft_do_chain_inet
+                                             nf_hook_slow
+
+     0.35%  videocall  videocall          [.] bssl::tls_write_app_data(bssl::SSLImpl*, bool*, unsigned long*, bssl::Span<unsigned char const, 18446744073709551615ul>)
+            |          
+             --0.35%--bssl::tls_write_app_data(bssl::SSLImpl*, bool*, unsigned long*, bssl::Span<unsigned char const, 18446744073709551615ul>)
+                       SSL_write
+                       dusty_tls.Connection.Writer.writeAll
+                       dusty_tls.Connection.Writer.drain
+
+     0.35%  videocall  [kernel.kallsyms]  [k] tcp_ack
+            |
+            ---tcp_ack
+               tcp_rcv_established
+               tcp_v4_do_rcv
+               tcp_v4_rcv
+               ip_protocol_deliver_rcu
+               ip_local_deliver_finish
+               __netif_receive_skb_one_core
+               process_backlog
+               __napi_poll
+               net_rx_action
+               handle_softirqs
+               do_softirq.part.0
+               __local_bh_enable_ip
+               __dev_queue_xmit
+               ip_finish_output2
+               ip_output
+               __ip_queue_xmit
+               __tcp_transmit_skb
+
+     0.35%  videocall  libc.so.6          [.] malloc
+            |
+            ---malloc
+
+     0.34%  videocall  [kernel.kallsyms]  [k] tcp_clean_rtx_queue
+            |          
+             --0.32%--tcp_clean_rtx_queue
+                       tcp_ack
+                       tcp_rcv_established
+                       tcp_v4_do_rcv
+                       |          
+                        --0.32%--tcp_v4_rcv
+                                  ip_protocol_deliver_rcu
+                                  ip_local_deliver_finish
+                                  __netif_receive_skb_one_core
+                                  process_backlog
+                                  __napi_poll
+                                  net_rx_action
+                                  handle_softirqs
+                                  do_softirq.part.0
+                                  __local_bh_enable_ip
+                                  __dev_queue_xmit
+                                  ip_finish_output2
+                                  ip_output
+                                  __ip_queue_xmit
+                                  __tcp_transmit_skb
+
+     0.34%  videocall  videocall          [.] bssl::CRYPTO_gcm128_init_ctx(bssl::gcm128_key_st const*, bssl::GCM128_CONTEXT*, unsigned char const*, unsigned long)
+            |          
+             --0.33%--bssl::CRYPTO_gcm128_init_ctx(bssl::gcm128_key_st const*, bssl::GCM128_CONTEXT*, unsigned char const*, unsigned long)
+
+     0.33%  videocall  videocall          [.] bssl::SSLAEADContext::ExplicitNonceLen() const
+            |
+            ---bssl::SSLAEADContext::ExplicitNonceLen() const
+               |          
+                --0.32%--bssl::do_seal_record(bssl::SSLImpl*, unsigned char*, unsigned char*, unsigned char*, unsigned char, unsigned char const*, unsigned long)
+                          bssl::tls_seal_record(bssl::SSLImpl*, unsigned char*, unsigned long*, unsigned long, unsigned char, unsigned char const*, unsigned long)
+                          bssl::do_tls_write(bssl::SSLImpl*, unsigned long*, unsigned char, bssl::Span<unsigned char const, 18446744073709551615ul>)
+                          bssl::tls_write_app_data(bssl::SSLImpl*, bool*, unsigned long*, bssl::Span<unsigned char const, 18446744073709551615ul>)
+                          SSL_write
+                          dusty_tls.Connection.Writer.writeAll
+                          dusty_tls.Connection.Writer.drain
+
+     0.32%  videocall  [kernel.kallsyms]  [k] __sys_sendto
+            |          
+             --0.31%--__sys_sendto
+                       __x64_sys_sendto
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       os.net.send
+                       ev.backends.linux.epoll.checkCompletion
+                       ev.sockreg.submitIo__func_1633
+                       common.waitForIo
+                       io.netWriteOpImpl
+                       io.operateInner
+                       io.operateImpl
+                       Io.net.Stream.Writer.drain
+                       Io.Writer.writeAll
+                       dusty_tls.Shared.sendPending
+                       dusty_tls.Connection.Writer.drain
+
+     0.32%  videocall  videocall          [.] gcm_gmult_vpclmulqdq_avx2
+     0.31%  videocall  videocall          [.] Io.net.Stream.Reader.readVec
+            |          
+             --0.30%--Io.net.Stream.Reader.readVec
+                       dusty_tls.Shared.fill
+                       dusty_tls.Connection.Reader.stream
+                       Io.Reader.defaultReadVec
+                       Io.Reader.readVec
+                       Io.Reader.readSliceShort
+                       main.wsConnect
+                       middleware.Chain(main.App).call
+                       middleware.Chain(main.App).run
+                       server.Server(main.App).handleRequests
+                       server.Server(main.App).serveRequests
+                       server.Server(main.App).handleConnectionWrapper
+                       group.Group.spawnInto__func_2377.Wrapper.start
+                       task.AnyTask.startFn
+                       coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn
+                       0
+
+     0.31%  videocall  videocall          [.] bssl::SSLAEADContext::Open(bssl::Span<unsigned char, 18446744073709551615ul>*, unsigned char, unsigned short, unsigned long, bssl::Span<unsigned char const, 18446744073709551615ul>, bssl::Span<unsigned char, 18446744073709551615ul>)
+     0.30%  videocall  [kernel.kallsyms]  [k] tcp_skb_can_collapse
+            |
+            ---tcp_skb_can_collapse
+               tcp_write_xmit
+               __tcp_push_pending_frames
+               tcp_rcv_established
+               tcp_v4_do_rcv
+               tcp_v4_rcv
+               ip_protocol_deliver_rcu
+               ip_local_deliver_finish
+               __netif_receive_skb_one_core
+               process_backlog
+               __napi_poll
+               net_rx_action
+               handle_softirqs
+
+     0.30%  videocall  [kernel.kallsyms]  [k] nft_do_chain_inet
+     0.30%  videocall  videocall          [.] BIO_read
+     0.30%  videocall  videocall          [.] bssl::ssl_read_buffer_extend_to(bssl::SSLImpl*, unsigned long)
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

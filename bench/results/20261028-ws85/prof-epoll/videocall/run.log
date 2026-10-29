@@ -1,0 +1,4 @@
+00:20:32 a ws: ramp
+00:23:41 a ws: stopped: max users at 950 users after 3m8s [running exit=0 oom=false]
+00:24:51 b ws: ramp
+00:27:58 b ws: stopped: max users at 950 users after 3m6s [running exit=0 oom=false]

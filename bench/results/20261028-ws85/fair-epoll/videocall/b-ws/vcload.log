@@ -1,0 +1,22 @@
+vcload ws https://127.0.0.1:8443: 1800 frames (GOP 60, 4.02 Mbit/s), 3001 audio packets (64 kbit/s); one user every 5s
+   10s users  100 connected  100 in call  100  video ok 100.0%  p99    2.0 ms  mem     41 MB  cpu 0.08  load 0.32
+   20s users  200 connected  200 in call  200  video ok 100.0%  p99    2.1 ms  mem     73 MB  cpu 0.16  load 0.61
+   30s users  300 connected  300 in call  300  video ok 100.0%  p99    2.7 ms  mem    105 MB  cpu 0.24  load 0.89
+   40s users  400 connected  400 in call  400  video ok 100.0%  p99    6.9 ms  mem    138 MB  cpu 0.33  load 1.20
+   50s users  500 connected  500 in call  500  video ok 100.0%  p99    4.6 ms  mem    175 MB  cpu 0.42  load 1.54
+   60s users  600 connected  600 in call  600  video ok 100.0%  p99   21.1 ms  mem    208 MB  cpu 0.52  load 1.86
+   70s users  700 connected  700 in call  700  video ok 100.0%  p99   42.8 ms  mem    247 MB  cpu 0.63  load 2.21
+   80s users  800 connected  800 in call  800  video ok  93.0%  p99  182.9 ms  mem    286 MB  cpu 0.75  load 2.56
+   90s users  900 connected  900 in call  900  video ok  53.8%  p99 3335.3 ms  mem    427 MB  cpu 0.80  load 2.61
+settling 950 users for 30s
+  100s users  950 connected  950 in call  950  video ok  48.2%  p99 7768.4 ms  mem    476 MB  cpu 0.80  load 2.48
+  110s users  950 connected  950 in call  950  video ok  47.5%  p99 12020.1 ms  mem    485 MB  cpu 0.80  load 2.28
+  120s users  950 connected  950 in call  950  video ok  42.3%  p99 15519.5 ms  mem    502 MB  cpu 0.80  load 2.25
+holding 950 users for 1m0s
+  130s users  950 connected  950 in call  950  video ok  33.5%  p99 18382.1 ms  mem    518 MB  cpu 0.79  load 2.34
+  140s users  950 connected  950 in call  950  video ok  32.4%  p99 19613.7 ms  mem    517 MB  cpu 0.80  load 2.35
+  150s users  950 connected  950 in call  950  video ok  33.1%  p99 19404.7 ms  mem    524 MB  cpu 0.79  load 2.28
+  160s users  950 connected  950 in call  950  video ok  29.7%  p99 20833.0 ms  mem    532 MB  cpu 0.79  load 2.28
+  170s users  950 connected  950 in call  950  video ok  30.2%  p99 21295.3 ms  mem    535 MB  cpu 0.79  load 2.24
+  180s users  950 connected  950 in call  950  video ok  31.5%  p99 19747.7 ms  mem    534 MB  cpu 0.79  load 2.27
+stopped: max users at 950 users after 3m6s

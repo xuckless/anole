@@ -1,0 +1,6 @@
+23:33:20 a ws: ramp
+23:40:36 a ws: stopped: video under 40% for 2 steps at 870 users after 7m15s [running exit=0 oom=false]
+23:41:46 b ws: ramp
+23:50:27 b ws: stopped: video under 40% for 2 steps at 1040 users after 8m40s [running exit=0 oom=false]
+23:51:37 c ws: ramp
+00:00:22 c ws: stopped: video under 40% for 2 steps at 1050 users after 8m45s [running exit=0 oom=false]

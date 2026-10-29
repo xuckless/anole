@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -34,6 +35,12 @@ func main() {
 	step := flag.Duration("step", 5*time.Second, "time between added users")
 	batch := flag.Int("batch", 1, "users added each step")
 	maxUsers := flag.Int("max-users", 3000, "stop after this many users")
+	stopBelow := flag.Float64("stop-below", parseFloat(stopBelowDefault), "stop once displayed video is under this share for 2 steps in a row (0: off)")
+	fastTo := flag.Int("fast-to", int(parseFloat(fastToDefault)), "join users in -fast-batch batches up to this many, settle -settle, then step by -batch (0: off; only when at most -max-users)")
+	fastBatch := flag.Int("fast-batch", int(parseFloat(fastBatchDefault)), "users added each step up to -fast-to")
+	settle, _ := time.ParseDuration(settleDefault)
+	settleF := flag.Duration("settle", settle, "pause at -fast-to before the steps go on")
+	hold := flag.Duration("hold", 0, "at -max-users, keep the users this long and measure it as one step before stopping")
 	maxTime := flag.Duration("max-time", 2*time.Hour, "stop after this long")
 	collapse := flag.Duration("collapse", 30*time.Second, "stop when calls stay collapsed this long")
 	videoDeadline := flag.Duration("video-deadline", 200*time.Millisecond, "a frame later than this (one way) misses its playout")
@@ -64,10 +71,27 @@ func main() {
 		os.Exit(1)
 	}
 	r := &ramp{base: *url, transport: *transport, clip: c, cgroup: *cgroup, out: *out, step: *step,
-		maxUsers: *maxUsers, batch: max(1, *batch), maxTime: *maxTime, collapse: *collapse, videoDeadline: *videoDeadline,
+		maxUsers: *maxUsers, hold: *hold, stopBelow: *stopBelow, fastTo: *fastTo, fastBatch: max(1, *fastBatch), settle: *settleF, batch: max(1, *batch), maxTime: *maxTime, collapse: *collapse, videoDeadline: *videoDeadline,
 		audioDeadline: *audioDeadline, chatEvery: *chatEvery}
 	if err := r.run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+// stopBelowDefault is -stop-below's default; a run's binary may set it at
+// link time (-ldflags "-X main.stopBelowDefault=0.4") so a harness that
+// passes fixed arguments picks the rule up.
+var stopBelowDefault = "0"
+
+// The fast start's defaults, set the same way (main.fastToDefault=700 ...).
+var (
+	fastToDefault    = "0"
+	fastBatchDefault = "50"
+	settleDefault    = "30s"
+)
+
+func parseFloat(s string) float64 {
+	f, _ := strconv.ParseFloat(s, 64)
+	return f
 }

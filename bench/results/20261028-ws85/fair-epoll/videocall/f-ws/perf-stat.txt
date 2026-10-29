@@ -1,0 +1,22 @@
+# started on Thu Oct 29 04:48:00 2026
+
+
+ Performance counter stats for process id '4070298':
+
+          19989.96 msec task-clock                                                            
+                 0      syscalls:sys_enter_read                                               
+                 0      syscalls:sys_enter_readv                                              
+            547438      syscalls:sys_enter_recvfrom                                           
+                 0      syscalls:sys_enter_recvmsg                                            
+                 0      syscalls:sys_enter_write                                              
+                 0      syscalls:sys_enter_writev                                             
+           1335368      syscalls:sys_enter_sendto                                             
+                 0      syscalls:sys_enter_sendmsg                                            
+                 0      syscalls:sys_enter_epoll_wait                                         
+                 0      syscalls:sys_enter_epoll_pwait                                        
+            209933      syscalls:sys_enter_epoll_pwait2                                       
+                 0      syscalls:sys_enter_ppoll                                              
+                 0      syscalls:sys_enter_io_uring_enter                                      
+
+      20.001206021 seconds time elapsed
+

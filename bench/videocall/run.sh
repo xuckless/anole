@@ -8,6 +8,8 @@
 #   SERVERS="anole bun" TRANSPORTS=ws STEP=5s bench/videocall/run.sh test-1
 #   MEDIA_DEFLATE=off bench/videocall/run.sh <id>   # a pure relay
 #   EXTRA="-batch 10" SKIP="anole-ws" bench/videocall/run.sh <id>   # 10 users a step
+#   URING=1 ...       # the servers may use io_uring (Docker's seccomp blocks it)
+#   VCLOAD=<binary>   # a vcload build to use in place of the image's
 #
 # Server: 1 CPU (SUT_CPUS_1) / 2 GB, no swap. Load generator: LOAD_CPUS.
 # Images: anole-bench/vc-<app> (each servers/<app>/Dockerfile),
@@ -27,6 +29,8 @@ EXTRA=${EXTRA:-}
 MEDIA_DEFLATE=${MEDIA_DEFLATE:-on}
 # app-transport pairs already measured in this results directory, kept as they are.
 SKIP=${SKIP:-}
+uring=(); [ "${URING:-0}" = 1 ] && uring=(--security-opt seccomp=unconfined --ulimit memlock=-1:-1)
+vcload=(); [ -n "${VCLOAD:-}" ] && vcload=(-v "$VCLOAD:/usr/local/bin/vcload:ro")
 media=$bench/.data/media/vc
 sh "$bench/lib/certs.sh" >/dev/null
 [ -f "$media/video.h264" ] || docker run --rm -v "$media:/out:z" anole-bench/vc-media sh -c "gen.sh /out >/dev/null && chown -R $(id -u):$(id -g) /out"
@@ -47,7 +51,7 @@ for transport in $TRANSPORTS; do
     docker rm -f vc-sut >/dev/null 2>&1
     cid=$(docker run -d --name vc-sut --network host \
       --cpuset-cpus "$SUT_CPUS_1" --cpus 1 --memory 2g --memory-swap 2g \
-      --ulimit nofile=1048576:1048576 \
+      --ulimit nofile=1048576:1048576 "${uring[@]}" \
       -v "$bench/.data/certs:/certs:ro,z" -e PORT=8443 -e MEDIA_DEFLATE="$MEDIA_DEFLATE" "anole-bench/vc-$app")
     ready=0
     for _ in $(seq 60); do
@@ -61,7 +65,7 @@ for transport in $TRANSPORTS; do
     docker run --rm --name vc-load --network host --cpuset-cpus "$LOAD_CPUS" \
       --ulimit nofile=1048576:1048576 --security-opt label=disable \
       -u "$(id -u):$(id -g)" -e MEDIA_DEFLATE="$MEDIA_DEFLATE" \
-      -v /sys/fs/cgroup:/host/cgroup:ro -v "$media:/data/media/vc:ro" -v "$dir:/out" \
+      -v /sys/fs/cgroup:/host/cgroup:ro -v "$media:/data/media/vc:ro" -v "$dir:/out" "${vcload[@]}" \
       --entrypoint vcload anole-bench/loadgen \
       -transport "$transport" -url https://127.0.0.1:8443 -step "$STEP" \
       -cgroup "/host/cgroup/system.slice/docker-$cid.scope" -out /out $EXTRA >"$dir/vcload.log" 2>&1

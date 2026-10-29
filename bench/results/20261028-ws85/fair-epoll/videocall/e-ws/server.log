@@ -1,0 +1,4 @@
+{"time":"2026-10-29T04:42:01.656Z","level":"info","scope":"anole","message":"environment production (release build): JSON Lines logs"}
+{"time":"2026-10-29T04:42:01.656Z","level":"info","scope":"anole","message":"ReleaseSafe build"}
+{"time":"2026-10-29T04:42:01.657Z","level":"info","scope":"anole","message":"listening on https://0.0.0.0:8443 (HTTP/2, HTTP/1.1, HTTP/3)"}
+{"time":"2026-10-29T04:42:01.657Z","level":"info","scope":"anole","message":"console: `anole console videocall` attaches (socket /run/anole/videocall.1.sock)"}
