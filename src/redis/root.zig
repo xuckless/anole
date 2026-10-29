@@ -849,7 +849,10 @@ pub const Client = struct {
     /// replies; the first error reply fails the call.
     fn exchange(self: *Client, ctx: *const Ctx, held: ?*Connection, batch: *const Batch) anyerror![]Reply {
         var conn = held orelse try self.take(ctx);
-        defer if (held == null) self.give(conn);
+        // Whether this call holds `conn` from the pool and gives it back
+        // (M1): not between giving a stale one back and taking the next.
+        var owned = held == null;
+        defer if (owned) self.give(conn);
         if (conn.broken) return ctx.failf(self.errors, .unavailable, "the connection broke in an earlier call; release it and acquire another", .{});
         var stale_retries: u8 = 0;
         const replies = while (true) {
@@ -861,8 +864,10 @@ pub const Client = struct {
                 // the retry policy).
                 if (held == null and conn.untouched() and err != error.Canceled and stale_retries < 4) {
                     stale_retries += 1;
+                    owned = false;
                     self.give(conn);
                     conn = try self.take(ctx);
+                    owned = true;
                     continue;
                 }
                 return self.broke(ctx, conn, err);
