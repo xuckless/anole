@@ -48,15 +48,15 @@ const Rig = struct {
 
     fn start(r: *Rig, consumers: []*engine.Consumer) !void {
         // The fake broker runs on std.testing.io, whose tasks run
-        // concurrently with the engine's.
+        // concurrently with the engine's. Each consumer gets an executor.
         const fio = std.testing.io;
         r.broker = try FakeBroker.start(alloc, fio, .{ .partitions = 3 });
         errdefer r.broker.deinit();
         r.json = try std.fmt.allocPrint(alloc,
-            \\{{"executors": 2, "timeouts": {{"shutdown_ms": 200}},
+            \\{{"executors": {d}, "timeouts": {{"shutdown_ms": 200}},
             \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
             \\ "brokers": [{{"name": "log", "kafka": {{"brokers": ["{s}"], "producer": {{"linger_ms": 1}}}}}}]}}
-        , .{r.broker.address()});
+        , .{ @max(2, consumers.len), r.broker.address() });
         errdefer alloc.free(r.json);
         var why_buf: [512]u8 = undefined;
         var why: Io.Writer = .fixed(&why_buf);
