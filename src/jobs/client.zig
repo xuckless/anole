@@ -337,7 +337,8 @@ pub const Client = struct {
             self.metrics = mm;
         }
         self.backend.vt.migrate(self.backend.ptr) catch |e| {
-            log.err("jobs: migrating the store failed: {t}", .{e});
+            // The caller gets the error too: a test that provokes it says so (expectLog).
+            anole.errors.log.err("jobs: migrating the store failed: {t}", .{e});
             return error.DatabaseUnavailable;
         };
         for (self.crons.items) |c| try self.loadZone(c);

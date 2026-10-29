@@ -477,3 +477,180 @@ const TeardownLoad = struct {
 test "jobs: [stress] app teardown with runs in flight on four executors never frees a connector a run still uses" {
     if (comptime anole.features.webhooks) try TeardownLoad.body() else return error.SkipZigTest;
 }
+
+/// A run that outlives the HTTP drain and then uses the app's own UDP
+/// socket (`app.udpSocket`), which the app frees with its raw listeners:
+/// the app must end the run before it frees anything a handler may use,
+/// not only before the connectors (J1, SAFETY.md M2).
+const AfterHttpUdp = struct {
+    const Drop = struct {
+        pub fn datagram(_: *anole.net.Datagram) !void {}
+    };
+    var io: std.Io = undefined;
+    var app: *anole.App = undefined;
+    var jc: *root.Client = undefined;
+    var started: std.atomic.Value(bool) = .init(false);
+    var sent: std.atomic.Value(bool) = .init(false);
+    var release: std.Io.Event = .unset;
+
+    fn run(_: *root.Job) anyerror!void {
+        started.store(true, .release);
+        // Cancelable; the drain's cancel is an hour away, so only the
+        // teardown's hook ends it.
+        try release.wait(io);
+        const s = app.udpSocket("udp-0") orelse return error.NoSocket;
+        // The listener has stopped: the socket refuses, and is still there.
+        s.send(s.address(), null, "late") catch |e| if (e != error.Closed) return e;
+        sent.store(true, .release);
+    }
+
+    fn setRelease(_: *root.Client) void {
+        release.set(io);
+    }
+
+    fn check(a: *anole.App) !void {
+        defer a.stop();
+        try a.waitReady();
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var ctx: anole.db.Ctx = .{ .io = a.io(), .arena = arena.allocator() };
+        _ = try jc.enqueueRaw(&ctx, kind.name, "{}", .{});
+        try waitFor(a.io(), isStarted, .{});
+    }
+
+    fn isStarted() bool {
+        return started.load(.acquire);
+    }
+
+    fn body() !void {
+        {
+            // `deinit` at the end of this block is what the test is about.
+            var a = try anole.App.init(gpa, .{ .executors = .exact(2), .listen_tls_http3 = false });
+            defer a.deinit();
+            app = &a;
+            io = a.io();
+            started.store(false, .release);
+            sent.store(false, .release);
+            release = .unset;
+            try a.udp("127.0.0.1:0", Drop, .{});
+            jc = try a.jobs(.{ .store = .memory, .drain_timeout = .fromSeconds(3600) });
+            jc.test_on_stop = setRelease;
+            try jc.handleRaw(&a, kind, .{}, run);
+            var checking = try a.io().concurrent(check, .{&a});
+            defer checking.cancel(a.io()) catch {};
+            try a.listen("127.0.0.1:0");
+            try checking.await(a.io());
+        }
+        try std.testing.expect(sent.load(.acquire));
+    }
+};
+
+test "jobs: a run still going after the HTTP drain ends before the app frees its UDP sockets" {
+    if (comptime anole.features.net) try AfterHttpUdp.body() else return error.SkipZigTest;
+}
+
+/// The store's `leaderTake`: this process leads on the first call; the
+/// second waits (cancelably, as a store's round trip does) until its task
+/// is canceled.
+const CanceledLeader = struct {
+    var io: std.Io = undefined;
+    var vt: store.VTable = undefined;
+    var calls: std.atomic.Value(u32) = .init(0);
+    var entered: std.atomic.Value(bool) = .init(false);
+    var never: std.Io.Event = .unset;
+
+    fn install(client: *root.Client, rio: std.Io) void {
+        io = rio;
+        calls.store(0, .release);
+        entered.store(false, .release);
+        never = .unset;
+        vt = client.backend.vt.*;
+        vt.leaderTake = leaderTake;
+        client.backend.vt = &vt;
+    }
+
+    fn leaderTake(_: *anyopaque, _: []const u8, _: root.Time, _: root.Duration) anyerror!bool {
+        if (calls.fetchAdd(1, .acq_rel) == 0) return true;
+        entered.store(true, .release);
+        try never.wait(io);
+        return true;
+    }
+
+    fn step(client: *root.Client, ctx: *anole.db.Ctx) root.Error!void {
+        _ = try client.step(ctx);
+    }
+};
+
+fn leaderGauge(registry: *anole.observe.metrics.Registry) ?i64 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    registry.render(&out.writer) catch return null;
+    const needle = "\nanole_jobs_leader ";
+    const at = std.mem.indexOf(u8, out.written(), needle) orelse return null;
+    const rest = out.written()[at + needle.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    return std.fmt.parseInt(i64, rest[0..end], 10) catch null;
+}
+
+fn leaderCanceledCheck(io: std.Io) !void {
+    var registry: anole.observe.metrics.Registry = .init(gpa, io);
+    defer registry.deinit();
+    const client = try root.Client.init(gpa, io, .{ .store = .memory, .run = .manual });
+    defer client.deinit();
+    CanceledLeader.install(client, io);
+    try client.start(&registry, null, null);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var ctx: anole.db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    _ = try client.step(&ctx);
+    try std.testing.expect(client.is_leader.load(.acquire));
+    try std.testing.expectEqual(@as(?i64, 1), leaderGauge(&registry));
+    var f = try io.concurrent(CanceledLeader.step, .{ client, &ctx });
+    try wait.waitFlag(io, "the leader's renewal is in the store", &CanceledLeader.entered);
+    try std.testing.expectError(error.Canceled, f.cancel(io));
+    // Whatever the store held for the leader went with the canceled call
+    // (PostgreSQL's advisory session is closed): not leading any more.
+    try std.testing.expect(!client.is_leader.load(.acquire));
+    try std.testing.expectEqual(@as(?i64, 0), leaderGauge(&registry));
+}
+
+test "jobs: a cancel during the leader's renewal leaves the process not leading, in is_leader and the gauge" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(leaderCanceledCheck, .{io});
+    try f.await(io);
+}
+
+/// `app.jobs` while serving, on a store whose migration fails: the error
+/// reaches the caller, and the app keeps no entry for the freed client (its
+/// teardown would stop and free it a second time).
+const StartFails = struct {
+    var db: if (anole.features.sqlite) *anole.sqlite.Client else void = undefined;
+
+    fn check(a: *anole.App) !void {
+        defer a.stop();
+        try a.waitReady();
+        const logged = anole.errors.expectLog();
+        defer logged.deinit();
+        try std.testing.expectError(error.DatabaseUnavailable, a.jobs(.{ .store = .{ .sqlite = db } }));
+    }
+
+    fn body() !void {
+        const lvl = std.testing.log_level;
+        std.testing.log_level = .err;
+        defer std.testing.log_level = lvl;
+        var a = try anole.App.init(gpa, .{ .executors = .exact(2), .listen_tls_http3 = false });
+        defer a.deinit();
+        // Read-only: the queue's tables cannot be made.
+        db = try a.sqlite(anole.sqlite.Options{ .path = ":memory:", .pragmas = &.{"PRAGMA query_only = ON"} });
+        var checking = try a.io().concurrent(check, .{&a});
+        defer checking.cancel(a.io()) catch {};
+        try a.listen("127.0.0.1:0");
+        try checking.await(a.io());
+    }
+};
+
+test "jobs: app.jobs failing to start while serving leaves no connector entry behind" {
+    if (comptime anole.features.sqlite) try StartFails.body() else return error.SkipZigTest;
+}

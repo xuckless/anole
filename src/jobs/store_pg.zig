@@ -767,7 +767,13 @@ fn leaderCancelCheck(io: std.Io, url: []const u8) !void {
     const placement = @import("dusty").placement;
     const pgc = try pg.Client.init(gpa, io, .{ .url = url, .environ = .empty });
     defer pgc.deinit();
-    const be = try Postgres.create(gpa, io, pgc, "t7_", .{ .notify = false, .advisory_lock = true });
+    // The advisory key hashes the prefix: one per run, so parallel test
+    // processes on one PostgreSQL never contend for the same lock.
+    var rb: [4]u8 = undefined;
+    io.random(&rb);
+    var prefix_buf: [16]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&prefix_buf, "t7_{x:0>8}_", .{std.mem.readInt(u32, &rb, .little)});
+    const be = try Postgres.create(gpa, io, pgc, prefix, .{ .notify = false, .advisory_lock = true });
     defer be.vt.deinit(be.ptr);
     const self = Postgres.me(be.ptr);
     LeaderQueryHold.io = io;
@@ -783,7 +789,9 @@ fn leaderCancelCheck(io: std.Io, url: []const u8) !void {
         _ = f.await(io) catch false;
     }
     try wait.waitFlag(io, "the leader's query is about to run", &LeaderQueryHold.entered);
-    // The cancel comes before the query runs, by construction.
+    // The cancel comes before the query runs, by construction: zio's
+    // waitForIo (check_first) returns Canceled before it submits the write,
+    // so pg_try_advisory_lock never runs and no lock waits on the backend.
     placement.cancelTask(LeaderQueryHold.task.?);
     LeaderQueryHold.release.set(io);
     try std.testing.expectError(error.Canceled, f.await(io));
