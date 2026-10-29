@@ -1325,26 +1325,38 @@ const ChunkCount = struct {
     }
 };
 
-test "net tcp: a steady echo on one connection allocates no new send chunk after the first" {
+test "net tcp: a steady echo on one connection allocates no new send chunk after the first, at each size" {
     var counting: ChunkCount = .{ .child = alloc };
     var app = try App.init(counting.allocator(), .{ .executors = .exact(1) });
     defer app.deinit();
-    try app.tcp("127.0.0.1:0", Echo, .{});
+    // Whole messages per read, so the echoes are the messages' sizes.
+    try app.tcp("127.0.0.1:0", Echo, .{ .read_window = 65536 });
     const Run = struct {
         var count: *ChunkCount = undefined;
-        fn round(s: *ClientStream) !void {
-            try s.writer().writeAll("0123456789abcdef");
+        var out: [32 * 1024]u8 = undefined;
+        var in: [32 * 1024]u8 = undefined;
+        fn round(s: *ClientStream, n: usize) !void {
+            try s.writer().writeAll(out[0..n]);
             try s.writer().flush();
-            try expectRead(s, "0123456789abcdef");
+            var got: usize = 0;
+            while (got < n) got += try readSome(s, in[got..n]);
+            try std.testing.expectEqualSlices(u8, out[0..n], in[0..n]);
         }
         fn run(a: *App) !void {
+            for (&out, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
             const s = try connect(a, portOf(a));
             defer s.close();
-            for (0..10) |_| try round(s);
-            const warm = count.chunks.load(.acquire);
-            try std.testing.expect(warm >= 1);
-            for (0..200) |_| try round(s);
-            try std.testing.expectEqual(warm, count.chunks.load(.acquire));
+            // 16 KiB is a standard chunk's room; one byte past it, and twice it.
+            for ([_]usize{ 16, 16 * 1024 - 1, 16 * 1024, 16 * 1024 + 1, 32 * 1024 }) |n| {
+                for (0..10) |_| try round(s, n);
+                const warm = count.chunks.load(.acquire);
+                for (0..50) |_| try round(s, n);
+                if (warm != count.chunks.load(.acquire)) {
+                    std.debug.print("{d}-byte echo: {d} chunk allocations after the warm-up\n", .{ n, count.chunks.load(.acquire) - warm });
+                    return error.TestUnexpectedResult;
+                }
+            }
+            try std.testing.expect(count.chunks.load(.acquire) >= 1);
         }
     };
     Run.count = &counting;
