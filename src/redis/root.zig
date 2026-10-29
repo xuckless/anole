@@ -328,9 +328,16 @@ const Pool = struct {
     /// `max` slots; the first `idle_len` hold idle connections.
     idle: []*Connection,
     idle_len: usize = 0,
-    /// Idle and in use.
+    /// Idle, in use, being opened or being closed.
     open: usize = 0,
     max: usize,
+    /// `max` slots; the first `spare_len` hold the memory of closed
+    /// connections, which the next dial reuses. A pooled `Connection` is
+    /// freed only in `deinit` (process-wide, M2): a `Conn` from an earlier
+    /// checkout reads a lease, never freed memory (M6). Every one is
+    /// counted in `open` or here, so there are `max` at most.
+    spare: []*Connection,
+    spare_len: usize = 0,
 };
 
 /// One connection to the server, and its RESP parser.
@@ -338,7 +345,7 @@ const Connection = struct {
     gpa: std.mem.Allocator,
     stream: *ClientStream,
     parser: *hiredis.redisReader,
-    /// Null for a subscriber's.
+    /// Null for a subscriber's. Set once, when the memory is made.
     pool: ?*Pool,
     idle_since: std.Io.Clock.Timestamp = undefined,
     state: State = .{},
@@ -411,9 +418,16 @@ const Connection = struct {
         }
     }
 
-    fn close(self: *Connection) void {
+    /// Closes the socket and the parser; the memory stays.
+    fn shut(self: *Connection) void {
         hiredis.redisReaderFree(self.parser);
         self.stream.close();
+    }
+
+    /// Closes it and frees its memory: a subscriber's, or a pooled one in
+    /// `deinit`.
+    fn close(self: *Connection) void {
+        self.shut();
         self.gpa.destroy(self);
     }
 };
@@ -547,12 +561,17 @@ pub const Client = struct {
         self.pools = try .init(gpa, io);
         var made: usize = 0;
         errdefer {
-            for (self.pools.pools[0..made]) |*p| gpa.free(p.idle);
+            for (self.pools.pools[0..made]) |*p| {
+                gpa.free(p.idle);
+                gpa.free(p.spare);
+            }
             self.pools.deinit(gpa);
         }
         for (self.pools.pools, 0..) |*p, i| {
             const max = self.pools.share(total, i);
-            p.* = .{ .idle = try gpa.alloc(*Connection, max), .max = max };
+            const idle = try gpa.alloc(*Connection, max);
+            errdefer gpa.free(idle);
+            p.* = .{ .idle = idle, .spare = try gpa.alloc(*Connection, max), .max = max };
             made += 1;
         }
         log.info("redis \"{s}\": {f}, up to {d} connections over {d} executors", .{ self.name, s, @max(total, executors), executors });
@@ -570,8 +589,10 @@ pub const Client = struct {
         self.guard.deinit();
         for (self.pools.pools) |*p| {
             for (p.idle[0..p.idle_len]) |conn| conn.close();
+            for (p.spare[0..p.spare_len]) |conn| gpa.destroy(conn);
             if (p.open > p.idle_len) log.warn("redis \"{s}\": {d} connections were still taken at deinit", .{ self.name, p.open - p.idle_len });
             gpa.free(p.idle);
+            gpa.free(p.spare);
         }
         self.pools.deinit(gpa);
         self.arena.deinit();
@@ -693,7 +714,11 @@ pub const Client = struct {
         var b = Builder.init(ctx.arena) catch return error.OutOfMemory;
         b.add(.{ verb, names }) catch |err| return self.narrow(&ctx, err);
         const batch = b.finish();
-        const conn = self.dial(&ctx, null) catch |err| return self.narrow(&ctx, err);
+        const slot = newSlot(self.gpa, null) catch return error.OutOfMemory;
+        const conn = self.dial(&ctx, slot) catch |err| {
+            self.gpa.destroy(slot);
+            return self.narrow(&ctx, err);
+        };
         const sub = self.gpa.create(Subscriber) catch {
             conn.close();
             return error.OutOfMemory;
@@ -933,10 +958,9 @@ pub const Client = struct {
                 pool.idle_len -= 1;
                 const conn = pool.idle[pool.idle_len];
                 if (self.expired(conn, io)) {
-                    pool.open -= 1;
                     pool.mutex.unlock(io);
                     self.observer.connections(-1, 0);
-                    conn.close();
+                    self.retire(conn);
                     pool.mutex.lockUncancelable(io);
                     continue;
                 }
@@ -948,9 +972,22 @@ pub const Client = struct {
             }
             if (pool.open < pool.max) {
                 pool.open += 1;
+                const spare: ?*Connection = if (pool.spare_len > 0) blk: {
+                    pool.spare_len -= 1;
+                    break :blk pool.spare[pool.spare_len];
+                } else null;
                 pool.mutex.unlock(io);
-                const conn = self.dial(ctx, pool) catch |err| {
+                const slot = spare orelse newSlot(self.gpa, pool) catch |err| {
                     pool.mutex.lockUncancelable(io);
+                    pool.open -= 1;
+                    pool.returned.signal(io);
+                    pool.mutex.unlock(io);
+                    return err;
+                };
+                const conn = self.dial(ctx, slot) catch |err| {
+                    pool.mutex.lockUncancelable(io);
+                    pool.spare[pool.spare_len] = slot;
+                    pool.spare_len += 1;
                     pool.open -= 1;
                     pool.returned.signal(io);
                     pool.mutex.unlock(io);
@@ -996,11 +1033,9 @@ pub const Client = struct {
                 }
                 pool.idle_len -= 1;
                 const conn = pool.idle[pool.idle_len];
-                pool.open -= 1;
-                pool.returned.signal(io);
                 pool.mutex.unlock(io);
                 self.observer.connections(-1, 0);
-                conn.close();
+                self.retire(conn);
             }
         }
     }
@@ -1032,11 +1067,9 @@ pub const Client = struct {
         // Read after the lease check: the connection is still this
         // caller's, no one else's.
         if (!conn.reusable()) {
-            pool.open -= 1;
-            pool.returned.signal(io);
             pool.mutex.unlock(io);
             self.observer.connections(0, -1);
-            conn.close();
+            self.retire(conn);
             return;
         }
         conn.idle_since = .now(io, .awake);
@@ -1047,11 +1080,37 @@ pub const Client = struct {
         self.observer.connections(1, -1);
     }
 
-    /// Opens a connection and logs in, within `connect_timeout`.
-    fn dial(self: *Client, ctx: *const Ctx, pool: ?*Pool) anyerror!*Connection {
+    /// Closes a pooled connection no one holds, which still counts in its
+    /// pool's `open`, and frees its place. Its memory stays in the pool as a
+    /// spare until `deinit` (see `Pool.spare`).
+    fn retire(self: *Client, conn: *Connection) void {
+        const io = self.io;
+        const pool = conn.pool.?;
+        conn.shut();
+        pool.mutex.lockUncancelable(io);
+        pool.spare[pool.spare_len] = conn;
+        pool.spare_len += 1;
+        pool.open -= 1;
+        pool.returned.signal(io);
+        pool.mutex.unlock(io);
+    }
+
+    /// The memory of a new connection of `pool` (null: a subscriber's),
+    /// with its pool and its first lease set; `open` fills in the rest.
+    fn newSlot(gpa: std.mem.Allocator, pool: ?*Pool) error{OutOfMemory}!*Connection {
+        const conn = try gpa.create(Connection);
+        conn.pool = pool;
+        conn.lease = 0;
+        return conn;
+    }
+
+    /// Opens a connection into `slot` (from `newSlot` or a pool's spares)
+    /// and logs in, within `connect_timeout`. On a failure `slot` is the
+    /// caller's to keep or free.
+    fn dial(self: *Client, ctx: *const Ctx, slot: *Connection) anyerror!*Connection {
         const timeout: std.Io.Timeout = if (self.connect_timeout) |t| .{ .duration = .{ .raw = t, .clock = .awake } } else .none;
         const deadline: dusty.Deadline = .init(ctx.io, timeout);
-        return deadline.run(open, .{ self, ctx, pool }) catch |err| {
+        return deadline.run(open, .{ self, ctx, slot }) catch |err| {
             // Recorded already: the server refused the login.
             inline for (@typeInfo(db.Error).error_set.error_names.?) |name| {
                 if (err == @field(db.Error, name)) return err;
@@ -1064,16 +1123,23 @@ pub const Client = struct {
         };
     }
 
-    fn open(self: *Client, ctx: *const Ctx, pool: ?*Pool) anyerror!*Connection {
+    fn open(self: *Client, ctx: *const Ctx, slot: *Connection) anyerror!*Connection {
         const stream = try ClientStream.connect(self.gpa, ctx.io, self.stream_options);
         errdefer stream.close();
         const parser = hiredis.redisReaderCreate() orelse return error.OutOfMemory;
         errdefer hiredis.redisReaderFree(parser);
         // `convert` (and hiredis's freeReplyObject) recurse once per level.
         parser.*.maxdepth = max_reply_depth;
-        const conn = try self.gpa.create(Connection);
-        errdefer self.gpa.destroy(conn);
-        conn.* = .{ .gpa = self.gpa, .stream = stream, .parser = parser, .pool = pool };
+        const conn = slot;
+        // Field by field: `pool` and `lease` stay, and a stale `Conn` may
+        // read the lease (under the pool's lock) meanwhile.
+        conn.gpa = self.gpa;
+        conn.stream = stream;
+        conn.parser = parser;
+        conn.state = .{};
+        conn.broken = false;
+        conn.reused = false;
+        conn.sent = 0;
         if (self.login.count > 0) {
             const replies = conn.transfer(ctx.arena, &self.login) catch |err| return switch (err) {
                 error.ReadFailed => stream.readError() orelse err,
