@@ -351,6 +351,10 @@ const Connection = struct {
     /// `stream.bytesSent()` when it was taken: unchanged after a failure,
     /// nothing of the call reached the server.
     sent: u64 = 0,
+    /// Bumped by every give-back, under its pool's `mutex`: a `Conn` from
+    /// an earlier checkout gives nothing back (SAFETY.md M6, as pgxpool's
+    /// idempotent `Release`). Read without the lock only by its holder.
+    lease: u32 = 0,
 
     /// What the commands sent so far have left on the connection.
     const State = struct {
@@ -651,7 +655,7 @@ pub const Client = struct {
     pub fn acquire(self: *Client, c: anytype) Error!Conn {
         const ctx = erase(c);
         const conn = self.take(&ctx) catch |err| return self.narrow(&ctx, err);
-        return .{ .client = self, .conn = conn };
+        return .{ .client = self, .conn = conn, .lease = conn.lease };
     }
 
     /// The shared SUBSCRIBE connection of `anole.watch` (internal): one per
@@ -1002,22 +1006,36 @@ pub const Client = struct {
         return conn.idle_since.durationTo(.now(io, .awake)).raw.nanoseconds > limit.nanoseconds;
     }
 
-    /// Gives a connection back to its pool, or closes it when it is broken
-    /// or left in a state the next call must not inherit.
+    /// Gives a connection the caller holds back to its pool, or closes it
+    /// when it is broken or left in a state the next call must not inherit.
     fn give(self: *Client, conn: *Connection) void {
+        self.giveLease(conn, conn.lease);
+    }
+
+    /// `give`, when `lease` is the checkout that holds `conn` now; a lease
+    /// given back already (a second `release`, or one after the connection
+    /// was taken again) gives nothing back and logs.
+    fn giveLease(self: *Client, conn: *Connection, lease: u32) void {
         const io = self.io;
         const pool = conn.pool.?;
+        pool.mutex.lockUncancelable(io);
+        if (conn.lease != lease) {
+            pool.mutex.unlock(io);
+            log.err("redis \"{s}\": a connection from acquire() was released twice; the second release did nothing", .{self.name});
+            return;
+        }
+        conn.lease +%= 1;
+        // Read after the lease check: the connection is still this
+        // caller's, no one else's.
         if (!conn.reusable()) {
-            conn.close();
-            pool.mutex.lockUncancelable(io);
             pool.open -= 1;
             pool.returned.signal(io);
             pool.mutex.unlock(io);
             self.observer.connections(0, -1);
+            conn.close();
             return;
         }
         conn.idle_since = .now(io, .awake);
-        pool.mutex.lockUncancelable(io);
         pool.idle[pool.idle_len] = conn;
         pool.idle_len += 1;
         pool.returned.signal(io);
@@ -1297,11 +1315,15 @@ fn rest(args: anytype) Rest(@TypeOf(args)) {
 pub const Conn = struct {
     client: *Client,
     conn: *Connection,
+    /// `conn.lease` when it was acquired.
+    lease: u32,
 
     /// Gives the connection back; one left inside MULTI or WATCH, on
-    /// another database or subscribed, or broken, is closed instead.
+    /// another database or subscribed, or broken, is closed instead. A
+    /// second call does nothing (it logs). Don't call anything on it after
+    /// `release`.
     pub fn release(self: *const Conn) void {
-        self.client.give(self.conn);
+        self.client.giveLease(self.conn, self.lease);
     }
 
     /// `Client.command`, on this connection.
