@@ -638,14 +638,28 @@ test "requestMany: the stream ends at its deadline, and what came before comes o
     const responses = try s.client.requestMany("many.2", "?", many(100, 32));
     defer responses.deinit();
     const deadline = responses.deadline;
+    const expected = [_][]const u8{ "r1", "r2" };
+    var taken: usize = 0;
+    // While the stream is live, a short wait gives a response or times out;
+    // an end (null) here is legal only past the deadline.
+    const step: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } };
+    if (responses.next(.{ .timeout = step })) |first| {
+        if (first) |message| {
+            var m = message;
+            defer m.deinit();
+            try testing.expectEqualStrings(expected[0], m.payload);
+            taken = 1;
+        } else try testing.expect(time.expired(io, deadline));
+    } else |err| switch (err) {
+        error.Timeout => {},
+        else => |e| return e,
+    }
     // Time passes on purpose, up to the deadline.
     while (!time.expired(io, deadline)) try io.sleep(.fromMilliseconds(5), .awake);
     // What came by the deadline comes out, in order, then the end. How many
     // came in time depends on the machine's speed (none, one or both); which
     // ones and in what order does not.
     const received = responses.messages.stats(io).received;
-    const expected = [_][]const u8{ "r1", "r2" };
-    var taken: usize = 0;
     while (try responses.next(.{})) |message| {
         var m = message;
         defer m.deinit();
@@ -654,7 +668,7 @@ test "requestMany: the stream ends at its deadline, and what came before comes o
         taken += 1;
     }
     try testing.expect(taken >= received);
-    try testing.expect(time.expired(io, deadline));
+    if (test_wait.timing()) try testing.expectEqual(expected.len, taken);
     try testing.expectEqual(0, s.client.inbox.pendingCount(io));
     try s.finish();
 }
