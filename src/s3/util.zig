@@ -18,7 +18,7 @@ pub fn parseHttpDate(value: []const u8) ?i64 {
     const hour = std.fmt.parseInt(u8, v[17..19], 10) catch return null;
     const minute = std.fmt.parseInt(u8, v[20..22], 10) catch return null;
     const second = std.fmt.parseInt(u8, v[23..25], 10) catch return null;
-    if (day == 0 or day > std.time.epoch.getDaysInMonth(year, @enumFromInt(month))) return null;
+    if (day == 0 or day > std.time.epoch.getDaysInMonth(year, @fromBackingInt(@intCast(month)))) return null;
     if (hour > 23 or minute > 59 or second > 60) return null;
     return daysFromCivil(year, month, day) * std.time.s_per_day + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second;
 }
@@ -41,8 +41,8 @@ pub fn formatHttpDate(buf: *[29]u8, seconds: i64) []const u8 {
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
     return std.fmt.bufPrint(buf, "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
-        day_names[day.day % 7],         md.day_index + 1,          month_names[md.month.numeric() - 1], yd.year,
-        ds.getHoursIntoDay(),           ds.getMinutesIntoHour(),   ds.getSecondsIntoMinute(),
+        day_names[day.day % 7], md.day_index + 1,        month_names[md.month.numeric() - 1], yd.year,
+        ds.getHoursIntoDay(),   ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     }) catch unreachable;
 }
 

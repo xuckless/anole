@@ -671,7 +671,7 @@ pub const ConnectionPool = struct {
         const n = @min(remote_host.len, buf.len);
         for (remote_host[0..n], buf[0..n]) |ch, *o| o.* = std.ascii.toLower(ch);
         h.update(buf[0..n]);
-        h.update(&.{@intFromEnum(protocol)});
+        h.update(&.{@backingInt(protocol)});
         return h.final();
     }
 
@@ -1899,7 +1899,7 @@ pub const Client = struct {
     const FetchJudge = struct {
         pub fn verdict(a: *const Attempt) resilience.Verdict {
             const resp = a.result catch |err| return transportVerdict(@errorName(err));
-            const code = @intFromEnum(resp.status());
+            const code = @backingInt(resp.status());
             for (a.statuses) |s| if (s == code) return if (code == 429) .retryable else .transient;
             return switch (code) {
                 408, 500, 502, 503, 504 => .failure,
@@ -1910,7 +1910,7 @@ pub const Client = struct {
         }
         pub fn retryAfter(a: *const Attempt) ?std.Io.Duration {
             const resp = a.result catch return null;
-            const code = @intFromEnum(resp.status());
+            const code = @backingInt(resp.status());
             if (code != 429 and code != 503) return null;
             const value = resp.headers().get("Retry-After") orelse return null;
             return retryAfterValue(value, a.now_s);

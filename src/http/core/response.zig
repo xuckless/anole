@@ -1578,7 +1578,7 @@ pub const Response = struct {
         return self.detachUnchecked(req, owner);
     }
 
-    fn detachUnchecked(self: *Response, req: *Request, owner: Detached.Owner) error{ OutOfMemory }!*Detached {
+    fn detachUnchecked(self: *Response, req: *Request, owner: Detached.Owner) error{OutOfMemory}!*Detached {
         const d = try self.arena.create(Detached);
         d.* = .{
             .request = req,

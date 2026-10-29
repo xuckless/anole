@@ -332,7 +332,6 @@ test "SCRAM-SHA-1: RFC 5802's example" {
         try rfc.clientFinal(arena, testing.io, null, "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096"),
     );
     try rfc.verifyServerFinal("v=rmF9pqV8S7suAoZWja4dJRkFsKQ=");
-
 }
 
 test "SCRAM-SHA-256: RFC 7677's example (also auth.md's)" {

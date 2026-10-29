@@ -355,7 +355,7 @@ fn fetchIfTask(io: std.Io, url: []const u8, names: []const []const u8, values_in
     for (names, values_in) |n, v| try h.add(n, v);
     var resp = try http.fetch(url, .{ .headers = &h, .decompress = false });
     defer resp.deinit();
-    out.status = @intCast(@intFromEnum(resp.status()));
+    out.status = @intCast(@backingInt(resp.status()));
     out.body = try alloc.dupe(u8, (try resp.body()) orelse "");
 }
 

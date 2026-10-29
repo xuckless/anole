@@ -253,7 +253,7 @@ pub const Breaker = struct {
     }
 
     pub fn state(b: *const Breaker) State {
-        return @enumFromInt(b._state.load(.acquire));
+        return @fromBackingInt(@intCast(b._state.load(.acquire)));
     }
 
     /// When an open breaker lets the next probe through (awake ns).
@@ -297,7 +297,7 @@ pub const Breaker = struct {
             }
             b._probes.store(0, .monotonic);
             b._probe_ok.store(0, .monotonic);
-            if (b._state.cmpxchgStrong(@intFromEnum(State.open), @intFromEnum(State.half_open), .acq_rel, .acquire) == null) {
+            if (b._state.cmpxchgStrong(@backingInt(State.open), @backingInt(State.half_open), .acq_rel, .acquire) == null) {
                 b.announce(.half_open);
             }
             st = b.state();
@@ -385,7 +385,7 @@ pub const Breaker = struct {
     }
 
     fn close(b: *Breaker) void {
-        if (b._state.cmpxchgStrong(@intFromEnum(State.half_open), @intFromEnum(State.closed), .acq_rel, .acquire) != null) return;
+        if (b._state.cmpxchgStrong(@backingInt(State.half_open), @backingInt(State.closed), .acq_rel, .acquire) != null) return;
         b.clear();
         b._open_for.store(@intCast(@min(b.options.open_for.nanoseconds, std.math.maxInt(i64))), .monotonic);
         b.announce(.closed);
@@ -401,7 +401,7 @@ pub const Breaker = struct {
         // Cut by a random part of up to a fifth.
         const cut: i64 = @intCast(b.random() % @as(u64, @intCast(@max(1, @divTrunc(period, 5)))));
         b._open_until.store(now_ns +| (period - cut), .monotonic);
-        if (b._state.cmpxchgStrong(@intFromEnum(from), @intFromEnum(State.open), .acq_rel, .acquire) != null) return;
+        if (b._state.cmpxchgStrong(@backingInt(from), @backingInt(State.open), .acq_rel, .acquire) != null) return;
         b._consecutive.store(0, .monotonic);
         b.announce(.open);
     }

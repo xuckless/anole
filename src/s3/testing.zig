@@ -275,7 +275,7 @@ pub const FakeServer = struct {
         try self.log.append(self.gpa, .{
             .method = util.methodName(req.method),
             .target = try self.arena.allocator().dupe(u8, req.url),
-            .status = @intCast(@intFromEnum(res.status)),
+            .status = @intCast(@backingInt(res.status)),
         });
     }
 

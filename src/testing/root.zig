@@ -158,7 +158,7 @@ const MemSink = struct {
         var list: std.ArrayList([]const u8) = .empty;
         const a = self.store.allocator();
         list.append(a, w.buffered()) catch return self.fail(error.SystemResources);
-        for (data[0 .. data.len -| 1]) |d| list.append(a, d) catch return self.fail(error.SystemResources);
+        for (data[0..data.len -| 1]) |d| list.append(a, d) catch return self.fail(error.SystemResources);
         if (data.len > 0) for (0..splat) |_| list.append(a, data[data.len - 1]) catch return self.fail(error.SystemResources);
         try self.pushLocked(list.items);
         w.end = 0;

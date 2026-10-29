@@ -360,7 +360,7 @@ fn onOpen(sub: *sse.Subscriber) void {
 fn onClose(sub: *sse.Subscriber, reason: sse.CloseReason) void {
     const slot: *SseSlot = @ptrCast(@alignCast(sub.context.?));
     slot.sub = null;
-    retire(slot.exec, slot, slot.gen(), @intFromEnum(reason));
+    retire(slot.exec, slot, slot.gen(), @backingInt(reason));
 }
 
 fn retire(x: *Exec, s: *SseSlot, g: u32, reason: u32) void {

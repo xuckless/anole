@@ -304,11 +304,11 @@ fn writeStyle(w: *std.Io.Writer, s: Style, color: bool) !void {
     if (s.underline) try w.writeAll(seq.ul_single);
     if (!color) return;
     if (s.fg != .default) {
-        const n: u8 = @intFromEnum(s.fg) - 1;
+        const n: u8 = @backingInt(s.fg) - 1;
         if (n < 8) try w.print(seq.fg_base, .{n}) else try w.print(seq.fg_bright, .{n - 8});
     }
     if (s.bg != .default) {
-        const n: u8 = @intFromEnum(s.bg) - 1;
+        const n: u8 = @backingInt(s.bg) - 1;
         if (n < 8) try w.print(seq.bg_base, .{n}) else try w.print(seq.bg_bright, .{n - 8});
     }
 }

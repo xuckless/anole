@@ -11,7 +11,7 @@ const metrics = observe.metrics;
 
 pub const max_targets = 256;
 comptime {
-    std.debug.assert(@intFromEnum(core.Kind.kafka) == 7);
+    std.debug.assert(@backingInt(core.Kind.kafka) == 7);
 }
 
 /// The series of one registry, and the hooks that feed them. Pin it (the
@@ -62,7 +62,7 @@ pub const Binding = struct {
     }
 
     fn label(self: *Binding, kind: core.Kind, target: []const u8) []const u8 {
-        const set = &self.seen[@intFromEnum(kind)];
+        const set = &self.seen[@backingInt(kind)];
         while (!self.lock.tryLock()) std.atomic.spinLoopHint();
         defer self.lock.unlock();
         if (set.contains(target)) return set.getKey(target).?;
@@ -82,7 +82,7 @@ pub const Binding = struct {
     fn onState(ctx: ?*anyopaque, kind: core.Kind, target: []const u8, st: core.Breaker.State) void {
         const self = cast(ctx);
         const t = self.label(kind, target);
-        self.state.with(&.{ @tagName(kind), t }).set(@intFromEnum(st));
+        self.state.with(&.{ @tagName(kind), t }).set(@backingInt(st));
         if (st == .open) self.opened.with(&.{ @tagName(kind), t }).inc();
     }
     fn onRejected(ctx: ?*anyopaque, kind: core.Kind, target: []const u8) void {

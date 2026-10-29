@@ -27,11 +27,11 @@ fn slot(io: std.Io) usize {
 
 /// Adds `delta` (negative to remove) on the calling task's executor.
 pub fn add(io: std.Io, kind: Kind, delta: i64) void {
-    _ = counts[@intFromEnum(kind)][slot(io)].fetchAdd(delta, .monotonic);
+    _ = counts[@backingInt(kind)][slot(io)].fetchAdd(delta, .monotonic);
 }
 
 /// The count on executor `index`. A connection closed on another executor
 /// than it opened on can make one slot negative; sums stay right.
 pub fn get(kind: Kind, index: usize) i64 {
-    return counts[@intFromEnum(kind)][index].load(.monotonic);
+    return counts[@backingInt(kind)][index].load(.monotonic);
 }

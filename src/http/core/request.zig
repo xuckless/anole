@@ -220,9 +220,9 @@ pub const Request = struct {
 
     fn keptOnReset(comptime name: []const u8) bool {
         const kept = [_][]const u8{
-            "arena",          "io",       "_parser", "_transport", "_config",          "_response",
-            "remote_address", "listener", "secure",  "drain",      "_drain_hooks",     "peer_certificate",
-            "_timeout_context", "_set_timeout",   "_claim_timeout",
+            "arena",            "io",           "_parser",        "_transport", "_config",      "_response",
+            "remote_address",   "listener",     "secure",         "drain",      "_drain_hooks", "peer_certificate",
+            "_timeout_context", "_set_timeout", "_claim_timeout",
         };
         @setEvalBranchQuota(10_000);
         for (kept) |k| if (std.mem.eql(u8, k, name)) return true;

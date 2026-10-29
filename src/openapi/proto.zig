@@ -36,10 +36,10 @@ pub const connect_error: Component = .{
             m("code", obj(&.{
                 m("type", str("string")),
                 m("enum", arr(&.{
-                    str("canceled"),            str("unknown"),             str("invalid_argument"), str("deadline_exceeded"),
-                    str("not_found"),           str("already_exists"),      str("permission_denied"), str("resource_exhausted"),
-                    str("failed_precondition"), str("aborted"),             str("out_of_range"),      str("unimplemented"),
-                    str("internal"),            str("unavailable"),         str("data_loss"),         str("unauthenticated"),
+                    str("canceled"),            str("unknown"),        str("invalid_argument"),  str("deadline_exceeded"),
+                    str("not_found"),           str("already_exists"), str("permission_denied"), str("resource_exhausted"),
+                    str("failed_precondition"), str("aborted"),        str("out_of_range"),      str("unimplemented"),
+                    str("internal"),            str("unavailable"),    str("data_loss"),         str("unauthenticated"),
                 })),
             })),
             m("message", obj(&.{m("type", str("string"))})),

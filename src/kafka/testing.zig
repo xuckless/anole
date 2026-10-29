@@ -317,11 +317,11 @@ pub const FakeBroker = struct {
                 for (all) |a| {
                     var lo: i16 = 0;
                     var hi: i16 = a.version() + 1;
-                    for (b.config.serves) |r| if (r.key == @intFromEnum(a)) {
+                    for (b.config.serves) |r| if (r.key == @backingInt(a)) {
                         lo = r.min;
                         hi = r.max;
                     };
-                    try out.i16_(@intFromEnum(a));
+                    try out.i16_(@backingInt(a));
                     try out.i16_(lo);
                     try out.i16_(hi);
                 }

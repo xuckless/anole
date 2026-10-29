@@ -46,7 +46,7 @@ pub const Tap = struct {
     ud: ?*anyopaque = null,
     /// The least severe level passed on (as std.log.Level's integer): warn
     /// while no console shows logs, debug while one does.
-    min_level: std.atomic.Value(u8) = .init(@intFromEnum(std.log.Level.warn)),
+    min_level: std.atomic.Value(u8) = .init(@backingInt(std.log.Level.warn)),
 };
 
 // ------------------------------------------------------------------ state
@@ -57,7 +57,7 @@ var suppress_stderr: std.atomic.Value(bool) = .init(false);
 /// (`fromStd`) must not tap it a second time.
 threadlocal var tl_tapped: bool = false;
 
-var format_state: std.atomic.Value(u8) = .init(@intFromEnum(Format.text));
+var format_state: std.atomic.Value(u8) = .init(@backingInt(Format.text));
 /// 255: no runtime filter.
 var level_state: std.atomic.Value(u8) = .init(255);
 var sink_state: std.atomic.Value(?*const Callback) = .init(null);
@@ -70,16 +70,16 @@ threadlocal var tl_busy: bool = false;
 
 /// `.auto` stores `.text`: resolve it from the environment first.
 pub fn setFormat(f: Format) void {
-    format_state.store(@intFromEnum(if (f == .auto) Format.text else f), .release);
+    format_state.store(@backingInt(if (f == .auto) Format.text else f), .release);
 }
 
 /// `.text` or `.json`.
 pub fn currentFormat() Format {
-    return @enumFromInt(format_state.load(.acquire));
+    return @fromBackingInt(@intCast(format_state.load(.acquire)));
 }
 
 pub fn setLevel(l: ?std.log.Level) void {
-    level_state.store(if (l) |x| @intFromEnum(x) else 255, .release);
+    level_state.store(if (l) |x| @backingInt(x) else 255, .release);
 }
 
 pub fn setService(name: ?[]const u8) void {
@@ -114,7 +114,7 @@ pub fn suppressStderr(on: bool) void {
 /// The tap, when it wants records of `level`: one relaxed load when none.
 inline fn tapFor(level: std.log.Level) ?*Tap {
     const t = tap_state.load(.monotonic) orelse return null;
-    if (@intFromEnum(level) > t.min_level.load(.monotonic)) return null;
+    if (@backingInt(level) > t.min_level.load(.monotonic)) return null;
     return t;
 }
 
@@ -139,7 +139,7 @@ pub fn hasSink() bool {
 
 fn enabled(level: std.log.Level) bool {
     const l = level_state.load(.acquire);
-    return l == 255 or @intFromEnum(level) <= l;
+    return l == 255 or @backingInt(level) <= l;
 }
 
 fn now() std.Io.Timestamp {

@@ -131,7 +131,6 @@ pub const ResponseDoc = struct {
     content_type: ?[]const u8 = null,
 };
 
-
 /// What a middleware tells the document: `pub const openapi:
 /// anole.openapi.MiddlewareDoc = .{ ... }` in its type. A middleware that
 /// is a function has no declarations: make it a type with `pub fn run`.

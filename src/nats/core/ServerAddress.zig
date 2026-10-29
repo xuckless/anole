@@ -131,13 +131,13 @@ test "accepted forms" {
 test "rejected forms" {
     const too_long: [256]u8 = @splat('h');
     for ([_][]const u8{
-        "",                    "nats://",                    "tls://",          "ws://host",           "wss://host",
-        "http://host",         "nats://user:pass@host:4222", "user@host",       "host:",               "host:0",
-        "host:65536",          "host:12a",                   "host:-1",         "::1",                 "::1:4222",
-        "[::1",                "[::1]x",                     "[::1]:",          "[127.0.0.1]:4222",    "host:4222/path",
-        "nats://host:4222?x",  "host name",                  "host\r\n",        "[]:4222",             &too_long,
+        "",                    "nats://",                    "tls://",    "ws://host",           "wss://host",
+        "http://host",         "nats://user:pass@host:4222", "user@host", "host:",               "host:0",
+        "host:65536",          "host:12a",                   "host:-1",   "::1",                 "::1:4222",
+        "[::1",                "[::1]x",                     "[::1]:",    "[127.0.0.1]:4222",    "host:4222/path",
+        "nats://host:4222?x",  "host name",                  "host\r\n",  "[]:4222",             &too_long,
         // Brackets hold an IPv6 literal and nothing else.
-        "[:]:4222",            "[zz:zz]:4222",               "[::1::2]",        "[1:2:3:4:5:6:7:8:9]", "[fe80::1%]:4222",
+        "[:]:4222",            "[zz:zz]:4222",               "[::1::2]",  "[1:2:3:4:5:6:7:8:9]", "[fe80::1%]:4222",
         "[::ffff:1.2.3]:4222", "[localhost:1]",
     }) |text| {
         try testing.expectError(error.InvalidOptions, parse(text));

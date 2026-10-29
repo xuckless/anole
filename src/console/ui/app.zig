@@ -343,7 +343,7 @@ pub const App = struct {
     }
 
     fn ingestSnapshot(self: *App, v: protocol.View, data: ?std.json.Value) void {
-        const idx = @intFromEnum(v);
+        const idx = @backingInt(v);
         _ = self.arenas[idx].reset(.retain_capacity);
         const a = self.arenas[idx].allocator();
         switch (v) {
@@ -710,7 +710,7 @@ pub const App = struct {
 
     fn persist(self: *App, s: []const u8) []const u8 {
         // Prompts are short; keep them in the snapshot arena of `tasks` (unused).
-        return self.arenas[@intFromEnum(protocol.View.tasks)].allocator().dupe(u8, s) catch "";
+        return self.arenas[@backingInt(protocol.View.tasks)].allocator().dupe(u8, s) catch "";
     }
 
     fn cmdFullRestart(self: *App, args: []const []const u8) void {

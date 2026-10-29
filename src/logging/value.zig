@@ -503,9 +503,7 @@ fn expectFields(fields: anytype, comptime json: []const u8, comptime text: []con
 
 test "scalars, strings, optionals and enums" {
     const E = enum { a, b };
-    try expectFields(.{ .n = 5, .ok = true, .s = "hi there", .o = @as(?u8, null), .e = E.b },
-        ",\"n\":5,\"ok\":true,\"s\":\"hi there\",\"o\":null,\"e\":\"b\"",
-        " n=5 ok=true s=\"hi there\" o=null e=b");
+    try expectFields(.{ .n = 5, .ok = true, .s = "hi there", .o = @as(?u8, null), .e = E.b }, ",\"n\":5,\"ok\":true,\"s\":\"hi there\",\"o\":null,\"e\":\"b\"", " n=5 ok=true s=\"hi there\" o=null e=b");
 }
 
 test "redaction by name and by marker" {
@@ -513,15 +511,11 @@ test "redaction by name and by marker" {
         raw: []const u8,
         pub const anole_sensitive = true;
     };
-    try expectFields(.{ .password = "x", .k = Key{ .raw = "abc" } },
-        ",\"password\":\"[REDACTED]\",\"k\":\"[REDACTED]\"",
-        " password=[REDACTED] k=[REDACTED]");
+    try expectFields(.{ .password = "x", .k = Key{ .raw = "abc" } }, ",\"password\":\"[REDACTED]\",\"k\":\"[REDACTED]\"", " password=[REDACTED] k=[REDACTED]");
 }
 
 test "nested objects and lists" {
-    try expectFields(.{ .p = .{ .host = "pg", .port = @as(u16, 5432) }, .xs = [_]u8{ 1, 2 } },
-        ",\"p\":{\"host\":\"pg\",\"port\":5432},\"xs\":[1,2]",
-        " p.host=pg p.port=5432 xs=[1,2]");
+    try expectFields(.{ .p = .{ .host = "pg", .port = @as(u16, 5432) }, .xs = [_]u8{ 1, 2 } }, ",\"p\":{\"host\":\"pg\",\"port\":5432},\"xs\":[1,2]", " p.host=pg p.port=5432 xs=[1,2]");
 }
 
 test "control bytes are escaped and invalid UTF-8 replaced" {

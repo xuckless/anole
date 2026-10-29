@@ -30,7 +30,7 @@ pub const Seed = struct {
     /// The public key as text ("UA...", 56 bytes).
     pub fn publicKey(self: Seed, out: *[56]u8) []const u8 {
         var raw: [35]u8 = undefined;
-        raw[0] = @intFromEnum(self.kind);
+        raw[0] = @backingInt(self.kind);
         @memcpy(raw[1..33], &self.key_pair.public_key.toBytes());
         const crc = crc16(raw[0..33]);
         std.mem.writeInt(u16, raw[33..35], crc, .little);
@@ -56,7 +56,7 @@ pub fn decodeSeed(text: []const u8) Error!Seed {
     const b1 = raw[0] & 248;
     const b2 = ((raw[0] & 7) << 5) | ((raw[1] & 248) >> 3);
     if (b1 != seed_prefix) return error.InvalidPrefix;
-    const kind: Kind = @enumFromInt(b2);
+    const kind: Kind = @fromBackingInt(@intCast(b2));
     switch (kind) {
         .server, .cluster, .operator, .account, .user => {},
         else => return error.InvalidPrefix,
@@ -68,7 +68,7 @@ pub fn decodeSeed(text: []const u8) Error!Seed {
 /// A seed's text from its kind and 32 bytes (tests and tools).
 pub fn encodeSeed(out: *[58]u8, kind: Kind, bytes: *const [32]u8) []const u8 {
     var raw: [36]u8 = undefined;
-    const k = @intFromEnum(kind);
+    const k = @backingInt(kind);
     raw[0] = seed_prefix | (k >> 5);
     raw[1] = (k & 31) << 3;
     @memcpy(raw[2..34], bytes);

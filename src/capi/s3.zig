@@ -1453,7 +1453,7 @@ const BodyReader = struct {
         const self: *BodyReader = @alignCast(@fieldParentPtr("interface", r));
         const s = self.slot;
         var tmp: [16 * 1024]u8 = undefined;
-        const want = @min(tmp.len, @intFromEnum(limit));
+        const want = @min(tmp.len, @backingInt(limit));
         if (want == 0) return 0;
         while (true) {
             s.in.acquire();
@@ -1538,7 +1538,7 @@ pub fn presign(st: *Store, method: u32, key: abi.Str, o: abi.S3PresignOptions, b
     var fba: std.heap.FixedBufferAllocator = undefined;
     var ctx = scratchCtx(&scratch, &fba);
     const bucket = if (o.bucket.len > 0) o.bucket.slice() else (cl.default_bucket orelse return abi.E_INVALID);
-    const url = cl.presignUrl(&ctx, bucket, @enumFromInt(method), key.slice(), .{
+    const url = cl.presignUrl(&ctx, bucket, @fromBackingInt(@intCast(method)), key.slice(), .{
         .expires = std.Io.Duration.fromSeconds(if (o.expires_s == 0) 900 else o.expires_s),
         .version_id = if (o.version_id.len > 0) o.version_id.slice() else null,
         .content_type = if (o.content_type.len > 0) o.content_type.slice() else null,

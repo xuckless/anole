@@ -32,7 +32,7 @@ pub const Filter = struct {
     grep: ?[]const u8 = null,
 
     pub fn matches(self: Filter, r: Rec) bool {
-        if (self.level) |l| if (@intFromEnum(r.level) > @intFromEnum(l)) return false;
+        if (self.level) |l| if (@backingInt(r.level) > @backingInt(l)) return false;
         if (self.scope) |s| if (!std.mem.eql(u8, s, r.scope)) return false;
         if (self.route) |p| {
             if (p.len > 0 and p[p.len - 1] == '*') {
@@ -134,11 +134,11 @@ pub const LogRing = struct {
     /// A console starts or stops showing logs: info and debug are kept only
     /// meanwhile.
     pub fn watch(self: *LogRing) void {
-        if (self.watchers.fetchAdd(1, .monotonic) == 0) self.tap.min_level.store(@intFromEnum(std.log.Level.debug), .monotonic);
+        if (self.watchers.fetchAdd(1, .monotonic) == 0) self.tap.min_level.store(@backingInt(std.log.Level.debug), .monotonic);
     }
 
     pub fn unwatch(self: *LogRing) void {
-        if (self.watchers.fetchSub(1, .monotonic) == 1) self.tap.min_level.store(@intFromEnum(std.log.Level.warn), .monotonic);
+        if (self.watchers.fetchSub(1, .monotonic) == 1) self.tap.min_level.store(@backingInt(std.log.Level.warn), .monotonic);
     }
 
     fn tapFn(ud: ?*anyopaque, level: std.log.Level, scope: []const u8, ctx: logging.Context, json: bool, text: []const u8) void {
@@ -160,7 +160,7 @@ pub const LogRing = struct {
         const now_ns: i64 = @intCast(@min(std.Io.Clock.real.now(std.Options.debug_io).nanoseconds, std.math.maxInt(i64)));
         var h: [header_len]u8 = undefined;
         std.mem.writeInt(i64, h[0..8], now_ns, .little);
-        h[8] = @intFromEnum(level);
+        h[8] = @backingInt(level);
         h[9] = @intFromBool(json);
         h[10] = @intCast(scope_c.len);
         h[11] = @intCast(rid_c.len);
@@ -198,7 +198,7 @@ pub const LogRing = struct {
         return .{
             .rec = .{
                 .time_ns = std.mem.readInt(i64, h[0..8], .little),
-                .level = @enumFromInt(h[8]),
+                .level = @fromBackingInt(@intCast(h[8])),
                 .json = h[9] != 0,
                 .scope = body[0..sl],
                 .rid = body[sl..][0..il],
