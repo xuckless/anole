@@ -572,7 +572,9 @@ pub const Connection = struct {
 
     /// Cleartext into `buf`; 0 means the peer ended the stream, with
     /// close_notify or by closing the transport between records. Belongs to
-    /// the reading side.
+    /// the reading side. Returns the plaintext of every whole record already
+    /// read from the socket, as far as `buf` has room (`readBuffered`), and
+    /// waits for the socket only while it has nothing to return.
     ///
     /// A transport EOF without close_notify is taken as an end here, as
     /// tls.zig does by default: many peers skip close_notify, and HTTP's own
@@ -620,11 +622,12 @@ pub const Connection = struct {
             const code = if (rc > 0) c.SSL_ERROR_NONE else c.SSL_get_error(sh.ssl, rc);
             const failure: ?HandshakeError = if (code == c.SSL_ERROR_SSL) queuedError("SSL_read") else null;
             if (rc <= 0 and c.ERR_peek_error() != 0) c.ERR_clear_error();
+            const total = if (rc > 0) sh.readBuffered(buf, @intCast(rc)) else 0;
             const eof = sh.input_eof;
             sh.unlock();
 
             switch (code) {
-                c.SSL_ERROR_NONE => return @intCast(rc),
+                c.SSL_ERROR_NONE => return total,
                 c.SSL_ERROR_WANT_READ => sh.fill() catch |err| switch (err) {
                     error.ReadFailed => return error.ReadFailed,
                 },
@@ -1428,6 +1431,47 @@ const Shared = struct {
         sh.mutex.unlock();
     }
 
+    /// After an SSL_read that put `got` bytes into `buf`, with the lock
+    /// held: SSL_read again into the rest of `buf` while a whole record is
+    /// already buffered in `input`, so one call returns every record the
+    /// socket reads brought rather than one (BoringSSL's SSL_read never
+    /// returns bytes of two records). The lock, `write_owed` and the
+    /// SSL_get_error of the first call are paid once per batch, and the
+    /// error queue is checked once, after it. nginx's `ngx_ssl_recv` ("try
+    /// to read until SSL_read() would return no data"), HAProxy's
+    /// `ssl_sock_to_buf` and uSockets' `ssl_on_data` loop the same way.
+    ///
+    /// Never reads the socket, so it cannot wait: it stops at the first
+    /// record not all here, when `buf` is full, or at the first SSL_read
+    /// that returns no data. That one's cause is not lost: an alert or a
+    /// close_notify sets BoringSSL's read shutdown state, and the next
+    /// SSL_read (the caller's next `read`) reports it again.
+    ///
+    /// Why the record header in `input` and not `SSL_pending`: the header
+    /// check is exact and costs no call into BoringSSL. SSL_read returns
+    /// fewer bytes than asked only once it has handed over all of its
+    /// record (ssl_lib.cc copies min(pending, asked)), so `SSL_pending` is
+    /// 0 whenever the loop asks; and BoringSSL reads no ciphertext past the
+    /// end of the record it opens (no read-ahead in TLS, ssl.h
+    /// `SSL_has_pending`), so `input` starts at a record boundary. Were it
+    /// ever not, the SSL_read the check let through would only answer
+    /// WANT_READ with what it took kept for the next call, and end the loop.
+    fn readBuffered(sh: *Shared, buf: []u8, got: usize) usize {
+        var total = got;
+        var failed = false;
+        while (total < buf.len and wholeRecord(sh.input.buffered())) {
+            const room: c_int = @intCast(@min(buf.len - total, std.math.maxInt(c_int)));
+            const rc = c.SSL_read(sh.ssl, buf[total..].ptr, room);
+            if (rc <= 0) {
+                failed = true;
+                break;
+            }
+            total += @intCast(rc);
+        }
+        if (failed and c.ERR_peek_error() != 0) c.ERR_clear_error();
+        return total;
+    }
+
     /// Reads more ciphertext from the socket, with the lock released. Called
     /// by the reading side after WANT_READ, when the BIO has consumed
     /// everything buffered.
@@ -1524,6 +1568,13 @@ const Shared = struct {
         sh.output.writeAll(sh.sending.items()) catch return error.WriteFailed;
     }
 };
+
+/// Whether `bytes` starts with a whole TLS record: its 5-byte header (legacy
+/// version major 3) and the body the header announces.
+fn wholeRecord(bytes: []const u8) bool {
+    if (bytes.len < 5 or bytes[1] != 3) return false;
+    return bytes.len - 5 >= ((@as(usize, bytes[3]) << 8) | bytes[4]);
+}
 
 // ---------------------------------------------------------------------------
 // Ciphertext blocks

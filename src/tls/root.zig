@@ -64,6 +64,12 @@ test "TLS: an idle connection keeps no ciphertext buffer beyond its stash" {
     try testing.duplex.idle(std.testing.allocator, rt.io());
 }
 
+test "TLS: one read returns the plaintext of every whole record already received" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    try testing.duplex.batched(std.testing.allocator, rt.io());
+}
+
 test "TLS: a header ahead of a big payload and keyframe-sized writes arrive in order" {
     const rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
