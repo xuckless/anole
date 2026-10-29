@@ -121,6 +121,8 @@ test "metrics: target labels capped at 256, then other" {
     const text = out.written();
     try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_rejected_total{client=\"http\",target=\"other\"} 5") != null);
     try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_rejected_total{client=\"http\",target=\"h1\"} 1") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "target=\"h300\"") == null);
+    // The first target past the cap (h256) and the last one (h260) get no series of their own.
+    try testing.expect(std.mem.indexOf(u8, text, "target=\"h256\"") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "target=\"h260\"") == null);
     try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_rejected_total{client=\"grpc\",target=\"x\"} 1") != null);
 }
