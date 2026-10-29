@@ -117,7 +117,12 @@ pub const EventWriter = struct {
     fn finish(self: *EventWriter) std.Io.Writer.Error!void {
         try self.interface.flush();
         const out = &self.body.interface;
-        if (self.line_in_progress) try out.writeAll("\n");
+        // The last line ends the event. When nothing was written, or the
+        // last byte was a line break, that line is empty and still goes out,
+        // as `writeEvent` writes it: the peer then keeps the trailing break
+        // (WHATWG HTML 9.2.6), and dispatches an event with no data at all
+        // rather than dropping it.
+        try out.writeAll(if (self.line_in_progress) "\n" else "data: \n");
         try out.writeAll("\n");
         return out.flush();
     }
@@ -212,7 +217,8 @@ pub const EventStream = struct {
 /// The fields must not hold CR or LF (`EventStream.Options.validate`).
 pub fn writeEvent(w: *std.Io.Writer, data: []const u8, opts: EventStream.Options) std.Io.Writer.Error!void {
     try EventStream.sendFields(w, opts);
-    // A line per CR, LF or CRLF in `data`, as `EventWriter` splits it.
+    // A line per CR, LF or CRLF in `data`, as `EventWriter` splits it, and
+    // the last one even when empty, as `EventWriter.end` writes it.
     var rest = data;
     while (std.mem.indexOfAny(u8, rest, "\r\n")) |idx| {
         try w.print("data: {s}\n", .{rest[0..idx]});
@@ -3673,7 +3679,54 @@ test "EventWriter: a bare CR is a line break, and a CRLF split across writes is 
     try ew.interface.writeAll("c\r");
     try ew.end();
 
-    try std.testing.expectEqualStrings("data: a\ndata: event: x\ndata: b\ndata: c\n\n", try t.events());
+    // The data ends in a CR, so its last line is empty, as `send` writes it.
+    try std.testing.expectEqualStrings("data: a\ndata: event: x\ndata: b\ndata: c\ndata: \n\n", try t.events());
+}
+
+/// `writeEvent`'s bytes for `data`, the reference both encoders must match.
+fn expectedEvent(buf: []u8, data: []const u8, opts: EventStream.Options) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try writeEvent(&w, data, opts);
+    return w.buffered();
+}
+
+test "EventWriter: encodes every event as writeEvent does" {
+    const cases = [_][]const []const u8{
+        &.{},
+        &.{""},
+        &.{"hi"},
+        &.{"hi\n"},
+        &.{"hi\r"},
+        &.{"a\r\nb"},
+        &.{"\n"},
+        &.{"\r\n"},
+        &.{ "a\r", "\nb" },
+        &.{ "a\r", "\n" },
+        &.{ "a\r", "b" },
+        &.{ "a", "\n" },
+        &.{ "a\n", "" },
+    };
+    const options = [_]EventStream.Options{ .{}, .{ .event = "e", .id = "7" } };
+    for (options) |opts| for (cases) |writes| {
+        var buf: [1024]u8 = undefined;
+        var t: TestEventStream = undefined;
+        try t.init(&buf);
+        defer t.deinit();
+
+        var data_buf: [64]u8 = undefined;
+        var data_len: usize = 0;
+        var ew = try t.stream.startSend(opts);
+        for (writes) |part| {
+            try ew.interface.writeAll(part);
+            @memcpy(data_buf[data_len..][0..part.len], part);
+            data_len += part.len;
+        }
+        try ew.end();
+
+        var want_buf: [256]u8 = undefined;
+        const want = try expectedEvent(&want_buf, data_buf[0..data_len], opts);
+        try std.testing.expectEqualStrings(want, try t.events());
+    };
 }
 
 test "fuzz: SSE data never adds a line that is not data" {
@@ -3708,6 +3761,29 @@ test "fuzz: SSE data never adds a line that is not data" {
             }
         }
     }.check, &.{ "", "a\rb", "a\r\nb\n", "\r\r\r", "x\revent: y\rid: 1\r\rdata: z" });
+}
+
+test "fuzz: SSE EventWriter encodes every event as writeEvent does" {
+    try @import("fuzz.zig").bytes(struct {
+        fn check(input: []const u8) !void {
+            var buf: [4096]u8 = undefined;
+            var t: TestEventStream = undefined;
+            try t.init(&buf);
+            defer t.deinit();
+            // What one event can expand to fits the test stream's buffers.
+            const data = input[0..@min(input.len, 64)];
+            // Split where the input says, so a CRLF lands across the two
+            // writes as often as anywhere else.
+            const split = if (data.len == 0) 0 else data[0] % (data.len + 1);
+            var ew = try t.stream.startSend(.{});
+            try ew.interface.writeAll(data[0..split]);
+            try ew.interface.writeAll(data[split..]);
+            try ew.end();
+
+            var want_buf: [512]u8 = undefined;
+            try std.testing.expectEqualStrings(try expectedEvent(&want_buf, data, .{}), try t.events());
+        }
+    }.check, &.{ "", "hi", "hi\n", "\x02a\r\n", "\x03a\r\n", "\x03a\r\nb", "\r", "a\r\nb\r" });
 }
 
 test "Response: resetBody replaces a half written body" {
