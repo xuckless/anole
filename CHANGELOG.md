@@ -122,6 +122,16 @@ breaking changes are listed anyway.
   starting together take turns; it has no time limit, and each table lock it
   waits for is bounded by a 10 s `lock_timeout`, past which the start fails
   with a log line saying what to do (#109).
+- gRPC client: a cancel of the task waiting on a call is passed on as
+  `error.Canceled` from `receive`, `send` and `closeSend`, and the call is
+  reset (RST_STREAM CANCEL, H3_REQUEST_CANCELLED). It was swallowed: waiting
+  for the response head or the next message returned null with status
+  CANCELLED, and a send waiting for flow control returned
+  `error.StreamClosed`, so the canceled task went on. `s.cancel()` still
+  ends the call with status CANCELLED and no error. A unary call's cancel
+  no longer counts as a failure for the channel's breaker or retry
+  throttle. The error sets of `receive`, `send` and `closeSend` now include
+  `Canceled`, so an exhaustive `switch` on them needs the new case (#126).
 
 ### Changed
 
