@@ -6,6 +6,7 @@ const safety = @import("anole_safety");
 const builtin = @import("builtin");
 const server_mod = @import("../server.zig");
 const net = @import("root.zig");
+const udp_service = @import("udp_service.zig");
 
 const App = server_mod.App;
 /// The App's allocator panics at an allocation under a spin lock (SAFETY.md
@@ -206,6 +207,46 @@ test "net udp: send from another thread" {
             try expectDatagram(io, c, "from a thread");
         }
     }.run);
+}
+
+test "net udp: a send racing the stop is refused, not accepted and lost" {
+    // The test allocator, not `alloc`: the claim is the race with the stop
+    // (L5 under the queue's lock is the test above's).
+    var app = try App.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.udp("127.0.0.1:0", Pong, .{});
+    var hold: udp_service.TestHold = .{};
+    // 0: not returned yet; 1: accepted; 2: Closed; 3: another error.
+    var result: std.atomic.Value(u8) = .init(0);
+    var thread: ?std.Thread = null;
+    defer if (thread) |t| {
+        hold.release.store(true, .release);
+        t.join();
+    };
+    const Sender = struct {
+        fn run(s: *net.UdpSocket, out: *std.atomic.Value(u8)) void {
+            const to: std.Io.net.IpAddress = .{ .ip4 = .loopback(9) };
+            if (s.send(to, null, "late")) |_| out.store(1, .release) else |err| out.store(if (err == error.Closed) 2 else 3, .release);
+        }
+    };
+    const Ctl = struct {
+        fn run(a: *App, h: *udp_service.TestHold, th: *?std.Thread, out: *std.atomic.Value(u8)) !void {
+            defer a.stop();
+            try a.waitReady();
+            udp_service.test_send_hold.store(h, .release);
+            th.* = try std.Thread.spawn(.{}, Sender.run, .{ a.udpSocket("udp-0").?, out });
+            try wait.waitFlag(a.io(), "the send is held where the stop can race it", &h.held);
+        }
+    };
+    var ctl = try app.io().concurrent(Ctl.run, .{ &app, &hold, &thread, &result });
+    defer ctl.cancel(app.io()) catch {};
+    // Returns once the stop has ended the readers and senders.
+    try app.run();
+    try ctl.await(app.io());
+    hold.release.store(true, .release);
+    thread.?.join();
+    thread = null;
+    try std.testing.expectEqual(@as(u8, 2), result.load(.acquire));
 }
 
 test "net udp: TLS, a Unix socket or PROXY protocol on a UDP listener make run() fail with a named error" {

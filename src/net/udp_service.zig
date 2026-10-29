@@ -323,6 +323,7 @@ pub const UdpSocket = struct {
     pub fn send(s: *UdpSocket, to: std.Io.net.IpAddress, from: ?std.Io.net.IpAddress, bytes: []const u8) Datagram.SendError!void {
         if (bytes.len > 65507) return error.TooLarge;
         if (s.closed.load(.acquire)) return error.Closed;
+        testSendHold();
         const cap = s.group.service.options.send_queue;
         s.lockQ();
         if (s.queue_bytes + bytes.len > cap) {
@@ -672,6 +673,22 @@ pub const UdpSocket = struct {
         if (notify) if (s.group.service.table.writable) |f| f(s.group.service.state, s);
     }
 };
+
+/// A test hook (test builds only): the next `send` stops at the point a
+/// stop can race it and holds there (`held` set) until the test sets
+/// `release`. Taken once.
+pub const TestHold = struct {
+    held: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+};
+pub var test_send_hold: if (builtin.is_test) std.atomic.Value(?*TestHold) else void = if (builtin.is_test) .init(null) else {};
+
+fn testSendHold() void {
+    if (comptime !builtin.is_test) return;
+    const h = test_send_hold.swap(null, .acq_rel) orelse return;
+    h.held.store(true, .release);
+    while (!h.release.load(.acquire)) std.Thread.yield() catch {};
+}
 
 /// One UDP listener: its sockets and their tasks.
 pub const UdpGroup = struct {
