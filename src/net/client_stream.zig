@@ -406,7 +406,7 @@ fn roundTrip(s: *ClientStream, text: []const u8) !void {
     try testing.expectEqualStrings(text, try s.reader().takeDelimiterInclusive('\n'));
 }
 
-test "ClientStream: plain TCP" {
+test "ClientStream: a plain connection carries data, has no certificate, and counts bytes sent" {
     const rt = try zio.Runtime.init(testing.allocator, .{});
     defer rt.deinit();
     const io = rt.io();
@@ -458,6 +458,14 @@ test "ClientStream: TLS, verified against the server's CA, with ALPN" {
     try roundTrip(s, &long);
 }
 
+/// `connect` fails with `want` (closing the stream if it connects).
+fn expectConnectError(want: anyerror, io: std.Io, opts: ConnectOptions) !void {
+    if (ClientStream.connect(testing.allocator, io, opts)) |s| {
+        s.close();
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(want, err);
+}
+
 test "ClientStream: a certificate for another name fails, unless only the chain is checked" {
     if (comptime !has_tls) return error.SkipZigTest;
     const rt = try zio.Runtime.init(testing.allocator, .{});
@@ -474,10 +482,7 @@ test "ClientStream: a certificate for another name fails, unless only the chain 
     {
         var serving = try io.concurrent(TestServer.serveOne, .{ &server, io, .tls });
         defer serving.cancel(io) catch {};
-        if (ClientStream.connect(testing.allocator, io, opts)) |s| {
-            s.close();
-            return error.TestUnexpectedResult;
-        } else |_| {}
+        try expectConnectError(error.CertificateHostMismatch, io, opts);
     }
     {
         var serving = try io.concurrent(TestServer.serveOne, .{ &server, io, .tls });
@@ -497,10 +502,7 @@ test "ClientStream: a certificate for another name fails, unless only the chain 
         var wrong_ca = opts;
         wrong_ca.tls.?.ca = .{ .pem = other.cert };
         wrong_ca.tls.?.skip_host_check = true;
-        if (ClientStream.connect(testing.allocator, io, wrong_ca)) |s| {
-            s.close();
-            return error.TestUnexpectedResult;
-        } else |_| {}
+        try expectConnectError(error.CertificateIssuerNotFound, io, wrong_ca);
     }
 }
 
