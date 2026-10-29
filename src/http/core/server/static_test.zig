@@ -4,10 +4,12 @@
 
 const std = @import("std");
 const dusty = @import("../root.zig");
+const test_socket = @import("test_socket.zig");
 const loopback: []const dusty.Listener = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }};
 
 /// Serves `dir` at `prefix`, sends `request` on one connection and returns
-/// everything the server sent back before closing it.
+/// everything the server sent back before closing it (each read with
+/// `wait.deadline()`: a server that never closes fails the test).
 fn exchange(dir: std.Io.Dir, prefix: []const u8, opts: dusty.StaticOptions, request: []const u8, out: []u8) ![]const u8 {
     var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = loopback }, {});
     defer server.deinit();
@@ -43,9 +45,15 @@ fn send(server: *dusty.Server(void), request: []const u8, out: []u8) ![]const u8
     try writer.interface.flush();
 
     var read_buf: [1024]u8 = undefined;
-    var reader = stream.reader(io, &read_buf);
+    var reader: test_socket.DeadlineReader = .init(stream, io, &read_buf);
     var sink: std.Io.Writer = .fixed(out);
-    _ = reader.interface.streamRemaining(&sink) catch {};
+    _ = reader.interface.streamRemaining(&sink) catch |err| switch (err) {
+        // A timeout fails the test; a reset after the response leaves
+        // what came for the caller's checks.
+        error.ReadFailed => if (reader.err.? == error.ReadTimedOut) return error.ReadTimedOut,
+        // `out` is full: the caller's checks see what fit.
+        error.WriteFailed => {},
+    };
     return sink.buffered();
 }
 

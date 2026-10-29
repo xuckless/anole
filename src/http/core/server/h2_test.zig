@@ -11,18 +11,21 @@ const build_options = @import("build_options");
 const tls = @import("tls");
 const h2 = @import("h2.zig");
 const wait = @import("anole_test_wait");
+const test_socket = @import("test_socket.zig");
 
 const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
 
 /// A blocking HTTP/2 client over one connection, for tests: submit
-/// requests, then `run` until every stream is closed.
+/// requests, then `run` until every stream is closed. Every read from the
+/// socket has `wait.deadline()` (`test_socket.DeadlineReader`), so a
+/// server that stops answering fails the test instead of hanging it.
 const TestClient = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     stream: std.Io.net.Stream,
     read_buf: [16 * 1024 + 1024]u8 = undefined,
     write_buf: [16 * 1024 + 1024]u8 = undefined,
-    reader: std.Io.net.Stream.Reader = undefined,
+    reader: test_socket.DeadlineReader = undefined,
     writer: std.Io.net.Stream.Writer = undefined,
     /// The connection as the session sees it: the socket, or TLS over it.
     r: *std.Io.Reader = undefined,
@@ -65,7 +68,7 @@ const TestClient = struct {
 
     fn init(self: *TestClient, gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress) !void {
         self.* = .{ .gpa = gpa, .io = io, .stream = try addr.connect(io, .{ .mode = .stream }) };
-        self.reader = self.stream.reader(io, &self.read_buf);
+        self.reader = .init(self.stream, io, &self.read_buf);
         self.writer = self.stream.writer(io, &self.write_buf);
         self.r = &self.reader.interface;
         self.w = &self.writer.interface;
@@ -81,7 +84,7 @@ const TestClient = struct {
     /// clear before the handshake.
     fn initTlsAfter(self: *TestClient, gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, ca: *std.crypto.Certificate.Bundle, preamble: []const u8) !void {
         self.* = .{ .gpa = gpa, .io = io, .stream = try addr.connect(io, .{ .mode = .stream }) };
-        self.reader = self.stream.reader(io, &self.read_buf);
+        self.reader = .init(self.stream, io, &self.read_buf);
         self.writer = self.stream.writer(io, &self.write_buf);
         if (preamble.len > 0) {
             try self.writer.interface.writeAll(preamble);
