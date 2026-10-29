@@ -11,6 +11,7 @@ const wire = @import("wire.zig");
 const mongodb = @import("root.zig");
 
 const testing = std.testing;
+const wait = @import("anole_test_wait");
 const gpa = testing.allocator;
 
 const Fake = struct {
@@ -28,9 +29,10 @@ const Fake = struct {
     lsids: [8][16]u8 = undefined,
     killed: std.atomic.Value(u32) = .init(0),
     get_mores: std.atomic.Value(u32) = .init(0),
-    /// Finds answered, and how long each waits first.
+    /// Finds answered; while `find_gate` is set to an event, each find
+    /// waits for it before answering.
     finds: std.atomic.Value(u32) = .init(0),
-    find_delay_ms: std.atomic.Value(u32) = .init(0),
+    find_gate: std.atomic.Value(?*std.Io.Event) = .init(null),
 
     fn init(f: *Fake, io: std.Io) !void {
         const listen_at: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -100,8 +102,7 @@ const Fake = struct {
         } else if (std.mem.eql(u8, command, "find")) {
             if (dec(&f.drop_finds)) return false;
             _ = f.finds.fetchAdd(1, .monotonic);
-            const delay = f.find_delay_ms.load(.monotonic);
-            if (delay > 0) try io.sleep(.fromMilliseconds(delay), .awake);
+            if (f.find_gate.load(.acquire)) |gate| try gate.wait(io);
             // Ten documents, four per batch. The cursor id is where the
             // next batch starts, so cursors running at once stay apart.
             try f.batch(b, "firstBatch", 0, 4);
@@ -179,31 +180,49 @@ const Fake = struct {
 
 const Row = struct { n: i32 };
 
-test "fake mongod: discovery, cursors, retryable writes and reads, errors" {
+/// A client of the fake, as a replica set of one.
+fn open(io: std.Io, fake: *Fake) !*mongodb.Client {
+    var url_buf: [96]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "mongodb://{s}/app?replicaSet=rs0&heartbeatFrequencyMS=500", .{fake.addr()});
+    return mongodb.Client.init(gpa, io, .{ .url = url, .server_selection_timeout = .fromSeconds(5) });
+}
+
+test "fake mongod: find reads every batch through getMore" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
     var fake: Fake = undefined;
     try fake.init(io);
     defer fake.deinit(io);
-
-    var url_buf: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "mongodb://{s}/app?replicaSet=rs0&heartbeatFrequencyMS=500", .{fake.addr()});
-    const client = try mongodb.Client.init(gpa, io, .{ .url = url, .server_selection_timeout = .fromSeconds(5) });
+    const client = try open(io, &fake);
     defer client.deinit();
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
     const users = client.collection("users");
+    // The server found first, as an app's first call after start finds it.
+    try client.ping(&c);
     try testing.expectEqualStrings("app", users.database);
-
-    // Every batch, through getMore.
     const rows = try users.find(Row, &c, .{}, .{ .batch_size = 4 });
     try testing.expectEqual(@as(usize, 10), rows.len);
     for (rows, 0..) |row, i| try testing.expectEqual(@as(i32, @intCast(i)), row.n);
+}
 
-    // The shared verbs are the same calls, and `Client.with` hands its
-    // options to the databases and collections it leads to.
+test "fake mongod: the shared verbs are the same calls, and with() hands its options to the databases and collections it leads to" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    const users = client.collection("users");
+    // The server found first, as an app's first call after start finds it.
+    try client.ping(&c);
     try testing.expectEqual(@as(usize, 10), (try users.all(Row, &c, .{}, .{ .batch_size = 4 })).len);
     try testing.expectEqual(@as(i32, 0), (try users.one(Row, &c, .{}, .{})).n);
     try testing.expectEqual(@as(i32, 0), (try users.optional(Row, &c, .{}, .{})).?.n);
@@ -212,16 +231,44 @@ test "fake mongod: discovery, cursors, retryable writes and reads, errors" {
     try testing.expectEqualStrings("app", timed.database);
     try testing.expectEqual(@as(usize, 10), (try timed.all(Row, &c, .{}, .{ .batch_size = 4 })).len);
     try testing.expect(client.with(.{ .coalesce = true }).db("app").collection("users").options.coalesce);
+}
 
-    // A cursor left early is killed.
-    fake.get_mores.store(0, .monotonic);
+test "fake mongod: a cursor left early is killed" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    const users = client.collection("users");
+    // The server found first, as an app's first call after start finds it.
+    try client.ping(&c);
     var cursor = try users.iterate(Row, &c, .{}, .{});
     try testing.expectEqual(@as(i32, 0), (try cursor.next()).?.n);
     cursor.deinit();
     try testing.expectEqual(@as(u32, 1), fake.killed.load(.monotonic));
+}
 
-    // NotWritablePrimary with RetryableWriteError: sent again, with the
-    // same session and transaction number.
+test "fake mongod: a retryable write error is sent again with the same session and txnNumber; the next write is a new statement" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    const users = client.collection("users");
+    // The server found first, as an app's first call after start finds it.
+    try client.ping(&c);
     fake.fail_inserts.store(1, .monotonic);
     const r = try users.insertOne(&c, .{ .name = "Ada" });
     try testing.expect(r.objectId() != null);
@@ -229,12 +276,26 @@ test "fake mongod: discovery, cursors, retryable writes and reads, errors" {
     try testing.expect(fake.txn_numbers[0] >= 1);
     try testing.expectEqual(fake.txn_numbers[0], fake.txn_numbers[1]);
     try testing.expectEqualSlices(u8, &fake.lsids[0], &fake.lsids[1]);
-    // The next write is a new statement.
     _ = try users.insertOne(&c, .{ .name = "Grace" });
     try testing.expectEqual(fake.txn_numbers[1] + 1, fake.txn_numbers[2]);
+}
 
-    // Twice: the retry fails as well, and the call with it (a warning
-    // the test expects, kept out of its output).
+test "fake mongod: a retried write that fails again is a 503 with the server's code" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    const users = client.collection("users");
+    // The server found first, as an app's first call after start finds it.
+    try client.ping(&c);
+    // A warning the test expects, kept out of its output.
     fake.fail_inserts.store(2, .monotonic);
     {
         const level = testing.log_level;
@@ -243,22 +304,50 @@ test "fake mongod: discovery, cursors, retryable writes and reads, errors" {
         try testing.expectError(error.ServiceUnavailable, users.insertOne(&c, .{ .name = "Linus" }));
     }
     try testing.expectEqualStrings("10107", db.lastError(&c).?.code);
+}
 
-    // A duplicate key: a Conflict, not retried.
+test "fake mongod: a duplicate key is a Conflict, not retried" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    const users = client.collection("users");
+    // The server found first, as an app's first call after start finds it.
+    try client.ping(&c);
     const before = fake.inserts.load(.monotonic);
     try testing.expectError(error.Conflict, users.insertOne(&c, .{ .dup = true }));
     try testing.expectEqual(before + 1, fake.inserts.load(.monotonic));
     try testing.expectEqual(db.Class.unique, db.lastError(&c).?.class);
+}
 
-    // The connection dropped mid-read: retried on a new one (after the
-    // server is found again).
+test "fake mongod: a read whose connection dropped is retried on a new one" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    const users = client.collection("users");
+    // The server found first, as an app's first call after start finds it.
+    try client.ping(&c);
     fake.drop_finds.store(1, .monotonic);
     try testing.expectEqual(@as(i32, 0), (try users.findOne(Row, &c, .{}, .{})).n);
-
     try client.ping(&c);
 }
 
-test "fake mongod: no server, a timeout and a bad connection string" {
+test "fake mongod: an unreachable server is a 503, a call's own shorter timeout a 504" {
     // Every call here fails on purpose, and logs a warning saying why.
     const level = testing.log_level;
     testing.log_level = .err;
@@ -271,13 +360,21 @@ test "fake mongod: no server, a timeout and a bad connection string" {
     var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
 
     // Nothing listens on port 1: server selection gives up, 503.
-    const client = try mongodb.Client.init(gpa, io, .{ .url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=300&connectTimeoutMS=200" });
+    const client = try mongodb.Client.init(gpa, io, .{ .url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=100&connectTimeoutMS=100" });
     defer client.deinit();
     try testing.expectError(error.ServiceUnavailable, client.ping(&c));
     try testing.expectEqual(db.Class.unavailable, db.lastError(&c).?.class);
-    // A timeout of the call's own, shorter than server selection: 504.
-    try testing.expectError(error.GatewayTimeout, client.db("admin").with(.{ .timeout = .fromMilliseconds(50) }).runCommand(&c, .{ .ping = 1 }));
+    // A timeout of the call's own, 5x shorter than server selection: 504.
+    try testing.expectError(error.GatewayTimeout, client.db("admin").with(.{ .timeout = .fromMilliseconds(20) }).runCommand(&c, .{ .ping = 1 }));
+}
 
+test "mongodb: a bad connection string, and a URL that would turn off TLS the code asks for, are refused" {
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
     try testing.expectError(error.InvalidUri, mongodb.Client.init(gpa, io, .{ .url = "mongodb://host:99999/" }));
     try testing.expectError(error.Unsupported, mongodb.Client.init(gpa, io, .{ .url = "mongodb://host/?readPreference=secondary" }));
     try testing.expectError(error.Unsupported, mongodb.Client.init(gpa, io, .{ .url = "mongodb+srv://cluster.example.com/" }));
@@ -327,9 +424,7 @@ test "fake mongod: coalesced and cached reads, invalidation" {
     try fake.init(io);
     defer fake.deinit(io);
 
-    var url_buf: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "mongodb://{s}/app?replicaSet=rs0&heartbeatFrequencyMS=500", .{fake.addr()});
-    const client = try mongodb.Client.init(gpa, io, .{ .url = url, .server_selection_timeout = .fromSeconds(5) });
+    const client = try open(io, &fake);
     defer client.deinit();
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -338,8 +433,13 @@ test "fake mongod: coalesced and cached reads, invalidation" {
     // Found before the counting starts.
     try client.ping(&c);
 
-    // 8 callers on each of 2 executors: one find per executor.
-    fake.find_delay_ms.store(100, .monotonic);
+    // 8 callers on each of 2 executors: one find per executor. Each find
+    // waits for the gate, so every caller joins one in flight however
+    // slow the machine is.
+    var gate: std.Io.Event = .unset;
+    defer gate.set(io);
+    fake.find_gate.store(&gate, .release);
+    defer fake.find_gate.store(null, .release);
     const Worker = struct {
         fn run(coll: mongodb.Collection, io_: std.Io, bad: *std.atomic.Value(u32)) void {
             var a: std.heap.ArenaAllocator = .init(gpa);
@@ -356,11 +456,18 @@ test "fake mongod: coalesced and cached reads, invalidation" {
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     for (0..16) |i| try @import("dusty").placement.concurrent(&group, io, .{ .executor = i % 2 }, Worker.run, .{ users, io, &bad });
+    const Joined = struct {
+        fn f(cl: *mongodb.Client) bool {
+            return cl.cache.stats().coalesced >= 14;
+        }
+    };
+    try wait.waitUntil(io, "the 14 identical finds joined the two in flight", client, Joined.f);
+    gate.set(io);
     try group.await(io);
+    fake.find_gate.store(null, .release);
     try testing.expectEqual(@as(u32, 0), bad.load(.monotonic));
     try testing.expectEqual(@as(u32, 2), fake.finds.load(.monotonic));
     try testing.expectEqual(@as(u64, 14), client.cache.stats().coalesced);
-    fake.find_delay_ms.store(0, .monotonic);
 
     // Cached: one find until invalidated. Another filter is another key,
     // and so is the same value under another field name.
@@ -382,6 +489,33 @@ test "fake mongod: coalesced and cached reads, invalidation" {
 }
 
 test "mongodb: with(options).dynamic is the dynamic runner with the context first" {
-    const f = &mongodb.Query.dynamic;
-    _ = f;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    const users = client.collection("users");
+    // The server found first, as an app's first call after start finds it.
+    try client.ping(&c);
+    _ = users;
+    var b: bson.Builder = .init(arena.allocator());
+    try b.begin();
+    try b.end();
+    const empty: bson.Document = .{ .bytes = b.bytes() };
+    const found = try client.with(.{}).dynamic(&c, .find, "users", &.{empty});
+    try testing.expectEqual(@as(usize, 10), found.documents.len);
+
+    var d: bson.Builder = .init(arena.allocator());
+    try d.begin();
+    try d.append("name", .{ .string = "Ada" });
+    try d.end();
+    const inserted = try client.with(.{}).dynamic(&c, .insertOne, "users", &.{.{ .bytes = d.bytes() }});
+    try testing.expectEqual(@as(u64, 1), inserted.write.changes);
+    try testing.expect(inserted.write.summary.get("insertedId") != null);
 }
