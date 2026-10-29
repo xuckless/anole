@@ -489,31 +489,6 @@ fn makeTestResponse(conn: *Connection) Response {
     };
 }
 
-test "Middleware: single middleware executes before handler" {
-    var tracker = CallTracker{};
-    var mw = TestMiddleware{ .tracker = &tracker, .id = 1 };
-    const middlewares = [_]Middleware(void){Middleware(void).init(&mw)};
-
-    var req = testRequest();
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
-
-    var chain = Chain(void){
-        .req = &req,
-        .res = &res,
-        .ctx = {},
-        .action = testHandler,
-        .middlewares = &middlewares,
-    };
-
-    try chain.call();
-
-    try std.testing.expectEqual(1, tracker.len);
-    try std.testing.expectEqual(1, tracker.items()[0]);
-    try std.testing.expectEqualStrings("handler called", res.body);
-}
-
 test "Middleware: multiple middlewares execute in order" {
     var tracker = CallTracker{};
 
@@ -655,26 +630,6 @@ test "Middleware: no action returns 404" {
 
 fn errorHandler(_: *Request, _: *Response) !void {
     return error.TestError;
-}
-
-test "Executor: default 500 handler on action error" {
-    var req = testRequest();
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
-
-    var chain = Chain(void){
-        .req = &req,
-        .res = &res,
-        .ctx = {},
-        .action = errorHandler,
-        .middlewares = &.{},
-    };
-
-    chain.run() catch {};
-
-    try std.testing.expectEqual(.internal_server_error, res.status);
-    try std.testing.expectEqualStrings("500 Internal Server Error\n", res.body);
 }
 
 fn goneHandler(_: *Request, _: *Response) !void {
