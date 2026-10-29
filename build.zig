@@ -1114,6 +1114,22 @@ pub fn build(b: *std.Build) void {
             .use_llvm = use_llvm,
         });
         test_step.dependOn(&b.addRunArtifact(core_fuzz).step);
+        // core-test-bare: the core's tests on the core without TLS, HTTP/2
+        // or compression (the minimal profile's core), so the tests that
+        // run only there (`if (use_tls) return error.SkipZigTest` and the
+        // like) run somewhere. Not part of `test`; one CI step runs it
+        // (research/s15/audit/lead-decisions.md item 3).
+        if (core.dusty_by[0][0][0][0]) |core_bare| {
+            const bare_tests = b.addTest(.{
+                .name = "core-test-bare",
+                .root_module = core_test_mod(b, core_bare, core.test_wait, target, optimize),
+                .test_runner = .{ .path = b.path("src/http/core/test_runner.zig"), .mode = .simple },
+                .use_llvm = use_llvm,
+            });
+            const run_bare = b.addRunArtifact(bare_tests);
+            run_bare.setCwd(certs_dir);
+            b.step("core-test-bare", "Run the HTTP core's own tests on the core without TLS, HTTP/2 or compression").dependOn(&run_bare.step);
+        }
     }
 
     // test-flags: one test binary per preset and edge combination. Each gets its

@@ -104,6 +104,13 @@ jobs:
       - name: HTTP/3 without HTTP/2 (nghttp3 without nghttp2)
         timeout-minutes: 31
         run: zig build test -Dhttp2=false -Dhttp3=true --test-timeout 120s --summary all
+      # The core's tests on the core without TLS, HTTP/2 or compression:
+      # no other step builds core-test there, so the tests that skip when
+      # TLS or zlib/zstd is on run only here.
+      - name: HTTP core without TLS or compression
+        if: runner.os == 'Linux'
+        timeout-minutes: 15
+        run: zig build core-test-bare --summary all
       - name: Invalid flag combination is rejected
         shell: bash
         run: |
