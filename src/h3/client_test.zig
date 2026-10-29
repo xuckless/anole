@@ -86,6 +86,26 @@ fn download(req: *dusty.Request, res: *dusty.Response) !void {
     try w.end();
 }
 
+/// GET /ahead: says it started, waits for `ahead_gate`, then streams
+/// `ahead_len` bytes in 4 KiB pieces, counting what its writes returned.
+const ahead_len = 1 << 20;
+var ahead_started: std.atomic.Value(bool) = .init(false);
+var ahead_written: std.atomic.Value(usize) = .init(0);
+var ahead_gate: std.Io.Event = .unset;
+fn ahead(req: *dusty.Request, res: *dusty.Response) !void {
+    ahead_started.store(true, .release);
+    try ahead_gate.wait(req.io);
+    var out_buf: [4096]u8 = undefined;
+    var out = try res.stream(&out_buf);
+    var chunk: [4096]u8 = undefined;
+    for (&chunk, 0..) |*b, i| b.* = @truncate(i);
+    for (0..ahead_len / chunk.len) |_| {
+        try out.interface.writeAll(&chunk);
+        _ = ahead_written.fetchAdd(chunk.len, .release);
+    }
+    try out.end();
+}
+
 fn slow(req: *dusty.Request, res: *dusty.Response) !void {
     try req.io.sleep(.fromSeconds(5), .awake);
     res.body = "too late";
@@ -284,6 +304,7 @@ const Fixture = struct {
         http.router.post("/answer-first", answerFirst);
         http.router.get("/port", port);
         http.router.get("/download", download);
+        http.router.get("/ahead", ahead);
         http.router.get("/huge-head", hugeHead);
         http.router.get("/fields", fields);
         http.router.get("/hold", holdHandler);
@@ -329,6 +350,16 @@ const Fixture = struct {
         return client.ClientConnection.connect(gpa, io, .{
             .host = "localhost",
             .address = f.ep.address(),
+            .port = f.ep.address().getPort(),
+            .tls = .{ .ca = .{ .pem = f.pem.cert } },
+        });
+    }
+
+    /// Through `relay`.
+    fn connectVia(f: *Fixture, gpa: std.mem.Allocator, io: std.Io, relay: *Relay) !*client.ClientConnection {
+        return client.ClientConnection.connect(gpa, io, .{
+            .host = "localhost",
+            .address = relay.front.socket.address,
             .port = f.ep.address().getPort(),
             .tls = .{ .ca = .{ .pem = f.pem.cert } },
         });
@@ -1384,6 +1415,23 @@ pub const Relay = struct {
         r.up_gate.set(r.io);
     }
 
+    /// Holds every datagram the server sends from now on (its ACKs among
+    /// them), in order, until `releaseDown`: the client hears nothing.
+    pub fn holdDown(r: *Relay) void {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        r.gate = .unset;
+        r.gate_down = true;
+    }
+
+    /// The held datagrams go on, and so does everything after them.
+    pub fn releaseDown(r: *Relay) void {
+        r.mutex.lockUncancelable(r.io);
+        r.gate_down = false;
+        r.mutex.unlock(r.io);
+        r.gate.set(r.io);
+    }
+
     /// Holds the server's datagrams until the client resends its first
     /// flight's token-less Initials (`hold_down_until_resend`).
     fn holdDownUntilResend(r: *Relay) void {
@@ -2040,6 +2088,114 @@ test "h3 server: a response streamed past its send buffer completes and leaves n
             return ep.stats.blocks_live.load(.monotonic) <= 1;
         }
     }.cond);
+}
+
+test "h3 server: a response gets more than 64 KiB ahead of the client's acknowledgements once the congestion window allows" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    ahead_started.store(false, .release);
+    ahead_written.store(0, .release);
+    ahead_gate = .unset;
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    // On every exit, before the fixture stops: the handler goes on.
+    defer ahead_gate.set(io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    const conn = try f.connectVia(gpa, io, relay);
+    defer conn.close();
+    // A 1 MiB download first, acknowledged as usual: the server's
+    // congestion window grows well past 64 KiB.
+    const warm = try get(conn, "/download?n=1048576", gpa);
+    defer gpa.free(warm);
+    try std.testing.expectEqual(@as(usize, 1 << 20), warm.len);
+    const s = try request(conn, "GET", "/ahead", .{});
+    defer s.release();
+    try wait.waitFlag(io, "the /ahead handler started", &ahead_started);
+    // From now on the server hears nothing from the client, no ACK either,
+    // and only then does the handler write.
+    relay.holdUp();
+    defer relay.releaseUp();
+    ahead_gate.set(io);
+    // Half as much again as the old fixed cap, none of it acknowledged: a
+    // cap of 64 KiB on what a response holds unacknowledged never lets the
+    // writes get here, and the wait fails. (The new cap lets the writes
+    // reach what is in flight plus at least 64 KiB.)
+    try wait.waitUntil(io, "the handler's writes got 96 KiB ahead of any acknowledgement", {}, struct {
+        fn cond(_: void) bool {
+            return ahead_written.load(.acquire) >= 96 * 1024;
+        }
+    }.cond);
+    relay.releaseUp();
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    const body = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(body);
+    try std.testing.expectEqual(@as(usize, ahead_len), body.len);
+    for (body, 0..) |b, i| if (b != @as(u8, @truncate(i % 4096))) return error.TestUnexpectedResult;
+}
+
+test "h3 client: a request body gets more than 64 KiB ahead of the server's acknowledgements once the congestion window allows" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    const conn = try f.connectVia(gpa, io, relay);
+    defer conn.close();
+    const body = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 7);
+    // A 1 MiB upload first, acknowledged as usual: the client's congestion
+    // window grows well past 64 KiB.
+    const want = blk: {
+        const s = try request(conn, "POST", "/nw/sum", .{ .body = true });
+        try s.writer().writeAll(body);
+        try s.writer().flush();
+        try s.closeSend();
+        break :blk try finish(s, gpa);
+    };
+    defer gpa.free(want);
+    const s = try request(conn, "POST", "/nw/sum", .{ .body = true });
+    defer s.release();
+    // From now on the client hears nothing from the server, no ACK either.
+    relay.holdDown();
+    defer relay.releaseDown();
+    // The writes, in a task, counting what returned.
+    var progress: std.atomic.Value(usize) = .init(0);
+    var writer = try io.concurrent(struct {
+        fn write(st: *client.Stream, data: []const u8, done: *std.atomic.Value(usize)) !void {
+            var off: usize = 0;
+            while (off < data.len) {
+                const k = @min(4096, data.len - off);
+                try st.writer().writeAll(data[off..][0..k]);
+                off += k;
+                done.store(off, .release);
+            }
+            try st.writer().flush();
+        }
+    }.write, .{ s, body, &progress });
+    defer writer.cancel(io) catch {};
+    // Half as much again as the old default send buffer, none of it
+    // acknowledged.
+    try wait.waitUntil(io, "the client's writes got 96 KiB ahead of any acknowledgement", &progress, struct {
+        fn cond(p: *std.atomic.Value(usize)) bool {
+            return p.load(.acquire) >= 96 * 1024;
+        }
+    }.cond);
+    relay.releaseDown();
+    try writer.await(io);
+    try s.closeSend();
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    const got = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings(want, got);
 }
 
 test "h3 client: unprocessed is true after H3_REQUEST_REJECTED and for a request the GOAWAY did not reach" {
