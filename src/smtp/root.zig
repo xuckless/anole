@@ -193,6 +193,9 @@ pub const Call = struct {
 
 /// An SMTP server: the handle in the App state.
 pub const Client = struct {
+    /// The console's `/db` "system" for this connector.
+    pub const console_system = "smtp";
+
     gpa: std.mem.Allocator,
     io: std.Io,
     /// The settings' strings.

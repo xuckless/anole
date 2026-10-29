@@ -964,14 +964,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// after a long freeze); null when it has no pool to close.
             closeIdle: ?*const fn (context: *anyopaque) void = null,
 
+            /// The console's `/db` system: the type's `console_system` decl
+            /// ("postgres", "redis"...), or "connector" when it has none.
             fn systemOf(comptime T: type) []const u8 {
-                @setEvalBranchQuota(20_000);
-                const n = @typeName(T);
-                inline for (.{ "postgres:pg", "sqlite:sqlite", "mongodb:mongodb", "redis:redis", "nats:nats", "kafka:kafka", "smtp:smtp", "s3:s3" }) |pair| {
-                    const colon = comptime std.mem.indexOfScalar(u8, pair, ':').?;
-                    if (std.mem.find(u8, n, pair[colon + 1 ..]) != null) return pair[0..colon];
-                }
-                return "connector";
+                if (!@hasDecl(T, "console_system")) return "connector";
+                const system: []const u8 = T.console_system;
+                return system;
             }
 
             fn of(comptime T: type, value: *T) Connector {
@@ -5270,4 +5268,35 @@ test "anole.Server: a .env file with a problem is InvalidEnvFile" {
         .http = .{ .port = 0 },
         .executors = .exact(1),
     }, {}));
+}
+
+test "console: a connector type is not reported as PostgreSQL for a piece of its name" {
+    // "Upgrade" contains "pg"; the test's name (part of the type's name)
+    // must contain no system's substring, so the struct is the only trigger.
+    const Upgrade = struct {
+        fn start(_: *@This(), _: ?*observe.metrics.Registry, _: ?*observe.trace.Exporter, _: ?*observe.Health) anyerror!void {}
+        fn deinit(_: *@This()) void {}
+    };
+    var u: Upgrade = .{};
+    const c = Server(void).Connector.of(Upgrade, &u);
+    try std.testing.expectEqualStrings("connector", c.name);
+    try std.testing.expect(c.describe == null);
+}
+
+test "console: each database and service connector keeps its /db system name" {
+    const S = Server(void);
+    const Name = struct {
+        fn of(comptime T: type) []const u8 {
+            var v: T = undefined;
+            return S.Connector.of(T, &v).name;
+        }
+    };
+    if (features.postgres) try std.testing.expectEqualStrings("postgres", Name.of(pg_mod.Client));
+    if (features.sqlite) try std.testing.expectEqualStrings("sqlite", Name.of(sqlite_mod.Client));
+    if (features.mongodb) try std.testing.expectEqualStrings("mongodb", Name.of(mongodb_mod.Client));
+    if (features.redis) try std.testing.expectEqualStrings("redis", Name.of(redis_mod.Client));
+    if (features.nats) try std.testing.expectEqualStrings("nats", Name.of(nats_mod.Client));
+    if (features.kafka) try std.testing.expectEqualStrings("kafka", Name.of(kafka_mod.Client));
+    if (features.s3) try std.testing.expectEqualStrings("s3", Name.of(@import("s3/root.zig").Client));
+    if (features.smtp) try std.testing.expectEqualStrings("smtp", Name.of(@import("smtp/root.zig").Client));
 }

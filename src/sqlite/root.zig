@@ -151,6 +151,9 @@ pub const Error = db.Error || error{ Canceled, OutOfMemory };
 /// One SQLite database: a writer thread with the read-write connection, and
 /// read-only connections for reads. Safe to use from any task.
 pub const Client = struct {
+    /// The console's `/db` "system" for this connector.
+    pub const console_system = "sqlite";
+
     gpa: std.mem.Allocator,
     io: std.Io,
     name: []const u8,
