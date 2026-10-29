@@ -720,7 +720,8 @@ pub const Exec = struct {
     /// room keeps waiting, uncancelably, for at most `cancel_post_wait_ns`,
     /// so the record keeps its place behind the ones before it; the record
     /// is freed only if the consumer still hasn't made room by then. The
-    /// cancel is re-armed for the caller's next cancelation point.
+    /// cancel is re-armed for the caller's next cancelation point. Once
+    /// `destroy` set `abandon`, a waiter frees its record at once.
     pub fn postRecord(x: *Exec, rec: []align(8) u8, wait: bool) void {
         const c = x.consumer orelse return freeRecord(rec.ptr);
         if (!x.onThisExecutor()) {
@@ -729,27 +730,15 @@ pub const Exec = struct {
         }
         if (wait) {
             const need: usize = if (rec.len > small_record) rec.len else 0;
-            while (!x.hasRoom(need)) x.waitRoom(need, null) catch {
-                // C3: the cancel goes back to the caller's next wait. C2/U4:
-                // the record (often the end of something: ws_close,
-                // net_close) still takes its place in the ring,
-                // uncancelably, for at most `cancel_post_wait_ns`; past
-                // that the consumer is not polling and it is freed. Not the
-                // overflow list: `poll` drains it after the ring, so a later
-                // record that found ring room would overtake this one.
-                const io = x.engine.io;
-                if (comptime builtin.is_test) if (test_room_canceled) |h| h();
-                io.recancel();
-                const prot = io.swapCancelProtection(.blocked);
-                defer _ = io.swapCancelProtection(prot);
-                const bound = if (comptime builtin.is_test) test_cancel_post_wait_ns orelse cancel_post_wait_ns else cancel_post_wait_ns;
-                const until = std.Io.Clock.awake.now(io).nanoseconds + bound;
-                while (!x.hasRoom(need)) x.waitRoom(need, until) catch |e| switch (e) {
-                    error.Timeout => return freeRecord(rec.ptr),
-                    error.Canceled => unreachable, // protection is blocked
+            while (!x.hasRoom(need)) {
+                // `destroy`: the consumer hears nothing more, and nobody
+                // may poll again to make room.
+                if (x.engine.abandon.load(.acquire)) return freeRecord(rec.ptr);
+                x.waitRoom(need, null) catch {
+                    if (!x.waitRoomCanceled(need)) return freeRecord(rec.ptr);
+                    break;
                 };
-                break;
-            };
+            }
             _ = x.record_bytes.fetchAdd(rec.len, .monotonic);
             const pushed = x.ring.push(.{ .handle = 0, .rec = rec.ptr });
             std.debug.assert(pushed);
@@ -761,6 +750,33 @@ pub const Exec = struct {
             x.pushOverflow(rec);
         }
         c.wake();
+    }
+
+    /// `postRecord`'s waiter was canceled while it waited for room. C3:
+    /// the cancel goes back to the caller's next wait. C2/U4: the record
+    /// (often the end of something: ws_close, net_close) still takes its
+    /// place in the ring, uncancelably, for at most `cancel_post_wait_ns`;
+    /// past that the consumer is not polling. Not the overflow list: `poll`
+    /// drains it after the ring, so a later record that found ring room
+    /// would overtake this one. False: no room came (the bound passed, or
+    /// `destroy` abandoned the consumer), and the caller frees the record.
+    fn waitRoomCanceled(x: *Exec, need: usize) bool {
+        const io = x.engine.io;
+        if (comptime builtin.is_test) if (test_room_canceled) |h| h();
+        io.recancel();
+        const prot = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(prot);
+        const bound = if (comptime builtin.is_test) test_cancel_post_wait_ns orelse cancel_post_wait_ns else cancel_post_wait_ns;
+        const until = std.Io.Clock.awake.now(io).nanoseconds + bound;
+        while (!x.hasRoom(need)) {
+            if (x.engine.abandon.load(.acquire)) return false;
+            x.waitRoom(need, until) catch |e| switch (e) {
+                // Room made right at the deadline still takes the record.
+                error.Timeout => return x.hasRoom(need),
+                error.Canceled => unreachable, // protection is blocked
+            };
+        }
+        return true;
     }
 
     fn onThisExecutor(x: *const Exec) bool {
@@ -784,8 +800,9 @@ pub const Exec = struct {
         _ = x.room_waiters.fetchAdd(1, .seq_cst);
         defer _ = x.room_waiters.fetchSub(1, .monotonic);
         // Announced: look again (Dekker with the consumer's pop and
-        // `signalRoom`).
-        if (x.hasRoom(need)) return;
+        // `signalRoom`). `abandon` is set before `destroy` bumps `room`:
+        // a `seen` taken after that bump finds it set here.
+        if (x.hasRoom(need) or x.engine.abandon.load(.acquire)) return;
         // The consumer is behind: make sure it hears there is work.
         if (x.consumer) |c| c.wake();
         const io = x.engine.io;
@@ -793,6 +810,13 @@ pub const Exec = struct {
         io.futexWaitTimeout(u32, &x.room.raw, seen, t) catch return error.Canceled;
         if (comptime builtin.is_test) _ = x.room_wakeups.fetchAdd(1, .monotonic);
         if (deadline) |d| if (std.Io.Clock.awake.now(io).nanoseconds >= d) return error.Timeout;
+    }
+
+    /// `destroy`, after it set `abandon`: every task parked for room wakes
+    /// and frees its record (`postRecord`), whatever the room.
+    fn abandonRoom(x: *Exec) void {
+        _ = x.room.fetchAdd(1, .release);
+        x.wakeFutex(&x.room);
     }
 
     /// Consumer side: after `poll` took anything from this executor's ring.
@@ -2058,6 +2082,7 @@ pub const Engine = struct {
                 // that cannot come (it may run on a consumer's own thread).
                 .running, .draining => {
                     e.abandon.store(true, .release);
+                    for (e.execs) |*x| x.abandonRoom();
                     for (e.execs) |*x| x.setEvent(&x.kick);
                     e.drain() catch {};
                 },
