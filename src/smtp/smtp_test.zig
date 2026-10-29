@@ -325,6 +325,43 @@ test "retry: a refused connection is tried again with retry and fails after the 
     try testing.expectError(error.ServiceUnavailable, client.send(&c, .{ .to = &.{"a@example.com"}, .text = "x" }));
 }
 
+test "smtp: a connect past connect_timeout is ServiceUnavailable connect_timeout, never Canceled" {
+    // Regression test of 90b9e00 (two connect timers of the same length; the
+    // inner one leaked Canceled). A peer that never completes the handshake:
+    // a listener with backlog 0 whose queue one unaccepted connect fills, so
+    // the kernel drops the next SYN. Windows answers a full backlog with a
+    // reset instead (a refused connect), so the peer is not silent there.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const expected_log = errors.expectLog();
+    defer expected_log.deinit();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const listen_at: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try listen_at.listen(io, .{ .kernel_backlog = 0 });
+    defer listener.deinit(io);
+    const filler = try listener.socket.address.connect(io, .{ .mode = .stream });
+    defer filler.close(io);
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "smtp://127.0.0.1:{d}?tls=none", .{listener.socket.address.getPort()});
+    const client = try smtp.Client.init(gpa, io, .{
+        .url = url,
+        .from = "app@example.com",
+        .environment = .development,
+        .connect_timeout = .fromMilliseconds(100),
+        .breaker = null,
+        .retry = .{ .attempts = 2, .backoff = .{ .base = .fromMilliseconds(1), .max = .fromMilliseconds(2), .jitter = .none } },
+    });
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    try testing.expectError(error.ServiceUnavailable, client.with(.{ .retry = true }).send(&c, .{ .to = &.{"a@example.com"}, .text = "x" }));
+    const d = db.lastError(&c).?;
+    try testing.expectEqual(db.Class.unavailable, d.class);
+    try testing.expectEqualStrings("connect_timeout", d.code);
+}
+
 test "tls: STARTTLS upgrades, then EHLO again; AUTH PLAIN after it" {
     if (comptime !has_tls) return error.SkipZigTest;
     var h: Harness = undefined;
@@ -390,13 +427,14 @@ test "auth: LOGIN when PLAIN is absent; a wrong password is authentication_faile
         // The password is not in the error.
         try testing.expect(std.mem.indexOf(u8, db.lastError(&h.c).?.message, "wrong") == null);
     }
-    {
-        var h: Harness = undefined;
-        try h.init(.{}, .{ .username = "ada", .password = "pw" });
-        defer h.deinit();
-        try testing.expectError(error.Database, h.hello());
-        try expectDetail(&h, .other, "auth_unsupported");
-    }
+}
+
+test "auth: credentials and a server that offers no mechanism is auth_unsupported" {
+    var h: Harness = undefined;
+    try h.init(.{}, .{ .username = "ada", .password = "pw" });
+    defer h.deinit();
+    try testing.expectError(error.Database, h.hello());
+    try expectDetail(&h, .other, "auth_unsupported");
 }
 
 test "url: smtps means implicit TLS on 465, a public host with credentials and no TLS is refused" {
@@ -432,7 +470,9 @@ test "start: no SMTP_URL fails in production and goes to Mailpit's port otherwis
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();
-    // The environment is the test process's: no SMTP_URL there.
+    // The environment is the test process's. Skip kind d (inverted): the unit
+    // jobs leave SMTP_URL unset, so this always runs there; the smtp live job may
+    // set it and skips this one.
     if (smtpUrlSet()) return error.SkipZigTest;
     try testing.expectError(error.InvalidOptions, smtp.Client.init(gpa, io, .{ .environment = .production }));
     const dev = try smtp.Client.init(gpa, io, .{ .environment = .development });
