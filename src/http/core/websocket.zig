@@ -65,9 +65,31 @@ pub const WebSocket = struct {
     /// Holds the reading task's replies while more of the peer's messages
     /// are buffered.
     batch: Batch = .{},
+    /// The reading task's turn budget (`turn_budget`): units spent on
+    /// messages handed on since the task last went through its executor's
+    /// scheduler, and that scheduler's mark (`placement.schedulerMark`) as
+    /// of the last message. The reading task only.
+    turn_spent: u32 = 0,
+    turn_mark: ?u32 = null,
     /// The last control frame's payload: a ping's (answered from here) or a
     /// close's reason, valid as a message's data is.
     control_payload: [125]u8 = undefined,
+
+    /// How much a reading task hands on from what it has already read
+    /// before it lets the other tasks on its executor run (#85): in units
+    /// of one per message plus one per KiB of its payload, so 32 small
+    /// messages or 32 KiB (two TLS records' worth). On zio a task parks at
+    /// every socket read and write, even one that completes at once, so
+    /// the budget only comes into play for a run of messages already
+    /// buffered (since #85 a TLS read returns every whole record received,
+    /// up to a 16.5 KiB ciphertext block: about a hundred audio-sized
+    /// messages) whose handling does not write either (sends held for a
+    /// batch). Tokio gives a task 128 units a poll (tokio/src/task/coop);
+    /// a unit here (a message read, handled and relayed) costs more than
+    /// one of Tokio's (one resource poll), and 32 of them stay well inside
+    /// zio's 100 µs tick (`tick_target_ns`) and Seastar's 0.5 ms task
+    /// quota. research/s1/ws85-fairness.md.
+    pub const turn_budget: u32 = 32;
 
     /// The largest message a socket accepts unless told otherwise: 16 MiB.
     pub const default_max_message_size: usize = 1024 * 1024; // 1 MiB
@@ -253,15 +275,49 @@ pub const WebSocket = struct {
     }
 
     fn nextMessage(self: *WebSocket) !Message {
+        self.takeTurn() catch |err| {
+            self.batch.endRound();
+            return err;
+        };
         const msg = @call(.always_inline, readMessageOrFail, .{self}) catch |err| {
             self.batch.endRound();
             return err;
         };
+        self.turn_spent += 1 + @as(u32, @intCast(@min(msg.data.len >> 10, turn_budget)));
         // A batch lasts while the peer's next message is already here, or
         // begun: its header is buffered and bytes wait below the reader
         // (the TLS layer), so it needs no wait for the peer.
         self.batch.round(self.io, !self.wouldWait());
         return msg;
+    }
+
+    /// Before the reading task reads a message: once it has handed on a
+    /// `turn_budget`'s worth without going through its executor's
+    /// scheduler, the other ready tasks there run first (#85). On zio
+    /// every socket read and write parks the task, so a turn ends there
+    /// on its own; this ends the turns that read nothing from the socket
+    /// and write nothing, a run of messages already buffered whose sends
+    /// are held for batches. Without it, one busy peer's burst is handled
+    /// whole while every other connection on the executor waits. Like
+    /// Tokio's coop budget, the count starts again at every real break.
+    /// Off zio (a thread the kernel preempts) there is no budget.
+    fn takeTurn(self: *WebSocket) !void {
+        const mark = placement.schedulerMark(self.io) orelse return;
+        if (self.turn_mark == null or self.turn_mark.? != mark) {
+            // Parked or yielded since the last message: a fresh turn.
+            self.turn_mark = mark;
+            self.turn_spent = 0;
+            return;
+        }
+        if (self.turn_spent < turn_budget) return;
+        // What the batch holds goes out first, and that write is the
+        // break (on zio a write parks, even one that completes at once).
+        // Otherwise, to the back of the run queue: free when nothing else
+        // is ready.
+        if (self.batch.deferred.load(.monotonic)) try self.flushDeferred();
+        if (placement.schedulerMark(self.io) == mark) try placement.yieldTurn(self.io);
+        self.turn_mark = placement.schedulerMark(self.io);
+        self.turn_spent = 0;
     }
 
     /// Whether reading the next message may have to wait for the peer: no

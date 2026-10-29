@@ -113,6 +113,31 @@ pub fn executorCount(io: std.Io) ?usize {
     return rt.executors.items.len;
 }
 
+/// A number that moves whenever the calling task has been through its
+/// executor's scheduler since the last call: it parked (any wait, any I/O,
+/// which on zio parks even when it completes at once) or yielded, and was
+/// taken off the run queue again. Equal across two calls means the task
+/// ran without a break in between. zio's count of tasks taken off the run
+/// queue (`Executor.runs`, kept with `fast_accept`, which Anole always
+/// builds with; without it the count stands still and every turn looks
+/// unbroken). Null off zio, where a task is an OS thread the kernel
+/// preempts. For a cooperative budget (`WebSocket`'s turn budget).
+pub fn schedulerMark(io: std.Io) ?u32 {
+    if (comptime !have_zio) return null;
+    const rt = zio.Runtime.fromIo(io) orelse return null;
+    const id = rt.currentExecutor() orelse return null;
+    return rt.executors.items[id].runs;
+}
+
+/// Lets the other ready tasks of the calling task's executor run first:
+/// the task goes to the back of the run queue (`zio.yield`). Free when no
+/// other task is ready (zio's fast path returns at once). Nothing off zio.
+pub fn yieldTurn(io: std.Io) std.Io.Cancelable!void {
+    if (comptime !have_zio) return;
+    if (zio.Runtime.fromIo(io) == null) return;
+    return zio.yield();
+}
+
 /// zio can cancel one task: the type behind the task an `AutoCancel` arms
 /// against has a non-blocking `cancel`.
 const have_task_cancel = !is_stub;

@@ -786,3 +786,83 @@ test "WebSocket loop: peers that hang up or reset are closed" {
     try hangUps("/loop", .{ .idle_park = .fromMilliseconds(30) }, false);
     try hangUps("/loop", .{ .idle_park = null }, false);
 }
+
+/// The turn-budget test's record of who ran when: the burst reader logs
+/// each message's index, the other task `other_ran`. One executor, so the
+/// two never run at once.
+const TurnLog = struct {
+    const other_ran = std.math.maxInt(u16);
+    entries: [256]u16 = undefined,
+    len: usize = 0,
+    failed: ?anyerror = null,
+
+    fn add(l: *TurnLog, v: u16) void {
+        l.entries[l.len] = v;
+        l.len += 1;
+    }
+
+    /// Reads the socket to its end, setting `wake` at the first message.
+    fn burst(ws: *dusty.WebSocket, wake: *std.Io.Event, l: *TurnLog) std.Io.Cancelable!void {
+        var i: u16 = 0;
+        while (true) : (i += 1) {
+            _ = ws.receive() catch |err| {
+                const e: anyerror = err;
+                if (e == error.EndOfStream) return;
+                if (e == error.Canceled) return error.Canceled;
+                l.failed = e;
+                return;
+            };
+            l.add(i);
+            if (i == 0) wake.set(ws.io);
+        }
+    }
+
+    fn other(io: std.Io, ready: *std.Io.Event, l: *TurnLog) std.Io.Cancelable!void {
+        try ready.wait(io);
+        l.add(other_ran);
+    }
+};
+
+test "WebSocket turn budget: a reader's long buffered burst lets another task on its executor run between its messages" {
+    // #85: a burst already read (here all of it, from memory: no read or
+    // write ever parks the reader) is handed on a budget at a time, and a
+    // task that became ready meanwhile runs before the rest.
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const budget = dusty.WebSocket.turn_budget;
+    const n = 3 * budget;
+    // One-byte text messages, masked with a zero key.
+    var frames: [n * 7]u8 = undefined;
+    for (0..n) |i| frames[i * 7 ..][0..7].* = .{ 0x81, 0x81, 0, 0, 0, 0, 'x' };
+    var reader: std.Io.Reader = .fixed(&frames);
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var ws = dusty.WebSocket.init(io, .{ .writer = &out, .reader = &reader }, gpa, 0);
+    defer ws.deinit();
+
+    var turns: TurnLog = .{};
+    var ready: std.Io.Event = .unset;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, TurnLog.other, .{ io, &ready, &turns });
+    try group.concurrent(io, TurnLog.burst, .{ &ws, &ready, &turns });
+    try group.await(io);
+
+    if (turns.failed) |err| return err;
+    try std.testing.expectEqual(n + 1, turns.len);
+    const at = std.mem.indexOfScalar(u16, turns.entries[0..turns.len], TurnLog.other_ran).?;
+    // Woken by the first message; it ran once the reader had spent its
+    // budget, not after the whole burst.
+    try std.testing.expect(at >= 1);
+    try std.testing.expect(at <= budget);
+    // The burst itself, whole and in order around it.
+    var want: u16 = 0;
+    for (turns.entries[0..turns.len]) |e| {
+        if (e == TurnLog.other_ran) continue;
+        try std.testing.expectEqual(want, e);
+        want += 1;
+    }
+}
