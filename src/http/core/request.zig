@@ -1118,7 +1118,7 @@ test "Request: no std.Io.Reader sentinel escapes the body-reading API" {
     }
 }
 
-test "Request.body: basic POST" {
+test "Request.body: a Content-Length body is read whole" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1586,7 +1586,7 @@ test "Request.body: framing the parser rejects is reported as itself" {
     try std.testing.expectError(error.MalformedBody, req.body());
 }
 
-test "Request.body: large body over 128 bytes" {
+test "Request.body: a Content-Length body larger than one read's destination is read whole" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 

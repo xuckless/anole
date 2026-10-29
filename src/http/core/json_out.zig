@@ -225,7 +225,7 @@ test "json out: renamed fields by outside names, nested and in slices" {
     }{ .display_name = "x" }, .{ .omit_null_fields = true });
 }
 
-test "json out: hasOutsideNames" {
+test "json out: only a type with a rename somewhere inside takes the renaming writer (recursive types end)" {
     try testing.expect(hasOutsideNames(TodoResponse));
     try testing.expect(hasOutsideNames([]const Line));
     try testing.expect(hasOutsideNames(?Line));

@@ -958,7 +958,7 @@ test "Router: path mismatch returns null" {
     try std.testing.expect(handler == null);
 }
 
-test "Router: multiple routes" {
+test "Router: each method and path pair finds its own handler" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1006,7 +1006,7 @@ test "Router: multiple routes" {
     try std.testing.expect(handler3.?.action == testHandler2);
 }
 
-test "Router: all HTTP methods" {
+test "Router: an any() route answers every method" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1232,7 +1232,7 @@ test "Router: a static path finds what the tree walk would, in any spelling" {
     }
 }
 
-test "Router: wildcard route basic matching" {
+test "Router: a wildcard matches a single remaining segment" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1659,7 +1659,7 @@ test "Group: prefix concatenation" {
     try std.testing.expect(route2.?.action == testHandler2);
 }
 
-test "Group: routes without group middleware get global middlewares" {
+test "Router: a route registered on the router runs the router's middleware" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1761,7 +1761,7 @@ test "Group: keeps its own copy of the middleware list" {
     }
 }
 
-test "Group: direct routes have no middlewares when none set" {
+test "Router: a route with no middleware anywhere has an empty chain" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
