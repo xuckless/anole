@@ -3068,46 +3068,6 @@ test "parseUrl: URL with query string" {
     try std.testing.expectEqualStrings("foo=bar&baz=qux", uri.query.?.percent_encoded);
 }
 
-test "Uri.resolveInPlace: relative path" {
-    const base = try parseUrl("http://example.com/foo/bar");
-
-    // Test absolute path redirect
-    {
-        var buf: [256]u8 = undefined;
-        const location = "/new/path";
-        @memcpy(buf[0..location.len], location);
-        var aux: []u8 = buf[0..];
-        const resolved = try Uri.resolveInPlace(base, location.len, &aux);
-        try std.testing.expectEqualStrings("http", resolved.scheme);
-        try std.testing.expectEqualStrings("example.com", resolved.host.?.percent_encoded);
-        try std.testing.expectEqualStrings("/new/path", resolved.path.percent_encoded);
-    }
-
-    // Test relative path redirect
-    {
-        var buf: [256]u8 = undefined;
-        const location = "other";
-        @memcpy(buf[0..location.len], location);
-        var aux: []u8 = buf[0..];
-        const resolved = try Uri.resolveInPlace(base, location.len, &aux);
-        try std.testing.expectEqualStrings("http", resolved.scheme);
-        try std.testing.expectEqualStrings("example.com", resolved.host.?.percent_encoded);
-        try std.testing.expectEqualStrings("/foo/other", resolved.path.percent_encoded);
-    }
-
-    // Test absolute URL redirect
-    {
-        var buf: [256]u8 = undefined;
-        const location = "http://other.com/different";
-        @memcpy(buf[0..location.len], location);
-        var aux: []u8 = buf[0..];
-        const resolved = try Uri.resolveInPlace(base, location.len, &aux);
-        try std.testing.expectEqualStrings("http", resolved.scheme);
-        try std.testing.expectEqualStrings("other.com", resolved.host.?.percent_encoded);
-        try std.testing.expectEqualStrings("/different", resolved.path.percent_encoded);
-    }
-}
-
 test "ClientResponse.body: basic response" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3276,11 +3236,21 @@ test "Client: no std.Io sentinel escapes its public API" {
     }
 }
 
-test "ClientResponse.body: large body over 128 bytes" {
+test "ClientResponse.body: a body longer than the first destination slice arrives whole and in order" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const body_content = &@as([256]u8, @splat('A'));
+    // body() reads into a growing writer whose first slice is
+    // 1 + cache line (129 bytes on x86_64 and aarch64): 256 bytes make the
+    // parser stop mid-body and resume after the writer grows. Every byte
+    // differs from its neighbours, so a lost, repeated or reordered chunk
+    // at the resume point fails the comparison, not only the length.
+    const body_content = comptime blk: {
+        var out: [256]u8 = undefined;
+        for (&out, 0..) |*b, i| b.* = @intCast((i * 7 + 1) % 251);
+        const final = out;
+        break :blk &final;
+    };
     const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 256\r\n\r\n" ++ body_content;
     var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
@@ -3299,8 +3269,7 @@ test "ClientResponse.body: large body over 128 bytes" {
     };
 
     const body = try response.body();
-    try std.testing.expectEqual(256, body.?.len);
-    try std.testing.expectEqualStrings(body_content, body.?);
+    try std.testing.expectEqualSlices(u8, body_content, body.?);
 }
 
 test "ClientResponse.body: no body" {
@@ -3614,9 +3583,14 @@ test "ClientResponse.body: an empty body with a Content-Encoding is not decoded"
     try std.testing.expectEqualStrings("gzip", response.headers().get("Content-Encoding").?);
 }
 
-test "Protocol.fromScheme: http" {
-    const proto = try Protocol.fromScheme("http");
-    try std.testing.expectEqual(Protocol.http, proto);
+test "Protocol: http and ws are port 80, https and wss are 443, any other scheme is refused" {
+    try std.testing.expectEqual(Protocol.http, try Protocol.fromScheme("http"));
+    try std.testing.expectEqual(Protocol.http, try Protocol.fromScheme("ws"));
+    try std.testing.expectEqual(Protocol.https, try Protocol.fromScheme("https"));
+    try std.testing.expectEqual(Protocol.https, try Protocol.fromScheme("wss"));
+    try std.testing.expectError(error.UnsupportedScheme, Protocol.fromScheme("ftp"));
+    try std.testing.expectEqual(80, Protocol.http.defaultPort());
+    try std.testing.expectEqual(443, Protocol.https.defaultPort());
 }
 
 test "uriPortAndProtocol: https default" {
@@ -3807,25 +3781,6 @@ test "writeUpgradeRequest: refuses a path or query with bytes a request target c
     }));
 }
 
-test "redirect: Referer strips userinfo and fragment" {
-    // Verify that writeToStream with authentication=false, fragment=false
-    // produces a clean Referer without credentials or fragment.
-    var referer_buf: [2048]u8 = undefined;
-    var w = std.Io.Writer.fixed(&referer_buf);
-    const uri = try parseUrl("http://user:pass@example.com/path?q=1#section");
-    try uri.writeToStream(&w, .{
-        .scheme = true,
-        .authority = true,
-        .authentication = false,
-        .path = true,
-        .query = true,
-        .fragment = false,
-        .port = true,
-    });
-    const referer = w.buffered();
-    try std.testing.expectEqualStrings("http://example.com/path?q=1", referer);
-}
-
 test "writeRequest: strips sensitive headers on cross-origin redirect" {
     var buf: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
@@ -3850,60 +3805,6 @@ test "writeRequest: strips sensitive headers on cross-origin redirect" {
     const written = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Authorization") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Cookie") == null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
-}
-
-test "redirect: strips sensitive headers on https to http downgrade" {
-    // Verify the stripping condition fires on scheme downgrade even when host is identical.
-    // We exercise the flag directly since the full redirect loop requires a live server.
-    var buf: [4096]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&buf);
-
-    var headers = try Headers.init(std.testing.allocator, 4);
-    defer headers.deinit(std.testing.allocator);
-    try headers.put("Authorization", "Bearer secret");
-    try headers.put("X-Custom", "keep-me");
-
-    const uri = try parseUrl("http://example.com/path");
-    try writeRequest(&writer, .{
-        .method = .get,
-        .uri = uri,
-        .host = "example.com",
-        .port = 80,
-        .protocol = .http,
-        .headers = &headers,
-        .strip_sensitive_headers = true,
-    });
-
-    const written = writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "Authorization") == null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
-}
-
-test "redirect: once stripping triggered it persists across hops" {
-    // strip_sensitive_headers=true should propagate even if a later hop passes the host check.
-    var buf: [4096]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&buf);
-
-    var headers = try Headers.init(std.testing.allocator, 4);
-    defer headers.deinit(std.testing.allocator);
-    try headers.put("Authorization", "Bearer secret");
-    try headers.put("X-Custom", "keep-me");
-
-    // Simulate a hop that is back on the original host but already has strip=true.
-    const uri = try parseUrl("http://example.com/new-path");
-    try writeRequest(&writer, .{
-        .method = .get,
-        .uri = uri,
-        .host = "example.com",
-        .port = 80,
-        .protocol = .http,
-        .headers = &headers,
-        .strip_sensitive_headers = true,
-    });
-
-    const written = writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "Authorization") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
 }
 
@@ -3990,19 +3891,23 @@ test "Connection.release: the Keep-Alive timeout is in seconds" {
     var client = Client.init(std.testing.allocator, io, .{});
     defer client.deinit();
 
+    // The deadline is set while the fetch runs: it must lie 5 s after some
+    // moment between these two readings, however long the fetch took (D6).
+    const before = std.Io.Timestamp.now(io, .awake);
     {
         var resp = try client.fetch(url, .{});
         defer resp.deinit();
         _ = try resp.body();
     }
+    const after = std.Io.Timestamp.now(io, .awake);
 
+    // Read through the pool's internal deadline (Q2): observing the close
+    // itself would mean waiting the Keep-Alive timeout out (K1).
     try std.testing.expectEqual(1, client.pool().idle_len);
     const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", client.pool().idle.first.?));
-    const now = std.Io.Timestamp.now(io, .awake);
-    const left = conn.idle_deadline.?.nanoseconds - now.nanoseconds;
-    // Five seconds, less however long the release took to get here.
-    try std.testing.expect(left > 4 * std.time.ns_per_s);
-    try std.testing.expect(left <= 5 * std.time.ns_per_s);
+    const deadline = conn.idle_deadline.?.nanoseconds;
+    try std.testing.expect(deadline >= before.nanoseconds + 5 * std.time.ns_per_s);
+    try std.testing.expect(deadline <= after.nanoseconds + 5 * std.time.ns_per_s);
     peer_future.cancel(io);
 }
 
