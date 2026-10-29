@@ -283,15 +283,18 @@ const Fixture = struct {
         resetCounts();
         background = .init;
         self.rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+        errdefer self.rt.deinit();
         self.io = self.rt.io();
         self.listeners = .{.{ .address = loopback }};
         if (comptime have_tls) if (secure) {
             self.pem = try tls_root.selfSigned(gpa, .{});
             self.listeners[0].tls = .{ .pem = .{ .cert = self.pem.?.cert, .key = self.pem.?.key }, .alpn_protocols = &.{"http/1.1"} };
         };
+        errdefer if (comptime have_tls) if (self.pem) |*p| p.deinit(gpa);
         var cfg = config;
         cfg.listeners = &self.listeners;
         self.server = Server.init(gpa, self.io, cfg, {});
+        errdefer self.server.deinit();
         self.server.router.get("/ws", websocket.callbacks(void, Echo, .{}));
         self.server.router.get("/quiet", websocket.callbacks(void, Echo, .{ .close_on_drain = false }));
         self.server.router.get("/loop", websocket.route(void, loopEcho, .{}));
@@ -303,6 +306,7 @@ const Fixture = struct {
                 try s.run();
             }
         }.run, .{&self.server});
+        errdefer self.future.cancel(self.io) catch {};
         try self.server.waitReady(self.io);
     }
 
@@ -465,9 +469,12 @@ test "WebSocket callbacks: with parking off, the socket waits on its task" {
     for (0..3) |_| {
         try c.send(0x1, "again");
         try c.expectText("again");
-        try f.io.sleep(.fromMilliseconds(20), .awake);
     }
-    try std.testing.expectEqual(0, f.server.parkedConnections());
+    try wait.expectStays(f.io, "no socket parks with parking off", &f.server, struct {
+        fn parkedIsZero(s: *const Server) bool {
+            return s.parkedConnections() == 0;
+        }
+    }.parkedIsZero, wait.short_window);
 }
 
 test "WebSocket callbacks: another task sends to a parked socket" {
@@ -542,6 +549,7 @@ test "WebSocket callbacks: the drain closes parked sockets with 1001" {
             fx.stopServer();
         }
     }.run, .{&f});
+    defer stopper.cancel(f.io);
     // Every socket hears 1001; the drain waits for their answers.
     for (&clients) |*c| try c.expectClose(1001);
     try std.testing.expect(f.server.draining.isSet());
@@ -586,9 +594,17 @@ test "WebSocket callbacks: a callback socket closes at its deadline while parked
     try c.open(f.io, f.server.address.ip, false, "/brief");
     defer c.close(f.io);
     try c.expectText("hello");
-    try f.waitParked(1);
-    try std.testing.expect(c.hungUp());
+    // The 400 ms route deadline passes on purpose (the socket parks after
+    // 30 ms idle); the close callback runs once the server closed it.
     try f.waitClosed(1);
+    try std.testing.expect(c.hungUp());
+    // It was parked when its deadline closed it: the shelf's sweep, not
+    // the socket's own task, ended it.
+    if (f.server.parksIdle()) {
+        var expired: u32 = 0;
+        for (f.server.shelves) |*shelf| expired += shelf.test_deadline_expired.load(.monotonic);
+        try std.testing.expectEqual(@as(u32, 1), expired);
+    }
 }
 
 /// The `i`th small message of a burst: 40 bytes, its number first.

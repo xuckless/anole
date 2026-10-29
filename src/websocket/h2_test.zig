@@ -82,6 +82,11 @@ const Client = struct {
     in_len: usize = 0,
     /// DATA frames received.
     data_frames: usize = 0,
+    /// Drop what arrives instead of keeping it in `incoming` (a test that
+    /// only waits for the stream to end).
+    discard: bool = false,
+    /// The server ended its side of the stream (END_STREAM).
+    remote_ended: bool = false,
     /// The `origin` header to send, if any.
     origin: ?[]const u8 = null,
     /// The `sec-websocket-protocol` header to send, if any, and what the
@@ -103,6 +108,7 @@ const Client = struct {
         c.nghttp2_session_callbacks_set_on_header_callback(cbs, onHeader);
         c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, onData);
         c.nghttp2_session_callbacks_set_on_stream_close_callback(cbs, onClose);
+        c.nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, onFrame);
         if (c.nghttp2_session_client_new(&self.session, cbs, self) != 0) return error.Http2Init;
         if (c.nghttp2_submit_settings(self.session, c.NGHTTP2_FLAG_NONE, null, 0) != 0) return error.Http2Init;
     }
@@ -244,9 +250,16 @@ const Client = struct {
 
     fn onData(_: ?*c.nghttp2_session, _: u8, _: i32, data: [*c]const u8, len: usize, user: ?*anyopaque) callconv(.c) c_int {
         const self: *Client = @ptrCast(@alignCast(user.?));
+        if (self.discard) return 0;
         @memcpy(self.incoming[self.in_len..][0..len], data[0..len]);
         self.in_len += len;
         self.data_frames += 1;
+        return 0;
+    }
+
+    fn onFrame(_: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user: ?*anyopaque) callconv(.c) c_int {
+        const self: *Client = @ptrCast(@alignCast(user.?));
+        if (frame.*.hd.stream_id == self.stream_id and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) self.remote_ended = true;
         return 0;
     }
 
@@ -275,7 +288,7 @@ const Client = struct {
     }
 };
 
-test "WebSocket over HTTP/2 (RFC 8441): echo, ping, close" {
+test "WebSocket over HTTP/2 (RFC 8441): echo, ping, close; the metrics record the socket as a 101" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
@@ -491,6 +504,7 @@ test "WebSocket over HTTP/2: the drain closes an open socket with 1001 and does 
             try std.testing.expectError(error.Canceled, f.cancel(io_));
         }
     }.run, .{ &server_future, io });
+    defer drain.cancel(io) catch {};
     const closing = try client.nextFrame(&op, &buf);
     try std.testing.expectEqual(wsc.Opcode.close, op);
     try std.testing.expectEqual(@as(u16, 1001), std.mem.readInt(u16, closing[0..2], .big));
@@ -558,6 +572,7 @@ test "WebSocket over HTTP/2: route() and next(): echo, then the drain's 1001 ans
             try std.testing.expectError(error.Canceled, f.cancel(io_));
         }
     }.run, .{ &server_future, io });
+    defer drain.cancel(io) catch {};
     const closing = try client.nextFrame(&op, &buf);
     try std.testing.expectEqual(wsc.Opcode.close, op);
     try std.testing.expectEqual(@as(u16, 1001), std.mem.readInt(u16, closing[0..2], .big));
@@ -793,6 +808,14 @@ test "WebSocket over HTTP/2: a room member that stops reading is closed, its str
             return false;
         }
     }.left);
+    // Its stream ends: what was queued drains, then the server ends or
+    // resets the stream.
+    client.discard = true;
+    try client.pumpUntil(struct {
+        fn ended(cl: *Client) bool {
+            return cl.closed or cl.remote_ended;
+        }
+    }.ended);
 }
 
 fn subprotocolSocket(req: *dusty.Request, res: *dusty.Response) !void {

@@ -142,7 +142,7 @@ test "Rooms: a stalled member holds up neither other rooms nor joins, and leaves
         stalled.release.set(io);
         _ = stuck.cancel(io);
     }
-    try stalled.entered.wait(io);
+    try wait.waitEvent(io, "the broadcast's send reached the stalled member", &stalled.entered);
 
     // Another room, and joins and counts, go on meanwhile.
     try std.testing.expectEqual(@as(usize, 1), r.broadcast("fast", .text, "hi", null));
@@ -243,10 +243,16 @@ test "Rooms: a broadcast does not wait for a member that stopped reading, and a 
     // messages are skipped for it, and once its send has been stuck for
     // `close_after_ms` it is closed and gets nothing more.
     const msg: [200]u8 = @splat('m');
+    // The frames the other member's writer sees: "one" (2 + 3 bytes), then
+    // each of these (2 + 2 + 200 bytes).
+    const one_frame = 2 + 3;
+    const msg_frame = 4 + msg.len;
     var reached_all: usize = 0;
-    for (0..20) |_| {
+    for (1..21) |k| {
         reached_all += r.broadcast("room", .binary, &msg, null);
-        try io.sleep(.fromMilliseconds(1), .awake);
+        // The other member's sender drains each before the next, so its
+        // own queue never fills.
+        try wait.waitAtLeast(io, "the other member got the broadcast", &other.written, one_frame + k * msg_frame);
     }
     try std.testing.expect(reached_all < 40);
     // Time passing on purpose: past `close_after_ms` (a sleep never ends
@@ -359,12 +365,14 @@ const loopback: []const dusty.Listener = &.{.{ .address = .{ .ip = .{ .ip4 = .lo
 
 fn startServer(gpa: std.mem.Allocator, io: std.Io, server: *dusty.Server(void)) !std.Io.Future(anyerror!void) {
     server.* = dusty.Server(void).init(gpa, io, .{ .listeners = loopback }, {});
+    errdefer server.deinit();
     server.router.get("/lobby", joinOnly);
-    const future = try io.concurrent(struct {
+    var future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) anyerror!void {
             try s.run();
         }
     }.run, .{server});
+    errdefer future.cancel(io) catch {};
     try server.waitReady(io);
     return future;
 }

@@ -74,6 +74,25 @@ const Hub = struct {
     }
 };
 
+/// Waits until the runtime's live task count stops falling: two reads one
+/// poll apart agree (what is left of a finished round trip has ended).
+/// A baseline taken while a task is still ending is only higher, which
+/// makes a "back to the baseline" check easier, never wrong.
+fn settledTasks(io: std.Io) !i64 {
+    const Settle = struct {
+        io: std.Io,
+        last: i64 = std.math.minInt(i64),
+        fn still(self: *@This()) bool {
+            const now = liveTasks(self.io);
+            defer self.last = now;
+            return now == self.last;
+        }
+    };
+    var st: Settle = .{ .io = io };
+    try wait.waitUntil(io, "the runtime's live tasks to stop falling", &st, Settle.still);
+    return st.last;
+}
+
 const TaskWatch = struct {
     io: std.Io,
     want: i64,
@@ -109,11 +128,9 @@ test "app.sse over HTTP/1.1: the connection parks with no task; events and a hea
                 defer acc.deinit(alloc);
                 try readToEnd(&r.interface, &acc);
                 s.close(io);
-                // Time for the round trip's task to end (a sensitivity
-                // sleep: a baseline taken early is higher, which only makes
-                // the check below easier, never fails it).
-                try io.sleep(.fromMilliseconds(20), .awake);
-                break :blk liveTasks(io);
+                // The round trip's connection is gone, and its task ended.
+                try wait.waitEqual(io, "the server released the round trip's connection", &a.server.active_connections, 0);
+                break :blk try settledTasks(io);
             };
 
             const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
@@ -165,6 +182,7 @@ test "app.sse over HTTP/1.1: the connection parks with no task; events and a hea
         }
     };
     var checking = try app.io().concurrent(Check.run, .{ &app, live });
+    defer checking.cancel(app.io()) catch {};
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
@@ -210,6 +228,7 @@ test "app.sse over HTTP/1.1: the drain gives a parked subscriber a retry, then e
         }
     };
     var checking = try app.io().concurrent(Check.run, .{ &app, live });
+    defer checking.cancel(app.io()) catch {};
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
@@ -278,6 +297,7 @@ test "app.sse over h2c: events arrive as DATA on the parked stream; a reset leav
         }
     };
     var checking = try app.io().concurrent(Check.run, .{ &app, live });
+    defer checking.cancel(app.io()) catch {};
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
@@ -317,6 +337,7 @@ test "app.sse over h2c: the drain ends the parked stream after a retry" {
         }
     };
     var checking = try app.io().concurrent(Check.run, .{ &app, live });
+    defer checking.cancel(app.io()) catch {};
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
@@ -364,14 +385,13 @@ test "app.sse over HTTP/3: the stream parks with no task; events arrive; a reset
                 .address = q,
                 .port = q.getPort(),
                 .tls = .{ .insecure_skip_verify = true },
-                .connect_timeout = .fromSeconds(3),
+                .connect_timeout = wait.deadline(),
             });
             defer conn.close();
             // A round trip first, so the endpoint's tasks have settled.
             try ping(conn);
-            // A sensitivity sleep, as over HTTP/1.1.
-            try io.sleep(.fromMilliseconds(20), .awake);
-            const baseline = liveTasks(io);
+            // The ping's request task ended.
+            const baseline = try settledTasks(io);
 
             const st = try conn.request(&hdrs("/live"), .{});
             var released = false;
@@ -421,6 +441,7 @@ test "app.sse over HTTP/3: the stream parks with no task; events arrive; a reset
         }
     };
     var checking = try app.io().concurrent(Check.run, .{ &app, live });
+    defer checking.cancel(app.io()) catch {};
     try app.listenTls("127.0.0.1:0", .dev_self_signed);
     try checking.await(app.io());
 }

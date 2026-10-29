@@ -381,9 +381,14 @@ test "sse: a heartbeat tick writes a comment only to subscribers idle for the in
     // moves the made-up clock (a sender still running would stamp it with
     // the tick's time).
     try h.waitSettled(0);
-    // Not yet: 5 s after the last write.
+    // Not yet: 5 s after the last write. A wrongly queued heartbeat is
+    // written later by a sender task, so the count must stay at one.
     _ = h.hub._tick(0, 1000 + 5_000);
-    try std.testing.expectEqual(@as(u32, 1), idle.writes_done.load(.acquire));
+    try wait.expectStays(io, "no heartbeat before the interval", idle, struct {
+        fn writesStillOne(f: *Fake) bool {
+            return f.writes_done.load(.acquire) == 1;
+        }
+    }.writesStillOne, wait.short_window);
     _ = h.hub._tick(0, 1000 + 10_000);
     try Harness.waitText(idle, ":\n\n");
 }
@@ -415,7 +420,7 @@ test "sse: on_full=drop: the full subscriber misses the event, the others get it
     const slow = try h.addHeld(&.{"t"});
     const fast = try h.add(&.{"t"}, null);
     _ = try h.hub.publish("t", .{ .data = "first" });
-    slow.held.wait(io) catch unreachable;
+    try wait.waitEvent(io, "the held subscriber's first write", &slow.held);
     // One at a time, each waited for on the fast one, so only the held one
     // fills up (the fast one has the same cap).
     try Harness.waitBytes(fast, "data: first\n\n".len);
@@ -623,9 +628,14 @@ test "sse: on_full=close with a stuck sender: the tick past close_after aborts t
     // Fill the queue: the subscriber is ending (slow) with its sender stuck.
     for (0..20) |_| _ = try c.hub.publish("t", .{ .data = "more" });
     try std.testing.expectEqual(@as(u64, 1), c.hub.stats().closed_slow);
-    // Before close_after: nothing happens.
+    // Before close_after: nothing happens. An abort would cancel the
+    // sender and report on_close later, so the count must stay at zero.
     _ = c.hub._tick(0, 1000 + 500);
-    try std.testing.expectEqual(@as(u32, 0), c.closed.load(.acquire));
+    try wait.expectStays(rio, "no abort before close_after", &c.closed, struct {
+        fn isZero(v: *std.atomic.Value(u32)) bool {
+            return v.load(.acquire) == 0;
+        }
+    }.isZero, wait.short_window);
     // Past it: the sender is canceled and the stream aborted.
     _ = c.hub._tick(0, 1000 + 1_500);
     try c.waitClosed();

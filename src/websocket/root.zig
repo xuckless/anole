@@ -1878,14 +1878,11 @@ test "WebSocket accept key matches RFC 6455 section 1.3" {
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &out);
 }
 
-test "isUpgrade and offeredSubprotocols: header lines, commas, spaces, HTTP/2 :protocol" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+/// A request with a version-13 handshake's headers, offering subprotocols
+/// over two header lines.
+fn testHandshake(a: std.mem.Allocator) !dusty.Request {
     var req: dusty.Request = .{ .arena = a, ._transport = undefined, ._parser = undefined };
     req.headers = try dusty.Headers.init(a, 16);
-    // Not a handshake yet.
-    try std.testing.expect(!isUpgrade(&req));
     req.method = .get;
     try req.headers.add("Upgrade", "WebSocket");
     try req.headers.add("Connection", "keep-alive, Upgrade");
@@ -1893,15 +1890,19 @@ test "isUpgrade and offeredSubprotocols: header lines, commas, spaces, HTTP/2 :p
     try req.headers.add("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
     try req.headers.add("Sec-WebSocket-Protocol", "b ,  a,,\tc");
     try req.headers.add("sec-websocket-protocol", "d");
+    return req;
+}
+
+test "websocket: isUpgrade accepts a version-13 GET, or an extended CONNECT with :protocol websocket, and nothing else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Not a handshake yet.
+    var bare: dusty.Request = .{ .arena = a, ._transport = undefined, ._parser = undefined };
+    bare.headers = try dusty.Headers.init(a, 16);
+    try std.testing.expect(!isUpgrade(&bare));
+    var req = try testHandshake(a);
     try std.testing.expect(isUpgrade(&req));
-    var it = offeredSubprotocols(&req);
-    const want = [_][]const u8{ "b", "a", "c", "d" };
-    for (want) |w| try std.testing.expectEqualStrings(w, it.next().?);
-    try std.testing.expect(it.next() == null);
-    try std.testing.expectEqualStrings("a", selectSubprotocol(&req, &.{ "x", "a", "b" }).?);
-    try std.testing.expectEqualStrings("d", selectSubprotocol(&req, &.{ "d", "a" }).?);
-    try std.testing.expect(selectSubprotocol(&req, &.{"x"}) == null);
-    try std.testing.expect(selectSubprotocol(&req, &.{}) == null);
     // Wrong version.
     try req.headers.put("Sec-WebSocket-Version", "8");
     try std.testing.expect(!isUpgrade(&req));
@@ -1913,6 +1914,23 @@ test "isUpgrade and offeredSubprotocols: header lines, commas, spaces, HTTP/2 :p
         req.protocol = "connect-udp";
         try std.testing.expect(!isUpgrade(&req));
     }
+}
+
+test "websocket: offered subprotocols are read across header lines, commas and spaces, and selected by the server's order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var req = try testHandshake(arena.allocator());
+    var it = offeredSubprotocols(&req);
+    const want = [_][]const u8{ "b", "a", "c", "d" };
+    for (want) |w| try std.testing.expectEqualStrings(w, it.next().?);
+    try std.testing.expect(it.next() == null);
+    try std.testing.expectEqualStrings("a", selectSubprotocol(&req, &.{ "x", "a", "b" }).?);
+    try std.testing.expectEqualStrings("d", selectSubprotocol(&req, &.{ "d", "a" }).?);
+    try std.testing.expect(selectSubprotocol(&req, &.{"x"}) == null);
+    try std.testing.expect(selectSubprotocol(&req, &.{}) == null);
+}
+
+test "websocket: extra handshake headers may not set Sec-WebSocket-Accept or Content-Length; subprotocol names are tokens" {
     try std.testing.expect(isToken("graphql-transport-ws"));
     try std.testing.expect(!isToken("a b"));
     try std.testing.expect(!isToken(""));
