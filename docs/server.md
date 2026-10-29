@@ -500,7 +500,11 @@ SIGUSR2, or `stop()`, starts a graceful drain:
 2. HTTP/1.1 connections finish the request in flight.
 3. Every HTTP/2 connection gets a two-phase GOAWAY: a notice with a PING,
    then the final GOAWAY on the PING's answer or after one second. Open
-   streams finish.
+   streams finish. Then the server ends its side and reads what the peer
+   still sends until the peer closes its side, for up to one second (a
+   lingering close): closing with input unread would make the kernel send
+   a reset, and a peer may then lose the final GOAWAY or the end of a
+   response it has not read yet.
 4. HTTP/3 connections get a GOAWAY and finish their open requests (except
    when a SIGUSR2 restart hands the socket over: then they close at once,
    see [below](#zero-downtime-restart-and-socket-activation)).

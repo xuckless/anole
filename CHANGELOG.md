@@ -122,6 +122,15 @@ breaking changes are listed anyway.
   starting together take turns; it has no time limit, and each table lock it
   waits for is bounded by a 10 s `lock_timeout`, past which the start fails
   with a log line saying what to do (#109).
+- HTTP/2: a graceful drain no longer resets connections whose peer sent
+  something after the final GOAWAY (a PING, a WINDOW_UPDATE). The drain let
+  go of a connection as soon as its final GOAWAY was written, and its cancel
+  could then skip the lingering close, so the socket was closed with that
+  input unread and the kernel sent a reset instead of a FIN; a peer could
+  lose the final GOAWAY or the end of a response it had not read yet. The
+  drain now waits for each connection's lingering close (until the peer
+  closes its side, one second at most, within `timeouts.shutdown`), as Go
+  and Envoy do (#135).
 
 ### Changed
 

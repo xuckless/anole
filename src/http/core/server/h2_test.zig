@@ -287,7 +287,8 @@ const TestClient = struct {
     }
 
     /// Keeps the connection going (answering PINGs and SETTINGS) until the
-    /// server closes it.
+    /// server closes it, then shuts the socket as a real client does, so
+    /// the server's lingering close ends at once.
     fn runUntilClosed(self: *TestClient) !void {
         while (true) {
             while (true) {
@@ -299,7 +300,10 @@ const TestClient = struct {
             }
             try self.w.flush();
             const bytes = self.r.peekGreedy(1) catch |err| switch (err) {
-                error.EndOfStream => return,
+                error.EndOfStream => {
+                    self.stream.shutdown(self.io, .both) catch {};
+                    return;
+                },
                 else => |e| return e,
             };
             const rv = c.nghttp2_session_mem_recv2(self.session, bytes.ptr, bytes.len);

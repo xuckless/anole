@@ -240,12 +240,11 @@ pub fn Engine(comptime Ctx: type) type {
             /// submitted yet.
             drain_notice: bool = false,
             /// The connection holds one count in the server's in-flight
-            /// requests from the drain's notice until its final GOAWAY is
-            /// written, so the drain's cancel cannot cut that off.
+            /// requests from the drain's notice until its teardown, after
+            /// the final GOAWAY and the lingering close, so the drain's
+            /// cancel cuts off neither: a close with the peer's last frames
+            /// unread would be a reset (#135).
             drain_hold: bool = false,
-            /// The final GOAWAY was handed to the writer; the hold goes
-            /// once the writer has flushed it.
-            drain_flush: bool = false,
             /// Streams that are done but whose last frames the writer may
             /// not have flushed yet. Each keeps its count in the server's
             /// in-flight requests until the writer has flushed everything it
@@ -299,17 +298,19 @@ pub fn Engine(comptime Ctx: type) type {
 
             /// Drain, phase two: GOAWAY with the last stream taken. Once
             /// the open streams finish the session is done and the writer
-            /// closes the connection. Under the mutex.
+            /// closes the connection. The drain hold stays until the
+            /// connection's teardown. Under the mutex.
             fn finishDrainLocked(conn: *Conn) void {
                 if (!conn.drain_notice) return;
                 conn.drain_notice = false;
-                if (!conn.goaway_sent and !conn.closing and
-                    c.nghttp2_submit_goaway(conn.session, c.NGHTTP2_FLAG_NONE, c.nghttp2_session_get_last_proc_stream_id(conn.session), c.NGHTTP2_NO_ERROR, null, 0) == 0)
-                {
+                // Ending already: the teardown gives the hold back.
+                if (conn.goaway_sent or conn.closing) return;
+                if (c.nghttp2_submit_goaway(conn.session, c.NGHTTP2_FLAG_NONE, c.nghttp2_session_get_last_proc_stream_id(conn.session), c.NGHTTP2_NO_ERROR, null, 0) == 0) {
                     conn.goaway_sent = true;
                     conn.kickWriter();
-                    return; // the hold goes when the writer has flushed it
+                    return;
                 }
+                // No final GOAWAY, so nothing to close after it.
                 conn.releaseDrainHold();
             }
 
@@ -317,7 +318,6 @@ pub fn Engine(comptime Ctx: type) type {
             fn releaseDrainHold(conn: *Conn) void {
                 if (!conn.drain_hold) return;
                 conn.drain_hold = false;
-                conn.drain_flush = false;
                 conn.server.finishRequest();
             }
 
@@ -754,7 +754,8 @@ pub fn Engine(comptime Ctx: type) type {
                 server.h2_conns.remove(&conn);
                 conn.lock();
                 defer conn.unlock();
-                // A drain still holding the server: give back its count.
+                // The drain's hold, kept until here so the drain waits
+                // for the lingering close too: give back its count.
                 conn.drain_notice = false;
                 conn.releaseDrainHold();
                 conn.writerGone();
@@ -910,11 +911,11 @@ pub fn Engine(comptime Ctx: type) type {
         /// task after. Whether the peer may still be there to read from.
         ///
         /// A cancel that arrives here is passed on, never dropped. The drain
-        /// cancels the connection as soon as its final GOAWAY is flushed,
-        /// which can land just before the shutdown below; a cancel taken
-        /// there and dropped left the send side open and the writer's wait
-        /// in `awaitReader` no longer cancelable, so the peer saw the end
-        /// only `linger_timeout` later.
+        /// no longer cancels a connection it is waiting for (its hold lasts
+        /// until the teardown), but the shutdown's hard deadline does; a
+        /// cancel taken there and dropped would leave the send side open
+        /// and the writer's wait in `awaitReader` no longer cancelable, so
+        /// the peer would see the end only `linger_timeout` later.
         fn shutSend(conn: *Conn) std.Io.Cancelable!bool {
             {
                 conn.lock();
@@ -1090,12 +1091,6 @@ pub fn Engine(comptime Ctx: type) type {
                     writer.flush() catch return writeFailed(conn, &write_timer);
                     write_timer.clear(conn.io);
                     conn.settleFinished(settled);
-                    // The drain's final GOAWAY is on the wire now.
-                    if (@atomicLoad(bool, &conn.drain_flush, .acquire)) {
-                        conn.lock();
-                        defer conn.unlock();
-                        if (conn.drain_flush) conn.releaseDrainHold();
-                    }
                     continue;
                 }
                 // Nothing taken this round: whatever came before is flushed.
@@ -2522,13 +2517,6 @@ pub fn Engine(comptime Ctx: type) type {
         fn onFrameSend(session: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
             const conn = connFrom(user_data);
             const hd = frame.*.hd;
-            // The drain's final GOAWAY (not its notice) left the session.
-            if (hd.type == c.NGHTTP2_GOAWAY and conn.drain_hold and !conn.drain_notice and
-                frame.*.goaway.last_stream_id != std.math.maxInt(i32))
-            {
-                @atomicStore(bool, &conn.drain_flush, true, .release);
-                return 0;
-            }
             if (hd.flags & c.NGHTTP2_FLAG_END_STREAM == 0) return 0;
             if (hd.type != c.NGHTTP2_HEADERS and hd.type != c.NGHTTP2_DATA) return 0;
             const stream = streamFor(session, hd.stream_id) orelse return 0;
