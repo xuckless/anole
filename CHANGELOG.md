@@ -188,6 +188,17 @@ breaking changes are listed anyway.
 - C ABI config: a watch on a SQLite database is refused with "is SQLite,
   which has no change feed"; it said the database was not PostgreSQL (or
   Redis, MongoDB), which hid the reason.
+- Jobs: a job still running after the server stopped could use a connector
+  the app had already freed (`app.webhooks`, or any connector made after
+  `app.jobs`), crashing the process at shutdown; a webhook delivery in
+  flight was enough. The app now ends every job run before it frees any
+  connector. Outside an app, `jobs.Client.stopWork` does the same before
+  you free what the handlers use.
+- Jobs: with the PostgreSQL store, a cancel during the leader's
+  advisory-lock query was taken for "not the leader", so a canceled
+  maintenance round carried on until its next poll.
+- Jobs: the metrics no longer allocate under a spin lock when they see a
+  new job kind.
 
 ### Changed
 

@@ -97,6 +97,11 @@ Kubernetes (30 s by default), the stop timeout of `docker stop` (10 s by
 default, `--time`). A process killed earlier leaves its running jobs held
 until their lease lapses; they then run again.
 
+The app frees nothing a job handler may use until every run has ended: at
+teardown the queue's work stops first (the drain under way included), then
+the connectors are closed, last made first. Outside an app, call the
+client's `stopWork` before you free what your handlers use.
+
 ## Admin
 
 `jobs.get`, `list`, `counts`, `retry`, `cancel`, `delete`, `cronList` and
