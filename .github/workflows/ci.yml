@@ -754,7 +754,7 @@ jobs:
   # ---- p3/s3 ----
   s3:
     # K2: catches the S3 client against MinIO, plain and TLS (the XML fuzz target runs in the fuzz job).
-    name: S3 (the client against MinIO, plain and TLS; fuzz target; the C ABI's storage tests)
+    name: S3 (the client against MinIO, plain and TLS; the C ABI's storage tests)
     runs-on: ubuntu-latest
     timeout-minutes: 81
     steps:
