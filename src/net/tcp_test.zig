@@ -1034,3 +1034,256 @@ test "net tcp: [stress] sends from eight threads racing close, end and reset" {
     try std.testing.expectEqual(@as(u32, 0), Storm.bad.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), Storm.mismatched.load(.acquire));
 }
+
+// -- Review regressions (s15/net): each forces its interleaving through a
+// test hook in tcp.zig (`tcp.test_hold`) at the point the scheduler or a
+// thread can stop, instead of hoping for it.
+
+const tcp = @import("tcp.zig");
+
+fn waitConn(io: std.Io, comptime what: []const u8, v: *std.atomic.Value(?*net.Conn)) !*net.Conn {
+    try wait.waitUntil(io, what, v, struct {
+        fn set(x: *std.atomic.Value(?*net.Conn)) bool {
+            return x.load(.acquire) != null;
+        }
+    }.set);
+    return v.load(.acquire).?;
+}
+
+/// Reads at least one byte (the stream must not end).
+fn readSome(s: *ClientStream, buf: []u8) !usize {
+    const n = try s.reader().readSliceShort(buf);
+    if (n == 0) return error.EndOfStream;
+    return n;
+}
+
+/// The driver writes a send over the high-water mark, and WRITABLE's task
+/// starts: zio may suspend the driver in that spawn (spawn backpressure).
+/// The hold stops it there while WRITABLE resets the connection and the
+/// connection is released; the driver then goes on.
+const SpawnYield = struct {
+    var io: std.Io = undefined;
+    var hold: tcp.TestHold = .{ .point = .spawn_writable };
+    var closed: std.atomic.Value(u32) = .init(0);
+    const big: [8 * 1024]u8 = @splat('w');
+
+    pub fn data(conn: *net.Conn, _: []const u8) !void {
+        tcp.test_hold.store(&hold, .release);
+        _ = try conn.send(&big);
+    }
+    pub fn writable(conn: *net.Conn) !void {
+        conn.reset();
+    }
+    pub fn close(_: *net.Conn, _: net.CloseReason) void {
+        _ = closed.fetchAdd(1, .release);
+        hold.let(io);
+    }
+};
+
+test "net tcp: a connection released while the driver is suspended in a spawn is not touched after" {
+    SpawnYield.hold = .{ .point = .spawn_writable };
+    SpawnYield.closed.store(0, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    defer tcp.test_hold.store(null, .release);
+    SpawnYield.io = app.io();
+    try app.tcp("127.0.0.1:0", SpawnYield, .{ .write_high_water = 4096 });
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            try s.writer().writeAll("x");
+            try s.writer().flush();
+            try waitFor(a.io(), &SpawnYield.closed, 1);
+            // The driver was held in the spawn (the interleaving happened),
+            // and the server still serves: a new connection opens and ends.
+            try std.testing.expect(SpawnYield.hold.held.load(.acquire));
+            const s2 = try connect(a, portOf(a));
+            defer s2.close();
+            try s2.writer().writeAll("y");
+            try s2.writer().flush();
+            try waitFor(a.io(), &SpawnYield.closed, 2);
+        }
+    }.run);
+}
+
+/// Echo, for the driver's start: two connections on one executor while
+/// the first is stopped in `driverFor` where zio may suspend it.
+const TwoStarts = struct {
+    var io: std.Io = undefined;
+    var hold: tcp.TestHold = .{ .point = .driver_start };
+    var opened: std.atomic.Value(u32) = .init(0);
+
+    pub fn open(_: *net.Conn) !void {
+        _ = opened.fetchAdd(1, .release);
+    }
+    pub fn data(conn: *net.Conn, bytes: []const u8) !void {
+        _ = try conn.send(bytes);
+    }
+};
+
+test "net tcp: a second connection while the first starts the driver starts no second driver" {
+    TwoStarts.hold = .{ .point = .driver_start };
+    TwoStarts.opened.store(0, .monotonic);
+    tcp.test_driver_runs.store(0, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    defer tcp.test_hold.store(null, .release);
+    TwoStarts.io = app.io();
+    try app.tcp("127.0.0.1:0", TwoStarts, .{});
+    tcp.test_hold.store(&TwoStarts.hold, .release);
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s1 = try connect(a, portOf(a));
+            defer s1.close();
+            try wait.waitFlag(a.io(), "the first connection is held starting the driver", &TwoStarts.hold.held);
+            const s2 = try connect(a, portOf(a));
+            defer s2.close();
+            try s2.writer().writeAll("two");
+            try s2.writer().flush();
+            try expectRead(s2, "two");
+            TwoStarts.hold.let(a.io());
+            try s1.writer().writeAll("one");
+            try s1.writer().flush();
+            try expectRead(s1, "one");
+            try std.testing.expectEqual(@as(u32, 2), TwoStarts.opened.load(.acquire));
+            try wait.expectStays(a.io(), "one driver task for the listener's executor", {}, struct {
+                fn one(_: void) bool {
+                    return tcp.test_driver_runs.load(.acquire) == 1;
+                }
+            }.one, wait.short_window);
+        }
+    }.run);
+}
+
+/// A send from a thread finds the queue full; before it asks for WRITABLE
+/// (held there) the queue drains completely. It must not be left waiting
+/// for a WRITABLE nothing will send. The high-water mark is `write_max`,
+/// so no send before it asks for WRITABLE: the drain sends none, and any
+/// WRITABLE is the held send's.
+const FullRace = struct {
+    var conn: std.atomic.Value(?*net.Conn) = .init(null);
+    var writables: std.atomic.Value(u32) = .init(0);
+    var hold: tcp.TestHold = .{ .point = .queue_full };
+    // 0: not returned yet; 1: taken; 2: QueueFull; 3: another error.
+    var result: std.atomic.Value(u8) = .init(0);
+    const piece: [16 * 1024]u8 = @splat('q');
+
+    pub fn open(c: *net.Conn) !void {
+        conn.store(c, .release);
+    }
+    pub fn data(_: *net.Conn, _: []const u8) !void {}
+    pub fn writable(_: *net.Conn) !void {
+        _ = writables.fetchAdd(1, .release);
+    }
+    pub fn close(_: *net.Conn, _: net.CloseReason) void {
+        conn.store(null, .release);
+    }
+
+    fn sender(c: *net.Conn) void {
+        if (c.send(&piece)) |_| result.store(1, .release) else |err| result.store(if (err == error.QueueFull) 2 else 3, .release);
+    }
+
+    fn heldOrDone(_: void) bool {
+        return hold.held.load(.acquire) or result.load(.acquire) != 0;
+    }
+};
+
+test "net tcp: a send refused as full while the queue drains gets WRITABLE or is taken" {
+    FullRace.conn.store(null, .monotonic);
+    FullRace.writables.store(0, .monotonic);
+    FullRace.hold = .{ .point = .queue_full };
+    FullRace.result.store(0, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    defer tcp.test_hold.store(null, .release);
+    try app.tcp("127.0.0.1:0", FullRace, .{ .write_high_water = 64 * 1024, .write_max = 64 * 1024 });
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            const c = try waitConn(a.io(), "the connection opened", &FullRace.conn);
+            // The client reads nothing: sends from a thread fill the
+            // kernel's buffers, then the queue, until one is refused and
+            // held where it asks for WRITABLE.
+            tcp.test_hold.store(&FullRace.hold, .release);
+            var taken: usize = 0;
+            var th: ?std.Thread = null;
+            defer if (th) |t| {
+                FullRace.hold.let(a.io());
+                t.join();
+            };
+            while (true) {
+                FullRace.result.store(0, .release);
+                th = try std.Thread.spawn(.{}, FullRace.sender, .{c});
+                try wait.waitUntil(a.io(), "the thread's send returned or is held at the full queue", {}, FullRace.heldOrDone);
+                if (FullRace.hold.held.load(.acquire)) break;
+                th.?.join();
+                th = null;
+                try std.testing.expectEqual(@as(u8, 1), FullRace.result.load(.acquire));
+                taken += FullRace.piece.len;
+            }
+            // Everything queued is read: the queue drains to empty.
+            var buf: [16 * 1024]u8 = undefined;
+            var got: usize = 0;
+            while (got < taken) got += try readSome(s, buf[0..@min(buf.len, taken - got)]);
+            try wait.waitUntil(a.io(), "the queue is empty", c, struct {
+                fn empty(conn: *net.Conn) bool {
+                    return conn.queued() == 0;
+                }
+            }.empty);
+            try std.testing.expectEqual(@as(u32, 0), FullRace.writables.load(.acquire));
+            FullRace.hold.let(a.io());
+            th.?.join();
+            th = null;
+            switch (FullRace.result.load(.acquire)) {
+                // Taken after all: its bytes arrive.
+                1 => {
+                    var n: usize = 0;
+                    while (n < FullRace.piece.len) n += try readSome(s, buf[0 .. FullRace.piece.len - n]);
+                },
+                // Refused: a WRITABLE follows.
+                2 => try wait.waitAtLeast(a.io(), "WRITABLE after the refused send", &FullRace.writables, 1),
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }.run);
+}
+
+/// A paused connection whose task waits for `resumeReading` is reset.
+const PausedReset = struct {
+    var conn: std.atomic.Value(?*net.Conn) = .init(null);
+    var closed: std.atomic.Value(u32) = .init(0);
+
+    pub fn data(c: *net.Conn, _: []const u8) !void {
+        c.pauseReading();
+        conn.store(c, .release);
+    }
+    pub fn close(_: *net.Conn, _: net.CloseReason) void {
+        _ = closed.fetchAdd(1, .release);
+    }
+};
+
+test "net tcp: reset of a paused connection ends it" {
+    PausedReset.conn.store(null, .monotonic);
+    PausedReset.closed.store(0, .monotonic);
+    tcp.test_paused_waits.store(0, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", PausedReset, .{});
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            try s.writer().writeAll("a");
+            try s.writer().flush();
+            const c = try waitConn(a.io(), "the connection paused", &PausedReset.conn);
+            // More input: the connection's task stops to wait for a resume.
+            try s.writer().writeAll("b");
+            try s.writer().flush();
+            try wait.waitAtLeast(a.io(), "the task waits for a resume", &tcp.test_paused_waits, 1);
+            c.reset();
+            try waitFor(a.io(), &PausedReset.closed, 1);
+        }
+    }.run);
+}

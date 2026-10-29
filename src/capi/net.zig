@@ -30,6 +30,9 @@ const Exec = engine.Exec;
 const Handle = engine.Handle;
 const AnswerError = engine.AnswerError;
 const gpa = engine.gpa;
+/// The writes' chunks come from it: in Debug and test builds an allocation
+/// or a free under a slot's spin lock panics (L5); elsewhere it is `gpa`.
+var chunk_checked: safety.SpinCheckedAllocator = .init(engine.gpa);
 
 const chunk_len = 256;
 const max_chunks = 4096;
@@ -595,9 +598,9 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
     var chunk: ?*net.OutChunk = null;
     errdefer if (chunk) |c| c.destroy();
     if (sent != null and !copy) {
-        chunk = try net.OutChunk.borrowed(gpa, data, @intFromPtr(sent.?.ptr));
+        chunk = try net.OutChunk.borrowed(chunk_checked.allocator(), data, @intFromPtr(sent.?.ptr));
     } else if (frame or data.len > 0) {
-        const c = try net.OutChunk.create(gpa, data.len);
+        const c = try net.OutChunk.create(chunk_checked.allocator(), data.len);
         @memcpy(c.payload(), data);
         chunk = c;
     }

@@ -401,3 +401,87 @@ test "net udp: [stress] sends from eight threads racing the stop" {
         try std.testing.expectEqual(StopStorm.full.load(.acquire), st.datagrams_dropped);
     }
 }
+
+/// A send from a thread finds the queue full (another send's bytes are
+/// reserved there); before it asks for WRITABLE (held) that other send goes
+/// out and the queue drains. It must not be left waiting for a WRITABLE
+/// nothing will send. Through a table of its own: WRITABLE is the C ABI's
+/// callback.
+const FullRace = struct {
+    var writables: std.atomic.Value(u32) = .init(0);
+    fn datagram(_: ?*anyopaque, _: *net.Datagram) anyerror!void {}
+    fn writable(_: ?*anyopaque, _: *net.UdpSocket) void {
+        _ = writables.fetchAdd(1, .release);
+    }
+    const table: net.UdpTable = .{ .datagram = datagram, .writable = writable };
+    const cap = 4096;
+
+    // 0: not returned yet; 1: taken; 2: QueueFull; 3: another error.
+    fn send(s: *net.UdpSocket, to: std.Io.net.IpAddress, len: usize, out: *std.atomic.Value(u8)) void {
+        const bytes: [cap]u8 = @splat('u');
+        if (s.send(to, null, bytes[0..len])) |_| out.store(1, .release) else |err| out.store(if (err == error.QueueFull) 2 else 3, .release);
+    }
+};
+
+test "net udp: a send refused as full while the queue drains gets WRITABLE or is taken" {
+    FullRace.writables.store(0, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1), .listeners = &.{.{
+        .address = "127.0.0.1",
+        .port = 0,
+        .udp = .{ .table = &FullRace.table, .options = .{ .send_queue = FullRace.cap }, .ctx_type = "void" },
+    }} });
+    defer app.deinit();
+    var first: udp_service.TestHold = .{};
+    var full: udp_service.TestHold = .{};
+    var r1: std.atomic.Value(u8) = .init(0);
+    var r2: std.atomic.Value(u8) = .init(0);
+    var threads: [2]?std.Thread = .{ null, null };
+    defer {
+        first.release.store(true, .release);
+        full.release.store(true, .release);
+        for (threads) |t| if (t) |th| th.join();
+        udp_service.test_send_hold.store(null, .release);
+        udp_service.test_full_hold.store(null, .release);
+    }
+    const Ctl = struct {
+        fn run(a: *App, h1: *udp_service.TestHold, h2: *udp_service.TestHold, out1: *std.atomic.Value(u8), out2: *std.atomic.Value(u8), th: *[2]?std.Thread) !void {
+            defer a.stop();
+            try a.waitReady();
+            const sock = &a.net_udp.items[0].sockets[0];
+            const peer = try client(a.io());
+            defer peer.close(a.io());
+            const to = peer.address;
+            // Half the queue, reserved and held before it is pushed.
+            udp_service.test_send_hold.store(h1, .release);
+            th[0] = try std.Thread.spawn(.{}, FullRace.send, .{ sock, to, FullRace.cap / 2, out1 });
+            try wait.waitFlag(a.io(), "the first send is held with its bytes reserved", &h1.held);
+            // More than the rest: full, held before it asks for WRITABLE.
+            udp_service.test_full_hold.store(h2, .release);
+            th[1] = try std.Thread.spawn(.{}, FullRace.send, .{ sock, to, FullRace.cap / 2 + 1000, out2 });
+            try wait.waitFlag(a.io(), "the second send is held at the full queue", &h2.held);
+            // The first goes out: the queue drains to empty.
+            h1.release.store(true, .release);
+            th[0].?.join();
+            th[0] = null;
+            try std.testing.expectEqual(@as(u8, 1), out1.load(.acquire));
+            try wait.waitUntil(a.io(), "the queue is empty", sock, struct {
+                fn empty(x: *net.UdpSocket) bool {
+                    return x.queue_bytes.load(.acquire) == 0;
+                }
+            }.empty);
+            const before = FullRace.writables.load(.acquire);
+            h2.release.store(true, .release);
+            th[1].?.join();
+            th[1] = null;
+            switch (out2.load(.acquire)) {
+                1 => {},
+                2 => try wait.waitAtLeast(a.io(), "WRITABLE after the refused send", &FullRace.writables, before + 1),
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    };
+    var ctl = try app.io().concurrent(Ctl.run, .{ &app, &first, &full, &r1, &r2, &threads });
+    defer ctl.cancel(app.io()) catch {};
+    try app.run();
+    try ctl.await(app.io());
+}

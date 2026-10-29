@@ -656,6 +656,7 @@ pub const TcpListener = struct {
         d.io = info.io;
         d.owner = .here(info.io);
         try placement.concurrent(info.group, info.io, .local, Driver.run, .{d});
+        testHold(info.io, .driver_start);
         d.started = true;
         return d;
     }
@@ -708,6 +709,7 @@ const Driver = struct {
     }
 
     fn run(d: *Driver) std.Io.Cancelable!void {
+        if (builtin.is_test) _ = test_driver_runs.fetchAdd(1, .monotonic);
         defer {
             // Waits out a kick inside the gate (libuv's `uv__async_spin`),
             // then refuses later ones. What is left is dropped: each
@@ -1266,10 +1268,11 @@ const TcpConn = struct {
 
     /// Runs `func(t)` on a task of the connection's group, on its executor.
     /// False when no task could be had, or the connection is released.
-    fn spawn(t: *TcpConn, comptime func: fn (*TcpConn) void) bool {
+    fn spawn(t: *TcpConn, comptime func: fn (*TcpConn) void, comptime point: ?TestPoint) bool {
         t.owner.check(t.io);
         if (t.isClosed()) return false;
         placement.concurrent(&t.group, t.io, .local, func, .{t}) catch return false;
+        if (point) |p| testHold(t.io, p);
         return true;
     }
 
@@ -1355,6 +1358,7 @@ const TcpConn = struct {
         var q = t.queued.load(.monotonic);
         while (true) {
             if (@as(u64, q) + n > o.write_max) {
+                testHold(t.io, .queue_full);
                 _ = t.flags.fetchOr(Flag.want_writable, .acq_rel);
                 _ = t.listener.stats.queue_full.fetchAdd(1, .monotonic);
                 if (t.listener.series) |m| m.queue_full.inc();
@@ -1517,7 +1521,7 @@ const TcpConn = struct {
         t.owner.check(t.io);
         if (t.has(Flag.drain_pending)) {
             const f = t.flags.fetchAnd(~Flag.drain_pending, .acq_rel);
-            if (f & Flag.drain_pending != 0) _ = t.spawn(drainTask);
+            if (f & Flag.drain_pending != 0) _ = t.spawn(drainTask, .spawn_drain);
         }
         if (comptime native_os == .windows) if (t.has(Flag.cancel_reader)) {
             _ = t.flags.fetchAnd(~Flag.cancel_reader, .acq_rel);
@@ -1534,7 +1538,7 @@ const TcpConn = struct {
     /// Passes the outbox to a flusher task.
     fn handOver(t: *TcpConn) void {
         t.sched.store(Sched.flusher, .seq_cst);
-        if (!t.spawn(flusher)) {
+        if (!t.spawn(flusher, null)) {
             t.failWrite(.server);
         }
     }
@@ -1654,7 +1658,7 @@ const TcpConn = struct {
             return;
         }
         if (t.writable_pending.swap(true, .acq_rel)) return;
-        if (!t.spawn(writableTask)) t.writable_pending.store(false, .release);
+        if (!t.spawn(writableTask, .spawn_writable)) t.writable_pending.store(false, .release);
     }
 
     fn writableTask(t: *TcpConn) void {
@@ -1976,6 +1980,7 @@ const TcpConn = struct {
 
     fn waitResumed(t: *TcpConn) !void {
         while (t.paused.load(.acquire) != 0 and t.over.load(.acquire) == 0) {
+            if (builtin.is_test) _ = test_paused_waits.fetchAdd(1, .release);
             try t.io.futexWait(u32, &t.paused.raw, 1);
         }
     }
@@ -2222,4 +2227,71 @@ fn socketName(fd: std.posix.fd_t) ?std.Io.net.IpAddress {
     if (std.c.getsockname(fd, &storage.any, &len) != 0) return null;
     if (storage.any.family != std.posix.AF.INET and storage.any.family != std.posix.AF.INET6) return null;
     return dusty.unmapIpv4(std.Io.Threaded.addressFromPosix(&storage));
+}
+
+// ---------------------------------------------------------------------------
+// Test hooks (test builds only)
+
+/// Where a test stops a task or a sender to force an interleaving the
+/// scheduler makes only sometimes (TESTING.md D5).
+pub const TestPoint = enum {
+    /// `spawn`, right after a WRITABLE task was started: where zio's spawn
+    /// backpressure (`registerTask` -> `yieldForRound`) can suspend the
+    /// spawner.
+    spawn_writable,
+    /// `spawn`, right after a drain task was started (the same yield).
+    spawn_drain,
+    /// `driverFor`, right after the driver's task was started (the same
+    /// yield).
+    driver_start,
+    /// `reserve`: a send found the queue full and has not yet asked for
+    /// WRITABLE.
+    queue_full,
+};
+
+/// One stop: armed through `test_hold`, taken once by the first caller at
+/// `point`, which sets `held` and waits until the test calls `let`. A task
+/// waits on the futex (other tasks of its executor run meanwhile); a
+/// thread yields. Past `limit` it panics: a hang check, not an ordering.
+pub const TestHold = struct {
+    point: TestPoint,
+    held: std.atomic.Value(bool) = .init(false),
+    released: std.atomic.Value(u32) = .init(0),
+    limit: Duration = .fromSeconds(30),
+
+    /// Lets the held caller go (any task or thread of the runtime of `io`).
+    pub fn let(h: *TestHold, io: std.Io) void {
+        h.released.store(1, .release);
+        io.futexWake(u32, &h.released.raw, 1);
+    }
+
+    fn stay(h: *TestHold, io: std.Io) void {
+        h.held.store(true, .release);
+        const start = std.Io.Clock.awake.now(io);
+        const on_task = placement.currentExecutor(io) != null;
+        while (h.released.load(.acquire) == 0) {
+            if (start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds > h.limit.nanoseconds) {
+                std.debug.panic("tcp test hold at {t}: never let go", .{h.point});
+            }
+            if (on_task) {
+                io.futexWaitTimeout(u32, &h.released.raw, 0, .{ .duration = .{ .raw = h.limit, .clock = .awake } }) catch {};
+            } else {
+                std.Thread.yield() catch {};
+            }
+        }
+    }
+};
+
+pub var test_hold: if (builtin.is_test) std.atomic.Value(?*TestHold) else void = if (builtin.is_test) .init(null) else {};
+/// Waits of a paused connection's task for `resumeReading` (test builds only).
+pub var test_paused_waits: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {};
+/// Driver tasks started (test builds only).
+pub var test_driver_runs: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {};
+
+fn testHold(io: std.Io, comptime point: TestPoint) void {
+    if (comptime !builtin.is_test) return;
+    const h = test_hold.load(.acquire) orelse return;
+    if (h.point != point) return;
+    if (test_hold.cmpxchgStrong(h, null, .acq_rel, .monotonic) != null) return;
+    h.stay(io);
 }

@@ -757,3 +757,19 @@ test "fuzz: net addr parse" {
     const fuzz = @import("../fuzz.zig");
     try fuzz.bytes(addrFuzz, &.{ "10.0.0.1:53", "[::1]:53", "[2001:db8::1]:443", "127.0.0.1", "[::ffff:1.2.3.4]:80", "1.2.3.4:99999", "[fe80::1%eth0]:1", "" });
 }
+
+test "capi net: writes refused after F_END free their chunks after the slot lock (L5)" {
+    if (comptime !features.net) return error.SkipZigTest;
+    const rig = try Rig.create(tcp_length);
+    defer rig.destroy();
+    const s = try rig.client();
+    defer s.close();
+    const h = try openFramed(rig, s);
+    _ = try engine.net.write(rig.e, h, "", abi.NET_F_END);
+    // Copied, borrowed and framed: each made its chunk before the lock and
+    // gets it back refused; the chunk allocator panics at a free under it.
+    for ([_]u32{ 0, abi.BODY_BORROW, abi.NET_F_FRAME }) |f| {
+        try std.testing.expectError(error.Invalid, engine.net.write(rig.e, h, "late", f));
+        try std.testing.expectEqualStrings("Ended", engine.net.invalid_token);
+    }
+}

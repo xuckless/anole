@@ -410,6 +410,7 @@ pub const UdpSocket = struct {
         var q = s.queue_bytes.load(.monotonic);
         while (true) {
             if (q + n > cap) {
+                testHold(&test_full_hold);
                 s.want_writable.store(true, .release);
                 b.destroy();
                 s.countDrop(.queue_full, items.len);
@@ -418,7 +419,7 @@ pub const UdpSocket = struct {
             q = s.queue_bytes.cmpxchgWeak(q, q + n, .acq_rel, .monotonic) orelse break;
         }
         if (q + n > cap / 2) s.want_writable.store(true, .release);
-        testSendHold();
+        testHold(&test_send_hold);
         // Sealed: the sender has ended (the stop).
         const was_empty = s.pending.push(&b.node) catch {
             _ = s.queue_bytes.fetchSub(n, .acq_rel);
@@ -715,18 +716,21 @@ pub const UdpSocket = struct {
     }
 };
 
-/// A test hook (test builds only): the next `send` stops at the point a
-/// stop can race it and holds there (`held` set) until the test sets
-/// `release`. Taken once.
+/// Test hooks (test builds only): the next `send` stops at a point and
+/// holds there (`held` set) until the test sets `release`. Taken once.
+/// `test_send_hold`: after the reservation, where a stop can race it;
+/// `test_full_hold`: a send found the queue full and has not yet asked for
+/// WRITABLE.
 pub const TestHold = struct {
     held: std.atomic.Value(bool) = .init(false),
     release: std.atomic.Value(bool) = .init(false),
 };
 pub var test_send_hold: if (builtin.is_test) std.atomic.Value(?*TestHold) else void = if (builtin.is_test) .init(null) else {};
+pub var test_full_hold: if (builtin.is_test) std.atomic.Value(?*TestHold) else void = if (builtin.is_test) .init(null) else {};
 
-fn testSendHold() void {
+fn testHold(which: anytype) void {
     if (comptime !builtin.is_test) return;
-    const h = test_send_hold.swap(null, .acq_rel) orelse return;
+    const h = which.swap(null, .acq_rel) orelse return;
     h.held.store(true, .release);
     while (!h.release.load(.acquire)) std.Thread.yield() catch {};
 }
