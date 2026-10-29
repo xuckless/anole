@@ -17,6 +17,7 @@
 //! In: `Verify`, see verify.zig.
 const std = @import("std");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const anole = @import("../root.zig");
 const jobs = @import("../jobs/root.zig");
 const resilience = @import("resilience_core");
@@ -203,6 +204,7 @@ pub const Client = struct {
     key: ?[32]u8 = null,
     allow_private: bool,
     require_https: bool,
+    teardown: safety.Teardown = .init,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
         if (options.attempts == 0 or options.attempts > 1000) return invalid("attempts", "must be 1 .. 1000");
@@ -255,12 +257,17 @@ pub const Client = struct {
         return error.InvalidOptions;
     }
 
+    /// Frees the client. Delivery runs use it until they end: the app ends
+    /// them first (the jobs client's `stopWork`). Outside an app, call the
+    /// jobs client's `stopWork` before this.
     pub fn deinit(self: *Client) void {
+        self.teardown.begin();
         _ = active.cmpxchgStrong(self, null, .monotonic, .monotonic);
         self.breakers.deinit();
         self.http.deinit();
         self.gpa.destroy(self.http);
         self.store.deinit(self.gpa);
+        self.teardown.end();
         self.gpa.destroy(self);
     }
 

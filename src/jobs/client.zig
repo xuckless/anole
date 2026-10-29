@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const root = @import("root.zig");
 const store = @import("store.zig");
 const clock_mod = @import("clock.zig");
@@ -139,7 +140,10 @@ pub const Client = struct {
     wake_kicks: std.atomic.Value(u32) = .init(0),
     /// Tests only: runs on a run's task right after `hold` has published it.
     test_after_hold: if (builtin.is_test) ?*const fn (*Client, *JobBox) void else void = if (builtin.is_test) null else {},
-    /// Tests only: runs on the stopping thread when the queue's work stops.
+    /// Set by the first `stopWork`; the owner's thread only (`stopWork`, `deinit`).
+    work_stopped: bool = false,
+    teardown: safety.Teardown = .init,
+    /// Tests only: runs on the stopping thread when `stopWork` starts its work.
     test_on_stop: if (builtin.is_test) ?*const fn (*Client) void else void = if (builtin.is_test) null else {},
 
     /// `app.jobs(options)` calls it; outside an app, `init`, `start`, `drain`, `deinit`.
@@ -188,7 +192,16 @@ pub const Client = struct {
         return self;
     }
 
-    pub fn deinit(self: *Client) void {
+    /// Ends the queue's work: the drain under way is waited for (else one
+    /// runs, to 10 s), then every task (fetchers, heartbeat, maintenance,
+    /// runs) is canceled and joined. Idempotent; on the owner's thread, as
+    /// `deinit`. The app calls it before it frees any connector, since a
+    /// run may use any of them (SAFETY.md M2); `deinit` calls it first.
+    /// Outside an app, call it before freeing what the handlers use.
+    pub fn stopWork(self: *Client) void {
+        self.teardown.assertNotDead();
+        if (self.work_stopped) return;
+        self.work_stopped = true;
         if (builtin.is_test) if (self.test_on_stop) |f| f(self);
         self.closing.store(true, .release);
         // A drain under way (the server's) is waited for, not cut short.
@@ -196,6 +209,11 @@ pub const Client = struct {
             self.drain(std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = .fromSeconds(10), .clock = .awake }));
         }
         self.group.cancel(self.io);
+    }
+
+    pub fn deinit(self: *Client) void {
+        self.teardown.begin();
+        self.stopWork();
         self.backend.vt.deinit(self.backend.ptr);
         for (self.queues) |*q| q.kinds.deinit(self.gpa);
         self.gpa.free(self.queues);
@@ -212,6 +230,7 @@ pub const Client = struct {
             self.gpa.destroy(mm);
         }
         self.arena_state.deinit();
+        self.teardown.end();
         self.gpa.destroy(self);
     }
 

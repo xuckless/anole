@@ -965,6 +965,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// Closes the connector's idle connections (under AWS Lambda,
             /// after a long freeze); null when it has no pool to close.
             closeIdle: ?*const fn (context: *anyopaque) void = null,
+            /// Ends the connector's own work that may still call other
+            /// connectors (a job queue's runs), joining it. `App.deinit`
+            /// calls it on every connector, last made first, before it
+            /// frees any (SAFETY.md M2). Null for the rest.
+            stop_work: ?*const fn (context: *anyopaque) void = null,
 
             /// The console's `/db` system: the type's `console_system` decl
             /// ("postgres", "redis"...), or "connector" when it has none.
@@ -997,6 +1002,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         _ = v.closeIdle();
                     }
                 };
+                const Work = struct {
+                    fn stopWork(context: *anyopaque) void {
+                        // SAFETY: context is the *T given to of().
+                        const v: *T = @ptrCast(@alignCast(context));
+                        v.stopWork();
+                    }
+                };
                 return .{
                     .context = value,
                     .start = Hooks.start,
@@ -1004,6 +1016,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .describe = if (comptime @hasDecl(T, "consoleInfo") or !std.mem.eql(u8, system, "connector")) Hooks.describe else null,
                     .name = system,
                     .closeIdle = if (comptime @hasDecl(T, "closeIdle")) Idle.closeIdle else null,
+                    .stop_work = if (comptime @hasDecl(T, "stopWork")) Work.stopWork else null,
                 };
             }
         };
@@ -1891,6 +1904,15 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             for (self.net_udp.items) |g| g.destroy();
             for (self.net_tcp.items) |t| t.destroy();
             // ---- end p3/net ----
+            // Job runs may use any connector (app.webhooks, or one made
+            // after the queue): they end before any connector is freed
+            // (SAFETY.md M2).
+            var w = extras.connectors.items.len;
+            while (w > 0) {
+                w -= 1;
+                const k = extras.connectors.items[w];
+                if (k.stop_work) |stop_work| stop_work(k.context);
+            }
             // The databases, once nothing uses them: last made, first closed.
             var c = extras.connectors.items.len;
             while (c > 0) {
