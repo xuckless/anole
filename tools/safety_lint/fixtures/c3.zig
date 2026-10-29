@@ -89,3 +89,15 @@ fn read(io: std.Io) !void {
 }
 fn cleanup() !void {}
 fn log() void {}
+
+fn comparedNotHandled(cause: ?anyerror) bool {
+    const a = if (cause) |e| e == error.Canceled else false;
+    std.debug.assert(a or cause == error.Canceled);
+    return cause == error.Canceled;
+}
+
+fn compoundCondition(io: std.Io, closing: bool) void {
+    read(io) catch |err| {
+        if (closing and err == error.Canceled) {} // expect: C3
+    };
+}

@@ -1,5 +1,10 @@
-//! `zig build lint`: SAFETY.md E2, a token-level check of the Zig sources
-//! for the rules a grep can see.
+//! `zig build lint`: SAFETY.md E2, a check of the Zig sources on
+//! `std.zig.Ast` (the parser `zig fmt` uses). The tree gives each token its
+//! context: test code (`test` declarations), its function, its statement.
+//! Comments are not in the tree, so `// SAFETY:` reasons are read from the
+//! source lines: on the hit's line, or in the comment lines just above the
+//! hit's line or its statement's first line. A file that does not parse is
+//! a PARSE hit.
 //!
 //! - T1: a task spawned outside a group. `placement.concurrent` (a group,
 //!   placed) is the way; a Future from `io.concurrent`/`io.async` is allowed
@@ -26,8 +31,8 @@
 //! `*_tests.zig`, `testing.zig`, files under a `testing/` directory and the
 //! test runners.
 const std = @import("std");
+const Ast = std.zig.Ast;
 const Token = std.zig.Token;
-const Tokenizer = std.zig.Tokenizer;
 
 /// U1: the C binding modules and the files allowed to import them. A
 /// library called from more than one file is a named set (an exception to
@@ -178,35 +183,52 @@ fn isWrapper(p: []const u8) bool {
     return startsWithAny(p, &unsafe_modules);
 }
 
-const Ctx = enum { container, fn_body, block, test_block, init_list, error_set };
+const none = std.math.maxInt(u32);
 
+/// One file's syntax tree plus, for each token, the context the rules ask
+/// about: whether it is in a test, its innermost function, its innermost
+/// statement (a block statement or a container member).
 const Lint = struct {
     arena: std.mem.Allocator,
     path: []const u8,
     src: [:0]const u8,
-    toks: []const Token,
+    tree: *const Ast,
+    tags: []const Token.Tag,
+    starts: []const u32,
     hits: *std.ArrayList(Hit),
-    /// The context of each token: the innermost brace it is in.
-    ctx: []const Ctx,
-    /// Whether each token is inside a test block (at any depth).
+    line_starts: []const u32,
     in_test: []const bool,
-    /// For each token, the index of the l_brace of its innermost function
-    /// body, or null at container level.
-    fn_start: []const ?usize,
-    /// For each l_brace, the index of its r_brace.
-    match: []const usize,
+    /// The innermost `fn_decl` holding each token's body, or `none`.
+    fn_of: []const u32,
+    /// The innermost statement holding each token, or `none`.
+    stmt_of: []const u32,
 
     fn text(self: *const Lint, i: usize) []const u8 {
-        const t = self.toks[i];
-        return self.src[t.loc.start..t.loc.end];
+        return self.tree.tokenSlice(@intCast(i));
     }
 
     fn tag(self: *const Lint, i: usize) Token.Tag {
-        return if (i < self.toks.len) self.toks[i].tag else .eof;
+        return if (i < self.tags.len) self.tags[i] else .eof;
+    }
+
+    fn first(self: *const Lint, n: Node) u32 {
+        return self.tree.firstToken(n);
+    }
+
+    fn last(self: *const Lint, n: Node) u32 {
+        return self.tree.lastToken(n);
     }
 
     fn lineOf(self: *const Lint, i: usize) usize {
-        return std.mem.count(u8, self.src[0..self.toks[i].loc.start], "\n") + 1;
+        const pos = self.starts[i];
+        // The number of line starts at or before pos.
+        var lo: usize = 0;
+        var hi: usize = self.line_starts.len;
+        while (lo < hi) {
+            const mid = (lo + hi) / 2;
+            if (self.line_starts[mid] <= pos) lo = mid + 1 else hi = mid;
+        }
+        return lo;
     }
 
     fn hit(self: *Lint, i: usize, rule: []const u8, msg: []const u8) !void {
@@ -220,13 +242,21 @@ const Lint = struct {
         return .{ .start = s, .end = e };
     }
 
+    /// The first token of the statement holding token i (i itself at
+    /// container level outside any member).
+    fn stmtStart(self: *const Lint, i: usize) usize {
+        const s = self.stmt_of[i];
+        return if (s == none) i else self.first(@fromBackingInt(@intCast(s)));
+    }
+
     /// A `// SAFETY:` comment on the token's line, or in the comment lines
-    /// just above the line of `stmt` (the statement's first token).
-    fn hasSafetyComment(self: *const Lint, i: usize, stmt: usize) bool {
-        const l = self.lineAt(self.toks[i].loc.start);
+    /// just above the token's line or its statement's first line. Comments
+    /// are not in the tree, so this reads the source lines.
+    fn hasSafetyComment(self: *const Lint, i: usize) bool {
+        const l = self.lineAt(self.starts[i]);
         if (std.mem.indexOf(u8, self.src[l.start..l.end], "// SAFETY:") != null) return true;
-        for ([_]usize{ i, stmt }) |anchor| {
-            var ls = self.lineAt(self.toks[anchor].loc.start).start;
+        for ([_]usize{ i, self.stmtStart(i) }) |anchor| {
+            var ls = self.lineAt(self.starts[anchor]).start;
             while (ls > 0) {
                 const prev = self.lineAt(ls - 1);
                 const line = std.mem.trim(u8, self.src[prev.start..prev.end], " \t\r");
@@ -238,119 +268,104 @@ const Lint = struct {
         return false;
     }
 
-    /// The first token of the statement or declaration holding token i.
-    fn stmtStart(self: *const Lint, i: usize) usize {
-        var depth: i32 = 0;
-        var j = i;
-        while (j > 0) {
-            const t = self.tag(j - 1);
-            switch (t) {
-                .r_paren, .r_bracket => depth += 1,
-                .l_paren, .l_bracket => {
-                    if (depth == 0) return j;
-                    depth -= 1;
-                },
-                .r_brace => if (depth == 0) return j,
-                .l_brace, .semicolon => if (depth == 0) return j,
-                .comma => if (depth == 0 and self.ctx[j - 1] != .fn_body and self.ctx[j - 1] != .block and self.ctx[j - 1] != .test_block) return j,
-                else => {},
-            }
-            j -= 1;
+    /// The tokens of a node's subtree.
+    fn tokensOf(self: *const Lint, n: Node) struct { u32, u32 } {
+        return .{ self.first(n), self.last(n) };
+    }
+
+    /// An identifier token in [a, b] named `name`, followed by `.` and one
+    /// of `fields`.
+    fn mentionsField(self: *const Lint, a: u32, b: u32, name: []const u8, fields: []const []const u8) bool {
+        var k = a;
+        while (k + 2 <= b) : (k += 1) {
+            if (self.tags[k] != .identifier or self.tags[k + 1] != .period or self.tags[k + 2] != .identifier) continue;
+            if (!std.mem.eql(u8, self.text(k), name)) continue;
+            for (fields) |f| if (std.mem.eql(u8, self.text(k + 2), f)) return true;
         }
-        return 0;
+        return false;
     }
 };
 
+const Node = Ast.Node.Index;
+const Span = struct { node: u32, first: u32, last: u32 };
+
+/// Writes each span's node over its tokens, outer spans first, so a token
+/// ends up with its innermost span.
+fn paint(dst: []u32, spans: []Span) void {
+    std.mem.sort(Span, spans, {}, struct {
+        fn lt(_: void, a: Span, b: Span) bool {
+            return a.last - a.first > b.last - b.first;
+        }
+    }.lt);
+    for (spans) |s| @memset(dst[s.first .. s.last + 1], s.node);
+}
+
 fn lintFile(arena: std.mem.Allocator, path: []const u8, src: [:0]const u8, tests: bool, hits: *std.ArrayList(Hit)) !void {
-    var toks: std.ArrayList(Token) = .empty;
-    var tz: Tokenizer = .init(src);
-    while (true) {
-        const t = tz.next();
-        if (t.tag == .eof) break;
-        if (t.tag == .doc_comment or t.tag == .container_doc_comment) continue;
-        try toks.append(arena, t);
+    const tree = try arena.create(Ast);
+    tree.* = try Ast.parse(arena, src, .{});
+    if (tree.errors.len > 0) {
+        const t = tree.errors[0].token;
+        const line = std.mem.count(u8, src[0..tree.tokens.items(.start)[t]], "\n") + 1;
+        try hits.append(arena, .{ .path = path, .line = line, .rule = "PARSE", .msg = "the file does not parse, so the lint cannot check it" });
+        return;
     }
-    const n = toks.items.len;
-    const ctx = try arena.alloc(Ctx, n);
-    const in_test = try arena.alloc(bool, n);
-    const fn_start = try arena.alloc(?usize, n);
-    const match = try arena.alloc(usize, n);
-    @memset(match, 0);
+    const ntok = tree.tokens.len;
+    var line_starts: std.ArrayList(u32) = .empty;
+    try line_starts.append(arena, 0);
+    for (src, 0..) |c, k| if (c == '\n') try line_starts.append(arena, @intCast(k + 1));
+
+    const in_test = try arena.alloc(bool, ntok);
+    @memset(in_test, false);
+    const fn_of = try arena.alloc(u32, ntok);
+    @memset(fn_of, none);
+    const stmt_of = try arena.alloc(u32, ntok);
+    @memset(stmt_of, none);
     {
-        const Frame = struct { ctx: Ctx, tok: usize, in_test: bool, fn_start: ?usize };
-        var stack: std.ArrayList(Frame) = .empty;
-        var pending_fn = false; // saw `fn`, its body brace is next at paren depth 0
-        var pending_test = false;
-        var paren: i32 = 0;
-        var paren_opener: std.ArrayList(Token.Tag) = .empty; // the tag before each open paren
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const t = toks.items[i].tag;
-            const top: Frame = if (stack.items.len > 0) stack.items[stack.items.len - 1] else .{ .ctx = .container, .tok = 0, .in_test = false, .fn_start = null };
-            ctx[i] = top.ctx;
-            in_test[i] = top.in_test;
-            fn_start[i] = top.fn_start;
-            switch (t) {
-                .keyword_fn => pending_fn = true,
-                .keyword_test => pending_test = true,
-                .l_paren => {
-                    try paren_opener.append(arena, if (i > 0) toks.items[i - 1].tag else .invalid);
-                    paren += 1;
-                },
-                .r_paren => {
-                    if (paren > 0) paren -= 1;
-                    _ = paren_opener.pop();
-                },
-                .semicolon => if (paren == 0) {
-                    pending_fn = false;
-                },
-                .l_brace => {
-                    const prev: Token.Tag = if (i > 0) toks.items[i - 1].tag else .invalid;
-                    var c: Ctx = .block;
-                    if (prev == .keyword_struct or prev == .keyword_enum or prev == .keyword_union or prev == .keyword_opaque) {
-                        c = .container;
-                    } else if (prev == .keyword_error) {
-                        c = .error_set;
-                    } else if (prev == .period) {
-                        c = .init_list;
-                    } else if (prev == .r_paren and parenOpenerIsContainer(toks.items, i - 1)) {
-                        c = .container;
-                    } else if (pending_test and paren == 0) {
-                        c = .test_block;
-                        pending_test = false;
-                    } else if (pending_fn and paren == 0) {
-                        c = .fn_body;
-                        pending_fn = false;
-                    } else if (isTypedInit(toks.items, i)) {
-                        c = .init_list;
-                    }
-                    try stack.append(arena, .{
-                        .ctx = c,
-                        .tok = i,
-                        .in_test = top.in_test or c == .test_block,
-                        .fn_start = if (c == .fn_body) i else top.fn_start,
-                    });
-                },
-                .r_brace => {
-                    if (stack.pop()) |f| match[f.tok] = i;
+        var fns: std.ArrayList(Span) = .empty;
+        var stmts: std.ArrayList(Span) = .empty;
+        var buf2: [2]Node = undefined;
+        for (0..tree.nodes.len) |k| {
+            const n: Node = @fromBackingInt(@intCast(k));
+            switch (tree.nodeTag(n)) {
+                .test_decl => @memset(in_test[tree.firstToken(n) .. tree.lastToken(n) + 1], true),
+                .fn_decl => {
+                    const body = tree.nodeData(n).node_and_node[1];
+                    try fns.append(arena, .{ .node = @intCast(k), .first = tree.firstToken(body), .last = tree.lastToken(body) });
                 },
                 else => {},
             }
+            const members: []const Node = if (tree.blockStatements(&buf2, n)) |s| s else if (tree.fullContainerDecl(&buf2, n)) |c| c.ast.members else &.{};
+            for (members) |m| try stmts.append(arena, .{ .node = @backingInt(m), .first = tree.firstToken(m), .last = tree.lastToken(m) });
         }
+        paint(fn_of, fns.items);
+        paint(stmt_of, stmts.items);
     }
-    var lint: Lint = .{ .arena = arena, .path = path, .src = src, .toks = toks.items, .hits = hits, .ctx = ctx, .in_test = in_test, .fn_start = fn_start, .match = match };
+
+    var lint: Lint = .{
+        .arena = arena,
+        .path = path,
+        .src = src,
+        .tree = tree,
+        .tags = tree.tokens.items(.tag),
+        .starts = tree.tokens.items(.start),
+        .hits = hits,
+        .line_starts = line_starts.items,
+        .in_test = in_test,
+        .fn_of = fn_of,
+        .stmt_of = stmt_of,
+    };
     const wrapper = isWrapper(path);
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
+
+    // Token rules: U3, U1.
+    for (0..ntok) |i| {
         if (!tests and in_test[i]) continue;
-        const t = toks.items[i];
         const s = lint.text(i);
-        switch (t.tag) {
+        switch (lint.tags[i]) {
             .builtin => {
                 if (std.mem.eql(u8, s, "@ptrCast") or std.mem.eql(u8, s, "@alignCast") or std.mem.eql(u8, s, "@ptrFromInt") or std.mem.eql(u8, s, "@intFromPtr")) {
                     // `@ptrCast(@alignCast(x))` is one cast.
                     if (std.mem.eql(u8, s, "@alignCast") and i >= 2 and lint.tag(i - 1) == .l_paren and std.mem.eql(u8, lint.text(i - 2), "@ptrCast")) continue;
-                    if (!wrapper and !lint.hasSafetyComment(i, lint.stmtStart(i)))
+                    if (!wrapper and !lint.hasSafetyComment(i))
                         try lint.hit(i, "U3", try std.fmt.allocPrint(arena, "{s} without a // SAFETY: reason (or safety.fromCtx/toCtx)", .{s}));
                 } else if (std.mem.eql(u8, s, "@import") and lint.tag(i + 1) == .l_paren and lint.tag(i + 2) == .string_literal) {
                     const name = std.mem.trim(u8, lint.text(i + 2), "\"");
@@ -368,215 +383,218 @@ fn lintFile(arena: std.mem.Allocator, path: []const u8, src: [:0]const u8, tests
                 if (lint.tag(i + 1) == .keyword_struct or lint.tag(i + 1) == .keyword_union or lint.tag(i + 1) == .keyword_enum) continue;
                 if (!wrapper) try lint.hit(i, "U1", "an extern declaration outside a wrapper module");
             },
-            .identifier => {
-                if (std.mem.eql(u8, s, "undefined")) {
-                    if (wrapper) continue;
-                    const st = lint.stmtStart(i);
-                    if (isLocalArrayDecl(&lint, st, i)) continue;
-                    if (lint.hasSafetyComment(i, st)) continue;
-                    try lint.hit(i, "U3", "undefined outside a local array declaration, without a // SAFETY: reason");
-                } else if ((std.mem.eql(u8, s, "concurrent") or std.mem.eql(u8, s, "async")) and i > 0 and lint.tag(i - 1) == .period and lint.tag(i + 1) == .l_paren) {
-                    try checkSpawn(&lint, i);
-                } else if (std.mem.eql(u8, s, "spawnInto") and lint.tag(i + 1) == .l_paren) {
-                    if (!std.mem.eql(u8, path, "src/http/core/placement.zig")) try lint.hit(i, "T1", "zio spawnInto outside placement.zig: use placement.concurrent");
-                } else if (std.mem.eql(u8, s, "spawn") and i >= 2 and lint.tag(i - 1) == .period and std.mem.eql(u8, lint.text(i - 2), "Thread") and lint.tag(i + 1) == .l_paren) {
-                    try checkThread(&lint, i);
-                } else if (std.mem.eql(u8, s, "Canceled") and i >= 2 and lint.tag(i - 1) == .period and std.mem.eql(u8, lint.text(i - 2), "error")) {
-                    try checkCanceled(&lint, i);
-                }
+            .identifier => if (std.mem.eql(u8, s, "undefined")) {
+                if (wrapper) continue;
+                if (isLocalArrayDecl(&lint, i)) continue;
+                if (lint.hasSafetyComment(i)) continue;
+                try lint.hit(i, "U3", "undefined outside a local array declaration, without a // SAFETY: reason");
             },
             else => {},
         }
     }
-}
 
-/// `enum(u8) {`, `union(enum) {`, `packed struct(u32) {`: the paren group
-/// ending at r_paren `rp` was opened right after a container keyword.
-fn parenOpenerIsContainer(toks: []const Token, rp: usize) bool {
-    var depth: i32 = 0;
-    var j = rp;
-    while (true) {
-        switch (toks[j].tag) {
-            .r_paren => depth += 1,
-            .l_paren => {
-                depth -= 1;
-                if (depth == 0) {
-                    if (j == 0) return false;
-                    const t = toks[j - 1].tag;
-                    return t == .keyword_enum or t == .keyword_union or t == .keyword_struct;
-                }
-            },
-            else => {},
+    // Node rules: T1, C3.
+    var buf1: [1]Node = undefined;
+    for (0..tree.nodes.len) |k| {
+        const n: Node = @fromBackingInt(@intCast(k));
+        if (!tests and in_test[tree.nodeMainToken(n)]) continue;
+        if (tree.fullCall(&buf1, n)) |call| {
+            try checkCall(&lint, n, call);
+        } else if (tree.fullSwitchCase(n)) |case| {
+            for (case.ast.values) |v| {
+                if (!isCanceled(&lint, v)) continue;
+                try checkCanceled(&lint, tree.lastToken(v), case.ast.target_expr);
+            }
+        } else if (tree.fullIf(n)) |f| {
+            if (canceledComparison(&lint, f.ast.cond_expr)) |tok| try checkCanceled(&lint, tok, f.ast.then_expr);
         }
-        if (j == 0) return false;
-        j -= 1;
     }
 }
 
-/// `T{ ... }`, `[_]u8{ ... }`, `std.ArrayList(u8){}`: a typed literal (an
-/// identifier, a `]` of an array type, or a call's `)` that is not a
-/// control-flow header).
-fn isTypedInit(toks: []const Token, lb: usize) bool {
-    if (lb == 0) return false;
-    const prev = toks[lb - 1].tag;
-    if (prev == .identifier) {
-        // `else {`, `blk: {`, `=> |x| {` are not literals; an identifier right
-        // before `{` is a type name only when no keyword precedes it.
-        if (lb >= 2 and (toks[lb - 2].tag == .period or toks[lb - 2].tag == .equal or toks[lb - 2].tag == .l_paren or toks[lb - 2].tag == .comma or toks[lb - 2].tag == .keyword_return))
-            return true;
-    }
-    return false;
+/// `var|const name: [..]T = undefined` in a function, with `undefined` the
+/// whole initializer.
+fn isLocalArrayDecl(l: *const Lint, u: usize) bool {
+    if (l.fn_of[u] == none) return false;
+    const s = l.stmt_of[u];
+    if (s == none) return false;
+    const vd = l.tree.fullVarDecl(@fromBackingInt(@intCast(s))) orelse return false;
+    const init = vd.ast.init_node.unwrap() orelse return false;
+    if (l.tree.nodeMainToken(init) != u or l.tree.nodeTag(init) != .identifier) return false;
+    const ty = vd.ast.type_node.unwrap() orelse return false;
+    return l.tag(l.first(ty)) == .l_bracket;
 }
 
-/// `var|const name: [..]T = undefined` with `undefined` the whole initializer.
-fn isLocalArrayDecl(l: *const Lint, st: usize, u: usize) bool {
-    var j = st;
-    if (l.tag(j) == .keyword_pub) j += 1;
-    if (l.tag(j) == .keyword_threadlocal) j += 1;
-    if (l.tag(j) != .keyword_var and l.tag(j) != .keyword_const) return false;
-    if (l.tag(j + 1) != .identifier or l.tag(j + 2) != .colon) return false;
-    if (l.tag(j + 3) != .l_bracket) return false;
-    if (l.tag(u - 1) != .equal) return false;
-    if (l.tag(u + 1) != .semicolon) return false;
-    return l.fn_start[u] != null;
+/// `error.Canceled` as a node.
+fn isCanceled(l: *const Lint, n: Node) bool {
+    return l.tree.nodeTag(n) == .error_value and std.mem.eql(u8, l.text(l.last(n)), "Canceled");
+}
+
+/// The `Canceled` token of an `x == error.Canceled` (either side) anywhere
+/// in an `if` condition.
+fn canceledComparison(l: *const Lint, cond: Node) ?u32 {
+    const a, const b = l.tokensOf(cond);
+    var k = a;
+    while (k + 3 <= b) : (k += 1) {
+        if (l.tags[k] == .equal_equal and l.tags[k + 1] == .keyword_error and l.tags[k + 2] == .period and std.mem.eql(u8, l.text(k + 3), "Canceled")) return k + 3;
+        if (l.tags[k] == .keyword_error and l.tags[k + 1] == .period and std.mem.eql(u8, l.text(k + 2), "Canceled") and l.tags[k + 3] == .equal_equal) return k + 2;
+    }
+    return null;
+}
+
+/// T1 over one call: `.concurrent(`/`.async(`, `spawnInto`, `Thread.spawn`.
+fn checkCall(l: *Lint, call_node: Node, call: Ast.full.Call) !void {
+    const tree = l.tree;
+    const callee = call.ast.fn_expr;
+    const name_tok: u32, const recv: ?Node = switch (tree.nodeTag(callee)) {
+        .field_access => .{ tree.nodeData(callee).node_and_token[1], tree.nodeData(callee).node_and_token[0] },
+        .identifier => .{ tree.nodeMainToken(callee), null },
+        else => return,
+    };
+    const name = l.text(name_tok);
+    if (std.mem.eql(u8, name, "spawnInto")) {
+        if (!std.mem.eql(u8, l.path, "src/http/core/placement.zig")) try l.hit(name_tok, "T1", "zio spawnInto outside placement.zig: use placement.concurrent");
+        return;
+    }
+    const r = recv orelse return;
+    if (std.mem.eql(u8, name, "concurrent") or std.mem.eql(u8, name, "async")) {
+        try checkSpawn(l, call_node, name_tok, r);
+    } else if (std.mem.eql(u8, name, "spawn") and std.mem.eql(u8, l.text(l.last(r)), "Thread")) {
+        try checkThread(l, name_tok);
+    }
 }
 
 /// T1. `placement.concurrent(...)` is the way. Otherwise the spawn must be
 /// function-local: its Future kept in a local (declared in this function),
 /// or its receiver a Group or Select local to this function, and the
 /// function cancels or awaits that local.
-fn checkSpawn(l: *Lint, i: usize) !void {
-    if (i >= 2 and std.mem.eql(u8, l.text(i - 2), "placement")) return;
+fn checkSpawn(l: *Lint, call_node: Node, i: u32, recv: Node) !void {
+    if (std.mem.eql(u8, l.text(l.last(recv)), "placement")) return;
     // Inside placement.zig, the one place that wraps the std call.
     if (std.mem.eql(u8, l.path, "src/http/core/placement.zig")) return;
     // `x.concurrent(` with x a simple name: a local Group or Select.
-    if (i >= 2 and l.tag(i - 2) == .identifier and (i < 3 or l.tag(i - 3) != .period)) {
-        const recv = l.text(i - 2);
-        if (declaredLocal(l, i, recv) and localFutureEnded(l, i, recv)) return;
+    if (l.tree.nodeTag(recv) == .identifier) {
+        const name = l.text(l.tree.nodeMainToken(recv));
+        if (declaredLocal(l, i, name) and localFutureEnded(l, i, name)) return;
     }
-    // `const f = ....concurrent(` or `f = ....concurrent(`: a local Future.
-    const st = l.stmtStart(i);
-    var j = st;
-    if (l.tag(j) == .keyword_var or l.tag(j) == .keyword_const) j += 1;
-    if (l.tag(j) == .identifier and (l.tag(j + 1) == .equal or l.tag(j + 1) == .colon)) {
-        const name = l.text(j);
+    // `const f = [try] ....concurrent(` or `f = [try] ....concurrent(`: a
+    // local Future.
+    if (futureName(l, i, call_node)) |name| {
         if (declaredLocal(l, i, name) and localFutureEnded(l, i, name)) return;
         return l.hit(i, "T1", "a Future this function does not cancel or await, or one kept outside it: use placement.concurrent with the owner's group");
     }
     try l.hit(i, "T1", "a spawn outside placement.concurrent and outside a function-local Future, Group or Select");
 }
 
-/// `name` is declared (`var name` / `const name`) in the function holding
-/// token i, before it.
-fn declaredLocal(l: *const Lint, i: usize, name: []const u8) bool {
-    const fs = l.fn_start[i] orelse return false;
-    var k = fs;
-    while (k + 1 < i) : (k += 1) {
-        if ((l.tag(k) == .keyword_var or l.tag(k) == .keyword_const) and l.tag(k + 1) == .identifier and std.mem.eql(u8, l.text(k + 1), name)) return true;
+/// The name a statement stores the call's Future in: the statement is a
+/// declaration or a plain assignment to a name, and its value is the call
+/// (or `try` of it).
+fn futureName(l: *const Lint, i: u32, call_node: Node) ?[]const u8 {
+    const tree = l.tree;
+    const s = l.stmt_of[i];
+    if (s == none) return null;
+    const stmt: Node = @fromBackingInt(@intCast(s));
+    var value: Node = undefined; // SAFETY: set on every path that reaches its read
+    var name: []const u8 = undefined; // SAFETY: as value
+    if (tree.fullVarDecl(stmt)) |vd| {
+        value = vd.ast.init_node.unwrap() orelse return null;
+        name = l.text(vd.ast.mut_token + 1);
+    } else if (tree.nodeTag(stmt) == .assign) {
+        const lhs, value = tree.nodeData(stmt).node_and_node;
+        if (tree.nodeTag(lhs) != .identifier) return null;
+        name = l.text(tree.nodeMainToken(lhs));
+    } else return null;
+    return if (holdsCall(l, value, call_node)) name else null;
+}
+
+/// The value is the call itself, through `try`, `catch` (its left side) and
+/// the branches of an `if`.
+fn holdsCall(l: *const Lint, value: Node, call_node: Node) bool {
+    const tree = l.tree;
+    if (value == call_node) return true;
+    switch (tree.nodeTag(value)) {
+        .@"try" => return holdsCall(l, tree.nodeData(value).node, call_node),
+        .@"catch", .@"orelse" => return holdsCall(l, tree.nodeData(value).node_and_node[0], call_node),
+        else => {},
+    }
+    if (tree.fullIf(value)) |f| {
+        if (holdsCall(l, f.ast.then_expr, call_node)) return true;
+        if (f.ast.else_expr.unwrap()) |e| return holdsCall(l, e, call_node);
     }
     return false;
 }
 
-/// The function holding token i mentions `name.cancel(` or `name.await(`.
-fn localFutureEnded(l: *const Lint, i: usize, name: []const u8) bool {
-    const fs = l.fn_start[i] orelse return false;
-    const end = l.match[fs];
-    var k = fs;
-    while (k + 3 < end) : (k += 1) {
-        if (l.tag(k) == .identifier and std.mem.eql(u8, l.text(k), name) and l.tag(k + 1) == .period and l.tag(k + 2) == .identifier) {
-            const m = l.text(k + 2);
-            if (std.mem.eql(u8, m, "cancel") or std.mem.eql(u8, m, "await")) return true;
-        }
+/// `name` is declared (`var name` / `const name`) in the function holding
+/// token i, before it.
+fn declaredLocal(l: *const Lint, i: u32, name: []const u8) bool {
+    const f = l.fn_of[i];
+    if (f == none) return false;
+    const body = l.tree.nodeData(@fromBackingInt(@intCast(f))).node_and_node[1];
+    var k = l.first(body);
+    while (k + 1 < i) : (k += 1) {
+        if ((l.tags[k] == .keyword_var or l.tags[k] == .keyword_const) and l.tags[k + 1] == .identifier and std.mem.eql(u8, l.text(k + 1), name)) return true;
+    }
+    return false;
+}
+
+/// The function holding token i mentions `name.cancel` or `name.await`.
+fn localFutureEnded(l: *const Lint, i: u32, name: []const u8) bool {
+    const f = l.fn_of[i];
+    if (f == none) return false;
+    const body = l.tree.nodeData(@fromBackingInt(@intCast(f))).node_and_node[1];
+    const a = l.first(body);
+    const b = l.last(body);
+    if (l.mentionsField(a, b, name, &.{ "cancel", "await" })) return true;
+    // An optional Future: `if (name) |*x| x.cancel(io)`.
+    var k = a;
+    while (k + 6 <= b) : (k += 1) {
+        if (l.tags[k] != .keyword_if or l.tags[k + 1] != .l_paren or l.tags[k + 2] != .identifier or l.tags[k + 3] != .r_paren or l.tags[k + 4] != .pipe) continue;
+        if (!std.mem.eql(u8, l.text(k + 2), name)) continue;
+        const cap = if (l.tags[k + 5] == .asterisk) k + 6 else k + 5;
+        if (l.tags[cap] != .identifier) continue;
+        if (l.mentionsField(cap + 1, @min(b, cap + 8), l.text(cap), &.{ "cancel", "await" })) return true;
     }
     return false;
 }
 
 /// T1 for OS threads: the handle is kept and joined in the same file, never
 /// detached.
-fn checkThread(l: *Lint, i: usize) !void {
+fn checkThread(l: *Lint, i: u32) !void {
     // A detach in the same statement.
+    const s = l.stmt_of[i];
+    const end = if (s == none) i else l.last(@fromBackingInt(@intCast(s)));
     var k = i;
-    while (k < l.toks.len and l.tag(k) != .semicolon) : (k += 1) {
-        if (l.tag(k) == .identifier and std.mem.eql(u8, l.text(k), "detach")) return l.hit(i, "T1", "a detached thread: keep the handle and join it in its owner's teardown");
+    while (k <= end) : (k += 1) {
+        if (l.tags[k] == .identifier and std.mem.eql(u8, l.text(k), "detach")) return l.hit(i, "T1", "a detached thread: keep the handle and join it in its owner's teardown");
     }
-    for (l.toks, 0..) |t, m| {
-        if (t.tag == .identifier and std.mem.eql(u8, l.text(m), "join") and m > 0 and l.tag(m - 1) == .period) return;
+    for (l.tags, 0..) |t, m| {
+        if (t == .identifier and m > 0 and l.tags[m - 1] == .period and std.mem.eql(u8, l.text(m), "join")) return;
     }
     try l.hit(i, "T1", "a thread that this file never joins");
 }
 
-/// C3: a prong or branch on `error.Canceled` that carries on: it neither
-/// returns (or breaks out with) an error nor calls `recancel`.
-fn checkCanceled(l: *Lint, i: usize) !void {
-    // Only where it is handled: a switch prong item (after `{` or `,`) or a
-    // comparison; `return error.Canceled`, `=> error.Canceled` hand it on.
-    const before = if (i >= 3) l.tag(i - 3) else .invalid;
-    if (before != .l_brace and before != .comma and before != .equal_equal and before != .bang_equal) return;
-    // Find the handling body: a switch prong `error.Canceled[, ...] => body`
-    // or `if (... == error.Canceled) body`.
-    var k = i + 1;
-    while (k < l.toks.len and (l.tag(k) == .comma or l.tag(k) == .period or l.tag(k) == .identifier or l.tag(k) == .keyword_error)) : (k += 1) {}
-    var body_start: usize = undefined;
-    if (l.tag(k) == .equal_angle_bracket_right) {
-        body_start = k + 1;
-    } else if (l.tag(i - 3) == .equal_equal or l.tag(k) == .r_paren) {
-        if (l.tag(i - 3) != .equal_equal) return;
-        // `if (err == error.Canceled)`: the body follows the `)`.
-        var depth: i32 = 0;
-        while (k < l.toks.len) : (k += 1) {
-            if (l.tag(k) == .l_paren) depth += 1;
-            if (l.tag(k) == .r_paren) {
-                if (depth == 0) break;
-                depth -= 1;
-            }
-        }
-        body_start = k + 1;
-    } else return;
-    // The body: a block, or tokens up to the prong's `,` / statement's `;`.
-    var end: usize = body_start;
-    if (l.tag(body_start) == .pipe) {
-        // `=> |e| ...`
-        end = body_start + 1;
-        while (end < l.toks.len and l.tag(end) != .pipe) : (end += 1) {}
-        end += 1;
-    }
-    const start = end;
-    if (l.tag(start) == .l_brace) {
-        end = l.match[start];
-    } else {
-        var depth: i32 = 0;
-        while (end < l.toks.len) : (end += 1) {
-            switch (l.tag(end)) {
-                .l_paren, .l_bracket, .l_brace => depth += 1,
-                .r_paren, .r_bracket => depth -= 1,
-                .r_brace => {
-                    if (depth == 0) break;
-                    depth -= 1;
-                },
-                .comma, .semicolon => if (depth == 0) break,
-                else => {},
-            }
-        }
-    }
-    // `=> error.Canceled,` or `=> err,`: the prong's value is the error
+/// C3: a prong or branch on `error.Canceled` (token i) whose body carries
+/// on: it neither returns (or breaks out with) an error nor calls
+/// `recancel`.
+fn checkCanceled(l: *Lint, i: u32, body: Node) !void {
+    const tree = l.tree;
+    // `=> error.Canceled,` or `=> cause,`: the prong's value is the error
     // itself, handed on by the switch's `return`/`break`.
-    if (l.tag(start) == .keyword_error and l.tag(start + 2) == .identifier and std.mem.eql(u8, l.text(start + 2), "Canceled")) return;
-    // `=> cause,`: the prong's value is the error being switched on.
-    if (l.tag(start) == .identifier and (l.tag(start + 1) == .comma or l.tag(start + 1) == .r_brace)) return;
-    var m = start;
-    while (m <= end and m < l.toks.len) : (m += 1) {
-        switch (l.tag(m)) {
+    if (isCanceled(l, body) or tree.nodeTag(body) == .identifier) return;
+    const a, const b = l.tokensOf(body);
+    var m = a;
+    while (m <= b) : (m += 1) {
+        switch (l.tags[m]) {
             .keyword_return, .keyword_try, .keyword_unreachable => return,
             .identifier => if (std.mem.eql(u8, l.text(m), "recancel") or std.mem.eql(u8, l.text(m), "panic")) return,
             .keyword_break => {
                 // `break :blk error.Canceled` hands it on.
                 var q = m;
-                while (q <= end and q < l.toks.len) : (q += 1) if (l.tag(q) == .keyword_error) return;
+                while (q <= b) : (q += 1) if (l.tags[q] == .keyword_error) return;
             },
             else => {},
         }
     }
-    if (l.hasSafetyComment(i, l.stmtStart(i))) return;
+    if (l.hasSafetyComment(i)) return;
     try l.hit(i, "C3", "error.Canceled caught and carried on from: return it, or call io.recancel()");
 }
 

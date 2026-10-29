@@ -30,3 +30,20 @@ fn arg() void {
 fn take(x: u32) void {
     _ = x;
 }
+
+fn nested(comptime n: usize) void {
+    // A function inside an anonymous struct passed as a call argument.
+    run(struct {
+        fn check() void {
+            var buf: [512]u8 = undefined;
+            _ = &buf;
+        }
+    });
+    comptime var out: [n][]const u8 = undefined;
+    var kvs: [n]struct { []const u8, usize } = undefined;
+    _ = .{ &out, &kvs };
+}
+
+fn run(comptime T: type) void {
+    _ = T;
+}

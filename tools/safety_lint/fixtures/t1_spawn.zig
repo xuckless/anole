@@ -43,3 +43,14 @@ fn zio(rt: anytype) void {
 }
 
 fn work() void {}
+
+fn caught(io: std.Io) void {
+    var f = io.concurrent(work, .{}) catch return;
+    f.await(io);
+}
+
+fn optional(io: std.Io, on: bool) !void {
+    var f: ?std.Io.Future(void) = if (on) try io.concurrent(work, .{}) else null;
+    defer if (f) |*x| x.cancel(io);
+    _ = &f;
+}
