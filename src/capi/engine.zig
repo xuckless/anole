@@ -720,7 +720,10 @@ pub const Exec = struct {
         }
         if (wait) {
             const need: usize = if (rec.len > small_record) rec.len else 0;
-            while (!x.hasRoom(need)) x.waitRoom(need, null) catch return freeRecord(rec.ptr);
+            while (!x.hasRoom(need)) x.waitRoom(need, null) catch {
+                if (comptime builtin.is_test) if (test_room_canceled) |h| h();
+                return freeRecord(rec.ptr);
+            };
             _ = x.record_bytes.fetchAdd(rec.len, .monotonic);
             const pushed = x.ring.push(.{ .handle = 0, .rec = rec.ptr });
             std.debug.assert(pushed);
@@ -3630,6 +3633,11 @@ pub var test_pin: if (builtin.is_test) ?*TestPin else void = if (builtin.is_test
 /// the test sets `release`, so a test can end a detached request's stream
 /// while another thread's call is on it.
 pub var test_answer_hold: if (builtin.is_test) ?*TestPin else void = if (builtin.is_test) null else {};
+
+/// A test hook (test builds only): called by `postRecord` when a cancel
+/// ends the poster's wait for ring room, so a test knows the cancel landed
+/// while the poster was parked.
+pub var test_room_canceled: if (builtin.is_test) ?*const fn () void else void = if (builtin.is_test) null else {};
 
 fn testHold(p: *TestPin) void {
     p.held.store(true, .release);

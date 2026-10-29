@@ -1301,6 +1301,107 @@ test "capi engine: a full ring parks the executor on the room futex" {
     try std.testing.expectEqual(@as(u32, 8), counts[@backingInt(abi.EventType.writable)]);
 }
 
+/// A poster that is canceled while it waits for ring room: three records
+/// with `wait` into a ring of 2 (the third parks), then the poster's next
+/// cancelation point.
+const RoomCancel = struct {
+    const PostFuture = std.Io.Future(std.Io.Cancelable!void);
+
+    /// Set by `engine.test_room_canceled`: the cancel ended the wait.
+    var landed: std.atomic.Value(bool) = .init(false);
+
+    fn hook() void {
+        landed.store(true, .release);
+    }
+
+    fn post(x: *engine.Exec, posted: *std.atomic.Value(u32)) std.Io.Cancelable!void {
+        for (0..3) |_| {
+            const rec = engine.newRecord(@sizeOf(abi.Event), .writable, 7) catch return;
+            x.postRecord(rec, true);
+            _ = posted.fetchAdd(1, .release);
+        }
+        try x.engine.io.checkCancel();
+    }
+
+    /// The canceler task: what the poster returned once canceled.
+    fn cancel(io: std.Io, f: *PostFuture) std.Io.Cancelable!void {
+        return f.cancel(io);
+    }
+
+    const Parked = struct {
+        posted: *std.atomic.Value(u32),
+        x: *engine.Exec,
+        fn waiting(p: @This()) bool {
+            return p.posted.load(.acquire) == 2 and p.x.room_waiters.load(.seq_cst) == 1;
+        }
+    };
+
+    fn hasLanded(_: void) bool {
+        return landed.load(.acquire);
+    }
+
+    /// Runs the poster until it is parked for room, cancels it from a
+    /// second task and waits until the cancel reached `postRecord`. The
+    /// caller drains and then awaits `canceler`.
+    const Run = struct {
+        e: *engine.Engine,
+        posted: std.atomic.Value(u32) = .init(0),
+        poster: ?PostFuture = null,
+        canceler: ?PostFuture = null,
+
+        fn start(r: *Run) !void {
+            landed.store(false, .release);
+            engine.test_room_canceled = &hook;
+            const x = &r.e.execs[0];
+            r.poster = try r.e.io.concurrent(post, .{ x, &r.posted });
+            try wait.waitUntil(engine.threadedIo(), "two posted, and the poster waits for room", Parked{ .posted = &r.posted, .x = x }, Parked.waiting);
+            r.canceler = try r.e.io.concurrent(cancel, .{ r.e.io, &r.poster.? });
+            try wait.waitUntil(engine.threadedIo(), "the cancel reached the poster's wait for room", {}, hasLanded);
+        }
+
+        /// Collects both tasks (once, whichever way the test ended) and
+        /// returns what the poster returned.
+        fn finish(r: *Run) std.Io.Cancelable!void {
+            defer engine.test_room_canceled = null;
+            if (r.canceler) |*g| {
+                defer r.canceler = null;
+                defer r.poster = null;
+                return g.await(r.e.io);
+            }
+            if (r.poster) |*f| {
+                defer r.poster = null;
+                return f.cancel(r.e.io);
+            }
+        }
+    };
+};
+
+test "capi engine: a poster canceled while it waits for ring room still delivers its record" {
+    const e, const c = try ringEngine(2);
+    defer e.destroy();
+    var r: RoomCancel.Run = .{ .e = e };
+    defer _ = r.finish() catch {};
+    try r.start();
+    // The consumer makes room: the third record (posted before the cancel)
+    // still arrives, in its place behind the first two.
+    var counts: [64]u32 = @splat(0);
+    try drainCounts(c, &counts, 3);
+    try std.testing.expectEqual(@as(u32, 3), counts[@backingInt(abi.EventType.writable)]);
+}
+
+test "capi engine: a poster canceled while it waits for ring room passes the cancel on" {
+    const e, const c = try ringEngine(2);
+    defer e.destroy();
+    var r: RoomCancel.Run = .{ .e = e };
+    defer _ = r.finish() catch {};
+    try r.start();
+    // Room for the third record; then the poster reaches its next
+    // cancelation point, where the cancel must still be pending.
+    var counts: [64]u32 = @splat(0);
+    try drainCounts(c, &counts, 2);
+    try std.testing.expectError(error.Canceled, r.finish());
+}
+
 fn postAdvisory(x: *engine.Exec) std.Io.Cancelable!void {
     // The ring fills with records that wait for room...
     for (0..2) |_| x.postRecord(engine.newRecord(@sizeOf(abi.Event), .body, 1) catch return, true);
