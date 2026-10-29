@@ -993,13 +993,17 @@ test "kafka capi: a records event lays out records, header spans and bytes" {
     try std.testing.expectEqual(@as(u32, 0), spans[3].len);
 }
 
-test "kafka capi: a delivery event and an assign event" {
+test "kafka capi: a delivery event carries offset, partition and the error code" {
     const rec = try deliveryRecord(.{ .user_data = 9, .partition = 3, .offset = 42, .timestamp_ms = 5, .topic = "t", .code = "MESSAGE_TOO_LARGE", .status = abi.E_BROKER, .http_status = 500, .error_class = .other });
     defer engine.freeRecord(rec.ptr);
     const ev: *const abi.KafkaDeliveryEvent = @ptrCast(rec.ptr);
     try std.testing.expectEqual(@as(u32, 81), ev.ev.type);
     try std.testing.expectEqual(@as(i64, 42), ev.offset);
+    try std.testing.expectEqual(@as(i32, 3), ev.partition);
     try std.testing.expectEqualStrings("MESSAGE_TOO_LARGE", rec[ev.error_code.off..][0..ev.error_code.len]);
+}
+
+test "kafka capi: an assign event lists each topic and partition" {
     const topics = [_][]const u8{ "a", "bb" };
     const parts = [_]i32{ 0, 4 };
     const arec = try assignRecord(.kafka_assign, 1, 2, &topics, &parts);
