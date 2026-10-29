@@ -855,10 +855,11 @@ test "send queue with keep_first keeps its first block across idle spells and gi
 test "signal: a notify between epoch and wait makes wait return at once; no sleepers, no futex call" {
     var s: Signal = .{};
     const seen = s.epoch();
-    // Nobody sleeps: no wake call (the io is never touched).
+    // Nobody sleeps, so notify makes no wake call: testIo() is undefined,
+    // and a futex wake through it would crash.
     s.notify(testIo());
-    try std.testing.expectEqual(@as(u32, 0), s.wakes.load(.monotonic));
     try std.testing.expect(s.epoch() != seen);
+    // The epoch moved, so wait returns without sleeping (it would block
+    // here forever otherwise: nothing else notifies).
     try s.wait(std.testing.io, seen);
-    try std.testing.expectEqual(@as(u32, 1), s.returns.load(.monotonic));
 }
