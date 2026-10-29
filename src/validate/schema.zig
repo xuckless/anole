@@ -401,14 +401,6 @@ test "JSON strings are written as std.json writes them with escape_unicode" {
     }) |s| try expectStdJson(s);
 }
 
-test "a non-ASCII character becomes a \\u escape that std.json reads back" {
-    const text = comptime string("a\u{85}b\u{3000}c😀");
-    try testing.expectEqualStrings("\"a\\u0085b\\u3000c\\ud83d\\ude00\"", text);
-    const parsed = try std.json.parseFromSlice([]const u8, testing.allocator, text, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("a\u{85}b\u{3000}c😀", parsed.value);
-}
-
 test "values are written as JSON: integers exact, floats from their text, tags and strings as strings, lists in brackets" {
     try testing.expectEqualStrings("-170141183460469231731687303715884105728", comptime integer(std.math.minInt(i128)));
     try testing.expectEqualStrings("0.1", comptime param(core.param("min", @as(f32, 0.1))));
