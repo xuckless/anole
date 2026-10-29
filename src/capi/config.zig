@@ -1646,10 +1646,10 @@ fn checkRealtime(cfg: Config, why: *std.Io.Writer) Problem!void {
             found = d;
         };
         const db_cfg = found orelse return fail(why, "watches[{d}]: database \"{s}\" is not in databases", .{ i, w.database });
+        if (db_cfg.sqlite != null) return fail(why, "watches[{d}]: database \"{s}\" is SQLite, which has no change feed", .{ i, w.database });
         if (w.postgres != null and db_cfg.postgres == null) return fail(why, "watches[{d}]: database \"{s}\" is not PostgreSQL, which a postgres watch needs", .{ i, w.database });
         if ((w.redis != null or w.redis_stream != null) and db_cfg.redis == null) return fail(why, "watches[{d}]: database \"{s}\" is not Redis, which a redis watch needs", .{ i, w.database });
         if (w.mongodb != null and db_cfg.mongodb == null) return fail(why, "watches[{d}]: database \"{s}\" is not MongoDB, which a mongodb watch needs", .{ i, w.database });
-        if (db_cfg.sqlite != null) return fail(why, "watches[{d}]: database \"{s}\" is SQLite, which has no change feed", .{ i, w.database });
         if (w.postgres) |p| {
             if (p.channels.len == 0) return fail(why, "watches[{d}].postgres.channels: at least one", .{i});
             for (p.channels) |c| if (c.len == 0 or c.len > 63) return fail(why, "watches[{d}].postgres.channels: 1-63 bytes each", .{i});
