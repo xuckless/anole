@@ -4,6 +4,7 @@
 const std = @import("std");
 const wait = @import("anole_test_wait");
 const root = @import("root.zig");
+const store = @import("store.zig");
 const Time = root.Time;
 const anole = @import("../root.zig");
 const Backend = enum { memory, sqlite, postgres, redis };
@@ -279,6 +280,22 @@ fn Suite(comptime B: Backend) type {
             // The first holder (attempt 1) tries to complete.
             const ok = try be.vt.finish(be.ptr, .{ .id = e.id, .attempt = 1, .to = .completed });
             try std.testing.expect(!ok);
+        }
+
+        test "jobs: heartbeat returns the pairs it renewed, not a stale attempt" {
+            var fx: Fx = undefined;
+            try setup(&fx);
+            defer fx.deinit();
+            const be = fx.client.backend;
+            const e = try fx.client.enqueueRaw(&fx.ctx, "t.plain", "{\"a\":1}", .{});
+            const t0 = Time.fromSeconds(1_800_000_000);
+            const claimed = try be.vt.claim(be.ptr, fx.ctx.arena, .{ .queue = "default", .kinds = null, .limit = 1, .now = t0, .lease_until = .{ .us = t0.us + 30_000_000 }, .worker = "w1" });
+            try std.testing.expectEqual(@as(usize, 1), claimed.len);
+            const attempt = claimed[0].attempt;
+            // An older run of the same job, still ending, beside the current claim's.
+            const sent = [_]store.Held{ .{ .id = e.id, .attempt = attempt - 1 }, .{ .id = e.id, .attempt = attempt } };
+            const renewed = try be.vt.heartbeat(be.ptr, fx.ctx.arena, .{ .us = t0.us + 60_000_000 }, &sent);
+            try std.testing.expectEqualSlices(store.Held, &[_]store.Held{.{ .id = e.id, .attempt = attempt }}, renewed);
         }
 
         test "jobs: kinds filter: a client never claims a kind it has no handler for" {

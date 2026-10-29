@@ -142,6 +142,18 @@ breaking changes are listed anyway.
   no longer counts as a failure for the channel's breaker or retry
   throttle. The error sets of `receive`, `send` and `closeSend` now include
   `Canceled`, so an exhaustive `switch` on them needs the new case (#126).
+- Jobs: two races on the table of running jobs. A job cancelled through the
+  admin API just as its run started could be reported as a lost lease
+  (`ANOLE_JOB_CANCEL_LEASE_LOST`, `job.admin_cancelled` false): the
+  heartbeat could see the run before its job was built, and building it
+  cleared the flag. And when a job was claimed again while its earlier,
+  lost run was still ending, that run's end untracked the new one (whose
+  lease then lapsed, so the job ran again), and the heartbeat took the old
+  run for alive, so both ran at once. Runs are now tracked one by one, the
+  job is built before the heartbeat can see it, and a run counts as alive
+  only when the store renewed its own attempt. A run that cannot be
+  tracked for lack of memory is put back instead of running untracked
+  (#127).
 
 ### Changed
 

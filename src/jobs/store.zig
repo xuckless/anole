@@ -105,8 +105,10 @@ pub const VTable = struct {
     claim: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, req: ClaimRequest) anyerror![]Row,
     /// scheduled/retrying due at `now` -> available; returns how many.
     stage: *const fn (ptr: *anyopaque, now: Time) anyerror!u32,
-    /// Extends the lease of every held job still held; returns those ids.
-    heartbeat: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, until: Time, held: []const Held) anyerror![]Id,
+    /// Extends the lease of every held job still held (running, with that
+    /// attempt); returns the (id, attempt) pairs it renewed, so a run whose
+    /// job was claimed again is told apart from the newer claim.
+    heartbeat: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, until: Time, held: []const Held) anyerror![]Held,
     finish: *const fn (ptr: *anyopaque, f: Finish) anyerror!bool,
     rescue: *const fn (ptr: *anyopaque, arena: std.mem.Allocator, now: Time) anyerror![]Rescued,
     prune: *const fn (ptr: *anyopaque, now: Time, keep: root.Options.Keep) anyerror!u32,
