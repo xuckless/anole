@@ -94,7 +94,7 @@ fn free(_: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void
 
 test "never_reuse: a freed range is not handed out again" {
     if (!supported) return error.SkipZigTest;
-    const a = allocator.alloc(u8, 100) catch return error.SkipZigTest;
+    const a = try allocator.alloc(u8, 100);
     const first = @intFromPtr(a.ptr);
     allocator.free(a);
     const b = try allocator.alloc(u8, 100);

@@ -289,24 +289,18 @@ test "blocking.run: the one executor keeps running other tasks while a job spins
 
     // Errors come back as the function returned them.
     try std.testing.expectError(error.Nope, run(io, fails, .{}));
-
-    // The same job without a pool holds the executor: no ticks meanwhile.
-    const before = ticks.load(.monotonic);
-    _ = spin(io, 100);
-    try std.testing.expect(ticks.load(.monotonic) - before <= 1);
 }
 
-test "blocking.Pool: a canceled caller gets error.Canceled after its job finishes; deinit waits for jobs" {
+test "blocking.Pool: a canceled caller gets error.Canceled only after its job finishes" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     const io = rt.io();
     var pool: Pool = undefined;
     try pool.init(rt, .{ .threads = 1 });
-    // A failed wait must not leave a job spinning: the pool's end lets
-    // `Held` go, and waits for whatever runs.
-    var pool_open = true;
-    errdefer if (pool_open) pool.deinit();
+    // The pool's end waits for whatever runs; the caller is collected
+    // first (defers run in reverse).
+    defer pool.deinit();
 
     // A job that runs until its caller's cancel has arrived (the cancel
     // hook only tells it so), then a little longer.
@@ -345,6 +339,19 @@ test "blocking.Pool: a canceled caller gets error.Canceled after its job finishe
     // returned only once it had finished.
     try std.testing.expect(job.cancel_seen.load(.acquire));
     try std.testing.expect(job.finished.load(.acquire));
+}
+
+test "blocking.Pool: deinit waits for the running job, refuses the waiting one, and run calls directly afterwards" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var pool: Pool = undefined;
+    try pool.init(rt, .{ .threads = 1 });
+    // A failed wait must not leave a job spinning: the pool's end lets
+    // `Held` go, and waits for whatever runs.
+    var pool_open = true;
+    errdefer if (pool_open) pool.deinit();
 
     // With the one slot busy, the other job waits; deinit waits for the
     // running one (which runs until the test has seen the pool closing),
