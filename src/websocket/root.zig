@@ -1217,7 +1217,7 @@ const UpgradedWindow = struct {
 /// record's plaintext (16 KiB) with room ahead of it for the part of a
 /// frame already read, so a read takes a whole record at once. The one
 /// line to change to try a bigger block (32 KiB: two records a read).
-const read_block_len = 16 * 1024 + 512;
+const read_block_len = 32 * 1024 + 512;
 
 /// The blocks `ReadWindow` reads into, kept per thread for reuse, and
 /// beyond `cap` given back to malloc. None of the HTTP core's pools fits:
