@@ -1406,6 +1406,58 @@ test "capi engine: a poster canceled while it waits for ring room passes the can
     try std.testing.expectError(error.Canceled, r.finish());
 }
 
+/// `destroy` on a thread of its own, so the test can wait for it under the
+/// hang guard.
+const Destroyer = struct {
+    e: *engine.Engine,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(d: *Destroyer) void {
+        d.e.destroy();
+        d.done.store(true, .release);
+    }
+
+    fn finished(d: *Destroyer) bool {
+        return d.done.load(.acquire);
+    }
+};
+
+test "capi engine: destroy does not wait for a canceled poster's ring room" {
+    const e, _ = try ringEngine(2);
+    // The poster's own bound outlasts the hang guard below: while nobody
+    // polls, only `destroy` can end its wait in time.
+    engine.test_cancel_post_wait_ns = 3 * wait.deadline().nanoseconds;
+    defer engine.test_cancel_post_wait_ns = null;
+    RoomCancel.landed.store(false, .release);
+    engine.test_room_canceled = &RoomCancel.hook;
+    defer engine.test_room_canceled = null;
+    const x = &e.execs[0];
+    var posted: std.atomic.Value(u32) = .init(0);
+    var poster: ?RoomCancel.PostFuture = null;
+    // Until the canceler owns the poster, a failure cancels it (with the
+    // plain 1 s bound) and destroys the engine here.
+    var handed = false;
+    defer if (!handed) {
+        engine.test_cancel_post_wait_ns = null;
+        if (poster) |*f| _ = f.cancel(e.io) catch {};
+        e.destroy();
+    };
+    poster = try e.io.concurrent(RoomCancel.post, .{ x, &posted });
+    try wait.waitUntil(engine.threadedIo(), "two posted, and the poster waits for room", RoomCancel.Parked{ .posted = &posted, .x = x }, RoomCancel.Parked.waiting);
+    // The canceler runs in the engine's own task group, as the tasks that
+    // post do: the teardown waits for it, and so for the poster.
+    try e.tasks.concurrent(e.io, RoomCancel.cancel, .{ e.io, &poster.? });
+    handed = true;
+    try wait.waitUntil(engine.threadedIo(), "the cancel reached the poster's wait for room", {}, RoomCancel.hasLanded);
+    // Nobody polls: `destroy` (the consumer hears nothing more) must not
+    // wait for room the consumer will never make.
+    var d: Destroyer = .{ .e = e };
+    const t = try std.Thread.spawn(.{}, Destroyer.run, .{&d});
+    defer t.join();
+    try wait.waitUntil(engine.threadedIo(), "destroy finished with the canceled poster parked", &d, Destroyer.finished);
+    try std.testing.expectEqual(@as(u32, 3), posted.load(.acquire));
+}
+
 fn postAdvisory(x: *engine.Exec) std.Io.Cancelable!void {
     // The ring fills with records that wait for room...
     for (0..2) |_| x.postRecord(engine.newRecord(@sizeOf(abi.Event), .body, 1) catch return, true);
