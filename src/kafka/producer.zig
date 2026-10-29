@@ -988,6 +988,7 @@ pub const Producer = struct {
             pid = ids.id;
             epoch = ids.epoch;
             generation = ids.generation;
+            testHold(self.io, .ids_taken);
         }
         std.mem.sort(Work, work, {}, struct {
             fn lt(_: void, a: Work, b: Work) bool {
@@ -1285,4 +1286,128 @@ pub const Producer = struct {
 };
 
 const testing = std.testing;
+const test_wait = @import("anole_test_wait");
 
+/// One holder thread's refs to its completer thread, oldest first (an SPSC
+/// ring of test tooling).
+const RefRing = struct {
+    // SAFETY: an item is written before `tail` passes it, and read only below `tail`.
+    items: [256]Wait.Ref = undefined,
+    head: std.atomic.Value(usize) = .init(0),
+    tail: std.atomic.Value(usize) = .init(0),
+    closed: std.atomic.Value(bool) = .init(false),
+
+    fn push(r: *RefRing, ref: Wait.Ref) void {
+        const t = r.tail.load(.monotonic);
+        while (t - r.head.load(.acquire) == r.items.len) std.Thread.yield() catch {};
+        r.items[t % r.items.len] = ref;
+        r.tail.store(t + 1, .release);
+    }
+
+    /// Null once the ring is closed and empty.
+    fn pop(r: *RefRing) ?Wait.Ref {
+        while (true) {
+            const h = r.head.load(.monotonic);
+            if (h != r.tail.load(.acquire)) {
+                const ref = r.items[h % r.items.len];
+                r.head.store(h + 1, .release);
+                return ref;
+            }
+            if (r.closed.load(.acquire) and h == r.tail.load(.acquire)) return null;
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+const WaitRace = struct {
+    p: *Producer,
+    ring: RefRing = .{},
+    index: u32,
+    seed: u64,
+    refs: usize,
+    failure: ?anyerror = null,
+
+    fn hold(w: *WaitRace) void {
+        w.holdInner() catch |err| {
+            w.failure = err;
+        };
+        w.ring.closed.store(true, .release);
+    }
+
+    fn holdInner(w: *WaitRace) !void {
+        var prng: std.Random.DefaultPrng = .init(w.seed);
+        const rand = prng.random();
+        for (0..w.refs) |_| {
+            const ref = blk: {
+                w.p.mutex.lockUncancelable(w.p.io);
+                defer w.p.mutex.unlock(w.p.io);
+                try w.p.waits.reserve(w.p.gpa);
+                break :blk w.p.waits.take();
+            };
+            w.ring.push(ref);
+            switch (rand.uintLessThan(u32, 5)) {
+                0 => w.p.abandon(ref),
+                4 => try w.check(ref, try w.p.waitFor(ref, null)),
+                else => |ticks| try w.check(ref, try w.p.waitFor(ref, .fromMicroseconds(20 * (ticks - 1)))),
+            }
+        }
+    }
+
+    /// A result reaches only the holder whose own completion made it.
+    fn check(w: *WaitRace, ref: Wait.Ref, out: Producer.Outcome) !void {
+        switch (out) {
+            .ok => |d| {
+                try testing.expectEqual(@as(i32, @intCast(w.index)), d.partition);
+                try testing.expectEqual(@as(i64, ref.gen), d.offset);
+            },
+            .timeout => {},
+            .failed => return error.TestUnexpectedResult,
+        }
+    }
+
+    fn completeAll(w: *WaitRace) void {
+        while (w.ring.pop()) |ref| {
+            w.p.complete(ref, .{ .ok = .{ .partition = @intCast(w.index), .offset = ref.gen, .timestamp_ms = 0 } });
+        }
+    }
+};
+
+test "kafka producer: [stress] waits, completions and abandons race" {
+    try test_wait.requireStress();
+    const seed: u64 = 0x5eed_4a1f;
+    errdefer std.debug.print("kafka wait race: seed 0x{x}\n", .{seed});
+    var p: Producer = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        // SAFETY: the wait table never reaches the cluster.
+        .cluster = undefined,
+        .cfg = .{},
+    };
+    defer p.waits.deinit(testing.allocator);
+    const pairs = 4;
+    // SAFETY: every element is set on the next line.
+    var races: [pairs]WaitRace = undefined;
+    for (&races, 0..) |*w, i| w.* = .{ .p = &p, .index = @intCast(i), .seed = seed +% i, .refs = 1_000_000 / pairs };
+    // SAFETY: only `threads[0..started]` is read.
+    var threads: [2 * pairs]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |t| t.join();
+    for (&races) |*w| {
+        threads[started] = try std.Thread.spawn(.{}, WaitRace.completeAll, .{w});
+        started += 1;
+        threads[started] = try std.Thread.spawn(.{}, WaitRace.hold, .{w});
+        started += 1;
+    }
+    for (threads[0..started]) |t| t.join();
+    started = 0;
+    for (&races) |*w| if (w.failure) |err| return err;
+    // Every slot was given back.
+    p.mutex.lockUncancelable(p.io);
+    defer p.mutex.unlock(p.io);
+    var free: usize = 0;
+    var n = p.waits.freed.takeAll();
+    while (n) |node| : (n = node.next) free += 1;
+    var f = p.waits.free;
+    while (f) |w| : (f = w.next_free) free += 1;
+    try testing.expectEqual(p.waits.chunks.items.len * WaitTable.chunk_len, free);
+}

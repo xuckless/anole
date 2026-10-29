@@ -786,3 +786,173 @@ test "kafka producer: a produce that timed out is still delivered, and nothing l
     try client.producer.flush(.fromSeconds(10));
     try testing.expectEqual(@as(i64, 2), broker.count("late", 0));
 }
+
+test "kafka producer: a sender whose producer id was reset after it took it numbers its batch under the new id" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 2, .nodes = 2 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    for (0..3) |_| {
+        _ = try client.produce(&c, .{ .topic = "ids", .value = "warm", .partition = 0 });
+        _ = try client.produce(&c, .{ .topic = "ids", .value = "warm", .partition = 1 });
+    }
+
+    // Partition 1's sender stops after taking the producer id.
+    var hold: TestHold = .{ .point = .ids_taken };
+    hold.arm();
+    defer hold_mod.test_hold.store(null, .release);
+    var result: TaskResult = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, produceTask, .{ client, io, kafka.Record{ .topic = "ids", .value = "held", .partition = 1 }, &result });
+    try wait.waitFlag(io, "partition 1's sender is held after taking the id", &hold.held);
+    // Meanwhile partition 0's sender is refused (UNKNOWN_PRODUCER_ID), resets
+    // the id and takes a new one.
+    broker.fail_code.store(59, .release);
+    broker.fail_produce.store(1, .release);
+    _ = try client.produce(&c, .{ .topic = "ids", .value = "reset", .partition = 0 });
+    hold.let(io);
+    try result.wait(io);
+    // The held batch went out under the new id: stored, not taken for a
+    // duplicate of the old id's sequence.
+    try testing.expectEqual(@as(i64, 4), broker.count("ids", 0));
+    try testing.expectEqual(@as(i64, 4), broker.count("ids", 1));
+    try testing.expectEqual(@as(u32, 0), broker.out_of_order.load(.monotonic));
+}
+
+/// What one task of the four-executor stress test did with each record.
+const StressTask = struct {
+    const records_per_task = 24;
+    const Kind = enum(u8) { send, ok, failed, pending };
+
+    client: *kafka.Client,
+    broker: *FakeBroker,
+    io: std.Io,
+    index: u32,
+    seed: u64,
+    /// Inject retriable failures and dropped answers (phase 1 only: a
+    /// dropped answer across an id reset may store a record twice, which
+    /// an idempotent producer allows).
+    inject: bool,
+    kinds: [records_per_task]Kind = @splat(.failed),
+    failure: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn name(t: *const StressTask, buf: []u8, i: usize) []const u8 {
+        return std.fmt.bufPrint(buf, "p{d}-t{d}-r{d}", .{ @intFromBool(t.inject), t.index, i }) catch unreachable;
+    }
+
+    fn run(t: *StressTask) std.Io.Cancelable!void {
+        defer t.done.store(true, .release);
+        t.runInner() catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => t.failure = err,
+        };
+    }
+
+    fn runInner(t: *StressTask) !void {
+        var prng: std.Random.DefaultPrng = .init(t.seed);
+        const rand = prng.random();
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        for (0..records_per_task) |i| {
+            _ = arena.reset(.retain_capacity);
+            var c: db.Ctx = .{ .io = t.io, .arena = arena.allocator() };
+            var buf: [32]u8 = undefined;
+            const record: kafka.Record = .{ .topic = "stress", .key = t.name(&buf, i), .value = t.name(&buf, i) };
+            if (t.inject) switch (rand.uintLessThan(u32, 48)) {
+                0 => t.broker.fail_produce.store(1, .release),
+                1 => t.broker.drop_after_store.store(1, .release),
+                else => {},
+            };
+            switch (rand.uintLessThan(u32, 8)) {
+                0...4 => {
+                    try t.client.send(&c, record);
+                    t.kinds[i] = .send;
+                },
+                5, 6 => {
+                    const ms = 1 + rand.uintLessThan(u32, 1000);
+                    if (t.client.with(.{ .timeout = .fromMilliseconds(ms) }).produce(&c, record)) |_| {
+                        t.kinds[i] = .ok;
+                    } else |err| switch (err) {
+                        error.Canceled => return error.Canceled,
+                        else => {
+                            const code = (db.lastError(&c) orelse return err).code;
+                            t.kinds[i] = if (std.mem.eql(u8, code, "delivery_pending")) .pending else .failed;
+                        },
+                    }
+                },
+                else => {
+                    try t.client.send(&c, record);
+                    t.kinds[i] = .send;
+                    try t.client.with(.{ .timeout = .fromSeconds(30) }).flush(&c);
+                },
+            }
+        }
+    }
+};
+
+fn stressPhase(io: std.Io, client: *kafka.Client, broker: *FakeBroker, tasks: []StressTask, inject: bool, seed: u64) !void {
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (tasks, 0..) |*t, i| {
+        t.* = .{ .client = client, .broker = broker, .io = io, .index = @intCast(i), .seed = seed +% i, .inject = inject };
+        try dusty.placement.concurrent(&group, io, .{ .executor = i }, StressTask.run, .{t});
+    }
+    for (tasks) |*t| try wait.waitUntilFor(io, "every stress task finished", .fromSeconds(120), t, struct {
+        fn done(x: *StressTask) bool {
+            return x.done.load(.acquire);
+        }
+    }.done);
+    for (tasks) |*t| if (t.failure) |err| return err;
+}
+
+test "kafka: [stress] produce from four executors to two nodes with retries, timeouts and an id reset" {
+    try wait.requireStress();
+    const seed: u64 = 0x4b_af_4a;
+    errdefer std.debug.print("kafka four-executor stress: seed 0x{x}\n", .{seed});
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 8, .nodes = 2 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    const tasks = try gpa.alloc(StressTask, 4 * 64);
+    defer gpa.free(tasks);
+    const both = try gpa.alloc(StressTask, 2 * tasks.len);
+    defer gpa.free(both);
+
+    // Phase 1: NOT_LEADER_OR_FOLLOWER (a stale leader) and dropped answers.
+    broker.fail_code.store(6, .release);
+    try stressPhase(io, client, broker, tasks, true, seed);
+    @memcpy(both[0..tasks.len], tasks);
+    // Phase 2: UNKNOWN_PRODUCER_ID once: the id is reset under load.
+    try client.producer.flush(.fromSeconds(30));
+    broker.fail_code.store(59, .release);
+    broker.fail_produce.store(1, .release);
+    try stressPhase(io, client, broker, tasks, false, seed +% 0x10000);
+    @memcpy(both[tasks.len..], tasks);
+    try client.producer.flush(.fromSeconds(30));
+
+    try testing.expectEqual(@as(u32, 0), broker.out_of_order.load(.monotonic));
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var seen: std.StringHashMapUnmanaged(u32) = .empty;
+    for (0..8) |p| for (try broker.stored(arena.allocator(), "stress", p)) |r| {
+        const gop = try seen.getOrPut(arena.allocator(), r.value.?);
+        gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+    };
+    // Every record is stored once, but a failed one at most once.
+    for (both) |*t| for (t.kinds, 0..) |k, i| {
+        var buf: [32]u8 = undefined;
+        const n = seen.get(t.name(&buf, i)) orelse 0;
+        if (k == .failed) try testing.expect(n <= 1) else try testing.expectEqual(@as(u32, 1), n);
+    };
+}

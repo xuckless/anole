@@ -95,7 +95,9 @@ fn pastDeadline(started: std.Io.Timestamp) bool {
 
 test "capi kafka: every produced record gets one DELIVERY event, a key's records in order" {
     if (comptime !features.kafka) return error.SkipZigTest;
+    // SAFETY: `start` sets every field.
     var r: Rig = undefined;
+    // SAFETY: `start` sets every element.
     var cs: [1]*engine.Consumer = undefined;
     try r.start(&cs);
     defer r.deinit();
@@ -199,16 +201,20 @@ const Producer = struct {
 test "capi kafka: [stress] produces from four consumer threads racing the stop" {
     if (comptime !features.kafka) return error.SkipZigTest;
     try wait.requireStress();
+    // SAFETY: `start` sets every field.
     var r: Rig = undefined;
+    // SAFETY: `start` sets every element.
     var cs: [4]*engine.Consumer = undefined;
     try r.start(&cs);
     defer r.deinit();
+    // SAFETY: every element is set on the next line.
     var ps: [4]Producer = undefined;
     for (&ps, cs, 0..) |*p, c, i| p.* = .{ .r = &r, .c = c, .index = i };
     defer for (&ps) |*p| {
         p.taken.deinit(alloc);
         if (p.deliveries) |*d| d.deinit();
     };
+    // SAFETY: only `threads[0..started]` is read.
     var threads: [4]std.Thread = undefined;
     var started: usize = 0;
     defer for (threads[0..started]) |t| t.join();

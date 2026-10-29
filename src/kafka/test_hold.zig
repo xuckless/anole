@@ -19,6 +19,8 @@ pub const TestPoint = enum {
     pid_reset,
     /// A sender, before its Produce round trip.
     send_request,
+    /// A sender, between taking the producer id and numbering its batches.
+    ids_taken,
     /// Right after a consumer member task was spawned (the same yield as
     /// `sender_spawned`).
     member_spawned,
