@@ -1,7 +1,11 @@
 //! Whole documents: the app's routes and services written out and compared,
 //! byte for byte, with the files in tests/openapi/. On a mismatch the
-//! document is written to tests/openapi/<name>.actual.json for review; there
-//! is no update flag, so changing a golden file is a deliberate copy.
+//! document is written to tests/openapi/<name>.actual.json for review.
+//! After an intended change, regenerate them with ANOLE_UPDATE_GOLDEN=1
+//! (`ANOLE_UPDATE_GOLDEN=1 zig build test -Dtest-filter=openapi`, as the
+//! console's goldens) and read the diff (TESTING.md F2). A golden file
+//! checked out with CRLF line ends (Git's autocrlf on Windows) compares as
+//! LF.
 const std = @import("std");
 const dusty = @import("dusty");
 const server_mod = @import("../server.zig");
@@ -29,11 +33,17 @@ fn expectGolden(name: []const u8, actual: []const u8) !void {
     const io = std.testing.io;
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "tests/openapi/{s}.json", .{name});
-    const want = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(4 << 20)) catch |err| switch (err) {
+    if (try std.testing.environ.containsUnempty(alloc, "ANOLE_UPDATE_GOLDEN")) {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = actual });
+        return;
+    }
+    const file = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(4 << 20)) catch |err| switch (err) {
         error.FileNotFound => "",
         else => return err,
     };
-    defer if (want.len > 0) alloc.free(want);
+    defer if (file.len > 0) alloc.free(file);
+    const want = try std.mem.replaceOwned(u8, alloc, file, "\r\n", "\n");
+    defer alloc.free(want);
     if (std.mem.eql(u8, want, actual)) return;
     const actual_path = try std.fmt.allocPrint(alloc, "tests/openapi/{s}.actual.json", .{name});
     defer alloc.free(actual_path);
