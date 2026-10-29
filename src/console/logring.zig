@@ -5,6 +5,7 @@
 const std = @import("std");
 const logging = @import("anole_log");
 const ui = @import("anole_console_ui");
+const safety = @import("anole_safety");
 
 pub const ring_count = 16;
 pub const header_len = 16;
@@ -46,7 +47,7 @@ pub const Filter = struct {
 };
 
 const Ring = struct {
-    lock: std.atomic.Mutex = .unlocked,
+    lock: safety.SpinLock(.leaf) = .init,
     buf: []u8 = &.{},
     /// Absolute byte offsets: the next write, and the oldest intact record.
     head: u64 = 0,
@@ -54,10 +55,6 @@ const Ring = struct {
     /// The sequence number of the record at `tail`, and of the next write.
     first_seq: u64 = 0,
     next_seq: u64 = 0,
-
-    fn acquire(self: *Ring) void {
-        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
-    }
 
     fn copyIn(self: *Ring, at: u64, bytes: []const u8) void {
         const size = self.buf.len;
@@ -168,7 +165,7 @@ pub const LogRing = struct {
         std.mem.writeInt(u16, h[14..16], @intCast(text.len), .little);
 
         const r = &self.rings[myRing()];
-        r.acquire();
+        r.lock.lock();
         defer r.lock.unlock();
         if (r.buf.len == 0) r.buf = self.gpa.alloc(u8, self.size_each) catch return;
         while (r.head + n - r.tail > r.buf.len) {
@@ -213,7 +210,7 @@ pub const LogRing = struct {
     /// backlog starts from).
     pub fn attachAtEnd(self: *LogRing, cursors: *Cursors) void {
         for (&self.rings, cursors) |*r, *c| {
-            r.acquire();
+            r.lock.lock();
             c.* = .{ .offset = r.head, .seq = r.next_seq };
             r.lock.unlock();
         }
@@ -224,7 +221,7 @@ pub const LogRing = struct {
     pub fn readNew(self: *LogRing, arena: std.mem.Allocator, cursors: *Cursors, out: *std.ArrayList(Rec), dropped: *u64) !void {
         const start = out.items.len;
         for (&self.rings, cursors) |*r, *c| {
-            r.acquire();
+            r.lock.lock();
             defer r.lock.unlock();
             if (r.buf.len == 0) continue;
             if (c.offset < r.tail) {
@@ -246,7 +243,7 @@ pub const LogRing = struct {
     pub fn readBacklogAndAttach(self: *LogRing, arena: std.mem.Allocator, cursors: *Cursors, out: *std.ArrayList(Rec)) !void {
         const start = out.items.len;
         for (&self.rings, cursors) |*r, *c| {
-            r.acquire();
+            r.lock.lock();
             defer r.lock.unlock();
             c.* = .{ .offset = r.head, .seq = r.next_seq };
             if (r.buf.len == 0) continue;

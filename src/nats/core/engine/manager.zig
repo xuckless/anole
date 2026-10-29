@@ -38,6 +38,7 @@ const events = @import("../events.zig");
 const incoming = @import("incoming.zig");
 const dialer = @import("connect.zig");
 const time = @import("time.zig");
+const safety = @import("anole_safety");
 const log = std.log.scoped(.nats);
 
 /// Why a connection ends.
@@ -289,7 +290,7 @@ fn openFirst(client: *Client) Client.ConnectError!Opened {
 /// shut down: the attempt may have lost its cancellation and would wait on
 /// the socket for good. The mutex keeps shutdown off a closed socket.
 pub const AttemptState = struct {
-    mutex: Io.Mutex = .init,
+    mutex: safety.Mutex(.leaf) = .init,
     stream: ?*ClientStream = null,
     aborted: bool = false,
     /// How the server refused the credentials, when it did.

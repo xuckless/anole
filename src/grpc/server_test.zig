@@ -1502,3 +1502,100 @@ test "grpc channel: Retry.attempt_timeout cuts a stuck attempt and the call is r
         }
     }.run);
 }
+
+/// The client ports the calls of `withCountingServer` came from: one per
+/// connection the server accepted.
+const Connections = struct {
+    var ports: [16]std.atomic.Value(u16) = @splat(.init(0));
+
+    fn reset() void {
+        for (&ports) |*p| p.store(0, .monotonic);
+    }
+
+    fn unary(call: *grpc.Call, req: pb.EchoRequest) anyerror!pb.EchoResponse {
+        const port = call.req.remote_address.getPort();
+        for (&ports) |*p| {
+            const seen = p.cmpxchgStrong(0, port, .acq_rel, .acquire) orelse break;
+            if (seen == port) break;
+        }
+        return .{ .message = req.message, .index = 0 };
+    }
+
+    fn count() usize {
+        var n: usize = 0;
+        for (&ports) |*p| {
+            if (p.load(.acquire) != 0) n += 1;
+        }
+        return n;
+    }
+};
+
+/// An Echo server whose unary calls note their connection (`Connections`),
+/// on a runtime of `executors`.
+fn withCountingServer(executors: u8, comptime body: fn (std.mem.Allocator, std.Io, u16) anyerror!void) !void {
+    Connections.reset();
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(executors) });
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Echo, .{
+        .Unary = Connections.unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    });
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+    try body(gpa, io, server.address.ip.getPort());
+}
+
+/// One unary call on `channel`; a failure is counted in `failed`.
+fn countedCall(channel: *grpc.Channel, gpa: std.mem.Allocator, failed: *std.atomic.Value(u32)) void {
+    const client: grpc.Client(Echo) = .{ .channel = channel };
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const r = client.unary("Unary", arena_state.allocator(), .{ .message = "x" }, .{}) catch {
+        _ = failed.fetchAdd(1, .monotonic);
+        return;
+    };
+    if (r.status.code != .ok) _ = failed.fetchAdd(1, .monotonic);
+}
+
+/// Shuts the channel's connection down under it and waits until the
+/// channel sees it closed.
+fn loseConnection(channel: *grpc.Channel, io: std.Io) !void {
+    const conn = channel.conn.?;
+    conn.socket.shutdown(io, .both) catch {};
+    try wait.waitUntil(io, "the channel's connection closed", conn, struct {
+        fn closed(c_: *@TypeOf(conn.*)) bool {
+            return !c_.isOpen();
+        }
+    }.closed);
+}
+
+test "grpc channel: calls after the connection closed share one redial" {
+    try withCountingServer(2, struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
+            const channel = try grpc.Channel.connect(gpa, io, .{ .host = "127.0.0.1", .port = port }, .{});
+            defer channel.close();
+            var failed: std.atomic.Value(u32) = .init(0);
+            countedCall(channel, gpa, &failed);
+            try loseConnection(channel, io);
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            for (0..16) |_| try group.concurrent(io, countedCall, .{ channel, gpa, &failed });
+            try group.await(io);
+            try std.testing.expectEqual(@as(u32, 0), failed.load(.monotonic));
+            try std.testing.expectEqual(@as(usize, 2), Connections.count());
+        }
+    }.run);
+}

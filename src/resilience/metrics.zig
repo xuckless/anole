@@ -6,6 +6,7 @@
 const std = @import("std");
 const core = @import("resilience_core");
 const observe = @import("../observe/root.zig");
+const safety = @import("anole_safety");
 
 const metrics = observe.metrics;
 
@@ -24,7 +25,7 @@ pub const Binding = struct {
     rejected: *metrics.Family(metrics.Counter),
     retries: *metrics.Family(metrics.Counter),
     throttled: *metrics.Family(metrics.Counter),
-    lock: std.atomic.Mutex = .unlocked,
+    lock: safety.SpinLock(.leaf) = .init,
     /// Targets seen per client kind.
     seen: [8]std.StringHashMapUnmanaged(void) = @splat(.empty),
     hooks: core.Metrics = .{},
@@ -63,7 +64,7 @@ pub const Binding = struct {
 
     fn label(self: *Binding, kind: core.Kind, target: []const u8) []const u8 {
         const set = &self.seen[@backingInt(kind)];
-        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
+        self.lock.lock();
         defer self.lock.unlock();
         if (set.contains(target)) return set.getKey(target).?;
         if (set.count() >= max_targets) return "other";
@@ -105,7 +106,9 @@ test "metrics: target labels capped at 256, then other" {
     const gpa = testing.allocator;
     var registry = metrics.Registry.init(gpa, testing.io);
     defer registry.deinit();
-    var binding = try Binding.init(gpa, &registry);
+    // The binding's allocations are checked against its spin lock (L5).
+    var checked: safety.SpinCheckedAllocator = .init(gpa);
+    var binding = try Binding.init(checked.allocator(), &registry);
     defer binding.deinit();
     const hooks = binding.metricsHooks();
     var buf: [32]u8 = undefined;
@@ -125,4 +128,26 @@ test "metrics: target labels capped at 256, then other" {
     try testing.expect(std.mem.indexOf(u8, text, "target=\"h256\"") == null);
     try testing.expect(std.mem.indexOf(u8, text, "target=\"h260\"") == null);
     try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_rejected_total{client=\"grpc\",target=\"x\"} 1") != null);
+}
+
+test "metrics: a breaker's state reaches the metrics when it is made, and when the breakers are observed" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var registry = metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    var binding = try Binding.init(gpa, &registry);
+    defer binding.deinit();
+    var breakers = core.Breakers.init(gpa, .{}, .http, 64);
+    defer breakers.deinit();
+    // Made before the metrics: reported when they are observed.
+    _ = try breakers.get(io, "a");
+    breakers.observe(io, binding.metricsHooks());
+    // Made after: reported as it is made.
+    _ = try breakers.get(io, "b");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    const text = out.written();
+    try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_state{client=\"http\",target=\"a\"} 0") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_state{client=\"http\",target=\"b\"} 0") != null);
 }

@@ -10,6 +10,7 @@ const service = @import("service.zig");
 const stats_mod = @import("stats.zig");
 const logring = @import("logring.zig");
 const os = @import("os.zig");
+const safety = @import("anole_safety");
 
 const sys = ui.sys;
 const protocol = ui.protocol;
@@ -94,18 +95,24 @@ const Fake = struct {
 
 const Harness = struct {
     gpa: std.mem.Allocator,
+    /// What the service, its rings and its stats allocate with: a call
+    /// while a spin lock is held panics (SAFETY.md L5).
+    checked: *safety.SpinCheckedAllocator,
     fake: *Fake,
     stats: *stats_mod.Stats,
     logs: *logring.LogRing,
     svc: *service.Service,
 
     fn init(gpa: std.mem.Allocator, opts: service.Options, allow: protocol.Allow) !Harness {
+        const checked = try gpa.create(safety.SpinCheckedAllocator);
+        checked.* = .init(gpa);
+        const sa = checked.allocator();
         const fake = try gpa.create(Fake);
         fake.* = .{};
         const st = try gpa.create(stats_mod.Stats);
-        st.* = try stats_mod.Stats.init(gpa, 2, 8, 16);
+        st.* = try stats_mod.Stats.init(sa, 2, 8, 16);
         const lr = try gpa.create(logring.LogRing);
-        lr.* = logring.LogRing.init(gpa, 64 * 1024);
+        lr.* = logring.LogRing.init(sa, 64 * 1024);
         const info: service.Info = .{
             .anole = "0.3.0",
             .name = "test",
@@ -130,8 +137,8 @@ const Harness = struct {
             .route_meta = Fake.routeMeta,
             .routes = Fake.routes,
         };
-        const svc = try service.Service.init(gpa, host, info, opts, st, lr, null);
-        return .{ .gpa = gpa, .fake = fake, .stats = st, .logs = lr, .svc = svc };
+        const svc = try service.Service.init(sa, host, info, opts, st, lr, null);
+        return .{ .gpa = gpa, .checked = checked, .fake = fake, .stats = st, .logs = lr, .svc = svc };
     }
 
     fn deinit(self: *Harness) void {
@@ -141,6 +148,7 @@ const Harness = struct {
         self.stats.deinit();
         self.gpa.destroy(self.stats);
         self.gpa.destroy(self.fake);
+        self.gpa.destroy(self.checked);
     }
 
     /// A connected, hello'd client.

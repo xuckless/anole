@@ -33,6 +33,7 @@ const deadline = @import("deadline.zig");
 const Compression = @import("compression.zig").Compression;
 const server = @import("server.zig");
 const resilience = @import("resilience_core");
+const safety = @import("anole_safety");
 const features = @import("build_options");
 const wire = @import("wire.zig");
 const alt_svc = @import("../h3/alt_svc.zig");
@@ -133,7 +134,7 @@ pub const Channel = struct {
         options: h2.ConnectOptions,
         http: Http,
         http3: Http3,
-        mutex: std.Io.Mutex = .init,
+        mutex: safety.Mutex(.leaf) = .init,
         /// Connections replaced by a redial: they may still carry calls,
         /// so they close with the channel.
         retired: std.ArrayList(*h2.ClientConnection) = .empty,

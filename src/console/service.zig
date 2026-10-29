@@ -15,6 +15,7 @@ const stats_mod = @import("stats.zig");
 const logring = @import("logring.zig");
 const procinfo = @import("procinfo.zig");
 const reexec = @import("reexec.zig");
+const safety = @import("anole_safety");
 
 const protocol = ui.protocol;
 const sys = ui.sys;
@@ -136,7 +137,7 @@ pub const Service = struct {
     stopped: bool = false,
     bye_reason: std.atomic.Value(u8) = .init(0),
 
-    lock: std.atomic.Mutex = .unlocked,
+    lock: safety.SpinLock(.leaf) = .init,
     clients: std.ArrayList(*Client) = .empty,
     attached: std.atomic.Value(u32) = .init(0),
     euid: u32,
@@ -173,10 +174,6 @@ pub const Service = struct {
         return self;
     }
 
-    fn acquire(self: *Service) void {
-        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
-    }
-
     /// Binds the socket and starts accepting. Failure leaves the service
     /// usable for the in-process console.
     pub fn listen(self: *Service, path: []const u8) !void {
@@ -210,7 +207,7 @@ pub const Service = struct {
         self.acceptor = null;
         // Clients join themselves in `reap`; wait for all of them.
         while (true) {
-            self.acquire();
+            self.lock.lock();
             const n = self.clients.items.len;
             self.lock.unlock();
             if (n == 0) break;
@@ -238,7 +235,7 @@ pub const Service = struct {
     fn reap(self: *Service) void {
         var finished: [8]*Client = undefined;
         var n: usize = 0;
-        self.acquire();
+        self.lock.lock();
         var i: usize = 0;
         while (i < self.clients.items.len and n < finished.len) {
             const c = self.clients.items[i];
@@ -258,7 +255,7 @@ pub const Service = struct {
     }
 
     fn liveCount(self: *Service) usize {
-        self.acquire();
+        self.lock.lock();
         defer self.lock.unlock();
         var n: usize = 0;
         for (self.clients.items) |c| {
@@ -283,7 +280,7 @@ pub const Service = struct {
         c.* = .{ .service = self, .fd = fd, .in_process = in_process };
         errdefer self.gpa.destroy(c);
         sys.setNonblock(fd);
-        self.acquire();
+        self.lock.lock();
         self.clients.append(self.gpa, c) catch {
             self.lock.unlock();
             return error.OutOfMemory;
@@ -292,7 +289,7 @@ pub const Service = struct {
         _ = self.attached.fetchAdd(1, .monotonic);
         c.thread = std.Thread.spawn(.{}, clientMain, .{c}) catch {
             _ = self.attached.fetchSub(1, .monotonic);
-            self.acquire();
+            self.lock.lock();
             for (self.clients.items, 0..) |x, i| if (x == c) {
                 _ = self.clients.swapRemove(i);
                 break;
@@ -395,7 +392,7 @@ pub const Service = struct {
             }
             const seq = self.broadcast_seq.load(.acquire);
             if (seq != last_broadcast) {
-                self.acquire();
+                self.lock.lock();
                 const text = self.gpa.dupe(u8, self.broadcast_buf[0..self.broadcast_len]) catch "";
                 self.lock.unlock();
                 defer if (text.len > 0) self.gpa.free(text);
@@ -631,7 +628,7 @@ pub const Service = struct {
 
     /// Queues a line for every client; returns its sequence.
     pub fn broadcastLine(self: *Service, line: []const u8) u32 {
-        self.acquire();
+        self.lock.lock();
         const n = @min(line.len, self.broadcast_buf.len);
         @memcpy(self.broadcast_buf[0..n], line[0..n]);
         self.broadcast_len = n;
@@ -645,7 +642,7 @@ pub const Service = struct {
         const deadline = sys.monotonicMs() + timeout_ms;
         while (sys.monotonicMs() < deadline) {
             var all = true;
-            self.acquire();
+            self.lock.lock();
             for (self.clients.items) |c| {
                 if (c.done.load(.acquire)) continue;
                 if (c.seen_broadcast.load(.acquire) != seq) all = false;
@@ -972,7 +969,7 @@ pub const Service = struct {
                 try root.put(a, "anole", .{ .string = self.info.anole });
                 try root.put(a, "runtime", .{ .string = self.runtime_name });
                 var lang: std.json.Array = .init(a);
-                self.acquire();
+                self.lock.lock();
                 defer self.lock.unlock();
                 for (self.metrics[0..self.metric_count]) |m| {
                     var o: std.json.ObjectMap = .empty;
@@ -990,7 +987,7 @@ pub const Service = struct {
     /// The C ABI's `anole_console_report`: replaces the language metrics.
     pub fn setMetrics(self: *Service, items: []const Metric) !void {
         if (items.len > self.metrics.len) return error.TooMany;
-        self.acquire();
+        self.lock.lock();
         defer self.lock.unlock();
         _ = self.metric_arena.reset(.retain_capacity);
         const ma = self.metric_arena.allocator();

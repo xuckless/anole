@@ -69,6 +69,7 @@ const dialer = @import("engine/connect.zig");
 const manager = @import("engine/manager.zig");
 const time = @import("engine/time.zig");
 const Broadcast = @import("engine/Broadcast.zig");
+const safety = @import("anole_safety");
 const log = std.log.scoped(.nats);
 const Client = @This();
 
@@ -104,7 +105,7 @@ connection: Connection = undefined,
 /// Held while connect, close and deinit start or stop the manager.
 lifecycle: Io.Mutex = .init,
 /// Guards the fields below.
-mutex: Io.Mutex = .init,
+mutex: safety.Mutex(.leaf) = .init,
 /// Woken on every change of the fields below. Any number of tasks may
 /// wait on it, as callers of `connect()` do while it connects.
 changed: Broadcast = .{},

@@ -399,6 +399,37 @@ test "with retry_initial_connect, close() stops the attempts at once" {
     }.one, test_wait.short_window);
 }
 
+/// Takes the connection and says nothing, not even INFO, until the test
+/// releases it.
+fn sessionSilentUntilReleased(peer: *FakeServer.Peer, record: *Record) anyerror!void {
+    try record.release.wait(peer.io);
+}
+
+fn acceptedOne(r: *Record) bool {
+    return r.accepted.load(.monotonic) == 1;
+}
+
+test "close() during a connection attempt stops the attempt and closes the client" {
+    const io = testing.io;
+    var listener = try FakeServer.listen(io);
+    defer listener.deinit(io);
+    var record: Record = .{};
+    defer record.deinit();
+    const sessions = [_]Session{sessionSilentUntilReleased};
+    var server = try io.concurrent(serveSessions, .{ io, &listener, &sessions, &record });
+    defer server.cancel(io) catch {};
+    defer record.release.set(io);
+    var url: [64]u8 = undefined;
+    var client: Client = try .init(testing.allocator, io, .{ .servers = &.{try FakeServer.url(&listener, &url)}, .retry_initial_connect = true });
+    defer client.deinit();
+    try client.connect();
+    // The attempt is connected and waits for the server's INFO.
+    try awaitAccepted(&record, 1);
+    client.close();
+    try testing.expectEqual(.closed, client.state());
+    try test_wait.expectStays(io, "no connection attempt after close()", &record, acceptedOne, test_wait.short_window);
+}
+
 /// Hangs up as soon as the client subscribed to `sub`.
 fn sessionHangUpAfterSub(peer: *FakeServer.Peer, record: *Record) anyerror!void {
     try handshake(peer, golden.info_default);

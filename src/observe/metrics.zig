@@ -20,6 +20,7 @@
 //! raw path, so their number stays bounded.
 const std = @import("std");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const common = @import("common.zig");
 
 /// A value that only goes up (requests, errors, bytes). Safe from any
@@ -117,7 +118,7 @@ pub fn Family(comptime T: type) type {
         help: []const u8,
         labels: []const []const u8,
         buckets: []const f64 = &default_buckets,
-        mutex: std.Io.Mutex = .init,
+        mutex: safety.Mutex(.leaf) = .init,
         series: std.StringArrayHashMapUnmanaged(*T) = .empty,
 
         /// The series for these label values (as many as the labels).
@@ -234,7 +235,7 @@ fn escape(w: *std.Io.Writer, v: []const u8) !void {
 pub const Registry = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    mutex: std.Io.Mutex = .init,
+    mutex: safety.Mutex(.leaf) = .init,
     counters: std.ArrayList(*Family(Counter)) = .empty,
     gauges: std.ArrayList(*Family(Gauge)) = .empty,
     histograms: std.ArrayList(*Family(Histogram)) = .empty,

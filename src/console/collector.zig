@@ -3,6 +3,7 @@
 //! them under those locks, and the console's thread, which must not take a
 //! lock of the runtime, waits for the answer (up to `wait_ms`).
 const std = @import("std");
+const safety = @import("anole_safety");
 
 pub const What = enum(u8) { ws, db };
 
@@ -12,10 +13,6 @@ pub const CollectFn = *const fn (ctx: *anyopaque, what: What, w: *std.Io.Writer)
 /// The console's threads wait on the blocking `Io`, never the runtime's.
 fn blockingIo() std.Io {
     return std.Options.debug_io;
-}
-
-fn spin(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.atomic.spinLoopHint();
 }
 
 pub const Collector = struct {
@@ -31,7 +28,7 @@ pub const Collector = struct {
     /// An answer is in `out` (set on the blocking `Io`).
     answered: std.Io.Event = .unset,
     /// Over `out`, `out_seq` and `out_ok`; held only to copy.
-    lock: std.atomic.Mutex = .unlocked,
+    lock: safety.SpinLock(.leaf) = .init,
     out: std.ArrayList(u8) = .empty,
     out_seq: u32 = 0,
     out_ok: bool = false,
@@ -69,7 +66,7 @@ pub const Collector = struct {
             var buf: std.Io.Writer.Allocating = .init(c.gpa);
             defer buf.deinit();
             var ok = if (c.collect(c.ctx, what, &buf.writer)) |_| true else |_| false;
-            spin(&c.lock);
+            c.lock.lock();
             c.out.clearRetainingCapacity();
             c.out.appendSlice(c.gpa, buf.written()) catch {
                 ok = false;
@@ -104,7 +101,7 @@ pub const Collector = struct {
 
     /// The answer to `seq` into `w`, if it is in.
     fn take(c: *Collector, seq: u32, w: *std.Io.Writer) !bool {
-        spin(&c.lock);
+        c.lock.lock();
         defer c.lock.unlock();
         if (c.out_seq != seq) return false;
         if (!c.out_ok) return error.CollectFailed;

@@ -553,3 +553,76 @@ test "trace: flush sends queued spans before it returns" {
     // Nothing queued: returns at once.
     exporter.flush(.fromSeconds(30));
 }
+
+/// The collector of the flush-cancel test: tells the test a batch came,
+/// then answers only when the test lets it.
+const HeldCollector = struct {
+    var arrived: std.Io.Event = .unset;
+    var release: std.Io.Event = .unset;
+
+    fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+        _ = try req.body();
+        arrived.set(req.io);
+        release.waitUncancelable(req.io);
+        res.body = "{}";
+    }
+};
+
+/// A span of the trace tests, its IDs all `id`.
+fn testSpan(id: u8) observe.trace.Span {
+    // SAFETY: every field the encoder reads for a server span is set below.
+    var span: observe.trace.Span = undefined;
+    span.db = null;
+    span.job = null;
+    span.name_len = 0;
+    span.method_len = 0;
+    span.route_len = 0;
+    span.parent_span_id = null;
+    span.status_code = 200;
+    span.start_ns = 0;
+    span.end_ns = 0;
+    @memset(&span.trace_id, id);
+    @memset(&span.span_id, id);
+    return span;
+}
+
+test "trace: a flush whose caller is canceled stays canceled" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    HeldCollector.arrived = .unset;
+    HeldCollector.release = .unset;
+
+    var otel = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer otel.deinit();
+    otel.router.post("/v1/traces", HeldCollector.handle);
+    var otel_future = try io.concurrent(serve, .{&otel});
+    defer otel_future.cancel(io) catch {};
+    try otel.waitReady(io);
+
+    var client = dusty.Client.init(gpa, io, .{});
+    defer client.deinit();
+    var endpoint_buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{otel.address.ip.getPort()});
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = endpoint, .service_name = "cancel", .interval = .fromSeconds(600) });
+    defer exporter.deinit();
+    // Before the exporter's close waits for its task, which waits for the
+    // collector's answer.
+    defer HeldCollector.release.set(io);
+    try exporter.start();
+    exporter.submit(testSpan('c'));
+    try wait.waitEvent(io, "the collector got the batch", &HeldCollector.arrived);
+
+    // The batch is unanswered: the flush waits until its caller is
+    // canceled, and the caller must still see the cancel after it.
+    var flusher = try io.concurrent(struct {
+        fn run(e: *observe.trace.Exporter, io_: std.Io) error{ Canceled, CancelLost }!void {
+            e.flush(.fromSeconds(3600));
+            try io_.checkCancel();
+            return error.CancelLost;
+        }
+    }.run, .{ &exporter, io });
+    defer flusher.cancel(io) catch {};
+    try std.testing.expectError(error.Canceled, flusher.cancel(io));
+}

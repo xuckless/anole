@@ -1,8 +1,9 @@
 //! Retries, backoff, retry throttling and circuit breakers: the parts that
-//! need nothing but `std`, so the HTTP core (its own module) and the rest
-//! of Anole use the same types. `anole.resilience` (root.zig) re-exports
+//! need nothing but `std` and anole_safety's ranked locks, so the HTTP core
+//! (its own module) and the rest of Anole use the same types. `anole.resilience` (root.zig) re-exports
 //! them and adds the Prometheus binding.
 const std = @import("std");
+const safety = @import("anole_safety");
 
 const log = std.log.scoped(.anole);
 
@@ -436,7 +437,7 @@ pub const Breakers = struct {
         last_used: u64,
     };
     const Shard = struct {
-        mutex: std.Io.Mutex = .init,
+        mutex: safety.Mutex(.leaf) = .init,
         map: std.StringHashMapUnmanaged(*Entry) = .empty,
     };
 

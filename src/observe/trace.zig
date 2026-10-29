@@ -17,6 +17,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const common = @import("common.zig");
 const Client = @import("../client.zig").Client;
 
@@ -299,7 +300,7 @@ pub const Exporter = struct {
     kick: std.Io.Event = .unset,
     /// Set by the task after each batch; `flush` waits on it.
     progress: std.Io.Event = .unset,
-    flush_lock: std.Io.Mutex = .init,
+    flush_lock: safety.Mutex(.leaf) = .init,
     /// Spans queued, and spans the task has finished with (sent or
     /// dropped): `flush` waits until `finished` reaches what `queued` was.
     queued: std.atomic.Value(u64) = .init(0),
