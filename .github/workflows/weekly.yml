@@ -1,0 +1,86 @@
+name: Weekly
+
+# Checks trimmed from every pull request (research/s15/test-audit.md, K2:
+# T9 and the native arm64 run): each has either never disagreed with a
+# sibling job in the 80 runs measured, or costs runner minutes out of
+# proportion to what it caught. Weekly, and by hand.
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Time limits as in ci.yml: the matching ci.yml job's limit, until weekly
+# runs give their own p95.
+
+jobs:
+  arm64-test:
+    name: test (ubuntu-24.04-arm; native arm64 Linux)
+    # K2: catches what only a native aarch64 run shows (memory ordering, the
+    # io_uring and epoll paths on ARM, the aarch64 C code), which the
+    # per-PR cross job only compiles and links.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: weekly-arm64
+      - uses: ./.github/actions/install-gdb
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: Unit and smoke tests (default profile, every feature on)
+        timeout-minutes: 36
+        run: zig build test --test-timeout 120s --summary all
+
+  mongodb-8:
+    name: MongoDB 8.0 (live client tests; the C ABI's suite)
+    # K2: catches an 8.0-only server behaviour. 7.0 and 9.0 run per pull
+    # request and bracket it; the three never disagreed in 79 runs. The
+    # runner image is ubuntu-22.04 for the kernel reason given in ci.yml.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 36
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: mongodb-ubuntu-22.04
+      - uses: ./.github/actions/install-gdb
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: Tests with a live server
+        timeout-minutes: 35
+        run: tests/mongodb/run.sh mongo:8.0 --test-timeout 120s
+        env:
+          ANOLE_KEEP_CONTAINERS: "1"
+      - name: Container logs and states
+        if: failure()
+        uses: ./.github/actions/docker-logs
+        with:
+          name: containers-${{ github.job }}-${{ strategy.job-index }}
+      - name: Remove the containers
+        if: always()
+        run: ids=$(docker ps -aq --filter name=^anole-); [ -z "$ids" ] || docker rm -f $ids
+
+  templates-macos:
+    name: anole new templates (macos-latest; the minimal template)
+    # K2: catches a macOS-only break in what `anole new` generates. The
+    # Linux job runs all five templates on every pull request; this one had
+    # 0 failures in 47 runs.
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: templates-macos-latest
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: The minimal template (macOS)
+        timeout-minutes: 37
+        run: ANOLE_TEST_TIMEOUT=120s tests/templates/run.sh minimal

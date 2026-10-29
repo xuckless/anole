@@ -801,6 +801,17 @@ pub fn build(b: *std.Build) void {
         run_stress.has_side_effects = true;
         stress_step.dependOn(&run_stress.step);
     }
+    // fuzz: only the "fuzz:" targets, for CI's fuzz job
+    // (`zig build fuzz -Dllvm=true --fuzz=200K`): the main suite filtered to
+    // them, the HTTP core's and BSON's (added where those are defined). The
+    // unit tests are not repeated here (research/s15/test-audit.md T1).
+    const fuzz_step = b.step("fuzz", "Run only the fuzz targets (\"fuzz:\" tests; pass --fuzz=N with -Dllvm=true to fuzz them)");
+    {
+        const main_fuzz = addSafeTest(b, .{ .name = "anole-fuzz", .root_module = tests.root_module, .filters = &.{"fuzz:"}, .use_llvm = use_llvm });
+        const run_main_fuzz = b.addRunArtifact(main_fuzz);
+        run_main_fuzz.skip_foreign_checks = true;
+        fuzz_step.dependOn(&run_main_fuzz.step);
+    }
     // The hang probe (src/safety/hang_probe.zig): a test that never returns,
     // to see the runner's hang dump work. `-Dhang-probe=true` adds it to
     // `test`; `zig build hang-probe` runs it alone. Both fail by design.
@@ -1004,6 +1015,23 @@ pub fn build(b: *std.Build) void {
         b.step("test-redis", "Run the Redis tests (live with -Dredis-test-url=redis://...)").dependOn(&run_redis_tests.step);
     }
 
+    // test-nats and test-kafka: the live tests alone (nats/live_test.zig,
+    // kafka/live_test.zig); with -Dnats-test-url / -Dkafka-test-url, against
+    // that server (tests/nats/run.sh, tests/kafka/run.sh). CI's two jobs run
+    // only these: the unit suite is the test job's.
+    if (features.nats) {
+        const nats_tests = addSafeTest(b, .{ .name = "anole-test-nats", .root_module = tests.root_module, .filters = &.{"nats.live_test"}, .use_llvm = use_llvm });
+        const run_nats_tests = b.addRunArtifact(nats_tests);
+        run_nats_tests.has_side_effects = nats_test_url != null;
+        b.step("test-nats", "Run the NATS live tests (live with -Dnats-test-url=nats://...)").dependOn(&run_nats_tests.step);
+    }
+    if (features.kafka) {
+        const kafka_tests = addSafeTest(b, .{ .name = "anole-test-kafka", .root_module = tests.root_module, .filters = &.{"kafka.live_test"}, .use_llvm = use_llvm });
+        const run_kafka_tests = b.addRunArtifact(kafka_tests);
+        run_kafka_tests.has_side_effects = kafka_test_url != null;
+        b.step("test-kafka", "Run the Kafka live tests (live with -Dkafka-test-url=host:port)").dependOn(&run_kafka_tests.step);
+    }
+
     // ---- p3/s3 ----
     // test-s3: the S3 client's tests alone ("s3: ..."), and the C ABI's
     // storage tests ("capi s3: ..."); with -Ds3-test-url, also against that
@@ -1130,6 +1158,7 @@ pub fn build(b: *std.Build) void {
             run_bare.setCwd(certs_dir);
             b.step("core-test-bare", "Run the HTTP core's own tests on the core without TLS, HTTP/2 or compression").dependOn(&run_bare.step);
         }
+        fuzz_step.dependOn(&b.addRunArtifact(core_fuzz).step);
     }
 
     // test-flags: one test binary per preset and edge combination. Each gets its
@@ -1189,6 +1218,11 @@ pub fn build(b: *std.Build) void {
         const run_bson_tests = b.addRunArtifact(bson_tests);
         run_bson_tests.skip_foreign_checks = true;
         test_step.dependOn(&run_bson_tests.step);
+        // Its "fuzz:" targets alone, for `zig build fuzz`.
+        const bson_fuzz = addSafeTest(b, .{ .name = "bson-fuzz", .root_module = bson_tests.root_module, .filters = &.{"fuzz:"}, .use_llvm = use_llvm });
+        const run_bson_fuzz = b.addRunArtifact(bson_fuzz);
+        run_bson_fuzz.skip_foreign_checks = true;
+        fuzz_step.dependOn(&run_bson_fuzz.step);
         const bson_step = b.step("bson-test", "Run the BSON codec's tests and the bson-corpus (src/bson, tests/bson)");
         bson_step.dependOn(&run_bson_tests.step);
         const mongodb_spec_step = b.step("mongodb-spec-test", "Run the MongoDB client's spec tests (connection string, URI options, auth, SDAM) from mongodb/specifications");

@@ -195,6 +195,27 @@ jobs:
         timeout-minutes: 32
         run: zig build capi-test test-capi-engine -Doptimize=ReleaseFast --test-timeout 120s --summary all
 
+  # K2 (research/s15/test-audit.md T1): the unit suite under the LLVM
+  # backend, the one place it runs now that the fuzz job only fuzzes. The
+  # different backend (and its optimizer-visible UB) is the mechanism; it
+  # costs a release, not a pull request.
+  unit-llvm:
+    name: Unit and smoke tests under the LLVM backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 92
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: release-unit-llvm
+      - uses: ./.github/actions/install-gdb
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: zig build test -Dllvm=true
+        timeout-minutes: 88
+        run: zig build test -Dllvm=true --test-timeout 120s --summary all
+
   # The C libraries' own test suites under ASan and UBSan, from the pinned
   # tarballs (the Sanitizers workflow, run for the release too).
   sanitizers:
