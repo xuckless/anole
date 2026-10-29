@@ -172,6 +172,9 @@ pub const Datagram = struct {
     local: ?std.Io.net.IpAddress,
     socket: *UdpSocket,
 
+    /// TooLarge: a datagram over 65507 bytes, or datagrams together over
+    /// `send_queue`: never taken, so no WRITABLE follows for them.
+    /// QueueFull: no room now; WRITABLE follows.
     pub const SendError = error{ TooLarge, QueueFull, Closed, OutOfMemory };
 
     /// A datagram back to `remote` from `local`, sent with the rest of the
@@ -417,8 +420,13 @@ pub const UdpSocket = struct {
     /// reserved, then it is pushed; the sender is woken when the list was
     /// empty, through the group's gate (T5).
     fn enqueue(s: *UdpSocket, items: []const Outgoing) Datagram.SendError!void {
-        const b = try Batch.create(s.group.gpa, s, items);
         const cap = s.group.service.options.send_queue;
+        var total: u64 = 0;
+        for (items) |it| total += it.bytes.len;
+        // More than the queue holds empty: never taken (not QueueFull,
+        // which promises a WRITABLE).
+        if (total > cap) return error.TooLarge;
+        const b = try Batch.create(s.group.gpa, s, items);
         const n: u64 = b.bytes;
         var q = s.queue_bytes.load(.monotonic);
         while (true) {

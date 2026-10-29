@@ -645,6 +645,9 @@ fn writeError(e: *Engine, err: net.Conn.SendError) AnswerError {
         error.NoFraming => invalid("NoFraming", "ANOLE_NET_F_FRAME on a listener without framing"),
         error.FrameTooLarge => invalid("FrameTooLarge", "the payload is over the listener's framing max"),
         error.QueueFull => error.Again,
+        // Over tcp.write_max: never taken (ANOLE_E_TOOBIG, as a WebTransport
+        // datagram over its max).
+        error.TooLarge => error.TooBig,
         error.OutOfMemory => error.OutOfMemory,
     };
 }
@@ -780,7 +783,9 @@ pub fn udpSend(e: *Engine, hv: u64, items: []const abi.NetDatagram, flags: u32) 
         };
     }
     sock.sendMany(out) catch |err| return switch (err) {
-        error.TooLarge => error.Invalid,
+        // Each datagram's size was checked above: the batch is over
+        // udp.send_queue, never taken.
+        error.TooLarge => error.TooBig,
         error.QueueFull => error.Again,
         error.Closed => e.gone(),
         error.OutOfMemory => error.OutOfMemory,

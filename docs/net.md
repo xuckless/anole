@@ -118,6 +118,8 @@ any time. Bytes leave in the order sends were made.
   is called, or call `conn.waitWritable()` from a task of your own.
 - Past `write_max` (8 MiB) it takes nothing and returns `error.QueueFull`;
   `writable` follows once the outbox drains under half the high-water mark.
+  One send larger than `write_max` returns `error.TooLarge`: it can never be
+  taken, so no `writable` follows for it.
 - `error.Closed` and `error.Ended` say the connection is over, or that this
   side was ended.
 
@@ -216,7 +218,8 @@ try app.udp(":7001", Game, .{ .sessions = .{ .idle_timeout = .fromSeconds(30) } 
   the batch's other replies in one `sendmmsg`. From any other task or thread,
   `socket.send(to, from, bytes)` queues for the socket's sender; neither waits
   on anything but the local queue. Past `send_queue` they return
-  `error.QueueFull`. A `send` that races the server's stop answers
+  `error.QueueFull` (WRITABLE follows); datagrams whose bytes together are
+  over `send_queue` return `error.TooLarge` (never taken). A `send` that races the server's stop answers
   `error.Closed`: it is never taken and lost.
 - `max_datagram` (2048) bounds what is taken; a larger one is dropped and
   counted.

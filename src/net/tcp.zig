@@ -393,8 +393,12 @@ pub const Conn = struct {
         Closed,
         /// This side was ended (`end`).
         Ended,
-        /// Past `write_max`: nothing taken; `writable` / `waitWritable` follow.
+        /// No room now (the queue would pass `write_max`): nothing taken;
+        /// `writable` / `waitWritable` follow.
         QueueFull,
+        /// More than `write_max` bytes in one send (its framing included):
+        /// never taken, now or later, so no `writable` follows for it.
+        TooLarge,
         /// `sendFrame` with a payload over the framing's `max`.
         FrameTooLarge,
         /// `sendFrame` on a listener with `Framing.none`.
@@ -436,7 +440,9 @@ pub const Conn = struct {
     }
 
     /// Waits until fewer than half `write_high_water` bytes are queued.
-    /// `error.Closed` when it closes meanwhile.
+    /// `error.Closed` when it closes meanwhile. Any task, until the `close`
+    /// callback returns; one still waiting then answers Closed (the
+    /// connection's memory lasts until it has left).
     pub fn waitWritable(c: *Conn) error{ Closed, Canceled }!void {
         return c.tc().waitUnder(c.tc().service.options.write_high_water / 2);
     }
@@ -501,14 +507,14 @@ pub const Conn = struct {
 
     /// Stops reading (Anole leaves the input in the kernel: TCP flow
     /// control slows the peer) until `resumeReading`. Holds the connection's
-    /// task while paused.
+    /// task while paused. After the connection ended, nothing.
     pub fn pauseReading(c: *Conn) void {
-        c.tc().paused.store(1, .release);
+        _ = c.tc().paused.cmpxchgStrong(Paused.reading, Paused.paused, .acq_rel, .monotonic);
     }
 
     pub fn resumeReading(c: *Conn) void {
         const t = c.tc();
-        if (t.paused.swap(0, .acq_rel) != 0) t.wakeAll(&t.paused);
+        if (t.paused.cmpxchgStrong(Paused.paused, Paused.reading, .acq_rel, .monotonic) == null) t.wakeAll(&t.paused);
     }
 
     /// Replaces the listener's `idle_timeout` for this connection (null: none).
@@ -543,7 +549,7 @@ pub const Conn = struct {
         return c.tc().readFrameTask();
     }
 
-    pub const WriteError = error{ Closed, Ended, WriteTimeout, Canceled, NotTaskForm, OutOfMemory };
+    pub const WriteError = error{ Closed, Ended, WriteTimeout, Canceled, NotTaskForm, OutOfMemory, TooLarge };
 
     /// `send`, waiting first while past `write_high_water`: back-pressure by
     /// waiting, which only the connection's own task may do.
@@ -590,6 +596,7 @@ fn sendToWrite(err: Conn.SendError) Conn.WriteError {
         // Past write_max after waiting under the high-water mark: a single
         // message bigger than the room.
         error.QueueFull => error.WriteTimeout,
+        error.TooLarge => error.TooLarge,
         error.FrameTooLarge, error.NoFraming => error.Closed,
     };
 }
@@ -979,6 +986,17 @@ const Flag = struct {
 };
 
 /// `TcpConn.sched`: who is responsible for the outbox.
+/// `TcpConn.paused`. `ended` is sticky: set when the connection ends, it
+/// makes a later `pauseReading` change nothing, so the task waiting for a
+/// resume (`waitResumed`), which looked at `over` before it waits on this
+/// word, sees the word changed and never sleeps on a connection that is
+/// over.
+const Paused = struct {
+    const reading: u32 = 0;
+    const paused: u32 = 1;
+    const ended: u32 = 2;
+};
+
 const Sched = struct {
     const none: u8 = 0;
     /// Kicked: the driver, on its next round.
@@ -1039,7 +1057,9 @@ const TcpConn = struct {
     inflight: Fifo = .{},
     /// One standard chunk kept after it was written, for the next sends
     /// (an echo then allocates nothing). owner: the connection (M2), its
-    /// executor only, no atomics; freed when it parks and at `release`.
+    /// executor only, no atomics; freed when it parks and at `release`. A
+    /// chunk written while it is parked can become the spare again, so a
+    /// parked connection may hold 16 KiB until it wakes or is released.
     /// Sends from other threads make their own chunks.
     spare: ?*OutChunk = null,
     /// The helper tasks (flusher, writable, drain): children of the
@@ -1054,7 +1074,12 @@ const TcpConn = struct {
     reset_requested: std.atomic.Value(bool) = .init(false),
     /// Futex word: 1 once the connection's serving is to end.
     over: std.atomic.Value(u32) = .init(0),
-    paused: std.atomic.Value(u32) = .init(0),
+    /// `Paused`; a futex word for the task waiting for `resumeReading`.
+    paused: std.atomic.Value(u32) = .init(Paused.reading),
+    /// References to this memory: `release`'s, and one per writer in
+    /// `waitUnder` (which may be a task outside the connection's, still
+    /// there when it is released). The last `unhold` frees it.
+    holds: std.atomic.Value(u32) = .init(1),
     /// 0: none yet; else `CloseReason` + 1.
     reason: std.atomic.Value(u8) = .init(0),
     errno_value: std.atomic.Value(i32) = .init(0),
@@ -1199,7 +1224,14 @@ const TcpConn = struct {
         }
         t.decoder.deinit();
         t.frames.deinit(t.gpa);
-        t.gpa.destroy(t);
+        // Freed now, or by the last writer still in `waitUnder`.
+        t.unhold();
+    }
+
+    fn unhold(t: *TcpConn) void {
+        if (t.holds.fetchSub(1, .acq_rel) != 1) return;
+        const gpa = t.gpa;
+        gpa.destroy(t);
     }
 
     fn logClosed(t: *TcpConn, reason: CloseReason, bytes_out: u64) void {
@@ -1337,6 +1369,10 @@ const TcpConn = struct {
     /// memory) is read before and looked at after: `.gone` when another
     /// connection, or none, is in it now. A caller in the group (the
     /// flusher) is joined by `release` and would be safe, but stops too.
+    /// `.refused` means no suspension happened (zio's `registerTask` fails
+    /// only before `scheduleTask`, and its yield is `.no_cancel`), so the
+    /// refusal paths go on with `t`; a zio whose spawn could yield and then
+    /// fail would make them use-after-free (MAINTAINING.md, zio bumps).
     fn spawn(t: *TcpConn, comptime func: fn (*TcpConn) void, comptime point: ?TestPoint) Spawned {
         t.owner.check(t.io);
         if (t.isClosed()) return .refused;
@@ -1359,6 +1395,7 @@ const TcpConn = struct {
         if (f & (Flag.closed | Flag.dead) != 0) return error.Closed;
         if (f & Flag.ended != 0) return error.Ended;
         if (total == 0) return .ok;
+        if (total > t.service.options.write_max) return error.TooLarge;
         // On the connection's executor, with nothing from elsewhere ahead:
         // straight into the outbox (no lock, as nothing here suspends).
         if (t.onOwner() and t.inbox.isEmpty()) return t.queueLocal(parts, total, token);
@@ -1377,7 +1414,12 @@ const TcpConn = struct {
     }
 
     /// The owner executor's send: into the last chunk when it has room
-    /// (many small sends cost one allocation), else into a fresh one.
+    /// (many small sends cost one allocation), else into the spare or a
+    /// fresh one. Every such chunk is 16 KiB (`standard_size`), whatever
+    /// `write_high_water` is: the limits count bytes queued, not chunk
+    /// room, so a listener with a small high-water mark needs nothing; it
+    /// only means a connection with output pending holds 16 KiB at least.
+    /// A send larger than the standard room gets a chunk of its own size.
     fn queueLocal(t: *TcpConn, parts: []const []const u8, total: usize, token: u64) Conn.SendError!Conn.Sent {
         var fresh: ?*OutChunk = null;
         if (token != 0) {
@@ -1405,6 +1447,7 @@ const TcpConn = struct {
     /// it holds, L5). The kick, if one is due, is the caller's to make.
     fn pushChunk(t: *TcpConn, c: *OutChunk) Conn.SendError!Conn.Queued {
         const n = c.len;
+        if (n > t.service.options.write_max) return error.TooLarge;
         const busy = t.reserve(n) catch return error.QueueFull;
         // Checked again after the reservation, which `requestEnd`'s flag
         // pairs with (both `.seq_cst`): a send either sees the end, or is
@@ -1534,10 +1577,11 @@ const TcpConn = struct {
 
     /// The end of a paused connection: its task, waiting for
     /// `resumeReading` (`waitResumed`), must hear it. The word it waits on
-    /// changes: a wake alone, with `paused` still 1, could fall between its
-    /// look at `over` and its wait and be lost.
+    /// changes, for good (`Paused.ended`): a wake alone, or a word a later
+    /// `pauseReading` could set back, could fall between its look at
+    /// `over` and its wait and be lost.
     fn unpause(t: *TcpConn) void {
-        if (t.paused.swap(0, .acq_rel) != 0) t.wakeAll(&t.paused);
+        if (t.paused.swap(Paused.ended, .acq_rel) == Paused.paused) t.wakeAll(&t.paused);
     }
 
     fn shutdownSocket(t: *TcpConn, how: std.Io.net.ShutdownHow) void {
@@ -1783,8 +1827,9 @@ const TcpConn = struct {
         return c;
     }
 
-    /// Frees the spare: the connection parks (an idle one holds no buffer)
-    /// or is released.
+    /// Frees the spare: the connection parks (an idle one should hold no
+    /// buffer; one written after the park can come back, see `spare`) or
+    /// is released.
     fn dropSpare(t: *TcpConn) void {
         if (t.takeSpare()) |c| c.destroy();
     }
@@ -1816,10 +1861,7 @@ const TcpConn = struct {
         // Released while it waited for the lock: `release` joins it.
         if (t.isClosed()) return;
         const f = t.service.table.writable.?;
-        f(t.service.state, &t.conn) catch |err| {
-            if (err != error.Canceled) log.warn("tcp {s}: writable failed: {t}", .{ t.info.listener.name, err });
-            t.abort(.failed);
-        };
+        f(t.service.state, &t.conn) catch |err| t.callbackFailed("writable", err);
     }
 
     /// Drops whatever is queued (a reset or a failed connection), by the
@@ -1973,6 +2015,12 @@ const TcpConn = struct {
     /// `epoch`, which every change it waits for moves (`wakeWaiters`), read
     /// before the looks: a change after them makes the wait return.
     fn waitUnder(t: *TcpConn, below: u32) error{ Closed, Canceled }!void {
+        // A writer outside the connection's tasks may still be here when
+        // it is released (woken, about to look): it keeps the memory until
+        // it leaves. Taken before `release` can run (the caller's `Conn`
+        // is valid until the close callback returns), dropped last.
+        _ = t.holds.fetchAdd(1, .monotonic);
+        defer t.unhold();
         _ = t.waiters.fetchAdd(1, .seq_cst);
         defer _ = t.waiters.fetchSub(1, .seq_cst);
         while (true) {
@@ -2011,10 +2059,19 @@ const TcpConn = struct {
         defer t.callUnlock();
         if (t.isClosed()) return;
         const f = t.service.table.drain.?;
-        f(t.service.state, &t.conn) catch |err| {
-            if (err != error.Canceled) log.warn("tcp {s}: drain failed: {t}", .{ t.info.listener.name, err });
-            t.abort(.failed);
-        };
+        f(t.service.state, &t.conn) catch |err| t.callbackFailed("drain", err);
+    }
+
+    /// A callback task's error. Canceled: released (`release` reports the
+    /// connection's own reason: idle, lifetime, drain), or the server
+    /// stops (drain), as the flusher does. Else the connection fails.
+    fn callbackFailed(t: *TcpConn, comptime what: []const u8, err: anyerror) void {
+        if (err == error.Canceled) {
+            if (t.isClosed()) return;
+            return t.abort(.drain);
+        }
+        log.warn("tcp {s}: " ++ what ++ " failed: {t}", .{ t.info.listener.name, err });
+        t.abort(.failed);
     }
 
     // -- Deadlines ---------------------------------------------------------------
@@ -2071,7 +2128,7 @@ const TcpConn = struct {
         const o = &t.service.options;
         while (true) {
             if (t.over.load(.acquire) != 0) return .close;
-            if (t.paused.load(.acquire) != 0) {
+            if (t.paused.load(.acquire) == Paused.paused) {
                 try t.waitResumed();
                 continue;
             }
@@ -2086,7 +2143,7 @@ const TcpConn = struct {
                 t.dropSpare();
                 return .park;
             }
-            if (t.paused.load(.acquire) != 0) continue; // the bytes wait in the reader
+            if (t.paused.load(.acquire) == Paused.paused) continue; // the bytes wait in the reader
             const bytes = r.buffered();
             r.toss(bytes.len);
             r.seek = 0;
@@ -2136,10 +2193,10 @@ const TcpConn = struct {
     }
 
     fn waitResumed(t: *TcpConn) !void {
-        while (t.paused.load(.acquire) != 0 and t.over.load(.acquire) == 0) {
+        while (t.paused.load(.acquire) == Paused.paused and t.over.load(.acquire) == 0) {
             if (builtin.is_test) _ = test_paused_waits.fetchAdd(1, .release);
             testHold(t.io, .paused_wait);
-            try t.io.futexWait(u32, &t.paused.raw, 1);
+            try t.io.futexWait(u32, &t.paused.raw, Paused.paused);
         }
     }
 

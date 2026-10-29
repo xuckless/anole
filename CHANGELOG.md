@@ -14,6 +14,13 @@ breaking changes are listed anyway.
   before it is freed. A send from another thread costs one allocation, as
   before; small sends from the connection's executor share one.
 - C ABI: `anole_net_write` no longer allocates under a lock.
+- net: one send larger than `write_max` (UDP: datagrams together larger
+  than `send_queue`) answers `error.TooLarge` (C ABI: `ANOLE_E_TOOBIG`)
+  instead of `QueueFull`/`ANOLE_E_AGAIN`, whose promised WRITABLE never
+  came. A reset or close of a paused connection ends it even when it is
+  paused again meanwhile; a task waiting in `waitWritable` when the
+  connection closes answers Closed; a connection closed while its
+  `writable` or `drain` callback waits keeps its own close reason.
 - SSE: an event written through `EventStream.startSend` (the streaming
   `EventWriter`) now encodes its data as `send` does. Data ending in a CR or
   LF kept its last line break off the wire, so browsers delivered `"hi"` for
