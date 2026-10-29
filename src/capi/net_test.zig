@@ -633,6 +633,12 @@ test "capi net: parity, the net options have a C ABI key with the same default" 
     try parity.checkSchemaAndDefaults(anole.net.Udp.Options, config.Config, &parity.net_udp, root);
 }
 
+// Audit row lane11 net_test.zig:523 (Q3, W5), recorded as infra: this fuzz
+// reaches std.Io.net.IpAddress only, not the abi.NetAddr conversion in
+// anole_net_addr_parse/format (lib.zig), which lives inside the export
+// bodies of the library root and is not importable here. Fuzzing the glue
+// needs that conversion moved into a function the tests can call (a product
+// refactor), so the test stays as it is until then.
 fn addrFuzz(input: []const u8) anyerror!void {
     // What anole_net_addr_parse accepts, formats and parses back to itself.
     const ip = std.Io.net.IpAddress.parseLiteral(input) catch return;
