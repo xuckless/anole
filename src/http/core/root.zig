@@ -56,6 +56,9 @@ pub const gauges = @import("gauges.zig");
 pub const qsbr = @import("qsbr.zig");
 /// Counters kept per executor and summed when read (SAFETY.md L6/L7).
 pub const exec_counter = @import("exec_counter.zig");
+/// A sealable multi-producer, single-consumer push list (SAFETY.md L7's
+/// hand-offs between executors or threads).
+pub const push_list = @import("push_list.zig");
 pub const hooks = @import("hooks.zig");
 
 /// Tests that provoke `err` logs on purpose declare it here.
@@ -195,6 +198,7 @@ comptime {
     _ = @import("placement.zig");
     _ = @import("qsbr.zig");
     _ = @import("exec_counter.zig");
+    _ = @import("push_list.zig");
     _ = @import("api_test.zig");
     _ = @import("proxy_protocol.zig");
     _ = @import("fuzz.zig");
