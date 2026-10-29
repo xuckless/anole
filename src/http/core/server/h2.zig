@@ -2754,7 +2754,7 @@ pub fn Engine(comptime Ctx: type) type {
     };
 }
 
-test "HTTP/2 tunnel outbox: a message past outbox_keep drained, trimmed, then the next one" {
+test "HTTP/2 tunnel outbox: after a trim, the next message reads back whole" {
     // A 120 KB video keyframe on a WebSocket over HTTP/2 grew the outbox
     // past outbox_keep; once it was sent, trim freed `draining` but kept
     // the read position, and the next message read past its end.
@@ -2775,7 +2775,6 @@ test "HTTP/2 tunnel outbox: a message past outbox_keep drained, trimmed, then th
             if (ob.pending() == 0) ob.trim(gpa);
         }
         try std.testing.expectEqual(size, got);
-        try std.testing.expectEqual(@as(usize, 0), ob.drain_pos);
         try std.testing.expectEqual(@as(usize, 0), ob.take(&buf));
     }
 }

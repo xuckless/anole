@@ -255,6 +255,9 @@ test "static: a precompressed copy is served to a client that accepts it" {
 }
 
 test "static: something other than a regular file is a 404" {
+    // Windows: not supported, a permanent limit of this fixture (no
+    // /dev/null to link to, and symlinks need privilege there). The
+    // file-kind check itself is the same code everywhere.
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var tmp = try testDir();
     defer tmp.cleanup();
@@ -281,7 +284,10 @@ test "embedded: serves the content, with a 304 for its ETag" {
     const not_modified = try exchangeEmbedded(.{}, request, &out);
     try std.testing.expect(std.mem.startsWith(u8, not_modified, "HTTP/1.1 304"));
     try std.testing.expectEqualStrings("", body(not_modified));
+}
 
+test "embedded: a range is a 206, and If-Modified-Since says nothing without an mtime" {
+    var out: [4096]u8 = undefined;
     // Without an mtime, a date says nothing either way.
     const dated = try exchangeEmbedded(.{}, "GET /style.css HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Thu, 01 Jan 2099 00:00:00 GMT\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, dated, "HTTP/1.1 200"));
@@ -313,23 +319,32 @@ test "embedded: a compressed copy is served to a client that accepts it" {
     try std.testing.expectEqualStrings("body { color: red }", body(plain));
 }
 
-test "static: the client's q-values pick the precompressed copy, and Cache-Control goes out" {
+test "static: the client's q-values pick the precompressed copy, a tie goes to the server's order" {
     const io = std.testing.io;
     var tmp = try testDir();
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "style.css.gz", .data = "gzipped" });
     try tmp.dir.writeFile(io, .{ .sub_path = "style.css.br", .data = "brotli" });
-    const opts: dusty.StaticOptions = .{ .precompressed = &.{ .br, .gzip }, .cache_control = "public, max-age=60" };
+    const opts: dusty.StaticOptions = .{ .precompressed = &.{ .br, .gzip } };
 
     var out: [4096]u8 = undefined;
     // br is preferred by the server, but the client rates gzip higher.
     const gz = try exchange(tmp.dir, "/", opts, "GET /style.css HTTP/1.1\r\nHost: x\r\nAccept-Encoding: br;q=0.5, gzip\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expectEqualStrings("gzip", header(gz, "Content-Encoding").?);
-    try std.testing.expectEqualStrings("public, max-age=60", header(gz, "Cache-Control").?);
     // A tie goes to the server's order.
     const br = try exchange(tmp.dir, "/", opts, "GET /style.css HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, br\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expectEqualStrings("br", header(br, "Content-Encoding").?);
-    // Not on a 416.
+}
+
+test "static: Cache-Control goes out with a file, not with a 416" {
+    var tmp = try testDir();
+    defer tmp.cleanup();
+    const opts: dusty.StaticOptions = .{ .cache_control = "public, max-age=60" };
+
+    var out: [4096]u8 = undefined;
+    const ok = try exchange(tmp.dir, "/", opts, "GET /style.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
+    try std.testing.expectEqualStrings("public, max-age=60", header(ok, "Cache-Control").?);
     const range = try exchange(tmp.dir, "/", opts, "GET /style.css HTTP/1.1\r\nHost: x\r\nRange: bytes=900-\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, range, "HTTP/1.1 416"));
     try std.testing.expectEqual(null, header(range, "Cache-Control"));
