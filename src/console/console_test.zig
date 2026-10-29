@@ -595,3 +595,103 @@ test "console: the /h3 fixture of the UI's golden test has the fields the host s
         for (names, keys[1..]) |name, key| try std.testing.expectEqualStrings(name, key);
     }
 }
+
+// ------------------------------------------------------------ stress (W3)
+
+/// The threads of the log ring stress test.
+const RingStress = struct {
+    ring: *logring.LogRing,
+    gpa: std.mem.Allocator,
+    producers_done: std.atomic.Value(u32) = .init(0),
+    failures: std.atomic.Value(u32) = .init(0),
+
+    const producers = 8;
+    const per_producer = 12_500;
+
+    fn produce(t: *RingStress, id: usize) void {
+        defer _ = t.producers_done.fetchAdd(1, .release);
+        var buf: [32]u8 = undefined;
+        for (0..per_producer) |i| {
+            const text = std.fmt.bufPrint(&buf, "p{d} {d}", .{ id, i }) catch unreachable;
+            t.ring.push(.warn, "stress", "", "", false, text);
+        }
+    }
+
+    /// Reads from the end at its start until the producers are done, then
+    /// once more: every record reads back whole, and each one pushed was
+    /// read or counted as lapped.
+    fn readAll(t: *RingStress, cursors: *logring.Cursors) void {
+        var arena_state: std.heap.ArenaAllocator = .init(t.gpa);
+        defer arena_state.deinit();
+        var read: u64 = 0;
+        var dropped: u64 = 0;
+        while (true) {
+            const last = t.producers_done.load(.acquire) == producers;
+            _ = arena_state.reset(.retain_capacity);
+            var out: std.ArrayList(logring.Rec) = .empty;
+            t.ring.readNew(arena_state.allocator(), cursors, &out, &dropped) catch return t.fail();
+            for (out.items) |r| if (!wellFormed(r)) return t.fail();
+            read += out.items.len;
+            if (last) break;
+        }
+        if (read + dropped != producers * per_producer) t.fail();
+    }
+
+    /// Takes the backlog again and again while the producers run.
+    fn backlogs(t: *RingStress) void {
+        var arena_state: std.heap.ArenaAllocator = .init(t.gpa);
+        defer arena_state.deinit();
+        var cursors: logring.Cursors = undefined;
+        while (t.producers_done.load(.acquire) != producers) {
+            _ = arena_state.reset(.retain_capacity);
+            var out: std.ArrayList(logring.Rec) = .empty;
+            t.ring.readBacklogAndAttach(arena_state.allocator(), &cursors, &out) catch return t.fail();
+            for (out.items) |r| if (!wellFormed(r)) return t.fail();
+        }
+    }
+
+    fn wellFormed(r: logring.Rec) bool {
+        if (r.level != .warn or !std.mem.eql(u8, r.scope, "stress") or r.rid.len != 0) return false;
+        if (r.text.len < 4 or r.text[0] != 'p') return false;
+        const space = std.mem.indexOfScalar(u8, r.text, ' ') orelse return false;
+        _ = std.fmt.parseInt(u32, r.text[1..space], 10) catch return false;
+        _ = std.fmt.parseInt(u32, r.text[space + 1 ..], 10) catch return false;
+        return true;
+    }
+
+    fn fail(t: *RingStress) void {
+        _ = t.failures.fetchAdd(1, .monotonic);
+    }
+};
+
+test "logring: [stress] producers on many threads and readers at once: every record reads back whole, and each is read or counted as lapped" {
+    try wait.requireStress();
+    // Every allocation is checked against the ring locks (SAFETY.md L5).
+    var checked: safety.SpinCheckedAllocator = .init(std.testing.allocator);
+    const gpa = checked.allocator();
+    var ring = logring.LogRing.init(gpa, 64 * 1024);
+    defer ring.deinit();
+    var t: RingStress = .{ .ring = &ring, .gpa = gpa };
+    var cursors: [2]logring.Cursors = undefined;
+    for (&cursors) |*c| ring.attachAtEnd(c);
+    var threads: [RingStress.producers + 3]std.Thread = undefined;
+    var n: usize = 0;
+    defer for (threads[0..n]) |th| th.join();
+    for (&cursors) |*c| {
+        threads[n] = try std.Thread.spawn(.{}, RingStress.readAll, .{ &t, c });
+        n += 1;
+    }
+    threads[n] = try std.Thread.spawn(.{}, RingStress.backlogs, .{&t});
+    n += 1;
+    for (0..RingStress.producers) |id| {
+        threads[n] = std.Thread.spawn(.{}, RingStress.produce, .{ &t, id }) catch |err| {
+            // The readers end once every producer is counted done.
+            _ = t.producers_done.fetchAdd(@intCast(RingStress.producers - id), .release);
+            return err;
+        };
+        n += 1;
+    }
+    for (threads[0..n]) |th| th.join();
+    n = 0;
+    try std.testing.expectEqual(@as(u32, 0), t.failures.load(.monotonic));
+}

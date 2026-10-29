@@ -1599,3 +1599,91 @@ test "grpc channel: calls after the connection closed share one redial" {
         }
     }.run);
 }
+
+/// The tasks of the channel stress test: callers on every executor, and a
+/// task that takes the channel's connection away after every `every` calls.
+const ChannelStress = struct {
+    channel: *grpc.Channel,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    /// Calls that ended, however.
+    calls: std.atomic.Value(u32) = .init(0),
+    /// Calls that ended OK.
+    ok: std.atomic.Value(u32) = .init(0),
+    callers_done: std.atomic.Value(u32) = .init(0),
+    losses: u32 = 0,
+
+    const callers = 64;
+    const calls_each = 200;
+
+    fn caller(t: *ChannelStress) void {
+        defer _ = t.callers_done.fetchAdd(1, .release);
+        const client: grpc.Client(Echo) = .{ .channel = t.channel };
+        var arena_state: std.heap.ArenaAllocator = .init(t.gpa);
+        defer arena_state.deinit();
+        for (0..calls_each) |_| {
+            _ = arena_state.reset(.retain_capacity);
+            defer _ = t.calls.fetchAdd(1, .release);
+            // A call on a connection taken away under it may fail; the
+            // claim is that every call ends.
+            const r = client.unary("Unary", arena_state.allocator(), .{ .message = "x" }, .{}) catch continue;
+            if (r.status.code == .ok) _ = t.ok.fetchAdd(1, .monotonic);
+        }
+    }
+
+    const Reached = struct {
+        t: *ChannelStress,
+        target: u32,
+
+        fn reached(x: Reached) bool {
+            return x.t.callers_done.load(.acquire) == callers or x.t.calls.load(.acquire) >= x.target;
+        }
+    };
+
+    /// Takes the connection away after each of `points` (seeded) call
+    /// counts.
+    fn loser(t: *ChannelStress, points: []const u32) std.Io.Cancelable!void {
+        for (points) |p| {
+            wait.waitUntil(t.io, "the callers made the calls before the next loss", Reached{ .t = t, .target = p }, Reached.reached) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.WaitTimedOut => return,
+            };
+            if (t.callers_done.load(.acquire) == callers) return;
+            // The connection object lives until the channel closes (its
+            // retired list), so a stale one is only shut down twice.
+            const conn = t.channel.conn orelse continue;
+            conn.socket.shutdown(t.io, .both) catch {};
+            t.losses += 1;
+        }
+    }
+};
+
+test "grpc channel: [stress] calls across executors through repeated connection loss all end, and each loss costs at most one redial" {
+    try wait.requireStress();
+    try withCountingServer(4, struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
+            const channel = try grpc.Channel.connect(gpa, io, .{ .host = "127.0.0.1", .port = port }, .{ .retry = fast_grpc_retry });
+            defer channel.close();
+            var t: ChannelStress = .{ .channel = channel, .gpa = gpa, .io = io };
+            const seed: u64 = 0x5eed_0122;
+            var prng: std.Random.DefaultPrng = .init(seed);
+            var points: [8]u32 = undefined;
+            var at: u32 = 0;
+            for (&points) |*p| {
+                at += 200 + prng.random().uintLessThan(u32, 1200);
+                p.* = at;
+            }
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            for (0..ChannelStress.callers) |i| try dusty.placement.concurrent(&group, io, .{ .executor = i }, ChannelStress.caller, .{&t});
+            try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, ChannelStress.loser, .{ &t, &points });
+            group.await(io) catch |err| {
+                std.debug.print("grpc channel stress: seed 0x{x}\n", .{seed});
+                return err;
+            };
+            try std.testing.expectEqual(@as(u32, ChannelStress.callers * ChannelStress.calls_each), t.calls.load(.acquire));
+            try std.testing.expect(t.ok.load(.monotonic) > 0);
+            try std.testing.expect(Connections.count() <= t.losses + 1);
+        }
+    }.run);
+}

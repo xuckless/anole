@@ -626,3 +626,184 @@ test "trace: a flush whose caller is canceled stays canceled" {
     defer flusher.cancel(io) catch {};
     try std.testing.expectError(error.Canceled, flusher.cancel(io));
 }
+
+// ------------------------------------------------------------ stress (W3)
+
+/// An OTLP collector that takes every batch.
+fn takingCollector(req: *dusty.Request, res: *dusty.Response) !void {
+    _ = try req.body();
+    res.body = "{}";
+}
+
+/// The tasks of the trace stress test.
+const TraceStress = struct {
+    exporter: *observe.trace.Exporter,
+    io: std.Io,
+    submitted: std.atomic.Value(u64) = .init(0),
+    /// `close` returned.
+    closed: std.atomic.Value(bool) = .init(false),
+    close_after: u64,
+
+    fn flusher(t: *TraceStress) void {
+        // Flushes until the close; each returns once its spans are
+        // answered, on its timeout, or at once after the close.
+        for (0..200) |_| {
+            if (t.closed.load(.acquire)) return;
+            t.exporter.flush(.fromMilliseconds(50));
+        }
+    }
+
+    fn submitter(t: *TraceStress, n: usize, id: u8) void {
+        for (0..n) |_| {
+            t.exporter.submit(testSpan(id));
+            _ = t.submitted.fetchAdd(1, .release);
+        }
+    }
+
+    fn closer(t: *TraceStress) std.Io.Cancelable!void {
+        wait.waitAtLeast(t.io, "the submitters reached the close point", &t.submitted, t.close_after) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.WaitTimedOut => {},
+        };
+        t.exporter.close();
+        t.closed.store(true, .release);
+    }
+};
+
+test "trace: [stress] flushes racing submits and close all return, and every span is exported or dropped" {
+    try wait.requireStress();
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    var otel = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer otel.deinit();
+    otel.router.post("/v1/traces", takingCollector);
+    var otel_future = try io.concurrent(serve, .{&otel});
+    defer otel_future.cancel(io) catch {};
+    try otel.waitReady(io);
+    var client = dusty.Client.init(gpa, io, .{});
+    defer client.deinit();
+    var endpoint_buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{otel.address.ip.getPort()});
+
+    const seed: u64 = 0x5eed_0118;
+    var prng: std.Random.DefaultPrng = .init(seed);
+    for (0..4) |round| {
+        var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = endpoint, .service_name = "stress", .interval = .fromMilliseconds(5), .batch_size = 64 });
+        defer exporter.deinit();
+        try exporter.start();
+        var t: TraceStress = .{ .exporter = &exporter, .io = io, .close_after = prng.random().uintLessThan(u64, 20_000) };
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        for (0..8) |i| try dusty.placement.concurrent(&group, io, .{ .executor = i }, TraceStress.flusher, .{&t});
+        for (0..4) |i| try dusty.placement.concurrent(&group, io, .{ .executor = i }, TraceStress.submitter, .{ &t, 5000, @as(u8, 'a') + @as(u8, @intCast(i)) });
+        try dusty.placement.concurrent(&group, io, .{ .executor = round }, TraceStress.closer, .{&t});
+        group.await(io) catch |err| {
+            std.debug.print("trace stress: seed 0x{x}, round {d}\n", .{ seed, round });
+            return err;
+        };
+        const queued = exporter.queued.load(.acquire);
+        try std.testing.expectEqual(queued, exporter.finished.load(.acquire));
+        try std.testing.expectEqual(t.submitted.load(.acquire), exporter.exported.load(.acquire) + exporter.dropped.load(.acquire));
+    }
+}
+
+/// The tasks of the metrics stress test: each worker registers families of
+/// its own and labels series in them; the scraper renders as they go.
+const MetricsStress = struct {
+    registry: *observe.metrics.Registry,
+    io: std.Io,
+    ops: std.atomic.Value(u64) = .init(0),
+    workers_done: std.atomic.Value(u32) = .init(0),
+    failures: std.atomic.Value(u32) = .init(0),
+
+    const workers = 4;
+    const ops_each = 4000;
+    const labels = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
+
+    /// `names` (the worker's own arena) keeps the family names past the
+    /// registry.
+    fn worker(m: *MetricsStress, id: usize, names: std.mem.Allocator) void {
+        defer _ = m.workers_done.fetchAdd(1, .release);
+        var families: [ops_each / 100]*observe.metrics.Family(observe.metrics.Counter) = undefined;
+        var n: usize = 0;
+        for (0..ops_each) |i| {
+            if (i % 100 == 0) {
+                const name = std.fmt.allocPrint(names, "w{d}_f{d}_total", .{ id, i / 100 }) catch return m.fail();
+                families[n] = m.registry.counter(name, "Stress.", &.{"l"}) catch return m.fail();
+                n += 1;
+            }
+            families[i % n].with(&.{labels[i % labels.len]}).inc();
+            _ = m.ops.fetchAdd(1, .release);
+        }
+    }
+
+    fn fail(m: *MetricsStress) void {
+        _ = m.failures.fetchAdd(1, .monotonic);
+    }
+
+    const Next = struct {
+        m: *MetricsStress,
+        target: u64,
+
+        fn reached(x: Next) bool {
+            return x.m.workers_done.load(.acquire) == workers or x.m.ops.load(.acquire) >= x.target;
+        }
+    };
+
+    /// Renders after every 1000 operations, until the workers are done:
+    /// each render reads as the text format, and no family it saw goes.
+    fn scraper(m: *MetricsStress) std.Io.Cancelable!void {
+        var seen_families: usize = 0;
+        var target: u64 = 1000;
+        while (true) {
+            const done = m.workers_done.load(.acquire) == workers;
+            var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer out.deinit();
+            m.registry.render(&out.writer) catch return m.fail();
+            var families: usize = 0;
+            var lines = std.mem.splitScalar(u8, out.written(), '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                if (std.mem.startsWith(u8, line, "# TYPE ")) {
+                    families += 1;
+                } else if (!std.mem.startsWith(u8, line, "# HELP ")) {
+                    // `name{labels} value` or `name value`.
+                    const space = std.mem.lastIndexOfScalar(u8, line, ' ') orelse return m.fail();
+                    _ = std.fmt.parseFloat(f64, line[space + 1 ..]) catch return m.fail();
+                }
+            }
+            if (families < seen_families) return m.fail();
+            seen_families = families;
+            if (done) return;
+            wait.waitUntil(m.io, "the workers did 1000 more operations, or ended", Next{ .m = m, .target = target }, Next.reached) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.WaitTimedOut => return m.fail(),
+            };
+            target += 1000;
+        }
+    }
+};
+
+test "metrics: [stress] scrapes racing registration and new series read as the text format, and families never vanish" {
+    try wait.requireStress();
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
+    defer rt.deinit();
+    const io = rt.io();
+    // One arena per worker for the family names, which must outlive the
+    // registry: they go after it.
+    var names: [MetricsStress.workers]std.heap.ArenaAllocator = @splat(.init(gpa));
+    defer for (&names) |*a| a.deinit();
+    var registry = observe.metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    var m: MetricsStress = .{ .registry = &registry, .io = io };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..MetricsStress.workers) |i| try dusty.placement.concurrent(&group, io, .{ .executor = i }, MetricsStress.worker, .{ &m, i, names[i].allocator() });
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, MetricsStress.scraper, .{&m});
+    try group.await(io);
+    try std.testing.expectEqual(@as(u32, 0), m.failures.load(.monotonic));
+}

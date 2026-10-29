@@ -168,3 +168,56 @@ test "metrics: a breaker's state reaches the metrics when it is made, and when t
     try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_state{client=\"http\",target=\"a\"} 0") != null);
     try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_state{client=\"http\",target=\"b\"} 0") != null);
 }
+
+/// The tasks of the breakers stress test: each makes and looks up breakers
+/// over the same keys, with the metrics on.
+const BreakersStress = struct {
+    breakers: *core.Breakers,
+    io: std.Io,
+    failures: std.atomic.Value(u32) = .init(0),
+
+    const keys = 200;
+    const gets_each = 10_000;
+
+    fn worker(t: *BreakersStress, seed: u64) void {
+        var prng: std.Random.DefaultPrng = .init(seed);
+        var buf: [16]u8 = undefined;
+        for (0..gets_each) |_| {
+            const key = std.fmt.bufPrint(&buf, "k{d}", .{prng.random().uintLessThan(u32, keys)}) catch unreachable;
+            const b = t.breakers.get(t.io, key) catch {
+                _ = t.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            if (!std.mem.eql(u8, b.name(), key)) _ = t.failures.fetchAdd(1, .monotonic);
+        }
+    }
+};
+
+test "metrics: [stress] breakers made and reported from every executor: one state series per key" {
+    try @import("anole_test_wait").requireStress();
+    const zio = @import("zio");
+    const placement = @import("dusty").placement;
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
+    defer rt.deinit();
+    const io = rt.io();
+    var registry = metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    var binding = try Binding.init(gpa, &registry);
+    defer binding.deinit();
+    // Room for every key: nothing is evicted.
+    var breakers = core.Breakers.init(gpa, .{}, .http, 16 * BreakersStress.keys);
+    defer breakers.deinit();
+    breakers.observe(io, binding.metricsHooks());
+    var t: BreakersStress = .{ .breakers = &breakers, .io = io };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..4) |i| try placement.concurrent(&group, io, .{ .executor = i }, BreakersStress.worker, .{ &t, 0x5eed_0126 + i });
+    try group.await(io);
+    try testing.expectEqual(@as(u32, 0), t.failures.load(.monotonic));
+    try testing.expectEqual(@as(usize, BreakersStress.keys), breakers.count(io));
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    try testing.expectEqual(@as(usize, BreakersStress.keys), std.mem.count(u8, out.written(), "anole_breaker_state{"));
+}

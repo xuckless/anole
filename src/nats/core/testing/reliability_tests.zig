@@ -2788,3 +2788,50 @@ test "a requestMany past its deadline that nobody reads does not hold up a drain
     try client.drain(.{ .timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } } });
     try testing.expectEqual(.drained, client.close_reason.?);
 }
+
+/// Takes connections one at a time and says nothing on them, each until the
+/// client hangs up, until canceled.
+fn serveSilently(io: Io, listener: *net.Server, record: *Record) anyerror!void {
+    while (true) {
+        var peer: FakeServer.Peer = undefined;
+        try peer.accept(io, listener);
+        defer peer.close();
+        _ = record.accepted.fetchAdd(1, .monotonic);
+        while (true) {
+            const line = peer.nextLine() catch |err| {
+                if (peer.canceled(err)) return error.Canceled;
+                break;
+            };
+            if (line == null) break;
+        }
+    }
+}
+
+test "nats: [stress] close() racing connection attempts always closes the client, and nothing leaks" {
+    try test_wait.requireStress();
+    const io = testing.io;
+    var listener = try FakeServer.listen(io);
+    defer listener.deinit(io);
+    var record: Record = .{};
+    defer record.deinit();
+    var server = try io.concurrent(serveSilently, .{ io, &listener, &record });
+    defer server.cancel(io) catch {};
+    var url: [64]u8 = undefined;
+    const servers: []const []const u8 = &.{try FakeServer.url(&listener, &url)};
+    const seed: u64 = 0x5eed_0136;
+    var prng: std.Random.DefaultPrng = .init(seed);
+    for (0..500) |round| {
+        var client: Client = try .init(testing.allocator, io, .{ .servers = servers, .retry_initial_connect = true });
+        defer client.deinit();
+        const before = record.accepted.load(.monotonic);
+        try client.connect();
+        // Before the dial ends, or once the server has the connection and
+        // the attempt waits for INFO.
+        if (prng.random().boolean()) try awaitAccepted(&record, before + 1);
+        client.close();
+        if (client.state() != .closed) {
+            std.debug.print("nats close stress: seed 0x{x}, round {d}\n", .{ seed, round });
+            return error.TestNotClosed;
+        }
+    }
+}
