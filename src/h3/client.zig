@@ -1725,6 +1725,15 @@ pub const Stream = struct {
         return self.write_err;
     }
 
+    /// True when `cancel` or `release` ended the stream: its
+    /// `error.Canceled` is that call's, not a cancel of the waiting task.
+    pub fn canceledLocally(self: *const Stream) bool {
+        const conn = self.conn;
+        conn.lock();
+        defer conn.unlock();
+        return if (self.cause) |e| e == error.Canceled else false;
+    }
+
     /// Ends the request body.
     pub fn closeSend(self: *Stream) !void {
         try self.out_writer.flush();
