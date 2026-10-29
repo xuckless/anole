@@ -20,6 +20,8 @@ var last_close_code: std.atomic.Value(u16) = .init(0);
 var last_end_error: std.atomic.Value(bool) = .init(false);
 /// The last socket opened, for sends from the test's own task.
 var last_socket: std.atomic.Value(?*websocket.Socket) = .init(null);
+/// The most read blocks `Watched` saw held during one of its callbacks.
+var blocks_seen: std.atomic.Value(usize) = .init(0);
 /// Tasks the callbacks started, joined by the test.
 var background: std.Io.Group = .init;
 
@@ -29,6 +31,7 @@ fn resetCounts() void {
     last_close_code.store(0, .release);
     last_end_error.store(false, .release);
     last_socket.store(null, .release);
+    blocks_seen.store(0, .release);
 }
 
 /// Per-socket state, in `context`.
@@ -73,6 +76,15 @@ const Echo = struct {
     fn sendLater(ws: *websocket.Socket) std.Io.Cancelable!void {
         try ws.io.sleep(.fromMilliseconds(150), .awake);
         ws.send(.text, "later!") catch {};
+    }
+};
+
+/// An echo that notes whether a read block was out while it ran, so a test
+/// knows its traffic moved the socket to one.
+const Watched = struct {
+    pub fn message(ws: *websocket.Socket, msg: websocket.Message) !void {
+        _ = blocks_seen.fetchMax(websocket._readBlocksHeld(), .acq_rel);
+        try ws.send(msg.type, msg.data);
     }
 };
 
@@ -171,6 +183,42 @@ const Client = struct {
         try std.testing.expectEqual(code, std.mem.readInt(u16, f.payload[0..2], .big));
     }
 
+    /// Queues one masked frame of any length (a zero key: the payload goes
+    /// as it is).
+    fn queueAny(self: *Client, opcode: u8, payload: []const u8) !void {
+        var head: [14]u8 = undefined;
+        head[0] = 0x80 | opcode;
+        var n: usize = 2;
+        if (payload.len < 126) {
+            head[1] = 0x80 | @as(u8, @intCast(payload.len));
+        } else if (payload.len <= 0xFFFF) {
+            head[1] = 0x80 | 126;
+            std.mem.writeInt(u16, head[2..4], @intCast(payload.len), .big);
+            n = 4;
+        } else {
+            head[1] = 0x80 | 127;
+            std.mem.writeInt(u64, head[2..10], payload.len, .big);
+            n = 10;
+        }
+        @memset(head[n..][0..4], 0);
+        try self.writer().writeAll(head[0 .. n + 4]);
+        try self.writer().writeAll(payload);
+    }
+
+    /// The next frame of any length, its payload in `out`.
+    fn nextAny(self: *Client, out: []u8) !Frame {
+        const head = try self.reader().takeArray(2);
+        const opcode = head[0] & 0x0f;
+        var len: usize = head[1] & 0x7f;
+        if (len == 126) {
+            len = try self.reader().takeInt(u16, .big);
+        } else if (len == 127) {
+            len = @intCast(try self.reader().takeInt(u64, .big));
+        }
+        try self.reader().readSliceAll(out[0..len]);
+        return .{ .opcode = opcode, .payload = out[0..len] };
+    }
+
     fn hungUp(self: *Client) bool {
         _ = self.reader().takeByte() catch return true;
         return false;
@@ -219,6 +267,7 @@ const Fixture = struct {
         self.server.router.get("/ws", websocket.callbacks(void, Echo, .{}));
         self.server.router.get("/quiet", websocket.callbacks(void, Echo, .{ .close_on_drain = false }));
         self.server.router.get("/loop", websocket.route(void, loopEcho, .{}));
+        self.server.router.get("/watched", websocket.callbacks(void, Watched, .{}));
         self.server.router.get("/brief", websocket.callbacks(void, Echo, .{ .timeout = .{ .duration = .{ .raw = .fromMilliseconds(400), .clock = .awake } } }));
         self.future = try self.io.concurrent(struct {
             fn run(s: *Server) anyerror!void {
@@ -508,6 +557,98 @@ test "WebSocket callbacks: a callback socket closes at its deadline while parked
     try f.waitParked(1);
     try std.testing.expect(c.hungUp());
     try f.waitClosed(1);
+}
+
+/// The `i`th small message of a burst: 40 bytes, its number first.
+fn smallMessage(buf: *[40]u8, i: usize) []const u8 {
+    @memset(buf, 'a' + @as(u8, @intCast(i % 26)));
+    _ = std.fmt.bufPrint(buf, "msg {d:0>6} ", .{i}) catch unreachable;
+    return buf;
+}
+
+/// Sends `count` small messages in one go, which leave the client's
+/// writer 4 KiB at a time (records of 4 KiB over TLS), so the server's
+/// first read fills its window; with `big`, that message and as many small
+/// ones after it. Then reads every echo and checks it, in order.
+fn burst(c: *Client, count: usize, big: ?[]const u8) !void {
+    var buf: [40]u8 = undefined;
+    for (0..count) |i| try c.queueAny(0x1, smallMessage(&buf, i));
+    if (big) |b| {
+        try c.queueAny(0x2, b);
+        for (count..2 * count) |i| try c.queueAny(0x1, smallMessage(&buf, i));
+    }
+    try c.writer().flush();
+
+    const out = try std.testing.allocator.alloc(u8, if (big) |b| b.len else 64);
+    defer std.testing.allocator.free(out);
+    for (0..count) |i| {
+        const frame = try c.nextAny(out);
+        try std.testing.expectEqual(@as(u8, 0x1), frame.opcode);
+        try std.testing.expectEqualStrings(smallMessage(&buf, i), frame.payload);
+    }
+    const b = big orelse return;
+    const frame = try c.nextAny(out);
+    try std.testing.expectEqual(@as(u8, 0x2), frame.opcode);
+    try std.testing.expectEqualSlices(u8, b, frame.payload);
+    for (count..2 * count) |i| {
+        const small = try c.nextAny(out);
+        try std.testing.expectEqual(@as(u8, 0x1), small.opcode);
+        try std.testing.expectEqualStrings(smallMessage(&buf, i), small.payload);
+    }
+}
+
+test "WebSocket callbacks: small messages around a 64 KiB one arrive whole and in order, over TLS" {
+    if (!have_tls) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(gpa, true, quick);
+    defer f.deinit(gpa);
+
+    var c: Client = undefined;
+    try c.open(f.io, f.server.address.ip, true, "/watched");
+    defer c.close(f.io);
+    const big = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate((i *% 131) +% (i >> 8));
+    try burst(&c, 200, big);
+    // The burst moved the socket from its small window to a read block on
+    // the way, or this test proves nothing about the move.
+    try std.testing.expect(blocks_seen.load(.acquire) >= 1);
+}
+
+test "WebSocket callbacks: a busy socket that parks holds no read block" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(gpa, false, quick);
+    defer f.deinit(gpa);
+
+    var c: Client = undefined;
+    try c.open(f.io, f.server.address.ip, false, "/watched");
+    defer c.close(f.io);
+    try burst(&c, 200, null);
+    try std.testing.expect(blocks_seen.load(.acquire) >= 1);
+    try f.waitParked(1);
+    try std.testing.expectEqual(0, websocket._readBlocksHeld());
+}
+
+test "WebSocket callbacks: a busy socket waiting on its task gives its read block back once the peer is quiet" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(gpa, false, .{ .timeout = .{ .idle_park = null } });
+    defer f.deinit(gpa);
+
+    var c: Client = undefined;
+    try c.open(f.io, f.server.address.ip, false, "/watched");
+    defer c.close(f.io);
+    try burst(&c, 200, null);
+    try std.testing.expect(blocks_seen.load(.acquire) >= 1);
+    // One small message at a time, each answered before the next: twice as
+    // many waits for the peer as a busy socket keeps its block for (8).
+    for (0..16) |_| {
+        try c.send(0x1, "quiet");
+        try c.expectText("quiet");
+    }
+    try std.testing.expectEqual(0, websocket._readBlocksHeld());
 }
 
 /// Peers that go away without a close frame, each way: a FIN or a RST,
