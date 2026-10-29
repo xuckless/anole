@@ -50,7 +50,10 @@ fn pack(g: u32, st: SlotState) u64 {
 pub const NetSlot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
     /// Over `conn`: a call from a consumer thread holds it while it uses
-    /// the connection, `retire` while it takes it away. Never across I/O.
+    /// the connection, `onClose` while it takes it away. A leaf (L4):
+    /// nothing is taken, allocated or woken under it but the connection's
+    /// atomics (a reset's non-blocking `setsockopt`/`shutdown` and its gated
+    /// wakes); a call's chunk is made before it, its kick made after.
     lock: safety.SpinLock(.leaf) = .init,
     conn: ?*net.Conn = null,
     state: *TcpState = undefined,
@@ -151,21 +154,22 @@ pub const UdpState = struct {
     ordinal: u32,
     max_datagram: u16,
     /// Set once the sockets exist (the first batch, or the start), cleared
-    /// at the stop before they are freed. `users` counts the calls inside.
+    /// at the stop before they are freed.
     group: std.atomic.Value(?*net.UdpGroup) = .init(null),
-    users: std.atomic.Value(u32) = .init(0),
+    /// The calls from consumer threads inside the group (T5): closed at the
+    /// stop, which waits for those inside.
+    gate: safety.IoGate = .{},
 
     fn enter(u: *UdpState) ?*net.UdpGroup {
-        _ = u.users.fetchAdd(1, .seq_cst);
-        const g = u.group.load(.seq_cst) orelse {
-            _ = u.users.fetchSub(1, .seq_cst);
+        if (!u.gate.enter()) return null;
+        return u.group.load(.acquire) orelse {
+            u.gate.leave();
             return null;
         };
-        return g;
     }
 
     fn leave(u: *UdpState) void {
-        _ = u.users.fetchSub(1, .seq_cst);
+        u.gate.leave();
     }
 };
 
@@ -284,8 +288,8 @@ pub fn opened(e: *Engine, app: *anole.App) void {
 /// Before the sockets are freed: no call is inside them, none gets in.
 pub fn close(e: *Engine) void {
     for (e.net_state.udps.items) |u| {
-        u.group.store(null, .seq_cst);
-        while (u.users.load(.seq_cst) != 0) std.atomic.spinLoopHint();
+        u.group.store(null, .release);
+        u.gate.close();
     }
 }
 
@@ -581,22 +585,50 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
     const s, const g = slotOf(e, hv) catch |err| return e.badHandle(err);
     const borrow = flags & abi.BODY_BORROW != 0;
     const frame = flags & abi.NET_F_FRAME != 0;
-    // The SENT record first: a call that fails takes nothing.
-    var sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
-    errdefer if (sent) |r| engine.freeRecord(r.ptr);
-    s.acquire();
-    defer s.release();
-    const conn = s.conn orelse return e.gone();
-    if (!s.live(g)) return e.gone();
     // A framed or empty write is copied (there is nothing to borrow): its
     // SENT follows at once, when the call took it.
     const copy = frame or data.len == 0;
-    const result = (if (frame)
-        conn.sendFrame(data)
-    else if (sent != null and !copy)
-        conn.sendBorrowed(data, @intFromPtr(sent.?.ptr))
-    else
-        conn.send(data)) catch |err| return switch (err) {
+    // The SENT record first: a call that fails takes nothing.
+    const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
+    errdefer if (sent) |r| engine.freeRecord(r.ptr);
+    // The chunk before the lock (L5): nothing allocates under it.
+    var chunk: ?*net.OutChunk = null;
+    errdefer if (chunk) |c| c.destroy();
+    if (sent != null and !copy) {
+        chunk = try net.OutChunk.borrowed(gpa, data, @intFromPtr(sent.?.ptr));
+    } else if (frame or data.len > 0) {
+        const c = try net.OutChunk.create(gpa, data.len);
+        @memcpy(c.payload(), data);
+        chunk = c;
+    }
+    // The wakes are made after the lock is let go.
+    var kicks: [2]?net.Kick = .{ null, null };
+    const result: net.Conn.Sent = locked: {
+        s.acquire();
+        defer s.release();
+        const conn = s.conn orelse return e.gone();
+        if (!s.live(g)) return e.gone();
+        var r: net.Conn.Sent = .ok;
+        if (chunk) |c| {
+            // Taken by the call, on success and on error alike.
+            chunk = null;
+            const q = conn.queueChunk(c, frame) catch |err| return writeError(e, err);
+            r = q.sent;
+            kicks[0] = q.kick;
+        } else {
+            // Empty: the checks only.
+            _ = conn.send("") catch |err| return writeError(e, err);
+        }
+        if (flags & abi.NET_F_END != 0) kicks[1] = conn.endKick();
+        break :locked r;
+    };
+    for (kicks) |k| if (k) |kick| kick.run();
+    if (sent) |rec| if (copy) s.exec.postSentRec(s.handle(g), rec);
+    return result == .busy;
+}
+
+fn writeError(e: *Engine, err: net.Conn.SendError) AnswerError {
+    return switch (err) {
         error.Closed => e.gone(),
         error.Ended => invalid("Ended", "this side of the connection was ended already (ANOLE_NET_F_END, or a close)"),
         error.NoFraming => invalid("NoFraming", "ANOLE_NET_F_FRAME on a listener without framing"),
@@ -604,23 +636,20 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
         error.QueueFull => error.Again,
         error.OutOfMemory => error.OutOfMemory,
     };
-    if (sent) |rec| if (copy) {
-        s.exec.postSentRec(s.handle(g), rec);
-        sent = null;
-    };
-    if (flags & abi.NET_F_END != 0) conn.end();
-    return result == .busy;
 }
 
 /// `anole_net_close`: a cleanup call.
 pub fn closeConn(e: *Engine, hv: u64, how: u32) AnswerError!void {
     if (how != abi.NET_CLOSE_GRACEFUL and how != abi.NET_CLOSE_RESET) return error.Invalid;
     const s, const g = try slotOf(e, hv);
-    s.acquire();
-    defer s.release();
-    const conn = s.conn orelse return error.Over;
-    if (!s.live(g)) return error.Over;
-    if (how == abi.NET_CLOSE_RESET) conn.reset() else conn.close();
+    const kick = locked: {
+        s.acquire();
+        defer s.release();
+        const conn = s.conn orelse return error.Over;
+        if (!s.live(g)) return error.Over;
+        break :locked if (how == abi.NET_CLOSE_RESET) conn.resetKick() else conn.closeKick();
+    };
+    if (kick) |k| k.run();
 }
 
 pub fn pause(e: *Engine, hv: u64, on: bool) AnswerError!void {
