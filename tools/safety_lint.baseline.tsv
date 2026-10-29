@@ -193,7 +193,6 @@ src/net/framing.zig	U3	1
 src/net/scram.zig	L2	1
 src/net/scram.zig	U3	5
 src/net/sessions.zig	U3	4
-src/net/tcp.zig	C3	1
 src/net/tcp.zig	U3	16
 src/net/udp.zig	U3	8
 src/net/udp_service.zig	U3	6
