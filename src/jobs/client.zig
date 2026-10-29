@@ -139,6 +139,8 @@ pub const Client = struct {
     wake_kicks: std.atomic.Value(u32) = .init(0),
     /// Tests only: runs on a run's task right after `hold` has published it.
     test_after_hold: if (builtin.is_test) ?*const fn (*Client, *JobBox) void else void = if (builtin.is_test) null else {},
+    /// Tests only: runs on the stopping thread when the queue's work stops.
+    test_on_stop: if (builtin.is_test) ?*const fn (*Client) void else void = if (builtin.is_test) null else {},
 
     /// `app.jobs(options)` calls it; outside an app, `init`, `start`, `drain`, `deinit`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
@@ -187,6 +189,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        if (builtin.is_test) if (self.test_on_stop) |f| f(self);
         self.closing.store(true, .release);
         // A drain under way (the server's) is waited for, not cut short.
         if (self.started) {

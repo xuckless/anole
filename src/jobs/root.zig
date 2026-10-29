@@ -370,5 +370,7 @@ test {
     _ = @import("trace_test.zig");
     _ = @import("client.zig");
     _ = @import("unique.zig");
+    _ = @import("metrics.zig");
+    if (anole.features.postgres) _ = @import("store_pg.zig");
     _ = @import("../cron/root.zig");
 }

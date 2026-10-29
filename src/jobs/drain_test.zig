@@ -337,3 +337,69 @@ test "jobs: the teardown's cancel inside a maintenance store call ends the maint
     var f = try io.concurrent(maintenanceCancelCheck, .{io});
     try f.await(io);
 }
+
+/// A run that outlives the HTTP drain and then uses `app.webhooks`, a
+/// connector made after the queue (#J1, SAFETY.md M2): the app must end it
+/// before it frees any connector.
+const AfterHttp = struct {
+    const wh = @import("../webhooks/root.zig");
+    var io: std.Io = undefined;
+    var jc: *root.Client = undefined;
+    var hooks: *wh.Client = undefined;
+    var started: std.atomic.Value(bool) = .init(false);
+    var listed: std.atomic.Value(bool) = .init(false);
+    var release: std.Io.Event = .unset;
+
+    fn run(job: *root.Job) anyerror!void {
+        started.store(true, .release);
+        // Cancelable, as a handler's network wait is; the drain's cancel is
+        // an hour away, so only the teardown's hook ends it.
+        try release.wait(io);
+        _ = try hooks.listEndpoints(job, "nobody");
+        listed.store(true, .release);
+    }
+
+    /// The queue's work stops: the run may go on.
+    fn setRelease(_: *root.Client) void {
+        release.set(io);
+    }
+
+    fn check(a: *anole.App) !void {
+        defer a.stop();
+        try a.waitReady();
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var ctx: anole.db.Ctx = .{ .io = a.io(), .arena = arena.allocator() };
+        _ = try jc.enqueueRaw(&ctx, kind.name, "{}", .{});
+        try waitFor(a.io(), isStarted, .{});
+    }
+
+    fn isStarted() bool {
+        return started.load(.acquire);
+    }
+
+    fn body() !void {
+        {
+            // `deinit` at the end of this block is what the test is about.
+            var app = try anole.App.init(gpa, .{ .executors = .exact(2), .listen_tls_http3 = false });
+            defer app.deinit();
+            io = app.io();
+            started.store(false, .release);
+            listed.store(false, .release);
+            release = .unset;
+            jc = try app.jobs(.{ .store = .memory, .drain_timeout = .fromSeconds(3600) });
+            jc.test_on_stop = setRelease;
+            hooks = try app.webhooks(.{ .jobs = jc });
+            try jc.handleRaw(&app, kind, .{}, run);
+            var checking = try app.io().concurrent(check, .{&app});
+            defer checking.cancel(app.io()) catch {};
+            try app.listen("127.0.0.1:0");
+            try checking.await(app.io());
+        }
+        try std.testing.expect(listed.load(.acquire));
+    }
+};
+
+test "jobs: a run still going after the HTTP drain ends before a connector made after the queue is freed" {
+    if (comptime anole.features.webhooks) try AfterHttp.body() else return error.SkipZigTest;
+}

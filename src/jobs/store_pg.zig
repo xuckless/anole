@@ -6,6 +6,7 @@
 //! convert in SQL, so the Zig side keeps the same `Time` values as the
 //! other stores.
 const std = @import("std");
+const builtin = @import("builtin");
 const anole = @import("../root.zig");
 const root = @import("root.zig");
 const store = @import("store.zig");
@@ -57,6 +58,8 @@ pub const Postgres = struct {
     held_owner: ?[]u8 = null,
     /// Serialises the leader's session.
     leader_mutex: std.Io.Mutex = .init,
+    /// Tests only: runs in `takeAdvisory` with the session in hand, before its query.
+    test_before_leader_query: if (builtin.is_test) ?*const fn (*Postgres) void else void = if (builtin.is_test) null else {},
 
     pub const Config = struct {
         notify: bool = true,
@@ -627,6 +630,7 @@ pub const Postgres = struct {
             self.session = try self.client.session(ctx);
             self.holds_lock = false;
         }
+        if (builtin.is_test) if (self.test_before_leader_query) |f| f(self);
         const raw = self.session.?.raw;
         const key = advisoryKey("anole.leader:", self.prefix);
         if (self.holds_lock) {
@@ -718,4 +722,66 @@ pub fn ddlText(arena: std.mem.Allocator, prefix: []const u8) ![]const u8 {
         \\CREATE TABLE IF NOT EXISTS {0s}cron (name text PRIMARY KEY, spec text NOT NULL, last_tick timestamptz);
         \\CREATE TABLE IF NOT EXISTS {0s}leader (name text PRIMARY KEY, owner text NOT NULL, until timestamptz NOT NULL);
     , .{prefix});
+}
+
+/// The leader's advisory query held until the test lets it go, on the task
+/// that runs it (an uncancelable wait: the cancel stays pending for the query).
+const LeaderQueryHold = struct {
+    // SAFETY: set by leaderCancelCheck before the hook is installed.
+    var io: std.Io = undefined;
+    var task: ?@import("dusty").placement.Task = null;
+    var entered: std.atomic.Value(bool) = .init(false);
+    var release: std.Io.Event = .unset;
+
+    fn hold(_: *Postgres) void {
+        task = @import("dusty").placement.currentTask(io);
+        entered.store(true, .release);
+        release.waitUncancelable(io);
+    }
+
+    fn take(be: store.Backend) anyerror!bool {
+        return be.vt.leaderTake(be.ptr, "t7-leader", Time.fromSeconds(1_800_000_000), .fromSeconds(15));
+    }
+};
+
+fn leaderCancelCheck(io: std.Io, url: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const wait = @import("anole_test_wait");
+    const placement = @import("dusty").placement;
+    const pgc = try pg.Client.init(gpa, io, .{ .url = url, .environ = .empty });
+    defer pgc.deinit();
+    const be = try Postgres.create(gpa, io, pgc, "t7_", .{ .notify = false, .advisory_lock = true });
+    defer be.vt.deinit(be.ptr);
+    const self = Postgres.me(be.ptr);
+    LeaderQueryHold.io = io;
+    LeaderQueryHold.task = null;
+    LeaderQueryHold.entered.store(false, .release);
+    LeaderQueryHold.release = .unset;
+    self.test_before_leader_query = LeaderQueryHold.hold;
+    var f = try io.concurrent(LeaderQueryHold.take, .{be});
+    // A failed wait lets the query go and waits for it before the store
+    // goes; after the await below this does nothing.
+    defer {
+        LeaderQueryHold.release.set(io);
+        _ = f.await(io) catch false;
+    }
+    try wait.waitFlag(io, "the leader's query is about to run", &LeaderQueryHold.entered);
+    // The cancel comes before the query runs, by construction.
+    placement.cancelTask(LeaderQueryHold.task.?);
+    LeaderQueryHold.release.set(io);
+    try std.testing.expectError(error.Canceled, f.await(io));
+    // The failed query dropped its session, and the lock with it.
+    self.test_before_leader_query = null;
+    try std.testing.expect(try LeaderQueryHold.take(be));
+    try be.vt.leaderRelease(be.ptr, "t7-leader");
+}
+
+test "jobs pg: a cancel during the leader's advisory query reaches the caller" {
+    const url = @import("build_options").postgres_test_url orelse return error.SkipZigTest;
+    const zio = @import("zio");
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(leaderCancelCheck, .{ io, url });
+    try f.await(io);
 }

@@ -1,6 +1,7 @@
 //! Prometheus series of the job queue (§7.1). `kind` and `name` labels take
 //! at most 256 distinct values; later ones report as "other".
 const std = @import("std");
+const safety = @import("anole_safety");
 const observe = @import("../observe/root.zig");
 
 const m = observe.metrics;
@@ -21,7 +22,7 @@ pub const Series = struct {
     unsaved: *m.Family(m.Counter),
     leader: *m.Family(m.Gauge),
     cron_enqueued: *m.Family(m.Counter),
-    lock: std.atomic.Mutex = .unlocked,
+    lock: safety.SpinLock(.leaf) = .init,
     kinds: std.StringHashMapUnmanaged(void) = .empty,
     names: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -51,7 +52,7 @@ pub const Series = struct {
     }
 
     fn cap(self: *Series, set: *std.StringHashMapUnmanaged(void), value: []const u8) []const u8 {
-        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
+        self.lock.lock();
         defer self.lock.unlock();
         if (set.getKey(value)) |k| return k;
         if (set.count() >= max_labels) return "other";
@@ -82,3 +83,17 @@ pub const Series = struct {
         self.cron_enqueued.with(&.{self.cap(&self.names, name)}).inc();
     }
 };
+
+test "jobs metrics: a new kind label is recorded without allocating under the label lock" {
+    var registry: m.Registry = .init(std.testing.allocator, std.testing.io);
+    defer registry.deinit();
+    // Panics (SAFETY.md L5) when the series allocates under its spin lock.
+    var checked: safety.SpinCheckedAllocator = .init(std.testing.allocator);
+    var s = try Series.init(checked.allocator(), &registry);
+    defer s.deinit();
+    s.onEnqueued("default", "k1", true);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "anole_jobs_enqueued_total{queue=\"default\",kind=\"k1\"} 1") != null);
+}
