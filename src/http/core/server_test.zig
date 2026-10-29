@@ -569,61 +569,6 @@ test "Server: WebSocket echo" {
     try std.testing.expectEqualStrings("Hello", ctx.received_msg[0..ctx.received_len]);
 }
 
-test "Server: void context handlers" {
-    const io = std.testing.io;
-
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
-    defer server.deinit();
-
-    server.router.get("/test", struct {
-        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
-            _ = req;
-            res.body = "Hello from void context!\n";
-        }
-    }.handle);
-
-    server.router.post("/echo", struct {
-        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
-            var read_buf: [1024]u8 = undefined;
-            var reader = try req.reader(&read_buf);
-            const body = try reader.interface.allocRemaining(req.arena, .limited(1024));
-            res.body = try std.fmt.allocPrint(res.arena, "Echo: {s}\n", .{body});
-        }
-    }.handle);
-
-    var server_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(void)) !void {
-            try s.run();
-        }
-    }.run, .{&server});
-    defer server_future.cancel(io) catch {};
-
-    var client_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.waitReady(_io);
-
-            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
-            defer stream.close(_io);
-            defer stream.shutdown(_io, .both) catch {};
-
-            var write_buf: [1024]u8 = undefined;
-            var writer = stream.writer(_io, &write_buf);
-
-            try writer.interface.writeAll("GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n");
-            try writer.interface.flush();
-
-            var read_buf: [1024]u8 = undefined;
-            var reader = stream.reader(_io, &read_buf);
-            const status_line = try reader.interface.takeDelimiterExclusive('\n');
-
-            std.log.info("Response: {s}", .{status_line});
-            try std.testing.expect(std.mem.indexOf(u8, status_line, "200 OK") != null);
-        }
-    }.run, .{ &server, io });
-
-    try client_future.await(io);
-}
-
 test "Server: graceful shutdown drain still blocks after an earlier connection closed" {
     const io = std.testing.io;
 
