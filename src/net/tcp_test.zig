@@ -1287,3 +1287,66 @@ test "net tcp: reset of a paused connection ends it" {
         }
     }.run);
 }
+
+/// Counts the allocations of 16 KiB or more: a send chunk's size (an
+/// owner-executor send's chunk has room for 16 KiB; the echo path's other
+/// allocations are small).
+const ChunkCount = struct {
+    child: std.mem.Allocator,
+    chunks: std.atomic.Value(u32) = .init(0),
+
+    fn allocator(self: *ChunkCount) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = allocFn, .resize = resizeFn, .remap = remapFn, .free = freeFn };
+
+    fn from(ctx: *anyopaque) *ChunkCount {
+        // SAFETY: `allocator()` sets the context to a *ChunkCount.
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self = from(ctx);
+        if (len >= 16 * 1024) _ = self.chunks.fetchAdd(1, .monotonic);
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+
+    fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        return from(ctx).child.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        return from(ctx).child.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        from(ctx).child.rawFree(memory, alignment, ra);
+    }
+};
+
+test "net tcp: a steady echo on one connection allocates no new send chunk after the first" {
+    var counting: ChunkCount = .{ .child = alloc };
+    var app = try App.init(counting.allocator(), .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", Echo, .{});
+    const Run = struct {
+        var count: *ChunkCount = undefined;
+        fn round(s: *ClientStream) !void {
+            try s.writer().writeAll("0123456789abcdef");
+            try s.writer().flush();
+            try expectRead(s, "0123456789abcdef");
+        }
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            for (0..10) |_| try round(s);
+            const warm = count.chunks.load(.acquire);
+            try std.testing.expect(warm >= 1);
+            for (0..200) |_| try round(s);
+            try std.testing.expectEqual(warm, count.chunks.load(.acquire));
+        }
+    };
+    Run.count = &counting;
+    try serveWith(&app, Run.run);
+}
