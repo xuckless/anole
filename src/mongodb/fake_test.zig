@@ -360,12 +360,13 @@ test "fake mongod: an unreachable server is a 503, a call's own shorter timeout 
     var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
 
     // Nothing listens on port 1: server selection gives up, 503.
-    const client = try mongodb.Client.init(gpa, io, .{ .url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=100&connectTimeoutMS=100" });
+    const client = try mongodb.Client.init(gpa, io, .{ .url = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=300&connectTimeoutMS=200" });
     defer client.deinit();
     try testing.expectError(error.ServiceUnavailable, client.ping(&c));
     try testing.expectEqual(db.Class.unavailable, db.lastError(&c).?.class);
-    // A timeout of the call's own, 5x shorter than server selection: 504.
-    try testing.expectError(error.GatewayTimeout, client.db("admin").with(.{ .timeout = .fromMilliseconds(20) }).runCommand(&c, .{ .ping = 1 }));
+    // A timeout of the call's own, 250 ms shorter than server selection
+    // (slack for a runner whose timers fire late): 504.
+    try testing.expectError(error.GatewayTimeout, client.db("admin").with(.{ .timeout = .fromMilliseconds(50) }).runCommand(&c, .{ .ping = 1 }));
 }
 
 test "mongodb: a bad connection string, and a URL that would turn off TLS the code asks for, are refused" {
