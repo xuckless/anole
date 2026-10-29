@@ -72,88 +72,153 @@ fn has(resp: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, resp, needle) != null;
 }
 
-test "RequireJwt: RFC 6750 answers, claims in the locals only, required claims, scopes" {
-    const gpa = std.testing.allocator;
-    const rt = try zio.Runtime.init(gpa, .{});
-    defer rt.deinit();
-    const io = rt.io();
+const hs256_keys = [_]jws.Key{.{ .alg = .HS256, .material = .{ .hmac = secret } }};
+const M = dusty.Middleware(void);
 
-    const keys = [_]jws.Key{.{ .alg = .HS256, .material = .{ .hmac = secret } }};
-    var plain = bearer.RequireJwt.init(.{ .static = &keys }, .{ .issuer = "me", .audience = "api" }, .{ .realm = "example" });
-    var mapped = bearer.RequireJwt.init(.{ .static = &keys }, .{ .issuer = "me", .audience = "api" }, .{
-        .required_claims = &.{ "sub", "role" },
-        .scopes = &.{ "notes:read", "notes:write" },
-    });
-    var after: [64]u8 = undefined;
-    var after_len: usize = 0;
-    var fake: FakeSession = .{ .after = &after, .after_len = &after_len };
+/// Static: the server keeps the slice past the fixture's `start`.
+const loopback_listeners = [_]dusty.Listener{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }};
 
-    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
-    defer server.deinit();
-    const M = dusty.Middleware(void);
-    const plain_mw = [_]M{ .init(&fake), .init(&plain) };
-    const mapped_mw = [_]M{ .init(&fake), .init(&mapped) };
-    server.router.group("/plain", &plain_mw).get("/me", handler);
-    server.router.group("/mapped", &mapped_mw).get("/me", handler);
-    var future = try io.concurrent(struct {
-        fn r(s: *dusty.Server(void)) !void {
-            try s.run();
-        }
-    }.r, .{&server});
-    defer future.cancel(io) catch {};
-    try server.waitReady(io);
-    const port = server.address.ip.getPort();
+/// A server with two groups behind `FakeSession` + `RequireJwt`: /plain
+/// (realm "example") and /mapped (required claims sub and role, scopes
+/// notes:read and notes:write), each serving `handler` at /me.
+const Fixture = struct {
+    rt: *zio.Runtime,
+    plain: bearer.RequireJwt,
+    mapped: bearer.RequireJwt,
+    after: [64]u8 = undefined,
+    after_len: usize = 0,
+    fake: FakeSession,
+    plain_mw: [2]M,
+    mapped_mw: [2]M,
+    server: dusty.Server(void),
+    future: std.Io.Future(anyerror!void),
+    port: u16,
+    arena_state: std.heap.ArenaAllocator,
+    now: i64,
+    out: [4096]u8 = undefined,
 
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const now = std.Io.Clock.real.now(io).toSeconds();
-    const good = try token(arena, try std.fmt.allocPrint(arena, "\"iss\":\"me\",\"aud\":\"api\",\"sub\":\"alice\",\"role\":\"editor\",\"scope\":\"notes:write notes:read\",\"exp\":{d}", .{now + 600}));
-    const expired = try token(arena, try std.fmt.allocPrint(arena, "\"iss\":\"me\",\"aud\":\"api\",\"sub\":\"alice\",\"exp\":{d}", .{now - 600}));
-    const other_aud = try token(arena, try std.fmt.allocPrint(arena, "\"iss\":\"me\",\"aud\":\"web\",\"sub\":\"alice\",\"exp\":{d}", .{now + 600}));
-    const narrow = try token(arena, try std.fmt.allocPrint(arena, "\"iss\":\"me\",\"aud\":\"api\",\"sub\":\"bob\",\"scope\":\"notes:read\",\"exp\":{d}", .{now + 600}));
-    const narrow_role = try token(arena, try std.fmt.allocPrint(arena, "\"iss\":\"me\",\"aud\":\"api\",\"sub\":\"bob\",\"role\":\"reader\",\"scope\":\"notes:read\",\"exp\":{d}", .{now + 600}));
-    const no_sub = try token(arena, try std.fmt.allocPrint(arena, "\"iss\":\"me\",\"aud\":\"api\",\"exp\":{d}", .{now + 600}));
+    fn runServer(s: *dusty.Server(void)) anyerror!void {
+        try s.run();
+    }
 
-    var out: [4096]u8 = undefined;
+    fn start(f: *Fixture, gpa: std.mem.Allocator) !void {
+        f.rt = try zio.Runtime.init(gpa, .{});
+        errdefer f.rt.deinit();
+        const io = f.rt.io();
+        f.plain = bearer.RequireJwt.init(.{ .static = &hs256_keys }, .{ .issuer = "me", .audience = "api" }, .{ .realm = "example" });
+        f.mapped = bearer.RequireJwt.init(.{ .static = &hs256_keys }, .{ .issuer = "me", .audience = "api" }, .{
+            .required_claims = &.{ "sub", "role" },
+            .scopes = &.{ "notes:read", "notes:write" },
+        });
+        f.after_len = 0;
+        f.fake = .{ .after = &f.after, .after_len = &f.after_len };
+        f.server = dusty.Server(void).init(gpa, io, .{ .listeners = &loopback_listeners }, {});
+        errdefer f.server.deinit();
+        f.plain_mw = .{ .init(&f.fake), .init(&f.plain) };
+        f.mapped_mw = .{ .init(&f.fake), .init(&f.mapped) };
+        f.server.router.group("/plain", &f.plain_mw).get("/me", handler);
+        f.server.router.group("/mapped", &f.mapped_mw).get("/me", handler);
+        f.future = try io.concurrent(runServer, .{&f.server});
+        errdefer f.future.cancel(io) catch {};
+        try f.server.waitReady(io);
+        f.port = f.server.address.ip.getPort();
+        f.arena_state = .init(gpa);
+        f.now = std.Io.Clock.real.now(io).toSeconds();
+    }
+
+    fn deinit(f: *Fixture) void {
+        const io = f.rt.io();
+        f.future.cancel(io) catch {};
+        f.server.deinit();
+        f.arena_state.deinit();
+        f.rt.deinit();
+    }
+
+    /// "Bearer <token>" for these claims plus an `exp` this many seconds
+    /// from now (600 s margins: no clock edge in reach).
+    fn bearerFor(f: *Fixture, claims: []const u8, exp_in: i64) ![]const u8 {
+        const arena = f.arena_state.allocator();
+        const t = try token(arena, try std.fmt.allocPrint(arena, "{s},\"exp\":{d}", .{ claims, f.now + exp_in }));
+        return std.fmt.allocPrint(arena, "Bearer {s}", .{t});
+    }
+
+    fn get(f: *Fixture, path: []const u8, auth: ?[]const u8) ![]const u8 {
+        return exchange(f.rt.io(), f.port, path, auth, &f.out);
+    }
+};
+
+const good_claims = "\"iss\":\"me\",\"aud\":\"api\",\"sub\":\"alice\",\"role\":\"editor\",\"scope\":\"notes:write notes:read\"";
+
+test "RequireJwt: no or a malformed Authorization gets 401 with a bare challenge or 400 invalid_request" {
+    var f: Fixture = undefined;
+    try f.start(std.testing.allocator);
+    defer f.deinit();
+
     // No token: 401 and a challenge without an error code.
-    var resp = try exchange(io, port, "/plain/me", null, &out);
+    var resp = try f.get("/plain/me", null);
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 401"));
     try std.testing.expect(has(resp, "WWW-Authenticate: Bearer realm=\"example\"\r\n"));
-    resp = try exchange(io, port, "/plain/me", "Basic YTpi", &out);
+    // Another scheme counts as no token.
+    resp = try f.get("/plain/me", "Basic YTpi");
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 401"));
+    try std.testing.expect(!has(resp, "error="));
     // A malformed header: 400 invalid_request.
-    resp = try exchange(io, port, "/plain/me", "Bearer a b", &out);
+    resp = try f.get("/plain/me", "Bearer a b");
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 400"));
     try std.testing.expect(has(resp, "error=\"invalid_request\""));
-    // Bad tokens: 401 invalid_token.
-    resp = try exchange(io, port, "/plain/me", try std.fmt.allocPrint(arena, "Bearer {s}", .{other_aud}), &out);
+}
+
+test "RequireJwt: a bad, expired or wrong-audience token gets 401 invalid_token" {
+    var f: Fixture = undefined;
+    try f.start(std.testing.allocator);
+    defer f.deinit();
+
+    var resp = try f.get("/plain/me", try f.bearerFor("\"iss\":\"me\",\"aud\":\"web\",\"sub\":\"alice\"", 600));
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 401"));
     try std.testing.expect(has(resp, "WWW-Authenticate: Bearer realm=\"example\", error=\"invalid_token\"\r\n"));
-    resp = try exchange(io, port, "/plain/me", try std.fmt.allocPrint(arena, "Bearer {s}", .{expired}), &out);
+    resp = try f.get("/plain/me", try f.bearerFor("\"iss\":\"me\",\"aud\":\"api\",\"sub\":\"alice\"", -600));
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 401"));
     try std.testing.expect(has(resp, "error=\"invalid_token\", error_description=\"The access token expired\""));
-    resp = try exchange(io, port, "/plain/me", try std.fmt.allocPrint(arena, "Bearer {s}x", .{good}), &out);
+    // A tampered signature.
+    const arena = f.arena_state.allocator();
+    resp = try f.get("/plain/me", try std.fmt.allocPrint(arena, "{s}x", .{try f.bearerFor(good_claims, 600)}));
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 401"));
-    // A required claim missing.
-    resp = try exchange(io, port, "/plain/me", try std.fmt.allocPrint(arena, "Bearer {s}", .{no_sub}), &out);
-    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 401"));
+    try std.testing.expect(has(resp, "error=\"invalid_token\""));
+}
 
-    // A good token: the handler reads it from the locals; the session
-    // holds only its own "user", before and after.
-    resp = try exchange(io, port, "/plain/me", try std.fmt.allocPrint(arena, "bearer  {s}", .{good}), &out);
+test "RequireJwt: verified claims reach the handler through the locals and never touch the session" {
+    var f: Fixture = undefined;
+    try f.start(std.testing.allocator);
+    defer f.deinit();
+    const arena = f.arena_state.allocator();
+
+    // The scheme is case-insensitive and takes extra spaces.
+    const good = try f.bearerFor(good_claims, 600);
+    var resp = try f.get("/plain/me", try std.fmt.allocPrint(arena, "bearer  {s}", .{good["Bearer ".len..]}));
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200"));
     try std.testing.expect(std.mem.endsWith(u8, resp, "subject=alice alg=HS256 role=editor user=from-session entries=1"));
-    try std.testing.expectEqualStrings("from-session", after[0..after_len]);
+    try std.testing.expectEqualStrings("from-session", f.after[0..f.after_len]);
 
-    resp = try exchange(io, port, "/mapped/me", try std.fmt.allocPrint(arena, "Bearer {s}", .{good}), &out);
+    resp = try f.get("/mapped/me", good);
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200"));
     try std.testing.expect(std.mem.endsWith(u8, resp, "subject=alice alg=HS256 role=editor user=from-session entries=1"));
-    try std.testing.expectEqualStrings("from-session", after[0..after_len]);
-    // A claim `required_claims` names, missing: 401 invalid_token.
-    resp = try exchange(io, port, "/mapped/me", try std.fmt.allocPrint(arena, "Bearer {s}", .{narrow}), &out);
+    try std.testing.expectEqualStrings("from-session", f.after[0..f.after_len]);
+}
+
+test "RequireJwt: a missing required claim is 401 invalid_token, too few scopes 403 insufficient_scope naming them" {
+    var f: Fixture = undefined;
+    try f.start(std.testing.allocator);
+    defer f.deinit();
+
+    // No sub at all.
+    var resp = try f.get("/plain/me", try f.bearerFor("\"iss\":\"me\",\"aud\":\"api\"", 600));
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 401"));
+    // A claim `required_claims` names (role), missing.
+    resp = try f.get("/mapped/me", try f.bearerFor("\"iss\":\"me\",\"aud\":\"api\",\"sub\":\"bob\",\"scope\":\"notes:read\"", 600));
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 401"));
     try std.testing.expect(has(resp, "error=\"invalid_token\""));
     // Too few scopes: 403 insufficient_scope, naming the ones needed.
-    resp = try exchange(io, port, "/mapped/me", try std.fmt.allocPrint(arena, "Bearer {s}", .{narrow_role}), &out);
+    resp = try f.get("/mapped/me", try f.bearerFor("\"iss\":\"me\",\"aud\":\"api\",\"sub\":\"bob\",\"role\":\"reader\",\"scope\":\"notes:read\"", 600));
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 403"));
     try std.testing.expect(has(resp, "WWW-Authenticate: Bearer error=\"insufficient_scope\", scope=\"notes:read notes:write\"\r\n"));
 }

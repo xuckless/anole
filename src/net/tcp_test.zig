@@ -49,6 +49,7 @@ fn serveWith(app: *App, comptime check: fn (*App) anyerror!void) !void {
         }
     };
     var checking = try app.io().concurrent(Run.run, .{app});
+    defer checking.cancel(app.io()) catch {};
     try app.run();
     try checking.await(app.io());
 }
@@ -319,10 +320,20 @@ test "net tcp: busy past the high-water mark, QueueFull past the maximum, writab
             try waitFor(a.io(), &Burst.full_seen, 1);
             try std.testing.expectEqual(@as(u32, 1), Burst.busy_seen.load(.acquire));
             // Reading everything lets the outbox drain: writable follows.
-            var buf: [16 * 1024]u8 = undefined;
-            while (Burst.writable_seen.load(.acquire) == 0) {
-                _ = try s.reader().readSliceShort(&buf);
-            }
+            // The reader runs on its own task until canceled, so the
+            // wait below has a deadline whenever the callback comes.
+            const Drain = struct {
+                fn run(st: *ClientStream) void {
+                    var buf: [16 * 1024]u8 = undefined;
+                    while (true) {
+                        const n = st.reader().readSliceShort(&buf) catch return;
+                        if (n == 0) return;
+                    }
+                }
+            };
+            var draining = try a.io().concurrent(Drain.run, .{s});
+            defer draining.cancel(a.io());
+            try wait.waitAtLeast(a.io(), "writable followed the drain", &Burst.writable_seen, 1);
         }
     }.run);
 }
@@ -350,7 +361,7 @@ test "net tcp: netStats counts connections and bytes" {
     }.run);
 }
 
-test "net tcp: options refused" {
+test "net tcp: invalid listener options make run() fail with a named error (tcp+udp, no port, http3, wrong state type, bad framing)" {
     const expected_log = @import("../errors.zig").expectLog();
     defer expected_log.deinit();
     // Both kinds on one listener.
@@ -421,6 +432,7 @@ test "net tcp: a raw listener beside HTTP, in one server" {
         }
     };
     var checking = try app.io().concurrent(Check.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
@@ -621,6 +633,7 @@ test "net tcp: drain runs the handler's drain, and the connections left open clo
         }
     };
     var checking = try app.io().concurrent(Run.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
     try app.run();
     try checking.await(app.io());
     try std.testing.expectEqual(@as(u32, 2), Goodbye.drains.load(.acquire));
@@ -721,6 +734,7 @@ test "net tcp: mutual TLS gives the handler the peer certificate" {
         }
     };
     var checking = try app.io().concurrent(Check.run, .{ &app, &pem });
+    defer checking.cancel(app.io()) catch {};
     try app.run();
     try checking.await(app.io());
 }

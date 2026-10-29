@@ -16,7 +16,8 @@ var provider_port: u16 = 0;
 /// authorization request).
 var next_nonce: [64]u8 = undefined;
 var next_nonce_len: usize = 0;
-var token_requests: usize = 0;
+/// Written on the server's tasks, read on the test's.
+var token_requests: std.atomic.Value(usize) = .init(0);
 
 fn issuer(buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}", .{provider_port}) catch unreachable;
@@ -49,7 +50,7 @@ fn tokenMoved(_: *dusty.Request, res: *dusty.Response) !void {
 }
 
 fn token(req: *dusty.Request, res: *dusty.Response) !void {
-    token_requests += 1;
+    _ = token_requests.fetchAdd(1, .monotonic);
     const body = (try req.body()) orelse "";
     // The code verifier must come along (PKCE).
     if (std.mem.indexOf(u8, body, "code_verifier=") == null or std.mem.indexOf(u8, body, "code=the-code") == null) {
@@ -72,76 +73,140 @@ fn token(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = try std.fmt.allocPrint(res.arena, "{{\"access_token\":\"at\",\"id_token\":\"{s}.{s}\"}}", .{ input, b64.Encoder.encode(&s, &sig) });
 }
 
-test "OIDC: discovery, PKCE authorization URL, code exchange, ID token checks" {
-    const gpa = std.testing.allocator;
-    const rt = try zio.Runtime.init(gpa, .{});
-    defer rt.deinit();
-    const io = rt.io();
-    provider_key = E.KeyPair.generate(io);
+/// Static: the server keeps the slice past the fixture's `start`.
+const loopback_listeners = [_]dusty.Listener{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }};
 
-    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
-    defer server.deinit();
-    server.router.get("/.well-known/openid-configuration", discovery);
-    server.router.get("/jwks", jwks);
-    server.router.post("/token", token);
-    server.router.post("/token-moved", tokenMoved);
-    var future = try io.concurrent(struct {
-        fn r(s: *dusty.Server(void)) !void {
-            try s.run();
-        }
-    }.r, .{&server});
-    defer future.cancel(io) catch {};
-    try server.waitReady(io);
-    provider_port = server.address.ip.getPort();
+/// The fake provider (discovery, jwks, token, token-moved) on loopback and
+/// a relying party discovered from it.
+const Fixture = struct {
+    gpa: std.mem.Allocator,
+    rt: *zio.Runtime,
+    server: dusty.Server(void),
+    future: std.Io.Future(anyerror!void),
+    client: dusty.Client,
+    provider: oidc.Provider,
+    keyring: Keyring,
+    rp: oidc.RelyingParty,
+    arena_state: std.heap.ArenaAllocator,
+    iss_buf: [64]u8 = undefined,
 
-    var client = dusty.Client.init(gpa, io, .{});
-    defer client.deinit();
-    var buf: [64]u8 = undefined;
-    var provider = try oidc.Provider.discover(gpa, .{ .http = &client }, issuer(&buf));
-    defer provider.deinit(gpa);
-    var keyring = Keyring.init(gpa, io, .{ .http = &client }, provider.jwks_uri);
-    defer keyring.deinit();
-    const rp: oidc.RelyingParty = .{
-        .provider = &provider,
-        .client_id = "my-client",
-        .client_secret = "s3cret",
-        .redirect_uri = "https://app.example/callback",
-        .keyring = &keyring,
-    };
+    fn serve(s: *dusty.Server(void)) anyerror!void {
+        try s.run();
+    }
 
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const start = try rp.begin(arena, io);
+    fn start(f: *Fixture, gpa: std.mem.Allocator) !void {
+        f.gpa = gpa;
+        f.rt = try zio.Runtime.init(gpa, .{});
+        errdefer f.rt.deinit();
+        const io = f.rt.io();
+        provider_key = E.KeyPair.generate(io);
+        token_requests.store(0, .monotonic);
+        next_nonce_len = 0;
+
+        f.server = dusty.Server(void).init(gpa, io, .{ .listeners = &loopback_listeners }, {});
+        errdefer f.server.deinit();
+        f.server.router.get("/.well-known/openid-configuration", discovery);
+        f.server.router.get("/jwks", jwks);
+        f.server.router.post("/token", token);
+        f.server.router.post("/token-moved", tokenMoved);
+        f.future = try io.concurrent(serve, .{&f.server});
+        errdefer f.future.cancel(io) catch {};
+        try f.server.waitReady(io);
+        provider_port = f.server.address.ip.getPort();
+
+        f.client = dusty.Client.init(gpa, io, .{});
+        errdefer f.client.deinit();
+        f.provider = try oidc.Provider.discover(gpa, .{ .http = &f.client }, issuer(&f.iss_buf));
+        errdefer f.provider.deinit(gpa);
+        f.keyring = Keyring.init(gpa, io, .{ .http = &f.client }, f.provider.jwks_uri);
+        f.rp = .{
+            .provider = &f.provider,
+            .client_id = "my-client",
+            .client_secret = "s3cret",
+            .redirect_uri = "https://app.example/callback",
+            .keyring = &f.keyring,
+        };
+        f.arena_state = .init(gpa);
+    }
+
+    fn deinit(f: *Fixture) void {
+        const io = f.rt.io();
+        f.arena_state.deinit();
+        f.keyring.deinit();
+        f.provider.deinit(f.gpa);
+        f.client.deinit();
+        f.future.cancel(io) catch {};
+        f.server.deinit();
+        f.rt.deinit();
+    }
+
+    /// Starts a sign-in; the provider's next ID token carries its nonce.
+    fn begin(f: *Fixture) !oidc.Start {
+        const s = try f.rp.begin(f.arena_state.allocator(), f.rt.io());
+        @memcpy(next_nonce[0..s.nonce.len], s.nonce);
+        next_nonce_len = s.nonce.len;
+        return s;
+    }
+};
+
+test "OIDC: a sign-in discovers the provider, sends a PKCE S256 URL and exchanges the code for a verified identity" {
+    var f: Fixture = undefined;
+    try f.start(std.testing.allocator);
+    defer f.deinit();
+    const io = f.rt.io();
+    const arena = f.arena_state.allocator();
+
+    const start = try f.begin();
     try std.testing.expect(std.mem.indexOf(u8, start.url, "code_challenge_method=S256") != null);
     try std.testing.expect(std.mem.indexOf(u8, start.url, "redirect_uri=https%3A%2F%2Fapp.example%2Fcallback") != null);
-    @memcpy(next_nonce[0..start.nonce.len], start.nonce);
-    next_nonce_len = start.nonce.len;
 
-    const id = try rp.finish(arena, io, .{ .http = &client }, .{ .code = "the-code", .state = start.state }, start);
+    const id = try f.rp.finish(arena, io, .{ .http = &f.client }, .{ .code = "the-code", .state = start.state }, start);
     try std.testing.expectEqualStrings("user-7", id.subject);
     try std.testing.expectEqualStrings("u7@example.com", id.email.?);
     try std.testing.expect(id.email_verified);
+    try std.testing.expectEqual(@as(usize, 1), token_requests.load(.monotonic));
+}
 
-    // A forged state never reaches the provider.
-    const before = token_requests;
-    try std.testing.expectError(error.StateMismatch, rp.finish(arena, io, .{ .http = &client }, .{ .code = "the-code", .state = "forged-state-forged-state-forged-state-1234" }, start));
-    try std.testing.expectEqual(before, token_requests);
+test "OIDC: a forged state is refused before any token request" {
+    var f: Fixture = undefined;
+    try f.start(std.testing.allocator);
+    defer f.deinit();
+    const io = f.rt.io();
+    const arena = f.arena_state.allocator();
 
-    // An ID token with another sign-in's nonce is refused (replay).
-    const second = try rp.begin(arena, io);
-    try std.testing.expectError(error.NonceMismatch, rp.finish(arena, io, .{ .http = &client }, .{ .code = "the-code", .state = second.state }, second));
+    const start = try f.begin();
+    try std.testing.expectError(error.StateMismatch, f.rp.finish(arena, io, .{ .http = &f.client }, .{ .code = "the-code", .state = "forged-state-forged-state-forged-state-1234" }, start));
+    try std.testing.expectEqual(@as(usize, 0), token_requests.load(.monotonic));
+}
 
-    // The token request, client secret and all, is never sent on to
-    // where a redirect points.
-    var moved = provider;
-    moved.token_endpoint = try std.fmt.allocPrint(arena, "{s}/token-moved", .{issuer(&buf)});
-    var moved_rp = rp;
+test "OIDC: an ID token carrying another sign-in's nonce is refused" {
+    var f: Fixture = undefined;
+    try f.start(std.testing.allocator);
+    defer f.deinit();
+    const io = f.rt.io();
+    const arena = f.arena_state.allocator();
+
+    // The provider answers with the first sign-in's nonce (a replayed ID
+    // token) to the second sign-in's exchange.
+    _ = try f.begin();
+    const second = try f.rp.begin(arena, io);
+    try std.testing.expectError(error.NonceMismatch, f.rp.finish(arena, io, .{ .http = &f.client }, .{ .code = "the-code", .state = second.state }, second));
+}
+
+test "OIDC: the token request (with the client secret) never follows a redirect" {
+    var f: Fixture = undefined;
+    try f.start(std.testing.allocator);
+    defer f.deinit();
+    const io = f.rt.io();
+    const arena = f.arena_state.allocator();
+
+    var moved = f.provider;
+    moved.token_endpoint = try std.fmt.allocPrint(arena, "{s}/token-moved", .{issuer(&f.iss_buf)});
+    var moved_rp = f.rp;
     moved_rp.provider = &moved;
-    const third = try rp.begin(arena, io);
-    const before_moved = token_requests;
-    try std.testing.expectError(error.TokenRequestFailed, moved_rp.finish(arena, io, .{ .http = &client }, .{ .code = "the-code", .state = third.state }, third));
-    try std.testing.expectEqual(before_moved, token_requests);
+    const start = try f.begin();
+    try std.testing.expectError(error.TokenRequestFailed, moved_rp.finish(arena, io, .{ .http = &f.client }, .{ .code = "the-code", .state = start.state }, start));
+    try std.testing.expectEqual(@as(usize, 0), token_requests.load(.monotonic));
 }
 
 test "Sign in with Apple: the client secret is an ES256 JWT our verifier accepts" {
