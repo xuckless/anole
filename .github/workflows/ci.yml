@@ -46,6 +46,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  fmt:
+    # zig fmt over everything but the generated gRPC code; no dependency
+    # fetch, so this fails in seconds (S1.5, research/s15/small-fixes.md).
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+      - name: zig fmt --check
+        run: zig fmt --check build.zig build.zig.zon build src tests examples tools templates bench --exclude tests/grpc/gen --exclude examples/grpc/gen
+
   test:
     name: test (${{ matrix.os }})
     strategy:
