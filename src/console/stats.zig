@@ -85,6 +85,7 @@ fn copyCut(dst: []u8, src: []const u8) u8 {
 
 /// The recent 5xx answers: a ring under a spin lock held for the copy only.
 pub const ErrorRing = struct {
+    /// Over the fields below; held for a bounded struct copy only.
     lock: safety.SpinLock(.leaf) = .init,
     entries: []ErrorEntry,
     /// Entries ever pushed.
@@ -148,8 +149,9 @@ pub const Stats = struct {
     /// Slots per executor: no route (0), routes 1..max_routes, other routes.
     route_slots: u32,
     max_routes: u32,
+    /// Published once by `ensureTables` (compare and swap), freed only by
+    /// `deinit` (process-wide).
     tables: std.atomic.Value(?[*]Counters) = .init(null),
-    alloc_lock: safety.SpinLock(.leaf) = .init,
     errors: ErrorRing,
 
     pub fn init(gpa: std.mem.Allocator, executors: u32, max_routes: u32, errors_kept: u32) !Stats {
@@ -171,15 +173,14 @@ pub const Stats = struct {
         return @as(usize, self.executors + 1) * self.route_slots;
     }
 
-    /// Allocates the counters on first use (the first `stats` subscription).
+    /// Allocates the counters on first use (the first `stats` subscription):
+    /// a table made with no lock held is published by compare and swap, and
+    /// the thread that loses the race frees its own.
     pub fn ensureTables(self: *Stats) !void {
-        if (self.tables.load(.acquire) != null) return;
-        self.alloc_lock.lock();
-        defer self.alloc_lock.unlock();
         if (self.tables.load(.acquire) != null) return;
         const t = try self.gpa.alloc(Counters, self.tableLen());
         for (t) |*c| c.* = .{};
-        self.tables.store(t.ptr, .release);
+        if (self.tables.cmpxchgStrong(null, t.ptr, .acq_rel, .acquire) != null) self.gpa.free(t);
     }
 
     /// The slot index of a route for counting: 0 no route, past

@@ -27,12 +27,19 @@ pub const Collector = struct {
     what: std.atomic.Value(u8) = .init(0),
     /// An answer is in `out` (set on the blocking `Io`).
     answered: std.Io.Event = .unset,
-    /// Over `out`, `out_seq` and `out_ok`; held only to copy.
+    /// Over `out`, `out_seq` and `out_ok`; held only to swap or move `out`,
+    /// never to allocate (SAFETY.md L5).
     lock: safety.SpinLock(.leaf) = .init,
+    /// The latest answer: made by the collector's task, taken (and freed)
+    /// by the console thread that asked for it, or replaced by the next.
     out: std.ArrayList(u8) = .empty,
     out_seq: u32 = 0,
     out_ok: bool = false,
     /// One asker at a time (the console serves up to four clients).
+    // SAFETY: L2/L5 do not fit this lock: only console OS threads take it
+    // (never a zio task), and it is held across their blocking wait for the
+    // runtime's answer (up to `wait_ms`) on `std.Options.debug_io`, by
+    // design: one asker at a time. Waiters sleep-poll (1 ms).
     serial: std.atomic.Mutex = .unlocked,
     task: ?std.Io.Future(void) = null,
 
@@ -65,15 +72,16 @@ pub const Collector = struct {
             const what: What = @fromBackingInt(@intCast(c.what.load(.acquire)));
             var buf: std.Io.Writer.Allocating = .init(c.gpa);
             defer buf.deinit();
-            var ok = if (c.collect(c.ctx, what, &buf.writer)) |_| true else |_| false;
+            const ok = if (c.collect(c.ctx, what, &buf.writer)) |_| true else |_| false;
+            // The answer is made outside the lock; under it, only swapped
+            // in. The one it replaces is freed after.
+            var answer = buf.toArrayList();
             c.lock.lock();
-            c.out.clearRetainingCapacity();
-            c.out.appendSlice(c.gpa, buf.written()) catch {
-                ok = false;
-            };
+            std.mem.swap(std.ArrayList(u8), &c.out, &answer);
             c.out_seq = seq;
             c.out_ok = ok;
             c.lock.unlock();
+            answer.deinit(c.gpa);
             c.answered.set(blockingIo());
         }
     }
@@ -99,13 +107,20 @@ pub const Collector = struct {
         }
     }
 
-    /// The answer to `seq` into `w`, if it is in.
+    /// The answer to `seq` into `w`, if it is in: moved out under the
+    /// lock, written and freed after it.
     fn take(c: *Collector, seq: u32, w: *std.Io.Writer) !bool {
-        c.lock.lock();
-        defer c.lock.unlock();
-        if (c.out_seq != seq) return false;
-        if (!c.out_ok) return error.CollectFailed;
-        try w.writeAll(c.out.items);
+        var answer, const ok = taken: {
+            c.lock.lock();
+            defer c.lock.unlock();
+            if (c.out_seq != seq) return false;
+            const moved = c.out;
+            c.out = .empty;
+            break :taken .{ moved, c.out_ok };
+        };
+        defer answer.deinit(c.gpa);
+        if (!ok) return error.CollectFailed;
+        try w.writeAll(answer.items);
         return true;
     }
 };
