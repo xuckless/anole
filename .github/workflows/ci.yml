@@ -606,11 +606,11 @@ jobs:
         with:
           version: 0.17.0
           use-cache: false
-      # Retried for the same occasional NameServerFailure in Zig's own
-      # git fetches; a real failure fails all three runs.
+      # run.sh retries only its network fetches (Zig's git fetches see an
+      # occasional NameServerFailure); the build and checks run once.
       - name: tests/consumer/run.sh
         timeout-minutes: 30
-        run: for i in 1 2 3; do tests/consumer/run.sh "git+https://github.com/${{ github.repository }}#${{ github.sha }}" && exit 0; sleep $((i * 10)); done; exit 1
+        run: tests/consumer/run.sh "git+https://github.com/${{ github.repository }}#${{ github.sha }}"
         env:
           ANOLE_CONSUMER_FRESH_CACHE: "1"
 

@@ -728,16 +728,11 @@ static int wait_for(atomic_int *v, int n) {
   return atomic_load(v) >= n;
 }
 
-static void test_basics(void) {
-  CHECK((anole_abi_version() >> 16) == ANOLE_ABI_VERSION_MAJOR);
-  CHECK((anole_abi_version() & 0xffff) >= ANOLE_ABI_VERSION_MINOR);
-  anole_str v = anole_version();
-  CHECK(v.len > 0 && v.ptr[0] >= '0' && v.ptr[0] <= '9');
-  anole_str http2 = {"http2", 5}, nope = {"nope", 4};
-  int h2 = anole_has_feature(http2);
-  CHECK(h2 == 0 || h2 == 1);
+/* A bad configuration is refused with ANOLE_E_CONFIG and a message; an
+   unknown create flag is ANOLE_E_INVALID; an unknown feature name is 0. */
+static void test_bad_config_refused(void) {
+  anole_str nope = {"nope", 4};
   CHECK(anole_has_feature(nope) == 0);
-  /* bad configuration, with the place in anole_last_error */
   const char *bad[] = {
       "{\"routes\":[{\"path\":\"/x\"}]}",
       "{\"nope\":1}",
@@ -755,19 +750,30 @@ static void test_basics(void) {
   }
   anole_server_options o = {sizeof o, {"{}", 2}, 0x80, 0, NULL, NULL};
   anole_server *s = NULL;
-  CHECK(anole_server_create(&o, &s) == ANOLE_E_INVALID);
-  /* an options struct from an older header (smaller size) reads as zeros */
+  CHECK(anole_server_create(&o, &s) == ANOLE_E_INVALID && s == NULL);
+  anole_server_destroy(NULL);
+  printf("ok bad configurations are ANOLE_E_CONFIG with a message, an unknown create flag ANOLE_E_INVALID\n");
+}
+
+/* An options struct from an older header (smaller size) reads as zeros past
+   its end: log_level 99 lies beyond it and is never read. */
+static void test_older_options_struct(void) {
+  anole_server *s = NULL;
   anole_server_options small = {offsetof(anole_server_options, log_level), {"{}", 2}, 0, 99, NULL, NULL};
   CHECK(anole_server_create(&small, &s) == ANOLE_OK);
-  /* routes name handlers: a consumer must be attached first */
   anole_server_destroy(s);
+  printf("ok an options struct from an older header reads as zeros\n");
+}
+
+/* Routes that name handlers need a consumer before start. */
+static void test_handler_routes_need_consumer(void) {
+  anole_server *s = NULL;
   const char *needs = "{\"listeners\":[{\"port\":0}],\"routes\":[{\"path\":\"/x\",\"handler\":1}]}";
   anole_server_options n = {sizeof n, {needs, strlen(needs)}, 0, 0, NULL, NULL};
   CHECK(anole_server_create(&n, &s) == ANOLE_OK);
   CHECK(anole_server_start(s) == ANOLE_E_STATE);
   anole_server_destroy(s);
-  anole_server_destroy(NULL);
-  printf("ok basics\n");
+  printf("ok routes naming handlers need a consumer before start\n");
 }
 
 /* Route tables come from user code in bindings (app.get calls collected into
@@ -833,7 +839,22 @@ static void test_route_conflicts(void) {
   printf("ok route conflicts: ANOLE_E_CONFIG naming the routes, no panic\n");
 }
 
-static void test_main_server(void) {
+/* The main suite's server: test_config with consumer threads (`mcs`)
+   answering its handler routes, shared by the test_main_* functions below
+   in order, stopped by the drain test. Starting it checks the lifecycle
+   states (one server per process, start once, no late attach). */
+static anole_server *main_s;
+static uint16_t main_port;
+static consumer_state mcs;
+#define MAIN_PROLOGUE                                                                               \
+  anole_server *s = main_s;                                                                         \
+  uint16_t port = main_port;                                                                        \
+  response r;                                                                                       \
+  response_init(&r);                                                                                \
+  (void)s;                                                                                          \
+  (void)port;
+
+static void main_server_start(void) {
   char json[4096];
   /* The drain's budget (shutdown_ms) is half the wait helper's deadline:
      the drain test below answers a held request after a pause, which must
@@ -848,11 +869,10 @@ static void test_main_server(void) {
     anole_server_options o = {sizeof o, {"{}", 2}, 0, 0, NULL, NULL};
     CHECK(anole_server_create(&o, &s2) == ANOLE_E_STATE);
   }
-  static consumer_state cs;
-  cs.on_event = on_event;
+  mcs.on_event = on_event;
   anole_consumer_options co = {sizeof co, NULL, NULL, 0};
-  CHECK(anole_consumer_attach(s, &co, &cs.c) == ANOLE_OK);
-  CHECK(anole_consumer_fd(cs.c) >= 0);
+  CHECK(anole_consumer_attach(s, &co, &mcs.c) == ANOLE_OK);
+  CHECK(anole_consumer_fd(mcs.c) >= 0);
   CHECK(anole_server_start(s) == ANOLE_OK);
   CHECK(anole_server_start(s) == ANOLE_E_STATE);
   {
@@ -865,10 +885,13 @@ static void test_main_server(void) {
     anole_listener_info past = {sizeof past};
     CHECK(anole_server_listener(s, 1, &past) == ANOLE_E_INVALID);
   }
-  start_consumer(&cs);
+  start_consumer(&mcs);
+  main_s = s;
+  main_port = port;
+}
 
-  response r;
-  response_init(&r);
+static void test_main_routes(void) {
+  MAIN_PROLOGUE
   request(port, "GET", "/native", NULL, &r);
   CHECK(r.status == 200 && strcmp(r.body, "native") == 0);
   request(port, "GET", "/hello", NULL, &r);
@@ -894,6 +917,11 @@ static void test_main_server(void) {
   CHECK(r.status == 200);
   printf("ok routes\n");
 
+  response_free(&r);
+}
+
+static void test_main_bodies(void) {
+  MAIN_PROLOGUE
   /* bodies: 64 KiB inline; 100 KiB streamed (anole_req_read); past body_max 413 */
   {
     static char big[200 * 1024];
@@ -915,27 +943,42 @@ static void test_main_server(void) {
   }
   printf("ok bodies\n");
 
+  response_free(&r);
+}
+
+static void test_main_borrowed_body_sent(void) {
+  MAIN_PROLOGUE
   /* borrowed body: ANOLE_EV_SENT once Anole is done with it */
   {
     memset(big_body, 'b', sizeof big_body);
-    int sent0 = atomic_load(&cs.sent);
+    int sent0 = atomic_load(&mcs.sent);
     request(port, "GET", "/borrow", NULL, &r);
     CHECK(r.status == 200 && r.body_len == BIG_LEN && r.body[0] == 'b' && r.body[BIG_LEN - 1] == 'b');
-    CHECK(wait_for(&cs.sent, sent0 + 1));
-    CHECK(atomic_load(&cs.last_sent) == (uintptr_t)big_body);
+    CHECK(wait_for(&mcs.sent, sent0 + 1));
+    CHECK(atomic_load(&mcs.last_sent) == (uintptr_t)big_body);
   }
   printf("ok borrowed body\n");
 
+  response_free(&r);
+}
+
+static void test_main_streamed_response(void) {
+  MAIN_PROLOGUE
   /* streamed response (chunked over HTTP/1.1), with a borrowed chunk */
   {
-    int sent0 = atomic_load(&cs.sent);
+    int sent0 = atomic_load(&mcs.sent);
     request(port, "GET", "/stream", NULL, &r);
     CHECK(r.status == 200 && r.body_len == 1008);
     CHECK(memcmp(r.body, "one,", 4) == 0 && memcmp(r.body + 1004, ",two", 4) == 0);
-    CHECK(wait_for(&cs.sent, sent0 + 1));
+    CHECK(wait_for(&mcs.sent, sent0 + 1));
   }
   printf("ok streamed response\n");
 
+  response_free(&r);
+}
+
+static void test_main_respond_fd(void) {
+  MAIN_PROLOGUE
   /* a file: bytes 6..10 of it, the consumer's fd closed at once */
   {
     snprintf(file_path, sizeof file_path, "/tmp/anole-capi-%d.txt", (int)getpid());
@@ -949,39 +992,48 @@ static void test_main_server(void) {
   }
   printf("ok respond_fd\n");
 
+  response_free(&r);
+}
+
+static void test_main_response_cache(void) {
+  MAIN_PROLOGUE
   /* the response cache (one per executor: one connection here): the
      second request never reaches the consumer */
   {
     static conn_reader c;
     c.fd = dial(port);
     c.len = c.pos = 0;
-    uint64_t ev0 = cs.events;
+    uint64_t ev0 = mcs.events;
     roundtrip(&c, "GET", "/cached", NULL, 0, &r);
     CHECK(r.status == 200 && strcmp(r.body, "Hello, World!") == 0);
     roundtrip(&c, "GET", "/cached", NULL, 0, &r);
     CHECK(r.status == 200 && strcmp(r.body, "Hello, World!") == 0);
-    CHECK(cs.events == ev0 + 1);
+    CHECK(mcs.events == ev0 + 1);
     close(c.fd);
   }
   printf("ok response cache\n");
 
+  response_free(&r);
+}
+
+static void test_main_stale_handles_and_slot_reuse(void) {
+  MAIN_PROLOGUE
   /* answered handle: a second answer is GONE; so are made-up handles */
   {
     pthread_t t;
     async_req a = {port, "/hold", {0}, 0};
     response_init(&a.r);
-    atomic_store(&cs.nheld, 0);
+    atomic_store(&mcs.nheld, 0);
     CHECK(pthread_create(&t, NULL, async_get, &a) == 0);
-    CHECK(wait_for(&cs.nheld, 1));
-    anole_req h = cs.held[0];
+    CHECK(wait_for(&mcs.nheld, 1));
+    anole_req h = mcs.held[0];
     CHECK(anole_req_respond(h, 999, NULL, 0, NULL, 0, 0) == ANOLE_E_INVALID); /* still owed */
     CHECK(anole_req_respond(h, 201, NULL, 0, "late-ok", 7, 0) == ANOLE_OK);
     pthread_join(t, NULL);
     CHECK(a.r.status == 201 && strcmp(a.r.body, "late-ok") == 0);
     response_free(&a.r);
-    CHECK(anole_req_respond(h, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+    /* A second answer GONE and cleanup OK: test_cleanup_rules. */
     CHECK(anole_req_fail(h, 0, (anole_str){0}) == ANOLE_E_GONE);
-    CHECK(anole_handle_release(h) == ANOLE_OK); /* a cleanup call: over is success */
     CHECK(anole_req_stream_write(h, "x", 1, 0) == ANOLE_E_GONE);
     char rb[8];
     CHECK(anole_req_read(h, rb, sizeof rb, 0) == ANOLE_E_GONE);
@@ -1002,10 +1054,10 @@ static void test_main_server(void) {
     for (int i = 0; i < 300 && !reused; i++) {
       async_req b = {port, "/hold", {0}, 0};
       response_init(&b.r);
-      atomic_store(&cs.nheld, 0);
+      atomic_store(&mcs.nheld, 0);
       CHECK(pthread_create(&t, NULL, async_get, &b) == 0);
-      CHECK(wait_for(&cs.nheld, 1));
-      anole_req h2 = cs.held[0];
+      CHECK(wait_for(&mcs.nheld, 1));
+      anole_req h2 = mcs.held[0];
       anole_header bad = {{"bad name", 8}, {"v", 1}};
       CHECK(anole_req_respond(h2, 200, &bad, 1, NULL, 0, 0) == ANOLE_E_INVALID);
       anole_header bad_value = {{"x-ok", 4}, {"a\r\nb", 4}};
@@ -1027,6 +1079,11 @@ static void test_main_server(void) {
     printf("ok stale handles and slot reuse\n");
   }
 
+  response_free(&r);
+}
+
+static void test_main_deadlines(void) {
+  MAIN_PROLOGUE
   /* deadlines: 504 after request_ms, and after a route's own timeout_ms;
      the late answer is GONE. Only what is guaranteed is checked: the 504
      never comes early, and a late answer to a request the consumer did hold
@@ -1043,13 +1100,13 @@ static void test_main_server(void) {
       pthread_t t;
       async_req a = {port, paths[i], {0}, 0};
       response_init(&a.r);
-      atomic_store(&cs.nheld, 0);
+      atomic_store(&mcs.nheld, 0);
       CHECK(pthread_create(&t, NULL, async_get, &a) == 0);
       pthread_join(t, NULL);
       CHECK(a.r.status == 504);
       CHECK(a.ms >= lo[i] && a.ms < 10000);
-      if (wait_for(&cs.nheld, 1)) {
-        CHECK(anole_req_respond(cs.held[0], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+      if (wait_for(&mcs.nheld, 1)) {
+        CHECK(anole_req_respond(mcs.held[0], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
         late++;
       }
       response_free(&a.r);
@@ -1059,112 +1116,156 @@ static void test_main_server(void) {
     CHECK(st1.expired == st0.expired + 2 && st1.gone >= st0.gone + (uint64_t)late);
   }
 
+  response_free(&r);
+}
+
+static void test_main_client_gone(void) {
+  MAIN_PROLOGUE
   /* a client that leaves: ANOLE_EV_ABORT, and the handle is GONE */
   {
-    atomic_store(&cs.nheld, 0);
+    atomic_store(&mcs.nheld, 0);
     int fd = dial(port);
     send_request(fd, "GET", "/hold", NULL, 0);
-    CHECK(wait_for(&cs.nheld, 1));
+    CHECK(wait_for(&mcs.nheld, 1));
     close(fd);
     /* This request's own ABORT: the deadline checks above may still have
        theirs in flight. */
-    for (double until = wait_until(); atomic_load(&cs.last_abort) != cs.held[0] && now_ms() < until;) usleep(2000);
-    CHECK(atomic_load(&cs.last_abort) == cs.held[0]);
-    CHECK(anole_req_respond(cs.held[0], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+    for (double until = wait_until(); atomic_load(&mcs.last_abort) != mcs.held[0] && now_ms() < until;) usleep(2000);
+    CHECK(atomic_load(&mcs.last_abort) == mcs.held[0]);
+    CHECK(anole_req_respond(mcs.held[0], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
   }
   printf("ok client gone\n");
 
-  /* WebSocket: echo, publish to a topic, a close from the consumer */
-  if (have_websocket) {
-    static conn_reader c;
-    char buf[256];
-    size_t n;
-    ws_connect(&c, port);
-    CHECK(wait_for(&cs.ws_open, 1));
-    ws_send_frame(c.fd, 1, "hello ws", 8);
-    CHECK(ws_read_frame(&c, buf, sizeof buf, &n) == 1 && n == 8 && memcmp(buf, "hello ws", 8) == 0);
-    ws_send_frame(c.fd, 2, "\x01\x02", 2);
-    CHECK(ws_read_frame(&c, buf, sizeof buf, &n) == 2 && n == 2);
-    ws_send_frame(c.fd, 1, "pub", 3);
-    CHECK(ws_read_frame(&c, buf, sizeof buf, &n) == 1 && strcmp(buf, "news") == 0);
-    anole_stats st = {.size = sizeof st};
-    CHECK(anole_server_stats(s, &st) == ANOLE_OK && st.websockets == 1 && st.ws_messages_in >= 3);
-    ws_send_frame(c.fd, 1, "bye", 3);
-    CHECK(ws_read_frame(&c, buf, sizeof buf, &n) == 8 && n >= 2);
-    CHECK((((unsigned char)buf[0] << 8) | (unsigned char)buf[1]) == 1000);
-    ws_send_frame(c.fd, 8, "\x03\xe8", 2);
-    CHECK(wait_for(&cs.ws_closes, 1));
-    CHECK(atomic_load(&cs.last_close_code) == 1000);
-    close(c.fd);
-    /* a socket whose peer just leaves: 1006 */
-    ws_connect(&c, port);
-    CHECK(wait_for(&cs.ws_open, 2));
-    close(c.fd);
-    CHECK(wait_for(&cs.ws_closes, 2));
-    CHECK(atomic_load(&cs.last_close_code) == 1006);
-    CHECK(anole_ws_send(atomic_load(&cs.ws_handle), ANOLE_WS_TEXT, "x", 1, 0) == ANOLE_E_GONE);
-    anole_str room = {"room", 4};
-    CHECK(anole_ws_subscribe(atomic_load(&cs.ws_handle), room) == ANOLE_E_GONE);
-    CHECK(anole_ws_close(atomic_load(&cs.ws_handle), 999, room) == ANOLE_E_INVALID);
-    /* a consumer that falls behind: the messages queued for it are bounded,
-       and the socket feeding it is held back (TCP backpressure) */
-    {
-      int big0 = atomic_load(&cs.ws_big);
-      atomic_store(&cs.paused, 1);
-      ws_connect(&c, port);
-      size_t accepted = 0;
-      int frames = ws_flood(c.fd, 1000 * 1024, 200, &accepted, &cs.paused);
-      CHECK(accepted < (size_t)48 << 20);
-      CHECK(wait_for(&cs.ws_open, 3));
-      for (double until = wait_until(); atomic_load(&cs.ws_big) < big0 + frames && now_ms() < until;) usleep(5000);
-      CHECK(atomic_load(&cs.ws_big) == big0 + frames);
-      close(c.fd);
-      CHECK(wait_for(&cs.ws_closes, 3));
-    }
-    /* a subscriber that stops reading holds up no publish: what is queued
-       for it is bounded (limits.ws_high_water), and another subscriber
-       still gets every publish */
-    {
-      static char chunk[60 * 1024]; /* fits a 16-bit frame length */
-      uint32_t x = 12345;
-      for (size_t i = 0; i < sizeof chunk; i++) {
-        x = x * 1103515245u + 12345u;
-        chunk[i] = (char)(x >> 24);
-      }
-      ws_connect(&c, port);
-      CHECK(wait_for(&cs.ws_open, 4));
-      for (int i = 0; i < 2000; i++) {
-        anole_status st = anole_ws_publish(s, room, ANOLE_WS_BINARY, chunk, sizeof chunk, 0);
-        CHECK(st == ANOLE_OK || st == ANOLE_E_AGAIN);
-        if (st == ANOLE_E_AGAIN) usleep(1000);
-      }
-      static conn_reader c2;
-      static char frame[64 * 1024];
-      ws_connect(&c2, port);
-      CHECK(wait_for(&cs.ws_open, 5));
-      int ok = 0;
-      for (double until = wait_until(); !ok && now_ms() < until;) {
-        if (anole_ws_publish(s, room, ANOLE_WS_TEXT, "after", 5, 0) == ANOLE_OK) ok = 1;
-        else usleep(10000);
-      }
-      CHECK(ok);
-      /* chunks still being fanned out may come first */
-      size_t n2 = 0;
-      int op;
-      while ((op = ws_read_frame(&c2, frame, sizeof frame, &n2)) == 2) {}
-      CHECK(op == 1 && strcmp(frame, "after") == 0);
-      close(c2.fd);
-      close(c.fd);
-      CHECK(wait_for(&cs.ws_closes, 5));
-    }
-  }
-  printf("ok websocket\n");
+  response_free(&r);
+}
 
-  /* many clients at once, keep-alive, answers never mixed up */
+/* The WebSocket tests run in order on the main server: each opens the
+   next socket (mcs.ws_open counts them) and ends with it closed. */
+static conn_reader ws_c;
+
+static void test_main_ws_echo_publish_close(void) {
+  MAIN_PROLOGUE
+  /* WebSocket: echo, publish to a topic, a close from the consumer */
+  char buf[256];
+  size_t n;
+  ws_connect(&ws_c, port);
+  CHECK(wait_for(&mcs.ws_open, 1));
+  ws_send_frame(ws_c.fd, 1, "hello ws", 8);
+  CHECK(ws_read_frame(&ws_c, buf, sizeof buf, &n) == 1 && n == 8 && memcmp(buf, "hello ws", 8) == 0);
+  ws_send_frame(ws_c.fd, 2, "\x01\x02", 2);
+  CHECK(ws_read_frame(&ws_c, buf, sizeof buf, &n) == 2 && n == 2);
+  ws_send_frame(ws_c.fd, 1, "pub", 3);
+  CHECK(ws_read_frame(&ws_c, buf, sizeof buf, &n) == 1 && strcmp(buf, "news") == 0);
+  anole_stats st = {.size = sizeof st};
+  CHECK(anole_server_stats(s, &st) == ANOLE_OK && st.websockets == 1 && st.ws_messages_in >= 3);
+  ws_send_frame(ws_c.fd, 1, "bye", 3);
+  CHECK(ws_read_frame(&ws_c, buf, sizeof buf, &n) == 8 && n >= 2);
+  CHECK((((unsigned char)buf[0] << 8) | (unsigned char)buf[1]) == 1000);
+  ws_send_frame(ws_c.fd, 8, "\x03\xe8", 2);
+  CHECK(wait_for(&mcs.ws_closes, 1));
+  CHECK(atomic_load(&mcs.last_close_code) == 1000);
+  close(ws_c.fd);
+  printf("ok websocket: echo, publish to a topic, a close from the consumer\n");
+  response_free(&r);
+}
+
+static void test_main_ws_peer_gone(void) {
+  MAIN_PROLOGUE
+  /* a socket whose peer just leaves: 1006, and its handle is GONE */
+  ws_connect(&ws_c, port);
+  CHECK(wait_for(&mcs.ws_open, 2));
+  close(ws_c.fd);
+  CHECK(wait_for(&mcs.ws_closes, 2));
+  CHECK(atomic_load(&mcs.last_close_code) == 1006);
+  CHECK(anole_ws_send(atomic_load(&mcs.ws_handle), ANOLE_WS_TEXT, "x", 1, 0) == ANOLE_E_GONE);
+  anole_str room = {"room", 4};
+  CHECK(anole_ws_subscribe(atomic_load(&mcs.ws_handle), room) == ANOLE_E_GONE);
+  CHECK(anole_ws_close(atomic_load(&mcs.ws_handle), 999, room) == ANOLE_E_INVALID);
+  printf("ok websocket: a peer that leaves is 1006, its handle GONE\n");
+  response_free(&r);
+}
+
+static void test_main_ws_slow_consumer_backpressure(void) {
+  MAIN_PROLOGUE
+  /* a consumer that falls behind: the messages queued for it are bounded,
+     and the socket feeding it is held back (TCP backpressure) */
+  int big0 = atomic_load(&mcs.ws_big);
+  atomic_store(&mcs.paused, 1);
+  ws_connect(&ws_c, port);
+  size_t accepted = 0;
+  int frames = ws_flood(ws_c.fd, 1000 * 1024, 200, &accepted, &mcs.paused);
+  CHECK(accepted < (size_t)48 << 20);
+  CHECK(wait_for(&mcs.ws_open, 3));
+  for (double until = wait_until(); atomic_load(&mcs.ws_big) < big0 + frames && now_ms() < until;) usleep(5000);
+  CHECK(atomic_load(&mcs.ws_big) == big0 + frames);
+  close(ws_c.fd);
+  CHECK(wait_for(&mcs.ws_closes, 3));
+  printf("ok websocket: a consumer that falls behind holds the socket back\n");
+  response_free(&r);
+}
+
+static void test_main_ws_slow_subscriber(void) {
+  MAIN_PROLOGUE
+  /* a subscriber that stops reading holds up no publish: what is queued
+     for it is bounded (limits.ws_high_water), and another subscriber
+     still gets every publish */
+  anole_str room = {"room", 4};
+  static char chunk[60 * 1024]; /* fits a 16-bit frame length */
+  uint32_t x = 12345;
+  for (size_t i = 0; i < sizeof chunk; i++) {
+    x = x * 1103515245u + 12345u;
+    chunk[i] = (char)(x >> 24);
+  }
+  ws_connect(&ws_c, port);
+  CHECK(wait_for(&mcs.ws_open, 4));
+  for (int i = 0; i < 2000; i++) {
+    anole_status st = anole_ws_publish(s, room, ANOLE_WS_BINARY, chunk, sizeof chunk, 0);
+    CHECK(st == ANOLE_OK || st == ANOLE_E_AGAIN);
+    if (st == ANOLE_E_AGAIN) usleep(1000);
+  }
+  static conn_reader c2;
+  static char frame[64 * 1024];
+  ws_connect(&c2, port);
+  CHECK(wait_for(&mcs.ws_open, 5));
+  int ok = 0;
+  for (double until = wait_until(); !ok && now_ms() < until;) {
+    if (anole_ws_publish(s, room, ANOLE_WS_TEXT, "after", 5, 0) == ANOLE_OK) ok = 1;
+    else usleep(10000);
+  }
+  CHECK(ok);
+  /* chunks still being fanned out may come first */
+  size_t n2 = 0;
+  int op;
+  while ((op = ws_read_frame(&c2, frame, sizeof frame, &n2)) == 2) {}
+  CHECK(op == 1 && strcmp(frame, "after") == 0);
+  close(c2.fd);
+  close(ws_c.fd);
+  CHECK(wait_for(&mcs.ws_closes, 5));
+  printf("ok websocket: a subscriber that stops reading holds up no publish\n");
+  response_free(&r);
+}
+
+/* The C suite's stress step (`zig build test-stress`: ANOLE_TEST_STRESS set
+   and not "0"), as src/testing/wait.zig's stress(): load runs only there
+   (TESTING.md W3). */
+static int stress(void) {
+  const char *t = getenv("ANOLE_TEST_STRESS");
+  if (!t) return 0;
+  size_t a = 0, b = strlen(t);
+  while (a < b && strchr(" \t\r\n", t[a])) a++;
+  while (b > a && strchr(" \t\r\n", t[b - 1])) b--;
+  return b > a && !(b - a == 1 && t[a] == '0');
+}
+
+static void test_main_many_clients(void) {
+  MAIN_PROLOGUE
+  /* many clients at once, keep-alive, answers never mixed up: 4 x 100
+     requests here, the 16 x 2000 load under the stress step */
   {
-    enum { T = 16, N = 2000 };
-    pthread_t t[T];
-    hammer_arg h[T];
+    enum { T_MAX = 16 };
+    const int T = stress() ? 16 : 4, N = stress() ? 2000 : 100;
+    pthread_t t[T_MAX];
+    hammer_arg h[T_MAX];
     for (int i = 0; i < T; i++) {
       h[i] = (hammer_arg){port, i, N, 0};
       CHECK(pthread_create(&t[i], NULL, hammer, &h[i]) == 0);
@@ -1177,10 +1278,15 @@ static void test_main_server(void) {
     CHECK(failures == 0);
     anole_stats st = {.size = sizeof st};
     CHECK(anole_server_stats(s, &st) == ANOLE_OK);
-    printf("ok concurrency (%d requests, %llu batches, %llu wakes, %llu rewakes)\n", T * N,
-           (unsigned long long)cs.batches, (unsigned long long)st.wakes, (unsigned long long)st.rewakes);
+    printf("ok many clients at once, answers never mixed up (%d requests, %llu batches, %llu wakes, %llu rewakes)\n", T * N,
+           (unsigned long long)mcs.batches, (unsigned long long)st.wakes, (unsigned long long)st.rewakes);
   }
 
+  response_free(&r);
+}
+
+static void test_main_drain(void) {
+  MAIN_PROLOGUE
   /* drain with requests in flight: one answered during the drain (200),
      one never answered (504 at its deadline, before shutdown_ms) */
   {
@@ -1188,10 +1294,10 @@ static void test_main_server(void) {
     async_req a = {port, "/hold", {0}, 0}, b = {port, "/hold", {0}, 0};
     response_init(&a.r);
     response_init(&b.r);
-    atomic_store(&cs.nheld, 0);
+    atomic_store(&mcs.nheld, 0);
     CHECK(pthread_create(&t1, NULL, async_get, &a) == 0);
     CHECK(pthread_create(&t2, NULL, async_get, &b) == 0);
-    CHECK(wait_for(&cs.nheld, 2));
+    CHECK(wait_for(&mcs.nheld, 2));
     double t0 = now_ms();
     CHECK(anole_server_drain(s) == ANOLE_OK);
     CHECK(anole_server_drain(s) == ANOLE_OK); /* again: no-op */
@@ -1200,7 +1306,7 @@ static void test_main_server(void) {
        request (a slow machine only makes the wait longer). */
     usleep(100 * 1000);
     CHECK(anole_server_wait(s, 0) == ANOLE_E_TIMEOUT);
-    CHECK(anole_req_respond(cs.held[0], 200, NULL, 0, "drained", 7, 0) == ANOLE_OK);
+    CHECK(anole_req_respond(mcs.held[0], 200, NULL, 0, "drained", 7, 0) == ANOLE_OK);
     pthread_join(t1, NULL);
     pthread_join(t2, NULL);
     async_req *answered = a.r.status == 200 ? &a : &b, *dropped = answered == &a ? &b : &a;
@@ -1208,11 +1314,11 @@ static void test_main_server(void) {
     CHECK(dropped->r.status == 504 || dropped->r.eof);
     CHECK(anole_server_wait(s, wait_ms()) == ANOLE_OK);
     double took = now_ms() - t0;
-    CHECK(anole_req_respond(cs.held[1], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
-    pthread_join(cs.thread, NULL);
-    CHECK(atomic_load(&cs.stopped));
+    CHECK(anole_req_respond(mcs.held[1], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
+    pthread_join(mcs.thread, NULL);
+    CHECK(atomic_load(&mcs.stopped));
     /* after the stop, polls return 0 */
-    CHECK(anole_poll(cs.c, cs.buf, sizeof cs.buf, 0) == 0);
+    CHECK(anole_poll(mcs.c, mcs.buf, sizeof mcs.buf, 0) == 0);
     printf("ok drain (stopped after %.0f ms; dropped request: %s)\n", took,
            dropped->r.eof ? "connection closed" : "504");
     response_free(&a.r);
@@ -1222,6 +1328,28 @@ static void test_main_server(void) {
   CHECK(atomic_load(&log_lines) > 0); /* "listening on ..." went to the callback */
   anole_server_destroy(s);
   current_server = NULL;
+  main_s = NULL;
+}
+
+static void test_main_server(void) {
+  main_server_start();
+  test_main_routes();
+  test_main_bodies();
+  test_main_borrowed_body_sent();
+  test_main_streamed_response();
+  test_main_respond_fd();
+  test_main_response_cache();
+  test_main_stale_handles_and_slot_reuse();
+  test_main_deadlines();
+  test_main_client_gone();
+  if (have_websocket) {
+    test_main_ws_echo_publish_close();
+    test_main_ws_peer_gone();
+    test_main_ws_slow_consumer_backpressure();
+    test_main_ws_slow_subscriber();
+  }
+  test_main_many_clients();
+  test_main_drain(); /* stops the server: last */
 }
 
 /* Polls `c` until a request arrives; its handle. */
@@ -1287,66 +1415,107 @@ static void test_stale_across_servers(void) {
   printf("ok stale handles across servers: ANOLE_E_GONE\n");
 }
 
-/* A second server: a shared consumer on anole_poll_wait threads, max_inflight
-   503, and a drain that cuts a request waiting past shutdown_ms. */
-static void test_shared_consumer(void) {
+/* A second server, shared by the four tests below in order: a shared
+   consumer (ANOLE_CONSUMER_F_SHARED) on two anole_poll_wait threads,
+   max_inflight 2, shutdown_ms 300. */
+static anole_server *shared_s;
+static uint16_t shared_port;
+static consumer_state shared_cs[2];
+
+static void shared_server_start(void) {
   char json[4096];
   snprintf(json, sizeof json, test_config, 1, 128 * 1024, 2, 5000, 300, have_websocket ? ws_route : "");
-  anole_server *s = make_server(json);
-  static consumer_state cs[2];
+  shared_s = make_server(json);
   anole_consumer_options co = {sizeof co, NULL, NULL, ANOLE_CONSUMER_F_SHARED};
   anole_consumer *c = NULL;
-  CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
+  CHECK(anole_consumer_attach(shared_s, &co, &c) == ANOLE_OK);
   CHECK(anole_consumer_fd(c) == -1);
-  CHECK(anole_server_start(s) == ANOLE_OK);
-  uint16_t port;
-  port = port_of(s, 0); CHECK(port != 0);
+  CHECK(anole_server_start(shared_s) == ANOLE_OK);
+  shared_port = port_of(shared_s, 0);
+  CHECK(shared_port != 0);
   for (int i = 0; i < 2; i++) {
-    cs[i].c = c;
-    cs[i].on_event = on_event;
-    cs[i].use_wait = 1;
-    start_consumer(&cs[i]);
+    shared_cs[i].c = c;
+    shared_cs[i].on_event = on_event;
+    shared_cs[i].use_wait = 1;
+    start_consumer(&shared_cs[i]);
   }
+}
+
+/* (a) every request reaches the shared consumer's threads exactly once */
+static void test_shared_consumer_delivery(void) {
   response r;
   response_init(&r);
   for (int i = 0; i < 50; i++) {
-    request(port, "GET", "/hello", NULL, &r);
+    request(shared_port, "GET", "/hello", NULL, &r);
     CHECK(r.status == 200);
   }
-  CHECK(cs[0].events + cs[1].events == 50);
-  /* max_inflight 2 per executor: the third request is 503 */
-  pthread_t t1, t2;
-  async_req a = {port, "/hold", {0}, 0}, b = {port, "/hold", {0}, 0};
-  response_init(&a.r);
-  response_init(&b.r);
-  CHECK(pthread_create(&t1, NULL, async_get, &a) == 0);
-  CHECK(pthread_create(&t2, NULL, async_get, &b) == 0);
-  for (double until = wait_until(); atomic_load(&cs[0].nheld) + atomic_load(&cs[1].nheld) < 2 && now_ms() < until;) usleep(2000);
-  request(port, "GET", "/hello", NULL, &r);
+  CHECK(shared_cs[0].events + shared_cs[1].events == 50);
+  response_free(&r);
+  printf("ok a shared consumer on poll_wait threads gets every request once\n");
+}
+
+/* (b) and (c) share the two held requests: (b) holds them, (c) drains. */
+static pthread_t shared_t1, shared_t2;
+static async_req shared_a, shared_b;
+
+/* (b) max_inflight 2 per executor: a third request is 503 */
+static void test_shared_max_inflight_503(void) {
+  shared_a = (async_req){shared_port, "/hold", {0}, 0};
+  shared_b = (async_req){shared_port, "/hold", {0}, 0};
+  response_init(&shared_a.r);
+  response_init(&shared_b.r);
+  CHECK(pthread_create(&shared_t1, NULL, async_get, &shared_a) == 0);
+  CHECK(pthread_create(&shared_t2, NULL, async_get, &shared_b) == 0);
+  for (double until = wait_until();
+       atomic_load(&shared_cs[0].nheld) + atomic_load(&shared_cs[1].nheld) < 2 && now_ms() < until;)
+    usleep(2000);
+  CHECK(atomic_load(&shared_cs[0].nheld) + atomic_load(&shared_cs[1].nheld) == 2);
+  response r;
+  response_init(&r);
+  request(shared_port, "GET", "/hello", NULL, &r);
   CHECK(r.status == 503);
+  response_free(&r);
+  printf("ok max_inflight answers 503\n");
+}
+
+/* (c) the drain cuts both requests still held past shutdown_ms */
+static void test_shared_drain_past_shutdown(void) {
   double t0 = now_ms();
-  CHECK(anole_server_drain(s) == ANOLE_OK);
-  pthread_join(t1, NULL);
-  pthread_join(t2, NULL);
-  CHECK(a.r.eof || a.r.status >= 500);
-  CHECK(anole_server_wait(s, -1) == ANOLE_OK);
+  CHECK(anole_server_drain(shared_s) == ANOLE_OK);
+  pthread_join(shared_t1, NULL);
+  pthread_join(shared_t2, NULL);
+  CHECK(shared_a.r.eof || shared_a.r.status >= 500);
+  CHECK(shared_b.r.eof || shared_b.r.status >= 500);
+  CHECK(anole_server_wait(shared_s, -1) == ANOLE_OK);
   double took = now_ms() - t0;
   CHECK(!timing() || took < 2000);
   for (int i = 0; i < 2; i++) {
-    atomic_store(&cs[i].stopped, 1);
-    pthread_join(cs[i].thread, NULL);
+    atomic_store(&shared_cs[i].stopped, 1);
+    pthread_join(shared_cs[i].thread, NULL);
   }
   anole_stats st = {.size = sizeof st};
-  CHECK(anole_server_stats(s, &st) == ANOLE_OK);
+  CHECK(anole_server_stats(shared_s, &st) == ANOLE_OK);
   CHECK(st.busy == 1 && st.inflight == 0);
-  /* stats from an older header: only what its size covers */
+  response_free(&shared_a.r);
+  response_free(&shared_b.r);
+  printf("ok the drain cuts requests held past shutdown_ms (%.0f ms)\n", took);
+}
+
+/* (d) anole_stats from an older header: filled only up to its size */
+static void test_shared_stats_older_header(void) {
   anole_stats small = {.size = offsetof(anole_stats, inflight), .inflight = 77};
-  CHECK(anole_server_stats(s, &small) == ANOLE_OK && small.inflight == 77 && small.requests > 0);
-  anole_server_destroy(s);
-  response_free(&r);
-  response_free(&a.r);
-  response_free(&b.r);
-  printf("ok shared consumer, max_inflight 503, drain past shutdown_ms (%.0f ms)\n", took);
+  CHECK(anole_server_stats(shared_s, &small) == ANOLE_OK && small.inflight == 77 && small.requests > 0);
+  anole_server_destroy(shared_s);
+  shared_s = NULL;
+  printf("ok stats from an older header are filled only up to its size\n");
+}
+
+static void test_shared_consumer(void) {
+  shared_server_start();
+  test_shared_consumer_delivery();
+  test_shared_max_inflight_503();
+  test_shared_drain_past_shutdown();
+  test_shared_stats_older_header();
 }
 
 /* ---- databases (anole_db_*) ----------------------------------------------------------------- */
@@ -1356,6 +1525,8 @@ static void test_shared_consumer(void) {
 /* The next ANOLE_EV_DB_RESULT, copied into `out` (other events are not
    expected here). */
 static unsigned char db_buf[1 << 20];
+/* The record db_next copies the answer into (one at a time). */
+static unsigned char db_rec[1 << 20];
 static size_t db_have = 0, db_at = 0;
 /* Forgets what db_next has read ahead (a new server, a new consumer). */
 static void db_flush(void) { db_have = db_at = 0; }
@@ -1369,7 +1540,7 @@ static const anole_db_result_event *db_next(anole_consumer *c, void *out, size_t
       memcpy(out, ev, ev->len);
       return (const anole_db_result_event *)out;
     }
-    int64_t n = anole_poll_wait(c, db_buf, sizeof db_buf, 10000);
+    int64_t n = anole_poll_wait(c, db_buf, sizeof db_buf, wait_ms());
     CHECK(n > 0);
     db_have = (size_t)n;
     db_at = 0;
@@ -1386,11 +1557,24 @@ static anole_str db_column(const anole_db_result_event *r, uint32_t col) {
   return anole_event_str(r, names[col]);
 }
 
-static void test_db(void) {
+/* SQLite through anole_db_*, one server shared by the tests below in order
+   (rows they add carry over: the counts are cumulative). */
+static anole_server *sq_s;
+static anole_db *sq_db;
+static anole_consumer *sq_c;
+static anole_db_value sq_v[4];
+static char sq_path[64];
+
+#define TEST_DB_PROLOGUE anole_server *s = sq_s; anole_db *db = sq_db; anole_consumer *c = sq_c; anole_db_value *v = sq_v; \
+  const anole_db_result_event *r = NULL; const char *path = sq_path; anole_str sel = LIT("SELECT 1"); \
+  anole_str ins = LIT("INSERT INTO items (name, qty, price, data) VALUES (?, ?, ?, ?)"); \
+  (void)s, (void)db, (void)c, (void)v, (void)r, (void)path, (void)sel, (void)ins;
+
+static int test_db_start(void) {
   anole_str sqlite_name = LIT("sqlite");
   if (!anole_has_feature(sqlite_name)) {
     printf("ok databases (SQLite not built in)\n");
-    return;
+    return 0;
   }
   char path[64];
   snprintf(path, sizeof path, "/tmp/anole-capi-%d.db", (int)getpid());
@@ -1413,29 +1597,36 @@ static void test_db(void) {
   anole_str sel = LIT("SELECT 1");
   CHECK(anole_db_query(db, c, sel, NULL, 0, NULL, 1) == ANOLE_E_STATE); /* not started */
   CHECK(anole_server_start(s) == ANOLE_OK);
-  static unsigned char rec[1 << 20];
-  const anole_db_result_event *r;
 
+  sq_s = s;
+  sq_db = db;
+  sq_c = c;
+  memcpy(sq_path, path, sizeof sq_path);
+  return 1;
+}
+
+static void test_db_values_both_ways(void) {
+  TEST_DB_PROLOGUE
   /* exec with every value type */
-  anole_str ins = LIT("INSERT INTO items (name, qty, price, data) VALUES (?, ?, ?, ?)");
-  anole_db_value v[4] = {{ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("apple")}},
-                         {ANOLE_DB_TYPE_INT, 0, {.i = 3}},
-                         {ANOLE_DB_TYPE_FLOAT, 0, {.f = 1.25}},
-                         {ANOLE_DB_TYPE_BLOB, 0, {.s = LIT("\x00\x01\x02")}}};
+  const anole_db_value v0[4] = {{ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("apple")}},
+                                {ANOLE_DB_TYPE_INT, 0, {.i = 3}},
+                                {ANOLE_DB_TYPE_FLOAT, 0, {.f = 1.25}},
+                                {ANOLE_DB_TYPE_BLOB, 0, {.s = LIT("\x00\x01\x02")}}};
+  memcpy(v, v0, sizeof v0);
   CHECK(anole_db_exec(db, c, ins, v, 4, NULL, 10) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 10 && r->status == ANOLE_OK && r->changes == 1 && r->last_insert_rowid == 1);
   CHECK(r->ncolumns == 0 && r->nrows == 0 && r->http_status == 0);
   v[0].v.s = LIT("pear");
   v[1].type = ANOLE_DB_TYPE_NULL;
   CHECK(anole_db_exec(db, c, ins, v, 4, NULL, 11) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->last_insert_rowid == 2);
 
   /* a read: names and cells */
   anole_str q = LIT("SELECT id, name AS label, qty, price, data FROM items ORDER BY id");
   CHECK(anole_db_query(db, c, q, NULL, 0, NULL, 12) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 12 && r->status == ANOLE_OK && r->ncolumns == 5 && r->nrows == 2);
   CHECK(str_is(db_column(r, 1), "label"));
   CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_INT && db_cell(r, 0, 0)->v.i == 1);
@@ -1445,26 +1636,38 @@ static void test_db(void) {
   CHECK(memcmp(anole_event_str(r, db_cell(r, 0, 4)->v.s).ptr, "\x00\x01\x02", 3) == 0);
   CHECK(db_cell(r, 1, 2)->type == ANOLE_DB_TYPE_NULL);
   CHECK(r->source == ANOLE_DB_FROM_DATABASE);
+  printf("ok sqlite: values of every type go in and come back typed, with column names\n");
+}
 
+static void test_db_errors(void) {
+  TEST_DB_PROLOGUE
   /* failures: a unique key, a syntax error, a wrong value type */
   v[0].v.s = LIT("apple");
   CHECK(anole_db_exec(db, c, ins, v, 4, NULL, 13) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_DB && r->http_status == 409 && r->error_class == ANOLE_DB_ERR_UNIQUE);
   CHECK(str_is(anole_event_str(r, r->constraint), "items.name") && r->error.len > 0 && r->error_code.len > 0);
   anole_str bad = LIT("SELEKT 1");
   CHECK(anole_db_query(db, c, bad, NULL, 0, NULL, 14) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_DB && r->http_status == 500 && r->error_class == ANOLE_DB_ERR_OTHER);
   anole_db_value wrong = {99, 0, {.i = 0}};
   CHECK(anole_db_query(db, c, sel, &wrong, 1, NULL, 15) == ANOLE_E_INVALID);
+  printf("ok sqlite: a unique key is 409 naming the constraint, a syntax error 500, a bad value type refused\n");
+}
 
+static void test_db_script(void) {
+  TEST_DB_PROLOGUE
   /* several statements without parameters */
   anole_str script = LIT("CREATE TABLE t2 (x); INSERT INTO t2 VALUES (1); INSERT INTO t2 VALUES (2);");
   CHECK(anole_db_exec(db, c, script, NULL, 0, NULL, 16) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->changes == 2);
+  printf("ok sqlite: a script of several statements runs as one call\n");
+}
 
+static void test_db_open_transaction_refused(void) {
+  TEST_DB_PROLOGUE
   /* A call that leaves a transaction open (a bare BEGIN, a script that
      fails before its COMMIT) is rolled back and refused: separate calls
      share no connection, and SQLite's writer is every request's, so later
@@ -1486,7 +1689,7 @@ static void test_db(void) {
   for (size_t i = 0; i < sizeof txs / sizeof *txs; i++) {
     anole_str sql = {txs[i].sql, strlen(txs[i].sql)};
     CHECK(anole_db_exec(db, c, sql, NULL, 0, NULL, 50 + i) == ANOLE_OK);
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     if (txs[i].ok) {
       CHECK(r->status == ANOLE_OK);
     } else {
@@ -1497,30 +1700,39 @@ static void test_db(void) {
       CHECK(memmem(why.ptr, why.len, "transaction", 11) != NULL);
     }
     CHECK(anole_db_query(db, c, t2count, NULL, 0, NULL, 60 + i) == ANOLE_OK);
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     if (r->status != ANOLE_OK || db_cell(r, 0, 0)->v.i != txs[i].count)
       fprintf(stderr, "after \"%s\": %lld rows\n", txs[i].sql, (long long)db_cell(r, 0, 0)->v.i);
     CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == txs[i].count);
   }
+  printf("ok sqlite: a call that leaves a transaction open is rolled back and refused\n");
+}
 
+static void test_db_cache(void) {
+  TEST_DB_PROLOGUE
   /* the cache: a hit until invalidated */
   anole_db_options cached = {sizeof cached, 0, 0, 60000, 0, LIT("items")};
   anole_str count = LIT("SELECT count(*) AS n FROM items");
   CHECK(anole_db_query(db, c, count, NULL, 0, &cached, 20) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->source == ANOLE_DB_FROM_DATABASE && db_cell(r, 0, 0)->v.i == 2);
   v[0].v.s = LIT("plum");
   CHECK(anole_db_exec(db, c, ins, v, 4, NULL, 21) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(anole_db_query(db, c, count, NULL, 0, &cached, 22) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->source == ANOLE_DB_FROM_CACHE && db_cell(r, 0, 0)->v.i == 2);
   anole_str items = LIT("items");
   CHECK(anole_db_invalidate(db, items) == ANOLE_OK);
   CHECK(anole_db_query(db, c, count, NULL, 0, &cached, 23) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->source == ANOLE_DB_FROM_DATABASE && db_cell(r, 0, 0)->v.i == 3);
+  printf("ok sqlite: a cached query hits until invalidated\n");
+}
 
+static void test_db_coalesce(void) {
+  TEST_DB_PROLOGUE
+  anole_str count = LIT("SELECT count(*) AS n FROM items");
   /* many at once, coalesced: each answered once */
   enum { MANY = 200 };
   static int seen[MANY];
@@ -1529,39 +1741,55 @@ static void test_db(void) {
   for (int i = 0; i < MANY; i++) CHECK(anole_db_query(db, c, count, NULL, 0, &co_opts, 1000 + i) == ANOLE_OK);
   int coalesced = 0;
   for (int i = 0; i < MANY; i++) {
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     CHECK(r->user_data >= 1000 && r->user_data < 1000 + MANY && !seen[r->user_data - 1000]);
     seen[r->user_data - 1000] = 1;
     CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 3);
     if (r->source == ANOLE_DB_FROM_COALESCED) coalesced++;
   }
+  printf("ok sqlite: many at once, coalesced, each answered once (%d of %d coalesced)\n", coalesced, MANY);
+}
 
+static void test_db_timeout(void) {
+  TEST_DB_PROLOGUE
   /* a timeout interrupts the statement */
   anole_str slow = LIT("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT count(*) FROM n");
   anole_db_options quick = {sizeof quick, 0, 50, 0, 0, {NULL, 0}};
   double t0 = now_ms();
   CHECK(anole_db_query(db, c, slow, NULL, 0, &quick, 30) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_TIMEOUT && r->http_status == 504 && r->error_class == ANOLE_DB_ERR_TIMEOUT);
   CHECK(!timing() || now_ms() - t0 < 2000);
+  printf("ok sqlite: a timeout interrupts the statement (504)\n");
+}
 
+static void test_db_result_max(void) {
+  TEST_DB_PROLOGUE
   /* an answer past limits.db_result_max */
   anole_str huge = LIT("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 10000) SELECT x FROM n");
   CHECK(anole_db_query(db, c, huge, NULL, 0, NULL, 31) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_TOOBIG && r->nrows == 0);
+  printf("ok sqlite: an answer past limits.db_result_max is TOOBIG\n");
+}
 
+static void test_db_poll_buffer_too_small(void) {
+  TEST_DB_PROLOGUE
   /* a poll buffer too small for the next answer: TOOBIG, the record stays */
   anole_str some = LIT("WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 100) SELECT x FROM n");
   CHECK(anole_db_query(db, c, some, NULL, 0, NULL, 32) == ANOLE_OK);
   unsigned char tiny[256];
   int64_t n;
-  do n = anole_poll_wait(c, tiny, sizeof tiny, 10000);
+  do n = anole_poll_wait(c, tiny, sizeof tiny, wait_ms());
   while (n == 0);
   CHECK(n == ANOLE_E_TOOBIG);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 32 && r->nrows == 100);
+  printf("ok sqlite: a poll buffer too small for the answer is TOOBIG, the record stays\n");
+}
 
+static void test_db_stop(void) {
+  TEST_DB_PROLOGUE
   CHECK(anole_server_drain(s) == ANOLE_OK);
   CHECK(anole_server_wait(s, -1) == ANOLE_OK);
   CHECK(anole_db_query(db, c, sel, NULL, 0, NULL, 40) == ANOLE_E_STATE);
@@ -1572,17 +1800,43 @@ static void test_db(void) {
   unlink(side);
   snprintf(side, sizeof side, "%s-shm", path);
   unlink(side);
-  printf("ok databases: values both ways, errors, scripts, cache, %d of %d coalesced, timeout, size limit\n", coalesced, MANY);
+  printf("ok sqlite: after the stop a query is ANOLE_E_STATE\n");
 }
 
-/* PostgreSQL, against the server ANOLE_TEST_POSTGRES_URL names (zig build
-   capi-test -Dpostgres-test-url=...; tests/postgres/run.sh). */
-static void test_db_postgres(void) {
+static void test_db(void) {
+  if (!test_db_start()) return;
+  test_db_values_both_ways();
+  test_db_errors();
+  test_db_script();
+  test_db_open_transaction_refused();
+  test_db_cache();
+  test_db_coalesce();
+  test_db_timeout();
+  test_db_result_max();
+  test_db_poll_buffer_too_small();
+  test_db_stop();
+}
+
+/* PostgreSQL through anole_db_*, against the server ANOLE_TEST_POSTGRES_URL
+   names (zig build capi-test -Dpostgres-test-url=...; tests/postgres/run.sh).
+   One server shared by the tests below in order (rows carry over). */
+static anole_server *pg_s;
+static anole_db *pg_db;
+static anole_consumer *pg_c;
+static anole_db_value pg_v[6];
+
+#define TEST_DB_POSTGRES_PROLOGUE anole_server *s = pg_s; anole_db *db = pg_db; anole_consumer *c = pg_c; anole_db_value *v = pg_v; \
+  const anole_db_result_event *r = NULL; \
+  anole_str ins = LIT("INSERT INTO anole_capi_items (name, qty, price, ok, data, at) VALUES ($1, $2, $3, $4, $5, $6)"); \
+  anole_str count = LIT("SELECT count(*) AS n FROM anole_capi_items"); \
+  (void)s, (void)db, (void)c, (void)v, (void)r, (void)ins, (void)count;
+
+static int test_db_postgres_start(void) {
   anole_str pg_name = LIT("postgres");
   const char *url = getenv("ANOLE_TEST_POSTGRES_URL");
   if (!anole_has_feature(pg_name) || url == NULL || url[0] == 0) {
     printf("ok postgres (%s)\n", anole_has_feature(pg_name) ? "no ANOLE_TEST_POSTGRES_URL" : "not built in");
-    return;
+    return 0;
   }
   char json[4096];
   snprintf(json, sizeof json,
@@ -1601,29 +1855,44 @@ static void test_db_postgres(void) {
   anole_consumer_options co = {sizeof co, NULL, NULL, 0};
   CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
   CHECK(anole_server_start(s) == ANOLE_OK);
-  static unsigned char rec[1 << 20];
-  const anole_db_result_event *r;
 
+  pg_s = s;
+  pg_db = db;
+  pg_c = c;
+  return 1;
+}
+
+static void test_db_postgres_values_sent(void) {
+  TEST_DB_POSTGRES_PROLOGUE
   /* every value type, sent as the parameter's type or as text */
-  anole_str ins = LIT("INSERT INTO anole_capi_items (name, qty, price, ok, data, at) VALUES ($1, $2, $3, $4, $5, $6)");
-  anole_db_value v[6] = {{ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("apple")}},     {ANOLE_DB_TYPE_INT, 0, {.i = 3}},
+  const anole_db_value v0[6] = {{ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("apple")}},     {ANOLE_DB_TYPE_INT, 0, {.i = 3}},
                          {ANOLE_DB_TYPE_FLOAT, 0, {.f = 1.25}},            {ANOLE_DB_TYPE_BOOL, 0, {.i = 1}},
                          {ANOLE_DB_TYPE_BLOB, 0, {.s = LIT("\x00\x01\x02")}}, {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("2026-10-22T10:00:00Z")}}};
+  memcpy(v, v0, sizeof v0);
   CHECK(anole_db_exec(db, c, ins, v, 6, NULL, 10) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 10 && r->status == ANOLE_OK && r->changes == 1 && r->last_insert_rowid == 0);
+  printf("ok postgres: every value type is sent as its parameter's type or as text\n");
+}
+
+static void test_db_postgres_returning(void) {
+  TEST_DB_POSTGRES_PROLOGUE
   /* RETURNING through a query; an int sent to a text parameter */
   anole_str ret = LIT("INSERT INTO anole_capi_items (name, qty) VALUES ($1::text, $2) RETURNING id");
   anole_db_value v2[2] = {{ANOLE_DB_TYPE_INT, 0, {.i = 42}}, {ANOLE_DB_TYPE_NULL, 0, {.i = 0}}};
   CHECK(anole_db_query(db, c, ret, v2, 2, NULL, 11) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_INT && db_cell(r, 0, 0)->v.i == 2);
   CHECK(db_cell(r, 0, 0)->db_type == 20);
+  printf("ok postgres: RETURNING comes back through a query, an int sent to a text parameter\n");
+}
 
+static void test_db_postgres_read_with_oids(void) {
+  TEST_DB_POSTGRES_PROLOGUE
   /* a read: converted cells, the rest as text, each with its type OID */
   anole_str q = LIT("SELECT id, name AS label, qty, price, ok, data, at FROM anole_capi_items ORDER BY id");
   CHECK(anole_db_query(db, c, q, NULL, 0, NULL, 12) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->ncolumns == 7 && r->nrows == 2);
   CHECK(str_is(db_column(r, 1), "label"));
   CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_INT && db_cell(r, 0, 0)->v.i == 1);
@@ -1638,19 +1907,27 @@ static void test_db_postgres(void) {
   CHECK(db_cell(r, 0, 6)->type == ANOLE_DB_TYPE_TEXT && db_cell(r, 0, 6)->db_type == 1184);
   CHECK(str_is(anole_event_str(r, db_cell(r, 1, 1)->v.s), "42"));
   CHECK(db_cell(r, 1, 2)->type == ANOLE_DB_TYPE_NULL && db_cell(r, 1, 2)->db_type == 23);
+  printf("ok postgres: a read converts cells and gives each its type OID\n");
+}
 
+static void test_db_postgres_errors(void) {
+  TEST_DB_POSTGRES_PROLOGUE
   /* failures: a unique key, a syntax error, a value PostgreSQL refuses */
   CHECK(anole_db_exec(db, c, ins, v, 6, NULL, 13) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_DB && r->http_status == 409 && r->error_class == ANOLE_DB_ERR_UNIQUE);
   CHECK(str_is(anole_event_str(r, r->constraint), "anole_capi_items_name_key"));
   CHECK(str_is(anole_event_str(r, r->error_code), "23505") && r->error.len > 0);
   anole_str bad = LIT("SELEKT 1");
   CHECK(anole_db_query(db, c, bad, NULL, 0, NULL, 14) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_DB && r->http_status == 500 && r->error_class == ANOLE_DB_ERR_OTHER);
   CHECK(str_is(anole_event_str(r, r->error_code), "42601"));
+  printf("ok postgres: a unique key is 409 naming the constraint, a syntax error 500 with its SQLSTATE\n");
+}
 
+static void test_db_postgres_open_transaction_refused(void) {
+  TEST_DB_POSTGRES_PROLOGUE
   /* A call that leaves a transaction open (a bare BEGIN) is rolled back and
      refused: the connection went back to the pool closed, and the
      statements meant for the transaction each committed on their own. A
@@ -1672,7 +1949,7 @@ static void test_db_postgres(void) {
     for (size_t i = 0; i < sizeof txs / sizeof *txs; i++) {
       anole_str sql = {txs[i].sql, strlen(txs[i].sql)};
       CHECK(anole_db_exec(db, c, sql, NULL, 0, NULL, 50 + i) == ANOLE_OK);
-      r = db_next(c, rec, sizeof rec);
+      r = db_next(c, db_rec, sizeof db_rec);
       if (txs[i].ok != (r->status == ANOLE_OK)) {
         anole_str why = anole_event_str(r, r->error);
         fprintf(stderr, "\"%s\": status %d: %.*s\n", txs[i].sql, r->status, (int)why.len, why.ptr);
@@ -1683,34 +1960,46 @@ static void test_db_postgres(void) {
         CHECK(r->error_class == ANOLE_DB_ERR_OTHER && memmem(why.ptr, why.len, "transaction", 11) != NULL);
       }
       CHECK(anole_db_query(db, c, txcount, NULL, 0, NULL, 60 + i) == ANOLE_OK);
-      r = db_next(c, rec, sizeof rec);
+      r = db_next(c, db_rec, sizeof db_rec);
       CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == txs[i].count);
     }
   }
+  printf("ok postgres: a call that leaves a transaction open is rolled back and refused\n");
+}
+
+static void test_db_postgres_refused_value(void) {
+  TEST_DB_POSTGRES_PROLOGUE
   anole_str as_int = LIT("SELECT $1::int4");
   anole_db_value half = {ANOLE_DB_TYPE_FLOAT, 0, {.f = 1.5}};
   CHECK(anole_db_query(db, c, as_int, &half, 1, NULL, 15) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_DB && str_is(anole_event_str(r, r->error_code), "22P02"));
+  printf("ok postgres: a value PostgreSQL refuses comes back with its SQLSTATE\n");
+}
 
+static void test_db_postgres_cache(void) {
+  TEST_DB_POSTGRES_PROLOGUE
   /* the cache: a hit until invalidated */
   anole_db_options cached = {sizeof cached, 0, 0, 60000, 0, LIT("items")};
-  anole_str count = LIT("SELECT count(*) AS n FROM anole_capi_items");
   for (int round = 0; round < 2; round++) {
     CHECK(anole_db_query(db, c, count, NULL, 0, &cached, 20) == ANOLE_OK);
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 2);
   }
   /* (two executors: the second may have missed; a third ask hits one of them) */
   CHECK(anole_db_query(db, c, count, NULL, 0, &cached, 21) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->source == ANOLE_DB_FROM_CACHE);
   anole_str items = LIT("items");
   CHECK(anole_db_invalidate(db, items) == ANOLE_OK);
   CHECK(anole_db_query(db, c, count, NULL, 0, &cached, 22) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->source == ANOLE_DB_FROM_DATABASE);
+  printf("ok postgres: a cached query hits until invalidated\n");
+}
 
+static void test_db_postgres_coalesce(void) {
+  TEST_DB_POSTGRES_PROLOGUE
   /* many at once, coalesced: each answered once */
   enum { MANY = 200 };
   static int seen[MANY];
@@ -1719,52 +2008,90 @@ static void test_db_postgres(void) {
   for (int i = 0; i < MANY; i++) CHECK(anole_db_query(db, c, count, NULL, 0, &co_opts, 1000 + i) == ANOLE_OK);
   int coalesced = 0;
   for (int i = 0; i < MANY; i++) {
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     CHECK(r->user_data >= 1000 && r->user_data < 1000 + MANY && !seen[r->user_data - 1000]);
     seen[r->user_data - 1000] = 1;
     CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 2);
     if (r->source == ANOLE_DB_FROM_COALESCED) coalesced++;
   }
+  printf("ok postgres: many at once, coalesced, each answered once (%d of %d coalesced)\n", coalesced, MANY);
+}
 
+static void test_db_postgres_timeout(void) {
+  TEST_DB_POSTGRES_PROLOGUE
   /* a timeout cancels the statement on the server; the pool carries on */
   anole_str slow = LIT("SELECT pg_sleep(10)");
   anole_db_options quick = {sizeof quick, 0, 100, 0, 0, {NULL, 0}};
   double t0 = now_ms();
   CHECK(anole_db_query(db, c, slow, NULL, 0, &quick, 30) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_TIMEOUT && r->http_status == 504 && r->error_class == ANOLE_DB_ERR_TIMEOUT);
   CHECK(!timing() || now_ms() - t0 < 3000);
   CHECK(anole_db_query(db, c, count, NULL, 0, NULL, 31) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 2);
+  printf("ok postgres: a timeout cancels the statement on the server, the pool carries on\n");
+}
 
+static void test_db_postgres_result_max(void) {
+  TEST_DB_POSTGRES_PROLOGUE
   /* an answer past limits.db_result_max */
   anole_str huge = LIT("SELECT x FROM generate_series(1, 20000) x");
   CHECK(anole_db_query(db, c, huge, NULL, 0, NULL, 32) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_TOOBIG && r->nrows == 0);
+  printf("ok postgres: an answer past limits.db_result_max is TOOBIG\n");
+}
 
+static void test_db_postgres_stop(void) {
+  TEST_DB_POSTGRES_PROLOGUE
   anole_str drop = LIT("DROP TABLE anole_capi_items");
   CHECK(anole_db_exec(db, c, drop, NULL, 0, NULL, 33) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK);
 
   CHECK(anole_server_drain(s) == ANOLE_OK);
   CHECK(anole_server_wait(s, -1) == ANOLE_OK);
   CHECK(anole_db_query(db, c, count, NULL, 0, NULL, 40) == ANOLE_E_STATE);
   anole_server_destroy(s);
-  printf("ok postgres: values both ways with type OIDs, RETURNING, errors, cache, %d of %d coalesced, timeout, size limit\n",
-         coalesced, MANY);
+  printf("ok postgres: after the stop a query is ANOLE_E_STATE\n");
 }
 
-/* Redis, against the server ANOLE_TEST_REDIS_URL names (zig build
-   capi-test -Dredis-test-url=...; tests/redis/run.sh). */
-static void test_db_redis(void) {
+static void test_db_postgres(void) {
+  if (!test_db_postgres_start()) return;
+  test_db_postgres_values_sent();
+  test_db_postgres_returning();
+  test_db_postgres_read_with_oids();
+  test_db_postgres_errors();
+  test_db_postgres_open_transaction_refused();
+  test_db_postgres_refused_value();
+  test_db_postgres_cache();
+  test_db_postgres_coalesce();
+  test_db_postgres_timeout();
+  test_db_postgres_result_max();
+  test_db_postgres_stop();
+}
+
+/* Redis through anole_db_*, against the server ANOLE_TEST_REDIS_URL names
+   (zig build capi-test -Dredis-test-url=...; tests/redis/run.sh). One
+   server shared by the tests below in order (keys carry over). */
+static anole_server *rd_s;
+static anole_db *rd_db;
+static anole_consumer *rd_c;
+static anole_db_value rd_keys[3];
+
+#define TEST_DB_REDIS_PROLOGUE anole_server *s = rd_s; anole_db *db = rd_db; anole_consumer *c = rd_c; anole_db_value *keys = rd_keys; \
+  const anole_db_result_event *r = NULL; \
+  anole_str del = LIT("DEL"), set = LIT("SET"), get = LIT("GET"), rpush = LIT("RPUSH"), lrange = LIT("LRANGE"); \
+  anole_db_value rv[3] = {keys[1], {ANOLE_DB_TYPE_INT, 0, {.i = 0}}, {ANOLE_DB_TYPE_INT, 0, {.i = -1}}}; \
+  (void)s, (void)db, (void)c, (void)r, (void)del, (void)set, (void)get, (void)rpush, (void)lrange, (void)rv;
+
+static int test_db_redis_start(void) {
   anole_str redis_name = LIT("redis");
   const char *url = getenv("ANOLE_TEST_REDIS_URL");
   if (!anole_has_feature(redis_name) || url == NULL || url[0] == 0) {
     printf("ok redis (%s)\n", anole_has_feature(redis_name) ? "no ANOLE_TEST_REDIS_URL" : "not built in");
-    return;
+    return 0;
   }
   char json[2048];
   snprintf(json, sizeof json,
@@ -1779,120 +2106,178 @@ static void test_db_redis(void) {
   anole_consumer_options co = {sizeof co, NULL, NULL, 0};
   CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
   CHECK(anole_server_start(s) == ANOLE_OK);
-  /* No transactions here: SQLite and PostgreSQL only. */
-  CHECK(anole_db_begin(db, c, NULL, 1) == ANOLE_E_UNSUPPORTED);
-  static unsigned char rec[1 << 20];
   const anole_db_result_event *r;
-  anole_str del = LIT("DEL"), set = LIT("SET"), get = LIT("GET"), rpush = LIT("RPUSH"), lrange = LIT("LRANGE");
-  anole_db_value keys[3] = {{ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("anole:capi:s")}},
+  anole_str del = LIT("DEL");
+  anole_db_value *keys = rd_keys;
+  const anole_db_value keys0[3] = {{ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("anole:capi:s")}},
                             {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("anole:capi:l")}},
                             {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("anole:capi:n")}}};
+  memcpy(keys, keys0, sizeof keys0);
   CHECK(anole_db_exec(db, c, del, keys, 3, NULL, 1) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->nrows == 0);
 
+  rd_s = s;
+  rd_db = db;
+  rd_c = c;
+  return 1;
+}
+
+static void test_db_redis_begin_unsupported(void) {
+  TEST_DB_REDIS_PROLOGUE
+  /* No transactions here: SQLite and PostgreSQL only. */
+  CHECK(anole_db_begin(db, c, NULL, 1) == ANOLE_E_UNSUPPORTED);
+  printf("ok redis: anole_db_begin is ANOLE_E_UNSUPPORTED\n");
+}
+
+static void test_db_redis_binary_values(void) {
+  TEST_DB_REDIS_PROLOGUE
   /* SET with binary-safe bytes and an int, then GET */
   anole_db_value sv[4] = {keys[0], {ANOLE_DB_TYPE_BLOB, 0, {.s = LIT("v\x00w")}}, {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("EX")}},
                           {ANOLE_DB_TYPE_INT, 0, {.i = 60}}};
   CHECK(anole_db_query(db, c, set, sv, 4, NULL, 2) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->ncolumns == 0 && r->nrows == 1);
   CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_TEXT && str_is(anole_event_str(r, db_cell(r, 0, 0)->v.s), "OK"));
   CHECK(anole_db_query(db, c, get, keys, 1, NULL, 3) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_BLOB && db_cell(r, 0, 0)->v.s.len == 3);
   CHECK(memcmp(anole_event_str(r, db_cell(r, 0, 0)->v.s).ptr, "v\x00w", 3) == 0);
   CHECK(anole_db_query(db, c, get, &keys[2], 1, NULL, 4) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_NULL);
+  printf("ok redis: binary-safe values and ints go in, GET gives the bytes back, a missing key NULL\n");
+}
 
+static void test_db_redis_integer_reply_changes(void) {
+  TEST_DB_REDIS_PROLOGUE
   /* exec: an integer reply as `changes` */
   anole_db_value lv[4] = {keys[1], {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("a")}}, {ANOLE_DB_TYPE_INT, 0, {.i = 2}},
                           {ANOLE_DB_TYPE_FLOAT, 0, {.f = 2.5}}};
   CHECK(anole_db_exec(db, c, rpush, lv, 4, NULL, 5) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->changes == 3);
+  printf("ok redis: exec gives an integer reply as changes\n");
+}
 
+static void test_db_redis_nested_replies(void) {
+  TEST_DB_REDIS_PROLOGUE
   /* an array; a nested reply from a script, in preorder */
-  anole_db_value rv[3] = {keys[1], {ANOLE_DB_TYPE_INT, 0, {.i = 0}}, {ANOLE_DB_TYPE_INT, 0, {.i = -1}}};
   CHECK(anole_db_query(db, c, lrange, rv, 3, NULL, 6) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->nrows == 4 && db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_ARRAY && db_cell(r, 0, 0)->v.i == 3);
   CHECK(str_is(anole_event_str(r, db_cell(r, 0, 3)->v.s), "2.5"));
   anole_str eval = LIT("EVAL");
   anole_db_value ev[2] = {{ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("return {1, {2, 'x'}, 3}")}}, {ANOLE_DB_TYPE_INT, 0, {.i = 0}}};
   CHECK(anole_db_query(db, c, eval, ev, 2, NULL, 7) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->nrows == 6);
   CHECK(db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_ARRAY && db_cell(r, 0, 0)->v.i == 3);
   CHECK(db_cell(r, 0, 1)->type == ANOLE_DB_TYPE_INT && db_cell(r, 0, 1)->v.i == 1);
   CHECK(db_cell(r, 0, 2)->type == ANOLE_DB_TYPE_ARRAY && db_cell(r, 0, 2)->v.i == 2);
   CHECK(db_cell(r, 0, 4)->type == ANOLE_DB_TYPE_BLOB && db_cell(r, 0, 5)->v.i == 3);
+  printf("ok redis: arrays and nested replies come back in preorder\n");
+}
 
+static void test_db_redis_errors(void) {
+  TEST_DB_REDIS_PROLOGUE
   /* a server error; an empty command */
   anole_str incr = LIT("INCR");
   CHECK(anole_db_query(db, c, incr, &keys[1], 1, NULL, 8) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_DB && r->http_status == 500 && r->error_class == ANOLE_DB_ERR_OTHER);
   CHECK(str_is(anole_event_str(r, r->error_code), "WRONGTYPE"));
   anole_str blank = LIT("  ");
   CHECK(anole_db_query(db, c, blank, NULL, 0, NULL, 9) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_DB && r->http_status == 400);
+  printf("ok redis: a server error names its code, an empty command is 400\n");
+}
 
+static void test_db_redis_cache(void) {
+  TEST_DB_REDIS_PROLOGUE
   /* the cache, for read commands: a hit until invalidated */
   anole_db_options cached = {sizeof cached, 0, 0, 60000, 0, LIT("l")};
   for (int round = 0; round < 3; round++) {
     CHECK(anole_db_query(db, c, lrange, rv, 3, &cached, 20) == ANOLE_OK);
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 3);
     if (round == 2) CHECK(r->source == ANOLE_DB_FROM_CACHE);
   }
   anole_str l = LIT("l");
   CHECK(anole_db_invalidate(db, l) == ANOLE_OK);
   CHECK(anole_db_query(db, c, lrange, rv, 3, &cached, 21) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->source == ANOLE_DB_FROM_DATABASE);
+  printf("ok redis: a cached read command hits until invalidated\n");
+}
 
+static void test_db_redis_coalesce(void) {
+  TEST_DB_REDIS_PROLOGUE
   /* many at once, coalesced */
   enum { MANY = 200 };
   anole_db_options co_opts = {sizeof co_opts, ANOLE_DB_F_COALESCE, 0, 0, 0, {NULL, 0}};
   for (int i = 0; i < MANY; i++) CHECK(anole_db_query(db, c, get, keys, 1, &co_opts, 1000 + i) == ANOLE_OK);
   int coalesced = 0;
   for (int i = 0; i < MANY; i++) {
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.s.len == 3);
     if (r->source == ANOLE_DB_FROM_COALESCED) coalesced++;
   }
+  printf("ok redis: many at once, coalesced (%d of %d coalesced)\n", coalesced, MANY);
+}
 
+static void test_db_redis_timeout(void) {
+  TEST_DB_REDIS_PROLOGUE
   /* a timeout: a blocking pop that waits longer */
   anole_str blpop = LIT("BLPOP");
   anole_db_value bv[2] = {keys[2], {ANOLE_DB_TYPE_INT, 0, {.i = 5}}};
   anole_db_options quick = {sizeof quick, 0, 100, 0, 0, {NULL, 0}};
   double t0 = now_ms();
   CHECK(anole_db_query(db, c, blpop, bv, 2, &quick, 30) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_TIMEOUT && r->http_status == 504);
   CHECK(!timing() || now_ms() - t0 < 3000);
+  printf("ok redis: a timeout cuts a blocking pop (504)\n");
+}
 
+static void test_db_redis_result_max(void) {
+  TEST_DB_REDIS_PROLOGUE
   /* an answer past limits.db_result_max */
   anole_str setrange = LIT("SETRANGE");
   anole_db_value sr[3] = {keys[2], {ANOLE_DB_TYPE_INT, 0, {.i = 100000}}, {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("x")}}};
   CHECK(anole_db_exec(db, c, setrange, sr, 3, NULL, 31) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->changes == 100001);
   CHECK(anole_db_query(db, c, get, &keys[2], 1, NULL, 32) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_TOOBIG);
+  printf("ok redis: an answer past limits.db_result_max is TOOBIG\n");
+}
 
+static void test_db_redis_stop(void) {
+  TEST_DB_REDIS_PROLOGUE
   CHECK(anole_db_exec(db, c, del, keys, 3, NULL, 33) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->changes == 3);
   CHECK(anole_server_drain(s) == ANOLE_OK);
   CHECK(anole_server_wait(s, -1) == ANOLE_OK);
   anole_server_destroy(s);
-  printf("ok redis: commands with binary values, nested replies, errors, cache, %d of %d coalesced, timeout, size limit\n",
-         coalesced, MANY);
+  printf("ok redis: keys removed, server stopped\n");
+}
+
+static void test_db_redis(void) {
+  if (!test_db_redis_start()) return;
+  test_db_redis_begin_unsupported();
+  test_db_redis_binary_values();
+  test_db_redis_integer_reply_changes();
+  test_db_redis_nested_replies();
+  test_db_redis_errors();
+  test_db_redis_cache();
+  test_db_redis_coalesce();
+  test_db_redis_timeout();
+  test_db_redis_result_max();
+  test_db_redis_stop();
 }
 
 /* ---- a little BSON, for the MongoDB part ---- */
@@ -2003,14 +2388,25 @@ static int bson_str_is(const anole_db_result_event *r, uint32_t row, const char 
   return strcmp((const char *)v + 4, want) == 0;
 }
 
-/* MongoDB, against the server ANOLE_TEST_MONGODB_URL names (zig build
-   capi-test -Dmongodb-test-url=...; tests/mongodb/run.sh). */
-static void test_db_mongodb(void) {
+/* MongoDB through anole_db_*, against the server ANOLE_TEST_MONGODB_URL
+   names (zig build capi-test -Dmongodb-test-url=...; tests/mongodb/run.sh).
+   One server shared by the tests below in order (documents carry over). */
+static anole_server *mg_s;
+static anole_db *mg_db;
+static anole_consumer *mg_c;
+static bson_b mg_b1, mg_b2, mg_b3;
+
+#define TEST_DB_MONGODB_PROLOGUE anole_server *s = mg_s; anole_db *db = mg_db; anole_consumer *c = mg_c; \
+  const anole_db_result_event *r = NULL; anole_db_value p[3]; \
+  anole_str drop = LIT("runCommand"), ins1 = LIT("insertOne items"), find = LIT("find items"), count = LIT("countDocuments items"); \
+  (void)s, (void)db, (void)c, (void)r, (void)p, (void)drop, (void)ins1, (void)find, (void)count;
+
+static int test_db_mongodb_start(void) {
   anole_str mongo_name = LIT("mongodb");
   const char *url = getenv("ANOLE_TEST_MONGODB_URL");
   if (!anole_has_feature(mongo_name) || url == NULL || url[0] == 0) {
     printf("ok mongodb (%s)\n", anole_has_feature(mongo_name) ? "no ANOLE_TEST_MONGODB_URL" : "not built in");
-    return;
+    return 0;
   }
   char json[4096];
   snprintf(json, sizeof json,
@@ -2025,28 +2421,39 @@ static void test_db_mongodb(void) {
   anole_consumer_options co = {sizeof co, NULL, NULL, 0};
   CHECK(anole_consumer_attach(s, &co, &c) == ANOLE_OK);
   CHECK(anole_server_start(s) == ANOLE_OK);
-  /* No transactions here: SQLite and PostgreSQL only. */
-  CHECK(anole_db_begin(db, c, NULL, 1) == ANOLE_E_UNSUPPORTED);
-  static unsigned char rec[1 << 20];
-  static bson_b b1, b2, b3;
   const anole_db_result_event *r;
   anole_db_value p[3];
 
   /* a clean collection */
   anole_str drop = LIT("runCommand");
-  b1.len = 0;
-  bb_begin(&b1), bb_str(&b1, "drop", "items", 5), bb_end(&b1);
-  p[0] = bb_value(&b1);
+  mg_b1.len = 0;
+  bb_begin(&mg_b1), bb_str(&mg_b1, "drop", "items", 5), bb_end(&mg_b1);
+  p[0] = bb_value(&mg_b1);
   CHECK(anole_db_query(db, c, drop, p, 1, NULL, 1) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec); /* ok, or NamespaceNotFound: either way it is gone */
+  r = db_next(c, db_rec, sizeof db_rec); /* ok, or NamespaceNotFound: either way it is gone */
+  (void)r;
 
+  mg_s = s;
+  mg_db = db;
+  mg_c = c;
+  return 1;
+}
+
+static void test_db_mongodb_begin_unsupported(void) {
+  TEST_DB_MONGODB_PROLOGUE
+  /* No transactions here: SQLite and PostgreSQL only. */
+  CHECK(anole_db_begin(db, c, NULL, 1) == ANOLE_E_UNSUPPORTED);
+  printf("ok mongodb: anole_db_begin is ANOLE_E_UNSUPPORTED\n");
+}
+
+static void test_db_mongodb_insert_one(void) {
+  TEST_DB_MONGODB_PROLOGUE
   /* insertOne: the summary carries the new _id */
-  anole_str ins1 = LIT("insertOne items");
-  b1.len = 0;
-  bb_begin(&b1), bb_str(&b1, "name", "apple", 5), bb_int(&b1, "qty", 3), bb_end(&b1);
-  p[0] = bb_value(&b1);
+  mg_b1.len = 0;
+  bb_begin(&mg_b1), bb_str(&mg_b1, "name", "apple", 5), bb_int(&mg_b1, "qty", 3), bb_end(&mg_b1);
+  p[0] = bb_value(&mg_b1);
   CHECK(anole_db_query(db, c, ins1, p, 1, NULL, 2) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->ncolumns == 1 && r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_BSON);
   CHECK(str_is(db_column(r, 0), "document"));
   {
@@ -2054,165 +2461,224 @@ static void test_db_mongodb(void) {
     const unsigned char *v;
     CHECK(bson_find((const unsigned char *)d.ptr, d.len, "insertedId", &v) == 0x07);
   }
+  printf("ok mongodb: insertOne's summary carries the new _id\n");
+}
 
+static void test_db_mongodb_insert_many(void) {
+  TEST_DB_MONGODB_PROLOGUE
   /* insertMany through exec: the count as changes */
   anole_str insn = LIT("insertMany items");
-  b1.len = b2.len = 0;
-  bb_begin(&b1), bb_str(&b1, "name", "pear", 4), bb_int(&b1, "qty", 5), bb_end(&b1);
-  bb_begin(&b2), bb_str(&b2, "name", "plum", 4), bb_int(&b2, "qty", 7), bb_end(&b2);
-  p[0] = bb_value(&b1), p[1] = bb_value(&b2);
+  mg_b1.len = mg_b2.len = 0;
+  bb_begin(&mg_b1), bb_str(&mg_b1, "name", "pear", 4), bb_int(&mg_b1, "qty", 5), bb_end(&mg_b1);
+  bb_begin(&mg_b2), bb_str(&mg_b2, "name", "plum", 4), bb_int(&mg_b2, "qty", 7), bb_end(&mg_b2);
+  p[0] = bb_value(&mg_b1), p[1] = bb_value(&mg_b2);
   CHECK(anole_db_exec(db, c, insn, p, 2, NULL, 3) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->changes == 2 && r->nrows == 0);
+  printf("ok mongodb: insertMany through exec gives the count as changes\n");
+}
 
+static void test_db_mongodb_find(void) {
+  TEST_DB_MONGODB_PROLOGUE
   /* find with a filter and options under the command's names */
-  anole_str find = LIT("find items");
-  b1.len = b2.len = 0;
-  bb_begin(&b1), bb_doc(&b1, "qty"), bb_int(&b1, "$gte", 4), bb_end(&b1), bb_end(&b1);
-  bb_begin(&b2), bb_doc(&b2, "sort"), bb_int(&b2, "qty", -1), bb_end(&b2), bb_doc(&b2, "projection"), bb_int(&b2, "_id", 0),
-      bb_end(&b2), bb_int(&b2, "batchSize", 1), bb_end(&b2);
-  p[0] = bb_value(&b1), p[1] = bb_value(&b2);
+  mg_b1.len = mg_b2.len = 0;
+  bb_begin(&mg_b1), bb_doc(&mg_b1, "qty"), bb_int(&mg_b1, "$gte", 4), bb_end(&mg_b1), bb_end(&mg_b1);
+  bb_begin(&mg_b2), bb_doc(&mg_b2, "sort"), bb_int(&mg_b2, "qty", -1), bb_end(&mg_b2), bb_doc(&mg_b2, "projection"), bb_int(&mg_b2, "_id", 0),
+      bb_end(&mg_b2), bb_int(&mg_b2, "batchSize", 1), bb_end(&mg_b2);
+  p[0] = bb_value(&mg_b1), p[1] = bb_value(&mg_b2);
   CHECK(anole_db_query(db, c, find, p, 2, NULL, 4) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->nrows == 2);
   CHECK(bson_str_is(r, 0, "name", "plum") && bson_int(r, 0, "qty") == 7 && bson_str_is(r, 1, "name", "pear"));
+  printf("ok mongodb: find takes a filter and options under the command's names\n");
+}
 
+static void test_db_mongodb_find_one_count_aggregate(void) {
+  TEST_DB_MONGODB_PROLOGUE
   /* findOne, countDocuments, aggregate */
   anole_str find1 = LIT("findOne items");
-  b1.len = 0;
-  bb_begin(&b1), bb_str(&b1, "name", "apple", 5), bb_end(&b1);
-  p[0] = bb_value(&b1);
+  mg_b1.len = 0;
+  bb_begin(&mg_b1), bb_str(&mg_b1, "name", "apple", 5), bb_end(&mg_b1);
+  p[0] = bb_value(&mg_b1);
   CHECK(anole_db_query(db, c, find1, p, 1, NULL, 5) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->nrows == 1 && bson_int(r, 0, "qty") == 3);
-  anole_str count = LIT("countDocuments items");
   CHECK(anole_db_query(db, c, count, NULL, 0, NULL, 6) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->nrows == 1 && db_cell(r, 0, 0)->type == ANOLE_DB_TYPE_INT && db_cell(r, 0, 0)->v.i == 3);
   anole_str agg = LIT("aggregate items");
-  b1.len = 0;
-  bb_begin(&b1), bb_doc(&b1, "0"), bb_doc(&b1, "$group"), bb_key(&b1, 0x0A, "_id"), bb_doc(&b1, "total"),
-      bb_str(&b1, "$sum", "$qty", 4), bb_end(&b1), bb_end(&b1), bb_end(&b1), bb_end(&b1);
-  p[0] = bb_value(&b1);
+  mg_b1.len = 0;
+  bb_begin(&mg_b1), bb_doc(&mg_b1, "0"), bb_doc(&mg_b1, "$group"), bb_key(&mg_b1, 0x0A, "_id"), bb_doc(&mg_b1, "total"),
+      bb_str(&mg_b1, "$sum", "$qty", 4), bb_end(&mg_b1), bb_end(&mg_b1), bb_end(&mg_b1), bb_end(&mg_b1);
+  p[0] = bb_value(&mg_b1);
   CHECK(anole_db_query(db, c, agg, p, 1, NULL, 7) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->nrows == 1 && bson_int(r, 0, "total") == 15);
+  printf("ok mongodb: findOne, countDocuments and aggregate\n");
+}
 
+static void test_db_mongodb_update_delete(void) {
+  TEST_DB_MONGODB_PROLOGUE
   /* updateOne and deleteOne */
   anole_str upd = LIT("updateOne items");
-  b1.len = b2.len = 0;
-  bb_begin(&b1), bb_str(&b1, "name", "apple", 5), bb_end(&b1);
-  bb_begin(&b2), bb_doc(&b2, "$inc"), bb_int(&b2, "qty", 1), bb_end(&b2), bb_end(&b2);
-  p[0] = bb_value(&b1), p[1] = bb_value(&b2);
+  mg_b1.len = mg_b2.len = 0;
+  bb_begin(&mg_b1), bb_str(&mg_b1, "name", "apple", 5), bb_end(&mg_b1);
+  bb_begin(&mg_b2), bb_doc(&mg_b2, "$inc"), bb_int(&mg_b2, "qty", 1), bb_end(&mg_b2), bb_end(&mg_b2);
+  p[0] = bb_value(&mg_b1), p[1] = bb_value(&mg_b2);
   CHECK(anole_db_query(db, c, upd, p, 2, NULL, 8) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && bson_int(r, 0, "matchedCount") == 1 && bson_int(r, 0, "modifiedCount") == 1);
   anole_str del = LIT("deleteOne items");
-  b1.len = 0;
-  bb_begin(&b1), bb_str(&b1, "name", "plum", 4), bb_end(&b1);
-  p[0] = bb_value(&b1);
+  mg_b1.len = 0;
+  bb_begin(&mg_b1), bb_str(&mg_b1, "name", "plum", 4), bb_end(&mg_b1);
+  p[0] = bb_value(&mg_b1);
   CHECK(anole_db_exec(db, c, del, p, 1, NULL, 9) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->changes == 1);
+  printf("ok mongodb: updateOne and deleteOne summaries\n");
+}
 
+static void test_db_mongodb_unique_409(void) {
+  TEST_DB_MONGODB_PROLOGUE
   /* a unique index, then a duplicate: 409 with the server's code */
   anole_str cmd = LIT("runCommand");
-  b1.len = 0;
-  bb_begin(&b1), bb_str(&b1, "createIndexes", "items", 5), bb_arr(&b1, "indexes"), bb_doc(&b1, "0"), bb_doc(&b1, "key"),
-      bb_int(&b1, "name", 1), bb_end(&b1), bb_str(&b1, "name", "name_1", 6), bb_bool(&b1, "unique", 1), bb_end(&b1),
-      bb_end(&b1), bb_end(&b1);
-  p[0] = bb_value(&b1);
+  mg_b1.len = 0;
+  bb_begin(&mg_b1), bb_str(&mg_b1, "createIndexes", "items", 5), bb_arr(&mg_b1, "indexes"), bb_doc(&mg_b1, "0"), bb_doc(&mg_b1, "key"),
+      bb_int(&mg_b1, "name", 1), bb_end(&mg_b1), bb_str(&mg_b1, "name", "name_1", 6), bb_bool(&mg_b1, "unique", 1), bb_end(&mg_b1),
+      bb_end(&mg_b1), bb_end(&mg_b1);
+  p[0] = bb_value(&mg_b1);
   CHECK(anole_db_query(db, c, cmd, p, 1, NULL, 10) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK);
-  b1.len = 0;
-  bb_begin(&b1), bb_str(&b1, "name", "apple", 5), bb_end(&b1);
-  p[0] = bb_value(&b1);
+  mg_b1.len = 0;
+  bb_begin(&mg_b1), bb_str(&mg_b1, "name", "apple", 5), bb_end(&mg_b1);
+  p[0] = bb_value(&mg_b1);
   CHECK(anole_db_exec(db, c, ins1, p, 1, NULL, 11) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_DB && r->http_status == 409 && r->error_class == ANOLE_DB_ERR_UNIQUE);
   CHECK(str_is(anole_event_str(r, r->error_code), "11000"));
+  printf("ok mongodb: a duplicate on a unique index is 409 with the server's code\n");
+}
 
+static void test_db_mongodb_refused_400(void) {
+  TEST_DB_MONGODB_PROLOGUE
   /* calls Anole refuses: 400 */
   anole_str nope = LIT("frobnicate items"), bare = LIT("find");
   CHECK(anole_db_query(db, c, nope, NULL, 0, NULL, 12) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_DB && r->http_status == 400);
   CHECK(anole_db_query(db, c, bare, NULL, 0, NULL, 13) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->http_status == 400);
   anole_db_value text = {ANOLE_DB_TYPE_TEXT, 0, {.s = LIT("{}")}};
   CHECK(anole_db_query(db, c, find, &text, 1, NULL, 14) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->http_status == 400);
-  b1.len = b2.len = 0;
-  bb_begin(&b1), bb_end(&b1);
-  bb_begin(&b2), bb_int(&b2, "limt", 1), bb_end(&b2);
-  p[0] = bb_value(&b1), p[1] = bb_value(&b2);
+  mg_b1.len = mg_b2.len = 0;
+  bb_begin(&mg_b1), bb_end(&mg_b1);
+  bb_begin(&mg_b2), bb_int(&mg_b2, "limt", 1), bb_end(&mg_b2);
+  p[0] = bb_value(&mg_b1), p[1] = bb_value(&mg_b2);
   CHECK(anole_db_query(db, c, find, p, 2, NULL, 15) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->http_status == 400 && span_has(anole_event_str(r, r->error), "limt"));
+  printf("ok mongodb: calls Anole refuses are 400\n");
+}
 
+static void test_db_mongodb_cache(void) {
+  TEST_DB_MONGODB_PROLOGUE
   /* the cache: a hit until invalidated */
   anole_db_options cached = {sizeof cached, 0, 0, 60000, 0, LIT("items")};
   for (int round = 0; round < 3; round++) {
     CHECK(anole_db_query(db, c, find, NULL, 0, &cached, 20) == ANOLE_OK);
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     CHECK(r->status == ANOLE_OK && r->nrows == 2);
     if (round == 2) CHECK(r->source == ANOLE_DB_FROM_CACHE);
   }
   anole_str items = LIT("items");
   CHECK(anole_db_invalidate(db, items) == ANOLE_OK);
   CHECK(anole_db_query(db, c, find, NULL, 0, &cached, 21) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->source == ANOLE_DB_FROM_DATABASE);
+  printf("ok mongodb: a cached find hits until invalidated\n");
+}
 
+static void test_db_mongodb_coalesce(void) {
+  TEST_DB_MONGODB_PROLOGUE
   /* many at once, coalesced */
   enum { MANY = 200 };
   anole_db_options co_opts = {sizeof co_opts, ANOLE_DB_F_COALESCE, 0, 0, 0, {NULL, 0}};
   for (int i = 0; i < MANY; i++) CHECK(anole_db_query(db, c, count, NULL, 0, &co_opts, 1000 + i) == ANOLE_OK);
   int coalesced = 0;
   for (int i = 0; i < MANY; i++) {
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     CHECK(r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 2);
     if (r->source == ANOLE_DB_FROM_COALESCED) coalesced++;
   }
+  printf("ok mongodb: many at once, coalesced (%d of %d coalesced)\n", coalesced, MANY);
+}
 
+static void test_db_mongodb_timeout(void) {
+  TEST_DB_MONGODB_PROLOGUE
   /* a timeout: a filter that sleeps on the server */
-  b1.len = 0;
-  bb_begin(&b1), bb_str(&b1, "$where", "sleep(3000) || true", 19), bb_end(&b1);
-  p[0] = bb_value(&b1);
+  mg_b1.len = 0;
+  bb_begin(&mg_b1), bb_str(&mg_b1, "$where", "sleep(3000) || true", 19), bb_end(&mg_b1);
+  p[0] = bb_value(&mg_b1);
   anole_db_options quick = {sizeof quick, 0, 200, 0, 0, {NULL, 0}};
   double t0 = now_ms();
   CHECK(anole_db_query(db, c, find, p, 1, &quick, 30) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_TIMEOUT && r->http_status == 504);
   CHECK(!timing() || now_ms() - t0 < 2500);
+  printf("ok mongodb: a timeout cuts a filter that sleeps on the server (504)\n");
+}
 
+static void test_db_mongodb_result_max(void) {
+  TEST_DB_MONGODB_PROLOGUE
   /* an answer past limits.db_result_max */
   static char big[70000];
   memset(big, 'x', sizeof big);
-  b3.len = 0;
-  bb_begin(&b3), bb_str(&b3, "name", "big", 3), bb_str(&b3, "blob", big, sizeof big), bb_end(&b3);
-  p[0] = bb_value(&b3);
+  mg_b3.len = 0;
+  bb_begin(&mg_b3), bb_str(&mg_b3, "name", "big", 3), bb_str(&mg_b3, "blob", big, sizeof big), bb_end(&mg_b3);
+  p[0] = bb_value(&mg_b3);
   CHECK(anole_db_exec(db, c, ins1, p, 1, NULL, 31) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK);
   CHECK(anole_db_query(db, c, find, NULL, 0, NULL, 32) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_TOOBIG);
+  printf("ok mongodb: an answer past limits.db_result_max is TOOBIG\n");
+}
 
-  b1.len = 0;
-  bb_begin(&b1), bb_str(&b1, "drop", "items", 5), bb_end(&b1);
-  p[0] = bb_value(&b1);
+static void test_db_mongodb_stop(void) {
+  TEST_DB_MONGODB_PROLOGUE
+  /* the end: the collection dropped, the server stopped */
+  mg_b1.len = 0;
+  bb_begin(&mg_b1), bb_str(&mg_b1, "drop", "items", 5), bb_end(&mg_b1);
+  p[0] = bb_value(&mg_b1);
   CHECK(anole_db_query(db, c, drop, p, 1, NULL, 33) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK);
   CHECK(anole_server_drain(s) == ANOLE_OK);
   CHECK(anole_server_wait(s, -1) == ANOLE_OK);
   anole_server_destroy(s);
-  printf("ok mongodb: CRUD and aggregate with BSON both ways, errors, cache, %d of %d coalesced, timeout, size limit\n",
-         coalesced, MANY);
+  printf("ok mongodb: collection dropped, server stopped\n");
+}
+
+static void test_db_mongodb(void) {
+  if (!test_db_mongodb_start()) return;
+  test_db_mongodb_begin_unsupported();
+  test_db_mongodb_insert_one();
+  test_db_mongodb_insert_many();
+  test_db_mongodb_find();
+  test_db_mongodb_find_one_count_aggregate();
+  test_db_mongodb_update_delete();
+  test_db_mongodb_unique_409();
+  test_db_mongodb_refused_400();
+  test_db_mongodb_cache();
+  test_db_mongodb_coalesce();
+  test_db_mongodb_timeout();
+  test_db_mongodb_result_max();
+  test_db_mongodb_stop();
 }
 
 /* ---- WebTransport: the server in C, the client in Zig (tests/capi/wt_client.zig,
@@ -2622,10 +3088,24 @@ static int64_t db_count(anole_db *db, anole_consumer *c, const char *table, uint
   return db_cell(r, 0, 0)->v.i;
 }
 
-static void test_db_tx(void) {
+/* SQLite transactions (anole_db_begin/anole_db_tx_*), one server shared by
+   the tests below in order (rows carry over). */
+static anole_server *dtx_s;
+static anole_db *dtx_db;
+static anole_consumer *dtx_c;
+static anole_db_tx dtx_tx1, dtx_tx2;
+static char dtx_path[64];
+
+#define TEST_DB_TX_PROLOGUE anole_server *s = dtx_s; anole_db *db = dtx_db; anole_consumer *c = dtx_c; const char *path = dtx_path; \
+  const anole_db_result_event *r = NULL; anole_db_tx tx1 = dtx_tx1, tx2 = dtx_tx2; \
+  anole_str ins1 = LIT("INSERT INTO acct (id, cents) VALUES (1, 100)"); \
+  anole_str ins2 = LIT("INSERT INTO acct (id, cents) VALUES (2, 50)"); \
+  (void)s, (void)db, (void)c, (void)path, (void)r, (void)tx1, (void)tx2, (void)ins1, (void)ins2;
+
+static int test_db_tx_start(void) {
   if (!anole_has_feature(LIT("sqlite"))) {
     printf("ok database transactions (SQLite not built in)\n");
-    return;
+    return 0;
   }
   char path[64];
   snprintf(path, sizeof path, "/tmp/anole-capi-tx-%d.db", (int)getpid());
@@ -2641,28 +3121,37 @@ static void test_db_tx(void) {
   CHECK(anole_db_find(s, LIT("d"), &db) == ANOLE_OK);
   CHECK(anole_server_start(s) == ANOLE_OK);
   db_flush();
-  static unsigned char rec[1 << 16];
-  const anole_db_result_event *r;
-  anole_str ins1 = LIT("INSERT INTO acct (id, cents) VALUES (1, 100)");
-  anole_str ins2 = LIT("INSERT INTO acct (id, cents) VALUES (2, 50)");
 
+  dtx_s = s;
+  dtx_db = db;
+  dtx_c = c;
+  memcpy(dtx_path, path, sizeof dtx_path);
+  return 1;
+}
+
+static void test_db_tx_commit_and_waiting_begin(void) {
+  TEST_DB_TX_PROLOGUE
   /* begin, a statement, a second begin that waits for the writer, commit */
   CHECK(anole_db_begin(db, c, NULL, 100) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 100 && r->status == ANOLE_OK && r->ev.handle != 0);
-  anole_db_tx tx1 = r->ev.handle;
+  tx1 = dtx_tx1 = r->ev.handle;
   CHECK(anole_db_tx_exec(tx1, ins1, NULL, 0, NULL, 101) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 101 && r->status == ANOLE_OK && r->changes == 1 && r->ev.handle == tx1);
   CHECK(anole_db_begin(db, c, NULL, 103) == ANOLE_OK);
   CHECK(count_events(c, ANOLE_EV_DB_RESULT, 150) == 0); /* the writer is tx1's */
   CHECK(anole_db_tx_commit(tx1, 102) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 102 && r->status == ANOLE_OK && r->ev.handle == tx1);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 103 && r->status == ANOLE_OK && r->ev.handle != 0 && r->ev.handle != tx1);
-  anole_db_tx tx2 = r->ev.handle;
+  dtx_tx2 = r->ev.handle;
+  printf("ok transactions: commit; a second begin waits for the writer\n");
+}
 
+static void test_db_tx_stale_after_commit(void) {
+  TEST_DB_TX_PROLOGUE
   /* after the commit the handle is stale: GONE at once; release is OK */
   CHECK(anole_db_tx_exec(tx1, ins2, NULL, 0, NULL, 110) == ANOLE_E_GONE && name_is("Gone"));
   CHECK(anole_db_tx_query(tx1, ins2, NULL, 0, NULL, 111) == ANOLE_E_GONE);
@@ -2671,19 +3160,27 @@ static void test_db_tx(void) {
   CHECK(anole_db_tx_release(tx1) == ANOLE_OK);
   CHECK(anole_db_tx_release(0) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
   CHECK(anole_db_tx_commit(((uint64_t)1 << 28) | 1, 0) == ANOLE_E_INVALID); /* a request handle */
+  printf("ok transactions: after the commit the handle is GONE at once, release OK\n");
+}
 
+static void test_db_tx_rollback(void) {
+  TEST_DB_TX_PROLOGUE
   /* a rollback leaves nothing; a read inside sees the transaction's own write */
   CHECK(anole_db_tx_exec(tx2, ins2, NULL, 0, NULL, 120) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->changes == 1);
   CHECK(anole_db_tx_query(tx2, LIT("SELECT count(*) FROM acct"), NULL, 0, NULL, 121) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->ev.handle == tx2 && db_cell(r, 0, 0)->v.i == 2);
   CHECK(anole_db_tx_rollback(tx2, 122) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 122 && r->status == ANOLE_OK);
   CHECK(db_count(db, c, "acct", 123) == 1);
+  printf("ok transactions: a rollback leaves nothing; a read inside sees its own write\n");
+}
 
+static void test_db_tx_options_validated(void) {
+  TEST_DB_TX_PROLOGUE
   /* options are validated */
   anole_db_tx_options bad = {sizeof bad};
   bad.flags = 1u << 5;
@@ -2704,7 +3201,7 @@ static void test_db_tx(void) {
   CHECK(anole_db_begin(db, c, &big.o, 0) == ANOLE_E_INVALID && name_is("UnknownField"));
   anole_db_tx_options ro = {sizeof ro, ANOLE_DB_TX_READ_ONLY, ANOLE_DB_ISOLATION_SERIALIZABLE, 0, 0, 0};
   CHECK(anole_db_begin(db, c, &ro, 130) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK);
   anole_db_tx tx3 = r->ev.handle;
   anole_db_options coalesce = {sizeof coalesce, ANOLE_DB_F_COALESCE};
@@ -2716,10 +3213,14 @@ static void test_db_tx(void) {
   CHECK(anole_db_tx_query(tx3, LIT("SELECT 1"), NULL, 0, &tied, 0) == ANOLE_E_INVALID);
   CHECK(anole_handle_release(tx3) == ANOLE_OK); /* the generic release rolls it back */
   CHECK(anole_db_tx_exec(tx3, LIT("SELECT 1"), NULL, 0, NULL, 0) == ANOLE_E_GONE);
+  printf("ok transactions: options are validated\n");
+}
 
+static void test_db_tx_queued_order(void) {
+  TEST_DB_TX_PROLOGUE
   /* calls queued without waiting answer in the order made */
   CHECK(anole_db_begin(db, c, NULL, 300) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   anole_db_tx tx4 = r->ev.handle;
   anole_str ins3 = LIT("INSERT INTO acct (id, cents) VALUES (?, 1)");
   for (int i = 0; i < 3; i++) {
@@ -2728,14 +3229,18 @@ static void test_db_tx(void) {
   }
   CHECK(anole_db_tx_commit(tx4, 304) == ANOLE_OK);
   for (int i = 0; i < 4; i++) {
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     CHECK(r->user_data == (uint64_t)(301 + i) && r->status == ANOLE_OK && r->ev.handle == tx4);
   }
   CHECK(db_count(db, c, "acct", 305) == 4);
+  printf("ok transactions: calls queued without waiting answer in the order made\n");
+}
 
+static void test_db_tx_release_answers_gone(void) {
+  TEST_DB_TX_PROLOGUE
   /* release answers what was queued GONE and frees the writer */
   CHECK(anole_db_begin(db, c, NULL, 400) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   anole_db_tx tx5 = r->ev.handle;
   CHECK(anole_db_tx_query(tx5, (anole_str){slow_sql, strlen(slow_sql)}, NULL, 0, NULL, 401) == ANOLE_OK);
   CHECK(anole_db_tx_exec(tx5, ins1, NULL, 0, NULL, 402) == ANOLE_OK);
@@ -2746,34 +3251,42 @@ static void test_db_tx(void) {
   double t0 = now_ms();
   CHECK(anole_db_tx_release(tx5) == ANOLE_OK);
   for (int i = 0; i < 3; i++) {
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     CHECK(r->user_data == (uint64_t)(401 + i) && r->status == ANOLE_E_GONE && r->http_status == 0);
   }
   CHECK(!timing() || now_ms() - t0 < 3000);
   CHECK(db_count(db, c, "acct", 404) == 4); /* the writer is free and nothing was kept */
+  printf("ok transactions: release answers what was queued GONE and frees the writer\n");
+}
 
+static void test_db_tx_timeout(void) {
+  TEST_DB_TX_PROLOGUE
   /* its timeout rolls it back: idle, the next call is GONE; with a statement running, TIMEOUT */
   anole_db_tx_options quick = {sizeof quick};
-  quick.timeout_ms = 100;
+  quick.timeout_ms = 50;
   CHECK(anole_db_begin(db, c, &quick, 500) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   anole_db_tx tx6 = r->ev.handle;
-  /* Past its 100 ms timeout on purpose (a lower bound). */
+  /* Past its 50 ms timeout on purpose (a lower bound, 6x). */
   usleep(300 * 1000);
   CHECK(anole_db_tx_exec(tx6, ins1, NULL, 0, NULL, 501) == ANOLE_E_GONE);
   CHECK(anole_db_begin(db, c, &quick, 510) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   anole_db_tx tx7 = r->ev.handle;
   CHECK(anole_db_tx_query(tx7, (anole_str){slow_sql, strlen(slow_sql)}, NULL, 0, NULL, 511) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 511 && r->status == ANOLE_E_TIMEOUT && r->http_status == 504 && r->error_class == ANOLE_DB_ERR_TIMEOUT);
   /* Over once its TIMEOUT is answered: GONE at once, no pause (the end is
      set before the rollback runs). */
   CHECK(anole_db_tx_exec(tx7, ins1, NULL, 0, NULL, 512) == ANOLE_E_GONE);
+  printf("ok transactions: the timeout rolls back (idle: GONE; running: TIMEOUT)\n");
+}
 
+static void test_db_tx_stop(void) {
+  TEST_DB_TX_PROLOGUE
   /* the server's stop rolls back what is open and answers nothing more */
   CHECK(anole_db_begin(db, c, NULL, 600) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK);
   stop_polled(s);
   unlink(path);
@@ -2782,13 +3295,37 @@ static void test_db_tx(void) {
   unlink(side);
   snprintf(side, sizeof side, "%s-shm", path);
   unlink(side);
-  printf("ok database transactions: commit, rollback, order, release, timeout, validation, stop\n");
+  printf("ok transactions: the server's stop rolls back what is open\n");
 }
 
-static void test_db_request_tie(void) {
+static void test_db_tx(void) {
+  if (!test_db_tx_start()) return;
+  test_db_tx_commit_and_waiting_begin();
+  test_db_tx_stale_after_commit();
+  test_db_tx_rollback();
+  test_db_tx_options_validated();
+  test_db_tx_queued_order();
+  test_db_tx_release_answers_gone();
+  test_db_tx_timeout();
+  test_db_tx_stop();
+}
+
+/* Database calls tied to requests (anole_db_options.req), one SQLite server
+   shared by the tests below in order. */
+static anole_server *dti_s;
+static anole_db *dti_db;
+static anole_consumer *dti_c;
+static uint16_t dti_port;
+
+#define TEST_DB_REQUEST_TIE_PROLOGUE anole_server *s = dti_s; anole_db *db = dti_db; anole_consumer *c = dti_c; uint16_t port = dti_port; \
+  const anole_db_result_event *r = NULL; pthread_t t; async_req *a = NULL; anole_req h = 0; \
+  anole_str slow = {slow_sql, strlen(slow_sql)}; \
+  (void)s, (void)db, (void)c, (void)port, (void)r, (void)t, (void)a, (void)h, (void)slow;
+
+static int test_db_request_tie_start(void) {
   if (!anole_has_feature(LIT("sqlite"))) {
     printf("ok database queries tied to requests (SQLite not built in)\n");
-    return;
+    return 0;
   }
   const char *json =
       "{\"executors\":1,\"listeners\":[{\"address\":\"127.0.0.1\",\"port\":0}],"
@@ -2804,19 +3341,28 @@ static void test_db_request_tie(void) {
   CHECK(anole_server_start(s) == ANOLE_OK);
   db_flush();
   uint16_t port = port_of(s, 0);
-  static unsigned char rec[1 << 16];
-  const anole_db_result_event *r;
-  pthread_t t;
-  anole_str slow = {slow_sql, strlen(slow_sql)};
 
+  dti_s = s;
+  dti_db = db;
+  dti_c = c;
+  dti_port = port;
+  return 1;
+}
+
+static void test_db_tie_cut_at_deadline(void) {
+  TEST_DB_REQUEST_TIE_PROLOGUE
   /* canceled at the request's deadline: the client gets 504, the query GONE */
-  async_req *a = start_get(port, "/short", &t);
-  anole_req h = next_request(c);
+  a = start_get(port, "/short", &t);
+  h = next_request(c);
   CHECK(anole_db_query(db, NULL, slow, NULL, 0, &(anole_db_options){.size = sizeof(anole_db_options), .req = h}, 1) == ANOLE_OK);
   CHECK(finish_get(a, t, NULL) == 504);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 1 && r->status == ANOLE_E_GONE && r->http_status == 0 && r->error_class == ANOLE_DB_ERR_NONE);
+  printf("ok tied calls: a query is canceled at its request's deadline (504, the query GONE)\n");
+}
 
+static void test_db_tie_kept_after_answer(void) {
+  TEST_DB_REQUEST_TIE_PROLOGUE
   /* an answered request leaves its query running */
   a = start_get(port, "/hold", &t);
   h = next_request(c);
@@ -2825,71 +3371,118 @@ static void test_db_request_tie(void) {
   on_h.req = h;
   CHECK(anole_db_query(db, c, some, NULL, 0, &on_h, 2) == ANOLE_OK); /* the request's own consumer, named */
   CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
-  /* a stale request: GONE from the call as soon as it is answered (its
-     executor has yet to write the answer and free the slot), and after,
-     nothing queued */
+  CHECK(finish_get(a, t, NULL) == 200);
+  r = db_next(c, db_rec, sizeof db_rec);
+  CHECK(r->user_data == 2 && r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 20000);
+  printf("ok tied calls: an answered request leaves its query running\n");
+}
+
+static void test_db_tie_gone_at_once_after_answer(void) {
+  TEST_DB_REQUEST_TIE_PROLOGUE
+  /* Regression (a253561): a request is stale for the calls tied to it as
+     soon as it is answered (its executor has yet to write the answer and
+     free the slot), and after; nothing is queued. The same for a
+     transaction tied to a request whose deadline answered it. */
+  a = start_get(port, "/hold", &t);
+  h = next_request(c);
+  anole_db_options on_h = {sizeof on_h};
+  on_h.req = h;
+  CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
   CHECK(anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, &on_h, 3) == ANOLE_E_GONE && name_is("Gone"));
   CHECK(finish_get(a, t, NULL) == 200);
-  r = db_next(c, rec, sizeof rec);
-  CHECK(r->user_data == 2 && r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 20000);
   CHECK(anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, &on_h, 3) == ANOLE_E_GONE && name_is("Gone"));
   CHECK(count_events(c, ANOLE_EV_DB_RESULT, 100) == 0);
+  a = start_get(port, "/short", &t);
+  h = next_request(c);
+  anole_db_tx_options tied_to = {sizeof tied_to};
+  tied_to.req = h;
+  CHECK(anole_db_begin(db, NULL, &tied_to, 14) == ANOLE_OK);
+  r = db_next(c, db_rec, sizeof db_rec);
+  CHECK(r->user_data == 14 && r->status == ANOLE_OK);
+  anole_db_tx tied_tx = r->ev.handle;
+  CHECK(finish_get(a, t, NULL) == 504);
+  /* its request ended before the 504 went out: GONE at once, though its
+     task may not have rolled it back yet */
+  CHECK(anole_db_tx_exec(tied_tx, LIT("INSERT INTO tt VALUES (2)"), NULL, 0, NULL, 15) == ANOLE_E_GONE);
+  CHECK(db_count(db, c, "tt", 16) == 0);
+  printf("ok tied calls: GONE at once when the request is answered (regression a253561)\n");
+}
+
+static void test_db_tie_streamed_answer(void) {
+  TEST_DB_REQUEST_TIE_PROLOGUE
   /* a streamed answer: owed until its end, GONE from then on */
   a = start_get(port, "/hold", &t);
   h = next_request(c);
+  anole_db_options on_h = {sizeof on_h};
   on_h.req = h;
   CHECK(anole_req_stream_start(h, 200, NULL, 0) == ANOLE_OK);
   CHECK(anole_db_query(db, NULL, LIT("SELECT 8"), NULL, 0, &on_h, 8) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 8 && r->status == ANOLE_OK && db_cell(r, 0, 0)->v.i == 8);
   CHECK(anole_req_stream_end(h, NULL, 0) == ANOLE_OK);
   CHECK(anole_db_query(db, NULL, LIT("SELECT 9"), NULL, 0, &on_h, 9) == ANOLE_E_GONE && name_is("Gone"));
   CHECK(finish_get(a, t, NULL) == 200);
   CHECK(count_events(c, ANOLE_EV_DB_RESULT, 100) == 0);
+  printf("ok tied calls: a streamed answer is owed until its end, GONE from then on\n");
+}
+
+static void test_db_tie_wrong_handle_kind(void) {
+  TEST_DB_REQUEST_TIE_PROLOGUE
   /* another kind of handle, and a NULL consumer without a request */
   anole_db_options on_ws = {sizeof on_ws};
   on_ws.req = ((uint64_t)2 << 28) | 1;
   CHECK(anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, &on_ws, 4) == ANOLE_E_INVALID);
   CHECK(anole_db_query(db, NULL, LIT("SELECT 1"), NULL, 0, NULL, 5) == ANOLE_E_INVALID);
+  printf("ok tied calls: another kind of handle, or a NULL consumer without a request, is invalid\n");
+}
 
+static void test_db_tie_timeout_default_and_none(void) {
+  TEST_DB_REQUEST_TIE_PROLOGUE
   /* timeout_ms 0 takes the database's (2.5 s here, above /short's deadline); NONE lifts it */
   double t0 = now_ms();
   CHECK(anole_db_query(db, c, slow, NULL, 0, NULL, 6) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 6 && r->status == ANOLE_E_TIMEOUT && r->http_status == 504);
   CHECK(!timing() || now_ms() - t0 < 6000);
   anole_db_options none = {sizeof none};
   none.timeout_ms = ANOLE_DB_TIMEOUT_NONE;
   CHECK(anole_db_query(db, c, LIT("SELECT 1"), NULL, 0, &none, 7) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 7 && r->status == ANOLE_OK);
+  printf("ok tied calls: timeout_ms 0 takes the database's, NONE lifts it\n");
+}
 
+static void test_db_tie_tx_rolled_back_at_deadline(void) {
+  TEST_DB_REQUEST_TIE_PROLOGUE
   /* a transaction tied to a request is rolled back at the request's deadline */
   a = start_get(port, "/short", &t);
   h = next_request(c);
   anole_db_tx_options to = {sizeof to};
   to.req = h;
   CHECK(anole_db_begin(db, NULL, &to, 10) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 10 && r->status == ANOLE_OK);
   anole_db_tx tx = r->ev.handle;
   CHECK(anole_db_tx_exec(tx, LIT("INSERT INTO tt VALUES (1)"), NULL, 0, NULL, 11) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 11 && r->status == ANOLE_OK);
   CHECK(finish_get(a, t, NULL) == 504);
-  /* its request ended before the 504 went out: GONE at once, though its
-     task may not have rolled it back yet */
-  CHECK(anole_db_tx_exec(tx, LIT("INSERT INTO tt VALUES (2)"), NULL, 0, NULL, 12) == ANOLE_E_GONE);
+  /* GONE at once: the regression test above */
   CHECK(db_count(db, c, "tt", 13) == 0);
+  printf("ok tied calls: a transaction tied to a request is rolled back at its deadline\n");
+}
 
+static void test_db_tie_tx_survives_answer(void) {
+  TEST_DB_REQUEST_TIE_PROLOGUE
   /* ... and survives the request's answer, bounded by its own timeout */
   a = start_get(port, "/hold", &t);
   h = next_request(c);
+  anole_db_tx_options to = {sizeof to};
   to.req = h;
   CHECK(anole_db_begin(db, c, &to, 20) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 20 && r->status == ANOLE_OK);
-  tx = r->ev.handle;
+  anole_db_tx tx = r->ev.handle;
   CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
   CHECK(finish_get(a, t, NULL) == 200);
   /* Time for the request's end to reach the transaction, were it tied to
@@ -2897,22 +3490,47 @@ static void test_db_request_tie(void) {
   usleep(50 * 1000);
   CHECK(anole_db_tx_exec(tx, LIT("INSERT INTO tt VALUES (3)"), NULL, 0, NULL, 21) == ANOLE_OK);
   CHECK(anole_db_tx_commit(tx, 22) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 21 && r->status == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 22 && r->status == ANOLE_OK);
   CHECK(db_count(db, c, "tt", 23) == 1);
-
-  stop_polled(s);
-  printf("ok database queries and transactions tied to requests: cut at the deadline, kept after the answer\n");
+  printf("ok tied calls: a tied transaction survives the request's answer\n");
 }
 
-/* PostgreSQL transactions and tied queries, against ANOLE_TEST_POSTGRES_URL. */
-static void test_db_postgres_tx(void) {
+static void test_db_tie_stop(void) {
+  TEST_DB_REQUEST_TIE_PROLOGUE
+  stop_polled(s);
+}
+
+static void test_db_request_tie(void) {
+  if (!test_db_request_tie_start()) return;
+  test_db_tie_cut_at_deadline();
+  test_db_tie_kept_after_answer();
+  test_db_tie_gone_at_once_after_answer();
+  test_db_tie_streamed_answer();
+  test_db_tie_wrong_handle_kind();
+  test_db_tie_timeout_default_and_none();
+  test_db_tie_tx_rolled_back_at_deadline();
+  test_db_tie_tx_survives_answer();
+  test_db_tie_stop();
+}
+
+/* PostgreSQL transactions and tied queries, against ANOLE_TEST_POSTGRES_URL;
+   one server shared by the tests below in order. */
+static anole_server *ptx_s;
+static anole_db *ptx_db;
+static anole_consumer *ptx_c;
+
+#define TEST_DB_POSTGRES_TX_PROLOGUE anole_server *s = ptx_s; anole_db *db = ptx_db; anole_consumer *c = ptx_c; const anole_db_result_event *r = NULL; \
+  anole_str sleepers = LIT("SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(600)%' AND pid <> pg_backend_pid()"); \
+  (void)s, (void)db, (void)c, (void)r, (void)sleepers;
+
+static int test_db_postgres_tx_start(void) {
   const char *url = getenv("ANOLE_TEST_POSTGRES_URL");
   if (!anole_has_feature(LIT("postgres")) || url == NULL || url[0] == 0) {
     printf("ok postgres transactions (%s)\n", anole_has_feature(LIT("postgres")) ? "no ANOLE_TEST_POSTGRES_URL" : "not built in");
-    return;
+    return 0;
   }
   char json[4096];
   snprintf(json, sizeof json,
@@ -2930,92 +3548,113 @@ static void test_db_postgres_tx(void) {
   CHECK(anole_db_find(s, LIT("pg"), &db) == ANOLE_OK);
   CHECK(anole_server_start(s) == ANOLE_OK);
   db_flush();
-  static unsigned char rec[1 << 20];
-  const anole_db_result_event *r;
-  anole_str sum = LIT("SELECT sum(n) FROM anole_capi_acct");
 
+  ptx_s = s;
+  ptx_db = db;
+  ptx_c = c;
+  return 1;
+}
+
+static void test_db_postgres_tx_error_names_table(void) {
+  TEST_DB_POSTGRES_TX_PROLOGUE
   /* an error names its table */
   CHECK(anole_db_exec(db, c, LIT("INSERT INTO anole_capi_fk_child VALUES (999)"), NULL, 0, NULL, 1) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_DB && r->error_class == ANOLE_DB_ERR_FOREIGN_KEY && str_is(anole_event_str(r, r->table), "anole_capi_fk_child"));
+  printf("ok postgres: a foreign-key error names its table\n");
+}
 
+static void test_db_postgres_tx_serialization_409(void) {
+  TEST_DB_POSTGRES_TX_PROLOGUE
   /* serializable transactions with crossed reads and writes: one loses (409) */
+  anole_str sum = LIT("SELECT sum(n) FROM anole_capi_acct");
   anole_db_tx_options ser = {sizeof ser, 0, ANOLE_DB_ISOLATION_SERIALIZABLE, 0, 0, 0};
   CHECK(anole_db_begin(db, c, &ser, 10) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK);
   anole_db_tx ta = r->ev.handle;
   CHECK(anole_db_begin(db, c, &ser, 11) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK);
   anole_db_tx tb = r->ev.handle;
   CHECK(anole_db_tx_query(ta, sum, NULL, 0, NULL, 12) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->ev.handle == ta);
   CHECK(anole_db_tx_query(tb, sum, NULL, 0, NULL, 13) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK && r->ev.handle == tb);
   CHECK(anole_db_tx_exec(ta, LIT("UPDATE anole_capi_acct SET n = n + 1 WHERE id = 1"), NULL, 0, NULL, 14) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK);
   CHECK(anole_db_tx_exec(tb, LIT("UPDATE anole_capi_acct SET n = n + 1 WHERE id = 2"), NULL, 0, NULL, 15) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   int b_failed = r->status != ANOLE_OK;
   if (b_failed) CHECK(r->error_class == ANOLE_DB_ERR_SERIALIZATION && r->http_status == 409);
   CHECK(anole_db_tx_commit(ta, 16) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 16 && r->status == ANOLE_OK);
   CHECK(anole_db_tx_commit(tb, 17) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 17 && r->status == ANOLE_E_DB);
   if (!b_failed) CHECK(r->error_class == ANOLE_DB_ERR_SERIALIZATION && r->http_status == 409);
+  printf("ok postgres: crossed serializable transactions, one loses with 409\n");
+}
 
+static void test_db_postgres_tx_poisoned(void) {
+  TEST_DB_POSTGRES_TX_PROLOGUE
   /* a failed statement poisons the transaction: 25P02 until the rollback */
   CHECK(anole_db_begin(db, c, NULL, 20) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   anole_db_tx tp = r->ev.handle;
   CHECK(anole_db_tx_exec(tp, LIT("SELEKT 1"), NULL, 0, NULL, 21) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_DB);
   CHECK(anole_db_tx_query(tp, LIT("SELECT 1"), NULL, 0, NULL, 22) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_DB && str_is(anole_event_str(r, r->error_code), "25P02"));
   CHECK(anole_db_tx_commit(tp, 23) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_E_DB && memmem(anole_event_str(r, r->error).ptr, anole_event_str(r, r->error).len, "rolled back", 11) != NULL);
+  printf("ok postgres: a failed statement poisons the transaction (25P02 until the rollback)\n");
+}
 
+static void test_db_postgres_tx_release_cancels(void) {
+  TEST_DB_POSTGRES_TX_PROLOGUE
   /* release cancels a running statement on the server */
   CHECK(anole_db_begin(db, c, NULL, 30) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   anole_db_tx tr = r->ev.handle;
   CHECK(anole_db_tx_query(tr, LIT("SELECT pg_sleep(600)"), NULL, 0, NULL, 31) == ANOLE_OK);
   /* Released once the server runs the statement (seen from another
      connection), not after a fixed pause. */
-  anole_str sleepers = LIT("SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(600)%' AND pid <> pg_backend_pid()");
   int64_t left = 0;
   for (double until = wait_until(); left == 0;) {
     CHECK(now_ms() < until);
     CHECK(anole_db_query(db, c, sleepers, NULL, 0, NULL, 32) == ANOLE_OK);
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     CHECK(r->status == ANOLE_OK);
     left = db_cell(r, 0, 0)->v.i;
     if (left == 0) usleep(10 * 1000);
   }
   double t0 = now_ms();
   CHECK(anole_db_tx_release(tr) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 31 && r->status == ANOLE_E_GONE);
   CHECK(!timing() || now_ms() - t0 < 1500);
   left = -1;
   for (double until = wait_until(); left != 0;) {
     CHECK(now_ms() < until);
     CHECK(anole_db_query(db, c, sleepers, NULL, 0, NULL, 40) == ANOLE_OK);
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     CHECK(r->status == ANOLE_OK);
     left = db_cell(r, 0, 0)->v.i;
     if (left != 0) usleep(10 * 1000);
   }
+  printf("ok postgres: releasing a transaction cancels its running statement on the server\n");
+}
 
+static void test_db_postgres_tx_tied_query_cancels(void) {
+  TEST_DB_POSTGRES_TX_PROLOGUE
   /* a query tied to a request sends CancelRequest at the request's deadline */
   pthread_t t;
   async_req *a = start_get(port_of(s, 0), "/short", &t);
@@ -3024,22 +3663,35 @@ static void test_db_postgres_tx(void) {
   on.req = h;
   CHECK(anole_db_query(db, NULL, LIT("SELECT pg_sleep(600)"), NULL, 0, &on, 60) == ANOLE_OK);
   CHECK(finish_get(a, t, NULL) == 504);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->user_data == 60 && r->status == ANOLE_E_GONE);
-  left = -1;
+  int64_t left = -1;
   for (double until = wait_until(); left != 0;) {
     CHECK(now_ms() < until);
     CHECK(anole_db_query(db, c, sleepers, NULL, 0, NULL, 70) == ANOLE_OK);
-    r = db_next(c, rec, sizeof rec);
+    r = db_next(c, db_rec, sizeof db_rec);
     left = db_cell(r, 0, 0)->v.i;
     if (left != 0) usleep(10 * 1000);
   }
+  printf("ok postgres: a query tied to a request is canceled on the server at the deadline\n");
+}
 
+static void test_db_postgres_tx_stop(void) {
+  TEST_DB_POSTGRES_TX_PROLOGUE
   CHECK(anole_db_exec(db, c, LIT("DROP TABLE anole_capi_fk_child, anole_capi_fk_parent, anole_capi_acct"), NULL, 0, NULL, 99) == ANOLE_OK);
-  r = db_next(c, rec, sizeof rec);
+  r = db_next(c, db_rec, sizeof db_rec);
   CHECK(r->status == ANOLE_OK);
   stop_polled(s);
-  printf("ok postgres transactions: serialization 409, failed statement, release cancels, tied query cancels, error table\n");
+}
+
+static void test_db_postgres_tx(void) {
+  if (!test_db_postgres_tx_start()) return;
+  test_db_postgres_tx_error_names_table();
+  test_db_postgres_tx_serialization_409();
+  test_db_postgres_tx_poisoned();
+  test_db_postgres_tx_release_cancels();
+  test_db_postgres_tx_tied_query_cancels();
+  test_db_postgres_tx_stop();
 }
 
 static void test_abi07_rules(void) {
@@ -3048,6 +3700,10 @@ static void test_abi07_rules(void) {
   CHECK(ANOLE_ABI_COMPATIBLE(anole_abi_version()));
   CHECK(!ANOLE_ABI_COMPATIBLE(ANOLE_ABI_VERSION + 1));
   CHECK(!ANOLE_ABI_COMPATIBLE(ANOLE_ABI_VERSION - 1));
+
+  /* the library's version string export starts with a digit */
+  anole_str v = anole_version();
+  CHECK(v.len > 0 && v.ptr[0] >= '0' && v.ptr[0] <= '9');
 
   int have_sqlite = anole_has_feature(LIT("sqlite"));
   const char *json = have_sqlite
@@ -3137,20 +3793,9 @@ static void test_cleanup_rules(void) {
   CHECK(anole_req_fail(0, 500, (anole_str){0}) == ANOLE_E_INVALID && name_is("WrongHandleKind"));
   CHECK(gone_count(s) == gone);
 
-  /* anole_req_fail: an error answer in the server's error format */
-  a = start_get(port, "/hold", &t);
-  anole_req hb = next_request(c);
-  CHECK(anole_req_fail(hb, 200, LIT("nope")) == ANOLE_E_INVALID); /* still owed */
-  CHECK(anole_req_fail(hb, 404, LIT("nope")) == ANOLE_OK);
-  CHECK(finish_get(a, t, "nope") == 404);
-  a = start_get(port, "/hold", &t);
-  hb = next_request(c);
-  CHECK(anole_req_fail(hb, 0, (anole_str){0}) == ANOLE_OK);
-  CHECK(finish_get(a, t, NULL) == 500);
-
   /* a request not answered: anole_handle_release answers 500 */
   a = start_get(port, "/hold", &t);
-  hb = next_request(c);
+  anole_req hb = next_request(c);
   CHECK(anole_handle_release(hb) == ANOLE_OK);
   CHECK(finish_get(a, t, NULL) == 500);
   CHECK(anole_handle_release(hb) == ANOLE_OK);
@@ -3211,7 +3856,27 @@ static void test_cleanup_rules(void) {
   CHECK(anole_handle_release(old) == ANOLE_OK);
   CHECK(anole_req_respond(old, 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
   stop_polled(s3);
-  printf("ok cleanup calls are idempotent, wrong kinds are invalid, req_fail, req_abort, handle_release\n");
+  printf("ok cleanup calls are idempotent, wrong kinds are invalid, req_abort, handle_release\n");
+}
+
+/* anole_req_fail answers in the server's error format: a non-error status
+   is refused (the request still owed), status 0 means 500. */
+static void test_req_fail_error_format(void) {
+  anole_consumer *c = NULL;
+  anole_server *s = hold_server(&c, 5000, 500, "");
+  uint16_t port = port_of(s, 0);
+  pthread_t t;
+  async_req *a = start_get(port, "/hold", &t);
+  anole_req h = next_request(c);
+  CHECK(anole_req_fail(h, 200, LIT("nope")) == ANOLE_E_INVALID); /* still owed */
+  CHECK(anole_req_fail(h, 404, LIT("nope")) == ANOLE_OK);
+  CHECK(finish_get(a, t, "nope") == 404);
+  a = start_get(port, "/hold", &t);
+  h = next_request(c);
+  CHECK(anole_req_fail(h, 0, (anole_str){0}) == ANOLE_OK);
+  CHECK(finish_get(a, t, NULL) == 500);
+  stop_polled(s);
+  printf("ok anole_req_fail answers in the server's error format\n");
 }
 
 static void test_error_identity(void) {
@@ -3758,7 +4423,7 @@ static void test_set_wake(void) {
   c2.fd = dial(port);
   send_request(c2.fd, "GET", "/hold", NULL, 0);
   struct pollfd p = {(int)fd, POLLIN, 0};
-  CHECK(poll(&p, 1, 3000) == 1);
+  CHECK(poll(&p, 1, (int)wait_ms()) == 1);
   (void)next_request(c);
   CHECK(atomic_load(&wake_a) == a_before);
   /* and another callback */
@@ -3817,7 +4482,7 @@ static void test_ws_writable_and_sent(void) {
   }
   static _Alignas(8) unsigned char buf[64 * 1024];
   int writable = 0;
-  for (int tries = 0; tries < 100 && !writable; tries++) {
+  for (double until = wait_until(); !writable && now_ms() < until;) {
     int64_t n = anole_poll_wait(c, buf, sizeof buf, 100);
     CHECK(n >= 0);
     for (int64_t off = 0; off < n;) {
@@ -4044,9 +4709,10 @@ static int two_frames(const net_seen *s) { return s->opened && s->nframes >= 2; 
 static int is_closed(const net_seen *s) { return s->closed; }
 static int got_datagram(const net_seen *s) { return s->ndatagrams >= 1; }
 
-static void test_net(void) {
+/* Addresses: parsed and formatted; a short buffer is TOOBIG, a host name
+   is not an address. */
+static void test_net_addresses(void) {
   if (!anole_has_feature(NET_STR("net"))) return;
-  /* addresses */
   anole_net_addr a;
   CHECK(anole_net_addr_parse(NET_STR("[2001:db8::1]:443"), &a) == ANOLE_OK);
   CHECK(a.family == 6 && a.port == 443);
@@ -4055,7 +4721,21 @@ static void test_net(void) {
   CHECK(n == 17 && memcmp(text, "[2001:db8::1]:443", 17) == 0);
   CHECK(anole_net_addr_format(&a, text, 4) == ANOLE_E_TOOBIG);
   CHECK(anole_net_addr_parse(NET_STR("example.com:80"), &a) == ANOLE_E_INVALID);
+  printf("ok net addresses: parse and format\n");
+}
 
+/* Raw TCP and UDP listeners, one server shared by the tests below. */
+static anole_server *net_s;
+static anole_consumer *net_c;
+static uint16_t net_tcp_port, net_udp_port;
+
+#define TEST_NET_PROLOGUE anole_server *s = net_s; anole_consumer *c = net_c; \
+  anole_listener_info li = {sizeof li}, ui = {sizeof ui}; \
+  li.port = net_tcp_port; ui.udp_port = net_udp_port; \
+  (void)s, (void)c, (void)li, (void)ui;
+
+static int test_net_start(void) {
+  if (!anole_has_feature(NET_STR("net"))) return 0;
   const char *json = "{\"executors\":1,\"timeouts\":{\"shutdown_ms\":500},\"listeners\":["
                      "{\"name\":\"chat\",\"address\":\"127.0.0.1\",\"port\":0,"
                      "\"tcp\":{\"handler\":5,\"framing\":{\"lines\":{}}}},"
@@ -4070,6 +4750,15 @@ static void test_net(void) {
   CHECK(anole_server_listener(s, 1, &ui) == ANOLE_OK);
   CHECK((ui.flags & ANOLE_LISTENER_F_UDP) && ui.port == 0 && ui.udp_port != 0);
 
+  net_s = s;
+  net_c = c;
+  net_tcp_port = li.port;
+  net_udp_port = ui.udp_port;
+  return 1;
+}
+
+static void test_net_tcp(void) {
+  TEST_NET_PROLOGUE
   /* TCP: two lines in, two framed replies out, then the end */
   int fd = dial(li.port);
   CHECK(write(fd, "hello\nworld\n", 12) == 12);
@@ -4095,7 +4784,11 @@ static void test_net(void) {
   CHECK(anole_net_write(seen.conn, "x", 1, 0) == ANOLE_E_GONE);
   CHECK(anole_handle_release(seen.conn) == ANOLE_OK);
   CHECK(anole_net_write(0, "x", 1, 0) == ANOLE_E_INVALID);
+  printf("ok raw TCP: framed lines both ways, FIN, stale handles\n");
+}
 
+static void test_net_udp(void) {
+  TEST_NET_PROLOGUE
   /* UDP: one datagram in, one out through anole_net_udp_send, found by name */
   int ufd = socket(AF_INET, SOCK_DGRAM, 0);
   CHECK(ufd >= 0);
@@ -4114,7 +4807,7 @@ static void test_net(void) {
   CHECK(anole_net_udp_send(us.udp, &reply, 1, 0) == ANOLE_OK);
   char dg[16];
   struct pollfd pfd = {ufd, POLLIN, 0};
-  CHECK(poll(&pfd, 1, 5000) == 1);
+  CHECK(poll(&pfd, 1, (int)wait_ms()) == 1);
   CHECK(recv(ufd, dg, sizeof dg, 0) == 4 && memcmp(dg, "pong", 4) == 0);
   anole_net_udp found = 0;
   CHECK(anole_net_udp_find(s, NET_STR("game"), &found) == ANOLE_OK && found != 0);
@@ -4130,8 +4823,14 @@ static void test_net(void) {
     usleep(2000);
   }
   CHECK(st.udp_datagrams_in >= 1 && st.udp_datagrams_out >= 1);
+  printf("ok raw UDP: a datagram in, one out, the listener found by name, counted\n");
   stop_polled(s);
-  printf("ok raw TCP and UDP: framed lines, FIN, stale handles, datagrams, addresses\n");
+}
+
+static void test_net(void) {
+  if (!test_net_start()) return;
+  test_net_tcp();
+  test_net_udp();
 }
 
 static void test_publish_order(void) {
@@ -4193,7 +4892,9 @@ static int run_tests(void) {
   start_watchdog(600);
   anole_str ws = {"websocket", 9};
   have_websocket = anole_has_feature(ws);
-  test_basics();
+  test_bad_config_refused();
+  test_older_options_struct();
+  test_handler_routes_need_consumer();
   test_route_conflicts();
   test_main_server();
   test_stale_across_servers();
@@ -4209,6 +4910,7 @@ static int run_tests(void) {
   test_db_request_tie();
   test_db_postgres_tx();
   test_cleanup_rules();
+  test_req_fail_error_format();
   test_error_identity();
   test_abort_reasons();
   test_sent_once();
@@ -4226,6 +4928,7 @@ static int run_tests(void) {
   test_ws_accept();
   test_ws_subprotocols_auto();
   test_publish_order();
+  test_net_addresses();
   test_net();
   printf("PASS\n");
   return 0;

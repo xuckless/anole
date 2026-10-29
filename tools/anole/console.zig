@@ -363,7 +363,7 @@ fn installSignalHandlers() void {
     std.posix.sigaction(.INT, &act, null);
 }
 
-test "console args" {
+test "anole console: options parse, and an unknown option or a missing value is refused" {
     const a = try parseArgs(&.{ "api", "--snapshot", "conns", "--wedge-timeout", "9" });
     try std.testing.expectEqualStrings("api", a.target.?);
     try std.testing.expectEqualStrings("conns", a.snapshot.?);
