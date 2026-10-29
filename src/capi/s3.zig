@@ -13,6 +13,7 @@
 //! A write returns once its bytes are buffered; back-pressure is
 //! `ANOLE_BUSY`, `ANOLE_E_AGAIN` and `ANOLE_EV_WRITABLE`, never a wait.
 const std = @import("std");
+const builtin = @import("builtin");
 const dusty = @import("dusty");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
@@ -254,6 +255,20 @@ fn transferOf(e: *Engine, hv: u64) ?Found {
     if (@as(u32, @intCast(w >> 32)) != h.gen) return null;
     if (@as(TState, @fromBackingInt(@intCast(w & 0xFFFFFFFF))) != .open) return null;
     return .{ t, h };
+}
+
+/// A test hook (test builds only): while set, the next transfer call
+/// (`uploadWrite`, `uploadFinish`, `readMore`, `release`) takes it and,
+/// once it has found its transfer, holds before the slot's lock until the
+/// test sets `release`, so a test can end that transfer on the executor
+/// and open another in its slot meanwhile.
+pub var test_transfer_hold: if (builtin.is_test) std.atomic.Value(?*engine.TestPin) else void = if (builtin.is_test) .init(null) else {};
+
+fn testTransferHold() void {
+    if (comptime !builtin.is_test) return;
+    const p = test_transfer_hold.swap(null, .acq_rel) orelse return;
+    p.held.store(true, .release);
+    while (!p.release.load(.acquire)) std.Thread.yield() catch {};
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,6 +1152,7 @@ pub fn uploadWrite(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerErro
     if (comptime !features.s3) return error.Unsupported;
     if (flags != 0) return error.Invalid;
     const t, const h = transferOf(e, hv) orelse return e.gone();
+    testTransferHold();
     if (t.kind != .upload) return error.WrongKind;
     var buf: [2048]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = undefined;
@@ -1173,6 +1189,7 @@ pub fn uploadWrite(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerErro
 pub fn uploadFinish(e: *Engine, hv: u64, user_data: u64) AnswerError!void {
     if (comptime !features.s3) return error.Unsupported;
     const t, const h = transferOf(e, hv) orelse return e.gone();
+    testTransferHold();
     if (t.kind != .upload) return error.WrongKind;
     var buf: [2048]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = undefined;
@@ -1198,6 +1215,7 @@ pub fn uploadFinish(e: *Engine, hv: u64, user_data: u64) AnswerError!void {
 pub fn readMore(e: *Engine, hv: u64, bytes: u32) AnswerError!void {
     if (comptime !features.s3) return error.Unsupported;
     const t, const h = transferOf(e, hv) orelse return e.gone();
+    testTransferHold();
     if (t.kind != .download) return error.WrongKind;
     _ = t.credit.fetchAdd(bytes, .acq_rel);
     kick(t, h);
@@ -1207,6 +1225,7 @@ pub fn readMore(e: *Engine, hv: u64, bytes: u32) AnswerError!void {
 pub fn release(e: *Engine, hv: u64) AnswerError!void {
     if (comptime !features.s3) return error.Unsupported;
     const t, const h = transferOf(e, hv) orelse return error.Over;
+    testTransferHold();
     t.released.store(true, .release);
     kick(t, h);
 }
