@@ -90,6 +90,11 @@ breaking changes are listed anyway.
   that timed out, refuses `anole_db_tx_query`, `_exec`, `_commit` and
   `_rollback` with `ANOLE_E_GONE` at once, as documented. They were taken
   until the transaction's task had rolled it back.
+- C ABI: an S3 transfer call (`anole_s3_upload_write`, `_upload_finish`,
+  `anole_s3_read_more`, `anole_handle_release`) made while its transfer
+  ended could act on the transfer opened next in the same slot. It now
+  checks the transfer again under the slot's lock and answers
+  `ANOLE_E_GONE` (a release: `ANOLE_OK`, as for any ended handle).
 
 ### Changed
 
