@@ -544,7 +544,7 @@ fn expectViolations(sink: *const Collector, expected: []const [3][]const u8) !vo
     }
 }
 
-test "json: every type of the section 7 table" {
+test "json: each field type takes its own JSON kind, refuses the others, and numbers stop at their type's edges" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
