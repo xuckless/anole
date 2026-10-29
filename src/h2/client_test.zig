@@ -560,7 +560,7 @@ test "h2 client: the system trust store by default, a CA in memory, mutual TLS f
     }
 }
 
-/// dusty's client (HTTP/2 on) and a TLS server with an h2 listener and an
+/// The core's client (HTTP/2 on) and a TLS server with an h2 listener and an
 /// HTTP/1.1-only one. On the heap, so the client and the listeners stay
 /// where they were made.
 const DustyH2 = struct {
