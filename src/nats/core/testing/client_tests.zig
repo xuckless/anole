@@ -12,6 +12,7 @@ const test_wait = @import("anole_test_wait");
 const nats = @import("../root.zig");
 const Client = nats.Client;
 const FakeServer = @import("FakeServer.zig");
+const probe = @import("probe.zig");
 const golden = @import("../protocol/golden.zig");
 const time = @import("../engine/time.zig");
 
@@ -42,7 +43,7 @@ fn serveNormally(io: Io, listener: *net.Server) !void {
 
 const quick: nats.FlushOptions = .{ .timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } } };
 
-test "connect, flush, rtt and close" {
+test "a connected client flushes and measures rtt; after close() it reports no server and refuses flush and connect" {
     const io = testing.io;
     var listener = try FakeServer.listen(io);
     defer listener.deinit(io);
@@ -500,22 +501,38 @@ test "with reconnect off, a -ERR that ends the connection closes the client" {
     try server.await(io);
 }
 
+/// Takes every connection and closes it before INFO, until canceled;
+/// counts them.
+fn serveRefusing(io: Io, listener: *net.Server, accepted: *std.atomic.Value(u32)) !void {
+    while (true) {
+        var peer: FakeServer.Peer = undefined;
+        try peer.accept(io, listener);
+        _ = accepted.fetchAdd(1, .monotonic);
+        peer.close();
+    }
+}
+
 test "connect tries the servers in order" {
     const io = testing.io;
-    // A port nobody listens on comes first.
-    var gone = try FakeServer.listen(io);
-    var gone_url: [64]u8 = undefined;
-    const dead = try FakeServer.url(&gone, &gone_url);
-    gone.deinit(io);
+    // A server that hangs up before INFO comes first. Not a closed port:
+    // Windows takes seconds to refuse a connection on loopback.
+    var refusing = try FakeServer.listen(io);
+    defer refusing.deinit(io);
+    var refused: std.atomic.Value(u32) = .init(0);
+    var first = try io.concurrent(serveRefusing, .{ io, &refusing, &refused });
+    defer first.cancel(io) catch {};
+    var first_url: [64]u8 = undefined;
 
     var listener = try FakeServer.listen(io);
     defer listener.deinit(io);
     var server = try io.concurrent(serveNormally, .{ io, &listener });
     defer server.cancel(io) catch {};
     var url: [64]u8 = undefined;
-    var client: Client = try .init(testing.allocator, io, .{ .servers = &.{ dead, try FakeServer.url(&listener, &url) }, .randomize_servers = false });
+    var client: Client = try .init(testing.allocator, io, .{ .servers = &.{ try FakeServer.url(&refusing, &first_url), try FakeServer.url(&listener, &url) }, .randomize_servers = false });
     defer client.deinit();
     try client.connect();
+    // The first was tried, and the client is on the second.
+    try testing.expect(refused.load(.monotonic) >= 1);
     const server_address = client.connectedServer() orelse return error.TestNotConnected;
     try testing.expectEqual(listener.socket.address.getPort(), server_address.port);
     client.close();
@@ -605,11 +622,12 @@ fn expectSecondConnectWaits(reject: bool) !void {
     var first = try io.concurrent(connectAndNote, .{ &client, &first_noted });
     defer first.cancel(io) catch {};
     try awaitState(&client, .connecting);
+    try test_wait.waitUntil(io, "the first connect() waits", &client, probe.stateWaitersAtLeastOne);
     var second_noted: nats.State = .disconnected;
     var second = try io.concurrent(connectAndNote, .{ &client, &second_noted });
     defer second.cancel(io) catch {};
-    // A second connect() that does not wait has returned by now.
-    try io.sleep(.fromMilliseconds(20), .awake);
+    // Both calls wait for the attempt before the server answers.
+    try test_wait.waitUntil(io, "both connect() calls wait", &client, probe.stateWaitersAtLeastTwo);
     release.set(io);
     if (reject) {
         try testing.expectError(error.AuthenticationFailed, first.await(io));

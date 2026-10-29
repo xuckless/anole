@@ -301,7 +301,7 @@ test "a request times out at its deadline, and its reply counts as late when it 
     try testing.expectEqual(0, s.client.inbox.pendingCount(io));
     // The server sends the reply before it answers this PING.
     try s.client.flush(quick);
-    try testing.expectEqual(1, s.client.inbox.lateResponses(io));
+    try testing.expectEqual(1, s.client.stats().late_responses);
     try s.finish();
 }
 
@@ -642,13 +642,25 @@ test "requestMany: the stream ends at its deadline, and what came before comes o
     var s: Served = undefined;
     try s.start(.{ .servers = &.{} });
     defer s.deinit();
-    // Ample time for both replies, wherever timers are coarse.
-    const responses = try s.client.requestMany("many.2", "?", many(1000, 32));
+    const responses = try s.client.requestMany("many.2", "?", many(100, 32));
     defer responses.deinit();
     const deadline = responses.deadline;
-    try expectResponse(responses, "r1");
-    try expectResponse(responses, "r2");
-    try testing.expect(try responses.next(.{}) == null);
+    // Time passes on purpose, up to the deadline.
+    while (!time.expired(io, deadline)) try io.sleep(.fromMilliseconds(5), .awake);
+    // What came by the deadline comes out, in order, then the end. How many
+    // came in time depends on the machine's speed (none, one or both); which
+    // ones and in what order does not.
+    const received = responses.messages.stats(io).received;
+    const expected = [_][]const u8{ "r1", "r2" };
+    var taken: usize = 0;
+    while (try responses.next(.{})) |message| {
+        var m = message;
+        defer m.deinit();
+        if (taken == expected.len) return error.TestTooManyResponses;
+        try testing.expectEqualStrings(expected[taken], m.payload);
+        taken += 1;
+    }
+    try testing.expect(taken >= received);
     try testing.expect(time.expired(io, deadline));
     try testing.expectEqual(0, s.client.inbox.pendingCount(io));
     try s.finish();
