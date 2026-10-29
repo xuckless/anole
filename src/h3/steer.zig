@@ -293,21 +293,18 @@ test "steering in the kernel: each datagram reaches the socket its ID names" {
             try sendTo(client, address, packet);
             // Only socket i has it.
             for (fds, 0..) |fd, j| {
-                const n = receiveNow(fd, &rx);
-                if (j == i) {
-                    try std.testing.expectEqual(packet.len, n orelse return error.NotSteered);
-                } else {
-                    try std.testing.expectEqual(@as(?usize, null), n);
-                }
+                const ours = receiveOurs(fd, &rx, packet);
+                try std.testing.expectEqual(j == i, ours);
             }
         }
     }
     // Detached: the hash decides; something receives it all the same.
     try detach(fds[0]);
     const cid = ourCid(3);
-    try sendTo(client, address, shortPacket(&buf, &cid));
+    const last = shortPacket(&buf, &cid);
+    try sendTo(client, address, last);
     var got: usize = 0;
-    for (fds) |fd| if (receiveNow(fd, &rx) != null) {
+    for (fds) |fd| if (receiveOurs(fd, &rx, last)) {
         got += 1;
     };
     try std.testing.expectEqual(@as(usize, 1), got);
@@ -324,6 +321,17 @@ fn sendTo(fd: std.posix.fd_t, to: std.Io.net.IpAddress, data: []const u8) !void 
     var storage: std.Io.Threaded.PosixAddress = undefined;
     const len = std.Io.Threaded.addressToPosix(&to, &storage);
     if (std.c.sendto(fd, data.ptr, data.len, 0, &storage.any, len) != @as(isize, @intCast(data.len))) return error.SendFailed;
+}
+
+/// Whether `packet` reached `fd`. The sockets sit on an ephemeral loopback
+/// port, which another test's QUIC client may still be sending to (a
+/// 1200-byte datagram, cut to `buf`'s length): datagrams that are not
+/// `packet` are skipped, not counted.
+fn receiveOurs(fd: std.posix.fd_t, buf: []u8, packet: []const u8) bool {
+    while (receiveNow(fd, buf)) |n| {
+        if (std.mem.eql(u8, buf[0..n], packet)) return true;
+    }
+    return false;
 }
 
 /// A datagram waiting on `fd` within 200 ms, or null.
