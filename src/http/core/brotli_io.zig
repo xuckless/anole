@@ -226,6 +226,8 @@ test "brotli_io: an encoder's large blocks are reused by the next, and trimmed w
     defer text.deinit();
     for (0..400) |i| try text.writer.print("{{\"id\":{d},\"name\":\"item {d}\"}},", .{ i, i % 13 });
     const input = text.written();
+    // Other tests on this thread may have left blocks (up to `max_cached`).
+    block_cache.drainLocalForTest();
 
     var after_first: usize = 0;
     for (0..3) |round| {
@@ -253,10 +255,9 @@ test "brotli_io: an encoder's large blocks are reused by the next, and trimmed w
     var zs: [2]Compress = undefined;
     for (&zs, &outs) |*z, *o| try z.init(&o.writer, &.{}, .{});
     for (&zs) |*z| try z.writer.writeAll(input);
-    for (&zs) |*z| {
-        try z.finish();
-        z.deinit();
-    }
+    // Both finish (and hold their blocks) before either gives them back.
+    for (&zs) |*z| try z.finish();
+    for (&zs) |*z| z.deinit();
     try std.testing.expect(block_cache.cached().count > block_cache.trim_keep);
     block_cache.trimLocal(); // the low mark of the interval that just ended
     block_cache.trimLocal(); // nothing taken since: down to trim_keep

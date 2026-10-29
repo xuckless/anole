@@ -156,6 +156,18 @@ pub fn cached() struct { count: usize, bytes: usize } {
     return .{ .count = cache.count, .bytes = cache.bytes };
 }
 
+/// Tests only: unmaps every block the calling thread's cache holds, so a
+/// test starts from an empty cache whatever ran before it on the thread.
+pub fn drainLocalForTest() void {
+    if (!@import("builtin").is_test) @compileError("drainLocalForTest is for tests");
+    while (cache.first) |f| {
+        cache.first = f.next;
+        const block: [*]align(16) u8 = @ptrCast(f);
+        page_allocator.rawFree(block[0..f.len], .fromByteUnits(std.heap.pageSize()), @returnAddress());
+    }
+    cache = .{};
+}
+
 /// `alloc` and `free` as a `std.mem.Allocator`, for alignments up to 16.
 pub const allocator: std.mem.Allocator = .{ .ptr = undefined, .vtable = &.{
     .alloc = vtableAlloc,
@@ -174,8 +186,8 @@ fn vtableFree(_: *anyopaque, memory: []u8, _: std.mem.Alignment, _: usize) void 
 }
 
 test "block_cache: large blocks are kept and reused, small ones are malloc's" {
-    trimLocal();
-    trimLocal();
+    // Other tests on this thread may have left blocks (up to `max_cached`).
+    drainLocalForTest();
     const before = cached();
     const small = try allocator.alloc(u8, 100);
     allocator.free(small);
