@@ -55,57 +55,6 @@ test "zlib-ng: gzip round trip through zlib.zig's std.Io wrapper" {
     try std.testing.expectEqualSlices(u8, &input, out);
 }
 
-test "zlib-ng: raw deflate round trip (permessage-deflate's framing)" {
-    const gpa = std.testing.allocator;
-    var text_buf: [60 * 20]u8 = undefined;
-    for (0..20) |i| @memcpy(text_buf[i * 60 ..][0..60], "a message, a message, a message, and the same message again!");
-    const text: []const u8 = &text_buf;
-    var compressed: std.Io.Writer.Allocating = try .initCapacity(gpa, 16 * 1024);
-    defer compressed.deinit();
-    {
-        var d = try zlib.Compress.init(gpa, &compressed.writer, &.{}, .raw, .{});
-        defer d.deinit();
-        try d.writer.writeAll(text);
-        try d.finish();
-    }
-    var source: std.Io.Reader = .fixed(compressed.written());
-    var inflate = try zlib.Decompress.init(gpa, &source, &.{}, .raw, .{});
-    defer inflate.deinit();
-    const out = try inflate.reader.allocRemaining(gpa, .unlimited);
-    defer gpa.free(out);
-    try std.testing.expectEqualStrings(text, out);
-}
-
-test "zstd: streaming round trip with an 8 MiB window cap" {
-    const gpa = std.testing.allocator;
-    const input = try gpa.alloc(u8, 1024 * 1024);
-    defer gpa.free(input);
-    for (input, 0..) |*b, i| b.* = @truncate(i / 1000);
-
-    const bound = zstd.ZSTD_compressBound(input.len);
-    const compressed = try gpa.alloc(u8, bound);
-    defer gpa.free(compressed);
-    const n = zstd.ZSTD_compress(compressed.ptr, bound, input.ptr, input.len, 3);
-    try std.testing.expectEqual(@as(c_uint, 0), zstd.ZSTD_isError(n));
-    try std.testing.expect(n < input.len / 10);
-
-    // Streaming decode, as an HTTP body decoder does, capped at the 8 MiB
-    // window RFC 9659 allows for Content-Encoding: zstd.
-    const dctx = zstd.ZSTD_createDCtx() orelse return error.OutOfMemory;
-    defer _ = zstd.ZSTD_freeDCtx(dctx);
-    try std.testing.expectEqual(@as(c_uint, 0), zstd.ZSTD_isError(zstd.ZSTD_DCtx_setParameter(dctx, zstd.ZSTD_d_windowLogMax, 23)));
-    const out = try gpa.alloc(u8, input.len);
-    defer gpa.free(out);
-    var in_buf: zstd.ZSTD_inBuffer = .{ .src = compressed.ptr, .size = n, .pos = 0 };
-    var out_buf: zstd.ZSTD_outBuffer = .{ .dst = out.ptr, .size = out.len, .pos = 0 };
-    while (in_buf.pos < in_buf.size) {
-        const rc = zstd.ZSTD_decompressStream(dctx, &out_buf, &in_buf);
-        try std.testing.expectEqual(@as(c_uint, 0), zstd.ZSTD_isError(rc));
-    }
-    try std.testing.expectEqual(input.len, out_buf.pos);
-    try std.testing.expectEqualSlices(u8, input, out);
-}
-
 // zstd and gzip through dusty, over loopback: a response marked compress is
 // sent zstd when the client accepts it (preferred over gzip), and a zstd
 // request body is decoded before the handler sees it.

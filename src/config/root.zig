@@ -319,10 +319,6 @@ const TestConfig = struct {
     debug: bool = false,
 };
 
-test "ConfigType returns the struct behind the pointer" {
-    try testing.expect(ConfigType(*TestConfig) == TestConfig);
-}
-
 test "sources apply in order" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

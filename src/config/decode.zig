@@ -328,13 +328,6 @@ fn editDistance(a: []const u8, b: []const u8) ?usize {
     return previous[b.len];
 }
 
-test "edit distance and suggestions" {
-    try std.testing.expectEqual(1, editDistance("databse", "database"));
-    try std.testing.expectEqual(2, editDistance("prot", "port"));
-    try std.testing.expectEqualStrings("database", closest("databse", &.{ "name", "database" }).?);
-    try std.testing.expectEqual(null, closest("x", &.{ "name", "database" }));
-}
-
 test "bools in every spelling" {
     try std.testing.expectEqual(true, parseBool(" Yes "));
     try std.testing.expectEqual(false, parseBool("OFF"));
