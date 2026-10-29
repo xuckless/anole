@@ -142,6 +142,24 @@ const Client = struct {
         }
     }
 
+    /// `pumpUntil` bounded by `test_wait.deadline()`: the pump runs as its
+    /// own task, so a peer that never gets to `done` fails as a named wait
+    /// instead of a read that never returns (the socket has no timeout).
+    fn pumpUntilBounded(self: *Client, comptime what: []const u8, done: *const fn (*Client) bool) !void {
+        var finished: std.Io.Event = .unset;
+        var pump = try self.io.concurrent(struct {
+            fn run(cl: *Client, d: *const fn (*Client) bool, ev: *std.Io.Event) anyerror!void {
+                defer ev.set(cl.io);
+                try cl.pumpUntil(d);
+            }
+        }.run, .{ self, done, &finished });
+        test_wait.waitEvent(self.io, what, &finished) catch |err| {
+            pump.cancel(self.io) catch {};
+            return err;
+        };
+        try pump.await(self.io);
+    }
+
     fn open(self: *Client) !void {
         // nghttp2 lets :protocol out only once the server's SETTINGS allow it.
         try self.pumpUntil(struct {
@@ -761,7 +779,7 @@ test "WebSocket over HTTP/2: a room member that stops reading is closed, its str
     // Its stream ends: what was queued drains, then the server ends or
     // resets the stream.
     client.discard = true;
-    try client.pumpUntil(struct {
+    try client.pumpUntilBounded("the slow member's stream ended or was reset", struct {
         fn ended(cl: *Client) bool {
             return cl.closed or cl.remote_ended;
         }

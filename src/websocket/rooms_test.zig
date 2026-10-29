@@ -237,7 +237,7 @@ test "Rooms: a broadcast does not wait for a member that stopped reading, and a 
     defer _ = first.cancel(io);
     try wait.waitFlag(io, "the first broadcast returned", &done);
     try std.testing.expectEqual(@as(usize, 2), first.await(io));
-    try stalled.entered.wait(io);
+    try wait.waitEvent(io, "the first broadcast's send reached the stalled member", &stalled.entered);
 
     // What follows queues up for the stalled member until it is full; then
     // messages are skipped for it, and once its send has been stuck for

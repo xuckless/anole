@@ -624,7 +624,7 @@ test "sse: on_full=close with a stuck sender: the tick past close_after aborts t
     defer c.deinit();
     const rio = c.rt.io();
     _ = try c.hub.publish("t", .{ .data = "first" });
-    c.f.held.wait(rio) catch unreachable;
+    try wait.waitEvent(rio, "the stuck sender's first write", &c.f.held);
     // Fill the queue: the subscriber is ending (slow) with its sender stuck.
     for (0..20) |_| _ = try c.hub.publish("t", .{ .data = "more" });
     try std.testing.expectEqual(@as(u64, 1), c.hub.stats().closed_slow);
