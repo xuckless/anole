@@ -200,6 +200,18 @@ test "Handle: the kind in bits 28-32; every kind, the last slot and the last gen
     }
 }
 
+test "capi engine: every handle kind but the reserved db_query has an entry in abi.handle_kinds with its number and name" {
+    inline for (@typeInfo(Handle.Kind).@"enum".fields) |f| {
+        if (f.value == @backingInt(Handle.Kind.db_query)) continue;
+        var found = false;
+        for (abi.handle_kinds) |k| if (k.kind == f.value) {
+            try std.testing.expectEqualStrings(f.name, k.name);
+            found = true;
+        };
+        try std.testing.expect(found);
+    }
+}
+
 /// Generations count 1..max_gen and wrap to 1 (0 is never valid).
 pub const max_gen: u32 = std.math.maxInt(u28);
 
