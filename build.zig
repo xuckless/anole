@@ -977,6 +977,11 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_ui_tests.step);
         compile_tests_step.dependOn(&ui_tests.step);
         b.step("console-ui-test", "Run the live console's std-only module tests (protocol, keys, screen, app, restart plan)").dependOn(&run_ui_tests.step);
+        // Its "fuzz:" targets alone (frame decode, key parser), for `zig build fuzz`.
+        const ui_fuzz = addSafeTest(b, .{ .name = "console-ui-fuzz", .root_module = ui_tests.root_module, .filters = &.{"fuzz:"}, .use_llvm = use_llvm });
+        const run_ui_fuzz = b.addRunArtifact(ui_fuzz);
+        run_ui_fuzz.skip_foreign_checks = true;
+        fuzz_step.dependOn(&run_ui_fuzz.step);
     }
 
     // test-postgres: the PostgreSQL tests alone ("pg: ...", the jobs
