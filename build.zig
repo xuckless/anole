@@ -767,8 +767,12 @@ pub fn build(b: *std.Build) void {
     // `-Dtest-shards=N` runs the main suite as N processes of the same
     // binary in parallel (ANOLE_TEST_SHARD=i/N, src/safety/test_runner.zig)
     // and the HTTP core's as max(1, N/2), 4 and 2 by default;
-    // each shard's tests are its index modulo N.
-    const test_shards = b.option(u32, "test-shards", "Run anole-test as N parallel shards and core-test as max(1, N/2) (default 4; 1 runs each suite as one process)") orelse 4;
+    // each shard's tests are its index modulo N. With a live server
+    // (`-D*-test-url`, `-Dredis-test-port`) the default is 1: the live
+    // tests share fixed databases and tables on it (anole_whtest_icu, the
+    // jobs suite's jtest_*), and shards running them at once break each other.
+    const live_server = redis_test_port != null or redis_test_url != null or postgres_test_url != null or mongodb_test_url != null or nats_test_url != null or kafka_test_url != null or s3_test_url != null or smtp_test_url != null;
+    const test_shards = b.option(u32, "test-shards", "Run anole-test as N parallel shards and core-test as max(1, N/2) (default 4, or 1 with a live server URL; 1 runs each suite as one process)") orelse if (live_server) @as(u32, 1) else 4;
     if (test_shards == 0) @panic("-Dtest-shards must be at least 1");
     for (addShardedRuns(b, tests, test_shards)) |run_tests| {
         run_tests.skip_foreign_checks = true;
