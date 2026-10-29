@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const low = @import("udp.zig");
 const sessions_mod = @import("sessions.zig");
 const handoff = @import("../handoff.zig");
@@ -258,7 +259,7 @@ pub const UdpSocket = struct {
     table: ?SessionNode = null,
 
     // Cross-task sends (any thread), under `qlock`.
-    qlock: std.atomic.Mutex = .unlocked,
+    qlock: safety.SpinLock(.leaf) = .init,
     pending: std.ArrayList(Pending) = .empty,
     pending_buf: std.ArrayList(u8) = .empty,
     queue_bytes: usize = 0,
@@ -314,7 +315,7 @@ pub const UdpSocket = struct {
     }
 
     fn lockQ(s: *UdpSocket) void {
-        while (!s.qlock.tryLock()) std.atomic.spinLoopHint();
+        s.qlock.lock();
     }
 
     /// A datagram to `to` (from `from` when given): any task or thread;

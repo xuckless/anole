@@ -17,6 +17,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
 const anole_log = @import("anole_log");
+const safety = @import("anole_safety");
 const framing_mod = @import("framing.zig");
 const net_metrics = @import("metrics.zig");
 
@@ -604,7 +605,7 @@ pub const TcpListener = struct {
 const Driver = struct {
     io: std.Io = undefined,
     state: std.atomic.Value(u32) = .init(0),
-    start_lock: std.Io.Mutex = .init,
+    start_lock: safety.Mutex(.leaf) = .init,
     stack: std.atomic.Value(?*TcpConn) = .init(null),
     signal: placement.Signal = .{},
     stopped: std.atomic.Value(bool) = .init(false),
@@ -693,7 +694,7 @@ const TcpConn = struct {
 
     // Writing (any thread): `lock` guards `out`, `scheduled`, `dead`,
     // `ended`. Never held across I/O.
-    lock: std.atomic.Mutex = .unlocked,
+    lock: safety.SpinLock(.leaf) = .init,
     out: std.ArrayList(Chunk) = .empty,
     out_bytes: usize = 0,
     scheduled: bool = false,
@@ -724,7 +725,7 @@ const TcpConn = struct {
     release_waiting: std.atomic.Value(bool) = .init(false),
     writable_pending: std.atomic.Value(bool) = .init(false),
     /// Serves callbacks one at a time on the Zig path.
-    cb_lock: std.Io.Mutex = .init,
+    cb_lock: safety.IoLock = .init,
     ending: bool = false,
 
     // Reading (its task).
@@ -950,7 +951,7 @@ const TcpConn = struct {
     // -- Writing: queue --------------------------------------------------------
 
     fn spinLock(t: *TcpConn) void {
-        while (!t.lock.tryLock()) std.atomic.spinLoopHint();
+        t.lock.lock();
     }
 
     /// Appends `parts` as one piece of the outbox. `token` nonzero: one

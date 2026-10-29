@@ -19,6 +19,7 @@
 const std = @import("std");
 const anole = @import("../root.zig");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const abi = @import("abi.zig");
 const engine = @import("engine.zig");
 const config_mod = @import("config.zig");
@@ -50,7 +51,7 @@ pub const NetSlot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
     /// Over `conn`: a call from a consumer thread holds it while it uses
     /// the connection, `retire` while it takes it away. Never across I/O.
-    lock: std.atomic.Mutex = .unlocked,
+    lock: safety.SpinLock(.leaf) = .init,
     conn: ?*net.Conn = null,
     state: *TcpState = undefined,
     /// Bytes of this connection posted and not yet polled.
@@ -62,7 +63,7 @@ pub const NetSlot = struct {
     next_free: u32 = engine.no_slot,
 
     fn acquire(s: *NetSlot) void {
-        while (!s.lock.tryLock()) std.atomic.spinLoopHint();
+        s.lock.lock();
     }
     fn release(s: *NetSlot) void {
         s.lock.unlock();
