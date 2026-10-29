@@ -7,6 +7,13 @@ breaking changes are listed anyway.
 
 ### Fixed
 
+- net: a UDP send racing the stop answers Closed instead of being dropped
+  uncounted. It used to be taken after the sender's last drain, answer
+  success and never go out.
+- net: sends take no lock; a connection's helper tasks belong to it and end
+  before it is freed. A send from another thread costs one allocation, as
+  before; small sends from the connection's executor share one.
+- C ABI: `anole_net_write` no longer allocates under a lock.
 - SSE: an event written through `EventStream.startSend` (the streaming
   `EventWriter`) now encodes its data as `send` does. Data ending in a CR or
   LF kept its last line break off the wire, so browsers delivered `"hi"` for

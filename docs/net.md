@@ -121,6 +121,9 @@ any time. Bytes leave in the order sends were made.
 - `error.Closed` and `error.Ended` say the connection is over, or that this
   side was ended.
 
+From another thread a send costs one allocation; from a task on the
+connection's executor, small sends share one.
+
 A peer that stops reading does not hold anything up: past `write_timeout`
 (30 s) of no progress the connection closes (reason `.write_timeout`).
 
@@ -213,7 +216,8 @@ try app.udp(":7001", Game, .{ .sessions = .{ .idle_timeout = .fromSeconds(30) } 
   the batch's other replies in one `sendmmsg`. From any other task or thread,
   `socket.send(to, from, bytes)` queues for the socket's sender; neither waits
   on anything but the local queue. Past `send_queue` they return
-  `error.QueueFull`.
+  `error.QueueFull`. A `send` that races the server's stop answers
+  `error.Closed`: it is never taken and lost.
 - `max_datagram` (2048) bounds what is taken; a larger one is dropped and
   counted.
 - With `sessions`, `open`/`datagram`/`close` run per peer, with a `State`;
