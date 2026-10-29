@@ -14,6 +14,7 @@
 const std = @import("std");
 const jws = @import("jws.zig");
 const Client = @import("../client.zig").Client;
+const safety = @import("anole_safety");
 
 const log = std.log.scoped(.anole_auth);
 
@@ -43,13 +44,14 @@ pub const Keyring = struct {
     retry: std.Io.Duration = .fromSeconds(5),
     max_retry: std.Io.Duration = .fromSeconds(300),
 
-    /// Guards the fields below; never held across I/O or a verification.
-    mutex: std.Io.Mutex = .init,
+    /// Guards the fields below; never held across I/O, a verification or
+    /// a log call (SAFETY.md L2, L3).
+    mutex: safety.Mutex(.leaf) = .init,
     /// The current set; null before the first fetch.
     current: ?*Set = null,
     /// A fetch is running (single flight); the others wait on `fetched`.
     fetching: bool = false,
-    fetched: std.Io.Condition = .init,
+    fetched: safety.Condition = .init,
     /// Bumped whenever a fetch ends, successful or not.
     generation: u64 = 0,
     /// When the last fetch began (for `min_refresh`).
@@ -114,6 +116,9 @@ pub const Keyring = struct {
     /// `min_refresh` ago or fetches are backing off; null when
     /// there is none. The caller releases what it gets.
     fn obtain(self: *Keyring, seen: ?*Set) !?*Set {
+        // A failed fetch is logged after the lock is let go.
+        var failed: ?struct { err: anyerror, retry_in: i64 } = null;
+        defer if (failed) |f| log.warn("JWKS fetch from {s} failed ({t}); next try in {d}s", .{ self.url, f.err, f.retry_in });
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         var waited_for: ?u64 = null;
@@ -160,7 +165,7 @@ pub const Keyring = struct {
                 self.failures +|= 1;
                 const shift: u6 = @intCast(@min(self.failures - 1, 20));
                 self.retry_at = t + @min(self.max_retry.toSeconds(), self.retry.toSeconds() << shift);
-                log.warn("JWKS fetch from {s} failed ({t}); next try in {d}s", .{ self.url, err, self.retry_at - t });
+                failed = .{ .err = err, .retry_in = self.retry_at - t };
                 if (seen == null) if (self.staleLocked(t)) |stale| return stale;
                 return err;
             };
