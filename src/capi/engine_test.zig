@@ -1163,6 +1163,11 @@ const TlsFixture = struct {
 /// comes after the client's side of the handshake is done (TLS 1.3, QUIC).
 /// Which one depends on timing, so either is a refusal (D5).
 const server_refusals = &[_]anyerror{ error.ConnectionClosed, error.TlsAlertCertificateRequired, error.TlsAlertUnknownCa, error.TlsAlertBadCertificate, error.TlsAlertHandshakeFailure };
+/// Over QUIC the client's own handshake can also end on the refusal: a
+/// CONNECTION_CLOSE that lands before the client's handshake completes
+/// ends its wait with HandshakeFailed (h3/client.zig waitHandshake). The
+/// client is usually open by then, but which comes first is timing (D5).
+const h3_server_refusals = &(server_refusals.* ++ [_]anyerror{error.HandshakeFailed});
 /// How a client refuses a server certificate its CA did not sign.
 const client_refusals = &[_]anyerror{error.CertificateIssuerNotFound};
 
@@ -1198,7 +1203,7 @@ const TlsClaims = struct {
     fn http3(fx: *TlsFixture, io: std.Io) !void {
         var bundle = try fx.clientDer(io);
         defer bundle.deinit(alloc);
-        try expectRefused(h3Get(io, fx.quic(), fx.server.cert, null), server_refusals, error.ServedWithoutClientCertificate);
+        try expectRefused(h3Get(io, fx.quic(), fx.server.cert, null), h3_server_refusals, error.ServedWithoutClientCertificate);
         const body = try h3Get(io, fx.quic(), fx.server.cert, &fx.client);
         defer alloc.free(body);
         try std.testing.expectEqualSlices(u8, bundle.bytes.items, body);
