@@ -197,6 +197,13 @@ pub const Conn = struct {
         };
     }
 
+    /// A failed read or write: the cancel that ended it, so it reaches the
+    /// caller (C3), else the connection is gone.
+    fn lost(cause: ?anyerror) ConnError {
+        if (cause) |e| if (e == error.Canceled) return error.Canceled;
+        return error.ConnectionLost;
+    }
+
     fn roundTrip(self: *Conn, arena: std.mem.Allocator, api: Api, body: []const u8, want_reply: bool) ConnError![]const u8 {
         const corr = self.correlation;
         self.correlation +%= 1;
@@ -209,18 +216,18 @@ pub const Conn = struct {
         try e.raw(body);
         e.patchLen(at);
         const w = self.stream.writer();
-        w.writeAll(e.bytesWritten()) catch return error.ConnectionLost;
-        w.flush() catch return error.ConnectionLost;
+        w.writeAll(e.bytesWritten()) catch return lost(self.stream.writeError());
+        w.flush() catch return lost(self.stream.writeError());
         if (!want_reply) return "";
         testHold(self.io, .request_written);
         const r = self.stream.reader();
         var len_buf: [4]u8 = undefined;
-        r.readSliceAll(&len_buf) catch return error.ConnectionLost;
+        r.readSliceAll(&len_buf) catch return lost(self.stream.readError());
         const len = std.mem.readInt(i32, &len_buf, .big);
         if (len < 4 or len > max_response) return error.ProtocolError;
         const data = r.readAllocAll(arena, @intCast(len)) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
-            else => error.ConnectionLost,
+            else => lost(self.stream.readError()),
         };
         if (std.mem.readInt(i32, data[0..4], .big) != corr) return error.ProtocolError;
         return data[4..];
