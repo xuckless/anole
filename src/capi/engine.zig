@@ -1085,6 +1085,16 @@ pub const ListenerState = struct {
 pub var test_control_hook: ?*const fn () void = null;
 /// Tests only: the environment lookups `create` resolves the modes with.
 pub var _test_vars: ?modes.Vars = null;
+/// Tests only: the margin of Anole's request backstop past the longest
+/// consumer deadline (`serverOptions`), read at `create`. A test that needs
+/// a stream to outlive the backstop shortens it instead of waiting 5 s.
+pub var test_backstop_margin_ms: if (builtin.is_test) u32 else void = if (builtin.is_test) backstop_margin_ms else {};
+/// The request backstop's margin past the longest consumer deadline.
+const backstop_margin_ms: u32 = 5000;
+
+fn backstopMarginMs() u32 {
+    return if (comptime builtin.is_test) test_backstop_margin_ms else backstop_margin_ms;
+}
 
 pub const Engine = struct {
     arena: std.heap.ArenaAllocator,
@@ -1464,7 +1474,7 @@ pub const Engine = struct {
             for (cfg.routes) |r| if (r.timeout_ms) |t| {
                 longest = @max(longest, t);
             };
-            break :blk .fromMilliseconds(@as(i64, longest) + 5000);
+            break :blk .fromMilliseconds(@as(i64, longest) + backstopMarginMs());
         } else null;
         const listeners = try e.buildListeners(a, cfg);
         return .{
