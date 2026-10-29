@@ -1674,13 +1674,18 @@ test "net tcp: a parked connection keeps no spare chunk after an owner send" {
     }.run);
 }
 
-/// A connection paused for good, with a lifetime: the lifetime still ends
-/// it, with its reason.
+/// A connection paused while parked: when input wakes it, its task waits
+/// for a resume under the lifetime only (the park's idle deadline does not
+/// end it), and the lifetime ends it with its reason.
 const PausedLife = struct {
+    var conn: std.atomic.Value(?*net.Conn) = .init(null);
     var reason: std.atomic.Value(u32) = .init(99);
     var closed: std.atomic.Value(u32) = .init(0);
-    pub fn data(c: *net.Conn, _: []const u8) !void {
-        c.pauseReading();
+    pub fn open(c: *net.Conn) !void {
+        conn.store(c, .release);
+    }
+    pub fn data(c: *net.Conn, bytes: []const u8) !void {
+        _ = try c.send(bytes);
     }
     pub fn close(_: *net.Conn, r: net.CloseReason) void {
         reason.store(@backingInt(r), .release);
@@ -1688,17 +1693,32 @@ const PausedLife = struct {
     }
 };
 
-test "net tcp: a paused connection still ends at its lifetime, with reason lifetime" {
+test "net tcp: a connection paused while parked ends at its lifetime, not its idle timeout" {
+    PausedLife.conn.store(null, .monotonic);
     PausedLife.closed.store(0, .monotonic);
     PausedLife.reason.store(99, .monotonic);
-    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    var app = try App.init(alloc, .{ .executors = .exact(1), .timeouts = .{ .idle_park = .fromMilliseconds(5) } });
     defer app.deinit();
-    try app.tcp("127.0.0.1:0", PausedLife, .{ .lifetime = .fromMilliseconds(50) });
+    if (!app.server.parksIdle()) return error.SkipZigTest;
+    // The idle timeout leaves the test 2 s to pause and write; the lifetime
+    // comes after it.
+    try app.tcp("127.0.0.1:0", PausedLife, .{ .idle_timeout = .fromSeconds(2), .lifetime = .fromSeconds(3) });
     try serveWith(&app, struct {
         fn run(a: *App) !void {
             const s = try connect(a, portOf(a));
             defer s.close();
+            const c = try waitConn(a.io(), "the connection opened", &PausedLife.conn);
             try s.writer().writeAll("a");
+            try s.writer().flush();
+            try expectRead(s, "a");
+            try wait.waitUntil(a.io(), "the connection parked", a, struct {
+                fn one(ap: *App) bool {
+                    return ap.server.parkedConnections() >= 1;
+                }
+            }.one);
+            c.pauseReading();
+            // Input wakes it: its task finds it paused.
+            try s.writer().writeAll("b");
             try s.writer().flush();
             try waitFor(a.io(), &PausedLife.closed, 1);
             try std.testing.expectEqual(@backingInt(net.CloseReason.lifetime), PausedLife.reason.load(.acquire));
