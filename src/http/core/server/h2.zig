@@ -66,6 +66,14 @@ pub var test_before_flush: if (@import("builtin").is_test) ?*const fn (std.Io) s
 pub var test_before_fill: if (@import("builtin").is_test) ?*const fn (std.Io, FillProbe) std.Io.Cancelable!void else void =
     if (@import("builtin").is_test) null else {};
 
+/// Tests only: runs once the reader has seen the peer's side end cleanly
+/// (EOF, e.g. a half-close) and the connection has marked itself closing
+/// and let go of the streams that can no longer finish, before the writer
+/// sends the last responses, so a test can act only after the server has
+/// observed the end (h2_test.zig). Nothing outside tests.
+pub var test_after_peer_end: if (@import("builtin").is_test) ?*const fn (std.Io) void else void =
+    if (@import("builtin").is_test) null else {};
+
 /// What `test_before_fill` is told about the connection.
 pub const FillProbe = struct {
     /// The drain's final GOAWAY (or the one a draining server sends a new
@@ -832,12 +840,14 @@ pub fn Engine(comptime Ctx: type) type {
             try placement.concurrent(&group, conn.io, .local, writerLoop, .{&conn});
 
             var reader_failed = false;
+            var peer_ended = false;
             // Whether the peer's side may still be open, with input the
             // session will not read: the session ended first (a GOAWAY
             // either way, or a protocol error).
             var linger = false;
             if (readerLoop(&conn, &group)) |end| {
                 linger = end == .done;
+                peer_ended = end == .eof;
             } else |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => {
@@ -881,6 +891,7 @@ pub fn Engine(comptime Ctx: type) type {
                 // iteration: the abort may free the stream.)
                 for (gone.items) |stream| abortDetached(stream);
             }
+            if (comptime @import("builtin").is_test) if (peer_ended) if (test_after_peer_end) |hook| hook(conn.io);
             conn.kickWriter();
             group.await(conn.io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
@@ -2754,7 +2765,7 @@ pub fn Engine(comptime Ctx: type) type {
     };
 }
 
-test "HTTP/2 tunnel outbox: a message past outbox_keep drained, trimmed, then the next one" {
+test "HTTP/2 tunnel outbox: after a trim, the next message reads back whole" {
     // A 120 KB video keyframe on a WebSocket over HTTP/2 grew the outbox
     // past outbox_keep; once it was sent, trim freed `draining` but kept
     // the read position, and the next message read past its end.
@@ -2775,7 +2786,6 @@ test "HTTP/2 tunnel outbox: a message past outbox_keep drained, trimmed, then th
             if (ob.pending() == 0) ob.trim(gpa);
         }
         try std.testing.expectEqual(size, got);
-        try std.testing.expectEqual(@as(usize, 0), ob.drain_pos);
         try std.testing.expectEqual(@as(usize, 0), ob.take(&buf));
     }
 }

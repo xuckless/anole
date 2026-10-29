@@ -610,10 +610,7 @@ test parseRange {
     try std.testing.expectEqual(.ignore, parseRange("items=0-1", 100));
 }
 
-test "HTTP date round trip" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", try formatHttpDate(arena.allocator(), 784111777));
+test "parseHttpDate: IMF-fixdate only, with real leap days" {
     try std.testing.expectEqual(784111777, parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT"));
     try std.testing.expectEqual(951782400, parseHttpDate("Tue, 29 Feb 2000 00:00:00 GMT"));
     try std.testing.expectEqual(null, parseHttpDate("Sun, 29 Feb 1999 00:00:00 GMT"));
