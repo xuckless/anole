@@ -167,7 +167,7 @@ test "capi s3: a missing key answers E_SERVICE, class NOT_FOUND, http 404, code 
     try std.testing.expectEqualStrings("NoSuchKey", text(got, got.error_code));
 }
 
-test "capi s3: list gives entries and prefixes; delete_many deletes" {
+test "capi s3: list with a delimiter gives one entry and one prefix" {
     if (comptime !features.s3) return error.SkipZigTest;
     var r: Rig = undefined;
     try r.start(false);
@@ -184,13 +184,60 @@ test "capi s3: list gives entries and prefixes; delete_many deletes" {
     try std.testing.expectEqual(@as(u64, 3), entry.size);
     const prefixes: [*]const abi.Span = @ptrCast(@alignCast(bytes + page.prefixes_off));
     try std.testing.expectEqualStrings("d/", text(page, prefixes[0]));
+}
 
+test "capi s3: delete_many deletes every key it names" {
+    if (comptime !features.s3) return error.SkipZigTest;
+    var r: Rig = undefined;
+    try r.start(false);
+    defer r.deinit();
+    for ([_][]const u8{ "d/1", "d/2", "top" }) |k| try r.fake.putObject("b", k, "xyz", "text/plain");
     try engine.s3.deleteMany(r.store(), r.c, &.{ .of("d/1"), .of("d/2") }, .{}, 5);
     const del = try r.ev.result(5);
     try std.testing.expectEqual(abi.OK, del.status);
     try std.testing.expectEqual(@as(u32, 0), del.nentries);
     try std.testing.expect(r.fake.getObject("b", "d/1") == null);
+    try std.testing.expect(r.fake.getObject("b", "d/2") == null);
+    try std.testing.expect(r.fake.getObject("b", "top") != null);
 }
+
+/// The DATA of one streamed download, collected as the consumer polls.
+const Download = struct {
+    ev: *Events,
+    got: std.ArrayList(u8) = .empty,
+    seen: usize = 0,
+    fin: bool = false,
+
+    /// Polls once (without waiting) and appends the new DATA; returns how
+    /// many DATA records came.
+    fn pump(d: *Download) !usize {
+        try d.ev.pump(0);
+        var n: usize = 0;
+        for (d.ev.list.items[d.seen..]) |rec| {
+            if (rec.typ != @backingInt(abi.EventType.s3_data)) continue;
+            const de: *const abi.S3DataEvent = @ptrCast(@alignCast(rec.bytes.ptr));
+            try d.got.appendSlice(alloc, text(de, de.data));
+            if (de.flags & abi.S3_DATA_F_FIN != 0) d.fin = true;
+            n += 1;
+        }
+        d.seen = d.ev.list.items.len;
+        return n;
+    }
+
+    fn windowFull(d: *Download) !bool {
+        _ = try d.pump();
+        return d.got.items.len >= 128 * 1024;
+    }
+
+    fn noMore(d: *Download) !bool {
+        return try d.pump() == 0;
+    }
+
+    fn finished(d: *Download) !bool {
+        _ = try d.pump();
+        return d.fin;
+    }
+};
 
 test "capi s3: get STREAM with a 128 KiB window delivers DATA up to the window, read_more resumes, FIN ends" {
     if (comptime !features.s3) return error.SkipZigTest;
@@ -206,38 +253,17 @@ test "capi s3: get STREAM with a 128 KiB window delivers DATA up to the window, 
     try std.testing.expectEqual(abi.OK, head.status);
     const handle = head.ev.handle;
     try std.testing.expect(handle != 0);
-    var got: std.ArrayList(u8) = .empty;
-    defer got.deinit(alloc);
-    var seen: usize = 0;
-    var idle: u32 = 0;
+    var dl: Download = .{ .ev = &r.ev };
+    defer dl.got.deinit(alloc);
+    const tio = engine.threadedIo();
     // Until the window is used up.
-    while (got.items.len < 128 * 1024 and idle < 400) : (idle += 1) {
-        try r.ev.pump(50);
-        for (r.ev.list.items[seen..]) |rec| {
-            if (rec.typ != @backingInt(abi.EventType.s3_data)) continue;
-            const d: *const abi.S3DataEvent = @ptrCast(@alignCast(rec.bytes.ptr));
-            try got.appendSlice(alloc, text(d, d.data));
-        }
-        seen = r.ev.list.items.len;
-    }
-    try std.testing.expectEqual(@as(usize, 128 * 1024), got.items.len);
+    try wait.waitUntil(tio, "DATA up to the 128 KiB window", &dl, Download.windowFull);
+    try std.testing.expectEqual(@as(usize, 128 * 1024), dl.got.items.len);
     // Nothing beyond the window arrives until there is credit.
-    try r.ev.pump(200);
-    for (r.ev.list.items[seen..]) |rec| try std.testing.expect(rec.typ != @backingInt(abi.EventType.s3_data));
+    try wait.expectStays(tio, "no DATA past the window", &dl, Download.noMore, wait.short_window);
     try engine.s3.readMore(r.e, handle, 1 << 20);
-    var fin = false;
-    idle = 0;
-    while (!fin and idle < 400) : (idle += 1) {
-        try r.ev.pump(50);
-        for (r.ev.list.items[seen..]) |rec| {
-            if (rec.typ != @backingInt(abi.EventType.s3_data)) continue;
-            const d: *const abi.S3DataEvent = @ptrCast(@alignCast(rec.bytes.ptr));
-            try got.appendSlice(alloc, text(d, d.data));
-            if (d.flags & abi.S3_DATA_F_FIN != 0) fin = true;
-        }
-        seen = r.ev.list.items.len;
-    }
-    try std.testing.expect(fin);
+    try wait.waitUntil(tio, "the download's FIN", &dl, Download.finished);
+    const got = &dl.got;
     try std.testing.expectEqualSlices(u8, data, got.items);
     // The handle is over (it goes once the FIN is out).
     const Over = struct {
@@ -251,7 +277,19 @@ test "capi s3: get STREAM with a 128 KiB window delivers DATA up to the window, 
     try wait.waitUntil(engine.threadedIo(), "the finished download's handle is gone", Over{ .e = r.e, .h = handle }, Over.gone);
 }
 
-test "capi s3: a push upload: write OK, BORROW refused, finish answers UPLOAD_FINISH with parts" {
+test "capi s3: an upload write refuses BODY_BORROW" {
+    if (comptime !features.s3) return error.SkipZigTest;
+    var r: Rig = undefined;
+    try r.start(false);
+    defer r.deinit();
+    try engine.s3.uploadOpen(r.store(), r.c, .of("up.bin"), .{}, 10);
+    const opened = try r.ev.result(10);
+    try std.testing.expectEqual(abi.OK, opened.status);
+    defer engine.s3.release(r.e, opened.ev.handle) catch {};
+    try std.testing.expectError(error.Invalid, engine.s3.uploadWrite(r.e, opened.ev.handle, "x", abi.BODY_BORROW));
+}
+
+test "capi s3: a push upload: writes are taken, finish answers UPLOAD_FINISH with its parts" {
     if (comptime !features.s3) return error.SkipZigTest;
     var r: Rig = undefined;
     try r.start(false);
@@ -262,7 +300,6 @@ test "capi s3: a push upload: write OK, BORROW refused, finish answers UPLOAD_FI
     try std.testing.expectEqual(abi.S3_OP_UPLOAD_OPEN, opened.op);
     const t = opened.ev.handle;
     try std.testing.expect(t != 0);
-    try std.testing.expectError(error.Invalid, engine.s3.uploadWrite(r.e, t, "x", abi.BODY_BORROW));
     const chunk = try alloc.alloc(u8, mib);
     defer alloc.free(chunk);
     pattern(chunk, 3);
@@ -380,6 +417,7 @@ fn serveConditional(which: Conditional) !u16 {
     var res: HttpResult = .{};
     defer alloc.free(res.body);
     var f = try io.concurrent(fetchIfTask, .{ io, url, names, values, &res });
+    defer f.cancel(io) catch {};
     const i = try r.ev.waitFor(.request, 0, 15000);
     try engine.s3.serve(r.store(), r.ev.list.items[i].handle, .of("obj.bin"), .{}, 23);
     try f.await(io);
@@ -411,6 +449,7 @@ test "capi s3: serve answers the request from the object; the body never enters 
     var res: HttpResult = .{};
     defer alloc.free(res.body);
     var f = try io.concurrent(fetchTask, .{ io, url, dusty.Method.get, null, &res });
+    defer f.cancel(io) catch {};
     const i = try r.ev.waitFor(.request, 0, 15000);
     try engine.s3.serve(r.store(), r.ev.list.items[i].handle, .of("obj.bin"), .{}, 20);
     try f.await(io);
@@ -429,6 +468,7 @@ test "capi s3: serve with PASS_NOT_FOUND leaves the request owed and reports; th
     var res: HttpResult = .{};
     defer alloc.free(res.body);
     var f = try io.concurrent(fetchTask, .{ io, url, dusty.Method.get, null, &res });
+    defer f.cancel(io) catch {};
     const i = try r.ev.waitFor(.request, 0, 15000);
     const req = r.ev.list.items[i].handle;
     try engine.s3.serve(r.store(), req, .of("missing.bin"), .{ .flags = abi.S3_F_PASS_NOT_FOUND }, 21);
@@ -445,7 +485,8 @@ test "capi s3: put_body stores the request body without the consumer reading it;
     var r: Rig = undefined;
     try r.start(true);
     defer r.deinit();
-    const body = try alloc.alloc(u8, 12 * mib);
+    // Just over one 5 MiB part: two parts, so the multipart path runs.
+    const body = try alloc.alloc(u8, 5 * mib + 1);
     defer alloc.free(body);
     pattern(body, 2);
     const io = r.rt.io();
@@ -454,6 +495,7 @@ test "capi s3: put_body stores the request body without the consumer reading it;
     var res: HttpResult = .{};
     defer alloc.free(res.body);
     var f = try io.concurrent(fetchTask, .{ io, url, dusty.Method.post, body, &res });
+    defer f.cancel(io) catch {};
     const i = try r.ev.waitFor(.request, 0, 15000);
     const req = r.ev.list.items[i].handle;
     try engine.s3.putBody(r.store(), req, .of("posted.bin"), .{}, 22);
