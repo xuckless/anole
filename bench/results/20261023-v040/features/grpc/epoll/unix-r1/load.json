@@ -1,0 +1,1 @@
+{"target":"unix:/sock/grpc.sock","conns":4,"concurrency":64,"ok":11204687,"errors":0,"rps":373489.52228366176,"p50_ms":0.166,"p99_ms":0.357,"p999_ms":0.686,"max_ms":2.398}

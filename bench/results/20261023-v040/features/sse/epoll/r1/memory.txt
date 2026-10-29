@@ -1,0 +1,4 @@
+idle-empty current 2211840 rss_kb 7036
+idle-subscribed current 294002688 rss_kb 97616
+idle cpu cores .00083468764198866479
+after-publish current 897261568 rss_kb 508952

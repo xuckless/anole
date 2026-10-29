@@ -1,0 +1,25 @@
+18:33:37 fanin epoll h2 r1: 20657.10 req/s, p99 2.01ms, upstream conns 1, errors 
+18:35:17 fanin epoll h1 r1: 94767.08 req/s, p99 3.01ms, upstream conns 256, errors 
+18:37:03 grpc epoll unix r1: {"target":"unix:/sock/grpc.sock","conns":4,"concurrency":64,"ok":11204687,"errors":0,"rps":373489.52228366176,"p50_ms":0.166,"p99_ms":0.357,"p999_ms":0.686,"max_ms":2.398}
+18:38:49 grpc epoll h2c r1: {"target":"127.0.0.1:50051","conns":4,"concurrency":64,"ok":9163734,"errors":0,"rps":305457.7248268539,"p50_ms":0.204,"p99_ms":0.407,"p999_ms":0.704,"max_ms":1.399}
+18:40:35 grpc epoll tls r1: {"target":"127.0.0.1:50052","conns":4,"concurrency":64,"ok":8649072,"errors":0,"rps":288302.37874250463,"p50_ms":0.216,"p99_ms":0.434,"p999_ms":0.739,"max_ms":2.346}
+18:44:09 sse epoll r1: idle-empty current 2211840 rss_kb 7036;idle-subscribed current 294002688 rss_kb 97616;idle cpu cores .00083468764198866479;after-publish current 897261568 rss_kb 508952; connected 50000 errors 0 fan-out p50 184.8 p99 415.9 all median 360.5 all max 466.5 received [50000, 50000, 50000] ended 0
+18:45:50 fanin epoll h1 r2: 91898.31 req/s, p99 3.07ms, upstream conns 256, errors 
+18:47:31 fanin epoll h2 r2: 20652.73 req/s, p99 2.09ms, upstream conns 1, errors 
+18:49:16 grpc epoll h2c r2: {"target":"127.0.0.1:50051","conns":4,"concurrency":64,"ok":8989242,"errors":0,"rps":299641.3756691203,"p50_ms":0.208,"p99_ms":0.413,"p999_ms":0.71,"max_ms":1.765}
+18:51:02 grpc epoll tls r2: {"target":"127.0.0.1:50052","conns":4,"concurrency":64,"ok":8589275,"errors":0,"rps":286309.0123079345,"p50_ms":0.218,"p99_ms":0.424,"p999_ms":0.731,"max_ms":1.819}
+18:52:48 grpc epoll unix r2: {"target":"unix:/sock/grpc.sock","conns":4,"concurrency":64,"ok":11328588,"errors":0,"rps":377619.21033473685,"p50_ms":0.164,"p99_ms":0.351,"p999_ms":0.673,"max_ms":1.795}
+18:56:22 sse epoll r2: idle-empty current 2416640 rss_kb 7072;idle-subscribed current 292507648 rss_kb 96268;idle cpu cores .00079723374062470587;after-publish current 931090432 rss_kb 551640; connected 50000 errors 0 fan-out p50 191.2 p99 408.5 all median 385.6 all max 469.1 received [50000, 50000, 50000] ended 0
+18:58:02 fanin uring h2 r1: 20654.08 req/s, p99 1.93ms, upstream conns 1, errors 
+18:59:43 fanin uring h1 r1: 100572.22 req/s, p99 2.81ms, upstream conns 256, errors 
+19:01:29 grpc uring unix r1: {"target":"unix:/sock/grpc.sock","conns":4,"concurrency":64,"ok":10868556,"errors":0,"rps":362284.7676010537,"p50_ms":0.176,"p99_ms":0.374,"p999_ms":0.694,"max_ms":2.007}
+19:03:15 grpc uring h2c r1: {"target":"127.0.0.1:50051","conns":4,"concurrency":64,"ok":9350937,"errors":0,"rps":311697.8620040306,"p50_ms":0.201,"p99_ms":0.412,"p999_ms":0.709,"max_ms":1.734}
+19:05:00 grpc uring tls r1: {"target":"127.0.0.1:50052","conns":4,"concurrency":64,"ok":8882544,"errors":0,"rps":296084.74581649154,"p50_ms":0.211,"p99_ms":0.443,"p999_ms":0.734,"max_ms":1.912}
+19:08:34 sse uring r1: idle-empty current 2105344 rss_kb 6496;idle-subscribed current 293105664 rss_kb 94860;idle cpu cores .00090025912424870104;after-publish current 893812736 rss_kb 529168; connected 50000 errors 0 fan-out p50 179.3 p99 408.3 all median 351.3 all max 437.4 received [50000, 50000, 50000] ended 0
+19:10:15 fanin uring h1 r2: 102942.15 req/s, p99 2.75ms, upstream conns 256, errors 
+19:11:56 fanin uring h2 r2: 20664.68 req/s, p99 1.86ms, upstream conns 1, errors 
+19:13:42 grpc uring h2c r2: {"target":"127.0.0.1:50051","conns":4,"concurrency":64,"ok":9434676,"errors":0,"rps":314488.1955666351,"p50_ms":0.2,"p99_ms":0.402,"p999_ms":0.699,"max_ms":1.623}
+19:15:28 grpc uring tls r2: {"target":"127.0.0.1:50052","conns":4,"concurrency":64,"ok":8746448,"errors":0,"rps":291547.81747894426,"p50_ms":0.214,"p99_ms":0.452,"p999_ms":0.74,"max_ms":2.238}
+19:17:13 grpc uring unix r2: {"target":"unix:/sock/grpc.sock","conns":4,"concurrency":64,"ok":10821732,"errors":0,"rps":360724.37830844073,"p50_ms":0.177,"p99_ms":0.373,"p999_ms":0.695,"max_ms":3.192}
+19:20:47 sse uring r2: idle-empty current 2134016 rss_kb 6684;idle-subscribed current 289865728 rss_kb 91732;idle cpu cores .00084971088556529049;after-publish current 983035904 rss_kb 577292; connected 50000 errors 0 fan-out p50 175.4 p99 379.9 all median 351.8 all max 424.3 received [50000, 50000, 50000] ended 0
+19:20:47 done

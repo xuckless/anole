@@ -1,0 +1,13 @@
+Running 30s test @ http://127.0.0.1:8080/fanin
+  8 threads and 256 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     2.72ms  768.00us  46.36ms   99.75%
+    Req/Sec    11.92k   470.84    18.09k    79.88%
+  Latency Distribution
+     50%    2.72ms
+     75%    2.75ms
+     90%    2.80ms
+     99%    3.01ms
+  2847706 requests in 30.05s, 407.37MB read
+Requests/sec:  94767.08
+Transfer/sec:     13.56MB

@@ -1,0 +1,6 @@
+{"time":"2026-10-23T23:15:28.110Z","level":"info","scope":"anole","message":"environment production (release build): JSON Lines logs"}
+{"time":"2026-10-23T23:15:28.110Z","level":"warn","scope":"anole","message":"built with ReleaseFast: Zig's safety checks are off, so a bug that ReleaseSafe would stop at the faulty line can corrupt memory instead; ReleaseSafe is the recommended build for production"}
+{"time":"2026-10-23T23:15:28.111Z","level":"info","scope":"anole","message":"listening on unix:/sock/grpc.sock (HTTP/1.1, HTTP/2 cleartext)"}
+{"time":"2026-10-23T23:15:28.111Z","level":"info","scope":"anole","message":"listening on http://127.0.0.1:50051 (HTTP/2 cleartext)"}
+{"time":"2026-10-23T23:15:28.111Z","level":"info","scope":"anole","message":"listening on https://127.0.0.1:50052 (HTTP/2)"}
+{"time":"2026-10-23T23:15:28.111Z","level":"info","scope":"anole","message":"console: `anole console anole-grpc` attaches (socket /run/anole/anole-grpc.1.sock)"}

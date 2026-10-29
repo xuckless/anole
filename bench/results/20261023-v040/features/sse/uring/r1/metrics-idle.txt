@@ -1,0 +1,13 @@
+anole_sse_subscribers_closed_total{reason="client_gone"} 0
+anole_sse_subscribers_closed_total{reason="slow"} 0
+anole_sse_subscribers_closed_total{reason="drain"} 0
+anole_sse_subscribers_closed_total{reason="closed"} 0
+anole_sse_subscribers_closed_total{reason="server"} 0
+anole_sse_resumes_total{result="exact"} 0
+anole_sse_resumes_total{result="gap"} 0
+anole_sse_events_published_total 0
+anole_sse_events_delivered_total 0
+anole_sse_events_dropped_total 0
+anole_sse_subscribers 50000
+anole_sse_topics 1
+anole_sse_replay_bytes 0
