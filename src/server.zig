@@ -5270,7 +5270,9 @@ test "anole.Server: a .env file with a problem is InvalidEnvFile" {
     }, {}));
 }
 
-test "console: a connector type whose name contains \"pg\" is not reported as PostgreSQL" {
+test "console: a connector type is not reported as PostgreSQL for a piece of its name" {
+    // "Upgrade" contains "pg"; the test's name (part of the type's name)
+    // must contain no system's substring, so the struct is the only trigger.
     const Upgrade = struct {
         fn start(_: *@This(), _: ?*observe.metrics.Registry, _: ?*observe.trace.Exporter, _: ?*observe.Health) anyerror!void {}
         fn deinit(_: *@This()) void {}
