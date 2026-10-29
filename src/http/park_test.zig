@@ -345,11 +345,14 @@ fn racePark(secure: bool) !void {
     }
 }
 
-test "idle park: requests arriving as the connection parks" {
+test "idle park: requests arriving as the connection parks [stress]" {
+    // A race hunt: 80 seeded rounds, ~2 s (TESTING.md W3, K1).
+    try wait.requireStress();
     try racePark(false);
 }
 
-test "idle park: requests arriving as a TLS connection parks" {
+test "idle park: requests arriving as a TLS connection parks [stress]" {
+    try wait.requireStress();
     try racePark(true);
 }
 
