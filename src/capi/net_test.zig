@@ -70,11 +70,7 @@ const Rig = struct {
     /// poll (a poll still under way would overlap the test's).
     fn takeOver(r: *Rig) !void {
         r.manual.store(true, .release);
-        for (0..5000) |_| {
-            if (r.parked.load(.acquire)) return;
-            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
-        }
-        return error.TimedOut;
+        try wait.waitFlag(std.testing.io, "the rig's thread left its poll", &r.parked);
     }
 
     fn lockIt(r: *Rig) void {
@@ -110,17 +106,23 @@ const Rig = struct {
 
     /// The first record of `typ` not taken yet (waits).
     fn take(r: *Rig, typ: abi.EventType) !Rec {
-        for (0..5000) |_| {
-            r.lockIt();
-            for (r.recs.items, 0..) |x, i| if (x.type == @backingInt(typ)) {
-                const rec = r.recs.orderedRemove(i);
-                r.lock.unlock();
-                return rec;
-            };
-            r.lock.unlock();
-            try std.testing.io.sleep(.fromMilliseconds(2), .awake);
-        }
-        return error.TimedOut;
+        const Take = struct {
+            r: *Rig,
+            typ: abi.EventType,
+            got: *?Rec,
+            fn found(t: @This()) bool {
+                t.r.lockIt();
+                defer t.r.lock.unlock();
+                for (t.r.recs.items, 0..) |x, i| if (x.type == @backingInt(t.typ)) {
+                    t.got.* = t.r.recs.orderedRemove(i);
+                    return true;
+                };
+                return false;
+            }
+        };
+        var got: ?Rec = null;
+        try wait.waitUntil(std.testing.io, "a record of the type came", Take{ .r = r, .typ = typ, .got = &got }, Take.found);
+        return got.?;
     }
 
     /// How many records of `typ` are waiting.
@@ -314,8 +316,11 @@ test "capi net: pause holds input until resume" {
     try s.writer().writeAll("two");
     try s.writer().flush();
     // Held: nothing arrives while paused.
-    try std.testing.io.sleep(.fromMilliseconds(100), .awake);
-    try std.testing.expectEqual(@as(usize, 0), rig.pending(.net_data));
+    try wait.expectStays(std.testing.io, "no data record while paused", rig, struct {
+        fn none(r: *Rig) bool {
+            return r.pending(.net_data) == 0;
+        }
+    }.none, wait.short_window);
     try engine.net.pause(rig.e, open.handle, false);
     const second = try rig.take(.net_data);
     defer free(second);

@@ -172,15 +172,15 @@ pub const Fake = struct {
 };
 
 /// Stops `app` once `n` posts are recorded and the script is over (or
-/// after a generous bound, failing the test then).
+/// past the wait helper's deadline, failing the test then).
 fn stopAfter(app: *anole.App, f: *Fake, n: usize) anyerror!void {
     defer app.stop();
-    const io = app.io();
-    var waited: u32 = 0;
-    while (f.postCount() < n or !f.drained.load(.acquire)) : (waited += 10) {
-        if (waited > 20_000) return error.TimedOut;
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    const Ctx = struct { f: *Fake, n: usize };
+    try @import("anole_test_wait").waitUntil(app.io(), "the Runtime API got the posts and was drained", Ctx{ .f = f, .n = n }, struct {
+        fn done(c: Ctx) bool {
+            return c.f.postCount() >= c.n and c.f.drained.load(.acquire);
+        }
+    }.done);
 }
 
 /// Runs `app` against `f` until `n` posts are recorded.

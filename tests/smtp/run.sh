@@ -21,6 +21,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+. tests/lib/wait.sh
 ZIG=${ZIG:-zig}
 IMAGE=${MAILPIT_IMAGE:-axllent/mailpit@sha256:0790692be935ea4420d085694f7985b1f692ca6a8771ab0e0bd8ba75ac180498} # v1.32.0
 PLAIN_PORT=${SMTP_PLAIN_PORT:-51025}
@@ -73,13 +74,9 @@ docker run -d --name "anole-mailpit-smtps-$SUFFIX" \
   -e MP_SMTP_TLS_CERT=/tls/server.crt -e MP_SMTP_TLS_KEY=/tls/server.key \
   -e MP_SMTP_REQUIRE_TLS=true -e MP_SMTP_AUTH_ACCEPT_ANY=true "$IMAGE" >/dev/null
 
+info() { curl -fsS "http://127.0.0.1:$1/api/v1/info" >/dev/null 2>&1; }
 for api in "$PLAIN_API" "$STARTTLS_API" "$SMTPS_API"; do
-  ok=0
-  for _ in $(seq 1 60); do
-    if curl -fsS "http://127.0.0.1:$api/api/v1/info" >/dev/null 2>&1; then ok=1; break; fi
-    sleep 1
-  done
-  if [ "$ok" != 1 ]; then
+  if ! wait_until 60 "Mailpit's API on port $api" info "$api"; then
     echo "Mailpit's API on port $api did not answer; the logs:" >&2
     for n in $NAMES; do docker logs "$n" >&2 || true; done
     exit 1

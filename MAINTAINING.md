@@ -316,7 +316,22 @@ Anole's own tests wait through `src/testing/wait.zig` (the module
 - `waitEqual`, `waitNonZero` and `deadlineMs()` (the deadline for an API
   that takes milliseconds) cover the rest; the C consumer
   (tests/capi/consumer.c) has `wait_until()` with the same deadline, and
-  `timing()` for its elapsed-time bounds (`CHECK(!timing() || ...)`).
+  `timing()` for its elapsed-time bounds (`CHECK(!timing() || ...)`);
+  tests/capi/grpc.c and sse.c have the same `wait_until()`, and their
+  watchdogs scale with the factor.
+- The shell runners (tests/*/run.sh and the scripts beside them) source
+  `tests/lib/wait.sh` (POSIX sh): `wait_until SECONDS "what" CMD...` runs
+  CMD until it succeeds, for SECONDS times `ANOLE_TEST_TIMEOUT_FACTOR`, and
+  says what it waited for when it gives up. A runner waits for what a
+  fixed sleep stood for, as testcontainers' wait strategies do: a port
+  that accepts (`port_open`, `udp_bound`), a log line N times (`log_has`,
+  `docker_log_has`; PostgreSQL's "ready to accept connections" twice, the
+  broker's running line for Kafka and Redpanda), a process gone (`gone`),
+  or a command that succeeds (`pg_isready`, `PING`). A server started by a
+  runner says when it is ready (tests/h3/server.zig logs "h3 test server
+  ready", and a line when a slow request or download has started), so the
+  runner never guesses. tests/restart/across.py and
+  tests/console/pty_test.py scale their limits by the same factor.
 
 ## The S3 client
 

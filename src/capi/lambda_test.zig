@@ -155,8 +155,9 @@ fn recHeader(rec: []const u8, r: *const abi.RequestEvent, name: []const u8) ?[]c
 fn nextRequest(c: *engine.Consumer, out: []align(8) u8) ![]align(8) u8 {
     var buf: [64 * 1024]u8 align(8) = undefined;
     var need: u32 = 0;
-    var waited: u32 = 0;
-    while (waited < 10_000) : (waited += 50) {
+    const tio = engine.threadedIo();
+    const started = std.Io.Clock.awake.now(tio);
+    while (started.untilNow(tio, .awake).nanoseconds < wait.deadline().nanoseconds) {
         const n = try engine.pollWait(c, &buf, 50, &need);
         var off: usize = 0;
         while (off < n) {
@@ -172,12 +173,12 @@ fn nextRequest(c: *engine.Consumer, out: []align(8) u8) ![]align(8) u8 {
 }
 
 fn waitPosts(f: *fake_rt.Fake, n: usize) !void {
-    const tio = engine.threadedIo();
-    var waited: u32 = 0;
-    while (f.postCount() < n or !f.drained.load(.acquire)) : (waited += 10) {
-        if (waited > 10_000) return error.TimedOut;
-        try std.Io.sleep(tio, .fromMilliseconds(10), .awake);
-    }
+    const Posts = struct { f: *fake_rt.Fake, n: usize };
+    try wait.waitUntil(engine.threadedIo(), "the Runtime API got the posts and was drained", Posts{ .f = f, .n = n }, struct {
+        fn done(c: Posts) bool {
+            return c.f.postCount() >= c.n and c.f.drained.load(.acquire);
+        }
+    }.done);
 }
 
 test "capi lambda: a consumer route and a fixed route answered through the Runtime API" {

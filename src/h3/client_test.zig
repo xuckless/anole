@@ -709,6 +709,10 @@ test "h3 server: requests the client cancels keep their stream credit until thei
     for (0..40) |_| try group.concurrent(io, struct {
         fn one(cn: *client.ClientConnection, i: std.Io) std.Io.Cancelable!void {
             const st = request(cn, "GET", "/hold", .{}) catch return;
+            // Time for the handler to start before the cancel (a
+            // sensitivity sleep: on a slow machine more requests are
+            // canceled before their handlers run, which only makes the
+            // cap easier to keep, never fails a right server).
             try i.sleep(.fromMilliseconds(30), .awake);
             st.release();
         }

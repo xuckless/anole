@@ -247,11 +247,21 @@ test "ResponseCache: what is kept, Vary, HEAD, expiry, invalidation and metrics"
             try testing.expectEqualStrings("lang fr", (try fetch(io, arena, port, .get, "/lang", &.{.{ "Accept-Language", "fr" }})).body);
             try testing.expectEqual(@as(u32, 2), ran(6));
 
-            // s-maxage=1 wins over max-age and the route's ttl.
+            // s-maxage=1 wins over max-age and the route's ttl. The entry
+            // is stored after `filled_by`, so a second answer back within
+            // the second of it was a hit; on a slower machine the entry
+            // may have expired already, and that check is skipped.
+            const filled_by = std.Io.Clock.awake.now(io);
             try testing.expectEqualStrings("short 1", (try fetch(io, arena, port, .get, "/short", &.{})).body);
-            try testing.expectEqualStrings("short 1", (try fetch(io, arena, port, .get, "/short", &.{})).body);
+            const again = try fetch(io, arena, port, .get, "/short", &.{});
+            if (filled_by.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 1000) try testing.expectEqualStrings("short 1", again.body);
+            // Time passes on purpose (a lower bound): past s-maxage the
+            // handler runs again, although max-age and the ttl would keep it.
             try io.sleep(.fromMilliseconds(1100), .awake);
-            try testing.expectEqualStrings("short 2", (try fetch(io, arena, port, .get, "/short", &.{})).body);
+            const runs_before = ran(5);
+            const expired = try fetch(io, arena, port, .get, "/short", &.{});
+            try testing.expectEqual(runs_before + 1, ran(5));
+            try testing.expectEqualStrings(try std.fmt.allocPrint(arena, "short {d}", .{runs_before + 1}), expired.body);
 
             // A cache of the app's own, for a group of routes, and
             // invalidated by path (every query of it) and as a whole.

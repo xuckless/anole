@@ -4272,12 +4272,25 @@ test "anole.Server: with a blocking pool, one executor serves other requests whi
         .blocking = .{ .threads = 2 },
     }, {});
     defer app.deinit();
+    const test_wait = @import("anole_test_wait");
     const Routes = struct {
-        /// 600 ms of CPU, as a slow password hash would take.
+        var spinning: std.atomic.Value(bool) = .init(false);
+        var fast_answered: std.atomic.Value(bool) = .init(false);
+        var ended_by_answer: std.atomic.Value(bool) = .init(false);
+        /// CPU, as a slow password hash would take, until /fast has been
+        /// answered: the job ends only because the one executor served
+        /// /fast meanwhile (the wait helper's deadline is a hang guard).
         fn spin(io_: std.Io) u32 {
+            spinning.store(true, .release);
             const start = std.Io.Clock.awake.now(io_);
             var n: u32 = 0;
-            while (start.durationTo(std.Io.Clock.awake.now(io_)).toMilliseconds() < 600) n +%= 1;
+            while (start.durationTo(std.Io.Clock.awake.now(io_)).nanoseconds < test_wait.deadline().nanoseconds) {
+                if (fast_answered.load(.acquire)) {
+                    ended_by_answer.store(true, .release);
+                    break;
+                }
+                n +%= 1;
+            }
             return n;
         }
         fn slow(req: *http.Request, res: *http.Response) !void {
@@ -4310,10 +4323,13 @@ test "anole.Server: with a blocking pool, one executor serves other requests whi
             const addr = a.addresses()[0].ip;
             var slow_req = try io_.concurrent(get, .{ io_, addr, "/slow" });
             defer _ = slow_req.cancel(io_) catch {};
-            try io_.sleep(.fromMilliseconds(100), .awake);
+            try test_wait.waitFlag(io_, "the slow job is running", &spinning);
             // The slow job is running; the only executor still answers.
-            try std.testing.expect(try get(io_, addr, "/fast") < 300);
-            try std.testing.expect(try slow_req.await(io_) >= 500);
+            const fast_ms = try get(io_, addr, "/fast");
+            fast_answered.store(true, .release);
+            _ = try slow_req.await(io_);
+            try std.testing.expect(ended_by_answer.load(.acquire));
+            if (test_wait.timing()) try std.testing.expect(fast_ms < 300);
         }
     };
     app.get("/slow", Routes.slow);
@@ -4463,27 +4479,28 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
             // SIGHUP, once `run` listens for it.
             try dir.writeFile(io_, .{ .sub_path = "cert.pem", .data = p[2].cert });
             if (comptime unix_signals) {
-                var armed = false;
-                for (0..500) |_| {
-                    var current: std.posix.Sigaction = undefined;
-                    std.posix.sigaction(.HUP, null, &current);
-                    if (current.handler.handler != std.posix.SIG.DFL) {
-                        armed = true;
-                        break;
+                try @import("anole_test_wait").waitUntil(io_, "run listens for SIGHUP", {}, struct {
+                    fn armed(_: void) bool {
+                        var current: std.posix.Sigaction = undefined;
+                        std.posix.sigaction(.HUP, null, &current);
+                        return current.handler.handler != std.posix.SIG.DFL;
                     }
-                    try io_.sleep(.fromMilliseconds(10), .awake);
-                }
-                try std.testing.expect(armed);
+                }.armed);
                 _ = std.c.kill(std.c.getpid(), std.c.SIG.HUP);
             } else {
                 // No SIGHUP on Windows: the call it makes.
                 try a.reloadCertificates();
             }
-            const switched = for (0..300) |_| {
-                if (ReloadCheck.h1(io_, port, td, "ca2.pem")) |_| break true else |_| {}
-                try io_.sleep(.fromMilliseconds(10), .awake);
-            } else false;
-            try std.testing.expect(switched);
+            const Switched = struct {
+                io: std.Io,
+                port: u16,
+                td: *const std.testing.TmpDir,
+                fn done(c: @This()) bool {
+                    _ = ReloadCheck.h1(c.io, c.port, c.td, "ca2.pem") catch return false;
+                    return true;
+                }
+            };
+            try @import("anole_test_wait").waitUntil(io_, "the server serves the reloaded certificate", Switched{ .io = io_, .port = port, .td = td }, Switched.done);
             try ReloadCheck.serves(a, td, "ca2.pem", p[2].cert);
 
             // setCertificate: PEM in memory.

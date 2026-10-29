@@ -9,6 +9,7 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 const testing = std.testing;
+const test_wait = @import("anole_test_wait");
 const nats = @import("../root.zig");
 const Client = nats.Client;
 const FakeServer = @import("FakeServer.zig");
@@ -86,7 +87,7 @@ fn msPast(io: Io, deadline: Io.Clock.Timestamp) i64 {
 /// Waits until the client reaches `expected`, for 5 s at most.
 fn awaitState(client: *Client, expected: nats.State) !void {
     const io = client.io;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (client.state() != expected) {
         if (time.expired(io, give_up)) return error.TestStateNeverReached;
         try io.sleep(.fromMilliseconds(2), .awake);
@@ -112,7 +113,7 @@ const Waiter = struct {
     /// What `wait` returned, within 5 s.
     fn end(w: *Waiter) !Client.WaitError!void {
         const io = w.client.io;
-        const give_up = time.after(io, .fromSeconds(5));
+        const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
         while (!w.done.isSet()) {
             w.done.waitTimeout(io, .{ .deadline = give_up }) catch |err| switch (err) {
                 // A spurious wake-up is a Timeout too.
@@ -285,7 +286,7 @@ test "canceling wait leaves the client running" {
 
     var task = try io.concurrent(Client.wait, .{ &client, io });
     // Once the task waits, its cancelation ends the wait.
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (waiting(&client) == 0) {
         if (time.expired(io, give_up)) return error.TestNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);

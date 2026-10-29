@@ -2,6 +2,7 @@
 //! is not the runtime's (as the console's are): open WebSockets by
 //! protocol, rooms with their members, SSE topics with their subscribers.
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const features = @import("build_options");
 const server_mod = @import("../server.zig");
 const websocket = if (features.websocket) @import("../websocket/root.zig") else struct {};
@@ -38,11 +39,9 @@ const Asker = struct {
 fn wsSnapshot(app: *App, arena: std.mem.Allocator) !std.json.Value {
     var asker: Asker = .{ .app = app, .out = .init(arena) };
     const t = try std.Thread.spawn(.{}, Asker.run, .{&asker});
-    for (0..5000) |_| {
-        if (asker.done.load(.acquire)) break;
-        try app.io().sleep(.fromMilliseconds(1), .awake);
-    }
+    const answered = wait.waitFlag(app.io(), "the collector answered the snapshot", &asker.done);
     t.join();
+    try answered;
     if (asker.err) |e| return e;
     return try std.json.parseFromSliceLeaky(std.json.Value, arena, asker.out.written(), .{});
 }
@@ -96,30 +95,30 @@ test "console /ws: open sockets by protocol, rooms and their members, SSE topics
             defer ev.close(io);
             // Both are in: one socket over HTTP/1.1 in "lobby", one
             // subscriber of "news".
-            var seen = false;
-            for (0..500) |_| {
-                const v = try wsSnapshot(a, arena.allocator());
-                const sockets = v.object.get("sockets").?.object;
-                if (sockets.get("h1").?.integer == 1 and countOf(v, "rooms", "lobby", "members") == 1 and
-                    countOf(v, "topics", "news", "subscribers") == 1)
-                {
-                    try std.testing.expectEqual(@as(i64, 0), sockets.get("h2").?.integer);
-                    try std.testing.expectEqual(@as(i64, 0), countOf(v, "rooms", "lobby", "closed_slow"));
-                    seen = true;
-                    break;
+            const Snap = struct {
+                app: *App,
+                arena: std.mem.Allocator,
+                last: *std.json.Value,
+                fn bothIn(c: @This()) !bool {
+                    c.last.* = try wsSnapshot(c.app, c.arena);
+                    const sockets = c.last.object.get("sockets").?.object;
+                    return sockets.get("h1").?.integer == 1 and countOf(c.last.*, "rooms", "lobby", "members") == 1 and
+                        countOf(c.last.*, "topics", "news", "subscribers") == 1;
                 }
-                try io.sleep(.fromMilliseconds(5), .awake);
-            }
-            if (!seen) return error.NeverCounted;
+                fn wsGone(c: @This()) !bool {
+                    c.last.* = try wsSnapshot(c.app, c.arena);
+                    return c.last.object.get("sockets").?.object.get("h1").?.integer == 0 and countOf(c.last.*, "rooms", "lobby", "members") == -1;
+                }
+            };
+            var last: std.json.Value = undefined;
+            const snap: Snap = .{ .app = a, .arena = arena.allocator(), .last = &last };
+            try wait.waitUntil(io, "the snapshot counts the socket, its room and the subscriber", snap, Snap.bothIn);
+            try std.testing.expectEqual(@as(i64, 0), last.object.get("sockets").?.object.get("h2").?.integer);
+            try std.testing.expectEqual(@as(i64, 0), countOf(last, "rooms", "lobby", "closed_slow"));
             // The WebSocket goes: its count and its room go with it.
             ws.close(io);
             ws_open = false;
-            for (0..500) |_| {
-                const v = try wsSnapshot(a, arena.allocator());
-                if (v.object.get("sockets").?.object.get("h1").?.integer == 0 and countOf(v, "rooms", "lobby", "members") == -1) return;
-                try io.sleep(.fromMilliseconds(5), .awake);
-            }
-            return error.NeverUncounted;
+            try wait.waitUntil(io, "the snapshot no longer counts the socket or its room", snap, Snap.wsGone);
         }
     };
     var checking = try app.io().concurrent(Check.run, .{&app});

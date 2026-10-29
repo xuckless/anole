@@ -534,7 +534,11 @@ const log = std.log.scoped(.anole_h3);
 
 test "UDP: a send that a cancelation interrupts leaves it for the next cancelation point" {
     const zio = @import("zio");
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    const wait = @import("anole_test_wait");
+    // One executor: the task runs only while the test's side waits, so the
+    // cancelation is surely asked for (the test's side does that before it
+    // yields) by the time the task sees `asking`, whatever the speed.
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();
     const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -542,19 +546,27 @@ test "UDP: a send that a cancelation interrupts leaves it for the next cancelati
     defer sink.socket.close(io);
     var udp: Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), .{});
     defer udp.socket.close(io);
+    var started: std.atomic.Value(bool) = .init(false);
+    var asking: std.atomic.Value(bool) = .init(false);
     const Task = struct {
-        fn run(u: *Udp, to: std.Io.net.IpAddress, tio: std.Io) std.Io.Cancelable!void {
-            // Protected until the cancelation has surely been asked for,
-            // so that the send is the first point to see it.
+        fn run(u: *Udp, to: std.Io.net.IpAddress, tio: std.Io, s: *std.atomic.Value(bool), a: *const std.atomic.Value(bool)) std.Io.Cancelable!void {
+            // Protected until the cancelation has been asked for, so that
+            // the send is the first point to see it.
             const protection = tio.swapCancelProtection(.blocked);
-            tio.sleep(.fromMilliseconds(200), .awake) catch {};
+            s.store(true, .release);
+            wait.waitFlag(tio, "the test asks for the cancelation", a) catch {};
             _ = tio.swapCancelProtection(protection);
             u.send(tio, to, null, 0, "ping", 4);
             // As the endpoint's receive loop: it must still see it.
             return tio.checkCancel();
         }
     };
-    var future = try io.concurrent(Task.run, .{ &udp, sink.socket.address, io });
+    var future = try io.concurrent(Task.run, .{ &udp, sink.socket.address, io, &started, &asking });
+    wait.waitFlag(io, "the task started", &started) catch |err| {
+        _ = future.cancel(io) catch {};
+        return err;
+    };
+    asking.store(true, .release);
     try std.testing.expectError(error.Canceled, future.cancel(io));
 }
 

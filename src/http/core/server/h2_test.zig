@@ -217,6 +217,19 @@ const TestClient = struct {
         }
     }
 
+    /// Sends and receives until stream `id` is closed (others may still be
+    /// open).
+    fn runUntilDone(self: *TestClient, id: i32) !void {
+        while (true) {
+            try self.sendPending();
+            if (self.get(id).closed) return;
+            const bytes = try self.r.peekGreedy(1);
+            const rv = c.nghttp2_session_mem_recv2(self.session, bytes.ptr, bytes.len);
+            if (rv < 0) return error.Http2Recv;
+            self.r.toss(@intCast(rv));
+        }
+    }
+
     fn nv(name: []const u8, value: []const u8) c.nghttp2_nv {
         return .{ .name = @constCast(name.ptr), .namelen = name.len, .value = @constCast(value.ptr), .valuelen = value.len, .flags = c.NGHTTP2_NV_FLAG_NONE };
     }
@@ -652,11 +665,17 @@ test "HTTP/2: a no_wait handler that waits anyway still answers, holding up its 
     // Run in turn on the reader, so the quick one waited for the slow one.
     try std.testing.expect(client.get(slow).close_seq < client.get(hello).close_seq);
 
-    // On tasks, the quick one does not wait.
-    const slow_task = try client.request("GET", "/slow", null);
+    // On tasks, the quick one does not wait: it is answered while the
+    // other is still held (a gate, not a race against a sleep).
+    Handlers.held_gate = .unset;
+    const held_task = try client.request("GET", "/held", null);
     const hello_task = try client.request("GET", "/hello", null);
+    try client.runUntilDone(hello_task);
+    try std.testing.expect(!client.get(held_task).closed);
+    Handlers.held_gate.set(io);
     try client.run();
-    try std.testing.expect(client.get(hello_task).close_seq < client.get(slow_task).close_seq);
+    try std.testing.expectEqualStrings("held but whole", client.get(held_task).body.items);
+    try std.testing.expect(client.get(hello_task).close_seq < client.get(held_task).close_seq);
 }
 
 test "HTTP/2: many streams multiplexed on one connection" {

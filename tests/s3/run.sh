@@ -17,6 +17,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+. tests/lib/wait.sh
 ZIG=${ZIG:-zig}
 IMAGE=${S3_IMAGE:-cgr.dev/chainguard/minio@sha256:d88920d6a50bd0b088223b688be3b76c63e6205dbe494437f67ba1240ea12880}
 PORT=${S3_PORT:-59000}
@@ -57,12 +58,10 @@ start() { # name port [certs]
   docker run "${args[@]}" "$IMAGE" server /data --address :9000 ${certs:+--certs-dir /certs} >/dev/null
 }
 
+live() { curl -fsS "$@" >/dev/null 2>&1; }
 wait_ready() { # name url [curl args]
   local name=$1 url=$2; shift 2
-  for _ in $(seq 1 60); do
-    if curl -fsS "$@" "$url/minio/health/live" >/dev/null 2>&1; then return 0; fi
-    sleep 1
-  done
+  if wait_until 60 "MinIO at $url" live "$@" "$url/minio/health/live"; then return 0; fi
   echo "MinIO did not come up at $url" >&2
   docker logs "$name" 2>&1 | tail -5 >&2 || true
   return 1

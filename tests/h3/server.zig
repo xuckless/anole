@@ -20,16 +20,20 @@ pub const std_options: std.Options = .{
     .log_scope_levels = &.{.{ .scope = .zio, .level = .warn }},
 };
 
-/// GET /slow?ms=N: answers after N milliseconds.
+/// GET /slow?ms=N: answers after N milliseconds (a slow handler on purpose).
+/// Logs "slow request started" first, which run.sh waits for.
 fn slow(req: *http.Request, res: *http.Response) !void {
     const ms = std.fmt.parseInt(i64, req.query.get("ms") orelse "0", 10) catch 0;
+    std.log.info("slow request started", .{});
     try req.io.sleep(.fromMilliseconds(ms), .awake);
     res.body = "slow\n";
 }
 
-/// GET /download?n=BYTES: that many bytes, streamed.
+/// GET /download?n=BYTES: that many bytes, streamed. With `announce`, logs
+/// "download started" first (run.sh waits for it before a drain).
 fn download(req: *http.Request, res: *http.Response) !void {
     const n = std.fmt.parseInt(usize, req.query.get("n") orelse "0", 10) catch 0;
+    if (req.query.get("announce") != null) std.log.info("download started", .{});
     var w = try res.writer();
     var chunk: [16 * 1024]u8 = undefined;
     for (&chunk, 0..) |*b, i| b.* = @truncate(i);
@@ -175,5 +179,14 @@ pub fn main(init: std.process.Init) !void {
     if (anole.features.websocket) app.ws("/ws", wsEcho);
     app.webtransport("/wt", wtEcho);
     std.log.info("h3 test server on https://{s}:{d} (TCP and UDP)", .{ address, port });
+    // run.sh waits for this line, not for a fixed time: every listener,
+    // HTTP/3 included, is bound once it is out.
+    var announce = try app.io().concurrent(announceReady, .{&app});
+    defer announce.cancel(app.io()) catch {};
     try app.run();
+}
+
+fn announceReady(app: *anole.Server(void)) !void {
+    try app.waitReady();
+    std.log.info("h3 test server ready", .{});
 }

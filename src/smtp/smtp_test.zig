@@ -68,14 +68,15 @@ const Harness = struct {
     }
 };
 
-/// The fake reads a QUIT after the client has gone: waits (generously) until
-/// it has seen `n` commands starting with `prefix`.
+/// The fake reads a QUIT after the client has gone: waits until it has
+/// seen `n` commands starting with `prefix`.
 fn waitCommands(h: *Harness, prefix: []const u8, n: usize) !void {
-    for (0..2000) |_| {
-        if (h.fake.commandCount(prefix) >= n) return;
-        try h.io.sleep(.fromMilliseconds(5), .awake);
-    }
-    return error.TimedOut;
+    const Ctx = struct { h: *Harness, prefix: []const u8, n: usize };
+    try @import("anole_test_wait").waitUntil(h.io, "the fake saw the commands", Ctx{ .h = h, .prefix = prefix, .n = n }, struct {
+        fn seen(c: Ctx) bool {
+            return c.h.fake.commandCount(c.prefix) >= c.n;
+        }
+    }.seen);
 }
 
 fn expectDetail(h: *Harness, class: db.Class, code: []const u8) !void {

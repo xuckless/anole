@@ -75,12 +75,12 @@ test "net udp: echo, the replies of a batch go out together" {
             // A batch's replies are counted once their send returns, which
             // can be after they arrived here: wait for the count (10 s at
             // most), don't read it once.
-            var st = a.netStats();
-            var waited: u32 = 0;
-            while (st.datagrams_out < 20 and waited < 10_000) : (waited += 1) {
-                try io.sleep(.fromMilliseconds(1), .awake);
-                st = a.netStats();
-            }
+            try wait.waitUntil(io, "the twenty replies counted", a, struct {
+                fn counted(server: *App) bool {
+                    return server.netStats().datagrams_out >= 20;
+                }
+            }.counted);
+            const st = a.netStats();
             try std.testing.expectEqual(@as(u64, 20), st.datagrams_in);
             try std.testing.expectEqual(@as(u64, 20), st.datagrams_out);
             // UDP only: no TCP listener either (the core's 127.0.0.1:8080
@@ -219,7 +219,9 @@ test "net udp: per-core sockets keep a peer on one socket" {
     const Probe = struct {
         var by_peer: [8]std.atomic.Value(u32) = @splat(.init(0xff));
         var bad: std.atomic.Value(u32) = .init(0);
+        var handled: std.atomic.Value(u32) = .init(0);
         pub fn datagram(d: *net.Datagram) !void {
+            defer _ = handled.fetchAdd(1, .release);
             const peer: usize = d.data[0] - '0';
             const idx = d.socket.index;
             const prev = by_peer[peer].cmpxchgStrong(0xff, idx, .acq_rel, .acquire);
@@ -240,7 +242,7 @@ test "net udp: per-core sockets keep a peer on one socket" {
             for (&clients) |*c| c.* = try client(io);
             defer for (clients) |c| c.close(io);
             for (0..10) |_| for (clients, 0..) |c, i| try c.send(io, &to, &.{@as(u8, '0') + @as(u8, @intCast(i))});
-            try io.sleep(.fromMilliseconds(100), .awake);
+            try wait.waitAtLeast(io, "every datagram handled", &Probe.handled, 80);
             try std.testing.expectEqual(@as(u32, 0), Probe.bad.load(.acquire));
         }
     }.run);

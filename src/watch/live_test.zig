@@ -161,14 +161,18 @@ test "watch live: postgres: two channels share the hub connection; the listener'
     _ = try client.all(bool, &c, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE query ILIKE 'LISTEN %' AND pid <> pg_backend_pid()", .{});
     try waitGaps(&ca, io, 1);
     try waitGaps(&cb, io, 1);
-    var sent: u32 = 0;
-    while (ca.count("|anole_wa|three|") == 0) {
-        // The LISTEN may not be back yet: notify until it is heard.
-        _ = try client.exec(&c, "NOTIFY anole_wa, 'three'", .{});
-        sent += 1;
-        try std.testing.expect(sent < 2000);
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    // The LISTEN may not be back yet: notify until it is heard.
+    const Notify = struct {
+        col: *Collector,
+        client: *pg.Client,
+        c: *db.Ctx,
+        fn heard(n: @This()) !bool {
+            if (n.col.count("|anole_wa|three|") != 0) return true;
+            _ = try n.client.exec(n.c, "NOTIFY anole_wa, 'three'", .{});
+            return false;
+        }
+    };
+    try wait.waitUntil(io, "a NOTIFY heard once the LISTEN is back", Notify{ .col = &ca, .client = client, .c = &c }, Notify.heard);
     try waitConnected(wa, io);
 }
 
@@ -195,13 +199,17 @@ test "watch live: redis: PSUBSCRIBE room:* reaches the watch with the channel an
     try w.start(null, null, null);
     defer w.stop();
     try waitConnected(w, io);
-    var sent: u32 = 0;
-    while (col.count("|anole_room:7|hello|anole_room:*|") == 0) {
-        _ = try r.command(&c, .{ "PUBLISH", "anole_room:7", "hello" });
-        sent += 1;
-        try std.testing.expect(sent < 2000);
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    const Publish = struct {
+        col: *Collector,
+        r: *redis.Client,
+        c: *db.Ctx,
+        fn heard(p: @This()) !bool {
+            if (p.col.count("|anole_room:7|hello|anole_room:*|") != 0) return true;
+            _ = try p.r.command(p.c, .{ "PUBLISH", "anole_room:7", "hello" });
+            return false;
+        }
+    };
+    try wait.waitUntil(io, "a PUBLISH heard by the pattern watch", Publish{ .col = &col, .r = r, .c = &c }, Publish.heard);
 }
 
 fn killOthers(r: *redis.Client, c: *db.Ctx) !void {
@@ -308,12 +316,14 @@ test "watch live: redis: a group redelivers its pending entries before new ones,
         const position = parts.next().?;
         try w.ackEntry("anole_stream_g", position);
         // Wait for the XACK to be sent: the pending count falls to 2.
-        for (0..4000) |_| {
-            const pending = try r.command(&c, .{ "XPENDING", "anole_stream_g", "g1" });
-            const n = pendingCount(pending);
-            if (n == 2) break;
-            try io.sleep(.fromMilliseconds(5), .awake);
-        } else return error.TimedOut;
+        const Pending = struct {
+            r: *redis.Client,
+            c: *db.Ctx,
+            fn two(p: @This()) !bool {
+                return pendingCount(try p.r.command(p.c, .{ "XPENDING", "anole_stream_g", "g1" })) == 2;
+            }
+        };
+        try wait.waitUntil(io, "the XACK settled p1 (two pending)", Pending{ .r = r, .c = &c }, Pending.two);
     }
 }
 
@@ -414,11 +424,16 @@ test "watch live: mongodb: insert, update and delete arrive with fullDocument; a
     try coll.drop(&c);
     try col.waitFor(io, "drop|");
     try col.waitFor(io, "invalidate|");
-    var sent: u32 = 0;
-    while (col.count("\"name\":\"bob\"") == 0) {
-        _ = try coll.insertOne(&c, .{ .name = "bob", .n = 3 });
-        sent += 1;
-        try std.testing.expect(sent < 400);
-        try io.sleep(.fromMilliseconds(50), .awake);
-    }
+    // The stream may not be open again yet: insert until it is heard.
+    const Insert = struct {
+        col: *Collector,
+        coll: *const @TypeOf(coll),
+        c: *db.Ctx,
+        fn heard(i: @This()) !bool {
+            if (i.col.count("\"name\":\"bob\"") != 0) return true;
+            _ = try i.coll.insertOne(i.c, .{ .name = "bob", .n = 3 });
+            return false;
+        }
+    };
+    try wait.waitUntil(io, "an insert heard once the stream reopened", Insert{ .col = &col, .coll = &coll, .c = &c }, Insert.heard);
 }

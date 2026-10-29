@@ -339,12 +339,16 @@ test "WebSocket over HTTP/2 (RFC 8441): echo, ping, close" {
     // stream does.
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    for (0..1000) |_| {
-        out.clearRetainingCapacity();
-        try registry.render(&out.writer);
-        if (std.mem.indexOf(u8, out.written(), "route=\"/chat\",status=\"101\"} 1") != null) break;
-        try io.sleep(.fromMilliseconds(2), .awake);
-    } else return error.TestUnexpectedResult;
+    const Recorded = struct {
+        registry: *observe.metrics.Registry,
+        out: *std.Io.Writer.Allocating,
+        fn as101(r: @This()) !bool {
+            r.out.clearRetainingCapacity();
+            try r.registry.render(&r.out.writer);
+            return std.mem.indexOf(u8, r.out.written(), "route=\"/chat\",status=\"101\"} 1") != null;
+        }
+    };
+    try test_wait.waitUntil(io, "the metrics record the stream as a 101", Recorded{ .registry = &registry, .out = &out }, Recorded.as101);
 }
 
 test "WebSocket over HTTP/2: a socket carries more than limits.body_max in total" {
@@ -623,11 +627,7 @@ test "WebSocket over HTTP/2: callbacks(): open, echo, ping, close" {
     const closing = try client.nextFrame(&op, &buf);
     try std.testing.expectEqual(wsc.Opcode.close, op);
     try std.testing.expectEqual(@as(u16, 1000), std.mem.readInt(u16, closing[0..2], .big));
-    for (0..200) |_| {
-        if (callbacks_closed.load(.acquire)) break;
-        try io.sleep(.fromMilliseconds(5), .awake);
-    }
-    try std.testing.expect(callbacks_closed.load(.acquire));
+    try test_wait.waitFlag(io, "the close callback ran", &callbacks_closed);
 }
 
 fn startEcho(server: *dusty.Server(void), io: std.Io) !std.Io.Future(anyerror!void) {
@@ -776,25 +776,23 @@ test "WebSocket over HTTP/2: a room member that stops reading is closed, its str
     defer client.deinit();
     try client.open();
     try std.testing.expectEqual(@as(u16, 200), client.status);
-    for (0..1000) |_| {
-        if (lobby.count("lobby") == 1) break;
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
-    try std.testing.expectEqual(@as(usize, 1), lobby.count("lobby"));
+    try test_wait.waitUntil(io, "the socket joined the lobby", {}, struct {
+        fn joined(_: void) bool {
+            return lobby.count("lobby") == 1;
+        }
+    }.joined);
 
     const msg = try gpa.alloc(u8, 64 * 1024);
     defer gpa.free(msg);
     @memset(msg, 'm');
-    var left = false;
-    for (0..5000) |_| {
-        _ = lobby.broadcast("lobby", .binary, msg, null);
-        try io.sleep(.fromMilliseconds(1), .awake);
-        if (lobby.count("lobby") == 0) {
-            left = true;
-            break;
+    // Broadcast until the member that reads nothing is closed and leaves.
+    try test_wait.waitUntil(io, "the slow member left the lobby", msg, struct {
+        fn left(m: []const u8) bool {
+            if (lobby.count("lobby") == 0) return true;
+            _ = lobby.broadcast("lobby", .binary, m, null);
+            return false;
         }
-    }
-    try std.testing.expect(left);
+    }.left);
 }
 
 fn subprotocolSocket(req: *dusty.Request, res: *dusty.Response) !void {

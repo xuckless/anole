@@ -7,6 +7,7 @@
 #   tests/grpc/interop/run-http2.sh [path-to-grpc-interop-server]
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/../../lib/wait.sh"
 server=${1:-zig-out/bin/grpc-interop-server}
 module=github.com/grpc/grpc/tools/http2_interop
 version=v0.0.0-20260718051024-8542e01ff47e # grpc 8542e01ff47e
@@ -37,7 +38,8 @@ cp "$work/cert.pem" "$work/suite/src/core/tsi/test_creds/ca.pem"
 pids="$pids $!"
 "$server" 10076 "$work/cert.pem" "$work/key.pem" >"$work/tls.log" 2>&1 &
 pids="$pids $!"
-sleep 1
+wait_until 30 "the h2c server to listen" port_open 127.0.0.1 10075 || { tail -20 "$work/h2c.log"; exit 1; }
+wait_until 30 "the TLS server to listen" port_open 127.0.0.1 10076 || { tail -20 "$work/tls.log"; exit 1; }
 
 run() { # mode port use_tls test_case
   (cd "$work/suite" && go test -count=1 -v . -args -server_host=127.0.0.1 -server_port="$2" \

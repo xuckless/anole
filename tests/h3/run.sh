@@ -11,6 +11,7 @@ set -eu
 server=${1:-zig-out/bin/h3-test-server}
 client=${2:-zig-out/bin/h3-test-client}
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/../lib/wait.sh"
 work=$(mktemp -d)
 pid=""
 trap '[ -n "$pid" ] && kill -9 $pid 2>/dev/null; [ -n "$peer" ] && kill -9 $peer 2>/dev/null; rm -rf "$work"' EXIT
@@ -21,8 +22,19 @@ py="$work/venv/bin/python -I $here/client.py"
 port=${ANOLE_H3_PORT:-18543}
 url=https://127.0.0.1:$port
 
-start() { "$server" $port "$@" >"$work/server.log" 2>&1 & pid=$!; sleep 1; }
 fail() { echo "FAIL $1"; tail -20 "$work/server.log"; exit 1; }
+# Starts the server and waits until it says every listener is bound (or it
+# exited).
+up() { log_has "$work/server.log" "h3 test server ready" || gone $pid; }
+start() {
+  "$server" $port "$@" >"$work/server.log" 2>&1 &
+  pid=$!
+  wait_until 30 "the h3 test server to listen" up || fail "the server did not start"
+  gone $pid && fail "the server exited at start"
+  return 0
+}
+# Waits for the server to exit (after a TERM).
+stopped() { wait_until 30 "the h3 test server to exit" gone $pid || fail "$1"; }
 
 start
 for n in 0 1000 70000 1000000 10000000; do
@@ -64,25 +76,24 @@ out=$($py "$url/nothing-here" --quiet | head -1)
 echo "PASS 404"
 
 # A drain lets a download in flight finish.
-$py "$url/download?n=3000000" --quiet >"$work/mid" 2>&1 &
+$py "$url/download?n=3000000&announce" --quiet >"$work/mid" 2>&1 &
 downloader=$!
-sleep 0.5
+wait_until 30 "the download to start" log_has "$work/server.log" "download started" || fail "drain: the download never started"
 kill -TERM $pid
 wait $downloader || true
 grep -q "status 200 bytes 3000000" "$work/mid" || fail "drain: $(cat "$work/mid")"
-for i in $(seq 1 200); do kill -0 $pid 2>/dev/null || break; sleep 0.05; done
-kill -0 $pid 2>/dev/null && fail "server still running after the drain"
+stopped "server still running after the drain"
 grep -qiE "leaked|panic" "$work/server.log" && fail "leak or panic in the server log"
 pid=""
 echo "PASS drain"
-# The drain's hard deadline: a request that never finishes is cut off.
+# The drain's hard deadline: a request that never finishes (within any
+# wait here) is cut off.
 start drain=1000
-$py "$url/slow?ms=60000" --quiet >"$work/slow" 2>&1 &
+$py "$url/slow?ms=3600000" --quiet >"$work/slow" 2>&1 &
 slowpid=$!
-sleep 0.5
+wait_until 30 "the slow request to start" log_has "$work/server.log" "slow request started" || fail "drain deadline: the request never started"
 kill -TERM $pid
-for i in $(seq 1 60); do kill -0 $pid 2>/dev/null || break; sleep 0.1; done
-kill -0 $pid 2>/dev/null && fail "server still running 6 s after a 1 s drain"
+stopped "server still running long after a 1 s drain"
 kill -9 $slowpid 2>/dev/null || true
 grep -qiE "leaked|panic" "$work/server.log" && fail "leak or panic after the drain deadline"
 pid=""
@@ -92,7 +103,7 @@ start retry
 out=$($py "$url/download?n=70000" --quiet | head -1)
 [ "$out" = "status 200 bytes 70000" ] || fail "retry: $out"
 kill -TERM $pid
-for i in $(seq 1 200); do kill -0 $pid 2>/dev/null || break; sleep 0.05; done
+stopped "server still running after a TERM (retry)"
 grep -qiE "leaked|panic" "$work/server.log" && fail "leak or panic with retry"
 pid=""
 echo "PASS address validation (Retry)"
@@ -113,7 +124,7 @@ echo "$out" | grep -q "^body (4 bytes): late" || fail "0-RTT POST: $out"
 [ "$(echo "$out" | tail -1)" = "resumed 1 early 1" ] || fail "0-RTT POST: $out"
 echo "PASS 0-RTT POST held until the handshake"
 kill -TERM $pid
-for i in $(seq 1 200); do kill -0 $pid 2>/dev/null || break; sleep 0.05; done
+stopped "server still running after a TERM (0-RTT)"
 grep -qiE "leaked|panic" "$work/server.log" && fail "leak or panic with 0-RTT"
 pid=""
 # WebTransport (draft-02) and WebSocket over HTTP/3 (RFC 9220) on aioquic's
@@ -127,9 +138,10 @@ for mode in wt wt-close ws; do
 done
 $xc wt-hold $port >"$work/wt-hold" 2>&1 &
 $xc ws-hold $port >"$work/ws-hold" 2>&1 &
-sleep 1
+wait_until 30 "the WebTransport session to open" log_has "$work/wt-hold" "^PASS WebTransport session accepted" || fail "WebTransport hold: $(cat "$work/wt-hold")"
+wait_until 30 "the WebSocket to open" log_has "$work/ws-hold" "^PASS WebSocket over HTTP/3 accepted" || fail "WebSocket hold: $(cat "$work/ws-hold")"
 kill -TERM $pid
-for i in $(seq 1 100); do kill -0 $pid 2>/dev/null || break; sleep 0.05; done
+stopped "server still running after a TERM (WebTransport)"
 wait
 grep -qx "capsules 0x78ae 0x2843:00000000'server shutting down'" "$work/wt-hold" || fail "WebTransport drain: $(cat "$work/wt-hold")"
 grep -qx "close 1001 server shutting down" "$work/ws-hold" || fail "WebSocket drain: $(cat "$work/ws-hold")"
@@ -153,9 +165,11 @@ pid=""
 "$client" cert "$work"
 "$work/venv/bin/python" -I "$here/peer_server.py" $port "$work/cert.pem" "$work/key.pem" >"$work/peer.log" 2>&1 &
 peer=$!
-sleep 1
 ca="$work/cert.pem"
 pfail() { echo "FAIL $1"; tail -20 "$work/peer.log"; exit 1; }
+peer_up() { log_has "$work/peer.log" "^listening" || gone $peer; }
+wait_until 30 "aioquic's server to listen" peer_up || pfail "aioquic's server did not start"
+gone $peer && pfail "aioquic's server exited at start"
 for n in 0 1000 1000000 10000000; do
   want=$(python3 -I -c "import sys; n=int(sys.argv[1]); p=bytes(range(251)); print(sum((p*(n//251+1))[:n]) & 0xffffffff)" $n)
   out=$("$client" get $port "$ca" "/download?n=$n") || pfail "client download $n"
@@ -191,8 +205,7 @@ datagram d1
 datagram datagram two
 closed by peer 7 asked to
 second session closed" ] || pfail "client WebTransport: $out"
-sleep 0.2
-grep -qx "wt closed 4242 client done" "$work/peer.log" || pfail "client WebTransport close not seen by the server"
+wait_until 30 "the server to see the WebTransport close" log_has "$work/peer.log" "^wt closed 4242 client done$" || pfail "client WebTransport close not seen by the server"
 echo "PASS client WebTransport: streams, datagrams, a close from either side"
 kill $peer
 peer=""

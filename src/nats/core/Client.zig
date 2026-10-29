@@ -1375,8 +1375,14 @@ test "a second connect() that gives up returns Canceled; the first one goes on" 
     defer client.deinit();
     var first = try io.concurrent(connectLong, .{&client});
     defer first.cancel(io) catch {};
-    while (client.state() != .connecting) try io.sleep(.fromMilliseconds(1), .awake);
+    try @import("anole_test_wait").waitUntil(io, "the first connect() to start", &client, struct {
+        fn connecting(c: *Client) bool {
+            return c.state() == .connecting;
+        }
+    }.connecting);
     var second = try io.concurrent(connectLong, .{&client});
+    // Time for the second to join the wait (a sensitivity sleep: canceled
+    // before it joins, it gives up as well).
     try io.sleep(.fromMilliseconds(20), .awake);
     try testing.expectError(error.Canceled, second.cancel(io));
     try testing.expectEqual(.connecting, client.state());
@@ -1405,7 +1411,11 @@ test "many tasks may wait in connect() for the one connection" {
         f.* = try io.concurrent(connectLong, .{&client});
         started += 1;
     }
-    while (client.state() != .connecting) try io.sleep(.fromMilliseconds(1), .awake);
+    try @import("anole_test_wait").waitUntil(io, "the first connect() to start", &client, struct {
+        fn connecting(c: *Client) bool {
+            return c.state() == .connecting;
+        }
+    }.connecting);
     release.set(io);
     for (&callers) |*f| try f.await(io);
     try testing.expectEqual(.connected, client.state());

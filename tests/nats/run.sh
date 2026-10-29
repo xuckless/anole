@@ -11,6 +11,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+. tests/lib/wait.sh
 ZIG=${ZIG:-zig}
 IMAGE=${NATS_IMAGE:-nats:2.11}
 PORT=${NATS_PORT:-54222}
@@ -18,8 +19,5 @@ NAME=anole-nats-test-$$
 trap '[ -n "${ANOLE_KEEP_CONTAINERS:-}" ] || docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
 
 docker run -d --name "$NAME" -p "127.0.0.1:$PORT:4222" "$IMAGE" -js >/dev/null
-for _ in $(seq 1 50); do
-  if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then break; fi
-  sleep 0.2
-done
+wait_until 60 "nats-server to listen" port_open 127.0.0.1 "$PORT" || { docker logs "$NAME" 2>&1 | tail -30 >&2; exit 1; }
 "$ZIG" build test -Dnats-test-url="nats://127.0.0.1:$PORT" "$@"

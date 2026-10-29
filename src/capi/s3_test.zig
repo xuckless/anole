@@ -121,7 +121,7 @@ const Rig = struct {
     fn deinit(r: *Rig) void {
         r.ev.deinit();
         r.e.drain() catch {};
-        _ = r.e.wait(5000);
+        _ = r.e.wait(@intCast(wait.deadlineMs()));
         r.e.destroy();
         r.fake.stop();
         alloc.free(r.json);
@@ -131,10 +131,6 @@ const Rig = struct {
 
 fn pattern(buf: []u8, seed: u8) void {
     for (buf, 0..) |*b, i| b.* = @truncate(i *% 31 +% seed);
-}
-
-fn sleepMs(ms: i64) void {
-    std.Io.sleep(engine.threadedIo(), .fromMilliseconds(ms), .awake) catch {};
 }
 
 test "capi s3: put then get whole: the RESULT has the body and the etag" {

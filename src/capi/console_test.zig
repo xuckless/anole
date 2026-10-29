@@ -56,17 +56,9 @@ fn get(io: std.Io, port: u16, path: []const u8, request_id: []const u8) !void {
     if (!std.mem.startsWith(u8, ow.buffered(), "HTTP/1.1 200")) return error.NotOk;
 }
 
-fn waitAtLeast(io: std.Io, v: *std.atomic.Value(u32), n: u32) !void {
-    for (0..2500) |_| {
-        if (v.load(.acquire) >= n) return;
-        try io.sleep(.fromMilliseconds(2), .awake);
-    }
-    return error.TimedOut;
-}
-
 fn check(a: *Logger, port: u16, io: std.Io) !void {
     try get(io, port, "/charges/42", "req-7f3a");
-    try waitAtLeast(io, &a.answered, 1);
+    try wait.waitAtLeast(io, "the consumer answered the request", &a.answered, 1);
     // The request is answered and its slot released: its handle tags
     // nothing now.
     a.e.consoleLog(.warn, "app", "late line", a.last.load(.acquire));

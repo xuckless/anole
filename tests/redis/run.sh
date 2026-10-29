@@ -18,6 +18,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+. tests/lib/wait.sh
 ZIG=${ZIG:-zig}
 IMAGE=${REDIS_IMAGE:-redis:7}
 PORT=${REDIS_PORT:-56379}
@@ -61,11 +62,8 @@ docker run -d --name "$NAME" -p "127.0.0.1:$PORT:6379" -p "127.0.0.1:$TLS_PORT:6
   --tls-ca-cert-file /tls/root.crt --tls-auth-clients no \
   --user anole on ">$PASSWORD" '~*' '&*' '+@all' >/dev/null
 
-for _ in $(seq 1 60); do
-  if docker exec "$NAME" "${SERVER%-server}-cli" ping 2>/dev/null | grep -q PONG; then break; fi
-  sleep 1
-done
-if ! docker exec "$NAME" "${SERVER%-server}-cli" ping 2>/dev/null | grep -q PONG; then
+pong() { docker exec "$NAME" "${SERVER%-server}-cli" ping 2>/dev/null | grep -q PONG; }
+if ! wait_until 60 "the server to answer PING" pong; then
   echo "the server did not answer; its log:" >&2
   docker logs "$NAME" >&2 || true
   exit 1

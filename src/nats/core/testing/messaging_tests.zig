@@ -9,6 +9,7 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 const testing = std.testing;
+const test_wait = @import("anole_test_wait");
 const nats = @import("../root.zig");
 const Client = nats.Client;
 const FakeServer = @import("FakeServer.zig");
@@ -210,7 +211,7 @@ fn serveStalled(io: Io, listener: *net.Server, release: *Io.Event) !void {
 
 /// Waits until `event` is set, for 5 s at most.
 fn awaitEvent(io: Io, event: *Io.Event) !void {
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (!event.isSet()) {
         event.waitTimeout(io, .{ .deadline = give_up }) catch |err| switch (err) {
             // Io.Event reports a spurious wakeup as Timeout too.
@@ -236,7 +237,7 @@ fn publishUntilError(client: *Client, payload: []const u8, published: *std.atomi
 /// 200 ms. How much the sockets take first differs by system; 10 s at most.
 fn awaitStuck(client: *Client, published: *std.atomic.Value(u32)) !void {
     const io = client.io;
-    const give_up = time.after(io, .fromSeconds(10));
+    const give_up = time.after(io, .fromSeconds(10 * @as(i64, test_wait.timeoutFactor())));
     var last = published.load(.monotonic);
     var still_since = Io.Clock.awake.now(io);
     while (true) {
@@ -321,7 +322,7 @@ test "close() while a publish waits for room: ConnectionClosed at once" {
     const start = Io.Clock.awake.now(io);
     s.client.close();
     try testing.expectError(error.ConnectionClosed, publisher.await(io));
-    try testing.expect(elapsedSince(io, start).toSeconds() < 1);
+    if (test_wait.timing()) try testing.expect(elapsedSince(io, start).toSeconds() < 1);
 }
 
 fn waitFor(duration: Io.Duration) Io.Timeout {
@@ -341,7 +342,7 @@ test "publishMessageTimeout gives up waiting for room at its timeout, and the cl
     try testing.expectError(error.Timeout, s.client.publishMessageTimeout(.{ .subject = "stalled", .payload = "late" }, waitFor(.fromMilliseconds(100))));
     const took = elapsedSince(io, start);
     try testing.expect(took.toMilliseconds() >= 100);
-    try testing.expect(took.toSeconds() < 5);
+    if (test_wait.timing()) try testing.expect(took.toSeconds() < 5);
     // Nothing went in, and only the stuck publish waits for room.
     try testing.expectEqual(out, s.client.stats().messages_out);
     try testing.expectEqual(1, s.client.outbound.roomWaiters(io));
@@ -390,7 +391,7 @@ fn subscribeOnce(client: *Client) Client.SubscribeError!void {
 /// Waits until `count` puts wait for room, for 5 s at most.
 fn awaitRoomWaiters(client: *Client, count: u32) !void {
     const io = client.io;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (client.outbound.roomWaiters(io) < count) {
         if (time.expired(io, give_up)) return error.TestNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -442,7 +443,7 @@ test "a subscribe with a timeout gives up waiting for room at it, and is not reg
     try testing.expectError(error.Timeout, s.client.subscribe("late.sub", .{ .timeout = waitFor(.fromMilliseconds(100)) }));
     const took = elapsedSince(io, start);
     try testing.expect(took.toMilliseconds() >= 100);
-    try testing.expect(took.toSeconds() < 5);
+    if (test_wait.timing()) try testing.expect(took.toSeconds() < 5);
     // Nothing stays, and only the stuck publish waits for room.
     try testing.expectEqual(0, s.client.subscriptions.count(io));
     try testing.expectEqual(1, s.client.outbound.roomWaiters(io));
@@ -781,7 +782,7 @@ test "max_messages counts the messages dropped too, then the subscription ends" 
     const once = try s.client.subscribe("once", .{ .max_messages = 3, .pending = .{ .messages = 1 } });
     defer once.deinit();
     try s.client.flush(quick);
-    const give_up = time.after(testing.io, .fromSeconds(5));
+    const give_up = time.after(testing.io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (once.messages.isOpen(testing.io)) {
         if (time.expired(testing.io, give_up)) return error.TestNeverEnded;
         try testing.io.sleep(.fromMilliseconds(1), .awake);
@@ -810,7 +811,7 @@ test "a message cut short by the server is freed" {
 /// Waits until `sub` has received `count` messages, for 5 s at most.
 fn awaitReceived(sub: *nats.Subscription, count: u64) !void {
     const io = testing.io;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (sub.stats().received < count) {
         if (time.expired(io, give_up)) return error.TestMessagesNeverCame;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -1033,7 +1034,7 @@ fn nextLong(sub: *nats.Subscription) nats.Subscription.NextError!?nats.Message {
 /// Waits until a task waits in `sub.next()`, for 5 s at most.
 fn awaitReceiving(sub: *nats.Subscription) !void {
     const io = testing.io;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (!sub.messages.isReceiving(io)) {
         if (time.expired(io, give_up)) return error.TestReceiverNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -1056,7 +1057,7 @@ test "close() while a task waits in next(): ConnectionClosed at once" {
     const start = Io.Clock.awake.now(io);
     s.client.close();
     try testing.expectError(error.ConnectionClosed, receiver.await(io));
-    try testing.expect(elapsedSince(io, start).toSeconds() < 1);
+    if (test_wait.timing()) try testing.expect(elapsedSince(io, start).toSeconds() < 1);
     try testing.expectError(error.ConnectionClosed, idle.next(.{}));
     try testing.expectError(error.ConnectionClosed, idle.unsubscribe());
     try s.server.await(io);
@@ -1133,7 +1134,7 @@ test "unsubscribe() from another task while next() waits: null at once" {
     const start = Io.Clock.awake.now(io);
     try idle.unsubscribe();
     try testing.expect(try receiver.await(io) == null);
-    try testing.expect(elapsedSince(io, start).toSeconds() < 1);
+    if (test_wait.timing()) try testing.expect(elapsedSince(io, start).toSeconds() < 1);
     try s.client.flush(quick);
     try s.finish();
 }
@@ -1186,10 +1187,10 @@ test "publishNow past the outbound limit is Full at once: nothing queued, nobody
 
     // The server reads again: room comes back, and the next publish is taken.
     s.release.set(io);
-    var tries: u32 = 0;
-    while (!s.client.writable()) : (tries += 1) {
-        if (tries > 5000) return error.TestNeverWritable;
-        try io.sleep(.fromMilliseconds(2), .awake);
-    }
+    try test_wait.waitUntil(io, "room in the outbound queue", &s, struct {
+        fn room(st: *Stalled) bool {
+            return st.client.writable();
+        }
+    }.room);
     _ = try s.client.publishNow(.{ .subject = "stalled", .payload = "again" });
 }

@@ -220,13 +220,17 @@ test "Readiness: one ping per ttl, the answer kept in between" {
         }
     };
     var fake: Fake = .{};
-    var ready: Readiness = .{ .io = testing.io, .context = &fake, .ping = Fake.ping, .ttl = .fromMilliseconds(50) };
+    // A ttl no run of the test outlives while the answer must be kept, so
+    // the kept answer never depends on how fast the machine is.
+    var ready: Readiness = .{ .io = testing.io, .context = &fake, .ping = Fake.ping, .ttl = .fromSeconds(600) };
     var health = observe.Health.init(.{});
     try ready.register(&health, "db");
     try testing.expect(health.checks[0].ready(health.checks[0].ctx));
     fake.up = false;
     try testing.expect(Readiness.check(&ready));
     try testing.expectEqual(@as(u32, 1), fake.pings);
+    // Then a 50 ms ttl, and time passes on purpose past it (a lower bound).
+    ready.ttl = .fromMilliseconds(50);
     try testing.io.sleep(.fromMilliseconds(60), .awake);
     try testing.expect(!Readiness.check(&ready));
     try testing.expectEqual(@as(u32, 2), fake.pings);
