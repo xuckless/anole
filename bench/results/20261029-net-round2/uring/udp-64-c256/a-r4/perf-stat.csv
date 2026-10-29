@@ -1,0 +1,9 @@
+# started on Thu Oct 29 20:22:56 2026
+
+<not counted>,,cpu_atom/instructions/u,0,0.00,,
+4367971764,,cpu_core/instructions/u,14793303988,100.00,,
+<not counted>,,cpu_atom/cycles/u,0,0.00,,
+1988652564,,cpu_core/cycles/u,14793293342,100.00,,
+14793.29,msec,task-clock,14793287953,100.00,,
+0,,page-faults,14793284042,100.00,,
+0,,syscalls:sys_enter_brk,14793280339,100.00,,

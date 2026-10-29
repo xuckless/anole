@@ -30,6 +30,9 @@ mkdir -p "$out"
 log() { echo "$(date +%H:%M:%S) $*" | tee -a "$out/run.log"; }
 cg() { echo "/sys/fs/cgroup/system.slice/docker-$(docker inspect -f '{{.Id}}' "$1").scope"; }
 usage() { awk '$1=="usage_usec"{print $2}' "$(cg "$1")/cpu.stat"; }
+# Busy jiffies of the SUT's CPU and its SMT sibling (user nice system irq softirq).
+cpu23() { awk '$1=="cpu2"||$1=="cpu3"{printf "%d ", $2+$3+$4+$7+$8}' /proc/stat; }
+others() { pgrep -c -x 'rsync|ssh|sshd|scp' || true; }
 
 one() { # <backend> <proto> <size> <conns> <side> <run>
   local be=$1 p=$2 sz=$3 n=$4 s=$5 r=$6
@@ -51,14 +54,20 @@ one() { # <backend> <proto> <size> <conns> <side> <run>
   docker run -d --name net-load --network host --cpuset-cpus "$LOAD_CPUS" --ulimit nofile=1048576:1048576 \
     -v "$TOOLS:/b:ro" --entrypoint /b/$tool anole-bench/loadgen $args -size $sz -warmup ${WARM}s -d ${DUR}s >/dev/null
   sleep "$WARM"
-  local u0; u0=$(usage net-sut)
+  local u0 c0 o0; u0=$(usage net-sut); c0=$(cpu23); o0=$(others)
   docker run --rm --privileged --pid=host --cpuset-cpus 16-19 -v "$d:/out" anole-bench/perf perf stat -x, \
     -e instructions:u,cycles:u,task-clock,page-faults,syscalls:sys_enter_brk -p "$pid" -o /out/perf-stat.csv -- sleep "$DUR"
-  echo $(( $(usage net-sut) - u0 )) > "$d/cpu-usec"; echo "$DUR" > "$d/dur"
+  local u1 c1; u1=$(usage net-sut); c1=$(cpu23)
+  echo $(( u1 - u0 )) > "$d/cpu-usec"; echo "$DUR" > "$d/dur"
+  # Other work on the SUT's core: cpu2's busy time beyond the server's own
+  # (includes the loopback softirqs it serves), and cpu3, its idle sibling.
+  read -r a2 a3 <<<"$c0"; read -r b2 b3 <<<"$c1"
+  local hz; hz=$(getconf CLK_TCK)
+  echo "cpu2_beyond_sut_pct $(( ((b2 - a2) * 1000000 / hz - (u1 - u0)) * 100 / (DUR * 1000000) )) cpu3_busy_pct $(( (b3 - a3) * 100 / (hz * DUR) )) rsync_ssh_procs $o0/$(others)" > "$d/intrusion"
   docker wait net-load >/dev/null; docker logs net-load > "$d/load.json" 2>&1; docker rm net-load >/dev/null
   docker logs net-sut > "$d/server.log" 2>&1
   docker rm -f net-sut >/dev/null
-  log "$be $p $sz c$n $s r$r: $(python3 "$bench/repro/net-ab-summary.py" one "$d")"
+  log "$be $p $sz c$n $s r$r: $(python3 "$bench/repro/net-ab-summary.py" one "$d"); $(cat "$d/intrusion")"
 }
 
 log "start: ${names[*]} = $(for s in "${names[@]}"; do echo -n "${image[$s]}@$(docker inspect -f '{{.Id}}' "${image[$s]}" | cut -c8-19) "; done)REST=$REST RUNS=$RUNS DUR=$DUR"
