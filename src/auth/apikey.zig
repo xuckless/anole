@@ -120,7 +120,7 @@ pub const Middleware = struct {
     }
 };
 
-test "generate and digest" {
+test "apikey: a generated key carries the ak_ prefix and 46 characters, and its digest is digest(key)" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const k = try generate(arena.allocator(), std.testing.io);

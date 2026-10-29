@@ -410,7 +410,7 @@ fn expectEverySplit(framing: Framing, input: []const u8, expected: []const u8) !
     }
 }
 
-test "framing: lines" {
+test "framing: lines split at LF at any read boundary, CR stripped unless strip_cr is off" {
     try expectEverySplit(.{ .lines = .{} }, "a\nb\r\nc", "a|b|");
     try expectEverySplit(.{ .lines = .{} }, "a\n\nb\n", "a||b|");
     // Without strip_cr the "\r" stays.
@@ -441,7 +441,7 @@ test "framing: a line over max closes" {
     try testing.expectError(error.FrameTooLarge, raw.feed("abcde", &frames, gpa));
 }
 
-test "framing: length prefixes" {
+test "framing: length prefixes of 1, 2 and 4 bytes in either byte order decode at any split, with max and header-inclusive lengths enforced" {
     // Two frames and an empty one: 1-byte, big endian.
     try expectEverySplit(.{ .length = .{ .bytes = 1 } }, "\x02hi\x00\x03abc", "hi||abc|");
     try expectEverySplit(.{ .length = .{ .bytes = 2 } }, "\x00\x02hi\x00\x01x", "hi|x|");
@@ -464,7 +464,7 @@ test "framing: length prefixes" {
     try testing.expectError(error.InvalidFrame, low.feed("\x00\x01", &frames, gpa));
 }
 
-test "framing: varint" {
+test "framing: varint prefixes decode at any split, and a sixth length byte or a length over max is refused" {
     // 0, 1 byte "x", 127 would be long: test the prefixes through encoding.
     const gpa = testing.allocator;
     const f: Framing = .{ .varint = .{ .max = 1 << 22 } };

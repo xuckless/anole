@@ -483,7 +483,7 @@ pub const Cluster = struct {
     }
 };
 
-test "parseHostPort" {
+test "kafka: host:port parsing takes bracketed IPv6 and defaults the port to 9092" {
     const a = parseHostPort("kafka-1:9093");
     try std.testing.expectEqualStrings("kafka-1", a.host);
     try std.testing.expectEqual(@as(u16, 9093), a.port);

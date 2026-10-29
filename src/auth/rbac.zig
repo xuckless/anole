@@ -104,7 +104,7 @@ pub const Require = struct {
     }
 };
 
-test "roles, inclusion and wildcards" {
+test "rbac: a role grants its own and its included roles' permissions, wildcards match by prefix, and a cycle grants nothing" {
     const policy: Policy = .{ .roles = &.{
         .{ .name = "reader", .grants = &.{"posts:read"} },
         .{ .name = "editor", .grants = &.{"posts:*"}, .includes = &.{"reader"} },
