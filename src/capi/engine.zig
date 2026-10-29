@@ -4224,6 +4224,7 @@ test {
     _ = config_mod;
     _ = @import("engine_test.zig");
     _ = @import("nats_test.zig");
+    _ = @import("kafka_test.zig");
     _ = @import("parity_test.zig");
     if (features.grpc) _ = grpc;
     _ = net;

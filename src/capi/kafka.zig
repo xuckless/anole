@@ -29,6 +29,7 @@ const nats_cap = @import("nats.zig");
 
 const features = anole.features;
 const placement = dusty.placement;
+const push_list = dusty.push_list;
 const gpa = engine.gpa;
 const Engine = engine.Engine;
 const Exec = engine.Exec;
@@ -114,13 +115,14 @@ pub fn close(e: *Engine) void {
     for (e.kafka_brokers) |*b| b.open.store(false, .release);
 }
 
-/// Frees what a stopped server's queues still hold.
+/// Frees what a stopped server's queues still hold, and seals them: a
+/// produce after it is refused (`error.State`).
 pub fn destroy(e: *Engine) void {
     for (e.kafka_brokers) |*b| {
-        var it = b.queue.take();
-        while (it) |item| {
-            it = item.next;
-            item.free();
+        var it = b.queue.list.seal();
+        while (it) |n| {
+            it = n.next;
+            itemOf(n).free();
         }
     }
 }
@@ -345,43 +347,26 @@ fn failedDelivery(b: *Broker, user_data: u64, topic: []const u8, class: anole.db
 // ---------------------------------------------------------------------------
 // Producing
 
-/// The FIFO a pump task drains.
+/// The records a pump task drains, in the order they came (SAFETY.md L7's
+/// push-list hand-off). owner (the taking side): the one running pump,
+/// named by `running`; producers: any consumer thread. Sealed by
+/// `destroy`, so a push after it is refused, not lost.
 const Queue = struct {
-    lock: std.atomic.Mutex = .unlocked,
-    head: ?*Item = null,
-    tail: ?*Item = null,
+    list: push_list.PushList = .{},
+    /// A pump is scheduled or running.
     running: std.atomic.Value(bool) = .init(false),
-
-    fn acquire(q: *Queue) void {
-        while (!q.lock.tryLock()) std.atomic.spinLoopHint();
-    }
-
-    fn push(q: *Queue, it: *Item) void {
-        q.acquire();
-        defer q.lock.unlock();
-        it.next = null;
-        if (q.tail) |t| t.next = it else q.head = it;
-        q.tail = it;
-    }
-
-    fn take(q: *Queue) ?*Item {
-        q.acquire();
-        defer q.lock.unlock();
-        const h = q.head;
-        q.head = null;
-        q.tail = null;
-        return h;
-    }
-
-    fn isEmpty(q: *Queue) bool {
-        q.acquire();
-        defer q.lock.unlock();
-        return q.head == null;
-    }
 };
 
+fn itemOf(n: *push_list.Node) *Item {
+    // SAFETY: every node on a `Queue` is the `node` of an `Item` (`produce`, `flush`).
+    return @fieldParentPtr("node", n);
+}
+
+/// One record (or flush) from a consumer thread. owner: the queue, then
+/// the pump, then the task that answers it (`waiter`, `flushTask`), which
+/// frees it (`finish`).
 const Item = struct {
-    next: ?*Item = null,
+    node: push_list.Node = .{},
     kind: enum { record, flush },
     c: *Consumer,
     user_data: u64,
@@ -440,7 +425,11 @@ pub fn produce(b: *Broker, c: *Consumer, m: abi.KafkaOut, user_data: u64) CallEr
         it.free();
         return error.OutOfMemory;
     };
-    b.queue.push(it);
+    _ = b.queue.list.push(&it.node) catch {
+        _ = b.pending.fetchSub(size, .acq_rel);
+        it.free();
+        return error.State;
+    };
     kick(b, c);
     if (before + size > b.buffer_bytes / 2) {
         want(b, c);
@@ -471,12 +460,18 @@ pub fn flush(b: *Broker, c: *Consumer, user_data: u64) CallError!void {
     if (c.execs.items.len == 0) return error.State;
     const it = newItem(c, user_data) catch return error.OutOfMemory;
     it.kind = .flush;
-    b.queue.push(it);
+    _ = b.queue.list.push(&it.node) catch {
+        it.free();
+        return error.State;
+    };
     kick(b, c);
 }
 
+/// After a push: schedules a pump unless one is scheduled or running.
+/// `.seq_cst` with the push's: the store-buffering pair of push_list.zig
+/// (either this sees `running` clear, or the pump sees the node).
 fn kick(b: *Broker, c: *Consumer) void {
-    if (b.queue.running.swap(true, .acq_rel)) return;
+    if (b.queue.running.swap(true, .seq_cst)) return;
     const cmd = gpa.create(PumpCmd) catch {
         b.queue.running.store(false, .release);
         return;
@@ -498,25 +493,28 @@ const PumpCmd = struct {
     }
 };
 
-/// Appends the queued records to the producer in the order they came.
+/// Appends the queued records to the producer in the order they came. The
+/// queue's one taker while `running` is set.
 fn pump(x: *Exec, b: *Broker) std.Io.Cancelable!void {
-    var rest: ?*Item = null;
-    defer while (rest) |r| {
-        rest = r.next;
+    var rest: ?*push_list.Node = null;
+    defer while (rest) |n| {
+        rest = n.next;
+        const r = itemOf(n);
         _ = b.pending.fetchSub(r.size, .acq_rel);
         r.free();
     };
     while (true) {
-        rest = b.queue.take();
+        rest = b.queue.list.takeAll();
         if (rest == null) {
-            b.queue.running.store(false, .release);
-            // One may have been added meanwhile.
-            if (b.queue.isEmpty() or b.queue.running.swap(true, .acq_rel)) return;
+            b.queue.running.store(false, .seq_cst);
+            // One may have been pushed meanwhile (its kick saw `running`
+            // still set): take it, unless a new pump already will.
+            if (b.queue.list.isEmpty() or b.queue.running.swap(true, .seq_cst)) return;
             continue;
         }
-        while (rest) |it| {
-            rest = it.next;
-            try handleItem(x, b, it);
+        while (rest) |n| {
+            rest = n.next;
+            try handleItem(x, b, itemOf(n));
         }
     }
 }
