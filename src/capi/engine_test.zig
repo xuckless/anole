@@ -1431,6 +1431,10 @@ const Racer = struct {
     };
 };
 
+// Stays in the unit suite (S1.5 row move:W3 not applied): the verdict made
+// the move to test-stress depend on the 5.2 durations, and the test runs in
+// about 250 ms (24 rounds, x86 box, 2026-10-29), well under the 1 s line, so
+// CI keeps the many-rounds race.
 test "capi engine: drain and reloads from other threads race the stop, many times over" {
     if (comptime features.tls != .boringssl) return error.SkipZigTest;
     const json =
