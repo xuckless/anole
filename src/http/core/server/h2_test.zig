@@ -1826,15 +1826,15 @@ test "HTTP/2: an event stream outlives timeouts.request" {
     }, {});
     defer server.deinit();
     server.router.get("/slow", struct {
-        // Time passing on purpose: sleeps are lower bounds, so the stream
-        // lives at least 240 ms, past the 100 ms request timeout, on any
-        // machine.
+        // Time passing on purpose (TESTING.md D1, margin >= 5x): sleeps are
+        // lower bounds, so the stream lives at least 6 x 100 ms = 600 ms,
+        // 6x the 100 ms request timeout, on any machine.
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
             var buf: [256]u8 = undefined;
             var events = try res.startEventStream(&buf);
-            for (0..4) |_| {
+            for (0..6) |_| {
                 try events.send("tick", .{});
-                try req.io.sleep(.fromMilliseconds(60), .awake);
+                try req.io.sleep(.fromMilliseconds(100), .awake);
             }
             try events.end();
         }
@@ -1849,7 +1849,7 @@ test "HTTP/2: an event stream outlives timeouts.request" {
     const id = try client.request("GET", "/slow", null);
     try client.run();
     try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
-    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, client.get(id).body.items, "data: tick"));
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, client.get(id).body.items, "data: tick"));
 }
 
 /// A parked response (`Response._park`): the handler returns, and bursts
