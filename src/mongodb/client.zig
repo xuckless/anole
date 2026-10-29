@@ -11,6 +11,7 @@
 //! retryable-reads (one retry), client-side-operations-timeout (a call's
 //! timeout bounds it and becomes `maxTimeMS`).
 const std = @import("std");
+const builtin = @import("builtin");
 const bson = @import("bson");
 const dusty = @import("dusty");
 const shared = @import("../db/root.zig");
@@ -137,6 +138,18 @@ pub const Server = struct {
         return s.pools.get(io);
     }
 };
+
+/// Tests only (void outside test builds): runs right after a monitor is
+/// spawned, with the client's `io`, once (the caller disarms it). It stands
+/// for the spawn's own yield on a busy executor (zio task.zig, the run
+/// queue's threshold).
+pub var test_after_monitor_spawn: if (builtin.is_test) ?*const fn (std.Io) void else void = if (builtin.is_test) null else {};
+/// Tests only: runs in `deinit` for a server whose monitor holds a
+/// connection, once (the caller disarms it).
+pub var test_close_hold: if (builtin.is_test) ?*const fn (*Server) void else void = if (builtin.is_test) null else {};
+/// Tests only: runs as a monitor ends, after it closed its connection
+/// (every monitor, until the test clears it).
+pub var test_monitor_closed: if (builtin.is_test) ?*const fn (*Server) void else void = if (builtin.is_test) null else {};
 
 /// The client with `QueryOptions` (`Client.with`): the databases and
 /// collections it leads to make their calls with them.
@@ -507,7 +520,13 @@ pub const Client = struct {
         self.mutex.lockUncancelable(io);
         for (self.servers.items) |s| {
             s.retired.store(true, .release);
-            if (s.monitor_conn.load(.acquire)) |c| c.stream.shutdown();
+            if (s.monitor_conn.load(.acquire)) |c| {
+                if (builtin.is_test) if (test_close_hold) |f| {
+                    test_close_hold = null;
+                    f(s);
+                };
+                c.stream.shutdown();
+            }
             s.check_now.set(io);
         }
         self.mutex.unlock(io);
@@ -547,6 +566,10 @@ pub const Client = struct {
                 ts.context = s;
                 placement.concurrent(&self.group, self.io, .{ .executor = 0 }, monitor, .{s}) catch |err| {
                     log.warn("mongodb {s}: monitor not started: {t}", .{ s.address.text, err });
+                };
+                if (builtin.is_test) if (test_after_monitor_spawn) |f| {
+                    test_after_monitor_spawn = null;
+                    f(self.io);
                 };
             }
             const s: *Server = @ptrCast(@alignCast(ts.context.?));
@@ -661,6 +684,7 @@ pub const Client = struct {
         defer if (connection) |c| {
             s.monitor_conn.store(null, .release);
             c.close();
+            if (builtin.is_test) if (test_monitor_closed) |f| f(s);
         };
         var known = false;
         while (!s.retired.load(.acquire)) {

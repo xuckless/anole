@@ -2284,6 +2284,10 @@ const Fake = struct {
     incrs: std.atomic.Value(u32) = .init(0),
     /// "filled" is nil to GET until a SET of it.
     filled: std.atomic.Value(bool) = .init(false),
+    /// PINGs read; while `ping_gate` is set to an event, a PING waits for
+    /// it before the answer.
+    pings: std.atomic.Value(u32) = .init(0),
+    ping_gate: std.atomic.Value(?*std.Io.Event) = .init(null),
 
     fn port(self: *Fake) u16 {
         return self.listener.socket.address.getPort();
@@ -2327,6 +2331,10 @@ const Fake = struct {
                 if (eql(u8, words[1][0..lens[1]], "shared")) if (self.shared_gate.load(.acquire)) |gate| gate.wait(io) catch return;
             }
             if (eql(u8, cmd, "INCR")) _ = self.incrs.fetchAdd(1, .monotonic);
+            if (eql(u8, cmd, "PING")) {
+                _ = self.pings.fetchAdd(1, .release);
+                if (self.ping_gate.load(.acquire)) |gate| gate.wait(io) catch return;
+            }
             const key = words[1][0..lens[1]];
             if (eql(u8, cmd, "SET") and eql(u8, key, "filled")) self.filled.store(true, .monotonic);
             const nil = eql(u8, key, "missing") or (eql(u8, key, "filled") and !self.filled.load(.monotonic));
@@ -2593,6 +2601,138 @@ test "redis: acquire runs its calls on one connection and gives it back" {
     _ = try client.incr(&c, "n");
     try testing.expectEqual(@as(u32, 1), fake.accepted.load(.monotonic));
     try testing.expect(Client.ping(client, io));
+}
+
+test "redis: a connection released twice is never handed to two holders" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 2 });
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+
+    const first = try client.acquire(&c);
+    first.release();
+    // A second release of the same checkout gives nothing back.
+    first.release();
+    // Two holders at once: two connections, the second one dialed.
+    var x = try client.acquire(&c);
+    var y = try client.acquire(&c);
+    try testing.expect(x.conn != y.conn);
+    _ = try x.incr(&c, "n");
+    _ = try y.incr(&c, "n");
+    x.release();
+    y.release();
+}
+
+/// A probe of `/readyz` on its own task: the task it runs on, the answer,
+/// and whether it ended.
+const ReadyProbe = struct {
+    task: std.atomic.Value(?dusty.placement.Task) = .init(null),
+    answer: ?bool = null,
+    ended: std.atomic.Value(bool) = .init(false),
+
+    /// `check`, then (`hold`) a wait an hour long that only a cancel ends.
+    fn run(p: *ReadyProbe, io: std.Io, client: *Client, hold: bool) std.Io.Cancelable!void {
+        defer p.ended.store(true, .release);
+        p.task.store(dusty.placement.currentTask(io), .release);
+        p.answer = db.Readiness.check(&client.readiness);
+        if (hold) try io.sleep(.fromSeconds(3600), .awake);
+    }
+
+    fn hasEnded(p: *ReadyProbe) bool {
+        return p.ended.load(.acquire);
+    }
+};
+
+fn pinged(fake: *Fake) bool {
+    return fake.pings.load(.acquire) >= 1;
+}
+
+test "redis: a readiness probe canceled mid-ping stays canceled" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const wait = @import("anole_test_wait");
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var gate: std.Io.Event = .unset;
+    fake.ping_gate.store(&gate, .release);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+    defer gate.set(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .ping_timeout = .fromSeconds(3600) });
+    defer client.deinit();
+
+    var probe: ReadyProbe = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, ReadyProbe.run, .{ &probe, io, client, true });
+    try wait.waitUntil(io, "the probe's PING at the server", &fake, pinged);
+    dusty.placement.cancelTask(probe.task.load(.acquire).?);
+    // The cancel ends the ping, and the probe's task stays canceled: its
+    // wait after the check ends at once.
+    try wait.waitUntil(io, "the canceled probe's task ended", &probe, ReadyProbe.hasEnded);
+}
+
+test "redis: a readiness probe canceled mid-ping leaves no answer behind" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const wait = @import("anole_test_wait");
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var gate: std.Io.Event = .unset;
+    fake.ping_gate.store(&gate, .release);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+    defer gate.set(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .ping_timeout = .fromSeconds(3600) });
+    defer client.deinit();
+    // An answer, once given, is kept for longer than any run of the test.
+    client.readiness.ttl = .fromSeconds(3600);
+
+    var probe: ReadyProbe = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, ReadyProbe.run, .{ &probe, io, client, false });
+    try wait.waitUntil(io, "the probe's PING at the server", &fake, pinged);
+    dusty.placement.cancelTask(probe.task.load(.acquire).?);
+    try wait.waitUntil(io, "the canceled probe's task ended", &probe, ReadyProbe.hasEnded);
+    // The server answers from now on: the next probe pings again and is
+    // ready, as nothing was kept from the canceled one.
+    gate.set(io);
+    try testing.expect(db.Readiness.check(&client.readiness));
+    try testing.expectEqual(@as(u32, 2), fake.pings.load(.monotonic));
 }
 
 test "redis: a server that cannot be reached is a 503, and /readyz says so" {

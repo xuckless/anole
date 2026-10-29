@@ -1107,6 +1107,37 @@ test "sqlite: acquire released inside a transaction rolls the writer back" {
     try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
+test "sqlite: a writer released twice leaves the next holder's transaction alone" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+    const level = quiet();
+    defer testing.log_level = level;
+
+    const first = try db.acquire(ctx);
+    first.release();
+    var tx = try db.begin(ctx, .{});
+    defer tx.deinit();
+    _ = try tx.exec(ctx, "INSERT INTO notes (title) VALUES ('kept')", .{});
+    // The first checkout given back again, while the transaction holds the
+    // writer: nothing happens to the transaction.
+    first.release();
+    try tx.commit(ctx);
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
 test "sqlite: Tx.table and Tx.run see the transaction's own writes" {
     const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
     defer db.deinit();
