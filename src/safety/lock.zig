@@ -11,8 +11,11 @@
 //! Each entry of that stack also keeps where the lock was taken (the return
 //! address of the `lock` call, as the Linux kernel's lockdep keeps
 //! `acquire_ip` per held lock), so a violation names the site of the new
-//! acquisition and of every lock held, symbolized, before it panics. Outside
-//! debug builds none of this is compiled in.
+//! acquisition and of every lock held, symbolized, before it panics. zio's
+//! own suspension check reports through `suspendReport` too (the fork's
+//! `held_locks.report` hook), so a task that suspends holding a lock names
+//! each lock's site beside the suspension's trace. Outside debug builds none
+//! of this is compiled in.
 //!
 //! The global order, outer first (SAFETY.md L4): `table`, `protocol`, `tls`,
 //! then `leaf`. A lock of rank `leaf` (most locks) is the innermost level:
@@ -74,6 +77,32 @@ fn acquired(rank: Rank, site: usize) void {
     held[held_len] = .{ .rank = rank, .site = site };
     held_len += 1;
     zio_held.acquired();
+    installSuspendReport();
+}
+
+/// Makes zio's suspension check (`debug_held_locks`) report through
+/// `suspendReport`, once, before the first lock is counted. Every thread
+/// stores the same pointer, so a race between first locks is harmless.
+inline fn installSuspendReport() void {
+    if (comptime !@hasDecl(zio_held, "report")) return;
+    if (@atomicLoad(?*const fn (u32) noreturn, &zio_held.report, .monotonic) == null)
+        @atomicStore(?*const fn (u32) noreturn, &zio_held.report, &suspendReport, .monotonic);
+}
+
+/// zio's report when a task suspends while this thread counts `count` held
+/// locks (L2): like the L4 reports, it names where each held lock was taken;
+/// the panic's own stack trace is the suspension site.
+fn suspendReport(count: u32) noreturn {
+    @branchHint(.cold);
+    var buf: [3584]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    writeSuspendReport(&w, count, held[0..held_len]) catch {};
+    std.debug.panic("{s}", .{w.buffered()});
+}
+
+fn writeSuspendReport(w: *std.Io.Writer, count: u32, locks: []const Held) std.Io.Writer.Error!void {
+    try w.print("SAFETY.md L2: a task suspended while holding {d} lock(s): never hold a lock across a suspension point (the suspension is the trace below)\n", .{count});
+    try writeHeld(w, locks);
 }
 
 fn releasing(rank: Rank, site: usize) void {
@@ -108,6 +137,10 @@ fn writeReport(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype, rank:
     try w.print(fmt, args);
     try w.print("\nthe {s} lock is being {s} at:\n", .{ @tagName(rank), verb });
     try writeSite(w, site);
+    try writeHeld(w, locks);
+}
+
+fn writeHeld(w: *std.Io.Writer, locks: []const Held) std.Io.Writer.Error!void {
     try w.print("locks held by this thread, outer first ({d}):\n", .{locks.len});
     for (locks, 0..) |h, i| {
         try w.print("#{d} a {s} lock, taken at:\n", .{ i, @tagName(h.rank) });
@@ -329,6 +362,21 @@ fn waitWhileHolding(run: bool) [2]u32 {
     return .{ outer, inner };
 }
 
+/// Whether this zio checks suspensions (`debug_held_locks`) and has the
+/// fork's report hook; off for the HTTP core's stub zio.
+const zio_checks_suspend = @hasDecl(zio, "held_locks") and @hasDecl(zio.held_locks, "report") and zio.held_locks.enabled;
+
+/// Holds a leaf spin lock and sleeps (a suspension) on `io`'s zio runtime,
+/// at the lines it returns; `io` null only computes the lines.
+fn suspendWhileHolding(io: ?std.Io) [2]u32 {
+    var l: SpinLock(.leaf) = .init;
+    const outer = @src().line + 1;
+    if (io != null) l.lock();
+    const inner = @src().line + 1;
+    if (io) |i| i.sleep(.fromMilliseconds(1), .awake) catch {};
+    return .{ outer, inner };
+}
+
 /// Fails unless `out` names the source line `line` of this file.
 fn expectSite(out: []const u8, line: u32) !void {
     var buf: [32]u8 = undefined;
@@ -371,6 +419,21 @@ test "lock: a lock taken while holding a leaf names where both were taken" {
     defer std.testing.allocator.free(out);
     const lines = underLeaf(false);
     try std.testing.expect(std.mem.indexOf(u8, out, "SAFETY.md L4: taking a table lock while holding a leaf lock") != null);
+    try expectSite(out, lines[0]);
+    try expectSite(out, lines[1]);
+}
+
+test "lock: a task suspending while holding a lock names where it was taken and where it suspends" {
+    if (!enabled or !zio_checks_suspend) return error.SkipZigTest;
+    const key = "a task suspending while holding a lock names where it was taken and where it suspends";
+    if (child.isChild(key)) {
+        const rt = try zio.Runtime.init(std.heap.page_allocator, .{ .executors = .exact(1) });
+        _ = suspendWhileHolding(rt.io());
+    }
+    const out = try child.runPanicking(std.testing.allocator, key);
+    defer std.testing.allocator.free(out);
+    const lines = suspendWhileHolding(null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "SAFETY.md L2: a task suspended while holding 1 lock(s)") != null);
     try expectSite(out, lines[0]);
     try expectSite(out, lines[1]);
 }
