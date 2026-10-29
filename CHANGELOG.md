@@ -7,6 +7,11 @@ breaking changes are listed anyway.
 
 ### Fixed
 
+- HTTP/1.1: a body set with `res.body` after a non-chunked stream (a
+  declared `Content-Length`, an HTTP/1.0 close-delimited body, or a sink
+  stream) was abandoned without `end` went out behind the streamed bytes.
+  The streamed bytes are now the whole body: a short one ends with the
+  connection closed, never padded with other text (#138).
 - C ABI: a crash when a binding thread answered, sent or polled while the
   server stopped. The call wakes an executor through the runtime, and the
   stop could free the runtime while that wake was still under way. The stop

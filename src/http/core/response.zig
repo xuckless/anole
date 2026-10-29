@@ -2213,7 +2213,16 @@ pub const Response = struct {
             return self.finish(w);
         }
 
-        if (send_header) try self.sendHeader(w);
+        if (send_header) {
+            try self.sendHeader(w);
+        } else if (self._streaming or self.content_length != null) {
+            // A stream's head is out with its framing (a declared length,
+            // close-delimited, or the sink's), and what it sent is the
+            // body. One abandoned before `end` stays short: a `body` set
+            // after it is not part of it, and `write` has already kept
+            // the connection from being reused.
+            return self.finish(w);
+        }
 
         // Write body (either from buffer or body field). A HEAD response
         // has already reported its length and must stop here.
