@@ -7,8 +7,10 @@
 //! handle can always take the lock and find the pipe serves another
 //! generation (`gen`): its call gets `error.Gone`, never a freed pointer.
 //! The lock is a spin lock held only to move bytes or flags, never across a
-//! wait.
+//! wait, and a leaf (SAFETY.md L4): no other lock is taken under it, which
+//! debug and test builds check.
 const std = @import("std");
+const safety = @import("anole_safety");
 
 const engine = @import("engine.zig");
 pub const gpa = engine.gpa;
@@ -35,7 +37,7 @@ pub const Chunk = struct {
 };
 
 pub const Pipe = struct {
-    lock: std.atomic.Mutex = .unlocked,
+    lock: safety.SpinLock(.leaf) = .init,
     /// The slot generation this pipe serves; 0 when it serves none.
     gen: u32 = 0,
     chunks: std.ArrayList(Chunk) = .empty,
@@ -57,11 +59,12 @@ pub const Pipe = struct {
     seq: std.atomic.Value(u32) = .init(0),
     blocked: std.atomic.Value(u32) = .init(0),
 
-    pub fn acquire(p: *Pipe) void {
-        while (!p.lock.tryLock()) std.atomic.spinLoopHint();
+    // Inline, so a lock report names the caller's line, not these.
+    pub inline fn acquire(p: *Pipe) void {
+        p.lock.lock();
     }
 
-    pub fn release(p: *Pipe) void {
+    pub inline fn release(p: *Pipe) void {
         p.lock.unlock();
     }
 
