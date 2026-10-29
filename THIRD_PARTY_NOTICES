@@ -31,7 +31,7 @@ zio (async runtime)
             and the executor stall watchdog, src/diag.zig, the held-lock
             report hook, and the per-executor quiescent-state counters,
             quiescent_state)
-  Pinned:   commit c21be0b777f847c70b39625f157cced846f06599 of the fork
+  Pinned:   commit d4b3ba6c82d3627ed1f8bdc028fcd031205eb3f4 of the fork
   Linked:   always
 
 nghttp2 1.70.0 (HTTP/2)

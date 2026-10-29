@@ -296,7 +296,7 @@ breaking changes are listed anyway.
 - Tests: the test allocator never reuses freed memory on macOS too, and
   test binaries built with `-Doptimize=ReleaseSafe` check a lock held
   across a suspension and swallowed cancellations, as Debug ones do.
-- zio: Anole pins the fork's c21be0b, which adds `quiescent_state`, and
+- zio: Anole pins the fork's d4b3ba6, which adds `quiescent_state`, and
   `anole.zio_options` turns it on. Each executor reports its scheduler
   passes and parks, so the HTTP core's new `qsbr` cells (read-mostly data
   behind an atomic pointer, SAFETY.md L7) are read on the executors

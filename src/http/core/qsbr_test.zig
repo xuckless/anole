@@ -499,3 +499,171 @@ test "qsbr: a task that suspends inside a read section panics, naming where the 
         }
     }
 }
+
+// ---- Writers at the retire list's cap ----
+
+/// Fills `cell`'s domain (max_retired 2) to its cap with objects that
+/// acquired references hold, so they stay retired; returns the holders.
+fn fillToCap(cell: *ObjCell, stats: *Stats, io: std.Io, gen: *u64) ![2]ObjCell.Ref {
+    var held: [2]ObjCell.Ref = undefined;
+    for (&held) |*h| {
+        h.* = cell.acquire(io);
+        try cell.store(.make(stats, gen.*));
+        gen.* += 1;
+    }
+    return held;
+}
+
+test "qsbr: compareAndStore at max_retired on an executor ends its read section before it waits" {
+    const rt = try startRuntime(1);
+    defer rt.deinit();
+    // The main task is executor 0's: its reads are the free ones.
+    const io = rt.io();
+    var stats: Stats = .{};
+    var d: qsbr.Domain = undefined;
+    d.init(io, .{ .max_retired = 2 });
+    defer d.deinit();
+    var cell: ObjCell = try .init(&d, object_gpa, .make(&stats, 0));
+    defer cell.deinit();
+    var gen: u64 = 1;
+    const held = try fillToCap(&cell, &stats, io, &gen);
+    defer for (held) |h| h.release();
+    const g = cell.read(io);
+    // At the cap, with no lock held once its section has ended, the retire
+    // waits for a grace period: a suspension, which inside the section
+    // would panic (L2) or let the object be freed under the guard (M3).
+    try std.testing.expect(try cell.compareAndStore(g, .make(&stats, 9)));
+    const now = cell.read(io);
+    defer now.end();
+    try std.testing.expectEqual(@as(u64, 9), now.get().gen);
+}
+
+test "qsbr: a store that can't wait (a read section open) goes past max_retired instead of suspending" {
+    if (!safety.enabled) return error.SkipZigTest;
+    const rt = try startRuntime(1);
+    defer rt.deinit();
+    const io = rt.io();
+    var stats: Stats = .{};
+    var d: qsbr.Domain = undefined;
+    d.init(io, .{ .max_retired = 2 });
+    defer d.deinit();
+    var cell: ObjCell = try .init(&d, object_gpa, .make(&stats, 0));
+    defer cell.deinit();
+    var other: ObjCell = try .init(&d, object_gpa, .make(&stats, 100));
+    defer other.deinit();
+    var gen: u64 = 1;
+    const held = try fillToCap(&cell, &stats, io, &gen);
+    defer for (held) |h| h.release();
+    {
+        // A section on another cell stays open across the stores: they
+        // must not suspend (Debug and test builds see the section).
+        const g = other.read(io);
+        defer g.end();
+        for (0..4) |_| {
+            try cell.store(.make(&stats, gen));
+            gen += 1;
+        }
+        try std.testing.expectEqual(@as(u64, 100), g.get().gen);
+    }
+    const now = cell.read(io);
+    defer now.end();
+    try std.testing.expectEqual(gen - 1, now.get().gen);
+}
+
+/// Stores into a domain at its cap with a read section open until the
+/// retire list reaches the hard bound (which panics).
+fn storePastHardBound(io: std.Io) !void {
+    var stats: Stats = .{};
+    const d = try std.heap.page_allocator.create(qsbr.Domain);
+    d.init(io, .{ .max_retired = 2 });
+    var cell: ObjCell = try .init(d, std.heap.page_allocator, .make(&stats, 0));
+    var other: ObjCell = try .init(d, std.heap.page_allocator, .make(&stats, 100));
+    var gen: u64 = 1;
+    _ = try fillToCap(&cell, &stats, io, &gen);
+    const g = other.read(io);
+    // max_retired 2 times the factor; a ninth retire passes the bound.
+    for (0..2 * qsbr.hard_bound_factor + 1) |_| {
+        // Hold each new object too, so nothing can be freed meanwhile.
+        _ = cell.acquire(io);
+        try cell.store(.make(&stats, gen));
+        gen += 1;
+    }
+    g.end();
+}
+
+test "qsbr: a store that can't wait panics at the retire list's hard bound" {
+    if (!safety.enabled) return error.SkipZigTest;
+    const key = "a store that can't wait panics at the retire list's hard bound";
+    if (safety.child.isChild(key)) {
+        // The child panics; nothing is cleaned up.
+        const rt = try zio.Runtime.init(std.heap.page_allocator, .{ .executors = .exact(1) });
+        try storePastHardBound(rt.io());
+        return;
+    }
+    const out = try safety.child.runPanicking(std.testing.allocator, key);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "SAFETY.md U4: a qsbr domain has 8 objects retired and not freed (4 times max_retired)") != null);
+}
+
+// ---- pollAll and deinit ----
+
+const DeinitRace = struct {
+    var copied: std.atomic.Value(bool) = .init(false);
+    var go: std.atomic.Value(bool) = .init(false);
+    var deinit_waiting: std.atomic.Value(bool) = .init(false);
+    var done: std.atomic.Value(bool) = .init(false);
+
+    fn isSet(flag: *std.atomic.Value(bool)) bool {
+        return flag.load(.acquire);
+    }
+
+    /// pollAll has copied and pinned its batch: it waits for `go`.
+    fn afterCopy() void {
+        copied.store(true, .release);
+        wait.waitUntil(std.testing.io, "the test lets the poll go on", &go, isSet) catch {};
+    }
+
+    fn deinitWaits() void {
+        deinit_waiting.store(true, .release);
+    }
+
+    fn poller() void {
+        qsbr.pollAll();
+    }
+
+    fn deinitAndFree(d: *qsbr.Domain) void {
+        d.deinit();
+        object_gpa.destroy(d);
+        done.store(true, .release);
+    }
+
+    fn deinitWaitingOrDone(_: void) bool {
+        return deinit_waiting.load(.acquire) or done.load(.acquire);
+    }
+};
+
+test "qsbr: a domain deinitialized while pollAll is between copying and polling it waits for that poll" {
+    const io = std.testing.io;
+    // In pages of its own: polled after a free, it faults.
+    const d = try object_gpa.create(qsbr.Domain);
+    d.init(io, .{});
+    qsbr.test_hooks = .{ .after_copy = DeinitRace.afterCopy, .deinit_waits = DeinitRace.deinitWaits };
+    defer qsbr.test_hooks = .{};
+    const poller = try std.Thread.spawn(.{}, DeinitRace.poller, .{});
+    var poller_joined = false;
+    defer if (!poller_joined) {
+        DeinitRace.go.store(true, .release);
+        poller.join();
+    };
+    try wait.waitUntil(io, "pollAll has copied the domain", &DeinitRace.copied, DeinitRace.isSet);
+    const deiniter = try std.Thread.spawn(.{}, DeinitRace.deinitAndFree, .{d});
+    // Either deinit waits for the pinned poll, or (the bug) it has already
+    // freed the domain; then the poll goes on.
+    const waited = wait.waitUntil(io, "deinit waits or ends", {}, DeinitRace.deinitWaitingOrDone);
+    DeinitRace.go.store(true, .release);
+    poller.join();
+    poller_joined = true;
+    deiniter.join();
+    try waited;
+    try std.testing.expect(DeinitRace.done.load(.acquire));
+}

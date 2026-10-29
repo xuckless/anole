@@ -1950,7 +1950,7 @@ pub fn Server(comptime Ctx: type) type {
                 if (shards) self.request_buffers.trimShards();
                 if (build_options.use_zlib or build_options.use_brotli) block_cache.trimLocal();
                 // Objects retired with no writer after them (src/http/core/qsbr.zig).
-                if (shards) qsbr.pollAll(self.io);
+                if (shards) qsbr.pollAll();
             }
         }
 

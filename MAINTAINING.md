@@ -206,8 +206,10 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   executor's offline flag is stored with seq_cst before and after the park
   and when it stops. On every upstream merge, check that the pass still
   runs before every task (the run loop and `switchOut` both call
-  `getNextTask`) and that both offline stores stay seq_cst: a weaker one
-  lets a writer free what a task just loaded. Run the suite with
+  `getNextTask`), that both offline stores stay seq_cst (a weaker one
+  lets a writer free what a task just loaded), and that every write to the
+  grace-period number stays a read-modify-write (executors synchronize with
+  earlier writers through its release sequence). Run the suite with
   `./check.sh --scheduling pinned --quiescent-state` and once with Anole's
   whole set (`zig build test -Dscheduling=pinned -Dfast_accept=true
   -Ddiagnostics=true -Ddebug_held_locks=true -Ddebug_cancel=true
