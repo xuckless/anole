@@ -31,6 +31,9 @@ pub fn handler(msg: []const u8, first_trace_addr: ?usize) noreturn {
 /// inside the logging itself, takes Zig's own path (standard error).
 pub fn log(msg: []const u8, first_address: usize) void {
     @branchHint(.cold);
+    // Logging allocates; a panic inside a spin section must not panic
+    // again over that (SAFETY.md L5's debug check).
+    @import("anole_safety").notePanic();
     if (before_panic) |f| f();
     if (taken.swap(true, .acq_rel)) std.debug.defaultPanic(msg, first_address);
     var w: std.Io.Writer = .fixed(&trace_buf);

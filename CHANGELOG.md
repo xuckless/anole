@@ -296,6 +296,19 @@ breaking changes are listed anyway.
 - Tests: the test allocator never reuses freed memory on macOS too, and
   test binaries built with `-Doptimize=ReleaseSafe` check a lock held
   across a suspension and swallowed cancellations, as Debug ones do.
+- zio: Anole pins the fork's d4b3ba6, which adds `quiescent_state`, and
+  `anole.zio_options` turns it on. Each executor reports its scheduler
+  passes and parks, so the HTTP core's new `qsbr` cells (read-mostly data
+  behind an atomic pointer, SAFETY.md L7) are read on the executors
+  without a lock and free a replaced value once no task can still read it.
+  A scheduler pass costs two loads and a compare more. A program whose own
+  `zio_options` leave it out still works; its reads take a spin lock.
+- Debug and test builds: a task that suspends inside a `qsbr` read
+  section panics naming where the section began (SAFETY.md M3), and
+  `safety.SpinCheckedAllocator` panics on an allocation while a
+  `safety.SpinLock` is held, naming where the lock was taken (L5).
+  `safety.IoLock` is the lock L2 now allows across a suspension (an I/O
+  resource's one writer), taken only with no other lock held.
 
 ## 0.4.0 (2026-10-25)
 

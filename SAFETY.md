@@ -98,23 +98,26 @@ A spawn outside a group is banned, and so are fire-and-forget tasks. Work that m
 
 **L2. Never hold a lock across a suspension point.** Debug builds check this: a task that suspends while holding a lock panics.
 
+*Exception (user, 2026-10-28): I/O locks.* An I/O lock (`safety.IoLock`) guards an I/O resource, not data: the one writer of a socket or stream, one round trip on a broker connection, the SQLite writer. It may be held across a suspension, under three conditions: it is taken only when no other lock is held (rank `io`, outermost in L4's order); nothing waits for it inside a C callback; and it guards no data that another lock or an executor also guards. The suspension check skips it. Single-flight and init-once guards are not I/O locks: they use the keyring shape (a flag and a condition). Each I/O lock is temporary: it stays until the protocol work that owns its resource replaces it with an outbox and one writer (the HTTP/2 takeover in S2, #85, #111). New code doesn't add I/O locks without a reason recorded beside it.
+
 **L3. Never call out while holding a lock.** That means no user handlers, no callbacks into other subsystems, no logging that may wait, and nothing that may allocate and wait. C library callbacks that run under a lock (nghttp2's under its session mutex, until the takeover) may only record and return.
 
 **L4. One lock at a time, or a fixed order.** Code normally holds at most one lock. Where two are needed, they are taken in the documented global order below, which debug builds assert. That rules out deadlocks by construction.
 
 Lock order (outer first), to be filled in by the retrofit audit:
-1. process-wide tables (handle tables, topic registries)
-2. per-connection protocol locks (HTTP/2 session, HTTP/3 connection)
-3. per-connection TLS spin lock
-4. leaf locks: locks under which no other lock is taken and nothing is called out (the C ABI's Pipe spin lock, the test runner's log ring). A leaf lock may be taken while holding any lock above.
+1. I/O locks (`safety.IoLock`, L2's exception), taken only when no other lock is held
+2. process-wide tables (handle tables, topic registries)
+3. per-connection protocol locks (HTTP/2 session, HTTP/3 connection)
+4. per-connection TLS spin lock
+5. leaf locks: locks under which no other lock is taken and nothing is called out (the C ABI's Pipe spin lock, the test runner's log ring). A leaf lock may be taken while holding any lock above.
 
 **L5. Spin locks only for short, bounded sections.** A spin lock may guard only a short, fixed-length section that never allocates, waits or calls C code that may block.
 
 **L6. Atomics through a few wrappers.** Atomics are used only through a few wrappers: counters, flags, generations, the SPSC ring. The existing lock-free structures (the C ABI rings, the HTTP/3 kick list) get dedicated multi-thread stress tests.
 
 **L7. Atomics instead of a lock where they remove a bug class or win in numbers.** A lock is replaced by atomics when that removes a deadlock or use-after-free class, removes real technical debt, or gives a measured performance win (an A/B on the box). Never for style alone. Only these patterns, each through a wrapper with a multi-thread stress test:
-- **Read-mostly data** (routes, config, certificates, ticket keys): readers load an atomic pointer and take no lock; a writer builds a new copy and swaps the pointer. The old copy is freed only after every executor has passed a scheduler pass since the swap (quiescent-state reclamation, as userspace RCU's QSBR flavour and Seastar do), never while a reader may hold it. Readers do not keep the pointer across a suspension point (M3).
-- **Counters and gauges:** one per executor, written only by its executor, summed when read (`/metrics`, the console), so no cache line moves between cores.
+- **Read-mostly data** (routes, config, certificates, ticket keys): readers load an atomic pointer and take no lock; a writer builds a new copy and swaps the pointer. The old copy is freed only after every executor has passed a scheduler pass since the swap (quiescent-state reclamation, as userspace RCU's QSBR flavour and Seastar do), never while a reader may hold it. Readers do not keep the pointer across a suspension point (M3). The wrapper is `qsbr.Cell` in the HTTP core (src/http/core/qsbr.zig, on the zio fork's `quiescent_state` counters): `read` borrows until the next suspension point, `acquire` counts a reference that may be kept across suspensions; threads that are not executors count a reference under a leaf spin lock.
+- **Counters and gauges:** one per executor, written only by its executor, summed when read (`/metrics`, the console), so no cache line moves between cores. The wrapper is `exec_counter.PerExecutor` in the HTTP core (src/http/core/exec_counter.zig).
 - **Hand-offs between executors or threads:** the existing SPSC ring and the atomic push list (the done lists), each with one documented owner on the consuming side (T3).
 - **State machines on a handle:** a generation-checked state word changed by compare-and-swap (M2's fourth class, including pins).
 
@@ -138,7 +141,8 @@ The lint enforces this against an allowlist.
 
 **E1. Debug-build checks** (Debug and test builds only, no cost in ReleaseFast):
 - executor ownership (T3);
-- a lock held across a suspension point (L2), which needs a held-lock counter per task (a small zio hook, kept in Anole's zio fork, not offered upstream);
+- a lock held across a suspension point (L2), which needs a held-lock counter per task (a small zio hook, kept in Anole's zio fork, not offered upstream); an `IoLock` is not counted, and is itself checked to be taken with no other lock held; a QSBR read section (`qsbr.Cell.read`, `Domain.enter`) is counted like a lock, so a task that suspends inside one panics and the report names where it began (M3);
+- an allocation while a `safety.SpinLock` is held (L5): `safety.SpinCheckedAllocator` panics at the allocator call and names where each held lock was taken (std's test allocator can't be intercepted, so a test that claims a site wraps the allocator it hands the code); `safety.ProcessAllocator` checks the same once the C ABI's Pipe no longer allocates under its lock (retrofit step 6);
 - lock order (L4); a violation, a wait for a lock while one is held (L2), and a suspension while one is held (L2) name where the new lock is taken or the task suspends and where each held lock was taken (as lockdep and Abseil do);
 - the teardown state (M5);
 - poisoned freed memory in tests: an allocator that poisons and never reuses freed memory, on Linux and macOS, so a use-after-free crashes at once instead of only under CI load (`safety.process_gpa` for memory outside a test's scope); pools poison what they take back with `safety.poison`, and request arenas are reset with `safety.resetArena` (M6);
