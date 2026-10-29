@@ -366,6 +366,19 @@ pub const UdpSocket = struct {
     }
 
     /// A drop, counted here and in the Prometheus series.
+    /// Seals the send queue and drops what is in it, counted (`send_failed`).
+    /// Nothing for a socket whose sender ended (it sealed its own queue).
+    fn dropUnsent(s: *UdpSocket) void {
+        var it = s.pending.seal();
+        while (it) |n| {
+            it = n.next;
+            const b = Batch.of(n);
+            _ = s.queue_bytes.fetchSub(b.bytes, .monotonic);
+            s.countDrop(.send_failed, b.count);
+            b.destroy();
+        }
+    }
+
     fn countDrop(s: *UdpSocket, why: net_metrics.DropReason, n: u64) void {
         const field = switch (why) {
             .kernel => &s.stats.dropped_kernel,
@@ -411,7 +424,19 @@ pub const UdpSocket = struct {
         while (true) {
             if (q + n > cap) {
                 testHold(&test_full_hold);
-                s.want_writable.store(true, .release);
+                // Asks for WRITABLE, then looks again (the store-buffering
+                // pair with `finishWork`'s subtraction then flag load, all
+                // `.seq_cst`): a batch that left after the look above read
+                // the flag unset, so the send is tried again. Still full:
+                // what is queued now leaves later, and that `finishWork`
+                // sees the flag. (A retry that fits leaves the flag set:
+                // one WRITABLE too many, which the contract allows.)
+                s.want_writable.store(true, .seq_cst);
+                const again = s.queue_bytes.load(.seq_cst);
+                if (again + n <= cap) {
+                    q = again;
+                    continue;
+                }
                 b.destroy();
                 s.countDrop(.queue_full, items.len);
                 return error.QueueFull;
@@ -709,8 +734,9 @@ pub const UdpSocket = struct {
     /// sender that was told to wait hears it may go on (on this task).
     fn finishWork(s: *UdpSocket, bytes: u64) void {
         const cap = s.group.service.options.send_queue;
-        const was = s.queue_bytes.fetchSub(bytes, .acq_rel);
-        if (was - bytes < cap / 4 and s.want_writable.load(.acquire) and s.want_writable.swap(false, .acq_rel)) {
+        // `.seq_cst` subtraction, then flag load: see `enqueue`.
+        const was = s.queue_bytes.fetchSub(bytes, .seq_cst);
+        if (was - bytes < cap / 4 and s.want_writable.load(.seq_cst) and s.want_writable.swap(false, .acq_rel)) {
             if (s.group.service.table.writable) |f| f(s.group.service.state, s);
         }
     }
@@ -915,6 +941,10 @@ pub const UdpGroup = struct {
             // Each sender seals its queue as it ends: a send after that
             // answers Closed.
             g.senders.cancel(io);
+            // A socket whose sender never started (a spawn failed part way)
+            // is sealed here: its later sends answer Closed too, and what
+            // got in is dropped and counted.
+            for (g.sockets) |*s| s.dropUnsent();
             g.gate.close();
         }
         for (g.sockets) |*s| {

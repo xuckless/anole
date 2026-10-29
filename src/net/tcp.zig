@@ -403,8 +403,9 @@ pub const Conn = struct {
     };
 
     /// `queueChunk`'s answer: the wake to make once the caller's own lock
-    /// is let go (null: none due).
-    pub const Queued = struct { sent: Sent, kick: ?Kick };
+    /// is let go (null: none due), and whether the chunk was taken (an
+    /// empty one is not: the caller frees it, after its lock).
+    pub const Queued = struct { sent: Sent, kick: ?Kick, taken: bool = true };
 
     /// Queues `bytes` (copied) and returns: any task, any executor, any
     /// time; never waits. Sent in order with this connection's other sends.
@@ -459,34 +460,28 @@ pub const Conn = struct {
 
     /// For the C ABI: queues `chunk` (an `OutChunk.create` whose payload
     /// the caller filled, or an `OutChunk.borrowed`), with the listener's
-    /// framing around it when `frame`. Takes the chunk on success and on
-    /// error alike. Never allocates and never waits: the wake it needs is
-    /// returned, for a caller that holds a lock to make after it.
+    /// framing around it when `frame`. Takes the chunk on success (unless
+    /// `taken` says otherwise); on an error it stays the caller's. Never
+    /// allocates, frees or waits, so a caller may hold a spin lock (L5):
+    /// it frees a chunk left to it, and makes the returned wake, after.
     pub fn queueChunk(c: *Conn, chunk: *OutChunk, frame: bool) SendError!Queued {
         const t = c.tc();
         const f = t.flags.load(.acquire);
         if (f & (Flag.closed | Flag.dead | Flag.ended) != 0) {
-            chunk.destroy();
             return if (f & (Flag.closed | Flag.dead) != 0) error.Closed else error.Ended;
         }
         if (frame) {
             std.debug.assert(chunk.owned and chunk.off == Framing.max_prefix);
             const framing = t.service.options.framing;
             var pbuf: [Framing.max_prefix]u8 = undefined;
-            const prefix = framing.prefix(chunk.cap, &pbuf) catch |err| {
-                chunk.destroy();
-                return err;
-            };
+            const prefix = try framing.prefix(chunk.cap, &pbuf);
             const suffix = framing.suffix();
             chunk.off = Framing.max_prefix - prefix.len;
             @memcpy(chunk.region[chunk.off..][0..prefix.len], prefix);
             @memcpy(chunk.region[Framing.max_prefix + chunk.cap ..][0..suffix.len], suffix);
             chunk.len = prefix.len + chunk.cap + suffix.len;
         }
-        if (chunk.len == 0) {
-            chunk.destroy();
-            return .{ .sent = .ok, .kick = null };
-        }
+        if (chunk.len == 0) return .{ .sent = .ok, .kick = null, .taken = false };
         return t.pushChunk(chunk);
     }
 
@@ -645,8 +640,12 @@ pub const TcpListener = struct {
     }
 
     /// The driver of the caller's executor, started by its first
-    /// connection. No lock (T3): only this executor's connections call it,
-    /// and nothing here suspends.
+    /// connection. No lock (T3): only this executor's connections call it.
+    /// `started` is set before the spawn, which can suspend (zio's spawn
+    /// backpressure yields the spawner): a connection opening meanwhile
+    /// finds the driver started, not a second one. A spawn that fails has
+    /// not suspended (zio fails before it yields), so the rollback is seen
+    /// by nobody.
     fn driverFor(self: *TcpListener, info: *const dusty.RawInfo) !*Driver {
         const d = &self.drivers[info.executor % self.drivers.len];
         if (d.started) {
@@ -655,9 +654,12 @@ pub const TcpListener = struct {
         }
         d.io = info.io;
         d.owner = .here(info.io);
-        try placement.concurrent(info.group, info.io, .local, Driver.run, .{d});
-        testHold(info.io, .driver_start);
         d.started = true;
+        placement.concurrent(info.group, info.io, .local, Driver.run, .{d}) catch |err| {
+            d.started = false;
+            return err;
+        };
+        testHold(info.io, .driver_start);
         return d;
     }
 
@@ -728,6 +730,8 @@ const Driver = struct {
                 s.kicked.store(false, .seq_cst);
                 const t = s.conn orelse continue;
                 t.serviceKick();
+                // Nothing of `t` after this: the service may have suspended
+                // in a spawn, and `t` may be gone (it checks, `spawn`).
             }
         }
     }
@@ -745,6 +749,11 @@ const KickSlot = struct {
     kicked: std.atomic.Value(bool) = .init(false),
     /// The connection in it (driver's executor only).
     conn: ?*TcpConn = null,
+    /// Bumped each time the slot is emptied (driver's executor only): with
+    /// `conn`, tells whether the connection seen before a suspension is
+    /// still the one in it after (`TcpConn.spawn`), even when a new
+    /// connection got the same address and the same slot.
+    gen: u32 = 0,
     next_free: ?*KickSlot = null,
 
     fn of(n: *push_list.Node) *KickSlot {
@@ -781,6 +790,7 @@ const KickSlots = struct {
     /// Empties the slot; it may still be on the driver's list.
     fn free(ks: *KickSlots, s: *KickSlot) void {
         s.conn = null;
+        s.gen +%= 1;
         s.next_free = ks.free_list;
         ks.free_list = s;
     }
@@ -815,8 +825,9 @@ pub const Kick = struct {
 /// one allocation: this header, then `Framing.max_prefix` bytes of room, the
 /// payload, and room for a suffix, so a frame's prefix and suffix are
 /// written around the payload later (`Conn.queueChunk`). owner: the sender
-/// until a queue call takes it (on success and on error alike); then the
-/// connection's outbox, which frees it once written or dropped.
+/// until a queue call takes it (on success; a refused one stays the
+/// sender's, freed after any lock it holds); then the connection's outbox,
+/// which frees it once written or dropped.
 pub const OutChunk = struct {
     node: push_list.Node = .{},
     /// The outbox's order (the connection's executor).
@@ -987,9 +998,12 @@ const TcpConn = struct {
     flags: std.atomic.Value(u32) = .init(0),
     /// Bytes queued and not yet written (reserved, in the inbox, the outbox
     /// and the batch): reserved with a compare-and-swap bounded by
-    /// `write_max`. A futex word for the writers that wait.
+    /// `write_max`.
     queued: std.atomic.Value(u32) = .init(0),
+    /// Writers in `waitUnder`, and the futex word they wait on: moved by
+    /// `wakeWaiters` (bytes left, the connection ended), never by a send.
     waiters: std.atomic.Value(u32) = .init(0),
+    epoch: std.atomic.Value(u32) = .init(0),
     /// Sends made off the connection's executor; owner: the responsible
     /// party, which moves them to `out`. Sealed by `release`.
     inbox: push_list.PushList = .{},
@@ -1121,14 +1135,16 @@ const TcpConn = struct {
         // Every spawn site checks this and spawns without a suspension in
         // between, on this executor.
         _ = t.flags.fetchOr(Flag.closed, .seq_cst);
-        // The driver resolves slots on this executor, and never suspends
-        // while it services one: from here it can't reach `t`.
+        // The driver resolves slots on this executor: from here a kick finds
+        // the slot empty. A driver suspended in a spawn for `t` (zio's spawn
+        // backpressure) finds the slot changed when it resumes and touches
+        // nothing of `t` (`spawn`).
         t.driver.slots.free(t.kick);
         t.shutdownSocket(.both);
         t.over.store(1, .release);
         io.futexWake(u32, &t.over.raw, std.math.maxInt(u32));
-        io.futexWake(u32, &t.paused.raw, std.math.maxInt(u32));
-        io.futexWake(u32, &t.queued.raw, std.math.maxInt(u32));
+        t.unpause();
+        t.wakeWaiters();
         // No drain hook runs for it after this (it runs under the drain's
         // lock, which `remove` takes).
         t.info.drain_hooks.remove(io, &t.drain_hook);
@@ -1228,7 +1244,11 @@ const TcpConn = struct {
         return t.has(Flag.dead);
     }
 
-    /// The caller runs on the connection's executor.
+    /// The caller runs on the connection's executor. Off zio (`exec` null,
+    /// as on `std.Io.Threaded`) never: the executor reasoning in this file
+    /// (T3's owner checks, M3's "nothing suspends between a look and its
+    /// use", the driver's slots) assumes zio's pinned executors, which
+    /// every Anole server runs on; it does not hold elsewhere.
     fn onOwner(t: *const TcpConn) bool {
         const e = t.exec orelse return false;
         return placement.currentExecutor(t.io) == e;
@@ -1244,8 +1264,15 @@ const TcpConn = struct {
         t.io.futexWake(u32, &word.raw, std.math.maxInt(u32));
     }
 
+    /// Tells the writers waiting in `waitUnder`: bytes left the queue, or
+    /// the connection ended. The caller changed `queued` or the flags
+    /// (`.seq_cst`) before this `.seq_cst` look at `waiters`, which pairs
+    /// with a waiter's count then look (store-buffering): either it sees
+    /// the change, or the epoch moves after its look at it.
     fn wakeWaiters(t: *TcpConn) void {
-        if (t.waiters.load(.seq_cst) != 0) t.wakeAll(&t.queued);
+        if (t.waiters.load(.seq_cst) == 0) return;
+        _ = t.epoch.fetchAdd(1, .seq_cst);
+        t.wakeAll(&t.epoch);
     }
 
     fn kickOf(t: *TcpConn) Kick {
@@ -1266,14 +1293,32 @@ const TcpConn = struct {
 
     // -- Helpers (tasks that touch the connection) ----------------------------
 
+    const Spawned = enum {
+        started,
+        /// No task: none could be had, or the connection is being released.
+        refused,
+        /// Started, but the spawn suspended and the connection was released
+        /// meanwhile: the caller touches nothing of `t` any more.
+        gone,
+    };
+
     /// Runs `func(t)` on a task of the connection's group, on its executor.
-    /// False when no task could be had, or the connection is released.
-    fn spawn(t: *TcpConn, comptime func: fn (*TcpConn) void, comptime point: ?TestPoint) bool {
+    /// The spawn can suspend the caller: zio's spawn backpressure
+    /// (`registerTask` -> `yieldForRound`) yields a spawner once the run
+    /// queue is long. A caller outside the group (the driver) may then find
+    /// `t` released and freed when it resumes; so the kick slot (stable
+    /// memory) is read before and looked at after: `.gone` when another
+    /// connection, or none, is in it now. A caller in the group (the
+    /// flusher) is joined by `release` and would be safe, but stops too.
+    fn spawn(t: *TcpConn, comptime func: fn (*TcpConn) void, comptime point: ?TestPoint) Spawned {
         t.owner.check(t.io);
-        if (t.isClosed()) return false;
-        placement.concurrent(&t.group, t.io, .local, func, .{t}) catch return false;
+        if (t.isClosed()) return .refused;
+        const slot = t.kick;
+        const gen = slot.gen;
+        placement.concurrent(&t.group, t.io, .local, func, .{t}) catch return .refused;
         if (point) |p| testHold(t.io, p);
-        return true;
+        if (slot.conn != t or slot.gen != gen) return .gone;
+        return .started;
     }
 
     // -- Writing: queue --------------------------------------------------------
@@ -1296,7 +1341,10 @@ const TcpConn = struct {
             c.append(parts);
             break :blk c;
         };
-        const q = try t.pushChunk(c);
+        const q = t.pushChunk(c) catch |err| {
+            c.destroy();
+            return err;
+        };
         if (q.kick) |k| k.run();
         return q.sent;
     }
@@ -1324,48 +1372,59 @@ const TcpConn = struct {
     }
 
     /// Takes `c` (whole, framed already) into the inbox: reserved, then
-    /// pushed. Frees `c` on an error. The kick, if one is due, is the
-    /// caller's to make.
+    /// pushed. On an error `c` stays the caller's (to free after any lock
+    /// it holds, L5). The kick, if one is due, is the caller's to make.
     fn pushChunk(t: *TcpConn, c: *OutChunk) Conn.SendError!Conn.Queued {
         const n = c.len;
-        const busy = t.reserve(n) catch {
-            c.destroy();
-            return error.QueueFull;
-        };
+        const busy = t.reserve(n) catch return error.QueueFull;
         // Checked again after the reservation, which `requestEnd`'s flag
         // pairs with (both `.seq_cst`): a send either sees the end, or is
         // counted in `queued` before the end's FIN is decided.
         const f = t.flags.load(.seq_cst);
         if (f & (Flag.closed | Flag.dead | Flag.ended) != 0) {
             t.unreserve(n);
-            c.destroy();
             return if (f & Flag.ended != 0 and f & (Flag.closed | Flag.dead) == 0) error.Ended else error.Closed;
         }
         // (A refusal here is rare, a stop or end racing the send: its
         // `unreserve` wakes through the gate even under a caller's lock.)
         _ = t.inbox.push(&c.node) catch {
             t.unreserve(n);
-            c.destroy();
             return error.Closed;
         };
         return .{ .sent = if (busy) .busy else .ok, .kick = t.claimDriver() };
     }
 
     /// Reserves `n` bytes of `write_max`: busy when past the high-water
-    /// mark. QueueFull takes nothing.
+    /// mark. QueueFull takes nothing, and a WRITABLE follows it.
     fn reserve(t: *TcpConn, n: usize) error{QueueFull}!bool {
         const o = &t.service.options;
         var q = t.queued.load(.monotonic);
         while (true) {
             if (@as(u64, q) + n > o.write_max) {
                 testHold(t.io, .queue_full);
-                _ = t.flags.fetchOr(Flag.want_writable, .acq_rel);
+                // Asks for WRITABLE, then looks again (the store-buffering
+                // pair with `consume`'s subtraction then flag load, all
+                // `.seq_cst`): a write that emptied the queue after the look
+                // above read the flag before it was set and sent nothing,
+                // so the send is tried again. Still full: what is queued now
+                // leaves later, and that `consume` sees the flag. (A retry
+                // that fits leaves the flag set: one WRITABLE too many, which
+                // the contract allows.)
+                _ = t.flags.fetchOr(Flag.want_writable, .seq_cst);
+                const again = t.queued.load(.seq_cst);
+                if (@as(u64, again) + n <= o.write_max) {
+                    q = again;
+                    continue;
+                }
                 _ = t.listener.stats.queue_full.fetchAdd(1, .monotonic);
                 if (t.listener.series) |m| m.queue_full.inc();
                 return error.QueueFull;
             }
             q = t.queued.cmpxchgWeak(q, q + @as(u32, @intCast(n)), .seq_cst, .monotonic) orelse break;
         }
+        // Busy: these bytes are in `queued`, and the `consume` that takes
+        // them comes after the push that follows this flag (happens-before),
+        // so it sees the flag.
         const busy = @as(u64, q) + n > o.write_high_water;
         if (busy) _ = t.flags.fetchOr(Flag.want_writable, .acq_rel);
         return busy;
@@ -1423,7 +1482,8 @@ const TcpConn = struct {
         t.shutdownSocket(.both);
         t.over.store(1, .release);
         t.wakeAll(&t.over);
-        t.wakeAll(&t.queued);
+        t.unpause();
+        t.wakeWaiters();
         const k = t.scheduleKick();
         // Windows off the executor: the driver also cancels the reader.
         if (comptime native_os == .windows) if (t.has(Flag.cancel_reader)) return t.kickOf();
@@ -1438,8 +1498,17 @@ const TcpConn = struct {
         t.shutdownSocket(.both);
         t.over.store(1, .release);
         t.wakeAll(&t.over);
-        t.wakeAll(&t.queued);
+        t.unpause();
+        t.wakeWaiters();
         if (comptime native_os == .windows) if (t.has(Flag.cancel_reader)) t.kickOf().run();
+    }
+
+    /// The end of a paused connection: its task, waiting for
+    /// `resumeReading` (`waitResumed`), must hear it. The word it waits on
+    /// changes: a wake alone, with `paused` still 1, could fall between its
+    /// look at `over` and its wait and be lost.
+    fn unpause(t: *TcpConn) void {
+        if (t.paused.swap(0, .acq_rel) != 0) t.wakeAll(&t.paused);
     }
 
     fn shutdownSocket(t: *TcpConn, how: std.Io.net.ShutdownHow) void {
@@ -1469,7 +1538,8 @@ const TcpConn = struct {
     fn cancelReader(t: *TcpConn) void {
         if (comptime native_os != .windows) return;
         if (!t.onOwner()) {
-            _ = t.flags.fetchOr(Flag.cancel_reader, .acq_rel);
+            // `.seq_cst`: see `serviceKick`.
+            _ = t.flags.fetchOr(Flag.cancel_reader, .seq_cst);
             return;
         }
         const me = placement.currentTask(t.io);
@@ -1514,17 +1584,27 @@ const TcpConn = struct {
         return t.sched.cmpxchgStrong(Sched.none, mine, .seq_cst, .seq_cst) == null;
     }
 
-    /// The driver's turn with a kicked connection, on its executor. Never
-    /// suspends, so `release` (on this executor too) cannot free `t` while
-    /// the driver is in here (M3).
+    /// The driver's turn with a kicked connection, on its executor. It
+    /// suspends only in a spawn (the drain's, WRITABLE's, the flusher's:
+    /// zio's spawn backpressure), and `release`, on this executor too, may
+    /// run and free `t` meanwhile (M3): after each spawn it goes on only
+    /// when `spawn` says the connection is still the one in its slot, and
+    /// after a spawn that ends its turn (`handOver`) it touches nothing.
+    ///
+    /// The flag loads here are `.seq_cst`: they pair with a setter's
+    /// `.seq_cst` flag then `kicked` swap (`onDrain`, `cancelReader`)
+    /// against the driver's `kicked` store then these loads, so a kick
+    /// dropped because the slot was still listed finds its flag here.
     fn serviceKick(t: *TcpConn) void {
         t.owner.check(t.io);
-        if (t.has(Flag.drain_pending)) {
-            const f = t.flags.fetchAnd(~Flag.drain_pending, .acq_rel);
-            if (f & Flag.drain_pending != 0) _ = t.spawn(drainTask, .spawn_drain);
+        if (t.flags.load(.seq_cst) & Flag.drain_pending != 0) {
+            const f = t.flags.fetchAnd(~Flag.drain_pending, .seq_cst);
+            if (f & Flag.drain_pending != 0) {
+                if (t.spawn(drainTask, .spawn_drain) == .gone) return;
+            }
         }
-        if (comptime native_os == .windows) if (t.has(Flag.cancel_reader)) {
-            _ = t.flags.fetchAnd(~Flag.cancel_reader, .acq_rel);
+        if (comptime native_os == .windows) if (t.flags.load(.seq_cst) & Flag.cancel_reader != 0) {
+            _ = t.flags.fetchAnd(~Flag.cancel_reader, .seq_cst);
             if (t.reader_task) |task| placement.cancelTask(task);
         };
         // A kick for the drain, or a stale one: the outbox is someone else's.
@@ -1535,12 +1615,12 @@ const TcpConn = struct {
         t.handOver();
     }
 
-    /// Passes the outbox to a flusher task.
+    /// Passes the outbox to a flusher task. The caller's last touch of `t`
+    /// (the spawn may suspend; see `spawn`).
     fn handOver(t: *TcpConn) void {
         t.sched.store(Sched.flusher, .seq_cst);
-        if (!t.spawn(flusher, null)) {
-            t.failWrite(.server);
-        }
+        // Refused without a suspension: `t` is still there.
+        if (t.spawn(flusher, null) == .refused) t.failWrite(.server);
     }
 
     fn serviceDirect(t: *TcpConn) void {
@@ -1564,6 +1644,7 @@ const TcpConn = struct {
             switch (t.writeNow()) {
                 .done => {},
                 .would_block => return t.handOver(),
+                .gone => return,
                 .failed => {
                     t.failWrite(.reset);
                     t.discardAll();
@@ -1574,7 +1655,8 @@ const TcpConn = struct {
         }
     }
 
-    const NowResult = enum { done, would_block, failed };
+    /// `gone`: released during a spawn of WRITABLE's task (see `spawn`).
+    const NowResult = enum { done, would_block, failed, gone };
 
     /// Writes `inflight` without waiting: `sendmsg` with MSG_DONTWAIT.
     fn writeNow(t: *TcpConn) NowResult {
@@ -1608,14 +1690,15 @@ const TcpConn = struct {
                     return .failed;
                 },
             };
-            t.consume(@intCast(rc));
+            if (!t.consume(@intCast(rc))) return .gone;
         }
         return .done;
     }
 
     /// `n` bytes of the batch are written: frees what is whole, advances
-    /// into the chunk that is not, and tells the writable waiters.
-    fn consume(t: *TcpConn, n: usize) void {
+    /// into the chunk that is not, and tells the writable waiters. False:
+    /// the connection was released during WRITABLE's spawn (see `spawn`).
+    fn consume(t: *TcpConn, n: usize) bool {
         var left = n;
         while (left > 0) {
             const c = t.inflight.head orelse break;
@@ -1634,10 +1717,14 @@ const TcpConn = struct {
         const was = t.queued.fetchSub(@intCast(n), .seq_cst);
         const now_queued = was - @as(u32, @intCast(n));
         t.wakeWaiters();
+        // The flag is read after the subtraction, both `.seq_cst`: they
+        // pair with `reserve`'s refusal (flag, then a second look at
+        // `queued`), so either it sees the flag or the sender sees room.
         const half = t.service.options.write_high_water / 2;
-        if (now_queued < half and t.has(Flag.want_writable)) {
-            if (t.flags.fetchAnd(~Flag.want_writable, .acq_rel) & Flag.want_writable != 0) t.notifyWritable();
+        if (now_queued < half and t.flags.load(.seq_cst) & Flag.want_writable != 0) {
+            if (t.flags.fetchAnd(~Flag.want_writable, .seq_cst) & Flag.want_writable != 0) return t.notifyWritable();
         }
+        return true;
     }
 
     /// A chunk leaves the connection, written or dropped: a borrowed one
@@ -1650,15 +1737,21 @@ const TcpConn = struct {
     }
 
     /// WRITABLE: the C ABI's table posts it from here; a Zig handler's
-    /// `writable` runs on a task of its own.
-    fn notifyWritable(t: *TcpConn) void {
-        const f = t.service.table.writable orelse return;
+    /// `writable` runs on a task of its own. False: released during that
+    /// task's spawn (see `spawn`).
+    fn notifyWritable(t: *TcpConn) bool {
+        const f = t.service.table.writable orelse return true;
         if (t.service.table.inline_events) {
             f(t.service.state, &t.conn) catch {};
-            return;
+            return true;
         }
-        if (t.writable_pending.swap(true, .acq_rel)) return;
-        if (!t.spawn(writableTask, .spawn_writable)) t.writable_pending.store(false, .release);
+        if (t.writable_pending.swap(true, .acq_rel)) return true;
+        switch (t.spawn(writableTask, .spawn_writable)) {
+            .started => {},
+            .refused => t.writable_pending.store(false, .release),
+            .gone => return false,
+        }
+        return true;
     }
 
     fn writableTask(t: *TcpConn) void {
@@ -1750,6 +1843,7 @@ const TcpConn = struct {
                 if (t.connection.tls_conn == null) switch (t.writeNow()) {
                     .done => continue,
                     .would_block => {},
+                    .gone => return,
                     .failed => {
                         t.failWrite(.reset);
                         continue;
@@ -1762,10 +1856,14 @@ const TcpConn = struct {
             if (result) |_| {} else |err| switch (err) {
                 error.Timeout => t.abort(.write_timeout),
                 error.Canceled => {
-                    // The server stops, or the connection is released: the
-                    // connection task ends it.
+                    // Released: `release` drops the output and reports the
+                    // connection's own reason (idle, lifetime, ...), not the
+                    // flusher's. Else the server stops: the connection task
+                    // ends it.
+                    if (t.isClosed()) return;
                     t.abort(.drain);
                 },
+                error.Gone => return,
                 else => t.failWrite(.reset),
             }
         }
@@ -1773,7 +1871,7 @@ const TcpConn = struct {
 
     /// Writes the batch through the connection's writer (TLS records
     /// included), waiting as the socket needs.
-    fn writeBatch(t: *TcpConn) error{WriteFailed}!void {
+    fn writeBatch(t: *TcpConn) error{ WriteFailed, Gone }!void {
         const w = t.connection.writer;
         while (t.inflight.head) |first| {
             var slices: [32][]const u8 = undefined;
@@ -1788,7 +1886,7 @@ const TcpConn = struct {
             }
             w.writeVecAll(slices[0..n]) catch return error.WriteFailed;
             w.flush() catch return error.WriteFailed;
-            t.consume(bytes);
+            if (!t.consume(bytes)) return error.Gone;
         }
     }
 
@@ -1818,15 +1916,17 @@ const TcpConn = struct {
 
     // -- Waiting on the outbox -------------------------------------------------
 
-    /// Waits until fewer than `below` bytes are queued.
+    /// Waits until fewer than `below` bytes are queued. It waits on
+    /// `epoch`, which every change it waits for moves (`wakeWaiters`), read
+    /// before the looks: a change after them makes the wait return.
     fn waitUnder(t: *TcpConn, below: u32) error{ Closed, Canceled }!void {
         _ = t.waiters.fetchAdd(1, .seq_cst);
         defer _ = t.waiters.fetchSub(1, .seq_cst);
         while (true) {
-            if (t.has(Flag.closed | Flag.dead)) return error.Closed;
-            const q = t.queued.load(.seq_cst);
-            if (q < below) return;
-            try t.io.futexWait(u32, &t.queued.raw, q);
+            const e = t.epoch.load(.seq_cst);
+            if (t.flags.load(.seq_cst) & (Flag.closed | Flag.dead) != 0) return error.Closed;
+            if (t.queued.load(.seq_cst) < below) return;
+            try t.io.futexWait(u32, &t.epoch.raw, e);
         }
     }
 
@@ -1844,7 +1944,8 @@ const TcpConn = struct {
     fn onDrain(hook: *dusty.DrainHooks.Hook) void {
         const t: *TcpConn = @alignCast(@fieldParentPtr("drain_hook", hook));
         if (t.service.table.drain == null) return;
-        _ = t.flags.fetchOr(Flag.drain_pending, .acq_rel);
+        // `.seq_cst`: see `serviceKick`.
+        _ = t.flags.fetchOr(Flag.drain_pending, .seq_cst);
         t.driver.kick(t.kick);
     }
 

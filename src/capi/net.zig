@@ -54,9 +54,11 @@ pub const NetSlot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
     /// Over `conn`: a call from a consumer thread holds it while it uses
     /// the connection, `onClose` while it takes it away. A leaf (L4):
-    /// nothing is taken, allocated or woken under it but the connection's
-    /// atomics (a reset's non-blocking `setsockopt`/`shutdown` and its gated
-    /// wakes); a call's chunk is made before it, its kick made after.
+    /// nothing is taken, allocated, freed or woken under it but the
+    /// connection's atomics (a reset's non-blocking `setsockopt`/`shutdown`
+    /// and its gated wakes); a call's chunk is made before it and, when the
+    /// connection refuses it, freed after it (`chunk_checked` panics
+    /// otherwise in Debug and tests); its kick is made after it.
     lock: safety.SpinLock(.leaf) = .init,
     conn: ?*net.Conn = null,
     state: *TcpState = undefined,
@@ -160,7 +162,8 @@ pub const UdpState = struct {
     /// at the stop before they are freed.
     group: std.atomic.Value(?*net.UdpGroup) = .init(null),
     /// The calls from consumer threads inside the group (T5): closed at the
-    /// stop, which waits for those inside.
+    /// stop, which waits for those inside. A send queues its batch inside
+    /// it (the batch's one allocation included): short, never a wait.
     gate: safety.IoGate = .{},
 
     fn enter(u: *UdpState) ?*net.UdpGroup {
@@ -594,9 +597,10 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
     // The SENT record first: a call that fails takes nothing.
     const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
     errdefer if (sent) |r| engine.freeRecord(r.ptr);
-    // The chunk before the lock (L5): nothing allocates under it.
+    // The chunk before the lock (L5): nothing allocates under it, and one
+    // the call did not take is freed here, after it.
     var chunk: ?*net.OutChunk = null;
-    errdefer if (chunk) |c| c.destroy();
+    defer if (chunk) |c| c.destroy();
     if (sent != null and !copy) {
         chunk = try net.OutChunk.borrowed(chunk_checked.allocator(), data, @intFromPtr(sent.?.ptr));
     } else if (frame or data.len > 0) {
@@ -613,9 +617,9 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
         if (!s.live(g)) return e.gone();
         var r: net.Conn.Sent = .ok;
         if (chunk) |c| {
-            // Taken by the call, on success and on error alike.
-            chunk = null;
+            // Taken on success; refused, it stays `chunk`.
             const q = conn.queueChunk(c, frame) catch |err| return writeError(e, err);
+            if (q.taken) chunk = null;
             r = q.sent;
             kicks[0] = q.kick;
         } else {
@@ -625,6 +629,10 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
         if (flags & abi.NET_F_END != 0) kicks[1] = conn.endKick();
         break :locked r;
     };
+    // After the unlock the connection may be gone; the kicks touch only its
+    // driver and kick slot, which the server frees at destroy. That rests
+    // on the ABI's rule: anole_server_destroy overlaps nothing on its
+    // server (anole.h), so no anole_net_* call is running then.
     for (kicks) |k| if (k) |kick| kick.run();
     if (sent) |rec| if (copy) s.exec.postSentRec(s.handle(g), rec);
     return result == .busy;
@@ -652,6 +660,7 @@ pub fn closeConn(e: *Engine, hv: u64, how: u32) AnswerError!void {
         if (!s.live(g)) return error.Over;
         break :locked if (how == abi.NET_CLOSE_RESET) conn.resetKick() else conn.closeKick();
     };
+    // After the unlock: see `write`'s kicks.
     if (kick) |k| k.run();
 }
 

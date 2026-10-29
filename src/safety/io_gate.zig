@@ -37,13 +37,15 @@ pub const IoGate = struct {
     }
 
     /// Before what the wakes touch goes: no wake enters from now on, and
-    /// those inside have left when this returns. They are a few
-    /// instructions long.
+    /// those inside have left when this returns. What runs inside never
+    /// waits: mostly a wake, a few instructions; at most a short call that
+    /// may allocate (the C ABI's UDP send queues a batch inside its
+    /// listener's gate, `capi/net.zig` `UdpState`).
     pub fn close(g: *IoGate) void {
         _ = g.word.fetchOr(closed, .acq_rel);
         // Spin first, then yield, as libuv's `uv__async_spin` does: a wake
         // in flight is done within a few hundred cycles unless its thread
-        // was preempted.
+        // was preempted (or allocating, past the spins: then it yields).
         var spins: u32 = 0;
         while (g.word.load(.acquire) & ~closed != 0) {
             if (spins < 1000) {
