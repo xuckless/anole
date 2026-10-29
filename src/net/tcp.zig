@@ -2191,7 +2191,11 @@ const TcpConn = struct {
         while (true) {
             if (t.over.load(.acquire) != 0) return .close;
             if (t.paused.load(.acquire) == Paused.paused) {
-                try t.waitResumed();
+                // Paused: no idle deadline (no input is read), the lifetime
+                // still holds; its timer ends the wait as a read's.
+                burst.deadline = t.lifetimeAt();
+                burst.armDeadline();
+                t.waitResumed() catch |err| return t.readEnded(burst, err);
                 continue;
             }
             if (t.close_graceful.load(.acquire) or t.ending) return t.finishGraceful(burst, r);
