@@ -484,7 +484,7 @@ pub const Client = struct {
         try self.guard.observe(self.gpa, registry);
         try self.cache.observe(registry);
         if (health) |h| {
-            self.readiness = .{ .io = self.io, .context = self, .ping = readyPing };
+            self.readiness = .{ .io = self.io, .context = safety.toCtx(self), .ping = readyPing };
             try self.readiness.register(h, self.name);
         }
         if (self.options.connect_at_start) self.warm() catch |err| {
@@ -523,12 +523,17 @@ pub const Client = struct {
     }
 
     /// The readiness check: a ping within `ping_timeout`.
-    fn readyPing(context: *anyopaque, io: std.Io) bool {
-        const self: *Client = @ptrCast(@alignCast(context));
+    /// A cancel of the caller is `error.Canceled` (`Readiness` keeps no
+    /// answer then).
+    fn readyPing(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
+        const self = safety.fromCtx(Client, context);
         var buf: [2048]u8 = undefined;
         var fba: std.heap.FixedBufferAllocator = .init(&buf);
         var c: shared.Ctx = .{ .io = io, .arena = fba.allocator() };
-        _ = self.db("admin").with(.{ .timeout = self.options.ping_timeout }).runCommand(&c, .{ .ping = 1 }) catch return false;
+        _ = self.db("admin").with(.{ .timeout = self.options.ping_timeout }).runCommand(&c, .{ .ping = 1 }) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return false,
+        };
         return true;
     }
 

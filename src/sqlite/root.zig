@@ -213,7 +213,7 @@ pub const Client = struct {
             .writer = .{ .conn = undefined, .thread = undefined },
             .readers = .{},
             .observer = .{ .system = .sqlite, .name = name },
-            .readiness = .{ .io = io, .context = self, .ping = ping },
+            .readiness = .{ .io = io, .context = safety.toCtx(self), .ping = ping },
             .cache = try .init(gpa, io, .sqlite, name, options.cache),
         };
         errdefer self.cache.deinit();
@@ -541,12 +541,17 @@ pub const Client = struct {
     }
 
     /// The readiness check: a `SELECT 1` within `ping_timeout`.
-    fn ping(context: *anyopaque, io: std.Io) bool {
-        const self: *Client = @ptrCast(@alignCast(context));
+    /// A cancel of the caller is `error.Canceled` (`db.Readiness` keeps no
+    /// answer then).
+    fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
+        const self = safety.fromCtx(Client, context);
         var buf: [1024]u8 = undefined;
         var fba: std.heap.FixedBufferAllocator = .init(&buf);
         var ctx: db.Ctx = .{ .io = io, .arena = fba.allocator() };
-        const v = self.with(.{ .timeout = self.ping_timeout }).one(i64, &ctx, "SELECT 1", .{}) catch return false;
+        const v = self.with(.{ .timeout = self.ping_timeout }).one(i64, &ctx, "SELECT 1", .{}) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return false,
+        };
         return v == 1;
     }
 };

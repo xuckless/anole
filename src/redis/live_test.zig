@@ -437,7 +437,7 @@ test "redis: live TLS as the URL asks, and a refused login" {
     const detail = db.lastError(&c).?;
     try testing.expectEqual(db.Class.unavailable, detail.class);
     try testing.expect(std.mem.eql(u8, detail.code, "WRONGPASS") or std.mem.eql(u8, detail.code, "ERR"));
-    try testing.expect(!refused.readiness.ping(refused, io));
+    try testing.expect(!try refused.readiness.ping(refused, io));
 }
 
 const AppState = struct {

@@ -488,7 +488,7 @@ pub const Client = struct {
             .errors = opts.errors,
             .guard = try .init(.redis, name, opts.breaker, opts.retry),
             .observer = .{ .system = .redis, .name = name },
-            .readiness = .{ .io = io, .context = self, .ping = ping },
+            .readiness = .{ .io = io, .context = safety.toCtx(self), .ping = ping },
             .acquire_timeout = opts.acquire_timeout,
             .connect_timeout = opts.connect_timeout,
             .idle_timeout = opts.idle_timeout,
@@ -717,9 +717,10 @@ pub const Client = struct {
     }
 
     /// True when the server answers PING within `ping_timeout`: `/readyz`'s
-    /// check. Its failures are not logged.
-    fn ping(context: *anyopaque, io: std.Io) bool {
-        const self: *Client = @ptrCast(@alignCast(context));
+    /// check. Its failures are not logged; a cancel of the caller is
+    /// `error.Canceled` (`db.Readiness` keeps no answer then).
+    fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
+        const self = safety.fromCtx(Client, context);
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         const quiet: Ctx = .{ .io = io, .arena = arena.allocator(), .any = self, .record = keep, .last = noLast, .request = null };
@@ -727,7 +728,10 @@ pub const Client = struct {
         b.add(.{"PING"}) catch return false;
         const batch = b.finish();
         // Not a call of the app's: no metrics, no span.
-        const replies = self.bounded(&quiet, self.ping_timeout, null, &batch) catch return false;
+        const replies = self.bounded(&quiet, self.ping_timeout, null, &batch) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return false,
+        };
         return replies[0] == .status;
     }
 
@@ -2625,7 +2629,7 @@ test "redis: acquire runs its calls on one connection and gives it back" {
     conn.release();
     _ = try client.incr(&c, "n");
     try testing.expectEqual(@as(u32, 1), fake.accepted.load(.monotonic));
-    try testing.expect(Client.ping(client, io));
+    try testing.expect(try Client.ping(client, io));
 }
 
 test "redis: a connection released twice is never handed to two holders" {
@@ -2783,7 +2787,7 @@ test "redis: a server that cannot be reached is a 503, and /readyz says so" {
     defer testing.log_level = level;
     try testing.expectError(error.ServiceUnavailable, client.get(&c, "k"));
     try testing.expectStringStartsWith(db.lastError(&c).?.message, "cannot connect to redis://127.0.0.1:");
-    try testing.expect(!Client.ping(client, io));
+    try testing.expect(!try Client.ping(client, io));
 
     // A URL may not turn off the checks of a CA the code gives.
     if (has_tls) try testing.expectError(error.InvalidDatabaseUrl, Client.init(gpa, io, .{ .url = "rediss://cache.example.com?ssl_cert_reqs=none", .environ = .empty, .tls = .{ .ca = .system } }));

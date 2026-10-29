@@ -6,46 +6,63 @@ const dusty = @import("dusty");
 const observe = @import("../observe/root.zig");
 const db = @import("root.zig");
 const internal = @import("internal.zig");
+const safety = @import("anole_safety");
 
 const metrics = observe.metrics;
 
 /// A readiness check that pings the database at most once per `ttl`;
-/// probes in between get the last answer, and concurrent ones wait for the
-/// ping in flight rather than start their own.
+/// probes in between get the last answer. One ping runs at a time: probes
+/// that come while it runs answer with the last result (not ready before
+/// the first) instead of waiting for it, so `/readyz` never queues behind
+/// a slow database. A ping canceled with its request keeps nothing.
 ///
 ///     state.ready = .{ .io = io, .context = pg, .ping = Db.ping };
 ///     try state.ready.register(app.health(.{}), "postgres");
+///
+/// owner: the connector it is a field of (process-wide, M2). Any thread:
+/// its state is atomics (a single flight with no waiters, no lock).
 pub const Readiness = struct {
     io: std.Io,
     context: *anyopaque,
-    /// True when the database answers. Bounded by the connector (a short
-    /// timeout of its own): `/readyz` waits for it.
-    ping: *const fn (context: *anyopaque, io: std.Io) bool,
+    /// True when the database answers, bounded by the connector (a short
+    /// timeout of its own). `error.Canceled` only when the calling task
+    /// was canceled: no answer is kept then.
+    ping: *const fn (context: *anyopaque, io: std.Io) std.Io.Cancelable!bool,
     ttl: std.Io.Duration = .fromSeconds(1),
-    mutex: std.Io.Mutex = .init,
-    checked_at: ?std.Io.Clock.Timestamp = null,
-    ready: bool = false,
+    /// When the last ping ended (the awake clock, ns, at least 1); 0: none
+    /// yet. Stored after `ready` (release), loaded before it (acquire).
+    checked_ns: std.atomic.Value(i64) = .init(0),
+    ready: std.atomic.Value(bool) = .init(false),
+    /// A ping runs.
+    pinging: std.atomic.Value(bool) = .init(false),
 
     /// Adds the check to `health` under `name`. `self` must stay put.
     pub fn register(self: *Readiness, health: *observe.Health, name: []const u8) !void {
-        try health.addCheck(name, check, self);
+        try health.addCheck(name, check, safety.toCtx(self));
     }
 
     /// The `observe.Health` check.
     pub fn check(context: ?*anyopaque) bool {
-        const self: *Readiness = @ptrCast(@alignCast(context.?));
-        self.mutex.lock(self.io) catch {
-            self.io.recancel();
-            return false;
+        const self = safety.fromCtx(Readiness, context);
+        const io = self.io;
+        const at = self.checked_ns.load(.acquire);
+        if (at != 0 and nowNs(io) - at < self.ttl.nanoseconds) return self.ready.load(.monotonic);
+        // Another probe pings: its answer comes later, the last one now.
+        if (self.pinging.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return self.ready.load(.monotonic);
+        defer self.pinging.store(false, .release);
+        const ok = self.ping(self.context, io) catch {
+            // SAFETY.md C3: the cancel is the caller's; nothing is kept.
+            io.recancel();
+            return self.ready.load(.monotonic);
         };
-        defer self.mutex.unlock(self.io);
-        const now: std.Io.Clock.Timestamp = .now(self.io, .awake);
-        if (self.checked_at) |at| {
-            if (at.durationTo(now).raw.nanoseconds < self.ttl.nanoseconds) return self.ready;
-        }
-        self.ready = self.ping(self.context, self.io);
-        self.checked_at = .now(self.io, .awake);
-        return self.ready;
+        self.ready.store(ok, .monotonic);
+        self.checked_ns.store(@max(1, nowNs(io)), .release);
+        return ok;
+    }
+
+    fn nowNs(io: std.Io) i64 {
+        const now: std.Io.Clock.Timestamp = .now(io, .awake);
+        return @intCast(now.raw.nanoseconds);
     }
 };
 
@@ -213,8 +230,8 @@ test "Readiness: one ping per ttl, the answer kept in between" {
     const Fake = struct {
         pings: u32 = 0,
         up: bool = true,
-        fn ping(context: *anyopaque, _: std.Io) bool {
-            const self: *@This() = @ptrCast(@alignCast(context));
+        fn ping(context: *anyopaque, _: std.Io) std.Io.Cancelable!bool {
+            const self = safety.fromCtx(@This(), context);
             self.pings += 1;
             return self.up;
         }
@@ -222,7 +239,7 @@ test "Readiness: one ping per ttl, the answer kept in between" {
     var fake: Fake = .{};
     // A ttl no run of the test outlives while the answer must be kept, so
     // the kept answer never depends on how fast the machine is.
-    var ready: Readiness = .{ .io = testing.io, .context = &fake, .ping = Fake.ping, .ttl = .fromSeconds(600) };
+    var ready: Readiness = .{ .io = testing.io, .context = safety.toCtx(&fake), .ping = Fake.ping, .ttl = .fromSeconds(600) };
     var health = observe.Health.init(.{});
     try ready.register(&health, "db");
     try testing.expect(health.checks[0].ready(health.checks[0].ctx));
@@ -235,6 +252,56 @@ test "Readiness: one ping per ttl, the answer kept in between" {
     try testing.io.sleep(.fromMilliseconds(60), .awake);
     try testing.expect(!Readiness.check(&ready));
     try testing.expectEqual(@as(u32, 2), fake.pings);
+}
+
+/// A ping that waits for `gate` (B-2, S-4): counts its pings and how many
+/// run at once.
+const GatedPing = struct {
+    gate: std.Io.Event = .unset,
+    started: std.Io.Event = .unset,
+    pings: std.atomic.Value(u32) = .init(0),
+    running: std.atomic.Value(u32) = .init(0),
+    most: std.atomic.Value(u32) = .init(0),
+    answer: bool = true,
+
+    fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
+        const self = safety.fromCtx(GatedPing, context);
+        _ = self.pings.fetchAdd(1, .monotonic);
+        const now = self.running.fetchAdd(1, .acq_rel) + 1;
+        defer _ = self.running.fetchSub(1, .acq_rel);
+        _ = self.most.fetchMax(now, .monotonic);
+        self.started.set(io);
+        try self.gate.wait(io);
+        return self.answer;
+    }
+};
+
+const ReadyProbe = struct {
+    fn run(ready: *Readiness, answer: *?bool) void {
+        answer.* = Readiness.check(ready);
+    }
+};
+
+test "db readiness: probes during a ping answer with the last result" {
+    const wait = @import("anole_test_wait");
+    const io = testing.io;
+    var fake: GatedPing = .{};
+    var ready: Readiness = .{ .io = io, .context = safety.toCtx(&fake), .ping = GatedPing.ping, .ttl = .fromSeconds(600) };
+    var answer: ?bool = null;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, ReadyProbe.run, .{ &ready, &answer });
+    try wait.waitEvent(io, "the first probe's ping", &fake.started);
+    // While it pings: the last answer (none yet, so not ready), at once,
+    // and no second ping.
+    try testing.expect(!Readiness.check(&ready));
+    try testing.expectEqual(@as(u32, 1), fake.pings.load(.monotonic));
+    fake.gate.set(io);
+    try group.await(io);
+    try testing.expectEqual(@as(?bool, true), answer);
+    // The answer kept for the ttl: no new ping.
+    try testing.expect(Readiness.check(&ready));
+    try testing.expectEqual(@as(u32, 1), fake.pings.load(.monotonic));
 }
 
 test "Observer: metrics shared by two databases, and a child span in a traced request" {

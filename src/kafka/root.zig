@@ -335,7 +335,7 @@ pub const Client = struct {
         } else for (self.consumers.items) |c| try c.start();
     }
 
-    fn pingFn(context: *anyopaque, _: std.Io) bool {
+    fn pingFn(context: *anyopaque, _: std.Io) std.Io.Cancelable!bool {
         const self: *Client = @ptrCast(@alignCast(context));
         return self.cluster.ping();
     }
