@@ -53,9 +53,14 @@ pub const Conn = struct {
     io: std.Io,
     settings: Settings,
     stream: *net.ClientStream,
-    /// L2's exception (an I/O lock): one round trip at a time on this
-    /// socket, taken with no other lock held, until #111's reader demux.
-    mutex: safety.IoLock = .init,
+    /// One round trip at a time on this socket, taken with no other lock
+    /// held, until #111's reader demux. L2's exception (an I/O lock), but a
+    /// raw mutex for now: `safety.IoLock` keeps held I/O locks on a
+    /// per-thread stack, so while one task is suspended in its round trip
+    /// another task of the same executor taking its own connection's lock
+    /// is reported as nesting I/O locks. It becomes an `IoLock` once the
+    /// helper tracks them per task.
+    mutex: std.Io.Mutex = .init,
     correlation: i32 = 1,
     broken: bool = false,
     node_id: i32,
