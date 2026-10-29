@@ -642,6 +642,58 @@ test "capi grpc: destroy ends a client-streaming call parked for ring room" {
     try f.await(io);
 }
 
+/// Two calls started, and the ring is full: a task waits for room (the
+/// first call's reader with its message, or the second call itself).
+fn ringFull(e: *engine.Engine) bool {
+    return e.stats().requests == 2 and e.execs[0].room_waiters.load(.seq_cst) >= 1;
+}
+
+fn deadlineWhileParked(e: *engine.Engine, io: std.Io) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = e.port(0) });
+    defer conn.close();
+    var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost" };
+    const client: grpc.Client(Echo) = .{ .channel = &channel };
+    // Two calls with no deadline fill the ring while nobody polls.
+    var s0 = try client.stream("ClientStream", arena, .{});
+    defer s0.deinit();
+    try s0.send(.{ .message = "a" });
+    var s1 = try client.stream("ClientStream", arena, .{});
+    defer s1.deinit();
+    try s1.send(.{ .message = "b" });
+    try wait.waitUntil(io, "two calls started and the ring is full", e, ringFull);
+    // The third waits to be handed over until its deadline. The deadline
+    // goes as plain metadata, not `.timeout`: the client would enforce
+    // that one itself and reset the stream, and the server would see a
+    // cancel instead of its own deadline.
+    var s2 = try client.stream("ClientStream", arena, .{ .metadata = &.{.{ .name = "grpc-timeout", .value = "100m" }} });
+    defer s2.deinit();
+    try s2.send(.{ .message = "c" });
+    try std.testing.expect(try s2.receive() == null);
+    try std.testing.expectEqual(grpc.Code.deadline_exceeded, s2.status.?.code);
+    try std.testing.expectEqualStrings("deadline exceeded", s2.status.?.message);
+    try std.testing.expectEqual(@as(u64, 1), e.stats().expired);
+}
+
+test "capi grpc: a client-streaming call whose deadline passes while it waits for ring room ends DEADLINE_EXCEEDED" {
+    if (comptime !features.http2) return error.SkipZigTest;
+    // Whichever comes first, the room wait's timeout or the request's
+    // timer canceling the task, the call ends with its deadline, once;
+    // the test runner fails the test on a swallowed cancel, and zio
+    // asserts on a cancel re-armed that was never delivered.
+    const e = try ringEngine("\"shutdown_ms\": {d}", .{@as(u64, 200)});
+    defer e.destroy();
+    _ = try e.attach(null, null, false);
+    try e.start();
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(deadlineWhileParked, .{ e, io });
+    try f.await(io);
+}
+
 test "capi grpc: configurations refused" {
     const cases = [_][]const u8{
         // No descriptors and no methods.
