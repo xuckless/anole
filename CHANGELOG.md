@@ -198,6 +198,10 @@ breaking changes are listed anyway.
   now one step, and a sender numbers its batches under the id of that step.
 - Kafka: a consumer group whose start failed (no memory for its tasks) was
   freed while the client still listed it, and freed again with the client.
+- Kafka: a call canceled while it waited for a broker's answer (a server
+  stopping under a produce that was refreshing the metadata) failed as a
+  lost connection, and the cancel was lost with it: the task went on and
+  waited again, holding up the stop. It now ends with the cancel.
 
 ### Changed
 
