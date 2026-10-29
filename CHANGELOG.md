@@ -38,6 +38,11 @@ breaking changes are listed anyway.
   "connector" rows with nothing in them.
 - Console: `/routes` gives WebSocket, WebTransport and gRPC routes their
   kind (`ws`, `wt`, `grpc`); every route said `http`.
+- Console: `/db` no longer files a connector under a database by a piece
+  of its type's name. A type whose name contained "pg" (`Upgrade`, a file
+  named `pg_cache.zig`) showed as PostgreSQL, and likewise for "s3",
+  "nats" and the rest. Each connector now names its system itself
+  (`console_system`); the strings are unchanged.
 - Jobs: a job that finished while the server drained could run a second
   time. A drain past its deadline cancels the runs still going, and the
   cancel could land on a finished run's state write (logged as "finished

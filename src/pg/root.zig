@@ -490,6 +490,9 @@ pub const Session = struct {
 /// A PostgreSQL database: the handle in the App state. Its calls take the
 /// request (or an `anole.db.Ctx`) first; see `anole.db`.
 pub const Client = struct {
+    /// The console's `/db` "system" for this connector.
+    pub const console_system = "postgres";
+
     gpa: std.mem.Allocator,
     io: std.Io,
     /// The settings' strings and the startup parameters.

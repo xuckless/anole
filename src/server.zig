@@ -964,14 +964,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// after a long freeze); null when it has no pool to close.
             closeIdle: ?*const fn (context: *anyopaque) void = null,
 
+            /// The console's `/db` system: the type's `console_system` decl
+            /// ("postgres", "redis"...), or "connector" when it has none.
             fn systemOf(comptime T: type) []const u8 {
-                @setEvalBranchQuota(20_000);
-                const n = @typeName(T);
-                inline for (.{ "postgres:pg", "sqlite:sqlite", "mongodb:mongodb", "redis:redis", "nats:nats", "kafka:kafka", "smtp:smtp", "s3:s3" }) |pair| {
-                    const colon = comptime std.mem.indexOfScalar(u8, pair, ':').?;
-                    if (std.mem.find(u8, n, pair[colon + 1 ..]) != null) return pair[0..colon];
-                }
-                return "connector";
+                if (!@hasDecl(T, "console_system")) return "connector";
+                const system: []const u8 = T.console_system;
+                return system;
             }
 
             fn of(comptime T: type, value: *T) Connector {

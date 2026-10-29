@@ -235,6 +235,9 @@ pub const Msg = struct {
 
 /// The client: `app.nats(options)` makes one.
 pub const Client = struct {
+    /// The console's `/db` "system" for this connector.
+    pub const console_system = "nats";
+
     gpa: std.mem.Allocator,
     io: std.Io,
     /// Strings the core clients point into.
