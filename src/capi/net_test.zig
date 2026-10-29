@@ -35,6 +35,8 @@ const Rig = struct {
     /// Set by the thread once it saw `manual`, out of its poll: one consumer
     /// is polled by one thread at a time.
     parked: std.atomic.Value(bool) = .init(false),
+    /// Set with `stop`: wakes a thread parked by `takeOver`.
+    stopped: std.Io.Event = .unset,
     lock: std.atomic.Mutex = .unlocked,
     recs: std.ArrayList(Rec) = .empty,
 
@@ -57,6 +59,7 @@ const Rig = struct {
 
     fn destroy(r: *Rig) void {
         r.stop.store(true, .release);
+        r.stopped.set(std.testing.io);
         r.thread.join();
         r.e.drain() catch {};
         _ = r.e.wait(@intCast(wait.deadlineMs()));
@@ -83,7 +86,8 @@ const Rig = struct {
         while (!r.stop.load(.acquire)) {
             if (r.manual.load(.acquire)) {
                 r.parked.store(true, .release);
-                std.testing.io.sleep(.fromMilliseconds(2), .awake) catch {};
+                // Parked until `destroy`; the loop then ends on `stop`.
+                r.stopped.wait(std.testing.io) catch {};
                 continue;
             }
             const n = engine.pollWait(r.c, &buf, 20, &need) catch continue;
@@ -189,7 +193,7 @@ test "capi net: open, data and close records" {
     engine.handleRelease(rig.e, open.handle) catch |err| try std.testing.expectEqual(error.Over, err);
 }
 
-test "capi net: frames come batched, one record per burst" {
+test "capi net: line framing delivers each line as one frame, in order, with F_FRAMES" {
     if (comptime !features.net) return error.SkipZigTest;
     const rig = try Rig.create(tcp_lines);
     defer rig.destroy();
@@ -218,26 +222,39 @@ test "capi net: frames come batched, one record per burst" {
     try std.testing.expectEqualStrings("a|bb|ccc|", got.items);
 }
 
-test "capi net: write, framing, F_END, borrowed writes get one SENT, stale handles" {
-    if (comptime !features.net) return error.SkipZigTest;
-    const json = "{\"executors\": 2, \"timeouts\": {\"shutdown_ms\": 500}, \"listeners\": [{\"name\": \"rpc\", \"address\": \"127.0.0.1\", \"port\": 0, \"tcp\": {\"handler\": 1, \"framing\": {\"length\": {\"bytes\": 2}}}}]}";
-    const rig = try Rig.create(json);
-    defer rig.destroy();
-    const s = try rig.client();
-    defer s.close();
+const tcp_length = "{\"executors\": 2, \"timeouts\": {\"shutdown_ms\": 500}, \"listeners\": [{\"name\": \"rpc\", \"address\": \"127.0.0.1\", \"port\": 0, \"tcp\": {\"handler\": 1, \"framing\": {\"length\": {\"bytes\": 2}}}}]}";
+
+/// A connection on a 2-byte length-framed listener, opened by one frame
+/// from the client; returns its handle.
+fn openFramed(rig: *Rig, s: *ClientStream) !u64 {
     try s.writer().writeAll("\x00\x01x");
     try s.writer().flush();
     const open = try rig.take(.net_open);
     defer free(open);
-    const h = open.handle;
+    return open.handle;
+}
 
-    // Plain write, then framed write.
+test "capi net: plain and length-framed writes reach the client" {
+    if (comptime !features.net) return error.SkipZigTest;
+    const rig = try Rig.create(tcp_length);
+    defer rig.destroy();
+    const s = try rig.client();
+    defer s.close();
+    const h = try openFramed(rig, s);
     try std.testing.expect(!(try engine.net.write(rig.e, h, "abc", 0)));
     try std.testing.expectEqualStrings("abc", try readExactly(s, 3));
     try std.testing.expect(!(try engine.net.write(rig.e, h, "hello", abi.NET_F_FRAME)));
     try std.testing.expectEqualStrings("\x00\x05hello", try readExactly(s, 7));
+}
 
-    // A borrowed write: its bytes stay valid until SENT, which comes once.
+test "capi net: a borrowed write gets exactly one SENT with its pointer" {
+    if (comptime !features.net) return error.SkipZigTest;
+    const rig = try Rig.create(tcp_length);
+    defer rig.destroy();
+    const s = try rig.client();
+    defer s.close();
+    const h = try openFramed(rig, s);
+    // Its bytes stay valid until SENT.
     const body = try alloc.dupe(u8, "borrowed");
     defer alloc.free(body);
     _ = try engine.net.write(rig.e, h, body, abi.BODY_BORROW);
@@ -247,15 +264,37 @@ test "capi net: write, framing, F_END, borrowed writes get one SENT, stale handl
     const se: *const abi.SentEvent = @ptrCast(sent.bytes.ptr);
     try std.testing.expectEqual(@intFromPtr(body.ptr), se.data);
     try std.testing.expectEqual(h, sent.handle);
+    try wait.expectStays(std.testing.io, "no second SENT", rig, struct {
+        fn none(r: *Rig) bool {
+            return r.pending(.sent) == 0;
+        }
+    }.none, wait.short_window);
+}
 
-    // Ending: len 0 with F_END; the client reads EOF, a later write is invalid.
+test "capi net: F_END ends the stream: EOF at the client, a later write is Invalid/Ended" {
+    if (comptime !features.net) return error.SkipZigTest;
+    const rig = try Rig.create(tcp_length);
+    defer rig.destroy();
+    const s = try rig.client();
+    defer s.close();
+    const h = try openFramed(rig, s);
     _ = try engine.net.write(rig.e, h, "", abi.NET_F_END);
     var buf: [8]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), s.reader().readSliceShort(&buf) catch 0);
     try std.testing.expectError(error.Invalid, engine.net.write(rig.e, h, "late", 0));
     try std.testing.expectEqualStrings("Ended", engine.net.invalid_token);
-    // A wrong kind of handle.
-    try std.testing.expectError(error.WrongKind, engine.net.write(rig.e, @as(u64, 1), "x", 0));
+}
+
+test "capi net: a write on a handle of another kind is WrongKind" {
+    if (comptime !features.net) return error.SkipZigTest;
+    const rig = try Rig.create(tcp_length);
+    defer rig.destroy();
+    const s = try rig.client();
+    defer s.close();
+    const h = engine.Handle.decode(try openFramed(rig, s));
+    // The live connection's slot, named as a request.
+    const other = engine.Handle.encode(.{ .gen = h.gen, .kind = .request, .slot = h.slot, .exec = h.exec });
+    try std.testing.expectError(error.WrongKind, engine.net.write(rig.e, other, "x", 0));
 }
 
 test "capi net: close RESET resets the client" {
@@ -358,8 +397,12 @@ test "capi net: a connection never has more than read_ahead unpolled" {
     var need: u32 = 0;
     var total: usize = 0;
     var max_unpolled: u32 = 0;
-    var tries: usize = 0;
-    while (total < 64 * 1024 and tries < 5000) : (tries += 1) {
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    while (total < 64 * 1024) {
+        if (started.untilNow(std.testing.io, .awake).nanoseconds >= wait.deadline().nanoseconds) {
+            std.debug.print("timed out with {d} of {d} bytes received\n", .{ total, 64 * 1024 });
+            return error.WaitTimedOut;
+        }
         const n = try engine.pollWait(rig.c, &small, 20, &need);
         var off: usize = 0;
         while (off < n) {
@@ -383,71 +426,151 @@ test "capi net: a connection never has more than read_ahead unpolled" {
 
 const udp_json = "{\"executors\": 2, \"timeouts\": {\"shutdown_ms\": 500}, \"listeners\": [{\"name\": \"game\", \"address\": \"127.0.0.1\", \"port\": 0, \"udp\": {\"handler\": 3}}]}";
 
-test "capi net: datagrams batch, udp_send replies in one call, udp_find, listener info" {
+/// A UDP listener, a client socket, and the five datagrams it sent taken
+/// as records: the socket's handle and the client's address as the engine
+/// saw it.
+const Udp = struct {
+    rig: *Rig,
+    c: std.Io.net.Socket,
+    handle: u64 = 0,
+    from: abi.NetAddr = .{},
+
+    fn init() !Udp {
+        const rig = try Rig.create(udp_json);
+        errdefer rig.destroy();
+        const io = std.testing.io;
+        const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        return .{ .rig = rig, .c = try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }) };
+    }
+
+    fn deinit(u: *Udp) void {
+        u.c.close(std.testing.io);
+        u.rig.destroy();
+    }
+
+    fn sendFive(u: *Udp) !void {
+        const to: std.Io.net.IpAddress = .{ .ip4 = .loopback(u.rig.e.listeners[0].udp_port) };
+        for (0..5) |i| {
+            var b: [8]u8 = undefined;
+            try u.c.send(std.testing.io, &to, try std.fmt.bufPrint(&b, "d{d}", .{i}));
+        }
+    }
+
+    /// Takes records until the five datagrams came, checking each.
+    fn takeFive(u: *Udp) !void {
+        var seen: usize = 0;
+        while (seen < 5) {
+            const rec = try u.rig.take(.net_datagrams);
+            defer free(rec);
+            const ev: *const abi.NetDatagramsEvent = @ptrCast(rec.bytes.ptr);
+            try std.testing.expectEqual(@as(u32, 3), ev.handler_id);
+            u.handle = rec.handle;
+            for (0..ev.ndatagrams) |i| {
+                const d: *const abi.NetDatagramIn = @ptrCast(@alignCast(&rec.bytes[ev.datagrams_off + i * @sizeOf(abi.NetDatagramIn)]));
+                try std.testing.expectEqual(@as(u16, 4), d.remote.family);
+                try std.testing.expectEqual(u.c.address.getPort(), d.remote.port);
+                u.from = d.remote;
+            }
+            seen += ev.ndatagrams;
+        }
+    }
+
+    fn ready(u: *Udp) !void {
+        try u.sendFive();
+        try u.takeFive();
+    }
+
+    /// One datagram at the client, with a deadline: the receive runs as
+    /// its own task (std.Io.Threaded has no receive timeout on Windows).
+    fn receive(u: *Udp, out: []u8) ![]const u8 {
+        const io = std.testing.io;
+        const Recv = struct {
+            c: *const std.Io.net.Socket,
+            buf: [16]u8 = undefined,
+            len: usize = 0,
+            done: std.atomic.Value(bool) = .init(false),
+            fn run(r: *@This(), rio: std.Io) anyerror!void {
+                const msg = try r.c.receive(rio, &r.buf);
+                r.len = msg.data.len;
+                r.done.store(true, .release);
+            }
+        };
+        var r: Recv = .{ .c = &u.c };
+        var f = try io.concurrent(Recv.run, .{ &r, io });
+        defer f.cancel(io) catch {};
+        try wait.waitFlag(io, "a reply datagram reached the client", &r.done);
+        try f.await(io);
+        @memcpy(out[0..r.len], r.buf[0..r.len]);
+        return out[0..r.len];
+    }
+};
+
+const reply_texts = [_][]const u8{ "r0", "r1", "r2", "r3", "r4" };
+
+fn replies(to: abi.NetAddr) [5]abi.NetDatagram {
+    var out: [5]abi.NetDatagram = undefined;
+    for (&out, reply_texts) |*r, t| r.* = .{ .to = to, .from = .{}, .data = t.ptr, .len = t.len };
+    return out;
+}
+
+test "capi net: a UDP listener reports the UDP flag, port 0 and its bound udp_port" {
     if (comptime !features.net) return error.SkipZigTest;
-    const rig = try Rig.create(udp_json);
-    defer rig.destroy();
-    const io = std.testing.io;
-    // The listener: UDP flag, port 0, udp_port bound.
-    const l = &rig.e.listeners[0];
+    var u: Udp = try .init();
+    defer u.deinit();
+    const l = &u.rig.e.listeners[0];
     try std.testing.expectEqual(abi.LISTENER_F_UDP, l.flags & abi.LISTENER_F_UDP);
     try std.testing.expectEqual(@as(u16, 0), l.port);
     try std.testing.expect(l.udp_port != 0);
+}
 
-    const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    const c = try lo.bind(io, .{ .mode = .dgram, .protocol = .udp });
-    defer c.close(io);
-    const to: std.Io.net.IpAddress = .{ .ip4 = .loopback(l.udp_port) };
-    for (0..5) |i| {
-        var b: [8]u8 = undefined;
-        try c.send(io, &to, try std.fmt.bufPrint(&b, "d{d}", .{i}));
-    }
-    var seen: usize = 0;
-    var handle: u64 = 0;
-    var from: abi.NetAddr = .{};
-    while (seen < 5) {
-        const rec = try rig.take(.net_datagrams);
-        defer free(rec);
-        const ev: *const abi.NetDatagramsEvent = @ptrCast(rec.bytes.ptr);
-        try std.testing.expectEqual(@as(u32, 3), ev.handler_id);
-        handle = rec.handle;
-        for (0..ev.ndatagrams) |i| {
-            const d: *const abi.NetDatagramIn = @ptrCast(@alignCast(&rec.bytes[ev.datagrams_off + i * @sizeOf(abi.NetDatagramIn)]));
-            try std.testing.expectEqual(@as(u16, 4), d.remote.family);
-            try std.testing.expectEqual(c.address.getPort(), d.remote.port);
-            from = d.remote;
-        }
-        seen += ev.ndatagrams;
-    }
-    // Five replies in one call.
-    var replies: [5]abi.NetDatagram = undefined;
-    const texts = [_][]const u8{ "r0", "r1", "r2", "r3", "r4" };
-    for (&replies, texts) |*r, t| r.* = .{ .to = from, .from = .{}, .data = t.ptr, .len = t.len };
-    _ = try engine.net.udpSend(rig.e, handle, &replies, 0);
-    for (texts) |t| {
+test "capi net: datagrams arrive with their handler id and the sender's address" {
+    if (comptime !features.net) return error.SkipZigTest;
+    var u: Udp = try .init();
+    defer u.deinit();
+    try u.sendFive();
+    // takeFive checks the handler id and the address of each.
+    try u.takeFive();
+    try std.testing.expect(u.handle != 0);
+}
+
+test "capi net: udp_send sends five replies in one call" {
+    if (comptime !features.net) return error.SkipZigTest;
+    var u: Udp = try .init();
+    defer u.deinit();
+    try u.ready();
+    var r = replies(u.from);
+    _ = try engine.net.udpSend(u.rig.e, u.handle, &r, 0);
+    for (reply_texts) |t| {
         var buf: [16]u8 = undefined;
-        // No timeout: std.Io.Threaded has none for a receive on Windows
-        // (ConcurrencyUnavailable); the test runner's watchdog bounds a hang.
-        const msg = try c.receive(io, &buf);
-        try std.testing.expectEqualStrings(t, msg.data);
+        try std.testing.expectEqualStrings(t, try u.receive(&buf));
     }
-    // Found by name: the listener's first socket, the one the datagrams
-    // came on unless Linux has a socket per executor. It sends too.
-    const found = try engine.net.udpFind(rig.e, "game");
-    if (builtin.os.tag != .linux) try std.testing.expectEqual(handle, found);
-    _ = try engine.net.udpSend(rig.e, found, replies[0..1], 0);
-    {
-        var buf: [16]u8 = undefined;
-        // No timeout: std.Io.Threaded has none for a receive on Windows
-        // (ConcurrencyUnavailable); the test runner's watchdog bounds a hang.
-        const msg = try c.receive(io, &buf);
-        try std.testing.expectEqualStrings("r0", msg.data);
-    }
-    // Invalid sizes.
-    try std.testing.expectError(error.Invalid, engine.net.udpFind(rig.e, "nope"));
-    var big: [1]abi.NetDatagram = .{.{ .to = from, .from = .{}, .data = texts[0].ptr, .len = 70000 }};
-    try std.testing.expectError(error.Invalid, engine.net.udpSend(rig.e, handle, &big, 0));
-    try std.testing.expectError(error.Invalid, engine.net.udpSend(rig.e, handle, &replies, 1));
+}
+
+test "capi net: udp_find finds a UDP listener's socket by name, and it sends" {
+    if (comptime !features.net) return error.SkipZigTest;
+    var u: Udp = try .init();
+    defer u.deinit();
+    try u.ready();
+    // The listener's first socket, the one the datagrams came on unless
+    // Linux has a socket per executor.
+    const found = try engine.net.udpFind(u.rig.e, "game");
+    if (builtin.os.tag != .linux) try std.testing.expectEqual(u.handle, found);
+    var r = replies(u.from);
+    _ = try engine.net.udpSend(u.rig.e, found, r[0..1], 0);
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("r0", try u.receive(&buf));
+}
+
+test "capi net: udp_find and udp_send refuse an unknown name, an oversized datagram and unknown flags" {
+    if (comptime !features.net) return error.SkipZigTest;
+    var u: Udp = try .init();
+    defer u.deinit();
+    try u.ready();
+    try std.testing.expectError(error.Invalid, engine.net.udpFind(u.rig.e, "nope"));
+    var big: [1]abi.NetDatagram = .{.{ .to = u.from, .from = .{}, .data = reply_texts[0].ptr, .len = 70000 }};
+    try std.testing.expectError(error.Invalid, engine.net.udpSend(u.rig.e, u.handle, &big, 0));
+    var r = replies(u.from);
+    try std.testing.expectError(error.Invalid, engine.net.udpSend(u.rig.e, u.handle, &r, 1));
 }
 
 test "capi net: drain closes a connection the consumer leaves open" {
