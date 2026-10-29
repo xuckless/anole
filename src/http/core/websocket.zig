@@ -501,10 +501,8 @@ pub const WebSocket = struct {
         const w = self.transport.writer;
         if (w.buffer.len != 0 and w.end + len + 14 > w.buffer.len) return .now;
         if (self.batch.holds(self.io)) return .batch;
-        // A task in the middle of a batch of its own sending here: the frame
-        // waits in this socket's buffer for this socket's backstop, so
-        // several messages from that batch leave in one write.
-        if (Batch.sendingFromBatch(self.io)) return .batch;
+        // Any other task, a reader in the middle of a batch of its own
+        // included (a relay): now (#85, see `Batch`).
         return .now;
     }
 
@@ -941,7 +939,16 @@ pub const WebSocket = struct {
 ///   - when another task sends or flushes, or the write buffer fills, or
 ///   - when the reading task waits for anything else (a database, a timer,
 ///     another lock): the backstop flushes then.
-/// Sends from any other task (a broadcast, say) never wait for a batch.
+/// Sends from any other task (a broadcast, say) never wait for a batch,
+/// and neither do the reading task's sends to other sockets (a relay,
+/// a fan-out from its handler): a batch holds only the reading socket's
+/// own frames. Holding a relay on the receiver's batch (0.2.1) coalesced
+/// a burst's relays per receiver, but it left them waiting for the
+/// receiver's next flush, which under load is a whole run-queue cycle or
+/// more away (the receiver's own reader, the next large send to it, or
+/// its backstop and then a flusher task), and it took away the write
+/// that ended the relaying reader's turn (#85). Rooms and the C ABI
+/// coalesce their own way (`sendNoFlush`, then one `flush`).
 ///
 /// The backstop is one task per executor (`Backstop`), shared by every
 /// socket on it, rather than one per socket: each batch, as it starts
@@ -960,11 +967,6 @@ pub const WebSocket = struct {
 /// Shared with layers that frame WebSocket messages themselves (over
 /// HTTP/2 and HTTP/3): the owner gives it a flush function and calls
 /// `flushing` under its write lock as every flush starts.
-/// The task (`placement.taskId`) on this thread that is inside a batch of
-/// some socket right now: it read a message with another already buffered
-/// behind it. Frames it sends to other sockets wait for their backstops
-/// (`WebSocket.sendFlush`). 0 when none.
-threadlocal var batching_task: usize = 0;
 
 pub const Batch = struct {
     /// The reading task (`placement.taskId`) while the batch lasts; 0
@@ -998,28 +1000,12 @@ pub const Batch = struct {
     /// The reading task, as it hands a message on: `more` when another
     /// whole message (or a close) is already buffered behind it.
     pub fn round(self: *Batch, io: std.Io, more: bool) void {
-        if (more) {
-            const id = placement.taskId(io);
-            self.owner.store(id, .monotonic);
-            batching_task = id;
-        } else {
-            self.owner.store(0, .monotonic);
-            if (batching_task != 0 and batching_task == placement.taskId(io)) batching_task = 0;
-        }
-    }
-
-    /// Whether the calling task is inside a batch of some socket's (it read
-    /// a message with another buffered behind it), so a frame it sends to
-    /// another socket may wait for that socket's backstop.
-    pub fn sendingFromBatch(io: std.Io) bool {
-        return batching_task != 0 and batching_task == placement.taskId(io);
+        self.owner.store(if (more) placement.taskId(io) else 0, .monotonic);
     }
 
     /// No batch: a read failed, or the reader is done.
     pub fn endRound(self: *Batch) void {
-        const owner = self.owner.load(.monotonic);
         self.owner.store(0, .monotonic);
-        if (owner != 0 and batching_task == owner) batching_task = 0;
     }
 
     /// Whether a frame the calling task sends belongs to the batch.
@@ -1115,8 +1101,6 @@ pub const Batch = struct {
     /// Takes the batch off its executor's backstop and stops its flusher.
     /// Before the owner goes away.
     pub fn deinit(self: *Batch, io: std.Io) void {
-        const owner = self.owner.load(.monotonic);
-        if (owner != 0 and batching_task == owner) batching_task = 0;
         if (self.home) |home| home.leave(self, io);
         self.flusher.cancel(io);
     }
@@ -1955,7 +1939,9 @@ test "WebSocket: a send from another task is not held by the reader's batch" {
     try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'A', 0x81, 1, 'X' }, probe.out.items);
 }
 
-test "WebSocket: a send outside any batch leaves at once; from a task mid-batch it waits on the receiver's batch" {
+test "WebSocket: a send to another socket leaves at once, also from a reader in the middle of its batch" {
+    // #85: a relay from inside the reader's batch reaches the receiver now,
+    // not with the receiver's next flush or its backstop.
     const gpa = std.testing.allocator;
     // The reading socket A: two messages buffered, so reading the first
     // starts a batch for this task.
@@ -1982,24 +1968,26 @@ test "WebSocket: a send outside any batch leaves at once; from a task mid-batch 
     try b.send(.text, "2");
     try std.testing.expectEqual(@as(usize, 2), b_probe.writes);
 
-    // Mid-batch (another whole message is buffered behind this one).
+    // In A's batch (another whole message is buffered behind this one):
+    // each relay to B is written as it is sent, and B holds nothing.
     _ = try a.receive();
+    try std.testing.expect(a.batch.holds(std.testing.io));
     try b.send(.text, "x");
-    try b.send(.text, "y");
-    try b.send(.text, "z");
-    try std.testing.expectEqual(@as(usize, 2), b_probe.writes);
-    try b.flush();
     try std.testing.expectEqual(@as(usize, 3), b_probe.writes);
-    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, '1', 0x81, 1, '2', 0x81, 1, 'x', 0x81, 1, 'y', 0x81, 1, 'z' }, b_probe.out.items);
-
-    // The batch ends with the last whole message: sends leave at once again.
-    _ = try a.receive();
-    try b.send(.text, "w");
+    try b.send(.text, "y");
     try std.testing.expectEqual(@as(usize, 4), b_probe.writes);
+    try std.testing.expect(!b.batch.deferred.load(.monotonic));
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, '1', 0x81, 1, '2', 0x81, 1, 'x', 0x81, 1, 'y' }, b_probe.out.items);
+    // A's own answer still waits for A's batch.
+    try a.send(.text, "A");
+    try std.testing.expectEqual(@as(usize, 0), a_probe.writes);
+    try std.testing.expect(a.batch.deferred.load(.monotonic));
 }
 
-test "WebSocket: from a task mid-batch, a big frame, or one the buffer has no room for, leaves at once" {
+test "WebSocket: in the reader's batch, a big answer, or one the buffer has no room for, leaves at once" {
     const gpa = std.testing.allocator;
+    // Room for the frames below, with less than a 250-byte frame left
+    // behind the first.
     var a_buf: [256]u8 = undefined;
     var a_probe = SocketProbe.init(gpa, &a_buf);
     defer a_probe.out.deinit(gpa);
@@ -2009,33 +1997,25 @@ test "WebSocket: from a task mid-batch, a big frame, or one the buffer has no ro
     defer a.deinit();
     a.batch.backstop_on = false;
 
-    var b_buf: [256]u8 = undefined;
-    var b_probe = SocketProbe.init(gpa, &b_buf);
-    defer b_probe.out.deinit(gpa);
-    var b_reader: std.Io.Reader = .fixed("");
-    var b = WebSocket.init(std.testing.io, .{ .writer = &b_probe.interface, .reader = &b_reader }, gpa, 0);
-    defer b.deinit();
-    b.batch.backstop_on = false;
-
-    // Mid-batch: a small frame waits for the batch.
+    // In the batch: a small answer waits for it.
     _ = try a.receive();
-    try b.send(.text, "x");
-    try std.testing.expectEqual(@as(usize, 0), b_probe.writes);
+    try a.send(.text, "x");
+    try std.testing.expectEqual(@as(usize, 0), a_probe.writes);
     // One that would not fit behind it goes now, the held one ahead of it.
     const mid: [250]u8 = @splat('m');
-    try b.send(.binary, &mid);
-    try std.testing.expect(b_probe.writes > 0);
-    try std.testing.expectEqual(@as(usize, 3 + 4 + mid.len), b_probe.out.items.len);
-    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'x' }, b_probe.out.items[0..3]);
+    try a.send(.binary, &mid);
+    try std.testing.expect(a_probe.writes > 0);
+    try std.testing.expectEqual(@as(usize, 3 + 4 + mid.len), a_probe.out.items.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'x' }, a_probe.out.items[0..3]);
     // A big one goes now whatever the buffer holds, and the socket keeps
     // nothing of it.
-    const writes = b_probe.writes;
+    const writes = a_probe.writes;
     const big: [5000]u8 = @splat('k');
-    try b.send(.binary, &big);
-    try std.testing.expect(b_probe.writes > writes);
-    try std.testing.expectEqual(@as(usize, 0), b_probe.interface.end);
-    try std.testing.expectEqual(@as(usize, 3 + 4 + mid.len + 4 + big.len), b_probe.out.items.len);
-    try std.testing.expect(!b.batch.deferred.load(.monotonic));
+    try a.send(.binary, &big);
+    try std.testing.expect(a_probe.writes > writes);
+    try std.testing.expectEqual(@as(usize, 0), a_probe.interface.end);
+    try std.testing.expectEqual(@as(usize, 3 + 4 + mid.len + 4 + big.len), a_probe.out.items.len);
+    try std.testing.expect(!a.batch.deferred.load(.monotonic));
 }
 
 test "WebSocket: sendNoFlush leaves frames for one flush, in order" {

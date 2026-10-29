@@ -228,9 +228,8 @@ pub const H2Socket = struct {
 
     fn sendFlush(self: *H2Socket) Flush {
         if (self.batch.holds(self.io)) return .batch;
-        // A task in the middle of a batch of its own sending here: the frame
-        // waits for this socket's backstop (see the core's `WebSocket`).
-        if (dusty.WebSocketBatch.sendingFromBatch(self.io)) return .batch;
+        // Any other task, a reader in the middle of a batch of its own
+        // included: now (see the core's `Batch`).
         return .now;
     }
 
