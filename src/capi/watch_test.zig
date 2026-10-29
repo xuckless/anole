@@ -208,6 +208,20 @@ test "capi engine: unlisten ends a watch listener with one END UNLISTENED; the h
     try std.testing.expectEqual(@as(u32, @backingInt(abi.EventType.watch_end)), en.ev.type);
     try std.testing.expectEqual(abi.WATCH_END_UNLISTENED, en.reason);
     try std.testing.expectEqual(h, en.ev.handle);
+    const NoSecondEnd = struct {
+        rx: *Rx,
+        h: @TypeOf(h),
+        fn none(s: *@This()) anyerror!bool {
+            try s.rx.pump(0);
+            for (s.rx.recs.items[s.rx.next_at..]) |later| {
+                const ev: *const abi.Event = @ptrCast(@alignCast(later.ptr));
+                if (ev.type == @backingInt(abi.EventType.watch_end) and ev.handle == s.h) return false;
+            }
+            return true;
+        }
+    };
+    var no_second: NoSecondEnd = .{ .rx = &r.rx, .h = h };
+    try wait.expectStays(std.testing.io, "no second watch END for the handle", &no_second, NoSecondEnd.none, wait.short_window);
     try std.testing.expectError(error.Over, engine.watch.unlisten(r.e, h));
 }
 
