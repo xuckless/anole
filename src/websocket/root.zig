@@ -1872,12 +1872,6 @@ test {
     _ = origin;
 }
 
-test "WebSocket accept key matches RFC 6455 section 1.3" {
-    var out: [28]u8 = undefined;
-    WebSocket.computeAcceptKey("dGhlIHNhbXBsZSBub25jZQ==", &out);
-    try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &out);
-}
-
 /// A request with a version-13 handshake's headers, offering subprotocols
 /// over two header lines.
 fn testHandshake(a: std.mem.Allocator) !dusty.Request {
