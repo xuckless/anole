@@ -723,7 +723,14 @@ test "WebSocket loop: after the peer goes quiet the reader's window is narrow ag
     var c: Client = undefined;
     try c.open(f.io, f.server.address.ip, false, "/watched-loop");
     defer c.close(f.io);
-    try burst(&c, 200, null);
+    // A 64 KiB message among the small ones: its header announces more than
+    // the narrow window holds, so the window widens whatever its size (to
+    // the end of a page: 16 KiB on arm64 macOS, more than the small
+    // messages ever fill).
+    const big = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(big);
+    @memset(big, 'b');
+    try burst(&c, 200, big);
     try std.testing.expect(widest_window.load(.acquire) > first_window.load(.acquire));
     // One small message at a time, each answered before the next: twice as
     // many waits for the peer as a busy socket keeps its room for (8).
