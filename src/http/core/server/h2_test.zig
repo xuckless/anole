@@ -1103,9 +1103,13 @@ var unread_socket: std.atomic.Value(std.Io.net.Socket.Handle) = .init(-1);
 /// `holdUnreadAtDrain` let the reader go with a cancel.
 var unread_canceled: std.atomic.Value(bool) = .init(false);
 
+/// FIONREAD: std 0.17's `std.c.T` has none for Darwin, where it is
+/// `_IOR('f', 127, int)` (sys/filio.h).
+const fionread = if (@import("builtin").os.tag.isDarwin()) 0x4004667f else std.c.T.FIONREAD;
+
 fn hasUnreadInput(fd: std.Io.net.Socket.Handle) bool {
     var n: c_int = 0;
-    if (std.c.ioctl(fd, std.c.T.FIONREAD, &n) != 0) return false;
+    if (std.c.ioctl(fd, fionread, &n) != 0) return false;
     return n > 0;
 }
 
