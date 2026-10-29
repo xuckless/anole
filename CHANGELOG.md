@@ -221,6 +221,12 @@ breaking changes are listed anyway.
   answer with the last result instead of waiting for it.
 - SMTP: closing idle connections allocates nothing and never sends QUIT
   under the pool lock.
+- SQLite: a `begin(req)` canceled (or timed out) while its BEGIN ran, and
+  a `tx.rollback(req)` on a canceled request or past its deadline, gave
+  the connection back with the transaction open, so the next call on the
+  writer failed with "cannot start a transaction within a transaction" or
+  had its own work rolled back. Both roll back first now, as `tx.deinit()`
+  does; `rollback` fails only on a transaction that is over.
 
 ### Changed
 

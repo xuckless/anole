@@ -562,7 +562,9 @@ On both SQL connectors a `Tx` also has `table(req, sql, values)` and
 `with(options)`, whose calls take `timeout` and `prepare`; `coalesce` and
 `cache` fail the call inside a transaction. A `Tx` used after `commit` or
 `rollback` fails with `error.Database` ("the transaction is over"), never
-an assert. A transaction left open by `iterate`, or by a connection from
+an assert. `rollback` is not cut short by the request's cancel or
+deadline (neither is `deinit`): the connection always goes back with no
+transaction open. A transaction left open by `iterate`, or by a connection from
 `acquire` given back (the writer, for SQLite), is rolled back and logged,
 as a plain call that leaves one is.
 

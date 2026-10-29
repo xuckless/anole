@@ -356,7 +356,9 @@ pub const Client = struct {
             break :blk &self.writer.conn;
         };
         var tx: Tx = .{ .db = self, .io = cx.io, .conn = conn, .on_writer = !reader, .lease = lease };
-        errdefer tx.release();
+        // A rollback first: a BEGIN that ran while its caller was canceled
+        // (or timed out) returns that error, with the transaction open.
+        errdefer tx.deinit();
         _ = try tx.runOp(cx, .exec, void, if (reader) "BEGIN" else "BEGIN IMMEDIATE", .{}, .{ .prepare = false });
         return tx;
     }
@@ -783,16 +785,18 @@ pub const Tx = struct {
         tx.release();
     }
 
-    /// Rolls back and gives the connection back, failed or not. `deinit`
-    /// does it too when neither this nor `commit` ran.
+    /// Rolls back and gives the connection back, as `deinit` does (which
+    /// does it too when neither this nor `commit` ran): not canceled by the
+    /// request's cancel nor cut by its deadline, so the connection goes back
+    /// with no transaction open. Fails only when the transaction is over.
     pub fn rollback(tx: *Tx, cx: anytype) Error!void {
         try tx.usable(cx);
-        defer tx.release();
-        _ = try tx.runOp(cx, .exec, void, "ROLLBACK", .{}, .{ .prepare = false });
+        tx.deinit();
     }
 
     /// Rolls back unless committed, and gives the connection back. Not
-    /// canceled by the request's cancel.
+    /// canceled by the request's cancel: the next holder of the writer (or
+    /// of the reader) must not find the transaction open.
     pub fn deinit(tx: *Tx) void {
         if (tx.finished) return;
         const was = tx.io.swapCancelProtection(.blocked);
