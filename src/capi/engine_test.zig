@@ -1421,21 +1421,18 @@ pub const Destroyer = struct {
         return d.done.load(.acquire);
     }
 
-    /// Destroys `e`, which has a task parked for ring room on consumer `c`
-    /// (nobody polls), and waits for it on `io` under the hang guard. If the
-    /// guard runs out, one poll makes the room that task waits for, so it,
-    /// the destroy and the test end instead of hanging the run.
-    pub fn withTaskParked(io: std.Io, e: *engine.Engine, c: *engine.Consumer, comptime what: []const u8) !void {
+    /// Destroys `e`, which has a task parked for ring room (nobody polls),
+    /// and waits for it on `io` under the hang guard. The caller's
+    /// `timeouts.shutdown_ms` outlasts the guard, so a destroy that waits
+    /// for the parked task fails here; the destroy still ends once that
+    /// bound has passed (its drain cancels what is left), and the join
+    /// waits for it. Nothing polls meanwhile: the engine may be freed under
+    /// a poll.
+    pub fn withTaskParked(io: std.Io, e: *engine.Engine, comptime what: []const u8) !void {
         var d: Destroyer = .{ .e = e };
         const t = try std.Thread.spawn(.{}, run, .{&d});
         defer t.join();
-        wait.waitUntil(io, "destroy finished with " ++ what ++ " parked for ring room", &d, finished) catch |err| {
-            const buf = try alloc.alignedAlloc(u8, .@"8", 64 * 1024);
-            defer alloc.free(buf);
-            var need: u32 = 0;
-            _ = engine.poll(c, buf, false, &need) catch {};
-            return err;
-        };
+        try wait.waitUntil(io, "destroy finished with " ++ what ++ " parked for ring room", &d, finished);
     }
 };
 
@@ -1481,13 +1478,15 @@ fn roomWaited(x: *engine.Exec) bool {
 }
 
 test "capi engine: destroy ends an HTTP/1.1 request parked for ring room" {
-    // The route's deadline outlasts the hang guard: while nobody polls,
-    // only `destroy` can end the request's wait in time.
+    // The route's deadline and the drain's bound both outlast the hang
+    // guard: while nobody polls, only `destroy` ending the parked wait at
+    // once makes it in time (a drain that gives up and cancels the task
+    // would not).
     const json = try std.fmt.allocPrint(alloc,
-        \\{{"executors": 1, "limits": {{"queue": 2}}, "timeouts": {{"request_ms": {d}, "shutdown_ms": 200}},
+        \\{{"executors": 1, "limits": {{"queue": 2}}, "timeouts": {{"request_ms": {d}, "shutdown_ms": {d}}},
         \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
         \\ "routes": [{{"path": "/x", "handler": 1}}]}}
-    , .{3 * @as(u64, wait.deadlineMs())});
+    , .{ 3 * @as(u64, wait.deadlineMs()), 2 * @as(u64, wait.deadlineMs()) });
     defer alloc.free(json);
     var why_buf: [256]u8 = undefined;
     var why: std.Io.Writer = .fixed(&why_buf);
@@ -1497,7 +1496,7 @@ test "capi engine: destroy ends an HTTP/1.1 request parked for ring room" {
     };
     var destroying = false;
     defer if (!destroying) e.destroy();
-    const c = try e.attach(null, null, false);
+    _ = try e.attach(null, null, false);
     try e.start();
     const io = engine.threadedIo();
     var conns: [3]?std.Io.net.Stream = @splat(null);
@@ -1514,7 +1513,18 @@ test "capi engine: destroy ends an HTTP/1.1 request parked for ring room" {
     }
     try wait.waitUntil(io, "a request's task waits for ring room", &e.execs[0], roomWaited);
     destroying = true;
-    try Destroyer.withTaskParked(io, e, c, "an HTTP/1.1 request");
+    try Destroyer.withTaskParked(io, e, "an HTTP/1.1 request");
+    // The parked request (whichever of the three) was answered, not
+    // dropped; the two handed over end the same way.
+    for (&conns) |*slot| {
+        const s = slot.*.?;
+        var rbuf: [512]u8 = undefined;
+        var r = s.reader(io, &rbuf);
+        const got = try r.interface.allocRemaining(alloc, .limited(4096));
+        defer alloc.free(got);
+        try std.testing.expectStringStartsWith(got, "HTTP/1.1 503 ");
+        try std.testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nthe server is stopping"));
+    }
 }
 
 fn postAdvisory(x: *engine.Exec) std.Io.Cancelable!void {

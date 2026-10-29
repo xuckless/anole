@@ -551,17 +551,27 @@ test "capi grpc over HTTP/3: detached unary, server stream, bidi, status and tra
     try std.testing.expectEqual(@as(u64, 0), e.stats().inflight);
 }
 
-/// All three calls started, and the ring is full: at least one of them is
-/// in its loop that waits for room to be handed over (`start` counts a
-/// call before it, with no suspension point between), the others' handles
-/// or request messages fill the ring.
+/// All three calls started: with a ring of 2 and nobody polling, one of
+/// them waits for room to be handed over (`start` counts a call before its
+/// first push, with no suspension point between).
 fn callParked(e: *engine.Engine) bool {
-    return e.stats().requests == 3 and e.execs[0].ring.full();
+    return e.stats().requests == 3;
+}
+
+/// The call ended with UNAVAILABLE "the server is stopping" (its status
+/// from the server, not a reset or a closed connection).
+fn expectStopping(s: anytype) !void {
+    try std.testing.expect(try s.receive() == null);
+    try std.testing.expectEqual(grpc.Code.unavailable, s.status.?.code);
+    try std.testing.expectEqualStrings("the server is stopping", s.status.?.message);
 }
 
 /// Three client-streaming calls (they do not detach) into a ring of 2
 /// while nobody polls, so one waits to be handed over. Then `destroy`.
-fn destroyWithCallParked(e: *engine.Engine, c: *engine.Consumer, io: std.Io, destroying: *bool) !void {
+/// Each call's sending side is closed first: a stream whose request the
+/// client keeps open outlives its answer, and holds the server's drain
+/// until `shutdown_ms` whatever the ring does.
+fn destroyWithCallParked(e: *engine.Engine, io: std.Io, destroying: *bool) !void {
     var arena_state: std.heap.ArenaAllocator = .init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -572,45 +582,63 @@ fn destroyWithCallParked(e: *engine.Engine, c: *engine.Consumer, io: std.Io, des
     var s0 = try client.stream("ClientStream", arena, .{});
     defer s0.deinit();
     try s0.send(.{ .message = "a" });
+    try s0.closeSend();
     var s1 = try client.stream("ClientStream", arena, .{});
     defer s1.deinit();
     try s1.send(.{ .message = "b" });
+    try s1.closeSend();
     var s2 = try client.stream("ClientStream", arena, .{});
     defer s2.deinit();
     try s2.send(.{ .message = "c" });
+    try s2.closeSend();
     try wait.waitUntil(io, "a call waits for ring room", e, callParked);
     destroying.* = true;
-    try EngineTest.Destroyer.withTaskParked(io, e, c, "a client-streaming call");
+    try EngineTest.Destroyer.withTaskParked(io, e, "a client-streaming call");
+    // The parked call (whichever of the three) is answered; the ones
+    // handed over end the same way.
+    try expectStopping(&s0);
+    try expectStopping(&s1);
+    try expectStopping(&s2);
 }
 
-test "capi grpc: destroy ends a client-streaming call parked for ring room" {
-    if (comptime !features.http2) return error.SkipZigTest;
+/// The test's engine: anole.test.Echo on one executor with a ring of 2,
+/// and `timeouts` as given (JSON members).
+fn ringEngine(comptime timeouts: []const u8, args: anytype) !*engine.Engine {
     const set = @import("anole_test_descriptors").set;
     const b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(set.len));
     defer alloc.free(b64);
     _ = std.base64.standard.Encoder.encode(b64, set);
-    // No deadline on the calls: while nobody polls, only `destroy` can end
-    // the parked call's wait.
     const json = try std.fmt.allocPrint(alloc,
-        \\{{"executors": 1, "limits": {{"queue": 2}}, "timeouts": {{"shutdown_ms": 200}},
+        \\{{"executors": 1, "limits": {{"queue": 2}}, "timeouts": {{
+    ++ timeouts ++
+        \\}},
         \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
         \\ "grpc": {{"descriptor_set": "{s}", "services": [{{"name": "anole.test.Echo", "handler": 10}}]}}}}
-    , .{b64});
+    , args ++ .{b64});
     defer alloc.free(json);
     var why_buf: [400]u8 = undefined;
     var why: std.Io.Writer = .fixed(&why_buf);
-    const e = engine.Engine.create(json, false, &why) catch |err| {
+    return engine.Engine.create(json, false, &why) catch |err| {
         std.debug.print("{s}\n", .{why.buffered()});
         return err;
     };
+}
+
+test "capi grpc: destroy ends a client-streaming call parked for ring room" {
+    if (comptime !features.http2) return error.SkipZigTest;
+    // No deadline on the calls, and the drain's bound outlasts the hang
+    // guard: while nobody polls, only `destroy` ending the parked wait at
+    // once makes it in time (a drain that gives up and cancels the task
+    // would not).
+    const e = try ringEngine("\"shutdown_ms\": {d}", .{2 * @as(u64, wait.deadlineMs())});
     var destroying = false;
     defer if (!destroying) e.destroy();
-    const c = try e.attach(null, null, false);
+    _ = try e.attach(null, null, false);
     try e.start();
     const rt = try zio.Runtime.init(alloc, .{});
     defer rt.deinit();
     const io = rt.io();
-    var f = try io.concurrent(destroyWithCallParked, .{ e, c, io, &destroying });
+    var f = try io.concurrent(destroyWithCallParked, .{ e, io, &destroying });
     try f.await(io);
 }
 
