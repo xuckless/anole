@@ -24,7 +24,6 @@ src/capi/grpc.zig	U3	8
 src/capi/jobs.zig	L2	1
 src/capi/jobs.zig	U3	12
 src/capi/kafka.zig	C3	1
-src/capi/kafka.zig	L2	1
 src/capi/kafka.zig	U3	9
 src/capi/lib.zig	U3	22
 src/capi/nats.zig	C3	1
@@ -142,12 +141,9 @@ src/jobs/store_pg.zig	L2	1
 src/jobs/store_pg.zig	U3	20
 src/jobs/store_redis.zig	U3	21
 src/jobs/store_sqlite.zig	U3	19
-src/kafka/cluster.zig	L2	3
+src/kafka/cluster.zig	L2	1
 src/kafka/cluster.zig	U3	1
-src/kafka/consumer.zig	L2	4
-src/kafka/producer.zig	L2	3
 src/kafka/protocol.zig	U3	1
-src/kafka/root.zig	L2	1
 src/kafka/root.zig	U3	4
 src/lambda/exchange.zig	U3	11
 src/logging/escape.zig	U3	4
