@@ -318,8 +318,13 @@ test "Watch: a deadline republished before its generation does not expire the co
     if (!std.Io.Clock.awake.now(io).compare(.lt, first_end)) {
         // Too slow to publish before the first deadline: the race this test
         // builds never happened. In the timing step that is a failure.
+        // The watcher may rightly have expired on the first deadline; that
+        // Timeout is not the failure here (Canceled still propagates).
         watch.finish(io);
-        try watcher.await(io);
+        watcher.await(io) catch |err| switch (err) {
+            error.Timeout => {},
+            else => |e| return e,
+        };
         return error.TooSlowToBuildTheRace;
     }
 
