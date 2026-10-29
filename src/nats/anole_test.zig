@@ -42,9 +42,12 @@ const Script = struct {
     /// After the handshake read nothing (until canceled): the client's
     /// writes back up in the sockets.
     stall: bool = false,
+    /// Set when serveScript returns, however it ends.
+    done: std.atomic.Value(bool) = .init(false),
 };
 
 fn serveScript(io: Io, listener: *net.Server, script: *Script) anyerror!void {
+    defer script.done.store(true, .release);
     var peer: FakeServer.Peer = undefined;
     try peer.accept(io, listener);
     defer peer.close();
@@ -53,7 +56,7 @@ fn serveScript(io: Io, listener: *net.Server, script: *Script) anyerror!void {
     var subscribed = false;
     if (script.stall) {
         var never: Io.Event = .unset;
-        never.wait(io) catch {};
+        try never.wait(io);
         return;
     }
     if (script.expect_pubs == 0 and script.deliveries.len == 0) return;
@@ -167,8 +170,11 @@ fn serialHandler(m: *nats.Msg) !void {
 }
 
 fn waitServer(r: *Rig) !void {
-    // The fake returns after the publishes it was told to expect.
-    try r.server.await(r.rt.io());
+    // The fake returns after the publishes it was told to expect; a client
+    // that never publishes them fails the wait instead of hanging.
+    const io = r.rt.io();
+    try @import("anole_test_wait").waitFlag(io, "the fake server to see the expected publishes", &r.script.done);
+    try r.server.await(io);
 }
 
 test "handle: a message reaches the handler as a Msg and respond publishes to its reply subject" {

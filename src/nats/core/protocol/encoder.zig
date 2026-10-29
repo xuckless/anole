@@ -235,7 +235,7 @@ test "client frames match what nats-server 2.15.1 accepted" {
     try testing.expectEqualStrings("PONG\r\n", pong);
 }
 
-test "lengths across digit boundaries" {
+test "pubLen, hpubLen, subLen and unsubLen equal the written length across digit boundaries" {
     var payload: [1001]u8 = undefined;
     @memset(&payload, 'x');
     const headers = [_]Header{.{ .name = "A", .value = "b" }}; // a 18-byte block

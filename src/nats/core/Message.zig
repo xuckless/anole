@@ -136,7 +136,7 @@ test "a message from HMSG keeps every header, in order" {
     try testing.expectEqualStrings("", header_only.payload);
 }
 
-test "the status of a no-responders message" {
+test "a no-responders HMSG gives status 503 with an empty body, and a described status keeps its text" {
     var msg = try assemble(testing.allocator, golden.hmsg_no_responders, golden.hmsg_no_responders.len);
     defer msg.deinit();
     try testing.expectEqual(503, msg.status.?);

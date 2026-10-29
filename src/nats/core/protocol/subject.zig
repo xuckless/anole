@@ -57,7 +57,7 @@ fn isSubjectByte(c: u8) bool {
     return c > ' ' and c != 0x7f;
 }
 
-test "publish and reply-to subjects" {
+test "publish and reply-to subjects with wildcards, empty tokens, whitespace or control bytes are InvalidSubject" {
     for ([_][]const u8{ "foo", "foo.bar.baz", "a*b", "a>b.c", "$SYS.x", "_INBOX.abc.1", "foo-bar_baz", "ünïcödé.subject" }) |subject| {
         try validatePublish(subject);
     }
@@ -70,7 +70,7 @@ test "publish and reply-to subjects" {
     }
 }
 
-test "subscribe subjects" {
+test "subscribe subjects take * and a final >, and refuse empty tokens, > before the end and whitespace" {
     for ([_][]const u8{ "foo", "*", ">", "foo.*", "foo.>", "*.bar.>", "foo.*.baz", "a*b", "a>b" }) |subject| {
         try validateSubscribe(subject);
     }
@@ -79,7 +79,7 @@ test "subscribe subjects" {
     }
 }
 
-test "queue group names" {
+test "queue group names with whitespace, control bytes or DEL, or empty, are refused" {
     for ([_][]const u8{ "workers", "a.b", "q-1", "очередь" }) |queue| {
         try std.testing.expect(isValidQueue(queue));
     }
