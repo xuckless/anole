@@ -38,7 +38,22 @@ fn unary(call: *grpc.Call, req: pb.EchoRequest) anyerror!pb.EchoResponse {
     return .{ .message = req.message, .index = 0 };
 }
 
+/// The Sleeper's sleep: until the call is canceled (or 10 s pass).
+fn sleepUntilCanceled(io: std.Io) !void {
+    defer Sleeper.done.store(true, .release);
+    Sleeper.started.store(true, .release);
+    io.sleep(.fromSeconds(10), .awake) catch |err| {
+        Sleeper.canceled.store(true, .release);
+        return err;
+    };
+}
+
 fn serverStream(call: *grpc.Call, req: pb.EchoRequest, out: *std.Io.Queue(pb.EchoResponse)) anyerror!void {
+    // One message, then the sleep.
+    if (std.mem.eql(u8, req.message, "sleep")) {
+        try out.putOne(call.io, .{ .message = "first", .index = 0 });
+        return sleepUntilCanceled(call.io);
+    }
     if (std.mem.eql(u8, req.message, "headers")) {
         // Initial metadata before the first message goes out with it;
         // once the writer has started the response, it is refused.
@@ -80,6 +95,13 @@ fn clientStream(call: *grpc.Call, in: *std.Io.Queue(pb.EchoRequest)) anyerror!pb
         n += 1;
     }
     return .{ .message = joined.items, .index = n };
+}
+
+/// Never reads its requests: the client's sends stop at flow control.
+fn clientStreamUnread(call: *grpc.Call, in: *std.Io.Queue(pb.EchoRequest)) anyerror!pb.EchoResponse {
+    _ = in;
+    try sleepUntilCanceled(call.io);
+    return .{ .message = "", .index = 0 };
 }
 
 fn bidi(call: *grpc.Call, in: *std.Io.Queue(pb.EchoRequest), out: *std.Io.Queue(pb.EchoResponse)) anyerror!void {
@@ -983,6 +1005,168 @@ test "gRPC: the client's RST_STREAM cancels the handler" {
     // The connection serves on.
     const r = try client.unary("Unary", arena, .{ .message = "after" }, .{});
     try std.testing.expectEqual(grpc.Code.ok, r.status.code);
+}
+
+/// An h2c server whose calls sleep until canceled ("sleep" for Unary and
+/// ServerStream, any ClientStream call), and a channel to it.
+const SleepEnv = struct {
+    io: std.Io,
+    channel: *grpc.Channel,
+
+    fn run(comptime body: fn (*SleepEnv) anyerror!void) !void {
+        const gpa = std.testing.allocator;
+        const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+        defer rt.deinit();
+        const io = rt.io();
+        var server = dusty.Server(void).init(gpa, io, .{
+            .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        }, {});
+        defer server.deinit();
+        grpc.register(void, &server.router, Echo, .{
+            .Unary = unary,
+            .ServerStream = serverStream,
+            .ClientStream = clientStreamUnread,
+            .Bidi = bidi,
+        });
+        var server_future = try startServer(&server, io);
+        defer server_future.cancel(io) catch {};
+
+        const h2 = @import("anole_h2_client");
+        const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = server.address.ip.getPort() });
+        defer conn.close();
+        var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost" };
+        Sleeper.started.store(false, .release);
+        Sleeper.canceled.store(false, .release);
+        Sleeper.done.store(false, .release);
+        var env: SleepEnv = .{ .io = io, .channel = &channel };
+        try body(&env);
+    }
+
+    /// The call was reset: the server's handler ended canceled.
+    fn expectHandlerCanceled(env: *SleepEnv) !void {
+        try wait.waitFlag(env.io, "the canceled handler returned", &Sleeper.done);
+        try std.testing.expect(Sleeper.canceled.load(.acquire));
+    }
+};
+
+/// What a calling task shares with the test, which joins it before the
+/// test returns.
+const CallerState = struct {
+    io: std.Io,
+    channel: *grpc.Channel,
+    /// ServerStream: the first message came.
+    got_first: std.atomic.Value(bool) = .init(false),
+    /// ClientStream: the call's HTTP/2 stream, and whether a `send` is
+    /// under way.
+    stream: std.atomic.Value(?*@import("anole_h2_client").Stream) = .init(null),
+    in_send: std.atomic.Value(bool) = .init(false),
+
+    /// A `send` waits for room: its bytes are queued behind a full window.
+    fn blockedInSend(st: *CallerState) bool {
+        if (!st.in_send.load(.acquire)) return false;
+        const s = st.stream.load(.acquire) orelse return false;
+        const q = &s.out.type_erased;
+        q.mutex.lockUncancelable(st.io);
+        defer q.mutex.unlock(st.io);
+        return q.putters.first != null;
+    }
+};
+
+/// A failed wait still joins the calling task before the test returns.
+fn joinAfter(env: *SleepEnv, f: *std.Io.Future(anyerror!void), err: anyerror) anyerror {
+    f.cancel(env.io) catch {};
+    return err;
+}
+
+test "gRPC client: a caller canceled while it waits for the response head gets Canceled" {
+    try SleepEnv.run(struct {
+        fn caller(st: *CallerState) anyerror!void {
+            var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena_state.deinit();
+            const client: grpc.Client(Echo) = .{ .channel = st.channel };
+            var s = try client.stream("Unary", arena_state.allocator(), .{});
+            defer s.deinit();
+            try s.send(.{ .message = "sleep" });
+            try s.closeSend();
+            _ = try s.receive();
+        }
+        fn body(env: *SleepEnv) anyerror!void {
+            var st: CallerState = .{ .io = env.io, .channel = env.channel };
+            var f = try env.io.concurrent(caller, .{&st});
+            wait.waitFlag(env.io, "the sleeping handler started", &Sleeper.started) catch |err| return joinAfter(env, &f, err);
+            try std.testing.expectError(error.Canceled, f.cancel(env.io));
+            try env.expectHandlerCanceled();
+        }
+    }.body);
+}
+
+test "gRPC client: a caller canceled while it reads the next message gets Canceled" {
+    try SleepEnv.run(struct {
+        fn caller(st: *CallerState) anyerror!void {
+            var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena_state.deinit();
+            const client: grpc.Client(Echo) = .{ .channel = st.channel };
+            var s = try client.stream("ServerStream", arena_state.allocator(), .{});
+            defer s.deinit();
+            try s.send(.{ .message = "sleep" });
+            try s.closeSend();
+            _ = (try s.receive()) orelse return error.NoFirstMessage;
+            st.got_first.store(true, .release);
+            _ = try s.receive();
+        }
+        fn body(env: *SleepEnv) anyerror!void {
+            var st: CallerState = .{ .io = env.io, .channel = env.channel };
+            var f = try env.io.concurrent(caller, .{&st});
+            wait.waitFlag(env.io, "the caller received the first message", &st.got_first) catch |err| return joinAfter(env, &f, err);
+            try std.testing.expectError(error.Canceled, f.cancel(env.io));
+            try env.expectHandlerCanceled();
+        }
+    }.body);
+}
+
+test "gRPC client: a caller canceled while a send waits for flow control gets Canceled" {
+    try SleepEnv.run(struct {
+        const big: [16 * 1024]u8 = @splat('x');
+        fn caller(st: *CallerState) anyerror!void {
+            var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena_state.deinit();
+            const client: grpc.Client(Echo) = .{ .channel = st.channel };
+            var s = try client.stream("ClientStream", arena_state.allocator(), .{});
+            defer s.deinit();
+            st.stream.store(s.stream.h2, .release);
+            // The server never reads: one of these sends ends up waiting.
+            while (true) {
+                st.in_send.store(true, .release);
+                try s.send(.{ .message = &big });
+                st.in_send.store(false, .release);
+            }
+        }
+        fn body(env: *SleepEnv) anyerror!void {
+            var st: CallerState = .{ .io = env.io, .channel = env.channel };
+            var f = try env.io.concurrent(caller, .{&st});
+            wait.waitUntil(env.io, "a send waiting for flow control", &st, CallerState.blockedInSend) catch |err| return joinAfter(env, &f, err);
+            try std.testing.expectError(error.Canceled, f.cancel(env.io));
+            try env.expectHandlerCanceled();
+        }
+    }.body);
+}
+
+test "gRPC client: cancel() ends the call CANCELLED without a task cancel" {
+    try SleepEnv.run(struct {
+        fn body(env: *SleepEnv) anyerror!void {
+            var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena_state.deinit();
+            const client: grpc.Client(Echo) = .{ .channel = env.channel };
+            var s = try client.stream("Unary", arena_state.allocator(), .{});
+            defer s.deinit();
+            try s.send(.{ .message = "sleep" });
+            try s.closeSend();
+            try wait.waitFlag(env.io, "the sleeping handler started", &Sleeper.started);
+            s.cancel();
+            try std.testing.expect(try s.receive() == null);
+            try std.testing.expectEqual(grpc.Code.cancelled, s.status.?.code);
+        }
+    }.body);
 }
 
 test "gRPC: grpc-status survives concurrent unary calls on several executors" {
