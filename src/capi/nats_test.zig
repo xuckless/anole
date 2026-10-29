@@ -167,7 +167,7 @@ const Rig = struct {
             \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
             \\ "routes": [{s}],
             \\ "brokers": [{{"name": "events", "nats": {{"url": "{s}", "connect_at_start": true{s}}}}}]}}
-        , .{ if (with_route) "{\"path\": \"/hold\", \"handler\": 1, \"timeout_ms\": 2000}" else "", try r.fake.url(), extra_nats });
+        , .{ if (with_route) "{\"path\": \"/hold\", \"handler\": 1, \"timeout_ms\": 200}" else "", try r.fake.url(), extra_nats });
         errdefer alloc.free(r.json);
         var why_buf: [512]u8 = undefined;
         var why: Io.Writer = .fixed(&why_buf);
@@ -213,7 +213,7 @@ test "capi nats: publish is taken (OK) and reaches the server" {
     try waitAtLeast(&r.fake.pubs, 1);
 }
 
-test "capi nats: subscribe delivers NATS_MSG; unsubscribe ends it with SUB_END CLOSED" {
+test "capi nats: unsubscribe ends a subscription with one SUB_END CLOSED carrying its user_data" {
     if (comptime !features.nats) return error.SkipZigTest;
     var r: Rig = undefined;
     try r.start("", false);
@@ -227,8 +227,14 @@ test "capi nats: subscribe delivers NATS_MSG; unsubscribe ends it with SUB_END C
     const rec = r.ev.as(abi.BrokerEndEvent, end);
     try std.testing.expectEqual(abi.BROKER_END_CLOSED, rec.reason);
     try std.testing.expectEqual(@as(u64, 77), rec.user_data);
-    // Idempotent: a second unsubscribe says nothing.
+    // Idempotent: a second unsubscribe ends nothing again.
     engine.nats.unsubscribe(r.e, h);
+    try wait.expectStays(engine.threadedIo(), "one SUB_END after the second unsubscribe", &r.ev, struct {
+        fn one(ev: *Events) !bool {
+            try ev.pump(0);
+            return ev.count(.nats_sub_end) == 1;
+        }
+    }.one, wait.short_window);
 }
 
 test "capi nats: a delivered message is a NATS_MSG record naming the subscription" {
@@ -267,7 +273,7 @@ test "capi nats: a request tied to a req answers E_GONE when the req ends" {
     defer r.deinit();
     const tio = engine.threadedIo();
     // An HTTP/1.1 request the consumer holds, unanswered. It ends at its
-    // route's deadline (2 s, a 504): an HTTP/1.1 request waiting for the
+    // route's deadline (200 ms, a 504): an HTTP/1.1 request waiting for the
     // consumer does not watch its socket, so the end comes from the
     // deadline, not from the client closing.
     const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", r.e.port(0));
@@ -293,10 +299,19 @@ test "capi nats: a request for a req that is already over is refused with E_GONE
     var r: Rig = undefined;
     try r.start("", true);
     defer r.deinit();
-    // A forged request handle: never live.
-    const forged: u64 = (@as(u64, 0x7fffff) << 33) | 1;
-    const got = engine.nats.request(r.broker(), r.c, out("no.answer", "?"), .{ .size = @sizeOf(abi.NatsRequestOptions), .req = forged }, 1);
-    try std.testing.expect(std.meta.isError(got));
+    const tio = engine.threadedIo();
+    // A real request handle, answered: over from then on.
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", r.e.port(0));
+    var conn = try addr.connect(tio, .{ .mode = .stream });
+    defer conn.close(tio);
+    var wbuf: [256]u8 = undefined;
+    var w = conn.writer(tio, &wbuf);
+    try w.interface.writeAll("GET /hold HTTP/1.1\r\nHost: x\r\n\r\n");
+    try w.interface.flush();
+    const req_i = try r.ev.waitFor(.request, 0, 5000);
+    const req_handle = r.ev.list.items[req_i].handle;
+    try engine.respond(r.e, req_handle, 200, &.{}, "ok", false);
+    try std.testing.expectError(error.Gone, engine.nats.request(r.broker(), r.c, out("no.answer", "?"), .{ .size = @sizeOf(abi.NatsRequestOptions), .req = req_handle }, 1));
 }
 
 test "capi nats: past the outbound limit a publish is E_AGAIN; when the server reads again, WRITABLE comes once per answer that asked for it" {

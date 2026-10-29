@@ -52,7 +52,12 @@ fn get(io: std.Io, port: u16, path: []const u8, request_id: []const u8) !void {
     var r = stream.reader(io, &rbuf);
     var out: [512]u8 = undefined;
     var ow: std.Io.Writer = .fixed(&out);
-    _ = r.interface.streamRemaining(&ow) catch {};
+    // A read or write error after the head is fine (the server closes after
+    // the response); a cancel is not swallowed.
+    _ = r.interface.streamRemaining(&ow) catch |err| switch (err) {
+        error.ReadFailed => if (r.err) |re| if (re == error.Canceled) return error.Canceled,
+        error.WriteFailed => {},
+    };
     if (!std.mem.startsWith(u8, ow.buffered(), "HTTP/1.1 200")) return error.NotOk;
 }
 
@@ -66,6 +71,10 @@ fn check(a: *Logger, port: u16, io: std.Io) !void {
 
 test "capi engine: anole_console_log tags a record with its request's id and route, and a stale handle with nothing" {
     if (comptime !features.console) return error.SkipZigTest;
+    // Windows: the console's control socket is a Unix socket, and the
+    // console on Windows is deferred (AGENTS.md "the console on Windows
+    // comes after 0.3.0"; TODO.md "Windows dev target: ... console on
+    // Windows"). Remove this skip with that item.
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

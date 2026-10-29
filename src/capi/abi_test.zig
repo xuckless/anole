@@ -227,7 +227,7 @@ fn upperOf(comptime s: []const u8) []const u8 {
     }
 }
 
-test "abi.zig: the allocation table holds" {
+test "abi.zig: every event type has one entry named after it inside its area's range, handle kinds are unique, ascending and fit five bits, error tokens are sorted" {
     @setEvalBranchQuota(1_000_000);
     // Every EventType has exactly one entry, named after it.
     const info = @typeInfo(abi.EventType).@"enum";
@@ -259,8 +259,10 @@ test "abi.zig: the allocation table holds" {
         }
     }
     // Handle kinds named, ascending, no duplicates (7 is reserved), and
-    // within the handle's five kind bits.
-    try std.testing.expectEqual(@as(usize, 17), abi.handle_kinds.len);
+    // within the handle's five kind bits. That every engine.Handle.Kind but
+    // the reserved db_query has an entry is checked beside the enum
+    // (engine.zig, "capi engine: every handle kind but the reserved db_query
+    // has an entry in abi.handle_kinds ...").
     for (abi.handle_kinds, 0..) |k, i| {
         try std.testing.expect(k.kind != 7);
         try std.testing.expect(k.kind > 0 and k.kind < 32);

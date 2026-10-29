@@ -38,9 +38,12 @@ const Rx = struct {
         }
     }
 
-    /// The next watch record that is not a plain connection status, waiting.
+    /// The next watch record that is not a plain connection status,
+    /// waiting up to `wait.deadline()`.
     fn next(rx: *Rx) ![]align(8) u8 {
-        for (0..400) |_| {
+        const tio = engine.threadedIo();
+        const started = std.Io.Clock.awake.now(tio);
+        while (started.untilNow(tio, .awake).nanoseconds < wait.deadline().nanoseconds) {
             while (rx.next_at < rx.recs.items.len) {
                 const r = rx.recs.items[rx.next_at];
                 rx.next_at += 1;
@@ -53,6 +56,7 @@ const Rx = struct {
             }
             try rx.pump(25);
         }
+        std.debug.print("timed out waiting for a watch record\n", .{});
         return error.TimedOut;
     }
 };
@@ -77,61 +81,88 @@ fn listenOpts(max_events: u32, format: u32) abi.WatchListenOptions {
     return .{ .size = @sizeOf(abi.WatchListenOptions), .max_events = max_events, .format = format };
 }
 
-test "capi engine: a watch listener over a fake source: records parse, overflow is one GAP with the count, unlisten and drain end it" {
-    if (comptime !features.redis) return error.SkipZigTest;
-    var why_buf: [256]u8 = undefined;
-    var why: std.Io.Writer = .fixed(&why_buf);
-    const e = engine.Engine.create(json_both, false, &why) catch |err| {
-        std.debug.print("{s}\n", .{why.buffered()});
-        return err;
-    };
-    defer e.destroy();
-    const c = try e.attach(null, null, true);
-    try e.start();
-    var rx: Rx = .{ .c = c };
-    defer rx.deinit();
+/// An engine with the "orders" (Redis channel) and "feed" (Redis stream)
+/// watches over fake sources, and a consumer this thread polls.
+const WatchRig = struct {
+    e: *engine.Engine,
+    rx: Rx,
+    orders: *engine.watch.Entry,
+    feed: *engine.watch.Entry,
+    drained: bool = false,
 
-    const orders = engine.watch.find(e, "orders").?;
-    const feed = engine.watch.find(e, "feed").?;
-    orders.w._fake();
-    feed.w._fake();
-    try std.testing.expect(engine.watch.find(e, "nope") == null);
+    fn init(r: *WatchRig) !void {
+        var why_buf: [256]u8 = undefined;
+        var why: std.Io.Writer = .fixed(&why_buf);
+        const e = engine.Engine.create(json_both, false, &why) catch |err| {
+            std.debug.print("{s}\n", .{why.buffered()});
+            return err;
+        };
+        errdefer e.destroy();
+        const c = try e.attach(null, null, true);
+        try e.start();
+        r.* = .{ .e = e, .rx = .{ .c = c }, .orders = engine.watch.find(e, "orders").?, .feed = engine.watch.find(e, "feed").? };
+        r.orders.w._fake();
+        r.feed.w._fake();
+    }
+
+    fn deinit(r: *WatchRig) void {
+        if (!r.drained) {
+            r.e.drain() catch {};
+            _ = r.e.wait(@intCast(wait.deadlineMs()));
+        }
+        r.rx.deinit();
+        r.e.destroy();
+    }
+};
+
+fn injectOrder(r: *WatchRig, i: usize) void {
+    var data: [16]u8 = undefined;
+    r.orders.w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = std.fmt.bufPrint(&data, "payload {d}", .{i}) catch unreachable });
+}
+
+test "capi engine: a bounded watch listener drops the overflow and reports one GAP with the count" {
+    if (comptime !features.redis) return error.SkipZigTest;
+    var r: WatchRig = undefined;
+    try r.init();
+    defer r.deinit();
+    try std.testing.expect(engine.watch.find(r.e, "nope") == null);
 
     // Bounded: two events fit, the rest are counted.
-    const h = try engine.watch.listen(e, orders, c, listenOpts(2, abi.WATCH_NATIVE), 77);
-    for (0..5) |i| {
-        var data: [16]u8 = undefined;
-        orders.w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = std.fmt.bufPrint(&data, "payload {d}", .{i}) catch unreachable });
-    }
+    _ = try engine.watch.listen(r.e, r.orders, r.rx.c, listenOpts(2, abi.WATCH_NATIVE), 77);
+    for (0..5) |i| injectOrder(&r, i);
     for (0..2) |i| {
-        const r = try rx.next();
-        const ev: *const abi.WatchEvent = @ptrCast(@alignCast(r.ptr));
+        const rec = try r.rx.next();
+        const ev: *const abi.WatchEvent = @ptrCast(@alignCast(rec.ptr));
         try std.testing.expectEqual(@as(u32, @backingInt(abi.EventType.watch_event)), ev.ev.type);
         try std.testing.expectEqual(@as(u64, 77), ev.user_data);
         try std.testing.expectEqual(@as(u16, abi.WATCH_SRC_REDIS), ev.source);
         try std.testing.expectEqual(@as(u16, abi.WATCH_OP_MESSAGE), ev.op);
         try std.testing.expectEqual(abi.WATCH_FMT_TEXT, ev.format);
-        try std.testing.expectEqualStrings("orders", text(r, ev.channel));
+        try std.testing.expectEqualStrings("orders", text(rec, ev.channel));
         var want: [16]u8 = undefined;
-        try std.testing.expectEqualStrings(std.fmt.bufPrint(&want, "payload {d}", .{i}) catch unreachable, text(r, ev.data));
+        try std.testing.expectEqualStrings(std.fmt.bufPrint(&want, "payload {d}", .{i}) catch unreachable, text(rec, ev.data));
     }
     // Room again: the next accepted event is preceded by one GAP with the count.
-    orders.w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = "payload 5" });
-    {
-        const r = try rx.next();
-        const st: *const abi.WatchStatusEvent = @ptrCast(@alignCast(r.ptr));
-        try std.testing.expectEqual(@as(u32, @backingInt(abi.EventType.watch_status)), st.ev.type);
-        try std.testing.expectEqual(abi.WATCH_GAP, st.status);
-        try std.testing.expectEqual(@as(u64, 3), st.dropped);
-        const r2 = try rx.next();
-        const ev: *const abi.WatchEvent = @ptrCast(@alignCast(r2.ptr));
-        try std.testing.expectEqualStrings("payload 5", text(r2, ev.data));
-    }
+    injectOrder(&r, 5);
+    const rec = try r.rx.next();
+    const st: *const abi.WatchStatusEvent = @ptrCast(@alignCast(rec.ptr));
+    try std.testing.expectEqual(@as(u32, @backingInt(abi.EventType.watch_status)), st.ev.type);
+    try std.testing.expectEqual(abi.WATCH_GAP, st.status);
+    try std.testing.expectEqual(@as(u64, 3), st.dropped);
+    const rec2 = try r.rx.next();
+    const ev: *const abi.WatchEvent = @ptrCast(@alignCast(rec2.ptr));
+    try std.testing.expectEqual(@as(u32, @backingInt(abi.EventType.watch_event)), ev.ev.type);
+    try std.testing.expectEqualStrings("payload 5", text(rec2, ev.data));
+}
 
-    // A stream entry: FIELDS natively, JSON when asked.
-    const hf = try engine.watch.listen(e, feed, c, listenOpts(0, abi.WATCH_NATIVE), 1);
-    const hj = try engine.watch.listen(e, feed, c, listenOpts(0, abi.WATCH_JSON), 2);
-    feed.w._inject(.{
+test "capi engine: a watch stream entry arrives as FIELDS natively and as JSON when asked" {
+    if (comptime !features.redis) return error.SkipZigTest;
+    var r: WatchRig = undefined;
+    try r.init();
+    defer r.deinit();
+    const hf = try engine.watch.listen(r.e, r.feed, r.rx.c, listenOpts(0, abi.WATCH_NATIVE), 1);
+    const hj = try engine.watch.listen(r.e, r.feed, r.rx.c, listenOpts(0, abi.WATCH_JSON), 2);
+    r.feed.w._inject(.{
         .op = .entry,
         .op_name = "entry",
         .channel = "events",
@@ -142,52 +173,78 @@ test "capi engine: a watch listener over a fake source: records parse, overflow 
     var saw_fields = false;
     var saw_json = false;
     for (0..2) |_| {
-        const r = try rx.next();
-        const ev: *const abi.WatchEvent = @ptrCast(@alignCast(r.ptr));
+        const rec = try r.rx.next();
+        const ev: *const abi.WatchEvent = @ptrCast(@alignCast(rec.ptr));
         try std.testing.expectEqual(@as(u16, abi.WATCH_SRC_REDIS_STREAM), ev.source);
-        try std.testing.expectEqualStrings("1-0", text(r, ev.position));
+        try std.testing.expectEqualStrings("1-0", text(rec, ev.position));
         if (ev.ev.handle == hf) {
             saw_fields = true;
             try std.testing.expectEqual(abi.WATCH_FMT_FIELDS, ev.format);
             try std.testing.expectEqual(@as(u32, 2), ev.nfields);
-            const spans: [*]align(1) const abi.Span = @ptrCast(r[ev.fields_off..].ptr);
-            try std.testing.expectEqualStrings("a", text(r, spans[0]));
-            try std.testing.expectEqualStrings("1", text(r, spans[1]));
-            try std.testing.expectEqualStrings("b", text(r, spans[2]));
-            try std.testing.expectEqualStrings("2", text(r, spans[3]));
+            const spans: [*]align(1) const abi.Span = @ptrCast(rec[ev.fields_off..].ptr);
+            try std.testing.expectEqualStrings("a", text(rec, spans[0]));
+            try std.testing.expectEqualStrings("1", text(rec, spans[1]));
+            try std.testing.expectEqualStrings("b", text(rec, spans[2]));
+            try std.testing.expectEqualStrings("2", text(rec, spans[3]));
         } else {
             try std.testing.expectEqual(hj, ev.ev.handle);
             saw_json = true;
             try std.testing.expectEqual(abi.WATCH_FMT_JSON, ev.format);
-            try std.testing.expectEqualStrings("{\"a\":\"1\",\"b\":\"2\"}", text(r, ev.data));
+            try std.testing.expectEqualStrings("{\"a\":\"1\",\"b\":\"2\"}", text(rec, ev.data));
         }
     }
     try std.testing.expect(saw_fields and saw_json);
+}
 
-    // Unlisten: END (unlisted) once; the handle is over after.
-    try engine.watch.unlisten(e, hf);
-    {
-        const r = try rx.next();
-        const en: *const abi.WatchEndEvent = @ptrCast(@alignCast(r.ptr));
-        try std.testing.expectEqual(@as(u32, @backingInt(abi.EventType.watch_end)), en.ev.type);
-        try std.testing.expectEqual(abi.WATCH_END_UNLISTENED, en.reason);
-        try std.testing.expectEqual(hf, en.ev.handle);
-    }
-    try std.testing.expectError(error.Over, engine.watch.unlisten(e, hf));
+test "capi engine: unlisten ends a watch listener with one END UNLISTENED; the handle is over after" {
+    if (comptime !features.redis) return error.SkipZigTest;
+    var r: WatchRig = undefined;
+    try r.init();
+    defer r.deinit();
+    const h = try engine.watch.listen(r.e, r.feed, r.rx.c, listenOpts(0, abi.WATCH_NATIVE), 1);
+    try engine.watch.unlisten(r.e, h);
+    const rec = try r.rx.next();
+    const en: *const abi.WatchEndEvent = @ptrCast(@alignCast(rec.ptr));
+    try std.testing.expectEqual(@as(u32, @backingInt(abi.EventType.watch_end)), en.ev.type);
+    try std.testing.expectEqual(abi.WATCH_END_UNLISTENED, en.reason);
+    try std.testing.expectEqual(h, en.ev.handle);
+    const NoSecondEnd = struct {
+        rx: *Rx,
+        h: @TypeOf(h),
+        fn none(s: *@This()) anyerror!bool {
+            try s.rx.pump(0);
+            for (s.rx.recs.items[s.rx.next_at..]) |later| {
+                const ev: *const abi.Event = @ptrCast(@alignCast(later.ptr));
+                if (ev.type == @backingInt(abi.EventType.watch_end) and ev.handle == s.h) return false;
+            }
+            return true;
+        }
+    };
+    var no_second: NoSecondEnd = .{ .rx = &r.rx, .h = h };
+    try wait.expectStays(std.testing.io, "no second watch END for the handle", &no_second, NoSecondEnd.none, wait.short_window);
+    try std.testing.expectError(error.Over, engine.watch.unlisten(r.e, h));
+}
 
-    // The drain ends what is left.
-    try e.drain();
+test "capi engine: the drain ends every watch listener with END DRAINED" {
+    if (comptime !features.redis) return error.SkipZigTest;
+    var r: WatchRig = undefined;
+    try r.init();
+    defer r.deinit();
+    const h = try engine.watch.listen(r.e, r.orders, r.rx.c, listenOpts(2, abi.WATCH_NATIVE), 77);
+    const hj = try engine.watch.listen(r.e, r.feed, r.rx.c, listenOpts(0, abi.WATCH_JSON), 2);
+    try r.e.drain();
+    r.drained = true;
     var ended: usize = 0;
     while (ended < 2) {
-        const r = try rx.next();
-        const ev: *const abi.Event = @ptrCast(@alignCast(r.ptr));
+        const rec = try r.rx.next();
+        const ev: *const abi.Event = @ptrCast(@alignCast(rec.ptr));
         if (ev.type != @backingInt(abi.EventType.watch_end)) continue;
-        const en: *const abi.WatchEndEvent = @ptrCast(@alignCast(r.ptr));
+        const en: *const abi.WatchEndEvent = @ptrCast(@alignCast(rec.ptr));
         try std.testing.expectEqual(abi.WATCH_END_DRAINED, en.reason);
         try std.testing.expect(ev.handle == h or ev.handle == hj);
         ended += 1;
     }
-    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
+    try std.testing.expect(r.e.wait(@intCast(wait.deadlineMs())));
 }
 
 test "capi engine: handle kinds: an sse handle given to ws_send, a watch handle to sse_send: Invalid; release works on both" {

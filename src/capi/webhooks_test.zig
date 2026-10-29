@@ -14,12 +14,6 @@ comptime {
     }
 }
 
-test "webhooks: the records are the sizes anole.h states" {
-    try std.testing.expectEqual(@as(usize, 112), @sizeOf(abi.WebhookOut));
-    try std.testing.expectEqual(@as(usize, 56), @sizeOf(abi.WebhookPublishedEvent));
-    try std.testing.expectEqual(@as(usize, 64), @sizeOf(abi.WebhookStatusEvent));
-}
-
 test "webhooks: the configuration parses, with defaults" {
     if (comptime !features.webhooks) return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -71,7 +65,7 @@ const engine = @import("engine.zig");
 const alloc = std.testing.allocator;
 
 /// Runs one admin request and returns its answer (status, http status and
-/// JSON copied into `arena`), polling the consumer with a generous bound.
+/// JSON copied into `arena`), polling the consumer until `wait.deadline()`.
 const AdminRig = struct {
     e: *engine.Engine,
     c: *engine.Consumer,
@@ -113,8 +107,9 @@ const AdminRig = struct {
         r.next_user += 1;
         try engine.jobs.admin(r.e, r.c, request, user);
         var buf: [64 * 1024]u8 align(8) = undefined;
-        var waited: u32 = 0;
-        while (waited < 10_000) : (waited += 50) {
+        const tio = engine.threadedIo();
+        const started = std.Io.Clock.awake.now(tio);
+        while (started.untilNow(tio, .awake).nanoseconds < wait.deadline().nanoseconds) {
             var need: u32 = 0;
             const n = try engine.pollWait(r.c, &buf, 50, &need);
             var off: usize = 0;
@@ -129,9 +124,28 @@ const AdminRig = struct {
                 return .{ .status = rec.status, .http = rec.http_status, .json = value, .text = text };
             }
         }
+        std.debug.print("timed out waiting for the admin answer to: {s}\n", .{request});
         return error.TimedOut;
     }
 };
+
+test "capi webhooks: admin errors: a bad URL is 400 E_INVALID, an unknown endpoint 404, a broken request 400" {
+    if (comptime !(features.webhooks and features.sqlite)) return error.SkipZigTest;
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var r: AdminRig = undefined;
+    try r.create();
+    defer r.deinit();
+    const bad = try r.call(arena, "{\"op\":\"webhooks.endpoint.create\",\"url\":\"ftp://nope\"}");
+    try std.testing.expectEqual(@as(u16, 400), bad.http);
+    try std.testing.expectEqual(abi.E_INVALID, bad.status);
+    const missing = try r.call(arena, "{\"op\":\"webhooks.endpoint.get\",\"id\":\"ep_nope\"}");
+    try std.testing.expectEqual(@as(u16, 404), missing.http);
+    try std.testing.expectEqual(abi.OK, missing.status);
+    const not_json = try r.call(arena, "{\"op\":\"webhooks.endpoint.create\",");
+    try std.testing.expectEqual(@as(u16, 400), not_json.http);
+}
 
 test "capi webhooks: endpoints are created, listed, updated, rotated and deleted through jobs admin" {
     if (comptime !(features.webhooks and features.sqlite)) return error.SkipZigTest;
@@ -172,16 +186,6 @@ test "capi webhooks: endpoints are created, listed, updated, rotated and deleted
     const fresh = rotated.json.object.get("secret").?.string;
     try std.testing.expect(std.mem.startsWith(u8, fresh, "whsec_"));
     try std.testing.expect(!std.mem.eql(u8, fresh, secret));
-
-    // A bad URL is 400, an unknown endpoint 404.
-    const bad = try r.call(arena, "{\"op\":\"webhooks.endpoint.create\",\"url\":\"ftp://nope\"}");
-    try std.testing.expectEqual(@as(u16, 400), bad.http);
-    try std.testing.expectEqual(abi.E_INVALID, bad.status);
-    const missing = try r.call(arena, "{\"op\":\"webhooks.endpoint.get\",\"id\":\"ep_nope\"}");
-    try std.testing.expectEqual(@as(u16, 404), missing.http);
-    try std.testing.expectEqual(abi.OK, missing.status);
-    const not_json = try r.call(arena, "{\"op\":\"webhooks.endpoint.create\",");
-    try std.testing.expectEqual(@as(u16, 400), not_json.http);
 
     const del_req = try std.fmt.allocPrint(arena, "{{\"op\":\"webhooks.endpoint.delete\",\"id\":\"{s}\"}}", .{id});
     const deleted = try r.call(arena, del_req);
