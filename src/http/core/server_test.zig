@@ -49,7 +49,7 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
     try client_future.await(io);
 }
 
-test "Server: POST with body" {
+test "Server: a Content-Length body reaches the handler through req.reader" {
     const TestContext = struct {
         const Self = @This();
 
@@ -133,7 +133,7 @@ test "Server: a gzip request body reaches the handler decoded" {
     try std.testing.expectEqualStrings("Hello from test!", ctx.received_body[0..ctx.received_len]);
 }
 
-test "Server: POST with chunked encoding" {
+test "Server: a chunked body sent in several writes reaches the handler whole" {
     const TestContext = struct {
         const Self = @This();
 
@@ -194,7 +194,7 @@ test "Server: POST with chunked encoding" {
     try std.testing.expectEqualStrings("Hello from chunked test!", ctx.received_body[0..ctx.received_len]);
 }
 
-test "Server: GET with no body" {
+test "Server: a request with no body gives the handler an empty reader" {
     const TestContext = struct {
         const Self = @This();
 
@@ -239,7 +239,7 @@ test "Server: GET with no body" {
     try std.testing.expectEqual(0, ctx.read_len);
 }
 
-test "Server: HTTP/1.0 GET request" {
+test "Server: an HTTP/1.0 request reaches the handler as version 1.0" {
     const TestContext = struct {
         const Self = @This();
 
@@ -660,7 +660,7 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
     if (wait.timing()) try std.testing.expect(elapsed_ns < 1500 * std.time.ns_per_ms);
 }
 
-test "Server: 100-continue" {
+test "Server: Expect: 100-continue gets 100 Continue before the handler reads the body" {
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
@@ -1923,10 +1923,12 @@ test "Server: graceful shutdown waits for a connection that finishes in time" {
         var started: std.Io.Event = .unset;
         var release: std.Io.Event = .unset;
         var finished: std.atomic.Value(bool) = .init(false);
+        var shut_down: std.atomic.Value(bool) = .init(false);
     };
     sync.started = .unset;
     sync.release = .unset;
     sync.finished.store(false, .release);
+    sync.shut_down.store(false, .release);
 
     // The wait helper's deadline, a hang guard: the drain has no reason to
     // give up on the handler, which the test lets go once the drain began.
@@ -1970,18 +1972,15 @@ test "Server: graceful shutdown waits for a connection that finishes in time" {
     var shutdown_future = try io.concurrent(struct {
         fn run(f: *std.Io.Future(anyerror!void), _io: std.Io) !void {
             try std.testing.expectError(error.Canceled, f.cancel(_io));
+            sync.shut_down.store(true, .release);
         }
     }.run, .{ &server_future, io });
     defer shutdown_future.cancel(io) catch {};
-    try wait.waitUntil(io, "the server is draining", &server, struct {
-        fn draining(srv: *dusty.Server(void)) bool {
-            return srv.busy.load(.acquire).draining;
-        }
-    }.draining);
+    try wait.waitEvent(io, "the server is draining", &server.draining);
     // Waits for the handler rather than abandoning it...
-    try wait.expectStays(io, "the shutdown waits for the held handler", &server, struct {
-        fn running(srv: *dusty.Server(void)) bool {
-            return srv.active_connections.load(.acquire) == 1;
+    try wait.expectStays(io, "the shutdown waits for the held handler", &sync.shut_down, struct {
+        fn running(shut_down: *std.atomic.Value(bool)) bool {
+            return !shut_down.load(.acquire) and !sync.finished.load(.acquire);
         }
     }.running, wait.short_window);
     const released = std.Io.Timestamp.now(io, .awake);
@@ -2125,11 +2124,7 @@ test "Server: a request arriving during the shutdown drain is refused, not serve
         }
     }.run, .{ &server_future, io });
     defer shutdown_future.cancel(io) catch {};
-    try wait.waitUntil(io, "the server is draining", &server, struct {
-        fn draining(srv: *dusty.Server(void)) bool {
-            return srv.busy.load(.acquire).draining;
-        }
-    }.draining);
+    try wait.waitEvent(io, "the server is draining", &server.draining);
 
     var write_buf: [256]u8 = undefined;
     var writer = idle.writer(io, &write_buf);
@@ -2178,7 +2173,7 @@ test "Server: a long-lived handler learns of the drain through req.drain and end
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
-    try server.ready.wait(io);
+    try server.waitReady(io);
 
     const conn = try server.address.ip.connect(io, .{ .mode = .stream });
     defer conn.close(io);
@@ -2376,6 +2371,9 @@ test "Server: run serves every listener and tells the handler which one" {
 }
 
 test "Server: socket_per_acceptor binds every socket to one port and serves them all" {
+    // Not supported off Linux, by design: only Linux's SO_REUSEPORT spreads
+    // connections across the sockets, so `run` refuses the option elsewhere
+    // (the refusal is the next test, on every OS).
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
 
@@ -2428,9 +2426,10 @@ test "Server: socket_per_acceptor binds every socket to one port and serves them
 }
 
 test "Server: socket_per_acceptor is refused without SO_REUSEPORT or on a unix socket" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
 
+    // Refused on every OS: off Linux for the platform, on Linux for the
+    // missing SO_REUSEPORT. The check precedes any bind.
     {
         var server = dusty.Server(void).init(std.testing.allocator, io, .{
             .listeners = &.{.{ .address = loopback_addr, .socket_per_acceptor = true, .reuse_address = false }},
@@ -2438,7 +2437,8 @@ test "Server: socket_per_acceptor is refused without SO_REUSEPORT or on a unix s
         defer server.deinit();
         try std.testing.expectError(error.SocketPerAcceptorUnsupported, server.run());
     }
-    {
+    if (std.Io.net.has_unix_sockets) {
+        // Never bound: the check precedes the bind.
         const unix = try std.Io.net.UnixAddress.init("/tmp/dusty-socket-per-acceptor.sock");
         var server = dusty.Server(void).init(std.testing.allocator, io, .{
             .listeners = &.{.{ .address = .{ .unix = unix }, .socket_per_acceptor = true }},
@@ -2568,11 +2568,7 @@ test "Server: graceful shutdown waits for a request in flight on a later listene
         }
     }.run, .{ &server_future, io });
     defer shutdown_future.cancel(io) catch {};
-    try wait.waitUntil(io, "the server is draining", &server, struct {
-        fn draining(srv: *dusty.Server(void)) bool {
-            return srv.busy.load(.acquire).draining;
-        }
-    }.draining);
+    try wait.waitEvent(io, "the server is draining", &server.draining);
     sync.release.set(io);
     try shutdown_future.await(io);
     try std.testing.expect(sync.finished.load(.acquire));
@@ -2600,9 +2596,7 @@ test "Server: a request head too large for the buffer gets 431, not a panic" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            s.run() catch |err| {
-                if (err != error.Canceled) return err;
-            };
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -2651,16 +2645,14 @@ test "Server: a head that is not HTTP/1.x gets a 400 and a clean close, an HTTP/
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            s.run() catch |err| {
-                if (err != error.Canceled) return err;
-            };
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             for ([_][]const u8{ "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", "GET / HTTP/1.1\r\nBad Header\r\n\r\n", "\x16\x03\x01\x02\x00" }) |head| {
                 const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
                 defer stream.close(_io);
@@ -2704,9 +2696,7 @@ test "Server: on an h2c listener, a first line with no method is an invalid HTTP
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            s.run() catch |err| {
-                if (err != error.Canceled) return err;
-            };
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -2762,16 +2752,14 @@ test "Server: Response.abort closes the connection under a streamed body" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            s.run() catch |err| {
-                if (err != error.Canceled) return err;
-            };
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
             var write_buf: [256]u8 = undefined;
@@ -2793,15 +2781,19 @@ test "Server: Response.abort closes the connection under a streamed body" {
 test "Server: a peer that will not hang up after a 431 is hung up on anyway" {
     const io = std.testing.io;
 
+    // The lingering close given 50 ms rather than its 1 s: the claim is
+    // that it ends, not when.
+    const linger = @import("server.zig").test_linger_timeout_ms;
+    linger.ms.store(50, .release);
+    defer linger.ms.store(0, .release);
+
     // No request deadline, so the drain's own is what ends it.
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback, .timeout = .{ .request = null } }, {});
     defer server.deinit();
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            s.run() catch |err| {
-                if (err != error.Canceled) return err;
-            };
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -2928,9 +2920,7 @@ fn expectStatusForHeadOfLength(
 
     var server_future = try io.concurrent(struct {
         fn run(s: *S) !void {
-            s.run() catch |err| {
-                if (err != error.Canceled) return err;
-            };
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -2991,18 +2981,17 @@ test "Server: a head ending exactly at the buffer end gets 431, not a panic" {
 }
 
 /// Counts how many handlers are in flight at once, so a test can see whether
-/// the cap held.
+/// the cap held. Handlers hold until `release` is set.
 const ConcurrencyCtx = struct {
     active: std.atomic.Value(u32) = .init(0),
     peak: std.atomic.Value(u32) = .init(0),
     served: std.atomic.Value(u32) = .init(0),
+    release: std.Io.Event = .unset,
 
     pub fn handle(ctx: *ConcurrencyCtx, req: *dusty.Request, res: *dusty.Response) !void {
         const now = ctx.active.fetchAdd(1, .acq_rel) + 1;
         _ = ctx.peak.fetchMax(now, .acq_rel);
-        // Long enough that the others are all waiting, so the cap is what
-        // limits overlap rather than the handlers being too brief to overlap.
-        try req.io.sleep(.fromMilliseconds(30), .awake);
+        try ctx.release.wait(req.io);
         _ = ctx.active.fetchSub(1, .acq_rel);
         _ = ctx.served.fetchAdd(1, .acq_rel);
         res.body = "OK";
@@ -3022,9 +3011,7 @@ test "Server: max_connections caps overlap without dropping anyone" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *S) !void {
-            s.run() catch |err| {
-                if (err != error.Canceled) return err;
-            };
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -3032,7 +3019,18 @@ test "Server: max_connections caps overlap without dropping anyone" {
     try server.waitReady(io);
 
     const One = struct {
-        fn run(s: *S, _io: std.Io) !void {
+        fn run(s: *S, _io: std.Io, answered: *std.atomic.Value(u32)) std.Io.Cancelable!void {
+            get(s, _io) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => {
+                    std.log.err("a client was not answered: {t}", .{err});
+                    return;
+                },
+            };
+            _ = answered.fetchAdd(1, .acq_rel);
+        }
+
+        fn get(s: *S, _io: std.Io) !void {
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             // Closing is what frees the slot.
             defer stream.close(_io);
@@ -3049,17 +3047,25 @@ test "Server: max_connections caps overlap without dropping anyone" {
         }
     };
 
-    const Fut = @TypeOf(try io.concurrent(One.run, .{ &server, io }));
-    var futures: [clients]Fut = undefined;
-    for (&futures) |*f| f.* = try io.concurrent(One.run, .{ &server, io });
-    var first_err: ?anyerror = null;
-    for (&futures) |*f| f.await(io) catch |err| {
-        if (first_err == null) first_err = err;
-    };
-    if (first_err) |err| return err;
+    var answered: std.atomic.Value(u32) = .init(0);
+    var clients_group: std.Io.Group = .init;
+    defer clients_group.cancel(io);
+    for (0..clients) |_| try clients_group.concurrent(io, One.run, .{ &server, io, &answered });
 
+    // The cap fills, and no third handler gets in while it is full.
+    try wait.waitEqual(io, "max_connections handlers are in flight", &ctx.active, cap);
+    try wait.expectStays(io, "no handler past the cap starts", &ctx.peak, struct {
+        fn capped(peak: *const std.atomic.Value(u32)) bool {
+            return peak.load(.acquire) <= cap;
+        }
+    }.capped, wait.short_window);
+
+    // Let them go: everyone waiting gets a slot in turn.
+    ctx.release.set(io);
+    try clients_group.await(io);
+
+    try std.testing.expectEqual(@as(u32, clients), answered.load(.acquire));
     try std.testing.expectEqual(@as(u32, clients), ctx.served.load(.acquire));
-    // Equality rather than <=, so this cannot pass by nothing overlapping.
     try std.testing.expectEqual(@as(u32, cap), ctx.peak.load(.acquire));
 }
 
@@ -3079,9 +3085,7 @@ test "Server: a slot freed on one listener reaches a connection waiting on anoth
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            s.run() catch |err| {
-                if (err != error.Canceled) return err;
-            };
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -3163,9 +3167,7 @@ fn millisUntilServerHangsUp(config: dusty.ServerConfig, head: []const u8) !?i64 
 
     var server_future = try io.concurrent(struct {
         fn run(s: *S) !void {
-            s.run() catch |err| {
-                if (err != error.Canceled) return err;
-            };
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -3221,9 +3223,7 @@ test "Server: an idle keepalive connection is cut off by timeout.keepalive" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *S) !void {
-            s.run() catch |err| {
-                if (err != error.Canceled) return err;
-            };
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -3261,6 +3261,14 @@ test "Server.dispatch: a request over a sink is routed through the middleware to
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
     defer server.deinit();
+    const Mark = struct {
+        pub fn execute(_: *const @This(), _: *dusty.Request, res: *dusty.Response, next: anytype) !void {
+            try res.header("X-Mw", "ran");
+            return next.call();
+        }
+    };
+    var mark: Mark = .{};
+    server.router.use(dusty.Middleware(void).init(&mark));
     server.router.get("/users/:id", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
             try res.print(.text, "user {s}", .{req.params.get("id").?});
@@ -3270,6 +3278,7 @@ test "Server.dispatch: a request over a sink is routed through the middleware to
 
     const Capture = struct {
         status: ?dusty.Status = null,
+        mw: []const u8 = "",
         ended: bool = false,
         trailer: []const u8 = "",
         buf: [64]u8 = undefined,
@@ -3284,9 +3293,10 @@ test "Server.dispatch: a request over a sink is routed through the middleware to
                 .peerGone = peerGone,
             } };
         }
-        fn head(ptr: *anyopaque, status: dusty.Status, _: *const dusty.Headers, _: ?usize) std.Io.Writer.Error!void {
+        fn head(ptr: *anyopaque, status: dusty.Status, headers: *const dusty.Headers, _: ?usize) std.Io.Writer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.status = status;
+            self.mw = headers.get("x-mw") orelse "";
         }
         fn interim(_: *anyopaque, _: dusty.Status) std.Io.Writer.Error!void {}
         fn body(ptr: *anyopaque) *std.Io.Writer {
@@ -3320,6 +3330,7 @@ test "Server.dispatch: a request over a sink is routed through the middleware to
     try res.write();
 
     try std.testing.expectEqual(dusty.Status.ok, cap.status.?);
+    try std.testing.expectEqualStrings("ran", cap.mw);
     try std.testing.expectEqualStrings("user 42", cap.w.buffered());
     try std.testing.expect(cap.ended);
     try std.testing.expectEqualStrings("yes", cap.trailer);
@@ -3419,7 +3430,7 @@ test "Server: a head that does not arrive within read_header closes the connecti
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = loopback,
         // The request deadline only as a hang guard (the wait helper's).
-        .timeout = .{ .request = wait.deadline(), .read_header = .fromMilliseconds(200) },
+        .timeout = .{ .request = wait.deadline(), .read_header = .fromMilliseconds(50) },
     }, {});
     defer server.deinit();
     server.router.post("/echo", struct {
@@ -3457,8 +3468,8 @@ test "Server: a head that does not arrive within read_header closes the connecti
         var w = stream.writer(io, &wbuf);
         try w.interface.writeAll("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nConnection: close\r\n\r\n");
         try w.interface.flush();
-        // Slower than read_header on purpose (a lower bound).
-        try io.sleep(.fromMilliseconds(400), .awake);
+        // Slower than read_header on purpose, by 5x (a lower bound).
+        try io.sleep(.fromMilliseconds(250), .awake);
         try w.interface.writeAll("late");
         try w.interface.flush();
         var rbuf: [512]u8 = undefined;
@@ -3478,12 +3489,13 @@ test "Server: a keep-alive request outlives the keepalive timeout; a half head o
         // No request deadline: a whole head buffered at once runs without a
         // timer, and the keepalive one armed for the wait must not carry
         // into the handler.
-        .timeout = .{ .request = null, .keepalive = .fromMilliseconds(200), .read_header = .fromMilliseconds(200) },
+        .timeout = .{ .request = null, .keepalive = .fromMilliseconds(50), .read_header = .fromMilliseconds(50) },
     }, {});
     defer server.deinit();
     server.router.get("/slow", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
-            try req.io.sleep(.fromMilliseconds(500), .awake);
+            // Outlives keepalive and read_header by 5x, on purpose.
+            try req.io.sleep(.fromMilliseconds(250), .awake);
             res.body = "slow";
         }
     }.handle);
@@ -3588,21 +3600,17 @@ fn repeat(comptime s: []const u8, comptime n: usize) []const u8 {
     }
 }
 
-test "Server: router.use with RequestId and Logger, and nested groups" {
+test "Server: nested groups run the outer group's middleware, then the inner's" {
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
-
-    var request_id = dusty.middleware.RequestId.init(.{});
-    var logger = dusty.middleware.Logger.init(.{});
-    server.router.use(dusty.Middleware(void).init(&request_id));
-    server.router.use(dusty.Middleware(void).init(&logger));
 
     const Tag = struct {
         value: []const u8,
         pub fn execute(self: *const @This(), req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
             _ = req;
-            try res.header("X-Group", self.value);
+            // Added, not replaced: the wire shows every Tag that ran, in order.
+            try res.addHeader("X-Group", self.value);
             return next.call();
         }
     };
@@ -3612,7 +3620,37 @@ test "Server: router.use with RequestId and Logger, and nested groups" {
     const inner_mws = [_]dusty.Middleware(void){dusty.Middleware(void).init(&inner_tag)};
     const api = server.router.group("/api", &outer_mws);
     const v1 = api.group("/v1", &inner_mws);
-    v1.get("/id", struct {
+    v1.get("/x", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "ok";
+        }
+    }.handle);
+
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var out: [2048]u8 = undefined;
+    const resp = try rawAll(io, &server, "GET /api/v1/x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
+    const outer_at = std.mem.indexOf(u8, resp, "X-Group: outer\r\n") orelse return error.OuterMiddlewareDidNotRun;
+    const inner_at = std.mem.indexOf(u8, resp, "X-Group: inner\r\n") orelse return error.InnerMiddlewareDidNotRun;
+    try std.testing.expect(outer_at < inner_at);
+}
+
+test "RequestId: the response's X-Request-Id is the ID the handler saw" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    var request_id = dusty.middleware.RequestId.init(.{});
+    server.router.use(dusty.Middleware(void).init(&request_id));
+    server.router.get("/id", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
             res.body = req.id;
         }
@@ -3626,22 +3664,10 @@ test "Server: router.use with RequestId and Logger, and nested groups" {
     defer future.cancel(io) catch {};
     try server.waitReady(io);
 
-    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
-    defer stream.close(io);
-    var wbuf: [256]u8 = undefined;
-    var w = stream.writer(io, &wbuf);
-    try w.interface.writeAll("GET /api/v1/id HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
-    try w.interface.flush();
-    var rbuf: [1024]u8 = undefined;
-    var r = stream.reader(io, &rbuf);
     var out: [2048]u8 = undefined;
-    var fw: std.Io.Writer = .fixed(&out);
-    _ = r.interface.streamRemaining(&fw) catch {};
-    const resp = fw.buffered();
+    const resp = try rawAll(io, &server, "GET /id HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
 
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
-    // Both groups' middleware ran, outer first (the later header wins).
-    try std.testing.expect(std.mem.indexOf(u8, resp, "X-Group: inner") != null);
     const id_at = std.mem.indexOf(u8, resp, "X-Request-Id: ").? + "X-Request-Id: ".len;
     const id = resp[id_at..][0..32];
     for (id) |ch| try std.testing.expect(std.ascii.isHex(ch));
@@ -3782,8 +3808,18 @@ test "Server: X-Forwarded-Proto and X-Forwarded-Host from a trusted proxy" {
 }
 
 test "Server: X-Forwarded-Host is ignored unless trusted, X-Forwarded-Proto when turned off" {
+    const request = "GET /who HTTP/1.1\r\nHost: internal:8080\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: evil.example\r\nConnection: close\r\n\r\n";
+    // Each setting on a server of its own, fixed at init: the config is
+    // not changed under a running server.
+    try expectWho(.{ .listeners = loopback, .trusted_proxy_hops = 1 }, request, "203.0.113.9:0 secure=true host=internal:8080");
+    try expectWho(.{ .listeners = loopback, .trusted_proxy_hops = 1, .trust_forwarded_proto = false }, request, "203.0.113.9:0 secure=false host=internal:8080");
+}
+
+/// Serves `request` on a new server with `config` and checks that
+/// `WhoHandler`'s answer ends with `expected`.
+fn expectWho(config: dusty.ServerConfig, request: []const u8, expected: []const u8) !void {
     const io = std.testing.io;
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback, .trusted_proxy_hops = 1 }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, config, {});
     defer server.deinit();
     server.router.get("/who", WhoHandler.handle);
     var future = try io.concurrent(struct {
@@ -3795,13 +3831,8 @@ test "Server: X-Forwarded-Host is ignored unless trusted, X-Forwarded-Proto when
     try server.waitReady(io);
 
     var out: [2048]u8 = undefined;
-    const request = "GET /who HTTP/1.1\r\nHost: internal:8080\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: evil.example\r\nConnection: close\r\n\r\n";
     const resp = try rawAll(io, &server, request, &out);
-    try std.testing.expect(std.mem.endsWith(u8, resp, "203.0.113.9:0 secure=true host=internal:8080"));
-
-    server.config.trust_forwarded_proto = false;
-    const no_proto = try rawAll(io, &server, request, &out);
-    try std.testing.expect(std.mem.endsWith(u8, no_proto, "203.0.113.9:0 secure=false host=internal:8080"));
+    try std.testing.expect(std.mem.endsWith(u8, resp, expected));
 }
 
 test "Server: an HTTP/1.1 request needs exactly one Host" {
@@ -3875,6 +3906,8 @@ fn closedWithin(io: std.Io, address: std.Io.net.IpAddress, request: []const u8) 
             flag.store(true, .release);
         }
     }.run, .{ stream, io, &done });
+    // Before the deferred close: the reader is gone before its socket is.
+    defer reader.cancel(io);
     wait.waitFlag(io, "the server closed the connection", &done) catch |err| switch (err) {
         error.WaitTimedOut => {},
         error.Canceled => |e| return e,
@@ -4124,7 +4157,7 @@ test "Server: a response can carry more headers than a request may" {
 
     var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
-            try s.ready.wait(_io);
+            try s.waitReady(_io);
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
             var write_buf: [256]u8 = undefined;
@@ -4170,16 +4203,17 @@ test "stream: an event stream outlives timeouts.request" {
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = loopback,
         // The write deadline only as a hang guard (the wait helper's).
-        .timeout = .{ .request = .fromMilliseconds(300), .write = wait.deadline() },
+        .timeout = .{ .request = .fromMilliseconds(50), .write = wait.deadline() },
     }, {});
     defer server.deinit();
     server.router.get("/slow", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
             var buf: [256]u8 = undefined;
             var events = try res.startEventStream(&buf);
-            for (0..12) |_| {
+            // Six ticks of the request timeout each: the stream outlives it 6x.
+            for (0..6) |_| {
                 try events.send("tick", .{});
-                try req.io.sleep(.fromMilliseconds(100), .awake);
+                try req.io.sleep(.fromMilliseconds(50), .awake);
             }
             try events.end();
         }
@@ -4200,7 +4234,7 @@ test "stream: an event stream outlives timeouts.request" {
     var w: std.Io.Writer = .fixed(&out);
     _ = reader.interface.streamRemaining(&w) catch {};
     const got = w.buffered();
-    try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, got, "data: tick"));
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, got, "data: tick"));
     try std.testing.expect(std.mem.endsWith(u8, got, "0\r\n\r\n"));
 }
 
@@ -4248,9 +4282,10 @@ test "stream: a peer that stops reading is cut after timeouts.write" {
 
 test "sendFile: a download slower than timeouts.request completes" {
     const io = std.testing.io;
+    const request_ms = 60;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const size: u64 = 32 * 1024 * 1024;
+    const size: u64 = 8 * 1024 * 1024;
     {
         const file = try tmp.dir.createFile(io, "big.bin", .{});
         defer file.close(io);
@@ -4258,7 +4293,7 @@ test "sendFile: a download slower than timeouts.request completes" {
     }
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = loopback,
-        .timeout = .{ .request = .fromMilliseconds(300), .write = .fromSeconds(5) },
+        .timeout = .{ .request = .fromMilliseconds(request_ms), .write = .fromSeconds(5) },
     }, {});
     defer server.deinit();
     server.router.static("/files", tmp.dir, .{});
@@ -4276,20 +4311,27 @@ test "sendFile: a download slower than timeouts.request completes" {
     var reader = stream.reader(io, &read_buf);
     const start = std.Io.Clock.awake.now(io);
     var total: u64 = 0;
-    var scratch: [2 * 1024 * 1024]u8 = undefined;
+    var scratch: [1024 * 1024]u8 = undefined;
     while (true) {
-        // 2 MiB per 40 ms: the whole file takes about twice the request timeout.
+        // 1 MiB per 40 ms: the whole file takes over 5x the request timeout.
         const n = reader.interface.readSliceShort(&scratch) catch break;
         total += n;
         if (n < scratch.len) break;
         try io.sleep(.fromMilliseconds(40), .awake);
     }
-    try std.testing.expect(total >= size);
-    try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() > 300);
+    try std.testing.expectEqual(size, total);
+    try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() > 5 * request_ms);
 }
 
 test "stream: a handler's own setTimeout before the stream is kept" {
     const io = std.testing.io;
+    const Forever = struct {
+        /// Set when the handler ran out of ticks (10x its timeout) without
+        /// being cut: the timeout was dropped. Ends the stream so that is a
+        /// failure, not a hang.
+        var ran_out: std.atomic.Value(bool) = .init(false);
+    };
+    Forever.ran_out.store(false, .release);
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = loopback,
         .timeout = .{ .request = .fromSeconds(30), .write = .fromSeconds(30) },
@@ -4300,10 +4342,11 @@ test "stream: a handler's own setTimeout before the stream is kept" {
             req.setTimeout(.fromMilliseconds(500));
             var buf: [256]u8 = undefined;
             var events = try res.startEventStream(&buf);
-            while (true) {
+            for (0..100) |_| {
                 try events.send("tick", .{});
                 try req.io.sleep(.fromMilliseconds(50), .awake);
             }
+            Forever.ran_out.store(true, .release);
         }
     }.handle);
     var server_future = try io.concurrent(struct {
@@ -4323,6 +4366,7 @@ test "stream: a handler's own setTimeout before the stream is kept" {
     var w: std.Io.Writer = .fixed(&out);
     _ = reader.interface.streamRemaining(&w) catch {};
     const ms = start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    try std.testing.expect(!Forever.ran_out.load(.acquire));
     try std.testing.expect(ms >= 400);
     if (wait.timing()) try std.testing.expect(ms < 3000);
 }
