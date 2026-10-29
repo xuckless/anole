@@ -773,7 +773,7 @@ fn greaterStr(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .gt;
 }
 
-test "memory store: endpoints, messages with idempotency, attempts" {
+test "memory store: endpoints list by owner and delete once" {
     const gpa = std.testing.allocator;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -790,6 +790,15 @@ test "memory store: endpoints, messages with idempotency, attempts" {
     try std.testing.expectEqual(@as(u32, 2), try st.epCount(&c, "acme"));
     try std.testing.expect(try st.epDel(&c, "ep_1"));
     try std.testing.expect(!try st.epDel(&c, "ep_1"));
+}
+
+test "memory store: a second message with the same owner and idempotency key returns the first" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: anole.db.Ctx = .{ .io = std.testing.io, .arena = arena_state.allocator() };
+    const st = try Store.init(gpa, std.testing.io, .memory, "anole_", "anole:");
+    defer st.deinit(gpa);
 
     try std.testing.expect(try st.msgPut(&c, "msg_A", "acme", "k1", 0, "one") == null);
     const dup = try st.msgPut(&c, "msg_B", "acme", "k1", 0, "two");
@@ -797,6 +806,15 @@ test "memory store: endpoints, messages with idempotency, attempts" {
     try std.testing.expect(try st.msgPut(&c, "msg_C", "other", "k1", 0, "three") == null);
     const ml = try st.msgList(&c, "acme", null, 10);
     try std.testing.expectEqual(@as(usize, 1), ml.len);
+}
+
+test "memory store: attempts list newest first and page by id" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: anole.db.Ctx = .{ .io = std.testing.io, .arena = arena_state.allocator() };
+    const st = try Store.init(gpa, std.testing.io, .memory, "anole_", "anole:");
+    defer st.deinit(gpa);
 
     try st.attAdd(&c, "msg_A", "ep_2", 5, "a1");
     try st.attAdd(&c, "msg_A", "ep_2", 6, "a2");
@@ -805,6 +823,7 @@ test "memory store: endpoints, messages with idempotency, attempts" {
     try std.testing.expectEqualStrings("a2", atts[0].body);
     const page = try st.attList(&c, .{ .endpoint = "ep_2", .before = atts[0].id });
     try std.testing.expectEqual(@as(usize, 1), page.len);
+    try std.testing.expectEqualStrings("a1", page[0].body);
 }
 
 fn buildAndFreeSql(gpa: std.mem.Allocator, d: Dialect) !void {
