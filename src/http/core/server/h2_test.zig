@@ -1432,9 +1432,17 @@ test "HTTP/2: a client that half-closes still gets the responses in flight" {
     }
     try client.w.flush();
     try wait.waitAtLeast(io, "the held request's handler runs", &Handlers.held_entered, helds + 1);
-    // Done sending, with the request in flight; it is answered only after.
+    // Done sending, with the request in flight; the handler answers only
+    // once the server has read the EOF and handled it (the hook runs on the
+    // connection's clean end of input), so the half-close always lands
+    // while the response is in flight.
+    h2.test_after_peer_end = struct {
+        fn release(hook_io: std.Io) void {
+            Handlers.held_gate.set(hook_io);
+        }
+    }.release;
+    defer h2.test_after_peer_end = null;
     try client.stream.shutdown(io, .send);
-    Handlers.held_gate.set(io);
     // Nothing more goes out from here; read until the response is in (each
     // read with the client's deadline).
     while (!client.get(id).closed) {
