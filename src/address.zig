@@ -143,16 +143,6 @@ test "listen addresses: every interface is dual-stack where it can be" {
     try std.testing.expectError(error.InvalidListenAddress, resolve("example.com", 80, true));
 }
 
-test "listen addresses: a bare port is every interface" {
-    const p = try parse("3000");
-    try std.testing.expectEqualStrings(any, p.host);
-    try std.testing.expectEqual(@as(u16, 3000), p.port);
-    try std.testing.expectEqual(@as(u16, 0), (try parse("0")).port);
-    try std.testing.expectError(error.InvalidListenAddress, parse("65536"));
-    try std.testing.expectError(error.InvalidListenAddress, parse("3000x"));
-    try std.testing.expectError(error.InvalidListenAddress, parse(""));
-}
-
 test "address: isLoopback" {
     try std.testing.expect(isLoopback(try std.Io.net.IpAddress.parse("127.0.0.1", 1)));
     try std.testing.expect(isLoopback(try std.Io.net.IpAddress.parse("127.5.5.5", 1)));

@@ -84,13 +84,123 @@ const AppRoutes = struct {
     }
 };
 
-test "anole.App: listen, function middleware, with, staticDir, metrics, health, ws, grpcHealth, tracing and the client" {
+fn urlOf(arena: std.mem.Allocator, port: u16, path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "http://127.0.0.1:{d}{s}", .{ port, path });
+}
+
+/// Listens on 127.0.0.1:0 and runs `check` against the server from a task
+/// on its runtime; the server stops when `check` returns.
+fn listenAndCheck(app: *App, comptime check: anytype) !void {
+    const Check = struct {
+        fn run(a: *App) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            var arena_state: std.heap.ArenaAllocator = .init(alloc);
+            defer arena_state.deinit();
+            try check(io_, arena_state.allocator(), a.addresses()[0].ip.getPort());
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{app});
+    defer checking.cancel(app.io()) catch {};
+    try app.listen("127.0.0.1:0");
+    try checking.await(app.io());
+}
+
+test "anole.App: function middleware runs on every route, with() adds one to a single route, and a handler calls the server through anole.client" {
+    var app = try App.init(alloc, .{ .executors = .exact(2) });
+    defer app.deinit();
+    app.use(AppRoutes.stamp);
+    app.get("/hello", AppRoutes.hello);
+    app.get("/via", AppRoutes.via);
+    app.with(.{AppRoutes.requireKey}).get("/secret", AppRoutes.secret);
+
+    try listenAndCheck(&app, struct {
+        fn check(io_: std.Io, arena: std.mem.Allocator, port: u16) !void {
+            app_port.store(port, .release);
+            const hello = try get(io_, arena, try urlOf(arena, port, "/hello"), &.{});
+            try std.testing.expectEqualStrings("hello", hello.body);
+            try std.testing.expectEqualStrings("fn-middleware", hello.stamp.?);
+
+            const via = try get(io_, arena, try urlOf(arena, port, "/via"), &.{});
+            try std.testing.expectEqualStrings("via: hello", via.body);
+
+            // `with`: this route alone is behind the key check.
+            const refused = try get(io_, arena, try urlOf(arena, port, "/secret"), &.{});
+            try std.testing.expectEqual(http.Status.unauthorized, refused.status);
+            try std.testing.expectEqualStrings("fn-middleware", refused.stamp.?);
+            const allowed = try get(io_, arena, try urlOf(arena, port, "/secret"), &.{.{ "X-Api-Key", "k" }});
+            try std.testing.expectEqualStrings("secret", allowed.body);
+        }
+    }.check);
+}
+
+test "anole.App: staticDir serves files, health answers /healthz and /readyz, and metrics counts requests per route" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "page.txt", .data = "static page" });
     const files = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(files);
 
+    var app = try App.init(alloc, .{ .executors = .exact(2) });
+    defer app.deinit();
+    const registry = app.metrics(.{});
+    try std.testing.expectEqual(registry, app.metrics(.{}));
+    app.get("/hello", AppRoutes.hello);
+    try app.staticDir("/files", files, .{});
+    _ = app.health(.{});
+
+    try listenAndCheck(&app, struct {
+        fn check(io_: std.Io, arena: std.mem.Allocator, port: u16) !void {
+            try std.testing.expectEqualStrings("static page", (try get(io_, arena, try urlOf(arena, port, "/files/page.txt"), &.{})).body);
+            try std.testing.expectEqualStrings("ok\n", (try get(io_, arena, try urlOf(arena, port, "/healthz"), &.{})).body);
+            try std.testing.expectEqualStrings("ok\n", (try get(io_, arena, try urlOf(arena, port, "/readyz"), &.{})).body);
+            for (0..2) |_| try std.testing.expectEqualStrings("hello", (try get(io_, arena, try urlOf(arena, port, "/hello"), &.{})).body);
+            const scraped = (try get(io_, arena, try urlOf(arena, port, "/metrics"), &.{})).body;
+            try std.testing.expect(std.mem.indexOf(u8, scraped, "anole_http_requests_total{method=\"GET\",route=\"/hello\",status=\"200\"} 2") != null);
+        }
+    }.check);
+}
+
+test "anole.App: ws answers a plain GET with 426 and echoes over a WebSocket" {
+    if (comptime !features.websocket) return error.SkipZigTest;
+    var app = try App.init(alloc, .{ .executors = .exact(2) });
+    defer app.deinit();
+    app.ws("/echo", AppRoutes.echo);
+
+    try listenAndCheck(&app, struct {
+        fn check(io_: std.Io, arena: std.mem.Allocator, port: u16) !void {
+            const plain = try get(io_, arena, try urlOf(arena, port, "/echo"), &.{});
+            try std.testing.expectEqual(http.Status.upgrade_required, plain.status);
+            var dc = http.Client.init(alloc, io_, .{});
+            defer dc.deinit();
+            var ws = try dc.connectWebSocket(try std.fmt.allocPrint(arena, "ws://127.0.0.1:{d}/echo", .{port}), .{});
+            defer ws.deinit();
+            try ws.send(.text, "ping me back");
+            try std.testing.expectEqualStrings("ping me back", (try ws.receive()).data);
+            try ws.close(.normal, "");
+            const answer = try ws.receive();
+            try std.testing.expectEqual(http.core.WebSocket.MessageType.close, answer.type);
+        }
+    }.check);
+}
+
+test "anole.App: grpcHealth answers grpc.health.v1 Check over Connect's unary JSON, per service and whole" {
+    if (comptime !features.grpc) return error.SkipZigTest;
+    var app = try App.init(alloc, .{ .executors = .exact(2) });
+    defer app.deinit();
+    try app.grpcHealth().set("app.Svc", .NOT_SERVING);
+
+    try listenAndCheck(&app, struct {
+        fn check(io_: std.Io, arena: std.mem.Allocator, port: u16) !void {
+            const check_url = try urlOf(arena, port, "/grpc.health.v1.Health/Check");
+            try std.testing.expectEqualStrings("{\"status\":\"NOT_SERVING\"}", try post(io_, arena, check_url, "application/json", "{\"service\":\"app.Svc\"}"));
+            try std.testing.expectEqualStrings("{\"status\":\"SERVING\"}", try post(io_, arena, check_url, "application/json", "{}"));
+        }
+    }.check);
+}
+
+test "anole.App: tracing exports the spans of served requests to an OTLP collector" {
     var app = try App.init(alloc, .{ .executors = .exact(2) });
     defer app.deinit();
     const io = app.io();
@@ -110,85 +220,15 @@ test "anole.App: listen, function middleware, with, staticDir, metrics, health, 
     const endpoint = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}", .{collector.address.ip.getPort()});
     defer alloc.free(endpoint);
 
-    const registry = app.metrics(.{});
-    try std.testing.expectEqual(registry, app.metrics(.{}));
     _ = try app.tracing(.{ .endpoint = endpoint, .service_name = "app-test", .interval = .fromMilliseconds(20) });
-    app.use(AppRoutes.stamp);
     app.get("/hello", AppRoutes.hello);
-    app.get("/via", AppRoutes.via);
-    app.with(.{AppRoutes.requireKey}).get("/secret", AppRoutes.secret);
-    try app.staticDir("/files", files, .{});
-    _ = app.health(.{});
-    if (features.websocket) app.ws("/echo", AppRoutes.echo);
-    if (features.grpc) try app.grpcHealth().set("app.Svc", .NOT_SERVING);
 
-    const Check = struct {
-        fn run(a: *App) !void {
-            defer a.stop();
-            const io_ = a.io();
-            try a.waitReady();
-            var arena_state: std.heap.ArenaAllocator = .init(alloc);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-            const port = a.addresses()[0].ip.getPort();
-            app_port.store(port, .release);
-            const base = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}", .{port});
-            const url = struct {
-                fn f(ar: std.mem.Allocator, b: []const u8, path: []const u8) ![]const u8 {
-                    return std.fmt.allocPrint(ar, "{s}{s}", .{ b, path });
-                }
-            }.f;
-
-            const hello = try get(io_, arena, try url(arena, base, "/hello"), &.{});
-            try std.testing.expectEqualStrings("hello", hello.body);
-            try std.testing.expectEqualStrings("fn-middleware", hello.stamp.?);
-
-            const via = try get(io_, arena, try url(arena, base, "/via"), &.{});
-            try std.testing.expectEqualStrings("via: hello", via.body);
-
-            // `with`: this route alone is behind the key check.
-            const refused = try get(io_, arena, try url(arena, base, "/secret"), &.{});
-            try std.testing.expectEqual(http.Status.unauthorized, refused.status);
-            try std.testing.expectEqualStrings("fn-middleware", refused.stamp.?);
-            const allowed = try get(io_, arena, try url(arena, base, "/secret"), &.{.{ "X-Api-Key", "k" }});
-            try std.testing.expectEqualStrings("secret", allowed.body);
-
-            try std.testing.expectEqualStrings("static page", (try get(io_, arena, try url(arena, base, "/files/page.txt"), &.{})).body);
-            try std.testing.expectEqualStrings("ok\n", (try get(io_, arena, try url(arena, base, "/healthz"), &.{})).body);
-            try std.testing.expectEqualStrings("ok\n", (try get(io_, arena, try url(arena, base, "/readyz"), &.{})).body);
-            const scraped = (try get(io_, arena, try url(arena, base, "/metrics"), &.{})).body;
-            try std.testing.expect(std.mem.indexOf(u8, scraped, "anole_http_requests_total{method=\"GET\",route=\"/hello\",status=\"200\"} 2") != null);
-
-            if (features.websocket) {
-                // A plain request to a WebSocket route.
-                const plain = try get(io_, arena, try url(arena, base, "/echo"), &.{});
-                try std.testing.expectEqual(http.Status.upgrade_required, plain.status);
-                var dc = http.Client.init(alloc, io_, .{});
-                defer dc.deinit();
-                var ws = try dc.connectWebSocket(try std.fmt.allocPrint(arena, "ws://127.0.0.1:{d}/echo", .{port}), .{});
-                defer ws.deinit();
-                try ws.send(.text, "ping me back");
-                try std.testing.expectEqualStrings("ping me back", (try ws.receive()).data);
-                try ws.close(.normal, "");
-                const answer = try ws.receive();
-                try std.testing.expectEqual(http.core.WebSocket.MessageType.close, answer.type);
-            }
-
-            if (features.grpc) {
-                // Connect's unary JSON over HTTP/1.1.
-                const check = try post(io_, arena, try url(arena, base, "/grpc.health.v1.Health/Check"), "application/json", "{\"service\":\"app.Svc\"}");
-                try std.testing.expectEqualStrings("{\"status\":\"NOT_SERVING\"}", check);
-                const whole = try post(io_, arena, try url(arena, base, "/grpc.health.v1.Health/Check"), "application/json", "{}");
-                try std.testing.expectEqualStrings("{\"status\":\"SERVING\"}", whole);
-            }
-
-            // The spans of the requests above reach the collector.
-            try AppRoutes.spans_seen.waitTimeout(io_, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try listenAndCheck(&app, struct {
+        fn check(io_: std.Io, arena: std.mem.Allocator, port: u16) !void {
+            try std.testing.expectEqualStrings("hello", (try get(io_, arena, try urlOf(arena, port, "/hello"), &.{})).body);
+            try @import("anole_test_wait").waitEvent(io_, "the request's span reaches the collector", &AppRoutes.spans_seen);
         }
-    };
-    var checking = try io.concurrent(Check.run, .{&app});
-    try app.listen("127.0.0.1:0");
-    try checking.await(io);
+    }.check);
 }
 
 const State = struct {
@@ -228,17 +268,12 @@ const StateRoutes = struct {
     };
 };
 
-test "anole.Server(State): (req, res) and (state, req, res) handlers, function middleware with state, grpc with methods on a value; listen refused beside init's listeners" {
+test "anole.Server(State): listen after init's listeners is ListenersAlreadySet, and run serves init's listeners" {
     const expected_log = @import("errors.zig").expectLog();
     defer expected_log.deinit();
     var state: State = .{};
     var app = try Server(State).init(alloc, .{ .http = .{ .port = 0, .h2c = false }, .executors = .exact(2) }, &state);
     defer app.deinit();
-    app.use(StateRoutes.count);
-    app.get("/plain", StateRoutes.plain);
-    app.get("/stateful", StateRoutes.stateful);
-    var impl: StateRoutes.Health = .{ .status = "known" };
-    if (features.grpc) app.grpc(grpc.health.pb.Health, &impl);
     // The listeners came from init's options...
     try std.testing.expectError(error.ListenersAlreadySet, app.listen(":0"));
     // ...and `run` still serves them.
@@ -250,11 +285,12 @@ test "anole.Server(State): (req, res) and (state, req, res) handlers, function m
         }
     };
     var checking = try app.io().concurrent(Check.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
     try app.run();
     try checking.await(app.io());
 }
 
-test "anole.Server(State): served" {
+test "anole.Server(State): (req, res) and (state, req, res) handlers, state middleware and gRPC methods on a value are served" {
     var state: State = .{};
     var app = try Server(State).init(alloc, .{ .executors = .exact(2) }, &state);
     defer app.deinit();
@@ -283,6 +319,7 @@ test "anole.Server(State): served" {
         }
     };
     var checking = try app.io().concurrent(Check.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
     // `run` sets up what `init` left: 127.0.0.1:8080 by default, so a
     // port of our own here.
     try app.listen("127.0.0.1:0");
@@ -339,6 +376,7 @@ test "anole.noWait: a marked route answers over HTTP/1.1 and HTTP/2, beside a wa
         }
     };
     var checking = try app.io().concurrent(Check.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
@@ -348,7 +386,6 @@ test "anole.App: listenTls serves HTTPS, and HTTP/3 advertised with Alt-Svc" {
     var app = try App.init(alloc, .{ .executors = .exact(2) });
     defer app.deinit();
     app.get("/hello", AppRoutes.hello);
-    app.post("/hello", AppRoutes.hello);
 
     const Check = struct {
         fn run(a: *App) !void {
@@ -365,16 +402,6 @@ test "anole.App: listenTls serves HTTPS, and HTTP/3 advertised with Alt-Svc" {
             if (comptime !features.http3) {
                 try std.testing.expect(resp.headers().get("Alt-Svc") == null);
                 return;
-            }
-            {
-                // With HTTP/3 on, early data's guard is too, on every
-                // route: an unsafe request a proxy took early gets 425.
-                var early = try http.Headers.init(alloc, 2);
-                defer early.deinit(alloc);
-                try early.put("Early-Data", "1");
-                var too_early = try dc.fetch(try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/hello", .{port}), .{ .method = .post, .headers = &early, .body = "" });
-                defer too_early.deinit();
-                try std.testing.expectEqual(@as(u16, 425), @backingInt(too_early.status()));
             }
             const q = a.http3Address().?;
             var alt_buf: [64]u8 = undefined;
@@ -397,6 +424,7 @@ test "anole.App: listenTls serves HTTPS, and HTTP/3 advertised with Alt-Svc" {
         }
     };
     var checking = try app.io().concurrent(Check.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
     try app.listenTls("127.0.0.1:0", .dev_self_signed);
     try checking.await(app.io());
 }
@@ -444,7 +472,10 @@ fn rawGet(io: std.Io, to: std.Io.net.IpAddress, out: []u8) ![]const u8 {
     var rbuf: [1024]u8 = undefined;
     var r = stream.reader(io, &rbuf);
     var fw: std.Io.Writer = .fixed(out);
-    _ = r.interface.streamRemaining(&fw) catch {};
+    if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
+        // A cancel is handed on (SAFETY.md C3); anything else ends the read.
+        if (r.err) |e| if (e == error.Canceled) return error.Canceled;
+    }
     const resp = fw.buffered();
     if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n")) return error.UnexpectedStatus;
     const head_end = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return error.NoBody;
@@ -478,6 +509,7 @@ test "anole.App: listen(\":0\") takes IPv4 and IPv6 on one dual-stack socket; ha
         }
     };
     var checking = try app.io().concurrent(Check.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
     try app.listen(":0");
     try checking.await(app.io());
 }
@@ -504,6 +536,7 @@ test "anole.App: an explicit 0.0.0.0 stays IPv4 only" {
         }
     };
     var checking = try app.io().concurrent(Check.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
     try app.listen("0.0.0.0:0");
     try checking.await(app.io());
 }
@@ -538,7 +571,9 @@ test "anole.App: metrics and health only on the listener named for them" {
             var r = stream.reader(io, &rbuf);
             var out: [8192]u8 = undefined;
             var fw: std.Io.Writer = .fixed(&out);
-            _ = r.interface.streamRemaining(&fw) catch {};
+            if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
+                if (r.err) |e| if (e == error.Canceled) return error.Canceled;
+            }
             return std.fmt.parseInt(u16, fw.buffered()[9..12], 10);
         }
 
@@ -557,6 +592,7 @@ test "anole.App: metrics and health only on the listener named for them" {
         }
     };
     var checking = try app.io().concurrent(Check.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
     try app.run();
     try checking.await(app.io());
 }
@@ -590,11 +626,14 @@ test "anole.App: an unsafe request marked as early data gets 425, HTTP/3 or not"
             var r = stream.reader(io_, &rbuf);
             var out: [1024]u8 = undefined;
             var fw: std.Io.Writer = .fixed(&out);
-            _ = r.interface.streamRemaining(&fw) catch {};
+            if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
+                if (r.err) |e| if (e == error.Canceled) return error.Canceled;
+            }
             try std.testing.expect(std.mem.startsWith(u8, fw.buffered(), "HTTP/1.1 425 "));
         }
     };
     var checking = try app.io().concurrent(Check.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
@@ -646,6 +685,7 @@ test "anole.App: listenTls(\":0\") serves HTTP/3 to 127.0.0.1 and ::1 on one soc
         }
     };
     var checking = try app.io().concurrent(Check.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
     try app.listenTls(":0", .dev_self_signed);
     try checking.await(app.io());
 }

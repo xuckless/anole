@@ -887,8 +887,9 @@ pub fn build(b: *std.Build) void {
         const run_lint = b.addRunArtifact(lint_exe);
         run_lint.setCwd(b.path("."));
         if (b.option(bool, "lint-tests", "zig build lint: check test code too") orelse false) run_lint.addArg("--tests");
+        if (b.option([]const u8, "lint-rules", "zig build lint: report only these rules (comma-separated, e.g. DOC)")) |r| run_lint.addArg(b.fmt("--rules={s}", .{r}));
         run_lint.addArg("src");
-        const lint_step = b.step("lint", "Check the sources against SAFETY.md (T1, U1, U3, C3)");
+        const lint_step = b.step("lint", "Check the sources against SAFETY.md (T1, U1, U3, C3) and doc-comment names (DOC)");
         lint_step.dependOn(&run_lint.step);
         const lint_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("tools/safety_lint.zig"), .target = b.graph.host, .optimize = .Debug }) });
         lint_step.dependOn(&b.addRunArtifact(lint_tests).step);

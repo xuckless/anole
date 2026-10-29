@@ -189,16 +189,44 @@ const Listener = struct {
     }
 };
 
+/// A private directory with a short path under /tmp, so a socket in it fits
+/// sun_path (104 bytes on macOS, 108 on Linux) wherever the test runs from.
+const ShortDir = struct {
+    buf: [32:0]u8,
+    len: usize,
+
+    extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
+
+    fn make() !ShortDir {
+        var d: ShortDir = .{ .buf = @splat(0), .len = 0 };
+        const template = "/tmp/anole-sd-XXXXXX";
+        @memcpy(d.buf[0..template.len], template);
+        d.len = template.len;
+        if (mkdtemp(&d.buf) == null) return error.MkdtempFailed;
+        return d;
+    }
+
+    /// `<dir>/<name>`, in `out`.
+    fn socketPath(d: *const ShortDir, out: []u8, name: []const u8) ![:0]const u8 {
+        return std.fmt.bufPrintSentinel(out, "{s}/{s}", .{ d.buf[0..d.len], name }, 0);
+    }
+
+    /// Removes the socket `name` and the directory.
+    fn remove(d: *const ShortDir, name: []const u8) void {
+        var out: [64]u8 = undefined;
+        if (d.socketPath(&out, name)) |p| {
+            _ = c.unlink(p.ptr);
+        } else |_| {}
+        _ = c.rmdir(&d.buf);
+    }
+};
+
 test "sd_notify: take keeps the socket and takes NOTIFY_SOCKET out of the environment" {
     if (comptime !supported) return error.SkipZigTest; // no systemd on Windows
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var cwd_buf: [256]u8 = undefined;
-    if (c.getcwd(&cwd_buf, cwd_buf.len) == null) return error.SkipZigTest;
-    const cwd = std.mem.sliceTo(&cwd_buf, 0);
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/.zig-cache/tmp/{s}/n", .{ cwd, tmp.sub_path });
-    if (path.len >= 104) return error.SkipZigTest;
+    const dir = try ShortDir.make();
+    defer dir.remove("n");
+    var path_buf: [64]u8 = undefined;
+    const path = try dir.socketPath(&path_buf, "n");
     const listener = try Listener.bind(path);
     defer listener.close();
 
@@ -223,16 +251,10 @@ test "sd_notify: take keeps the socket and takes NOTIFY_SOCKET out of the enviro
 
 test "sd_notify: a datagram to NOTIFY_SOCKET, by path and (Linux) by abstract name" {
     if (comptime !supported) return error.SkipZigTest; // no systemd on Windows
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    // The test's temporary directory is under the working directory.
-    var cwd_buf: [256]u8 = undefined;
-    if (c.getcwd(&cwd_buf, cwd_buf.len) == null) return error.SkipZigTest;
-    const cwd = std.mem.sliceTo(&cwd_buf, 0);
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/.zig-cache/tmp/{s}/notify", .{ cwd, tmp.sub_path });
-    // sun_path holds 104 bytes on macOS, 108 on Linux.
-    if (path.len >= 104) return error.SkipZigTest;
+    const dir = try ShortDir.make();
+    defer dir.remove("notify");
+    var path_buf: [64]u8 = undefined;
+    const path = try dir.socketPath(&path_buf, "notify");
     const listener = try Listener.bind(path);
     defer listener.close();
 

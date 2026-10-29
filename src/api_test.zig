@@ -18,7 +18,10 @@ fn get(io: std.Io, addr: std.Io.net.IpAddress, request: []const u8, out: []u8) !
     var rbuf: [1024]u8 = undefined;
     var r = stream.reader(io, &rbuf);
     var fw: std.Io.Writer = .fixed(out);
-    _ = r.interface.streamRemaining(&fw) catch {};
+    if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
+        // A cancel is handed on (SAFETY.md C3); anything else ends the read.
+        if (r.err) |e| if (e == error.Canceled) return error.Canceled;
+    }
     return fw.buffered();
 }
 
@@ -61,7 +64,7 @@ const Tenant = struct {
     }
 };
 
-test "anole.Server: status errors in JSON, an error_handler without a Ctx, bind, locals, CORS in a group (HTTP/1.1 and h2c)" {
+test "anole.Server: Options.errors = .json and an error_handler without a Ctx answer status errors (HTTP/1.1 and h2c)" {
     const gpa = std.testing.allocator;
     var app = try Server(void).init(gpa, .{
         .http = .{ .port = 0 },
@@ -70,12 +73,8 @@ test "anole.Server: status errors in JSON, an error_handler without a Ctx, bind,
         .error_handler = teapotOrDefault,
     }, {});
     defer app.deinit();
-    app.use(Tenant{});
     app.get("/key", Handlers.requireKey);
     app.get("/teapot", Handlers.teapot);
-    const api = app.group("/api", .{http.middleware.Cors.init(.{})});
-    api.post("/users", Handlers.create);
-    api.get("/users", Handlers.ok);
 
     var client_future = try app.io().concurrent(struct {
         fn run(a: *Server(void)) !void {
@@ -94,18 +93,99 @@ test "anole.Server: status errors in JSON, an error_handler without a Ctx, bind,
             try std.testing.expectEqualStrings("{\"error\":\"short and stout\"}", bodyOf(teapot));
 
             const missing = try get(io_, addr, "GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+            try std.testing.expect(std.mem.startsWith(u8, missing, "HTTP/1.1 404 "));
             try std.testing.expectEqualStrings("{\"error\":\"Not Found\"}", bodyOf(missing));
+
+            // The same over h2c, through the HTTP/2 engine's dispatch.
+            if (comptime features.http2) {
+                const conn = try anole.h2.ClientConnection.connect(gpa, io_, .{ .host = "localhost", .address = addr, .port = addr.getPort() });
+                defer conn.close();
+                const e = try conn.request(&.{
+                    .{ .name = ":method", .value = "GET" },  .{ .name = ":path", .value = "/key" },
+                    .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
+                }, .{});
+                defer e.release();
+                try e.waitHead();
+                try std.testing.expectEqual(@as(u16, 401), e.status);
+                const err_body = try e.reader().allocRemaining(gpa, .unlimited);
+                defer gpa.free(err_body);
+                try std.testing.expectEqualStrings("{\"error\":\"Unauthorized\"}", err_body);
+
+                const t = try conn.request(&.{
+                    .{ .name = ":method", .value = "GET" },  .{ .name = ":path", .value = "/teapot" },
+                    .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
+                }, .{});
+                defer t.release();
+                try t.waitHead();
+                try std.testing.expectEqual(@as(u16, 418), t.status);
+                const t_body = try t.reader().allocRemaining(gpa, .unlimited);
+                defer gpa.free(t_body);
+                try std.testing.expectEqualStrings("{\"error\":\"short and stout\"}", t_body);
+            }
+        }
+    }.run, .{&app});
+    defer client_future.cancel(app.io()) catch {};
+    try app.run();
+    try client_future.await(app.io());
+}
+
+test "anole.Server: req.bind answers 201 with request locals from middleware, and bad JSON is a 400" {
+    const gpa = std.testing.allocator;
+    var app = try Server(void).init(gpa, .{
+        .http = .{ .port = 0 },
+        .executors = .exact(1),
+        .errors = .json,
+    }, {});
+    defer app.deinit();
+    app.use(Tenant{});
+    app.post("/users", Handlers.create);
+
+    var client_future = try app.io().concurrent(struct {
+        fn run(a: *Server(void)) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const addr = a.addresses()[0].ip;
+            var out: [2048]u8 = undefined;
 
             const body = "{\"name\":\"ann\",\"unknown\":true}";
             var req_buf: [512]u8 = undefined;
-            const created = try get(io_, addr, try std.fmt.bufPrint(&req_buf, "POST /api/users HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }), &out);
+            const created = try get(io_, addr, try std.fmt.bufPrint(&req_buf, "POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }), &out);
             try std.testing.expect(std.mem.startsWith(u8, created, "HTTP/1.1 201 "));
-            try std.testing.expect(has(created, "Access-Control-Allow-Origin: *\r\n"));
             try std.testing.expectEqualStrings("{\"name\":\"ann\",\"tenant\":\"acme\"}", bodyOf(created));
 
-            const bad = try get(io_, addr, "POST /api/users HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{", &out);
+            const bad = try get(io_, addr, "POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{", &out);
             try std.testing.expect(std.mem.startsWith(u8, bad, "HTTP/1.1 400 "));
             try std.testing.expectEqualStrings("{\"error\":\"Bad Request\"}", bodyOf(bad));
+        }
+    }.run, .{&app});
+    defer client_future.cancel(app.io()) catch {};
+    try app.run();
+    try client_future.await(app.io());
+}
+
+test "anole.Server: CORS in a group answers a simple request and a preflight (HTTP/1.1 and h2c)" {
+    const gpa = std.testing.allocator;
+    var app = try Server(void).init(gpa, .{
+        .http = .{ .port = 0 },
+        .executors = .exact(2),
+    }, {});
+    defer app.deinit();
+    const api = app.group("/api", .{http.middleware.Cors.init(.{})});
+    api.get("/users", Handlers.ok);
+    api.post("/users", Handlers.ok);
+
+    var client_future = try app.io().concurrent(struct {
+        fn run(a: *Server(void)) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const addr = a.addresses()[0].ip;
+            var out: [2048]u8 = undefined;
+
+            const simple = try get(io_, addr, "GET /api/users HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\nConnection: close\r\n\r\n", &out);
+            try std.testing.expect(std.mem.startsWith(u8, simple, "HTTP/1.1 200 "));
+            try std.testing.expect(has(simple, "Access-Control-Allow-Origin: *\r\n"));
 
             const preflight = try get(io_, addr, "OPTIONS /api/users HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\n" ++
                 "Access-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: content-type\r\nConnection: close\r\n\r\n", &out);
@@ -113,11 +193,20 @@ test "anole.Server: status errors in JSON, an error_handler without a Ctx, bind,
             try std.testing.expect(has(preflight, "Access-Control-Allow-Methods: GET, HEAD, POST, PUT, PATCH, DELETE\r\n"));
             try std.testing.expect(has(preflight, "Access-Control-Allow-Headers: content-type\r\n"));
 
-            // The same preflight over h2c, through the HTTP/2 engine's
-            // dispatch.
+            // The same over h2c, through the HTTP/2 engine's dispatch.
             if (comptime features.http2) {
                 const conn = try anole.h2.ClientConnection.connect(gpa, io_, .{ .host = "localhost", .address = addr, .port = addr.getPort() });
                 defer conn.close();
+                const g = try conn.request(&.{
+                    .{ .name = ":method", .value = "GET" },                .{ .name = ":path", .value = "/api/users" },
+                    .{ .name = ":scheme", .value = "http" },               .{ .name = ":authority", .value = "localhost" },
+                    .{ .name = "origin", .value = "https://app.example" },
+                }, .{});
+                defer g.release();
+                try g.waitHead();
+                try std.testing.expectEqual(@as(u16, 200), g.status);
+                try std.testing.expectEqualStrings("*", g.header("access-control-allow-origin").?);
+
                 const s = try conn.request(&.{
                     .{ .name = ":method", .value = "OPTIONS" },                    .{ .name = ":path", .value = "/api/users" },
                     .{ .name = ":scheme", .value = "http" },                       .{ .name = ":authority", .value = "localhost" },
@@ -129,20 +218,10 @@ test "anole.Server: status errors in JSON, an error_handler without a Ctx, bind,
                 try std.testing.expectEqual(@as(u16, 204), s.status);
                 try std.testing.expectEqualStrings("*", s.header("access-control-allow-origin").?);
                 try std.testing.expectEqualStrings("x-a", s.header("access-control-allow-headers").?);
-
-                const e = try conn.request(&.{
-                    .{ .name = ":method", .value = "GET" },  .{ .name = ":path", .value = "/key" },
-                    .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
-                }, .{});
-                defer e.release();
-                try e.waitHead();
-                try std.testing.expectEqual(@as(u16, 401), e.status);
-                const err_body = try e.reader().allocRemaining(gpa, .unlimited);
-                defer gpa.free(err_body);
-                try std.testing.expectEqualStrings("{\"error\":\"Unauthorized\"}", err_body);
             }
         }
     }.run, .{&app});
+    defer client_future.cancel(app.io()) catch {};
     try app.run();
     try client_future.await(app.io());
 }
@@ -201,6 +280,7 @@ test "rateLimit: the 3rd request in a minute is 429, with Retry-After" {
             try std.testing.expect(has(limited, "Retry-After: "));
         }
     }.run, .{&app});
+    defer client_future.cancel(app.io()) catch {};
     try app.run();
     try client_future.await(app.io());
 }
@@ -277,38 +357,4 @@ test "public surface: Request, Response and websocket.Socket expose only the fie
     Allowed.check(http.Request, &Allowed.request_fields, &Allowed.request_decls);
     Allowed.check(http.Response, &Allowed.response_fields, &Allowed.response_decls);
     if (features.websocket) Allowed.check(anole.websocket.Socket, &Allowed.socket_fields, &Allowed.socket_decls);
-}
-
-test "doc comments: no dusty or core build-option names in public doc comments" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var dir = std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true }) catch return error.SkipZigTest;
-    defer dir.close(io);
-    var walker = try dir.walk(gpa);
-    defer walker.deinit();
-    var bad: usize = 0;
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
-        const text = dir.readFileAlloc(io, entry.path, gpa, .limited(16 << 20)) catch continue;
-        defer gpa.free(text);
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        var n: usize = 0;
-        while (lines.next()) |raw| {
-            n += 1;
-            const line = std.mem.trim(u8, raw, " \t");
-            if (!std.mem.startsWith(u8, line, "///") and !std.mem.startsWith(u8, line, "//!")) continue;
-            const names = std.mem.indexOf(u8, line, "dusty") != null or std.mem.indexOf(u8, line, "use_http2") != null or
-                std.mem.indexOf(u8, line, "use_tls") != null;
-            if (!names) continue;
-            // Attribution, and identifiers that still carry the name.
-            const allowed = [_][]const u8{ "Adapted from", "adapted from", "lalinsky/dusty", "xuckless/dusty", "LICENSE.dusty", "dusty_tls", "`dusty.", "dusty_mod", "`dusty`" };
-            const ok = for (allowed) |a| {
-                if (std.mem.indexOf(u8, line, a) != null) break true;
-            } else false;
-            if (ok) continue;
-            std.debug.print("{s}:{d}: {s}\n", .{ entry.path, n, line });
-            bad += 1;
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 0), bad);
 }

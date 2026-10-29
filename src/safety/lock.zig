@@ -280,10 +280,11 @@ test "lock: tryLock of a held mutex fails and counts nothing" {
     try std.testing.expectEqual(@as(usize, 0), heldLocks());
 }
 
-test "lock: a condition wait gives the lock back while it sleeps" {
+test "lock: a condition wait on its own mutex is not a wait while holding (L2), and the lock counts again after" {
     var m: Mutex(.leaf) = .init;
     var c: Condition = .init;
     try m.lock(std.testing.io);
+    // The 1 ms is time passing on purpose: a timeout or a wake both end it.
     c.waitTimeout(std.testing.io, &m, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }) catch |err| switch (err) {
         error.Timeout => {},
         else => return err,

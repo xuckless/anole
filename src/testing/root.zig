@@ -918,7 +918,7 @@ test "client: 422 problem document; expectViolation finds the field and code" {
     try res.expectViolation("tags[1]", "validation.not_empty");
 }
 
-test "client: global and group middleware run (RequestId with trust_incoming echoes X-Request-Id)" {
+test "client: global middleware runs (RequestId with trust_incoming echoes X-Request-Id)" {
     var app = try testApp();
     defer app.deinit();
     app.use(anole.middleware.RequestId.init(.{ .trust_incoming = true }));
@@ -1068,20 +1068,23 @@ test "LogCapture: req.log() in json format carries request_id from X-Request-Id"
 test "client: sqlite :memory: connector is started" {
     if (comptime !anole.features.sqlite) return error.SkipZigTest;
     const Db = struct {
+        var handle: ?*anole.sqlite.Client = null;
         fn count(req: *anole.Request, res: *anole.Response) !void {
-            _ = req;
-            res.body = "ok";
+            const n = try handle.?.one(i64, req, "SELECT 40 + 2", .{});
+            try res.print(.text, "{d}", .{n});
         }
     };
     var app = try testApp();
     defer app.deinit();
-    _ = try app.sqlite(":memory:");
+    Db.handle = try app.sqlite(":memory:");
+    defer Db.handle = null;
     app.get("/count", Db.count);
     var t = try client(&app);
     defer t.deinit();
     var res = try t.get("/count", .{});
     defer res.deinit();
     try res.expectStatus(.ok);
+    try res.expectBody("42");
 }
 
 test "app.sse: a subscriber over the in-memory client sees published events with ids, and closing leaves the topic" {

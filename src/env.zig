@@ -240,11 +240,14 @@ test "env: ANOLE_ENV in a file is dropped and noted" {
     try testing.expectEqual(1, files.entries.count());
 }
 
-test "env: defaultFiles" {
-    // Empty in tests, whatever the environment.
+test "env: development reads the four .env files in order, production none" {
+    const dev = defaultFilesFor(.development);
+    const want = [_][]const u8{ ".env.development.local", ".env.local", ".env.development", ".env" };
+    try testing.expectEqual(want.len, dev.len);
+    for (want, dev) |w, d| try testing.expectEqualStrings(w, d);
+    try testing.expectEqual(0, defaultFilesFor(.production).len);
+    // A test build reads none, whatever the environment.
     try testing.expectEqual(0, defaultFiles(.development).len);
-    try testing.expectEqual(0, defaultFiles(.production).len);
-    try testing.expectEqual(4, development_files.len);
 }
 
 test "env: get prefers the process environment" {
