@@ -232,7 +232,7 @@ test "lambda_zip: round trip through std.zip, with modes" {
     try testing.expectEqual(entries.len, seen);
 }
 
-test "lambda_zip: two runs give identical bytes" {
+test "lambda_zip: the headers carry the fixed 1980-01-01 stamp, so two runs give identical bytes" {
     const entries = [_]Entry{
         .{ .name = "bootstrap", .data = &@as([1000]u8, @splat('x')), .mode = 0o755 },
         .{ .name = "b", .data = "bb" },
@@ -242,6 +242,28 @@ test "lambda_zip: two runs give identical bytes" {
     var b = try build(&entries);
     defer b.deinit();
     try testing.expectEqualSlices(u8, a.written(), b.written());
+
+    // The contract that makes the bytes reproducible: every local and
+    // central header carries the fixed DOS stamp 1980-01-01 00:00:00
+    // (date 0x0021, time 0), never the clock.
+    const z = a.written();
+    const eocd = z[z.len - 22 ..];
+    try testing.expectEqual(@as(u32, 0x06054b50), std.mem.readInt(u32, eocd[0..4], .little));
+    const count = std.mem.readInt(u16, eocd[10..12], .little);
+    try testing.expectEqual(@as(u16, entries.len), count);
+    var off: usize = std.mem.readInt(u32, eocd[16..20], .little);
+    for (0..count) |_| {
+        const c = z[off..];
+        try testing.expectEqual(@as(u32, 0x02014b50), std.mem.readInt(u32, c[0..4], .little));
+        try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, c[12..14], .little));
+        try testing.expectEqual(@as(u16, 0x0021), std.mem.readInt(u16, c[14..16], .little));
+        const local = z[std.mem.readInt(u32, c[42..46], .little)..];
+        try testing.expectEqual(@as(u32, 0x04034b50), std.mem.readInt(u32, local[0..4], .little));
+        try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, local[10..12], .little));
+        try testing.expectEqual(@as(u16, 0x0021), std.mem.readInt(u16, local[12..14], .little));
+        off += 46 + @as(usize, std.mem.readInt(u16, c[28..30], .little)) +
+            std.mem.readInt(u16, c[30..32], .little) + std.mem.readInt(u16, c[32..34], .little);
+    }
 }
 
 test "lambda_zip: absolute names, .. and backslashes are refused" {
@@ -252,7 +274,7 @@ test "lambda_zip: absolute names, .. and backslashes are refused" {
     }
 }
 
-test "lambda_zip: spec parsing" {
+test "lambda_zip: name=path[:mode] parses, mode defaults to 644, a spec without = is refused" {
     const a = try parseSpec("bootstrap=zig-out/bin/app:755");
     try testing.expectEqualStrings("bootstrap", a.name);
     try testing.expectEqualStrings("zig-out/bin/app", a.path);

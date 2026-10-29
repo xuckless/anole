@@ -490,13 +490,13 @@ test "init takes no directory" {
     try testing.expectError(error.ConflictingDependency, parseInitArgs(&.{ "--anole", "main", "--anole-path", "../anole" }));
 }
 
-test "placeholders" {
+test "template placeholders: {{name}} is replaced, other braces are left" {
     const out = try substitute(testing.allocator, "name={{name}} again={{name}} keep={{other}} {name}", "my_api");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("name=my_api again=my_api keep={{other}} {name}", out);
 }
 
-test "arguments" {
+test "anole new: arguments parse with defaults, and each mistake is refused by name" {
     const ok = try parseNewArgs(&.{ "app", "--template", "grpc", "--no-fetch", "--force" });
     try testing.expectEqualStrings("app", ok.dir);
     try testing.expectEqualStrings("grpc", ok.template);
@@ -515,7 +515,12 @@ test "an unknown template is not found" {
 
 test "index lists every template file" {
     const io = testing.io;
-    var root = Io.Dir.cwd().openDir(io, "templates", .{ .iterate = true }) catch return error.SkipZigTest;
+    // `zig build cli-test` runs this at the repository root (setCwd in
+    // build.zig); a missing templates/ is a failure, not a skip.
+    var root = Io.Dir.cwd().openDir(io, "templates", .{ .iterate = true }) catch |err| {
+        std.debug.print("templates/ not found from the cwd ({t}); run through zig build cli-test\n", .{err});
+        return err;
+    };
     defer root.close(io);
     var walker = try root.walk(testing.allocator);
     defer walker.deinit();

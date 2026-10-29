@@ -1897,7 +1897,11 @@ pub fn build(b: *std.Build) void {
         b.step("cli", "Build and install the anole command line (zig-out/bin/anole)").dependOn(&install_cli.step);
 
         const cli_tests = addSafeTest(b, .{ .name = "anole-cli-test", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize, null) });
-        b.step("cli-test", "Run the anole command line's unit tests").dependOn(&b.addRunArtifact(cli_tests).step);
+        // The index test walks templates/ from the cwd: run it at the
+        // repository root whatever directory zig build was started from.
+        const run_cli_tests = b.addRunArtifact(cli_tests);
+        run_cli_tests.setCwd(b.path("."));
+        b.step("cli-test", "Run the anole command line's unit tests").dependOn(&run_cli_tests.step);
 
         const dist = b.step("cli-dist", "Cross-build the anole binaries for five targets and SHA256SUMS into zig-out/dist");
         const sums_exe = b.addExecutable(.{ .name = "anole-sums", .root_module = b.createModule(.{
