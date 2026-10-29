@@ -106,6 +106,55 @@ pub fn idle(gpa: std.mem.Allocator, io: std.Io) !void {
     try pingPong(io, &server_side, &client_side, 10, true);
 }
 
+/// The client sends several small records in one flight, then nothing
+/// until the server has read: the server's first read, with room for all
+/// of them, returns all of their plaintext in that one call, and returns
+/// rather than wait for more.
+pub fn batched(gpa: std.mem.Allocator, io: std.Io) !void {
+    var pem = try selfSigned(gpa, .{});
+    defer pem.deinit(gpa);
+    var auth = try tls.config.CertKeyPair.fromSlice(gpa, io, pem.cert, pem.key);
+    defer auth.deinit(gpa);
+
+    const listen_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try listen_addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+
+    var server_side: Side = undefined;
+    var client_side: Side = undefined;
+    var accept_future = try io.concurrent(acceptAndHandshake, .{ io, &listener, &server_side, &auth });
+    defer _ = accept_future.cancel(io) catch {};
+    try connectAndHandshake(io, listener.socket.address, &client_side);
+    try accept_future.await(io);
+    defer {
+        client_side.conn.deinit();
+        client_side.stream.close(io);
+        server_side.conn.deinit();
+        server_side.stream.close(io);
+    }
+
+    // Six records of 100 bytes: with no buffer in the writer, each slice
+    // is an SSL_write of its own, and the one flush at the end of the
+    // drain sends them in one socket write. Their ciphertext (under 1 KiB)
+    // is one segment on loopback, so it arrives whole.
+    const count = 6;
+    const len = 100;
+    var plain: [count * len]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = expectedByte(client_side.id, i);
+    var slices: [count][]const u8 = undefined;
+    for (&slices, 0..) |*s, i| s.* = plain[i * len ..][0..len];
+    var w = client_side.conn.writer(&.{});
+    try w.interface.writeVecAll(&slices);
+
+    var got: [count * len + 1000]u8 = undefined;
+    var r = server_side.conn.reader(&.{});
+    var vec = [_][]u8{&got};
+    // One underlying read (`readVec` on a reader with no buffer).
+    const n = try r.interface.readVec(&vec);
+    try std.testing.expectEqual(plain.len, n);
+    try std.testing.expectEqualSlices(u8, &plain, got[0..n]);
+}
+
 /// `from` sends `len` bytes and `to` reads them; then `from`, and if
 /// `check_reader` `to` too, must hold no ciphertext buffer.
 fn pingPong(io: std.Io, from: *Side, to: *Side, len: usize, check_reader: bool) !void {
