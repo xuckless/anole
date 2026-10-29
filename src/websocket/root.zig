@@ -291,6 +291,9 @@ pub const Socket = struct {
     /// `abort_cancels_h1_reader`), which `abortConnection` cancels; null
     /// over HTTP/1.1 elsewhere and off zio.
     _task: ?placement.Task = null,
+    /// Over HTTP/1.1 from `upgrade` (a handler's own loop): the reader's
+    /// window, sized to the load. Unused otherwise.
+    _read: UpgradedWindow = .{},
 
     /// Which protocol a socket runs on. The sockets it points at are
     /// internal: they hand over permessage-deflate messages still
@@ -329,6 +332,7 @@ pub const Socket = struct {
     /// than through a call for each layer, which costs an echo loop about a
     /// tenth of its CPU.
     pub fn receive(self: *Socket) !Message {
+        if (self._read.conn != null) self._read.between(self._conn.h1.transport.reader);
         return @call(.always_inline, finishMessage, .{ self, switch (self._conn) {
             inline else => |ws| try @call(.always_inline, @TypeOf(ws.*).receive, .{ws}),
         } });
@@ -475,6 +479,7 @@ pub const Socket = struct {
         }
         if (self._drain_watch) |w| w.stop();
         if (comptime features.compression) if (self._deflate) |d| d.deinit();
+        if (self._read.conn != null) self._read.release(self._conn.h1.transport.reader);
         switch (self._conn) {
             inline else => |ws| ws.deinit(),
         }
@@ -648,6 +653,10 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         ws.max_message_size = max_message;
         ws.rsv1_allowed = negotiated;
         socket._conn = .{ .h1 = ws };
+        // A callback socket sizes its window per run (`ReadWindow`).
+        if (owner == null) if (res._conn) |conn| {
+            socket._read = .init(conn, ws.transport.reader);
+        };
     }
     req.setDeadline(options.timeout);
     if (options.close_on_drain) if (req._drain_hooks) |hooks| {
@@ -1078,6 +1087,128 @@ const ReadWindow = struct {
         const b = w.block orelse return;
         w.block = null;
         std.debug.assert(r.buffer.ptr != b.ptr);
+        read_blocks.give(b);
+    }
+};
+
+/// `ReadWindow` for a socket from `upgrade` over HTTP/1.1, which a
+/// handler's own loop reads (`Socket.next`, `receive`), sized to its load
+/// between messages (#85) with the same triggers and hysteresis. That
+/// socket's reader reads into the connection's request read buffer, which
+/// it holds for its life, narrowed by `shrinkForUpgrade` to a small window
+/// past the head with the rest of its pages given back. So no block here:
+/// while the peer streams the view is widened again to the end of that
+/// buffer (`Connection.widenUpgradedReader`), and after `busy_reads` quiet
+/// waits narrowed again (`narrowUpgradedReader`, one madvise per busy
+/// spell, never one per message). Only where the widened view would be
+/// smaller than `read_block_len` (a small `request.buffer_size`) does it
+/// read into a pooled block instead.
+///
+/// owner: the `Socket`, used only by the task that reads it. A block it
+/// took goes back at a quiet wait or in `Socket.deinit` (`release`), the
+/// reader pointed at its small window again first; a handler that never
+/// deinits its socket leaks the block, never frees it under the reader.
+const UpgradedWindow = struct {
+    conn: ?*dusty.Connection = null,
+    /// The reader's view as `shrinkForUpgrade` left it (as the last
+    /// narrowing did): what it goes back to.
+    small: []u8 = &.{},
+    how: enum { widen, block } = .widen,
+    /// The reader reads into the widened view or the block.
+    grown: bool = false,
+    block: ?[]u8 = null,
+    /// Waits for the peer left before the window narrows again.
+    busy: u8 = 0,
+    /// Times the window narrowed again after a busy spell (each one
+    /// madvise): for diagnostics and tests.
+    narrowed: u32 = 0,
+
+    fn init(conn: *dusty.Connection, r: *std.Io.Reader) UpgradedWindow {
+        return .{
+            .conn = conn,
+            .small = r.buffer,
+            .how = if (conn.upgradedReaderRoom() >= read_block_len) .widen else .block,
+        };
+    }
+
+    /// Before each message: grows the window if the socket is busy, and at
+    /// a wait for the peer (nothing buffered) reads from its front and
+    /// counts down to narrowing it.
+    fn between(w: *UpgradedWindow, r: *std.Io.Reader) void {
+        if (loaded(r, w.small.len)) {
+            w.busy = ReadWindow.busy_reads;
+            if (!w.grown) w.grow(r);
+        }
+        if (r.bufferedLen() != 0) return;
+        r.seek = 0;
+        r.end = 0;
+        if (!w.grown) return;
+        if (w.busy > 1) {
+            w.busy -= 1;
+            return;
+        }
+        w.busy = 0;
+        w.shrink(r);
+    }
+
+    /// Whether the reads since the last wait brought at least `small`
+    /// bytes, or the next frame is bigger than that.
+    fn loaded(r: *std.Io.Reader, small: usize) bool {
+        if (r.end >= small) return true;
+        const frame = ReadWindow.announcedFrame(r.buffered()) orelse return false;
+        return frame > small;
+    }
+
+    fn grow(w: *UpgradedWindow, r: *std.Io.Reader) void {
+        switch (w.how) {
+            .widen => w.grown = w.conn.?.widenUpgradedReader(),
+            .block => {
+                const buffered = r.buffered();
+                if (buffered.len >= read_block_len) return;
+                // Out of memory: the small window still works.
+                const b = read_blocks.take() orelse return;
+                @memcpy(b[0..buffered.len], buffered);
+                r.buffer = b;
+                r.seek = 0;
+                r.end = buffered.len;
+                w.block = b;
+                w.grown = true;
+            },
+        }
+    }
+
+    /// With nothing buffered: the small window back.
+    fn shrink(w: *UpgradedWindow, r: *std.Io.Reader) void {
+        std.debug.assert(r.bufferedLen() == 0);
+        w.grown = false;
+        w.narrowed += 1;
+        switch (w.how) {
+            .widen => {
+                w.conn.?.narrowUpgradedReader();
+                w.small = r.buffer;
+            },
+            .block => {
+                r.buffer = w.small;
+                r.seek = 0;
+                r.end = 0;
+                read_blocks.give(w.block.?);
+                w.block = null;
+            },
+        }
+    }
+
+    /// As the socket goes: a block back, the reader on its small window
+    /// with what fits of what it held. A widened view stays: the request's
+    /// buffers go back to their pool with the connection.
+    fn release(w: *UpgradedWindow, r: *std.Io.Reader) void {
+        const b = w.block orelse return;
+        const keep = r.buffered()[0..@min(r.bufferedLen(), w.small.len)];
+        std.mem.copyForwards(u8, w.small[0..keep.len], keep);
+        r.buffer = w.small;
+        r.seek = 0;
+        r.end = keep.len;
+        w.block = null;
+        w.grown = false;
         read_blocks.give(b);
     }
 };

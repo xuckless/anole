@@ -22,6 +22,13 @@ var last_end_error: std.atomic.Value(bool) = .init(false);
 var last_socket: std.atomic.Value(?*websocket.Socket) = .init(null);
 /// The most read blocks `Watched` saw held during one of its callbacks.
 var blocks_seen: std.atomic.Value(usize) = .init(0);
+/// `watchedLoop`'s reader window: right after the upgrade, the widest it
+/// saw at a message, and at the last message.
+var first_window: std.atomic.Value(usize) = .init(0);
+var widest_window: std.atomic.Value(usize) = .init(0);
+var last_window: std.atomic.Value(usize) = .init(0);
+/// Times `watchedLoop`'s window had narrowed again, at its last message.
+var last_narrowed: std.atomic.Value(u32) = .init(0);
 /// Tasks the callbacks started, joined by the test.
 var background: std.Io.Group = .init;
 
@@ -32,6 +39,10 @@ fn resetCounts() void {
     last_end_error.store(false, .release);
     last_socket.store(null, .release);
     blocks_seen.store(0, .release);
+    first_window.store(0, .release);
+    widest_window.store(0, .release);
+    last_window.store(0, .release);
+    last_narrowed.store(0, .release);
 }
 
 /// Per-socket state, in `context`.
@@ -87,6 +98,20 @@ const Watched = struct {
         try ws.send(msg.type, msg.data);
     }
 };
+
+/// The loop API's echo, noting how wide its reader's window is: the reader
+/// reads straight into it (or into a read block, where the request
+/// buffers are too small to widen).
+fn watchedLoop(ws: *websocket.Socket) !void {
+    const r = ws._conn.h1.transport.reader;
+    first_window.store(r.buffer.len, .release);
+    while (try ws.next()) |msg| {
+        _ = widest_window.fetchMax(r.buffer.len, .acq_rel);
+        last_window.store(r.buffer.len, .release);
+        last_narrowed.store(ws._read.narrowed, .release);
+        try ws.send(msg.type, msg.data);
+    }
+}
 
 /// A WebSocket client over a plain or TLS connection, masked frames with a
 /// zero key, short payloads.
@@ -268,6 +293,7 @@ const Fixture = struct {
         self.server.router.get("/quiet", websocket.callbacks(void, Echo, .{ .close_on_drain = false }));
         self.server.router.get("/loop", websocket.route(void, loopEcho, .{}));
         self.server.router.get("/watched", websocket.callbacks(void, Watched, .{}));
+        self.server.router.get("/watched-loop", websocket.route(void, watchedLoop, .{}));
         self.server.router.get("/brief", websocket.callbacks(void, Echo, .{ .timeout = .{ .duration = .{ .raw = .fromMilliseconds(400), .clock = .awake } } }));
         self.future = try self.io.concurrent(struct {
             fn run(s: *Server) anyerror!void {
@@ -649,6 +675,59 @@ test "WebSocket callbacks: a busy socket waiting on its task gives its read bloc
         try c.expectText("quiet");
     }
     try std.testing.expectEqual(0, websocket._readBlocksHeld());
+}
+
+/// `burst` with a 64 KiB message over TLS to the loop API, on a server
+/// with `config`; the reader's window must have grown on the way.
+fn loopBurstOverTls(config: dusty.ServerConfig) !void {
+    if (!have_tls) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(gpa, true, config);
+    defer f.deinit(gpa);
+
+    var c: Client = undefined;
+    try c.open(f.io, f.server.address.ip, true, "/watched-loop");
+    defer c.close(f.io);
+    const big = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate((i *% 131) +% (i >> 8));
+    try burst(&c, 200, big);
+    // The burst widened the window on the way, or this test proves
+    // nothing about the switch.
+    try std.testing.expect(widest_window.load(.acquire) > first_window.load(.acquire));
+}
+
+test "WebSocket loop: small messages around a 64 KiB one arrive whole and in order, over TLS" {
+    try loopBurstOverTls(quick);
+}
+
+test "WebSocket loop: small messages around a 64 KiB one arrive whole and in order, over TLS, with small request buffers" {
+    // Too small to widen into a whole record: a read block instead.
+    try loopBurstOverTls(.{ .timeout = quick.timeout, .request = .{ .buffer_size = 4096 } });
+    try std.testing.expectEqual(0, websocket._readBlocksHeld());
+}
+
+test "WebSocket loop: after the peer goes quiet the reader's window is narrow again" {
+    const gpa = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.start(gpa, false, quick);
+    defer f.deinit(gpa);
+
+    var c: Client = undefined;
+    try c.open(f.io, f.server.address.ip, false, "/watched-loop");
+    defer c.close(f.io);
+    try burst(&c, 200, null);
+    try std.testing.expect(widest_window.load(.acquire) > first_window.load(.acquire));
+    // One small message at a time, each answered before the next: twice as
+    // many waits for the peer as a busy socket keeps its room for (8).
+    for (0..16) |_| {
+        try c.send(0x1, "quiet");
+        try c.expectText("quiet");
+    }
+    try std.testing.expectEqual(first_window.load(.acquire), last_window.load(.acquire));
+    // Narrowed (one madvise) once for the busy spell, not per message.
+    try std.testing.expectEqual(1, last_narrowed.load(.acquire));
 }
 
 /// Peers that go away without a close frame, each way: a FIN or a RST,

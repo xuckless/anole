@@ -610,12 +610,30 @@ pub const Connection = struct {
     /// send (`transport`, `Transport.write_buffers`). Before anything is
     /// written to the connection after the head was read.
     pub fn shrinkForUpgrade(self: *Connection) void {
-        const r = self.reader;
         // Not reading from the pooled buffer (a test's fixed reader), or
         // the writer holds something already.
-        if (self.read_buffer.len == 0 or self.writer.end != 0) return;
+        if (self.writer.end != 0 or !self.readerRunsToEnd()) return;
+        self.narrowReader();
+    }
+
+    /// Whether the reader's view lies in `read_buffer` and runs to its end:
+    /// a head's leftover room (`parseHeaders`), or a view `widenUpgradedReader`
+    /// widened. False off the pooled buffer (a test's fixed reader).
+    fn readerRunsToEnd(self: *const Connection) bool {
+        if (self.read_buffer.len == 0) return false;
+        const r = self.reader;
         const read_end = @intFromPtr(self.read_buffer.ptr) + self.read_buffer.len;
-        if (@intFromPtr(r.buffer.ptr) < @intFromPtr(self.read_buffer.ptr) or @intFromPtr(r.buffer.ptr) + r.buffer.len != read_end) return;
+        return @intFromPtr(r.buffer.ptr) >= @intFromPtr(self.read_buffer.ptr) and @intFromPtr(r.buffer.ptr) + r.buffer.len == read_end;
+    }
+
+    /// The narrowing `shrinkForUpgrade` and `narrowUpgradedReader` share: the
+    /// reader's view (one that `readerRunsToEnd`) moves what it holds to its
+    /// front and shrinks to the end of that page (or of the next, when
+    /// that leaves less than `upgrade_window_min`), and the pages of the
+    /// read buffer past it go back to the OS (Linux, `MADV_DONTNEED`).
+    fn narrowReader(self: *Connection) void {
+        const r = self.reader;
+        const read_end = @intFromPtr(self.read_buffer.ptr) + self.read_buffer.len;
 
         // What is buffered past the head, to the front of the reader's view.
         const buffered_len = r.end - r.seek;
@@ -636,6 +654,43 @@ pub const Connection = struct {
         const to = std.mem.alignBackward(usize, read_end, page);
         if (to <= end) return;
         _ = std.os.linux.madvise(@ptrFromInt(end), to - end, std.os.linux.MADV.DONTNEED);
+    }
+
+    /// How long the reader's view of an upgraded connection would be once
+    /// widened (`widenUpgradedReader`): to the end of `read_buffer`, or as
+    /// it is when it is not a view into it.
+    pub fn upgradedReaderRoom(self: *const Connection) usize {
+        const r = self.reader;
+        const base = @intFromPtr(self.read_buffer.ptr);
+        const start = @intFromPtr(r.buffer.ptr);
+        if (self.read_buffer.len == 0 or start < base or start >= base + self.read_buffer.len) return r.buffer.len;
+        return base + self.read_buffer.len - start;
+    }
+
+    /// For an upgraded connection whose peer streams (a busy WebSocket):
+    /// the reader's view, which `shrinkForUpgrade` narrowed, runs to the end
+    /// of `read_buffer` again, what it holds kept in place; the pages past
+    /// the window fault back in as reads reach them. Nothing else lives
+    /// there: the head is before the window, the arena's chunks are outside
+    /// `read_buffer`, and an upgraded connection serves no other request.
+    /// False, with nothing changed, when the view already runs to the end
+    /// or is not in `read_buffer`. The reading task only.
+    pub fn widenUpgradedReader(self: *Connection) bool {
+        const room = self.upgradedReaderRoom();
+        const r = self.reader;
+        if (room <= r.buffer.len or self.read_buffer.len == 0) return false;
+        r.buffer = r.buffer.ptr[0..room];
+        return true;
+    }
+
+    /// Undoes `widenUpgradedReader` once the peer is quiet again: the small
+    /// window back, the tail's pages back to the OS (`narrowReader`). With
+    /// at most a small window's worth buffered, so the window comes out as
+    /// small as the upgrade left it. The reading task only.
+    pub fn narrowUpgradedReader(self: *Connection) void {
+        std.debug.assert(self.reader.bufferedLen() <= upgrade_window_min);
+        if (!self.readerRunsToEnd()) return;
+        self.narrowReader();
     }
 
     /// Once the 101 of an upgrade is out: the connection is the upgraded
