@@ -435,6 +435,14 @@ pub const Conn = struct {
     }
 
     /// Bytes queued and not yet written.
+    /// Test builds: the bytes the connection's spare send chunk holds (0:
+    /// none). On its executor, with nothing being sent.
+    pub fn testSpare(c: *const Conn) usize {
+        if (!builtin.is_test) @compileError("Conn.testSpare is for tests");
+        const t = c.tc();
+        return if (t.spare) |sp| sp.capacity() else 0;
+    }
+
     pub fn queued(c: *const Conn) usize {
         return c.tc().queued.load(.acquire);
     }
@@ -1117,6 +1125,13 @@ const TcpConn = struct {
     reader_task: if (native_os == .windows) ?placement.Task else void = if (native_os == .windows) null else {},
 
     const linger: Duration = .fromSeconds(2);
+
+    /// `linger`, or in test builds `test_linger` when set (a graceful
+    /// close's wait for the peer, cut short).
+    fn lingerFor() Duration {
+        if (builtin.is_test) if (test_linger) |d| return d;
+        return linger;
+    }
 
     // -- Start and release ---------------------------------------------------
 
@@ -2017,7 +2032,7 @@ const TcpConn = struct {
         if (!t.close_graceful.load(.acquire)) return;
         // The reading side drops input until the peer ends: a bound on it.
         if (!canceled and t.over.load(.acquire) == 0) {
-            io.futexWaitTimeout(u32, &t.over.raw, 0, .{ .duration = .{ .raw = linger, .clock = .awake } }) catch io.recancel();
+            io.futexWaitTimeout(u32, &t.over.raw, 0, .{ .duration = .{ .raw = lingerFor(), .clock = .awake } }) catch io.recancel();
         }
         if (t.over.load(.acquire) == 0) {
             t.shutdownSocket(.both);
@@ -2525,6 +2540,8 @@ pub const TestHold = struct {
 pub var test_hold: if (builtin.is_test) std.atomic.Value(?*TestHold) else void = if (builtin.is_test) .init(null) else {};
 /// Waits of a paused connection's task for `resumeReading` (test builds only).
 pub var test_paused_waits: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {};
+/// Test builds: replaces the 2 s a graceful close waits for the peer.
+pub var test_linger: if (builtin.is_test) ?Duration else void = if (builtin.is_test) null else {};
 /// Waits of a writer in `waitUnder` (test builds only).
 pub var test_write_waits: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {};
 /// Driver tasks started (test builds only).

@@ -1557,3 +1557,119 @@ test "net tcp: a task waiting in waitWritable when the connection is released an
         }
     }.run);
 }
+
+// -- Third review (s15/net).
+
+/// A paused connection (its task waiting for a resume) closed gracefully,
+/// with a peer that sends nothing more: the close's wait for the peer
+/// (cut short here) ends it.
+const PausedClose = struct {
+    var conn: std.atomic.Value(?*net.Conn) = .init(null);
+    var closed: std.atomic.Value(u32) = .init(0);
+
+    pub fn data(c: *net.Conn, _: []const u8) !void {
+        c.pauseReading();
+        conn.store(c, .release);
+    }
+    pub fn close(_: *net.Conn, _: net.CloseReason) void {
+        _ = closed.fetchAdd(1, .release);
+    }
+};
+
+test "net tcp: a graceful close of a paused connection whose peer sends nothing ends it" {
+    PausedClose.conn.store(null, .monotonic);
+    PausedClose.closed.store(0, .monotonic);
+    tcp.test_paused_waits.store(0, .monotonic);
+    tcp.test_linger = .fromMilliseconds(1);
+    defer tcp.test_linger = null;
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", PausedClose, .{});
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            try s.writer().writeAll("a");
+            try s.writer().flush();
+            const c = try waitConn(a.io(), "the connection paused", &PausedClose.conn);
+            try s.writer().writeAll("b");
+            try s.writer().flush();
+            try wait.waitAtLeast(a.io(), "the task waits for a resume", &tcp.test_paused_waits, 1);
+            c.close();
+            try waitFor(a.io(), &PausedClose.closed, 1);
+        }
+    }.run);
+}
+
+/// Sends from another thread (each its own chunk, as the C ABI's writes)
+/// leave no spare chunk; nor does an owner send to a parked connection.
+const SpareKeep = struct {
+    var conn: std.atomic.Value(?*net.Conn) = .init(null);
+    pub fn open(c: *net.Conn) !void {
+        conn.store(c, .release);
+    }
+    pub fn data(c: *net.Conn, bytes: []const u8) !void {
+        _ = try c.send(bytes);
+    }
+    pub fn close(_: *net.Conn, _: net.CloseReason) void {
+        conn.store(null, .release);
+    }
+
+    fn sender(c: *net.Conn) void {
+        const piece: [8 * 1024]u8 = @splat('s');
+        for (0..4) |_| _ = c.send(&piece) catch {};
+    }
+
+    fn drained(c: *net.Conn) bool {
+        return c.queued() == 0;
+    }
+};
+
+test "net tcp: sends from another thread leave the connection no spare chunk" {
+    SpareKeep.conn.store(null, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", SpareKeep, .{});
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            const c = try waitConn(a.io(), "the connection opened", &SpareKeep.conn);
+            const th = try std.Thread.spawn(.{}, SpareKeep.sender, .{c});
+            th.join();
+            var buf: [8 * 1024]u8 = undefined;
+            var got: usize = 0;
+            while (got < 4 * buf.len) got += try readSome(s, buf[0..@min(buf.len, 4 * buf.len - got)]);
+            try wait.waitUntil(a.io(), "the queue is empty", c, SpareKeep.drained);
+            try std.testing.expectEqual(@as(usize, 0), c.testSpare());
+        }
+    }.run);
+}
+
+test "net tcp: a parked connection keeps no spare chunk after an owner send" {
+    SpareKeep.conn.store(null, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1), .timeouts = .{ .idle_park = .fromMilliseconds(5) } });
+    defer app.deinit();
+    if (!app.server.parksIdle()) return error.SkipZigTest;
+    try app.tcp("127.0.0.1:0", SpareKeep, .{});
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            const c = try waitConn(a.io(), "the connection opened", &SpareKeep.conn);
+            try s.writer().writeAll("a");
+            try s.writer().flush();
+            try expectRead(s, "a");
+            try wait.waitUntil(a.io(), "the connection parked", a, struct {
+                fn one(ap: *App) bool {
+                    return ap.server.parkedConnections() >= 1;
+                }
+            }.one);
+            // From this task, on the connection's executor: the owner's send.
+            _ = try c.send("while parked");
+            try expectRead(s, "while parked");
+            try wait.waitUntil(a.io(), "the queue is empty", c, SpareKeep.drained);
+            try std.testing.expectEqual(@as(usize, 0), c.testSpare());
+        }
+    }.run);
+}
