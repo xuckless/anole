@@ -47,6 +47,7 @@ concurrency:
 
 jobs:
   fmt:
+    # K2: catches formatting drift, in seconds, before any dependency is fetched; also the live-coverage check (no zig).
     # zig fmt over everything but the generated gRPC code; no dependency
     # fetch, so this fails in seconds (S1.5, research/s15/small-fixes.md).
     runs-on: ubuntu-latest
@@ -58,8 +59,13 @@ jobs:
           version: 0.17.0
       - name: zig fmt --check
         run: zig fmt --check build.zig build.zig.zon build src tests examples tools templates bench --exclude tests/grpc/gen --exclude examples/grpc/gen
+      # Every test gated on a live-server URL must be reached by a live
+      # step's filter (TESTING.md, research/s15/test-audit.md T10).
+      - name: Live-test coverage
+        run: python3 -I tools/live_coverage.py
 
   test:
+    # K2: catches the suite on the two first-class platforms (epoll/io_uring vs kqueue); the configure paths of the minimal profile; compile-only for web, tls=none, h3-without-h2.
     name: test (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -88,15 +94,17 @@ jobs:
       - name: Profile minimal (no C library besides llhttp)
         timeout-minutes: 15
         run: zig build test -Dprofile=minimal --test-timeout 120s --summary all
-      - name: Profile web (BoringSSL + nghttp2, no HTTP/3)
+      # These three catch a configure-path error, which compiling catches;
+      # the suites they would run are run by the steps above and by flags.
+      - name: Profile web compiles (BoringSSL + nghttp2, no HTTP/3)
         timeout-minutes: 23
-        run: zig build test -Dprofile=web --test-timeout 120s --summary all
-      - name: Full profile without TLS (turns HTTP/3 off)
+        run: zig build compile-tests -Dprofile=web --summary all
+      - name: Full profile without TLS compiles (turns HTTP/3 off)
         timeout-minutes: 20
-        run: zig build test -Dtls=none --test-timeout 120s --summary all
-      - name: HTTP/3 without HTTP/2 (nghttp3 without nghttp2)
+        run: zig build compile-tests -Dtls=none --summary all
+      - name: HTTP/3 without HTTP/2 compiles (nghttp3 without nghttp2)
         timeout-minutes: 31
-        run: zig build test -Dhttp2=false -Dhttp3=true --test-timeout 120s --summary all
+        run: zig build compile-tests -Dhttp2=false -Dhttp3=true --summary all
       - name: Invalid flag combination is rejected
         shell: bash
         run: |
@@ -115,17 +123,20 @@ jobs:
           zig build cli rest --summary all
           python3 -I tests/console/pty_test.py zig-out/bin/anole zig-out/bin/rest
 
-  # Every preset and edge flag combination, a third of them per job: the
-  # twelve full suites one after another outgrew one step's time on the
-  # macOS runner.
+  # Every edge flag combination, a third of them per job. `full` and
+  # `minimal` are not here: they are the test job's default and minimal
+  # steps (same features, same binary); macOS is not here either, since a
+  # flag combination changes which Zig is compiled, which Linux catches
+  # (research/s15/test-audit.md T4, T5).
   flags:
+    # K2: catches a flag combination that no longer compiles (pg_live_test without postgres) and the no-compression / no-TLS skip paths; Linux only, macOS compiles the same Zig.
     name: test-flags (${{ matrix.os }}, ${{ matrix.group.name }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
         group:
-          - { name: full, combos: "full,full-no-compression,full-tls-none,minimal" }
+          - { name: full, combos: "full-no-compression,full-tls-none" }
           - { name: trimmed, combos: "full-no-brotli,full-no-openapi,db-none,db-only" }
           - { name: subsets, combos: "brokers-none,http2-no-grpc,web,minimal-no-lambda" }
     runs-on: ${{ matrix.os }}
@@ -144,13 +155,15 @@ jobs:
         run: zig build test-flags -Dflags-combos=${{ matrix.group.combos }} --test-timeout 120s --summary all
 
   cross:
+    # K2: catches compile and link of the aarch64 production target, which has no native job (the native arm64 test run is in weekly.yml).
     name: cross (${{ matrix.target }}, compile and link only)
     strategy:
       fail-fast: false
       matrix:
-        # x86_64-windows: every preset and edge combination, which the
-        # windows job (default profile only) does not build.
-        target: [aarch64-linux-gnu, x86_64-windows]
+        # aarch64 Linux is a production target with no native job here. The
+        # Windows cross build is gone: the windows job and test-flags caught
+        # every error it caught (T7).
+        target: [aarch64-linux-gnu]
     runs-on: ubuntu-latest
     timeout-minutes: 76
     steps:
@@ -164,11 +177,12 @@ jobs:
       # HttpConnectionClosing), so the fetch is retried before building.
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
-      - name: Build every test binary and the full example
+      - name: Build the default profile's test binaries and the full example
         timeout-minutes: 72
-        run: zig build test-flags full -Dtarget=${{ matrix.target }} --summary all
+        run: zig build compile-tests full -Dtarget=${{ matrix.target }} --summary all
 
   capi:
+    # K2: catches anole.h under -Werror (C11 typedef redefinition), the ELF/Mach-O export list and packing, the C suite under ASan/UBSan; macOS only the Mach-O build and capi-test.
     name: capi (${{ matrix.os }})
     # libanole, the C ABI (include/anole.h): packed with Zig alone, its
     # exported symbols checked, anole.h's layout against the Zig side, the C
@@ -195,13 +209,20 @@ jobs:
       - name: libanole (static and shared, only anole_* exported)
         timeout-minutes: 27
         run: zig build capi --summary all
+      - name: anole.h layout and the C suite
+        if: runner.os != 'Linux'
+        timeout-minutes: 20
+        run: zig build capi-test --test-timeout 120s --summary all
       - name: anole.h layout, the C suite, the engine over HTTP/2 and HTTP/3
+        if: runner.os == 'Linux'
         timeout-minutes: 20
         run: zig build capi-test test-capi-engine --test-timeout 120s --summary all
       - name: The C suite under ASan and UBSan (system cc)
+        if: runner.os == 'Linux'
         timeout-minutes: 20
         run: zig build capi-test-asan --test-timeout 120s --summary all
       - name: The same, against a ReleaseSafe libanole
+        if: runner.os == 'Linux'
         timeout-minutes: 22
         run: zig build capi-test -Doptimize=ReleaseSafe --test-timeout 120s --summary all
       - name: anole.h and the Zig side of libanole for Windows
@@ -215,6 +236,7 @@ jobs:
           zig build capi-zig capi -Dtarget=x86_64-windows-gnu --summary all
 
   windows:
+    # K2: catches IOCP and every Windows-only failure (openapi goldens, net, WebTransport close, listeners); the job with the most unique catches.
     name: windows (development target; default profile)
     runs-on: windows-latest
     # Windows is a development target ("works on Windows, fast on Linux"):
@@ -289,6 +311,7 @@ jobs:
           exit $ok
 
   h2spec:
+    # K2: catches RFC 9113 conformance of the HTTP/2 engine over h2c and TLS.
     name: h2spec (HTTP/2 conformance, h2c and TLS)
     runs-on: ubuntu-latest
     timeout-minutes: 24
@@ -317,6 +340,7 @@ jobs:
         run: tests/h2spec/run.sh ./h2spec ./zig-out/bin/full
 
   autobahn:
+    # K2: catches WebSocket protocol conformance (24 failing cases in release-0.2.0).
     name: Autobahn (WebSocket conformance, HTTP/1.1)
     runs-on: ubuntu-latest
     timeout-minutes: 40
@@ -351,6 +375,7 @@ jobs:
         run: ids=$(docker ps -aq --filter name=^anole-); [ -z "$ids" ] || docker rm -f $ids
 
   h3:
+    # K2: catches HTTP/3 server and client against aioquic; macOS has one UDP socket and no BPF steering, Linux has per-core steering.
     name: HTTP/3 server and client against aioquic (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -381,6 +406,7 @@ jobs:
         run: tests/restart/run.sh ./zig-out/bin/full
 
   quic-interop:
+    # K2: catches QUIC interop against the ngtcp2 and quic-go clients, which find handshake and migration bugs aioquic does not.
     name: QUIC interop runner (Anole's server, ngtcp2 and quic-go clients)
     runs-on: ubuntu-latest
     timeout-minutes: 24
@@ -431,6 +457,7 @@ jobs:
           retention-days: 7
 
   webtransport-interop:
+    # K2: catches WebTransport against flupke (caught twice); Chrome and Firefox are informational.
     name: WebTransport interop runner (Anole's server, flupke; Chrome and Firefox)
     runs-on: ubuntu-latest
     timeout-minutes: 27
@@ -491,13 +518,13 @@ jobs:
           retention-days: 7
 
   templates:
+    # K2: catches every anole new template builds, tests and lints on Linux with PostgreSQL (the macOS minimal template is weekly).
     name: anole new templates (${{ matrix.os }}; build, test, openapi, lint)
     strategy:
       fail-fast: false
       matrix:
-        # macOS builds the minimal template only (the full profile is the
-        # slow part of the Linux run).
-        os: [ubuntu-latest, macos-latest]
+        # macOS (minimal template) runs weekly, in weekly.yml.
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     # rest-postgres runs its database tests against this server on Linux.
@@ -526,10 +553,6 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 48
         run: DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres ANOLE_TEST_TIMEOUT=120s tests/templates/run.sh
-      - name: The minimal template (macOS)
-        if: runner.os != 'Linux'
-        timeout-minutes: 37
-        run: ANOLE_TEST_TIMEOUT=120s tests/templates/run.sh minimal
       # The service container (GitHub removes it after the job).
       - name: Container logs and states
         if: failure() && runner.os == 'Linux'
@@ -538,6 +561,7 @@ jobs:
           name: containers-${{ github.job }}-${{ strategy.job-index }}
 
   cli:
+    # K2: catches the cross-built release binaries of the anole command line (five targets, Windows included).
     name: anole command line (cross-build of the release binaries)
     runs-on: ubuntu-latest
     timeout-minutes: 16
@@ -555,6 +579,7 @@ jobs:
         run: ls -l zig-out/dist && cat zig-out/dist/SHA256SUMS
 
   consumer:
+    # K2: catches a fresh project adding Anole with zig fetch from an empty cache (the package as users get it).
     name: A project that adds Anole with zig fetch (fresh cache)
     # The commit must be fetchable from this repository, so pushes only.
     if: github.event_name == 'push'
@@ -575,6 +600,7 @@ jobs:
           ANOLE_CONSUMER_FRESH_CACHE: "1"
 
   fuzz:
+    # K2: catches the fuzz targets only, under LLVM coverage, at 200K runs each; the unit suite under LLVM runs in release-checks.
     name: Fuzz the parsers (200K runs per target)
     runs-on: ubuntu-latest
     timeout-minutes: 92
@@ -590,15 +616,18 @@ jobs:
       # HttpConnectionClosing), so the fetch is retried before building.
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
-      # The fuzz targets are the "fuzz:" tests (src/fuzz.zig, and the HTTP
+      # The fuzz targets are the "fuzz:" tests (src/fuzz.zig, the HTTP
       # core's: the PROXY protocol, requests through llhttp whole and in
-      # pieces, a connection's bytes over HTTP/1.1 and HTTP/2); a plain
-      # `zig build test` runs them on their seeds and fixed mutations only.
-      - name: zig build test --fuzz=200K
+      # pieces, a connection's bytes over HTTP/1.1 and HTTP/2; and BSON's);
+      # `zig build fuzz` is those alone. A plain `zig build test` runs them
+      # on their seeds and fixed mutations; the whole unit suite under the
+      # LLVM backend runs in release-checks.
+      - name: zig build fuzz --fuzz=200K
         timeout-minutes: 88
-        run: zig build test -Dllvm=true --fuzz=200K --test-timeout 120s
+        run: zig build fuzz -Dllvm=true --fuzz=200K --test-timeout 120s
 
   grpc-interop:
+    # K2: catches gRPC against grpc-go in both directions, h2c and TLS, plus grpc's HTTP/2 checks.
     name: gRPC interop (both directions with grpc-go, h2c and TLS; grpc's HTTP/2 checks)
     runs-on: ubuntu-latest
     timeout-minutes: 27
@@ -639,6 +668,7 @@ jobs:
 
   # ---- p3/grpc-h3 ----
   grpc-h3-interop:
+    # K2: catches gRPC over HTTP/3 against grpc-dotnet (failed alone in p3/all).
     name: gRPC over HTTP/3 interop (grpc-dotnet v2.84.0 client and server, Anole native and C ABI servers)
     runs-on: ubuntu-latest
     timeout-minutes: 36
@@ -678,6 +708,7 @@ jobs:
   # ---- end p3/grpc-h3 ----
 
   redis:
+    # K2: catches the live Redis client against redis and Valkey, two different servers, plain and TLS.
     name: Redis and Valkey (live client, session store and rate limiter tests, plain and TLS; the C ABI's suite)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -715,6 +746,7 @@ jobs:
 
   # ---- p3/s3 ----
   s3:
+    # K2: catches the S3 client against MinIO, plain and TLS (the XML fuzz target runs in the fuzz job).
     name: S3 (the client against MinIO, plain and TLS; fuzz target; the C ABI's storage tests)
     runs-on: ubuntu-latest
     timeout-minutes: 81
@@ -729,8 +761,7 @@ jobs:
       # lookups fail now and then on the runners (NameServerFailure).
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
-      # The fake server tests (no Docker: "s3: ..." and "capi s3: ..."), the
-      # XML reader's fuzz target ("fuzz: s3 xml") on its seeds, then the same
+      # The fake server tests (no Docker: "s3: ..." and "capi s3: ..."), then the same
       # suite plus the live tests against a throwaway MinIO (the image is
       # pinned by digest in the script), once over HTTP and once over TLS.
       - name: Tests against a live server
@@ -746,12 +777,10 @@ jobs:
       - name: Remove the containers
         if: always()
         run: ids=$(docker ps -aq --filter name=^anole-); [ -z "$ids" ] || docker rm -f $ids
-      - name: Fuzz the XML reader
-        timeout-minutes: 69
-        run: 'zig build test -Dtest-filter="fuzz: s3 xml" -Dllvm=true --fuzz=200K --test-timeout 120s'
   # ---- end p3/s3 ----
 
   postgres:
+    # K2: catches the live PostgreSQL client with scram-sha-256 and verify-full TLS (caught the bare BEGIN iterate bug).
     name: PostgreSQL (live client tests, plain and verify-full TLS, scram-sha-256; the C ABI's suite)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -788,6 +817,7 @@ jobs:
         run: ids=$(docker ps -aq --filter name=^anole-); [ -z "$ids" ] || docker rm -f $ids
 
   nats:
+    # K2: catches the live NATS and JetStream tests only; the unit suite runs elsewhere.
     name: NATS (live client and JetStream tests)
     runs-on: ubuntu-latest
     timeout-minutes: 43
@@ -821,6 +851,7 @@ jobs:
         run: ids=$(docker ps -aq --filter name=^anole-); [ -z "$ids" ] || docker rm -f $ids
 
   kafka:
+    # K2: catches the live Kafka tests against apache/kafka and redpanda, two different brokers (redpanda caught bugs alone).
     name: Kafka (live client tests)
     runs-on: ubuntu-latest
     timeout-minutes: 47
@@ -858,11 +889,13 @@ jobs:
         run: ids=$(docker ps -aq --filter name=^anole-); [ -z "$ids" ] || docker rm -f $ids
 
   mongodb:
+    # K2: catches the live MongoDB client against 7.0 (oldest supported) and 9.0 (newest); 8.0 runs weekly.
     name: MongoDB (live client tests; the C ABI's suite)
     # MongoDB 8.0.21+ and 9.x exit at startup on Linux kernels 6.19 to
     # 7.0.13 (SERVER-125742; ubuntu-24.04 runs 7.0.0), and earlier 8.0s
     # crash there: 8.0 and 9.0 run on ubuntu-22.04 (kernel 6.8) until the
-    # newer image's kernel reaches 7.0.14.
+    # newer image's kernel reaches 7.0.14. 7.0 and 9.0 bracket 8.0, which
+    # runs weekly (weekly.yml).
     runs-on: ${{ matrix.os }}
     timeout-minutes: 36
     strategy:
@@ -870,7 +903,6 @@ jobs:
       matrix:
         include:
           - { image: "mongo:7.0", os: ubuntu-latest }
-          - { image: "mongo:8.0", os: ubuntu-22.04 }
           - { image: "mongo:9.0", os: ubuntu-22.04 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
@@ -898,6 +930,7 @@ jobs:
         run: ids=$(docker ps -aq --filter name=^anole-); [ -z "$ids" ] || docker rm -f $ids
 
   smtp:
+    # K2: catches the live SMTP client against Mailpit: plain, STARTTLS with AUTH, implicit TLS.
     name: "SMTP (live tests against Mailpit: plain, STARTTLS with AUTH, implicit TLS)"
     runs-on: ubuntu-latest
     timeout-minutes: 38
