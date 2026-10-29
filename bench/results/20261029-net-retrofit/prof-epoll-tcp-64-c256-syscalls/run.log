@@ -1,0 +1,3 @@
+10:45:29 a counters: 228761 msg/s; page-faults 0.317/msg, context-switches 0.000/msg, brk 0.042/msg, mmap 0.000/msg, munmap 0.000/msg, madvise 0.000/msg, write 0.000/msg, writev 0.000/msg, sendto 0.000/msg, sendmsg 0.975/msg, read 0.000/msg, recvfrom 1.950/msg, recvmsg 0.000/msg, epoll_pwait2 0.016/msg, epoll_wait 0.000/msg, epoll_ctl 0.000/msg, futex 0.000/msg
+10:47:16 b counters: 202011 msg/s; page-faults 0.968/msg, context-switches 0.000/msg, brk 0.111/msg, mmap 0.000/msg, munmap 0.000/msg, madvise 0.000/msg, write 0.000/msg, writev 0.000/msg, sendto 0.000/msg, sendmsg 0.972/msg, read 0.000/msg, recvfrom 1.943/msg, recvmsg 0.000/msg, epoll_pwait2 0.015/msg, epoll_wait 0.000/msg, epoll_ctl 0.000/msg, futex 0.000/msg
+10:47:16 done

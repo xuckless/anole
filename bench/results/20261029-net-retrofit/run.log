@@ -1,0 +1,94 @@
+10:22:57 start: a b = anole-bench/anole:net-a@e062b25584d9 anole-bench/anole:net-b@c4a13a99622b REST=70 RUNS=5 DUR=15
+10:24:26 epoll tcp 64 c256 a r1: 234632 msg/s, p50 1.081 ms, p99 1.278 ms, 2.39 us CPU/msg, 2501 ins:u/msg, 2714 cyc:u/msg, lost/errors 0
+10:25:55 epoll tcp 64 c256 b r1: 197597 msg/s, p50 1.278 ms, p99 1.475 ms, 3.15 us CPU/msg, 2513 ins:u/msg, 3670 cyc:u/msg, lost/errors 0
+10:27:24 epoll tcp 64 c256 b r2: 198431 msg/s, p50 1.278 ms, p99 1.442 ms, 3.14 us CPU/msg, 2523 ins:u/msg, 3675 cyc:u/msg, lost/errors 0
+10:28:53 epoll tcp 64 c256 a r2: 231116 msg/s, p50 1.081 ms, p99 1.245 ms, 2.43 us CPU/msg, 2467 ins:u/msg, 2771 cyc:u/msg, lost/errors 0
+10:30:22 epoll tcp 64 c256 a r3: 241930 msg/s, p50 1.032 ms, p99 1.212 ms, 2.30 us CPU/msg, 2480 ins:u/msg, 2587 cyc:u/msg, lost/errors 0
+10:31:50 epoll tcp 64 c256 b r3: 197600 msg/s, p50 1.278 ms, p99 1.475 ms, 3.16 us CPU/msg, 2511 ins:u/msg, 3675 cyc:u/msg, lost/errors 0
+10:33:19 epoll tcp 64 c256 b r4: 210103 msg/s, p50 1.180 ms, p99 1.376 ms, 2.92 us CPU/msg, 2519 ins:u/msg, 3278 cyc:u/msg, lost/errors 0
+10:34:48 epoll tcp 64 c256 a r4: 230952 msg/s, p50 1.081 ms, p99 1.245 ms, 2.44 us CPU/msg, 2468 ins:u/msg, 2818 cyc:u/msg, lost/errors 0
+10:36:17 epoll tcp 64 c256 a r5: 242303 msg/s, p50 1.032 ms, p99 1.212 ms, 2.28 us CPU/msg, 2503 ins:u/msg, 2567 cyc:u/msg, lost/errors 0
+10:37:46 epoll tcp 64 c256 b r5: 197786 msg/s, p50 1.278 ms, p99 1.442 ms, 3.16 us CPU/msg, 2517 ins:u/msg, 3686 cyc:u/msg, lost/errors 0
+10:37:46 cell epoll tcp 64 c256: a: 234632 msg/s, p99 1.245 ms, 2.39 us/msg, 2480 ins/msg (n=5, runs [234632, 231116, 241930, 230952, 242303], lost 0); b: 197786 msg/s, p99 1.442 ms, 3.15 us/msg, 2517 ins/msg (n=5, runs [197597, 198431, 197600, 210103, 197786], lost 0); B vs A: msg/s -15.7%, p99 +15.8% -> FAIL
+10:38:27 paused after epoll tcp 64 c256 for the B/A profile (lead's request); the partial epoll tcp 64 c4096 a r1 was discarded
+10:47:35 resumed after the profiles (prof-epoll-tcp-64-c256, prof-epoll-tcp-64-c256-syscalls)
+10:47:35 start: a b = anole-bench/anole:net-a@e062b25584d9 anole-bench/anole:net-b@c4a13a99622b REST=70 RUNS=5 DUR=15
+10:47:35 cell epoll tcp 64 c256: a: 234632 msg/s, p99 1.245 ms, 2.39 us/msg, 2480 ins/msg (n=5, runs [234632, 231116, 241930, 230952, 242303], lost 0); b: 197786 msg/s, p99 1.442 ms, 3.15 us/msg, 2517 ins/msg (n=5, runs [197597, 198431, 197600, 210103, 197786], lost 0); B vs A: msg/s -15.7%, p99 +15.8% -> FAIL
+10:49:04 epoll tcp 64 c4096 a r1: 165740 msg/s, p50 24.117 ms, p99 26.739 ms, 3.89 us CPU/msg, 2492 ins:u/msg, 7255 cyc:u/msg, lost/errors 0
+10:50:33 epoll tcp 64 c4096 b r1: 139697 msg/s, p50 28.836 ms, p99 30.933 ms, 5.00 us CPU/msg, 2597 ins:u/msg, 8447 cyc:u/msg, lost/errors 0
+10:52:02 epoll tcp 64 c4096 b r2: 134040 msg/s, p50 30.409 ms, p99 32.506 ms, 5.31 us CPU/msg, 2570 ins:u/msg, 9510 cyc:u/msg, lost/errors 0
+10:53:31 epoll tcp 64 c4096 a r2: 155648 msg/s, p50 25.690 ms, p99 28.312 ms, 4.22 us CPU/msg, 2488 ins:u/msg, 8094 cyc:u/msg, lost/errors 0
+10:55:00 epoll tcp 64 c4096 a r3: 164097 msg/s, p50 24.642 ms, p99 26.739 ms, 3.92 us CPU/msg, 2486 ins:u/msg, 7246 cyc:u/msg, lost/errors 0
+10:56:28 epoll tcp 64 c4096 b r3: 137381 msg/s, p50 29.360 ms, p99 32.506 ms, 5.12 us CPU/msg, 2573 ins:u/msg, 8914 cyc:u/msg, lost/errors 0
+10:57:57 epoll tcp 64 c4096 b r4: 140038 msg/s, p50 28.836 ms, p99 32.506 ms, 4.99 us CPU/msg, 2569 ins:u/msg, 8526 cyc:u/msg, lost/errors 0
+10:59:26 epoll tcp 64 c4096 a r4: 154821 msg/s, p50 26.214 ms, p99 28.312 ms, 4.29 us CPU/msg, 2498 ins:u/msg, 8313 cyc:u/msg, lost/errors 0
+11:00:55 epoll tcp 64 c4096 a r5: 164597 msg/s, p50 24.642 ms, p99 26.214 ms, 3.88 us CPU/msg, 2491 ins:u/msg, 7216 cyc:u/msg, lost/errors 0
+11:02:24 epoll tcp 64 c4096 b r5: 138135 msg/s, p50 29.360 ms, p99 32.506 ms, 5.10 us CPU/msg, 2568 ins:u/msg, 8846 cyc:u/msg, lost/errors 0
+11:02:24 cell epoll tcp 64 c4096: a: 164097 msg/s, p99 26.739 ms, 3.92 us/msg, 2491 ins/msg (n=5, runs [165740, 155648, 164097, 154821, 164597], lost 0); b: 138135 msg/s, p99 32.506 ms, 5.10 us/msg, 2570 ins/msg (n=5, runs [139697, 134040, 137381, 140038, 138135], lost 0); B vs A: msg/s -15.8%, p99 +21.6% -> FAIL
+11:03:53 epoll tcp 16384 c256 a r1: 121238 msg/s, p50 2.097 ms, p99 2.490 ms, 5.97 us CPU/msg, 5589 ins:u/msg, 7839 cyc:u/msg, lost/errors 0
+11:05:22 epoll tcp 16384 c256 b r1: 103493 msg/s, p50 2.425 ms, p99 2.818 ms, 7.39 us CPU/msg, 5597 ins:u/msg, 8654 cyc:u/msg, lost/errors 0
+11:06:51 epoll tcp 16384 c256 b r2: 104094 msg/s, p50 2.425 ms, p99 2.884 ms, 7.41 us CPU/msg, 5605 ins:u/msg, 9026 cyc:u/msg, lost/errors 0
+11:08:20 epoll tcp 16384 c256 a r2: 142881 msg/s, p50 1.737 ms, p99 2.163 ms, 4.82 us CPU/msg, 5492 ins:u/msg, 6780 cyc:u/msg, lost/errors 0
+11:09:49 epoll tcp 16384 c256 a r3: 135957 msg/s, p50 1.868 ms, p99 2.294 ms, 5.16 us CPU/msg, 5527 ins:u/msg, 7296 cyc:u/msg, lost/errors 0
+11:11:18 epoll tcp 16384 c256 b r3: 102218 msg/s, p50 2.425 ms, p99 2.949 ms, 7.50 us CPU/msg, 5598 ins:u/msg, 8645 cyc:u/msg, lost/errors 0
+11:12:47 epoll tcp 16384 c256 b r4: 97020 msg/s, p50 2.556 ms, p99 3.080 ms, 7.95 us CPU/msg, 5587 ins:u/msg, 9313 cyc:u/msg, lost/errors 0
+11:14:15 epoll tcp 16384 c256 a r4: 134886 msg/s, p50 1.868 ms, p99 2.228 ms, 5.18 us CPU/msg, 5496 ins:u/msg, 7158 cyc:u/msg, lost/errors 0
+11:15:44 epoll tcp 16384 c256 a r5: 131544 msg/s, p50 1.901 ms, p99 2.294 ms, 5.41 us CPU/msg, 5547 ins:u/msg, 7390 cyc:u/msg, lost/errors 0
+11:17:13 epoll tcp 16384 c256 b r5: 100335 msg/s, p50 2.490 ms, p99 2.949 ms, 7.63 us CPU/msg, 5581 ins:u/msg, 8733 cyc:u/msg, lost/errors 0
+11:17:13 cell epoll tcp 16384 c256: a: 134886 msg/s, p99 2.294 ms, 5.18 us/msg, 5527 ins/msg (n=5, runs [121238, 142881, 135957, 134886, 131544], lost 0); b: 102218 msg/s, p99 2.949 ms, 7.50 us/msg, 5597 ins/msg (n=5, runs [103493, 104094, 102218, 97020, 100335], lost 0); B vs A: msg/s -24.2%, p99 +28.6% -> FAIL
+11:18:42 epoll tcp 16384 c4096 a r1: 67337 msg/s, p50 59.769 ms, p99 67.109 ms, 10.75 us CPU/msg, 5589 ins:u/msg, 15645 cyc:u/msg, lost/errors 0
+11:20:11 epoll tcp 16384 c4096 b r1: 55550 msg/s, p50 73.400 ms, p99 75.497 ms, 13.93 us CPU/msg, 5684 ins:u/msg, 16697 cyc:u/msg, lost/errors 0
+11:21:40 epoll tcp 16384 c4096 b r2: 54197 msg/s, p50 73.400 ms, p99 77.595 ms, 14.46 us CPU/msg, 5694 ins:u/msg, 18287 cyc:u/msg, lost/errors 0
+11:23:09 epoll tcp 16384 c4096 a r2: 66448 msg/s, p50 60.817 ms, p99 65.012 ms, 10.96 us CPU/msg, 5588 ins:u/msg, 16152 cyc:u/msg, lost/errors 0
+11:24:38 epoll tcp 16384 c4096 a r3: 66548 msg/s, p50 60.817 ms, p99 65.012 ms, 10.99 us CPU/msg, 5590 ins:u/msg, 16428 cyc:u/msg, lost/errors 0
+11:26:07 epoll tcp 16384 c4096 b r3: 56047 msg/s, p50 71.303 ms, p99 77.595 ms, 13.83 us CPU/msg, 5690 ins:u/msg, 16615 cyc:u/msg, lost/errors 0
+11:27:36 epoll tcp 16384 c4096 b r4: 56318 msg/s, p50 71.303 ms, p99 77.595 ms, 13.83 us CPU/msg, 5673 ins:u/msg, 16026 cyc:u/msg, lost/errors 0
+11:29:05 epoll tcp 16384 c4096 a r4: 67807 msg/s, p50 59.769 ms, p99 66.060 ms, 10.74 us CPU/msg, 5581 ins:u/msg, 15912 cyc:u/msg, lost/errors 0
+11:30:34 epoll tcp 16384 c4096 a r5: 66156 msg/s, p50 60.817 ms, p99 63.963 ms, 11.02 us CPU/msg, 5585 ins:u/msg, 16456 cyc:u/msg, lost/errors 0
+11:32:02 epoll tcp 16384 c4096 b r5: 54182 msg/s, p50 73.400 ms, p99 77.595 ms, 14.42 us CPU/msg, 5695 ins:u/msg, 18428 cyc:u/msg, lost/errors 0
+11:32:02 cell epoll tcp 16384 c4096: a: 66548 msg/s, p99 65.012 ms, 10.96 us/msg, 5588 ins/msg (n=5, runs [67337, 66448, 66548, 67807, 66156], lost 0); b: 55550 msg/s, p99 77.595 ms, 13.93 us/msg, 5690 ins/msg (n=5, runs [55550, 54197, 56047, 56318, 54182], lost 0); B vs A: msg/s -16.5%, p99 +19.4% -> FAIL
+11:33:31 epoll udp 64 c256 a r1: 315428 msg/s, p50 0.541 ms, p99 0.606 ms, 1.56 us CPU/msg, 937 ins:u/msg, 393 cyc:u/msg, lost/errors 6170
+11:35:00 epoll udp 64 c256 b r1: 316431 msg/s, p50 0.541 ms, p99 0.606 ms, 1.55 us CPU/msg, 939 ins:u/msg, 386 cyc:u/msg, lost/errors 6116
+11:36:29 epoll udp 64 c256 b r2: 305977 msg/s, p50 0.557 ms, p99 0.623 ms, 1.66 us CPU/msg, 939 ins:u/msg, 401 cyc:u/msg, lost/errors 6210
+11:37:58 epoll udp 64 c256 a r2: 313400 msg/s, p50 0.541 ms, p99 0.606 ms, 1.57 us CPU/msg, 938 ins:u/msg, 393 cyc:u/msg, lost/errors 6193
+11:39:27 epoll udp 64 c256 a r3: 318471 msg/s, p50 0.541 ms, p99 0.606 ms, 1.54 us CPU/msg, 938 ins:u/msg, 393 cyc:u/msg, lost/errors 6097
+11:40:56 epoll udp 64 c256 b r3: 318047 msg/s, p50 0.541 ms, p99 0.606 ms, 1.54 us CPU/msg, 940 ins:u/msg, 385 cyc:u/msg, lost/errors 6172
+11:42:25 epoll udp 64 c256 b r4: 314451 msg/s, p50 0.541 ms, p99 0.606 ms, 1.57 us CPU/msg, 939 ins:u/msg, 390 cyc:u/msg, lost/errors 6173
+11:43:54 epoll udp 64 c256 a r4: 306594 msg/s, p50 0.541 ms, p99 0.623 ms, 1.64 us CPU/msg, 938 ins:u/msg, 407 cyc:u/msg, lost/errors 6386
+11:45:23 epoll udp 64 c256 a r5: 315615 msg/s, p50 0.541 ms, p99 0.606 ms, 1.55 us CPU/msg, 937 ins:u/msg, 393 cyc:u/msg, lost/errors 6109
+11:46:51 epoll udp 64 c256 b r5: 315956 msg/s, p50 0.524 ms, p99 0.606 ms, 1.55 us CPU/msg, 939 ins:u/msg, 388 cyc:u/msg, lost/errors 6332
+11:46:51 cell epoll udp 64 c256: a: 315428 msg/s, p99 0.606 ms, 1.56 us/msg, 938 ins/msg (n=5, runs [315428, 313400, 318471, 306594, 315615], lost 30955); b: 315956 msg/s, p99 0.606 ms, 1.55 us/msg, 939 ins/msg (n=5, runs [316431, 305977, 318047, 314451, 315956], lost 31003); B vs A: msg/s +0.2%, p99 +0.0% -> pass
+11:48:20 epoll udp 64 c4096 a r1: 304253 msg/s, p50 0.557 ms, p99 0.705 ms, 1.67 us CPU/msg, 941 ins:u/msg, 410 cyc:u/msg, lost/errors 293536
+11:49:49 epoll udp 64 c4096 b r1: 308548 msg/s, p50 0.557 ms, p99 0.688 ms, 1.59 us CPU/msg, 944 ins:u/msg, 395 cyc:u/msg, lost/errors 293331
+11:51:18 epoll udp 64 c4096 b r2: 309590 msg/s, p50 0.541 ms, p99 0.688 ms, 1.59 us CPU/msg, 943 ins:u/msg, 391 cyc:u/msg, lost/errors 294000
+11:52:47 epoll udp 64 c4096 a r2: 304131 msg/s, p50 0.557 ms, p99 0.705 ms, 1.63 us CPU/msg, 941 ins:u/msg, 399 cyc:u/msg, lost/errors 293756
+11:54:16 epoll udp 64 c4096 a r3: 304982 msg/s, p50 0.557 ms, p99 0.705 ms, 1.64 us CPU/msg, 941 ins:u/msg, 406 cyc:u/msg, lost/errors 293453
+11:55:45 epoll udp 64 c4096 b r3: 312968 msg/s, p50 0.541 ms, p99 0.688 ms, 1.57 us CPU/msg, 942 ins:u/msg, 386 cyc:u/msg, lost/errors 293401
+11:57:14 epoll udp 64 c4096 b r4: 311455 msg/s, p50 0.557 ms, p99 0.688 ms, 1.58 us CPU/msg, 942 ins:u/msg, 388 cyc:u/msg, lost/errors 293597
+11:58:43 epoll udp 64 c4096 a r4: 304988 msg/s, p50 0.573 ms, p99 0.705 ms, 1.64 us CPU/msg, 941 ins:u/msg, 402 cyc:u/msg, lost/errors 293802
+12:00:12 epoll udp 64 c4096 a r5: 314870 msg/s, p50 0.541 ms, p99 0.672 ms, 1.57 us CPU/msg, 941 ins:u/msg, 395 cyc:u/msg, lost/errors 294046
+12:01:41 epoll udp 64 c4096 b r5: 298426 msg/s, p50 0.573 ms, p99 0.705 ms, 1.69 us CPU/msg, 944 ins:u/msg, 403 cyc:u/msg, lost/errors 293524
+12:01:41 cell epoll udp 64 c4096: a: 304982 msg/s, p99 0.705 ms, 1.64 us/msg, 941 ins/msg (n=5, runs [304253, 304131, 304982, 304988, 314870], lost 1468593); b: 309590 msg/s, p99 0.688 ms, 1.59 us/msg, 943 ins/msg (n=5, runs [308548, 309590, 312968, 311455, 298426], lost 1467853); B vs A: msg/s +1.5%, p99 -2.3% -> pass
+12:03:10 epoll udp 2048 c256 a r1: 286228 msg/s, p50 0.129 ms, p99 0.168 ms, 1.84 us CPU/msg, 1312 ins:u/msg, 610 cyc:u/msg, lost/errors 16146
+12:04:39 epoll udp 2048 c256 b r1: 285916 msg/s, p50 0.129 ms, p99 0.168 ms, 1.83 us CPU/msg, 1314 ins:u/msg, 608 cyc:u/msg, lost/errors 16175
+12:06:08 epoll udp 2048 c256 b r2: 287570 msg/s, p50 0.129 ms, p99 0.168 ms, 1.83 us CPU/msg, 1314 ins:u/msg, 606 cyc:u/msg, lost/errors 16146
+12:07:37 epoll udp 2048 c256 a r2: 286777 msg/s, p50 0.129 ms, p99 0.168 ms, 1.83 us CPU/msg, 1311 ins:u/msg, 611 cyc:u/msg, lost/errors 16191
+12:09:05 epoll udp 2048 c256 a r3: 287228 msg/s, p50 0.129 ms, p99 0.168 ms, 1.83 us CPU/msg, 1312 ins:u/msg, 610 cyc:u/msg, lost/errors 16188
+12:10:34 epoll udp 2048 c256 b r3: 284522 msg/s, p50 0.131 ms, p99 0.168 ms, 1.85 us CPU/msg, 1315 ins:u/msg, 607 cyc:u/msg, lost/errors 16201
+12:12:03 epoll udp 2048 c256 b r4: 286628 msg/s, p50 0.129 ms, p99 0.172 ms, 1.84 us CPU/msg, 1315 ins:u/msg, 609 cyc:u/msg, lost/errors 16208
+12:13:32 epoll udp 2048 c256 a r4: 287591 msg/s, p50 0.129 ms, p99 0.172 ms, 1.83 us CPU/msg, 1312 ins:u/msg, 611 cyc:u/msg, lost/errors 16216
+12:15:01 epoll udp 2048 c256 a r5: 287063 msg/s, p50 0.129 ms, p99 0.172 ms, 1.83 us CPU/msg, 1312 ins:u/msg, 611 cyc:u/msg, lost/errors 16175
+12:16:30 epoll udp 2048 c256 b r5: 287412 msg/s, p50 0.129 ms, p99 0.168 ms, 1.83 us CPU/msg, 1313 ins:u/msg, 605 cyc:u/msg, lost/errors 16147
+12:16:30 cell epoll udp 2048 c256: a: 287063 msg/s, p99 0.168 ms, 1.83 us/msg, 1312 ins/msg (n=5, runs [286228, 286777, 287228, 287591, 287063], lost 80916); b: 286628 msg/s, p99 0.168 ms, 1.83 us/msg, 1314 ins/msg (n=5, runs [285916, 287570, 284522, 286628, 287412], lost 80877); B vs A: msg/s -0.2%, p99 +0.0% -> pass
+12:17:59 epoll udp 2048 c4096 a r1: 284082 msg/s, p50 0.135 ms, p99 0.213 ms, 1.86 us CPU/msg, 1316 ins:u/msg, 616 cyc:u/msg, lost/errors 304029
+12:19:28 epoll udp 2048 c4096 b r1: 281916 msg/s, p50 0.135 ms, p99 0.209 ms, 1.88 us CPU/msg, 1319 ins:u/msg, 609 cyc:u/msg, lost/errors 303899
+12:20:57 epoll udp 2048 c4096 b r2: 282579 msg/s, p50 0.135 ms, p99 0.217 ms, 1.87 us CPU/msg, 1318 ins:u/msg, 611 cyc:u/msg, lost/errors 304052
+12:22:26 epoll udp 2048 c4096 a r2: 286104 msg/s, p50 0.135 ms, p99 0.217 ms, 1.85 us CPU/msg, 1318 ins:u/msg, 615 cyc:u/msg, lost/errors 304099
+12:23:55 epoll udp 2048 c4096 a r3: 284992 msg/s, p50 0.135 ms, p99 0.213 ms, 1.85 us CPU/msg, 1318 ins:u/msg, 613 cyc:u/msg, lost/errors 304278
+12:25:24 epoll udp 2048 c4096 b r3: 284034 msg/s, p50 0.135 ms, p99 0.217 ms, 1.85 us CPU/msg, 1317 ins:u/msg, 609 cyc:u/msg, lost/errors 304083
+12:26:53 epoll udp 2048 c4096 b r4: 282268 msg/s, p50 0.135 ms, p99 0.213 ms, 1.87 us CPU/msg, 1320 ins:u/msg, 614 cyc:u/msg, lost/errors 304191
+12:28:21 epoll udp 2048 c4096 a r4: 284327 msg/s, p50 0.135 ms, p99 0.213 ms, 1.86 us CPU/msg, 1316 ins:u/msg, 613 cyc:u/msg, lost/errors 304102
+12:29:50 epoll udp 2048 c4096 a r5: 281801 msg/s, p50 0.135 ms, p99 0.217 ms, 1.87 us CPU/msg, 1317 ins:u/msg, 616 cyc:u/msg, lost/errors 303915
+12:31:19 epoll udp 2048 c4096 b r5: 283886 msg/s, p50 0.135 ms, p99 0.213 ms, 1.86 us CPU/msg, 1318 ins:u/msg, 611 cyc:u/msg, lost/errors 304055
+12:31:19 cell epoll udp 2048 c4096: a: 284327 msg/s, p99 0.213 ms, 1.86 us/msg, 1317 ins/msg (n=5, runs [284082, 286104, 284992, 284327, 281801], lost 1520423); b: 282579 msg/s, p99 0.213 ms, 1.87 us/msg, 1318 ins/msg (n=5, runs [281916, 282579, 284034, 282268, 283886], lost 1520280); B vs A: msg/s -0.6%, p99 +0.0% -> pass
+12:31:35 stopped after the epoll UDP cells (lead's request): io_uring skipped on b2f1fbb; the just-started uring tcp 64 c256 a r1 (no load yet) was discarded

@@ -1,0 +1,8 @@
+# started on Thu Oct 29 14:39:47 2026
+
+10459913285,,cpu_core/cycles/u,14996358764,100.00,,
+7916270423,,cpu_core/instructions/u,14996358479,100.00,,
+13010311,,cpu_core/cache-misses/,14996357352,100.00,,
+1187613290,,cpu_core/L1-dcache-load-misses/,14996356848,100.00,,
+280164210,,cpu_core/mem_inst_retired.lock_loads/,14996356185,100.00,,
+29431902829,,cpu_core/mem_inst_retired.all_loads/,14996355338,100.00,,

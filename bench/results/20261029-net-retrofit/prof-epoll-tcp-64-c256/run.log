@@ -1,0 +1,5 @@
+10:40:20 b counters: 206511 msg/s; cycles/u 3376.70/msg, instructions/u 2555.56/msg, cache-misses 4.20/msg, L1-dcache-load-misses 383.39/msg, mem_inst_retired.lock_loads 90.44/msg, mem_inst_retired.all_loads 9501.30/msg
+10:40:20 b flame: 14989 samples; top self: nft_do_chain 12.0%, ? 3.2%, asm_exc_page_fault 2.8%, nft_meta_get_eval 2.7%, sized_strscpy 2.0%, nft_meta_store_ifname 1.7%
+10:42:07 a counters: 224214 msg/s; cycles/u 3037.34/msg, instructions/u 2547.46/msg, cache-misses 3.72/msg, L1-dcache-load-misses 371.65/msg, mem_inst_retired.lock_loads 79.48/msg, mem_inst_retired.all_loads 8424.19/msg
+10:42:07 a flame: 14988 samples; top self: nft_do_chain 14.1%, nft_meta_get_eval 2.7%, sized_strscpy 1.9%, ? 1.9%, __raw_spin_lock_irqsave 1.9%, nft_meta_store_ifname 1.8%
+10:42:07 done
