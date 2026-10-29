@@ -5,6 +5,7 @@ const std = @import("std");
 const wait = @import("anole_test_wait");
 const root = @import("root.zig");
 const sse = @import("../sse/root.zig");
+const metrics = @import("../observe/metrics.zig");
 
 const Watch = root.Watch;
 const gpa = std.testing.allocator;
@@ -49,13 +50,16 @@ const Closed = struct {
     }
 };
 
-test "watch: a fake source publishes to SSE topics, templates {channel}, {op}, {data.room}" {
+test "watch: a templated SSE topic gets only matching events; an event without the field is skipped" {
     var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true, .replay = null });
     defer topics.deinit();
     var fake: sse.out_mod.Fake = .init(gpa, io);
     defer fake.deinit();
+    var registry = metrics.Registry.init(gpa, io);
+    defer registry.deinit();
     const w = try newWatch(&topics, "room:{data.room}", &.{});
     defer w.deinit();
+    try w.start(&registry, null, null);
     Closed.n.store(0, .release);
     const sub = try topics._attach(io, fake.out(), .{ .topics = &.{"room:lobby"}, .on_close = Closed.onClose }, null);
     w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = "{\"room\":\"lobby\",\"n\":1}" });
@@ -63,8 +67,18 @@ test "watch: a fake source publishes to SSE topics, templates {channel}, {op}, {
     // Another room: not this subscriber. A payload without the field: skipped.
     w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = "{\"room\":\"other\"}" });
     w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = "{\"x\":1}" });
-    try std.testing.expectEqual(@as(u64, 1), w.n_template_skipped.load(.monotonic));
-    try std.testing.expect(std.mem.indexOf(u8, fake.bytes.items, "other") == null);
+    // A later lobby event is the barrier: once it arrived, "other" would have too.
+    w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = "{\"room\":\"lobby\",\"n\":2}" });
+    try waitFor(&fake, "\"n\":2");
+    {
+        fake.mutex.lockUncancelable(io);
+        defer fake.mutex.unlock(io);
+        try std.testing.expect(std.mem.indexOf(u8, fake.bytes.items, "other") == null);
+    }
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "anole_watch_template_skipped_total{watch=\"orders\"} 1") != null);
     sse.Topics._gone(sub);
     try wait.waitAtLeast(io, "the subscriber closed", &Closed.n, 1);
 }
@@ -142,7 +156,7 @@ const Seen = struct {
     }
 };
 
-test "watch: a handler runs events in order; a failing one is logged and the next runs" {
+test "watch: a handler runs events in order; after a failing one the next still runs" {
     var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
     defer topics.deinit();
     const w = try newWatch(&topics, "t", &.{});
@@ -308,10 +322,17 @@ test "watch: auto-ack: after the handler succeeded, never after it failed (handl
     try std.testing.expect(Acks.has("5-0"));
     try std.testing.expect(!Acks.has("4-0"));
     try std.testing.expectEqual(@as(usize, 2), Acks.count);
+}
 
-    // Manual: Event.ack goes through the manual hook only.
-    w.setAckHooks(hook, null);
+test "watch: a manual ack goes through the manual hook only; with the reader gone it is refused (Unsupported)" {
+    var topics = try sse.Topics.init(gpa, .{ ._manual_ticks = true });
+    defer topics.deinit();
+    const w = try newWatch(&topics, "t", &.{});
+    defer w.deinit();
     Acks.reset();
+    var dummy: u8 = 0;
+    const hook: root.AckHook = .{ .ctx = &dummy, .call = Acks.call };
+    w.setAckHooks(hook, null);
     w.setHandler(null, .{ .timeout = null }, Acks.handle);
     try std.testing.expectEqual(root.Outcome.ok, w.deliver(entry("good", "6-0")));
     try std.testing.expectEqual(@as(usize, 0), Acks.count);
@@ -323,12 +344,12 @@ test "watch: auto-ack: after the handler succeeded, never after it failed (handl
 }
 
 const Gate = struct {
-    var entered: std.Io.Event = .unset;
+    var entered: std.atomic.Value(bool) = .init(false);
     var open: std.Io.Event = .unset;
     var finished: std.atomic.Value(bool) = .init(false);
 
     fn handle(_: ?*anyopaque, _: *root.Event) anyerror!void {
-        entered.set(io);
+        entered.store(true, .release);
         open.waitUncancelable(io);
         finished.store(true, .release);
     }
@@ -344,14 +365,16 @@ test "watch: stop: a running handler finishes, a listener ends after what it has
     var c: Ctx = .{ .io = io, .arena = arena_state.allocator() };
     const l = try w.listen(&c, .{});
     defer l.close();
-    Gate.entered = .unset;
+    Gate.entered.store(false, .release);
     Gate.open = .unset;
+    // A failed check before the gate opens must not leave the handler blocked (w.deinit would hang).
+    defer Gate.open.set(io);
     Gate.finished.store(false, .release);
     w.setHandler(null, .{ .timeout = null }, Gate.handle);
     try w._startWorker();
     w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = "a" });
     w._inject(.{ .op = .message, .op_name = "message", .channel = "orders", .data = "b" });
-    try Gate.entered.wait(io);
+    try wait.waitFlag(io, "the handler entered", &Gate.entered);
     w.stop();
     try std.testing.expectEqual(root.Status.stopped, w.status());
     // The handler was not canceled by the stop: it ends its event.
