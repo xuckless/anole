@@ -55,12 +55,12 @@ fn stall(req: *dusty.Request, res: *dusty.Response) !void {
     try out.end();
 }
 
-/// GET /gate: answers once `gate_expected` requests are in at once.
+/// GET /gate: counts its arrival, then answers once the test opens the
+/// gate (the test waits for the arrivals it expects, with a deadline).
 var gate_arrivals: std.atomic.Value(u32) = .init(0);
-var gate_expected: u32 = 0;
 var gate_open: std.Io.Event = .unset;
 fn gate(req: *dusty.Request, res: *dusty.Response) !void {
-    if (gate_arrivals.fetchAdd(1, .acq_rel) + 1 == gate_expected) gate_open.set(req.io);
+    _ = gate_arrivals.fetchAdd(1, .acq_rel);
     try gate_open.wait(req.io);
     res.body = "through the gate";
 }
@@ -123,78 +123,107 @@ fn request(conn: *h2.ClientConnection, path: []const u8, options: h2.ClientConne
     }, options);
 }
 
-test "h2 client: GET, a large streamed echo, trailers and 20 concurrent streams" {
+/// A prior-knowledge h2c server on `io`, stopped by `stop`.
+fn startH2c(gpa: std.mem.Allocator, io: std.Io) !Running {
+    return Running.start(gpa, io, &.{.{ .address = loopback, .http2_prior_knowledge = true }});
+}
+
+test "h2 client: a GET returns the handler's body" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     const io = rt.io();
-    const server = try startServer(gpa, io, &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }});
-    defer gpa.destroy(server);
-    defer server.deinit();
-    var server_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(void)) !void {
-            try s.run();
-        }
-    }.run, .{server});
-    defer server_future.cancel(io) catch {};
-    try server.waitReady(io);
-
-    const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = server.address.ip.getPort() });
+    var srv = try startH2c(gpa, io);
+    defer srv.stop(gpa, io);
+    const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = srv.port() });
     defer conn.close();
 
     const body = try get(conn, "/hello", gpa);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("hello over h2", body);
+}
 
-    {
-        // 1 MiB up and back: many windows' worth each way.
-        const big = try gpa.alloc(u8, 1 << 20);
-        defer gpa.free(big);
-        for (big, 0..) |*b, i| b.* = @truncate(i *% 31);
-        const s = try conn.request(&.{
-            .{ .name = ":method", .value = "POST" }, .{ .name = ":path", .value = "/echo" },
-            .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
-        }, .{ .body = true });
-        defer s.release();
-        var sender = try io.concurrent(struct {
-            fn send(st: *h2.Stream, data: []const u8) !void {
-                try st.writer().writeAll(data);
-                try st.closeSend();
-            }
-        }.send, .{ s, big });
-        try s.waitHead();
-        const back = try s.reader().allocRemaining(gpa, .unlimited);
-        defer gpa.free(back);
-        try sender.await(io);
-        try std.testing.expect(std.mem.eql(u8, big, back));
-    }
-    {
-        const s = try conn.request(&.{
-            .{ .name = ":method", .value = "GET" },  .{ .name = ":path", .value = "/trailers" },
-            .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
-        }, .{});
-        defer s.release();
-        try s.waitHead();
-        const b = try s.reader().allocRemaining(gpa, .unlimited);
-        defer gpa.free(b);
-        try std.testing.expectEqualStrings("body", b);
-        try std.testing.expectEqualStrings("abc", s.trailer("x-checksum").?);
-    }
-    {
-        // Twenty tasks, one connection.
-        var group: std.Io.Group = .init;
-        defer group.cancel(io);
-        var ok: std.atomic.Value(usize) = .init(0);
-        for (0..20) |_| try group.concurrent(io, struct {
-            fn one(cn: *h2.ClientConnection, a: std.mem.Allocator, count: *std.atomic.Value(usize)) std.Io.Cancelable!void {
-                const b = get(cn, "/hello", a) catch return;
-                defer a.free(b);
-                if (std.mem.eql(u8, b, "hello over h2")) _ = count.fetchAdd(1, .monotonic);
-            }
-        }.one, .{ conn, gpa, &ok });
-        try group.await(io);
-        try std.testing.expectEqual(@as(usize, 20), ok.load(.monotonic));
-    }
+test "h2 client: a 1 MiB body streams up and back past the flow-control windows" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var srv = try startH2c(gpa, io);
+    defer srv.stop(gpa, io);
+    const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = srv.port() });
+    defer conn.close();
+
+    // 1 MiB up and back: many windows' worth each way.
+    const big = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 31);
+    const s = try conn.request(&.{
+        .{ .name = ":method", .value = "POST" }, .{ .name = ":path", .value = "/echo" },
+        .{ .name = ":scheme", .value = "http" }, .{ .name = ":authority", .value = "localhost" },
+    }, .{ .body = true });
+    defer s.release();
+    var sender = try io.concurrent(struct {
+        fn send(st: *h2.Stream, data: []const u8) !void {
+            try st.writer().writeAll(data);
+            try st.closeSend();
+        }
+    }.send, .{ s, big });
+    defer sender.cancel(io) catch {};
+    try s.waitHead();
+    const back = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(back);
+    try sender.await(io);
+    try std.testing.expect(std.mem.eql(u8, big, back));
+}
+
+test "h2 client: trailers arrive after the body" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var srv = try startH2c(gpa, io);
+    defer srv.stop(gpa, io);
+    const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = srv.port() });
+    defer conn.close();
+
+    const s = try request(conn, "/trailers", .{});
+    defer s.release();
+    try s.waitHead();
+    const b = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(b);
+    try std.testing.expectEqualStrings("body", b);
+    try std.testing.expectEqualStrings("abc", s.trailer("x-checksum").?);
+}
+
+test "h2 client: 20 concurrent streams share one connection" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var srv = try startH2c(gpa, io);
+    defer srv.stop(gpa, io);
+    const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = srv.port() });
+    defer conn.close();
+
+    // Twenty tasks, one connection.
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    var ok: std.atomic.Value(usize) = .init(0);
+    for (0..20) |_| try group.concurrent(io, struct {
+        fn one(cn: *h2.ClientConnection, a: std.mem.Allocator, count: *std.atomic.Value(usize)) std.Io.Cancelable!void {
+            const b = get(cn, "/hello", a) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                // Not counted: the wait below fails and says so.
+                else => return,
+            };
+            defer a.free(b);
+            if (std.mem.eql(u8, b, "hello over h2")) _ = count.fetchAdd(1, .monotonic);
+        }
+    }.one, .{ conn, gpa, &ok });
+    // Bounded: a stream credit that leaks would hold the group forever.
+    try wait.waitAtLeast(io, "20 concurrent GETs answered", &ok, 20);
+    try group.await(io);
+    try std.testing.expectEqual(@as(usize, 20), ok.load(.monotonic));
 }
 
 test "h2 client: over TLS with ALPN h2" {
@@ -347,29 +376,36 @@ test "h2 engine: a peer's GOAWAY ends the connection with a FIN, and what it sen
     const goaway_sent: std.Io.Clock.Timestamp = .now(io, .awake);
     try w.interface.writeAll(&.{ 0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff });
     try w.interface.flush();
-    // Time for the session to end. Read what the server sent (its SETTINGS
-    // frames), so a reset is not hidden behind buffered data. A slow
-    // machine can only hide a wrong reset here, never fail a right FIN.
-    try io.sleep(.fromMilliseconds(100), .awake);
+
+    // The session ends with a FIN: read what the server sent (its SETTINGS
+    // frames) to the end of the stream; a reset fails the read. The
+    // server shuts its side as the session ends, then lingers (reading and
+    // dropping what comes) for up to linger_timeout, 1 s. A FIN held back
+    // until the linger is over fails here too, not only under test-timing:
+    // by the time it is read the server has closed, so the PING below
+    // draws a reset. test-timing also checks the FIN came well within the
+    // linger.
     var rbuf: [1024]u8 = undefined;
     var rd = socket.reader(io, &rbuf);
-    rd.interface.fillMore() catch return rd.err orelse error.Unexpected;
-    rd.interface.tossBuffered();
-    // The PING finds the server's side closed: it is thrown away while the
-    // server lingers, and draws a reset if the server closed at once.
-    try w.interface.writeAll(&([_]u8{ 0, 0, 8, 6, 0, 0, 0, 0, 0 } ++ "h2spec  ".*)); // PING
-    try w.interface.flush();
-    // Time for a wrong reset to arrive (as above: it can only be missed).
-    try io.sleep(.fromMilliseconds(50), .awake);
-
-    // Then the end of the stream; a reset fails the read. The server shuts
-    // its side as the session ends, then lingers (reading and dropping what
-    // comes) for up to linger_timeout, 1 s, while the test's side stays
-    // open. A FIN held back until the linger is over is still a clean end,
-    // only late: only test-timing tells it apart, as it comes a full
-    // linger_timeout after the GOAWAY.
     _ = rd.interface.discardRemaining() catch return rd.err orelse error.Unexpected;
     if (wait.timing()) try std.testing.expect(goaway_sent.durationTo(.now(io, .awake)).raw.toMilliseconds() < 900);
+
+    // The PING finds the server's side closed: it is thrown away while the
+    // server lingers, and draws a reset if the server closed at once. No
+    // reset comes: the read side stays at its clean end. (A slow machine
+    // can only make this miss a wrong reset, never fail a right FIN.)
+    try w.interface.writeAll(&([_]u8{ 0, 0, 8, 6, 0, 0, 0, 0, 0 } ++ "h2spec  ".*)); // PING
+    try w.interface.flush();
+    try wait.expectStays(io, "the connection stays at its clean end, with no reset", &rd, struct {
+        fn atEnd(reader: *std.Io.net.Stream.Reader) !bool {
+            reader.interface.fillMore() catch |err| switch (err) {
+                error.EndOfStream => return true,
+                error.ReadFailed => return reader.err orelse error.Unexpected,
+            };
+            // Bytes after the FIN cannot come; anything here is wrong.
+            return false;
+        }
+    }.atEnd, wait.short_window);
 }
 
 test "h2 client: request timeouts, for the head and for the body, and the connection carries on" {
@@ -524,147 +560,261 @@ test "h2 client: the system trust store by default, a CA in memory, mutual TLS f
     }
 }
 
-test "dusty's client over HTTP/2: GET, POST, HEAD, a redirect, reuse, a timeout, and HTTP/1.1 where h2 is not offered" {
+/// The core's client (HTTP/2 on) and a TLS server with an h2 listener and an
+/// HTTP/1.1-only one. On the heap, so the client and the listeners stay
+/// where they were made.
+const DustyH2 = struct {
+    pem: @import("../tls/root.zig").Pem,
+    listeners: [2]dusty.Listener,
+    srv: Running,
+    client: dusty.Client,
+    url_buf: [128]u8 = undefined,
+
+    fn start(gpa: std.mem.Allocator, io: std.Io) !*DustyH2 {
+        const f = try gpa.create(DustyH2);
+        errdefer gpa.destroy(f);
+        f.* = .{ .pem = undefined, .listeners = undefined, .srv = undefined, .client = undefined };
+        f.pem = try @import("../tls/root.zig").selfSigned(gpa, .{});
+        errdefer f.pem.deinit(gpa);
+        f.listeners = .{
+            .{ .address = loopback, .tls = .{ .pem = .{ .cert = f.pem.cert, .key = f.pem.key }, .alpn_protocols = &.{ "h2", "http/1.1" } } },
+            .{ .address = loopback, .tls = .{ .pem = .{ .cert = f.pem.cert, .key = f.pem.key }, .alpn_protocols = &.{"http/1.1"} } },
+        };
+        f.srv = try Running.start(gpa, io, &f.listeners);
+        f.client = dusty.Client.init(gpa, io, .{ .tls = .{ .ca = .{ .pem = f.pem.cert } }, .http2 = true });
+        return f;
+    }
+
+    fn stop(f: *DustyH2, gpa: std.mem.Allocator, io: std.Io) void {
+        f.client.deinit();
+        f.srv.stop(gpa, io);
+        f.pem.deinit(gpa);
+        gpa.destroy(f);
+    }
+
+    fn h2Port(f: *const DustyH2) u16 {
+        return f.srv.server.addresses[0].ip.getPort();
+    }
+
+    fn h1Port(f: *const DustyH2) u16 {
+        return f.srv.server.addresses[1].ip.getPort();
+    }
+
+    /// https://localhost:<the h2 listener's port><path>.
+    fn url(f: *DustyH2, path: []const u8) ![]const u8 {
+        return std.fmt.bufPrint(&f.url_buf, "https://localhost:{d}{s}", .{ f.h2Port(), path });
+    }
+
+    fn dials(f: *const DustyH2) u64 {
+        return f.client.dials.load(.monotonic);
+    }
+};
+
+test "dusty's client over HTTP/2: a GET is answered over h2, with a content-length" {
     if (comptime features.tls != .boringssl) return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    const anole_tls = @import("../tls/root.zig");
-    var pem = try anole_tls.selfSigned(gpa, .{});
-    defer pem.deinit(gpa);
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     const io = rt.io();
-    var srv = try Running.start(gpa, io, &.{
-        .{ .address = loopback, .tls = .{ .pem = .{ .cert = pem.cert, .key = pem.key }, .alpn_protocols = &.{ "h2", "http/1.1" } } },
-        .{ .address = loopback, .tls = .{ .pem = .{ .cert = pem.cert, .key = pem.key }, .alpn_protocols = &.{"http/1.1"} } },
-    });
-    defer srv.stop(gpa, io);
-    const h2_port = srv.server.addresses[0].ip.getPort();
-    const h1_port = srv.server.addresses[1].ip.getPort();
+    const f = try DustyH2.start(gpa, io);
+    defer f.stop(gpa, io);
 
-    var client = dusty.Client.init(gpa, io, .{ .tls = .{ .ca = .{ .pem = pem.cert } }, .http2 = true });
-    defer client.deinit();
-    var url_buf: [128]u8 = undefined;
+    var response = try f.client.fetch(try f.url("/hello"), .{});
+    defer response.deinit();
+    try std.testing.expectEqual(.ok, response.status());
+    try std.testing.expectEqual(@as(u8, 2), response.version().major);
+    try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
+    try std.testing.expect(response.headers().get("content-length") != null);
+}
+
+test "dusty's client over HTTP/2: a 300 KiB POST echoes back on the connection the GET before it used" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const f = try DustyH2.start(gpa, io);
+    defer f.stop(gpa, io);
 
     {
-        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/hello", .{h2_port}), .{});
-        defer response.deinit();
-        try std.testing.expectEqual(.ok, response.status());
-        try std.testing.expectEqual(@as(u8, 2), response.version().major);
-        try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
-        try std.testing.expect(response.headers().get("content-length") != null);
-    }
-    // The same connection, from the pool.
-    try std.testing.expectEqual(@as(usize, 1), client.pool().idle_len);
-    {
-        const big = try gpa.alloc(u8, 300 * 1024);
-        defer gpa.free(big);
-        for (big, 0..) |*b, i| b.* = @truncate(i *% 7);
-        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/echo", .{h2_port}), .{ .method = .post, .body = big });
-        defer response.deinit();
-        try std.testing.expectEqual(.ok, response.status());
-        try std.testing.expect(std.mem.eql(u8, big, (try response.body()).?));
-    }
-    try std.testing.expectEqual(@as(usize, 1), client.pool().idle_len);
-    {
-        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/hello", .{h2_port}), .{ .method = .head });
-        defer response.deinit();
-        try std.testing.expectEqual(.ok, response.status());
-        try std.testing.expectEqual(@as(?[]const u8, null), try response.body());
-    }
-    {
-        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/redirect", .{h2_port}), .{});
+        var response = try f.client.fetch(try f.url("/hello"), .{});
         defer response.deinit();
         try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
     }
+    const big = try gpa.alloc(u8, 300 * 1024);
+    defer gpa.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i *% 7);
+    var response = try f.client.fetch(try f.url("/echo"), .{ .method = .post, .body = big });
+    defer response.deinit();
+    try std.testing.expectEqual(.ok, response.status());
+    try std.testing.expectEqual(@as(u8, 2), response.version().major);
+    try std.testing.expect(std.mem.eql(u8, big, (try response.body()).?));
+    // The same connection, from the pool: one dial for both.
+    try std.testing.expectEqual(@as(u64, 1), f.dials());
+}
+
+test "dusty's client over HTTP/2: HEAD gets the status and no body" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const f = try DustyH2.start(gpa, io);
+    defer f.stop(gpa, io);
+
+    var response = try f.client.fetch(try f.url("/hello"), .{ .method = .head });
+    defer response.deinit();
+    try std.testing.expectEqual(.ok, response.status());
+    try std.testing.expectEqual(@as(u8, 2), response.version().major);
+    try std.testing.expectEqual(@as(?[]const u8, null), try response.body());
+}
+
+test "dusty's client over HTTP/2: a redirect is followed" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const f = try DustyH2.start(gpa, io);
+    defer f.stop(gpa, io);
+
+    var response = try f.client.fetch(try f.url("/redirect"), .{});
+    defer response.deinit();
+    try std.testing.expectEqual(.ok, response.status());
+    try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
+}
+
+test "dusty's client over HTTP/2: a streamed response released with its body unread keeps the connection" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const f = try DustyH2.start(gpa, io);
+    defer f.stop(gpa, io);
+
     {
         // Streamed, and released with the body unread: the stream is
         // reset and the connection kept.
-        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/stall", .{h2_port}), .{ .stream = true });
+        var response = try f.client.fetch(try f.url("/stall"), .{ .stream = true });
+        defer response.deinit();
         var buf: [4]u8 = undefined;
         var r = try response.reader(&buf);
         try std.testing.expectEqualStrings("part", try r.interface.take(4));
-        response.deinit();
     }
-    try std.testing.expectError(error.Timeout, client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/slow", .{h2_port}), .{
+    var response = try f.client.fetch(try f.url("/hello"), .{});
+    defer response.deinit();
+    try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
+    try std.testing.expectEqual(@as(u64, 1), f.dials());
+}
+
+test "dusty's client over HTTP/2: a request timeout fails the request, and the connection carries on" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const f = try DustyH2.start(gpa, io);
+    defer f.stop(gpa, io);
+
+    // The handler takes 5 s: an error before that is the timeout's doing.
+    try std.testing.expectError(error.Timeout, f.client.fetch(try f.url("/slow"), .{
         .timeout = .{ .duration = .{ .raw = .fromMilliseconds(300), .clock = .awake } },
     }));
-    {
-        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/hello", .{h2_port}), .{});
-        defer response.deinit();
-        try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
-    }
-    {
-        var response = try client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/hello", .{h1_port}), .{});
-        defer response.deinit();
-        try std.testing.expectEqual(@as(u8, 1), response.version().major);
-        try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
-    }
+    var response = try f.client.fetch(try f.url("/hello"), .{});
+    defer response.deinit();
+    try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
+    try std.testing.expectEqual(@as(u64, 1), f.dials());
+}
+
+test "dusty's client over HTTP/2: HTTP/1.1 where the server does not offer h2" {
+    if (comptime features.tls != .boringssl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const f = try DustyH2.start(gpa, io);
+    defer f.stop(gpa, io);
+
+    var url_buf: [64]u8 = undefined;
+    var response = try f.client.fetch(try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/hello", .{f.h1Port()}), .{});
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u8, 1), response.version().major);
+    try std.testing.expectEqualStrings("hello over h2", (try response.body()).?);
 }
 
 test "dusty's client over HTTP/2: concurrent requests share one connection and one dial" {
     if (comptime features.tls != .boringssl) return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    const anole_tls = @import("../tls/root.zig");
-    var pem = try anole_tls.selfSigned(gpa, .{});
-    defer pem.deinit(gpa);
     // One executor, so one pool: the clients' tasks all share it.
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();
-    var srv = try Running.start(gpa, io, &.{
-        .{ .address = loopback, .tls = .{ .pem = .{ .cert = pem.cert, .key = pem.key }, .alpn_protocols = &.{ "h2", "http/1.1" } } },
-        .{ .address = loopback, .tls = .{ .pem = .{ .cert = pem.cert, .key = pem.key }, .alpn_protocols = &.{"http/1.1"} } },
-    });
-    defer srv.stop(gpa, io);
-    const h2_port = srv.server.addresses[0].ip.getPort();
-    const h1_port = srv.server.addresses[1].ip.getPort();
-
-    var client = dusty.Client.init(gpa, io, .{ .tls = .{ .ca = .{ .pem = pem.cert } } });
-    defer client.deinit();
+    const f = try DustyH2.start(gpa, io);
+    defer f.stop(gpa, io);
 
     const n = 16;
     gate_arrivals.store(0, .release);
-    gate_expected = n;
     gate_open = .unset;
     const Worker = struct {
-        fn run(c: *dusty.Client, port: u16, ok: *std.atomic.Value(u32)) void {
+        fn run(c: *dusty.Client, port: u16, ok: *std.atomic.Value(u32)) std.Io.Cancelable!void {
             var url_buf: [64]u8 = undefined;
             const url = std.fmt.bufPrint(&url_buf, "https://localhost:{d}/gate", .{port}) catch return;
-            var response = c.fetch(url, .{}) catch return;
+            // Not counted on any other error: the wait below says so.
+            var response = c.fetch(url, .{}) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return,
+            };
             defer response.deinit();
-            const body = response.body() catch return;
+            const body = response.body() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return,
+            };
             if (response.version().major == 2 and std.mem.eql(u8, body orelse "", "through the gate")) _ = ok.fetchAdd(1, .monotonic);
         }
     };
     var ok: std.atomic.Value(u32) = .init(0);
     var group: std.Io.Group = .init;
-    for (0..n) |_| try dusty.placement.concurrent(&group, io, .local, Worker.run, .{ &client, h2_port, &ok });
+    // On every exit: the gate open (no handler left waiting on it) and the
+    // workers canceled; the cancel joins them.
+    defer {
+        gate_open.set(io);
+        group.cancel(io);
+    }
+    for (0..n) |_| try dusty.placement.concurrent(&group, io, .local, Worker.run, .{ &f.client, f.h2Port(), &ok });
+    // All sixteen in the handler at once: none waits behind another.
+    try wait.waitAtLeast(io, "16 requests in the handler at once", &gate_arrivals, n);
+    gate_open.set(io);
+    try wait.waitAtLeast(io, "16 requests answered over h2", &ok, n);
     try group.await(io);
-    // All sixteen were in flight together, on one connection.
     try std.testing.expectEqual(@as(u32, n), ok.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 1), client.dials.load(.monotonic));
-    try std.testing.expectEqual(@as(usize, 1), client.pool().idle_len);
+    // On one connection.
+    try std.testing.expectEqual(@as(u64, 1), f.dials());
+    try std.testing.expectEqual(@as(usize, 1), f.client.pool().idle_len);
 
     // A host that only speaks HTTP/1.1: each gets a connection of its own,
     // after the first dial showed it.
-    gate_arrivals.store(0, .release);
-    gate_open = .unset;
     ok.store(0, .release);
-    const dials_before = client.dials.load(.monotonic);
+    const dials_before = f.dials();
     const H1Worker = struct {
-        fn run(c: *dusty.Client, port: u16, count: *std.atomic.Value(u32)) void {
+        fn run(c: *dusty.Client, port: u16, count: *std.atomic.Value(u32)) std.Io.Cancelable!void {
             var url_buf: [64]u8 = undefined;
             const url = std.fmt.bufPrint(&url_buf, "https://localhost:{d}/hello", .{port}) catch return;
-            var response = c.fetch(url, .{}) catch return;
+            var response = c.fetch(url, .{}) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return,
+            };
             defer response.deinit();
             if (response.version().major == 1) _ = count.fetchAdd(1, .monotonic);
         }
     };
     var group2: std.Io.Group = .init;
-    for (0..4) |_| try dusty.placement.concurrent(&group2, io, .local, H1Worker.run, .{ &client, h1_port, &ok });
+    defer group2.cancel(io);
+    for (0..4) |_| try dusty.placement.concurrent(&group2, io, .local, H1Worker.run, .{ &f.client, f.h1Port(), &ok });
+    try wait.waitAtLeast(io, "4 requests answered over HTTP/1.1", &ok, 4);
     try group2.await(io);
     try std.testing.expectEqual(@as(u32, 4), ok.load(.acquire));
-    try std.testing.expect(client.dials.load(.monotonic) > dials_before);
+    try std.testing.expect(f.dials() > dials_before);
 }
 
 test "dusty's client over HTTP/2: h2c_hosts speak cleartext HTTP/2 with prior knowledge" {

@@ -97,7 +97,7 @@ pub fn encodeBatch(gpa: std.mem.Allocator, recs: []const Rec, opts: EncodeOption
     try e.i32_(-1);
     try e.i8_(2);
     try e.u32_(0);
-    try e.i16_(@intFromEnum(opts.codec));
+    try e.i16_(@backingInt(opts.codec));
     try e.i32_(@intCast(recs.len - 1));
     try e.i64_(first_ts);
     try e.i64_(max_ts);

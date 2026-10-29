@@ -127,7 +127,7 @@ pub const core = dusty;
 // Loopback smoke test: a dusty server and a raw TCP client as two tasks of a
 // zio runtime. The harness shape is adapted from dusty's src/server_test.zig
 // (testClientServer, MIT, d3cb485).
-test "HTTP/1.1 smoke: GET /users/:id over loopback on zio" {
+test "core Server on zio: GET /users/:id answers with the parameter over HTTP/1.1" {
     const zio = @import("zio");
     const gpa = std.testing.allocator;
 

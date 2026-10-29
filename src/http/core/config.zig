@@ -560,6 +560,10 @@ test "ServerConfig: connection timeouts are finite by default" {
     const cfg: ServerConfig = .{};
     try std.testing.expectEqual(std.Io.Duration.fromSeconds(30), cfg.timeout.request.?);
     try std.testing.expectEqual(std.Io.Duration.fromSeconds(60), cfg.timeout.keepalive.?);
+}
+
+test "ServerConfig: no proxy hop is trusted by default" {
+    const cfg: ServerConfig = .{};
     try std.testing.expectEqual(@as(usize, 0), cfg.trusted_proxy_hops);
 }
 

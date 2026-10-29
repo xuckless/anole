@@ -1646,10 +1646,10 @@ fn checkRealtime(cfg: Config, why: *std.Io.Writer) Problem!void {
             found = d;
         };
         const db_cfg = found orelse return fail(why, "watches[{d}]: database \"{s}\" is not in databases", .{ i, w.database });
+        if (db_cfg.sqlite != null) return fail(why, "watches[{d}]: database \"{s}\" is SQLite, which has no change feed", .{ i, w.database });
         if (w.postgres != null and db_cfg.postgres == null) return fail(why, "watches[{d}]: database \"{s}\" is not PostgreSQL, which a postgres watch needs", .{ i, w.database });
         if ((w.redis != null or w.redis_stream != null) and db_cfg.redis == null) return fail(why, "watches[{d}]: database \"{s}\" is not Redis, which a redis watch needs", .{ i, w.database });
         if (w.mongodb != null and db_cfg.mongodb == null) return fail(why, "watches[{d}]: database \"{s}\" is not MongoDB, which a mongodb watch needs", .{ i, w.database });
-        if (db_cfg.sqlite != null) return fail(why, "watches[{d}]: database \"{s}\" is SQLite, which has no change feed", .{ i, w.database });
         if (w.postgres) |p| {
             if (p.channels.len == 0) return fail(why, "watches[{d}].postgres.channels: at least one", .{i});
             for (p.channels) |c| if (c.len == 0 or c.len > 63) return fail(why, "watches[{d}].postgres.channels: 1-63 bytes each", .{i});
@@ -1932,16 +1932,22 @@ pub fn fixed(arena: std.mem.Allocator, f: Config.Fixed) !*FixedRoute {
     return out;
 }
 
-test "parse: the defaults, a full document, and what is refused" {
+test "parse: an empty document gives one listener and request_ms 30000" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    const d = try parse(arena.allocator(), "{}", &why);
+    try std.testing.expectEqual(@as(usize, 1), d.listeners.len);
+    try std.testing.expectEqual(@as(u32, 30_000), d.timeouts.request_ms.?);
+}
+
+test "parse: a full document with routes, middleware and observe parses" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var buf: [256]u8 = undefined;
     var why: std.Io.Writer = .fixed(&buf);
-
-    const d = try parse(a, "{}", &why);
-    try std.testing.expectEqual(@as(usize, 1), d.listeners.len);
-    try std.testing.expectEqual(@as(u32, 30_000), d.timeouts.request_ms.?);
 
     const full_doc =
         \\{"executors": 2,
@@ -1961,6 +1967,31 @@ test "parse: the defaults, a full document, and what is refused" {
     try std.testing.expectEqual(@as(usize, if (features.websocket) 3 else 2), f.routes.len);
     try std.testing.expectEqual(@as(?u32, 500), f.routes[0].timeout_ms);
     try std.testing.expect(f.middleware[2] == .rate_limit);
+
+    if (features.postgres) {
+        why.end = 0;
+        const p = try parse(a, "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"url\": \"postgres://db.internal/app\", \"sslmode\": \"verify-ca\", \"ca_pem\": \"-----BEGIN CERTIFICATE-----\"}}]}", &why);
+        try std.testing.expectEqual(SslMode.verify_ca, sslMode(p.databases[0].postgres.?.sslmode.?).?);
+        try std.testing.expectEqual(ResetSession.auto, p.databases[0].postgres.?.reset_session);
+        why.end = 0;
+        const always = try parse(a, "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"url\": \"postgres://localhost/app\", \"reset_session\": \"always\"}}]}", &why);
+        try std.testing.expectEqual(ResetSession.always, always.databases[0].postgres.?.reset_session);
+    }
+    if (features.auth) {
+        why.end = 0;
+        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\", \"audience\": \"api\"}}]}", &why);
+        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\", \"allow_any_audience\": true}}]}", &why);
+        // Inline keys are the application's own: no audience needed.
+        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks\": {\"keys\": []}}}]}", &why);
+    }
+}
+
+test "parse: each refused document is error.Config with a reason" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
 
     const bad = [_][]const u8{
         "{\"nope\": 1}",
@@ -2003,25 +2034,14 @@ test "parse: the defaults, a full document, and what is refused" {
     };
     for (bad) |doc| {
         why.end = 0;
-        try std.testing.expectError(error.Config, parse(a, doc, &why));
-        try std.testing.expect(why.buffered().len > 0);
-    }
-
-    if (features.postgres) {
-        why.end = 0;
-        const p = try parse(a, "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"url\": \"postgres://db.internal/app\", \"sslmode\": \"verify-ca\", \"ca_pem\": \"-----BEGIN CERTIFICATE-----\"}}]}", &why);
-        try std.testing.expectEqual(SslMode.verify_ca, sslMode(p.databases[0].postgres.?.sslmode.?).?);
-        try std.testing.expectEqual(ResetSession.auto, p.databases[0].postgres.?.reset_session);
-        why.end = 0;
-        const always = try parse(a, "{\"databases\": [{\"name\": \"d\", \"postgres\": {\"url\": \"postgres://localhost/app\", \"reset_session\": \"always\"}}]}", &why);
-        try std.testing.expectEqual(ResetSession.always, always.databases[0].postgres.?.reset_session);
-    }
-    if (features.auth) {
-        why.end = 0;
-        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\", \"audience\": \"api\"}}]}", &why);
-        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks_url\": \"https://issuer.example/jwks\", \"allow_any_audience\": true}}]}", &why);
-        // Inline keys are the application's own: no audience needed.
-        _ = try parse(a, "{\"middleware\": [{\"jwt\": {\"jwks\": {\"keys\": []}}}]}", &why);
+        std.testing.expectError(error.Config, parse(a, doc, &why)) catch |err| {
+            std.debug.print("not refused: {s}\n", .{doc});
+            return err;
+        };
+        std.testing.expect(why.buffered().len > 0) catch |err| {
+            std.debug.print("refused without a reason: {s}\n", .{doc});
+            return err;
+        };
     }
 }
 
@@ -2175,7 +2195,7 @@ const SchemaCheck = struct {
     }
 };
 
-test "config: modes keys" {
+test "config: environment, deployment, error_detail, proxy.trusted and proxy_protocol_from parse; absent they stay unset (keepalive 75 s)" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

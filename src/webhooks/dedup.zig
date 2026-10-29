@@ -223,9 +223,9 @@ test "memory: bounded, oldest dropped" {
         const id = std.fmt.bufPrint(&b, "id{d}", .{i}) catch unreachable;
         _ = try m.claim(keyOf("x", id), 1_000_000, 0);
     }
-    var total: usize = 0;
-    for (&m.shards) |*s| total += s.map.count();
-    try std.testing.expect(total <= 32);
+    // The newest id is still held; the first one was dropped to make room.
+    try std.testing.expectEqual(Claim.pending, try m.claim(keyOf("x", "id999"), 1_000_000, 0));
+    try std.testing.expectEqual(Claim.new, try m.claim(keyOf("x", "id0"), 1_000_000, 0));
 }
 
 test "keys differ by preset" {

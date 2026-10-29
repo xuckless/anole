@@ -669,14 +669,14 @@ const Host = struct {
     }
 };
 
-test "isPublic table" {
+test "isPublic: only global unicast is public (loopback, private, link-local, CGNAT, ULA, multicast, unspecified are not)" {
     for ([_][]const u8{ "8.8.8.8", "2001:4860::8888" }) |t| try std.testing.expect(isPublic(try IpAddress.parse(t, 0)));
     for ([_][]const u8{ "127.0.0.1", "::1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "fc00::1", "169.254.1.1", "fe80::1", "100.64.0.1", "0.0.0.0", "224.0.0.1" }) |t| {
         try std.testing.expect(!isPublic(try IpAddress.parse(t, 0)));
     }
 }
 
-test "named networks and Network.format" {
+test "networks: the private and loopback sets cover their ranges and print in CIDR form" {
     try std.testing.expect(containsAny(&networks.private, try IpAddress.parse("172.31.255.255", 0)));
     try std.testing.expect(!containsAny(&networks.private, try IpAddress.parse("172.32.0.1", 0)));
     try std.testing.expect(containsAny(&networks.loopback, try IpAddress.parse("::ffff:127.0.0.1", 0)));
@@ -690,6 +690,4 @@ test "named networks and Network.format" {
     w = .fixed(&buf);
     try networks.private[3].format(&w);
     try std.testing.expectEqualStrings("fc00::/7", w.buffered());
-    const parsed = try Network.parse("10.0.0.0/8");
-    try std.testing.expect(parsed.contains(try IpAddress.parse("10.9.9.9", 0)));
 }

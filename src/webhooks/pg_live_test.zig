@@ -12,6 +12,7 @@ const build_options = @import("build_options");
 const zio = @import("zio");
 const anole = @import("../root.zig");
 const wh = @import("root.zig");
+const wait = @import("anole_test_wait");
 
 const testing = std.testing;
 const gpa = testing.allocator;
@@ -250,10 +251,6 @@ test "pg: live webhooks: two instances starting together on populated 0.4.0 tabl
     try f.init(.icu_en_us);
     defer f.deinit();
     try f.makeOldTables();
-    // Enough rows that moving them and building the new index takes a
-    // while, so the two starts overlap.
-    _ = try f.pgc.with(.{ .timeout = .max }).exec(&f.c, "INSERT INTO whtest_webhook_messages (id, owner, created_ms, body) SELECT 'bulk_' || g, 'owner_' || (g % 100), 0, '{}' FROM generate_series(1, 200000) g", .{});
-    _ = try f.pgc.with(.{ .timeout = .max }).exec(&f.c, "INSERT INTO whtest_webhook_attempts (message_id, endpoint_id, at_ms, body) SELECT 'bulk_' || g, 'ep_' || (g % 10), 0, '{}' FROM generate_series(1, 200000) g", .{});
     const jc = try f.jobs();
     defer jc.deinit();
     {
@@ -270,10 +267,28 @@ test "pg: live webhooks: two instances starting together on populated 0.4.0 tabl
     defer a.deinit();
     const b = try f.hooks(other_jc);
     defer b.deinit();
+    // A third session holds the migration's advisory lock, so both starts
+    // queue behind it and are released together (regression test, 9b13c2f).
+    const holder_pg = try anole.pg.Client.init(gpa, f.c.io, .{ .url = f.url, .environ = .empty });
+    defer holder_pg.deinit();
+    var holder = try holder_pg.begin(&f.c, .{ .timeout = .max });
+    defer holder.deinit();
+    _ = try holder.table(&f.c, "SELECT pg_advisory_xact_lock($1::bigint)", &.{.{ .int = a.store.sql.migrate_key }});
     var sa: Starting = .{ .hooks = a };
     var sb: Starting = .{ .hooks = b };
     var fa = try f.c.io.concurrent(Starting.run, .{&sa});
+    defer fa.cancel(f.c.io);
     var fb = try f.c.io.concurrent(Starting.run, .{&sb});
+    defer fb.cancel(f.c.io);
+    const Waiting = struct {
+        admin: *anole.pg.Client,
+        c: *anole.db.Ctx,
+        fn both(w: @This()) !bool {
+            return (try w.admin.one(i64, w.c, "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND database = (SELECT oid FROM pg_database WHERE datname = '" ++ db_name ++ "')", .{})) == 2;
+        }
+    };
+    try wait.waitUntil(f.c.io, "both starts wait for the migration's advisory lock", Waiting{ .admin = f.admin, .c = &f.c }, Waiting.both);
+    try holder.rollback(&f.c);
     fa.await(f.c.io);
     fb.await(f.c.io);
     try sa.result;

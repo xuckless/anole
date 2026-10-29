@@ -58,7 +58,7 @@ pub fn needsRehash(stored: []const u8) bool {
     return std.mem.indexOf(u8, stored, want) == null;
 }
 
-test "hash, verify, rehash" {
+test "password: a hash verifies only its password, and needsRehash flags bcrypt and other parameters" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var buf: [128]u8 = undefined;

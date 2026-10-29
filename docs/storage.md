@@ -117,7 +117,7 @@ Once the server drains, no upload starts (`ServiceUnavailable`, code `draining`)
 
 ## Testing
 
-`anole.s3.testing.FakeServer` is an S3 in process, on Anole's HTTP server, for tests that need no Docker. It keeps objects in memory, **verifies every request's SigV4 signature** (header or presigned) with the same code the client uses, and models what S3 checks: ListObjectsV2, multipart (with the 5 MiB minimum part), conditional and range requests, `If-None-Match: *`. `addFault` scripts failures (a 503 twice, a clock-skew answer); `hold_parts` and `stall_gets` make back-pressure and the idle bound testable without timing.
+`anole.s3.testing.FakeServer` is an S3 in process, on Anole's HTTP server, for tests that need no Docker. It keeps objects in memory, **verifies every request's SigV4 signature** (header or presigned) with the same code the client uses, and models what S3 checks: ListObjectsV2, multipart (with the 5 MiB minimum part), conditional and range requests, `If-None-Match: *`, and a signature date more than 15 minutes off its clock (403 `RequestTimeTooSkewed`; `clock_offset_s` moves the fake's clock). `addFault` scripts failures (a 503 twice, a clock-skew answer); `hold_parts` and `stall_gets` make back-pressure and the idle bound testable without timing.
 
 ```zig
 var fake = try anole.s3.testing.FakeServer.start(gpa, io);

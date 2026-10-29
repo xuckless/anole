@@ -200,6 +200,19 @@ test "Handle: the kind in bits 28-32; every kind, the last slot and the last gen
     }
 }
 
+test "capi engine: every handle kind but the reserved db_query has an entry in abi.handle_kinds with its number and name" {
+    const info = @typeInfo(Handle.Kind).@"enum";
+    inline for (info.field_names, info.field_values) |name, value| {
+        if (value == @backingInt(Handle.Kind.db_query)) continue;
+        var found = false;
+        for (abi.handle_kinds) |k| if (k.kind == value) {
+            try std.testing.expectEqualStrings(name, k.name);
+            found = true;
+        };
+        try std.testing.expect(found);
+    }
+}
+
 /// Generations count 1..max_gen and wrap to 1 (0 is never valid).
 pub const max_gen: u32 = std.math.maxInt(u28);
 
@@ -353,6 +366,11 @@ pub const no_slot = std.math.maxInt(u32);
 
 /// Records up to this size never wait for `Exec.record_bytes` to fall.
 const small_record = 1024;
+
+/// How long a poster canceled while it waits for ring room still waits,
+/// uncancelably, for its record's place (`Exec.postRecord`): the drain's
+/// other per-connection bounds (linger, the HTTP/2 notice) are 1 s too.
+const cancel_post_wait_ns: i96 = 1 * std.time.ns_per_s;
 
 fn closeFd(fd: c_int) void {
     if (comptime builtin.os.tag == .windows) return;
@@ -710,8 +728,13 @@ pub const Exec = struct {
     /// while the ring is full (a large record also while the records
     /// already queued pass `record_budget` bytes: one always fits in an
     /// empty ring). Everywhere else (another thread, or no `wait` and a
-    /// full ring) it goes onto the overflow list: nothing is ever dropped,
-    /// and nothing spins.
+    /// full ring) it goes onto the overflow list: nothing is dropped, and
+    /// nothing spins. One exception: a waiter canceled while it waits for
+    /// room keeps waiting, uncancelably, for at most `cancel_post_wait_ns`,
+    /// so the record keeps its place behind the ones before it; the record
+    /// is freed only if the consumer still hasn't made room by then. The
+    /// cancel is re-armed for the caller's next cancelation point. Once
+    /// `destroy` set `abandon`, a waiter frees its record at once.
     pub fn postRecord(x: *Exec, rec: []align(8) u8, wait: bool) void {
         const c = x.consumer orelse return freeRecord(rec.ptr);
         if (!x.onThisExecutor()) {
@@ -720,7 +743,19 @@ pub const Exec = struct {
         }
         if (wait) {
             const need: usize = if (rec.len > small_record) rec.len else 0;
-            while (!x.hasRoom(need)) x.waitRoom(need, null) catch return freeRecord(rec.ptr);
+            while (!x.hasRoom(need)) {
+                // `destroy`: the consumer hears nothing more, and nobody
+                // may poll again to make room.
+                if (x.engine.abandon.load(.acquire)) return freeRecord(rec.ptr);
+                x.waitRoom(need, null) catch |err| switch (err) {
+                    error.Abandoned => return freeRecord(rec.ptr),
+                    error.Canceled => {
+                        if (!x.waitRoomCanceled(need)) return freeRecord(rec.ptr);
+                        break;
+                    },
+                    error.Timeout => unreachable, // no deadline
+                };
+            }
             _ = x.record_bytes.fetchAdd(rec.len, .monotonic);
             const pushed = x.ring.push(.{ .handle = 0, .rec = rec.ptr });
             std.debug.assert(pushed);
@@ -732,6 +767,34 @@ pub const Exec = struct {
             x.pushOverflow(rec);
         }
         c.wake();
+    }
+
+    /// `postRecord`'s waiter was canceled while it waited for room. C3:
+    /// the cancel goes back to the caller's next wait. C2/U4: the record
+    /// (often the end of something: ws_close, net_close) still takes its
+    /// place in the ring, uncancelably, for at most `cancel_post_wait_ns`;
+    /// past that the consumer is not polling. Not the overflow list: `poll`
+    /// drains it after the ring, so a later record that found ring room
+    /// would overtake this one. False: no room came (the bound passed, or
+    /// `destroy` abandoned the consumer), and the caller frees the record.
+    fn waitRoomCanceled(x: *Exec, need: usize) bool {
+        const io = x.engine.io;
+        if (comptime builtin.is_test) if (test_room_canceled) |h| h();
+        io.recancel();
+        const prot = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(prot);
+        const bound = if (comptime builtin.is_test) test_cancel_post_wait_ns orelse cancel_post_wait_ns else cancel_post_wait_ns;
+        const until = std.Io.Clock.awake.now(io).nanoseconds + bound;
+        while (!x.hasRoom(need)) {
+            if (x.engine.abandon.load(.acquire)) return false;
+            x.waitRoom(need, until) catch |e| switch (e) {
+                // Room made right at the deadline still takes the record.
+                error.Timeout => return x.hasRoom(need),
+                error.Abandoned => return false,
+                error.Canceled => unreachable, // protection is blocked
+            };
+        }
+        return true;
     }
 
     fn onThisExecutor(x: *const Exec) bool {
@@ -750,12 +813,17 @@ pub const Exec = struct {
 
     /// Waits (a task of this executor) until `poll` has made room, or until
     /// `deadline` (awake clock, ns). The caller re-checks its own condition.
-    pub fn waitRoom(x: *Exec, need: usize, deadline: ?i96) error{ Canceled, Timeout }!void {
+    /// `error.Abandoned`: `destroy` abandoned the consumer, nobody will make
+    /// room, and every later call returns it at once, so a caller that
+    /// loops must leave on it (it is not a cancel: nothing to re-arm).
+    pub fn waitRoom(x: *Exec, need: usize, deadline: ?i96) error{ Canceled, Timeout, Abandoned }!void {
         const seen = x.room.load(.acquire);
         _ = x.room_waiters.fetchAdd(1, .seq_cst);
         defer _ = x.room_waiters.fetchSub(1, .monotonic);
         // Announced: look again (Dekker with the consumer's pop and
-        // `signalRoom`).
+        // `signalRoom`). `abandon` is set before `destroy` bumps `room`:
+        // a `seen` taken after that bump finds it set here.
+        if (x.engine.abandon.load(.acquire)) return error.Abandoned;
         if (x.hasRoom(need)) return;
         // The consumer is behind: make sure it hears there is work.
         if (x.consumer) |c| c.wake();
@@ -763,7 +831,17 @@ pub const Exec = struct {
         const t: std.Io.Timeout = if (deadline) |d| .{ .deadline = .{ .raw = .{ .nanoseconds = d }, .clock = .awake } } else .none;
         io.futexWaitTimeout(u32, &x.room.raw, seen, t) catch return error.Canceled;
         if (comptime builtin.is_test) _ = x.room_wakeups.fetchAdd(1, .monotonic);
+        // Woken by `destroy`'s bump (`abandonRoom`).
+        if (x.engine.abandon.load(.acquire)) return error.Abandoned;
         if (deadline) |d| if (std.Io.Clock.awake.now(io).nanoseconds >= d) return error.Timeout;
+    }
+
+    /// `destroy`, after it set `abandon`: every task parked for room wakes
+    /// with `error.Abandoned`, whatever the room: `postRecord` frees its
+    /// record, a request or call still waiting to be handed over is ended.
+    fn abandonRoom(x: *Exec) void {
+        _ = x.room.fetchAdd(1, .release);
+        x.wakeFutex(&x.room);
     }
 
     /// Consumer side: after `poll` took anything from this executor's ring.
@@ -1085,6 +1163,16 @@ pub const ListenerState = struct {
 pub var test_control_hook: ?*const fn () void = null;
 /// Tests only: the environment lookups `create` resolves the modes with.
 pub var _test_vars: ?modes.Vars = null;
+/// Tests only: the margin of Anole's request backstop past the longest
+/// consumer deadline (`serverOptions`), read at `create`. A test that needs
+/// a stream to outlive the backstop shortens it instead of waiting 5 s.
+pub var test_backstop_margin_ms: if (builtin.is_test) u32 else void = if (builtin.is_test) backstop_margin_ms else {};
+/// The request backstop's margin past the longest consumer deadline.
+const backstop_margin_ms: u32 = 5000;
+
+fn backstopMarginMs() u32 {
+    return if (comptime builtin.is_test) test_backstop_margin_ms else backstop_margin_ms;
+}
 
 pub const Engine = struct {
     arena: std.heap.ArenaAllocator,
@@ -1464,7 +1552,7 @@ pub const Engine = struct {
             for (cfg.routes) |r| if (r.timeout_ms) |t| {
                 longest = @max(longest, t);
             };
-            break :blk .fromMilliseconds(@as(i64, longest) + 5000);
+            break :blk .fromMilliseconds(@as(i64, longest) + backstopMarginMs());
         } else null;
         const listeners = try e.buildListeners(a, cfg);
         return .{
@@ -2029,6 +2117,7 @@ pub const Engine = struct {
                 // that cannot come (it may run on a consumer's own thread).
                 .running, .draining => {
                     e.abandon.store(true, .release);
+                    for (e.execs) |*x| x.abandonRoom();
                     for (e.execs) |*x| x.setEvent(&x.kick);
                     e.drain() catch {};
                 },
@@ -2485,9 +2574,16 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
     var canceled = false;
     while (!x.ring.push(.{ .handle = x.handleOf(si, gen), .rec = null })) {
         std.debug.assert(d == null);
-        if (s.timed_out or std.Io.Clock.awake.now(io).nanoseconds >= s.deadline) {
+        // `destroy` (`abandonAll` may have marked the slot already): the
+        // consumer will never make room.
+        const stopping = s.abandoned or e.abandon.load(.acquire);
+        if (stopping or s.timed_out or std.Io.Clock.awake.now(io).nanoseconds >= s.deadline) {
             x.unlink(si);
             x.release(si);
+            if (stopping) {
+                res.fail(.service_unavailable, "the server is stopping");
+                return;
+            }
             _ = e.busy_count.fetchAdd(1, .monotonic);
             res.fail(.service_unavailable, "the application is behind");
             return;
@@ -2497,7 +2593,8 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
                 canceled = true;
                 break;
             },
-            error.Timeout => continue,
+            // The checks above end it.
+            error.Timeout, error.Abandoned => continue,
         };
     }
     x.consumer.?.wake();
@@ -3630,6 +3727,16 @@ pub var test_pin: if (builtin.is_test) ?*TestPin else void = if (builtin.is_test
 /// the test sets `release`, so a test can end a detached request's stream
 /// while another thread's call is on it.
 pub var test_answer_hold: if (builtin.is_test) ?*TestPin else void = if (builtin.is_test) null else {};
+
+/// A test hook (test builds only): called by `postRecord` when a cancel
+/// ends the poster's wait for ring room, so a test knows the cancel landed
+/// while the poster was parked.
+pub var test_room_canceled: if (builtin.is_test) ?*const fn () void else void = if (builtin.is_test) null else {};
+
+/// A test hook (test builds only): replaces `cancel_post_wait_ns`, so a
+/// test whose consumer polls only after the cancel does not depend on
+/// polling within 1 s (TESTING.md D6).
+pub var test_cancel_post_wait_ns: if (builtin.is_test) ?i96 else void = if (builtin.is_test) null else {};
 
 fn testHold(p: *TestPin) void {
     p.held.store(true, .release);

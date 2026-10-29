@@ -19,6 +19,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const features = @import("build_options");
+const wait = @import("anole_test_wait");
 const ui = @import("anole_console_ui");
 const anole = @import("../root.zig");
 const server_mod = @import("../server.zig");
@@ -56,14 +57,6 @@ fn lobby(ws: *websocket.Socket, _: *http.Request) !void {
 }
 
 // ------------------------------------------------------- the hang guard
-
-fn guardMs() i64 {
-    var factor: i64 = 1;
-    if (comptime builtin.link_libc) if (std.c.getenv("ANOLE_TEST_TIMEOUT_FACTOR")) |v| {
-        factor = @max(1, std.fmt.parseInt(i64, std.mem.trim(u8, std.mem.span(v), " \t\r\n"), 10) catch 1);
-    };
-    return 10_000 * factor;
-}
 
 /// Waits until `fd` is readable or `deadline` (monotonic ms) passes.
 fn readable(fd: sys.fd_t, deadline: i64, comptime what: []const u8) !void {
@@ -219,30 +212,35 @@ const Console = struct {
     }
 
     /// Asks `view` until `check` holds (the state is the runtime's, reached
-    /// on its own time), with a back-off between asks; the last snapshot.
+    /// on its own time); the last snapshot. A busy answer is "not yet".
     fn snapshotUntil(self: *Console, comptime T: type, view: protocol.View, comptime what: []const u8, comptime check: fn (T) bool) !T {
-        var backoff: i32 = 1;
-        while (true) {
-            if (try self.snapshot(T, view)) |v| if (check(v)) return v;
-            if (sys.monotonicMs() >= self.deadline) {
-                std.log.warn("console live test: timed out waiting for: " ++ what, .{});
-                return error.TimedOut;
+        const Ctx = struct {
+            c: *Console,
+            view: protocol.View,
+            last: *?T,
+            fn holds(x: @This()) !bool {
+                const v = (try x.c.snapshot(T, x.view)) orelse return false;
+                x.last.* = v;
+                return check(v);
             }
-            var p = [1]sys.PollFd{.{ .fd = -1, .events = 0, .revents = 0 }};
-            _ = sys.poll(&p, backoff);
-            backoff = @min(backoff * 2, 50);
-        }
+        };
+        var last: ?T = null;
+        try wait.waitUntil(std.testing.io, what, Ctx{ .c = self, .view = view, .last = &last }, Ctx.holds);
+        return last.?;
     }
 
-    /// Reads frames until `check(self)` holds.
+    /// Reads frames (each batch waited for on the socket) until
+    /// `check(self)` holds.
     fn until(self: *Console, comptime what: []const u8, comptime check: fn (*Console) bool) !void {
-        while (!check(self)) {
-            if (sys.monotonicMs() >= self.deadline) {
-                std.log.warn("console live test: timed out waiting for: " ++ what, .{});
-                return error.TimedOut;
+        const Ctx = struct {
+            c: *Console,
+            fn holds(x: @This()) !bool {
+                if (check(x.c)) return true;
+                _ = try x.c.pump(null);
+                return check(x.c);
             }
-            _ = try self.pump(null);
-        }
+        };
+        try wait.waitUntil(std.testing.io, what, Ctx{ .c = self }, Ctx.holds);
     }
 };
 
@@ -328,7 +326,7 @@ const Check = struct {
     }
 
     fn run(self: *Check) !void {
-        const deadline = sys.monotonicMs() + guardMs();
+        const deadline = sys.monotonicMs() + wait.deadlineMs();
         var c = try Console.attach(self.socket, deadline);
         defer c.deinit();
 
@@ -357,7 +355,10 @@ const Check = struct {
         if (!try ev.until("\r\n\r\n", deadline)) return error.EventStreamClosed;
         try std.testing.expect(std.mem.startsWith(u8, ev.buf[0..ev.len], "HTTP/1.1 200"));
 
-        // /requests: both requests under their route patterns.
+        // /requests: both requests under their route patterns. Subscribing
+        // again replaces the subscription, whose first frame goes out at
+        // once with the cumulative sums (no 250 ms interval to wait).
+        try c.subscribed(try c.conn.subscribeStats(250));
         try c.until("both requests in a stats frame", bothCounted);
         const st = c.last_stats.?;
         const ok = routeStat(st, "/notes/:id").?;

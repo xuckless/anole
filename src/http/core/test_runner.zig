@@ -94,6 +94,7 @@ pub fn main(init: std.process.Init) !void {
 
     var env = Env.init(gpa, init.environ_map);
     defer env.deinit(gpa);
+    durations.setup(&env, gpa, init.minimal.args);
 
     var slowest = SlowTracker.init(io, 5);
     defer slowest.deinit(gpa);
@@ -123,8 +124,9 @@ pub fn main(init: std.process.Init) !void {
     // Count total tests to run
     const test_count = blk: {
         var count: usize = 0;
-        for (builtin.test_functions) |t| {
+        for (builtin.test_functions, 0..) |t, ti| {
             if (isSetup(t) or isTeardown(t)) continue;
+            if (!env.inShard(ti)) continue;
             const is_unnamed_test = isUnnamed(t);
             if (env.filters.items.len > 0) {
                 if (is_unnamed_test) continue;
@@ -149,10 +151,11 @@ pub fn main(init: std.process.Init) !void {
 
     var test_index: usize = 0;
 
-    for (builtin.test_functions) |t| {
+    for (builtin.test_functions, 0..) |t, ti| {
         if (isSetup(t) or isTeardown(t)) {
             continue;
         }
+        if (!env.inShard(ti)) continue;
 
         var status = Status.pass;
         slowest.startTiming(io);
@@ -246,6 +249,8 @@ pub fn main(init: std.process.Init) !void {
             },
         }
 
+        durations.record(&env, friendly_name, ns_taken, if (leaked) "leak" else @tagName(status));
+
         const ms = @as(f64, @floatFromInt(ns_taken)) / 1_000_000.0;
         const status_str = switch (status) {
             .pass => "OK",
@@ -321,6 +326,49 @@ pub fn main(init: std.process.Init) !void {
     Printer.fmt("\n", .{});
     std.process.exit(if (fail == 0 and leak == 0) 0 else 1);
 }
+
+/// ANOLE: per-test durations, the same lines as src/safety/test_runner.zig
+/// writes (`<ns>\t<result>\t<name>\t<binary>`, one O_APPEND write each,
+/// so shards share the file); tools/test_durations.py summarizes them.
+/// Local only, POSIX only.
+const durations = struct {
+    fn setup(env: *Env, gpa: Allocator, args: std.process.Args) void {
+        if (env.durations_path == null) return;
+        var it = args.iterateAllocator(gpa) catch return;
+        defer it.deinit();
+        const argv0 = it.next() orelse "core-test";
+        const base = std.fs.path.basename(argv0);
+        env.binary = if (env.shard_label.len == 0)
+            std.heap.page_allocator.dupe(u8, base) catch "core-test"
+        else
+            std.fmt.allocPrint(std.heap.page_allocator, "{s}#{s}", .{ base, env.shard_label }) catch "core-test";
+    }
+
+    fn record(env: *Env, name: []const u8, ns: u64, result: []const u8) void {
+        if (comptime builtin.os.tag == .windows) return;
+        const p = env.durations_path orelse return;
+        var buf: [4096]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "{d}\t{s}\t{s}\t{s}\n", .{ ns, result, name, env.binary }) catch return;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, p, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o644) catch |err| {
+            std.debug.print("ANOLE_TEST_DURATIONS={s}: cannot open it ({t}); no durations recorded\n", .{ p, err });
+            env.durations_path = null;
+            return;
+        };
+        defer _ = std.posix.system.close(fd);
+        var rest: []const u8 = line;
+        while (rest.len > 0) {
+            const rc = std.posix.system.write(fd, rest.ptr, rest.len);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return;
+                    rest = rest[@intCast(rc)..];
+                },
+                .INTR => continue,
+                else => return,
+            }
+        }
+    }
+};
 
 const Printer = struct {
     fn fmt(comptime format: []const u8, args: anytype) void {
@@ -424,6 +472,15 @@ const Env = struct {
     fail_first: bool,
     filters: std.ArrayList([]const u8),
     do_log_capture: bool,
+    /// ANOLE_TEST_SHARD=i/n: only the tests whose index in
+    /// `builtin.test_functions` is i modulo n (build.zig's
+    /// `-Dtest-shards`; the same protocol as src/safety/test_runner.zig).
+    shard_index: usize = 0,
+    shard_count: usize = 1,
+    shard_label: []const u8 = "",
+    /// ANOLE_TEST_DURATIONS=<path> (see `durations`).
+    durations_path: ?[]const u8 = null,
+    binary: []const u8 = "",
 
     fn init(allocator: Allocator, environ_map: *std.process.Environ.Map) Env {
         var filters: std.ArrayList([]const u8) = .empty;
@@ -439,12 +496,30 @@ const Env = struct {
             }
         }
 
-        return .{
+        var env: Env = .{
             .verbose = readEnvVerbose(environ_map),
             .fail_first = readEnvBool(environ_map, "TEST_FAIL_FIRST", false),
             .filters = filters,
             .do_log_capture = readEnvBool(environ_map, "TEST_LOG_CAPTURE", true),
+            .durations_path = if (environ_map.get("ANOLE_TEST_DURATIONS")) |p| (if (p.len > 0) p else null) else null,
         };
+        if (environ_map.get("ANOLE_TEST_SHARD")) |v| if (v.len > 0) {
+            const slash = std.mem.indexOfScalar(u8, v, '/') orelse badShard(v);
+            env.shard_index = std.fmt.parseUnsigned(usize, v[0..slash], 10) catch badShard(v);
+            env.shard_count = std.fmt.parseUnsigned(usize, v[slash + 1 ..], 10) catch badShard(v);
+            if (env.shard_count == 0 or env.shard_index >= env.shard_count) badShard(v);
+            env.shard_label = v;
+        };
+        return env;
+    }
+
+    fn badShard(v: []const u8) noreturn {
+        std.debug.print("ANOLE_TEST_SHARD={s}: expected <index>/<count> with index < count\n", .{v});
+        std.process.exit(1);
+    }
+
+    fn inShard(self: *const Env, index: usize) bool {
+        return index % self.shard_count == self.shard_index;
     }
 
     fn deinit(self: *Env, allocator: Allocator) void {

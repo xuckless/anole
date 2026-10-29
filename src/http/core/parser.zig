@@ -1004,7 +1004,7 @@ test "parseKeepAliveHeader: empty string" {
     try std.testing.expectEqual(null, params.max);
 }
 
-test "RequestParser: basic" {
+test "RequestParser: a request fed one byte at a time yields its method, version, URL and headers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1030,24 +1030,17 @@ test "RequestParser: basic" {
         };
     }
 
-    try std.testing.expectEqual(true, parser.state.has_method);
     try std.testing.expectEqual(.get, req.method);
-
-    try std.testing.expectEqual(true, parser.state.has_version);
     try std.testing.expectEqual(1, req.version_major);
     try std.testing.expectEqual(1, req.version_minor);
-
-    try std.testing.expectEqual(true, parser.state.has_url);
     try std.testing.expectEqualStrings("/example", req.url);
-
-    try std.testing.expectEqual(true, parser.state.headers_complete);
 
     const host_val = req.headers.get("Host");
     try std.testing.expect(host_val != null);
     try std.testing.expectEqualStrings("example.com", host_val.?);
 }
 
-test "ResponseParser: basic" {
+test "ResponseParser: a response fed one byte at a time yields its status, version and headers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1069,14 +1062,9 @@ test "ResponseParser: basic" {
         };
     }
 
-    try std.testing.expectEqual(true, parser.state.has_status);
     try std.testing.expectEqual(.ok, response.status);
-
-    try std.testing.expectEqual(true, parser.state.has_version);
     try std.testing.expectEqual(1, response.version_major);
     try std.testing.expectEqual(1, response.version_minor);
-
-    try std.testing.expectEqual(true, parser.state.headers_complete);
 
     const content_type = response.headers.get("Content-Type");
     try std.testing.expect(content_type != null);

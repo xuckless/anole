@@ -1,0 +1,35 @@
+name: Nightly
+
+# The stress and load tests (TESTING.md W3), which `zig build test` never
+# runs (research/s15/test-audit.md, K2 T11). The 0.4.0 flakes were found by
+# repeating the suite across ten jobs by accident; this is the same
+# pressure on purpose, on a schedule. tools/stress-tests.sh remains the
+# loop to run before pushing concurrent code.
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: Stress and load tests (ubuntu)
+    # K2: catches what the per-PR suite is kept too short to hit: races and
+    # load-dependent failures in the [stress] tests (and the [slow] tests
+    # moved out of `zig build test` by K1).
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 (v7.0.1)
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+          cache-key: nightly-stress
+      - uses: ./.github/actions/install-gdb
+      - name: Fetch dependencies (retried)
+        run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      - name: zig build test-stress
+        timeout-minutes: 85
+        run: zig build test-stress --test-timeout 120s --summary all

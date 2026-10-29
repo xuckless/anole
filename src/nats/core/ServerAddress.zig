@@ -113,7 +113,7 @@ fn expectAddress(text: []const u8, expected_host: []const u8, expected_port: u16
     try testing.expectEqual(expected_port, address.port);
 }
 
-test "accepted forms" {
+test "these address forms parse to their host and port, 4222 when none is given" {
     try expectAddress("nats://127.0.0.1:4222", "127.0.0.1", 4222);
     try expectAddress("NATS://demo.nats.io", "demo.nats.io", 4222);
     try expectAddress("localhost:14222", "localhost", 14222);
@@ -128,16 +128,16 @@ test "accepted forms" {
     try expectAddress(&long_host, &long_host, 4222);
 }
 
-test "rejected forms" {
+test "other schemes, credentials, paths, bad ports and malformed IPv6 literals are InvalidOptions" {
     const too_long: [256]u8 = @splat('h');
     for ([_][]const u8{
-        "",                    "nats://",                    "tls://",          "ws://host",           "wss://host",
-        "http://host",         "nats://user:pass@host:4222", "user@host",       "host:",               "host:0",
-        "host:65536",          "host:12a",                   "host:-1",         "::1",                 "::1:4222",
-        "[::1",                "[::1]x",                     "[::1]:",          "[127.0.0.1]:4222",    "host:4222/path",
-        "nats://host:4222?x",  "host name",                  "host\r\n",        "[]:4222",             &too_long,
+        "",                    "nats://",                    "tls://",    "ws://host",           "wss://host",
+        "http://host",         "nats://user:pass@host:4222", "user@host", "host:",               "host:0",
+        "host:65536",          "host:12a",                   "host:-1",   "::1",                 "::1:4222",
+        "[::1",                "[::1]x",                     "[::1]:",    "[127.0.0.1]:4222",    "host:4222/path",
+        "nats://host:4222?x",  "host name",                  "host\r\n",  "[]:4222",             &too_long,
         // Brackets hold an IPv6 literal and nothing else.
-        "[:]:4222",            "[zz:zz]:4222",               "[::1::2]",        "[1:2:3:4:5:6:7:8:9]", "[fe80::1%]:4222",
+        "[:]:4222",            "[zz:zz]:4222",               "[::1::2]",  "[1:2:3:4:5:6:7:8:9]", "[fe80::1%]:4222",
         "[::ffff:1.2.3]:4222", "[localhost:1]",
     }) |text| {
         try testing.expectError(error.InvalidOptions, parse(text));

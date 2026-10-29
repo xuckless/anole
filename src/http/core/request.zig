@@ -220,9 +220,9 @@ pub const Request = struct {
 
     fn keptOnReset(comptime name: []const u8) bool {
         const kept = [_][]const u8{
-            "arena",          "io",       "_parser", "_transport", "_config",          "_response",
-            "remote_address", "listener", "secure",  "drain",      "_drain_hooks",     "peer_certificate",
-            "_timeout_context", "_set_timeout",   "_claim_timeout",
+            "arena",            "io",           "_parser",        "_transport", "_config",      "_response",
+            "remote_address",   "listener",     "secure",         "drain",      "_drain_hooks", "peer_certificate",
+            "_timeout_context", "_set_timeout", "_claim_timeout",
         };
         @setEvalBranchQuota(10_000);
         for (kept) |k| if (std.mem.eql(u8, k, name)) return true;
@@ -1035,7 +1035,6 @@ test "Request.setTimeout: forwards relative, absolute, and disabled deadlines" {
 
     req.setTimeout(.fromSeconds(7));
     try std.testing.expectEqual(std.Io.Duration.fromSeconds(7), probe.last.duration.raw);
-    try std.testing.expect(req._deadline_from_handler);
 
     const deadline = std.Io.Clock.Timestamp.now(std.testing.io, .real).addDuration(.{
         .raw = .fromSeconds(11),
@@ -1118,7 +1117,7 @@ test "Request: no std.Io.Reader sentinel escapes the body-reading API" {
     }
 }
 
-test "Request.body: basic POST" {
+test "Request.body: a Content-Length body is read whole" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1152,14 +1151,14 @@ test "Request.body: built without zlib, a coded body is refused" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .transport = .{ .reader = &reader, .writer = undefined },
-        .parser = undefined,
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
     };
 
     var parser: RequestParser = undefined;
     try parser.init(&req);
     defer parser.deinit();
-    req.parser = &parser;
+    req._parser = &parser;
     try parseHeaders(&reader, &parser);
 
     try std.testing.expectError(error.UnsupportedContentEncoding, req.body());
@@ -1586,7 +1585,7 @@ test "Request.body: framing the parser rejects is reported as itself" {
     try std.testing.expectError(error.MalformedBody, req.body());
 }
 
-test "Request.body: large body over 128 bytes" {
+test "Request.body: a Content-Length body larger than one read's destination is read whole" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1760,7 +1759,7 @@ test "Request.multiFormData: entry with filename" {
     try std.testing.expectEqualStrings("foo.txt", form_data.get("foo").?.filename.?);
 }
 
-test "Request.multiFormData: semicolon in attribute name (regression)" {
+test "Request.multiFormData: a ';' inside an attribute name is refused, not a panic" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1794,8 +1793,8 @@ test "Request.multiFormData: semicolon in attribute name (regression)" {
 
     try parseHeaders(&reader, &parser);
 
-    // Should error out cleanly, not panic.
-    _ = req.multiFormData() catch {};
+    // The field name is "name;x", not "name", so the part has no name.
+    try std.testing.expectError(error.InvalidMultiPartEncoding, req.multiFormData());
 }
 
 test "Request.multiFormData: trailing backslash in quoted attribute (regression)" {
@@ -1877,6 +1876,7 @@ test "Request.body: 100 Continue goes through the response's sink" {
 
     const Probe = struct {
         interim: ?http.Status = null,
+        interims: usize = 0,
         w: std.Io.Writer = .failing,
         fn sink(self: *@This()) @import("sink.zig").Sink {
             return .{ .ptr = self, .vtable = &.{
@@ -1892,6 +1892,7 @@ test "Request.body: 100 Continue goes through the response's sink" {
         fn interimFn(ptr: *anyopaque, status: http.Status) std.Io.Writer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.interim = status;
+            self.interims += 1;
         }
         fn bodyFn(ptr: *anyopaque) *std.Io.Writer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1917,7 +1918,9 @@ test "Request.body: 100 Continue goes through the response's sink" {
 
     try std.testing.expectEqualStrings("data", (try req.body()).?);
     try std.testing.expectEqual(http.Status.@"continue", probe.interim.?);
-    try std.testing.expect(!req._expects_continue);
+    // A second read sends no second 100 Continue.
+    try std.testing.expectEqualStrings("data", (try req.body()).?);
+    try std.testing.expectEqual(1, probe.interims);
 }
 
 test "misuse: a second reader is BodyReaderTaken in every build mode" {

@@ -11,10 +11,8 @@ var saw_draining: std.atomic.Value(bool) = .init(false);
 /// whether the handler gave up waiting for that (the echo came late).
 var wait_release: std.Io.Event = .unset;
 var wait_gave_up: std.atomic.Value(bool) = .init(false);
-/// Closes the echo handler has seen, and whether any of those sockets
-/// needed a flusher task of its own (`dusty.WebSocketBatch`).
+/// Closes the echo handler has seen.
 var closes_seen: std.atomic.Value(usize) = .init(0);
-var flusher_started: std.atomic.Value(bool) = .init(false);
 /// "park" messages whose socket's flusher sent the held echo and ended.
 var flusher_ended: std.atomic.Value(usize) = .init(0);
 
@@ -66,7 +64,6 @@ fn echo(req: *dusty.Request, res: *dusty.Response) !void {
             },
             .close => {
                 saw_draining.store(ws.draining(), .release);
-                if (ws._conn == .h1 and ws._conn.h1.batch.started) flusher_started.store(true, .release);
                 _ = closes_seen.fetchAdd(1, .acq_rel);
                 return;
             },
@@ -131,11 +128,12 @@ const Raw = struct {
 
 fn startServer(server: *dusty.Server(void), io: std.Io) !std.Io.Future(anyerror!void) {
     server.router.get("/ws", echo);
-    const future = try io.concurrent(struct {
+    var future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) anyerror!void {
             try s.run();
         }
     }.run, .{server});
+    errdefer future.cancel(io) catch {};
     try server.waitReady(io);
     return future;
 }
@@ -194,6 +192,7 @@ test "WebSocket over HTTP/1.1: the drain closes an open socket with 1001 and doe
             try std.testing.expectError(error.Canceled, f.cancel(io_));
         }
     }.run, .{ &future, io });
+    defer drain.cancel(io) catch {};
     try std.testing.expectEqualStrings("server shutting down", try c.expectClose(1001, &buf));
     // The closing handshake: answer, and the server ends the connection.
     try c.send(0x8, &.{ 0x03, 0xe9 });
@@ -266,7 +265,56 @@ test "WebSocket over HTTP/1.1: an answer held for a batch goes out while the han
     if (test_wait.timing()) try std.testing.expect(start.durationTo(.now(io, .awake)).raw.toMilliseconds() < 2000);
 }
 
-test "WebSocket over HTTP/1.1: sockets share their executor's backstop, and one whose handler waits holds up no other" {
+/// Tasks spawned so far on the runtime, every executor.
+fn spawnedTasks(io: std.Io) !u64 {
+    const rt = zio.Runtime.fromIo(io) orelse return error.SkipZigTest;
+    var n: u64 = 0;
+    for (0..rt.executorCount()) |i| n += (rt.executorStats(i) orelse return error.SkipZigTest).spawned;
+    return n;
+}
+
+/// Opens a socket, sends `count` messages in one write (pipelined, so the
+/// server reads them as one batch), reads their echoes, closes, and waits
+/// for the handler to see the close. Returns the tasks spawned meanwhile.
+fn pipelinedSocket(io: std.Io, addr: std.Io.net.IpAddress, count: usize) !u64 {
+    const before = try spawnedTasks(io);
+    const seen = closes_seen.load(.acquire);
+    var buf: [16]u8 = undefined;
+    var a: Raw = undefined;
+    try a.open(io, addr);
+    defer a.stream.close(io);
+    for (0..count) |_| try a.queue(0x1, "m");
+    try a.writer.interface.flush();
+    for (0..count) |_| try std.testing.expectEqualStrings("m", (try a.next(&buf)).payload);
+    try a.send(0x8, &.{ 0x03, 0xe8 });
+    _ = try a.expectClose(1000, &buf);
+    try test_wait.waitAtLeast(io, "the handler saw the close", &closes_seen, seen + 1);
+    return try spawnedTasks(io) - before;
+}
+
+test "WebSocket over HTTP/1.1: busy sockets answer their batches with no task of their own" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    var future = try startServer(&server, io);
+    defer future.cancel(io) catch {};
+
+    // One socket at a time. A socket with one message makes no batch: what
+    // it costs in tasks is the connection's own.
+    const single = try pipelinedSocket(io, server.address.ip, 1);
+    // The executor's shared backstop may start again with each socket's
+    // first batch, but its reader flushes on the way to the next read, so
+    // no socket needs a flusher task of its own.
+    for (0..2) |_| {
+        const busy = try pipelinedSocket(io, server.address.ip, 3);
+        try std.testing.expect(busy <= single + 1);
+    }
+}
+
+test "WebSocket over HTTP/1.1: a socket whose handler waits holds up no other socket's answers" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
@@ -276,26 +324,6 @@ test "WebSocket over HTTP/1.1: sockets share their executor's backstop, and one 
     var future = try startServer(&server, io);
     defer future.cancel(io) catch {};
     var buf: [16]u8 = undefined;
-
-    // One socket at a time: the backstop ends with the last socket on the
-    // executor and starts again with the next one's first batch. Their
-    // readers flush on their way to the next read, so neither socket needs
-    // a flusher task of its own.
-    closes_seen.store(0, .release);
-    flusher_started.store(false, .release);
-    for (0..2) |_| {
-        var a: Raw = undefined;
-        try a.open(io, server.address.ip);
-        defer a.stream.close(io);
-        for (0..3) |_| try a.queue(0x1, "m");
-        try a.writer.interface.flush();
-        for (0..3) |_| try std.testing.expectEqualStrings("m", (try a.next(&buf)).payload);
-        try a.send(0x8, &.{ 0x03, 0xe8 });
-        _ = try a.expectClose(1000, &buf);
-    }
-    try test_wait.waitAtLeast(io, "both closes seen", &closes_seen, 2);
-    try std.testing.expectEqual(@as(usize, 2), closes_seen.load(.acquire));
-    try std.testing.expect(!flusher_started.load(.acquire));
 
     // "wait" with "x" behind it: its handler waits for this test with the
     // echo held, and the backstop has that socket's flusher send it (while
@@ -508,8 +536,8 @@ test "WebSocket over HTTP/1.1: a subprotocol the client offered is selected by t
             try s.run();
         }
     }.run, .{&server});
-    try server.waitReady(io);
     defer future.cancel(io) catch {};
+    try server.waitReady(io);
 
     var buf: [1024]u8 = undefined;
     // Offered `b, a` over two lines; the server prefers `a, c`.
@@ -525,7 +553,7 @@ test "WebSocket over HTTP/1.1: a subprotocol the client offered is selected by t
     try std.testing.expect(std.ascii.findIgnoreCase(none, "Sec-WebSocket-Protocol") == null);
 }
 
-test "WebSocket over HTTP/1.1: extra handshake headers go out with the 101; Sec-WebSocket-Accept in them is refused" {
+test "WebSocket over HTTP/1.1: Sec-WebSocket-Accept among the extra handshake headers is refused before anything is written" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
@@ -538,8 +566,8 @@ test "WebSocket over HTTP/1.1: extra handshake headers go out with the 101; Sec-
             try s.run();
         }
     }.run, .{&server});
-    try server.waitReady(io);
     defer future.cancel(io) catch {};
+    try server.waitReady(io);
 
     var buf: [1024]u8 = undefined;
     const head = try upgradeHead(io, server.address.ip, "/bad", "", &buf);

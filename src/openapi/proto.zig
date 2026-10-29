@@ -36,10 +36,10 @@ pub const connect_error: Component = .{
             m("code", obj(&.{
                 m("type", str("string")),
                 m("enum", arr(&.{
-                    str("canceled"),            str("unknown"),             str("invalid_argument"), str("deadline_exceeded"),
-                    str("not_found"),           str("already_exists"),      str("permission_denied"), str("resource_exhausted"),
-                    str("failed_precondition"), str("aborted"),             str("out_of_range"),      str("unimplemented"),
-                    str("internal"),            str("unavailable"),         str("data_loss"),         str("unauthenticated"),
+                    str("canceled"),            str("unknown"),        str("invalid_argument"),  str("deadline_exceeded"),
+                    str("not_found"),           str("already_exists"), str("permission_denied"), str("resource_exhausted"),
+                    str("failed_precondition"), str("aborted"),        str("out_of_range"),      str("unimplemented"),
+                    str("internal"),            str("unavailable"),    str("data_loss"),         str("unauthenticated"),
                 })),
             })),
             m("message", obj(&.{m("type", str("string"))})),
@@ -910,7 +910,7 @@ test "field_behavior, deprecated and comments" {
     try contains(text, "\"description\": \"A widget.\"");
 }
 
-test "template paths" {
+test "templatePath: HttpRule variables become {name} parameters, multi-segment captures split into numbered ones, ** marks the rest of the path" {
     const T = transcode.Template;
     const a = comptime templatePath(T.parse("/v1/{name}") catch unreachable);
     try testing.expectEqualStrings("/v1/{name}", a.path);

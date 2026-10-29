@@ -59,5 +59,5 @@ pub fn simple(
         error.ReadFailed => return r.err orelse error.Unexpected,
         else => |e| return e,
     };
-    return .{ .status = @intCast(@intFromEnum(resp.status())), .body = bytes };
+    return .{ .status = @intCast(@backingInt(resp.status())), .body = bytes };
 }

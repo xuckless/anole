@@ -351,7 +351,7 @@ fn expectViolations(sink: *const Collector, expected: []const [3][]const u8) !vo
     }
 }
 
-test "query: every type of the section 7 table" {
+test "query: each field type takes its own string form, refuses the others, and names absent required fields" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -465,7 +465,7 @@ test "query: all violations at once, by outside names" {
     try testing.expectEqual(50, (renamed.value orelse return error.TestUnexpectedResult).per_page);
 }
 
-test "query: a repeated single parameter is must be given once" {
+test "query: a single-valued parameter given twice is a \"must be given once\" violation" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const got = try mapInto(SearchQuery, .query, arena_state.allocator(), &.{

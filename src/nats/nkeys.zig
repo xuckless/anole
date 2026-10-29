@@ -30,7 +30,7 @@ pub const Seed = struct {
     /// The public key as text ("UA...", 56 bytes).
     pub fn publicKey(self: Seed, out: *[56]u8) []const u8 {
         var raw: [35]u8 = undefined;
-        raw[0] = @intFromEnum(self.kind);
+        raw[0] = @backingInt(self.kind);
         @memcpy(raw[1..33], &self.key_pair.public_key.toBytes());
         const crc = crc16(raw[0..33]);
         std.mem.writeInt(u16, raw[33..35], crc, .little);
@@ -56,7 +56,7 @@ pub fn decodeSeed(text: []const u8) Error!Seed {
     const b1 = raw[0] & 248;
     const b2 = ((raw[0] & 7) << 5) | ((raw[1] & 248) >> 3);
     if (b1 != seed_prefix) return error.InvalidPrefix;
-    const kind: Kind = @enumFromInt(b2);
+    const kind: Kind = @fromBackingInt(@intCast(b2));
     switch (kind) {
         .server, .cluster, .operator, .account, .user => {},
         else => return error.InvalidPrefix,
@@ -68,7 +68,7 @@ pub fn decodeSeed(text: []const u8) Error!Seed {
 /// A seed's text from its kind and 32 bytes (tests and tools).
 pub fn encodeSeed(out: *[58]u8, kind: Kind, bytes: *const [32]u8) []const u8 {
     var raw: [36]u8 = undefined;
-    const k = @intFromEnum(kind);
+    const k = @backingInt(kind);
     raw[0] = seed_prefix | (k >> 5);
     raw[1] = (k & 31) << 3;
     @memcpy(raw[2..34], bytes);
@@ -153,6 +153,13 @@ test "nkeys: a seed round trips, the public key starts with U, and a signature v
     var sig_bytes: [64]u8 = undefined;
     try std.base64.url_safe_no_pad.Decoder.decode(&sig_bytes, sig_text);
     try Ed25519.Signature.fromBytes(sig_bytes).verify("nonce-123", seed.key_pair.public_key);
+
+    // A seed nats-io made (the user pair of the NATS NKeys docs; checked
+    // with Python's cryptography Ed25519, not this file), split so secret
+    // scanners pass it (TESTING.md F3): its public key is the documented one.
+    const published = try decodeSeed("SUACSSL3UAHUDXKFSNVUZRF5UHPM" ++ "WZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY");
+    try testing.expectEqual(Kind.user, published.kind);
+    try testing.expectEqualStrings("UDXU4RCSJNZOIQHZNWXHXORDPRTGNJAHAHFRGZNEEJCPQTT2M7NLCNF4", published.publicKey(&pk_buf));
 }
 
 test "nkeys: a bad CRC, a wrong prefix and a bad length are refused" {
@@ -170,6 +177,9 @@ test "nkeys: a bad CRC, a wrong prefix and a bad length are refused" {
     var as_seed: [58]u8 = @splat('A');
     @memcpy(as_seed[0..56], seed.publicKey(&pk_buf));
     try testing.expectError(error.InvalidChecksum, decodeSeed(&as_seed));
+    // A seed with a valid CRC of a kind a login never uses.
+    var curve_buf: [58]u8 = undefined;
+    try testing.expectError(error.InvalidPrefix, decodeSeed(encodeSeed(&curve_buf, .curve, &bytes)));
 }
 
 const fuzz = @import("../fuzz.zig");

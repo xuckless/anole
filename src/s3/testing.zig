@@ -94,6 +94,11 @@ pub const FakeServer = struct {
     /// Requests currently inside a handler holding a part.
     held_parts: std.atomic.Value(u32) = .init(0),
     now_override: ?i64 = null,
+    /// Seconds the fake's own clock is ahead of the test process's. As S3
+    /// does, a header-signed request whose x-amz-date is more than 15 minutes
+    /// from the fake's clock is answered 403 RequestTimeTooSkewed with the
+    /// fake's Date (clock-skew tests).
+    clock_offset_s: i64 = 0,
     signature_failures: u32 = 0,
 
     pub fn start(gpa: std.mem.Allocator, io: std.Io) !*FakeServer {
@@ -275,7 +280,7 @@ pub const FakeServer = struct {
         try self.log.append(self.gpa, .{
             .method = util.methodName(req.method),
             .target = try self.arena.allocator().dupe(u8, req.url),
-            .status = @intCast(@intFromEnum(res.status)),
+            .status = @intCast(@backingInt(res.status)),
         });
     }
 
@@ -445,6 +450,13 @@ pub const FakeServer = struct {
         const signed = auth[sh_at + "SignedHeaders=".len .. sh_end];
         const date = req.headers.get("x-amz-date") orelse return deny(self, res, "no x-amz-date");
         const now_s = parseAmzDate(date) orelse return deny(self, res, "bad x-amz-date");
+        const server_now = util.nowSeconds(self.io) + self.clock_offset_s;
+        if (@abs(now_s - server_now) > 15 * 60) {
+            var date_buf: [29]u8 = undefined;
+            try res.header("Date", try arena.dupe(u8, util.formatHttpDate(&date_buf, server_now)));
+            try errorXml(res, .forbidden, "RequestTimeTooSkewed", "The difference between the request time and the current time is too large.");
+            return false;
+        }
         const payload_text = req.headers.get("x-amz-content-sha256") orelse return deny(self, res, "no x-amz-content-sha256");
         const payload: sigv4.PayloadHash = if (std.mem.eql(u8, payload_text, sigv4.unsigned_payload)) .unsigned else blk: {
             var d: [32]u8 = undefined;

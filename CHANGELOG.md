@@ -7,6 +7,16 @@ breaking changes are listed anyway.
 
 ### Fixed
 
+- SSE: an event written through `EventStream.startSend` (the streaming
+  `EventWriter`) now encodes its data as `send` does. Data ending in a CR or
+  LF kept its last line break off the wire, so browsers delivered `"hi"` for
+  `"hi\n"`, and an event with no data wrote no `data:` line, so browsers
+  never dispatched it (#137).
+- HTTP/1.1: a body set with `res.body` after a non-chunked stream (a
+  declared `Content-Length`, an HTTP/1.0 close-delimited body, or a sink
+  stream) was abandoned without `end` went out behind the streamed bytes.
+  The streamed bytes are now the whole body: a short one ends with the
+  connection closed, never padded with other text (#138).
 - C ABI: a crash when a binding thread answered, sent or polled while the
   server stopped. The call wakes an executor through the runtime, and the
   stop could free the runtime while that wake was still under way. The stop
@@ -38,6 +48,11 @@ breaking changes are listed anyway.
   "connector" rows with nothing in them.
 - Console: `/routes` gives WebSocket, WebTransport and gRPC routes their
   kind (`ws`, `wt`, `grpc`); every route said `http`.
+- Console: `/db` no longer files a connector under a database by a piece
+  of its type's name. A type whose name contained "pg" (`Upgrade`, a file
+  named `pg_cache.zig`) showed as PostgreSQL, and likewise for "s3",
+  "nats" and the rest. Each connector now names its system itself
+  (`console_system`); the strings are unchanged.
 - Jobs: a job that finished while the server drained could run a second
   time. A drain past its deadline cancels the runs still going, and the
   cancel could land on a finished run's state write (logged as "finished
@@ -105,6 +120,23 @@ breaking changes are listed anyway.
   that timed out, refuses `anole_db_tx_query`, `_exec`, `_commit` and
   `_rollback` with `ANOLE_E_GONE` at once, as documented. They were taken
   until the transaction's task had rolled it back.
+- C ABI: an executor task canceled while it waited for room in a full ring
+  (the consumer behind) dropped the event it was posting and swallowed the
+  cancel. Those posts include the terminal events (a WebSocket's,
+  WebTransport session's or raw connection's close), so the binding could
+  keep a handle that never ended, and the task's next wait missed its
+  cancel. The task now keeps waiting for room, uncancelably and for at most
+  1 s, so the event still arrives in order, and its cancel is passed on to
+  its next wait (#125). `anole_server_destroy` (the consumer hears nothing
+  more) ends such waits at once, so it does not wait for room that no poll
+  will make; the same goes for an HTTP/1.1 request (503) and a client- or
+  bidirectional-streaming gRPC call (UNAVAILABLE) still waiting to be
+  handed over, which held `destroy` until the earlier of the request's
+  deadline and `timeouts.shutdown_ms` (for ever only with an unbounded
+  shutdown). Such a gRPC call whose deadline passed in that wait still
+  ends with DEADLINE_EXCEEDED, but no longer re-arms a cancel that was
+  never delivered (a zio assertion in Debug and ReleaseSafe, a phantom
+  pending cancel at the task's next wait in ReleaseFast).
 - Webhooks: on PostgreSQL, `hooks.messages` paged in the database's
   collation order (en_US, ICU) instead of by bytes, so caller-supplied ids
   such as `msg_D` and `msg_c` came back in a different order than on SQLite
@@ -122,9 +154,48 @@ breaking changes are listed anyway.
   starting together take turns; it has no time limit, and each table lock it
   waits for is bounded by a 10 s `lock_timeout`, past which the start fails
   with a log line saying what to do (#109).
+- gRPC client: a cancel of the task waiting on a call is passed on as
+  `error.Canceled` from `receive`, `send` and `closeSend`, and the call is
+  reset (RST_STREAM CANCEL, H3_REQUEST_CANCELLED). It was swallowed: waiting
+  for the response head or the next message returned null with status
+  CANCELLED, and a send waiting for flow control returned
+  `error.StreamClosed`, so the canceled task went on. `s.cancel()` still
+  ends the call with status CANCELLED and no error. A unary call's cancel
+  no longer counts as a failure for the channel's breaker or retry
+  throttle. The error sets of `receive`, `send` and `closeSend` now include
+  `Canceled`, so an exhaustive `switch` on them needs the new case (#126).
+- Jobs: two races on the table of running jobs. A job cancelled through the
+  admin API just as its run started could be reported as a lost lease
+  (`ANOLE_JOB_CANCEL_LEASE_LOST`, `job.admin_cancelled` false): the
+  heartbeat could see the run before its job was built, and building it
+  cleared the flag. And when a job was claimed again while its earlier,
+  lost run was still ending, that run's end untracked the new one (whose
+  lease then lapsed, so the job ran again), and the heartbeat took the old
+  run for alive, so both ran at once. Runs are now tracked one by one, the
+  job is built before the heartbeat can see it, and a run counts as alive
+  only when the store renewed its own attempt. A run that cannot be
+  tracked for lack of memory is put back instead of running untracked
+  (#127).
+- HTTP/2: a graceful drain no longer resets connections whose peer sent
+  something after the final GOAWAY (a PING, a WINDOW_UPDATE). The drain let
+  go of a connection as soon as its final GOAWAY was written, and its cancel
+  could then skip the lingering close, so the socket was closed with that
+  input unread and the kernel sent a reset instead of a FIN; a peer could
+  lose the final GOAWAY or the end of a response it had not read yet. The
+  drain now waits for each connection's lingering close (until the peer
+  closes its side, one second at most, within `timeouts.shutdown`), as Go
+  and Envoy do (#135).
+- C ABI config: a watch on a SQLite database is refused with "is SQLite,
+  which has no change feed"; it said the database was not PostgreSQL (or
+  Redis, MongoDB), which hid the reason.
 
 ### Changed
 
+- Test utilities: `anole.s3.testing.FakeServer` answers a header-signed
+  request whose `x-amz-date` is more than 15 minutes off its clock with
+  403 `RequestTimeTooSkewed`, as S3 does (`clock_offset_s` moves its
+  clock); `anole.console.inprocess.drainLines`, documented as for tests and
+  used by none, is removed.
 - WebSocket over TLS (#85): one TLS read now returns every whole record
   already received, and a busy HTTP/1.1 WebSocket reads through a larger
   window: `upgrade()`/`next()` sockets widen their reader over the

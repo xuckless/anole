@@ -474,6 +474,39 @@ test "routeInfo reflects In through noWait and cached" {
     try std.testing.expect(!d.typed and d.takes_res and d.output == void);
 }
 
+test "typed: Created and Accepted answer their status with the value as JSON" {
+    const anole = @import("root.zig");
+    const Todo = struct { id: u32 };
+    const H = struct {
+        fn created(_: *dusty.Request) !Created(Todo) {
+            return .{ .value = .{ .id = 7 }, .location = "/todos/7" };
+        }
+        fn accepted(_: *dusty.Request) !Accepted(Todo) {
+            return .{ .value = .{ .id = 8 } };
+        }
+    };
+    var app = try anole.App.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer app.deinit();
+    app.post("/created", H.created);
+    app.post("/accepted", H.accepted);
+    var t = try anole.testing.client(&app);
+    defer t.deinit();
+
+    var c = try t.post("/created", .{});
+    defer c.deinit();
+    try c.expectStatus(.created);
+    try c.expectHeader("location", "/todos/7");
+    try c.expectBody("{\"id\":7}");
+
+    var a = try t.post("/accepted", .{});
+    defer a.deinit();
+    try a.expectStatus(.accepted);
+    try a.expectBody("{\"id\":8}");
+}
+
+// Kept (the audit's rewrite would drop it): a typed handler returning
+// WithStatus(.no_content, void) does not compile (res.json of void), so the
+// 204 claim has no behaviour test yet; reported, not fixed here.
 test "Created and Accepted carry a status" {
     try std.testing.expect(Created(u8).anole_status == .created);
     try std.testing.expect(Accepted(u8).anole_status == .accepted);

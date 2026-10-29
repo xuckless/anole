@@ -1013,8 +1013,8 @@ pub fn isoMs(buf: *[32]u8, ms: i64) []const u8 {
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
     return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
-        yd.year,                      md.month.numeric(), md.day_index + 1,
-        ds.getHoursIntoDay(),         ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+        yd.year,              md.month.numeric(),      md.day_index + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
         rem,
     }) catch "";
 }
@@ -1036,8 +1036,8 @@ fn isoMsStatic(ms: i64) []const u8 {
 
 // ------------------------------------------------------------------ tests
 
-test "service: iso time" {
+test "service: isoMs writes UTC ISO 8601 with milliseconds that the client's parseIso reads" {
     var b: [32]u8 = undefined;
     try std.testing.expectEqualStrings("2026-10-23T09:41:07.415Z", isoMs(&b, 1792748467415));
-    try std.testing.expect(ui.app.parseIso("2026-10-23T09:41:07.415Z") != null);
+    try std.testing.expectEqual(@as(i64, 1792748467415), ui.app.parseIso("2026-10-23T09:41:07.415Z").?);
 }

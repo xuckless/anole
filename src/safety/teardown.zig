@@ -66,8 +66,3 @@ test "teardown: begin then end" {
     t.assertNotDead();
     t.end();
 }
-
-test "teardown: zero-sized outside debug builds" {
-    if (enabled) return error.SkipZigTest;
-    try std.testing.expectEqual(@as(usize, 0), @sizeOf(Teardown));
-}

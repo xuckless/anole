@@ -118,13 +118,13 @@ test "h3 with empty host" {
     try std.testing.expectEqual(@as(u32, 86400), r.h3.max_age_s);
 }
 
-test "ma parsed, default 86400" {
+test "alt_svc: ma sets the max age; other parameters are skipped" {
     const r = parse("h3=\":8443\"; ma=3600; persist=1", "x");
     try std.testing.expectEqual(@as(u16, 8443), r.h3.port);
     try std.testing.expectEqual(@as(u32, 3600), r.h3.max_age_s);
 }
 
-test "clear" {
+test "alt_svc: clear, in any case and with spaces, means forget the alternatives" {
     try std.testing.expect(parse(" clear ", "x") == .clear);
     try std.testing.expect(parse("CLEAR", "x") == .clear);
 }
@@ -141,7 +141,7 @@ test "h3-29 and h2 skipped" {
     try std.testing.expectEqual(@as(u16, 444), parse("h3-29=\":443\", h2=\":443\", h3=\":444\"", "x").h3.port);
 }
 
-test "quoted values with escapes" {
+test "alt_svc: a quoted ma does not overwrite the quoted authority (escapes unescaped)" {
     const r = parse("h3=\":\\4\\43\"; ma=\"60\"", "x");
     try std.testing.expectEqual(@as(u16, 443), r.h3.port);
     try std.testing.expectEqual(@as(u32, 60), r.h3.max_age_s);

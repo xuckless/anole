@@ -979,7 +979,7 @@ fn exercise(gpa: Allocator) !void {
 }
 
 test "nothing leaks when an allocation fails" {
-    try testing.checkAllAllocationFailures(testing.allocator, exercise, .{});
+    try testing.checkAllAllocationFailures(@import("../../../testing/no_resize.zig").allocator, exercise, .{});
 }
 
 /// A request's side of the gate.
@@ -1214,7 +1214,8 @@ fn timeMissingLookups(inbox: *Inbox, io: Io, count: u64) !i96 {
     return fastest;
 }
 
-test "a burst of pending requests and long churn after it leave lookups as cheap as they were" {
+test "a burst of pending requests and long churn after it leave lookups as cheap as they were [timing]" {
+    try @import("anole_test_wait").requireTiming();
     const io = testing.io;
     var inbox = testInbox();
     defer inbox.deinit(testing.allocator);

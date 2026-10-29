@@ -194,6 +194,7 @@ elseif op == 'heartbeat' then
       put(id, j, 'lease_until', until_ms)
       redis.call('ZADD', P .. 'running', tonumber(until_ms), pad(id))
       out[#out + 1] = id
+      out[#out + 1] = tonumber(j.attempt)
     end
   end
   return out

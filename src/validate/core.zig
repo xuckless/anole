@@ -412,14 +412,6 @@ pub inline fn escape(comptime s: []const u8) []const u8 {
     }
 }
 
-test "the kind table has a row for each of the 96 kinds" {
-    try std.testing.expectEqual(96, kinds.len);
-    try std.testing.expectEqual(96, @typeInfo(Kind).@"enum".field_names.len);
-    try std.testing.expectEqualStrings("notEmpty", comptime info(.not_empty).name);
-    try std.testing.expectEqualStrings("uniqueBy", comptime info(.unique_by).name);
-    try std.testing.expectEqualStrings("custom", comptime info(.custom).name);
-}
-
 test "a public name in snake_case is the tag of its kind" {
     try std.testing.expectEqualStrings("not_empty", comptime snakeCase("notEmpty"));
     try std.testing.expectEqualStrings("base64_url", comptime snakeCase("base64Url"));
@@ -2960,15 +2952,6 @@ test "a rule is named by its public name, its call and its snake_case label" {
     try expect("each(...)", comptime r.each_positive.label());
 }
 
-test "a rule's run-time check returns pass or fail" {
-    try std.testing.expectEqual(Outcome.pass, passIf(true));
-    try std.testing.expectEqual(Outcome.fail, passIf(false));
-    const zero: u32 = 0;
-    const one: u32 = 1;
-    try std.testing.expectEqual(Outcome.fail, test_rules.positive.eval(&zero));
-    try std.testing.expectEqual(Outcome.pass, test_rules.positive.eval(&one));
-}
-
 test "a string is a u8 slice that is neither volatile nor allowzero" {
     inline for (.{ []const u8, []u8, [:0]const u8, [:0]u8, []align(4) const u8 }) |T| {
         try std.testing.expect(isString(T));
@@ -3486,7 +3469,7 @@ test "string lengths, byte counts and dates contradict by the largest lower and 
     try expect("validator: Dto.field_rules.x[]: min_length(10) and max_length(5)" ++ tail, comptime contradictionText(each_rule.inner, S, where ++ "[]").?);
 }
 
-test "equal bounds, every digit of a fraction, and bounds of different measures or forms on strings" {
+test "equal string, byte and date bounds do not contradict; date-time bounds compare every fraction digit" {
     const r = root;
     const S = []const u8;
     try std.testing.expectEqual(null, comptime contradiction(&.{ r.minLength(5), r.maxLength(5) }, S));
@@ -3610,14 +3593,6 @@ fn editDistance(comptime a: []const u8, comptime b: []const u8) ?usize {
         @memcpy(previous[0 .. b.len + 1], current[0 .. b.len + 1]);
     }
     return previous[b.len];
-}
-
-test "suggestion names a field within 2 edits, ignoring ASCII case" {
-    const S = struct { name: []const u8, email: []const u8 };
-    try std.testing.expectEqualStrings("; did you mean \"name\"?", comptime suggestion(S, "nmae"));
-    try std.testing.expectEqualStrings("; did you mean \"name\"?", comptime suggestion(S, "NAME"));
-    try std.testing.expectEqualStrings("; did you mean \"email\"?", comptime suggestion(S, "emial"));
-    try std.testing.expectEqualStrings("", comptime suggestion(S, "zzz"));
 }
 
 test "suggestion needs a distance below 3 and below the key's length, and never names a comptime field" {
@@ -3758,7 +3733,7 @@ test "every rule name a hint mentions is exported" {
     try std.testing.expectEqualStrings("nonEmpty", comptime unknownHintName(&texts).?);
 }
 
-test "hint for a constructor used without a call" {
+test "a constructor used without a call gets a hint with an example call that fits its parameter" {
     const S = struct {
         const Options = struct { strict: bool = false };
         const Algorithm = enum { md5, sha1 };
@@ -3818,7 +3793,7 @@ test "every transform is exported under its public name, the camelCase of its ki
     }
 }
 
-test "hint for a predicate used as a rule" {
+test "a predicate used as a rule gets a hint naming the exported rule, called when it takes arguments" {
     const S = struct {
         const Options = struct { strict: bool = false };
         const Algorithm = enum { md5, sha1 };

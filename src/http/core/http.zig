@@ -72,13 +72,13 @@ test "Method: construct from llhttp_method_t" {
     try std.testing.expectEqual(.get, method);
 }
 
-test "Method: name" {
+test "Method: name() is the wire token (GET, POST, DELETE)" {
     try std.testing.expectEqualStrings("GET", Method.get.name());
     try std.testing.expectEqualStrings("POST", Method.post.name());
     try std.testing.expectEqualStrings("DELETE", Method.delete.name());
 }
 
-test "Method: format" {
+test "Method: {f} prints the wire token" {
     var buf: [32]u8 = undefined;
     const result = try std.fmt.bufPrint(&buf, "{f}", .{Method.get});
     try std.testing.expectEqualStrings("GET", result);
@@ -361,7 +361,7 @@ test "Status: construct from llhttp_status_t" {
     try std.testing.expectEqual(.ok, status);
 }
 
-test "Status: fromCode" {
+test "Status.fromCode: named codes map, unassigned/0/600 are InvalidStatusCode" {
     try std.testing.expectEqual(.ok, try Status.fromCode(200));
     try std.testing.expectEqual(.not_found, try Status.fromCode(404));
     try std.testing.expectEqual(.im_a_teapot, try Status.fromCode(418));
@@ -379,13 +379,13 @@ test "Status: fromCode round-trips every named status" {
     }
 }
 
-test "Status: name" {
+test "Status.name: the upper-snake tag (NOT_FOUND)" {
     try std.testing.expectEqualStrings("OK", Status.ok.name());
     try std.testing.expectEqualStrings("NOT_FOUND", Status.not_found.name());
     try std.testing.expectEqualStrings("INTERNAL_SERVER_ERROR", Status.internal_server_error.name());
 }
 
-test "Status: format" {
+test "Status: {f} prints the reason phrase" {
     var buf: [32]u8 = undefined;
     const result = try std.fmt.bufPrint(&buf, "{f}", .{Status.not_found});
     try std.testing.expectEqualStrings("Not Found", result);
@@ -644,7 +644,7 @@ pub const Params = struct {
     };
 };
 
-test "Params: getInt" {
+test "Params.getInt: null for missing, junk, negative-into-unsigned and too-wide values" {
     var params: Params = .{};
     defer params.map.deinit(std.testing.allocator);
     try params.map.put(std.testing.allocator, "n", "42");
@@ -664,7 +664,7 @@ test "Params: getInt" {
     try std.testing.expectEqual(@as(?u16, null), params.getInt(u16, "absent"));
 }
 
-test "Params: getFloat" {
+test "Params.getFloat: null for missing, junk, nan and inf" {
     var params: Params = .{};
     defer params.map.deinit(std.testing.allocator);
     try params.map.put(std.testing.allocator, "half", "0.5");
@@ -1243,7 +1243,7 @@ fn testAcceptsGzip(values: []const []const u8) !bool {
     return acceptsGzip(&headers);
 }
 
-test "acceptsGzip" {
+test "acceptsGzip: gzip, x-gzip or * without q=0, across repeated fields" {
     try std.testing.expect(try testAcceptsGzip(&.{"gzip"}));
     try std.testing.expect(try testAcceptsGzip(&.{"deflate, gzip;q=0.5, br"}));
     try std.testing.expect(try testAcceptsGzip(&.{"x-gzip"}));
@@ -1263,7 +1263,7 @@ test "acceptsGzip" {
     try std.testing.expect(!try testAcceptsGzip(&.{}));
 }
 
-test "ContentEncoding: fromString" {
+test "ContentEncoding.fromString: case-insensitive, x-gzip is gzip, br is unknown" {
     try std.testing.expectEqual(ContentEncoding.identity, ContentEncoding.fromString("identity"));
     try std.testing.expectEqual(ContentEncoding.gzip, ContentEncoding.fromString("gzip"));
     try std.testing.expectEqual(ContentEncoding.gzip, ContentEncoding.fromString("x-gzip"));
@@ -1273,7 +1273,7 @@ test "ContentEncoding: fromString" {
     try std.testing.expectEqual(ContentEncoding.zstd, ContentEncoding.fromString("zstd"));
 }
 
-test "Headers: remove" {
+test "Headers.remove: case-insensitive, every copy, returns the count" {
     var headers = try Headers.init(std.testing.allocator, 8);
     defer headers.deinit(std.testing.allocator);
 
@@ -1318,7 +1318,7 @@ fn expectJson(expected: []const u8, value: anytype) !void {
     try std.testing.expectEqualStrings(expected, out.buffered());
 }
 
-test "Headers: jsonStringify" {
+test "Headers: JSON object in insertion order" {
     var headers = try Headers.init(std.testing.allocator, 8);
     defer headers.deinit(std.testing.allocator);
 
@@ -1370,7 +1370,7 @@ test "Headers: jsonStringify of an empty map" {
     try expectJson("{}", headers);
 }
 
-test "Params: jsonStringify" {
+test "Params: JSON object of string values, {} when empty" {
     var params: Params = .{};
     defer params.map.deinit(std.testing.allocator);
     try params.map.put(std.testing.allocator, "a", "1");

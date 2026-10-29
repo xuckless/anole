@@ -11,18 +11,21 @@ const build_options = @import("build_options");
 const tls = @import("tls");
 const h2 = @import("h2.zig");
 const wait = @import("anole_test_wait");
+const test_socket = @import("test_socket.zig");
 
 const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
 
 /// A blocking HTTP/2 client over one connection, for tests: submit
-/// requests, then `run` until every stream is closed.
+/// requests, then `run` until every stream is closed. Every read from the
+/// socket has `wait.deadline()` (`test_socket.DeadlineReader`), so a
+/// server that stops answering fails the test instead of hanging it.
 const TestClient = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     stream: std.Io.net.Stream,
     read_buf: [16 * 1024 + 1024]u8 = undefined,
     write_buf: [16 * 1024 + 1024]u8 = undefined,
-    reader: std.Io.net.Stream.Reader = undefined,
+    reader: test_socket.DeadlineReader = undefined,
     writer: std.Io.net.Stream.Writer = undefined,
     /// The connection as the session sees it: the socket, or TLS over it.
     r: *std.Io.Reader = undefined,
@@ -56,8 +59,14 @@ const TestClient = struct {
         /// When it closed: 1 for the first stream of the client to close.
         close_seq: usize = 0,
         error_code: u32 = 0,
+        /// RST_STREAM frames received for the stream, and how much of the
+        /// body had come when the first one did.
+        rsts: usize = 0,
+        body_at_rst: usize = 0,
         /// The request body to send, if any.
         send: []const u8 = "",
+        /// How much of `send` has gone to the session. Read by a test's
+        /// helper thread (`SentGate`).
         sent: usize = 0,
         /// Never end the request side (a tunnel the peer keeps open).
         keep_open: bool = false,
@@ -65,7 +74,7 @@ const TestClient = struct {
 
     fn init(self: *TestClient, gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress) !void {
         self.* = .{ .gpa = gpa, .io = io, .stream = try addr.connect(io, .{ .mode = .stream }) };
-        self.reader = self.stream.reader(io, &self.read_buf);
+        self.reader = .init(self.stream, io, &self.read_buf);
         self.writer = self.stream.writer(io, &self.write_buf);
         self.r = &self.reader.interface;
         self.w = &self.writer.interface;
@@ -81,7 +90,7 @@ const TestClient = struct {
     /// clear before the handshake.
     fn initTlsAfter(self: *TestClient, gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress, ca: *std.crypto.Certificate.Bundle, preamble: []const u8) !void {
         self.* = .{ .gpa = gpa, .io = io, .stream = try addr.connect(io, .{ .mode = .stream }) };
-        self.reader = self.stream.reader(io, &self.read_buf);
+        self.reader = .init(self.stream, io, &self.read_buf);
         self.writer = self.stream.writer(io, &self.write_buf);
         if (preamble.len > 0) {
             try self.writer.interface.writeAll(preamble);
@@ -262,10 +271,14 @@ const TestClient = struct {
         return 0;
     }
 
-    fn onFrame(_: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
+    fn onFrame(session: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
         const self: *TestClient = @ptrCast(@alignCast(user_data.?));
         if (frame.*.hd.type == c.NGHTTP2_DATA and frame.*.hd.length == 0 and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) self.empty_ends += 1;
         if (frame.*.hd.type == c.NGHTTP2_WINDOW_UPDATE and frame.*.hd.stream_id != 0) self.stream_window_updates += 1;
+        if (frame.*.hd.type == c.NGHTTP2_RST_STREAM) if (respFor(session, frame.*.hd.stream_id)) |resp| {
+            if (resp.rsts == 0) resp.body_at_rst = resp.body.items.len;
+            resp.rsts += 1;
+        };
         if (frame.*.hd.type == c.NGHTTP2_GOAWAY) self.goaway_error = frame.*.goaway.error_code;
         if (frame.*.hd.type == c.NGHTTP2_GOAWAY and self.goaway_count < self.goaways.len) {
             self.goaways[self.goaway_count] = frame.*.goaway.last_stream_id;
@@ -287,7 +300,8 @@ const TestClient = struct {
     }
 
     /// Keeps the connection going (answering PINGs and SETTINGS) until the
-    /// server closes it.
+    /// server closes it, then shuts the socket as a real client does, so
+    /// the server's lingering close ends at once.
     fn runUntilClosed(self: *TestClient) !void {
         while (true) {
             while (true) {
@@ -299,7 +313,10 @@ const TestClient = struct {
             }
             try self.w.flush();
             const bytes = self.r.peekGreedy(1) catch |err| switch (err) {
-                error.EndOfStream => return,
+                error.EndOfStream => {
+                    self.stream.shutdown(self.io, .both) catch {};
+                    return;
+                },
                 else => |e| return e,
             };
             const rv = c.nghttp2_session_mem_recv2(self.session, bytes.ptr, bytes.len);
@@ -323,7 +340,7 @@ const TestClient = struct {
         const rest = resp.send[resp.sent..];
         const n = @min(rest.len, length);
         @memcpy(buf[0..n], rest[0..n]);
-        resp.sent += n;
+        @atomicStore(usize, &resp.sent, resp.sent + n, .release);
         if (resp.sent == resp.send.len) {
             if (resp.keep_open) {
                 if (n == 0) return c.NGHTTP2_ERR_DEFERRED;
@@ -378,17 +395,11 @@ const Handlers = struct {
     /// Answers once the test sets `held_gate`; counts itself in first.
     fn held(req: *dusty.Request, res: *dusty.Response) !void {
         _ = held_entered.fetchAdd(1, .acq_rel);
-        try held_gate.wait(req.io);
+        try wait.waitEvent(req.io, "the test opened the held handler's gate", &held_gate);
         res.body = "held but whole";
     }
     var held_gate: std.Io.Event = .unset;
     var held_entered: std.atomic.Value(u32) = .init(0);
-    fn slower(req: *dusty.Request, res: *dusty.Response) !void {
-        _ = slower_entered.fetchAdd(1, .acq_rel);
-        try req.io.sleep(.fromMilliseconds(900), .awake);
-        res.body = "slower but whole";
-    }
-    var slower_entered: std.atomic.Value(u32) = .init(0);
     /// A streamed body far past the client's 64 KiB stream window.
     fn big(_: *dusty.Request, res: *dusty.Response) !void {
         var buf: [4096]u8 = undefined;
@@ -397,22 +408,27 @@ const Handlers = struct {
         try out.end();
     }
     const big_len = 1000 * 1000;
-    /// Reads the body only after a full window of it has queued up, and
-    /// answers with its length and a checksum.
+    /// Reads the body only once the test opens `late_gate` (after a full
+    /// window of it has queued up, `SentGate`), and answers with its
+    /// length and a checksum. Counts itself in first.
     fn late(req: *dusty.Request, res: *dusty.Response) !void {
-        try req.io.sleep(.fromMilliseconds(100), .awake);
+        _ = late_entered.fetchAdd(1, .acq_rel);
+        try wait.waitEvent(req.io, "the test opened the late handlers' gate", &late_gate);
         return sum(req, res);
     }
+    var late_gate: std.Io.Event = .unset;
+    var late_entered: std.atomic.Value(u32) = .init(0);
     /// `sum`, as a handler starved of CPU at the worst moment: it reads
     /// exactly `stall_credit` bytes, half the window its first read raised
-    /// it to, which returns credit for all of them, then stops while the
-    /// peer fills the whole window again, then reads the rest.
+    /// it to, which returns credit for all of them, then stops until the
+    /// test opens `stall_gate` (once the peer has sent the whole window
+    /// again, `SentGate`), then reads the rest.
     fn stall(req: *dusty.Request, res: *dusty.Response) !void {
         const raw = req._body_source.?.reader;
         var hash: std.hash.Wyhash = .init(0);
         var n: usize = 0;
         while (n < stall_credit) n += try takeBody(raw, &hash, stall_credit - n);
-        try req.io.sleep(.fromMilliseconds(300), .awake);
+        try wait.waitEvent(req.io, "the test opened the stalled handler's gate", &stall_gate);
         while (true) n += takeBody(raw, &hash, 4096) catch |err| switch (err) {
             error.EndOfStream => break,
             else => |e| return e,
@@ -420,6 +436,7 @@ const Handlers = struct {
         try res.print(.text, "{d} {x}", .{ n, hash.final() });
     }
     const stall_credit = 512 * 1024;
+    var stall_gate: std.Io.Event = .unset;
     /// At most `limit` body bytes, straight from the stream: each read is
     /// what the engine credits back.
     fn takeBody(raw: *std.Io.Reader, hash: *std.hash.Wyhash, limit: usize) !usize {
@@ -452,6 +469,36 @@ const Handlers = struct {
     var sum_entered: std.atomic.Value(u32) = .init(0);
 };
 
+/// Sets `gate` once each of `resps` has sent at least `n` bytes of its
+/// body, and `entered` (handlers that count themselves in) has reached
+/// `want`: a handler held at the gate then has that much of its body
+/// queued or on its way, however slow the machine. A late server read can
+/// only make a test miss its case, never fail it. The test awaits
+/// `release` after its client is done, so a wait that timed out (and
+/// opened the gate anyway) fails it.
+const SentGate = struct {
+    resps: []const *const TestClient.Resp,
+    n: usize,
+    entered: ?*const std.atomic.Value(u32) = null,
+    want: u32 = 0,
+
+    fn reached(g: *const SentGate) bool {
+        if (g.entered) |e| if (e.load(.acquire) < g.want) return false;
+        for (g.resps) |r| if (@atomicLoad(usize, &r.sent, .acquire) < g.n) return false;
+        return true;
+    }
+
+    fn release(io: std.Io, g: *const SentGate, gate: *std.Io.Event) wait.WaitError!void {
+        defer gate.set(io);
+        try wait.waitUntil(io, "the client sent each body up to the window", g, reached);
+    }
+};
+
+/// What a client may send on a stream before the server reads any of it,
+/// whether or not it has seen the server's SETTINGS yet: the default
+/// initial window (65535), one byte under the server's `stream_window`.
+const default_window = 65535;
+
 const Fixture = struct {
     server: dusty.Server(void),
     future: std.Io.Future(anyerror!void) = undefined,
@@ -470,7 +517,6 @@ const Fixture = struct {
         self.server.router.get("/trailers", Handlers.trailers);
         self.server.router.post("/ignore", Handlers.ignoreBody);
         self.server.router.get("/slow", Handlers.slow);
-        self.server.router.get("/slower", Handlers.slower);
         self.server.router.get("/held", Handlers.held);
         self.server.router.post("/late", Handlers.late);
         self.server.router.post("/stall", Handlers.stall);
@@ -609,8 +655,21 @@ test "HTTP/2: a no_wait request with a body runs inline when it came whole, else
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ i * 100, std.hash.Wyhash.hash(0, body[0 .. i * 100]) }), client.get(id).body.items);
     }
     try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(big).body.items);
+}
 
-    // Reset with its body half sent: let go, and the connection carries on.
+test "HTTP/2: a no_wait request reset with its body half sent lets its handler go, and the connection carries on" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var body: [1000]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i *% 77 +% (i >> 13));
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    var expect: [64]u8 = undefined;
     const sums = Handlers.sum_entered.load(.acquire);
     const cut = try client.request("POST", "/nw/sum", body[0..1000]);
     client.get(cut).keep_open = true;
@@ -637,6 +696,14 @@ test "HTTP/2: a body window raised before the client acknowledged SETTINGS never
     try client.init(std.testing.allocator, io, fx.server.address.ip);
     defer client.deinit();
     const id = try client.request("POST", "/stall", body);
+    // The handler stops after `stall_credit` until the client has sent
+    // that plus the whole raised window (1 MiB): the window filled again
+    // behind a handler that does not read.
+    Handlers.stall_gate = .unset;
+    const resps = [_]*const TestClient.Resp{client.get(id)};
+    const gate: SentGate = .{ .resps = &resps, .n = Handlers.stall_credit + 1024 * 1024 };
+    var releaser = try io.concurrent(SentGate.release, .{ io, &gate, &Handlers.stall_gate });
+    defer releaser.cancel(io) catch {};
     // The preface, SETTINGS, the head and a default window of the body,
     // then nothing until the handler's first read has raised the stream's
     // window: the client's ACK of the server's SETTINGS (whose initial
@@ -644,6 +711,7 @@ test "HTTP/2: a body window raised before the client acknowledged SETTINGS never
     try client.sendPending();
     try client.recvUntilStreamWindowUpdate();
     try client.run();
+    try releaser.await(io);
     var expect: [64]u8 = undefined;
     try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(id).body.items);
 }
@@ -738,7 +806,18 @@ test "HTTP/2: a body read late moves to the bigger window whole and in order" {
     defer client.deinit();
     const a = try client.request("POST", "/late", body);
     const b = try client.request("POST", "/late", body[0 .. 70 * 1024]);
+    Handlers.late_gate = .unset;
+    const resps = [_]*const TestClient.Resp{ client.get(a), client.get(b) };
+    const gate: SentGate = .{
+        .resps = &resps,
+        .n = default_window,
+        .entered = &Handlers.late_entered,
+        .want = Handlers.late_entered.load(.acquire) + 2,
+    };
+    var releaser = try io.concurrent(SentGate.release, .{ io, &gate, &Handlers.late_gate });
+    defer releaser.cancel(io) catch {};
     try client.run();
+    try releaser.await(io);
     var expect: [64]u8 = undefined;
     try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(a).body.items);
     try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ 70 * 1024, std.hash.Wyhash.hash(0, body[0 .. 70 * 1024]) }), client.get(b).body.items);
@@ -777,6 +856,10 @@ test "HTTP/2: a small unread request body is read and dropped, and the stream en
     try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
     try std.testing.expectEqualStrings("not reading that", client.get(id).body.items);
     try std.testing.expectEqual(@as(u32, c.NGHTTP2_NO_ERROR), client.get(id).error_code);
+    // Ended by both sides' END_STREAM: the client's went out with the
+    // whole body, and no RST_STREAM came.
+    try std.testing.expectEqual(body.len, client.get(id).sent);
+    try std.testing.expectEqual(@as(usize, 0), client.get(id).rsts);
 }
 
 test "HTTP/2: an unread request body gets the whole response, then RST_STREAM(NO_ERROR)" {
@@ -794,9 +877,13 @@ test "HTTP/2: an unread request body gets the whole response, then RST_STREAM(NO
     defer client.deinit();
     const id = try client.request("POST", "/ignore", body);
     try client.run();
-    try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
-    try std.testing.expectEqualStrings("not reading that", client.get(id).body.items);
-    try std.testing.expectEqual(@as(u32, c.NGHTTP2_NO_ERROR), client.get(id).error_code);
+    const resp = client.get(id);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("not reading that", resp.body.items);
+    // One RST_STREAM, with NO_ERROR, once the whole response was in.
+    try std.testing.expectEqual(@as(usize, 1), resp.rsts);
+    try std.testing.expectEqual(resp.body.items.len, resp.body_at_rst);
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_NO_ERROR), resp.error_code);
 }
 
 test "HTTP/2: HTTP/1.1 still works on a prior-knowledge listener" {
@@ -1007,18 +1094,237 @@ test "HTTP/2: a drain with a stream in flight sends a two-phase GOAWAY and finis
     try std.testing.expectEqualStrings("held but whole", resp.body.items);
 }
 
-/// Holds every write of the HTTP/2 writer for 200 ms (`h2.test_before_flush`).
+/// `holdUnreadAtDrain` holds the reader after the final GOAWAY. It acts
+/// once: a later entry (the reader going on) passes straight through.
+var unread_held: std.atomic.Value(bool) = .init(false);
+/// The server's socket, once `holdUnreadAtDrain` has held the reader with
+/// the client's PING unread and let it go (-1 before).
+var unread_socket: std.atomic.Value(std.Io.net.Socket.Handle) = .init(-1);
+/// `holdUnreadAtDrain` let the reader go with a cancel.
+var unread_canceled: std.atomic.Value(bool) = .init(false);
+
+/// FIONREAD: std 0.17's `std.c.T` has none for Darwin, where it is
+/// `_IOR('f', 127, int)` (sys/filio.h).
+const fionread = if (@import("builtin").os.tag.isDarwin()) 0x4004667f else std.c.T.FIONREAD;
+
+fn hasUnreadInput(fd: std.Io.net.Socket.Handle) bool {
+    var n: c_int = 0;
+    if (std.c.ioctl(fd, fionread, &n) != 0) return false;
+    return n > 0;
+}
+
+fn isSet(flag: *std.atomic.Value(bool)) bool {
+    return flag.load(.acquire);
+}
+
+fn never(_: void) bool {
+    return false;
+}
+
+/// `h2.test_before_fill` for the test below. The first time the reader
+/// waits for input after the drain's final GOAWAY is submitted, holds it,
+/// uncancelably, until the client's PING is in the server's socket. The
+/// PING follows the response, which the writer takes only after it has
+/// flushed the final GOAWAY, so by then a drain that lets go of a
+/// connection at that flush (#135) has done so: it cancels the connection
+/// once the held stream is done, and the cancel is taken here, with the
+/// PING unread. A drain still holding the connection lets the reader go
+/// on. (The server's in-flight count cannot tell the two apart: the
+/// stream's count and the drain's hold are one each, and the stream's may
+/// go back before or after the server's FIN.)
+fn holdUnreadAtDrain(io: std.Io, probe: h2.FillProbe) std.Io.Cancelable!void {
+    if (!probe.goaway_sent) return;
+    if (unread_held.swap(true, .acq_rel)) return;
+    defer unread_socket.store(probe.socket, .release);
+    {
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        wait.waitUntil(io, "the client's PING is in the server's socket", probe.socket, hasUnreadInput) catch |err| switch (err) {
+            error.Canceled => unreachable,
+            error.WaitTimedOut => return,
+        };
+    }
+    if (probe.drainHolds()) return;
+    wait.waitUntil(io, "the drain's cancel", {}, never) catch |err| switch (err) {
+        error.Canceled => {
+            unread_canceled.store(true, .release);
+            return error.Canceled;
+        },
+        error.WaitTimedOut => {},
+    };
+}
+
+/// The server took the client's PING (its reader went on), or a reset came
+/// (its reader was canceled, and the connection closes with the PING
+/// unread); `reset` keeps the reset's error.
+const TookOrReset = struct {
+    client: std.Io.net.Socket.Handle,
+    reset: *c_int,
+
+    fn holds(x: TookOrReset) bool {
+        const err = socketError(x.client);
+        if (err != 0) {
+            x.reset.* = err;
+            return true;
+        }
+        const server = unread_socket.load(.acquire);
+        if (server == -1 or unread_canceled.load(.acquire)) return false;
+        // Read, or the connection closed after reading it.
+        return !hasUnreadInput(server);
+    }
+};
+
+/// One HTTP/2 frame, written by hand.
+fn writeFrame(w: *std.Io.Writer, kind: u8, flags: u8, stream_id: u31, payload: []const u8) !void {
+    var head: [9]u8 = undefined;
+    std.mem.writeInt(u24, head[0..3], @intCast(payload.len), .big);
+    head[3] = kind;
+    head[4] = flags;
+    std.mem.writeInt(u32, head[5..9], stream_id, .big);
+    try w.writeAll(&head);
+    try w.writeAll(payload);
+    try w.flush();
+}
+
+/// The socket's pending error (SO_ERROR), which a reset sets; reading it
+/// clears it.
+fn socketError(fd: std.Io.net.Socket.Handle) c_int {
+    var err: c_int = 0;
+    var len: std.c.socklen_t = @sizeOf(c_int);
+    if (std.c.getsockopt(fd, std.c.SOL.SOCKET, std.c.SO.ERROR, &err, &len) != 0) return -1;
+    return err;
+}
+
+test "HTTP/2: a drain ends with a clean close when the peer's last frames are unread" {
+    // Windows: not supported, not pending. The probes are POSIX ioctl and
+    // getsockopt through libc; the drain code is the same everywhere.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // A peer may still send after the final GOAWAY (a PING, a
+    // WINDOW_UPDATE). The connection must not close with that unread: the
+    // kernel then sends a reset after the FIN, and a peer may drop what it
+    // has not read yet. The client frames by hand: an nghttp2 session
+    // reads nothing once it has a GOAWAY and no stream open.
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.server.deinit();
+
+    unread_held.store(false, .release);
+    unread_socket.store(-1, .release);
+    unread_canceled.store(false, .release);
+    h2.test_before_fill = holdUnreadAtDrain;
+    defer h2.test_before_fill = null;
+
+    const sock = try fx.server.address.ip.connect(io, .{ .mode = .stream });
+    defer sock.close(io);
+    var read_buf: [32 * 1024]u8 = undefined;
+    var write_buf: [1024]u8 = undefined;
+    var sr = sock.reader(io, &read_buf);
+    var sw = sock.writer(io, &write_buf);
+    const r = &sr.interface;
+    const w = &sw.interface;
+
+    // A request held until the final GOAWAY is out: its open stream keeps
+    // the server's reader reading after that GOAWAY, into the hook.
+    Handlers.held_gate = .unset;
+    defer Handlers.held_gate.set(io);
+    const helds = Handlers.held_entered.load(.acquire);
+    try w.writeAll(h2.preface);
+    try writeFrame(w, 0x4, 0, 0, ""); // SETTINGS
+    // HPACK: GET, http, then :path and :authority as literals.
+    try writeFrame(w, 0x1, 0x1 | 0x4, 1, "\x82\x86\x04\x05/held\x01\x09localhost");
+    try wait.waitAtLeast(io, "the held request's handler runs", &Handlers.held_entered, helds + 1);
+    var stopper: ?std.Io.Future(void) = try io.concurrent(stopFixture, .{ &fx, io });
+    defer if (stopper) |*s| s.await(io);
+
+    var goaways: usize = 0;
+    var answered = false;
+    var end: ?anyerror = null;
+    while (end == null) {
+        const head = r.takeArray(9) catch |err| {
+            end = err;
+            break;
+        };
+        const len = std.mem.readInt(u24, head[0..3], .big);
+        const kind = head[3];
+        const flags = head[4];
+        const payload = r.take(len) catch |err| {
+            end = err;
+            break;
+        };
+        switch (kind) {
+            0x0, 0x1 => if (flags & 0x1 != 0) { // the response's END_STREAM
+                answered = true;
+                // After the final GOAWAY and the last response: what the
+                // server has not read when its drain is done with the
+                // connection.
+                try writeFrame(w, 0x6, 0, 0, "unread!!");
+            },
+            0x4 => if (flags & 0x1 == 0) try writeFrame(w, 0x4, 0x1, 0, ""), // SETTINGS: ACK
+            0x6 => if (flags & 0x1 == 0) try writeFrame(w, 0x6, 0x1, 0, payload), // PING: ACK
+            0x7 => { // GOAWAY
+                goaways += 1;
+                const last = std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff;
+                if (last != std.math.maxInt(u31)) {
+                    try wait.waitUntil(io, "the server's reader is held after the final GOAWAY", &unread_held, isSet);
+                    Handlers.held_gate.set(io);
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(answered);
+    try std.testing.expectEqual(@as(usize, 2), goaways);
+    if (end.? == error.ReadFailed) return sr.err orelse error.ReadFailed;
+    try std.testing.expect(end.? == error.EndOfStream);
+
+    // The server's FIN came first either way. Before hanging up, wait for
+    // the server to take the PING, or for the reset.
+    var reset: c_int = 0;
+    try wait.waitUntil(io, "the server took the PING, or a reset", TookOrReset{ .client = sock.socket.handle, .reset = &reset }, TookOrReset.holds);
+    if (reset == 0) reset = socketError(sock.socket.handle);
+    sock.shutdown(io, .send) catch {};
+    stopper.?.await(io);
+    stopper = null;
+    if (reset == 0) reset = socketError(sock.socket.handle);
+    // No reset came after the server's FIN.
+    try std.testing.expectEqual(@as(c_int, 0), reset);
+}
+
+/// `holdFlush` holds the writer's writes once set.
+var flush_held: std.atomic.Value(bool) = .init(false);
+
+/// Holds each write of the HTTP/2 writer for 200 ms once `flush_held` is
+/// set (`h2.test_before_flush`): a deliberate window, not a wait for
+/// anything.
 fn holdFlush(io: std.Io) std.Io.Cancelable!void {
+    if (!flush_held.load(.acquire)) return;
     try io.sleep(.fromMilliseconds(200), .awake);
+}
+
+/// `releaseOnFinalGoaway`, holding the writer's writes (`holdFlush`) from
+/// just before the gate opens: the held response is then taken from the
+/// session after the final GOAWAY and written 200 ms later.
+fn holdAndReleaseOnFinalGoaway(io: std.Io, client: *const TestClient, gate: *std.Io.Event) std.Io.Cancelable!void {
+    defer gate.set(io);
+    wait.waitUntil(io, "the client took the drain's final GOAWAY", client, struct {
+        fn f(cl: *const TestClient) bool {
+            return @atomicLoad(usize, &cl.goaway_count, .acquire) >= 2;
+        }
+    }.f) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.WaitTimedOut => return,
+    };
+    flush_held.store(true, .release);
 }
 
 test "HTTP/2: a drain waits for a response that is taken from the session but not yet written" {
     // nghttp2 closes a stream when the writer takes its last frame, before
     // the write. The stream's count in the in-flight requests must last
     // until that write is done, or the drain sees zero and cancels the
-    // connection with the response still in the writer's buffer. Every
-    // write is held 200 ms, which makes that window 200 ms wide; the drain's
-    // two GOAWAYs are out by about 500 ms, the response comes at 900.
+    // connection with the response still in the writer's buffer. The
+    // response is held until both GOAWAYs reached the client, then its
+    // write is held 200 ms: the drain decides inside that window.
     const io = std.testing.io;
     var fx: Fixture = undefined;
     try fx.start(io);
@@ -1031,19 +1337,24 @@ test "HTTP/2: a drain waits for a response that is taken from the session but no
     try client.run();
     try std.testing.expectEqual(@as(u16, 200), client.get(warm).status);
 
+    flush_held.store(false, .release);
     h2.test_before_flush = holdFlush;
     defer h2.test_before_flush = null;
-    const slowers = Handlers.slower_entered.load(.acquire);
-    const id = try client.request("GET", "/slower", null);
+    Handlers.held_gate = .unset;
+    const helds = Handlers.held_entered.load(.acquire);
+    const id = try client.request("GET", "/held", null);
     try client.sendPending();
-    try wait.waitAtLeast(io, "the slower request's handler runs", &Handlers.slower_entered, slowers + 1);
+    try wait.waitAtLeast(io, "the held request's handler runs", &Handlers.held_entered, helds + 1);
+    var releaser = try io.concurrent(holdAndReleaseOnFinalGoaway, .{ io, &client, &Handlers.held_gate });
+    defer releaser.cancel(io) catch {};
     var stopper = try io.concurrent(stopFixture, .{ &fx, io });
     defer stopper.await(io);
 
     try client.runUntilClosed();
+    try std.testing.expectEqual(@as(usize, 2), client.goaway_count);
     const resp = client.get(id);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
-    try std.testing.expectEqualStrings("slower but whole", resp.body.items);
+    try std.testing.expectEqualStrings("held but whole", resp.body.items);
 }
 
 test "HTTP/2: a PROXY protocol header ahead of TLS names the client of an h2 stream" {
@@ -1114,7 +1425,9 @@ test "HTTP/2: a client that half-closes still gets the responses in flight" {
     var client: TestClient = undefined;
     try client.init(std.testing.allocator, io, fx.server.address.ip);
     defer client.deinit();
-    const id = try client.request("GET", "/slow", null);
+    Handlers.held_gate = .unset;
+    const helds = Handlers.held_entered.load(.acquire);
+    const id = try client.request("GET", "/held", null);
     while (true) {
         var data: [*c]const u8 = undefined;
         const n = c.nghttp2_session_mem_send2(client.session, &data);
@@ -1122,9 +1435,20 @@ test "HTTP/2: a client that half-closes still gets the responses in flight" {
         try client.w.writeAll(data[0..@intCast(n)]);
     }
     try client.w.flush();
-    // Done sending: the server reads EOF while /slow is still sleeping.
+    try wait.waitAtLeast(io, "the held request's handler runs", &Handlers.held_entered, helds + 1);
+    // Done sending, with the request in flight; the handler answers only
+    // once the server has read the EOF and handled it (the hook runs on the
+    // connection's clean end of input), so the half-close always lands
+    // while the response is in flight.
+    h2.test_after_peer_end = struct {
+        fn release(hook_io: std.Io) void {
+            Handlers.held_gate.set(hook_io);
+        }
+    }.release;
+    defer h2.test_after_peer_end = null;
     try client.stream.shutdown(io, .send);
-    // Nothing more goes out from here; read until the response is in.
+    // Nothing more goes out from here; read until the response is in (each
+    // read with the client's deadline).
     while (!client.get(id).closed) {
         const bytes = try client.r.peekGreedy(1);
         const rv = c.nghttp2_session_mem_recv2(client.session, bytes.ptr, bytes.len);
@@ -1132,7 +1456,7 @@ test "HTTP/2: a client that half-closes still gets the responses in flight" {
         client.r.toss(@intCast(rv));
     }
     try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
-    try std.testing.expectEqualStrings("slow but whole", client.get(id).body.items);
+    try std.testing.expectEqualStrings("held but whole", client.get(id).body.items);
 }
 
 test "HTTP/2: a finished tunnel is reset even when the peer keeps its side open" {
@@ -1482,7 +1806,22 @@ test "HTTP/2: the raised body windows of a connection share one budget" {
     for (body, 0..) |*b, i| b.* = @truncate(i *% 7);
     var ids: [8]i32 = undefined;
     for (&ids) |*id| id.* = try client.request("POST", "/late", body);
+    // The eight handlers read only once all of them have started and each
+    // stream has a window of its body sent: they raise their windows
+    // together.
+    Handlers.late_gate = .unset;
+    var resps: [ids.len]*const TestClient.Resp = undefined;
+    for (&resps, ids) |*r, id| r.* = client.get(id);
+    const gate: SentGate = .{
+        .resps = &resps,
+        .n = default_window,
+        .entered = &Handlers.late_entered,
+        .want = Handlers.late_entered.load(.acquire) + @as(u32, ids.len),
+    };
+    var releaser = try io.concurrent(SentGate.release, .{ io, &gate, &Handlers.late_gate });
+    defer releaser.cancel(io) catch {};
     try client.run();
+    try releaser.await(io);
     var want: std.ArrayList(u8) = .empty;
     defer want.deinit(std.testing.allocator);
     try want.print(std.testing.allocator, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) });
@@ -1495,14 +1834,17 @@ test "HTTP/2: an event stream outlives timeouts.request" {
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
-        .timeout = .{ .request = .fromMilliseconds(300), .write = .fromSeconds(5) },
+        .timeout = .{ .request = .fromMilliseconds(100), .write = .fromSeconds(5) },
     }, {});
     defer server.deinit();
     server.router.get("/slow", struct {
+        // Time passing on purpose (TESTING.md D1, margin >= 5x): sleeps are
+        // lower bounds, so the stream lives at least 6 x 100 ms = 600 ms,
+        // 6x the 100 ms request timeout, on any machine.
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
             var buf: [256]u8 = undefined;
             var events = try res.startEventStream(&buf);
-            for (0..12) |_| {
+            for (0..6) |_| {
                 try events.send("tick", .{});
                 try req.io.sleep(.fromMilliseconds(100), .awake);
             }
@@ -1519,7 +1861,7 @@ test "HTTP/2: an event stream outlives timeouts.request" {
     const id = try client.request("GET", "/slow", null);
     try client.run();
     try std.testing.expectEqual(@as(u16, 200), client.get(id).status);
-    try std.testing.expectEqual(@as(usize, 12), std.mem.count(u8, client.get(id).body.items, "data: tick"));
+    try std.testing.expectEqual(@as(usize, 6), std.mem.count(u8, client.get(id).body.items, "data: tick"));
 }
 
 /// A parked response (`Response._park`): the handler returns, and bursts
@@ -1575,7 +1917,7 @@ test "parked h2: a handler that waited first parks; bursts arrive as DATA; end f
     defer client.deinit();
     const id = try client.request("GET", "/live", null);
     try ParkProbe.flushClient(&client);
-    try ParkProbe.opened.wait(io);
+    try wait.waitEvent(io, "the handler parked", &ParkProbe.opened);
     const p = ParkProbe.parked.?;
     try std.testing.expect(p.begin());
     try p.write(&.{ "id: 1\n", "data: a\n\n" });
@@ -1609,10 +1951,10 @@ test "parked h2: RST_STREAM tells the owner once; release frees the stream" {
     defer client.deinit();
     const id = try client.request("GET", "/live", null);
     try ParkProbe.flushClient(&client);
-    try ParkProbe.opened.wait(io);
+    try wait.waitEvent(io, "the handler parked", &ParkProbe.opened);
     _ = c.nghttp2_submit_rst_stream(client.session, c.NGHTTP2_FLAG_NONE, id, c.NGHTTP2_CANCEL);
     try ParkProbe.flushClient(&client);
-    try ParkProbe.gone.wait(io);
+    try wait.waitEvent(io, "the parked stream's owner was told it is gone", &ParkProbe.gone);
     try std.testing.expectEqual(@as(u32, 1), ParkProbe.gone_calls.load(.monotonic));
     try std.testing.expect(!ParkProbe.parked.?.begin());
     ParkProbe.parked.?.release();
@@ -1633,9 +1975,9 @@ test "parked h2: the connection closing with a parked stream tells the owner, an
     try client.init(std.testing.allocator, io, fx.server.address.ip);
     _ = try client.request("GET", "/live", null);
     try ParkProbe.flushClient(&client);
-    try ParkProbe.opened.wait(io);
+    try wait.waitEvent(io, "the handler parked", &ParkProbe.opened);
     client.deinit();
-    try ParkProbe.gone.wait(io);
+    try wait.waitEvent(io, "the parked stream's owner was told it is gone", &ParkProbe.gone);
     try std.testing.expectEqual(@as(u32, 1), ParkProbe.gone_calls.load(.monotonic));
     ParkProbe.parked.?.release();
 }
@@ -1652,7 +1994,7 @@ test "parked h2: the connection closing with a burst blocked on a full outbox: t
     try client.init(std.testing.allocator, io, fx.server.address.ip);
     _ = try client.request("GET", "/live", null);
     try ParkProbe.flushClient(&client);
-    try ParkProbe.opened.wait(io);
+    try wait.waitEvent(io, "the handler parked", &ParkProbe.opened);
 
     // The client reads nothing: no WINDOW_UPDATE, so past the stream's
     // window and the 1 MiB outbox the burst waits for room.
@@ -1660,7 +2002,10 @@ test "parked h2: the connection closing with a burst blocked on a full outbox: t
         written: std.atomic.Value(u32) = .init(0),
         failed: ?dusty.Parked.WriteError = null,
         gone_before_end: u32 = 0,
+        /// The burst is over (set last, on every way out).
+        done: std.atomic.Value(bool) = .init(false),
         fn run(self: *@This(), p: *dusty.Parked) void {
+            defer self.done.store(true, .release);
             if (!p.begin()) return;
             const chunk: [16 * 1024]u8 = @splat('x');
             while (true) {
@@ -1684,10 +2029,11 @@ test "parked h2: the connection closing with a burst blocked on a full outbox: t
     // is written, then close the connection under the waiting burst.
     try wait.waitAtLeast(io, "most of the burst written", &w.written, 66);
     client.deinit();
+    try wait.waitFlag(io, "the blocked burst failed and ended", &w.done);
     writing.await(io);
     try std.testing.expect(w.failed != null);
     try std.testing.expectEqual(@as(u32, 0), w.gone_before_end);
-    try ParkProbe.gone.wait(io);
+    try wait.waitEvent(io, "the parked stream's owner was told it is gone", &ParkProbe.gone);
     try std.testing.expectEqual(@as(u32, 1), ParkProbe.gone_calls.load(.monotonic));
     try std.testing.expect(!ParkProbe.parked.?.begin());
     ParkProbe.parked.?.release();
@@ -1749,10 +2095,10 @@ test "parked h2: a park that fails on a reset stream lets go of the stream once"
     defer client.deinit();
     const id = try client.request("GET", "/live", null);
     try ParkProbe.flushClient(&client);
-    try FailedPark.started.wait(io);
+    try wait.waitEvent(io, "the failing park's handler started", &FailedPark.started);
     _ = c.nghttp2_submit_rst_stream(client.session, c.NGHTTP2_FLAG_NONE, id, c.NGHTTP2_CANCEL);
     try ParkProbe.flushClient(&client);
-    try FailedPark.done.wait(io);
+    try wait.waitEvent(io, "the failing park's handler finished", &FailedPark.done);
     try std.testing.expectEqual(@as(?anyerror, error.WriteFailed), FailedPark.result);
     // The connection serves on (a double release would have broken its
     // stream count), and the fixture's allocator checks the rest.

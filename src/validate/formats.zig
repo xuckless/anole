@@ -1165,7 +1165,7 @@ test "the string rules take strings only, and a number field gets the rule's own
     try expect(head ++ "lat_long expects a string, field is i32; use two float fields with v.latitude and v.longitude", comptime stringText(latLong, i32).?);
 }
 
-test "the string rules on [N]u8, on lists of strings and on other types" {
+test "the string rules give [N]u8 its hint, lists of strings the each hint, and other types none" {
     const expect = std.testing.expectEqualStrings;
     const head = "validator: Dto.field_rules.x: ";
     const u8_array = "; [N]u8 is an array of numbers, not a string: use []const u8";
@@ -1217,7 +1217,7 @@ test "latitude and longitude take strings and floats; an integer field gets the 
     }
 }
 
-test "an uncalled decimal gets an example call, and inside each the head is each(...)" {
+test "an uncalled decimal gets an example call, and isDecimal or isPort used as a rule names the rule" {
     const expect = std.testing.expectEqualStrings;
     try expect("decimal must be called, e.g. v.decimal(.{})", comptime core.hints.mustBeCalled("decimal", @TypeOf(decimal)));
     try expect("expected a rule, got the predicate isDecimal; use the rule v.decimal(.{})", comptime core.hints.predicateAsRule("isDecimal", "decimal", @TypeOf(decimal)));

@@ -343,7 +343,7 @@ pub const App = struct {
     }
 
     fn ingestSnapshot(self: *App, v: protocol.View, data: ?std.json.Value) void {
-        const idx = @intFromEnum(v);
+        const idx = @backingInt(v);
         _ = self.arenas[idx].reset(.retain_capacity);
         const a = self.arenas[idx].allocator();
         switch (v) {
@@ -710,7 +710,7 @@ pub const App = struct {
 
     fn persist(self: *App, s: []const u8) []const u8 {
         // Prompts are short; keep them in the snapshot arena of `tasks` (unused).
-        return self.arenas[@intFromEnum(protocol.View.tasks)].allocator().dupe(u8, s) catch "";
+        return self.arenas[@backingInt(protocol.View.tasks)].allocator().dupe(u8, s) catch "";
     }
 
     fn cmdFullRestart(self: *App, args: []const []const u8) void {
@@ -936,7 +936,7 @@ pub fn parseIso(s: []const u8) ?i64 {
     return ((days * 24 + h) * 60 + mi) * 60_000 + se * 1000 + ms;
 }
 
-test "app: parseIso" {
+test "app: parseIso reads UTC ISO 8601 timestamps to epoch milliseconds" {
     try std.testing.expectEqual(@as(i64, 0), parseIso("1970-01-01T00:00:00.000Z").?);
     try std.testing.expectEqual(@as(i64, 1_000_000_123), parseIso("1970-01-12T13:46:40.123Z").?);
     try std.testing.expectEqual(@as(i64, 1_792_748_222_004), parseIso("2026-10-23T09:37:02.004Z").?);

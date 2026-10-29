@@ -100,6 +100,12 @@ tasks, and its connections are pooled: `deinit` on a response hands its
 connection back, and the next request to the same scheme, host and port
 takes it. The `gpa` you pass must be thread-safe.
 
+A server may answer before it has read the whole request body (a `413` to
+a large upload, say) and then close the connection. `fetch` returns that
+answer instead of the write error. Not on Windows: there the operating
+system discards what was received once the server resets the connection,
+so the upload fails with the write error and the early answer is lost.
+
 ### The connection pool
 
 On zio each executor has a pool of its own, as the database connectors do:

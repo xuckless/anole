@@ -56,7 +56,7 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) ParseError!std.json.Parse
 const testing = std.testing;
 const golden = @import("protocol/golden.zig");
 
-test "the INFO of a plain server" {
+test "a recorded plain-server INFO parses into its fields" {
     const info = try parse(testing.allocator, golden.info_default_json);
     defer info.deinit();
     try testing.expectEqualStrings("2.15.1", info.value.version);
@@ -69,7 +69,7 @@ test "the INFO of a plain server" {
     try testing.expectEqual(0, info.value.connect_urls.len);
 }
 
-test "INFO after CONNECT, with auth, with TLS" {
+test "recorded INFOs set headers, auth_required and tls_required" {
     const connected = try parse(testing.allocator, golden.info_connected_json);
     defer connected.deinit();
     try testing.expect(connected.value.headers);
@@ -83,7 +83,7 @@ test "INFO after CONNECT, with auth, with TLS" {
     try testing.expect(tls.value.tls_required);
 }
 
-test "cluster topology and lame duck mode" {
+test "a recorded cluster INFO gives connect_urls, and a lame duck's INFO sets ldm" {
     const cluster = try parse(testing.allocator, golden.info_cluster_json);
     defer cluster.deinit();
     try testing.expectEqualStrings("spike", cluster.value.cluster);
@@ -106,7 +106,7 @@ test "strings are copied out of the input" {
     try testing.expectEqualStrings("127.0.0.1:14234", info.value.connect_urls[0]);
 }
 
-test "malformed INFO" {
+test "malformed INFO is ProtocolError, and {} gives the defaults" {
     for ([_][]const u8{ "", "not json", "[1]", "{\"port\":70000}", "{\"port\":-1}", "{\"headers\":1}", "{\"port\":1,\"port\":2}" }) |json| {
         try testing.expectError(error.ProtocolError, parse(testing.allocator, json));
     }
@@ -121,5 +121,5 @@ fn parseAndFree(gpa: std.mem.Allocator, json: []const u8) !void {
 }
 
 test "no leaks when an allocation fails" {
-    try testing.checkAllAllocationFailures(testing.allocator, parseAndFree, .{golden.info_cluster_json});
+    try testing.checkAllAllocationFailures(@import("../../testing/no_resize.zig").allocator, parseAndFree, .{golden.info_cluster_json});
 }

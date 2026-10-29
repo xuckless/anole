@@ -877,7 +877,7 @@ test "Dec: truncation and bad lengths" {
     try testing.expectError(error.Invalid, d2.arrayLen());
 }
 
-test "error table" {
+test "kafka: error codes have Kafka's names, and NOT_LEADER_OR_FOLLOWER is retriable" {
     try testing.expectEqualStrings("NOT_LEADER_OR_FOLLOWER", errorName(6));
     try testing.expect(isRetriable(6));
     try testing.expect(!isRetriable(58));

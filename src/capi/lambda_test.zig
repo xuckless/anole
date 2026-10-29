@@ -10,7 +10,7 @@ const engine = @import("engine.zig");
 const config = @import("config.zig");
 const features = anole.features;
 
-test "config: lambda keys" {
+test "capi config: the lambda group parses with its defaults; each refusal names its key" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -252,8 +252,9 @@ test "capi lambda: anole_server_drain during a held /next ends with ANOLE_EV_STO
     var buf: [16 * 1024]u8 align(8) = undefined;
     var need: u32 = 0;
     var stopped = false;
-    var waited: u32 = 0;
-    while (!stopped and waited < 10_000) : (waited += 50) {
+    const tio = engine.threadedIo();
+    const started = std.Io.Clock.awake.now(tio);
+    while (!stopped and started.untilNow(tio, .awake).nanoseconds < wait.deadline().nanoseconds) {
         const n = try engine.pollWait(c, &buf, 50, &need);
         var off: usize = 0;
         while (off < n) {
@@ -262,6 +263,9 @@ test "capi lambda: anole_server_drain during a held /next ends with ANOLE_EV_STO
             off += ev.len;
         }
     }
-    try std.testing.expect(stopped);
+    if (!stopped) {
+        std.debug.print("no STOPPED after drain\n", .{});
+        return error.TestUnexpectedResult;
+    }
     try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }

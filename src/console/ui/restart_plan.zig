@@ -76,7 +76,7 @@ fn with(comptime f: anytype) Situation {
     return s;
 }
 
-test "restart_plan: table of situations" {
+test "restart_plan: each situation gets its plan (refuse, exec in place, kill then wait for the supervisor or relaunch)" {
     const T = std.testing;
     try T.expectEqualDeep(Plan{ .refuse = .not_allowed }, plan(with(.{ .allowed = false })));
     try T.expectEqualDeep(Plan{ .refuse = .not_allowed }, plan(with(.{ .allowed = false, .in_process = true })));
@@ -97,7 +97,7 @@ test "restart_plan: table of situations" {
     try T.expectEqualDeep(Plan{ .kill = .{ .send_kill = true, .then = .wait_for_supervisor } }, plan(with(.{ .force_kill = true, .supervisor = .pm2, .have_launch_info = false })));
 }
 
-test "restart_plan: wedged with an injected clock" {
+test "restart_plan: an app silent for 5 s is wedged, one silent for 4,999 ms is not" {
     try std.testing.expect(!wedged(5_999, 1_000, 5_000)); // 4,999 ms
     try std.testing.expect(wedged(6_000, 1_000, 5_000)); // 5,000 ms
 }

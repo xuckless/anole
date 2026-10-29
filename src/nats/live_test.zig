@@ -21,7 +21,7 @@ fn open(io: std.Io, opts: nats.Options) !*nats.Client {
     return c;
 }
 
-test "live: publish, subscribe by hand, request and reply" {
+test "live: a published message reaches a subscriber, and a request nobody answers is ServiceUnavailable (no_responders)" {
     if (url == null) return error.SkipZigTest;
     const io = testing.io;
     const nc = try open(io, .{});
@@ -52,9 +52,14 @@ test "live: JetStream stream, publish with ack, duplicate id" {
     var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
     const js = nc.js();
     try js.ensureStream(&c, .{ .name = "ANOLE_LIVE", .subjects = &.{"anole.live.js.>"}, .storage = .memory });
-    const first = try js.publish(&c, "anole.live.js.a", "one", .{ .msg_id = "m-1" });
+    // A message id of this run: a run within JetStream's duplicate window
+    // of an earlier one (2 min by default) does not find it taken.
+    var id_buf: [32]u8 = undefined;
+    const msg_id = try std.fmt.bufPrint(&id_buf, "m-{x}", .{@as(u96, @bitCast(std.Io.Clock.real.now(io).nanoseconds))});
+    errdefer std.debug.print("live JetStream test: msg_id {s}\n", .{msg_id});
+    const first = try js.publish(&c, "anole.live.js.a", "one", .{ .msg_id = msg_id });
     try testing.expect(!first.duplicate);
-    const second = try js.publish(&c, "anole.live.js.a", "one", .{ .msg_id = "m-1" });
+    const second = try js.publish(&c, "anole.live.js.a", "one", .{ .msg_id = msg_id });
     try testing.expect(second.duplicate);
     try testing.expectEqual(first.sequence, second.sequence);
 }

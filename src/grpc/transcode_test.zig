@@ -396,124 +396,131 @@ fn http2(conn: *@import("anole_h2_client").ClientConnection, arena: std.mem.Allo
     return reply;
 }
 
-/// Every check, over one protocol.
-fn exercise(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
-    {
-        // A resource name with literals inside the variable, and the query.
-        const r = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/s1/books/b%201?view=FULL&shade=DARK&tags=a&tags=b&author.name=Ada&revision=7&full=true&big=9" });
-        try std.testing.expectEqual(@as(u16, 200), r.status);
-        try std.testing.expectEqualStrings("application/json", r.content_type);
-        try std.testing.expect(r.book_header);
-        try std.testing.expectEqualStrings("1", r.served_trailer.?);
-        try std.testing.expectEqualStrings(
-            "{\"name\":\"shelves/s1/books/b 1\",\"title\":\"view=FULL shade=DARK tags=2 author=Ada rev=7 full=true big=9\",\"tags\":[\"a\",\"b\"],\"author\":{\"name\":\"Ada\"}}",
-            r.body,
-        );
-    }
-    {
-        // The additional bindings; a nested field in the path.
-        const r = try send(ctx, arena, .{ .method = .get, .path = "/v1/books/one" });
-        try std.testing.expectEqual(@as(u16, 200), r.status);
-        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"name\":\"one\"") != null);
-        const r2 = try send(ctx, arena, .{ .method = .get, .path = "/v1/authors/Ada%20L/books" });
-        try std.testing.expect(std.mem.indexOf(u8, r2.body, "author=Ada L") != null);
-        // Another binding on the same route (/v1/books/:name), with a verb.
-        const stat = try send(ctx, arena, .{ .method = .get, .path = "/v1/books/one:stat" });
-        try std.testing.expectEqualStrings("{\"name\":\"one\",\"title\":\"stat\"}", stat.body);
-        // A variable named differently at a position another route has.
-        const shelf = try send(ctx, arena, .{ .method = .get, .path = "/v1/authors/Ada/shelf?pageSize=1" });
-        try std.testing.expectEqualStrings("{\"books\":[{\"name\":\"Ada/books/0\"}],\"nextPageToken\":\"next\"}", shelf.body);
-    }
-    {
-        // A gRPC status: its HTTP status and google.rpc.Status JSON.
-        const r = try send(ctx, arena, .{ .method = .get, .path = "/v1/books/missing" });
-        try std.testing.expectEqual(@as(u16, 404), r.status);
-        try std.testing.expectEqualStrings("{\"code\":5,\"message\":\"no such book\",\"details\":[]}", r.body);
-        const boom = try send(ctx, arena, .{ .method = .get, .path = "/v1/books/boom" });
-        try std.testing.expectEqual(@as(u16, 500), boom.status);
-        try std.testing.expectEqualStrings("{\"code\":2,\"message\":\"Application error processing RPC\",\"details\":[]}", boom.body);
-        const bad = try send(ctx, arena, .{ .method = .get, .path = "/v1/books/x?full=maybe" });
-        try std.testing.expectEqual(@as(u16, 400), bad.status);
-        try std.testing.expect(std.mem.indexOf(u8, bad.body, "\"code\":3") != null);
-    }
-    {
-        // body: a field; the rest from the query (JSON or proto names).
-        const r = try send(ctx, arena, .{ .method = .post, .path = "/v1/shelves/s2/books?bookId=b9", .body = "{\"title\":\"Dune\",\"pages\":\"412\",\"shade\":\"LIGHT\"}" });
-        try std.testing.expectEqual(@as(u16, 200), r.status);
-        try std.testing.expectEqualStrings("{\"name\":\"shelves/s2/books/b9\",\"title\":\"Dune\",\"pages\":\"412\",\"shade\":\"LIGHT\"}", r.body);
-        const bad = try send(ctx, arena, .{ .method = .post, .path = "/v1/shelves/s2/books", .body = "{\"title\":" });
-        try std.testing.expectEqual(@as(u16, 400), bad.status);
-    }
-    {
-        // PATCH with the body field and a path variable inside it; the
-        // PUT binding with body "*".
-        const r = try send(ctx, arena, .{ .method = .patch, .path = "/v1/shelves/s/books/b?mask=isbn", .body = "{\"title\":\"T\"}" });
-        try std.testing.expectEqualStrings("{\"name\":\"shelves/s/books/b\",\"title\":\"T\",\"isbn\":\"isbn\"}", r.body);
-        const p = try send(ctx, arena, .{ .method = .put, .path = "/v1/shelves/s/books/b", .body = "{\"book\":{\"title\":\"U\"},\"mask\":\"m\"}" });
-        try std.testing.expectEqualStrings("{\"name\":\"shelves/s/books/b\",\"title\":\"U\",\"isbn\":\"m\"}", p.body);
-    }
-    {
-        // response_body: the repeated field alone.
-        const r = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/s3/books?pageSize=2" });
-        try std.testing.expectEqualStrings("[{\"name\":\"shelves/s3/books/0\"},{\"name\":\"shelves/s3/books/1\"}]", r.body);
-        const none = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/s3/books" });
-        try std.testing.expectEqualStrings("[]", none.body);
-    }
-    {
-        const r = try send(ctx, arena, .{ .method = .delete, .path = "/v1/shelves/s/books/b" });
-        try std.testing.expectEqual(@as(u16, 200), r.status);
-        try std.testing.expectEqualStrings("{}", r.body);
-    }
-    {
-        // Verbs: after a variable, after a literal, after **.
-        const r = try send(ctx, arena, .{ .method = .post, .path = "/v1/shelves/s/books/b:publish", .body = "{\"view\":\"V\"}" });
-        try std.testing.expectEqual(@as(u16, 200), r.status);
-        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"name\":\"shelves/s/books/b\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, r.body, "view=V") != null);
-        const b = try send(ctx, arena, .{ .method = .get, .path = "/v1/books:batchGet?view=W" });
-        try std.testing.expect(std.mem.indexOf(u8, b.body, "\"name\":\"batch\"") != null);
-        const f = try send(ctx, arena, .{ .method = .get, .path = "/files/x/a/b%2Fc/d.txt" });
-        try std.testing.expectEqualStrings("{\"name\":\"a/b%2Fc/d.txt\",\"title\":\"file\"}", f.body);
-        const i = try send(ctx, arena, .{ .method = .get, .path = "/info/a/b:stat" });
-        try std.testing.expectEqualStrings("{\"name\":\"a/b\",\"title\":\"info\"}", i.body);
-        const no_verb = try send(ctx, arena, .{ .method = .get, .path = "/info/a/b" });
-        try std.testing.expectEqual(@as(u16, 404), no_verb.status);
-    }
-    {
-        // A custom HTTP method.
-        const r = try send(ctx, arena, .{ .method = .search, .path = "/v1/books", .body = "{\"view\":\"S\"}" });
-        try std.testing.expectEqualStrings("{\"name\":\"found\",\"title\":\"S\"}", r.body);
-    }
-    {
-        // Server streaming: one JSON array.
-        const r = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/w/books:watch?pageSize=3" });
-        try std.testing.expectEqual(@as(u16, 200), r.status);
-        try std.testing.expect(!r.cut);
-        try std.testing.expectEqualStrings("[{\"name\":\"shelves/w/books/0\"},{\"name\":\"shelves/w/books/1\"},{\"name\":\"shelves/w/books/2\"}]", r.body);
-        const none = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/w/books:watch" });
-        try std.testing.expectEqualStrings("[]", none.body);
-        // Failing before the first message: an ordinary error.
-        const first = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/w/books:watch?pageSize=3&fail=first" });
-        try std.testing.expectEqual(@as(u16, 400), first.status);
-        try std.testing.expect(std.mem.indexOf(u8, first.body, "\"code\":9") != null);
-        // Failing after it: the array is cut short.
-        const midway = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/w/books:watch?pageSize=5&fail=midway" });
-        try std.testing.expect(midway.cut);
-    }
-    {
-        // Client streaming is not transcoded.
-        const r = try send(ctx, arena, .{ .method = .post, .path = "/v1/books:upload", .body = "{}" });
-        try std.testing.expectEqual(@as(u16, 501), r.status);
-        try std.testing.expect(std.mem.indexOf(u8, r.body, "\"code\":12") != null);
-    }
-    {
-        // Paths no binding matches.
-        const r = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/s/papers/b" });
-        try std.testing.expectEqual(@as(u16, 404), r.status);
-    }
+fn checkBindings(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
+    // A resource name with literals inside the variable, and the query.
+    const r = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/s1/books/b%201?view=FULL&shade=DARK&tags=a&tags=b&author.name=Ada&revision=7&full=true&big=9" });
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqualStrings("application/json", r.content_type);
+    try std.testing.expect(r.book_header);
+    try std.testing.expectEqualStrings("1", r.served_trailer.?);
+    try std.testing.expectEqualStrings(
+        "{\"name\":\"shelves/s1/books/b 1\",\"title\":\"view=FULL shade=DARK tags=2 author=Ada rev=7 full=true big=9\",\"tags\":[\"a\",\"b\"],\"author\":{\"name\":\"Ada\"}}",
+        r.body,
+    );
+    // The additional bindings; a nested field in the path.
+    const one = try send(ctx, arena, .{ .method = .get, .path = "/v1/books/one" });
+    try std.testing.expectEqual(@as(u16, 200), one.status);
+    try std.testing.expect(std.mem.indexOf(u8, one.body, "\"name\":\"one\"") != null);
+    const r2 = try send(ctx, arena, .{ .method = .get, .path = "/v1/authors/Ada%20L/books" });
+    try std.testing.expect(std.mem.indexOf(u8, r2.body, "author=Ada L") != null);
+    // Another binding on the same route (/v1/books/:name), with a verb.
+    const stat = try send(ctx, arena, .{ .method = .get, .path = "/v1/books/one:stat" });
+    try std.testing.expectEqualStrings("{\"name\":\"one\",\"title\":\"stat\"}", stat.body);
+    // A variable named differently at a position another route has.
+    const shelf = try send(ctx, arena, .{ .method = .get, .path = "/v1/authors/Ada/shelf?pageSize=1" });
+    try std.testing.expectEqualStrings("{\"books\":[{\"name\":\"Ada/books/0\"}],\"nextPageToken\":\"next\"}", shelf.body);
 }
 
-test "transcoding: REST routes over HTTP/1.1 and HTTP/2" {
+fn checkStatus(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
+    // A gRPC status: its HTTP status and google.rpc.Status JSON.
+    const r = try send(ctx, arena, .{ .method = .get, .path = "/v1/books/missing" });
+    try std.testing.expectEqual(@as(u16, 404), r.status);
+    try std.testing.expectEqualStrings("{\"code\":5,\"message\":\"no such book\",\"details\":[]}", r.body);
+    const boom = try send(ctx, arena, .{ .method = .get, .path = "/v1/books/boom" });
+    try std.testing.expectEqual(@as(u16, 500), boom.status);
+    try std.testing.expectEqualStrings("{\"code\":2,\"message\":\"Application error processing RPC\",\"details\":[]}", boom.body);
+    const bad = try send(ctx, arena, .{ .method = .get, .path = "/v1/books/x?full=maybe" });
+    try std.testing.expectEqual(@as(u16, 400), bad.status);
+    try std.testing.expect(std.mem.indexOf(u8, bad.body, "\"code\":3") != null);
+}
+
+fn checkBodyField(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
+    // body: a field; the rest from the query (JSON or proto names).
+    const r = try send(ctx, arena, .{ .method = .post, .path = "/v1/shelves/s2/books?bookId=b9", .body = "{\"title\":\"Dune\",\"pages\":\"412\",\"shade\":\"LIGHT\"}" });
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqualStrings("{\"name\":\"shelves/s2/books/b9\",\"title\":\"Dune\",\"pages\":\"412\",\"shade\":\"LIGHT\"}", r.body);
+    const bad = try send(ctx, arena, .{ .method = .post, .path = "/v1/shelves/s2/books", .body = "{\"title\":" });
+    try std.testing.expectEqual(@as(u16, 400), bad.status);
+}
+
+fn checkPatchPut(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
+    // PATCH with the body field and a path variable inside it; the
+    // PUT binding with body "*".
+    const r = try send(ctx, arena, .{ .method = .patch, .path = "/v1/shelves/s/books/b?mask=isbn", .body = "{\"title\":\"T\"}" });
+    try std.testing.expectEqualStrings("{\"name\":\"shelves/s/books/b\",\"title\":\"T\",\"isbn\":\"isbn\"}", r.body);
+    const p = try send(ctx, arena, .{ .method = .put, .path = "/v1/shelves/s/books/b", .body = "{\"book\":{\"title\":\"U\"},\"mask\":\"m\"}" });
+    try std.testing.expectEqualStrings("{\"name\":\"shelves/s/books/b\",\"title\":\"U\",\"isbn\":\"m\"}", p.body);
+}
+
+fn checkResponseBody(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
+    // response_body: the repeated field alone.
+    const r = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/s3/books?pageSize=2" });
+    try std.testing.expectEqualStrings("[{\"name\":\"shelves/s3/books/0\"},{\"name\":\"shelves/s3/books/1\"}]", r.body);
+    const none = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/s3/books" });
+    try std.testing.expectEqualStrings("[]", none.body);
+}
+
+fn checkDelete(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
+    const r = try send(ctx, arena, .{ .method = .delete, .path = "/v1/shelves/s/books/b" });
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expectEqualStrings("{}", r.body);
+}
+
+fn checkVerbs(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
+    // Verbs: after a variable, after a literal, after **.
+    const r = try send(ctx, arena, .{ .method = .post, .path = "/v1/shelves/s/books/b:publish", .body = "{\"view\":\"V\"}" });
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"name\":\"shelves/s/books/b\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "view=V") != null);
+    const b = try send(ctx, arena, .{ .method = .get, .path = "/v1/books:batchGet?view=W" });
+    try std.testing.expect(std.mem.indexOf(u8, b.body, "\"name\":\"batch\"") != null);
+    const f = try send(ctx, arena, .{ .method = .get, .path = "/files/x/a/b%2Fc/d.txt" });
+    try std.testing.expectEqualStrings("{\"name\":\"a/b%2Fc/d.txt\",\"title\":\"file\"}", f.body);
+    const i = try send(ctx, arena, .{ .method = .get, .path = "/info/a/b:stat" });
+    try std.testing.expectEqualStrings("{\"name\":\"a/b\",\"title\":\"info\"}", i.body);
+    const no_verb = try send(ctx, arena, .{ .method = .get, .path = "/info/a/b" });
+    try std.testing.expectEqual(@as(u16, 404), no_verb.status);
+}
+
+fn checkCustomMethod(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
+    // A custom HTTP method.
+    const r = try send(ctx, arena, .{ .method = .search, .path = "/v1/books", .body = "{\"view\":\"S\"}" });
+    try std.testing.expectEqualStrings("{\"name\":\"found\",\"title\":\"S\"}", r.body);
+}
+
+fn checkServerStream(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
+    // Server streaming: one JSON array.
+    const r = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/w/books:watch?pageSize=3" });
+    try std.testing.expectEqual(@as(u16, 200), r.status);
+    try std.testing.expect(!r.cut);
+    try std.testing.expectEqualStrings("[{\"name\":\"shelves/w/books/0\"},{\"name\":\"shelves/w/books/1\"},{\"name\":\"shelves/w/books/2\"}]", r.body);
+    const none = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/w/books:watch" });
+    try std.testing.expectEqualStrings("[]", none.body);
+    // Failing before the first message: an ordinary error.
+    const first = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/w/books:watch?pageSize=3&fail=first" });
+    try std.testing.expectEqual(@as(u16, 400), first.status);
+    try std.testing.expect(std.mem.indexOf(u8, first.body, "\"code\":9") != null);
+    // Failing after it: the array is cut short.
+    const midway = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/w/books:watch?pageSize=5&fail=midway" });
+    try std.testing.expect(midway.cut);
+}
+
+fn checkClientStream(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
+    // Client streaming is not transcoded.
+    const r = try send(ctx, arena, .{ .method = .post, .path = "/v1/books:upload", .body = "{}" });
+    try std.testing.expectEqual(@as(u16, 501), r.status);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"code\":12") != null);
+}
+
+fn checkUnmatched(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
+    // Paths no binding matches.
+    const r = try send(ctx, arena, .{ .method = .get, .path = "/v1/shelves/s/papers/b" });
+    try std.testing.expectEqual(@as(u16, 404), r.status);
+}
+
+/// Runs `check(ctx, send, arena)` over HTTP/1.1 and, with HTTP/2 built in,
+/// over HTTP/2, against one server with the Library service.
+fn overBoth(comptime check: anytype) !void {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
@@ -524,8 +531,8 @@ test "transcoding: REST routes over HTTP/1.1 and HTTP/2" {
     defer server.deinit();
     grpc.register(void, &server.router, Library, impl);
     var server_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(void)) !void {
-            try s.run();
+        fn run(srv: *dusty.Server(void)) !void {
+            try srv.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -547,44 +554,97 @@ test "transcoding: REST routes over HTTP/1.1 and HTTP/2" {
             return http1(self.gpa, a, self.io, self.port, x);
         }
     };
-    try exercise(H1{ .gpa = gpa, .io = io, .port = port }, H1.send, arena);
-
-    // The gRPC route of an annotated method still serves gRPC's protocols.
-    {
-        var client = dusty.Client.init(gpa, io, .{});
-        defer client.deinit();
-        var headers = try dusty.Headers.init(gpa, 4);
-        defer headers.deinit(gpa);
-        try headers.put("Content-Type", "application/json");
-        const url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/transcode.Library/GetBook", .{port});
-        var resp = try client.fetch(url, .{ .method = .post, .headers = &headers, .body = "{\"name\":\"c\"}" });
-        defer resp.deinit();
-        try std.testing.expectEqual(@as(u16, 200), @as(u16, @intCast(@backingInt(resp.status()))));
-        // Connect's JSON is protojson too: a oneof member is a field of
-        // the message, not nested under the oneof's name.
-        const update = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/transcode.Library/UpdateBook", .{port});
-        var oneof = try client.fetch(update, .{ .method = .post, .headers = &headers, .body = "{\"book\":{\"title\":\"T\"},\"mask\":\"978\"}" });
-        defer oneof.deinit();
-        try std.testing.expectEqualStrings("{\"title\":\"T\",\"isbn\":\"978\"}", (try oneof.body()).?);
-    }
+    try check(H1{ .gpa = gpa, .io = io, .port = port }, H1.send, arena);
 
     if (features.http2) {
         const h2 = @import("anole_h2_client");
         const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = port });
         defer conn.close();
-        try exercise(conn, http2, arena);
+        try check(conn, http2, arena);
     }
 }
 
-test "transcoding: the body is read under the request timeout, and must be JSON" {
+test "transcoding: path variables, query parameters, nested fields and the additional bindings" {
+    try overBoth(checkBindings);
+}
+
+test "transcoding: a gRPC status is its HTTP status and google.rpc.Status JSON" {
+    try overBoth(checkStatus);
+}
+
+test "transcoding: a body field, the rest of the request from the query" {
+    try overBoth(checkBodyField);
+}
+
+test "transcoding: PATCH with a body field and PUT with body \"*\"" {
+    try overBoth(checkPatchPut);
+}
+
+test "transcoding: response_body sends the one field" {
+    try overBoth(checkResponseBody);
+}
+
+test "transcoding: DELETE" {
+    try overBoth(checkDelete);
+}
+
+test "transcoding: verbs after a variable, a literal and **" {
+    try overBoth(checkVerbs);
+}
+
+test "transcoding: a custom HTTP method" {
+    try overBoth(checkCustomMethod);
+}
+
+test "transcoding: a server stream is one JSON array, cut short when it fails midway" {
+    try overBoth(checkServerStream);
+}
+
+test "transcoding: client streaming is 501 UNIMPLEMENTED" {
+    try overBoth(checkClientStream);
+}
+
+test "transcoding: a path no binding matches is 404" {
+    try overBoth(checkUnmatched);
+}
+
+test "transcoding: the gRPC route of an annotated method still serves Connect; oneof members are fields" {
+    try overBoth(struct {
+        fn check(ctx: anytype, send: anytype, arena: std.mem.Allocator) !void {
+            _ = send;
+            // Over HTTP/1.1 only: Connect's unary JSON needs no HTTP/2.
+            if (@TypeOf(ctx) != *@import("anole_h2_client").ClientConnection) {
+                const gpa = ctx.gpa;
+                var client = dusty.Client.init(gpa, ctx.io, .{});
+                defer client.deinit();
+                var headers = try dusty.Headers.init(gpa, 4);
+                defer headers.deinit(gpa);
+                try headers.put("Content-Type", "application/json");
+                const url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/transcode.Library/GetBook", .{ctx.port});
+                var resp = try client.fetch(url, .{ .method = .post, .headers = &headers, .body = "{\"name\":\"c\"}" });
+                defer resp.deinit();
+                try std.testing.expectEqual(@as(u16, 200), @as(u16, @intCast(@backingInt(resp.status()))));
+                // Connect's JSON is protojson too: a oneof member is a field of
+                // the message, not nested under the oneof's name.
+                const update = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/transcode.Library/UpdateBook", .{ctx.port});
+                var oneof = try client.fetch(update, .{ .method = .post, .headers = &headers, .body = "{\"book\":{\"title\":\"T\"},\"mask\":\"978\"}" });
+                defer oneof.deinit();
+                try std.testing.expectEqualStrings("{\"title\":\"T\",\"isbn\":\"978\"}", (try oneof.body()).?);
+            }
+        }
+    }.check);
+}
+
+/// Runs `body(gpa, io, port)` against a server with the Library service on a
+/// plain HTTP/1.1 listener with `options`.
+fn withLibraryServer(comptime options: dusty.ServerConfig, comptime body: fn (std.mem.Allocator, std.Io, u16) anyerror!void) !void {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
     const io = rt.io();
-    var server = dusty.Server(void).init(gpa, io, .{
-        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }},
-        .timeout = .{ .request = .fromMilliseconds(300) },
-    }, {});
+    var opts = options;
+    opts.listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }};
+    var server = dusty.Server(void).init(gpa, io, opts, {});
     defer server.deinit();
     grpc.register(void, &server.router, Library, impl);
     var server_future = try io.concurrent(struct {
@@ -594,36 +654,51 @@ test "transcoding: the body is read under the request timeout, and must be JSON"
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
     try server.waitReady(io);
-    const port = server.address.ip.getPort();
     const level = std.testing.log_level;
     std.testing.log_level = .err;
     defer std.testing.log_level = level;
+    try body(gpa, io, server.address.ip.getPort());
+}
 
-    const book = "{\"title\":\"T\"}";
-    {
-        // A body that never arrives in full: the request timeout still
-        // ends the request.
-        const answer = try slowExchange(gpa, io, port, &.{
-            "POST /v1/shelves/1/books HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"title\"",
-        }, .zero, "\r\n\r\n");
-        gpa.free(answer);
-    }
-    for ([_]struct { []const u8, []const u8 }{
-        .{ "Content-Type: text/plain\r\n", "415" },
-        .{ "Content-Type: application/x-www-form-urlencoded\r\n", "415" },
-        .{ "", "415" },
-        .{ "Content-Type: application/json; charset=utf-8\r\n", "200" },
-        .{ "Content-Type: Application/JSON\r\n", "200" },
-    }) |case| {
-        var buf: [256]u8 = undefined;
-        const request = try std.fmt.bufPrint(&buf, "POST /v1/shelves/1/books HTTP/1.1\r\nHost: x\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ case[0], book.len, book });
-        const answer = try slowExchange(gpa, io, port, &.{request}, .zero, "\r\n\r\n");
-        defer gpa.free(answer);
-        if (!std.mem.startsWith(u8, answer, "HTTP/1.1 ") or !std.mem.startsWith(u8, answer[9..], case[1])) {
-            std.debug.print("{s}: {s}\n", .{ case[0], answer });
-            return error.TestUnexpectedResult;
+test "transcoding: a body that never arrives in full ends at the request timeout" {
+    try withLibraryServer(.{ .timeout = .{ .request = .fromMilliseconds(300) } }, struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
+            // 100 bytes declared, 8 sent: the request timeout still ends
+            // the request, with a 408 or by closing the connection.
+            const answer = try slowExchange(gpa, io, port, &.{
+                "POST /v1/shelves/1/books HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"title\"",
+            }, .zero, "\r\n\r\n");
+            defer gpa.free(answer);
+            if (answer.len != 0 and !std.mem.startsWith(u8, answer, "HTTP/1.1 408")) {
+                std.debug.print("answer: {s}\n", .{answer});
+                return error.TestUnexpectedResult;
+            }
         }
-    }
+    }.run);
+}
+
+test "transcoding: a non-empty body must be JSON" {
+    try withLibraryServer(.{}, struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
+            const book = "{\"title\":\"T\"}";
+            for ([_]struct { []const u8, []const u8 }{
+                .{ "Content-Type: text/plain\r\n", "415" },
+                .{ "Content-Type: application/x-www-form-urlencoded\r\n", "415" },
+                .{ "", "415" },
+                .{ "Content-Type: application/json; charset=utf-8\r\n", "200" },
+                .{ "Content-Type: Application/JSON\r\n", "200" },
+            }) |case| {
+                var buf: [256]u8 = undefined;
+                const request = try std.fmt.bufPrint(&buf, "POST /v1/shelves/1/books HTTP/1.1\r\nHost: x\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ case[0], book.len, book });
+                const answer = try slowExchange(gpa, io, port, &.{request}, .zero, "\r\n\r\n");
+                defer gpa.free(answer);
+                if (!std.mem.startsWith(u8, answer, "HTTP/1.1 ") or !std.mem.startsWith(u8, answer[9..], case[1])) {
+                    std.debug.print("{s}: {s}\n", .{ case[0], answer });
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }.run);
 }
 
 /// Sends `parts` over a new connection, waiting `pause` before each one
@@ -700,14 +775,45 @@ test "fuzz: request messages decoded as gRPC decodes them (protobuf and JSON)" {
     });
 }
 
-test "transcoding: off for a registration" {
+test "transcoding: off for a registration, only the gRPC routes serve" {
     const gpa = std.testing.allocator;
-    var router = dusty.Router(void).init(gpa);
-    defer router.deinit();
-    grpc.registerWith(void, &router, Library, impl, .{ .transcode = false });
-    // Only the gRPC routes (POST, one per method).
-    try std.testing.expect(router.trees[@backingInt(dusty.Method.get)] == null);
-    try std.testing.expect(router.trees[@backingInt(dusty.Method.patch)] == null);
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer server.deinit();
+    grpc.registerWith(void, &server.router, Library, impl, .{ .transcode = false });
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+    const port = server.address.ip.getPort();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // One request per REST binding kind (GET, POST, PATCH, PUT, DELETE,
+    // the custom SEARCH and a custom verb): none of them is routed.
+    const bindings = [_]Exchange{
+        .{ .method = .get, .path = "/v1/books/one" },
+        .{ .method = .post, .path = "/v1/shelves/s2/books?bookId=b9", .body = "{\"title\":\"Dune\"}" },
+        .{ .method = .patch, .path = "/v1/shelves/s/books/b?mask=isbn", .body = "{\"title\":\"T\"}" },
+        .{ .method = .put, .path = "/v1/shelves/s/books/b", .body = "{\"book\":{\"title\":\"U\"},\"mask\":\"m\"}" },
+        .{ .method = .delete, .path = "/v1/shelves/s/books/b" },
+        .{ .method = .search, .path = "/v1/books", .body = "{\"view\":\"S\"}" },
+        .{ .method = .post, .path = "/v1/shelves/s/books/b:publish", .body = "{\"view\":\"V\"}" },
+    };
+    for (bindings) |x| {
+        const rest = try http1(gpa, arena, io, port, x);
+        std.testing.expectEqual(@as(u16, 404), rest.status) catch |err| {
+            std.debug.print("{s} {s}\n", .{ @tagName(x.method), x.path });
+            return err;
+        };
+    }
+    const rpc = try http1(gpa, arena, io, port, .{ .method = .post, .path = "/transcode.Library/GetBook", .body = "{\"name\":\"c\"}" });
+    try std.testing.expectEqual(@as(u16, 200), rpc.status);
 }
 
 /// Middleware that refuses every request.

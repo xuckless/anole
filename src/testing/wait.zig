@@ -16,6 +16,9 @@
 //! `defaultTestShortTimeout`, 100 ms). Such a check can only miss a bug on
 //! a slow machine, never fail a correct program.
 //!
+//! `waitEvent` waits on a `std.Io.Event` with the same deadline, in place
+//! of a bare `event.wait(io)` that hangs the binary when nothing sets it.
+//!
 //! Prefer an event or a counter of the code under test over polling where
 //! one exists; polling is the fallback (Envoy's `waitForCounter`). Prior
 //! art: gRPC-go `test/timeouts.go` (10 s default), Envoy
@@ -222,6 +225,36 @@ pub fn waitFlag(io: std.Io, comptime what: []const u8, v: *const std.atomic.Valu
     }.set);
 }
 
+/// Waits until `event` is set, for `deadline()` at most (a hang guard in
+/// place of a bare `event.wait(io)`, which hangs the test binary when the
+/// event is never set). A real timed wait on the event, no polling: it wakes
+/// as soon as the event is set. On a timeout it logs (at warn) "timed out
+/// after Ns waiting for: <what>" and returns `error.WaitTimedOut`, as
+/// `waitUntil` does. A canceled caller gets `error.Canceled`.
+pub fn waitEvent(io: std.Io, comptime what: []const u8, event: *std.Io.Event) WaitError!void {
+    return waitEventFor(io, what, deadline(), event);
+}
+
+/// `waitEvent` with an explicit limit (still a hang guard: scale it with
+/// `timeoutFactor()` if it is not `deadline()`).
+pub fn waitEventFor(io: std.Io, comptime what: []const u8, limit: std.Io.Duration, event: *std.Io.Event) WaitError!void {
+    const start = std.Io.Clock.awake.now(io);
+    const until: std.Io.Clock.Timestamp = .{ .raw = start.addDuration(limit), .clock = .awake };
+    while (true) {
+        event.waitTimeout(io, .{ .deadline = until }) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            // The deadline passed or a spurious wake-up: look again below.
+            error.Timeout => {},
+        };
+        if (event.isSet()) return;
+        const waited = start.durationTo(std.Io.Clock.awake.now(io));
+        if (waited.nanoseconds >= limit.nanoseconds) {
+            log.warn("timed out after {d}s waiting for: " ++ what, .{@divTrunc(waited.nanoseconds, std.time.ns_per_s)});
+            return error.WaitTimedOut;
+        }
+    }
+}
+
 fn CondError(comptime F: type) type {
     const R = @typeInfo(F).@"fn".return_type.?;
     return switch (@typeInfo(R)) {
@@ -293,6 +326,21 @@ test "wait: waitEqual and waitNonZero wait for a value another thread stores" {
     defer t.join();
     try testing.expectEqual(@as(u64, 42), try waitNonZero(testing.io, "the value stored", &v));
     try waitEqual(testing.io, "the value is 42", &v, 42);
+}
+
+test "wait: waitEvent returns once another thread sets the event, and times out on one never set" {
+    var event: std.Io.Event = .unset;
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(e: *std.Io.Event) void {
+            e.set(testing.io);
+        }
+    }.run, .{&event});
+    defer t.join();
+    try waitEvent(testing.io, "the other thread set the event", &event);
+    try testing.expect(event.isSet());
+
+    var never: std.Io.Event = .unset;
+    try testing.expectError(error.WaitTimedOut, waitEventFor(testing.io, "an event nobody sets (on purpose)", .fromMilliseconds(20), &never));
 }
 
 test "wait: expectStays passes while the condition holds for the window" {

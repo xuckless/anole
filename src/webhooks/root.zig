@@ -686,7 +686,7 @@ pub const Client = struct {
         };
         defer resp.deinit();
         const dur = elapsedMs(self.io, started);
-        const code: u16 = @intCast(@intFromEnum(resp.status()));
+        const code: u16 = @intCast(@backingInt(resp.status()));
         const kept = self.options.response_kept;
         const body_full = resp.body() catch "";
         const body_kept = body_full[0..@min(body_full.len, kept)];

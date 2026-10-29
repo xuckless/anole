@@ -184,7 +184,7 @@ pub const Verify = struct {
             self.release(req, key);
             return err;
         };
-        const code = @intFromEnum(res.status);
+        const code = @backingInt(res.status);
         if (code >= 200 and code < 300) self.markDone(req, key, self.nowMs()) else self.release(req, key);
     }
 
@@ -322,7 +322,6 @@ pub const Inbound = struct { preset: Verify.Preset, id: ?[]const u8, timestamp: 
 pub fn inbound(req: *const dusty.Request) ?Inbound {
     return req.local(Inbound, "anole.webhook");
 }
-
 
 /// Whether `encoded` (hex or base64, exactly the digest's size) is `H`'s
 /// MAC of the concatenated `parts` under `key`; compared in constant time.

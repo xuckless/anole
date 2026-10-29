@@ -607,6 +607,9 @@ pub const Reply = struct {
 };
 
 pub const Client = struct {
+    /// The console's `/db` "system" for this connector.
+    pub const console_system = "s3";
+
     gpa: std.mem.Allocator,
     io: std.Io,
     arena: std.heap.ArenaAllocator,

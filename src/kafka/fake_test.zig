@@ -285,6 +285,10 @@ test "fake broker: a consumer group reads from the start, commits, and leaves" {
     Reads.sum.store(0, .release);
 
     const client = try kafka.Client.init(gpa, io, opts(broker, .{}));
+    // The deinit below is the leave under test; until then a failed wait
+    // must still stop the consumer's tasks.
+    var client_live = true;
+    errdefer if (client_live) client.deinit();
     try client.consume({}, .{
         .group = "g1",
         .topics = &.{"orders"},
@@ -300,6 +304,7 @@ test "fake broker: a consumer group reads from the start, commits, and leaves" {
     // More records arrive while it runs.
     try broker.preload("orders", 1, &.{.{ .key = "b", .value = "6", .timestamp_ms = 6 }});
     try waitCount(io, &Reads.seen, 6);
+    client_live = false;
     client.deinit();
     // Leaving the group removed the member.
     try testing.expectEqual(@as(usize, 0), broker.memberCount("g1"));
@@ -310,7 +315,7 @@ test "fake broker: two members share the partitions" {
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
     const io = rt.io();
-    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 4, .join_wait_ms = 400 });
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 4 });
     defer broker.deinit();
     for (0..4) |p| try broker.preload("orders", p, &.{.{ .key = "k", .value = "x", .timestamp_ms = 1 }});
     Reads.seen.store(0, .release);
@@ -328,8 +333,20 @@ test "fake broker: two members share the partitions" {
         .commit_interval = .fromMilliseconds(100),
     }, Reads.on);
     try client.start(null, null, null);
+    // Both members joined and a round with both of them completed.
+    const Shared = struct {
+        fn twoMembersSynced(b: *FakeBroker) bool {
+            var out: [4]usize = undefined;
+            const counts = b.assignedCounts("g2", &out) orelse return false;
+            return counts.len == 2 and counts[0] + counts[1] == 4;
+        }
+    };
+    try wait.waitUntil(io, "a completed round with both members", broker, Shared.twoMembersSynced);
+    var out: [4]usize = undefined;
+    const counts = broker.assignedCounts("g2", &out).?;
+    try testing.expectEqualSlices(usize, &.{ 2, 2 }, counts);
+
     try waitCount(io, &Reads.seen, 4);
-    try testing.expectEqual(@as(usize, 2), broker.memberCount("g2"));
     for (0..4) |p| try waitCommitted(io, broker, "g2", "orders", @intCast(p), 1);
 }
 
@@ -426,6 +443,7 @@ test "fake broker: a broker serving Produce 0-7 and ListOffsets 0-4 (Redpanda) i
         } });
         defer broker.deinit();
         const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+        errdefer client.deinit();
         const a = try client.produce(&c, .{ .topic = "t", .key = "a", .value = "1" });
         const b = try client.produce(&c, .{ .topic = "t", .key = "a", .value = "22" });
         try testing.expectEqual(a.offset + 1, b.offset);

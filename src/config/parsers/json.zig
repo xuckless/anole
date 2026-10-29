@@ -157,7 +157,7 @@ test "values, nesting, arrays and lines" {
     try std.testing.expectEqualStrings("b", hosts[1].value.string);
 }
 
-test "problems" {
+test "json config: a duplicate key keeps the first value, and a non-object or broken document is a problem with its line" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -184,7 +184,7 @@ test "problems" {
     , text);
 }
 
-test "escaped keys and numbers" {
+test "json config: string escapes are decoded; integers stay integers up to i64, exponents become floats" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     var diag: Diagnostics = .init(std.testing.allocator);

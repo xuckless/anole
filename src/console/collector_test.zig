@@ -64,6 +64,7 @@ fn connect(io: std.Io, port: u16, request: []const u8) !std.Io.net.Stream {
 
 test "console /ws: open sockets by protocol, rooms and their members, SSE topics and their subscribers" {
     if (comptime !features.websocket or !features.console) return error.SkipZigTest;
+    // The console has no socket on Windows (docs/console.md).
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -99,14 +100,23 @@ test "console /ws: open sockets by protocol, rooms and their members, SSE topics
                 app: *App,
                 arena: std.mem.Allocator,
                 last: *std.json.Value,
+                /// The snapshot, or null when the collector answered busy
+                /// (its answer window passed on a slow machine): not yet.
+                fn take(c: @This()) !bool {
+                    c.last.* = wsSnapshot(c.app, c.arena) catch |e| switch (e) {
+                        error.Busy => return false,
+                        else => return e,
+                    };
+                    return true;
+                }
                 fn bothIn(c: @This()) !bool {
-                    c.last.* = try wsSnapshot(c.app, c.arena);
+                    if (!try c.take()) return false;
                     const sockets = c.last.object.get("sockets").?.object;
                     return sockets.get("h1").?.integer == 1 and countOf(c.last.*, "rooms", "lobby", "members") == 1 and
                         countOf(c.last.*, "topics", "news", "subscribers") == 1;
                 }
                 fn wsGone(c: @This()) !bool {
-                    c.last.* = try wsSnapshot(c.app, c.arena);
+                    if (!try c.take()) return false;
                     return c.last.object.get("sockets").?.object.get("h1").?.integer == 0 and countOf(c.last.*, "rooms", "lobby", "members") == -1;
                 }
             };
@@ -122,6 +132,7 @@ test "console /ws: open sockets by protocol, rooms and their members, SSE topics
         }
     };
     var checking = try app.io().concurrent(Check.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }

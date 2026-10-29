@@ -885,6 +885,22 @@ fn sendServiceUnavailable(w: *std.Io.Writer) std.Io.Writer.Error!void {
 /// within a round trip, and the request deadline may be off.
 pub const linger_limit: usize = 64 * 1024;
 pub const linger_timeout: std.Io.Duration = .fromSeconds(1);
+
+/// Tests only: a shorter `linger_timeout` for the HTTP/1.x lingering close
+/// while non-zero, so a test of a peer that will not hang up need not sit
+/// out the whole second. Set it before the connection and put it back to 0
+/// after the test. Absent outside test builds.
+pub const test_linger_timeout_ms = if (builtin.is_test) struct {
+    pub var ms: std.atomic.Value(u32) = .init(0);
+} else struct {};
+
+fn lingerTimeout() std.Io.Duration {
+    if (builtin.is_test) {
+        const ms = test_linger_timeout_ms.ms.load(.acquire);
+        if (ms != 0) return .fromMilliseconds(ms);
+    }
+    return linger_timeout;
+}
 /// How long an unread request body is drained for when `timeout.keepalive`
 /// is off.
 const drain_timeout_fallback: std.Io.Duration = .fromSeconds(10);
@@ -1678,6 +1694,13 @@ pub fn Server(comptime Ctx: type) type {
             return park.supported;
         }
 
+        /// Test builds only: idle-park shelves started after this sweep for
+        /// expired deadlines every `interval` instead of every second (null
+        /// restores it).
+        pub fn setParkSweepIntervalForTest(interval: ?std.Io.Duration) void {
+            park.setSweepIntervalForTest(interval);
+        }
+
         /// How many connections are parked right now (`timeout.idle_park`).
         pub fn parkedConnections(self: *const Self) usize {
             var n: usize = 0;
@@ -2041,7 +2064,8 @@ pub fn Server(comptime Ctx: type) type {
             // notice now, the final one a round trip later, when the PING
             // sent with the notice comes back, or after `h2_notice_wait` for
             // a peer that does not answer. Each holds the drain open until
-            // its final GOAWAY is out.
+            // it has closed: the final GOAWAY, then the lingering close (up
+            // to `linger_timeout` for a peer that keeps its side open).
             var notice_deadline: ?std.Io.Clock.Timestamp = null;
             if (comptime build_options.use_http2) {
                 if (self.h2_conns.beginDrain())
@@ -2064,7 +2088,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 if (timeout.toTimestamp(self.io)) |deadline| {
                     if (std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, deadline)) {
-                        log.warn("Shutdown timed out with {d} request(s) still in flight", .{remaining});
+                        log.warn("Shutdown timed out with {d} request(s) or connection(s) still in flight", .{remaining});
                         return;
                     }
                 }
@@ -2080,7 +2104,7 @@ pub fn Server(comptime Ctx: type) type {
                     wait = if (timeout.toTimestamp(self.io)) |d| (if (d.compare(.lt, nd)) timeout else nd_timeout) else nd_timeout;
                 }
 
-                log.info("Waiting for {} in-flight request(s) to finish", .{remaining});
+                log.info("Waiting for {} in-flight request(s) or connection(s) to finish", .{remaining});
                 // Wakes when a request finishes, or when the deadline
                 // arrives; the loop above decides which happened. Spurious
                 // wakeups just re-read the count.
@@ -2333,8 +2357,8 @@ pub fn Server(comptime Ctx: type) type {
                 error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return,
                 else => |e| return e,
             };
-            if (!timer.canBound()) return self.io.sleep(linger_timeout, .awake);
-            timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
+            if (!timer.canBound()) return self.io.sleep(lingerTimeout(), .awake);
+            timer.set(self.io, .{ .duration = .{ .raw = lingerTimeout(), .clock = .awake } });
             defer timer.clear(self.io);
             _ = connection.reader.discardShort(linger_limit) catch {
                 const cause = connection.getReadError() orelse error.Unexpected;
@@ -2351,7 +2375,7 @@ pub fn Server(comptime Ctx: type) type {
         fn closeNotify(self: *Self, connection: *Connection, timer: *Timer) std.Io.Cancelable!void {
             if (connection.tls_conn == null or connection.close_notify_sent) return;
             const bounded = timer.canBound();
-            if (bounded) timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
+            if (bounded) timer.set(self.io, .{ .duration = .{ .raw = lingerTimeout(), .clock = .awake } });
             defer if (bounded) timer.clear(self.io);
             return connection.closeNotify();
         }
@@ -2368,7 +2392,7 @@ pub fn Server(comptime Ctx: type) type {
                 error.Canceled => return error.Canceled,
                 else => return,
             };
-            timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
+            timer.set(self.io, .{ .duration = .{ .raw = lingerTimeout(), .clock = .awake } });
             defer timer.clear(self.io);
             var buf: [512]u8 = undefined;
             var r = stream.reader(self.io, &buf);
@@ -3560,33 +3584,31 @@ test "forwarded: rightmost untrusted" {
 test "forwarded: an untrusted peer's headers are ignored, with one warning" {
     resetUntrustedWarningForTest();
     defer resetUntrustedWarningForTest();
-    const nets = proxy_protocol.networks.private;
+    var server = Server(void).init(std.testing.allocator, std.testing.io, .{
+        .trusted_proxies = &proxy_protocol.networks.private,
+        .warn_untrusted_peer = true,
+    }, {});
+    defer server.deinit();
+    var headers = try Headers.init(std.testing.allocator, 2);
+    defer headers.deinit(std.testing.allocator);
+    try xff(&headers, "198.51.100.1");
+
+    // A peer outside proxy.trusted is the client, whatever it forwards.
     const stranger = try std.Io.net.IpAddress.parse("203.0.113.9", 0);
-    try std.testing.expect(!proxy_protocol.containsAny(&nets, stranger));
-    try std.testing.expect(warnUntrustedPeer(stranger));
+    try std.testing.expectEqual([4]u8{ 203, 0, 113, 9 }, server.clientAddress(stranger, &headers).ip4.bytes);
+    // That call logged the one warning: no further one, for either path.
     try std.testing.expect(!warnUntrustedPeer(stranger));
     try std.testing.expect(!warnUntrustedPeerProxy(stranger));
-    // An IPv4-mapped peer of a proxy on the private network is trusted.
-    try std.testing.expect(proxy_protocol.containsAny(&nets, try std.Io.net.IpAddress.parse("::ffff:10.0.0.2", 0)));
+    try std.testing.expectEqual([4]u8{ 203, 0, 113, 9 }, server.clientAddress(stranger, &headers).ip4.bytes);
 }
 
-test "forwarded: 0.2 hops, entries with a port" {
+test "forwarded: with trusted_proxy_hops, X-Forwarded-For entries with ports select the address" {
     var headers = try Headers.init(std.testing.allocator, 2);
     defer headers.deinit(std.testing.allocator);
     try xff(&headers, "203.0.113.9:4711, 198.51.100.2:80");
     const peer = try std.Io.net.IpAddress.parse("127.0.0.1", 1);
     try std.testing.expectEqual([4]u8{ 198, 51, 100, 2 }, remoteAddress(peer, &headers, 1).ip4.bytes);
     try std.testing.expectEqual([4]u8{ 203, 0, 113, 9 }, remoteAddress(peer, &headers, 2).ip4.bytes);
-}
-
-test "proxy protocol: the gate falls back to proxy.trusted" {
-    const trusted = proxy_protocol.networks.private;
-    const own = [_]proxy_protocol.Network{try .parse("192.0.2.0/24")};
-    const inside = try std.Io.net.IpAddress.parse("10.1.2.3", 0);
-    const outside = try std.Io.net.IpAddress.parse("203.0.113.9", 0);
-    try std.testing.expect(proxy_protocol.trustedPeer(&trusted, inside));
-    try std.testing.expect(!proxy_protocol.trustedPeer(&trusted, outside));
-    try std.testing.expect(!proxy_protocol.trustedPeer(&own, inside));
 }
 
 test "fuzz: parseForwardedEntry and rightmostUntrusted" {

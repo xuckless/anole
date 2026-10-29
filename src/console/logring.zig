@@ -32,7 +32,7 @@ pub const Filter = struct {
     grep: ?[]const u8 = null,
 
     pub fn matches(self: Filter, r: Rec) bool {
-        if (self.level) |l| if (@intFromEnum(r.level) > @intFromEnum(l)) return false;
+        if (self.level) |l| if (@backingInt(r.level) > @backingInt(l)) return false;
         if (self.scope) |s| if (!std.mem.eql(u8, s, r.scope)) return false;
         if (self.route) |p| {
             if (p.len > 0 and p[p.len - 1] == '*') {
@@ -134,11 +134,11 @@ pub const LogRing = struct {
     /// A console starts or stops showing logs: info and debug are kept only
     /// meanwhile.
     pub fn watch(self: *LogRing) void {
-        if (self.watchers.fetchAdd(1, .monotonic) == 0) self.tap.min_level.store(@intFromEnum(std.log.Level.debug), .monotonic);
+        if (self.watchers.fetchAdd(1, .monotonic) == 0) self.tap.min_level.store(@backingInt(std.log.Level.debug), .monotonic);
     }
 
     pub fn unwatch(self: *LogRing) void {
-        if (self.watchers.fetchSub(1, .monotonic) == 1) self.tap.min_level.store(@intFromEnum(std.log.Level.warn), .monotonic);
+        if (self.watchers.fetchSub(1, .monotonic) == 1) self.tap.min_level.store(@backingInt(std.log.Level.warn), .monotonic);
     }
 
     fn tapFn(ud: ?*anyopaque, level: std.log.Level, scope: []const u8, ctx: logging.Context, json: bool, text: []const u8) void {
@@ -160,7 +160,7 @@ pub const LogRing = struct {
         const now_ns: i64 = @intCast(@min(std.Io.Clock.real.now(std.Options.debug_io).nanoseconds, std.math.maxInt(i64)));
         var h: [header_len]u8 = undefined;
         std.mem.writeInt(i64, h[0..8], now_ns, .little);
-        h[8] = @intFromEnum(level);
+        h[8] = @backingInt(level);
         h[9] = @intFromBool(json);
         h[10] = @intCast(scope_c.len);
         h[11] = @intCast(rid_c.len);
@@ -198,7 +198,7 @@ pub const LogRing = struct {
         return .{
             .rec = .{
                 .time_ns = std.mem.readInt(i64, h[0..8], .little),
-                .level = @enumFromInt(h[8]),
+                .level = @fromBackingInt(@intCast(h[8])),
                 .json = h[9] != 0,
                 .scope = body[0..sl],
                 .rid = body[sl..][0..il],
@@ -344,7 +344,21 @@ test "logring: a long record is cut at 16 KiB and one too big for the ring is sk
     var out: std.ArrayList(Rec) = .empty;
     var dropped: u64 = 0;
     try lr.readNew(a, &cur, &out, &dropped);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
     try std.testing.expectEqual(@as(usize, max_text), out.items[0].text.len);
+
+    // A ring whose share per executor is below one cut record: the record
+    // is skipped, not stored or counted as dropped.
+    var small = LogRing.init(std.testing.allocator, ring_count * 1024);
+    defer small.deinit();
+    var small_cur: Cursors = undefined;
+    small.attachAtEnd(&small_cur);
+    small.push(.err, "s", "", "", false, big);
+    var small_out: std.ArrayList(Rec) = .empty;
+    var small_dropped: u64 = 0;
+    try small.readNew(a, &small_cur, &small_out, &small_dropped);
+    try std.testing.expectEqual(@as(usize, 0), small_out.items.len);
+    try std.testing.expectEqual(@as(u64, 0), small_dropped);
 }
 
 test "logring: the tap keeps warn and error until a console watches, then every level" {
@@ -381,7 +395,7 @@ test "logring: the tap keeps warn and error until a console watches, then every 
     try std.testing.expectEqualStrings("now kept", out.items[0].text);
 }
 
-test "logring: filters" {
+test "logring: a filter matches by minimum level, scope, case-insensitive grep, route pattern and request id" {
     const r: Rec = .{ .time_ns = 0, .level = .warn, .json = false, .scope = "billing", .rid = "r1", .route = "/charges/:id", .text = "Retrying charge" };
     try std.testing.expect((Filter{ .level = .warn }).matches(r));
     try std.testing.expect(!(Filter{ .level = .err }).matches(r));

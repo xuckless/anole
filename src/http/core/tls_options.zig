@@ -116,7 +116,7 @@ pub fn addCertsFromPem(
     }
 }
 
-test "Ca: file, dir, pem and system load" {
+test "Ca: an empty PEM is an empty bundle; a missing file or dir fails" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     // No certificates in the text: an empty bundle, not an error.
@@ -128,9 +128,4 @@ test "Ca: file, dir, pem and system load" {
     // A path that is not there fails, for both forms.
     try std.testing.expectError(error.FileNotFound, (Ca{ .file = "no-such-ca.pem" }).load(gpa, io));
     try std.testing.expect(std.meta.isError((Ca{ .dir = "no-such-ca-dir" }).load(gpa, io)));
-    // The platform store: loads where the system has one.
-    if (Ca.load(.system, gpa, io)) |b| {
-        var bundle = b;
-        bundle.deinit(gpa);
-    } else |_| {}
 }

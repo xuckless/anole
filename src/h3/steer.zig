@@ -259,7 +259,8 @@ test "fuzz: the steering program and indexOf agree, and never pick a socket past
 }
 
 test "steering in the kernel: each datagram reaches the socket its ID names" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // SO_ATTACH_REUSEPORT_CBPF is Linux only (steering is off elsewhere)
+    const wait = @import("anole_test_wait");
     const net = @import("net.zig");
     const posix = std.posix;
     const sockets = 4;
@@ -291,26 +292,26 @@ test "steering in the kernel: each datagram reaches the socket its ID names" {
                 else => shortPacket(&buf, &cid),
             };
             try sendTo(client, address, packet);
-            // Only socket i has it.
+            // Socket i has it (the wait is a hang guard: a datagram steered
+            // elsewhere never reaches i, and the wait fails)...
+            try std.testing.expect(receiveOurs(fds[i], &rx, packet, @intCast(wait.deadlineMs())));
+            // ...and, delivered once, no other socket has it as well.
             for (fds, 0..) |fd, j| {
-                const n = receiveNow(fd, &rx);
-                if (j == i) {
-                    try std.testing.expectEqual(packet.len, n orelse return error.NotSteered);
-                } else {
-                    try std.testing.expectEqual(@as(?usize, null), n);
-                }
+                if (j == i) continue;
+                try std.testing.expect(!receiveOurs(fd, &rx, packet, 0));
             }
         }
     }
-    // Detached: the hash decides; something receives it all the same.
+    // Detached: the hash decides; exactly one socket receives it.
     try detach(fds[0]);
     const cid = ourCid(3);
-    try sendTo(client, address, shortPacket(&buf, &cid));
-    var got: usize = 0;
-    for (fds) |fd| if (receiveNow(fd, &rx) != null) {
-        got += 1;
-    };
-    try std.testing.expectEqual(@as(usize, 1), got);
+    const last = shortPacket(&buf, &cid);
+    try sendTo(client, address, last);
+    const first = receiveOursAny(&fds, &rx, last, @intCast(wait.deadlineMs())) orelse return error.TestUnexpectedResult;
+    for (fds, 0..) |fd, j| {
+        if (j == first) continue;
+        try std.testing.expect(!receiveOurs(fd, &rx, last, 0));
+    }
 }
 
 fn boundAddress(fd: std.posix.fd_t) std.Io.net.IpAddress {
@@ -326,10 +327,38 @@ fn sendTo(fd: std.posix.fd_t, to: std.Io.net.IpAddress, data: []const u8) !void 
     if (std.c.sendto(fd, data.ptr, data.len, 0, &storage.any, len) != @as(isize, @intCast(data.len))) return error.SendFailed;
 }
 
-/// A datagram waiting on `fd` within 200 ms, or null.
-fn receiveNow(fd: std.posix.fd_t, buf: []u8) ?usize {
+/// Whether `packet` reached `fd` within `timeout_ms` (0: already queued).
+/// The sockets sit on an ephemeral loopback port, which another test's
+/// QUIC client may still be sending to (a 1200-byte datagram, cut to
+/// `buf`'s length): datagrams that are not `packet` are skipped, not
+/// counted.
+fn receiveOurs(fd: std.posix.fd_t, buf: []u8, packet: []const u8, timeout_ms: i32) bool {
+    while (receiveWithin(fd, buf, timeout_ms)) |n| {
+        if (std.mem.eql(u8, buf[0..n], packet)) return true;
+    }
+    return false;
+}
+
+/// The index of the first of `fds` that `packet` reaches within
+/// `timeout_ms`, or null; other datagrams are skipped as in `receiveOurs`.
+fn receiveOursAny(fds: []const std.posix.fd_t, buf: []u8, packet: []const u8, timeout_ms: i32) ?usize {
+    var pfds: [8]std.c.pollfd = undefined;
+    for (fds, pfds[0..fds.len]) |fd, *p| p.* = .{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 };
+    while (true) {
+        for (pfds[0..fds.len]) |*p| p.revents = 0;
+        if (std.c.poll(&pfds, @intCast(fds.len), timeout_ms) <= 0) return null;
+        for (pfds[0..fds.len], 0..) |p, i| {
+            if (p.revents & std.c.POLL.IN == 0) continue;
+            const n = std.c.recv(p.fd, buf.ptr, buf.len, 0);
+            if (n >= 0 and std.mem.eql(u8, buf[0..@intCast(n)], packet)) return i;
+        }
+    }
+}
+
+/// A datagram waiting on `fd` within `timeout_ms`, or null.
+fn receiveWithin(fd: std.posix.fd_t, buf: []u8, timeout_ms: i32) ?usize {
     var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
-    if (std.c.poll(&pfd, 1, 200) <= 0) return null;
+    if (std.c.poll(&pfd, 1, timeout_ms) <= 0) return null;
     const n = std.c.recv(fd, buf.ptr, buf.len, 0);
     return if (n < 0) null else @intCast(n);
 }

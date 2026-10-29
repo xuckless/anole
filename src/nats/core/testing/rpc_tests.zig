@@ -13,6 +13,7 @@ const testing = std.testing;
 const nats = @import("../root.zig");
 const Client = nats.Client;
 const FakeServer = @import("FakeServer.zig");
+const StallingIo = @import("StallingIo.zig");
 const Inbox = @import("../engine/Inbox.zig");
 const golden = @import("../protocol/golden.zig");
 const time = @import("../engine/time.zig");
@@ -301,7 +302,7 @@ test "a request times out at its deadline, and its reply counts as late when it 
     try testing.expectEqual(0, s.client.inbox.pendingCount(io));
     // The server sends the reply before it answers this PING.
     try s.client.flush(quick);
-    try testing.expectEqual(1, s.client.inbox.lateResponses(io));
+    try testing.expectEqual(1, s.client.stats().late_responses);
     try s.finish();
 }
 
@@ -449,8 +450,7 @@ test "the line of a request counts its reply subject: 4096 argument bytes pass, 
     try testing.expectEqual(1, s.record.count("PUB echo."));
 }
 
-/// A handshake, then nothing is read until `release` is set: the client's
-/// writes back up in the socket.
+/// A handshake, then nothing is read until `release` is set.
 fn serveStalled(io: Io, listener: *net.Server, release: *Io.Event) anyerror!void {
     var peer: FakeServer.Peer = undefined;
     try peer.accept(io, listener);
@@ -472,33 +472,25 @@ fn awaitEvent(io: Io, event: *Io.Event) !void {
     }
 }
 
-/// Publishes `payload` until a publish fails; counts the ones that went in.
-fn publishUntilError(client: *Client, payload: []const u8, published: *std.atomic.Value(u32)) Client.PublishError!void {
-    while (true) {
-        try client.publish("stalled", payload);
-        _ = published.fetchAdd(1, .monotonic);
-    }
+/// Publishes `payload` until a publish fails.
+fn publishUntilError(client: *Client, payload: []const u8) Client.PublishError!void {
+    while (true) try client.publish("stalled", payload);
 }
 
-/// Waits until a publish is stuck: it waits for room, and none went in for
-/// 200 ms. 10 s at most.
-fn awaitStuck(client: *Client, published: *std.atomic.Value(u32)) !void {
-    const io = client.io;
-    const give_up = time.after(io, .fromSeconds(10 * @as(i64, test_wait.timeoutFactor())));
-    var last = published.load(.monotonic);
-    var still_since = Io.Clock.awake.now(io);
-    while (true) {
-        try io.sleep(.fromMilliseconds(10), .awake);
-        const now = published.load(.monotonic);
-        if (now != last or client.outbound.roomWaiters(io) == 0) {
-            last = now;
-            still_since = Io.Clock.awake.now(io);
-        } else if (elapsedSince(io, still_since).toMilliseconds() >= 200) {
-            return;
+/// Waits until a publish is stuck: the writer is blocked on its socket
+/// write (StallingIo, armed) and a put waits for room behind it.
+fn awaitStuck(client: *Client) !void {
+    try test_wait.waitFlag(testing.io, "the client's socket write stalled", StallingIo.blocked());
+    try test_wait.waitUntil(testing.io, "a put waits for room", client, struct {
+        fn waits(c: *Client) bool {
+            return c.outbound.roomWaiters(testing.io) >= 1;
         }
-        if (time.expired(io, give_up)) return error.TestPublishNeverWaited;
-    }
+    }.waits);
 }
+
+/// A small payload: with an outbound limit of 1 byte one frame fills the
+/// queue while the stalled writer holds it.
+const stalled_payload: [64]u8 = @splat('b');
 
 test "a request that waits for room in the outbound queue ends at its deadline" {
     const io = testing.io;
@@ -511,19 +503,20 @@ test "a request that waits for room in the outbound queue ends at its deadline" 
         server.cancel(io) catch {};
     }
     var url: [64]u8 = undefined;
-    var client: Client = try .init(testing.allocator, io, .{
+    var client: Client = try .init(testing.allocator, StallingIo.io(), .{
         .servers = &.{try FakeServer.url(&listener, &url)},
         .limits = .{ .outbound_bytes = 1 },
     });
-    defer client.deinit();
+    defer {
+        StallingIo.release();
+        client.deinit();
+        StallingIo.reset();
+    }
     try client.connect();
-    const payload = try testing.allocator.alloc(u8, 1024 * 1024);
-    defer testing.allocator.free(payload);
-    @memset(payload, 'b');
-    var published: std.atomic.Value(u32) = .init(0);
-    var publisher = try io.concurrent(publishUntilError, .{ &client, payload, &published });
+    StallingIo.arm();
+    var publisher = try io.concurrent(publishUntilError, .{ &client, &stalled_payload });
     defer publisher.cancel(io) catch {};
-    try awaitStuck(&client, &published);
+    try awaitStuck(&client);
 
     // The SUB of the inbox and the PUB wait behind the stuck publish.
     const start = Io.Clock.awake.now(io);
@@ -642,14 +635,40 @@ test "requestMany: the stream ends at its deadline, and what came before comes o
     var s: Served = undefined;
     try s.start(.{ .servers = &.{} });
     defer s.deinit();
-    // Ample time for both replies, wherever timers are coarse.
-    const responses = try s.client.requestMany("many.2", "?", many(1000, 32));
+    const responses = try s.client.requestMany("many.2", "?", many(100, 32));
     defer responses.deinit();
     const deadline = responses.deadline;
-    try expectResponse(responses, "r1");
-    try expectResponse(responses, "r2");
-    try testing.expect(try responses.next(.{}) == null);
-    try testing.expect(time.expired(io, deadline));
+    const expected = [_][]const u8{ "r1", "r2" };
+    var taken: usize = 0;
+    // While the stream is live, a short wait gives a response or times out;
+    // an end (null) here is legal only past the deadline.
+    const step: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } };
+    if (responses.next(.{ .timeout = step })) |first| {
+        if (first) |message| {
+            var m = message;
+            defer m.deinit();
+            try testing.expectEqualStrings(expected[0], m.payload);
+            taken = 1;
+        } else try testing.expect(time.expired(io, deadline));
+    } else |err| switch (err) {
+        error.Timeout => {},
+        else => |e| return e,
+    }
+    // Time passes on purpose, up to the deadline.
+    while (!time.expired(io, deadline)) try io.sleep(.fromMilliseconds(5), .awake);
+    // What came by the deadline comes out, in order, then the end. How many
+    // came in time depends on the machine's speed (none, one or both); which
+    // ones and in what order does not.
+    const received = responses.messages.stats(io).received;
+    while (try responses.next(.{})) |message| {
+        var m = message;
+        defer m.deinit();
+        if (taken == expected.len) return error.TestTooManyResponses;
+        try testing.expectEqualStrings(expected[taken], m.payload);
+        taken += 1;
+    }
+    try testing.expect(taken >= received);
+    if (test_wait.timing()) try testing.expectEqual(expected.len, taken);
     try testing.expectEqual(0, s.client.inbox.pendingCount(io));
     try s.finish();
 }
@@ -887,7 +906,15 @@ fn raceTimeoutsTask(rounds: u32, tally: *Tally, failure: *?anyerror) void {
     };
 }
 
-test "a reply that comes at the moment of the timeout, 1000 times: the reply or Timeout, never both" {
+test "a reply that comes at the moment of the timeout: the reply or Timeout, never both" {
+    // One pair, 13 rounds: every shift (-2 to +1 ms in 250 us steps) once.
+    var tally: Tally = .{};
+    try raceTimeouts(13, &tally);
+    try testing.expectEqual(13, tally.replies + tally.ended);
+}
+
+test "a reply that comes at the moment of the timeout, 1000 times: the reply or Timeout, never both [stress]" {
+    try test_wait.requireStress();
     const io = testing.io;
     const pairs = 10;
     var tallies: [pairs]Tally = @splat(.{});
@@ -1305,22 +1332,23 @@ test "a request whose PUB waits for room in the outbound queue ends at its deadl
         server.cancel(io) catch {};
     }
     var url: [64]u8 = undefined;
-    var client: Client = try .init(testing.allocator, io, .{
+    var client: Client = try .init(testing.allocator, StallingIo.io(), .{
         .servers = &.{try FakeServer.url(&listener, &url)},
         .limits = .{ .outbound_bytes = 1 },
     });
-    defer client.deinit();
+    defer {
+        StallingIo.release();
+        client.deinit();
+        StallingIo.reset();
+    }
     try client.connect();
-    // The first request makes the inbox subscription; then the server
-    // stops reading.
+    // The first request makes the inbox subscription; then the client's
+    // writer stalls on its next socket write.
     try testing.expectError(error.NoResponders, client.request("nobody.home", "?", five_seconds));
-    const payload = try testing.allocator.alloc(u8, 1024 * 1024);
-    defer testing.allocator.free(payload);
-    @memset(payload, 'b');
-    var published: std.atomic.Value(u32) = .init(0);
-    var publisher = try io.concurrent(publishUntilError, .{ &client, payload, &published });
+    StallingIo.arm();
+    var publisher = try io.concurrent(publishUntilError, .{ &client, &stalled_payload });
     defer publisher.cancel(io) catch {};
-    try awaitStuck(&client, &published);
+    try awaitStuck(&client);
 
     // The inbox is in place: this request waits for room with its PUB.
     const start = Io.Clock.awake.now(io);

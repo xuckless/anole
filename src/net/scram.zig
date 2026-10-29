@@ -332,7 +332,6 @@ test "SCRAM-SHA-1: RFC 5802's example" {
         try rfc.clientFinal(arena, testing.io, null, "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096"),
     );
     try rfc.verifyServerFinal("v=rmF9pqV8S7suAoZWja4dJRkFsKQ=");
-
 }
 
 test "SCRAM-SHA-256: RFC 7677's example (also auth.md's)" {
@@ -344,7 +343,7 @@ test "SCRAM-SHA-256: RFC 7677's example (also auth.md's)" {
     );
 }
 
-test "Conversation: messages, checks on the server's, and the key cache" {
+test "SCRAM: a second conversation over the same salt takes the cached keys and computes the same proof" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -359,11 +358,20 @@ test "Conversation: messages, checks on the server's, and the key cache" {
     const final = try conv.clientFinal(arena, testing.io, &cache, sf);
     try testing.expect(std.mem.startsWith(u8, final, "c=biws,r="));
     try testing.expectEqual(@as(usize, 1), cache.len);
-    // A second conversation over the same salt takes the cached keys and
-    // computes the same proof.
     var again = conv;
     try testing.expectEqualStrings(final, try again.clientFinal(arena, testing.io, &cache, sf));
     try testing.expectEqual(@as(usize, 1), cache.len);
+}
+
+test "SCRAM: a wrong server signature, an e= error, a foreign nonce, out-of-range iteration counts and extensions are refused" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var conv = try Conversation.init(arena, .sha256, "us=er,x", "pencil", @splat(7), .saslprep);
+    _ = try conv.clientFirst(arena);
+    const ours = conv.nonce;
+    const sf = try std.fmt.allocPrint(arena, "r={s}SERVER,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", .{ours});
+    _ = try conv.clientFinal(arena, testing.io, null, sf);
 
     try testing.expectError(error.ServerSignatureMismatch, conv.verifyServerFinal("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="));
     try testing.expectError(error.AuthenticationFailed, conv.verifyServerFinal("e=invalid-proof"));

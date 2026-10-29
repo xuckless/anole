@@ -145,7 +145,7 @@ test "s3: live: presigned GET and PUT work for the core client, and browser-styl
     {
         var resp = try http.fetch(put_url, .{ .method = .put, .body = "12345", .decompress = false });
         defer resp.deinit();
-        try testing.expectEqual(@as(u32, 200), @intFromEnum(resp.status()));
+        try testing.expectEqual(@as(u32, 200), @backingInt(resp.status()));
     }
     const get_url = try l.client.presign(l.c(), .get, k, .{});
     {

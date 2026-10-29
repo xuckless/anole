@@ -54,7 +54,7 @@ fn expectRefused(text: []const u8, needle: []const u8) !void {
     }
 }
 
-test "capi config: sse routes and the sse block" {
+test "capi config: sse routes and the sse block parse, and each bad one is refused with the key named" {
     try expectConfig(
         \\{"sse":{"heartbeat_ms":5000,"replay":null,"on_full":"drop"},"limits":{"sse_max_event":4096},
         \\ "routes":[{"path":"/rooms/:room/events","sse":{"topics":["news","room:{room}"],"last":3}},
@@ -118,7 +118,7 @@ test "capi config: a watch on SQLite says it has no change feed" {
     try expectRefused(
         \\{"databases":[{"name":"main","sqlite":{"path":":memory:"}}],
         \\ "watches":[{"name":"a","database":"main","postgres":{"channels":["a"]}}]}
-    , "main");
+    , "is SQLite, which has no change feed");
 }
 
 // ---------------------------------------------------------------------------
@@ -309,53 +309,10 @@ test "capi engine: a native sse route: subscribers get published events with ids
     try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }
 
-fn consumerCheck(a: *SseConsumer, port: u16, io: std.Io) !void {
-    const e = a.e;
-    var buf: [2048]u8 = undefined;
-    var buf2: [2048]u8 = undefined;
-    var c1: RawSse = undefined;
-    try c1.open(io, port, "/me", "");
-    var c1_open = true;
-    defer if (c1_open) c1.close(io);
-    try std.testing.expect(std.mem.startsWith(u8, c1.headText(), "HTTP/1.1 200"));
-    try waitAtLeast(io, &a.subscribes, 1);
-    var c2: RawSse = undefined;
-    try c2.open(io, port, "/me", "");
-    defer c2.close(io);
-    try waitAtLeast(io, &a.subscribes, 2);
-    const h1 = a.handles[0].load(.acquire);
-    const h2 = a.handles[1].load(.acquire);
-    try std.testing.expect(h1 != 0 and h2 != 0 and h1 != h2);
-
-    // A send reaches only its subscriber: c2 hears its own event first.
-    _ = try engine.sse.send(e, h1, "only", "for one");
-    _ = try engine.sse.send(e, h2, "only", "for two");
-    const t1 = try c1.until(&buf, "data: for one");
-    try std.testing.expect(std.mem.indexOf(u8, t1, "for two") == null);
-    const t2 = try c2.until(&buf2, "data: for two");
-    try std.testing.expect(std.mem.indexOf(u8, t2, "for one") == null);
-
-    // The subscribers joined the topic the consumer named.
-    try engine.sse.publish(e, "x", "", "both", 0);
-    _ = try c1.until(&buf, "data: both");
-    _ = try c2.until(&buf2, "data: both");
-
-    // The client goes away: SSE_CLOSE (client gone) for its handle.
-    c1.close(io);
-    c1_open = false;
-    try waitAtLeast(io, &a.closes, 1);
-    try std.testing.expectEqual(abi.SSE_CLOSED_CLIENT_GONE, a.last_close_reason.load(.acquire));
-    try std.testing.expectEqual(h1, a.last_close_handle.load(.acquire));
-    // Over: gone for an answer call, OK (Over) for the cleanup calls.
-    try std.testing.expectError(error.Gone, engine.sse.send(e, h1, "x", "late"));
-    try std.testing.expectError(error.Over, engine.sse.closeSub(e, h1));
-    try std.testing.expectError(error.Over, engine.sse.release(e, h1));
-    // The other one still lives.
-    _ = try engine.sse.send(e, h2, "", "still");
-    _ = try c2.until(&buf2, "data: still");
-}
-
-test "capi engine: a consumer sse route: accept with topics, send reaches only its subscriber, client gone is SSE_CLOSE" {
+/// Runs `claim` (`fn (*SseConsumer, port, std.Io) !void`) against a fresh
+/// engine with one consumer sse route (/me, handler 7) and its consumer
+/// thread, then drains the engine.
+fn consumerRun(comptime claim: anytype) !void {
     const json =
         \\{"executors": 2, "timeouts": {"request_ms": 3000, "shutdown_ms": 1000},
         \\ "sse": {"heartbeat_ms": null},
@@ -380,14 +337,87 @@ test "capi engine: a consumer sse route: accept with topics, send reaches only i
     const rt = try zio.Runtime.init(alloc, .{});
     defer rt.deinit();
     const io = rt.io();
-    var f = try io.concurrent(consumerCheck, .{ &a, e.port(0), io });
+    var f = try io.concurrent(claim, .{ &a, e.port(0), io });
     try f.await(io);
     try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
     try e.drain();
     try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }
 
-test "capi engine: anole_sse_publish: errors before start, for a CR in the event, a too large event, and AGAIN past the lane limits" {
+/// Opens a subscriber of /me and returns the handle the consumer accepted
+/// it with (into topic "x"), the `n`th one accepted.
+fn openSub(a: *SseConsumer, port: u16, io: std.Io, c: *RawSse, n: u32) !u64 {
+    try c.open(io, port, "/me", "");
+    errdefer c.close(io);
+    try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 200"));
+    try waitAtLeast(io, &a.subscribes, n);
+    return a.handles[n - 1].load(.acquire);
+}
+
+fn sendOnlyToItsSubscriber(a: *SseConsumer, port: u16, io: std.Io) !void {
+    const e = a.e;
+    var buf: [2048]u8 = undefined;
+    var buf2: [2048]u8 = undefined;
+    var c1: RawSse = undefined;
+    const h1 = try openSub(a, port, io, &c1, 1);
+    defer c1.close(io);
+    var c2: RawSse = undefined;
+    const h2 = try openSub(a, port, io, &c2, 2);
+    defer c2.close(io);
+    try std.testing.expect(h1 != 0 and h2 != 0 and h1 != h2);
+
+    // A send reaches only its subscriber: c2 hears its own event first.
+    _ = try engine.sse.send(e, h1, "only", "for one");
+    _ = try engine.sse.send(e, h2, "only", "for two");
+    const t1 = try c1.until(&buf, "data: for one");
+    try std.testing.expect(std.mem.indexOf(u8, t1, "for two") == null);
+    const t2 = try c2.until(&buf2, "data: for two");
+    try std.testing.expect(std.mem.indexOf(u8, t2, "for one") == null);
+
+    // The subscribers joined the topic the consumer named.
+    try engine.sse.publish(e, "x", "", "both", 0);
+    _ = try c1.until(&buf, "data: both");
+    _ = try c2.until(&buf2, "data: both");
+}
+
+fn clientGone(a: *SseConsumer, port: u16, io: std.Io) !void {
+    const e = a.e;
+    var buf2: [2048]u8 = undefined;
+    var c1: RawSse = undefined;
+    const h1 = try openSub(a, port, io, &c1, 1);
+    var c1_open = true;
+    defer if (c1_open) c1.close(io);
+    var c2: RawSse = undefined;
+    const h2 = try openSub(a, port, io, &c2, 2);
+    defer c2.close(io);
+    try std.testing.expect(h1 != 0 and h2 != 0 and h1 != h2);
+
+    // The client goes away: SSE_CLOSE (client gone) for its handle.
+    c1.close(io);
+    c1_open = false;
+    try waitAtLeast(io, &a.closes, 1);
+    try std.testing.expectEqual(abi.SSE_CLOSED_CLIENT_GONE, a.last_close_reason.load(.acquire));
+    try std.testing.expectEqual(h1, a.last_close_handle.load(.acquire));
+    // Over: gone for an answer call, OK (Over) for the cleanup calls.
+    try std.testing.expectError(error.Gone, engine.sse.send(e, h1, "x", "late"));
+    try std.testing.expectError(error.Over, engine.sse.closeSub(e, h1));
+    try std.testing.expectError(error.Over, engine.sse.release(e, h1));
+    // The other one still lives.
+    _ = try engine.sse.send(e, h2, "", "still");
+    _ = try c2.until(&buf2, "data: still");
+}
+
+test "capi engine: a consumer sse route: anole_sse_send reaches only its subscriber, and a publish reaches the topics the accept named" {
+    try consumerRun(sendOnlyToItsSubscriber);
+}
+
+test "capi engine: a consumer sse route: a client gone is SSE_CLOSE CLIENT_GONE for its handle; sends are GONE, cleanups OVER, the other subscriber lives" {
+    try consumerRun(clientGone);
+}
+
+/// An engine with a native sse route on topic "news" and events of at
+/// most 1024 bytes, created (not started).
+fn publishEngine() !*engine.Engine {
     const json =
         \\{"executors": 1, "timeouts": {"shutdown_ms": 1000}, "limits": {"sse_max_event": 1024},
         \\ "listeners": [{"address": "127.0.0.1", "port": 0}],
@@ -399,8 +429,14 @@ test "capi engine: anole_sse_publish: errors before start, for a CR in the event
         std.debug.print("{s}\n", .{why.buffered()});
         return err;
     };
-    defer e.destroy();
+    errdefer e.destroy();
     _ = try e.attach(null, null, true);
+    return e;
+}
+
+test "capi engine: anole_sse_publish is STATE before start, and INVALID for CR or LF in the event, an event past sse_max_event, an empty topic, unknown flags" {
+    const e = try publishEngine();
+    defer e.destroy();
     try std.testing.expectError(error.State, engine.sse.publish(e, "news", "", "early", 0));
     try e.start();
 
@@ -410,11 +446,21 @@ test "capi engine: anole_sse_publish: errors before start, for a CR in the event
     try std.testing.expectError(error.Invalid, engine.sse.publish(e, "news", "", &big, 0));
     try std.testing.expectError(error.Invalid, engine.sse.publish(e, "", "", "x", 0));
     try std.testing.expectError(error.Invalid, engine.sse.publish(e, "news", "", "x", 2));
+    try e.drain();
+    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
+}
 
-    // Hold the lanes: a topic change that never completes, so what is
-    // published piles up until the limit says no.
-    const st = &e.sse_state;
-    _ = st.topic_changes.fetchAdd(1, .acq_rel);
+test "capi engine: anole_sse_publish answers AGAIN past the lane limit, and takes again once the lanes drain" {
+    const e = try publishEngine();
+    defer e.destroy();
+    try e.start();
+
+    // Hold the lanes, so what is published piles up until the limit
+    // (64 publishes per executor, `publishLimits`) says no.
+    var hold: engine.sse.LaneHold = .{};
+    engine.sse.test_lane_hold = &hold;
+    defer engine.sse.test_lane_hold = null;
+    defer hold.release(e);
     const lim = engine.sse.publishLimits(e);
     var taken: usize = 0;
     var again = false;
@@ -428,9 +474,18 @@ test "capi engine: anole_sse_publish: errors before start, for a CR in the event
     }
     try std.testing.expect(again);
     try std.testing.expect(taken <= lim.tasks);
-    // Let them go.
-    st.topic_changes_done.store(st.topic_changes.load(.acquire), .release);
-    e.io.futexWake(u32, &st.topic_changes_done.raw, std.math.maxInt(u32));
+
+    // Let them go: the lanes drain, and a publish is taken again.
+    hold.release(e);
+    try wait.waitUntil(engine.threadedIo(), "a publish is taken once the lanes drain", e, struct {
+        fn takes(e_: *engine.Engine) !bool {
+            engine.sse.publish(e_, "news", "", "after", 0) catch |err| switch (err) {
+                error.Again => return false,
+                else => return err,
+            };
+            return true;
+        }
+    }.takes);
     try e.drain();
     try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }

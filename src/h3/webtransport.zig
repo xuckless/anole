@@ -2104,7 +2104,7 @@ test "WebTransport error codes map onto HTTP/3's and back, skipping the reserved
     try std.testing.expectEqual(@as(?u32, null), fromHttp3Error(error_session_gone));
 }
 
-test "Sched: the most urgent class goes first, a class takes turns, the ready mask stays consistent" {
+test "Sched: the most urgent class goes first and a class takes turns" {
     var q: Sched = .{};
     var a: std.DoublyLinkedList.Node = .{};
     var b: std.DoublyLinkedList.Node = .{};
@@ -2116,22 +2116,25 @@ test "Sched: the most urgent class goes first, a class takes turns, the ready ma
     q.push(&c3, 1);
     try std.testing.expect(q.firstNode().? == &c3);
     try std.testing.expectEqual(@as(?u3, 1), q.mostUrgent());
-    try std.testing.expectEqual(@as(u8, 0b1010), q.ready);
     // Round-robin within class 3 once class 1 is empty.
     q.remove(&c3, 1);
-    try std.testing.expectEqual(@as(u8, 0b1000), q.ready);
+    try std.testing.expectEqual(@as(?u3, 3), q.mostUrgent());
     try std.testing.expect(q.firstNode().? == &a);
     q.remove(&a, 3);
     q.push(&a, 3);
     try std.testing.expect(q.firstNode().? == &b);
-    // Removing the last of a class clears its bit; re-pushing sets it.
+    // Removing the last of a class empties it; pushing into another class
+    // makes that one the most urgent.
     q.remove(&b, 3);
     q.remove(&a, 3);
-    try std.testing.expectEqual(@as(u8, 0), q.ready);
+    try std.testing.expect(q.firstNode() == null);
+    try std.testing.expectEqual(@as(?u3, null), q.mostUrgent());
     q.push(&a, 7);
-    try std.testing.expectEqual(@as(u8, 0b10000000), q.ready);
+    try std.testing.expectEqual(@as(?u3, 7), q.mostUrgent());
+    try std.testing.expect(q.firstNode().? == &a);
     q.remove(&a, 7);
     try std.testing.expect(q.firstNode() == null);
+    try std.testing.expectEqual(@as(?u3, null), q.mostUrgent());
 }
 
 fn makeCapsule(buf: []u8, kind: u64, payload: []const u8) []const u8 {

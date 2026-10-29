@@ -764,9 +764,20 @@ pub fn build(b: *std.Build) void {
         .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url, .nats_test_url = nats_test_url, .kafka_test_url = kafka_test_url, .s3_test_url = s3_test_url, .smtp_test_url = smtp_test_url, .mailpit_api_url = mailpit_api_url }),
         .use_llvm = use_llvm,
     });
-    const run_tests = b.addRunArtifact(tests);
-    run_tests.skip_foreign_checks = true;
-    test_step.dependOn(&run_tests.step);
+    // `-Dtest-shards=N` runs the main suite as N processes of the same
+    // binary in parallel (ANOLE_TEST_SHARD=i/N, src/safety/test_runner.zig)
+    // and the HTTP core's as max(1, N/2), 4 and 2 by default;
+    // each shard's tests are its index modulo N. With a live server
+    // (`-D*-test-url`, `-Dredis-test-port`) the default is 1: the live
+    // tests share fixed databases and tables on it (anole_whtest_icu, the
+    // jobs suite's jtest_*), and shards running them at once break each other.
+    const live_server = redis_test_port != null or redis_test_url != null or postgres_test_url != null or mongodb_test_url != null or nats_test_url != null or kafka_test_url != null or s3_test_url != null or smtp_test_url != null;
+    const test_shards = b.option(u32, "test-shards", "Run anole-test as N parallel shards and core-test as max(1, N/2) (default 4, or 1 with a live server URL; 1 runs each suite as one process)") orelse if (live_server) @as(u32, 1) else 4;
+    if (test_shards == 0) @panic("-Dtest-shards must be at least 1");
+    for (addShardedRuns(b, tests, test_shards)) |run_tests| {
+        run_tests.skip_foreign_checks = true;
+        test_step.dependOn(&run_tests.step);
+    }
     // test-timing: the main and the HTTP core's suites again, the same
     // binaries run with ANOLE_TEST_TIMING=1 (src/testing/wait.zig): the
     // elapsed-time bounds a test checks only `if (wait.timing())`, and the
@@ -794,6 +805,17 @@ pub fn build(b: *std.Build) void {
         run_stress.skip_foreign_checks = true;
         run_stress.has_side_effects = true;
         stress_step.dependOn(&run_stress.step);
+    }
+    // fuzz: only the "fuzz:" targets, for CI's fuzz job
+    // (`zig build fuzz -Dllvm=true --fuzz=200K`): the main suite filtered to
+    // them, the HTTP core's and BSON's (added where those are defined). The
+    // unit tests are not repeated here (research/s15/test-audit.md T1).
+    const fuzz_step = b.step("fuzz", "Run only the fuzz targets (\"fuzz:\" tests; pass --fuzz=N with -Dllvm=true to fuzz them)");
+    {
+        const main_fuzz = addSafeTest(b, .{ .name = "anole-fuzz", .root_module = tests.root_module, .filters = &.{"fuzz:"}, .use_llvm = use_llvm });
+        const run_main_fuzz = b.addRunArtifact(main_fuzz);
+        run_main_fuzz.skip_foreign_checks = true;
+        fuzz_step.dependOn(&run_main_fuzz.step);
     }
     // The hang probe (src/safety/hang_probe.zig): a test that never returns,
     // to see the runner's hang dump work. `-Dhang-probe=true` adds it to
@@ -869,8 +891,9 @@ pub fn build(b: *std.Build) void {
         const run_lint = b.addRunArtifact(lint_exe);
         run_lint.setCwd(b.path("."));
         if (b.option(bool, "lint-tests", "zig build lint: check test code too") orelse false) run_lint.addArg("--tests");
+        if (b.option([]const u8, "lint-rules", "zig build lint: report only these rules (comma-separated, e.g. DOC)")) |r| run_lint.addArg(b.fmt("--rules={s}", .{r}));
         run_lint.addArg("src");
-        const lint_step = b.step("lint", "Check the sources against SAFETY.md (T1, U1, U3, C3)");
+        const lint_step = b.step("lint", "Check the sources against SAFETY.md (T1, U1, U3, C3) and doc-comment names (DOC)");
         lint_step.dependOn(&run_lint.step);
         const lint_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("tools/safety_lint.zig"), .target = b.graph.host, .optimize = .Debug }) });
         lint_step.dependOn(&b.addRunArtifact(lint_tests).step);
@@ -959,12 +982,20 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_ui_tests.step);
         compile_tests_step.dependOn(&ui_tests.step);
         b.step("console-ui-test", "Run the live console's std-only module tests (protocol, keys, screen, app, restart plan)").dependOn(&run_ui_tests.step);
+        // Its "fuzz:" targets alone (frame decode, key parser), for `zig build fuzz`.
+        const ui_fuzz = addSafeTest(b, .{ .name = "console-ui-fuzz", .root_module = ui_tests.root_module, .filters = &.{"fuzz:"}, .use_llvm = use_llvm });
+        const run_ui_fuzz = b.addRunArtifact(ui_fuzz);
+        run_ui_fuzz.skip_foreign_checks = true;
+        fuzz_step.dependOn(&run_ui_fuzz.step);
     }
 
-    // test-postgres: the PostgreSQL tests alone ("pg: ..."); with
-    // -Dpostgres-test-url, against that server (tests/postgres/run.sh).
+    // test-postgres: the PostgreSQL tests alone ("pg: ...", the jobs
+    // conformance suite's PostgreSQL instance, watch's and webhooks' live
+    // tests); with -Dpostgres-test-url, against that server
+    // (tests/postgres/run.sh). tools/live_coverage.py (CI) fails when a test
+    // that reads a service's URL matches no CI step's filters.
     if (features.postgres) {
-        const pg_tests = addSafeTest(b, .{ .name = "anole-test-pg", .root_module = tests.root_module, .filters = &.{"pg:"}, .use_llvm = use_llvm });
+        const pg_tests = addSafeTest(b, .{ .name = "anole-test-pg", .root_module = tests.root_module, .filters = &.{ "pg:", "jobs.conformance_test.Suite(.postgres)", "watch live: postgres", "on PostgreSQL (live)" }, .use_llvm = use_llvm });
         const run_pg_tests = b.addRunArtifact(pg_tests);
         run_pg_tests.has_side_effects = postgres_test_url != null;
         b.step("test-postgres", "Run the PostgreSQL tests (live with -Dpostgres-test-url=postgres://...)").dependOn(&run_pg_tests.step);
@@ -979,7 +1010,7 @@ pub fn build(b: *std.Build) void {
     // test-mongodb: the MongoDB client's tests alone (src/mongodb); with
     // -Dmongodb-test-url, against that server (tests/mongodb/run.sh).
     if (features.mongodb) {
-        const mongo_tests = addSafeTest(b, .{ .name = "anole-test-mongodb", .root_module = tests.root_module, .filters = &.{"mongodb."}, .use_llvm = use_llvm });
+        const mongo_tests = addSafeTest(b, .{ .name = "anole-test-mongodb", .root_module = tests.root_module, .filters = &.{ "mongodb.", "watch live: mongodb" }, .use_llvm = use_llvm });
         const run_mongo_tests = b.addRunArtifact(mongo_tests);
         run_mongo_tests.has_side_effects = mongodb_test_url != null;
         b.step("test-mongodb", "Run the MongoDB client's tests (live with -Dmongodb-test-url=mongodb://...)").dependOn(&run_mongo_tests.step);
@@ -989,10 +1020,27 @@ pub fn build(b: *std.Build) void {
     // and the rate limiter's among them; with -Dredis-test-url (or
     // -Dredis-test-port), against that server (tests/redis/run.sh).
     if (features.redis) {
-        const redis_tests = addSafeTest(b, .{ .name = "anole-test-redis", .root_module = tests.root_module, .filters = &.{"redis:"}, .use_llvm = use_llvm });
+        const redis_tests = addSafeTest(b, .{ .name = "anole-test-redis", .root_module = tests.root_module, .filters = &.{ "redis:", "jobs.conformance_test.Suite(.redis)" }, .use_llvm = use_llvm });
         const run_redis_tests = b.addRunArtifact(redis_tests);
         run_redis_tests.has_side_effects = redis_test_url != null or redis_test_port != null;
         b.step("test-redis", "Run the Redis tests (live with -Dredis-test-url=redis://...)").dependOn(&run_redis_tests.step);
+    }
+
+    // test-nats and test-kafka: the live tests alone (nats/live_test.zig,
+    // kafka/live_test.zig); with -Dnats-test-url / -Dkafka-test-url, against
+    // that server (tests/nats/run.sh, tests/kafka/run.sh). CI's two jobs run
+    // only these: the unit suite is the test job's.
+    if (features.nats) {
+        const nats_tests = addSafeTest(b, .{ .name = "anole-test-nats", .root_module = tests.root_module, .filters = &.{"nats.live_test"}, .use_llvm = use_llvm });
+        const run_nats_tests = b.addRunArtifact(nats_tests);
+        run_nats_tests.has_side_effects = nats_test_url != null;
+        b.step("test-nats", "Run the NATS live tests (live with -Dnats-test-url=nats://...)").dependOn(&run_nats_tests.step);
+    }
+    if (features.kafka) {
+        const kafka_tests = addSafeTest(b, .{ .name = "anole-test-kafka", .root_module = tests.root_module, .filters = &.{"kafka.live_test"}, .use_llvm = use_llvm });
+        const run_kafka_tests = b.addRunArtifact(kafka_tests);
+        run_kafka_tests.has_side_effects = kafka_test_url != null;
+        b.step("test-kafka", "Run the Kafka live tests (live with -Dkafka-test-url=host:port)").dependOn(&run_kafka_tests.step);
     }
 
     // ---- p3/s3 ----
@@ -1065,7 +1113,7 @@ pub fn build(b: *std.Build) void {
             .test_runner = .{ .path = b.path("src/http/core/test_runner.zig"), .mode = .simple },
             .use_llvm = use_llvm,
         });
-        const run_core_tests = b.addRunArtifact(core_tests);
+        const core_runs = addShardedRuns(b, core_tests, @max(1, test_shards / 2));
         compile_tests_step.dependOn(&core_tests.step);
         // The TLS tests open certs/cert.pem and certs/key.pem from where
         // they run: a certificate made now by tests/test_cert.zig, so no
@@ -1080,8 +1128,12 @@ pub fn build(b: *std.Build) void {
             }),
         }));
         const certs_dir = make_cert.addOutputDirectoryArg("certs").dirname();
-        run_core_tests.setCwd(certs_dir);
-        test_step.dependOn(&run_core_tests.step);
+        const core_test_step = b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng, zstd and Brotli");
+        for (core_runs) |run_core_tests| {
+            run_core_tests.setCwd(certs_dir);
+            test_step.dependOn(&run_core_tests.step);
+            core_test_step.dependOn(&run_core_tests.step);
+        }
         // test-timing: the core's tests again, with ANOLE_TEST_TIMING=1
         // (see test-timing above).
         {
@@ -1101,7 +1153,24 @@ pub fn build(b: *std.Build) void {
             .use_llvm = use_llvm,
         });
         test_step.dependOn(&b.addRunArtifact(core_fuzz).step);
-        b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng, zstd and Brotli").dependOn(&run_core_tests.step);
+        // core-test-bare: the core's tests on the core without TLS, HTTP/2
+        // or compression (the minimal profile's core), so the tests that
+        // run only there (`if (use_tls) return error.SkipZigTest` and the
+        // like) run somewhere. Not part of `test`; one CI step runs it
+        // (research/s15/audit/lead-decisions.md item 3).
+        if (core.dusty_by[0][0][0][0]) |core_bare| {
+            const bare_tests = b.addTest(.{
+                .name = "core-test-bare",
+                .root_module = core_test_mod(b, core_bare, core.test_wait, target, optimize),
+                .test_runner = .{ .path = b.path("src/http/core/test_runner.zig"), .mode = .simple },
+                .use_llvm = use_llvm,
+            });
+            const run_bare = b.addRunArtifact(bare_tests);
+            run_bare.setCwd(certs_dir);
+            b.step("core-test-bare", "Run the HTTP core's own tests on the core without TLS, HTTP/2 or compression").dependOn(&run_bare.step);
+            compile_tests_step.dependOn(&bare_tests.step);
+        }
+        fuzz_step.dependOn(&b.addRunArtifact(core_fuzz).step);
     }
 
     // test-flags: one test binary per preset and edge combination. Each gets its
@@ -1161,6 +1230,11 @@ pub fn build(b: *std.Build) void {
         const run_bson_tests = b.addRunArtifact(bson_tests);
         run_bson_tests.skip_foreign_checks = true;
         test_step.dependOn(&run_bson_tests.step);
+        // Its "fuzz:" targets alone, for `zig build fuzz`.
+        const bson_fuzz = addSafeTest(b, .{ .name = "bson-fuzz", .root_module = bson_tests.root_module, .filters = &.{"fuzz:"}, .use_llvm = use_llvm });
+        const run_bson_fuzz = b.addRunArtifact(bson_fuzz);
+        run_bson_fuzz.skip_foreign_checks = true;
+        fuzz_step.dependOn(&run_bson_fuzz.step);
         const bson_step = b.step("bson-test", "Run the BSON codec's tests and the bson-corpus (src/bson, tests/bson)");
         bson_step.dependOn(&run_bson_tests.step);
         const mongodb_spec_step = b.step("mongodb-spec-test", "Run the MongoDB client's spec tests (connection string, URI options, auth, SDAM) from mongodb/specifications");
@@ -1540,6 +1614,17 @@ pub fn build(b: *std.Build) void {
                 if (mongodb_test_url) |url| run_timing.setEnvironmentVariable("ANOLE_TEST_MONGODB_URL", url);
                 timing_step.dependOn(&run_timing.step);
             }
+            // test-stress: the C suite again with its load on
+            // (ANOLE_TEST_STRESS: 16 clients x 2000 requests).
+            {
+                const run_stress = b.addRunArtifact(consumer);
+                run_stress.addArg("test");
+                if (wt_client) |wc| run_stress.addArtifactArg(wc);
+                run_stress.stdio = .inherit;
+                run_stress.has_side_effects = true;
+                run_stress.setEnvironmentVariable("ANOLE_TEST_STRESS", "1");
+                stress_step.dependOn(&run_stress.step);
+            }
             b.step("capi-consumer", "Build the C consumer (tests/capi/consumer.c: `test`, or `serve` for benchmarks)").dependOn(&b.addInstallArtifact(consumer, .{}).step);
 
             // The gRPC suite (tests/capi/grpc.c): its own process, as one
@@ -1828,7 +1913,11 @@ pub fn build(b: *std.Build) void {
         b.step("cli", "Build and install the anole command line (zig-out/bin/anole)").dependOn(&install_cli.step);
 
         const cli_tests = addSafeTest(b, .{ .name = "anole-cli-test", .root_module = CliBuild.module(b, cli_options, templates_mod, target, optimize, null) });
-        b.step("cli-test", "Run the anole command line's unit tests").dependOn(&b.addRunArtifact(cli_tests).step);
+        // The index test walks templates/ from the cwd: run it at the
+        // repository root whatever directory zig build was started from.
+        const run_cli_tests = b.addRunArtifact(cli_tests);
+        run_cli_tests.setCwd(b.path("."));
+        b.step("cli-test", "Run the anole command line's unit tests").dependOn(&run_cli_tests.step);
 
         const dist = b.step("cli-dist", "Cross-build the anole binaries for five targets and SHA256SUMS into zig-out/dist");
         const sums_exe = b.addExecutable(.{ .name = "anole-sums", .root_module = b.createModule(.{
@@ -2012,6 +2101,25 @@ const LlHttp = struct {
         return .{ .mod = tc.createModule(), .lib = lib };
     }
 };
+
+/// One run of `tests` per shard (`-Dtest-shards`): each gets
+/// ANOLE_TEST_SHARD=i/n, which both test runners read, so the shards run in
+/// parallel as separate processes of one binary. With
+/// ANOLE_TEST_DURATIONS set (tools/test_durations.py) the runs always run,
+/// as a cached result would record nothing.
+fn addShardedRuns(b: *std.Build, tests: *std.Build.Step.Compile, n: u32) []const *std.Build.Step.Run {
+    const runs = b.allocator.alloc(*std.Build.Step.Run, n) catch @panic("OOM");
+    const want_durations = if (b.graph.environ_map.get("ANOLE_TEST_DURATIONS")) |p| p.len > 0 else false;
+    for (runs, 0..) |*r, i| {
+        r.* = b.addRunArtifact(tests);
+        if (n > 1) {
+            r.*.setName(b.fmt("run test {s} {d}/{d}", .{ tests.name, i, n }));
+            r.*.setEnvironmentVariable("ANOLE_TEST_SHARD", b.fmt("{d}/{d}", .{ i, n }));
+        }
+        if (want_durations) r.*.has_side_effects = true;
+    }
+    return runs;
+}
 
 /// `b.addTest` with src/safety/test_runner.zig: Zig's default test runner
 /// with the test allocator backed by memory that is never reused, failing a

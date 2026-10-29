@@ -11,7 +11,7 @@ const metrics = observe.metrics;
 
 pub const max_targets = 256;
 comptime {
-    std.debug.assert(@intFromEnum(core.Kind.kafka) == 7);
+    std.debug.assert(@backingInt(core.Kind.kafka) == 7);
 }
 
 /// The series of one registry, and the hooks that feed them. Pin it (the
@@ -62,7 +62,7 @@ pub const Binding = struct {
     }
 
     fn label(self: *Binding, kind: core.Kind, target: []const u8) []const u8 {
-        const set = &self.seen[@intFromEnum(kind)];
+        const set = &self.seen[@backingInt(kind)];
         while (!self.lock.tryLock()) std.atomic.spinLoopHint();
         defer self.lock.unlock();
         if (set.contains(target)) return set.getKey(target).?;
@@ -82,7 +82,7 @@ pub const Binding = struct {
     fn onState(ctx: ?*anyopaque, kind: core.Kind, target: []const u8, st: core.Breaker.State) void {
         const self = cast(ctx);
         const t = self.label(kind, target);
-        self.state.with(&.{ @tagName(kind), t }).set(@intFromEnum(st));
+        self.state.with(&.{ @tagName(kind), t }).set(@backingInt(st));
         if (st == .open) self.opened.with(&.{ @tagName(kind), t }).inc();
     }
     fn onRejected(ctx: ?*anyopaque, kind: core.Kind, target: []const u8) void {
@@ -113,8 +113,16 @@ test "metrics: target labels capped at 256, then other" {
         const t = try std.fmt.bufPrint(&buf, "h{d}", .{i});
         hooks.on_rejected(hooks.context, .http, t);
     }
-    try testing.expectEqualStrings("other", binding.label(.http, "h300"));
-    try testing.expectEqualStrings("h1", binding.label(.http, "h1"));
     // Another client has its own budget.
-    try testing.expectEqualStrings("x", binding.label(.grpc, "x"));
+    hooks.on_rejected(hooks.context, .grpc, "x");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    const text = out.written();
+    try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_rejected_total{client=\"http\",target=\"other\"} 5") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_rejected_total{client=\"http\",target=\"h1\"} 1") != null);
+    // The first target past the cap (h256) and the last one (h260) get no series of their own.
+    try testing.expect(std.mem.indexOf(u8, text, "target=\"h256\"") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "target=\"h260\"") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_rejected_total{client=\"grpc\",target=\"x\"} 1") != null);
 }

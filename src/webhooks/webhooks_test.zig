@@ -15,6 +15,24 @@ test "Client: publish keeps one message per idempotency key" {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var cx: anole.db.Ctx = .{ .io = std.testing.io, .arena = arena.allocator() };
+    const first = try c.publish(&cx, .{ .owner = "acme", .type = "invoice.paid", .id = "evt-1" }, .{ .n = 1 });
+    const again = try c.publish(&cx, .{ .owner = "acme", .type = "invoice.paid", .id = "evt-1" }, .{ .n = 2 });
+    try std.testing.expect(!first.duplicate and again.duplicate);
+    try std.testing.expectEqualStrings(first.message_id, again.message_id);
+    const msgs = try c.messages(&cx, .{ .owner = "acme" });
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expectEqualStrings(first.message_id, msgs[0].id);
+}
+
+test "webhooks: createEndpoint gives a whsec_ secret and an ep_ id, refuses a non-http URL, and rotateSecret changes the secret" {
+    const gpa = std.testing.allocator;
+    const jc = try anole.jobs.Client.init(gpa, std.testing.io, .{ .store = .memory });
+    defer jc.deinit();
+    const c = try wh.Client.init(gpa, std.testing.io, .{ .jobs = jc, .allow_private_addresses = true, .require_https = false });
+    defer c.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var cx: anole.db.Ctx = .{ .io = std.testing.io, .arena = arena.allocator() };
     const made = try c.createEndpoint(&cx, .{ .owner = "acme", .url = "http://localhost:9/hook", .types = &.{"invoice.*"} });
     try std.testing.expect(std.mem.startsWith(u8, made.secret, "whsec_"));
     try std.testing.expect(std.mem.startsWith(u8, made.endpoint.id, "ep_"));
@@ -75,6 +93,8 @@ const E2E = struct {
     var owner: []const u8 = "";
     var got: std.atomic.Value(u32) = .init(0);
     var bad: std.atomic.Value(u32) = .init(0);
+    /// The webhooks client's clock: pruning ages messages by moving it, not by sleeping.
+    var clock: anole.jobs.testing.FakeClock = undefined;
 
     fn hook(req: *anole.Request, res: *anole.Response) !void {
         const body = (try req.body()) orelse "";
@@ -129,8 +149,8 @@ const E2E = struct {
         try std.testing.expectEqual(@as(usize, 2), (try hooks.messages(&cx, .{ .owner = owner })).len);
 
         // Pruning through its job (keep is 1 s here): both messages and the
-        // attempt go. The sleep only lets them age (a lower bound).
-        try io.sleep(.fromMilliseconds(1100), .awake);
+        // attempt go once the webhooks clock is 2 s on.
+        clock.advance(.fromSeconds(2));
         _ = try jc.enqueueRaw(&cx, "anole.webhook.prune", "{}", .{ .queue = "webhooks" });
         const Pruned = struct {
             hooks: *wh.Client,
@@ -152,11 +172,14 @@ const E2E = struct {
         defer app.deinit();
         const now_ms = std.Io.Timestamp.now(app.io(), .real).toMilliseconds();
         owner = try std.fmt.bufPrint(&owner_buf, "acme-{d}", .{now_ms});
+        // The jobs client keeps the real clock, so its background runner still delivers.
+        clock = .init(anole.jobs.Time.fromMillis(now_ms));
         const store: anole.jobs.Store = if (pg) .{ .postgres = try app.postgres(.{ .url = build_options.postgres_test_url.?, .environ = .empty }) } else .memory;
         jc = try app.jobs(.{ .store = store, .table_prefix = "whtest_" });
-        hooks = try app.webhooks(.{ .jobs = jc, .allow_private_addresses = true, .require_https = false, .keep_messages = .fromSeconds(1), .keep_attempts = .fromSeconds(1) });
+        hooks = try app.webhooks(.{ .jobs = jc, .allow_private_addresses = true, .require_https = false, .keep_messages = .fromSeconds(1), .keep_attempts = .fromSeconds(1), .clock = clock.clock() });
         app.post("/hook", hook);
         var checking = try app.io().concurrent(check, .{&app});
+        defer checking.cancel(app.io()) catch {};
         try app.listen("127.0.0.1:0");
         try checking.await(app.io());
     }

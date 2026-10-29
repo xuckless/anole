@@ -360,6 +360,10 @@ test "zone: names that could escape are refused" {
     try std.testing.expectError(error.UnknownTimeZone, Zone.load(std.testing.allocator, io, ".."));
     try std.testing.expectError(error.UnknownTimeZone, Zone.load(std.testing.allocator, io, "/etc/passwd"));
     try std.testing.expectError(error.UnknownTimeZone, Zone.load(std.testing.allocator, io, "Europe/../x"));
+}
+
+test "zone: a +HH:MM name is a fixed offset" {
+    const io = std.testing.io;
     var z = try Zone.load(std.testing.allocator, io, "+05:30");
     defer z.deinit();
     try std.testing.expectEqual(@as(i32, 19800), z.offsetAtSeconds(0));

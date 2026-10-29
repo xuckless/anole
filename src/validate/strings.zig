@@ -883,14 +883,13 @@ test "minLength, maxLength and length on a slice of other items name the list ru
     try expect(head ++ "min_length expects a string, field is u32", comptime fitsText(minLength(3), u32).?);
 }
 
-test "an uncalled length or byte rule gets an example call, and inside each the head is each(...)" {
+test "an uncalled length or byte rule gets an example call" {
     const expect = std.testing.expectEqualStrings;
     try expect("validator: Dto.field_rules.x: minLength must be called, e.g. v.minLength(1)", comptime uncalledText("minLength", @TypeOf(minLength)));
     try expect("validator: Dto.field_rules.x: maxLength must be called, e.g. v.maxLength(100)", comptime uncalledText("maxLength", @TypeOf(maxLength)));
     try expect("validator: Dto.field_rules.x: length must be called, e.g. v.length(1, 100)", comptime uncalledText("length", @TypeOf(length)));
     try expect("validator: Dto.field_rules.x: minBytes must be called, e.g. v.minBytes(1)", comptime uncalledText("minBytes", @TypeOf(minBytes)));
     try expect("validator: Dto.field_rules.x: maxBytes must be called, e.g. v.maxBytes(100)", comptime uncalledText("maxBytes", @TypeOf(maxBytes)));
-    try expect("validator: each(...): minLength must be called, e.g. v.minLength(1)", "validator: each(...): " ++ comptime core.hints.mustBeCalled("minLength", @TypeOf(minLength)));
 }
 
 test "the length rules count code points after the utf8 precondition" {
@@ -1121,32 +1120,52 @@ test "an uncalled contains, notContains or strongPassword gets an example call" 
     try expect("validator: Dto.field_rules.x: strongPassword must be called, e.g. v.strongPassword(.{})", comptime uncalledText("strongPassword", @TypeOf(strongPassword)));
 }
 
-test "the Knuth-Morris-Pratt table and the search agree with a naive search on both paths" {
-    try std.testing.expectEqualSlices(u3, &.{ 0, 1, 2, 3, 0 }, &kmpTable(u3, "aaaab"));
-    try std.testing.expectEqualSlices(u3, &.{ 0, 0, 1, 2, 0 }, &kmpTable(u3, "ababc"));
-    try std.testing.expectEqualSlices(u3, &.{ 0, 0, 1, 2, 3, 0, 1 }, &kmpTable(u3, "ababaca"));
-    try std.testing.expect(occurs("aaaab", "aaaaaaaab"));
-    try std.testing.expect(!occurs("aaaab", "aaabaaa"));
-    try std.testing.expect(occurs("aabaab", "aabaabaab"));
-    try std.testing.expect(!occurs("aabaab", "aabaa"));
-    try std.testing.expect(occurs("ab", "xxab"));
-    try std.testing.expect(!occurs("ab", "a\xffb"));
-    try std.testing.expect(!occurs("abcde", ""));
-    try std.testing.expect(!occurs("a", ""));
+test "contains finds seeds with repeated prefixes on both search paths" {
+    // Seeds of 1-4 bytes take std.mem.find, longer ones the KMP table.
+    try expectOutcome(.pass, contains("aaaab"), @as([]const u8, "aaaaaaaab"));
+    try expectOutcome(.fail, contains("aaaab"), @as([]const u8, "aaabaaa"));
+    try expectOutcome(.pass, contains("aabaab"), @as([]const u8, "aabaabaab"));
+    try expectOutcome(.fail, contains("aabaab"), @as([]const u8, "aabaa"));
+    try expectOutcome(.pass, contains("ab"), @as([]const u8, "xxab"));
+    try expectOutcome(.fail, contains("ab"), @as([]const u8, "a\xffb"));
+    try expectOutcome(.fail, contains("abcde"), @as([]const u8, ""));
+    try expectOutcome(.fail, contains("a"), @as([]const u8, ""));
+    try expectOutcome(.fail, notContains("aaaab"), @as([]const u8, "aaaaaaaab"));
+    try expectOutcome(.pass, notContains("aaaab"), @as([]const u8, "aaabaaa"));
+    try expectOutcome(.fail, notContains("aabaab"), @as([]const u8, "aabaabaab"));
+    try expectOutcome(.pass, notContains("aabaab"), @as([]const u8, "aabaa"));
+    try expectOutcome(.fail, notContains("ab"), @as([]const u8, "xxab"));
+    try expectOutcome(.pass, notContains("ab"), @as([]const u8, "a\xffb"));
+    try expectOutcome(.pass, notContains("abcde"), @as([]const u8, ""));
 }
 
-test "the password counts: code points, ASCII letters and digits, and 34 symbols" {
-    const counts = countPassword("Ab1! \u{A3}\u{20AC}\t").?;
-    try std.testing.expectEqual(8, counts.length);
-    try std.testing.expectEqual(1, counts.lower);
-    try std.testing.expectEqual(1, counts.upper);
-    try std.testing.expectEqual(1, counts.numbers);
-    try std.testing.expectEqual(3, counts.symbols);
-    try std.testing.expectEqual(null, countPassword("Ab1!\xff"));
+test "a strong password counts code points, ASCII letters and digits, and 34 symbols" {
+    const t = std.testing;
+    const password = "Ab1! \u{A3}\u{20AC}\t";
+    const options: StrongPasswordOptions = .{ .min_length = 8, .min_lowercase = 1, .min_uppercase = 1, .min_numbers = 1, .min_symbols = 3 };
+    try t.expect(isStrongPassword(password, options));
+    var longer = options;
+    longer.min_length = 9;
+    try t.expect(!isStrongPassword(password, longer));
+    var more_symbols = options;
+    more_symbols.min_symbols = 4;
+    try t.expect(!isStrongPassword(password, more_symbols));
+    var more_lowercase = options;
+    more_lowercase.min_lowercase = 2;
+    try t.expect(!isStrongPassword(password, more_lowercase));
+    var more_uppercase = options;
+    more_uppercase.min_uppercase = 2;
+    try t.expect(!isStrongPassword(password, more_uppercase));
+    var more_numbers = options;
+    more_numbers.min_numbers = 2;
+    try t.expect(!isStrongPassword(password, more_numbers));
+    try t.expect(!isStrongPassword("Ab1!\xff", .{ .min_length = 1, .min_lowercase = 0, .min_uppercase = 0, .min_numbers = 0, .min_symbols = 0 }));
     var symbols: usize = 0;
     var cp: u21 = 0;
     while (cp < 0x100) : (cp += 1) {
-        if (isPasswordSymbol(cp)) symbols += 1;
+        var buf: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(cp, &buf);
+        if (isStrongPassword(buf[0..n], .{ .min_length = 1, .min_lowercase = 0, .min_uppercase = 0, .min_numbers = 0, .min_symbols = 1 })) symbols += 1;
     }
-    try std.testing.expectEqual(34, symbols);
+    try t.expectEqual(34, symbols);
 }

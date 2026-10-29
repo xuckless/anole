@@ -31,6 +31,7 @@
 //! the chunks they are in, so none is ever lost for lack of memory.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Writer = Io.Writer;
@@ -158,6 +159,10 @@ generation: u64 = 0,
 room_line: std.DoublyLinkedList = .{},
 /// How many wait in `room_line`.
 room_waiters: u32 = 0,
+/// Tests only: how far waiting puts see the awake clock ahead of the real
+/// one when they check their deadlines (`testAdvanceClock`), so a test
+/// expires a deadline on command instead of sleeping until it.
+test_clock_ahead: if (builtin.is_test) i96 else void = if (builtin.is_test) 0 else {},
 /// Signaled when there is something to write.
 ready: Io.Condition = .init,
 /// Woken when a PONG arrives.
@@ -391,7 +396,7 @@ fn awaitRoom(q: *Outbound, io: Io, deadline: ?Io.Clock.Timestamp) error{ Cancele
         q.room_waiters -= 1;
     }
     while (q.mode == .live and !(q.queued < q.limit and q.room_line.first == &waiter.node)) {
-        if (deadline) |d| if (time.expired(io, d)) return error.Timeout;
+        if (deadline) |d| if (q.putExpired(io, d)) return error.Timeout;
         // Only this put waits on its event, and others set it under the
         // mutex: resetting it here loses no wake.
         waiter.turn.reset();
@@ -404,6 +409,26 @@ fn awaitRoom(q: *Outbound, io: Io, deadline: ?Io.Clock.Timestamp) error{ Cancele
             error.Canceled => return error.Canceled,
         };
         q.room_wakeups += 1;
+    }
+}
+
+/// A waiting put's deadline has passed (on the clock tests may move ahead).
+fn putExpired(q: *const Outbound, io: Io, at: Io.Clock.Timestamp) bool {
+    if (comptime builtin.is_test) return Io.Clock.awake.now(io).nanoseconds + q.test_clock_ahead >= at.raw.nanoseconds;
+    return time.expired(io, at);
+}
+
+/// Tests only: moves the clock waiting puts check their deadlines on ahead
+/// by `by` and wakes them all to look again.
+fn testAdvanceClock(q: *Outbound, io: Io, by: Io.Duration) void {
+    comptime std.debug.assert(builtin.is_test);
+    q.mutex.lockUncancelable(io);
+    defer q.mutex.unlock(io);
+    q.test_clock_ahead += by.nanoseconds;
+    var node = q.room_line.first;
+    while (node) |n| : (node = n.next) {
+        const waiter: *RoomWaiter = @fieldParentPtr("node", n);
+        waiter.turn.set(io);
     }
 }
 
@@ -1119,6 +1144,32 @@ fn drainOnce(q: *Outbound, io: Io, out: *std.ArrayList(u8)) !void {
     q.written(io, batch.len);
 }
 
+/// The writer waits in `take` for something to write. Reads the waiter
+/// count of `Io.Condition`, which `wait` raises before it lets the mutex go.
+fn takeWaiting(q: *Outbound, io: Io) bool {
+    q.mutex.lockUncancelable(io);
+    defer q.mutex.unlock(io);
+    return q.ready.state.load(.monotonic).waiters > 0;
+}
+
+/// A task waits in `waitPong`.
+fn pongWaiters(q: *Outbound, io: Io) u32 {
+    q.mutex.lockUncancelable(io);
+    defer q.mutex.unlock(io);
+    return q.answered.waiters;
+}
+
+const QueueIo = struct {
+    q: *Outbound,
+    io: Io,
+    fn writerWaits(c: @This()) bool {
+        return takeWaiting(c.q, c.io);
+    }
+    fn pongWaited(c: @This()) bool {
+        return pongWaiters(c.q, c.io) > 0;
+    }
+};
+
 fn awaitRoomWaiter(q: *Outbound, io: Io) !void {
     const give_up = time.after(io, .fromSeconds(5 * @as(i64, @import("anole_test_wait").timeoutFactor())));
     while (q.roomWaiters(io) == 0) {
@@ -1145,7 +1196,7 @@ test "frames come out whole and in order, PONGs first" {
     try testing.expectEqual(0, q.unsent(io, &frames).len);
 }
 
-test "a frame larger than a chunk, among small ones in many chunks" {
+test "a frame larger than a chunk comes out whole and in order among small frames spread over many chunks" {
     const io = testing.io;
     var q: Outbound = .init(testing.allocator, 1 << 24);
     defer q.deinit();
@@ -1288,7 +1339,7 @@ test "close wakes a waiting put, the writer and PING waiters" {
         defer q.deinit();
         var writer = try io.concurrent(takeOne, .{ &q, io });
         defer _ = writer.cancel(io) catch null;
-        try io.sleep(.fromMilliseconds(10), .awake);
+        try @import("anole_test_wait").waitUntil(io, "the writer waiting in take()", QueueIo{ .q = &q, .io = io }, QueueIo.writerWaits);
         q.close(io);
         try testing.expect(try writer.await(io) == null);
     }
@@ -1298,7 +1349,7 @@ test "close wakes a waiting put, the writer and PING waiters" {
         _ = try q.putPing(io, .flush);
         var waiter = try io.concurrent(waitFirstPong, .{ &q, io });
         defer waiter.cancel(io) catch {};
-        try io.sleep(.fromMilliseconds(10), .awake);
+        try @import("anole_test_wait").waitUntil(io, "the PING waiter in waitPong()", QueueIo{ .q = &q, .io = io }, QueueIo.pongWaited);
         q.close(io);
         try testing.expectError(error.Closed, waiter.await(io));
     }
@@ -1391,7 +1442,7 @@ fn exercise(gpa: Allocator) !void {
 }
 
 test "nothing leaks when an allocation fails" {
-    try testing.checkAllAllocationFailures(testing.allocator, exercise, .{});
+    try testing.checkAllAllocationFailures(@import("../../../testing/no_resize.zig").allocator, exercise, .{});
 }
 
 test "a PING answered before its connection ended is answered, whenever its waiter looks" {
@@ -1593,19 +1644,20 @@ test "a put with a deadline goes in when room comes in time, and one that timed 
     // at once.
     try testing.expectError(error.Timeout, putNamedUntil(&q, io, "gone", time.after(io, .zero)));
     try putNamedUntil(&q, io, "a", time.after(io, .fromSeconds(5)));
-    // Its deadline leaves the next put ample time to get in line behind it,
-    // even where sleeps are counted in ticks of ~15.6 ms, as on Windows.
-    const soon_deadline = time.after(io, .fromSeconds(1));
-    var soon = try io.concurrent(putNamedUntil, .{ &q, io, "soon", soon_deadline });
+    // Deadlines far off in real time: the test moves the queue's clock past
+    // the first one once both puts are in line, and no machine is too slow
+    // for that (TESTING.md D4, D6).
+    var soon = try io.concurrent(putNamedUntil, .{ &q, io, "soon", time.after(io, .fromSeconds(600)) });
     defer soon.cancel(io) catch {};
     try awaitRoomWaiters(&q, io, 1);
-    var later = try io.concurrent(putNamedUntil, .{ &q, io, "later", time.after(io, .fromSeconds(30)) });
+    var later = try io.concurrent(putNamedUntil, .{ &q, io, "later", time.after(io, .fromSeconds(3600)) });
     defer later.cancel(io) catch {};
     try awaitRoomWaiters(&q, io, 2);
+    // Both still wait: neither deadline has passed.
+    try testing.expectEqual(2, q.roomWaiters(io));
+    q.testAdvanceClock(io, .fromSeconds(1200));
     try testing.expectError(error.Timeout, soon.await(io));
-    // Not before its deadline, on the deadline's own clock; the put behind
-    // it still waits.
-    try testing.expect(time.expired(io, soon_deadline));
+    // The put behind it still waits.
     try testing.expectEqual(1, q.roomWaiters(io));
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
@@ -1848,7 +1900,7 @@ fn exerciseSettle(gpa: Allocator) !void {
 }
 
 test "nothing leaks when an allocation fails while settling and restoring" {
-    try testing.checkAllAllocationFailures(testing.allocator, exerciseSettle, .{});
+    try testing.checkAllAllocationFailures(@import("../../../testing/no_resize.zig").allocator, exerciseSettle, .{});
 }
 
 /// A ticket that admits its frame, or not, as `admit` says, and notes the

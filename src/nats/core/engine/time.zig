@@ -56,7 +56,9 @@ test "a duration becomes a deadline that far from now" {
     try testing.expectEqual(.awake, at.clock);
     try testing.expect(at.raw.nanoseconds >= before.nanoseconds + 250 * std.time.ns_per_ms);
     try testing.expect(at.raw.nanoseconds <= later.nanoseconds + 250 * std.time.ns_per_ms);
-    try testing.expect(!expired(io, at));
+    // Not expired: a deadline an hour off, so no stall of this thread can
+    // pass it (TESTING.md D6).
+    try testing.expect(!expired(io, after(io, .fromSeconds(3600))));
     try testing.expect(expired(io, after(io, .zero)));
     try testing.expect(expired(io, after(io, .fromSeconds(-1))));
     try testing.expectEqual(Io.Timeout.none, until(null));
@@ -80,16 +82,22 @@ test "the longest and shortest timeouts do not overflow" {
     try testing.expect(expired(io, past));
 }
 
-fn sleepUntil(io: Io, at: Io.Clock.Timestamp) Io.Cancelable!void {
+fn sleepUntil(io: Io, at: Io.Clock.Timestamp, woke: *std.atomic.Value(bool)) Io.Cancelable!void {
+    defer woke.store(true, .release);
     return at.wait(io);
 }
 
 test "sleeping until the latest deadline is safe" {
     // Io.Threaded turns a deadline into a timespec; the longest one fits.
     const io = testing.io;
-    var sleeper = try io.concurrent(sleepUntil, .{ io, deadline(io, forever()).? });
-    // Time for the sleeper to start its wait (a sensitivity sleep: canceled
-    // before, it is Canceled as well).
-    try io.sleep(.fromMilliseconds(10), .awake);
+    var woke: std.atomic.Value(bool) = .init(false);
+    var sleeper = try io.concurrent(sleepUntil, .{ io, deadline(io, forever()).?, &woke });
+    // An overflowed timespec would end the wait at once (or panic).
+    const wait = @import("anole_test_wait");
+    try wait.expectStays(io, "the sleeper on the latest deadline still asleep", &woke, struct {
+        fn asleep(w: *std.atomic.Value(bool)) bool {
+            return !w.load(.acquire);
+        }
+    }.asleep, wait.short_window);
     try testing.expectError(error.Canceled, sleeper.cancel(io));
 }

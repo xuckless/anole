@@ -65,7 +65,7 @@ pub const Collector = struct {
             c.ask.reset();
             // `what` was stored before `asked`.
             const seq = c.asked.load(.acquire);
-            const what: What = @enumFromInt(c.what.load(.acquire));
+            const what: What = @fromBackingInt(@intCast(c.what.load(.acquire)));
             var buf: std.Io.Writer.Allocating = .init(c.gpa);
             defer buf.deinit();
             var ok = if (c.collect(c.ctx, what, &buf.writer)) |_| true else |_| false;
@@ -88,7 +88,7 @@ pub const Collector = struct {
         defer c.serial.unlock();
         const seq = c.asked.load(.monotonic) +% 1;
         c.answered.reset();
-        c.what.store(@intFromEnum(what), .release);
+        c.what.store(@backingInt(what), .release);
         c.asked.store(seq, .release);
         c.ask.set(c.io);
         const deadline = std.Io.Clock.Timestamp.now(blockingIo(), .awake).addDuration(.{ .raw = .fromMilliseconds(wait_ms), .clock = .awake });

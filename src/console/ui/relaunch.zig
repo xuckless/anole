@@ -152,6 +152,18 @@ test "relaunch: starts a program detached, output appended, then killAndWait" {
     try std.testing.expect(!sys.pidAlive(pid));
 }
 
+/// A clock that only the fake sleep moves, so timeouts cost no wall time.
+const FakeTime = struct {
+    var now_ms: i64 = 0;
+    fn clock() i64 {
+        return now_ms;
+    }
+    fn sleep(ms: u32) void {
+        now_ms += ms;
+    }
+    const hooks: Hooks = .{ .clock = clock, .sleep = sleep };
+};
+
 test "relaunch: waitForSocket finds a newer pid and times out otherwise" {
     // The console's terminal side is not on Windows yet (design D15): no pipes, no clock.
     if (!sys.supported) return error.SkipZigTest;
@@ -167,13 +179,17 @@ test "relaunch: waitForSocket finds a newer pid and times out otherwise" {
     const fname = try std.fmt.bufPrint(&name_buf, "api.{d}.sock", .{sys.getpid()});
     var f = try tmp.dir.createFile(io, fname, .{});
     f.close(io);
-    const found = try waitForSocket(gpa, io, dir, "api", 1, 500, .{});
+    FakeTime.now_ms = 0;
+    const found = try waitForSocket(gpa, io, dir, "api", 1, 500, FakeTime.hooks);
     defer if (found) |p| gpa.free(p);
     try std.testing.expect(found != null);
     try std.testing.expect(std.mem.endsWith(u8, found.?, fname));
     // The old pid is excluded: nothing else appears.
-    const none = try waitForSocket(gpa, io, dir, "api", sys.getpid(), 300, .{});
+    FakeTime.now_ms = 0;
+    const none = try waitForSocket(gpa, io, dir, "api", sys.getpid(), 300, FakeTime.hooks);
     try std.testing.expect(none == null);
+    // It gave up only once its 300 ms had passed on its clock.
+    try std.testing.expect(FakeTime.now_ms >= 300);
 }
 
 test "relaunch: launch_info data parses" {

@@ -286,16 +286,16 @@ pub const Sqlite = struct {
         return @intCast(c.changes);
     }
 
-    fn heartbeat(ptr: *anyopaque, arena: std.mem.Allocator, until: Time, held: []const store.Held) anyerror![]Id {
+    fn heartbeat(ptr: *anyopaque, arena: std.mem.Allocator, until: Time, held: []const store.Held) anyerror![]store.Held {
         const self = me(ptr);
         var sc: Scratch = undefined;
         sc.start(self);
         defer sc.deinit();
         const stmt = try self.text(sc.ctx.arena, "UPDATE {p}jobs SET lease_until_ms = ?1 WHERE id = ?2 AND attempt = ?3 AND state = 'running'");
-        var out: std.ArrayList(Id) = .empty;
+        var out: std.ArrayList(store.Held) = .empty;
         for (held) |h| {
             const c = try self.w().execValues(&sc.ctx, stmt, &.{ V{ .int = ms(until) }, V{ .int = h.id }, V{ .int = h.attempt } });
-            if (c.changes > 0) try out.append(arena, h.id);
+            if (c.changes > 0) try out.append(arena, h);
         }
         return out.items;
     }

@@ -203,21 +203,26 @@ const UntilCanceled = struct {
 };
 
 test "jobs: with no connection to drain, a running job still gets the queue's drain_timeout" {
-    var app = try anole.App.init(gpa, .{ .executors = .exact(2), .listen_tls_http3 = false });
-    UntilCanceled.io = app.io();
-    UntilCanceled.started.store(false, .release);
-    UntilCanceled.canceled_after_ns.store(-1, .release);
-    UntilCanceled.never = .unset;
-    UntilCanceled.jc = try app.jobs(.{ .store = .memory, .drain_timeout = .fromSeconds(1) });
-    try UntilCanceled.jc.handleRaw(&app, kind, .{}, UntilCanceled.run);
-    var checking = try app.io().concurrent(UntilCanceled.check, .{&app});
-    try app.listen("127.0.0.1:0");
-    try checking.await(app.io());
-    app.deinit();
+    // Regression guard for 1751ae8: the drain under way is waited for, not cut short.
+    {
+        var app = try anole.App.init(gpa, .{ .executors = .exact(2), .listen_tls_http3 = false });
+        defer app.deinit();
+        UntilCanceled.io = app.io();
+        UntilCanceled.started.store(false, .release);
+        UntilCanceled.canceled_after_ns.store(-1, .release);
+        UntilCanceled.never = .unset;
+        UntilCanceled.jc = try app.jobs(.{ .store = .memory, .drain_timeout = .fromMilliseconds(200) });
+        try UntilCanceled.jc.handleRaw(&app, kind, .{}, UntilCanceled.run);
+        var checking = try app.io().concurrent(UntilCanceled.check, .{&app});
+        defer checking.cancel(app.io()) catch {};
+        try app.listen("127.0.0.1:0");
+        try checking.await(app.io());
+    }
     const after = UntilCanceled.canceled_after_ns.load(.acquire);
-    // Canceled, and not before the drain_timeout ran out.
+    // Canceled, and not before the drain_timeout ran out (a lower bound only:
+    // stopped_at is taken before the stop, so it holds on any machine).
     try std.testing.expect(after >= 0);
-    try std.testing.expect(after >= 900 * std.time.ns_per_ms);
+    try std.testing.expect(after >= 180 * std.time.ns_per_ms);
 }
 
 /// The store's `finish` always fails.

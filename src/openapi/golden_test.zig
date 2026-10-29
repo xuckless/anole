@@ -1,7 +1,11 @@
 //! Whole documents: the app's routes and services written out and compared,
 //! byte for byte, with the files in tests/openapi/. On a mismatch the
-//! document is written to tests/openapi/<name>.actual.json for review; there
-//! is no update flag, so changing a golden file is a deliberate copy.
+//! document is written to tests/openapi/<name>.actual.json for review.
+//! After an intended change, regenerate them with ANOLE_UPDATE_GOLDEN=1
+//! (`ANOLE_UPDATE_GOLDEN=1 zig build test -Dtest-filter=openapi`, as the
+//! console's goldens) and read the diff (TESTING.md F2). A golden file
+//! checked out with CRLF line ends (Git's autocrlf on Windows) compares as
+//! LF.
 const std = @import("std");
 const dusty = @import("dusty");
 const server_mod = @import("../server.zig");
@@ -29,11 +33,17 @@ fn expectGolden(name: []const u8, actual: []const u8) !void {
     const io = std.testing.io;
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "tests/openapi/{s}.json", .{name});
-    const want = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(4 << 20)) catch |err| switch (err) {
+    if (try std.testing.environ.containsUnempty(alloc, "ANOLE_UPDATE_GOLDEN")) {
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = actual });
+        return;
+    }
+    const file = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(4 << 20)) catch |err| switch (err) {
         error.FileNotFound => "",
         else => return err,
     };
-    defer if (want.len > 0) alloc.free(want);
+    defer if (file.len > 0) alloc.free(file);
+    const want = try std.mem.replaceOwned(u8, alloc, file, "\r\n", "\n");
+    defer alloc.free(want);
     if (std.mem.eql(u8, want, actual)) return;
     const actual_path = try std.fmt.allocPrint(alloc, "tests/openapi/{s}.actual.json", .{name});
     defer alloc.free(actual_path);
@@ -142,16 +152,20 @@ test "deterministic: the same routes in another order write the same bytes" {
     try std.testing.expectEqualStrings(first, second);
 }
 
+fn socket(_: *@import("../websocket/root.zig").Socket, _: *Request) !void {}
+
 test "left out: any, hidden and routes of other kinds" {
     var app = try server_mod.App.init(alloc, .{ .executors = .exact(1) });
     defer app.deinit();
     app.any("/anything", legacy);
     app.get("/internal", handlers.doc(.{ .hidden = true }, hidden));
+    if (comptime features.websocket) app.ws("/socket", socket);
     app.get("/shown", legacy);
     const doc = try app.openapiDocument(alloc);
     defer alloc.free(doc);
     try std.testing.expect(std.mem.indexOf(u8, doc, "/anything") == null);
     try std.testing.expect(std.mem.indexOf(u8, doc, "/internal") == null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "/socket") == null);
     try std.testing.expect(std.mem.indexOf(u8, doc, "/shown") != null);
 }
 
@@ -206,7 +220,7 @@ test "golden: Widgets gRPC service" {
     try expectGolden("widgets", doc);
 }
 
-test "gRPC forms by Options.grpc" {
+test "gRPC forms by Options.grpc: connect = .none leaves no Connect paths; transcoded = false leaves no HttpRule paths" {
     if (comptime !grpc_on) return error.SkipZigTest;
     const ops = comptime proto.serviceOperations(Widgets);
     var entries: [ops.len]root.Entry = undefined;
@@ -216,10 +230,12 @@ test "gRPC forms by Options.grpc" {
     }
     const none = try document.build(alloc, &entries, .{ .grpc = .{ .connect = .none } }, .auto, errors.log);
     defer alloc.free(none);
-    try std.testing.expect(std.mem.indexOf(u8, none, "application/json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, none, "\"/transcode.Widgets/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, none, "\"/v1/widgets/{name_1}\"") != null);
     const rest_off = try document.build(alloc, &entries, .{ .grpc = .{ .transcoded = false } }, .auto, errors.log);
     defer alloc.free(rest_off);
-    try std.testing.expect(rest_off.len != none.len);
+    try std.testing.expect(std.mem.indexOf(u8, rest_off, "\"/v1/widgets/{name_1}\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rest_off, "\"/transcode.Widgets/Make\"") != null);
 }
 
 // ------------------------------------------------------------------ names

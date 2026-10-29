@@ -364,7 +364,7 @@ pub const Watch = struct {
     mutex: std.Io.Mutex = .init,
     sinks: std.DoublyLinkedList = .{},
     handler: ?HandlerSlot = null,
-    status_value: std.atomic.Value(u8) = .init(@intFromEnum(Status.starting)),
+    status_value: std.atomic.Value(u8) = .init(@backingInt(Status.starting)),
     stopping: std.atomic.Value(bool) = .init(false),
     started: bool = false,
     /// Not started under this deployment (lambda).
@@ -636,11 +636,11 @@ pub const Watch = struct {
     }
 
     pub fn status(self: *const Watch) Status {
-        return @enumFromInt(self.status_value.load(.acquire));
+        return @fromBackingInt(@intCast(self.status_value.load(.acquire)));
     }
 
     pub fn setStatus(self: *Watch, s: Status) void {
-        const old: Status = @enumFromInt(self.status_value.swap(@intFromEnum(s), .acq_rel));
+        const old: Status = @fromBackingInt(@intCast(self.status_value.swap(@backingInt(s), .acq_rel)));
         if (old == s) return;
         if (self.metrics != null) self.syncMetrics();
         switch (s) {

@@ -439,7 +439,7 @@ test "bounded: past its timeout a call is canceled and fails with GatewayTimeout
     try testing.expectEqual(db.Class.timeout, db.lastError(&ctx).?.class);
 }
 
-test "db: callTimeout" {
+test "db: a call's own timeout wins over the default, .max means none" {
     const D = std.Io.Duration;
     try std.testing.expectEqual(@as(i96, 5 * std.time.ns_per_s), internal_ns(callTimeout(D.fromSeconds(5), D.fromSeconds(30))));
     try std.testing.expectEqual(@as(i96, 30 * std.time.ns_per_s), internal_ns(callTimeout(null, D.fromSeconds(30))));

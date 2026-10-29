@@ -35,15 +35,18 @@ const FakeVars = struct {
 const runtime_build: modes.Build = .{ .mode = .debug, .is_test = false };
 
 test "resolution: enabled off in tests, lambda and with ANOLE_CONSOLE=0; allow_restart by environment" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // Windows: the console is not available yet (docs/console.md), so it
+    // resolves to disabled even where it would otherwise be on; the rest of
+    // the table holds on every platform.
+    const on_here = @import("builtin").os.tag != .windows;
     var buf: [128]u8 = undefined;
     var why: std.Io.Writer = .fixed(&buf);
     const none: FakeVars = .{};
     const r1 = try root.resolve(.{}, none.vars(), .development, .standalone, runtime_build, &why);
-    try std.testing.expect(r1.enabled);
+    try std.testing.expectEqual(on_here, r1.enabled);
     try std.testing.expect(r1.allow_restart);
     const r2 = try root.resolve(.{}, none.vars(), .production, .standalone, runtime_build, &why);
-    try std.testing.expect(r2.enabled);
+    try std.testing.expectEqual(on_here, r2.enabled);
     try std.testing.expect(!r2.allow_restart);
     const r3 = try root.resolve(.{}, none.vars(), .development, .standalone, .{ .mode = .debug, .is_test = true }, &why);
     try std.testing.expect(!r3.enabled);
@@ -54,7 +57,7 @@ test "resolution: enabled off in tests, lambda and with ANOLE_CONSOLE=0; allow_r
     try std.testing.expect(!r5.enabled);
     // An explicit option beats the variable and the test default.
     const r6 = try root.resolve(.{ .enabled = true }, off.vars(), .production, .standalone, .{ .mode = .debug, .is_test = true }, &why);
-    try std.testing.expect(r6.enabled);
+    try std.testing.expectEqual(on_here, r6.enabled);
     const r7 = try root.resolve(.{ .allow_restart = true }, none.vars(), .production, .standalone, runtime_build, &why);
     try std.testing.expect(r7.allow_restart);
     const named: FakeVars = .{ .name = "billing" };
@@ -178,7 +181,8 @@ fn waitFor(c: *ui.client.Conn, arena: std.mem.Allocator, want: Wanted) !protocol
 
 const full_allow: protocol.Allow = .{ .reload = true, .drain = true, .restart = false, .full_restart = true };
 
-test "service: hello on attach, ping and the routes snapshot" {
+test "service: hello on attach; ping and /routes are answered, /tasks is unavailable" {
+    // Windows: the console is not available yet (docs/console.md).
     if (!os.supported) return error.SkipZigTest;
     var h = try Harness.init(std.testing.allocator, .{}, full_allow);
     defer h.deinit();
@@ -234,7 +238,7 @@ test "service: logs subscription filters, backlog first" {
     try std.testing.expectEqualStrings("new error", next.text);
 }
 
-test "service: a stats subscription carries the requests just counted" {
+test "service: a stats subscription carries the requests counted so far" {
     if (!os.supported) return error.SkipZigTest;
     var h = try Harness.init(std.testing.allocator, .{}, full_allow);
     defer h.deinit();
@@ -246,22 +250,22 @@ test "service: a stats subscription carries the requests just counted" {
     var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_s.deinit();
     const a = arena_s.allocator();
+    // Count before subscribing: the subscription's first frame goes out at
+    // once and carries the cumulative sums, so no interval passes.
+    try h.stats.ensureTables();
+    h.stats.count(0, 1, 200, 20_000);
+    h.stats.count(1, 1, 503, 40_000);
     _ = try c.subscribeStats(250);
     try c.flush();
     _ = try waitFor(&c, a, .res);
-    h.stats.count(0, 1, 200, 20_000);
-    h.stats.count(1, 1, 503, 40_000);
-    // Frames come every 250 ms; wait for one that has both requests.
+    const f = (try waitFor(&c, a, .stats)).stats;
     var seen = false;
-    var tries: u32 = 0;
-    while (!seen and tries < 40) : (tries += 1) {
-        const f = (try waitFor(&c, a, .stats)).stats;
-        for (f.routes) |r| if (r.i == 1 and r.n == 2) {
-            seen = true;
-            try std.testing.expectEqualStrings("/users/:id", r.p);
-            try std.testing.expectEqual(@as(u32, 1), r.s5);
-        };
-    }
+    for (f.routes) |r| if (r.i == 1) {
+        seen = true;
+        try std.testing.expectEqual(@as(u32, 2), r.n);
+        try std.testing.expectEqualStrings("/users/:id", r.p);
+        try std.testing.expectEqual(@as(u32, 1), r.s5);
+    };
     try std.testing.expect(seen);
 }
 
@@ -319,98 +323,118 @@ test "service: a newer protocol gets a version error" {
     const pair = try os.socketpair();
     try h.svc.adopt(pair[0], false);
     defer sys.close(pair[1]);
-    var c = ui.client.Conn.init(std.testing.allocator, pair[1], pair[1]);
-    defer c.deinit();
     // Read the server's hello by hand, then answer with proto 2.
     var buf: [4096]u8 = undefined;
-    var p = [1]sys.PollFd{.{ .fd = pair[1], .events = sys.POLLIN, .revents = 0 }};
-    _ = sys.poll(&p, 5000);
-    _ = try sys.read(pair[1], &buf);
+    _ = try readLineRaw(pair[1], &buf);
     try sys.writeAll(pair[1], "{\"t\":\"hello\",\"proto\":2}\n");
-    _ = sys.poll(&p, 5000);
-    const n = try sys.read(pair[1], &buf);
-    try std.testing.expect(std.mem.find(u8, buf[0..n], "\"code\":\"version\"") != null);
+    const line = try readLineRaw(pair[1], &buf);
+    try std.testing.expect(std.mem.find(u8, line, "\"code\":\"version\"") != null);
 }
 
-test "service: drain needs its token; read_only refuses; restart and full restart are gated" {
+/// Reads one whole line from `fd` by hand (the server says nothing more until
+/// answered); fails when none arrives within the wait helper's deadline.
+fn readLineRaw(fd: sys.fd_t, buf: []u8) ![]const u8 {
+    var len: usize = 0;
+    const deadline = sys.monotonicMs() + wait.deadlineMs();
+    while (std.mem.indexOfScalar(u8, buf[0..len], '\n') == null) {
+        const now = sys.monotonicMs();
+        if (now >= deadline) return error.TimedOut;
+        if (len == buf.len) return error.LineTooLong;
+        var p = [1]sys.PollFd{.{ .fd = fd, .events = sys.POLLIN, .revents = 0 }};
+        if (sys.poll(&p, @intCast(deadline - now)) == 0) continue;
+        const n = try sys.read(fd, buf[len..]);
+        if (n == 0) return error.EndOfStream;
+        len += n;
+    }
+    return buf[0..len];
+}
+
+test "service: drain without its token is refused, with it the server stops; reload runs; restart without hand-off explains why" {
     if (!os.supported) return error.SkipZigTest;
     var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_s.deinit();
     const a = arena_s.allocator();
-    {
-        var h = try Harness.init(std.testing.allocator, .{}, full_allow);
-        defer h.deinit();
-        var c = try h.attach();
-        defer {
-            c.close();
-            c.deinit();
-        }
-        _ = try c.op("drain", null);
-        try c.flush();
-        const no_token = (try waitFor(&c, a, .res)).res;
-        try std.testing.expectEqualStrings("confirm_required", no_token.code.?);
-        try std.testing.expect(!h.fake.stopped.load(.acquire));
-
-        _ = try c.op("reload", null);
-        try c.flush();
-        const rel = (try waitFor(&c, a, .res)).res;
-        try std.testing.expect(rel.ok);
-        try std.testing.expectEqual(@as(u32, 1), h.fake.reloads.load(.monotonic));
-
-        _ = try c.op("restart", "restart");
-        try c.flush();
-        const rs = (try waitFor(&c, a, .res)).res;
-        try std.testing.expect(!rs.ok);
-        try std.testing.expect(std.mem.find(u8, rs.message.?, "no listener hand-off: set .process = init.minimal in ServerOptions") != null);
-
-        _ = try c.op("drain", "drain");
-        try c.flush();
-        const ok = (try waitFor(&c, a, .res)).res;
-        try std.testing.expect(ok.ok);
-        var tries: u32 = 0;
-        while (!h.fake.stopped.load(.acquire) and tries < 200) : (tries += 1) {
-            var p = [1]sys.PollFd{.{ .fd = -1, .events = 0, .revents = 0 }};
-            _ = sys.poll(&p, 10);
-        }
-        try std.testing.expect(h.fake.stopped.load(.acquire));
+    var h = try Harness.init(std.testing.allocator, .{}, full_allow);
+    defer h.deinit();
+    var c = try h.attach();
+    defer {
+        c.close();
+        c.deinit();
     }
-    {
-        var h = try Harness.init(std.testing.allocator, .{ .read_only = true }, .{});
-        defer h.deinit();
-        var c = try h.attach();
-        defer {
-            c.close();
-            c.deinit();
-        }
-        for ([_][]const u8{ "reload", "drain", "restart", "full_restart" }) |op| {
-            _ = try c.op(op, "drain");
-            try c.flush();
-            const r = (try waitFor(&c, a, .res)).res;
-            try std.testing.expectEqualStrings("refused", r.code.?);
-        }
-        try std.testing.expectEqual(@as(u32, 0), h.fake.reloads.load(.monotonic));
-        try std.testing.expect(!h.fake.stopped.load(.acquire));
+    _ = try c.op("drain", null);
+    try c.flush();
+    const no_token = (try waitFor(&c, a, .res)).res;
+    try std.testing.expectEqualStrings("confirm_required", no_token.code.?);
+    try std.testing.expect(!h.fake.stopped.load(.acquire));
+
+    _ = try c.op("reload", null);
+    try c.flush();
+    const rel = (try waitFor(&c, a, .res)).res;
+    try std.testing.expect(rel.ok);
+    try std.testing.expectEqual(@as(u32, 1), h.fake.reloads.load(.monotonic));
+
+    _ = try c.op("restart", "restart");
+    try c.flush();
+    const rs = (try waitFor(&c, a, .res)).res;
+    try std.testing.expect(!rs.ok);
+    try std.testing.expect(std.mem.find(u8, rs.message.?, "no listener hand-off: set .process = init.minimal in ServerOptions") != null);
+
+    _ = try c.op("drain", "drain");
+    try c.flush();
+    const ok = (try waitFor(&c, a, .res)).res;
+    try std.testing.expect(ok.ok);
+    try wait.waitFlag(std.testing.io, "the drain stopped the server", &h.fake.stopped);
+}
+
+test "service: read_only refuses reload, drain, restart and full_restart" {
+    if (!os.supported) return error.SkipZigTest;
+    var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_s.deinit();
+    const a = arena_s.allocator();
+    var h = try Harness.init(std.testing.allocator, .{ .read_only = true }, .{});
+    defer h.deinit();
+    var c = try h.attach();
+    defer {
+        c.close();
+        c.deinit();
     }
-    {
-        // allow_restart off: full_restart is refused with the reason.
-        var h = try Harness.init(std.testing.allocator, .{}, .{ .reload = true, .drain = true });
-        defer h.deinit();
-        var c = try h.attach();
-        defer {
-            c.close();
-            c.deinit();
-        }
-        _ = try c.op("full_restart", "full-restart");
+    for ([_][]const u8{ "reload", "drain", "restart", "full_restart" }) |op| {
+        _ = try c.op(op, "drain");
         try c.flush();
         const r = (try waitFor(&c, a, .res)).res;
         try std.testing.expectEqualStrings("refused", r.code.?);
     }
+    try std.testing.expectEqual(@as(u32, 0), h.fake.reloads.load(.monotonic));
+    try std.testing.expect(!h.fake.stopped.load(.acquire));
+}
+
+test "service: full_restart is refused when restarts are not allowed" {
+    if (!os.supported) return error.SkipZigTest;
+    var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_s.deinit();
+    const a = arena_s.allocator();
+    var h = try Harness.init(std.testing.allocator, .{}, .{ .reload = true, .drain = true });
+    defer h.deinit();
+    var c = try h.attach();
+    defer {
+        c.close();
+        c.deinit();
+    }
+    _ = try c.op("full_restart", "full-restart");
+    try c.flush();
+    const r = (try waitFor(&c, a, .res)).res;
+    try std.testing.expectEqualStrings("refused", r.code.?);
 }
 
 test "service: stopping sends bye to every client" {
     if (!os.supported) return error.SkipZigTest;
     var h = try Harness.init(std.testing.allocator, .{}, full_allow);
+    defer h.deinit();
     var c = try h.attach();
+    defer {
+        c.close();
+        c.deinit();
+    }
     var arena_s = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_s.deinit();
     const a = arena_s.allocator();
@@ -418,9 +442,6 @@ test "service: stopping sends bye to every client" {
     h.svc.setStopping();
     const bye = (try waitFor(&c, a, .bye)).bye;
     try std.testing.expectEqualStrings("drain", bye.reason);
-    c.close();
-    c.deinit();
-    h.deinit();
 }
 
 test "service: a client that never reads never blocks logging, then sees a dropped count" {
@@ -450,10 +471,11 @@ test "service: a client that never reads never blocks logging, then sees a dropp
 
 test "service: the socket file is 0600 in a 0700 directory and goes away with the service" {
     if (!os.supported) return error.SkipZigTest;
+    // A short /tmp path: sun_path holds at most 104 bytes on macOS.
     var dir_buf: [128]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/anole-ct-{d}", .{sys.getpid()});
+    const dir = try std.fmt.bufPrintSentinel(&dir_buf, "/tmp/anole-ct-{d}", .{sys.getpid()}, 0);
     try std.testing.expect(os.ensurePrivateDir(dir, sys.geteuid()) == .created);
-    defer os.chmod(dir, 0o700);
+    defer _ = std.c.rmdir(dir.ptr);
     var path_buf: [160]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/t.1.sock", .{dir});
     var h = try Harness.init(std.testing.allocator, .{}, full_allow);
@@ -464,15 +486,21 @@ test "service: the socket file is 0600 in a 0700 directory and goes away with th
     try std.testing.expectEqual(@as(u32, 0o600), info.mode);
     try std.testing.expectEqual(@as(u32, 0o700), os.lstat(dir).?.mode);
 
-    // A real client over the socket.
-    const fd = try os.connectUnix(path);
-    var c = ui.client.Conn.init(std.testing.allocator, fd, fd);
-    defer {
-        c.close();
-        c.deinit();
+    {
+        // A real client over the socket.
+        const fd = try os.connectUnix(path);
+        var c = ui.client.Conn.init(std.testing.allocator, fd, fd);
+        defer {
+            c.close();
+            c.deinit();
+        }
+        try c.handshake("test", @intCast(wait.deadlineMs()), sys.monotonicMs);
+        try std.testing.expectEqual(@as(u32, 1), h.svc.attachedCount());
     }
-    try c.handshake("test", @intCast(wait.deadlineMs()), sys.monotonicMs);
-    try std.testing.expectEqual(@as(u32, 1), h.svc.attachedCount());
+
+    // Stopping the service removes the socket file.
+    h.svc.stop();
+    try std.testing.expect(os.lstat(path) == null);
 }
 
 test "service: language metrics show in the runtime snapshot" {
@@ -535,7 +563,7 @@ test "console: a tap and the request counters taken before stop stay usable unti
     tap.func(tap.ud, .warn, "anole", .{}, false, "draining");
     c.stop(false);
     try std.testing.expect(stats_mod.global == null);
-    tap.func(tap.ud, .warn, "anole", .{}, false, "Shutdown timed out with 1 request(s) still in flight");
+    tap.func(tap.ud, .warn, "anole", .{}, false, "Shutdown timed out with 1 request(s) or connection(s) still in flight");
     st.count(0, 0, 504, 1000);
     c.release();
 }

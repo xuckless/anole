@@ -1381,9 +1381,17 @@ test "a second connect() that gives up returns Canceled; the first one goes on" 
         }
     }.connecting);
     var second = try io.concurrent(connectLong, .{&client});
-    // Time for the second to join the wait (a sensitivity sleep: canceled
-    // before it joins, it gives up as well).
-    try io.sleep(.fromMilliseconds(20), .awake);
+    // Both calls wait for the one attempt before the second is canceled.
+    const Joined = struct {
+        io: Io,
+        client: *Client,
+        fn both(j: @This()) bool {
+            j.client.mutex.lockUncancelable(j.io);
+            defer j.client.mutex.unlock(j.io);
+            return j.client.changed.waiters >= 2;
+        }
+    };
+    try @import("anole_test_wait").waitUntil(io, "both connect() calls waiting", Joined{ .io = io, .client = &client }, Joined.both);
     try testing.expectError(error.Canceled, second.cancel(io));
     try testing.expectEqual(.connecting, client.state());
     release.set(io);

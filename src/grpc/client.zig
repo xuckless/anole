@@ -441,7 +441,8 @@ pub const CallOptions = struct {
 
 /// What `Client.unary` returns: the status, and the response message when
 /// the status is OK. A failed call is a status, not an error; errors are
-/// for the call not being made at all.
+/// for the call not being made at all, and `error.Canceled` when the
+/// calling task is canceled (the call is then reset).
 pub fn UnaryResult(comptime Resp: type) type {
     return struct {
         status: Status,
@@ -507,29 +508,51 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
             }
         }
 
+        /// A cancel of the calling task (not `cancel`/`release`): the call
+        /// is reset and ends CANCELLED, and the caller passes the cancel on
+        /// (SAFETY.md C3).
+        fn taskCanceled(self: *Self, err: h2.StreamError) bool {
+            if (err != error.Canceled or self.stream.canceledLocally()) return false;
+            self.status = .init(.cancelled, "cancelled");
+            // RST_STREAM CANCEL / H3_REQUEST_CANCELLED, as grpc aio and Go do.
+            self.stream.cancel();
+            return true;
+        }
+
+        /// What a failed write returns: `error.Canceled` when the calling
+        /// task was canceled, else `error.StreamClosed`.
+        fn writeFailed(self: *Self) error{ Canceled, StreamClosed } {
+            if (self.stream.writeError()) |e| if (self.taskCanceled(e)) return error.Canceled;
+            return error.StreamClosed;
+        }
+
         /// Sends one request message. Fails with `error.StreamClosed`
-        /// once the call has ended (read the status with `receive`).
+        /// once the call has ended (read the status with `receive`), and
+        /// with `error.Canceled` when the calling task is canceled (the
+        /// call is reset).
         pub fn send(self: *Self, message: Req) !void {
             var encoded: std.Io.Writer.Allocating = .init(self.arena);
             try message.encode(&encoded.writer, self.arena);
             const framed = try frame.encodeWithCompression(self.arena, encoded.written(), self.compression);
             const w = self.stream.writer();
-            w.writeAll(framed) catch return error.StreamClosed;
-            w.flush() catch return error.StreamClosed;
+            w.writeAll(framed) catch return self.writeFailed();
+            w.flush() catch return self.writeFailed();
         }
 
         /// No more requests (half-close).
         pub fn closeSend(self: *Self) !void {
-            self.stream.closeSend() catch return error.StreamClosed;
+            self.stream.closeSend() catch return self.writeFailed();
         }
 
         /// The next response, or null at the end of the call, when `status`
-        /// is set.
+        /// is set. `error.Canceled` when the calling task is canceled: the
+        /// call is reset, and `status` is CANCELLED.
         pub fn receive(self: *Self) !?Resp {
             if (self.status != null) return null;
             if (!self.head_checked) {
                 self.head_checked = true;
                 self.stream.waitHead() catch |err| {
+                    if (self.taskCanceled(err)) return error.Canceled;
                     self.lost_before_head = err == error.ConnectionClosed;
                     self.status = self.transportStatus(err);
                     return null;
@@ -551,6 +574,7 @@ pub fn Stream(comptime Req: type, comptime Resp: type) type {
             const encoding: Compression = if (self.stream.header("grpc-encoding")) |e| Compression.parse(e) orelse .identity else .identity;
             // Read and inflated outside the arena, freed once decoded.
             const msg = frame.readMessage(self.stream.reader(), server.scratch, self.channel.max_message_size, encoding) catch |err| {
+                if (err == error.ReadFailed) if (self.stream.readError()) |e| if (self.taskCanceled(e)) return error.Canceled;
                 self.status = switch (err) {
                     error.ReadFailed => if (self.stream.readError()) |e| self.transportStatus(e) else self.transportStatus(error.StreamReset),
                     error.MessageTooLarge => .init(.resource_exhausted, "message larger than the limit"),
@@ -749,7 +773,8 @@ fn UnaryJudge(comptime Resp: type) type {
         }
 
         pub fn verdict(a: *const Attempt) resilience.Verdict {
-            const r = a.result catch return .failure;
+            // The caller's own cancel says nothing about the target.
+            const r = a.result catch |e| return if (e == error.Canceled) .neutral else .failure;
             if (r.status.code == .ok) return .success;
             var retryable = false;
             for (a.codes) |c| if (c == r.status.code) {

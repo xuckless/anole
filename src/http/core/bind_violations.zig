@@ -100,7 +100,7 @@ pub const Collector = struct {
 
 const testing = std.testing;
 
-test "violations stop at v.max_report_violations" {
+test "Collector: keeps v.max_report_violations and marks the rest truncated" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     var c: Collector = .init(arena_state.allocator());
@@ -115,5 +115,8 @@ test "violations stop at v.max_report_violations" {
     try testing.expectEqualStrings("ids[1]", c.items()[1].field orelse "");
     try testing.expect(c.has(invalid_type, "page"));
     try testing.expect(!c.has(missing_field, "page"));
+}
+
+test "messages.oneOf lists the enum's variants" {
     try testing.expectEqualStrings("must be one of low, normal, high", comptime messages.oneOf(enum { low, normal, high }));
 }

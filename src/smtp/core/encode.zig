@@ -306,7 +306,7 @@ test "writeExtValue: RFC 2231 percent encoding" {
     try testing.expectEqualStrings("UTF-8''%C3%A9%20a.txt", out);
 }
 
-test "is7bit and write7bit" {
+test "encode: 7bit means ASCII without a bare CR and lines up to 998 bytes; write7bit ends every line with CRLF" {
     try testing.expect(is7bit("hello\nworld"));
     try testing.expect(!is7bit("héllo"));
     try testing.expect(!is7bit("a\rb"));
@@ -358,7 +358,7 @@ test "base64: 76-column lines across chunks, and the computed size" {
     }
 }
 
-test "boundary and message id" {
+test "encode: a boundary starts with ---- and a Message-ID ends with @domain, from the seeded generator" {
     var prng = std.Random.DefaultPrng.init(0);
     const b = createBoundary(prng.random());
     try testing.expectEqualStrings("----", b[0..4]);

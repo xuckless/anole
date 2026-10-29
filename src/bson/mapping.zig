@@ -474,7 +474,7 @@ test "numbers decode leniently, within range" {
     try testing.expectError(error.InvalidEnum, decodeValue(Role, arena, .{ .string = "root" }, .{}));
 }
 
-test "missing, unknown and duplicate fields" {
+test "BSON decode: a missing field takes its default or fails, unknown fields are ignored unless refused, a duplicate key reads the first" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -494,7 +494,7 @@ test "missing, unknown and duplicate fields" {
     try testing.expectEqual(1, (try decode(S, arena, b.bytes(), .{})).a);
 }
 
-test "dynamic values, tuples and zero-copy decoding" {
+test "BSON decode: Value and tuple fields decode, and with .copy = false strings point into the input" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

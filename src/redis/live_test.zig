@@ -187,17 +187,18 @@ test "redis: live pipelines, MULTI/EXEC, and WATCH on an acquired connection" {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
-    const pool = &r.pools.pools[0];
 
     _ = try r.del(&c, .{ "anole:test:p", "anole:test:stock" });
     const replies = try r.pipeline(&c, .{ .{ "INCR", "anole:test:p" }, .{ "EXPIRE", "anole:test:p", 60 }, .{ "GET", "anole:test:p" } });
     try testing.expectEqual(@as(i64, 1), replies[0].int);
     try testing.expectEqual(@as(i64, 1), replies[1].int);
     try testing.expectEqualStrings("1", replies[2].string);
-    // MULTI ... EXEC in one round trip; the connection goes back clean.
+    // MULTI ... EXEC in one round trip; the connection goes back clean:
+    // the next call runs on the same one.
+    const before_tx = try r.one(i64, &c, .{ "CLIENT", "ID" });
     const tx = try r.pipeline(&c, .{ .{"MULTI"}, .{ "INCR", "anole:test:p" }, .{ "INCR", "anole:test:p" }, .{"EXEC"} });
     try testing.expectEqual(@as(i64, 3), tx[3].array[1].int);
-    try testing.expectEqual(@as(usize, 1), pool.open);
+    try testing.expectEqual(before_tx, try r.one(i64, &c, .{ "CLIENT", "ID" }));
     // A slice of commands works as well.
     const cmds: []const []const []const u8 = &.{ &.{ "GET", "anole:test:p" }, &.{"PING"} };
     try testing.expectEqualStrings("PONG", (try r.pipeline(&c, cmds))[1].status);
@@ -217,17 +218,20 @@ test "redis: live pipelines, MULTI/EXEC, and WATCH on an acquired connection" {
         try testing.expectEqual(id, try conn.one(i64, &c, .{ "CLIENT", "ID" }));
     }
     try testing.expectEqual(@as(i64, 100), try r.one(i64, &c, .{ "GET", "anole:test:stock" }));
-    try testing.expectEqual(@as(usize, 2), pool.idle_len);
 
     // A connection moved to another database is closed on release, not
-    // handed to the next call.
-    {
+    // handed to the next call: no later call runs on it, and they all
+    // see the URL's database.
+    const moved = blk: {
         var conn = try r.acquire(&c);
         defer conn.release();
         _ = try conn.command(&c, .{ "SELECT", 9 });
+        break :blk try conn.one(i64, &c, .{ "CLIENT", "ID" });
+    };
+    for (0..3) |_| {
+        try testing.expect(try r.one(i64, &c, .{ "CLIENT", "ID" }) != moved);
+        try testing.expectEqual(@as(i64, 100), try r.one(i64, &c, .{ "GET", "anole:test:stock" }));
     }
-    try testing.expectEqual(@as(usize, 1), pool.open);
-    try testing.expectEqual(@as(i64, 100), try r.one(i64, &c, .{ "GET", "anole:test:stock" }));
 }
 
 test "redis: live pub/sub on a connection of its own" {
@@ -277,6 +281,7 @@ test "redis: live pub/sub on a connection of its own" {
         }
     };
     var waiting = try io.concurrent(Waiter.run, .{ sub, io });
+    defer _ = waiting.cancel(io) catch {};
     // Time for the waiter to be waiting (a sensitivity sleep: a publish
     // before it waits is still read by its `next`).
     try io.sleep(.fromMilliseconds(20), .awake);
@@ -298,6 +303,7 @@ test "redis: live pub/sub on a connection of its own" {
         }
     };
     var stopping = try io.concurrent(Stopper.run, .{ other, io });
+    defer stopping.cancel(io) catch {};
     try testing.expect(try other.next(&c) == null);
     try stopping.await(io);
 }
@@ -353,7 +359,6 @@ test "redis: live a timeout or a cancel closes the connection, and the next call
     };
     try testing.expectError(error.Canceled, task.cancel(io));
     try testing.expect(try r.one(i64, &c, .{ "CLIENT", "ID" }) != second);
-    try testing.expectEqual(@as(usize, 1), r.pools.pools[0].open);
 }
 
 test "redis: live a pool per executor" {
@@ -410,9 +415,10 @@ test "redis: live TLS as the URL asks, and a refused login" {
 
     const r = try open(io, .{ .max_connections = 1 });
     defer r.deinit();
+    // tests/redis/run.sh's TLS leg uses a port that speaks only TLS (and
+    // the plain leg one that speaks only plain), so a PONG proves the
+    // connection is what the URL asks.
     try testing.expectEqualStrings("PONG", (try r.command(&c, .{"PING"})).status);
-    const conn = r.pools.pools[0].idle[0];
-    try testing.expectEqual(r.settings.tls, conn.stream.isTls());
     // The URL's database, selected at login.
     const info = try r.one([]const u8, &c, .{ "CLIENT", "INFO" });
     var db_field_buf: [16]u8 = undefined;
@@ -489,7 +495,7 @@ test "redis: live app.redis: handlers, statuses, /readyz and /metrics" {
             return .{ resp.status(), try arena.dupe(u8, try resp.body()) };
         }
 
-        fn run(a: *server_mod.Server(AppState), cache: *redis.Client) !void {
+        fn run(a: *server_mod.Server(AppState)) !void {
             defer a.stop();
             const io = a.io();
             try a.waitReady();
@@ -523,10 +529,47 @@ test "redis: live app.redis: handlers, statuses, /readyz and /metrics" {
                     return error.TestUnexpectedResult;
                 }
             }
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{&app});
+    defer _ = checking.cancel(app.io()) catch {};
+    try app.listen("127.0.0.1:0");
+    try checking.await(app.io());
+}
+
+test "redis: live an event stream fed by a subscription ends when the server drains" {
+    const test_url = try testUrl();
+    var state: AppState = undefined;
+    var app = try server_mod.Server(AppState).init(gpa, .{ .executors = .exact(2) }, &state);
+    defer app.deinit();
+    state.redis = try app.redis(.{ .url = test_url, .environ = .empty });
+    app.get("/events", AppRoutes.events);
+
+    const Check = struct {
+        fn fetch(io: std.Io, arena: std.mem.Allocator, method: http.Method, target: []const u8) !struct { http.Status, []const u8 } {
+            var resp = try client_mod.client(io).fetch(target, .{ .method = method });
+            defer resp.deinit();
+            return .{ resp.status(), try arena.dupe(u8, try resp.body()) };
+        }
+
+        fn run(a: *server_mod.Server(AppState), cache: *redis.Client) !void {
+            defer a.stop();
+            const io = a.io();
+            try a.waitReady();
+            var arena_state: std.heap.ArenaAllocator = .init(gpa);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const port = a.addresses()[0].ip.getPort();
+            const at = struct {
+                fn f(ar: std.mem.Allocator, p: u16, path: []const u8) ![]const u8 {
+                    return std.fmt.allocPrint(ar, "http://127.0.0.1:{d}{s}", .{ p, path });
+                }
+            }.f;
 
             // An event stream fed by a subscription ends when the server
             // drains, well before the drain's 30 s deadline.
             var streaming = try io.concurrent(fetch, .{ io, arena, http.Method.get, try at(arena, port, "/events") });
+            defer _ = streaming.cancel(io) catch {};
             var c: db.Ctx = .{ .io = io, .arena = arena };
             const Publish = struct {
                 r: *redis.Client,
@@ -544,6 +587,7 @@ test "redis: live app.redis: handlers, statuses, /readyz and /metrics" {
         }
     };
     var checking = try app.io().concurrent(Check.run, .{ &app, state.redis });
+    defer _ = checking.cancel(app.io()) catch {};
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }

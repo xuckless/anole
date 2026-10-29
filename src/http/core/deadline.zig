@@ -284,14 +284,15 @@ test "Watch: accepts an absolute deadline on another clock" {
     try std.testing.expectError(error.Timeout, watch.wait(io));
 }
 
-test "Watch: a deadline republished before its generation does not expire the connection" {
+test "Watch: a deadline republished before its generation does not expire the connection [timing]" {
+    // Building the race needs the watcher asleep before the first deadline:
+    // local timing step only (TESTING.md D6).
+    try test_wait.requireTiming();
     const io = std.testing.io;
     var watch: Watch = .{};
 
-    // Leave enough room for the watcher and this test task both to be
-    // scheduled on a loaded runner before the first deadline arrives.
-    const first_end = std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(500));
-    watch.arm(io, .fromMilliseconds(500));
+    const first_end = std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(100));
+    watch.arm(io, .fromMilliseconds(100));
 
     var entered: std.atomic.Value(bool) = .init(false);
     var watcher = try io.concurrent(struct {
@@ -307,7 +308,7 @@ test "Watch: a deadline republished before its generation does not expire the co
     // -- the window between its store and its wake. (A watcher that reads
     // the later one first never builds the race: that can only hide a bug.)
     try test_wait.waitFlag(io, "the watcher entered its wait", &entered);
-    // Far enough out that no stall reaches it (TESTING.md D6).
+    // Far enough out that no stall reaches it.
     const later: std.Io.Timeout = .{
         .deadline = .fromNow(io, .{ .raw = .fromSeconds(600), .clock = .awake }),
     };
@@ -315,16 +316,21 @@ test "Watch: a deadline republished before its generation does not expire the co
     watch.timeout = later;
     watch.mutex.unlock(io);
     if (!std.Io.Clock.awake.now(io).compare(.lt, first_end)) {
-        // Too slow to publish before the first deadline: the watcher may
-        // rightly have expired on it, and the race this test builds never
-        // happened. Nothing to check (TESTING.md D6).
+        // Too slow to publish before the first deadline: the race this test
+        // builds never happened. In the timing step that is a failure.
+        // The watcher may rightly have expired on the first deadline; that
+        // Timeout is not the failure here (Canceled still propagates).
         watch.finish(io);
-        _ = watcher.await(io) catch {};
-        return error.SkipZigTest;
+        watcher.await(io) catch |err| switch (err) {
+            error.Timeout => {},
+            else => |e| return e,
+        };
+        return error.TooSlowToBuildTheRace;
     }
 
-    // Well past the first deadline, and nowhere near the second.
-    try io.sleep(.fromMilliseconds(600), .awake);
+    // Past the first deadline by 100 ms, and nowhere near the second.
+    const left = std.Io.Clock.awake.now(io).durationTo(first_end.addDuration(.fromMilliseconds(100)));
+    try io.sleep(left, .awake);
     watch.finish(io);
 
     try watcher.await(io);

@@ -964,14 +964,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// after a long freeze); null when it has no pool to close.
             closeIdle: ?*const fn (context: *anyopaque) void = null,
 
+            /// The console's `/db` system: the type's `console_system` decl
+            /// ("postgres", "redis"...), or "connector" when it has none.
             fn systemOf(comptime T: type) []const u8 {
-                @setEvalBranchQuota(20_000);
-                const n = @typeName(T);
-                inline for (.{ "postgres:pg", "sqlite:sqlite", "mongodb:mongodb", "redis:redis", "nats:nats", "kafka:kafka", "smtp:smtp", "s3:s3" }) |pair| {
-                    const colon = comptime std.mem.indexOfScalar(u8, pair, ':').?;
-                    if (std.mem.find(u8, n, pair[colon + 1 ..]) != null) return pair[0..colon];
-                }
-                return "connector";
+                if (!@hasDecl(T, "console_system")) return "connector";
+                const system: []const u8 = T.console_system;
+                return system;
             }
 
             fn of(comptime T: type, value: *T) Connector {
@@ -4083,7 +4081,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
     };
 }
 
-test "anole.Server: one call each to serve HTTP/1.1 and HTTPS, routes and middleware, stop" {
+test "anole.Server: init with http and https binds both, and a route behind app.use(RequestId) answers with a 32-character id" {
     const gpa = std.testing.allocator;
     var app = try Server(void).init(gpa, .{
         .http = .{ .port = 0, .h2c = false },
@@ -4114,7 +4112,10 @@ test "anole.Server: one call each to serve HTTP/1.1 and HTTPS, routes and middle
             var r = stream.reader(io_, &rbuf);
             var out: [1024]u8 = undefined;
             var fw: std.Io.Writer = .fixed(&out);
-            _ = r.interface.streamRemaining(&fw) catch {};
+            if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
+                // A cancel is handed on (SAFETY.md C3); anything else ends the read.
+                if (r.err) |e| if (e == error.Canceled) return error.Canceled;
+            }
             const resp = fw.buffered();
             try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
             try std.testing.expect(std.mem.indexOf(u8, resp, "X-Request-Id: ") != null);
@@ -4122,6 +4123,7 @@ test "anole.Server: one call each to serve HTTP/1.1 and HTTPS, routes and middle
             if (features.tls == .boringssl) try std.testing.expectEqual(@as(usize, 2), a.addresses().len);
         }
     }.run, .{&app});
+    defer client_future.cancel(app.io()) catch {};
     try app.run();
     try client_future.await(app.io());
 }
@@ -4260,6 +4262,7 @@ test "anole.Server: mutual TLS on HTTP/1.1, HTTP/2 and HTTP/3, and the client ce
         }
     };
     var client_future = try app.io().concurrent(Check.run, .{ &app, &pem, &tmp });
+    defer client_future.cancel(app.io()) catch {};
     try app.run();
     try client_future.await(app.io());
 }
@@ -4312,7 +4315,10 @@ test "anole.Server: with a blocking pool, one executor serves other requests whi
             var r = stream.reader(io_, &rbuf);
             var out: [1024]u8 = undefined;
             var fw: std.Io.Writer = .fixed(&out);
-            _ = r.interface.streamRemaining(&fw) catch {};
+            if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
+                // A cancel is handed on (SAFETY.md C3); anything else ends the read.
+                if (r.err) |e| if (e == error.Canceled) return error.Canceled;
+            }
             try std.testing.expect(std.mem.endsWith(u8, fw.buffered(), path[1..]));
             return start.durationTo(std.Io.Clock.awake.now(io_)).toMilliseconds();
         }
@@ -4335,6 +4341,7 @@ test "anole.Server: with a blocking pool, one executor serves other requests whi
     app.get("/slow", Routes.slow);
     app.get("/fast", Routes.fast);
     var client_future = try app.io().concurrent(Routes.client, .{&app});
+    defer client_future.cancel(app.io()) catch {};
     try app.run();
     try client_future.await(app.io());
 }
@@ -4511,6 +4518,7 @@ test "anole.Server: reloadCertificates, SIGHUP and setCertificate switch the cer
         }
     };
     var client_future = try app.io().concurrent(Run.run, .{ &app, &pems, &tmp });
+    defer client_future.cancel(app.io()) catch {};
     try app.run();
     try client_future.await(app.io());
 }
@@ -4563,7 +4571,11 @@ test "anole.Server: http listens on 127.0.0.1:8080 when nothing is set, from run
     try app.configure(app.pending.?);
     const listeners = app.server.config.listeners;
     try std.testing.expectEqual(@as(usize, 1), listeners.len);
-    try std.testing.expectEqual(@as(u16, 8080), listeners[0].address.ip.getPort());
+    const ip = listeners[0].address.ip;
+    try std.testing.expectEqual(@as(u16, 8080), ip.getPort());
+    // Loopback only, not every interface: the default exposes nothing.
+    try std.testing.expect(ip == .ip4);
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &ip.ip4.bytes);
     try std.testing.expect(listeners[0].tls == null);
 }
 
@@ -4604,13 +4616,41 @@ test "Server: anole.noWait(f) marks a function middleware; a noWait route behind
     app.get("/quick", handlers.noWait(Fns.quick));
 }
 
-test "anole.Server: use, group and middleware copy what they are given, and deinit it with the server; static, embedded and query" {
+/// HTTP/1.1 heads to 127.0.0.1:`port`, one connection each, for the
+/// routing tests: the body of a 200, or an error.
+const BodyClient = struct {
+    fn get(io_: std.Io, port: u16, head: []const u8) ![]const u8 {
+        const stream = try (try std.Io.net.IpAddress.parse("127.0.0.1", port)).connect(io_, .{ .mode = .stream });
+        defer stream.close(io_);
+        var wbuf: [512]u8 = undefined;
+        var w = stream.writer(io_, &wbuf);
+        try w.interface.writeAll(head);
+        try w.interface.flush();
+        var rbuf: [2048]u8 = undefined;
+        var r = stream.reader(io_, &rbuf);
+        var out: [2048]u8 = undefined;
+        var fw: std.Io.Writer = .fixed(&out);
+        if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
+            // A cancel is handed on (SAFETY.md C3); anything else ends the read.
+            if (r.err) |e| if (e == error.Canceled) return error.Canceled;
+        }
+        const resp = fw.buffered();
+        if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200")) return error.UnexpectedStatus;
+        const body_at = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return error.NoBody;
+        return std.testing.allocator.dupe(u8, resp[body_at + 4 ..]);
+    }
+
+    fn expectBody(io_: std.Io, port: u16, head: []const u8, want: []const u8) !void {
+        const body = try get(io_, port, head);
+        defer std.testing.allocator.free(body);
+        try std.testing.expectEqualStrings(want, body);
+    }
+};
+
+test "anole.Server: use, group and middleware copy what they are given and deinit each copy once with the server" {
     const gpa = std.testing.allocator;
     var hits: std.atomic.Value(u32) = .init(0);
     var deinits: u32 = 0;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "page.txt", .data = "static page" });
     {
         var app = try Server(void).init(gpa, .{ .http = .{ .port = 0, .h2c = false }, .executors = .exact(2) }, {});
         defer app.deinit();
@@ -4624,60 +4664,65 @@ test "anole.Server: use, group and middleware copy what they are given, and dein
                 res.body = "a";
             }
         }.handle);
-        api.group("/v2", .{shared}).query("/q", struct {
-            fn handle(req: *http.Request, res: *http.Response) !void {
-                res.body = (try req.body()) orelse "";
+        api.group("/v2", .{shared}).get("/b", struct {
+            fn handle(_: *http.Request, res: *http.Response) !void {
+                res.body = "b";
             }
         }.handle);
-        app.static("/files", tmp.dir, .{});
-        app.embedded("/embedded.txt", "embedded file", .{});
 
         const Client = struct {
-            fn get(io_: std.Io, port: u16, head: []const u8) ![]const u8 {
-                const stream = try (try std.Io.net.IpAddress.parse("127.0.0.1", port)).connect(io_, .{ .mode = .stream });
-                defer stream.close(io_);
-                var wbuf: [512]u8 = undefined;
-                var w = stream.writer(io_, &wbuf);
-                try w.interface.writeAll(head);
-                try w.interface.flush();
-                var rbuf: [2048]u8 = undefined;
-                var r = stream.reader(io_, &rbuf);
-                var out: [2048]u8 = undefined;
-                var fw: std.Io.Writer = .fixed(&out);
-                _ = r.interface.streamRemaining(&fw) catch {};
-                const resp = fw.buffered();
-                if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200")) return error.UnexpectedStatus;
-                const body_at = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return error.NoBody;
-                return std.testing.allocator.dupe(u8, resp[body_at + 4 ..]);
-            }
-
-            fn expectBody(io_: std.Io, port: u16, head: []const u8, want: []const u8) !void {
-                const body = try get(io_, port, head);
-                defer std.testing.allocator.free(body);
-                try std.testing.expectEqualStrings(want, body);
-            }
-
             fn run(a: *Server(void)) !void {
                 defer a.stop();
                 const io_ = a.io();
                 try a.waitReady();
                 const port = a.addresses()[0].ip.getPort();
-                try expectBody(io_, port, "GET /api/a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", "a");
-                try expectBody(io_, port, "QUERY /api/v2/q HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 5\r\n\r\nq=abc", "q=abc");
-                try expectBody(io_, port, "GET /files/page.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", "static page");
-                try expectBody(io_, port, "GET /embedded.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", "embedded file");
+                try BodyClient.expectBody(io_, port, "GET /api/a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", "a");
+                try BodyClient.expectBody(io_, port, "GET /api/v2/b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", "b");
             }
         };
         var client_future = try app.io().concurrent(Client.run, .{&app});
+        defer client_future.cancel(app.io()) catch {};
         try app.run();
         try client_future.await(app.io());
-        // use: all 4 requests; /api/a: shared and the group's copy;
-        // /api/v2/q: those two, then shared again (the nested group's).
-        try std.testing.expectEqual(@as(u32, 4 + 2 + 3), hits.load(.monotonic));
+        // use: both requests; /api/a: shared and the group's copy;
+        // /api/v2/b: those two, then shared again (the nested group's).
+        try std.testing.expectEqual(@as(u32, 2 + 2 + 3), hits.load(.monotonic));
         try std.testing.expectEqual(@as(u32, 0), deinits);
     }
     // The `use` copy, `shared`, and the copy in the "/api" group.
     try std.testing.expectEqual(@as(u32, 3), deinits);
+}
+
+test "anole.Server: static, embedded and QUERY routes answer over HTTP/1.1" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "page.txt", .data = "static page" });
+    var app = try Server(void).init(gpa, .{ .http = .{ .port = 0, .h2c = false }, .executors = .exact(2) }, {});
+    defer app.deinit();
+    app.query("/q", struct {
+        fn handle(req: *http.Request, res: *http.Response) !void {
+            res.body = (try req.body()) orelse "";
+        }
+    }.handle);
+    app.static("/files", tmp.dir, .{});
+    app.embedded("/embedded.txt", "embedded file", .{});
+
+    const Client = struct {
+        fn run(a: *Server(void)) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const port = a.addresses()[0].ip.getPort();
+            try BodyClient.expectBody(io_, port, "QUERY /q HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 5\r\n\r\nq=abc", "q=abc");
+            try BodyClient.expectBody(io_, port, "GET /files/page.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", "static page");
+            try BodyClient.expectBody(io_, port, "GET /embedded.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", "embedded file");
+        }
+    };
+    var client_future = try app.io().concurrent(Client.run, .{&app});
+    defer client_future.cancel(app.io()) catch {};
+    try app.run();
+    try client_future.await(app.io());
 }
 
 /// Raw HTTP/1.1 over one connection, for the listener tests: the whole
@@ -4911,6 +4956,7 @@ test "anole.Server: listeners that cannot be set up are refused, with what is wr
 }
 
 test "anole.Server: the open-file limit is raised, and max_connections follows it unless set" {
+    // Not supported on Windows: it has no RLIMIT_NOFILE to raise.
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const before = try std.posix.getrlimit(.NOFILE);
@@ -4937,6 +4983,7 @@ test "anole.Server: the open-file limit is raised, and max_connections follows i
             }
         };
         var f = try app.io().concurrent(Run.run, .{ &app, soft });
+        defer f.cancel(app.io()) catch {};
         try app.run();
         try f.await(app.io());
     }
@@ -4960,6 +5007,7 @@ test "anole.Server: the open-file limit is raised, and max_connections follows i
         }
     };
     var g = try capped.io().concurrent(Capped.run, .{&capped});
+    defer g.cancel(capped.io()) catch {};
     try capped.run();
     try g.await(capped.io());
 }
@@ -5141,6 +5189,7 @@ test "setCertificate: a key that does not match is error.KeyMismatch, from eithe
         }
     };
     var f = try app.io().concurrent(Run.run, .{ &app, b.key, a.cert, &tmp });
+    defer f.cancel(app.io()) catch {};
     try app.run();
     try f.await(app.io());
 }
@@ -5164,7 +5213,10 @@ const RawRequest = struct {
         var rbuf: [1024]u8 = undefined;
         var r = stream.reader(io_, &rbuf);
         var fw: std.Io.Writer = .fixed(out);
-        _ = r.interface.streamRemaining(&fw) catch {};
+        if (r.interface.streamRemaining(&fw)) |_| {} else |_| {
+            // A cancel is handed on (SAFETY.md C3); anything else ends the read.
+            if (r.err) |e| if (e == error.Canceled) return error.Canceled;
+        }
         return fw.buffered();
     }
 };
@@ -5201,6 +5253,7 @@ test "anole.Server: behind_proxy over a real connection reads X-Forwarded-For fr
             try std.testing.expect(std.mem.endsWith(u8, resp, "198.51.100.7:0"));
         }
     }.run, .{&app});
+    defer client_future.cancel(app.io()) catch {};
     try app.run();
     try client_future.await(app.io());
 }
@@ -5235,6 +5288,7 @@ test "anole.Server: error_detail names the error in a 500, in development only" 
             }
         };
         var client_future = try app.io().concurrent(Client.run, .{&app});
+        defer client_future.cancel(app.io()) catch {};
         try app.run();
         try client_future.await(app.io());
     }
@@ -5270,4 +5324,35 @@ test "anole.Server: a .env file with a problem is InvalidEnvFile" {
         .http = .{ .port = 0 },
         .executors = .exact(1),
     }, {}));
+}
+
+test "console: a connector type is not reported as PostgreSQL for a piece of its name" {
+    // "Upgrade" contains "pg"; the test's name (part of the type's name)
+    // must contain no system's substring, so the struct is the only trigger.
+    const Upgrade = struct {
+        fn start(_: *@This(), _: ?*observe.metrics.Registry, _: ?*observe.trace.Exporter, _: ?*observe.Health) anyerror!void {}
+        fn deinit(_: *@This()) void {}
+    };
+    var u: Upgrade = .{};
+    const c = Server(void).Connector.of(Upgrade, &u);
+    try std.testing.expectEqualStrings("connector", c.name);
+    try std.testing.expect(c.describe == null);
+}
+
+test "console: each database and service connector keeps its /db system name" {
+    const S = Server(void);
+    const Name = struct {
+        fn of(comptime T: type) []const u8 {
+            var v: T = undefined;
+            return S.Connector.of(T, &v).name;
+        }
+    };
+    if (features.postgres) try std.testing.expectEqualStrings("postgres", Name.of(pg_mod.Client));
+    if (features.sqlite) try std.testing.expectEqualStrings("sqlite", Name.of(sqlite_mod.Client));
+    if (features.mongodb) try std.testing.expectEqualStrings("mongodb", Name.of(mongodb_mod.Client));
+    if (features.redis) try std.testing.expectEqualStrings("redis", Name.of(redis_mod.Client));
+    if (features.nats) try std.testing.expectEqualStrings("nats", Name.of(nats_mod.Client));
+    if (features.kafka) try std.testing.expectEqualStrings("kafka", Name.of(kafka_mod.Client));
+    if (features.s3) try std.testing.expectEqualStrings("s3", Name.of(@import("s3/root.zig").Client));
+    if (features.smtp) try std.testing.expectEqualStrings("smtp", Name.of(@import("smtp/root.zig").Client));
 }

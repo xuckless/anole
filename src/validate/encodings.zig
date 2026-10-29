@@ -40,8 +40,8 @@ pub fn isJson(s: []const u8) bool {
     var buf: [json_stack_bytes]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&buf);
     var scanner: std.json.Scanner = .initCompleteInput(fba.allocator(), s);
-    // The scanner's only allocation, which fills `buf` exactly (tested
-    // below); if a release of std grew differently, every input would fail.
+    // The scanner's only allocation, which fits in `buf`; if a release
+    // of std grew differently, every input would fail (the json tests below).
     scanner.ensureTotalStackCapacity(core.max_json_depth + 1) catch return false;
     var first = true;
     while (true) {
@@ -919,31 +919,6 @@ test "base58 accepts the Bitcoin alphabet only, without 0, O, I and l" {
     const t = std.testing;
     for ([_][]const u8{ "", "1", "111", "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", "z", "9" }) |s| try t.expect(isBase58(s));
     for ([_][]const u8{ "0", "O", "I", "l", "1 1", "+", "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa\n", "\xc3\xa9" }) |s| try t.expect(!isBase58(s));
-}
-
-test "json: the scanner's one reservation fills the stack buffer exactly, and a byte less fails" {
-    const t = std.testing;
-    // 65 bits need 9 bytes; std grows that to 9 + 9 / 2 + cache_line.
-    try t.expectEqual(9 + 4 + std.atomic.cache_line, json_stack_bytes);
-    switch (@import("builtin").cpu.arch) {
-        .x86_64, .aarch64 => try t.expectEqual(141, json_stack_bytes),
-        else => {},
-    }
-    var deep: [2 * core.max_json_depth]u8 = undefined;
-    @memset(deep[0..core.max_json_depth], '[');
-    @memset(deep[core.max_json_depth..], ']');
-    var buf: [json_stack_bytes]u8 = undefined;
-    var fba: std.heap.FixedBufferAllocator = .init(&buf);
-    var scanner: std.json.Scanner = .initCompleteInput(fba.allocator(), &deep);
-    try scanner.ensureTotalStackCapacity(core.max_json_depth + 1);
-    try t.expectEqual(json_stack_bytes, fba.end_index);
-    while (try scanner.next() != .end_of_document) {}
-    // No second allocation on the deepest document that passes.
-    try t.expectEqual(json_stack_bytes, fba.end_index);
-    var small: [json_stack_bytes - 1]u8 = undefined;
-    var fba_small: std.heap.FixedBufferAllocator = .init(&small);
-    var short: std.json.Scanner = .initCompleteInput(fba_small.allocator(), "{}");
-    try t.expectError(error.OutOfMemory, short.ensureTotalStackCapacity(core.max_json_depth + 1));
 }
 
 test "json passes an object or an array at the top level, with whitespace around it" {

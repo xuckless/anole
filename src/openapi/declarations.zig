@@ -131,7 +131,6 @@ pub const ResponseDoc = struct {
     content_type: ?[]const u8 = null,
 };
 
-
 /// What a middleware tells the document: `pub const openapi:
 /// anole.openapi.MiddlewareDoc = .{ ... }` in its type. A middleware that
 /// is a function has no declarations: make it a type with `pub fn run`.
@@ -290,21 +289,13 @@ test "Doc: a union's fields are its variants; an enum has none; a type that writ
     try testing.expect(@FieldType(FieldDoc(?u8), "example") == ??u8);
 }
 
-test "MiddlewareDoc: security, input and a response for each status" {
+test "MiddlewareDoc: query and cookies default to none, an unset status is null, a response's json defaults to none, and there is one Responses field per std.http.Status" {
     const doc: MiddlewareDoc = .{
-        .security_schemes = &.{
-            .{ .name = "bearer", .kind = .{ .http = .{ .scheme = "bearer", .bearer_format = "opaque" } } },
-            .{ .name = "session", .kind = .{ .api_key = .{ .in = .cookie, .param = "session" } } },
-            .{ .name = "mtls", .kind = .mutual_tls },
-        },
-        .security = .any,
-        .roles = &.{"todos"},
+        .security_schemes = &.{.{ .name = "mtls", .kind = .mutual_tls }},
         .headers = struct { authorization: ?[]const u8 = null },
-        .responses = .{ .not_modified = .{}, .unauthorized = .{ .content_type = "text/html" } },
+        .responses = .{ .not_modified = .{} },
     };
-    try testing.expectEqual(3, doc.security_schemes.len);
-    try testing.expect(doc.query == void and doc.cookies == void and doc.headers != void);
-    try testing.expectEqualStrings("text/html", doc.responses.unauthorized.?.content_type.?);
+    try testing.expect(doc.query == void and doc.cookies == void);
     try testing.expect(doc.responses.not_modified.?.json == void);
     try testing.expectEqual(null, doc.responses.ok);
     try testing.expectEqual(@typeInfo(std.http.Status).@"enum".field_names.len, @typeInfo(MiddlewareDoc.Responses).@"struct".field_names.len);

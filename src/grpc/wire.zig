@@ -103,6 +103,22 @@ pub const Stream = union(Transport) {
         };
     }
 
+    pub fn writeError(s: Stream) ?h2.StreamError {
+        return switch (s) {
+            .h2 => |x| x.writeError(),
+            .h3 => |x| if (comptime have_h3) x.writeError() else unreachable,
+        };
+    }
+
+    /// `cancel` or `release` ended the stream (not a cancel of the task
+    /// waiting on it).
+    pub fn canceledLocally(s: Stream) bool {
+        return switch (s) {
+            .h2 => |x| x.canceledLocally(),
+            .h3 => |x| if (comptime have_h3) x.canceledLocally() else unreachable,
+        };
+    }
+
     pub fn resetCode(s: Stream) ?u64 {
         return switch (s) {
             .h2 => |x| x.resetCode(),

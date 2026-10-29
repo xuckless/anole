@@ -699,18 +699,19 @@ test "MemoryStore: capped at max_entries, and update/touch never bring a session
     try std.testing.expect((try s.load(arena, "a")) == null);
 }
 
-test "regenerate drops the CSRF token, and __Host- names are checked" {
+test "session.regenerate drops the CSRF token and keeps the other data" {
     var req: dusty.Request = .{ .arena = std.testing.allocator, ._parser = undefined, ._transport = undefined };
     try req.session.set(csrf_key, "old-token");
     try req.session.set("user", "alice");
     try regenerate(&req);
     try std.testing.expect(req.session.get(csrf_key) == null);
     try std.testing.expectEqualStrings("alice", req.session.get("user").?);
-    // The defaults allow a __Host- name (the refusals are in cookie.zig's
-    // tests, without the error this would log).
+}
+
+test "session.Middleware.init accepts a __Host- cookie name with the default options" {
+    // The refusals are in cookie.zig's tests (SessionCookieOpts.checkPrefix),
+    // without the error this would log.
     _ = try Middleware.init(.{ .key = @splat(1), .cookie_name = "__Host-anole_session" });
-    const opts: CookieOpts = .{ .path = "/app" };
-    try std.testing.expectError(error.CookiePrefixMismatch, opts.checkPrefix("__Host-s"));
 }
 
 test "Options: setting one cookie_opts field keeps the secure defaults of the others" {
@@ -728,7 +729,7 @@ test "MemoryStore: expired sessions are swept as new ones come in" {
     // Each expires at once (a TTL of 0), and none is ever looked up again.
     for (0..500) |i| try s.save(try std.fmt.bufPrint(&buf, "dead{d}", .{i}), "x", 0);
     try s.save("live", "x", 3600);
-    try std.testing.expect(mem.entries.count() < 100);
+    try std.testing.expect(mem.count() < 100);
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     try std.testing.expectEqualStrings("x", (try s.load(arena_state.allocator(), "live")).?);

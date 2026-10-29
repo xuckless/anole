@@ -339,7 +339,7 @@ fn encodeToString(source: lambda.Source, multi: bool, a: Answer, lost: *usize) !
     return out.toOwnedSlice();
 }
 
-test "lambda encode: isText table" {
+test "lambda encode: a body is text when its type is textual, it has no content-encoding and its parts are valid UTF-8 together" {
     const text: []const []const u8 = &.{"hello"};
     try testing.expect(isText(null, null, text));
     try testing.expect(isText("text/html; charset=utf-8", null, text));
@@ -365,7 +365,7 @@ test "lambda encode: isText table" {
     try testing.expect(!isText("text/plain", null, &.{ "a\xc3", "(" }));
 }
 
-test "lambda encode: REST multi-value" {
+test "lambda encode: a REST API answer carries every header in multiValueHeaders, Set-Cookie included" {
     var h = try headersOf(&.{ .{ "Content-Type", "application/json" }, .{ "Set-Cookie", "a=1" }, .{ "set-cookie", "b=2" } });
     defer h.deinit(testing.allocator);
     var lost: usize = 0;
@@ -377,7 +377,7 @@ test "lambda encode: REST multi-value" {
     );
 }
 
-test "lambda encode: HTTP API" {
+test "lambda encode: an HTTP API answer joins repeated headers and moves Set-Cookie to cookies (none without them)" {
     var h = try headersOf(&.{ .{ "Content-Type", "text/plain" }, .{ "Vary", "Accept-Encoding" }, .{ "Vary", "Origin" }, .{ "Set-Cookie", "a=1" }, .{ "Set-Cookie", "b=2" } });
     defer h.deinit(testing.allocator);
     var lost: usize = 0;
@@ -396,7 +396,7 @@ test "lambda encode: HTTP API" {
     try testing.expect(std.mem.indexOf(u8, none, "cookies") == null);
 }
 
-test "lambda encode: ALB" {
+test "lambda encode: ALB keeps every cookie with multi-value headers, and only the first (the rest counted lost) without" {
     var h = try headersOf(&.{ .{ "Content-Type", "text/plain" }, .{ "Set-Cookie", "a=1" }, .{ "Set-Cookie", "b=2" } });
     defer h.deinit(testing.allocator);
     var lost: usize = 0;
@@ -416,7 +416,7 @@ test "lambda encode: ALB" {
     try testing.expectEqual(@as(usize, 1), lost);
 }
 
-test "lambda encode: VPC Lattice" {
+test "lambda encode: a VPC Lattice answer has single-value headers and a text body" {
     var h = try headersOf(&.{.{ "Content-Type", "application/json" }});
     defer h.deinit(testing.allocator);
     var lost: usize = 0;
@@ -478,7 +478,7 @@ test "lambda encode: text escapes controls and quotes, keeps UTF-8" {
     try testing.expectEqualStrings("a\"b\\c\n\x01 caf\xc3\xa9", parsed.value.object.get("body").?.string);
 }
 
-test "lambda encode: prelude" {
+test "lambda encode: the streaming prelude carries the status, joined headers and cookies, and defaults the type to octet-stream" {
     var h = try headersOf(&.{ .{ "Content-Type", "text/event-stream" }, .{ "Set-Cookie", "s=1" }, .{ "X-A", "1" }, .{ "x-a", "2" } });
     defer h.deinit(testing.allocator);
     var out: std.Io.Writer.Allocating = .init(testing.allocator);

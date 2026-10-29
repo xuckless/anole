@@ -47,6 +47,25 @@ const TaskPtr = if (supported) @typeInfo(@typeInfo(@TypeOf(zio.currentTask)).@"f
 /// the deadlines are kept to about this.
 pub const sweep_interval: std.Io.Duration = .fromSeconds(1);
 
+/// Test builds only: a shorter sweep set by a test (time injection,
+/// TESTING.md D4), in nanoseconds; 0 for `sweep_interval`.
+var test_sweep_ns: std.atomic.Value(u64) = .init(0);
+
+/// Test builds only: sweeps every `interval` instead of `sweep_interval`
+/// (null restores it), for shelves that start after the call.
+pub fn setSweepIntervalForTest(interval: ?std.Io.Duration) void {
+    if (comptime !@import("builtin").is_test) @compileError("setSweepIntervalForTest is for tests");
+    test_sweep_ns.store(if (interval) |d| @intCast(d.nanoseconds) else 0, .monotonic);
+}
+
+fn sweepInterval() std.Io.Duration {
+    if (comptime @import("builtin").is_test) {
+        const ns = test_sweep_ns.load(.monotonic);
+        if (ns != 0) return .fromNanoseconds(ns);
+    }
+    return sweep_interval;
+}
+
 /// What a parked connection keeps for its shelf, in the connection's own
 /// heap state.
 pub const Parked = struct {
@@ -199,6 +218,9 @@ pub const Shelf = struct {
     long_park: std.Io.Duration,
     /// The tasks serving adopted connections on this executor (`Watch`).
     watches: std.DoublyLinkedList = .{},
+    /// Test builds only: connections ended by `sweep` because their
+    /// deadline passed while they were parked (not by the stop).
+    test_deadline_expired: if (@import("builtin").is_test) std.atomic.Value(u32) else void = if (@import("builtin").is_test) .init(0) else {},
 
     /// Registers the calling task, on the shelf's executor, for idle
     /// detection while it serves a connection: `unwatch` before it is done
@@ -299,6 +321,7 @@ pub const Shelf = struct {
         while (self.timed.first) |n| {
             const p: *Parked = @alignCast(@fieldParentPtr("node", n));
             if (p.deadline.?.nanoseconds > now.nanoseconds) break;
+            if (@import("builtin").is_test) _ = self.test_deadline_expired.fetchAdd(1, .monotonic);
             self.expire(p);
         }
     }
@@ -339,7 +362,7 @@ pub fn drive(shelf: *Shelf, io: std.Io) std.Io.Cancelable!void {
         shelf.closed = true;
         return;
     };
-    var next_sweep = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = sweep_interval, .clock = .awake });
+    var next_sweep = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = sweepInterval(), .clock = .awake });
     var next_look: ?std.Io.Clock.Timestamp = null;
     while (!shelf.closed or shelf.count.load(.monotonic) > 0) {
         const now = std.Io.Clock.Timestamp.now(io, .awake);
@@ -347,7 +370,7 @@ pub fn drive(shelf: *Shelf, io: std.Io) std.Io.Cancelable!void {
         // wakes would never let happen.
         if (now.compare(.gte, next_sweep)) {
             shelf.sweep(now.raw);
-            next_sweep = now.addDuration(.{ .raw = sweep_interval, .clock = .awake });
+            next_sweep = now.addDuration(.{ .raw = sweepInterval(), .clock = .awake });
         }
         if (shelf.watches.first == null) {
             next_look = null;

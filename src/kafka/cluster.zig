@@ -125,7 +125,7 @@ pub const Conn = struct {
             const hi = api.version();
             var found = false;
             for (r.apis) |a| {
-                if (a.key != @intFromEnum(api)) continue;
+                if (a.key != @backingInt(api)) continue;
                 found = true;
                 const use = @min(hi, a.max);
                 if (use < lo or use < a.min) {
@@ -190,7 +190,7 @@ pub const Conn = struct {
         self.correlation +%= 1;
         var e: protocol.Enc = .init(arena);
         const at = try e.reserveLen();
-        try e.i16_(@intFromEnum(api));
+        try e.i16_(@backingInt(api));
         try e.i16_(self.versions.get(api));
         try e.i32_(corr);
         try e.string(self.settings.client_id);
@@ -483,7 +483,7 @@ pub const Cluster = struct {
     }
 };
 
-test "parseHostPort" {
+test "kafka: host:port parsing takes bracketed IPv6 and defaults the port to 9092" {
     const a = parseHostPort("kafka-1:9093");
     try std.testing.expectEqualStrings("kafka-1", a.host);
     try std.testing.expectEqual(@as(u16, 9093), a.port);

@@ -211,6 +211,23 @@ pub const FakeBroker = struct {
         return g.members.items.len;
     }
 
+    /// How many partitions each member of the group was assigned, in
+    /// member order, written to `out`; null while a round is open (not
+    /// every member synced yet) or the group has more members than `out`.
+    pub fn assignedCounts(b: *FakeBroker, group_name: []const u8, out: []usize) ?[]usize {
+        b.mutex.lockUncancelable(b.io);
+        defer b.mutex.unlock(b.io);
+        const g = b.groups.get(group_name) orelse return null;
+        if (g.state != .stable or !g.synced or g.members.items.len > out.len) return null;
+        for (g.members.items, 0..) |m, i| {
+            var buf: [4096]u8 = undefined;
+            var fba: std.heap.FixedBufferAllocator = .init(&buf);
+            const parts = protocol.decodeAssignment(fba.allocator(), m.assignment) catch return null;
+            out[i] = parts.len;
+        }
+        return out[0..g.members.items.len];
+    }
+
     // Under `mutex`.
     fn topicOf(b: *FakeBroker, name: []const u8) !*Topic {
         if (b.topics.get(name)) |t| return t;
@@ -317,11 +334,11 @@ pub const FakeBroker = struct {
                 for (all) |a| {
                     var lo: i16 = 0;
                     var hi: i16 = a.version() + 1;
-                    for (b.config.serves) |r| if (r.key == @intFromEnum(a)) {
+                    for (b.config.serves) |r| if (r.key == @backingInt(a)) {
                         lo = r.min;
                         hi = r.max;
                     };
-                    try out.i16_(@intFromEnum(a));
+                    try out.i16_(@backingInt(a));
                     try out.i16_(lo);
                     try out.i16_(hi);
                 }

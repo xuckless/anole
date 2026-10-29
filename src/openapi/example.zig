@@ -11,7 +11,6 @@ const json = @import("json.zig");
 const declarations = @import("declarations.zig");
 const validate = @import("validate");
 
-
 /// How a value goes: in a request, in a response, or in a response body
 /// whose null fields are left out.
 pub const Way = enum {
@@ -108,7 +107,6 @@ fn string(comptime bytes: []const u8, comptime where: []const u8) json.Node {
 fn writesItself(comptime T: type, comptime where: []const u8) noreturn {
     @compileError("anole.openapi: " ++ where ++ ": " ++ @typeName(T) ++ " writes itself with jsonStringify, so its JSON is known only when the program runs; leave this value out of the document");
 }
-
 
 const testing = std.testing;
 

@@ -71,7 +71,7 @@ test "todos: typed routes, a 422 with the rules, a 409 and a 404" {
     try missing.expectStatus(.not_found);
 }
 
-test "server-sent events" {
+test "server-sent events: a created todo reaches an open /events stream with an id" {
     var state: app_main.App = undefined;
     var app = try start(&state);
     defer state.rooms.deinit();
@@ -139,7 +139,7 @@ test "bearer tokens: 401 without, 200 with; roles decide notes" {
     try refused.expectStatus(.forbidden);
 }
 
-test "API keys" {
+test "API keys: no key is 401, the right key reaches /service/stats as its owner" {
     var state: app_main.App = undefined;
     var app = try start(&state);
     defer state.rooms.deinit();
@@ -150,6 +150,11 @@ test "API keys" {
     var none = try t.get("/service/stats", .{});
     defer none.deinit();
     try none.expectStatus(.unauthorized);
+
+    var ok = try t.get("/service/stats", .{ .headers = &.{.{ "X-API-Key", api_key_text }} });
+    defer ok.deinit();
+    try ok.expectStatus(.ok);
+    try ok.expectJson(.{ .owner = "reporting-service", .requests = 42 });
 }
 
 test "gRPC service as REST and Connect" {
@@ -205,7 +210,17 @@ test "the chat: a message reaches both clients" {
             defer first.deinit();
             var second = try client.connectWebSocket(url, .{});
             defer second.deinit();
-            // Both are in the room once a message round trip works for both.
+            // The chat joins the room after the 101, so connecting is not
+            // enough: each client's own message coming back proves it is in
+            // the room. First, then second (whose message first sees too).
+            try first.send(.text, "a");
+            try std.testing.expectEqualStrings("a", (try first.receive()).data);
+            try second.send(.text, "b");
+            // Second may have joined in time for "a" or not: both are right.
+            var got = (try second.receive()).data;
+            if (std.mem.eql(u8, got, "a")) got = (try second.receive()).data;
+            try std.testing.expectEqualStrings("b", got);
+            try std.testing.expectEqualStrings("b", (try first.receive()).data);
             try first.send(.text, "hello");
             try std.testing.expectEqualStrings("hello", (try first.receive()).data);
             try std.testing.expectEqualStrings("hello", (try second.receive()).data);

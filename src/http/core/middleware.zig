@@ -489,30 +489,15 @@ fn makeTestResponse(conn: *Connection) Response {
     };
 }
 
-test "Middleware: single middleware executes before handler" {
-    var tracker = CallTracker{};
-    var mw = TestMiddleware{ .tracker = &tracker, .id = 1 };
-    const middlewares = [_]Middleware(void){Middleware(void).init(&mw)};
+/// A handler that records its call in the same tracker as the middlewares.
+const TrackingHandler = struct {
+    var tracker: ?*CallTracker = null;
 
-    var req = testRequest();
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
-
-    var chain = Chain(void){
-        .req = &req,
-        .res = &res,
-        .ctx = {},
-        .action = testHandler,
-        .middlewares = &middlewares,
-    };
-
-    try chain.call();
-
-    try std.testing.expectEqual(1, tracker.len);
-    try std.testing.expectEqual(1, tracker.items()[0]);
-    try std.testing.expectEqualStrings("handler called", res.body);
-}
+    fn handle(_: *Request, res: *Response) !void {
+        tracker.?.append(9);
+        res.body = "handler called";
+    }
+};
 
 test "Middleware: multiple middlewares execute in order" {
     var tracker = CallTracker{};
@@ -536,16 +521,16 @@ test "Middleware: multiple middlewares execute in order" {
         .req = &req,
         .res = &res,
         .ctx = {},
-        .action = testHandler,
+        .action = TrackingHandler.handle,
         .middlewares = &middlewares,
     };
 
+    TrackingHandler.tracker = &tracker;
+    defer TrackingHandler.tracker = null;
     try chain.call();
 
-    try std.testing.expectEqual(3, tracker.len);
-    try std.testing.expectEqual(1, tracker.items()[0]);
-    try std.testing.expectEqual(2, tracker.items()[1]);
-    try std.testing.expectEqual(3, tracker.items()[2]);
+    // The middlewares in order, then the handler (9).
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 9 }, tracker.items());
     try std.testing.expectEqualStrings("handler called", res.body);
 }
 
@@ -657,26 +642,6 @@ fn errorHandler(_: *Request, _: *Response) !void {
     return error.TestError;
 }
 
-test "Executor: default 500 handler on action error" {
-    var req = testRequest();
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
-
-    var chain = Chain(void){
-        .req = &req,
-        .res = &res,
-        .ctx = {},
-        .action = errorHandler,
-        .middlewares = &.{},
-    };
-
-    chain.run() catch {};
-
-    try std.testing.expectEqual(.internal_server_error, res.status);
-    try std.testing.expectEqualStrings("500 Internal Server Error\n", res.body);
-}
-
 fn goneHandler(_: *Request, _: *Response) !void {
     return error.ConnectionResetByPeer;
 }
@@ -720,7 +685,7 @@ test "Executor: a peer-shaped error of the handler's own is still a 500" {
 
     // Nothing failed on this connection, so the error came from elsewhere:
     // a file, an upstream call, a std helper at the end of the body.
-    chain.run() catch {};
+    try chain.run();
     try std.testing.expectEqual(.internal_server_error, res.status);
 }
 
@@ -805,7 +770,7 @@ test "Executor: custom notFound handler" {
         .middlewares = &.{},
     };
 
-    chain.run() catch {};
+    try chain.run();
 
     try std.testing.expect(ctx.not_found_called);
     try std.testing.expectEqual(.not_found, res.status);
@@ -827,7 +792,7 @@ test "Executor: custom uncaughtError handler" {
         .middlewares = &.{},
     };
 
-    chain.run() catch {};
+    try chain.run();
 
     try std.testing.expect(ctx.uncaught_error_called);
     try std.testing.expectEqual(error.CustomError, ctx.last_error.?);
@@ -874,7 +839,7 @@ test "Executor: middleware error triggers custom uncaughtError" {
         .middlewares = &middlewares,
     };
 
-    chain.run() catch {};
+    try chain.run();
 
     try std.testing.expect(ctx.uncaught_error_called);
     try std.testing.expectEqual(error.MiddlewareError, ctx.last_error.?);

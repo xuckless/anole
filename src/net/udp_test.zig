@@ -37,6 +37,7 @@ fn serveWith(app: *App, comptime check: fn (*App) anyerror!void) !void {
         }
     };
     var checking = try app.io().concurrent(Run.run, .{app});
+    defer checking.cancel(app.io()) catch {};
     try app.run();
     try checking.await(app.io());
 }
@@ -47,7 +48,7 @@ const Pong = struct {
     }
 };
 
-test "net udp: echo, the replies of a batch go out together" {
+test "net udp: twenty datagrams are each echoed and counted in and out" {
     var app = try App.init(alloc, .{ .executors = .exact(2) });
     defer app.deinit();
     try app.udp("127.0.0.1:0", Pong, .{});
@@ -83,8 +84,17 @@ test "net udp: echo, the replies of a batch go out together" {
             const st = a.netStats();
             try std.testing.expectEqual(@as(u64, 20), st.datagrams_in);
             try std.testing.expectEqual(@as(u64, 20), st.datagrams_out);
-            // UDP only: no TCP listener either (the core's 127.0.0.1:8080
-            // default used to be bound beside it).
+        }
+    }.run);
+}
+
+test "net udp: a UDP-only app binds no TCP listener" {
+    var app = try App.init(alloc, .{ .executors = .exact(1) });
+    defer app.deinit();
+    try app.udp("127.0.0.1:0", Pong, .{});
+    try serveWith(&app, struct {
+        fn run(a: *App) !void {
+            // The core's 127.0.0.1:8080 default used to be bound beside it.
             try std.testing.expectEqual(@as(usize, 0), a.addresses().len);
         }
     }.run);
@@ -194,7 +204,7 @@ test "net udp: send from another thread" {
     }.run);
 }
 
-test "net udp: options refused" {
+test "net udp: TLS, a Unix socket or PROXY protocol on a UDP listener make run() fail with a named error" {
     const expected_log = @import("../errors.zig").expectLog();
     defer expected_log.deinit();
     {

@@ -166,6 +166,9 @@ pub fn parseBrokers(arena: std.mem.Allocator, text: []const u8) !struct { list: 
 }
 
 pub const Client = struct {
+    /// The console's `/db` "system" for this connector.
+    pub const console_system = "kafka";
+
     gpa: std.mem.Allocator,
     io: std.Io,
     arena_state: std.heap.ArenaAllocator,

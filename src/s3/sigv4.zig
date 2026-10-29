@@ -334,8 +334,8 @@ const Stamp = struct {
         const md = yd.calculateMonthDay();
         const ds = es.getDaySeconds();
         _ = std.fmt.bufPrint(&self.buf, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
-            yd.year,                  md.month.numeric(),         md.day_index + 1,
-            ds.getHoursIntoDay(),     ds.getMinutesIntoHour(),    ds.getSecondsIntoMinute(),
+            yd.year,              md.month.numeric(),      md.day_index + 1,
+            ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
         }) catch unreachable;
     }
 
@@ -578,16 +578,17 @@ test "sigv4: header values are trimmed and inner blanks collapsed; user-agent is
     try testing.expect(std.mem.indexOf(u8, a.get("Authorization").?, "user-agent") == null);
 }
 
-test "sigv4: the signing key is derived once per day" {
-    var s: Signer = .init("us-east-1");
-    for (0..5) |i| {
-        var h: HeaderList = .{};
-        try s.sign(example_keys, example_time + @as(i64, @intCast(i)), .{ .method = "GET", .host = "h", .canonical_uri = "/" }, &h);
+test "sigv4: a signer reused across a UTC day boundary signs with the new day's key" {
+    const req: Request = .{ .method = "GET", .host = "h", .canonical_uri = "/" };
+    var reused: Signer = .init("us-east-1");
+    for ([_]i64{ example_time, example_time + 1, example_time + 86400 }) |t| {
+        var got: HeaderList = .{};
+        try reused.sign(example_keys, t, req, &got);
+        var fresh: Signer = .init("us-east-1");
+        var want: HeaderList = .{};
+        try fresh.sign(example_keys, t, req, &want);
+        try testing.expectEqualStrings(want.get("Authorization").?, got.get("Authorization").?);
     }
-    try testing.expectEqual(@as(u32, 1), s.derivations.load(.monotonic));
-    var h: HeaderList = .{};
-    try s.sign(example_keys, example_time + 86400, .{ .method = "GET", .host = "h", .canonical_uri = "/" }, &h);
-    try testing.expectEqual(@as(u32, 2), s.derivations.load(.monotonic));
 }
 
 test "sigv4: a session token is signed into the header, and into the query for a presign" {

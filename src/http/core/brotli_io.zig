@@ -49,9 +49,23 @@ fn brotliFree(_: ?*anyopaque, address: ?*anyopaque) callconv(.c) void {
 
 pub const State = c.BrotliEncoderState;
 
+/// Tests only: the encoders this thread made and has not freed, a leak
+/// signal for state that comes from `block_cache` rather than the testing
+/// allocator. Signed: an encoder freed on another thread than the one that
+/// made it moves both counts, and neither may trap.
+threadlocal var live_for_test: isize = 0;
+
+/// Tests only: how many encoders made on this thread are still alive
+/// (`init` without `deinit` or `destroy`).
+pub fn liveForTest() isize {
+    if (!@import("builtin").is_test) @compileError("liveForTest is for tests");
+    return live_for_test;
+}
+
 /// Frees an encoder whose `Compress` is gone (`Compress.state`).
 pub fn destroy(state: *State) void {
     c.BrotliEncoderDestroyInstance(state);
+    if (@import("builtin").is_test) live_for_test -= 1;
 }
 
 pub const Compress = struct {
@@ -86,11 +100,12 @@ pub const Compress = struct {
             if (c.BrotliEncoderSetParameter(state, c.BROTLI_PARAM_SIZE_HINT, hint) == c.BROTLI_FALSE) return error.CompressFailed;
         }
         self.state = state;
+        if (@import("builtin").is_test) live_for_test += 1;
     }
 
     /// Frees the encoder. Safe to call twice, and after a failed `init`.
     pub fn deinit(self: *Compress) void {
-        if (self.state) |state| c.BrotliEncoderDestroyInstance(state);
+        if (self.state) |state| destroy(state);
         self.state = null;
     }
 
@@ -226,6 +241,8 @@ test "brotli_io: an encoder's large blocks are reused by the next, and trimmed w
     defer text.deinit();
     for (0..400) |i| try text.writer.print("{{\"id\":{d},\"name\":\"item {d}\"}},", .{ i, i % 13 });
     const input = text.written();
+    // Other tests on this thread may have left blocks (up to `max_cached`).
+    block_cache.drainLocalForTest();
 
     var after_first: usize = 0;
     for (0..3) |round| {
@@ -253,10 +270,9 @@ test "brotli_io: an encoder's large blocks are reused by the next, and trimmed w
     var zs: [2]Compress = undefined;
     for (&zs, &outs) |*z, *o| try z.init(&o.writer, &.{}, .{});
     for (&zs) |*z| try z.writer.writeAll(input);
-    for (&zs) |*z| {
-        try z.finish();
-        z.deinit();
-    }
+    // Both finish (and hold their blocks) before either gives them back.
+    for (&zs) |*z| try z.finish();
+    for (&zs) |*z| z.deinit();
     try std.testing.expect(block_cache.cached().count > block_cache.trim_keep);
     block_cache.trimLocal(); // the low mark of the interval that just ended
     block_cache.trimLocal(); // nothing taken since: down to trim_keep

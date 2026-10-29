@@ -248,7 +248,7 @@ pub fn realEnv(environ: ?std.process.Environ, name: []const u8) ?[]const u8 {
 
 const testing = std.testing;
 
-test "Url: PostgreSQL, MongoDB, Redis and SQLite forms" {
+test "Url: PostgreSQL, MongoDB, Redis and SQLite URLs parse into hosts, credentials, database and parameters; malformed ones are refused" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();

@@ -387,7 +387,7 @@ fn expectIp(expected: []const u8, actual: ?std.Io.net.IpAddress) !void {
     try testing.expect(want.eql(&actual.?));
 }
 
-test "lambda event: REST GET" {
+test "lambda event: a REST API event gives method, target with the multi-value query in order, client IP, stage and body" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const in = try parseFixture(arena_state.allocator(), "apigw_multi_value_proxy_request", .{});
@@ -520,7 +520,7 @@ test "lambda event: ALB single and multi-value" {
     try expectIp("9.8.7.6", plain.client);
 }
 
-test "lambda event: VPC Lattice v2" {
+test "lambda event: VPC Lattice v2 events expand array headers and queries, decode base64 bodies and keep an inline query" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -573,7 +573,7 @@ test "lambda event: non-HTTP events carry the whole event as the body" {
     }
 }
 
-test "lambda event: invalid events" {
+test "lambda event: malformed events (not JSON, wrong types, bad base64, a relative path, v2 without a method) are InvalidEvent" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();

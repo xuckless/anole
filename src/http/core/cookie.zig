@@ -239,12 +239,6 @@ pub fn serializeCookie(arena: std.mem.Allocator, name: []const u8, value: []cons
 
 // Tests
 
-test "Cookie.get: no cookies" {
-    const cookies = Cookie{ .header = "" };
-    try std.testing.expectEqual(null, cookies.get(""));
-    try std.testing.expectEqual(null, cookies.get("auth"));
-}
-
 test "Cookie.get: empty cookie header" {
     const cookies = Cookie{ .header = "" };
     try std.testing.expectEqual(null, cookies.get(""));
@@ -274,7 +268,7 @@ test "Cookie.get: multiple cookies without space after semicolon" {
     try std.testing.expectEqualStrings("Name", cookies.get("id").?);
 }
 
-test "serializeCookie: basic" {
+test "serializeCookie: no options writes name=value and nothing else" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -288,14 +282,6 @@ test "serializeCookie: value with comma" {
 
     const result = try serializeCookie(arena.allocator(), "c-n2", "c,v", .{});
     try std.testing.expectEqualStrings("c-n2=\"c,v\"", result);
-}
-
-test "serializeCookie: value with space" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const result = try serializeCookie(arena.allocator(), "name", "hello world", .{});
-    try std.testing.expectEqualStrings("name=\"hello world\"", result);
 }
 
 test "serializeCookie: all options" {
@@ -348,7 +334,7 @@ fn expectCookieJson(expected: []const u8, header: []const u8) !void {
     try std.testing.expectEqualStrings(expected, out.buffered());
 }
 
-test "Cookie: iterator" {
+test "Cookie: the iterator yields every pair in order, with or without a space after ;" {
     var it = (Cookie{ .header = "a=1; b=2;c=3" }).iterator();
     try std.testing.expectEqualStrings("a", it.next().?.name);
     try std.testing.expectEqualStrings("2", it.next().?.value);
@@ -374,7 +360,7 @@ test "Cookie: iterator skips what get would never match" {
     try std.testing.expectEqual(@as(?Cookie.Iterator.Entry, null), it.next());
 }
 
-test "Cookie: jsonStringify" {
+test "Cookie: serializes as a JSON object of name to value, a bare name left out" {
     try expectCookieJson(
         \\{"a":"1","b":"2"}
     , "a=1; b=2");

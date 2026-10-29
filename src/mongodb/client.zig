@@ -186,6 +186,9 @@ const SessionPool = struct {
 ///     const users = app.db.collection("users");
 ///     const user = try users.findOne(User, req, .{ .email = email }, .{});
 pub const Client = struct {
+    /// The console's `/db` "system" for this connector.
+    pub const console_system = "mongodb";
+
     gpa: std.mem.Allocator,
     io: std.Io,
     /// The connection string, the credential, the metadata: the client's
