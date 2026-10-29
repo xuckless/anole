@@ -113,18 +113,12 @@ test "capi config: watches name their database and exactly one source" {
     , "is not valid");
 }
 
-// The needle stays "main" (S1.5 verdict: "is SQLite, which has no change
-// feed", config.zig's message): that message cannot be reached. A watch is
-// postgres, redis, redis_stream or mongodb, and each first checks that its
-// database is of that kind, so a SQLite database is always refused as "is
-// not PostgreSQL/Redis/MongoDB" before the SQLite check. Reported to the
-// lead, product left as it is (the rewrite revealed it).
 test "capi config: a watch on SQLite says it has no change feed" {
     if (comptime !features.sqlite) return error.SkipZigTest;
     try expectRefused(
         \\{"databases":[{"name":"main","sqlite":{"path":":memory:"}}],
         \\ "watches":[{"name":"a","database":"main","postgres":{"channels":["a"]}}]}
-    , "main");
+    , "is SQLite, which has no change feed");
 }
 
 // ---------------------------------------------------------------------------
