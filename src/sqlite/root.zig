@@ -61,6 +61,7 @@
 //! tuple for `?` (or `?NNN`) in order, of the same types; a `Time` is
 //! stored as text in SQLite's own format (`2026-10-21 09:30:00.25`, UTC).
 const std = @import("std");
+const builtin = @import("builtin");
 const safety = @import("anole_safety");
 const sqlite = @import("anole_sqlite");
 const db = @import("../db/root.zig");
@@ -71,6 +72,10 @@ const observe = @import("../observe/root.zig");
 
 /// SQLite's C API (sqlite3.h, as built), for what Anole's calls leave out.
 pub const c = sqlite.c;
+
+/// Test hook: on the writer thread, after a job ran and while it still
+/// counts as running (a canceled caller interrupts it then).
+pub var test_after_job: ?*const fn (std.Io, ?*c.sqlite3) void = null;
 /// xuckless/zig-sqlite, the driver under `Conn.run`: user functions,
 /// blobs, backups, virtual tables.
 pub const driver = sqlite;
@@ -1155,6 +1160,7 @@ const Writer = struct {
             w.running = job;
             w.mutex.unlock(io);
             job.run(job);
+            if (builtin.is_test) if (test_after_job) |f| f(io, w.conn.handle.db);
             w.mutex.lockUncancelable(io);
             w.running = null;
             w.mutex.unlock(io);

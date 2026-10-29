@@ -1138,6 +1138,75 @@ test "sqlite: a writer released twice leaves the next holder's transaction alone
     try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
+/// T-S3's hook, on the writer thread after a job ran: holds the job
+/// running until its canceled caller has interrupted it.
+const BeginCanceled = struct {
+    var armed: std.atomic.Value(bool) = .init(false);
+    var ran: std.atomic.Value(bool) = .init(false);
+
+    fn afterJob(io: std.Io, handle: ?*c.sqlite3) void {
+        if (!armed.swap(false, .acq_rel)) return;
+        ran.store(true, .release);
+        // The deadline is a hang guard.
+        const until = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = wait.deadline(), .clock = .awake });
+        while (c.sqlite3_is_interrupted(handle) == 0) {
+            if (until.untilNow(io).raw.nanoseconds >= 0) return;
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn hasRun(_: void) bool {
+        return ran.load(.acquire);
+    }
+
+    fn begin(db: *sqlite.Client, io: std.Io, failure: *?anyerror) void {
+        var sc: Scratch = undefined;
+        sc.init(io);
+        defer sc.deinit();
+        var tx = db.begin(&sc.ctx, .{}) catch |err| {
+            if (err != error.Canceled) failure.* = err;
+            return;
+        };
+        // Not canceled in time (the BEGIN ran and returned first).
+        tx.deinit();
+        failure.* = error.NotCanceled;
+    }
+};
+
+test "sqlite: a begin canceled while its BEGIN runs gives the writer back with no transaction open" {
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+
+    BeginCanceled.ran.store(false, .release);
+    BeginCanceled.armed.store(true, .release);
+    sqlite.test_after_job = BeginCanceled.afterJob;
+    defer sqlite.test_after_job = null;
+    defer BeginCanceled.armed.store(false, .release);
+    var failure: ?anyerror = null;
+    var task = try io.concurrent(BeginCanceled.begin, .{ db, io, &failure });
+    // The BEGIN has run on the writer thread; its caller still waits.
+    try wait.waitUntil(io, "the BEGIN run", {}, BeginCanceled.hasRun);
+    task.cancel(io);
+    if (failure) |err| return err;
+    // The next holder begins a transaction of its own.
+    var tx = try db.begin(ctx, .{});
+    defer tx.deinit();
+    _ = try tx.exec(ctx, "INSERT INTO notes (title) VALUES ('kept')", .{});
+    try tx.commit(ctx);
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
 /// Tasks that hold a connection until `go` is set (B-1).
 const Holders = struct {
     db: *sqlite.Client,
