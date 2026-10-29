@@ -185,6 +185,9 @@ breaking changes are listed anyway.
   drain now waits for each connection's lingering close (until the peer
   closes its side, one second at most, within `timeouts.shutdown`), as Go
   and Envoy do (#135).
+- C ABI config: a watch on a SQLite database is refused with "is SQLite,
+  which has no change feed"; it said the database was not PostgreSQL (or
+  Redis, MongoDB), which hid the reason.
 
 ### Changed
 
