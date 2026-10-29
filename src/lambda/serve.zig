@@ -24,8 +24,6 @@ const log = std.log.scoped(.anole);
 pub var _test_clock_offset_ms: std.atomic.Value(i64) = .init(0);
 /// Tests: stands for AWS_LAMBDA_INITIALIZATION_TYPE.
 pub var _test_initialization_type: ?[]const u8 = null;
-/// Tests: how many times idle connections were closed.
-pub var _test_close_idle_count: std.atomic.Value(u32) = .init(0);
 
 /// `/next` failing this many times in a row ends `run`.
 const max_next_failures = 3;
@@ -259,7 +257,6 @@ fn Worker(comptime Ctx: type, comptime App: type) type {
                     const gap = now - t;
                     if (gap > d.toMilliseconds()) {
                         app.closeIdleConnections();
-                        _ = _test_close_idle_count.fetchAdd(1, .monotonic);
                         log.debug("lambda: {d} s since the last invocation; closed idle connections", .{@divTrunc(gap, 1000)});
                     }
                 };
