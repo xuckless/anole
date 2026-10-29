@@ -13,7 +13,9 @@
 //! and a SIGABRT handler); a failed test names its error (the
 //! server-mode runner printed only the trace); and a run with
 //! ANOLE_TEST_CHILD set runs only the tests whose names contain it
-//! (src/safety/child.zig, for tests whose claim is a panic). The fuzzing
+//! (src/safety/child.zig, for tests whose claim is a panic); ANOLE_TEST_SHARD
+//! runs one shard of the tests (`shard`) and ANOLE_TEST_DURATIONS records
+//! each test's duration (`durations`). The fuzzing
 //! loops keep `std.heap.page_allocator` (an mprotect per bucket costs a
 //! fuzzer's throughput). Re-copy it when moving to the next
 //! Zig version and apply the change again (`ANOLE:` marks it).
@@ -591,6 +593,96 @@ pub const std_options: std.Options = .{
     .logFn = log,
 };
 
+/// ANOLE: test sharding (Bazel's TEST_SHARD_INDEX/TEST_TOTAL_SHARDS,
+/// adapted). With ANOLE_TEST_SHARD=i/n the binary runs only the tests whose
+/// index in `builtin.test_functions` is i modulo n: in server mode its
+/// metadata answer lists only those, and the build runner's indices (into
+/// that list) are mapped back through `indexes`. build.zig's
+/// `-Dtest-shards=N` runs one process per shard of the same binary, in
+/// parallel. The map is made at startup from the environment, so a runner
+/// restarted after a timeout or crash agrees with the first one.
+const shard = struct {
+    var indexes: []u32 = &.{};
+    var len: usize = 0;
+    /// "i/n" for the durations file, empty when not sharded.
+    var label: []const u8 = "";
+
+    fn setup(environ: std.process.Environ) void {
+        indexes = std.heap.page_allocator.alloc(u32, builtin.test_functions.len) catch @panic("OOM");
+        for (indexes, 0..) |*x, i| x.* = @intCast(i);
+        len = indexes.len;
+        const v = environ.getAlloc(std.heap.page_allocator, "ANOLE_TEST_SHARD") catch return;
+        if (v.len == 0) return;
+        const slash = std.mem.indexOfScalar(u8, v, '/') orelse badValue(v);
+        const i = std.fmt.parseUnsigned(u32, v[0..slash], 10) catch badValue(v);
+        const n = std.fmt.parseUnsigned(u32, v[slash + 1 ..], 10) catch badValue(v);
+        if (n == 0 or i >= n) badValue(v);
+        label = v;
+        len = 0;
+        for (0..builtin.test_functions.len) |t| {
+            if (t % n != i) continue;
+            indexes[len] = @intCast(t);
+            len += 1;
+        }
+    }
+
+    fn badValue(v: []const u8) noreturn {
+        std.debug.print("ANOLE_TEST_SHARD={s}: expected <index>/<count> with index < count\n", .{v});
+        std.process.exit(1);
+    }
+
+    fn list() []const u32 {
+        return indexes[0..len];
+    }
+};
+
+/// ANOLE: per-test durations (pytest's --durations, nextest's slow-test
+/// report). With ANOLE_TEST_DURATIONS=<path> each test appends
+/// `<ns>\t<result>\t<name>\t<binary>` to the file, where binary is the
+/// executable's name plus `#i/n` for a shard. Each line is one O_APPEND
+/// write, so the shards of one run can share the file, and a runner the
+/// build runner restarts keeps appending. tools/test_durations.py
+/// summarizes it. Local only (the durations never gate CI, TESTING.md D6);
+/// POSIX only. src/http/core/test_runner.zig has the same helper.
+const durations = struct {
+    var path: ?[]const u8 = null;
+    var binary: []const u8 = "";
+
+    fn setup(environ: std.process.Environ, argv0: []const u8) void {
+        if (comptime builtin.os.tag == .windows) return;
+        const p = environ.getAlloc(std.heap.page_allocator, "ANOLE_TEST_DURATIONS") catch return;
+        if (p.len == 0) return;
+        path = p;
+        const base = std.fs.path.basename(argv0);
+        binary = if (shard.label.len == 0) base else std.fmt.allocPrint(std.heap.page_allocator, "{s}#{s}", .{ base, shard.label }) catch base;
+    }
+
+    fn record(name: []const u8, ns: u64, result: []const u8) void {
+        if (comptime builtin.os.tag == .windows) return;
+        const p = path orelse return;
+        var buf: [4096]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "{d}\t{s}\t{s}\t{s}\n", .{ ns, result, name, binary }) catch return;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, p, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o644) catch |err| {
+            std.debug.print("ANOLE_TEST_DURATIONS={s}: cannot open it ({t}); no durations recorded\n", .{ p, err });
+            path = null;
+            return;
+        };
+        defer _ = std.posix.system.close(fd);
+        var rest: []const u8 = line;
+        while (rest.len > 0) {
+            const rc = std.posix.system.write(fd, rest.ptr, rest.len);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) return;
+                    rest = rest[@intCast(rc)..];
+                },
+                .INTR => continue,
+                else => return,
+            }
+        }
+    }
+};
+
 var log_err_count: usize = 0;
 var fba: std.heap.FixedBufferAllocator = .init(&fba_buffer);
 var fba_buffer: [8192]u8 = undefined;
@@ -648,6 +740,8 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     watchdog.setup(init.environ); // ANOLE
     captured.setup(); // ANOLE
+    shard.setup(init.environ); // ANOLE
+    durations.setup(init.environ, if (args.len > 0) args[0] else "test"); // ANOLE
 
     if (listen) {
         return mainServer(init) catch |err| panicf("internal test runner failure: {t}", .{err});
@@ -681,13 +775,15 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 defer string_bytes.deinit(gpa);
                 try string_bytes.append(gpa, 0); // Reserve 0 for null.
 
-                const test_fns = builtin.test_functions;
-                const names = try gpa.alloc(u32, test_fns.len);
+                // ANOLE: only this shard's tests (`shard`).
+                const shard_list = shard.list();
+                const names = try gpa.alloc(u32, shard_list.len);
                 defer gpa.free(names);
-                const expected_panic_msgs = try gpa.alloc(u32, test_fns.len);
+                const expected_panic_msgs = try gpa.alloc(u32, shard_list.len);
                 defer gpa.free(expected_panic_msgs);
 
-                for (test_fns, names, expected_panic_msgs) |test_fn, *name, *expected_panic_msg| {
+                for (shard_list, names, expected_panic_msgs) |fn_index, *name, *expected_panic_msg| {
+                    const test_fn = builtin.test_functions[fn_index];
                     name.* = @intCast(string_bytes.items.len);
                     try string_bytes.ensureUnusedCapacity(gpa, test_fn.name.len + 1);
                     string_bytes.appendSliceAssumeCapacity(test_fn.name);
@@ -714,14 +810,17 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 });
                 log_err_count = 0;
                 const index = try server.receiveBody_u32();
-                const test_fn = builtin.test_functions[index];
+                // ANOLE: the build runner's index is into this shard's list.
+                const fn_index = shard.list()[index];
+                const test_fn = builtin.test_functions[fn_index];
                 is_fuzz_test = false;
 
                 // let the build server know we're starting the test now
                 try server.serveStringMessage(.test_started, &.{});
                 // ANOLE: from here to the results, as the build runner's
                 // per-test limit counts it.
-                watchdog.begin(index);
+                watchdog.begin(fn_index);
+                const started_ns = watchdog.now(); // ANOLE
 
                 const TestResults = std.zig.Server.Message.TestResults;
                 const status: TestResults.Status = if (runTest(test_fn)) |v| s: { // ANOLE
@@ -747,6 +846,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 // error logged too; held lines go with it, else nowhere.
                 captured.end(leak_count != 0 or log_err_count != 0);
                 watchdog.end(); // ANOLE
+                durations.record(test_fn.name, watchdog.now() -| started_ns, if (leak_count != 0) "leak" else @tagName(status)); // ANOLE
                 try server.serveTestResults(.{
                     .index = index,
                     .flags = .{
@@ -872,6 +972,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
     var leaks: usize = 0;
     for (test_fn_list, 0..) |test_fn, i| {
         if (only) |o| if (std.mem.indexOf(u8, test_fn.name, o) == null) continue; // ANOLE
+        if (std.mem.indexOfScalar(u32, shard.list(), @intCast(i)) == null) continue; // ANOLE
         testing.allocator_instance = .init(never_reuse.allocator, .{ // ANOLE
             .canary = 0xc3a701ba,
             .check_write_after_free = true,
@@ -884,6 +985,8 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
         // after it, so a leak shows the test's held lines (as in server
         // mode).
         watchdog.begin(i);
+        const started_ns = watchdog.now(); // ANOLE
+        var result: []const u8 = "fail"; // ANOLE
         const errs_before = log_err_count;
         defer {
             testing.io_instance.deinit();
@@ -891,6 +994,7 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
             if (leaked) leaks += 1;
             captured.end(leaked or log_err_count != errs_before);
             watchdog.end();
+            durations.record(test_fn.name, watchdog.now() -| started_ns, if (leaked) "leak" else result); // ANOLE
         }
         testing.log_level = .warn;
         testing.environ = init.environ;
@@ -902,11 +1006,13 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
         is_fuzz_test = false;
         if (runTest(test_fn)) |_| { // ANOLE
             ok_count += 1;
+            result = "pass"; // ANOLE
             test_node.end();
             if (!have_tty) std.debug.print("OK\n", .{});
         } else |err| switch (err) {
             error.SkipZigTest => {
                 skip_count += 1;
+                result = "skip"; // ANOLE
                 if (have_tty) {
                     std.debug.print("{d}/{d} {s}...SKIP\n", .{ i + 1, test_fn_list.len, test_fn.name });
                 } else {

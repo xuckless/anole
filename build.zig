@@ -764,9 +764,15 @@ pub fn build(b: *std.Build) void {
         .root_module = anoleModule(b, .{ .features = features, .core = core, .c = c_mods, .bson = bson_mod, .target = target, .optimize = optimize, .for_test = true, .redis_test_port = redis_test_port, .redis_test_url = redis_test_url, .postgres_test_url = postgres_test_url, .mongodb_test_url = mongodb_test_url, .nats_test_url = nats_test_url, .kafka_test_url = kafka_test_url, .s3_test_url = s3_test_url, .smtp_test_url = smtp_test_url, .mailpit_api_url = mailpit_api_url }),
         .use_llvm = use_llvm,
     });
-    const run_tests = b.addRunArtifact(tests);
-    run_tests.skip_foreign_checks = true;
-    test_step.dependOn(&run_tests.step);
+    // `-Dtest-shards=N` runs the main suite as N processes of the same
+    // binary in parallel (ANOLE_TEST_SHARD=i/N, src/safety/test_runner.zig)
+    // and the HTTP core's as N/2; each shard's tests are its index modulo N.
+    const test_shards = b.option(u32, "test-shards", "Run anole-test as N parallel shards and core-test as N/2 (default 1)") orelse 1;
+    if (test_shards == 0) @panic("-Dtest-shards must be at least 1");
+    for (addShardedRuns(b, tests, test_shards)) |run_tests| {
+        run_tests.skip_foreign_checks = true;
+        test_step.dependOn(&run_tests.step);
+    }
     // test-timing: the main and the HTTP core's suites again, the same
     // binaries run with ANOLE_TEST_TIMING=1 (src/testing/wait.zig): the
     // elapsed-time bounds a test checks only `if (wait.timing())`, and the
@@ -1065,7 +1071,7 @@ pub fn build(b: *std.Build) void {
             .test_runner = .{ .path = b.path("src/http/core/test_runner.zig"), .mode = .simple },
             .use_llvm = use_llvm,
         });
-        const run_core_tests = b.addRunArtifact(core_tests);
+        const core_runs = addShardedRuns(b, core_tests, @max(1, test_shards / 2));
         compile_tests_step.dependOn(&core_tests.step);
         // The TLS tests open certs/cert.pem and certs/key.pem from where
         // they run: a certificate made now by tests/test_cert.zig, so no
@@ -1080,8 +1086,12 @@ pub fn build(b: *std.Build) void {
             }),
         }));
         const certs_dir = make_cert.addOutputDirectoryArg("certs").dirname();
-        run_core_tests.setCwd(certs_dir);
-        test_step.dependOn(&run_core_tests.step);
+        const core_test_step = b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng, zstd and Brotli");
+        for (core_runs) |run_core_tests| {
+            run_core_tests.setCwd(certs_dir);
+            test_step.dependOn(&run_core_tests.step);
+            core_test_step.dependOn(&run_core_tests.step);
+        }
         // test-timing: the core's tests again, with ANOLE_TEST_TIMING=1
         // (see test-timing above).
         {
@@ -1101,7 +1111,6 @@ pub fn build(b: *std.Build) void {
             .use_llvm = use_llvm,
         });
         test_step.dependOn(&b.addRunArtifact(core_fuzz).step);
-        b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng, zstd and Brotli").dependOn(&run_core_tests.step);
     }
 
     // test-flags: one test binary per preset and edge combination. Each gets its
@@ -2012,6 +2021,25 @@ const LlHttp = struct {
         return .{ .mod = tc.createModule(), .lib = lib };
     }
 };
+
+/// One run of `tests` per shard (`-Dtest-shards`): each gets
+/// ANOLE_TEST_SHARD=i/n, which both test runners read, so the shards run in
+/// parallel as separate processes of one binary. With
+/// ANOLE_TEST_DURATIONS set (tools/test_durations.py) the runs always run,
+/// as a cached result would record nothing.
+fn addShardedRuns(b: *std.Build, tests: *std.Build.Step.Compile, n: u32) []const *std.Build.Step.Run {
+    const runs = b.allocator.alloc(*std.Build.Step.Run, n) catch @panic("OOM");
+    const want_durations = if (b.graph.environ_map.get("ANOLE_TEST_DURATIONS")) |p| p.len > 0 else false;
+    for (runs, 0..) |*r, i| {
+        r.* = b.addRunArtifact(tests);
+        if (n > 1) {
+            r.*.setName(b.fmt("run test {s} {d}/{d}", .{ tests.name, i, n }));
+            r.*.setEnvironmentVariable("ANOLE_TEST_SHARD", b.fmt("{d}/{d}", .{ i, n }));
+        }
+        if (want_durations) r.*.has_side_effects = true;
+    }
+    return runs;
+}
 
 /// `b.addTest` with src/safety/test_runner.zig: Zig's default test runner
 /// with the test allocator backed by memory that is never reused, failing a
