@@ -276,6 +276,12 @@ breaking changes are listed anyway.
   10 minutes. With neither, the interop steps are skipped with a warning
   that names the outage, instead of failing as if a test had (Ubuntu's own
   tshark is too old for the runner); the release checks still fail (#54).
+- `zig build lint` (SAFETY.md E2) checks the sources against a ratchet
+  baseline, `tools/safety_lint.baseline.tsv`: a per file and rule count of
+  today's hits that may only go down. `-Dlint-update` lowers it; a new CI
+  job runs the check. The lint now parses with `std.zig.Ast` and adds two
+  rules: raw locks outside `src/safety/` (L2/L4) and runtime wakes in the C
+  ABI outside an `IoGate` (T5).
 
 ## 0.4.0 (2026-10-25)
 
