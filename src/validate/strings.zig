@@ -1150,6 +1150,15 @@ test "a strong password counts code points, ASCII letters and digits, and 34 sym
     var more_symbols = options;
     more_symbols.min_symbols = 4;
     try t.expect(!isStrongPassword(password, more_symbols));
+    var more_lowercase = options;
+    more_lowercase.min_lowercase = 2;
+    try t.expect(!isStrongPassword(password, more_lowercase));
+    var more_uppercase = options;
+    more_uppercase.min_uppercase = 2;
+    try t.expect(!isStrongPassword(password, more_uppercase));
+    var more_numbers = options;
+    more_numbers.min_numbers = 2;
+    try t.expect(!isStrongPassword(password, more_numbers));
     try t.expect(!isStrongPassword("Ab1!\xff", .{ .min_length = 1, .min_lowercase = 0, .min_uppercase = 0, .min_numbers = 0, .min_symbols = 0 }));
     var symbols: usize = 0;
     var cp: u21 = 0;

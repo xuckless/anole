@@ -40,7 +40,7 @@ pub fn isJson(s: []const u8) bool {
     var buf: [json_stack_bytes]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&buf);
     var scanner: std.json.Scanner = .initCompleteInput(fba.allocator(), s);
-    // The scanner's only allocation, which fills `buf` exactly; if a release
+    // The scanner's only allocation, which fits in `buf`; if a release
     // of std grew differently, every input would fail (the json tests below).
     scanner.ensureTotalStackCapacity(core.max_json_depth + 1) catch return false;
     var first = true;
