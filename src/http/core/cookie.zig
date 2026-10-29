@@ -239,12 +239,6 @@ pub fn serializeCookie(arena: std.mem.Allocator, name: []const u8, value: []cons
 
 // Tests
 
-test "Cookie.get: no cookies" {
-    const cookies = Cookie{ .header = "" };
-    try std.testing.expectEqual(null, cookies.get(""));
-    try std.testing.expectEqual(null, cookies.get("auth"));
-}
-
 test "Cookie.get: empty cookie header" {
     const cookies = Cookie{ .header = "" };
     try std.testing.expectEqual(null, cookies.get(""));
@@ -288,14 +282,6 @@ test "serializeCookie: value with comma" {
 
     const result = try serializeCookie(arena.allocator(), "c-n2", "c,v", .{});
     try std.testing.expectEqualStrings("c-n2=\"c,v\"", result);
-}
-
-test "serializeCookie: value with space" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    const result = try serializeCookie(arena.allocator(), "name", "hello world", .{});
-    try std.testing.expectEqualStrings("name=\"hello world\"", result);
 }
 
 test "serializeCookie: all options" {

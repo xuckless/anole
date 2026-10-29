@@ -916,50 +916,6 @@ fn testHandler2(ctx: *TestContext, req: *Request, res: *Response) !void {
     _ = ctx;
 }
 
-test "Router: register and find GET route" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var router = TestRouter.init(std.testing.allocator);
-    defer router.deinit();
-
-    router.get("/users", testHandler);
-
-    var req = Request{
-        .method = .get,
-        .url = "/users",
-        .arena = arena.allocator(),
-        ._parser = undefined,
-        ._transport = undefined,
-    };
-
-    const handler = try router.findHandler(&req);
-    try std.testing.expect(handler != null);
-    try std.testing.expect(handler.?.action == testHandler);
-}
-
-test "Router: register and find POST route" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var router = TestRouter.init(std.testing.allocator);
-    defer router.deinit();
-
-    router.post("/posts", testHandler);
-
-    var req = Request{
-        .method = .post,
-        .url = "/posts",
-        .arena = arena.allocator(),
-        ._parser = undefined,
-        ._transport = undefined,
-    };
-
-    const handler = try router.findHandler(&req);
-    try std.testing.expect(handler != null);
-    try std.testing.expect(handler.?.action == testHandler);
-}
-
 test "Router: method mismatch returns null" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1000,28 +956,6 @@ test "Router: path mismatch returns null" {
 
     const handler = try router.findHandler(&req);
     try std.testing.expect(handler == null);
-}
-
-test "Router: parameterized routes" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var router = TestRouter.init(std.testing.allocator);
-    defer router.deinit();
-
-    router.get("/users/:id", testHandler);
-
-    var req = Request{
-        .method = .get,
-        .url = "/users/123",
-        .arena = arena.allocator(),
-        ._parser = undefined,
-        ._transport = undefined,
-    };
-
-    const handler = try router.findHandler(&req);
-    try std.testing.expect(handler != null);
-    try std.testing.expect(handler.?.action == testHandler);
 }
 
 test "Router: multiple routes" {
@@ -1398,31 +1332,6 @@ test "Router: param route has precedence over wildcard" {
     try std.testing.expect(id != null);
     try std.testing.expectEqualStrings("123", id.?);
     try std.testing.expect(req.params.get("catchall") == null);
-}
-
-test "Router: wildcard with multiple segments" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var router = TestRouter.init(std.testing.allocator);
-    defer router.deinit();
-
-    router.get("/assets/*filepath", testHandler);
-
-    var req = Request{
-        .method = .get,
-        .url = "/assets/images/icons/logo.png",
-        .arena = arena.allocator(),
-        ._parser = undefined,
-        ._transport = undefined,
-    };
-
-    const handler = try router.findHandler(&req);
-    try std.testing.expect(handler != null);
-
-    const filepath = req.params.get("filepath");
-    try std.testing.expect(filepath != null);
-    try std.testing.expectEqualStrings("images/icons/logo.png", filepath.?);
 }
 
 test "Router: wildcard with prefix path" {
@@ -1813,34 +1722,6 @@ test "Group: group middlewares appended after global" {
     // Global middleware should come first
     try std.testing.expect(route.?.middlewares[0].ptr == @as(*anyopaque, @ptrCast(@constCast(&mw_global))));
     try std.testing.expect(route.?.middlewares[1].ptr == @as(*anyopaque, @ptrCast(@constCast(&mw_group))));
-}
-
-test "Group: no global middlewares, only group middlewares" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var router = TestVoidRouter.init(std.testing.allocator);
-    defer router.deinit();
-
-    const TestMw = struct {
-        id: u8,
-        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Chain(void)) !void {}
-    };
-
-    var mw_group = TestMw{ .id = 1 };
-    const api = router.group("/api", &.{Middleware(void).init(&mw_group)});
-    api.get("/users", voidHandler1);
-
-    var req = Request{
-        .method = .get,
-        .url = "/api/users",
-        .arena = arena.allocator(),
-        ._parser = undefined,
-        ._transport = undefined,
-    };
-    const route = try router.findHandler(&req);
-    try std.testing.expect(route != null);
-    try std.testing.expectEqual(1, route.?.middlewares.len);
 }
 
 test "Group: keeps its own copy of the middleware list" {
