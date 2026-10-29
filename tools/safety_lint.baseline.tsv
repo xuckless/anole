@@ -30,7 +30,7 @@ src/capi/lib.zig	U3	22
 src/capi/nats.zig	C3	1
 src/capi/nats.zig	L2	2
 src/capi/nats.zig	U3	10
-src/capi/net.zig	U3	16
+src/capi/net.zig	U3	15
 src/capi/s3.zig	L2	2
 src/capi/s3.zig	U3	16
 src/capi/smtp.zig	L2	1
