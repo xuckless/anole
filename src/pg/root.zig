@@ -2067,6 +2067,9 @@ fn environ(comptime vars: []const [:0]const u8) std.process.Environ {
 }
 
 test "pg: settings: libpq's defaults, a full URL and a Unix socket; the password stays out of the printed URL" {
+    // Windows: `.environ` is not read there (db.realEnv asks the process
+    // environment), so the runner's own PG* variables would leak in.
+    if (@TypeOf(std.process.Environ.empty.block) != std.process.Environ.PosixBlock) return error.SkipZigTest;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2109,6 +2112,9 @@ test "pg: settings: libpq's defaults, a full URL and a Unix socket; the password
 }
 
 test "pg: settings: with a CA given in code the URL cannot turn the check off" {
+    // Windows: `.environ` is not read there (db.realEnv asks the process
+    // environment), so the runner's own PG* variables would leak in.
+    if (@TypeOf(std.process.Environ.empty.block) != std.process.Environ.PosixBlock) return error.SkipZigTest;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2124,6 +2130,9 @@ test "pg: settings: with a CA given in code the URL cannot turn the check off" {
 }
 
 test "pg: settings: insecure_skip_verify is TLS without checking, refused with a CA or an sslmode that verifies or disables" {
+    // Windows: `.environ` is not read there (db.realEnv asks the process
+    // environment), so the runner's own PG* variables would leak in.
+    if (@TypeOf(std.process.Environ.empty.block) != std.process.Environ.PosixBlock) return error.SkipZigTest;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2138,6 +2147,9 @@ test "pg: settings: insecure_skip_verify is TLS without checking, refused with a
 }
 
 test "pg: settings: the default sslmode and auth methods by host, and Options.sslmode under the URL's" {
+    // Windows: `.environ` is not read there (db.realEnv asks the process
+    // environment), so the runner's own PG* variables would leak in.
+    if (@TypeOf(std.process.Environ.empty.block) != std.process.Environ.PosixBlock) return error.SkipZigTest;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2171,6 +2183,9 @@ test "pg: settings: the default sslmode and auth methods by host, and Options.ss
 }
 
 test "pg: settings: require_auth and channel_binding from the URL; require with a root certificate checks the chain" {
+    // Windows: `.environ` is not read there (db.realEnv asks the process
+    // environment), so the runner's own PG* variables would leak in.
+    if (@TypeOf(std.process.Environ.empty.block) != std.process.Environ.PosixBlock) return error.SkipZigTest;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -2231,6 +2246,9 @@ test "pg: settings: the PG* variables fill in what the URL leaves out, DATABASE_
 }
 
 test "pg: settings: a bad URL is refused with its reason, the password never in it" {
+    // Windows: `.environ` is not read there (db.realEnv asks the process
+    // environment), so the runner's own PG* variables would leak in.
+    if (@TypeOf(std.process.Environ.empty.block) != std.process.Environ.PosixBlock) return error.SkipZigTest;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
