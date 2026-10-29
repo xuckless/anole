@@ -2731,6 +2731,40 @@ test "StreamingBodyWriter: never writes past a declared Content-Length" {
     try std.testing.expect(std.mem.indexOf(u8, conn_writer.buffered(), "then") == null);
 }
 
+test "Response: a body set after an abandoned stream is not sent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    try response.header("Content-Length", "11");
+
+    var body_buf: [4]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.writeAll("abc");
+    try body.interface.flush();
+    // The handler gives up without `end`, and something after it sets a
+    // body directly. The head promised 11 bytes and 3 went out: the rest
+    // cannot be filled with other text, so the body stays short and the
+    // connection is not reused.
+    response.body = "an error message";
+    try response.write();
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 11\r\n" ++
+            "\r\n" ++
+            "abc",
+        conn_writer.buffered(),
+    );
+    try std.testing.expect(!response.keepalive);
+}
+
 test "Response: framing headers are the server's" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
