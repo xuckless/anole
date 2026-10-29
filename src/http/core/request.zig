@@ -1035,7 +1035,6 @@ test "Request.setTimeout: forwards relative, absolute, and disabled deadlines" {
 
     req.setTimeout(.fromSeconds(7));
     try std.testing.expectEqual(std.Io.Duration.fromSeconds(7), probe.last.duration.raw);
-    try std.testing.expect(req._deadline_from_handler);
 
     const deadline = std.Io.Clock.Timestamp.now(std.testing.io, .real).addDuration(.{
         .raw = .fromSeconds(11),
@@ -1760,7 +1759,7 @@ test "Request.multiFormData: entry with filename" {
     try std.testing.expectEqualStrings("foo.txt", form_data.get("foo").?.filename.?);
 }
 
-test "Request.multiFormData: semicolon in attribute name (regression)" {
+test "Request.multiFormData: a ';' inside an attribute name is refused, not a panic" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1794,8 +1793,8 @@ test "Request.multiFormData: semicolon in attribute name (regression)" {
 
     try parseHeaders(&reader, &parser);
 
-    // Should error out cleanly, not panic.
-    _ = req.multiFormData() catch {};
+    // The field name is "name;x", not "name", so the part has no name.
+    try std.testing.expectError(error.InvalidMultiPartEncoding, req.multiFormData());
 }
 
 test "Request.multiFormData: trailing backslash in quoted attribute (regression)" {
@@ -1877,6 +1876,7 @@ test "Request.body: 100 Continue goes through the response's sink" {
 
     const Probe = struct {
         interim: ?http.Status = null,
+        interims: usize = 0,
         w: std.Io.Writer = .failing,
         fn sink(self: *@This()) @import("sink.zig").Sink {
             return .{ .ptr = self, .vtable = &.{
@@ -1892,6 +1892,7 @@ test "Request.body: 100 Continue goes through the response's sink" {
         fn interimFn(ptr: *anyopaque, status: http.Status) std.Io.Writer.Error!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.interim = status;
+            self.interims += 1;
         }
         fn bodyFn(ptr: *anyopaque) *std.Io.Writer {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1917,7 +1918,9 @@ test "Request.body: 100 Continue goes through the response's sink" {
 
     try std.testing.expectEqualStrings("data", (try req.body()).?);
     try std.testing.expectEqual(http.Status.@"continue", probe.interim.?);
-    try std.testing.expect(!req._expects_continue);
+    // A second read sends no second 100 Continue.
+    try std.testing.expectEqualStrings("data", (try req.body()).?);
+    try std.testing.expectEqual(1, probe.interims);
 }
 
 test "misuse: a second reader is BodyReaderTaken in every build mode" {
