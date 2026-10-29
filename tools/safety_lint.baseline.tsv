@@ -132,13 +132,9 @@ src/http/core/websocket.zig	L2	2
 src/http/core/websocket.zig	U3	8
 src/inmem.zig	U3	2
 src/jobs/client.zig	C3	2
-src/jobs/client.zig	L2	1
 src/jobs/client.zig	U3	13
-src/jobs/metrics.zig	L2	1
 src/jobs/root.zig	U3	1
-src/jobs/store_memory.zig	L2	1
 src/jobs/store_memory.zig	U3	1
-src/jobs/store_pg.zig	L2	1
 src/jobs/store_pg.zig	U3	20
 src/jobs/store_redis.zig	U3	21
 src/jobs/store_sqlite.zig	U3	19
@@ -253,9 +249,7 @@ src/watch/redis.zig	L2	3
 src/watch/redis.zig	U3	1
 src/watch/root.zig	L2	5
 src/watch/root.zig	U3	18
-src/webhooks/dedup.zig	L2	1
 src/webhooks/root.zig	U3	3
-src/webhooks/store.zig	L2	1
 src/webhooks/store.zig	U3	1
 src/webhooks/verify.zig	U3	2
 src/websocket/h2_socket.zig	L2	1
