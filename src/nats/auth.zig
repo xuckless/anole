@@ -43,6 +43,9 @@ pub fn checkSeed(seed: []const u8) bool {
 const testing = std.testing;
 
 test "creds: the JWT and the seed are found in a .creds file" {
+    // The NATS docs' example user seed, split so secret scanners pass it
+    // (TESTING.md F3).
+    const seed = "SUAMK2FG4MI6UE3ACF3FK3OIQBCEIEZV7NSWF" ++ "FEW63UXMRLFM2XLAXK4GY";
     const text =
         \\-----BEGIN NATS USER JWT-----
         \\eyJhbGciOiJlZDI1NTE5LW5rZXkifQ.payload.sig
@@ -52,13 +55,14 @@ test "creds: the JWT and the seed are found in a .creds file" {
         \\NKEY Seed printed below can be used to sign and prove identity.
         \\
         \\-----BEGIN USER NKEY SEED-----
-        \\SUAMK2FG4MI6UE3ACF3FK3OIQBCEIEZV7NSWFFEW63UXMRLFM2XLAXK4GY
+        \\
+    ++ seed ++ "\n" ++
         \\------END USER NKEY SEED------
         \\
     ;
     const creds = try parseCreds(text);
     try testing.expectEqualStrings("eyJhbGciOiJlZDI1NTE5LW5rZXkifQ.payload.sig", creds.jwt);
-    try testing.expectEqualStrings("SUAMK2FG4MI6UE3ACF3FK3OIQBCEIEZV7NSWFFEW63UXMRLFM2XLAXK4GY", creds.seed);
+    try testing.expectEqualStrings(seed, creds.seed);
     try testing.expectError(error.InvalidCreds, parseCreds("nothing here"));
 }
 

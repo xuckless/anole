@@ -107,6 +107,6 @@ const corpus = make: {
     break :make entries;
 };
 
-test "fuzz the parser" {
+test "fuzz: the parser gives the same frames whole or cut into pieces, and never waits on a full buffer" {
     try std.testing.fuzz({}, fuzzParser, .{ .corpus = &corpus });
 }

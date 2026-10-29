@@ -283,7 +283,7 @@ test "servers: at least one, at most 64, every one parses" {
     try expectInvalid(.{ .servers = &many });
 }
 
-test "name and credentials" {
+test "an empty or non-UTF-8 name, username or password is InvalidOptions" {
     try expectInvalid(.{ .servers = one_server, .name = "" });
     try expectInvalid(.{ .servers = one_server, .name = "bad\xff" });
     try validate(.{ .servers = one_server, .name = "сервис" });
@@ -293,7 +293,7 @@ test "name and credentials" {
     try validate(.{ .servers = one_server, .auth = .{ .user_password = .{ .username = "u", .password = "p\"w\\d" } } });
 }
 
-test "durations and reconnect" {
+test "non-positive durations, max_delay below min_delay, zero attempts, and retry_initial_connect without reconnect are InvalidOptions" {
     try expectInvalid(.{ .servers = one_server, .connect_timeout = .zero });
     try expectInvalid(.{ .servers = one_server, .ping_interval = .fromSeconds(-1) });
     try expectInvalid(.{ .servers = one_server, .max_outstanding_pings = 0 });
@@ -305,7 +305,7 @@ test "durations and reconnect" {
     try validate(.{ .servers = one_server, .reconnect = .{ .buffer_bytes = 0 } });
 }
 
-test "limits" {
+test "a zero limit, a control line above the maximum, or a header limit above the frame limit is InvalidOptions" {
     for ([_]Limits{
         .{ .outbound_bytes = 0 },                                  .{ .subscription_messages = 0 },                                .{ .subscription_bytes = 0 },
         .{ .max_pending_requests = 0 },                            .{ .max_subscriptions = 0 },                                    .{ .max_inbound_frame_bytes = 0 },

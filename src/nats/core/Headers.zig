@@ -147,7 +147,7 @@ test "multi-value headers keep order, duplicates and case" {
     try testing.expect(h.status() == null);
 }
 
-test "inline status and description" {
+test "Headers: the status and description of the NATS/1.0 line are read, and a malformed status line has none" {
     const no_responders: Headers = .{ .block = "NATS/1.0 503\r\nNats-Subject: nobody.listens\r\n\r\n" };
     try testing.expectEqual(503, no_responders.status().?);
     try testing.expectEqualStrings("", no_responders.description());
@@ -185,7 +185,7 @@ test "a block without the version line keeps its first header" {
     try testing.expect(h.status() == null);
 }
 
-test "validate headers to send" {
+test "Headers.validate refuses empty, non-token or non-ASCII names and values with CR or LF" {
     try validate(&.{ .{ .name = "X-Id", .value = "1" }, .{ .name = "Empty", .value = "" }, .{ .name = "Utf8", .value = "значение" } });
     for ([_]Header{
         .{ .name = "", .value = "v" },

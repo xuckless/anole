@@ -724,8 +724,12 @@ test "drains: the first begins it, the client's drain adds its UNSUB once, and t
     defer waiter.cancel(io);
     q.leaveDrain();
     // A window for a wrong wake to show (a slow machine only hides one).
-    try io.sleep(.fromMilliseconds(20), .awake);
-    try testing.expect(!done.load(.acquire));
+    const wait = @import("anole_test_wait");
+    try wait.expectStays(io, "awaitNoDrains still waiting after one of two drains left", &done, struct {
+        fn waiting(d: *std.atomic.Value(bool)) bool {
+            return !d.load(.acquire);
+        }
+    }.waiting, wait.short_window);
     q.leaveDrain();
     waiter.await(io);
     try testing.expect(done.load(.acquire));

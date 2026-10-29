@@ -729,7 +729,7 @@ fn serveCloseAtOnce(io: Io, listener: *net.Server) !void {
     peer.close();
 }
 
-test "a server that closes before INFO" {
+test "a server that closes before INFO fails the handshake with Disconnected" {
     const io = testing.io;
     var listener = try FakeServer.listen(io);
     defer listener.deinit(io);

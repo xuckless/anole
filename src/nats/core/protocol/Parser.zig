@@ -287,7 +287,7 @@ fn expectTranscriptWith(expected: []const u8, input: []const u8, limits: Limits)
     try testing.expectEqualStrings(expected, out.written());
 }
 
-test "golden frames from nats-server 2.15.1" {
+test "every frame recorded from nats-server 2.15.1 parses to its fields" {
     try expectTranscript("INFO " ++ golden.info_default_json ++ "\n", golden.info_default);
     try expectTranscript("MSG foo 1 - 0 5\nBODY hello\nEND\n", golden.msg_plain);
     try expectTranscript("MSG foo 1 reply.to.me 0 5\nBODY world\nEND\n", golden.msg_reply);
@@ -324,7 +324,7 @@ test "the recorded session gives the same frames however it is cut" {
     }
 }
 
-test "lenient forms a server may send" {
+test "lenient forms a server may send (any case, runs of spaces and tabs, bare LF, unquoted -ERR) are read" {
     // Operation names in any case, runs of spaces and tabs, a bare LF.
     try expectTranscript("MSG foo 1 - 0 5\nBODY hello\nEND\nPING\nPONG\nOK\nERR x\n", "msg\tfoo  1 \t5 \r\nhello\r\nping\npOnG\r\n+ok\r\n-err 'x'\r\n");
     try expectTranscript("INFO {}\n", "info  {} \r\n");
@@ -414,7 +414,7 @@ test "lines the server sends for the longest arguments a client may send" {
     );
 }
 
-test "malformed frames" {
+test "malformed frames fail with UnknownOperation, InvalidArguments or MissingTerminator" {
     for ([_][2][]const u8{
         .{ "FOO bar\r\n", "ERROR UnknownOperation\n" },
         .{ "\r\n", "ERROR UnknownOperation\n" },

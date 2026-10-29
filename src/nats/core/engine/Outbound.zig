@@ -1144,6 +1144,32 @@ fn drainOnce(q: *Outbound, io: Io, out: *std.ArrayList(u8)) !void {
     q.written(io, batch.len);
 }
 
+/// The writer waits in `take` for something to write. Reads the waiter
+/// count of `Io.Condition`, which `wait` raises before it lets the mutex go.
+fn takeWaiting(q: *Outbound, io: Io) bool {
+    q.mutex.lockUncancelable(io);
+    defer q.mutex.unlock(io);
+    return q.ready.state.load(.monotonic).waiters > 0;
+}
+
+/// A task waits in `waitPong`.
+fn pongWaiters(q: *Outbound, io: Io) u32 {
+    q.mutex.lockUncancelable(io);
+    defer q.mutex.unlock(io);
+    return q.answered.waiters;
+}
+
+const QueueIo = struct {
+    q: *Outbound,
+    io: Io,
+    fn writerWaits(c: @This()) bool {
+        return takeWaiting(c.q, c.io);
+    }
+    fn pongWaited(c: @This()) bool {
+        return pongWaiters(c.q, c.io) > 0;
+    }
+};
+
 fn awaitRoomWaiter(q: *Outbound, io: Io) !void {
     const give_up = time.after(io, .fromSeconds(5 * @as(i64, @import("anole_test_wait").timeoutFactor())));
     while (q.roomWaiters(io) == 0) {
@@ -1170,7 +1196,7 @@ test "frames come out whole and in order, PONGs first" {
     try testing.expectEqual(0, q.unsent(io, &frames).len);
 }
 
-test "a frame larger than a chunk, among small ones in many chunks" {
+test "a frame larger than a chunk comes out whole and in order among small frames spread over many chunks" {
     const io = testing.io;
     var q: Outbound = .init(testing.allocator, 1 << 24);
     defer q.deinit();
@@ -1313,7 +1339,7 @@ test "close wakes a waiting put, the writer and PING waiters" {
         defer q.deinit();
         var writer = try io.concurrent(takeOne, .{ &q, io });
         defer _ = writer.cancel(io) catch null;
-        try io.sleep(.fromMilliseconds(10), .awake);
+        try @import("anole_test_wait").waitUntil(io, "the writer waiting in take()", QueueIo{ .q = &q, .io = io }, QueueIo.writerWaits);
         q.close(io);
         try testing.expect(try writer.await(io) == null);
     }
@@ -1323,7 +1349,7 @@ test "close wakes a waiting put, the writer and PING waiters" {
         _ = try q.putPing(io, .flush);
         var waiter = try io.concurrent(waitFirstPong, .{ &q, io });
         defer waiter.cancel(io) catch {};
-        try io.sleep(.fromMilliseconds(10), .awake);
+        try @import("anole_test_wait").waitUntil(io, "the PING waiter in waitPong()", QueueIo{ .q = &q, .io = io }, QueueIo.pongWaited);
         q.close(io);
         try testing.expectError(error.Closed, waiter.await(io));
     }
@@ -1618,19 +1644,20 @@ test "a put with a deadline goes in when room comes in time, and one that timed 
     // at once.
     try testing.expectError(error.Timeout, putNamedUntil(&q, io, "gone", time.after(io, .zero)));
     try putNamedUntil(&q, io, "a", time.after(io, .fromSeconds(5)));
-    // Its deadline leaves the next put ample time to get in line behind it,
-    // even where sleeps are counted in ticks of ~15.6 ms, as on Windows.
-    const soon_deadline = time.after(io, .fromSeconds(1));
-    var soon = try io.concurrent(putNamedUntil, .{ &q, io, "soon", soon_deadline });
+    // Deadlines far off in real time: the test moves the queue's clock past
+    // the first one once both puts are in line, and no machine is too slow
+    // for that (TESTING.md D4, D6).
+    var soon = try io.concurrent(putNamedUntil, .{ &q, io, "soon", time.after(io, .fromSeconds(600)) });
     defer soon.cancel(io) catch {};
     try awaitRoomWaiters(&q, io, 1);
-    var later = try io.concurrent(putNamedUntil, .{ &q, io, "later", time.after(io, .fromSeconds(30)) });
+    var later = try io.concurrent(putNamedUntil, .{ &q, io, "later", time.after(io, .fromSeconds(3600)) });
     defer later.cancel(io) catch {};
     try awaitRoomWaiters(&q, io, 2);
+    // Both still wait: neither deadline has passed.
+    try testing.expectEqual(2, q.roomWaiters(io));
+    q.testAdvanceClock(io, .fromSeconds(1200));
     try testing.expectError(error.Timeout, soon.await(io));
-    // Not before its deadline, on the deadline's own clock; the put behind
-    // it still waits.
-    try testing.expect(time.expired(io, soon_deadline));
+    // The put behind it still waits.
     try testing.expectEqual(1, q.roomWaiters(io));
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
