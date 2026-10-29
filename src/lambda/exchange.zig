@@ -71,7 +71,7 @@ pub const BufferedSink = struct {
     streamed: std.ArrayList(u8) = .empty,
     /// `result`'s one part when the body was streamed: the answer's
     /// `parts` points here, so it lives as long as the sink.
-    streamed_part: [1][]const u8 = undefined,
+    streamed_part: [1][]const u8 = .{&.{}},
     writer: std.Io.Writer,
 
     pub fn init(arena: std.mem.Allocator, limit: usize) BufferedSink {
