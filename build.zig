@@ -1158,6 +1158,7 @@ pub fn build(b: *std.Build) void {
             const run_bare = b.addRunArtifact(bare_tests);
             run_bare.setCwd(certs_dir);
             b.step("core-test-bare", "Run the HTTP core's own tests on the core without TLS, HTTP/2 or compression").dependOn(&run_bare.step);
+            compile_tests_step.dependOn(&bare_tests.step);
         }
         fuzz_step.dependOn(&b.addRunArtifact(core_fuzz).step);
     }
