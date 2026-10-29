@@ -734,9 +734,13 @@ pub const Exec = struct {
                 // `destroy`: the consumer hears nothing more, and nobody
                 // may poll again to make room.
                 if (x.engine.abandon.load(.acquire)) return freeRecord(rec.ptr);
-                x.waitRoom(need, null) catch {
-                    if (!x.waitRoomCanceled(need)) return freeRecord(rec.ptr);
-                    break;
+                x.waitRoom(need, null) catch |err| switch (err) {
+                    error.Abandoned => return freeRecord(rec.ptr),
+                    error.Canceled => {
+                        if (!x.waitRoomCanceled(need)) return freeRecord(rec.ptr);
+                        break;
+                    },
+                    error.Timeout => unreachable, // no deadline
                 };
             }
             _ = x.record_bytes.fetchAdd(rec.len, .monotonic);
@@ -773,6 +777,7 @@ pub const Exec = struct {
             x.waitRoom(need, until) catch |e| switch (e) {
                 // Room made right at the deadline still takes the record.
                 error.Timeout => return x.hasRoom(need),
+                error.Abandoned => return false,
                 error.Canceled => unreachable, // protection is blocked
             };
         }
@@ -795,25 +800,32 @@ pub const Exec = struct {
 
     /// Waits (a task of this executor) until `poll` has made room, or until
     /// `deadline` (awake clock, ns). The caller re-checks its own condition.
-    pub fn waitRoom(x: *Exec, need: usize, deadline: ?i96) error{ Canceled, Timeout }!void {
+    /// `error.Abandoned`: `destroy` abandoned the consumer, nobody will make
+    /// room, and every later call returns it at once, so a caller that
+    /// loops must leave on it (it is not a cancel: nothing to re-arm).
+    pub fn waitRoom(x: *Exec, need: usize, deadline: ?i96) error{ Canceled, Timeout, Abandoned }!void {
         const seen = x.room.load(.acquire);
         _ = x.room_waiters.fetchAdd(1, .seq_cst);
         defer _ = x.room_waiters.fetchSub(1, .monotonic);
         // Announced: look again (Dekker with the consumer's pop and
         // `signalRoom`). `abandon` is set before `destroy` bumps `room`:
         // a `seen` taken after that bump finds it set here.
-        if (x.hasRoom(need) or x.engine.abandon.load(.acquire)) return;
+        if (x.engine.abandon.load(.acquire)) return error.Abandoned;
+        if (x.hasRoom(need)) return;
         // The consumer is behind: make sure it hears there is work.
         if (x.consumer) |c| c.wake();
         const io = x.engine.io;
         const t: std.Io.Timeout = if (deadline) |d| .{ .deadline = .{ .raw = .{ .nanoseconds = d }, .clock = .awake } } else .none;
         io.futexWaitTimeout(u32, &x.room.raw, seen, t) catch return error.Canceled;
         if (comptime builtin.is_test) _ = x.room_wakeups.fetchAdd(1, .monotonic);
+        // Woken by `destroy`'s bump (`abandonRoom`).
+        if (x.engine.abandon.load(.acquire)) return error.Abandoned;
         if (deadline) |d| if (std.Io.Clock.awake.now(io).nanoseconds >= d) return error.Timeout;
     }
 
     /// `destroy`, after it set `abandon`: every task parked for room wakes
-    /// and frees its record (`postRecord`), whatever the room.
+    /// with `error.Abandoned`, whatever the room: `postRecord` frees its
+    /// record, a request or call still waiting to be handed over is ended.
     fn abandonRoom(x: *Exec) void {
         _ = x.room.fetchAdd(1, .release);
         x.wakeFutex(&x.room);
@@ -2539,9 +2551,16 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
     var canceled = false;
     while (!x.ring.push(.{ .handle = x.handleOf(si, gen), .rec = null })) {
         std.debug.assert(d == null);
-        if (s.timed_out or std.Io.Clock.awake.now(io).nanoseconds >= s.deadline) {
+        // `destroy` (`abandonAll` may have marked the slot already): the
+        // consumer will never make room.
+        const stopping = s.abandoned or e.abandon.load(.acquire);
+        if (stopping or s.timed_out or std.Io.Clock.awake.now(io).nanoseconds >= s.deadline) {
             x.unlink(si);
             x.release(si);
+            if (stopping) {
+                res.fail(.service_unavailable, "the server is stopping");
+                return;
+            }
             _ = e.busy_count.fetchAdd(1, .monotonic);
             res.fail(.service_unavailable, "the application is behind");
             return;
@@ -2551,7 +2570,8 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
                 canceled = true;
                 break;
             },
-            error.Timeout => continue,
+            // The checks above end it.
+            error.Timeout, error.Abandoned => continue,
         };
     }
     x.consumer.?.wake();
