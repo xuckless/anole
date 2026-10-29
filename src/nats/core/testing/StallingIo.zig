@@ -26,10 +26,20 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 
-const State = struct {
+const Stage = enum(u8) {
+    /// No stall.
+    idle,
     /// The next socket write waits.
-    armed: std.atomic.Value(bool) = .init(false),
+    armed,
     /// A socket write waits now.
+    blocked,
+};
+
+const State = struct {
+    /// One word, so a shutdown or close always sees an armed or waiting
+    /// stall: armed -> blocked is a single compare-and-swap.
+    stage: std.atomic.Value(Stage) = .init(.idle),
+    /// Mirrors `stage == .blocked`, for `test_wait.waitFlag`.
     blocked: std.atomic.Value(bool) = .init(false),
     /// Set to let the waiting write go on.
     release: Io.Event = .unset,
@@ -52,9 +62,9 @@ pub fn io() Io {
 
 /// The next socket write through `io()` waits (see the file's comment).
 pub fn arm() void {
-    std.debug.assert(!state.armed.load(.acquire) and !state.blocked.load(.acquire));
+    std.debug.assert(state.stage.load(.acquire) == .idle);
     state.release.reset();
-    state.armed.store(true, .release);
+    state.stage.store(.armed, .release);
 }
 
 /// Set while a socket write waits; for `test_wait.waitFlag`.
@@ -65,7 +75,8 @@ pub fn blocked() *const std.atomic.Value(bool) {
 /// Lets the waiting write go on (or the next one, if none waits yet: the
 /// stall is then over).
 pub fn release() void {
-    state.armed.store(false, .release);
+    // An armed stall is over; a waiting write clears its own stage.
+    _ = state.stage.cmpxchgStrong(.armed, .idle, .acq_rel, .acquire);
     state.release.set(std.testing.io);
 }
 
@@ -73,13 +84,17 @@ pub fn release() void {
 /// the fixture's teardown, after the client is gone.
 pub fn reset() void {
     release();
+    state.stage.store(.idle, .release);
     state.blocked.store(false, .release);
 }
 
 fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
-    if (operation == .net_write and state.armed.swap(false, .acq_rel)) {
+    if (operation == .net_write and state.stage.cmpxchgStrong(.armed, .blocked, .acq_rel, .acquire) == null) {
         state.blocked.store(true, .release);
-        defer state.blocked.store(false, .release);
+        defer {
+            state.blocked.store(false, .release);
+            state.stage.store(.idle, .release);
+        }
         const inner: Io = .{ .userdata = userdata, .vtable = std.testing.io.vtable };
         try state.release.wait(inner);
     }
@@ -100,5 +115,5 @@ fn netClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
 
 /// A socket is shut down or closed: a stall, armed or waiting, is over.
 fn stallEnds() void {
-    if (state.armed.load(.acquire) or state.blocked.load(.acquire)) release();
+    if (state.stage.load(.acquire) != .idle) release();
 }
