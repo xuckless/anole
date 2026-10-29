@@ -11,6 +11,7 @@
 //! was filled under are current, so an invalidation reaches every
 //! executor's entries at once, those still being filled included.
 const std = @import("std");
+const builtin = @import("builtin");
 const dusty = @import("dusty");
 const observe = @import("../observe/root.zig");
 const placement = dusty.placement;
@@ -20,8 +21,17 @@ const Counter = std.atomic.Value(u64);
 
 /// The awake clock in nanoseconds: what expiry is measured on.
 pub fn now(io: std.Io) i96 {
+    if (builtin.is_test) {
+        const frozen = test_clock.load(.monotonic);
+        if (frozen != 0) return frozen;
+    }
     return std.Io.Timestamp.now(io, .awake).nanoseconds;
 }
+
+/// Tests only: while non-zero, `now` returns it (nanoseconds on the awake
+/// clock), so a test moves expiry forward without sleeping (TESTING.md D4).
+/// Set it from `now`, advance it, and store 0 again when done.
+pub var test_clock: if (builtin.is_test) std.atomic.Value(i64) else void = if (builtin.is_test) .init(0) else {};
 
 /// Counters an invalidation bumps, shared by every executor: one for
 /// everything, one per tag (hashed into a slot) and one per key (hashed
