@@ -1408,7 +1408,7 @@ test "capi engine: a poster canceled while it waits for ring room passes the can
 
 /// `destroy` on a thread of its own, so the test can wait for it under the
 /// hang guard.
-const Destroyer = struct {
+pub const Destroyer = struct {
     e: *engine.Engine,
     done: std.atomic.Value(bool) = .init(false),
 
@@ -1419,6 +1419,23 @@ const Destroyer = struct {
 
     fn finished(d: *Destroyer) bool {
         return d.done.load(.acquire);
+    }
+
+    /// Destroys `e`, which has a task parked for ring room on consumer `c`
+    /// (nobody polls), and waits for it on `io` under the hang guard. If the
+    /// guard runs out, one poll makes the room that task waits for, so it,
+    /// the destroy and the test end instead of hanging the run.
+    pub fn withTaskParked(io: std.Io, e: *engine.Engine, c: *engine.Consumer, comptime what: []const u8) !void {
+        var d: Destroyer = .{ .e = e };
+        const t = try std.Thread.spawn(.{}, run, .{&d});
+        defer t.join();
+        wait.waitUntil(io, "destroy finished with " ++ what ++ " parked for ring room", &d, finished) catch |err| {
+            const buf = try alloc.alignedAlloc(u8, .@"8", 64 * 1024);
+            defer alloc.free(buf);
+            var need: u32 = 0;
+            _ = engine.poll(c, buf, false, &need) catch {};
+            return err;
+        };
     }
 };
 
@@ -1456,6 +1473,48 @@ test "capi engine: destroy does not wait for a canceled poster's ring room" {
     defer t.join();
     try wait.waitUntil(engine.threadedIo(), "destroy finished with the canceled poster parked", &d, Destroyer.finished);
     try std.testing.expectEqual(@as(u32, 3), posted.load(.acquire));
+}
+
+/// A task of executor `x` waits for ring room.
+fn roomWaited(x: *engine.Exec) bool {
+    return x.room_waiters.load(.seq_cst) == 1;
+}
+
+test "capi engine: destroy ends an HTTP/1.1 request parked for ring room" {
+    // The route's deadline outlasts the hang guard: while nobody polls,
+    // only `destroy` can end the request's wait in time.
+    const json = try std.fmt.allocPrint(alloc,
+        \\{{"executors": 1, "limits": {{"queue": 2}}, "timeouts": {{"request_ms": {d}, "shutdown_ms": 200}},
+        \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
+        \\ "routes": [{{"path": "/x", "handler": 1}}]}}
+    , .{3 * @as(u64, wait.deadlineMs())});
+    defer alloc.free(json);
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    var destroying = false;
+    defer if (!destroying) e.destroy();
+    const c = try e.attach(null, null, false);
+    try e.start();
+    const io = engine.threadedIo();
+    var conns: [3]?std.Io.net.Stream = @splat(null);
+    defer for (conns) |s| if (s) |st| st.close(io);
+    // Nobody polls: two requests fill the ring, the third's task waits for
+    // room (HTTP/1.1 does not detach).
+    for (&conns) |*slot| {
+        const s = try (try std.Io.net.IpAddress.parse("127.0.0.1", e.port(0))).connect(io, .{ .mode = .stream });
+        slot.* = s;
+        var wbuf: [128]u8 = undefined;
+        var w = s.writer(io, &wbuf);
+        try w.interface.writeAll("GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+        try w.interface.flush();
+    }
+    try wait.waitUntil(io, "a request's task waits for ring room", &e.execs[0], roomWaited);
+    destroying = true;
+    try Destroyer.withTaskParked(io, e, c, "an HTTP/1.1 request");
 }
 
 fn postAdvisory(x: *engine.Exec) std.Io.Cancelable!void {

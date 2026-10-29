@@ -9,6 +9,7 @@ const anole = @import("../root.zig");
 const dusty = @import("dusty");
 const engine = @import("engine.zig");
 const grpc_capi = @import("grpc.zig");
+const EngineTest = @import("engine_test.zig");
 const abi = engine.abi;
 const features = anole.features;
 const zio = anole.zio;
@@ -548,6 +549,69 @@ test "capi grpc over HTTP/3: detached unary, server stream, bidi, status and tra
     try e.drain();
     try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
     try std.testing.expectEqual(@as(u64, 0), e.stats().inflight);
+}
+
+/// All three calls started, and the ring is full: at least one of them is
+/// in its loop that waits for room to be handed over (`start` counts a
+/// call before it, with no suspension point between), the others' handles
+/// or request messages fill the ring.
+fn callParked(e: *engine.Engine) bool {
+    return e.stats().requests == 3 and e.execs[0].ring.full();
+}
+
+/// Three client-streaming calls (they do not detach) into a ring of 2
+/// while nobody polls, so one waits to be handed over. Then `destroy`.
+fn destroyWithCallParked(e: *engine.Engine, c: *engine.Consumer, io: std.Io, destroying: *bool) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = e.port(0) });
+    defer conn.close();
+    var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost" };
+    const client: grpc.Client(Echo) = .{ .channel = &channel };
+    var s0 = try client.stream("ClientStream", arena, .{});
+    defer s0.deinit();
+    try s0.send(.{ .message = "a" });
+    var s1 = try client.stream("ClientStream", arena, .{});
+    defer s1.deinit();
+    try s1.send(.{ .message = "b" });
+    var s2 = try client.stream("ClientStream", arena, .{});
+    defer s2.deinit();
+    try s2.send(.{ .message = "c" });
+    try wait.waitUntil(io, "a call waits for ring room", e, callParked);
+    destroying.* = true;
+    try EngineTest.Destroyer.withTaskParked(io, e, c, "a client-streaming call");
+}
+
+test "capi grpc: destroy ends a client-streaming call parked for ring room" {
+    if (comptime !features.http2) return error.SkipZigTest;
+    const set = @import("anole_test_descriptors").set;
+    const b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(set.len));
+    defer alloc.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, set);
+    // No deadline on the calls: while nobody polls, only `destroy` can end
+    // the parked call's wait.
+    const json = try std.fmt.allocPrint(alloc,
+        \\{{"executors": 1, "limits": {{"queue": 2}}, "timeouts": {{"shutdown_ms": 200}},
+        \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
+        \\ "grpc": {{"descriptor_set": "{s}", "services": [{{"name": "anole.test.Echo", "handler": 10}}]}}}}
+    , .{b64});
+    defer alloc.free(json);
+    var why_buf: [400]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    var destroying = false;
+    defer if (!destroying) e.destroy();
+    const c = try e.attach(null, null, false);
+    try e.start();
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(destroyWithCallParked, .{ e, c, io, &destroying });
+    try f.await(io);
 }
 
 test "capi grpc: configurations refused" {
