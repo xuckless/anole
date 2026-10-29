@@ -1,0 +1,6 @@
+{"time":"2026-10-29T18:07:27.998Z","level":"info","scope":"anole","message":"listening on udp://0.0.0.0:7001 (1 socket)"}
+{"time":"2026-10-29T18:07:27.999Z","level":"info","scope":"anole","message":"environment production (release build): JSON Lines logs"}
+{"time":"2026-10-29T18:07:27.999Z","level":"warn","scope":"anole","message":"built with ReleaseFast: Zig's safety checks are off, so a bug that ReleaseSafe would stop at the faulty line can corrupt memory instead; ReleaseSafe is the recommended build for production"}
+{"time":"2026-10-29T18:07:27.999Z","level":"info","scope":"anole","message":"listening on http://0.0.0.0:8080 (HTTP/1.1, HTTP/2 cleartext)"}
+{"time":"2026-10-29T18:07:27.999Z","level":"info","scope":"anole","message":"listening on tcp://0.0.0.0:7000 (raw TCP)"}
+{"time":"2026-10-29T18:07:28.000Z","level":"info","scope":"anole","message":"console: `anole console anole-bench` attaches (socket /run/anole/anole-bench.1.sock)"}

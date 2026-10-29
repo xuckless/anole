@@ -1,0 +1,8 @@
+# started on Thu Oct 29 18:14:57 2026
+
+13531132592,,cpu_core/cycles/u,14992780328,100.00,,
+8669149850,,cpu_core/instructions/u,14992778251,100.00,,
+226295900,,cpu_core/mem_inst_retired.lock_loads/,14992776120,100.00,,
+22538921647,,cpu_core/mem_inst_retired.all_loads/,14992775037,100.00,,
+5799546,,page-faults,14992773999,100.00,,
+178695,,syscalls:sys_enter_brk,14992773626,100.00,,

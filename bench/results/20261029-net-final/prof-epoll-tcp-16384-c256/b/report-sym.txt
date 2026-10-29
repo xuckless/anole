@@ -1,0 +1,83 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 14K of event 'cpu_core/cycles/P'
+# Event count (approx.): 75295946373
+#
+# Overhead  Symbol                                                           
+# ........  .................................................................
+#
+     8.54%  [.] compiler_rt.memcpy.memcpyFast
+     7.05%  [k] nft_do_chain
+     7.05%  [k] _copy_to_iter
+     3.97%  [k] clear_highpages_kasan_tagged
+     3.60%  [k] _copy_from_iter
+     2.56%  [k] _raw_spin_lock
+     2.32%  [k] native_irq_return_iret
+     1.36%  [k] __nf_conntrack_find_get
+     1.28%  [.] 0x00000000000a20f4
+     1.27%  [k] nft_meta_get_eval
+     1.22%  [k] fdget
+     1.03%  [.] runtime.Executor.switchOut
+     1.02%  [k] nft_meta_store_ifname
+     0.98%  [k] sized_strscpy
+     0.96%  [k] selinux_socket_recvmsg
+     0.92%  [.] ev.sockreg.service__func_920
+     0.90%  [k] __raw_spin_lock_irqsave
+     0.83%  [k] __list_del_entry_valid_or_report
+     0.74%  [k] __inet_lookup_established
+     0.69%  [.] os.net.recv
+     0.68%  [k] sock_rfree
+     0.65%  [k] perf_iterate_ctx
+     0.57%  [k] tcp_clean_rtx_queue
+     0.57%  [k] tcp_v4_rcv
+     0.56%  [k] mas_walk
+     0.56%  [k] skb_defer_free_flush
+     0.56%  [k] skb_release_data
+     0.55%  [k] __mod_memcg_lruvec_state
+     0.54%  [.] net.tcp.TcpConn.queue
+     0.53%  [k] __rcu_read_lock
+     0.53%  [.] net.tcp.TcpConn.loop
+     0.52%  [k] lru_gen_add_folio
+     0.51%  [k] __rcu_read_unlock
+     0.49%  [k] ep_poll_callback
+     0.47%  [.] net.tcp.Driver.run
+     0.47%  [k] expr_call_ops_eval
+     0.46%  [k] __pi_memcpy
+     0.46%  [k] nft_match_eval
+     0.45%  [k] nft_immediate_eval
+     0.45%  [k] folio_batch_move_lru
+     0.44%  [k] avc_lookup
+     0.43%  [k] __wake_up_common
+     0.43%  [k] tcp_sendmsg_locked
+     0.41%  [k] __pte_offset_map
+     0.40%  [k] try_charge_memcg
+     0.40%  [k] do_user_addr_fault
+     0.40%  [k] sock_has_perm
+     0.39%  [.] ev.sockreg.park__func_1362
+     0.39%  [k] __alloc_frozen_pages_noprof
+     0.39%  [k] strnlen
+     0.38%  [k] tcp_ack
+     0.38%  [k] tcp_recvmsg_locked
+     0.38%  [k] __sys_recvfrom
+     0.37%  [k] nft_do_chain_inet
+     0.37%  [k] get_page_from_freelist
+     0.36%  [k] zap_present_ptes.constprop.0
+     0.36%  [k] map_anon_folio_pte_nopf
+     0.36%  [k] __handle_mm_fault
+     0.36%  [k] __mod_memcg_state
+     0.36%  [k] do_anonymous_page
+     0.33%  [k] kfree
+     0.33%  [k] nf_hook_slow
+     0.32%  [k] tcp_rcv_established
+     0.32%  [k] count_memcg_events
+     0.31%  [k] lruvec_stat_mod_folio
+     0.30%  [k] __skb_datagram_iter
+     0.30%  [k] tcp_rcv_space_adjust
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

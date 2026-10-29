@@ -9,9 +9,10 @@
 # -window 1). Every run starts a fresh server, rests REST s, then loads it
 # (3 s warm-up, DUR s counted). RUNS runs per side and cell, A and B
 # alternating (A B, B A, ...). perf stat counts the server's user-space
-# instructions and cycles over the counted part (whole-run counts divided by
+# instructions and cycles, page faults and brk calls over the counted part (whole-run counts divided by
 # the messages echoed, not the D19 fixed-count method). A rerun with the same
-# results id skips the runs that already have a result.
+# results id skips the runs that already have a result. STOP_ON_FAIL=1 ends
+# the run at the first cell that fails the gate.
 #
 #   TOOLS=<dir with tcpload, udpload> bench/repro/net-ab.sh <results-id> a=<image> b=<image>
 set -u
@@ -52,7 +53,7 @@ one() { # <backend> <proto> <size> <conns> <side> <run>
   sleep "$WARM"
   local u0; u0=$(usage net-sut)
   docker run --rm --privileged --pid=host --cpuset-cpus 16-19 -v "$d:/out" anole-bench/perf perf stat -x, \
-    -e instructions:u,cycles:u,task-clock -p "$pid" -o /out/perf-stat.csv -- sleep "$DUR"
+    -e instructions:u,cycles:u,task-clock,page-faults,syscalls:sys_enter_brk -p "$pid" -o /out/perf-stat.csv -- sleep "$DUR"
   echo $(( $(usage net-sut) - u0 )) > "$d/cpu-usec"; echo "$DUR" > "$d/dur"
   docker wait net-load >/dev/null; docker logs net-load > "$d/load.json" 2>&1; docker rm net-load >/dev/null
   docker logs net-sut > "$d/server.log" 2>&1
@@ -70,7 +71,9 @@ for be in $BACKENDS; do
           if [ $((r % 2)) = 1 ]; then o="${names[*]}"; else o=$(printf '%s\n' "${names[@]}" | tac | tr '\n' ' '); fi
           for s in $o; do one $be $p $sz $n $s $r; done
         done
-        log "cell $be $p $sz c$n: $(python3 "$bench/repro/net-ab-summary.py" cell "$out/$be/$p-$sz-c$n")"
+        line=$(python3 "$bench/repro/net-ab-summary.py" cell "$out/$be/$p-$sz-c$n")
+        log "cell $be $p $sz c$n: $line"
+        if [ "${STOP_ON_FAIL:-0}" = 1 ] && [[ $line == *FAIL* ]]; then log "stopped: $be $p $sz c$n fails the gate"; exit 3; fi
       done
     done
   done

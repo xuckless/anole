@@ -1,0 +1,5 @@
+14:15:31 b counters: 101949 msg/s; cycles/u 8848.289/msg, instructions/u 5668.937/msg, mem_inst_retired.lock_loads 147.980/msg, mem_inst_retired.all_loads 14738.670/msg, page-faults 3.792/msg, brk 0.117/msg
+14:15:31 b flame: 14986 samples; top self: _copy_to_iter 7.0%, nft_do_chain 7.0%, compiler_rt.memcpy.memcpyFast 6.0%, asm_exc_page_fault 5.8%, clear_highpages_kasan_tagged 4.0%, _copy_from_iter 3.6%
+14:17:18 a counters: 124552 msg/s; cycles/u 7984.904/msg, instructions/u 5725.494/msg, mem_inst_retired.lock_loads 100.639/msg, mem_inst_retired.all_loads 11033.694/msg, page-faults 0.862/msg, brk 0.030/msg
+14:17:18 a flame: 14987 samples; top self: compiler_rt.memcpy.memcpyFast 8.0%, nft_do_chain 7.8%, _copy_to_iter 7.7%, _copy_from_iter 4.4%, clear_highpages_kasan_tagged 3.9%, asm_exc_page_fault 2.3%
+14:17:18 done

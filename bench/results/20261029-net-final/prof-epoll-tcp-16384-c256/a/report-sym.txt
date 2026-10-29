@@ -1,0 +1,82 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 14K of event 'cpu_core/cycles/P'
+# Event count (approx.): 76254947837
+#
+# Overhead  Symbol                                                                
+# ........  ......................................................................
+#
+     9.17%  [.] compiler_rt.memcpy.memcpyFast
+     7.79%  [k] nft_do_chain
+     7.69%  [k] _copy_to_iter
+     4.44%  [k] _copy_from_iter
+     3.91%  [k] clear_highpages_kasan_tagged
+     1.49%  [k] nft_meta_get_eval
+     1.37%  [k] fdget
+     1.30%  [k] __nf_conntrack_find_get
+     1.16%  [k] __raw_spin_lock_irqsave
+     1.13%  [.] net.tcp.TcpConn.loop
+     1.12%  [k] selinux_socket_recvmsg
+     1.10%  [k] _raw_spin_lock
+     1.07%  [k] sized_strscpy
+     1.05%  [.] ev.sockreg.service__func_920
+     0.99%  [.] runtime.Executor.switchOut
+     0.93%  [k] __inet_lookup_established
+     0.91%  [k] nft_meta_store_ifname
+     0.88%  [k] skb_defer_free_flush
+     0.88%  [k] tcp_clean_rtx_queue
+     0.88%  [.] net.tcp.Driver.run
+     0.88%  [k] sock_rfree
+     0.84%  [k] native_irq_return_iret
+     0.68%  [k] skb_release_data
+     0.67%  [k] tcp_sendmsg_locked
+     0.64%  [k] tcp_v4_rcv
+     0.64%  [k] __list_del_entry_valid_or_report
+     0.63%  [.] os.net.recv
+     0.62%  [k] __wake_up_common
+     0.59%  [k] sock_has_perm
+     0.59%  [k] ep_poll_callback
+     0.54%  [k] nft_match_eval
+     0.53%  [.] server.Burst.waitInput
+     0.52%  [k] __sys_recvfrom
+     0.52%  [k] ____sys_sendmsg
+     0.49%  [k] __pi_memcpy
+     0.49%  [k] try_charge_memcg
+     0.48%  [k] skb_page_frag_refill
+     0.47%  [.] ev.sockreg.park__func_1362
+     0.47%  [k] __mod_memcg_state
+     0.46%  [k] expr_call_ops_eval
+     0.45%  [k] __rcu_read_unlock
+     0.45%  [k] tcp_ack
+     0.45%  [k] nft_immediate_eval
+     0.43%  [k] strnlen
+     0.42%  [k] ip_finish_output2
+     0.42%  [k] nf_hook_slow
+     0.42%  [k] entry_SYSRETQ_unsafe_stack
+     0.41%  [k] nft_do_chain_inet
+     0.41%  [k] kfree_skbmem
+     0.40%  [k] perf_iterate_ctx
+     0.40%  [k] tcp_recvmsg_locked
+     0.39%  [.] array_list.Aligned(h3.server.Endpoint(main.App).Field,null).append
+     0.39%  [k] __tcp_transmit_skb
+     0.39%  [.] 0x00000000000a20f4
+     0.38%  [k] avc_lookup
+     0.37%  [k] tcp_rcv_established
+     0.37%  [k] sock_def_readable
+     0.36%  [.] net.tcp.TcpConn.queue
+     0.36%  [k] nft_ct_get_fast_eval
+     0.36%  [k] nft_rhash_lookup
+     0.35%  [k] kfree
+     0.34%  [k] native_queued_spin_lock_slowpath
+     0.33%  [k] __dev_queue_xmit
+     0.33%  [k] do_syscall_64
+     0.33%  [k] ktime_get
+     0.30%  [k] sock_poll
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

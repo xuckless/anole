@@ -29,6 +29,10 @@ def run(d):
                 r["ins_msg"] = float(f[0]) / msgs if msgs else 0
             elif f[2] == "cpu_core/cycles/u":
                 r["cyc_msg"] = float(f[0]) / msgs if msgs else 0
+            elif f[2] == "page-faults":
+                r["pf_msg"] = float(f[0]) / msgs if msgs else 0
+            elif f[2] == "syscalls:sys_enter_brk":
+                r["brk_msg"] = float(f[0]) / msgs if msgs else 0
     except FileNotFoundError:
         pass
     return r
@@ -38,7 +42,7 @@ def one(d):
     r = run(d)
     return (f"{r['rate']:.0f} msg/s, p50 {r['p50']:.3f} ms, p99 {r['p99']:.3f} ms, "
             f"{r['us_msg']:.2f} us CPU/msg, {r.get('ins_msg', 0):.0f} ins:u/msg, "
-            f"{r.get('cyc_msg', 0):.0f} cyc:u/msg, lost/errors {r['loss']}")
+            f"{r.get('cyc_msg', 0):.0f} cyc:u/msg, {r.get('pf_msg', 0):.3f} faults/msg, {r.get('brk_msg', 0):.3f} brk/msg, lost/errors {r['loss']}")
 
 
 def cell(cd):
@@ -49,7 +53,7 @@ def cell(cd):
             sides.setdefault(s, []).append(run(os.path.join(cd, e)))
         except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
             pass
-    med = {s: {k: statistics.median(x.get(k, 0) for x in rs) for k in ("rate", "p50", "p99", "us_msg", "ins_msg", "cyc_msg")}
+    med = {s: {k: statistics.median(x.get(k, 0) for x in rs) for k in ("rate", "p50", "p99", "us_msg", "ins_msg", "cyc_msg", "pf_msg", "brk_msg")}
            | {"n": len(rs), "loss": sum(x["loss"] for x in rs), "rates": [round(x["rate"]) for x in rs]}
            for s, rs in sides.items()}
     return med
@@ -68,7 +72,7 @@ def verdict(med):
 def cell_line(cd):
     med = cell(cd)
     parts = [f"{s}: {m['rate']:.0f} msg/s, p99 {m['p99']:.3f} ms, {m['us_msg']:.2f} us/msg, "
-             f"{m['ins_msg']:.0f} ins/msg (n={m['n']}, runs {m['rates']}, lost {m['loss']})" for s, m in sorted(med.items())]
+             f"{m['ins_msg']:.0f} ins/msg, {m['pf_msg']:.3f} faults/msg, {m['brk_msg']:.3f} brk/msg (n={m['n']}, runs {m['rates']}, lost {m['loss']})" for s, m in sorted(med.items())]
     v = verdict(med)
     if v:
         parts.append(f"B vs A: msg/s {v[0]*100:+.1f}%, p99 {v[1]*100:+.1f}% -> {'pass' if v[2] else 'FAIL'}")
@@ -76,8 +80,8 @@ def cell_line(cd):
 
 
 def table(root):
-    rows = ["| backend | proto | size | conns | A msg/s | B msg/s | Δ msg/s | A p99 ms | B p99 ms | Δ p99 | A µs/msg | B µs/msg | A ins/msg | B ins/msg | gate |",
-            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    rows = ["| backend | proto | size | conns | A msg/s | B msg/s | Δ msg/s | A p99 ms | B p99 ms | Δ p99 | A µs/msg | B µs/msg | A ins/msg | B ins/msg | A faults/msg | B faults/msg | A brk/msg | B brk/msg | gate |",
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for be in ("epoll", "uring"):
         bd = os.path.join(root, be)
         if not os.path.isdir(bd):
@@ -94,7 +98,8 @@ def table(root):
             p, sz, n = key(c)
             rows.append(f"| {be} | {p} | {sz} | {n} | {a['rate']:,.0f} | {b['rate']:,.0f} | {v[0]*100:+.1f}% | "
                         f"{a['p99']:.3f} | {b['p99']:.3f} | {v[1]*100:+.1f}% | {a['us_msg']:.2f} | {b['us_msg']:.2f} | "
-                        f"{a['ins_msg']:.0f} | {b['ins_msg']:.0f} | {'pass' if v[2] else '**fail**'} |")
+                        f"{a['ins_msg']:.0f} | {b['ins_msg']:.0f} | {a['pf_msg']:.3f} | {b['pf_msg']:.3f} | {a['brk_msg']:.3f} | {b['brk_msg']:.3f} | "
+                        f"{'pass' if v[2] else '**fail**'} |")
     return "\n".join(rows)
 
 

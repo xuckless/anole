@@ -1,0 +1,35 @@
+13:28:54 start: a b = anole-bench/anole:net-a@e062b25584d9 anole-bench/anole:net-b2@50a701a3a9ff REST=70 RUNS=5 DUR=15
+13:30:23 epoll tcp 64 c256 a r1: 229755 msg/s, p50 1.081 ms, p99 1.278 ms, 2.48 us CPU/msg, 2531 ins:u/msg, 2749 cyc:u/msg, 0.247 faults/msg, 0.034 brk/msg, lost/errors 0
+13:31:52 epoll tcp 64 c256 b r1: 248586 msg/s, p50 1.016 ms, p99 1.180 ms, 2.16 us CPU/msg, 2035 ins:u/msg, 2241 cyc:u/msg, 0.000 faults/msg, 0.000 brk/msg, lost/errors 0
+13:33:21 epoll tcp 64 c256 b r2: 242659 msg/s, p50 1.032 ms, p99 1.245 ms, 2.25 us CPU/msg, 2041 ins:u/msg, 2366 cyc:u/msg, 0.000 faults/msg, 0.000 brk/msg, lost/errors 0
+13:34:50 epoll tcp 64 c256 a r2: 227611 msg/s, p50 1.114 ms, p99 1.278 ms, 2.52 us CPU/msg, 2528 ins:u/msg, 2803 cyc:u/msg, 0.317 faults/msg, 0.042 brk/msg, lost/errors 0
+13:36:19 epoll tcp 64 c256 a r3: 228068 msg/s, p50 1.081 ms, p99 1.343 ms, 2.47 us CPU/msg, 2490 ins:u/msg, 2746 cyc:u/msg, 0.088 faults/msg, 0.015 brk/msg, lost/errors 0
+13:37:48 epoll tcp 64 c256 b r3: 235356 msg/s, p50 1.049 ms, p99 1.212 ms, 2.37 us CPU/msg, 2047 ins:u/msg, 2573 cyc:u/msg, 0.000 faults/msg, 0.000 brk/msg, lost/errors 0
+13:39:17 epoll tcp 64 c256 b r4: 235411 msg/s, p50 1.049 ms, p99 1.212 ms, 2.36 us CPU/msg, 2045 ins:u/msg, 2557 cyc:u/msg, 0.000 faults/msg, 0.000 brk/msg, lost/errors 0
+13:40:46 epoll tcp 64 c256 a r4: 239342 msg/s, p50 1.049 ms, p99 1.212 ms, 2.31 us CPU/msg, 2458 ins:u/msg, 2520 cyc:u/msg, 0.054 faults/msg, 0.012 brk/msg, lost/errors 0
+13:42:15 epoll tcp 64 c256 a r5: 218360 msg/s, p50 1.147 ms, p99 1.311 ms, 2.67 us CPU/msg, 2545 ins:u/msg, 3073 cyc:u/msg, 0.332 faults/msg, 0.042 brk/msg, lost/errors 0
+13:43:44 epoll tcp 64 c256 b r5: 236655 msg/s, p50 1.049 ms, p99 1.245 ms, 2.35 us CPU/msg, 2047 ins:u/msg, 2583 cyc:u/msg, 0.000 faults/msg, 0.000 brk/msg, lost/errors 0
+13:43:44 cell epoll tcp 64 c256: a: 228068 msg/s, p99 1.278 ms, 2.48 us/msg, 2528 ins/msg, 0.247 faults/msg, 0.034 brk/msg (n=5, runs [229755, 227611, 228068, 239342, 218360], lost 0); b: 236655 msg/s, p99 1.212 ms, 2.35 us/msg, 2045 ins/msg, 0.000 faults/msg, 0.000 brk/msg (n=5, runs [248586, 242659, 235356, 235411, 236655], lost 0); B vs A: msg/s +3.8%, p99 -5.1% -> pass
+13:45:13 epoll tcp 64 c4096 a r1: 152765 msg/s, p50 26.214 ms, p99 30.409 ms, 4.33 us CPU/msg, 2497 ins:u/msg, 8179 cyc:u/msg, 0.013 faults/msg, 0.002 brk/msg, lost/errors 0
+13:46:42 epoll tcp 64 c4096 b r1: 154168 msg/s, p50 26.214 ms, p99 29.360 ms, 4.26 us CPU/msg, 2084 ins:u/msg, 8091 cyc:u/msg, 0.000 faults/msg, 0.000 brk/msg, lost/errors 0
+13:48:11 epoll tcp 64 c4096 b r2: 155205 msg/s, p50 26.214 ms, p99 28.312 ms, 4.21 us CPU/msg, 2087 ins:u/msg, 8050 cyc:u/msg, 0.000 faults/msg, 0.000 brk/msg, lost/errors 0
+13:49:40 epoll tcp 64 c4096 a r2: 162171 msg/s, p50 24.642 ms, p99 27.263 ms, 3.96 us CPU/msg, 2496 ins:u/msg, 7265 cyc:u/msg, 0.010 faults/msg, 0.001 brk/msg, lost/errors 0
+13:51:09 epoll tcp 64 c4096 a r3: 152763 msg/s, p50 26.214 ms, p99 28.836 ms, 4.34 us CPU/msg, 2492 ins:u/msg, 8388 cyc:u/msg, 0.009 faults/msg, 0.001 brk/msg, lost/errors 0
+13:52:38 epoll tcp 64 c4096 b r3: 155606 msg/s, p50 25.690 ms, p99 28.312 ms, 4.23 us CPU/msg, 2084 ins:u/msg, 8050 cyc:u/msg, 0.000 faults/msg, 0.000 brk/msg, lost/errors 0
+13:54:07 epoll tcp 64 c4096 b r4: 162752 msg/s, p50 24.642 ms, p99 27.263 ms, 3.93 us CPU/msg, 2080 ins:u/msg, 7242 cyc:u/msg, 0.000 faults/msg, 0.000 brk/msg, lost/errors 0
+13:55:36 epoll tcp 64 c4096 a r4: 151813 msg/s, p50 26.739 ms, p99 29.360 ms, 4.36 us CPU/msg, 2498 ins:u/msg, 8236 cyc:u/msg, 0.013 faults/msg, 0.002 brk/msg, lost/errors 0
+13:57:05 epoll tcp 64 c4096 a r5: 151875 msg/s, p50 26.739 ms, p99 29.360 ms, 4.36 us CPU/msg, 2489 ins:u/msg, 8328 cyc:u/msg, 0.000 faults/msg, 0.000 brk/msg, lost/errors 0
+13:58:34 epoll tcp 64 c4096 b r5: 155715 msg/s, p50 25.690 ms, p99 29.360 ms, 4.22 us CPU/msg, 2084 ins:u/msg, 8127 cyc:u/msg, 0.000 faults/msg, 0.000 brk/msg, lost/errors 0
+13:58:34 cell epoll tcp 64 c4096: a: 152763 msg/s, p99 29.360 ms, 4.34 us/msg, 2496 ins/msg, 0.010 faults/msg, 0.001 brk/msg (n=5, runs [152765, 162171, 152763, 151813, 151875], lost 0); b: 155606 msg/s, p99 28.312 ms, 4.22 us/msg, 2084 ins/msg, 0.000 faults/msg, 0.000 brk/msg (n=5, runs [154168, 155205, 155606, 162752, 155715], lost 0); B vs A: msg/s +1.9%, p99 -3.6% -> pass
+14:00:03 epoll tcp 16384 c256 a r1: 124072 msg/s, p50 2.032 ms, p99 2.425 ms, 5.81 us CPU/msg, 5528 ins:u/msg, 7549 cyc:u/msg, 1.038 faults/msg, 0.035 brk/msg, lost/errors 0
+14:01:32 epoll tcp 16384 c256 b r1: 102387 msg/s, p50 2.425 ms, p99 2.949 ms, 7.52 us CPU/msg, 5604 ins:u/msg, 9097 cyc:u/msg, 3.732 faults/msg, 0.116 brk/msg, lost/errors 0
+14:03:01 epoll tcp 16384 c256 b r2: 98776 msg/s, p50 2.490 ms, p99 3.080 ms, 7.84 us CPU/msg, 5606 ins:u/msg, 9229 cyc:u/msg, 3.730 faults/msg, 0.116 brk/msg, lost/errors 0
+14:04:29 epoll tcp 16384 c256 a r2: 131361 msg/s, p50 1.933 ms, p99 2.359 ms, 5.40 us CPU/msg, 5560 ins:u/msg, 7455 cyc:u/msg, 0.361 faults/msg, 0.013 brk/msg, lost/errors 0
+14:05:58 epoll tcp 16384 c256 a r3: 134329 msg/s, p50 1.868 ms, p99 2.228 ms, 5.24 us CPU/msg, 5678 ins:u/msg, 7313 cyc:u/msg, 0.229 faults/msg, 0.018 brk/msg, lost/errors 0
+14:07:27 epoll tcp 16384 c256 b r3: 104865 msg/s, p50 2.359 ms, p99 2.818 ms, 7.31 us CPU/msg, 5602 ins:u/msg, 8586 cyc:u/msg, 3.736 faults/msg, 0.116 brk/msg, lost/errors 0
+14:08:56 epoll tcp 16384 c256 b r4: 98888 msg/s, p50 2.490 ms, p99 3.080 ms, 7.83 us CPU/msg, 5598 ins:u/msg, 9256 cyc:u/msg, 3.729 faults/msg, 0.116 brk/msg, lost/errors 0
+14:10:25 epoll tcp 16384 c256 a r4: 132346 msg/s, p50 1.901 ms, p99 2.294 ms, 5.32 us CPU/msg, 5520 ins:u/msg, 7369 cyc:u/msg, 0.327 faults/msg, 0.012 brk/msg, lost/errors 0
+14:11:54 epoll tcp 16384 c256 a r5: 132334 msg/s, p50 1.868 ms, p99 2.425 ms, 5.34 us CPU/msg, 5535 ins:u/msg, 7123 cyc:u/msg, 0.702 faults/msg, 0.025 brk/msg, lost/errors 0
+14:13:23 epoll tcp 16384 c256 b r5: 97375 msg/s, p50 2.556 ms, p99 3.080 ms, 7.96 us CPU/msg, 5595 ins:u/msg, 9411 cyc:u/msg, 3.785 faults/msg, 0.114 brk/msg, lost/errors 0
+14:13:23 cell epoll tcp 16384 c256: a: 132334 msg/s, p99 2.359 ms, 5.34 us/msg, 5535 ins/msg, 0.361 faults/msg, 0.018 brk/msg (n=5, runs [124072, 131361, 134329, 132346, 132334], lost 0); b: 98888 msg/s, p99 3.080 ms, 7.83 us/msg, 5602 ins/msg, 3.732 faults/msg, 0.116 brk/msg (n=5, runs [102387, 98776, 104865, 98888, 97375], lost 0); B vs A: msg/s -25.3%, p99 +30.6% -> FAIL
+14:13:23 stopped: epoll tcp 16384 c256 fails the gate
