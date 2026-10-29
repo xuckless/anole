@@ -1011,18 +1011,14 @@ test "HTTP/2: a drain with a stream in flight sends a two-phase GOAWAY and finis
     try std.testing.expectEqualStrings("held but whole", resp.body.items);
 }
 
-/// The server whose drain `holdUnreadAtDrain` watches.
-var unread_server: ?*dusty.Server(void) = null;
-/// `holdUnreadAtDrain` holds the reader after the final GOAWAY.
+/// `holdUnreadAtDrain` holds the reader after the final GOAWAY. It acts
+/// once: a later entry (the reader going on) passes straight through.
 var unread_held: std.atomic.Value(bool) = .init(false);
 /// The server's socket, once `holdUnreadAtDrain` has held the reader with
 /// the client's PING unread and let it go (-1 before).
 var unread_socket: std.atomic.Value(std.Io.net.Socket.Handle) = .init(-1);
 /// `holdUnreadAtDrain` let the reader go with a cancel.
 var unread_canceled: std.atomic.Value(bool) = .init(false);
-/// The server's in-flight count when the test let the held request
-/// answer: the stream's, and the drain's hold on the connection if any.
-var unread_gate_count: std.atomic.Value(u32) = .init(0);
 
 fn hasUnreadInput(fd: std.Io.net.Socket.Handle) bool {
     var n: c_int = 0;
@@ -1034,24 +1030,24 @@ fn isSet(flag: *std.atomic.Value(bool)) bool {
     return flag.load(.acquire);
 }
 
-fn heldStreamSettled(server: *dusty.Server(void)) bool {
-    const at_gate = unread_gate_count.load(.acquire);
-    return at_gate != 0 and server.busy.load(.acquire).count < at_gate;
-}
-
 fn never(_: void) bool {
     return false;
 }
 
-/// `h2.test_before_fill` for the test below. Once the drain's final GOAWAY
-/// is submitted, holds the reader, uncancelably, until the client's PING
-/// is in the server's socket and the held stream is settled. A drain that
-/// has let go of the connection by then (#135) cancels it: the cancel is
-/// taken here, with the PING unread. A drain still holding it lets the
-/// reader go on.
+/// `h2.test_before_fill` for the test below. The first time the reader
+/// waits for input after the drain's final GOAWAY is submitted, holds it,
+/// uncancelably, until the client's PING is in the server's socket. The
+/// PING follows the response, which the writer takes only after it has
+/// flushed the final GOAWAY, so by then a drain that lets go of a
+/// connection at that flush (#135) has done so: it cancels the connection
+/// once the held stream is done, and the cancel is taken here, with the
+/// PING unread. A drain still holding the connection lets the reader go
+/// on. (The server's in-flight count cannot tell the two apart: the
+/// stream's count and the drain's hold are one each, and the stream's may
+/// go back before or after the server's FIN.)
 fn holdUnreadAtDrain(io: std.Io, probe: h2.FillProbe) std.Io.Cancelable!void {
     if (!probe.goaway_sent) return;
-    unread_held.store(true, .release);
+    if (unread_held.swap(true, .acq_rel)) return;
     defer unread_socket.store(probe.socket, .release);
     {
         const protection = io.swapCancelProtection(.blocked);
@@ -1060,14 +1056,8 @@ fn holdUnreadAtDrain(io: std.Io, probe: h2.FillProbe) std.Io.Cancelable!void {
             error.Canceled => unreachable,
             error.WaitTimedOut => return,
         };
-        // The held stream gives its count back once its response is out.
-        // What is left is the connection's drain hold, or nothing.
-        wait.waitUntil(io, "the held stream is settled", unread_server.?, heldStreamSettled) catch |err| switch (err) {
-            error.Canceled => unreachable,
-            error.WaitTimedOut => return,
-        };
     }
-    if (unread_server.?.busy.load(.acquire).count > 0) return;
+    if (probe.drainHolds()) return;
     wait.waitUntil(io, "the drain's cancel", {}, never) catch |err| switch (err) {
         error.Canceled => {
             unread_canceled.store(true, .release);
@@ -1132,11 +1122,9 @@ test "HTTP/2: a drain ends with a clean close when the peer's last frames are un
     try fx.start(io);
     defer fx.server.deinit();
 
-    unread_server = &fx.server;
     unread_held.store(false, .release);
     unread_socket.store(-1, .release);
     unread_canceled.store(false, .release);
-    unread_gate_count.store(0, .release);
     h2.test_before_fill = holdUnreadAtDrain;
     defer h2.test_before_fill = null;
 
@@ -1192,7 +1180,6 @@ test "HTTP/2: a drain ends with a clean close when the peer's last frames are un
                 const last = std.mem.readInt(u32, payload[0..4], .big) & 0x7fff_ffff;
                 if (last != std.math.maxInt(u31)) {
                     try wait.waitUntil(io, "the server's reader is held after the final GOAWAY", &unread_held, isSet);
-                    unread_gate_count.store(@intCast(fx.server.busy.load(.acquire).count), .release);
                     Handlers.held_gate.set(io);
                 }
             },

@@ -73,6 +73,16 @@ pub const FillProbe = struct {
     goaway_sent: bool,
     /// The connection's socket.
     socket: std.Io.net.Socket.Handle,
+    /// The connection, for `drainHolds`.
+    conn: *anyopaque,
+    drain_holds: *const fn (*anyopaque) bool,
+
+    /// Whether the drain still counts the connection in flight, now (not
+    /// when the hook was entered): a drain that has let go of it cancels
+    /// it once nothing else is in flight. Takes the connection's mutex.
+    pub fn drainHolds(probe: FillProbe) bool {
+        return probe.drain_holds(probe.conn);
+    }
 };
 
 /// The client connection preface (RFC 9113 §3.4).
@@ -1000,7 +1010,19 @@ pub fn Engine(comptime Ctx: type) type {
 
                 if (comptime @import("builtin").is_test) if (test_before_fill) |hook| {
                     conn.lock();
-                    const probe: FillProbe = .{ .goaway_sent = conn.goaway_sent, .socket = conn.connection.stream.socket.handle };
+                    const probe: FillProbe = .{
+                        .goaway_sent = conn.goaway_sent,
+                        .socket = conn.connection.stream.socket.handle,
+                        .conn = conn,
+                        .drain_holds = struct {
+                            fn holds(ptr: *anyopaque) bool {
+                                const c_: *Conn = @ptrCast(@alignCast(ptr));
+                                c_.lock();
+                                defer c_.unlock();
+                                return c_.drain_hold;
+                            }
+                        }.holds,
+                    };
                     conn.unlock();
                     try hook(conn.io, probe);
                 };
