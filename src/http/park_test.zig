@@ -362,22 +362,24 @@ fn keepAliveDeadline(secure: bool) !void {
     Server.setParkSweepIntervalForTest(.fromMilliseconds(50));
     defer Server.setParkSweepIntervalForTest(null);
     var f: Fixture = undefined;
-    try f.start(gpa, 1, secure, .{ .idle_park = .fromMilliseconds(30), .keepalive = .fromMilliseconds(150) });
+    try f.start(gpa, 1, secure, .{ .idle_park = .fromMilliseconds(30), .keepalive = .fromMilliseconds(600) });
     defer f.stop(gpa);
 
     var c: Client = undefined;
     try c.open(f.io, f.addr(), secure);
     defer c.close(f.io);
     // Before the request: the wait for the next one starts after this, so
-    // the keep-alive deadline (150 ms from that start, never swept early)
-    // is at least 150 ms from here, however slow the machine.
+    // the keep-alive deadline (600 ms from that start, never swept early)
+    // is at least 600 ms from here, however slow the machine. The deadline
+    // stays well past the 30 ms park so the parked gauge has a wide window
+    // to be seen in; the 50 ms sweep keeps the close prompt after it.
     const before = std.Io.Timestamp.now(f.io, .awake);
     try std.testing.expectEqual(200, try c.get("/"));
     try f.waitParked(1);
     const parked_at = std.Io.Timestamp.now(f.io, .awake);
     try std.testing.expect(c.hungUp());
     // Not closed as it parked: closed at its deadline.
-    try std.testing.expect(before.untilNow(f.io, .awake).toMilliseconds() >= 150);
+    try std.testing.expect(before.untilNow(f.io, .awake).toMilliseconds() >= 600);
     // Not much later than it (the sweep's 50 ms): a timing claim.
     const waited = parked_at.untilNow(f.io, .awake).toMilliseconds();
     if (wait.timing()) try std.testing.expect(waited < 2_500);
@@ -398,7 +400,7 @@ test "idle park: a connection that never sends a request parks under the request
     Server.setParkSweepIntervalForTest(.fromMilliseconds(50));
     defer Server.setParkSweepIntervalForTest(null);
     var f: Fixture = undefined;
-    try f.start(gpa, 1, false, .{ .idle_park = .fromMilliseconds(30), .request = .fromMilliseconds(150) });
+    try f.start(gpa, 1, false, .{ .idle_park = .fromMilliseconds(30), .request = .fromMilliseconds(500) });
     defer f.stop(gpa);
 
     var c: Client = undefined;
