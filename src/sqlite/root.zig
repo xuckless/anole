@@ -23,9 +23,9 @@
 //! - **Writes** go to the database's own writer thread, which owns the one
 //!   read-write connection: `exec`, a statement that changes something
 //!   (`INSERT ... RETURNING` through `one` too), `.with(.{ .write = true })`,
-//!   and transactions. Callers take turns in arrival order, so Anole's own
-//!   writers never meet `SQLITE_BUSY`; the coroutine waits, its executor
-//!   serves the rest.
+//!   and transactions. Callers take turns one at a time (no order among
+//!   the waiters), so Anole's own writers never meet `SQLITE_BUSY`; the
+//!   coroutine waits, its executor serves the rest.
 //! - **Reads** (`SELECT`, `WITH`, `VALUES`, `PRAGMA`, `EXPLAIN`) run on
 //!   `anole.blocking`'s threads over a pool of read-only connections (one
 //!   per executor, at most 8), beside the writer: the database is in WAL
@@ -66,6 +66,7 @@ const sqlite = @import("anole_sqlite");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
 const blocking = @import("../blocking.zig");
+const dusty = @import("dusty");
 const observe = @import("../observe/root.zig");
 
 /// SQLite's C API (sqlite3.h, as built), for what Anole's calls leave out.
@@ -171,11 +172,14 @@ pub const Client = struct {
     observer: db.Observer,
     /// `/readyz`'s check, once `start` has a `Health` for it.
     readiness: db.Readiness,
-    /// Connections in use (readers taken, the writer held), for the gauges.
-    in_use: std.atomic.Value(i64) = .init(0),
+    /// Connections in use (readers taken, the writer held), for the gauges:
+    /// per executor, summed when read (SAFETY.md L7). A call that ends on
+    /// another executor than it began leaves one slot high and one low;
+    /// only the sum means anything.
+    in_use: dusty.exec_counter.PerExecutor(i64) = .init,
     /// Calls waiting for a reader or for the writer, for the gauges and
-    /// the console's `/db`.
-    waiting: std.atomic.Value(i64) = .init(0),
+    /// the console's `/db`; per executor, as `in_use`.
+    waiting: dusty.exec_counter.PerExecutor(i64) = .init,
     /// Calls with `.coalesce` or `.cache` (`with`), and `invalidate` for
     /// cached results: `app.db.cache.invalidate(.{ .tag = "notes" })`.
     cache: db.QueryCache,
@@ -262,7 +266,7 @@ pub const Client = struct {
         if (registry) |r| {
             const m = try db.Metrics.init(r, .sqlite, self.name);
             const total: i64 = @intCast(self.readers.conns.len + 1);
-            const in_use = self.in_use.load(.monotonic);
+            const in_use = self.in_use.sum();
             m.idle.add(total - in_use);
             m.in_use.add(in_use);
             self.observer.metrics = m;
@@ -277,8 +281,8 @@ pub const Client = struct {
     /// `init` on). From any thread: the counts are atomics, no lock.
     pub fn consoleInfo(self: *Client, w: *std.Io.Writer) !void {
         const total: i64 = @intCast(self.readers.conns.len + 1);
-        const in_use = std.math.clamp(self.in_use.load(.monotonic), 0, total);
-        const waiting = @max(self.waiting.load(.monotonic), 0);
+        const in_use = std.math.clamp(self.in_use.sum(), 0, total);
+        const waiting = @max(self.waiting.sum(), 0);
         try w.print("\"system\":\"sqlite\",\"name\":{f},\"target\":{f},\"pools\":[{{\"max\":{d},\"open\":{d},\"idle\":{d},\"in_use\":{d},\"waiting\":{d}}}]", .{
             std.json.fmt(self.name, .{}), std.json.fmt(self.path, .{}), total, total, total - in_use, in_use, waiting,
         });
@@ -341,11 +345,12 @@ pub const Client = struct {
     ///     try tx.commit(req);
     pub fn begin(self: *Client, cx: anytype, options: db.TxOptions) Error!Tx {
         const reader = options.read_only and self.readers.conns.len > 0;
+        var lease: u32 = 0;
         const conn: *Connection = if (reader) try self.acquireReader(cx.io) else blk: {
-            try self.lockWriter(cx.io);
+            lease = try self.lockWriter(cx.io);
             break :blk &self.writer.conn;
         };
-        var tx: Tx = .{ .db = self, .io = cx.io, .conn = conn, .on_writer = !reader };
+        var tx: Tx = .{ .db = self, .io = cx.io, .conn = conn, .on_writer = !reader, .lease = lease };
         errdefer tx.release();
         _ = try tx.runOp(cx, .exec, void, if (reader) "BEGIN" else "BEGIN IMMEDIATE", .{}, .{ .prepare = false });
         return tx;
@@ -388,8 +393,8 @@ pub const Client = struct {
     /// The writer connection for the driver's own calls (`Conn.run`), held
     /// until `release`.
     pub fn acquire(self: *Client, cx: anytype) Error!Conn {
-        try self.lockWriter(cx.io);
-        return .{ .db = self, .io = cx.io };
+        const lease = try self.lockWriter(cx.io);
+        return .{ .db = self, .io = cx.io, .lease = lease };
     }
 
     // -----------------------------------------------------------------------
@@ -401,12 +406,12 @@ pub const Client = struct {
         try r.mutex.lock(io);
         defer r.mutex.unlock(io);
         if (r.free_len == 0) {
-            self.waits(1);
-            defer self.waits(-1);
+            self.waits(io, 1);
+            defer self.waits(io, -1);
             while (r.free_len == 0) try r.changed.wait(io, &r.mutex);
         }
         r.free_len -= 1;
-        self.taken(started.durationTo(.now(io, .awake)).raw);
+        self.taken(io, started.durationTo(.now(io, .awake)).raw);
         return r.free[r.free_len];
     }
 
@@ -417,38 +422,74 @@ pub const Client = struct {
         r.free[r.free_len] = conn;
         r.free_len += 1;
         r.changed.signal(io);
-        self.given();
+        self.given(io);
     }
 
-    /// Takes the writer: one call, transaction or `acquire` at a time.
-    fn lockWriter(self: *Client, io: std.Io) error{Canceled}!void {
+    /// Checks the writer out: one call, transaction, `iterate` or `acquire`
+    /// holds it at a time (a pool of one; no order among the waiters). The
+    /// returned lease gives it back (`unlockWriter`). Nothing is locked
+    /// when this returns: the holder suspends freely (SAFETY.md L2).
+    fn lockWriter(self: *Client, io: std.Io) error{Canceled}!u32 {
+        const w = &self.writer;
         const started: std.Io.Clock.Timestamp = .now(io, .awake);
-        if (!self.writer.lock.tryLock()) {
-            self.waits(1);
-            defer self.waits(-1);
-            try self.writer.lock.lock(io);
+        try w.mutex.lock(io);
+        if (w.held) {
+            self.waits(io, 1);
+            while (w.held) w.free.wait(io, &w.mutex) catch |err| {
+                // `deregister` hands a wake this waiter took on to the next.
+                w.mutex.unlock(io);
+                self.waits(io, -1);
+                return err;
+            };
+            self.waits(io, -1);
         }
-        self.taken(started.durationTo(.now(io, .awake)).raw);
+        w.held = true;
+        w.lease +%= 1;
+        const lease = w.lease;
+        w.mutex.unlock(io);
+        self.taken(io, started.durationTo(.now(io, .awake)).raw);
+        return lease;
     }
 
-    fn unlockWriter(self: *Client, io: std.Io) void {
-        self.writer.lock.unlock(io);
-        self.given();
+    /// Gives the writer back when `lease` is the checkout holding it; a
+    /// lease given back already (a second `release`) does nothing but log
+    /// (SAFETY.md M6).
+    fn unlockWriter(self: *Client, io: std.Io, lease: u32) void {
+        const w = &self.writer;
+        w.mutex.lockUncancelable(io);
+        if (!w.held or w.lease != lease) {
+            w.mutex.unlock(io);
+            log.err("sqlite \"{s}\": the writer was given back twice; the second time did nothing", .{self.name});
+            return;
+        }
+        w.held = false;
+        w.lease +%= 1;
+        w.free.signal(io);
+        w.mutex.unlock(io);
+        self.given(io);
     }
 
-    fn waits(self: *Client, delta: i64) void {
-        _ = self.waiting.fetchAdd(delta, .monotonic);
+    /// Whether `lease` is the checkout holding the writer now.
+    fn holdsWriter(self: *Client, io: std.Io, lease: u32) bool {
+        const w = &self.writer;
+        w.mutex.lockUncancelable(io);
+        defer w.mutex.unlock(io);
+        return w.held and w.lease == lease;
+    }
+
+    fn waits(self: *Client, io: std.Io, delta: i64) void {
+        self.waiting.add(io, delta);
         self.observer.waiting(delta);
     }
 
-    fn taken(self: *Client, waited: std.Io.Duration) void {
-        _ = self.in_use.fetchAdd(1, .monotonic);
+    fn taken(self: *Client, io: std.Io, waited: std.Io.Duration) void {
+        self.in_use.add(io, 1);
         self.observer.connections(-1, 1);
         self.observer.acquired(waited);
     }
 
-    fn given(self: *Client) void {
-        _ = self.in_use.fetchSub(1, .monotonic);
+    fn given(self: *Client, io: std.Io) void {
+        self.in_use.add(io, -1);
         self.observer.connections(1, -1);
     }
 
@@ -488,7 +529,9 @@ pub const Client = struct {
                 w.mutex.unlock(io);
                 return err;
             }
-            // Under the lock, so the interrupt cannot reach the next job.
+            // SAFETY (L3): sqlite3_interrupt only sets a flag, documented safe
+            // from any thread (https://sqlite.org/c3ref/interrupt.html); under
+            // the mutex so it cannot reach the next job.
             if (w.running == &t.job) c.sqlite3_interrupt(w.conn.handle.db);
             w.mutex.unlock(io);
             t.job.done.waitUncancelable(io);
@@ -643,8 +686,8 @@ pub const Query = struct {
                 else => |e| return e,
             }
         }
-        try self.lockWriter(cx.io);
-        defer self.unlockWriter(cx.io);
+        const lease = try self.lockWriter(cx.io);
+        defer self.unlockWriter(cx.io, lease);
         return runOnWriter(self, cx, op, T, sql, args, flags);
     }
 };
@@ -673,6 +716,8 @@ pub const Tx = struct {
     io: std.Io,
     conn: *Connection,
     on_writer: bool,
+    /// The writer's checkout, when `on_writer`.
+    lease: u32 = 0,
     /// Committed or rolled back.
     finished: bool = false,
 
@@ -752,7 +797,7 @@ pub const Tx = struct {
 
     fn release(tx: *Tx) void {
         tx.finished = true;
-        if (tx.on_writer) tx.db.unlockWriter(tx.io) else tx.db.releaseReader(tx.io, tx.conn);
+        if (tx.on_writer) tx.db.unlockWriter(tx.io, tx.lease) else tx.db.releaseReader(tx.io, tx.conn);
     }
 
     fn usable(tx: *const Tx, cx: anytype) Error!void {
@@ -843,6 +888,8 @@ fn failedWith(d: *Client, cx: anytype, comptime message: []const u8) Error {
 pub const Conn = struct {
     db: *Client,
     io: std.Io,
+    /// The writer's checkout this `Conn` holds until `release`.
+    lease: u32,
 
     /// Runs `func(driver_db, args...)` on the writer thread, with
     /// `driver_db` zig-sqlite's `*driver.Db` on the writer connection: what may
@@ -856,15 +903,20 @@ pub const Conn = struct {
         return self.db.onWriter(self.io, Wrap.call, .{ self.db, args });
     }
 
-    /// Gives the writer back, for the next call or transaction.
+    /// Gives the writer back, for the next call or transaction; a second
+    /// call does nothing (it logs). Don't call anything on it after.
     pub fn release(self: *const Conn) void {
+        if (!self.db.holdsWriter(self.io, self.lease)) {
+            log.err("sqlite \"{s}\": a connection from acquire() was released twice; the second release did nothing", .{self.db.name});
+            return;
+        }
         {
             const was = self.io.swapCancelProtection(.blocked);
             defer _ = self.io.swapCancelProtection(was);
             if (self.db.onWriter(self.io, rollbackIfOpen, .{&self.db.writer.conn}) catch false)
                 log.err("acquire(): the writer was given back inside a transaction; rolled back", .{});
         }
-        self.db.unlockWriter(self.io);
+        self.db.unlockWriter(self.io, self.lease);
     }
 };
 
@@ -883,6 +935,8 @@ pub fn Rows(comptime T: type) type {
         on_writer: bool,
         /// Gives the connection back on `deinit` (not inside a `Tx`).
         owns: bool,
+        /// The writer's checkout, when `on_writer` and `owns`.
+        lease: u32 = 0,
         stmt: Stmt,
         columns: Columns(T),
         /// Records a failure on the caller's request.
@@ -905,12 +959,14 @@ pub fn Rows(comptime T: type) type {
                     if (err != error.NeedsWriter) return @errorCast(err);
                 }
             }
-            try d.lockWriter(cx.io);
-            errdefer d.unlockWriter(cx.io);
-            return startOn(d, cx, &d.writer.conn, true, true, sql, args) catch |err| switch (err) {
+            const lease = try d.lockWriter(cx.io);
+            errdefer d.unlockWriter(cx.io, lease);
+            var rows = startOn(d, cx, &d.writer.conn, true, true, sql, args) catch |err| switch (err) {
                 error.NeedsWriter => unreachable,
-                else => |e| e,
+                else => |e| return e,
             };
+            rows.lease = lease;
+            return rows;
         }
 
         fn startOn(d: *Client, cx: anytype, conn: *Connection, on_writer: bool, owns: bool, sql: []const u8, args: anytype) (Error || error{NeedsWriter})!Self {
@@ -1017,7 +1073,7 @@ pub fn Rows(comptime T: type) type {
                     Client.onReader(self.io, self.conn, rollbackIfOpen, .{self.conn});
                 if (rolled catch false) log.err("the call left a transaction open (BEGIN without its COMMIT in the same call); rolled back", .{});
             }
-            if (self.on_writer) self.db.unlockWriter(self.io) else self.db.releaseReader(self.io, self.conn);
+            if (self.on_writer) self.db.unlockWriter(self.io, self.lease) else self.db.releaseReader(self.io, self.conn);
         }
 
         fn fetchJob(self: *Self, f: *Failure) JobError!void {
@@ -1056,13 +1112,13 @@ const Job = struct {
     done: std.Io.Event = .unset,
 };
 
+/// owner: the `Client` (process-wide, M2); the thread is joined in
+/// `Client.deinit` before anything here is freed, so it wakes callers
+/// directly (SAFETY.md T5).
 const Writer = struct {
     conn: Connection,
     thread: std.Thread,
-    /// Held by a writing call, a transaction or an `acquire`, in arrival
-    /// order; the holder alone hands the thread jobs.
-    lock: safety.Mutex(.leaf) = .init,
-    /// Guards the fields below.
+    /// Guards every field below; the writer thread takes it too.
     mutex: safety.Mutex(.leaf) = .init,
     ready: safety.Condition = .init,
     /// The job handed over and not yet started.
@@ -1070,6 +1126,16 @@ const Writer = struct {
     /// The job running: a cancel may interrupt it.
     running: ?*Job = null,
     closing: bool = false,
+    /// Checked out by a writing call, a transaction, an `iterate` or an
+    /// `acquire` (`Client.lockWriter`): one holder at a time, which alone
+    /// hands the thread jobs. A pool of one, as database/sql's
+    /// SetMaxOpenConns(1), not a lock held across the holder's calls.
+    held: bool = false,
+    /// Bumped by each checkout and each give-back (odd while held): a
+    /// give-back with another lease does nothing (M6).
+    lease: u32 = 0,
+    /// Signalled when the writer is given back.
+    free: safety.Condition = .init,
 
     /// The thread: runs each job handed over, until `Client.deinit`.
     fn loop(w: *Writer, io: std.Io) void {

@@ -509,8 +509,8 @@ no statement runs on an executor:
 - **Writes** go to the database's writer thread, which owns the one
   read-write connection: `exec`, any statement that changes something
   (`INSERT ... RETURNING` through `one` included), and transactions.
-  Writers take turns in arrival order, so they never get `SQLITE_BUSY`
-  from each other.
+  Writers take turns one at a time, so they never get `SQLITE_BUSY` from
+  each other.
 - **Reads** (`SELECT`, `WITH`, `VALUES`, `PRAGMA`, `EXPLAIN`) run on the
   server's blocking pool over read-only connections, one per executor (at
   most 8). The database is in WAL mode, so reads run beside a write and

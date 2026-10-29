@@ -1138,6 +1138,93 @@ test "sqlite: a writer released twice leaves the next holder's transaction alone
     try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
+/// Tasks that hold a connection until `go` is set (B-1).
+const Holders = struct {
+    db: *sqlite.Client,
+    io: std.Io,
+    go: std.Io.Event = .unset,
+    failed: std.atomic.Value(u32) = .init(0),
+
+    fn iterate(h: *Holders) void {
+        var sc: Scratch = undefined;
+        sc.init(h.io);
+        defer sc.deinit();
+        var rows = h.db.iterate(Note, &sc.ctx, "SELECT id, title, done FROM notes", .{}) catch {
+            _ = h.failed.fetchAdd(1, .monotonic);
+            return;
+        };
+        defer rows.deinit();
+        h.go.wait(h.io) catch {};
+    }
+
+    fn acquire(h: *Holders) void {
+        var sc: Scratch = undefined;
+        sc.init(h.io);
+        defer sc.deinit();
+        const conn = h.db.acquire(&sc.ctx) catch {
+            _ = h.failed.fetchAdd(1, .monotonic);
+            return;
+        };
+        defer conn.release();
+        h.go.wait(h.io) catch {};
+    }
+
+    fn read(h: *Holders) void {
+        var sc: Scratch = undefined;
+        sc.init(h.io);
+        defer sc.deinit();
+        _ = h.db.one(i64, &sc.ctx, "SELECT count(*) FROM notes", .{}) catch {
+            _ = h.failed.fetchAdd(1, .monotonic);
+        };
+    }
+};
+
+/// Whether the console's `/db` entry of `db` says `want`.
+fn consoleSays(db: *sqlite.Client, comptime want: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    db.consoleInfo(&w) catch return false;
+    return std.mem.indexOf(u8, w.buffered(), want) != null;
+}
+
+test "sqlite: the console's in_use and waiting count calls on every executor" {
+    var r: Runtime = undefined;
+    try r.init(2, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(io);
+    defer s.deinit();
+    _ = try db.exec(&s.ctx, schema, .{});
+
+    var h: Holders = .{ .db = db, .io = io };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    // The reader held on executor 0, the writer on executor 1, and a read
+    // on executor 1 waiting for the reader.
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, Holders.iterate, .{&h});
+    try wait.waitUntil(io, "the reader held", db, struct {
+        fn f(d: *sqlite.Client) bool {
+            return consoleSays(d, "\"in_use\":1,");
+        }
+    }.f);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, Holders.acquire, .{&h});
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, Holders.read, .{&h});
+    try wait.waitUntil(io, "two connections in use and one call waiting", db, struct {
+        fn f(d: *sqlite.Client) bool {
+            return consoleSays(d, "\"in_use\":2,\"waiting\":1}");
+        }
+    }.f);
+    h.go.set(io);
+    try group.await(io);
+    try testing.expectEqual(@as(u32, 0), h.failed.load(.monotonic));
+    try testing.expect(consoleSays(db, "\"in_use\":0,\"waiting\":0}"));
+}
+
 test "sqlite: Tx.table and Tx.run see the transaction's own writes" {
     const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
     defer db.deinit();
