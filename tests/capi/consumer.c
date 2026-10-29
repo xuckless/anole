@@ -58,6 +58,12 @@ static double wait_until(void) {
   return now_ms() + 10000.0 * (double)n;
 }
 
+/* The same hang guard for a call that takes milliseconds
+   (anole_server_wait). */
+static uint32_t wait_ms(void) {
+  return (uint32_t)(wait_until() - now_ms());
+}
+
 /* Elapsed-time upper bounds hold only on a machine that is not stalled:
    checked under `zig build test-timing` (ANOLE_TEST_TIMING set and not "0"),
    as src/testing/wait.zig's timing(); never in CI. */
@@ -325,6 +331,8 @@ static void *consumer_main(void *arg) {
   int fd = (int)anole_consumer_fd(cs->c);
   while (!atomic_load(&cs->stopped)) {
     if (atomic_load(&cs->paused)) {
+      /* Paused on purpose (the test holds the consumer off the ring until
+         it clears the flag); not a wait on the engine. */
       usleep(1000);
       continue;
     }
@@ -820,14 +828,18 @@ static void test_route_conflicts(void) {
   anole_server *s = make_server(fine);
   CHECK(anole_server_start(s) == ANOLE_OK);
   CHECK(anole_server_drain(s) == ANOLE_OK);
-  CHECK(anole_server_wait(s, 5000) == ANOLE_OK);
+  CHECK(anole_server_wait(s, wait_ms()) == ANOLE_OK);
   anole_server_destroy(s);
   printf("ok route conflicts: ANOLE_E_CONFIG naming the routes, no panic\n");
 }
 
 static void test_main_server(void) {
   char json[4096];
-  snprintf(json, sizeof json, test_config, 4, 128 * 1024, 64, 400, 600, have_websocket ? ws_route : "");
+  /* The drain's budget (shutdown_ms) is half the wait helper's deadline:
+     the drain test below answers a held request after a pause, which must
+     fall inside it on any machine. */
+  snprintf(json, sizeof json, test_config, 4, 128 * 1024, 64, 400, (int)(wait_ms() / 2),
+           have_websocket ? ws_route : "");
   anole_server *s = make_server(json);
   current_server = s;
 
@@ -1131,7 +1143,7 @@ static void test_main_server(void) {
       ws_connect(&c2, port);
       CHECK(wait_for(&cs.ws_open, 5));
       int ok = 0;
-      for (int i = 0; i < 300 && !ok; i++) {
+      for (double until = wait_until(); !ok && now_ms() < until;) {
         if (anole_ws_publish(s, room, ANOLE_WS_TEXT, "after", 5, 0) == ANOLE_OK) ok = 1;
         else usleep(10000);
       }
@@ -1184,14 +1196,17 @@ static void test_main_server(void) {
     CHECK(anole_server_drain(s) == ANOLE_OK);
     CHECK(anole_server_drain(s) == ANOLE_OK); /* again: no-op */
     CHECK(anole_server_wait(s, 0) == ANOLE_E_TIMEOUT);
+    /* Time passes on purpose, and the drain still waits for the held
+       request (a slow machine only makes the wait longer). */
     usleep(100 * 1000);
+    CHECK(anole_server_wait(s, 0) == ANOLE_E_TIMEOUT);
     CHECK(anole_req_respond(cs.held[0], 200, NULL, 0, "drained", 7, 0) == ANOLE_OK);
     pthread_join(t1, NULL);
     pthread_join(t2, NULL);
     async_req *answered = a.r.status == 200 ? &a : &b, *dropped = answered == &a ? &b : &a;
     CHECK(answered->r.status == 200 && strcmp(answered->r.body, "drained") == 0);
     CHECK(dropped->r.status == 504 || dropped->r.eof);
-    CHECK(anole_server_wait(s, 10000) == ANOLE_OK);
+    CHECK(anole_server_wait(s, wait_ms()) == ANOLE_OK);
     double took = now_ms() - t0;
     CHECK(anole_req_respond(cs.held[1], 200, NULL, 0, NULL, 0, 0) == ANOLE_E_GONE);
     pthread_join(cs.thread, NULL);
@@ -1212,7 +1227,7 @@ static void test_main_server(void) {
 /* Polls `c` until a request arrives; its handle. */
 static anole_req next_request(anole_consumer *c) {
   static _Alignas(8) unsigned char buf[64 * 1024];
-  for (int i = 0; i < 100; i++) {
+  for (double until = wait_until(); now_ms() < until;) {
     int64_t n = anole_poll_wait(c, buf, sizeof buf, 100);
     CHECK(n >= 0);
     for (int64_t off = 0; off < n;) {
@@ -1250,7 +1265,7 @@ static void test_stale_across_servers(void) {
       /* Left unanswered: the drain cuts it. */
       old = h;
       CHECK(anole_server_drain(s) == ANOLE_OK);
-      CHECK(anole_server_wait(s, 5000) == ANOLE_OK);
+      CHECK(anole_server_wait(s, wait_ms()) == ANOLE_OK);
       anole_server_destroy(s);
       close(cr.fd);
       continue;
@@ -1266,7 +1281,7 @@ static void test_stale_across_servers(void) {
     response_free(&r);
     close(cr.fd);
     CHECK(anole_server_drain(s) == ANOLE_OK);
-    CHECK(anole_server_wait(s, 5000) == ANOLE_OK);
+    CHECK(anole_server_wait(s, wait_ms()) == ANOLE_OK);
     anole_server_destroy(s);
   }
   printf("ok stale handles across servers: ANOLE_E_GONE\n");
@@ -2494,7 +2509,7 @@ static anole_server *polled_server(const char *json, anole_consumer **c) {
 
 static void stop_polled(anole_server *s) {
   CHECK(anole_server_drain(s) == ANOLE_OK);
-  CHECK(anole_server_wait(s, 10000) == ANOLE_OK);
+  CHECK(anole_server_wait(s, wait_ms()) == ANOLE_OK);
   anole_server_destroy(s);
 }
 
@@ -2502,7 +2517,7 @@ static void stop_polled(anole_server *s) {
    a buffer that lives until the next call. */
 static const anole_event *next_event(anole_consumer *c, uint32_t type) {
   static _Alignas(8) unsigned char buf[256 * 1024];
-  for (int i = 0; i < 100; i++) {
+  for (double until = wait_until(); now_ms() < until;) {
     int64_t n = anole_poll_wait(c, buf, sizeof buf, 100);
     CHECK(n >= 0);
     for (int64_t off = 0; off < n;) {
@@ -2519,7 +2534,7 @@ static const anole_event *next_event(anole_consumer *c, uint32_t type) {
 static void collect_sent(anole_consumer *c, int n, anole_sent_event *out) {
   static _Alignas(8) unsigned char buf[64 * 1024];
   int got = 0;
-  for (int i = 0; i < 100 && got < n; i++) {
+  for (double until = wait_until(); got < n && now_ms() < until;) {
     int64_t k = anole_poll_wait(c, buf, sizeof buf, 100);
     CHECK(k >= 0);
     for (int64_t off = 0; off < k;) {
@@ -2725,6 +2740,8 @@ static void test_db_tx(void) {
   CHECK(anole_db_tx_query(tx5, (anole_str){slow_sql, strlen(slow_sql)}, NULL, 0, NULL, 401) == ANOLE_OK);
   CHECK(anole_db_tx_exec(tx5, ins1, NULL, 0, NULL, 402) == ANOLE_OK);
   CHECK(anole_db_tx_exec(tx5, ins1, NULL, 0, NULL, 403) == ANOLE_OK);
+  /* Time for the slow statement to start (a sensitivity sleep: released
+     before it runs, all three are GONE as well). */
   usleep(100 * 1000);
   double t0 = now_ms();
   CHECK(anole_db_tx_release(tx5) == ANOLE_OK);
@@ -2741,6 +2758,7 @@ static void test_db_tx(void) {
   CHECK(anole_db_begin(db, c, &quick, 500) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   anole_db_tx tx6 = r->ev.handle;
+  /* Past its 100 ms timeout on purpose (a lower bound). */
   usleep(300 * 1000);
   CHECK(anole_db_tx_exec(tx6, ins1, NULL, 0, NULL, 501) == ANOLE_E_GONE);
   CHECK(anole_db_begin(db, c, &quick, 510) == ANOLE_OK);
@@ -2749,7 +2767,8 @@ static void test_db_tx(void) {
   CHECK(anole_db_tx_query(tx7, (anole_str){slow_sql, strlen(slow_sql)}, NULL, 0, NULL, 511) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 511 && r->status == ANOLE_E_TIMEOUT && r->http_status == 504 && r->error_class == ANOLE_DB_ERR_TIMEOUT);
-  usleep(100 * 1000);
+  /* Over once its TIMEOUT is answered: GONE at once, no pause (the end is
+     set before the rollback runs). */
   CHECK(anole_db_tx_exec(tx7, ins1, NULL, 0, NULL, 512) == ANOLE_E_GONE);
 
   /* the server's stop rolls back what is open and answers nothing more */
@@ -2873,6 +2892,8 @@ static void test_db_request_tie(void) {
   tx = r->ev.handle;
   CHECK(anole_req_respond(h, 200, NULL, 0, "x", 1, 0) == ANOLE_OK);
   CHECK(finish_get(a, t, NULL) == 200);
+  /* Time for the request's end to reach the transaction, were it tied to
+     it (a sensitivity sleep: a slow machine only hides that bug). */
   usleep(50 * 1000);
   CHECK(anole_db_tx_exec(tx, LIT("INSERT INTO tt VALUES (3)"), NULL, 0, NULL, 21) == ANOLE_OK);
   CHECK(anole_db_tx_commit(tx, 22) == ANOLE_OK);
@@ -2968,14 +2989,24 @@ static void test_db_postgres_tx(void) {
   r = db_next(c, rec, sizeof rec);
   anole_db_tx tr = r->ev.handle;
   CHECK(anole_db_tx_query(tr, LIT("SELECT pg_sleep(600)"), NULL, 0, NULL, 31) == ANOLE_OK);
-  usleep(200 * 1000);
+  /* Released once the server runs the statement (seen from another
+     connection), not after a fixed pause. */
+  anole_str sleepers = LIT("SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(600)%' AND pid <> pg_backend_pid()");
+  int64_t left = 0;
+  for (double until = wait_until(); left == 0;) {
+    CHECK(now_ms() < until);
+    CHECK(anole_db_query(db, c, sleepers, NULL, 0, NULL, 32) == ANOLE_OK);
+    r = db_next(c, rec, sizeof rec);
+    CHECK(r->status == ANOLE_OK);
+    left = db_cell(r, 0, 0)->v.i;
+    if (left == 0) usleep(10 * 1000);
+  }
   double t0 = now_ms();
   CHECK(anole_db_tx_release(tr) == ANOLE_OK);
   r = db_next(c, rec, sizeof rec);
   CHECK(r->user_data == 31 && r->status == ANOLE_E_GONE);
   CHECK(!timing() || now_ms() - t0 < 1500);
-  anole_str sleepers = LIT("SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(600)%' AND pid <> pg_backend_pid()");
-  int64_t left = -1;
+  left = -1;
   for (double until = wait_until(); left != 0;) {
     CHECK(now_ms() < until);
     CHECK(anole_db_query(db, c, sleepers, NULL, 0, NULL, 40) == ANOLE_OK);
@@ -3318,7 +3349,7 @@ static void test_abort_reasons(void) {
   ab = (const anole_abort_event *)next_event(c, ANOLE_EV_ABORT);
   CHECK(ab->ev.handle == h && ab->reason == ANOLE_ABORT_DRAIN);
   close(cr.fd);
-  CHECK(anole_server_wait(s, 10000) == ANOLE_OK);
+  CHECK(anole_server_wait(s, wait_ms()) == ANOLE_OK);
   anole_server_destroy(s);
   printf("ok abort reasons: deadline, body, drain\n");
 }
@@ -3373,10 +3404,14 @@ static void test_sent_once(void) {
   send_request(cr.fd, "GET", "/hold", NULL, 0);
   h = next_request(c);
   close(cr.fd);
+  /* Time for the close to reach the server (either outcome is checked). */
   usleep(100 * 1000);
   int rc = anole_req_respond(h, 200, text_plain, 1, body, sizeof body - 1, ANOLE_BODY_BORROW);
   CHECK(rc == ANOLE_OK || rc == ANOLE_E_GONE);
-  CHECK(count_events(c, ANOLE_EV_SENT, 300) == (rc == ANOLE_OK ? 1 : 0));
+  /* Taken: its SENT comes (waited for, not within a fixed time), and no
+     second one. Not taken: none. */
+  if (rc == ANOLE_OK) CHECK(next_event(c, ANOLE_EV_SENT) != NULL);
+  CHECK(count_events(c, ANOLE_EV_SENT, 100) == 0);
   stop_polled(s);
   printf("ok SENT: exactly one per borrowing call that was taken\n");
 }
@@ -3410,7 +3445,7 @@ static void test_listener_info(void) {
     CHECK((info.flags & ANOLE_LISTENER_F_TLS) && (info.flags & ANOLE_LISTENER_F_HTTP3));
   }
   CHECK(anole_server_drain(s) == ANOLE_OK);
-  CHECK(anole_server_wait(s, 10000) == ANOLE_OK);
+  CHECK(anole_server_wait(s, wait_ms()) == ANOLE_OK);
   for (uint32_t i = 0; i < n; i++) {
     CHECK(anole_server_listener(s, i, &info) == ANOLE_OK);
     CHECK(info.state == ANOLE_LISTENER_CLOSED);
@@ -3635,9 +3670,12 @@ static void test_signals_stay_off_anole_threads(void) {
   CHECK(sigaction(SIGUSR1, &sa, NULL) == 0);
   anole_consumer *c = NULL;
   anole_server *s = hold_server(&c, 5000, 200, "");
+  /* One at a time: each counted before the next is sent, so two never
+     merge into one pending signal (on a thread that may take it later). */
   for (int i = 0; i < 50; i++) {
     CHECK(kill(getpid(), SIGUSR1) == 0);
-    usleep(1000);
+    for (double until = wait_until(); atomic_load(&sig_count) < i + 1 && now_ms() < until;) usleep(1000);
+    CHECK(atomic_load(&sig_count) == i + 1);
   }
   CHECK(atomic_load(&sig_wrong) == 0 && atomic_load(&sig_count) == 50);
   stop_polled(s);
@@ -3957,7 +3995,7 @@ typedef struct {
 
 static void net_collect(anole_consumer *c, net_seen *seen, int (*done)(const net_seen *)) {
   static _Alignas(8) unsigned char buf[256 * 1024];
-  for (int i = 0; i < 100 && !done(seen); i++) {
+  for (double until = wait_until(); !done(seen) && now_ms() < until;) {
     int64_t n = anole_poll_wait(c, buf, sizeof buf, 100);
     CHECK(n >= 0);
     for (int64_t off = 0; off < n;) {

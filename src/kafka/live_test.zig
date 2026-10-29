@@ -54,10 +54,14 @@ test "live: produce with every codec and consume it back from the start" {
     defer consumer.deinit();
     try consumer.consume({}, .{ .group = group, .topics = &.{topic}, .start = .earliest }, Seen.on);
     try consumer.start(null, null, null);
-    for (0..500) |_| {
-        if (Seen.count.load(.acquire) >= total) break;
-        try io.sleep(.fromMilliseconds(100), .awake);
-    }
+    // A live broker's group join alone can take seconds (Kafka's initial
+    // rebalance delay is 3 s): a longer hang guard than the default.
+    const wait = @import("anole_test_wait");
+    try wait.waitUntilFor(io, "the consumer saw every record", .fromSeconds(@as(i64, 60) * wait.timeoutFactor()), total, struct {
+        fn all(want: u32) bool {
+            return Seen.count.load(.acquire) >= want;
+        }
+    }.all);
     try testing.expectEqual(total, Seen.count.load(.acquire));
 }
 

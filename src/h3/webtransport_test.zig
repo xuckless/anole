@@ -323,15 +323,25 @@ test "WebTransport: a peer stream reset before its session prefix completes is f
     // Unidirectional (type 0x54) and bidirectional (signal 0x41) streams
     // that say their type and nothing more, then reset; more of them than
     // the server's stream limits, so its credit must come back.
-    for (0..120) |i| {
-        var tries: usize = 0;
-        const id = while (true) : (tries += 1) {
-            break wt.Session.Driver.testOpenRaw(session, if (i % 2 == 0) .uni_out else .bidi, if (i % 2 == 0) "\x40\x54" else "\x40\x41") catch |err| {
-                if (err != error.StreamIdBlocked or tries > 200) return err;
-                try io.sleep(.fromMilliseconds(10), .awake);
-                continue;
+    const Open = struct {
+        session: *wt.Session,
+        i: usize,
+        id: *i64,
+        /// Opens the raw stream; false while the server's credit is not
+        /// back yet.
+        fn opened(o: @This()) !bool {
+            o.id.* = wt.Session.Driver.testOpenRaw(o.session, if (o.i % 2 == 0) .uni_out else .bidi, if (o.i % 2 == 0) "\x40\x54" else "\x40\x41") catch |err| {
+                if (err == error.StreamIdBlocked) return false;
+                return err;
             };
-        };
+            return true;
+        }
+    };
+    for (0..120) |i| {
+        var id: i64 = -1;
+        try wait.waitUntil(io, "stream credit to open the next raw stream", Open{ .session = session, .i = i, .id = &id }, Open.opened);
+        // Time for the type to go out before the reset (a sensitivity
+        // sleep: either order must free the stream).
         try io.sleep(.fromMilliseconds(2), .awake);
         wt.Session.Driver.testReset(session, id);
     }
@@ -372,10 +382,13 @@ fn bulkSession(session: *wt.Session, req: *dusty.Request) !void {
 
 /// The wake-ups of the second stream's reader, when the first one ended.
 var herd_wakes: std.atomic.Value(u32) = .init(std.math.maxInt(u32));
+/// Set once the second stream's reader has taken its one byte.
+var herd_b_read: std.atomic.Value(bool) = .init(false);
 
 fn herdReadB(b: *wt.Stream) std.Io.Cancelable!void {
     // One byte, then blocked until the stream ends.
     _ = b.reader().takeByte() catch return;
+    herd_b_read.store(true, .release);
     _ = b.reader().takeByte() catch return;
 }
 
@@ -436,9 +449,11 @@ fn budgetWrite(session: *wt.Session) std.Io.Cancelable!void {
     for (0..50) |_| out.writer().writeAll(&chunk) catch return;
     out.closeSend() catch return;
     _ = budget_done.fetchAdd(1, .release);
-    // The stream's end must reach the peer before it is released.
-    var tries: usize = 0;
-    while (tries < 100) : (tries += 1) session.core.io.sleep(.fromMilliseconds(10), .awake) catch return;
+    // The stream's end must reach the peer before it is released: it is
+    // held until the session's handler ends and cancels this task, which
+    // the test asks for only once it has read all three streams (the
+    // wait helper's deadline is a hang guard).
+    session.core.io.sleep(wait.deadline(), .awake) catch return;
 }
 
 /// On "go": three streams of 200 KiB each, against a connection budget that
@@ -784,17 +799,18 @@ test "WebTransport: stopSending stops only the peer's writes, which fail with it
     // failed, the server lets go and stops our side in turn (code 0): a
     // write may fail then, only after the server saw our code.
     s.stopSending(9);
-    var tries: usize = 0;
-    while (last_stop_code.load(.acquire) != 9) : (tries += 1) {
-        if (tries > 300) return error.Timeout;
-        s.writer().writeAll("more") catch {};
-        s.writer().flush() catch {};
-        if (s.writeError()) |e| {
-            if (last_stop_code.load(.acquire) == 9) break;
-            return e;
+    try wait.waitUntil(io, "the server's echo failed with our code", s, struct {
+        fn stopped(st: *wt.Stream) !bool {
+            if (last_stop_code.load(.acquire) == 9) return true;
+            st.writer().writeAll("more") catch {};
+            st.writer().flush() catch {};
+            if (st.writeError()) |e| {
+                if (last_stop_code.load(.acquire) == 9) return true;
+                return e;
+            }
+            return false;
         }
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
+    }.stopped);
 }
 
 test "WebSocket over HTTP/3 (RFC 9220): echo, ping, close" {
@@ -981,12 +997,13 @@ test "WebTransport: a stream's reader is not woken by another stream's traffic" 
     const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/herd" });
     defer session.deinit();
     herd_wakes.store(std.math.maxInt(u32), .release);
-    // Stream B: one byte, then silence.
+    herd_b_read.store(false, .release);
+    // Stream B: one byte, then silence, its reader blocked for more.
     const b = try session.openStream();
     defer b.release();
     try b.writer().writeAll("b");
     try b.writer().flush();
-    try io.sleep(.fromMilliseconds(100), .awake);
+    try wait.waitFlag(io, "the server's reader of stream B took its byte", &herd_b_read);
     // Stream A: 200 messages.
     const a = try session.openStream();
     defer a.release();

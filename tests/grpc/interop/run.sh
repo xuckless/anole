@@ -7,6 +7,7 @@
 # Without a client path, it is built with `go install` (grpc-go v1.84.0).
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/../../lib/wait.sh"
 tls=false
 if [ "${1:-}" = "--tls" ]; then
   tls=true
@@ -36,7 +37,7 @@ mkdir -p "$logs"
 "$server" $port "$@" >"$logs/server.log" 2>&1 &
 pid=$!
 trap 'kill $pid 2>/dev/null || true; rm -rf "$work"' EXIT
-sleep 1
+wait_until 30 "the interop server to listen" port_open 127.0.0.1 "$port" || { tail -20 "$logs/server.log"; exit 1; }
 cases="empty_unary large_unary client_streaming server_streaming ping_pong empty_stream
 timeout_on_sleeping_server cancel_after_begin cancel_after_first_response
 status_code_and_message special_status_message custom_metadata

@@ -1,5 +1,6 @@
 //! The C ABI's server-sent events and watch configuration (p3/realtime).
 const std = @import("std");
+const wait = @import("anole_test_wait");
 const anole = @import("../root.zig");
 const parity = @import("parity.zig");
 const config = @import("config.zig");
@@ -233,19 +234,16 @@ pub const RawSse = struct {
 };
 
 fn waitCount(io: std.Io, topics: *anole.sse.Topics, topic: []const u8, n: usize) !void {
-    for (0..2500) |_| {
-        if (topics.count(topic) >= n) return;
-        try io.sleep(.fromMilliseconds(2), .awake);
-    }
-    return error.TimedOut;
+    const Ctx = struct { topics: *anole.sse.Topics, topic: []const u8, n: usize };
+    try wait.waitUntil(io, "the topic has its subscribers", Ctx{ .topics = topics, .topic = topic, .n = n }, struct {
+        fn reached(c: Ctx) bool {
+            return c.topics.count(c.topic) >= c.n;
+        }
+    }.reached);
 }
 
 fn waitAtLeast(io: std.Io, v: *std.atomic.Value(u32), n: u32) !void {
-    for (0..2500) |_| {
-        if (v.load(.acquire) >= n) return;
-        try io.sleep(.fromMilliseconds(2), .awake);
-    }
-    return error.TimedOut;
+    try wait.waitAtLeast(io, "the consumer's counter reached its count", v, n);
 }
 
 /// The last `id:` line of `text`.
@@ -308,7 +306,7 @@ test "capi engine: a native sse route: subscribers get published events with ids
     var f = try io.concurrent(nativeCheck, .{ e, e.port(0), io });
     try f.await(io);
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }
 
 fn consumerCheck(a: *SseConsumer, port: u16, io: std.Io) !void {
@@ -386,7 +384,7 @@ test "capi engine: a consumer sse route: accept with topics, send reaches only i
     try f.await(io);
     try std.testing.expectEqual(@as(u32, 0), a.failures.load(.acquire));
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }
 
 test "capi engine: anole_sse_publish: errors before start, for a CR in the event, a too large event, and AGAIN past the lane limits" {
@@ -434,7 +432,7 @@ test "capi engine: anole_sse_publish: errors before start, for a CR in the event
     st.topic_changes_done.store(st.topic_changes.load(.acquire), .release);
     e.io.futexWake(u32, &st.topic_changes_done.raw, std.math.maxInt(u32));
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }
 
 fn slowCheck(a: *SseConsumer, port: u16, io: std.Io) !void {
@@ -519,7 +517,7 @@ test "capi engine: anole_sse_send: BUSY past half the queue, AGAIN past it, WRIT
     var f = try io.concurrent(slowCheck, .{ &a, e.port(0), io });
     try f.await(io);
     try e.drain();
-    try std.testing.expect(e.wait(5000));
+    try std.testing.expect(e.wait(@intCast(wait.deadlineMs())));
 }
 
 test "capi config: a MongoDB watch's pipeline is an array of stages" {

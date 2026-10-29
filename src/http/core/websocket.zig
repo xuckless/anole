@@ -2098,11 +2098,18 @@ test "WebSocket: what a batch holds goes out when the reader waits for something
     _ = try ws.receive();
     try ws.send(.text, "A");
     // The handler goes off to wait for something, "b" still unread: the
-    // backstop sends "A" meanwhile.
-    var waited: usize = 0;
-    while (probe.writes == 0 and waited < 5000) : (waited += 1) {
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
+    // backstop sends "A" meanwhile (it writes under the write lock).
+    const Sent = struct {
+        ws: *WebSocket,
+        probe: *SocketProbe,
+        io: std.Io,
+        fn written(c: @This()) !bool {
+            try c.ws.write_mutex.lock(c.io);
+            defer c.ws.write_mutex.unlock(c.io);
+            return c.probe.writes != 0;
+        }
+    };
+    try @import("anole_test_wait").waitUntil(io, "the backstop wrote the held frame", Sent{ .ws = &ws, .probe = &probe, .io = io }, Sent.written);
     try ws.write_mutex.lock(io);
     defer ws.write_mutex.unlock(io);
     try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'A' }, probe.out.items);

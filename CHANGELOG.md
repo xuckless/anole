@@ -27,6 +27,17 @@ breaking changes are listed anyway.
   a column at a time, keeping its first column; ‹ and › mark hidden
   columns. `/h3` showed 8 of its 15 columns at 100 columns wide, with no
   sign that more existed (#119).
+- Console: `/errors` names the error a handler returned. The column was
+  empty for every 5xx the server answered itself, which is nearly all of
+  them: the 5xx ring got the request after the error had become the error
+  response.
+- Console: `/db` shows SQLite databases with their name, file and
+  connections (the writer and the readers: open, idle, in use, waiting);
+  they showed as "sqlite" with no target and no pool. SSE topics, the
+  response cache, jobs, webhooks and watches no longer show there as
+  "connector" rows with nothing in them.
+- Console: `/routes` gives WebSocket, WebTransport and gRPC routes their
+  kind (`ws`, `wt`, `grpc`); every route said `http`.
 - Jobs: a job that finished while the server drained could run a second
   time. A drain past its deadline cancels the runs still going, and the
   cancel could land on a finished run's state write (logged as "finished
@@ -114,6 +125,18 @@ breaking changes are listed anyway.
 
 ### Changed
 
+- WebSocket over TLS (#85): one TLS read now returns every whole record
+  already received, and a busy HTTP/1.1 WebSocket reads through a larger
+  window: `upgrade()`/`next()` sockets widen their reader over the
+  connection's read buffer (about 17 KiB) and callback sockets take a
+  pooled 16.5 KiB block, both given back after 8 quiet waits. A relay that
+  works through buffered messages now batches what it sends to the other
+  members. Past its capacity the video-call relay degrades differently: at
+  950 users (epoll) about 30% of calls stay fully served where 0.4.0
+  served none, and on io_uring video stays above 40% up to about 1,040
+  users instead of 870. Its knee (users served properly) is a little lower
+  in single runs, 790 against 860 on epoll and 810 against 830 on io_uring;
+  CPU per relayed message is unchanged. Raising the knee is S2 work.
 - Jobs: with `app.tracing()`, each run of a job is a CONSUMER span
   `process <queue>`, linked (not parented) to the context it was enqueued
   from, with OpenTelemetry's messaging attributes and `anole.job.kind`,
@@ -134,6 +157,14 @@ breaking changes are listed anyway.
   suite alike, are checked only by a new local-only step,
   `zig build test-timing` (MAINTAINING.md, "Waiting in tests"). Stress
   tests run only in another step, `zig build test-stress`.
+- Tests: the shell runners (tests/*/run.sh: Kafka, NATS, PostgreSQL,
+  Redis, MongoDB, S3, SMTP, HTTP/3, restart, Autobahn, h2spec, gRPC
+  interop) wait for what they need instead of a fixed time: a port that
+  accepts, a log line (the broker's or the server's own "ready" line), a
+  process gone, or a command that succeeds, through `tests/lib/wait.sh`,
+  bounded by the same `ANOLE_TEST_TIMEOUT_FACTOR`. The copied NATS client's
+  tests check their elapsed-time bounds under `zig build test-timing` only
+  and scale their hang guards by the factor.
 - Tests: a hung unit test says where it hangs. CI runs every unit test step
   with `--test-timeout 120s`; a test still running at 110 s, its teardown
   (the test Io's and allocator's deinit) included, is named and every
@@ -144,6 +175,17 @@ breaking changes are listed anyway.
   test held the build until the runner's own 300 s limit, and the report
   said nothing about where it hung. `zig build hang-probe` shows a dump
   (`ANOLE_TEST_DUMP_AFTER` sets the threshold in seconds).
+- Tests: the hang dump also lists every live zio task after the thread
+  backtraces, with each suspended task's stack. A task waiting forever is on
+  no thread's stack, so the backtraces alone showed only executors parked
+  in their event loops. zio (the fork's `anole-diag` branch) keeps a list of
+  the live tasks per executor and a registry of its runtimes in Debug and
+  test builds, and walks each suspended task's saved frame pointers.
+- Debug and test builds: an executor that has not passed its scheduler for
+  200 ms while tasks wait in its run queue is reported once per stall (at
+  most 5 reports a minute per runtime), with what it runs and, on Linux and
+  macOS, that code's stack, taken with SIGURG. A warning only; nothing
+  fails on it. Release builds have neither the watchdog nor the task list.
 - Tests: a passing test's log lines are not printed. The runner holds a
   test's log lines and prints them only when the test fails, leaks, logs
   an error or crashes (a panic, SIGSEGV, SIGBUS, SIGILL, SIGFPE or SIGABRT),

@@ -291,6 +291,9 @@ pub const Socket = struct {
     /// `abort_cancels_h1_reader`), which `abortConnection` cancels; null
     /// over HTTP/1.1 elsewhere and off zio.
     _task: ?placement.Task = null,
+    /// Over HTTP/1.1 from `upgrade` (a handler's own loop): the reader's
+    /// window, sized to the load. Unused otherwise.
+    _read: UpgradedWindow = .{},
 
     /// Which protocol a socket runs on. The sockets it points at are
     /// internal: they hand over permessage-deflate messages still
@@ -329,6 +332,7 @@ pub const Socket = struct {
     /// than through a call for each layer, which costs an echo loop about a
     /// tenth of its CPU.
     pub fn receive(self: *Socket) !Message {
+        if (self._read.conn != null) self._read.between(self._conn.h1.transport.reader);
         return @call(.always_inline, finishMessage, .{ self, switch (self._conn) {
             inline else => |ws| try @call(.always_inline, @TypeOf(ws.*).receive, .{ws}),
         } });
@@ -475,6 +479,7 @@ pub const Socket = struct {
         }
         if (self._drain_watch) |w| w.stop();
         if (comptime features.compression) if (self._deflate) |d| d.deinit();
+        if (self._read.conn != null) self._read.release(self._conn.h1.transport.reader);
         switch (self._conn) {
             inline else => |ws| ws.deinit(),
         }
@@ -648,6 +653,10 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
         ws.max_message_size = max_message;
         ws.rsv1_allowed = negotiated;
         socket._conn = .{ .h1 = ws };
+        // A callback socket sizes its window per run (`ReadWindow`).
+        if (owner == null) if (res._conn) |conn| {
+            socket._read = .init(conn, ws.transport.reader);
+        };
     }
     req.setDeadline(options.timeout);
     if (options.close_on_drain) if (req._drain_hooks) |hooks| {
@@ -863,9 +872,11 @@ const H1Callbacks = struct {
     /// `open` failed: the socket ends at once, as a `route` handler's would.
     ending: bool = false,
 
-    /// Each run's reader window, on its task's stack. A frame bigger than
-    /// it is read straight into its message. The writer borrows a buffer
-    /// from the connection while it has something to send.
+    /// Each run's reader window, on its task's stack, while the peer is
+    /// quiet; a busy peer's reads go into a pooled block (`ReadWindow`). A
+    /// frame bigger than the window is read straight into its message. The
+    /// writer borrows a buffer from the connection while it has something
+    /// to send.
     const window_len = 2048;
 
     fn open(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions, table: *const Table, state: ?*anyopaque) !?*H1Callbacks {
@@ -913,11 +924,19 @@ const H1Callbacks = struct {
         // the core gives them back once it returns.
         var read_window: [window_len]u8 = undefined;
         if (ws.transport.reader.buffer.len == 0) ws.attachBuffers(&read_window);
+        var window: ReadWindow = .{ .stack = &read_window };
+        // Every return below leaves the reader without a buffer
+        // (`detachBuffers` before `.park`, `shut` in `finish`), so the
+        // block, if the run still holds one, goes back here: on a park, a
+        // close, a failed read or callback, and a cancel alike.
+        defer window.release(ws.transport.reader);
         while (true) {
+            window.adapt(ws.transport.reader);
             const started = self.socket.receiveStarted() catch |err| return self.finish(err);
             const msg = started orelse {
                 // Nothing buffered: what a batch held goes out, and the
                 // connection waits, here or parked.
+                window.quiet(ws);
                 ws.flushBatch() catch |err| return self.finish(err);
                 const input = burst.waitInput() catch |err| return self.finish(err);
                 if (input == .idle) {
@@ -964,6 +983,292 @@ const H1Callbacks = struct {
         gpa.destroy(self);
     }
 };
+
+/// What a callback socket over HTTP/1.1 reads into, sized to its load
+/// (#85): the run's window on its stack (`H1Callbacks.window_len`) while
+/// the peer's messages are small and far apart, and a pooled block of
+/// `read_block_len` once it streams, so a read takes a whole TLS record
+/// (and over TLS, every whole record already received) rather than a
+/// window's worth at a time.
+///
+/// It moves to the block, between messages, when the last read filled the
+/// window or the next frame's header announces more than the window holds.
+/// It keeps the block while reads keep bringing a window's worth, and goes
+/// back to the stack window after `busy_reads` waits for the peer without
+/// one, or when the connection parks (`detachBuffers`). Every wait starts
+/// reading at the front of the window, so a run of small messages never
+/// squeezes reads into its tail.
+///
+/// owner: one run of `H1Callbacks.serve` (SAFETY.md M2, a batch: the run).
+/// Only that run's task touches it and the reader; the block goes back to
+/// the pool at a quiet wait (`quiet`) or as the run returns (`release`,
+/// deferred, so on every exit), after the reader has let go of it.
+const ReadWindow = struct {
+    /// The run's window on its stack.
+    stack: []u8,
+    /// The pooled block the reader reads into, while it has one.
+    block: ?[]u8 = null,
+    /// Waits for the peer left before the block goes back.
+    busy: u8 = 0,
+
+    /// Waits for the peer a busy socket keeps its block for after the last
+    /// read that brought a window's worth (dusty_tls's `busy_reads`, the
+    /// same idea for its ciphertext blocks).
+    const busy_reads = 8;
+
+    /// Between messages: moves the reader to a block if the socket is busy,
+    /// what it holds of the next frame with it.
+    fn adapt(w: *ReadWindow, r: *std.Io.Reader) void {
+        if (!loaded(r)) return;
+        w.busy = busy_reads;
+        if (w.block != null) return;
+        const buffered = r.buffered();
+        // Only a first run's window, in the request's buffers, can hold so
+        // much; it reads on in them.
+        if (buffered.len >= read_block_len) return;
+        // Out of memory: the window still works, a little slower.
+        const b = read_blocks.take() orelse return;
+        @memcpy(b[0..buffered.len], buffered);
+        r.buffer = b;
+        r.seek = 0;
+        r.end = buffered.len;
+        w.block = b;
+    }
+
+    /// Whether the reads since the last wait brought at least a window's
+    /// worth (in the window itself: filled it), or the next frame is
+    /// bigger than the window.
+    fn loaded(r: *std.Io.Reader) bool {
+        if (r.end >= @min(r.buffer.len, H1Callbacks.window_len)) return true;
+        const frame = announcedFrame(r.buffered()) orelse return false;
+        return frame > H1Callbacks.window_len;
+    }
+
+    /// The whole length of the frame `bytes` starts with, as its header
+    /// announces it; null until the header is all there.
+    fn announcedFrame(bytes: []const u8) ?u64 {
+        if (bytes.len < 2) return null;
+        var header_len: usize = 2;
+        var payload_len: u64 = bytes[1] & 0x7F;
+        if (payload_len == 126) {
+            if (bytes.len < 4) return null;
+            payload_len = std.mem.readInt(u16, bytes[2..4], .big);
+            header_len = 4;
+        } else if (payload_len == 127) {
+            if (bytes.len < 10) return null;
+            payload_len = std.mem.readInt(u64, bytes[2..10], .big);
+            header_len = 10;
+        }
+        if (bytes[1] & 0x80 != 0) header_len += 4;
+        return std.math.add(u64, header_len, payload_len) catch std.math.maxInt(u64);
+    }
+
+    /// At a wait for the peer, with nothing buffered: the next read starts
+    /// at the front, and a block held for `busy_reads` waits since the last
+    /// busy read goes back.
+    fn quiet(w: *ReadWindow, ws: *WebSocket) void {
+        const r = ws.transport.reader;
+        std.debug.assert(r.bufferedLen() == 0);
+        r.seek = 0;
+        r.end = 0;
+        const b = w.block orelse return;
+        if (w.busy > 1) {
+            w.busy -= 1;
+            return;
+        }
+        w.busy = 0;
+        ws.attachBuffers(w.stack);
+        w.block = null;
+        read_blocks.give(b);
+    }
+
+    /// As the run returns, with the reader detached: the block back.
+    fn release(w: *ReadWindow, r: *const std.Io.Reader) void {
+        const b = w.block orelse return;
+        w.block = null;
+        std.debug.assert(r.buffer.ptr != b.ptr);
+        read_blocks.give(b);
+    }
+};
+
+/// `ReadWindow` for a socket from `upgrade` over HTTP/1.1, which a
+/// handler's own loop reads (`Socket.next`, `receive`), sized to its load
+/// between messages (#85) with the same triggers and hysteresis. That
+/// socket's reader reads into the connection's request read buffer, which
+/// it holds for its life, narrowed by `shrinkForUpgrade` to a small window
+/// past the head with the rest of its pages given back. So no block here:
+/// while the peer streams the view is widened again to the end of that
+/// buffer (`Connection.widenUpgradedReader`), and after `busy_reads` quiet
+/// waits narrowed again (`narrowUpgradedReader`, one madvise per busy
+/// spell, never one per message). Only where the widened view would be
+/// smaller than `read_block_len` (a small `request.buffer_size`) does it
+/// read into a pooled block instead.
+///
+/// owner: the `Socket`, used only by the task that reads it. A block it
+/// took goes back at a quiet wait or in `Socket.deinit` (`release`), the
+/// reader pointed at its small window again first; a handler that never
+/// deinits its socket leaks the block, never frees it under the reader.
+const UpgradedWindow = struct {
+    conn: ?*dusty.Connection = null,
+    /// The reader's view as `shrinkForUpgrade` left it (as the last
+    /// narrowing did): what it goes back to.
+    small: []u8 = &.{},
+    how: enum { widen, block } = .widen,
+    /// The reader reads into the widened view or the block.
+    grown: bool = false,
+    block: ?[]u8 = null,
+    /// Waits for the peer left before the window narrows again.
+    busy: u8 = 0,
+    /// Times the window narrowed again after a busy spell (each one
+    /// madvise): for diagnostics and tests.
+    narrowed: u32 = 0,
+
+    fn init(conn: *dusty.Connection, r: *std.Io.Reader) UpgradedWindow {
+        return .{
+            .conn = conn,
+            .small = r.buffer,
+            .how = if (conn.upgradedReaderRoom() >= read_block_len) .widen else .block,
+        };
+    }
+
+    /// Before each message: grows the window if the socket is busy, and at
+    /// a wait for the peer (nothing buffered) reads from its front and
+    /// counts down to narrowing it.
+    fn between(w: *UpgradedWindow, r: *std.Io.Reader) void {
+        if (loaded(r, w.small.len)) {
+            w.busy = ReadWindow.busy_reads;
+            if (!w.grown) w.grow(r);
+        }
+        if (r.bufferedLen() != 0) return;
+        r.seek = 0;
+        r.end = 0;
+        if (!w.grown) return;
+        if (w.busy > 1) {
+            w.busy -= 1;
+            return;
+        }
+        w.busy = 0;
+        w.shrink(r);
+    }
+
+    /// Whether the reads since the last wait brought at least `small`
+    /// bytes, or the next frame is bigger than that.
+    fn loaded(r: *std.Io.Reader, small: usize) bool {
+        if (r.end >= small) return true;
+        const frame = ReadWindow.announcedFrame(r.buffered()) orelse return false;
+        return frame > small;
+    }
+
+    fn grow(w: *UpgradedWindow, r: *std.Io.Reader) void {
+        switch (w.how) {
+            .widen => w.grown = w.conn.?.widenUpgradedReader(),
+            .block => {
+                const buffered = r.buffered();
+                if (buffered.len >= read_block_len) return;
+                // Out of memory: the small window still works.
+                const b = read_blocks.take() orelse return;
+                @memcpy(b[0..buffered.len], buffered);
+                r.buffer = b;
+                r.seek = 0;
+                r.end = buffered.len;
+                w.block = b;
+                w.grown = true;
+            },
+        }
+    }
+
+    /// With nothing buffered: the small window back.
+    fn shrink(w: *UpgradedWindow, r: *std.Io.Reader) void {
+        std.debug.assert(r.bufferedLen() == 0);
+        w.grown = false;
+        w.narrowed += 1;
+        switch (w.how) {
+            .widen => {
+                w.conn.?.narrowUpgradedReader();
+                w.small = r.buffer;
+            },
+            .block => {
+                r.buffer = w.small;
+                r.seek = 0;
+                r.end = 0;
+                read_blocks.give(w.block.?);
+                w.block = null;
+            },
+        }
+    }
+
+    /// As the socket goes: a block back, the reader on its small window
+    /// with what fits of what it held. A widened view stays: the request's
+    /// buffers go back to their pool with the connection.
+    fn release(w: *UpgradedWindow, r: *std.Io.Reader) void {
+        const b = w.block orelse return;
+        const keep = r.buffered()[0..@min(r.bufferedLen(), w.small.len)];
+        std.mem.copyForwards(u8, w.small[0..keep.len], keep);
+        r.buffer = w.small;
+        r.seek = 0;
+        r.end = keep.len;
+        w.block = null;
+        w.grown = false;
+        read_blocks.give(b);
+    }
+};
+
+/// A busy callback socket's read block (`ReadWindow`): the largest TLS
+/// record's plaintext (16 KiB) with room ahead of it for the part of a
+/// frame already read, so a read takes a whole record at once. The one
+/// line to change to try a bigger block (32 KiB: two records a read).
+const read_block_len = 16 * 1024 + 512;
+
+/// The blocks `ReadWindow` reads into, kept per thread for reuse, and
+/// beyond `cap` given back to malloc. None of the HTTP core's pools fits:
+/// its write buffers are `response.write_buffer_size` long (configurable,
+/// 16384 by default: no room for a frame's tail ahead of a whole record),
+/// `block_cache` serves 64 KiB and more, and the TLS module's ciphertext
+/// blocks are its own (and absent without TLS). Owned by the process
+/// (SAFETY.md M2); a block taken is the taking run's until it gives it
+/// back. No I/O or suspension runs between a pool's reads and writes, so a
+/// task that later runs on another thread just gives the block to that
+/// thread's pool.
+const read_blocks = struct {
+    /// Blocks a thread keeps: a busy executor's sockets hold theirs only
+    /// while they stream.
+    const cap = 16;
+
+    threadlocal var free: [cap][*]u8 = undefined;
+    threadlocal var free_len: usize = 0;
+    /// Blocks out of the pools, across the process (`_readBlocksHeld`).
+    var held: std.atomic.Value(usize) = .init(0);
+
+    fn take() ?[]u8 {
+        const b: []u8 = if (free_len > 0) blk: {
+            free_len -= 1;
+            break :blk free[free_len][0..read_block_len];
+        } else std.heap.c_allocator.alloc(u8, read_block_len) catch return null;
+        _ = held.fetchAdd(1, .monotonic);
+        return b;
+    }
+
+    fn give(b: []u8) void {
+        std.debug.assert(b.len == read_block_len);
+        _ = held.fetchSub(1, .monotonic);
+        // SAFETY.md M6: poisoned in Debug, so a reader left pointing at a
+        // returned block reads garbage at once rather than old frames.
+        if (builtin.mode == .debug) @memset(b, undefined);
+        if (free_len < cap) {
+            free[free_len] = b.ptr;
+            free_len += 1;
+            return;
+        }
+        std.heap.c_allocator.free(b);
+    }
+};
+
+/// Read blocks (`ReadWindow`) that HTTP/1.1 callback sockets hold right
+/// now, across the process: 0 once every socket is quiet or parked. For
+/// tests and diagnostics. Internal.
+pub fn _readBlocksHeld() usize {
+    return read_blocks.held.load(.monotonic);
+}
 
 /// Named groups of sockets for publish/subscribe: a handler joins its
 /// socket to rooms, and anything may broadcast to a room. Safe from any task

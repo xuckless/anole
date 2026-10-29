@@ -18,6 +18,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+. tests/lib/wait.sh
 ZIG=${ZIG:-zig}
 PORT=${PG_PORT:-55432}
 IMAGE=${PG_IMAGE:-postgres:17}
@@ -60,15 +61,15 @@ docker run -d --name "$NAME" -p "127.0.0.1:$PORT:5432" \
     exec docker-entrypoint.sh postgres -c ssl=on \
       -c ssl_cert_file=/etc/pgtls/server.crt -c ssl_key_file=/etc/pgtls/server.key' >/dev/null
 
-# The entrypoint starts the server once to initialize it, then restarts it.
-for _ in $(seq 1 60); do
-  if docker exec "$NAME" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then
-    sleep 1
-    docker exec "$NAME" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && break
-  fi
-  sleep 1
-done
-docker exec "$NAME" pg_isready -h 127.0.0.1 -U postgres >/dev/null
+# The entrypoint starts the server once to initialize it, then restarts it:
+# ready once the second start says so (testcontainers' PostgreSQL wait: the
+# "ready to accept connections" line twice), and answering.
+pg_ready() { docker exec "$NAME" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; }
+if ! wait_until 120 "PostgreSQL's second start" docker_log_has "$NAME" "database system is ready to accept connections" 2 ||
+  ! wait_until 30 "PostgreSQL to answer" pg_ready; then
+  docker logs "$NAME" 2>&1 | tail -30 >&2
+  exit 1
+fi
 
 BASE="postgres://postgres:$PASSWORD@127.0.0.1:$PORT/postgres"
 echo "== plain"

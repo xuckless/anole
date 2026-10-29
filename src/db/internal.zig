@@ -428,7 +428,9 @@ test "bounded: past its timeout a call is canceled and fails with GatewayTimeout
         }
     };
     try testing.expectEqual(@as(u8, 7), try bounded(&ctx, .postgresql, null, Slow.wait, .{ io, 1 }));
-    try testing.expectEqual(@as(u8, 7), try bounded(&ctx, .postgresql, .fromSeconds(5), Slow.wait, .{ io, 1 }));
+    // A 1 ms call well inside its timeout (the wait helper's deadline, a
+    // hang guard): it is not canceled.
+    try testing.expectEqual(@as(u8, 7), try bounded(&ctx, .postgresql, @import("anole_test_wait").deadline(), Slow.wait, .{ io, 1 }));
     // It logs a warning, as a 5xx does; not in the test's output.
     const level = testing.log_level;
     testing.log_level = .err;

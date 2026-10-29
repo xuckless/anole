@@ -10,6 +10,7 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 const testing = std.testing;
+const test_wait = @import("anole_test_wait");
 const nats = @import("../root.zig");
 const Client = nats.Client;
 const FakeServer = @import("FakeServer.zig");
@@ -191,7 +192,7 @@ fn sessionTwoThenHangUp(peer: *FakeServer.Peer, record: *Record) anyerror!void {
 /// Waits until the client reaches `expected`, for 5 s at most.
 fn awaitState(client: *Client, expected: nats.State) !void {
     const io = client.io;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (client.state() != expected) {
         if (time.expired(io, give_up)) return error.TestStateNeverReached;
         try io.sleep(.fromMilliseconds(2), .awake);
@@ -218,7 +219,7 @@ fn releaseReply(result: Client.RequestError!nats.Message) void {
 /// Waits until `count` requests wait for replies, for 5 s at most.
 fn awaitAwaiting(client: *Client, count: u32) !void {
     const io = client.io;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (client.inbox.awaitingCount(io) < count) {
         if (time.expired(io, give_up)) return error.TestRequestNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -281,7 +282,7 @@ test "a lost connection: the client reconnects and subscribes again with the sam
 /// at most.
 fn awaitServer(client: *Client, port: u16) !void {
     const io = client.io;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (true) {
         if (client.connectedServer()) |server| if (server.port == port) return;
         if (time.expired(io, give_up)) return error.TestNeverMoved;
@@ -291,7 +292,7 @@ fn awaitServer(client: *Client, port: u16) !void {
 
 /// Waits until the server accepted `count` connections, for 5 s at most.
 fn awaitAccepted(record: *Record, count: u32) !void {
-    const give_up = time.after(testing.io, .fromSeconds(5));
+    const give_up = time.after(testing.io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (record.accepted.load(.monotonic) < count) {
         if (time.expired(testing.io, give_up)) return error.TestNeverAccepted;
         try testing.io.sleep(.fromMilliseconds(1), .awake);
@@ -387,7 +388,14 @@ test "with retry_initial_connect, close() stops the attempts at once" {
     const start = Io.Clock.awake.now(io);
     client.close();
     try testing.expectEqual(.closed, client.state());
-    try testing.expect(start.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 300);
+    if (test_wait.timing()) try testing.expect(start.durationTo(Io.Clock.awake.now(io)).toMilliseconds() < 300);
+    // And no attempt after it (the logical claim; the time bound above
+    // holds only on a machine that is not stalled).
+    try test_wait.expectStays(io, "no connection attempt after close()", &record, struct {
+        fn one(r: *Record) bool {
+            return r.accepted.load(.monotonic) == 1;
+        }
+    }.one, test_wait.short_window);
 }
 
 /// Hangs up as soon as the client subscribed to `sub`.
@@ -763,7 +771,7 @@ fn drainClient(client: *Client, timeout: Io.Duration) Client.DrainError!void {
 }
 
 fn awaitReceived(sub: *nats.Subscription, count: u64) !void {
-    const give_up = time.after(testing.io, .fromSeconds(5));
+    const give_up = time.after(testing.io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (sub.stats().received < count) {
         if (time.expired(testing.io, give_up)) return error.TestNeverReceived;
         try testing.io.sleep(.fromMilliseconds(1), .awake);
@@ -1003,7 +1011,7 @@ test "a reader may free its subscription at null while another task drains it" {
 
 /// Notes `line`: the session reached it.
 fn awaitSeen(record: *Record, text: []const u8) !void {
-    const give_up = time.after(testing.io, .fromSeconds(5));
+    const give_up = time.after(testing.io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (true) {
         const seen = try record.seen(testing.io);
         defer testing.allocator.free(seen);
@@ -1015,7 +1023,7 @@ fn awaitSeen(record: *Record, text: []const u8) !void {
 
 /// Waits until `count` drain() calls are inside the subscription.
 fn awaitDrainers(sub: *nats.Subscription, count: u32) !void {
-    const give_up = time.after(testing.io, .fromSeconds(5));
+    const give_up = time.after(testing.io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (sub.messages.drainers.load(.acquire) < count) {
         if (time.expired(testing.io, give_up)) return error.TestNoDrainer;
         try testing.io.sleep(.fromMilliseconds(1), .awake);
@@ -1310,7 +1318,7 @@ const SlowDrain = struct {
         try peer.accept(io, listener);
         defer peer.close();
         try handshake(&peer, golden.info_default);
-        while (!d.go.load(.acquire)) try io.sleep(.fromMilliseconds(5), .awake);
+        try test_wait.waitFlag(io, "the test to let the server read", &d.go);
         var pubs: u32 = 0;
         while (try peer.nextLine()) |line| {
             if (std.mem.startsWith(u8, line, "PUB ")) {
@@ -1422,7 +1430,7 @@ test "a drain keeps what the streams of requestMany received for their owners to
     defer responses.deinit();
     var first = (try responses.next(.{})) orelse return error.TestNoResponse;
     first.deinit();
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (responses.messages.stats(io).received < 3) {
         if (time.expired(io, give_up)) return error.TestNoResponse;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -1456,7 +1464,7 @@ test "a drained close keeps what the streams of requestMany received when the ma
     defer responses.deinit();
     var first = (try responses.next(.{})) orelse return error.TestNoResponse;
     first.deinit();
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (responses.messages.stats(io).received < 3) {
         if (time.expired(io, give_up)) return error.TestNoResponse;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -1641,7 +1649,7 @@ test "close() wakes a task waiting in nextEvent, which gets closed, then null; o
     _ = try expectEvent(&client, .connected);
     var waiter = try io.concurrent(nextEventLong, .{&client});
     defer _ = waiter.cancel(io) catch {};
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     while (!client.events.isReceiving(io)) {
         if (time.expired(io, give_up)) return error.TestNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -1650,7 +1658,7 @@ test "close() wakes a task waiting in nextEvent, which gets closed, then null; o
     const start = Io.Clock.awake.now(io);
     client.close();
     try testing.expectEqual(.closed, (try waiter.await(io)).?.closed);
-    try testing.expect(start.durationTo(Io.Clock.awake.now(io)).toSeconds() < 1);
+    if (test_wait.timing()) try testing.expect(start.durationTo(Io.Clock.awake.now(io)).toSeconds() < 1);
     try testing.expect(try client.nextEvent(.{}) == null);
 }
 
@@ -1859,12 +1867,20 @@ test "close() while reconnecting: a request in the buffer, next() and nextEvent(
     try awaitAwaiting(&client, 1);
     var reader = try io.concurrent(nextMessageLong, .{sub});
     defer releaseMessage(reader.cancel(io));
-    while (!sub.messages.isReceiving(io)) try io.sleep(.fromMilliseconds(1), .awake);
+    try test_wait.waitUntil(io, "the reader to wait in next()", sub, struct {
+        fn waiting(s: *nats.Subscription) bool {
+            return s.messages.isReceiving(s.client.io);
+        }
+    }.waiting);
     // The events so far, up to the first attempt to reconnect.
     _ = try awaitEventOf(&client, .reconnecting);
     var watcher = try io.concurrent(nextEventLong, .{&client});
     defer _ = watcher.cancel(io) catch {};
-    while (!client.events.isReceiving(io)) try io.sleep(.fromMilliseconds(1), .awake);
+    try test_wait.waitUntil(io, "the watcher to wait for an event", &client, struct {
+        fn waiting(c: *Client) bool {
+            return c.events.isReceiving(c.io);
+        }
+    }.waiting);
 
     const start = Io.Clock.awake.now(io);
     client.close();
@@ -1873,7 +1889,7 @@ test "close() while reconnecting: a request in the buffer, next() and nextEvent(
     const last = (try watcher.await(io)).?;
     // The request's PUB never went out.
     try testing.expect(last == .message_dropped or last == .closed);
-    try testing.expect(start.durationTo(Io.Clock.awake.now(io)).toSeconds() < 1);
+    if (test_wait.timing()) try testing.expect(start.durationTo(Io.Clock.awake.now(io)).toSeconds() < 1);
 }
 
 test "a server down for good: 200 failed attempts in a row, then the client gives up, and nothing leaks" {
@@ -1894,7 +1910,7 @@ test "a server down for good: 200 failed attempts in a row, then the client give
     try client.connect();
     // Publishes wait in the buffer meanwhile, within its bounds.
     for (0..10) |_| try client.publish("waiting", "x");
-    const give_up = time.after(io, .fromSeconds(30));
+    const give_up = time.after(io, .fromSeconds(30 * @as(i64, test_wait.timeoutFactor())));
     while (client.state() != .closed) {
         if (time.expired(io, give_up)) return error.TestNeverGaveUp;
         try io.sleep(.fromMilliseconds(5), .awake);
@@ -2026,7 +2042,7 @@ fn sessionRecordAny(peer: *FakeServer.Peer, record: *Record) anyerror!void {
 
 fn awaitRoomWaitersOf(client: *Client, count: u32) !void {
     const io = client.io;
-    const give_up = time.after(io, .fromSeconds(10));
+    const give_up = time.after(io, .fromSeconds(10 * @as(i64, test_wait.timeoutFactor())));
     while (client.outbound.roomWaiters(io) < count) {
         if (time.expired(io, give_up)) return error.TestPutNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -2048,7 +2064,7 @@ fn publishUntilFull(client: *Client, published: *std.atomic.Value(u32)) void {
 /// 200 ms; how much the sockets take first differs by system.
 fn awaitStuck(client: *Client, published: *std.atomic.Value(u32)) !void {
     const io = client.io;
-    const give_up = time.after(io, .fromSeconds(10));
+    const give_up = time.after(io, .fromSeconds(10 * @as(i64, test_wait.timeoutFactor())));
     var last = published.load(.monotonic);
     var still_since = Io.Clock.awake.now(io);
     while (true) {
@@ -2398,7 +2414,7 @@ test "an io out of concurrency during a reconnect is one more failed attempt: th
         release.set(cio);
         for (&slots) |*slot| if (slot.*) |*f| f.await(cio);
     }
-    const give_up = time.after(tio, .fromSeconds(5));
+    const give_up = time.after(tio, .fromSeconds(5 * @as(i64, test_wait.timeoutFactor())));
     for (&slots) |*slot| {
         while (slot.* == null) {
             slot.* = cio.concurrent(holdSlot, .{ cio, &release }) catch null;
@@ -2428,7 +2444,7 @@ test "an io out of concurrency during a reconnect is one more failed attempt: th
 /// The client is connected and a flush goes through, within 10 s: a
 /// connection dropped as it came up (`Disconnected`) is waited out.
 fn awaitWorkingConnection(client: *Client) !void {
-    const give_up = time.after(client.io, .fromSeconds(10));
+    const give_up = time.after(client.io, .fromSeconds(10 * @as(i64, test_wait.timeoutFactor())));
     while (true) {
         try awaitState(client, .connected);
         if (client.flush(quick)) |_| return else |err| switch (err) {

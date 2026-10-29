@@ -28,6 +28,15 @@ ALT_ON, ALT_OFF = b"\x1b[?1049h", b"\x1b[?1049l"
 procs = []
 
 
+def factor():
+    """ANOLE_TEST_TIMEOUT_FACTOR (a whole number, default 1): every wait here
+    is a hang guard scaled by it, as src/testing/wait.zig's are."""
+    try:
+        return max(int(os.environ.get("ANOLE_TEST_TIMEOUT_FACTOR", "1")), 1)
+    except ValueError:
+        return 1
+
+
 def env():
     e = dict(os.environ)
     # The development hotkey stays off under CI, systemd and journald.
@@ -63,6 +72,7 @@ class Pty:
         os.write(self.master, b)
 
     def expect(self, needle, timeout=10.0, since=0):
+        timeout *= factor()
         end = time.time() + timeout
         while needle not in self.out[since:]:
             left = end - time.time()
@@ -122,7 +132,7 @@ def fail(msg):
 
 def wait_exit(t, timeout):
     """The child's exit status, or None if it is still running."""
-    end = time.time() + timeout
+    end = time.time() + timeout * factor()
     while time.time() < end:
         t.drain(0.1)
         i = t.out.rfind(b"EXIT:")

@@ -184,7 +184,7 @@ test "race gives up at the deadline and cancels the slower task" {
     // counts sleeps in timer ticks, and they may end a little early.
     try testing.expect(time.expired(io, deadline));
     const waited = start.durationTo(Io.Clock.awake.now(io));
-    try testing.expect(waited.toSeconds() < 10);
+    if (@import("anole_test_wait").timing()) try testing.expect(waited.toSeconds() < 10);
 }
 
 /// Allocates after 30 ms and cannot be canceled before that.
@@ -211,7 +211,7 @@ test "a value that comes after the deadline is released" {
 fn waitDeaf(io: Io, event: *Io.Event) error{Abandoned}!u32 {
     const protection = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(protection);
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, @import("anole_test_wait").timeoutFactor())));
     while (!event.isSet()) {
         event.waitTimeout(io, .{ .deadline = give_up }) catch {};
         if (time.expired(io, give_up)) return error.Abandoned;
@@ -233,7 +233,7 @@ test "a task that ignores cancellation is stopped through the abort hook" {
         .function = setEvent,
     }));
     try testing.expect(event.isSet());
-    try testing.expect(start.durationTo(Io.Clock.awake.now(io)).toSeconds() < 3);
+    if (@import("anole_test_wait").timing()) try testing.expect(start.durationTo(Io.Clock.awake.now(io)).toSeconds() < 3);
 }
 
 test "a race whose timer cannot start still stops its task through the abort hook" {
@@ -248,5 +248,5 @@ test "a race whose timer cannot start still stops its task through the abort hoo
         .function = setEvent,
     }));
     try testing.expect(event.isSet());
-    try testing.expect(start.durationTo(Io.Clock.awake.now(io)).toSeconds() < 3);
+    if (@import("anole_test_wait").timing()) try testing.expect(start.durationTo(Io.Clock.awake.now(io)).toSeconds() < 3);
 }

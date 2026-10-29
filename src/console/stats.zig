@@ -266,14 +266,14 @@ pub var global: ?*Stats = null;
 /// response's at its finish). `start_ns` is non-zero only while a console
 /// collects; with 0 the answer may be a 5xx (the core calls nothing else
 /// while nobody collects).
-pub fn requestEnd(req: *dusty.Request, res: *dusty.Response, err: ?anyerror, start_ns: u64) void {
+pub fn requestEnd(req: *dusty.Request, res: *dusty.Response, err: ?anyerror, answered: ?anyerror, start_ns: u64) void {
     const st = global orelse return;
     const result: anyerror!void = if (err) |e| e else {};
     const status = observe_common.statusOf(req, res, result);
     const dur: u64 = if (start_ns != 0) dusty.hooks.now(req.io) -% start_ns else 0;
     if (status >= 500) {
         const now_ms = std.Io.Clock.real.now(req.io).toMilliseconds();
-        st.recordError(req, status, if (result) |_| null else |e| e, dur, now_ms);
+        st.recordError(req, status, err orelse answered, dur, now_ms);
     }
     if (start_ns != 0) {
         const ri: u32 = if (req.route) |r| r.index else 0;

@@ -798,10 +798,12 @@ pub fn build(b: *std.Build) void {
     // The hang probe (src/safety/hang_probe.zig): a test that never returns,
     // to see the runner's hang dump work. `-Dhang-probe=true` adds it to
     // `test`; `zig build hang-probe` runs it alone. Both fail by design.
+    // It imports Anole's zio for the test whose hang is a task suspended
+    // forever, which the runner finds through zio's task dump.
     {
         const probe = addSafeTest(b, .{
             .name = "hang-probe",
-            .root_module = b.createModule(.{ .root_source_file = b.path("src/safety/hang_probe.zig"), .target = target, .optimize = optimize, .link_libc = true }),
+            .root_module = b.createModule(.{ .root_source_file = b.path("src/safety/hang_probe.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "zio", .module = core.zio }} }),
             .use_llvm = use_llvm,
         });
         const run_probe = b.addRunArtifact(probe);
@@ -840,13 +842,15 @@ pub fn build(b: *std.Build) void {
     // compile-tests: build the test binaries without running them.
     const compile_tests_step = b.step("compile-tests", "Compile the test binaries without running them");
     compile_tests_step.dependOn(&tests.step);
-    // The validator's, the logger's and the banner's own tests: each is its
-    // own module (no imports), so the anole test binary does not collect them.
+    // The validator's, the logger's, the banner's and src/safety's own
+    // tests: each is its own module, so the anole test binary does not
+    // collect them.
     for ([_]struct { name: []const u8, mod: *std.Build.Module }{
         .{ .name = "validate-test", .mod = core.validate },
         .{ .name = "log-test", .mod = core.anole_log },
         .{ .name = "banner-test", .mod = core.banner },
         .{ .name = "wait-test", .mod = core.test_wait },
+        .{ .name = "safety-test", .mod = core.safety },
     }) |t| {
         const sub_tests = addSafeTest(b, .{ .name = t.name, .root_module = t.mod, .use_llvm = use_llvm });
         const run_sub = b.addRunArtifact(sub_tests);
@@ -944,6 +948,8 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "fuzz", .module = b.createModule(.{ .root_source_file = b.path("src/fuzz.zig"), .target = target, .optimize = optimize }) },
                     .{ .name = "anole_banner", .module = b.createModule(.{ .root_source_file = b.path("src/banner/root.zig"), .target = target, .optimize = optimize }) },
+                    // Its tests' waits (test blocks only: the module stays std-only).
+                    .{ .name = "anole_test_wait", .module = testWaitModule(b, target, optimize) },
                 },
             }),
             .use_llvm = use_llvm,
@@ -1685,7 +1691,11 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("tests/h3/client.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "anole", .module = anole_mod }},
+                .imports = &.{
+                    .{ .name = "anole", .module = anole_mod },
+                    // The one the anole module has (a file lives in one module).
+                    .{ .name = "anole_test_wait", .module = core.test_wait },
+                },
             }),
         });
         b.step("h3-test-client", "Build the HTTP/3 test client (tests/h3/run.sh drives it against aioquic)").dependOn(&b.addInstallArtifact(h3_client, .{}).step);
@@ -2013,6 +2023,9 @@ fn addSafeTest(b: *std.Build, options: std.Build.TestOptions) *std.Build.Step.Co
     var o = options;
     o.test_runner = .{ .path = b.path("src/safety/test_runner.zig"), .mode = .server };
     const m = o.root_module;
+    // Frame pointers in every mode (Debug keeps them anyway): the hang
+    // dump's task stacks (zio.dumpTasks) and zio's stall reports walk them.
+    if (m.omit_frame_pointer == null) m.omit_frame_pointer = false;
     if (m.import_table.get("anole_test_hooks") == null) {
         const zio_mod: ?*std.Build.Module = m.import_table.get("zio") orelse
             if (m.import_table.get("anole")) |a| a.import_table.get("zio") else null;

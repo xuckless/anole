@@ -32,10 +32,16 @@
         // suspends holding a counted lock panics (L2), and a count of
         // `debug_cancel` reports (3accc88, exported in 42f97ae), on which
         // the test runner fails a test (C3), and no report for a cancel an
-        // AutoCancel consumed as its timeout (812eac3).
+        // AutoCancel consumed as its timeout (812eac3). Pinned on the
+        // fork's `anole-diag` branch (1dbfd10, `anole` + one commit): in
+        // Debug and test builds, `diagnostics` also keeps a live-task list
+        // per executor and a registry of runtimes for `zio.dumpTasks`, which
+        // the test runner's hang dump prints, and a stall watchdog that
+        // reports an executor that stops passing its scheduler while work
+        // waits (src/diag.zig in the fork).
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#812eac300e20c7d042403a5df7e59f4a913159b6",
-            .hash = "zio-0.19.0-xHbVVBPwLQBsgh4wHD9aXWugD40WWDN5m2zGfdKe9110",
+            .url = "git+https://github.com/xuckless/zio#1dbfd100eee25b52d6bf4d6bf7fc590f33ee06cb",
+            .hash = "zio-0.19.0-xHbVVGORLgAiOUyTS0XlZ_OIbAuKSpCLqoZsrTsdKksv",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{

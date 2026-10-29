@@ -1,16 +1,21 @@
 //! Zig 0.17.0's default test runner (lib/compiler/test_runner.zig, MIT,
-//! Copyright (c) Zig contributors), with one change for SAFETY.md E1: the
+//! Copyright (c) Zig contributors), with changes for SAFETY.md E1: the
 //! test allocator of a unit test is backed by `never_reuse.allocator`, so
 //! freed memory is never handed out again and a use after free faults at
 //! once; a unit test fails when zio's `debug_cancel` reports a swallowed
 //! cancellation during it (C3); a test that runs past 110 s is named and
 //! every thread's backtrace is dumped before the build runner's
-//! `--test-timeout` kills it (`watchdog`, TESTING.md D2), so a hang says
-//! where it is; a test's log lines are printed only when it fails or
+//! `--test-timeout` kills it (`watchdog`, TESTING.md D2), followed by
+//! every live zio task and the stack of each suspended one
+//! (`zio.dumpTasks`), so a hang says where it is; a test's log lines are
+//! printed only when it fails or
 //! crashes (`captured`, flushed by the panic handler, `debug.handleSegfault`
-//! and a SIGABRT handler); and a failed test names its error (the
-//! server-mode runner printed only the trace). The fuzzing loops keep `std.heap.page_allocator`
-//! (an mprotect per bucket costs a fuzzer's throughput). Re-copy it when moving to the next
+//! and a SIGABRT handler); a failed test names its error (the
+//! server-mode runner printed only the trace); and a run with
+//! ANOLE_TEST_CHILD set runs only the tests whose names contain it
+//! (src/safety/child.zig, for tests whose claim is a panic). The fuzzing
+//! loops keep `std.heap.page_allocator` (an mprotect per bucket costs a
+//! fuzzer's throughput). Re-copy it when moving to the next
 //! Zig version and apply the change again (`ANOLE:` marks it).
 const builtin = @import("builtin");
 
@@ -167,11 +172,15 @@ const watchdog = struct {
         }
     }
 
-    /// The test's name, its log so far, then every thread's backtrace.
+    /// The test's name, its log so far, every thread's backtrace, then
+    /// every zio task's (`dumpTasks`).
     fn dump(name: []const u8, elapsed: u64) void {
         std.debug.print("\ntest '{s}' has run for {d} s: taken for a hang\n", .{ name, elapsed / std.time.ns_per_s });
         captured.show("its log so far");
-        if (comptime !can_dump) return;
+        if (comptime !can_dump) {
+            dumpTasks();
+            return;
+        }
         dieOnSigterm();
         const pid = getpid();
         var pid_buf: [16]u8 = undefined;
@@ -199,7 +208,26 @@ const watchdog = struct {
         endDump(name);
     }
 
+    /// The thread backtraces show what each executor thread runs; a task
+    /// suspended in a wait is on no thread's stack, so a hang that is a task
+    /// waiting forever shows only here. zio keeps a registry of its runtimes
+    /// (the `diagnostics` option, Debug and test builds) and walks each
+    /// suspended task's saved frame pointers (`zio.dumpTasks`; it waits at
+    /// most 2 s for any of its locks). Written with the runner's own Io
+    /// straight to stderr, not through std.debug's stderr lock, which a hung
+    /// test may hold. The symbolizer's own lock (std.debug.SelfInfo) is
+    /// still taken; the raw addresses go out before it, on each task's line.
+    fn dumpTasks() void {
+        var buf: [4096]u8 = undefined;
+        var fw = Io.File.stderr().writerStreaming(runner_threaded_io, &buf);
+        hooks.dumpTasks(&fw.interface);
+        fw.interface.flush() catch {};
+    }
+
     fn endDump(name: []const u8) void {
+        // After the debugger has detached: the dump reads task stacks
+        // while the threads run again.
+        dumpTasks();
         std.debug.print("hang dump of '{s}' ends here; --test-timeout (SIGTERM) or the {d} s backstop ends the test\n", .{ name, abort_after_ns / std.time.ns_per_s });
     }
 
@@ -835,8 +863,15 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
     });
     const have_tty = Io.File.stderr().isTty(runner_threaded_io) catch unreachable;
 
+    // ANOLE: a child run of one test (src/safety/child.zig): only the tests
+    // whose names contain ANOLE_TEST_CHILD.
+    // `getAlloc` maps the whole environment first, hence page_allocator
+    // and not the small `fba`.
+    const only: ?[]const u8 = init.environ.getAlloc(std.heap.page_allocator, "ANOLE_TEST_CHILD") catch null;
+
     var leaks: usize = 0;
     for (test_fn_list, 0..) |test_fn, i| {
+        if (only) |o| if (std.mem.indexOf(u8, test_fn.name, o) == null) continue; // ANOLE
         testing.allocator_instance = .init(never_reuse.allocator, .{ // ANOLE
             .canary = 0xc3a701ba,
             .check_write_after_free = true,

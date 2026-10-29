@@ -22,7 +22,9 @@ const Sleeper = struct {
 
 fn unary(call: *grpc.Call, req: pb.EchoRequest) anyerror!pb.EchoResponse {
     if (std.mem.eql(u8, req.message, "fail")) return call.fail(.not_found, "no such thing: fail");
-    if (std.mem.eql(u8, req.message, "slow")) try call.io.sleep(.fromMilliseconds(2000), .awake);
+    // "slow" runs until the call's deadline cancels it (the wait helper's
+    // deadline is only a hang guard): a 100 ms deadline never races it.
+    if (std.mem.eql(u8, req.message, "slow")) try call.io.sleep(wait.deadline(), .awake);
     if (std.mem.eql(u8, req.message, "boom")) return error.SecretInternalName;
     if (std.mem.eql(u8, req.message, "sleep")) {
         defer Sleeper.done.store(true, .release);
@@ -42,7 +44,15 @@ fn serverStream(call: *grpc.Call, req: pb.EchoRequest, out: *std.Io.Queue(pb.Ech
         // once the writer has started the response, it is refused.
         try call.addHeader("x-early", "yes");
         try out.putOne(call.io, .{ .message = "first", .index = 0 });
-        try call.io.sleep(.fromMilliseconds(200), .awake);
+        // Until the writer has started the head with the first message
+        // (it does so under the write lock).
+        try wait.waitUntil(call.io, "the writer started the response head", call, struct {
+            fn started(cl: *grpc.Call) !bool {
+                try cl.impl.write_mutex.lock(cl.io);
+                defer cl.impl.write_mutex.unlock(cl.io);
+                return cl.impl.out != null;
+            }
+        }.started);
         const late: []const u8 = if (call.addHeader("x-late", "yes")) |_| "added" else |err| @errorName(err);
         try out.putOne(call.io, .{ .message = late, .index = 1 });
         return;
@@ -304,7 +314,7 @@ test "gRPC: unary, server, client and bidi streaming; status and trailers; deadl
         try std.testing.expectEqual(@as(i32, 1), rs[1].index);
     }
     {
-        // 100 ms against a handler that sleeps for 2 s.
+        // 100 ms against a handler that runs until canceled.
         const cl = try Client.call(gpa, io, addr, "/anole.test.Echo/Unary", &.{.{ .message = "slow" }}, &.{Client.nv("grpc-timeout", "100m")});
         defer cl.deinit();
         try std.testing.expectEqual(@as(?u32, 4), cl.grpc_status);
@@ -544,7 +554,7 @@ test "gRPC: per-call limits on what a client sends and how slowly" {
         // after the read timeout, and the connection then closes rather
         // than wait for the rest of the body.
         const head = try webHead(&head_buf, "/anole.test.Echo/Unary", 105);
-        const answer = try slowExchange(gpa, io, port, &.{ head, "\x00\x00\x00\x00\x64ab" }, .zero, "(until the server closes)", .fromSeconds(5));
+        const answer = try slowExchange(gpa, io, port, &.{ head, "\x00\x00\x00\x00\x64ab" }, .zero, "(until the server closes)");
         defer gpa.free(answer);
         try std.testing.expect(std.mem.indexOf(u8, answer, "grpc-status:4\r\n") != null);
     }
@@ -552,14 +562,14 @@ test "gRPC: per-call limits on what a client sends and how slowly" {
         // A client stream may pause between messages longer than the read
         // timeout...
         const head = try webHead(&head_buf, "/anole.test.Echo/ClientStream", 2 * message.len);
-        const answer = try slowExchange(gpa, io, port, &.{ head, message, message }, .fromMilliseconds(400), "grpc-status:", .fromSeconds(5));
+        const answer = try slowExchange(gpa, io, port, &.{ head, message, message }, .fromMilliseconds(400), "grpc-status:");
         defer gpa.free(answer);
         try std.testing.expect(std.mem.indexOf(u8, answer, "grpc-status:0\r\n") != null);
     }
     {
         // ...but not within one.
         const head = try webHead(&head_buf, "/anole.test.Echo/ClientStream", 2 * message.len);
-        const answer = try slowExchange(gpa, io, port, &.{ head, message, message[0..3], message[3..] }, .fromMilliseconds(400), "grpc-status:", .fromSeconds(5));
+        const answer = try slowExchange(gpa, io, port, &.{ head, message, message[0..3], message[3..] }, .fromMilliseconds(400), "grpc-status:");
         defer gpa.free(answer);
         try std.testing.expect(std.mem.indexOf(u8, answer, "grpc-status:4\r\n") != null);
     }
@@ -607,7 +617,8 @@ test "gRPC-Web over HTTP/1.1: a deadline that cancels the handler is answered DE
 
     const stream = try server.address.ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
-    // One message, EchoRequest{ message: "slow" }: the handler sleeps 2 s.
+    // One message, EchoRequest{ message: "slow" }: the handler runs until
+    // the deadline cancels it.
     const request = "POST /anole.test.Echo/Unary HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/grpc-web+proto\r\n" ++
         "Grpc-Timeout: 100m\r\nContent-Length: 11\r\n\r\n" ++ "\x00\x00\x00\x00\x06\x0a\x04slow";
     var wbuf: [512]u8 = undefined;
@@ -963,11 +974,10 @@ test "gRPC: the client's RST_STREAM cancels the handler" {
         try wait.waitFlag(io, "the sleeping handler started", &Sleeper.started);
         const reset_at: std.Io.Clock.Timestamp = .now(io, .awake);
         s.cancel();
-        // A 10 s sleep, over well inside a second.
-        while (!Sleeper.done.load(.acquire)) {
-            if (wait.timing()) try std.testing.expect(reset_at.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
-            try io.sleep(.fromMilliseconds(5), .awake);
-        }
+        // A 10 s sleep, ended by the cancel (and under test-timing, well
+        // inside a second).
+        try wait.waitFlag(io, "the canceled handler returned", &Sleeper.done);
+        if (wait.timing()) try std.testing.expect(reset_at.durationTo(.now(io, .awake)).raw.toMilliseconds() < 1000);
         try std.testing.expect(Sleeper.canceled.load(.acquire));
     }
     // The connection serves on.

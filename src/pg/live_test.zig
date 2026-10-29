@@ -311,13 +311,25 @@ fn sleeping(d: *pg.Client, c: *db.Ctx, app: []const u8) !i64 {
     return d.one(i64, c, "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND state = 'active' AND query LIKE '%pg_sleep%' AND pid <> pg_backend_pid()", .{app});
 }
 
-/// Waits up to 3 s for `app`'s sleeping statements to stop.
-fn expectStopped(io: std.Io, d: *pg.Client, c: *db.Ctx, app: []const u8) !void {
-    for (0..60) |_| {
-        if (try sleeping(d, c, app) == 0) return;
-        try io.sleep(.fromMilliseconds(50), .awake);
+const Sleeping = struct {
+    d: *pg.Client,
+    c: *db.Ctx,
+    app: []const u8,
+    n: i64,
+    fn reached(s: Sleeping) !bool {
+        return try sleeping(s.d, s.c, s.app) == s.n;
     }
-    return error.StatementStillRunning;
+};
+
+/// Waits for `app`'s sleeping statements to stop (the wait helper's
+/// deadline is a hang guard: one that never stops fails the test).
+fn expectStopped(io: std.Io, d: *pg.Client, c: *db.Ctx, app: []const u8) !void {
+    try wait.waitUntil(io, "the sleeping statements stopped on the server", Sleeping{ .d = d, .c = c, .app = app, .n = 0 }, Sleeping.reached);
+}
+
+/// Waits until `n` of `app`'s statements run `pg_sleep` on the server.
+fn waitSleeping(io: std.Io, d: *pg.Client, c: *db.Ctx, app: []const u8, n: i64) !void {
+    try wait.waitUntil(io, "the statements sleep on the server", Sleeping{ .d = d, .c = c, .app = app, .n = n }, Sleeping.reached);
 }
 
 test "pg: live a timeout or a cancel stops the statement on the server" {
@@ -353,10 +365,10 @@ test "pg: live a timeout or a cancel stops the statement on the server" {
         }
     };
     var task = try io.concurrent(Sleeper.run, .{ d, io });
-    for (0..80) |_| {
-        if (try sleeping(watcher, &c, app_name) == 1) break;
-        try io.sleep(.fromMilliseconds(25), .awake);
-    }
+    waitSleeping(io, watcher, &c, app_name, 1) catch |err| {
+        _ = task.cancel(io) catch {};
+        return err;
+    };
     try testing.expectError(error.Canceled, task.cancel(io));
     try expectStopped(io, watcher, &c, app_name);
 
@@ -501,13 +513,29 @@ test "pg: live coalesced and cached reads, a canceled caller, invalidation" {
     try testing.expectEqual(@as(u64, 28), d.cache.stats().coalesced);
 
     // The first caller canceled: the others still get the row, from the
-    // one statement.
+    // one statement. They join once it runs on the server, and the first
+    // is canceled once all three joined (events, not sleeps); the
+    // statement's 1 s only has to outlast those few steps.
     var first: std.Io.Group = .init;
     seen = @splat(.init(0));
-    try dusty.placement.concurrent(&first, io, .{ .executor = 1 }, Worker.run, .{ d, io, .{ .coalesce = true }, 0.3, &seen, &wrong });
-    try io.sleep(.fromMilliseconds(50), .awake);
-    for (0..3) |_| try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, Worker.run, .{ d, io, .{ .coalesce = true }, 0.3, &seen, &wrong });
-    try io.sleep(.fromMilliseconds(20), .awake);
+    try dusty.placement.concurrent(&first, io, .{ .executor = 1 }, Worker.run, .{ d, io, .{ .coalesce = true }, 1.0, &seen, &wrong });
+    waitSleeping(io, watcher, &c, app_name, 1) catch |err| {
+        first.cancel(io);
+        return err;
+    };
+    const joined_before = d.cache.stats().coalesced;
+    for (0..3) |_| try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, Worker.run, .{ d, io, .{ .coalesce = true }, 1.0, &seen, &wrong });
+    const Joined = struct {
+        d: *pg.Client,
+        n: u64,
+        fn reached(x: @This()) bool {
+            return x.d.cache.stats().coalesced >= x.n;
+        }
+    };
+    wait.waitUntil(io, "the three callers joined the statement in flight", Joined{ .d = d, .n = joined_before + 3 }, Joined.reached) catch |err| {
+        first.cancel(io);
+        return err;
+    };
     first.cancel(io);
     try group.await(io);
     try testing.expectEqual(@as(u32, 1), wrong.load(.monotonic));
@@ -517,10 +545,10 @@ test "pg: live coalesced and cached reads, a canceled caller, invalidation" {
     // Every caller gone: the statement is stopped on the server.
     var gone: std.Io.Group = .init;
     for (0..3) |_| try dusty.placement.concurrent(&gone, io, .{ .executor = 2 }, Worker.run, .{ d, io, .{ .coalesce = true }, 30.0, &seen, &wrong });
-    for (0..40) |_| {
-        if (try sleeping(watcher, &c, app_name) == 1) break;
-        try io.sleep(.fromMilliseconds(50), .awake);
-    }
+    waitSleeping(io, watcher, &c, app_name, 1) catch |err| {
+        gone.cancel(io);
+        return err;
+    };
     gone.cancel(io);
     const level = quiet();
     defer testing.log_level = level;

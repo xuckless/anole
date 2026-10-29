@@ -70,10 +70,11 @@ pub fn main(init: std.process.Init) !void {
             defer conn.close();
             try fetch(gpa, io, conn, "GET", path, null, w);
             // The ticket comes after the handshake; wait for it once.
-            if (i == 0) for (0..200) |_| {
-                if (cache.count() > 0) break;
-                try io.sleep(.fromMilliseconds(10), .awake);
-            };
+            if (i == 0) try @import("anole_test_wait").waitUntil(io, "the session ticket", &cache, struct {
+                fn held(c: *h3.SessionCache) bool {
+                    return c.count() > 0;
+                }
+            }.held);
             try w.print("resumed {d} early {t}\n", .{ @intFromBool(conn.resumed()), conn.earlyData() });
         }
         return;

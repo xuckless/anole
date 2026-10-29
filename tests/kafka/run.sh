@@ -16,6 +16,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+. tests/lib/wait.sh
 ZIG=${ZIG:-zig}
 FLAVOR=${KAFKA_FLAVOR:-kafka}
 PORT=${KAFKA_PORT:-59092}
@@ -53,11 +54,16 @@ case "$FLAVOR" in
     ;;
 esac
 
-# The port opens before the broker is ready; the tests retry metadata, but
-# give a slow start (KRaft formats its log first) up to a minute.
-for _ in $(seq 1 300); do
-  if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then break; fi
-  sleep 0.2
-done
-sleep 5
+# The port opens before the broker is ready: wait for the line the broker
+# logs once it serves (testcontainers' wait strategies for both images), a
+# slow start (KRaft formats its log first) given up to two minutes.
+case "$FLAVOR" in
+  kafka) READY="Transitioning from RECOVERY to RUNNING" ;;
+  redpanda) READY="Successfully started Redpanda!" ;;
+esac
+if ! wait_until 120 "the broker to start" docker_log_has "$NAME" "$READY" ||
+  ! wait_until 30 "the broker to listen" port_open 127.0.0.1 "$PORT"; then
+  docker logs "$NAME" 2>&1 | tail -30 >&2
+  exit 1
+fi
 "$ZIG" build test -Dkafka-test-url="127.0.0.1:$PORT" "$@"

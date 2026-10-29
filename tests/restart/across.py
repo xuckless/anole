@@ -18,6 +18,16 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ConnectionTerminated
 
 
+def deadline():
+    """The hang guard every wait here uses, as src/testing/wait.zig's: 10 s
+    times ANOLE_TEST_TIMEOUT_FACTOR (a whole number, default 1)."""
+    try:
+        factor = max(int(os.environ.get("ANOLE_TEST_TIMEOUT_FACTOR", "1")), 1)
+    except ValueError:
+        factor = 1
+    return 10 * factor
+
+
 class Client(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -43,7 +53,7 @@ class Client(QuicConnectionProtocol):
         fut = asyncio.get_running_loop().create_future()
         self.waiters[stream_id] = fut
         self.transmit()
-        return await asyncio.wait_for(fut, 5)
+        return await asyncio.wait_for(fut, deadline())
 
 
 async def main():
@@ -52,10 +62,17 @@ async def main():
     config.verify_mode = ssl.CERT_NONE
     async with connect(host, port, configuration=config, create_protocol=Client, wait_connected=True) as client:
         print("before", await client.get(f"{host}:{port}"), flush=True)
+        # run.sh creates `go` once the successor is ready.
+        loop = asyncio.get_running_loop()
+        until = loop.time() + 6 * deadline()
         while not os.path.exists(go):
+            if loop.time() > until:
+                print("no go from run.sh", flush=True)
+                sys.exit(1)
             await asyncio.sleep(0.02)
+        # Closed by the old process (well before the 60 s idle timeout).
         try:
-            ev = await asyncio.wait_for(asyncio.shield(client.terminated), 5)
+            ev = await asyncio.wait_for(asyncio.shield(client.terminated), deadline())
         except asyncio.TimeoutError:
             print("still open", flush=True)
             sys.exit(1)

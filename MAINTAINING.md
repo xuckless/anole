@@ -9,7 +9,7 @@ that happens promptly.
 
 | Component | Pinned in | Form |
 | --- | --- | --- |
-| zio | build.zig.zon | commit of the xuckless/zio fork, branch `anole` |
+| zio | build.zig.zon | commit of the xuckless/zio fork, branch `anole` (for now `anole-diag`, see below) |
 | HTTP core (from dusty) | src/http/core | Anole code since 2026-10-20; see "The HTTP core" below |
 | nghttp2 1.70.0 | build.zig.zon | commit of the xuckless/nghttp2 fork, branch `anole` (tarball) |
 | BoringSSL | build.zig.zon | upstream commit tarball, compiled by `build/boringssl.zig` |
@@ -175,6 +175,19 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   in lalinsky/zio#837, which Anole turns on in `build.zig` and
   `anole.zio_options`. The bench suite's `conns` and `raw` scenarios measure
   them.
+  Anole pins the fork's `anole-diag` branch for now: `anole` plus the task
+  dump and the executor stall watchdog (src/diag.zig in the fork), behind
+  `diagnostics` and compiled only in Debug and test builds. Every task is
+  on its spawn executor's list from `AnyTask.create` until it finishes;
+  `zio.dumpTasks` walks each suspended task's saved frame pointers, and the
+  test runner prints it after the thread backtraces of a hang dump
+  (src/safety/test_hooks.zig). A watchdog thread per runtime reports an
+  executor that has not passed its scheduler (`getNextTask`) for
+  `RuntimeOptions.stall_watchdog.threshold` (200 ms) while its run queue
+  holds tasks, taking the stack with SIGURG on Linux and macOS. Run the
+  fork's suite with `--diagnostics` too (`./check.sh --diagnostics` and
+  `./check.sh --scheduling pinned --diagnostics`). Fork only, not offered
+  upstream (user, 2026-10-28).
   Anole requires the fork's declarations and fails to compile without them
   (src/http/core/placement.zig, top): `Placement`, `Group` (with
   `spawnInto`), `AutoCancel` (with its `task` field), `currentTask`, `Event`,
@@ -303,7 +316,22 @@ Anole's own tests wait through `src/testing/wait.zig` (the module
 - `waitEqual`, `waitNonZero` and `deadlineMs()` (the deadline for an API
   that takes milliseconds) cover the rest; the C consumer
   (tests/capi/consumer.c) has `wait_until()` with the same deadline, and
-  `timing()` for its elapsed-time bounds (`CHECK(!timing() || ...)`).
+  `timing()` for its elapsed-time bounds (`CHECK(!timing() || ...)`);
+  tests/capi/grpc.c and sse.c have the same `wait_until()`, and their
+  watchdogs scale with the factor.
+- The shell runners (tests/*/run.sh and the scripts beside them) source
+  `tests/lib/wait.sh` (POSIX sh): `wait_until SECONDS "what" CMD...` runs
+  CMD until it succeeds, for SECONDS times `ANOLE_TEST_TIMEOUT_FACTOR`, and
+  says what it waited for when it gives up. A runner waits for what a
+  fixed sleep stood for, as testcontainers' wait strategies do: a port
+  that accepts (`port_open`, `udp_bound`), a log line N times (`log_has`,
+  `docker_log_has`; PostgreSQL's "ready to accept connections" twice, the
+  broker's running line for Kafka and Redpanda), a process gone (`gone`),
+  or a command that succeeds (`pg_isready`, `PING`). A server started by a
+  runner says when it is ready (tests/h3/server.zig logs "h3 test server
+  ready", and a line when a slow request or download has started), so the
+  runner never guesses. tests/restart/across.py and
+  tests/console/pty_test.py scale their limits by the same factor.
 
 ## The S3 client
 

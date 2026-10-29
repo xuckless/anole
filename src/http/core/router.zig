@@ -60,6 +60,9 @@ const Node = struct {
     route: ?*const anyopaque,
 };
 
+/// What a route serves, for the live console's `/routes`.
+pub const RouteKind = enum { http, ws, wt, grpc };
+
 /// How a route is registered (`Router.addRouteWith`).
 pub const RouteOptions = struct {
     /// Whatever the route is registered with, for its handler to read back
@@ -82,6 +85,9 @@ pub const RouteOptions = struct {
     /// Parameter names the route's handler reads (`anole.In` path fields);
     /// one the full path lacks is a conflict. Checked at registration.
     required_params: []const []const u8 = &.{},
+    /// What the route serves: a WebSocket, WebTransport or gRPC endpoint,
+    /// or plain HTTP. Shown by the live console; nothing else reads it.
+    kind: RouteKind = .http,
 };
 
 pub fn Action(comptime Ctx: type) type {
@@ -105,6 +111,8 @@ pub fn Router(comptime Ctx: type) type {
             no_wait: bool = false,
             /// The method it was registered for; null for `any`.
             method: ?Method = null,
+            /// See `RouteOptions.kind`.
+            kind: RouteKind = .http,
         };
 
         /// One method's route in `static_routes`; the methods for one path
@@ -347,6 +355,7 @@ pub fn Router(comptime Ctx: type) type {
                 .middlewares = middlewares,
                 .no_wait = opts.no_wait,
                 .method = method,
+                .kind = opts.kind,
             };
             try self.routes.append(alloc, route);
             current.route = @ptrCast(route);

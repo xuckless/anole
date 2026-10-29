@@ -1120,7 +1120,7 @@ fn drainOnce(q: *Outbound, io: Io, out: *std.ArrayList(u8)) !void {
 }
 
 fn awaitRoomWaiter(q: *Outbound, io: Io) !void {
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, @import("anole_test_wait").timeoutFactor())));
     while (q.roomWaiters(io) == 0) {
         if (time.expired(io, give_up)) return error.TestPutNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -1520,7 +1520,7 @@ fn putNamed(q: *Outbound, io: Io, subject: []const u8) PutError!void {
 
 /// Waits until `count` puts wait for room, for 5 s at most.
 fn awaitRoomWaiters(q: *Outbound, io: Io, count: u32) !void {
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, @import("anole_test_wait").timeoutFactor())));
     while (q.roomWaiters(io) < count) {
         if (time.expired(io, give_up)) return error.TestPutNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);

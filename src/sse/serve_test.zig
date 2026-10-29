@@ -109,6 +109,9 @@ test "app.sse over HTTP/1.1: the connection parks with no task; events and a hea
                 defer acc.deinit(alloc);
                 try readToEnd(&r.interface, &acc);
                 s.close(io);
+                // Time for the round trip's task to end (a sensitivity
+                // sleep: a baseline taken early is higher, which only makes
+                // the check below easier, never fails it).
                 try io.sleep(.fromMilliseconds(20), .awake);
                 break :blk liveTasks(io);
             };
@@ -366,6 +369,7 @@ test "app.sse over HTTP/3: the stream parks with no task; events arrive; a reset
             defer conn.close();
             // A round trip first, so the endpoint's tasks have settled.
             try ping(conn);
+            // A sensitivity sleep, as over HTTP/1.1.
             try io.sleep(.fromMilliseconds(20), .awake);
             const baseline = liveTasks(io);
 

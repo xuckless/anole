@@ -44,6 +44,22 @@ static anole_str S(const char *s) {
   return r;
 }
 
+/* Hang guards, as src/testing/wait.zig: 10 s times ANOLE_TEST_TIMEOUT_FACTOR
+   (a whole number, default 1), counted on the clock. Never a latency bound. */
+static long timeout_factor(void) {
+  const char *f = getenv("ANOLE_TEST_TIMEOUT_FACTOR");
+  long n = f ? strtol(f, NULL, 10) : 1;
+  return n < 1 ? 1 : n;
+}
+
+static double now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+static double wait_until(void) { return now_ms() + 10000.0 * (double)timeout_factor(); }
+
 /* A hang fails the run instead of holding CI until the job's timeout: the
    last "ok" line printed (stdout is line-buffered) names the last step that
    passed. abort() leaves a core where cores are kept. */
@@ -57,7 +73,7 @@ static void on_watchdog(int sig) {
 static void start_watchdog(unsigned seconds) {
   setvbuf(stdout, NULL, _IOLBF, 0);
   signal(SIGALRM, on_watchdog);
-  alarm(seconds);
+  alarm(seconds * (unsigned)timeout_factor());
 }
 
 static void sleep_ms(int ms) {
@@ -492,7 +508,7 @@ static int msg_is(const reply *r, int i, const char *s) {
 }
 
 static uint64_t wait_for(atomic_ullong *v, uint64_t want) {
-  for (int i = 0; i < 2500; i++) {
+  for (double until = wait_until(); now_ms() < until;) {
     uint64_t got = atomic_load(v);
     if (want ? got == want : got != 0) return got;
     sleep_ms(2);
@@ -718,14 +734,16 @@ int main(void) {
     const char *m[] = {"borrow-me"};
     call("Unary", m, 1, NULL, r);
     CHECK(r->status == 200 && has_trailer(r, "grpc-status:0"));
-    for (int i = 0; i < 500 && atomic_load(&sent_events) < n0 + 1; i++) sleep_ms(2);
+    for (double until = wait_until(); atomic_load(&sent_events) < n0 + 1 && now_ms() < until;) sleep_ms(2);
     CHECK(atomic_load(&sent_events) == n0 + 1);
     CHECK(atomic_load(&sent_data) == (unsigned long long)(uintptr_t)borrowed_answer && atomic_load(&sent_len) == sizeof borrowed_answer - 1);
     const char *e[] = {"borrow-empty"};
     call("Unary", e, 1, NULL, r);
     CHECK(r->status == 200 && has_trailer(r, "grpc-status:0"));
-    for (int i = 0; i < 500 && atomic_load(&sent_events) < n0 + 2; i++) sleep_ms(2);
+    for (double until = wait_until(); atomic_load(&sent_events) < n0 + 2 && now_ms() < until;) sleep_ms(2);
     CHECK(atomic_load(&sent_events) == n0 + 2 && atomic_load(&sent_len) == 0);
+    /* No third one: a window for one to show (a slow machine only hides a
+       duplicate, never fakes one). */
     sleep_ms(100);
     CHECK(atomic_load(&sent_events) == n0 + 2);
     printf("ok borrowed messages: one SENT each\n");
@@ -749,7 +767,7 @@ int main(void) {
     CHECK(health("") == 1 && health("anole.test.Echo") == 1 && health("later.Service") == 2);
     CHECK(anole_grpc_health_set(s, S("anole.test.Echo"), ANOLE_GRPC_HEALTH_NOT_SERVING) == ANOLE_OK);
     int st = 0;
-    for (int i = 0; i < 500 && (st = health("anole.test.Echo")) != 2; i++) sleep_ms(2);
+    for (double until = wait_until(); (st = health("anole.test.Echo")) != 2 && now_ms() < until;) sleep_ms(2);
     CHECK(st == 2);
     printf("ok health\n");
   }

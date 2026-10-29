@@ -129,20 +129,26 @@ test "relaunch: starts a program detached, output appended, then killAndWait" {
         .cwd = dir,
         .env = &.{ "ANOLE_T=yes", "PATH=/usr/bin:/bin" },
     };
+    const wait = @import("anole_test_wait");
     const pid = try relaunch(gpa, info, out);
     try std.testing.expect(pid > 1);
-    // Wait for the line to appear.
     const hooks: Hooks = .{};
-    var seen = false;
-    var tries: u32 = 0;
-    while (tries < 100 and !seen) : (tries += 1) {
-        hooks.sleep(50);
-        const text = tmp.dir.readFileAlloc(io, "app.out", gpa, .limited(4096)) catch continue;
-        defer gpa.free(text);
-        seen = std.mem.indexOf(u8, text, "with yes") != null;
-    }
-    try std.testing.expect(seen);
-    try killAndWait(pid, 5000, hooks);
+    // The child sleeps 30 s so that there is something to kill; it must
+    // not outlive a failed check.
+    errdefer killAndWait(pid, wait.deadlineMs(), hooks) catch {};
+    // Wait for the line to appear.
+    const Out = struct {
+        dir: std.Io.Dir,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        fn seen(c: @This()) bool {
+            const text = c.dir.readFileAlloc(c.io, "app.out", c.gpa, .limited(4096)) catch return false;
+            defer c.gpa.free(text);
+            return std.mem.indexOf(u8, text, "with yes") != null;
+        }
+    };
+    try wait.waitUntil(io, "the relaunched program wrote its line", Out{ .dir = tmp.dir, .io = io, .gpa = gpa }, Out.seen);
+    try killAndWait(pid, wait.deadlineMs(), hooks);
     try std.testing.expect(!sys.pidAlive(pid));
 }
 

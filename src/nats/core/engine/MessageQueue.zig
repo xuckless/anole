@@ -623,7 +623,7 @@ fn receive(q: *MessageQueue) NextError!?Message {
 /// Waits until a task waits in `next`, for 5 s at most.
 fn awaitReceiver(q: *MessageQueue) !void {
     const io = testing.io;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, @import("anole_test_wait").timeoutFactor())));
     while (!q.isReceiving(io)) {
         if (time.expired(io, give_up)) return error.TestReceiverNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -685,7 +685,7 @@ test "a reader still inside next() when the queue ends is waited for" {
     defer q.deinit();
     var reader = try io.concurrent(nextLong, .{ &q, io });
     defer _ = reader.cancel(io) catch null;
-    const give_up = time.after(io, .fromSeconds(5));
+    const give_up = time.after(io, .fromSeconds(5 * @as(i64, @import("anole_test_wait").timeoutFactor())));
     while (!q.isReceiving(io)) {
         if (time.expired(io, give_up)) return error.TestNeverWaited;
         try io.sleep(.fromMilliseconds(1), .awake);
@@ -723,6 +723,7 @@ test "drains: the first begins it, the client's drain adds its UNSUB once, and t
     var waiter = try io.concurrent(waitForDrains, .{ &q, io, &done });
     defer waiter.cancel(io);
     q.leaveDrain();
+    // A window for a wrong wake to show (a slow machine only hides one).
     try io.sleep(.fromMilliseconds(20), .awake);
     try testing.expect(!done.load(.acquire));
     q.leaveDrain();

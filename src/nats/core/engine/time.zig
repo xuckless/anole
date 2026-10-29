@@ -88,6 +88,8 @@ test "sleeping until the latest deadline is safe" {
     // Io.Threaded turns a deadline into a timespec; the longest one fits.
     const io = testing.io;
     var sleeper = try io.concurrent(sleepUntil, .{ io, deadline(io, forever()).? });
+    // Time for the sleeper to start its wait (a sensitivity sleep: canceled
+    // before, it is Canceled as well).
     try io.sleep(.fromMilliseconds(10), .awake);
     try testing.expectError(error.Canceled, sleeper.cancel(io));
 }
