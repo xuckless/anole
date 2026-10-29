@@ -90,7 +90,18 @@ fn exchange(io: std.Io, addr: std.Io.net.IpAddress, request: []const u8, out: []
     return fw.buffered();
 }
 
-test "dusty on zstd: zstd responses (preferred over gzip) and zstd request bodies" {
+/// A dusty server on a loopback port with the /big and /echo routes.
+fn startServer(io: std.Io, server: *dusty.Server(void)) !std.Io.Future(anyerror!void) {
+    server.router.get("/big", bigHandler);
+    server.router.post("/echo", echoHandler);
+    return io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{server});
+}
+
+test "zstd: a response marked compress goes out as zstd when the client takes gzip and zstd" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();
@@ -99,13 +110,7 @@ test "dusty on zstd: zstd responses (preferred over gzip) and zstd request bodie
     const loopback: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
     var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = loopback }} }, {});
     defer server.deinit();
-    server.router.get("/big", bigHandler);
-    server.router.post("/echo", echoHandler);
-    var future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(void)) !void {
-            try s.run();
-        }
-    }.run, .{&server});
+    var future = try startServer(io, &server);
     defer future.cancel(io) catch {};
     try server.waitReady(io);
     const addr = server.address.ip;
@@ -122,8 +127,22 @@ test "dusty on zstd: zstd responses (preferred over gzip) and zstd request bodie
     try std.testing.expectEqual(@as(c_uint, 0), zstd.ZSTD_isError(n));
     try std.testing.expect(std.mem.startsWith(u8, plain[0..n], "row 0: compressible"));
     try std.testing.expect(body.len < n / 5);
+}
 
-    // A zstd request body, decoded for the handler.
+test "zstd: a zstd request body reaches the handler decoded" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const loopback: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
+    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = loopback }} }, {});
+    defer server.deinit();
+    var future = try startServer(io, &server);
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+    const addr = server.address.ip;
+
     const text = "a zstd request body for the echo handler";
     var frame: [256]u8 = undefined;
     const fn_len = zstd.ZSTD_compress(&frame, frame.len, text.ptr, text.len, 3);
@@ -132,6 +151,7 @@ test "dusty on zstd: zstd responses (preferred over gzip) and zstd request bodie
     var rw: std.Io.Writer = .fixed(&req_buf);
     try rw.print("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Encoding: zstd\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{fn_len});
     try rw.writeAll(frame[0..fn_len]);
+    var out: [64 * 1024]u8 = undefined;
     const echoed = try exchange(io, addr, rw.buffered(), &out);
     try std.testing.expect(std.mem.endsWith(u8, echoed, text));
 }

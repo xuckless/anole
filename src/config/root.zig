@@ -892,6 +892,25 @@ test "unknown keys in a section are reported with their path" {
     );
 }
 
+test "an unknown key's hint ignores case, and none is given past 64 characters or when the key is mostly wrong" {
+    const long: []const u8 = comptime &@as([64]u8, @splat('a'));
+    const Config = struct { port: u16 = 1, xy: u8 = 0, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa: u8 = 0 };
+    comptime std.debug.assert(@hasField(Config, long));
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = "{\n" ++
+        "  \"PORT\": 1,\n" ++
+        "  \"" ++ long ++ "a\": 2,\n" ++
+        "  \"ab\": 3\n" ++
+        "}" });
+
+    try expectProblems(Config, .{ .io = testing.io, .dir = tmp.dir, .sources = &.{.json("config.json")} }, "3 configuration problems:\n" ++
+        "  config.json:2: PORT: unknown key (did you mean \"port\"?)\n" ++
+        "  config.json:3: " ++ long ++ "a: unknown key\n" ++
+        "  config.json:4: ab: unknown key");
+}
+
 test "a struct field's default fills the keys no source sets" {
     const Db = struct { host: []const u8 = "localhost", port: u16 = 5432, user: []const u8 };
     const Config = struct { db: Db = .{ .host = "db.internal", .user = "app" } };

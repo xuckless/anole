@@ -152,16 +152,20 @@ test "deterministic: the same routes in another order write the same bytes" {
     try std.testing.expectEqualStrings(first, second);
 }
 
+fn socket(_: *@import("../websocket/root.zig").Socket, _: *Request) !void {}
+
 test "left out: any, hidden and routes of other kinds" {
     var app = try server_mod.App.init(alloc, .{ .executors = .exact(1) });
     defer app.deinit();
     app.any("/anything", legacy);
     app.get("/internal", handlers.doc(.{ .hidden = true }, hidden));
+    if (comptime features.websocket) app.ws("/socket", socket);
     app.get("/shown", legacy);
     const doc = try app.openapiDocument(alloc);
     defer alloc.free(doc);
     try std.testing.expect(std.mem.indexOf(u8, doc, "/anything") == null);
     try std.testing.expect(std.mem.indexOf(u8, doc, "/internal") == null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "/socket") == null);
     try std.testing.expect(std.mem.indexOf(u8, doc, "/shown") != null);
 }
 
@@ -216,7 +220,7 @@ test "golden: Widgets gRPC service" {
     try expectGolden("widgets", doc);
 }
 
-test "gRPC forms by Options.grpc" {
+test "gRPC forms by Options.grpc: connect = .none leaves no Connect paths; transcoded = false leaves no HttpRule paths" {
     if (comptime !grpc_on) return error.SkipZigTest;
     const ops = comptime proto.serviceOperations(Widgets);
     var entries: [ops.len]root.Entry = undefined;
@@ -226,10 +230,12 @@ test "gRPC forms by Options.grpc" {
     }
     const none = try document.build(alloc, &entries, .{ .grpc = .{ .connect = .none } }, .auto, errors.log);
     defer alloc.free(none);
-    try std.testing.expect(std.mem.indexOf(u8, none, "application/json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, none, "\"/transcode.Widgets/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, none, "\"/v1/widgets/{name_1}\"") != null);
     const rest_off = try document.build(alloc, &entries, .{ .grpc = .{ .transcoded = false } }, .auto, errors.log);
     defer alloc.free(rest_off);
-    try std.testing.expect(rest_off.len != none.len);
+    try std.testing.expect(std.mem.indexOf(u8, rest_off, "\"/v1/widgets/{name_1}\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rest_off, "\"/transcode.Widgets/Make\"") != null);
 }
 
 // ------------------------------------------------------------------ names

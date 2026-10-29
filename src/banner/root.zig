@@ -442,9 +442,11 @@ test "write: a very narrow terminal gets one line" {
     try testing.expectEqualStrings("anole 0.4.0 · development\n", w.buffered());
 }
 
-test "show: never in tests; styleFor reads the width, COLUMNS, NO_COLOR and COLORTERM" {
-    // A test build never shows it, whatever else holds.
+test "banner: a test build never shows the banner" {
     try testing.expect(!show(true, true, true, FakeEnv{}));
+}
+
+test "styleFor: width, COLUMNS, NO_COLOR and COLORTERM pick the art and palette" {
     const env: FakeEnv = .{};
     try testing.expectEqual(Art.blocks, styleFor(110, env, false).art);
     try testing.expectEqual(Art.glyphs, styleFor(200, env, true).art);

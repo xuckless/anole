@@ -297,7 +297,7 @@ test "write: the bytes of std.json with indent_2, strings escaped as it escapes 
     try testing.expectEqualStrings(again.written(), text);
 }
 
-test "eql and get" {
+test "eql compares nodes by value; get finds an object member or returns null" {
     const a = comptime object(&.{ .{ .key = "type", .value = .{ .string = "integer" } }, .{ .key = "minimum", .value = .{ .raw = "0" } } });
     const b = comptime object(&.{ .{ .key = "type", .value = .{ .string = "integer" } }, .{ .key = "minimum", .value = .{ .raw = "1" } } });
     try testing.expect(comptime eql(a, a));

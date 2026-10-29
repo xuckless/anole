@@ -699,7 +699,12 @@ test "throttle: five failures stop retries; successes earn them back at 0.1 each
     t.onSuccess();
     try testing.expect(t.allowRetry());
     for (0..20) |_| t.onSuccess();
-    try testing.expectEqual(@as(u32, 7100), t._tokens.load(.monotonic));
+    // 21 successes at 0.1 earn 2.1 tokens over the 5 left: 7.1. Retries
+    // need more than 5, so three failures stop them again (a whole token
+    // per success would have refilled to 10 and needed five).
+    failures = 0;
+    while (t.allowRetry()) : (failures += 1) t.onFailure();
+    try testing.expectEqual(@as(u32, 3), failures);
 }
 
 test "breaker: five consecutive failures open it; allow is null until open_until" {
@@ -756,28 +761,40 @@ test "breaker: half-open lets one probe; success closes and resets open_for; fai
     try testing.expect(b.allow(now) == null);
     b.record(probe, .failure, now);
     try testing.expectEqual(Breaker.State.open, b.state());
-    try testing.expectEqual(@as(i64, 2000 * std.time.ns_per_ms), b._open_for.load(.monotonic));
-    now += 3 * sec;
-    b.record(b.allow(now).?, .failure, now);
-    try testing.expectEqual(@as(i64, 3000 * std.time.ns_per_ms), b._open_for.load(.monotonic));
-    now += 4 * sec;
+    // Doubled to 2 s.
+    try testing.expect(b.allow(now + 1900 * std.time.ns_per_ms) == null);
+    now += 2100 * std.time.ns_per_ms;
+    const second = b.allow(now).?;
+    try testing.expect(second.probe);
+    b.record(second, .failure, now);
+    // Doubled again, capped at 3 s.
+    try testing.expect(b.allow(now + 2900 * std.time.ns_per_ms) == null);
+    now += 3100 * std.time.ns_per_ms;
     b.record(b.allow(now).?, .success, now);
     try testing.expectEqual(Breaker.State.closed, b.state());
-    try testing.expectEqual(@as(i64, 1000 * std.time.ns_per_ms), b._open_for.load(.monotonic));
+    // The next trip is open for 1 s again.
+    trip(&b, now);
+    try testing.expect(b.allow(now + 900 * std.time.ns_per_ms) == null);
+    try testing.expect(b.allow(now + 1100 * std.time.ns_per_ms) != null);
 }
 
 test "breaker: neutral outcomes change nothing; a non-probe call recorded while open only counts in buckets" {
     var b: Breaker = .init(.{}, .redis, "t");
     const now: i96 = 50 * sec;
+    // Neutrals between failures neither count toward the run nor reset it.
+    for (0..2) |_| b.record(b.allow(now).?, .failure, now);
     for (0..10) |_| b.record(b.allow(now).?, .neutral, now);
+    for (0..2) |_| b.record(b.allow(now).?, .failure, now);
     try testing.expectEqual(Breaker.State.closed, b.state());
-    try testing.expectEqual(@as(u32, 0), b._consecutive.load(.monotonic));
+    b.record(b.allow(now).?, .failure, now);
+    try testing.expectEqual(Breaker.State.open, b.state());
     // A call admitted before the trip finishes after it.
-    const late = b.allow(now).?;
-    for (0..5) |_| b.record(b.allow(now).?, .failure, now);
-    try testing.expectEqual(Breaker.State.open, b.state());
-    b.record(late, .success, now);
-    try testing.expectEqual(Breaker.State.open, b.state());
+    var c: Breaker = .init(.{}, .redis, "t");
+    const late = c.allow(now).?;
+    for (0..5) |_| c.record(c.allow(now).?, .failure, now);
+    try testing.expectEqual(Breaker.State.open, c.state());
+    c.record(late, .success, now);
+    try testing.expectEqual(Breaker.State.open, c.state());
 }
 
 test "breakers: same key gives the same breaker; past max_entries the least recently used closed one is evicted, an open one never" {
@@ -786,24 +803,22 @@ test "breakers: same key gives the same breaker; past max_entries the least rece
     const io = testing.io;
     const a = try bs.get(io, "https://a:443");
     try testing.expect(a == try bs.get(io, "https://a:443"));
-    // Keys that land in a's shard, so its capacity (1) is exceeded.
-    const shard = std.hash.Wyhash.hash(0, "https://a:443") % 16;
-    var keys: [3][32]u8 = undefined;
-    var found: usize = 0;
-    var i: usize = 0;
-    while (found < keys.len) : (i += 1) {
-        const k = std.fmt.bufPrint(&keys[found], "https://h{d}:443", .{i}) catch unreachable;
-        if (std.hash.Wyhash.hash(0, k) % 16 == shard) {
-            keys[found][k.len] = 0;
-            found += 1;
-        }
+    // a: four failures, one short of opening. b: open.
+    for (0..4) |_| a.record(a.allow(0).?, .failure, 0);
+    const b = try bs.get(io, "https://b:443");
+    for (0..5) |_| b.record(b.allow(0).?, .failure, 0);
+    try testing.expectEqual(Breaker.State.open, b.state());
+    // Many more keys than max_entries: every shard overflows.
+    for (0..200) |i| {
+        var buf: [32]u8 = undefined;
+        _ = try bs.get(io, std.fmt.bufPrint(&buf, "https://h{d}:443", .{i}) catch unreachable);
     }
-    for (0..5) |_| a.record(a.allow(0).?, .failure, 0);
-    try testing.expectEqual(Breaker.State.open, a.state());
-    const k0 = std.mem.sliceTo(&keys[0], 0);
-    _ = try bs.get(io, k0);
-    // a is open: never evicted.
-    try testing.expect(a == try bs.get(io, "https://a:443"));
+    // a was evicted: its breaker is a fresh one, which one failure leaves closed.
+    const a2 = try bs.get(io, "https://a:443");
+    a2.record(a2.allow(0).?, .failure, 0);
+    try testing.expectEqual(Breaker.State.closed, a2.state());
+    // b was kept, still open.
+    try testing.expect((try bs.get(io, "https://b:443")).allow(0) == null);
 }
 
 const CountJudge = struct {
