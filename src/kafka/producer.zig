@@ -11,6 +11,9 @@
 const std = @import("std");
 const dusty = @import("dusty");
 const placement = dusty.placement;
+const safety = @import("anole_safety");
+const test_hold = @import("test_hold.zig");
+const testHold = test_hold.testHold;
 const protocol = @import("protocol.zig");
 const records = @import("records.zig");
 const compress = @import("compress.zig");
@@ -129,8 +132,8 @@ pub const Producer = struct {
     cfg: Config,
     tel: ?*const Telemetry = null,
 
-    mutex: std.Io.Mutex = .init,
-    drained: std.Io.Condition = .init,
+    mutex: safety.Mutex(.leaf) = .init,
+    drained: safety.Condition = .init,
     topics: std.StringHashMapUnmanaged(*TopicState) = .empty,
     active: std.ArrayList(*Accum) = .empty,
     senders: std.AutoHashMapUnmanaged(i32, *Sender) = .empty,
@@ -140,7 +143,7 @@ pub const Producer = struct {
     flushing: u32 = 0,
     stopping: bool = false,
 
-    pid_mutex: std.Io.Mutex = .init,
+    pid_mutex: safety.IoLock = .init,
     pid: i64 = -1,
     epoch: i16 = -1,
     generation: u32 = 0,
@@ -379,6 +382,7 @@ pub const Producer = struct {
         errdefer _ = self.senders.remove(id);
         const exec: usize = if (id >= 0) @intCast(id) else 0;
         placement.concurrent(&self.group, self.io, .{ .executor = exec }, senderLoop, .{ self, s }) catch return error.OutOfMemory;
+        testHold(self.io, .sender_spawned);
         return s;
     }
 
@@ -651,6 +655,7 @@ pub const Producer = struct {
             return;
         }
         const timeout: Duration = .fromMilliseconds(@as(i64, @intCast(@divTrunc(self.cfg.request_timeout.nanoseconds, std.time.ns_per_ms))) + 5000);
+        testHold(self.io, .send_request);
         const body = try conn.call(arena, .produce, e.bytesWritten(), timeout);
         const results = protocol.decodeProduce(arena, body, conn.version(.produce)) catch return error.ProtocolError;
         for (work) |w| {
@@ -810,6 +815,7 @@ pub const Producer = struct {
         }
         self.pid = -1;
         self.pid_mutex.unlock(self.io);
+        testHold(self.io, .pid_reset);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var ti = self.topics.valueIterator();

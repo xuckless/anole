@@ -8,6 +8,7 @@
 //! produce or a heartbeat; the mutex only keeps accidental sharing safe.
 const std = @import("std");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const protocol = @import("protocol.zig");
 const sasl = @import("sasl.zig");
 const scram = @import("../net/scram.zig");
@@ -49,7 +50,9 @@ pub const Conn = struct {
     io: std.Io,
     settings: Settings,
     stream: *net.ClientStream,
-    mutex: std.Io.Mutex = .init,
+    /// L2's exception (an I/O lock): one round trip at a time on this
+    /// socket, taken with no other lock held, until #111's reader demux.
+    mutex: safety.IoLock = .init,
     correlation: i32 = 1,
     broken: bool = false,
     node_id: i32,
@@ -233,11 +236,12 @@ pub const Cluster = struct {
     settings: Settings,
     /// "host:port" strings, owned.
     bootstrap: [][]u8,
-    mutex: std.Io.Mutex = .init,
+    /// Over `brokers` and `topics`. A leaf (L4).
+    mutex: safety.Mutex(.leaf) = .init,
     brokers: std.AutoHashMapUnmanaged(i32, BrokerInfo) = .empty,
     topics: std.StringHashMapUnmanaged(TopicInfo) = .empty,
     /// Serialises metadata refreshes and owns `meta_conn`.
-    refresh_mutex: std.Io.Mutex = .init,
+    refresh_mutex: safety.IoLock = .init,
     meta_conn: ?*Conn = null,
     closing: std.atomic.Value(bool) = .init(false),
 

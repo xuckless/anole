@@ -479,3 +479,159 @@ test "fake broker: a broker serving Produce 0-7 and ListOffsets 0-4 (Redpanda) i
         try testing.expect(!client.ping());
     }
 }
+
+// ---------------------------------------------------------------------------
+// SAFETY.md §8 step 4: nothing waits under the producer's, the cluster's or
+// the client's locks (forced interleavings through test_hold.zig).
+
+const hold_mod = @import("test_hold.zig");
+const TestHold = hold_mod.TestHold;
+
+/// What a task of a test did: set once, then `done`.
+const TaskResult = struct {
+    done: std.atomic.Value(bool) = .init(false),
+    err: ?anyerror = null,
+    delivery: ?kafka.Delivery = null,
+
+    fn finish(r: *TaskResult) void {
+        r.done.store(true, .release);
+    }
+
+    fn wait(r: *TaskResult, io: std.Io) !void {
+        try wait_mod.waitFlag(io, "the test's task finished", &r.done);
+        if (r.err) |e| return e;
+    }
+};
+const wait_mod = wait;
+
+fn produceTask(client: *kafka.Client, io: std.Io, record: kafka.Record, out: *TaskResult) std.Io.Cancelable!void {
+    defer out.finish();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    out.delivery = client.produce(&c, record) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => {
+            out.err = err;
+            return;
+        },
+    };
+}
+
+test "kafka producer: a record whose sender starts while the producing task is suspended at the spawn is delivered" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+
+    var hold: TestHold = .{ .point = .sender_spawned };
+    hold.arm();
+    defer hold_mod.test_hold.store(null, .release);
+    var result: TaskResult = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    // The first record of a topic starts its leader's sender: the producing
+    // task stops right after that spawn, where zio's spawn backpressure can
+    // suspend it.
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, produceTask, .{ client, io, kafka.Record{ .topic = "spawned", .value = "v" }, &result });
+    try wait.waitFlag(io, "the producing task is held at the sender's spawn", &hold.held);
+    hold.let(io);
+    try result.wait(io);
+    try testing.expectEqual(@as(i64, 0), result.delivery.?.offset);
+    try testing.expectEqual(@as(i64, 1), broker.count("spawned", 0));
+}
+
+const Joined = struct {
+    var seen: std.atomic.Value(u32) = .init(0);
+
+    fn on(_: ?*anyopaque, _: *kafka.Msg) anyerror!void {
+        _ = seen.fetchAdd(1, .monotonic);
+    }
+};
+
+fn consumeTask(client: *kafka.Client, out: *TaskResult) std.Io.Cancelable!void {
+    defer out.finish();
+    _ = client.consumeRaw(.{
+        .group = "late",
+        .topics = &.{"joined"},
+        .start = .earliest,
+        .heartbeat_interval = .fromMilliseconds(100),
+        .commit_interval = .fromMilliseconds(100),
+    }, Joined.on, null) catch |err| {
+        out.err = err;
+    };
+}
+
+test "kafka: a consumer group added after start joins while its member spawn is suspended" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    try client.start(null, null, null);
+    Joined.seen.store(0, .release);
+
+    var hold: TestHold = .{ .point = .member_spawned };
+    hold.arm();
+    defer hold_mod.test_hold.store(null, .release);
+    var result: TaskResult = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    // Serving has started, so the group joins at once: the adding task
+    // stops right after its member's spawn.
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, consumeTask, .{ client, &result });
+    try wait.waitFlag(io, "the adding task is held at the member's spawn", &hold.held);
+    hold.let(io);
+    try result.wait(io);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    _ = try client.produce(&c, .{ .topic = "joined", .value = "v" });
+    try waitCount(io, &Joined.seen, 1);
+}
+
+test "kafka producer: after a producer id reset, the broker refuses no batch as out of order" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    // Two leaders: partition 0 on broker id 0 (its sender on executor 0),
+    // partition 1 on broker id 1 (executor 1).
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 2, .nodes = 2 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    // Both partitions numbered past 0 under the first producer id.
+    for (0..3) |_| {
+        _ = try client.produce(&c, .{ .topic = "ids", .value = "warm", .partition = 0 });
+        _ = try client.produce(&c, .{ .topic = "ids", .value = "warm", .partition = 1 });
+    }
+
+    // The next Produce is refused with UNKNOWN_PRODUCER_ID: partition 0's
+    // sender resets the id and stops right after.
+    broker.fail_code.store(59, .release);
+    broker.fail_produce.store(1, .release);
+    var hold: TestHold = .{ .point = .pid_reset };
+    hold.arm();
+    defer hold_mod.test_hold.store(null, .release);
+    var result: TaskResult = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, produceTask, .{ client, io, kafka.Record{ .topic = "ids", .value = "after-reset", .partition = 0 }, &result });
+    try wait.waitFlag(io, "partition 0's sender is held after the id reset", &hold.held);
+    // Meanwhile partition 1's sender takes a new id and sends.
+    const other = try client.produce(&c, .{ .topic = "ids", .value = "other", .partition = 1 });
+    try testing.expectEqual(@as(i32, 1), other.partition);
+    hold.let(io);
+    try result.wait(io);
+    try testing.expectEqual(@as(u32, 0), broker.out_of_order.load(.monotonic));
+    try testing.expectEqual(@as(i64, 4), broker.count("ids", 0));
+    try testing.expectEqual(@as(i64, 4), broker.count("ids", 1));
+}

@@ -36,6 +36,7 @@
 //! producers put them; librdkafka's default differs.
 const std = @import("std");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
 const observe = @import("../observe/root.zig");
@@ -184,7 +185,8 @@ pub const Client = struct {
     telemetry: ?Telemetry = null,
     ready: ?db.Readiness = null,
     consumers: std.ArrayList(*consumer_mod.Consumer) = .empty,
-    consumers_mutex: std.Io.Mutex = .init,
+    /// Over `consumers`, `started` and `drained`. A leaf (L4).
+    consumers_mutex: safety.Mutex(.leaf) = .init,
     started: bool = false,
     drained: bool = false,
     /// Set by `app.kafka` under `deployment = lambda`: consumer groups are
