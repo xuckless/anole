@@ -201,11 +201,12 @@ test "Handle: the kind in bits 28-32; every kind, the last slot and the last gen
 }
 
 test "capi engine: every handle kind but the reserved db_query has an entry in abi.handle_kinds with its number and name" {
-    inline for (@typeInfo(Handle.Kind).@"enum".fields) |f| {
-        if (f.value == @backingInt(Handle.Kind.db_query)) continue;
+    const info = @typeInfo(Handle.Kind).@"enum";
+    inline for (info.field_names, info.field_values) |name, value| {
+        if (value == @backingInt(Handle.Kind.db_query)) continue;
         var found = false;
-        for (abi.handle_kinds) |k| if (k.kind == f.value) {
-            try std.testing.expectEqualStrings(f.name, k.name);
+        for (abi.handle_kinds) |k| if (k.kind == value) {
+            try std.testing.expectEqualStrings(name, k.name);
             found = true;
         };
         try std.testing.expect(found);
