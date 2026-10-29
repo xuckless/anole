@@ -125,6 +125,18 @@ breaking changes are listed anyway.
 
 ### Changed
 
+- WebSocket over TLS (#85): one TLS read now returns every whole record
+  already received, and a busy HTTP/1.1 WebSocket reads through a larger
+  window: `upgrade()`/`next()` sockets widen their reader over the
+  connection's read buffer (about 17 KiB) and callback sockets take a
+  pooled 16.5 KiB block, both given back after 8 quiet waits. A relay that
+  works through buffered messages now batches what it sends to the other
+  members. Past its capacity the video-call relay degrades differently: at
+  950 users (epoll) about 30% of calls stay fully served where 0.4.0
+  served none, and on io_uring video stays above 40% up to about 1,040
+  users instead of 870. Its knee (users served properly) is a little lower
+  in single runs, 790 against 860 on epoll and 810 against 830 on io_uring;
+  CPU per relayed message is unchanged. Raising the knee is S2 work.
 - Jobs: with `app.tracing()`, each run of a job is a CONSUMER span
   `process <queue>`, linked (not parented) to the context it was enqueued
   from, with OpenTelemetry's messaging attributes and `anole.job.kind`,
