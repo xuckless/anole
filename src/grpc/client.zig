@@ -284,23 +284,29 @@ pub const Channel = struct {
     /// The HTTP/2 connection of an owned channel: a fresh one when the
     /// current has gone. One dial at a time, with no lock held across it
     /// (SAFETY.md L2): the calls that find it running wait for it, then
-    /// look again; a failed dial fails only its own call.
+    /// look again; a failed dial fails only its own call. `isOpen` takes
+    /// the connection's own lock, so it is asked with the channel's let go.
     fn activeH2(self: *Channel) !*h2.ClientConnection {
         const owned = self._owned orelse return self.conn.?;
-        if (self.conn) |c| if (c.isOpen()) return c;
         const io_ = self.runtime();
-        owned.mutex.lockUncancelable(io_);
-        defer owned.mutex.unlock(io_);
         while (true) {
-            // Another call may have redialed while this one waited.
-            if (self.conn) |c| if (c.isOpen()) return c;
-            if (!owned.redialing) break;
-            owned.dialed.waitUncancelable(io_, &owned.mutex);
+            const current = self.conn;
+            if (current) |c| if (c.isOpen()) return c;
+            owned.mutex.lockUncancelable(io_);
+            defer owned.mutex.unlock(io_);
+            // Another call is dialing, or has dialed since `current` was
+            // read: look again once it is done.
+            if (owned.redialing) {
+                owned.dialed.waitUncancelable(io_, &owned.mutex);
+                continue;
+            }
+            if (self.conn != current) continue;
+            owned.redialing = true;
+            break;
         }
-        owned.redialing = true;
-        owned.mutex.unlock(io_);
         const dial = h2.ClientConnection.connect(owned.gpa, io_, owned.options);
         owned.mutex.lockUncancelable(io_);
+        defer owned.mutex.unlock(io_);
         owned.redialing = false;
         owned.dialed.broadcast(io_);
         const fresh = try dial;
@@ -315,19 +321,23 @@ pub const Channel = struct {
     fn activeH3(self: *Channel) !*H3Connection {
         if (comptime !features.http3) unreachable;
         const owned = self._owned.?;
-        if (self.h3) |c| if (c.isOpen()) return c;
         const io_ = self.runtime();
-        owned.mutex.lockUncancelable(io_);
-        defer owned.mutex.unlock(io_);
         while (true) {
-            if (self.h3) |c| if (c.isOpen()) return c;
-            if (!owned.redialing) break;
-            owned.dialed.waitUncancelable(io_, &owned.mutex);
+            const current = self.h3;
+            if (current) |c| if (c.isOpen()) return c;
+            owned.mutex.lockUncancelable(io_);
+            defer owned.mutex.unlock(io_);
+            if (owned.redialing) {
+                owned.dialed.waitUncancelable(io_, &owned.mutex);
+                continue;
+            }
+            if (self.h3 != current) continue;
+            owned.redialing = true;
+            break;
         }
-        owned.redialing = true;
-        owned.mutex.unlock(io_);
         const dial = dialH3(owned, io_, owned.h3_port);
         owned.mutex.lockUncancelable(io_);
+        defer owned.mutex.unlock(io_);
         owned.redialing = false;
         owned.dialed.broadcast(io_);
         const fresh = try dial;
@@ -344,11 +354,17 @@ pub const Channel = struct {
     fn autoH3(self: *Channel) !?*H3Connection {
         const owned = self._owned.?;
         const io_ = self.runtime();
+        // `isOpen` takes the connection's own lock: asked before the
+        // channel's is taken.
+        const current = self.h3;
+        if (current) |c| if (c.isOpen()) return c;
         owned.mutex.lockUncancelable(io_);
-        if (self.h3) |c| if (c.isOpen()) {
+        // Another call dialed meanwhile: its connection is the one to use.
+        if (self.h3 != current) {
+            const newer = self.h3;
             owned.mutex.unlock(io_);
-            return c;
-        };
+            return newer;
+        }
         const now = std.Io.Clock.Timestamp.now(io_, .awake);
         const port: u16 = blk: {
             if (owned.alt) |a| if (now.compare(.lt, a.until)) break :blk a.port;
