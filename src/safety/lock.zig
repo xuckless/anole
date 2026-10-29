@@ -377,8 +377,12 @@ fn suspendWhileHolding(io: ?std.Io) [2]u32 {
     return .{ outer, inner };
 }
 
-/// Fails unless `out` names the source line `line` of this file.
+/// Fails unless `out` names the source line `line` of this file. Debug
+/// builds only: an optimized test binary (ReleaseSafe) inlines the lock
+/// calls, and a site is then the nearest frame left out of line, not the
+/// line that took the lock. The report itself is the same.
 fn expectSite(out: []const u8, line: u32) !void {
+    if (@import("builtin").mode != .debug) return;
     var buf: [32]u8 = undefined;
     const needle = try std.fmt.bufPrint(&buf, "lock.zig:{d}:", .{line});
     if (std.mem.indexOf(u8, out, needle) == null) {
