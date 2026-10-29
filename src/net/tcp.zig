@@ -856,12 +856,18 @@ pub const OutChunk = struct {
 
     const max_suffix = 2;
     const header = std.mem.alignForward(usize, @sizeOf(OutChunk), @alignOf(OutChunk));
-    /// The allocation of an owner-executor send's standard chunk, header
-    /// included: 16 KiB exactly, so it sits in the allocator's 16 KiB class
-    /// instead of just past it.
-    pub const standard_size = 16 * 1024;
-    /// The bytes a standard chunk holds.
-    const standard_room = standard_size - header - Framing.max_prefix - max_suffix;
+    /// The room of an owner-executor send's first chunk: 16 KiB of
+    /// payload (plus the header and the frame room), so a 16 KiB message
+    /// fits one.
+    pub const standard_room = 16 * 1024;
+    /// The largest chunk a connection keeps as its spare, by region size:
+    /// the listener's high-water mark, at least a standard chunk, at most
+    /// 64 KiB. A message bigger than the high-water mark makes the
+    /// connection busy by itself, and past 64 KiB the copy costs more than
+    /// the allocation, while every busy connection may hold one spare.
+    pub fn spareMax(write_high_water: u32) usize {
+        return @min(64 * 1024, @max(Framing.max_prefix + standard_room + max_suffix, write_high_water));
+    }
 
     /// An owned chunk whose payload (`payload()`, `payload_len` bytes) the
     /// caller fills.
@@ -929,9 +935,10 @@ pub const OutChunk = struct {
         return @fieldParentPtr("node", n);
     }
 
-    /// Made by `fresh` with the standard room (or the same size by `create`).
-    fn isStandard(c: *const OutChunk) bool {
-        return c.owned and c.size == standard_size - header;
+    /// The bytes an owned chunk holds from its start (`fresh` writes from
+    /// offset 0): its whole region.
+    fn capacity(c: *const OutChunk) usize {
+        return c.size;
     }
 
     /// A written chunk, emptied for the next sends.
@@ -1055,12 +1062,12 @@ const TcpConn = struct {
     out: Fifo = .{},
     /// The batch being written (the responsible party's).
     inflight: Fifo = .{},
-    /// One standard chunk kept after it was written, for the next sends
-    /// (an echo then allocates nothing). owner: the connection (M2), its
-    /// executor only, no atomics; freed when it parks and at `release`. A
-    /// chunk written while it is parked can become the spare again, so a
-    /// parked connection may hold 16 KiB until it wakes or is released.
-    /// Sends from other threads make their own chunks.
+    /// One written chunk kept for the next sends (an echo then allocates
+    /// nothing): the biggest seen, up to `OutChunk.spareMax`. owner: the
+    /// connection (M2), its executor only, no atomics; freed when it parks
+    /// and at `release`. A chunk written while it is parked can become the
+    /// spare again, so a parked connection may hold one until it wakes or
+    /// is released. Sends from other threads make their own chunks.
     spare: ?*OutChunk = null,
     /// The helper tasks (flusher, writable, drain): children of the
     /// connection (T1), canceled and joined by `release`.
@@ -1414,21 +1421,18 @@ const TcpConn = struct {
     }
 
     /// The owner executor's send: into the last chunk when it has room
-    /// (many small sends cost one allocation), else into the spare or a
-    /// fresh one. Every such chunk is 16 KiB (`standard_size`), whatever
-    /// `write_high_water` is: the limits count bytes queued, not chunk
-    /// room, so a listener with a small high-water mark needs nothing; it
-    /// only means a connection with output pending holds 16 KiB at least.
-    /// A send larger than the standard room gets a chunk of its own size.
+    /// (many small sends cost one allocation), else into the spare when it
+    /// is big enough, else into a fresh chunk of 16 KiB (`standard_room`)
+    /// or the send's size if larger, whatever `write_high_water` is: the
+    /// limits count bytes queued, not chunk room, so a listener with a
+    /// small high-water mark needs nothing; a connection with output
+    /// pending holds 16 KiB at least.
     fn queueLocal(t: *TcpConn, parts: []const []const u8, total: usize, token: u64) Conn.SendError!Conn.Sent {
         var fresh: ?*OutChunk = null;
         if (token != 0) {
             fresh = try OutChunk.borrowed(t.gpa, parts[0], token);
         } else if (t.out.tail == null or t.out.tail.?.room() < total) {
-            fresh = if (total <= OutChunk.standard_room)
-                t.takeSpare() orelse try OutChunk.fresh(t.gpa, OutChunk.standard_room)
-            else
-                try OutChunk.fresh(t.gpa, total);
+            fresh = t.takeSpare(total) orelse try OutChunk.fresh(t.gpa, @max(total, OutChunk.standard_room));
         }
         const busy = t.reserve(total) catch {
             if (fresh) |c| t.recycle(c);
@@ -1810,28 +1814,40 @@ const TcpConn = struct {
         t.recycle(c);
     }
 
-    /// Keeps a standard chunk as the spare when there is none, else frees
-    /// it. The connection's executor only.
+    /// Keeps an owned chunk up to `spareMax` as the spare when there is
+    /// none or it is bigger than the one there (that one is freed), else
+    /// frees it. The connection's executor only.
     fn recycle(t: *TcpConn, c: *OutChunk) void {
-        if (t.spare == null and c.isStandard()) {
-            c.reset();
-            t.spare = c;
-            return;
+        if (c.owned and c.capacity() <= OutChunk.spareMax(t.service.options.write_high_water)) {
+            const old = t.spare;
+            if (old == null or old.?.capacity() < c.capacity()) {
+                c.reset();
+                t.spare = c;
+                if (old) |o| o.destroy();
+                return;
+            }
         }
         c.destroy();
     }
 
-    fn takeSpare(t: *TcpConn) ?*OutChunk {
+    /// The spare when it holds `room` bytes; a smaller one is freed (the
+    /// chunk made instead becomes the next spare).
+    fn takeSpare(t: *TcpConn, room: usize) ?*OutChunk {
         const c = t.spare orelse return null;
         t.spare = null;
-        return c;
+        if (c.capacity() >= room) return c;
+        c.destroy();
+        return null;
     }
 
     /// Frees the spare: the connection parks (an idle one should hold no
     /// buffer; one written after the park can come back, see `spare`) or
     /// is released.
     fn dropSpare(t: *TcpConn) void {
-        if (t.takeSpare()) |c| c.destroy();
+        if (t.spare) |c| {
+            t.spare = null;
+            c.destroy();
+        }
     }
 
     /// WRITABLE: the C ABI's table posts it from here; a Zig handler's
