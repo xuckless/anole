@@ -196,6 +196,23 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   it). Re-apply them on every upstream merge, and run the suite once with
   both on (check.sh has no switch for them: `zig build test
   -Dscheduling=pinned -Ddebug_held_locks=true -Ddebug_cancel=true`).
+  And `quiescent_state` (fork only, never offered upstream; user,
+  2026-10-28): a quiescent-state counter per executor, on a cache line of
+  its own, and a grace-period number in the runtime, which
+  src/http/core/qsbr.zig's reclamation waits on
+  (`Runtime.quiescentSnapshot`, `Runtime.quiescentPassed`). A scheduler
+  pass (`getNextTask`) loads the number and the executor's counter and
+  stores only when a grace period has started since its last pass; the
+  executor's offline flag is stored with seq_cst before and after the park
+  and when it stops. On every upstream merge, check that the pass still
+  runs before every task (the run loop and `switchOut` both call
+  `getNextTask`) and that both offline stores stay seq_cst: a weaker one
+  lets a writer free what a task just loaded. Run the suite with
+  `./check.sh --scheduling pinned --quiescent-state` and once with Anole's
+  whole set (`zig build test -Dscheduling=pinned -Dfast_accept=true
+  -Ddiagnostics=true -Ddebug_held_locks=true -Ddebug_cancel=true
+  -Dquiescent_state=true`). Under ReleaseSafe two diag tests that look for
+  function names in stack traces fail (inlining), on baf4e5f as well.
   Anole requires the fork's declarations and fails to compile without them
   (src/http/core/placement.zig, top): `Placement`, `Group` (with
   `spawnInto`), `AutoCancel` (with its `task` field), `currentTask`, `Event`,

@@ -34,16 +34,19 @@
         // the test runner fails a test (C3), and no report for a cancel an
         // AutoCancel consumed as its timeout (812eac3), and a report hook
         // (`held_locks.report`, baf4e5f) through which src/safety names
-        // where each held lock was taken. Pinned on the fork's `anole-diag`
-        // branch (baf4e5f, `anole` + two commits): in
+        // where each held lock was taken; and `quiescent_state` (c21be0b,
+        // fork only): a quiescent-state counter per executor and a
+        // grace-period number (`Runtime.quiescentSnapshot`/`quiescentPassed`)
+        // for src/http/core/qsbr.zig's reclamation. Pinned on the fork's
+        // `anole-diag` branch (c21be0b, `anole` + three commits): in
         // Debug and test builds, `diagnostics` also keeps a live-task list
         // per executor and a registry of runtimes for `zio.dumpTasks`, which
         // the test runner's hang dump prints, and a stall watchdog that
         // reports an executor that stops passing its scheduler while work
         // waits (src/diag.zig in the fork).
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#baf4e5f03fc2e8b1ea0add72cf6aa30099fa22c4",
-            .hash = "zio-0.19.0-xHbVVOaTLgCZI85YzzCtsKA--qcxyBQUkPFRDvCnjYeg",
+            .url = "git+https://github.com/xuckless/zio#c21be0b777f847c70b39625f157cced846f06599",
+            .hash = "zio-0.19.0-xHbVVL-9LgCBbG9bClmiizWcwMWDrB9H57GaJSp4oZuG",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{

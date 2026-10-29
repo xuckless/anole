@@ -28,9 +28,10 @@ zio (async runtime)
             spawn-cache, idle-stack, recvmmsg-with-control, Windows,
             diagnostics, held-lock and swallowed-cancel patches, some open
             upstream as lalinsky/zio #837, #838 and #850; plus the task dump
-            and the executor stall watchdog, src/diag.zig, and the held-lock
-            report hook)
-  Pinned:   commit baf4e5f03fc2e8b1ea0add72cf6aa30099fa22c4 of the fork
+            and the executor stall watchdog, src/diag.zig, the held-lock
+            report hook, and the per-executor quiescent-state counters,
+            quiescent_state)
+  Pinned:   commit c21be0b777f847c70b39625f157cced846f06599 of the fork
   Linked:   always
 
 nghttp2 1.70.0 (HTTP/2)

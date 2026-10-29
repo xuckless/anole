@@ -51,6 +51,11 @@ pub const writeEvent = @import("response.zig").writeEvent;
 pub const placement = @import("placement.zig");
 /// Live connection and stream counts per executor.
 pub const gauges = @import("gauges.zig");
+/// Read-mostly data behind an atomic pointer with quiescent-state
+/// reclamation (SAFETY.md L7).
+pub const qsbr = @import("qsbr.zig");
+/// Counters kept per executor and summed when read (SAFETY.md L6/L7).
+pub const exec_counter = @import("exec_counter.zig");
 pub const hooks = @import("hooks.zig");
 
 /// Tests that provoke `err` logs on purpose declare it here.
@@ -188,6 +193,8 @@ comptime {
     _ = @import("middleware/middleware.zig");
     _ = @import("locals.zig");
     _ = @import("placement.zig");
+    _ = @import("qsbr.zig");
+    _ = @import("exec_counter.zig");
     _ = @import("api_test.zig");
     _ = @import("proxy_protocol.zig");
     _ = @import("fuzz.zig");

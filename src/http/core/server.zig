@@ -36,6 +36,7 @@ const have_auto_cancel = @import("deadline.zig").have_auto_cancel;
 const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
 const placement = @import("placement.zig");
+const qsbr = @import("qsbr.zig");
 const expect_log = @import("expect_log.zig");
 const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 /// The HTTP/2 engine, with the `-Dhttp2` build option.
@@ -1948,6 +1949,8 @@ pub fn Server(comptime Ctx: type) type {
                 self.request_buffers.trimLocal();
                 if (shards) self.request_buffers.trimShards();
                 if (build_options.use_zlib or build_options.use_brotli) block_cache.trimLocal();
+                // Objects retired with no writer after them (src/http/core/qsbr.zig).
+                if (shards) qsbr.pollAll(self.io);
             }
         }
 

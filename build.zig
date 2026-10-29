@@ -2215,7 +2215,8 @@ const Core = struct {
         // program that declares no `zio_options` still gets what Anole needs;
         // anole.Server refuses to compile with work stealing declared. And
         // `fast_accept` (see `anole.zio_options`), so a program whose own
-        // `zio_options` leave it out still has it.
+        // `zio_options` leave it out still has it. And `quiescent_state`
+        // (src/http/core/qsbr.zig: lock-free reads on the executors).
         // In Debug: `debug_held_locks`, a task that suspends holding a lock
         // panics (SAFETY.md L2; src/safety counts the locks); `debug_cancel`,
         // a task that parks after swallowing error.Canceled is reported (C3),
@@ -2225,7 +2226,7 @@ const Core = struct {
         // declares `zio_options` (src/safety/test_hooks.zig), so a
         // ReleaseSafe test binary checks suspensions as it counts locks.
         const debug = optimize == .debug;
-        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .diagnostics = true, .debug_held_locks = debug, .debug_cancel = debug }).module("zio");
+        const zio_mod = b.dependency("zio", .{ .target = target, .optimize = optimize, .scheduling = .pinned, .fast_accept = true, .diagnostics = true, .quiescent_state = true, .debug_held_locks = debug, .debug_cancel = debug }).module("zio");
         const safety = safetyModule(b, zio_mod, target, optimize);
         const seam: ?*std.Build.Module = if (c_mods.boringssl) |bssl| b.createModule(.{
             .root_source_file = b.path("src/tls/dusty_tls.zig"),
