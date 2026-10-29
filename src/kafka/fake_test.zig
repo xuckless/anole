@@ -635,3 +635,154 @@ test "kafka producer: after a producer id reset, the broker refuses no batch as 
     try testing.expectEqual(@as(i64, 4), broker.count("ids", 0));
     try testing.expectEqual(@as(i64, 4), broker.count("ids", 1));
 }
+
+/// An allocator that fails the `fail_at`-th allocation made by the thread
+/// that armed it (other threads pass through), counting from the arming.
+const FailNth = struct {
+    backing: std.mem.Allocator,
+    thread: std.atomic.Value(std.Thread.Id) = .init(0),
+    armed: std.atomic.Value(bool) = .init(false),
+    count: u32 = 0,
+    fail_at: u32 = std.math.maxInt(u32),
+
+    fn allocator(f: *FailNth) std.mem.Allocator {
+        return .{ .ptr = f, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    /// The calling thread's next allocations count; the `fail_at`-th fails.
+    fn arm(f: *FailNth, fail_at: u32) void {
+        f.count = 0;
+        f.fail_at = fail_at;
+        f.thread.store(std.Thread.getCurrentId(), .release);
+        f.armed.store(true, .release);
+    }
+
+    /// How many allocations the arming thread made since `arm`.
+    fn disarm(f: *FailNth) u32 {
+        f.armed.store(false, .release);
+        return f.count;
+    }
+
+    fn mine(f: *FailNth) bool {
+        return f.armed.load(.acquire) and f.thread.load(.acquire) == std.Thread.getCurrentId();
+    }
+
+    fn of(p: *anyopaque) *FailNth {
+        // SAFETY: `allocator()` sets the context to a *FailNth.
+        return @ptrCast(@alignCast(p));
+    }
+
+    fn alloc(p: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const f = of(p);
+        if (f.mine()) {
+            defer f.count += 1;
+            if (f.count == f.fail_at) return null;
+        }
+        return f.backing.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(p: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        return of(p).backing.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(p: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        return of(p).backing.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn free(p: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        of(p).backing.rawFree(memory, alignment, ra);
+    }
+};
+
+/// One waiting append on the executor, failing its `fail_at`-th
+/// allocation: `allocs` is how many it made, `outcome` its answer.
+const FailingAppend = struct {
+    fail: *FailNth,
+    fail_at: u32,
+    allocs: u32 = 0,
+    err: ?anyerror = null,
+    outcome: ?kafka.impl.producer.Producer.Outcome = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(r: *FailingAppend, client: *kafka.Client, value: []const u8) std.Io.Cancelable!void {
+        defer r.done.store(true, .release);
+        const p = client.producer;
+        // A warm append never suspends: nothing else of this executor runs
+        // (or allocates) until it returns.
+        r.fail.arm(r.fail_at);
+        const got = p.appendWaiting("oom", null, value, &.{}, 0, 1);
+        r.allocs = r.fail.disarm();
+        const ref = got catch |err| {
+            r.err = err;
+            return;
+        };
+        r.outcome = try p.waitFor(ref, null);
+    }
+};
+
+test "kafka producer: an allocation failure at any step of a waiting produce answers it once and leaks nothing" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    var fail: FailNth = .{ .backing = gpa };
+    const client = try kafka.Client.init(fail.allocator(), io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    // Warm: the topic, its accumulator and the sender exist.
+    _ = try client.produce(&c, .{ .topic = "oom", .value = "warm", .partition = 0 });
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    // The dry run counts the allocations of a waiting append.
+    var dry: FailingAppend = .{ .fail = &fail, .fail_at = std.math.maxInt(u32) };
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, FailingAppend.run, .{ &dry, client, "dry" });
+    try wait.waitFlag(io, "the dry run's append was answered", &dry.done);
+    try testing.expect(dry.outcome.? == .ok);
+    try testing.expect(dry.allocs > 0);
+    var delivered: i64 = 2;
+    for (0..dry.allocs) |n| {
+        var run: FailingAppend = .{ .fail = &fail, .fail_at = @intCast(n) };
+        try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, FailingAppend.run, .{ &run, client, "x" });
+        try wait.waitFlag(io, "the failing append was answered", &run.done);
+        // Either refused with no wait made, or queued and answered once.
+        if (run.err) |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+        } else {
+            try testing.expect(run.outcome.? == .ok);
+            delivered += 1;
+        }
+        try client.producer.flush(.fromSeconds(10));
+    }
+    try testing.expectEqual(delivered, broker.count("oom", 0));
+}
+
+test "kafka producer: a produce that timed out is still delivered, and nothing leaks" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    _ = try client.produce(&c, .{ .topic = "late", .value = "warm" });
+
+    // The sender stops before its Produce round trip: no outcome can come
+    // while the caller waits.
+    var hold: TestHold = .{ .point = .send_request };
+    hold.arm();
+    defer hold_mod.test_hold.store(null, .release);
+    const ref = try client.producer.appendWaiting("late", null, "late", &.{}, 0, 1);
+    try wait.waitFlag(io, "the sender is held before its round trip", &hold.held);
+    // Time passes on purpose: the hold guarantees no outcome meanwhile.
+    try testing.expect(try client.producer.waitFor(ref, .fromMilliseconds(10)) == .timeout);
+    hold.let(io);
+    try client.producer.flush(.fromSeconds(10));
+    try testing.expectEqual(@as(i64, 2), broker.count("late", 0));
+}

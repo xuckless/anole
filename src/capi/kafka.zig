@@ -38,7 +38,7 @@ const Handle = engine.Handle;
 
 const KClient = if (features.kafka) anole.kafka.Client else void;
 const KConsumer = if (features.kafka) anole.kafka.impl.consumer.Consumer else void;
-const Slot = if (features.kafka) anole.kafka.impl.producer.Slot else void;
+const WaitRef = if (features.kafka) anole.kafka.impl.producer.Wait.Ref else void;
 const KHeader = if (features.kafka) anole.kafka.Header else struct { key: []const u8, value: ?[]const u8 };
 const KMsg = if (features.kafka) anole.kafka.Msg else void;
 
@@ -539,10 +539,8 @@ fn handleItem(x: *Exec, b: *Broker, it: *Item) std.Io.Cancelable!void {
         placement.concurrent(&x.kafka.work, x.engine.io, .local, flushTask, .{ b, cl, it }) catch finish(b, it);
         return;
     }
-    const slot = Slot.create(gpa) catch return reportFailure(b, it, .unavailable, "out_of_memory", "out of memory");
-    cl.producer.append(it.topic, it.key, it.value, it.headers, if (it.partition >= 0) it.partition else null, it.timestamp_ms, slot) catch |err| {
-        slot.release();
-        slot.release();
+    // On an error no wait exists: nothing to give back.
+    const ref = cl.producer.appendWaiting(it.topic, it.key, it.value, it.headers, if (it.partition >= 0) it.partition else null, it.timestamp_ms) catch |err| {
         return switch (err) {
             error.Canceled => {
                 finish(b, it);
@@ -560,8 +558,10 @@ fn handleItem(x: *Exec, b: *Broker, it: *Item) std.Io.Cancelable!void {
             error.ProtocolError, error.Truncated, error.Invalid => reportFailure(b, it, .other, "protocol", "the broker's answer was not understood"),
         };
     };
-    placement.concurrent(&x.kafka.work, x.engine.io, .local, waiter, .{ b, it, slot }) catch {
-        slot.release();
+    // zio fails a spawn only before it can yield: nothing below meets a
+    // suspension after a failure.
+    placement.concurrent(&x.kafka.work, x.engine.io, .local, waiter, .{ b, cl, it, ref }) catch {
+        cl.producer.abandon(ref);
         finish(b, it);
     };
 }
@@ -577,14 +577,15 @@ fn reportFailure(b: *Broker, it: *Item, class: anole.db.Class, code: []const u8,
     post(it, rec);
 }
 
-fn waiter(b: *Broker, it: *Item, slot: *Slot) std.Io.Cancelable!void {
+/// Holds the record's wait ref until its outcome comes (`waitFor` abandons
+/// it on a cancel). The client outlives it: the engine joins `x.kafka.work`
+/// before it frees the app.
+fn waiter(b: *Broker, cl: *KClient, it: *Item, ref: WaitRef) std.Io.Cancelable!void {
     if (comptime !features.kafka) return;
-    defer slot.release();
     defer finish(b, it);
-    const io = b.engine.io;
-    try slot.event.wait(io);
+    const outcome = try cl.producer.waitFor(ref, null);
     var d: Delivery = .{ .user_data = it.user_data, .topic = it.topic };
-    switch (slot.result) {
+    switch (outcome) {
         .ok => |ok| {
             d.partition = ok.partition;
             d.offset = ok.offset;
@@ -595,7 +596,7 @@ fn waiter(b: *Broker, it: *Item, slot: *Slot) std.Io.Cancelable!void {
             .timeout => .timeout,
             .other => .other,
         }, f.code, "the record was not delivered"),
-        .pending => d = failedDelivery(b, it.user_data, it.topic, .timeout, "delivery_pending", "no result"),
+        .timeout => d = failedDelivery(b, it.user_data, it.topic, .timeout, "delivery_pending", "no result"),
     }
     if (it.flags & abi.KAFKA_F_NO_REPORT != 0) {
         if (d.status != abi.OK) log.warn("kafka {s}: record for {s} not delivered: {s}", .{ b.config.name, it.topic, d.code });

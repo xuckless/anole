@@ -418,7 +418,7 @@ pub const Client = struct {
 
     fn sendInner(self: *Client, c: anytype, record: Record) Error!void {
         const headers = try self.withTrace(c, record);
-        self.producer.append(record.topic, record.key, record.value, headers, record.partition, self.timestampOf(record), null) catch |err|
+        self.producer.append(record.topic, record.key, record.value, headers, record.partition, self.timestampOf(record)) catch |err|
             return self.appendError(c, err);
     }
 

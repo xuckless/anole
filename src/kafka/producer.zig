@@ -11,6 +11,7 @@
 const std = @import("std");
 const dusty = @import("dusty");
 const placement = dusty.placement;
+const push_list = dusty.push_list;
 const safety = @import("anole_safety");
 const test_hold = @import("test_hold.zig");
 const testHold = test_hold.testHold;
@@ -57,28 +58,107 @@ pub const Result = union(enum) {
     failed: Failure,
 };
 
-/// Where a waiting `produce` learns what became of its record. Shared
-/// between the caller and the producer (two references).
-pub const Slot = struct {
-    gpa: std.mem.Allocator,
-    refs: std.atomic.Value(u32) = .init(2),
-    event: std.Io.Event = .unset,
+/// Where a waiting caller learns what became of its record
+/// (`appendWaiting`, then `waitFor` or `abandon`). M2's fourth class: stable
+/// memory in the producer's `waits` table (chunks of 64, freed only by
+/// `Producer.deinit`), named by a generation-checked `Ref`. A batch keeps
+/// the ref, never a pointer it could outlive. The holder of the ref (one
+/// task or thread) gives the slot back; `complete` never frees, and a stale
+/// ref is a no-op (T4). The shape of the C ABI's handle slots
+/// (capi/engine.zig `Slot.word`).
+pub const Wait = struct {
+    /// gen (u32) << 32 | state (u32). `gen` counts takes, so a stale ref
+    /// fails every compare-and-swap.
+    word: std.atomic.Value(u64) = .init(0),
+    /// An eventcount: bumped and futex-woken by `complete`; the holder
+    /// sleeps on it. A late bump meant for an earlier holder only wakes the
+    /// next one spuriously (it looks at `word` again).
+    bell: std.atomic.Value(u32) = .init(0),
+    /// Written only while `busy` (by `complete`), read only once `done` (by
+    /// the holder).
     result: Result = .pending,
+    /// On `WaitTable.freed` while given back.
+    node: push_list.Node = .{},
+    /// On `WaitTable.free`, under `Producer.mutex`.
+    next_free: ?*Wait = null,
 
-    pub fn create(gpa: std.mem.Allocator) !*Slot {
-        const s = try gpa.create(Slot);
-        s.* = .{ .gpa = gpa };
-        return s;
+    pub const State = enum(u32) { free, pending, busy, done };
+
+    /// What the holder keeps. Copied freely; valid until it is waited for
+    /// or abandoned.
+    pub const Ref = struct { wait: *Wait, gen: u32 };
+
+    fn pack(gen: u32, state: State) u64 {
+        return @as(u64, gen) << 32 | @intFromEnum(state);
     }
 
-    pub fn release(s: *Slot) void {
-        if (s.refs.fetchSub(1, .acq_rel) == 1) s.gpa.destroy(s);
+    fn genOf(word: u64) u32 {
+        return @truncate(word >> 32);
     }
 
-    fn finish(s: *Slot, io: std.Io, r: Result) void {
-        s.result = r;
-        s.event.set(io);
-        s.release();
+    fn stateOf(word: u64) State {
+        return @enumFromInt(@as(u32, @truncate(word)));
+    }
+};
+
+/// The wait slots. owner: the producer. The free list is taken under
+/// `Producer.mutex`; holders give slots back from any task or thread
+/// through `freed` (SAFETY.md L7's push-list hand-off: any thread pushes,
+/// the mutex holder takes). Bounded by the records pending (U4): it keeps
+/// its high-water mark until `Producer.deinit`.
+const WaitTable = struct {
+    chunks: std.ArrayList(*[chunk_len]Wait) = .empty,
+    free: ?*Wait = null,
+    freed: push_list.PushList = .{},
+
+    const chunk_len = 64;
+
+    /// Under `Producer.mutex`: makes `free` non-empty, from the slots given
+    /// back or a new chunk (a `Mutex`, not a spin lock: allocating here is
+    /// allowed, L5).
+    fn reserve(t: *WaitTable, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+        if (t.free != null) return;
+        var n = t.freed.takeAll();
+        while (n) |node| {
+            n = node.next;
+            // SAFETY: every node on `freed` is the `node` of a `Wait` (`giveBack`).
+            const w: *Wait = @fieldParentPtr("node", node);
+            w.next_free = t.free;
+            t.free = w;
+        }
+        if (t.free != null) return;
+        try t.chunks.ensureUnusedCapacity(gpa, 1);
+        const c = try gpa.create([chunk_len]Wait);
+        c.* = @splat(.{});
+        t.chunks.appendAssumeCapacity(c);
+        var i: usize = chunk_len;
+        while (i > 0) {
+            i -= 1;
+            c[i].next_free = t.free;
+            t.free = &c[i];
+        }
+    }
+
+    /// Under `Producer.mutex`, after `reserve`: never fails.
+    fn take(t: *WaitTable) Wait.Ref {
+        const w = t.free.?;
+        t.free = w.next_free;
+        w.next_free = null;
+        const gen = Wait.genOf(w.word.load(.monotonic)) +% 1;
+        w.result = .pending;
+        w.word.store(Wait.pack(gen, .pending), .release);
+        return .{ .wait = w, .gen = gen };
+    }
+
+    /// Any task or thread, by the slot's holder once it is done with it.
+    fn giveBack(t: *WaitTable, w: *Wait) void {
+        // Never sealed: the chunks live until `deinit`.
+        _ = t.freed.push(&w.node) catch unreachable;
+    }
+
+    fn deinit(t: *WaitTable, gpa: std.mem.Allocator) void {
+        for (t.chunks.items) |c| gpa.destroy(c);
+        t.chunks.deinit(gpa);
     }
 };
 
@@ -96,7 +176,8 @@ const Batch = struct {
     /// The topic's name (`TopicState.name`, freed only by `Producer.deinit`).
     topic: []const u8,
     recs: std.ArrayList(records.Rec) = .empty,
-    slots: std.ArrayList(?*Slot) = .empty,
+    /// Per record: the waiting caller's ref, or null.
+    waits: std.ArrayList(?Wait.Ref) = .empty,
     bytes: usize = 0,
     created: Timestamp,
     deadline: Timestamp,
@@ -262,6 +343,9 @@ pub const Producer = struct {
     pid_fetching: bool = false,
     pid_ready: safety.Condition = .init,
 
+    /// The waiting callers' slots (M2's fourth class).
+    waits: WaitTable = .{},
+
     /// The senders (T1).
     group: std.Io.Group = .init,
 
@@ -292,6 +376,7 @@ pub const Producer = struct {
         }
         self.topics.deinit(self.gpa);
         self.active.deinit(self.gpa);
+        self.waits.deinit(self.gpa);
         self.teardown.end();
         self.gpa.destroy(self);
     }
@@ -311,9 +396,8 @@ pub const Producer = struct {
         return n;
     }
 
-    /// Queues one record. `slot`, when given, receives the outcome (the
-    /// producer then owns one reference to it). A topic the cluster does
-    /// not list yet is waited for, at most `metadata_wait`.
+    /// Queues one record. A topic the cluster does not list yet is waited
+    /// for, at most `metadata_wait`. A later delivery failure is counted.
     pub fn append(
         self: *Producer,
         topic: []const u8,
@@ -322,16 +406,32 @@ pub const Producer = struct {
         headers: []const records.Header,
         explicit_partition: ?i32,
         timestamp_ms: i64,
-        slot: ?*Slot,
     ) AppendError!void {
         const rec: Rec = .{ .topic = topic, .key = key, .value = value, .headers = headers, .partition = explicit_partition, .timestamp_ms = timestamp_ms };
-        return self.appendWithin(&rec, slot, self.cfg.metadata_wait);
+        _ = try self.appendWithin(&rec, false, self.cfg.metadata_wait);
+    }
+
+    /// `append`, and a ref to wait for the record's outcome with: the
+    /// caller must end it with `waitFor` or `abandon`. On an error there is
+    /// none.
+    pub fn appendWaiting(
+        self: *Producer,
+        topic: []const u8,
+        key: ?[]const u8,
+        value: ?[]const u8,
+        headers: []const records.Header,
+        explicit_partition: ?i32,
+        timestamp_ms: i64,
+    ) AppendError!Wait.Ref {
+        const rec: Rec = .{ .topic = topic, .key = key, .value = value, .headers = headers, .partition = explicit_partition, .timestamp_ms = timestamp_ms };
+        return (try self.appendWithin(&rec, true, self.cfg.metadata_wait)).?;
     }
 
     /// What `appendLocked` asks its caller to do.
     const Step = union(enum) {
-        /// The record is in a batch. Wake this sender, if any.
-        done: ?*Sender,
+        /// The record is in a batch (and the wait taken when asked). Wake
+        /// this sender, if any.
+        done: struct { wake: ?*Sender, ref: ?Wait.Ref },
         /// Partition `p` has no leader yet: look it up without the lock,
         /// then try again.
         need_leader: i32,
@@ -347,7 +447,7 @@ pub const Producer = struct {
     /// waits runs under `mutex`: the topic's partition count, a leader
     /// lookup and a sender's start come between lock sections, and a record
     /// joins its batch in one section in the steady state.
-    fn appendWithin(self: *Producer, rec: *const Rec, slot: ?*Slot, metadata_wait: Duration) AppendError!void {
+    fn appendWithin(self: *Producer, rec: *const Rec, wait: bool, metadata_wait: Duration) AppendError!?Wait.Ref {
         const size = recordBytes(rec.key, rec.value, rec.headers);
         if (size + records.header_len > self.cfg.max_request_bytes) return error.TooLarge;
         // May suspend; touches only `self` (process-wide) and the caller's
@@ -360,13 +460,13 @@ pub const Producer = struct {
             const step = blk: {
                 try self.mutex.lock(self.io);
                 defer self.mutex.unlock(self.io);
-                break :blk try self.appendLocked(rec, size, count, now, known, lookups >= 2, slot);
+                break :blk try self.appendLocked(rec, size, count, now, known, lookups >= 2, wait);
             };
             switch (step) {
                 // Senders are freed only by `deinit`: `s` stays valid.
-                .done => |to_wake| {
-                    if (to_wake) |s| s.wake.set(self.io);
-                    return;
+                .done => |d| {
+                    if (d.wake) |s| s.wake.set(self.io);
+                    return d.ref;
                 },
                 .need_leader => |p| {
                     known = .{ .partition = p, .id = self.cluster.leader(rec.topic, p) };
@@ -380,9 +480,10 @@ pub const Producer = struct {
     /// Under `mutex`. Every fallible step (the topic, accumulator and batch,
     /// the record's copies, `active`'s capacity) comes before the record
     /// joins its batch; past that point nothing fails (M1: the batch owns
-    /// the record and the slot's reference). `settle_unknown`: a partition
-    /// whose leader is still unknown goes to the resolver.
-    fn appendLocked(self: *Producer, rec: *const Rec, size: usize, count: u32, now: Timestamp, known: ?Leader, settle_unknown: bool, slot: ?*Slot) AppendError!Step {
+    /// the record, and the wait is taken there, so an error never leaves a
+    /// wait behind). `settle_unknown`: a partition whose leader is still
+    /// unknown goes to the resolver.
+    fn appendLocked(self: *Producer, rec: *const Rec, size: usize, count: u32, now: Timestamp, known: ?Leader, settle_unknown: bool, wait: bool) AppendError!Step {
         if (self.stopping) return error.Closing;
         if (self.buffered + size > self.cfg.buffer_bytes) return error.BufferFull;
         const ts = try self.topicState(rec.topic, count);
@@ -403,9 +504,10 @@ pub const Producer = struct {
         const s = self.senders.get(a.leader) orelse return .{ .need_sender = a.leader };
         if (s.state == .failed) return .{ .need_sender = a.leader };
         try self.active.ensureUnusedCapacity(self.gpa, 1);
+        if (wait) try self.waits.reserve(self.gpa);
         const fresh = a.open == null;
         const batch = a.open orelse try self.newBatch(ts.name, now);
-        {
+        const copy: records.Rec = blk: {
             errdefer if (fresh) self.destroyBatch(batch);
             const arena = batch.arena.allocator();
             const k2: ?[]const u8 = if (rec.key) |k| try arena.dupe(u8, k) else null;
@@ -413,10 +515,13 @@ pub const Producer = struct {
             const hs = try arena.alloc(records.Header, rec.headers.len);
             for (rec.headers, hs) |h, *o| o.* = .{ .key = try arena.dupe(u8, h.key), .value = if (h.value) |v| try arena.dupe(u8, v) else null };
             try batch.recs.ensureUnusedCapacity(arena, 1);
-            try batch.slots.ensureUnusedCapacity(arena, 1);
-            batch.recs.appendAssumeCapacity(.{ .key = k2, .value = v2, .headers = hs, .timestamp_ms = rec.timestamp_ms });
-            batch.slots.appendAssumeCapacity(slot);
-        }
+            try batch.waits.ensureUnusedCapacity(arena, 1);
+            break :blk .{ .key = k2, .value = v2, .headers = hs, .timestamp_ms = rec.timestamp_ms };
+        };
+        // Nothing fails from here on.
+        const ref: ?Wait.Ref = if (wait) self.waits.take() else null;
+        batch.recs.appendAssumeCapacity(copy);
+        batch.waits.appendAssumeCapacity(ref);
         batch.bytes += size;
         a.open = batch;
         self.buffered += size;
@@ -433,7 +538,7 @@ pub const Producer = struct {
             self.active.appendAssumeCapacity(a);
             a.in_active = true;
         }
-        return .{ .done = if (fresh or sealed) s else null };
+        return .{ .done = .{ .wake = if (fresh or sealed) s else null, .ref = ref } };
     }
 
     pub const Outcome = union(enum) { ok: Delivered, failed: Failure, timeout };
@@ -450,30 +555,91 @@ pub const Producer = struct {
         timestamp_ms: i64,
         timeout: ?Duration,
     ) AppendError!Outcome {
-        const slot = try Slot.create(self.gpa);
         const started: Timestamp = .now(self.io, .awake);
-        const wait = if (timeout) |t| (if (t.nanoseconds < self.cfg.metadata_wait.nanoseconds) t else self.cfg.metadata_wait) else self.cfg.metadata_wait;
+        const metadata_wait = if (timeout) |t| (if (t.nanoseconds < self.cfg.metadata_wait.nanoseconds) t else self.cfg.metadata_wait) else self.cfg.metadata_wait;
         const rec: Rec = .{ .topic = topic, .key = key, .value = value, .headers = headers, .partition = partition, .timestamp_ms = timestamp_ms };
-        self.appendWithin(&rec, slot, wait) catch |err| {
-            slot.release();
-            slot.release();
-            return err;
-        };
-        defer slot.release();
-        if (timeout) |t| {
-            // The time spent waiting for a new topic's metadata counts.
-            const spent = started.durationTo(.now(self.io, .awake)).raw.nanoseconds;
-            const left: Duration = .{ .nanoseconds = @max(0, t.nanoseconds - spent) };
-            slot.event.waitTimeout(self.io, .{ .duration = .{ .raw = left, .clock = .awake } }) catch |err| switch (err) {
-                error.Timeout => return .timeout,
-                error.Canceled => return error.Canceled,
-            };
-        } else try slot.event.wait(self.io);
-        return switch (slot.result) {
-            .ok => |d| .{ .ok = d },
-            .failed => |f| .{ .failed = f },
-            .pending => .timeout,
-        };
+        // On an error no wait exists: nothing to give back.
+        const ref = (try self.appendWithin(&rec, true, metadata_wait)).?;
+        // The time spent waiting for a new topic's metadata counts.
+        const left: ?Duration = if (timeout) |t| .{ .nanoseconds = @max(0, t.nanoseconds - started.durationTo(.now(self.io, .awake)).raw.nanoseconds) } else null;
+        return self.waitFor(ref, left);
+    }
+
+    /// The holder of `ref`, once: waits for the record's outcome, at most
+    /// `timeout` (null: until it comes; the delivery timeout ends every
+    /// record). Gives the slot back. At the timeout, or on a cancel, the
+    /// ref is abandoned (`.timeout`, `error.Canceled`): the record still
+    /// finishes, and its outcome reaches no one.
+    pub fn waitFor(self: *Producer, ref: Wait.Ref, timeout: ?Duration) error{Canceled}!Outcome {
+        const w = ref.wait;
+        const until: ?Timestamp = if (timeout) |t| Timestamp.now(self.io, .awake).addDuration(.{ .raw = t, .clock = .awake }) else null;
+        while (true) {
+            const bell = w.bell.load(.acquire);
+            const word = w.word.load(.acquire);
+            std.debug.assert(Wait.genOf(word) == ref.gen);
+            switch (Wait.stateOf(word)) {
+                .done => {
+                    const r = w.result;
+                    w.word.store(Wait.pack(ref.gen, .free), .release);
+                    self.waits.giveBack(w);
+                    return switch (r) {
+                        .ok => |d| .{ .ok = d },
+                        .failed => |f| .{ .failed = f },
+                        .pending => .timeout,
+                    };
+                },
+                // `complete` is copying the result: a few instructions.
+                .busy => std.atomic.spinLoopHint(),
+                .pending => {
+                    if (until) |u| if (!Timestamp.now(self.io, .awake).compare(.lt, u)) {
+                        self.abandon(ref);
+                        return .timeout;
+                    };
+                    const t: std.Io.Timeout = if (until) |u| .{ .deadline = u } else .none;
+                    self.io.futexWaitTimeout(u32, &w.bell.raw, bell, t) catch |err| switch (err) {
+                        error.Canceled => {
+                            self.abandon(ref);
+                            return error.Canceled;
+                        },
+                    };
+                },
+                .free => unreachable,
+            }
+        }
+    }
+
+    /// The holder gives `ref` up without the outcome. The record still
+    /// finishes; its outcome reaches no one.
+    pub fn abandon(self: *Producer, ref: Wait.Ref) void {
+        const w = ref.wait;
+        while (true) {
+            const word = w.word.load(.acquire);
+            std.debug.assert(Wait.genOf(word) == ref.gen);
+            switch (Wait.stateOf(word)) {
+                .pending => if (w.word.cmpxchgWeak(word, Wait.pack(ref.gen, .free), .acq_rel, .acquire) != null) continue,
+                .busy => {
+                    std.atomic.spinLoopHint();
+                    continue;
+                },
+                .done => w.word.store(Wait.pack(ref.gen, .free), .release),
+                .free => unreachable,
+            }
+            self.waits.giveBack(w);
+            return;
+        }
+    }
+
+    /// Any task or thread (a sender's `retire`, `deinit`): gives the holder
+    /// of `ref` its outcome, unless it abandoned it (a stale ref is a
+    /// no-op). The pinned (`busy`) section only copies the result: it never
+    /// allocates or waits. Never frees.
+    fn complete(self: *Producer, ref: Wait.Ref, r: Result) void {
+        const w = ref.wait;
+        if (w.word.cmpxchgStrong(Wait.pack(ref.gen, .pending), Wait.pack(ref.gen, .busy), .acquire, .monotonic) != null) return;
+        w.result = r;
+        w.word.store(Wait.pack(ref.gen, .done), .release);
+        _ = w.bell.fetchAdd(1, .release);
+        self.io.futexWake(u32, &w.bell.raw, 1);
     }
 
     fn randomPartition(self: *Producer, count: u32, avoid: i32) i32 {
@@ -987,7 +1153,7 @@ pub const Producer = struct {
     }
 
     /// No lock held on entry. The batches were detached under the lock, so
-    /// the caller is their only owner: completes every record's slot, counts
+    /// the caller is their only owner: completes every record's wait, counts
     /// the telemetry (a metrics family takes its own lock: never under
     /// `mutex`, L3), then gives the buffer space back in one section and
     /// frees them. Completions come first, so `flush` returns only after
@@ -999,13 +1165,13 @@ pub const Producer = struct {
         var it = done.head;
         while (it) |b| : (it = b.next) {
             const result = b.outcome;
-            for (b.slots.items, b.recs.items, 0..) |maybe, rec, i| {
-                if (maybe) |slot| {
+            for (b.waits.items, b.recs.items, 0..) |maybe, rec, i| {
+                if (maybe) |ref| {
                     const r: Result = switch (result) {
                         .ok => |d| .{ .ok = .{ .partition = d.partition, .offset = if (d.offset >= 0) d.offset + @as(i64, @intCast(i)) else -1, .timestamp_ms = rec.timestamp_ms } },
                         else => result,
                     };
-                    slot.finish(self.io, r);
+                    self.complete(ref, r);
                 }
             }
             const count = b.recs.items.len;
@@ -1120,10 +1286,3 @@ pub const Producer = struct {
 
 const testing = std.testing;
 
-test "Slot: two references, finished once" {
-    const s = try Slot.create(testing.allocator);
-    s.finish(testing.io, .{ .ok = .{ .partition = 1, .offset = 5, .timestamp_ms = 9 } });
-    try s.event.wait(testing.io);
-    try testing.expectEqual(@as(i64, 5), s.result.ok.offset);
-    s.release();
-}
