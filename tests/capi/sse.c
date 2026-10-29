@@ -164,29 +164,15 @@ static void wait_for(atomic_int *v, int at_least) {
   CHECK(atomic_load(v) >= at_least);
 }
 
-int main(void) {
-  signal(SIGALRM, on_watchdog);
-  alarm(120 * (unsigned)timeout_factor());
-  setvbuf(stdout, NULL, _IOLBF, 0);
-  const char *json =
-      "{\"executors\": 2, \"sse\": {\"heartbeat_ms\": null}, \"limits\": {\"sse_max_event\": 1024},"
-      " \"listeners\": [{\"address\": \"127.0.0.1\", \"port\": 0}],"
-      " \"routes\": [{\"path\": \"/live\", \"sse\": {\"topics\": [\"news\"]}},"
-      "              {\"path\": \"/me\", \"sse\": {\"handler\": 7}}]}";
-  anole_server_options o = {sizeof o, {json, strlen(json)}, 0, 0, on_log, NULL};
-  anole_server *s = NULL;
-  CHECK(anole_server_create(&o, &s) == ANOLE_OK);
-  anole_consumer_options co = {sizeof co, NULL, NULL, ANOLE_CONSUMER_F_SHARED};
-  CHECK(anole_consumer_attach(s, &co, &consumer) == ANOLE_OK);
-  /* Before start: nothing to publish to. */
-  CHECK(anole_sse_publish(s, S("news"), S(""), "early", 5, 0) == ANOLE_E_STATE);
-  CHECK(anole_server_start(s) == ANOLE_OK);
-  anole_listener_info info = {sizeof info};
-  CHECK(anole_server_listener(s, 0, &info) == ANOLE_OK && info.port != 0);
-  uint16_t port = info.port;
-  pthread_t t;
-  CHECK(pthread_create(&t, NULL, consumer_main, NULL) == 0);
+/* One server and consumer thread, shared by the tests below in the order
+   main runs them. */
+static anole_server *g_server;
+static uint16_t g_port;
 
+static void test_argument_checks(void) {
+  anole_server *s = g_server;
+  uint16_t port = g_port;
+  (void)s, (void)port;
   /* Argument checks. */
   CHECK(anole_sse_publish(s, S("news"), S("a\rb"), "x", 1, 0) == ANOLE_E_INVALID);
   CHECK(anole_sse_publish(s, S("news"), S("a\nb"), "x", 1, 0) == ANOLE_E_INVALID);
@@ -200,7 +186,12 @@ int main(void) {
   anole_watch *w = NULL;
   CHECK(anole_watch_find(s, S("nope"), &w) == ANOLE_E_INVALID);
   printf("ok argument checks\n");
+}
 
+static void test_native_route(void) {
+  anole_server *s = g_server;
+  uint16_t port = g_port;
+  (void)s, (void)port;
   /* A native route. */
   {
     char buf[4096];
@@ -214,7 +205,12 @@ int main(void) {
     close(fd);
     printf("ok native route\n");
   }
+}
 
+static void test_consumer_route(void) {
+  anole_server *s = g_server;
+  uint16_t port = g_port;
+  (void)s, (void)port;
   /* A consumer route. */
   {
     char b1[4096], b2[4096];
@@ -252,6 +248,36 @@ int main(void) {
     close(c2);
     printf("ok consumer route\n");
   }
+}
+
+int main(void) {
+  signal(SIGALRM, on_watchdog);
+  alarm(120 * (unsigned)timeout_factor());
+  setvbuf(stdout, NULL, _IOLBF, 0);
+  const char *json =
+      "{\"executors\": 2, \"sse\": {\"heartbeat_ms\": null}, \"limits\": {\"sse_max_event\": 1024},"
+      " \"listeners\": [{\"address\": \"127.0.0.1\", \"port\": 0}],"
+      " \"routes\": [{\"path\": \"/live\", \"sse\": {\"topics\": [\"news\"]}},"
+      "              {\"path\": \"/me\", \"sse\": {\"handler\": 7}}]}";
+  anole_server_options o = {sizeof o, {json, strlen(json)}, 0, 0, on_log, NULL};
+  anole_server *s = NULL;
+  CHECK(anole_server_create(&o, &s) == ANOLE_OK);
+  anole_consumer_options co = {sizeof co, NULL, NULL, ANOLE_CONSUMER_F_SHARED};
+  CHECK(anole_consumer_attach(s, &co, &consumer) == ANOLE_OK);
+  /* Before start: nothing to publish to. */
+  CHECK(anole_sse_publish(s, S("news"), S(""), "early", 5, 0) == ANOLE_E_STATE);
+  CHECK(anole_server_start(s) == ANOLE_OK);
+  anole_listener_info info = {sizeof info};
+  CHECK(anole_server_listener(s, 0, &info) == ANOLE_OK && info.port != 0);
+  uint16_t port = info.port;
+  pthread_t t;
+  CHECK(pthread_create(&t, NULL, consumer_main, NULL) == 0);
+  g_server = s;
+  g_port = port;
+
+  test_argument_checks();
+  test_native_route();
+  test_consumer_route();
 
   CHECK(anole_server_drain(s) == ANOLE_OK);
   CHECK(anole_server_wait(s, 10000) == ANOLE_OK);

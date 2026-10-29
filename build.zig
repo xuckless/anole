@@ -1609,6 +1609,17 @@ pub fn build(b: *std.Build) void {
                 if (mongodb_test_url) |url| run_timing.setEnvironmentVariable("ANOLE_TEST_MONGODB_URL", url);
                 timing_step.dependOn(&run_timing.step);
             }
+            // test-stress: the C suite again with its load on
+            // (ANOLE_TEST_STRESS: 16 clients x 2000 requests).
+            {
+                const run_stress = b.addRunArtifact(consumer);
+                run_stress.addArg("test");
+                if (wt_client) |wc| run_stress.addArtifactArg(wc);
+                run_stress.stdio = .inherit;
+                run_stress.has_side_effects = true;
+                run_stress.setEnvironmentVariable("ANOLE_TEST_STRESS", "1");
+                stress_step.dependOn(&run_stress.step);
+            }
             b.step("capi-consumer", "Build the C consumer (tests/capi/consumer.c: `test`, or `serve` for benchmarks)").dependOn(&b.addInstallArtifact(consumer, .{}).step);
 
             // The gRPC suite (tests/capi/grpc.c): its own process, as one

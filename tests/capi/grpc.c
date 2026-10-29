@@ -595,6 +595,252 @@ static void h2_call_and_hold(int fd) {
   h2_frame(fd, 0, 1, 1, "\x00\x00\x00\x00\x04hold", 9); /* DATA, END_STREAM */
 }
 
+/* One server and consumer thread, shared by the tests below in the order
+   main runs them; each states one claim. */
+static anole_server *g_server;
+static reply *g_reply;
+
+static void test_unary(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* Unary. */
+  {
+    const char *m[] = {"hello"};
+    call("Unary", m, 1, NULL, r);
+    CHECK(r->status == 200 && r->nmessages == 1 && msg_is(r, 0, "hello"));
+    CHECK(has_trailer(r, "grpc-status:0"));
+    printf("ok unary\n");
+  }
+}
+
+static void test_error_status_trailers(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* An error status with trailing metadata (-bin as base64). */
+  {
+    const char *m[] = {"fail"};
+    call("Unary", m, 1, NULL, r);
+    CHECK(r->status == 200 && r->nmessages == 0);
+    CHECK(has_trailer(r, "grpc-status:5") && has_trailer(r, "grpc-message:no such thing"));
+    CHECK(has_trailer(r, "x-why:test") && has_trailer(r, "x-raw-bin:AAH/"));
+    printf("ok error status and trailers\n");
+  }
+}
+
+static void test_metadata_and_state_checks(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* Metadata both ways, and the answer functions' checks. */
+  {
+    const char *m[] = {"checks"};
+    call("Unary", m, 1, "X-Trace: t1\r\nX-Data-Bin: AAH/\r\n", r);
+    CHECK(r->status == 200 && msg_is(r, 0, "checked"));
+    CHECK(strcasestr(r->head, "x-initial: yes"));
+    CHECK(has_trailer(r, "grpc-status:0") && has_trailer(r, "x-echoed:t1"));
+    printf("ok metadata and state checks\n");
+  }
+}
+
+static void test_server_streaming(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* Server streaming. */
+  {
+    const char *m[] = {"5"};
+    call("ServerStream", m, 1, NULL, r);
+    CHECK(r->status == 200 && r->nmessages == 5 && msg_is(r, 0, "tick0") && msg_is(r, 4, "tick4"));
+    CHECK(has_trailer(r, "grpc-status:0"));
+    const char *z[] = {"0"};
+    call("ServerStream", z, 1, NULL, r);
+    CHECK(r->nmessages == 0 && has_trailer(r, "grpc-status:0"));
+    printf("ok server streaming\n");
+  }
+}
+
+static void test_backpressure(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* Backpressure: past stream_high_water, ANOLE_BUSY, then ANOLE_EV_WRITABLE. */
+  {
+    const char *m[] = {"busy"};
+    call("ServerStream", m, 1, NULL, r);
+    CHECK(r->nmessages == 64 && r->message_len[63] == 1024 && has_trailer(r, "grpc-status:0"));
+    CHECK(atomic_load(&busies) > 0 && atomic_load(&writables) > 0);
+    const char *w[] = {"wait"};
+    call("ServerStream", w, 1, NULL, r);
+    CHECK(r->nmessages == 64 && has_trailer(r, "grpc-status:0"));
+    /* ANOLE_BUSY on the last message: the ANOLE_EV_WRITABLE after it is
+       when the consumer ends the stream. */
+    const char *l[] = {"busylast"};
+    call("ServerStream", l, 1, NULL, r);
+    CHECK(r->nmessages == 2 && r->message_len[0] == 1024 && r->message_len[1] == 5000);
+    CHECK(has_trailer(r, "grpc-status:0"));
+    printf("ok backpressure\n");
+  }
+}
+
+static void test_client_streaming(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* Client streaming: more messages than read_ahead (2). */
+  {
+    const char *m[] = {"a", "b", "c", "d", "e", "f"};
+    call("ClientStream", m, 6, NULL, r);
+    CHECK(r->status == 200 && r->nmessages == 1 && msg_is(r, 0, "abcdef"));
+    CHECK(has_trailer(r, "grpc-status:0") && has_trailer(r, "x-count:done"));
+    printf("ok client streaming\n");
+  }
+}
+
+static void test_bidi(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* Bidi (half duplex over HTTP/1.1: the requests, then the answers). */
+  {
+    const char *m[] = {"x", "y", "z"};
+    call("Bidi", m, 3, NULL, r);
+    CHECK(r->nmessages == 3 && msg_is(r, 0, "x#0") && msg_is(r, 2, "z#2"));
+    CHECK(has_trailer(r, "grpc-status:0"));
+    printf("ok bidi\n");
+  }
+}
+
+static void test_deadline(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* A deadline: DEADLINE_EXCEEDED for the client, ANOLE_EV_ABORT for the
+     consumer, and its late answer is ANOLE_E_GONE. 2 s, so the consumer
+     holds the call before it: a call that expires unpolled is skipped. */
+  {
+    atomic_store(&held, 0);
+    const char *m[] = {"hold"};
+    call("Unary", m, 1, "Grpc-Timeout: 2000m\r\n", r);
+    CHECK(r->status == 200 && has_trailer(r, "grpc-status:4"));
+    uint64_t h = wait_for(&held, 0);
+    long long us = atomic_load(&held_timeout_us);
+    CHECK(us > 0 && us <= 2000000);
+    wait_for(&last_abort, h);
+    CHECK(atomic_load(&last_abort_reason) == ANOLE_ABORT_DEADLINE && atomic_load(&last_abort_status) == ANOLE_GRPC_STATUS_DEADLINE_EXCEEDED);
+    CHECK(anole_grpc_send(h, "late", 4, ANOLE_GRPC_F_FINISH) == ANOLE_E_GONE);
+    printf("ok deadline\n");
+  }
+}
+
+static void test_cancel(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* A cancel: the client resets the stream (HTTP/2, cleartext; HTTP/1.1
+     cannot tell a hang-up while the answer is pending); ANOLE_EV_ABORT, and
+     the late answer is ANOLE_E_GONE. */
+  {
+    atomic_store(&held, 0);
+    int fd = dial();
+    h2_call_and_hold(fd);
+    uint64_t h = wait_for(&held, 0);
+    CHECK(atomic_load(&held_timeout_us) == -1);
+    h2_frame(fd, 3, 0, 1, "\x00\x00\x00\x08", 4); /* RST_STREAM, CANCEL */
+    wait_for(&last_abort, h);
+    CHECK(atomic_load(&last_abort_reason) == ANOLE_ABORT_CLIENT && atomic_load(&last_abort_status) == 0);
+    CHECK(anole_grpc_finish(h, ANOLE_GRPC_STATUS_OK, S(""), NULL, 0) == ANOLE_E_GONE);
+    close(fd);
+    printf("ok cancel\n");
+  }
+}
+
+static void test_handle_release(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* anole_handle_release on a call: UNKNOWN, "Application error processing RPC". */
+  {
+    const char *m[] = {"release-me"};
+    call("Unary", m, 1, NULL, r);
+    CHECK(r->status == 200 && has_trailer(r, "grpc-status:2"));
+    printf("ok handle_release on a call\n");
+  }
+}
+
+static void test_borrowed_sent_once(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* Borrowed answers: exactly one SENT each, an empty one too. */
+  {
+    int n0 = atomic_load(&sent_events);
+    const char *m[] = {"borrow-me"};
+    call("Unary", m, 1, NULL, r);
+    CHECK(r->status == 200 && has_trailer(r, "grpc-status:0"));
+    for (double until = wait_until(); atomic_load(&sent_events) < n0 + 1 && now_ms() < until;) sleep_ms(2);
+    CHECK(atomic_load(&sent_events) == n0 + 1);
+    CHECK(atomic_load(&sent_data) == (unsigned long long)(uintptr_t)borrowed_answer && atomic_load(&sent_len) == sizeof borrowed_answer - 1);
+    const char *e[] = {"borrow-empty"};
+    call("Unary", e, 1, NULL, r);
+    CHECK(r->status == 200 && has_trailer(r, "grpc-status:0"));
+    for (double until = wait_until(); atomic_load(&sent_events) < n0 + 2 && now_ms() < until;) sleep_ms(2);
+    CHECK(atomic_load(&sent_events) == n0 + 2 && atomic_load(&sent_len) == 0);
+    /* No third one: a window for one to show (a slow machine only hides a
+       duplicate, never fakes one). */
+    sleep_ms(100);
+    CHECK(atomic_load(&sent_events) == n0 + 2);
+    printf("ok borrowed messages: one SENT each\n");
+  }
+}
+
+static void test_json_refused(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* JSON needs descriptors: none here, so 415. */
+  {
+    int fd = dial();
+    const char req[] =
+        "POST /anole.test.Echo/Unary HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nConnection: close\r\n"
+        "Content-Length: 2\r\n\r\n{}";
+    CHECK(write(fd, req, sizeof req - 1) == (ssize_t)(sizeof req - 1));
+    unsigned char *raw;
+    size_t n = read_all(fd, &raw);
+    close(fd);
+    CHECK(n > 12 && atoi((char *)raw + 9) == 415);
+    free(raw);
+    printf("ok json refused without descriptors\n");
+  }
+}
+
+static void test_health(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* Health: the services SERVING, a status set before start, one after. */
+  {
+    CHECK(health("") == 1 && health("anole.test.Echo") == 1 && health("later.Service") == 2);
+    CHECK(anole_grpc_health_set(s, S("anole.test.Echo"), ANOLE_GRPC_HEALTH_NOT_SERVING) == ANOLE_OK);
+    int st = 0;
+    for (double until = wait_until(); (st = health("anole.test.Echo")) != 2 && now_ms() < until;) sleep_ms(2);
+    CHECK(st == 2);
+    printf("ok health\n");
+  }
+}
+
+static void test_handle_kinds(void) {
+  anole_server *s = g_server;
+  reply *r = g_reply;
+  (void)s, (void)r;
+  /* Handles of another kind are not calls. */
+  CHECK(anole_grpc_finish(0, 0, S(""), NULL, 0) == ANOLE_E_INVALID);
+  CHECK(anole_grpc_send(12345, "x", 1, 0) == ANOLE_E_INVALID);
+  CHECK(anole_grpc_send(1, "x", 1, 64) == ANOLE_E_INVALID);
+  printf("ok handles of another kind are not calls\n");
+}
+
 int main(void) {
   start_watchdog(300);
   CHECK(anole_has_feature(S("grpc")) == 1);
@@ -618,163 +864,23 @@ int main(void) {
   CHECK(pthread_create(&t, NULL, consumer_main, NULL) == 0);
   reply *r = malloc(sizeof *r);
   CHECK(r);
+  g_server = s;
+  g_reply = r;
 
-  /* Unary. */
-  {
-    const char *m[] = {"hello"};
-    call("Unary", m, 1, NULL, r);
-    CHECK(r->status == 200 && r->nmessages == 1 && msg_is(r, 0, "hello"));
-    CHECK(has_trailer(r, "grpc-status:0"));
-    printf("ok unary\n");
-  }
-  /* An error status with trailing metadata (-bin as base64). */
-  {
-    const char *m[] = {"fail"};
-    call("Unary", m, 1, NULL, r);
-    CHECK(r->status == 200 && r->nmessages == 0);
-    CHECK(has_trailer(r, "grpc-status:5") && has_trailer(r, "grpc-message:no such thing"));
-    CHECK(has_trailer(r, "x-why:test") && has_trailer(r, "x-raw-bin:AAH/"));
-    printf("ok error status and trailers\n");
-  }
-  /* Metadata both ways, and the answer functions' checks. */
-  {
-    const char *m[] = {"checks"};
-    call("Unary", m, 1, "X-Trace: t1\r\nX-Data-Bin: AAH/\r\n", r);
-    CHECK(r->status == 200 && msg_is(r, 0, "checked"));
-    CHECK(strcasestr(r->head, "x-initial: yes"));
-    CHECK(has_trailer(r, "grpc-status:0") && has_trailer(r, "x-echoed:t1"));
-    printf("ok metadata and state checks\n");
-  }
-  /* Server streaming. */
-  {
-    const char *m[] = {"5"};
-    call("ServerStream", m, 1, NULL, r);
-    CHECK(r->status == 200 && r->nmessages == 5 && msg_is(r, 0, "tick0") && msg_is(r, 4, "tick4"));
-    CHECK(has_trailer(r, "grpc-status:0"));
-    const char *z[] = {"0"};
-    call("ServerStream", z, 1, NULL, r);
-    CHECK(r->nmessages == 0 && has_trailer(r, "grpc-status:0"));
-    printf("ok server streaming\n");
-  }
-  /* Backpressure: past stream_high_water, ANOLE_BUSY, then ANOLE_EV_WRITABLE. */
-  {
-    const char *m[] = {"busy"};
-    call("ServerStream", m, 1, NULL, r);
-    CHECK(r->nmessages == 64 && r->message_len[63] == 1024 && has_trailer(r, "grpc-status:0"));
-    CHECK(atomic_load(&busies) > 0 && atomic_load(&writables) > 0);
-    const char *w[] = {"wait"};
-    call("ServerStream", w, 1, NULL, r);
-    CHECK(r->nmessages == 64 && has_trailer(r, "grpc-status:0"));
-    /* ANOLE_BUSY on the last message: the ANOLE_EV_WRITABLE after it is
-       when the consumer ends the stream. */
-    const char *l[] = {"busylast"};
-    call("ServerStream", l, 1, NULL, r);
-    CHECK(r->nmessages == 2 && r->message_len[0] == 1024 && r->message_len[1] == 5000);
-    CHECK(has_trailer(r, "grpc-status:0"));
-    printf("ok backpressure\n");
-  }
-  /* Client streaming: more messages than read_ahead (2). */
-  {
-    const char *m[] = {"a", "b", "c", "d", "e", "f"};
-    call("ClientStream", m, 6, NULL, r);
-    CHECK(r->status == 200 && r->nmessages == 1 && msg_is(r, 0, "abcdef"));
-    CHECK(has_trailer(r, "grpc-status:0") && has_trailer(r, "x-count:done"));
-    printf("ok client streaming\n");
-  }
-  /* Bidi (half duplex over HTTP/1.1: the requests, then the answers). */
-  {
-    const char *m[] = {"x", "y", "z"};
-    call("Bidi", m, 3, NULL, r);
-    CHECK(r->nmessages == 3 && msg_is(r, 0, "x#0") && msg_is(r, 2, "z#2"));
-    CHECK(has_trailer(r, "grpc-status:0"));
-    printf("ok bidi\n");
-  }
-  /* A deadline: DEADLINE_EXCEEDED for the client, ANOLE_EV_ABORT for the
-     consumer, and its late answer is ANOLE_E_GONE. 2 s, so the consumer
-     holds the call before it: a call that expires unpolled is skipped. */
-  {
-    atomic_store(&held, 0);
-    const char *m[] = {"hold"};
-    call("Unary", m, 1, "Grpc-Timeout: 2000m\r\n", r);
-    CHECK(r->status == 200 && has_trailer(r, "grpc-status:4"));
-    uint64_t h = wait_for(&held, 0);
-    long long us = atomic_load(&held_timeout_us);
-    CHECK(us > 0 && us <= 2000000);
-    wait_for(&last_abort, h);
-    CHECK(atomic_load(&last_abort_reason) == ANOLE_ABORT_DEADLINE && atomic_load(&last_abort_status) == ANOLE_GRPC_STATUS_DEADLINE_EXCEEDED);
-    CHECK(anole_grpc_send(h, "late", 4, ANOLE_GRPC_F_FINISH) == ANOLE_E_GONE);
-    printf("ok deadline\n");
-  }
-  /* A cancel: the client resets the stream (HTTP/2, cleartext; HTTP/1.1
-     cannot tell a hang-up while the answer is pending); ANOLE_EV_ABORT, and
-     the late answer is ANOLE_E_GONE. */
-  {
-    atomic_store(&held, 0);
-    int fd = dial();
-    h2_call_and_hold(fd);
-    uint64_t h = wait_for(&held, 0);
-    CHECK(atomic_load(&held_timeout_us) == -1);
-    h2_frame(fd, 3, 0, 1, "\x00\x00\x00\x08", 4); /* RST_STREAM, CANCEL */
-    wait_for(&last_abort, h);
-    CHECK(atomic_load(&last_abort_reason) == ANOLE_ABORT_CLIENT && atomic_load(&last_abort_status) == 0);
-    CHECK(anole_grpc_finish(h, ANOLE_GRPC_STATUS_OK, S(""), NULL, 0) == ANOLE_E_GONE);
-    close(fd);
-    printf("ok cancel\n");
-  }
-  /* anole_handle_release on a call: UNKNOWN, "Application error processing RPC". */
-  {
-    const char *m[] = {"release-me"};
-    call("Unary", m, 1, NULL, r);
-    CHECK(r->status == 200 && has_trailer(r, "grpc-status:2"));
-    printf("ok handle_release on a call\n");
-  }
-  /* Borrowed answers: exactly one SENT each, an empty one too. */
-  {
-    int n0 = atomic_load(&sent_events);
-    const char *m[] = {"borrow-me"};
-    call("Unary", m, 1, NULL, r);
-    CHECK(r->status == 200 && has_trailer(r, "grpc-status:0"));
-    for (double until = wait_until(); atomic_load(&sent_events) < n0 + 1 && now_ms() < until;) sleep_ms(2);
-    CHECK(atomic_load(&sent_events) == n0 + 1);
-    CHECK(atomic_load(&sent_data) == (unsigned long long)(uintptr_t)borrowed_answer && atomic_load(&sent_len) == sizeof borrowed_answer - 1);
-    const char *e[] = {"borrow-empty"};
-    call("Unary", e, 1, NULL, r);
-    CHECK(r->status == 200 && has_trailer(r, "grpc-status:0"));
-    for (double until = wait_until(); atomic_load(&sent_events) < n0 + 2 && now_ms() < until;) sleep_ms(2);
-    CHECK(atomic_load(&sent_events) == n0 + 2 && atomic_load(&sent_len) == 0);
-    /* No third one: a window for one to show (a slow machine only hides a
-       duplicate, never fakes one). */
-    sleep_ms(100);
-    CHECK(atomic_load(&sent_events) == n0 + 2);
-    printf("ok borrowed messages: one SENT each\n");
-  }
-  /* JSON needs descriptors: none here, so 415. */
-  {
-    int fd = dial();
-    const char req[] =
-        "POST /anole.test.Echo/Unary HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nConnection: close\r\n"
-        "Content-Length: 2\r\n\r\n{}";
-    CHECK(write(fd, req, sizeof req - 1) == (ssize_t)(sizeof req - 1));
-    unsigned char *raw;
-    size_t n = read_all(fd, &raw);
-    close(fd);
-    CHECK(n > 12 && atoi((char *)raw + 9) == 415);
-    free(raw);
-    printf("ok json refused without descriptors\n");
-  }
-  /* Health: the services SERVING, a status set before start, one after. */
-  {
-    CHECK(health("") == 1 && health("anole.test.Echo") == 1 && health("later.Service") == 2);
-    CHECK(anole_grpc_health_set(s, S("anole.test.Echo"), ANOLE_GRPC_HEALTH_NOT_SERVING) == ANOLE_OK);
-    int st = 0;
-    for (double until = wait_until(); (st = health("anole.test.Echo")) != 2 && now_ms() < until;) sleep_ms(2);
-    CHECK(st == 2);
-    printf("ok health\n");
-  }
-  /* Handles of another kind are not calls. */
-  CHECK(anole_grpc_finish(0, 0, S(""), NULL, 0) == ANOLE_E_INVALID);
-  CHECK(anole_grpc_send(12345, "x", 1, 0) == ANOLE_E_INVALID);
-  CHECK(anole_grpc_send(1, "x", 1, 64) == ANOLE_E_INVALID);
+  test_unary();
+  test_error_status_trailers();
+  test_metadata_and_state_checks();
+  test_server_streaming();
+  test_backpressure();
+  test_client_streaming();
+  test_bidi();
+  test_deadline();
+  test_cancel();
+  test_handle_release();
+  test_borrowed_sent_once();
+  test_json_refused();
+  test_health();
+  test_handle_kinds();
 
   free(r);
   CHECK(anole_server_drain(s) == ANOLE_OK);
