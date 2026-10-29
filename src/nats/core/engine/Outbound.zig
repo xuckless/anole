@@ -31,6 +31,7 @@
 //! the chunks they are in, so none is ever lost for lack of memory.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Writer = Io.Writer;
@@ -158,6 +159,10 @@ generation: u64 = 0,
 room_line: std.DoublyLinkedList = .{},
 /// How many wait in `room_line`.
 room_waiters: u32 = 0,
+/// Tests only: how far waiting puts see the awake clock ahead of the real
+/// one when they check their deadlines (`testAdvanceClock`), so a test
+/// expires a deadline on command instead of sleeping until it.
+test_clock_ahead: if (builtin.is_test) i96 else void = if (builtin.is_test) 0 else {},
 /// Signaled when there is something to write.
 ready: Io.Condition = .init,
 /// Woken when a PONG arrives.
@@ -391,7 +396,7 @@ fn awaitRoom(q: *Outbound, io: Io, deadline: ?Io.Clock.Timestamp) error{ Cancele
         q.room_waiters -= 1;
     }
     while (q.mode == .live and !(q.queued < q.limit and q.room_line.first == &waiter.node)) {
-        if (deadline) |d| if (time.expired(io, d)) return error.Timeout;
+        if (deadline) |d| if (q.putExpired(io, d)) return error.Timeout;
         // Only this put waits on its event, and others set it under the
         // mutex: resetting it here loses no wake.
         waiter.turn.reset();
@@ -404,6 +409,26 @@ fn awaitRoom(q: *Outbound, io: Io, deadline: ?Io.Clock.Timestamp) error{ Cancele
             error.Canceled => return error.Canceled,
         };
         q.room_wakeups += 1;
+    }
+}
+
+/// A waiting put's deadline has passed (on the clock tests may move ahead).
+fn putExpired(q: *const Outbound, io: Io, at: Io.Clock.Timestamp) bool {
+    if (comptime builtin.is_test) return Io.Clock.awake.now(io).nanoseconds + q.test_clock_ahead >= at.raw.nanoseconds;
+    return time.expired(io, at);
+}
+
+/// Tests only: moves the clock waiting puts check their deadlines on ahead
+/// by `by` and wakes them all to look again.
+fn testAdvanceClock(q: *Outbound, io: Io, by: Io.Duration) void {
+    comptime std.debug.assert(builtin.is_test);
+    q.mutex.lockUncancelable(io);
+    defer q.mutex.unlock(io);
+    q.test_clock_ahead += by.nanoseconds;
+    var node = q.room_line.first;
+    while (node) |n| : (node = n.next) {
+        const waiter: *RoomWaiter = @fieldParentPtr("node", n);
+        waiter.turn.set(io);
     }
 }
 
