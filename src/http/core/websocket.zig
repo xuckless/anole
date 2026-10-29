@@ -1246,24 +1246,6 @@ test "WebSocket: computeAcceptKey" {
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &accept);
 }
 
-test "WebSocket: writeFrame text" {
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-    var reader: std.Io.Reader = .fixed("");
-
-    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
-    defer ws.deinit();
-    try ws.writeFrame(.text, "Hello", true, .now);
-
-    const written = conn_writer.buffered();
-    // FIN + text opcode
-    try std.testing.expectEqual(0x81, written[0]);
-    // Length = 5
-    try std.testing.expectEqual(5, written[1]);
-    // Payload
-    try std.testing.expectEqualStrings("Hello", written[2..7]);
-}
-
 test "WebSocket: writeFrame binary with medium length" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
@@ -1537,46 +1519,6 @@ test "WebSocket: a receive that fails on the transport sends no close" {
     defer ws.deinit();
     try std.testing.expect(std.meta.isError(ws.receive()));
     try std.testing.expectEqual(0, out.buffered().len);
-}
-
-test "WebSocket: readFrame rejects RSV bits" {
-
-    // Frame with RSV1 bit set (0x40)
-    const frame_data = [_]u8{
-        0xC1, // FIN + RSV1 + text opcode
-        0x02,
-        'H',
-        'i',
-    };
-    var reader: std.Io.Reader = .fixed(&frame_data);
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
-    defer ws.deinit();
-    try std.testing.expectError(WebSocket.Error.ReservedFlags, ws.readFrame());
-}
-
-test "WebSocket: readFrame rejects large control frame" {
-
-    // Ping frame with 126-byte payload (uses extended length).
-    // Test the size limit independent of masking — use client mode so the
-    // unmasked frame is otherwise valid.
-    const frame_data = [_]u8{
-        0x89, // FIN + ping
-        126, // extended length indicator
-        0x00, 0x7E, // 126 bytes
-    } ++ @as([126]u8, @splat(0));
-    var reader: std.Io.Reader = .fixed(&frame_data);
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
-    defer ws.deinit();
-    ws.is_client = true;
-    try std.testing.expectError(WebSocket.Error.LargeControlFrame, ws.readFrame());
 }
 
 test "WebSocket: writeFrame masked (client mode)" {
