@@ -64,137 +64,6 @@ fn verifyTimed(keyring: *Keyring, io: std.Io, tok: []const u8, sub: []const u8) 
     return start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
 }
 
-test "Keyring: one fetch for concurrent verifiers, and known keys never wait on a fetch" {
-    const gpa = std.testing.allocator;
-    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
-    defer rt.deinit();
-    const io = rt.io();
-    for (&keys) |*k| k.* = Ed.KeyPair.generate(io);
-    served.store(1, .monotonic);
-    fetches.store(0, .monotonic);
-
-    var server = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
-    defer server.deinit();
-    server.router.get("/jwks", jwks);
-    var future = try io.concurrent(struct {
-        fn r(s: *dusty.Server(void)) !void {
-            try s.run();
-        }
-    }.r, .{&server});
-    defer future.cancel(io) catch {};
-    try server.waitReady(io);
-
-    var client = dusty.Client.init(gpa, io, .{});
-    defer client.deinit();
-    var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/jwks", .{server.address.ip.getPort()});
-    var keyring = Keyring.init(gpa, io, .{ .http = &client }, url);
-    defer keyring.deinit();
-    keyring.min_refresh = .fromSeconds(0);
-
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const t1 = try token(arena, io, 1);
-    const t2 = try token(arena, io, 2);
-    const t3 = try token(arena, io, 3);
-
-    // A cold keyring and eight requests at once: one fetch, all verified.
-    delay_ms.store(200, .monotonic);
-    var group: std.Io.Group = .init;
-    defer group.cancel(io);
-    const Verifier = struct {
-        fn run(k: *Keyring, io_: std.Io, tok: []const u8, sub: []const u8, failed: *std.atomic.Value(usize)) void {
-            _ = verifyTimed(k, io_, tok, sub) catch {
-                _ = failed.fetchAdd(1, .monotonic);
-            };
-        }
-    };
-    var failed: std.atomic.Value(usize) = .init(0);
-    for (0..8) |_| try group.concurrent(io, Verifier.run, .{ &keyring, io, t1, "u1", &failed });
-    try group.await(io);
-    try std.testing.expectEqual(@as(usize, 0), failed.load(.monotonic));
-    try std.testing.expectEqual(@as(usize, 1), fetches.load(.monotonic));
-
-    // The provider rotates in k2, and its answer is held. Four k2 tokens
-    // share one refetch; a k1 token meanwhile verifies with the keys in
-    // hand, while the refetch is still held: it never waits on it.
-    served.store(2, .monotonic);
-    delay_ms.store(0, .monotonic);
-    var held: std.Io.Event = .unset;
-    gate.store(&held, .release);
-    defer gate.store(null, .release);
-    for (0..4) |_| try group.concurrent(io, Verifier.run, .{ &keyring, io, t2, "u2", &failed });
-    try wait.waitAtLeast(io, "the k2 refetch reached the endpoint", &fetches, 2);
-    const Known = struct {
-        fn run(k: *Keyring, io_: std.Io, tok: []const u8, done: *std.atomic.Value(bool)) !void {
-            _ = try verifyTimed(k, io_, tok, "u1");
-            done.store(true, .release);
-        }
-    };
-    var known_done: std.atomic.Value(bool) = .init(false);
-    var known = try io.concurrent(Known.run, .{ &keyring, io, t1, &known_done });
-    defer known.cancel(io) catch {};
-    try wait.waitFlag(io, "the k1 token verified while the refetch is held", &known_done);
-    try known.await(io);
-    held.set(io);
-    try group.await(io);
-    try std.testing.expectEqual(@as(usize, 0), failed.load(.monotonic));
-    try std.testing.expectEqual(@as(usize, 2), fetches.load(.monotonic));
-
-    // An unknown kid within `min_refresh` of the last fetch: no fetch.
-    keyring.min_refresh = .fromSeconds(60);
-    delay_ms.store(0, .monotonic);
-    try std.testing.expectError(error.NoMatchingKey, verifyTimed(&keyring, io, t3, "u3"));
-    try std.testing.expectEqual(@as(usize, 2), fetches.load(.monotonic));
-
-    // Past it, the unknown kid makes one refetch, which finds k3.
-    keyring.min_refresh = .fromSeconds(0);
-    served.store(3, .monotonic);
-    _ = try verifyTimed(&keyring, io, t3, "u3");
-    try std.testing.expectEqual(@as(usize, 3), fetches.load(.monotonic));
-}
-
-test "Keyring: requests waiting on a fetch that fails get an error, and nothing is left behind" {
-    const gpa = std.testing.allocator;
-    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
-    defer rt.deinit();
-    const io = rt.io();
-    for (&keys) |*k| k.* = Ed.KeyPair.generate(io);
-    served.store(1, .monotonic);
-
-    // Nothing listens at this address once the listener is gone.
-    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var listener = try addr.listen(io, .{});
-    const port = listener.socket.address.getPort();
-    listener.deinit(io);
-
-    var client = dusty.Client.init(gpa, io, .{});
-    defer client.deinit();
-    var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/jwks", .{port});
-    var keyring = Keyring.init(gpa, io, .{ .http = &client }, url);
-    defer keyring.deinit();
-    var arena_state: std.heap.ArenaAllocator = .init(gpa);
-    defer arena_state.deinit();
-    const t1 = try token(arena_state.allocator(), io, 1);
-
-    var group: std.Io.Group = .init;
-    defer group.cancel(io);
-    var failed: std.atomic.Value(usize) = .init(0);
-    for (0..4) |_| try group.concurrent(io, struct {
-        fn run(k: *Keyring, io_: std.Io, tok: []const u8, f: *std.atomic.Value(usize)) void {
-            _ = verifyTimed(k, io_, tok, "u1") catch {
-                _ = f.fetchAdd(1, .monotonic);
-            };
-        }
-    }.run, .{ &keyring, io, t1, &failed });
-    try group.await(io);
-    try std.testing.expectEqual(@as(usize, 4), failed.load(.monotonic));
-    try std.testing.expect(!keyring.fetching);
-    try std.testing.expect(keyring.current == null);
-}
-
 /// A keyring on the fake endpoint, which serves k1.
 const Fixture = struct {
     /// Static: the server keeps the slice.
@@ -228,6 +97,197 @@ const Fixture = struct {
         f.server.deinit();
     }
 };
+
+/// A verifier task: verifies `tok` (subject `sub`), counting itself in
+/// `started` before it calls verify and in `failed` when verify fails.
+const Verifier = struct {
+    fn run(k: *Keyring, io_: std.Io, tok: []const u8, sub: []const u8, started: *std.atomic.Value(usize), failed: *std.atomic.Value(usize)) void {
+        _ = started.fetchAdd(1, .acq_rel);
+        _ = verifyTimed(k, io_, tok, sub) catch {
+            _ = failed.fetchAdd(1, .monotonic);
+        };
+    }
+};
+
+/// Fresh endpoint state: k1..k3 generated, k1 served, no delay, no gate,
+/// no fetches counted.
+fn resetEndpoint(io: std.Io) void {
+    for (&keys) |*k| k.* = Ed.KeyPair.generate(io);
+    served.store(1, .monotonic);
+    delay_ms.store(0, .monotonic);
+    fetches.store(0, .monotonic);
+    down.store(false, .monotonic);
+    gate.store(null, .release);
+}
+
+test "Keyring: concurrent verifiers of a cold keyring share one fetch" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    resetEndpoint(io);
+
+    var f: Fixture = undefined;
+    try f.init(gpa, io);
+    defer f.deinit(io);
+    f.keyring.min_refresh = .fromSeconds(0);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const t1 = try token(arena_state.allocator(), io, 1);
+
+    // The endpoint holds its answer until released: eight verifiers of a
+    // cold keyring start while the one fetch is in flight.
+    var held: std.Io.Event = .unset;
+    gate.store(&held, .release);
+    defer gate.store(null, .release);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    var started: std.atomic.Value(usize) = .init(0);
+    var failed: std.atomic.Value(usize) = .init(0);
+    for (0..8) |_| try group.concurrent(io, Verifier.run, .{ &f.keyring, io, t1, "u1", &started, &failed });
+    try wait.waitAtLeast(io, "the eight verifiers started", &started, 8);
+    try wait.waitAtLeast(io, "the fetch reached the endpoint", &fetches, 1);
+    const One = struct {
+        fn one(v: *std.atomic.Value(usize)) bool {
+            return v.load(.acquire) == 1;
+        }
+    };
+    try wait.expectStays(io, "a single fetch while it is held", &fetches, One.one, wait.short_window);
+    held.set(io);
+    try group.await(io);
+    try std.testing.expectEqual(@as(usize, 0), failed.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 1), fetches.load(.monotonic));
+}
+
+test "Keyring: a token the current keys verify never waits on a refetch in flight" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    resetEndpoint(io);
+
+    var f: Fixture = undefined;
+    try f.init(gpa, io);
+    defer f.deinit(io);
+    f.keyring.min_refresh = .fromSeconds(0);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t1 = try token(arena, io, 1);
+    const t2 = try token(arena, io, 2);
+    _ = try verifyTimed(&f.keyring, io, t1, "u1");
+    try std.testing.expectEqual(@as(usize, 1), fetches.load(.monotonic));
+
+    // The provider rotates in k2, and its answer is held. Four k2 tokens
+    // share one refetch; a k1 token meanwhile verifies with the keys in
+    // hand, while the refetch is still held: it never waits on it.
+    served.store(2, .monotonic);
+    var held: std.Io.Event = .unset;
+    gate.store(&held, .release);
+    defer gate.store(null, .release);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    var started: std.atomic.Value(usize) = .init(0);
+    var failed: std.atomic.Value(usize) = .init(0);
+    for (0..4) |_| try group.concurrent(io, Verifier.run, .{ &f.keyring, io, t2, "u2", &started, &failed });
+    try wait.waitAtLeast(io, "the k2 refetch reached the endpoint", &fetches, 2);
+    const Known = struct {
+        fn run(k: *Keyring, io_: std.Io, tok: []const u8, done: *std.atomic.Value(bool)) !void {
+            _ = try verifyTimed(k, io_, tok, "u1");
+            done.store(true, .release);
+        }
+    };
+    var known_done: std.atomic.Value(bool) = .init(false);
+    var known = try io.concurrent(Known.run, .{ &f.keyring, io, t1, &known_done });
+    defer known.cancel(io) catch {};
+    try wait.waitFlag(io, "the k1 token verified while the refetch is held", &known_done);
+    try known.await(io);
+    held.set(io);
+    try group.await(io);
+    try std.testing.expectEqual(@as(usize, 0), failed.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 2), fetches.load(.monotonic));
+}
+
+test "Keyring: an unknown kid refetches only once min_refresh has passed" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    resetEndpoint(io);
+
+    var f: Fixture = undefined;
+    try f.init(gpa, io);
+    defer f.deinit(io);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t1 = try token(arena, io, 1);
+    const t3 = try token(arena, io, 3);
+    _ = try verifyTimed(&f.keyring, io, t1, "u1");
+    try std.testing.expectEqual(@as(usize, 1), fetches.load(.monotonic));
+
+    // An unknown kid within `min_refresh` of the last fetch: no fetch.
+    f.keyring.min_refresh = .fromSeconds(60);
+    try std.testing.expectError(error.NoMatchingKey, verifyTimed(&f.keyring, io, t3, "u3"));
+    try std.testing.expectEqual(@as(usize, 1), fetches.load(.monotonic));
+
+    // Past it, the unknown kid makes one refetch, which finds k3.
+    f.keyring.min_refresh = .fromSeconds(0);
+    served.store(3, .monotonic);
+    _ = try verifyTimed(&f.keyring, io, t3, "u3");
+    try std.testing.expectEqual(@as(usize, 2), fetches.load(.monotonic));
+}
+
+test "Keyring: requests waiting on a fetch that fails get an error, and nothing is left behind" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    resetEndpoint(io);
+
+    // Nothing listens at this address once the listener is gone.
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try addr.listen(io, .{});
+    const port = listener.socket.address.getPort();
+    listener.deinit(io);
+
+    var client = dusty.Client.init(gpa, io, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/jwks", .{port});
+    var keyring = Keyring.init(gpa, io, .{ .http = &client }, url);
+    defer keyring.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const t1 = try token(arena_state.allocator(), io, 1);
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    var started: std.atomic.Value(usize) = .init(0);
+    var failed: std.atomic.Value(usize) = .init(0);
+    for (0..4) |_| try group.concurrent(io, Verifier.run, .{ &keyring, io, t1, "u1", &started, &failed });
+    try group.await(io);
+    try std.testing.expectEqual(@as(usize, 4), failed.load(.monotonic));
+
+    // Nothing is left behind: no fetch still marked running (the next
+    // request would wait on it forever) and no key set (it would verify).
+    // Within the back-off, the next request fails at once.
+    const Again = struct {
+        fn run(k: *Keyring, io_: std.Io, tok: []const u8, result: *std.atomic.Value(u8)) void {
+            if (verifyTimed(k, io_, tok, "u1")) |_| {
+                result.store(1, .release);
+            } else |err| {
+                result.store(if (err == error.JwksFetchFailed) 2 else 3, .release);
+            }
+        }
+    };
+    var result: std.atomic.Value(u8) = .init(0);
+    var again = try io.concurrent(Again.run, .{ &keyring, io, t1, &result });
+    defer again.cancel(io);
+    const got = try wait.waitNonZero(io, "a verify after the failed fetch ended", &result);
+    again.await(io);
+    try std.testing.expectEqual(@as(u8, 2), got);
+}
 
 test "Keyring: a policy without an audience is refused" {
     const gpa = std.testing.allocator;
