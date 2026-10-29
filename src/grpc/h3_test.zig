@@ -10,6 +10,7 @@ const frame = @import("frame.zig");
 const tls = if (features.tls == .boringssl) @import("../tls/root.zig") else struct {};
 const h3 = if (features.http3) @import("../h3/root.zig") else struct {};
 const server_mod = @import("../server.zig");
+const wait = @import("anole_test_wait");
 
 const Server = server_mod.Server;
 const Echo = pb.Echo(grpc.Call, anyerror);
@@ -145,6 +146,8 @@ fn withServer(comptime setup: Setup, comptime body: fn (*Env) anyerror!void) !vo
         }
     };
     var future = try app.io().concurrent(Check.run, .{ &app, &pem });
+    // A failed run must not leave Check.run on the freed app and pem.
+    defer future.cancel(app.io()) catch {};
     try app.run();
     try future.await(app.io());
 }
@@ -297,7 +300,7 @@ test "grpc over h3: client deadline gives DEADLINE_EXCEEDED and the handler's wa
             const r = try client.unary("Unary", arena_state.allocator(), .{ .message = "hang" }, .{ .timeout = .fromMilliseconds(200) });
             try std.testing.expectEqual(grpc.Code.deadline_exceeded, r.status.code);
             // The handler's wait ended with Canceled (no time bound).
-            try Probe.canceled.wait(env.io);
+            try wait.waitEvent(env.io, "the handler's wait was canceled", &Probe.canceled);
         }
     }.run);
 }
@@ -316,9 +319,9 @@ test "grpc over h3: client cancel cancels the handler" {
             defer s.deinit();
             try s.send(.{ .message = "hang" });
             try s.closeSend();
-            try Probe.started.wait(env.io);
+            try wait.waitEvent(env.io, "the handler started", &Probe.started);
             s.cancel();
-            try Probe.canceled.wait(env.io);
+            try wait.waitEvent(env.io, "the handler's wait was canceled", &Probe.canceled);
             try std.testing.expect(try s.receive() == null);
             try std.testing.expectEqual(grpc.Code.cancelled, s.status.?.code);
         }
@@ -410,7 +413,7 @@ test "grpc over h3: gRPC-Web and Connect unary" {
 }
 
 test "grpc: gRPC over HTTP/1.1 is still 505" {
-    if (comptime features.tls != .boringssl or !features.http2 or !features.grpc) return error.SkipZigTest;
+    if (comptime !features.http2 or !features.grpc) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var app = try Server(void).init(gpa, .{ .listeners = &.{.{ .name = "plain", .port = 0 }}, .executors = .exact(1) }, {});
     defer app.deinit();
@@ -433,6 +436,7 @@ test "grpc: gRPC over HTTP/1.1 is still 505" {
         }
     };
     var future = try app.io().concurrent(Check.run, .{&app});
+    defer future.cancel(app.io()) catch {};
     try app.run();
     try future.await(app.io());
 }

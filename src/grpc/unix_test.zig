@@ -18,7 +18,12 @@ fn newArena() std.heap.ArenaAllocator {
     return .init(std.testing.allocator);
 }
 
-test "grpc over a unix socket: all four call modes, socket mode 0660, a stale socket file replaced" {
+/// Runs `body(app, socket path, "unix:" target)` on a server whose only
+/// listener is a unix socket, with Echo registered. A socket file left
+/// behind by a server that is gone sits at the path first.
+fn withUnixServer(comptime body: fn (*Server(void), []const u8, []const u8) anyerror!void) !void {
+    // Windows: no AF_UNIX listener yet (docs/grpc.md: "Windows needs
+    // `AF_UNIX` support and comes after 0.4").
     if (comptime builtin.os.tag == .windows or !features.http2 or !features.grpc) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -41,6 +46,27 @@ test "grpc over a unix socket: all four call modes, socket mode 0660, a stale so
         fn run(a: *Server(void), sock: []const u8, host: []const u8) !void {
             defer a.stop();
             try a.waitReady();
+            try body(a, sock, host);
+        }
+    };
+
+    // A socket file left behind by a server that is gone.
+    {
+        const io = app.io();
+        const addr = try std.Io.net.UnixAddress.init(path);
+        var stale = try addr.listen(io, .{});
+        stale.deinit(io);
+    }
+    var future = try app.io().concurrent(Check.run, .{ &app, path, target });
+    // A failed run must not leave Check.run on the freed app.
+    defer future.cancel(app.io()) catch {};
+    try app.run();
+    try future.await(app.io());
+}
+
+test "grpc over a unix socket: all four call modes, socket mode 0660, a stale socket file replaced" {
+    try withUnixServer(struct {
+        fn run(a: *Server(void), sock: []const u8, host: []const u8) !void {
             const io = a.io();
             // Owner and group only.
             const stat = try std.Io.Dir.cwd().statFile(io, sock, .{});
@@ -87,7 +113,18 @@ test "grpc over a unix socket: all four call modes, socket mode 0660, a stale so
                 try std.testing.expect(try s.receive() == null);
                 try std.testing.expectEqual(grpc.Code.ok, s.status.?.code);
             }
-            // "unix:///path" is the same socket.
+        }
+    }.run);
+}
+
+test "grpc: unix:// targets name the same socket; tls on a unix target is refused" {
+    try withUnixServer(struct {
+        fn run(a: *Server(void), sock: []const u8, host: []const u8) !void {
+            const io = a.io();
+            var arena_state = newArena();
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            // "unix://" + the path is the same socket as "unix:" + the path.
             var url_buf: [160]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "unix://{s}", .{sock});
             const second = try grpc.Channel.connect(std.testing.allocator, io, .{ .host = url, .port = 0 }, .{});
@@ -101,16 +138,5 @@ test "grpc over a unix socket: all four call modes, socket mode 0660, a stale so
                 .tls = .{ .insecure_skip_verify = true },
             }));
         }
-    };
-
-    // A socket file left behind by a server that is gone.
-    {
-        const io = app.io();
-        const addr = try std.Io.net.UnixAddress.init(path);
-        var stale = try addr.listen(io, .{});
-        stale.deinit(io);
-    }
-    var future = try app.io().concurrent(Check.run, .{ &app, path, target });
-    try app.run();
-    try future.await(app.io());
+    }.run);
 }

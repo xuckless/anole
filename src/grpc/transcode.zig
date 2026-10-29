@@ -1059,7 +1059,7 @@ test "fuzz: path templates parse and match without crashing" {
     });
 }
 
-test "JSON depth guard" {
+test "transcode: JSON nested past the limit is refused; brackets inside strings do not count" {
     try std.testing.expect(jsonDepthWithin("{\"a\":[1,{\"b\":2}]}", 3));
     try std.testing.expect(!jsonDepthWithin("{\"a\":[1,{\"b\":2}]}", 2));
     try std.testing.expect(jsonDepthWithin("{\"a\":\"[[[[\"}", 1));

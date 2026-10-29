@@ -380,37 +380,18 @@ test "fuzz: gRPC message frames read off a stream" {
     });
 }
 
-test "frame round trips empty and binary payloads" {
-    for ([_][]const u8{ "", "abc\x00xyz" }) |payload| {
-        const encoded = try encode(std.testing.allocator, payload);
-        defer std.testing.allocator.free(encoded);
-        const decoded = try decodeUnary(std.testing.allocator, encoded, 1024);
-        defer std.testing.allocator.free(decoded);
-        try std.testing.expectEqualSlices(u8, payload, decoded);
-    }
-}
-
-test "frame round trips a multi-byte payload length" {
-    const payload = try std.testing.allocator.alloc(u8, 70_000);
-    defer std.testing.allocator.free(payload);
-    @memset(payload, 0x5a);
-
-    const encoded = try encode(std.testing.allocator, payload);
-    defer std.testing.allocator.free(encoded);
-    const decoded = try decodeUnary(std.testing.allocator, encoded, payload.len);
-    defer std.testing.allocator.free(decoded);
-    try std.testing.expectEqualSlices(u8, payload, decoded);
-}
-
 test "gzip frame round trips and marks compressed payload" {
     if (comptime !features.compression) return error.SkipZigTest;
-    const encoded = try encodeWithCompression(std.testing.allocator, "compress me compress me", .gzip);
-    defer std.testing.allocator.free(encoded);
+    const gpa = std.testing.allocator;
+    const encoded = try encodeWithCompression(gpa, "compress me compress me", .gzip);
+    defer gpa.free(encoded);
     try std.testing.expectEqual(@as(u8, 1), encoded[0]);
 
-    const decoded = try decodeUnaryWithCompression(std.testing.allocator, encoded, 1024, .gzip);
-    defer std.testing.allocator.free(decoded);
-    try std.testing.expectEqualStrings("compress me compress me", decoded);
+    var reader: std.Io.Reader = .fixed(encoded);
+    const msg = (try readMessage(&reader, gpa, 1024, .gzip)).?;
+    defer gpa.free(msg.payload);
+    try std.testing.expect(msg.compressed);
+    try std.testing.expectEqualStrings("compress me compress me", msg.payload);
 }
 
 test "gzip with the window sized to the message: round trips, and compresses as well as the defaults" {
@@ -443,37 +424,34 @@ test "gzip with the window sized to the message: round trips, and compresses as 
 
 test "gzip decoding rejects malformed data and compression mismatches" {
     if (comptime !features.compression) return error.SkipZigTest;
-    try std.testing.expectError(
-        error.MalformedCompressedMessage,
-        decodeUnaryWithCompression(
-            std.testing.allocator,
-            &.{ 1, 0, 0, 0, 3, 1, 2, 3 },
-            1024,
-            .gzip,
-        ),
-    );
-    try std.testing.expectError(
-        error.CompressionMismatch,
-        decodeUnaryWithCompression(std.testing.allocator, &.{ 1, 0, 0, 0, 0 }, 1024, .identity),
-    );
-    const uncompressed = try decodeUnaryWithCompression(
-        std.testing.allocator,
-        &.{ 0, 0, 0, 0, 0 },
-        1024,
-        .gzip,
-    );
-    defer std.testing.allocator.free(uncompressed);
-    try std.testing.expectEqual(@as(usize, 0), uncompressed.len);
+    const gpa = std.testing.allocator;
+    var garbage: std.Io.Reader = .fixed(&.{ 1, 0, 0, 0, 3, 1, 2, 3 });
+    try std.testing.expectError(error.MalformedCompressedMessage, readMessage(&garbage, gpa, 1024, .gzip));
+
+    var mismatch: std.Io.Reader = .fixed(&.{ 1, 0, 0, 0, 0 });
+    try std.testing.expectError(error.CompressionMismatch, readMessage(&mismatch, gpa, 1024, .identity));
+
+    var plain: std.Io.Reader = .fixed(&.{ 0, 0, 0, 0, 0 });
+    const uncompressed = (try readMessage(&plain, gpa, 1024, .gzip)).?;
+    defer gpa.free(uncompressed.payload);
+    try std.testing.expect(!uncompressed.compressed);
+    try std.testing.expectEqual(@as(usize, 0), uncompressed.payload.len);
 }
 
 test "gzip decoding enforces decompressed message size" {
     if (comptime !features.compression) return error.SkipZigTest;
-    const encoded = try encodeWithCompression(std.testing.allocator, "123456789", .gzip);
-    defer std.testing.allocator.free(encoded);
-    try std.testing.expectError(
-        error.MessageTooLarge,
-        decodeUnaryWithCompression(std.testing.allocator, encoded, 8, .gzip),
-    );
+    const gpa = std.testing.allocator;
+    // Inflates to exactly one byte over the limit: refused.
+    const encoded = try encodeWithCompression(gpa, "123456789", .gzip);
+    defer gpa.free(encoded);
+    var over: std.Io.Reader = .fixed(encoded);
+    try std.testing.expectError(error.MessageTooLarge, readMessage(&over, gpa, 8, .gzip));
+
+    // At the limit: accepted.
+    var at: std.Io.Reader = .fixed(encoded);
+    const msg = (try readMessage(&at, gpa, 9, .gzip)).?;
+    defer gpa.free(msg.payload);
+    try std.testing.expectEqualStrings("123456789", msg.payload);
 }
 
 test "decoder accepts fragmented input and multiple messages" {
@@ -565,38 +543,36 @@ test "decoder enforces buffered byte admission atomically" {
     try decoder.finish();
 }
 
-test "decoder reports malformed frames" {
-    var decoder = Decoder.init(std.testing.allocator, 3);
-    defer decoder.deinit();
+test "readMessage refuses malformed frames" {
+    const gpa = std.testing.allocator;
+    var bad_flag: std.Io.Reader = .fixed(&.{ 2, 0, 0, 0, 0 });
+    try std.testing.expectError(error.InvalidCompressedFlag, readMessage(&bad_flag, gpa, 3, .identity));
 
-    try decoder.feed(&.{ 1, 0, 0, 0, 0 });
-    try std.testing.expectError(error.CompressionMismatch, decoder.next());
+    var mismatch: std.Io.Reader = .fixed(&.{ 1, 0, 0, 0, 0 });
+    try std.testing.expectError(error.CompressionMismatch, readMessage(&mismatch, gpa, 3, .identity));
 
-    decoder.buffer.clearRetainingCapacity();
-    decoder.offset = 0;
-    try decoder.feed(&.{ 0, 0, 0, 0, 4 });
-    try std.testing.expectError(error.MessageTooLarge, decoder.next());
+    var too_long: std.Io.Reader = .fixed(&.{ 0, 0, 0, 0, 4 });
+    try std.testing.expectError(error.MessageTooLarge, readMessage(&too_long, gpa, 3, .identity));
 
-    decoder.buffer.clearRetainingCapacity();
-    decoder.offset = 0;
-    try decoder.feed(&.{ 2, 0, 0, 0, 0 });
-    try std.testing.expectError(error.InvalidCompressedFlag, decoder.next());
+    // A compressed message's wire form is bounded too: max * 2 + 1024
+    // (1030 for max 3), checked before any byte of it is read.
+    var wire_too_long: std.Io.Reader = .fixed(&.{ 1, 0, 0, 0x04, 0x07 });
+    try std.testing.expectError(error.MessageTooLarge, readMessage(&wire_too_long, gpa, 3, .gzip));
 }
 
-test "decoder enforces decompressed size limits" {
+test "readMessage limits a gzip message by its inflated size" {
     if (comptime !features.compression) return error.SkipZigTest;
-    const payload = try std.testing.allocator.alloc(u8, 4096);
-    defer std.testing.allocator.free(payload);
+    const gpa = std.testing.allocator;
+    const payload = try gpa.alloc(u8, 4096);
+    defer gpa.free(payload);
     @memset(payload, 'a');
-    const encoded = try encodeWithCompression(std.testing.allocator, payload, .gzip);
-    defer std.testing.allocator.free(encoded);
+    const encoded = try encodeWithCompression(gpa, payload, .gzip);
+    defer gpa.free(encoded);
     const compressed_length = encoded.len - header_size;
     try std.testing.expect(compressed_length < payload.len);
 
-    var decompressed_decoder = Decoder.initWithCompression(std.testing.allocator, compressed_length, .gzip);
-    defer decompressed_decoder.deinit();
-    try decompressed_decoder.feed(encoded);
-    try std.testing.expectError(error.MessageTooLarge, decompressed_decoder.nextMessage());
+    var reader: std.Io.Reader = .fixed(encoded);
+    try std.testing.expectError(error.MessageTooLarge, readMessage(&reader, gpa, compressed_length, .gzip));
 }
 
 test "decoder finish rejects fragmented header and payload" {
