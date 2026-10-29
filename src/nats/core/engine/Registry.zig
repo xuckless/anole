@@ -445,7 +445,8 @@ fn timeMissingLookups(r: *Registry, io: Io, lookups: u64) !i96 {
     return fastest;
 }
 
-test "a burst of subscriptions and long churn after it leave lookups as cheap as they were" {
+test "a burst of subscriptions and long churn after it leave lookups as cheap as they were [timing]" {
+    try @import("anole_test_wait").requireTiming();
     const io = testing.io;
     var r: Registry = .{};
     defer r.deinit(testing.allocator);
