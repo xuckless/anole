@@ -38,7 +38,16 @@ s = re.sub(r'\n\s*//[^\n]*\n\s*//[^\n]*\n\s*\.anole = \.\{ \.path = "\.\./\.\." 
 assert '.path =' not in s, s
 open(p, 'w').write(s)
 PY
-"$zig" fetch --save=anole "$url"
+# Only the network is retried (Zig's git fetches see an occasional
+# NameServerFailure): the fetch of Anole and of every lazy dependency. The
+# build and the checks below run once; a failure there is a real one.
+retry() {
+  local i
+  for i in 1 2 3; do "$@" && return 0; echo "retrying ($i): $*" >&2; sleep $((i * 10)); done
+  "$@"
+}
+retry "$zig" fetch --save=anole "$url"
+retry "$zig" build --fetch=all
 "$zig" build
 test -x zig-out/bin/consumer
 "$zig" build gen-proto
