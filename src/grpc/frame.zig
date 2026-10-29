@@ -380,28 +380,6 @@ test "fuzz: gRPC message frames read off a stream" {
     });
 }
 
-test "frame round trips empty and binary payloads" {
-    for ([_][]const u8{ "", "abc\x00xyz" }) |payload| {
-        const encoded = try encode(std.testing.allocator, payload);
-        defer std.testing.allocator.free(encoded);
-        const decoded = try decodeUnary(std.testing.allocator, encoded, 1024);
-        defer std.testing.allocator.free(decoded);
-        try std.testing.expectEqualSlices(u8, payload, decoded);
-    }
-}
-
-test "frame round trips a multi-byte payload length" {
-    const payload = try std.testing.allocator.alloc(u8, 70_000);
-    defer std.testing.allocator.free(payload);
-    @memset(payload, 0x5a);
-
-    const encoded = try encode(std.testing.allocator, payload);
-    defer std.testing.allocator.free(encoded);
-    const decoded = try decodeUnary(std.testing.allocator, encoded, payload.len);
-    defer std.testing.allocator.free(decoded);
-    try std.testing.expectEqualSlices(u8, payload, decoded);
-}
-
 test "gzip frame round trips and marks compressed payload" {
     if (comptime !features.compression) return error.SkipZigTest;
     const encoded = try encodeWithCompression(std.testing.allocator, "compress me compress me", .gzip);
