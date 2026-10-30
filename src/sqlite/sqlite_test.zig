@@ -1210,6 +1210,114 @@ test "sqlite: rows on the writer ended through a copy leave the next holder's tr
     try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
+test "sqlite: a read-only transaction ended through a copy leaves the next reader's snapshot alone" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try twiceSetup(io, &tmp, &s);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+
+    var tx = try db.begin(ctx, .{ .read_only = true });
+    // A copy commits; `tx` itself never learns that it ended.
+    var copy = tx;
+    try copy.commit(ctx);
+    // The one reader, now the next holder's; its snapshot starts at its
+    // first read.
+    var next = try db.begin(ctx, .{ .read_only = true });
+    defer next.deinit();
+    try testing.expectEqual(@as(i64, 0), try next.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+    _ = try db.exec(ctx, "INSERT INTO notes (title) VALUES ('later')", .{});
+    // The first transaction's deinit, while `next` holds the reader: `next`
+    // keeps its snapshot.
+    tx.deinit();
+    try testing.expectEqual(@as(i64, 0), try next.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+    try next.commit(ctx);
+}
+
+test "sqlite: rows on a reader ended through a copy leave the next reader's snapshot alone" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try twiceSetup(io, &tmp, &s);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+
+    var rows = try db.iterate(Note, ctx, "SELECT id, title, done FROM notes", .{});
+    var copy = rows;
+    copy.deinit();
+    var next = try db.begin(ctx, .{ .read_only = true });
+    defer next.deinit();
+    try testing.expectEqual(@as(i64, 0), try next.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+    _ = try db.exec(ctx, "INSERT INTO notes (title) VALUES ('later')", .{});
+    // The first rows' deinit, while `next` holds the reader: `next` keeps
+    // its snapshot.
+    rows.deinit();
+    try testing.expectEqual(@as(i64, 0), try next.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+    try next.commit(ctx);
+}
+
+test "sqlite: rows of a transaction a copy ended leave the next holder's statement alone" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try twiceSetup(io, &tmp, &s);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+    // More rows than one batch (64), so the next holder steps its statement
+    // again after the stale rows end.
+    _ = try db.exec(ctx, "WITH RECURSIVE k(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM k WHERE x < 100) INSERT INTO notes (title) SELECT 'n' || x FROM k", .{});
+    const sql = "SELECT id, title, done FROM notes ORDER BY id";
+
+    var tx = try db.begin(ctx, .{ .read_only = true });
+    var rows = try tx.iterate(Note, ctx, sql, .{});
+    while (try rows.next()) |_| {}
+    // A copy commits; `tx` and its rows never learn that it ended.
+    var copy = tx;
+    try copy.commit(ctx);
+    // The same reader and the same cached statement, the next holder's.
+    var next = try db.iterate(Note, ctx, sql, .{});
+    defer next.deinit();
+    try testing.expectEqual(@as(i64, 1), (try next.next()).?.id);
+    // The stale rows' deinit, while `next` steps the statement: `next`
+    // goes on where it was.
+    rows.deinit();
+    var last: i64 = 1;
+    while (try next.next()) |note| {
+        last += 1;
+        try testing.expectEqual(last, note.id);
+    }
+    try testing.expectEqual(@as(i64, 100), last);
+    tx.deinit();
+}
+
 /// The canceled begin's hook, on the writer thread after a job ran: holds the job
 /// running until its canceled caller has interrupted it.
 const BeginCanceled = struct {

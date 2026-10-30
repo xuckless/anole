@@ -288,8 +288,12 @@ breaking changes are listed anyway.
   back once; the second `release()` does nothing but log. Redis handed the
   connection to two later callers at once, and SQLite rolled back the
   next holder's transaction and let the writer go under it. A SQLite
-  transaction or `iterate()` rows ended through a copy of the value, then
-  `deinit` on the original, likewise does nothing but log.
+  transaction (read-only ones on a reader too) or `iterate()` rows (on a
+  reader, on the writer, or a transaction's) ended through a copy of the
+  value or of their transaction, then `deinit` on the original, likewise
+  does nothing but log: on a reader, the second end rolled back the next
+  holder's snapshot, reset the statement it was stepping and gave the
+  reader back twice (two holders at once, or a write past the free list).
 - MongoDB: closing the client, or a server leaving the topology, stops
   that server's monitor by cancellation; nothing outside the monitor
   touches its connection any more, which could be shut down after the
