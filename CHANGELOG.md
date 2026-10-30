@@ -5,6 +5,26 @@ breaking changes are listed anyway.
 
 ## 0.4.1 (unreleased)
 
+### Security
+
+- Redis: when a pooled connection had broken before a call's request was
+  sent and getting a new connection for the retry failed (Redis still down,
+  a dial refused, a pool timeout, a cancel), the call gave the old
+  connection back a second time and freed it twice: a crash, or heap
+  corruption in ReleaseFast builds. Since 0.3.0. A call now gives back only
+  a connection it holds.
+- C ABI: on HTTP/2 and HTTP/3, a request whose answer call failed (out of
+  memory, an SSE or WebSocket accept refused) while the client reset the
+  stream was freed with the stream, yet `anole_s3_serve` and
+  `anole_s3_put` still took it in `opts.req` and read it. They now answer
+  `ANOLE_E_GONE` for it. Since 0.4.0.
+- C ABI: an S3 transfer call (`anole_s3_upload_write`, `_upload_finish`,
+  `anole_s3_read_more`, `anole_handle_release`) made while its transfer
+  ended could act on the transfer opened next in the same slot: one
+  upload's bytes could land in another's object. It now checks the
+  transfer again under the slot's lock and answers `ANOLE_E_GONE` (a
+  release: `ANOLE_OK`, as for any ended handle). Since 0.4.0.
+
 ### Added
 
 - `anole.sse.Parser`: reads a server-sent event stream from any
@@ -327,11 +347,6 @@ breaking changes are listed anyway.
   writer failed with "cannot start a transaction within a transaction" or
   had its own work rolled back. Both roll back first now, as `tx.deinit()`
   does; `rollback` fails only on a transaction that is over.
-- C ABI: an S3 transfer call (`anole_s3_upload_write`, `_upload_finish`,
-  `anole_s3_read_more`, `anole_handle_release`) made while its transfer
-  ended could act on the transfer opened next in the same slot. It now
-  checks the transfer again under the slot's lock and answers
-  `ANOLE_E_GONE` (a release: `ANOLE_OK`, as for any ended handle).
 
 ### Changed
 
