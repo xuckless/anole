@@ -1003,3 +1003,43 @@ test "pg: live a call broken before sending on a pooled connection runs again; n
     }
     try testing.expectEqual(@as(i64, 1), try d.one(i64, &c, "SELECT count(*) FROM anole_pg_resend", .{}));
 }
+
+test "pg: live migrate runs each migration once, in a transaction with its record" {
+    _ = try testUrl();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const d = try open(io, .{});
+    defer d.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+    _ = try d.exec(&c, "DROP TABLE IF EXISTS schema_migrations, anole_pg_mig_tags, anole_pg_mig_notes", .{});
+
+    const good = [_]db.Migration{
+        .{ .version = 1, .name = "notes", .sql = "CREATE TABLE anole_pg_mig_notes (id bigserial PRIMARY KEY, title text NOT NULL);" },
+        .{ .version = 2, .name = "tags", .sql =
+        \\CREATE TABLE anole_pg_mig_tags (note bigint NOT NULL REFERENCES anole_pg_mig_notes (id), tag text NOT NULL);
+        \\CREATE INDEX anole_pg_mig_tags_note ON anole_pg_mig_tags (note);
+        },
+    };
+    const broken = [_]db.Migration{
+        good[0],
+        .{ .version = 2, .name = "tags", .sql =
+        \\CREATE TABLE anole_pg_mig_tags (note bigint NOT NULL);
+        \\INSERT INTO anole_pg_mig_missing VALUES (1);
+        },
+    };
+    {
+        const level = quiet();
+        defer testing.log_level = level;
+        try testing.expectError(error.Database, db.migrate(d, &c, &broken));
+    }
+    // The failing one left nothing, not even its CREATE TABLE.
+    try testing.expectEqual(@as(i64, 1), try d.one(i64, &c, "SELECT max(version) FROM schema_migrations", .{}));
+    try testing.expect(try d.one(?[]const u8, &c, "SELECT to_regclass('anole_pg_mig_tags')::text", .{}) == null);
+    try testing.expectEqual(@as(usize, 1), try db.migrate(d, &c, &good));
+    try testing.expectEqual(@as(usize, 0), try db.migrate(d, &c, &good));
+    try testing.expectEqualStrings("tags", try d.one([]const u8, &c, "SELECT name FROM schema_migrations WHERE version = 2", .{}));
+    _ = try d.exec(&c, "DROP TABLE schema_migrations, anole_pg_mig_tags, anole_pg_mig_notes", .{});
+}
