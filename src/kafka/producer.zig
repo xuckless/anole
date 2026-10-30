@@ -935,20 +935,40 @@ pub const Producer = struct {
                     continue;
                 };
                 if (a.leader != resolver_id) continue;
-                a.leader = id;
+                // The id is kept for its start before the leader is set: a
+                // leader whose sender never starts strands the batches.
                 for (start.items) |x| {
                     if (x == id) break;
-                } else start.append(arena, id) catch {};
+                } else start.append(arena, id) catch {
+                    all = false;
+                    continue;
+                };
+                a.leader = id;
             }
         }
         for (start.items) |id| {
             self.startSender(id) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
-                else => continue,
+                else => {
+                    // Not started: its partitions go back to the resolver,
+                    // which tries again.
+                    self.unassign(pend.items, id);
+                    all = false;
+                    continue;
+                },
             };
             self.wake(id);
         }
         return all;
+    }
+
+    /// Gives the partitions of `accums` led by `id` back to the resolver.
+    fn unassign(self: *Producer, accums: []const *Accum, id: i32) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (accums) |a| if (a.leader == id) {
+            a.leader = resolver_id;
+        };
     }
 
     // -----------------------------------------------------------------------
