@@ -191,6 +191,15 @@ handler's `drain(conn)` runs (and `conn.draining()` is true) so it can say
 goodbye and close; at `timeouts.shutdown` Anole closes the rest with reason
 `.drain`. A task-form handler waits on `conn.drainEvent()` beside its reads.
 
+A callback handler without `drain` gets `conn.close()` at drain start instead
+(after a callback in progress returns): what is queued goes out, Anole ends
+its side (FIN) and drops further input, and the connection closes, with reason
+`.drain`, as soon as the peer ends its side too, or after 2 s. A client that
+closes on FIN goes at once instead of holding the stop until
+`timeouts.shutdown`. Give the handler a `drain` callback to decide otherwise.
+The C ABI's raw TCP listeners keep their connections open until the consumer
+closes them or `timeouts.shutdown` passes.
+
 With `ServerOptions.process`, raw TCP listeners are inherited and handed over
 by name like HTTP ones: a systemd unit can use `ListenStream=` and
 `ListenDatagram=` with `FileDescriptorName=`, and SIGUSR2 re-executes the

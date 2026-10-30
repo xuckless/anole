@@ -2103,22 +2103,34 @@ const TcpConn = struct {
     // -- The drain -------------------------------------------------------------
 
     /// Runs under the drain's lock, on any task: must not wait. The driver
-    /// starts the callback on the connection's executor.
+    /// starts the callback on the connection's executor, or without one
+    /// the default end (`drainTask`). The task form watches
+    /// `drainEvent`, and the C ABI's events are the consumer's: neither
+    /// gets the default.
     fn onDrain(hook: *dusty.DrainHooks.Hook) void {
         const t: *TcpConn = @alignCast(@fieldParentPtr("drain_hook", hook));
-        if (t.service.table.drain == null) return;
+        const table = t.service.table;
+        if (table.drain == null and (table.task != null or table.inline_events)) return;
         // `.seq_cst`: see `serviceKick`.
         _ = t.flags.fetchOr(Flag.drain_pending, .seq_cst);
         t.driver.kick(t.kick);
     }
 
+    /// The handler's `drain`, after a callback in progress. Without one
+    /// (#107) the connection closes as `close` does: what is queued goes
+    /// out, this side ends (FIN), and input is dropped until the peer
+    /// ends (or `linger` passes), so a client that closes on FIN goes at
+    /// once instead of holding the stop until `timeouts.shutdown`.
     fn drainTask(t: *TcpConn) void {
         t.owner.check(t.io);
         if (t.isClosed()) return;
         t.callLock();
         defer t.callUnlock();
         if (t.isClosed()) return;
-        const f = t.service.table.drain.?;
+        const f = t.service.table.drain orelse {
+            t.setReason(.drain);
+            return t.requestEnd(true);
+        };
         f(t.service.state, &t.conn) catch |err| t.callbackFailed("drain", err);
     }
 
