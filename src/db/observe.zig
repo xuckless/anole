@@ -254,7 +254,7 @@ test "Readiness: one ping per ttl, the answer kept in between" {
     try testing.expectEqual(@as(u32, 2), fake.pings);
 }
 
-/// A ping that waits for `gate` (B-2, S-4): counts its pings and how many
+/// A ping that waits for `gate`: counts its pings and how many
 /// run at once.
 const GatedPing = struct {
     gate: std.Io.Event = .unset,
@@ -304,7 +304,7 @@ test "db readiness: probes during a ping answer with the last result" {
     try testing.expectEqual(@as(u32, 1), fake.pings.load(.monotonic));
 }
 
-/// S-4's ping: yields a seeded number of times instead of waiting for a
+/// The stress test's ping: yields a seeded number of times instead of waiting for a
 /// gate, counting how many run at once.
 const YieldingPing = struct {
     pings: std.atomic.Value(u32) = .init(0),
@@ -312,6 +312,9 @@ const YieldingPing = struct {
     most: std.atomic.Value(u32) = .init(0),
     answer: std.atomic.Value(bool) = .init(true),
     yields: std.atomic.Value(u32) = .init(0),
+    /// Pings that answered, and pings their caller's cancel ended.
+    answered: std.atomic.Value(u32) = .init(0),
+    canceled: std.atomic.Value(u32) = .init(0),
 
     fn ping(context: *anyopaque, _: std.Io) std.Io.Cancelable!bool {
         const zio = @import("zio");
@@ -320,12 +323,16 @@ const YieldingPing = struct {
         const now = self.running.fetchAdd(1, .acq_rel) + 1;
         defer _ = self.running.fetchSub(1, .acq_rel);
         _ = self.most.fetchMax(now, .monotonic);
-        for (0..self.yields.load(.monotonic)) |_| try zio.yield();
+        for (0..self.yields.load(.monotonic)) |_| zio.yield() catch |err| {
+            _ = self.canceled.fetchAdd(1, .acq_rel);
+            return err;
+        };
+        _ = self.answered.fetchAdd(1, .acq_rel);
         return self.answer.load(.monotonic);
     }
 };
 
-/// One probe of an S-4 wave: its task (for a cancel), then the check, then
+/// One probe of a stress wave: its task (for a cancel), then the check, then
 /// a wait for the wave's end, so it is alive until canceled or released.
 const WaveProbe = struct {
     task: std.atomic.Value(?dusty.placement.Task) = .init(null),
@@ -360,6 +367,9 @@ test "db readiness: [stress] probes from four executors with cancels ping one at
         const answer = random.boolean();
         fake.answer.store(answer, .monotonic);
         fake.yields.store(random.uintLessThan(u32, 8), .monotonic);
+        fake.answered.store(0, .release);
+        const before_ns = ready.checked_ns.load(.acquire);
+        const before = ready.ready.load(.monotonic);
         var started: std.atomic.Value(u32) = .init(0);
         var probes: [probes_per_wave]WaveProbe = @splat(.{ .started = &started });
         var end: std.Io.Event = .unset;
@@ -369,18 +379,23 @@ test "db readiness: [stress] probes from four executors with cancels ping one at
         try wait.waitEqual(io, "every probe of the wave started", &started, probes_per_wave);
         // A seeded few canceled, wherever they are: in the ping, waiting
         // for the wave's end, or about to check.
-        var canceled: u32 = 0;
         for (&probes) |*p| if (random.uintLessThan(u8, 4) == 0) {
             dusty.placement.cancelTask(p.task.load(.acquire).?);
-            canceled += 1;
         };
         end.set(io);
         group.await(io) catch {};
         try testing.expect(fake.most.load(.monotonic) <= 1);
         try testing.expect(!ready.pinging.load(.acquire));
-        if (canceled == 0) try testing.expectEqual(answer, ready.ready.load(.monotonic));
+        if (fake.answered.load(.acquire) == 0) {
+            // No ping answered (any that ran was canceled): the answer and
+            // its time are the last wave's.
+            try testing.expectEqual(before_ns, ready.checked_ns.load(.acquire));
+            try testing.expectEqual(before, ready.ready.load(.monotonic));
+        } else try testing.expectEqual(answer, ready.ready.load(.monotonic));
     }
     try testing.expectEqual(@as(u32, 1), fake.most.load(.monotonic));
+    // The waves did cancel pings.
+    try testing.expect(fake.canceled.load(.acquire) > 0);
 }
 
 test "Observer: metrics shared by two databases, and a child span in a traced request" {
