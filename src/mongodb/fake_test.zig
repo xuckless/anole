@@ -606,18 +606,18 @@ const MonitorEnd = struct {
     }
 
     /// Wakes the server's monitor, which ends (the client is closing) and
-    /// closes its connection, and waits until it has without suspending:
-    /// `deinit` runs on another executor than the monitor. The wait
-    /// deadline is a hang guard.
+    /// closes its connection, and waits until it has. `deinit` holds no
+    /// lock of the client here, so the wait suspends: the other tasks of
+    /// its executor (the fake's, answering a check in flight) run
+    /// meanwhile. The wait's deadline is a hang guard.
     fn hold(s: *client_mod.Server) void {
         const io = s.client.io;
         held.store(true, .release);
         s.check_now.set(io);
-        const until = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = wait.deadline(), .clock = .awake });
-        while (!closed.load(.acquire)) {
-            if (until.untilNow(io).raw.nanoseconds >= 0) return timed_out.store(true, .release);
-            std.Thread.yield() catch {};
-        }
+        wait.waitFlag(io, "the monitor ended and closed its connection", &closed) catch |err| {
+            if (err == error.Canceled) io.recancel();
+            timed_out.store(true, .release);
+        };
     }
 
     fn close(client: *mongodb.Client) void {
