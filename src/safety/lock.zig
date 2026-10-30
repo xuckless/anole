@@ -24,9 +24,13 @@
 //!
 //! `IoLock` is L2's exception: a lock that guards an I/O resource (the one
 //! writer of a socket, one round trip on a connection) and may be held
-//! across a suspension. It is never counted with zio, so zio's suspension
-//! check and the lock waits above skip it, and it is taken only when the
-//! thread holds no other lock (rank `io`, the outermost).
+//! across a suspension. It is never counted with zio and never pushed on
+//! the thread's stack: while its task is suspended, the executor thread
+//! runs other tasks, which take locks of their own. It is recorded on the
+//! task that takes it instead (a zio task-local; off a task, on the
+//! thread): a task takes one only when it holds no other I/O lock and its
+//! thread holds no other lock (rank `io`, the outermost), and only the task
+//! that took it lets it go.
 //!
 //! Two more checks use the same stack of held locks: a QSBR read section
 //! (`readSectionEntered`, src/http/core/qsbr.zig) is counted with zio like
@@ -65,9 +69,6 @@ const Kind = enum {
     mutex,
     /// A `SpinLock`: never held across an allocation (L5).
     spin,
-    /// An `IoLock`: may be held across a suspension (L2's exception), not
-    /// counted with zio.
-    io,
     /// A QSBR read section: counted with zio like a lock, outside L4's
     /// order (its rank is not compared).
     section,
@@ -76,7 +77,6 @@ const Kind = enum {
         return switch (k) {
             .mutex => "lock",
             .spin => "spin lock",
-            .io => "I/O lock",
             .section => "read section",
         };
     }
@@ -100,44 +100,132 @@ pub fn notePanic() void {
     if (enabled) reporting = true;
 }
 
-/// The locks the calling thread holds through these types (0 outside debug builds).
+/// The locks the calling thread holds through these types (0 outside debug
+/// builds). An `IoLock` is not one of them: it is its task's (`heldIo`).
 pub fn heldLocks() usize {
     return if (enabled) held_len else 0;
 }
 
-/// The innermost entry of the held stack that suspending would break: any
-/// but an `IoLock`. Null when there is none.
-fn topSuspendable() ?Held {
-    var i: usize = held_len;
-    while (i > 0) {
-        i -= 1;
-        if (held[i].kind != .io) return held[i];
-    }
-    return null;
+/// Whether `zio` can tell which task runs (`currentTask`) and keep a value
+/// per task (`TaskLocal`): the fork can, the HTTP core's stub can't.
+const have_task_local = @hasDecl(zio, "TaskLocal") and @hasDecl(zio, "currentTask");
+
+/// The `IoLock` the running task holds (one at most), bound through the
+/// lock's own node while it is held, so it follows the task across its
+/// suspensions and whatever else runs on the thread meanwhile.
+var task_io: if (have_task_local) zio.TaskLocal(*const IoLock) else void = if (have_task_local) .{} else {};
+/// Off a task (a thread that is no executor, zio's scheduler code, the
+/// core's stub zio), the thread holds its `IoLock` itself: there nothing
+/// else runs on the thread while it waits.
+threadlocal var thread_io: ?*const IoLock = null;
+
+/// Whether the caller runs as a zio task.
+fn onTask() bool {
+    if (comptime !have_task_local) return false;
+    return zio.currentTask() != null;
 }
 
-/// About to wait for a suspending lock at `site`: nothing may be held but
-/// I/O locks, which may be held across a suspension (L2).
+/// The `IoLock` the calling task (off a task: thread) holds, if any.
+fn heldIo() ?*const IoLock {
+    if (comptime !enabled) return null;
+    if (comptime have_task_local) if (onTask()) return task_io.get();
+    return thread_io;
+}
+
+/// Who holds an `IoLock`: a task, or off a task a thread.
+const IoHolder = union(enum) {
+    task: *const anyopaque,
+    thread: std.Thread.Id,
+
+    /// Who would hold an `IoLock` taken here.
+    fn current() IoHolder {
+        if (comptime have_task_local) if (zio.currentTask()) |t| return .{ .task = t };
+        return .{ .thread = std.Thread.getCurrentId() };
+    }
+
+    fn eql(a: IoHolder, b: IoHolder) bool {
+        return switch (a) {
+            .task => |t| b == .task and b.task == t,
+            .thread => |id| b == .thread and b.thread == id,
+        };
+    }
+};
+
+/// About to wait for a suspending lock at `site`: the thread may hold
+/// nothing (L2). An `IoLock` is not on the thread's stack: it may be held
+/// across a suspension.
 fn beforeWait(rank: Rank, site: usize) void {
     if (!enabled or held_len == 0) return;
-    const top = topSuspendable() orelse return;
+    const top = held[held_len - 1];
     if (top.kind == .section)
         report(site, "SAFETY.md L2: waiting for a {s} lock inside a read section: a lock wait is a suspension point", .{@tagName(rank)}, rank, "waited for")
     else
         report(site, "SAFETY.md L2: waiting for a {s} lock while holding a {s} lock: a lock wait is a suspension point", .{ @tagName(rank), @tagName(top.rank) }, rank, "waited for");
 }
 
-/// About to wait for an `IoLock` at `site`: nothing at all may be held, not
-/// even another I/O lock (L2's exception, L4's `io` rank).
-fn beforeIoWait(site: usize) void {
-    if (!enabled or held_len == 0) return;
-    const top = held[held_len - 1];
-    if (top.kind == .section)
-        report(site, "SAFETY.md L2: taking an I/O lock inside a read section: an I/O lock is taken only when no other lock is held", .{}, .io, "taken")
-    else if (top.kind == .io)
-        report(site, "SAFETY.md L2: taking an I/O lock while holding another I/O lock: an I/O lock is taken only when no other lock is held", .{}, .io, "taken")
+/// About to wait for `lock` at `site`: nothing at all may be held, not on
+/// the thread and not another I/O lock of the task (L2's exception, L4's
+/// `io` rank). I/O locks other tasks of the executor hold don't count.
+fn beforeIoWait(lock: *const IoLock, site: usize) void {
+    if (!enabled) return;
+    if (held_len != 0) {
+        const top = held[held_len - 1];
+        if (top.kind == .section)
+            report(site, "SAFETY.md L2: taking an I/O lock inside a read section: an I/O lock is taken only when no other lock is held", .{}, .io, "taken")
+        else
+            report(site, "SAFETY.md L2: taking an I/O lock while holding a {s} {s}: an I/O lock is taken only when no other lock is held", .{ @tagName(top.rank), top.kind.noun() }, .io, "taken");
+    }
+    if (heldIo()) |other| {
+        if (other == lock)
+            report(site, "SAFETY.md L2: taking an I/O lock this task already holds: it would wait for itself", .{}, .io, "taken")
+        else
+            report(site, "SAFETY.md L2: taking an I/O lock while this task holds another I/O lock: an I/O lock is taken only when no other lock is held", .{}, .io, "taken");
+    }
+}
+
+/// `lock` was taken at `site`: it is the calling task's (off a task, the
+/// thread's) until it lets it go. Not counted with zio, not on the thread's
+/// stack.
+fn ioTaken(lock: *IoLock, site: usize) void {
+    if (comptime !enabled) return;
+    lock.debug.holder = .current();
+    lock.debug.site = site;
+    if (comptime have_task_local) if (onTask()) return task_io.set(&lock.debug.node, lock);
+    thread_io = lock;
+}
+
+/// `lock` is let go at `site`: only by the task (or thread) that took it.
+fn ioReleasing(lock: *IoLock, site: usize) void {
+    if (comptime !enabled) return;
+    const holder = lock.debug.holder orelse ioNotHeld(lock, site);
+    if (!holder.eql(.current())) ioNotHeld(lock, site);
+    lock.debug.holder = null;
+    if (comptime have_task_local) if (lock.debug.node.base.key != null) return task_io.clear(&lock.debug.node);
+    thread_io = null;
+}
+
+/// Releasing an `IoLock` the caller does not hold: names where it is let go
+/// and, when someone holds it, where that one took it.
+fn ioNotHeld(lock: *const IoLock, site: usize) noreturn {
+    @branchHint(.cold);
+    reporting = true;
+    var buf: [3584]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    writeIoNotHeld(&w, lock, site) catch {};
+    std.debug.panic("{s}", .{w.buffered()});
+}
+
+fn writeIoNotHeld(w: *std.Io.Writer, lock: *const IoLock, site: usize) std.Io.Writer.Error!void {
+    if (lock.debug.holder == null)
+        try w.writeAll("SAFETY.md L2: releasing an I/O lock that is not held\n")
     else
-        report(site, "SAFETY.md L2: taking an I/O lock while holding a {s} {s}: an I/O lock is taken only when no other lock is held", .{ @tagName(top.rank), top.kind.noun() }, .io, "taken");
+        try w.writeAll("SAFETY.md L2: releasing an I/O lock this task does not hold: the task that took it lets it go\n");
+    try w.writeAll("the I/O lock is being released at:\n");
+    try writeSite(w, site);
+    if (lock.debug.holder != null) {
+        try w.writeAll("it was taken by another task or thread at:\n");
+        try writeSite(w, lock.debug.site);
+    }
 }
 
 /// The innermost entry that L4's order compares against: any but a read
@@ -169,8 +257,7 @@ fn acquiredKind(rank: Rank, site: usize, kind: Kind) void {
     };
     held[held_len] = .{ .rank = rank, .site = site, .kind = kind };
     held_len += 1;
-    // An I/O lock may be held across a suspension: zio does not count it.
-    if (kind != .io) zio_held.acquired();
+    zio_held.acquired();
     installSuspendReport();
 }
 
@@ -258,10 +345,9 @@ fn releasing(rank: Rank, site: usize) void {
 }
 
 fn removeAt(i: usize) void {
-    const kind = held[i].kind;
     std.mem.copyForwards(Held, held[i .. held_len - 1], held[i + 1 .. held_len]);
     held_len -= 1;
-    if (kind != .io) zio_held.released();
+    zio_held.released();
 }
 
 /// Panics with `fmt`, followed by where the `rank` lock is being `verb`
@@ -286,6 +372,10 @@ fn writeReport(w: *std.Io.Writer, comptime fmt: []const u8, args: anytype, rank:
 }
 
 fn writeHeld(w: *std.Io.Writer, locks: []const Held) std.Io.Writer.Error!void {
+    if (comptime enabled) if (heldIo()) |l| {
+        try w.writeAll("the I/O lock this task holds, taken at:\n");
+        try writeSite(w, l.debug.site);
+    };
     try w.print("locks held by this thread, outer first ({d}):\n", .{locks.len});
     for (locks, 0..) |h, i| {
         if (h.kind == .section)
@@ -372,39 +462,56 @@ pub fn SpinLock(comptime rank: Rank) type {
 /// SAFETY.md L2's exception: a lock that guards an I/O resource, not data
 /// (the one writer of a socket or stream, one round trip on a broker
 /// connection), and may be held across a suspension. Its waiters suspend
-/// (`std.Io.Mutex`). It is taken only when the thread holds no other lock,
-/// not even another I/O lock (rank `io`, outermost in L4's order): debug
-/// builds panic otherwise. While it is held, other locks may be taken in
-/// L4's order, and the task may suspend once they are let go. Nothing may
-/// wait for it inside a C callback, and it guards no data another lock or
-/// an executor also guards. Each one is temporary, until the protocol work
-/// that owns its resource gives it an outbox and one writer.
+/// (`std.Io.Mutex`). A task takes it only when it holds no other lock, not
+/// even another I/O lock (rank `io`, outermost in L4's order): debug builds
+/// panic otherwise. While it is held, other locks may be taken in L4's
+/// order, and the task may suspend once they are let go; other tasks on
+/// the same executor run meanwhile and take locks of their own, I/O locks
+/// too. Only the task that took it lets it go. Nothing may wait for it
+/// inside a C callback, and it guards no data another lock or an executor
+/// also guards. Each one is temporary, until the protocol work that owns
+/// its resource gives it an outbox and one writer.
+///
+/// Not checked: a wait between tasks, such as a task that holds one and
+/// awaits a task that waits for the same one (each task holds one lock).
 pub const IoLock = struct {
     inner: std.Io.Mutex = .init,
+    /// Debug and test builds: who holds it and where it was taken; written
+    /// and read by its holder only, under `inner`.
+    debug: Debug = .{},
 
     pub const init: IoLock = .{};
 
+    const Debug = if (enabled) struct {
+        /// The task that holds it (off a task, the thread); null when free.
+        holder: ?IoHolder = null,
+        /// Where it was taken (the `lock` call's return address).
+        site: usize = 0,
+        /// Binds it as its task's I/O lock (`task_io`) while held.
+        node: if (have_task_local) zio.TaskLocal(*const IoLock).Node else void = if (have_task_local) .unset else {},
+    } else struct {};
+
     pub fn lock(self: *IoLock, io: std.Io) std.Io.Cancelable!void {
-        if (enabled) beforeIoWait(@returnAddress());
+        if (enabled) beforeIoWait(self, @returnAddress());
         try self.inner.lock(io);
-        if (enabled) acquiredKind(.io, @returnAddress(), .io);
+        if (enabled) ioTaken(self, @returnAddress());
     }
 
     pub fn lockUncancelable(self: *IoLock, io: std.Io) void {
-        if (enabled) beforeIoWait(@returnAddress());
+        if (enabled) beforeIoWait(self, @returnAddress());
         self.inner.lockUncancelable(io);
-        if (enabled) acquiredKind(.io, @returnAddress(), .io);
+        if (enabled) ioTaken(self, @returnAddress());
     }
 
     pub fn tryLock(self: *IoLock) bool {
-        if (enabled) beforeIoWait(@returnAddress());
+        if (enabled) beforeIoWait(self, @returnAddress());
         if (!self.inner.tryLock()) return false;
-        if (enabled) acquiredKind(.io, @returnAddress(), .io);
+        if (enabled) ioTaken(self, @returnAddress());
         return true;
     }
 
     pub fn unlock(self: *IoLock, io: std.Io) void {
-        if (enabled) releasing(.io, @returnAddress());
+        if (enabled) ioReleasing(self, @returnAddress());
         self.inner.unlock(io);
     }
 };
@@ -521,11 +628,14 @@ test "lock: an I/O lock may be held across a lock wait, and other locks nest und
     try io_lock.lock(std.testing.io);
     try t.lock(std.testing.io);
     l.lock();
-    if (enabled) try std.testing.expectEqual(@as(usize, 3), heldLocks());
+    // The thread holds the two ranked locks; the I/O lock is the caller's.
+    if (enabled) try std.testing.expectEqual(@as(usize, 2), heldLocks());
+    if (enabled) try std.testing.expectEqual(@as(?*const IoLock, &io_lock), heldIo());
     l.unlock();
     t.unlock(std.testing.io);
     io_lock.unlock(std.testing.io);
     try std.testing.expectEqual(@as(usize, 0), heldLocks());
+    try std.testing.expectEqual(@as(?*const IoLock, null), heldIo());
 }
 
 test "lock: a task may suspend holding an I/O lock" {
@@ -538,6 +648,78 @@ test "lock: a task may suspend holding an I/O lock" {
     // A suspension of the main task on executor 0: zio's check passes it.
     try zio.yield();
     io_lock.unlock(io);
+}
+
+/// A connection's task in the tests below: takes its own I/O lock, waits
+/// for `go` inside it (a real suspension: the test sets the event), then
+/// takes a leaf lock and a table lock under it and lets everything go.
+const TaskWithIoLock = struct {
+    io_lock: IoLock = .init,
+    in_lock: std.Io.Event = .unset,
+    go: std.Io.Event = .unset,
+    done: std.Io.Event = .unset,
+
+    fn run(h: *TaskWithIoLock, io: std.Io) std.Io.Cancelable!void {
+        try h.io_lock.lock(io);
+        defer h.io_lock.unlock(io);
+        h.in_lock.set(io);
+        try h.go.wait(io);
+        var l: SpinLock(.leaf) = .init;
+        l.lock();
+        l.unlock();
+        var t: Mutex(.table) = .init;
+        try t.lock(io);
+        t.unlock(io);
+        h.done.set(io);
+    }
+};
+
+test "lock: a task takes an I/O lock while another task on its executor is suspended holding one" {
+    if (!zio_checks_suspend) return error.SkipZigTest;
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var a: TaskWithIoLock = .{};
+    var b: TaskWithIoLock = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    // Both on the only executor: a suspends inside its I/O lock, then b
+    // takes another I/O lock, a leaf and a table lock on the same thread.
+    try zio.Group.fromStd(&group).spawnInto(.{ .executor = 0 }, TaskWithIoLock.run, .{ &a, io });
+    try a.in_lock.wait(io);
+    try zio.Group.fromStd(&group).spawnInto(.{ .executor = 0 }, TaskWithIoLock.run, .{ &b, io });
+    try b.in_lock.wait(io);
+    // b is suspended inside its I/O lock too; a goes on and lets its own go
+    // while b still holds one, then b.
+    a.go.set(io);
+    try a.done.wait(io);
+    b.go.set(io);
+    try group.await(io);
+    try std.testing.expectEqual(@as(usize, 0), heldLocks());
+}
+
+test "lock: tasks on two executors each hold an I/O lock across suspensions, two per executor" {
+    if (!zio_checks_suspend) return error.SkipZigTest;
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var holders: [4]TaskWithIoLock = @splat(.{});
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    // Holder i on executor i % 2: every executor thread runs two tasks
+    // that are suspended inside their own I/O lock at the same time.
+    for (&holders, 0..) |*h, i| {
+        try zio.Group.fromStd(&group).spawnInto(.{ .executor = @intCast(i % 2) }, TaskWithIoLock.run, .{ h, io });
+    }
+    for (&holders) |*h| try h.in_lock.wait(io);
+    // Released in the reverse order of taking, each by its own task.
+    var i: usize = holders.len;
+    while (i > 0) {
+        i -= 1;
+        holders[i].go.set(io);
+        try holders[i].done.wait(io);
+    }
+    try group.await(io);
 }
 
 test "lock: a read section counts as held but is outside the lock order" {
@@ -574,6 +756,63 @@ test "lock: an I/O lock taken while holding another lock names where both were t
     try std.testing.expect(std.mem.indexOf(u8, out, "SAFETY.md L2: taking an I/O lock while holding a table spin lock") != null);
     try expectSite(out, lines[0]);
     try expectSite(out, lines[1]);
+}
+
+/// On a zio task, takes an I/O lock, then a second one while holding it, at
+/// the lines it returns; `io` null only computes the lines.
+fn ioUnderIo(io: ?std.Io) [2]u32 {
+    var first: IoLock = .init;
+    var second: IoLock = .init;
+    const outer = @src().line + 1;
+    if (io) |i| first.lockUncancelable(i);
+    const inner = @src().line + 1;
+    if (io) |i| second.lockUncancelable(i);
+    return .{ outer, inner };
+}
+
+test "lock: a task taking a second I/O lock names where both were taken" {
+    if (!enabled or !zio_checks_suspend) return error.SkipZigTest;
+    const key = "a task taking a second I/O lock names where both were taken";
+    if (child.isChild(key)) {
+        const rt = try zio.Runtime.init(std.heap.page_allocator, .{ .executors = .exact(1) });
+        _ = ioUnderIo(rt.io());
+    }
+    const out = try child.runPanicking(std.testing.allocator, key);
+    defer std.testing.allocator.free(out);
+    const lines = ioUnderIo(null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "SAFETY.md L2: taking an I/O lock while this task holds another I/O lock") != null);
+    try expectSite(out, lines[0]);
+    try expectSite(out, lines[1]);
+}
+
+/// Lets go of `h.io_lock`, which another task holds, at the line it
+/// returns; `io` null only computes the line.
+fn ioReleasedByOther(io: ?std.Io, h: *TaskWithIoLock) u32 {
+    const released = @src().line + 1;
+    if (io) |i| h.io_lock.unlock(i);
+    return released;
+}
+
+test "lock: an I/O lock let go by a task that did not take it names where it was taken" {
+    if (!enabled or !zio_checks_suspend) return error.SkipZigTest;
+    const key = "an I/O lock let go by a task that did not take it names where it was taken";
+    var h: TaskWithIoLock = .{};
+    if (child.isChild(key)) {
+        const rt = try zio.Runtime.init(std.heap.page_allocator, .{ .executors = .exact(1) });
+        const io = rt.io();
+        var group: std.Io.Group = .init;
+        // A task on executor 0 takes the lock and waits inside it; this
+        // task then lets it go.
+        try zio.Group.fromStd(&group).spawnInto(.{ .executor = 0 }, TaskWithIoLock.run, .{ &h, io });
+        try h.in_lock.wait(io);
+        _ = ioReleasedByOther(io, &h);
+    }
+    const out = try child.runPanicking(std.testing.allocator, key);
+    defer std.testing.allocator.free(out);
+    const released = ioReleasedByOther(null, &h);
+    try std.testing.expect(std.mem.indexOf(u8, out, "SAFETY.md L2: releasing an I/O lock this task does not hold") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "it was taken by another task or thread at:") != null);
+    try expectSite(out, released);
 }
 
 /// Takes a tls lock, then a protocol lock (out of order), at the lines it

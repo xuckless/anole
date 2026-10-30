@@ -7,6 +7,20 @@ breaking changes are listed anyway.
 
 ### Fixed
 
+- net: a UDP send racing the stop answers Closed instead of being dropped
+  uncounted. It used to be taken after the sender's last drain, answer
+  success and never go out.
+- net: sends take no lock; a connection's helper tasks belong to it and end
+  before it is freed. A send from another thread costs one allocation, as
+  before; small sends from the connection's executor share one.
+- C ABI: `anole_net_write` no longer allocates under a lock.
+- net: one send larger than `write_max` (UDP: datagrams together larger
+  than `send_queue`) answers `error.TooLarge` (C ABI: `ANOLE_E_TOOBIG`)
+  instead of `QueueFull`/`ANOLE_E_AGAIN`, whose promised WRITABLE never
+  came. A reset or close of a paused connection ends it even when it is
+  paused again meanwhile; a task waiting in `waitWritable` when the
+  connection closes answers Closed; a connection closed while its
+  `writable` or `drain` callback waits keeps its own close reason.
 - SSE: an event written through `EventStream.startSend` (the streaming
   `EventWriter`) now encodes its data as `send` does. Data ending in a CR or
   LF kept its last line break off the wire, so browsers delivered `"hi"` for
@@ -188,6 +202,10 @@ breaking changes are listed anyway.
 - C ABI config: a watch on a SQLite database is refused with "is SQLite,
   which has no change feed"; it said the database was not PostgreSQL (or
   Redis, MongoDB), which hid the reason.
+- Lambda: a buffered answer whose body the handler streamed (`res.stream`)
+  was encoded from a part list that pointed into a returned function's
+  stack, so the answer could carry garbage or crash; it now lives in the
+  sink. Seen as a crash in ReleaseSafe test builds.
 
 ### Changed
 
@@ -309,6 +327,10 @@ breaking changes are listed anyway.
   `safety.SpinLock` is held, naming where the lock was taken (L5).
   `safety.IoLock` is the lock L2 now allows across a suspension (an I/O
   resource's one writer), taken only with no other lock held.
+- Debug and test builds: a `safety.IoLock` is checked per task, not per
+  executor thread, so a task taking one while another task on its executor
+  is suspended holding one no longer panics, and releasing one is checked
+  against the task that took it.
 
 ## 0.4.0 (2026-10-25)
 

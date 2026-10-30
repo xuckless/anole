@@ -339,6 +339,110 @@ test "capi net: RESET racing the connection's end, many times" {
     }
 }
 
+/// Takes every record of `handle` the rig holds, and counts those of `typ`.
+fn dropFor(r: *Rig, handle: u64, typ: abi.EventType) usize {
+    r.lockIt();
+    defer r.lock.unlock();
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < r.recs.items.len) {
+        const x = r.recs.items[i];
+        if (x.handle != handle) {
+            i += 1;
+            continue;
+        }
+        if (x.type == @backingInt(typ)) n += 1;
+        alloc.free(x.bytes);
+        _ = r.recs.orderedRemove(i);
+    }
+    return n;
+}
+
+/// A borrowed write's bytes: valid for the process (until SENT, at least).
+const lent: [256]u8 = @splat('b');
+
+test "capi net: a borrowed write racing a RESET gets exactly one SENT, written or dropped" {
+    if (comptime !features.net) return error.SkipZigTest;
+    const rig = try Rig.create(tcp_plain);
+    defer rig.destroy();
+    for (0..30) |_| {
+        const s = try rig.client();
+        defer s.close();
+        try s.writer().writeAll("x");
+        try s.writer().flush();
+        const open = try rig.take(.net_open);
+        defer free(open);
+        _ = try engine.net.write(rig.e, open.handle, &lent, abi.BODY_BORROW);
+        try engine.net.closeConn(rig.e, open.handle, abi.NET_CLOSE_RESET);
+        const close = try rig.take(.net_close);
+        defer free(close);
+        // The connection's SENT records come before its CLOSE.
+        try std.testing.expectEqual(@as(usize, 1), dropFor(rig, open.handle, .sent));
+    }
+}
+
+/// `[stress]`: consumer threads writing to one connection while it is reset
+/// or its peer goes.
+const WriteStorm = struct {
+    rig: *Rig,
+    handle: u64,
+    /// Borrowed writes the call took (OK or BUSY).
+    borrowed_ok: std.atomic.Value(u32) = .init(0),
+    bad: std.atomic.Value(u32) = .init(0),
+
+    fn run(w: *WriteStorm, k: u32) void {
+        for (0..16) |j| {
+            const borrow = (j + k) % 2 == 0;
+            const n = 1 + (j * 37 + k * 11) % lent.len;
+            if (engine.net.write(w.rig.e, w.handle, lent[0..n], if (borrow) abi.BODY_BORROW else 0)) |_| {
+                if (borrow) _ = w.borrowed_ok.fetchAdd(1, .release);
+            } else |err| switch (err) {
+                error.Gone, error.Again => {},
+                error.Invalid => if (!std.mem.eql(u8, engine.net.invalid_token, "Ended")) {
+                    _ = w.bad.fetchAdd(1, .release);
+                },
+                else => _ = w.bad.fetchAdd(1, .release),
+            }
+        }
+    }
+};
+
+test "capi net: [stress] writes and borrowed writes racing RESET and peer close" {
+    if (comptime !features.net) return error.SkipZigTest;
+    try wait.requireStress();
+    const rig = try Rig.create(tcp_plain);
+    defer rig.destroy();
+    var prng: std.Random.DefaultPrng = .init(0xca91_0002);
+    for (0..5000) |round| {
+        const s = try rig.client();
+        var client_open = true;
+        defer if (client_open) s.close();
+        try s.writer().writeAll("x");
+        try s.writer().flush();
+        const open = try rig.take(.net_open);
+        defer free(open);
+        var ws: WriteStorm = .{ .rig = rig, .handle = open.handle };
+        var threads: [4]std.Thread = undefined;
+        for (&threads, 0..) |*t, k| t.* = try std.Thread.spawn(.{}, WriteStorm.run, .{ &ws, @as(u32, @intCast(k)) });
+        if (prng.random().boolean()) {
+            try engine.net.closeConn(rig.e, open.handle, abi.NET_CLOSE_RESET);
+        } else {
+            s.close();
+            client_open = false;
+        }
+        for (threads) |t| t.join();
+        const close = try rig.take(.net_close);
+        defer free(close);
+        // After its CLOSE was polled, a write is Gone, never OK.
+        try std.testing.expectError(error.Gone, engine.net.write(rig.e, open.handle, "late", 0));
+        const sent = dropFor(rig, open.handle, .sent);
+        if (sent != ws.borrowed_ok.load(.acquire) or ws.bad.load(.acquire) != 0) {
+            std.debug.print("round {d}: {d} borrowed writes taken, {d} SENT, {d} bad answers\n", .{ round, ws.borrowed_ok.load(.acquire), sent, ws.bad.load(.acquire) });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "capi net: pause holds input until resume" {
     if (comptime !features.net) return error.SkipZigTest;
     const rig = try Rig.create(tcp_plain);
@@ -652,4 +756,34 @@ fn addrFuzz(input: []const u8) anyerror!void {
 test "fuzz: net addr parse" {
     const fuzz = @import("../fuzz.zig");
     try fuzz.bytes(addrFuzz, &.{ "10.0.0.1:53", "[::1]:53", "[2001:db8::1]:443", "127.0.0.1", "[::ffff:1.2.3.4]:80", "1.2.3.4:99999", "[fe80::1%eth0]:1", "" });
+}
+
+test "capi net: writes refused after F_END free their chunks after the slot lock (L5)" {
+    if (comptime !features.net) return error.SkipZigTest;
+    const rig = try Rig.create(tcp_length);
+    defer rig.destroy();
+    const s = try rig.client();
+    defer s.close();
+    const h = try openFramed(rig, s);
+    _ = try engine.net.write(rig.e, h, "", abi.NET_F_END);
+    // Copied, borrowed and framed: each made its chunk before the lock and
+    // gets it back refused; the chunk allocator panics at a free under it.
+    for ([_]u32{ 0, abi.BODY_BORROW, abi.NET_F_FRAME }) |f| {
+        try std.testing.expectError(error.Invalid, engine.net.write(rig.e, h, "late", f));
+        try std.testing.expectEqualStrings("Ended", engine.net.invalid_token);
+    }
+}
+
+test "capi net: a write over tcp.write_max on an idle connection is TOOBIG, not AGAIN" {
+    if (comptime !features.net) return error.SkipZigTest;
+    const rig = try Rig.create("{\"executors\": 1, \"timeouts\": {\"shutdown_ms\": 500}, \"listeners\": [{\"name\": \"chat\", \"address\": \"127.0.0.1\", \"port\": 0, \"tcp\": {\"handler\": 7, \"write_high_water\": 4096, \"write_max\": 4096}}]}");
+    defer rig.destroy();
+    const s = try rig.client();
+    defer s.close();
+    try s.writer().writeAll("x");
+    try s.writer().flush();
+    const open = try rig.take(.net_open);
+    defer free(open);
+    const big: [4097]u8 = @splat('o');
+    try std.testing.expectError(error.TooBig, engine.net.write(rig.e, open.handle, &big, 0));
 }

@@ -222,6 +222,13 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   Windows `CompletionQueue` and `ev.NetPoll`/`ev.Async`. After a bump, a
   compile error naming one of them means the branch lost it. The core's own
   tests build against src/http/core/zio_stub.zig instead (`is_stub`).
+  On every bump, check that a spawn that fails has not suspended:
+  `registerTask` returns RuntimeShutdown only before `scheduleTask`, and
+  its backpressure yield (`yieldForRound`) is `.no_cancel`. anole.net's
+  refusal paths (`TcpConn.spawn`'s `.refused` in `handOver` and
+  `serviceKick`, `TcpListener.driverFor`'s rollback) touch the connection
+  or driver after a refused spawn; a spawn that could yield and then fail
+  (or be canceled in its yield) would make them use-after-free.
 - **nghttp2**, **ngtcp2**, **nghttp3**: see above.
 - **websocket-zig**, **zig-jwt**: ports to Zig 0.17 with small fixes; rebase
   when upstream moves and the fixes are still needed. websocket-zig also
