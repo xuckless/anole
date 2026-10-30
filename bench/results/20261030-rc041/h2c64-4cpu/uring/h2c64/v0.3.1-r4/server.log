@@ -1,0 +1,4 @@
+{"time":"2026-10-30T07:05:19.443Z","level":"info","scope":"anole","message":"environment production (release build): JSON Lines logs"}
+{"time":"2026-10-30T07:05:19.443Z","level":"warn","scope":"anole","message":"built with ReleaseFast: Zig's safety checks are off, so a bug that ReleaseSafe would stop at the faulty line can corrupt memory instead; ReleaseSafe is the recommended build for production"}
+{"time":"2026-10-30T07:05:19.444Z","level":"info","scope":"anole","message":"listening on http://0.0.0.0:8080 (HTTP/1.1, HTTP/2 cleartext)"}
+{"time":"2026-10-30T07:05:19.444Z","level":"info","scope":"anole","message":"console: `anole console anole-bench` attaches (socket /run/anole/anole-bench.1.sock)"}

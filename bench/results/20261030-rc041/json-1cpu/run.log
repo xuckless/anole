@@ -1,0 +1,10 @@
+02:35:27 uring json v0.3.1 r1: 237,140/s, p50 1.06 ms, p99 1.22 ms, errors 0, mem 9 MB
+02:37:07 uring json 0.4.1-rc r1: 231,758/s, p50 1.10 ms, p99 1.24 ms, errors 0, mem 9 MB
+02:38:48 uring json 0.4.1-rc r2: 240,339/s, p50 1.05 ms, p99 1.20 ms, errors 0, mem 9 MB
+02:40:28 uring json v0.3.1 r2: 234,000/s, p50 1.09 ms, p99 1.20 ms, errors 0, mem 8 MB
+02:42:09 uring json v0.3.1 r3: 235,780/s, p50 1.08 ms, p99 1.21 ms, errors 0, mem 8 MB
+02:43:49 uring json 0.4.1-rc r3: 232,670/s, p50 1.09 ms, p99 1.22 ms, errors 0, mem 9 MB
+02:45:30 uring json 0.4.1-rc r4: 234,672/s, p50 1.09 ms, p99 1.22 ms, errors 0, mem 8 MB
+02:47:10 uring json v0.3.1 r4: 231,826/s, p50 1.10 ms, p99 1.21 ms, errors 0, mem 9 MB
+02:48:51 uring json v0.3.1 r5: 237,659/s, p50 1.08 ms, p99 1.19 ms, errors 0, mem 10 MB
+02:50:32 uring json 0.4.1-rc r5: 238,704/s, p50 1.05 ms, p99 1.20 ms, errors 0, mem 9 MB

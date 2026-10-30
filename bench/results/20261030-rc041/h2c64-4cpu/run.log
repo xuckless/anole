@@ -1,0 +1,10 @@
+02:52:39 uring h2c64 v0.3.1 r1: 1,757,141/s, p50 8.32 ms, p99 18.75 ms, errors 0, mem 110 MB
+02:54:46 uring h2c64 0.4.1-rc r1: 1,722,226/s, p50 8.30 ms, p99 19.65 ms, errors 0, mem 118 MB
+02:56:52 uring h2c64 0.4.1-rc r2: 1,754,448/s, p50 8.41 ms, p99 19.83 ms, errors 0, mem 106 MB
+02:58:59 uring h2c64 v0.3.1 r2: 1,758,236/s, p50 8.04 ms, p99 20.98 ms, errors 0, mem 113 MB
+03:01:04 uring h2c64 v0.3.1 r3: 1,679,522/s, p50 9.11 ms, p99 21.31 ms, errors 0, mem 106 MB
+03:03:11 uring h2c64 0.4.1-rc r3: 1,806,776/s, p50 7.72 ms, p99 21.32 ms, errors 0, mem 109 MB
+03:05:19 uring h2c64 0.4.1-rc r4: 1,814,898/s, p50 7.84 ms, p99 20.53 ms, errors 0, mem 106 MB
+03:07:25 uring h2c64 v0.3.1 r4: 1,778,955/s, p50 7.96 ms, p99 21.79 ms, errors 0, mem 108 MB
+03:09:32 uring h2c64 v0.3.1 r5: 1,779,255/s, p50 8.23 ms, p99 21.97 ms, errors 0, mem 111 MB
+03:11:39 uring h2c64 0.4.1-rc r5: 1,833,747/s, p50 7.64 ms, p99 21.72 ms, errors 0, mem 107 MB

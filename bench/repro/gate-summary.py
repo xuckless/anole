@@ -40,7 +40,7 @@ def one(d):
 def table(out):
     sides = [l.split("=", 1)[0] for l in open(os.path.join(out, "sides.txt")).read().split()]
     f = lambda v, p=0: "–" if v is None else f"{v:,.{p}f}"
-    rows = ["| backend | case | side | req/s | vs " + sides[0] + " | p50 ms | p99 ms | mem MB | runs |", "|---|---|---|---|---|---|---|---|---|"]
+    rows = ["| backend | case | side | req/s | vs " + sides[0] + " | p50 ms | p99 ms | µs CPU/req | mem MB | runs |", "|---|---|---|---|---|---|---|---|---|---|"]
     for be in ("epoll", "uring"):
         for case in ("plain", "json", "h2c", "h2c64", "h3", "asyncdb", "wsecho"):
             base = None
@@ -54,7 +54,7 @@ def table(out):
                     base = rps
                 rel = f"{rps / base:.3f}" if base and rps else "–"
                 runs_s = " / ".join(f"{x.get('rps', 0) / 1000:.1f}k" for x in runs)
-                rows.append(f"| {be} | {case} | {side} | {f(rps)} | {rel} | {f(g('p50_ms'), 2)} | {f(g('p99_ms'), 2)} | {f(g('mem_peak_mb'))} | {runs_s} |")
+                rows.append(f"| {be} | {case} | {side} | {f(rps)} | {rel} | {f(g('p50_ms'), 2)} | {f(g('p99_ms'), 2)} | {f(g('cpu_us_per_req'), 3)} | {f(g('mem_peak_mb'))} | {runs_s} |")
     print("Medians per side; h2c and h3 percentiles from h2load's per-request log, wsecho from its RTT samples.\n")
     print("\n".join(rows))
 
