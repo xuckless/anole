@@ -1215,10 +1215,13 @@ test "sqlite: migrate rolls back a failing migration with its record, and keeps 
     var s: Scratch = undefined;
     s.init(testing.io);
     defer s.deinit();
-    const broken = [_]anole_db.Migration{ migrations[0], .{ .version = 2, .name = "tags", .sql =
-    \\CREATE TABLE tags (note INTEGER NOT NULL, tag TEXT NOT NULL);
-    \\INSERT INTO missing VALUES (1);
-    } };
+    const broken = [_]anole_db.Migration{
+        migrations[0],
+        .{ .version = 2, .name = "tags", .sql =
+        \\CREATE TABLE tags (note INTEGER NOT NULL, tag TEXT NOT NULL);
+        \\INSERT INTO missing VALUES (1);
+        },
+    };
     {
         const level = quiet();
         defer testing.log_level = level;

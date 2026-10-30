@@ -1023,10 +1023,13 @@ test "pg: live migrate runs each migration once, in a transaction with its recor
         \\CREATE INDEX anole_pg_mig_tags_note ON anole_pg_mig_tags (note);
         },
     };
-    const broken = [_]db.Migration{ good[0], .{ .version = 2, .name = "tags", .sql =
-    \\CREATE TABLE anole_pg_mig_tags (note bigint NOT NULL);
-    \\INSERT INTO anole_pg_mig_missing VALUES (1);
-    } };
+    const broken = [_]db.Migration{
+        good[0],
+        .{ .version = 2, .name = "tags", .sql =
+        \\CREATE TABLE anole_pg_mig_tags (note bigint NOT NULL);
+        \\INSERT INTO anole_pg_mig_missing VALUES (1);
+        },
+    };
     {
         const level = quiet();
         defer testing.log_level = level;
