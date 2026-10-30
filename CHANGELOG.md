@@ -254,6 +254,29 @@ breaking changes are listed anyway.
   was encoded from a part list that pointed into a returned function's
   stack, so the answer could carry garbage or crash; it now lives in the
   sink. Seen as a crash in ReleaseSafe test builds.
+- Redis, SQLite: a connection from `acquire()` released twice is given
+  back once; the second `release()` does nothing but log. Redis handed the
+  connection to two later callers at once, and SQLite rolled back the
+  next holder's transaction and let the writer go under it. A SQLite
+  transaction or `iterate()` rows ended through a copy of the value, then
+  `deinit` on the original, likewise does nothing but log.
+- MongoDB: closing the client, or a server leaving the topology, stops
+  that server's monitor by cancellation; nothing outside the monitor
+  touches its connection any more, which could be shut down after the
+  monitor had freed it. A server joining the topology starts its monitor
+  outside the topology lock.
+- Readiness (`/readyz`): a ping canceled with its request no longer
+  swallows the cancel (the request's task went on uncancelable) and is not
+  kept as "not ready" (for 30 s with SMTP); probes while a ping runs
+  answer with the last result instead of waiting for it.
+- SMTP: closing idle connections allocates nothing and never sends QUIT
+  under the pool lock.
+- SQLite: a `begin(req)` canceled (or timed out) while its BEGIN ran, and
+  a `tx.rollback(req)` on a canceled request or past its deadline, gave
+  the connection back with the transaction open, so the next call on the
+  writer failed with "cannot start a transaction within a transaction" or
+  had its own work rolled back. Both roll back first now, as `tx.deinit()`
+  does; `rollback` fails only on a transaction that is over.
 
 ### Changed
 
@@ -397,6 +420,11 @@ breaking changes are listed anyway.
   executor thread, so a task taking one while another task on its executor
   is suspended holding one no longer panics, and releasing one is checked
   against the task that took it.
+- `anole.db.Readiness.ping` returns `std.Io.Cancelable!bool`: a ping
+  returns `error.Canceled` when its caller was canceled (no answer is kept
+  then), `false` for any other failure. The SQLite writer is checked out by
+  one call, transaction or `acquire` at a time with no order among the
+  waiters (docs said "in arrival order", which it never was).
 
 ## 0.4.0 (2026-10-25)
 

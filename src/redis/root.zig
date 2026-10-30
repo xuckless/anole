@@ -81,6 +81,7 @@
 const std = @import("std");
 const features = @import("build_options");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const hiredis = @import("anole_hiredis_c");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
@@ -321,15 +322,22 @@ pub var test_after_take: if (builtin.is_test) ?*const fn (*ClientStream) void el
 
 /// The pool of one executor: idle connections, and how many are open.
 const Pool = struct {
-    mutex: std.Io.Mutex = .init,
+    mutex: safety.Mutex(.leaf) = .init,
     /// Signalled when a connection goes back, or a place frees up.
-    returned: std.Io.Condition = .init,
+    returned: safety.Condition = .init,
     /// `max` slots; the first `idle_len` hold idle connections.
     idle: []*Connection,
     idle_len: usize = 0,
-    /// Idle and in use.
+    /// Idle, in use, being opened or being closed.
     open: usize = 0,
     max: usize,
+    /// `max` slots; the first `spare_len` hold the memory of closed
+    /// connections, which the next dial reuses. A pooled `Connection` is
+    /// freed only in `deinit` (process-wide, M2): a `Conn` from an earlier
+    /// checkout reads a lease, never freed memory (M6). Every one is
+    /// counted in `open` or here, so there are `max` at most.
+    spare: []*Connection,
+    spare_len: usize = 0,
 };
 
 /// One connection to the server, and its RESP parser.
@@ -337,7 +345,7 @@ const Connection = struct {
     gpa: std.mem.Allocator,
     stream: *ClientStream,
     parser: *hiredis.redisReader,
-    /// Null for a subscriber's.
+    /// Null for a subscriber's. Set once, when the memory is made.
     pool: ?*Pool,
     idle_since: std.Io.Clock.Timestamp = undefined,
     state: State = .{},
@@ -350,6 +358,10 @@ const Connection = struct {
     /// `stream.bytesSent()` when it was taken: unchanged after a failure,
     /// nothing of the call reached the server.
     sent: u64 = 0,
+    /// Bumped by every give-back, under its pool's `mutex`: a `Conn` from
+    /// an earlier checkout gives nothing back (SAFETY.md M6, as pgxpool's
+    /// idempotent `Release`). Read without the lock only by its holder.
+    lease: u32 = 0,
 
     /// What the commands sent so far have left on the connection.
     const State = struct {
@@ -406,9 +418,16 @@ const Connection = struct {
         }
     }
 
-    fn close(self: *Connection) void {
+    /// Closes the socket and the parser; the memory stays.
+    fn shut(self: *Connection) void {
         hiredis.redisReaderFree(self.parser);
         self.stream.close();
+    }
+
+    /// Closes it and frees its memory: a subscriber's, or a pooled one in
+    /// `deinit`.
+    fn close(self: *Connection) void {
+        self.shut();
         self.gpa.destroy(self);
     }
 };
@@ -448,7 +467,9 @@ pub const Client = struct {
     /// The one SUBSCRIBE connection of this client's `anole.watch`es, made
     /// on first use (`_pubsubHub`).
     pubsub_hub: ?*PubSubHub = null,
-    pubsub_hub_mutex: std.Io.Mutex = .init,
+    /// Init-once guard of `pubsub_hub`: held only to read it or make it
+    /// (an allocation).
+    pubsub_hub_mutex: safety.Mutex(.leaf) = .init,
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.redis` calls it.
@@ -481,7 +502,7 @@ pub const Client = struct {
             .errors = opts.errors,
             .guard = try .init(.redis, name, opts.breaker, opts.retry),
             .observer = .{ .system = .redis, .name = name },
-            .readiness = .{ .io = io, .context = self, .ping = ping },
+            .readiness = .{ .io = io, .context = safety.toCtx(self), .ping = ping },
             .acquire_timeout = opts.acquire_timeout,
             .connect_timeout = opts.connect_timeout,
             .idle_timeout = opts.idle_timeout,
@@ -540,12 +561,17 @@ pub const Client = struct {
         self.pools = try .init(gpa, io);
         var made: usize = 0;
         errdefer {
-            for (self.pools.pools[0..made]) |*p| gpa.free(p.idle);
+            for (self.pools.pools[0..made]) |*p| {
+                gpa.free(p.idle);
+                gpa.free(p.spare);
+            }
             self.pools.deinit(gpa);
         }
         for (self.pools.pools, 0..) |*p, i| {
             const max = self.pools.share(total, i);
-            p.* = .{ .idle = try gpa.alloc(*Connection, max), .max = max };
+            const idle = try gpa.alloc(*Connection, max);
+            errdefer gpa.free(idle);
+            p.* = .{ .idle = idle, .spare = try gpa.alloc(*Connection, max), .max = max };
             made += 1;
         }
         log.info("redis \"{s}\": {f}, up to {d} connections over {d} executors", .{ self.name, s, @max(total, executors), executors });
@@ -563,8 +589,10 @@ pub const Client = struct {
         self.guard.deinit();
         for (self.pools.pools) |*p| {
             for (p.idle[0..p.idle_len]) |conn| conn.close();
+            for (p.spare[0..p.spare_len]) |conn| gpa.destroy(conn);
             if (p.open > p.idle_len) log.warn("redis \"{s}\": {d} connections were still taken at deinit", .{ self.name, p.open - p.idle_len });
             gpa.free(p.idle);
+            gpa.free(p.spare);
         }
         self.pools.deinit(gpa);
         self.arena.deinit();
@@ -648,7 +676,7 @@ pub const Client = struct {
     pub fn acquire(self: *Client, c: anytype) Error!Conn {
         const ctx = erase(c);
         const conn = self.take(&ctx) catch |err| return self.narrow(&ctx, err);
-        return .{ .client = self, .conn = conn };
+        return .{ .client = self, .conn = conn, .lease = conn.lease };
     }
 
     /// The shared SUBSCRIBE connection of `anole.watch` (internal): one per
@@ -686,7 +714,11 @@ pub const Client = struct {
         var b = Builder.init(ctx.arena) catch return error.OutOfMemory;
         b.add(.{ verb, names }) catch |err| return self.narrow(&ctx, err);
         const batch = b.finish();
-        const conn = self.dial(&ctx, null) catch |err| return self.narrow(&ctx, err);
+        const slot = newSlot(self.gpa, null) catch return error.OutOfMemory;
+        const conn = self.dial(&ctx, slot) catch |err| {
+            self.gpa.destroy(slot);
+            return self.narrow(&ctx, err);
+        };
         const sub = self.gpa.create(Subscriber) catch {
             conn.close();
             return error.OutOfMemory;
@@ -710,9 +742,10 @@ pub const Client = struct {
     }
 
     /// True when the server answers PING within `ping_timeout`: `/readyz`'s
-    /// check. Its failures are not logged.
-    fn ping(context: *anyopaque, io: std.Io) bool {
-        const self: *Client = @ptrCast(@alignCast(context));
+    /// check. Its failures are not logged; a cancel of the caller is
+    /// `error.Canceled` (`db.Readiness` keeps no answer then).
+    fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
+        const self = safety.fromCtx(Client, context);
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         const quiet: Ctx = .{ .io = io, .arena = arena.allocator(), .any = self, .record = keep, .last = noLast, .request = null };
@@ -720,7 +753,10 @@ pub const Client = struct {
         b.add(.{"PING"}) catch return false;
         const batch = b.finish();
         // Not a call of the app's: no metrics, no span.
-        const replies = self.bounded(&quiet, self.ping_timeout, null, &batch) catch return false;
+        const replies = self.bounded(&quiet, self.ping_timeout, null, &batch) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return false,
+        };
         return replies[0] == .status;
     }
 
@@ -922,10 +958,9 @@ pub const Client = struct {
                 pool.idle_len -= 1;
                 const conn = pool.idle[pool.idle_len];
                 if (self.expired(conn, io)) {
-                    pool.open -= 1;
                     pool.mutex.unlock(io);
                     self.observer.connections(-1, 0);
-                    conn.close();
+                    self.retire(conn);
                     pool.mutex.lockUncancelable(io);
                     continue;
                 }
@@ -937,9 +972,22 @@ pub const Client = struct {
             }
             if (pool.open < pool.max) {
                 pool.open += 1;
+                const spare: ?*Connection = if (pool.spare_len > 0) blk: {
+                    pool.spare_len -= 1;
+                    break :blk pool.spare[pool.spare_len];
+                } else null;
                 pool.mutex.unlock(io);
-                const conn = self.dial(ctx, pool) catch |err| {
+                const slot = spare orelse newSlot(self.gpa, pool) catch |err| {
                     pool.mutex.lockUncancelable(io);
+                    pool.open -= 1;
+                    pool.returned.signal(io);
+                    pool.mutex.unlock(io);
+                    return err;
+                };
+                const conn = self.dial(ctx, slot) catch |err| {
+                    pool.mutex.lockUncancelable(io);
+                    pool.spare[pool.spare_len] = slot;
+                    pool.spare_len += 1;
                     pool.open -= 1;
                     pool.returned.signal(io);
                     pool.mutex.unlock(io);
@@ -985,11 +1033,9 @@ pub const Client = struct {
                 }
                 pool.idle_len -= 1;
                 const conn = pool.idle[pool.idle_len];
-                pool.open -= 1;
-                pool.returned.signal(io);
                 pool.mutex.unlock(io);
                 self.observer.connections(-1, 0);
-                conn.close();
+                self.retire(conn);
             }
         }
     }
@@ -999,22 +1045,34 @@ pub const Client = struct {
         return conn.idle_since.durationTo(.now(io, .awake)).raw.nanoseconds > limit.nanoseconds;
     }
 
-    /// Gives a connection back to its pool, or closes it when it is broken
-    /// or left in a state the next call must not inherit.
+    /// Gives a connection the caller holds back to its pool, or closes it
+    /// when it is broken or left in a state the next call must not inherit.
     fn give(self: *Client, conn: *Connection) void {
+        self.giveLease(conn, conn.lease);
+    }
+
+    /// `give`, when `lease` is the checkout that holds `conn` now; a lease
+    /// given back already (a second `release`, or one after the connection
+    /// was taken again) gives nothing back and logs.
+    fn giveLease(self: *Client, conn: *Connection, lease: u32) void {
         const io = self.io;
         const pool = conn.pool.?;
+        pool.mutex.lockUncancelable(io);
+        if (conn.lease != lease) {
+            pool.mutex.unlock(io);
+            log.err("redis \"{s}\": a connection from acquire() was released twice; the second release did nothing", .{self.name});
+            return;
+        }
+        conn.lease +%= 1;
+        // Read after the lease check: the connection is still this
+        // caller's, no one else's.
         if (!conn.reusable()) {
-            conn.close();
-            pool.mutex.lockUncancelable(io);
-            pool.open -= 1;
-            pool.returned.signal(io);
             pool.mutex.unlock(io);
             self.observer.connections(0, -1);
+            self.retire(conn);
             return;
         }
         conn.idle_since = .now(io, .awake);
-        pool.mutex.lockUncancelable(io);
         pool.idle[pool.idle_len] = conn;
         pool.idle_len += 1;
         pool.returned.signal(io);
@@ -1022,11 +1080,37 @@ pub const Client = struct {
         self.observer.connections(1, -1);
     }
 
-    /// Opens a connection and logs in, within `connect_timeout`.
-    fn dial(self: *Client, ctx: *const Ctx, pool: ?*Pool) anyerror!*Connection {
+    /// Closes a pooled connection no one holds, which still counts in its
+    /// pool's `open`, and frees its place. Its memory stays in the pool as a
+    /// spare until `deinit` (see `Pool.spare`).
+    fn retire(self: *Client, conn: *Connection) void {
+        const io = self.io;
+        const pool = conn.pool.?;
+        conn.shut();
+        pool.mutex.lockUncancelable(io);
+        pool.spare[pool.spare_len] = conn;
+        pool.spare_len += 1;
+        pool.open -= 1;
+        pool.returned.signal(io);
+        pool.mutex.unlock(io);
+    }
+
+    /// The memory of a new connection of `pool` (null: a subscriber's),
+    /// with its pool and its first lease set; `open` fills in the rest.
+    fn newSlot(gpa: std.mem.Allocator, pool: ?*Pool) error{OutOfMemory}!*Connection {
+        const conn = try gpa.create(Connection);
+        conn.pool = pool;
+        conn.lease = 0;
+        return conn;
+    }
+
+    /// Opens a connection into `slot` (from `newSlot` or a pool's spares)
+    /// and logs in, within `connect_timeout`. On a failure `slot` is the
+    /// caller's to keep or free.
+    fn dial(self: *Client, ctx: *const Ctx, slot: *Connection) anyerror!*Connection {
         const timeout: std.Io.Timeout = if (self.connect_timeout) |t| .{ .duration = .{ .raw = t, .clock = .awake } } else .none;
         const deadline: dusty.Deadline = .init(ctx.io, timeout);
-        return deadline.run(open, .{ self, ctx, pool }) catch |err| {
+        return deadline.run(open, .{ self, ctx, slot }) catch |err| {
             // Recorded already: the server refused the login.
             inline for (@typeInfo(db.Error).error_set.error_names.?) |name| {
                 if (err == @field(db.Error, name)) return err;
@@ -1039,16 +1123,23 @@ pub const Client = struct {
         };
     }
 
-    fn open(self: *Client, ctx: *const Ctx, pool: ?*Pool) anyerror!*Connection {
+    fn open(self: *Client, ctx: *const Ctx, slot: *Connection) anyerror!*Connection {
         const stream = try ClientStream.connect(self.gpa, ctx.io, self.stream_options);
         errdefer stream.close();
         const parser = hiredis.redisReaderCreate() orelse return error.OutOfMemory;
         errdefer hiredis.redisReaderFree(parser);
         // `convert` (and hiredis's freeReplyObject) recurse once per level.
         parser.*.maxdepth = max_reply_depth;
-        const conn = try self.gpa.create(Connection);
-        errdefer self.gpa.destroy(conn);
-        conn.* = .{ .gpa = self.gpa, .stream = stream, .parser = parser, .pool = pool };
+        const conn = slot;
+        // Field by field: `pool` and `lease` stay, and a stale `Conn` may
+        // read the lease (under the pool's lock) meanwhile.
+        conn.gpa = self.gpa;
+        conn.stream = stream;
+        conn.parser = parser;
+        conn.state = .{};
+        conn.broken = false;
+        conn.reused = false;
+        conn.sent = 0;
         if (self.login.count > 0) {
             const replies = conn.transfer(ctx.arena, &self.login) catch |err| return switch (err) {
                 error.ReadFailed => stream.readError() orelse err,
@@ -1294,11 +1385,15 @@ fn rest(args: anytype) Rest(@TypeOf(args)) {
 pub const Conn = struct {
     client: *Client,
     conn: *Connection,
+    /// `conn.lease` when it was acquired.
+    lease: u32,
 
     /// Gives the connection back; one left inside MULTI or WATCH, on
-    /// another database or subscribed, or broken, is closed instead.
+    /// another database or subscribed, or broken, is closed instead. A
+    /// second call does nothing (it logs). Don't call anything on it after
+    /// `release`.
     pub fn release(self: *const Conn) void {
-        self.client.give(self.conn);
+        self.client.giveLease(self.conn, self.lease);
     }
 
     /// `Client.command`, on this connection.
@@ -2277,6 +2372,10 @@ fn nested(comptime depth: usize) []const u8 {
 const Fake = struct {
     listener: std.Io.net.Server,
     accepted: std.atomic.Value(u32) = .init(0),
+    /// Sessions open now (+1 at accept, -1 when one ends), and the most
+    /// open at once.
+    live: std.atomic.Value(u32) = .init(0),
+    most_live: std.atomic.Value(u32) = .init(0),
     /// GETs and INCRs answered; while `shared_gate` is set to an event, a
     /// GET of "shared" waits for it first.
     gets: std.atomic.Value(u32) = .init(0),
@@ -2284,6 +2383,10 @@ const Fake = struct {
     incrs: std.atomic.Value(u32) = .init(0),
     /// "filled" is nil to GET until a SET of it.
     filled: std.atomic.Value(bool) = .init(false),
+    /// PINGs read; while `ping_gate` is set to an event, a PING waits for
+    /// it before the answer.
+    pings: std.atomic.Value(u32) = .init(0),
+    ping_gate: std.atomic.Value(?*std.Io.Event) = .init(null),
 
     fn port(self: *Fake) u16 {
         return self.listener.socket.address.getPort();
@@ -2293,13 +2396,23 @@ const Fake = struct {
         var group: std.Io.Group = .init;
         defer group.cancel(io);
         while (true) {
-            const conn = try self.listener.accept(io);
+            const conn = self.listener.accept(io) catch |err| switch (err) {
+                // A client that gave up before the accept: the next one is
+                // still served.
+                error.ConnectionAborted => continue,
+                else => return err,
+            };
             _ = self.accepted.fetchAdd(1, .monotonic);
-            group.concurrent(io, session, .{ self, conn, io }) catch conn.close(io);
+            _ = self.most_live.fetchMax(self.live.fetchAdd(1, .acq_rel) + 1, .acq_rel);
+            group.concurrent(io, session, .{ self, conn, io }) catch {
+                conn.close(io);
+                _ = self.live.fetchSub(1, .acq_rel);
+            };
         }
     }
 
     fn session(self: *Fake, conn: std.Io.net.Stream, io: std.Io) void {
+        defer _ = self.live.fetchSub(1, .acq_rel);
         defer conn.close(io);
         var rbuf: [4096]u8 = undefined;
         var wbuf: [4096]u8 = undefined;
@@ -2327,6 +2440,10 @@ const Fake = struct {
                 if (eql(u8, words[1][0..lens[1]], "shared")) if (self.shared_gate.load(.acquire)) |gate| gate.wait(io) catch return;
             }
             if (eql(u8, cmd, "INCR")) _ = self.incrs.fetchAdd(1, .monotonic);
+            if (eql(u8, cmd, "PING")) {
+                _ = self.pings.fetchAdd(1, .release);
+                if (self.ping_gate.load(.acquire)) |gate| gate.wait(io) catch return;
+            }
             const key = words[1][0..lens[1]];
             if (eql(u8, cmd, "SET") and eql(u8, key, "filled")) self.filled.store(true, .monotonic);
             const nil = eql(u8, key, "missing") or (eql(u8, key, "filled") and !self.filled.load(.monotonic));
@@ -2592,7 +2709,301 @@ test "redis: acquire runs its calls on one connection and gives it back" {
     conn.release();
     _ = try client.incr(&c, "n");
     try testing.expectEqual(@as(u32, 1), fake.accepted.load(.monotonic));
-    try testing.expect(Client.ping(client, io));
+    try testing.expect(try Client.ping(client, io));
+}
+
+test "redis: a connection released twice is never handed to two holders" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 2 });
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+
+    const first = try client.acquire(&c);
+    first.release();
+    // A second release of the same checkout gives nothing back.
+    first.release();
+    // Two holders at once: two connections, the second one dialed.
+    var x = try client.acquire(&c);
+    var y = try client.acquire(&c);
+    try testing.expect(x.conn != y.conn);
+    _ = try x.incr(&c, "n");
+    _ = try y.incr(&c, "n");
+    x.release();
+    y.release();
+}
+
+test "redis: a connection released twice after it broke reads no freed memory" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 1 });
+    defer client.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena_state.allocator() };
+
+    const first = try client.acquire(&c);
+    // Out of step with the server: the first release closes it.
+    first.conn.broken = true;
+    first.release();
+    // The second release finds the checkout over and gives nothing back.
+    first.release();
+    const pool = &client.pools.pools[0];
+    try testing.expectEqual(@as(usize, 0), pool.open);
+    // The one place is free: the next acquire dials and works.
+    var next = try client.acquire(&c);
+    _ = try next.incr(&c, "n");
+    next.release();
+    try testing.expectEqual(@as(usize, 1), pool.open);
+    try testing.expectEqual(@as(usize, 1), pool.idle_len);
+}
+
+/// A probe of `/readyz` on its own task: the task it runs on, the answer,
+/// and whether it ended.
+const ReadyProbe = struct {
+    task: std.atomic.Value(?dusty.placement.Task) = .init(null),
+    answer: ?bool = null,
+    ended: std.atomic.Value(bool) = .init(false),
+
+    /// `check`, then (`hold`) a wait an hour long that only a cancel ends.
+    fn run(p: *ReadyProbe, io: std.Io, client: *Client, hold: bool) std.Io.Cancelable!void {
+        defer p.ended.store(true, .release);
+        p.task.store(dusty.placement.currentTask(io), .release);
+        p.answer = db.Readiness.check(&client.readiness);
+        if (hold) try io.sleep(.fromSeconds(3600), .awake);
+    }
+
+    fn hasEnded(p: *ReadyProbe) bool {
+        return p.ended.load(.acquire);
+    }
+};
+
+fn pinged(fake: *Fake) bool {
+    return fake.pings.load(.acquire) >= 1;
+}
+
+test "redis: a readiness probe canceled mid-ping stays canceled" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const wait = @import("anole_test_wait");
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var gate: std.Io.Event = .unset;
+    fake.ping_gate.store(&gate, .release);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+    defer gate.set(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .ping_timeout = .fromSeconds(3600) });
+    defer client.deinit();
+
+    var probe: ReadyProbe = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, ReadyProbe.run, .{ &probe, io, client, true });
+    try wait.waitUntil(io, "the probe's PING at the server", &fake, pinged);
+    dusty.placement.cancelTask(probe.task.load(.acquire).?);
+    // The cancel ends the ping, and the probe's task stays canceled: its
+    // wait after the check ends at once.
+    try wait.waitUntil(io, "the canceled probe's task ended", &probe, ReadyProbe.hasEnded);
+}
+
+test "redis: a readiness probe canceled mid-ping leaves no answer behind" {
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const wait = @import("anole_test_wait");
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var gate: std.Io.Event = .unset;
+    fake.ping_gate.store(&gate, .release);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+    defer gate.set(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .ping_timeout = .fromSeconds(3600) });
+    defer client.deinit();
+    // An answer, once given, is kept for longer than any run of the test.
+    client.readiness.ttl = .fromSeconds(3600);
+
+    var probe: ReadyProbe = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, ReadyProbe.run, .{ &probe, io, client, false });
+    try wait.waitUntil(io, "the probe's PING at the server", &fake, pinged);
+    dusty.placement.cancelTask(probe.task.load(.acquire).?);
+    try wait.waitUntil(io, "the canceled probe's task ended", &probe, ReadyProbe.hasEnded);
+    // The server answers from now on: the next probe pings again and is
+    // ready, as nothing was kept from the canceled one.
+    gate.set(io);
+    try testing.expect(db.Readiness.check(&client.readiness));
+    try testing.expectEqual(@as(u32, 2), fake.pings.load(.monotonic));
+}
+
+/// One task's rounds of calls and checkouts on a shared client.
+const PoolStress = struct {
+    client: *Client,
+    io: std.Io,
+    /// Calls that failed or answered wrong: nothing breaks a connection
+    /// here, so any failure, a reply of the wrong type or a broken
+    /// connection, comes from two holders on one connection.
+    failures: std.atomic.Value(u32) = .init(0),
+
+    fn task(p: *PoolStress, seed: u64, rounds: usize) void {
+        var prng: std.Random.DefaultPrng = .init(seed);
+        const random = prng.random();
+        var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena_state.deinit();
+        var c: db.Ctx = .{ .io = p.io, .arena = arena_state.allocator() };
+        for (0..rounds) |_| {
+            _ = arena_state.reset(.retain_capacity);
+            switch (random.uintLessThan(u8, 3)) {
+                0 => if (p.client.incr(&c, "n")) |n| {
+                    if (n != 42) p.fail();
+                } else |err| p.failed(err),
+                1 => if (p.client.get(&c, "k")) |v| {
+                    if (v == null or !std.mem.eql(u8, v.?, "value")) p.fail();
+                } else |err| p.failed(err),
+                else => {
+                    var conn = p.client.acquire(&c) catch |err| {
+                        p.failed(err);
+                        continue;
+                    };
+                    if (conn.incr(&c, "n")) |n| {
+                        if (n != 42) p.fail();
+                    } else |err| p.failed(err);
+                    if (conn.get(&c, "k")) |v| {
+                        if (v == null or !std.mem.eql(u8, v.?, "value")) p.fail();
+                    } else |err| p.failed(err);
+                    conn.release();
+                    // A tenth released twice: the second does nothing.
+                    if (random.uintLessThan(u8, 10) == 0) conn.release();
+                },
+            }
+        }
+    }
+
+    fn failed(p: *PoolStress, err: anyerror) void {
+        std.debug.print("redis stress: {t}\n", .{err});
+        p.fail();
+    }
+
+    fn fail(p: *PoolStress) void {
+        _ = p.failures.fetchAdd(1, .monotonic);
+    }
+
+    /// Holds two connections of its executor's pool until `go`.
+    fn hold(p: *PoolStress, go: *std.Io.Event, held: *std.atomic.Value(u32)) void {
+        var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena_state.deinit();
+        var c: db.Ctx = .{ .io = p.io, .arena = arena_state.allocator() };
+        const a = p.client.acquire(&c) catch return p.fail();
+        defer a.release();
+        const b = p.client.acquire(&c) catch return p.fail();
+        defer b.release();
+        if (a.conn == b.conn) p.fail();
+        _ = held.fetchAdd(2, .acq_rel);
+        go.wait(p.io) catch {};
+    }
+};
+
+test "redis: [stress] calls, acquire and double release from four executors never share a connection" {
+    const wait = @import("anole_test_wait");
+    try wait.requireStress();
+    const zio = @import("zio");
+    const gpa = testing.allocator;
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
+    defer rt.deinit();
+    const io = rt.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fake: Fake = .{ .listener = try addr.listen(io, .{}) };
+    defer fake.listener.deinit(io);
+    var serving = try io.concurrent(Fake.serve, .{ &fake, io });
+    defer serving.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "redis://127.0.0.1:{d}", .{fake.port()});
+    const client = try Client.init(gpa, io, .{ .url = url, .environ = .empty, .max_connections = 8, .acquire_timeout = wait.deadline() });
+    defer client.deinit();
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    const seed: u64 = 0x5_2ed15;
+    errdefer std.debug.print("redis stress: seed 0x{x}\n", .{seed});
+    var p: PoolStress = .{ .client = client, .io = io };
+    {
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        for (0..16) |t| try dusty.placement.concurrent(&group, io, .{ .executor = t % 4 }, PoolStress.task, .{ &p, seed +% t, 400 });
+        try group.await(io);
+    }
+    try testing.expectEqual(@as(u32, 0), p.failures.load(.monotonic));
+    // No more sessions at the server than the pools' 8 at any time (none
+    // closes here, so a session ends only with the test).
+    try testing.expect(fake.most_live.load(.acquire) <= 8);
+    // Every connection came back once: each pool holds no more than its
+    // share, all of it idle.
+    for (client.pools.pools) |*pool| {
+        try testing.expect(pool.open <= pool.max);
+        try testing.expectEqual(pool.open, pool.idle_len);
+    }
+    // All 8 held at once, two per executor: none was lost to a count
+    // that drifted.
+    var go: std.Io.Event = .unset;
+    var held: std.atomic.Value(u32) = .init(0);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..4) |e| try dusty.placement.concurrent(&group, io, .{ .executor = e }, PoolStress.hold, .{ &p, &go, &held });
+    try wait.waitEqual(io, "8 connections held", &held, 8);
+    go.set(io);
+    try group.await(io);
+    try testing.expectEqual(@as(u32, 0), p.failures.load(.monotonic));
 }
 
 test "redis: a server that cannot be reached is a 503, and /readyz says so" {
@@ -2618,7 +3029,7 @@ test "redis: a server that cannot be reached is a 503, and /readyz says so" {
     defer testing.log_level = level;
     try testing.expectError(error.ServiceUnavailable, client.get(&c, "k"));
     try testing.expectStringStartsWith(db.lastError(&c).?.message, "cannot connect to redis://127.0.0.1:");
-    try testing.expect(!Client.ping(client, io));
+    try testing.expect(!try Client.ping(client, io));
 
     // A URL may not turn off the checks of a CA the code gives.
     if (has_tls) try testing.expectError(error.InvalidDatabaseUrl, Client.init(gpa, io, .{ .url = "rediss://cache.example.com?ssl_cert_reqs=none", .environ = .empty, .tls = .{ .ca = .system } }));

@@ -74,8 +74,6 @@ src/cron/zone.zig	U3	3
 src/db/cache.zig	U3	10
 src/db/copy.zig	U3	1
 src/db/internal.zig	U3	1
-src/db/observe.zig	L2	1
-src/db/observe.zig	U3	1
 src/errors.zig	U3	1
 src/grpc/client.zig	C3	1
 src/grpc/client.zig	L2	1
@@ -145,8 +143,7 @@ src/logging/root.zig	U3	3
 src/logging/value.zig	U3	1
 src/modes.zig	U3	4
 src/mongodb/change_stream.zig	U3	2
-src/mongodb/client.zig	L2	5
-src/mongodb/client.zig	U3	16
+src/mongodb/client.zig	U3	10
 src/mongodb/collection.zig	U3	4
 src/mongodb/fake_cs.zig	L2	1
 src/mongodb/fake_cs.zig	T1	2
@@ -196,12 +193,10 @@ src/observe/trace.zig	T1	1
 src/observe/trace.zig	U3	10
 src/panic.zig	U3	1
 src/pg/root.zig	C3	2
-src/pg/root.zig	L2	1
-src/pg/root.zig	U3	14
+src/pg/root.zig	U3	13
 src/ratelimit/root.zig	L2	1
 src/ratelimit/root.zig	T1	1
 src/ratelimit/root.zig	U3	2
-src/redis/root.zig	L2	3
 src/resilience/core.zig	L2	1
 src/resilience/core.zig	U3	2
 src/resilience/metrics.zig	L2	1
@@ -220,10 +215,8 @@ src/server.zig	L2	1
 src/server.zig	U3	19
 src/session/root.zig	L2	1
 src/session/root.zig	U3	10
-src/smtp/pool.zig	L2	2
-src/smtp/root.zig	U3	6
+src/smtp/root.zig	U3	5
 src/smtp/session.zig	U3	1
-src/sqlite/root.zig	L2	5
 src/sse/out.zig	L2	1
 src/sse/out.zig	U3	3
 src/sse/replay.zig	U3	7
