@@ -5,6 +5,13 @@ breaking changes are listed anyway.
 
 ## 0.4.1 (unreleased)
 
+### Added
+
+- `anole.db.migrate(db, c, migrations)` and `anole.db.Migration`: numbered
+  SQL migrations for PostgreSQL and SQLite. Each runs once, in its own
+  transaction with its record in `schema_migrations`; a failing one is
+  rolled back and the ones before it stay applied. See docs/database.md.
+
 ### Fixed
 
 - net: a UDP send racing the stop answers Closed instead of being dropped

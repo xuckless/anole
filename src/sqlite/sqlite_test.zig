@@ -1170,3 +1170,90 @@ test "sqlite: Options.timeout bounds a plain call and .max lifts it" {
     const small = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 100000) SELECT count(*) FROM n";
     try testing.expectEqual(@as(i64, 100000), try db.with(.{ .timeout = .max }).one(i64, ctx, small, .{}));
 }
+
+const migrations = [_]anole_db.Migration{
+    .{ .version = 1, .name = "notes", .sql = "CREATE TABLE notes (id INTEGER PRIMARY KEY, title TEXT NOT NULL);" },
+    .{ .version = 2, .name = "tags", .sql =
+    \\CREATE TABLE tags (note INTEGER NOT NULL REFERENCES notes (id), tag TEXT NOT NULL);
+    \\CREATE INDEX tags_note ON tags (note);
+    },
+};
+
+fn tableExists(db: *sqlite.Client, ctx: *anole_db.Ctx, name: []const u8) !bool {
+    return try db.one(i64, ctx, "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?", .{name}) == 1;
+}
+
+test "sqlite: migrate runs each migration once and records it, across opens of the file" {
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const path = tmp.file("app.db");
+    var s: Scratch = undefined;
+    s.init(testing.io);
+    defer s.deinit();
+    {
+        const db = try sqlite.Client.init(gpa, testing.io, .{ .path = path });
+        defer db.deinit();
+        try testing.expectEqual(@as(usize, 1), try anole_db.migrate(db, &s.ctx, migrations[0..1]));
+        try testing.expectEqual(@as(usize, 1), try anole_db.migrate(db, &s.ctx, &migrations));
+        try testing.expectEqual(@as(usize, 0), try anole_db.migrate(db, &s.ctx, &migrations));
+    }
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = path });
+    defer db.deinit();
+    try testing.expectEqual(@as(usize, 0), try anole_db.migrate(db, &s.ctx, &migrations));
+    const Applied = struct { version: i64, name: []const u8, applied_at: i64 };
+    const rows = try db.all(Applied, &s.ctx, "SELECT version, name, applied_at FROM schema_migrations ORDER BY version", .{});
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expectEqualStrings("notes", rows[0].name);
+    try testing.expectEqualStrings("tags", rows[1].name);
+    try testing.expect(rows[1].applied_at > 0);
+    try testing.expect(try tableExists(db, &s.ctx, "tags"));
+}
+
+test "sqlite: migrate rolls back a failing migration with its record, and keeps the ones before it" {
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = "sqlite::memory:" });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(testing.io);
+    defer s.deinit();
+    const broken = [_]anole_db.Migration{ migrations[0], .{ .version = 2, .name = "tags", .sql =
+    \\CREATE TABLE tags (note INTEGER NOT NULL, tag TEXT NOT NULL);
+    \\INSERT INTO missing VALUES (1);
+    } };
+    {
+        const level = quiet();
+        defer testing.log_level = level;
+        try testing.expectError(error.Database, anole_db.migrate(db, &s.ctx, &broken));
+    }
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, &s.ctx, "SELECT max(version) FROM schema_migrations", .{}));
+    try testing.expect(!try tableExists(db, &s.ctx, "tags"));
+    // Fixed, it runs.
+    try testing.expectEqual(@as(usize, 1), try anole_db.migrate(db, &s.ctx, &migrations));
+    try testing.expect(try tableExists(db, &s.ctx, "tags"));
+}
+
+test "sqlite: migrate refuses versions that do not increase from 1, before running any" {
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = "sqlite::memory:" });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(testing.io);
+    defer s.deinit();
+    const level = quiet();
+    defer testing.log_level = level;
+    try testing.expectError(error.MigrationsOutOfOrder, anole_db.migrate(db, &s.ctx, &.{ migrations[1], migrations[0] }));
+    try testing.expectError(error.MigrationsOutOfOrder, anole_db.migrate(db, &s.ctx, &.{ migrations[0], migrations[0] }));
+    try testing.expectError(error.MigrationsOutOfOrder, anole_db.migrate(db, &s.ctx, &.{.{ .version = 0, .name = "zero", .sql = "SELECT 1;" }}));
+    try testing.expect(!try tableExists(db, &s.ctx, "schema_migrations"));
+}
+
+test "sqlite: migrate runs a migration below the latest applied when it is not recorded" {
+    const db = try sqlite.Client.init(gpa, testing.io, .{ .path = "sqlite::memory:" });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(testing.io);
+    defer s.deinit();
+    const later = [_]anole_db.Migration{.{ .version = 5, .name = "users", .sql = "CREATE TABLE users (id INTEGER PRIMARY KEY);" }};
+    try testing.expectEqual(@as(usize, 1), try anole_db.migrate(db, &s.ctx, &later));
+    const merged = [_]anole_db.Migration{ migrations[0], later[0] };
+    try testing.expectEqual(@as(usize, 1), try anole_db.migrate(db, &s.ctx, &merged));
+    try testing.expect(try tableExists(db, &s.ctx, "notes"));
+}

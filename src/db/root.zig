@@ -274,6 +274,14 @@ pub const CacheOptions = @import("cache.zig").Options;
 /// `QueryCache.read` names its own as `pub const shape`.
 pub const ReadShape = @import("cache.zig").Shape;
 
+/// One numbered SQL migration for `migrate`.
+pub const Migration = @import("migrate.zig").Migration;
+/// Runs the migrations a PostgreSQL or SQLite database has not recorded,
+/// each once and in its own transaction, and returns how many ran:
+/// `_ = try anole.db.migrate(state.db, &ctx, &migrations)`. See
+/// src/db/migrate.zig.
+pub const migrate = @import("migrate.zig").migrate;
+
 /// How `begin` and `transaction` open a transaction.
 pub const TxOptions = struct {
     /// Null: the database's default.
