@@ -100,6 +100,8 @@ const Rig = struct {
         concurrency: u8 = 2,
         /// The storage's `retry.attempts`.
         attempts: u8 = 1,
+        /// The engine's `executors` (1: every transfer in one slot table).
+        executors: u8 = 2,
     };
 
     fn start(r: *Rig, route: bool) !void {
@@ -115,7 +117,7 @@ const Rig = struct {
         var inline_buf: [48]u8 = undefined;
         const inline_max = if (t.inline_body_max == 0) "" else try std.fmt.bufPrint(&inline_buf, ", \"inline_body_max\": {d}", .{t.inline_body_max});
         r.json = try std.fmt.allocPrint(alloc,
-            \\{{"executors": 2, "timeouts": {{"shutdown_ms": 200}},
+            \\{{"executors": {d}, "timeouts": {{"shutdown_ms": 200}},
             \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
             \\ "limits": {{"body_max": 33554432{s}}},
             \\ "routes": [{s}],
@@ -123,6 +125,7 @@ const Rig = struct {
             \\   "access_key_id": "{s}", "secret_access_key": "{s}", "part_size": 5242880, "concurrency": {d}}},
             \\   "retry": {{"attempts": {d}, "base_ms": 1}}}}]}}
         , .{
+            t.executors,
             inline_max,
             if (route) "{\"path\": \"/f/obj\", \"handler\": 1, \"timeout_ms\": 20000}, {\"path\": \"/f/up\", \"method\": \"POST\", \"handler\": 1, \"timeout_ms\": 20000}" else "",
             r.fake.url(),
@@ -657,6 +660,203 @@ test "capi s3: put_body stores the whole inline body when the client resets the 
     const rep = try r.ev.result(31);
     try std.testing.expectEqual(abi.OK, rep.status);
     try std.testing.expectEqualSlices(u8, body, r.fake.getObject("b", "posted.bin").?);
+}
+
+/// A transfer call on a thread of its own, parked by
+/// `s3.test_transfer_hold` after it found its transfer and before the
+/// slot's lock.
+const Parked = struct {
+    const Op = enum { write, finish, release, read_more };
+    e: *engine.Engine,
+    handle: u64,
+    op: Op,
+    /// The call's error (null: it returned OK).
+    result: ?anyerror = null,
+
+    /// What the parked write carries.
+    const bytes = "bytes written to the first upload";
+
+    fn run(p: *Parked) void {
+        const res: anyerror!void = switch (p.op) {
+            .write => if (engine.s3.uploadWrite(p.e, p.handle, bytes, 0)) |_| {} else |err| err,
+            .finish => engine.s3.uploadFinish(p.e, p.handle, 77),
+            .release => engine.s3.release(p.e, p.handle),
+            .read_more => engine.s3.readMore(p.e, p.handle, 64 * 1024),
+        };
+        res catch |err| {
+            p.result = err;
+        };
+    }
+};
+
+/// Whether transfer `h` is over (its slot freed): a call of the other
+/// kind answers GONE instead of WrongKind.
+const TransferGone = struct {
+    e: *engine.Engine,
+    h: u64,
+    upload: bool,
+
+    fn gone(g: TransferGone) bool {
+        if (g.upload) {
+            engine.s3.readMore(g.e, g.h, 0) catch |err| return err == error.Gone;
+        } else {
+            _ = engine.s3.uploadWrite(g.e, g.h, "", 0) catch |err| return err == error.Gone;
+        }
+        return false;
+    }
+};
+
+fn sameSlot(a: u64, b: u64) bool {
+    const ha: engine.Handle = .decode(a);
+    const hb: engine.Handle = .decode(b);
+    return ha.exec == hb.exec and ha.slot == hb.slot and ha.gen != hb.gen;
+}
+
+/// A push upload's call held between finding upload A and taking its
+/// slot's lock, while A ends and upload B takes the slot.
+fn uploadSlotRace(op: Parked.Op) !void {
+    var r: Rig = undefined;
+    try r.startWith(false, .{ .executors = 1 });
+    defer r.deinit();
+    const tio = engine.threadedIo();
+    try engine.s3.uploadOpen(r.store(), r.c, .of("a.bin"), .{}, 1);
+    const ra = try r.ev.result(1);
+    try std.testing.expectEqual(abi.OK, ra.status);
+    const a = ra.ev.handle;
+
+    var pin: engine.TestPin = .{};
+    var p: Parked = .{ .e = r.e, .handle = a, .op = op };
+    engine.s3.test_transfer_hold.store(&pin, .release);
+    defer engine.s3.test_transfer_hold.store(null, .release);
+    var th: ?std.Thread = try std.Thread.spawn(.{}, Parked.run, .{&p});
+    defer if (th) |t| {
+        pin.release.store(true, .release);
+        t.join();
+    };
+    try wait.waitFlag(tio, "the transfer call holds before the slot's lock", &pin.held);
+
+    // A ends on the executor (released, or finished when the held call is
+    // the release) and its slot goes back to the table.
+    if (op == .release) {
+        try engine.s3.uploadFinish(r.e, a, 2);
+        try std.testing.expectEqual(abi.OK, (try r.ev.result(2)).status);
+    } else {
+        try engine.s3.release(r.e, a);
+    }
+    try wait.waitUntil(tio, "upload A's slot is freed", TransferGone{ .e = r.e, .h = a, .upload = true }, TransferGone.gone);
+    // B takes the slot (the free list is LIFO, one executor).
+    try engine.s3.uploadOpen(r.store(), r.c, .of("b.bin"), .{}, 3);
+    const rb = try r.ev.result(3);
+    try std.testing.expectEqual(abi.OK, rb.status);
+    const b = rb.ev.handle;
+    try std.testing.expect(sameSlot(a, b));
+
+    pin.release.store(true, .release);
+    th.?.join();
+    th = null;
+
+    // B holds its own bytes alone, finished by its own call.
+    try std.testing.expect(!try engine.s3.uploadWrite(r.e, b, "B", 0));
+    try engine.s3.uploadFinish(r.e, b, 4);
+    const fin = try r.ev.result(4);
+    try std.testing.expectEqual(abi.OK, fin.status);
+    try std.testing.expectEqual(abi.S3_OP_UPLOAD_FINISH, fin.op);
+    try std.testing.expectEqualStrings("B", r.fake.getObject("b", "b.bin").?);
+    // The held call found its transfer over.
+    try std.testing.expectEqual(@as(?anyerror, if (op == .release) error.Over else error.Gone), p.result);
+}
+
+test "capi s3: an upload write held while its upload ends answers GONE and writes nothing into the next upload in the slot" {
+    if (comptime !features.s3) return error.SkipZigTest;
+    try uploadSlotRace(.write);
+}
+
+test "capi s3: an upload finish held while its upload ends answers GONE and does not finish the next upload in the slot" {
+    if (comptime !features.s3) return error.SkipZigTest;
+    try uploadSlotRace(.finish);
+}
+
+test "capi s3: a release held while its upload ends is over and does not end the next upload in the slot" {
+    if (comptime !features.s3) return error.SkipZigTest;
+    try uploadSlotRace(.release);
+}
+
+/// The DATA bytes for `handle` so far, and whether its FIN came.
+fn dataOf(ev: *Events, handle: u64) struct { usize, bool } {
+    var n: usize = 0;
+    var fin = false;
+    for (ev.list.items) |rec| {
+        if (rec.typ != @backingInt(abi.EventType.s3_data) or rec.handle != handle) continue;
+        const d: *const abi.S3DataEvent = @ptrCast(@alignCast(rec.bytes.ptr));
+        n += d.data.len;
+        if (d.flags & abi.S3_DATA_F_FIN != 0) fin = true;
+    }
+    return .{ n, fin };
+}
+
+/// Polls until `handle` has `at_least` DATA bytes (or its FIN); what it has then.
+fn waitData(ev: *Events, handle: u64, at_least: usize) !struct { usize, bool } {
+    const started = std.Io.Clock.awake.now(engine.threadedIo());
+    while (true) {
+        const n, const fin = dataOf(ev, handle);
+        if (n >= at_least or fin) return .{ n, fin };
+        if (pastDeadline(started, 15000)) return error.TimedOut;
+        try ev.pump(50);
+    }
+}
+
+test "capi s3: a read_more held while its download ends answers GONE and gives the next download in the slot no credit" {
+    if (comptime !features.s3) return error.SkipZigTest;
+    var r: Rig = undefined;
+    try r.startWith(false, .{ .executors = 1 });
+    defer r.deinit();
+    const tio = engine.threadedIo();
+    const window = 4096;
+    const obj = try alloc.alloc(u8, 3 * window);
+    defer alloc.free(obj);
+    pattern(obj, 4);
+    try r.fake.putObject("b", "a.bin", obj, "application/octet-stream");
+    try r.fake.putObject("b", "b.bin", obj, "application/octet-stream");
+
+    // Download A waits for credit after its window.
+    try engine.s3.get(r.store(), r.c, .of("a.bin"), .{ .flags = abi.S3_F_STREAM, .window = window }, 1, false);
+    const ra = try r.ev.result(1);
+    try std.testing.expectEqual(abi.OK, ra.status);
+    const a = ra.ev.handle;
+    try std.testing.expectEqual(@as(usize, window), (try waitData(&r.ev, a, window))[0]);
+
+    var pin: engine.TestPin = .{};
+    var p: Parked = .{ .e = r.e, .handle = a, .op = .read_more };
+    engine.s3.test_transfer_hold.store(&pin, .release);
+    defer engine.s3.test_transfer_hold.store(null, .release);
+    var th: ?std.Thread = try std.Thread.spawn(.{}, Parked.run, .{&p});
+    defer if (th) |t| {
+        pin.release.store(true, .release);
+        t.join();
+    };
+    try wait.waitFlag(tio, "the read_more holds before the slot's lock", &pin.held);
+
+    // A is released and its slot freed; B takes it and uses up its window.
+    try engine.s3.release(r.e, a);
+    try wait.waitUntil(tio, "download A's slot is freed", TransferGone{ .e = r.e, .h = a, .upload = false }, TransferGone.gone);
+    try engine.s3.get(r.store(), r.c, .of("b.bin"), .{ .flags = abi.S3_F_STREAM, .window = window }, 2, false);
+    const rb = try r.ev.result(2);
+    try std.testing.expectEqual(abi.OK, rb.status);
+    const b = rb.ev.handle;
+    try std.testing.expect(sameSlot(a, b));
+    try std.testing.expectEqual(@as(usize, window), (try waitData(&r.ev, b, window))[0]);
+
+    pin.release.store(true, .release);
+    th.?.join();
+    th = null;
+
+    // One byte of credit from B's own call sends one byte: none of A's
+    // credit reached B.
+    try engine.s3.readMore(r.e, b, 1);
+    const n, const fin = try waitData(&r.ev, b, window + 1);
+    try std.testing.expectEqual(@as(usize, window + 1), n);
+    try std.testing.expect(!fin);
+    try std.testing.expectEqual(@as(?anyerror, error.Gone), p.result);
 }
 
 test "capi s3: config: storage parses, validates and maps every Options leaf" {

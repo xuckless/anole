@@ -327,6 +327,11 @@ breaking changes are listed anyway.
   writer failed with "cannot start a transaction within a transaction" or
   had its own work rolled back. Both roll back first now, as `tx.deinit()`
   does; `rollback` fails only on a transaction that is over.
+- C ABI: an S3 transfer call (`anole_s3_upload_write`, `_upload_finish`,
+  `anole_s3_read_more`, `anole_handle_release`) made while its transfer
+  ended could act on the transfer opened next in the same slot. It now
+  checks the transfer again under the slot's lock and answers
+  `ANOLE_E_GONE` (a release: `ANOLE_OK`, as for any ended handle).
 
 ### Changed
 
