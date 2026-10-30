@@ -999,3 +999,36 @@ test "kafka: a broker connection's round trip canceled while it waits for the an
     conn.close();
     return error.TestUnexpectedResult;
 }
+
+test "kafka: a broker connection opens on an executor where another connection's task is suspended in its round trip" {
+    // One executor: both connections' tasks run on the same thread. The
+    // first holds its connection's I/O lock while it waits for an answer;
+    // the second takes its own connection's lock meanwhile (SAFETY.md L2's
+    // exception: one I/O lock per task, not per thread).
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    const at: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var silent = try at.listen(io, .{});
+    defer silent.deinit(io);
+    var cache: @import("../net/scram.zig").Cache = .{};
+    const settings: kafka.cluster.Settings = .{ .client_id = "t", .scram_cache = &cache, .request_timeout = .fromSeconds(60) };
+    var hold: TestHold = .{ .point = .request_written };
+    hold.arm();
+    defer hold_mod.test_hold.store(null, .release);
+    var stuck = try io.concurrent(kafka.cluster.Conn.open, .{ gpa, io, settings, "127.0.0.1", silent.socket.address.getPort(), -1 });
+    try wait.waitFlag(io, "the silent connection's request is written", &hold.held);
+    var other = try io.concurrent(kafka.cluster.Conn.open, .{ gpa, io, settings, "127.0.0.1", broker.listener.socket.address.getPort(), 0 });
+    const conn = other.await(io) catch |err| {
+        hold.let(io);
+        if (stuck.cancel(io)) |c| c.close() else |_| {}
+        return err;
+    };
+    conn.close();
+    hold.let(io);
+    const c = stuck.cancel(io) catch |err| return testing.expectEqual(error.Canceled, err);
+    c.close();
+    return error.TestUnexpectedResult;
+}
