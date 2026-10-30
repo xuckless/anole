@@ -262,13 +262,16 @@ jobs:
 
   windows:
     # K2: catches IOCP and every Windows-only failure (openapi goldens, net, WebTransport close, listeners); the job with the most unique catches.
-    name: windows (development target; default profile)
+    name: windows (development target, not required; default profile)
     runs-on: windows-latest
     # Windows is a development target ("works on Windows, fast on Linux"):
     # the tests run, the examples build and two of them serve requests. The
     # Unix-only parts (per-core SO_REUSEPORT sockets, HTTP/3 steering and
     # UDP batching, listener hand-off and SIGUSR2, LISTEN_FDS, sd_notify,
     # idle parking) are compiled out there and their tests skipped.
+    # Not required for now (user, 2026-10-30: Linux and macOS only): a
+    # failure here is reported but does not fail the run.
+    continue-on-error: true
     timeout-minutes: 120
     defaults:
       run:
