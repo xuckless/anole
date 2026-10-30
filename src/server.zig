@@ -945,6 +945,19 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             openapi_options: if (features.openapi) ?openapi_mod.Options else void = if (features.openapi) null else {},
             /// `serveOpenApi` could not build the document; `run` fails with it.
             openapi_failed: if (features.openapi) ?anyerror else void = if (features.openapi) null else {},
+
+            /// Removes the entry of a connector its constructor is about to
+            /// free (its start failed), so the teardown never reaches it.
+            fn dropConnector(self: *Extras, context: *anyopaque) void {
+                var i = self.connectors.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (self.connectors.items[i].context == context) {
+                        _ = self.connectors.orderedRemove(i);
+                        return;
+                    }
+                }
+            }
         };
 
         /// A database connector the server made: when serving starts it
@@ -965,6 +978,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// Closes the connector's idle connections (under AWS Lambda,
             /// after a long freeze); null when it has no pool to close.
             closeIdle: ?*const fn (context: *anyopaque) void = null,
+            /// Ends the connector's own work that may still call other
+            /// connectors (a job queue's runs), joining it. `App.deinit`
+            /// calls it on every connector, last made first, before it
+            /// frees any (SAFETY.md M2). Null for the rest.
+            stop_work: ?*const fn (context: *anyopaque) void = null,
 
             /// The console's `/db` system: the type's `console_system` decl
             /// ("postgres", "redis"...), or "connector" when it has none.
@@ -997,6 +1015,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         _ = v.closeIdle();
                     }
                 };
+                const Work = struct {
+                    fn stopWork(context: *anyopaque) void {
+                        // SAFETY: context is the *T given to of().
+                        const v: *T = @ptrCast(@alignCast(context));
+                        v.stopWork();
+                    }
+                };
                 return .{
                     .context = value,
                     .start = Hooks.start,
@@ -1004,6 +1029,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .describe = if (comptime @hasDecl(T, "consoleInfo") or !std.mem.eql(u8, system, "connector")) Hooks.describe else null,
                     .name = system,
                     .closeIdle = if (comptime @hasDecl(T, "closeIdle")) Idle.closeIdle else null,
+                    .stop_work = if (comptime @hasDecl(T, "stopWork")) Work.stopWork else null,
                 };
             }
         };
@@ -1885,6 +1911,22 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // settles during the rest of the teardown (jobs runs, database
             // calls), allocating nothing; its memory goes at the end.
             if (extras.exporter) |e| e.close();
+            // Job runs may use anything the app made (a connector made
+            // before or after the queue, app.udpSocket, the server's state):
+            // they end before any of it is freed (SAFETY.md M2). stopWork
+            // needs only the runtime and `server.draining`.
+            // So connectors made after app.jobs (NATS/Kafka consumers, SSE
+            // topics, watches) stay open for the jobs drain, and their own
+            // tasks run up to drain_timeout + the cancel grace longer.
+            // Out of this pass: only jobs has stopWork, so a NATS/Kafka
+            // consumer made before app.jobs can still reach a freed jobs
+            // client between jobs' deinit and its own (the same M2 class).
+            var w = extras.connectors.items.len;
+            while (w > 0) {
+                w -= 1;
+                const k = extras.connectors.items[w];
+                if (k.stop_work) |stop_work| stop_work(k.context);
+            }
             if (comptime features.http3) if (self.h3) |ep| ep.deinit();
             self.server.deinit();
             // ---- p3/net ----
@@ -3220,6 +3262,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             j.suppress_workers = self.mode.deployment == .lambda;
             j.drain_event = &self.server.draining;
             try self.extras.connectors.append(self.arena.allocator(), .of(jobs_mod.Client, j));
+            // Before the errdefer above frees it: no entry outlives its client.
+            errdefer self.extras.dropConnector(j);
             if (self.extras.connectors_started) try j.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return j;
         }
@@ -3239,6 +3283,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             errdefer w.deinit();
             try w.register(self);
             try self.extras.connectors.append(self.arena.allocator(), .of(wh.Client, w));
+            // Before the errdefer above frees it: no entry outlives its client.
+            errdefer self.extras.dropConnector(w);
             if (self.extras.connectors_started) try w.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return w;
         }

@@ -3,6 +3,7 @@
 //! other stores' semantics. Scans are linear: it is not meant for millions
 //! of jobs.
 const std = @import("std");
+const safety = @import("anole_safety");
 const root = @import("root.zig");
 const store = @import("store.zig");
 
@@ -36,7 +37,9 @@ const Cron = struct { spec: []u8, last_tick: ?Time };
 pub const Memory = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    mutex: std.Io.Mutex = .init,
+    /// Every row, unique key, cron and the leader. A leaf: no store call
+    /// is made under another lock, and nothing is taken under it.
+    mutex: safety.Mutex(.leaf) = .init,
     rows: std.AutoArrayHashMapUnmanaged(Id, *MemRow) = .empty,
     next_id: Id = 1,
     uniques: std.AutoHashMapUnmanaged([16]u8, Id) = .empty,

@@ -60,6 +60,10 @@ re-sends one message. `hooks.attempts` and `hooks.messages` read the log.
 There is no ordering between deliveries: a slow endpoint must not hold the
 others up.
 
+A delivery in flight at shutdown gets the queue's drain
+([jobs.md](jobs.md#drain)); the webhooks client is freed only after it has
+ended.
+
 ### Addresses and secrets
 
 Endpoint URLs come from your customers, so they are untrusted input. In
