@@ -355,18 +355,18 @@ pub const Channel = struct {
     fn autoH3(self: *Channel) !?*H3Connection {
         const owned = self._owned.?;
         const io_ = self.runtime();
-        // `isOpen` takes the connection's own lock: asked before the
-        // channel's is taken.
-        const current = self.h3;
-        if (current) |c| if (c.isOpen()) return c;
-        testAutoH3BeforeLock(self);
-        owned.mutex.lockUncancelable(io_);
-        // Another call dialed meanwhile: its connection is the one to use.
-        if (self.h3 != current) {
-            const newer = self.h3;
+        // `isOpen` takes the connection's own lock: asked with the
+        // channel's let go. Another call dialed meanwhile: its connection is
+        // the one to use, once it is seen open (it may have gone too).
+        while (true) {
+            const current = self.h3;
+            if (current) |c| if (c.isOpen()) return c;
+            testAutoH3BeforeLock(self);
+            owned.mutex.lockUncancelable(io_);
+            if (self.h3 == current) break;
             owned.mutex.unlock(io_);
-            return newer;
         }
+        // Held from here: the connection is the one found gone, or none.
         const now = std.Io.Clock.Timestamp.now(io_, .awake);
         const port: u16 = blk: {
             if (owned.alt) |a| if (now.compare(.lt, a.until)) break :blk a.port;

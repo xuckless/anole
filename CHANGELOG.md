@@ -225,7 +225,9 @@ breaking changes are listed anyway.
   response under it.
 - Resilience: breaker state reaches the metrics with no lock of the
   breakers held; a breaker made or observed reported its state under its
-  shard's lock, which took the metrics' locks under it.
+  shard's lock, which took the metrics' locks under it. A breaker whose
+  state changes between that look and its report is reported again, so
+  `anole_breaker_state` ends on its state.
 - Lambda: a buffered answer whose body the handler streamed (`res.stream`)
   was encoded from a part list that pointed into a returned function's
   stack, so the answer could carry garbage or crash; it now lives in the

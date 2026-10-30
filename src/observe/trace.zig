@@ -304,8 +304,8 @@ pub const Exporter = struct {
     kick: std.Io.Event = .unset,
     /// Over the flushers' wait for `finished`: `flush` waits on
     /// `progressed`; the task broadcasts after each batch and when it ends,
-    /// `close` once more after the join. Never held across anything but the
-    /// condition's own wait (SAFETY.md L2).
+    /// `close` as it starts and once more after the join. Never held across
+    /// anything but the condition's own wait (SAFETY.md L2).
     progress_lock: safety.Mutex(.leaf) = .init,
     progressed: safety.Condition = .init,
     /// Tests: waits of a flusher for progress, counted under
@@ -350,6 +350,9 @@ pub const Exporter = struct {
             if (builtin.mode == .debug) std.debug.panic("trace.Exporter.close on an exporter already {t}", .{was});
             return;
         }
+        // A flusher that saw the exporter alive returns now, not once the
+        // last batch is answered.
+        self.notifyProgress();
         self.closing.set(self.io);
         self.kick.set(self.io);
         self.queue.close(self.io);
@@ -366,7 +369,7 @@ pub const Exporter = struct {
             _ = self.dropped.fetchAdd(n, .monotonic);
             _ = self.finished.fetchAdd(n, .release);
         }
-        // A flusher that saw the exporter alive returns now.
+        // `finished` changed: one more look for any flusher left.
         self.notifyProgress();
     }
 

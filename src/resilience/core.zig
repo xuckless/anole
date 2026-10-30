@@ -470,7 +470,8 @@ pub const Breakers = struct {
 
     /// Reports every breaker (existing and future) to `m`: each shard's
     /// breakers are noted under its lock, and reported after it (the hooks
-    /// take locks of their own).
+    /// take locks of their own), until a look under the lock finds no
+    /// state that changed since its report (`settle`).
     pub fn observe(self: *Breakers, io: std.Io, m: ?*const Metrics) void {
         self.metrics = m;
         const hooks = m orelse {
@@ -482,28 +483,27 @@ pub const Breakers = struct {
             }
             return;
         };
-        const Seen = struct { name: []const u8, state: Breaker.State };
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         for (&self.shard) |*s| {
-            var seen: std.ArrayList(Seen) = .empty;
+            var noted: std.ArrayList(Noted) = .empty;
             {
                 s.mutex.lockUncancelable(io);
                 defer s.mutex.unlock(io);
-                var it = s.map.valueIterator();
+                var it = s.map.iterator();
                 while (it.next()) |e| {
-                    const b = &e.*.breaker;
+                    const b = &e.value_ptr.*.breaker;
                     b.metrics = hooks;
                     // A breaker that cannot be noted is still reported from
                     // its next transition on.
-                    const name = arena.dupe(u8, b.name()) catch continue;
-                    seen.append(arena, .{ .name = name, .state = b.state() }) catch continue;
+                    const key = arena.dupe(u8, e.key_ptr.*) catch continue;
+                    noted.append(arena, .{ .key = key, .state = b.state() }) catch continue;
                 }
             }
-            if (seen.items.len == 0) continue;
+            if (noted.items.len == 0) continue;
             testAfterUnlock(self);
-            for (seen.items) |x| hooks.on_state(hooks.context, self.kind, x.name, x.state);
+            self.settle(io, s, hooks, noted.items);
         }
     }
 
@@ -511,9 +511,10 @@ pub const Breakers = struct {
     /// lookup). The pointer lives until `deinit` or the entry's eviction,
     /// which never happens while a permit of it is outstanding. A breaker
     /// made here is reported to the metrics after the shard's lock is let
-    /// go.
+    /// go (`settle`).
     pub fn get(self: *Breakers, io: std.Io, key: []const u8) error{OutOfMemory}!*Breaker {
         const s = &self.shard[std.hash.Wyhash.hash(0, key) % shards];
+        var noted: [1]Noted = .{.{ .key = key, .state = .closed }};
         const made = made: {
             s.mutex.lockUncancelable(io);
             defer s.mutex.unlock(io);
@@ -530,16 +531,46 @@ pub const Breakers = struct {
             entry.* = .{ .breaker = .init(self.options, self.kind, key), .last_used = stamp };
             try s.map.put(self.gpa, owned, entry);
             entry.breaker.metrics = self.metrics;
+            // Noted by the caller's key: nothing of the entry is read after
+            // the unlock but under the lock again.
+            noted[0].state = entry.breaker.state();
             break :made &entry.breaker;
         };
-        // A new breaker starts closed; its label is the caller's key, cut
-        // as the breaker cuts its name, so nothing of the entry is read
-        // here.
         if (self.metrics) |m| {
             testAfterUnlock(self);
-            m.on_state(m.context, self.kind, key[0..@min(key.len, max_name)], .closed);
+            self.settle(io, s, m, &noted);
         }
         return made;
+    }
+
+    /// A breaker noted under its shard's lock, to report after it: its key
+    /// and the state last reported (or to report, `due`).
+    const Noted = struct { key: []const u8, state: Breaker.State, due: bool = true };
+
+    /// Reports the noted breakers that are due, then looks at them again
+    /// under the shard's lock and reports again each whose state changed
+    /// meanwhile, until none did. A transition reports itself after its
+    /// state changed, so a report of an older state that lands after it is
+    /// followed by the newer one: the gauge ends on the breaker's state. A
+    /// breaker evicted meanwhile is not looked at again. The label is the
+    /// key cut as `Breaker.init` cuts its name.
+    fn settle(self: *Breakers, io: std.Io, s: *Shard, m: *const Metrics, noted: []Noted) void {
+        while (true) {
+            for (noted) |x| if (x.due) m.on_state(m.context, self.kind, x.key[0..@min(x.key.len, max_name)], x.state);
+            s.mutex.lockUncancelable(io);
+            var again = false;
+            for (noted) |*x| {
+                x.due = false;
+                const e = s.map.get(x.key) orelse continue;
+                const now = e.breaker.state();
+                if (now == x.state) continue;
+                x.state = now;
+                x.due = true;
+                again = true;
+            }
+            s.mutex.unlock(io);
+            if (!again) return;
+        }
     }
 
     /// Tests: runs once, after a shard's lock is let go and before its
