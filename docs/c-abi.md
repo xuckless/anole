@@ -1534,7 +1534,9 @@ queues the bytes (copied, or borrowed with `ANOLE_BODY_BORROW`: `ANOLE_EV_SENT`
 follows) and returns. `ANOLE_BUSY`: taken, but more than
 `tcp.write_high_water` bytes wait, so write no more until
 `ANOLE_EV_WRITABLE` on `c`. `ANOLE_E_AGAIN`: not taken, past `tcp.write_max`
-(`ANOLE_EV_WRITABLE` follows). `ANOLE_NET_F_FRAME` adds the listener's
+(`ANOLE_EV_WRITABLE` follows). `ANOLE_E_TOOBIG`: one write larger than
+`tcp.write_max` (with its framing), never taken, so no `ANOLE_EV_WRITABLE`
+follows for it. `ANOLE_NET_F_FRAME` adds the listener's
 framing around the bytes; `ANOLE_NET_F_END` ends this side after them (`len`
 may be 0), with TLS close_notify and a FIN. After this side ended, a write is
 `ANOLE_E_INVALID` ("Ended"). `anole_net_close(c, how)` closes gracefully
@@ -1554,7 +1556,8 @@ slow consumer cannot fill a core's ring.
 (`sendmmsg`). `from.family` 0 lets the system pick the source; a received
 datagram's `local` answers from the address it reached. `ANOLE_BUSY` means the
 queue is past half full; `ANOLE_E_AGAIN` that none was taken
-(`ANOLE_EV_WRITABLE` on `u` follows). `anole_net_udp_find(s, "game", &u)` gives
+(`ANOLE_EV_WRITABLE` on `u` follows); `ANOLE_E_TOOBIG` that their bytes
+together are over `udp.send_queue` (never taken). `anole_net_udp_find(s, "game", &u)` gives
 the first socket of a UDP listener, to send without having received. Datagrams
 are unreliable: one the kernel refuses is dropped and counted in
 `anole_stats.udp_datagrams_dropped`.

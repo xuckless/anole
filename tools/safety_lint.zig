@@ -24,7 +24,10 @@
 //! - T5: in `src/capi/` and in files with an `export fn` (code foreign
 //!   threads call), a wake of a runtime task (`.set(io)` on an Event,
 //!   `futexWake`, `.signal`/`.broadcast`/`.unlock(io)`, `put`/`putOne` on
-//!   a Queue) outside `IoGate`, unless the enclosing function's doc comment
+//!   a Queue) outside an `IoGate` (`safety.IoGate`, src/safety/io_gate.zig,
+//!   where the gate's own wakes are: outside T5's files; a declaration
+//!   named `IoGate` in a T5 file is exempt the same way), unless the
+//!   enclosing function's doc comment
 //!   starts with the thread it runs on ("On the executor", "On the capi
 //!   task", "Run by the capi task", "On the run thread"). Wakes through
 //!   `Threaded` io wake consumer threads and are exempt.
@@ -416,7 +419,10 @@ const Lint = struct {
     stmt_of: []const u32,
     /// T5 applies: a C ABI file, or one with an `export fn`.
     t5: bool,
-    /// Tokens inside `IoGate` (T5's one place for foreign wakes).
+    /// Tokens inside a declaration named `IoGate` (T5's one place for
+    /// foreign wakes; the real one is `safety.IoGate` in
+    /// src/safety/io_gate.zig, which T5 does not scan, and a C ABI file
+    /// may still re-export or declare one).
     in_gate: []const bool,
 
     fn text(self: *const Lint, i: usize) []const u8 {

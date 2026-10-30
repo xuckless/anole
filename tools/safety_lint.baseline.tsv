@@ -30,8 +30,7 @@ src/capi/lib.zig	U3	22
 src/capi/nats.zig	C3	1
 src/capi/nats.zig	L2	2
 src/capi/nats.zig	U3	10
-src/capi/net.zig	L2	1
-src/capi/net.zig	U3	16
+src/capi/net.zig	U3	15
 src/capi/s3.zig	L2	2
 src/capi/s3.zig	U3	16
 src/capi/smtp.zig	L2	1
@@ -190,11 +189,8 @@ src/net/framing.zig	U3	1
 src/net/scram.zig	L2	1
 src/net/scram.zig	U3	5
 src/net/sessions.zig	U3	4
-src/net/tcp.zig	C3	1
-src/net/tcp.zig	L2	3
 src/net/tcp.zig	U3	16
 src/net/udp.zig	U3	8
-src/net/udp_service.zig	L2	1
 src/net/udp_service.zig	U3	6
 src/observe/access_log.zig	U3	1
 src/observe/health.zig	U3	2

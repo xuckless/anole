@@ -497,65 +497,10 @@ const DeadlineList = struct {
 };
 
 /// Guards the runtime's wakes made from threads that are not the runtime's
-/// (a consumer's answer, a send, a poll): the run thread closes it before it
-/// frees the runtime and waits for the wakes under way, and a wake after
-/// that is skipped (the runtime's tasks are canceled as it ends, so nothing
-/// waits for it). The `ctl` scheme, for the hot path: one per executor, on
-/// the line its inbox already shares with consumers.
-pub const IoGate = struct {
-    word: std.atomic.Value(u32) = .init(0),
-
-    const closed: u32 = 1 << 31;
-
-    /// A compare-and-swap that never counts a wake once the gate is
-    /// closed (libuv's `uv_async_send` has the same shape), so a stream of
-    /// late wakes can't keep `close` waiting.
-    pub fn enter(g: *IoGate) bool {
-        var cur = g.word.load(.monotonic);
-        while (true) {
-            if (cur & closed != 0) return false;
-            cur = g.word.cmpxchgWeak(cur, cur + 1, .acquire, .monotonic) orelse break;
-        }
-        if (comptime builtin.is_test) if (test_io_hook) |f| f();
-        return true;
-    }
-
-    pub fn leave(g: *IoGate) void {
-        _ = g.word.fetchSub(1, .release);
-    }
-
-    /// On the run thread, before the runtime goes: no wake enters from now
-    /// on, and those inside have left when this returns. They are a few
-    /// instructions long.
-    pub fn close(g: *IoGate) void {
-        _ = g.word.fetchOr(closed, .acq_rel);
-        // Spin first, then yield, as libuv's `uv__async_spin` does: a wake
-        // in flight is done within a few hundred cycles unless its thread
-        // was preempted.
-        var spins: u32 = 0;
-        while (g.word.load(.acquire) & ~closed != 0) {
-            if (spins < 1000) {
-                spins += 1;
-                std.atomic.spinLoopHint();
-            } else std.Thread.yield() catch {};
-        }
-    }
-
-    pub fn setEvent(g: *IoGate, io: std.Io, ev: *std.Io.Event) void {
-        if (!g.enter()) return;
-        defer g.leave();
-        ev.set(io);
-    }
-
-    pub fn wakeFutex(g: *IoGate, io: std.Io, word: *const std.atomic.Value(u32)) void {
-        if (!g.enter()) return;
-        defer g.leave();
-        io.futexWake(u32, &word.raw, std.math.maxInt(u32));
-    }
-};
-
-/// Tests: runs inside every `IoGate` once it is entered, before the wake.
-pub var test_io_hook: ?*const fn () void = null;
+/// (SAFETY.md T5): one per executor, on the line its inbox already shares
+/// with consumers. It lives in `safety` (src/safety/io_gate.zig); its test
+/// hook is `safety.io_gate_test_hook`.
+pub const IoGate = safety.IoGate;
 
 pub const Exec = struct {
     engine: *Engine,

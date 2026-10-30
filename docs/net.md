@@ -116,10 +116,19 @@ any time. Bytes leave in the order sends were made.
 - It answers `.ok`, or `.busy` once more than `write_high_water` (256 KiB)
   bytes are queued: the bytes were taken, but stop sending until `writable`
   is called, or call `conn.waitWritable()` from a task of your own.
+  `waitWritable` may be called until the `close` callback returns; one still
+  waiting then returns `error.Closed`, and the connection is freed only after
+  it has left. After `error.Closed` do not touch the `Conn` again: a call that
+  starts after the close callback returned uses freed memory.
 - Past `write_max` (8 MiB) it takes nothing and returns `error.QueueFull`;
   `writable` follows once the outbox drains under half the high-water mark.
+  One send larger than `write_max` (with its framing) returns
+  `error.TooLarge`: it can never be taken, so no `writable` follows for it.
 - `error.Closed` and `error.Ended` say the connection is over, or that this
   side was ended.
+
+From another thread a send costs one allocation; from a task on the
+connection's executor, small sends share one.
 
 A peer that stops reading does not hold anything up: past `write_timeout`
 (30 s) of no progress the connection closes (reason `.write_timeout`).
@@ -140,7 +149,9 @@ destroy the last bytes. `conn.reset()` closes now with a reset.
 ## 4. Reading control and timeouts
 
 `pauseReading()` and `resumeReading()` stop and restart reading; Anole leaves
-the input in the kernel, and TCP flow control slows the peer. Timeouts, all
+the input in the kernel, and TCP flow control slows the peer. A paused
+connection keeps its task and never idles out (`idle_timeout` counts input it
+reads); `lifetime`, a close, a reset or the server's stop still end it. Timeouts, all
 in `Tcp.Options`:
 
 | Option | Default | Closes with |
@@ -213,7 +224,9 @@ try app.udp(":7001", Game, .{ .sessions = .{ .idle_timeout = .fromSeconds(30) } 
   the batch's other replies in one `sendmmsg`. From any other task or thread,
   `socket.send(to, from, bytes)` queues for the socket's sender; neither waits
   on anything but the local queue. Past `send_queue` they return
-  `error.QueueFull`.
+  `error.QueueFull` (WRITABLE follows); datagrams whose bytes together are
+  over `send_queue` return `error.TooLarge` (never taken). A `send` that races the server's stop answers
+  `error.Closed`: it is never taken and lost.
 - `max_datagram` (2048) bounds what is taken; a larger one is dropped and
   counted.
 - With `sessions`, `open`/`datagram`/`close` run per peer, with a `State`;
