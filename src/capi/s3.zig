@@ -13,6 +13,7 @@
 //! A write returns once its bytes are buffered; back-pressure is
 //! `ANOLE_BUSY`, `ANOLE_E_AGAIN` and `ANOLE_EV_WRITABLE`, never a wait.
 const std = @import("std");
+const builtin = @import("builtin");
 const dusty = @import("dusty");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
@@ -131,8 +132,10 @@ pub const TSlot = struct {
     exec: *Exec = undefined,
     index: u32 = 0,
     next_free: u32 = engine.no_slot,
-    /// Guards `up` against a consumer thread using it while the executor
-    /// tears it down. Never held across I/O.
+    /// Taken by a consumer call for as long as it acts on the transfer
+    /// (`lockLive`); the executor fills the slot and moves `word` out of
+    /// `open` only under it, so under it a live word names the same
+    /// transfer throughout. Never held across I/O.
     lock: std.atomic.Mutex = .unlocked,
     kind: Kind = .upload,
     up: ?*s3.Upload = null,
@@ -254,6 +257,31 @@ fn transferOf(e: *Engine, hv: u64) ?Found {
     if (@as(u32, @intCast(w >> 32)) != h.gen) return null;
     if (@as(TState, @fromBackingInt(@intCast(w & 0xFFFFFFFF))) != .open) return null;
     return .{ t, h };
+}
+
+/// A test hook (test builds only): while set, the next transfer call
+/// (`uploadWrite`, `uploadFinish`, `readMore`, `release`) takes it and,
+/// once it has found its transfer, holds before the slot's lock until the
+/// test sets `release`, so a test can end that transfer on the executor
+/// and open another in its slot meanwhile.
+pub var test_transfer_hold: if (builtin.is_test) std.atomic.Value(?*engine.TestPin) else void = if (builtin.is_test) .init(null) else {};
+
+fn testTransferHold() void {
+    if (comptime !builtin.is_test) return;
+    const p = test_transfer_hold.swap(null, .acq_rel) orelse return;
+    p.held.store(true, .release);
+    while (!p.release.load(.acquire)) std.Thread.yield() catch {};
+}
+
+/// Takes `t.lock` if the slot still holds the transfer `h` names (its
+/// generation, open): `transferOf` checked it before the lock, when the
+/// executor could still end it and reuse the slot for another transfer.
+/// False: the lock is not held.
+fn lockLive(t: *TSlot, h: Handle) bool {
+    while (!t.lock.tryLock()) std.atomic.spinLoopHint();
+    if (t.word.load(.acquire) == packT(h.gen, .open)) return true;
+    t.lock.unlock();
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -554,6 +582,10 @@ fn post(x: *Exec, r: *const Res) void {
 
 fn postGone(x: *Exec, user_data: u64, op: u8, message: []const u8) void {
     post(x, &.{ .user_data = user_data, .op = op, .status = abi.E_GONE, .message = message });
+}
+
+fn postNoMemory(x: *Exec, user_data: u64, op: u8) void {
+    post(x, &.{ .user_data = user_data, .op = op, .status = abi.E_NOMEM, .message = "out of memory" });
 }
 
 fn postWritable(x: *Exec, handle: u64) void {
@@ -1063,6 +1095,7 @@ fn openUpload(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!
         return post(x, &r);
     };
     const g = t.gen();
+    while (!t.lock.tryLock()) std.atomic.spinLoopHint();
     t.kind = .upload;
     t.up = up;
     t.open_user_data = c.user_data;
@@ -1071,6 +1104,7 @@ fn openUpload(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!
     t.wants_writable.store(false, .monotonic);
     t.released.store(false, .monotonic);
     t.word.store(packT(g, .open), .release);
+    t.lock.unlock();
     r.handle = t.handle(g);
     r.s3_status = 200;
     post(x, &r);
@@ -1081,8 +1115,8 @@ fn teardownUpload(x: *Exec, t: *TSlot, g: u32) void {
     while (!t.lock.tryLock()) std.atomic.spinLoopHint();
     const up = t.up;
     t.up = null;
-    t.lock.unlock();
     t.word.store(packT(g, .closing), .release);
+    t.lock.unlock();
     if (up) |u| u.deinit();
     freeSlot(x, t, g);
 }
@@ -1133,11 +1167,15 @@ pub fn uploadWrite(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerErro
     if (comptime !features.s3) return error.Unsupported;
     if (flags != 0) return error.Invalid;
     const t, const h = transferOf(e, hv) orelse return e.gone();
-    if (t.kind != .upload) return error.WrongKind;
+    testTransferHold();
     var buf: [2048]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = undefined;
     var ctx = scratchCtx(&buf, &fba);
-    while (!t.lock.tryLock()) std.atomic.spinLoopHint();
+    if (!lockLive(t, h)) return e.gone();
+    if (t.kind != .upload) {
+        t.lock.unlock();
+        return error.WrongKind;
+    }
     const up = t.up orelse {
         t.lock.unlock();
         return e.gone();
@@ -1147,18 +1185,20 @@ pub fn uploadWrite(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerErro
         return error.Invalid;
     }
     const res = up.copyIn(&ctx, data);
+    // Under the lock: after it the slot may hold another transfer.
+    if (res) |v| {
+        if (v.taken != .ok) t.wants_writable.store(true, .release);
+    } else |_| {}
     t.lock.unlock();
     const r = res catch return e.gone();
     if (r.rotated) kick(t, h);
     switch (r.taken) {
         .ok => return false,
         .busy => {
-            t.wants_writable.store(true, .release);
             kick(t, h);
             return true;
         },
         .full => {
-            t.wants_writable.store(true, .release);
             kick(t, h);
             return error.Again;
         },
@@ -1169,11 +1209,15 @@ pub fn uploadWrite(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerErro
 pub fn uploadFinish(e: *Engine, hv: u64, user_data: u64) AnswerError!void {
     if (comptime !features.s3) return error.Unsupported;
     const t, const h = transferOf(e, hv) orelse return e.gone();
-    if (t.kind != .upload) return error.WrongKind;
+    testTransferHold();
     var buf: [2048]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = undefined;
     var ctx = scratchCtx(&buf, &fba);
-    while (!t.lock.tryLock()) std.atomic.spinLoopHint();
+    if (!lockLive(t, h)) return e.gone();
+    if (t.kind != .upload) {
+        t.lock.unlock();
+        return error.WrongKind;
+    }
     const up = t.up orelse {
         t.lock.unlock();
         return e.gone();
@@ -1194,8 +1238,14 @@ pub fn uploadFinish(e: *Engine, hv: u64, user_data: u64) AnswerError!void {
 pub fn readMore(e: *Engine, hv: u64, bytes: u32) AnswerError!void {
     if (comptime !features.s3) return error.Unsupported;
     const t, const h = transferOf(e, hv) orelse return e.gone();
-    if (t.kind != .download) return error.WrongKind;
+    testTransferHold();
+    if (!lockLive(t, h)) return e.gone();
+    if (t.kind != .download) {
+        t.lock.unlock();
+        return error.WrongKind;
+    }
     _ = t.credit.fetchAdd(bytes, .acq_rel);
+    t.lock.unlock();
     kick(t, h);
 }
 
@@ -1203,7 +1253,10 @@ pub fn readMore(e: *Engine, hv: u64, bytes: u32) AnswerError!void {
 pub fn release(e: *Engine, hv: u64) AnswerError!void {
     if (comptime !features.s3) return error.Unsupported;
     const t, const h = transferOf(e, hv) orelse return error.Over;
+    testTransferHold();
+    if (!lockLive(t, h)) return error.Over;
     t.released.store(true, .release);
+    t.lock.unlock();
     kick(t, h);
 }
 
@@ -1251,6 +1304,7 @@ fn streamGet(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!v
         return post(x, &r);
     };
     const g = t.gen();
+    while (!t.lock.tryLock()) std.atomic.spinLoopHint();
     t.kind = .download;
     t.up = null;
     t.open_user_data = c.user_data;
@@ -1258,11 +1312,14 @@ fn streamGet(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!v
     t.credit.store(c.window, .monotonic);
     t.event.reset();
     t.word.store(packT(g, .open), .release);
+    t.lock.unlock();
     const handle = t.handle(g);
     r.handle = handle;
     post(x, &r);
     defer {
+        while (!t.lock.tryLock()) std.atomic.spinLoopHint();
         t.word.store(packT(g, .closing), .release);
+        t.lock.unlock();
         freeSlot(x, t, g);
     }
     const buf = ctx.arena.alloc(u8, s3.download_.read_buffer_len) catch return;
@@ -1320,6 +1377,9 @@ const CHeaders = struct {
 
 fn serveTask(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!void {
     const s = slotOfReq(x, c.req) orelse return postGone(x, c.user_data, abi.S3_OP_SERVE, "the request ended first");
+    // The request's memory may go at any suspension below (its stream
+    // reset, its deadline): what is read of it is copied first (M3).
+    const a = ctx.arena;
     const req = s.req;
     const is_head = req.method == .head;
     // The request's own conditional headers, unless the options set them.
@@ -1336,8 +1396,12 @@ fn serveTask(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket) std.Io.Cancelable!v
             };
         }
     }
-    if (go.if_none_match == null) go.if_none_match = req.headers.get("If-None-Match");
-    if (go.if_match == null) go.if_match = req.headers.get("If-Match");
+    if (go.if_none_match == null) if (req.headers.get("If-None-Match")) |v| {
+        go.if_none_match = a.dupe(u8, v) catch return postNoMemory(x, c.user_data, abi.S3_OP_SERVE);
+    };
+    if (go.if_match == null) if (req.headers.get("If-Match")) |v| {
+        go.if_match = a.dupe(u8, v) catch return postNoMemory(x, c.user_data, abi.S3_OP_SERVE);
+    };
     if (go.if_modified_since == null) if (req.headers.get("If-Modified-Since")) |v| if (@import("../s3/util.zig").parseHttpDate(v)) |t| {
         go.if_modified_since = db.Time.fromSeconds(t);
     };
@@ -1459,7 +1523,10 @@ const BodyReader = struct {
             s.in.acquire();
             const word = s.word.load(.acquire);
             const state = engine.stateOf(word);
-            const mine = engine.genOf(word) == self.gen and state != .free and state != .expired and state != .done;
+            // Orphaned: the stream went while a consumer call held the
+            // slot, and with it what the pipe held (executor-local, read
+            // on the executor).
+            const mine = engine.genOf(word) == self.gen and state != .free and state != .expired and state != .done and !s.orphan;
             if (!mine or s.in.failed) {
                 s.in.release();
                 self.failed = true;
@@ -1496,12 +1563,25 @@ fn putBodyTask(x: *Exec, c: *Call, ctx: *db.Ctx, b: s3.Bucket, r: *Res) std.Io.C
     };
     const h = Handle.decode(c.req);
     var po = c.putOptions();
-    if (po.content_type == null) po.content_type = s.req.headers.get("Content-Type");
+    // The request's memory may go at any suspension below (its stream
+    // reset, its deadline): what is read of it is copied first (M3).
+    if (po.content_type == null) if (s.req.headers.get("Content-Type")) |v| {
+        po.content_type = ctx.arena.dupe(u8, v) catch {
+            r.status = abi.E_NOMEM;
+            return;
+        };
+    };
     s.in.acquire();
     const streamed = s.in.live(h.gen);
     s.in.release();
     const result: anyerror!s3.Stored = blk: {
-        if (!streamed) break :blk b.put(ctx, c.key, .{ .bytes = s.body }, po);
+        if (!streamed) {
+            const body = ctx.arena.dupe(u8, s.body) catch {
+                r.status = abi.E_NOMEM;
+                return;
+            };
+            break :blk b.put(ctx, c.key, .{ .bytes = body }, po);
+        }
         const buffer = ctx.arena.alloc(u8, 16 * 1024) catch {
             r.status = abi.E_NOMEM;
             return;
