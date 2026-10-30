@@ -65,6 +65,12 @@ fn gate(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = "through the gate";
 }
 
+/// GET /kib16: a 16 KiB body, whole with the head.
+const sixteen_kib: [16 * 1024]u8 = @splat('k');
+fn kib16(_: *dusty.Request, res: *dusty.Response) !void {
+    res.body = &sixteen_kib;
+}
+
 fn redirect(_: *dusty.Request, res: *dusty.Response) !void {
     res.status = .found;
     try res.header("Location", "/hello");
@@ -80,6 +86,7 @@ fn startServer(gpa: std.mem.Allocator, io: std.Io, listeners: []const dusty.List
     server.router.get("/stall", stall);
     server.router.get("/redirect", redirect);
     server.router.get("/gate", gate);
+    server.router.get("/kib16", kib16);
     return server;
 }
 
@@ -224,6 +231,59 @@ test "h2 client: 20 concurrent streams share one connection" {
     try wait.waitAtLeast(io, "20 concurrent GETs answered", &ok, 20);
     try group.await(io);
     try std.testing.expectEqual(@as(usize, 20), ok.load(.monotonic));
+}
+
+/// nghttp2 has closed the stream: its whole response is in.
+fn streamClosed(s: *h2.Stream) bool {
+    s.conn.mutex.lockUncancelable(s.conn.io);
+    defer s.conn.mutex.unlock(s.conn.io);
+    return s.protocol_done;
+}
+
+test "h2 client: a body read after its stream closed gives its window back to the connection" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var srv = try startH2c(gpa, io);
+    defer srv.stop(gpa, io);
+    // A 64 KiB connection window; the request timeout is only a hang guard.
+    const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = srv.port(), .max_data = 64 * 1024, .timeout = wait.deadline() });
+    defer conn.close();
+
+    // Eight 16 KiB bodies, twice the window, each read only once its
+    // stream has closed (#149).
+    for (0..8) |_| {
+        const s = try request(conn, "/kib16", .{});
+        defer s.release();
+        try s.waitHead();
+        try wait.waitUntil(io, "the response's stream closed", s, streamClosed);
+        const b = try s.reader().allocRemaining(gpa, .unlimited);
+        defer gpa.free(b);
+        try std.testing.expectEqual(sixteen_kib.len, b.len);
+    }
+}
+
+test "h2 client: a response released unread gives its window back to the connection" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var srv = try startH2c(gpa, io);
+    defer srv.stop(gpa, io);
+    const conn = try h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = srv.port(), .max_data = 64 * 1024, .timeout = wait.deadline() });
+    defer conn.close();
+
+    // Eight 16 KiB bodies, twice the window, none of them read (#149).
+    for (0..8) |_| {
+        const s = try request(conn, "/kib16", .{});
+        defer s.release();
+        try s.waitHead();
+        try wait.waitUntil(io, "the response's stream closed", s, streamClosed);
+    }
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h2", body);
 }
 
 test "h2 client: over TLS with ALPN h2" {
