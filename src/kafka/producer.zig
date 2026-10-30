@@ -1121,7 +1121,12 @@ pub const Producer = struct {
                 if (!seen) self.cluster.invalidate(w.accum.topic);
             }
             testHold(self.io, .stale_settled);
-            self.startSender(resolver_id) catch {};
+            self.startSender(resolver_id) catch |err| switch (err) {
+                // Not this sender's wait point: it meets the cancel at its
+                // next wait (C3; the lock's wait consumed it).
+                error.Canceled => self.io.recancel(),
+                else => {},
+            };
             testHold(self.io, .resolver_started);
             self.wake(resolver_id);
         }
