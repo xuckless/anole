@@ -879,7 +879,10 @@ const StressTask = struct {
                 else => {},
             };
             switch (rand.uintLessThan(u32, 8)) {
-                0...4 => t.kinds[i] = try sendOne(t.client, &c, record),
+                0...4 => {
+                    try t.client.send(&c, record);
+                    t.kinds[i] = .send;
+                },
                 5, 6 => {
                     const ms = 1 + rand.uintLessThan(u32, 1000);
                     if (t.client.with(.{ .timeout = .fromMilliseconds(ms) }).produce(&c, record)) |_| {
@@ -893,7 +896,8 @@ const StressTask = struct {
                     }
                 },
                 else => {
-                    t.kinds[i] = try sendOne(t.client, &c, record);
+                    try t.client.send(&c, record);
+                    t.kinds[i] = .send;
                     // A flush waits until nothing is pending, the other
                     // tasks' records included: under their load it may time
                     // out (delivery_pending), which is its contract.
@@ -909,21 +913,6 @@ const StressTask = struct {
         }
     }
 };
-
-/// A send, or `.failed` when the topic was dropped from the metadata
-/// cache (a stale leader) between the refresh and the lookup of its
-/// partitions: the call fails visibly, nothing is lost.
-fn sendOne(client: *kafka.Client, c: *db.Ctx, record: kafka.Record) !StressTask.Kind {
-    client.send(c, record) catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
-        else => {
-            const e = db.lastError(c) orelse return err;
-            if (std.mem.eql(u8, e.code, "UNKNOWN_TOPIC_OR_PARTITION")) return .failed;
-            return err;
-        },
-    };
-    return .send;
-}
 
 fn stressPhase(io: std.Io, client: *kafka.Client, broker: *FakeBroker, tasks: []StressTask, inject: bool, seed: u64) !void {
     var group: std.Io.Group = .init;

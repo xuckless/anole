@@ -479,11 +479,12 @@ pub const Cluster = struct {
     }
 
     /// Whether the cached answer for `topic` is one a topic being created
-    /// gives.
+    /// gives, or there is none: the caller's own refresh stored one, so a
+    /// stale leader's `invalidate` dropped it since (ask again).
     fn mayAppear(self: *Cluster, topic: []const u8) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const t = self.topics.get(topic) orelse return false;
+        const t = self.topics.get(topic) orelse return true;
         return switch (t.error_code) {
             protocol.unknown_topic_or_partition, protocol.leader_not_available => true,
             0 => t.partitions.len == 0,
