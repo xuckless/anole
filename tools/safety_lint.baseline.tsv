@@ -140,7 +140,6 @@ src/jobs/store_pg.zig	L2	1
 src/jobs/store_pg.zig	U3	20
 src/jobs/store_redis.zig	U3	21
 src/jobs/store_sqlite.zig	U3	19
-src/kafka/cluster.zig	L2	1
 src/kafka/cluster.zig	U3	1
 src/kafka/protocol.zig	U3	1
 src/kafka/root.zig	U3	4
