@@ -14,6 +14,7 @@ const dusty = @import("dusty");
 
 const testing = std.testing;
 const wait = @import("anole_test_wait");
+const safety = @import("anole_safety");
 const gpa = testing.allocator;
 
 const Fake = struct {
@@ -35,7 +36,7 @@ const Fake = struct {
     /// waits for it before answering.
     finds: std.atomic.Value(u32) = .init(0),
     find_gate: std.atomic.Value(?*std.Io.Event) = .init(null),
-    /// S-3: the other member. A primary with `alternate` lists itself
+    /// The stress test's other member. A primary with `alternate` lists itself
     /// alone and itself with `peer` on alternate hellos; a `secondary`
     /// lists `peer` (the primary) and itself.
     peer: ?*Fake = null,
@@ -539,11 +540,17 @@ test "mongodb: with(options).dynamic is the dynamic runner with the context firs
     try testing.expect(inserted.write.summary.get("insertedId") != null);
 }
 
-/// T-M1's hook: a yield right after a monitor's spawn, as the spawn itself
+/// The spawn test's hook: a yield right after a monitor's spawn, as the spawn itself
 /// yields on a busy executor (zio's run-queue threshold). The executor is
 /// busy: the new monitor waits in its run queue.
 const SpawnYield = struct {
+    var ran: std.atomic.Value(bool) = .init(false);
+    /// The locks the spawning task held at the spawn.
+    var held: std.atomic.Value(usize) = .init(0);
+
     fn yield(io: std.Io) void {
+        held.store(safety.heldLocks(), .release);
+        ran.store(true, .release);
         zio.yield() catch io.recancel();
     }
 
@@ -570,6 +577,8 @@ test "mongodb: a monitor started while the executor is busy does not suspend und
     var fake: Fake = undefined;
     try fake.init(io);
     defer fake.deinit(io);
+    SpawnYield.ran.store(false, .release);
+    SpawnYield.held.store(0, .release);
     client_mod.test_after_monitor_spawn = SpawnYield.yield;
     defer client_mod.test_after_monitor_spawn = null;
     // On executor 0, where the monitor is spawned.
@@ -579,11 +588,18 @@ test "mongodb: a monitor started while the executor is busy does not suspend und
     try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, SpawnYield.openAndPing, .{ &fake, io, &failure });
     try group.await(io);
     if (failure) |err| return err;
+    // A monitor was spawned, and its spawn (which may yield) ran with no
+    // lock held.
+    try testing.expect(SpawnYield.ran.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), SpawnYield.held.load(.acquire));
 }
 
-/// T-M2's hooks: a monitor's end, watched from `deinit` without suspending.
+/// The close test's hooks: a monitor's end, watched from `deinit` without suspending.
 const MonitorEnd = struct {
     var closed: std.atomic.Value(bool) = .init(false);
+    var held: std.atomic.Value(bool) = .init(false);
+    /// `hold` gave up waiting: the monitor did not end on its own.
+    var timed_out: std.atomic.Value(bool) = .init(false);
 
     fn monitorClosed(_: *client_mod.Server) void {
         closed.store(true, .release);
@@ -595,10 +611,11 @@ const MonitorEnd = struct {
     /// deadline is a hang guard.
     fn hold(s: *client_mod.Server) void {
         const io = s.client.io;
+        held.store(true, .release);
         s.check_now.set(io);
         const until = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = wait.deadline(), .clock = .awake });
         while (!closed.load(.acquire)) {
-            if (until.untilNow(io).raw.nanoseconds >= 0) return;
+            if (until.untilNow(io).raw.nanoseconds >= 0) return timed_out.store(true, .release);
             std.Thread.yield() catch {};
         }
     }
@@ -626,6 +643,8 @@ test "mongodb: closing the client while a monitor ends frees the monitor's conne
     try client.ping(&c);
 
     MonitorEnd.closed.store(false, .release);
+    MonitorEnd.held.store(false, .release);
+    MonitorEnd.timed_out.store(false, .release);
     client_mod.test_monitor_closed = MonitorEnd.monitorClosed;
     defer client_mod.test_monitor_closed = null;
     client_mod.test_close_hold = MonitorEnd.hold;
@@ -636,10 +655,14 @@ test "mongodb: closing the client while a monitor ends frees the monitor's conne
     defer group.cancel(io);
     try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, MonitorEnd.close, .{client});
     try group.await(io);
+    // `deinit` held while the monitor ended on its own and closed its
+    // connection, then freed the rest.
+    try testing.expect(MonitorEnd.held.load(.acquire));
+    try testing.expect(!MonitorEnd.timed_out.load(.acquire));
     try testing.expect(MonitorEnd.closed.load(.acquire));
 }
 
-/// S-3: one task's finds on a client of the two fakes.
+/// One task's finds on a client of the two fakes.
 const Finder = struct {
     fn run(client: *mongodb.Client, io: std.Io, finds: u32, failures: *std.atomic.Value(u32)) void {
         var arena: std.heap.ArenaAllocator = .init(gpa);

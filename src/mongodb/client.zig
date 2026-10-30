@@ -321,7 +321,7 @@ pub const Client = struct {
         const changes = self.syncServers();
         self.mutex.unlock(io);
         // Nothing spawned yet: on a failure the servers made so far are
-        // freed here, with no monitor running (R8-4's OOM path).
+        // freed here, with no monitor running (an allocation failed).
         if (changes.failed) |err| {
             for (self.servers.items) |s| self.freeServer(s);
             self.servers.deinit(gpa);
@@ -554,8 +554,13 @@ pub const Client = struct {
             s.retired.store(true, .release);
             s.check_now.set(io);
         }
+        // Read under the lock: a monitor's `apply` may grow `servers` until
+        // the cancel below. A `Server` itself lives until `freeServer`.
+        const hold: if (builtin.is_test) ?*Server else void = if (builtin.is_test)
+            (if (test_close_hold != null and self.servers.items.len > 0) self.servers.items[0] else null)
+        else {};
         self.mutex.unlock(io);
-        if (builtin.is_test) for (self.servers.items) |s| if (test_close_hold) |f| {
+        if (builtin.is_test) if (hold) |s| if (test_close_hold) |f| {
             test_close_hold = null;
             f(s);
         };
