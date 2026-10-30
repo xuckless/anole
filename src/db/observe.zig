@@ -304,31 +304,46 @@ test "db readiness: probes during a ping answer with the last result" {
     try testing.expectEqual(@as(u32, 1), fake.pings.load(.monotonic));
 }
 
-/// The stress test's ping: yields a seeded number of times instead of waiting for a
-/// gate, counting how many run at once.
+/// The stress test's ping: yields until the wave lets it go, then a
+/// seeded number of times more, counting how many run at once.
 const YieldingPing = struct {
     pings: std.atomic.Value(u32) = .init(0),
     running: std.atomic.Value(u32) = .init(0),
     most: std.atomic.Value(u32) = .init(0),
     answer: std.atomic.Value(bool) = .init(true),
     yields: std.atomic.Value(u32) = .init(0),
+    /// Pings yield until this is set.
+    go: std.atomic.Value(bool) = .init(false),
+    /// The task of the ping that runs now.
+    task: std.atomic.Value(?dusty.placement.Task) = .init(null),
     /// Pings that answered, and pings their caller's cancel ended.
     answered: std.atomic.Value(u32) = .init(0),
     canceled: std.atomic.Value(u32) = .init(0),
 
-    fn ping(context: *anyopaque, _: std.Io) std.Io.Cancelable!bool {
-        const zio = @import("zio");
+    fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
         const self = safety.fromCtx(YieldingPing, context);
         _ = self.pings.fetchAdd(1, .monotonic);
         const now = self.running.fetchAdd(1, .acq_rel) + 1;
         defer _ = self.running.fetchSub(1, .acq_rel);
         _ = self.most.fetchMax(now, .monotonic);
-        for (0..self.yields.load(.monotonic)) |_| zio.yield() catch |err| {
+        self.task.store(dusty.placement.currentTask(io), .release);
+        defer self.task.store(null, .release);
+        while (!self.go.load(.acquire)) try self.yield();
+        for (0..self.yields.load(.monotonic)) |_| try self.yield();
+        _ = self.answered.fetchAdd(1, .acq_rel);
+        return self.answer.load(.monotonic);
+    }
+
+    fn yield(self: *YieldingPing) std.Io.Cancelable!void {
+        @import("zio").yield() catch |err| {
             _ = self.canceled.fetchAdd(1, .acq_rel);
             return err;
         };
-        _ = self.answered.fetchAdd(1, .acq_rel);
-        return self.answer.load(.monotonic);
+    }
+
+    /// A ping runs, waiting for `go`.
+    fn waiting(self: *YieldingPing) bool {
+        return self.task.load(.acquire) != null;
     }
 };
 
@@ -368,6 +383,7 @@ test "db readiness: [stress] probes from four executors with cancels ping one at
         fake.answer.store(answer, .monotonic);
         fake.yields.store(random.uintLessThan(u32, 8), .monotonic);
         fake.answered.store(0, .release);
+        fake.go.store(false, .release);
         const before_ns = ready.checked_ns.load(.acquire);
         const before = ready.ready.load(.monotonic);
         var started: std.atomic.Value(u32) = .init(0);
@@ -377,11 +393,18 @@ test "db readiness: [stress] probes from four executors with cancels ping one at
         defer group.cancel(io);
         for (&probes, 0..) |*p, i| try dusty.placement.concurrent(&group, io, .{ .executor = i % 4 }, WaveProbe.run, .{ p, io, &ready, &end });
         try wait.waitEqual(io, "every probe of the wave started", &started, probes_per_wave);
-        // A seeded few canceled, wherever they are: in the ping, waiting
-        // for the wave's end, or about to check.
+        // The first probe's ping holds until `go`.
+        try wait.waitUntil(io, "a ping of the wave", &fake, YieldingPing.waiting);
+        // In a seeded quarter of the waves the ping's own probe is
+        // canceled; a seeded few others too, wherever they are: waiting for
+        // the wave's end, or about to check.
+        const pinger = fake.task.load(.acquire).?;
+        if (random.uintLessThan(u8, 4) == 0) dusty.placement.cancelTask(pinger);
         for (&probes) |*p| if (random.uintLessThan(u8, 4) == 0) {
-            dusty.placement.cancelTask(p.task.load(.acquire).?);
+            const t = p.task.load(.acquire).?;
+            if (t != pinger) dusty.placement.cancelTask(t);
         };
+        fake.go.store(true, .release);
         end.set(io);
         group.await(io) catch {};
         try testing.expect(fake.most.load(.monotonic) <= 1);
