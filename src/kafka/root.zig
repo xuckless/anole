@@ -52,6 +52,7 @@ pub const sasl = @import("sasl.zig");
 const producer_mod = @import("producer.zig");
 const consumer_mod = @import("consumer.zig");
 const Telemetry = @import("telemetry.zig").Telemetry;
+const testHold = @import("test_hold.zig").testHold;
 /// An in-process broker for tests: `anole.kafka.testing.FakeBroker`.
 pub const testing = @import("testing.zig");
 
@@ -185,10 +186,15 @@ pub const Client = struct {
     telemetry: ?Telemetry = null,
     ready: ?db.Readiness = null,
     consumers: std.ArrayList(*consumer_mod.Consumer) = .empty,
-    /// Over `consumers`, `started` and `drained`. A leaf (L4).
+    /// Over `consumers`, `started`, `drained` and `starting`. A leaf (L4).
     consumers_mutex: safety.Mutex(.leaf) = .init,
     started: bool = false,
     drained: bool = false,
+    /// Consumer starts under way outside the lock (`start`, `consume`):
+    /// `drain` waits for them (`starts_done`) before it stops and joins the
+    /// consumers, so a start never races its consumer's stop.
+    starting: u32 = 0,
+    starts_done: safety.Condition = .init,
     /// Set by `app.kafka` under `deployment = lambda`: consumer groups are
     /// not joined (the process is frozen between invocations); producing
     /// works.
@@ -336,6 +342,8 @@ pub const Client = struct {
         const n = blk: {
             self.consumers_mutex.lockUncancelable(self.io);
             defer self.consumers_mutex.unlock(self.io);
+            // Set only once the observer, telemetry, health check and the
+            // start's refresh succeeded: a failed start can be retried.
             self.started = true;
             break :blk self.consumers.items.len;
         };
@@ -349,10 +357,23 @@ pub const Client = struct {
             const c = blk: {
                 self.consumers_mutex.lockUncancelable(self.io);
                 defer self.consumers_mutex.unlock(self.io);
+                // A drain that began meanwhile stops what is started: start
+                // no more.
+                if (self.drained) return;
+                self.starting += 1;
                 break :blk self.consumers.items[i];
             };
+            defer self.endStart();
             try c.start();
         }
+    }
+
+    /// Ends a consumer start counted in `starting` (no lock held).
+    fn endStart(self: *Client) void {
+        self.consumers_mutex.lockUncancelable(self.io);
+        defer self.consumers_mutex.unlock(self.io);
+        self.starting -= 1;
+        if (self.starting == 0) self.starts_done.broadcast(self.io);
     }
 
     fn isStarted(self: *Client) bool {
@@ -362,12 +383,15 @@ pub const Client = struct {
     }
 
     /// Adds a consumer; true when it is to be started now (serving has
-    /// started), which the caller does after the lock.
+    /// started), which the caller does after the lock and ends with
+    /// `endStart`.
     fn addConsumer(self: *Client, c: *consumer_mod.Consumer) !bool {
         self.consumers_mutex.lockUncancelable(self.io);
         defer self.consumers_mutex.unlock(self.io);
         try self.consumers.append(self.gpa, c);
-        return self.started and !self.drained and !self.suppress_consumers;
+        const now = self.started and !self.drained and !self.suppress_consumers;
+        if (now) self.starting += 1;
+        return now;
     }
 
     fn pingFn(context: *anyopaque, _: std.Io) bool {
@@ -393,6 +417,13 @@ pub const Client = struct {
             return;
         }
         self.drained = true;
+        // No start begins from here on; the ones under way finish first.
+        if (self.starting > 0) {
+            self.consumers_mutex.unlock(self.io);
+            testHold(self.io, .drain_waits);
+            self.consumers_mutex.lockUncancelable(self.io);
+        }
+        while (self.starting > 0) self.starts_done.waitUncancelable(self.io, &self.consumers_mutex);
         for (self.consumers.items) |c| c.stop();
         self.consumers_mutex.unlock(self.io);
         for (self.consumers.items) |c| c.join(deadline);
@@ -582,7 +613,10 @@ pub const Client = struct {
         };
         // In the list from here on: the client frees it, a failed start
         // included.
-        if (start_now) try c.start();
+        if (start_now) {
+            defer self.endStart();
+            try c.start();
+        }
     }
 
     /// `consume` for callers that bring their own function pointers (the C
@@ -596,7 +630,10 @@ pub const Client = struct {
         };
         // In the list from here on: the client frees it, a failed start
         // included.
-        if (start_now) try c.start();
+        if (start_now) {
+            defer self.endStart();
+            try c.start();
+        }
         return c;
     }
 
