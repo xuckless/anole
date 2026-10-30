@@ -1120,7 +1120,9 @@ pub const Producer = struct {
                 } else false;
                 if (!seen) self.cluster.invalidate(w.accum.topic);
             }
+            testHold(self.io, .stale_settled);
             self.startSender(resolver_id) catch {};
+            testHold(self.io, .resolver_started);
             self.wake(resolver_id);
         }
         self.retire(&done);

@@ -467,6 +467,7 @@ pub const Cluster = struct {
         var pause: std.Io.Duration = .fromMilliseconds(10);
         while (true) {
             try self.refresh(&.{topic}, true);
+            testHold(self.io, .metadata_refreshed);
             if (self.lookupCount(topic)) |n| return n;
             if (!self.mayAppear(topic)) return null;
             const elapsed = started.durationTo(.now(self.io, .awake)).raw.nanoseconds;

@@ -27,6 +27,16 @@ pub const TestPoint = enum {
     /// Right after a consumer member task was spawned (the same yield as
     /// `sender_spawned`).
     member_spawned,
+    /// A sender that met a stale leader, its batches handed back, before it
+    /// starts the resolver.
+    stale_settled,
+    /// The same sender, right after that start returned.
+    resolver_started,
+    /// `Client.drain`, `drained` set, before it waits for the consumer
+    /// starts in flight (no lock held).
+    drain_waits,
+    /// `partitionCountWait`, between its refresh and its look at the cache.
+    metadata_refreshed,
 };
 
 /// One stop: armed through `test_hold`, taken once by the first caller at
@@ -38,6 +48,11 @@ pub const TestHold = struct {
     held: std.atomic.Value(bool) = .init(false),
     released: std.atomic.Value(u32) = .init(0),
     limit: Duration = .fromSeconds(30),
+    /// The held task first waits cancelably until it is canceled, notes it
+    /// in `canceled` and re-arms the cancel (`recancel`), then stays as
+    /// usual: a test learns that the cancel is pending.
+    until_canceled: bool = false,
+    canceled: std.atomic.Value(bool) = .init(false),
 
     /// Lets the held caller go (any task or thread of the runtime of `io`).
     pub fn let(h: *TestHold, io: std.Io) void {
@@ -54,6 +69,18 @@ pub const TestHold = struct {
         h.held.store(true, .release);
         const start = std.Io.Clock.awake.now(io);
         const on_task = dusty.placement.currentExecutor(io) != null;
+        if (h.until_canceled and on_task) while (h.released.load(.acquire) == 0) {
+            if (start.durationTo(std.Io.Clock.awake.now(io)).nanoseconds > h.limit.nanoseconds) {
+                std.debug.panic("kafka test hold at {t}: never canceled", .{h.point});
+            }
+            io.futexWaitTimeout(u32, &h.released.raw, 0, .{ .duration = .{ .raw = h.limit, .clock = .awake } }) catch |err| switch (err) {
+                error.Canceled => {
+                    io.recancel();
+                    h.canceled.store(true, .release);
+                    break;
+                },
+            };
+        };
         // A cancel stays pending until the hold is let go (the held caller
         // goes on as it would have, and meets it at its next wait).
         const prev = io.swapCancelProtection(.blocked);

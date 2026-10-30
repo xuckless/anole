@@ -644,6 +644,10 @@ const FailNth = struct {
     armed: std.atomic.Value(bool) = .init(false),
     count: u32 = 0,
     fail_at: u32 = std.math.maxInt(u32),
+    /// Every allocation from the `fail_at`-th on fails, not that one alone.
+    sticky: bool = false,
+    /// How many allocations failed (any thread reads it).
+    failures: std.atomic.Value(u32) = .init(0),
 
     fn allocator(f: *FailNth) std.mem.Allocator {
         return .{ .ptr = f, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
@@ -676,7 +680,10 @@ const FailNth = struct {
         const f = of(p);
         if (f.mine()) {
             defer f.count += 1;
-            if (f.count == f.fail_at) return null;
+            if (f.count == f.fail_at or (f.sticky and f.count > f.fail_at)) {
+                _ = f.failures.fetchAdd(1, .monotonic);
+                return null;
+            }
         }
         return f.backing.rawAlloc(len, alignment, ra);
     }
@@ -1031,4 +1038,195 @@ test "kafka: a broker connection opens on an executor where another connection's
     const c = stuck.cancel(io) catch |err| return testing.expectEqual(error.Canceled, err);
     c.close();
     return error.TestUnexpectedResult;
+}
+
+/// Frees the client on a task (its deinit joins the senders), then sets
+/// `done`. The drain's deadline is already past: no flush waits.
+fn deinitTask(client: *kafka.Client, io: std.Io, done: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+    client.drain(std.Io.Clock.Timestamp.now(io, .awake));
+    client.deinit();
+    done.store(true, .release);
+}
+
+fn drainTask(client: *kafka.Client, io: std.Io, done: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+    client.drain(std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromSeconds(10), .clock = .awake }));
+    done.store(true, .release);
+}
+
+fn flagTask(done: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+    done.store(true, .release);
+}
+
+/// Arms `f` on the executor the task runs on: from now on every allocation
+/// made there fails.
+fn failHereTask(f: *FailNth, done: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+    f.sticky = true;
+    f.arm(0);
+    done.store(true, .release);
+}
+
+test "kafka: a drain that begins while a consumer's start spawns its members stops it only after the start" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    try client.start(null, null, null);
+
+    var spawned: TestHold = .{ .point = .member_spawned };
+    spawned.arm();
+    defer hold_mod.test_hold.store(null, .release);
+    var result: TaskResult = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    defer spawned.let(io);
+    // Serving has started: the added group starts at once, and its start
+    // stops right after spawning its member.
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, consumeTask, .{ client, &result });
+    try wait.waitFlag(io, "the consumer's start is held after its member's spawn", &spawned.held);
+    var waits: TestHold = .{ .point = .drain_waits };
+    waits.arm();
+    defer waits.let(io);
+    var drained: std.atomic.Value(bool) = .init(false);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, drainTask, .{ client, io, &drained });
+    const Seen = struct { waits: *TestHold, drained: *std.atomic.Value(bool) };
+    try wait.waitUntil(io, "the drain waits for the start, or returned", Seen{ .waits = &waits, .drained = &drained }, struct {
+        fn either(x: Seen) bool {
+            return x.waits.held.load(.acquire) or x.drained.load(.acquire);
+        }
+    }.either);
+    // The drain neither stops nor joins a consumer whose start is under way.
+    try testing.expect(!drained.load(.acquire));
+    waits.let(io);
+    spawned.let(io);
+    try result.wait(io);
+    try wait.waitFlag(io, "the drain returned", &drained);
+    // It joined the member the start spawned.
+    try testing.expectEqual(@as(u32, 0), client.consumers.items[0].active.load(.acquire));
+}
+
+test "kafka producer: a produce to a topic dropped from the metadata cache between its refresh and its lookup is delivered" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    _ = try client.produce(&c, .{ .topic = "dropped", .value = "warm" });
+    // Not cached any more: the next produce refreshes, and stops right after.
+    client.cluster.invalidate("dropped");
+
+    var refreshed: TestHold = .{ .point = .metadata_refreshed };
+    refreshed.arm();
+    defer hold_mod.test_hold.store(null, .release);
+    var result: TaskResult = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    defer refreshed.let(io);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, produceTask, .{ client, io, kafka.Record{ .topic = "dropped", .value = "v" }, &result });
+    try wait.waitFlag(io, "the produce is held after its refresh", &refreshed.held);
+    // Meanwhile a sender's stale leader drops the topic again.
+    client.cluster.invalidate("dropped");
+    refreshed.let(io);
+    try result.wait(io);
+    try testing.expectEqual(@as(i64, 2), broker.count("dropped", 0));
+}
+
+test "kafka producer: a sender that cannot allocate its work list waits instead of spinning on its executor" {
+    // The test's thread is executor 0: partition 1's leader, broker id 1,
+    // has its sender on executor 1.
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 2, .nodes = 2 });
+    defer broker.deinit();
+    var fail: FailNth = .{ .backing = gpa };
+    const client = try kafka.Client.init(fail.allocator(), io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    var armed: std.atomic.Value(bool) = .init(false);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, failHereTask, .{ &fail, &armed });
+    try wait.waitFlag(io, "allocations on the executor fail", &armed);
+    defer fail.armed.store(false, .release);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    // Queued from this thread, whose allocations pass. The sender, on the
+    // executor, cannot allocate its work list for the sealed batch.
+    try client.send(&c, .{ .topic = "spin", .value = "v", .partition = 1 });
+    try wait.waitAtLeast(io, "the sender failed to allocate twice", &fail.failures, 2);
+    // Another task of the sender's executor still gets its turn.
+    var ran: std.atomic.Value(bool) = .init(false);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, flagTask, .{&ran});
+    try wait.waitFlag(io, "a task of the sender's executor ran", &ran);
+    fail.armed.store(false, .release);
+    try client.producer.flush(.fromSeconds(10));
+    try testing.expectEqual(@as(i64, 1), broker.count("spin", 1));
+}
+
+test "kafka producer: a sender canceled while it starts the resolver after a stale leader ends with the client's deinit" {
+    // The test's thread is executor 0 and holds the producer's lock below:
+    // partition 1's sender (broker id 1) runs on executor 1.
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 2, .nodes = 2 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    var handed = false;
+    defer if (!handed) client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    // Partition 1's sender runs, connected.
+    _ = try client.produce(&c, .{ .topic = "stale", .value = "warm", .partition = 1 });
+
+    // The next Produce is answered NOT_LEADER_OR_FOLLOWER: the sender hands
+    // the batch back and stops before it starts the resolver.
+    broker.fail_code.store(6, .release);
+    broker.fail_produce.store(1, .release);
+    var settled: TestHold = .{ .point = .stale_settled, .until_canceled = true };
+    settled.arm();
+    defer hold_mod.test_hold.store(null, .release);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    defer settled.let(io);
+    try client.send(&c, .{ .topic = "stale", .value = "v", .partition = 1 });
+    try wait.waitFlag(io, "the sender is held before it starts the resolver", &settled.held);
+    // The client is freed on a task; its deinit cancels the held sender (the
+    // hold keeps the cancel pending). The drain's flush times out: quiet.
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    var freed: std.atomic.Value(bool) = .init(false);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, deinitTask, .{ client, io, &freed });
+    handed = true;
+    try wait.waitFlag(io, "the held sender's cancel is pending", &settled.canceled);
+    // The resolver's start finds the producer's lock taken and waits for it:
+    // the pending cancel ends that wait.
+    var started: TestHold = .{ .point = .resolver_started };
+    started.arm();
+    defer started.let(io);
+    {
+        client.producer.mutex.lockUncancelable(io);
+        defer client.producer.mutex.unlock(io);
+        settled.let(io);
+        // This thread holds the lock: it yields, it does not wait on the runtime.
+        const since = std.Io.Clock.awake.now(io);
+        while (!started.held.load(.acquire)) {
+            if (since.durationTo(std.Io.Clock.awake.now(io)).nanoseconds > wait.deadline().nanoseconds) std.debug.panic("kafka test: the sender never reached the resolver's start", .{});
+            std.Thread.yield() catch {};
+        }
+    }
+    started.let(io);
+    // The sender meets the cancel at its next wait; deinit joins it.
+    wait.waitFlag(io, "the client's deinit returned", &freed) catch
+        std.debug.panic("kafka test: the sender's cancel was swallowed at the resolver's start; it waits for a wake that never comes", .{});
 }
