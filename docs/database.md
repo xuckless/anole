@@ -127,6 +127,45 @@ var c: anole.db.Ctx = .{ .io = app.io(), .arena = arena.allocator() };
 _ = try app_state.db.exec(&c, "CREATE TABLE IF NOT EXISTS posts (...)", .{});
 ```
 
+### Migrations
+
+`anole.db.migrate(db, c, migrations)` brings a PostgreSQL or SQLite
+database's schema up to date from a list of numbered migrations, usually
+embedded in the program, and returns how many ran. Run it at startup,
+before `listen`:
+
+```zig
+const migrations = [_]anole.db.Migration{
+    .{ .version = 1, .name = "init", .sql = @embedFile("migrations/001_init.sql") },
+    .{ .version = 2, .name = "add_tags", .sql = @embedFile("migrations/002_add_tags.sql") },
+};
+
+var c: anole.db.Ctx = .{ .io = app.io(), .arena = arena.allocator() };
+_ = try anole.db.migrate(state.db, &c, &migrations);
+```
+
+- The table `schema_migrations` (`version`, `name`, `applied_at` in Unix
+  seconds) records what ran; it is created when missing. A migration runs
+  when its version is not recorded there, so one merged in below the
+  latest applied version still runs.
+- Each migration runs in its own transaction together with its record. A
+  migration that fails is rolled back, record and all, and its error
+  returned (the database's message in `anole.db.lastError(&c)`); the ones
+  before it stay applied, and the next start tries it again.
+- Versions start at 1 and increase through the list; anything else is
+  `error.MigrationsOutOfOrder` before anything runs. Append new migrations
+  and leave shipped ones as they are: an edited migration does not run
+  again.
+- `sql` may hold several statements, and no `BEGIN` or `COMMIT` of its
+  own. Statements that cannot run in a transaction (PostgreSQL's `CREATE
+  INDEX CONCURRENTLY`, SQLite's `VACUUM`) do not belong in one.
+- Neither the connector's `timeout` nor a transaction's applies.
+- SQLite's write transactions take the database's write lock, so two
+  processes migrating one file take turns. On PostgreSQL, a second process
+  migrating at the same time fails rather than applying a migration twice;
+  migrate from one process (a release step, or the first instance).
+- There are no down migrations: undo a change with a new migration.
+
 ## PostgreSQL
 
 Built in with `-Dpostgres` (on in the `web` and `full` profiles), on
