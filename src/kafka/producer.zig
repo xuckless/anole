@@ -831,7 +831,9 @@ pub const Producer = struct {
     /// Takes `mutex`. Seals batches whose linger is up, detaches batches
     /// past their delivery deadline into `done`, and picks one ready batch
     /// per idle partition this sender leads, as many as `work` has room
-    /// for. True when a batch was left for want of room.
+    /// for. True when a batch was left for want of room, unless `work` has
+    /// none at all (its allocation failed): the caller then waits instead
+    /// of coming straight back.
     fn collect(self: *Producer, s: *Sender, work: *std.ArrayList(Work), next_wake: *?Timestamp, unresolved: *bool, done: *Done) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -861,7 +863,7 @@ pub const Producer = struct {
                             a.in_flight = true;
                             request_bytes += b.bytes;
                             work.appendAssumeCapacity(.{ .accum = a, .batch = b });
-                        } else more = true;
+                        } else if (work.capacity > 0) more = true;
                     }
                 };
             }
