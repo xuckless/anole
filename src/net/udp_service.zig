@@ -9,12 +9,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const low = @import("udp.zig");
 const sessions_mod = @import("sessions.zig");
 const handoff = @import("../handoff.zig");
 const net_metrics = @import("metrics.zig");
 
 const placement = dusty.placement;
+const push_list = dusty.push_list;
 const Duration = std.Io.Duration;
 const native_os = builtin.os.tag;
 const log = std.log.scoped(.anole);
@@ -170,6 +172,9 @@ pub const Datagram = struct {
     local: ?std.Io.net.IpAddress,
     socket: *UdpSocket,
 
+    /// TooLarge: a datagram over 65507 bytes, or datagrams together over
+    /// `send_queue`: never taken, so no WRITABLE follows for them.
+    /// QueueFull: no room now; WRITABLE follows.
     pub const SendError = error{ TooLarge, QueueFull, Closed, OutOfMemory };
 
     /// A datagram back to `remote` from `local`, sent with the rest of the
@@ -236,6 +241,66 @@ pub const SocketStats = struct {
 };
 
 const Pending = struct { to: std.Io.net.IpAddress, from: ?std.Io.net.IpAddress, off: usize, len: usize };
+
+/// One `send`/`sendMany` call: its datagrams' addresses and bytes in one
+/// allocation (this header, the `Pending` entries, then the bytes), made
+/// before anything shared is touched (L5). owner: the caller until it is
+/// pushed; then the socket's sender, which frees it once sent.
+const Batch = struct {
+    node: push_list.Node = .{},
+    gpa: std.mem.Allocator,
+    count: u32,
+    /// Datagram bytes in all.
+    bytes: u32,
+    size: usize,
+
+    const header = std.mem.alignForward(usize, @sizeOf(Batch), @alignOf(Pending));
+    comptime {
+        std.debug.assert(@alignOf(Batch) >= @alignOf(Pending));
+    }
+
+    fn create(gpa: std.mem.Allocator, s: *const UdpSocket, items: []const UdpSocket.Outgoing) error{OutOfMemory}!*Batch {
+        var total: usize = 0;
+        for (items) |it| total += it.bytes.len;
+        const size = header + items.len * @sizeOf(Pending) + total;
+        const mem = try gpa.alignedAlloc(u8, .of(Batch), size);
+        // SAFETY: `mem` is aligned for a Batch and starts with `header` bytes for one.
+        const b: *Batch = @ptrCast(mem.ptr);
+        b.* = .{ .gpa = gpa, .count = @intCast(items.len), .bytes = @intCast(total), .size = size };
+        const slots = b.entries();
+        const data = b.payload();
+        var off: usize = 0;
+        for (items, slots) |it, *p| {
+            @memcpy(data[off..][0..it.bytes.len], it.bytes);
+            p.* = .{ .to = s.onWire(it.to), .from = if (it.from) |f| s.onWire(f) else null, .off = off, .len = it.bytes.len };
+            off += it.bytes.len;
+        }
+        return b;
+    }
+
+    fn base(b: *Batch) [*]align(@alignOf(Batch)) u8 {
+        // SAFETY: a Batch heads the allocation `create` made.
+        return @ptrCast(b);
+    }
+
+    fn entries(b: *Batch) []Pending {
+        // SAFETY: `create` placed `count` entries at `header`, aligned for them (`header` is aligned forward to `Pending`).
+        const at: [*]Pending = @ptrCast(@alignCast(b.base() + header));
+        return at[0..b.count];
+    }
+
+    fn payload(b: *Batch) []u8 {
+        return (b.base() + header + @as(usize, b.count) * @sizeOf(Pending))[0..b.bytes];
+    }
+
+    fn destroy(b: *Batch) void {
+        b.gpa.free(b.base()[0..b.size]);
+    }
+
+    fn of(n: *push_list.Node) *Batch {
+        return @fieldParentPtr("node", n);
+    }
+};
 const SessionNode = sessions_mod.SessionTable(Session);
 
 /// One socket of a UDP listener.
@@ -257,16 +322,19 @@ pub const UdpSocket = struct {
     last_dropped: ?u32 = null,
     table: ?SessionNode = null,
 
-    // Cross-task sends (any thread), under `qlock`.
-    qlock: std.atomic.Mutex = .unlocked,
-    pending: std.ArrayList(Pending) = .empty,
-    pending_buf: std.ArrayList(u8) = .empty,
-    queue_bytes: usize = 0,
-    want_writable: bool = false,
+    /// The executor its tasks run on (T3): `go` and the sender check it.
+    owner: safety.Owner = .none,
+    // Sends from any task or thread: no lock.
+    /// Batches to send; owner: the sender, which seals it when it ends.
+    pending: push_list.PushList = .{},
+    /// Bytes in `pending` and in the batch being sent: reserved with a
+    /// compare-and-swap bounded by `send_queue`.
+    queue_bytes: std.atomic.Value(u64) = .init(0),
+    want_writable: std.atomic.Value(bool) = .init(false),
     signal: placement.Signal = .{},
+    /// `go`'s tasks: children of the socket, on its executor (T1).
+    tasks: std.Io.Group = .init,
     // Sender task only.
-    work: std.ArrayList(Pending) = .empty,
-    work_buf: std.ArrayList(u8) = .empty,
     send_box: ?low.Udp.Outbox = null,
     closed: std.atomic.Value(bool) = .init(false),
 
@@ -301,6 +369,19 @@ pub const UdpSocket = struct {
     }
 
     /// A drop, counted here and in the Prometheus series.
+    /// Seals the send queue and drops what is in it, counted (`send_failed`).
+    /// Nothing for a socket whose sender ended (it sealed its own queue).
+    fn dropUnsent(s: *UdpSocket) void {
+        var it = s.pending.seal();
+        while (it) |n| {
+            it = n.next;
+            const b = Batch.of(n);
+            _ = s.queue_bytes.fetchSub(b.bytes, .monotonic);
+            s.countDrop(.send_failed, b.count);
+            b.destroy();
+        }
+    }
+
     fn countDrop(s: *UdpSocket, why: net_metrics.DropReason, n: u64) void {
         const field = switch (why) {
             .kernel => &s.stats.dropped_kernel,
@@ -313,92 +394,83 @@ pub const UdpSocket = struct {
         if (s.group.series) |m| m.drop(why, n);
     }
 
-    fn lockQ(s: *UdpSocket) void {
-        while (!s.qlock.tryLock()) std.atomic.spinLoopHint();
-    }
-
     /// A datagram to `to` (from `from` when given): any task or thread;
-    /// queued and sent by the socket's sender, never waits.
+    /// queued and sent by the socket's sender, never waits. A send that
+    /// races the stop answers `error.Closed`: it is never taken and lost.
     pub fn send(s: *UdpSocket, to: std.Io.net.IpAddress, from: ?std.Io.net.IpAddress, bytes: []const u8) Datagram.SendError!void {
         if (bytes.len > 65507) return error.TooLarge;
         if (s.closed.load(.acquire)) return error.Closed;
-        const cap = s.group.service.options.send_queue;
-        s.lockQ();
-        if (s.queue_bytes + bytes.len > cap) {
-            s.want_writable = true;
-            s.qlock.unlock();
-            s.countDrop(.queue_full, 1);
-            return error.QueueFull;
-        }
-        const was_empty = s.pending.items.len == 0;
-        const off = s.pending_buf.items.len;
-        s.pending_buf.appendSlice(s.group.gpa, bytes) catch {
-            s.qlock.unlock();
-            return error.OutOfMemory;
-        };
-        s.pending.append(s.group.gpa, .{ .to = s.onWire(to), .from = if (from) |f| s.onWire(f) else null, .off = off, .len = bytes.len }) catch {
-            s.pending_buf.shrinkRetainingCapacity(off);
-            s.qlock.unlock();
-            return error.OutOfMemory;
-        };
-        s.queue_bytes += bytes.len;
-        const over_half = s.queue_bytes > cap / 2;
-        if (over_half) s.want_writable = true;
-        s.qlock.unlock();
-        if (was_empty) s.signal.set(s.group.io);
+        return s.enqueue(&.{.{ .to = to, .from = from, .bytes = bytes }});
     }
 
     /// Whether the queue is past half full (the ABI's BUSY).
     pub fn queueBusy(s: *UdpSocket) bool {
-        s.lockQ();
-        defer s.qlock.unlock();
-        return s.queue_bytes > s.group.service.options.send_queue / 2;
+        return s.queue_bytes.load(.acquire) > s.group.service.options.send_queue / 2;
     }
 
-    /// Queues many datagrams, all or none (the ABI's `anole_net_udp_send`).
-    /// Each is copied under one lock.
+    /// Queues many datagrams, all or none (the ABI's `anole_net_udp_send`),
+    /// copied into one batch.
     pub fn sendMany(s: *UdpSocket, items: []const Outgoing) Datagram.SendError!void {
         if (s.closed.load(.acquire)) return error.Closed;
-        var total: usize = 0;
-        for (items) |it| {
-            if (it.bytes.len > 65507) return error.TooLarge;
-            total += it.bytes.len;
-        }
+        for (items) |it| if (it.bytes.len > 65507) return error.TooLarge;
+        return s.enqueue(items);
+    }
+
+    /// The batch is made first (the only allocation), then its bytes are
+    /// reserved, then it is pushed; the sender is woken when the list was
+    /// empty, through the group's gate (T5).
+    fn enqueue(s: *UdpSocket, items: []const Outgoing) Datagram.SendError!void {
         const cap = s.group.service.options.send_queue;
-        s.lockQ();
-        if (s.queue_bytes + total > cap) {
-            s.want_writable = true;
-            s.qlock.unlock();
-            s.countDrop(.queue_full, items.len);
-            return error.QueueFull;
+        var total: u64 = 0;
+        for (items) |it| total += it.bytes.len;
+        // More than the queue holds empty: never taken (not QueueFull,
+        // which promises a WRITABLE).
+        if (total > cap) return error.TooLarge;
+        const b = try Batch.create(s.group.gpa, s, items);
+        const n: u64 = b.bytes;
+        var q = s.queue_bytes.load(.monotonic);
+        while (true) {
+            if (q + n > cap) {
+                testHold(&test_full_hold);
+                // Asks for WRITABLE, then looks again (the store-buffering
+                // pair with `finishWork`'s subtraction then flag load, all
+                // `.seq_cst`): a batch that left after the look above read
+                // the flag unset, so the send is tried again. Still full:
+                // what is queued now leaves later, and that `finishWork`
+                // sees the flag. (A retry that fits leaves the flag set:
+                // one WRITABLE too many, which the contract allows.)
+                s.want_writable.store(true, .seq_cst);
+                const again = s.queue_bytes.load(.seq_cst);
+                if (again + n <= cap) {
+                    q = again;
+                    continue;
+                }
+                b.destroy();
+                s.countDrop(.queue_full, items.len);
+                return error.QueueFull;
+            }
+            q = s.queue_bytes.cmpxchgWeak(q, q + n, .acq_rel, .monotonic) orelse break;
         }
-        const was_empty = s.pending.items.len == 0;
-        s.pending_buf.ensureUnusedCapacity(s.group.gpa, total) catch {
-            s.qlock.unlock();
-            return error.OutOfMemory;
+        if (q + n > cap / 2) s.want_writable.store(true, .release);
+        testHold(&test_send_hold);
+        // Sealed: the sender has ended (the stop).
+        const was_empty = s.pending.push(&b.node) catch {
+            _ = s.queue_bytes.fetchSub(n, .acq_rel);
+            b.destroy();
+            return error.Closed;
         };
-        s.pending.ensureUnusedCapacity(s.group.gpa, items.len) catch {
-            s.qlock.unlock();
-            return error.OutOfMemory;
-        };
-        for (items) |it| {
-            const off = s.pending_buf.items.len;
-            s.pending_buf.appendSliceAssumeCapacity(it.bytes);
-            s.pending.appendAssumeCapacity(.{ .to = s.onWire(it.to), .from = if (it.from) |f| s.onWire(f) else null, .off = off, .len = it.bytes.len });
-        }
-        s.queue_bytes += total;
-        if (s.queue_bytes > cap / 2) s.want_writable = true;
-        s.qlock.unlock();
-        if (was_empty) s.signal.set(s.group.io);
+        if (was_empty) s.group.wake(s);
     }
 
     pub const Outgoing = struct { to: std.Io.net.IpAddress, from: ?std.Io.net.IpAddress, bytes: []const u8 };
 
     /// Runs `func(args...)` on a task on this socket's executor (work a
-    /// datagram handler must not wait for). Canceled at the stop.
+    /// datagram handler must not wait for). From a handler (the socket's
+    /// executor). Canceled at the stop.
     pub fn go(s: *UdpSocket, comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) error{ OutOfMemory, Closed }!void {
         if (s.closed.load(.acquire)) return error.Closed;
-        placement.concurrent(&s.group.tasks, s.group.io, .{ .executor = s.exec }, func, args) catch return error.OutOfMemory;
+        s.owner.check(s.group.io);
+        placement.concurrent(&s.tasks, s.group.io, .local, func, args) catch return error.OutOfMemory;
     }
 
     // -- Replies made inside a handler ---------------------------------------
@@ -435,6 +507,8 @@ pub const UdpSocket = struct {
     fn reader(s: *UdpSocket) std.Io.Cancelable!void {
         const g = s.group;
         const io = g.io;
+        // The reader and the sender run on this socket's executor.
+        s.owner = .here(io);
         const o = &g.service.options;
         const table = g.service.table;
         defer {
@@ -607,11 +681,13 @@ pub const UdpSocket = struct {
 
     fn sender(s: *UdpSocket) std.Io.Cancelable!void {
         const io = s.group.io;
+        s.owner = .here(io);
         defer {
-            // What other tasks queued goes out before the socket does.
+            // Sealed first, so a later send gets Closed; what got in goes
+            // out before the socket does.
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
-            s.drainQueue();
+            s.sendBatches(s.pending.seal());
         }
         while (true) {
             try s.signal.wait(io);
@@ -621,26 +697,36 @@ pub const UdpSocket = struct {
     }
 
     fn drainQueue(s: *UdpSocket) void {
+        s.owner.check(s.group.io);
+        s.sendBatches(s.pending.takeAll());
+    }
+
+    /// Sends the batches of `first` (oldest first) and frees them.
+    fn sendBatches(s: *UdpSocket, first: ?*push_list.Node) void {
+        if (first == null) return;
         const gpa = s.group.gpa;
-        s.lockQ();
-        std.mem.swap(std.ArrayList(Pending), &s.pending, &s.work);
-        std.mem.swap(std.ArrayList(u8), &s.pending_buf, &s.work_buf);
-        s.qlock.unlock();
-        if (s.work.items.len == 0) return;
-        if (s.send_box == null) s.send_box = low.Udp.Outbox.init(gpa) catch {
-            // No memory for a box: the datagrams are dropped, counted.
-            s.countDrop(.send_failed, s.work.items.len);
-            s.finishWork();
-            return;
-        };
-        const box = &s.send_box.?;
-        for (s.work.items) |p| {
-            if (!box.fits(p.len, 1)) s.sendBox(box);
-            @memcpy(box.space()[0..p.len], s.work_buf.items[p.off..][0..p.len]);
-            box.commit(&s.udp, p.to, p.from, 0, p.len, 0);
+        var bytes: u64 = 0;
+        var it = first;
+        if (s.send_box == null) s.send_box = low.Udp.Outbox.init(gpa) catch null;
+        while (it) |node| {
+            it = node.next;
+            const b = Batch.of(node);
+            bytes += b.bytes;
+            if (s.send_box) |*box| {
+                const dgram_bytes = b.payload();
+                for (b.entries()) |p| {
+                    if (!box.fits(p.len, 1)) s.sendBox(box);
+                    @memcpy(box.space()[0..p.len], dgram_bytes[p.off..][0..p.len]);
+                    box.commit(&s.udp, p.to, p.from, 0, p.len, 0);
+                }
+            } else {
+                // No memory for a box: the datagrams are dropped, counted.
+                s.countDrop(.send_failed, b.count);
+            }
+            b.destroy();
         }
-        s.sendBox(box);
-        s.finishWork();
+        if (s.send_box) |*box| s.sendBox(box);
+        s.finishWork(bytes);
     }
 
     fn sendBox(s: *UdpSocket, box: *low.Udp.Outbox) void {
@@ -652,25 +738,36 @@ pub const UdpSocket = struct {
         _ = s.stats.send_flushes.fetchAdd(1, .monotonic);
     }
 
-    /// The batch is out: its bytes leave the queue's account, and a sender
-    /// that was told to wait hears it may go on.
-    fn finishWork(s: *UdpSocket) void {
-        var bytes: usize = 0;
-        for (s.work.items) |p| bytes += p.len;
-        s.work.clearRetainingCapacity();
-        s.work_buf.clearRetainingCapacity();
+    /// The batches are out: their bytes leave the queue's account, and a
+    /// sender that was told to wait hears it may go on (on this task).
+    fn finishWork(s: *UdpSocket, bytes: u64) void {
         const cap = s.group.service.options.send_queue;
-        var notify = false;
-        s.lockQ();
-        s.queue_bytes -= bytes;
-        if (s.want_writable and s.queue_bytes < cap / 4) {
-            s.want_writable = false;
-            notify = true;
+        // `.seq_cst` subtraction, then flag load: see `enqueue`.
+        const was = s.queue_bytes.fetchSub(bytes, .seq_cst);
+        if (was - bytes < cap / 4 and s.want_writable.load(.seq_cst) and s.want_writable.swap(false, .acq_rel)) {
+            if (s.group.service.table.writable) |f| f(s.group.service.state, s);
         }
-        s.qlock.unlock();
-        if (notify) if (s.group.service.table.writable) |f| f(s.group.service.state, s);
     }
 };
+
+/// Test hooks (test builds only): the next `send` stops at a point and
+/// holds there (`held` set) until the test sets `release`. Taken once.
+/// `test_send_hold`: after the reservation, where a stop can race it;
+/// `test_full_hold`: a send found the queue full and has not yet asked for
+/// WRITABLE.
+pub const TestHold = struct {
+    held: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+};
+pub var test_send_hold: if (builtin.is_test) std.atomic.Value(?*TestHold) else void = if (builtin.is_test) .init(null) else {};
+pub var test_full_hold: if (builtin.is_test) std.atomic.Value(?*TestHold) else void = if (builtin.is_test) .init(null) else {};
+
+fn testHold(which: anytype) void {
+    if (comptime !builtin.is_test) return;
+    const h = which.swap(null, .acq_rel) orelse return;
+    h.held.store(true, .release);
+    while (!h.release.load(.acquire)) std.Thread.yield() catch {};
+}
 
 /// One UDP listener: its sockets and their tasks.
 pub const UdpGroup = struct {
@@ -681,8 +778,9 @@ pub const UdpGroup = struct {
     sockets: []UdpSocket,
     readers: std.Io.Group = .init,
     senders: std.Io.Group = .init,
-    /// `go` tasks of every socket.
-    tasks: std.Io.Group = .init,
+    /// Every wake of a sender from off its executor goes through it (T5);
+    /// closed at the end of `run`, once the senders have ended.
+    gate: safety.IoGate = .{},
     handed_over: std.atomic.Value(bool) = .init(false),
     /// The Prometheus series, set before serving when the app has metrics.
     series: ?*net_metrics.UdpSeries = null,
@@ -811,10 +909,12 @@ pub const UdpGroup = struct {
         if (s.table) |*t| t.deinit();
         if (s.outbox) |*b| b.deinit(gpa);
         if (s.send_box) |*b| b.deinit(gpa);
-        s.pending.deinit(gpa);
-        s.pending_buf.deinit(gpa);
-        s.work.deinit(gpa);
-        s.work_buf.deinit(gpa);
+        // Never served (or a send after the stop): what is still queued.
+        var it = s.pending.seal();
+        while (it) |n| {
+            it = n.next;
+            Batch.of(n).destroy();
+        }
         gpa.free(s.rx);
         gpa.free(s.msgs);
         gpa.free(s.controls);
@@ -845,8 +945,15 @@ pub const UdpGroup = struct {
         defer {
             g.readers.cancel(io);
             for (g.sockets) |*s| s.closed.store(true, .release);
-            g.tasks.cancel(io);
+            for (g.sockets) |*s| s.tasks.cancel(io);
+            // Each sender seals its queue as it ends: a send after that
+            // answers Closed.
             g.senders.cancel(io);
+            // A socket whose sender never started (a spawn failed part way)
+            // is sealed here: its later sends answer Closed too, and what
+            // got in is dropped and counted.
+            for (g.sockets) |*s| s.dropUnsent();
+            g.gate.close();
         }
         for (g.sockets) |*s| {
             try placement.concurrent(&g.readers, io, .{ .executor = s.exec }, UdpSocket.reader, .{s});
@@ -855,6 +962,13 @@ pub const UdpGroup = struct {
         // Until canceled; a hand-over ends the readers, not the group.
         var forever: std.Io.Event = .unset;
         forever.wait(io) catch return error.Canceled;
+    }
+
+    /// Wakes `s`'s sender from any thread (T5).
+    fn wake(g: *UdpGroup, s: *UdpSocket) void {
+        if (!g.gate.enter()) return;
+        defer g.gate.leave();
+        s.signal.set(g.io);
     }
 
     /// A restart passes the sockets to a new process: the readers stop at

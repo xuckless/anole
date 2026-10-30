@@ -69,6 +69,9 @@ pub const BufferedSink = struct {
     parts: ?[]const []const u8 = null,
     /// From `body`.
     streamed: std.ArrayList(u8) = .empty,
+    /// `result`'s one part when the body was streamed: the answer's
+    /// `parts` points here, so it lives as long as the sink.
+    streamed_part: [1][]const u8 = .{&.{}},
     writer: std.Io.Writer,
 
     pub fn init(arena: std.mem.Allocator, limit: usize) BufferedSink {
@@ -152,8 +155,11 @@ pub const BufferedSink = struct {
     }
 
     /// What was written, ready to encode.
-    pub fn result(self: *const BufferedSink, head_only: bool) encode.Answer {
-        const parts: []const []const u8 = if (self.parts) |p| p else &.{self.streamed.items};
+    pub fn result(self: *BufferedSink, head_only: bool) encode.Answer {
+        const parts: []const []const u8 = if (self.parts) |p| p else blk: {
+            self.streamed_part = .{self.streamed.items};
+            break :blk &self.streamed_part;
+        };
         return .{ .status = statusCode(self.status), .headers = self.headers.?, .parts = parts, .head = head_only };
     }
 

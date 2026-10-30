@@ -151,7 +151,8 @@ enum {
   ANOLE_E_CONFIG = -5,      /* see anole_last_error */
   ANOLE_E_STATE = -6,       /* not allowed in this state */
   ANOLE_E_UNSUPPORTED = -7, /* compiled out, or not on this OS */
-  ANOLE_E_TOOBIG = -8,      /* anole_poll: the next event does not fit */
+  ANOLE_E_TOOBIG = -8,      /* anole_poll: the next event does not fit; a send: more than
+                               the call can ever take (see the call) */
   ANOLE_E_SYSTEM = -9,      /* the OS refused (threads, sockets, files) */
   ANOLE_E_TIMEOUT = -10,    /* a blocking call's timeout passed */
   ANOLE_E_DB = -11,         /* a database refused a statement (anole_db_result_event) */
@@ -1844,8 +1845,8 @@ typedef struct anole_kafka_assign_event {
    framing) or datagrams (UDP) to the consumer as events, instead of HTTP.
    Writes never wait for the peer: a write returns once the bytes are
    queued (ANOLE_BUSY past tcp.write_high_water, ANOLE_E_AGAIN past
-   tcp.write_max with nothing taken), and ANOLE_EV_WRITABLE says when to go
-   on. A connection posts at most tcp.read_ahead bytes the consumer has not
+   tcp.write_max with nothing taken, ANOLE_E_TOOBIG for one write larger
+   than tcp.write_max), and ANOLE_EV_WRITABLE says when to go on. A connection posts at most tcp.read_ahead bytes the consumer has not
    polled; the rest waits in the kernel (TCP flow control). */
 
 /* An IP address and port, binary (no parsing on the hot path). family 4:
@@ -1963,7 +1964,9 @@ typedef struct anole_net_datagrams_event {
    follows; a framed write is always copied); never blocks, never waits for
    the peer. ANOLE_OK; ANOLE_BUSY: taken, but past tcp.write_high_water bytes
    wait (write no more until ANOLE_EV_WRITABLE on c); ANOLE_E_AGAIN: not
-   taken, past tcp.write_max (ANOLE_EV_WRITABLE follows); ANOLE_E_INVALID: a
+   taken, no room under tcp.write_max now (ANOLE_EV_WRITABLE follows);
+   ANOLE_E_TOOBIG: len (with its framing) over tcp.write_max, never taken
+   (no ANOLE_EV_WRITABLE follows for it); ANOLE_E_INVALID: a
    flag, ANOLE_NET_F_FRAME on a listener without framing or over its max, or
    after this side ended ("Ended"); ANOLE_E_GONE once closed. */
 ANOLE_API anole_status anole_net_write(anole_net_conn c, const void *data, size_t len, uint32_t flags);
@@ -1992,7 +1995,8 @@ typedef struct anole_net_datagram {
 /* Queues n datagrams on u (all copied), sent together; never blocks. All or
    none: ANOLE_OK; ANOLE_BUSY (taken, past half of udp.send_queue);
    ANOLE_E_AGAIN (none taken: the queue is full; ANOLE_EV_WRITABLE on u
-   follows); ANOLE_E_INVALID (a datagram over 65507 bytes or the socket's
+   follows); ANOLE_E_TOOBIG (their bytes together over udp.send_queue:
+   never taken, no ANOLE_EV_WRITABLE follows); ANOLE_E_INVALID (a datagram over 65507 bytes or the socket's
    max_datagram, an address of the wrong family, n 0, flags != 0);
    ANOLE_E_GONE after the stop. Datagrams are unreliable: one the kernel
    refuses is dropped and counted. */

@@ -109,6 +109,9 @@ const aliases = [_][2][]const u8{
 };
 
 fn toSet(comptime Set: type, err: anyerror) Set {
+    // The alias x member comparisons run at compile time; optimized
+    // builds evaluate them past the default quota.
+    @setEvalBranchQuota(100_000);
     const name = @errorName(err);
     const members = @typeInfo(Set).error_set.error_names.?;
     inline for (members) |m| if (std.mem.eql(u8, name, m)) return @field(Set, m);
@@ -493,6 +496,7 @@ pub fn explainBuf(buf: []u8, err: ServerError, ctx: Context) []const u8 {
 /// The member of `ServerError` that `name` stands for (an alias too), or
 /// null. Does not log.
 pub fn serverErrorNamed(name: []const u8) ?ServerError {
+    @setEvalBranchQuota(100_000);
     inline for (@typeInfo(ServerError).error_set.error_names.?) |m| if (std.mem.eql(u8, name, m)) return @field(ServerError, m);
     inline for (aliases) |alias| if (std.mem.eql(u8, name, alias[0])) {
         inline for (@typeInfo(ServerError).error_set.error_names.?) |m| if (comptime std.mem.eql(u8, alias[1], m)) return @field(ServerError, m);
