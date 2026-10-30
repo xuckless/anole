@@ -20,6 +20,7 @@
 //! raw path, so their number stays bounded.
 const std = @import("std");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const common = @import("common.zig");
 
 /// A value that only goes up (requests, errors, bytes). Safe from any
@@ -117,7 +118,9 @@ pub fn Family(comptime T: type) type {
         help: []const u8,
         labels: []const []const u8,
         buckets: []const f64 = &default_buckets,
-        mutex: std.Io.Mutex = .init,
+        /// Guards `series` (a leaf: held for a lookup, an insert or a
+        /// render into memory, never across the caller's writer).
+        mutex: safety.Mutex(.leaf) = .init,
         series: std.StringArrayHashMapUnmanaged(*T) = .empty,
 
         /// The series for these label values (as many as the labels).
@@ -158,12 +161,24 @@ pub fn Family(comptime T: type) type {
             self.series.deinit(gpa);
         }
 
+        /// Renders into memory under the lock, then writes that to `w`
+        /// with no lock held (`w` may suspend).
         fn render(self: *Self, w: *std.Io.Writer) !void {
+            var text: std.Io.Writer.Allocating = .init(self.registry.gpa);
+            defer text.deinit();
+            {
+                const io = self.registry.io;
+                self.mutex.lockUncancelable(io);
+                defer self.mutex.unlock(io);
+                try self.renderSeries(&text.writer);
+            }
+            try w.writeAll(text.written());
+        }
+
+        /// Under `mutex`.
+        fn renderSeries(self: *Self, w: *std.Io.Writer) !void {
             const kind = if (T == Counter) "counter" else if (T == Gauge) "gauge" else "histogram";
             try w.print("# HELP {s} {s}\n# TYPE {s} {s}\n", .{ self.name, self.help, self.name, kind });
-            const io = self.registry.io;
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
             for (self.series.keys(), self.series.values()) |key, s| {
                 if (T == Histogram) {
                     for (s.bounds, 0..) |b, i| {
@@ -234,7 +249,9 @@ fn escape(w: *std.Io.Writer, v: []const u8) !void {
 pub const Registry = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    mutex: std.Io.Mutex = .init,
+    /// Guards the three lists (a leaf: never held while a family's lock is
+    /// taken; families are never removed before `deinit`).
+    mutex: safety.Mutex(.leaf) = .init,
     counters: std.ArrayList(*Family(Counter)) = .empty,
     gauges: std.ArrayList(*Family(Gauge)) = .empty,
     histograms: std.ArrayList(*Family(Histogram)) = .empty,
@@ -294,14 +311,28 @@ pub const Registry = struct {
         return f;
     }
 
-    /// Every metric in the text exposition format (version 0.0.4).
+    /// Every metric in the text exposition format (version 0.0.4). Takes
+    /// a copy of the list of families under the registry's lock, then
+    /// renders each family under its own lock only, and writes nothing to
+    /// `w` while a lock is held: `w` may be any writer.
     pub fn render(self: *Registry, w: *std.Io.Writer) !void {
         if (self.runtime_gauges) @import("runtime.zig").refresh(self);
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        for (self.counters.items) |f| try f.render(w);
-        for (self.gauges.items) |f| try f.render(w);
-        for (self.histograms.items) |f| try f.render(w);
+        const counters, const gauges, const histograms = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            const c = try self.gpa.dupe(*Family(Counter), self.counters.items);
+            errdefer self.gpa.free(c);
+            const g = try self.gpa.dupe(*Family(Gauge), self.gauges.items);
+            errdefer self.gpa.free(g);
+            const h = try self.gpa.dupe(*Family(Histogram), self.histograms.items);
+            break :blk .{ c, g, h };
+        };
+        defer self.gpa.free(counters);
+        defer self.gpa.free(gauges);
+        defer self.gpa.free(histograms);
+        for (counters) |f| try f.render(w);
+        for (gauges) |f| try f.render(w);
+        for (histograms) |f| try f.render(w);
     }
 
     /// Serves `render` at `path` ("/metrics" by convention) on `router`.

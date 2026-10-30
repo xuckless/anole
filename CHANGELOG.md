@@ -214,10 +214,119 @@ breaking changes are listed anyway.
 - C ABI config: a watch on a SQLite database is refused with "is SQLite,
   which has no change feed"; it said the database was not PostgreSQL (or
   Redis, MongoDB), which hid the reason.
+- Jobs: a job still running after the server stopped could use a connector
+  the app had already freed (`app.webhooks`, or any connector made after
+  `app.jobs`), crashing the process at shutdown; a webhook delivery in
+  flight was enough, and so was a send on `app.udpSocket`. The app now
+  ends every job run before it frees anything a handler may use (the
+  connectors, the raw TCP/UDP listeners, the HTTP/3 endpoint). Connectors
+  made after `app.jobs` therefore stay open, and their own tasks running,
+  for the whole jobs drain at shutdown. Outside an app,
+  `jobs.Client.stopWork` ends the runs before you free what the handlers
+  use. `app.jobs` and `app.webhooks` failing to start while the app is
+  serving no longer leave the freed client in the app's list, which the
+  teardown freed again.
+- Jobs: with the PostgreSQL store, a cancel during the leader's
+  advisory-lock query was taken for "not the leader", so a canceled
+  maintenance round carried on until its next poll. The cancel now ends
+  the round, and the process reports it no longer leads
+  (`anole_jobs_leader` 0), since the failed query closed the session that
+  held the lock.
+- Jobs: the metrics no longer allocate under a spin lock when they see a
+  new job kind.
+- Kafka: after the producer id was reset (UNKNOWN_PRODUCER_ID, an epoch or
+  sequence error), a sender for another broker could number its next batch
+  under the new id from the old sequence; the broker refused it as out of
+  order and the producer asked for yet another id. A sender that had taken
+  the id just before the reset could number its batch under the old id from
+  the reset sequence, which the broker took for a duplicate: the batch was
+  reported delivered and never stored. The reset and the renumbering are
+  now one step, and a sender numbers its batches under the id of that step.
+- Kafka: a consumer group whose start failed (no memory for its tasks) was
+  freed while the client still listed it, and freed again with the client.
+- Kafka: a call canceled while it waited for a broker's answer (a server
+  stopping under a produce that was refreshing the metadata) failed as a
+  lost connection, and the cancel was lost with it: the task went on and
+  waited again, holding up the stop. It now ends with the cancel.
+- Kafka: a send or produce to an existing topic could fail with
+  UNKNOWN_TOPIC_OR_PARTITION when a stale leader dropped the topic from the
+  metadata cache right after the call's own refresh; it now asks again.
+- Kafka: when a partition's leader broker had no sender yet and starting
+  one failed (no memory, the spawn failed), or the start another call had
+  under way failed, the partition kept that leader: its records waiting in
+  the open batch were neither sent nor expired, and a waiting produce
+  without a timeout or a flush waited for good. A failed start now gives
+  the broker's partitions back to the resolver, which assigns them again.
+- C ABI: a consumer thread calling `anole_kafka_produce` without pause kept
+  the produce pump running on its executor, so the engine stop posted there
+  waited; the pump now lets the executor's other tasks run every 64 records.
+- Tracing: `Exporter.flush` keeps its caller's cancel (it swallowed it,
+  which delayed a Lambda shutdown to the next cancellation point), several
+  tasks may flush at once (each waits for the spans queued when it called),
+  and a flush that a `close` overtakes returns at once. Spans still queued
+  at `close` count as dropped.
+- gRPC: a channel that redials no longer holds its lock while it dials, so
+  calls on other executors that need nothing of the dial no longer wait
+  behind a TCP and TLS handshake; calls that find a dial running still wait
+  for it, and only one dial runs at a time.
+- NATS: `close()` no longer holds the client's lock while it shuts a
+  connection attempt's socket down; publishes on other executors no longer
+  wait behind it.
+- Console: the log rings, the stats tables, the snapshot answers and the
+  client list no longer allocate while a spin lock is held, which made log
+  calls on every executor spin behind a console thread's allocation.
+  `anole_console_report` keeps its metrics in fixed room (a name of 1 to 48
+  bytes, a unit of at most 16).
+- Metrics: a scrape renders each metric under that metric's lock only, and
+  writes to the caller's writer with no lock held. A scrape held the
+  registry's lock while it waited for each metric's, and wrote to the
+  response under it.
+- Resilience: breaker state reaches the metrics with no lock of the
+  breakers held; a breaker made or observed reported its state under its
+  shard's lock, which took the metrics' locks under it. A breaker whose
+  state changes between that look and its report is reported again, so
+  `anole_breaker_state` ends on its state.
 - Lambda: a buffered answer whose body the handler streamed (`res.stream`)
   was encoded from a part list that pointed into a returned function's
   stack, so the answer could carry garbage or crash; it now lives in the
   sink. Seen as a crash in ReleaseSafe test builds.
+- Redis, SQLite: a connection from `acquire()` released twice is given
+  back once; the second `release()` does nothing but log. Redis handed the
+  connection to two later callers at once, and SQLite rolled back the
+  next holder's transaction and let the writer go under it. A SQLite
+  transaction (read-only ones on a reader too) or `iterate()` rows (on a
+  reader, on the writer, or a transaction's) ended through a copy of the
+  value or of their transaction, then `deinit` on the original, likewise
+  does nothing but log: on a reader, the second end rolled back the next
+  holder's snapshot, reset the statement it was stepping and gave the
+  reader back twice (two holders at once, or a write past the free list).
+  A SQLite transaction's end (commit, rollback or `deinit`) resets the
+  statements of its `iterate()` rows still open (finalizes them with the
+  statement cache off), so the connection goes back with none of them
+  mid-result, and those rows' `deinit` after it does nothing. Before, the
+  connection went back with the statement stepping, which kept its old
+  snapshot (later writes unseen there) and handed the next call of the same
+  SQL the cached statement where the rows had left it, and the rows' later
+  `deinit` reset it under the next holder. Such rows' `next` now fails with
+  `error.Database` when it needs another batch, instead of stepping a
+  connection given back.
+- MongoDB: closing the client, or a server leaving the topology, stops
+  that server's monitor by cancellation; nothing outside the monitor
+  touches its connection any more, which could be shut down after the
+  monitor had freed it. A server joining the topology starts its monitor
+  outside the topology lock.
+- Readiness (`/readyz`): a ping canceled with its request no longer
+  swallows the cancel (the request's task went on uncancelable) and is not
+  kept as "not ready" (for 30 s with SMTP); probes while a ping runs
+  answer with the last result instead of waiting for it.
+- SMTP: closing idle connections allocates nothing and never sends QUIT
+  under the pool lock.
+- SQLite: a `begin(req)` canceled (or timed out) while its BEGIN ran, and
+  a `tx.rollback(req)` on a canceled request or past its deadline, gave
+  the connection back with the transaction open, so the next call on the
+  writer failed with "cannot start a transaction within a transaction" or
+  had its own work rolled back. Both roll back first now, as `tx.deinit()`
+  does; `rollback` fails only on a transaction that is over.
 
 ### Changed
 
@@ -339,10 +448,36 @@ breaking changes are listed anyway.
   `safety.SpinLock` is held, naming where the lock was taken (L5).
   `safety.IoLock` is the lock L2 now allows across a suspension (an I/O
   resource's one writer), taken only with no other lock held.
+- Kafka: no lock is held while a metadata refresh, a producer id request,
+  a sender start or a consumer group start waits (SAFETY.md L2, L3), and a
+  waiting produce no longer allocates per call: its outcome comes through a
+  generation-checked slot of the producer. Metadata refreshes still run one
+  at a time. A consumer group added after the client's drain began is
+  refused (`error.Closing`; over the C ABI its group ends as closed or
+  drained), so the list the drain joins no longer grows under it.
+  `Client.start` marks the client started only once its
+  metrics, tracing, health check and the start's metadata refresh
+  succeeded, so a failed start can be called again; `consume` doesn't
+  start groups added before a successful start (the next `start` does).
+- `anole.kafka.impl.producer`: `Slot` is gone and `Producer.append` takes no
+  slot; a waiting append is `appendWaiting`, then `waitFor` or `abandon`.
+- C ABI: `anole_kafka_produce` and `anole_kafka_flush` queue on a lock-free
+  list instead of a spin lock. After the broker is destroyed they return the
+  state error; before, the call queued a record that nothing freed.
+- Test utilities: `anole.kafka.testing.FakeBroker` has `Config.nodes`
+  (that many broker ids at its one address, partition `p` led by
+  `p % nodes`, so a test can have several partition leaders), counts the
+  batches it refused as out of order (`out_of_order`), and can answer every
+  partition without a leader (`hide_leaders`).
 - Debug and test builds: a `safety.IoLock` is checked per task, not per
   executor thread, so a task taking one while another task on its executor
   is suspended holding one no longer panics, and releasing one is checked
   against the task that took it.
+- `anole.db.Readiness.ping` returns `std.Io.Cancelable!bool`: a ping
+  returns `error.Canceled` when its caller was canceled (no answer is kept
+  then), `false` for any other failure. The SQLite writer is checked out by
+  one call, transaction or `acquire` at a time with no order among the
+  waiters (docs said "in arrival order", which it never was).
 
 ## 0.4.0 (2026-10-25)
 

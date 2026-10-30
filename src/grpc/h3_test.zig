@@ -510,6 +510,50 @@ test "grpc channel .auto: HTTP/3 unreachable, calls stay on h2" {
     }.run);
 }
 
+/// Another call between the third call's look at its gone HTTP/3
+/// connection and its lock: it dials a new one, which goes too.
+const DialedBetween = struct {
+    var transport: ?grpc.Transport = null;
+
+    fn dialAndLose(channel: *grpc.Channel) void {
+        const client: grpc.Client(Echo) = .{ .channel = channel };
+        var arena_state = newArena();
+        defer arena_state.deinit();
+        const r = client.unary("Unary", arena_state.allocator(), .{ .message = "between" }, .{}) catch return;
+        if (r.status.code == .ok) transport = r.transport;
+        channel.h3.?.testGoaway();
+    }
+};
+
+test "grpc channel .auto: an HTTP/3 connection another call dialed is not used once it has gone" {
+    try withServer(.{}, struct {
+        fn run(env: *Env) !void {
+            const channel = try grpc.Channel.connect(env.gpa, env.io, env.options(), .{ .http = .auto });
+            defer channel.close();
+            const client: grpc.Client(Echo) = .{ .channel = channel };
+            var arena_state = newArena();
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            _ = try client.unary("Unary", arena, .{ .message = "1" }, .{});
+            const second = try client.unary("Unary", arena, .{ .message = "2" }, .{});
+            try std.testing.expectEqual(grpc.Transport.h3, second.transport);
+            // The HTTP/3 connection goes; the next call finds it gone, and
+            // before it takes the channel's lock another call dials a new
+            // one, which goes as well.
+            channel.h3.?.testGoaway();
+            DialedBetween.transport = null;
+            grpc.Channel.test_auto_h3_before_lock = DialedBetween.dialAndLose;
+            defer grpc.Channel.test_auto_h3_before_lock = null;
+            const third = try client.unary("Unary", arena, .{ .message = "3" }, .{});
+            try std.testing.expectEqual(grpc.Transport.h3, DialedBetween.transport.?);
+            // The call dials once more instead of taking the gone one.
+            try std.testing.expectEqual(grpc.Code.ok, third.status.code);
+            try std.testing.expectEqual(grpc.Transport.h3, third.transport);
+            try std.testing.expectEqual(@as(u32, 3), channel.h3DialCount());
+        }
+    }.run);
+}
+
 test "grpc channel .h3: prior knowledge over a channel that owns its connection" {
     try withServer(.{}, struct {
         fn run(env: *Env) !void {

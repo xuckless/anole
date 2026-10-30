@@ -4,6 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const root = @import("root.zig");
 const store = @import("store.zig");
 const clock_mod = @import("clock.zig");
@@ -101,7 +102,12 @@ pub const Client = struct {
     queues: []Queue,
     handlers: std.ArrayList(Handler) = .empty,
     crons: std.ArrayList(*CronEntry) = .empty,
-    held_mutex: std.Io.Mutex = .init,
+    /// The runs going on (`held`) and `next_seq`. A leaf: nothing is taken
+    /// under it. It also keeps each `JobBox.task` valid while a holder
+    /// cancels it: a run leaves `held` (`unhold`) before its task ends.
+    /// Every section (hold, unhold, heartbeatOnce, drain, the tests' interruptedRun)
+    /// takes no other lock, calls no store and never suspends; cancelTask only flags.
+    held_mutex: safety.Mutex(.leaf) = .init,
     /// The runs going on, by `JobBox.seq`.
     held: std.AutoArrayHashMapUnmanaged(u64, *JobBox) = .empty,
     /// The last `JobBox.seq` given out; under `held_mutex`.
@@ -139,6 +145,11 @@ pub const Client = struct {
     wake_kicks: std.atomic.Value(u32) = .init(0),
     /// Tests only: runs on a run's task right after `hold` has published it.
     test_after_hold: if (builtin.is_test) ?*const fn (*Client, *JobBox) void else void = if (builtin.is_test) null else {},
+    /// Set by the first `stopWork`; the owner's thread only (`stopWork`, `deinit`).
+    work_stopped: bool = false,
+    teardown: safety.Teardown = .init,
+    /// Tests only: runs on the stopping thread when `stopWork` starts its work.
+    test_on_stop: if (builtin.is_test) ?*const fn (*Client) void else void = if (builtin.is_test) null else {},
 
     /// `app.jobs(options)` calls it; outside an app, `init`, `start`, `drain`, `deinit`.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, options: Options) !*Client {
@@ -186,13 +197,32 @@ pub const Client = struct {
         return self;
     }
 
-    pub fn deinit(self: *Client) void {
+    /// Ends the queue's work: the drain under way is waited for (else one
+    /// runs, to 10 s), then every task (fetchers, heartbeat, maintenance,
+    /// runs) is canceled and joined. Idempotent; on the owner's thread, as
+    /// `deinit`. The app calls it before it frees any connector, since a
+    /// run may use any of them (SAFETY.md M2); `deinit` calls it first.
+    /// Outside an app, call it before freeing what the handlers use.
+    pub fn stopWork(self: *Client) void {
+        self.teardown.assertNotDead();
+        if (self.work_stopped) return;
+        self.work_stopped = true;
+        if (builtin.is_test) if (self.test_on_stop) |f| f(self);
         self.closing.store(true, .release);
         // A drain under way (the server's) is waited for, not cut short.
+        // Pre-existing: if drainWatcher has not started the server's drain
+        // yet, this one wins and uses 10 s, not drain_timeout. On the owner's
+        // thread (no executor), so nothing here yields.
         if (self.started) {
             self.drain(std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = .fromSeconds(10), .clock = .awake }));
         }
         self.group.cancel(self.io);
+    }
+
+    pub fn deinit(self: *Client) void {
+        self.teardown.begin();
+        // stopWork's assertNotDead accepts .closing, the state begin() set.
+        self.stopWork();
         self.backend.vt.deinit(self.backend.ptr);
         for (self.queues) |*q| q.kinds.deinit(self.gpa);
         self.gpa.free(self.queues);
@@ -209,6 +239,7 @@ pub const Client = struct {
             self.gpa.destroy(mm);
         }
         self.arena_state.deinit();
+        self.teardown.end();
         self.gpa.destroy(self);
     }
 
@@ -312,7 +343,8 @@ pub const Client = struct {
             self.metrics = mm;
         }
         self.backend.vt.migrate(self.backend.ptr) catch |e| {
-            log.err("jobs: migrating the store failed: {t}", .{e});
+            // The caller gets the error too: a test that provokes it says so (expectLog).
+            anole.errors.log.err("jobs: migrating the store failed: {t}", .{e});
             return error.DatabaseUnavailable;
         };
         for (self.crons.items) |c| try self.loadZone(c);
@@ -1099,6 +1131,8 @@ pub const Client = struct {
         };
         _ = q.running.fetchAdd(1, .acq_rel);
         const exec = self.rr.fetchAdd(1, .monotonic);
+        // zio d4b3ba6 registerTask yields for backpressure only after the task is
+        // queued and cannot fail then: this catch runs only when no task exists.
         placement.concurrent(&self.group, self.io, .{ .executor = exec }, jobTask, .{box}) catch {
             _ = q.running.fetchSub(1, .acq_rel);
             box.arena_state.deinit();
@@ -1249,7 +1283,15 @@ pub const Client = struct {
         const t = self.now();
         const was = self.is_leader.load(.acquire);
         const lead = self.backend.vt.leaderTake(self.backend.ptr, self.worker_name, t, self.options.leader.ttl) catch |e| blk: {
-            try passCancel(e);
+            if (e == error.Canceled) {
+                // The store dropped what it held for the leader with the
+                // failed call (PostgreSQL closes the advisory session): not
+                // leading, in the flag and the gauge, before the cancel goes on.
+                self.is_leader.store(false, .release);
+                if (self.metrics) |mm| mm.leader.with(&.{}).set(0);
+                if (was) log.info("jobs: this process no longer leads schedules and maintenance", .{});
+                return error.Canceled;
+            }
             break :blk false;
         };
         self.is_leader.store(lead, .release);

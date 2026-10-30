@@ -73,8 +73,8 @@ fn serverStream(call: *grpc.Call, req: pb.EchoRequest, out: *std.Io.Queue(pb.Ech
         // (it does so under the write lock).
         try wait.waitUntil(call.io, "the writer started the response head", call, struct {
             fn started(cl: *grpc.Call) !bool {
-                try cl.impl.write_mutex.lock(cl.io);
-                defer cl.impl.write_mutex.unlock(cl.io);
+                try cl.impl.write_lock.lock(cl.io);
+                defer cl.impl.write_lock.unlock(cl.io);
                 return cl.impl.out != null;
             }
         }.started);
@@ -1499,6 +1499,193 @@ test "grpc channel: Retry.attempt_timeout cuts a stuck attempt and the call is r
             const r = try client.unary("Unary", arena_state.allocator(), .{ .message = "x" }, .{ .timeout = .fromSeconds(30) });
             try std.testing.expectEqual(grpc.Code.ok, r.status.code);
             try std.testing.expect(Script.prev_attempts_max.load(.monotonic) >= 1);
+        }
+    }.run);
+}
+
+/// The client ports the calls of `withCountingServer` came from: one per
+/// connection the server accepted.
+const Connections = struct {
+    var ports: [16]std.atomic.Value(u16) = @splat(.init(0));
+
+    fn reset() void {
+        for (&ports) |*p| p.store(0, .monotonic);
+    }
+
+    fn unary(call: *grpc.Call, req: pb.EchoRequest) anyerror!pb.EchoResponse {
+        const port = call.req.remote_address.getPort();
+        for (&ports) |*p| {
+            const seen = p.cmpxchgStrong(0, port, .acq_rel, .acquire) orelse break;
+            if (seen == port) break;
+        }
+        return .{ .message = req.message, .index = 0 };
+    }
+
+    fn count() usize {
+        var n: usize = 0;
+        for (&ports) |*p| {
+            if (p.load(.acquire) != 0) n += 1;
+        }
+        return n;
+    }
+};
+
+/// An Echo server whose unary calls note their connection (`Connections`),
+/// on a runtime of `executors`.
+fn withCountingServer(executors: u8, comptime body: fn (std.mem.Allocator, std.Io, u16) anyerror!void) !void {
+    Connections.reset();
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(executors) });
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    grpc.register(void, &server.router, Echo, .{
+        .Unary = Connections.unary,
+        .ServerStream = serverStream,
+        .ClientStream = clientStream,
+        .Bidi = bidi,
+    });
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+    try body(gpa, io, server.address.ip.getPort());
+}
+
+/// One unary call on `channel`; a failure is counted in `failed`.
+fn countedCall(channel: *grpc.Channel, gpa: std.mem.Allocator, failed: *std.atomic.Value(u32)) void {
+    const client: grpc.Client(Echo) = .{ .channel = channel };
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const r = client.unary("Unary", arena_state.allocator(), .{ .message = "x" }, .{}) catch {
+        _ = failed.fetchAdd(1, .monotonic);
+        return;
+    };
+    if (r.status.code != .ok) _ = failed.fetchAdd(1, .monotonic);
+}
+
+/// Shuts the channel's connection down under it and waits until the
+/// channel sees it closed.
+/// It reaches into the connection's socket: the server has no per-connection close to drive instead.
+fn loseConnection(channel: *grpc.Channel, io: std.Io) !void {
+    const conn = channel.conn.?;
+    conn.socket.shutdown(io, .both) catch {};
+    try wait.waitUntil(io, "the channel's connection closed", conn, struct {
+        fn closed(c_: *@TypeOf(conn.*)) bool {
+            return !c_.isOpen();
+        }
+    }.closed);
+}
+
+test "grpc channel: calls after the connection closed share one redial" {
+    try withCountingServer(2, struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
+            const channel = try grpc.Channel.connect(gpa, io, .{ .host = "127.0.0.1", .port = port }, .{});
+            defer channel.close();
+            var failed: std.atomic.Value(u32) = .init(0);
+            countedCall(channel, gpa, &failed);
+            try loseConnection(channel, io);
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            for (0..16) |_| try group.concurrent(io, countedCall, .{ channel, gpa, &failed });
+            try group.await(io);
+            try std.testing.expectEqual(@as(u32, 0), failed.load(.monotonic));
+            try std.testing.expectEqual(@as(usize, 2), Connections.count());
+        }
+    }.run);
+}
+
+/// The tasks of the channel stress test: callers on every executor, and a
+/// task that takes the channel's connection away after every `every` calls.
+const ChannelStress = struct {
+    channel: *grpc.Channel,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    /// Calls that ended, however.
+    calls: std.atomic.Value(u32) = .init(0),
+    /// Calls that ended OK.
+    ok: std.atomic.Value(u32) = .init(0),
+    callers_done: std.atomic.Value(u32) = .init(0),
+    losses: u32 = 0,
+
+    const callers = 64;
+    const calls_each = 200;
+
+    fn caller(t: *ChannelStress) void {
+        defer _ = t.callers_done.fetchAdd(1, .release);
+        const client: grpc.Client(Echo) = .{ .channel = t.channel };
+        var arena_state: std.heap.ArenaAllocator = .init(t.gpa);
+        defer arena_state.deinit();
+        for (0..calls_each) |_| {
+            _ = arena_state.reset(.retain_capacity);
+            defer _ = t.calls.fetchAdd(1, .release);
+            // A call on a connection taken away under it may fail; the
+            // claim is that every call ends.
+            const r = client.unary("Unary", arena_state.allocator(), .{ .message = "x" }, .{}) catch continue;
+            if (r.status.code == .ok) _ = t.ok.fetchAdd(1, .monotonic);
+        }
+    }
+
+    const Reached = struct {
+        t: *ChannelStress,
+        target: u32,
+
+        fn reached(x: Reached) bool {
+            return x.t.callers_done.load(.acquire) == callers or x.t.calls.load(.acquire) >= x.target;
+        }
+    };
+
+    /// Takes the connection away after each of `points` (seeded) call
+    /// counts.
+    fn loser(t: *ChannelStress, points: []const u32) std.Io.Cancelable!void {
+        for (points) |p| {
+            wait.waitUntil(t.io, "the callers made the calls before the next loss", Reached{ .t = t, .target = p }, Reached.reached) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.WaitTimedOut => return,
+            };
+            if (t.callers_done.load(.acquire) == callers) return;
+            // The connection object lives until the channel closes (its
+            // retired list), so a stale one is only shut down twice.
+            // A plain read of `conn` (D2's race, test side); a stalled run ends quietly with fewer losses.
+            const conn = t.channel.conn orelse continue;
+            conn.socket.shutdown(t.io, .both) catch {};
+            t.losses += 1;
+        }
+    }
+};
+
+test "grpc channel: [stress] calls across executors through repeated connection loss all end, and each loss costs at most one redial" {
+    try wait.requireStress();
+    try withCountingServer(4, struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, port: u16) !void {
+            const channel = try grpc.Channel.connect(gpa, io, .{ .host = "127.0.0.1", .port = port }, .{ .retry = fast_grpc_retry });
+            defer channel.close();
+            var t: ChannelStress = .{ .channel = channel, .gpa = gpa, .io = io };
+            const seed: u64 = 0x5eed_0122;
+            var prng: std.Random.DefaultPrng = .init(seed);
+            var points: [8]u32 = undefined;
+            var at: u32 = 0;
+            for (&points) |*p| {
+                at += 200 + prng.random().uintLessThan(u32, 1200);
+                p.* = at;
+            }
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            for (0..ChannelStress.callers) |i| try dusty.placement.concurrent(&group, io, .{ .executor = i }, ChannelStress.caller, .{&t});
+            try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, ChannelStress.loser, .{ &t, &points });
+            group.await(io) catch |err| {
+                std.debug.print("grpc channel stress: seed 0x{x}\n", .{seed});
+                return err;
+            };
+            try std.testing.expectEqual(@as(u32, ChannelStress.callers * ChannelStress.calls_each), t.calls.load(.acquire));
+            try std.testing.expect(t.ok.load(.monotonic) > 0);
+            try std.testing.expect(Connections.count() <= t.losses + 1);
         }
     }.run);
 }

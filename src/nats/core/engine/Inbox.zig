@@ -41,6 +41,11 @@ pub const prefix_len = head.len + token_len + 1;
 pub const max_reply_len = prefix_len + 20;
 
 /// Guards everything below but `sid`.
+// SAFETY: NATS engine lock, outside the ranked wrappers until a single-owner
+// connection replaces the nesting (research/s15/retrofit-9-rest.md Q1): order
+// Outbound.mutex -> {Inbox.mutex, Registry.mutex} -> MessageQueue.mutex, never
+// the other way; held across no suspension but an inner lock's wait and its
+// own condition's wait.
 mutex: Io.Mutex = .init,
 /// The SID of the inbox subscription; 0 until a request makes it. The
 /// reader reads it without the mutex: `prefix` is written before it.

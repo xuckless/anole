@@ -338,8 +338,10 @@ collector has answered for them, or `timeout` passes (the spans are not lost
 then; the batching task keeps going). It is for a process that may be
 frozen right after the call: the AWS Lambda adapter calls it after each
 answer and before asking for the next invocation, bounded by
-`lambda.flush_timeout` (500 ms). One caller at a time; it does nothing
-before `start`.
+`lambda.flush_timeout` (500 ms). Several callers may flush at once; each
+waits for the spans queued when it called. A canceled caller returns at once
+and stays canceled. It does nothing before `start`, and returns at once
+after `close`.
 
 On AWS Lambda, an invocation carries X-Ray's trace ID
 (`Root=1-5759e988-bd862e3fe1be46a994272793;Parent=53995c3f42cd8ad8;Sampled=1`).

@@ -23,9 +23,9 @@
 //! - **Writes** go to the database's own writer thread, which owns the one
 //!   read-write connection: `exec`, a statement that changes something
 //!   (`INSERT ... RETURNING` through `one` too), `.with(.{ .write = true })`,
-//!   and transactions. Callers take turns in arrival order, so Anole's own
-//!   writers never meet `SQLITE_BUSY`; the coroutine waits, its executor
-//!   serves the rest.
+//!   and transactions. Callers take turns one at a time (no order among
+//!   the waiters), so Anole's own writers never meet `SQLITE_BUSY`; the
+//!   coroutine waits, its executor serves the rest.
 //! - **Reads** (`SELECT`, `WITH`, `VALUES`, `PRAGMA`, `EXPLAIN`) run on
 //!   `anole.blocking`'s threads over a pool of read-only connections (one
 //!   per executor, at most 8), beside the writer: the database is in WAL
@@ -61,14 +61,21 @@
 //! tuple for `?` (or `?NNN`) in order, of the same types; a `Time` is
 //! stored as text in SQLite's own format (`2026-10-21 09:30:00.25`, UTC).
 const std = @import("std");
+const builtin = @import("builtin");
+const safety = @import("anole_safety");
 const sqlite = @import("anole_sqlite");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
 const blocking = @import("../blocking.zig");
+const dusty = @import("dusty");
 const observe = @import("../observe/root.zig");
 
 /// SQLite's C API (sqlite3.h, as built), for what Anole's calls leave out.
 pub const c = sqlite.c;
+
+/// Test hook: on the writer thread, after a job ran and while it still
+/// counts as running (a canceled caller interrupts it then).
+pub var test_after_job: if (builtin.is_test) ?*const fn (std.Io, ?*c.sqlite3) void else void = if (builtin.is_test) null else {};
 /// xuckless/zig-sqlite, the driver under `Conn.run`: user functions,
 /// blobs, backups, virtual tables.
 pub const driver = sqlite;
@@ -170,11 +177,14 @@ pub const Client = struct {
     observer: db.Observer,
     /// `/readyz`'s check, once `start` has a `Health` for it.
     readiness: db.Readiness,
-    /// Connections in use (readers taken, the writer held), for the gauges.
-    in_use: std.atomic.Value(i64) = .init(0),
+    /// Connections in use (readers taken, the writer held), for the gauges:
+    /// per executor, summed when read (SAFETY.md L7). A call that ends on
+    /// another executor than it began leaves one slot high and one low;
+    /// only the sum means anything.
+    in_use: dusty.exec_counter.PerExecutor(i64) = .init,
     /// Calls waiting for a reader or for the writer, for the gauges and
-    /// the console's `/db`.
-    waiting: std.atomic.Value(i64) = .init(0),
+    /// the console's `/db`; per executor, as `in_use`.
+    waiting: dusty.exec_counter.PerExecutor(i64) = .init,
     /// Calls with `.coalesce` or `.cache` (`with`), and `invalidate` for
     /// cached results: `app.db.cache.invalidate(.{ .tag = "notes" })`.
     cache: db.QueryCache,
@@ -208,7 +218,7 @@ pub const Client = struct {
             .writer = .{ .conn = undefined, .thread = undefined },
             .readers = .{},
             .observer = .{ .system = .sqlite, .name = name },
-            .readiness = .{ .io = io, .context = self, .ping = ping },
+            .readiness = .{ .io = io, .context = safety.toCtx(self), .ping = ping },
             .cache = try .init(gpa, io, .sqlite, name, options.cache),
         };
         errdefer self.cache.deinit();
@@ -261,7 +271,7 @@ pub const Client = struct {
         if (registry) |r| {
             const m = try db.Metrics.init(r, .sqlite, self.name);
             const total: i64 = @intCast(self.readers.conns.len + 1);
-            const in_use = self.in_use.load(.monotonic);
+            const in_use = self.in_use.sum();
             m.idle.add(total - in_use);
             m.in_use.add(in_use);
             self.observer.metrics = m;
@@ -276,8 +286,8 @@ pub const Client = struct {
     /// `init` on). From any thread: the counts are atomics, no lock.
     pub fn consoleInfo(self: *Client, w: *std.Io.Writer) !void {
         const total: i64 = @intCast(self.readers.conns.len + 1);
-        const in_use = std.math.clamp(self.in_use.load(.monotonic), 0, total);
-        const waiting = @max(self.waiting.load(.monotonic), 0);
+        const in_use = std.math.clamp(self.in_use.sum(), 0, total);
+        const waiting = @max(self.waiting.sum(), 0);
         try w.print("\"system\":\"sqlite\",\"name\":{f},\"target\":{f},\"pools\":[{{\"max\":{d},\"open\":{d},\"idle\":{d},\"in_use\":{d},\"waiting\":{d}}}]", .{
             std.json.fmt(self.name, .{}), std.json.fmt(self.path, .{}), total, total, total - in_use, in_use, waiting,
         });
@@ -340,12 +350,19 @@ pub const Client = struct {
     ///     try tx.commit(req);
     pub fn begin(self: *Client, cx: anytype, options: db.TxOptions) Error!Tx {
         const reader = options.read_only and self.readers.conns.len > 0;
-        const conn: *Connection = if (reader) try self.acquireReader(cx.io) else blk: {
-            try self.lockWriter(cx.io);
+        var lease: u32 = 0;
+        const conn: *Connection = if (reader) blk: {
+            const taken_ = try self.acquireReader(cx.io);
+            lease = taken_.lease;
+            break :blk taken_.conn;
+        } else blk: {
+            lease = try self.lockWriter(cx.io);
             break :blk &self.writer.conn;
         };
-        var tx: Tx = .{ .db = self, .io = cx.io, .conn = conn, .on_writer = !reader };
-        errdefer tx.release();
+        var tx: Tx = .{ .db = self, .io = cx.io, .conn = conn, .on_writer = !reader, .lease = lease };
+        // A rollback first: a BEGIN that ran while its caller was canceled
+        // (or timed out) returns that error, with the transaction open.
+        errdefer tx.deinit();
         _ = try tx.runOp(cx, .exec, void, if (reader) "BEGIN" else "BEGIN IMMEDIATE", .{}, .{ .prepare = false });
         return tx;
     }
@@ -387,67 +404,139 @@ pub const Client = struct {
     /// The writer connection for the driver's own calls (`Conn.run`), held
     /// until `release`.
     pub fn acquire(self: *Client, cx: anytype) Error!Conn {
-        try self.lockWriter(cx.io);
-        return .{ .db = self, .io = cx.io };
+        const lease = try self.lockWriter(cx.io);
+        return .{ .db = self, .io = cx.io, .lease = lease };
     }
 
     // -----------------------------------------------------------------------
     // Connections
 
-    fn acquireReader(self: *Client, io: std.Io) error{Canceled}!*Connection {
+    /// A reader checked out: `lease` gives it back (`releaseReader`).
+    const ReaderCheckout = struct { conn: *Connection, lease: u32 };
+
+    /// Checks a reader out, waiting while all are taken. The returned lease
+    /// gives it back (`releaseReader`); nothing is locked when this returns.
+    fn acquireReader(self: *Client, io: std.Io) error{Canceled}!ReaderCheckout {
         const r = &self.readers;
         const started: std.Io.Clock.Timestamp = .now(io, .awake);
         try r.mutex.lock(io);
         defer r.mutex.unlock(io);
         if (r.free_len == 0) {
-            self.waits(1);
-            defer self.waits(-1);
+            self.waits(io, 1);
+            defer self.waits(io, -1);
             while (r.free_len == 0) try r.changed.wait(io, &r.mutex);
         }
         r.free_len -= 1;
-        self.taken(started.durationTo(.now(io, .awake)).raw);
-        return r.free[r.free_len];
+        const conn = r.free[r.free_len];
+        conn.lease +%= 1;
+        self.taken(io, started.durationTo(.now(io, .awake)).raw);
+        return .{ .conn = conn, .lease = conn.lease };
     }
 
-    fn releaseReader(self: *Client, io: std.Io, conn: *Connection) void {
+    /// Gives a reader back when `lease` is the checkout holding it; a lease
+    /// given back already (a checkout ended through a copy, then again)
+    /// does nothing but log (SAFETY.md M6): the reader is never in the free
+    /// list twice, nor handed to two holders.
+    fn releaseReader(self: *Client, io: std.Io, conn: *Connection, lease: u32) void {
         const r = &self.readers;
         r.mutex.lockUncancelable(io);
         defer r.mutex.unlock(io);
+        if (conn.lease != lease) {
+            log.err("sqlite \"{s}\": a reader was given back twice; the second time did nothing", .{self.name});
+            return;
+        }
+        conn.lease +%= 1;
         r.free[r.free_len] = conn;
         r.free_len += 1;
         r.changed.signal(io);
-        self.given();
+        self.given(io);
     }
 
-    /// Takes the writer: one call, transaction or `acquire` at a time.
-    fn lockWriter(self: *Client, io: std.Io) error{Canceled}!void {
+    /// Checks the writer out: one call, transaction, `iterate` or `acquire`
+    /// holds it at a time (a pool of one; no order among the waiters). The
+    /// returned lease gives it back (`unlockWriter`). Nothing is locked
+    /// when this returns: the holder suspends freely (SAFETY.md L2).
+    fn lockWriter(self: *Client, io: std.Io) error{Canceled}!u32 {
+        const w = &self.writer;
         const started: std.Io.Clock.Timestamp = .now(io, .awake);
-        if (!self.writer.lock.tryLock()) {
-            self.waits(1);
-            defer self.waits(-1);
-            try self.writer.lock.lock(io);
+        try w.mutex.lock(io);
+        if (w.held) {
+            self.waits(io, 1);
+            while (w.held) w.free.wait(io, &w.mutex) catch |err| {
+                // `deregister` hands a wake this waiter took on to the next.
+                w.mutex.unlock(io);
+                self.waits(io, -1);
+                return err;
+            };
+            self.waits(io, -1);
         }
-        self.taken(started.durationTo(.now(io, .awake)).raw);
+        w.held = true;
+        w.lease +%= 1;
+        const lease = w.lease;
+        w.mutex.unlock(io);
+        self.taken(io, started.durationTo(.now(io, .awake)).raw);
+        return lease;
     }
 
-    fn unlockWriter(self: *Client, io: std.Io) void {
-        self.writer.lock.unlock(io);
-        self.given();
+    /// Gives the writer back when `lease` is the checkout holding it; a
+    /// lease given back already (a second `release`) does nothing but log
+    /// (SAFETY.md M6).
+    fn unlockWriter(self: *Client, io: std.Io, lease: u32) void {
+        const w = &self.writer;
+        w.mutex.lockUncancelable(io);
+        if (!w.held or w.lease != lease) {
+            w.mutex.unlock(io);
+            log.err("sqlite \"{s}\": the writer was given back twice; the second time did nothing", .{self.name});
+            return;
+        }
+        w.held = false;
+        w.lease +%= 1;
+        w.free.signal(io);
+        w.mutex.unlock(io);
+        self.given(io);
     }
 
-    fn waits(self: *Client, delta: i64) void {
-        _ = self.waiting.fetchAdd(delta, .monotonic);
+    /// Whether `lease` is the checkout holding the writer now.
+    fn holdsWriter(self: *Client, io: std.Io, lease: u32) bool {
+        const w = &self.writer;
+        w.mutex.lockUncancelable(io);
+        defer w.mutex.unlock(io);
+        return w.held and w.lease == lease;
+    }
+
+    /// Whether `lease` is the checkout holding the reader `conn` now.
+    fn holdsReader(self: *Client, io: std.Io, conn: *const Connection, lease: u32) bool {
+        const r = &self.readers;
+        r.mutex.lockUncancelable(io);
+        defer r.mutex.unlock(io);
+        return conn.lease == lease;
+    }
+
+    /// Whether `lease` is the checkout holding `conn` (the writer when
+    /// `on_writer`, else a reader) now.
+    fn holds(self: *Client, io: std.Io, conn: *const Connection, on_writer: bool, lease: u32) bool {
+        return if (on_writer) self.holdsWriter(io, lease) else self.holdsReader(io, conn, lease);
+    }
+
+    /// Gives back `conn`'s checkout `lease`: the writer when `on_writer`,
+    /// else a reader.
+    fn giveBack(self: *Client, io: std.Io, conn: *Connection, on_writer: bool, lease: u32) void {
+        if (on_writer) self.unlockWriter(io, lease) else self.releaseReader(io, conn, lease);
+    }
+
+    fn waits(self: *Client, io: std.Io, delta: i64) void {
+        self.waiting.add(io, delta);
         self.observer.waiting(delta);
     }
 
-    fn taken(self: *Client, waited: std.Io.Duration) void {
-        _ = self.in_use.fetchAdd(1, .monotonic);
+    fn taken(self: *Client, io: std.Io, waited: std.Io.Duration) void {
+        self.in_use.add(io, 1);
         self.observer.connections(-1, 1);
         self.observer.acquired(waited);
     }
 
-    fn given(self: *Client) void {
-        _ = self.in_use.fetchSub(1, .monotonic);
+    fn given(self: *Client, io: std.Io) void {
+        self.in_use.add(io, -1);
         self.observer.connections(1, -1);
     }
 
@@ -487,7 +576,9 @@ pub const Client = struct {
                 w.mutex.unlock(io);
                 return err;
             }
-            // Under the lock, so the interrupt cannot reach the next job.
+            // SAFETY (L3): sqlite3_interrupt only sets a flag, documented safe
+            // from any thread (https://sqlite.org/c3ref/interrupt.html); under
+            // the mutex so it cannot reach the next job.
             if (w.running == &t.job) c.sqlite3_interrupt(w.conn.handle.db);
             w.mutex.unlock(io);
             t.job.done.waitUncancelable(io);
@@ -497,12 +588,17 @@ pub const Client = struct {
     }
 
     /// The readiness check: a `SELECT 1` within `ping_timeout`.
-    fn ping(context: *anyopaque, io: std.Io) bool {
-        const self: *Client = @ptrCast(@alignCast(context));
+    /// A cancel of the caller is `error.Canceled` (`db.Readiness` keeps no
+    /// answer then).
+    fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
+        const self = safety.fromCtx(Client, context);
         var buf: [1024]u8 = undefined;
         var fba: std.heap.FixedBufferAllocator = .init(&buf);
         var ctx: db.Ctx = .{ .io = io, .arena = fba.allocator() };
-        const v = self.with(.{ .timeout = self.ping_timeout }).one(i64, &ctx, "SELECT 1", .{}) catch return false;
+        const v = self.with(.{ .timeout = self.ping_timeout }).one(i64, &ctx, "SELECT 1", .{}) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return false,
+        };
         return v == 1;
     }
 };
@@ -626,14 +722,15 @@ pub const Query = struct {
         const self = q.db;
         const flags: Flags = .{ .prepare = q.options.prepare, .plain = true };
         if (op != .exec and op != .run and !q.options.write and self.readers.conns.len > 0 and operation(sql).reads()) {
-            const conn = try self.acquireReader(cx.io);
+            const reader = try self.acquireReader(cx.io);
+            const conn = reader.conn;
             var failure: Failure = .{};
             var probe = flags;
             probe.reader = true;
             const read = Client.onReader(cx.io, conn, statement(op, T, @TypeOf(args)), .{ self, conn, cx.arena, sql, args, probe, &failure });
             // Back before waiting for the writer, which may be waiting for
             // a reader.
-            self.releaseReader(cx.io, conn);
+            self.releaseReader(cx.io, conn, reader.lease);
             if (read) |v| {
                 return v;
             } else |err| switch (err) {
@@ -642,8 +739,8 @@ pub const Query = struct {
                 else => |e| return e,
             }
         }
-        try self.lockWriter(cx.io);
-        defer self.unlockWriter(cx.io);
+        const lease = try self.lockWriter(cx.io);
+        defer self.unlockWriter(cx.io, lease);
         return runOnWriter(self, cx, op, T, sql, args, flags);
     }
 };
@@ -672,6 +769,8 @@ pub const Tx = struct {
     io: std.Io,
     conn: *Connection,
     on_writer: bool,
+    /// The checkout of `conn` (the writer's or the reader's).
+    lease: u32 = 0,
     /// Committed or rolled back.
     finished: bool = false,
 
@@ -703,7 +802,9 @@ pub const Tx = struct {
     }
 
     /// `Client.iterate` inside the transaction; `deinit` the rows before the
-    /// next call on `tx`.
+    /// next call on `tx`. The transaction's end (commit, rollback or
+    /// `deinit`) ends rows still open: their `deinit` after it does nothing,
+    /// and their `next` fails once it would step the statement again.
     pub fn iterate(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
         return tx.with(.{}).iterate(T, cx, sql, args);
     }
@@ -727,18 +828,28 @@ pub const Tx = struct {
         tx.release();
     }
 
-    /// Rolls back and gives the connection back, failed or not. `deinit`
-    /// does it too when neither this nor `commit` ran.
+    /// Rolls back and gives the connection back, as `deinit` does (which
+    /// does it too when neither this nor `commit` ran): not canceled by the
+    /// request's cancel nor cut by its deadline, so the connection goes back
+    /// with no transaction open. Fails only when the transaction is over.
     pub fn rollback(tx: *Tx, cx: anytype) Error!void {
         try tx.usable(cx);
-        defer tx.release();
-        _ = try tx.runOp(cx, .exec, void, "ROLLBACK", .{}, .{ .prepare = false });
+        tx.deinit();
     }
 
     /// Rolls back unless committed, and gives the connection back. Not
-    /// canceled by the request's cancel.
+    /// canceled by the request's cancel: the next holder of the writer (or
+    /// of the reader) must not find the transaction open.
     pub fn deinit(tx: *Tx) void {
         if (tx.finished) return;
+        // A copy of this `Tx` ended it already: the connection (the writer
+        // or the reader) may be another holder's now, its transaction not
+        // this one's to roll back (SAFETY.md M6).
+        if (!tx.db.holds(tx.io, tx.conn, tx.on_writer, tx.lease)) {
+            tx.finished = true;
+            log.err("sqlite \"{s}\": a transaction was ended twice (through a copy of its Tx); the second time did nothing", .{tx.db.name});
+            return;
+        }
         const was = tx.io.swapCancelProtection(.blocked);
         defer _ = tx.io.swapCancelProtection(was);
         var buf: [512]u8 = undefined;
@@ -751,7 +862,13 @@ pub const Tx = struct {
 
     fn release(tx: *Tx) void {
         tx.finished = true;
-        if (tx.on_writer) tx.db.unlockWriter(tx.io) else tx.db.releaseReader(tx.io, tx.conn);
+        // Rows of this transaction still open: their statements are reset
+        // (or finalized) here, so the connection goes back with none of them
+        // mid-result (a statement stepping keeps its read transaction, and
+        // the next holder's call of the same SQL would get the cached one
+        // where these rows left it). Only while this checkout holds it.
+        if (tx.db.holds(tx.io, tx.conn, tx.on_writer, tx.lease)) tx.conn.endTxRows();
+        tx.db.giveBack(tx.io, tx.conn, tx.on_writer, tx.lease);
     }
 
     fn usable(tx: *const Tx, cx: anytype) Error!void {
@@ -822,11 +939,16 @@ pub const TxQuery = struct {
 
     pub fn iterate(q: TxQuery, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
         try q.ready(cx);
+        // Room to keep the rows' statement for the transaction's end.
+        try q.tx.conn.tx_rows.ensureUnusedCapacity(q.tx.db.gpa, 1);
         // Not probed (`owns` is false): never NeedsWriter.
-        return Rows(T).startOn(q.tx.db, cx, q.tx.conn, q.tx.on_writer, false, sql, args) catch |err| switch (err) {
+        var rows = Rows(T).startOn(q.tx.db, cx, q.tx.conn, q.tx.on_writer, false, sql, args) catch |err| switch (err) {
             error.NeedsWriter => unreachable,
-            else => |e| e,
+            else => |e| return e,
         };
+        rows.lease = q.tx.lease;
+        rows.tx_rows = q.tx.conn.openedTxRows(rows.stmt);
+        return rows;
     }
 };
 
@@ -842,6 +964,8 @@ fn failedWith(d: *Client, cx: anytype, comptime message: []const u8) Error {
 pub const Conn = struct {
     db: *Client,
     io: std.Io,
+    /// The writer's checkout this `Conn` holds until `release`.
+    lease: u32,
 
     /// Runs `func(driver_db, args...)` on the writer thread, with
     /// `driver_db` zig-sqlite's `*driver.Db` on the writer connection: what may
@@ -855,15 +979,20 @@ pub const Conn = struct {
         return self.db.onWriter(self.io, Wrap.call, .{ self.db, args });
     }
 
-    /// Gives the writer back, for the next call or transaction.
+    /// Gives the writer back, for the next call or transaction; a second
+    /// call does nothing (it logs). Don't call anything on it after.
     pub fn release(self: *const Conn) void {
+        if (!self.db.holdsWriter(self.io, self.lease)) {
+            log.err("sqlite \"{s}\": a connection from acquire() was released twice; the second release did nothing", .{self.db.name});
+            return;
+        }
         {
             const was = self.io.swapCancelProtection(.blocked);
             defer _ = self.io.swapCancelProtection(was);
             if (self.db.onWriter(self.io, rollbackIfOpen, .{&self.db.writer.conn}) catch false)
                 log.err("acquire(): the writer was given back inside a transaction; rolled back", .{});
         }
-        self.db.unlockWriter(self.io);
+        self.db.unlockWriter(self.io, self.lease);
     }
 };
 
@@ -882,6 +1011,12 @@ pub fn Rows(comptime T: type) type {
         on_writer: bool,
         /// Gives the connection back on `deinit` (not inside a `Tx`).
         owns: bool,
+        /// The checkout of `conn` these rows run under: their own when
+        /// `owns`, else their `Tx`'s.
+        lease: u32 = 0,
+        /// A `Tx`'s rows (not `owns`): their entry in `conn.tx_rows`, which
+        /// the `Tx`'s end or their `deinit` ends.
+        tx_rows: u64 = 0,
         stmt: Stmt,
         columns: Columns(T),
         /// Records a failure on the caller's request.
@@ -896,20 +1031,24 @@ pub fn Rows(comptime T: type) type {
         fn start(q: Query, cx: anytype, sql: []const u8, args: anytype) Error!Self {
             const d = q.db;
             if (!q.options.write and d.readers.conns.len > 0 and operation(sql).reads()) {
-                const conn = try d.acquireReader(cx.io);
-                if (startOn(d, cx, conn, false, true, sql, args)) |rows| {
+                const reader = try d.acquireReader(cx.io);
+                if (startOn(d, cx, reader.conn, false, true, sql, args)) |rows_| {
+                    var rows = rows_;
+                    rows.lease = reader.lease;
                     return rows;
                 } else |err| {
-                    d.releaseReader(cx.io, conn);
+                    d.releaseReader(cx.io, reader.conn, reader.lease);
                     if (err != error.NeedsWriter) return @errorCast(err);
                 }
             }
-            try d.lockWriter(cx.io);
-            errdefer d.unlockWriter(cx.io);
-            return startOn(d, cx, &d.writer.conn, true, true, sql, args) catch |err| switch (err) {
+            const lease = try d.lockWriter(cx.io);
+            errdefer d.unlockWriter(cx.io, lease);
+            var rows = startOn(d, cx, &d.writer.conn, true, true, sql, args) catch |err| switch (err) {
                 error.NeedsWriter => unreachable,
-                else => |e| e,
+                else => |e| return e,
             };
+            rows.lease = lease;
+            return rows;
         }
 
         fn startOn(d: *Client, cx: anytype, conn: *Connection, on_writer: bool, owns: bool, sql: []const u8, args: anytype) (Error || error{NeedsWriter})!Self {
@@ -961,6 +1100,12 @@ pub fn Rows(comptime T: type) type {
             if (self.pos == self.batch.len) {
                 if (self.done) return self.leftOpen();
                 var failure: Failure = .{};
+                // Their checkout (or their `Tx`) is over: the statement is
+                // reset or finalized, the connection maybe another holder's.
+                if (!self.live()) {
+                    _ = failure.ours(.other, "these rows are over: their transaction ended, or a copy of them was ended; iterate again", .{}) catch {};
+                    return self.fail_fn(self.fail_ctx, self.db, &failure);
+                }
                 const fetched = if (self.on_writer)
                     self.db.onWriter(self.io, fetchJob, .{ self, &failure })
                 else
@@ -1004,9 +1149,26 @@ pub fn Rows(comptime T: type) type {
         pub fn deinit(self: *Self) void {
             if (self.finished) return;
             self.finished = true;
-            // Resetting ends the read; no I/O to speak of.
+            // A copy of these rows (or of their `Tx`) gave the connection
+            // back already: its statement is done or another holder's (a
+            // cached one is shared), and the connection may be another
+            // holder's (SAFETY.md M6).
+            if (!self.db.holds(self.io, self.conn, self.on_writer, self.lease)) {
+                // A `Tx`'s rows whose `Tx` ended: its end did the statement.
+                if (!self.owns) return;
+                log.err("sqlite \"{s}\": rows from iterate() were ended after their connection was given back (through a copy); the second time did nothing", .{self.db.name});
+                return;
+            }
+            if (!self.owns) {
+                if (!self.conn.endedTxRows(self.tx_rows)) {
+                    log.err("sqlite \"{s}\": rows of a transaction were ended twice (through a copy); the second time did nothing", .{self.db.name});
+                    return;
+                }
+                // Resetting ends the read; no I/O to speak of.
+                self.stmt.done();
+                return;
+            }
             self.stmt.done();
-            if (!self.owns) return;
             {
                 const was = self.io.swapCancelProtection(.blocked);
                 defer _ = self.io.swapCancelProtection(was);
@@ -1016,7 +1178,15 @@ pub fn Rows(comptime T: type) type {
                     Client.onReader(self.io, self.conn, rollbackIfOpen, .{self.conn});
                 if (rolled catch false) log.err("the call left a transaction open (BEGIN without its COMMIT in the same call); rolled back", .{});
             }
-            if (self.on_writer) self.db.unlockWriter(self.io) else self.db.releaseReader(self.io, self.conn);
+            self.db.giveBack(self.io, self.conn, self.on_writer, self.lease);
+        }
+
+        /// Whether the statement is still these rows' to step: their
+        /// checkout holds the connection, and a `Tx`'s rows were not ended
+        /// (by the `Tx`'s end or a copy's `deinit`).
+        fn live(self: *const Self) bool {
+            if (!self.db.holds(self.io, self.conn, self.on_writer, self.lease)) return false;
+            return self.owns or self.conn.hasTxRows(self.tx_rows);
         }
 
         fn fetchJob(self: *Self, f: *Failure) JobError!void {
@@ -1055,20 +1225,30 @@ const Job = struct {
     done: std.Io.Event = .unset,
 };
 
+/// owner: the `Client` (process-wide, M2); the thread is joined in
+/// `Client.deinit` before anything here is freed, so it wakes callers
+/// directly (SAFETY.md T5).
 const Writer = struct {
     conn: Connection,
     thread: std.Thread,
-    /// Held by a writing call, a transaction or an `acquire`, in arrival
-    /// order; the holder alone hands the thread jobs.
-    lock: std.Io.Mutex = .init,
-    /// Guards the fields below.
-    mutex: std.Io.Mutex = .init,
-    ready: std.Io.Condition = .init,
+    /// Guards every field below; the writer thread takes it too.
+    mutex: safety.Mutex(.leaf) = .init,
+    ready: safety.Condition = .init,
     /// The job handed over and not yet started.
     next: ?*Job = null,
     /// The job running: a cancel may interrupt it.
     running: ?*Job = null,
     closing: bool = false,
+    /// Checked out by a writing call, a transaction, an `iterate` or an
+    /// `acquire` (`Client.lockWriter`): one holder at a time, which alone
+    /// hands the thread jobs. A pool of one, as database/sql's
+    /// SetMaxOpenConns(1), not a lock held across the holder's calls.
+    held: bool = false,
+    /// Bumped by each checkout and each give-back (odd while held): a
+    /// give-back with another lease does nothing (M6).
+    lease: u32 = 0,
+    /// Signalled when the writer is given back.
+    free: safety.Condition = .init,
 
     /// The thread: runs each job handed over, until `Client.deinit`.
     fn loop(w: *Writer, io: std.Io) void {
@@ -1083,6 +1263,7 @@ const Writer = struct {
             w.running = job;
             w.mutex.unlock(io);
             job.run(job);
+            if (builtin.is_test) if (test_after_job) |f| f(io, w.conn.handle.db);
             w.mutex.lockUncancelable(io);
             w.running = null;
             w.mutex.unlock(io);
@@ -1096,8 +1277,8 @@ const Readers = struct {
     /// The connections not taken, `free[0..free_len]`.
     free: []*Connection = &.{},
     free_len: usize = 0,
-    mutex: std.Io.Mutex = .init,
-    changed: std.Io.Condition = .init,
+    mutex: safety.Mutex(.leaf) = .init,
+    changed: safety.Condition = .init,
 };
 
 // ---------------------------------------------------------------------------
@@ -1109,8 +1290,54 @@ const Connection = struct {
     handle: sqlite.Db,
     cache: std.StringHashMapUnmanaged(Cached) = .empty,
     tick: u64 = 0,
+    /// A reader's checkout: bumped under `Readers.mutex` by each checkout
+    /// and each give-back (odd while held), so a give-back with another
+    /// lease does nothing (M6). Unused on the writer (`Writer.lease`).
+    lease: u32 = 0,
+    /// The statements of a `Tx`'s rows (`Tx.iterate`) not ended yet: the
+    /// `Tx`'s end resets (or, uncached, finalizes) those its rows left
+    /// open. Touched only by the checkout holding the connection.
+    tx_rows: std.ArrayListUnmanaged(TxRows) = .empty,
+    /// The last `TxRows.id` handed out; 0 is none.
+    tx_rows_id: u64 = 0,
 
     const Cached = struct { stmt: *c.sqlite3_stmt, used: u64 };
+    const TxRows = struct { stmt: Stmt, id: u64 };
+
+    /// A `Tx`'s rows opened `stmt` (room reserved by the caller): kept for
+    /// the `Tx`'s end; the id ends it (`endedTxRows`).
+    fn openedTxRows(conn: *Connection, stmt: Stmt) u64 {
+        conn.tx_rows_id += 1;
+        conn.tx_rows.appendAssumeCapacity(.{ .stmt = stmt, .id = conn.tx_rows_id });
+        return conn.tx_rows_id;
+    }
+
+    fn heldByTxRows(conn: *const Connection, stmt: *c.sqlite3_stmt) bool {
+        for (conn.tx_rows.items) |e| if (e.stmt.handle == stmt) return true;
+        return false;
+    }
+
+    fn hasTxRows(conn: *const Connection, id: u64) bool {
+        for (conn.tx_rows.items) |e| if (e.id == id) return true;
+        return false;
+    }
+
+    /// The rows `id` end their statement themselves: whether they were
+    /// still open (not ended by their `Tx`'s end or a copy).
+    fn endedTxRows(conn: *Connection, id: u64) bool {
+        for (conn.tx_rows.items, 0..) |e, i| if (e.id == id) {
+            _ = conn.tx_rows.swapRemove(i);
+            return true;
+        };
+        return false;
+    }
+
+    /// The `Tx`'s end: every statement its rows left open is reset, or
+    /// finalized when not cached.
+    fn endTxRows(conn: *Connection) void {
+        for (conn.tx_rows.items) |e| e.stmt.done();
+        conn.tx_rows.clearRetainingCapacity();
+    }
 
     fn open(d: *Client, writer: bool, options: Options) !Connection {
         var diags: sqlite.Diagnostics = .{};
@@ -1151,6 +1378,9 @@ const Connection = struct {
     }
 
     fn close(conn: *Connection, gpa: std.mem.Allocator) void {
+        // A `Tx` never ended: its uncached statements (cached ones go below).
+        for (conn.tx_rows.items) |e| if (!e.stmt.cached) e.stmt.done();
+        conn.tx_rows.deinit(gpa);
         var it = conn.cache.iterator();
         while (it.next()) |e| {
             _ = c.sqlite3_finalize(e.value_ptr.stmt);
@@ -1193,11 +1423,13 @@ const Connection = struct {
         return .{ .handle = handle, .cached = keep };
     }
 
-    /// Drops the statement used longest ago.
+    /// Drops the statement used longest ago, but none a `Tx`'s open rows
+    /// hold (their `Tx`'s end resets it).
     fn evict(conn: *Connection, gpa: std.mem.Allocator) void {
         var oldest: ?std.StringHashMapUnmanaged(Cached).Entry = null;
         var it = conn.cache.iterator();
         while (it.next()) |e| {
+            if (conn.heldByTxRows(e.value_ptr.stmt)) continue;
             if (oldest == null or e.value_ptr.used < oldest.?.value_ptr.used) oldest = e;
         }
         const e = oldest orelse return;

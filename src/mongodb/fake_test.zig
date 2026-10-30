@@ -9,9 +9,12 @@ const bson = @import("bson");
 const db = @import("../db/root.zig");
 const wire = @import("wire.zig");
 const mongodb = @import("root.zig");
+const client_mod = @import("client.zig");
+const dusty = @import("dusty");
 
 const testing = std.testing;
 const wait = @import("anole_test_wait");
+const safety = @import("anole_safety");
 const gpa = testing.allocator;
 
 const Fake = struct {
@@ -33,6 +36,13 @@ const Fake = struct {
     /// waits for it before answering.
     finds: std.atomic.Value(u32) = .init(0),
     find_gate: std.atomic.Value(?*std.Io.Event) = .init(null),
+    /// The stress test's other member. A primary with `alternate` lists itself
+    /// alone and itself with `peer` on alternate hellos; a `secondary`
+    /// lists `peer` (the primary) and itself.
+    peer: ?*Fake = null,
+    alternate: bool = false,
+    secondary: bool = false,
+    hellos: std.atomic.Value(u32) = .init(0),
 
     fn init(f: *Fake, io: std.Io) !void {
         const listen_at: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -54,6 +64,9 @@ const Fake = struct {
         while (true) {
             const conn = f.listener.accept(io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
+                // A client that gave up before the accept (a monitor
+                // canceled mid-connect): the next one is still served.
+                error.ConnectionAborted => continue,
                 else => return,
             };
             f.group.concurrent(io, serve, .{ f, io, conn }) catch conn.close(io);
@@ -86,15 +99,21 @@ const Fake = struct {
         var it = msg.body.iterator();
         const command = it.next().?.name;
         if (std.mem.eql(u8, command, "isMaster") or std.mem.eql(u8, command, "hello")) {
+            const n = f.hellos.fetchAdd(1, .acq_rel);
             try b.append("helloOk", .{ .boolean = true });
-            try b.append("isWritablePrimary", .{ .boolean = true });
+            try b.append("isWritablePrimary", .{ .boolean = !f.secondary });
+            if (f.secondary) try b.append("secondary", .{ .boolean = true });
             try b.append("setName", .{ .string = "rs0" });
             try b.beginArray("hosts");
+            if (f.secondary) try b.append("", .{ .string = f.peer.?.addr() });
             try b.append("", .{ .string = f.addr() });
+            if (f.alternate and n % 2 == 1) try b.append("", .{ .string = f.peer.?.addr() });
             try b.end();
             try b.append("me", .{ .string = f.addr() });
-            try b.append("setVersion", .{ .int32 = 1 });
-            try b.append("electionId", .{ .object_id = try .parse("7fffffff0000000000000001") });
+            if (!f.secondary) {
+                try b.append("setVersion", .{ .int32 = 1 });
+                try b.append("electionId", .{ .object_id = try .parse("7fffffff0000000000000001") });
+            }
             try b.append("minWireVersion", .{ .int32 = 0 });
             try b.append("maxWireVersion", .{ .int32 = 21 });
             try b.append("logicalSessionTimeoutMinutes", .{ .int32 = 30 });
@@ -519,4 +538,196 @@ test "mongodb: with(options).dynamic is the dynamic runner with the context firs
     const inserted = try client.with(.{}).dynamic(&c, .insertOne, "users", &.{.{ .bytes = d.bytes() }});
     try testing.expectEqual(@as(u64, 1), inserted.write.changes);
     try testing.expect(inserted.write.summary.get("insertedId") != null);
+}
+
+/// The spawn test's hook: a yield right after a monitor's spawn, as the spawn itself
+/// yields on a busy executor (zio's run-queue threshold). The executor is
+/// busy: the new monitor waits in its run queue.
+const SpawnYield = struct {
+    var ran: std.atomic.Value(bool) = .init(false);
+    /// The locks the spawning task held at the spawn.
+    var held: std.atomic.Value(usize) = .init(0);
+
+    fn yield(io: std.Io) void {
+        held.store(safety.heldLocks(), .release);
+        ran.store(true, .release);
+        zio.yield() catch io.recancel();
+    }
+
+    fn openAndPing(fake: *Fake, io: std.Io, failure: *?anyerror) void {
+        run(fake, io) catch |err| {
+            failure.* = err;
+        };
+    }
+
+    fn run(fake: *Fake, io: std.Io) !void {
+        const client = try open(io, fake);
+        defer client.deinit();
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+        try client.ping(&c);
+    }
+};
+
+test "mongodb: a monitor started while the executor is busy does not suspend under the topology lock" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+    SpawnYield.ran.store(false, .release);
+    SpawnYield.held.store(0, .release);
+    client_mod.test_after_monitor_spawn = SpawnYield.yield;
+    defer client_mod.test_after_monitor_spawn = null;
+    // On executor 0, where the monitor is spawned.
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    var failure: ?anyerror = null;
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, SpawnYield.openAndPing, .{ &fake, io, &failure });
+    try group.await(io);
+    if (failure) |err| return err;
+    // A monitor was spawned, and its spawn (which may yield) ran with no
+    // lock held.
+    try testing.expect(SpawnYield.ran.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), SpawnYield.held.load(.acquire));
+}
+
+/// The close test's hooks: a monitor's end, watched from `deinit` without suspending.
+const MonitorEnd = struct {
+    var closed: std.atomic.Value(bool) = .init(false);
+    var held: std.atomic.Value(bool) = .init(false);
+    /// `hold` gave up waiting: the monitor did not end on its own.
+    var timed_out: std.atomic.Value(bool) = .init(false);
+
+    fn monitorClosed(_: *client_mod.Server) void {
+        closed.store(true, .release);
+    }
+
+    /// Wakes the server's monitor, which ends (the client is closing) and
+    /// closes its connection, and waits until it has. `deinit` holds no
+    /// lock of the client here, so the wait suspends: the other tasks of
+    /// its executor (the fake's, answering a check in flight) run
+    /// meanwhile. The wait's deadline is a hang guard.
+    fn hold(s: *client_mod.Server) void {
+        const io = s.client.io;
+        held.store(true, .release);
+        s.check_now.set(io);
+        wait.waitFlag(io, "the monitor ended and closed its connection", &closed) catch |err| {
+            if (err == error.Canceled) io.recancel();
+            timed_out.store(true, .release);
+        };
+    }
+
+    fn close(client: *mongodb.Client) void {
+        client.deinit();
+    }
+};
+
+test "mongodb: closing the client while a monitor ends frees the monitor's connection once" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    var open_client: ?*mongodb.Client = client;
+    defer if (open_client) |cl| cl.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    // A primary found: the monitor has checked the server, and holds its
+    // connection.
+    try client.ping(&c);
+
+    MonitorEnd.closed.store(false, .release);
+    MonitorEnd.held.store(false, .release);
+    MonitorEnd.timed_out.store(false, .release);
+    client_mod.test_monitor_closed = MonitorEnd.monitorClosed;
+    defer client_mod.test_monitor_closed = null;
+    client_mod.test_close_hold = MonitorEnd.hold;
+    defer client_mod.test_close_hold = null;
+    // `deinit` on executor 1; the monitor runs on executor 0.
+    open_client = null;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, MonitorEnd.close, .{client});
+    try group.await(io);
+    // `deinit` held while the monitor ended on its own and closed its
+    // connection, then freed the rest.
+    try testing.expect(MonitorEnd.held.load(.acquire));
+    try testing.expect(!MonitorEnd.timed_out.load(.acquire));
+    try testing.expect(MonitorEnd.closed.load(.acquire));
+}
+
+/// One task's finds on a client of the two fakes.
+const Finder = struct {
+    fn run(client: *mongodb.Client, io: std.Io, finds: u32, failures: *std.atomic.Value(u32)) void {
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+        const users = client.collection("users");
+        for (0..finds) |_| {
+            _ = arena.reset(.retain_capacity);
+            _ = users.findOne(Row, &c, .{}, .{}) catch {
+                _ = failures.fetchAdd(1, .monotonic);
+            };
+        }
+    }
+};
+
+const HelloWait = struct {
+    fake: *Fake,
+    from: u32,
+
+    fn twiceMore(w: HelloWait) bool {
+        return w.fake.hellos.load(.acquire) >= w.from + 2;
+    }
+};
+
+test "mongodb: [stress] servers joining and leaving while calls run and the client closes" {
+    try wait.requireStress();
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var a: Fake = undefined;
+    try a.init(io);
+    defer a.deinit(io);
+    var b: Fake = undefined;
+    try b.init(io);
+    defer b.deinit(io);
+    // A's hellos list A alone, then A and B, and so on: B's monitor
+    // starts when it joins and stops when it leaves.
+    a.peer = &b;
+    a.alternate = true;
+    b.peer = &a;
+    b.secondary = true;
+
+    const seed: u64 = 0x53_0d1e;
+    errdefer std.debug.print("mongodb stress: seed 0x{x}\n", .{seed});
+    var prng: std.Random.DefaultPrng = .init(seed);
+    const random = prng.random();
+    var failures: std.atomic.Value(u32) = .init(0);
+    for (0..100) |_| {
+        // Server selection waits up to the hang guard: the claim is that a
+        // find always finds the primary, not how soon on a loaded machine.
+        var url_buf: [96]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "mongodb://{s}/app?replicaSet=rs0&heartbeatFrequencyMS=500", .{a.addr()});
+        const client = try mongodb.Client.init(gpa, io, .{ .url = url, .server_selection_timeout = wait.deadline() });
+        defer client.deinit();
+        const from = a.hellos.load(.acquire);
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        for (0..4) |t| try dusty.placement.concurrent(&group, io, .{ .executor = t % 2 }, Finder.run, .{ client, io, random.intRangeAtMost(u32, 1, 40), &failures });
+        // Half the rounds last until A answered two more hellos, so its
+        // monitor's next check (a heartbeat later) moves B in or out
+        // while the calls run; the rest close at once.
+        if (random.boolean()) try wait.waitUntil(io, "two more hellos from A", HelloWait{ .fake = &a, .from = from }, HelloWait.twiceMore);
+        try group.await(io);
+    }
+    // A stays the primary throughout: every find succeeds. The rest of the
+    // claim is no fault and no leak (the test allocator).
+    try testing.expectEqual(@as(u32, 0), failures.load(.monotonic));
 }

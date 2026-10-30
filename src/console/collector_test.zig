@@ -136,3 +136,61 @@ test "console /ws: open sockets by protocol, rooms and their members, SSE topics
     try app.listen("127.0.0.1:0");
     try checking.await(app.io());
 }
+
+// ------------------------------------------------- the collector alone
+
+const zio = @import("zio");
+const safety = @import("anole_safety");
+const collector_mod = @import("collector.zig");
+
+/// Writes 4 KiB of 'x' for any snapshot.
+fn collectBig(_: *anyopaque, _: collector_mod.What, w: *std.Io.Writer) anyerror!void {
+    try w.splatByteAll('x', 4096);
+}
+
+/// Asks for `.ws` from a thread that is not the runtime's, as a console
+/// thread does, into its own allocating writer.
+const BigAsker = struct {
+    c: *collector_mod.Collector,
+    out: std.Io.Writer.Allocating,
+    err: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *BigAsker) void {
+        self.c.snapshot(.ws, &self.out.writer) catch |e| {
+            self.err = e;
+        };
+        self.done.store(true, .release);
+    }
+
+    /// One ask, waited for on the runtime, with the answer in `out`.
+    fn ask(self: *BigAsker, io: std.Io) !void {
+        const t = try std.Thread.spawn(.{}, run, .{self});
+        const answered = wait.waitFlag(io, "the collector answered the snapshot", &self.done);
+        t.join();
+        try answered;
+        if (self.err) |e| return e;
+    }
+};
+
+test "console collector: the answer to a snapshot reaches the asker" {
+    const rt = try zio.Runtime.init(alloc, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    // The collector's and the asker's allocations are checked against
+    // their spin lock (SAFETY.md L5).
+    var checked: safety.SpinCheckedAllocator = .init(alloc);
+    var unused: u8 = 0;
+    var c: collector_mod.Collector = .{ .gpa = checked.allocator(), .io = io, .ctx = &unused, .collect = collectBig };
+    try c.start();
+    defer c.stop();
+    var asker: BigAsker = .{ .c = &c, .out = .init(checked.allocator()) };
+    defer asker.out.deinit();
+    // The asker waits for the answer up to the test's own deadline, not the
+    // console's 200 ms: a slow machine is no retry.
+    collector_mod.Collector.test_wait_ms = wait.deadlineMs();
+    defer collector_mod.Collector.test_wait_ms = null;
+    try asker.ask(io);
+    try std.testing.expectEqual(@as(usize, 4096), asker.out.written().len);
+    for (asker.out.written()) |b| try std.testing.expectEqual(@as(u8, 'x'), b);
+}

@@ -1107,6 +1107,481 @@ test "sqlite: acquire released inside a transaction rolls the writer back" {
     try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
+test "sqlite: a writer released twice leaves the next holder's transaction alone" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+    const level = quiet();
+    defer testing.log_level = level;
+
+    const first = try db.acquire(ctx);
+    first.release();
+    var tx = try db.begin(ctx, .{});
+    defer tx.deinit();
+    _ = try tx.exec(ctx, "INSERT INTO notes (title) VALUES ('kept')", .{});
+    // The first checkout given back again, while the transaction holds the
+    // writer: nothing happens to the transaction.
+    first.release();
+    try tx.commit(ctx);
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
+/// A writer client on a file with one reader, its schema made, for the
+/// tests of a checkout ended twice.
+fn twiceSetup(io: std.Io, tmp: *TmpFile, s: *Scratch) !*sqlite.Client {
+    s.init(io);
+    errdefer s.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    errdefer db.deinit();
+    _ = try db.exec(&s.ctx, schema, .{});
+    return db;
+}
+
+test "sqlite: a transaction ended through a copy leaves the next holder's transaction alone" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try twiceSetup(io, &tmp, &s);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+
+    var tx = try db.begin(ctx, .{});
+    // A copy commits; `tx` itself never learns that it ended.
+    var copy = tx;
+    try copy.commit(ctx);
+    var next = try db.begin(ctx, .{});
+    defer next.deinit();
+    _ = try next.exec(ctx, "INSERT INTO notes (title) VALUES ('kept')", .{});
+    // The first transaction's deinit, while `next` holds the writer:
+    // nothing happens to `next`'s transaction.
+    tx.deinit();
+    try next.commit(ctx);
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
+test "sqlite: rows on the writer ended through a copy leave the next holder's transaction alone" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try twiceSetup(io, &tmp, &s);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+
+    var rows = try db.with(.{ .write = true }).iterate(Note, ctx, "SELECT id, title, done FROM notes", .{});
+    var copy = rows;
+    copy.deinit();
+    var next = try db.begin(ctx, .{});
+    defer next.deinit();
+    _ = try next.exec(ctx, "INSERT INTO notes (title) VALUES ('kept')", .{});
+    // The first rows' deinit, while `next` holds the writer: nothing
+    // happens to `next`'s transaction.
+    rows.deinit();
+    try next.commit(ctx);
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
+test "sqlite: a read-only transaction ended through a copy leaves the next reader's snapshot alone" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try twiceSetup(io, &tmp, &s);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+
+    var tx = try db.begin(ctx, .{ .read_only = true });
+    // A copy commits; `tx` itself never learns that it ended.
+    var copy = tx;
+    try copy.commit(ctx);
+    // The one reader, now the next holder's; its snapshot starts at its
+    // first read.
+    var next = try db.begin(ctx, .{ .read_only = true });
+    defer next.deinit();
+    try testing.expectEqual(@as(i64, 0), try next.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+    _ = try db.exec(ctx, "INSERT INTO notes (title) VALUES ('later')", .{});
+    // The first transaction's deinit, while `next` holds the reader: `next`
+    // keeps its snapshot.
+    tx.deinit();
+    try testing.expectEqual(@as(i64, 0), try next.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+    try next.commit(ctx);
+}
+
+test "sqlite: rows on a reader ended through a copy leave the next reader's snapshot alone" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try twiceSetup(io, &tmp, &s);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+
+    var rows = try db.iterate(Note, ctx, "SELECT id, title, done FROM notes", .{});
+    var copy = rows;
+    copy.deinit();
+    var next = try db.begin(ctx, .{ .read_only = true });
+    defer next.deinit();
+    try testing.expectEqual(@as(i64, 0), try next.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+    _ = try db.exec(ctx, "INSERT INTO notes (title) VALUES ('later')", .{});
+    // The first rows' deinit, while `next` holds the reader: `next` keeps
+    // its snapshot.
+    rows.deinit();
+    try testing.expectEqual(@as(i64, 0), try next.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+    try next.commit(ctx);
+}
+
+test "sqlite: rows of a transaction a copy ended leave the next holder's statement alone" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try twiceSetup(io, &tmp, &s);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+    // More rows than one batch (64), so the next holder steps its statement
+    // again after the stale rows end.
+    _ = try db.exec(ctx, "WITH RECURSIVE k(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM k WHERE x < 100) INSERT INTO notes (title) SELECT 'n' || x FROM k", .{});
+    const sql = "SELECT id, title, done FROM notes ORDER BY id";
+
+    var tx = try db.begin(ctx, .{ .read_only = true });
+    var rows = try tx.iterate(Note, ctx, sql, .{});
+    while (try rows.next()) |_| {}
+    // A copy commits; `tx` and its rows never learn that it ended.
+    var copy = tx;
+    try copy.commit(ctx);
+    // The same reader and the same cached statement, the next holder's.
+    var next = try db.iterate(Note, ctx, sql, .{});
+    defer next.deinit();
+    try testing.expectEqual(@as(i64, 1), (try next.next()).?.id);
+    // The stale rows' deinit, while `next` steps the statement: `next`
+    // goes on where it was.
+    rows.deinit();
+    var last: i64 = 1;
+    while (try next.next()) |note| {
+        last += 1;
+        try testing.expectEqual(last, note.id);
+    }
+    try testing.expectEqual(@as(i64, 100), last);
+    tx.deinit();
+}
+
+/// One reader, 100 notes (more than one batch of 64), and the statement
+/// cache of `cache_size`.
+fn openRowsSetup(io: std.Io, tmp: *TmpFile, s: *Scratch, cache_size: u16) !*sqlite.Client {
+    s.init(io);
+    errdefer s.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1, .statement_cache_size = cache_size });
+    errdefer db.deinit();
+    _ = try db.exec(&s.ctx, schema, .{});
+    _ = try db.exec(&s.ctx, "WITH RECURSIVE k(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM k WHERE x < 100) INSERT INTO notes (title) SELECT 'n' || x FROM k", .{});
+    return db;
+}
+
+const open_rows_sql = "SELECT id, title, done FROM notes ORDER BY id";
+
+test "sqlite: rows a reader transaction left mid-result when a copy committed it: the next holder's rows of the same SQL start at the first row" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try openRowsSetup(io, &tmp, &s, 64);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+
+    var tx = try db.begin(ctx, .{ .read_only = true });
+    var rows = try tx.iterate(Note, ctx, open_rows_sql, .{});
+    // One batch stepped, the statement mid-result.
+    try testing.expectEqual(@as(i64, 1), (try rows.next()).?.id);
+    var copy = tx;
+    try copy.commit(ctx);
+    // The same reader and the same cached statement, the next holder's.
+    var next = try db.iterate(Note, ctx, open_rows_sql, .{});
+    defer next.deinit();
+    try testing.expectEqual(@as(i64, 1), (try next.next()).?.id);
+    rows.deinit();
+    tx.deinit();
+}
+
+/// A reader transaction's rows stepped one batch, the transaction
+/// committed with the rows still open (their deinit deferred past the
+/// commit), then a write: the same reader's next call must see it.
+fn laterWriteSeen(cache_size: u16) !void {
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try openRowsSetup(io, &tmp, &s, cache_size);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+
+    var tx = try db.begin(ctx, .{ .read_only = true });
+    defer tx.deinit();
+    var rows = try tx.iterate(Note, ctx, open_rows_sql, .{});
+    defer rows.deinit();
+    try testing.expectEqual(@as(i64, 1), (try rows.next()).?.id);
+    try tx.commit(ctx);
+    _ = try db.exec(ctx, "INSERT INTO notes (title) VALUES ('later')", .{});
+    // One reader: the one the transaction gave back.
+    try testing.expectEqual(@as(i64, 101), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
+test "sqlite: rows a reader transaction left mid-result at its commit keep no snapshot: another statement on that reader sees a later write" {
+    try laterWriteSeen(64);
+}
+
+test "sqlite: with the statement cache off, rows a reader transaction left mid-result at its commit keep no snapshot: another statement on that reader sees a later write" {
+    try laterWriteSeen(0);
+}
+
+test "sqlite: rows of a transaction that is over fail at their next batch instead of stepping the connection given back" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try openRowsSetup(io, &tmp, &s, 64);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+
+    var tx = try db.begin(ctx, .{ .read_only = true });
+    defer tx.deinit();
+    var rows = try tx.iterate(Note, ctx, open_rows_sql, .{});
+    defer rows.deinit();
+    // The first batch, read before the commit.
+    var id: i64 = 0;
+    while (id < 64) : (id += 1) try testing.expectEqual(id + 1, (try rows.next()).?.id);
+    try tx.commit(ctx);
+    try testing.expectError(error.Database, rows.next());
+}
+
+/// The canceled begin's hook, on the writer thread after a job ran: holds the job
+/// running until its canceled caller has interrupted it.
+const BeginCanceled = struct {
+    var armed: std.atomic.Value(bool) = .init(false);
+    var ran: std.atomic.Value(bool) = .init(false);
+
+    fn afterJob(io: std.Io, handle: ?*c.sqlite3) void {
+        if (!armed.swap(false, .acq_rel)) return;
+        ran.store(true, .release);
+        // The deadline is a hang guard.
+        const until = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = wait.deadline(), .clock = .awake });
+        while (c.sqlite3_is_interrupted(handle) == 0) {
+            if (until.untilNow(io).raw.nanoseconds >= 0) return;
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn hasRun(_: void) bool {
+        return ran.load(.acquire);
+    }
+
+    fn begin(db: *sqlite.Client, io: std.Io, failure: *?anyerror) void {
+        var sc: Scratch = undefined;
+        sc.init(io);
+        defer sc.deinit();
+        var tx = db.begin(&sc.ctx, .{}) catch |err| {
+            if (err != error.Canceled) failure.* = err;
+            return;
+        };
+        // Not canceled in time (the BEGIN ran and returned first).
+        tx.deinit();
+        failure.* = error.NotCanceled;
+    }
+};
+
+test "sqlite: a begin canceled while its BEGIN runs gives the writer back with no transaction open" {
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+
+    BeginCanceled.ran.store(false, .release);
+    BeginCanceled.armed.store(true, .release);
+    sqlite.test_after_job = BeginCanceled.afterJob;
+    defer sqlite.test_after_job = null;
+    defer BeginCanceled.armed.store(false, .release);
+    var failure: ?anyerror = null;
+    var task = try io.concurrent(BeginCanceled.begin, .{ db, io, &failure });
+    // The BEGIN has run on the writer thread; its caller still waits.
+    try wait.waitUntil(io, "the BEGIN run", {}, BeginCanceled.hasRun);
+    task.cancel(io);
+    if (failure) |err| return err;
+    // The next holder begins a transaction of its own.
+    var tx = try db.begin(ctx, .{});
+    defer tx.deinit();
+    _ = try tx.exec(ctx, "INSERT INTO notes (title) VALUES ('kept')", .{});
+    try tx.commit(ctx);
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
+/// Tasks that hold a connection until `go` is set.
+const Holders = struct {
+    db: *sqlite.Client,
+    io: std.Io,
+    go: std.Io.Event = .unset,
+    failed: std.atomic.Value(u32) = .init(0),
+
+    fn iterate(h: *Holders) void {
+        var sc: Scratch = undefined;
+        sc.init(h.io);
+        defer sc.deinit();
+        var rows = h.db.iterate(Note, &sc.ctx, "SELECT id, title, done FROM notes", .{}) catch {
+            _ = h.failed.fetchAdd(1, .monotonic);
+            return;
+        };
+        defer rows.deinit();
+        h.go.wait(h.io) catch {};
+    }
+
+    fn acquire(h: *Holders) void {
+        var sc: Scratch = undefined;
+        sc.init(h.io);
+        defer sc.deinit();
+        const conn = h.db.acquire(&sc.ctx) catch {
+            _ = h.failed.fetchAdd(1, .monotonic);
+            return;
+        };
+        defer conn.release();
+        h.go.wait(h.io) catch {};
+    }
+
+    fn read(h: *Holders) void {
+        var sc: Scratch = undefined;
+        sc.init(h.io);
+        defer sc.deinit();
+        _ = h.db.one(i64, &sc.ctx, "SELECT count(*) FROM notes", .{}) catch {
+            _ = h.failed.fetchAdd(1, .monotonic);
+        };
+    }
+};
+
+/// Whether the console's `/db` entry of `db` says `want`.
+fn consoleSays(db: *sqlite.Client, comptime want: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    db.consoleInfo(&w) catch return false;
+    return std.mem.indexOf(u8, w.buffered(), want) != null;
+}
+
+test "sqlite: the console's in_use and waiting count calls on every executor" {
+    var r: Runtime = undefined;
+    try r.init(2, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(io);
+    defer s.deinit();
+    _ = try db.exec(&s.ctx, schema, .{});
+
+    var h: Holders = .{ .db = db, .io = io };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    // The reader held on executor 0, the writer on executor 1, and a read
+    // on executor 1 waiting for the reader.
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, Holders.iterate, .{&h});
+    try wait.waitUntil(io, "the reader held", db, struct {
+        fn f(d: *sqlite.Client) bool {
+            return consoleSays(d, "\"in_use\":1,");
+        }
+    }.f);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, Holders.acquire, .{&h});
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, Holders.read, .{&h});
+    try wait.waitUntil(io, "two connections in use and one call waiting", db, struct {
+        fn f(d: *sqlite.Client) bool {
+            return consoleSays(d, "\"in_use\":2,\"waiting\":1}");
+        }
+    }.f);
+    h.go.set(io);
+    try group.await(io);
+    try testing.expectEqual(@as(u32, 0), h.failed.load(.monotonic));
+    try testing.expect(consoleSays(db, "\"in_use\":0,\"waiting\":0}"));
+}
+
 test "sqlite: Tx.table and Tx.run see the transaction's own writes" {
     const db = try sqlite.Client.init(gpa, testing.io, .{ .path = ":memory:" });
     defer db.deinit();
@@ -1169,6 +1644,158 @@ test "sqlite: Options.timeout bounds a plain call and .max lifts it" {
     try testing.expectError(error.GatewayTimeout, db.one(i64, ctx, endless, .{}));
     const small = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 100000) SELECT count(*) FROM n";
     try testing.expectEqual(@as(i64, 100000), try db.with(.{ .timeout = .max }).one(i64, ctx, small, .{}));
+}
+
+/// The stress test's worker: its rounds against the writer checkout.
+/// Counts the rows it committed and every failure that is not a cancel the
+/// test made.
+const WriterStress = struct {
+    db: *sqlite.Client,
+    io: std.Io,
+    committed: std.atomic.Value(u64) = .init(0),
+    failures: std.atomic.Value(u32) = .init(0),
+
+    const Op = enum { insert, tx_commit, tx_rollback, acquire, acquire_twice, read };
+
+    fn noop(_: *sqlite.driver.Db) void {}
+
+    /// One operation. A canceled one (`error.Canceled`) is fine for the
+    /// operations that commit nothing; the rest must succeed.
+    fn one(w: *WriterStress, sc: *Scratch, op: Op, id: u64) error{Canceled}!void {
+        var buf: [40]u8 = undefined;
+        const title = std.fmt.bufPrint(&buf, "s1-{d}", .{id}) catch unreachable;
+        var buf2: [40]u8 = undefined;
+        const title2 = std.fmt.bufPrint(&buf2, "s1-{d}b", .{id}) catch unreachable;
+        const ctx = &sc.ctx;
+        switch (op) {
+            .insert => {
+                _ = w.db.exec(ctx, "INSERT INTO notes (title) VALUES (?)", .{title}) catch |err| return w.failed(sc, err);
+                _ = w.committed.fetchAdd(1, .monotonic);
+            },
+            .tx_commit, .tx_rollback => {
+                var tx = w.db.begin(ctx, .{}) catch |err| return w.failed(sc, err);
+                defer tx.deinit();
+                _ = tx.exec(ctx, "INSERT INTO notes (title) VALUES (?)", .{title}) catch |err| return w.failed(sc, err);
+                _ = tx.exec(ctx, "INSERT INTO notes (title) VALUES (?)", .{title2}) catch |err| return w.failed(sc, err);
+                if (op == .tx_rollback) {
+                    tx.rollback(ctx) catch |err| return w.failed(sc, err);
+                } else {
+                    tx.commit(ctx) catch |err| return w.failed(sc, err);
+                    _ = w.committed.fetchAdd(2, .monotonic);
+                }
+            },
+            .acquire, .acquire_twice => {
+                const conn = w.db.acquire(ctx) catch |err| return w.failed(sc, err);
+                defer conn.release();
+                conn.run(noop, .{}) catch |err| return w.failed(sc, err);
+                // The second release (deferred) does nothing.
+                if (op == .acquire_twice) conn.release();
+            },
+            .read => _ = w.db.one(i64, ctx, "SELECT count(*) FROM notes", .{}) catch |err| return w.failed(sc, err),
+        }
+    }
+
+    fn failed(w: *WriterStress, sc: *Scratch, err: anyerror) error{Canceled}!void {
+        if (err == error.Canceled) return error.Canceled;
+        if (anole_db.lastError(&sc.ctx)) |d| std.debug.print("sqlite stress: {t}: {f}\n", .{ err, d }) else std.debug.print("sqlite stress: {t}\n", .{err});
+        _ = w.failures.fetchAdd(1, .monotonic);
+    }
+
+    /// A task's rounds; ids are `base + round`. A seeded few run as a
+    /// child task canceled after a seeded number of yields: those commit
+    /// nothing (a rolled-back transaction or a checkout), so the count
+    /// stays exact whether the cancel lands while waiting for the writer,
+    /// in a statement, or after.
+    fn task(w: *WriterStress, seed: u64, base: u64, rounds: u64) void {
+        var prng: std.Random.DefaultPrng = .init(seed);
+        const random = prng.random();
+        var sc: Scratch = undefined;
+        sc.init(w.io);
+        defer sc.deinit();
+        for (0..rounds) |i| {
+            _ = sc.arena.reset(.retain_capacity);
+            const op = random.enumValue(Op);
+            if ((op == .tx_rollback or op == .acquire or op == .acquire_twice) and random.uintLessThan(u8, 3) == 0) {
+                var child = w.io.concurrent(cancelable, .{ w, op, base + i }) catch {
+                    _ = w.failures.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                for (0..random.uintLessThan(u8, 6)) |_| zio.yield() catch {};
+                child.cancel(w.io);
+                continue;
+            }
+            w.one(&sc, op, base + i) catch {};
+        }
+    }
+
+    fn cancelable(w: *WriterStress, op: Op, id: u64) void {
+        var sc: Scratch = undefined;
+        sc.init(w.io);
+        defer sc.deinit();
+        w.one(&sc, op, id) catch {};
+    }
+
+    /// The blocking-pool caller: writes and checkouts from an OS thread.
+    fn blockingTask(w: *WriterStress, seed: u64, base: u64, rounds: u64) void {
+        var prng: std.Random.DefaultPrng = .init(seed);
+        const random = prng.random();
+        var sc: Scratch = undefined;
+        sc.init(w.io);
+        defer sc.deinit();
+        for (0..rounds) |i| {
+            _ = sc.arena.reset(.retain_capacity);
+            const op: Op = switch (random.uintLessThan(u8, 4)) {
+                0 => .insert,
+                1 => .tx_commit,
+                2 => .acquire,
+                else => .acquire_twice,
+            };
+            w.one(&sc, op, base + i) catch {};
+        }
+    }
+
+    fn onBlocking(w: *WriterStress, pool: *blocking.Pool, seed: u64, base: u64, rounds: u64) void {
+        pool.run(w.io, blockingTask, .{ w, seed, base, rounds }) catch {
+            _ = w.failures.fetchAdd(1, .monotonic);
+        };
+    }
+};
+
+test "sqlite: [stress] writes, transactions and acquire from four executors and a blocking thread, with cancels, keep one writer holder" {
+    try wait.requireStress();
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(4, 4);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    // The busy timeout is the hang guard: the claim is one writer holder,
+    // not how soon a reader gets in on a loaded machine.
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 2, .busy_timeout = wait.deadline() });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(io);
+    defer s.deinit();
+    _ = try db.exec(&s.ctx, schema, .{});
+    const level = quiet();
+    defer testing.log_level = level;
+
+    const seed: u64 = 0x51_5ee0;
+    errdefer std.debug.print("sqlite stress: seed 0x{x}\n", .{seed});
+    var w: WriterStress = .{ .db = db, .io = io };
+    const tasks = 16;
+    const rounds = 120;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..tasks) |t| try dusty.placement.concurrent(&group, io, .{ .executor = t % 4 }, WriterStress.task, .{ &w, seed +% t, t * 1000, rounds });
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, WriterStress.onBlocking, .{ &w, &r.pool, seed +% tasks, tasks * 1000, rounds });
+    try group.await(io);
+
+    try testing.expectEqual(@as(u32, 0), w.failures.load(.monotonic));
+    try testing.expectEqual(@as(i64, @intCast(w.committed.load(.monotonic))), try db.one(i64, &s.ctx, "SELECT count(*) FROM notes", .{}));
+    try testing.expect(consoleSays(db, "\"in_use\":0,\"waiting\":0}"));
 }
 
 const migrations = [_]anole_db.Migration{

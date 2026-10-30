@@ -20,6 +20,7 @@ const dusty = @import("dusty");
 const features = @import("build_options");
 const redis = if (features.redis) @import("../redis/root.zig") else struct {};
 const db = @import("../db/root.zig");
+const safety = @import("anole_safety");
 
 const Cipher = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 const base64url = std.base64.url_safe_no_pad;
@@ -97,7 +98,8 @@ pub const Store = struct {
 pub const MemoryStore = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    mutex: std.Io.Mutex = .init,
+    /// Guards the store (a leaf: nothing is logged or waited for under it).
+    mutex: safety.Mutex(.leaf) = .init,
     entries: std.StringHashMapUnmanaged(*Entry) = .empty,
     /// Most recently written first. The middleware gives every session the
     /// same TTL, so the far end is where they expire first.
@@ -197,6 +199,9 @@ pub const MemoryStore = struct {
 
     fn save(ptr: *anyopaque, id: []const u8, data: []const u8, ttl_seconds: u32) anyerror!void {
         const self: *MemoryStore = @ptrCast(@alignCast(ptr));
+        // The "store full" warning, once, after the lock is let go.
+        var warn_full = false;
+        defer if (warn_full) log.warn("anole.session: MemoryStore holds max_entries ({d}) sessions; the oldest are being dropped", .{self.max_entries});
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const t = self.now();
@@ -212,7 +217,7 @@ pub const MemoryStore = struct {
         if (self.entries.count() >= self.max_entries) {
             if (!self.warned_full) {
                 self.warned_full = true;
-                log.warn("anole.session: MemoryStore holds max_entries ({d}) sessions; the oldest are being dropped", .{self.max_entries});
+                warn_full = true;
             }
             self.removeLocked(@fieldParentPtr("node", self.order.last.?));
         }

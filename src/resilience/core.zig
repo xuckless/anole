@@ -1,8 +1,10 @@
 //! Retries, backoff, retry throttling and circuit breakers: the parts that
-//! need nothing but `std`, so the HTTP core (its own module) and the rest
-//! of Anole use the same types. `anole.resilience` (root.zig) re-exports
+//! need nothing but `std` and anole_safety's ranked locks, so the HTTP core
+//! (its own module) and the rest of Anole use the same types. `anole.resilience` (root.zig) re-exports
 //! them and adds the Prometheus binding.
 const std = @import("std");
+const builtin = @import("builtin");
+const safety = @import("anole_safety");
 
 const log = std.log.scoped(.anole);
 
@@ -158,7 +160,8 @@ pub const Throttle = struct {
 // Metrics hooks
 
 /// Where breakers and retries report. `anole.resilience.Binding` makes one
-/// for a Prometheus registry; tests make their own.
+/// for a Prometheus registry; tests make their own. Hooks run with no lock
+/// of the breakers held, on any executor.
 pub const Metrics = struct {
     context: ?*anyopaque = null,
     on_state: *const fn (ctx: ?*anyopaque, kind: Kind, target: []const u8, state: Breaker.State) void = noState,
@@ -430,13 +433,15 @@ pub const Breaker = struct {
 /// at most `max_entries`, the least recently used closed one evicted.
 pub const Breakers = struct {
     const shards = 16;
+    /// How much of a key a breaker keeps as its name.
+    const max_name = @sizeOf(@FieldType(Breaker, "name_buf"));
 
     const Entry = struct {
         breaker: Breaker,
         last_used: u64,
     };
     const Shard = struct {
-        mutex: std.Io.Mutex = .init,
+        mutex: safety.Mutex(.leaf) = .init,
         map: std.StringHashMapUnmanaged(*Entry) = .empty,
     };
 
@@ -463,38 +468,122 @@ pub const Breakers = struct {
         }
     }
 
-    /// Reports every breaker (existing and future) to `m`.
+    /// Reports every breaker (existing and future) to `m`: each shard's
+    /// breakers are noted under its lock, and reported after it (the hooks
+    /// take locks of their own), until a look under the lock finds no
+    /// state that changed since its report (`settle`).
     pub fn observe(self: *Breakers, io: std.Io, m: ?*const Metrics) void {
         self.metrics = m;
+        const hooks = m orelse {
+            for (&self.shard) |*s| {
+                s.mutex.lockUncancelable(io);
+                defer s.mutex.unlock(io);
+                var it = s.map.valueIterator();
+                while (it.next()) |e| e.*.breaker.metrics = null;
+            }
+            return;
+        };
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
         for (&self.shard) |*s| {
-            s.mutex.lockUncancelable(io);
-            defer s.mutex.unlock(io);
-            var it = s.map.valueIterator();
-            while (it.next()) |e| e.*.breaker.observe(m);
+            var noted: std.ArrayList(Noted) = .empty;
+            {
+                s.mutex.lockUncancelable(io);
+                defer s.mutex.unlock(io);
+                var it = s.map.iterator();
+                while (it.next()) |e| {
+                    const b = &e.value_ptr.*.breaker;
+                    b.metrics = hooks;
+                    // A breaker that cannot be noted is still reported from
+                    // its next transition on.
+                    const key = arena.dupe(u8, e.key_ptr.*) catch continue;
+                    noted.append(arena, .{ .key = key, .state = b.state() }) catch continue;
+                }
+            }
+            if (noted.items.len == 0) continue;
+            testAfterUnlock(self);
+            self.settle(io, s, hooks, noted.items);
         }
     }
 
-    /// Sharded (16 shards, a `std.Io.Mutex` each, held only for the map
+    /// Sharded (16 shards, a `safety.Mutex` each, held only for the map
     /// lookup). The pointer lives until `deinit` or the entry's eviction,
-    /// which never happens while a permit of it is outstanding.
+    /// which never happens while a permit of it is outstanding. A breaker
+    /// made here is reported to the metrics after the shard's lock is let
+    /// go (`settle`).
     pub fn get(self: *Breakers, io: std.Io, key: []const u8) error{OutOfMemory}!*Breaker {
         const s = &self.shard[std.hash.Wyhash.hash(0, key) % shards];
-        s.mutex.lockUncancelable(io);
-        defer s.mutex.unlock(io);
-        const stamp = self.tick.fetchAdd(1, .monotonic);
-        if (s.map.get(key)) |e| {
-            e.last_used = stamp;
-            return &e.breaker;
+        var noted: [1]Noted = .{.{ .key = key, .state = .closed }};
+        const made = made: {
+            s.mutex.lockUncancelable(io);
+            defer s.mutex.unlock(io);
+            const stamp = self.tick.fetchAdd(1, .monotonic);
+            if (s.map.get(key)) |e| {
+                e.last_used = stamp;
+                return &e.breaker;
+            }
+            if (s.map.count() >= @max(1, self.max_entries / shards)) self.evict(s);
+            const entry = try self.gpa.create(Entry);
+            errdefer self.gpa.destroy(entry);
+            const owned = try self.gpa.dupe(u8, key);
+            errdefer self.gpa.free(owned);
+            entry.* = .{ .breaker = .init(self.options, self.kind, key), .last_used = stamp };
+            try s.map.put(self.gpa, owned, entry);
+            entry.breaker.metrics = self.metrics;
+            // Noted by the caller's key: nothing of the entry is read after
+            // the unlock but under the lock again.
+            noted[0].state = entry.breaker.state();
+            break :made &entry.breaker;
+        };
+        if (self.metrics) |m| {
+            testAfterUnlock(self);
+            self.settle(io, s, m, &noted);
         }
-        if (s.map.count() >= @max(1, self.max_entries / shards)) self.evict(s);
-        const entry = try self.gpa.create(Entry);
-        errdefer self.gpa.destroy(entry);
-        const owned = try self.gpa.dupe(u8, key);
-        errdefer self.gpa.free(owned);
-        entry.* = .{ .breaker = .init(self.options, self.kind, key), .last_used = stamp };
-        try s.map.put(self.gpa, owned, entry);
-        entry.breaker.observe(self.metrics);
-        return &entry.breaker;
+        return made;
+    }
+
+    /// A breaker noted under its shard's lock, to report after it: its key
+    /// and the state last reported (or to report, `due`).
+    const Noted = struct { key: []const u8, state: Breaker.State, due: bool = true };
+
+    /// Reports the noted breakers that are due, then looks at them again
+    /// under the shard's lock and reports again each whose state changed
+    /// meanwhile, until none did. A transition reports itself after its
+    /// state changed, so a report of an older state that lands after it is
+    /// followed by the newer one: the gauge ends on the breaker's state. A
+    /// breaker evicted meanwhile is not looked at again. The label is the
+    /// key cut as `Breaker.init` cuts its name.
+    fn settle(self: *Breakers, io: std.Io, s: *Shard, m: *const Metrics, noted: []Noted) void {
+        while (true) {
+            for (noted) |x| if (x.due) m.on_state(m.context, self.kind, x.key[0..@min(x.key.len, max_name)], x.state);
+            s.mutex.lockUncancelable(io);
+            var again = false;
+            for (noted) |*x| {
+                x.due = false;
+                const e = s.map.get(x.key) orelse continue;
+                const now = e.breaker.state();
+                if (now == x.state) continue;
+                x.state = now;
+                x.due = true;
+                again = true;
+            }
+            s.mutex.unlock(io);
+            if (!again) return;
+        }
+    }
+
+    /// Tests: runs once, after a shard's lock is let go and before its
+    /// breakers are reported (`get` of a new key, `observe` of a shard
+    /// with breakers), where another executor's transition can come in
+    /// between. Test builds only.
+    pub var test_after_unlock: if (builtin.is_test) ?*const fn (*Breakers) void else void = if (builtin.is_test) null else {};
+
+    fn testAfterUnlock(self: *Breakers) void {
+        if (comptime !builtin.is_test) return;
+        const hook = test_after_unlock orelse return;
+        test_after_unlock = null;
+        hook(self);
     }
 
     fn evict(self: *Breakers, s: *Shard) void {

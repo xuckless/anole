@@ -17,6 +17,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const common = @import("common.zig");
 const Client = @import("../client.zig").Client;
 
@@ -291,15 +292,25 @@ pub const Exporter = struct {
     options: Options,
     queue: std.Io.Queue(Span),
     buffer: []Span,
+    /// The batching task: only `start` and `close` (the owner) touch it.
     task: ?std.Io.Future(void) = null,
+    /// Set by `start` (release) once the task runs, read by `flush`
+    /// (acquire) in place of `task`.
+    started: std.atomic.Value(bool) = .init(false),
     /// Set by `deinit`: wakes the task from its pause between batches.
     closing: std.Io.Event = .unset,
     /// Set by `flush` and `deinit`: cuts the task's pause short. Only the
     /// task waits on it and resets it.
     kick: std.Io.Event = .unset,
-    /// Set by the task after each batch; `flush` waits on it.
-    progress: std.Io.Event = .unset,
-    flush_lock: std.Io.Mutex = .init,
+    /// Over the flushers' wait for `finished`: `flush` waits on
+    /// `progressed`; the task broadcasts after each batch and when it ends,
+    /// `close` as it starts and once more after the join. Never held across
+    /// anything but the condition's own wait (SAFETY.md L2).
+    progress_lock: safety.Mutex(.leaf) = .init,
+    progressed: safety.Condition = .init,
+    /// Tests: waits of a flusher for progress, counted under
+    /// `progress_lock` as each starts. Test builds only.
+    test_flush_waits: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {},
     /// Spans queued, and spans the task has finished with (sent or
     /// dropped): `flush` waits until `finished` reaches what `queued` was.
     queued: std.atomic.Value(u64) = .init(0),
@@ -326,6 +337,7 @@ pub const Exporter = struct {
     /// Starts the batching task.
     pub fn start(self: *Exporter) !void {
         self.task = try self.io.concurrent(run, .{self});
+        self.started.store(true, .release);
     }
 
     /// Sends what is queued and stops the task, then takes no more spans:
@@ -338,19 +350,27 @@ pub const Exporter = struct {
             if (builtin.mode == .debug) std.debug.panic("trace.Exporter.close on an exporter already {t}", .{was});
             return;
         }
+        // A flusher that saw the exporter alive returns now, not once the
+        // last batch is answered.
+        self.notifyProgress();
         self.closing.set(self.io);
         self.kick.set(self.io);
         self.queue.close(self.io);
         if (self.task) |*t| t.await(self.io);
         self.task = null;
         // What was never sent (no `start`, or past the task's last batch):
-        // its job runs are freed. No span can be queued after the close.
+        // its job runs are freed, and counted as finished and dropped. No
+        // span can be queued after the close.
         var rest: [16]Span = undefined;
         while (true) {
             const n = self.queue.getUncancelable(self.io, &rest, 0) catch break;
             if (n == 0) break;
             for (rest[0..n]) |span| self.release(span);
+            _ = self.dropped.fetchAdd(n, .monotonic);
+            _ = self.finished.fetchAdd(n, .release);
         }
+        // `finished` changed: one more look for any flusher left.
+        self.notifyProgress();
     }
 
     /// `close`, when not done yet, then frees the queue. Nothing may use
@@ -380,21 +400,41 @@ pub const Exporter = struct {
     /// Sends the spans queued so far and waits until the collector has
     /// answered for them, or `timeout` passes (they are not lost then; the
     /// task keeps going). For a process that may be frozen after this call
-    /// (AWS Lambda between invocations). One caller at a time; others wait
-    /// their turn. Does nothing before `start`.
+    /// (AWS Lambda between invocations). Several callers may flush at once;
+    /// each waits for the spans queued when it called. A canceled caller
+    /// returns at once and stays canceled. Does nothing before `start`, and
+    /// returns at once after `close`.
     pub fn flush(self: *Exporter, timeout: std.Io.Duration) void {
-        if (self.state.load(.acquire) != .alive or self.task == null) return;
-        self.flush_lock.lockUncancelable(self.io);
-        defer self.flush_lock.unlock(self.io);
+        if (self.state.load(.acquire) != .alive or !self.started.load(.acquire)) return;
         const target = self.queued.load(.acquire);
+        if (self.finished.load(.acquire) >= target) return;
         const deadline = std.Io.Timeout{ .deadline = .{ .raw = std.Io.Clock.awake.now(self.io).addDuration(timeout), .clock = .awake } };
-        while (self.finished.load(.acquire) < target) {
-            self.progress.reset();
+        self.progress_lock.lockUncancelable(self.io);
+        defer self.progress_lock.unlock(self.io);
+        // `finished` and `state` change before `notifyProgress`, which
+        // takes the lock to broadcast: a change after this check wakes the
+        // wait below.
+        while (self.finished.load(.acquire) < target and self.state.load(.acquire) == .alive) {
+            // A wake under the leaf lock, not a wait (L2 holds).
             self.kick.set(self.io);
-            // The task may have finished between the check and the reset.
-            if (self.finished.load(.acquire) >= target) return;
-            self.progress.waitTimeout(self.io, deadline) catch return;
+            if (comptime builtin.is_test) _ = self.test_flush_waits.fetchAdd(1, .release);
+            self.progressed.waitTimeout(self.io, &self.progress_lock, deadline) catch |err| switch (err) {
+                error.Timeout => return,
+                // SAFETY.md C3: the caller stays canceled.
+                error.Canceled => {
+                    self.io.recancel();
+                    return;
+                },
+            };
         }
+    }
+
+    /// Wakes every flusher to look again: after `finished` or `state`
+    /// changed.
+    fn notifyProgress(self: *Exporter) void {
+        self.progress_lock.lockUncancelable(self.io);
+        defer self.progress_lock.unlock(self.io);
+        self.progressed.broadcast(self.io);
     }
 
     /// Queues a client span for a call made while serving `req` (a
@@ -539,6 +579,8 @@ pub const Exporter = struct {
     }
 
     fn run(self: *Exporter) void {
+        // However the task ends (closed, canceled), flushers look again.
+        defer self.notifyProgress();
         const batch = self.gpa.alloc(Span, self.options.batch_size) catch return;
         defer self.gpa.free(batch);
         while (true) {
@@ -548,12 +590,13 @@ pub const Exporter = struct {
                 const rest = self.queue.getUncancelable(self.io, batch, 0) catch 0;
                 if (rest > 0) self.send(batch[0..rest]);
                 for (batch[0..rest]) |span| self.release(span);
+                _ = self.finished.fetchAdd(rest, .release);
                 return;
             };
             self.send(batch[0..n]);
             for (batch[0..n]) |span| self.release(span);
             _ = self.finished.fetchAdd(n, .release);
-            self.progress.set(self.io);
+            self.notifyProgress();
             // A pause before the next batch, cut short by `deinit` and
             // `flush`.
             if (n < batch.len) self.kick.waitTimeout(self.io, .{ .duration = .{

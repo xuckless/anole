@@ -1904,6 +1904,8 @@ pub const Engine = struct {
 
     /// On the run thread, right before the runtime goes: every wake from
     /// another thread that is under way finishes, later ones are skipped.
+    /// It runs before app.deinit's stop_work: a job run still in the jobs
+    /// drain then gets no consumer wake (a wait to drain_timeout, no UAF).
     fn closeIo(e: *Engine) void {
         e.assertNoTasks();
         for (e.execs) |*x| x.io_gate.close();
@@ -4169,6 +4171,7 @@ test {
     _ = config_mod;
     _ = @import("engine_test.zig");
     _ = @import("nats_test.zig");
+    _ = @import("kafka_test.zig");
     _ = @import("parity_test.zig");
     if (features.grpc) _ = grpc;
     _ = net;

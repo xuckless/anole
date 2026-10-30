@@ -29,6 +29,7 @@
 //! once. A server that refuses the early data gets the same requests again
 //! once the handshake is done.
 const std = @import("std");
+const builtin = @import("builtin");
 const dusty = @import("dusty");
 const tls = @import("anole_dusty_tls");
 const ngtcp2 = @import("ngtcp2.zig");
@@ -695,6 +696,16 @@ pub const ClientConnection = struct {
 
     fn kick(self: *ClientConnection) void {
         self.gen.notify(self.io);
+    }
+
+    /// Tests: the connection takes no new requests, as after the server's
+    /// GOAWAY (`isOpen` false); `close` still frees it. Test builds only.
+    pub fn testGoaway(self: *ClientConnection) void {
+        comptime std.debug.assert(builtin.is_test);
+        self.lock();
+        defer self.unlock();
+        self.closing = true;
+        self.kick();
     }
 
     /// Whether QUIC keep-alive is armed: a request is live. For tests.

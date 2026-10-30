@@ -29,6 +29,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const features = @import("build_options");
 const zio = @import("zio");
+const safety = @import("anole_safety");
 const http = @import("http/root.zig");
 const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
 const tls_testing = if (features.tls == .boringssl) @import("tls/testing.zig") else struct {};
@@ -937,14 +938,32 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// The connector whose start failed, and why (for the startup error's text).
             failed_system: ?[]const u8 = null,
             failed_cause: ?[]const u8 = null,
-            /// One certificate reload at a time.
-            cert_mutex: std.Io.Mutex = .init,
+            /// One certificate reload at a time, across its file reads
+            /// (SAFETY.md L2's exception: the reload is the resource; it
+            /// guards the certificate sources, which only a reload
+            /// touches). Taken with no other lock held: SIGHUP's task, the
+            /// console's thread, a C ABI thread.
+            /// Off zio: through the ctl gate (`Engine.enter`), or a console thread joined before the runtime ends (T5).
+            cert_lock: safety.IoLock = .init,
             /// The routes recorded for the OpenAPI document (`-Dopenapi`),
             /// and what `app.openapi` asked for.
             doc_entries: if (features.openapi) std.ArrayList(openapi_mod.Entry) else void = if (features.openapi) .empty else {},
             openapi_options: if (features.openapi) ?openapi_mod.Options else void = if (features.openapi) null else {},
             /// `serveOpenApi` could not build the document; `run` fails with it.
             openapi_failed: if (features.openapi) ?anyerror else void = if (features.openapi) null else {},
+
+            /// Removes the entry of a connector its constructor is about to
+            /// free (its start failed), so the teardown never reaches it.
+            fn dropConnector(self: *Extras, context: *anyopaque) void {
+                var i = self.connectors.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (self.connectors.items[i].context == context) {
+                        _ = self.connectors.orderedRemove(i);
+                        return;
+                    }
+                }
+            }
         };
 
         /// A database connector the server made: when serving starts it
@@ -965,6 +984,11 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// Closes the connector's idle connections (under AWS Lambda,
             /// after a long freeze); null when it has no pool to close.
             closeIdle: ?*const fn (context: *anyopaque) void = null,
+            /// Ends the connector's own work that may still call other
+            /// connectors (a job queue's runs), joining it. `App.deinit`
+            /// calls it on every connector, last made first, before it
+            /// frees any (SAFETY.md M2). Null for the rest.
+            stop_work: ?*const fn (context: *anyopaque) void = null,
 
             /// The console's `/db` system: the type's `console_system` decl
             /// ("postgres", "redis"...), or "connector" when it has none.
@@ -997,6 +1021,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                         _ = v.closeIdle();
                     }
                 };
+                const Work = struct {
+                    fn stopWork(context: *anyopaque) void {
+                        // SAFETY: context is the *T given to of().
+                        const v: *T = @ptrCast(@alignCast(context));
+                        v.stopWork();
+                    }
+                };
                 return .{
                     .context = value,
                     .start = Hooks.start,
@@ -1004,6 +1035,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .describe = if (comptime @hasDecl(T, "consoleInfo") or !std.mem.eql(u8, system, "connector")) Hooks.describe else null,
                     .name = system,
                     .closeIdle = if (comptime @hasDecl(T, "closeIdle")) Idle.closeIdle else null,
+                    .stop_work = if (comptime @hasDecl(T, "stopWork")) Work.stopWork else null,
                 };
             }
         };
@@ -1885,6 +1917,22 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // settles during the rest of the teardown (jobs runs, database
             // calls), allocating nothing; its memory goes at the end.
             if (extras.exporter) |e| e.close();
+            // Job runs may use anything the app made (a connector made
+            // before or after the queue, app.udpSocket, the server's state):
+            // they end before any of it is freed (SAFETY.md M2). stopWork
+            // needs only the runtime and `server.draining`.
+            // So connectors made after app.jobs (NATS/Kafka consumers, SSE
+            // topics, watches) stay open for the jobs drain, and their own
+            // tasks run up to drain_timeout + the cancel grace longer.
+            // Out of this pass: only jobs has stopWork, so a NATS/Kafka
+            // consumer made before app.jobs can still reach a freed jobs
+            // client between jobs' deinit and its own (the same M2 class).
+            var w = extras.connectors.items.len;
+            while (w > 0) {
+                w -= 1;
+                const k = extras.connectors.items[w];
+                if (k.stop_work) |stop_work| stop_work(k.context);
+            }
             if (comptime features.http3) if (self.h3) |ep| ep.deinit();
             self.server.deinit();
             // ---- p3/net ----
@@ -3220,6 +3268,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             j.suppress_workers = self.mode.deployment == .lambda;
             j.drain_event = &self.server.draining;
             try self.extras.connectors.append(self.arena.allocator(), .of(jobs_mod.Client, j));
+            // Before the errdefer above frees it: no entry outlives its client.
+            errdefer self.extras.dropConnector(j);
             if (self.extras.connectors_started) try j.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return j;
         }
@@ -3239,6 +3289,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             errdefer w.deinit();
             try w.register(self);
             try self.extras.connectors.append(self.arena.allocator(), .of(wh.Client, w));
+            // Before the errdefer above frees it: no entry outlives its client.
+            errdefer self.extras.dropConnector(w);
             if (self.extras.connectors_started) try w.start(self.extras.metrics, self.extras.exporter, self.extras.health);
             return w;
         }
@@ -3432,8 +3484,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         fn reloadCertificatesInner(self: *Self) !void {
             if (self.certs.len == 0) return error.NoTlsListener;
             const io_ = self.rt.io();
-            try self.extras.cert_mutex.lock(io_);
-            defer self.extras.cert_mutex.unlock(io_);
+            try self.extras.cert_lock.lock(io_);
+            defer self.extras.cert_lock.unlock(io_);
             const next = try self.gpa.alloc(CertState.Pem, self.certs.len);
             defer self.gpa.free(next);
             var loaded: usize = 0;
@@ -3460,8 +3512,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         fn setCertificateInner(self: *Self, cert: Cert) !void {
             if (self.certs.len == 0) return error.NoTlsListener;
             const io_ = self.rt.io();
-            try self.extras.cert_mutex.lock(io_);
-            defer self.extras.cert_mutex.unlock(io_);
+            try self.extras.cert_lock.lock(io_);
+            defer self.extras.cert_lock.unlock(io_);
             const next = try self.gpa.alloc(CertState.Pem, self.certs.len);
             defer self.gpa.free(next);
             var loaded: usize = 0;
@@ -3483,7 +3535,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// Puts `next` (one per `certs`) in place on the TLS listeners and
         /// HTTP/3, or none of it. Takes `next` on success. Under
-        /// `cert_mutex`.
+        /// `cert_lock` (an I/O lock, so the listeners' TLS spin locks and
+        /// HTTP/3's taken here are below it: L4).
         fn switchCertificates(self: *Self, next: []const CertState.Pem) !void {
             const gpa = self.gpa;
             // HTTP/3's context first: it checks the certificate and key, and

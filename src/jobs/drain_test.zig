@@ -337,3 +337,320 @@ test "jobs: the teardown's cancel inside a maintenance store call ends the maint
     var f = try io.concurrent(maintenanceCancelCheck, .{io});
     try f.await(io);
 }
+
+/// A run that outlives the HTTP drain and then uses `app.webhooks`, a
+/// connector made after the queue (#J1, SAFETY.md M2): the app must end it
+/// before it frees any connector.
+const AfterHttp = struct {
+    const wh = @import("../webhooks/root.zig");
+    var io: std.Io = undefined;
+    var jc: *root.Client = undefined;
+    var hooks: *wh.Client = undefined;
+    var started: std.atomic.Value(bool) = .init(false);
+    var listed: std.atomic.Value(bool) = .init(false);
+    var release: std.Io.Event = .unset;
+
+    fn run(job: *root.Job) anyerror!void {
+        started.store(true, .release);
+        // Cancelable, as a handler's network wait is; the drain's cancel is
+        // an hour away, so only the teardown's hook ends it.
+        try release.wait(io);
+        _ = try hooks.listEndpoints(job, "nobody");
+        listed.store(true, .release);
+    }
+
+    /// The queue's work stops: the run may go on.
+    fn setRelease(_: *root.Client) void {
+        release.set(io);
+    }
+
+    fn check(a: *anole.App) !void {
+        defer a.stop();
+        try a.waitReady();
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var ctx: anole.db.Ctx = .{ .io = a.io(), .arena = arena.allocator() };
+        _ = try jc.enqueueRaw(&ctx, kind.name, "{}", .{});
+        try waitFor(a.io(), isStarted, .{});
+    }
+
+    fn isStarted() bool {
+        return started.load(.acquire);
+    }
+
+    fn body() !void {
+        {
+            // `deinit` at the end of this block is what the test is about.
+            var app = try anole.App.init(gpa, .{ .executors = .exact(2), .listen_tls_http3 = false });
+            defer app.deinit();
+            io = app.io();
+            started.store(false, .release);
+            listed.store(false, .release);
+            release = .unset;
+            jc = try app.jobs(.{ .store = .memory, .drain_timeout = .fromSeconds(3600) });
+            jc.test_on_stop = setRelease;
+            hooks = try app.webhooks(.{ .jobs = jc });
+            try jc.handleRaw(&app, kind, .{}, run);
+            var checking = try app.io().concurrent(check, .{&app});
+            defer checking.cancel(app.io()) catch {};
+            try app.listen("127.0.0.1:0");
+            try checking.await(app.io());
+        }
+        try std.testing.expect(listed.load(.acquire));
+    }
+};
+
+test "jobs: a run still going after the HTTP drain ends before a connector made after the queue is freed" {
+    if (comptime anole.features.webhooks) try AfterHttp.body() else return error.SkipZigTest;
+}
+
+/// SAFETY.md M2's teardown with runs in flight on every executor, at seeded
+/// points; TESTING.md W3 keeps it out of the unit suite (`zig build
+/// test-stress`). The deterministic claim is the test above.
+const TeardownLoad = struct {
+    const wh = @import("../webhooks/root.zig");
+    const Plan = struct { mode: u8, yields: u16 };
+    var jc: *root.Client = undefined;
+    var hooks: *wh.Client = undefined;
+    var started: std.atomic.Value(u32) = .init(0);
+    var never: std.Io.Event = .unset;
+
+    /// Mode 0: yields, then uses the webhooks client; 1: the same, then
+    /// waits until the drain's cancel ends it; 2: returns at once.
+    fn run(job: *root.Job) anyerror!void {
+        _ = started.fetchAdd(1, .acq_rel);
+        const p = try job.args(Plan);
+        if (p.mode == 2) return;
+        for (0..p.yields) |_| try zio.yield();
+        _ = try hooks.listEndpoints(job, "nobody");
+        if (p.mode == 1) try never.wait(job.io);
+    }
+
+    fn startedAtLeast(n: u32) bool {
+        return started.load(.acquire) >= n;
+    }
+
+    fn check(a: *anole.App, plan: []const Plan, stop_at: u32, extra_yields: u32) !void {
+        defer a.stop();
+        try a.waitReady();
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var ctx: anole.db.Ctx = .{ .io = a.io(), .arena = arena.allocator() };
+        for (plan) |p| {
+            var buf: [48]u8 = undefined;
+            const args = try std.fmt.bufPrint(&buf, "{{\"mode\":{d},\"yields\":{d}}}", .{ p.mode, p.yields });
+            _ = try jc.enqueueRaw(&ctx, kind.name, args, .{});
+        }
+        try waitFor(a.io(), startedAtLeast, .{stop_at});
+        for (0..extra_yields) |_| try zio.yield();
+    }
+
+    fn round(prng: *std.Random.DefaultPrng) !void {
+        const r = prng.random();
+        var plan: [64]Plan = undefined;
+        for (&plan, 0..) |*p, i| p.* = .{ .mode = @intCast(i % 3), .yields = r.uintAtMost(u16, 200) };
+        r.shuffle(Plan, &plan);
+        const stop_at = 1 + r.uintLessThan(u32, 4);
+        const extra_yields = r.uintLessThan(u32, 64);
+        var app = try anole.App.init(gpa, .{ .executors = .exact(4), .listen_tls_http3 = false });
+        defer app.deinit();
+        started.store(0, .release);
+        jc = try app.jobs(.{ .store = .memory, .drain_timeout = .fromMilliseconds(20) });
+        hooks = try app.webhooks(.{ .jobs = jc });
+        try jc.handleRaw(&app, kind, .{}, run);
+        var checking = try app.io().concurrent(check, .{ &app, @as([]const Plan, &plan), stop_at, extra_yields });
+        defer checking.cancel(app.io()) catch {};
+        try app.listen("127.0.0.1:0");
+        try checking.await(app.io());
+    }
+
+    fn body() !void {
+        try wait.requireStress();
+        const lvl = std.testing.log_level;
+        std.testing.log_level = .err;
+        defer std.testing.log_level = lvl;
+        var prng: std.Random.DefaultPrng = .init(0x7e4d0007);
+        for (0..200) |_| try round(&prng);
+    }
+};
+
+test "jobs: [stress] app teardown with runs in flight on four executors never frees a connector a run still uses" {
+    if (comptime anole.features.webhooks) try TeardownLoad.body() else return error.SkipZigTest;
+}
+
+/// A run that outlives the HTTP drain and then uses the app's own UDP
+/// socket (`app.udpSocket`), which the app frees with its raw listeners:
+/// the app must end the run before it frees anything a handler may use,
+/// not only before the connectors (J1, SAFETY.md M2).
+const AfterHttpUdp = struct {
+    const Drop = struct {
+        pub fn datagram(_: *anole.net.Datagram) !void {}
+    };
+    var io: std.Io = undefined;
+    var app: *anole.App = undefined;
+    var jc: *root.Client = undefined;
+    var started: std.atomic.Value(bool) = .init(false);
+    var sent: std.atomic.Value(bool) = .init(false);
+    var release: std.Io.Event = .unset;
+
+    fn run(_: *root.Job) anyerror!void {
+        started.store(true, .release);
+        // Cancelable; the drain's cancel is an hour away, so only the
+        // teardown's hook ends it.
+        try release.wait(io);
+        const s = app.udpSocket("udp-0") orelse return error.NoSocket;
+        // The listener has stopped: the socket refuses, and is still there.
+        s.send(s.address(), null, "late") catch |e| if (e != error.Closed) return e;
+        sent.store(true, .release);
+    }
+
+    fn setRelease(_: *root.Client) void {
+        release.set(io);
+    }
+
+    fn check(a: *anole.App) !void {
+        defer a.stop();
+        try a.waitReady();
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var ctx: anole.db.Ctx = .{ .io = a.io(), .arena = arena.allocator() };
+        _ = try jc.enqueueRaw(&ctx, kind.name, "{}", .{});
+        try waitFor(a.io(), isStarted, .{});
+    }
+
+    fn isStarted() bool {
+        return started.load(.acquire);
+    }
+
+    fn body() !void {
+        {
+            // `deinit` at the end of this block is what the test is about.
+            var a = try anole.App.init(gpa, .{ .executors = .exact(2), .listen_tls_http3 = false });
+            defer a.deinit();
+            app = &a;
+            io = a.io();
+            started.store(false, .release);
+            sent.store(false, .release);
+            release = .unset;
+            try a.udp("127.0.0.1:0", Drop, .{});
+            jc = try a.jobs(.{ .store = .memory, .drain_timeout = .fromSeconds(3600) });
+            jc.test_on_stop = setRelease;
+            try jc.handleRaw(&a, kind, .{}, run);
+            var checking = try a.io().concurrent(check, .{&a});
+            defer checking.cancel(a.io()) catch {};
+            try a.listen("127.0.0.1:0");
+            try checking.await(a.io());
+        }
+        try std.testing.expect(sent.load(.acquire));
+    }
+};
+
+test "jobs: a run still going after the HTTP drain ends before the app frees its UDP sockets" {
+    if (comptime anole.features.net) try AfterHttpUdp.body() else return error.SkipZigTest;
+}
+
+/// The store's `leaderTake`: this process leads on the first call; the
+/// second waits (cancelably, as a store's round trip does) until its task
+/// is canceled.
+const CanceledLeader = struct {
+    var io: std.Io = undefined;
+    var vt: store.VTable = undefined;
+    var calls: std.atomic.Value(u32) = .init(0);
+    var entered: std.atomic.Value(bool) = .init(false);
+    var never: std.Io.Event = .unset;
+
+    fn install(client: *root.Client, rio: std.Io) void {
+        io = rio;
+        calls.store(0, .release);
+        entered.store(false, .release);
+        never = .unset;
+        vt = client.backend.vt.*;
+        vt.leaderTake = leaderTake;
+        client.backend.vt = &vt;
+    }
+
+    fn leaderTake(_: *anyopaque, _: []const u8, _: root.Time, _: root.Duration) anyerror!bool {
+        if (calls.fetchAdd(1, .acq_rel) == 0) return true;
+        entered.store(true, .release);
+        try never.wait(io);
+        return true;
+    }
+
+    fn step(client: *root.Client, ctx: *anole.db.Ctx) root.Error!void {
+        _ = try client.step(ctx);
+    }
+};
+
+fn leaderGauge(registry: *anole.observe.metrics.Registry) ?i64 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    registry.render(&out.writer) catch return null;
+    const needle = "\nanole_jobs_leader ";
+    const at = std.mem.indexOf(u8, out.written(), needle) orelse return null;
+    const rest = out.written()[at + needle.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    return std.fmt.parseInt(i64, rest[0..end], 10) catch null;
+}
+
+fn leaderCanceledCheck(io: std.Io) !void {
+    var registry: anole.observe.metrics.Registry = .init(gpa, io);
+    defer registry.deinit();
+    const client = try root.Client.init(gpa, io, .{ .store = .memory, .run = .manual });
+    defer client.deinit();
+    CanceledLeader.install(client, io);
+    try client.start(&registry, null, null);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var ctx: anole.db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    _ = try client.step(&ctx);
+    try std.testing.expect(client.is_leader.load(.acquire));
+    try std.testing.expectEqual(@as(?i64, 1), leaderGauge(&registry));
+    var f = try io.concurrent(CanceledLeader.step, .{ client, &ctx });
+    try wait.waitFlag(io, "the leader's renewal is in the store", &CanceledLeader.entered);
+    try std.testing.expectError(error.Canceled, f.cancel(io));
+    // Whatever the store held for the leader went with the canceled call
+    // (PostgreSQL's advisory session is closed): not leading any more.
+    try std.testing.expect(!client.is_leader.load(.acquire));
+    try std.testing.expectEqual(@as(?i64, 0), leaderGauge(&registry));
+}
+
+test "jobs: a cancel during the leader's renewal leaves the process not leading, in is_leader and the gauge" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(leaderCanceledCheck, .{io});
+    try f.await(io);
+}
+
+/// `app.jobs` while serving, on a store whose migration fails: the error
+/// reaches the caller, and the app keeps no entry for the freed client (its
+/// teardown would stop and free it a second time).
+const StartFails = struct {
+    var db: if (anole.features.sqlite) *anole.sqlite.Client else void = undefined;
+
+    fn check(a: *anole.App) !void {
+        defer a.stop();
+        try a.waitReady();
+        const logged = anole.errors.expectLog();
+        defer logged.deinit();
+        try std.testing.expectError(error.DatabaseUnavailable, a.jobs(.{ .store = .{ .sqlite = db } }));
+    }
+
+    fn body() !void {
+        const lvl = std.testing.log_level;
+        std.testing.log_level = .err;
+        defer std.testing.log_level = lvl;
+        var a = try anole.App.init(gpa, .{ .executors = .exact(2), .listen_tls_http3 = false });
+        defer a.deinit();
+        // Read-only: the queue's tables cannot be made.
+        db = try a.sqlite(anole.sqlite.Options{ .path = ":memory:", .pragmas = &.{"PRAGMA query_only = ON"} });
+        var checking = try a.io().concurrent(check, .{&a});
+        defer checking.cancel(a.io()) catch {};
+        try a.listen("127.0.0.1:0");
+        try checking.await(a.io());
+    }
+};
+
+test "jobs: app.jobs failing to start while serving leaves no connector entry behind" {
+    if (comptime anole.features.sqlite) try StartFails.body() else return error.SkipZigTest;
+}

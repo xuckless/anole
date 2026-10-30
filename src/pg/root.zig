@@ -65,6 +65,7 @@
 //!   HTTP/2 reset, `QueryOptions.timeout`) sends a CancelRequest so the
 //!   server stops the statement, and the connection is closed.
 const std = @import("std");
+const safety = @import("anole_safety");
 const builtin = @import("builtin");
 const features = @import("build_options");
 const dusty = @import("dusty");
@@ -521,7 +522,9 @@ pub const Client = struct {
     /// The one LISTEN connection of this client's `anole.watch`es, made on
     /// first use (`_notifyHub`).
     notify_hub: ?*NotifyHub = null,
-    notify_hub_mutex: std.Io.Mutex = .init,
+    /// Init-once guard of `notify_hub`: held only to read it or make it
+    /// (an allocation).
+    notify_hub_mutex: safety.Mutex(.leaf) = .init,
 
     /// Resolves the settings and sets up a pool per executor of `io`'s
     /// runtime; no connection opens yet. `app.postgres` calls it.
@@ -548,7 +551,7 @@ pub const Client = struct {
             .errors = opts.errors,
             .guard = try .init(.postgresql, name, opts.breaker, opts.retry),
             .observer = .{ .system = .postgresql, .name = name },
-            .readiness = .{ .io = io, .context = self, .ping = ping },
+            .readiness = .{ .io = io, .context = safety.toCtx(self), .ping = ping },
             .acquire_timeout = opts.acquire_timeout,
             .connect_timeout = undefined,
             .ping_timeout = opts.ping_timeout,
@@ -930,10 +933,15 @@ pub const Client = struct {
 
     /// True when the database answers `SELECT 1` within `ping_timeout`:
     /// `/readyz`'s check.
-    fn ping(context: *anyopaque, io: std.Io) bool {
-        const self: *Client = @ptrCast(@alignCast(context));
+    /// A cancel of the caller is `error.Canceled` (`db.Readiness` keeps no
+    /// answer then).
+    fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
+        const self = safety.fromCtx(Client, context);
         const deadline: dusty.Deadline = .init(io, .{ .duration = .{ .raw = self.ping_timeout, .clock = .awake } });
-        return deadline.run(pingOnce, .{ self, io }) catch false;
+        return deadline.run(pingOnce, .{ self, io }) catch |err| {
+            const e: anyerror = err;
+            return if (e == error.Canceled) error.Canceled else false;
+        };
     }
 
     fn pingOnce(self: *Client, io: std.Io) !bool {
@@ -2416,7 +2424,7 @@ test "pg: no connection before a call, and a refused one is a 503 with its reaso
     try testing.expectError(error.ServiceUnavailable, d.one(i64, &c, "SELECT $1::int8", .{@as(i64, 1)}));
     // The slots the failed connects reserved were given back.
     try expectPools(d, io, &.{ .{ .max = 2, .open = 0, .in_use = 0 }, .{ .max = 1, .open = 0, .in_use = 0 } });
-    try testing.expect(!Client.ping(d, io));
+    try testing.expect(!try Client.ping(d, io));
 }
 
 const PoolView = struct { max: i64, open: i64, in_use: i64 };

@@ -262,6 +262,8 @@ an admin call still reaching the broker; then the call fails with
 
 `anole.kafka.testing.FakeBroker` is an in-process broker for tests (point
 `Options.brokers` at `broker.address()`): one node, no replication, topics made
-on first use. Against real brokers: `zig build test -Dkafka-test-url=host:9092`
+on first use. `Config.nodes` (default 1) lists that many broker ids at the one
+address, partition `p` led by `p % nodes`, so a test can have several partition
+leaders (and the producer several sender tasks). Against real brokers: `zig build test -Dkafka-test-url=host:9092`
 with Apache Kafka 4.x (KRaft) or Redpanda; CI runs both, each with a plain
 listener and a SASL SCRAM + TLS one.

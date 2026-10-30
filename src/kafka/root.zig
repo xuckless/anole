@@ -36,6 +36,7 @@
 //! producers put them; librdkafka's default differs.
 const std = @import("std");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
 const observe = @import("../observe/root.zig");
@@ -51,6 +52,7 @@ pub const sasl = @import("sasl.zig");
 const producer_mod = @import("producer.zig");
 const consumer_mod = @import("consumer.zig");
 const Telemetry = @import("telemetry.zig").Telemetry;
+const testHold = @import("test_hold.zig").testHold;
 /// An in-process broker for tests: `anole.kafka.testing.FakeBroker`.
 pub const testing = @import("testing.zig");
 
@@ -184,9 +186,15 @@ pub const Client = struct {
     telemetry: ?Telemetry = null,
     ready: ?db.Readiness = null,
     consumers: std.ArrayList(*consumer_mod.Consumer) = .empty,
-    consumers_mutex: std.Io.Mutex = .init,
+    /// Over `consumers`, `started`, `drained` and `starting`. A leaf (L4).
+    consumers_mutex: safety.Mutex(.leaf) = .init,
     started: bool = false,
     drained: bool = false,
+    /// Consumer starts under way outside the lock (`start`, `consume`):
+    /// `drain` waits for them (`starts_done`) before it stops and joins the
+    /// consumers, so a start never races its consumer's stop.
+    starting: u32 = 0,
+    starts_done: safety.Condition = .init,
     /// Set by `app.kafka` under `deployment = lambda`: consumer groups are
     /// not joined (the process is frozen between invocations); producing
     /// works.
@@ -311,8 +319,7 @@ pub const Client = struct {
     /// this for you): metrics, spans for calls in traced requests, the
     /// `/readyz` check. Also starts the consumers registered so far.
     pub fn start(self: *Client, registry: ?*observe.metrics.Registry, tracer: ?*observe.trace.Exporter, health: ?*observe.Health) !void {
-        if (self.started) return;
-        self.started = true;
+        if (self.isStarted()) return;
         self.observer = try db.Observer.init(.kafka, self.name, registry, tracer);
         if (registry) |r| {
             self.telemetry = try Telemetry.init(r, self.name);
@@ -328,14 +335,69 @@ pub const Client = struct {
                 return error.KafkaUnavailable;
             };
         }
-        self.consumers_mutex.lockUncancelable(self.io);
-        defer self.consumers_mutex.unlock(self.io);
+        // The consumers added before `started` is set are started here, the
+        // ones after it by `consume`: each by exactly one of the two. A start
+        // spawns (and may suspend), and the log line may wait: both after
+        // the lock (L2, L3).
+        const n = blk: {
+            self.consumers_mutex.lockUncancelable(self.io);
+            defer self.consumers_mutex.unlock(self.io);
+            // Set only once the observer, telemetry, health check and the
+            // start's refresh succeeded: a failed start can be retried, and
+            // consume does not start groups added before a successful start.
+            self.started = true;
+            break :blk self.consumers.items.len;
+        };
         if (self.suppress_consumers) {
-            if (self.consumers.items.len > 0) log.info("kafka \"{s}\": lambda deployment joins no consumer groups here; producing works", .{self.name});
-        } else for (self.consumers.items) |c| try c.start();
+            if (n > 0) log.info("kafka \"{s}\": lambda deployment joins no consumer groups here; producing works", .{self.name});
+            return;
+        }
+        // The list only grows until `deinit`: an index read under the lock
+        // names a live consumer.
+        for (0..n) |i| {
+            const c = blk: {
+                self.consumers_mutex.lockUncancelable(self.io);
+                defer self.consumers_mutex.unlock(self.io);
+                // A drain that began meanwhile stops what is started: start
+                // no more.
+                if (self.drained) return;
+                self.starting += 1;
+                break :blk self.consumers.items[i];
+            };
+            defer self.endStart();
+            try c.start();
+        }
     }
 
-    fn pingFn(context: *anyopaque, _: std.Io) bool {
+    /// Ends a consumer start counted in `starting` (no lock held).
+    fn endStart(self: *Client) void {
+        self.consumers_mutex.lockUncancelable(self.io);
+        defer self.consumers_mutex.unlock(self.io);
+        self.starting -= 1;
+        if (self.starting == 0) self.starts_done.broadcast(self.io);
+    }
+
+    fn isStarted(self: *Client) bool {
+        self.consumers_mutex.lockUncancelable(self.io);
+        defer self.consumers_mutex.unlock(self.io);
+        return self.started;
+    }
+
+    /// Adds a consumer; true when it is to be started now (serving has
+    /// started), which the caller does after the lock and ends with
+    /// `endStart`. `error.Closing` once a drain began: the list `drain`
+    /// joins without the lock grows no more.
+    fn addConsumer(self: *Client, c: *consumer_mod.Consumer) error{ OutOfMemory, Closing }!bool {
+        self.consumers_mutex.lockUncancelable(self.io);
+        defer self.consumers_mutex.unlock(self.io);
+        if (self.drained) return error.Closing;
+        try self.consumers.append(self.gpa, c);
+        const now = self.started and !self.drained and !self.suppress_consumers;
+        if (now) self.starting += 1;
+        return now;
+    }
+
+    fn pingFn(context: *anyopaque, _: std.Io) std.Io.Cancelable!bool {
         const self: *Client = @ptrCast(@alignCast(context));
         return self.cluster.ping();
     }
@@ -358,9 +420,19 @@ pub const Client = struct {
             return;
         }
         self.drained = true;
+        // No start begins from here on; the ones under way finish first.
+        if (self.starting > 0) {
+            self.consumers_mutex.unlock(self.io);
+            testHold(self.io, .drain_waits);
+            self.consumers_mutex.lockUncancelable(self.io);
+        }
+        while (self.starting > 0) self.starts_done.waitUncancelable(self.io, &self.consumers_mutex);
         for (self.consumers.items) |c| c.stop();
+        // `addConsumer` refuses from `drained` on: the list read after the
+        // lock is the one stopped above.
+        const consumers = self.consumers.items;
         self.consumers_mutex.unlock(self.io);
-        for (self.consumers.items) |c| c.join(deadline);
+        for (consumers) |c| c.join(deadline);
         const left = std.Io.Clock.Timestamp.now(self.io, .awake).durationTo(deadline).raw;
         self.producer.flush(if (left.nanoseconds > 0) left else .fromMilliseconds(1)) catch |err| switch (err) {
             error.Timeout => log.warn("kafka: records were still unsent at the drain deadline", .{}),
@@ -383,7 +455,7 @@ pub const Client = struct {
 
     fn sendInner(self: *Client, c: anytype, record: Record) Error!void {
         const headers = try self.withTrace(c, record);
-        self.producer.append(record.topic, record.key, record.value, headers, record.partition, self.timestampOf(record), null) catch |err|
+        self.producer.append(record.topic, record.key, record.value, headers, record.partition, self.timestampOf(record)) catch |err|
             return self.appendError(c, err);
     }
 
@@ -527,7 +599,8 @@ pub const Client = struct {
     /// `fn (*App, *Msg) !void`, with `server` the `anole.Server` (or any
     /// value with the app's state as `.ctx`). A record is retried in place
     /// and then dead-lettered or skipped (`ConsumeOptions.retry`,
-    /// `dead_letter`); offsets are committed once handled.
+    /// `dead_letter`); offsets are committed once handled. Once the
+    /// client's drain began, `error.Closing`.
     pub fn consume(self: *Client, server: anytype, opts: ConsumeOptions, comptime handler: anytype) !void {
         const params = @typeInfo(@TypeOf(handler)).@"fn".param_types;
         if (params.len < 1 or params.len > 2) @compileError("a Kafka handler is fn (*Msg) !void or fn (*App, *Msg) !void");
@@ -541,23 +614,34 @@ pub const Client = struct {
         };
         const context: ?*anyopaque = if (comptime params.len == 2) appOf(server) else null;
         const c = try consumer_mod.Consumer.create(self.host(), opts, Thunk.call, context);
-        errdefer c.destroy();
-        self.consumers_mutex.lockUncancelable(self.io);
-        defer self.consumers_mutex.unlock(self.io);
-        try self.consumers.append(self.gpa, c);
-        if (self.started and !self.suppress_consumers) try c.start();
+        const start_now = self.addConsumer(c) catch |err| {
+            c.destroy();
+            return err;
+        };
+        // In the list from here on: the client frees it, a failed start
+        // included.
+        if (start_now) {
+            defer self.endStart();
+            try c.start();
+        }
     }
 
     /// `consume` for callers that bring their own function pointers (the C
     /// ABI): the consumer joins once serving starts (at once when it
     /// already has). It lives, stopped or not, until the client is freed.
+    /// Once the client's drain began, `error.Closing`.
     pub fn consumeRaw(self: *Client, opts: ConsumeOptions, handler: consumer_mod.HandlerFn, context: ?*anyopaque) !*consumer_mod.Consumer {
         const c = try consumer_mod.Consumer.create(self.host(), opts, handler, context);
-        errdefer c.destroy();
-        self.consumers_mutex.lockUncancelable(self.io);
-        defer self.consumers_mutex.unlock(self.io);
-        try self.consumers.append(self.gpa, c);
-        if (self.started and !self.suppress_consumers) try c.start();
+        const start_now = self.addConsumer(c) catch |err| {
+            c.destroy();
+            return err;
+        };
+        // In the list from here on: the client frees it, a failed start
+        // included.
+        if (start_now) {
+            defer self.endStart();
+            try c.start();
+        }
         return c;
     }
 

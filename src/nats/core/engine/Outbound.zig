@@ -29,6 +29,16 @@
 //! the new server would refuse and puts the frames that bring the server
 //! up to date before everything that waits. Frames are moved only inside
 //! the chunks they are in, so none is ever lost for lack of memory.
+//!
+//! Lock order of a client's engine (as nats.go's `Conn` documents its own,
+//! "nc.mu -> nc.subsMu -> sub.mu"): `Outbound.mutex`, then `Inbox.mutex` or
+//! `Registry.mutex`, then `MessageQueue.mutex`. Each may be taken while
+//! holding the ones before it, none while holding one after it: tickets
+//! (`admit`) and `restore`'s callbacks run under this queue's mutex and take
+//! the inbox's or the registry's, which take a subscription queue's. These
+//! four are raw `Io.Mutex`es outside SAFETY.md's ranked wrappers (whose
+//! check refuses a lock wait under a held lock); no ranked lock is held
+//! across an engine call, and no engine lock across a ranked one.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -150,6 +160,11 @@ const pong_run: [max_pongs_per_batch * encoder.pong.len]u8 = run: {
 gpa: Allocator,
 /// Frames other than PINGs wait while `queued` is at least this.
 limit: usize,
+// SAFETY: NATS engine lock, outside the ranked wrappers until a single-owner
+// connection replaces the nesting (research/s15/retrofit-9-rest.md Q1): order
+// Outbound.mutex -> {Inbox.mutex, Registry.mutex} -> MessageQueue.mutex, never
+// the other way; held across no suspension but an inner lock's wait and its
+// own condition's wait.
 mutex: Io.Mutex = .init,
 mode: Mode = .live,
 /// Counts the connections that ended: a PING of an older one is never
@@ -164,6 +179,7 @@ room_waiters: u32 = 0,
 /// expires a deadline on command instead of sleeping until it.
 test_clock_ahead: if (builtin.is_test) i96 else void = if (builtin.is_test) 0 else {},
 /// Signaled when there is something to write.
+// SAFETY: the condition of the NATS engine lock above (same order and rule).
 ready: Io.Condition = .init,
 /// Woken when a PONG arrives.
 answered: Broadcast = .{},

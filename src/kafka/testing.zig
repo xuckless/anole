@@ -2,8 +2,8 @@
 //! speaks the protocol versions the client uses (ApiVersions, Metadata,
 //! Produce, Fetch, ListOffsets, FindCoordinator, InitProducerId, the group
 //! APIs, OffsetCommit/Fetch, SASL PLAIN and SCRAM), keeps the batches it is
-//! given, and fails on request. It is not a Kafka: one broker, no
-//! replication, topics made on first use, a join barrier of a few hundred
+//! given, and fails on request. It is not a Kafka: one broker (which can
+//! answer for several broker ids, `Config.nodes`), no replication, topics made on first use, a join barrier of a few hundred
 //! milliseconds. `anole.kafka.testing.FakeBroker` is for an app's own tests
 //! (point `Options.brokers` at `broker.address()`); Anole's tests use it
 //! too.
@@ -19,6 +19,10 @@ const Dec = protocol.Dec;
 pub const Config = struct {
     /// Partitions of a topic made on first use.
     partitions: u32 = 3,
+    /// Broker ids the metadata lists, all at the one address (0 to
+    /// `nodes - 1`); partition `p`'s leader is `p % nodes`. More than one
+    /// gives a test several partition leaders, so several sender tasks.
+    nodes: u32 = 1,
     /// Require this login before anything but ApiVersions.
     sasl: ?struct { mechanism: sasl.Mechanism, username: []const u8, password: []const u8 } = null,
     /// How long a JoinGroup waits for the other members of the round.
@@ -94,6 +98,9 @@ pub const FakeBroker = struct {
     drop_after_store: std.atomic.Value(u32) = .init(0),
     /// Counters.
     produce_requests: std.atomic.Value(u32) = .init(0),
+    /// Partitions answered OUT_OF_ORDER_SEQUENCE_NUMBER: a batch whose
+    /// sequence was not the next one for its producer id.
+    out_of_order: std.atomic.Value(u32) = .init(0),
     /// The version of the last Produce request.
     produce_version: std.atomic.Value(i16) = .init(-1),
     fetch_requests: std.atomic.Value(u32) = .init(0),
@@ -101,6 +108,9 @@ pub const FakeBroker = struct {
     commits: std.atomic.Value(u32) = .init(0),
     /// Every Metadata request answers with the topic missing.
     hide_topics: std.atomic.Value(bool) = .init(false),
+    /// Every Metadata request answers each partition with
+    /// LEADER_NOT_AVAILABLE and no leader.
+    hide_leaders: std.atomic.Value(bool) = .init(false),
     /// The next N Metadata answers for a topic that does not exist yet say
     /// UNKNOWN_TOPIC_OR_PARTITION, as Kafka 4.x does while it auto-creates
     /// one; the answer after them creates it.
@@ -396,12 +406,15 @@ pub const FakeBroker = struct {
         const all = n < 0;
         if (!all) for (0..@intCast(n)) |_| try names.append(b.gpa, try d.string());
         const auto_create = d.bool_() catch true;
+        const nodes: u32 = @max(b.config.nodes, 1);
         try out.i32_(0);
-        try out.arrayLen(1);
-        try out.i32_(0);
-        try out.string("127.0.0.1");
-        try out.i32_(b.listener.socket.address.getPort());
-        try out.nullableString(null);
+        try out.arrayLen(nodes);
+        for (0..nodes) |id| {
+            try out.i32_(@intCast(id));
+            try out.string("127.0.0.1");
+            try out.i32_(b.listener.socket.address.getPort());
+            try out.nullableString(null);
+        }
         try out.nullableString("fake");
         try out.i32_(0);
         b.mutex.lockUncancelable(b.io);
@@ -428,15 +441,17 @@ pub const FakeBroker = struct {
                 try out.string(name);
                 try out.bool_(false);
                 try out.arrayLen(tp.parts.len);
+                const leaderless = b.hide_leaders.load(.acquire);
                 for (tp.parts, 0..) |_, i| {
-                    try out.i16_(0);
+                    const leader: i32 = @intCast(i % nodes);
+                    try out.i16_(if (leaderless) protocol.leader_not_available else 0);
                     try out.i32_(@intCast(i));
-                    try out.i32_(0);
-                    try out.i32_(0);
-                    try out.arrayLen(1);
+                    try out.i32_(if (leaderless) -1 else leader);
                     try out.i32_(0);
                     try out.arrayLen(1);
-                    try out.i32_(0);
+                    try out.i32_(leader);
+                    try out.arrayLen(1);
+                    try out.i32_(leader);
                     try out.arrayLen(0);
                 }
             } else {
@@ -494,6 +509,7 @@ pub const FakeBroker = struct {
                                 base = st.last_base;
                             } else if (seq != st.next_seq) {
                                 code = protocol.out_of_order_sequence;
+                                _ = b.out_of_order.fetchAdd(1, .monotonic);
                             }
                         }
                         if (code == 0) {

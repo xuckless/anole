@@ -6,6 +6,8 @@
 //! convert in SQL, so the Zig side keeps the same `Time` values as the
 //! other stores.
 const std = @import("std");
+const builtin = @import("builtin");
+const safety = @import("anole_safety");
 const anole = @import("../root.zig");
 const root = @import("root.zig");
 const store = @import("store.zig");
@@ -55,8 +57,16 @@ pub const Postgres = struct {
     holds_lock: bool = false,
     /// Who holds the lock through `session` (one process can have several clients on one store).
     held_owner: ?[]u8 = null,
-    /// Serialises the leader's session.
-    leader_mutex: std.Io.Mutex = .init,
+    /// The leader's session: one pooled connection that holds the advisory
+    /// lock for as long as it is open (Que's and GoodJob's shape). An I/O
+    /// lock (SAFETY.md L2's exception): held across the session checkout
+    /// and the leader query, taken with no other lock held (`maintain`, and
+    /// `drain` after its unlock), guarding only `session`, `holds_lock` and
+    /// `held_owner`. Temporary, until the maintenance task alone owns the
+    /// session and the drain asks it by message.
+    leader_mutex: safety.IoLock = .init,
+    /// Tests only: runs in `takeAdvisory` with the session in hand, before its query.
+    test_before_leader_query: if (builtin.is_test) ?*const fn (*Postgres) void else void = if (builtin.is_test) null else {},
 
     pub const Config = struct {
         notify: bool = true,
@@ -627,22 +637,33 @@ pub const Postgres = struct {
             self.session = try self.client.session(ctx);
             self.holds_lock = false;
         }
+        if (builtin.is_test) if (self.test_before_leader_query) |f| f(self);
         const raw = self.session.?.raw;
         const key = advisoryKey("anole.leader:", self.prefix);
         if (self.holds_lock) {
             // Renewal: the lock lives as long as the connection.
-            var r = (raw.row("SELECT 1", .{}) catch return self.dropSession()) orelse return self.dropSession();
-            r.deinit() catch return self.dropSession();
+            var r = (raw.row("SELECT 1", .{}) catch |e| return self.queryFailed(e)) orelse return self.dropSession();
+            r.deinit() catch |e| return self.queryFailed(e);
             return true;
         }
-        var r = (raw.row("SELECT pg_try_advisory_lock($1)", .{key}) catch return self.dropSession()) orelse return self.dropSession();
-        defer r.deinit() catch {};
-        self.holds_lock = r.get(bool, 0) catch false;
+        var r = (raw.row("SELECT pg_try_advisory_lock($1)", .{key}) catch |e| return self.queryFailed(e)) orelse return self.dropSession();
+        const got = r.get(bool, 0) catch false;
+        r.deinit() catch |e| return self.queryFailed(e);
+        self.holds_lock = got;
         if (self.holds_lock) {
             if (self.held_owner) |h| self.gpa.free(h);
             self.held_owner = try self.gpa.dupe(u8, owner);
         }
         return self.holds_lock;
+    }
+
+    /// A failed leader query: the session goes (closing it releases the
+    /// lock), and a cancel is passed on, never taken for "not the leader"
+    /// (SAFETY.md C3).
+    fn queryFailed(self: *Postgres, err: anyerror) error{Canceled}!bool {
+        _ = self.dropSession();
+        if (err == error.Canceled) return error.Canceled;
+        return false;
     }
 
     fn dropSession(self: *Postgres) bool {
@@ -718,4 +739,74 @@ pub fn ddlText(arena: std.mem.Allocator, prefix: []const u8) ![]const u8 {
         \\CREATE TABLE IF NOT EXISTS {0s}cron (name text PRIMARY KEY, spec text NOT NULL, last_tick timestamptz);
         \\CREATE TABLE IF NOT EXISTS {0s}leader (name text PRIMARY KEY, owner text NOT NULL, until timestamptz NOT NULL);
     , .{prefix});
+}
+
+/// The leader's advisory query held until the test lets it go, on the task
+/// that runs it (an uncancelable wait: the cancel stays pending for the query).
+const LeaderQueryHold = struct {
+    // SAFETY: set by leaderCancelCheck before the hook is installed.
+    var io: std.Io = undefined;
+    var task: ?@import("dusty").placement.Task = null;
+    var entered: std.atomic.Value(bool) = .init(false);
+    var release: std.Io.Event = .unset;
+
+    fn hold(_: *Postgres) void {
+        task = @import("dusty").placement.currentTask(io);
+        entered.store(true, .release);
+        release.waitUncancelable(io);
+    }
+
+    fn take(be: store.Backend) anyerror!bool {
+        return be.vt.leaderTake(be.ptr, "t7-leader", Time.fromSeconds(1_800_000_000), .fromSeconds(15));
+    }
+};
+
+fn leaderCancelCheck(io: std.Io, url: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const wait = @import("anole_test_wait");
+    const placement = @import("dusty").placement;
+    const pgc = try pg.Client.init(gpa, io, .{ .url = url, .environ = .empty });
+    defer pgc.deinit();
+    // The advisory key hashes the prefix: one per run, so parallel test
+    // processes on one PostgreSQL never contend for the same lock.
+    var rb: [4]u8 = undefined;
+    io.random(&rb);
+    var prefix_buf: [16]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&prefix_buf, "t7_{x:0>8}_", .{std.mem.readInt(u32, &rb, .little)});
+    const be = try Postgres.create(gpa, io, pgc, prefix, .{ .notify = false, .advisory_lock = true });
+    defer be.vt.deinit(be.ptr);
+    const self = Postgres.me(be.ptr);
+    LeaderQueryHold.io = io;
+    LeaderQueryHold.task = null;
+    LeaderQueryHold.entered.store(false, .release);
+    LeaderQueryHold.release = .unset;
+    self.test_before_leader_query = LeaderQueryHold.hold;
+    var f = try io.concurrent(LeaderQueryHold.take, .{be});
+    // A failed wait lets the query go and waits for it before the store
+    // goes; after the await below this does nothing.
+    defer {
+        LeaderQueryHold.release.set(io);
+        _ = f.await(io) catch false;
+    }
+    try wait.waitFlag(io, "the leader's query is about to run", &LeaderQueryHold.entered);
+    // The cancel comes before the query runs, by construction: zio's
+    // waitForIo (check_first) returns Canceled before it submits the write,
+    // so pg_try_advisory_lock never runs and no lock waits on the backend.
+    placement.cancelTask(LeaderQueryHold.task.?);
+    LeaderQueryHold.release.set(io);
+    try std.testing.expectError(error.Canceled, f.await(io));
+    // The failed query dropped its session, and the lock with it.
+    self.test_before_leader_query = null;
+    try std.testing.expect(try LeaderQueryHold.take(be));
+    try be.vt.leaderRelease(be.ptr, "t7-leader");
+}
+
+test "jobs pg: a cancel during the leader's advisory query reaches the caller" {
+    const url = @import("build_options").postgres_test_url orelse return error.SkipZigTest;
+    const zio = @import("zio");
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(leaderCancelCheck, .{ io, url });
+    try f.await(io);
 }

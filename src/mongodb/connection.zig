@@ -151,6 +151,9 @@ pub const Connection = struct {
     generation: u32 = 0,
     /// The client's per-server state this connection belongs to.
     server: ?*anyopaque = null,
+    /// The pool (one server's, on one executor) a call connection goes
+    /// back to (`safety.toCtx`); null for a monitor's.
+    pool: ?*anyopaque = null,
     builder: bson.Builder,
     read_buf: std.ArrayList(u8) = .empty,
     /// From the handshake.

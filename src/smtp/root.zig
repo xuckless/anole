@@ -44,6 +44,7 @@
 //! Tests that need no server use `anole.smtp.testing.FakeServer`.
 const std = @import("std");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const features = @import("build_options");
 const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
@@ -267,7 +268,7 @@ pub const Client = struct {
             .pools = undefined,
             .guard = try .init(.smtp, name, opts.breaker, opts.retry),
             .observer = .{ .system = .smtp, .name = name },
-            .readiness = .{ .io = io, .context = self, .ping = ping, .ttl = .fromSeconds(30) },
+            .readiness = .{ .io = io, .context = safety.toCtx(self), .ping = ping, .ttl = .fromSeconds(30) },
             .readiness_on = opts.readiness,
         };
         errdefer self.arena.deinit();
@@ -328,7 +329,7 @@ pub const Client = struct {
     /// Returns how many it closed.
     pub fn closeIdle(self: *Client) usize {
         var n: usize = 0;
-        for (self.pools.pools) |*p| n += p.closeIdle(self.gpa, self.io, &self.observer, null);
+        for (self.pools.pools) |*p| n += p.closeIdle(self.io, &self.observer, null);
         return n;
     }
 
@@ -363,7 +364,7 @@ pub const Client = struct {
     /// What the live console's /db entry shows.
     pub fn consoleInfo(self: *Client, w: *std.Io.Writer) !void {
         var open: usize = 0;
-        for (self.pools.pools) |*p| open += p.open;
+        for (self.pools.pools) |*p| open += p.openCount(self.io);
         try w.print("\"system\":\"smtp\",\"name\":\"{s}\",\"target\":\"{s}:{d}\",\"pools\":[{{\"open\":{d}}}]", .{ self.name, self.settings.host, self.settings.port, open });
     }
 
@@ -371,18 +372,23 @@ pub const Client = struct {
         const every: Duration = .{ .nanoseconds = @max(std.time.ns_per_s, @divTrunc(self.idle_timeout.nanoseconds, 2)) };
         while (true) {
             try self.io.sleep(every, .awake);
-            for (self.pools.pools) |*p| _ = p.closeIdle(self.gpa, self.io, &self.observer, self.idle_timeout);
+            for (self.pools.pools) |*p| _ = p.closeIdle(self.io, &self.observer, self.idle_timeout);
         }
     }
 
-    fn ping(context: *anyopaque, io: std.Io) bool {
-        const self: *Client = @ptrCast(@alignCast(context));
+    /// A cancel of the caller is `error.Canceled` (`db.Readiness` keeps no
+    /// answer then).
+    fn ping(context: *anyopaque, io: std.Io) std.Io.Cancelable!bool {
+        const self = safety.fromCtx(Client, context);
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
         const ctx = erase(&c);
         const deadline: dusty.Deadline = .init(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
-        deadline.run(Session.probe, .{ self.gpa, &ctx, self.errors, &self.settings }) catch return false;
+        deadline.run(Session.probe, .{ self.gpa, &ctx, self.errors, &self.settings }) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return false,
+        };
         return true;
     }
 

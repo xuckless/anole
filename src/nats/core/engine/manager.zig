@@ -38,6 +38,7 @@ const events = @import("../events.zig");
 const incoming = @import("incoming.zig");
 const dialer = @import("connect.zig");
 const time = @import("time.zig");
+const safety = @import("anole_safety");
 const log = std.log.scoped(.nats);
 
 /// Why a connection ends.
@@ -151,7 +152,7 @@ fn reconnect(client: *Client, pacing: *Pacing, lame_duck: bool) ?Opened {
             if (awaitExit(client, time.after(io, wait)) != null) return null;
         }
         const server = client.pool.next(io);
-        var state: AttemptState = .{};
+        var state: AttemptState = .{ .client = client };
         if (!track(client, &state)) return null;
         defer untrack(client);
         log.debug("reconnecting to {f}", .{server});
@@ -262,7 +263,7 @@ fn openFirst(client: *Client) Client.ConnectError!Opened {
     var last_error: Client.ConnectError = error.ConnectionClosed;
     for (0..client.pool.count(io)) |_| {
         const server = client.pool.next(io);
-        var state: AttemptState = .{};
+        var state: AttemptState = .{ .client = client };
         if (!track(client, &state)) return error.Canceled;
         defer untrack(client);
         log.debug("connecting to {f}", .{server});
@@ -287,20 +288,56 @@ fn openFirst(client: *Client) Client.ConnectError!Opened {
 
 /// The socket of an attempt in progress, for the manager or `close()` to
 /// shut down: the attempt may have lost its cancellation and would wait on
-/// the socket for good. The mutex keeps shutdown off a closed socket.
+/// the socket for good. The shutdown runs with no lock held (SAFETY.md L2:
+/// it is a zio I/O call); `shutting` keeps the socket and this frame alive
+/// meanwhile.
+///
+/// owner: the manager's frame (`openFirst`, `reconnect`), tracked in
+/// `client.attempt` between `track` and `untrack`. Every field but
+/// `refused` (the attempt task's own) is guarded by `client.mutex`.
 pub const AttemptState = struct {
-    mutex: Io.Mutex = .init,
+    client: *Client,
     stream: ?*ClientStream = null,
     aborted: bool = false,
+    /// A stop is shutting `stream` down with `client.mutex` let go:
+    /// `release` and `untrack` wait it out (on `client.changed`), so neither
+    /// the socket nor this frame goes meanwhile.
+    shutting: bool = false,
     /// How the server refused the credentials, when it did.
     refused: ?server_error.Refusal = null,
 
     /// Makes the attempt end soon: now, or as soon as it has a socket.
     pub fn stop(state: *AttemptState, io: Io) void {
-        state.mutex.lockUncancelable(io);
-        defer state.mutex.unlock(io);
+        const client = state.client;
+        const stream = stream: {
+            client.mutex.lockUncancelable(io);
+            defer client.mutex.unlock(io);
+            break :stream state.beginStop();
+        };
+        if (stream) |s| state.finishStop(io, s);
+    }
+
+    /// Under `client.mutex`: marks the attempt aborted; the stream to shut
+    /// down (and `shutting` set), or null when there is none or another
+    /// stop is shutting it down already.
+    pub fn beginStop(state: *AttemptState) ?*ClientStream {
         state.aborted = true;
-        if (state.stream) |stream| shutdown(io, stream);
+        if (state.shutting) return null;
+        const stream = state.stream orelse return null;
+        state.shutting = true;
+        return stream;
+    }
+
+    /// With no lock held, after `beginStop` gave `stream`: shuts it down,
+    /// then clears `shutting` and wakes who waits for it.
+    pub fn finishStop(state: *AttemptState, io: Io, stream: *ClientStream) void {
+        shutdown(io, stream);
+        const client = state.client;
+        client.mutex.lockUncancelable(io);
+        defer client.mutex.unlock(io);
+        // `state` is touched only before `shutting` clears: after it, `untrack` may end the frame.
+        state.shutting = false;
+        client.changed.wake(io);
     }
 
     fn abort(context: *anyopaque, io: Io) void {
@@ -311,18 +348,33 @@ pub const AttemptState = struct {
     /// Registers the attempt's stream; false when the attempt was aborted
     /// already.
     fn hold(state: *AttemptState, io: Io, stream: *ClientStream) bool {
-        state.mutex.lockUncancelable(io);
-        defer state.mutex.unlock(io);
+        const client = state.client;
+        client.mutex.lockUncancelable(io);
+        defer client.mutex.unlock(io);
         if (state.aborted) return false;
         state.stream = stream;
         return true;
     }
 
-    /// From here on the attempt's stream is no longer the manager's to touch.
+    /// From here on the attempt's stream is no longer the manager's to
+    /// touch: once no stop is shutting it down.
     fn release(state: *AttemptState, io: Io) void {
-        state.mutex.lockUncancelable(io);
-        defer state.mutex.unlock(io);
+        const client = state.client;
+        client.mutex.lockUncancelable(io);
+        defer client.mutex.unlock(io);
+        state.awaitShutdown(io);
         state.stream = null;
+    }
+
+    /// Under `client.mutex`: waits until no stop is shutting `stream` down
+    /// (one `shutdown(2)`), uncancelably: the socket and this frame must
+    /// outlive the shutdown.
+    fn awaitShutdown(state: *AttemptState, io: Io) void {
+        if (!state.shutting) return;
+        const was = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(was);
+        // With cancellation blocked the wait returns no error, and a cancel stays pending (C3).
+        while (state.shutting) state.client.changed.wait(io, &state.client.mutex, null) catch {};
     }
 };
 
@@ -839,24 +891,24 @@ fn lameDuck(client: *Client) void {
 }
 
 /// The servers an INFO announces join the pool, and the discovered ones it
-/// no longer names leave it.
+/// no longer names leave it; each change becomes an event, pushed after the
+/// pool's lock is let go.
 fn discover(client: *Client, info: ServerInfo) void {
     if (client.options.options.ignore_discovered_servers) return;
-    client.pool.update(client.io, info.connect_urls, PoolEvents{ .client = client });
+    if (info.connect_urls.len == 0) return;
+    // One buffer per INFO that names servers (cold path).
+    const changes = client.gpa.alloc(Pool.Change, Pool.max_changes) catch {
+        log.warn("no memory to take the servers an INFO announces", .{});
+        return;
+    };
+    defer client.gpa.free(changes);
+    const updated = client.pool.update(client.io, info.connect_urls, changes);
+    for (updated.changes) |change| client.events.push(client.io, switch (change.kind) {
+        .discovered => .{ .server_discovered = change.address },
+        .removed => .{ .server_removed = change.address },
+    });
+    if (updated.skipped > 0) log.debug("the pool holds {d} servers: {d} announced servers not added", .{ Options.max_servers, updated.skipped });
 }
-
-/// Turns the changes of the pool into events.
-const PoolEvents = struct {
-    client: *Client,
-
-    pub fn discovered(e: PoolEvents, server: ServerAddress) void {
-        e.client.events.push(e.client.io, .{ .server_discovered = server });
-    }
-
-    pub fn removed(e: PoolEvents, server: ServerAddress) void {
-        e.client.events.push(e.client.io, .{ .server_removed = server });
-    }
-};
 
 /// The `max_payload` of an INFO; 0 when the server gave none, or one that
 /// cannot be a size.
@@ -907,9 +959,12 @@ fn track(client: *Client, state: *AttemptState) bool {
     return true;
 }
 
+/// The attempt ends: once no `close()` is shutting its socket down, its
+/// frame may go.
 fn untrack(client: *Client) void {
     client.mutex.lockUncancelable(client.io);
     defer client.mutex.unlock(client.io);
+    if (client.attempt) |state| state.awaitShutdown(client.io);
     client.attempt = null;
 }
 

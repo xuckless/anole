@@ -4,10 +4,13 @@
 //! demand, on a leader error, and after `metadata_max_age`.
 //!
 //! A `Conn` is used by one component at a time (a producer sender, a
-//! consumer's coordinator, one fetcher), so a long fetch never holds up a
-//! produce or a heartbeat; the mutex only keeps accidental sharing safe.
+//! consumer's coordinator, one fetcher, the metadata refresh round holding
+//! the turn), so a long fetch never holds up a produce or a heartbeat; its
+//! I/O lock only keeps accidental sharing safe.
 const std = @import("std");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
+const testHold = @import("test_hold.zig").testHold;
 const protocol = @import("protocol.zig");
 const sasl = @import("sasl.zig");
 const scram = @import("../net/scram.zig");
@@ -44,12 +47,18 @@ pub fn parseHostPort(text: []const u8) HostPort {
 
 const max_response = 256 * 1024 * 1024;
 
+/// owner: the component that opened it (a sender task, the refresh round
+/// holding the turn, a consumer task); `close` is the owner's.
 pub const Conn = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     settings: Settings,
     stream: *net.ClientStream,
-    mutex: std.Io.Mutex = .init,
+    /// One round trip at a time on this socket, taken with no other lock
+    /// held, until #111's reader demux. L2's exception (an I/O lock); held
+    /// per task, so other tasks of the executor take their own connections'
+    /// locks while this one waits for its answer.
+    mutex: safety.IoLock = .init,
     correlation: i32 = 1,
     broken: bool = false,
     node_id: i32,
@@ -185,6 +194,13 @@ pub const Conn = struct {
         };
     }
 
+    /// A failed read or write: the cancel that ended it, so it reaches the
+    /// caller (C3), else the connection is gone.
+    fn lost(cause: ?anyerror) ConnError {
+        if (cause) |e| if (e == error.Canceled) return error.Canceled;
+        return error.ConnectionLost;
+    }
+
     fn roundTrip(self: *Conn, arena: std.mem.Allocator, api: Api, body: []const u8, want_reply: bool) ConnError![]const u8 {
         const corr = self.correlation;
         self.correlation +%= 1;
@@ -197,17 +213,18 @@ pub const Conn = struct {
         try e.raw(body);
         e.patchLen(at);
         const w = self.stream.writer();
-        w.writeAll(e.bytesWritten()) catch return error.ConnectionLost;
-        w.flush() catch return error.ConnectionLost;
+        w.writeAll(e.bytesWritten()) catch return lost(self.stream.writeError());
+        w.flush() catch return lost(self.stream.writeError());
         if (!want_reply) return "";
+        testHold(self.io, .request_written);
         const r = self.stream.reader();
         var len_buf: [4]u8 = undefined;
-        r.readSliceAll(&len_buf) catch return error.ConnectionLost;
+        r.readSliceAll(&len_buf) catch return lost(self.stream.readError());
         const len = std.mem.readInt(i32, &len_buf, .big);
         if (len < 4 or len > max_response) return error.ProtocolError;
         const data = r.readAllocAll(arena, @intCast(len)) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
-            else => error.ConnectionLost,
+            else => lost(self.stream.readError()),
         };
         if (std.mem.readInt(i32, data[0..4], .big) != corr) return error.ProtocolError;
         return data[4..];
@@ -227,17 +244,26 @@ const TopicInfo = struct {
 
 const BrokerInfo = struct { host: []u8, port: u16 };
 
+/// owner: Client. M2 process-wide: `deinit` runs after the producer and the
+/// consumers are torn down (every task that calls it is joined first).
+/// Shared by every executor under `mutex` (L1: real cross-thread state).
 pub const Cluster = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     settings: Settings,
     /// "host:port" strings, owned.
     bootstrap: [][]u8,
-    mutex: std.Io.Mutex = .init,
+    teardown: safety.Teardown = .init,
+    /// Over `brokers`, `topics` and `refresh_busy`. A leaf (L4): nothing
+    /// waits, calls out or takes another lock while it is held.
+    mutex: safety.Mutex(.leaf) = .init,
     brokers: std.AutoHashMapUnmanaged(i32, BrokerInfo) = .empty,
     topics: std.StringHashMapUnmanaged(TopicInfo) = .empty,
-    /// Serialises metadata refreshes and owns `meta_conn`.
-    refresh_mutex: std.Io.Mutex = .init,
+    /// One metadata refresh at a time (the keyring shape: a flag and a
+    /// condition under `mutex`, never a lock held across the round trip).
+    /// The round that holds the turn owns `meta_conn`.
+    refresh_busy: bool = false,
+    refresh_done: safety.Condition = .init,
     meta_conn: ?*Conn = null,
     closing: std.atomic.Value(bool) = .init(false),
 
@@ -260,7 +286,9 @@ pub const Cluster = struct {
     }
 
     pub fn deinit(self: *Cluster) void {
+        self.teardown.begin();
         self.closing.store(true, .release);
+        // No round holds the turn: every caller is joined.
         if (self.meta_conn) |c| c.close();
         var bi = self.brokers.iterator();
         while (bi.next()) |e| self.gpa.free(e.value_ptr.host);
@@ -273,6 +301,7 @@ pub const Cluster = struct {
         self.topics.deinit(self.gpa);
         for (self.bootstrap) |s| self.gpa.free(s);
         self.gpa.free(self.bootstrap);
+        self.teardown.end();
         self.gpa.destroy(self);
     }
 
@@ -337,10 +366,12 @@ pub const Cluster = struct {
     }
 
     /// Fetches the metadata of `topics` (just the brokers when empty) and
-    /// updates the cache.
+    /// updates the cache. One round at a time: a caller waits for the turn
+    /// (cancelable), then runs its own round holding no lock.
     pub fn refresh(self: *Cluster, topics: []const []const u8, allow_auto_create: bool) ConnError!void {
-        try self.refresh_mutex.lock(self.io);
-        defer self.refresh_mutex.unlock(self.io);
+        try self.takeRefreshTurn();
+        // C2: the turn goes back on every exit, a cancel included.
+        defer self.giveRefreshTurn();
         var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -359,6 +390,20 @@ pub const Cluster = struct {
         };
         const md = protocol.decodeMetadata(arena, body) catch return error.ProtocolError;
         try self.apply(md);
+    }
+
+    fn takeRefreshTurn(self: *Cluster) std.Io.Cancelable!void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        while (self.refresh_busy) try self.refresh_done.wait(self.io, &self.mutex);
+        self.refresh_busy = true;
+    }
+
+    fn giveRefreshTurn(self: *Cluster) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.refresh_busy = false;
+        self.refresh_done.broadcast(self.io);
     }
 
     fn apply(self: *Cluster, md: protocol.Metadata) ConnError!void {
@@ -422,6 +467,7 @@ pub const Cluster = struct {
         var pause: std.Io.Duration = .fromMilliseconds(10);
         while (true) {
             try self.refresh(&.{topic}, true);
+            testHold(self.io, .metadata_refreshed);
             if (self.lookupCount(topic)) |n| return n;
             if (!self.mayAppear(topic)) return null;
             const elapsed = started.durationTo(.now(self.io, .awake)).raw.nanoseconds;
@@ -433,11 +479,12 @@ pub const Cluster = struct {
     }
 
     /// Whether the cached answer for `topic` is one a topic being created
-    /// gives.
+    /// gives, or there is none: the caller's own refresh stored one, so a
+    /// stale leader's `invalidate` dropped it since (ask again).
     fn mayAppear(self: *Cluster, topic: []const u8) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const t = self.topics.get(topic) orelse return false;
+        const t = self.topics.get(topic) orelse return true;
         return switch (t.error_code) {
             protocol.unknown_topic_or_partition, protocol.leader_not_available => true,
             0 => t.partitions.len == 0,
