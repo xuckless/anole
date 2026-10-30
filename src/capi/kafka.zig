@@ -29,6 +29,7 @@ const nats_cap = @import("nats.zig");
 
 const features = anole.features;
 const placement = dusty.placement;
+const zio = anole.zio;
 const push_list = dusty.push_list;
 const gpa = engine.gpa;
 const Engine = engine.Engine;
@@ -493,8 +494,15 @@ const PumpCmd = struct {
     }
 };
 
+/// Records a pump hands the producer before it gives its executor's other
+/// tasks a turn.
+const pump_turn = 64;
+
 /// Appends the queued records to the producer in the order they came. The
-/// queue's one taker while `running` is set.
+/// queue's one taker while `running` is set. A consumer thread producing
+/// without pause keeps the list from running dry, so the pump yields every
+/// `pump_turn` records: the waiters it spawned and the executor's commands
+/// (the stop among them) run meanwhile.
 fn pump(x: *Exec, b: *Broker) std.Io.Cancelable!void {
     var rest: ?*push_list.Node = null;
     defer while (rest) |n| {
@@ -503,6 +511,7 @@ fn pump(x: *Exec, b: *Broker) std.Io.Cancelable!void {
         _ = b.pending.fetchSub(r.size, .acq_rel);
         r.free();
     };
+    var handled: u32 = 0;
     while (true) {
         rest = b.queue.list.takeAll();
         if (rest == null) {
@@ -515,6 +524,10 @@ fn pump(x: *Exec, b: *Broker) std.Io.Cancelable!void {
         while (rest) |n| {
             rest = n.next;
             try handleItem(x, b, itemOf(n));
+            // Counted across takes: a list fed one record at a time is
+            // taken one at a time.
+            handled +%= 1;
+            if (handled % pump_turn == 0) try zio.yield();
         }
     }
 }
