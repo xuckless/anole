@@ -7,6 +7,11 @@ breaking changes are listed anyway.
 
 ### Added
 
+- `anole.sse.Parser`: reads a server-sent event stream from any
+  `*std.Io.Reader` (a response fetched with `.stream = true`), by the WHATWG
+  rules: CRLF, LF and CR line ends, a leading BOM, comments, `id` and
+  `retry`, lines of any length up to `Options.max_event_size` (16 MiB), and
+  an event cut off by the end of the stream dropped. See docs/realtime.md.
 - `anole.db.migrate(db, c, migrations)` and `anole.db.Migration`: numbered
   SQL migrations for PostgreSQL and SQLite. Each runs once, in its own
   transaction with its record in `schema_migrations`; a failing one is
