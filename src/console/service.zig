@@ -309,6 +309,10 @@ pub const Service = struct {
         c.* = .{ .service = self, .fd = fd, .in_process = in_process };
         errdefer self.gpa.destroy(c);
         sys.setNonblock(fd);
+        if (comptime builtin.is_test) if (test_before_append) |hook| {
+            test_before_append = null;
+            hook(self);
+        };
         self.lock.lock();
         self.clients.appendBounded(c) catch {
             // Clients whose thread ended faster than `reap` could join
@@ -329,6 +333,28 @@ pub const Service = struct {
             sys.close(fd);
             return error.SystemResources;
         };
+    }
+
+    /// Tests: runs once in `adopt`, after its count of live clients and
+    /// before the new one is added, where clients whose thread ended can
+    /// fill the list before `reap` joins them. Test builds only.
+    pub var test_before_append: if (builtin.is_test) ?*const fn (*Service) void else void = if (builtin.is_test) null else {};
+
+    /// Tests: fills the list with clients whose thread has ended and that
+    /// `reap` has not joined yet (no thread, no socket). Test builds only.
+    pub fn testFillFinished(self: *Service) void {
+        comptime std.debug.assert(builtin.is_test);
+        while (true) {
+            const c = self.gpa.create(Client) catch @panic("OOM");
+            c.* = .{ .service = self, .fd = -1, .done = .init(true) };
+            self.lock.lock();
+            const added = if (self.clients.appendBounded(c)) |_| true else |_| false;
+            self.lock.unlock();
+            if (!added) {
+                self.gpa.destroy(c);
+                return;
+            }
+        }
     }
 
     // ---------------------------------------------------------- acceptor

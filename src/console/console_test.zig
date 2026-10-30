@@ -324,6 +324,25 @@ test "service: the fifth client is told busy" {
     try std.testing.expect(std.mem.startsWith(u8, c5.refusal.?, "busy:"));
 }
 
+test "service: a client past the tracked limit is told busy" {
+    if (!os.supported) return error.SkipZigTest;
+    var h = try Harness.init(std.testing.allocator, .{}, full_allow);
+    defer h.deinit();
+    // Past the count of live clients, the list fills with clients whose
+    // thread ended and that are not joined yet.
+    service.Service.test_before_append = service.Service.testFillFinished;
+    defer service.Service.test_before_append = null;
+    const pair = try os.socketpair();
+    try std.testing.expectError(error.Busy, h.svc.adopt(pair[0], false));
+    var c = ui.client.Conn.init(std.testing.allocator, pair[1], pair[1]);
+    defer {
+        c.close();
+        c.deinit();
+    }
+    try std.testing.expectError(error.Refused, c.handshake("test", 5000, sys.monotonicMs));
+    try std.testing.expect(std.mem.startsWith(u8, c.refusal.?, "busy:"));
+}
+
 test "service: a newer protocol gets a version error" {
     if (!os.supported) return error.SkipZigTest;
     var h = try Harness.init(std.testing.allocator, .{}, full_allow);
@@ -509,6 +528,17 @@ test "service: the socket file is 0600 in a 0700 directory and goes away with th
     // Stopping the service removes the socket file.
     h.svc.stop();
     try std.testing.expect(os.lstat(path) == null);
+}
+
+test "service: setMetrics refuses an empty name, a name over 48 bytes and a unit over 16" {
+    if (!os.supported) return error.SkipZigTest;
+    var h = try Harness.init(std.testing.allocator, .{}, full_allow);
+    defer h.deinit();
+    // At the limits: taken.
+    try h.svc.setMetrics(&.{.{ .name = &@as([48]u8, @splat('n')), .value = 1, .unit = &@as([16]u8, @splat('u')) }});
+    try std.testing.expectError(error.Invalid, h.svc.setMetrics(&.{.{ .name = "", .value = 1, .unit = "" }}));
+    try std.testing.expectError(error.Invalid, h.svc.setMetrics(&.{.{ .name = &@as([49]u8, @splat('n')), .value = 1, .unit = "" }}));
+    try std.testing.expectError(error.Invalid, h.svc.setMetrics(&.{.{ .name = "lag", .value = 1, .unit = &@as([17]u8, @splat('u')) }}));
 }
 
 test "service: language metrics show in the runtime snapshot" {

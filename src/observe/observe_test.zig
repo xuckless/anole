@@ -627,6 +627,151 @@ test "trace: a flush whose caller is canceled stays canceled" {
     try std.testing.expectError(error.Canceled, flusher.cancel(io));
 }
 
+/// A task that flushes and notes when the flush returned.
+const Flusher = struct {
+    exporter: *observe.trace.Exporter,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(f: *Flusher) void {
+        f.exporter.flush(.fromSeconds(3600));
+        f.done.store(true, .release);
+    }
+};
+
+/// An OTLP collector that holds its first two batches, each until the
+/// test lets it go.
+const StepCollector = struct {
+    var arrivals: std.atomic.Value(u32) = .init(0);
+    var arrived: [2]std.Io.Event = @splat(.unset);
+    var release: [2]std.Io.Event = @splat(.unset);
+
+    fn reset() void {
+        arrivals = .init(0);
+        arrived = @splat(.unset);
+        release = @splat(.unset);
+    }
+
+    fn letAllGo(io: std.Io) void {
+        for (&release) |*r| r.set(io);
+    }
+
+    fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+        _ = try req.body();
+        const i = arrivals.fetchAdd(1, .acq_rel);
+        if (i < 2) {
+            arrived[i].set(req.io);
+            release[i].waitUncancelable(req.io);
+        }
+        res.body = "{}";
+    }
+};
+
+test "trace: a flush that a close overtakes returns before the last batch is answered" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    HeldCollector.arrived = .unset;
+    HeldCollector.release = .unset;
+
+    var otel = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer otel.deinit();
+    otel.router.post("/v1/traces", HeldCollector.handle);
+    var otel_future = try io.concurrent(serve, .{&otel});
+    defer otel_future.cancel(io) catch {};
+    try otel.waitReady(io);
+
+    var client = dusty.Client.init(gpa, io, .{});
+    defer client.deinit();
+    var endpoint_buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{otel.address.ip.getPort()});
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = endpoint, .service_name = "overtaken", .interval = .fromSeconds(600) });
+    defer exporter.deinit();
+    defer HeldCollector.release.set(io);
+    try exporter.start();
+    exporter.submit(testSpan('d'));
+    try wait.waitEvent(io, "the collector got the batch", &HeldCollector.arrived);
+
+    // A flusher waits for the unanswered batch; then the close comes, and
+    // waits for the task, which waits for the collector.
+    var flusher: Flusher = .{ .exporter = &exporter };
+    var flushing = try io.concurrent(Flusher.run, .{&flusher});
+    defer flushing.cancel(io);
+    try wait.waitAtLeast(io, "the flusher waits", &exporter.test_flush_waits, 1);
+    var closing = try io.concurrent(observe.trace.Exporter.close, .{&exporter});
+    defer closing.cancel(io);
+    // On a failure: before the close is waited for.
+    defer HeldCollector.release.set(io);
+    try wait.waitFlag(io, "the overtaken flush returned while the batch is unanswered", &flusher.done);
+    HeldCollector.release.set(io);
+    closing.await(io);
+    try std.testing.expectEqual(exporter.queued.load(.acquire), exporter.finished.load(.acquire));
+}
+
+test "trace: flushes from several tasks each return once their own spans are answered" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    StepCollector.reset();
+
+    var otel = dusty.Server(void).init(gpa, io, .{ .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } }} }, {});
+    defer otel.deinit();
+    otel.router.post("/v1/traces", StepCollector.handle);
+    var otel_future = try io.concurrent(serve, .{&otel});
+    defer otel_future.cancel(io) catch {};
+    try otel.waitReady(io);
+
+    var client = dusty.Client.init(gpa, io, .{});
+    defer client.deinit();
+    var endpoint_buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{otel.address.ip.getPort()});
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = endpoint, .service_name = "flushers", .interval = .fromSeconds(600) });
+    defer exporter.deinit();
+    defer StepCollector.letAllGo(io);
+    try exporter.start();
+
+    // The first flusher waits for span 'e' (the first batch, held), the
+    // second for 'e' and 'f' ('f' goes in the second batch).
+    exporter.submit(testSpan('e'));
+    try wait.waitEvent(io, "the collector got the first batch", &StepCollector.arrived[0]);
+    var first: Flusher = .{ .exporter = &exporter };
+    var first_future = try io.concurrent(Flusher.run, .{&first});
+    defer first_future.cancel(io);
+    try wait.waitAtLeast(io, "the first flusher waits", &exporter.test_flush_waits, 1);
+    exporter.submit(testSpan('f'));
+    var second: Flusher = .{ .exporter = &exporter };
+    var second_future = try io.concurrent(Flusher.run, .{&second});
+    defer second_future.cancel(io);
+
+    StepCollector.release[0].set(io);
+    try wait.waitFlag(io, "the first flusher returned once the first batch was answered", &first.done);
+    try wait.waitEvent(io, "the collector got the second batch", &StepCollector.arrived[1]);
+    // Its 'f' is unanswered: the second flusher still waits.
+    try std.testing.expect(!second.done.load(.acquire));
+    StepCollector.release[1].set(io);
+    try wait.waitFlag(io, "the second flusher returned once the second batch was answered", &second.done);
+    try std.testing.expectEqual(@as(u64, 2), exporter.exported.load(.acquire));
+}
+
+test "trace: spans close finds unsent are counted finished and dropped" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var client = dusty.Client.init(gpa, io, .{});
+    defer client.deinit();
+    // Never started: nothing sends what is queued.
+    var exporter = try observe.trace.Exporter.init(gpa, io, .{ .http = &client }, .{ .endpoint = "http://127.0.0.1:9", .service_name = "unsent" });
+    defer exporter.deinit();
+    for ("ghi") |id| exporter.submit(testSpan(id));
+    exporter.close();
+    try std.testing.expectEqual(@as(u64, 3), exporter.queued.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 3), exporter.finished.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 3), exporter.dropped.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), exporter.exported.load(.acquire));
+}
+
 // ------------------------------------------------------------ stress (W3)
 
 /// An OTLP collector that takes every batch.

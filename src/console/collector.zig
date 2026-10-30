@@ -3,6 +3,7 @@
 //! them under those locks, and the console's thread, which must not take a
 //! lock of the runtime, waits for the answer (up to `wait_ms`).
 const std = @import("std");
+const builtin = @import("builtin");
 const safety = @import("anole_safety");
 
 pub const What = enum(u8) { ws, db };
@@ -44,6 +45,10 @@ pub const Collector = struct {
     task: ?std.Io.Future(void) = null,
 
     pub const wait_ms = 200;
+    /// Tests: replaces `wait_ms`, so that a test's ask waits for the answer
+    /// however slow the machine is (its own deadline still holds). Test
+    /// builds only.
+    pub var test_wait_ms: if (builtin.is_test) ?u32 else void = if (builtin.is_test) null else {};
 
     /// On a task of the runtime (the server's run).
     pub fn start(c: *Collector) !void {
@@ -96,7 +101,8 @@ pub const Collector = struct {
         c.what.store(@backingInt(what), .release);
         c.asked.store(seq, .release);
         c.ask.set(c.io);
-        const deadline = std.Io.Clock.Timestamp.now(blockingIo(), .awake).addDuration(.{ .raw = .fromMilliseconds(wait_ms), .clock = .awake });
+        const ms: u32 = if (comptime builtin.is_test) test_wait_ms orelse wait_ms else wait_ms;
+        const deadline = std.Io.Clock.Timestamp.now(blockingIo(), .awake).addDuration(.{ .raw = .fromMilliseconds(ms), .clock = .awake });
         while (true) {
             if (try c.take(seq, w)) return;
             // A late answer to an earlier ask woke this: look again after

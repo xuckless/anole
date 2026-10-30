@@ -26,6 +26,7 @@
 //! The method table is the generated service type the server side uses;
 //! its handlers are not called here, only its names and message types.
 const std = @import("std");
+const builtin = @import("builtin");
 const h2 = @import("anole_h2_client");
 const frame = @import("frame.zig");
 const status_mod = @import("status.zig");
@@ -358,6 +359,7 @@ pub const Channel = struct {
         // channel's is taken.
         const current = self.h3;
         if (current) |c| if (c.isOpen()) return c;
+        testAutoH3BeforeLock(self);
         owned.mutex.lockUncancelable(io_);
         // Another call dialed meanwhile: its connection is the one to use.
         if (self.h3 != current) {
@@ -398,6 +400,18 @@ pub const Channel = struct {
         };
         self.h3 = fresh;
         return fresh;
+    }
+
+    /// Tests: runs once in `autoH3`, after it found the HTTP/3 connection
+    /// it read gone and before it takes the channel's lock, where another
+    /// call's dial can come in between. Test builds only.
+    pub var test_auto_h3_before_lock: if (builtin.is_test) ?*const fn (*Channel) void else void = if (builtin.is_test) null else {};
+
+    fn testAutoH3BeforeLock(self: *Channel) void {
+        if (comptime !builtin.is_test) return;
+        const hook = test_auto_h3_before_lock orelse return;
+        test_auto_h3_before_lock = null;
+        hook(self);
     }
 
     /// The Alt-Svc of a response on an `.auto` channel.

@@ -169,6 +169,52 @@ test "metrics: a breaker's state reaches the metrics when it is made, and when t
     try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_state{client=\"http\",target=\"b\"} 0") != null);
 }
 
+/// Another executor's transition between a report's unlock and the
+/// report: "a" opens (five failures).
+fn tripA(bs: *core.Breakers) void {
+    const a = bs.get(testing.io, "a") catch unreachable;
+    for (0..5) |_| a.record(a.allow(0).?, .failure, 0);
+}
+
+test "metrics: a new breaker that opens before its first report reads open" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var registry = metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    var binding = try Binding.init(gpa, &registry);
+    defer binding.deinit();
+    var breakers = core.Breakers.init(gpa, .{}, .http, 64);
+    defer breakers.deinit();
+    breakers.observe(io, binding.metricsHooks());
+    core.Breakers.test_after_unlock = tripA;
+    defer core.Breakers.test_after_unlock = null;
+    const a = try breakers.get(io, "a");
+    try testing.expectEqual(core.Breaker.State.open, a.state());
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "anole_breaker_state{client=\"http\",target=\"a\"} 2") != null);
+}
+
+test "metrics: a breaker that opens while the breakers are observed reads open" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var registry = metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    var binding = try Binding.init(gpa, &registry);
+    defer binding.deinit();
+    var breakers = core.Breakers.init(gpa, .{}, .http, 64);
+    defer breakers.deinit();
+    _ = try breakers.get(io, "a");
+    core.Breakers.test_after_unlock = tripA;
+    defer core.Breakers.test_after_unlock = null;
+    breakers.observe(io, binding.metricsHooks());
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "anole_breaker_state{client=\"http\",target=\"a\"} 2") != null);
+}
+
 /// The tasks of the breakers stress test: each makes and looks up breakers
 /// over the same keys, with the metrics on.
 const BreakersStress = struct {

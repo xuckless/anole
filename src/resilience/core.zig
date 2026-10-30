@@ -3,6 +3,7 @@
 //! (its own module) and the rest of Anole use the same types. `anole.resilience` (root.zig) re-exports
 //! them and adds the Prometheus binding.
 const std = @import("std");
+const builtin = @import("builtin");
 const safety = @import("anole_safety");
 
 const log = std.log.scoped(.anole);
@@ -500,6 +501,8 @@ pub const Breakers = struct {
                     seen.append(arena, .{ .name = name, .state = b.state() }) catch continue;
                 }
             }
+            if (seen.items.len == 0) continue;
+            testAfterUnlock(self);
             for (seen.items) |x| hooks.on_state(hooks.context, self.kind, x.name, x.state);
         }
     }
@@ -532,8 +535,24 @@ pub const Breakers = struct {
         // A new breaker starts closed; its label is the caller's key, cut
         // as the breaker cuts its name, so nothing of the entry is read
         // here.
-        if (self.metrics) |m| m.on_state(m.context, self.kind, key[0..@min(key.len, max_name)], .closed);
+        if (self.metrics) |m| {
+            testAfterUnlock(self);
+            m.on_state(m.context, self.kind, key[0..@min(key.len, max_name)], .closed);
+        }
         return made;
+    }
+
+    /// Tests: runs once, after a shard's lock is let go and before its
+    /// breakers are reported (`get` of a new key, `observe` of a shard
+    /// with breakers), where another executor's transition can come in
+    /// between. Test builds only.
+    pub var test_after_unlock: if (builtin.is_test) ?*const fn (*Breakers) void else void = if (builtin.is_test) null else {};
+
+    fn testAfterUnlock(self: *Breakers) void {
+        if (comptime !builtin.is_test) return;
+        const hook = test_after_unlock orelse return;
+        test_after_unlock = null;
+        hook(self);
     }
 
     fn evict(self: *Breakers, s: *Shard) void {

@@ -163,18 +163,13 @@ const BigAsker = struct {
         self.done.store(true, .release);
     }
 
-    /// One ask, waited for on the runtime: true with the answer in `out`,
-    /// false when the runtime did not answer in time (a busy machine).
-    fn ask(self: *BigAsker, io: std.Io) !bool {
-        self.done.store(false, .release);
-        self.err = null;
-        self.out.clearRetainingCapacity();
+    /// One ask, waited for on the runtime, with the answer in `out`.
+    fn ask(self: *BigAsker, io: std.Io) !void {
         const t = try std.Thread.spawn(.{}, run, .{self});
         const answered = wait.waitFlag(io, "the collector answered the snapshot", &self.done);
         t.join();
         try answered;
-        if (self.err) |e| return if (e == error.Busy) false else e;
-        return true;
+        if (self.err) |e| return e;
     }
 };
 
@@ -191,11 +186,11 @@ test "console collector: the answer to a snapshot reaches the asker" {
     defer c.stop();
     var asker: BigAsker = .{ .c = &c, .out = .init(checked.allocator()) };
     defer asker.out.deinit();
-    try wait.waitUntil(io, "the collector answered in time", &asker, struct {
-        fn answered(a: *BigAsker) !bool {
-            return a.ask(a.c.io);
-        }
-    }.answered);
+    // The asker waits for the answer up to the test's own deadline, not the
+    // console's 200 ms: a slow machine is no retry.
+    collector_mod.Collector.test_wait_ms = wait.deadlineMs();
+    defer collector_mod.Collector.test_wait_ms = null;
+    try asker.ask(io);
     try std.testing.expectEqual(@as(usize, 4096), asker.out.written().len);
     for (asker.out.written()) |b| try std.testing.expectEqual(@as(u8, 'x'), b);
 }
