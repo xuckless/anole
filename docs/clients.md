@@ -463,6 +463,9 @@ _ = body.interface.streamRemaining(&file_writer.interface) catch |err| switch (e
 };
 ```
 
+To read a `text/event-stream` response event by event, hand the reader to
+`anole.sse.Parser` (docs/realtime.md, "Reading another server's stream").
+
 A streamed body is not limited by `max_response_size`. A response released
 with its body unread is drained in the background (up to 256 KiB) so its
 connection can be reused, or else closed.

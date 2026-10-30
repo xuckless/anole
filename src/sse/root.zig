@@ -27,6 +27,8 @@ pub const replay = @import("replay.zig");
 pub const out_mod = @import("out.zig");
 
 pub const Out = out_mod.Out;
+/// Reads an event stream from another server (the client side).
+pub const Parser = @import("parser.zig").Parser;
 pub const Payload = replay.Payload;
 
 pub const Duration = std.Io.Duration;
@@ -1590,6 +1592,7 @@ fn pathHasParam(path: []const u8, name: []const u8) bool {
 
 test {
     _ = replay;
+    _ = @import("parser.zig");
     _ = @import("topics_test.zig");
     _ = @import("serve_test.zig");
 }

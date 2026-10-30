@@ -5,6 +5,14 @@ breaking changes are listed anyway.
 
 ## 0.4.1 (unreleased)
 
+### Added
+
+- `anole.sse.Parser`: reads a server-sent event stream from any
+  `*std.Io.Reader` (a response fetched with `.stream = true`), by the WHATWG
+  rules: CRLF, LF and CR line ends, a leading BOM, comments, `id` and
+  `retry`, lines of any length up to `Options.max_event_size` (16 MiB), and
+  an event cut off by the end of the stream dropped. See docs/realtime.md.
+
 ### Fixed
 
 - net: a UDP send racing the stop answers Closed instead of being dropped
