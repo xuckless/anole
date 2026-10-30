@@ -89,7 +89,7 @@ pub const Wait = struct {
     pub const Ref = struct { wait: *Wait, gen: u32 };
 
     fn pack(gen: u32, state: State) u64 {
-        return @as(u64, gen) << 32 | @intFromEnum(state);
+        return @as(u64, gen) << 32 | @backingInt(state);
     }
 
     fn genOf(word: u64) u32 {
@@ -97,7 +97,7 @@ pub const Wait = struct {
     }
 
     fn stateOf(word: u64) State {
-        return @enumFromInt(@as(u32, @truncate(word)));
+        return @fromBackingInt(@intCast(@as(u32, @truncate(word))));
     }
 };
 
