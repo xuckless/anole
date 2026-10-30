@@ -177,14 +177,9 @@ const Producer = struct {
         p.deliveries = .{ .c = p.c };
         const d = &p.deliveries.?;
         var i: u64 = 0;
+        // No pause between produces: the pump's queue never runs dry, and
+        // the stop still gets its executor.
         while (!d.stopped) : (i += 1) {
-            // At most 64 records unanswered per thread: the pump's queue
-            // stays short (a pump fed without pause never yields its
-            // executor, which then never runs the stop).
-            if (p.taken.items.len - d.list.items.len >= 64) {
-                try d.pump(10);
-                continue;
-            }
             const ud = p.index << 32 | i;
             if (engine.kafka.produce(p.r.log(), p.c, out("race", "k", "v", 0), ud)) |_| {
                 try p.taken.append(alloc, ud);
