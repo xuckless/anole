@@ -1081,6 +1081,10 @@ const SpawnYield = struct {
 };
 
 test "net tcp: a connection released while the driver is suspended in a spawn is not touched after" {
+    // On Windows the driver never writes itself (no `serviceDirect`): it
+    // hands every outbox to the flusher, which is in the connection's group
+    // and joined by `release`, so this interleaving does not exist there.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     SpawnYield.hold = .{ .point = .spawn_writable };
     SpawnYield.closed.store(0, .monotonic);
     var app = try App.init(alloc, .{ .executors = .exact(1) });
