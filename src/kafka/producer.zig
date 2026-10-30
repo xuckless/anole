@@ -939,9 +939,10 @@ pub const Producer = struct {
                 if (a.leader != resolver_id) continue;
                 // The id is kept for its start before the leader is set: a
                 // leader whose sender never starts strands the batches.
-                for (start.items) |x| {
-                    if (x == id) break;
-                } else start.append(arena, id) catch {
+                const listed = for (start.items) |x| {
+                    if (x == id) break true;
+                } else false;
+                if (!listed) start.append(arena, id) catch {
                     all = false;
                     continue;
                 };
