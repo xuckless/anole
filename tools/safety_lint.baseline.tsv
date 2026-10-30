@@ -78,7 +78,6 @@ src/grpc/frame.zig	U3	5
 src/grpc/health.zig	U3	1
 src/grpc/metadata.zig	U3	1
 src/grpc/server.zig	C3	1
-src/grpc/server.zig	L2	1
 src/grpc/server.zig	U3	4
 src/grpc/transcode.zig	U3	4
 src/h2/client.zig	L2	1
@@ -153,7 +152,6 @@ src/mongodb/fake_cs.zig	L2	1
 src/mongodb/fake_cs.zig	T1	2
 src/mongodb/fake_cs.zig	U3	2
 src/mongodb/sdam.zig	U3	3
-src/nats/core/Client.zig	L2	1
 src/nats/core/Client.zig	U3	4
 src/nats/core/Message.zig	U3	3
 src/nats/core/ServerAddress.zig	U3	1
@@ -204,7 +202,6 @@ src/s3/sigv4.zig	U3	6
 src/s3/upload.zig	L2	1
 src/s3/xml.zig	U3	3
 src/sd_notify.zig	U3	4
-src/server.zig	L2	1
 src/server.zig	U3	19
 src/session/root.zig	U3	10
 src/smtp/pool.zig	L2	2

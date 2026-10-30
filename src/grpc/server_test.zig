@@ -73,8 +73,8 @@ fn serverStream(call: *grpc.Call, req: pb.EchoRequest, out: *std.Io.Queue(pb.Ech
         // (it does so under the write lock).
         try wait.waitUntil(call.io, "the writer started the response head", call, struct {
             fn started(cl: *grpc.Call) !bool {
-                try cl.impl.write_mutex.lock(cl.io);
-                defer cl.impl.write_mutex.unlock(cl.io);
+                try cl.impl.write_lock.lock(cl.io);
+                defer cl.impl.write_lock.unlock(cl.io);
                 return cl.impl.out != null;
             }
         }.started);

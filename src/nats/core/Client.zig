@@ -102,8 +102,11 @@ connection_tasks: Io.Group = .init,
 /// The current connection; only the manager opens and closes it.
 connection: Connection = undefined,
 
-/// Held while connect, close and deinit start or stop the manager.
-lifecycle: Io.Mutex = .init,
+/// Held while connect, close and deinit start or stop the manager: a spawn
+/// (which may yield) and a join. An I/O lock (SAFETY.md L2's exception):
+/// it guards the manager's start and stop, no other lock's data, and is
+/// taken with no other lock held; `mutex` is taken under it.
+lifecycle: safety.IoLock = .init,
 /// Guards the fields below.
 mutex: safety.Mutex(.leaf) = .init,
 /// Woken on every change of the fields below. Any number of tasks may

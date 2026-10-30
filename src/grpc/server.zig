@@ -20,6 +20,7 @@
 //! or the deadline in any of them cancels the others.
 const std = @import("std");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const frame = @import("frame.zig");
 const status_mod = @import("status.zig");
 const metadata_mod = @import("metadata.zig");
@@ -179,7 +180,13 @@ pub const Call = struct {
         /// A transcoded server stream: its messages are the elements of
         /// one JSON array.
         json_array: bool = false,
-        write_mutex: std.Io.Mutex = .init,
+        /// The call's response stream: one writer at a time, across the
+        /// stream's write and flush; also orders `addHeader` against the
+        /// head the first write sends. An I/O lock (SAFETY.md L2's
+        /// exception): its two takers, the handler and its streaming
+        /// writer task, run on the call's executor. Replaced at the S2
+        /// HTTP/2 takeover.
+        write_lock: safety.IoLock = .init,
         /// The wire protocol and message encoding, from the request's
         /// content type.
         protocol: Protocol = .grpc,
@@ -233,8 +240,8 @@ pub const Call = struct {
     /// `putOne`.
     pub fn addHeader(self: *Call, name: []const u8, value: []const u8) !void {
         // The writer starts the head under the same lock (`writeBytes`).
-        try self.impl.write_mutex.lock(self.io);
-        defer self.impl.write_mutex.unlock(self.io);
+        try self.impl.write_lock.lock(self.io);
+        defer self.impl.write_lock.unlock(self.io);
         if (self.impl.out != null) return error.HeadersSent;
         if (!metadata_mod.isSendableKey(name, .header) or !metadata_mod.isSendableValue(name, value)) return error.InvalidMetadata;
         try self.res.addHeader(try self.arena.dupe(u8, name), try self.arena.dupe(u8, value));
@@ -1325,8 +1332,8 @@ fn writeBytesWith(call: *Call, bytes: []const u8, allocator: std.mem.Allocator) 
         null;
     defer if (encoded) |enc| if (allocator.ptr != call.arena.ptr) allocator.free(enc);
     const data = if (encoded) |enc| std.base64.standard.Encoder.encode(enc, bytes) else bytes;
-    try call.impl.write_mutex.lock(call.io);
-    defer call.impl.write_mutex.unlock(call.io);
+    try call.impl.write_lock.lock(call.io);
+    defer call.impl.write_lock.unlock(call.io);
     call.impl.started = true;
     if (call.impl.buffer == null and call.impl.out == null and call.impl.out_buf.len == 0) {
         // No stream was set up (a call refused or failed before it could

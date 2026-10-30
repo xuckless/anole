@@ -29,6 +29,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const features = @import("build_options");
 const zio = @import("zio");
+const safety = @import("anole_safety");
 const http = @import("http/root.zig");
 const tls = if (features.tls == .boringssl) @import("tls/root.zig") else struct {};
 const tls_testing = if (features.tls == .boringssl) @import("tls/testing.zig") else struct {};
@@ -937,8 +938,12 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// The connector whose start failed, and why (for the startup error's text).
             failed_system: ?[]const u8 = null,
             failed_cause: ?[]const u8 = null,
-            /// One certificate reload at a time.
-            cert_mutex: std.Io.Mutex = .init,
+            /// One certificate reload at a time, across its file reads
+            /// (SAFETY.md L2's exception: the reload is the resource; it
+            /// guards the certificate sources, which only a reload
+            /// touches). Taken with no other lock held: SIGHUP's task, the
+            /// console's thread, a C ABI thread.
+            cert_lock: safety.IoLock = .init,
             /// The routes recorded for the OpenAPI document (`-Dopenapi`),
             /// and what `app.openapi` asked for.
             doc_entries: if (features.openapi) std.ArrayList(openapi_mod.Entry) else void = if (features.openapi) .empty else {},
@@ -3432,8 +3437,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         fn reloadCertificatesInner(self: *Self) !void {
             if (self.certs.len == 0) return error.NoTlsListener;
             const io_ = self.rt.io();
-            try self.extras.cert_mutex.lock(io_);
-            defer self.extras.cert_mutex.unlock(io_);
+            try self.extras.cert_lock.lock(io_);
+            defer self.extras.cert_lock.unlock(io_);
             const next = try self.gpa.alloc(CertState.Pem, self.certs.len);
             defer self.gpa.free(next);
             var loaded: usize = 0;
@@ -3460,8 +3465,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
         fn setCertificateInner(self: *Self, cert: Cert) !void {
             if (self.certs.len == 0) return error.NoTlsListener;
             const io_ = self.rt.io();
-            try self.extras.cert_mutex.lock(io_);
-            defer self.extras.cert_mutex.unlock(io_);
+            try self.extras.cert_lock.lock(io_);
+            defer self.extras.cert_lock.unlock(io_);
             const next = try self.gpa.alloc(CertState.Pem, self.certs.len);
             defer self.gpa.free(next);
             var loaded: usize = 0;
@@ -3483,7 +3488,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         /// Puts `next` (one per `certs`) in place on the TLS listeners and
         /// HTTP/3, or none of it. Takes `next` on success. Under
-        /// `cert_mutex`.
+        /// `cert_lock` (an I/O lock, so the listeners' TLS spin locks and
+        /// HTTP/3's taken here are below it: L4).
         fn switchCertificates(self: *Self, next: []const CertState.Pem) !void {
             const gpa = self.gpa;
             // HTTP/3's context first: it checks the certificate and key, and
