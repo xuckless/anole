@@ -343,7 +343,8 @@ pub const Client = struct {
             self.consumers_mutex.lockUncancelable(self.io);
             defer self.consumers_mutex.unlock(self.io);
             // Set only once the observer, telemetry, health check and the
-            // start's refresh succeeded: a failed start can be retried.
+            // start's refresh succeeded: a failed start can be retried, and
+            // consume does not start groups added before a successful start.
             self.started = true;
             break :blk self.consumers.items.len;
         };

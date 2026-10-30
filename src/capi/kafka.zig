@@ -426,6 +426,7 @@ pub fn produce(b: *Broker, c: *Consumer, m: abi.KafkaOut, user_data: u64) CallEr
         it.free();
         return error.OutOfMemory;
     };
+    // Sealed by destroy: refused with the state error (before the push list, it was queued and never freed).
     _ = b.queue.list.push(&it.node) catch {
         _ = b.pending.fetchSub(size, .acq_rel);
         it.free();
@@ -461,6 +462,7 @@ pub fn flush(b: *Broker, c: *Consumer, user_data: u64) CallError!void {
     if (c.execs.items.len == 0) return error.State;
     const it = newItem(c, user_data) catch return error.OutOfMemory;
     it.kind = .flush;
+    // Sealed by destroy: refused with the state error, as in produce.
     _ = b.queue.list.push(&it.node) catch {
         it.free();
         return error.State;

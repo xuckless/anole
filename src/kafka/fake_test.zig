@@ -900,7 +900,9 @@ const StressTask = struct {
                     t.kinds[i] = .send;
                     // A flush waits until nothing is pending, the other
                     // tasks' records included: under their load it may time
-                    // out (delivery_pending), which is its contract.
+                    // out (delivery_pending), which is its contract (#156:
+                    // only the records before it). Once the tasks stop, the
+                    // flushes below must return.
                     t.client.with(.{ .timeout = .fromSeconds(1) }).flush(&c) catch |err| switch (err) {
                         error.Canceled => return error.Canceled,
                         else => {

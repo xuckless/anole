@@ -438,6 +438,7 @@ fn leaveGroup(m: *Member) void {
     const arena = arena_state.allocator();
     var e: protocol.Enc = .init(arena);
     protocol.encodeLeaveGroup(&e, c.opts.group, m.member_id.items, null) catch return;
+    // Swallows a cancel (C3): the consumer retrofit's (step 9), not covered by step 4.
     _ = coord.call(arena, .leave_group, e.bytesWritten(), .fromSeconds(5)) catch {};
 }
 

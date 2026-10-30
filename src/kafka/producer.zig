@@ -469,6 +469,7 @@ pub const Producer = struct {
                     return d.ref;
                 },
                 .need_leader => |p| {
+                    // Looked up without the lock: a settleAll may invalidate it meanwhile; the record then costs one refused round trip and resolves again.
                     known = .{ .partition = p, .id = self.cluster.leader(rec.topic, p) };
                     lookups += 1;
                 },
@@ -588,7 +589,7 @@ pub const Producer = struct {
                         .pending => .timeout,
                     };
                 },
-                // `complete` is copying the result: a few instructions.
+                // `complete` is copying the result: a few instructions (only deinit's failAll completes off a task, after every holder is joined).
                 .busy => std.atomic.spinLoopHint(),
                 .pending => {
                     if (until) |u| if (!Timestamp.now(self.io, .awake).compare(.lt, u)) {
@@ -618,6 +619,7 @@ pub const Producer = struct {
             switch (Wait.stateOf(word)) {
                 .pending => if (w.word.cmpxchgWeak(word, Wait.pack(ref.gen, .free), .acq_rel, .acquire) != null) continue,
                 .busy => {
+                    // As in waitFor: a completer's busy window is a few instructions on a task.
                     std.atomic.spinLoopHint();
                     continue;
                 },
@@ -1133,6 +1135,7 @@ pub const Producer = struct {
             if (reinit) self.resetPidLocked(generation);
         }
         if (reinit) testHold(self.io, .pid_reset);
+        // Retries and a reinit need no wake: this is the leader's own sender, which loops again after settleAll.
         if (stale) {
             for (work, verdicts, 0..) |w, v, i| {
                 if (v != .retry or !v.retry) continue;
@@ -1208,6 +1211,7 @@ pub const Producer = struct {
                 }
             }
             const count = b.recs.items.len;
+            // `tel` is read without the lock; Client.start writes it without one too (a race already on main).
             if (self.tel) |t| switch (result) {
                 .ok => t.produced.with(&.{ t.client, b.topic }).add(count),
                 .failed => |f| for (0..count) |_| t.failedOne(f.code),
@@ -1433,7 +1437,7 @@ test "kafka producer: [stress] waits, completions and abandons race" {
     for (threads[0..started]) |t| t.join();
     started = 0;
     for (&races) |*w| if (w.failure) |err| return err;
-    // Every slot was given back.
+    // Every slot was given back. Asserts the table's free lists (implementation): the wrapper's own stress test, as design §6 allows.
     p.mutex.lockUncancelable(p.io);
     defer p.mutex.unlock(p.io);
     var free: usize = 0;
