@@ -802,7 +802,9 @@ pub const Tx = struct {
     }
 
     /// `Client.iterate` inside the transaction; `deinit` the rows before the
-    /// next call on `tx`.
+    /// next call on `tx`. The transaction's end (commit, rollback or
+    /// `deinit`) ends rows still open: their `deinit` after it does nothing,
+    /// and their `next` fails once it would step the statement again.
     pub fn iterate(tx: *Tx, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
         return tx.with(.{}).iterate(T, cx, sql, args);
     }
@@ -860,6 +862,12 @@ pub const Tx = struct {
 
     fn release(tx: *Tx) void {
         tx.finished = true;
+        // Rows of this transaction still open: their statements are reset
+        // (or finalized) here, so the connection goes back with none of them
+        // mid-result (a statement stepping keeps its read transaction, and
+        // the next holder's call of the same SQL would get the cached one
+        // where these rows left it). Only while this checkout holds it.
+        if (tx.db.holds(tx.io, tx.conn, tx.on_writer, tx.lease)) tx.conn.endTxRows();
         tx.db.giveBack(tx.io, tx.conn, tx.on_writer, tx.lease);
     }
 
@@ -931,12 +939,15 @@ pub const TxQuery = struct {
 
     pub fn iterate(q: TxQuery, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
         try q.ready(cx);
+        // Room to keep the rows' statement for the transaction's end.
+        try q.tx.conn.tx_rows.ensureUnusedCapacity(q.tx.db.gpa, 1);
         // Not probed (`owns` is false): never NeedsWriter.
         var rows = Rows(T).startOn(q.tx.db, cx, q.tx.conn, q.tx.on_writer, false, sql, args) catch |err| switch (err) {
             error.NeedsWriter => unreachable,
             else => |e| return e,
         };
         rows.lease = q.tx.lease;
+        rows.tx_rows = q.tx.conn.openedTxRows(rows.stmt);
         return rows;
     }
 };
@@ -1003,6 +1014,9 @@ pub fn Rows(comptime T: type) type {
         /// The checkout of `conn` these rows run under: their own when
         /// `owns`, else their `Tx`'s.
         lease: u32 = 0,
+        /// A `Tx`'s rows (not `owns`): their entry in `conn.tx_rows`, which
+        /// the `Tx`'s end or their `deinit` ends.
+        tx_rows: u64 = 0,
         stmt: Stmt,
         columns: Columns(T),
         /// Records a failure on the caller's request.
@@ -1086,6 +1100,12 @@ pub fn Rows(comptime T: type) type {
             if (self.pos == self.batch.len) {
                 if (self.done) return self.leftOpen();
                 var failure: Failure = .{};
+                // Their checkout (or their `Tx`) is over: the statement is
+                // reset or finalized, the connection maybe another holder's.
+                if (!self.live()) {
+                    _ = failure.ours(.other, "these rows are over: their transaction ended, or a copy of them was ended; iterate again", .{}) catch {};
+                    return self.fail_fn(self.fail_ctx, self.db, &failure);
+                }
                 const fetched = if (self.on_writer)
                     self.db.onWriter(self.io, fetchJob, .{ self, &failure })
                 else
@@ -1134,12 +1154,21 @@ pub fn Rows(comptime T: type) type {
             // cached one is shared), and the connection may be another
             // holder's (SAFETY.md M6).
             if (!self.db.holds(self.io, self.conn, self.on_writer, self.lease)) {
+                // A `Tx`'s rows whose `Tx` ended: its end did the statement.
+                if (!self.owns) return;
                 log.err("sqlite \"{s}\": rows from iterate() were ended after their connection was given back (through a copy); the second time did nothing", .{self.db.name});
                 return;
             }
-            // Resetting ends the read; no I/O to speak of.
+            if (!self.owns) {
+                if (!self.conn.endedTxRows(self.tx_rows)) {
+                    log.err("sqlite \"{s}\": rows of a transaction were ended twice (through a copy); the second time did nothing", .{self.db.name});
+                    return;
+                }
+                // Resetting ends the read; no I/O to speak of.
+                self.stmt.done();
+                return;
+            }
             self.stmt.done();
-            if (!self.owns) return;
             {
                 const was = self.io.swapCancelProtection(.blocked);
                 defer _ = self.io.swapCancelProtection(was);
@@ -1150,6 +1179,14 @@ pub fn Rows(comptime T: type) type {
                 if (rolled catch false) log.err("the call left a transaction open (BEGIN without its COMMIT in the same call); rolled back", .{});
             }
             self.db.giveBack(self.io, self.conn, self.on_writer, self.lease);
+        }
+
+        /// Whether the statement is still these rows' to step: their
+        /// checkout holds the connection, and a `Tx`'s rows were not ended
+        /// (by the `Tx`'s end or a copy's `deinit`).
+        fn live(self: *const Self) bool {
+            if (!self.db.holds(self.io, self.conn, self.on_writer, self.lease)) return false;
+            return self.owns or self.conn.hasTxRows(self.tx_rows);
         }
 
         fn fetchJob(self: *Self, f: *Failure) JobError!void {
@@ -1257,8 +1294,50 @@ const Connection = struct {
     /// and each give-back (odd while held), so a give-back with another
     /// lease does nothing (M6). Unused on the writer (`Writer.lease`).
     lease: u32 = 0,
+    /// The statements of a `Tx`'s rows (`Tx.iterate`) not ended yet: the
+    /// `Tx`'s end resets (or, uncached, finalizes) those its rows left
+    /// open. Touched only by the checkout holding the connection.
+    tx_rows: std.ArrayListUnmanaged(TxRows) = .empty,
+    /// The last `TxRows.id` handed out; 0 is none.
+    tx_rows_id: u64 = 0,
 
     const Cached = struct { stmt: *c.sqlite3_stmt, used: u64 };
+    const TxRows = struct { stmt: Stmt, id: u64 };
+
+    /// A `Tx`'s rows opened `stmt` (room reserved by the caller): kept for
+    /// the `Tx`'s end; the id ends it (`endedTxRows`).
+    fn openedTxRows(conn: *Connection, stmt: Stmt) u64 {
+        conn.tx_rows_id += 1;
+        conn.tx_rows.appendAssumeCapacity(.{ .stmt = stmt, .id = conn.tx_rows_id });
+        return conn.tx_rows_id;
+    }
+
+    fn heldByTxRows(conn: *const Connection, stmt: *c.sqlite3_stmt) bool {
+        for (conn.tx_rows.items) |e| if (e.stmt.handle == stmt) return true;
+        return false;
+    }
+
+    fn hasTxRows(conn: *const Connection, id: u64) bool {
+        for (conn.tx_rows.items) |e| if (e.id == id) return true;
+        return false;
+    }
+
+    /// The rows `id` end their statement themselves: whether they were
+    /// still open (not ended by their `Tx`'s end or a copy).
+    fn endedTxRows(conn: *Connection, id: u64) bool {
+        for (conn.tx_rows.items, 0..) |e, i| if (e.id == id) {
+            _ = conn.tx_rows.swapRemove(i);
+            return true;
+        };
+        return false;
+    }
+
+    /// The `Tx`'s end: every statement its rows left open is reset, or
+    /// finalized when not cached.
+    fn endTxRows(conn: *Connection) void {
+        for (conn.tx_rows.items) |e| e.stmt.done();
+        conn.tx_rows.clearRetainingCapacity();
+    }
 
     fn open(d: *Client, writer: bool, options: Options) !Connection {
         var diags: sqlite.Diagnostics = .{};
@@ -1299,6 +1378,9 @@ const Connection = struct {
     }
 
     fn close(conn: *Connection, gpa: std.mem.Allocator) void {
+        // A `Tx` never ended: its uncached statements (cached ones go below).
+        for (conn.tx_rows.items) |e| if (!e.stmt.cached) e.stmt.done();
+        conn.tx_rows.deinit(gpa);
         var it = conn.cache.iterator();
         while (it.next()) |e| {
             _ = c.sqlite3_finalize(e.value_ptr.stmt);
@@ -1341,11 +1423,13 @@ const Connection = struct {
         return .{ .handle = handle, .cached = keep };
     }
 
-    /// Drops the statement used longest ago.
+    /// Drops the statement used longest ago, but none a `Tx`'s open rows
+    /// hold (their `Tx`'s end resets it).
     fn evict(conn: *Connection, gpa: std.mem.Allocator) void {
         var oldest: ?std.StringHashMapUnmanaged(Cached).Entry = null;
         var it = conn.cache.iterator();
         while (it.next()) |e| {
+            if (conn.heldByTxRows(e.value_ptr.stmt)) continue;
             if (oldest == null or e.value_ptr.used < oldest.?.value_ptr.used) oldest = e;
         }
         const e = oldest orelse return;

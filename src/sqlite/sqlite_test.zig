@@ -1318,6 +1318,114 @@ test "sqlite: rows of a transaction a copy ended leave the next holder's stateme
     tx.deinit();
 }
 
+/// One reader, 100 notes (more than one batch of 64), and the statement
+/// cache of `cache_size`.
+fn openRowsSetup(io: std.Io, tmp: *TmpFile, s: *Scratch, cache_size: u16) !*sqlite.Client {
+    s.init(io);
+    errdefer s.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1, .statement_cache_size = cache_size });
+    errdefer db.deinit();
+    _ = try db.exec(&s.ctx, schema, .{});
+    _ = try db.exec(&s.ctx, "WITH RECURSIVE k(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM k WHERE x < 100) INSERT INTO notes (title) SELECT 'n' || x FROM k", .{});
+    return db;
+}
+
+const open_rows_sql = "SELECT id, title, done FROM notes ORDER BY id";
+
+test "sqlite: rows a reader transaction left mid-result when a copy committed it: the next holder's rows of the same SQL start at the first row" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try openRowsSetup(io, &tmp, &s, 64);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+
+    var tx = try db.begin(ctx, .{ .read_only = true });
+    var rows = try tx.iterate(Note, ctx, open_rows_sql, .{});
+    // One batch stepped, the statement mid-result.
+    try testing.expectEqual(@as(i64, 1), (try rows.next()).?.id);
+    var copy = tx;
+    try copy.commit(ctx);
+    // The same reader and the same cached statement, the next holder's.
+    var next = try db.iterate(Note, ctx, open_rows_sql, .{});
+    defer next.deinit();
+    try testing.expectEqual(@as(i64, 1), (try next.next()).?.id);
+    rows.deinit();
+    tx.deinit();
+}
+
+/// A reader transaction's rows stepped one batch, the transaction
+/// committed with the rows still open (their deinit deferred past the
+/// commit), then a write: the same reader's next call must see it.
+fn laterWriteSeen(cache_size: u16) !void {
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try openRowsSetup(io, &tmp, &s, cache_size);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+
+    var tx = try db.begin(ctx, .{ .read_only = true });
+    defer tx.deinit();
+    var rows = try tx.iterate(Note, ctx, open_rows_sql, .{});
+    defer rows.deinit();
+    try testing.expectEqual(@as(i64, 1), (try rows.next()).?.id);
+    try tx.commit(ctx);
+    _ = try db.exec(ctx, "INSERT INTO notes (title) VALUES ('later')", .{});
+    // One reader: the one the transaction gave back.
+    try testing.expectEqual(@as(i64, 101), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
+test "sqlite: rows a reader transaction left mid-result at its commit keep no snapshot: another statement on that reader sees a later write" {
+    try laterWriteSeen(64);
+}
+
+test "sqlite: with the statement cache off, rows a reader transaction left mid-result at its commit keep no snapshot: another statement on that reader sees a later write" {
+    try laterWriteSeen(0);
+}
+
+test "sqlite: rows of a transaction that is over fail at their next batch instead of stepping the connection given back" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try openRowsSetup(io, &tmp, &s, 64);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+
+    var tx = try db.begin(ctx, .{ .read_only = true });
+    defer tx.deinit();
+    var rows = try tx.iterate(Note, ctx, open_rows_sql, .{});
+    defer rows.deinit();
+    // The first batch, read before the commit.
+    var id: i64 = 0;
+    while (id < 64) : (id += 1) try testing.expectEqual(id + 1, (try rows.next()).?.id);
+    try tx.commit(ctx);
+    try testing.expectError(error.Database, rows.next());
+}
+
 /// The canceled begin's hook, on the writer thread after a job ran: holds the job
 /// running until its canceled caller has interrupted it.
 const BeginCanceled = struct {

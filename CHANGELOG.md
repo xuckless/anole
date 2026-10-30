@@ -300,6 +300,16 @@ breaking changes are listed anyway.
   does nothing but log: on a reader, the second end rolled back the next
   holder's snapshot, reset the statement it was stepping and gave the
   reader back twice (two holders at once, or a write past the free list).
+  A SQLite transaction's end (commit, rollback or `deinit`) resets the
+  statements of its `iterate()` rows still open (finalizes them with the
+  statement cache off), so the connection goes back with none of them
+  mid-result, and those rows' `deinit` after it does nothing. Before, the
+  connection went back with the statement stepping, which kept its old
+  snapshot (later writes unseen there) and handed the next call of the same
+  SQL the cached statement where the rows had left it, and the rows' later
+  `deinit` reset it under the next holder. Such rows' `next` now fails with
+  `error.Database` when it needs another batch, instead of stepping a
+  connection given back.
 - MongoDB: closing the client, or a server leaving the topology, stops
   that server's monitor by cancellation; nothing outside the monitor
   touches its connection any more, which could be shut down after the
