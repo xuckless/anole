@@ -1138,6 +1138,78 @@ test "sqlite: a writer released twice leaves the next holder's transaction alone
     try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
+/// A writer client on a file with one reader, its schema made, for the
+/// tests of a checkout ended twice.
+fn twiceSetup(io: std.Io, tmp: *TmpFile, s: *Scratch) !*sqlite.Client {
+    s.init(io);
+    errdefer s.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    errdefer db.deinit();
+    _ = try db.exec(&s.ctx, schema, .{});
+    return db;
+}
+
+test "sqlite: a transaction ended through a copy leaves the next holder's transaction alone" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try twiceSetup(io, &tmp, &s);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+
+    var tx = try db.begin(ctx, .{});
+    // A copy commits; `tx` itself never learns that it ended.
+    var copy = tx;
+    try copy.commit(ctx);
+    var next = try db.begin(ctx, .{});
+    defer next.deinit();
+    _ = try next.exec(ctx, "INSERT INTO notes (title) VALUES ('kept')", .{});
+    // The first transaction's deinit, while `next` holds the writer:
+    // nothing happens to `next`'s transaction.
+    tx.deinit();
+    try next.commit(ctx);
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
+test "sqlite: rows on the writer ended through a copy leave the next holder's transaction alone" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try twiceSetup(io, &tmp, &s);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+
+    var rows = try db.with(.{ .write = true }).iterate(Note, ctx, "SELECT id, title, done FROM notes", .{});
+    var copy = rows;
+    copy.deinit();
+    var next = try db.begin(ctx, .{});
+    defer next.deinit();
+    _ = try next.exec(ctx, "INSERT INTO notes (title) VALUES ('kept')", .{});
+    // The first rows' deinit, while `next` holds the writer: nothing
+    // happens to `next`'s transaction.
+    rows.deinit();
+    try next.commit(ctx);
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
 /// T-S3's hook, on the writer thread after a job ran: holds the job
 /// running until its canceled caller has interrupted it.
 const BeginCanceled = struct {
