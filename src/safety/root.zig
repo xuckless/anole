@@ -18,6 +18,8 @@
 //! - `IoLock`: L2's exception, a lock held across I/O (rank `io`).
 //! - `SpinCheckedAllocator`: an allocator that panics when the calling
 //!   thread holds a `SpinLock` (L5).
+//! - `IoGate`: T5's one way to wake runtime tasks from a thread that may
+//!   outlive the runtime (moved from the C ABI's engine).
 //! - `readSectionEntered`, `readSectionLeft`: the debug side of a QSBR
 //!   read section (src/http/core/qsbr.zig, M3).
 const std = @import("std");
@@ -40,6 +42,10 @@ pub const readSectionLeft = lock.readSectionLeft;
 pub const checkAllocation = lock.checkAllocation;
 pub const notePanic = lock.notePanic;
 pub const SpinCheckedAllocator = @import("alloc_check.zig").SpinCheckedAllocator;
+pub const IoGate = @import("io_gate.zig").IoGate;
+/// Tests: runs inside every `IoGate` once it is entered, before the wake
+/// (test builds only; a test sets it and clears it after).
+pub var io_gate_test_hook: ?*const fn () void = null;
 /// Tests whose claim is a panic: they run their own binary again (see
 /// child.zig). Test binaries built with src/safety/test_runner.zig only.
 pub const child = @import("child.zig");
@@ -180,6 +186,7 @@ test {
     _ = @import("lock.zig");
     _ = @import("child.zig");
     _ = @import("alloc_check.zig");
+    _ = @import("io_gate.zig");
     _ = @import("ctx.zig");
     _ = @import("anole_never_reuse");
 }

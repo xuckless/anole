@@ -19,6 +19,7 @@
 const std = @import("std");
 const anole = @import("../root.zig");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const abi = @import("abi.zig");
 const engine = @import("engine.zig");
 const config_mod = @import("config.zig");
@@ -29,6 +30,9 @@ const Exec = engine.Exec;
 const Handle = engine.Handle;
 const AnswerError = engine.AnswerError;
 const gpa = engine.gpa;
+/// The writes' chunks come from it: in Debug and test builds an allocation
+/// or a free under a slot's spin lock panics (L5); elsewhere it is `gpa`.
+var chunk_checked: safety.SpinCheckedAllocator = .init(engine.gpa);
 
 const chunk_len = 256;
 const max_chunks = 4096;
@@ -49,10 +53,18 @@ fn pack(g: u32, st: SlotState) u64 {
 pub const NetSlot = struct {
     word: std.atomic.Value(u64) = .init(pack(1, .free)),
     /// Over `conn`: a call from a consumer thread holds it while it uses
-    /// the connection, `retire` while it takes it away. Never across I/O.
-    lock: std.atomic.Mutex = .unlocked,
+    /// the connection, `onClose` while it takes it away. A leaf (L4):
+    /// nothing is taken, allocated, freed or woken under it but the
+    /// connection's atomics (a reset's non-blocking `setsockopt`/`shutdown`
+    /// and its gated wakes); a call's chunk is made before it and, when the
+    /// connection refuses it, freed after it (`chunk_checked` panics
+    /// otherwise in Debug and tests); its kick is made after it.
+    lock: safety.SpinLock(.leaf) = .init,
     conn: ?*net.Conn = null,
-    state: *TcpState = undefined,
+    /// Its listener's: set at the open (before the OPEN record is posted),
+    /// read by `write` before it takes the lock (an atomic, as a reused
+    /// slot's is written while a stale handle's call may read it).
+    state: std.atomic.Value(?*TcpState) = .init(null),
     /// Bytes of this connection posted and not yet polled.
     unpolled: std.atomic.Value(u32) = .init(0),
     /// A futex word: 1 while the connection's task waits for credit.
@@ -62,7 +74,7 @@ pub const NetSlot = struct {
     next_free: u32 = engine.no_slot,
 
     fn acquire(s: *NetSlot) void {
-        while (!s.lock.tryLock()) std.atomic.spinLoopHint();
+        s.lock.lock();
     }
     fn release(s: *NetSlot) void {
         s.lock.unlock();
@@ -141,6 +153,10 @@ pub const TcpState = struct {
     handler_id: u32,
     read_ahead: u32,
     framing: u32,
+    /// The listener's `write_max` and framing: `write` refuses a payload
+    /// over the max before it allocates for it.
+    write_max: u32,
+    net_framing: net.Framing,
 };
 
 /// A "udp" listener's settings, the `state` of its service.
@@ -150,21 +166,23 @@ pub const UdpState = struct {
     ordinal: u32,
     max_datagram: u16,
     /// Set once the sockets exist (the first batch, or the start), cleared
-    /// at the stop before they are freed. `users` counts the calls inside.
+    /// at the stop before they are freed.
     group: std.atomic.Value(?*net.UdpGroup) = .init(null),
-    users: std.atomic.Value(u32) = .init(0),
+    /// The calls from consumer threads inside the group (T5): closed at the
+    /// stop, which waits for those inside. A send queues its batch inside
+    /// it (the batch's one allocation included): short, never a wait.
+    gate: safety.IoGate = .{},
 
     fn enter(u: *UdpState) ?*net.UdpGroup {
-        _ = u.users.fetchAdd(1, .seq_cst);
-        const g = u.group.load(.seq_cst) orelse {
-            _ = u.users.fetchSub(1, .seq_cst);
+        if (!u.gate.enter()) return null;
+        return u.group.load(.acquire) orelse {
+            u.gate.leave();
             return null;
         };
-        return g;
     }
 
     fn leave(u: *UdpState) void {
-        _ = u.users.fetchSub(1, .seq_cst);
+        u.gate.leave();
     }
 };
 
@@ -206,7 +224,14 @@ fn framingConst(f: ?config_mod.Config.NetFraming) u32 {
 /// The service of a "tcp" listener.
 pub fn tcpService(e: *Engine, a: std.mem.Allocator, t: config_mod.Config.NetTcp) !net.TcpService {
     const st = try a.create(TcpState);
-    st.* = .{ .engine = e, .handler_id = t.handler, .read_ahead = t.read_ahead, .framing = framingConst(t.framing) };
+    st.* = .{
+        .engine = e,
+        .handler_id = t.handler,
+        .read_ahead = t.read_ahead,
+        .framing = framingConst(t.framing),
+        .write_max = t.write_max,
+        .net_framing = config_mod.netFraming(t.framing),
+    };
     return .{
         .table = &tcp_table,
         .options = .{
@@ -283,8 +308,8 @@ pub fn opened(e: *Engine, app: *anole.App) void {
 /// Before the sockets are freed: no call is inside them, none gets in.
 pub fn close(e: *Engine) void {
     for (e.net_state.udps.items) |u| {
-        u.group.store(null, .seq_cst);
-        while (u.users.load(.seq_cst) != 0) std.atomic.spinLoopHint();
+        u.group.store(null, .release);
+        u.gate.close();
     }
 }
 
@@ -337,7 +362,7 @@ fn onOpen(state: ?*anyopaque, conn: *net.Conn) anyerror!void {
     slot.acquire();
     slot.conn = conn;
     slot.release();
-    slot.state = st;
+    slot.state.store(st, .release);
     slot.unpolled.store(0, .monotonic);
     slot.credit_wait.store(0, .monotonic);
     conn.context = slot;
@@ -412,7 +437,7 @@ fn postData(x: *Exec, slot: *NetSlot, g: u32, frames: []const []const u8, framed
         at += f.len;
     }
     const len: u32 = @intCast(rec.len);
-    awaitCredit(e, slot, len, slot.state.read_ahead) catch {
+    awaitCredit(e, slot, len, slot.state.load(.monotonic).?.read_ahead) catch {
         engine.freeRecord(rec.ptr);
         return error.Canceled;
     };
@@ -580,46 +605,97 @@ pub fn write(e: *Engine, hv: u64, data: []const u8, flags: u32) AnswerError!bool
     const s, const g = slotOf(e, hv) catch |err| return e.badHandle(err);
     const borrow = flags & abi.BODY_BORROW != 0;
     const frame = flags & abi.NET_F_FRAME != 0;
-    // The SENT record first: a call that fails takes nothing.
-    var sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
-    errdefer if (sent) |r| engine.freeRecord(r.ptr);
-    s.acquire();
-    defer s.release();
-    const conn = s.conn orelse return e.gone();
-    if (!s.live(g)) return e.gone();
     // A framed or empty write is copied (there is nothing to borrow): its
     // SENT follows at once, when the call took it.
     const copy = frame or data.len == 0;
-    const result = (if (frame)
-        conn.sendFrame(data)
-    else if (sent != null and !copy)
-        conn.sendBorrowed(data, @intFromPtr(sent.?.ptr))
-    else
-        conn.send(data)) catch |err| return switch (err) {
+    // Over the listener's write_max: refused before anything is allocated
+    // (a stale handle's slot may be another listener's by now: GONE then).
+    if (s.state.load(.acquire)) |st| {
+        var want: usize = data.len;
+        if (frame) {
+            var pbuf: [net.Framing.max_prefix]u8 = undefined;
+            const p = st.net_framing.prefix(data.len, &pbuf) catch |err| {
+                if (s.gen() != g) return e.gone();
+                return writeError(e, err);
+            };
+            want += p.len + st.net_framing.suffix().len;
+        }
+        if (want > st.write_max) {
+            if (s.gen() != g) return e.gone();
+            return writeError(e, error.TooLarge);
+        }
+    }
+    // The SENT record first: a call that fails takes nothing.
+    const sent: ?[]align(8) u8 = if (borrow) try engine.newSent(data) else null;
+    errdefer if (sent) |r| engine.freeRecord(r.ptr);
+    // The chunk before the lock (L5): nothing allocates under it, and one
+    // the call did not take is freed here, after it.
+    var chunk: ?*net.OutChunk = null;
+    defer if (chunk) |c| c.destroy();
+    if (sent != null and !copy) {
+        chunk = try net.OutChunk.borrowed(chunk_checked.allocator(), data, @intFromPtr(sent.?.ptr));
+    } else if (frame or data.len > 0) {
+        const c = try net.OutChunk.create(chunk_checked.allocator(), data.len);
+        @memcpy(c.payload(), data);
+        chunk = c;
+    }
+    // The wakes are made after the lock is let go.
+    var kicks: [2]?net.Kick = .{ null, null };
+    const result: net.Conn.Sent = locked: {
+        s.acquire();
+        defer s.release();
+        const conn = s.conn orelse return e.gone();
+        if (!s.live(g)) return e.gone();
+        var r: net.Conn.Sent = .ok;
+        if (chunk) |c| {
+            // Taken on success; refused, it stays `chunk`.
+            const q = conn.queueChunk(c, frame) catch |err| return writeError(e, err);
+            if (q.taken) chunk = null;
+            r = q.sent;
+            kicks[0] = q.kick;
+        } else {
+            // Empty: the checks only.
+            _ = conn.send("") catch |err| return writeError(e, err);
+        }
+        if (flags & abi.NET_F_END != 0) kicks[1] = conn.endKick();
+        break :locked r;
+    };
+    // After the unlock the connection may be gone; the kicks touch only its
+    // driver and kick slot, which the server frees at destroy. That rests
+    // on the ABI's rule: anole_server_destroy overlaps nothing on its
+    // server (anole.h), so no anole_net_* call is running then.
+    for (kicks) |k| if (k) |kick| kick.run();
+    if (sent) |rec| if (copy) s.exec.postSentRec(s.handle(g), rec);
+    return result == .busy;
+}
+
+fn writeError(e: *Engine, err: net.Conn.SendError) AnswerError {
+    return switch (err) {
         error.Closed => e.gone(),
         error.Ended => invalid("Ended", "this side of the connection was ended already (ANOLE_NET_F_END, or a close)"),
         error.NoFraming => invalid("NoFraming", "ANOLE_NET_F_FRAME on a listener without framing"),
         error.FrameTooLarge => invalid("FrameTooLarge", "the payload is over the listener's framing max"),
         error.QueueFull => error.Again,
+        // Over tcp.write_max: never taken (ANOLE_E_TOOBIG, as a WebTransport
+        // datagram over its max).
+        error.TooLarge => error.TooBig,
         error.OutOfMemory => error.OutOfMemory,
     };
-    if (sent) |rec| if (copy) {
-        s.exec.postSentRec(s.handle(g), rec);
-        sent = null;
-    };
-    if (flags & abi.NET_F_END != 0) conn.end();
-    return result == .busy;
 }
 
 /// `anole_net_close`: a cleanup call.
 pub fn closeConn(e: *Engine, hv: u64, how: u32) AnswerError!void {
     if (how != abi.NET_CLOSE_GRACEFUL and how != abi.NET_CLOSE_RESET) return error.Invalid;
     const s, const g = try slotOf(e, hv);
-    s.acquire();
-    defer s.release();
-    const conn = s.conn orelse return error.Over;
-    if (!s.live(g)) return error.Over;
-    if (how == abi.NET_CLOSE_RESET) conn.reset() else conn.close();
+    const kick = locked: {
+        s.acquire();
+        defer s.release();
+        const conn = s.conn orelse return error.Over;
+        if (!s.live(g)) return error.Over;
+        break :locked if (how == abi.NET_CLOSE_RESET) conn.resetKick() else conn.closeKick();
+    };
+    // After the unlock: see `write`'s kicks.
+    if (kick) |k| k.run();
 }
 
 pub fn pause(e: *Engine, hv: u64, on: bool) AnswerError!void {
@@ -738,7 +814,9 @@ pub fn udpSend(e: *Engine, hv: u64, items: []const abi.NetDatagram, flags: u32) 
         };
     }
     sock.sendMany(out) catch |err| return switch (err) {
-        error.TooLarge => error.Invalid,
+        // Each datagram's size was checked above: the batch is over
+        // udp.send_queue, never taken.
+        error.TooLarge => error.TooBig,
         error.QueueFull => error.Again,
         error.Closed => e.gone(),
         error.OutOfMemory => error.OutOfMemory,

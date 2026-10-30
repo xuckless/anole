@@ -32,6 +32,10 @@ pub const TcpService = tcp_mod.TcpService;
 /// A TCP service for `Listener.tcp` (what `app.tcp` builds).
 pub const tcp = tcp_mod.tcp;
 pub const TcpListener = tcp_mod.TcpListener;
+/// One send's bytes for `Conn.queueChunk` (the C ABI's writes).
+pub const OutChunk = tcp_mod.OutChunk;
+/// A driver wake a call under a lock leaves for after it (`Conn.queueChunk`).
+pub const Kick = tcp_mod.Kick;
 
 /// A UDP listener's options (`Udp.Options`, `Udp.Sessions`).
 pub const Udp = udp_mod.Udp;
