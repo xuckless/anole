@@ -1210,7 +1210,7 @@ test "sqlite: rows on the writer ended through a copy leave the next holder's tr
     try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
-/// T-S3's hook, on the writer thread after a job ran: holds the job
+/// The canceled begin's hook, on the writer thread after a job ran: holds the job
 /// running until its canceled caller has interrupted it.
 const BeginCanceled = struct {
     var armed: std.atomic.Value(bool) = .init(false);
@@ -1279,7 +1279,7 @@ test "sqlite: a begin canceled while its BEGIN runs gives the writer back with n
     try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
-/// Tasks that hold a connection until `go` is set (B-1).
+/// Tasks that hold a connection until `go` is set.
 const Holders = struct {
     db: *sqlite.Client,
     io: std.Io,
@@ -1430,8 +1430,9 @@ test "sqlite: Options.timeout bounds a plain call and .max lifts it" {
     try testing.expectEqual(@as(i64, 100000), try db.with(.{ .timeout = .max }).one(i64, ctx, small, .{}));
 }
 
-/// S-1: one worker's rounds against the writer checkout. Counts the rows it
-/// committed and every failure that is not a cancel the test made.
+/// The stress test's worker: its rounds against the writer checkout.
+/// Counts the rows it committed and every failure that is not a cancel the
+/// test made.
 const WriterStress = struct {
     db: *sqlite.Client,
     io: std.Io,
