@@ -75,7 +75,7 @@ pub const c = sqlite.c;
 
 /// Test hook: on the writer thread, after a job ran and while it still
 /// counts as running (a canceled caller interrupts it then).
-pub var test_after_job: ?*const fn (std.Io, ?*c.sqlite3) void = null;
+pub var test_after_job: if (builtin.is_test) ?*const fn (std.Io, ?*c.sqlite3) void else void = if (builtin.is_test) null else {};
 /// xuckless/zig-sqlite, the driver under `Conn.run`: user functions,
 /// blobs, backups, virtual tables.
 pub const driver = sqlite;
@@ -799,6 +799,14 @@ pub const Tx = struct {
     /// of the reader) must not find the transaction open.
     pub fn deinit(tx: *Tx) void {
         if (tx.finished) return;
+        // A copy of this `Tx` ended it already: the writer may be another
+        // holder's now, its transaction not this one's to roll back
+        // (SAFETY.md M6).
+        if (tx.on_writer and !tx.db.holdsWriter(tx.io, tx.lease)) {
+            tx.finished = true;
+            log.err("sqlite \"{s}\": a transaction was ended twice (through a copy of its Tx); the second time did nothing", .{tx.db.name});
+            return;
+        }
         const was = tx.io.swapCancelProtection(.blocked);
         defer _ = tx.io.swapCancelProtection(was);
         var buf: [512]u8 = undefined;
@@ -1075,6 +1083,13 @@ pub fn Rows(comptime T: type) type {
         pub fn deinit(self: *Self) void {
             if (self.finished) return;
             self.finished = true;
+            // A copy of these rows gave the writer back already: its
+            // statement is done, and the writer may be another holder's
+            // (SAFETY.md M6).
+            if (self.owns and self.on_writer and !self.db.holdsWriter(self.io, self.lease)) {
+                log.err("sqlite \"{s}\": rows from iterate() were ended twice (through a copy); the second time did nothing", .{self.db.name});
+                return;
+            }
             // Resetting ends the read; no I/O to speak of.
             self.stmt.done();
             if (!self.owns) return;

@@ -209,7 +209,9 @@ breaking changes are listed anyway.
 - Redis, SQLite: a connection from `acquire()` released twice is given
   back once; the second `release()` does nothing but log. Redis handed the
   connection to two later callers at once, and SQLite rolled back the
-  next holder's transaction and let the writer go under it.
+  next holder's transaction and let the writer go under it. A SQLite
+  transaction or `iterate()` rows ended through a copy of the value, then
+  `deinit` on the original, likewise does nothing but log.
 - MongoDB: closing the client, or a server leaving the topology, stops
   that server's monitor by cancellation; nothing outside the monitor
   touches its connection any more, which could be shut down after the
