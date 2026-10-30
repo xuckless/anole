@@ -230,6 +230,26 @@ breaking changes are listed anyway.
   held the lock.
 - Jobs: the metrics no longer allocate under a spin lock when they see a
   new job kind.
+- Kafka: after the producer id was reset (UNKNOWN_PRODUCER_ID, an epoch or
+  sequence error), a sender for another broker could number its next batch
+  under the new id from the old sequence; the broker refused it as out of
+  order and the producer asked for yet another id. A sender that had taken
+  the id just before the reset could number its batch under the old id from
+  the reset sequence, which the broker took for a duplicate: the batch was
+  reported delivered and never stored. The reset and the renumbering are
+  now one step, and a sender numbers its batches under the id of that step.
+- Kafka: a consumer group whose start failed (no memory for its tasks) was
+  freed while the client still listed it, and freed again with the client.
+- Kafka: a call canceled while it waited for a broker's answer (a server
+  stopping under a produce that was refreshing the metadata) failed as a
+  lost connection, and the cancel was lost with it: the task went on and
+  waited again, holding up the stop. It now ends with the cancel.
+- Kafka: a send or produce to an existing topic could fail with
+  UNKNOWN_TOPIC_OR_PARTITION when a stale leader dropped the topic from the
+  metadata cache right after the call's own refresh; it now asks again.
+- C ABI: a consumer thread calling `anole_kafka_produce` without pause kept
+  the produce pump running on its executor, so the engine stop posted there
+  waited; the pump now lets the executor's other tasks run every 64 records.
 - Lambda: a buffered answer whose body the handler streamed (`res.stream`)
   was encoded from a part list that pointed into a returned function's
   stack, so the answer could carry garbage or crash; it now lives in the
@@ -355,6 +375,24 @@ breaking changes are listed anyway.
   `safety.SpinLock` is held, naming where the lock was taken (L5).
   `safety.IoLock` is the lock L2 now allows across a suspension (an I/O
   resource's one writer), taken only with no other lock held.
+- Kafka: no lock is held while a metadata refresh, a producer id request,
+  a sender start or a consumer group start waits (SAFETY.md L2, L3), and a
+  waiting produce no longer allocates per call: its outcome comes through a
+  generation-checked slot of the producer. Metadata refreshes still run one
+  at a time. A consumer group added after the client's drain began is no
+  longer started. `Client.start` marks the client started only once its
+  metrics, tracing, health check and the start's metadata refresh
+  succeeded, so a failed start can be called again; `consume` doesn't
+  start groups added before a successful start (the next `start` does).
+- `anole.kafka.impl.producer`: `Slot` is gone and `Producer.append` takes no
+  slot; a waiting append is `appendWaiting`, then `waitFor` or `abandon`.
+- C ABI: `anole_kafka_produce` and `anole_kafka_flush` queue on a lock-free
+  list instead of a spin lock. After the broker is destroyed they return the
+  state error; before, the call queued a record that nothing freed.
+- Test utilities: `anole.kafka.testing.FakeBroker` has `Config.nodes`
+  (that many broker ids at its one address, partition `p` led by
+  `p % nodes`, so a test can have several partition leaders) and counts the
+  batches it refused as out of order (`out_of_order`).
 - Debug and test builds: a `safety.IoLock` is checked per task, not per
   executor thread, so a task taking one while another task on its executor
   is suspended holding one no longer panics, and releasing one is checked

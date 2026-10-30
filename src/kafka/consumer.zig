@@ -20,6 +20,8 @@
 //! rejoins (or leaves).
 const std = @import("std");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
+const test_hold = @import("test_hold.zig");
 const placement = dusty.placement;
 const protocol = @import("protocol.zig");
 const records = @import("records.zig");
@@ -256,8 +258,11 @@ const PartState = struct {
     topic: []const u8,
     partition: i32,
     leader: i32 = -1,
-    mutex: std.Io.Mutex = .init,
-    cond: std.Io.Condition = .init,
+    /// Over `chunks` and `buffered`: the fetcher appends, the delivery task
+    /// takes (L1: they run on different executors). Nothing waits, calls
+    /// out or takes another lock while it is held (L2-L4).
+    mutex: safety.Mutex(.leaf) = .init,
+    cond: safety.Condition = .init,
     chunks: std.ArrayList(*Chunk) = .empty,
     buffered: usize = 0,
     /// The next offset to fetch (the fetcher's).
@@ -297,8 +302,10 @@ const Session = struct {
     fatal: std.atomic.Value(bool) = .init(false),
     group: std.Io.Group = .init,
     deliveries: std.Io.Group = .init,
-    mutex: std.Io.Mutex = .init,
-    cond: std.Io.Condition = .init,
+    /// Over `running`: the delivery tasks (one per partition, each on its
+    /// partition's executor) and `endSession`. A leaf (L4).
+    mutex: safety.Mutex(.leaf) = .init,
+    cond: safety.Condition = .init,
     running: usize = 0,
 
     /// Ends the session at the member's next look.
@@ -362,6 +369,7 @@ pub const Consumer = struct {
                 _ = c.active.fetchSub(1, .acq_rel);
                 return error.OutOfMemory;
             };
+            test_hold.testHold(c.host.io, .member_spawned);
         }
     }
 
@@ -430,6 +438,7 @@ fn leaveGroup(m: *Member) void {
     const arena = arena_state.allocator();
     var e: protocol.Enc = .init(arena);
     protocol.encodeLeaveGroup(&e, c.opts.group, m.member_id.items, null) catch return;
+    // Swallows a cancel (C3): the consumer retrofit's (step 9), not covered by step 4.
     _ = coord.call(arena, .leave_group, e.bytesWritten(), .fromSeconds(5)) catch {};
 }
 

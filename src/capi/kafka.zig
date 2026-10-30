@@ -29,6 +29,8 @@ const nats_cap = @import("nats.zig");
 
 const features = anole.features;
 const placement = dusty.placement;
+const zio = anole.zio;
+const push_list = dusty.push_list;
 const gpa = engine.gpa;
 const Engine = engine.Engine;
 const Exec = engine.Exec;
@@ -38,7 +40,7 @@ const Handle = engine.Handle;
 
 const KClient = if (features.kafka) anole.kafka.Client else void;
 const KConsumer = if (features.kafka) anole.kafka.impl.consumer.Consumer else void;
-const Slot = if (features.kafka) anole.kafka.impl.producer.Slot else void;
+const WaitRef = if (features.kafka) anole.kafka.impl.producer.Wait.Ref else void;
 const KHeader = if (features.kafka) anole.kafka.Header else struct { key: []const u8, value: ?[]const u8 };
 const KMsg = if (features.kafka) anole.kafka.Msg else void;
 
@@ -114,13 +116,14 @@ pub fn close(e: *Engine) void {
     for (e.kafka_brokers) |*b| b.open.store(false, .release);
 }
 
-/// Frees what a stopped server's queues still hold.
+/// Frees what a stopped server's queues still hold, and seals them: a
+/// produce after it is refused (`error.State`).
 pub fn destroy(e: *Engine) void {
     for (e.kafka_brokers) |*b| {
-        var it = b.queue.take();
-        while (it) |item| {
-            it = item.next;
-            item.free();
+        var it = b.queue.list.seal();
+        while (it) |n| {
+            it = n.next;
+            itemOf(n).free();
         }
     }
 }
@@ -345,43 +348,26 @@ fn failedDelivery(b: *Broker, user_data: u64, topic: []const u8, class: anole.db
 // ---------------------------------------------------------------------------
 // Producing
 
-/// The FIFO a pump task drains.
+/// The records a pump task drains, in the order they came (SAFETY.md L7's
+/// push-list hand-off). owner (the taking side): the one running pump,
+/// named by `running`; producers: any consumer thread. Sealed by
+/// `destroy`, so a push after it is refused, not lost.
 const Queue = struct {
-    lock: std.atomic.Mutex = .unlocked,
-    head: ?*Item = null,
-    tail: ?*Item = null,
+    list: push_list.PushList = .{},
+    /// A pump is scheduled or running.
     running: std.atomic.Value(bool) = .init(false),
-
-    fn acquire(q: *Queue) void {
-        while (!q.lock.tryLock()) std.atomic.spinLoopHint();
-    }
-
-    fn push(q: *Queue, it: *Item) void {
-        q.acquire();
-        defer q.lock.unlock();
-        it.next = null;
-        if (q.tail) |t| t.next = it else q.head = it;
-        q.tail = it;
-    }
-
-    fn take(q: *Queue) ?*Item {
-        q.acquire();
-        defer q.lock.unlock();
-        const h = q.head;
-        q.head = null;
-        q.tail = null;
-        return h;
-    }
-
-    fn isEmpty(q: *Queue) bool {
-        q.acquire();
-        defer q.lock.unlock();
-        return q.head == null;
-    }
 };
 
+fn itemOf(n: *push_list.Node) *Item {
+    // SAFETY: every node on a `Queue` is the `node` of an `Item` (`produce`, `flush`).
+    return @fieldParentPtr("node", n);
+}
+
+/// One record (or flush) from a consumer thread. owner: the queue, then
+/// the pump, then the task that answers it (`waiter`, `flushTask`), which
+/// frees it (`finish`).
 const Item = struct {
-    next: ?*Item = null,
+    node: push_list.Node = .{},
     kind: enum { record, flush },
     c: *Consumer,
     user_data: u64,
@@ -440,7 +426,12 @@ pub fn produce(b: *Broker, c: *Consumer, m: abi.KafkaOut, user_data: u64) CallEr
         it.free();
         return error.OutOfMemory;
     };
-    b.queue.push(it);
+    // Sealed by destroy: refused with the state error (before the push list, it was queued and never freed).
+    _ = b.queue.list.push(&it.node) catch {
+        _ = b.pending.fetchSub(size, .acq_rel);
+        it.free();
+        return error.State;
+    };
     kick(b, c);
     if (before + size > b.buffer_bytes / 2) {
         want(b, c);
@@ -471,12 +462,19 @@ pub fn flush(b: *Broker, c: *Consumer, user_data: u64) CallError!void {
     if (c.execs.items.len == 0) return error.State;
     const it = newItem(c, user_data) catch return error.OutOfMemory;
     it.kind = .flush;
-    b.queue.push(it);
+    // Sealed by destroy: refused with the state error, as in produce.
+    _ = b.queue.list.push(&it.node) catch {
+        it.free();
+        return error.State;
+    };
     kick(b, c);
 }
 
+/// After a push: schedules a pump unless one is scheduled or running.
+/// `.seq_cst` with the push's: the store-buffering pair of push_list.zig
+/// (either this sees `running` clear, or the pump sees the node).
 fn kick(b: *Broker, c: *Consumer) void {
-    if (b.queue.running.swap(true, .acq_rel)) return;
+    if (b.queue.running.swap(true, .seq_cst)) return;
     const cmd = gpa.create(PumpCmd) catch {
         b.queue.running.store(false, .release);
         return;
@@ -498,25 +496,40 @@ const PumpCmd = struct {
     }
 };
 
-/// Appends the queued records to the producer in the order they came.
+/// Records a pump hands the producer before it gives its executor's other
+/// tasks a turn.
+const pump_turn = 64;
+
+/// Appends the queued records to the producer in the order they came. The
+/// queue's one taker while `running` is set. A consumer thread producing
+/// without pause keeps the list from running dry, so the pump yields every
+/// `pump_turn` records: the waiters it spawned and the executor's commands
+/// (the stop among them) run meanwhile.
 fn pump(x: *Exec, b: *Broker) std.Io.Cancelable!void {
-    var rest: ?*Item = null;
-    defer while (rest) |r| {
-        rest = r.next;
+    var rest: ?*push_list.Node = null;
+    defer while (rest) |n| {
+        rest = n.next;
+        const r = itemOf(n);
         _ = b.pending.fetchSub(r.size, .acq_rel);
         r.free();
     };
+    var handled: u32 = 0;
     while (true) {
-        rest = b.queue.take();
+        rest = b.queue.list.takeAll();
         if (rest == null) {
-            b.queue.running.store(false, .release);
-            // One may have been added meanwhile.
-            if (b.queue.isEmpty() or b.queue.running.swap(true, .acq_rel)) return;
+            b.queue.running.store(false, .seq_cst);
+            // One may have been pushed meanwhile (its kick saw `running`
+            // still set): take it, unless a new pump already will.
+            if (b.queue.list.isEmpty() or b.queue.running.swap(true, .seq_cst)) return;
             continue;
         }
-        while (rest) |it| {
-            rest = it.next;
-            try handleItem(x, b, it);
+        while (rest) |n| {
+            rest = n.next;
+            try handleItem(x, b, itemOf(n));
+            // Counted across takes: a list fed one record at a time is
+            // taken one at a time.
+            handled +%= 1;
+            if (handled % pump_turn == 0) try zio.yield();
         }
     }
 }
@@ -539,10 +552,8 @@ fn handleItem(x: *Exec, b: *Broker, it: *Item) std.Io.Cancelable!void {
         placement.concurrent(&x.kafka.work, x.engine.io, .local, flushTask, .{ b, cl, it }) catch finish(b, it);
         return;
     }
-    const slot = Slot.create(gpa) catch return reportFailure(b, it, .unavailable, "out_of_memory", "out of memory");
-    cl.producer.append(it.topic, it.key, it.value, it.headers, if (it.partition >= 0) it.partition else null, it.timestamp_ms, slot) catch |err| {
-        slot.release();
-        slot.release();
+    // On an error no wait exists: nothing to give back.
+    const ref = cl.producer.appendWaiting(it.topic, it.key, it.value, it.headers, if (it.partition >= 0) it.partition else null, it.timestamp_ms) catch |err| {
         return switch (err) {
             error.Canceled => {
                 finish(b, it);
@@ -560,8 +571,10 @@ fn handleItem(x: *Exec, b: *Broker, it: *Item) std.Io.Cancelable!void {
             error.ProtocolError, error.Truncated, error.Invalid => reportFailure(b, it, .other, "protocol", "the broker's answer was not understood"),
         };
     };
-    placement.concurrent(&x.kafka.work, x.engine.io, .local, waiter, .{ b, it, slot }) catch {
-        slot.release();
+    // zio fails a spawn only before it can yield: nothing below meets a
+    // suspension after a failure.
+    placement.concurrent(&x.kafka.work, x.engine.io, .local, waiter, .{ b, cl, it, ref }) catch {
+        cl.producer.abandon(ref);
         finish(b, it);
     };
 }
@@ -577,14 +590,15 @@ fn reportFailure(b: *Broker, it: *Item, class: anole.db.Class, code: []const u8,
     post(it, rec);
 }
 
-fn waiter(b: *Broker, it: *Item, slot: *Slot) std.Io.Cancelable!void {
+/// Holds the record's wait ref until its outcome comes (`waitFor` abandons
+/// it on a cancel). The client outlives it: the engine joins `x.kafka.work`
+/// before it frees the app.
+fn waiter(b: *Broker, cl: *KClient, it: *Item, ref: WaitRef) std.Io.Cancelable!void {
     if (comptime !features.kafka) return;
-    defer slot.release();
     defer finish(b, it);
-    const io = b.engine.io;
-    try slot.event.wait(io);
+    const outcome = try cl.producer.waitFor(ref, null);
     var d: Delivery = .{ .user_data = it.user_data, .topic = it.topic };
-    switch (slot.result) {
+    switch (outcome) {
         .ok => |ok| {
             d.partition = ok.partition;
             d.offset = ok.offset;
@@ -595,7 +609,7 @@ fn waiter(b: *Broker, it: *Item, slot: *Slot) std.Io.Cancelable!void {
             .timeout => .timeout,
             .other => .other,
         }, f.code, "the record was not delivered"),
-        .pending => d = failedDelivery(b, it.user_data, it.topic, .timeout, "delivery_pending", "no result"),
+        .timeout => d = failedDelivery(b, it.user_data, it.topic, .timeout, "delivery_pending", "no result"),
     }
     if (it.flags & abi.KAFKA_F_NO_REPORT != 0) {
         if (d.status != abi.OK) log.warn("kafka {s}: record for {s} not delivered: {s}", .{ b.config.name, it.topic, d.code });
