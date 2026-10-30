@@ -301,6 +301,7 @@ pub const Channel = struct {
                 owned.dialed.waitUncancelable(io_, &owned.mutex);
                 continue;
             }
+            // The defer unlocks on `continue` and `break` alike; `self.conn`'s plain reads are D2's race.
             if (self.conn != current) continue;
             owned.redialing = true;
             break;
@@ -308,6 +309,7 @@ pub const Channel = struct {
         const dial = h2.ClientConnection.connect(owned.gpa, io_, owned.options);
         owned.mutex.lockUncancelable(io_);
         defer owned.mutex.unlock(io_);
+        // Waiters are woken under the lock before `try dial`: a failed dial lets each dial in turn.
         owned.redialing = false;
         owned.dialed.broadcast(io_);
         const fresh = try dial;
@@ -339,6 +341,7 @@ pub const Channel = struct {
         const dial = dialH3(owned, io_, owned.h3_port);
         owned.mutex.lockUncancelable(io_);
         defer owned.mutex.unlock(io_);
+        // Waiters are woken under the lock before `try dial`: a failed dial lets each dial in turn.
         owned.redialing = false;
         owned.dialed.broadcast(io_);
         const fresh = try dial;

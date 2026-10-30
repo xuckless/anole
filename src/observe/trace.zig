@@ -415,6 +415,7 @@ pub const Exporter = struct {
         // takes the lock to broadcast: a change after this check wakes the
         // wait below.
         while (self.finished.load(.acquire) < target and self.state.load(.acquire) == .alive) {
+            // A wake under the leaf lock, not a wait (L2 holds).
             self.kick.set(self.io);
             if (comptime builtin.is_test) _ = self.test_flush_waits.fetchAdd(1, .release);
             self.progressed.waitTimeout(self.io, &self.progress_lock, deadline) catch |err| switch (err) {

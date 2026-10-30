@@ -50,6 +50,7 @@ pub const Filter = struct {
 
 const Ring = struct {
     /// Over the fields below; held for a bounded copy only.
+    /// A log call made under any ranked lock panics here in debug builds once the tap is installed (D9).
     lock: safety.SpinLock(.leaf) = .init,
     buf: []u8 = &.{},
     /// Absolute byte offsets: the next write, and the oldest intact record.
@@ -172,6 +173,7 @@ pub const LogRing = struct {
         // another thread installed one meanwhile, this copy is freed after
         // the lock is let go.
         var spare: []u8 = &.{};
+        // Declared before the lock's defer, so it runs after the unlock.
         defer if (spare.len > 0) self.gpa.free(spare);
         r.lock.lock();
         defer r.lock.unlock();
@@ -236,6 +238,7 @@ pub const LogRing = struct {
     /// cursors; `dropped` counts records the rings lapped.
     pub fn readNew(self: *LogRing, arena: std.mem.Allocator, cursors: *Cursors, out: *std.ArrayList(Rec), dropped: *u64) !void {
         const start = out.items.len;
+        // Every pump tick, even with nothing new: one ring's size from the tick's arena (cold path).
         const scratch = try arena.alloc(u8, self.size_each);
         for (&self.rings, cursors) |*r, *c| {
             const live = live: {

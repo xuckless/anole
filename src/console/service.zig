@@ -315,6 +315,7 @@ pub const Service = struct {
         };
         self.lock.lock();
         self.clients.appendBounded(c) catch {
+            // Unreachable in practice (reap empties, live < max_clients < max_tracked); the fd is closed.
             // Clients whose thread ended faster than `reap` could join
             // them fill the list (U4): this one is told busy.
             self.lock.unlock();
@@ -1054,6 +1055,7 @@ pub const Service = struct {
     /// (`error.Invalid`). Copied under the service's lock, with nothing
     /// allocated.
     pub fn setMetrics(self: *Service, items: []const Metric) !void {
+        // The C ABI validates first (capi/lib.zig), so error.Invalid never reaches its `else` arm.
         if (items.len > max_metrics) return error.TooMany;
         for (items) |m| {
             if (m.name.len == 0 or m.name.len > max_metric_name or m.unit.len > max_metric_unit) return error.Invalid;

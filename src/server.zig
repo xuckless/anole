@@ -943,6 +943,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             /// guards the certificate sources, which only a reload
             /// touches). Taken with no other lock held: SIGHUP's task, the
             /// console's thread, a C ABI thread.
+            /// Off zio: through the ctl gate (`Engine.enter`), or a console thread joined before the runtime ends (T5).
             cert_lock: safety.IoLock = .init,
             /// The routes recorded for the OpenAPI document (`-Dopenapi`),
             /// and what `app.openapi` asked for.

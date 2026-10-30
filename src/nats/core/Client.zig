@@ -1083,6 +1083,7 @@ fn closeWith(client: *Client, reason: CloseReason) void {
         // is untracked, and `untrack` waits for the shutdown begun here.
         const attempt = client.attempt;
         const stream = if (attempt) |a| a.beginStop() else null;
+        // Before the socket's shutdown, harmless: waiters on `changed` only look at `status` again.
         client.changed.wake(io);
         break :under .{ was_open, attempt, stream };
     };
@@ -1090,6 +1091,7 @@ fn closeWith(client: *Client, reason: CloseReason) void {
     // of the attempt's socket, a zio I/O call.
     if (was_open) log.debug("closing the client", .{});
     if (attempt_stream) |stream| attempt.?.finishStop(io, stream);
+    // The engine's raw locks below are taken with `client.mutex` let go (their order: SAFETY reasons).
     // Before the outbound queue wakes them, requests learn why. After a
     // drain, the streams of requestMany keep what they received.
     if (reason == .drained) client.inbox.endDrained(io) else client.inbox.end(io, .closed);

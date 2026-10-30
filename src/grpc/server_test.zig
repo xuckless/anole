@@ -1572,6 +1572,7 @@ fn countedCall(channel: *grpc.Channel, gpa: std.mem.Allocator, failed: *std.atom
 
 /// Shuts the channel's connection down under it and waits until the
 /// channel sees it closed.
+/// It reaches into the connection's socket: the server has no per-connection close to drive instead.
 fn loseConnection(channel: *grpc.Channel, io: std.Io) !void {
     const conn = channel.conn.?;
     conn.socket.shutdown(io, .both) catch {};
@@ -1651,6 +1652,7 @@ const ChannelStress = struct {
             if (t.callers_done.load(.acquire) == callers) return;
             // The connection object lives until the channel closes (its
             // retired list), so a stale one is only shut down twice.
+            // A plain read of `conn` (D2's race, test side); a stalled run ends quietly with fewer losses.
             const conn = t.channel.conn orelse continue;
             conn.socket.shutdown(t.io, .both) catch {};
             t.losses += 1;

@@ -119,6 +119,7 @@ pub fn update(pool: *Pool, io: Io, urls: []const []const u8, changes: []Change) 
     std.debug.assert(changes.len >= max_changes);
     var updated: Updated = .{ .changes = changes[0..0] };
     if (urls.len == 0) return updated;
+    // Each URL is parsed twice (here for the log, under the lock to apply it): a cold path.
     for (urls) |url| {
         _ = ServerAddress.parse(url) catch log.debug("ignoring a server the cluster announced that is no address: {f}", .{server_error.printable(url)});
     }

@@ -335,6 +335,7 @@ pub const AttemptState = struct {
         const client = state.client;
         client.mutex.lockUncancelable(io);
         defer client.mutex.unlock(io);
+        // `state` is touched only before `shutting` clears: after it, `untrack` may end the frame.
         state.shutting = false;
         client.changed.wake(io);
     }
@@ -372,7 +373,7 @@ pub const AttemptState = struct {
         if (!state.shutting) return;
         const was = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(was);
-        // With cancellation blocked the wait returns no error.
+        // With cancellation blocked the wait returns no error, and a cancel stays pending (C3).
         while (state.shutting) state.client.changed.wait(io, &state.client.mutex, null) catch {};
     }
 };
@@ -895,6 +896,7 @@ fn lameDuck(client: *Client) void {
 fn discover(client: *Client, info: ServerInfo) void {
     if (client.options.options.ignore_discovered_servers) return;
     if (info.connect_urls.len == 0) return;
+    // One buffer per INFO that names servers (cold path).
     const changes = client.gpa.alloc(Pool.Change, Pool.max_changes) catch {
         log.warn("no memory to take the servers an INFO announces", .{});
         return;

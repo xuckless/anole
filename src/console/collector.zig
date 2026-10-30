@@ -82,6 +82,7 @@ pub const Collector = struct {
             // in. The one it replaces is freed after.
             var answer = buf.toArrayList();
             c.lock.lock();
+            // An answer to an older seq is dropped here: only the current asker (`serial`) reads one.
             std.mem.swap(std.ArrayList(u8), &c.out, &answer);
             c.out_seq = seq;
             c.out_ok = ok;
