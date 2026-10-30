@@ -743,6 +743,9 @@ test "trace: flushes from several tasks each return once their own spans are ans
     var second: Flusher = .{ .exporter = &exporter };
     var second_future = try io.concurrent(Flusher.run, .{&second});
     defer second_future.cancel(io);
+    // Nothing is answered yet, so the first flusher waits once: the second
+    // wait is the second flusher's, which has taken its target ('e' and 'f').
+    try wait.waitAtLeast(io, "the second flusher waits", &exporter.test_flush_waits, 2);
 
     StepCollector.release[0].set(io);
     try wait.waitFlag(io, "the first flusher returned once the first batch was answered", &first.done);
