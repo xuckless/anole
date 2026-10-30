@@ -75,6 +75,41 @@ indicator) out of the buffers.
 - `Subscriber` (from `on_open`) can `join`, `leave`, `send` (to that
   subscriber only; `error.Full` past the queue) and `close`.
 
+## Reading another server's stream
+
+`anole.sse.Parser` reads an event stream from any `*std.Io.Reader`, such as a
+response fetched with `.stream = true` (an LLM API's streamed answer, a feed):
+
+```zig
+var response = try client.fetch(url, .{ .stream = true });
+defer response.deinit();
+var buf: [16 * 1024]u8 = undefined;
+var body = try response.reader(&buf);
+var events = anole.sse.Parser.init(gpa, &body.interface, .{});
+defer events.deinit();
+while (try events.next()) |e| {
+    if (std.mem.eql(u8, e.data, "[DONE]")) break;
+    try handle(e.event, e.data);
+}
+```
+
+- `next()` returns the next `Parser.Event` (`event`, "message" when the
+  stream named none; `data`, its `data:` lines joined with LF; `id`, the
+  last `id:` sent so far, or null), or null at the end of the stream. The
+  slices are the parser's and stay valid until the next `next`.
+- It follows the WHATWG event stream rules: lines end in CRLF, LF or CR
+  (also split across reads), a leading BOM is skipped, comments (`:`
+  keep-alives), unknown fields and blocks without `data:` dispatch nothing,
+  and an `id` holding NUL is ignored. An event the end of the stream cuts
+  off is dropped, not dispatched.
+- `parser.retry` holds the last `retry:` in milliseconds, for a reconnect
+  that also sends `id` as `Last-Event-ID`. Reconnecting is the caller's.
+- A line of any length is read whole. `Options.max_event_size` (16 MiB)
+  bounds one line and one event's data; past it `next` fails with
+  `error.EventTooLarge`. `error.ReadFailed` comes from the reader (for the
+  HTTP client, `body.err` has the cause). After an error the parser is
+  spent.
+
 ## Watching changes
 
 | Source | Guarantee | Gap when | Position |
