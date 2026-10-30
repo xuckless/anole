@@ -108,6 +108,9 @@ pub const FakeBroker = struct {
     commits: std.atomic.Value(u32) = .init(0),
     /// Every Metadata request answers with the topic missing.
     hide_topics: std.atomic.Value(bool) = .init(false),
+    /// Every Metadata request answers each partition with
+    /// LEADER_NOT_AVAILABLE and no leader.
+    hide_leaders: std.atomic.Value(bool) = .init(false),
     /// The next N Metadata answers for a topic that does not exist yet say
     /// UNKNOWN_TOPIC_OR_PARTITION, as Kafka 4.x does while it auto-creates
     /// one; the answer after them creates it.
@@ -438,11 +441,12 @@ pub const FakeBroker = struct {
                 try out.string(name);
                 try out.bool_(false);
                 try out.arrayLen(tp.parts.len);
+                const leaderless = b.hide_leaders.load(.acquire);
                 for (tp.parts, 0..) |_, i| {
                     const leader: i32 = @intCast(i % nodes);
-                    try out.i16_(0);
+                    try out.i16_(if (leaderless) protocol.leader_not_available else 0);
                     try out.i32_(@intCast(i));
-                    try out.i32_(leader);
+                    try out.i32_(if (leaderless) -1 else leader);
                     try out.i32_(0);
                     try out.arrayLen(1);
                     try out.i32_(leader);

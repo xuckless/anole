@@ -251,6 +251,12 @@ breaking changes are listed anyway.
 - Kafka: a send or produce to an existing topic could fail with
   UNKNOWN_TOPIC_OR_PARTITION when a stale leader dropped the topic from the
   metadata cache right after the call's own refresh; it now asks again.
+- Kafka: when a partition's leader broker had no sender yet and starting
+  one failed (no memory, the spawn failed), or the start another call had
+  under way failed, the partition kept that leader: its records waiting in
+  the open batch were neither sent nor expired, and a waiting produce
+  without a timeout or a flush waited for good. A failed start now gives
+  the broker's partitions back to the resolver, which assigns them again.
 - C ABI: a consumer thread calling `anole_kafka_produce` without pause kept
   the produce pump running on its executor, so the engine stop posted there
   waited; the pump now lets the executor's other tasks run every 64 records.
@@ -450,8 +456,9 @@ breaking changes are listed anyway.
   state error; before, the call queued a record that nothing freed.
 - Test utilities: `anole.kafka.testing.FakeBroker` has `Config.nodes`
   (that many broker ids at its one address, partition `p` led by
-  `p % nodes`, so a test can have several partition leaders) and counts the
-  batches it refused as out of order (`out_of_order`).
+  `p % nodes`, so a test can have several partition leaders), counts the
+  batches it refused as out of order (`out_of_order`), and can answer every
+  partition without a leader (`hide_leaders`).
 - Debug and test builds: a `safety.IoLock` is checked per task, not per
   executor thread, so a task taking one while another task on its executor
   is suspended holding one no longer panics, and releasing one is checked

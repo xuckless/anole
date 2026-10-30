@@ -473,7 +473,13 @@ pub const Producer = struct {
                     known = .{ .partition = p, .id = self.cluster.leader(rec.topic, p) };
                     lookups += 1;
                 },
-                .need_sender => |id| try self.startSender(id),
+                .need_sender => |id| self.startSender(id) catch |err| {
+                    // Not started: the partitions it was to lead (this
+                    // record's, whose leader `appendLocked` set) went back to
+                    // the resolver, which assigns them again.
+                    if (id != resolver_id) self.kickResolver();
+                    return err;
+                },
             }
         }
     }
@@ -698,13 +704,28 @@ pub const Producer = struct {
 
     /// No lock held on entry. Starts the sender of broker `id` unless it is
     /// running or starting; the spawn runs after the lock is let go (zio's
-    /// spawn backpressure may suspend the caller there, L2).
+    /// spawn backpressure may suspend the caller there, L2). A start that
+    /// fails gives the partitions led by `id` back to the resolver
+    /// (`startFailedLocked`), a start canceled at its lock included.
     fn startSender(self: *Producer, id: i32) error{ OutOfMemory, Closing, Canceled }!void {
         const s = blk: {
-            try self.mutex.lock(self.io);
+            self.mutex.lock(self.io) catch |err| {
+                if (id != resolver_id) {
+                    self.mutex.lockUncancelable(self.io);
+                    defer self.mutex.unlock(self.io);
+                    self.startFailedLocked(id);
+                }
+                return err;
+            };
             defer self.mutex.unlock(self.io);
-            if (self.stopping) return error.Closing;
-            const gop = try self.senders.getOrPut(self.gpa, id);
+            if (self.stopping) {
+                self.startFailedLocked(id);
+                return error.Closing;
+            }
+            const gop = self.senders.getOrPut(self.gpa, id) catch |err| {
+                self.startFailedLocked(id);
+                return err;
+            };
             if (gop.found_existing) {
                 const old = gop.value_ptr.*;
                 if (old.state != .failed) return;
@@ -713,6 +734,7 @@ pub const Producer = struct {
             }
             const made = self.gpa.create(Sender) catch |err| {
                 _ = self.senders.remove(id);
+                self.startFailedLocked(id);
                 return err;
             };
             made.* = .{ .id = id };
@@ -724,10 +746,34 @@ pub const Producer = struct {
             // Kept, not freed: a racing `wake` may hold it.
             self.mutex.lockUncancelable(self.io);
             s.state = .failed;
+            self.startFailedLocked(id);
             self.mutex.unlock(self.io);
             return error.OutOfMemory;
         };
         testHold(self.io, .sender_spawned);
+    }
+
+    /// Under `mutex`: broker `id`'s sender did not start. Every partition
+    /// with batches whose leader is `id` goes back to the resolver: a leader
+    /// set by an append (`appendLocked`) or by the resolver, which saw this
+    /// start under way and took it as started, would otherwise keep its
+    /// batches unsent and unexpired. The caller wakes the resolver
+    /// (`kickResolver`), or is the resolver and tries again.
+    fn startFailedLocked(self: *Producer, id: i32) void {
+        if (id == resolver_id) return;
+        for (self.active.items) |a| if (a.leader == id) {
+            a.leader = resolver_id;
+        };
+    }
+
+    /// Starts the resolver unless it runs, and wakes it: for partitions
+    /// given back to it outside its own rounds. A caller's pending cancel
+    /// waits until after (C3: it meets it at its next wait).
+    fn kickResolver(self: *Producer) void {
+        const was = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(was);
+        self.startSender(resolver_id) catch {};
+        self.wake(resolver_id);
     }
 
     fn wake(self: *Producer, id: i32) void {
@@ -951,11 +997,11 @@ pub const Producer = struct {
         }
         for (start.items) |id| {
             self.startSender(id) catch |err| switch (err) {
+                // Its partitions went back to the resolver as well.
                 error.Canceled => return error.Canceled,
                 else => {
-                    // Not started: its partitions go back to the resolver,
-                    // which tries again.
-                    self.unassign(pend.items, id);
+                    // Not started: its partitions went back to the resolver
+                    // (`startFailedLocked`), which tries again.
                     all = false;
                     continue;
                 },
@@ -963,15 +1009,6 @@ pub const Producer = struct {
             self.wake(id);
         }
         return all;
-    }
-
-    /// Gives the partitions of `accums` led by `id` back to the resolver.
-    fn unassign(self: *Producer, accums: []const *Accum, id: i32) void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        for (accums) |a| if (a.leader == id) {
-            a.leader = resolver_id;
-        };
     }
 
     // -----------------------------------------------------------------------

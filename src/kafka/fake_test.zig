@@ -1135,6 +1135,70 @@ test "kafka: a consumer added once a drain began is refused" {
     try wait.waitFlag(io, "the drain returned", &drained);
 }
 
+/// A waiting append on the executor: `err` is its failure.
+fn appendTask(client: *kafka.Client, value: []const u8, partition: i32, out: *TaskResult) std.Io.Cancelable!void {
+    defer out.finish();
+    _ = client.producer.appendWaiting("lead", null, value, &.{}, partition, 0) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => out.err = err,
+    };
+}
+
+fn refreshTask(client: *kafka.Client, topic: []const u8, out: *TaskResult) std.Io.Cancelable!void {
+    defer out.finish();
+    client.cluster.refresh(&.{topic}, true) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => out.err = err,
+    };
+}
+
+test "kafka producer: a record waiting for its leader is delivered after a produce that set the leader failed to start its sender" {
+    // The test's thread is executor 0, the resolver's; partition 1's leader,
+    // broker id 1, has its sender on executor 1.
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 2, .nodes = 2 });
+    defer broker.deinit();
+    var fail: FailNth = .{ .backing = gpa };
+    const client = try kafka.Client.init(fail.allocator(), io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+
+    // No leader known: the record waits under the resolver, which finds
+    // none either.
+    broker.hide_leaders.store(true, .release);
+    const ref = try client.producer.appendWaiting("lead", null, "first", &.{}, 1, 0);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    // From now on every allocation on executor 0 fails: the resolver
+    // refreshes nothing (and starts no sender) until the end of the test.
+    var armed: std.atomic.Value(bool) = .init(false);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, failHereTask, .{ &fail, &armed });
+    try wait.waitFlag(io, "allocations on executor 0 fail", &armed);
+    defer fail.armed.store(false, .release);
+    try wait.waitAtLeast(io, "the resolver failed a refresh", &fail.failures, 1);
+    // The leader is known (refreshed on executor 1).
+    broker.hide_leaders.store(false, .release);
+    var refreshed: TaskResult = .{};
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, refreshTask, .{ client, "lead", &refreshed });
+    try refreshed.wait(io);
+    try testing.expectEqual(@as(?i32, 1), client.cluster.leader("lead", 1));
+    // A produce on executor 0 sets the partition's leader, and cannot start
+    // its sender.
+    var second: TaskResult = .{};
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, appendTask, .{ client, "second", 1, &second });
+    try testing.expectError(error.OutOfMemory, second.wait(io));
+    fail.armed.store(false, .release);
+    // The first record still reaches its leader. The deadline is a hang
+    // guard.
+    const outcome = try client.producer.waitFor(ref, wait.deadline());
+    try testing.expect(outcome == .ok);
+    try testing.expectEqual(@as(i64, 1), broker.count("lead", 1));
+}
+
 test "kafka producer: a produce to a topic dropped from the metadata cache between its refresh and its lookup is delivered" {
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
