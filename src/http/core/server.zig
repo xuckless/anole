@@ -895,6 +895,11 @@ pub const test_linger_timeout_ms = if (builtin.is_test) struct {
     pub var ms: std.atomic.Value(u32) = .init(0);
 } else struct {};
 
+/// Tests only: runs where an accept loop logs that it is at the connection
+/// cap, under the same cancel protection, just before its wait for a slot.
+/// Absent outside test builds.
+pub var test_at_cap_log: if (builtin.is_test) ?*const fn (std.Io) void else void = if (builtin.is_test) null else {};
+
 fn lingerTimeout() std.Io.Duration {
     if (builtin.is_test) {
         const ms = test_linger_timeout_ms.ms.load(.acquire);
@@ -2127,9 +2132,24 @@ pub fn Server(comptime Ctx: type) type {
             while (true) {
                 const active = self.active_connections.load(.acquire);
                 if (active < max) return;
-                log.debug("At the {d} connection cap; waiting for a slot", .{max});
+                self.logAtCap(max);
                 try self.io.futexWait(u32, &self.active_connections.raw, active);
             }
+        }
+
+        /// Says the accept loop waits for a slot. Logging can wait on a
+        /// cancelable lock (a Debug allocator's stack trace takes
+        /// `std.debug.SelfInfo`'s module mutex through `std.Options.debug_io`)
+        /// and drop its `error.Canceled`; under std.Io.Threaded that
+        /// acknowledges the cancel pending on this task, and the loop's next
+        /// accept then blocks for good under a stop (#158). Blocked here, the
+        /// cancel stays pending for the wait that follows, as in
+        /// `placement.concurrent`.
+        fn logAtCap(self: *Self, max: u32) void {
+            const protection = self.io.swapCancelProtection(.blocked);
+            defer _ = self.io.swapCancelProtection(protection);
+            log.debug("At the {d} connection cap; waiting for a slot", .{max});
+            if (builtin.is_test) if (test_at_cap_log) |hook| hook(self.io);
         }
 
         /// Takes the slot for a connection just accepted. The check above is
@@ -2146,7 +2166,7 @@ pub fn Server(comptime Ctx: type) type {
             var active = self.active_connections.load(.acquire);
             while (true) {
                 if (active >= max) {
-                    log.debug("At the {d} connection cap; waiting for a slot", .{max});
+                    self.logAtCap(max);
                     try self.io.futexWait(u32, &self.active_connections.raw, active);
                     active = self.active_connections.load(.acquire);
                     continue;
