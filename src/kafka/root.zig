@@ -385,10 +385,12 @@ pub const Client = struct {
 
     /// Adds a consumer; true when it is to be started now (serving has
     /// started), which the caller does after the lock and ends with
-    /// `endStart`.
-    fn addConsumer(self: *Client, c: *consumer_mod.Consumer) !bool {
+    /// `endStart`. `error.Closing` once a drain began: the list `drain`
+    /// joins without the lock grows no more.
+    fn addConsumer(self: *Client, c: *consumer_mod.Consumer) error{ OutOfMemory, Closing }!bool {
         self.consumers_mutex.lockUncancelable(self.io);
         defer self.consumers_mutex.unlock(self.io);
+        if (self.drained) return error.Closing;
         try self.consumers.append(self.gpa, c);
         const now = self.started and !self.drained and !self.suppress_consumers;
         if (now) self.starting += 1;
@@ -426,8 +428,11 @@ pub const Client = struct {
         }
         while (self.starting > 0) self.starts_done.waitUncancelable(self.io, &self.consumers_mutex);
         for (self.consumers.items) |c| c.stop();
+        // `addConsumer` refuses from `drained` on: the list read after the
+        // lock is the one stopped above.
+        const consumers = self.consumers.items;
         self.consumers_mutex.unlock(self.io);
-        for (self.consumers.items) |c| c.join(deadline);
+        for (consumers) |c| c.join(deadline);
         const left = std.Io.Clock.Timestamp.now(self.io, .awake).durationTo(deadline).raw;
         self.producer.flush(if (left.nanoseconds > 0) left else .fromMilliseconds(1)) catch |err| switch (err) {
             error.Timeout => log.warn("kafka: records were still unsent at the drain deadline", .{}),
@@ -594,7 +599,8 @@ pub const Client = struct {
     /// `fn (*App, *Msg) !void`, with `server` the `anole.Server` (or any
     /// value with the app's state as `.ctx`). A record is retried in place
     /// and then dead-lettered or skipped (`ConsumeOptions.retry`,
-    /// `dead_letter`); offsets are committed once handled.
+    /// `dead_letter`); offsets are committed once handled. Once the
+    /// client's drain began, `error.Closing`.
     pub fn consume(self: *Client, server: anytype, opts: ConsumeOptions, comptime handler: anytype) !void {
         const params = @typeInfo(@TypeOf(handler)).@"fn".param_types;
         if (params.len < 1 or params.len > 2) @compileError("a Kafka handler is fn (*Msg) !void or fn (*App, *Msg) !void");
@@ -623,6 +629,7 @@ pub const Client = struct {
     /// `consume` for callers that bring their own function pointers (the C
     /// ABI): the consumer joins once serving starts (at once when it
     /// already has). It lives, stopped or not, until the client is freed.
+    /// Once the client's drain began, `error.Closing`.
     pub fn consumeRaw(self: *Client, opts: ConsumeOptions, handler: consumer_mod.HandlerFn, context: ?*anyopaque) !*consumer_mod.Consumer {
         const c = try consumer_mod.Consumer.create(self.host(), opts, handler, context);
         const start_now = self.addConsumer(c) catch |err| {

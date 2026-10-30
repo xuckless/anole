@@ -1098,6 +1098,43 @@ test "kafka: a drain that begins while a consumer's start spawns its members sto
     try testing.expectEqual(@as(u32, 0), client.consumers.items[0].active.load(.acquire));
 }
 
+test "kafka: a consumer added once a drain began is refused" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    try client.start(null, null, null);
+
+    // A start under way keeps the drain, `drained` set, before its joins.
+    var spawned: TestHold = .{ .point = .member_spawned };
+    spawned.arm();
+    defer hold_mod.test_hold.store(null, .release);
+    var result: TaskResult = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    defer spawned.let(io);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, consumeTask, .{ client, &result });
+    try wait.waitFlag(io, "the consumer's start is held after its member's spawn", &spawned.held);
+    var waits: TestHold = .{ .point = .drain_waits };
+    waits.arm();
+    defer waits.let(io);
+    var drained: std.atomic.Value(bool) = .init(false);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, drainTask, .{ client, io, &drained });
+    try wait.waitFlag(io, "the drain waits for the start", &waits.held);
+    // The drain began: a consumer added now is refused, so the list the
+    // drain joins does not grow under it.
+    var late: TaskResult = .{};
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, consumeTask, .{ client, &late });
+    try testing.expectError(error.Closing, late.wait(io));
+    waits.let(io);
+    spawned.let(io);
+    try result.wait(io);
+    try wait.waitFlag(io, "the drain returned", &drained);
+}
+
 test "kafka producer: a produce to a topic dropped from the metadata cache between its refresh and its lookup is delivered" {
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();

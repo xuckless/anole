@@ -836,7 +836,11 @@ fn groupTask(x: *Exec, g: *Group) std.Io.Cancelable!void {
             .on_assign = onAssign,
             .on_revoke = onRevoke,
         }, unusedHandler, g) catch |err| {
-            if (endRecord(g.handle, g.user_data, abi.BROKER_END_FAILED, @errorName(err))) |rec| x.postRecord(rec, false) else |_| {}
+            // The client is closing (its drain began first): the group ends
+            // as a close or the engine's drain ends the others.
+            const end = if (err != error.Closing) abi.BROKER_END_FAILED else if (g.draining.load(.acquire)) abi.BROKER_END_DRAINED else abi.BROKER_END_CLOSED;
+            const why = if (err == error.Closing) "" else @errorName(err);
+            if (endRecord(g.handle, g.user_data, end, why)) |rec| x.postRecord(rec, false) else |_| {}
             g.release();
             return;
         };

@@ -436,8 +436,10 @@ breaking changes are listed anyway.
   a sender start or a consumer group start waits (SAFETY.md L2, L3), and a
   waiting produce no longer allocates per call: its outcome comes through a
   generation-checked slot of the producer. Metadata refreshes still run one
-  at a time. A consumer group added after the client's drain began is no
-  longer started. `Client.start` marks the client started only once its
+  at a time. A consumer group added after the client's drain began is
+  refused (`error.Closing`; over the C ABI its group ends as closed or
+  drained), so the list the drain joins no longer grows under it.
+  `Client.start` marks the client started only once its
   metrics, tracing, health check and the start's metadata refresh
   succeeded, so a failed start can be called again; `consume` doesn't
   start groups added before a successful start (the next `start` does).
