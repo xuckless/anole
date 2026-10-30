@@ -1,10 +1,13 @@
 //! Process-wide log rings for the live console (design 6.4). Producers (any
 //! thread) copy a record into one of up to 16 byte rings under a spin lock
-//! held for the copy only; readers keep cursors and learn how many records
-//! the rings lapped. Nothing here ever waits for a console.
+//! held for the copy only; readers copy a ring's live bytes out under it and
+//! parse them after, keep cursors and learn how many records the rings
+//! lapped. Nothing allocates under a ring's lock (SAFETY.md L5), and nothing
+//! here ever waits for a console.
 const std = @import("std");
 const logging = @import("anole_log");
 const ui = @import("anole_console_ui");
+const safety = @import("anole_safety");
 
 pub const ring_count = 16;
 pub const header_len = 16;
@@ -46,7 +49,9 @@ pub const Filter = struct {
 };
 
 const Ring = struct {
-    lock: std.atomic.Mutex = .unlocked,
+    /// Over the fields below; held for a bounded copy only.
+    /// A log call made under any ranked lock panics here in debug builds once the tap is installed (D9).
+    lock: safety.SpinLock(.leaf) = .init,
     buf: []u8 = &.{},
     /// Absolute byte offsets: the next write, and the oldest intact record.
     head: u64 = 0,
@@ -54,10 +59,6 @@ const Ring = struct {
     /// The sequence number of the record at `tail`, and of the next write.
     first_seq: u64 = 0,
     next_seq: u64 = 0,
-
-    fn acquire(self: *Ring) void {
-        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
-    }
 
     fn copyIn(self: *Ring, at: u64, bytes: []const u8) void {
         const size = self.buf.len;
@@ -168,9 +169,23 @@ pub const LogRing = struct {
         std.mem.writeInt(u16, h[14..16], @intCast(text.len), .little);
 
         const r = &self.rings[myRing()];
-        r.acquire();
+        // The first record of a ring allocates it, before the lock; when
+        // another thread installed one meanwhile, this copy is freed after
+        // the lock is let go.
+        var spare: []u8 = &.{};
+        // Declared before the lock's defer, so it runs after the unlock.
+        defer if (spare.len > 0) self.gpa.free(spare);
+        r.lock.lock();
         defer r.lock.unlock();
-        if (r.buf.len == 0) r.buf = self.gpa.alloc(u8, self.size_each) catch return;
+        if (r.buf.len == 0) {
+            r.lock.unlock();
+            const fresh = self.gpa.alloc(u8, self.size_each) catch {
+                r.lock.lock();
+                return;
+            };
+            r.lock.lock();
+            if (r.buf.len == 0) r.buf = fresh else spare = fresh;
+        }
         while (r.head + n - r.tail > r.buf.len) {
             r.tail += r.recLen(r.tail);
             r.first_seq += 1;
@@ -186,15 +201,15 @@ pub const LogRing = struct {
         r.next_seq += 1;
     }
 
-    fn readOne(r: *const Ring, arena: std.mem.Allocator, at: u64) !struct { rec: Rec, len: usize } {
-        var h: [header_len]u8 = undefined;
-        r.copyOut(at, &h);
+    /// The record at the start of `bytes` (records copied out of a ring,
+    /// whole), its strings copied into `arena`.
+    fn readOne(bytes: []const u8, arena: std.mem.Allocator) !struct { rec: Rec, len: usize } {
+        const h = bytes[0..header_len];
         const sl: usize = h[10];
         const il: usize = h[11];
         const rl: usize = std.mem.readInt(u16, h[12..14], .little);
         const tl: usize = std.mem.readInt(u16, h[14..16], .little);
-        const body = try arena.alloc(u8, sl + il + rl + tl);
-        r.copyOut(at + header_len, body);
+        const body = try arena.dupe(u8, bytes[header_len..][0 .. sl + il + rl + tl]);
         return .{
             .rec = .{
                 .time_ns = std.mem.readInt(i64, h[0..8], .little),
@@ -213,7 +228,7 @@ pub const LogRing = struct {
     /// backlog starts from).
     pub fn attachAtEnd(self: *LogRing, cursors: *Cursors) void {
         for (&self.rings, cursors) |*r, *c| {
-            r.acquire();
+            r.lock.lock();
             c.* = .{ .offset = r.head, .seq = r.next_seq };
             r.lock.unlock();
         }
@@ -223,20 +238,23 @@ pub const LogRing = struct {
     /// cursors; `dropped` counts records the rings lapped.
     pub fn readNew(self: *LogRing, arena: std.mem.Allocator, cursors: *Cursors, out: *std.ArrayList(Rec), dropped: *u64) !void {
         const start = out.items.len;
+        // Every pump tick, even with nothing new: one ring's size from the tick's arena (cold path).
+        const scratch = try arena.alloc(u8, self.size_each);
         for (&self.rings, cursors) |*r, *c| {
-            r.acquire();
-            defer r.lock.unlock();
-            if (r.buf.len == 0) continue;
-            if (c.offset < r.tail) {
-                dropped.* += r.first_seq - c.seq;
-                c.* = .{ .offset = r.tail, .seq = r.first_seq };
-            }
-            while (c.offset < r.head) {
-                const one = try readOne(r, arena, c.offset);
-                try out.append(arena, one.rec);
-                c.offset += one.len;
-                c.seq += 1;
-            }
+            const live = live: {
+                r.lock.lock();
+                defer r.lock.unlock();
+                if (r.buf.len == 0) continue;
+                if (c.offset < r.tail) {
+                    dropped.* += r.first_seq - c.seq;
+                    c.* = .{ .offset = r.tail, .seq = r.first_seq };
+                }
+                const n: usize = @intCast(r.head - c.offset);
+                r.copyOut(c.offset, scratch[0..n]);
+                c.* = .{ .offset = r.head, .seq = r.next_seq };
+                break :live scratch[0..n];
+            };
+            try parseInto(live, arena, out);
         }
         sortByTime(out.items[start..]);
     }
@@ -245,19 +263,31 @@ pub const LogRing = struct {
     /// cursors to the end: a new subscription's backlog.
     pub fn readBacklogAndAttach(self: *LogRing, arena: std.mem.Allocator, cursors: *Cursors, out: *std.ArrayList(Rec)) !void {
         const start = out.items.len;
+        const scratch = try arena.alloc(u8, self.size_each);
         for (&self.rings, cursors) |*r, *c| {
-            r.acquire();
-            defer r.lock.unlock();
-            c.* = .{ .offset = r.head, .seq = r.next_seq };
-            if (r.buf.len == 0) continue;
-            var at = r.tail;
-            while (at < r.head) {
-                const one = try readOne(r, arena, at);
-                try out.append(arena, one.rec);
-                at += one.len;
-            }
+            const live = live: {
+                r.lock.lock();
+                defer r.lock.unlock();
+                c.* = .{ .offset = r.head, .seq = r.next_seq };
+                if (r.buf.len == 0) continue;
+                const n: usize = @intCast(r.head - r.tail);
+                r.copyOut(r.tail, scratch[0..n]);
+                break :live scratch[0..n];
+            };
+            try parseInto(live, arena, out);
         }
         sortByTime(out.items[start..]);
+    }
+
+    /// Appends the whole records in `bytes` (copied out of one ring) to
+    /// `out`, their strings in `arena`.
+    fn parseInto(bytes: []const u8, arena: std.mem.Allocator, out: *std.ArrayList(Rec)) !void {
+        var at: usize = 0;
+        while (at < bytes.len) {
+            const one = try readOne(bytes[at..], arena);
+            try out.append(arena, one.rec);
+            at += one.len;
+        }
     }
 };
 

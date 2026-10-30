@@ -3,6 +3,8 @@
 //! them under those locks, and the console's thread, which must not take a
 //! lock of the runtime, waits for the answer (up to `wait_ms`).
 const std = @import("std");
+const builtin = @import("builtin");
+const safety = @import("anole_safety");
 
 pub const What = enum(u8) { ws, db };
 
@@ -12,10 +14,6 @@ pub const CollectFn = *const fn (ctx: *anyopaque, what: What, w: *std.Io.Writer)
 /// The console's threads wait on the blocking `Io`, never the runtime's.
 fn blockingIo() std.Io {
     return std.Options.debug_io;
-}
-
-fn spin(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.atomic.spinLoopHint();
 }
 
 pub const Collector = struct {
@@ -30,16 +28,27 @@ pub const Collector = struct {
     what: std.atomic.Value(u8) = .init(0),
     /// An answer is in `out` (set on the blocking `Io`).
     answered: std.Io.Event = .unset,
-    /// Over `out`, `out_seq` and `out_ok`; held only to copy.
-    lock: std.atomic.Mutex = .unlocked,
+    /// Over `out`, `out_seq` and `out_ok`; held only to swap or move `out`,
+    /// never to allocate (SAFETY.md L5).
+    lock: safety.SpinLock(.leaf) = .init,
+    /// The latest answer: made by the collector's task, taken (and freed)
+    /// by the console thread that asked for it, or replaced by the next.
     out: std.ArrayList(u8) = .empty,
     out_seq: u32 = 0,
     out_ok: bool = false,
     /// One asker at a time (the console serves up to four clients).
+    // SAFETY: L2/L5 do not fit this lock: only console OS threads take it
+    // (never a zio task), and it is held across their blocking wait for the
+    // runtime's answer (up to `wait_ms`) on `std.Options.debug_io`, by
+    // design: one asker at a time. Waiters sleep-poll (1 ms).
     serial: std.atomic.Mutex = .unlocked,
     task: ?std.Io.Future(void) = null,
 
     pub const wait_ms = 200;
+    /// Tests: replaces `wait_ms`, so that a test's ask waits for the answer
+    /// however slow the machine is (its own deadline still holds). Test
+    /// builds only.
+    pub var test_wait_ms: if (builtin.is_test) ?u32 else void = if (builtin.is_test) null else {};
 
     /// On a task of the runtime (the server's run).
     pub fn start(c: *Collector) !void {
@@ -68,15 +77,17 @@ pub const Collector = struct {
             const what: What = @fromBackingInt(@intCast(c.what.load(.acquire)));
             var buf: std.Io.Writer.Allocating = .init(c.gpa);
             defer buf.deinit();
-            var ok = if (c.collect(c.ctx, what, &buf.writer)) |_| true else |_| false;
-            spin(&c.lock);
-            c.out.clearRetainingCapacity();
-            c.out.appendSlice(c.gpa, buf.written()) catch {
-                ok = false;
-            };
+            const ok = if (c.collect(c.ctx, what, &buf.writer)) |_| true else |_| false;
+            // The answer is made outside the lock; under it, only swapped
+            // in. The one it replaces is freed after.
+            var answer = buf.toArrayList();
+            c.lock.lock();
+            // An answer to an older seq is dropped here: only the current asker (`serial`) reads one.
+            std.mem.swap(std.ArrayList(u8), &c.out, &answer);
             c.out_seq = seq;
             c.out_ok = ok;
             c.lock.unlock();
+            answer.deinit(c.gpa);
             c.answered.set(blockingIo());
         }
     }
@@ -91,7 +102,8 @@ pub const Collector = struct {
         c.what.store(@backingInt(what), .release);
         c.asked.store(seq, .release);
         c.ask.set(c.io);
-        const deadline = std.Io.Clock.Timestamp.now(blockingIo(), .awake).addDuration(.{ .raw = .fromMilliseconds(wait_ms), .clock = .awake });
+        const ms: u32 = if (comptime builtin.is_test) test_wait_ms orelse wait_ms else wait_ms;
+        const deadline = std.Io.Clock.Timestamp.now(blockingIo(), .awake).addDuration(.{ .raw = .fromMilliseconds(ms), .clock = .awake });
         while (true) {
             if (try c.take(seq, w)) return;
             // A late answer to an earlier ask woke this: look again after
@@ -102,13 +114,20 @@ pub const Collector = struct {
         }
     }
 
-    /// The answer to `seq` into `w`, if it is in.
+    /// The answer to `seq` into `w`, if it is in: moved out under the
+    /// lock, written and freed after it.
     fn take(c: *Collector, seq: u32, w: *std.Io.Writer) !bool {
-        spin(&c.lock);
-        defer c.lock.unlock();
-        if (c.out_seq != seq) return false;
-        if (!c.out_ok) return error.CollectFailed;
-        try w.writeAll(c.out.items);
+        var answer, const ok = taken: {
+            c.lock.lock();
+            defer c.lock.unlock();
+            if (c.out_seq != seq) return false;
+            const moved = c.out;
+            c.out = .empty;
+            break :taken .{ moved, c.out_ok };
+        };
+        defer answer.deinit(c.gpa);
+        if (!ok) return error.CollectFailed;
+        try w.writeAll(answer.items);
         return true;
     }
 };

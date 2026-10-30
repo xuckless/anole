@@ -18,6 +18,11 @@ const log = std.log.scoped(.nats);
 const Registry = @This();
 
 /// Guards everything below.
+// SAFETY: NATS engine lock, outside the ranked wrappers until a single-owner
+// connection replaces the nesting (research/s15/retrofit-9-rest.md Q1): order
+// Outbound.mutex -> {Inbox.mutex, Registry.mutex} -> MessageQueue.mutex, never
+// the other way; held across no suspension but an inner lock's wait and its
+// own condition's wait.
 mutex: Io.Mutex = .init,
 /// An array hash map: a removal leaves no mark behind, so lookups stay as
 /// cheap after many subscriptions came and went as before.

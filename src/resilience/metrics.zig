@@ -6,6 +6,7 @@
 const std = @import("std");
 const core = @import("resilience_core");
 const observe = @import("../observe/root.zig");
+const safety = @import("anole_safety");
 
 const metrics = observe.metrics;
 
@@ -24,15 +25,22 @@ pub const Binding = struct {
     rejected: *metrics.Family(metrics.Counter),
     retries: *metrics.Family(metrics.Counter),
     throttled: *metrics.Family(metrics.Counter),
-    lock: std.atomic.Mutex = .unlocked,
-    /// Targets seen per client kind.
+    /// Over `seen`: a lookup or an insert into room made beforehand, never
+    /// an allocation (SAFETY.md L5).
+    lock: safety.SpinLock(.leaf) = .init,
+    /// Targets seen per client kind, each with room for `max_targets`
+    /// from `init` on.
     seen: [8]std.StringHashMapUnmanaged(void) = @splat(.empty),
     hooks: core.Metrics = .{},
 
     pub fn init(gpa: std.mem.Allocator, registry: *metrics.Registry) !Binding {
         const labels = &.{ "client", "target" };
+        var seen: [8]std.StringHashMapUnmanaged(void) = @splat(.empty);
+        errdefer for (&seen) |*m| m.deinit(gpa);
+        for (&seen) |*m| try m.ensureTotalCapacity(gpa, max_targets);
         return .{
             .gpa = gpa,
+            .seen = seen,
             .state = try registry.gauge("anole_breaker_state", "Circuit breaker state: 0 closed, 1 half-open, 2 open.", labels),
             .opened = try registry.counter("anole_breaker_opened_total", "Times a circuit breaker opened.", labels),
             .rejected = try registry.counter("anole_breaker_rejected_total", "Calls a circuit breaker rejected.", labels),
@@ -61,18 +69,28 @@ pub const Binding = struct {
         return &self.hooks;
     }
 
+    /// The `target` label of `target`: its own until `max_targets` are
+    /// taken, then "other". The copy of a new one is made and, when another
+    /// thread put it first, freed with the lock let go.
     fn label(self: *Binding, kind: core.Kind, target: []const u8) []const u8 {
         const set = &self.seen[@backingInt(kind)];
-        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
-        defer self.lock.unlock();
-        if (set.contains(target)) return set.getKey(target).?;
-        if (set.count() >= max_targets) return "other";
+        {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (set.getKey(target)) |k| return k;
+            if (set.count() >= max_targets) return "other";
+        }
         const owned = self.gpa.dupe(u8, target) catch return "other";
-        set.put(self.gpa, owned, {}) catch {
-            self.gpa.free(owned);
-            return "other";
+        const kept: ?[]const u8 = kept: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (set.getKey(target)) |k| break :kept k;
+            if (set.count() >= max_targets) break :kept null;
+            set.putAssumeCapacityNoClobber(owned, {});
+            return owned;
         };
-        return owned;
+        self.gpa.free(owned);
+        return kept orelse "other";
     }
 
     fn cast(ctx: ?*anyopaque) *Binding {
@@ -105,7 +123,9 @@ test "metrics: target labels capped at 256, then other" {
     const gpa = testing.allocator;
     var registry = metrics.Registry.init(gpa, testing.io);
     defer registry.deinit();
-    var binding = try Binding.init(gpa, &registry);
+    // The binding's allocations are checked against its spin lock (L5).
+    var checked: safety.SpinCheckedAllocator = .init(gpa);
+    var binding = try Binding.init(checked.allocator(), &registry);
     defer binding.deinit();
     const hooks = binding.metricsHooks();
     var buf: [32]u8 = undefined;
@@ -125,4 +145,125 @@ test "metrics: target labels capped at 256, then other" {
     try testing.expect(std.mem.indexOf(u8, text, "target=\"h256\"") == null);
     try testing.expect(std.mem.indexOf(u8, text, "target=\"h260\"") == null);
     try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_rejected_total{client=\"grpc\",target=\"x\"} 1") != null);
+}
+
+test "metrics: a breaker's state reaches the metrics when it is made, and when the breakers are observed" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var registry = metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    var binding = try Binding.init(gpa, &registry);
+    defer binding.deinit();
+    var breakers = core.Breakers.init(gpa, .{}, .http, 64);
+    defer breakers.deinit();
+    // Made before the metrics: reported when they are observed.
+    _ = try breakers.get(io, "a");
+    breakers.observe(io, binding.metricsHooks());
+    // Made after: reported as it is made.
+    _ = try breakers.get(io, "b");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    const text = out.written();
+    try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_state{client=\"http\",target=\"a\"} 0") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "anole_breaker_state{client=\"http\",target=\"b\"} 0") != null);
+}
+
+/// Another executor's transition between a report's unlock and the
+/// report: "a" opens (five failures).
+fn tripA(bs: *core.Breakers) void {
+    const a = bs.get(testing.io, "a") catch unreachable;
+    for (0..5) |_| a.record(a.allow(0).?, .failure, 0);
+}
+
+test "metrics: a new breaker that opens before its first report reads open" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var registry = metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    var binding = try Binding.init(gpa, &registry);
+    defer binding.deinit();
+    var breakers = core.Breakers.init(gpa, .{}, .http, 64);
+    defer breakers.deinit();
+    breakers.observe(io, binding.metricsHooks());
+    core.Breakers.test_after_unlock = tripA;
+    defer core.Breakers.test_after_unlock = null;
+    const a = try breakers.get(io, "a");
+    try testing.expectEqual(core.Breaker.State.open, a.state());
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "anole_breaker_state{client=\"http\",target=\"a\"} 2") != null);
+}
+
+test "metrics: a breaker that opens while the breakers are observed reads open" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var registry = metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    var binding = try Binding.init(gpa, &registry);
+    defer binding.deinit();
+    var breakers = core.Breakers.init(gpa, .{}, .http, 64);
+    defer breakers.deinit();
+    _ = try breakers.get(io, "a");
+    core.Breakers.test_after_unlock = tripA;
+    defer core.Breakers.test_after_unlock = null;
+    breakers.observe(io, binding.metricsHooks());
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "anole_breaker_state{client=\"http\",target=\"a\"} 2") != null);
+}
+
+/// The tasks of the breakers stress test: each makes and looks up breakers
+/// over the same keys, with the metrics on.
+const BreakersStress = struct {
+    breakers: *core.Breakers,
+    io: std.Io,
+    failures: std.atomic.Value(u32) = .init(0),
+
+    const keys = 200;
+    const gets_each = 10_000;
+
+    fn worker(t: *BreakersStress, seed: u64) void {
+        var prng: std.Random.DefaultPrng = .init(seed);
+        var buf: [16]u8 = undefined;
+        for (0..gets_each) |_| {
+            const key = std.fmt.bufPrint(&buf, "k{d}", .{prng.random().uintLessThan(u32, keys)}) catch unreachable;
+            const b = t.breakers.get(t.io, key) catch {
+                _ = t.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            if (!std.mem.eql(u8, b.name(), key)) _ = t.failures.fetchAdd(1, .monotonic);
+        }
+    }
+};
+
+test "metrics: [stress] breakers made and reported from every executor: one state series per key" {
+    try @import("anole_test_wait").requireStress();
+    const zio = @import("zio");
+    const placement = @import("dusty").placement;
+    const gpa = testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(4) });
+    defer rt.deinit();
+    const io = rt.io();
+    var registry = metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    var binding = try Binding.init(gpa, &registry);
+    defer binding.deinit();
+    // Room for every key: nothing is evicted.
+    var breakers = core.Breakers.init(gpa, .{}, .http, 16 * BreakersStress.keys);
+    defer breakers.deinit();
+    breakers.observe(io, binding.metricsHooks());
+    var t: BreakersStress = .{ .breakers = &breakers, .io = io };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..4) |i| try placement.concurrent(&group, io, .{ .executor = i }, BreakersStress.worker, .{ &t, 0x5eed_0126 + i });
+    try group.await(io);
+    try testing.expectEqual(@as(u32, 0), t.failures.load(.monotonic));
+    try testing.expectEqual(@as(usize, BreakersStress.keys), breakers.count(io));
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    try testing.expectEqual(@as(usize, BreakersStress.keys), std.mem.count(u8, out.written(), "anole_breaker_state{"));
 }

@@ -15,6 +15,7 @@ const stats_mod = @import("stats.zig");
 const logring = @import("logring.zig");
 const procinfo = @import("procinfo.zig");
 const reexec = @import("reexec.zig");
+const safety = @import("anole_safety");
 
 const protocol = ui.protocol;
 const sys = ui.sys;
@@ -80,6 +81,27 @@ pub const Info = struct {
 
 pub const Metric = struct { name: []const u8, value: f64, unit: []const u8 };
 
+/// A language metric as the service keeps it: copied into fixed room, so
+/// that `setMetrics` and `/runtime` copy it under the service's spin lock
+/// without allocating (SAFETY.md L5).
+const Stored = struct {
+    name: [max_metric_name]u8 = @splat(0),
+    name_len: u8 = 0,
+    unit: [max_metric_unit]u8 = @splat(0),
+    unit_len: u8 = 0,
+    value: f64 = 0,
+};
+
+/// A language metric's name is 1 to 48 bytes (anole.h, `anole_console_report`).
+pub const max_metric_name = 48;
+pub const max_metric_unit = 16;
+pub const max_metrics = 32;
+
+/// Clients the service tracks at once: the ones attached and the ones whose
+/// thread ended and is not joined yet (`reap`). A fixed list, so that adding
+/// one under the spin lock never allocates.
+const max_tracked = 2 * protocol.max_clients + 8;
+
 pub const Options = struct {
     read_only: bool = false,
     /// The effective permission for /restart and /full-restart.
@@ -136,8 +158,13 @@ pub const Service = struct {
     stopped: bool = false,
     bye_reason: std.atomic.Value(u8) = .init(0),
 
-    lock: std.atomic.Mutex = .unlocked,
+    /// Over `clients`, the broadcast line and the language metrics; held
+    /// for bounded copies only, never across an allocation (SAFETY.md L5).
+    lock: safety.SpinLock(.leaf) = .init,
+    /// In `clients_buf` (set by `init`).
     clients: std.ArrayList(*Client) = .empty,
+    // SAFETY: only `clients.items` is read; `init` points `clients` here.
+    clients_buf: [max_tracked]*Client = undefined,
     attached: std.atomic.Value(u32) = .init(0),
     euid: u32,
 
@@ -150,9 +177,8 @@ pub const Service = struct {
     restart_state: std.atomic.Value(u8) = .init(0), // 0 idle, 1 requested, 2 ok, 3 failed
     restart_pid: std.atomic.Value(i32) = .init(0),
 
-    metrics: [32]Metric = undefined,
+    metrics: [max_metrics]Stored = @splat(.{}),
     metric_count: usize = 0,
-    metric_arena: std.heap.ArenaAllocator,
     runtime_name: []const u8,
 
     pub fn init(gpa: std.mem.Allocator, host: Host, info: Info, opts: Options, stats: *stats_mod.Stats, logs: ?*logring.LogRing, launch: ?*const reexec.LaunchInfo) !*Service {
@@ -166,15 +192,11 @@ pub const Service = struct {
             .logs = logs,
             .launch = launch,
             .euid = sys.geteuid(),
-            .metric_arena = .init(gpa),
             .runtime_name = info.runtime,
         };
+        self.clients = .initBuffer(&self.clients_buf);
         self.stop_pipe = try sys.pipe();
         return self;
-    }
-
-    fn acquire(self: *Service) void {
-        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
     }
 
     /// Binds the socket and starts accepting. Failure leaves the service
@@ -210,7 +232,7 @@ pub const Service = struct {
         self.acceptor = null;
         // Clients join themselves in `reap`; wait for all of them.
         while (true) {
-            self.acquire();
+            self.lock.lock();
             const n = self.clients.items.len;
             self.lock.unlock();
             if (n == 0) break;
@@ -218,7 +240,6 @@ pub const Service = struct {
             var p = [1]sys.PollFd{.{ .fd = -1, .events = 0, .revents = 0 }};
             _ = sys.poll(&p, 5);
         }
-        self.clients.deinit(self.gpa);
         if (self.listener >= 0) sys.close(self.listener);
         if (self.path) |p| {
             os.unlink(p);
@@ -230,35 +251,47 @@ pub const Service = struct {
 
     /// Frees the service, once nothing can reach it any more (after `stop`).
     pub fn destroy(self: *Service) void {
-        self.metric_arena.deinit();
         self.gpa.destroy(self);
     }
 
-    /// Joins and frees clients whose thread ended.
+    /// Joins and frees every client whose thread ended.
     fn reap(self: *Service) void {
-        var finished: [8]*Client = undefined;
-        var n: usize = 0;
-        self.acquire();
-        var i: usize = 0;
-        while (i < self.clients.items.len and n < finished.len) {
-            const c = self.clients.items[i];
-            if (c.done.load(.acquire)) {
-                finished[n] = c;
-                n += 1;
-                _ = self.clients.swapRemove(i);
-            } else i += 1;
-        }
-        self.lock.unlock();
-        for (finished[0..n]) |c| {
-            if (c.thread) |t| t.join();
-            c.reader.deinit(self.gpa);
-            c.out.deinit(self.gpa);
-            self.gpa.destroy(c);
+        while (true) {
+            var finished: [8]*Client = undefined;
+            var n: usize = 0;
+            self.lock.lock();
+            var i: usize = 0;
+            while (i < self.clients.items.len and n < finished.len) {
+                const c = self.clients.items[i];
+                if (c.done.load(.acquire)) {
+                    finished[n] = c;
+                    n += 1;
+                    _ = self.clients.swapRemove(i);
+                } else i += 1;
+            }
+            self.lock.unlock();
+            for (finished[0..n]) |c| {
+                if (c.thread) |t| t.join();
+                c.reader.deinit(self.gpa);
+                c.out.deinit(self.gpa);
+                self.gpa.destroy(c);
+            }
+            if (n < finished.len) return;
         }
     }
 
+    /// Tells the peer on `fd` that the console is busy, and closes it.
+    fn refuseBusy(fd: sys.fd_t) error{Busy} {
+        var buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        protocol.encode(.{ .err = .{ .code = protocol.code_busy, .message = "4 consoles are attached already" } }, &w) catch {};
+        sys.writeAll(fd, w.buffered()) catch {};
+        sys.close(fd);
+        return error.Busy;
+    }
+
     fn liveCount(self: *Service) usize {
-        self.acquire();
+        self.lock.lock();
         defer self.lock.unlock();
         var n: usize = 0;
         for (self.clients.items) |c| {
@@ -271,28 +304,28 @@ pub const Service = struct {
     /// end, or an accepted socket). The service owns `fd` from here.
     pub fn adopt(self: *Service, fd: sys.fd_t, in_process: bool) !void {
         self.reap();
-        if (self.liveCount() >= protocol.max_clients) {
-            var buf: [256]u8 = undefined;
-            var w: std.Io.Writer = .fixed(&buf);
-            protocol.encode(.{ .err = .{ .code = protocol.code_busy, .message = "4 consoles are attached already" } }, &w) catch {};
-            sys.writeAll(fd, w.buffered()) catch {};
-            sys.close(fd);
-            return error.Busy;
-        }
+        if (self.liveCount() >= protocol.max_clients) return refuseBusy(fd);
         const c = try self.gpa.create(Client);
         c.* = .{ .service = self, .fd = fd, .in_process = in_process };
         errdefer self.gpa.destroy(c);
         sys.setNonblock(fd);
-        self.acquire();
-        self.clients.append(self.gpa, c) catch {
+        if (comptime builtin.is_test) if (test_before_append) |hook| {
+            test_before_append = null;
+            hook(self);
+        };
+        self.lock.lock();
+        self.clients.appendBounded(c) catch {
+            // Unreachable in practice (reap empties, live < max_clients < max_tracked); the fd is closed.
+            // Clients whose thread ended faster than `reap` could join
+            // them fill the list (U4): this one is told busy.
             self.lock.unlock();
-            return error.OutOfMemory;
+            return refuseBusy(fd);
         };
         self.lock.unlock();
         _ = self.attached.fetchAdd(1, .monotonic);
         c.thread = std.Thread.spawn(.{}, clientMain, .{c}) catch {
             _ = self.attached.fetchSub(1, .monotonic);
-            self.acquire();
+            self.lock.lock();
             for (self.clients.items, 0..) |x, i| if (x == c) {
                 _ = self.clients.swapRemove(i);
                 break;
@@ -301,6 +334,28 @@ pub const Service = struct {
             sys.close(fd);
             return error.SystemResources;
         };
+    }
+
+    /// Tests: runs once in `adopt`, after its count of live clients and
+    /// before the new one is added, where clients whose thread ended can
+    /// fill the list before `reap` joins them. Test builds only.
+    pub var test_before_append: if (builtin.is_test) ?*const fn (*Service) void else void = if (builtin.is_test) null else {};
+
+    /// Tests: fills the list with clients whose thread has ended and that
+    /// `reap` has not joined yet (no thread, no socket). Test builds only.
+    pub fn testFillFinished(self: *Service) void {
+        comptime std.debug.assert(builtin.is_test);
+        while (true) {
+            const c = self.gpa.create(Client) catch @panic("OOM");
+            c.* = .{ .service = self, .fd = -1, .done = .init(true) };
+            self.lock.lock();
+            const added = if (self.clients.appendBounded(c)) |_| true else |_| false;
+            self.lock.unlock();
+            if (!added) {
+                self.gpa.destroy(c);
+                return;
+            }
+        }
     }
 
     // ---------------------------------------------------------- acceptor
@@ -395,11 +450,12 @@ pub const Service = struct {
             }
             const seq = self.broadcast_seq.load(.acquire);
             if (seq != last_broadcast) {
-                self.acquire();
-                const text = self.gpa.dupe(u8, self.broadcast_buf[0..self.broadcast_len]) catch "";
+                var line: [@sizeOf(@TypeOf(self.broadcast_buf))]u8 = undefined;
+                self.lock.lock();
+                const len = self.broadcast_len;
+                @memcpy(line[0..len], self.broadcast_buf[0..len]);
                 self.lock.unlock();
-                defer if (text.len > 0) self.gpa.free(text);
-                try c.out.appendSlice(self.gpa, text);
+                try c.out.appendSlice(self.gpa, line[0..len]);
                 last_broadcast = seq;
             }
             try pump(c);
@@ -631,7 +687,7 @@ pub const Service = struct {
 
     /// Queues a line for every client; returns its sequence.
     pub fn broadcastLine(self: *Service, line: []const u8) u32 {
-        self.acquire();
+        self.lock.lock();
         const n = @min(line.len, self.broadcast_buf.len);
         @memcpy(self.broadcast_buf[0..n], line[0..n]);
         self.broadcast_len = n;
@@ -645,7 +701,7 @@ pub const Service = struct {
         const deadline = sys.monotonicMs() + timeout_ms;
         while (sys.monotonicMs() < deadline) {
             var all = true;
-            self.acquire();
+            self.lock.lock();
             for (self.clients.items) |c| {
                 if (c.done.load(.acquire)) continue;
                 if (c.seen_broadcast.load(.acquire) != seq) all = false;
@@ -972,13 +1028,19 @@ pub const Service = struct {
                 try root.put(a, "anole", .{ .string = self.info.anole });
                 try root.put(a, "runtime", .{ .string = self.runtime_name });
                 var lang: std.json.Array = .init(a);
-                self.acquire();
-                defer self.lock.unlock();
-                for (self.metrics[0..self.metric_count]) |m| {
+                // Copied under the lock, turned into JSON after it.
+                var kept: [max_metrics]Stored = undefined;
+                const n = n: {
+                    self.lock.lock();
+                    defer self.lock.unlock();
+                    @memcpy(kept[0..self.metric_count], self.metrics[0..self.metric_count]);
+                    break :n self.metric_count;
+                };
+                for (kept[0..n]) |*m| {
                     var o: std.json.ObjectMap = .empty;
-                    try o.put(a, "name", .{ .string = try a.dupe(u8, m.name) });
+                    try o.put(a, "name", .{ .string = try a.dupe(u8, m.name[0..m.name_len]) });
                     try o.put(a, "value", .{ .float = m.value });
-                    try o.put(a, "unit", .{ .string = try a.dupe(u8, m.unit) });
+                    try o.put(a, "unit", .{ .string = try a.dupe(u8, m.unit[0..m.unit_len]) });
                     try lang.append(.{ .object = o });
                 }
                 try root.put(a, "language", .{ .array = lang });
@@ -988,14 +1050,22 @@ pub const Service = struct {
     }
 
     /// The C ABI's `anole_console_report`: replaces the language metrics.
+    /// At most `max_metrics` (`error.TooMany`); a name is 1 to
+    /// `max_metric_name` bytes and a unit at most `max_metric_unit`
+    /// (`error.Invalid`). Copied under the service's lock, with nothing
+    /// allocated.
     pub fn setMetrics(self: *Service, items: []const Metric) !void {
-        if (items.len > self.metrics.len) return error.TooMany;
-        self.acquire();
+        // The C ABI validates first (capi/lib.zig), so error.Invalid never reaches its `else` arm.
+        if (items.len > max_metrics) return error.TooMany;
+        for (items) |m| {
+            if (m.name.len == 0 or m.name.len > max_metric_name or m.unit.len > max_metric_unit) return error.Invalid;
+        }
+        self.lock.lock();
         defer self.lock.unlock();
-        _ = self.metric_arena.reset(.retain_capacity);
-        const ma = self.metric_arena.allocator();
-        for (items, 0..) |m, i| {
-            self.metrics[i] = .{ .name = try ma.dupe(u8, m.name), .value = m.value, .unit = try ma.dupe(u8, m.unit) };
+        for (items, self.metrics[0..items.len]) |m, *d| {
+            d.* = .{ .name_len = @intCast(m.name.len), .unit_len = @intCast(m.unit.len), .value = m.value };
+            @memcpy(d.name[0..m.name.len], m.name);
+            @memcpy(d.unit[0..m.unit.len], m.unit);
         }
         self.metric_count = items.len;
     }

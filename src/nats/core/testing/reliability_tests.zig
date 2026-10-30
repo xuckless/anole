@@ -399,6 +399,37 @@ test "with retry_initial_connect, close() stops the attempts at once" {
     }.one, test_wait.short_window);
 }
 
+/// Takes the connection and says nothing, not even INFO, until the test
+/// releases it.
+fn sessionSilentUntilReleased(peer: *FakeServer.Peer, record: *Record) anyerror!void {
+    try record.release.wait(peer.io);
+}
+
+fn acceptedOne(r: *Record) bool {
+    return r.accepted.load(.monotonic) == 1;
+}
+
+test "close() during a connection attempt stops the attempt and closes the client" {
+    const io = testing.io;
+    var listener = try FakeServer.listen(io);
+    defer listener.deinit(io);
+    var record: Record = .{};
+    defer record.deinit();
+    const sessions = [_]Session{sessionSilentUntilReleased};
+    var server = try io.concurrent(serveSessions, .{ io, &listener, &sessions, &record });
+    defer server.cancel(io) catch {};
+    defer record.release.set(io);
+    var url: [64]u8 = undefined;
+    var client: Client = try .init(testing.allocator, io, .{ .servers = &.{try FakeServer.url(&listener, &url)}, .retry_initial_connect = true });
+    defer client.deinit();
+    try client.connect();
+    // The attempt is connected and waits for the server's INFO.
+    try awaitAccepted(&record, 1);
+    client.close();
+    try testing.expectEqual(.closed, client.state());
+    try test_wait.expectStays(io, "no connection attempt after close()", &record, acceptedOne, test_wait.short_window);
+}
+
 /// Hangs up as soon as the client subscribed to `sub`.
 fn sessionHangUpAfterSub(peer: *FakeServer.Peer, record: *Record) anyerror!void {
     try handshake(peer, golden.info_default);
@@ -2756,4 +2787,51 @@ test "a requestMany past its deadline that nobody reads does not hold up a drain
     try testing.expectEqual(0, client.stats().pending_requests);
     try client.drain(.{ .timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } } });
     try testing.expectEqual(.drained, client.close_reason.?);
+}
+
+/// Takes connections one at a time and says nothing on them, each until the
+/// client hangs up, until canceled.
+fn serveSilently(io: Io, listener: *net.Server, record: *Record) anyerror!void {
+    while (true) {
+        var peer: FakeServer.Peer = undefined;
+        try peer.accept(io, listener);
+        defer peer.close();
+        _ = record.accepted.fetchAdd(1, .monotonic);
+        while (true) {
+            const line = peer.nextLine() catch |err| {
+                if (peer.canceled(err)) return error.Canceled;
+                break;
+            };
+            if (line == null) break;
+        }
+    }
+}
+
+test "nats: [stress] close() racing connection attempts always closes the client, and nothing leaks" {
+    try test_wait.requireStress();
+    const io = testing.io;
+    var listener = try FakeServer.listen(io);
+    defer listener.deinit(io);
+    var record: Record = .{};
+    defer record.deinit();
+    var server = try io.concurrent(serveSilently, .{ io, &listener, &record });
+    defer server.cancel(io) catch {};
+    var url: [64]u8 = undefined;
+    const servers: []const []const u8 = &.{try FakeServer.url(&listener, &url)};
+    const seed: u64 = 0x5eed_0136;
+    var prng: std.Random.DefaultPrng = .init(seed);
+    for (0..500) |round| {
+        var client: Client = try .init(testing.allocator, io, .{ .servers = servers, .retry_initial_connect = true });
+        defer client.deinit();
+        const before = record.accepted.load(.monotonic);
+        try client.connect();
+        // Before the dial ends, or once the server has the connection and
+        // the attempt waits for INFO.
+        if (prng.random().boolean()) try awaitAccepted(&record, before + 1);
+        client.close();
+        if (client.state() != .closed) {
+            std.debug.print("nats close stress: seed 0x{x}, round {d}\n", .{ seed, round });
+            return error.TestNotClosed;
+        }
+    }
 }

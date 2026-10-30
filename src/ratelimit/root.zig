@@ -14,6 +14,7 @@
 //! LRU list so a full table costs O(1) per new key.
 const std = @import("std");
 const dusty = @import("dusty");
+const safety = @import("anole_safety");
 const declarations = @import("../openapi/declarations.zig");
 const features = @import("build_options");
 const redis = if (features.redis) @import("../redis/root.zig") else struct {};
@@ -111,7 +112,9 @@ fn step(tokens: *f64, last_ms: *i64, now_ms: i64, cost: u32, policy: Policy) Res
 pub const MemoryLimiter = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    mutex: std.Io.Mutex = .init,
+    /// One process-wide lock over the buckets (a leaf), held for a lookup
+    /// and its arithmetic.
+    mutex: safety.Mutex(.leaf) = .init,
     buckets: std.StringHashMapUnmanaged(*Bucket) = .empty,
     /// Most recently used first.
     lru: std.DoublyLinkedList = .{},

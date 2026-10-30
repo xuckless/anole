@@ -8,6 +8,7 @@
 const std = @import("std");
 const dusty = @import("dusty");
 const ui = @import("anole_console_ui");
+const safety = @import("anole_safety");
 const observe_common = @import("../observe/common.zig");
 
 pub const bucket_count = ui.protocol.bucket_count;
@@ -84,7 +85,8 @@ fn copyCut(dst: []u8, src: []const u8) u8 {
 
 /// The recent 5xx answers: a ring under a spin lock held for the copy only.
 pub const ErrorRing = struct {
-    lock: std.atomic.Mutex = .unlocked,
+    /// Over the fields below; held for a bounded struct copy only.
+    lock: safety.SpinLock(.leaf) = .init,
     entries: []ErrorEntry,
     /// Entries ever pushed.
     seq: u64 = 0,
@@ -97,12 +99,8 @@ pub const ErrorRing = struct {
         gpa.free(self.entries);
     }
 
-    fn acquire(self: *ErrorRing) void {
-        while (!self.lock.tryLock()) std.atomic.spinLoopHint();
-    }
-
     pub fn push(self: *ErrorRing, e: ErrorEntry) void {
-        self.acquire();
+        self.lock.lock();
         defer self.lock.unlock();
         self.seq += 1;
         var x = e;
@@ -112,7 +110,7 @@ pub const ErrorRing = struct {
 
     /// Copies up to `out.len` newest entries, newest last; returns how many.
     pub fn copyRecent(self: *ErrorRing, out: []ErrorEntry) usize {
-        self.acquire();
+        self.lock.lock();
         defer self.lock.unlock();
         const have: usize = @intCast(@min(self.seq, self.entries.len));
         const n = @min(have, out.len);
@@ -126,7 +124,7 @@ pub const ErrorRing = struct {
 
     /// Entries with seq > `after`, oldest first, up to `out.len`.
     pub fn copyAfter(self: *ErrorRing, after: u64, out: []ErrorEntry) usize {
-        self.acquire();
+        self.lock.lock();
         defer self.lock.unlock();
         const oldest: u64 = if (self.seq > self.entries.len) self.seq - self.entries.len else 0;
         var s = @max(after, oldest) + 1;
@@ -139,7 +137,7 @@ pub const ErrorRing = struct {
     }
 
     pub fn current(self: *ErrorRing) u64 {
-        self.acquire();
+        self.lock.lock();
         defer self.lock.unlock();
         return self.seq;
     }
@@ -151,8 +149,9 @@ pub const Stats = struct {
     /// Slots per executor: no route (0), routes 1..max_routes, other routes.
     route_slots: u32,
     max_routes: u32,
+    /// Published once by `ensureTables` (compare and swap), freed only by
+    /// `deinit` (process-wide).
     tables: std.atomic.Value(?[*]Counters) = .init(null),
-    alloc_lock: std.atomic.Mutex = .unlocked,
     errors: ErrorRing,
 
     pub fn init(gpa: std.mem.Allocator, executors: u32, max_routes: u32, errors_kept: u32) !Stats {
@@ -174,15 +173,14 @@ pub const Stats = struct {
         return @as(usize, self.executors + 1) * self.route_slots;
     }
 
-    /// Allocates the counters on first use (the first `stats` subscription).
+    /// Allocates the counters on first use (the first `stats` subscription):
+    /// a table made with no lock held is published by compare and swap, and
+    /// the thread that loses the race frees its own.
     pub fn ensureTables(self: *Stats) !void {
-        if (self.tables.load(.acquire) != null) return;
-        while (!self.alloc_lock.tryLock()) std.atomic.spinLoopHint();
-        defer self.alloc_lock.unlock();
         if (self.tables.load(.acquire) != null) return;
         const t = try self.gpa.alloc(Counters, self.tableLen());
         for (t) |*c| c.* = .{};
-        self.tables.store(t.ptr, .release);
+        if (self.tables.cmpxchgStrong(null, t.ptr, .acq_rel, .acquire) != null) self.gpa.free(t);
     }
 
     /// The slot index of a route for counting: 0 no route, past

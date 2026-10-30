@@ -26,6 +26,7 @@
 //! The method table is the generated service type the server side uses;
 //! its handlers are not called here, only its names and message types.
 const std = @import("std");
+const builtin = @import("builtin");
 const h2 = @import("anole_h2_client");
 const frame = @import("frame.zig");
 const status_mod = @import("status.zig");
@@ -33,6 +34,7 @@ const deadline = @import("deadline.zig");
 const Compression = @import("compression.zig").Compression;
 const server = @import("server.zig");
 const resilience = @import("resilience_core");
+const safety = @import("anole_safety");
 const features = @import("build_options");
 const wire = @import("wire.zig");
 const alt_svc = @import("../h3/alt_svc.zig");
@@ -133,7 +135,13 @@ pub const Channel = struct {
         options: h2.ConnectOptions,
         http: Http,
         http3: Http3,
-        mutex: std.Io.Mutex = .init,
+        /// Guards the fields below; never held across a dial (SAFETY.md L2).
+        mutex: safety.Mutex(.leaf) = .init,
+        /// `activeH2`/`activeH3` are dialing (single flight: a channel uses
+        /// one of them; `.auto`'s HTTP/3 dial is `h3_dialing`, which never
+        /// makes a call wait). Calls that need the dial wait on `dialed`.
+        redialing: bool = false,
+        dialed: safety.Condition = .init,
         /// Connections replaced by a redial: they may still carry calls,
         /// so they close with the channel.
         retired: std.ArrayList(*h2.ClientConnection) = .empty,
@@ -275,32 +283,68 @@ pub const Channel = struct {
     }
 
     /// The HTTP/2 connection of an owned channel: a fresh one when the
-    /// current has gone.
+    /// current has gone. One dial at a time, with no lock held across it
+    /// (SAFETY.md L2): the calls that find it running wait for it, then
+    /// look again; a failed dial fails only its own call. `isOpen` takes
+    /// the connection's own lock, so it is asked with the channel's let go.
     fn activeH2(self: *Channel) !*h2.ClientConnection {
         const owned = self._owned orelse return self.conn.?;
-        if (self.conn) |c| if (c.isOpen()) return c;
         const io_ = self.runtime();
+        while (true) {
+            const current = self.conn;
+            if (current) |c| if (c.isOpen()) return c;
+            owned.mutex.lockUncancelable(io_);
+            defer owned.mutex.unlock(io_);
+            // Another call is dialing, or has dialed since `current` was
+            // read: look again once it is done.
+            if (owned.redialing) {
+                owned.dialed.waitUncancelable(io_, &owned.mutex);
+                continue;
+            }
+            // The defer unlocks on `continue` and `break` alike; `self.conn`'s plain reads are D2's race.
+            if (self.conn != current) continue;
+            owned.redialing = true;
+            break;
+        }
+        const dial = h2.ClientConnection.connect(owned.gpa, io_, owned.options);
         owned.mutex.lockUncancelable(io_);
         defer owned.mutex.unlock(io_);
-        // Another call may have redialed while this one waited.
-        if (self.conn) |c| if (c.isOpen()) return c;
-        const fresh = try h2.ClientConnection.connect(owned.gpa, io_, owned.options);
+        // Waiters are woken under the lock before `try dial`: a failed dial lets each dial in turn.
+        owned.redialing = false;
+        owned.dialed.broadcast(io_);
+        const fresh = try dial;
         errdefer fresh.close();
         if (self.conn) |old| try owned.retired.append(owned.gpa, old);
         self.conn = fresh;
         return fresh;
     }
 
-    /// The HTTP/3 connection of a `.h3` channel, redialed when it has gone.
+    /// The HTTP/3 connection of a `.h3` channel, redialed when it has gone,
+    /// as `activeH2` does.
     fn activeH3(self: *Channel) !*H3Connection {
         if (comptime !features.http3) unreachable;
         const owned = self._owned.?;
-        if (self.h3) |c| if (c.isOpen()) return c;
         const io_ = self.runtime();
+        while (true) {
+            const current = self.h3;
+            if (current) |c| if (c.isOpen()) return c;
+            owned.mutex.lockUncancelable(io_);
+            defer owned.mutex.unlock(io_);
+            if (owned.redialing) {
+                owned.dialed.waitUncancelable(io_, &owned.mutex);
+                continue;
+            }
+            if (self.h3 != current) continue;
+            owned.redialing = true;
+            break;
+        }
+        const dial = dialH3(owned, io_, owned.h3_port);
         owned.mutex.lockUncancelable(io_);
         defer owned.mutex.unlock(io_);
-        if (self.h3) |c| if (c.isOpen()) return c;
-        const fresh = try dialH3(owned, io_, owned.h3_port);
+        // Waiters are woken under the lock before `try dial`: a failed dial lets each dial in turn.
+        owned.redialing = false;
+        owned.dialed.broadcast(io_);
+        const fresh = try dial;
         errdefer fresh.close();
         owned.h3_dials += 1;
         if (self.h3) |old| try owned.retired3.append(owned.gpa, old);
@@ -314,11 +358,18 @@ pub const Channel = struct {
     fn autoH3(self: *Channel) !?*H3Connection {
         const owned = self._owned.?;
         const io_ = self.runtime();
-        owned.mutex.lockUncancelable(io_);
-        if (self.h3) |c| if (c.isOpen()) {
+        // `isOpen` takes the connection's own lock: asked with the
+        // channel's let go. Another call dialed meanwhile: its connection is
+        // the one to use, once it is seen open (it may have gone too).
+        while (true) {
+            const current = self.h3;
+            if (current) |c| if (c.isOpen()) return c;
+            testAutoH3BeforeLock(self);
+            owned.mutex.lockUncancelable(io_);
+            if (self.h3 == current) break;
             owned.mutex.unlock(io_);
-            return c;
-        };
+        }
+        // Held from here: the connection is the one found gone, or none.
         const now = std.Io.Clock.Timestamp.now(io_, .awake);
         const port: u16 = blk: {
             if (owned.alt) |a| if (now.compare(.lt, a.until)) break :blk a.port;
@@ -352,6 +403,18 @@ pub const Channel = struct {
         };
         self.h3 = fresh;
         return fresh;
+    }
+
+    /// Tests: runs once in `autoH3`, after it found the HTTP/3 connection
+    /// it read gone and before it takes the channel's lock, where another
+    /// call's dial can come in between. Test builds only.
+    pub var test_auto_h3_before_lock: if (builtin.is_test) ?*const fn (*Channel) void else void = if (builtin.is_test) null else {};
+
+    fn testAutoH3BeforeLock(self: *Channel) void {
+        if (comptime !builtin.is_test) return;
+        const hook = test_auto_h3_before_lock orelse return;
+        test_auto_h3_before_lock = null;
+        hook(self);
     }
 
     /// The Alt-Svc of a response on an `.auto` channel.

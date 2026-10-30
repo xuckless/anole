@@ -250,6 +250,32 @@ breaking changes are listed anyway.
 - C ABI: a consumer thread calling `anole_kafka_produce` without pause kept
   the produce pump running on its executor, so the engine stop posted there
   waited; the pump now lets the executor's other tasks run every 64 records.
+- Tracing: `Exporter.flush` keeps its caller's cancel (it swallowed it,
+  which delayed a Lambda shutdown to the next cancellation point), several
+  tasks may flush at once (each waits for the spans queued when it called),
+  and a flush that a `close` overtakes returns at once. Spans still queued
+  at `close` count as dropped.
+- gRPC: a channel that redials no longer holds its lock while it dials, so
+  calls on other executors that need nothing of the dial no longer wait
+  behind a TCP and TLS handshake; calls that find a dial running still wait
+  for it, and only one dial runs at a time.
+- NATS: `close()` no longer holds the client's lock while it shuts a
+  connection attempt's socket down; publishes on other executors no longer
+  wait behind it.
+- Console: the log rings, the stats tables, the snapshot answers and the
+  client list no longer allocate while a spin lock is held, which made log
+  calls on every executor spin behind a console thread's allocation.
+  `anole_console_report` keeps its metrics in fixed room (a name of 1 to 48
+  bytes, a unit of at most 16).
+- Metrics: a scrape renders each metric under that metric's lock only, and
+  writes to the caller's writer with no lock held. A scrape held the
+  registry's lock while it waited for each metric's, and wrote to the
+  response under it.
+- Resilience: breaker state reaches the metrics with no lock of the
+  breakers held; a breaker made or observed reported its state under its
+  shard's lock, which took the metrics' locks under it. A breaker whose
+  state changes between that look and its report is reported again, so
+  `anole_breaker_state` ends on its state.
 - Lambda: a buffered answer whose body the handler streamed (`res.stream`)
   was encoded from a part list that pointed into a returned function's
   stack, so the answer could carry garbage or crash; it now lives in the
