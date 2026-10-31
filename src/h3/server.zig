@@ -122,8 +122,12 @@ pub const Options = struct {
     /// Requests a client may have open at once on a connection. A request
     /// counts until its stream has ended and its handler has returned, so
     /// requests the client resets do not free room while their handlers
-    /// still run.
-    max_streams_bidi: u64 = 100,
+    /// still run. 256 lets a client keep 64 requests in flight with
+    /// room for the streams whose answers wait for its ACK: a stream's
+    /// credit comes back only once its FIN is acknowledged, so a window as
+    /// large as the client's concurrency stalls it for an ACK each round
+    /// (ngtcp2-based servers use 1024 to 65535).
+    max_streams_bidi: u64 = 256,
     /// Connection and per-stream receive windows.
     max_data: u64 = 16 << 20,
     max_stream_data: u64 = 1 << 20,
@@ -4091,4 +4095,10 @@ test "0-RTT context: the same for the same settings, different when a limit or a
     with_webtransport.webtransport = true;
     try std.testing.expect(!std.mem.eql(u8, try Ctx.of(base, &a), try Ctx.of(with_webtransport, &b)));
     try std.testing.expectEqual(@as(u8, early_context_version), (try Ctx.of(base, &a))[0]);
+}
+
+test "transport parameters: 256 concurrent requests per connection by default" {
+    const base: Options = .{ .address = .{ .ip4 = .loopback(0) }, .cert_pem = "", .key_pem = "" };
+    const params = transportParams(&base);
+    try std.testing.expectEqual(@as(u64, 256), params.initial_max_streams_bidi);
 }

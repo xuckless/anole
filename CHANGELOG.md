@@ -13,6 +13,15 @@ breaking changes are listed anyway.
   (whether the kernel steers datagrams by connection ID). The server logs
   an info line when steering is attached (#100).
 
+### Changed
+
+- HTTP/3 lets a client open 256 requests at once per connection, up from
+  100 (`http3.max_streams_bidi`). A stream's credit comes back only once
+  the client has acknowledged its end, so at 64 requests in flight the old
+  window could stall a client for an ACK each round. Session tickets from
+  0.4.x resume without 0-RTT once, since the limit is part of their
+  context (#100).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed

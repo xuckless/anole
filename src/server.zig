@@ -560,7 +560,7 @@ pub const Options = struct {
         /// browsers switch to it.
         alt_svc: bool = true,
         /// Concurrent requests per connection.
-        max_streams_bidi: u64 = 100,
+        max_streams_bidi: u64 = 256,
         /// Make every new client prove its address with a Retry first (one
         /// more round trip; resists spoofed-source floods).
         validate_address: bool = false,

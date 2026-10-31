@@ -613,7 +613,7 @@ pub const Config = struct {
         /// The UDP address and port; null: the TLS listener's.
         address: ?[]const u8 = null,
         port: ?u16 = null,
-        max_streams_bidi: u64 = 100,
+        max_streams_bidi: u64 = 256,
         /// Make every new client prove its address with a Retry first.
         validate_address: bool = false,
         idle_timeout_ms: u32 = 30_000,
