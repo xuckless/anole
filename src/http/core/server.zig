@@ -895,10 +895,17 @@ pub const test_linger_timeout_ms = if (builtin.is_test) struct {
     pub var ms: std.atomic.Value(u32) = .init(0);
 } else struct {};
 
-/// Tests only: runs where an accept loop logs that it is at the connection
-/// cap, under the same cancel protection, just before its wait for a slot.
-/// Absent outside test builds.
-pub var test_at_cap_log: if (builtin.is_test) ?*const fn (std.Io) void else void = if (builtin.is_test) null else {};
+/// Tests only: runs where an accept loop writes a log line, under the same
+/// cancel protection, just before the wait that follows it. Absent outside
+/// test builds.
+pub var test_accept_log: if (builtin.is_test) ?*const fn (std.Io) void else void = if (builtin.is_test) null else {};
+
+/// Tests only: while set, the accept loop's next spawn of a connection
+/// handler fails as if no task could be had, and clears it. Absent outside
+/// test builds.
+pub const test_fail_spawn = if (builtin.is_test) struct {
+    pub var once: std.atomic.Value(bool) = .init(false);
+} else struct {};
 
 fn lingerTimeout() std.Io.Duration {
     if (builtin.is_test) {
@@ -1996,14 +2003,7 @@ pub fn Server(comptime Ctx: type) type {
                     error.Unexpected,
                     => {
                         backoff_ms = if (backoff_ms == 0) min_accept_backoff_ms else @min(backoff_ms * 2, max_accept_backoff_ms);
-                        {
-                            // Logging allocates, which can swallow a cancel
-                            // (see `placement.concurrent`): it must reach the
-                            // sleep below.
-                            const protection = self.io.swapCancelProtection(.blocked);
-                            defer _ = self.io.swapCancelProtection(protection);
-                            log.warn("Accept failed: {}; retrying in {d}ms", .{ err, backoff_ms });
-                        }
+                        self.logProtected(.warn, "Accept failed: {}; retrying in {d}ms", .{ err, backoff_ms });
                         // A cancel is taken here, not deferred to the accept
                         // above with `recancel`. That accept keeps failing
                         // for its own reason -- the fd table is full, which
@@ -2032,8 +2032,12 @@ pub fn Server(comptime Ctx: type) type {
                 };
                 _ = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
                 // On the executor that accepted it, for its whole life.
-                placement.concurrent(connections, self.io, .local, handleConnectionWrapper, .{ self, l, stream }) catch |err| {
-                    log.err("Failed to spawn connection handler: {}", .{err});
+                const spawned: std.Io.ConcurrentError!void = if (builtin.is_test and test_fail_spawn.once.swap(false, .acq_rel))
+                    error.ConcurrencyUnavailable
+                else
+                    placement.concurrent(connections, self.io, .local, handleConnectionWrapper, .{ self, l, stream });
+                spawned catch |err| {
+                    self.logProtected(.err, "Failed to spawn connection handler: {}", .{err});
                     self.finishRequest();
                     self.releaseListenerSlot(l);
                     self.releaseConnectionSlot();
@@ -2132,24 +2136,30 @@ pub fn Server(comptime Ctx: type) type {
             while (true) {
                 const active = self.active_connections.load(.acquire);
                 if (active < max) return;
-                self.logAtCap(max);
+                self.logProtected(.debug, "At the {d} connection cap; waiting for a slot", .{max});
                 try self.io.futexWait(u32, &self.active_connections.raw, active);
             }
         }
 
-        /// Says the accept loop waits for a slot. Logging can wait on a
-        /// cancelable lock (a Debug allocator's stack trace takes
-        /// `std.debug.SelfInfo`'s module mutex through `std.Options.debug_io`)
-        /// and drop its `error.Canceled`; under std.Io.Threaded that
-        /// acknowledges the cancel pending on this task, and the loop's next
-        /// accept then blocks for good under a stop (#158). Blocked here, the
-        /// cancel stays pending for the wait that follows, as in
+        /// A log line of the accept loop, every one of which comes just
+        /// before a cancelable wait. Logging can wait on a cancelable lock (a
+        /// Debug allocator's stack trace takes `std.debug.SelfInfo`'s module
+        /// mutex through `std.Options.debug_io`) and drop its
+        /// `error.Canceled`; under std.Io.Threaded that acknowledges the
+        /// cancel pending on this task, and the loop's next accept then
+        /// blocks for good under a stop (#158). Blocked here, the cancel
+        /// stays pending for the wait that follows, as in
         /// `placement.concurrent`.
-        fn logAtCap(self: *Self, max: u32) void {
+        fn logProtected(self: *Self, comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
             const protection = self.io.swapCancelProtection(.blocked);
             defer _ = self.io.swapCancelProtection(protection);
-            log.debug("At the {d} connection cap; waiting for a slot", .{max});
-            if (builtin.is_test) if (test_at_cap_log) |hook| hook(self.io);
+            switch (level) {
+                .err => log.err(format, args),
+                .warn => log.warn(format, args),
+                .info => log.info(format, args),
+                .debug => log.debug(format, args),
+            }
+            if (builtin.is_test) if (test_accept_log) |hook| hook(self.io);
         }
 
         /// Takes the slot for a connection just accepted. The check above is
@@ -2166,7 +2176,7 @@ pub fn Server(comptime Ctx: type) type {
             var active = self.active_connections.load(.acquire);
             while (true) {
                 if (active >= max) {
-                    self.logAtCap(max);
+                    self.logProtected(.debug, "At the {d} connection cap; waiting for a slot", .{max});
                     try self.io.futexWait(u32, &self.active_connections.raw, active);
                     active = self.active_connections.load(.acquire);
                     continue;

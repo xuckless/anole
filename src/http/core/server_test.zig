@@ -3128,12 +3128,12 @@ test "Server: max_connections caps overlap without dropping anyone" {
     try std.testing.expectEqual(@as(u32, cap), ctx.peak.load(.acquire));
 }
 
-/// `test_at_cap_log` for the test below: the first time the accept loop
-/// logs at the cap, a cancelable wait, as a Debug allocator's stack trace
-/// can do in that log line, which then drops the `error.Canceled` (#158).
+/// `test_accept_log` for the tests below: the first time the accept loop
+/// logs, a cancelable wait, as a Debug allocator's stack trace can do in
+/// that log line, which then drops the `error.Canceled` (#158).
 /// The hook notes a cancel that reached it and re-arms it, so a failing
 /// run still stops.
-const CapLogSwallow = struct {
+const AcceptLogSwallow = struct {
     var at_log: std.atomic.Value(bool) = .init(false);
     var swallowed: std.atomic.Value(bool) = .init(false);
     var gate: std.Io.Event = .unset;
@@ -3155,11 +3155,11 @@ test "Server: a stop that reaches the accept loop while it logs at the connectio
     const io = std.testing.io;
     const S = dusty.Server(ConcurrencyCtx);
     const server_mod = @import("server.zig");
-    CapLogSwallow.at_log.store(false, .monotonic);
-    CapLogSwallow.swallowed.store(false, .monotonic);
-    CapLogSwallow.gate = .unset;
-    server_mod.test_at_cap_log = CapLogSwallow.hook;
-    defer server_mod.test_at_cap_log = null;
+    AcceptLogSwallow.at_log.store(false, .monotonic);
+    AcceptLogSwallow.swallowed.store(false, .monotonic);
+    AcceptLogSwallow.gate = .unset;
+    server_mod.test_accept_log = AcceptLogSwallow.hook;
+    defer server_mod.test_accept_log = null;
 
     var ctx: ConcurrencyCtx = .{};
     var server = S.init(std.testing.allocator, io, .{ .listeners = loopback, .max_connections = 1 }, &ctx);
@@ -3193,15 +3193,66 @@ test "Server: a stop that reaches the accept loop while it logs at the connectio
     // for a slot, and the hook holds it in that log line.
     var client = try io.concurrent(Run.get, .{ &server, io });
     defer client.cancel(io) catch {};
-    try wait.waitFlag(io, "the accept loop logs at the cap", &CapLogSwallow.at_log);
+    try wait.waitFlag(io, "the accept loop logs at the cap", &AcceptLogSwallow.at_log);
 
     // Stop the server there: the cancel must stay pending through the log
     // line for the wait after it, or the loop's next accept never ends.
     var stopper = try io.concurrent(Run.stop, .{ &server_future, io });
     defer stopper.await(io);
     defer ctx.release.set(io);
-    defer CapLogSwallow.gate.set(io);
-    try wait.expectStays(io, "the log line leaves the stop pending", &CapLogSwallow.swallowed, CapLogSwallow.kept, wait.short_window);
+    defer AcceptLogSwallow.gate.set(io);
+    try wait.expectStays(io, "the log line leaves the stop pending", &AcceptLogSwallow.swallowed, AcceptLogSwallow.kept, wait.short_window);
+}
+
+test "Server: a stop that reaches the accept loop while it logs a failed spawn still ends it" {
+    const io = std.testing.io;
+    const S = dusty.Server(ConcurrencyCtx);
+    const server_mod = @import("server.zig");
+    AcceptLogSwallow.at_log.store(false, .monotonic);
+    AcceptLogSwallow.swallowed.store(false, .monotonic);
+    AcceptLogSwallow.gate = .unset;
+    server_mod.test_accept_log = AcceptLogSwallow.hook;
+    defer server_mod.test_accept_log = null;
+    server_mod.test_fail_spawn.once.store(true, .release);
+    defer server_mod.test_fail_spawn.once.store(false, .release);
+
+    var ctx: ConcurrencyCtx = .{};
+    var server = S.init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
+    defer server.deinit();
+    server.router.get("/", ConcurrencyCtx.handle);
+
+    const Run = struct {
+        fn run(s: *S) anyerror!void {
+            try s.run();
+        }
+        fn stop(f: *std.Io.Future(anyerror!void), _io: std.Io) void {
+            f.cancel(_io) catch {};
+        }
+        /// Connects and reads until the server, which could not spawn a
+        /// handler for it, closes the connection.
+        fn connect(s: *S, _io: std.Io) !void {
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+            var read_buf: [64]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+            _ = reader.interface.discardRemaining() catch {};
+        }
+    };
+    var server_future: std.Io.Future(anyerror!void) = try io.concurrent(Run.run, .{&server});
+    try server.waitReady(io);
+
+    // The spawn for this connection fails: the accept loop logs it, and the
+    // hook holds it in that log line.
+    var client = try io.concurrent(Run.connect, .{ &server, io });
+    defer client.cancel(io) catch {};
+    try wait.waitFlag(io, "the accept loop logs the failed spawn", &AcceptLogSwallow.at_log);
+
+    // Stop the server there: the cancel must stay pending through the log
+    // line for the accept after it, or that accept never ends.
+    var stopper = try io.concurrent(Run.stop, .{ &server_future, io });
+    defer stopper.await(io);
+    defer AcceptLogSwallow.gate.set(io);
+    try wait.expectStays(io, "the log line leaves the stop pending", &AcceptLogSwallow.swallowed, AcceptLogSwallow.kept, wait.short_window);
 }
 
 test "Server: a slot freed on one listener reaches a connection waiting on another" {

@@ -24,9 +24,10 @@ breaking changes are listed anyway.
   window, and a connection (the shared one of `h2c_hosts`, say) stopped
   receiving response bodies after 16 MiB of them, failing every request on
   it with `Timeout`.
-- A stop that reaches an accept loop while it logs that it waits for a
-  connection slot (`max_connections`) no longer leaves the loop blocked in
-  its next accept under `std.Io.Threaded`.
+- A stop that reaches an accept loop while it logs (that it waits for a
+  connection slot under `max_connections`, or that it could not start a
+  connection's handler) no longer leaves the loop blocked in its next accept
+  under `std.Io.Threaded`.
 
 ## 0.4.1 (2026-10-30)
 
