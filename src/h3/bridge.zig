@@ -617,10 +617,13 @@ pub const send_floor: usize = 64 * 1024;
 /// credit allows (the less of the two), at least `send_floor`; at most
 /// three quarters of the connection's budget, so the connection's other
 /// streams always have room. A fixed cap held a download to that much per
-/// round trip (#151); this bounds only the unsent part by the path, as
-/// quiche's send capacity and Linux's `tcp_notsent_lowat` do, so a reader
-/// whose credit ran out holds `send_floor` once its bytes in flight are
-/// acknowledged (research/s15/h3-send-cap.md).
+/// round trip (#151); this bounds only the unsent part by the path, like
+/// Linux's `tcp_notsent_lowat` and quiche's send capacity (quiche takes the
+/// window less what is in flight, per connection, with the connection's
+/// credit; this takes the whole window per stream, with the stream's
+/// credit, and the connection's budget bounds the sum). A reader whose
+/// credit ran out holds what nghttp3 already took (up to one pull, about
+/// 32 KiB) plus `send_floor` (research/s2/h3-send-cap.md).
 pub fn pathCap(in_flight: u64, cwnd: u64, credit: u64, budget_max: usize) usize {
     const ceiling: u64 = @max(send_floor, budget_max - budget_max / 4);
     const unsent = std.math.clamp(@min(cwnd, credit), send_floor, ceiling);

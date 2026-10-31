@@ -87,7 +87,8 @@ fn download(req: *dusty.Request, res: *dusty.Response) !void {
 }
 
 /// GET /ahead: says it started, waits for `ahead_gate`, then streams
-/// `ahead_len` bytes in 4 KiB pieces, counting what its writes returned.
+/// `ahead_len` bytes in 4 KiB pieces, each flushed, counting what its
+/// flushes returned: the count is what the stream has queued.
 const ahead_len = 1 << 20;
 var ahead_started: std.atomic.Value(bool) = .init(false);
 var ahead_written: std.atomic.Value(usize) = .init(0);
@@ -101,6 +102,7 @@ fn ahead(req: *dusty.Request, res: *dusty.Response) !void {
     for (&chunk, 0..) |*b, i| b.* = @truncate(i);
     for (0..ahead_len / chunk.len) |_| {
         try out.interface.writeAll(&chunk);
+        try out.interface.flush();
         _ = ahead_written.fetchAdd(chunk.len, .release);
     }
     try out.end();
@@ -2090,7 +2092,7 @@ test "h3 server: a response streamed past its send buffer completes and leaves n
     }.cond);
 }
 
-test "h3 server: a response gets more than 64 KiB ahead of the client's acknowledgements once the congestion window allows" {
+test "h3 server: a response gets more than 64 KiB ahead of the client's acknowledgements" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
@@ -2119,13 +2121,14 @@ test "h3 server: a response gets more than 64 KiB ahead of the client's acknowle
     relay.holdUp();
     defer relay.releaseUp();
     ahead_gate.set(io);
-    // Half as much again as the old fixed cap, none of it acknowledged: a
-    // cap of 64 KiB on what a response holds unacknowledged never lets the
-    // writes get here, and the wait fails. (The new cap lets the writes
-    // reach what is in flight plus at least 64 KiB.)
-    try wait.waitUntil(io, "the handler's writes got 96 KiB ahead of any acknowledgement", {}, struct {
+    // More than the old fixed cap, none of it acknowledged: each write is
+    // flushed, so the count is what the stream holds, and a cap of 64 KiB
+    // on what a response holds unacknowledged stops it at 65,536. The cap
+    // counts what is in flight apart, so the first bytes nghttp3 takes let
+    // the writes past it.
+    try wait.waitUntil(io, "the handler's writes got more than 64 KiB ahead of any acknowledgement", {}, struct {
         fn cond(_: void) bool {
-            return ahead_written.load(.acquire) >= 96 * 1024;
+            return ahead_written.load(.acquire) > 64 * 1024;
         }
     }.cond);
     relay.releaseUp();
@@ -2137,7 +2140,7 @@ test "h3 server: a response gets more than 64 KiB ahead of the client's acknowle
     for (body, 0..) |b, i| if (b != @as(u8, @truncate(i % 4096))) return error.TestUnexpectedResult;
 }
 
-test "h3 client: a request body gets more than 64 KiB ahead of the server's acknowledgements once the congestion window allows" {
+test "h3 client: a request body gets more than 64 KiB ahead of the server's acknowledgements" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
@@ -2174,6 +2177,7 @@ test "h3 client: a request body gets more than 64 KiB ahead of the server's ackn
             while (off < data.len) {
                 const k = @min(4096, data.len - off);
                 try st.writer().writeAll(data[off..][0..k]);
+                try st.writer().flush();
                 off += k;
                 done.store(off, .release);
             }
@@ -2181,11 +2185,12 @@ test "h3 client: a request body gets more than 64 KiB ahead of the server's ackn
         }
     }.write, .{ s, body, &progress });
     defer writer.cancel(io) catch {};
-    // Half as much again as the old default send buffer, none of it
-    // acknowledged.
-    try wait.waitUntil(io, "the client's writes got 96 KiB ahead of any acknowledgement", &progress, struct {
+    // More than the old default send buffer, none of it acknowledged: each
+    // write is flushed, so the count is what the stream holds, which a
+    // 64 KiB cap stops at 65,536.
+    try wait.waitUntil(io, "the client's writes got more than 64 KiB ahead of any acknowledgement", &progress, struct {
         fn cond(p: *std.atomic.Value(usize)) bool {
-            return p.load(.acquire) >= 96 * 1024;
+            return p.load(.acquire) > 64 * 1024;
         }
     }.cond);
     relay.releaseDown();
