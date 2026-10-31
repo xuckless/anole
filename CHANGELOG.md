@@ -22,6 +22,11 @@ breaking changes are listed anyway.
   0.4.x resume without 0-RTT once, since the limit is part of their
   context (#100).
 
+- HTTP/3 packets are no longer padded to the path MTU. A small answer went
+  out as a ~1,250-byte packet that both sides had to encrypt and decrypt;
+  ngtcp2 still pads what RFC 9000 requires (Initials, path validation,
+  MTU probes) (#100).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed

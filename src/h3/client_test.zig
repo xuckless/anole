@@ -446,6 +446,38 @@ test "h3 client: 40 requests on one connection wait for stream credit under max_
     try std.testing.expectEqual(@as(usize, 40), ok.load(.monotonic));
 }
 
+test "h3 server: without the PADDING flag, both sides' first datagrams (their Initials) are still padded to 1200 bytes" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    const conn = try client.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = relay.front.socket.address,
+        .port = f.ep.address().getPort(),
+        .tls = .{ .ca = .{ .pem = f.pem.cert } },
+    });
+    defer conn.close();
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
+    // RFC 9000 §14.1: a client's Initial datagram, and a server's that
+    // carries an ack-eliciting Initial, are at least 1200 bytes. ngtcp2
+    // pads them itself; the relay's sockets have GRO off, so each read is
+    // one datagram. Not every server Initial: one that only acknowledges
+    // the first half of a ClientHello split over two datagrams (a
+    // post-quantum key share) needs no padding, so the largest is checked,
+    // the one with the ServerHello.
+    relay.mutex.lockUncancelable(io);
+    defer relay.mutex.unlock(io);
+    try std.testing.expect(relay.first_up_len >= 1200);
+    try std.testing.expect(relay.max_down_initial_len >= 1200);
+}
+
 test "h3 server: the outbox sends several datagrams per flush under a bulk transfer" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
@@ -1213,6 +1245,11 @@ pub const Relay = struct {
     gate: std.Io.Event = .unset,
     /// The datagrams recorded before the gate opened: the first flight.
     first_flight: usize = 0,
+    /// The size of the client's first datagram (its Initial), and of the
+    /// largest server datagram that leads with an Initial packet; 0 until
+    /// seen.
+    first_up_len: usize = 0,
+    max_down_initial_len: usize = 0,
     group: std.Io.Group = .init,
 
     pub fn start(gpa: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress) !*Relay {
@@ -1340,6 +1377,7 @@ pub const Relay = struct {
     fn forwardUp(r: *Relay, from: std.Io.net.IpAddress, d: []const u8) std.Io.Cancelable!void {
         r.mutex.lockUncancelable(r.io);
         r.client = from;
+        if (r.first_up_len == 0) r.first_up_len = d.len;
         var resent = false;
         if (tokenlessInitial(d)) {
             r.tokenless_initials += 1;
@@ -1433,6 +1471,9 @@ pub const Relay = struct {
             }
             r.answered = true;
             const to = r.client;
+            if (dg.data.len >= 5 and dg.data[0] & 0x80 != 0 and
+                LongPackets.kindOf(dg.data[0], std.mem.readInt(u32, dg.data[1..5], .big)) == .initial)
+                r.max_down_initial_len = @max(r.max_down_initial_len, dg.data.len);
             r.mutex.unlock(r.io);
             if (to) |a| while (dg.next()) |d| r.front.send(r.io, a, null, 0, d, d.len);
         }

@@ -2237,7 +2237,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                     }
                     var vec: [1]c.ngtcp2_vec = undefined;
                     var datav: []const c.ngtcp2_vec = &.{};
-                    var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE | c.NGTCP2_WRITE_STREAM_FLAG_PADDING;
+                    // Unpadded, as `bridge.writePacket`.
+                    var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE;
                     if (picked) |hs| {
                         const rest = hs.response[hs.sent..];
                         vec[0] = .{ .base = @constCast(rest.ptr), .len = rest.len };
