@@ -18,10 +18,12 @@
 //! and the writer encrypts through one `tls.Connection`, which must support
 //! one concurrent reader plus one writer (tls.zig does).
 //!
-//! Request bodies: a per-stream queue sized to the stream window, allocated
-//! on the first DATA frame. The session side can always put into it without
-//! blocking (a peer past its window is a protocol error nghttp2 rejects
-//! first), and the handler returns window credit as it reads.
+//! Request bodies: a per-stream queue allocated on the first DATA frame,
+//! sized to the body when its length is known (content-length, or the one
+//! DATA frame that carries END_STREAM) and else to the stream window. The
+//! session side can always put into it without blocking (a peer past its
+//! window or its content-length is a protocol error nghttp2 rejects first),
+//! and the handler returns window credit as it reads.
 //!
 //! Response bodies: the handler writes into a per-stream queue and blocks
 //! when it is full; the data provider takes from it without blocking and
@@ -52,6 +54,7 @@ const Transport = @import("../transport.zig").Transport;
 const Timer = @import("../deadline.zig").Timer;
 const placement = @import("../placement.zig");
 const gauges = @import("../gauges.zig");
+const block_cache = @import("../block_cache.zig");
 
 const log = std.log.scoped(.anole_h2);
 
@@ -74,6 +77,20 @@ pub var test_before_fill: if (@import("builtin").is_test) ?*const fn (std.Io, Fi
 /// observed the end (h2_test.zig). Nothing outside tests.
 pub var test_after_peer_end: if (@import("builtin").is_test) ?*const fn (std.Io) void else void =
     if (@import("builtin").is_test) null else {};
+
+/// Tests only: when set, every request body queue is this long, whatever
+/// the body, so a test can make the session's put overflow it
+/// (h2_test.zig). Nothing outside tests.
+pub var test_body_queue_len: if (@import("builtin").is_test) ?usize else void =
+    if (@import("builtin").is_test) null else {};
+
+/// Tests only: request body queues allocated so far, by where their
+/// memory came from (`BodyBuf`).
+pub const test_body_allocs = if (@import("builtin").is_test) struct {
+    pub var arena: std.atomic.Value(usize) = .init(0);
+    pub var heap: std.atomic.Value(usize) = .init(0);
+    pub var block: std.atomic.Value(usize) = .init(0);
+} else struct {};
 
 /// What `test_before_fill` is told about the connection.
 pub const FillProbe = struct {
@@ -113,6 +130,10 @@ pub fn sniffPreface(r: *std.Io.Reader) error{ReadFailed}!bool {
         };
     }
 }
+
+/// A request body queue up to this long comes from the stream's arena,
+/// whose kept node holds it.
+const arena_body_max = 4 * 1024;
 
 /// Spare streams a connection keeps for reuse.
 const max_spare_streams = 16;
@@ -398,6 +419,7 @@ pub fn Engine(comptime Ctx: type) type {
                 var callbacks: ?*c.nghttp2_session_callbacks = null;
                 if (c.nghttp2_session_callbacks_new(&callbacks) != 0) return error.OutOfMemory;
                 defer c.nghttp2_session_callbacks_del(callbacks);
+                c.nghttp2_session_callbacks_set_on_begin_frame_callback(callbacks, onBeginFrame);
                 c.nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, onBeginHeaders);
                 c.nghttp2_session_callbacks_set_on_header_callback(callbacks, onHeader);
                 c.nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, onFrameRecv);
@@ -415,6 +437,10 @@ pub fn Engine(comptime Ctx: type) type {
                 // onHeader, against what SETTINGS advertised.
                 c.nghttp2_option_set_stream_reset_rate_limit(option, conn.config.stream_reset_burst, conn.config.stream_reset_rate);
                 c.nghttp2_option_set_max_continuations(option, conn.config.max_continuations);
+                // Never `nghttp2_option_set_no_http_messaging`: the body
+                // queue is sized to the content-length, which only HTTP
+                // messaging holds the DATA to (`Stream.bodySize`; the test
+                // "a body past its content-length resets only its stream").
 
                 if (c.nghttp2_session_server_new2(&conn.session, callbacks, conn, option) != 0) return error.OutOfMemory;
                 errdefer {
@@ -517,6 +543,14 @@ pub fn Engine(comptime Ctx: type) type {
             /// Request body: DATA in, the handler out. Allocated on the
             /// first DATA frame; a request without a body never has one.
             body: ?std.Io.Queue(u8) = null,
+            /// Where the body queue's memory is, freed in `release`.
+            body_buf: BodyBuf = .{},
+            /// The request's content-length, which nghttp2 holds the DATA
+            /// to (it never runs with `no_http_messaging`).
+            content_length: ?u64 = null,
+            /// The length of the DATA frame with END_STREAM, when it is the
+            /// body's first (`onBeginFrame`): the whole body fits in it.
+            end_frame_len: ?u32 = null,
             /// The stream's receive window, which the body queue holds:
             /// `stream_window`, raised to `stream_window_reading` once the
             /// handler reads. Zero until set (`window`).
@@ -605,6 +639,60 @@ pub fn Engine(comptime Ctx: type) type {
 
             const Field = struct { name: []const u8, value: []const u8 };
 
+            /// A request body queue's memory: up to `arena_body_max` from
+            /// the stream's arena, up to `block_cache.malloc_max` from the
+            /// connection's allocator (malloc's slabs), larger from
+            /// `block_cache` (past its largest class, the allocator again).
+            /// Sized to the body, which is mostly small, so a request
+            /// neither maps memory nor grows its arena for it.
+            const BodyBuf = struct {
+                mem: []u8 = &.{},
+                from: enum { none, arena, heap, block } = .none,
+
+                fn alloc(stream: *Stream, size: usize) ?BodyBuf {
+                    const buf: BodyBuf = if (size <= arena_body_max)
+                        .{ .mem = stream.arena.allocator().alloc(u8, size) catch return null, .from = .arena }
+                    else if (size > block_cache.malloc_max and size <= block_cache.classes[block_cache.classes.len - 1])
+                        .{ .mem = block_cache.take(block_cache.classFor(size).?) orelse return null, .from = .block }
+                    else
+                        .{ .mem = stream.conn.allocator.alloc(u8, size) catch return null, .from = .heap };
+                    if (comptime @import("builtin").is_test) {
+                        _ = switch (buf.from) {
+                            .none => unreachable,
+                            .arena => test_body_allocs.arena.fetchAdd(1, .monotonic),
+                            .heap => test_body_allocs.heap.fetchAdd(1, .monotonic),
+                            .block => test_body_allocs.block.fetchAdd(1, .monotonic),
+                        };
+                    }
+                    return buf;
+                }
+
+                /// The arena's goes with the arena.
+                fn free(buf: *BodyBuf, gpa: std.mem.Allocator) void {
+                    switch (buf.from) {
+                        .none, .arena => {},
+                        .heap => gpa.free(buf.mem),
+                        .block => block_cache.give(buf.mem),
+                    }
+                    buf.* = .{};
+                }
+            };
+
+            /// How long the body queue is, on the first DATA frame: the
+            /// body when its length is known and within the window, else a
+            /// whole window (before the peer's ACK of SETTINGS that is still
+            /// the default one, which may be the larger). A tunnel's is
+            /// always its window. Under the mutex.
+            fn bodySize(stream: *const Stream) usize {
+                if (comptime @import("builtin").is_test) if (test_body_queue_len) |n| return n;
+                const conn = stream.conn;
+                const full: usize = @max(stream.window(), conn.ackedStreamWindow());
+                if (stream.connect_protocol.len > 0) return full;
+                if (stream.content_length) |n| if (n <= full) return @intCast(n);
+                if (stream.end_frame_len) |n| return @min(n, full);
+                return full;
+            }
+
             fn window(stream: *const Stream) u31 {
                 return if (stream.recv_window != 0) stream.recv_window else stream.conn.config.stream_window;
             }
@@ -628,8 +716,8 @@ pub fn Engine(comptime Ctx: type) type {
                 // The connection's raised windows share one budget; a stream
                 // past it reads at `stream_window`.
                 if (size > conn.config.reading_window_budget -| conn.raised_bytes) return;
-                const buf = stream.arena.allocator().alloc(u8, size) catch return;
-                var bigger: std.Io.Queue(u8) = .init(buf);
+                var buf = BodyBuf.alloc(stream, size) orelse return;
+                var bigger: std.Io.Queue(u8) = .init(buf.mem[0..size]);
                 if (stream.body) |*q| {
                     // What is queued moves over, in order; nobody else gets
                     // from it (this is the handler), and the session puts
@@ -644,8 +732,13 @@ pub fn Engine(comptime Ctx: type) type {
                 // Less by what that ACK will add, so the window lands on
                 // `want` and never holds more than the queue.
                 const pending = if (conn.config.stream_window > acked) conn.config.stream_window - acked else 0;
-                if (c.nghttp2_session_set_local_window_size(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, want - pending) != 0) return;
+                if (c.nghttp2_session_set_local_window_size(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, want - pending) != 0) {
+                    buf.free(conn.allocator);
+                    return;
+                }
                 stream.body = bigger;
+                stream.body_buf.free(conn.allocator);
+                stream.body_buf = buf;
                 stream.recv_window = want;
                 stream.raised_bytes = size;
                 conn.raised_bytes += size;
@@ -707,6 +800,8 @@ pub fn Engine(comptime Ctx: type) type {
                 if (stream.send_pending) conn.send_pending -= 1;
                 conn.raised_bytes -= stream.raised_bytes;
                 stream.outbox.deinit(conn.allocator);
+                stream.body = null;
+                stream.body_buf.free(conn.allocator);
                 if (conn.streams.remove(stream.id)) gauges.add(conn.io, .h2_streams, -1);
                 if (stream.counted) {
                     conn.open_streams -= 1;
@@ -2386,6 +2481,19 @@ pub fn Engine(comptime Ctx: type) type {
             return @ptrCast(@alignCast(ptr));
         }
 
+        /// Every frame's header, before its payload. A DATA frame with
+        /// END_STREAM that comes before any body holds the whole body:
+        /// its length (padding included) sizes the body queue
+        /// (`Stream.bodySize`), which gRPC clients, sending no
+        /// content-length, need to get a small one.
+        fn onBeginFrame(session: ?*c.nghttp2_session, hd: [*c]const c.nghttp2_frame_hd, user_data: ?*anyopaque) callconv(.c) c_int {
+            _ = user_data;
+            if (hd.*.type != c.NGHTTP2_DATA or hd.*.flags & c.NGHTTP2_FLAG_END_STREAM == 0) return 0;
+            const stream = streamFor(session, hd.*.stream_id) orelse return 0;
+            if (stream.body == null) stream.end_frame_len = @intCast(hd.*.length);
+            return 0;
+        }
+
         fn onBeginHeaders(session: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
             const conn = connFrom(user_data);
             if (frame.*.hd.type != c.NGHTTP2_HEADERS or frame.*.headers.cat != c.NGHTTP2_HCAT_REQUEST) return 0;
@@ -2450,6 +2558,9 @@ pub fn Engine(comptime Ctx: type) type {
             } else if (std.mem.eql(u8, name, ":protocol")) {
                 stream.connect_protocol = value;
             } else if (name.len > 0 and name[0] != ':') {
+                // Validated by nghttp2 (HTTP messaging), which also holds
+                // the DATA to it.
+                if (std.mem.eql(u8, name, "content-length")) stream.content_length = std.fmt.parseInt(u64, value, 10) catch null;
                 const name_copy = arena.dupe(u8, name) catch return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
                 stream.headers.append(arena, .{ .name = name_copy, .value = value }) catch return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
             }
@@ -2533,7 +2644,8 @@ pub fn Engine(comptime Ctx: type) type {
         /// The body of a request set aside in `awaiting` is whole: it runs
         /// inline after all.
         fn bodyEnded(conn: *Conn, stream: *Stream) void {
-            if (!stream.await_body) return;
+            // Reset by this side (`resetBody`): `startAwaiting` lets go.
+            if (!stream.await_body or stream.reset) return;
             stream.await_body = false;
             queueInline(conn, stream);
         }
@@ -2630,7 +2742,13 @@ pub fn Engine(comptime Ctx: type) type {
             _ = flags;
             const conn = connFrom(user_data);
             const stream = streamFor(session, stream_id) orelse return 0;
-            if (stream.body_done) return 0;
+            if (stream.body_done) {
+                // Reset by this side while the peer's frames were still
+                // coming (`resetBody`): what arrives is dropped, but its
+                // connection window credited back.
+                if (stream.reset) _ = c.nghttp2_session_consume(session, stream_id, len);
+                return 0;
+            }
             if (stream.discarding) {
                 _ = c.nghttp2_session_consume(session, stream_id, len);
                 if (len >= stream.discard_left) {
@@ -2639,20 +2757,48 @@ pub fn Engine(comptime Ctx: type) type {
                 return 0;
             }
             if (stream.body == null) {
-                // A whole window: before the peer's ACK of SETTINGS that is
-                // still the default one, which may be the larger.
-                const size = @max(stream.window(), conn.ackedStreamWindow());
-                const buf = stream.arena.allocator().alloc(u8, size) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                stream.body = .init(buf);
+                const size = stream.bodySize();
+                const buf = Stream.BodyBuf.alloc(stream, size) orelse {
+                    resetBody(conn, stream, len);
+                    return 0;
+                };
+                stream.body_buf = buf;
+                stream.body = .init(buf.mem[0..size]);
             }
-            // Cannot block: the queue holds a whole window, and the peer may
-            // not send past it.
+            // Cannot block: the queue holds the body or a whole window, and
+            // the peer may send past neither.
             const put = stream.body.?.putUncancelable(conn.io, data[0..len], 0) catch |err| switch (err) {
                 // The handler is gone; the bytes are dropped with the stream.
                 error.Closed => return 0,
             };
-            if (put != len) return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            if (put != len) resetBody(conn, stream, len - put);
             return 0;
+        }
+
+        /// The body does not fit its queue (impossible by its sizing, but
+        /// defended) or no queue could be allocated: only this stream is
+        /// reset, with RST_STREAM(INTERNAL_ERROR), and its handler sees
+        /// the reset rather than a body cut short. Not an error to
+        /// nghttp2: from the chunk callback it would end the connection
+        /// (CALLBACK_FAILURE) or be ignored (TEMPORAL_CALLBACK_FAILURE,
+        /// nghttp2_session.c, `on_data_chunk_recv_callback`). The window
+        /// of what is dropped (`dropped` bytes of the chunk, and what is
+        /// queued) is credited back to the connection. Under the mutex.
+        fn resetBody(conn: *Conn, stream: *Stream, dropped: usize) void {
+            stream.reset = true;
+            _ = c.nghttp2_submit_rst_stream(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, c.NGHTTP2_INTERNAL_ERROR);
+            _ = c.nghttp2_session_consume(conn.session, stream.id, dropped);
+            if (stream.body) |*q| {
+                var scratch: [4096]u8 = undefined;
+                while (true) {
+                    const n = q.getUncancelable(conn.io, &scratch, 0) catch break;
+                    if (n == 0) break;
+                    _ = c.nghttp2_session_consume(conn.session, stream.id, n);
+                }
+            }
+            stream.closeBody();
+            stream.cancelHandler();
+            conn.kickWriter();
         }
 
         fn onStreamClose(session: ?*c.nghttp2_session, stream_id: i32, error_code: u32, user_data: ?*anyopaque) callconv(.c) c_int {

@@ -145,14 +145,31 @@ const TestClient = struct {
 
     /// `request`, with a `:protocol` for an extended CONNECT (RFC 8441).
     fn requestProtocol(self: *TestClient, method: []const u8, path: []const u8, protocol: ?[]const u8, body: ?[]const u8) !i32 {
-        const all = [_]c.nghttp2_nv{
-            nv(":method", method),
-            nv(":path", path),
-            nv(":scheme", "http"),
-            nv(":authority", "localhost"),
-            nv(":protocol", protocol orelse ""),
-        };
-        const nva = if (protocol != null) all[0..] else all[0..4];
+        return self.requestFull(method, path, protocol, &.{}, body);
+    }
+
+    /// `request`, with `extra` fields after the pseudo-headers (such as a
+    /// content-length, which `request` never sends).
+    fn requestHeaders(self: *TestClient, method: []const u8, path: []const u8, extra: []const c.nghttp2_nv, body: ?[]const u8) !i32 {
+        return self.requestFull(method, path, null, extra, body);
+    }
+
+    fn requestFull(self: *TestClient, method: []const u8, path: []const u8, protocol: ?[]const u8, extra: []const c.nghttp2_nv, body: ?[]const u8) !i32 {
+        var all: [16]c.nghttp2_nv = undefined;
+        all[0] = nv(":method", method);
+        all[1] = nv(":path", path);
+        all[2] = nv(":scheme", "http");
+        all[3] = nv(":authority", "localhost");
+        var n: usize = 4;
+        if (protocol) |p| {
+            all[n] = nv(":protocol", p);
+            n += 1;
+        }
+        for (extra) |f| {
+            all[n] = f;
+            n += 1;
+        }
+        const nva = all[0..n];
         const resp = try self.gpa.create(Resp);
         resp.* = .{ .send = body orelse "" };
         var provider: c.nghttp2_data_provider2 = .{ .source = .{ .ptr = resp }, .read_callback = provide };
@@ -1018,6 +1035,121 @@ test "HTTP/2: a warm connection serves requests without allocating" {
         try awaitStreamsFreed(&server, io);
     }
     try std.testing.expectEqual(before, counting.count.load(.monotonic));
+}
+
+test "HTTP/2: a small body's queue comes from the stream's arena, with or without content-length" {
+    const io = std.testing.io;
+    const safety = @import("anole_safety");
+    safety.arena_poisoning.store(false, .monotonic);
+    defer safety.arena_poisoning.store(true, .monotonic);
+    var counting: CountingAllocator = .{ .inner = std.testing.allocator };
+    var server = dusty.Server(void).init(counting.allocator(), io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    server.router.post("/sum", Handlers.sum);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    const body = "123456789";
+    var expect: [64]u8 = undefined;
+    const want = try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) });
+    // With content-length, and as gRPC clients send it: without, the one
+    // DATA frame carrying END_STREAM (`onBeginFrame`).
+    const with_length = [_]c.nghttp2_nv{TestClient.nv("content-length", "9")};
+    for (0..5) |i| {
+        _ = try client.requestHeaders("POST", "/sum", if (i % 2 == 0) &with_length else &.{}, body);
+        try client.run();
+        try awaitStreamsFreed(&server, io);
+    }
+    const before = counting.count.load(.monotonic);
+    const arena_before = h2.test_body_allocs.arena.load(.monotonic);
+    const heap_before = h2.test_body_allocs.heap.load(.monotonic);
+    const block_before = h2.test_body_allocs.block.load(.monotonic);
+    for (0..20) |i| {
+        const id = try client.requestHeaders("POST", "/sum", if (i % 2 == 0) &with_length else &.{}, body);
+        try client.run();
+        try std.testing.expectEqualStrings(want, client.get(id).body.items);
+        try awaitStreamsFreed(&server, io);
+    }
+    // Nothing allocated: the queue fit in the arena's kept node.
+    try std.testing.expectEqual(before, counting.count.load(.monotonic));
+    try std.testing.expectEqual(arena_before + 20, h2.test_body_allocs.arena.load(.monotonic));
+    try std.testing.expectEqual(heap_before, h2.test_body_allocs.heap.load(.monotonic));
+    try std.testing.expectEqual(block_before, h2.test_body_allocs.block.load(.monotonic));
+}
+
+test "HTTP/2: a body of unknown length over several frames gets a window from block_cache" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    const body = try std.testing.allocator.alloc(u8, 20 * 1000);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 17);
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const block_before = h2.test_body_allocs.block.load(.monotonic);
+    const id = try client.request("POST", "/nw/sum", body);
+    try client.run();
+    var expect: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(id).body.items);
+    // Past one frame (16 KiB), the first carries no END_STREAM: a whole
+    // window, the 64 KiB class.
+    try std.testing.expectEqual(block_before + 1, h2.test_body_allocs.block.load(.monotonic));
+}
+
+test "HTTP/2: a body past its content-length resets only its stream" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const short = [_]c.nghttp2_nv{TestClient.nv("content-length", "5")};
+    const id = try client.requestHeaders("POST", "/nw/sum", &short, "123456789");
+    try client.run();
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_PROTOCOL_ERROR), client.get(id).error_code);
+    const after = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(after).body.items);
+}
+
+test "HTTP/2: a body that overflows its queue resets only its stream, with INTERNAL_ERROR" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    // Impossible by the queue's sizing: forced with a queue too short.
+    h2.test_body_queue_len = 4;
+    const id = blk: {
+        defer h2.test_body_queue_len = null;
+        const id = try client.request("POST", "/nw/sum", "123456789");
+        try client.run();
+        break :blk id;
+    };
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_INTERNAL_ERROR), client.get(id).error_code);
+    try std.testing.expect(client.get(id).rsts >= 1);
+    // The connection carries on, its window intact.
+    const body = try std.testing.allocator.alloc(u8, 200 * 1024);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 5);
+    const after = try client.request("POST", "/nw/sum", body);
+    try client.run();
+    var expect: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(after).body.items);
 }
 
 /// Waits until the server has freed every stream. The response can reach

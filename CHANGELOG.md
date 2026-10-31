@@ -7,6 +7,13 @@ breaking changes are listed anyway.
 
 ### Changed
 
+- HTTP/2: a request body's queue is sized to the body when its length is
+  known (content-length, or the one DATA frame that carries END_STREAM,
+  which gRPC clients send without a content-length), instead of a whole
+  64 KiB window per stream: a small body comes from the stream's arena or
+  malloc's slabs, a larger one from `block_cache`. A body that overflows
+  its queue resets only its stream (RST_STREAM INTERNAL_ERROR) instead of
+  the connection (#99).
 - `block_cache` keeps one free list per size class (64, 128 and 256 KiB,
   1 and 2 MiB) with an O(1) take and give, serves everything past
   malloc's slabs (32 KiB), and is trimmed per class (#99).
