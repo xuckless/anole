@@ -6,6 +6,7 @@ const std = @import("std");
 const wait = @import("anole_test_wait");
 const builtin = @import("builtin");
 const dusty = @import("root.zig");
+const test_socket = @import("server/test_socket.zig");
 const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
 const loopback: []const dusty.Listener = &.{.{ .address = loopback_addr }};
 
@@ -1192,6 +1193,240 @@ test "Server: Connection: close on a pipelined request ends the connection after
     var status2: [64]u8 = undefined;
     var body2: [32]u8 = undefined;
     try std.testing.expectError(error.EndOfStream, readResponse(r, &status2, &body2));
+}
+
+/// Corking (`Response._cork`): `no_wait` routes, whose pipelined responses
+/// wait in the write buffer for one write, and a route that waits, behind
+/// which they must not.
+const CorkCtx = struct {
+    /// What `/wait` waits for: the client sets it once it has read the
+    /// responses before it.
+    event: std.Io.Event = .unset,
+
+    const big_len = 1024;
+    const big_body: [big_len]u8 = @splat('b');
+
+    fn setup(server: *dusty.Server(CorkCtx)) void {
+        server.router.addRouteWith(.get, "/a", a, .{ .no_wait = true });
+        server.router.addRouteWith(.get, "/c", c, .{ .no_wait = true });
+        server.router.addRouteWith(.get, "/big", big, .{ .no_wait = true });
+        server.router.addRouteWith(.get, "/abort", abort, .{ .no_wait = true });
+        server.router.addRouteWith(.post, "/echo", echo, .{ .no_wait = true });
+        server.router.addRouteWith(.get, "/ws", ws, .{ .no_wait = true });
+        server.router.get("/wait", waitForClient);
+    }
+
+    fn a(_: *CorkCtx, _: *dusty.Request, res: *dusty.Response) !void {
+        res.body = "a";
+    }
+
+    fn c(_: *CorkCtx, _: *dusty.Request, res: *dusty.Response) !void {
+        res.body = "c";
+    }
+
+    fn big(_: *CorkCtx, _: *dusty.Request, res: *dusty.Response) !void {
+        res.body = &big_body;
+    }
+
+    fn abort(_: *CorkCtx, _: *dusty.Request, res: *dusty.Response) !void {
+        return res.abort();
+    }
+
+    fn echo(_: *CorkCtx, req: *dusty.Request, res: *dusty.Response) !void {
+        res.body = (try req.body()) orelse "no body";
+    }
+
+    fn ws(_: *CorkCtx, req: *dusty.Request, res: *dusty.Response) !void {
+        var socket = try res._upgradeWebSocket(req) orelse {
+            res.status = .bad_request;
+            return;
+        };
+        defer socket.deinit();
+        try socket.send(.text, "hi");
+    }
+
+    fn waitForClient(ctx: *CorkCtx, req: *dusty.Request, res: *dusty.Response) !void {
+        try ctx.event.wait(req.io);
+        res.body = "waited";
+    }
+};
+
+/// A server with `CorkCtx`'s routes and one client connection to it, read
+/// through a `DeadlineReader`: a response held back by a missed flush
+/// fails the read rather than hanging the test.
+const CorkClient = struct {
+    ctx: CorkCtx = .{},
+    server: dusty.Server(CorkCtx) = undefined,
+    server_future: std.Io.Future(anyerror!void) = undefined,
+    stream: std.Io.net.Stream = undefined,
+    write_buf: [1024]u8 = undefined,
+    writer: std.Io.net.Stream.Writer = undefined,
+    read_buf: [64 * 1024]u8 = undefined,
+    reader: test_socket.DeadlineReader = undefined,
+
+    fn start(self: *CorkClient) !void {
+        const io = std.testing.io;
+        self.server = dusty.Server(CorkCtx).init(std.testing.allocator, io, .{ .listeners = loopback }, &self.ctx);
+        errdefer self.server.deinit();
+        CorkCtx.setup(&self.server);
+        self.server_future = try io.concurrent(struct {
+            fn run(srv: *dusty.Server(CorkCtx)) anyerror!void {
+                try srv.run();
+            }
+        }.run, .{&self.server});
+        errdefer self.server_future.cancel(io) catch {};
+        try self.server.waitReady(io);
+        self.stream = try self.server.address.ip.connect(io, .{ .mode = .stream });
+        self.writer = self.stream.writer(io, &self.write_buf);
+        self.reader = .init(self.stream, io, &self.read_buf);
+    }
+
+    fn stop(self: *CorkClient) void {
+        const io = std.testing.io;
+        self.stream.shutdown(io, .both) catch {};
+        self.stream.close(io);
+        self.server_future.cancel(io) catch {};
+        self.server.deinit();
+    }
+
+    fn send(self: *CorkClient, bytes: []const u8) !void {
+        try self.writer.interface.writeAll(bytes);
+        try self.writer.interface.flush();
+    }
+
+    fn expectBody(self: *CorkClient, want: []const u8) !void {
+        var status: [64]u8 = undefined;
+        var body: [CorkCtx.big_len]u8 = undefined;
+        const resp = try readResponse(&self.reader.interface, &status, &body);
+        try std.testing.expect(std.mem.indexOf(u8, resp.status, "200") != null);
+        try std.testing.expectEqualStrings(want, resp.body);
+    }
+};
+
+test "Server: pipelined no_wait requests are answered in order, in one write" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    const before = dusty.Connection.TestSocketWrites.get();
+    // One write, so one read on the server: all three are buffered when
+    // the first is answered.
+    try client.send("GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try client.expectBody("a");
+    try client.expectBody("c");
+    try client.expectBody("a");
+    try std.testing.expectEqual(@as(usize, 1), dusty.Connection.TestSocketWrites.get() - before);
+}
+
+test "Server: corked responses go out before the server waits for the rest of a pipelined head" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    // Two whole requests and the start of a third: the two answers must
+    // not wait for the rest of it.
+    try client.send("GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /a HTTP/1.1\r\nHo");
+    try client.expectBody("a");
+    try client.expectBody("c");
+    try client.send("st: localhost\r\n\r\n");
+    try client.expectBody("a");
+}
+
+test "Server: corked responses go out before the server waits for the rest of a pipelined body" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    try client.send("GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhe");
+    try client.expectBody("a");
+    try client.send("llo");
+    try client.expectBody("hello");
+}
+
+test "Server: corked responses go out before a handler that may wait" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    // `/wait` waits until the client has read the answer to `/a`.
+    try client.send("GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /wait HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try client.expectBody("a");
+    client.ctx.event.set(std.testing.io);
+    try client.expectBody("waited");
+}
+
+test "Server: responses corked before an aborted one still go out before the close" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    try client.send("GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /abort HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try client.expectBody("a");
+    try client.expectBody("c");
+    var status: [64]u8 = undefined;
+    var body: [8]u8 = undefined;
+    try std.testing.expectError(error.EndOfStream, readResponse(&client.reader.interface, &status, &body));
+}
+
+test "Server: pipelined requests and then the end of input are all answered before the close" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    try client.send("GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try client.stream.shutdown(std.testing.io, .send);
+    try client.expectBody("a");
+    try client.expectBody("c");
+    try client.expectBody("a");
+    var status: [64]u8 = undefined;
+    var body: [8]u8 = undefined;
+    try std.testing.expectError(error.EndOfStream, readResponse(&client.reader.interface, &status, &body));
+}
+
+test "Server: a corked batch bigger than the write buffer arrives whole and in order" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    // 40 answers of 1 KiB, well past the 16 KiB write buffer, so the batch
+    // goes out as the buffer fills; the last request names itself.
+    var requests: [41 * 40]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&requests);
+    for (0..40) |_| try w.writeAll("GET /big HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.writeAll("GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try client.send(w.buffered());
+    for (0..40) |_| try client.expectBody(&CorkCtx.big_body);
+    try client.expectBody("c");
+}
+
+test "Server: a response corked before a WebSocket upgrade arrives before the 101" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    try client.send("GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    try client.expectBody("a");
+    const r = &client.reader.interface;
+    const head = try r.takeDelimiterInclusive('\n');
+    try std.testing.expect(std.mem.indexOf(u8, head, "101") != null);
+    while (true) {
+        const line = try r.takeDelimiterInclusive('\n');
+        if (std.mem.eql(u8, line, "\r\n")) break;
+    }
+    const frame = try r.takeArray(4);
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 2, 'h', 'i' }, frame);
 }
 
 test "Server: a CONNECT ends the connection, its body unserved" {

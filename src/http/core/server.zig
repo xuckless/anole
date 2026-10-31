@@ -466,6 +466,29 @@ pub const Connection = struct {
         self.buffers = try allocator.alloc(u8, tls_buffers_len);
     }
 
+    /// Tests only: the writes that reached the socket of any plain
+    /// connection (`Stream.Writer` drains and sendfiles), so a test can
+    /// count the writes a batch of responses took without timing anything.
+    pub const TestSocketWrites = if (builtin.is_test) struct {
+        var count: std.atomic.Value(usize) = .init(0);
+        const inner = std.Io.net.Stream.Writer.init(undefined, undefined, &.{}).interface.vtable;
+        const vtable: std.Io.Writer.VTable = .{ .drain = drain, .sendFile = sendFile };
+
+        pub fn get() usize {
+            return count.load(.monotonic);
+        }
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            _ = count.fetchAdd(1, .monotonic);
+            return inner.drain(w, data, splat);
+        }
+
+        fn sendFile(w: *std.Io.Writer, file_reader: *std.Io.File.Reader, limit: std.Io.Limit) std.Io.Writer.FileError!usize {
+            _ = count.fetchAdd(1, .monotonic);
+            return inner.sendFile(w, file_reader, limit);
+        }
+    } else void;
+
     pub fn initPlain(
         self: *Connection,
         allocator: std.mem.Allocator,
@@ -475,6 +498,7 @@ pub const Connection = struct {
         try self.init(allocator, io, stream, 0);
         self.tcp_reader = stream.reader(io, &.{});
         self.tcp_writer = stream.writer(io, &.{});
+        if (builtin.is_test) self.tcp_writer.interface.vtable = &TestSocketWrites.vtable;
         self.reader = &self.tcp_reader.interface;
         self.writer = &self.tcp_writer.interface;
     }
@@ -3318,6 +3342,13 @@ pub fn Server(comptime Ctx: type) type {
                     response.keepalive = false;
                 }
 
+                // Corking: the next request is already here, so this
+                // response waits in the write buffer and goes out with the
+                // next ones, in one write, at the first point the
+                // connection could wait (`Connection.flushOwed`), or when
+                // the buffer fills. A pipelined batch of `no_wait` requests
+                // is answered in one write per read.
+                response._cork = response.keepalive and parser.isBodyComplete() and connection.reader.bufferedLen() > 0;
                 try response.write();
 
                 if (!response.keepalive) {
