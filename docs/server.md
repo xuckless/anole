@@ -797,9 +797,8 @@ A handler's write returns once its bytes are queued, and waits only while
 the response has as much queued as its cap allows (a `no_wait` handler on
 the endpoint task never waits). Bytes stay queued until the client
 acknowledges them, so the cap follows the connection's path rather than a
-fixed size: what is in flight, plus up to one congestion window of bytes
-not yet sent (or less, when the client's flow-control credit for the
-stream is smaller), at least 64 KiB and at most 3 MiB. A download moves as
+fixed size: what is in flight (which the congestion window bounds), plus
+64 KiB not yet sent, at most 3 MiB. A download moves as
 fast as the path allows, as over TCP, while a client that stops reading
 leaves its response holding up to about 100 KiB (what the stack already
 took, plus 64 KiB). All of a connection's responses together hold at most

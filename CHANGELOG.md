@@ -10,9 +10,8 @@ breaking changes are listed anyway.
 - HTTP/3: a response could hold at most 64 KiB unacknowledged, so a
   download moved 64 KiB per round trip whatever the path allowed (1.2 MB/s
   at 50 ms RTT, against 14-38 MB/s over HTTP/1.1). A response's buffer now
-  follows the connection's congestion window: what is in flight plus up to
-  one window not yet sent (less when the client's flow-control credit is
-  smaller), at least 64 KiB and at most 3 MiB, within the connection's
+  counts only what is not yet sent: what is in flight (which the congestion
+  window bounds) plus 64 KiB unsent, at most 3 MiB, within the connection's
   unchanged 4 MiB. A client that stops reading still leaves up to about
   100 KiB queued (what the stack already took, plus 64 KiB).
   The HTTP/3 client's request bodies had the same 64 KiB ceiling and now

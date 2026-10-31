@@ -2845,12 +2845,12 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.tx.notify(io);
             }
 
-            /// The send cap of this stream's queue, for a write of `want`
-            /// more bytes: fixed for a message stream, else following the
-            /// connection's path (`bridge.pathCap`). Locked.
-            fn sendCap(s: *const Stream, want: usize) usize {
+            /// The send cap of this stream's queue: fixed for a message
+            /// stream, else following the connection's path
+            /// (`bridge.pathCap`). Locked.
+            fn sendCap(s: *const Stream) usize {
                 if (s.protocol.len > 0 or s.message) return message_cap;
-                return bridge.pathCapOf(s.conn.q, s.id, &s.out, s.conn.budget.max, want);
+                return bridge.pathCapOf(&s.out, s.conn.budget.max);
             }
 
             /// Tells nghttp3 there is more of the body, if it was waiting
@@ -3413,7 +3413,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         return err;
                     };
                     // Inline, the write passes the cap: no need to ask it.
-                    const cap = if (s.inline_mode) 0 else s.sendCap(rest.len);
+                    const cap = if (s.inline_mode) 0 else s.sendCap();
                     const n = s.out.write(&conn.ep.blocks, &conn.budget, rest, cap, s.inline_mode) catch {
                         conn.unlock();
                         return self.fail(error.SystemResources);
@@ -3458,7 +3458,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                             conn.unlock();
                             return err;
                         };
-                        const n = s.out.write(&conn.ep.blocks, &conn.budget, rest, s.sendCap(rest.len), false) catch {
+                        const n = s.out.write(&conn.ep.blocks, &conn.budget, rest, s.sendCap(), false) catch {
                             conn.unlock();
                             return self.fail(error.SystemResources);
                         };

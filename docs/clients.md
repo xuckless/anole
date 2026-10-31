@@ -297,8 +297,8 @@ download whose client's port a NAT rebinding moved resumes instead of
 stalling; null for none), `session_cache`, `early_data` and `webtransport`
 (below), `RequestOptions.early`, and `RequestOptions.send_buffer` (how much
 request body may wait unacknowledged before a write waits; null follows the
-path as the server's responses do: what is in flight plus up to a congestion
-window unsent, at least 64 KiB and at most 3 MiB; the connection's 4 MiB
+path as the server's responses do: what is in flight plus 64 KiB unsent,
+at most 3 MiB; the connection's 4 MiB
 budget still bounds all streams together); `tls` is not
 optional. `isOpen()` is false once the handshake failed, after a GOAWAY or
 after `close`, and `s.resetCode()` is the application error code of the

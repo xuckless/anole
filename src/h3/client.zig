@@ -874,8 +874,7 @@ pub const ClientConnection = struct {
         /// HTTP/3 only. How much request body may wait unacknowledged
         /// before a write waits (the stream's send buffer). Null: it
         /// follows the path, as the server's responses do: what is in
-        /// flight plus up to a congestion window (or the server's credit)
-        /// unsent, at least 64 KiB, at most 3 MiB (`bridge.pathCap`).
+        /// flight plus 64 KiB unsent, at most 3 MiB (`bridge.pathCap`).
         /// The connection's budget still bounds all streams together.
         send_buffer: ?usize = null,
     };
@@ -1892,7 +1891,7 @@ pub const Stream = struct {
                 conn.unlock();
                 return error.WriteFailed;
             }
-            const cap = self.send_cap orelse bridge.pathCapOf(conn.q, self.id, &self.out, conn.budget.max, rest.len);
+            const cap = self.send_cap orelse bridge.pathCapOf(&self.out, conn.budget.max);
             const n = self.out.write(&conn.blocks, &conn.budget, rest, cap, false) catch {
                 conn.unlock();
                 return error.WriteFailed;
