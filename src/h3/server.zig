@@ -350,7 +350,9 @@ pub const Stats = struct {
     /// Requests for `no_wait` routes run inline, without a task
     /// (`Options.inline_no_wait`).
     served_inline: std.atomic.Value(u64) = .init(0),
-    /// Requests started: given a task, or run inline (`served_inline`).
+    /// Requests given to a handler: a task spawned for them, or run
+    /// inline (`served_inline`). Not those rejected for want of a task
+    /// or reset before an inline run.
     requests: std.atomic.Value(u64) = .init(0),
     /// Times a connection armed QUIC keep-alive (a request opened on an
     /// idle connection).
@@ -2306,7 +2308,6 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// A request's head is complete: give it a task. Locked.
             fn startStream(conn: *Conn, stream: *Stream) void {
                 stream.started = true;
-                _ = conn.ep.stats.requests.fetchAdd(1, .monotonic);
                 stream.refs.handler = true;
                 // The flush waits for its answer (`Stream.unhold`).
                 stream.round = conn.round.load(.monotonic);
@@ -2315,14 +2316,16 @@ pub fn Endpoint(comptime Ctx: type) type {
                 // 0-RTT: the handshake's flight and the ACK go at once.
                 if (!conn.handshakeDone()) conn.hold_off.store(true, .monotonic);
                 _ = conn.tasks.fetchAdd(1, .acq_rel);
-                placement.concurrent(&conn.group, conn.ep.io, .local, Stream.run, .{stream}) catch {
+                if (placement.concurrent(&conn.group, conn.ep.io, .local, Stream.run, .{stream})) |_| {
+                    _ = conn.ep.stats.requests.fetchAdd(1, .monotonic);
+                } else |_| {
                     _ = conn.tasks.fetchSub(1, .acq_rel);
                     log.err("HTTP/3: no task for stream {d}", .{stream.id});
                     stream.refs.handler = false;
                     stream.unhold();
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, stream.id, h.NGHTTP3_H3_REQUEST_REJECTED);
                     conn.kick();
-                };
+                }
             }
 
             /// Whether the request's route was registered `no_wait`, to run

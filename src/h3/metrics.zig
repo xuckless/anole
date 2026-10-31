@@ -27,7 +27,7 @@ const counters = [_]Series{
     .{ .name = "anole_h3_dropped_total", .help = "Packets for another endpoint dropped: its inbox was full, or it had stopped.", .field = "dropped" },
     .{ .name = "anole_h3_datagrams_out_total", .help = "Datagrams an HTTP/3 endpoint sent.", .field = "datagrams_out" },
     .{ .name = "anole_h3_tx_flushes_total", .help = "Outbox sends those datagrams went out in.", .field = "tx_flushes" },
-    .{ .name = "anole_h3_requests_total", .help = "HTTP/3 requests started.", .field = "requests" },
+    .{ .name = "anole_h3_requests_total", .help = "HTTP/3 requests given to a handler (a task, or run inline).", .field = "requests" },
     .{ .name = "anole_h3_served_inline_total", .help = "HTTP/3 requests for no_wait routes run inline, without a task.", .field = "served_inline" },
 };
 

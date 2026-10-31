@@ -306,7 +306,7 @@ with its own UDP socket; `endpoint` is the socket's index.
 | `anole_h3_dropped_total` | `endpoint` | Packets for another endpoint dropped (its inbox was full). Kernel drops are in `/proc/net/udp6`'s `drops` column. |
 | `anole_h3_datagrams_out_total` | `endpoint` | Datagrams sent. |
 | `anole_h3_tx_flushes_total` | `endpoint` | Outbox sends they went out in (`sendmmsg` calls on Linux). |
-| `anole_h3_requests_total` | `endpoint` | Requests started. |
+| `anole_h3_requests_total` | `endpoint` | Requests given to a handler (a task, or run inline). |
 | `anole_h3_served_inline_total` | `endpoint` | Requests for `no_wait` routes run without a task. |
 | `anole_h3_connections_open` | `endpoint` | Connections open. |
 | `anole_h3_socket_rcvbuf_bytes`, `anole_h3_socket_sndbuf_bytes` | `endpoint` | The UDP socket buffers as the system reports them. Each endpoint asks for 4 MiB both ways; Linux caps that at `net.core.rmem_max`/`wmem_max` (208 KiB by default) and reports twice what it granted. Raise those sysctls for bursty HTTP/3 loads. |
