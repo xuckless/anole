@@ -88,17 +88,19 @@ pub fn probe(io: std.Io, dir: std.Io.Dir) Probe {
     };
 }
 
-/// Two O_PATH opens of `..` (it needs no read permission on the parent, and
-/// under `RESOLVE_BENEATH` the kernel answers `EXDEV` for `..` at the root
-/// before any permission check): without the flag it must work, with it the
-/// answer must be a refusal. Through the `Io`, so one that ignores the flag
-/// (Threaded) is detected too.
+/// Two opens of `..`: without the flag an O_PATH open (it needs no read
+/// permission on the parent) that must work; with it a plain open that must be
+/// refused. Under `RESOLVE_BENEATH` the kernel answers `EXDEV` for `..` at the
+/// root before any permission check, so the second needs no read permission
+/// either. It is not O_PATH: zio always adds O_NOCTTY, and openat2 (unlike
+/// openat) answers EINVAL for O_PATH combined with it. Through the `Io`, so
+/// one that ignores the flag (Threaded) is detected too.
 fn probeLinux(io: std.Io, dir: std.Io.Dir) Probe {
     const protection = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(protection);
     const plain = dir.openFile(io, "..", .{ .path_only = true }) catch return .{ .tier = .verify, .why = .probe_failed };
     plain.close(io);
-    if (dir.openFile(io, "..", .{ .path_only = true, .resolve_beneath = true })) |scoped| {
+    if (dir.openFile(io, "..", .{ .resolve_beneath = true })) |scoped| {
         scoped.close(io);
         return .{ .tier = .verify, .why = .flag_ignored };
     } else |err| return switch (err) {
