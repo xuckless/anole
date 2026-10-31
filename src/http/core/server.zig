@@ -471,6 +471,8 @@ pub const Connection = struct {
     /// count the writes a batch of responses took without timing anything.
     pub const TestSocketWrites = if (builtin.is_test) struct {
         var count: std.atomic.Value(usize) = .init(0);
+        // SAFETY: only the vtable is taken, at comptime; the stream and
+        // `Io` are never read.
         const inner = std.Io.net.Stream.Writer.init(undefined, undefined, &.{}).interface.vtable;
         const vtable: std.Io.Writer.VTable = .{ .drain = drain, .sendFile = sendFile };
 
