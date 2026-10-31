@@ -11,6 +11,9 @@ breaking changes are listed anyway.
   LISTEN/SUBSCRIBE connection when it stops, also when a drain could not
   start its stop task (or a test made a started watch fake). Freed while
   still listed, it was written to when that connection reconnected (#157).
+- MongoDB: a retryable write that is a new client's first call is retried
+  on a retryable error, as later ones are. It used to go without a session,
+  so it was never retried (#143).
 
 ## 0.4.1 (2026-10-30)
 

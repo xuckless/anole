@@ -299,6 +299,27 @@ test "fake mongod: a retryable write error is sent again with the same session a
     try testing.expectEqual(fake.txn_numbers[1] + 1, fake.txn_numbers[2]);
 }
 
+test "fake mongod: a retryable write error on a fresh client's first call is retried (#143)" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+    const client = try open(io, &fake);
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    // No call before: the write itself finds the server.
+    fake.fail_inserts.store(1, .monotonic);
+    const r = try client.collection("users").insertOne(&c, .{ .name = "Ada" });
+    try testing.expect(r.objectId() != null);
+    try testing.expectEqual(@as(u32, 2), fake.inserts.load(.monotonic));
+    try testing.expectEqual(fake.txn_numbers[0], fake.txn_numbers[1]);
+    try testing.expectEqualSlices(u8, &fake.lsids[0], &fake.lsids[1]);
+}
+
 test "fake mongod: a retried write that fails again is a 503 with the server's code" {
     const rt = try zio.Runtime.init(gpa, .{});
     defer rt.deinit();

@@ -1128,9 +1128,12 @@ pub const Client = struct {
             fn attempt(self: *Client, c: *const Context, op: Operation, ctx: *Ctx, deadline: ?std.Io.Clock.Timestamp) Error!Ctx.Result {
                 const io = c.io;
                 var x: Exchange = .{ .client = self, .op = op, .server = op.server orelse undefined };
-                if (op.session and op.lsid == null) if (self.sessionTimeout()) |minutes| {
-                    x.session = try self.takeSession(io, minutes);
-                };
+                // The implicit session is taken after the first server
+                // selection (below): before it, a fresh client knows no
+                // server yet, so no session timeout, and its first write
+                // would go without a session and never be retried (#143;
+                // driver-sessions.md: whether sessions are supported is
+                // known once a data-bearing server was selected).
                 // The cursor takes the session when it stays open.
                 defer if (x.session) |sess| if (!x.keep_session) self.giveSession(sess, io);
 
@@ -1154,6 +1157,9 @@ pub const Client = struct {
                             }, .table = op.collection }),
                     };
                     const server = x.server;
+                    if (tries == 0 and op.session and op.lsid == null) if (self.sessionTimeout()) |minutes| {
+                        x.session = try self.takeSession(io, minutes);
+                    };
                     const connection = self.acquire(server, io, deadline) catch |err| switch (err) {
                         error.Canceled => return error.Canceled,
                         error.PoolTimeout => return c.fail(self.errors, .{ .system = .mongodb, .class = if (past(io, deadline)) .timeout else .unavailable, .code = "pool_timeout", .message = "no pooled connection free in time", .table = op.collection }),
