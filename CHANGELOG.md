@@ -3,6 +3,30 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.5.0 (unreleased)
+
+### Changed
+
+- Response compression is cheaper per response (#101). A client that
+  offers `gzip` and `br` at the same q-value (Safari, `gzip, br`) now gets
+  gzip instead of Brotli; zstd still wins a tie, and q-values still decide
+  first. Brotli's default quality for responses is 4 (was 5;
+  `response.brotli_quality` and `res.brotli_quality` still set it), zstd
+  runs at level 1 (was 3) and zlib-ng's gzip at level 2 (was 6).
+- Buffered gzip responses go through libdeflate at level 1, a new bundled
+  dependency (MIT) behind `-Dlibdeflate`, on in the `web` and `full`
+  profiles; zlib-ng still gzips streamed bodies and bodies over 1 MiB, and
+  does all decompression (#101).
+- Each executor keeps one zstd context and one gzip encoder for buffered
+  bodies and reuses them, instead of making them for every response; they
+  are freed when idle for a trim interval (#101).
+- Allocations of 32-64 KiB for compressors come from the per-executor
+  block cache instead of malloc, which with musl mapped and unmapped each
+  one (#101).
+- `application/json` responses (`res.json`, `anole.json`, `content_type =
+  .json`, `.js.map` static files) no longer carry `; charset=UTF-8`: RFC
+  8259 defines no charset parameter for JSON (#101).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed
