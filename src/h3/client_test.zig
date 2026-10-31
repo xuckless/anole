@@ -2078,7 +2078,8 @@ test "h3 server: a response streamed past its send buffer completes and leaves n
     defer f.stop(gpa, io);
     const conn = try f.connect(gpa, io);
     defer conn.close();
-    // 4 MiB through a 64 KiB per-stream queue and a 4 MiB connection budget.
+    // 4 MiB through a per-stream queue that holds what is in flight plus
+    // 64 KiB (`bridge.pathCap`) and a 4 MiB connection budget.
     const body = try get(conn, "/download?n=4194304", gpa);
     defer gpa.free(body);
     try std.testing.expectEqual(@as(usize, 4 << 20), body.len);
@@ -2106,13 +2107,11 @@ test "h3 server: a response gets more than 64 KiB ahead of the client's acknowle
     defer ahead_gate.set(io);
     const relay = try Relay.start(gpa, io, f.ep.address());
     defer relay.stop();
+    // A fresh connection, so the congestion window is the initial one
+    // (about 14 KiB) and, with no ACK, stays so: what is in flight stays
+    // small, and the bound below shows the cap still holds.
     const conn = try f.connectVia(gpa, io, relay);
     defer conn.close();
-    // A 1 MiB download first, acknowledged as usual: the server's
-    // congestion window grows well past 64 KiB.
-    const warm = try get(conn, "/download?n=1048576", gpa);
-    defer gpa.free(warm);
-    try std.testing.expectEqual(@as(usize, 1 << 20), warm.len);
     const s = try request(conn, "GET", "/ahead", .{});
     defer s.release();
     try wait.waitFlag(io, "the /ahead handler started", &ahead_started);
@@ -2131,6 +2130,14 @@ test "h3 server: a response gets more than 64 KiB ahead of the client's acknowle
             return ahead_written.load(.acquire) > 64 * 1024;
         }
     }.cond);
+    // But the cap still bounds the queue: what nghttp3 took (the initial
+    // window plus one pull of about 32 KiB) plus 64 KiB, far below the
+    // 1 MiB response that an uncapped stream would queue at once.
+    try wait.expectStays(io, "the handler's writes stay under 256 KiB ahead of any acknowledgement", {}, struct {
+        fn cond(_: void) bool {
+            return ahead_written.load(.acquire) < 256 * 1024;
+        }
+    }.cond, wait.short_window);
     relay.releaseUp();
     try s.waitHead();
     try std.testing.expectEqual(@as(u16, 200), s.status);
@@ -2154,16 +2161,10 @@ test "h3 client: a request body gets more than 64 KiB ahead of the server's ackn
     const body = try gpa.alloc(u8, 1 << 20);
     defer gpa.free(body);
     for (body, 0..) |*b, i| b.* = @truncate(i *% 7);
-    // A 1 MiB upload first, acknowledged as usual: the client's congestion
-    // window grows well past 64 KiB.
-    const want = blk: {
-        const s = try request(conn, "POST", "/nw/sum", .{ .body = true });
-        try s.writer().writeAll(body);
-        try s.writer().flush();
-        try s.closeSend();
-        break :blk try finish(s, gpa);
-    };
-    defer gpa.free(want);
+    // The held upload goes first on the fresh connection, so the client's
+    // congestion window is the initial one and, with no ACK, stays so:
+    // what is in flight stays small, and the bound below shows the cap
+    // still holds.
     const s = try request(conn, "POST", "/nw/sum", .{ .body = true });
     defer s.release();
     // From now on the client hears nothing from the server, no ACK either.
@@ -2193,6 +2194,14 @@ test "h3 client: a request body gets more than 64 KiB ahead of the server's ackn
             return p.load(.acquire) > 64 * 1024;
         }
     }.cond);
+    // But the cap still bounds the queue: what nghttp3 took (the initial
+    // window plus one pull of about 32 KiB) plus 64 KiB, far below the
+    // 1 MiB body that an uncapped stream would queue at once.
+    try wait.expectStays(io, "the client's writes stay under 256 KiB ahead of any acknowledgement", &progress, struct {
+        fn cond(p: *std.atomic.Value(usize)) bool {
+            return p.load(.acquire) < 256 * 1024;
+        }
+    }.cond, wait.short_window);
     relay.releaseDown();
     try writer.await(io);
     try s.closeSend();
@@ -2200,6 +2209,15 @@ test "h3 client: a request body gets more than 64 KiB ahead of the server's ackn
     try std.testing.expectEqual(@as(u16, 200), s.status);
     const got = try s.reader().allocRemaining(gpa, .unlimited);
     defer gpa.free(got);
+    // The same body again, acknowledged as usual, for the expected sum.
+    const want = blk: {
+        const s2 = try request(conn, "POST", "/nw/sum", .{ .body = true });
+        try s2.writer().writeAll(body);
+        try s2.writer().flush();
+        try s2.closeSend();
+        break :blk try finish(s2, gpa);
+    };
+    defer gpa.free(want);
     try std.testing.expectEqualStrings(want, got);
 }
 
