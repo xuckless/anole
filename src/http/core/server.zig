@@ -552,10 +552,39 @@ pub const Connection = struct {
         lendWriteBuffer(self);
     }
 
+    /// Sends the responses corked in the write buffer (`Response._cork`), if
+    /// any, and gives the buffer back, so that what comes next -- a read
+    /// that may wait, a handler that may wait -- holds neither. Called at
+    /// every point where the connection task could wait with responses
+    /// owed. A failed send is the connection's recorded write error (a
+    /// cancel included, never swallowed).
+    pub fn flushOwed(self: *Connection) (WriteError || error{Unexpected})!void {
+        if (self.writer.end == 0) return;
+        self.writer.flush() catch return self.getWriteError() orelse error.Unexpected;
+        self.releaseWriteBuffer();
+    }
+
+    /// Best effort, on a connection about to close: the corked responses
+    /// go out before the close, as each would have before corking. What
+    /// cannot be sent is dropped. A cancel is passed on.
+    pub fn flushOwedBeforeClose(self: *Connection) std.Io.Cancelable!void {
+        if (self.writer.end == 0) return;
+        self.writer.flush() catch {
+            self.writer.end = 0;
+            if (self.getWriteError()) |err| if (err == error.Canceled) return error.Canceled;
+        };
+    }
+
+    /// Throws the corked responses away, on a connection that closes
+    /// without them (canceled, or its reads failed).
+    pub fn dropOwed(self: *Connection) void {
+        self.writer.end = 0;
+    }
+
     /// Takes the write buffer back, throwing away what it holds, and gives
-    /// it back to `write_pool` if it came from there. Every response is
-    /// flushed as it ends, so only a failed write leaves anything, on a
-    /// connection that is closing.
+    /// it back to `write_pool` if it came from there. A corked response is
+    /// flushed before this (`flushOwed`), so only a failed write leaves
+    /// anything, on a connection that is closing.
     pub fn releaseWriteBuffer(self: *Connection) void {
         self.writer.buffer = &.{};
         self.writer.end = 0;
@@ -2378,6 +2407,9 @@ pub fn Server(comptime Ctx: type) type {
             idle_read_buffer: []u8,
             buffers: *?*RequestBuffers,
         ) !void {
+            // Responses corked behind the one that closes (a head refused
+            // without an answer) still go out first.
+            try connection.flushOwedBeforeClose();
             if (buffers.*) |b| {
                 connection.replaceReadBuffer(idle_read_buffer);
                 connection.releaseWriteBuffer();
@@ -2890,7 +2922,14 @@ pub fn Server(comptime Ctx: type) type {
             defer if (buffers) |b| {
                 // An adopter's writer is its own, under its lock: it took
                 // it out of the buffers before it returned.
-                if (connection.adopter == null) connection.releaseWriteBuffer();
+                if (connection.adopter == null) {
+                    // Every exit sends or drops the corked responses
+                    // (`flushOwed`, `flushOwedBeforeClose`, `dropOwed`)
+                    // unless a write failed: anything left here is a
+                    // response lost.
+                    std.debug.assert(connection.writer.end == 0 or connection.getWriteError() != null);
+                    connection.releaseWriteBuffer();
+                }
                 self.request_buffers.release(b);
             };
             // A handler that handed the connection over (`Response.adopt`)
@@ -2941,6 +2980,9 @@ pub fn Server(comptime Ctx: type) type {
                 // itself must replace or clear.
                 var wait_armed = false;
                 if (connection.reader.bufferedLen() == 0) {
+                    // A guard: a response is corked only while the next
+                    // request is buffered, so nothing is owed here.
+                    try connection.flushOwed();
                     if (!self.config.request.keep_buffers_between_requests) {
                         if (buffers) |b| {
                             connection.useReadBuffer(&idle_read_buffer);
@@ -3044,6 +3086,10 @@ pub fn Server(comptime Ctx: type) type {
                     connection.useReadBuffer(b.read_buffer);
                     request.arena = b.arena.allocator();
                 }
+
+                // The rest of the head is still to come: the responses
+                // corked so far go out before the read waits for it.
+                if (!head_buffered) try connection.flushOwed();
 
                 parseHeaders(connection.reader, &parser) catch |err| switch (err) {
                     error.EndOfStream => return .close,
@@ -3205,19 +3251,40 @@ pub fn Server(comptime Ctx: type) type {
                     .allow = if (miss) |m| m.allow else null,
                     .error_handler = self.config.error_handler,
                 };
+                // Corked responses go out before a handler that may wait
+                // (a route not marked `no_wait`, a miss, or a body still to
+                // arrive), so its wait does not hold them back.
+                if (connection.writer.end != 0) {
+                    const never_waits = found != null and found.?.no_wait and
+                        (parser.isBodyComplete() or
+                            (request.content_length != null and request.content_length.? <= connection.reader.bufferedLen()));
+                    if (!never_waits) try connection.flushOwed();
+                }
                 const t0 = hooks.begin(self.io);
                 const run_result = executor.run();
                 hooks.end(&request, &response, run_result, executor.answered, t0);
                 run_result catch |err| switch (err) {
-                    error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
+                    error.ReadFailed => {
+                        connection.dropOwed();
+                        return connection.getReadError() orelse error.Unexpected;
+                    },
                     error.WriteFailed => return connection.getWriteError() orelse error.Unexpected,
                     // `Response.abort`: the connection closes under the
-                    // unfinished response, which is the abort.
+                    // unfinished response, which is the abort. The
+                    // responses corked before it still go out first.
                     error.ResponseAborted => {
                         log.debug("Response aborted ({f} {s})", .{ request.method, request.url });
+                        try connection.flushOwedBeforeClose();
                         return .close;
                     },
-                    else => |e| return e,
+                    error.Canceled => {
+                        connection.dropOwed();
+                        return error.Canceled;
+                    },
+                    else => |e| {
+                        try connection.flushOwedBeforeClose();
+                        return e;
+                    },
                 };
 
                 if (!parser.isBodyComplete()) {
@@ -3239,6 +3306,8 @@ pub fn Server(comptime Ctx: type) type {
                         // A tighter deadline the handler set (gRPC's read
                         // timeout) bounds the drain too; a lifted one does not.
                         const drain_deadline = earlier(request_deadline, request._handler_deadline);
+                        // The drain reads, and may wait for the body.
+                        try connection.flushOwed();
                         if (!try self.boundedDiscard(&parser, connection, max, timer, drain_deadline)) response.keepalive = false;
                     } else {
                         response.keepalive = false;
@@ -3281,8 +3350,11 @@ pub fn Server(comptime Ctx: type) type {
                 }
 
                 // The write buffer goes back between requests, so the next
-                // holds none while it waits to answer.
-                connection.releaseWriteBuffer();
+                // holds none while it waits to answer -- unless it holds
+                // corked responses, which go out with the next one's, or
+                // at the next point the connection could wait
+                // (`flushOwed`).
+                if (connection.writer.end == 0) connection.releaseWriteBuffer();
                 parser.reset();
                 request._reset();
                 buffers.?.resetArena();
