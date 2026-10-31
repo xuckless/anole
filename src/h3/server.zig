@@ -86,6 +86,15 @@ comptime {
 /// of datagrams started (`Conn.holding`), so that their answers and the
 /// ACK leave together in as few packets as they fit.
 const hold_ns = std.time.ns_per_ms;
+/// When the flush stops holding for a batch received at `ts`. A batch
+/// that comes while an earlier one's hold is still on keeps that hold's
+/// end: batches arriving faster than their requests answer would
+/// otherwise push the flush, and the ACKs in it, back without end, past
+/// the max_ack_delay we advertise (5 ms; RFC 9000 13.2.1).
+fn holdUntil(held: bool, until: u64, ts: u64) u64 {
+    return if (held) until else ts + hold_ns;
+}
+
 /// The UDP socket buffers each endpoint asks for, both ways: room for
 /// bursts from many connections between two reads (aegon, goose and
 /// agensio ask for 4 MiB too). The system caps it (Linux: rmem_max and
@@ -1503,6 +1512,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             round_ts: u64 = 0,
             round: std.atomic.Value(u32) = .init(0),
             hold_until: u64 = 0,
+            /// A batch came since the last flush: `hold_until` stays where
+            /// that batch set it (`holdUntil`).
+            hold_set: bool = false,
             /// Requests of the latest round whose handlers have yet to
             /// answer or wait: the flush holds for them (`hold_ns`).
             holding: std.atomic.Value(u32) = .init(0),
@@ -1810,7 +1822,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                     _ = conn.round.fetchAdd(1, .monotonic);
                     conn.holding.store(0, .monotonic);
                     conn.hold_off.store(false, .monotonic);
-                    conn.hold_until = ts + hold_ns;
+                    conn.hold_until = holdUntil(conn.hold_set, conn.hold_until, ts);
+                    conn.hold_set = true;
                 }
                 var r = remote;
                 var l: Addr = if (local) |a| .from(a) else conn.local;
@@ -1872,6 +1885,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         ep.setTimer(conn, conn.hold_until) catch return conn.lost();
                         return;
                     }
+                    conn.hold_set = false;
                     const flushed_at = conn.flush();
 
                     conn.lock();
@@ -4131,6 +4145,22 @@ test "0-RTT context: the same for the same settings, different when a limit or a
     with_webtransport.webtransport = true;
     try std.testing.expect(!std.mem.eql(u8, try Ctx.of(base, &a), try Ctx.of(with_webtransport, &b)));
     try std.testing.expectEqual(@as(u8, early_context_version), (try Ctx.of(base, &a))[0]);
+}
+
+test "flush hold: a later batch never moves the hold's end, so ACKs leave within max_ack_delay" {
+    // The first batch since a flush sets it.
+    var until = holdUntil(false, 0, 1000);
+    try std.testing.expectEqual(@as(u64, 1000 + hold_ns), until);
+    // Batches every 0.8 ms before that flush: the end stays put.
+    var ts: u64 = 1000;
+    for (0..10) |_| {
+        ts += 800 * std.time.ns_per_us;
+        until = holdUntil(true, until, ts);
+        try std.testing.expectEqual(@as(u64, 1000 + hold_ns), until);
+    }
+    // After the flush, the next batch starts a new hold.
+    try std.testing.expectEqual(ts + hold_ns, holdUntil(false, until, ts));
+    try std.testing.expect(hold_ns < 5 * std.time.ns_per_ms);
 }
 
 test "transport parameters: 256 concurrent requests per connection by default, and a 5 ms max_ack_delay" {
