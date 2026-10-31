@@ -1899,7 +1899,10 @@ pub const Stream = struct {
             if (n > 0) {
                 rest = rest[n..];
                 self.resumeLocked();
-            } else {
+            } else if (self.send_cap == null) {
+                // Under the path cap, nghttp3 taking queued bytes makes
+                // room (`readData` wakes this); a fixed `send_buffer` cap
+                // counts what is unacknowledged, so only acks do.
                 self.wants_room = true;
             }
             conn.unlock();

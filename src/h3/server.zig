@@ -2341,7 +2341,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Request body bytes not yet read by the handler.
             body: bridge.RecvQueue = .{},
             /// Woken when the body changes (data, end, reset), and when the
-            /// response has room (acknowledgments, budget, reset).
+            /// response has room (acknowledgments, budget, reset, or, under
+            /// the path cap, nghttp3 taking queued bytes in `readData`).
             rx: bridge.Signal = .{},
             tx: bridge.Signal = .{},
             waiter: bridge.Budget.Waiter = .{ .signal = undefined },
@@ -2849,8 +2850,15 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// stream, else following the connection's path
             /// (`bridge.pathCap`). Locked.
             fn sendCap(s: *const Stream) usize {
-                if (s.protocol.len > 0 or s.message) return message_cap;
+                if (!s.usesPathCap()) return message_cap;
                 return bridge.pathCapOf(&s.out, s.conn.budget.max);
+            }
+
+            /// Whether the send cap follows the path. Only then does
+            /// nghttp3 taking queued bytes (`readData`) make room: a fixed
+            /// cap counts what is unacknowledged, sent or not.
+            fn usesPathCap(s: *const Stream) bool {
+                return !(s.protocol.len > 0 or s.message);
             }
 
             /// Tells nghttp3 there is more of the body, if it was waiting
@@ -3422,9 +3430,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                         rest = rest[n..];
                         s.resume_();
                     } else {
-                        // Woken by an acknowledgment, by the budget, or by
-                        // nghttp3 taking queued bytes (`readData`).
-                        s.wants_room = true;
+                        // Woken by an acknowledgment, by the budget, or
+                        // (path cap only) by nghttp3 taking queued bytes
+                        // (`readData`).
+                        if (s.usesPathCap()) s.wants_room = true;
                         s.waiter.signal = &s.tx;
                         conn.budget.link(&s.waiter);
                     }
@@ -3466,7 +3475,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                             rest = rest[n..];
                             s.resume_();
                         } else {
-                            s.wants_room = true;
+                            if (s.usesPathCap()) s.wants_room = true;
                             s.waiter.signal = &s.tx;
                             conn.budget.link(&s.waiter);
                         }
