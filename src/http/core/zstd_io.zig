@@ -51,6 +51,24 @@ pub const Options = struct {
     pledged_size: ?usize = null,
 };
 
+/// A compression context for `Compress.initWith`, its memory from
+/// `allocator` (which must stay at that address while the context lives);
+/// null when out of memory. Free it with `freeContext`.
+pub fn createContext(allocator: *const Allocator) ?*c.ZSTD_CCtx {
+    return c.ZSTD_createCCtx_advanced(customMem(allocator));
+}
+
+pub fn freeContext(ctx: *c.ZSTD_CCtx) void {
+    _ = c.ZSTD_freeCCtx(ctx);
+}
+
+/// The memory a context holds, its workspace included.
+pub fn contextSize(ctx: *const c.ZSTD_CCtx) usize {
+    return c.ZSTD_sizeof_CCtx(ctx);
+}
+
+pub const Context = c.ZSTD_CCtx;
+
 pub const Compress = struct {
     writer: Writer,
     output: *Writer,
@@ -72,11 +90,33 @@ pub const Compress = struct {
             .allocator = allocator,
         };
         self.ctx = c.ZSTD_createCCtx_advanced(customMem(&self.allocator)) orelse return error.OutOfMemory;
+        try self.configure(options);
+    }
+
+    /// As `init`, over a context made by `createContext` and kept between
+    /// frames: the frame before, finished or abandoned, is dropped, and
+    /// zstd keeps its tables and workspace (index continuation), which a
+    /// fresh context would allocate and clear again.
+    pub fn initWith(self: *Compress, ctx: *c.ZSTD_CCtx, output: *Writer, buffer: []u8, options: Options) Error!void {
+        std.debug.assert(output.buffer.len > 0);
+        self.* = .{
+            .writer = .{ .buffer = buffer, .vtable = &.{ .drain = drain, .flush = flushFn } },
+            .output = output,
+            .ctx = ctx,
+            // Not used: the context's memory is the creator's.
+            .allocator = undefined,
+        };
+        if (c.ZSTD_isError(c.ZSTD_CCtx_reset(ctx, c.ZSTD_reset_session_only)) != 0) return error.CompressFailed;
+        try self.configure(options);
+    }
+
+    fn configure(self: *Compress, options: Options) Error!void {
         if (c.ZSTD_isError(c.ZSTD_CCtx_setParameter(self.ctx, c.ZSTD_c_compressionLevel, options.level)) != 0)
             return error.CompressFailed;
-        if (options.window_log) |log| {
-            if (c.ZSTD_isError(c.ZSTD_CCtx_setParameter(self.ctx, c.ZSTD_c_windowLog, log)) != 0) return error.CompressFailed;
-        }
+        // 0 is zstd's "from the level", which a reused context needs said
+        // again if an earlier frame set one.
+        const log = options.window_log orelse 0;
+        if (c.ZSTD_isError(c.ZSTD_CCtx_setParameter(self.ctx, c.ZSTD_c_windowLog, log)) != 0) return error.CompressFailed;
         if (options.pledged_size) |size| {
             if (c.ZSTD_isError(c.ZSTD_CCtx_setPledgedSrcSize(self.ctx, size)) != 0) return error.CompressFailed;
         }

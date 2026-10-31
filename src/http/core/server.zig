@@ -28,6 +28,7 @@ const body_read_reserve = @import("config.zig").body_read_reserve;
 const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersPool;
 const RequestBuffers = @import("server/request_buffers.zig").RequestBuffers;
 const block_cache = @import("block_cache.zig");
+const encoders = @import("encoders.zig");
 const WriteBuffer = @import("server/request_buffers.zig").WriteBuffer;
 const Chain = @import("middleware.zig").Chain;
 const Middleware = @import("middleware.zig").Middleware;
@@ -1954,12 +1955,19 @@ pub fn Server(comptime Ctx: type) type {
         /// last time, and the first executor's the shared ones too
         /// (`RequestBuffersPool.trimLocal`, `trimShards`); and the
         /// compressors' blocks it cached that no response took
-        /// (`block_cache`).
+        /// (`block_cache`), and the buffered-body encoders no response
+        /// took (`encoders`).
         fn trimLoop(self: *Self, shards: bool) std.Io.Cancelable!void {
+            // One task per executor, canceled at teardown: this runs on the
+            // thread that owns the encoders.
+            defer if (build_options.use_zlib) encoders.freeLocal();
             while (true) {
                 try self.io.sleep(request_buffers_trim_interval, .awake);
                 self.request_buffers.trimLocal();
                 if (shards) self.request_buffers.trimShards();
+                // The encoders first, so the blocks they give back are
+                // unmapped at the next trim if nothing takes them.
+                if (build_options.use_zlib) encoders.trimLocal();
                 if (build_options.use_zlib or build_options.use_brotli) block_cache.trimLocal();
                 // Objects retired with no writer after them (src/http/core/qsbr.zig).
                 if (shards) qsbr.pollAll();

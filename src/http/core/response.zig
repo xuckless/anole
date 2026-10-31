@@ -22,7 +22,7 @@ const ErrorFormat = @import("config.zig").ErrorFormat;
 const statusBody = @import("middleware.zig").statusBody;
 const zstd_io = if (build_options.use_zstd) @import("zstd_io.zig") else struct {};
 const brotli_io = if (build_options.use_brotli) @import("brotli_io.zig") else struct {};
-const block_cache = @import("block_cache.zig");
+const encoders = @import("encoders.zig");
 const json_out = @import("json_out.zig");
 
 var no_buf: [0]u8 = .{};
@@ -659,7 +659,7 @@ const StreamCompressor = struct {
         switch (coding) {
             .zstd => if (build_options.use_zstd) {
                 self.coder = .{ .zstd = undefined };
-                try self.coder.zstd.init(res.arena, &self.out, &.{}, .{});
+                try self.coder.zstd.init(res.arena, &self.out, &.{}, .{ .level = Response.zstd_level });
             } else unreachable,
             // Its memory is not the arena's: `finish` frees it, or
             // `Response.deinit` for a body never ended (`brotli_encoder`).
@@ -1734,6 +1734,8 @@ pub const Response = struct {
     }
 
     const compression_level: zlib.Level = .default;
+    /// zstd's level for responses, buffered or streamed.
+    const zstd_level: c_int = 3;
 
     /// A buffered body shorter than this is sent as it is, without trying:
     /// gzip adds 18 bytes of its own.
@@ -1852,7 +1854,7 @@ pub const Response = struct {
         const compressed = switch (coding) {
             .zstd => if (build_options.use_zstd) self.zstdBody(len) catch return else unreachable,
             .br => if (build_options.use_brotli) self.brotliBody(len) catch return else unreachable,
-            else => self.deflateBody(len) catch return,
+            else => if (build_options.use_zlib) self.deflateBody() catch return else unreachable,
         };
         if (compressed.len() >= len) return;
         self.body_buffer = compressed;
@@ -1860,13 +1862,15 @@ pub const Response = struct {
         self.markCompressed(coding);
     }
 
-    /// The buffered body as one zstd frame. The window shrinks to the body
-    /// on its own, since the length is known.
+    /// The buffered body as one zstd frame, through this executor's
+    /// context (`encoders`). The window shrinks to the body on its own,
+    /// since the length is known.
     fn zstdBody(self: *Response, len: usize) (std.mem.Allocator.Error || std.Io.Writer.Error || error{CompressFailed})!BodyBuffer {
         var compressed: BodyBuffer = try .init(self.arena);
         var out: BodyWriter = .into(self, &compressed);
         var z: zstd_io.Compress = undefined;
-        try z.init(self.arena, &out.interface, &.{}, .{ .window_log = null, .pledged_size = len });
+        try encoders.zstd(&z, &out.interface, zstd_level, len);
+        defer encoders.release();
         if (self.body_buffer.len() > 0) try self.body_buffer.writeTo(&z.writer) else try z.writer.writeAll(self.body);
         try z.finish();
         try out.interface.flush();
@@ -1886,23 +1890,15 @@ pub const Response = struct {
         return compressed;
     }
 
-    fn deflateBody(self: *Response, len: usize) (std.mem.Allocator.Error || std.Io.Writer.Error)!BodyBuffer {
+    /// The buffered body as one gzip stream, through this executor's
+    /// encoder (`encoders`), whose memory (about 300 KiB) comes from
+    /// `block_cache`. Its window is zlib's largest, whatever the body:
+    /// a reused encoder keeps the options it was made with.
+    fn deflateBody(self: *Response) (std.mem.Allocator.Error || std.Io.Writer.Error)!BodyBuffer {
         var compressed: BodyBuffer = try .init(self.arena);
         var out: BodyWriter = .into(self, &compressed);
-        // Sized to the body, and zlib's memory with it: a window much past
-        // the body finds nothing more to match. That memory (140 KiB and
-        // more) comes from `block_cache`, not the arena: an HTTP/2 or
-        // HTTP/3 stream's arena keeps less than that between requests, so
-        // it would be mapped again for each one.
-        const window_bits: u4 = @intCast(std.math.clamp(std.math.log2_int_ceil(usize, len), 9, 15));
-        var gzip = try zlib.Compress.init(block_cache.allocator, &out.interface, &.{}, .gzip, .{
-            .level = compression_level,
-            .window_bits = window_bits,
-            // Any less and the symbol buffer ends deflate blocks early
-            // enough to cost a few percent on bodies of about 512 bytes.
-            .mem_level = @min(window_bits - 6, 8),
-        });
-        defer gzip.deinit();
+        const gzip = try encoders.gzip(&out.interface, .{ .level = compression_level, .window_bits = 15, .mem_level = 8 });
+        defer encoders.release();
         if (self.body_buffer.len() > 0) try self.body_buffer.writeTo(&gzip.writer) else try gzip.writer.writeAll(self.body);
         try gzip.finish();
         try out.interface.flush();
