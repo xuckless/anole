@@ -74,6 +74,36 @@ Cells (HttpArena's request shapes where it has one):
 | sse-h2c | (4,000 subs) | | | 211 / 200 (settles at 206 / 194) | ≈ 48-51 KB settled RSS per subscriber |
 | net-tcp | 264k / 244k msg/s | 2,099 / 1,664 | 31k | 11 | kernel: netfilter 39-43% |
 
+## Conclusions: where S2 should start
+
+Ranked by waste per request and by how contained the fix is. Issue comments with the details went up on 2026-10-31 (#78, #89, #94, #97, #99, #100, #101, #102, #103, #130, #147, #151).
+
+1. **Compression (#101, K4)** is the largest per-request waste.
+   - A compressed `/json/50` costs 40-79 µs of one core, against about 4 µs uncompressed.
+   - Most of it is building a fresh encoder at a high level on every response. zstd spends more time zeroing a new context than compressing.
+   - The fix is contained (per-executor encoders, lower levels for dynamic bodies) and already first in S2.
+2. **HTTP/2 request bodies (#99, K1)**: the 64 KiB body queue for a 9-byte gRPC message, kept at its high-water mark per pooled stream.
+   - That is about 110 KB allocated per call and 0.84-0.95 GB RSS at 25,600 calls in flight.
+   - Sizing the queue to the body is an M0 change on nghttp2, before the takeover.
+3. **Static files (#102, K7)**: re-opened and re-read on every request.
+   - On epoll that's a blocking-pool handoff, 11-19 context switches per request; h3 also hits its 4 KiB sink cap.
+   - The body is copied three times on h2.
+   - The file cache removes the handoff and one copy. The other two go with the takeover.
+4. **The HTTP/2 takeover is justified on both CPU and memory.**
+   - CPU: nghttp2 18-22%, Anole's glue 14-17%, arena 11-14%.
+   - Memory: an idle h2c subscriber holds about 50 KB against about 5 KB over h1 (#97), and 38 KB of it is the nghttp2 session.
+5. **HTTP/3 per-request cost is fine on one core** (about 350k req/s for small JSON). The board's 64K on 64 cores still points at scaling or a stall, so #100's many-core diagnosis stays first.
+   - nghttp3 crosses its 15% takeover trigger (21% of h3-json), and memcpy is at 8% in h3-post.
+   - That's input for the H3-G decision once a second pass confirms it.
+6. **Not problems on this evidence:**
+   - the console (#103, no measurable cost on h1);
+   - TLS h1 in steady state (#130, 87% of cleartext's rate; the board's gap is handshakes and churn);
+   - `anole.net` user space (#147);
+   - the old h3 io_uring regressions (#89, #94; io_uring is now ahead of epoll).
+7. **Measurement:**
+   - Netfilter on loopback is 35-43% of the server's CPU in the h1 and TCP cells, so instructions:u per request is the trustworthy column for user-space changes.
+   - The one-core atlas can't show the many-core collapses (#99, #100, #101 on HttpArena). Those need the many-core runs the issues already plan.
+
 ## Findings by S2 item
 
 These are leads from one pass. The S2 work on each item verifies them (profile, then A/B, per AGENTS.md).
