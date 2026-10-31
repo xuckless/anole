@@ -31,10 +31,10 @@ nghttp2 and the rest) itself.
 mkdir api && cd api
 zig init
 rm src/root.zig
-zig fetch --save git+https://github.com/xuckless/anole#v0.4.1
+zig fetch --save git+https://github.com/xuckless/anole#v0.4.2
 ```
 
-(`#v0.4.1` is the latest release; a later tag or a commit works the same way.)
+(`#v0.4.2` is the latest release; a later tag or a commit works the same way.)
 
 Replace the `build.zig` that `zig init` wrote with this one:
 
