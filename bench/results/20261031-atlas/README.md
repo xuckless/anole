@@ -79,7 +79,7 @@ Cells (HttpArena's request shapes where it has one):
 Ranked by waste per request and by how contained the fix is. Issue comments with the details went up on 2026-10-31 (#78, #89, #94, #97, #99, #100, #101, #102, #103, #130, #147, #151).
 
 1. **Compression (#101, K4)** is the largest per-request waste.
-   - A compressed `/json/50` costs 40-79 µs of one core, against about 4 µs uncompressed.
+   - A compressed `/json/50` costs 40-79 µs of one core. Encoding the 50 items as JSON is about 9 µs of that, and the small `/json` route takes about 4.5 µs. Uncompressed `/json/50` wasn't measured.
    - Most of it is building a fresh encoder at a high level on every response. zstd spends more time zeroing a new context than compressing.
    - The fix is contained (per-executor encoders, lower levels for dynamic bodies) and already first in S2.
 2. **HTTP/2 request bodies (#99, K1)**: the 64 KiB body queue for a 9-byte gRPC message, kept at its high-water mark per pooled stream.
