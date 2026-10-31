@@ -329,11 +329,12 @@ test "public surface: Request, Response and websocket.Socket expose only the fie
             "brotli_encoder", "file",      "detached",
         };
         const response_decls = [_][]const u8{
-            "BodyFile", "HeaderError", "SendError",       "WriteError",    "trailer",          "abort",     "headersSent",
-            "peerGone", "deinit",      "SendFileOptions", "SendFileError", "sendFile",         "header",    "addHeader",
-            "writer",   "stream",      "clearWriter",     "resetBody",     "json",             "jsonWith",  "fail",
-            "render",   "encode",      "print",           "setCookie",     "startEventStream", "canDetach", "isDetached",
-            "detach",   "onFinish",    "adopt",           "write",         "memoryBodyLen",    "copyBody",  "problem",
+            "BodyFile",  "HeaderError", "SendError",       "WriteError",    "trailer",          "abort",     "headersSent",
+            "peerGone",  "deinit",      "SendFileOptions", "SendFileError", "sendFile",         "header",    "addHeader",
+            "writer",    "stream",      "clearWriter",     "resetBody",     "json",             "jsonWith",  "fail",
+            "render",    "encode",      "print",           "setCookie",     "startEventStream", "canDetach", "isDetached",
+            "detach",    "onFinish",    "adopt",           "write",         "memoryBodyLen",    "copyBody",  "problem",
+            "flushOwed",
         };
         fn listed(comptime list: []const []const u8, name: []const u8) bool {
             for (list) |n| if (std.mem.eql(u8, n, name)) return true;

@@ -1487,6 +1487,17 @@ pub const Response = struct {
         return .{ .body = try self.stream(buf) };
     }
 
+    /// HTTP/1.x: sends the responses to earlier pipelined requests that are
+    /// still corked in the connection's write buffer (`_cork`). For a
+    /// handler on a `no_wait` route that waits after all -- one that falls
+    /// back to waiting when it cannot `detach`, as the C ABI's consumer
+    /// routes do over HTTP/1.1 -- so its wait does not hold them back.
+    /// Nothing over HTTP/2 or HTTP/3, or with nothing owed.
+    pub fn flushOwed(self: *Response) SendError!void {
+        if (self._sink != null) return;
+        if (self._conn) |c| try c.flushOwed();
+    }
+
     /// Whether `detach` would work: the engine supports it, nothing has
     /// gone out, and every middleware the request passed is detach-safe.
     pub fn canDetach(self: *const Response) bool {
