@@ -37,6 +37,10 @@ breaking changes are listed anyway.
   and static-table references, and connections keep no decoder table.
   Session tickets from before resume without 0-RTT once (#100).
 
+- HTTP/3 acknowledges a client's packets within 5 ms at most
+  (`max_ack_delay`), down from 25 ms, so a request whose answer waits
+  does not hold the client's stream open for a delayed ACK (#100).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed

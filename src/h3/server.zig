@@ -258,6 +258,12 @@ fn transportParams(options: *const Options) ngtcp2.TransportParams {
     // HTTP datagrams (RFC 9297), for WebTransport.
     if (options.webtransport) params.max_datagram_frame_size = 65535;
     params.max_idle_timeout = std.math.lossyCast(u64, options.idle_timeout.toNanoseconds());
+    // 5 ms, not RFC 9000's 25: ngtcp2 delays our ACK by
+    // min(max_ack_delay, srtt/8), and h2load (like any ngtcp2 client)
+    // counts a request done only once its stream closes, which needs our
+    // ACK of the request. It also lowers the client's PTO for what it
+    // sends us. Kept only if the qlog shows late server ACKs (#100, HA3).
+    params.max_ack_delay = 5 * std.time.ns_per_ms;
     return params;
 }
 
@@ -4111,8 +4117,9 @@ test "0-RTT context: the same for the same settings, different when a limit or a
     try std.testing.expectEqual(@as(u8, early_context_version), (try Ctx.of(base, &a))[0]);
 }
 
-test "transport parameters: 256 concurrent requests per connection by default" {
+test "transport parameters: 256 concurrent requests per connection by default, and a 5 ms max_ack_delay" {
     const base: Options = .{ .address = .{ .ip4 = .loopback(0) }, .cert_pem = "", .key_pem = "" };
     const params = transportParams(&base);
     try std.testing.expectEqual(@as(u64, 256), params.initial_max_streams_bidi);
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_ms), params.max_ack_delay);
 }
