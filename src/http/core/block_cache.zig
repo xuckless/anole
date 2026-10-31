@@ -24,8 +24,12 @@
 //! blocks it kept that nothing took since the last trim, past `trim_keep`.
 const std = @import("std");
 
-/// Smallest allocation served from the cache.
-pub const big_min = 64 * 1024;
+/// Smallest allocation served from the cache, header included: just
+/// under the largest size class of musl's malloc (Zig's SmpAllocator,
+/// whose classes end at 32 KiB, its own 16-byte header counted), past
+/// which every malloc is an mmap and every free a munmap. With glibc the
+/// blocks from here to 64 KiB move from malloc's heap to this cache.
+pub const big_min = 32 * 1024 - 16;
 /// Most bytes one thread's cache holds; blocks given back past it are
 /// unmapped.
 pub const max_cached = 4 * 1024 * 1024;
@@ -206,4 +210,16 @@ test "block_cache: large blocks are kept and reused, small ones are malloc's" {
     const half = try allocator.alloc(u8, 100 * 1024);
     try std.testing.expect(half.ptr != big.ptr);
     allocator.free(half);
+}
+
+test "block_cache: a 40 KiB allocation is served from the cache" {
+    drainLocalForTest();
+    defer drainLocalForTest();
+    const first = try allocator.alloc(u8, 40 * 1024);
+    allocator.free(first);
+    try std.testing.expectEqual(@as(usize, 1), cached().count);
+    const again = try allocator.alloc(u8, 40 * 1024);
+    try std.testing.expectEqual(first.ptr, again.ptr);
+    try std.testing.expectEqual(@as(usize, 0), cached().count);
+    allocator.free(again);
 }
