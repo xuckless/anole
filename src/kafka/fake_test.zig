@@ -1230,6 +1230,49 @@ test "kafka producer: a produce to a topic dropped from the metadata cache betwe
     try testing.expectEqual(@as(i64, 2), broker.count("dropped", 0));
 }
 
+fn countTask(client: *kafka.Client, topic: []const u8, out: *TaskResult, count: *?u32) std.Io.Cancelable!void {
+    defer out.finish();
+    count.* = client.cluster.partitionCount(topic) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => {
+            out.err = err;
+            return;
+        },
+    };
+}
+
+test "kafka consumer: a topic dropped from the metadata cache between partitionCount's refresh and its lookup is still counted (#159)" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromMilliseconds(1) }));
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+    _ = try client.produce(&c, .{ .topic = "parts", .value = "warm" });
+    // Not cached any more: the count refreshes, and stops right after.
+    client.cluster.invalidate("parts");
+
+    var refreshed: TestHold = .{ .point = .metadata_refreshed };
+    refreshed.arm();
+    defer hold_mod.test_hold.store(null, .release);
+    var result: TaskResult = .{};
+    var count: ?u32 = null;
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    defer refreshed.let(io);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 0 }, countTask, .{ client, "parts", &result, &count });
+    try wait.waitFlag(io, "the count is held after its refresh", &refreshed.held);
+    // Meanwhile a sender's stale leader drops the topic again.
+    client.cluster.invalidate("parts");
+    refreshed.let(io);
+    try result.wait(io);
+    try testing.expectEqual(@as(?u32, 1), count);
+}
+
 test "kafka producer: a sender that cannot allocate its work list waits instead of spinning on its executor" {
     // The test's thread is executor 0: partition 1's leader, broker id 1,
     // has its sender on executor 1.

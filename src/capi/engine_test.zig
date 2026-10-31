@@ -583,7 +583,9 @@ const WtAnswerer = struct {
                 // go at once: it still goes out whole.
                 const s = try engine.wt.openStream(e, h, true);
                 try self.write(s, "hello from server", true);
-                try engine.wt.streamOp(e, s, .release, 0);
+                // The client may read it, end the session and so make the
+                // handle stale before this release.
+                try cleanup(engine.wt.streamOp(e, s, .release, 0));
                 _ = self.opens.fetchAdd(1, .monotonic);
             },
             .wt_stream => {
@@ -621,7 +623,7 @@ const WtAnswerer = struct {
                 _ = self.resets.fetchAdd(1, .monotonic);
                 const ent = self.streams.get(h) orelse return error.UnknownStream;
                 try self.forget(h);
-                try engine.wt.close(e, ent.session, 42, "bye");
+                try cleanup(engine.wt.close(e, ent.session, 42, "bye"));
             },
             .writable => {
                 _ = self.writables.fetchAdd(1, .monotonic);
@@ -651,7 +653,16 @@ const WtAnswerer = struct {
     fn forget(self: *WtAnswerer, h: u64) !void {
         var kv = self.streams.fetchRemove(h) orelse return;
         kv.value.got.deinit(alloc);
-        try engine.wt.streamOp(self.e, h, .release, 0);
+        try cleanup(engine.wt.streamOp(self.e, h, .release, 0));
+    }
+
+    /// A cleanup call's result as a C consumer sees it (lib.zig `cleanup`):
+    /// an object that is already over (`error.Over`) is done.
+    fn cleanup(result: engine.AnswerError!void) engine.AnswerError!void {
+        result catch |err| switch (err) {
+            error.Over => {},
+            else => return err,
+        };
     }
 };
 
@@ -2663,6 +2674,60 @@ test "capi engine: a fixed route behind a JWKS jwt middleware is not run inline;
         try e.drain();
         try std.testing.expect(e.wait(stopWaitMs()));
     }
+}
+
+/// One HTTP/1.1 GET with `Connection: close`; the whole response in `out`.
+fn rawGet(io: std.Io, port: u16, path: []const u8, out: []u8) ![]const u8 {
+    const stream = try (try std.Io.net.IpAddress.parse("127.0.0.1", port)).connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{path});
+    try w.interface.flush();
+    var rbuf: [1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var fw: std.Io.Writer = .fixed(out);
+    try readRest(&r, &fw);
+    return fw.buffered();
+}
+
+fn rateLimitCheck(io: std.Io, port: u16) !void {
+    var buf: [2048]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, try rawGet(io, port, "/fixed", &buf), "HTTP/1.1 200"));
+    const got = try rawGet(io, port, "/fixed", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 429"));
+    const head_end = (std.mem.indexOf(u8, got, "\r\n\r\n") orelse return error.NoBody) + 4;
+    var lower: [2048]u8 = undefined;
+    const head = std.ascii.lowerString(&lower, got[0..head_end]);
+    try std.testing.expect(std.mem.indexOf(u8, head, "\r\nretry-after: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "\r\nratelimit-remaining: 0\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "\r\ncontent-type: application/json") != null);
+    try std.testing.expectEqualStrings("{\"error\":\"Too Many Requests\"}", got[head_end..]);
+}
+
+test "capi engine: a rate_limit refusal answers in the configured error format, its headers kept" {
+    const json =
+        \\{"executors": 1, "timeouts": {"shutdown_ms": 200}, "errors": "json",
+        \\ "listeners": [{"address": "127.0.0.1", "port": 0}],
+        \\ "middleware": [{"rate_limit": {"limit": 1}}],
+        \\ "routes": [{"path": "/fixed", "respond": {"status": 200, "body": "ok"}}]}
+    ;
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    defer e.destroy();
+    _ = try e.attach(null, null, false);
+    try e.start();
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(rateLimitCheck, .{ io, e.port(0) });
+    try f.await(io);
+    try e.drain();
+    try std.testing.expect(e.wait(stopWaitMs()));
 }
 
 fn testVarsReal(_: ?*const anyopaque, name: []const u8) ?[]const u8 {

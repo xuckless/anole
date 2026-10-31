@@ -94,8 +94,19 @@ pub const Retry = struct {
 };
 
 fn invalid(field: []const u8, why: []const u8) error{InvalidOptions} {
-    log.err("invalid option {s}: {s}", .{ field, why });
+    if (!quietInvalid()) log.err("invalid option {s}: {s}", .{ field, why });
     return error.InvalidOptions;
+}
+
+/// Tests: a test that refuses options on purpose sets this so `invalid`'s
+/// `err` line (which the test runner counts as a failure) is left out.
+/// The module cannot use the HTTP core's `expect_log` (the core imports
+/// this module). Test builds only.
+pub var test_quiet_invalid: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
+
+fn quietInvalid() bool {
+    if (comptime !builtin.is_test) return false;
+    return test_quiet_invalid;
 }
 
 /// A per-call choice between the client's policy, none, or another.
@@ -666,9 +677,10 @@ fn AttemptResult(comptime attempt: anytype) type {
 
 /// Runs `attempt(context, n)` (n = 1, 2, ...) under `policy`. `Judge` has:
 ///     fn verdict(result: *const R) Verdict
-///     fn retryAfter(result: *const R) ?Duration   // optional: Retry-After, pushback
-///     fn discard(result: *R) void                 // optional: a result not returned
-///     fn reason(result: *const R) []const u8      // optional: the retries metric's `reason`
+///     pub fn retryAfter(result: *const R) ?Duration   // optional: Retry-After, pushback
+///     pub fn discard(result: *R) void                 // optional: a result not returned
+///     pub fn reason(result: *const R) []const u8      // optional: the retries metric's `reason`
+/// The optional ones are found by `@hasDecl`, which sees only `pub` ones.
 /// Returns the last attempt's result, or error.CircuitOpen before the first
 /// attempt when the breaker is open (a half-open breaker that has no probe
 /// slot left also rejects).
@@ -773,6 +785,8 @@ test "backoff: retry 10_000 and huge durations saturate at max" {
 }
 
 test "retry: validate refuses attempts 0 and 11, multiplier < 1" {
+    test_quiet_invalid = true;
+    defer test_quiet_invalid = false;
     try testing.expectError(error.InvalidOptions, (Retry{ .attempts = 0 }).validate());
     try testing.expectError(error.InvalidOptions, (Retry{ .attempts = 11 }).validate());
     try testing.expectError(error.InvalidOptions, (Retry{ .backoff = .{ .multiplier = 0.5 } }).validate());
@@ -850,20 +864,20 @@ test "breaker: half-open lets one probe; success closes and resets open_for; fai
     try testing.expect(b.allow(now) == null);
     b.record(probe, .failure, now);
     try testing.expectEqual(Breaker.State.open, b.state());
-    // Doubled to 2 s.
-    try testing.expect(b.allow(now + 1900 * std.time.ns_per_ms) == null);
+    // Doubled to 2 s, less a random cut of up to a fifth: 1.6 .. 2 s.
+    try testing.expect(b.allow(now + 1500 * std.time.ns_per_ms) == null);
     now += 2100 * std.time.ns_per_ms;
     const second = b.allow(now).?;
     try testing.expect(second.probe);
     b.record(second, .failure, now);
-    // Doubled again, capped at 3 s.
-    try testing.expect(b.allow(now + 2900 * std.time.ns_per_ms) == null);
+    // Doubled again, capped at 3 s, less the cut: 2.4 .. 3 s.
+    try testing.expect(b.allow(now + 2300 * std.time.ns_per_ms) == null);
     now += 3100 * std.time.ns_per_ms;
     b.record(b.allow(now).?, .success, now);
     try testing.expectEqual(Breaker.State.closed, b.state());
-    // The next trip is open for 1 s again.
+    // The next trip is open for 1 s again, less the cut: 0.8 .. 1 s.
     trip(&b, now);
-    try testing.expect(b.allow(now + 900 * std.time.ns_per_ms) == null);
+    try testing.expect(b.allow(now + 700 * std.time.ns_per_ms) == null);
     try testing.expect(b.allow(now + 1100 * std.time.ns_per_ms) != null);
 }
 
@@ -920,7 +934,7 @@ const CountJudge = struct {
             else => .failure,
         };
     }
-    fn discard(_: *u32) void {
+    pub fn discard(_: *u32) void {
         discarded += 1;
     }
 };
@@ -960,7 +974,7 @@ const HintJudge = struct {
     fn verdict(r: *const u32) Verdict {
         return CountJudge.verdict(r);
     }
-    fn retryAfter(_: *const u32) ?Duration {
+    pub fn retryAfter(_: *const u32) ?Duration {
         return hint;
     }
 };

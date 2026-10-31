@@ -211,6 +211,9 @@ pub const Transport = struct {
             error.BrokenPipe,
             // std's name for a send after the peer reset (EPIPE).
             error.SocketUnconnected,
+            // ECONNABORTED / WSAECONNABORTED: the local stack aborted the
+            // connection after the peer vanished (Go's isClosedConnError).
+            error.ConnectionAborted,
             => true,
             else => false,
         };

@@ -99,10 +99,13 @@ const WatchRig = struct {
         };
         errdefer e.destroy();
         const c = try e.attach(null, null, true);
-        try e.start();
+        // Made fake before the watches start: started first, they would
+        // register with the Redis hub, which reconnects in the background.
+        try e.open();
         r.* = .{ .e = e, .rx = .{ .c = c }, .orders = engine.watch.find(e, "orders").?, .feed = engine.watch.find(e, "feed").? };
         r.orders.w._fake();
         r.feed.w._fake();
+        try e.start();
     }
 
     fn deinit(r: *WatchRig) void {
@@ -257,6 +260,9 @@ test "capi engine: handle kinds: an sse handle given to ws_send, a watch handle 
     };
     defer e.destroy();
     const c = try e.attach(null, null, true);
+    try e.open();
+    const orders = engine.watch.find(e, "orders").?;
+    orders.w._fake();
     try e.start();
     var a: sse_test.SseConsumer = .{ .e = e, .c = c };
     const t = try std.Thread.spawn(.{}, sse_test.SseConsumer.run, .{&a});
@@ -264,8 +270,6 @@ test "capi engine: handle kinds: an sse handle given to ws_send, a watch handle 
         a.stop.store(true, .release);
         t.join();
     }
-    const orders = engine.watch.find(e, "orders").?;
-    orders.w._fake();
     const wh = try engine.watch.listen(e, orders, c, listenOpts(0, abi.WATCH_NATIVE), 5);
 
     const rt = try zio.Runtime.init(alloc, .{});

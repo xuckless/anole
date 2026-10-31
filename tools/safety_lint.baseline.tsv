@@ -16,7 +16,7 @@ src/capi/db.zig	U3	11
 src/capi/engine.zig	C3	1
 src/capi/engine.zig	L2	2
 src/capi/engine.zig	U3	41
-src/capi/grpc.zig	C3	2
+src/capi/grpc.zig	C3	1
 src/capi/grpc.zig	L2	1
 src/capi/grpc.zig	U3	8
 src/capi/jobs.zig	L2	1

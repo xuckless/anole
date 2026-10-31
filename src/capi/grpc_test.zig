@@ -437,6 +437,90 @@ test "capi grpc: a client-streaming call whose deadline passes while it waits fo
     try f.await(io);
 }
 
+/// `grpc_capi.test_canceled_wait` for the test below: the call's deadline
+/// cancel was delivered at its wait; the call's task stays (shielded,
+/// polling with the test's hang guard, so the reader beside it runs) until
+/// its reader has failed too. Only the first canceled wait is held.
+/// `read_error` is read without an atomic: the engine has one executor and
+/// the reader is placed `.local`, so both run on this thread.
+const CanceledWait = struct {
+    var held: std.atomic.Value(bool) = .init(false);
+    var gave_up: std.atomic.Value(bool) = .init(false);
+
+    fn hook(io: std.Io, s: *engine.Slot) void {
+        if (held.swap(true, .acq_rel)) return;
+        const prot = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(prot);
+        wait.waitUntil(io, "the call's reader failed", s, readFailed) catch gave_up.store(true, .release);
+    }
+
+    fn readFailed(s: *engine.Slot) bool {
+        return s.grpc.read_error != null;
+    }
+
+    fn isHeld(_: void) bool {
+        return held.load(.acquire);
+    }
+};
+
+/// A client-streaming call with a deadline, on one executor, nobody
+/// polling: the deadline cancels the call's task as it waits for its
+/// answer, and then (forced by the hook) a message over the limit makes
+/// its reader fail before the task looks at the call again.
+fn cancelWithReadError(e: *engine.Engine, io: std.Io) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const conn = try anole.h2.ClientConnection.connect(alloc, io, .{ .host = "127.0.0.1", .port = e.port(0) });
+    defer conn.close();
+    var channel: grpc.Channel = .{ .conn = conn, .authority = "localhost" };
+    const client: grpc.Client(Echo) = .{ .channel = &channel };
+    // The deadline as plain metadata, as in `deadlineWhileParked`: the
+    // server's own, not one the client enforces.
+    var s = try client.stream("ClientStream", arena, .{ .metadata = &.{.{ .name = "grpc-timeout", .value = "100m" }} });
+    defer s.deinit();
+    try s.send(.{ .message = "a" });
+    try wait.waitUntil(io, "the deadline's cancel reached the call's wait", {}, CanceledWait.isHeld);
+    const big: [200]u8 = @splat('x');
+    try s.send(.{ .message = &big });
+    try std.testing.expect(try s.receive() == null);
+    try std.testing.expect(!CanceledWait.gave_up.load(.acquire));
+    try std.testing.expectEqual(grpc.Code.deadline_exceeded, s.status.?.code);
+    try std.testing.expectEqualStrings("deadline exceeded", s.status.?.message);
+}
+
+test "capi grpc: a deadline cancel delivered to a call's wait wins over a read error that lands before the task looks again: DEADLINE_EXCEEDED" {
+    if (comptime !features.http2) return error.SkipZigTest;
+    const set = @import("anole_test_descriptors").set;
+    const b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(set.len));
+    defer alloc.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, set);
+    const json = try std.fmt.allocPrint(alloc,
+        \\{{"executors": 1, "timeouts": {{"shutdown_ms": 200}},
+        \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
+        \\ "grpc": {{"descriptor_set": "{s}", "services": [{{"name": "anole.test.Echo", "handler": 10, "max_message_size": 64}}]}}}}
+    , .{b64});
+    defer alloc.free(json);
+    var why_buf: [400]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    defer e.destroy();
+    CanceledWait.held.store(false, .release);
+    CanceledWait.gave_up.store(false, .release);
+    grpc_capi.test_canceled_wait = CanceledWait.hook;
+    defer grpc_capi.test_canceled_wait = null;
+    _ = try e.attach(null, null, false);
+    try e.start();
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(cancelWithReadError, .{ e, io });
+    try f.await(io);
+}
+
 fn runCheck(comptime transport: Transport, comptime checkFn: fn (*Ctx) anyerror!void, a: *Consumer, port: u16, io: std.Io) anyerror!void {
     var arena_state: std.heap.ArenaAllocator = .init(alloc);
     defer arena_state.deinit();

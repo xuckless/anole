@@ -3,6 +3,99 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.2 (unreleased)
+
+### Changed
+
+- The JWT, API key, RBAC, CSRF and rate-limit middlewares (and the C ABI's
+  `rate_limit`) refuse a request by returning `error.Unauthorized`,
+  `error.BadRequest`, `error.Forbidden` or `error.TooManyRequests` with
+  their protocol headers set (`WWW-Authenticate`, `Retry-After`,
+  `RateLimit-*`), instead of writing a plain-text body themselves. An app
+  with an `error_handler` or `uncaughtError` now receives these errors; a
+  middleware of its own that does work after `try next.call()` skips it on
+  a refusal, as for any handler error. The CSRF body no longer says why
+  (the reason is logged at `debug`) (#33).
+
+### Fixed
+
+- Auth, CSRF and rate-limit refusals ignored `ServerOptions.errors`: a JSON
+  API answered `{"error":...}` for its own errors and plain text for the
+  middleware's. They now follow the server's error format, and their 503
+  and 500 answers (a key store or limiter that failed, a weak HMAC key) do
+  too (#33).
+
+- A connection the local stack aborted after its peer vanished
+  (`ConnectionAborted`: ECONNABORTED, Windows' WSAECONNABORTED) counts as a
+  departed peer: no "HTTP/2 write error" log line, `peerGone()` and a gRPC
+  call's `cancelled()` are true, and `anole.net` reports a reset instead of a
+  failure (#34).
+- `Router.middlewares` assigned directly (instead of through `use()`) was
+  kept as the caller's slice by every route registered after it, so a
+  stack array or reused buffer was read after it changed or went out of
+  scope. A route now keeps a copy in the router's arena. `use()` is the
+  supported way to add global middleware; a list assigned after the last
+  route is still read as is for 404/405 answers (#38).
+- A typed handler returning `anole.WithStatus(.no_content, void)`,
+  `anole.Created(void)` or `anole.Accepted(void)` did not compile
+  (std.json cannot write `void`). It now sends the status (and `Location`)
+  with no body (#142).
+- C ABI gRPC: a call canceled while it waits for its answer ends as
+  canceled (DEADLINE_EXCEEDED for its deadline) even if a request read
+  error or the server stopping landed first; the cancel is no longer
+  swallowed (#140).
+- Windows: connecting a Unix-socket client (a `.unix` listener's clients, the
+  gRPC `unix:` client, `anole console`) no longer goes through ConnectEx after
+  binding the socket to the all-NUL name; it uses a plain connect, as .NET and
+  Go do there. One such connect failed with `ConnectEx failed: .EFAULT` (#139).
+  The fix is in Anole's zio fork.
+- watch: a PostgreSQL or Redis watch is always taken out of the shared
+  LISTEN/SUBSCRIBE connection when it stops, also when a drain could not
+  start its stop task (or a test made a started watch fake). Freed while
+  still listed, it was written to when that connection reconnected (#157).
+- MongoDB: a retryable write that is a new client's first call is retried
+  on a retryable error, as later ones are. It used to go without a session,
+  so it was never retried (#143).
+- MongoDB: sessions about to expire are dropped when given back, oldest
+  first, so the session pool no longer keeps every session of a burst
+  (#160).
+- SQLite: a call through a copy of a `Tx` whose transaction ended (`exec`,
+  `one`, `commit`...) fails with "the transaction is over"; it used to run
+  on the writer, inside the next holder's transaction (#160).
+- SQLite: a write whose caller is canceled after the write ran to its end
+  answers its own result (the cancel stays pending), not Canceled: a
+  committed INSERT or COMMIT is no longer reported as canceled, and a
+  constraint failure is reported as that (#160). A statement the cancel
+  interrupted still answers Canceled, including one run through
+  `Conn.run` (zig-sqlite's `SQLiteInterrupt`).
+- Kafka: a consumer group's leader counts the partitions of a topic whose
+  metadata a stale leader dropped right after the refresh, instead of
+  assigning none of them (#159).
+- Kafka: a producer whose resolver could not allocate its work for a round
+  tries again 250 ms later; records waiting for their leader were neither
+  sent nor expired (#159, #162).
+- HTTP/2: a graceful drain no longer waits until `timeouts.shutdown` for a
+  stream that was answered while its client keeps the request side open (a
+  client-streaming gRPC call answered early, say). At drain start such a
+  stream is reset with RST_STREAM(NO_ERROR), and so is one answered during
+  the drain (#141).
+- net: a raw TCP listener whose handler has no `drain` callback no longer
+  holds a stop until `timeouts.shutdown`. At drain start each connection is
+  closed as `conn.close()` does (after a callback in progress): what is
+  queued goes out, Anole ends its side, and the connection closes, with
+  reason `.drain`, when the peer ends its side too or after 2 s. Task-form
+  handlers and the C ABI's listeners are unchanged. See docs/net.md (#107).
+- HTTP/2 client: a response read after its stream closed, or released with
+  its body unread, now gives its bytes back to the connection's
+  flow-control window. Before, each such response kept its size of the
+  window, and a connection (the shared one of `h2c_hosts`, say) stopped
+  receiving response bodies after 16 MiB of them, failing every request on
+  it with `Timeout` (#149).
+- A stop that reaches an accept loop while it logs (that it waits for a
+  connection slot under `max_connections`, or that it could not start a
+  connection's handler) no longer leaves the loop blocked in its next accept
+  under `std.Io.Threaded` (#158).
+
 ## 0.4.1 (2026-10-30)
 
 ### Security

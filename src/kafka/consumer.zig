@@ -423,10 +423,10 @@ fn memberMain(m: *Member) std.Io.Cancelable!void {
         };
         failures = 0;
     }
-    leaveGroup(m);
+    try leaveGroup(m);
 }
 
-fn leaveGroup(m: *Member) void {
+fn leaveGroup(m: *Member) std.Io.Cancelable!void {
     const c = m.consumer;
     // A static member keeps its place for the session timeout.
     var ibuf: [128]u8 = undefined;
@@ -438,8 +438,12 @@ fn leaveGroup(m: *Member) void {
     const arena = arena_state.allocator();
     var e: protocol.Enc = .init(arena);
     protocol.encodeLeaveGroup(&e, c.opts.group, m.member_id.items, null) catch return;
-    // Swallows a cancel (C3): the consumer retrofit's (step 9), not covered by step 4.
-    _ = coord.call(arena, .leave_group, e.bytesWritten(), .fromSeconds(5)) catch {};
+    // Best effort: a failure leaves the member to the session timeout. A
+    // cancel is passed on (C3, #159).
+    _ = coord.call(arena, .leave_group, e.bytesWritten(), .fromSeconds(5)) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => {},
+    };
 }
 
 const SessionError = error{

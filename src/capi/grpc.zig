@@ -695,16 +695,17 @@ fn wait(x: *Exec, si: u32, gen: u32, call: *Call, canceled_in: bool) anyerror!vo
             },
             .queued, .out => {
                 if (canceled or s.grpc.read_error != null) {
-                    // Why it is over, for the consumer that saw it.
-                    var reason: u16 = abi.ABORT_CLIENT;
+                    // Why it is over, for the consumer that saw it. A
+                    // delivered cancel wins over a read error that landed
+                    // too (as in `engine.waitForAnswer`).
+                    var reason: u16 = abi.ABORT_BODY;
                     var status: u16 = 0;
-                    if (s.grpc.read_error != null) {
-                        reason = abi.ABORT_BODY;
-                        status = @intCast(@backingInt(call.status));
-                    } else if (call.deadlineExceeded()) {
-                        reason = abi.ABORT_DEADLINE;
-                        status = abi.GRPC_STATUS_DEADLINE_EXCEEDED;
-                    } else reason = e.clientReason();
+                    if (canceled) {
+                        if (call.deadlineExceeded()) {
+                            reason = abi.ABORT_DEADLINE;
+                            status = abi.GRPC_STATUS_DEADLINE_EXCEEDED;
+                        } else reason = e.clientReason();
+                    } else status = @intCast(@backingInt(call.status));
                     if (s.word.cmpxchgStrong(w, pack(gen, .expired), .acq_rel, .acquire) == null) {
                         if (stateOf(w) == .out and !s.abandoned) x.postAbort(x.handleOf(si, gen), reason, status);
                         break .expired;
@@ -713,6 +714,7 @@ fn wait(x: *Exec, si: u32, gen: u32, call: *Call, canceled_in: bool) anyerror!vo
                 }
                 s.event.wait(io) catch {
                     canceled = true;
+                    if (comptime builtin.is_test) if (test_canceled_wait) |hook| hook(io, s);
                 };
                 s.event.reset();
             },
@@ -721,9 +723,12 @@ fn wait(x: *Exec, si: u32, gen: u32, call: *Call, canceled_in: bool) anyerror!vo
     };
     switch (outcome) {
         .expired => {
-            const err = s.grpc.read_error orelse error.Canceled;
+            // A delivered cancel is the outcome even when a read error
+            // landed too: `serving.finish` consumes the deadline's own and
+            // re-arms any other (SAFETY.md C3), and must see it.
+            const err: anyerror = if (canceled) error.Canceled else s.grpc.read_error.?;
             x.release(si);
-            if (err == error.Canceled) {
+            if (canceled) {
                 if (call.deadlineExceeded()) {
                     _ = e.expired_count.fetchAdd(1, .monotonic);
                 } else _ = e.aborted_count.fetchAdd(1, .monotonic);
@@ -748,6 +753,12 @@ fn wait(x: *Exec, si: u32, gen: u32, call: *Call, canceled_in: bool) anyerror!vo
         },
     }
 }
+
+/// A test hook (test builds only): called on a call's task when a cancel
+/// was delivered at its wait for the answer, before it looks at the call
+/// again, so a test can land a read error in between without counting on
+/// timing.
+pub var test_canceled_wait: if (builtin.is_test) ?*const fn (std.Io, *Slot) void else void = if (builtin.is_test) null else {};
 
 /// The client- or bidirectional-streaming call's request messages, to the
 /// consumer while it has credit, then the half-close. A task beside the

@@ -435,6 +435,7 @@ test {
     _ = @import("fuzz.zig");
     _ = @import("log.zig");
     _ = @import("typed.zig");
+    _ = @import("unix_socket_test.zig");
     _ = testing;
     _ = http;
     _ = resilience;
