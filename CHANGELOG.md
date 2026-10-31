@@ -13,9 +13,12 @@ breaking changes are listed anyway.
   connection could wait (more input to read, a handler that is not
   `noWait`, a body still to arrive) or when the 16 KiB buffer fills. A
   pipelined batch of 16 took 16 sends; now it takes one (one TLS record
-  under TLS). Single requests are unchanged. New `Response.flushOwed()` for
-  a `noWait` handler that may still wait on HTTP/1.1; the C ABI's consumer
-  routes and gRPC methods call it (K3, PERFORMANCE_AUDIT).
+  under TLS). Bodyless requests and requests whose handler reads its body
+  batch; a request with a body its handler leaves unread still flushes
+  before the body is thrown away. Single requests are unchanged. New
+  `Response.flushOwed()` for a `noWait` handler that may still wait on
+  HTTP/1.1; the C ABI's consumer routes and gRPC methods call it (S2 K3;
+  issue number to come).
 
 ## 0.4.2 (2026-10-31)
 

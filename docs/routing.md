@@ -836,7 +836,9 @@ response leaves with the rest of the batch. Over HTTP/1.1, pipelined
 requests to `noWait` routes that arrive in one read are answered in one
 write: each response waits in the write buffer while the next request is
 already there, and they all go out before the connection could wait (for
-more input, or for a handler that is not `noWait`). A `noWait` handler that
+more input, or for a handler that is not `noWait`). A request whose body
+the handler leaves unread still flushes the batch before the body is
+thrown away. A `noWait` handler that
 waits anyway (one that falls back to waiting when `res.canDetach()` is
 false) calls `res.flushOwed()` first, so the earlier answers are not held
 behind its wait. The promise covers every
