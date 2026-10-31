@@ -3,6 +3,15 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.2 (unreleased)
+
+### Fixed
+
+- C ABI gRPC: a call canceled while it waits for its answer ends as
+  canceled (DEADLINE_EXCEEDED for its deadline) even if a request read
+  error or the server stopping landed first; the cancel is no longer
+  swallowed (#140).
+
 ## 0.4.1 (2026-10-30)
 
 ### Security
