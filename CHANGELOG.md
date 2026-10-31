@@ -49,6 +49,14 @@ breaking changes are listed anyway.
   pacing allows, up from 10, and each HTTP/3 endpoint's outbox holds
   256 KiB; raw `anole.net` UDP sockets keep their 128 KiB outboxes (#100).
 
+### Fixed
+
+- An HTTP/3 connection's flush, which waits up to 1 ms for the requests a
+  batch of packets started, no longer starts that wait over with every
+  new batch: a client sending requests faster than they answered could
+  keep its answers and ACKs back well past `max_ack_delay`. The wait now
+  ends 1 ms after the first batch since the last flush (#100).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed
