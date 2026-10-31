@@ -1734,8 +1734,10 @@ pub const Response = struct {
     }
 
     const compression_level: zlib.Level = .default;
-    /// zstd's level for responses, buffered or streamed.
-    const zstd_level: c_int = 3;
+    /// zstd's level for responses, buffered or streamed. On JSON of 4-8 KB
+    /// level 1 is both smaller and faster than zstd's default 3
+    /// (research/s2/k4-compression.md, §2).
+    const zstd_level: c_int = 1;
 
     /// A buffered body shorter than this is sent as it is, without trying:
     /// gzip adds 18 bytes of its own.
