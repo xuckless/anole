@@ -1,0 +1,5 @@
+      1 uprobe:/proc/1733762/root/lib/x86_64-linux-gnu/libc.so.6:free /pid == 1733762 && @live[arg0]/ { delete(@live, arg0); delete(@lst, arg0); }
+      1 /out/mem.bt:3:118-136: WARNING: Can't delete map element because it does not exist.
+      1 Attached 14 probes
+      1 Additional Info - helper: map_delete_elem, retcode: -2
+      1                                                                                                                      ~~~~~~~~~~~~~~~~~~

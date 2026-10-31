@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="256" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fff"/><text x="4" y="13">malloc bytes held at the window&#x27;s end: h1-jsoncomp-br (uring, 1 executor) (1865599 samples)</text>
+<g><title>malloc held (1865599 samples, 100.00%)</title><rect x="0.0" y="240" width="1600.0" height="15" fill="hsl(39,80%,62%)"/><text x="2.0" y="251">malloc held</text></g>
+<g><title>coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (1865599 samples, 100.00%)</title><rect x="0.0" y="224" width="1600.0" height="15" fill="hsl(41,80%,62%)"/><text x="2.0" y="235">coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn</text></g>
+<g><title>task.AnyTask.startFn (1865599 samples, 100.00%)</title><rect x="0.0" y="208" width="1600.0" height="15" fill="hsl(8,80%,62%)"/><text x="2.0" y="219">task.AnyTask.startFn</text></g>
+<g><title>group.Group.spawnInto__func_2363.Wrapper.start (1865599 samples, 100.00%)</title><rect x="0.0" y="192" width="1600.0" height="15" fill="hsl(21,80%,62%)"/><text x="2.0" y="203">group.Group.spawnInto__func_2363.Wrapper.start</text></g>
+<g><title>server.Server(main.App).handleConnectionWrapper (1865599 samples, 100.00%)</title><rect x="0.0" y="176" width="1600.0" height="15" fill="hsl(0,80%,62%)"/><text x="2.0" y="187">server.Server(main.App).handleConnectionWrapper</text></g>
+<g><title>server.Server(main.App).handleRequests (1865599 samples, 100.00%)</title><rect x="0.0" y="160" width="1600.0" height="15" fill="hsl(1,80%,62%)"/><text x="2.0" y="171">server.Server(main.App).handleRequests</text></g>
+<g><title>middleware.Chain(main.App).run (1210572 samples, 64.89%)</title><rect x="0.0" y="144" width="1038.2" height="15" fill="hsl(29,80%,62%)"/><text x="2.0" y="155">middleware.Chain(main.App).run</text></g>
+<g><title>middleware.Chain(main.App).call (1210572 samples, 64.89%)</title><rect x="0.0" y="128" width="1038.2" height="15" fill="hsl(46,80%,62%)"/><text x="2.0" y="139">middleware.Chain(main.App).call</text></g>
+<g><title>handlers.adapt__struct_6377.h (1210572 samples, 64.89%)</title><rect x="0.0" y="112" width="1038.2" height="15" fill="hsl(8,80%,62%)"/><text x="2.0" y="123">handlers.adapt__struct_6377.h</text></g>
+<g><title>heap.ArenaAllocator.alloc (423072 samples, 22.68%)</title><rect x="0.0" y="96" width="362.8" height="15" fill="hsl(15,80%,62%)"/><text x="2.0" y="107">heap.ArenaAllocator.alloc</text></g>
+<g><title>json.Stringify.encodeJsonString (787500 samples, 42.21%)</title><rect x="362.8" y="96" width="675.4" height="15" fill="hsl(12,80%,62%)"/><text x="364.8" y="107">json.Stringify.encodeJsonString</text></g>
+<g><title>response.BodyWriter.drain (787500 samples, 42.21%)</title><rect x="362.8" y="80" width="675.4" height="15" fill="hsl(24,80%,62%)"/><text x="364.8" y="91">response.BodyWriter.drain</text></g>
+<g><title>response.BodyBuffer.nextSegment (787500 samples, 42.21%)</title><rect x="362.8" y="64" width="675.4" height="15" fill="hsl(27,80%,62%)"/><text x="364.8" y="75">response.BodyBuffer.nextSegment</text></g>
+<g><title>heap.ArenaAllocator.alloc (787500 samples, 42.21%)</title><rect x="362.8" y="48" width="675.4" height="15" fill="hsl(15,80%,62%)"/><text x="364.8" y="59">heap.ArenaAllocator.alloc</text></g>
+<g><title>response.Response.write (655027 samples, 35.11%)</title><rect x="1038.2" y="144" width="561.8" height="15" fill="hsl(51,80%,62%)"/><text x="1040.2" y="155">response.Response.write</text></g>
+<g><title>Io.Writer.writeVecAll (537 samples, 0.03%)</title><rect x="1038.2" y="128" width="0.5" height="15" fill="hsl(25,80%,62%)"/><text x="1040.2" y="139"></text></g>
+<g><title>brotli_io.Compress.drain (537 samples, 0.03%)</title><rect x="1038.2" y="112" width="0.5" height="15" fill="hsl(55,80%,62%)"/><text x="1040.2" y="123"></text></g>
+<g><title>brotli_io.Compress.compress (537 samples, 0.03%)</title><rect x="1038.2" y="96" width="0.5" height="15" fill="hsl(45,80%,62%)"/><text x="1040.2" y="107"></text></g>
+<g><title>BrotliEncoderCompressStream (537 samples, 0.03%)</title><rect x="1038.2" y="80" width="0.5" height="15" fill="hsl(16,80%,62%)"/><text x="1040.2" y="91"></text></g>
+<g><title>BrotliAllocate (537 samples, 0.03%)</title><rect x="1038.2" y="64" width="0.5" height="15" fill="hsl(15,80%,62%)"/><text x="1040.2" y="75"></text></g>
+<g><title>block_cache.alloc (537 samples, 0.03%)</title><rect x="1038.2" y="48" width="0.5" height="15" fill="hsl(49,80%,62%)"/><text x="1040.2" y="59"></text></g>
+<g><title>brotli_io.Compress.compress (640506 samples, 34.33%)</title><rect x="1038.7" y="128" width="549.3" height="15" fill="hsl(45,80%,62%)"/><text x="1040.7" y="139">brotli_io.Compress.compress</text></g>
+<g><title>BrotliEncoderCompressStream (640506 samples, 34.33%)</title><rect x="1038.7" y="112" width="549.3" height="15" fill="hsl(16,80%,62%)"/><text x="1040.7" y="123">BrotliEncoderCompressStream</text></g>
+<g><title>EncodeData (640506 samples, 34.33%)</title><rect x="1038.7" y="96" width="549.3" height="15" fill="hsl(56,80%,62%)"/><text x="1040.7" y="107">EncodeData</text></g>
+<g><title>BrotliAllocate (103878 samples, 5.57%)</title><rect x="1038.7" y="80" width="89.1" height="15" fill="hsl(15,80%,62%)"/><text x="1040.7" y="91">BrotliAlloca</text></g>
+<g><title>block_cache.alloc (103878 samples, 5.57%)</title><rect x="1038.7" y="64" width="89.1" height="15" fill="hsl(49,80%,62%)"/><text x="1040.7" y="75">block_cache.</text></g>
+<g><title>BrotliBuildMetaBlockGreedy (160052 samples, 8.58%)</title><rect x="1127.8" y="80" width="137.3" height="15" fill="hsl(2,80%,62%)"/><text x="1129.8" y="91">BrotliBuildMetaBloc</text></g>
+<g><title>InitBlockSplitterCommand (74085 samples, 3.97%)</title><rect x="1127.8" y="64" width="63.5" height="15" fill="hsl(11,80%,62%)"/><text x="1129.8" y="75">InitBlock</text></g>
+<g><title>BrotliAllocate (74085 samples, 3.97%)</title><rect x="1127.8" y="48" width="63.5" height="15" fill="hsl(15,80%,62%)"/><text x="1129.8" y="59">BrotliAll</text></g>
+<g><title>block_cache.alloc (74085 samples, 3.97%)</title><rect x="1127.8" y="32" width="63.5" height="15" fill="hsl(49,80%,62%)"/><text x="1129.8" y="43">block_cac</text></g>
+<g><title>InitBlockSplitterDistance (81733 samples, 4.38%)</title><rect x="1191.3" y="64" width="70.1" height="15" fill="hsl(47,80%,62%)"/><text x="1193.3" y="75">InitBlockS</text></g>
+<g><title>BrotliAllocate (81733 samples, 4.38%)</title><rect x="1191.3" y="48" width="70.1" height="15" fill="hsl(15,80%,62%)"/><text x="1193.3" y="59">BrotliAllo</text></g>
+<g><title>block_cache.alloc (81733 samples, 4.38%)</title><rect x="1191.3" y="32" width="70.1" height="15" fill="hsl(49,80%,62%)"/><text x="1193.3" y="43">block_cach</text></g>
+<g><title>InitBlockSplitterLiteral (4234 samples, 0.23%)</title><rect x="1261.4" y="64" width="3.6" height="15" fill="hsl(49,80%,62%)"/><text x="1263.4" y="75"></text></g>
+<g><title>BrotliAllocate (4234 samples, 0.23%)</title><rect x="1261.4" y="48" width="3.6" height="15" fill="hsl(15,80%,62%)"/><text x="1263.4" y="59"></text></g>
+<g><title>block_cache.alloc (4234 samples, 0.23%)</title><rect x="1261.4" y="32" width="3.6" height="15" fill="hsl(49,80%,62%)"/><text x="1263.4" y="43"></text></g>
+<g><title>BrotliStoreMetaBlock (376576 samples, 20.19%)</title><rect x="1265.0" y="80" width="323.0" height="15" fill="hsl(29,80%,62%)"/><text x="1267.0" y="91">BrotliStoreMetaBlock</text></g>
+<g><title>BrotliAllocate (376576 samples, 20.19%)</title><rect x="1265.0" y="64" width="323.0" height="15" fill="hsl(15,80%,62%)"/><text x="1267.0" y="75">BrotliAllocate</text></g>
+<g><title>block_cache.alloc (376576 samples, 20.19%)</title><rect x="1265.0" y="48" width="323.0" height="15" fill="hsl(49,80%,62%)"/><text x="1267.0" y="59">block_cache.alloc</text></g>
+<g><title>brotli_io.Compress.init (13984 samples, 0.75%)</title><rect x="1588.0" y="128" width="12.0" height="15" fill="hsl(25,80%,62%)"/><text x="1590.0" y="139"></text></g>
+<g><title>BrotliEncoderCreateInstance (13984 samples, 0.75%)</title><rect x="1588.0" y="112" width="12.0" height="15" fill="hsl(47,80%,62%)"/><text x="1590.0" y="123"></text></g>
+<g><title>block_cache.alloc (13984 samples, 0.75%)</title><rect x="1588.0" y="96" width="12.0" height="15" fill="hsl(49,80%,62%)"/><text x="1590.0" y="107"></text></g>
+</svg>

@@ -7,6 +7,7 @@ const anole = @import("anole");
 const websocket = anole.websocket;
 const twelve = @import("twelve.zig");
 const asyncdb = @import("asyncdb.zig");
+const httparena = @import("arena.zig");
 const features = @import("features.zig");
 
 pub const zio_options = anole.zio_options;
@@ -280,7 +281,11 @@ pub fn main(init: std.process.Init) !void {
     app.post("/echo", echo);
     app.get("/gc/alloc", gcAlloc);
     app.get("/gc/stats", gcStats);
-    try app.staticDir("/static", env("MEDIA_DIR", "/media"), .{});
+    // HttpArena's json-comp and static data (arena.zig) replace the media.
+    const arena_data = env("ARENA_DATA", "");
+    if (arena_data.len > 0) {
+        try httparena.routes(&app, init.io, init.arena.allocator(), arena_data);
+    } else try app.staticDir("/static", env("MEDIA_DIR", "/media"), .{});
     app.wsWith("/ws/echo", wsEcho, .{ .max_message_size = 1 << 20 });
     app.ws("/ws/feed", wsFeed);
     app.ws("/ws/trade", wsTrade);

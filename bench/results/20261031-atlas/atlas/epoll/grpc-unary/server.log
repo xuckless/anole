@@ -1,0 +1,5 @@
+{"time":"2026-10-31T07:41:03.315Z","level":"info","message":"interop server on 127.0.0.1:50051 (h2c)"}
+{"time":"2026-10-31T07:41:03.315Z","level":"info","scope":"anole","message":"environment production (release build): JSON Lines logs"}
+{"time":"2026-10-31T07:41:03.315Z","level":"warn","scope":"anole","message":"built with ReleaseFast: Zig's safety checks are off, so a bug that ReleaseSafe would stop at the faulty line can corrupt memory instead; ReleaseSafe is the recommended build for production"}
+{"time":"2026-10-31T07:41:03.315Z","level":"info","scope":"anole","message":"listening on http://127.0.0.1:50051 (HTTP/1.1, HTTP/2 cleartext)"}
+{"time":"2026-10-31T07:41:03.315Z","level":"info","scope":"anole","message":"console: `anole console grpc-interop-server` attaches (socket /run/anole/grpc-interop-server.1.sock)"}

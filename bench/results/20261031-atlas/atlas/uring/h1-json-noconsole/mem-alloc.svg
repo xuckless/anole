@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="224" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fff"/><text x="4" y="13">Bytes allocated per stack: h1-json-noconsole (uring, 1 executor) (201472000 samples)</text>
+<g><title>arena (201472000 samples, 100.00%)</title><rect x="0.0" y="208" width="1600.0" height="15" fill="hsl(33,80%,62%)"/><text x="2.0" y="219">arena</text></g>
+<g><title>coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (201472000 samples, 100.00%)</title><rect x="0.0" y="192" width="1600.0" height="15" fill="hsl(41,80%,62%)"/><text x="2.0" y="203">coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn</text></g>
+<g><title>task.AnyTask.startFn (201472000 samples, 100.00%)</title><rect x="0.0" y="176" width="1600.0" height="15" fill="hsl(8,80%,62%)"/><text x="2.0" y="187">task.AnyTask.startFn</text></g>
+<g><title>group.Group.spawnInto__func_2363.Wrapper.start (201472000 samples, 100.00%)</title><rect x="0.0" y="160" width="1600.0" height="15" fill="hsl(21,80%,62%)"/><text x="2.0" y="171">group.Group.spawnInto__func_2363.Wrapper.start</text></g>
+<g><title>server.Server(main.App).handleConnectionWrapper (201472000 samples, 100.00%)</title><rect x="0.0" y="144" width="1600.0" height="15" fill="hsl(0,80%,62%)"/><text x="2.0" y="155">server.Server(main.App).handleConnectionWrapper</text></g>
+<g><title>server.Server(main.App).handleRequests (201472000 samples, 100.00%)</title><rect x="0.0" y="128" width="1600.0" height="15" fill="hsl(1,80%,62%)"/><text x="2.0" y="139">server.Server(main.App).handleRequests</text></g>
+<g><title>heap.ArenaAllocator.alloc (132971520 samples, 66.00%)</title><rect x="0.0" y="112" width="1056.0" height="15" fill="hsl(15,80%,62%)"/><text x="2.0" y="123">heap.ArenaAllocator.alloc</text></g>
+<g><title>middleware.Chain(main.App).run (68500480 samples, 34.00%)</title><rect x="1056.0" y="112" width="544.0" height="15" fill="hsl(29,80%,62%)"/><text x="1058.0" y="123">middleware.Chain(main.App).run</text></g>
+<g><title>middleware.Chain(main.App).call (68500480 samples, 34.00%)</title><rect x="1056.0" y="96" width="544.0" height="15" fill="hsl(46,80%,62%)"/><text x="1058.0" y="107">middleware.Chain(main.App).call</text></g>
+<g><title>handlers.adapt__struct_6478.h (68500480 samples, 34.00%)</title><rect x="1056.0" y="80" width="544.0" height="15" fill="hsl(22,80%,62%)"/><text x="1058.0" y="91">handlers.adapt__struct_6478.h</text></g>
+<g><title>response.BodyWriter.drain (68500480 samples, 34.00%)</title><rect x="1056.0" y="64" width="544.0" height="15" fill="hsl(24,80%,62%)"/><text x="1058.0" y="75">response.BodyWriter.drain</text></g>
+<g><title>response.BodyBuffer.nextSegment (68500480 samples, 34.00%)</title><rect x="1056.0" y="48" width="544.0" height="15" fill="hsl(27,80%,62%)"/><text x="1058.0" y="59">response.BodyBuffer.nextSegment</text></g>
+<g><title>heap.ArenaAllocator.alloc (68500480 samples, 34.00%)</title><rect x="1056.0" y="32" width="544.0" height="15" fill="hsl(15,80%,62%)"/><text x="1058.0" y="43">heap.ArenaAllocator.alloc</text></g>
+</svg>

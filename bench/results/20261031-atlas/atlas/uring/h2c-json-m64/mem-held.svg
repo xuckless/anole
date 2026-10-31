@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="208" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fff"/><text x="4" y="13">malloc bytes held at the window&#x27;s end: h2c-json-m64 (uring, 1 executor) (329012 samples)</text>
+<g><title>malloc held (329012 samples, 100.00%)</title><rect x="0.0" y="192" width="1600.0" height="15" fill="hsl(39,80%,62%)"/><text x="2.0" y="203">malloc held</text></g>
+<g><title>coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (329012 samples, 100.00%)</title><rect x="0.0" y="176" width="1600.0" height="15" fill="hsl(41,80%,62%)"/><text x="2.0" y="187">coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn</text></g>
+<g><title>task.AnyTask.startFn (329012 samples, 100.00%)</title><rect x="0.0" y="160" width="1600.0" height="15" fill="hsl(8,80%,62%)"/><text x="2.0" y="171">task.AnyTask.startFn</text></g>
+<g><title>group.Group.spawnInto__func_2472.Wrapper.start (329012 samples, 100.00%)</title><rect x="0.0" y="144" width="1600.0" height="15" fill="hsl(28,80%,62%)"/><text x="2.0" y="155">group.Group.spawnInto__func_2472.Wrapper.start</text></g>
+<g><title>server.h2.Engine(main.App).writerLoop (329012 samples, 100.00%)</title><rect x="0.0" y="128" width="1600.0" height="15" fill="hsl(43,80%,62%)"/><text x="2.0" y="139">server.h2.Engine(main.App).writerLoop</text></g>
+<g><title>nghttp2_session_mem_send2 (329012 samples, 100.00%)</title><rect x="0.0" y="112" width="1600.0" height="15" fill="hsl(1,80%,62%)"/><text x="2.0" y="123">nghttp2_session_mem_send2</text></g>
+<g><title>nghttp2_session_mem_send_internal (306900 samples, 93.28%)</title><rect x="0.0" y="96" width="1492.5" height="15" fill="hsl(43,80%,62%)"/><text x="2.0" y="107">nghttp2_session_mem_send_internal</text></g>
+<g><title>nghttp2_frame_pack_headers (306900 samples, 93.28%)</title><rect x="0.0" y="80" width="1492.5" height="15" fill="hsl(2,80%,62%)"/><text x="2.0" y="91">nghttp2_frame_pack_headers</text></g>
+<g><title>nghttp2_hd_deflate_hd_bufs (306900 samples, 93.28%)</title><rect x="0.0" y="64" width="1492.5" height="15" fill="hsl(52,80%,62%)"/><text x="2.0" y="75">nghttp2_hd_deflate_hd_bufs</text></g>
+<g><title>add_hd_table_incremental (163680 samples, 49.75%)</title><rect x="0.0" y="48" width="796.0" height="15" fill="hsl(52,80%,62%)"/><text x="2.0" y="59">add_hd_table_incremental</text></g>
+<g><title>nghttp2_rcbuf_new2 (143220 samples, 43.53%)</title><rect x="796.0" y="48" width="696.5" height="15" fill="hsl(17,80%,62%)"/><text x="798.0" y="59">nghttp2_rcbuf_new2</text></g>
+<g><title>session_after_frame_sent1 (22112 samples, 6.72%)</title><rect x="1492.5" y="96" width="107.5" height="15" fill="hsl(27,80%,62%)"/><text x="1494.5" y="107">session_after_f</text></g>
+<g><title>nghttp2_session_close_stream (22112 samples, 6.72%)</title><rect x="1492.5" y="80" width="107.5" height="15" fill="hsl(38,80%,62%)"/><text x="1494.5" y="91">nghttp2_session</text></g>
+<g><title>server.h2.Engine(main.App).onStreamClose (22112 samples, 6.72%)</title><rect x="1492.5" y="64" width="107.5" height="15" fill="hsl(31,80%,62%)"/><text x="1494.5" y="75">server.h2.Engin</text></g>
+<g><title>server.h2.Engine(main.App).Stream.release (22112 samples, 6.72%)</title><rect x="1492.5" y="48" width="107.5" height="15" fill="hsl(31,80%,62%)"/><text x="1494.5" y="59">server.h2.Engin</text></g>
+<g><title>heap.ArenaAllocator.reset (22112 samples, 6.72%)</title><rect x="1492.5" y="32" width="107.5" height="15" fill="hsl(3,80%,62%)"/><text x="1494.5" y="43">heap.ArenaAlloc</text></g>
+</svg>

@@ -1,0 +1,6 @@
+# Profiling tools for the flame-graph atlas (bench/atlas/atlas.sh): perf,
+# bpftrace, bcc's offcputime and h2load (the D19 fixed counts), from Fedora's
+# packages. Runs privileged with --pid=host against the server container.
+FROM fedora:44
+RUN dnf -q install -y perf bpftrace bcc-tools procps-ng binutils nghttp2 && dnf clean all
+ENV PATH=/usr/share/bcc/tools:$PATH

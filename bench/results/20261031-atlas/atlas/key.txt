@@ -1,0 +1,35 @@
+key_version=1
+date_utc=2026-10-31T06:39:44Z
+host=fedora
+bench_ref=f6e8923aff461adbe50f78661f9709adb53a01ea-dirty
+bench_app_ref=f2e1e91ea599dd0808b772d6ef6bedab7d87aa5f
+script=bench/atlas/atlas.sh REST=70 FRAC=0.6 MEMFRAC=0.05 MEMMAX=20000 BACKENDS=epoll uring CELLS=h1-plain h1-json h1-json-noconsole h1-jsoncomp-gzip h1-jsoncomp-br h1-jsoncomp-zstd tls-h1-json h2c-json-m10 h2c-json-m64 h2-static h3-json h3-static h3-post grpc-unary sse-h1 sse-h2c net-tcp
+kernel=7.2.9-200.fc44.x86_64
+cmdline=BOOT_IMAGE=(hd0,gpt6)/vmlinuz-7.2.9-200.fc44.x86_64 root=UUID=9bfa4e30-7d74-44f8-9361-7f50e7371e4a ro rootflags=subvol=root rhgb quiet rd.driver.blacklist=nouveau,nova_core modprobe.blacklist=nouveau,nova_core nvidia-drm.modeset=1
+cpu_model=Intel(R) Core(TM) i7-14700F
+microcode=0x133
+smt=on
+sut_cpus=2
+sut_siblings=2-3
+load_cpus=8-15,20-27
+governor=performance
+epp=performance
+no_turbo=0
+nmi_watchdog=1
+perf_event_paranoid=2
+user_slice_cpus=
+netfilter=yes; nft_ruleset_sha256=unknown
+docker=29.8.0
+tools_image=anole-bench/atlas-tools sha256:5d452f630e6d2053248e3a18758ef721d85906bea72389b5086423d4248df22d
+perf=perf version 7.2.13-200.fc44.x86_64
+h2load=h2load nghttp2/1.68.0
+bpftrace=bpftrace v0.24.2
+side.atlas.image=anole-bench/anole:atlas
+side.atlas.image_id=sha256:6f0609cfc0fb0718afa18d14e1452f5e5710bfa1602f6ff0120ec8004d7d4a30
+side.atlas.binary_sha256=bfb5d54158e8e71cf5b0cc854317b0ab502b18acac26fb035b43fb8fefe988b1
+side.atlas.anole_ref=
+side.atlas.env=ARENA_DATA=/arena
+anole_ref=c36cca065f4784c00f3c4fc6f6979a51fad6fd16
+side.atlas.grpc_binary_sha256=4de5fc889f41c84a4f6cc2006ba159683b246915049e380569ba7ad5a61cf268
+events=cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/instructions/k,page-faults,context-switches
+deviation=bench app gains bench/servers/anole/src/arena.zig (HttpArena /json/:count with res.compress, precompressed /static from ARENA_DATA); additive, existing routes unchanged; lead approved 2026-10-31

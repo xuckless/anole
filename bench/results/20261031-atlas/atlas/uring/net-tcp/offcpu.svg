@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="240" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fff"/><text x="4" y="13">Off-CPU (µs): net-tcp (uring, 1 executor) (14130480 samples)</text>
+<g><title>anole-bench (9010483 samples, 63.77%)</title><rect x="0.0" y="224" width="1020.3" height="15" fill="hsl(28,80%,62%)"/><text x="2.0" y="235">anole-bench</text></g>
+<g><title>[unknown] (9009003 samples, 63.76%)</title><rect x="0.0" y="208" width="1020.1" height="15" fill="hsl(56,80%,62%)"/><text x="2.0" y="219">[unknown]</text></g>
+<g><title>[unknown] (9008940 samples, 63.76%)</title><rect x="0.0" y="192" width="1020.1" height="15" fill="hsl(56,80%,62%)"/><text x="2.0" y="203">[unknown]</text></g>
+<g><title>entry_SYSCALL_64_after_hwframe (9008940 samples, 63.76%)</title><rect x="0.0" y="176" width="1020.1" height="15" fill="hsl(1,80%,62%)"/><text x="2.0" y="187">entry_SYSCALL_64_after_hwframe</text></g>
+<g><title>do_syscall_64 (9008940 samples, 63.76%)</title><rect x="0.0" y="160" width="1020.1" height="15" fill="hsl(10,80%,62%)"/><text x="2.0" y="171">do_syscall_64</text></g>
+<g><title>__x64_sys_poll (9008940 samples, 63.76%)</title><rect x="0.0" y="144" width="1020.1" height="15" fill="hsl(52,80%,62%)"/><text x="2.0" y="155">__x64_sys_poll</text></g>
+<g><title>do_sys_poll (9008940 samples, 63.76%)</title><rect x="0.0" y="128" width="1020.1" height="15" fill="hsl(57,80%,62%)"/><text x="2.0" y="139">do_sys_poll</text></g>
+<g><title>do_poll.constprop.0 (9008940 samples, 63.76%)</title><rect x="0.0" y="112" width="1020.1" height="15" fill="hsl(55,80%,62%)"/><text x="2.0" y="123">do_poll.constprop.0</text></g>
+<g><title>poll_schedule_timeout.constprop.0 (9008940 samples, 63.76%)</title><rect x="0.0" y="96" width="1020.1" height="15" fill="hsl(23,80%,62%)"/><text x="2.0" y="107">poll_schedule_timeout.constprop.0</text></g>
+<g><title>schedule_hrtimeout_range_clock (9008940 samples, 63.76%)</title><rect x="0.0" y="80" width="1020.1" height="15" fill="hsl(4,80%,62%)"/><text x="2.0" y="91">schedule_hrtimeout_range_clock</text></g>
+<g><title>schedule (9008940 samples, 63.76%)</title><rect x="0.0" y="64" width="1020.1" height="15" fill="hsl(35,80%,62%)"/><text x="2.0" y="75">schedule</text></g>
+<g><title>__schedule (9008940 samples, 63.76%)</title><rect x="0.0" y="48" width="1020.1" height="15" fill="hsl(45,80%,62%)"/><text x="2.0" y="59">__schedule</text></g>
+<g><title>finish_task_switch.isra.0 (9008940 samples, 63.76%)</title><rect x="0.0" y="32" width="1020.1" height="15" fill="hsl(5,80%,62%)"/><text x="2.0" y="43">finish_task_switch.isra.0</text></g>
+<g><title>iou-wrk-1771323 (5119997 samples, 36.23%)</title><rect x="1020.3" y="224" width="579.7" height="15" fill="hsl(1,80%,62%)"/><text x="1022.3" y="235">iou-wrk-1771323</text></g>
+<g><title>ret_from_fork_asm (5119997 samples, 36.23%)</title><rect x="1020.3" y="208" width="579.7" height="15" fill="hsl(49,80%,62%)"/><text x="1022.3" y="219">ret_from_fork_asm</text></g>
+<g><title>ret_from_fork (5119997 samples, 36.23%)</title><rect x="1020.3" y="192" width="579.7" height="15" fill="hsl(17,80%,62%)"/><text x="1022.3" y="203">ret_from_fork</text></g>
+<g><title>io_wq_worker (5119997 samples, 36.23%)</title><rect x="1020.3" y="176" width="579.7" height="15" fill="hsl(8,80%,62%)"/><text x="1022.3" y="187">io_wq_worker</text></g>
+<g><title>schedule_timeout (5119997 samples, 36.23%)</title><rect x="1020.3" y="160" width="579.7" height="15" fill="hsl(5,80%,62%)"/><text x="1022.3" y="171">schedule_timeout</text></g>
+<g><title>schedule (5119997 samples, 36.23%)</title><rect x="1020.3" y="144" width="579.7" height="15" fill="hsl(35,80%,62%)"/><text x="1022.3" y="155">schedule</text></g>
+<g><title>__schedule (5119997 samples, 36.23%)</title><rect x="1020.3" y="128" width="579.7" height="15" fill="hsl(45,80%,62%)"/><text x="1022.3" y="139">__schedule</text></g>
+<g><title>finish_task_switch.isra.0 (5119997 samples, 36.23%)</title><rect x="1020.3" y="112" width="579.7" height="15" fill="hsl(5,80%,62%)"/><text x="1022.3" y="123">finish_task_switch.isra.0</text></g>
+</svg>

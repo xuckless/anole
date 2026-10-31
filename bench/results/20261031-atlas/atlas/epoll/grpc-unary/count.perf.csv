@@ -1,0 +1,7 @@
+# started on Sat Oct 31 07:42:14 2026
+
+104283201222,,cpu_core/instructions/u,system.slice/docker-a71f7ef6682a6e2ee22887fde3eab4da1ed04a6335a7a394193fe08bb6f6c1d2.scope,9400542426,100.00,,
+46433341604,,cpu_core/cycles/u,system.slice/docker-a71f7ef6682a6e2ee22887fde3eab4da1ed04a6335a7a394193fe08bb6f6c1d2.scope,9400542426,100.00,,
+3631124989,,cpu_core/instructions/k,system.slice/docker-a71f7ef6682a6e2ee22887fde3eab4da1ed04a6335a7a394193fe08bb6f6c1d2.scope,9400542426,100.00,,
+208389,,page-faults,system.slice/docker-a71f7ef6682a6e2ee22887fde3eab4da1ed04a6335a7a394193fe08bb6f6c1d2.scope,9400542426,100.00,,
+233,,context-switches,system.slice/docker-a71f7ef6682a6e2ee22887fde3eab4da1ed04a6335a7a394193fe08bb6f6c1d2.scope,9400542426,100.00,,

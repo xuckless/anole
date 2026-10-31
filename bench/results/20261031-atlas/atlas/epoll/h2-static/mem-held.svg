@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="256" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fff"/><text x="4" y="13">malloc bytes held at the window&#x27;s end: h2-static (epoll, 1 executor) (966820 samples)</text>
+<g><title>malloc held (966820 samples, 100.00%)</title><rect x="0.0" y="240" width="1600.0" height="15" fill="hsl(39,80%,62%)"/><text x="2.0" y="251">malloc held</text></g>
+<g><title>coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (966788 samples, 100.00%)</title><rect x="0.1" y="224" width="1599.9" height="15" fill="hsl(41,80%,62%)"/><text x="2.1" y="235">coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn</text></g>
+<g><title>task.AnyTask.startFn (966788 samples, 100.00%)</title><rect x="0.1" y="208" width="1599.9" height="15" fill="hsl(8,80%,62%)"/><text x="2.1" y="219">task.AnyTask.startFn</text></g>
+<g><title>group.Group.spawnInto__func_2363.Wrapper.start (3517 samples, 0.36%)</title><rect x="0.1" y="192" width="5.8" height="15" fill="hsl(21,80%,62%)"/><text x="2.1" y="203"></text></g>
+<g><title>server.Server(main.App).handleConnectionWrapper (3517 samples, 0.36%)</title><rect x="0.1" y="176" width="5.8" height="15" fill="hsl(0,80%,62%)"/><text x="2.1" y="187"></text></g>
+<g><title>server.h2.Engine(main.App).serve (3517 samples, 0.36%)</title><rect x="0.1" y="160" width="5.8" height="15" fill="hsl(53,80%,62%)"/><text x="2.1" y="171"></text></g>
+<g><title>nghttp2_session_mem_recv2 (3517 samples, 0.36%)</title><rect x="0.1" y="144" width="5.8" height="15" fill="hsl(43,80%,62%)"/><text x="2.1" y="155"></text></g>
+<g><title>nghttp2_session_on_request_headers_received (3456 samples, 0.36%)</title><rect x="0.2" y="128" width="5.7" height="15" fill="hsl(9,80%,62%)"/><text x="2.2" y="139"></text></g>
+<g><title>nghttp2_session_open_stream (3456 samples, 0.36%)</title><rect x="0.2" y="112" width="5.7" height="15" fill="hsl(58,80%,62%)"/><text x="2.2" y="123"></text></g>
+<g><title>group.Group.spawnInto__func_2457.Wrapper.start (5127 samples, 0.53%)</title><rect x="5.9" y="192" width="8.5" height="15" fill="hsl(49,80%,62%)"/><text x="7.9" y="203"></text></g>
+<g><title>server.h2.Engine(main.App).runStream (5127 samples, 0.53%)</title><rect x="5.9" y="176" width="8.5" height="15" fill="hsl(57,80%,62%)"/><text x="7.9" y="187"></text></g>
+<g><title>server.h2.Engine(main.App).serveStream (5127 samples, 0.53%)</title><rect x="5.9" y="160" width="8.5" height="15" fill="hsl(13,80%,62%)"/><text x="7.9" y="171"></text></g>
+<g><title>response.Response.write (5127 samples, 0.53%)</title><rect x="5.9" y="144" width="8.5" height="15" fill="hsl(51,80%,62%)"/><text x="7.9" y="155"></text></g>
+<g><title>Io.Writer.defaultRebase (5127 samples, 0.53%)</title><rect x="5.9" y="128" width="8.5" height="15" fill="hsl(16,80%,62%)"/><text x="7.9" y="139"></text></g>
+<g><title>server.h2.Engine(main.App).StreamSink.drain (5127 samples, 0.53%)</title><rect x="5.9" y="112" width="8.5" height="15" fill="hsl(9,80%,62%)"/><text x="7.9" y="123"></text></g>
+<g><title>nghttp2_submit_response2 (5127 samples, 0.53%)</title><rect x="5.9" y="96" width="8.5" height="15" fill="hsl(30,80%,62%)"/><text x="7.9" y="107"></text></g>
+<g><title>submit_headers_shared_nva (5127 samples, 0.53%)</title><rect x="5.9" y="80" width="8.5" height="15" fill="hsl(11,80%,62%)"/><text x="7.9" y="91"></text></g>
+<g><title>nghttp2_nv_array_copy (4807 samples, 0.50%)</title><rect x="5.9" y="64" width="8.0" height="15" fill="hsl(50,80%,62%)"/><text x="7.9" y="75"></text></g>
+<g><title>group.Group.spawnInto__func_2472.Wrapper.start (958144 samples, 99.10%)</title><rect x="14.4" y="192" width="1585.6" height="15" fill="hsl(28,80%,62%)"/><text x="16.4" y="203">group.Group.spawnInto__func_2472.Wrapper.start</text></g>
+<g><title>server.h2.Engine(main.App).writerLoop (958144 samples, 99.10%)</title><rect x="14.4" y="176" width="1585.6" height="15" fill="hsl(43,80%,62%)"/><text x="16.4" y="187">server.h2.Engine(main.App).writerLoop</text></g>
+<g><title>Io.Writer.defaultFlush (44146 samples, 4.57%)</title><rect x="14.4" y="160" width="73.1" height="15" fill="hsl(56,80%,62%)"/><text x="16.4" y="171">Io.Writer.</text></g>
+<g><title>dusty_tls.Connection.Writer.drain (44146 samples, 4.57%)</title><rect x="14.4" y="144" width="73.1" height="15" fill="hsl(8,80%,62%)"/><text x="16.4" y="155">dusty_tls.</text></g>
+<g><title>dusty_tls.Connection.Writer.writeAll (44146 samples, 4.57%)</title><rect x="14.4" y="128" width="73.1" height="15" fill="hsl(18,80%,62%)"/><text x="16.4" y="139">dusty_tls.</text></g>
+<g><title>SSL_write (44146 samples, 4.57%)</title><rect x="14.4" y="112" width="73.1" height="15" fill="hsl(4,80%,62%)"/><text x="16.4" y="123">SSL_write</text></g>
+<g><title>bssl::tls_write_app_data(bssl::SSLImpl*, bool*, unsigned long*, bssl::Span&lt;unsigned char const, 18446744073709551615ul&gt;) (44146 samples, 4.57%)</title><rect x="14.4" y="96" width="73.1" height="15" fill="hsl(20,80%,62%)"/><text x="16.4" y="107">bssl::tls_</text></g>
+<g><title>bssl::do_tls_write(bssl::SSLImpl*, unsigned long*, unsigned char, bssl::Span&lt;unsigned char const, 18446744073709551615ul&gt;) (44146 samples, 4.57%)</title><rect x="14.4" y="80" width="73.1" height="15" fill="hsl(14,80%,62%)"/><text x="16.4" y="91">bssl::do_t</text></g>
+<g><title>bssl::SSLBuffer::EnsureCap(unsigned long, unsigned long) (10354 samples, 1.07%)</title><rect x="14.4" y="64" width="17.1" height="15" fill="hsl(7,80%,62%)"/><text x="16.4" y="75"></text></g>
+<g><title>bssl::ssl_write_buffer_flush(bssl::SSLImpl*) (33792 samples, 3.50%)</title><rect x="31.5" y="64" width="55.9" height="15" fill="hsl(23,80%,62%)"/><text x="33.5" y="75">bssl::s</text></g>
+<g><title>BIO_write_ex (33792 samples, 3.50%)</title><rect x="31.5" y="48" width="55.9" height="15" fill="hsl(8,80%,62%)"/><text x="33.5" y="59">BIO_wri</text></g>
+<g><title>dusty_tls.bioWrite (33792 samples, 3.50%)</title><rect x="31.5" y="32" width="55.9" height="15" fill="hsl(2,80%,62%)"/><text x="33.5" y="43">dusty_t</text></g>
+<g><title>dusty_tls.Connection.Writer.drain (320138 samples, 33.11%)</title><rect x="87.4" y="160" width="529.8" height="15" fill="hsl(8,80%,62%)"/><text x="89.4" y="171">dusty_tls.Connection.Writer.drain</text></g>
+<g><title>dusty_tls.Connection.Writer.writeAll (320138 samples, 33.11%)</title><rect x="87.4" y="144" width="529.8" height="15" fill="hsl(18,80%,62%)"/><text x="89.4" y="155">dusty_tls.Connection.Writer.writeAll</text></g>
+<g><title>SSL_write (320138 samples, 33.11%)</title><rect x="87.4" y="128" width="529.8" height="15" fill="hsl(4,80%,62%)"/><text x="89.4" y="139">SSL_write</text></g>
+<g><title>bssl::tls_write_app_data(bssl::SSLImpl*, bool*, unsigned long*, bssl::Span&lt;unsigned char const, 18446744073709551615ul&gt;) (320138 samples, 33.11%)</title><rect x="87.4" y="112" width="529.8" height="15" fill="hsl(20,80%,62%)"/><text x="89.4" y="123">bssl::tls_write_app_data(bssl::SSLImpl*, bool*, unsigned long*, bssl::Span&lt;</text></g>
+<g><title>bssl::do_tls_write(bssl::SSLImpl*, unsigned long*, unsigned char, bssl::Span&lt;unsigned char const, 18446744073709551615ul&gt;) (320138 samples, 33.11%)</title><rect x="87.4" y="96" width="529.8" height="15" fill="hsl(14,80%,62%)"/><text x="89.4" y="107">bssl::do_tls_write(bssl::SSLImpl*, unsigned long*, unsigned char, bssl::Spa</text></g>
+<g><title>bssl::SSLBuffer::EnsureCap(unsigned long, unsigned long) (32906 samples, 3.40%)</title><rect x="87.4" y="80" width="54.5" height="15" fill="hsl(7,80%,62%)"/><text x="89.4" y="91">bssl::S</text></g>
+<g><title>bssl::ssl_write_buffer_flush(bssl::SSLImpl*) (287232 samples, 29.71%)</title><rect x="141.9" y="80" width="475.3" height="15" fill="hsl(23,80%,62%)"/><text x="143.9" y="91">bssl::ssl_write_buffer_flush(bssl::SSLImpl*)</text></g>
+<g><title>BIO_write_ex (287232 samples, 29.71%)</title><rect x="141.9" y="64" width="475.3" height="15" fill="hsl(8,80%,62%)"/><text x="143.9" y="75">BIO_write_ex</text></g>
+<g><title>dusty_tls.bioWrite (287232 samples, 29.71%)</title><rect x="141.9" y="48" width="475.3" height="15" fill="hsl(2,80%,62%)"/><text x="143.9" y="59">dusty_tls.bioWrite</text></g>
+<g><title>nghttp2_session_mem_send2 (99520 samples, 10.29%)</title><rect x="617.2" y="160" width="164.7" height="15" fill="hsl(1,80%,62%)"/><text x="619.2" y="171">nghttp2_session_mem_sen</text></g>
+<g><title>nghttp2_session_mem_send_internal (96000 samples, 9.93%)</title><rect x="617.2" y="144" width="158.9" height="15" fill="hsl(43,80%,62%)"/><text x="619.2" y="155">nghttp2_session_mem_se</text></g>
+<g><title>nghttp2_frame_pack_headers (96000 samples, 9.93%)</title><rect x="617.2" y="128" width="158.9" height="15" fill="hsl(2,80%,62%)"/><text x="619.2" y="139">nghttp2_frame_pack_hea</text></g>
+<g><title>nghttp2_hd_deflate_hd_bufs (96000 samples, 9.93%)</title><rect x="617.2" y="112" width="158.9" height="15" fill="hsl(52,80%,62%)"/><text x="619.2" y="123">nghttp2_hd_deflate_hd_</text></g>
+<g><title>add_hd_table_incremental (51200 samples, 5.30%)</title><rect x="617.2" y="96" width="84.7" height="15" fill="hsl(52,80%,62%)"/><text x="619.2" y="107">add_hd_table</text></g>
+<g><title>nghttp2_rcbuf_new2 (44800 samples, 4.63%)</title><rect x="701.9" y="96" width="74.1" height="15" fill="hsl(17,80%,62%)"/><text x="703.9" y="107">nghttp2_rc</text></g>
+<g><title>session_after_frame_sent1 (3520 samples, 0.36%)</title><rect x="776.1" y="144" width="5.8" height="15" fill="hsl(27,80%,62%)"/><text x="778.1" y="155"></text></g>
+<g><title>nghttp2_submit_data_shared (3520 samples, 0.36%)</title><rect x="776.1" y="128" width="5.8" height="15" fill="hsl(39,80%,62%)"/><text x="778.1" y="139"></text></g>
+</svg>

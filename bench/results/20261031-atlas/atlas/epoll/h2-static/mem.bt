@@ -1,0 +1,14 @@
+uprobe:/proc/1733762/root/lib/x86_64-linux-gnu/libc.so.6:malloc /pid == 1733762/ { @a_malloc[ustack(perf, 48)] = sum(arg0); @c_malloc[ustack(perf, 48)] = count(); @sz[tid] = arg0; }
+uretprobe:/proc/1733762/root/lib/x86_64-linux-gnu/libc.so.6:malloc /pid == 1733762 && @sz[tid]/ { @live[retval] = @sz[tid]; @lst[retval] = ustack(perf, 48); delete(@sz, tid); }
+uprobe:/proc/1733762/root/lib/x86_64-linux-gnu/libc.so.6:free /pid == 1733762 && @live[arg0]/ { delete(@live, arg0); delete(@lst, arg0); }
+uprobe:/proc/1733762/root/lib/x86_64-linux-gnu/libc.so.6:calloc /pid == 1733762/ { @a_calloc[ustack(perf, 48)] = sum(arg0 * arg1); @c_calloc[ustack(perf, 48)] = count(); }
+uprobe:/proc/1733762/root/lib/x86_64-linux-gnu/libc.so.6:realloc /pid == 1733762/ { @a_realloc[ustack(perf, 48)] = sum(arg1); @c_realloc[ustack(perf, 48)] = count(); }
+tracepoint:syscalls:sys_enter_mmap /pid == 1733762/ { @a_mmap[ustack(perf, 48)] = sum(args.len); @c_mmap[ustack(perf, 48)] = count(); }
+tracepoint:syscalls:sys_enter_brk /pid == 1733762/ { @c_brk[ustack(perf, 48)] = count(); }
+uprobe:/proc/1733762/root/usr/local/bin/anole-bench:"heap.ArenaAllocator.alloc" { @a_arena[ustack(perf, 48)] = sum(arg1); @c_arena[ustack(perf, 48)] = count(); }
+uprobe:/proc/1733762/root/usr/local/bin/anole-bench:"block_cache.vtableAlloc" { @a_block[ustack(perf, 48)] = sum(arg1); @c_block[ustack(perf, 48)] = count(); }
+uprobe:/proc/1733762/root/usr/local/bin/anole-bench:"heap.PageAllocator.alloc" { @a_page[ustack(perf, 48)] = sum(arg1); @c_page[ustack(perf, 48)] = count(); }
+uprobe:/proc/1733762/root/usr/local/bin/anole-bench:"task.TaskPool.alloc" { @c_taskpool[ustack(perf, 48)] = count(); }
+uprobe:/proc/1733762/root/usr/local/bin/anole-bench:"server.request_buffers.RequestBuffersPool.acquire" { @c_reqbufs[ustack(perf, 48)] = count(); }
+uprobe:/proc/1733762/root/usr/local/bin/anole-bench:"coro.stack_pool.StackPool.acquire" { @c_stackpool[ustack(perf, 48)] = count(); }
+interval:s:10 { clear(@sz); exit(); }

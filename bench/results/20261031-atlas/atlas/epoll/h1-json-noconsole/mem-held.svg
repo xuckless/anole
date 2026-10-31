@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="160" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fff"/><text x="4" y="13">malloc bytes held at the window&#x27;s end: h1-json-noconsole (epoll, 1 executor) (32800 samples)</text>
+<g><title>malloc held (32800 samples, 100.00%)</title><rect x="0.0" y="144" width="1600.0" height="15" fill="hsl(39,80%,62%)"/><text x="2.0" y="155">malloc held</text></g>
+<g><title>coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (32800 samples, 100.00%)</title><rect x="0.0" y="128" width="1600.0" height="15" fill="hsl(41,80%,62%)"/><text x="2.0" y="139">coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn</text></g>
+<g><title>task.AnyTask.startFn (32800 samples, 100.00%)</title><rect x="0.0" y="112" width="1600.0" height="15" fill="hsl(8,80%,62%)"/><text x="2.0" y="123">task.AnyTask.startFn</text></g>
+<g><title>group.Group.spawnInto__func_2363.Wrapper.start (32800 samples, 100.00%)</title><rect x="0.0" y="96" width="1600.0" height="15" fill="hsl(21,80%,62%)"/><text x="2.0" y="107">group.Group.spawnInto__func_2363.Wrapper.start</text></g>
+<g><title>server.Server(main.App).handleConnectionWrapper (32800 samples, 100.00%)</title><rect x="0.0" y="80" width="1600.0" height="15" fill="hsl(0,80%,62%)"/><text x="2.0" y="91">server.Server(main.App).handleConnectionWrapper</text></g>
+<g><title>server.Server(main.App).handleRequests (32800 samples, 100.00%)</title><rect x="0.0" y="64" width="1600.0" height="15" fill="hsl(1,80%,62%)"/><text x="2.0" y="75">server.Server(main.App).handleRequests</text></g>
+<g><title>response.Response.write (32800 samples, 100.00%)</title><rect x="0.0" y="48" width="1600.0" height="15" fill="hsl(51,80%,62%)"/><text x="2.0" y="59">response.Response.write</text></g>
+<g><title>server.Connection.lendWriteBuffer (32800 samples, 100.00%)</title><rect x="0.0" y="32" width="1600.0" height="15" fill="hsl(33,80%,62%)"/><text x="2.0" y="43">server.Connection.lendWriteBuffer</text></g>
+</svg>

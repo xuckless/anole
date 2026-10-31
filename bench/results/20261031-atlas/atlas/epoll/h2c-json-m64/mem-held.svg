@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="192" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fff"/><text x="4" y="13">malloc bytes held at the window&#x27;s end: h2c-json-m64 (epoll, 1 executor) (307200 samples)</text>
+<g><title>malloc held (307200 samples, 100.00%)</title><rect x="0.0" y="176" width="1600.0" height="15" fill="hsl(39,80%,62%)"/><text x="2.0" y="187">malloc held</text></g>
+<g><title>coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (307200 samples, 100.00%)</title><rect x="0.0" y="160" width="1600.0" height="15" fill="hsl(41,80%,62%)"/><text x="2.0" y="171">coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn</text></g>
+<g><title>task.AnyTask.startFn (307200 samples, 100.00%)</title><rect x="0.0" y="144" width="1600.0" height="15" fill="hsl(8,80%,62%)"/><text x="2.0" y="155">task.AnyTask.startFn</text></g>
+<g><title>group.Group.spawnInto__func_2472.Wrapper.start (307200 samples, 100.00%)</title><rect x="0.0" y="128" width="1600.0" height="15" fill="hsl(28,80%,62%)"/><text x="2.0" y="139">group.Group.spawnInto__func_2472.Wrapper.start</text></g>
+<g><title>server.h2.Engine(main.App).writerLoop (307200 samples, 100.00%)</title><rect x="0.0" y="112" width="1600.0" height="15" fill="hsl(43,80%,62%)"/><text x="2.0" y="123">server.h2.Engine(main.App).writerLoop</text></g>
+<g><title>nghttp2_session_mem_send2 (307200 samples, 100.00%)</title><rect x="0.0" y="96" width="1600.0" height="15" fill="hsl(1,80%,62%)"/><text x="2.0" y="107">nghttp2_session_mem_send2</text></g>
+<g><title>nghttp2_session_mem_send_internal (307200 samples, 100.00%)</title><rect x="0.0" y="80" width="1600.0" height="15" fill="hsl(43,80%,62%)"/><text x="2.0" y="91">nghttp2_session_mem_send_internal</text></g>
+<g><title>nghttp2_frame_pack_headers (307200 samples, 100.00%)</title><rect x="0.0" y="64" width="1600.0" height="15" fill="hsl(2,80%,62%)"/><text x="2.0" y="75">nghttp2_frame_pack_headers</text></g>
+<g><title>nghttp2_hd_deflate_hd_bufs (307200 samples, 100.00%)</title><rect x="0.0" y="48" width="1600.0" height="15" fill="hsl(52,80%,62%)"/><text x="2.0" y="59">nghttp2_hd_deflate_hd_bufs</text></g>
+<g><title>add_hd_table_incremental (163840 samples, 53.33%)</title><rect x="0.0" y="32" width="853.3" height="15" fill="hsl(52,80%,62%)"/><text x="2.0" y="43">add_hd_table_incremental</text></g>
+<g><title>nghttp2_rcbuf_new2 (143360 samples, 46.67%)</title><rect x="853.3" y="32" width="746.7" height="15" fill="hsl(17,80%,62%)"/><text x="855.3" y="43">nghttp2_rcbuf_new2</text></g>
+</svg>
