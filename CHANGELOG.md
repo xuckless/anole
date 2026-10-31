@@ -24,6 +24,12 @@ breaking changes are listed anyway.
   answers its own result (the cancel stays pending), not Canceled: a
   committed INSERT or COMMIT is no longer reported as canceled, and a
   constraint failure is reported as that (#160).
+- Kafka: a consumer group's leader counts the partitions of a topic whose
+  metadata a stale leader dropped right after the refresh, instead of
+  assigning none of them (#159).
+- Kafka: a producer whose resolver could not allocate its work for a round
+  tries again 250 ms later; records waiting for their leader were neither
+  sent nor expired (#159, #162).
 
 ## 0.4.1 (2026-10-30)
 

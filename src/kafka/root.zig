@@ -323,7 +323,7 @@ pub const Client = struct {
         self.observer = try db.Observer.init(.kafka, self.name, registry, tracer);
         if (registry) |r| {
             self.telemetry = try Telemetry.init(r, self.name);
-            self.producer.tel = &self.telemetry.?;
+            self.producer.tel.store(&self.telemetry.?, .release);
         }
         if (health) |h| if (self.readiness_enabled) {
             self.ready = .{ .io = self.io, .context = self, .ping = pingFn };

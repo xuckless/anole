@@ -319,7 +319,9 @@ pub const Producer = struct {
     io: std.Io,
     cluster: *cluster_mod.Cluster,
     cfg: Config,
-    tel: ?*const Telemetry = null,
+    /// Set once by `Client.start` (any thread), read by the senders: an
+    /// atomic pointer to telemetry that lives as long as the client (#159).
+    tel: std.atomic.Value(?*const Telemetry) = .init(null),
 
     teardown: safety.Teardown = .init,
     /// Over everything below but `group`. A leaf (L4): no cluster call, no
@@ -533,7 +535,7 @@ pub const Producer = struct {
         a.open = batch;
         self.buffered += size;
         self.pending += 1;
-        if (self.tel) |t| t.buffer.set(@intCast(self.buffered));
+        if (self.tel.load(.acquire)) |t| t.buffer.set(@intCast(self.buffered));
         var sealed = false;
         if (batch.bytes >= self.cfg.batch_bytes) {
             a.ready.pushBack(batch);
@@ -949,21 +951,30 @@ pub const Producer = struct {
     fn resolve(self: *Producer, arena: std.mem.Allocator) std.Io.Cancelable!bool {
         var topics: std.ArrayList([]const u8) = .empty;
         var pend: std.ArrayList(*Accum) = .empty;
+        // A partition left off the lists (no room for it) is still
+        // unresolved: the round says so, and the resolver tries again on
+        // its timer (#159).
+        var missed = false;
         {
             try self.mutex.lock(self.io);
             defer self.mutex.unlock(self.io);
             for (self.active.items) |a| {
                 if (a.leader != resolver_id) continue;
-                pend.append(arena, a) catch continue;
+                pend.append(arena, a) catch {
+                    missed = true;
+                    continue;
+                };
                 var seen = false;
                 for (topics.items) |t| if (std.mem.eql(u8, t, a.topic)) {
                     seen = true;
                     break;
                 };
-                if (!seen) topics.append(arena, a.topic) catch {};
+                if (!seen) topics.append(arena, a.topic) catch {
+                    missed = true;
+                };
             }
         }
-        if (topics.items.len == 0) return true;
+        if (topics.items.len == 0) return !missed;
         self.cluster.refresh(topics.items, true) catch |err| {
             if (err == error.Canceled) return error.Canceled;
             log.debug("kafka: metadata refresh failed: {t}", .{err});
@@ -1008,7 +1019,7 @@ pub const Producer = struct {
             };
             self.wake(id);
         }
-        return all;
+        return all and !missed;
     }
 
     // -----------------------------------------------------------------------
@@ -1249,8 +1260,7 @@ pub const Producer = struct {
                 }
             }
             const count = b.recs.items.len;
-            // `tel` is read without the lock; Client.start writes it without one too (a race already on main).
-            if (self.tel) |t| switch (result) {
+            if (self.tel.load(.acquire)) |t| switch (result) {
                 .ok => t.produced.with(&.{ t.client, b.topic }).add(count),
                 .failed => |f| for (0..count) |_| t.failedOne(f.code),
                 .pending => {},
@@ -1263,7 +1273,7 @@ pub const Producer = struct {
             defer self.mutex.unlock(self.io);
             self.buffered -|= bytes;
             self.pending -|= n;
-            if (self.tel) |t| t.buffer.set(@intCast(self.buffered));
+            if (self.tel.load(.acquire)) |t| t.buffer.set(@intCast(self.buffered));
             if (self.pending == 0) self.drained.broadcast(self.io);
         }
         it = done.head;
@@ -1484,4 +1494,31 @@ test "kafka producer: [stress] waits, completions and abandons race" {
     var f = p.waits.free;
     while (f) |w| : (f = w.next_free) free += 1;
     try testing.expectEqual(p.waits.chunks.items.len * WaitTable.chunk_len, free);
+}
+
+test "kafka producer: a resolver round that cannot list its unresolved partitions reports them unresolved, so it tries again (#159)" {
+    const zio = @import("zio");
+    const kafka = @import("root.zig");
+    const FakeBroker = @import("testing.zig").FakeBroker;
+    const rt = try zio.Runtime.init(testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(testing.allocator, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    const client = try kafka.Client.init(testing.allocator, io, .{
+        .brokers = broker.bootstrap(),
+        .producer = .{ .linger = .fromMilliseconds(1) },
+        .request_timeout = .fromSeconds(5),
+        .timeout = .fromSeconds(10),
+    });
+    defer client.deinit();
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    // No leader known: the record waits under the resolver, unresolved.
+    broker.hide_leaders.store(true, .release);
+    try client.producer.append("lead", null, "v", &.{}, 0, 0);
+    // A round whose lists cannot be allocated left it unresolved.
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expect(!try client.producer.resolve(failing.allocator()));
 }
