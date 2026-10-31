@@ -851,7 +851,7 @@ pub const Response = struct {
     /// Brotli's quality, 0 to 11, when `compress` picks `br`. Set by the
     /// server from `ServerConfig.response.brotli_quality`; a handler may
     /// change it for its own response before the headers go out.
-    _brotli_quality: u4 = 5,
+    _brotli_quality: u4 = 4,
     /// A streamed body's Brotli encoder until the body ends: freed by
     /// `deinit` if it never does. Held here, not only in the compressor,
     /// which lives in the arena: the server may reset that before `deinit`.

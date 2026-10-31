@@ -548,11 +548,11 @@ pub const ServerConfig = struct {
         /// `Response.header` fails with `error.TooManyHeaders`.
         max_header_count: usize = 64,
         /// Brotli's quality (0 to 11) for responses compressed as `br`
-        /// (`res.compress` with `-Dbrotli`). 5, the usual on-the-fly
-        /// choice: on JSON of 1.5 to 12 KB it is 8-13% smaller than 4 and
-        /// 10-15% smaller than gzip, at about 1.3x the time of 4; 6 adds
-        /// under 1%. 11 is for precompressed files, not responses.
-        brotli_quality: u4 = 5,
+        /// (`res.compress` with `-Dbrotli`). 4: on JSON of 4 to 8 KB it is
+        /// about as small as gzip at level 6, where 5 is 8% smaller still
+        /// at about 1.3x the time, and 1 is larger than gzip at any level.
+        /// 11 is for precompressed files, not responses.
+        brotli_quality: u4 = 4,
     };
 };
 

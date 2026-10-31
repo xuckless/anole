@@ -18,9 +18,9 @@ const block_cache = @import("block_cache.zig");
 const Writer = std.Io.Writer;
 
 pub const Options = struct {
-    /// 0 (fastest) to 11 (smallest). 5 is where Brotli starts beating gzip
-    /// by a margin on small JSON and HTML; see `ServerConfig.Response`.
-    quality: u4 = 5,
+    /// 0 (fastest) to 11 (smallest). 4, the responses' default; see
+    /// `ServerConfig.Response.brotli_quality`.
+    quality: u4 = 4,
     /// log2 of the window, 10 to 24. Past 16 the encoder takes a hash table
     /// of 1.3 MiB instead of 512 KiB and, on JSON, compresses no better.
     lgwin: u5 = max_lgwin,
