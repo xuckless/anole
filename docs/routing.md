@@ -96,7 +96,9 @@ Any other handler of this shape is typed:
   status 200 or the type's own: `anole.Created(T)` (201, with an optional
   `Location`: `return .{ .value = todo, .location = "/todos/7" }`),
   `anole.Accepted(T)` (202) and `anole.WithStatus(.status, T)` for any 2xx. A
-  handler that takes `res` and changed `res.status` keeps its status.
+  handler that takes `res` and changed `res.status` keeps its status. With
+  `T = void` (`anole.WithStatus(.no_content, void)`, `anole.Created(void)`,
+  `anole.Accepted(void)`) only the status (and `Location`) is sent, no body.
 - **Void.** A typed handler that takes `res` answers itself; one that does
   not, answers 204.
 - **Errors.** Returned errors map as for any handler (`error.NotFound`, a

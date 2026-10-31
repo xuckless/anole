@@ -18,6 +18,10 @@ breaking changes are listed anyway.
   scope. A route now keeps a copy in the router's arena. `use()` is the
   supported way to add global middleware; a list assigned after the last
   route is still read as is for 404/405 answers (#38).
+- A typed handler returning `anole.WithStatus(.no_content, void)`,
+  `anole.Created(void)` or `anole.Accepted(void)` did not compile
+  (std.json cannot write `void`). It now sends the status (and `Location`)
+  with no body (#142).
 
 ## 0.4.1 (2026-10-30)
 
