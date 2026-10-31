@@ -107,7 +107,7 @@ src/http/core/router.zig	U3	4
 src/http/core/server.zig	C3	1
 src/http/core/server.zig	L2	1
 src/http/core/server.zig	U3	43
-src/http/core/server/h2.zig	L2	3
+src/http/core/server/h2_nghttp2.zig	L2	3
 src/http/core/server/park.zig	T1	2
 src/http/core/server/park.zig	U3	8
 src/http/core/server/request_buffers.zig	L2	2

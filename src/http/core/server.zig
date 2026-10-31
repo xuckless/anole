@@ -41,7 +41,7 @@ const expect_log = @import("expect_log.zig");
 const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 /// The HTTP/2 engine, with the `-Dhttp2` build option.
 const proxy_protocol = @import("proxy_protocol.zig");
-const h2 = if (build_options.use_http2) @import("server/h2.zig") else struct {};
+const h2 = if (build_options.use_http2) @import("server/h2_nghttp2.zig") else struct {};
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 const park = @import("server/park.zig");
 const cgroup = @import("cgroup.zig");

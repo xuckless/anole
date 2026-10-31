@@ -9,7 +9,7 @@ const dusty = @import("../root.zig");
 const c = @import("nghttp2");
 const build_options = @import("build_options");
 const tls = @import("tls");
-const h2 = @import("h2.zig");
+const h2 = @import("h2_nghttp2.zig");
 const wait = @import("anole_test_wait");
 const test_socket = @import("test_socket.zig");
 
