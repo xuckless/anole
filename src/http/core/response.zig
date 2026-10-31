@@ -1733,7 +1733,12 @@ pub const Response = struct {
         return !self.head and statusHasBody(self.status);
     }
 
-    const compression_level: zlib.Level = .default;
+    /// zlib-ng's level for gzip responses. Level 1 there codes with the
+    /// fixed Huffman table only (`deflate_quick`), 4% larger than 2 on
+    /// JSON of 4-8 KB; 2 is as small as libdeflate's 1 and 11% larger than
+    /// zlib's default 6, at a fraction of its time
+    /// (research/s2/k4-compression.md, §2).
+    const compression_level: zlib.Level = @fromBackingInt(@intCast(2));
     /// zstd's level for responses, buffered or streamed. On JSON of 4-8 KB
     /// level 1 is both smaller and faster than zstd's default 3
     /// (research/s2/k4-compression.md, §2).
