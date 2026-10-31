@@ -44,6 +44,11 @@ breaking changes are listed anyway.
   canceled (DEADLINE_EXCEEDED for its deadline) even if a request read
   error or the server stopping landed first; the cancel is no longer
   swallowed (#140).
+- Windows: connecting a Unix-socket client (a `.unix` listener's clients, the
+  gRPC `unix:` client, `anole console`) no longer goes through ConnectEx after
+  binding the socket to the all-NUL name; it uses a plain connect, as .NET and
+  Go do there. One such connect failed with `ConnectEx failed: .EFAULT` (#139).
+  The fix is in Anole's zio fork.
 
 ## 0.4.1 (2026-10-30)
 

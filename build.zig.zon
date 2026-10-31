@@ -45,9 +45,13 @@
         // the test runner's hang dump prints, and a stall watchdog that
         // reports an executor that stops passing its scheduler while work
         // waits (src/diag.zig in the fork).
+        // TEMPORARY (#139, bugfix/windows): a local checkout of the fork's
+        // `anole-diag` d4b3ba6 plus 56e57f6 (= 4c04fd0 on `anole`: IOCP
+        // connects AF_UNIX sockets with connect(), not a wildcard bind and
+        // ConnectEx), in ../zio-bf-windows. Before merging: push both fork
+        // branches and pin the new `anole-diag` commit by URL and hash again.
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#d4b3ba6c82d3627ed1f8bdc028fcd031205eb3f4",
-            .hash = "zio-0.19.0-xHbVVDbCLgALE5maQzjwdJLgBXp-LFsBsFPJwAWdG-WE",
+            .path = "../zio-bf-windows",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
