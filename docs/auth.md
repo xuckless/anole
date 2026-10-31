@@ -85,6 +85,12 @@ go there), and refuses the request as RFC 6750 says:
 | The keyring could not fetch the keys | 503, so the client keeps its token |
 | The HMAC key is shorter than its hash (`error.WeakKey`), or a keyring policy has no `audience` (`error.AudienceRequired`) | 500, and an error in the log |
 
+A 400, 401 or 403 is returned as `error.BadRequest`, `error.Unauthorized` or
+`error.Forbidden` with the `WWW-Authenticate` header set, so the body follows
+`ServerOptions.errors` and an `error_handler` can reword it; the header stays.
+The API key, RBAC, CSRF and rate-limit middlewares refuse the same way
+([routing.md](routing.md#error-handling)).
+
 ```zig
 const api = app.group("/api", .{anole.auth.RequireJwt.init(.{ .keyring = &keyring }, .{ .issuer = "https://issuer.example", .audience = "api" }, .{
     .scopes = &.{"notes:read"}, // all of these in the `scope` claim

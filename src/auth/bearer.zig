@@ -133,19 +133,15 @@ pub const RequireJwt = struct {
                 } else {
                     log.err("bearer token not verified: a keyring's policy needs .audience (this API's identifier at the provider), or .allow_any_audience = true when its keys sign for this application alone", .{});
                 }
-                res.status = .internal_server_error;
-                res.content_type = .text;
-                res.body = "500 Internal Server Error\n";
-                return;
+                // Logged here with its cause: answered (in the server's
+                // error format) rather than returned, which would log again.
+                return res.fail(.internal_server_error, "");
             },
             // The keys could not be had (the provider is down): not the
             // token's fault, so not a 401 that would make the client drop it.
             else => {
                 log.warn("bearer token not verified: {t}", .{err});
-                res.status = .service_unavailable;
-                res.content_type = .text;
-                res.body = "503 Service Unavailable\n";
-                return;
+                return res.fail(.service_unavailable, "");
             },
         };
 
@@ -183,12 +179,10 @@ pub const RequireJwt = struct {
 
     const Refusal = enum { missing, invalid_request, invalid_token, expired, insufficient_scope };
 
+    /// Sets `WWW-Authenticate` (RFC 6750 section 3) and returns the
+    /// status-named error, which the chain answers in the server's error
+    /// format (or `error_handler`'s) with the header kept.
     fn refuse(self: *const RequireJwt, res: *dusty.Response, why: Refusal) !void {
-        res.status = switch (why) {
-            .missing, .invalid_token, .expired => .unauthorized,
-            .invalid_request => .bad_request,
-            .insufficient_scope => .forbidden,
-        };
         var buf: [512]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         w.writeAll("Bearer") catch {};
@@ -209,11 +203,10 @@ pub const RequireJwt = struct {
             },
         }
         try res.header("WWW-Authenticate", try res.arena.dupe(u8, w.buffered()));
-        res.content_type = .text;
-        res.body = switch (res.status) {
-            .bad_request => "400 Bad Request\n",
-            .forbidden => "403 Forbidden\n",
-            else => "401 Unauthorized\n",
+        return switch (why) {
+            .missing, .invalid_token, .expired => error.Unauthorized,
+            .invalid_request => error.BadRequest,
+            .insufficient_scope => error.Forbidden,
         };
     }
 };

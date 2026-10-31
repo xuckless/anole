@@ -2665,6 +2665,60 @@ test "capi engine: a fixed route behind a JWKS jwt middleware is not run inline;
     }
 }
 
+/// One HTTP/1.1 GET with `Connection: close`; the whole response in `out`.
+fn rawGet(io: std.Io, port: u16, path: []const u8, out: []u8) ![]const u8 {
+    const stream = try (try std.Io.net.IpAddress.parse("127.0.0.1", port)).connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.print("GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{path});
+    try w.interface.flush();
+    var rbuf: [1024]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var fw: std.Io.Writer = .fixed(out);
+    try readRest(&r, &fw);
+    return fw.buffered();
+}
+
+fn rateLimitCheck(io: std.Io, port: u16) !void {
+    var buf: [2048]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, try rawGet(io, port, "/fixed", &buf), "HTTP/1.1 200"));
+    const got = try rawGet(io, port, "/fixed", &buf);
+    try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 429"));
+    const head_end = (std.mem.indexOf(u8, got, "\r\n\r\n") orelse return error.NoBody) + 4;
+    var lower: [2048]u8 = undefined;
+    const head = std.ascii.lowerString(&lower, got[0..head_end]);
+    try std.testing.expect(std.mem.indexOf(u8, head, "\r\nretry-after: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "\r\nratelimit-remaining: 0\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "\r\ncontent-type: application/json") != null);
+    try std.testing.expectEqualStrings("{\"error\":\"Too Many Requests\"}", got[head_end..]);
+}
+
+test "capi engine: a rate_limit refusal answers in the configured error format, its headers kept" {
+    const json =
+        \\{"executors": 1, "timeouts": {"shutdown_ms": 200}, "errors": "json",
+        \\ "listeners": [{"address": "127.0.0.1", "port": 0}],
+        \\ "middleware": [{"rate_limit": {"limit": 1}}],
+        \\ "routes": [{"path": "/fixed", "respond": {"status": 200, "body": "ok"}}]}
+    ;
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    defer e.destroy();
+    _ = try e.attach(null, null, false);
+    try e.start();
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(rateLimitCheck, .{ io, e.port(0) });
+    try f.await(io);
+    try e.drain();
+    try std.testing.expect(e.wait(stopWaitMs()));
+}
+
 fn testVarsReal(_: ?*const anyopaque, name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, name, "PORT")) return "41234";
     return null;

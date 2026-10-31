@@ -122,7 +122,8 @@ fn checkSpec(comptime s: InSpec) void {
 // ------------------------------------------------------------------ outputs
 
 /// A typed handler's result written as JSON with this status (any 2xx):
-/// `return .{ .value = todo };`.
+/// `return .{ .value = todo };`. With `T = void` nothing is written but
+/// the status: `WithStatus(.no_content, void)` answers a bare 204.
 pub fn WithStatus(comptime status: dusty.Status, comptime T: type) type {
     const code = @backingInt(status);
     if (code < 200 or code > 299) @compileError("anole.WithStatus takes a 2xx status, not " ++ @tagName(status));
@@ -288,6 +289,9 @@ fn writeOut(comptime sh: Shape, res: *dusty.Response, payload: sh.Out) !void {
     if (comptime hasStatus(Out)) {
         if (!(sh.takes_res and res.status != .ok)) res.status = Out.anole_status;
         if (payload.location) |l| try res.header("Location", l);
+        // Nothing to write: the status alone (a 204 has no content,
+        // RFC 9110 15.3.5).
+        if (Out.Payload == void) return;
         return res.json(payload.value);
     }
     return res.json(payload);
@@ -504,11 +508,32 @@ test "typed: Created and Accepted answer their status with the value as JSON" {
     try a.expectBody("{\"id\":8}");
 }
 
-// Kept (the audit's rewrite would drop it): a typed handler returning
-// WithStatus(.no_content, void) does not compile (res.json of void), so the
-// 204 claim has no behaviour test yet; reported, not fixed here.
-test "Created and Accepted carry a status" {
-    try std.testing.expect(Created(u8).anole_status == .created);
-    try std.testing.expect(Accepted(u8).anole_status == .accepted);
-    try std.testing.expect(WithStatus(.no_content, void).anole_status == .no_content);
+test "typed: WithStatus with a void value answers the status with no body" {
+    const anole = @import("root.zig");
+    const H = struct {
+        fn none(_: *dusty.Request) !WithStatus(.no_content, void) {
+            return .{ .value = {} };
+        }
+        fn accepted(_: *dusty.Request) !Accepted(void) {
+            return .{ .value = {}, .location = "/jobs/3" };
+        }
+    };
+    var app = try anole.App.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer app.deinit();
+    app.post("/none", H.none);
+    app.post("/accepted", H.accepted);
+    var t = try anole.testing.client(&app);
+    defer t.deinit();
+
+    var n = try t.post("/none", .{});
+    defer n.deinit();
+    try n.expectStatus(.no_content);
+    try n.expectBody("");
+    try std.testing.expect(n.header("content-type") == null);
+
+    var a = try t.post("/accepted", .{});
+    defer a.deinit();
+    try a.expectStatus(.accepted);
+    try a.expectHeader("location", "/jobs/3");
+    try a.expectBody("");
 }

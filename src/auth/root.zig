@@ -72,4 +72,5 @@ test {
     _ = @import("csrf_test.zig");
     _ = oidc;
     _ = @import("oidc_test.zig");
+    _ = @import("refusal_test.zig");
 }

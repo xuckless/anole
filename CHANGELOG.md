@@ -3,6 +3,44 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.2 (unreleased)
+
+### Changed
+
+- The JWT, API key, RBAC, CSRF and rate-limit middlewares (and the C ABI's
+  `rate_limit`) refuse a request by returning `error.Unauthorized`,
+  `error.BadRequest`, `error.Forbidden` or `error.TooManyRequests` with
+  their protocol headers set (`WWW-Authenticate`, `Retry-After`,
+  `RateLimit-*`), instead of writing a plain-text body themselves. An app
+  with an `error_handler` or `uncaughtError` now receives these errors; a
+  middleware of its own that does work after `try next.call()` skips it on
+  a refusal, as for any handler error. The CSRF body no longer says why
+  (the reason is logged at `debug`) (#33).
+
+### Fixed
+
+- Auth, CSRF and rate-limit refusals ignored `ServerOptions.errors`: a JSON
+  API answered `{"error":...}` for its own errors and plain text for the
+  middleware's. They now follow the server's error format, and their 503
+  and 500 answers (a key store or limiter that failed, a weak HMAC key) do
+  too (#33).
+
+- A connection the local stack aborted after its peer vanished
+  (`ConnectionAborted`: ECONNABORTED, Windows' WSAECONNABORTED) counts as a
+  departed peer: no "HTTP/2 write error" log line, `peerGone()` and a gRPC
+  call's `cancelled()` are true, and `anole.net` reports a reset instead of a
+  failure (#34).
+- `Router.middlewares` assigned directly (instead of through `use()`) was
+  kept as the caller's slice by every route registered after it, so a
+  stack array or reused buffer was read after it changed or went out of
+  scope. A route now keeps a copy in the router's arena. `use()` is the
+  supported way to add global middleware; a list assigned after the last
+  route is still read as is for 404/405 answers (#38).
+- A typed handler returning `anole.WithStatus(.no_content, void)`,
+  `anole.Created(void)` or `anole.Accepted(void)` did not compile
+  (std.json cannot write `void`). It now sends the status (and `Location`)
+  with no body (#142).
+
 ## 0.4.1 (2026-10-30)
 
 ### Security

@@ -10,6 +10,7 @@
 //!     // in a form: <input type="hidden" name="_csrf" value="{token}">, token = try anole.auth.csrf.token(req)
 const std = @import("std");
 const dusty = @import("dusty");
+const log = std.log.scoped(.anole_auth);
 const declarations = @import("../openapi/declarations.zig");
 
 /// The session key the token is kept under.
@@ -57,7 +58,7 @@ pub const Middleware = struct {
     /// Never waits: no I/O, so `no_wait` routes may sit behind it.
     pub const no_wait = true;
 
-    pub fn execute(self: *const Middleware, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
+    pub fn execute(self: *const Middleware, req: *dusty.Request, _: *dusty.Response, next: anytype) !void {
         switch (req.method) {
             .post, .put, .patch, .delete => {},
             else => return next.call(),
@@ -65,20 +66,21 @@ pub const Middleware = struct {
         const content_type = req.headers.get("Content-Type") orelse "";
         if (!self.config.check_json and std.mem.startsWith(u8, content_type, "application/json")) return next.call();
 
-        const expected = req.session.get(session_key) orelse return reject(res);
+        const expected = req.session.get(session_key) orelse return reject("no CSRF token in the session");
         const sent = req.headers.get(header_name) orelse blk: {
             if (!std.mem.startsWith(u8, content_type, "application/x-www-form-urlencoded")) break :blk null;
             const form = req.formData() catch break :blk null;
             break :blk form.get(field_name);
-        } orelse return reject(res);
-        if (sent.len != token_len or expected.len != token_len) return reject(res);
-        if (!std.crypto.timing_safe.eql([token_len]u8, sent[0..token_len].*, expected[0..token_len].*)) return reject(res);
+        } orelse return reject("no CSRF token sent");
+        if (sent.len != token_len or expected.len != token_len) return reject("CSRF token of the wrong length");
+        if (!std.crypto.timing_safe.eql([token_len]u8, sent[0..token_len].*, expected[0..token_len].*)) return reject("wrong CSRF token");
         return next.call();
     }
 
-    fn reject(res: *dusty.Response) void {
-        res.status = .forbidden;
-        res.content_type = .text;
-        res.body = "403 Forbidden: CSRF token missing or wrong\n";
+    /// A 403 answered by the chain in the server's error format; the
+    /// reason goes to the debug log, not to the client.
+    fn reject(why: []const u8) error{Forbidden} {
+        log.debug("request refused: {s}", .{why});
+        return error.Forbidden;
     }
 };
