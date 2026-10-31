@@ -593,8 +593,14 @@ pub const Connection = struct {
     /// Best effort, on a connection about to close: the corked responses
     /// go out before the close, as each would have before corking. What
     /// cannot be sent is dropped. A cancel is passed on.
+    /// A writer that already failed (a write timeout's cancel among them)
+    /// is not tried again: what it holds is dropped.
     pub fn flushOwedBeforeClose(self: *Connection) std.Io.Cancelable!void {
         if (self.writer.end == 0) return;
+        if (self.getWriteError() != null) {
+            self.writer.end = 0;
+            return;
+        }
         self.writer.flush() catch {
             self.writer.end = 0;
             if (self.getWriteError()) |err| if (err == error.Canceled) return error.Canceled;
@@ -2771,8 +2777,28 @@ pub fn Server(comptime Ctx: type) type {
         /// Whether `buffered`, the start of a request, holds its whole head:
         /// the blank line that ends it is there. A head ended by bare LFs
         /// is not recognized, which only costs a header deadline.
+        ///
+        /// Empty lines before the request line are skipped (RFC 9112 section
+        /// 2.2, as llhttp does): the CRLF an old client sends after a body
+        /// is not a head, and must not keep corked responses back while
+        /// the read waits for the real one.
         fn headBuffered(buffered: []const u8) bool {
-            return std.mem.indexOf(u8, buffered, "\r\n\r\n") != null;
+            const start = std.mem.trimStart(u8, buffered, "\r\n");
+            return std.mem.indexOf(u8, start, "\r\n\r\n") != null;
+        }
+
+        /// On a connection closing after a handler's error or abort: the
+        /// responses corked before this one go out first. Once this one's
+        /// body has started (a stream or a file: its head went out, and the
+        /// corked responses with it), the buffer holds only its unsent
+        /// tail, which is dropped, as before corking: a flush could wait
+        /// on a peer that stopped reading, past every deadline.
+        fn closeOwed(connection: *Connection, response: *const Response) std.Io.Cancelable!void {
+            if (response._stream_mode) {
+                connection.dropOwed();
+                return;
+            }
+            try connection.flushOwedBeforeClose();
         }
 
         fn deadlineAfter(start: std.Io.Clock.Timestamp, duration: ?std.Io.Duration) ?std.Io.Clock.Timestamp {
@@ -2949,11 +2975,15 @@ pub fn Server(comptime Ctx: type) type {
                 // An adopter's writer is its own, under its lock: it took
                 // it out of the buffers before it returned.
                 if (connection.adopter == null) {
-                    // Every exit sends or drops the corked responses
-                    // (`flushOwed`, `flushOwedBeforeClose`, `dropOwed`)
-                    // unless a write failed: anything left here is a
-                    // response lost.
-                    std.debug.assert(connection.writer.end == 0 or connection.getWriteError() != null);
+                    // The exits that pass `flushOwed`, `flushOwedBeforeClose`
+                    // or `dropOwed` leave nothing owed. The others are
+                    // errors before the next response wrote anything (its
+                    // head or Content-Length refused by `Response.write`,
+                    // out of memory): the responses corked before it are
+                    // whole, and go out before the close, as each would
+                    // have before corking.
+                    connection.flushOwedBeforeClose() catch self.io.recancel();
+                    std.debug.assert(connection.writer.end == 0);
                     connection.releaseWriteBuffer();
                 }
                 self.request_buffers.release(b);
@@ -3300,7 +3330,7 @@ pub fn Server(comptime Ctx: type) type {
                     // responses corked before it still go out first.
                     error.ResponseAborted => {
                         log.debug("Response aborted ({f} {s})", .{ request.method, request.url });
-                        try connection.flushOwedBeforeClose();
+                        try closeOwed(connection, &response);
                         return .close;
                     },
                     error.Canceled => {
@@ -3308,7 +3338,7 @@ pub fn Server(comptime Ctx: type) type {
                         return error.Canceled;
                     },
                     else => |e| {
-                        try connection.flushOwedBeforeClose();
+                        try closeOwed(connection, &response);
                         return e;
                     },
                 };

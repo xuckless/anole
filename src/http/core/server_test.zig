@@ -1213,6 +1213,7 @@ const CorkCtx = struct {
         server.router.addRouteWith(.get, "/abort", abort, .{ .no_wait = true });
         server.router.addRouteWith(.post, "/echo", echo, .{ .no_wait = true });
         server.router.addRouteWith(.get, "/ws", ws, .{ .no_wait = true });
+        server.router.addRouteWith(.get, "/badlen", badLength, .{ .no_wait = true });
         server.router.get("/wait", waitForClient);
     }
 
@@ -1234,6 +1235,13 @@ const CorkCtx = struct {
 
     fn echo(_: *CorkCtx, req: *dusty.Request, res: *dusty.Response) !void {
         res.body = (try req.body()) orelse "no body";
+    }
+
+    /// A Content-Length the body does not match: `Response.write` refuses
+    /// it before writing anything, and the connection closes.
+    fn badLength(_: *CorkCtx, _: *dusty.Request, res: *dusty.Response) !void {
+        try res.header("Content-Length", "5");
+        res.body = "abc";
     }
 
     fn ws(_: *CorkCtx, req: *dusty.Request, res: *dusty.Response) !void {
@@ -1374,6 +1382,34 @@ test "Server: responses corked before an aborted one still go out before the clo
     var status: [64]u8 = undefined;
     var body: [8]u8 = undefined;
     try std.testing.expectError(error.EndOfStream, readResponse(&client.reader.interface, &status, &body));
+}
+
+test "Server: a response corked before one that Response.write refuses still goes out before the close" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    // `/a` is corked behind `/badlen`, whose write fails before it writes
+    // anything: an exit past the handler's error arms.
+    try client.send("GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /badlen HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try client.expectBody("a");
+    var status: [64]u8 = undefined;
+    var body: [8]u8 = undefined;
+    try std.testing.expectError(error.EndOfStream, readResponse(&client.reader.interface, &status, &body));
+}
+
+test "Server: a response corked behind the empty lines after a body goes out before the next head is read" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    // An old client's CRLF after the body: not a head, so the server reads
+    // for the next one, and the answer must not wait for it.
+    try client.send("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello\r\n\r\n");
+    try client.expectBody("hello");
+    try client.send("GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try client.expectBody("a");
 }
 
 test "Server: pipelined requests and then the end of input are all answered before the close" {
@@ -4733,6 +4769,55 @@ test "stream: a peer that stops reading is cut after timeouts.write" {
     }.failed);
     try std.testing.expectEqual(StreamWatch.timed_out, StreamWatch.write_error.load(.acquire));
     if (wait.timing()) try std.testing.expect(start.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds() < 2000);
+}
+
+test "stream: a handler that returns its write timeout ends the connection without flushing to the stalled peer" {
+    const io = std.testing.io;
+    StreamWatch.write_error.store(0, .release);
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .timeout = .{ .request = .fromSeconds(30), .write = .fromMilliseconds(300) },
+    }, {});
+    defer server.deinit();
+    server.router.get("/big", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            var buf: [16 * 1024]u8 = undefined;
+            var body = try res.stream(&buf);
+            const chunk: [64 * 1024]u8 = @splat('x');
+            for (0..128) |_| {
+                body.interface.writeAll(&chunk) catch {
+                    const err = body.err orelse error.WriteFailed;
+                    StreamWatch.write_error.store(if (err == error.WriteTimeout) StreamWatch.timed_out else StreamWatch.other, .release);
+                    // Back to the server with the stream's tail still in
+                    // the write buffer: it must not flush it to a peer
+                    // that reads nothing.
+                    return err;
+                };
+            }
+        }
+    }.handle);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    // The client reads none of it and keeps its end open.
+    const stream = try startRaw(io, &server, "GET /big HTTP/1.1\r\nHost: x\r\n\r\n");
+    defer stream.close(io);
+    try wait.waitUntil(io, "the stream's write failed", {}, struct {
+        fn failed(_: void) bool {
+            return StreamWatch.write_error.load(.acquire) != 0;
+        }
+    }.failed);
+    try std.testing.expectEqual(StreamWatch.timed_out, StreamWatch.write_error.load(.acquire));
+    try wait.waitUntil(io, "the server let the connection go", &server, struct {
+        fn gone(s: *dusty.Server(void)) bool {
+            return s.active_connections.load(.acquire) == 0;
+        }
+    }.gone);
 }
 
 test "sendFile: a download slower than timeouts.request completes" {
