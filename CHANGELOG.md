@@ -27,6 +27,11 @@ breaking changes are listed anyway.
   ngtcp2 still pads what RFC 9000 requires (Initials, path validation,
   MTU probes) (#100).
 
+- HTTP/3 sockets ask for 4 MiB receive and send buffers (the system caps
+  them: on Linux `net.core.rmem_max`/`wmem_max`). The server logs what it
+  got once at startup, and `/metrics` shows it as
+  `anole_h3_socket_rcvbuf_bytes`/`anole_h3_socket_sndbuf_bytes` (#100).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed

@@ -7,7 +7,8 @@
 //! `anole_h3_forwarded_out_total`, `anole_h3_dropped_total`,
 //! `anole_h3_datagrams_out_total`, `anole_h3_tx_flushes_total`,
 //! `anole_h3_requests_total`, `anole_h3_served_inline_total` and
-//! `anole_h3_connections_open`. Per listener: `anole_h3_steering` (1 when
+//! `anole_h3_connections_open`, and the socket buffers the system granted,
+//! `anole_h3_socket_rcvbuf_bytes` and `anole_h3_socket_sndbuf_bytes`. Per listener: `anole_h3_steering` (1 when
 //! the kernel steers datagrams to their connection's endpoint).
 const std = @import("std");
 const metrics = @import("../observe/metrics.zig");
@@ -30,18 +31,22 @@ const counters = [_]Series{
     .{ .name = "anole_h3_served_inline_total", .help = "HTTP/3 requests for no_wait routes run inline, without a task.", .field = "served_inline" },
 };
 
-/// Copies `endpoints`' stats (each with `.index` and `.stats`) into
+/// Copies `endpoints`' stats (each with `.index`, `.stats` and `.udp`) into
 /// `registry`; `steering` and `listener` name the listener.
 pub fn refresh(registry: *metrics.Registry, endpoints: anytype, steering: bool, listener: []const u8) void {
     var families: [counters.len]*metrics.Family(metrics.Counter) = undefined;
     inline for (counters, 0..) |s, i| families[i] = registry.counter(s.name, s.help, &.{"endpoint"}) catch return;
     const open = registry.gauge("anole_h3_connections_open", "HTTP/3 connections open on an endpoint.", &.{"endpoint"}) catch return;
+    const rcvbuf = registry.gauge("anole_h3_socket_rcvbuf_bytes", "An HTTP/3 endpoint's UDP receive buffer, as the system reports it (Linux: twice what it granted).", &.{"endpoint"}) catch return;
+    const sndbuf = registry.gauge("anole_h3_socket_sndbuf_bytes", "An HTTP/3 endpoint's UDP send buffer, as the system reports it (Linux: twice what it granted).", &.{"endpoint"}) catch return;
     var buf: [4]u8 = undefined;
     for (endpoints) |ep| {
         const id = std.fmt.bufPrint(&buf, "{d}", .{ep.index}) catch continue;
         const st: *const Stats = &ep.stats;
         inline for (counters, 0..) |s, i| families[i].with(&.{id}).set(@field(st, s.field).load(.monotonic));
         open.with(&.{id}).set(@intCast(st.connections_open.load(.monotonic)));
+        rcvbuf.with(&.{id}).set(ep.udp.rcvbuf);
+        sndbuf.with(&.{id}).set(ep.udp.sndbuf);
     }
     const steer = registry.gauge("anole_h3_steering", "1 when the kernel steers an HTTP/3 listener's datagrams to their connection's endpoint (classic BPF on SO_REUSEPORT).", &.{"listener"}) catch return;
     steer.with(&.{listener}).set(@intFromBool(steering));
@@ -51,7 +56,7 @@ test "h3 metrics: a scrape shows each endpoint's counts and the steering gauge" 
     const gpa = std.testing.allocator;
     var r = metrics.Registry.init(gpa, std.testing.io);
     defer r.deinit();
-    const Ep = struct { index: u8, stats: Stats = .{} };
+    const Ep = struct { index: u8, stats: Stats = .{}, udp: struct { rcvbuf: u32 = 425984, sndbuf: u32 = 0 } = .{} };
     var eps = [_]Ep{ .{ .index = 0 }, .{ .index = 1 } };
     eps[0].stats.requests.store(3, .monotonic);
     eps[1].stats.requests.store(4, .monotonic);
@@ -70,6 +75,7 @@ test "h3 metrics: a scrape shows each endpoint's counts and the steering gauge" 
         "anole_h3_forwarded_out_total{endpoint=\"0\"} 0\n",
         "anole_h3_connections_open{endpoint=\"1\"} 1\n",
         "anole_h3_steering{listener=\"https\"} 1\n",
+        "anole_h3_socket_rcvbuf_bytes{endpoint=\"0\"} 425984\n",
     }) |line| {
         if (std.mem.indexOf(u8, text, line) == null) {
             std.debug.print("missing {s} in:\n{s}\n", .{ line, text });

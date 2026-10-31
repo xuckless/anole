@@ -81,6 +81,11 @@ const tx_round = burst * c.NGTCP2_MAX_UDP_PAYLOAD_SIZE;
 /// of datagrams started (`Conn.holding`), so that their answers and the
 /// ACK leave together in as few packets as they fit.
 const hold_ns = std.time.ns_per_ms;
+/// The UDP socket buffers each endpoint asks for, both ways: room for
+/// bursts from many connections between two reads (aegon, goose and
+/// agensio ask for 4 MiB too). The system caps it (Linux: rmem_max and
+/// wmem_max, 208 KiB by default); `init` logs what was granted.
+const socket_buffer = 4 << 20;
 /// Stateless resets sent per second at most (ngtcp2's examples' figure).
 const stateless_reset_burst = 100;
 /// Retries an endpoint remembers (`Endpoint.retried`), and for how long:
@@ -522,6 +527,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             // The group numbers its sockets in bind order, as we did, so
             // the program's index is the endpoint's. Inherited sockets keep
             // the order their first owner bound them in.
+            {
+                const u = &shared.endpoints[0].udp;
+                log.info("HTTP/3: UDP socket buffers {d} KiB receive, {d} KiB send as the system reports them (asked {d} KiB each; Linux caps them at net.core.rmem_max/wmem_max and reports twice what it grants)", .{ u.rcvbuf / 1024, u.sndbuf / 1024, socket_buffer / 1024 });
+            }
             if (count > 1) {
                 if (steer.attach(shared.endpoints[0].udp.socket.handle, @intCast(count))) {
                     shared.steering = true;
@@ -555,7 +564,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .io = io,
                 .http = http,
                 .options = options,
-                .udp = .init(socket, .{}),
+                .udp = .init(socket, .{ .rcvbuf = socket_buffer, .sndbuf = socket_buffer }),
                 .local = .from(socket.address),
                 .index = index,
                 .shared = shared,

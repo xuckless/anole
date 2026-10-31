@@ -101,6 +101,11 @@ pub const Udp = struct {
     /// Linux only; turned off for good if the kernel or NIC refuses it.
     gso: std.atomic.Value(bool) = .init(false),
     gro: bool = false,
+    /// The socket's receive and send buffers as the system reports them
+    /// after `init` (Linux doubles what it grants, for its bookkeeping);
+    /// 0 where unknown.
+    rcvbuf: u32 = 0,
+    sndbuf: u32 = 0,
 
     const posix = std.posix;
     const native_os = @import("builtin").os.tag;
@@ -130,6 +135,11 @@ pub const Udp = struct {
         /// receive buffer arrives with each datagram (SO_RXQ_OVFL), as
         /// `Datagram.dropped`.
         rxq_ovfl: bool = false,
+        /// SO_RCVBUF / SO_SNDBUF to ask for; null keeps the system's
+        /// default. The system caps them (Linux: net.core.rmem_max and
+        /// wmem_max); `Udp.rcvbuf`/`sndbuf` say what it granted.
+        rcvbuf: ?u31 = null,
+        sndbuf: ?u31 = null,
     };
 
     /// HTTP/3 takes `.{}`: everything on.
@@ -142,6 +152,10 @@ pub const Udp = struct {
         var self: Udp = .{ .socket = socket, .ip6 = ip6, .wildcard = wildcard };
         if (comptime !has_control) return self;
         const fd = socket.handle;
+        if (options.rcvbuf) |n| _ = setOption(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, n);
+        if (options.sndbuf) |n| _ = setOption(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, n);
+        self.rcvbuf = getOption(fd, posix.SOL.SOCKET, posix.SO.RCVBUF);
+        self.sndbuf = getOption(fd, posix.SOL.SOCKET, posix.SO.SNDBUF);
         if (ip6) {
             if (options.ecn) _ = setOption(fd, posix.IPPROTO.IPV6, posix.IPV6.RECVTCLASS, 1);
             if (wildcard) _ = setOption(fd, posix.IPPROTO.IPV6, posix.IPV6.RECVPKTINFO, 1);
@@ -179,6 +193,14 @@ pub const Udp = struct {
         var len: posix.socklen_t = @sizeOf(c_int);
         if (std.c.getsockopt(fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, @ptrCast(&value), &len) != 0) return true;
         return value != 0;
+    }
+
+    /// An int socket option's value; 0 when it can't be read.
+    fn getOption(fd: posix.socket_t, level: i32, name: u32) u32 {
+        var value: c_int = 0;
+        var len: posix.socklen_t = @sizeOf(c_int);
+        if (std.c.getsockopt(fd, level, name, &value, &len) != 0) return 0;
+        return std.math.cast(u32, value) orelse 0;
     }
 
     fn setOption(fd: posix.socket_t, level: i32, name: u32, value: c_int) bool {
@@ -568,6 +590,22 @@ test "UDP: a send that a cancelation interrupts leaves it for the next cancelati
     };
     asking.store(true, .release);
     try std.testing.expectError(error.Canceled, future.cancel(io));
+}
+
+test "UDP: asked socket buffers are set, and what the system granted is read back" {
+    if (comptime !Udp.has_control) return error.SkipZigTest; // no options on Windows
+    const zio = @import("zio");
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    // Under every default cap (Linux's rmem_max is 208 KiB unless raised).
+    const asked = 96 * 1024;
+    var u: Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), .{ .rcvbuf = asked, .sndbuf = asked });
+    defer u.socket.close(io);
+    // Linux reports twice what it granted; macOS what was asked.
+    try std.testing.expect(u.rcvbuf >= asked);
+    try std.testing.expect(u.sndbuf >= asked);
 }
 
 test "UDP: ECN codepoints and the local address of a wildcard socket come through" {
