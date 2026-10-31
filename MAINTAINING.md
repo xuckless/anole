@@ -175,6 +175,11 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   in lalinsky/zio#837, which Anole turns on in `build.zig` and
   `anole.zio_options`. The bench suite's `conns` and `raw` scenarios measure
   them.
+  Windows IOCP (#139, 4c04fd0 on `anole`, 56e57f6 on `anole-diag`): an
+  AF_UNIX connect goes through a plain connect() (as .NET and Go do)
+  instead of a wildcard bind and ConnectEx (the all-NUL AF_UNIX wildcard is
+  an abstract address; seen as WSAEFAULT on Windows Server 2025). Offer
+  upstream with the next scheduler PRs.
   Anole pins the fork's `anole-diag` branch for now: `anole` plus the task
   dump and the executor stall watchdog (src/diag.zig in the fork), behind
   `diagnostics` and compiled only in Debug and test builds. Every task is
