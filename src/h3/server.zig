@@ -1551,6 +1551,14 @@ pub fn Endpoint(comptime Ctx: type) type {
                 settings.preferred_versions = versions.ptr;
                 settings.preferred_versionslen = versions.len;
                 settings.max_stream_window = ep.options.max_stream_data;
+                // Every ack-eliciting packet is acknowledged in the next
+                // packet we write (ngtcp2's default waits for 2, or the
+                // ACK delay): the ACK of a request rides on its answer, so
+                // the client closes the stream at once. agensio, goose and
+                // cnetmod carry a pending ACK on every packet the same way.
+                // Kept only if the qlog shows late server ACKs after
+                // max_ack_delay 5 ms (#100, HA1).
+                settings.ack_thresh = 1;
                 // qlog stays off: both of ngtcp2's high-severity
                 // advisories were in its qlog code.
                 settings.qlog_write = null;

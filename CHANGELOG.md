@@ -41,6 +41,10 @@ breaking changes are listed anyway.
   (`max_ack_delay`), down from 25 ms, so a request whose answer waits
   does not hold the client's stream open for a delayed ACK (#100).
 
+- HTTP/3 acknowledges every ack-eliciting packet in the next packet it
+  writes (`ack_thresh` 1, ngtcp2's default is 2), so a request's ACK
+  leaves with its answer (#100).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed
