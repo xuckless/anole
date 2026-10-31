@@ -123,10 +123,12 @@ pub fn take(class_size: usize) ?[]align(16) u8 {
         list.count -= 1;
         list.low = @min(list.low, list.count);
         cache.bytes -= class_size;
+        // SAFETY: a free block starts with its `Free` header (`give`).
         const block: [*]align(16) u8 = @ptrCast(f);
         return block[0..class_size];
     }
     const fresh = page_allocator.rawAlloc(class_size, page_align, @returnAddress()) orelse return null;
+    // SAFETY: mapped at page alignment, past 16.
     return @alignCast(fresh[0..class_size]);
 }
 
