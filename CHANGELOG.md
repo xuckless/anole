@@ -3,6 +3,38 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.5.0 (unreleased)
+
+### Changed
+
+- Static files and `Response.sendFile` no longer follow a symlink out of
+  their directory: `StaticOptions.resolve_beneath` and
+  `SendFileOptions.resolve_beneath` are on by default, so a path that
+  resolves outside (a link, an index file or a precompressed copy that
+  points out) is a 404. Links that stay inside still work; use relative
+  ones, because where the OS confines the open (Linux 5.6+, macOS 26+) an
+  absolute link is refused even when it points inside, while on Windows,
+  macOS 15.x and Linux without `openat2` the server opens the file and
+  checks its real path, which serves such a link. Layouts such as
+  Capistrano's `public/system -> ../../shared/system` now answer 404:
+  serve the target as its own static directory, or set
+  `.resolve_beneath = false` for the old behaviour. The tier is picked once
+  at startup and logged. Linux without `openat2` (kernels before 5.6, some
+  sandboxes) uses the real-path check, which costs a second blocking-pool
+  hop per static open; `.resolve_beneath = false` restores the old speed. A
+  Linux system with neither `openat2` nor `/proc` refuses to start with a
+  message naming `.resolve_beneath = false`. The real path of each static
+  directory is read at startup, so renaming a directory while serving
+  answers 404 (#133).
+- C ABI 0.11: `routes[].static` takes `resolve_beneath` (default `true`; the
+  default changes what the bindings' static routes serve, as above). A
+  binding built for 0.11 that sends the key to a 0.10 library has its
+  configuration refused, as the exact version check says before 1.0 (#133).
+
+### Fixed
+
+- The docs said Anole has no runtime Brotli encoder; it has one (`-Dbrotli`).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed

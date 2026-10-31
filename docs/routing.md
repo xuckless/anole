@@ -531,13 +531,19 @@ The path stays inside the directory you pass: an absolute path or a `..`
 segment fails with `error.BadPathName` (a 404 if the handler returns it), so
 a name taken from the request (`req.params.get("name")`, a query parameter)
 cannot reach a file elsewhere. Symlinks inside the directory are still
-followed unless `.resolve_beneath = true`. To send a file your program names
-outside the directory, open the directory it is in and pass the name
-relative to that.
+served, but one that leads outside it is `error.AccessDenied` (a 404 if the
+handler returns it): `.resolve_beneath` is on by default, and
+`.resolve_beneath = false` follows symlinks wherever they lead. Use relative
+links: where the OS confines the open itself (Linux 5.6+, macOS 26+) an
+absolute link is refused even when it points back inside the directory,
+while elsewhere (Windows, macOS 15.x, Linux without openat2) the file is
+opened and its real path compared with the directory's, which serves it. To
+send a file your program names outside the directory, open the directory it
+is in and pass the name relative to that.
 
 ```zig
 fn download(_: *anole.Request, res: *anole.Response) !void {
-    _ = res.sendFile(std.Io.Dir.cwd(), "reports/latest.pdf", .{ .resolve_beneath = true }) catch |err| switch (err) {
+    _ = res.sendFile(std.Io.Dir.cwd(), "reports/latest.pdf", .{}) catch |err| switch (err) {
         error.FileNotFound => return error.NotFound,
         else => |e| return e,
     };
@@ -576,13 +582,43 @@ Both take the same options:
   a directory URL without its trailing slash is redirected (301).
 - `..` out of the directory is a 404, and so are dotfiles such as `/.env`
   unless `.hide_dotfiles = false` (serve `/.well-known/` with its own route).
-  Symlinks are followed unless `.resolve_beneath = true`, whose strength
-  depends on the platform.
+  A symlink that leads outside the directory is a 404 too
+  (`.resolve_beneath`, on by default; `false` follows symlinks wherever
+  they lead). Symlinks that stay inside are served, but use relative ones:
+  see "Symlinks out of the directory" below.
 - `precompressed`: `style.css.br`, `.zst` or `.gz` is served for
   `style.css` to a client that accepts that coding, by its q-values and then
   your order, with `Vary: Accept-Encoding`. The plain file must exist too.
-  This is the only way to serve Brotli; there is no runtime Brotli encoder.
 - `cache_control` goes out with 200, 206 and 304.
+
+### Symlinks out of the directory
+
+A symlink that leaves the directory is a 404, as is a precompressed copy or
+an index file that does. This changed in 0.5: a layout such as
+`public/system -> ../../shared/system` (Capistrano) or links into a store
+now answers 404. Serve the target as a static directory of its own, or set
+`.resolve_beneath = false` to follow symlinks wherever they lead (the old
+behaviour).
+
+- Links that stay inside the directory work. **Use relative links.** On
+  Linux 5.6+ and macOS 26+ the kernel refuses the open (`openat2` with
+  `RESOLVE_BENEATH`, `O_RESOLVE_BENEATH`), and it refuses an absolute link
+  even when that points back inside. On Windows, macOS 15.x and Linux
+  without `openat2` (kernels before 5.6, Docker before 20.10 under its
+  default seccomp profile) the server opens the file and compares its real
+  path with the directory's, which serves such an absolute link: a link
+  that works on one machine can be a 404 on another.
+- The check without kernel help costs a second blocking-pool hop per
+  open, on top of the open's own. The server logs which way it went at
+  startup (info on Linux, debug elsewhere); `.resolve_beneath = false`
+  restores the old speed where that matters.
+- The real path of the directory is read when the server starts, so a
+  directory renamed or replaced while serving answers 404.
+- Linux with neither `openat2` nor `/proc` cannot do the check, and the
+  server refuses to start, with a message that names
+  `.resolve_beneath = false`.
+- Hard links and bind mounts into the directory are not symlinks and are
+  served.
 
 `embedded` serves one file compiled into the binary, with the same
 conditional and range handling and an `ETag` hashed from the content. Its
