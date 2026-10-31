@@ -70,6 +70,8 @@ const TestClient = struct {
         sent: usize = 0,
         /// Never end the request side (a tunnel the peer keeps open).
         keep_open: bool = false,
+        /// The server's END_STREAM came: the response is whole.
+        answered: bool = false,
     };
 
     fn init(self: *TestClient, gpa: std.mem.Allocator, io: std.Io, addr: std.Io.net.IpAddress) !void {
@@ -239,6 +241,19 @@ const TestClient = struct {
         }
     }
 
+    /// Sends and receives until the response on stream `id` is whole,
+    /// whether or not the stream is closed.
+    fn runUntilAnswered(self: *TestClient, id: i32) !void {
+        while (true) {
+            try self.sendPending();
+            if (self.get(id).answered) return;
+            const bytes = try self.r.peekGreedy(1);
+            const rv = c.nghttp2_session_mem_recv2(self.session, bytes.ptr, bytes.len);
+            if (rv < 0) return error.Http2Recv;
+            self.r.toss(@intCast(rv));
+        }
+    }
+
     fn nv(name: []const u8, value: []const u8) c.nghttp2_nv {
         return .{ .name = @constCast(name.ptr), .namelen = name.len, .value = @constCast(value.ptr), .valuelen = value.len, .flags = c.NGHTTP2_NV_FLAG_NONE };
     }
@@ -275,6 +290,9 @@ const TestClient = struct {
         const self: *TestClient = @ptrCast(@alignCast(user_data.?));
         if (frame.*.hd.type == c.NGHTTP2_DATA and frame.*.hd.length == 0 and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) self.empty_ends += 1;
         if (frame.*.hd.type == c.NGHTTP2_WINDOW_UPDATE and frame.*.hd.stream_id != 0) self.stream_window_updates += 1;
+        if ((frame.*.hd.type == c.NGHTTP2_DATA or frame.*.hd.type == c.NGHTTP2_HEADERS) and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) {
+            if (respFor(session, frame.*.hd.stream_id)) |resp| resp.answered = true;
+        }
         if (frame.*.hd.type == c.NGHTTP2_RST_STREAM) if (respFor(session, frame.*.hd.stream_id)) |resp| {
             if (resp.rsts == 0) resp.body_at_rst = resp.body.items.len;
             resp.rsts += 1;
@@ -1097,6 +1115,67 @@ test "HTTP/2: a drain with a stream in flight sends a two-phase GOAWAY and finis
     const resp = client.get(id);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqualStrings("held but whole", resp.body.items);
+}
+
+test "HTTP/2: a drain resets an answered stream whose client keeps its request side open" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.server.deinit();
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    // Answered without reading the body; the client never ends its side,
+    // so the stream is left discarding when the drain starts.
+    const id = try client.request("POST", "/ignore", "x");
+    client.get(id).keep_open = true;
+    try client.runUntilAnswered(id);
+    try std.testing.expect(!client.get(id).closed);
+
+    var stopper = try io.concurrent(stopFixture, .{ &fx, io });
+    defer stopper.await(io);
+    // The stream ends with the server's RST_STREAM(NO_ERROR), not with the
+    // connection at the drain's deadline (#141).
+    try client.runUntilClosed();
+    const resp = client.get(id);
+    try std.testing.expectEqualStrings("not reading that", resp.body.items);
+    try std.testing.expect(resp.closed);
+    try std.testing.expectEqual(@as(usize, 1), resp.rsts);
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_NO_ERROR), resp.error_code);
+}
+
+test "HTTP/2: a stream answered during a drain whose client keeps its request side open is reset" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.server.deinit();
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    // A request whose client never ends its side, held until both of the
+    // drain's GOAWAYs reached the client: its handler answers during the
+    // drain without reading the body.
+    Handlers.held_gate = .unset;
+    const helds = Handlers.held_entered.load(.acquire);
+    const id = try client.request("GET", "/held", "x");
+    client.get(id).keep_open = true;
+    try client.sendPending();
+    try wait.waitAtLeast(io, "the held request's handler runs", &Handlers.held_entered, helds + 1);
+    var releaser = try io.concurrent(releaseOnFinalGoaway, .{ io, &client, &Handlers.held_gate });
+    defer releaser.cancel(io) catch {};
+    var stopper = try io.concurrent(stopFixture, .{ &fx, io });
+    defer stopper.await(io);
+
+    // The stream ends with the server's RST_STREAM(NO_ERROR) right after
+    // the response, not with the connection at the drain's deadline (#141).
+    try client.runUntilClosed();
+    const resp = client.get(id);
+    try std.testing.expectEqualStrings("held but whole", resp.body.items);
+    try std.testing.expect(resp.closed);
+    try std.testing.expectEqual(@as(usize, 1), resp.rsts);
+    try std.testing.expectEqual(@as(u32, c.NGHTTP2_NO_ERROR), resp.error_code);
 }
 
 /// `holdUnreadAtDrain` holds the reader after the final GOAWAY. It acts

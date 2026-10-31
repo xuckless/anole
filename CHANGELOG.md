@@ -74,6 +74,27 @@ breaking changes are listed anyway.
 - Kafka: a producer whose resolver could not allocate its work for a round
   tries again 250 ms later; records waiting for their leader were neither
   sent nor expired (#159, #162).
+- HTTP/2: a graceful drain no longer waits until `timeouts.shutdown` for a
+  stream that was answered while its client keeps the request side open (a
+  client-streaming gRPC call answered early, say). At drain start such a
+  stream is reset with RST_STREAM(NO_ERROR), and so is one answered during
+  the drain.
+- net: a raw TCP listener whose handler has no `drain` callback no longer
+  holds a stop until `timeouts.shutdown`. At drain start each connection is
+  closed as `conn.close()` does (after a callback in progress): what is
+  queued goes out, Anole ends its side, and the connection closes, with
+  reason `.drain`, when the peer ends its side too or after 2 s. Task-form
+  handlers and the C ABI's listeners are unchanged. See docs/net.md.
+- HTTP/2 client: a response read after its stream closed, or released with
+  its body unread, now gives its bytes back to the connection's
+  flow-control window. Before, each such response kept its size of the
+  window, and a connection (the shared one of `h2c_hosts`, say) stopped
+  receiving response bodies after 16 MiB of them, failing every request on
+  it with `Timeout`.
+- A stop that reaches an accept loop while it logs (that it waits for a
+  connection slot under `max_connections`, or that it could not start a
+  connection's handler) no longer leaves the loop blocked in its next accept
+  under `std.Io.Threaded`.
 
 ## 0.4.1 (2026-10-30)
 

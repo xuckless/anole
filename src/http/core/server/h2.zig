@@ -306,6 +306,14 @@ pub fn Engine(comptime Ctx: type) type {
             fn beginDrain(conn: *Conn) void {
                 conn.lock();
                 defer conn.unlock();
+                // Answered streams whose peer keeps its request side open
+                // would hold the drain until its deadline: end them now
+                // (`startDiscard` ends the ones that start discarding
+                // during the drain).
+                var it = conn.streams.valueIterator();
+                while (it.next()) |stream| {
+                    if (stream.*.discarding) resetDiscarded(conn, stream.*);
+                }
                 if (conn.goaway_sent or conn.drain_notice or conn.closing) return;
                 if (c.nghttp2_submit_shutdown_notice(conn.session) != 0) return;
                 _ = c.nghttp2_submit_ping(conn.session, c.NGHTTP2_FLAG_NONE, &drain_ping);
@@ -591,6 +599,9 @@ pub fn Engine(comptime Ctx: type) type {
             /// up to `discard_left` bytes, then the stream is reset.
             discarding: bool = false,
             discard_left: usize = 0,
+            /// The discarding stream's RST_STREAM(NO_ERROR) is submitted
+            /// (`resetDiscarded`).
+            discard_reset: bool = false,
 
             const Field = struct { name: []const u8, value: []const u8 };
 
@@ -2589,6 +2600,22 @@ pub fn Engine(comptime Ctx: type) type {
                     _ = c.nghttp2_session_consume(conn.session, stream.id, n);
                 }
             }
+            // A draining server does not wait for the rest: a peer that
+            // keeps its request side open would hold the drain until its
+            // deadline (#141). `Conn.beginDrain` ends the streams already
+            // discarding when the drain starts.
+            if (conn.server.busy.load(.acquire).draining) resetDiscarded(conn, stream);
+            conn.kickWriter();
+        }
+
+        /// Ends a discarding stream with RST_STREAM(NO_ERROR) (RFC 9113
+        /// §8.1), once; DATA still on the way is consumed and dropped.
+        /// Under the mutex.
+        fn resetDiscarded(conn: *Conn, stream: *Stream) void {
+            if (stream.discard_reset or stream.body_done or stream.reset) return;
+            stream.discard_reset = true;
+            stream.discard_left = 0;
+            _ = c.nghttp2_submit_rst_stream(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, c.NGHTTP2_NO_ERROR);
             conn.kickWriter();
         }
 
@@ -2607,8 +2634,7 @@ pub fn Engine(comptime Ctx: type) type {
             if (stream.discarding) {
                 _ = c.nghttp2_session_consume(session, stream_id, len);
                 if (len >= stream.discard_left) {
-                    stream.discard_left = 0;
-                    _ = c.nghttp2_submit_rst_stream(session, c.NGHTTP2_FLAG_NONE, stream_id, c.NGHTTP2_NO_ERROR);
+                    resetDiscarded(conn, stream);
                 } else stream.discard_left -= len;
                 return 0;
             }

@@ -922,6 +922,7 @@ pub const Stream = struct {
         conn.lock();
         defer conn.unlock();
         self.user_done = true;
+        self.creditUnread();
         // A stream nghttp2 never got, or one a dead session left behind,
         // has no close to wait for. nghttp2 must not hand it out again.
         if (!self.submitted or conn.session == null or conn.dead) {
@@ -930,6 +931,25 @@ pub const Stream = struct {
             self.protocol_done = true;
         }
         self.maybeFree();
+    }
+
+    /// Under the connection's mutex, once the caller is done: the body
+    /// bytes it never read are dropped, and their window goes back to the
+    /// connection (#149), as `readBody` gives back what it reads. The
+    /// queue is closed (`finishLocked`), so what arrives later is given
+    /// back by `onData`.
+    fn creditUnread(self: *Stream) void {
+        const conn = self.conn;
+        var scratch: [4096]u8 = undefined;
+        var dropped: usize = 0;
+        while (true) {
+            const n = self.body.getUncancelable(conn.io, &scratch, 0) catch break;
+            if (n == 0) break;
+            dropped += n;
+        }
+        if (dropped == 0 or conn.session == null) return;
+        _ = c.nghttp2_session_consume_connection(conn.session, dropped);
+        conn.kickWriter();
     }
 
     fn takeBody(self: *Stream, dest: []u8) (std.Io.QueueClosedError || std.Io.Cancelable)!usize {
@@ -961,7 +981,16 @@ pub const Stream = struct {
         };
         w.advance(n);
         conn.lock();
-        if (conn.session != null and !self.protocol_done) _ = c.nghttp2_session_consume(conn.session, self.id, n);
+        // The connection's window gets the bytes back even once the stream
+        // is closed (its whole response may have come before this read):
+        // else every response read late keeps its size of it, and the
+        // connection stops carrying DATA once that adds up (#149).
+        if (conn.session != null) {
+            if (self.protocol_done)
+                _ = c.nghttp2_session_consume_connection(conn.session, n)
+            else
+                _ = c.nghttp2_session_consume(conn.session, self.id, n);
+        }
         conn.unlock();
         conn.kickWriter();
         return n;

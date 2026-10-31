@@ -643,6 +643,45 @@ test "net tcp: drain runs the handler's drain, and the connections left open clo
     try std.testing.expectEqual(@as(u32, 2), Goodbye.drains.load(.acquire));
 }
 
+/// Reads until the stream ends, then sets `ended`.
+fn readToEnd(s: *ClientStream, ended: *std.atomic.Value(bool)) void {
+    expectEnd(s) catch {};
+    ended.store(true, .release);
+}
+
+test "net tcp: without a drain callback a drain ends this side, and a client that closes on FIN goes at once" {
+    Echo.closed.store(0, .monotonic);
+    Echo.last_reason.store(99, .monotonic);
+    // No shutdown deadline: only the drain's own end can let the
+    // connection go before the client closes (#107).
+    var app = try App.init(alloc, .{ .executors = .exact(1), .timeouts = .{ .shutdown = null } });
+    defer app.deinit();
+    try app.tcp("127.0.0.1:0", Echo, .{});
+    const Run = struct {
+        fn run(a: *App) !void {
+            try a.waitReady();
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            try s.writer().writeAll("hi");
+            try s.writer().flush();
+            try expectRead(s, "hi");
+            var ended: std.atomic.Value(bool) = .init(false);
+            var reading = try a.io().concurrent(readToEnd, .{ s, &ended });
+            defer reading.cancel(a.io());
+            a.stop();
+            // The server's FIN, as a polite client sees it; it closes then.
+            try wait.waitFlag(a.io(), "the server ended its side", &ended);
+            halfClose(s);
+            try waitFor(a.io(), &Echo.closed, 1);
+            try std.testing.expectEqual(@backingInt(net.CloseReason.drain), Echo.last_reason.load(.acquire));
+        }
+    };
+    var checking = try app.io().concurrent(Run.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
+    try app.run();
+    try checking.await(app.io());
+}
+
 test "net tcp: metrics count connections and bytes per listener" {
     var app = try App.init(alloc, .{ .executors = .exact(1) });
     defer app.deinit();
