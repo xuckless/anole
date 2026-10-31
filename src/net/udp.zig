@@ -429,23 +429,30 @@ pub const Udp = struct {
         /// Datagrams in all the messages.
         datagrams: usize = 0,
 
-        /// Room for four of HTTP/3's ~56 KiB rounds, or 256 datagrams
-        /// one by one where there is no GSO.
-        pub const buf_len = 256 * 1024;
-        pub const max_msgs = 256;
+        /// How much an outbox holds.
+        pub const Size = struct {
+            buf_len: usize,
+            max_msgs: usize,
 
-        pub fn init(gpa: std.mem.Allocator) !Outbox {
-            const buf = try gpa.alloc(u8, buf_len);
+            /// Raw UDP sockets (`anole.net`), which send without GSO.
+            pub const default: Size = .{ .buf_len = 128 * 1024, .max_msgs = 128 };
+            /// HTTP/3 endpoints: room for four ~56 KiB GSO rounds, or 256
+            /// datagrams one by one where there is no GSO.
+            pub const h3: Size = .{ .buf_len = 256 * 1024, .max_msgs = 256 };
+        };
+
+        pub fn init(gpa: std.mem.Allocator, size: Size) !Outbox {
+            const buf = try gpa.alloc(u8, size.buf_len);
             errdefer gpa.free(buf);
-            const msgs = try gpa.alloc(std.Io.net.OutgoingMessage, max_msgs);
+            const msgs = try gpa.alloc(std.Io.net.OutgoingMessage, size.max_msgs);
             errdefer gpa.free(msgs);
-            const addrs = try gpa.alloc(std.Io.net.IpAddress, max_msgs);
+            const addrs = try gpa.alloc(std.Io.net.IpAddress, size.max_msgs);
             errdefer gpa.free(addrs);
-            const locals = try gpa.alloc(?std.Io.net.IpAddress, max_msgs);
+            const locals = try gpa.alloc(?std.Io.net.IpAddress, size.max_msgs);
             errdefer gpa.free(locals);
-            const ecns = try gpa.alloc(u8, max_msgs);
+            const ecns = try gpa.alloc(u8, size.max_msgs);
             errdefer gpa.free(ecns);
-            const controls = try gpa.alignedAlloc(Control, .fromByteUnits(cmsg_align), max_msgs);
+            const controls = try gpa.alignedAlloc(Control, .fromByteUnits(cmsg_align), size.max_msgs);
             return .{ .buf = buf, .msgs = msgs, .addrs = addrs, .locals = locals, .ecns = ecns, .controls = controls };
         }
 
@@ -693,7 +700,7 @@ test "UDP: an outbox sends several destinations' packets at once, a run of them 
     var sender: Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), .{});
     defer sender.socket.close(io);
 
-    var outbox: Udp.Outbox = try .init(std.testing.allocator);
+    var outbox: Udp.Outbox = try .init(std.testing.allocator, .default);
     defer outbox.deinit(std.testing.allocator);
     try std.testing.expect(outbox.fits(10, 3));
     // Three datagrams of 4, 4 and 2 bytes for `a`, one for `b`.
@@ -706,7 +713,8 @@ test "UDP: an outbox sends several destinations' packets at once, a run of them 
     try std.testing.expectEqual(@as(usize, if (gso) 2 else 4), outbox.count);
     sender.sendOutbox(io, &outbox);
     try std.testing.expectEqual(@as(usize, 0), outbox.count);
-    try std.testing.expect(outbox.fits(Udp.Outbox.buf_len, Udp.Outbox.max_msgs));
+    try std.testing.expect(outbox.fits(Udp.Outbox.Size.default.buf_len, Udp.Outbox.Size.default.max_msgs));
+    try std.testing.expect(!outbox.fits(Udp.Outbox.Size.default.buf_len + 1, 1));
 
     var buf: [2048]u8 = undefined;
     var control: Udp.Control align(cmsg_align) = undefined;

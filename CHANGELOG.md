@@ -46,8 +46,8 @@ breaking changes are listed anyway.
   leaves with its answer (#100).
 
 - HTTP/3 connections write up to 48 packets (~56 KiB) per GSO send when
-  pacing allows, up from 10, and each endpoint's outbox holds 256 KiB
-  (#100).
+  pacing allows, up from 10, and each HTTP/3 endpoint's outbox holds
+  256 KiB; raw `anole.net` UDP sockets keep their 128 KiB outboxes (#100).
 
 ## 0.4.2 (2026-10-31)
 

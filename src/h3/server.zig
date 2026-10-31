@@ -79,6 +79,9 @@ const scid_len = steer.cid_len;
 const burst = 48;
 /// What a connection may write at a time at most.
 const tx_round = burst * c.NGTCP2_MAX_UDP_PAYLOAD_SIZE;
+comptime {
+    std.debug.assert(Udp.Outbox.Size.h3.buf_len >= 2 * tx_round and Udp.Outbox.Size.h3.max_msgs >= 2 * burst);
+}
 /// How long a connection's flush waits at most for the requests a batch
 /// of datagrams started (`Conn.holding`), so that their answers and the
 /// ACK leave together in as few packets as they fit.
@@ -567,9 +570,9 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn initOne(gpa: std.mem.Allocator, io: std.Io, http: *HttpServer, options: Options, socket: std.Io.net.Socket, index: u8, shared: *Shared, secret: [32]u8) !*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            var tx0: Udp.Outbox = try .init(gpa);
+            var tx0: Udp.Outbox = try .init(gpa, .h3);
             errdefer tx0.deinit(gpa);
-            var tx1: Udp.Outbox = try .init(gpa);
+            var tx1: Udp.Outbox = try .init(gpa, .h3);
             errdefer tx1.deinit(gpa);
             self.* = .{
                 .gpa = gpa,
