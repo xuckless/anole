@@ -40,6 +40,10 @@ breaking changes are listed anyway.
   `anole.Created(void)` or `anole.Accepted(void)` did not compile
   (std.json cannot write `void`). It now sends the status (and `Location`)
   with no body (#142).
+- C ABI gRPC: a call canceled while it waits for its answer ends as
+  canceled (DEADLINE_EXCEEDED for its deadline) even if a request read
+  error or the server stopping landed first; the cancel is no longer
+  swallowed (#140).
 
 ## 0.4.1 (2026-10-30)
 

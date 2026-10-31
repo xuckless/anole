@@ -583,7 +583,9 @@ const WtAnswerer = struct {
                 // go at once: it still goes out whole.
                 const s = try engine.wt.openStream(e, h, true);
                 try self.write(s, "hello from server", true);
-                try engine.wt.streamOp(e, s, .release, 0);
+                // The client may read it, end the session and so make the
+                // handle stale before this release.
+                try cleanup(engine.wt.streamOp(e, s, .release, 0));
                 _ = self.opens.fetchAdd(1, .monotonic);
             },
             .wt_stream => {
@@ -621,7 +623,7 @@ const WtAnswerer = struct {
                 _ = self.resets.fetchAdd(1, .monotonic);
                 const ent = self.streams.get(h) orelse return error.UnknownStream;
                 try self.forget(h);
-                try engine.wt.close(e, ent.session, 42, "bye");
+                try cleanup(engine.wt.close(e, ent.session, 42, "bye"));
             },
             .writable => {
                 _ = self.writables.fetchAdd(1, .monotonic);
@@ -651,7 +653,16 @@ const WtAnswerer = struct {
     fn forget(self: *WtAnswerer, h: u64) !void {
         var kv = self.streams.fetchRemove(h) orelse return;
         kv.value.got.deinit(alloc);
-        try engine.wt.streamOp(self.e, h, .release, 0);
+        try cleanup(engine.wt.streamOp(self.e, h, .release, 0));
+    }
+
+    /// A cleanup call's result as a C consumer sees it (lib.zig `cleanup`):
+    /// an object that is already over (`error.Over`) is done.
+    fn cleanup(result: engine.AnswerError!void) engine.AnswerError!void {
+        result catch |err| switch (err) {
+            error.Over => {},
+            else => return err,
+        };
     }
 };
 
