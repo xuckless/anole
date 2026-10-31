@@ -443,11 +443,28 @@ pub const Cluster = struct {
 
     /// The number of partitions of `topic`, refreshing the metadata when
     /// the topic is unknown or its entry older than `metadata_max_age`.
-    /// Null: the topic does not exist (or no leader is known yet).
+    /// Null: the topic does not exist (or no leader is known yet). An entry
+    /// gone right after the refresh stored it (a stale leader's
+    /// `invalidate` dropped it meanwhile) is asked for again, a few times
+    /// at most (#159).
     pub fn partitionCount(self: *Cluster, topic: []const u8) ConnError!?u32 {
         if (self.lookupCount(topic)) |n| return n;
-        try self.refresh(&.{topic}, true);
-        return self.lookupCount(topic);
+        var refreshes: u32 = 0;
+        while (true) {
+            try self.refresh(&.{topic}, true);
+            refreshes += 1;
+            testHold(self.io, .metadata_refreshed);
+            if (self.lookupCount(topic)) |n| return n;
+            if (refreshes == 4 or !self.dropped(topic)) return null;
+        }
+    }
+
+    /// Whether the cache holds no entry for `topic`: after the caller's own
+    /// refresh stored one, only an `invalidate` since removes it.
+    fn dropped(self: *Cluster, topic: []const u8) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return !self.topics.contains(topic);
     }
 
     /// `partitionCount`, but a topic that may still be on its way is asked

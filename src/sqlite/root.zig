@@ -582,7 +582,22 @@ pub const Client = struct {
             if (w.running == &t.job) c.sqlite3_interrupt(w.conn.handle.db);
             w.mutex.unlock(io);
             t.job.done.waitUncancelable(io);
-            return err;
+            // The job's own answer stands. An interrupted statement answers
+            // Canceled: Anole's own calls map SQLITE_INTERRUPT to Canceled
+            // (`Failure.fromStep`), zig-sqlite's (under `Conn.run`) to
+            // SQLiteInterrupt. One that ran to its end first answers what it
+            // did (a write committed is answered as committed, #160; a
+            // constraint failure as that), and the cancel is raised again
+            // for the caller's next cancelation point (C3), as
+            // `Deadline.run` does.
+            if (comptime @typeInfo(R) == .error_union) {
+                if (t.result) |_| {} else |e| switch (@as(anyerror, e)) {
+                    error.Canceled, error.SQLiteInterrupt => return err,
+                    else => {},
+                }
+            }
+            io.recancel();
+            return t.result;
         };
         return t.result;
     }
@@ -871,8 +886,10 @@ pub const Tx = struct {
         tx.db.giveBack(tx.io, tx.conn, tx.on_writer, tx.lease);
     }
 
+    /// Ended through this `Tx`, or through a copy of it: the checkout is
+    /// over, and the connection may be another holder's now (#160).
     fn usable(tx: *const Tx, cx: anytype) Error!void {
-        if (!tx.finished) return;
+        if (!tx.finished and tx.db.holds(tx.io, tx.conn, tx.on_writer, tx.lease)) return;
         return failedWith(tx.db, cx, "the transaction is over (committed or rolled back); begin another");
     }
 

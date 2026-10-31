@@ -386,3 +386,48 @@ test "watch: stop: a running handler finishes, a listener ends after what it has
     try std.testing.expect((try l.next(&c)) == null);
     try std.testing.expectError(error.Stopped, w.listen(&c, .{}));
 }
+
+/// The watch the hub's hook ends and frees (#157), and how often it ran.
+const FreedOnHub = struct {
+    var w: ?*Watch = null;
+    var ran: std.atomic.Value(u32) = .init(0);
+
+    fn endAndFree() void {
+        const x = w.?;
+        w = null;
+        // What the C ABI engine test did: `_fake()` on a started watch
+        // (it sets `fake`, which kept `stop` from unregistering), then the
+        // owner frees it.
+        x._fake();
+        x.deinit();
+        _ = ran.fetchAdd(1, .acq_rel);
+    }
+};
+
+test "watch redis: a started watch made fake and freed is out of its Pub/Sub hub before the hub's next status round (#157)" {
+    if (comptime !@import("build_options").redis) return error.SkipZigTest;
+    const zio = @import("zio");
+    const redis = @import("../redis/root.zig");
+    const hub = @import("redis.zig");
+    const g = @import("../errors.zig").expectLog();
+    defer g.deinit();
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const rio = rt.io();
+    // Nothing listens on port 1: each round of the hub's reader is refused
+    // and reports `.reconnecting` to every watch it lists.
+    const client = try redis.Client.init(gpa, rio, .{ .url = "redis://127.0.0.1:1", .environ = .empty });
+    defer client.deinit();
+    (try client._pubsubHub()).backoff = .{ .base = .fromMilliseconds(1), .max = .fromMilliseconds(1) };
+    const w = try Watch.init(gpa, rio, .{ .redis = .{ .client = client, .channels = &.{"orders"} } }, .{});
+    try w.start(null, null, null);
+    // The hub's next status round first makes the watch fake and frees
+    // it, as its owner may at any time, then goes over the watches it lists.
+    FreedOnHub.ran.store(0, .release);
+    FreedOnHub.w = w;
+    hub.test_before_status.store(&FreedOnHub.endAndFree, .release);
+    defer hub.test_before_status.store(null, .release);
+    try wait.waitAtLeast(rio, "the hub's reader ended and freed the watch", &FreedOnHub.ran, 1);
+    // `client.deinit` waits for the hub's reader: its status round over a
+    // freed watch, if it still listed one, ran before the test ends.
+}

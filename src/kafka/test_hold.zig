@@ -35,7 +35,8 @@ pub const TestPoint = enum {
     /// `Client.drain`, `drained` set, before it waits for the consumer
     /// starts in flight (no lock held).
     drain_waits,
-    /// `partitionCountWait`, between its refresh and its look at the cache.
+    /// `partitionCountWait` and `partitionCount`, between a refresh and the
+    /// look at the cache.
     metadata_refreshed,
 };
 

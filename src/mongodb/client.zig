@@ -1028,17 +1028,45 @@ pub const Client = struct {
         return age >= limit;
     }
 
+    /// Tests: makes the `count` oldest sessions in this executor's pool
+    /// `minutes` older.
+    pub fn _ageSessions(self: *Client, io: std.Io, count: usize, minutes: i64) void {
+        const p = self.sessions.get(io);
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        for (p.list.items[0..@min(count, p.list.items.len)]) |sess|
+            sess.last_used = sess.last_used.subDuration(.{ .raw = .fromSeconds(minutes * 60), .clock = .awake });
+    }
+
     /// Gives a server session back to the client's pool (a cursor's, when
     /// it ends); one that saw a network error is dropped instead.
+    /// Sessions about to expire are not kept (driver-sessions.md, "Algorithm
+    /// to return a server session to the pool"): the one given back when it
+    /// is, and those at the pool's oldest end, so the pool holds no more
+    /// than were in use at once within one session timeout (#160).
     fn giveSession(self: *Client, sess: *Session, io: std.Io) void {
         if (sess.dirty) {
             self.gpa.destroy(sess);
             return;
         }
         sess.last_used = .now(io, .awake);
+        // Read before the pool's lock: both locks are leaves. Null while no
+        // data-bearing server is known: nothing is pruned then.
+        const minutes = self.sessionTimeout();
         const p = self.sessions.get(io);
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
+        if (minutes) |m| {
+            // Oldest first: the list is pushed and popped at its end.
+            var expired: usize = 0;
+            while (expired < p.list.items.len and self.expiring(p.list.items[expired], io, m)) expired += 1;
+            for (p.list.items[0..expired]) |old| self.gpa.destroy(old);
+            p.list.replaceRangeAssumeCapacity(0, expired, &.{});
+            if (self.expiring(sess, io, m)) {
+                self.gpa.destroy(sess);
+                return;
+            }
+        }
         p.list.append(self.gpa, sess) catch self.gpa.destroy(sess);
     }
 
@@ -1128,9 +1156,12 @@ pub const Client = struct {
             fn attempt(self: *Client, c: *const Context, op: Operation, ctx: *Ctx, deadline: ?std.Io.Clock.Timestamp) Error!Ctx.Result {
                 const io = c.io;
                 var x: Exchange = .{ .client = self, .op = op, .server = op.server orelse undefined };
-                if (op.session and op.lsid == null) if (self.sessionTimeout()) |minutes| {
-                    x.session = try self.takeSession(io, minutes);
-                };
+                // The implicit session is taken after the first server
+                // selection (below): before it, a fresh client knows no
+                // server yet, so no session timeout, and its first write
+                // would go without a session and never be retried (#143;
+                // driver-sessions.md: whether sessions are supported is
+                // known once a data-bearing server was selected).
                 // The cursor takes the session when it stays open.
                 defer if (x.session) |sess| if (!x.keep_session) self.giveSession(sess, io);
 
@@ -1154,6 +1185,9 @@ pub const Client = struct {
                             }, .table = op.collection }),
                     };
                     const server = x.server;
+                    if (tries == 0 and op.session and op.lsid == null) if (self.sessionTimeout()) |minutes| {
+                        x.session = try self.takeSession(io, minutes);
+                    };
                     const connection = self.acquire(server, io, deadline) catch |err| switch (err) {
                         error.Canceled => return error.Canceled,
                         error.PoolTimeout => return c.fail(self.errors, .{ .system = .mongodb, .class = if (past(io, deadline)) .timeout else .unavailable, .code = "pool_timeout", .message = "no pooled connection free in time", .table = op.collection }),

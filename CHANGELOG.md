@@ -49,6 +49,31 @@ breaking changes are listed anyway.
   binding the socket to the all-NUL name; it uses a plain connect, as .NET and
   Go do there. One such connect failed with `ConnectEx failed: .EFAULT` (#139).
   The fix is in Anole's zio fork.
+- watch: a PostgreSQL or Redis watch is always taken out of the shared
+  LISTEN/SUBSCRIBE connection when it stops, also when a drain could not
+  start its stop task (or a test made a started watch fake). Freed while
+  still listed, it was written to when that connection reconnected (#157).
+- MongoDB: a retryable write that is a new client's first call is retried
+  on a retryable error, as later ones are. It used to go without a session,
+  so it was never retried (#143).
+- MongoDB: sessions about to expire are dropped when given back, oldest
+  first, so the session pool no longer keeps every session of a burst
+  (#160).
+- SQLite: a call through a copy of a `Tx` whose transaction ended (`exec`,
+  `one`, `commit`...) fails with "the transaction is over"; it used to run
+  on the writer, inside the next holder's transaction (#160).
+- SQLite: a write whose caller is canceled after the write ran to its end
+  answers its own result (the cancel stays pending), not Canceled: a
+  committed INSERT or COMMIT is no longer reported as canceled, and a
+  constraint failure is reported as that (#160). A statement the cancel
+  interrupted still answers Canceled, including one run through
+  `Conn.run` (zig-sqlite's `SQLiteInterrupt`).
+- Kafka: a consumer group's leader counts the partitions of a topic whose
+  metadata a stale leader dropped right after the refresh, instead of
+  assigning none of them (#159).
+- Kafka: a producer whose resolver could not allocate its work for a round
+  tries again 250 ms later; records waiting for their leader were neither
+  sent nor expired (#159, #162).
 
 ## 0.4.1 (2026-10-30)
 
