@@ -1791,16 +1791,18 @@ pub const Response = struct {
         if (!self.headerRoom(needed)) return .off;
 
         const request = self._request orelse return .identity;
-        // The client's q-values first; on a tie, zstd, then Brotli, then
-        // gzip. zstd compresses about as well as gzip at a third of the
-        // time; Brotli at quality 5 is 10-15% smaller than either on JSON
-        // of a few KiB, at about twice gzip's time.
+        // The client's q-values first; on a tie, zstd, then gzip, then
+        // Brotli. zstd compresses about as well as gzip at a third of the
+        // time. Brotli at a quality that beats gzip on size costs about
+        // twice its CPU for a few percent on JSON of a few KiB, so a client
+        // that offers both (Safari, `gzip, br`) gets gzip
+        // (research/s2/k4-compression.md).
         const zstd_q: u16 = if (build_options.use_zstd) http.encodingQuality(&request.headers, "zstd") else 0;
         const br_q: u16 = if (build_options.use_brotli) http.encodingQuality(&request.headers, "br") else 0;
         const gzip_q: u16 = if (build_options.use_zlib) http.encodingQuality(&request.headers, "gzip") else 0;
         if (zstd_q == 0 and br_q == 0 and gzip_q == 0) return .identity;
         if (zstd_q >= br_q and zstd_q >= gzip_q) return .zstd;
-        return if (br_q >= gzip_q) .br else .gzip;
+        return if (gzip_q >= br_q) .gzip else .br;
     }
 
     /// `Vary: *` included, which says the response varies by anything.
@@ -4292,23 +4294,26 @@ test "Response: a stream without the memory for a compressor goes out as it is" 
     try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
 }
 
-test "Response: Accept-Encoding picks zstd, br or gzip by q-value, then in that order" {
+test "Response: Accept-Encoding picks zstd, gzip or br by q-value, then in that order" {
     if (!(build_options.use_zlib and build_options.use_zstd and build_options.use_brotli)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var connection: Connection = undefined;
     const cases = [_]struct { []const u8, Response.Compression }{
-        // HttpArena's json-comp and Safari: br over gzip on a tie.
-        .{ "gzip, br", .br },
+        // HttpArena's json-comp and Safari: gzip over br on a tie.
+        .{ "gzip, br", .gzip },
+        .{ "br, gzip", .gzip },
         .{ "br", .br },
         // Chrome and Firefox: zstd first on a tie.
         .{ "gzip, deflate, br, zstd", .zstd },
-        .{ "br;q=1.0, zstd;q=0.9, gzip", .br },
+        .{ "br;q=1.0, zstd;q=0.9, gzip;q=0.8", .br },
+        .{ "br;q=1.0, zstd;q=0.9, gzip", .gzip },
         .{ "br;q=0.5, gzip", .gzip },
         .{ "gzip;q=0.2, br;q=0.8, zstd;q=0.5", .br },
         .{ "*", .zstd },
         .{ "*;q=0.1, br", .br },
         .{ "*, zstd;q=0, gzip;q=0.5", .br },
+        .{ "*, zstd;q=0", .gzip },
         .{ "br;q=0, gzip", .gzip },
         .{ "br;q=0", .identity },
         .{ "identity", .identity },
@@ -4329,10 +4334,36 @@ test "Response: Accept-Encoding picks zstd, br or gzip by q-value, then in that 
     }
 }
 
+test "compress: q-values still win over the tie order" {
+    if (!(build_options.use_zlib and build_options.use_zstd and build_options.use_brotli)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var connection: Connection = undefined;
+    // gzip wins a tie with br, and zstd with both, but never a higher q.
+    const cases = [_]struct { []const u8, Response.Compression }{
+        .{ "gzip;q=0.9, br", .br },
+        .{ "zstd;q=0.5, gzip;q=0.4, br;q=0.6", .br },
+        .{ "zstd;q=0.5, gzip;q=0.6, br;q=0.6", .gzip },
+        .{ "zstd;q=0.7, gzip;q=0.6, br;q=0.6", .zstd },
+    };
+    for (cases) |case| {
+        var request: Request = .{ .arena = arena.allocator(), ._parser = undefined, ._transport = undefined };
+        request.headers = try http.Headers.init(arena.allocator(), 4);
+        try request.headers.put("Accept-Encoding", case[0]);
+        var response = try Response._init(arena.allocator(), &connection, 8);
+        response._request = &request;
+        response.compress = true;
+        std.testing.expectEqual(case[1], response.negotiateCompression()) catch |err| {
+            std.debug.print("Accept-Encoding: {s}\n", .{case[0]});
+            return err;
+        };
+    }
+}
+
 fn testBrRequest(arena: std.mem.Allocator) !Request {
     var request: Request = .{ .arena = arena, ._parser = undefined, ._transport = undefined };
     request.headers = try http.Headers.init(arena, 4);
-    try request.headers.put("Accept-Encoding", "gzip, br");
+    try request.headers.put("Accept-Encoding", "br");
     return request;
 }
 

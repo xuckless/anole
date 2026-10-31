@@ -156,7 +156,7 @@ test "zstd: a zstd request body reaches the handler decoded" {
     try std.testing.expect(std.mem.endsWith(u8, echoed, text));
 }
 
-test "dusty on Brotli: br when the client takes gzip and br, as browsers and HttpArena send" {
+test "dusty on Brotli: br when the client prefers it over gzip" {
     if (!features.brotli) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{});
@@ -177,7 +177,7 @@ test "dusty on Brotli: br when the client takes gzip and br, as browsers and Htt
     const addr = server.address.ip;
 
     var out: [64 * 1024]u8 = undefined;
-    const resp = try exchange(io, addr, "GET /big HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, br\r\nConnection: close\r\n\r\n", &out);
+    const resp = try exchange(io, addr, "GET /big HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip;q=0.5, br\r\nConnection: close\r\n\r\n", &out);
     const split = std.mem.indexOf(u8, resp, "\r\n\r\n").?;
     const head = resp[0..split];
     try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding: br") != null);

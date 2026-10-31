@@ -601,8 +601,10 @@ the handler sets `res.compress = true`, or always through `Compress`.
 
 - zstd, Brotli (`br`, with `-Dbrotli`, on in `web` and `full`) or gzip
   (zlib-ng) by the client's `Accept-Encoding` q-values; on a tie zstd, then
-  `br`, then gzip. So browsers that offer zstd get zstd, and a client that
-  offers `gzip, br` (Safari, most HTTP benchmarks) gets `br`. `identity`
+  gzip, then `br`. So browsers that offer zstd get zstd, and a client that
+  offers `gzip, br` (Safari, most HTTP benchmarks) gets gzip: on JSON of a
+  few KiB, Brotli small enough to matter costs about twice gzip's CPU.
+  A client that prefers `br` by q-value gets it. `identity`
   and `*` count as RFC 9110 says: `*` stands for every coding not named,
   and `br;q=0` refuses one. Streamed bodies are compressed as they are
   written, and each `flush` sends what was written so far in a form the
