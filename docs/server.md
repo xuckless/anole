@@ -804,9 +804,13 @@ leaves its response holding up to about 100 KiB (what the stack already
 took, plus 64 KiB). All of a connection's responses together hold at most
 4 MiB. Nothing bounds the total across connections: plan for up to
 connections x 4 MiB of send buffers at worst (one download per connection
-held at most 64 KiB before 0.5.0). Message streams (WebSockets, the WebTransport
-session's stream, gRPC and Connect streaming calls) keep a fixed 1 MiB
-each, so a send there returns once buffered up to it.
+held at most 64 KiB before 0.5.0). Message streams keep a fixed 1 MiB
+unacknowledged each, so a send there returns once buffered up to it: the
+extended CONNECT streams (WebSockets, the WebTransport session's stream)
+and every gRPC request (unary, streaming and gRPC-Web, any
+`application/grpc*` content type) and Connect streaming request
+(`application/connect+*`). A large response on one of them still moves
+at most 1 MiB per round trip (about 20 MB/s at 50 ms RTT).
 
 ### 0-RTT
 

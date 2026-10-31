@@ -16,7 +16,10 @@ breaking changes are listed anyway.
   100 KiB queued (what the stack already took, plus 64 KiB).
   The HTTP/3 client's request bodies had the same 64 KiB ceiling and now
   follow the path the same way when `RequestOptions.send_buffer` is null.
-  Message streams keep their fixed 1 MiB (#151).
+  Message streams (extended CONNECT, and every gRPC, gRPC-Web and Connect
+  streaming request, unary gRPC included) keep their fixed 1 MiB
+  unacknowledged, so a large response there still moves at most 1 MiB per
+  round trip (#151).
 
 ## 0.4.2 (2026-10-31)
 
