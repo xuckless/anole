@@ -1180,6 +1180,39 @@ test "sqlite: a transaction ended through a copy leaves the next holder's transa
     try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
+test "sqlite: exec and commit through a copy of a Tx that ended are refused, and leave the next holder's transaction alone (#160)" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    var s: Scratch = undefined;
+    const db = try twiceSetup(io, &tmp, &s);
+    defer db.deinit();
+    defer s.deinit();
+    const ctx = &s.ctx;
+    const level = quiet();
+    defer testing.log_level = level;
+
+    var tx = try db.begin(ctx, .{});
+    // A copy commits; `tx` itself never learns that it ended.
+    var copy = tx;
+    try copy.commit(ctx);
+    var next = try db.begin(ctx, .{});
+    defer next.deinit();
+    // The stale `tx`, while `next` holds the writer: refused, nothing run.
+    try testing.expectError(error.Database, tx.exec(ctx, "INSERT INTO notes (title) VALUES ('stray')", .{}));
+    try testing.expectError(error.Database, tx.commit(ctx));
+    try testing.expect(std.mem.indexOf(u8, anole_db.lastError(ctx).?.message, "the transaction is over") != null);
+    tx.deinit();
+    // `next`'s transaction is still its own: its rollback undoes it all.
+    try next.rollback(ctx);
+    try testing.expectEqual(@as(i64, 0), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
 test "sqlite: rows on the writer ended through a copy leave the next holder's transaction alone" {
     const expected_log = @import("../errors.zig").expectLog();
     defer expected_log.deinit();
@@ -1455,9 +1488,10 @@ const BeginCanceled = struct {
             if (err != error.Canceled) failure.* = err;
             return;
         };
-        // Not canceled in time (the BEGIN ran and returned first).
+        // The BEGIN ran to its end before the cancel interrupted it: the
+        // Tx is answered (#160) with the cancel still pending, and its
+        // caller ends it as any caller does.
         tx.deinit();
-        failure.* = error.NotCanceled;
     }
 };
 
@@ -1492,6 +1526,90 @@ test "sqlite: a begin canceled while its BEGIN runs gives the writer back with n
     defer tx.deinit();
     _ = try tx.exec(ctx, "INSERT INTO notes (title) VALUES ('kept')", .{});
     try tx.commit(ctx);
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
+/// A write whose caller is canceled after the write ran (held by
+/// `BeginCanceled`'s hook until the cancel interrupted it).
+const WriteCanceled = struct {
+    fn insert(db: *sqlite.Client, io: std.Io, changed: *?u64, failure: *?anyerror) void {
+        var sc: Scratch = undefined;
+        sc.init(io);
+        defer sc.deinit();
+        changed.* = db.exec(&sc.ctx, "INSERT INTO notes (title) VALUES ('kept')", .{}) catch |err| {
+            failure.* = err;
+            return;
+        };
+    }
+};
+
+test "sqlite: a write canceled after it ran to its end answers its result, not Canceled (#160)" {
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+
+    // The hook of `BeginCanceled`: holds a job that ran until its caller's
+    // cancel interrupted it.
+    BeginCanceled.ran.store(false, .release);
+    BeginCanceled.armed.store(true, .release);
+    sqlite.test_after_job = BeginCanceled.afterJob;
+    defer sqlite.test_after_job = null;
+    defer BeginCanceled.armed.store(false, .release);
+    var changed: ?u64 = null;
+    var failure: ?anyerror = null;
+    var task = try io.concurrent(WriteCanceled.insert, .{ db, io, &changed, &failure });
+    // The INSERT has run (and committed) on the writer thread; its caller
+    // still waits.
+    try wait.waitUntil(io, "the INSERT run", {}, BeginCanceled.hasRun);
+    task.cancel(io);
+    if (failure) |err| return err;
+    try testing.expectEqual(@as(?u64, 1), changed);
+    try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
+}
+
+test "sqlite: a write canceled after it failed on its own answers its failure, not Canceled (#160)" {
+    const expected_log = @import("../errors.zig").expectLog();
+    defer expected_log.deinit();
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    defer db.deinit();
+    var s: Scratch = undefined;
+    s.init(io);
+    defer s.deinit();
+    const ctx = &s.ctx;
+    _ = try db.exec(ctx, schema, .{});
+    const level = quiet();
+    defer testing.log_level = level;
+    // The canceled INSERT of the same title then breaks the UNIQUE rule.
+    _ = try db.exec(ctx, "INSERT INTO notes (title) VALUES ('kept')", .{});
+
+    BeginCanceled.ran.store(false, .release);
+    BeginCanceled.armed.store(true, .release);
+    sqlite.test_after_job = BeginCanceled.afterJob;
+    defer sqlite.test_after_job = null;
+    defer BeginCanceled.armed.store(false, .release);
+    var changed: ?u64 = null;
+    var failure: ?anyerror = null;
+    var task = try io.concurrent(WriteCanceled.insert, .{ db, io, &changed, &failure });
+    try wait.waitUntil(io, "the INSERT run", {}, BeginCanceled.hasRun);
+    task.cancel(io);
+    try testing.expectEqual(@as(?anyerror, error.Conflict), failure);
+    try testing.expectEqual(@as(?u64, null), changed);
     try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 

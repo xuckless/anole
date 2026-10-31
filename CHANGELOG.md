@@ -14,6 +14,16 @@ breaking changes are listed anyway.
 - MongoDB: a retryable write that is a new client's first call is retried
   on a retryable error, as later ones are. It used to go without a session,
   so it was never retried (#143).
+- MongoDB: sessions about to expire are dropped when given back, oldest
+  first, so the session pool no longer keeps every session of a burst
+  (#160).
+- SQLite: a call through a copy of a `Tx` whose transaction ended (`exec`,
+  `one`, `commit`...) fails with "the transaction is over"; it used to run
+  on the writer, inside the next holder's transaction (#160).
+- SQLite: a write whose caller is canceled after the write ran to its end
+  answers its own result (the cancel stays pending), not Canceled: a
+  committed INSERT or COMMIT is no longer reported as canceled, and a
+  constraint failure is reported as that (#160).
 
 ## 0.4.1 (2026-10-30)
 

@@ -1028,17 +1028,45 @@ pub const Client = struct {
         return age >= limit;
     }
 
+    /// Tests: makes the `count` oldest sessions in this executor's pool
+    /// `minutes` older.
+    pub fn _ageSessions(self: *Client, io: std.Io, count: usize, minutes: i64) void {
+        const p = self.sessions.get(io);
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
+        for (p.list.items[0..@min(count, p.list.items.len)]) |sess|
+            sess.last_used = sess.last_used.subDuration(.{ .raw = .fromSeconds(minutes * 60), .clock = .awake });
+    }
+
     /// Gives a server session back to the client's pool (a cursor's, when
     /// it ends); one that saw a network error is dropped instead.
+    /// Sessions about to expire are not kept (driver-sessions.md, "Algorithm
+    /// to return a server session to the pool"): the one given back when it
+    /// is, and those at the pool's oldest end, so the pool holds no more
+    /// than were in use at once within one session timeout (#160).
     fn giveSession(self: *Client, sess: *Session, io: std.Io) void {
         if (sess.dirty) {
             self.gpa.destroy(sess);
             return;
         }
         sess.last_used = .now(io, .awake);
+        // Read before the pool's lock: both locks are leaves. Null while no
+        // data-bearing server is known: nothing is pruned then.
+        const minutes = self.sessionTimeout();
         const p = self.sessions.get(io);
         p.mutex.lockUncancelable(io);
         defer p.mutex.unlock(io);
+        if (minutes) |m| {
+            // Oldest first: the list is pushed and popped at its end.
+            var expired: usize = 0;
+            while (expired < p.list.items.len and self.expiring(p.list.items[expired], io, m)) expired += 1;
+            for (p.list.items[0..expired]) |old| self.gpa.destroy(old);
+            p.list.replaceRangeAssumeCapacity(0, expired, &.{});
+            if (self.expiring(sess, io, m)) {
+                self.gpa.destroy(sess);
+                return;
+            }
+        }
         p.list.append(self.gpa, sess) catch self.gpa.destroy(sess);
     }
 

@@ -43,6 +43,10 @@ const Fake = struct {
     alternate: bool = false,
     secondary: bool = false,
     hellos: std.atomic.Value(u32) = .init(0),
+    /// The hello's logicalSessionTimeoutMinutes.
+    session_minutes: i32 = 30,
+    /// Session ids the client's endSessions named.
+    ended_sessions: std.atomic.Value(u32) = .init(0),
 
     fn init(f: *Fake, io: std.Io) !void {
         const listen_at: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -116,7 +120,7 @@ const Fake = struct {
             }
             try b.append("minWireVersion", .{ .int32 = 0 });
             try b.append("maxWireVersion", .{ .int32 = 21 });
-            try b.append("logicalSessionTimeoutMinutes", .{ .int32 = 30 });
+            try b.append("logicalSessionTimeoutMinutes", .{ .int32 = f.session_minutes });
             try b.append("ok", .{ .double = 1 });
         } else if (std.mem.eql(u8, command, "find")) {
             if (dec(&f.drop_finds)) return false;
@@ -129,6 +133,10 @@ const Fake = struct {
             _ = f.get_mores.fetchAdd(1, .monotonic);
             const start: i32 = @intCast(msg.body.get("getMore").?.int64);
             try f.batch(b, "nextBatch", start, if (start + 4 >= 10) 0 else start + 4);
+        } else if (std.mem.eql(u8, command, "endSessions")) {
+            var ids = msg.body.get("endSessions").?.array.iterator();
+            while (ids.next()) |_| _ = f.ended_sessions.fetchAdd(1, .monotonic);
+            try b.append("ok", .{ .double = 1 });
         } else if (std.mem.eql(u8, command, "killCursors")) {
             _ = f.killed.fetchAdd(1, .monotonic);
             try b.append("ok", .{ .double = 1 });
@@ -318,6 +326,62 @@ test "fake mongod: a retryable write error on a fresh client's first call is ret
     try testing.expectEqual(@as(u32, 2), fake.inserts.load(.monotonic));
     try testing.expectEqual(fake.txn_numbers[0], fake.txn_numbers[1]);
     try testing.expectEqualSlices(u8, &fake.lsids[0], &fake.lsids[1]);
+}
+
+test "fake mongod: a session given back with less than a minute of its timeout left is dropped, not pooled (#160)" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+    // Sessions time out after a minute: every one is about to expire.
+    fake.session_minutes = 1;
+    {
+        const client = try open(io, &fake);
+        defer client.deinit();
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+        const users = client.collection("users");
+        try client.ping(&c);
+        // Four cursors open at once, each holding a session of its own,
+        // then given back.
+        var cursors: [4]@TypeOf(try users.iterate(Row, &c, .{}, .{})) = undefined;
+        for (&cursors) |*cur| cur.* = try users.iterate(Row, &c, .{}, .{});
+        for (&cursors) |*cur| cur.deinit();
+    }
+    // The client's close names the sessions it pooled: none.
+    try testing.expectEqual(@as(u32, 0), fake.ended_sessions.load(.monotonic));
+}
+
+test "fake mongod: sessions about to expire at the pool's oldest end are dropped when a fresh one is given back (#160)" {
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var fake: Fake = undefined;
+    try fake.init(io);
+    defer fake.deinit(io);
+    {
+        const client = try open(io, &fake);
+        defer client.deinit();
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        var c: db.Ctx = .{ .io = io, .arena = arena.allocator() };
+        const users = client.collection("users");
+        try client.ping(&c);
+        // A burst: four cursors at once leave four sessions in the pool.
+        var cursors: [4]@TypeOf(try users.iterate(Row, &c, .{}, .{})) = undefined;
+        for (&cursors) |*cur| cur.* = try users.iterate(Row, &c, .{}, .{});
+        for (&cursors) |*cur| cur.deinit();
+        // The two oldest come within a minute of the 30-minute timeout.
+        client._ageSessions(io, 2, 29);
+        // One more cursor takes the newest session and gives it back.
+        var cur = try users.iterate(Row, &c, .{}, .{});
+        cur.deinit();
+    }
+    // The client's close names the sessions it pooled: the two fresh ones.
+    try testing.expectEqual(@as(u32, 2), fake.ended_sessions.load(.monotonic));
 }
 
 test "fake mongod: a retried write that fails again is a 503 with the server's code" {
