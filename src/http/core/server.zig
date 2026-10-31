@@ -1562,6 +1562,14 @@ pub fn Server(comptime Ctx: type) type {
                 defer _ = self.io.swapCancelProtection(protection);
                 log.debug("at most {d} connections at once (open-file limit {?d})", .{ self.config.max_connections.?, soft });
             }
+            if (build_options.use_zlib or build_options.use_brotli or build_options.use_http2) {
+                const protection = self.io.swapCancelProtection(.blocked);
+                defer _ = self.io.swapCancelProtection(protection);
+                const n = executors orelse 1;
+                log.debug("block cache: at most {d} MiB per executor, {d} MiB for {d} executor(s)", .{
+                    block_cache.max_cached >> 20, (block_cache.max_cached * n) >> 20, n,
+                });
+            }
             // Out of `reloadTls`'s reach before the listeners close.
             self.lockTls();
             self.active_listeners = active;
@@ -1953,14 +1961,14 @@ pub fn Server(comptime Ctx: type) type {
         /// buffer sets this executor's connections left unused since the
         /// last time, and the first executor's the shared ones too
         /// (`RequestBuffersPool.trimLocal`, `trimShards`); and the
-        /// compressors' blocks it cached that no response took
-        /// (`block_cache`).
+        /// compressors' and HTTP/2 body queues' blocks it cached that
+        /// nothing took (`block_cache`).
         fn trimLoop(self: *Self, shards: bool) std.Io.Cancelable!void {
             while (true) {
                 try self.io.sleep(request_buffers_trim_interval, .awake);
                 self.request_buffers.trimLocal();
                 if (shards) self.request_buffers.trimShards();
-                if (build_options.use_zlib or build_options.use_brotli) block_cache.trimLocal();
+                if (build_options.use_zlib or build_options.use_brotli or build_options.use_http2) block_cache.trimLocal();
                 // Objects retired with no writer after them (src/http/core/qsbr.zig).
                 if (shards) qsbr.pollAll();
             }

@@ -3,6 +3,14 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.5.0 (unreleased)
+
+### Changed
+
+- `block_cache` keeps one free list per size class (64, 128 and 256 KiB,
+  1 and 2 MiB) with an O(1) take and give, serves everything past
+  malloc's slabs (32 KiB), and is trimmed per class (#99).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed

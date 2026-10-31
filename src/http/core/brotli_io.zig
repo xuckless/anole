@@ -264,7 +264,8 @@ test "brotli_io: an encoder's large blocks are reused by the next, and trimmed w
     try std.testing.expect(after_first >= 2);
 
     // Two encoders at once (two streams) need twice the blocks; once idle
-    // for a whole trim interval, the cache goes back to `trim_keep`.
+    // for a whole trim interval, each class goes back to `trim_keep` at
+    // most.
     var outs: [2]std.Io.Writer.Allocating = .{ try .initCapacity(gpa, 256), try .initCapacity(gpa, 256) };
     defer for (&outs) |*o| o.deinit();
     var zs: [2]Compress = undefined;
@@ -273,10 +274,12 @@ test "brotli_io: an encoder's large blocks are reused by the next, and trimmed w
     // Both finish (and hold their blocks) before either gives them back.
     for (&zs) |*z| try z.finish();
     for (&zs) |*z| z.deinit();
-    try std.testing.expect(block_cache.cached().count > block_cache.trim_keep);
+    const held = block_cache.cached().count;
+    try std.testing.expect(held > after_first);
     block_cache.trimLocal(); // the low mark of the interval that just ended
-    block_cache.trimLocal(); // nothing taken since: down to trim_keep
-    try std.testing.expectEqual(@as(usize, block_cache.trim_keep), block_cache.cached().count);
+    block_cache.trimLocal(); // nothing taken since: down to trim_keep a class
+    for (block_cache.classes, 0..) |_, i| try std.testing.expect(block_cache.cachedIn(i) <= block_cache.trim_keep);
+    try std.testing.expect(block_cache.cached().count < held);
     try std.testing.expect(block_cache.cached().bytes <= block_cache.max_cached);
 }
 

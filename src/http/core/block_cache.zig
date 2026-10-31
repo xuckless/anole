@@ -14,24 +14,51 @@
 //! KiB, glibc's until its threshold adapts, and each page then faults in
 //! again.
 //!
-//! So allocations of `big_min` and more come from a per-thread cache of
-//! blocks, best fit, which keeps their pages mapped from one response to
-//! the next: under zio a thread is an executor, and a buffered body is
-//! compressed without yielding, so one set of blocks serves every buffered
-//! response an executor compresses. Smaller allocations go to malloc, which
-//! serves them from its heap. The cache holds at most `max_cached` bytes,
-//! and `trimLocal` (the server's trim task, on each executor) unmaps the
-//! blocks it kept that nothing took since the last trim, past `trim_keep`.
+//! So allocations past what malloc serves from its slabs (`malloc_max`)
+//! come from a per-thread cache of blocks in a few size classes (64, 128
+//! and 256 KiB, 1 and 2 MiB), one free list each, which keeps their pages
+//! mapped from one response to the next: under zio a thread is an executor,
+//! and a buffered body is compressed without yielding, so one set of blocks
+//! serves every buffered response an executor compresses. Smaller
+//! allocations go to malloc, which serves them from its heap; larger ones
+//! are mapped and unmapped each time. The cache holds at most `max_cached`
+//! bytes, a class at most `class_max`, and `trimLocal` (the server's trim
+//! task, on each executor) unmaps the blocks of each class that nothing
+//! took since the last trim, past `trim_keep`.
+//!
+//! Callers that know their size (the HTTP/2 engine's request body queues)
+//! use `take` and `give`, which hand out a class's block as it is, with no
+//! header in front: a 64 KiB queue is a 64 KiB block. `alloc` and `free`
+//! (malloc's contract, for the compressors) put a 16-byte header in front,
+//! and round up to the class that holds both.
+//!
+//! A block given back on a thread that never trims (a blocking-pool thread)
+//! stays in that thread's cache, which the same bounds cap. The classes
+//! follow goose-http's per-ring record classes (MIT,
+//! github.com/kaitk/goose-http 6b566a7, shim/uring.c); no code is copied.
 const std = @import("std");
 
-/// Smallest allocation served from the cache.
-pub const big_min = 64 * 1024;
+/// The block sizes the cache holds, smallest first.
+pub const classes = [_]usize{ 64 * 1024, 128 * 1024, 256 * 1024, 1024 * 1024, 2 * 1024 * 1024 };
+/// The largest allocation (header included) `alloc` leaves to malloc:
+/// Zig's malloc (SmpAllocator, musl's and glibc's replacement in Zig
+/// builds) serves up to 32 KiB, its own 16-byte header included, from its
+/// slabs and maps anything larger; the rest is headroom for other mallocs'
+/// headers.
+pub const malloc_max = 32 * 1024 - 64;
 /// Most bytes one thread's cache holds; blocks given back past it are
 /// unmapped.
 pub const max_cached = 4 * 1024 * 1024;
-/// Blocks a trim keeps however long they sat unused: one buffered
-/// encoder's large blocks.
-pub const trim_keep = 3;
+/// Most bytes one class holds, so one size cannot crowd out the others.
+pub const class_max = max_cached / 2;
+/// Blocks of each class up to 256 KiB a trim keeps however long they sat
+/// unused: one buffered encoder's large blocks (Brotli's two hash tables).
+/// The 1 and 2 MiB classes (raised HTTP/2 body windows) keep none.
+pub const trim_keep = 2;
+
+fn keepOf(index: usize) usize {
+    return if (classes[index] <= 256 * 1024) trim_keep else 0;
+}
 
 /// In front of every allocation, keeping malloc's 16-byte alignment.
 const Header = extern struct {
@@ -46,34 +73,91 @@ const big_tag: usize = 0x62726f746c690002;
 /// A block in the cache, at its start.
 const Free = extern struct {
     next: ?*Free align(16),
-    len: usize,
 };
 
-const Cache = struct {
+const List = struct {
     first: ?*Free = null,
     count: usize = 0,
-    bytes: usize = 0,
     /// The fewest blocks held since the last trim: that many sat
     /// unused all the while.
     low: usize = 0,
 };
 
+const Cache = struct {
+    lists: [classes.len]List = @splat(.{}),
+    bytes: usize = 0,
+};
+
 threadlocal var cache: Cache = .{};
 
 const page_allocator = std.heap.page_allocator;
+const page_align: std.mem.Alignment = .fromByteUnits(std.heap.page_size_min);
+
+/// The index of the smallest class that holds `size` bytes, or null past
+/// the largest.
+pub fn classIndex(size: usize) ?usize {
+    inline for (classes, 0..) |class, i| {
+        if (size <= class) return i;
+    }
+    return null;
+}
+
+/// The smallest class that holds `size` bytes, or null past the largest.
+pub fn classFor(size: usize) ?usize {
+    return classes[classIndex(size) orelse return null];
+}
+
+fn exactIndex(len: usize) ?usize {
+    const i = classIndex(len) orelse return null;
+    return if (classes[i] == len) i else null;
+}
+
+/// A block of exactly `class_size` bytes (one of `classes`), from the
+/// calling thread's cache or freshly mapped; null when out of memory.
+/// Give it back with `give`.
+pub fn take(class_size: usize) ?[]align(16) u8 {
+    const i = exactIndex(class_size) orelse unreachable; // not a class
+    const list = &cache.lists[i];
+    if (list.first) |f| {
+        list.first = f.next;
+        list.count -= 1;
+        list.low = @min(list.low, list.count);
+        cache.bytes -= class_size;
+        const block: [*]align(16) u8 = @ptrCast(f);
+        return block[0..class_size];
+    }
+    const fresh = page_allocator.rawAlloc(class_size, page_align, @returnAddress()) orelse return null;
+    return @alignCast(fresh[0..class_size]);
+}
+
+/// Gives back a block from `take` (its whole length), to the calling
+/// thread's cache, or unmaps it past the bounds.
+pub fn give(block: []u8) void {
+    const i = exactIndex(block.len) orelse unreachable; // not from `take`
+    const list = &cache.lists[i];
+    if (cache.bytes + block.len > max_cached or (list.count + 1) * block.len > class_max) {
+        page_allocator.rawFree(block, page_align, @returnAddress());
+        return;
+    }
+    const f: *Free = @ptrCast(@alignCast(block.ptr));
+    f.* = .{ .next = list.first };
+    list.first = f;
+    list.count += 1;
+    cache.bytes += block.len;
+}
 
 /// malloc's contract: 16-byte aligned, null when out of memory.
 pub fn alloc(size: usize) ?*anyopaque {
     const total = std.math.add(usize, size, header_len) catch return null;
-    if (total < big_min) {
+    if (total <= malloc_max) {
         const raw: [*]align(16) u8 = @ptrCast(@alignCast(std.c.malloc(total) orelse return null));
         @as(*Header, @ptrCast(raw)).* = .{ .len = total, .tag = small_tag };
         return raw + header_len;
     }
-    const need = std.mem.alignForward(usize, total, std.heap.pageSize());
-    // A block from the cache may be larger than asked for.
-    const block: []align(16) u8 = take(need) orelse blk: {
-        const fresh = page_allocator.rawAlloc(need, .fromByteUnits(std.heap.pageSize()), @returnAddress()) orelse return null;
+    const block: []align(16) u8 = if (classFor(total)) |class| take(class) orelse return null else blk: {
+        // Past the largest class: mapped for this allocation alone.
+        const need = std.mem.alignForward(usize, total, std.heap.pageSize());
+        const fresh = page_allocator.rawAlloc(need, page_align, @returnAddress()) orelse return null;
         break :blk @alignCast(fresh[0..need]);
     };
     @as(*Header, @ptrCast(block.ptr)).* = .{ .len = block.len, .tag = big_tag };
@@ -86,84 +170,61 @@ pub fn free(address: ?*anyopaque) void {
     const h: *Header = @ptrCast(raw);
     switch (h.tag) {
         small_tag => std.c.free(raw),
-        big_tag => give(raw, h.len),
+        big_tag => if (exactIndex(h.len) != null) give(raw[0..h.len]) else page_allocator.rawFree(raw[0..h.len], page_align, @returnAddress()),
         else => unreachable, // not ours
     }
 }
 
-/// The smallest cached block of at least `need` bytes and at most twice
-/// that.
-fn take(need: usize) ?[]align(16) u8 {
-    var best: ?*Free = null;
-    var best_prev: ?*Free = null;
-    var prev: ?*Free = null;
-    var it = cache.first;
-    while (it) |f| : (it = f.next) {
-        if (f.len >= need and f.len <= 2 * need and (best == null or f.len < best.?.len)) {
-            best = f;
-            best_prev = prev;
-        }
-        prev = f;
-    }
-    const f = best orelse return null;
-    if (best_prev) |bp| bp.next = f.next else cache.first = f.next;
-    cache.count -= 1;
-    cache.bytes -= f.len;
-    cache.low = @min(cache.low, cache.count);
-    const block: [*]align(16) u8 = @ptrCast(f);
-    return block[0..f.len];
-}
-
-fn give(block: [*]align(16) u8, len: usize) void {
-    if (cache.bytes + len > max_cached) {
-        page_allocator.rawFree(block[0..len], .fromByteUnits(std.heap.pageSize()), @returnAddress());
-        return;
-    }
-    const f: *Free = @ptrCast(block);
-    f.* = .{ .next = cache.first, .len = len };
-    cache.first = f;
-    cache.count += 1;
-    cache.bytes += len;
-}
-
-/// Unmaps the calling thread's cached blocks that no encoder took since
-/// the last call, past `trim_keep`: those given back longest ago.
+/// Unmaps, in each class, the calling thread's cached blocks that nothing
+/// took since the last call, past `trim_keep`: those given back longest
+/// ago.
 pub fn trimLocal() void {
-    const n = cache.low -| trim_keep;
-    defer cache.low = cache.count;
-    if (n == 0) return;
-    var keep = cache.count - n;
-    var tail: ?*Free = cache.first;
-    if (keep == 0) {
-        cache.first = null;
-    } else {
-        var last = cache.first.?;
-        while (keep > 1) : (keep -= 1) last = last.next.?;
-        tail = last.next;
-        last.next = null;
+    for (&cache.lists, 0..) |*list, i| {
+        const n = list.low -| keepOf(i);
+        defer list.low = list.count;
+        if (n == 0) continue;
+        var keep = list.count - n;
+        var tail: ?*Free = list.first;
+        if (keep == 0) {
+            list.first = null;
+        } else {
+            var last = list.first.?;
+            while (keep > 1) : (keep -= 1) last = last.next.?;
+            tail = last.next;
+            last.next = null;
+        }
+        while (tail) |f| {
+            tail = f.next;
+            list.count -= 1;
+            cache.bytes -= classes[i];
+            const block: [*]align(16) u8 = @ptrCast(f);
+            page_allocator.rawFree(block[0..classes[i]], page_align, @returnAddress());
+        }
     }
-    while (tail) |f| {
-        tail = f.next;
-        cache.count -= 1;
-        cache.bytes -= f.len;
-        const block: [*]align(16) u8 = @ptrCast(f);
-        page_allocator.rawFree(block[0..f.len], .fromByteUnits(std.heap.pageSize()), @returnAddress());
-    }
+}
+
+/// Blocks the calling thread's cache holds of the class at `index`.
+pub fn cachedIn(index: usize) usize {
+    return cache.lists[index].count;
 }
 
 /// Blocks and bytes the calling thread's cache holds.
 pub fn cached() struct { count: usize, bytes: usize } {
-    return .{ .count = cache.count, .bytes = cache.bytes };
+    var count: usize = 0;
+    for (cache.lists) |list| count += list.count;
+    return .{ .count = count, .bytes = cache.bytes };
 }
 
 /// Tests only: unmaps every block the calling thread's cache holds, so a
 /// test starts from an empty cache whatever ran before it on the thread.
 pub fn drainLocalForTest() void {
     if (!@import("builtin").is_test) @compileError("drainLocalForTest is for tests");
-    while (cache.first) |f| {
-        cache.first = f.next;
-        const block: [*]align(16) u8 = @ptrCast(f);
-        page_allocator.rawFree(block[0..f.len], .fromByteUnits(std.heap.pageSize()), @returnAddress());
+    for (&cache.lists, 0..) |*list, i| {
+        while (list.first) |f| {
+            list.first = f.next;
+            const block: [*]align(16) u8 = @ptrCast(f);
+            page_allocator.rawFree(block[0..classes[i]], page_align, @returnAddress());
+        }
     }
     cache = .{};
 }
@@ -206,4 +267,74 @@ test "block_cache: large blocks are kept and reused, small ones are malloc's" {
     const half = try allocator.alloc(u8, 100 * 1024);
     try std.testing.expect(half.ptr != big.ptr);
     allocator.free(half);
+}
+
+test "block_cache: each class keeps its own blocks, and take hands out a class whole" {
+    drainLocalForTest();
+    defer drainLocalForTest();
+    // `take` gives exactly the class, with no header in front.
+    const a = take(64 * 1024).?;
+    try std.testing.expectEqual(@as(usize, 64 * 1024), a.len);
+    @memset(a, 0x11);
+    give(a);
+    try std.testing.expectEqual(@as(usize, 1), cachedIn(0));
+    const b = take(64 * 1024).?;
+    try std.testing.expectEqual(a.ptr, b.ptr);
+    try std.testing.expectEqual(@as(usize, 0), cachedIn(0));
+    // A block of another class is not taken for it.
+    const big = take(256 * 1024).?;
+    give(big);
+    const c = take(128 * 1024).?;
+    try std.testing.expect(c.ptr != big.ptr);
+    try std.testing.expectEqual(@as(usize, 1), cachedIn(2));
+    give(c);
+    give(b);
+
+    // 40 KiB is past malloc's slabs: `alloc` serves it from the 64 KiB
+    // class, the block `b` just went back as.
+    const mid = alloc(40 * 1024).?;
+    try std.testing.expectEqual(@intFromPtr(b.ptr) + 16, @intFromPtr(mid));
+    free(mid);
+    try std.testing.expectEqual(@as(usize, 1), cachedIn(0));
+    // Under `malloc_max` it is malloc's.
+    const small = alloc(16 * 1024).?;
+    free(small);
+    try std.testing.expectEqual(@as(usize, 1), cachedIn(0));
+    // Past the largest class: mapped and unmapped, never cached.
+    const before = cached();
+    const huge = alloc(3 * 1024 * 1024).?;
+    free(huge);
+    try std.testing.expectEqual(before.count, cached().count);
+}
+
+test "block_cache: a class holds at most class_max, the cache max_cached" {
+    drainLocalForTest();
+    defer drainLocalForTest();
+    var blocks: [40][]align(16) u8 = undefined;
+    for (&blocks) |*b| b.* = take(64 * 1024).?;
+    for (blocks) |b| give(b);
+    try std.testing.expectEqual(class_max / (64 * 1024), cachedIn(0));
+    // A 2 MiB block still fits the total; the next 1 MiB does not.
+    give(take(2 * 1024 * 1024).?);
+    try std.testing.expectEqual(@as(usize, 1), cachedIn(4));
+    give(take(1024 * 1024).?);
+    try std.testing.expectEqual(@as(usize, 0), cachedIn(3));
+    try std.testing.expect(cached().bytes <= max_cached);
+}
+
+test "block_cache: a trim unmaps per class what sat unused, past trim_keep" {
+    drainLocalForTest();
+    defer drainLocalForTest();
+    var small: [5][]align(16) u8 = undefined;
+    for (&small) |*b| b.* = take(64 * 1024).?;
+    for (small) |b| give(b);
+    give(take(1024 * 1024).?);
+    trimLocal(); // ends the interval in which they were taken
+    // One 64 KiB block taken and given back in the next interval: four
+    // sat unused all along, of which `trim_keep` stay. The 1 MiB class
+    // keeps none.
+    give(take(64 * 1024).?);
+    trimLocal();
+    try std.testing.expectEqual(@as(usize, 1 + trim_keep), cachedIn(0));
+    try std.testing.expectEqual(@as(usize, 0), cachedIn(3));
 }
