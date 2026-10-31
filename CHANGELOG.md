@@ -3,6 +3,16 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.2 (unreleased)
+
+### Fixed
+
+- A connection the local stack aborted after its peer vanished
+  (`ConnectionAborted`: ECONNABORTED, Windows' WSAECONNABORTED) counts as a
+  departed peer: no "HTTP/2 write error" log line, `peerGone()` and a gRPC
+  call's `cancelled()` are true, and `anole.net` reports a reset instead of a
+  failure (#34).
+
 ## 0.4.1 (2026-10-30)
 
 ### Security
