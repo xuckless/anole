@@ -104,6 +104,13 @@ pub const test_window = if (@import("builtin").is_test) struct {
     pub var peak_bytes: std.atomic.Value(usize) = .init(0);
 } else struct {};
 
+/// Tests only: the spare streams' trim epoch, which only a test moves (in
+/// place of `Server.trim_epoch`, which moves every 5 s): a connection
+/// that sees it change frees the spares it kept unused since
+/// (`Conn.trimSpares`).
+pub var test_trim_epoch: if (@import("builtin").is_test) std.atomic.Value(u32) else void =
+    if (@import("builtin").is_test) .init(0) else {};
+
 /// What `test_before_fill` is told about the connection.
 pub const FillProbe = struct {
     /// The drain's final GOAWAY (or the one a draining server sends a new
@@ -147,8 +154,12 @@ pub fn sniffPreface(r: *std.Io.Reader) error{ReadFailed}!bool {
 /// whose kept node holds it.
 const arena_body_max = 4 * 1024;
 
-/// Spare streams a connection keeps for reuse.
-const max_spare_streams = 16;
+/// Spare streams a connection keeps for reuse: as many as the client may
+/// open at once (`max_concurrent_streams`, h2load's 100 for one), up to
+/// this many.
+const max_spare_streams = 128;
+/// The spares a trim never goes below.
+const min_spare_streams = 16;
 /// What a reused stream's arena keeps between requests: the queues and
 /// buffers of an ordinary request with a body fit.
 const arena_retain_limit = 128 * 1024;
@@ -224,6 +235,23 @@ pub fn Engine(comptime Ctx: type) type {
                 return r.list.first != null;
             }
 
+            /// Tests only: the spare streams the open connections keep.
+            pub fn sparesForTest(r: *Registry) usize {
+                if (!@import("builtin").is_test) @compileError("sparesForTest is for tests");
+                const io = r.server().io;
+                r.mutex.lockUncancelable(io);
+                defer r.mutex.unlock(io);
+                var n: usize = 0;
+                var it = r.list.first;
+                while (it) |node| : (it = node.next) {
+                    const conn: *Conn = @alignCast(@fieldParentPtr("node", node));
+                    conn.lock();
+                    defer conn.unlock();
+                    n += conn.spare_streams.items.len;
+                }
+                return n;
+            }
+
             /// Sends the final GOAWAY to connections whose peer has not
             /// answered the notice's PING.
             pub fn finishDrain(r: *Registry) void {
@@ -259,6 +287,14 @@ pub fn Engine(comptime Ctx: type) type {
             /// Finished streams kept for reuse with their arenas, so a
             /// connection's requests stop allocating once it is warm.
             spare_streams: std.ArrayList(*Stream) = .empty,
+            /// At most `max_spare_streams`, and no more than the client may
+            /// open at once.
+            max_spares: usize = min_spare_streams,
+            /// The fewest spares held since the last trim: that many sat
+            /// unused all the while (`trimSpares`).
+            spare_low: usize = 0,
+            /// The trim epoch the spares were last trimmed at.
+            spare_epoch: u32 = 0,
             /// Streams with a handler still running or a response still
             /// going out, each counted in the server's in-flight requests.
             open_streams: usize = 0,
@@ -417,6 +453,25 @@ pub fn Engine(comptime Ctx: type) type {
             fn kickWriter(conn: *Conn) void {
                 _ = conn.write_gen.fetchAdd(1, .release);
                 conn.io.futexWake(u32, &conn.write_gen.raw, std.math.maxInt(u32));
+            }
+
+            fn trimEpoch(conn: *Conn) u32 {
+                if (comptime @import("builtin").is_test) return test_trim_epoch.load(.monotonic);
+                return conn.server.trim_epoch.load(.monotonic);
+            }
+
+            /// Once a trim interval has passed (`Server.trim_epoch`), frees
+            /// the spare streams that sat unused since the last trim (the
+            /// low-water mark), never below `min_spare_streams`, as
+            /// `block_cache.trimLocal` does with its blocks. A burst's
+            /// spares go after two quiet intervals. Under the mutex.
+            fn trimSpares(conn: *Conn) void {
+                const epoch = conn.trimEpoch();
+                if (epoch == conn.spare_epoch) return;
+                conn.spare_epoch = epoch;
+                const n = @min(conn.spare_low, conn.spare_streams.items.len -| min_spare_streams);
+                for (0..n) |_| conn.spare_streams.pop().?.destroy(conn.allocator);
+                conn.spare_low = conn.spare_streams.items.len;
             }
 
             fn lock(conn: *Conn) void {
@@ -802,6 +857,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// was released), or a new one. Under the mutex.
             fn create(conn: *Conn, id: i32) !*Stream {
                 if (conn.spare_streams.pop()) |stream| {
+                    conn.spare_low = @min(conn.spare_low, conn.spare_streams.items.len);
                     const arena = stream.arena;
                     stream.* = .{ .conn = conn, .id = id, .arena = arena };
                     return stream;
@@ -850,7 +906,7 @@ pub fn Engine(comptime Ctx: type) type {
                         conn.kickWriter();
                     }
                 }
-                if (conn.spare_streams.items.len < max_spare_streams) {
+                if (conn.spare_streams.items.len < conn.max_spares) {
                     // Trimmed now, not on reuse: the budget above is given
                     // back, so a spare must not keep a raised body window.
                     _ = safety.resetArena(&stream.arena, .{ .retain_with_limit = arena_retain_limit });
@@ -905,10 +961,12 @@ pub fn Engine(comptime Ctx: type) type {
                 .io = server.io,
                 .allocator = server.allocator,
                 .config = server.config.http2,
+                .max_spares = @max(1, @min(max_spare_streams, server.config.http2.max_concurrent_streams)),
                 .inline_ok = server.config.http2.inline_no_wait and server.router.has_no_wait,
                 .refused_tokens = server.config.http2.refused_stream_burst,
                 .refused_at = std.Io.Clock.awake.now(server.io).toSeconds(),
             };
+            conn.spare_epoch = conn.trimEpoch();
             defer conn.ready.deinit(conn.allocator);
             defer conn.awaiting.deinit(conn.allocator);
             try conn.initSession();
@@ -1157,6 +1215,7 @@ pub fn Engine(comptime Ctx: type) type {
 
                 conn.lock();
                 const idle = conn.open_streams == 0;
+                conn.trimSpares();
                 conn.unlock();
                 if (idle) {
                     if (conn.server.config.timeout.keepalive) |d| {

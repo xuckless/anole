@@ -21,6 +21,10 @@ breaking changes are listed anyway.
   arrives (HEADERS and DATA in separate reads, as browsers, grpc-go and
   curl often send them) no longer takes a 1 MiB buffer for a small body
   (#99).
+- HTTP/2: a connection keeps up to `min(max_concurrent_streams, 128)`
+  spare streams (was 16), so a client with 100 streams in flight stops
+  creating and freeing them; spares unused for a whole trim interval go,
+  down to 16 (#99).
 - `block_cache` keeps one free list per size class (64, 128 and 256 KiB,
   1 and 2 MiB) with an O(1) take and give, serves everything past
   malloc's slabs (32 KiB), and is trimmed per class (#99).

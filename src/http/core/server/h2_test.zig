@@ -1254,6 +1254,93 @@ test "HTTP/2: a long body of unknown length raises its window in steps, 256 KiB 
     try std.testing.expectEqual(@as(u32, 1024 * 1024), h2.test_window.raised[(raises + 1) % n].load(.monotonic));
 }
 
+/// `count` held requests at once on `client`, all in their handlers
+/// before any answers: the connection needs that many streams.
+fn heldBurst(client: *TestClient, io: std.Io, count: u32) !void {
+    Handlers.held_gate = .unset;
+    const entered = Handlers.held_entered.load(.acquire);
+    var ids: [128]i32 = undefined;
+    for (ids[0..count]) |*id| id.* = try client.request("GET", "/held", null);
+    try client.sendPending();
+    // The test client reads nothing meanwhile: the server's frames wait in
+    // the socket, and none of the requests can finish before the gate.
+    try wait.waitAtLeast(io, "every held request is in its handler", &Handlers.held_entered, entered + count);
+    Handlers.held_gate.set(io);
+    try client.run();
+    for (ids[0..count]) |id| try std.testing.expectEqualStrings("held but whole", client.get(id).body.items);
+}
+
+test "HTTP/2: a warm connection serves a burst of 100 streams without allocating" {
+    const io = std.testing.io;
+    const safety = @import("anole_safety");
+    safety.arena_poisoning.store(false, .monotonic);
+    defer safety.arena_poisoning.store(true, .monotonic);
+    var counting: CountingAllocator = .{ .inner = std.testing.allocator };
+    var server = dusty.Server(void).init(counting.allocator(), io, .{
+        .listeners = &.{.{ .address = loopback_addr, .http2_prior_knowledge = true }},
+    }, {});
+    defer server.deinit();
+    server.router.get("/held", Handlers.held);
+    var future = try io.concurrent(Fixture.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, server.address.ip);
+    defer client.deinit();
+    // Warm up: 100 streams (h2load's -m100), kept as spares.
+    for (0..2) |_| {
+        try heldBurst(&client, io, 100);
+        try awaitStreamsFreed(&server, io);
+    }
+    try std.testing.expectEqual(@as(usize, 100), server.h2_conns.sparesForTest());
+    const before = counting.count.load(.monotonic);
+    for (0..3) |_| {
+        try heldBurst(&client, io, 100);
+        try awaitStreamsFreed(&server, io);
+    }
+    try std.testing.expectEqual(before, counting.count.load(.monotonic));
+}
+
+var fills_seen: std.atomic.Value(u32) = .init(0);
+fn countFill(_: std.Io, _: h2.FillProbe) std.Io.Cancelable!void {
+    _ = fills_seen.fetchAdd(1, .acq_rel);
+}
+
+test "HTTP/2: a burst's spare streams go after two quiet trim intervals, down to 16" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    h2.test_before_fill = countFill;
+    defer h2.test_before_fill = null;
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    try heldBurst(&client, io, 40);
+    try awaitStreamsFreed(&fx.server, io);
+    try std.testing.expectEqual(@as(usize, 40), fx.server.h2_conns.sparesForTest());
+    // Each round: a trim interval passes, and one request makes the
+    // reader look (its idle check, which `test_before_fill` follows). The
+    // first trim sets the low-water mark; the next frees what sat unused
+    // since. Three rounds hold two trims after the burst, whichever idle
+    // check the first one lands on.
+    for (0..3) |_| {
+        const seen = fills_seen.load(.acquire);
+        _ = h2.test_trim_epoch.fetchAdd(1, .monotonic);
+        const id = try client.request("GET", "/hello", null);
+        try client.run();
+        try std.testing.expectEqualStrings("hello", client.get(id).body.items);
+        try wait.waitAtLeast(io, "the reader looked again", &fills_seen, seen + 1);
+        try awaitStreamsFreed(&fx.server, io);
+    }
+    // The floor, plus the one stream a round's request may have held
+    // while the trim ran.
+    const left = fx.server.h2_conns.sparesForTest();
+    try std.testing.expect(left >= 16 and left <= 17);
+}
+
 /// Waits until the server has freed every stream. The response can reach
 /// the client before its handler's task has let go of the stream (each
 /// task is a thread of its own under std.testing.io), and a request sent

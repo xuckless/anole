@@ -1276,6 +1276,10 @@ pub fn Server(comptime Ctx: type) type {
         /// GOAWAY that no new streams will be taken.
         h2_conns: if (build_options.use_http2) h2.Engine(Ctx).Registry else void =
             if (build_options.use_http2) .{} else {},
+        /// Bumped by the first executor's trim task every
+        /// `request_buffers_trim_interval`: an HTTP/2 connection that sees
+        /// it move frees the spare streams it kept unused since.
+        trim_epoch: std.atomic.Value(u32) = .init(0),
         /// The first listener's bound address, once `ready` is set. A
         /// listener given port zero has its real port here.
         address: Address,
@@ -1968,6 +1972,7 @@ pub fn Server(comptime Ctx: type) type {
                 try self.io.sleep(request_buffers_trim_interval, .awake);
                 self.request_buffers.trimLocal();
                 if (shards) self.request_buffers.trimShards();
+                if (shards) _ = self.trim_epoch.fetchAdd(1, .monotonic);
                 if (build_options.use_zlib or build_options.use_brotli or build_options.use_http2) block_cache.trimLocal();
                 // Objects retired with no writer after them (src/http/core/qsbr.zig).
                 if (shards) qsbr.pollAll();
