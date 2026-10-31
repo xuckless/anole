@@ -160,14 +160,17 @@ const arena_body_max = 4 * 1024;
 const max_spare_streams = 128;
 /// The spares a trim never goes below.
 const min_spare_streams = 16;
-/// What a reused stream's arena keeps between requests: the queues and
-/// buffers of an ordinary request with a body fit.
-const arena_retain_limit = 128 * 1024;
+/// What a stream's arena keeps between requests, and starts with: an
+/// ordinary request takes about 3 KB of it (the S2 atlas); the body and
+/// response queues are not in it.
+const arena_retain_limit = 8 * 1024;
 
 /// Response body bytes queued per stream between the handler and the data
-/// provider; a handler that gets this far ahead of the peer waits.
-const out_queue_len = 32 * 1024;
-/// The handler-side buffer in front of that queue.
+/// provider; a handler that gets this far ahead of the peer waits. From
+/// the connection's allocator, and short enough for malloc's slabs
+/// (`block_cache.malloc_max`), so a streamed response maps nothing.
+const out_queue_len = 32 * 1024 - 64;
+/// The handler-side buffer in front of that queue, from the same.
 const body_writer_len = 16 * 1024;
 
 /// The body writer buffer of a tunnel stream, whose frames go to the outbox
@@ -612,6 +615,10 @@ pub fn Engine(comptime Ctx: type) type {
             body: ?std.Io.Queue(u8) = null,
             /// Where the body queue's memory is, freed in `release`.
             body_buf: BodyBuf = .{},
+            /// The response queue's and body writer's memory, from the
+            /// connection's allocator, freed in `release`.
+            out_buf: []u8 = &.{},
+            writer_buf: []u8 = &.{},
             /// The request's content-length, which nghttp2 holds the DATA
             /// to (it never runs with `no_http_messaging`).
             content_length: ?u64 = null,
@@ -864,6 +871,11 @@ pub fn Engine(comptime Ctx: type) type {
                 }
                 const stream = try conn.allocator.create(Stream);
                 stream.* = .{ .conn = conn, .id = id, .arena = .init(conn.allocator) };
+                // The node every reset keeps, so the first reset does not
+                // reallocate it (`release`).
+                if (stream.arena.allocator().alloc(u8, arena_retain_limit)) |_| {
+                    _ = safety.resetArena(&stream.arena, .{ .retain_with_limit = arena_retain_limit });
+                } else |_| {}
                 return stream;
             }
 
@@ -896,6 +908,11 @@ pub fn Engine(comptime Ctx: type) type {
                 stream.outbox.deinit(conn.allocator);
                 stream.body = null;
                 stream.body_buf.free(conn.allocator);
+                stream.out = null;
+                conn.allocator.free(stream.out_buf);
+                stream.out_buf = &.{};
+                conn.allocator.free(stream.writer_buf);
+                stream.writer_buf = &.{};
                 if (conn.streams.remove(stream.id)) gauges.add(conn.io, .h2_streams, -1);
                 if (stream.counted) {
                     conn.open_streams -= 1;
@@ -2251,8 +2268,13 @@ pub fn Engine(comptime Ctx: type) type {
                 const self = fromPtr(ptr);
                 if (self.writer.buffer.len == 0 and self.stream.parked == null) {
                     // A handler that never writes a body never pays for it.
-                    const len: usize = if (self.stream.connect_protocol.len > 0) tunnel_writer_len else body_writer_len;
-                    self.writer.buffer = self.stream.arena.allocator().alloc(u8, len) catch &.{};
+                    const stream = self.stream;
+                    if (stream.connect_protocol.len > 0) {
+                        self.writer.buffer = stream.arena.allocator().alloc(u8, tunnel_writer_len) catch &.{};
+                    } else {
+                        stream.writer_buf = stream.conn.allocator.alloc(u8, body_writer_len) catch &.{};
+                        self.writer.buffer = stream.writer_buf;
+                    }
                 }
                 return &self.writer;
             }
@@ -2267,8 +2289,8 @@ pub fn Engine(comptime Ctx: type) type {
                     stream.outbox_mode = true;
                     return;
                 }
-                const buf = stream.arena.allocator().alloc(u8, out_queue_len) catch return self.fail(error.SystemResources);
-                stream.out = .init(buf);
+                stream.out_buf = stream.conn.allocator.alloc(u8, out_queue_len) catch return self.fail(error.SystemResources);
+                stream.out = .init(stream.out_buf);
             }
 
             /// Submits the head with a data provider, once. Under the mutex.
