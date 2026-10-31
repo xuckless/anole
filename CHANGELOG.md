@@ -14,6 +14,13 @@ breaking changes are listed anyway.
   malloc's slabs, a larger one from `block_cache`. A body that overflows
   its queue resets only its stream (RST_STREAM INTERNAL_ERROR) instead of
   the connection (#99).
+- HTTP/2: a stream's body window is raised in steps (64 KiB, 256 KiB,
+  1 MiB at the defaults) only when the body is longer than the window or
+  of unknown length and the client has used the window up, instead of to
+  1 MiB on the handler's first read. A handler that reads before its DATA
+  arrives (HEADERS and DATA in separate reads, as browsers, grpc-go and
+  curl often send them) no longer takes a 1 MiB buffer for a small body
+  (#99).
 - `block_cache` keeps one free list per size class (64, 128 and 256 KiB,
   1 and 2 MiB) with an O(1) take and give, serves everything past
   malloc's slabs (32 KiB), and is trimmed per class (#99).

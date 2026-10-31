@@ -725,12 +725,15 @@ handlers as HTTP/1.1.
   wait.
 
 `Options.http2` sets `max_concurrent_streams` (250), `stream_window`
-(64 KiB, also each stream's body buffer), `stream_window_reading` (1 MiB:
-the window and buffer from the handler's first read of the body),
+(64 KiB, also the most a stream's body buffer starts with: a body of known
+length, or one that comes whole in one DATA frame, gets a buffer its size),
+`stream_window_reading` (1 MiB: what the window and buffer grow to, in
+steps of four from 64 KiB, while the handler reads a body longer than the
+window and the client keeps using the window up),
 `tunnel_window` (128 KiB: the one fixed window and buffer of a WebSocket
 over HTTP/2; raise it for bulk uploads over long round trips),
 `reading_window_budget` (16 MiB: what those raised buffers take at most per
-connection; past it a stream keeps `stream_window`), `connection_window`
+connection; past it a stream keeps the window it has), `connection_window`
 (16 MiB), `max_header_list_size` (64 KiB), `stream_reset_burst` and
 `stream_reset_rate` (rapid-reset protection), `refused_stream_burst` (100)
 and `refused_stream_rate` (10 a second: streams refused before a handler,

@@ -454,10 +454,10 @@ const Handlers = struct {
     var late_gate: std.Io.Event = .unset;
     var late_entered: std.atomic.Value(u32) = .init(0);
     /// `sum`, as a handler starved of CPU at the worst moment: it reads
-    /// exactly `stall_credit` bytes, half the window its first read raised
-    /// it to, which returns credit for all of them, then stops until the
-    /// test opens `stall_gate` (once the peer has sent the whole window
-    /// again, `SentGate`), then reads the rest.
+    /// exactly `stall_credit` bytes, twice the window its first read
+    /// raised it to, which returns credit for all of them, then stops
+    /// until the test opens `stall_gate` (once the peer has sent a whole
+    /// raised window again, `SentGate`), then reads the rest.
     fn stall(req: *dusty.Request, res: *dusty.Response) !void {
         const raw = req._body_source.?.reader;
         var hash: std.hash.Wyhash = .init(0);
@@ -472,6 +472,25 @@ const Handlers = struct {
     }
     const stall_credit = 512 * 1024;
     var stall_gate: std.Io.Event = .unset;
+    /// `sum`, reading one byte each time the server has seen the peer use
+    /// up the stream's window (`h2.test_window.fulls` past
+    /// `stepper_base`), twice, then the rest: each of those reads raises
+    /// the window one step.
+    fn stepper(req: *dusty.Request, res: *dusty.Response) !void {
+        const raw = req._body_source.?.reader;
+        var hash: std.hash.Wyhash = .init(0);
+        var n: usize = 0;
+        for (0..2) |k| {
+            try wait.waitAtLeast(req.io, "the peer used up the stream window", &h2.test_window.fulls, stepper_base + @as(u32, @intCast(k)) + 1);
+            n += try takeBody(raw, &hash, 1);
+        }
+        while (true) n += takeBody(raw, &hash, 4096) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
+        try res.print(.text, "{d} {x}", .{ n, hash.final() });
+    }
+    var stepper_base: u32 = 0;
     /// At most `limit` body bytes, straight from the stream: each read is
     /// what the engine credits back.
     fn takeBody(raw: *std.Io.Reader, hash: *std.hash.Wyhash, limit: usize) !usize {
@@ -555,6 +574,7 @@ const Fixture = struct {
         self.server.router.get("/held", Handlers.held);
         self.server.router.post("/late", Handlers.late);
         self.server.router.post("/stall", Handlers.stall);
+        self.server.router.post("/stepper", Handlers.stepper);
         // The same handlers on routes that promise not to wait, which run
         // on the connection's reader when their request comes whole.
         self.server.router.addRouteWith(.get, "/nw/hello", Handlers.hello, .{ .no_wait = true });
@@ -732,11 +752,12 @@ test "HTTP/2: a body window raised before the client acknowledged SETTINGS never
     defer client.deinit();
     const id = try client.request("POST", "/stall", body);
     // The handler stops after `stall_credit` until the client has sent
-    // that plus the whole raised window (1 MiB): the window filled again
-    // behind a handler that does not read.
+    // that plus the window's first raised step (256 KiB): that window
+    // filled again behind a handler that does not read (a window raised
+    // further meanwhile only opens the gate sooner).
     Handlers.stall_gate = .unset;
     const resps = [_]*const TestClient.Resp{client.get(id)};
-    const gate: SentGate = .{ .resps = &resps, .n = Handlers.stall_credit + 1024 * 1024 };
+    const gate: SentGate = .{ .resps = &resps, .n = Handlers.stall_credit + 256 * 1024 };
     var releaser = try io.concurrent(SentGate.release, .{ io, &gate, &Handlers.stall_gate });
     defer releaser.cancel(io) catch {};
     // The preface, SETTINGS, the head and a default window of the body,
@@ -1150,6 +1171,87 @@ test "HTTP/2: a body that overflows its queue resets only its stream, with INTER
     try client.run();
     var expect: [64]u8 = undefined;
     try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(after).body.items);
+}
+
+test "HTTP/2: a handler reading before its small body arrives raises no window" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const raises = h2.test_window.raises.load(.monotonic);
+    const blocks = h2.test_body_allocs.block.load(.monotonic);
+    const sums = Handlers.sum_entered.load(.acquire);
+    // HEADERS alone (as browsers, grpc-go and curl often send them), so
+    // the task handler reads before its DATA comes.
+    const id = try client.request("POST", "/nw/sum", "");
+    client.get(id).keep_open = true;
+    try client.sendPending();
+    try wait.waitAtLeast(io, "the handler runs before its body", &Handlers.sum_entered, sums + 1);
+    const body = "123456789";
+    client.get(id).send = body;
+    client.get(id).keep_open = false;
+    if (c.nghttp2_session_resume_data(client.session, id) != 0) return error.Http2Resume;
+    try client.run();
+    var expect: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(id).body.items);
+    try std.testing.expectEqual(raises, h2.test_window.raises.load(.monotonic));
+    try std.testing.expectEqual(blocks, h2.test_body_allocs.block.load(.monotonic));
+}
+
+test "HTTP/2: a body that fits the window by its content-length is never raised" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const body = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 3);
+    const raises = h2.test_window.raises.load(.monotonic);
+    // The whole window sent before the handler reads: the peer used it
+    // all, but the content-length says nothing more is coming.
+    const length = [_]c.nghttp2_nv{TestClient.nv("content-length", "65536")};
+    const id = try client.requestHeaders("POST", "/late", &length, body);
+    Handlers.late_gate = .unset;
+    const resps = [_]*const TestClient.Resp{client.get(id)};
+    const gate: SentGate = .{ .resps = &resps, .n = body.len, .entered = &Handlers.late_entered, .want = Handlers.late_entered.load(.acquire) + 1 };
+    var releaser = try io.concurrent(SentGate.release, .{ io, &gate, &Handlers.late_gate });
+    defer releaser.cancel(io) catch {};
+    try client.run();
+    try releaser.await(io);
+    var expect: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(id).body.items);
+    try std.testing.expectEqual(raises, h2.test_window.raises.load(.monotonic));
+}
+
+test "HTTP/2: a long body of unknown length raises its window in steps, 256 KiB then 1 MiB" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const body = try std.testing.allocator.alloc(u8, 3 * 1024 * 1024);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 11 +% (i >> 9));
+    Handlers.stepper_base = h2.test_window.fulls.load(.monotonic);
+    const raises = h2.test_window.raises.load(.monotonic);
+    const id = try client.request("POST", "/stepper", body);
+    try client.run();
+    var expect: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(id).body.items);
+    try std.testing.expectEqual(raises + 2, h2.test_window.raises.load(.monotonic));
+    const n = h2.test_window.raised.len;
+    try std.testing.expectEqual(@as(u32, 256 * 1024), h2.test_window.raised[raises % n].load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1024 * 1024), h2.test_window.raised[(raises + 1) % n].load(.monotonic));
 }
 
 /// Waits until the server has freed every stream. The response can reach
@@ -2022,6 +2124,7 @@ test "HTTP/2: the raised body windows of a connection share one budget" {
     for (body, 0..) |*b, i| b.* = @truncate(i *% 7);
     var ids: [8]i32 = undefined;
     for (&ids) |*id| id.* = try client.request("POST", "/late", body);
+    h2.test_window.peak_bytes.store(0, .monotonic);
     // The eight handlers read only once all of them have started and each
     // stream has a window of its body sent: they raise their windows
     // together.
@@ -2042,8 +2145,10 @@ test "HTTP/2: the raised body windows of a connection share one budget" {
     defer want.deinit(std.testing.allocator);
     try want.print(std.testing.allocator, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) });
     for (ids) |id| try std.testing.expectEqualStrings(want.items, client.get(id).body.items);
-    // Eight streams reading at once would raise eight 1 MiB windows.
+    // Eight streams reading at once would raise eight 1 MiB windows. The
+    // raised queues come from block_cache, which `live` does not see.
     try std.testing.expect(live.peak.load(.monotonic) < 4 * 1024 * 1024);
+    try std.testing.expect(h2.test_window.peak_bytes.load(.monotonic) <= 1024 * 1024);
 }
 
 test "HTTP/2: an event stream outlives timeouts.request" {
