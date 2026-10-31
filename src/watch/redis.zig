@@ -262,6 +262,7 @@ pub const PubSubHub = struct {
     }
 
     fn statusAll(self: *PubSubHub, s: root.Status) void {
+        testBeforeStatus();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         inline for (.{ &self.channels, &self.patterns }) |map| {
@@ -289,6 +290,17 @@ pub const PubSubHub = struct {
         for (seen.items) |w| w.gapped(detail);
     }
 };
+
+/// Tests: runs once, on the hub's reader task, as `statusAll` begins (before
+/// it takes the hub's lock), where a watch's owner may end and free it.
+/// Test builds only.
+pub var test_before_status: if (builtin.is_test) std.atomic.Value(?*const fn () void) else void = if (builtin.is_test) .init(null) else {};
+
+fn testBeforeStatus() void {
+    if (comptime !builtin.is_test) return;
+    const hook = test_before_status.swap(null, .acq_rel) orelse return;
+    hook();
+}
 
 pub fn register(w: *Watch) !void {
     const r = w.source.redis;

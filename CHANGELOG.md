@@ -3,6 +3,15 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.4.2 (unreleased)
+
+### Fixed
+
+- watch: a PostgreSQL or Redis watch is always taken out of the shared
+  LISTEN/SUBSCRIBE connection when it stops, also when a drain could not
+  start its stop task (or a test made a started watch fake). Freed while
+  still listed, it was written to when that connection reconnected (#157).
+
 ## 0.4.1 (2026-10-30)
 
 ### Security

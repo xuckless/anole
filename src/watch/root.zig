@@ -367,6 +367,11 @@ pub const Watch = struct {
     status_value: std.atomic.Value(u8) = .init(@backingInt(Status.starting)),
     stopping: std.atomic.Value(bool) = .init(false),
     started: bool = false,
+    /// Set by `start` before it adds the watch to its shared connection's
+    /// hub (PostgreSQL LISTEN, Redis Pub/Sub); the first `stop` takes it
+    /// out again, whatever set `stopping` before (`fail`, a drain that
+    /// could not start its task), so a freed watch is never listed (#157).
+    hub_listed: std.atomic.Value(bool) = .init(false),
     /// Not started under this deployment (lambda).
     disabled: bool = false,
     group: std.Io.Group = .init,
@@ -583,8 +588,16 @@ pub const Watch = struct {
         if (self.started or self.disabled or self.fake) return;
         self.started = true;
         switch (self.source) {
-            .postgres => if (comptime features.postgres) try @import("pg.zig").register(self),
-            .redis => if (comptime features.redis) try @import("redis.zig").register(self),
+            // Listed before registering: a registration that fails half way
+            // is undone by `stop` too.
+            .postgres => if (comptime features.postgres) {
+                self.hub_listed.store(true, .release);
+                try @import("pg.zig").register(self);
+            },
+            .redis => if (comptime features.redis) {
+                self.hub_listed.store(true, .release);
+                try @import("redis.zig").register(self);
+            },
             .redis_stream => if (comptime features.redis) try @import("redis.zig").startStream(self),
             .mongodb => if (comptime features.mongodb) try @import("mongo.zig").startStream(self),
         }
@@ -623,12 +636,15 @@ pub const Watch = struct {
 
     /// Stops reading and ends handlers' work and listeners (W8). Does not wait.
     pub fn stop(self: *Watch) void {
-        if (self.stopping.swap(true, .acq_rel)) return;
-        if (self.started and !self.fake) switch (self.source) {
+        const first = !self.stopping.swap(true, .acq_rel);
+        // Out of the hub even when `stopping` was set already: `deinit`
+        // frees the watch right after this.
+        if (self.hub_listed.swap(false, .acq_rel)) switch (self.source) {
             .postgres => if (comptime features.postgres) @import("pg.zig").unregister(self),
             .redis => if (comptime features.redis) @import("redis.zig").unregister(self),
             .redis_stream, .mongodb => {},
         };
+        if (!first) return;
         self.setStatus(.stopped);
         if (self.reader_task) |t| placement.cancelTask(t);
         self.inbox_signal.set(self.io);
