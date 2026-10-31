@@ -3,6 +3,16 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.5.0 (unreleased)
+
+### Added
+
+- `/metrics` has HTTP/3 series per endpoint: packets, packets passed on
+  between endpoints and dropped, datagrams and outbox sends, requests,
+  requests served inline and open connections, plus `anole_h3_steering`
+  (whether the kernel steers datagrams by connection ID). The server logs
+  an info line when steering is attached (#100).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed

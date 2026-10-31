@@ -292,6 +292,28 @@ finished). A program that declares its own `zio_options` without it gets
 only `anole_connections` and `anole_streams`. A registry of your own gets
 them with `registry.runtime_gauges = true`.
 
+### HTTP/3 series
+
+With an HTTP/3 listener, `app.metrics` also copies each endpoint's counters
+on every scrape. On Linux a listener has one endpoint per executor, each
+with its own UDP socket; `endpoint` is the socket's index.
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `anole_h3_packets_total` | `endpoint` | QUIC packets handled: from its own socket and passed on to it. |
+| `anole_h3_forwarded_in_total` | `endpoint` | Packets another endpoint's socket received for this one's connections. |
+| `anole_h3_forwarded_out_total` | `endpoint` | Packets this socket received for another endpoint's connection. Stays at 0 while steering works. |
+| `anole_h3_dropped_total` | `endpoint` | Packets for another endpoint dropped (its inbox was full). Kernel drops are in `/proc/net/udp6`'s `drops` column. |
+| `anole_h3_datagrams_out_total` | `endpoint` | Datagrams sent. |
+| `anole_h3_tx_flushes_total` | `endpoint` | Outbox sends they went out in (`sendmmsg` calls on Linux). |
+| `anole_h3_requests_total` | `endpoint` | Requests started. |
+| `anole_h3_served_inline_total` | `endpoint` | Requests for `no_wait` routes run without a task. |
+| `anole_h3_connections_open` | `endpoint` | Connections open. |
+| `anole_h3_steering` | `listener` | 1 when the kernel steers each datagram to its connection's endpoint (a classic BPF program on the SO_REUSEPORT group), 0 with one socket or when the program could not be attached. |
+
+The server also logs one info line when steering is attached, and a warning
+when it could not be.
+
 ## Tracing
 
 `trace.Middleware` makes one server span per request. If the request has a

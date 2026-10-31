@@ -326,6 +326,8 @@ pub const Stats = struct {
     /// Requests for `no_wait` routes run inline, without a task
     /// (`Options.inline_no_wait`).
     served_inline: std.atomic.Value(u64) = .init(0),
+    /// Requests started: given a task, or run inline (`served_inline`).
+    requests: std.atomic.Value(u64) = .init(0),
     /// Times a connection armed QUIC keep-alive (a request opened on an
     /// idle connection).
     keep_alive_arms: std.atomic.Value(u64) = .init(0),
@@ -456,6 +458,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// The sockets go to another process: close every connection at
             /// once and stop reading (see `handOver`).
             hand_over: std.atomic.Value(bool) = .init(false),
+            /// The kernel steers each datagram to its connection's
+            /// endpoint (`steer.attach` took): false with one socket, or
+            /// where the program could not be attached.
+            steering: bool = false,
         };
 
         /// A datagram passed from the endpoint whose socket received it to
@@ -512,8 +518,12 @@ pub fn Endpoint(comptime Ctx: type) type {
             // The group numbers its sockets in bind order, as we did, so
             // the program's index is the endpoint's. Inherited sockets keep
             // the order their first owner bound them in.
-            if (count > 1) steer.attach(shared.endpoints[0].udp.socket.handle, @intCast(count)) catch
-                log.warn("HTTP/3: no connection-ID steering (classic BPF on SO_REUSEPORT needs Linux 4.5+); the {d} endpoints pass packets on to each other instead", .{count});
+            if (count > 1) {
+                if (steer.attach(shared.endpoints[0].udp.socket.handle, @intCast(count))) {
+                    shared.steering = true;
+                    log.info("HTTP/3: connection-ID steering attached on {d} sockets", .{count});
+                } else |_| log.warn("HTTP/3: no connection-ID steering (classic BPF on SO_REUSEPORT needs Linux 4.5+); the {d} endpoints pass packets on to each other instead", .{count});
+            }
             net.rand_io = io;
             return shared.endpoints[0];
         }
@@ -643,6 +653,12 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// their sockets, to hand to a successor, and their `stats`.
         pub fn endpoints(self: *const Self) []const *Self {
             return self.shared.endpoints;
+        }
+
+        /// Whether the kernel steers the listener's datagrams by
+        /// connection ID (`Shared.steering`).
+        pub fn steering(self: *const Self) bool {
+            return self.shared.steering;
         }
 
         /// The TLS context for `options`, with session ticket keys of its
@@ -2253,6 +2269,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// A request's head is complete: give it a task. Locked.
             fn startStream(conn: *Conn, stream: *Stream) void {
                 stream.started = true;
+                _ = conn.ep.stats.requests.fetchAdd(1, .monotonic);
                 stream.refs.handler = true;
                 // The flush waits for its answer (`Stream.unhold`).
                 stream.round = conn.round.load(.monotonic);
@@ -2546,6 +2563,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.unlock();
                 if (!gone) {
                     _ = conn.ep.stats.served_inline.fetchAdd(1, .monotonic);
+                    _ = conn.ep.stats.requests.fetchAdd(1, .monotonic);
                     if (s.serve(true)) |served| {
                         // Finished later; the stream is held till then.
                         if (served == .detached) return;
