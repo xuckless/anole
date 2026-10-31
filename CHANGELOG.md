@@ -45,6 +45,10 @@ breaking changes are listed anyway.
   writes (`ack_thresh` 1, ngtcp2's default is 2), so a request's ACK
   leaves with its answer (#100).
 
+- HTTP/3 connections write up to 48 packets (~56 KiB) per GSO send when
+  pacing allows, up from 10, and each endpoint's outbox holds 256 KiB
+  (#100).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed

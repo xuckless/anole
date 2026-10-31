@@ -429,8 +429,10 @@ pub const Udp = struct {
         /// Datagrams in all the messages.
         datagrams: usize = 0,
 
-        pub const buf_len = 128 * 1024;
-        pub const max_msgs = 128;
+        /// Room for four of HTTP/3's ~56 KiB rounds, or 256 datagrams
+        /// one by one where there is no GSO.
+        pub const buf_len = 256 * 1024;
+        pub const max_msgs = 256;
 
         pub fn init(gpa: std.mem.Allocator) !Outbox {
             const buf = try gpa.alloc(u8, buf_len);

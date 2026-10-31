@@ -73,8 +73,10 @@ const SendError = dusty.Response.SendError;
 /// Our connection IDs' length, as ngtcp2's examples use; one byte of them
 /// names the endpoint (`steer`).
 const scid_len = steer.cid_len;
-/// Packets a connection writes at a time (one message, with GSO).
-const burst = 10;
+/// Packets a connection writes at a time (one message, with GSO): 48 of
+/// 1200 bytes is a ~56 KiB GSO send, under the kernel's 64 segments and
+/// 64 KiB. Only taken when ngtcp2's send quantum (pacing) allows that much.
+const burst = 48;
 /// What a connection may write at a time at most.
 const tx_round = burst * c.NGTCP2_MAX_UDP_PAYLOAD_SIZE;
 /// How long a connection's flush waits at most for the requests a batch
