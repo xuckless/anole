@@ -221,10 +221,14 @@ pub const Options = struct {
 fn http3Settings(options: *const Options) nghttp3.Settings {
     var settings: nghttp3.Settings = undefined;
     nghttp3.settingsDefault(&settings);
-    // The client's requests may use a dynamic table (smaller requests
-    // in; looking an entry up costs the decoder little).
-    settings.qpack_max_dtable_capacity = 4096;
-    settings.qpack_blocked_streams = 100;
+    // No dynamic table for the client's requests either: it sends
+    // literals (Huffman-coded) and static-table references, and no
+    // connection keeps a decoder table or blocked-stream state. goose
+    // (plod) does the same; aegon and cnetmod take 4096/100. Under A/B
+    // against 4096/100 (#100, HA11): the trade is literal decoding for
+    // table upkeep, memory and the blocked-stream path.
+    settings.qpack_max_dtable_capacity = 0;
+    settings.qpack_blocked_streams = 0;
     // Our responses use the static table and literals only: searching the
     // dynamic table for every field of every response was ~8% of a
     // hello-world profile (Bun's, on lsquic's encoder; nghttp3's does the

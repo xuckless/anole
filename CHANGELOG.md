@@ -32,6 +32,11 @@ breaking changes are listed anyway.
   got once at startup, and `/metrics` shows it as
   `anole_h3_socket_rcvbuf_bytes`/`anole_h3_socket_sndbuf_bytes` (#100).
 
+- HTTP/3 no longer offers clients a QPACK dynamic table for their request
+  headers (capacity 0, no blocked streams): requests arrive as literals
+  and static-table references, and connections keep no decoder table.
+  Session tickets from before resume without 0-RTT once (#100).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed
