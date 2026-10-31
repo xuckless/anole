@@ -26,11 +26,19 @@ pub const StaticOptions = struct {
     /// 8.3 short name of a dotfile: `ENV~1` for `.env`.
     hide_dotfiles: bool = true,
     /// Answer a path that resolves outside the directory, through a
-    /// symlink say, with a 404. How far that holds depends on the platform
-    /// and the `Io`: `std.Io.Threaded` ignores it where the OS has no
-    /// such open flag, and zio, stricter, fails the open where it cannot
-    /// guarantee it. Without it, symlinks are followed wherever they lead.
-    resolve_beneath: bool = false,
+    /// symlink say, with a 404. Symlinks that stay inside it are served.
+    /// On by default; `false` follows symlinks wherever they lead.
+    ///
+    /// Where the OS can confine an open itself (Linux 5.6+, macOS 26+) it
+    /// does, at no extra cost, and an absolute symlink is refused even when
+    /// it points back inside the directory: use relative links. Elsewhere
+    /// (Windows, macOS 15.x, Linux without openat2) the server opens the
+    /// file and then compares its real path with the directory's, which
+    /// serves such an absolute link and costs a second blocking-pool hop
+    /// per open. The real path of the directory is read when the server
+    /// starts, so a directory renamed while serving answers 404. The
+    /// startup log says which way the server went.
+    resolve_beneath: bool = true,
     /// Sent as `Cache-Control` with a 200, 206 or 304, such as
     /// "public, max-age=3600". Copied by the router.
     cache_control: ?[]const u8 = null,
@@ -84,6 +92,9 @@ pub const Precompressed = enum {
 pub const Static = struct {
     dir: std.Io.Dir,
     options: StaticOptions,
+    /// The real path of `dir`, read when the server starts, for the
+    /// real-path check of `resolve_beneath`. Null until then.
+    root_real: ?[]const u8 = null,
 
     /// The wildcard the routes capture the path under.
     pub const param = "path";
@@ -100,7 +111,7 @@ pub const Static = struct {
     pub fn serve(self: *const Static, req: *Request, res: *Response) !bool {
         const raw = req.params.get(param) orelse "";
         const sub_path = try cleanPath(req.arena, raw, self.options.hide_dotfiles) orelse return false;
-        const open: Response.SendFileOptions = .{ .resolve_beneath = self.options.resolve_beneath };
+        const open: Response.SendFileOptions = .{ .resolve_beneath = self.options.resolve_beneath, .root_real = self.root_real };
 
         const url_path = urlPath(req.url);
         var served = sub_path;

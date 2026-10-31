@@ -135,6 +135,9 @@ pub fn Router(comptime Ctx: type) type {
         /// level the walk tries static children first, so a route of static
         /// segments only wins over any parameter or wildcard route.
         static_routes: std.StringHashMapUnmanaged(*StaticRoute) = .empty,
+        /// The `Static`s `static` registered, in order, for the server to
+        /// prepare at startup (`Server.prepareStatic`).
+        statics: std.ArrayList(*Static) = .empty,
         /// Global middlewares applied to all routes, in the router's
         /// arena. Internal: add to it with `use()`. A list assigned here
         /// directly is copied into the arena when the next route is
@@ -717,6 +720,7 @@ pub fn Router(comptime Ctx: type) type {
             const alloc = self.arena.allocator();
             const files = alloc.create(Static) catch @panic("OOM");
             files.* = .{ .dir = dir, .options = opts };
+            self.statics.append(alloc, files) catch @panic("OOM");
             if (opts.index) |index| files.options.index = alloc.dupe(u8, index) catch @panic("OOM");
             files.options.precompressed = alloc.dupe(Precompressed, opts.precompressed) catch @panic("OOM");
             if (opts.cache_control) |cc| files.options.cache_control = alloc.dupe(u8, cc) catch @panic("OOM");

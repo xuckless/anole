@@ -6,6 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("http.zig");
 const Request = @import("request.zig").Request;
+const beneath = @import("beneath.zig");
 pub const WebSocket = @import("websocket.zig").WebSocket;
 const WebSocketModule = @import("websocket.zig");
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
@@ -827,6 +828,9 @@ pub const Response = struct {
     _write_timeout: ?std.Io.Duration = null,
     /// `ServerConfig.error_detail`: `defaultError` names the error in a 500.
     _error_detail: bool = false,
+    /// How `sendFile` confines an open to its directory (`beneath.probe`'s
+    /// verdict, copied by the server). The safe one until it is known.
+    _beneath: beneath.Tier = .verify,
     /// When the write in progress times out, if one is being timed.
     _write_deadline: ?std.Io.Clock.Timestamp = null,
     /// The request deadline was lifted for a stream or file body.
@@ -1010,10 +1014,19 @@ pub const Response = struct {
     }
 
     pub const SendFileOptions = struct {
-        /// Also refuse a path that leaves `dir` through a symlink. See
-        /// `std.Io.Dir.OpenFileOptions.resolve_beneath`: how far that holds
-        /// depends on the platform and the `Io`.
-        resolve_beneath: bool = false,
+        /// Refuse a path that leaves `dir` through a symlink (`error.AccessDenied`,
+        /// a 404 for the server). Symlinks that stay inside `dir` are served. On by
+        /// default; `false` follows symlinks wherever they lead.
+        ///
+        /// Where the OS can confine an open (Linux 5.6+, macOS 26+) it does, and an
+        /// absolute symlink is refused even when it points back inside `dir`: use
+        /// relative links. Elsewhere the file is opened and its real path compared
+        /// with `dir`'s, at the cost of a second blocking-pool hop. See
+        /// `StaticOptions.resolve_beneath`.
+        resolve_beneath: bool = true,
+        /// The real path of `dir`, if the caller has it, for the real-path check.
+        /// Otherwise that check reads it from `dir` on every call.
+        root_real: ?[]const u8 = null,
     };
 
     pub const SendFileError = std.Io.File.OpenError || std.Io.File.StatError || http.MisuseError || error{ FileTooBig, NotFile };
@@ -1037,7 +1050,10 @@ pub const Response = struct {
         try self.checkBodyNotStarted();
         if (!staysInside(sub_path)) return error.BadPathName;
         const io = self.io;
-        const handle = try dir.openFile(io, sub_path, .{ .resolve_beneath = options.resolve_beneath });
+        const handle = if (options.resolve_beneath)
+            try beneath.openFile(io, dir, sub_path, self._beneath, options.root_real, self.arena)
+        else
+            try dir.openFile(io, sub_path, .{});
         errdefer handle.close(io);
         const stat = try handle.stat(io);
         switch (stat.kind) {

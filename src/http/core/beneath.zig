@@ -49,11 +49,9 @@ pub const Why = enum {
     /// Whether this verdict is the expected one on this platform, so the
     /// startup line is for debug only.
     pub fn expected(self: Why) bool {
-        return switch (self) {
-            .kernel_refuses, .windows => true,
-            .flag_ignored => builtin.os.tag == .macos,
-            else => false,
-        };
+        // macOS before 26 lands on `.verify` however the probe ends.
+        if (builtin.os.tag == .macos) return true;
+        return self == .kernel_refuses or self == .windows;
     }
 
     pub fn text(self: Why) []const u8 {

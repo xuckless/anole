@@ -3756,6 +3756,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                 std.debug.print("anole: {s}\n", .{msg});
                 return self.failStart(error.RouteConflict);
             }
+            self.server.prepareStatic() catch |err| return self.failStart(errors.toServerError(err));
             self.startConnectors() catch |err| {
                 errors.log.err("a database connector could not start: {t}", .{err});
                 return self.failStart(error.DatabaseUnavailable);
