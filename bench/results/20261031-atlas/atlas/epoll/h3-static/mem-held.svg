@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="272" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fff"/><text x="4" y="13">malloc bytes held at the window&#x27;s end: h3-static (epoll, 1 executor) (45556 samples)</text>
+<g><title>malloc held (45556 samples, 100.00%)</title><rect x="0.0" y="256" width="1600.0" height="15" fill="hsl(39,80%,62%)"/><text x="2.0" y="267">malloc held</text></g>
+<g><title>0x7f890ec06b7b (32 samples, 0.07%)</title><rect x="0.0" y="240" width="1.1" height="15" fill="hsl(13,80%,62%)"/><text x="2.0" y="251"></text></g>
+<g><title>Thread.PosixThreadImpl.spawn__func_1513.Instance.entryFn (32 samples, 0.07%)</title><rect x="0.0" y="224" width="1.1" height="15" fill="hsl(56,80%,62%)"/><text x="2.0" y="235"></text></g>
+<g><title>ev.backends.common.handleFileOpen (32 samples, 0.07%)</title><rect x="0.0" y="208" width="1.1" height="15" fill="hsl(53,80%,62%)"/><text x="2.0" y="219"></text></g>
+<g><title>coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (45524 samples, 99.93%)</title><rect x="1.1" y="240" width="1598.9" height="15" fill="hsl(41,80%,62%)"/><text x="3.1" y="251">coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn</text></g>
+<g><title>task.AnyTask.startFn (45524 samples, 99.93%)</title><rect x="1.1" y="224" width="1598.9" height="15" fill="hsl(8,80%,62%)"/><text x="3.1" y="235">task.AnyTask.startFn</text></g>
+<g><title>group.Group.spawnInto__func_2238.Wrapper.start (18368 samples, 40.32%)</title><rect x="1.1" y="208" width="645.1" height="15" fill="hsl(28,80%,62%)"/><text x="3.1" y="219">group.Group.spawnInto__func_2238.Wrapper.start</text></g>
+<g><title>h3.server.Endpoint(main.App).Stream.run (18368 samples, 40.32%)</title><rect x="1.1" y="192" width="645.1" height="15" fill="hsl(51,80%,62%)"/><text x="3.1" y="203">h3.server.Endpoint(main.App).Stream.run</text></g>
+<g><title>h3.server.Endpoint(main.App).Stream.serve (18368 samples, 40.32%)</title><rect x="1.1" y="176" width="645.1" height="15" fill="hsl(7,80%,62%)"/><text x="3.1" y="187">h3.server.Endpoint(main.App).Stream.serve</text></g>
+<g><title>response.Response.write (18368 samples, 40.32%)</title><rect x="1.1" y="160" width="645.1" height="15" fill="hsl(51,80%,62%)"/><text x="3.1" y="171">response.Response.write</text></g>
+<g><title>Io.Writer.defaultRebase (18368 samples, 40.32%)</title><rect x="1.1" y="144" width="645.1" height="15" fill="hsl(16,80%,62%)"/><text x="3.1" y="155">Io.Writer.defaultRebase</text></g>
+<g><title>h3.server.Endpoint(main.App).StreamSink.drain (18368 samples, 40.32%)</title><rect x="1.1" y="128" width="645.1" height="15" fill="hsl(41,80%,62%)"/><text x="3.1" y="139">h3.server.Endpoint(main.App).StreamSink.drain</text></g>
+<g><title>h3.server.Endpoint(main.App).StreamSink.put (18368 samples, 40.32%)</title><rect x="1.1" y="112" width="645.1" height="15" fill="hsl(34,80%,62%)"/><text x="3.1" y="123">h3.server.Endpoint(main.App).StreamSink.put</text></g>
+<g><title>h3.server.Endpoint(main.App).StreamSink.submit (18368 samples, 40.32%)</title><rect x="1.1" y="96" width="645.1" height="15" fill="hsl(19,80%,62%)"/><text x="3.1" y="107">h3.server.Endpoint(main.App).StreamSink.submit</text></g>
+<g><title>conn_submit_headers_data (18368 samples, 40.32%)</title><rect x="1.1" y="80" width="645.1" height="15" fill="hsl(39,80%,62%)"/><text x="3.1" y="91">conn_submit_headers_data</text></g>
+<g><title>nghttp3_nva_copy (13568 samples, 29.78%)</title><rect x="1.1" y="64" width="476.5" height="15" fill="hsl(50,80%,62%)"/><text x="3.1" y="75">nghttp3_nva_copy</text></g>
+<g><title>nghttp3_stream_frq_emplace (4800 samples, 10.54%)</title><rect x="477.7" y="64" width="168.6" height="15" fill="hsl(35,80%,62%)"/><text x="479.7" y="75">nghttp3_stream_frq_empla</text></g>
+<g><title>nghttp3_ringbuf_reserve (4800 samples, 10.54%)</title><rect x="477.7" y="48" width="168.6" height="15" fill="hsl(45,80%,62%)"/><text x="479.7" y="59">nghttp3_ringbuf_reserve</text></g>
+<g><title>group.Group.spawnInto__func_2263.Wrapper.start (27104 samples, 59.50%)</title><rect x="646.2" y="208" width="951.9" height="15" fill="hsl(14,80%,62%)"/><text x="648.2" y="219">group.Group.spawnInto__func_2263.Wrapper.start</text></g>
+<g><title>h3.server.Endpoint(main.App).drive (27104 samples, 59.50%)</title><rect x="646.2" y="192" width="951.9" height="15" fill="hsl(8,80%,62%)"/><text x="648.2" y="203">h3.server.Endpoint(main.App).drive</text></g>
+<g><title>h3.server.Endpoint(main.App).Conn.service (27104 samples, 59.50%)</title><rect x="646.2" y="176" width="951.9" height="15" fill="hsl(1,80%,62%)"/><text x="648.2" y="187">h3.server.Endpoint(main.App).Conn.service</text></g>
+<g><title>h3.server.Endpoint(main.App).Conn.flush (27104 samples, 59.50%)</title><rect x="646.2" y="160" width="951.9" height="15" fill="hsl(52,80%,62%)"/><text x="648.2" y="171">h3.server.Endpoint(main.App).Conn.flush</text></g>
+<g><title>ngtcp2_conn_write_aggregate_pkt2_versioned (27104 samples, 59.50%)</title><rect x="646.2" y="144" width="951.9" height="15" fill="hsl(55,80%,62%)"/><text x="648.2" y="155">ngtcp2_conn_write_aggregate_pkt2_versioned</text></g>
+<g><title>h3.server.Endpoint(main.App).writePkt (27104 samples, 59.50%)</title><rect x="646.2" y="128" width="951.9" height="15" fill="hsl(28,80%,62%)"/><text x="648.2" y="139">h3.server.Endpoint(main.App).writePkt</text></g>
+<g><title>nghttp3_conn_writev_stream (27104 samples, 59.50%)</title><rect x="646.2" y="112" width="951.9" height="15" fill="hsl(4,80%,62%)"/><text x="648.2" y="123">nghttp3_conn_writev_stream</text></g>
+<g><title>conn_writev_stream (27104 samples, 59.50%)</title><rect x="646.2" y="96" width="951.9" height="15" fill="hsl(55,80%,62%)"/><text x="648.2" y="107">conn_writev_stream</text></g>
+<g><title>nghttp3_stream_fill_outq (27104 samples, 59.50%)</title><rect x="646.2" y="80" width="951.9" height="15" fill="hsl(3,80%,62%)"/><text x="648.2" y="91">nghttp3_stream_fill_outq</text></g>
+<g><title>nghttp3_stream_write_data (22400 samples, 49.17%)</title><rect x="646.2" y="64" width="786.7" height="15" fill="hsl(58,80%,62%)"/><text x="648.2" y="75">nghttp3_stream_write_data</text></g>
+<g><title>nghttp3_stream_outq_add (22400 samples, 49.17%)</title><rect x="646.2" y="48" width="786.7" height="15" fill="hsl(21,80%,62%)"/><text x="648.2" y="59">nghttp3_stream_outq_add</text></g>
+<g><title>nghttp3_ringbuf_reserve (22400 samples, 49.17%)</title><rect x="646.2" y="32" width="786.7" height="15" fill="hsl(45,80%,62%)"/><text x="648.2" y="43">nghttp3_ringbuf_reserve</text></g>
+<g><title>nghttp3_stream_write_header_block (4704 samples, 10.33%)</title><rect x="1433.0" y="64" width="165.2" height="15" fill="hsl(13,80%,62%)"/><text x="1435.0" y="75">nghttp3_stream_write_he</text></g>
+<g><title>nghttp3_stream_ensure_chunk (4224 samples, 9.27%)</title><rect x="1433.0" y="48" width="148.4" height="15" fill="hsl(48,80%,62%)"/><text x="1435.0" y="59">nghttp3_stream_ensure</text></g>
+<g><title>nghttp3_ringbuf_reserve (4224 samples, 9.27%)</title><rect x="1433.0" y="32" width="148.4" height="15" fill="hsl(45,80%,62%)"/><text x="1435.0" y="43">nghttp3_ringbuf_reser</text></g>
+<g><title>nghttp3_stream_outq_add (480 samples, 1.05%)</title><rect x="1581.3" y="48" width="16.9" height="15" fill="hsl(21,80%,62%)"/><text x="1583.3" y="59"></text></g>
+<g><title>nghttp3_ringbuf_reserve (480 samples, 1.05%)</title><rect x="1581.3" y="32" width="16.9" height="15" fill="hsl(45,80%,62%)"/><text x="1583.3" y="43"></text></g>
+<g><title>h3.server.Endpoint(main.App).serve (52 samples, 0.11%)</title><rect x="1598.2" y="208" width="1.8" height="15" fill="hsl(25,80%,62%)"/><text x="1600.2" y="219"></text></g>
+<g><title>h3.server.Endpoint(main.App).onPacket (52 samples, 0.11%)</title><rect x="1598.2" y="192" width="1.8" height="15" fill="hsl(9,80%,62%)"/><text x="1600.2" y="203"></text></g>
+<g><title>ngtcp2_conn_read_pkt_versioned (52 samples, 0.11%)</title><rect x="1598.2" y="176" width="1.8" height="15" fill="hsl(14,80%,62%)"/><text x="1600.2" y="187"></text></g>
+<g><title>conn_recv_pkt (52 samples, 0.11%)</title><rect x="1598.2" y="160" width="1.8" height="15" fill="hsl(49,80%,62%)"/><text x="1600.2" y="171"></text></g>
+<g><title>conn_recv_stream (52 samples, 0.11%)</title><rect x="1598.2" y="144" width="1.8" height="15" fill="hsl(48,80%,62%)"/><text x="1600.2" y="155"></text></g>
+<g><title>h3.server.Endpoint(main.App).onRecvStreamData (52 samples, 0.11%)</title><rect x="1598.2" y="128" width="1.8" height="15" fill="hsl(15,80%,62%)"/><text x="1600.2" y="139"></text></g>
+<g><title>nghttp3_conn_read_stream2 (52 samples, 0.11%)</title><rect x="1598.2" y="112" width="1.8" height="15" fill="hsl(27,80%,62%)"/><text x="1600.2" y="123"></text></g>
+<g><title>nghttp3_conn_read_bidi (52 samples, 0.11%)</title><rect x="1598.2" y="96" width="1.8" height="15" fill="hsl(9,80%,62%)"/><text x="1600.2" y="107"></text></g>
+<g><title>nghttp3_conn_on_headers (52 samples, 0.11%)</title><rect x="1598.2" y="80" width="1.8" height="15" fill="hsl(40,80%,62%)"/><text x="1600.2" y="91"></text></g>
+<g><title>nghttp3_qpack_decoder_read_request (52 samples, 0.11%)</title><rect x="1598.2" y="64" width="1.8" height="15" fill="hsl(25,80%,62%)"/><text x="1600.2" y="75"></text></g>
+<g><title>nghttp3_rcbuf_new (52 samples, 0.11%)</title><rect x="1598.2" y="48" width="1.8" height="15" fill="hsl(34,80%,62%)"/><text x="1600.2" y="59"></text></g>
+</svg>

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="432" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fff"/><text x="4" y="13">Off-CPU (µs): h3-json (epoll, 1 executor) (12940098 samples)</text>
+<g><title>anole-bench (12940098 samples, 100.00%)</title><rect x="0.0" y="416" width="1600.0" height="15" fill="hsl(28,80%,62%)"/><text x="2.0" y="427">anole-bench</text></g>
+<g><title>[unknown] (12939756 samples, 100.00%)</title><rect x="0.0" y="400" width="1600.0" height="15" fill="hsl(56,80%,62%)"/><text x="2.0" y="411">[unknown]</text></g>
+<g><title>[unknown] (9008907 samples, 69.62%)</title><rect x="0.0" y="384" width="1113.9" height="15" fill="hsl(56,80%,62%)"/><text x="2.0" y="395">[unknown]</text></g>
+<g><title>entry_SYSCALL_64_after_hwframe (9008907 samples, 69.62%)</title><rect x="0.0" y="368" width="1113.9" height="15" fill="hsl(1,80%,62%)"/><text x="2.0" y="379">entry_SYSCALL_64_after_hwframe</text></g>
+<g><title>do_syscall_64 (9008907 samples, 69.62%)</title><rect x="0.0" y="352" width="1113.9" height="15" fill="hsl(10,80%,62%)"/><text x="2.0" y="363">do_syscall_64</text></g>
+<g><title>__x64_sys_poll (9008907 samples, 69.62%)</title><rect x="0.0" y="336" width="1113.9" height="15" fill="hsl(52,80%,62%)"/><text x="2.0" y="347">__x64_sys_poll</text></g>
+<g><title>do_sys_poll (9008907 samples, 69.62%)</title><rect x="0.0" y="320" width="1113.9" height="15" fill="hsl(57,80%,62%)"/><text x="2.0" y="331">do_sys_poll</text></g>
+<g><title>do_poll.constprop.0 (9008907 samples, 69.62%)</title><rect x="0.0" y="304" width="1113.9" height="15" fill="hsl(55,80%,62%)"/><text x="2.0" y="315">do_poll.constprop.0</text></g>
+<g><title>poll_schedule_timeout.constprop.0 (9008907 samples, 69.62%)</title><rect x="0.0" y="288" width="1113.9" height="15" fill="hsl(23,80%,62%)"/><text x="2.0" y="299">poll_schedule_timeout.constprop.0</text></g>
+<g><title>schedule_hrtimeout_range_clock (9008907 samples, 69.62%)</title><rect x="0.0" y="272" width="1113.9" height="15" fill="hsl(4,80%,62%)"/><text x="2.0" y="283">schedule_hrtimeout_range_clock</text></g>
+<g><title>schedule (9008907 samples, 69.62%)</title><rect x="0.0" y="256" width="1113.9" height="15" fill="hsl(35,80%,62%)"/><text x="2.0" y="267">schedule</text></g>
+<g><title>__schedule (9008907 samples, 69.62%)</title><rect x="0.0" y="240" width="1113.9" height="15" fill="hsl(45,80%,62%)"/><text x="2.0" y="251">__schedule</text></g>
+<g><title>finish_task_switch.isra.0 (9008907 samples, 69.62%)</title><rect x="0.0" y="224" width="1113.9" height="15" fill="hsl(5,80%,62%)"/><text x="2.0" y="235">finish_task_switch.isra.0</text></g>
+<g><title>main (3930820 samples, 30.38%)</title><rect x="1113.9" y="384" width="486.0" height="15" fill="hsl(7,80%,62%)"/><text x="1115.9" y="395">main</text></g>
+<g><title>main.main (3930820 samples, 30.38%)</title><rect x="1113.9" y="368" width="486.0" height="15" fill="hsl(36,80%,62%)"/><text x="1115.9" y="379">main.main</text></g>
+<g><title>server.ServerOf(main.App,false).runInner (3930820 samples, 30.38%)</title><rect x="1113.9" y="352" width="486.0" height="15" fill="hsl(40,80%,62%)"/><text x="1115.9" y="363">server.ServerOf(main.App,false).runInner</text></g>
+<g><title>Io.TypeErasedQueue.getLocked (3930820 samples, 30.38%)</title><rect x="1113.9" y="336" width="486.0" height="15" fill="hsl(27,80%,62%)"/><text x="1115.9" y="347">Io.TypeErasedQueue.getLocked</text></g>
+<g><title>Io.Condition.waitTimeout (3930820 samples, 30.38%)</title><rect x="1113.9" y="320" width="486.0" height="15" fill="hsl(57,80%,62%)"/><text x="1115.9" y="331">Io.Condition.waitTimeout</text></g>
+<g><title>io.futexWaitImpl (3930820 samples, 30.38%)</title><rect x="1113.9" y="304" width="486.0" height="15" fill="hsl(35,80%,62%)"/><text x="1115.9" y="315">io.futexWaitImpl</text></g>
+<g><title>sync.Futex.waitTimeoutClock (3930820 samples, 30.38%)</title><rect x="1113.9" y="288" width="486.0" height="15" fill="hsl(51,80%,62%)"/><text x="1115.9" y="299">sync.Futex.waitTimeoutClock</text></g>
+<g><title>sync.Futex.wait (3930820 samples, 30.38%)</title><rect x="1113.9" y="272" width="486.0" height="15" fill="hsl(46,80%,62%)"/><text x="1115.9" y="283">sync.Futex.wait</text></g>
+<g><title>common.Waiter.wait__func_912 (3930820 samples, 30.38%)</title><rect x="1113.9" y="256" width="486.0" height="15" fill="hsl(9,80%,62%)"/><text x="1115.9" y="267">common.Waiter.wait__func_912</text></g>
+<g><title>task.AnyTask.yield__func_1589 (3930820 samples, 30.38%)</title><rect x="1113.9" y="240" width="486.0" height="15" fill="hsl(43,80%,62%)"/><text x="1115.9" y="251">task.AnyTask.yield__func_1589</text></g>
+<g><title>runtime.Executor.run (3930820 samples, 30.38%)</title><rect x="1113.9" y="224" width="486.0" height="15" fill="hsl(24,80%,62%)"/><text x="1115.9" y="235">runtime.Executor.run</text></g>
+<g><title>ev.loop.Loop.poll (3930820 samples, 30.38%)</title><rect x="1113.9" y="208" width="486.0" height="15" fill="hsl(16,80%,62%)"/><text x="1115.9" y="219">ev.loop.Loop.poll</text></g>
+<g><title>ev.backends.linux.epoll.poll (3930820 samples, 30.38%)</title><rect x="1113.9" y="192" width="486.0" height="15" fill="hsl(3,80%,62%)"/><text x="1115.9" y="203">ev.backends.linux.epoll.poll</text></g>
+<g><title>entry_SYSCALL_64_after_hwframe (3930807 samples, 30.38%)</title><rect x="1113.9" y="176" width="486.0" height="15" fill="hsl(1,80%,62%)"/><text x="1115.9" y="187">entry_SYSCALL_64_after_hwframe</text></g>
+<g><title>do_syscall_64 (3930807 samples, 30.38%)</title><rect x="1113.9" y="160" width="486.0" height="15" fill="hsl(10,80%,62%)"/><text x="1115.9" y="171">do_syscall_64</text></g>
+<g><title>__x64_sys_epoll_pwait2 (3930807 samples, 30.38%)</title><rect x="1113.9" y="144" width="486.0" height="15" fill="hsl(37,80%,62%)"/><text x="1115.9" y="155">__x64_sys_epoll_pwait2</text></g>
+<g><title>do_epoll_pwait.part.0 (3930807 samples, 30.38%)</title><rect x="1113.9" y="128" width="486.0" height="15" fill="hsl(23,80%,62%)"/><text x="1115.9" y="139">do_epoll_pwait.part.0</text></g>
+<g><title>do_epoll_wait (3930807 samples, 30.38%)</title><rect x="1113.9" y="112" width="486.0" height="15" fill="hsl(46,80%,62%)"/><text x="1115.9" y="123">do_epoll_wait</text></g>
+<g><title>ep_poll (3930807 samples, 30.38%)</title><rect x="1113.9" y="96" width="486.0" height="15" fill="hsl(9,80%,62%)"/><text x="1115.9" y="107">ep_poll</text></g>
+<g><title>schedule_hrtimeout_range_clock (3930807 samples, 30.38%)</title><rect x="1113.9" y="80" width="486.0" height="15" fill="hsl(4,80%,62%)"/><text x="1115.9" y="91">schedule_hrtimeout_range_clock</text></g>
+<g><title>schedule (3930807 samples, 30.38%)</title><rect x="1113.9" y="64" width="486.0" height="15" fill="hsl(35,80%,62%)"/><text x="1115.9" y="75">schedule</text></g>
+<g><title>__schedule (3930807 samples, 30.38%)</title><rect x="1113.9" y="48" width="486.0" height="15" fill="hsl(45,80%,62%)"/><text x="1115.9" y="59">__schedule</text></g>
+<g><title>finish_task_switch.isra.0 (3930807 samples, 30.38%)</title><rect x="1113.9" y="32" width="486.0" height="15" fill="hsl(5,80%,62%)"/><text x="1115.9" y="43">finish_task_switch.isra.0</text></g>
+</svg>

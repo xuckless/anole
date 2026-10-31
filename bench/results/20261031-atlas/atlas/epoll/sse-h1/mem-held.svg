@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="208" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fff"/><text x="4" y="13">malloc bytes held at the window&#x27;s end: sse-h1 (epoll, 1 executor) (3755232 samples)</text>
+<g><title>malloc held (3755232 samples, 100.00%)</title><rect x="0.0" y="192" width="1600.0" height="15" fill="hsl(39,80%,62%)"/><text x="2.0" y="203">malloc held</text></g>
+<g><title>coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (3755232 samples, 100.00%)</title><rect x="0.0" y="176" width="1600.0" height="15" fill="hsl(41,80%,62%)"/><text x="2.0" y="187">coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn</text></g>
+<g><title>task.AnyTask.startFn (3755232 samples, 100.00%)</title><rect x="0.0" y="160" width="1600.0" height="15" fill="hsl(8,80%,62%)"/><text x="2.0" y="171">task.AnyTask.startFn</text></g>
+<g><title>group.Group.spawnInto__func_2363.Wrapper.start (1666776 samples, 44.39%)</title><rect x="0.0" y="144" width="710.2" height="15" fill="hsl(21,80%,62%)"/><text x="2.0" y="155">group.Group.spawnInto__func_2363.Wrapper.start</text></g>
+<g><title>server.Server(main.App).handleConnectionWrapper (1666776 samples, 44.39%)</title><rect x="0.0" y="128" width="710.2" height="15" fill="hsl(0,80%,62%)"/><text x="2.0" y="139">server.Server(main.App).handleConnectionWrapper</text></g>
+<g><title>server.Server(main.App).handleRequests (322776 samples, 8.60%)</title><rect x="0.0" y="112" width="137.5" height="15" fill="hsl(1,80%,62%)"/><text x="2.0" y="123">server.Server(main.</text></g>
+<g><title>middleware.Chain(main.App).run (321504 samples, 8.56%)</title><rect x="0.0" y="96" width="137.0" height="15" fill="hsl(29,80%,62%)"/><text x="2.0" y="107">middleware.Chain(ma</text></g>
+<g><title>middleware.Chain(main.App).call (321504 samples, 8.56%)</title><rect x="0.0" y="80" width="137.0" height="15" fill="hsl(46,80%,62%)"/><text x="2.0" y="91">middleware.Chain(ma</text></g>
+<g><title>handlers.adapt__struct_4919.h (321504 samples, 8.56%)</title><rect x="0.0" y="64" width="137.0" height="15" fill="hsl(8,80%,62%)"/><text x="2.0" y="75">handlers.adapt__str</text></g>
+<g><title>sse.root.Topics.register (134432 samples, 3.58%)</title><rect x="0.0" y="48" width="57.3" height="15" fill="hsl(52,80%,62%)"/><text x="2.0" y="59">sse.root</text></g>
+<g><title>array_list.Aligned(*h3.server.Endpoint(main.App).Stream,null).append (67048 samples, 1.79%)</title><rect x="0.0" y="32" width="28.6" height="15" fill="hsl(18,80%,62%)"/><text x="2.0" y="43">arra</text></g>
+<g><title>server.request_buffers.RequestBuffersPool.acquire (1272 samples, 0.03%)</title><rect x="137.0" y="96" width="0.5" height="15" fill="hsl(0,80%,62%)"/><text x="139.0" y="107"></text></g>
+<g><title>server.request_buffers.RequestBuffersPool.create (1272 samples, 0.03%)</title><rect x="137.0" y="80" width="0.5" height="15" fill="hsl(14,80%,62%)"/><text x="139.0" y="91"></text></g>
+<g><title>group.Group.spawnInto__func_2638.Wrapper.start (1104456 samples, 29.41%)</title><rect x="710.2" y="144" width="470.6" height="15" fill="hsl(56,80%,62%)"/><text x="712.2" y="155">group.Group.spawnInto__func_2638.Wrapper.start</text></g>
+<g><title>server.Server(main.App).acceptLoop (1104456 samples, 29.41%)</title><rect x="710.2" y="128" width="470.6" height="15" fill="hsl(59,80%,62%)"/><text x="712.2" y="139">server.Server(main.App).acceptLoop</text></g>
+<g><title>task.spawnTask (1104456 samples, 29.41%)</title><rect x="710.2" y="112" width="470.6" height="15" fill="hsl(39,80%,62%)"/><text x="712.2" y="123">task.spawnTask</text></g>
+<g><title>task.TaskPool.alloc (1104456 samples, 29.41%)</title><rect x="710.2" y="96" width="470.6" height="15" fill="hsl(21,80%,62%)"/><text x="712.2" y="107">task.TaskPool.alloc</text></g>
+<g><title>heap.ArenaAllocator.alloc (1104456 samples, 29.41%)</title><rect x="710.2" y="80" width="470.6" height="15" fill="hsl(15,80%,62%)"/><text x="712.2" y="91">heap.ArenaAllocator.alloc</text></g>
+<g><title>group.Group.spawnInto__func_4892.Wrapper.start (984000 samples, 26.20%)</title><rect x="1180.7" y="144" width="419.3" height="15" fill="hsl(24,80%,62%)"/><text x="1182.7" y="155">group.Group.spawnInto__func_4892.Wrapper.start</text></g>
+<g><title>sse.root.Topics.sendQueued (984000 samples, 26.20%)</title><rect x="1180.7" y="128" width="419.3" height="15" fill="hsl(10,80%,62%)"/><text x="1182.7" y="139">sse.root.Topics.sendQueued</text></g>
+<g><title>parked.H1Parked.write (984000 samples, 26.20%)</title><rect x="1180.7" y="112" width="419.3" height="15" fill="hsl(6,80%,62%)"/><text x="1182.7" y="123">parked.H1Parked.write</text></g>
+<g><title>server.Connection.lendWriteBuffer (984000 samples, 26.20%)</title><rect x="1180.7" y="96" width="419.3" height="15" fill="hsl(33,80%,62%)"/><text x="1182.7" y="107">server.Connection.lendWriteBuffer</text></g>
+</svg>

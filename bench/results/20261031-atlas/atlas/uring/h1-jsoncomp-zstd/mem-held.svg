@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="272" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fff"/><text x="4" y="13">malloc bytes held at the window&#x27;s end: h1-jsoncomp-zstd (uring, 1 executor) (19233416 samples)</text>
+<g><title>malloc held (19233416 samples, 100.00%)</title><rect x="0.0" y="256" width="1600.0" height="15" fill="hsl(39,80%,62%)"/><text x="2.0" y="267">malloc held</text></g>
+<g><title>coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (19233416 samples, 100.00%)</title><rect x="0.0" y="240" width="1600.0" height="15" fill="hsl(41,80%,62%)"/><text x="2.0" y="251">coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn</text></g>
+<g><title>task.AnyTask.startFn (19233416 samples, 100.00%)</title><rect x="0.0" y="224" width="1600.0" height="15" fill="hsl(8,80%,62%)"/><text x="2.0" y="235">task.AnyTask.startFn</text></g>
+<g><title>group.Group.spawnInto__func_2363.Wrapper.start (19233416 samples, 100.00%)</title><rect x="0.0" y="208" width="1600.0" height="15" fill="hsl(21,80%,62%)"/><text x="2.0" y="219">group.Group.spawnInto__func_2363.Wrapper.start</text></g>
+<g><title>server.Server(main.App).handleConnectionWrapper (19233416 samples, 100.00%)</title><rect x="0.0" y="192" width="1600.0" height="15" fill="hsl(0,80%,62%)"/><text x="2.0" y="203">server.Server(main.App).handleConnectionWrapper</text></g>
+<g><title>server.Server(main.App).handleRequests (19233416 samples, 100.00%)</title><rect x="0.0" y="176" width="1600.0" height="15" fill="hsl(1,80%,62%)"/><text x="2.0" y="187">server.Server(main.App).handleRequests</text></g>
+<g><title>middleware.Chain(main.App).run (1454856 samples, 7.56%)</title><rect x="0.0" y="160" width="121.0" height="15" fill="hsl(29,80%,62%)"/><text x="2.0" y="171">middleware.Chain(</text></g>
+<g><title>middleware.Chain(main.App).call (1454856 samples, 7.56%)</title><rect x="0.0" y="144" width="121.0" height="15" fill="hsl(46,80%,62%)"/><text x="2.0" y="155">middleware.Chain(</text></g>
+<g><title>handlers.adapt__struct_6377.h (1454856 samples, 7.56%)</title><rect x="0.0" y="128" width="121.0" height="15" fill="hsl(8,80%,62%)"/><text x="2.0" y="139">handlers.adapt__s</text></g>
+<g><title>heap.ArenaAllocator.alloc (509856 samples, 2.65%)</title><rect x="0.0" y="112" width="42.4" height="15" fill="hsl(15,80%,62%)"/><text x="2.0" y="123">heap.A</text></g>
+<g><title>json.Stringify.encodeJsonString (945000 samples, 4.91%)</title><rect x="42.4" y="112" width="78.6" height="15" fill="hsl(12,80%,62%)"/><text x="44.4" y="123">json.String</text></g>
+<g><title>response.BodyWriter.drain (945000 samples, 4.91%)</title><rect x="42.4" y="96" width="78.6" height="15" fill="hsl(24,80%,62%)"/><text x="44.4" y="107">response.Bo</text></g>
+<g><title>response.BodyBuffer.nextSegment (945000 samples, 4.91%)</title><rect x="42.4" y="80" width="78.6" height="15" fill="hsl(27,80%,62%)"/><text x="44.4" y="91">response.Bo</text></g>
+<g><title>heap.ArenaAllocator.alloc (945000 samples, 4.91%)</title><rect x="42.4" y="64" width="78.6" height="15" fill="hsl(15,80%,62%)"/><text x="44.4" y="75">heap.ArenaA</text></g>
+<g><title>response.Response.write (17778560 samples, 92.44%)</title><rect x="121.0" y="160" width="1479.0" height="15" fill="hsl(51,80%,62%)"/><text x="123.0" y="171">response.Response.write</text></g>
+<g><title>Io.Writer.writeVecAll (17778560 samples, 92.44%)</title><rect x="121.0" y="144" width="1479.0" height="15" fill="hsl(25,80%,62%)"/><text x="123.0" y="155">Io.Writer.writeVecAll</text></g>
+<g><title>zstd_io.Compress.drain (17778560 samples, 92.44%)</title><rect x="121.0" y="128" width="1479.0" height="15" fill="hsl(42,80%,62%)"/><text x="123.0" y="139">zstd_io.Compress.drain</text></g>
+<g><title>ZSTD_compressStream2 (17778560 samples, 92.44%)</title><rect x="121.0" y="112" width="1479.0" height="15" fill="hsl(22,80%,62%)"/><text x="123.0" y="123">ZSTD_compressStream2</text></g>
+<g><title>ZSTD_CCtx_init_compressStream2 (17778560 samples, 92.44%)</title><rect x="121.0" y="96" width="1479.0" height="15" fill="hsl(34,80%,62%)"/><text x="123.0" y="107">ZSTD_CCtx_init_compressStream2</text></g>
+<g><title>ZSTD_compressBegin_internal (17778560 samples, 92.44%)</title><rect x="121.0" y="80" width="1479.0" height="15" fill="hsl(19,80%,62%)"/><text x="123.0" y="91">ZSTD_compressBegin_internal</text></g>
+<g><title>ZSTD_resetCCtx_internal (17778560 samples, 92.44%)</title><rect x="121.0" y="64" width="1479.0" height="15" fill="hsl(31,80%,62%)"/><text x="123.0" y="75">ZSTD_resetCCtx_internal</text></g>
+<g><title>zstd_io.zstdAlloc (17778560 samples, 92.44%)</title><rect x="121.0" y="48" width="1479.0" height="15" fill="hsl(38,80%,62%)"/><text x="123.0" y="59">zstd_io.zstdAlloc</text></g>
+<g><title>heap.ArenaAllocator.alloc (17778560 samples, 92.44%)</title><rect x="121.0" y="32" width="1479.0" height="15" fill="hsl(15,80%,62%)"/><text x="123.0" y="43">heap.ArenaAllocator.alloc</text></g>
+</svg>

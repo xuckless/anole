@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="256" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fff"/><text x="4" y="13">Bytes allocated per stack: h2-static (uring, 1 executor) (1937965892 samples)</text>
+<g><title>arena (1284591494 samples, 66.29%)</title><rect x="0.0" y="240" width="1060.6" height="15" fill="hsl(33,80%,62%)"/><text x="2.0" y="251">arena</text></g>
+<g><title>coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (1284591494 samples, 66.29%)</title><rect x="0.0" y="224" width="1060.6" height="15" fill="hsl(41,80%,62%)"/><text x="2.0" y="235">coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn</text></g>
+<g><title>task.AnyTask.startFn (1284591494 samples, 66.29%)</title><rect x="0.0" y="208" width="1060.6" height="15" fill="hsl(8,80%,62%)"/><text x="2.0" y="219">task.AnyTask.startFn</text></g>
+<g><title>group.Group.spawnInto__func_2363.Wrapper.start (6535742 samples, 0.34%)</title><rect x="0.0" y="192" width="5.4" height="15" fill="hsl(21,80%,62%)"/><text x="2.0" y="203"></text></g>
+<g><title>server.Server(main.App).handleConnectionWrapper (6535742 samples, 0.34%)</title><rect x="0.0" y="176" width="5.4" height="15" fill="hsl(0,80%,62%)"/><text x="2.0" y="187"></text></g>
+<g><title>server.h2.Engine(main.App).serve (6535742 samples, 0.34%)</title><rect x="0.0" y="160" width="5.4" height="15" fill="hsl(53,80%,62%)"/><text x="2.0" y="171"></text></g>
+<g><title>nghttp2_session_mem_recv2 (6535742 samples, 0.34%)</title><rect x="0.0" y="144" width="5.4" height="15" fill="hsl(43,80%,62%)"/><text x="2.0" y="155"></text></g>
+<g><title>server.h2.Engine(main.App).onHeader (6535742 samples, 0.34%)</title><rect x="0.0" y="128" width="5.4" height="15" fill="hsl(52,80%,62%)"/><text x="2.0" y="139"></text></g>
+<g><title>array_list.Aligned(h3.server.Endpoint(main.App).Field,null).append (3966240 samples, 0.20%)</title><rect x="0.0" y="112" width="3.3" height="15" fill="hsl(32,80%,62%)"/><text x="2.0" y="123"></text></g>
+<g><title>heap.ArenaAllocator.alloc (3966240 samples, 0.20%)</title><rect x="0.0" y="96" width="3.3" height="15" fill="hsl(15,80%,62%)"/><text x="2.0" y="107"></text></g>
+<g><title>heap.ArenaAllocator.alloc (2569502 samples, 0.13%)</title><rect x="3.3" y="112" width="2.1" height="15" fill="hsl(15,80%,62%)"/><text x="5.3" y="123"></text></g>
+<g><title>group.Group.spawnInto__func_2457.Wrapper.start (1278055752 samples, 65.95%)</title><rect x="5.4" y="192" width="1055.2" height="15" fill="hsl(49,80%,62%)"/><text x="7.4" y="203">group.Group.spawnInto__func_2457.Wrapper.start</text></g>
+<g><title>server.h2.Engine(main.App).runStream (1278055752 samples, 65.95%)</title><rect x="5.4" y="176" width="1055.2" height="15" fill="hsl(57,80%,62%)"/><text x="7.4" y="187">server.h2.Engine(main.App).runStream</text></g>
+<g><title>server.h2.Engine(main.App).serveStream (1278055752 samples, 65.95%)</title><rect x="5.4" y="160" width="1055.2" height="15" fill="hsl(13,80%,62%)"/><text x="7.4" y="171">server.h2.Engine(main.App).serveStream</text></g>
+<g><title>heap.ArenaAllocator.alloc (39265776 samples, 2.03%)</title><rect x="5.4" y="144" width="32.4" height="15" fill="hsl(15,80%,62%)"/><text x="7.4" y="155">heap</text></g>
+<g><title>response.Response.write (1227896936 samples, 63.36%)</title><rect x="37.8" y="144" width="1013.8" height="15" fill="hsl(51,80%,62%)"/><text x="39.8" y="155">response.Response.write</text></g>
+<g><title>Io.Writer.defaultRebase (244056064 samples, 12.59%)</title><rect x="37.8" y="128" width="201.5" height="15" fill="hsl(16,80%,62%)"/><text x="39.8" y="139">Io.Writer.defaultRebase</text></g>
+<g><title>server.h2.Engine(main.App).StreamSink.drain (244056064 samples, 12.59%)</title><rect x="37.8" y="112" width="201.5" height="15" fill="hsl(9,80%,62%)"/><text x="39.8" y="123">server.h2.Engine(main.App).S</text></g>
+<g><title>heap.ArenaAllocator.alloc (244056064 samples, 12.59%)</title><rect x="37.8" y="96" width="201.5" height="15" fill="hsl(15,80%,62%)"/><text x="39.8" y="107">heap.ArenaAllocator.alloc</text></g>
+<g><title>response.Response.sendHeader (9468008 samples, 0.49%)</title><rect x="239.3" y="128" width="7.8" height="15" fill="hsl(3,80%,62%)"/><text x="241.3" y="139"></text></g>
+<g><title>response.Response.addSinkDate (718881 samples, 0.04%)</title><rect x="239.3" y="112" width="0.6" height="15" fill="hsl(34,80%,62%)"/><text x="241.3" y="123"></text></g>
+<g><title>heap.ArenaAllocator.alloc (718881 samples, 0.04%)</title><rect x="239.3" y="96" width="0.6" height="15" fill="hsl(15,80%,62%)"/><text x="241.3" y="107"></text></g>
+<g><title>server.h2.Engine(main.App).StreamSink.head (8749127 samples, 0.45%)</title><rect x="239.9" y="112" width="7.2" height="15" fill="hsl(41,80%,62%)"/><text x="241.9" y="123"></text></g>
+<g><title>heap.ArenaAllocator.alloc (8674760 samples, 0.45%)</title><rect x="240.0" y="96" width="7.2" height="15" fill="hsl(15,80%,62%)"/><text x="242.0" y="107"></text></g>
+<g><title>server.h2.Engine(main.App).StreamSink.body (406142976 samples, 20.96%)</title><rect x="247.1" y="128" width="335.3" height="15" fill="hsl(57,80%,62%)"/><text x="249.1" y="139">server.h2.Engine(main.App).StreamSink.body</text></g>
+<g><title>heap.ArenaAllocator.alloc (406142976 samples, 20.96%)</title><rect x="247.1" y="112" width="335.3" height="15" fill="hsl(15,80%,62%)"/><text x="249.1" y="123">heap.ArenaAllocator.alloc</text></g>
+<g><title>server.h2.Engine(main.App).StreamSink.flushFn (568229888 samples, 29.32%)</title><rect x="582.4" y="128" width="469.1" height="15" fill="hsl(29,80%,62%)"/><text x="584.4" y="139">server.h2.Engine(main.App).StreamSink.flushFn</text></g>
+<g><title>heap.ArenaAllocator.alloc (568229888 samples, 29.32%)</title><rect x="582.4" y="112" width="469.1" height="15" fill="hsl(15,80%,62%)"/><text x="584.4" y="123">heap.ArenaAllocator.alloc</text></g>
+<g><title>server.Server(main.App).dispatch (10893040 samples, 0.56%)</title><rect x="1051.6" y="144" width="9.0" height="15" fill="hsl(17,80%,62%)"/><text x="1053.6" y="155"></text></g>
+<g><title>middleware.Chain(main.App).run (1969000 samples, 0.10%)</title><rect x="1051.6" y="128" width="1.6" height="15" fill="hsl(29,80%,62%)"/><text x="1053.6" y="139"></text></g>
+<g><title>middleware.Chain(main.App).call (1969000 samples, 0.10%)</title><rect x="1051.6" y="112" width="1.6" height="15" fill="hsl(46,80%,62%)"/><text x="1053.6" y="123"></text></g>
+<g><title>router.Router(main.App).plainAction__struct_6332.handle (1969000 samples, 0.10%)</title><rect x="1051.6" y="96" width="1.6" height="15" fill="hsl(25,80%,62%)"/><text x="1053.6" y="107"></text></g>
+<g><title>heap.ArenaAllocator.alloc (1250119 samples, 0.06%)</title><rect x="1051.6" y="80" width="1.0" height="15" fill="hsl(15,80%,62%)"/><text x="1053.6" y="91"></text></g>
+<g><title>server.static.finish (718881 samples, 0.04%)</title><rect x="1052.6" y="80" width="0.6" height="15" fill="hsl(28,80%,62%)"/><text x="1054.6" y="91"></text></g>
+<g><title>heap.ArenaAllocator.alloc (718881 samples, 0.04%)</title><rect x="1052.6" y="64" width="0.6" height="15" fill="hsl(15,80%,62%)"/><text x="1054.6" y="75"></text></g>
+<g><title>router.Router(main.App).findHandler (8924040 samples, 0.46%)</title><rect x="1053.2" y="128" width="7.4" height="15" fill="hsl(14,80%,62%)"/><text x="1055.2" y="139"></text></g>
+<g><title>heap.ArenaAllocator.alloc (1784808 samples, 0.09%)</title><rect x="1053.2" y="112" width="1.5" height="15" fill="hsl(15,80%,62%)"/><text x="1055.2" y="123"></text></g>
+<g><title>router.Router(main.App).matchRecursive (7139232 samples, 0.37%)</title><rect x="1054.7" y="112" width="5.9" height="15" fill="hsl(0,80%,62%)"/><text x="1056.7" y="123"></text></g>
+<g><title>router.Router(main.App).matchRecursive (7139232 samples, 0.37%)</title><rect x="1054.7" y="96" width="5.9" height="15" fill="hsl(0,80%,62%)"/><text x="1056.7" y="107"></text></g>
+<g><title>hash_map.Custom([]const u8,[]const u8,hash_map.StringContext,80).putContext (7139232 samples, 0.37%)</title><rect x="1054.7" y="80" width="5.9" height="15" fill="hsl(38,80%,62%)"/><text x="1056.7" y="91"></text></g>
+<g><title>hash_map.Custom([]const u8,?[]const u8,hash_map.StringContext,80).grow (7139232 samples, 0.37%)</title><rect x="1054.7" y="64" width="5.9" height="15" fill="hsl(26,80%,62%)"/><text x="1056.7" y="75"></text></g>
+<g><title>heap.ArenaAllocator.alloc (7139232 samples, 0.37%)</title><rect x="1054.7" y="48" width="5.9" height="15" fill="hsl(15,80%,62%)"/><text x="1056.7" y="59"></text></g>
+<g><title>malloc (653374398 samples, 33.71%)</title><rect x="1060.6" y="240" width="539.4" height="15" fill="hsl(44,80%,62%)"/><text x="1062.6" y="251">malloc</text></g>
+<g><title>coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (653374398 samples, 33.71%)</title><rect x="1060.6" y="224" width="539.4" height="15" fill="hsl(41,80%,62%)"/><text x="1062.6" y="235">coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn</text></g>
+<g><title>task.AnyTask.startFn (653374398 samples, 33.71%)</title><rect x="1060.6" y="208" width="539.4" height="15" fill="hsl(8,80%,62%)"/><text x="1062.6" y="219">task.AnyTask.startFn</text></g>
+<g><title>group.Group.spawnInto__func_2363.Wrapper.start (6328245 samples, 0.33%)</title><rect x="1060.6" y="192" width="5.2" height="15" fill="hsl(21,80%,62%)"/><text x="1062.6" y="203"></text></g>
+<g><title>server.Server(main.App).handleConnectionWrapper (6328245 samples, 0.33%)</title><rect x="1060.6" y="176" width="5.2" height="15" fill="hsl(0,80%,62%)"/><text x="1062.6" y="187"></text></g>
+<g><title>server.h2.Engine(main.App).serve (6328245 samples, 0.33%)</title><rect x="1060.6" y="160" width="5.2" height="15" fill="hsl(53,80%,62%)"/><text x="1062.6" y="171"></text></g>
+<g><title>Io.Reader.defaultReadVec (1485049 samples, 0.08%)</title><rect x="1060.6" y="144" width="1.2" height="15" fill="hsl(46,80%,62%)"/><text x="1062.6" y="155"></text></g>
+<g><title>dusty_tls.Connection.Reader.stream (1485049 samples, 0.08%)</title><rect x="1060.6" y="128" width="1.2" height="15" fill="hsl(56,80%,62%)"/><text x="1062.6" y="139"></text></g>
+<g><title>SSL_read (1485049 samples, 0.08%)</title><rect x="1060.6" y="112" width="1.2" height="15" fill="hsl(23,80%,62%)"/><text x="1062.6" y="123"></text></g>
+<g><title>ssl_read_impl(bssl::SSLImpl*) (1485049 samples, 0.08%)</title><rect x="1060.6" y="96" width="1.2" height="15" fill="hsl(11,80%,62%)"/><text x="1062.6" y="107"></text></g>
+<g><title>bssl::ssl_handle_open_record(bssl::SSLImpl*, bool*, bssl::ssl_open_record_t, unsigned long, unsigned char) (1485049 samples, 0.08%)</title><rect x="1060.6" y="80" width="1.2" height="15" fill="hsl(39,80%,62%)"/><text x="1062.6" y="91"></text></g>
+<g><title>bssl::ssl_read_buffer_extend_to(bssl::SSLImpl*, unsigned long) (1485049 samples, 0.08%)</title><rect x="1060.6" y="64" width="1.2" height="15" fill="hsl(37,80%,62%)"/><text x="1062.6" y="75"></text></g>
+<g><title>__libc_malloc (1485049 samples, 0.08%)</title><rect x="1060.6" y="48" width="1.2" height="15" fill="hsl(49,80%,62%)"/><text x="1062.6" y="59"></text></g>
+<g><title>nghttp2_session_mem_recv2 (4843196 samples, 0.25%)</title><rect x="1061.8" y="144" width="4.0" height="15" fill="hsl(43,80%,62%)"/><text x="1063.8" y="155"></text></g>
+<g><title>nghttp2_hd_inflate_hd_nv (1574460 samples, 0.08%)</title><rect x="1061.8" y="128" width="1.3" height="15" fill="hsl(42,80%,62%)"/><text x="1063.8" y="139"></text></g>
+<g><title>__libc_malloc (1574460 samples, 0.08%)</title><rect x="1061.8" y="112" width="1.3" height="15" fill="hsl(49,80%,62%)"/><text x="1063.8" y="123"></text></g>
+<g><title>nghttp2_session_on_request_headers_received (3268736 samples, 0.17%)</title><rect x="1063.1" y="128" width="2.7" height="15" fill="hsl(9,80%,62%)"/><text x="1065.1" y="139"></text></g>
+<g><title>__libc_malloc (3268736 samples, 0.17%)</title><rect x="1063.1" y="112" width="2.7" height="15" fill="hsl(49,80%,62%)"/><text x="1065.1" y="123"></text></g>
+<g><title>group.Group.spawnInto__func_2457.Wrapper.start (17377814 samples, 0.90%)</title><rect x="1065.8" y="192" width="14.3" height="15" fill="hsl(49,80%,62%)"/><text x="1067.8" y="203"></text></g>
+<g><title>server.h2.Engine(main.App).runStream (17377814 samples, 0.90%)</title><rect x="1065.8" y="176" width="14.3" height="15" fill="hsl(57,80%,62%)"/><text x="1067.8" y="187"></text></g>
+<g><title>server.h2.Engine(main.App).serveStream (17377814 samples, 0.90%)</title><rect x="1065.8" y="160" width="14.3" height="15" fill="hsl(13,80%,62%)"/><text x="1067.8" y="171"></text></g>
+<g><title>response.Response.write (16446710 samples, 0.85%)</title><rect x="1065.8" y="144" width="13.6" height="15" fill="hsl(51,80%,62%)"/><text x="1067.8" y="155"></text></g>
+<g><title>Io.Writer.defaultRebase (4821800 samples, 0.25%)</title><rect x="1065.8" y="128" width="4.0" height="15" fill="hsl(16,80%,62%)"/><text x="1067.8" y="139"></text></g>
+<g><title>server.h2.Engine(main.App).StreamSink.drain (4821800 samples, 0.25%)</title><rect x="1065.8" y="112" width="4.0" height="15" fill="hsl(9,80%,62%)"/><text x="1067.8" y="123"></text></g>
+<g><title>nghttp2_submit_response2 (4821800 samples, 0.25%)</title><rect x="1065.8" y="96" width="4.0" height="15" fill="hsl(30,80%,62%)"/><text x="1067.8" y="107"></text></g>
+<g><title>__libc_malloc (1222400 samples, 0.06%)</title><rect x="1065.8" y="80" width="1.0" height="15" fill="hsl(49,80%,62%)"/><text x="1067.8" y="91"></text></g>
+<g><title>submit_headers_shared_nva (3599400 samples, 0.19%)</title><rect x="1066.8" y="80" width="3.0" height="15" fill="hsl(11,80%,62%)"/><text x="1068.8" y="91"></text></g>
+<g><title>__libc_malloc (3599400 samples, 0.19%)</title><rect x="1066.8" y="64" width="3.0" height="15" fill="hsl(49,80%,62%)"/><text x="1068.8" y="75"></text></g>
+<g><title>server.h2.Engine(main.App).StreamSink.flushFn (11624910 samples, 0.60%)</title><rect x="1069.8" y="128" width="9.6" height="15" fill="hsl(29,80%,62%)"/><text x="1071.8" y="139"></text></g>
+<g><title>nghttp2_submit_response2 (11624910 samples, 0.60%)</title><rect x="1069.8" y="112" width="9.6" height="15" fill="hsl(30,80%,62%)"/><text x="1071.8" y="123"></text></g>
+<g><title>__libc_malloc (2863520 samples, 0.15%)</title><rect x="1069.8" y="96" width="2.4" height="15" fill="hsl(49,80%,62%)"/><text x="1071.8" y="107"></text></g>
+<g><title>submit_headers_shared_nva (8761390 samples, 0.45%)</title><rect x="1072.1" y="96" width="7.2" height="15" fill="hsl(11,80%,62%)"/><text x="1074.1" y="107"></text></g>
+<g><title>__libc_malloc (8761390 samples, 0.45%)</title><rect x="1072.1" y="80" width="7.2" height="15" fill="hsl(49,80%,62%)"/><text x="1074.1" y="91"></text></g>
+<g><title>server.Server(main.App).dispatch (931104 samples, 0.05%)</title><rect x="1079.4" y="144" width="0.8" height="15" fill="hsl(17,80%,62%)"/><text x="1081.4" y="155"></text></g>
+<g><title>middleware.Chain(main.App).run (931104 samples, 0.05%)</title><rect x="1079.4" y="128" width="0.8" height="15" fill="hsl(29,80%,62%)"/><text x="1081.4" y="139"></text></g>
+<g><title>middleware.Chain(main.App).call (931104 samples, 0.05%)</title><rect x="1079.4" y="112" width="0.8" height="15" fill="hsl(46,80%,62%)"/><text x="1081.4" y="123"></text></g>
+<g><title>router.Router(main.App).plainAction__struct_6332.handle (931104 samples, 0.05%)</title><rect x="1079.4" y="96" width="0.8" height="15" fill="hsl(25,80%,62%)"/><text x="1081.4" y="107"></text></g>
+<g><title>response.Response.sendFile (931104 samples, 0.05%)</title><rect x="1079.4" y="80" width="0.8" height="15" fill="hsl(36,80%,62%)"/><text x="1081.4" y="91"></text></g>
+<g><title>io.dirOpenFileImpl (931104 samples, 0.05%)</title><rect x="1079.4" y="64" width="0.8" height="15" fill="hsl(23,80%,62%)"/><text x="1081.4" y="75"></text></g>
+<g><title>common.waitForIo (931104 samples, 0.05%)</title><rect x="1079.4" y="48" width="0.8" height="15" fill="hsl(57,80%,62%)"/><text x="1081.4" y="59"></text></g>
+<g><title>__libc_malloc (931104 samples, 0.05%)</title><rect x="1079.4" y="32" width="0.8" height="15" fill="hsl(49,80%,62%)"/><text x="1081.4" y="43"></text></g>
+<g><title>group.Group.spawnInto__func_2472.Wrapper.start (629668339 samples, 32.49%)</title><rect x="1080.1" y="192" width="519.9" height="15" fill="hsl(28,80%,62%)"/><text x="1082.1" y="203">group.Group.spawnInto__func_2472.Wrapper.start</text></g>
+<g><title>__libc_malloc (188837880 samples, 9.74%)</title><rect x="1080.1" y="176" width="155.9" height="15" fill="hsl(49,80%,62%)"/><text x="1082.1" y="187">__libc_malloc</text></g>
+<g><title>server.h2.Engine(main.App).writerLoop (440830459 samples, 22.75%)</title><rect x="1236.0" y="176" width="364.0" height="15" fill="hsl(43,80%,62%)"/><text x="1238.0" y="187">server.h2.Engine(main.App).writerLoop</text></g>
+<g><title>Io.Writer.defaultFlush (170344107 samples, 8.79%)</title><rect x="1236.0" y="160" width="140.6" height="15" fill="hsl(56,80%,62%)"/><text x="1238.0" y="171">Io.Writer.defaultFlu</text></g>
+<g><title>dusty_tls.Connection.Writer.drain (170344107 samples, 8.79%)</title><rect x="1236.0" y="144" width="140.6" height="15" fill="hsl(8,80%,62%)"/><text x="1238.0" y="155">dusty_tls.Connection</text></g>
+<g><title>dusty_tls.Connection.Writer.writeAll (170344107 samples, 8.79%)</title><rect x="1236.0" y="128" width="140.6" height="15" fill="hsl(18,80%,62%)"/><text x="1238.0" y="139">dusty_tls.Connection</text></g>
+<g><title>SSL_write (170344107 samples, 8.79%)</title><rect x="1236.0" y="112" width="140.6" height="15" fill="hsl(4,80%,62%)"/><text x="1238.0" y="123">SSL_write</text></g>
+<g><title>bssl::tls_write_app_data(bssl::SSLImpl*, bool*, unsigned long*, bssl::Span&lt;unsigned char const, 18446744073709551615ul&gt;) (170344107 samples, 8.79%)</title><rect x="1236.0" y="96" width="140.6" height="15" fill="hsl(20,80%,62%)"/><text x="1238.0" y="107">bssl::tls_write_app_</text></g>
+<g><title>bssl::do_tls_write(bssl::SSLImpl*, unsigned long*, unsigned char, bssl::Span&lt;unsigned char const, 18446744073709551615ul&gt;) (170344107 samples, 8.79%)</title><rect x="1236.0" y="80" width="140.6" height="15" fill="hsl(14,80%,62%)"/><text x="1238.0" y="91">bssl::do_tls_write(b</text></g>
+<g><title>__libc_malloc (166339755 samples, 8.58%)</title><rect x="1236.0" y="64" width="137.3" height="15" fill="hsl(49,80%,62%)"/><text x="1238.0" y="75">__libc_malloc</text></g>
+<g><title>bssl::ssl_write_buffer_flush(bssl::SSLImpl*) (4004352 samples, 0.21%)</title><rect x="1373.4" y="64" width="3.3" height="15" fill="hsl(23,80%,62%)"/><text x="1375.4" y="75"></text></g>
+<g><title>BIO_write_ex (4004352 samples, 0.21%)</title><rect x="1373.4" y="48" width="3.3" height="15" fill="hsl(8,80%,62%)"/><text x="1375.4" y="59"></text></g>
+<g><title>__libc_malloc (4004352 samples, 0.21%)</title><rect x="1373.4" y="32" width="3.3" height="15" fill="hsl(49,80%,62%)"/><text x="1375.4" y="43"></text></g>
+<g><title>dusty_tls.Connection.Writer.drain (266294832 samples, 13.74%)</title><rect x="1376.7" y="160" width="219.9" height="15" fill="hsl(8,80%,62%)"/><text x="1378.7" y="171">dusty_tls.Connection.Writer.dra</text></g>
+<g><title>dusty_tls.Connection.Writer.writeAll (266294832 samples, 13.74%)</title><rect x="1376.7" y="144" width="219.9" height="15" fill="hsl(18,80%,62%)"/><text x="1378.7" y="155">dusty_tls.Connection.Writer.wri</text></g>
+<g><title>SSL_write (266294832 samples, 13.74%)</title><rect x="1376.7" y="128" width="219.9" height="15" fill="hsl(4,80%,62%)"/><text x="1378.7" y="139">SSL_write</text></g>
+<g><title>bssl::tls_write_app_data(bssl::SSLImpl*, bool*, unsigned long*, bssl::Span&lt;unsigned char const, 18446744073709551615ul&gt;) (266294832 samples, 13.74%)</title><rect x="1376.7" y="112" width="219.9" height="15" fill="hsl(20,80%,62%)"/><text x="1378.7" y="123">bssl::tls_write_app_data(bssl::</text></g>
+<g><title>bssl::do_tls_write(bssl::SSLImpl*, unsigned long*, unsigned char, bssl::Span&lt;unsigned char const, 18446744073709551615ul&gt;) (266294832 samples, 13.74%)</title><rect x="1376.7" y="96" width="219.9" height="15" fill="hsl(14,80%,62%)"/><text x="1378.7" y="107">bssl::do_tls_write(bssl::SSLImp</text></g>
+<g><title>__libc_malloc (250395696 samples, 12.92%)</title><rect x="1376.7" y="80" width="206.7" height="15" fill="hsl(49,80%,62%)"/><text x="1378.7" y="91">__libc_malloc</text></g>
+<g><title>bssl::ssl_write_buffer_flush(bssl::SSLImpl*) (15899136 samples, 0.82%)</title><rect x="1583.4" y="80" width="13.1" height="15" fill="hsl(23,80%,62%)"/><text x="1585.4" y="91"></text></g>
+<g><title>BIO_write_ex (15899136 samples, 0.82%)</title><rect x="1583.4" y="64" width="13.1" height="15" fill="hsl(8,80%,62%)"/><text x="1585.4" y="75"></text></g>
+<g><title>__libc_malloc (15899136 samples, 0.82%)</title><rect x="1583.4" y="48" width="13.1" height="15" fill="hsl(49,80%,62%)"/><text x="1585.4" y="59"></text></g>
+<g><title>nghttp2_session_mem_send2 (4191520 samples, 0.22%)</title><rect x="1596.5" y="160" width="3.5" height="15" fill="hsl(1,80%,62%)"/><text x="1598.5" y="171"></text></g>
+<g><title>session_after_frame_sent1 (4085920 samples, 0.21%)</title><rect x="1596.6" y="144" width="3.4" height="15" fill="hsl(27,80%,62%)"/><text x="1598.6" y="155"></text></g>
+<g><title>__libc_malloc (4085920 samples, 0.21%)</title><rect x="1596.6" y="128" width="3.4" height="15" fill="hsl(49,80%,62%)"/><text x="1598.6" y="139"></text></g>
+</svg>

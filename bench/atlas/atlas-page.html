@@ -1,0 +1,223 @@
+<title>__TITLE__</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: a profiler's index. A sidebar of S2 items and their cells, and a detail pane with
+   the numbers first, then the flame graph, which takes the full width. */
+:root {
+  --bg: #f4f6f8; --panel: #ffffff; --ink: #18212b; --muted: #5b6875; --line: #d9e0e6;
+  --accent: #1f5fa8; --accent-soft: #e3edf8;
+  --f-kernel: #7d8fa3; --f-crypto: #8a5cc2; --f-protocol: #1f8a87; --f-payload: #c9822a; --f-memory: #c4506b; --f-anole: #4f8f3a;
+  --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0f141a; --panel: #161d25; --ink: #e3e9ef; --muted: #93a1ae; --line: #2a3541;
+  --accent: #6ea8e8; --accent-soft: #1b2a3b;
+  --f-kernel: #8ea0b4; --f-crypto: #a883dc; --f-protocol: #3fb3ae; --f-payload: #e0a04e; --f-memory: #e07590; --f-anole: #74b85c;
+  color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0f141a; --panel: #161d25; --ink: #e3e9ef; --muted: #93a1ae; --line: #2a3541;
+  --accent: #6ea8e8; --accent-soft: #1b2a3b;
+  --f-kernel: #8ea0b4; --f-crypto: #a883dc; --f-protocol: #3fb3ae; --f-payload: #e0a04e; --f-memory: #e07590; --f-anole: #74b85c;
+  color-scheme: dark }
+body { background: var(--bg); color: var(--ink); font-family: var(--body); font-size: 14px; line-height: 1.5; }
+.wrap { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 24px 48px; max-width: 1500px; margin: 0 auto; display: grid; gap: 20px; }
+header { display: grid; gap: 8px; }
+h1 { font-family: var(--display); font-weight: 700; font-size: 28px; line-height: 1.15; margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+.sub { color: var(--muted); max-width: 75ch; margin: 0; }
+.keys { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.keys span { font-family: var(--mono); font-size: 11.5px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px; max-width: 100%; overflow-wrap: anywhere; }
+.layout { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 860px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+nav { display: grid; gap: 14px; position: sticky; top: calc(env(safe-area-inset-top, 0px) + 12px); max-height: calc(100vh - 24px); overflow: auto; }
+@media (max-width: 860px) { nav { position: static; max-height: none; } }
+.grp h2 { font-family: var(--display); font-size: 12px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 4px; }
+.cellbtn { display: grid; grid-template-columns: 1fr auto; gap: 8px; width: 100%; text-align: left; background: none; border: 1px solid transparent; border-radius: 6px; padding: 5px 8px; color: var(--ink); font: inherit; cursor: pointer; }
+.cellbtn:hover { border-color: var(--line); }
+.cellbtn[aria-current="true"] { background: var(--accent-soft); border-color: var(--accent); }
+.cellbtn:focus-visible, .seg button:focus-visible, .tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.cellbtn .n { font-family: var(--mono); font-size: 12px; }
+.cellbtn .r { font-family: var(--mono); font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+main { display: grid; gap: 16px; min-width: 0; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; min-width: 0; }
+.head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px 16px; justify-content: space-between; }
+.head h2 { font-family: var(--mono); font-size: 20px; font-weight: 500; margin: 0; }
+.group-label { font-family: var(--display); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent); }
+.finding { margin: 8px 0 0; max-width: 90ch; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg button, .tabs button { font: inherit; font-size: 13px; background: none; border: 0; color: var(--muted); padding: 5px 12px; cursor: pointer; }
+.seg button[aria-pressed="true"], .tabs button[aria-selected="true"] { background: var(--accent); color: var(--panel); }
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.metric { background: var(--panel); padding: 10px 12px; display: grid; gap: 2px; }
+.metric .l { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+.metric .v { font-family: var(--mono); font-size: 18px; font-variant-numeric: tabular-nums; }
+.metric .c { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+@media (max-width: 1100px) { .two { grid-template-columns: minmax(0, 1fr); } }
+h3 { font-family: var(--display); font-size: 13px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 10px; }
+.bars { display: grid; gap: 4px; }
+.bar { display: grid; grid-template-columns: 150px minmax(0, 1fr) 48px; gap: 8px; align-items: center; font-size: 12.5px; }
+.bar .track { height: 10px; background: var(--bg); border-radius: 2px; overflow: hidden; }
+.bar .fill { height: 100%; border-radius: 2px; }
+.bar .p { font-family: var(--mono); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11.5px; color: var(--muted); margin-top: 10px; }
+.legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+ol.sym { margin: 0; padding-left: 22px; display: grid; gap: 4px; }
+ol.sym li { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+ol.sym b { font-weight: 500; color: var(--accent); font-variant-numeric: tabular-nums; }
+.tbl { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+th { font-weight: 500; color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+td.num { font-family: var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+.stack { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+svg.spark { width: 100%; height: 80px; display: block; }
+.tabs { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; flex-wrap: wrap; }
+.tabs button[disabled] { opacity: 0.4; cursor: default; }
+.flame { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; margin-top: 10px; background: var(--panel); min-height: 120px; }
+.flame svg { display: block; }
+.flame svg > rect:first-child { fill: var(--panel); }
+.flame svg > text { fill: var(--ink); }
+.flame .empty { padding: 24px; color: var(--muted); }
+.flamehead { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+.hint { color: var(--muted); font-size: 12px; }
+@media (prefers-reduced-motion: no-preference) { .fill { transition: width .25s ease; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>__TITLE__</h1>
+    <p class="sub">__SUB__</p>
+    <div class="keys" id="keys"></div>
+  </header>
+  <div class="layout">
+    <nav id="nav" aria-label="Scenarios"></nav>
+    <main id="main"></main>
+  </div>
+</div>
+
+<script id="data" type="application/json">__DATA__</script>
+<script>
+const D = JSON.parse(document.getElementById("data").textContent);
+const FAM = {}; for (const [f, cs] of Object.entries(D.family)) for (const c of cs) FAM[c] = f;
+const byKey = {}; for (const r of D.rows) byKey[r.cell + "--" + r.backend] = r;
+const groupOf = {}; for (const [g, cells, text] of D.groups) for (const c of cells) groupOf[c] = [g, text];
+const state = { cell: D.groups[0][1][0], backend: "uring", flame: "cpu" };
+const fmt = (v, d = 0) => v == null ? "–" : Number(v).toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d });
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const BE = { epoll: "epoll", uring: "io_uring" };
+
+document.getElementById("keys").innerHTML = D.key.map(l => `<span>${esc(l)}</span>`).join("");
+
+function nav() {
+  document.getElementById("nav").innerHTML = D.groups.map(([g, cells]) => `
+    <div class="grp"><h2>${esc(g)}</h2>${cells.map(c => {
+      const e = byKey[c + "--epoll"], u = byKey[c + "--uring"];
+      const rate = r => r && r.count && r.count.max_rps ? (r.count.max_rps >= 1000 ? fmt(r.count.max_rps / 1000) + "k" : fmt(r.count.max_rps)) : (r && r.rss.peak ? fmt(r.rss.peak) + " MB" : "–");
+      return `<button class="cellbtn" data-cell="${c}" aria-current="${c === state.cell}"><span class="n">${c}</span><span class="r">${rate(e)} / ${rate(u)}</span></button>`;
+    }).join("")}</div>`).join("") +
+    `<p class="note">Right column: max req/s on epoll / io_uring (SSE: peak RSS).</p>`;
+  for (const b of document.querySelectorAll(".cellbtn")) b.onclick = () => { state.cell = b.dataset.cell; go(); };
+}
+
+function spark(r) {
+  const t = r.rss.t, m = r.rss.mb; if (!t || t.length < 2) return "";
+  const W = 600, H = 80, P = 4, xm = t[t.length - 1] || 1, ym = Math.max(...m) || 1;
+  const pts = t.map((x, i) => [P + (W - 2 * P) * x / xm, H - P - (H - 2 * P) * m[i] / ym]);
+  const line = pts.map(p => p.map(v => v.toFixed(1)).join(",")).join(" ");
+  const area = `${P},${H - P} ${line} ${pts[pts.length - 1][0].toFixed(1)},${H - P}`;
+  const last = pts.reduce((a, p, i) => m[i] === ym ? p : a, pts[0]);
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="RSS over time, peak ${fmt(ym, 1)} MB">
+    <line x1="${P}" x2="${W - P}" y1="${H - P}" y2="${H - P}" stroke="var(--line)"/>
+    <polygon points="${area}" fill="var(--accent-soft)"/><polyline points="${line}" fill="none" stroke="var(--accent)" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+    <circle cx="${last[0].toFixed(1)}" cy="${last[1].toFixed(1)}" r="3" fill="var(--accent)"/></svg>
+    <p class="note">VmRSS every second over the server's life (${fmt(xm)} s); peak ${fmt(ym, 1)} MB, cgroup peak ${fmt(r.rss.cg_peak, 1)} MB.</p>`;
+}
+
+function detail() {
+  const r = byKey[state.cell + "--" + state.backend], other = byKey[state.cell + "--" + (state.backend === "epoll" ? "uring" : "epoll")];
+  const [g, text] = groupOf[state.cell]; const c = r.count || {};
+  const sse = state.cell.startsWith("sse");
+  const metric = (l, v, cmp) => `<div class="metric"><span class="l">${l}</span><span class="v">${v}</span>${cmp ? `<span class="c">${cmp}</span>` : ""}</div>`;
+  const oc = other && other.count || {};
+  const vs = (k, d = 0) => oc[k] != null ? `${BE[other.backend]} ${fmt(oc[k], d)}` : "";
+  const metrics = sse ? [
+    metric("Subscribers", fmt(r.subscribers)),
+    metric("Settled RSS", fmt(r.rss.settled, 1) + " MB", `peak ${fmt(r.rss.peak, 1)} MB during the connection ramp`),
+    metric("RSS / subscriber", r.subscribers ? fmt((r.rss.settled - (r.rss.start || 0)) * 1024 / r.subscribers, 1) + " KB" : "–", "settled RSS less the idle server's, per subscriber"),
+  ] : [
+    metric(state.cell === "net-tcp" ? "Max msg/s" : "Max req/s", fmt(c.max_rps), vs("max_rps")),
+    metric("ins:u / req", fmt(c.instr_u_req), vs("instr_u_req")),
+    metric("ins:k / req", fmt(c.instr_k_req), vs("instr_k_req")),
+    metric("IPC (user)", fmt(c.ipc_u, 2), vs("ipc_u", 2)),
+    metric("Page faults / req", fmt(c.pf_req, 3), vs("pf_req", 3)),
+    metric("Ctx switches / req", fmt(c.cs_req, 3), vs("cs_req", 3)),
+    metric("Peak RSS", fmt(r.rss.peak, 1) + " MB", other ? `${BE[other.backend]} ${fmt(other.rss.peak, 1)} MB` : ""),
+  ];
+  const comps = Object.entries(r.components || {}).filter(([, p]) => p >= 0.5);
+  const bars = comps.map(([k, p]) => `<div class="bar"><span>${esc(k)}</span><span class="track"><span class="fill" style="display:block;width:${Math.min(100, p * 2)}%;background:var(--f-${FAM[k] || "anole"})"></span></span><span class="p">${fmt(p, 1)}%</span></div>`).join("");
+  const legend = Object.keys(D.family).map(f => `<span><i style="background:var(--f-${f})"></i>${f}</span>`).join("");
+  const syms = (r.top_self || []).map(([s, p]) => `<li><b>${fmt(p, 1)}%</b> ${esc(s.replace(/_\[k\]$/, " [kernel]"))}</li>`).join("");
+  const pr = (r.mem && r.mem.per_req) || {};
+  const memrows = Object.entries(pr).filter(([, v]) => v.bytes || v.calls).sort((a, b) => (b[1].bytes || 0) - (a[1].bytes || 0))
+    .map(([k, v]) => `<tr><td>${esc(k)}</td><td class="num">${v.bytes ? fmt(v.bytes) + " B" : ""}</td><td class="num">${v.calls ? fmt(v.calls, 2) : ""}</td></tr>`).join("");
+  const unit = sse ? "subscriber" : state.cell === "net-tcp" ? "message" : "request";
+  const div = r.mem && r.mem.window_requests;
+  const allocs = ((r.mem && r.mem.top_alloc) || []).slice(0, 5).map(([s, b]) => `<tr><td class="stack">${esc(s.replace(/;/g, " ← ").replace(/ ← ([^←]+)$/, " ← $1"))}</td><td class="num">${div ? fmt(b / div) + " B" : ""}</td></tr>`).join("");
+  const held = r.probes_held ? `malloc held at the window's end: ${r.mem.held_truncated ? "at least " : ""}${fmt(r.probes_held.bytes / 1024)} KB in ${fmt(r.probes_held.blocks)} blocks${r.mem.held_truncated ? " (bpftrace's map filled at 4,096 entries)" : ""}.` : "";
+  const off = (r.offcpu || []).map(([k, p]) => `<li><b>${fmt(p, 0)}%</b> ${esc(k)}</li>`).join("");
+  const kinds = [["cpu", "CPU"], ["offcpu", "Off-CPU"], ["mem_alloc", "Bytes allocated"], ["mem_held", "malloc held"]];
+  document.getElementById("main").innerHTML = `
+  <section class="panel">
+    <div class="head"><div><div class="group-label">${esc(g)}</div><h2>${esc(state.cell)}</h2></div>
+      <div class="seg" role="group" aria-label="Backend">${["epoll", "uring"].map(b => `<button data-be="${b}" aria-pressed="${b === state.backend}">${BE[b]}</button>`).join("")}</div></div>
+    <p class="finding">${esc(text)}</p>
+  </section>
+  <section class="metrics">${metrics.join("")}</section>
+  <div class="two">
+    <section class="panel"><h3>CPU by component (self time at 60% load)</h3>${bars ? `<div class="bars">${bars}</div><div class="legend">${legend}</div><p class="note">Kernel share of samples: ${fmt(r.kernel_pct, 0)}%. Bars are drawn at twice their percentage.</p>` : `<p class="note">No CPU profile: the SSE cells hold idle subscribers and record memory only.</p>`}</section>
+    <section class="panel"><h3>Top-5 self-time symbols</h3>${syms ? `<ol class="sym">${syms}</ol>` : `<p class="note">None for this cell.</p>`}
+      <h3 style="margin-top:16px">Off-CPU, top waits</h3>${off ? `<ol class="sym">${off}</ol>` : `<p class="note">None recorded.</p>`}</section>
+  </div>
+  <div class="two">
+    <section class="panel"><h3>Memory per ${unit}</h3>${memrows ? `<div class="tbl"><table><thead><tr><th>allocator</th><th style="text-align:right">bytes</th><th style="text-align:right">calls</th></tr></thead><tbody>${memrows}</tbody></table></div>` : `<p class="note">No allocations in the window.</p>`}
+      ${allocs ? `<h3 style="margin-top:16px">Top allocation stacks</h3><div class="tbl"><table><tbody>${allocs}</tbody></table></div>` : ""}<p class="note">${held}</p></section>
+    <section class="panel"><h3>RSS over time</h3>${spark(r)}</section>
+  </div>
+  <section class="panel">
+    <div class="flamehead"><div class="tabs" role="tablist" aria-label="Flame graph">${kinds.map(([k, l]) => `<button role="tab" data-k="${k}" aria-selected="${k === state.flame}" ${r.flames[k] ? "" : "disabled"}>${l}</button>`).join("")}</div>
+      <span class="hint">Hover a frame for its samples and share; scroll sideways on narrow screens.</span></div>
+    <div class="flame" id="flame"><div class="empty">Loading…</div></div>
+  </section>`;
+  for (const b of document.querySelectorAll(".seg button")) b.onclick = () => { state.backend = b.dataset.be; go(); };
+  for (const b of document.querySelectorAll(".tabs button")) b.onclick = () => { if (!b.disabled) { state.flame = b.dataset.k; go(); } };
+  loadFlame(r);
+}
+
+const cache = {};
+async function loadFlame(r) {
+  let k = state.flame; if (!r.flames[k]) k = Object.keys(r.flames)[0];
+  const el = document.getElementById("flame");
+  if (!k) { el.innerHTML = `<div class="empty">No flame graph for this cell.</div>`; return; }
+  const url = `${r.backend}/${r.cell}/${r.flames[k]}`;
+  try {
+    cache[url] = cache[url] || await fetch(url).then(x => { if (!x.ok) throw new Error(x.status); return x.text(); });
+    if (document.getElementById("flame") === el) el.innerHTML = cache[url];
+  } catch (e) { el.innerHTML = `<div class="empty">The flame graph ${esc(url)} could not be loaded (${esc(e.message)}).</div>`; }
+}
+
+function go() {
+  try { history.replaceState(null, "", "#" + state.cell + "--" + state.backend); } catch (e) {}
+  nav(); detail();
+}
+function fromHash() {
+  const h = location.hash.slice(1).split("--");
+  if (h.length === 2 && byKey[h[0] + "--" + h[1]]) { state.cell = h[0]; state.backend = h[1]; }
+}
+window.addEventListener("hashchange", () => { fromHash(); nav(); detail(); });
+fromHash(); nav(); detail();
+</script>

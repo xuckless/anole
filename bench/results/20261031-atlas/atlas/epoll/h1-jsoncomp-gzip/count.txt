@@ -1,0 +1,30 @@
+starting benchmark...
+spawning thread #0: 32 total client(s). 75000 total requests
+spawning thread #1: 32 total client(s). 75000 total requests
+spawning thread #2: 32 total client(s). 75000 total requests
+spawning thread #3: 32 total client(s). 75000 total requests
+spawning thread #4: 32 total client(s). 75000 total requests
+spawning thread #5: 32 total client(s). 75000 total requests
+spawning thread #6: 32 total client(s). 75000 total requests
+spawning thread #7: 32 total client(s). 75000 total requests
+Application protocol: http/1.1
+progress: 10% done
+progress: 20% done
+progress: 30% done
+progress: 40% done
+progress: 50% done
+progress: 60% done
+progress: 70% done
+progress: 80% done
+progress: 90% done
+progress: 100% done
+
+finished in 23.90s, 25102.64 req/s, 40.53MB/s
+requests: 600000 total, 600000 started, 600000 done, 600000 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 600000 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 968.74MB (1015800000) total, 76.10MB (79800000) headers (space savings 0.00%), 870.32MB (912600000) data
+                     min         max         mean         sd        +/- sd
+time for request:      267us     13.25ms     10.18ms       243us    99.38%
+time for connect:       39us     37.89ms     19.73ms     10.14ms    77.34%
+time to 1st byte:      307us     47.49ms     24.69ms     11.91ms    75.78%
+req/s           :      98.07       98.38       98.18        0.08    67.97%

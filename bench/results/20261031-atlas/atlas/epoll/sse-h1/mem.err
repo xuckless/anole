@@ -1,0 +1,9 @@
+  24531 uretprobe:/proc/1760654/root/lib/x86_64-linux-gnu/libc.so.6:malloc /pid == 1760654 && @sz[tid]/ { @live[retval] = @sz[tid]; @lst[retval] = ustack(perf, 48); delete(@sz, tid); }
+  24531 Additional Info - helper: map_update_elem, retcode: -7
+  14276 /out/mem.bt:2:99-123: WARNING: Map full; can't update element. Try increasing max_map_keys config or manually setting the max entries in a map declaration e.g. `let @a = hash(5000)`
+  14276                                                                                                   ~~~~~~~~~~~~~~~~~~~~~~~~
+  10255 /out/mem.bt:2:125-156: WARNING: Map full; can't update element. Try increasing max_map_keys config or manually setting the max entries in a map declaration e.g. `let @a = hash(5000)`
+  10255                                                                                                                             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      1 WARNING: Total lost event count: 19119
+      1 Lost 19119 events
+      1 Attached 14 probes

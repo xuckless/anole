@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="272" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fff"/><text x="4" y="13">Bytes allocated per stack: h1-jsoncomp-zstd (epoll, 1 executor) (10752861440 samples)</text>
+<g><title>arena (4147588352 samples, 38.57%)</title><rect x="0.0" y="256" width="617.2" height="15" fill="hsl(33,80%,62%)"/><text x="2.0" y="267">arena</text></g>
+<g><title>coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (4147588352 samples, 38.57%)</title><rect x="0.0" y="240" width="617.2" height="15" fill="hsl(41,80%,62%)"/><text x="2.0" y="251">coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn</text></g>
+<g><title>task.AnyTask.startFn (4147588352 samples, 38.57%)</title><rect x="0.0" y="224" width="617.2" height="15" fill="hsl(8,80%,62%)"/><text x="2.0" y="235">task.AnyTask.startFn</text></g>
+<g><title>group.Group.spawnInto__func_2363.Wrapper.start (4147588352 samples, 38.57%)</title><rect x="0.0" y="208" width="617.2" height="15" fill="hsl(21,80%,62%)"/><text x="2.0" y="219">group.Group.spawnInto__func_2363.Wrapper.start</text></g>
+<g><title>server.Server(main.App).handleConnectionWrapper (4147588352 samples, 38.57%)</title><rect x="0.0" y="192" width="617.2" height="15" fill="hsl(0,80%,62%)"/><text x="2.0" y="203">server.Server(main.App).handleConnectionWrapper</text></g>
+<g><title>server.Server(main.App).handleRequests (4147588352 samples, 38.57%)</title><rect x="0.0" y="176" width="617.2" height="15" fill="hsl(1,80%,62%)"/><text x="2.0" y="187">server.Server(main.App).handleRequests</text></g>
+<g><title>heap.ArenaAllocator.alloc (14327808 samples, 0.13%)</title><rect x="0.0" y="160" width="2.1" height="15" fill="hsl(15,80%,62%)"/><text x="2.0" y="171"></text></g>
+<g><title>middleware.Chain(main.App).run (288075776 samples, 2.68%)</title><rect x="2.1" y="160" width="42.9" height="15" fill="hsl(29,80%,62%)"/><text x="4.1" y="171">middle</text></g>
+<g><title>middleware.Chain(main.App).call (288075776 samples, 2.68%)</title><rect x="2.1" y="144" width="42.9" height="15" fill="hsl(46,80%,62%)"/><text x="4.1" y="155">middle</text></g>
+<g><title>handlers.adapt__struct_6377.h (288075776 samples, 2.68%)</title><rect x="2.1" y="128" width="42.9" height="15" fill="hsl(8,80%,62%)"/><text x="4.1" y="139">handle</text></g>
+<g><title>heap.ArenaAllocator.alloc (70553600 samples, 0.66%)</title><rect x="2.1" y="112" width="10.5" height="15" fill="hsl(15,80%,62%)"/><text x="4.1" y="123"></text></g>
+<g><title>json.Stringify.encodeJsonString (84230144 samples, 0.78%)</title><rect x="12.6" y="112" width="12.5" height="15" fill="hsl(12,80%,62%)"/><text x="14.6" y="123"></text></g>
+<g><title>response.BodyWriter.drain (84230144 samples, 0.78%)</title><rect x="12.6" y="96" width="12.5" height="15" fill="hsl(24,80%,62%)"/><text x="14.6" y="107"></text></g>
+<g><title>response.BodyBuffer.nextSegment (84230144 samples, 0.78%)</title><rect x="12.6" y="80" width="12.5" height="15" fill="hsl(27,80%,62%)"/><text x="14.6" y="91"></text></g>
+<g><title>heap.ArenaAllocator.alloc (84230144 samples, 0.78%)</title><rect x="12.6" y="64" width="12.5" height="15" fill="hsl(15,80%,62%)"/><text x="14.6" y="75"></text></g>
+<g><title>json.Stringify.write__func_3398 (111583232 samples, 1.04%)</title><rect x="25.2" y="112" width="16.6" height="15" fill="hsl(12,80%,62%)"/><text x="27.2" y="123"></text></g>
+<g><title>json.Stringify.write__func_2095 (111583232 samples, 1.04%)</title><rect x="25.2" y="96" width="16.6" height="15" fill="hsl(23,80%,62%)"/><text x="27.2" y="107"></text></g>
+<g><title>json.Stringify.valueStartAssumeTypeOk (111583232 samples, 1.04%)</title><rect x="25.2" y="80" width="16.6" height="15" fill="hsl(42,80%,62%)"/><text x="27.2" y="91"></text></g>
+<g><title>response.BodyWriter.drain (111583232 samples, 1.04%)</title><rect x="25.2" y="64" width="16.6" height="15" fill="hsl(24,80%,62%)"/><text x="27.2" y="75"></text></g>
+<g><title>response.BodyBuffer.nextSegment (111583232 samples, 1.04%)</title><rect x="25.2" y="48" width="16.6" height="15" fill="hsl(27,80%,62%)"/><text x="27.2" y="59"></text></g>
+<g><title>heap.ArenaAllocator.alloc (111583232 samples, 1.04%)</title><rect x="25.2" y="32" width="16.6" height="15" fill="hsl(15,80%,62%)"/><text x="27.2" y="43"></text></g>
+<g><title>response.BodyWriter.drain (21708800 samples, 0.20%)</title><rect x="41.8" y="112" width="3.2" height="15" fill="hsl(24,80%,62%)"/><text x="43.8" y="123"></text></g>
+<g><title>response.BodyBuffer.nextSegment (21708800 samples, 0.20%)</title><rect x="41.8" y="96" width="3.2" height="15" fill="hsl(27,80%,62%)"/><text x="43.8" y="107"></text></g>
+<g><title>heap.ArenaAllocator.alloc (21708800 samples, 0.20%)</title><rect x="41.8" y="80" width="3.2" height="15" fill="hsl(15,80%,62%)"/><text x="43.8" y="91"></text></g>
+<g><title>response.Response.write (3836392704 samples, 35.68%)</title><rect x="45.0" y="160" width="570.8" height="15" fill="hsl(51,80%,62%)"/><text x="47.0" y="171">response.Response.write</text></g>
+<g><title>Io.Writer.writeVecAll (3714606336 samples, 34.55%)</title><rect x="45.0" y="144" width="552.7" height="15" fill="hsl(25,80%,62%)"/><text x="47.0" y="155">Io.Writer.writeVecAll</text></g>
+<g><title>zstd_io.Compress.drain (3714606336 samples, 34.55%)</title><rect x="45.0" y="128" width="552.7" height="15" fill="hsl(42,80%,62%)"/><text x="47.0" y="139">zstd_io.Compress.drain</text></g>
+<g><title>ZSTD_compressStream2 (3714606336 samples, 34.55%)</title><rect x="45.0" y="112" width="552.7" height="15" fill="hsl(22,80%,62%)"/><text x="47.0" y="123">ZSTD_compressStream2</text></g>
+<g><title>ZSTD_CCtx_init_compressStream2 (3714606336 samples, 34.55%)</title><rect x="45.0" y="96" width="552.7" height="15" fill="hsl(34,80%,62%)"/><text x="47.0" y="107">ZSTD_CCtx_init_compressStream2</text></g>
+<g><title>ZSTD_compressBegin_internal (3714606336 samples, 34.55%)</title><rect x="45.0" y="80" width="552.7" height="15" fill="hsl(19,80%,62%)"/><text x="47.0" y="91">ZSTD_compressBegin_internal</text></g>
+<g><title>ZSTD_resetCCtx_internal (3714606336 samples, 34.55%)</title><rect x="45.0" y="64" width="552.7" height="15" fill="hsl(31,80%,62%)"/><text x="47.0" y="75">ZSTD_resetCCtx_internal</text></g>
+<g><title>zstd_io.zstdAlloc (3714606336 samples, 34.55%)</title><rect x="45.0" y="48" width="552.7" height="15" fill="hsl(38,80%,62%)"/><text x="47.0" y="59">zstd_io.zstdAlloc</text></g>
+<g><title>heap.ArenaAllocator.alloc (3714606336 samples, 34.55%)</title><rect x="45.0" y="32" width="552.7" height="15" fill="hsl(15,80%,62%)"/><text x="47.0" y="43">heap.ArenaAllocator.alloc</text></g>
+<g><title>heap.ArenaAllocator.alloc (7380992 samples, 0.07%)</title><rect x="597.7" y="144" width="1.1" height="15" fill="hsl(15,80%,62%)"/><text x="599.7" y="155"></text></g>
+<g><title>response.BodyWriter.rebase (42549248 samples, 0.40%)</title><rect x="598.8" y="144" width="6.3" height="15" fill="hsl(4,80%,62%)"/><text x="600.8" y="155"></text></g>
+<g><title>response.BodyBuffer.nextSegment (42549248 samples, 0.40%)</title><rect x="598.8" y="128" width="6.3" height="15" fill="hsl(27,80%,62%)"/><text x="600.8" y="139"></text></g>
+<g><title>heap.ArenaAllocator.alloc (42549248 samples, 0.40%)</title><rect x="598.8" y="112" width="6.3" height="15" fill="hsl(15,80%,62%)"/><text x="600.8" y="123"></text></g>
+<g><title>zstd_io.Compress.init (71856128 samples, 0.67%)</title><rect x="605.2" y="144" width="10.7" height="15" fill="hsl(12,80%,62%)"/><text x="607.2" y="155"></text></g>
+<g><title>ZSTD_createCCtx_advanced (71856128 samples, 0.67%)</title><rect x="605.2" y="128" width="10.7" height="15" fill="hsl(25,80%,62%)"/><text x="607.2" y="139"></text></g>
+<g><title>zstd_io.zstdAlloc (71856128 samples, 0.67%)</title><rect x="605.2" y="112" width="10.7" height="15" fill="hsl(38,80%,62%)"/><text x="607.2" y="123"></text></g>
+<g><title>heap.ArenaAllocator.alloc (71856128 samples, 0.67%)</title><rect x="605.2" y="96" width="10.7" height="15" fill="hsl(15,80%,62%)"/><text x="607.2" y="107"></text></g>
+<g><title>router.Router(main.App).findHandler (8792064 samples, 0.08%)</title><rect x="615.8" y="160" width="1.3" height="15" fill="hsl(14,80%,62%)"/><text x="617.8" y="171"></text></g>
+<g><title>hash_map.Custom([]const u8,?[]const u8,hash_map.StringContext,80).grow (3907584 samples, 0.04%)</title><rect x="615.8" y="144" width="0.6" height="15" fill="hsl(26,80%,62%)"/><text x="617.8" y="155"></text></g>
+<g><title>heap.ArenaAllocator.alloc (3907584 samples, 0.04%)</title><rect x="615.8" y="128" width="0.6" height="15" fill="hsl(15,80%,62%)"/><text x="617.8" y="139"></text></g>
+<g><title>router.Router(main.App).matchRecursive (3907584 samples, 0.04%)</title><rect x="616.6" y="144" width="0.6" height="15" fill="hsl(0,80%,62%)"/><text x="618.6" y="155"></text></g>
+<g><title>router.Router(main.App).matchRecursive (3907584 samples, 0.04%)</title><rect x="616.6" y="128" width="0.6" height="15" fill="hsl(0,80%,62%)"/><text x="618.6" y="139"></text></g>
+<g><title>hash_map.Custom([]const u8,[]const u8,hash_map.StringContext,80).putContext (3907584 samples, 0.04%)</title><rect x="616.6" y="112" width="0.6" height="15" fill="hsl(38,80%,62%)"/><text x="618.6" y="123"></text></g>
+<g><title>hash_map.Custom([]const u8,?[]const u8,hash_map.StringContext,80).grow (3907584 samples, 0.04%)</title><rect x="616.6" y="96" width="0.6" height="15" fill="hsl(26,80%,62%)"/><text x="618.6" y="107"></text></g>
+<g><title>heap.ArenaAllocator.alloc (3907584 samples, 0.04%)</title><rect x="616.6" y="80" width="0.6" height="15" fill="hsl(15,80%,62%)"/><text x="618.6" y="91"></text></g>
+<g><title>malloc (6605273088 samples, 61.43%)</title><rect x="617.2" y="256" width="982.8" height="15" fill="hsl(44,80%,62%)"/><text x="619.2" y="267">malloc</text></g>
+<g><title>coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn (6605273088 samples, 61.43%)</title><rect x="617.2" y="240" width="982.8" height="15" fill="hsl(41,80%,62%)"/><text x="619.2" y="251">coro.coroutines.Coroutine.setup.CoroutineData.entrypointFn</text></g>
+<g><title>task.AnyTask.startFn (6605273088 samples, 61.43%)</title><rect x="617.2" y="224" width="982.8" height="15" fill="hsl(8,80%,62%)"/><text x="619.2" y="235">task.AnyTask.startFn</text></g>
+<g><title>group.Group.spawnInto__func_2363.Wrapper.start (6605273088 samples, 61.43%)</title><rect x="617.2" y="208" width="982.8" height="15" fill="hsl(21,80%,62%)"/><text x="619.2" y="219">group.Group.spawnInto__func_2363.Wrapper.start</text></g>
+<g><title>server.Server(main.App).handleConnectionWrapper (6605273088 samples, 61.43%)</title><rect x="617.2" y="192" width="982.8" height="15" fill="hsl(0,80%,62%)"/><text x="619.2" y="203">server.Server(main.App).handleConnectionWrapper</text></g>
+<g><title>server.Server(main.App).handleRequests (6605273088 samples, 61.43%)</title><rect x="617.2" y="176" width="982.8" height="15" fill="hsl(1,80%,62%)"/><text x="619.2" y="187">server.Server(main.App).handleRequests</text></g>
+<g><title>middleware.Chain(main.App).run (461002752 samples, 4.29%)</title><rect x="617.2" y="160" width="68.6" height="15" fill="hsl(29,80%,62%)"/><text x="619.2" y="171">middlewar</text></g>
+<g><title>middleware.Chain(main.App).call (461002752 samples, 4.29%)</title><rect x="617.2" y="144" width="68.6" height="15" fill="hsl(46,80%,62%)"/><text x="619.2" y="155">middlewar</text></g>
+<g><title>handlers.adapt__struct_6377.h (461002752 samples, 4.29%)</title><rect x="617.2" y="128" width="68.6" height="15" fill="hsl(8,80%,62%)"/><text x="619.2" y="139">handlers.</text></g>
+<g><title>__libc_malloc (149962752 samples, 1.39%)</title><rect x="617.2" y="112" width="22.3" height="15" fill="hsl(49,80%,62%)"/><text x="619.2" y="123">__l</text></g>
+<g><title>json.Stringify.encodeJsonString (311040000 samples, 2.89%)</title><rect x="639.5" y="112" width="46.3" height="15" fill="hsl(12,80%,62%)"/><text x="641.5" y="123">json.S</text></g>
+<g><title>response.BodyWriter.drain (311040000 samples, 2.89%)</title><rect x="639.5" y="96" width="46.3" height="15" fill="hsl(24,80%,62%)"/><text x="641.5" y="107">respon</text></g>
+<g><title>response.BodyBuffer.nextSegment (311040000 samples, 2.89%)</title><rect x="639.5" y="80" width="46.3" height="15" fill="hsl(27,80%,62%)"/><text x="641.5" y="91">respon</text></g>
+<g><title>__libc_malloc (311040000 samples, 2.89%)</title><rect x="639.5" y="64" width="46.3" height="15" fill="hsl(49,80%,62%)"/><text x="641.5" y="75">__libc</text></g>
+<g><title>response.Response.write (6144270336 samples, 57.14%)</title><rect x="685.7" y="160" width="914.3" height="15" fill="hsl(51,80%,62%)"/><text x="687.7" y="171">response.Response.write</text></g>
+<g><title>Io.Writer.writeVecAll (6144270336 samples, 57.14%)</title><rect x="685.7" y="144" width="914.3" height="15" fill="hsl(25,80%,62%)"/><text x="687.7" y="155">Io.Writer.writeVecAll</text></g>
+<g><title>zstd_io.Compress.drain (6144270336 samples, 57.14%)</title><rect x="685.7" y="128" width="914.3" height="15" fill="hsl(42,80%,62%)"/><text x="687.7" y="139">zstd_io.Compress.drain</text></g>
+<g><title>ZSTD_compressStream2 (6144270336 samples, 57.14%)</title><rect x="685.7" y="112" width="914.3" height="15" fill="hsl(22,80%,62%)"/><text x="687.7" y="123">ZSTD_compressStream2</text></g>
+<g><title>ZSTD_CCtx_init_compressStream2 (6144270336 samples, 57.14%)</title><rect x="685.7" y="96" width="914.3" height="15" fill="hsl(34,80%,62%)"/><text x="687.7" y="107">ZSTD_CCtx_init_compressStream2</text></g>
+<g><title>ZSTD_compressBegin_internal (6144270336 samples, 57.14%)</title><rect x="685.7" y="80" width="914.3" height="15" fill="hsl(19,80%,62%)"/><text x="687.7" y="91">ZSTD_compressBegin_internal</text></g>
+<g><title>ZSTD_resetCCtx_internal (6144270336 samples, 57.14%)</title><rect x="685.7" y="64" width="914.3" height="15" fill="hsl(31,80%,62%)"/><text x="687.7" y="75">ZSTD_resetCCtx_internal</text></g>
+<g><title>zstd_io.zstdAlloc (6144270336 samples, 57.14%)</title><rect x="685.7" y="48" width="914.3" height="15" fill="hsl(38,80%,62%)"/><text x="687.7" y="59">zstd_io.zstdAlloc</text></g>
+<g><title>__libc_malloc (6144270336 samples, 57.14%)</title><rect x="685.7" y="32" width="914.3" height="15" fill="hsl(49,80%,62%)"/><text x="687.7" y="43">__libc_malloc</text></g>
+</svg>
