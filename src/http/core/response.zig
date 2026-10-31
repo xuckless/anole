@@ -1738,6 +1738,11 @@ pub const Response = struct {
     /// JSON of 4-8 KB; 2 is as small as libdeflate's 1 and 11% larger than
     /// zlib's default 6, at a fraction of its time
     /// (research/s2/k4-compression.md, §2).
+    /// libdeflate's level for buffered gzip responses (`-Dlibdeflate`):
+    /// 1, which unlike zlib-ng's 1 builds dynamic Huffman codes, as small
+    /// as zlib-ng's 2 on JSON of 4-8 KB.
+    const libdeflate_level: c_int = 1;
+
     const compression_level: zlib.Level = @fromBackingInt(@intCast(2));
     /// zstd's level for responses, buffered or streamed. On JSON of 4-8 KB
     /// level 1 is both smaller and faster than zstd's default 3
@@ -1863,7 +1868,7 @@ pub const Response = struct {
         const compressed = switch (coding) {
             .zstd => if (build_options.use_zstd) self.zstdBody(len) catch return else unreachable,
             .br => if (build_options.use_brotli) self.brotliBody(len) catch return else unreachable,
-            else => if (build_options.use_zlib) self.deflateBody() catch return else unreachable,
+            else => if (build_options.use_zlib) self.deflateBody(len) catch return else unreachable,
         };
         if (compressed.len() >= len) return;
         self.body_buffer = compressed;
@@ -1899,11 +1904,50 @@ pub const Response = struct {
         return compressed;
     }
 
-    /// The buffered body as one gzip stream, through this executor's
-    /// encoder (`encoders`), whose memory (about 300 KiB) comes from
-    /// `block_cache`. Its window is zlib's largest, whatever the body:
-    /// a reused encoder keeps the options it was made with.
-    fn deflateBody(self: *Response) (std.mem.Allocator.Error || std.Io.Writer.Error)!BodyBuffer {
+    /// The buffered body as one gzip stream: through this executor's
+    /// libdeflate compressor with `-Dlibdeflate` (bodies up to
+    /// `encoders.max_gather`), otherwise through its zlib-ng encoder.
+    fn deflateBody(self: *Response, len: usize) (std.mem.Allocator.Error || std.Io.Writer.Error || error{CompressFailed})!BodyBuffer {
+        if (build_options.use_libdeflate and len <= encoders.max_gather) return self.libdeflateBody(len);
+        return self.zlibBody();
+    }
+
+    /// libdeflate compresses one contiguous input into one output in one
+    /// call: a body in more than one segment is gathered first. The output
+    /// is a single arena segment with room for one byte less than the body,
+    /// since only a shorter result is sent; one that does not fit is
+    /// `error.CompressFailed`, and the body goes out as it is.
+    fn libdeflateBody(self: *Response, len: usize) (std.mem.Allocator.Error || error{CompressFailed})!BodyBuffer {
+        const d = encoders.deflater(libdeflate_level) orelse return error.OutOfMemory;
+        defer encoders.release();
+        const input: []const u8 = if (self.body_buffer.len() == 0) self.body else blk: {
+            const first = BodyBuffer.Segment.fromNode(self.body_buffer.segments.first.?);
+            if (first.node.next == null) break :blk first.bytes()[0..first.len];
+            const scratch = encoders.gather(len) orelse return error.OutOfMemory;
+            var at: usize = 0;
+            var it = self.body_buffer.segments.first;
+            while (it) |node| : (it = node.next) {
+                const segment = BodyBuffer.Segment.fromNode(node);
+                @memcpy(scratch[at..][0..segment.len], segment.bytes()[0..segment.len]);
+                at += segment.len;
+            }
+            std.debug.assert(at == len);
+            break :blk scratch;
+        };
+        const segment = try BodyBuffer.Segment.create(self.arena, len - 1);
+        const n = encoders.deflateInto(d, input, segment.bytes());
+        if (n == 0) return error.CompressFailed;
+        segment.len = n;
+        var compressed: BodyBuffer = .{};
+        compressed.segments.append(&segment.node);
+        return compressed;
+    }
+
+    /// The buffered body through this executor's zlib-ng encoder
+    /// (`encoders`), whose memory (about 300 KiB) comes from `block_cache`.
+    /// Its window is zlib's largest, whatever the body: a reused encoder
+    /// keeps the options it was made with.
+    fn zlibBody(self: *Response) (std.mem.Allocator.Error || std.Io.Writer.Error)!BodyBuffer {
         var compressed: BodyBuffer = try .init(self.arena);
         var out: BodyWriter = .into(self, &compressed);
         const gzip = try encoders.gzip(&out.interface, .{ .level = compression_level, .window_bits = 15, .mem_level = 8 });
@@ -4205,6 +4249,53 @@ test "Response: compress without room for its headers sends the body as it is" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Encoding") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Vary") == null);
     try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n" ++ &@as([300]u8, @splat('a'))));
+}
+
+test "compress: a buffered body in several segments goes out as gzip that decodes" {
+    if (!build_options.use_zlib) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var text: std.Io.Writer.Allocating = .init(arena.allocator());
+    for (0..150) |i| try text.writer.print("{{\"id\":{d},\"name\":\"Widget {d}\",\"price\":{d}}},", .{ i, i % 9, i * 37 % 500 });
+    const body = text.written();
+
+    // Twice: the second response takes the encoders the first made.
+    for (0..2) |_| {
+        var buf: [16384]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
+        var request = try testGzipRequest(arena.allocator());
+        var response = try Response._init(arena.allocator(), &connection, 8);
+        defer response.deinit();
+        response._request = &request;
+        response.compress = true;
+        response.content_type = .json;
+        // In pieces, so the body spans several segments.
+        var w = try response.writer();
+        var rest = body;
+        while (rest.len > 0) {
+            const n = @min(rest.len, 300);
+            try w.interface.writeAll(rest[0..n]);
+            rest = rest[n..];
+        }
+        try w.end();
+        try response.write();
+
+        const written = conn_writer.buffered();
+        const split = std.mem.indexOf(u8, written, "\r\n\r\n").?;
+        const head = written[0 .. split + 2];
+        try std.testing.expect(std.mem.indexOf(u8, head, "Content-Encoding: gzip\r\n") != null);
+        const encoded = written[split + 4 ..];
+        try std.testing.expect(encoded.len < body.len);
+        try std.testing.expect(std.mem.indexOf(u8, head, try std.fmt.allocPrint(arena.allocator(), "Content-Length: {d}\r\n", .{encoded.len})) != null);
+        var in: std.Io.Reader = .fixed(encoded);
+        var d = try zlib.Decompress.init(arena.allocator(), &in, &.{}, .gzip, .{});
+        defer d.deinit();
+        var out: std.Io.Writer.Allocating = .init(arena.allocator());
+        _ = try d.reader.streamRemaining(&out.writer);
+        try std.testing.expectEqualStrings(body, out.written());
+    }
 }
 
 test "Response: a gzipped body weakens its ETag and drops Accept-Ranges" {

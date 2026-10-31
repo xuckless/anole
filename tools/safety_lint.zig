@@ -71,6 +71,7 @@ const c_libs = [_]struct { modules: []const []const u8, files: []const []const u
     .{ .modules = &.{ "zstd", "anole_zstd_c" }, .files = &.{ "src/http/core/zstd_io.zig", "src/http/core/root.zig", "src/compression/root.zig", "src/kafka/compress.zig" } },
     .{ .modules = &.{ "brotli", "anole_brotli_c" }, .files = &.{ "src/http/core/brotli_io.zig", "src/http/core/root.zig", "src/compression/root.zig" } },
     .{ .modules = &.{"anole_lz4_c"}, .files = &.{"src/kafka/compress.zig"} },
+    .{ .modules = &.{"libdeflate"}, .files = &.{"src/http/core/libdeflate_io.zig"} },
     .{ .modules = &.{ "anole_sqlite_c", "sqlite" }, .files = &.{"src/sqlite/root.zig"} },
 };
 

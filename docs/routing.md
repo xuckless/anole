@@ -600,7 +600,8 @@ With `-Dcompression` (on in `web` and `full`), a response is compressed when
 the handler sets `res.compress = true`, or always through `Compress`.
 
 - zstd, Brotli (`br`, with `-Dbrotli`, on in `web` and `full`) or gzip
-  (zlib-ng) by the client's `Accept-Encoding` q-values; on a tie zstd, then
+  (libdeflate for buffered bodies with `-Dlibdeflate`, on in `web` and
+  `full`; zlib-ng for streamed ones) by the client's `Accept-Encoding` q-values; on a tie zstd, then
   gzip, then `br`. So browsers that offer zstd get zstd, and a client that
   offers `gzip, br` (Safari, most HTTP benchmarks) gets gzip: on JSON of a
   few KiB, Brotli small enough to matter costs about twice gzip's CPU.
@@ -614,11 +615,20 @@ the handler sets `res.compress = true`, or always through `Compress`.
   response with `res.brotli_quality`. On JSON bodies of 4 to 8 KB,
   quality 4 is about as small as gzip at level 6; quality 5 is 8% smaller
   at about 1.3x the CPU time, quality 1 is larger than gzip, and 11 is for
-  precompressed files (`precompressed = &.{.br}`), not for responses. Its window is at most 64 KiB, so each Brotli response in
-  flight takes about 600 KiB. Its large blocks, and gzip's for a buffered
-  body, come from a cache per executor, reused from one response to the
-  next (no `mmap` or page faults per response, with glibc or musl),
-  holding at most 4 MiB and trimmed back to one encoder's worth when idle.
+  precompressed files (`precompressed = &.{.br}`), not for responses.
+  Its window is at most 64 KiB, so each Brotli response in flight takes
+  about 600 KiB.
+- gzip runs at libdeflate's level 1 for buffered bodies (zlib-ng's level 2
+  without `-Dlibdeflate`, and for streamed bodies), zstd at level 1. On
+  JSON of a few KB that gzip is about 11% larger than at level 6 for a
+  fraction of the CPU, and zstd 1 is both smaller and faster than its
+  default 3.
+- Each executor keeps one zstd context and one gzip encoder for buffered
+  bodies, reused from one response to the next, and frees them when no
+  response took them for a trim interval. Their memory, and Brotli's large
+  blocks, come from a cache per executor (no `mmap` or page faults per
+  response, with glibc or musl), holding at most 4 MiB and trimmed back to
+  one encoder's worth when idle.
 - Only compressible types: text, JSON, JavaScript, XML, SVG, `+json` and
   `+xml` types and the like. Not images, video, fonts or archives.
 - Buffered bodies under 128 bytes, or that do not shrink, go out as they are.

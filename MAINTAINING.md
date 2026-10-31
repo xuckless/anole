@@ -16,6 +16,7 @@ that happens promptly.
 | ngtcp2 1.25.0 | build.zig.zon | commit of the xuckless/ngtcp2 fork, branch `anole` (git URL) |
 | nghttp3 1.18.0 | build.zig.zon | commit of the xuckless/nghttp3 fork, branch `anole` (tarball) |
 | zlib-ng, zstd, Brotli, yyjson, hiredis, lz4 1.10.0 | build.zig.zon | upstream release tag tarballs (lz4: `-Dkafka`, built by `build/lz4.zig`) |
+| libdeflate 1.26 | build.zig.zon | upstream release tag tarball (`-Dlibdeflate`, built by `build/libdeflate.zig`; the source list follows nilo's build.zig, MIT) |
 | zig-protobuf | build.zig.zon | commit of the xuckless/zig-protobuf fork, branch `anole`; it pins protoc per platform |
 | websocket-zig, zig-jwt, zig-sqlite | build.zig.zon | commits of the xuckless forks, branch `anole` |
 | pg.zig | build.zig.zon | commit of the xuckless/pg.zig fork, branch `anole` (git URL) |
@@ -133,6 +134,13 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      `BROTLI_STATIC_INIT_LAZY`). Then run `tools/sanitize-c-libs.sh brotli`
      and the Brotli tests (`zig build test`: the round trips and the
      "fuzz: Brotli" target in `src/http/core/brotli_io.zig`).
+   - **libdeflate** (`-Dlibdeflate`): `build/libdeflate.zig` builds the
+     compressor only (`deflate_compress.c`, `gzip_compress.c`, `crc32.c`,
+     `utils.c` and the x86/arm `cpu_features.c`); compare the list with the
+     new tarball's `lib/`. Keep `FREESTANDING` off: with it `utils.c`
+     defines weak byte-loop `memcpy`/`memset` that win the link for the
+     whole program (nilo's finding). Then run the compression tests
+     (`zig build core-test`: "compress: ...").
    - **SQLite** is the amalgamation zip from sqlite.org (the URL carries
      the year and the version as `3XXYYZZ`); check the zip's SHA3-256
      against the download page. Its compile-time options are
