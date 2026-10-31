@@ -864,11 +864,12 @@ pub fn build(b: *std.Build) void {
     // compile-tests: build the test binaries without running them.
     const compile_tests_step = b.step("compile-tests", "Compile the test binaries without running them");
     compile_tests_step.dependOn(&tests.step);
-    // The validator's, the logger's, the banner's and src/safety's own
-    // tests: each is its own module, so the anole test binary does not
-    // collect them.
+    // The validator's, the logger's, the banner's, src/safety's and
+    // src/resilience/core.zig's own tests: each is its own module, so the
+    // anole test binary does not collect them.
     for ([_]struct { name: []const u8, mod: *std.Build.Module }{
         .{ .name = "validate-test", .mod = core.validate },
+        .{ .name = "resilience-test", .mod = core.resilience },
         .{ .name = "log-test", .mod = core.anole_log },
         .{ .name = "banner-test", .mod = core.banner },
         .{ .name = "wait-test", .mod = core.test_wait },
