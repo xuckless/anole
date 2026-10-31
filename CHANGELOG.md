@@ -5,7 +5,25 @@ breaking changes are listed anyway.
 
 ## 0.4.2 (unreleased)
 
+### Changed
+
+- The JWT, API key, RBAC, CSRF and rate-limit middlewares (and the C ABI's
+  `rate_limit`) refuse a request by returning `error.Unauthorized`,
+  `error.BadRequest`, `error.Forbidden` or `error.TooManyRequests` with
+  their protocol headers set (`WWW-Authenticate`, `Retry-After`,
+  `RateLimit-*`), instead of writing a plain-text body themselves. An app
+  with an `error_handler` or `uncaughtError` now receives these errors; a
+  middleware of its own that does work after `try next.call()` skips it on
+  a refusal, as for any handler error. The CSRF body no longer says why
+  (the reason is logged at `debug`) (#33).
+
 ### Fixed
+
+- Auth, CSRF and rate-limit refusals ignored `ServerOptions.errors`: a JSON
+  API answered `{"error":...}` for its own errors and plain text for the
+  middleware's. They now follow the server's error format, and their 503
+  and 500 answers (a key store or limiter that failed, a weak HMAC key) do
+  too (#33).
 
 - A connection the local stack aborted after its peer vanished
   (`ConnectionAborted`: ECONNABORTED, Windows' WSAECONNABORTED) counts as a

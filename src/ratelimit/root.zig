@@ -407,10 +407,9 @@ pub const OwnedMiddleware = struct {
         try res.header("RateLimit-Reset", try std.fmt.allocPrint(res.arena, "{d}", .{r.reset_seconds}));
         if (!r.allowed) {
             try res.header("Retry-After", try std.fmt.allocPrint(res.arena, "{d}", .{r.retry_after_seconds}));
-            res.status = .too_many_requests;
-            res.content_type = .text;
-            res.body = "429 Too Many Requests\n";
-            return;
+            // Answered by the chain in the server's error format, the
+            // headers kept (RFC 6585 section 4).
+            return error.TooManyRequests;
         }
         return next.call();
     }
@@ -495,10 +494,7 @@ pub const Middleware = struct {
             },
             .deny => {
                 std.log.scoped(.anole_ratelimit).warn("limiter failed, request refused (503): {t}", .{err});
-                res.status = .service_unavailable;
-                res.content_type = .text;
-                res.body = "503 Service Unavailable\n";
-                return;
+                return res.fail(.service_unavailable, "");
             },
         };
         try res.header("RateLimit-Limit", try std.fmt.allocPrint(res.arena, "{d}", .{r.limit}));
@@ -506,10 +502,9 @@ pub const Middleware = struct {
         try res.header("RateLimit-Reset", try std.fmt.allocPrint(res.arena, "{d}", .{r.reset_seconds}));
         if (!r.allowed) {
             try res.header("Retry-After", try std.fmt.allocPrint(res.arena, "{d}", .{r.retry_after_seconds}));
-            res.status = .too_many_requests;
-            res.content_type = .text;
-            res.body = "429 Too Many Requests\n";
-            return;
+            // Answered by the chain in the server's error format, the
+            // headers kept (RFC 6585 section 4).
+            return error.TooManyRequests;
         }
         return next.call();
     }

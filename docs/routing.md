@@ -749,7 +749,17 @@ const App = struct {
 `methodNotAllowed` has the same signature as `notFound`, and finds `Allow`
 already set. `uncaughtError` comes before `error_handler`; either replaces
 the built-in mapping unless it calls `anole.defaultError`. An error answered
-with a 4xx is logged at `debug`, one answered with a 5xx at `err`. A `Ctx`
+with a 4xx is logged at `debug`, one answered with a 5xx at `err`.
+
+The built-in middlewares refuse a request the same way: `auth.RequireJwt`,
+`auth.apikey.Middleware`, `auth.rbac.Require`, `auth.csrf.Middleware` and
+`ratelimit.Middleware` set their protocol headers (`WWW-Authenticate`,
+`Retry-After`, `RateLimit-*`) and return a status-named error
+(`error.Unauthorized`, `error.Forbidden`, `error.BadRequest`,
+`error.TooManyRequests`), so their answers follow `ServerOptions.errors` and
+reach `uncaughtError` and `error_handler` with those headers kept. Their 503s
+and 500s (a key store or limiter that failed) are logged by the middleware
+and answered with `res.fail`, in the same format. A `Ctx`
 can also declare `dispatch(self, action, req, res)` to wrap every handler
 call.
 

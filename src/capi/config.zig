@@ -1829,10 +1829,8 @@ pub const RateLimitMw = struct {
         try res.header("RateLimit-Reset", try std.fmt.allocPrint(res.arena, "{d}", .{r.reset_seconds}));
         if (!r.allowed) {
             try res.header("Retry-After", try std.fmt.allocPrint(res.arena, "{d}", .{r.retry_after_seconds}));
-            res.status = .too_many_requests;
-            res.content_type = .text;
-            res.body = "429 Too Many Requests\n";
-            return;
+            // Answered by the chain in the configured error format.
+            return error.TooManyRequests;
         }
         return next.call();
     }

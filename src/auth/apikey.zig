@@ -112,11 +112,10 @@ pub const Middleware = struct {
         return next.call();
     }
 
+    /// Answered by the chain in the server's error format, header kept.
     fn unauthorized(res: *dusty.Response) !void {
-        res.status = .unauthorized;
         try res.header("WWW-Authenticate", "Bearer");
-        res.content_type = .text;
-        res.body = "401 Unauthorized\n";
+        return error.Unauthorized;
     }
 };
 

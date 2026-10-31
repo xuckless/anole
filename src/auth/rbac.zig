@@ -93,13 +93,9 @@ pub const Require = struct {
     /// Never waits: no I/O, so `no_wait` routes may sit behind it.
     pub const no_wait = true;
 
-    pub fn execute(self: *const Require, req: *dusty.Request, res: *dusty.Response, next: anytype) !void {
-        if (!self.policy.anyAllows(try self.roles.roles(self.roles.ptr, req), self.permission)) {
-            res.status = .forbidden;
-            res.content_type = .text;
-            res.body = "403 Forbidden\n";
-            return;
-        }
+    pub fn execute(self: *const Require, req: *dusty.Request, _: *dusty.Response, next: anytype) !void {
+        // Answered by the chain in the server's error format.
+        if (!self.policy.anyAllows(try self.roles.roles(self.roles.ptr, req), self.permission)) return error.Forbidden;
         return next.call();
     }
 };
