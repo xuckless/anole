@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/xuckless/anole/blob/v0.4.1/include/anole.schema.json",
+  "$id": "https://github.com/xuckless/anole/blob/v0.4.2/include/anole.schema.json",
   "x-anole-abi": "0.10",
   "title": "Anole C ABI configuration",
   "description": "The JSON document anole_server_create takes (anole_server_options.config_json). Unknown keys are refused, with the line and column in anole_last_error (token UnknownKey).",
