@@ -75,12 +75,18 @@ pub const RouteOptions = struct {
     /// arrived whole right where it reads them, without a task (HTTP/2
     /// does, for a request whose end, body included, came in the read that
     /// brought its HEADERS; HTTP/3 for one whose end came in the packet
-    /// that completed its head). A handler that waits anyway still works,
-    /// but holds up every other request on its connection meanwhile, and
-    /// gets no request timeout. Leave it off for anything that talks to a
-    /// database, a cache, another service or the file system. Checked at
-    /// registration: every middleware in front of the route must say it
-    /// never waits (`pub const no_wait = true`), or the route is a conflict.
+    /// that completed its head). Over HTTP/1.1, pipelined requests to such
+    /// routes that arrive in one read are answered in one write: their
+    /// responses wait in the write buffer for the batch (`Response._cork`).
+    /// A handler that waits anyway still works, but holds up every other
+    /// request on its connection meanwhile, and gets no request timeout;
+    /// one that may wait (that falls back to waiting when it cannot
+    /// `detach`) calls `res.flushOwed()` first, or the answers to the
+    /// requests pipelined before it wait with it. Leave it off for anything
+    /// that talks to a database, a cache, another service or the file
+    /// system. Checked at registration: every middleware in front of the
+    /// route must say it never waits (`pub const no_wait = true`), or the
+    /// route is a conflict.
     no_wait: bool = false,
     /// Parameter names the route's handler reads (`anole.In` path fields);
     /// one the full path lacks is a conflict. Checked at registration.
