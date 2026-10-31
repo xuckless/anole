@@ -1613,6 +1613,70 @@ test "sqlite: a write canceled after it failed on its own answers its failure, n
     try testing.expectEqual(@as(i64, 1), try db.one(i64, ctx, "SELECT count(*) FROM notes", .{}));
 }
 
+/// A `Conn.run` statement its caller's cancel interrupts while it runs.
+const RunCanceled = struct {
+    var ran: std.atomic.Value(bool) = .init(false);
+
+    fn hasRun(_: void) bool {
+        return ran.load(.acquire);
+    }
+
+    /// On the writer thread: the first row is read, then the statement is
+    /// held active until the cancel interrupted it, and the next row gives
+    /// zig-sqlite's SQLiteInterrupt.
+    fn scan(d: *sqlite.driver.Db, io: std.Io) !void {
+        var stmt = try d.prepareDynamic("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000) SELECT i FROM n");
+        defer {
+            // The interrupted step's error is taken here, so that the
+            // finalize in `deinit` does not log it again.
+            _ = c.sqlite3_reset(stmt.stmt);
+            stmt.deinit();
+        }
+        var it = try stmt.iterator(i64, .{});
+        _ = try it.next(.{});
+        ran.store(true, .release);
+        // The deadline is a hang guard.
+        const until = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = wait.deadline(), .clock = .awake });
+        while (c.sqlite3_is_interrupted(d.db) == 0) {
+            if (until.untilNow(io).raw.nanoseconds >= 0) break;
+            std.Thread.yield() catch {};
+        }
+        while (try it.next(.{})) |_| {}
+    }
+
+    fn run(db: *sqlite.Client, io: std.Io, failure: *?anyerror) void {
+        var sc: Scratch = undefined;
+        sc.init(io);
+        defer sc.deinit();
+        const conn = db.acquire(&sc.ctx) catch |err| {
+            failure.* = err;
+            return;
+        };
+        defer conn.release();
+        conn.run(scan, .{io}) catch |err| {
+            failure.* = err;
+        };
+    }
+};
+
+test "sqlite: a Conn.run statement interrupted by its caller's cancel answers Canceled" {
+    var r: Runtime = undefined;
+    try r.init(1, 2);
+    defer r.deinit();
+    const io = r.io();
+    var tmp: TmpFile = .init();
+    defer tmp.deinit();
+    const db = try sqlite.Client.init(gpa, io, .{ .path = tmp.file("app.db"), .readers = 1 });
+    defer db.deinit();
+
+    RunCanceled.ran.store(false, .release);
+    var failure: ?anyerror = null;
+    var task = try io.concurrent(RunCanceled.run, .{ db, io, &failure });
+    try wait.waitUntil(io, "the statement run", {}, RunCanceled.hasRun);
+    task.cancel(io);
+    try testing.expectEqual(@as(?anyerror, error.Canceled), failure);
+}
+
 /// Tasks that hold a connection until `go` is set.
 const Holders = struct {
     db: *sqlite.Client,

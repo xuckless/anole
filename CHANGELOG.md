@@ -23,7 +23,9 @@ breaking changes are listed anyway.
 - SQLite: a write whose caller is canceled after the write ran to its end
   answers its own result (the cancel stays pending), not Canceled: a
   committed INSERT or COMMIT is no longer reported as canceled, and a
-  constraint failure is reported as that (#160).
+  constraint failure is reported as that (#160). A statement the cancel
+  interrupted still answers Canceled, including one run through
+  `Conn.run` (zig-sqlite's `SQLiteInterrupt`).
 - Kafka: a consumer group's leader counts the partitions of a topic whose
   metadata a stale leader dropped right after the refresh, instead of
   assigning none of them (#159).
