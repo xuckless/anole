@@ -801,8 +801,11 @@ fixed size: what is in flight, plus up to one congestion window of bytes
 not yet sent (or less, when the client's flow-control credit for the
 stream is smaller), at least 64 KiB and at most 3 MiB. A download moves as
 fast as the path allows, as over TCP, while a client that stops reading
-leaves its response holding 64 KiB. All of a connection's responses
-together hold at most 4 MiB. Message streams (WebSockets, the WebTransport
+leaves its response holding up to about 100 KiB (what the stack already
+took, plus 64 KiB). All of a connection's responses together hold at most
+4 MiB. Nothing bounds the total across connections: plan for up to
+connections x 4 MiB of send buffers at worst (one download per connection
+held at most 64 KiB before 0.5.0). Message streams (WebSockets, the WebTransport
 session's stream, gRPC and Connect streaming calls) keep a fixed 1 MiB
 each, so a send there returns once buffered up to it.
 
