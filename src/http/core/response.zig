@@ -274,7 +274,9 @@ const BodyBuffer = struct {
     /// With the first segment reserved up front: a short body then never
     /// reaches a writer's vtable, and a writer is never unbuffered, which
     /// `std.Io.Writer.sendFileAll` asserts against. The request arena keeps
-    /// its memory between a connection's requests, so this is a bump.
+    /// only its first chunks between requests (2 KiB and 8 KiB), which this
+    /// segment fits, so this is a bump; later segments of a large body may
+    /// be malloc's.
     fn init(arena: std.mem.Allocator) std.mem.Allocator.Error!BodyBuffer {
         var self: BodyBuffer = .{};
         try self.reserveFirst(arena);
@@ -1241,7 +1243,7 @@ pub const Response = struct {
             const json_formatter = std.json.fmt(value, options);
             try json_formatter.format(&w.interface);
         }
-        try self.header("Content-Type", "application/json; charset=UTF-8");
+        try self.header("Content-Type", http.ContentType.json.toContentType());
     }
 
     /// Answers with an RFC 9457 problem document (`application/problem+json`),
@@ -3059,7 +3061,7 @@ test "Response: json() sends the value as JSON with its Content-Type and length"
 
     const written = conn_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "HTTP/1.1 201") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Type: application/json; charset=UTF-8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Type: application/json\r\n") != null);
     // Check the actual JSON content length: {"id":123,"message":"Created"}
     const expected_json = "{\"id\":123,\"message\":\"Created\"}";
     try std.testing.expect(std.mem.indexOf(u8, written, expected_json) != null);

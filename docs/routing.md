@@ -581,7 +581,8 @@ Both take the same options:
 - `precompressed`: `style.css.br`, `.zst` or `.gz` is served for
   `style.css` to a client that accepts that coding, by its q-values and then
   your order, with `Vary: Accept-Encoding`. The plain file must exist too.
-  This is the only way to serve Brotli; there is no runtime Brotli encoder.
+  Static files are not compressed on the fly; responses are (see
+  Compression below).
 - `cache_control` goes out with 200, 206 and 304.
 
 `embedded` serves one file compiled into the binary, with the same

@@ -357,7 +357,7 @@ test "static: newer web types have their media types" {
     const cases = [_][2][]const u8{
         .{ "a.avif", "image/avif" },
         .{ "a.webmanifest", "application/manifest+json" },
-        .{ "a.js.map", "application/json; charset=UTF-8" },
+        .{ "a.js.map", "application/json" },
         .{ "a.otf", "font/otf" },
         .{ "a.csv", "text/csv; charset=UTF-8" },
         .{ "a.md", "text/markdown; charset=UTF-8" },
