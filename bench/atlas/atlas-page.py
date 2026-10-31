@@ -23,7 +23,7 @@ GROUPS = [
     ("#99 gRPC unary", ["grpc-unary"],
      "About 110 KB allocated per call for a 9-byte body, mostly under nghttp2 → h2.Engine.onDataChunk. Stream arenas keep their high-water mark after reset, so RSS reaches 0.84-0.95 GB at 25,600 calls in flight."),
     ("#97 idle HTTP/2 tasks", ["sse-h1", "sse-h2c"],
-     "An h2c SSE subscriber holds 3 coroutine stacks and 4 tasks, against 2 and 2 over h1: about 50 KB RSS each, against 20 KB."),
+     "Idle subscribers settle at about 4.7-5.0 KB of RSS each over h1 and 48-51 KB over h2c, about 10 times more. h1 gives back the connection ramp's memory; h2c keeps it. Per subscriber, h2c takes 3 coroutine stacks and 4 task-pool slots against 2 and 2, and maps 2.6 MB of stack space against 1.6 MB."),
     ("#147 raw TCP", ["net-tcp"],
      "User space is lean (1.7-2.1k instructions per message, no allocation). Netfilter is 39-43% of CPU. The second recvfrom needs a syscall count, not a profile."),
 ]
@@ -48,7 +48,8 @@ def slim(r):
         "mem": {k: r.get("mem", {}).get(k) for k in ("per_req", "top_alloc", "top_held", "held_truncated", "window_requests")},
         "probes_held": r.get("mem", {}).get("probes", {}).get("held"),
         "subscribers": r.get("subscribers"),
-        "rss": {"t": t[::step], "mb": mb[::step], "peak": rss.get("peak_rss_mb"), "cg_peak": rss.get("memory_peak_mb")},
+        "rss": {"t": t[::step], "mb": mb[::step], "peak": rss.get("peak_rss_mb"), "cg_peak": rss.get("memory_peak_mb"),
+                "settled": rss.get("settled_rss_mb"), "start": rss.get("start_rss_mb")},
         "flames": r.get("flames", {}),
     }
 

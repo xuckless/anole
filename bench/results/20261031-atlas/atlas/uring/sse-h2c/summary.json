@@ -586,6 +586,7 @@
   "peak_rss_mb": 199.9,
   "start_rss_mb": 6.2,
   "end_rss_mb": 193.9,
+  "settled_rss_mb": 193.8,
   "memory_peak_mb": 242.0
  },
  "flames": {

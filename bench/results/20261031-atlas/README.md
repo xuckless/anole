@@ -70,8 +70,8 @@ Cells (HttpArena's request shapes where it has one):
 | h3-static | 27.6k / 40.3k | 157,432 / 155,573 | 183k / 71k | 200 | spread out; epoll: blocking-pool file reads, 19 context switches/req |
 | h3-post | 40.2k / 40.0k | 230,381 / 231,496 | 53k | 47 | ngtcp2 20-21%, BoringSSL 13%, memcpy 8% |
 | grpc-unary | 318k / 322k | 34,761 / 34,820 | 1.2k | 839 / 952 | nghttp2 21%, h2 glue 15-16%, arena 10-11% |
-| sse-h1 | (4,000 subs) | | | 93 / 83 | ≈ 19-21 KB RSS per subscriber |
-| sse-h2c | (4,000 subs) | | | 211 / 200 | ≈ 48-51 KB RSS per subscriber |
+| sse-h1 | (4,000 subs) | | | 93 / 83 (settles at 25 / 26) | ≈ 4.7-5.0 KB settled RSS per subscriber |
+| sse-h2c | (4,000 subs) | | | 211 / 200 (settles at 206 / 194) | ≈ 48-51 KB settled RSS per subscriber |
 | net-tcp | 264k / 244k msg/s | 2,099 / 1,664 | 31k | 11 | kernel: netfilter 39-43% |
 
 ## Findings by S2 item
@@ -112,7 +112,9 @@ These are leads from one pass. The S2 work on each item verifies them (profile, 
   The response also takes 41 KB arena per request in `Response.write`, plus 10.5 KB malloc from BoringSSL's `tls_write_app_data`.
 - **#97 (idle HTTP/2 tasks):** an h2c SSE subscriber costs 4 task-pool slots and 3 coroutine stacks, against 2 and 2 over h1.
   - That is about 2.6 MB of stack mmap, against 1.6 MB over h1.
-  - It measured about 50 KB RSS per subscriber, against 20 KB over h1.
+  - Settled RSS, after the connection ramp, is 48-51 KB per subscriber over h2c against 4.7-5.0 KB over h1, about 10 times more.
+  - Over h1 the ramp's memory comes back within about 10 s (93 MB falls to 25 MB). Over h2c it stays (206 MB).
+  - An earlier draft of this note said 20 KB for h1: that was the ramp's peak, not the held figure.
   - The extra stacks come from `h2.Engine.startStream` (1.4 MB of mmap per subscriber) and the connection's `serve` writer.
 
 ### #100 / H3: nghttp3 crosses its takeover trigger

@@ -280,7 +280,9 @@ def rss(d):
     return {"t": [round(r[0] - t0, 1) for r in rows], "cgroup_mb": [round(r[1] / 2**20, 1) for r in rows],
             "rss_mb": [round(r[2] / 1024, 1) for r in rows], "threads": [r[3] for r in rows],
             "peak_cgroup_mb": round(max(r[1] for r in rows) / 2**20, 1), "peak_rss_mb": round(max(r[2] for r in rows) / 1024, 1),
-            "start_rss_mb": round(rows[0][2] / 1024, 1), "end_rss_mb": round(rows[-1][2] / 1024, 1)}
+            "start_rss_mb": round(rows[0][2] / 1024, 1), "end_rss_mb": round(rows[-1][2] / 1024, 1),
+            # What stays after the peak (the SSE cells: subscribers held, the connection ramp's buffers gone).
+            "settled_rss_mb": round(min(r[2] for r in rows[max(range(len(rows)), key=lambda i: rows[i][2]):]) / 1024, 1)}
 
 
 def one(d):

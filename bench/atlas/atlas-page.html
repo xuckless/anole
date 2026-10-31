@@ -147,8 +147,8 @@ function detail() {
   const vs = (k, d = 0) => oc[k] != null ? `${BE[other.backend]} ${fmt(oc[k], d)}` : "";
   const metrics = sse ? [
     metric("Subscribers", fmt(r.subscribers)),
-    metric("Peak RSS", fmt(r.rss.peak, 1) + " MB", other ? `${BE[other.backend]} ${fmt(other.rss.peak, 1)} MB` : ""),
-    metric("RSS / subscriber", r.subscribers ? fmt((r.rss.peak - (r.rss.mb[0] || 0)) * 1024 / r.subscribers, 1) + " KB" : "–"),
+    metric("Settled RSS", fmt(r.rss.settled, 1) + " MB", `peak ${fmt(r.rss.peak, 1)} MB during the connection ramp`),
+    metric("RSS / subscriber", r.subscribers ? fmt((r.rss.settled - (r.rss.start || 0)) * 1024 / r.subscribers, 1) + " KB" : "–", "settled RSS less the idle server's, per subscriber"),
   ] : [
     metric(state.cell === "net-tcp" ? "Max msg/s" : "Max req/s", fmt(c.max_rps), vs("max_rps")),
     metric("ins:u / req", fmt(c.instr_u_req), vs("instr_u_req")),

@@ -21601,6 +21601,7 @@
    "peak_rss_mb": 93.4,
    "start_rss_mb": 6.4,
    "end_rss_mb": 43.6,
+   "settled_rss_mb": 24.6,
    "memory_peak_mb": 119.8
   },
   "flames": {
@@ -22189,6 +22190,7 @@
    "peak_rss_mb": 83.4,
    "start_rss_mb": 6.0,
    "end_rss_mb": 34.4,
+   "settled_rss_mb": 25.6,
    "memory_peak_mb": 110.9
   },
   "flames": {
@@ -22787,6 +22789,7 @@
    "peak_rss_mb": 210.6,
    "start_rss_mb": 6.2,
    "end_rss_mb": 206.5,
+   "settled_rss_mb": 206.4,
    "memory_peak_mb": 250.7
   },
   "flames": {
@@ -23383,6 +23386,7 @@
    "peak_rss_mb": 199.9,
    "start_rss_mb": 6.2,
    "end_rss_mb": 193.9,
+   "settled_rss_mb": 193.8,
    "memory_peak_mb": 242.0
   },
   "flames": {
