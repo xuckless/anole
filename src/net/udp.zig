@@ -604,17 +604,31 @@ test "UDP: a send that a cancelation interrupts leaves it for the next cancelati
 test "UDP: asked socket buffers are set, and what the system granted is read back" {
     if (comptime !Udp.has_control) return error.SkipZigTest; // no options on Windows
     const zio = @import("zio");
-    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
     defer rt.deinit();
     const io = rt.io();
     const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    // Under every default cap (Linux's rmem_max is 208 KiB unless raised).
-    const asked = 96 * 1024;
+    const asked: u31 = 96 * 1024;
     var u: Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), .{ .rcvbuf = asked, .sndbuf = asked });
     defer u.socket.close(io);
-    // Linux reports twice what it granted; macOS what was asked.
-    try std.testing.expect(u.rcvbuf >= asked);
-    try std.testing.expect(u.sndbuf >= asked);
+    if (comptime @import("builtin").os.tag == .linux) {
+        // Linux grants up to net.core.{r,w}mem_max and reports twice that.
+        // (@min of a comptime-known value narrows its type: widen first.)
+        const rcv_want: u64 = @min(asked, try testSysctl(io, "/proc/sys/net/core/rmem_max"));
+        const snd_want: u64 = @min(asked, try testSysctl(io, "/proc/sys/net/core/wmem_max"));
+        try std.testing.expect(u.rcvbuf >= 2 * rcv_want);
+        try std.testing.expect(u.sndbuf >= 2 * snd_want);
+    } else {
+        // macOS reports what was asked (kern.ipc.maxsockbuf is 8 MiB).
+        try std.testing.expect(u.rcvbuf >= asked);
+        try std.testing.expect(u.sndbuf >= asked);
+    }
+}
+
+fn testSysctl(io: std.Io, path: []const u8) !u64 {
+    var buf: [32]u8 = undefined;
+    const text = try std.Io.Dir.cwd().readFile(io, path, &buf);
+    return std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10);
 }
 
 test "UDP: ECN codepoints and the local address of a wildcard socket come through" {
