@@ -3619,8 +3619,7 @@ test "Server: the Compress middleware gzips text and leaves images alone" {
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
     var compress = dusty.middleware.Compress.init(.{});
-    const mws = [_]dusty.Middleware(void){dusty.Middleware(void).init(&compress)};
-    server.router.middlewares = &mws;
+    server.router.use(dusty.Middleware(void).init(&compress));
     server.router.get("/text", struct {
         fn handle(_: *dusty.Request, res: *dusty.Response) !void {
             res.content_type = .text;

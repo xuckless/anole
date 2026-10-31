@@ -12,6 +12,12 @@ breaking changes are listed anyway.
   departed peer: no "HTTP/2 write error" log line, `peerGone()` and a gRPC
   call's `cancelled()` are true, and `anole.net` reports a reset instead of a
   failure (#34).
+- `Router.middlewares` assigned directly (instead of through `use()`) was
+  kept as the caller's slice by every route registered after it, so a
+  stack array or reused buffer was read after it changed or went out of
+  scope. A route now keeps a copy in the router's arena. `use()` is the
+  supported way to add global middleware; a list assigned after the last
+  route is still read as is for 404/405 answers (#38).
 
 ## 0.4.1 (2026-10-30)
 

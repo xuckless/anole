@@ -135,8 +135,18 @@ pub fn Router(comptime Ctx: type) type {
         /// level the walk tries static children first, so a route of static
         /// segments only wins over any parameter or wildcard route.
         static_routes: std.StringHashMapUnmanaged(*StaticRoute) = .empty,
-        // Global middlewares applied to all routes
+        /// Global middlewares applied to all routes, in the router's
+        /// arena. Internal: add to it with `use()`. A list assigned here
+        /// directly is copied into the arena when the next route is
+        /// registered, so no route keeps the caller's slice; routes
+        /// registered before the assignment keep the list they took. A
+        /// list assigned after the last route is not copied and is read
+        /// as is for 404/405 answers, so it must outlive the router.
         middlewares: []const Middleware(Ctx) = &.{},
+        /// The last list this router owns (`use()` or a copy of an
+        /// assigned one): `middlewares` pointing anywhere else was
+        /// assigned directly and is copied before a route keeps it.
+        owned_middlewares: []const Middleware(Ctx) = &.{},
         /// A route was registered: each route took a copy of the global
         /// middleware then, so adding more now would miss them.
         has_routes: bool = false,
@@ -232,6 +242,17 @@ pub fn Router(comptime Ctx: type) type {
             if (self.conflict == null) self.conflict = try std.fmt.allocPrint(self.arena.allocator(), fmt, args);
         }
 
+        /// Copies the global list into the arena when it was assigned
+        /// directly rather than built by `use()`, so neither the routes
+        /// nor a miss (`miss`) keep the caller's slice.
+        fn ownGlobal(self: *Self) !void {
+            const list = self.middlewares;
+            if (list.len == 0) return;
+            if (list.ptr == self.owned_middlewares.ptr and list.len == self.owned_middlewares.len) return;
+            self.owned_middlewares = try self.arena.allocator().dupe(Middleware(Ctx), list);
+            self.middlewares = self.owned_middlewares;
+        }
+
         fn insertRoute(
             self: *Self,
             path: []const u8,
@@ -240,6 +261,10 @@ pub fn Router(comptime Ctx: type) type {
             middlewares: []const Middleware(Ctx),
             opts: RouteOptions,
         ) !void {
+            // A route given the global list keeps the arena's copy of it.
+            const global = middlewares.len != 0 and middlewares.ptr == self.middlewares.ptr and middlewares.len == self.middlewares.len;
+            try self.ownGlobal();
+            const mws = if (global) self.middlewares else middlewares;
             self.has_routes = true;
             if (opts.no_wait) self.has_no_wait = true;
             if (route_pattern.problem(path)) |p| {
@@ -352,7 +377,7 @@ pub fn Router(comptime Ctx: type) type {
             route.* = .{
                 .info = .{ .path = try alloc.dupe(u8, path), .data = opts.data, .index = @intCast(self.routes.items.len + 1) },
                 .action = handler,
-                .middlewares = middlewares,
+                .middlewares = mws,
                 .no_wait = opts.no_wait,
                 .method = method,
                 .kind = opts.kind,
@@ -746,6 +771,7 @@ pub fn Router(comptime Ctx: type) type {
             @memcpy(list[0..self.middlewares.len], self.middlewares);
             list[self.middlewares.len] = middleware;
             self.middlewares = list;
+            self.owned_middlewares = list;
         }
 
         pub const Group = struct {
@@ -1673,7 +1699,8 @@ test "Router: a route registered on the router runs the router's middleware" {
 
     var mw1 = TestMw{ .id = 1 };
     var mw2 = TestMw{ .id = 2 };
-    router.middlewares = &.{ Middleware(void).init(&mw1), Middleware(void).init(&mw2) };
+    router.use(Middleware(void).init(&mw1));
+    router.use(Middleware(void).init(&mw2));
 
     router.get("/direct", voidHandler1);
 
@@ -1687,6 +1714,38 @@ test "Router: a route registered on the router runs the router's middleware" {
     const route = try router.findHandler(&req);
     try std.testing.expect(route != null);
     try std.testing.expectEqual(2, route.?.middlewares.len);
+}
+
+test "Router: a global middleware list assigned directly is copied when a route takes it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const TestMw = struct {
+        id: u8,
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Chain(void)) !void {}
+    };
+
+    var mw1 = TestMw{ .id = 1 };
+    var mw2 = TestMw{ .id = 2 };
+    // The caller's own buffer, reused after the route is registered.
+    var list = [_]Middleware(void){Middleware(void).init(&mw1)};
+    router.middlewares = &list;
+    router.get("/a", voidHandler1);
+    list[0] = Middleware(void).init(&mw2);
+
+    var req = Request{
+        .method = .get,
+        .url = "/a",
+        .arena = arena.allocator(),
+        ._parser = undefined,
+        ._transport = undefined,
+    };
+    const route = (try router.findHandler(&req)).?;
+    try std.testing.expectEqual(1, route.middlewares.len);
+    try std.testing.expect(route.middlewares[0].ptr == @as(*anyopaque, @ptrCast(&mw1)));
 }
 
 test "Group: group middlewares appended after global" {
@@ -1703,7 +1762,7 @@ test "Group: group middlewares appended after global" {
 
     var mw_global = TestMw{ .id = 1 };
     var mw_group = TestMw{ .id = 2 };
-    router.middlewares = &.{Middleware(void).init(&mw_global)};
+    router.use(Middleware(void).init(&mw_global));
 
     const api = router.group("/api", &.{Middleware(void).init(&mw_group)});
     api.get("/users", voidHandler1);
