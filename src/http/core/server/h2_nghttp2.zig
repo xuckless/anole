@@ -18,10 +18,12 @@
 //! and the writer encrypts through one `tls.Connection`, which must support
 //! one concurrent reader plus one writer (tls.zig does).
 //!
-//! Request bodies: a per-stream queue sized to the stream window, allocated
-//! on the first DATA frame. The session side can always put into it without
-//! blocking (a peer past its window is a protocol error nghttp2 rejects
-//! first), and the handler returns window credit as it reads.
+//! Request bodies: a per-stream queue allocated on the first DATA frame,
+//! sized to the body when its length is known (content-length, or the one
+//! DATA frame that carries END_STREAM) and else to the stream window. The
+//! session side can always put into it without blocking (a peer past its
+//! window or its content-length is a protocol error nghttp2 rejects first),
+//! and the handler returns window credit as it reads.
 //!
 //! Response bodies: the handler writes into a per-stream queue and blocks
 //! when it is full; the data provider takes from it without blocking and
@@ -52,6 +54,8 @@ const Transport = @import("../transport.zig").Transport;
 const Timer = @import("../deadline.zig").Timer;
 const placement = @import("../placement.zig");
 const gauges = @import("../gauges.zig");
+const block_cache = @import("../block_cache.zig");
+const Signal = @import("../signal.zig").Signal;
 
 const log = std.log.scoped(.anole_h2);
 
@@ -67,6 +71,34 @@ pub var test_before_flush: if (@import("builtin").is_test) ?*const fn (std.Io) s
 pub var test_before_fill: if (@import("builtin").is_test) ?*const fn (std.Io, FillProbe) std.Io.Cancelable!void else void =
     if (@import("builtin").is_test) null else {};
 
+/// Tests only: runs in the writer just before it waits for more output,
+/// with nothing held, so a test on a one-executor runtime knows the writer
+/// is asleep once the hook has run and the writer has yielded
+/// (src/http/h2_wake_test.zig). Nothing outside tests.
+pub var test_before_writer_wait: if (@import("builtin").is_test) ?*const fn (std.Io) void else void =
+    if (@import("builtin").is_test) null else {};
+
+/// Tests only: the rounds of output the writer task took and wrote (not
+/// the reader's inline ones, `writeInline`).
+pub var test_writer_rounds: if (@import("builtin").is_test) std.atomic.Value(u32) else void =
+    if (@import("builtin").is_test) .init(0) else {};
+
+/// Tests only: when set, the reader's inline write (`writeInline`) fails
+/// as a write that timed out would, with its round taken and unwritten.
+pub var test_inline_write_fails: if (@import("builtin").is_test) std.atomic.Value(bool) else void =
+    if (@import("builtin").is_test) .init(false) else {};
+
+/// Tests only: streams whose handler asked for a body writer
+/// (`StreamSink.body`), the streaming path; a response sent whole never
+/// does.
+pub var test_sink_bodies: if (@import("builtin").is_test) std.atomic.Value(u32) else void =
+    if (@import("builtin").is_test) .init(0) else {};
+
+/// Tests only: the writer task's waits for output that returned (woken,
+/// or a deadline).
+pub var test_writer_wakes: if (@import("builtin").is_test) std.atomic.Value(u32) else void =
+    if (@import("builtin").is_test) .init(0) else {};
+
 /// Tests only: runs once the reader has seen the peer's side end cleanly
 /// (EOF, e.g. a half-close) and the connection has marked itself closing
 /// and let go of the streams that can no longer finish, before the writer
@@ -74,6 +106,39 @@ pub var test_before_fill: if (@import("builtin").is_test) ?*const fn (std.Io, Fi
 /// observed the end (h2_test.zig). Nothing outside tests.
 pub var test_after_peer_end: if (@import("builtin").is_test) ?*const fn (std.Io) void else void =
     if (@import("builtin").is_test) null else {};
+
+/// Tests only: when set, every request body queue is this long, whatever
+/// the body, so a test can make the session's put overflow it
+/// (h2_test.zig). Nothing outside tests.
+pub var test_body_queue_len: if (@import("builtin").is_test) ?usize else void =
+    if (@import("builtin").is_test) null else {};
+
+/// Tests only: request body queues allocated so far, by where their
+/// memory came from (`BodyBuf`).
+pub const test_body_allocs = if (@import("builtin").is_test) struct {
+    pub var arena: std.atomic.Value(usize) = .init(0);
+    pub var heap: std.atomic.Value(usize) = .init(0);
+    pub var block: std.atomic.Value(usize) = .init(0);
+} else struct {};
+
+/// Tests only: times a stream's peer sent a whole window of a body that
+/// may still be raised (`Stream.raise_due`), and the raises, with the
+/// window each raised to (the last `test_raised.len`).
+pub const test_window = if (@import("builtin").is_test) struct {
+    pub var fulls: std.atomic.Value(u32) = .init(0);
+    pub var raises: std.atomic.Value(u32) = .init(0);
+    pub var raised: [8]std.atomic.Value(u32) = @splat(.init(0));
+    /// The most a connection's raised windows took at once
+    /// (`Conn.raised_bytes`).
+    pub var peak_bytes: std.atomic.Value(usize) = .init(0);
+} else struct {};
+
+/// Tests only: the spare streams' trim epoch, which only a test moves (in
+/// place of `Server.trim_epoch`, which moves every 5 s): a connection
+/// that sees it change frees the spares it kept unused since
+/// (`Conn.trimSpares`).
+pub var test_trim_epoch: if (@import("builtin").is_test) std.atomic.Value(u32) else void =
+    if (@import("builtin").is_test) .init(0) else {};
 
 /// What `test_before_fill` is told about the connection.
 pub const FillProbe = struct {
@@ -114,16 +179,29 @@ pub fn sniffPreface(r: *std.Io.Reader) error{ReadFailed}!bool {
     }
 }
 
-/// Spare streams a connection keeps for reuse.
-const max_spare_streams = 16;
-/// What a reused stream's arena keeps between requests: the queues and
-/// buffers of an ordinary request with a body fit.
-const arena_retain_limit = 128 * 1024;
+/// A request body queue up to this long comes from the stream's arena,
+/// whose kept node holds it.
+const arena_body_max = 4 * 1024;
+
+/// Spare streams a connection keeps for reuse: as many as the client may
+/// open at once (`max_concurrent_streams`, h2load's 100 for one), up to
+/// this many.
+const max_spare_streams = 128;
+/// The spares a trim never goes below.
+const min_spare_streams = 16;
+/// What a stream's arena keeps between requests, and starts with: an
+/// ordinary request takes about 3 KB of it (the S2 atlas); the body and
+/// response queues are not in it. Less the arena's node header (three
+/// words, `std.heap.ArenaAllocator`'s `Node`) and some slack, so the node
+/// fits malloc's 8 KiB slab class rather than the 16 KiB one.
+const arena_retain_limit = 8 * 1024 - 4 * @sizeOf(usize);
 
 /// Response body bytes queued per stream between the handler and the data
-/// provider; a handler that gets this far ahead of the peer waits.
-const out_queue_len = 32 * 1024;
-/// The handler-side buffer in front of that queue.
+/// provider; a handler that gets this far ahead of the peer waits. From
+/// the connection's allocator, and short enough for malloc's slabs
+/// (`block_cache.malloc_max`), so a streamed response maps nothing.
+const out_queue_len = 32 * 1024 - 64;
+/// The handler-side buffer in front of that queue, from the same.
 const body_writer_len = 16 * 1024;
 
 /// The body writer buffer of a tunnel stream, whose frames go to the outbox
@@ -191,6 +269,23 @@ pub fn Engine(comptime Ctx: type) type {
                 return r.list.first != null;
             }
 
+            /// Tests only: the spare streams the open connections keep.
+            pub fn sparesForTest(r: *Registry) usize {
+                if (!@import("builtin").is_test) @compileError("sparesForTest is for tests");
+                const io = r.server().io;
+                r.mutex.lockUncancelable(io);
+                defer r.mutex.unlock(io);
+                var n: usize = 0;
+                var it = r.list.first;
+                while (it) |node| : (it = node.next) {
+                    const conn: *Conn = @alignCast(@fieldParentPtr("node", node));
+                    conn.lock();
+                    defer conn.unlock();
+                    n += conn.spare_streams.items.len;
+                }
+                return n;
+            }
+
             /// Sends the final GOAWAY to connections whose peer has not
             /// answered the notice's PING.
             pub fn finishDrain(r: *Registry) void {
@@ -222,13 +317,33 @@ pub fn Engine(comptime Ctx: type) type {
             /// Held only for computation, never across I/O.
             mutex: std.Io.Mutex = .init,
             session: ?*c.nghttp2_session = null,
-            streams: std.AutoHashMapUnmanaged(i32, *Stream) = .empty,
+            /// The streams with a handler or a protocol side still holding
+            /// them. Std's array hash map: a dense array of entries (a linear
+            /// scan below 16, Robin Hood with backward-shift deletion above,
+            /// no tombstones), walked as `values()`. Removal swaps the last
+            /// entry in, so a walk that may remove goes backwards or starts
+            /// over.
+            streams: std.AutoArrayHashMapUnmanaged(i32, *Stream) = .empty,
             /// Finished streams kept for reuse with their arenas, so a
             /// connection's requests stop allocating once it is warm.
             spare_streams: std.ArrayList(*Stream) = .empty,
+            /// At most `max_spare_streams`, and no more than the client may
+            /// open at once.
+            max_spares: usize = min_spare_streams,
+            /// The fewest spares held since the last trim: that many sat
+            /// unused all the while (`trimSpares`).
+            spare_low: usize = 0,
+            /// The trim epoch the spares were last trimmed at.
+            spare_epoch: u32 = 0,
             /// Streams with a handler still running or a response still
-            /// going out, each counted in the server's in-flight requests.
+            /// going out.
             open_streams: usize = 0,
+            /// The connection holds one count in the server's in-flight
+            /// requests (`busy`) while any stream is open or a finished
+            /// one's last frames are not flushed yet (`releaseBusyIfIdle`):
+            /// two shared atomic writes per burst of streams, not per
+            /// stream (#99).
+            busy_held: bool = false,
             /// Set while the reader runs the session, so a stream whose head
             /// completes can be handed to a task in the connection's group.
             group: ?*std.Io.Group = null,
@@ -250,8 +365,10 @@ pub fn Engine(comptime Ctx: type) type {
             /// The reader is done; the writer sends what is left and exits.
             closing: bool = false,
             /// The session is over and the writer has shut the send side
-            /// (`shutSend`): what the peer still sends is not for the
-            /// session, only for the lingering close to throw away.
+            /// (`shutSend`), or the reader's inline write failed
+            /// (`inlineWriteFailed`): what the peer still sends is not for
+            /// the session, only for the lingering close to throw away, and
+            /// the writer writes nothing more.
             send_shut: bool = false,
             /// A GOAWAY went out because the server is draining.
             goaway_sent: bool = false,
@@ -264,17 +381,43 @@ pub fn Engine(comptime Ctx: type) type {
             /// cancel cuts off neither: a close with the peer's last frames
             /// unread would be a reset (#135).
             drain_hold: bool = false,
-            /// Streams that are done but whose last frames the writer may
-            /// not have flushed yet. Each keeps its count in the server's
-            /// in-flight requests until the writer has flushed everything it
-            /// took before the stream finished (`settleFinished`): nghttp2
-            /// closes a stream when the writer takes its last frame, before
+            /// Streams that are done but whose last frames may not have
+            /// been flushed yet. They keep the connection's count in the
+            /// server's in-flight requests until a round has flushed
+            /// everything taken up to their finish (`settleFinished`):
+            /// nghttp2 closes a stream when its last frame is taken, before
             /// the write, and a drain that saw the count reach zero there
             /// would cancel the connection with the response still unsent.
             unflushed_finishes: usize = 0,
+            /// Finished streams a round took out of `unflushed_finishes`
+            /// and has not flushed yet (`takeRound` to `settleFinished`).
+            settling: usize = 0,
             /// The writer has ended: a stream that finishes gives its count
             /// back at once.
             writer_gone: bool = false,
+            /// A round of output is being written, by the writer task or by
+            /// the reader after its `no_wait` requests (`writeInline`): the
+            /// other side takes nothing meanwhile, so frames go out in the
+            /// order the session gave them.
+            writing: bool = false,
+            /// The writer woke during the reader's round and waits for it:
+            /// the reader notifies it when its round is over.
+            writer_deferred: bool = false,
+            /// Frames of the current round that did not fit the
+            /// connection's write buffer; freed whenever the writer runs out
+            /// of output, so an idle connection holds none.
+            spill: std.ArrayList(u8) = .empty,
+            /// `takeRound` is taking output: what the session does meanwhile
+            /// (a stream closing, a reset it submits) goes out in that round,
+            /// so it kicks nobody (`kickWriterLocked`).
+            in_take: bool = false,
+            /// Set by the reader while it runs a read's `no_wait` requests
+            /// and writes their responses itself (`writeInline`): a kick then
+            /// only sets `kick_missed`, for the reader to pass on once its
+            /// round is over if its take did not cover it, so the writer
+            /// task is not woken for output the reader writes anyway.
+            inline_round: std.atomic.Value(bool) = .init(false),
+            kick_missed: std.atomic.Value(bool) = .init(false),
             /// In `Registry`.
             node: std.DoublyLinkedList.Node = .{},
             /// Streams whose handler is done with their response still
@@ -288,9 +431,9 @@ pub fn Engine(comptime Ctx: type) type {
             refused_tokens: u64 = 0,
             refused_at: i64 = 0,
 
-            /// Bumped (under the mutex) whenever the session may have output.
-            /// The writer waits on it.
-            write_gen: std.atomic.Value(u32) = .init(0),
+            /// Notified whenever the session may have output. Only the
+            /// writer waits on it; a handler waits on its stream's `wake`.
+            writer: Signal = .{},
 
             /// Parked streams (`H2Parked`) whose owner has not called
             /// `release`, and the bursts running on them. The connection's
@@ -310,9 +453,8 @@ pub fn Engine(comptime Ctx: type) type {
                 // would hold the drain until its deadline: end them now
                 // (`startDiscard` ends the ones that start discarding
                 // during the drain).
-                var it = conn.streams.valueIterator();
-                while (it.next()) |stream| {
-                    if (stream.*.discarding) resetDiscarded(conn, stream.*);
+                for (conn.streams.values()) |stream| {
+                    if (stream.discarding) resetDiscarded(conn, stream);
                 }
                 if (conn.goaway_sent or conn.drain_notice or conn.closing) return;
                 if (c.nghttp2_submit_shutdown_notice(conn.session) != 0) return;
@@ -357,14 +499,97 @@ pub fn Engine(comptime Ctx: type) type {
                 return @intCast(c.nghttp2_session_get_local_settings(conn.session, c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE));
             }
 
-            /// Gives back the counts of `n` finished streams, once the writer
-            /// has flushed what it took up to their finish. Takes the mutex.
+            /// Gives back the counts of `n` finished streams, which a round
+            /// took out of `unflushed_finishes` with its frames
+            /// (`takeRound`), once it has flushed them (or failed to: the
+            /// connection is gone then).
             fn settleFinished(conn: *Conn, n: usize) void {
                 if (n == 0) return;
                 conn.lock();
-                conn.unflushed_finishes -= n;
-                conn.unlock();
-                for (0..n) |_| conn.server.finishRequest();
+                defer conn.unlock();
+                conn.settling -= n;
+                conn.releaseBusyIfIdle();
+            }
+
+            /// A round that took nothing gives its finished streams back to
+            /// the next one. Under the mutex.
+            fn untake(conn: *Conn, n: usize) void {
+                conn.settling -= n;
+                conn.unflushed_finishes += n;
+            }
+
+            /// A stream is open: the connection counts in the server's
+            /// in-flight requests, once. Under the mutex.
+            fn holdBusy(conn: *Conn) void {
+                conn.open_streams += 1;
+                if (conn.busy_held) return;
+                conn.busy_held = true;
+                _ = conn.server.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
+            }
+
+            /// Gives the connection's count back once no stream is open and
+            /// every finished one's frames are flushed (or the writer is
+            /// gone). Under the mutex.
+            fn releaseBusyIfIdle(conn: *Conn) void {
+                if (!conn.busy_held or conn.open_streams != 0 or conn.unflushed_finishes != 0 or conn.settling != 0) return;
+                conn.busy_held = false;
+                conn.server.finishRequest();
+            }
+
+            /// Takes the session's output for one round, under the mutex,
+            /// a frame at a time: a frame from `mem_send2` is valid only
+            /// until the next call, so it is copied straight into the
+            /// connection's write buffer, where it waits for the round's one
+            /// write, or to `spill` when it does not fit (up to 64 KiB, the
+            /// rest next round). Returns the streams finished by now (during
+            /// the take too), whose counts go back once this round is
+            /// flushed.
+            fn takeRound(conn: *Conn) error{ Http2ProtocolError, OutOfMemory }!usize {
+                conn.in_take = true;
+                defer conn.in_take = false;
+                const writer = conn.connection.writer;
+                while (true) {
+                    var data: [*c]const u8 = undefined;
+                    const n = c.nghttp2_session_mem_send2(conn.session, &data);
+                    if (n < 0) return error.Http2ProtocolError;
+                    if (n == 0) break;
+                    const frame = data[0..@intCast(n)];
+                    const room = writer.unusedCapacitySlice();
+                    if (conn.spill.items.len == 0 and frame.len <= room.len) {
+                        @memcpy(room[0..frame.len], frame);
+                        writer.advance(frame.len);
+                        continue;
+                    }
+                    try conn.spill.appendSlice(conn.allocator, frame);
+                    if (conn.spill.items.len >= 64 * 1024) break;
+                }
+                // Taken last: a stream that closed during this take has its
+                // last frame in this round.
+                const settled = conn.unflushed_finishes;
+                conn.unflushed_finishes = 0;
+                conn.settling += settled;
+                return settled;
+            }
+
+            fn roundTaken(conn: *const Conn) bool {
+                return conn.connection.writer.end > 0 or conn.spill.items.len > 0;
+            }
+
+            /// Writes what `takeRound` took, bounded by the write timeout.
+            /// Not under the mutex; `writing` keeps the other side out.
+            fn flushRound(conn: *Conn) !void {
+                const writer = conn.connection.writer;
+                if (comptime @import("builtin").is_test) if (test_before_flush) |hook| try hook(conn.io);
+                // A peer that stops reading must not hold the connection,
+                // and with it every stream, for good.
+                var write_timer: Timer = .init(null);
+                defer write_timer.clear(conn.io);
+                if (conn.server.config.timeout.write) |d| write_timer.set(conn.io, .{ .duration = .{ .raw = d, .clock = .awake } });
+                if (conn.spill.items.len > 0) {
+                    writer.writeAll(conn.spill.items) catch return writeFailed(conn, &write_timer);
+                    conn.spill.clearRetainingCapacity();
+                }
+                writer.flush() catch return writeFailed(conn, &write_timer);
             }
 
             /// The writer has ended (or never started): what it still held
@@ -372,18 +597,55 @@ pub fn Engine(comptime Ctx: type) type {
             /// Under the mutex.
             fn writerGone(conn: *Conn) void {
                 conn.writer_gone = true;
-                for (0..conn.unflushed_finishes) |_| conn.server.finishRequest();
                 conn.unflushed_finishes = 0;
+                conn.releaseBusyIfIdle();
             }
 
-            /// Wakes every waiter on `write_gen`: the writer, and any
-            /// handler waiting for its stream's first DATA frame or end
-            /// (`BodyReader.streamFn`). Waking one could hand the kick to
-            /// such a reader, which finds nothing and waits again, while
-            /// the writer sleeps on with a frame another task queued.
+            /// Wakes the writer. Nothing else waits on its signal: a
+            /// handler waiting for its body waits on its stream's `wake`,
+            /// so it can never take a wake meant for the writer (57fdfa9).
             fn kickWriter(conn: *Conn) void {
-                _ = conn.write_gen.fetchAdd(1, .release);
-                conn.io.futexWake(u32, &conn.write_gen.raw, std.math.maxInt(u32));
+                // Against the reader's end of its round (`endInlineRound`):
+                // either this sees `inline_round` cleared and notifies, or
+                // the reader's swap sees `kick_missed` set (seq_cst both).
+                if (conn.inline_round.load(.seq_cst)) {
+                    conn.kick_missed.store(true, .seq_cst);
+                    if (conn.inline_round.load(.seq_cst)) return;
+                }
+                conn.writer.notify(conn.io);
+            }
+
+            /// `kickWriter`, under the mutex: none while `takeRound` takes,
+            /// whose round carries what the kick was for.
+            fn kickWriterLocked(conn: *Conn) void {
+                if (conn.in_take) return;
+                conn.kickWriter();
+            }
+
+            /// The reader's inline round is over: kicks the writer if a
+            /// kick came after the round's take.
+            fn endInlineRound(conn: *Conn, kick: bool) void {
+                conn.inline_round.store(false, .seq_cst);
+                if (conn.kick_missed.swap(false, .seq_cst) or kick) conn.writer.notify(conn.io);
+            }
+
+            fn trimEpoch(conn: *Conn) u32 {
+                if (comptime @import("builtin").is_test) return test_trim_epoch.load(.monotonic);
+                return conn.server.trim_epoch.load(.monotonic);
+            }
+
+            /// Once a trim interval has passed (`Server.trim_epoch`), frees
+            /// the spare streams that sat unused since the last trim (the
+            /// low-water mark), never below `min_spare_streams`, as
+            /// `block_cache.trimLocal` does with its blocks. A burst's
+            /// spares go after two quiet intervals. Under the mutex.
+            fn trimSpares(conn: *Conn) void {
+                const epoch = conn.trimEpoch();
+                if (epoch == conn.spare_epoch) return;
+                conn.spare_epoch = epoch;
+                const n = @min(conn.spare_low, conn.spare_streams.items.len -| min_spare_streams);
+                for (0..n) |_| conn.spare_streams.pop().?.destroy(conn.allocator);
+                conn.spare_low = conn.spare_streams.items.len;
             }
 
             fn lock(conn: *Conn) void {
@@ -398,6 +660,7 @@ pub fn Engine(comptime Ctx: type) type {
                 var callbacks: ?*c.nghttp2_session_callbacks = null;
                 if (c.nghttp2_session_callbacks_new(&callbacks) != 0) return error.OutOfMemory;
                 defer c.nghttp2_session_callbacks_del(callbacks);
+                c.nghttp2_session_callbacks_set_on_begin_frame_callback(callbacks, onBeginFrame);
                 c.nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, onBeginHeaders);
                 c.nghttp2_session_callbacks_set_on_header_callback(callbacks, onHeader);
                 c.nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, onFrameRecv);
@@ -415,6 +678,10 @@ pub fn Engine(comptime Ctx: type) type {
                 // onHeader, against what SETTINGS advertised.
                 c.nghttp2_option_set_stream_reset_rate_limit(option, conn.config.stream_reset_burst, conn.config.stream_reset_rate);
                 c.nghttp2_option_set_max_continuations(option, conn.config.max_continuations);
+                // Never `nghttp2_option_set_no_http_messaging`: the body
+                // queue is sized to the content-length, which only HTTP
+                // messaging holds the DATA to (`Stream.bodySize`; the test
+                // "a body past its content-length resets only its stream").
 
                 if (c.nghttp2_session_server_new2(&conn.session, callbacks, conn, option) != 0) return error.OutOfMemory;
                 errdefer {
@@ -517,15 +784,43 @@ pub fn Engine(comptime Ctx: type) type {
             /// Request body: DATA in, the handler out. Allocated on the
             /// first DATA frame; a request without a body never has one.
             body: ?std.Io.Queue(u8) = null,
+            /// Where the body queue's memory is, freed in `release`.
+            body_buf: BodyBuf = .{},
+            /// The response queue's and body writer's memory, from the
+            /// connection's allocator, freed in `release`.
+            out_buf: []u8 = &.{},
+            writer_buf: []u8 = &.{},
+            /// The request's content-length, which nghttp2 holds the DATA
+            /// to (it never runs with `no_http_messaging`).
+            content_length: ?u64 = null,
+            /// The length of the DATA frame with END_STREAM, when it is the
+            /// body's first (`onBeginFrame`): the whole body fits in it.
+            end_frame_len: ?u32 = null,
             /// The stream's receive window, which the body queue holds:
-            /// `stream_window`, raised to `stream_window_reading` once the
-            /// handler reads. Zero until set (`window`).
+            /// `stream_window`, raised in steps toward
+            /// `stream_window_reading` while the handler reads and the
+            /// peer keeps using it up (`raiseWindow`). Zero until raised
+            /// (`window`).
             recv_window: u31 = 0,
+            /// The peer sent a whole window since the window was last
+            /// raised (`since_raise`), and it may still be raised
+            /// (`mayRaise`): the handler's next read raises it.
+            raise_due: bool = false,
+            /// Body bytes the peer sent since the window was last raised,
+            /// counting what was queued unread then. Counted however fast
+            /// the handler reads: a handler that keeps up gives the window
+            /// back at each half (WINDOW_UPDATE), so the window itself never
+            /// runs out.
+            since_raise: usize = 0,
             /// The request had no body at all (END_STREAM on its HEADERS),
             /// or its body has ended.
             body_done: bool = false,
             /// The peer reset the stream, or the connection went away.
             reset: bool = false,
+            /// The handler waits on it for body bytes or the body's end
+            /// (`BodyReader.streamFn`): notified for each DATA frame, the
+            /// end, and a reset. Nothing else waits on it.
+            wake: Signal = .{},
             /// The handler's task while it runs, to cancel it when `reset`
             /// comes before the response is complete. Set and cleared by
             /// the task itself, under the mutex; null off zio.
@@ -605,50 +900,151 @@ pub fn Engine(comptime Ctx: type) type {
 
             const Field = struct { name: []const u8, value: []const u8 };
 
+            /// A request body queue's memory: up to `arena_body_max` from
+            /// the stream's arena, up to `block_cache.malloc_max` from the
+            /// connection's allocator (malloc's slabs), larger from
+            /// `block_cache` (past its largest class, the allocator again).
+            /// Sized to the body, which is mostly small, so a request
+            /// neither maps memory nor grows its arena for it.
+            const BodyBuf = struct {
+                mem: []u8 = &.{},
+                from: enum { none, arena, heap, block } = .none,
+
+                /// The block a queue of `size` bytes takes from `block_cache`,
+                /// a whole class, or null when it comes from elsewhere.
+                fn blockFor(size: usize) ?usize {
+                    if (size <= block_cache.malloc_max) return null;
+                    return block_cache.classFor(size);
+                }
+
+                /// What a queue of `size` bytes takes: its block, else
+                /// itself.
+                fn footprint(size: usize) usize {
+                    return blockFor(size) orelse size;
+                }
+
+                fn alloc(stream: *Stream, size: usize) ?BodyBuf {
+                    const buf: BodyBuf = if (size <= arena_body_max)
+                        .{ .mem = stream.arena.allocator().alloc(u8, size) catch return null, .from = .arena }
+                    else if (blockFor(size)) |class|
+                        .{ .mem = block_cache.take(class) orelse return null, .from = .block }
+                    else
+                        .{ .mem = stream.conn.allocator.alloc(u8, size) catch return null, .from = .heap };
+                    if (comptime @import("builtin").is_test) {
+                        _ = switch (buf.from) {
+                            .none => unreachable,
+                            .arena => test_body_allocs.arena.fetchAdd(1, .monotonic),
+                            .heap => test_body_allocs.heap.fetchAdd(1, .monotonic),
+                            .block => test_body_allocs.block.fetchAdd(1, .monotonic),
+                        };
+                    }
+                    return buf;
+                }
+
+                /// The arena's goes with the arena.
+                fn free(buf: *BodyBuf, gpa: std.mem.Allocator) void {
+                    switch (buf.from) {
+                        .none, .arena => {},
+                        .heap => gpa.free(buf.mem),
+                        .block => block_cache.give(buf.mem),
+                    }
+                    buf.* = .{};
+                }
+            };
+
+            /// How long the body queue is, on the first DATA frame: the
+            /// body when its length is known and within the window, else a
+            /// whole window (before the peer's ACK of SETTINGS that is still
+            /// the default one, which may be the larger). A tunnel's is
+            /// always its window. Under the mutex.
+            fn bodySize(stream: *const Stream) usize {
+                if (comptime @import("builtin").is_test) if (test_body_queue_len) |n| return n;
+                const conn = stream.conn;
+                const full: usize = @max(stream.window(), conn.ackedStreamWindow());
+                if (stream.connect_protocol.len > 0) return full;
+                if (stream.content_length) |n| if (n <= full) return @intCast(n);
+                if (stream.end_frame_len) |n| return @min(n, full);
+                return full;
+            }
+
             fn window(stream: *const Stream) u31 {
                 return if (stream.recv_window != 0) stream.recv_window else stream.conn.config.stream_window;
             }
 
-            /// The handler reads the body: the stream's window grows to
-            /// `stream_window_reading`, and the body queue with it, so the
-            /// session can still always put a whole window. Under the
+            /// Whether the stream's window may still grow: not a tunnel
+            /// (`setTunnelWindow`), not at `stream_window_reading` yet, and
+            /// a body longer than the window or of unknown length.
+            fn mayRaise(stream: *const Stream) bool {
+                if (stream.connect_protocol.len > 0) return false;
+                const current = stream.window();
+                if (current >= stream.conn.config.stream_window_reading) return false;
+                if (stream.content_length) |n| if (n <= current) return false;
+                return true;
+            }
+
+            /// The handler reads the body and the peer sent a whole window
+            /// since the last raise (`raise_due`): the window grows a step,
+            /// four times (64 KiB,
+            /// 256 KiB, 1 MiB at the defaults), up to
+            /// `stream_window_reading` and the content-length, and the body
+            /// queue with it, so the session can still always put a whole
+            /// window. A body that fits the window, or a peer that never
+            /// fills it, never takes more than the body (#99). Under the
             /// mutex.
             fn raiseWindow(stream: *Stream) void {
                 const conn = stream.conn;
-                const want = conn.config.stream_window_reading;
-                // A tunnel has its one window already (`setTunnelWindow`).
-                if (stream.connect_protocol.len > 0) return;
-                if (stream.recv_window != 0 or want <= conn.config.stream_window) return;
-                stream.recv_window = conn.config.stream_window;
+                stream.raise_due = false;
                 if (stream.body_done or stream.reset or stream.discarding) return;
+                if (!stream.mayRaise()) return;
+                const want = conn.config.stream_window_reading;
+                const current = stream.window();
+                var next: u31 = @intCast(@min(@as(usize, want), @as(usize, current) * 4));
+                if (stream.content_length) |n| next = @intCast(@min(next, n));
                 // Until the peer's ACK of SETTINGS, what is queued may be up
                 // to the default window, and the ACK still moves this one.
                 const acked = conn.ackedStreamWindow();
-                const size: usize = @max(want, acked);
-                // The connection's raised windows share one budget; a stream
-                // past it reads at `stream_window`.
-                if (size > conn.config.reading_window_budget -| conn.raised_bytes) return;
-                const buf = stream.arena.allocator().alloc(u8, size) catch return;
-                var bigger: std.Io.Queue(u8) = .init(buf);
+                const size: usize = @max(next, acked);
+                // The connection's raised windows share one budget, charged
+                // with the whole block a queue takes; a stream past it reads
+                // at the window it has (and tries again at its next window).
+                const cost = BodyBuf.footprint(size);
+                if (cost -| stream.raised_bytes > conn.config.reading_window_budget -| conn.raised_bytes) return;
+                var buf = BodyBuf.alloc(stream, size) orelse return;
+                // The window first: if the session refuses it, the old queue
+                // stays as it is. Less by what that ACK will add, so the
+                // window lands on `next` and never holds more than the queue.
+                // Nothing is put meanwhile: the session puts only under the
+                // mutex.
+                const pending = if (conn.config.stream_window > acked) conn.config.stream_window - acked else 0;
+                if (c.nghttp2_session_set_local_window_size(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, next - pending) != 0) {
+                    buf.free(conn.allocator);
+                    return;
+                }
+                var bigger: std.Io.Queue(u8) = .init(buf.mem[0..size]);
+                var moved: usize = 0;
                 if (stream.body) |*q| {
                     // What is queued moves over, in order; nobody else gets
-                    // from it (this is the handler), and the session puts
-                    // only under the mutex.
+                    // from it (this is the handler).
                     var scratch: [4096]u8 = undefined;
                     while (true) {
                         const n = q.getUncancelable(conn.io, &scratch, 0) catch break;
                         if (n == 0) break;
                         _ = bigger.putUncancelable(conn.io, scratch[0..n], 0) catch unreachable;
+                        moved += n;
                     }
                 }
-                // Less by what that ACK will add, so the window lands on
-                // `want` and never holds more than the queue.
-                const pending = if (conn.config.stream_window > acked) conn.config.stream_window - acked else 0;
-                if (c.nghttp2_session_set_local_window_size(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, want - pending) != 0) return;
                 stream.body = bigger;
-                stream.recv_window = want;
-                stream.raised_bytes = size;
-                conn.raised_bytes += size;
+                stream.body_buf.free(conn.allocator);
+                stream.body_buf = buf;
+                stream.recv_window = next;
+                stream.since_raise = moved;
+                conn.raised_bytes = conn.raised_bytes - stream.raised_bytes + cost;
+                stream.raised_bytes = cost;
+                if (comptime @import("builtin").is_test) {
+                    const i = test_window.raises.fetchAdd(1, .monotonic);
+                    test_window.raised[i % test_window.raised.len].store(next, .monotonic);
+                    _ = test_window.peak_bytes.fetchMax(conn.raised_bytes, .monotonic);
+                }
                 conn.kickWriter();
             }
 
@@ -671,12 +1067,18 @@ pub fn Engine(comptime Ctx: type) type {
             /// was released), or a new one. Under the mutex.
             fn create(conn: *Conn, id: i32) !*Stream {
                 if (conn.spare_streams.pop()) |stream| {
+                    conn.spare_low = @min(conn.spare_low, conn.spare_streams.items.len);
                     const arena = stream.arena;
                     stream.* = .{ .conn = conn, .id = id, .arena = arena };
                     return stream;
                 }
                 const stream = try conn.allocator.create(Stream);
                 stream.* = .{ .conn = conn, .id = id, .arena = .init(conn.allocator) };
+                // The node every reset keeps, so the first reset does not
+                // reallocate it (`release`).
+                if (stream.arena.allocator().alloc(u8, arena_retain_limit)) |_| {
+                    _ = safety.resetArena(&stream.arena, .{ .retain_with_limit = arena_retain_limit });
+                } else |_| {}
                 return stream;
             }
 
@@ -707,17 +1109,24 @@ pub fn Engine(comptime Ctx: type) type {
                 if (stream.send_pending) conn.send_pending -= 1;
                 conn.raised_bytes -= stream.raised_bytes;
                 stream.outbox.deinit(conn.allocator);
-                if (conn.streams.remove(stream.id)) gauges.add(conn.io, .h2_streams, -1);
+                stream.body = null;
+                stream.body_buf.free(conn.allocator);
+                stream.out = null;
+                conn.allocator.free(stream.out_buf);
+                stream.out_buf = &.{};
+                conn.allocator.free(stream.writer_buf);
+                stream.writer_buf = &.{};
+                if (conn.streams.swapRemove(stream.id)) gauges.add(conn.io, .h2_streams, -1);
                 if (stream.counted) {
                     conn.open_streams -= 1;
                     if (conn.writer_gone) {
-                        conn.server.finishRequest();
+                        conn.releaseBusyIfIdle();
                     } else {
                         conn.unflushed_finishes += 1;
-                        conn.kickWriter();
+                        conn.kickWriterLocked();
                     }
                 }
-                if (conn.spare_streams.items.len < max_spare_streams) {
+                if (conn.spare_streams.items.len < conn.max_spares) {
                     // Trimmed now, not on reuse: the budget above is given
                     // back, so a spare must not keep a raised body window.
                     _ = safety.resetArena(&stream.arena, .{ .retain_with_limit = arena_retain_limit });
@@ -730,6 +1139,7 @@ pub fn Engine(comptime Ctx: type) type {
             fn closeBody(stream: *Stream) void {
                 stream.body_done = true;
                 if (stream.body) |*q| q.close(stream.conn.io);
+                stream.wake.notify(stream.conn.io);
             }
 
             /// The stream is reset or the connection gone before the
@@ -772,13 +1182,23 @@ pub fn Engine(comptime Ctx: type) type {
                 .io = server.io,
                 .allocator = server.allocator,
                 .config = server.config.http2,
+                .max_spares = @max(1, @min(max_spare_streams, server.config.http2.max_concurrent_streams)),
                 .inline_ok = server.config.http2.inline_no_wait and server.router.has_no_wait,
                 .refused_tokens = server.config.http2.refused_stream_burst,
                 .refused_at = std.Io.Clock.awake.now(server.io).toSeconds(),
             };
+            conn.spare_epoch = conn.trimEpoch();
             defer conn.ready.deinit(conn.allocator);
             defer conn.awaiting.deinit(conn.allocator);
+            // After the group: the writer and the reader's inline rounds
+            // are both done with it by then.
+            defer conn.spill.deinit(conn.allocator);
             try conn.initSession();
+            // Room for a connection's usual streams, but no more than the
+            // map scans without an index (16 i32 keys in a 64-byte line):
+            // only a connection that runs more streams at once grows the
+            // map and gets its hash index.
+            conn.streams.ensureTotalCapacity(conn.allocator, @min(conn.max_spares, std.atomic.cache_line / @sizeOf(i32))) catch {};
             server.h2_conns.add(&conn);
             defer {
                 server.h2_conns.remove(&conn);
@@ -793,9 +1213,14 @@ pub fn Engine(comptime Ctx: type) type {
                 // and release when they have ended their bursts; the stream
                 // stays until then.
                 {
-                    var it = conn.streams.valueIterator();
-                    while (it.next()) |sp| {
-                        const stream = sp.*;
+                    // Backwards: `release(.protocol)` keeps a parked stream
+                    // (its owner still holds it), but a walk that may
+                    // remove must not skip the entry swapped in.
+                    const all = conn.streams.values();
+                    var i = all.len;
+                    while (i > 0) {
+                        i -= 1;
+                        const stream = all[i];
                         const p = stream.parked orelse continue;
                         stream.reset = true;
                         stream.closeBody();
@@ -808,9 +1233,8 @@ pub fn Engine(comptime Ctx: type) type {
                 // The tasks are joined (the group's cancel runs first), so
                 // each release here is the freeing one.
                 while (true) {
-                    var it = conn.streams.valueIterator();
-                    const stream = while (it.next()) |sp| {
-                        if (sp.*.parked == null) break sp.*;
+                    const stream = for (conn.streams.values()) |sp| {
+                        if (sp.parked == null) break sp;
                     } else break;
                     stream.reset = true;
                     stream.closeBody();
@@ -885,17 +1309,16 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.lock();
                 defer conn.unlock();
                 conn.closing = true;
-                var it = conn.streams.valueIterator();
                 var gone: std.ArrayList(*Stream) = .empty;
                 defer gone.deinit(conn.allocator);
-                while (it.next()) |stream| {
+                for (conn.streams.values()) |stream| {
                     // A parked response has nobody to send to once the peer
                     // closed its side of the connection.
-                    if (reader_failed or !stream.*.body_done or stream.*.parked != null) {
-                        stream.*.reset = true;
-                        stream.*.closeBody();
-                        stream.*.cancelHandler();
-                        if (stream.*.detached != null or stream.*.parked != null) gone.append(conn.allocator, stream.*) catch {};
+                    if (reader_failed or !stream.body_done or stream.parked != null) {
+                        stream.reset = true;
+                        stream.closeBody();
+                        stream.cancelHandler();
+                        if (stream.detached != null or stream.parked != null) gone.append(conn.allocator, stream) catch {};
                     }
                 }
                 // Detached responses with nobody left to send them to: let
@@ -1009,10 +1432,19 @@ pub fn Engine(comptime Ctx: type) type {
                         break :consumed @as(usize, @intCast(rv));
                     };
                     reader.toss(consumed);
-                    // The requests that run inline answer before the one
-                    // kick, so their responses share the next write.
-                    if (conn.ready.items.len > 0) try runInline(conn);
-                    conn.kickWriter();
+                    // The requests that run inline answer first, then the
+                    // reader writes their responses itself, in one write,
+                    // with no switch to the writer task (`writeInline`).
+                    if (conn.ready.items.len > 0) {
+                        conn.inline_round.store(true, .seq_cst);
+                        var kick = true;
+                        defer conn.endInlineRound(kick);
+                        try runInline(conn);
+                        // The keepalive deadline is for waiting for input,
+                        // not for this write, which has its own.
+                        timer.clear(conn.io);
+                        kick = try writeInline(conn);
+                    } else conn.kickWriter();
 
                     conn.lock();
                     const done = conn.send_shut or (c.nghttp2_session_want_read(conn.session) == 0 and
@@ -1024,6 +1456,7 @@ pub fn Engine(comptime Ctx: type) type {
 
                 conn.lock();
                 const idle = conn.open_streams == 0;
+                conn.trimSpares();
                 conn.unlock();
                 if (idle) {
                     if (conn.server.config.timeout.keepalive) |d| {
@@ -1056,6 +1489,71 @@ pub fn Engine(comptime Ctx: type) type {
             }
         }
 
+        /// After the reader ran a read's `no_wait` requests: writes the
+        /// session's output itself, one round (`takeRound`, `flushRound`),
+        /// as aegon does (`dispatch_sync` then `flush_outbound`, the read,
+        /// the handlers and the write in one coroutine), instead of waking
+        /// the writer task for it. Left to the writer when it is writing,
+        /// gone, or the connection is closing; the writer is kicked when
+        /// output is left over, it woke meanwhile, or a finished response
+        /// still waits for the peer (its send deadline is the writer's).
+        /// A write error is the connection's, as the writer's would be.
+        fn writeInline(conn: *Conn) !bool {
+            var settled: usize = 0;
+            {
+                conn.lock();
+                defer conn.unlock();
+                if (conn.writing or conn.writer_gone or conn.closing or conn.send_shut) return true;
+                // Kicks so far are for output this take covers.
+                conn.kick_missed.store(false, .seq_cst);
+                settled = try conn.takeRound();
+                if (!conn.roundTaken()) {
+                    conn.untake(settled);
+                    return true;
+                }
+                conn.writing = true;
+            }
+            defer conn.settleFinished(settled);
+            const flushed = if (comptime @import("builtin").is_test)
+                (if (test_inline_write_fails.load(.acquire)) error.WriteTimeout else conn.flushRound())
+            else
+                conn.flushRound();
+            flushed catch |err| {
+                inlineWriteFailed(conn);
+                return err;
+            };
+            return endInlineWrite(conn);
+        }
+
+        /// The reader's inline write failed: as when the writer's own write
+        /// fails (`writerLoop`), both directions are shut, and the writer
+        /// exits without writing again. A second write of the same round
+        /// would hold the connection for another `timeout.write`, and a
+        /// round half written already would go out twice (a TLS record cut
+        /// in the middle). The reader's caller kicks the writer.
+        fn inlineWriteFailed(conn: *Conn) void {
+            conn.connection.stream.shutdown(conn.io, .both) catch {};
+            conn.lock();
+            defer conn.unlock();
+            conn.writing = false;
+            conn.writer_deferred = false;
+            conn.send_shut = true;
+        }
+
+        /// The reader's round is written: the writer may take output
+        /// again. Whether it should be woken for what is left: output, a
+        /// wake it deferred, or a finished response's send deadline. Takes
+        /// the mutex.
+        fn endInlineWrite(conn: *Conn) bool {
+            conn.lock();
+            defer conn.unlock();
+            conn.writing = false;
+            const kick = conn.writer_deferred or conn.send_pending > 0 or conn.spill.items.len > 0 or
+                c.nghttp2_session_want_write(conn.session) != 0;
+            conn.writer_deferred = false;
+            return kick;
+        }
+
         fn writerLoop(conn: *Conn) std.Io.Cancelable!void {
             // Nothing goes out once the writer is gone, so a handler blocked
             // on a full response queue is let go, and any handler still
@@ -1064,11 +1562,11 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.lock();
                 defer conn.unlock();
                 conn.writerGone();
-                var it = conn.streams.valueIterator();
-                while (it.next()) |stream| {
-                    stream.*.reset = true;
-                    if (stream.*.out) |*q| q.close(conn.io);
-                    stream.*.cancelHandler();
+                for (conn.streams.values()) |stream| {
+                    stream.reset = true;
+                    if (stream.out) |*q| q.close(conn.io);
+                    stream.wake.notify(conn.io);
+                    stream.cancelHandler();
                 }
             }
             runWriter(conn) catch |err| switch (err) {
@@ -1081,61 +1579,50 @@ pub fn Engine(comptime Ctx: type) type {
             };
         }
 
-        /// Takes the session's output under the mutex, a frame at a time,
-        /// and writes it outside. A frame from `mem_send2` is valid only
-        /// until the next call, so it is copied straight into the
-        /// connection's write buffer, where it waits for the one write of
-        /// this round. A frame that does not fit there (a full DATA frame,
-        /// or the buffer filled up) goes to `spill`, which the writer frees
-        /// whenever it runs out of output, so an idle connection holds none.
+        /// Takes the session's output under the mutex (`takeRound`) and
+        /// writes it outside (`flushRound`), round after round, until the
+        /// session is over.
         fn runWriter(conn: *Conn) !void {
-            // A write the peer does not take, however many streams wait behind it.
-            const send_timeout = conn.server.config.timeout.write;
-            var spill: std.ArrayList(u8) = .empty;
-            defer spill.deinit(conn.allocator);
-            const writer = conn.connection.writer;
             var probed = false;
             while (true) {
-                const gen = conn.write_gen.load(.acquire);
+                const gen = conn.writer.epoch();
                 var closing = false;
+                var deferred = false;
                 // Streams finished by the time this round's frames were
                 // taken: their counts go back once those frames are flushed.
                 var settled: usize = 0;
+                var taken = false;
                 {
                     conn.lock();
                     defer conn.unlock();
-                    defer settled = conn.unflushed_finishes;
+                    // The reader's inline write failed: nothing more goes
+                    // out (`inlineWriteFailed`).
+                    if (conn.send_shut) return;
                     closing = conn.closing;
-                    while (true) {
-                        var data: [*c]const u8 = undefined;
-                        const n = c.nghttp2_session_mem_send2(conn.session, &data);
-                        if (n < 0) return error.Http2ProtocolError;
-                        if (n == 0) break;
-                        const frame = data[0..@intCast(n)];
-                        const room = writer.unusedCapacitySlice();
-                        if (spill.items.len == 0 and frame.len <= room.len) {
-                            @memcpy(room[0..frame.len], frame);
-                            writer.advance(frame.len);
-                            continue;
-                        }
-                        try spill.appendSlice(conn.allocator, frame);
-                        if (spill.items.len >= 64 * 1024) break;
+                    if (conn.writing) {
+                        // The reader is writing its round (`writeInline`).
+                        conn.writer_deferred = true;
+                        deferred = true;
+                    } else {
+                        settled = try conn.takeRound();
+                        taken = conn.roundTaken();
+                        conn.writing = taken;
                     }
                 }
-                if (writer.end > 0 or spill.items.len > 0) {
-                    if (comptime @import("builtin").is_test) if (test_before_flush) |hook| try hook(conn.io);
-                    // A peer that stops reading must not hold the writer,
-                    // and with it every stream of the connection, for good.
-                    var write_timer: Timer = .init(null);
-                    defer write_timer.clear(conn.io);
-                    if (send_timeout) |d| write_timer.set(conn.io, .{ .duration = .{ .raw = d, .clock = .awake } });
-                    if (spill.items.len > 0) {
-                        writer.writeAll(spill.items) catch return writeFailed(conn, &write_timer);
-                        spill.clearRetainingCapacity();
+                if (deferred) {
+                    try conn.writer.wait(conn.io, gen);
+                    if (comptime @import("builtin").is_test) _ = test_writer_wakes.fetchAdd(1, .monotonic);
+                    continue;
+                }
+                if (taken) {
+                    if (comptime @import("builtin").is_test) _ = test_writer_rounds.fetchAdd(1, .monotonic);
+                    defer conn.settleFinished(settled);
+                    defer {
+                        conn.lock();
+                        conn.writing = false;
+                        conn.unlock();
                     }
-                    writer.flush() catch return writeFailed(conn, &write_timer);
-                    write_timer.clear(conn.io);
-                    conn.settleFinished(settled);
+                    try conn.flushRound();
                     continue;
                 }
                 // Nothing taken this round: whatever came before is flushed.
@@ -1145,6 +1632,14 @@ pub fn Engine(comptime Ctx: type) type {
                 // came in with no stream open) and wants neither to read
                 // nor to write: close the connection (RFC 9113 §5.4.1).
                 conn.lock();
+                if (conn.writing) {
+                    // The reader started a round since this one's take:
+                    // nothing may close or write under it (`shutSend`).
+                    conn.writer_deferred = true;
+                    conn.unlock();
+                    try conn.writer.wait(conn.io, gen);
+                    continue;
+                }
                 const finished = c.nghttp2_session_want_read(conn.session) == 0 and
                     c.nghttp2_session_want_write(conn.session) == 0;
                 // With the reader gone (the peer closed, or only half-closed
@@ -1154,9 +1649,8 @@ pub fn Engine(comptime Ctx: type) type {
                 // when one starts), so nothing is coming from it.
                 var handlers_running = false;
                 if (closing) {
-                    var it = conn.streams.valueIterator();
-                    while (it.next()) |stream| {
-                        if (stream.*.counted and !stream.*.handler_done) handlers_running = true;
+                    for (conn.streams.values()) |stream| {
+                        if (stream.counted and !stream.handler_done) handlers_running = true;
                     }
                 }
                 conn.unlock();
@@ -1167,14 +1661,16 @@ pub fn Engine(comptime Ctx: type) type {
                 if (closing and !handlers_running) return;
                 // Nothing to send: the spill's memory goes back while the
                 // connection waits.
-                spill.clearAndFree(conn.allocator);
+                conn.lock();
+                if (!conn.writing) conn.spill.clearAndFree(conn.allocator);
+                conn.unlock();
                 if (closing) {
                     // A peer that closed the whole connection answers the
                     // probe with a TCP reset, so the next write fails;
                     // one that half-closed reads it and stays served.
                     if (probed) {
-                        try conn.io.futexWaitTimeout(u32, &conn.write_gen.raw, gen, .{ .duration = .{ .raw = half_close_probe_interval, .clock = .awake } });
-                        if (conn.write_gen.load(.acquire) != gen) continue;
+                        try conn.writer.waitTimeout(conn.io, gen, .{ .duration = .{ .raw = half_close_probe_interval, .clock = .awake } });
+                        if (conn.writer.epoch() != gen) continue;
                     }
                     probed = true;
                     conn.lock();
@@ -1185,11 +1681,14 @@ pub fn Engine(comptime Ctx: type) type {
                 // Responses whose handlers are done but that the peer is
                 // not taking (no window, or not reading) are bounded: past
                 // their deadline the stream is reset and freed.
-                switch (sweepSends(conn)) {
+                const sweep = sweepSends(conn);
+                if (comptime @import("builtin").is_test) if (sweep != .reset) if (test_before_writer_wait) |hook| hook(conn.io);
+                switch (sweep) {
                     .reset => continue,
-                    .none => try conn.io.futexWait(u32, &conn.write_gen.raw, gen),
-                    .until => |deadline| try conn.io.futexWaitTimeout(u32, &conn.write_gen.raw, gen, .{ .deadline = deadline }),
+                    .none => try conn.writer.wait(conn.io, gen),
+                    .until => |deadline| try conn.writer.waitTimeout(conn.io, gen, .{ .deadline = deadline }),
                 }
+                if (comptime @import("builtin").is_test) _ = test_writer_wakes.fetchAdd(1, .monotonic);
             }
         }
 
@@ -1222,9 +1721,7 @@ pub fn Engine(comptime Ctx: type) type {
             const now = std.Io.Clock.Timestamp.now(conn.io, .awake);
             var next: ?std.Io.Clock.Timestamp = null;
             var reset = false;
-            var it = conn.streams.valueIterator();
-            while (it.next()) |entry| {
-                const stream = entry.*;
+            for (conn.streams.values()) |stream| {
                 if (!stream.send_pending or stream.reset) continue;
                 const deadline = stream.send_deadline orelse blk: {
                     const d = now.addDuration(.{ .raw = limit, .clock = .awake });
@@ -1250,7 +1747,7 @@ pub fn Engine(comptime Ctx: type) type {
             const deadline = (std.Io.Timeout{ .duration = .{ .raw = linger_timeout, .clock = .awake } }).toDeadline(conn.io);
             const at = deadline.toTimestamp(conn.io).?;
             while (true) {
-                const gen = conn.write_gen.load(.acquire);
+                const gen = conn.writer.epoch();
                 conn.lock();
                 const closing = conn.closing;
                 conn.unlock();
@@ -1259,7 +1756,7 @@ pub fn Engine(comptime Ctx: type) type {
                     conn.connection.stream.shutdown(conn.io, .both) catch {};
                     return;
                 }
-                try conn.io.futexWaitTimeout(u32, &conn.write_gen.raw, gen, deadline);
+                try conn.writer.waitTimeout(conn.io, gen, deadline);
             }
         }
 
@@ -1870,50 +2367,46 @@ pub fn Engine(comptime Ctx: type) type {
                 const self: *BodyReader = @alignCast(@fieldParentPtr("interface", r));
                 const stream = self.stream;
                 const conn = stream.conn;
-                // The body queue appears with the first DATA frame; until
-                // then, or for a request with no body, wait for one or the end.
-                const queue = blk: {
-                    while (true) {
-                        conn.lock();
-                        stream.raiseWindow();
-                        const q = if (stream.body) |*q| q else null;
-                        const done = stream.body_done;
-                        const reset = stream.reset;
-                        conn.unlock();
-                        if (reset) return self.fail(error.ConnectionResetByPeer);
-                        if (q) |queue| break :blk queue;
-                        if (done) return error.EndOfStream;
-                        // A DATA frame or the end wakes the writer generation
-                        // (`kickWriter` wakes every waiter, the writer too).
-                        const gen = conn.write_gen.load(.acquire);
-                        conn.lock();
-                        const ready = stream.body != null or stream.body_done or stream.reset;
-                        conn.unlock();
-                        if (ready) continue;
-                        conn.io.futexWait(u32, &conn.write_gen.raw, gen) catch return self.fail(error.Canceled);
-                    }
-                };
                 const dest = limit.slice(try w.writableSliceGreedy(1));
                 if (dest.len == 0) return 0;
-                const n = queue.get(conn.io, dest, 1) catch |err| switch (err) {
-                    error.Closed => {
-                        conn.lock();
-                        const reset = stream.reset;
+                // Takes what is queued without waiting, under the mutex (the
+                // session puts only under it); with nothing there and the
+                // body not over, waits on the stream's own signal, whose
+                // epoch is read before the look. The body queue appears with
+                // the first DATA frame; a request with no body never has one.
+                while (true) {
+                    const seen = stream.wake.epoch();
+                    conn.lock();
+                    if (stream.raise_due) stream.raiseWindow();
+                    if (stream.reset) {
                         conn.unlock();
-                        if (reset) return self.fail(error.ConnectionResetByPeer);
+                        return self.fail(error.ConnectionResetByPeer);
+                    }
+                    if (stream.body) |*q| {
+                        const n = q.getUncancelable(conn.io, dest, 0) catch |err| switch (err) {
+                            error.Closed => {
+                                conn.unlock();
+                                return error.EndOfStream;
+                            },
+                        };
+                        if (n > 0) {
+                            _ = c.nghttp2_session_consume(conn.session, stream.id, n);
+                            // The writer has work only if the credit queued
+                            // a WINDOW_UPDATE (about once per half window),
+                            // not per read.
+                            const wants_write = c.nghttp2_session_want_write(conn.session) != 0;
+                            conn.unlock();
+                            if (wants_write) conn.kickWriter();
+                            w.advance(n);
+                            return n;
+                        }
+                    } else if (stream.body_done) {
+                        conn.unlock();
                         return error.EndOfStream;
-                    },
-                    error.Canceled => return self.fail(error.Canceled),
-                };
-                w.advance(n);
-                conn.lock();
-                _ = c.nghttp2_session_consume(conn.session, stream.id, n);
-                // The writer has work only if the credit queued a
-                // WINDOW_UPDATE (about once per half window), not per read.
-                const wants_write = c.nghttp2_session_want_write(conn.session) != 0;
-                conn.unlock();
-                if (wants_write) conn.kickWriter();
-                return n;
+                    }
+                    conn.unlock();
+                    stream.wake.wait(conn.io, seen) catch return self.fail(error.Canceled);
+                }
             }
 
             fn fail(self: *BodyReader, err: Transport.ReadError) std.Io.Reader.StreamError {
@@ -2057,10 +2550,16 @@ pub fn Engine(comptime Ctx: type) type {
 
             fn body(ptr: *anyopaque) *std.Io.Writer {
                 const self = fromPtr(ptr);
+                if (comptime @import("builtin").is_test) _ = test_sink_bodies.fetchAdd(1, .monotonic);
                 if (self.writer.buffer.len == 0 and self.stream.parked == null) {
                     // A handler that never writes a body never pays for it.
-                    const len: usize = if (self.stream.connect_protocol.len > 0) tunnel_writer_len else body_writer_len;
-                    self.writer.buffer = self.stream.arena.allocator().alloc(u8, len) catch &.{};
+                    const stream = self.stream;
+                    if (stream.connect_protocol.len > 0) {
+                        self.writer.buffer = stream.arena.allocator().alloc(u8, tunnel_writer_len) catch &.{};
+                    } else {
+                        stream.writer_buf = stream.conn.allocator.alloc(u8, body_writer_len) catch &.{};
+                        self.writer.buffer = stream.writer_buf;
+                    }
                 }
                 return &self.writer;
             }
@@ -2075,8 +2574,8 @@ pub fn Engine(comptime Ctx: type) type {
                     stream.outbox_mode = true;
                     return;
                 }
-                const buf = stream.arena.allocator().alloc(u8, out_queue_len) catch return self.fail(error.SystemResources);
-                stream.out = .init(buf);
+                stream.out_buf = stream.conn.allocator.alloc(u8, out_queue_len) catch return self.fail(error.SystemResources);
+                stream.out = .init(stream.out_buf);
             }
 
             /// Submits the head with a data provider, once. Under the mutex.
@@ -2386,6 +2885,19 @@ pub fn Engine(comptime Ctx: type) type {
             return @ptrCast(@alignCast(ptr));
         }
 
+        /// Every frame's header, before its payload. A DATA frame with
+        /// END_STREAM that comes before any body holds the whole body:
+        /// its length (padding included) sizes the body queue
+        /// (`Stream.bodySize`), which gRPC clients, sending no
+        /// content-length, need to get a small one.
+        fn onBeginFrame(session: ?*c.nghttp2_session, hd: [*c]const c.nghttp2_frame_hd, user_data: ?*anyopaque) callconv(.c) c_int {
+            _ = user_data;
+            if (hd.*.type != c.NGHTTP2_DATA or hd.*.flags & c.NGHTTP2_FLAG_END_STREAM == 0) return 0;
+            const stream = streamFor(session, hd.*.stream_id) orelse return 0;
+            if (stream.body == null) stream.end_frame_len = @intCast(hd.*.length);
+            return 0;
+        }
+
         fn onBeginHeaders(session: ?*c.nghttp2_session, frame: [*c]const c.nghttp2_frame, user_data: ?*anyopaque) callconv(.c) c_int {
             const conn = connFrom(user_data);
             if (frame.*.hd.type != c.NGHTTP2_HEADERS or frame.*.headers.cat != c.NGHTTP2_HCAT_REQUEST) return 0;
@@ -2406,6 +2918,9 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             const stream = Stream.create(conn, id) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            // Room for the client's concurrency was made up front (`serve`);
+            // past it (streams still answering after nghttp2 closed them)
+            // the map grows.
             conn.streams.put(conn.allocator, id, stream) catch {
                 stream.destroy(conn.allocator);
                 return c.NGHTTP2_ERR_CALLBACK_FAILURE;
@@ -2450,6 +2965,9 @@ pub fn Engine(comptime Ctx: type) type {
             } else if (std.mem.eql(u8, name, ":protocol")) {
                 stream.connect_protocol = value;
             } else if (name.len > 0 and name[0] != ':') {
+                // Validated by nghttp2 (HTTP messaging), which also holds
+                // the DATA to it.
+                if (std.mem.eql(u8, name, "content-length")) stream.content_length = std.fmt.parseInt(u64, value, 10) catch null;
                 const name_copy = arena.dupe(u8, name) catch return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
                 stream.headers.append(arena, .{ .name = name_copy, .value = value }) catch return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
             }
@@ -2487,10 +3005,11 @@ pub fn Engine(comptime Ctx: type) type {
                 c.NGHTTP2_DATA => if (end_stream) {
                     stream.closeBody();
                     bodyEnded(conn, stream);
-                },
+                } else stream.wake.notify(conn.io),
                 else => {},
             }
-            conn.kickWriter(); // also wakes a body reader waiting for its queue
+            // No writer kick per frame: the reader kicks it once after the
+            // read (`readerLoop`).
             return 0;
         }
 
@@ -2498,8 +3017,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// task.
         fn startStream(conn: *Conn, stream: *Stream) void {
             const group = conn.group orelse return;
-            _ = conn.server.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
-            conn.open_streams += 1;
+            conn.holdBusy();
             stream.counted = true;
             if (stream.connect_protocol.len > 0) stream.setTunnelWindow();
             placement.concurrent(group, conn.io, .local, runStream, .{ conn, stream }) catch {
@@ -2524,8 +3042,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// (`runInline`) once the session has taken the read.
         fn queueInline(conn: *Conn, stream: *Stream) void {
             conn.ready.append(conn.allocator, stream) catch return startStream(conn, stream);
-            _ = conn.server.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
-            conn.open_streams += 1;
+            conn.holdBusy();
             stream.counted = true;
             stream.inline_mode = true;
         }
@@ -2533,7 +3050,8 @@ pub fn Engine(comptime Ctx: type) type {
         /// The body of a request set aside in `awaiting` is whole: it runs
         /// inline after all.
         fn bodyEnded(conn: *Conn, stream: *Stream) void {
-            if (!stream.await_body) return;
+            // Reset by this side (`resetBody`): `startAwaiting` lets go.
+            if (!stream.await_body or stream.reset) return;
             stream.await_body = false;
             queueInline(conn, stream);
         }
@@ -2586,7 +3104,7 @@ pub fn Engine(comptime Ctx: type) type {
                 stream.reset = true;
                 _ = c.nghttp2_submit_rst_stream(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, c.NGHTTP2_NO_ERROR);
                 stream.closeBody();
-                conn.kickWriter();
+                conn.kickWriterLocked();
                 return;
             }
             stream.discarding = true;
@@ -2605,7 +3123,7 @@ pub fn Engine(comptime Ctx: type) type {
             // deadline (#141). `Conn.beginDrain` ends the streams already
             // discarding when the drain starts.
             if (conn.server.busy.load(.acquire).draining) resetDiscarded(conn, stream);
-            conn.kickWriter();
+            conn.kickWriterLocked();
         }
 
         /// Ends a discarding stream with RST_STREAM(NO_ERROR) (RFC 9113
@@ -2616,7 +3134,7 @@ pub fn Engine(comptime Ctx: type) type {
             stream.discard_reset = true;
             stream.discard_left = 0;
             _ = c.nghttp2_submit_rst_stream(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, c.NGHTTP2_NO_ERROR);
-            conn.kickWriter();
+            conn.kickWriterLocked();
         }
 
         fn onDataChunk(
@@ -2630,7 +3148,13 @@ pub fn Engine(comptime Ctx: type) type {
             _ = flags;
             const conn = connFrom(user_data);
             const stream = streamFor(session, stream_id) orelse return 0;
-            if (stream.body_done) return 0;
+            if (stream.body_done) {
+                // Reset by this side while the peer's frames were still
+                // coming (`resetBody`): what arrives is dropped, but its
+                // connection window credited back.
+                if (stream.reset) _ = c.nghttp2_session_consume(session, stream_id, len);
+                return 0;
+            }
             if (stream.discarding) {
                 _ = c.nghttp2_session_consume(session, stream_id, len);
                 if (len >= stream.discard_left) {
@@ -2639,20 +3163,70 @@ pub fn Engine(comptime Ctx: type) type {
                 return 0;
             }
             if (stream.body == null) {
-                // A whole window: before the peer's ACK of SETTINGS that is
-                // still the default one, which may be the larger.
-                const size = @max(stream.window(), conn.ackedStreamWindow());
-                const buf = stream.arena.allocator().alloc(u8, size) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-                stream.body = .init(buf);
+                const size = stream.bodySize();
+                const buf = Stream.BodyBuf.alloc(stream, size) orelse {
+                    resetBody(conn, stream, len);
+                    return 0;
+                };
+                stream.body_buf = buf;
+                stream.body = .init(buf.mem[0..size]);
             }
-            // Cannot block: the queue holds a whole window, and the peer may
-            // not send past it.
+            // Cannot block: the queue holds the body or a whole window, and
+            // the peer may send past neither.
             const put = stream.body.?.putUncancelable(conn.io, data[0..len], 0) catch |err| switch (err) {
                 // The handler is gone; the bytes are dropped with the stream.
                 error.Closed => return 0,
             };
-            if (put != len) return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            if (put != len) {
+                resetBody(conn, stream, len - put);
+                return 0;
+            }
+            // A handler asleep on its body gets these bytes now, not when
+            // the frame's last byte comes (`onFrameRecv` notifies then
+            // anyway, so a sleeper this misses is woken there). Nobody
+            // asleep: one load.
+            if (stream.wake.sleepers.load(.monotonic) > 0) stream.wake.notify(conn.io);
+            // The peer sent a whole window since the last raise: the
+            // handler's next read raises it, if it may grow
+            // (`Stream.raiseWindow`). Only counted for a body that may need
+            // it, not for one that fits the window. Before the first raise
+            // the window is the one the peer may use: the default until it
+            // has acknowledged the server's SETTINGS.
+            if (!stream.raise_due and stream.mayRaise()) {
+                stream.since_raise += len;
+                const window: usize = if (stream.recv_window != 0) stream.recv_window else @min(conn.config.stream_window, conn.ackedStreamWindow());
+                if (stream.since_raise >= window) {
+                    stream.raise_due = true;
+                    if (comptime @import("builtin").is_test) _ = test_window.fulls.fetchAdd(1, .monotonic);
+                }
+            }
             return 0;
+        }
+
+        /// The body does not fit its queue (impossible by its sizing, but
+        /// defended) or no queue could be allocated: only this stream is
+        /// reset, with RST_STREAM(INTERNAL_ERROR), and its handler sees
+        /// the reset rather than a body cut short. Not an error to
+        /// nghttp2: from the chunk callback it would end the connection
+        /// (CALLBACK_FAILURE) or be ignored (TEMPORAL_CALLBACK_FAILURE,
+        /// nghttp2_session.c, `on_data_chunk_recv_callback`). The window
+        /// of what is dropped (`dropped` bytes of the chunk, and what is
+        /// queued) is credited back to the connection. Under the mutex.
+        fn resetBody(conn: *Conn, stream: *Stream, dropped: usize) void {
+            stream.reset = true;
+            _ = c.nghttp2_submit_rst_stream(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, c.NGHTTP2_INTERNAL_ERROR);
+            _ = c.nghttp2_session_consume(conn.session, stream.id, dropped);
+            if (stream.body) |*q| {
+                var scratch: [4096]u8 = undefined;
+                while (true) {
+                    const n = q.getUncancelable(conn.io, &scratch, 0) catch break;
+                    if (n == 0) break;
+                    _ = c.nghttp2_session_consume(conn.session, stream.id, n);
+                }
+            }
+            stream.closeBody();
+            stream.cancelHandler();
+            conn.kickWriter();
         }
 
         fn onStreamClose(session: ?*c.nghttp2_session, stream_id: i32, error_code: u32, user_data: ?*anyopaque) callconv(.c) c_int {
@@ -2676,7 +3250,7 @@ pub fn Engine(comptime Ctx: type) type {
                 if (!conn.closing) refusedHead(conn, session);
             }
             stream.release(.protocol);
-            conn.kickWriter();
+            conn.kickWriterLocked();
             return 0;
         }
 

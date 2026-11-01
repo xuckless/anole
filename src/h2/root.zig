@@ -2,7 +2,7 @@
 //! through the official translate-c package). The server side needs
 //! nothing from here: `anole.App` serves HTTP/2 over TLS (ALPN "h2") and
 //! cleartext (h2c) through the HTTP core's engine
-//! (src/http/core/server/h2.zig).
+//! (src/http/core/server/h2_nghttp2.zig).
 //!
 //!     const conn = try anole.h2.ClientConnection.connect(gpa, io, .{ .host = "127.0.0.1", .port = 8080 });
 //!     defer conn.close();

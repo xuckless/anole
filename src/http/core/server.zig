@@ -44,7 +44,7 @@ const expect_log = @import("expect_log.zig");
 const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 /// The HTTP/2 engine, with the `-Dhttp2` build option.
 const proxy_protocol = @import("proxy_protocol.zig");
-const h2 = if (build_options.use_http2) @import("server/h2.zig") else struct {};
+const h2 = if (build_options.use_http2) @import("server/h2_nghttp2.zig") else struct {};
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 const park = @import("server/park.zig");
 const cgroup = @import("cgroup.zig");
@@ -1340,6 +1340,10 @@ pub fn Server(comptime Ctx: type) type {
         /// GOAWAY that no new streams will be taken.
         h2_conns: if (build_options.use_http2) h2.Engine(Ctx).Registry else void =
             if (build_options.use_http2) .{} else {},
+        /// Bumped by the first executor's trim task every
+        /// `request_buffers_trim_interval`: an HTTP/2 connection that sees
+        /// it move frees the spare streams it kept unused since.
+        trim_epoch: std.atomic.Value(u32) = .init(0),
         /// The first listener's bound address, once `ready` is set. A
         /// listener given port zero has its real port here.
         address: Address,
@@ -1680,6 +1684,14 @@ pub fn Server(comptime Ctx: type) type {
                 const protection = self.io.swapCancelProtection(.blocked);
                 defer _ = self.io.swapCancelProtection(protection);
                 log.debug("at most {d} connections at once (open-file limit {?d})", .{ self.config.max_connections.?, soft });
+            }
+            if (build_options.use_zlib or build_options.use_brotli or build_options.use_http2) {
+                const protection = self.io.swapCancelProtection(.blocked);
+                defer _ = self.io.swapCancelProtection(protection);
+                const n = executors orelse 1;
+                log.debug("block cache: at most {d} MiB per executor, {d} MiB for {d} executor(s)", .{
+                    block_cache.max_cached >> 20, (block_cache.max_cached * n) >> 20, n,
+                });
             }
             // Out of `reloadTls`'s reach before the listeners close.
             self.lockTls();
@@ -2078,9 +2090,9 @@ pub fn Server(comptime Ctx: type) type {
         /// buffer sets this executor's connections left unused since the
         /// last time, and the first executor's the shared ones too
         /// (`RequestBuffersPool.trimLocal`, `trimShards`); and the
-        /// compressors' blocks it cached that no response took
-        /// (`block_cache`), and the buffered-body encoders no response
-        /// took (`encoders`).
+        /// compressors' and HTTP/2 body queues' blocks it cached that
+        /// nothing took (`block_cache`), and the buffered-body encoders
+        /// no response took (`encoders`).
         fn trimLoop(self: *Self, shards: bool) std.Io.Cancelable!void {
             // One task per executor, canceled at teardown after the drain
             // and the connections: this runs on the thread that owns the
@@ -2090,10 +2102,11 @@ pub fn Server(comptime Ctx: type) type {
                 try self.io.sleep(request_buffers_trim_interval, .awake);
                 self.request_buffers.trimLocal();
                 if (shards) self.request_buffers.trimShards();
+                if (shards) _ = self.trim_epoch.fetchAdd(1, .monotonic);
                 // The encoders first, so the blocks they give back are
                 // unmapped at the next trim if nothing takes them.
                 if (build_options.use_zlib) encoders.trimLocal();
-                if (build_options.use_zlib or build_options.use_brotli) block_cache.trimLocal();
+                if (build_options.use_zlib or build_options.use_brotli or build_options.use_http2) block_cache.trimLocal();
                 // Objects retired with no writer after them (src/http/core/qsbr.zig).
                 if (shards) qsbr.pollAll();
             }

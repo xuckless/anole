@@ -36,8 +36,8 @@
 //!
 //! Ported from ngtcp2's examples/server.cc and
 //! http3_server_proto_codec.cc (MIT, ngtcp2 1.25.0); the request and
-//! response plumbing follows the core's HTTP/2 engine (src/server/h2.zig in
-//! the xuckless/dusty fork).
+//! response plumbing follows the core's HTTP/2 engine
+//! (src/http/core/server/h2_nghttp2.zig, from the xuckless/dusty fork).
 const std = @import("std");
 const zio = @import("zio");
 const safety = @import("anole_safety");

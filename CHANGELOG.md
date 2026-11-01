@@ -86,6 +86,73 @@ breaking changes are listed anyway.
   HTTP/1.1; the C ABI's consumer routes and gRPC methods call it (S2 K3;
   issue number to come).
 
+- HTTP/2: a request body's queue is sized to the body when its length is
+  known (content-length, or the one DATA frame that carries END_STREAM,
+  which gRPC clients send without a content-length), instead of a whole
+  64 KiB window per stream: a small body comes from the stream's arena or
+  malloc's slabs, a larger one from `block_cache`. A body that overflows
+  its queue resets only its stream (RST_STREAM INTERNAL_ERROR) instead of
+  the connection (#99).
+- HTTP/2: a stream's body window is raised in steps (64 KiB, 256 KiB,
+  1 MiB at the defaults) only when the body is longer than the window or
+  of unknown length and the client has sent a whole window since the
+  last step (however fast the handler reads), instead of to
+  1 MiB on the handler's first read. A handler that reads before its DATA
+  arrives (HEADERS and DATA in separate reads, as browsers, grpc-go and
+  curl often send them) no longer takes a 1 MiB buffer for a small body
+  (#99).
+- HTTP/2: a connection keeps up to `min(max_concurrent_streams, 128)`
+  spare streams (was 16), so a client with 100 streams in flight stops
+  creating and freeing them; spares unused for a whole trim interval go,
+  down to 16 (#99).
+- HTTP/2: a reused stream's arena keeps one 8 KiB node, its header
+  included (was 128 KiB), and a new one starts with that node; the response queue (32 KiB - 64) and body writer
+  (16 KiB) come from malloc's slabs instead of the arena, so a streamed
+  response maps no memory on musl (#99).
+- `block_cache` keeps one free list per size class (64, 128 and 256 KiB,
+  1 and 2 MiB) with an O(1) take and give, serves everything past
+  malloc's slabs (32 KiB), and is trimmed per class. A block maps one page
+  past its class, where `alloc` keeps its header, so a power-of-two
+  allocation (Brotli's 256 KiB hash tables) fits its own class. A thread
+  keeps up to 8 MiB (was 4 MiB), of which the 64 KiB class may hold 128
+  blocks (one HTTP/2 burst of bodies of unknown length) and the others 2
+  MiB each (#99).
+- HTTP/2: a handler waiting for its request body waits on its stream's own
+  signal, and only the writer waits on the connection's: a DATA frame or
+  the body's end wakes only its stream's handler, and the writer is kicked
+  once per read instead of once per frame, with no futex call when nobody
+  sleeps. A handler asleep on its body is still woken by each chunk of a
+  DATA frame as it is read, not only at the frame's end. `bridge.Signal` moved to the core (`dusty.Signal`), shared with
+  HTTP/3 (#99).
+- HTTP/2: after running a read's `no_wait` requests on the connection's
+  reader, the reader writes their responses itself, in one write, instead
+  of waking the writer task for them (the writer still takes output when it
+  is writing, or when something is left over); kicks during that round no
+  longer wake the writer, nor does a stream closing while output is taken.
+  A failed inline write ends the connection as a failed write of the writer
+  does: both directions shut, and the round is never written a second time
+  (#99).
+- HTTP/2: a connection's streams are kept in std's array hash map (a
+  dense array, backward-shift deletion, no tombstones) with room for 16
+  streams made when the connection starts (a linear scan, no hash index,
+  until a connection runs more at once), instead of a hash map whose
+  removals left tombstones to walk past (#99).
+- gRPC: a unary call's response is collected in the call's arena and sent
+  whole (HTTP/2 and HTTP/3: HEADERS, DATA and trailers in one round),
+  instead of through a streaming body queue; a binary gRPC message is
+  encoded behind room kept for its 5-byte frame prefix, so the body is
+  never copied. `Call.addHeader` in a unary call now works until the call
+  ends (#99).
+- The per-executor connection and stream gauges (HTTP/1.x, HTTP/2,
+  HTTP/3, WebSocket, WebTransport) keep each executor's counts on a cache
+  line of their own, so executors opening and closing streams at once no
+  longer write the same lines (#51, #99).
+- HTTP/2: a connection counts once in the server's in-flight requests
+  while any of its streams is open or a finished one's last frames are not
+  flushed yet, instead of once per stream: two writes to that shared
+  counter per burst of streams rather than two per stream. The drain still
+  waits for every stream (#99).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed
