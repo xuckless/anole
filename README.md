@@ -5,17 +5,23 @@
 <h3 align="center">Anole is a backend framework for Zig, and a native server engine for Node and Python.</h3>
 
 <p align="center">
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/xuckless/anole?color=green"></a>
-  <a href="https://ziglang.org/download/"><img alt="Zig 0.17" src="https://img.shields.io/badge/Zig-0.17.0-F7A41D?logo=zig&logoColor=white"></a>
-  <img alt="Platforms: Linux, macOS, Windows (development)" src="https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows%20(dev)-lightgrey">
-  <img alt="Protocols: HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket" src="https://img.shields.io/badge/protocols-HTTP%2F1.1%20%C2%B7%20h2%20%C2%B7%20h3%20%C2%B7%20gRPC%20%C2%B7%20WS-blue">
-  <img alt="WebTransport" src="https://img.shields.io/badge/WebTransport-draft--02-8A4FFF">
-  <img alt="Auth: JWT, OIDC, sessions" src="https://img.shields.io/badge/auth-JWT%20%C2%B7%20OIDC%20%C2%B7%20sessions-D8407F">
-  <img alt="TLS: BoringSSL" src="https://img.shields.io/badge/TLS-BoringSSL-2E7D32">
-  <img alt="Observability: Prometheus, OpenTelemetry" src="https://img.shields.io/badge/observability-Prometheus%20%C2%B7%20OpenTelemetry-E6522C">
-  <img alt="Databases: PostgreSQL, SQLite, MongoDB, Redis" src="https://img.shields.io/badge/databases-PostgreSQL%20%C2%B7%20SQLite%20%C2%B7%20MongoDB%20%C2%B7%20Redis-336791">
-  <a href="https://xuckless.github.io/anole/"><img alt="Docs" src="https://img.shields.io/badge/docs-xuckless.github.io%2Fanole-0A7B4F"></a>
-  <a href="https://github.com/xuckless/anole/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/xuckless/anole?style=flat&logo=github"></a>
+  <a href="#requirements"><img alt="Linux" src="https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black"></a>
+  <a href="#requirements"><img alt="macOS" src="https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white"></a>
+  <a href="#requirements"><img alt="Windows (development)" src="https://img.shields.io/badge/Windows%20(dev)-0078D4?style=for-the-badge&logo=windows11&logoColor=white"></a>
+  <a href="https://ziglang.org/download/"><img alt="Zig 0.17" src="https://img.shields.io/badge/Zig%200.17-F7A41D?style=for-the-badge&logo=zig&logoColor=white"></a>
+</p>
+
+<p align="center">
+  <img alt="Protocols: HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket" src="https://img.shields.io/badge/protocols-HTTP%2F1.1%20%C2%B7%20h2%20%C2%B7%20h3%20%C2%B7%20gRPC%20%C2%B7%20WS-2F80ED?style=flat-square">
+  <img alt="WebTransport" src="https://img.shields.io/badge/WebTransport-draft--02-8A4FFF?style=flat-square">
+  <img alt="Auth: JWT, OIDC, sessions" src="https://img.shields.io/badge/auth-JWT%20%C2%B7%20OIDC%20%C2%B7%20sessions-D8407F?style=flat-square&logo=jsonwebtokens&logoColor=white">
+  <img alt="TLS: BoringSSL" src="https://img.shields.io/badge/TLS-BoringSSL-2E7D32?style=flat-square&logo=letsencrypt&logoColor=white">
+  <img alt="Observability: Prometheus, OpenTelemetry" src="https://img.shields.io/badge/observability-Prometheus%20%C2%B7%20OpenTelemetry-E6522C?style=flat-square&logo=prometheus&logoColor=white">
+  <img alt="Databases: PostgreSQL, SQLite, MongoDB, Redis" src="https://img.shields.io/badge/databases-PostgreSQL%20%C2%B7%20SQLite%20%C2%B7%20MongoDB%20%C2%B7%20Redis-336791?style=flat-square&logo=postgresql&logoColor=white">
+  <a href="https://github.com/xuckless/anole/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/xuckless/anole?style=flat-square&color=0A7B4F"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/xuckless/anole?style=flat-square&color=4C4C4C"></a>
+  <a href="https://xuckless.github.io/anole/"><img alt="Docs" src="https://img.shields.io/badge/docs-xuckless.github.io%2Fanole-0A7B4F?style=flat-square"></a>
+  <a href="https://github.com/xuckless/anole/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/xuckless/anole?style=flat-square&logo=github"></a>
 </p>
 
 <p align="center">
@@ -136,15 +142,18 @@ epoll, requests that arrive whole run without a task of their own, batched
 writes on every protocol, and idle connections that hold almost no memory.
 Rather than quote my own numbers, I entered Anole in
 [HttpArena](https://www.http-arena.com/), an independent benchmark that runs
-every framework on the same hardware with the same rules. Its current ranks
-(the listed entry is an early release, v0.1.2):
+every framework on the same hardware with the same rules. Its composite
+scores for v0.5.0, among all its flagship, emerging and experimental entries
+(the run saved in [HttpArena PR #1692](https://github.com/MDA2AV/HttpArena/pull/1692);
+the board shows it once the PR is merged):
 
 <p align="center">
-  <a href="https://www.http-arena.com/#scope=h1"><img alt="HttpArena HTTP/1.1" src="https://img.shields.io/endpoint?url=https://http-arena.com/badge/anole/h1.json&logo=zig"></a>
-  <a href="https://www.http-arena.com/#scope=h2"><img alt="HttpArena HTTP/2" src="https://img.shields.io/endpoint?url=https://http-arena.com/badge/anole/h2.json&logo=zig"></a>
-  <a href="https://www.http-arena.com/#scope=h3"><img alt="HttpArena HTTP/3" src="https://img.shields.io/endpoint?url=https://http-arena.com/badge/anole/h3.json&logo=zig"></a>
-  <a href="https://www.http-arena.com/#scope=grpc"><img alt="HttpArena gRPC" src="https://img.shields.io/endpoint?url=https://http-arena.com/badge/anole/grpc.json&logo=zig"></a>
-  <a href="https://www.http-arena.com/#scope=ws"><img alt="HttpArena WebSocket" src="https://img.shields.io/endpoint?url=https://http-arena.com/badge/anole/ws.json&logo=zig"></a>
+  <a href="https://www.http-arena.com/#scope=grpc"><img alt="HttpArena gRPC: 3rd of 12" src="https://img.shields.io/badge/HttpArena%20gRPC-3rd%20of%2012-8a5a12?style=flat-square&logo=zig&logoColor=white"></a>
+  <a href="https://www.http-arena.com/#scope=gw"><img alt="HttpArena Gateway: 3rd of 10" src="https://img.shields.io/badge/HttpArena%20Gateway-3rd%20of%2010-8a5a12?style=flat-square&logo=zig&logoColor=white"></a>
+  <a href="https://www.http-arena.com/#scope=h3"><img alt="HttpArena HTTP/3: 4th of 22" src="https://img.shields.io/badge/HttpArena%20HTTP%2F3-4th%20of%2022-8a5a12?style=flat-square&logo=zig&logoColor=white"></a>
+  <a href="https://www.http-arena.com/#scope=h2"><img alt="HttpArena HTTP/2: 7th of 38" src="https://img.shields.io/badge/HttpArena%20HTTP%2F2-7th%20of%2038-8a5a12?style=flat-square&logo=zig&logoColor=white"></a>
+  <a href="https://www.http-arena.com/#scope=ws"><img alt="HttpArena WebSocket: 7th of 42" src="https://img.shields.io/badge/HttpArena%20WebSocket-7th%20of%2042-8a5a12?style=flat-square&logo=zig&logoColor=white"></a>
+  <a href="https://www.http-arena.com/#scope=h1"><img alt="HttpArena HTTP/1.1: 9th of 102" src="https://img.shields.io/badge/HttpArena%20HTTP%2F1.1-9th%20of%20102-8a5a12?style=flat-square&logo=zig&logoColor=white"></a>
 </p>
 
 My own harness and raw results live in `bench/` on the
