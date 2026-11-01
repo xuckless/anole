@@ -24,8 +24,10 @@ breaking changes are listed anyway.
   hop per static open; `.resolve_beneath = false` restores the old speed. A
   Linux system with neither `openat2` nor `/proc` refuses to start with a
   message naming `.resolve_beneath = false`. The real path of each static
-  directory is read at startup, so renaming a directory while serving
-  answers 404 (#133).
+  directory is read at startup where the server checks real paths (Windows,
+  macOS 15, Linux without `openat2`), so renaming a directory while serving
+  answers 404 there; with kernel confinement the open directory keeps
+  serving (#133).
 - C ABI 0.11: `routes[].static` takes `resolve_beneath` (default `true`; the
   default changes what the bindings' static routes serve, as above). A
   binding built for 0.11 that sends the key to a 0.10 library has its

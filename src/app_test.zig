@@ -189,6 +189,14 @@ test "anole.App: staticDir refuses a symlink out of its directory" {
         error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
         else => return err,
     };
+    // The production kernel tier (zio + openat2) sees an absolute link, a
+    // directory link up and a relative link that stays inside as well.
+    const secret_abs = try tmp.dir.realPathFileAlloc(io, "secret.txt", alloc);
+    defer alloc.free(secret_abs);
+    tmp.dir.symLink(io, secret_abs, "root/abs.txt", .{}) catch return error.SkipZigTest;
+    tmp.dir.symLink(io, "..", "root/up", .{ .is_directory = true }) catch return error.SkipZigTest;
+    tmp.dir.symLink(io, "page.txt", "root/alias.txt", .{}) catch return error.SkipZigTest;
+    tmp.dir.symLink(io, "../secret.txt", "root/index.html", .{}) catch return error.SkipZigTest;
     const files = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/root", .{tmp.sub_path});
     defer alloc.free(files);
 
@@ -199,9 +207,12 @@ test "anole.App: staticDir refuses a symlink out of its directory" {
     try listenAndCheck(&app, struct {
         fn check(io_: std.Io, arena: std.mem.Allocator, port: u16) !void {
             try std.testing.expectEqualStrings("static page", (try get(io_, arena, try urlOf(arena, port, "/files/page.txt"), &.{})).body);
-            const out = try get(io_, arena, try urlOf(arena, port, "/files/out.txt"), &.{});
-            try std.testing.expectEqual(http.Status.not_found, out.status);
-            try std.testing.expect(std.mem.find(u8, out.body, "secret") == null);
+            try std.testing.expectEqualStrings("static page", (try get(io_, arena, try urlOf(arena, port, "/files/alias.txt"), &.{})).body);
+            for ([_][]const u8{ "/files/out.txt", "/files/abs.txt", "/files/up/secret.txt", "/files/index.html", "/files/" }) |path| {
+                const out = try get(io_, arena, try urlOf(arena, port, path), &.{});
+                try std.testing.expectEqual(http.Status.not_found, out.status);
+                try std.testing.expect(std.mem.find(u8, out.body, "secret") == null);
+            }
         }
     }.check);
 

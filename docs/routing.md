@@ -612,8 +612,10 @@ behaviour).
   open, on top of the open's own. The server logs which way it went at
   startup (info on Linux, debug elsewhere); `.resolve_beneath = false`
   restores the old speed where that matters.
-- The real path of the directory is read when the server starts, so a
-  directory renamed or replaced while serving answers 404.
+- Where the server checks real paths (Windows, macOS 15, Linux without
+  `openat2`), the real path of the directory is read when the server
+  starts, so a directory renamed or replaced while serving answers 404.
+  With kernel confinement the open directory keeps serving.
 - Linux with neither `openat2` nor `/proc` cannot do the check, and the
   server refuses to start, with a message that names
   `.resolve_beneath = false`.
