@@ -1595,6 +1595,12 @@ pub fn Server(comptime Ctx: type) type {
                 for (active) |*l| logListening(l.config, l.address);
             }
 
+            // The trim tasks, one per executor. Canceled last, after the
+            // drain and the connections, so the encoders a response made
+            // during the drain are freed too (`trimLoop`).
+            var trimming: std.Io.Group = .init;
+            defer trimming.cancel(self.io);
+
             var connections: std.Io.Group = .init;
             // Parked connections: a shelf per executor, each with a driver
             // task there that closes them all when the shelf stops. That
@@ -1658,7 +1664,7 @@ pub fn Server(comptime Ctx: type) type {
 
             // One per executor, so that each trims its own free list.
             for (0..executors orelse 1) |i| {
-                placement.concurrent(&accepting, self.io, .{ .executor = i }, trimLoop, .{ self, i == 0 }) catch |err| {
+                placement.concurrent(&trimming, self.io, .{ .executor = i }, trimLoop, .{ self, i == 0 }) catch |err| {
                     log.debug("No task to trim the request buffers on executor {d}: {}", .{ i, err });
                 };
             }
@@ -1958,8 +1964,9 @@ pub fn Server(comptime Ctx: type) type {
         /// (`block_cache`), and the buffered-body encoders no response
         /// took (`encoders`).
         fn trimLoop(self: *Self, shards: bool) std.Io.Cancelable!void {
-            // One task per executor, canceled at teardown: this runs on the
-            // thread that owns the encoders.
+            // One task per executor, canceled at teardown after the drain
+            // and the connections: this runs on the thread that owns the
+            // encoders, and frees those the drain's responses made too.
             defer if (build_options.use_zlib) encoders.freeLocal();
             while (true) {
                 try self.io.sleep(request_buffers_trim_interval, .awake);
