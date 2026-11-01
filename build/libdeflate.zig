@@ -34,7 +34,7 @@ pub fn library(
         .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
     });
     lib.root_module.addIncludePath(upstream.path("."));
-    lib.root_module.addCSourceFiles(.{ .root = upstream.path("lib"), .files = sources, .flags = &.{"-std=c11"} });
+    lib.root_module.addCSourceFiles(.{ .root = upstream.path("lib"), .files = sources, .flags = &.{"-std=gnu11"} });
     lib.installHeader(upstream.path("libdeflate.h"), "libdeflate.h");
     return lib;
 }

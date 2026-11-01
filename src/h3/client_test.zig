@@ -2273,6 +2273,11 @@ const PastSlabs = struct {
 };
 
 test "h3 server: files of known length on pooled streams take nothing past malloc's slabs" {
+    // The premise is Zig's malloc on Linux (musl or glibc builds), where an
+    // allocation past its 32 KiB slabs is an mmap; Windows' heap has no such
+    // edge, and its socket path takes larger buffers through the same
+    // allocator.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
