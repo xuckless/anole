@@ -63,8 +63,8 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
    "hash mismatch". Check the final hashes from an empty cache
    (`ZIG_GLOBAL_CACHE_DIR=$(mktemp -d) zig build test`).
 2. Update the version in `tools/advisories.py` and the "Pinned:" line in
-   THIRD_PARTY_NOTICES. For zlib-ng, zstd, Brotli and yyjson, add the new
-   tarball's SHA-256 (and Brotli's `testdata.txz`'s) to `sha256_of` in
+   THIRD_PARTY_NOTICES. For zlib-ng, zstd, Brotli, yyjson, lz4 and
+   libdeflate, add the new tarball's SHA-256 (and Brotli's `testdata.txz`'s) to `sha256_of` in
    `tools/sanitize-c-libs.sh`, which refuses a download it has no hash for. Re-read the "Includes:" lines there (sfparse in
    nghttp2 and nghttp3, PCG in ngtcp2, fiat in BoringSSL), and re-copy
    BoringSSL's licence text into part E if it changed.
@@ -139,8 +139,10 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      `utils.c` and the x86/arm `cpu_features.c`); compare the list with the
      new tarball's `lib/`. Keep `FREESTANDING` off: with it `utils.c`
      defines weak byte-loop `memcpy`/`memset` that win the link for the
-     whole program (nilo's finding). Then run the compression tests
-     (`zig build core-test`: "compress: ...").
+     whole program (nilo's finding). Then run
+     `tools/sanitize-c-libs.sh libdeflate` (its CTest suite under ASan and
+     UBSan) and the compression tests (`zig build core-test`:
+     "compress: ...").
    - **SQLite** is the amalgamation zip from sqlite.org (the URL carries
      the year and the version as `3XXYYZZ`); check the zip's SHA3-256
      against the download page. Its compile-time options are

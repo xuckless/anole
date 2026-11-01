@@ -459,6 +459,16 @@ src/smtp/core/ (the SMTP client's message encoding and protocol pieces)
             538d0ddc064248b6c1431bfd68df2481f431c0fd
   Linked:   -Dsmtp=true
 
+build/libdeflate.zig (the libdeflate build script)
+  Its source list (the compressor, gzip's wrapper, CRC-32 and the CPU
+  feature detection, no decompressor) follows nilo's build.zig
+  (`libdeflateFor`); Anole builds with libc, so `FREESTANDING` stays off and
+  lib/utils.c is built as is. The file carries an attribution header.
+  Licence:  MIT (text in part C). Copyright (c) 2026 Nevindra
+  Source:   https://github.com/nevindra/nilo, commit
+            d3ab2f33bbb8fc2281605c33a12fe3619c63f42d
+  Linked:   -Dlibdeflate=true (build time only)
+
 tests/lambda/events/*.json (sample AWS events for the Lambda adapter's tests)
   Copied unchanged from aws-lambda-rust-runtime: lambda-http/tests/data
   (the API Gateway REST and HTTP API, Function URL, ALB and VPC Lattice
@@ -479,6 +489,8 @@ C. MIT licence text (applies to every MIT component above)
 
 zefir (src/config, src/nats/core, src/openapi, src/validate, src/logging, src/http/core/bind*.zig, json_out.zig): Copyright (c) 2026 vkiryakov
 libvaxis (src/console/ui/ctlseqs.zig, keys.zig): Copyright (c) 2023 Tim Culverhouse
+libdeflate (fetched, -Dlibdeflate): Copyright 2016 Eric Biggers, Copyright 2024 Google LLC
+nilo (build/libdeflate.zig's source list): Copyright (c) 2026 Nevindra
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
