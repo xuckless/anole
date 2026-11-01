@@ -33,7 +33,10 @@ breaking changes are listed anyway.
   1 and 2 MiB) with an O(1) take and give, serves everything past
   malloc's slabs (32 KiB), and is trimmed per class. A block maps one page
   past its class, where `alloc` keeps its header, so a power-of-two
-  allocation (Brotli's 256 KiB hash tables) fits its own class (#99).
+  allocation (Brotli's 256 KiB hash tables) fits its own class. A thread
+  keeps up to 8 MiB (was 4 MiB), of which the 64 KiB class may hold 128
+  blocks (one HTTP/2 burst of bodies of unknown length) and the others 2
+  MiB each (#99).
 
 ## 0.4.2 (2026-10-31)
 

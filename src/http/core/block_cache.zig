@@ -22,7 +22,7 @@
 //! serves every buffered response an executor compresses. Smaller
 //! allocations go to malloc, which serves them from its heap; larger ones
 //! are mapped and unmapped each time. The cache holds at most `max_cached`
-//! bytes, a class at most `class_max`, and `trimLocal` (the server's trim
+//! bytes, a class at most `classMax`, and `trimLocal` (the server's trim
 //! task, on each executor) unmaps the blocks of each class that nothing
 //! took since the last trim, past `trim_keep`.
 //!
@@ -53,10 +53,16 @@ pub const classes = [_]usize{ 64 * 1024, 128 * 1024, 256 * 1024, 1024 * 1024, 2 
 /// headers.
 pub const malloc_max = 32 * 1024 - 64;
 /// Most bytes one thread's cache holds; blocks given back past it are
-/// unmapped.
-pub const max_cached = 4 * 1024 * 1024;
-/// Most bytes one class holds, so one size cannot crowd out the others.
-pub const class_max = max_cached / 2;
+/// unmapped. Reached only right after that much was in use at once on the
+/// executor, and trimmed within two trim intervals.
+pub const max_cached = 8 * 1024 * 1024;
+/// Most bytes a class holds, so one size cannot crowd out the others: the
+/// 64 KiB class (an HTTP/2 body of unknown length, one per stream) holds a
+/// burst of 128 streams, a connection's most spare streams; the others 2
+/// MiB each.
+pub fn classMax(index: usize) usize {
+    return if (index == 0) 128 * classes[0] else 2 * 1024 * 1024;
+}
 /// Blocks of each class up to 256 KiB a trim keeps however long they sat
 /// unused: one buffered encoder's large blocks (Brotli's two hash tables).
 /// The 1 and 2 MiB classes (raised HTTP/2 body windows) keep none.
@@ -152,7 +158,7 @@ pub fn take(class_size: usize) ?[]align(16) u8 {
 pub fn give(block: []u8) void {
     const i = exactIndex(block.len) orelse unreachable; // not from `take`
     const list = &cache.lists[i];
-    if (cache.bytes + block.len > max_cached or (list.count + 1) * block.len > class_max) {
+    if (cache.bytes + block.len > max_cached or (list.count + 1) * block.len > classMax(i)) {
         // SAFETY: from `take`, a page-aligned mapping.
         unmap(@alignCast(block.ptr), block.len);
         return;
@@ -335,19 +341,37 @@ test "block_cache: each class keeps its own blocks, and take hands out a class w
     try std.testing.expectEqual(before.count, cached().count);
 }
 
-test "block_cache: a class holds at most class_max, the cache max_cached" {
+test "block_cache: a class holds at most classMax, the cache max_cached" {
     drainLocalForTest();
     defer drainLocalForTest();
     var blocks: [40][]align(16) u8 = undefined;
     for (&blocks) |*b| b.* = take(64 * 1024).?;
     for (blocks) |b| give(b);
-    try std.testing.expectEqual(class_max / (64 * 1024), cachedIn(0));
-    // A 2 MiB block still fits the total; the next 1 MiB does not.
-    give(take(2 * 1024 * 1024).?);
+    try std.testing.expectEqual(@as(usize, 40), cachedIn(0));
+    // A class stops at its cap.
+    var bigs: [3][]align(16) u8 = undefined;
+    for (&bigs) |*b| b.* = take(1024 * 1024).?;
+    for (bigs) |b| give(b);
+    try std.testing.expectEqual(classMax(3) / (1024 * 1024), cachedIn(3));
+    // A 2 MiB block still fits the total (2.5 + 2 + 2 MiB); the next one
+    // stops at the class cap, and a 256 KiB block past 8 MiB at the total.
+    const twos: [2][]align(16) u8 = .{ take(2 * 1024 * 1024).?, take(2 * 1024 * 1024).? };
+    for (twos) |b| give(b);
     try std.testing.expectEqual(@as(usize, 1), cachedIn(4));
-    give(take(1024 * 1024).?);
-    try std.testing.expectEqual(@as(usize, 0), cachedIn(3));
-    try std.testing.expect(cached().bytes <= max_cached);
+    var quarters: [8][]align(16) u8 = undefined;
+    for (&quarters) |*b| b.* = take(256 * 1024).?;
+    for (quarters) |b| give(b);
+    try std.testing.expectEqual(@as(usize, 6), cachedIn(2));
+    try std.testing.expectEqual(max_cached, cached().bytes);
+}
+
+test "block_cache: a burst of 128 bodies of 64 KiB comes back to the cache whole" {
+    drainLocalForTest();
+    defer drainLocalForTest();
+    var blocks: [129][]align(16) u8 = undefined;
+    for (&blocks) |*b| b.* = take(64 * 1024).?;
+    for (blocks) |b| give(b);
+    try std.testing.expectEqual(@as(usize, 128), cachedIn(0));
 }
 
 test "block_cache: alloc picks the class by the caller's size, so a power of two fits its class" {
