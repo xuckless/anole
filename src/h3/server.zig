@@ -286,11 +286,11 @@ const inbox_len = 256;
 
 /// What one connection's streams hold unacknowledged, all together.
 const conn_budget = 4 << 20;
-/// A response stream's own cap: ordinary responses, and message streams
-/// (extended CONNECT: WebSocket over HTTP/3, the WebTransport CONNECT; and
-/// gRPC or Connect streaming calls), which carry messages and are
-/// latency-sensitive.
-const response_cap = 64 * 1024;
+/// A message stream's own cap (extended CONNECT: WebSocket over HTTP/3,
+/// the WebTransport CONNECT; and gRPC or Connect streaming calls), which
+/// carry messages and are latency-sensitive: fixed, so a send returns
+/// once buffered up to it. An ordinary response's follows its path
+/// (`bridge.pathCap`).
 const message_cap = 1 << 20;
 
 /// One endpoint's counters. Several endpoints serve one listener on Linux
@@ -2341,7 +2341,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// Request body bytes not yet read by the handler.
             body: bridge.RecvQueue = .{},
             /// Woken when the body changes (data, end, reset), and when the
-            /// response has room (acknowledgments, budget, reset).
+            /// response has room (acknowledgments, budget, reset, or, under
+            /// the path cap, nghttp3 taking queued bytes in `readData`).
             rx: bridge.Signal = .{},
             tx: bridge.Signal = .{},
             waiter: bridge.Budget.Waiter = .{ .signal = undefined },
@@ -2418,6 +2419,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             ended: bool = false,
             /// nghttp3 asked for data and got none: resume it on the next.
             deferred: bool = false,
+            /// A writer found no room under the cap: the next bytes nghttp3
+            /// takes (`readData`) wake it, as well as acknowledgements.
+            /// Locked.
+            wants_room: bool = false,
             /// The response body until the peer acknowledges it.
             /// Keeps its first block across responses while the stream is
             /// pooled, so a small response takes none from the pool.
@@ -2841,9 +2846,19 @@ pub fn Endpoint(comptime Ctx: type) type {
                 s.tx.notify(io);
             }
 
-            /// The send cap of this stream's queue.
+            /// The send cap of this stream's queue: fixed for a message
+            /// stream, else following the connection's path
+            /// (`bridge.pathCap`). Locked.
             fn sendCap(s: *const Stream) usize {
-                return if (s.protocol.len > 0 or s.message) message_cap else response_cap;
+                if (!s.usesPathCap()) return message_cap;
+                return bridge.pathCapOf(&s.out, s.conn.budget.max);
+            }
+
+            /// Whether the send cap follows the path. Only then does
+            /// nghttp3 taking queued bytes (`readData`) make room: a fixed
+            /// cap counts what is unacknowledged, sent or not.
+            fn usesPathCap(s: *const Stream) bool {
+                return !(s.protocol.len > 0 or s.message);
             }
 
             /// Tells nghttp3 there is more of the body, if it was waiting
@@ -3052,7 +3067,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
 
             /// Copies `parts` into the stream's send queue (waiting past
-            /// `response_cap` for acknowledgments), then one kick.
+            /// its cap for room), then one kick.
             fn write(p: *dusty.Parked, parts: []const []const u8) dusty.Parked.WriteError!void {
                 const self = of(p);
                 const conn = self.s.conn;
@@ -3405,7 +3420,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                         conn.unlock();
                         return err;
                     };
-                    const n = s.out.write(&conn.ep.blocks, &conn.budget, rest, s.sendCap(), s.inline_mode) catch {
+                    // Inline, the write passes the cap: no need to ask it.
+                    const cap = if (s.inline_mode) 0 else s.sendCap();
+                    const n = s.out.write(&conn.ep.blocks, &conn.budget, rest, cap, s.inline_mode) catch {
                         conn.unlock();
                         return self.fail(error.SystemResources);
                     };
@@ -3413,7 +3430,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                         rest = rest[n..];
                         s.resume_();
                     } else {
-                        // Woken by an acknowledgment, or by the budget.
+                        // Woken by an acknowledgment, by the budget, or
+                        // (path cap only) by nghttp3 taking queued bytes
+                        // (`readData`).
+                        if (s.usesPathCap()) s.wants_room = true;
                         s.waiter.signal = &s.tx;
                         conn.budget.link(&s.waiter);
                     }
@@ -3455,6 +3475,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                             rest = rest[n..];
                             s.resume_();
                         } else {
+                            if (s.usesPathCap()) s.wants_room = true;
                             s.waiter.signal = &s.tx;
                             conn.budget.link(&s.waiter);
                         }
@@ -3987,6 +4008,13 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return 0;
             }
             const count = s.out.take(vec, veccnt);
+            // Taken bytes leave room under the unsent part of the cap
+            // (`bridge.pathCap`): a writer waiting for it goes on now,
+            // not at the next acknowledgement.
+            if (count > 0 and s.wants_room) {
+                s.wants_room = false;
+                s.tx.notify(s.conn.ep.io);
+            }
             if (s.ended and s.allSent()) {
                 pflags.* |= h.NGHTTP3_DATA_FLAG_EOF;
                 if (s.trailer_nv.len > 0) {

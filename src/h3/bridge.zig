@@ -606,6 +606,31 @@ pub const SendQueue = struct {
     }
 };
 
+/// The least a stream whose cap follows its path may queue ahead of the
+/// peer: the old fixed cap, so a small response, a slow path and a reader
+/// that stopped reading cost what they did.
+pub const send_floor: usize = 64 * 1024;
+
+/// The cap (`SendQueue.write`'s, on bytes written and not yet acknowledged)
+/// of a stream that follows its path: what it has in flight plus
+/// `send_floor` not yet sent, at most three quarters of the connection's
+/// budget, so the connection's other streams always have room. A fixed cap
+/// on everything unacknowledged held a download to that much per round
+/// trip (#151). Counting only the unsent part lets what is in flight
+/// follow the congestion window, which ngtcp2 already bounds, as fib (64
+/// KiB unsent), goose-http (128 KiB) and Linux's `tcp_notsent_lowat` do. A
+/// reader whose credit ran out holds what nghttp3 already took (up to one
+/// pull, about 32 KiB) plus `send_floor` (research/s2/h3-send-cap.md).
+pub fn pathCap(in_flight: u64, budget_max: usize) usize {
+    const ceiling: u64 = @max(send_floor, budget_max - budget_max / 4);
+    return @intCast(@min(in_flight + send_floor, ceiling));
+}
+
+/// `pathCap` for `queue`. With the connection's mutex held.
+pub fn pathCapOf(queue: *const SendQueue, budget_max: usize) usize {
+    return pathCap(queue.sent - queue.acked, budget_max);
+}
+
 /// Received and not yet read; in order (ngtcp2 delivers in order).
 pub const RecvQueue = struct {
     head: ?*Block = null,
@@ -738,6 +763,23 @@ test "send queue: the cap and the budget stop a write, force passes both and sti
     try std.testing.expectEqual(@as(usize, 550), budget.used);
     q.ack(&pool, &budget, 100);
     try std.testing.expectEqual(@as(usize, 450), budget.used);
+}
+
+test "h3 send cap: in flight plus 64 KiB unsent, at most three quarters of the budget" {
+    const KiB: usize = 1024;
+    const MiB = 1024 * KiB;
+    const budget = 4 * MiB;
+    // Nothing in flight: the floor.
+    try std.testing.expectEqual(64 * KiB, pathCap(0, budget));
+    // A reader that stopped, or a window the bytes in flight fill: what is
+    // in flight, plus the floor.
+    try std.testing.expectEqual(100 * KiB + 64 * KiB, pathCap(100 * KiB, budget));
+    try std.testing.expectEqual(2 * MiB + 64 * KiB, pathCap(2 * MiB, budget));
+    // Never past three quarters of the budget.
+    try std.testing.expectEqual(3 * MiB, pathCap(3 * MiB, budget));
+    try std.testing.expectEqual(3 * MiB, pathCap(16 * MiB, budget));
+    // A budget below the floor (tests lower it) leaves the floor.
+    try std.testing.expectEqual(64 * KiB, pathCap(0, 32 * KiB));
 }
 
 test "send queue take hands nghttp3 the same runs and marks them sent" {
