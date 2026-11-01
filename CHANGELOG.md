@@ -73,6 +73,19 @@ breaking changes are listed anyway.
   .json`, `.js.map` static files) no longer carry `; charset=UTF-8`: RFC
   8259 defines no charset parameter for JSON (#101).
 
+- Pipelined HTTP/1.1 requests on `noWait` routes are answered in one write
+  per read: a response waits in the connection's write buffer while the
+  next request is already buffered, and the batch goes out before the
+  connection could wait (more input to read, a handler that is not
+  `noWait`, a body still to arrive) or when the 16 KiB buffer fills. A
+  pipelined batch of 16 took 16 sends; now it takes one (one TLS record
+  under TLS). Bodyless requests and requests whose handler reads its body
+  batch; a request with a body its handler leaves unread still flushes
+  before the body is thrown away. Single requests are unchanged. New
+  `Response.flushOwed()` for a `noWait` handler that may still wait on
+  HTTP/1.1; the C ABI's consumer routes and gRPC methods call it (S2 K3;
+  issue number to come).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed

@@ -882,6 +882,13 @@ pub const Response = struct {
     /// `_park` ran: the response is a parked stream's, and `write` does
     /// nothing more.
     _parked: bool = false,
+    /// HTTP/1.x: the next request is already buffered behind this one, so
+    /// a whole in-memory body stays in the connection's write buffer
+    /// instead of being flushed at its end; it goes out with the responses
+    /// after it, in one write, at the first point where the connection
+    /// could wait (`Connection.flushOwed`). Set by the server just before
+    /// `write`; a file, a stream or a sink flushes as before.
+    _cork: bool = false,
 
     /// A file body set up by `sendFile`.
     pub const BodyFile = struct {
@@ -1496,6 +1503,17 @@ pub const Response = struct {
         // and none of the events; the body writer already drops what it is
         // given for a HEAD, so no send has to ask.
         return .{ .body = try self.stream(buf) };
+    }
+
+    /// HTTP/1.x: sends the responses to earlier pipelined requests that are
+    /// still corked in the connection's write buffer (`_cork`). For a
+    /// handler on a `no_wait` route that waits after all -- one that falls
+    /// back to waiting when it cannot `detach`, as the C ABI's consumer
+    /// routes do over HTTP/1.1 -- so its wait does not hold them back.
+    /// Nothing over HTTP/2 or HTTP/3, or with nothing owed.
+    pub fn flushOwed(self: *Response) SendError!void {
+        if (self._sink != null) return;
+        if (self._conn) |c| try c.flushOwed();
     }
 
     /// Whether `detach` would work: the engine supports it, nothing has
@@ -2304,6 +2322,9 @@ pub const Response = struct {
             }
         }
 
+        // Corked: the whole response is in the write buffer (or went out
+        // when it filled), and the server flushes it with the next ones.
+        if (send_header and self._cork and self._sink == null) return;
         return self.finish(w);
     }
 
@@ -2424,6 +2445,97 @@ test "Response: a body set as a slice goes out with its Content-Length" {
     try std.testing.expect(std.mem.indexOf(u8, written, "HTTP/1.1 200") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 11") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Hello World") != null);
+}
+
+/// A connection writer for tests that counts the writes that reach it
+/// (`drain` calls) and keeps what they carried.
+const CountingSink = struct {
+    interface: std.Io.Writer,
+    out: [2048]u8 = undefined,
+    len: usize = 0,
+    drains: usize = 0,
+
+    fn init(buffer: []u8) CountingSink {
+        return .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn sent(self: *const CountingSink) []const u8 {
+        return self.out[0..self.len];
+    }
+
+    fn put(self: *CountingSink, bytes: []const u8) std.Io.Writer.Error!void {
+        if (self.len + bytes.len > self.out.len) return error.WriteFailed;
+        @memcpy(self.out[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *CountingSink = @alignCast(@fieldParentPtr("interface", w));
+        self.drains += 1;
+        try self.put(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try self.put(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try self.put(last);
+        return n + last.len * splat;
+    }
+};
+
+test "Response: a corked response stays in the write buffer and goes out with the next in one write" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var sink: CountingSink = .init(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&sink.interface);
+
+    var first = try Response._init(arena.allocator(), &connection, 32);
+    first.body = "one";
+    first._cork = true;
+    try first.write();
+    try std.testing.expectEqual(@as(usize, 0), sink.drains);
+    try std.testing.expect(sink.interface.end > 0);
+
+    var second = try Response._init(arena.allocator(), &connection, 32);
+    second.body = "two";
+    try second.write();
+    try std.testing.expectEqual(@as(usize, 1), sink.drains);
+    try std.testing.expectEqual(@as(usize, 0), sink.interface.end);
+
+    const sent = sink.sent();
+    const one = std.mem.indexOf(u8, sent, "\r\n\r\none") orelse return error.TestUnexpectedResult;
+    const two = std.mem.indexOf(u8, sent, "\r\n\r\ntwo") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(one < two);
+}
+
+test "Response: a corked stream is still flushed at its head" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var sink: CountingSink = .init(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&sink.interface);
+
+    // `_cork` covers a whole body in memory only: a stream's head and its
+    // end (here `write`'s, for a stream the handler left open) flush as
+    // they always did.
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    response._cork = true;
+    var body_buf: [64]u8 = undefined;
+    var w = try response.stream(&body_buf);
+    try w.interface.writeAll("abc");
+    try w.interface.flush();
+    try response.write();
+    try std.testing.expectEqual(@as(usize, 0), sink.interface.end);
+    try std.testing.expect(std.mem.endsWith(u8, sink.sent(), "0\r\n\r\n"));
 }
 
 test "Response: write() only writes once" {

@@ -1995,6 +1995,57 @@ fn drainCheck(a: *Answerer, e: *engine.Engine, port: u16, io: std.Io) !void {
     try std.testing.expectEqual(@as(u32, abi.ABORT_DRAIN), a.last_abort_reason.load(.acquire));
 }
 
+test "capi engine over HTTP/1.1: answers to pipelined requests go out before a consumer route waits for its consumer" {
+    var fx: Fixture = undefined;
+    try fx.start(Fixture.plain_listener);
+    defer fx.stop();
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(pipelinedBeforeHold, .{ &fx, io });
+    try f.await(io);
+    try fx.finish();
+}
+
+/// Two pipelined requests to consumer routes, which are `no_wait` but wait
+/// for the consumer over HTTP/1.1: the answer to the first must arrive
+/// while the second is still held, or it would sit corked behind it
+/// until the request deadline.
+fn pipelinedBeforeHold(fx: *Fixture, io: std.Io) !void {
+    const stream = try (try std.Io.net.IpAddress.parse("127.0.0.1", fx.e.port(0))).connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    fx.a.held.store(0, .release);
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll("GET /hello/1 HTTP/1.1\r\nHost: x\r\n\r\n" ++
+        "GET /hold HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    try w.interface.flush();
+
+    var rbuf: [2048]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    const status = try r.interface.takeDelimiterInclusive('\n');
+    try std.testing.expect(std.mem.startsWith(u8, status, "HTTP/1.1 200"));
+    var content_length: usize = 0;
+    while (true) {
+        const line = try r.interface.takeDelimiterInclusive('\n');
+        if (std.mem.eql(u8, line, "\r\n")) break;
+        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+            content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, line["content-length:".len..], " \t\r\n"), 10);
+        }
+    }
+    const body = try r.interface.take(content_length);
+    try std.testing.expect(std.mem.startsWith(u8, body, "hello /hello/1"));
+
+    // Only now does the consumer answer the held request.
+    const held = try waitHeld(io, &fx.a.held);
+    try engine.respond(fx.e, held, 200, &.{}, "late", false);
+    var out: [1024]u8 = undefined;
+    var fw: std.Io.Writer = .fixed(&out);
+    try readRest(&r, &fw);
+    try std.testing.expect(std.mem.startsWith(u8, fw.buffered(), "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.endsWith(u8, fw.buffered(), "\r\n\r\nlate"));
+}
+
 test "capi: every ServerError and TlsLoadError name is an ABI error token" {
     // The server design's named error sets (`anole.ServerError`,
     // `anole.TlsLoadError`): their member names are the tokens verbatim.
