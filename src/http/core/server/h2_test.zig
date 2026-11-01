@@ -447,6 +447,16 @@ const Handlers = struct {
     }
     var held_gate: std.Io.Event = .unset;
     var held_entered: std.atomic.Value(u32) = .init(0);
+    /// `held`, after reading its (small) body.
+    fn heldBody(req: *dusty.Request, res: *dusty.Response) !void {
+        const raw = req._body_source.?.reader;
+        var hash: std.hash.Wyhash = .init(0);
+        while (true) _ = takeBody(raw, &hash, 4096) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
+        return held(req, res);
+    }
     /// A streamed body far past the client's 64 KiB stream window.
     fn big(_: *dusty.Request, res: *dusty.Response) !void {
         var buf: [4096]u8 = undefined;
@@ -1330,12 +1340,14 @@ test "HTTP/2: a handler that reads each piece of a long body as it comes still g
 }
 
 /// `count` held requests at once on `client`, all in their handlers
-/// before any answers: the connection needs that many streams.
-fn heldBurst(client: *TestClient, io: std.Io, count: u32) !void {
+/// before any answers: the connection needs that many streams. With
+/// `body`, each a POST that sends it (in a DATA frame of its own, with
+/// END_STREAM), which its handler reads.
+fn heldBurst(client: *TestClient, io: std.Io, count: u32, body: ?[]const u8) !void {
     Handlers.held_gate = .unset;
     const entered = Handlers.held_entered.load(.acquire);
     var ids: [128]i32 = undefined;
-    for (ids[0..count]) |*id| id.* = try client.request("GET", "/held", null);
+    for (ids[0..count]) |*id| id.* = try client.request(if (body != null) "POST" else "GET", "/held", body);
     try client.sendPending();
     // The test client reads nothing meanwhile: the server's frames wait in
     // the socket, and none of the requests can finish before the gate.
@@ -1345,7 +1357,7 @@ fn heldBurst(client: *TestClient, io: std.Io, count: u32) !void {
     for (ids[0..count]) |id| try std.testing.expectEqualStrings("held but whole", client.get(id).body.items);
 }
 
-test "HTTP/2: a warm connection serves a burst of 100 streams without allocating" {
+test "HTTP/2: a warm connection serves a burst of 100 streams, with or without small bodies, without allocating" {
     const io = std.testing.io;
     const safety = @import("anole_safety");
     safety.arena_poisoning.store(false, .monotonic);
@@ -1356,6 +1368,7 @@ test "HTTP/2: a warm connection serves a burst of 100 streams without allocating
     }, {});
     defer server.deinit();
     server.router.get("/held", Handlers.held);
+    server.router.post("/held", Handlers.heldBody);
     var future = try io.concurrent(Fixture.run, .{&server});
     defer future.cancel(io) catch {};
     try server.waitReady(io);
@@ -1363,15 +1376,17 @@ test "HTTP/2: a warm connection serves a burst of 100 streams without allocating
     var client: TestClient = undefined;
     try client.init(std.testing.allocator, io, server.address.ip);
     defer client.deinit();
-    // Warm up: 100 streams (h2load's -m100), kept as spares.
-    for (0..2) |_| {
-        try heldBurst(&client, io, 100);
+    // Warm up: 100 streams (h2load's -m100), kept as spares; bodyless,
+    // then each with a small body (its queue from the stream's arena).
+    const small = "123456789";
+    for ([_]?[]const u8{ null, null, small, small }) |body| {
+        try heldBurst(&client, io, 100, body);
         try awaitStreamsFreed(&server, io);
     }
     try std.testing.expectEqual(@as(usize, 100), server.h2_conns.sparesForTest());
     const before = counting.count.load(.monotonic);
-    for (0..3) |_| {
-        try heldBurst(&client, io, 100);
+    for ([_]?[]const u8{ null, small, null, small }) |body| {
+        try heldBurst(&client, io, 100, body);
         try awaitStreamsFreed(&server, io);
     }
     try std.testing.expectEqual(before, counting.count.load(.monotonic));
@@ -1393,7 +1408,7 @@ test "HTTP/2: a burst's spare streams go after two quiet trim intervals, down to
     var client: TestClient = undefined;
     try client.init(std.testing.allocator, io, fx.server.address.ip);
     defer client.deinit();
-    try heldBurst(&client, io, 40);
+    try heldBurst(&client, io, 40, null);
     try awaitStreamsFreed(&fx.server, io);
     try std.testing.expectEqual(@as(usize, 40), fx.server.h2_conns.sparesForTest());
     // Each round: a trim interval passes, and one request makes the
