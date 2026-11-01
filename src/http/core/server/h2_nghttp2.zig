@@ -162,8 +162,10 @@ const max_spare_streams = 128;
 const min_spare_streams = 16;
 /// What a stream's arena keeps between requests, and starts with: an
 /// ordinary request takes about 3 KB of it (the S2 atlas); the body and
-/// response queues are not in it.
-const arena_retain_limit = 8 * 1024;
+/// response queues are not in it. Less the arena's node header (three
+/// words, `std.heap.ArenaAllocator`'s `Node`) and some slack, so the node
+/// fits malloc's 8 KiB slab class rather than the 16 KiB one.
+const arena_retain_limit = 8 * 1024 - 4 * @sizeOf(usize);
 
 /// Response body bytes queued per stream between the handler and the data
 /// provider; a handler that gets this far ahead of the peer waits. From

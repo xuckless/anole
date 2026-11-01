@@ -26,8 +26,8 @@ breaking changes are listed anyway.
   spare streams (was 16), so a client with 100 streams in flight stops
   creating and freeing them; spares unused for a whole trim interval go,
   down to 16 (#99).
-- HTTP/2: a reused stream's arena keeps 8 KiB (was 128 KiB) and a new one
-  starts with that node; the response queue (32 KiB - 64) and body writer
+- HTTP/2: a reused stream's arena keeps one 8 KiB node, its header
+  included (was 128 KiB), and a new one starts with that node; the response queue (32 KiB - 64) and body writer
   (16 KiB) come from malloc's slabs instead of the arena, so a streamed
   response maps no memory on musl (#99).
 - `block_cache` keeps one free list per size class (64, 128 and 256 KiB,
