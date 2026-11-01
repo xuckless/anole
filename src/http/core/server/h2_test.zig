@@ -532,6 +532,7 @@ const Handlers = struct {
     /// `sum`, reading the body straight from the stream as it comes, and
     /// telling the test how much it has read so far (`reader_got`).
     fn reader(req: *dusty.Request, res: *dusty.Response) !void {
+        _ = reader_entered.fetchAdd(1, .acq_rel);
         const raw = req._body_source.?.reader;
         var hash: std.hash.Wyhash = .init(0);
         var n: usize = 0;
@@ -545,6 +546,7 @@ const Handlers = struct {
         try res.print(.text, "{d} {x}", .{ n, hash.final() });
     }
     var reader_got: std.atomic.Value(u32) = .init(0);
+    var reader_entered: std.atomic.Value(u32) = .init(0);
     /// At most `limit` body bytes, straight from the stream: each read is
     /// what the engine credits back.
     fn takeBody(raw: *std.Io.Reader, hash: *std.hash.Wyhash, limit: usize) !usize {
@@ -915,6 +917,59 @@ test "HTTP/2: a reader whose inline write fails ends the connection, and the wri
     // The response the failed write held never went out.
     try std.testing.expectEqual(@as(u16, 0), client.get(id).status);
     try std.testing.expectEqual(rounds, h2.test_writer_rounds.load(.monotonic));
+}
+
+test "HTTP/2: a handler waiting for its body gets a DATA frame's first bytes before the rest of the frame" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const warm = try client.request("GET", "/hello", null);
+    try client.run();
+    try std.testing.expectEqual(@as(u16, 200), client.get(warm).status);
+
+    // A head without END_STREAM; the body goes by hand below, so a frame
+    // can stop in the middle.
+    Handlers.reader_got.store(0, .release);
+    const entered = Handlers.reader_entered.load(.acquire);
+    const nva = [_]c.nghttp2_nv{
+        TestClient.nv(":method", "POST"),
+        TestClient.nv(":path", "/reader"),
+        TestClient.nv(":scheme", "http"),
+        TestClient.nv(":authority", "localhost"),
+    };
+    const resp = try std.testing.allocator.create(TestClient.Resp);
+    resp.* = .{};
+    const id = c.nghttp2_submit_headers(client.session, c.NGHTTP2_FLAG_NONE, -1, null, &nva, nva.len, resp);
+    if (id < 0) {
+        std.testing.allocator.destroy(resp);
+        return error.Http2Submit;
+    }
+    try client.responses.put(std.testing.allocator, id, resp);
+    try client.sendPending();
+    try wait.waitAtLeast(io, "the body reader's handler runs", &Handlers.reader_entered, entered + 1);
+
+    var body: [100]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i *% 13 +% 7);
+    const sid: u32 = @intCast(id);
+    // A DATA frame of 100 bytes, of which only the first 10 are sent.
+    const data_head = [9]u8{ 0, 0, body.len, 0x0, 0x0, @truncate(sid >> 24), @truncate(sid >> 16), @truncate(sid >> 8), @truncate(sid) };
+    try client.w.writeAll(&data_head);
+    try client.w.writeAll(body[0..10]);
+    try client.w.flush();
+    try wait.waitAtLeast(io, "the handler read the first bytes of the unfinished frame", &Handlers.reader_got, 10);
+    // The rest of the frame, then an empty one that ends the body.
+    const end_head = [9]u8{ 0, 0, 0, 0x0, 0x1, @truncate(sid >> 24), @truncate(sid >> 16), @truncate(sid >> 8), @truncate(sid) };
+    try client.w.writeAll(body[10..]);
+    try client.w.writeAll(&end_head);
+    try client.w.flush();
+    try client.runUntilAnswered(id);
+    var expect: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, &body) }), resp.body.items);
 }
 
 test "HTTP/2: a connection counts once in the server's in-flight requests, however many streams it has open" {

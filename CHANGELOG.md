@@ -42,7 +42,8 @@ breaking changes are listed anyway.
   signal, and only the writer waits on the connection's: a DATA frame or
   the body's end wakes only its stream's handler, and the writer is kicked
   once per read instead of once per frame, with no futex call when nobody
-  sleeps. `bridge.Signal` moved to the core (`dusty.Signal`), shared with
+  sleeps. A handler asleep on its body is still woken by each chunk of a
+  DATA frame as it is read, not only at the frame's end. `bridge.Signal` moved to the core (`dusty.Signal`), shared with
   HTTP/3 (#99).
 - HTTP/2: after running a read's `no_wait` requests on the connection's
   reader, the reader writes their responses itself, in one write, instead

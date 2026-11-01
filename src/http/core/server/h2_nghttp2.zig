@@ -3181,6 +3181,11 @@ pub fn Engine(comptime Ctx: type) type {
                 resetBody(conn, stream, len - put);
                 return 0;
             }
+            // A handler asleep on its body gets these bytes now, not when
+            // the frame's last byte comes (`onFrameRecv` notifies then
+            // anyway, so a sleeper this misses is woken there). Nobody
+            // asleep: one load.
+            if (stream.wake.sleepers.load(.monotonic) > 0) stream.wake.notify(conn.io);
             // The peer sent a whole window since the last raise: the
             // handler's next read raises it, if it may grow
             // (`Stream.raiseWindow`). Only counted for a body that may need
