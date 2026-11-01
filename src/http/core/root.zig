@@ -49,6 +49,9 @@ pub const writeEvent = @import("response.zig").writeEvent;
 /// Task placement on zio's executors, for protocol engines outside the
 /// core (HTTP/3) that keep a connection's tasks on one executor.
 pub const placement = @import("placement.zig");
+/// A wait point with a sleeper count, for one task's waits that others
+/// notify (HTTP/2 and HTTP/3 streams, their writers).
+pub const Signal = @import("signal.zig").Signal;
 /// Live connection and stream counts per executor.
 pub const gauges = @import("gauges.zig");
 /// Read-mostly data behind an atomic pointer with quiescent-state
@@ -212,6 +215,7 @@ comptime {
     if (@import("build_options").use_http2) _ = @import("server/h2_test.zig");
     if (@import("build_options").use_brotli) _ = @import("brotli_io.zig");
     _ = @import("block_cache.zig");
+    _ = @import("signal.zig");
     _ = @import("bind.zig");
     _ = @import("bind_strings.zig");
     _ = @import("bind_violations.zig");

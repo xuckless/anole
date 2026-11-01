@@ -38,6 +38,12 @@ breaking changes are listed anyway.
   keeps up to 8 MiB (was 4 MiB), of which the 64 KiB class may hold 128
   blocks (one HTTP/2 burst of bodies of unknown length) and the others 2
   MiB each (#99).
+- HTTP/2: a handler waiting for its request body waits on its stream's own
+  signal, and only the writer waits on the connection's: a DATA frame or
+  the body's end wakes only its stream's handler, and the writer is kicked
+  once per read instead of once per frame, with no futex call when nobody
+  sleeps. `bridge.Signal` moved to the core (`dusty.Signal`), shared with
+  HTTP/3 (#99).
 
 ## 0.4.2 (2026-10-31)
 

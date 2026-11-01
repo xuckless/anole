@@ -55,6 +55,7 @@ const Timer = @import("../deadline.zig").Timer;
 const placement = @import("../placement.zig");
 const gauges = @import("../gauges.zig");
 const block_cache = @import("../block_cache.zig");
+const Signal = @import("../signal.zig").Signal;
 
 const log = std.log.scoped(.anole_h2);
 
@@ -369,9 +370,9 @@ pub fn Engine(comptime Ctx: type) type {
             refused_tokens: u64 = 0,
             refused_at: i64 = 0,
 
-            /// Bumped (under the mutex) whenever the session may have output.
-            /// The writer waits on it.
-            write_gen: std.atomic.Value(u32) = .init(0),
+            /// Notified whenever the session may have output. Only the
+            /// writer waits on it; a handler waits on its stream's `wake`.
+            writer: Signal = .{},
 
             /// Parked streams (`H2Parked`) whose owner has not called
             /// `release`, and the bursts running on them. The connection's
@@ -457,14 +458,11 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.unflushed_finishes = 0;
             }
 
-            /// Wakes every waiter on `write_gen`: the writer, and any
-            /// handler waiting for its stream's first DATA frame or end
-            /// (`BodyReader.streamFn`). Waking one could hand the kick to
-            /// such a reader, which finds nothing and waits again, while
-            /// the writer sleeps on with a frame another task queued.
+            /// Wakes the writer. Nothing else waits on its signal: a
+            /// handler waiting for its body waits on its stream's `wake`,
+            /// so it can never take a wake meant for the writer (57fdfa9).
             fn kickWriter(conn: *Conn) void {
-                _ = conn.write_gen.fetchAdd(1, .release);
-                conn.io.futexWake(u32, &conn.write_gen.raw, std.math.maxInt(u32));
+                conn.writer.notify(conn.io);
             }
 
             fn trimEpoch(conn: *Conn) u32 {
@@ -655,6 +653,10 @@ pub fn Engine(comptime Ctx: type) type {
             body_done: bool = false,
             /// The peer reset the stream, or the connection went away.
             reset: bool = false,
+            /// The handler waits on it for body bytes or the body's end
+            /// (`BodyReader.streamFn`): notified for each DATA frame, the
+            /// end, and a reset. Nothing else waits on it.
+            wake: Signal = .{},
             /// The handler's task while it runs, to cancel it when `reset`
             /// comes before the response is complete. Set and cleared by
             /// the task itself, under the mutex; null off zio.
@@ -973,6 +975,7 @@ pub fn Engine(comptime Ctx: type) type {
             fn closeBody(stream: *Stream) void {
                 stream.body_done = true;
                 if (stream.body) |*q| q.close(stream.conn.io);
+                stream.wake.notify(stream.conn.io);
             }
 
             /// The stream is reset or the connection gone before the
@@ -1314,6 +1317,7 @@ pub fn Engine(comptime Ctx: type) type {
                 while (it.next()) |stream| {
                     stream.*.reset = true;
                     if (stream.*.out) |*q| q.close(conn.io);
+                    stream.*.wake.notify(conn.io);
                     stream.*.cancelHandler();
                 }
             }
@@ -1342,7 +1346,7 @@ pub fn Engine(comptime Ctx: type) type {
             const writer = conn.connection.writer;
             var probed = false;
             while (true) {
-                const gen = conn.write_gen.load(.acquire);
+                const gen = conn.writer.epoch();
                 var closing = false;
                 // Streams finished by the time this round's frames were
                 // taken: their counts go back once those frames are flushed.
@@ -1419,8 +1423,8 @@ pub fn Engine(comptime Ctx: type) type {
                     // probe with a TCP reset, so the next write fails;
                     // one that half-closed reads it and stays served.
                     if (probed) {
-                        try conn.io.futexWaitTimeout(u32, &conn.write_gen.raw, gen, .{ .duration = .{ .raw = half_close_probe_interval, .clock = .awake } });
-                        if (conn.write_gen.load(.acquire) != gen) continue;
+                        try conn.writer.waitTimeout(conn.io, gen, .{ .duration = .{ .raw = half_close_probe_interval, .clock = .awake } });
+                        if (conn.writer.epoch() != gen) continue;
                     }
                     probed = true;
                     conn.lock();
@@ -1435,8 +1439,8 @@ pub fn Engine(comptime Ctx: type) type {
                 if (comptime @import("builtin").is_test) if (sweep != .reset) if (test_before_writer_wait) |hook| hook(conn.io);
                 switch (sweep) {
                     .reset => continue,
-                    .none => try conn.io.futexWait(u32, &conn.write_gen.raw, gen),
-                    .until => |deadline| try conn.io.futexWaitTimeout(u32, &conn.write_gen.raw, gen, .{ .deadline = deadline }),
+                    .none => try conn.writer.wait(conn.io, gen),
+                    .until => |deadline| try conn.writer.waitTimeout(conn.io, gen, .{ .deadline = deadline }),
                 }
             }
         }
@@ -1498,7 +1502,7 @@ pub fn Engine(comptime Ctx: type) type {
             const deadline = (std.Io.Timeout{ .duration = .{ .raw = linger_timeout, .clock = .awake } }).toDeadline(conn.io);
             const at = deadline.toTimestamp(conn.io).?;
             while (true) {
-                const gen = conn.write_gen.load(.acquire);
+                const gen = conn.writer.epoch();
                 conn.lock();
                 const closing = conn.closing;
                 conn.unlock();
@@ -1507,7 +1511,7 @@ pub fn Engine(comptime Ctx: type) type {
                     conn.connection.stream.shutdown(conn.io, .both) catch {};
                     return;
                 }
-                try conn.io.futexWaitTimeout(u32, &conn.write_gen.raw, gen, deadline);
+                try conn.writer.waitTimeout(conn.io, gen, deadline);
             }
         }
 
@@ -2118,50 +2122,46 @@ pub fn Engine(comptime Ctx: type) type {
                 const self: *BodyReader = @alignCast(@fieldParentPtr("interface", r));
                 const stream = self.stream;
                 const conn = stream.conn;
-                // The body queue appears with the first DATA frame; until
-                // then, or for a request with no body, wait for one or the end.
-                const queue = blk: {
-                    while (true) {
-                        conn.lock();
-                        if (stream.raise_due) stream.raiseWindow();
-                        const q = if (stream.body) |*q| q else null;
-                        const done = stream.body_done;
-                        const reset = stream.reset;
-                        conn.unlock();
-                        if (reset) return self.fail(error.ConnectionResetByPeer);
-                        if (q) |queue| break :blk queue;
-                        if (done) return error.EndOfStream;
-                        // A DATA frame or the end wakes the writer generation
-                        // (`kickWriter` wakes every waiter, the writer too).
-                        const gen = conn.write_gen.load(.acquire);
-                        conn.lock();
-                        const ready = stream.body != null or stream.body_done or stream.reset;
-                        conn.unlock();
-                        if (ready) continue;
-                        conn.io.futexWait(u32, &conn.write_gen.raw, gen) catch return self.fail(error.Canceled);
-                    }
-                };
                 const dest = limit.slice(try w.writableSliceGreedy(1));
                 if (dest.len == 0) return 0;
-                const n = queue.get(conn.io, dest, 1) catch |err| switch (err) {
-                    error.Closed => {
-                        conn.lock();
-                        const reset = stream.reset;
+                // Takes what is queued without waiting, under the mutex (the
+                // session puts only under it); with nothing there and the
+                // body not over, waits on the stream's own signal, whose
+                // epoch is read before the look. The body queue appears with
+                // the first DATA frame; a request with no body never has one.
+                while (true) {
+                    const seen = stream.wake.epoch();
+                    conn.lock();
+                    if (stream.raise_due) stream.raiseWindow();
+                    if (stream.reset) {
                         conn.unlock();
-                        if (reset) return self.fail(error.ConnectionResetByPeer);
+                        return self.fail(error.ConnectionResetByPeer);
+                    }
+                    if (stream.body) |*q| {
+                        const n = q.getUncancelable(conn.io, dest, 0) catch |err| switch (err) {
+                            error.Closed => {
+                                conn.unlock();
+                                return error.EndOfStream;
+                            },
+                        };
+                        if (n > 0) {
+                            _ = c.nghttp2_session_consume(conn.session, stream.id, n);
+                            // The writer has work only if the credit queued
+                            // a WINDOW_UPDATE (about once per half window),
+                            // not per read.
+                            const wants_write = c.nghttp2_session_want_write(conn.session) != 0;
+                            conn.unlock();
+                            if (wants_write) conn.kickWriter();
+                            w.advance(n);
+                            return n;
+                        }
+                    } else if (stream.body_done) {
+                        conn.unlock();
                         return error.EndOfStream;
-                    },
-                    error.Canceled => return self.fail(error.Canceled),
-                };
-                w.advance(n);
-                conn.lock();
-                _ = c.nghttp2_session_consume(conn.session, stream.id, n);
-                // The writer has work only if the credit queued a
-                // WINDOW_UPDATE (about once per half window), not per read.
-                const wants_write = c.nghttp2_session_want_write(conn.session) != 0;
-                conn.unlock();
-                if (wants_write) conn.kickWriter();
-                return n;
+                    }
+                    conn.unlock();
+                    stream.wake.wait(conn.io, seen) catch return self.fail(error.Canceled);
+                }
             }
 
             fn fail(self: *BodyReader, err: Transport.ReadError) std.Io.Reader.StreamError {
@@ -2756,10 +2756,11 @@ pub fn Engine(comptime Ctx: type) type {
                 c.NGHTTP2_DATA => if (end_stream) {
                     stream.closeBody();
                     bodyEnded(conn, stream);
-                },
+                } else stream.wake.notify(conn.io),
                 else => {},
             }
-            conn.kickWriter(); // also wakes a body reader waiting for its queue
+            // No writer kick per frame: the reader kicks it once after the
+            // read (`readerLoop`).
             return 0;
         }
 
