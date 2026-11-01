@@ -339,11 +339,15 @@ pub const ServerConfig = struct {
         /// send on a stream before the handler reads them, which is also
         /// the stream's body buffer.
         stream_window: u31 = 64 * 1024,
-        /// The stream's window (and body buffer) from the handler's first
-        /// read of the body: a handler that takes the body gets it at a
+        /// The most a stream's window (and body buffer) grows to while the
+        /// handler reads the body: each time the client uses up the window
+        /// of a body longer than it (or of unknown length), the handler's
+        /// next read raises it four times, 64 KiB, 256 KiB, 1 MiB at the
+        /// defaults, so a handler that takes a large body gets it at a
         /// pace the round trip does not throttle (64 KiB a round trip is
-        /// 6.5 MB/s at 10 ms), while one that never reads holds only
-        /// `stream_window`. No larger than `stream_window`: stays as is.
+        /// 6.5 MB/s at 10 ms), while a small body or one that never reads
+        /// holds no more than the body or `stream_window`. No larger than
+        /// `stream_window`: stays as is.
         stream_window_reading: u31 = 1024 * 1024,
         /// The window (and body buffer) of a tunnel stream, an RFC 8441
         /// extended CONNECT such as a WebSocket, from its first DATA: one
@@ -548,11 +552,11 @@ pub const ServerConfig = struct {
         /// `Response.header` fails with `error.TooManyHeaders`.
         max_header_count: usize = 64,
         /// Brotli's quality (0 to 11) for responses compressed as `br`
-        /// (`res.compress` with `-Dbrotli`). 5, the usual on-the-fly
-        /// choice: on JSON of 1.5 to 12 KB it is 8-13% smaller than 4 and
-        /// 10-15% smaller than gzip, at about 1.3x the time of 4; 6 adds
-        /// under 1%. 11 is for precompressed files, not responses.
-        brotli_quality: u4 = 5,
+        /// (`res.compress` with `-Dbrotli`). 4: on JSON of 4 to 8 KB it is
+        /// about as small as gzip at level 6, where 5 is 8% smaller still
+        /// at about 1.3x the time, and 1 is larger than gzip at any level.
+        /// 11 is for precompressed files, not responses.
+        brotli_quality: u4 = 4,
     };
 };
 

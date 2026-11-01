@@ -18,9 +18,9 @@ const block_cache = @import("block_cache.zig");
 const Writer = std.Io.Writer;
 
 pub const Options = struct {
-    /// 0 (fastest) to 11 (smallest). 5 is where Brotli starts beating gzip
-    /// by a margin on small JSON and HTML; see `ServerConfig.Response`.
-    quality: u4 = 5,
+    /// 0 (fastest) to 11 (smallest). 4, the responses' default; see
+    /// `ServerConfig.Response.brotli_quality`.
+    quality: u4 = 4,
     /// log2 of the window, 10 to 24. Past 16 the encoder takes a hash table
     /// of 1.3 MiB instead of 512 KiB and, on JSON, compresses no better.
     lgwin: u5 = max_lgwin,
@@ -96,7 +96,14 @@ pub const Compress = struct {
         // What goes through here is text: the compressible types are.
         if (c.BrotliEncoderSetParameter(state, c.BROTLI_PARAM_MODE, c.BROTLI_MODE_TEXT) == c.BROTLI_FALSE) return error.CompressFailed;
         if (options.size_hint) |size| {
-            const hint: u32 = @intCast(@min(size, 1 << 30));
+            // At quality 4 a hint of 1 MiB or more picks hasher H54 (a 4 MiB
+            // table, past `block_cache`'s classes: mapped, cleared and
+            // unmapped per body) over H4 (512 KiB, a kept class). Within a
+            // 64 KiB window the larger table finds nothing more; past 1 MiB
+            // the hint only steers that choice at quality 4 (enc/quality.h
+            // ChooseHasher; the context modeling it also steers starts at 5).
+            const max_hint: usize = if (quality == 4 and lgwin <= max_lgwin) (1 << 20) - 1 else 1 << 30;
+            const hint: u32 = @intCast(@min(size, max_hint));
             if (c.BrotliEncoderSetParameter(state, c.BROTLI_PARAM_SIZE_HINT, hint) == c.BROTLI_FALSE) return error.CompressFailed;
         }
         self.state = state;
@@ -260,24 +267,59 @@ test "brotli_io: an encoder's large blocks are reused by the next, and trimmed w
         // and give them back, so the cache stops growing.
         if (round == 0) after_first = block_cache.cached().count else try std.testing.expectEqual(after_first, block_cache.cached().count);
     }
-    // At least its two hash tables.
-    try std.testing.expect(after_first >= 2);
+    // At least its hash table, 512 KiB at the default quality 4 (H4): the
+    // 512 KiB class.
+    try std.testing.expect(after_first >= 1);
+    const half = block_cache.classIndex(512 * 1024).?;
+    try std.testing.expect(block_cache.cachedIn(half) >= 1);
 
-    // Two encoders at once (two streams) need twice the blocks; once idle
-    // for a whole trim interval, the cache goes back to `trim_keep`.
-    var outs: [2]std.Io.Writer.Allocating = .{ try .initCapacity(gpa, 256), try .initCapacity(gpa, 256) };
+    // Three encoders at once (three streams) need three times the blocks;
+    // once idle for a whole trim interval, each class goes back to
+    // `trim_keep` at most.
+    var outs: [3]std.Io.Writer.Allocating = undefined;
+    for (&outs) |*o| o.* = try .initCapacity(gpa, 256);
     defer for (&outs) |*o| o.deinit();
-    var zs: [2]Compress = undefined;
+    var zs: [3]Compress = undefined;
     for (&zs, &outs) |*z, *o| try z.init(&o.writer, &.{}, .{});
     for (&zs) |*z| try z.writer.writeAll(input);
-    // Both finish (and hold their blocks) before either gives them back.
+    // All finish (and hold their blocks) before any gives them back.
     for (&zs) |*z| try z.finish();
     for (&zs) |*z| z.deinit();
-    try std.testing.expect(block_cache.cached().count > block_cache.trim_keep);
+    const held = block_cache.cached().count;
+    try std.testing.expect(held > after_first);
+    try std.testing.expectEqual(@as(usize, 3), block_cache.cachedIn(half));
     block_cache.trimLocal(); // the low mark of the interval that just ended
-    block_cache.trimLocal(); // nothing taken since: down to trim_keep
-    try std.testing.expectEqual(@as(usize, block_cache.trim_keep), block_cache.cached().count);
+    block_cache.trimLocal(); // nothing taken since: down to trim_keep a class
+    for (block_cache.classes, 0..) |_, i| try std.testing.expect(block_cache.cachedIn(i) <= block_cache.trim_keep);
+    // Two encoders' hash tables stay however long they sat idle.
+    try std.testing.expectEqual(@as(usize, block_cache.trim_keep), block_cache.cachedIn(half));
+    try std.testing.expect(block_cache.cached().count < held);
     try std.testing.expect(block_cache.cached().bytes <= block_cache.max_cached);
+}
+
+test "brotli_io: a buffered body of 1 MiB or more at quality 4 maps nothing past block_cache's classes" {
+    const gpa = std.testing.allocator;
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    defer text.deinit();
+    var i: usize = 0;
+    while (text.written().len < 1536 * 1024) : (i += 1) try text.writer.print("{{\"id\":{d},\"name\":\"item {d}\"}},", .{ i, i % 977 });
+    const input = text.written();
+    block_cache.drainLocalForTest();
+    defer block_cache.drainLocalForTest();
+    const unclassed = block_cache.unclassed_for_test;
+    var encoded: std.Io.Writer.Allocating = try .initCapacity(gpa, 64 * 1024);
+    defer encoded.deinit();
+    var z: Compress = undefined;
+    // As `Response.brotliBody` does: the window fitted, the size hinted.
+    try z.init(&encoded.writer, &.{}, .{ .lgwin = windowFor(input.len), .size_hint = input.len });
+    defer z.deinit();
+    try z.writer.writeAll(input);
+    try z.finish();
+    // H4's 512 KiB table, from its class; never H54's 4 MiB one.
+    try std.testing.expectEqual(unclassed, block_cache.unclassed_for_test);
+    const decoded = try testDecode(gpa, encoded.written(), input.len);
+    defer gpa.free(decoded);
+    try std.testing.expectEqualStrings(input, decoded);
 }
 
 test "brotli_io: the window fits the body, up to 64 KiB" {

@@ -477,8 +477,8 @@ pub const UdpSocket = struct {
 
     fn replyTo(s: *UdpSocket, to: std.Io.net.IpAddress, from: ?std.Io.net.IpAddress, bytes: []const u8) Datagram.SendError!void {
         if (!s.replying) return s.send(to, from, bytes);
-        if (bytes.len > 65507 or bytes.len > low.Udp.Outbox.buf_len) return error.TooLarge;
-        if (s.outbox == null) s.outbox = low.Udp.Outbox.init(s.group.gpa) catch return error.OutOfMemory;
+        if (bytes.len > 65507 or bytes.len > low.Udp.Outbox.Size.default.buf_len) return error.TooLarge;
+        if (s.outbox == null) s.outbox = low.Udp.Outbox.init(s.group.gpa, .default) catch return error.OutOfMemory;
         var box = &s.outbox.?;
         if (!box.fits(bytes.len, 1)) {
             s.flushOutbox();
@@ -707,7 +707,7 @@ pub const UdpSocket = struct {
         const gpa = s.group.gpa;
         var bytes: u64 = 0;
         var it = first;
-        if (s.send_box == null) s.send_box = low.Udp.Outbox.init(gpa) catch null;
+        if (s.send_box == null) s.send_box = low.Udp.Outbox.init(gpa, .default) catch null;
         while (it) |node| {
             it = node.next;
             const b = Batch.of(node);

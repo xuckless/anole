@@ -174,6 +174,10 @@ const Consumer = struct {
             12 => switch (call.method_id) {
                 0 => {
                     const req = try decode(tpb.GetBookRequest, arena, str(rec, call.message));
+                    if (std.mem.eql(u8, req.name, "hold")) {
+                        self.held.store(h, .release);
+                        return;
+                    }
                     _ = try g.send(e, h, try encode(arena, tpb.Book{ .name = req.name, .title = "T", .pages = 7 }), false, true);
                 },
                 1 => {
@@ -690,6 +694,65 @@ fn checkTranscoding(x: *Ctx) anyerror!void {
     try std.testing.expectEqual(@as(u16, 501), up.status);
 }
 
+/// Two calls pipelined over HTTP/1.1 in one write, the second one held by
+/// the consumer. HTTP/1.1 calls cannot detach, so the second waits for the
+/// consumer on the connection's task, with the first one's answer corked
+/// behind it unless it goes out first (`Response.flushOwed` at the C ABI's
+/// gRPC entry points). The first answer must arrive while the second is
+/// held; then the consumer answers the second with `late`.
+fn pipelinedBeforeHeld(x: *Ctx, requests: []const u8, first: []const u8, late: []const u8, late_body: []const u8) !void {
+    const stream = try (try std.Io.net.IpAddress.parse("127.0.0.1", x.port)).connect(x.io, .{ .mode = .stream });
+    defer stream.close(x.io);
+    var wbuf: [512]u8 = undefined;
+    var w = stream.writer(x.io, &wbuf);
+    try w.interface.writeAll(requests);
+    try w.interface.flush();
+    var rbuf: [2048]u8 = undefined;
+    var r = stream.reader(x.io, &rbuf);
+    try std.testing.expectEqualStrings(first, try readHttp1Body(&r.interface));
+    // Only now does the consumer answer the held call.
+    const held = try waitUntil(x.io, &x.a.held, null);
+    _ = try grpc_capi.send(x.a.e, held, late, false, true);
+    try std.testing.expectEqualStrings(late_body, try readHttp1Body(&r.interface));
+}
+
+/// One HTTP/1.1 response with a Content-Length off `r`: a 200, and its
+/// body (valid until the next read).
+fn readHttp1Body(r: *std.Io.Reader) ![]const u8 {
+    const status = try r.takeDelimiterInclusive('\n');
+    try std.testing.expect(std.mem.startsWith(u8, status, "HTTP/1.1 200"));
+    var content_length: ?usize = null;
+    while (true) {
+        const line = try r.takeDelimiterInclusive('\n');
+        if (std.mem.eql(u8, line, "\r\n")) break;
+        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+            content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, line["content-length:".len..], " \t\r\n"), 10);
+        }
+    }
+    return r.take(content_length orelse return error.NoContentLength);
+}
+
+fn checkPipelinedConnect(x: *Ctx) anyerror!void {
+    const call = "POST /anole.test.Echo/Unary HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 18\r\n";
+    try pipelinedBeforeHeld(
+        x,
+        call ++ "\r\n{\"message\":\"json\"}" ++ call ++ "Connection: close\r\n\r\n{\"message\":\"hold\"}",
+        "{\"message\":\"json\"}",
+        try Consumer.encode(x.arena, pb.EchoResponse{ .message = "late" }),
+        "{\"message\":\"late\"}",
+    );
+}
+
+fn checkPipelinedTranscoded(x: *Ctx) anyerror!void {
+    try pipelinedBeforeHeld(
+        x,
+        "GET /v1/books/abc HTTP/1.1\r\nHost: x\r\n\r\n" ++ "GET /v1/books/hold HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "{\"name\":\"abc\",\"title\":\"T\",\"pages\":\"7\"}",
+        try Consumer.encode(x.arena, tpb.Book{ .name = "late" }),
+        "{\"name\":\"late\"}",
+    );
+}
+
 const Health = grpc.health.pb.Health(grpc.Call, anyerror);
 
 fn checkHealth(x: *Ctx) anyerror!void {
@@ -766,6 +829,16 @@ test "capi grpc: Connect GET reaches a side-effect-free method, not the others" 
 test "capi grpc: transcoding serves unary and server-streaming methods as JSON, client streams 501" {
     if (comptime !features.http2) return error.SkipZigTest;
     try withEngine(.h2c, checkTranscoding);
+}
+
+test "capi grpc over HTTP/1.1: the answer to a pipelined Connect call goes out before the next call waits for its consumer" {
+    if (comptime !features.http2) return error.SkipZigTest;
+    try withEngine(.h2c, checkPipelinedConnect);
+}
+
+test "capi grpc over HTTP/1.1: the answer to a pipelined transcoded call goes out before the next call waits for its consumer" {
+    if (comptime !features.http2) return error.SkipZigTest;
+    try withEngine(.h2c, checkPipelinedTranscoded);
 }
 
 test "capi grpc: health set before start holds after it, and healthSet turns a service NOT_SERVING" {

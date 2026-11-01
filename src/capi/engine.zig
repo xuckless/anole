@@ -1672,6 +1672,7 @@ pub const Engine = struct {
                     .precompressed = try config_mod.precompressed(a, st.precompressed),
                     .cache_control = st.cache_control,
                     .hide_dotfiles = st.hide_dotfiles,
+                    .resolve_beneath = st.resolve_beneath,
                 });
             } else if (rc.websocket) |wc| {
                 if (comptime !features.websocket) unreachable;
@@ -2437,6 +2438,10 @@ fn serve(route: *const Route, req: *http.Request, res: *http.Response, up: ?*Upg
     }
     // A handshake never detaches (an extended CONNECT never arrives whole).
     const detach = up == null and res.canDetach() and route.detachable;
+    // HTTP/1.1 cannot detach, so this request waits for the consumer on
+    // the connection's task: the answers to the requests pipelined before
+    // it go out first.
+    if (!detach) try res.flushOwed();
     const plan = try planBody(e, req, detach);
     switch (plan) {
         .refused => |status| {

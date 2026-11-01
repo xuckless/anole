@@ -343,6 +343,19 @@ pub const server_options = [_]Entry{
 };
 
 // ---------------------------------------------------------------------------
+// Static routes
+
+/// `anole.http.StaticOptions` against `routes[].static` (the keys `dir` and
+/// the route's `path` are the registration's own arguments).
+pub const static_options = [_]Entry{
+    .{ .zig = "index", .json = "routes[].static.index" },
+    .{ .zig = "precompressed", .json = "routes[].static.precompressed", .kind = .custom, .note = "names (\"br\", \"zstd\", \"gzip\"), in order of preference" },
+    .{ .zig = "hide_dotfiles", .json = "routes[].static.hide_dotfiles" },
+    .{ .zig = "resolve_beneath", .json = "routes[].static.resolve_beneath" },
+    .{ .zig = "cache_control", .json = "routes[].static.cache_control" },
+};
+
+// ---------------------------------------------------------------------------
 // WebSocket routes
 
 /// `anole.websocket.UpgradeOptions` against `routes[].websocket`.

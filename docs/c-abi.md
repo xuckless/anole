@@ -27,7 +27,7 @@ cc -O2 app.c -Izig-out/include zig-out/lib/libanole.a -lpthread -o app
 ```
 
 `libanole.a` is one object holding Anole, every C library it uses (BoringSSL,
-nghttp2, ngtcp2, nghttp3, zlib-ng, zstd, Brotli, ...) and compiler-rt; it
+nghttp2, ngtcp2, nghttp3, zlib-ng, libdeflate, zstd, Brotli, ...) and compiler-rt; it
 needs only libc (and `-lpthread` on older glibc). It is packed with Zig alone
 (no system linker, `objcopy` or `strip`), and every symbol but `anole_*` is
 hidden (ELF `STV_HIDDEN`, Mach-O private extern), so a Node addon or a Python
@@ -589,7 +589,9 @@ here and runs on Anole's threads:
 
 - A route has exactly one of `handler` (a consumer's route id), `respond` (a
   fixed answer), `static` (files under a directory) or `websocket` (with
-  `"accept": "consumer"`, also `handler`).
+  `"accept": "consumer"`, also `handler`). A `static` route's keys are
+  `dir`, `index`, `precompressed`, `cache_control`, `hide_dotfiles` and
+  `resolve_beneath` (a symlink out of `dir` is a 404; default `true`).
   A `respond` answer's `headers` may not name `Connection` or
   `Transfer-Encoding`, which the server writes itself, and must be valid
   field names and values; the configuration is refused otherwise.
@@ -736,9 +738,9 @@ none.
 | `listeners[].address`, `port`, `proxy_protocol` | null, null, null | `Listener.*` (null: the deployment's default: `127.0.0.1`, 8080 or `$PORT`, off or on under `anole_lb`) |
 | `listeners[].tcp`, `listeners[].udp` | null | the raw TCP and UDP listener options (`anole.net.Tcp.Options`, `Udp.Options`, durations as `_ms`); see [Raw TCP and UDP](#raw-tcp-and-udp) |
 | `request.require_host`, `decompress`, `keep_buffers` | true, true, false | `request.*` |
-| `response.write_buffer_size`, `date`, `default_content_type`, `max_header_count`, `brotli_quality` | 16384, true, "text", 64, 5 | `response.*` (`default_content_type` by tag name; null: none) |
+| `response.write_buffer_size`, `date`, `default_content_type`, `max_header_count`, `brotli_quality` | 16384, true, "text", 64, 4 | `response.*` (`default_content_type` by tag name; null: none) |
 | `http2.*` | 250 streams, ..., `enable_connect_protocol` false | `http2.*` (`max_concurrent_streams`, `stream_window`, `stream_window_reading`, `tunnel_window`, `reading_window_budget`, `connection_window`, `max_header_list_size`, `stream_reset_burst`, `stream_reset_rate`, `max_continuations`, `refused_stream_burst`, `refused_stream_rate`, `enable_connect_protocol`, `inline_no_wait`) |
-| `http3.address`, `port`, `max_streams_bidi`, `validate_address`, `idle_timeout_ms`, `alt_svc`, `early_data`, `prefer_v2`, `sockets`, `enable_connect_protocol`, `inline_no_wait` | null, null, 100, false, 30000, true, false, true, null, true, true | `http3.*` |
+| `http3.address`, `port`, `max_streams_bidi`, `validate_address`, `idle_timeout_ms`, `alt_svc`, `early_data`, `prefer_v2`, `sockets`, `enable_connect_protocol`, `inline_no_wait` | null, null, 256, false, 30000, true, false, true, null, true, true | `http3.*` |
 | `errors` | "auto" | `errors` ("auto", "json", "text") |
 | `routes[].websocket.accept`, `subprotocols`, `compression`, `close_on_drain`, `origins` | "auto", [], true, true, [] | `websocket.UpgradeOptions` (`subprotocols`, `compression`, `close_on_drain`, `allowed_origins`); `accept` is the ABI's own: "consumer" hands each handshake to the application |
 | `executors` | 0 | `executors` (0 is `.auto`, n is `.exact(n)`) |
@@ -2006,6 +2008,21 @@ descriptors, JSON and transcoding). The C suite's WebTransport part has its
 server in C and its client in Zig (`tests/capi/wt_client.zig`, built with
 the suite and passed to it), since C has no WebTransport client. `tests/capi/bench.sh` compares consumer
 routes with native ones.
+
+## From ABI 0.10
+
+ABI 0.11 comes with Anole 0.5.0. A 0.10 binding rebuilds against the new
+`anole.h` (`ANOLE_ABI_COMPATIBLE` asks for an exact match before 1.0). What
+it notices:
+
+- `routes[].static` has a new key, `resolve_beneath` (default `true`): a
+  static route answers 404 for a path that resolves outside its `dir`
+  through a symlink, a precompressed copy or an index file included.
+  Symlinks that stay inside are served; use relative ones, since where the
+  OS confines the open (Linux 5.6+, macOS 26+) an absolute link is refused
+  even when it points inside. `false` restores the old behaviour. A binding
+  built for 0.11 that sends the key to a 0.10 library has its configuration
+  refused (unknown key), which the exact version check catches at load.
 
 ## From ABI 0.9
 

@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
 That's the whole server. To try it:
 
 1. In a project made with `zig init`, run
-   `zig fetch --save git+https://github.com/xuckless/anole#v0.4.2`
+   `zig fetch --save git+https://github.com/xuckless/anole#v0.5.0`
    (or a later tag, or a commit).
 2. Make `build.zig` one call:
    `@import("anole").addApp(b, .{ .name = "api", .root_source_file = b.path("src/main.zig") })`.
@@ -254,7 +254,7 @@ Everything below builds and passes its tests on macOS (arm64) and Linux
 - **AWS Lambda:** the same app served from the Lambda Runtime API with
   `deployment = .lambda` ([lambda](docs/lambda.md)).
 
-**Status: pre-1.0; the latest release is 0.4.2** ([CHANGELOG.md](CHANGELOG.md)).
+**Status: pre-1.0; the latest release is 0.5.0** ([CHANGELOG.md](CHANGELOG.md)).
 The API may still change before 1.0. Known issues and limitations are tracked in
 [Issues](https://github.com/xuckless/anole/issues). Next: the Node and
 Python bindings, anole-node (TypeScript) and anole-py (ASGI and WSGI), on the
@@ -313,6 +313,7 @@ memory, so `-k` it. Pass other ports with `zig build run-full -- 9000 9443`.
 | `-Dhttp3=bool` | false | false | true | ngtcp2, nghttp3, WebTransport |
 | `-Dcompression=bool` | false | true | true | zlib-ng, zstd |
 | `-Dbrotli=bool` | false | true | true | Brotli responses (google/brotli); needs `-Dcompression` |
+| `-Dlibdeflate=bool` | false | true | true | libdeflate for buffered gzip responses; needs `-Dcompression` |
 | `-Dgrpc=bool` | false | false | true | gRPC, zig-protobuf (and protoc for codegen) |
 | `-Dwebsocket=bool` | false | true | true | WebSocket |
 | `-Dauth=bool` | false | true | true | JWT, OIDC, CSRF, passwords, API keys, RBAC |
@@ -337,7 +338,7 @@ Constraints:
   `-Dhttp2=false` and `-Dgrpc=true` is an error.
 - HTTP/3 needs TLS, so `-Dtls=none` turns HTTP/3 off. Asking for both
   `-Dtls=none` and `-Dhttp3=true` is an error.
-- Brotli and Kafka need `-Dcompression`, and webhooks need `-Djobs`, in the
+- Brotli, libdeflate and Kafka need `-Dcompression`, and webhooks need `-Djobs`, in the
   same way: switching the first off switches them off, and asking for both
   is an error.
 
@@ -352,7 +353,7 @@ Hello, World is about 1.3 MB; everything on is about 6 MB.
 ## Using Anole as a dependency
 
 ```sh
-zig fetch --save git+https://github.com/xuckless/anole#v0.4.2
+zig fetch --save git+https://github.com/xuckless/anole#v0.5.0
 ```
 
 Any later tag (see the [releases](https://github.com/xuckless/anole/releases))

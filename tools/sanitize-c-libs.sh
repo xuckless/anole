@@ -7,7 +7,7 @@
 # CI, since its tests need a git submodule the tarball lacks. BoringSSL tests
 # itself under sanitizers upstream at every commit.)
 #
-#   tools/sanitize-c-libs.sh [ngtcp2 nghttp3 zlib-ng yyjson zstd brotli lz4]
+#   tools/sanitize-c-libs.sh [ngtcp2 nghttp3 zlib-ng yyjson zstd brotli lz4 libdeflate]
 #
 # Needs clang, make, cmake, curl, tar and git (ngtcp2 and nghttp3 come from
 # the xuckless forks, whose archives lack the tests' munit submodule, so
@@ -20,7 +20,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 work=${SANITIZE_WORK:-$(mktemp -d)}
 mkdir -p "$work"
 libs=("$@")
-[ ${#libs[@]} -gt 0 ] || libs=(ngtcp2 nghttp3 zlib-ng yyjson zstd brotli lz4)
+[ ${#libs[@]} -gt 0 ] || libs=(ngtcp2 nghttp3 zlib-ng yyjson zstd brotli lz4 libdeflate)
 jobs=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
 export CC=${CC:-clang}
@@ -45,6 +45,7 @@ sha256_of() {
     https://github.com/google/brotli/archive/refs/tags/v1.2.0.tar.gz) echo 816c96e8e8f193b40151dad7e8ff37b1221d019dbcb9c35cd3fadbfe6477dfec ;;
     https://github.com/google/brotli/releases/download/v1.2.0/testdata.txz) echo e8624d888f13067e7635353397cf42956bf4ca1382da67f9cec8d43e800deecb ;;
     https://github.com/lz4/lz4/archive/refs/tags/v1.10.0.tar.gz) echo 537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b ;;
+    https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.26.tar.gz) echo bba03fffc5538576213675ce6968fcff6ce2e67d82e4d5febea2d05f9f13cf85 ;;
     *) echo "" ;;
   esac
 }
@@ -153,6 +154,17 @@ for lib in "${libs[@]}"; do
       # other check stays fatal (-fno-sanitize-recover=undefined).
       UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=0 ./tests/fuzzer -T60s
       UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=0 ./tests/frametest -T60s
+      ;;
+    libdeflate)
+      fetch libdeflate "libdeflate/archive"
+      # Its CTest suite (programs/test_*.c: round trips through the
+      # compressor at every level, checksums, the decoder's invalid-stream
+      # and overread checks). Anole builds the compressor side only, but the
+      # tests decompress what they compress, so the whole library is built.
+      cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DLIBDEFLATE_BUILD_TESTS=ON -DLIBDEFLATE_BUILD_SHARED_LIB=OFF \
+        -DCMAKE_C_FLAGS="$san" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" >/dev/null
+      cmake --build build -j"$jobs" >/dev/null
+      (cd build && ctest --output-on-failure -j"$jobs" | tail -3)
       ;;
     *)
       echo "unknown library: $lib" >&2

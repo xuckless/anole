@@ -557,7 +557,8 @@ pub const Core = struct {
             }
             var vec: [4]c.ngtcp2_vec = undefined;
             for (runs[0..count], vec[0..count]) |run, *v| v.* = .{ .base = @constCast(run.ptr), .len = run.len };
-            var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE | c.NGTCP2_WRITE_STREAM_FLAG_PADDING;
+            // Unpadded, as `bridge.writePacket`.
+            var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE;
             if (fin) flags |= c.NGTCP2_WRITE_STREAM_FLAG_FIN;
             var data_len: c.ngtcp2_ssize = -1;
             const n = ngtcp2.connWritevStream(core.q, p, pi, dest, &data_len, flags, s.id, vec[0..count], ts);

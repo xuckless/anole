@@ -107,7 +107,12 @@ pub fn writePacket(side: Side, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, 
             .packet => |n| return n,
             .failed => |rv| return fail(side, rv),
         };
-        var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE | c.NGTCP2_WRITE_STREAM_FLAG_PADDING;
+        // No PADDING flag: ngtcp2 pads what RFC 9000 requires on its own
+        // (a datagram with an ack-eliciting Initial, PATH_RESPONSE, PMTUD
+        // probes), and padding every 1-RTT packet to the path MTU made a
+        // 1-byte answer a ~1,250-byte packet to seal and open. As aegon
+        // and ioxide, the ngtcp2 servers on HttpArena's board, write.
+        var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE;
         if (fin != 0) flags |= c.NGTCP2_WRITE_STREAM_FLAG_FIN;
         var data_len: c.ngtcp2_ssize = -1;
         const datav: []const c.ngtcp2_vec = @as([*]const c.ngtcp2_vec, @ptrCast(&vec))[0..@intCast(count)];
@@ -307,49 +312,8 @@ pub const BlockPool = struct {
     }
 };
 
-/// A wait point with a sleeper count, so a notify nobody waits for costs one
-/// atomic add and one load (no futex bucket lock).
-pub const Signal = struct {
-    gen: std.atomic.Value(u32) = .init(0),
-    sleepers: std.atomic.Value(u32) = .init(0),
-    /// Test builds: how many waits returned.
-    returns: std.atomic.Value(u32) = .init(0),
-    /// Test builds: futex wake calls made.
-    wakes: std.atomic.Value(u32) = .init(0),
-
-    /// Read this BEFORE checking the state it guards.
-    pub fn epoch(s: *const Signal) u32 {
-        return s.gen.load(.acquire);
-    }
-
-    /// Sleeps until `notify` after `seen`.
-    pub fn wait(s: *Signal, io: std.Io, seen: u32) std.Io.Cancelable!void {
-        _ = s.sleepers.fetchAdd(1, .seq_cst);
-        defer {
-            _ = s.sleepers.fetchSub(1, .seq_cst);
-            if (builtin.is_test) _ = s.returns.fetchAdd(1, .monotonic);
-        }
-        try io.futexWait(u32, &s.gen.raw, seen);
-    }
-
-    /// `wait`, giving up at `timeout` (returns normally then too).
-    pub fn waitTimeout(s: *Signal, io: std.Io, seen: u32, timeout: std.Io.Timeout) std.Io.Cancelable!void {
-        _ = s.sleepers.fetchAdd(1, .seq_cst);
-        defer {
-            _ = s.sleepers.fetchSub(1, .seq_cst);
-            if (builtin.is_test) _ = s.returns.fetchAdd(1, .monotonic);
-        }
-        try io.futexWaitTimeout(u32, &s.gen.raw, seen, timeout);
-    }
-
-    pub fn notify(s: *Signal, io: std.Io) void {
-        _ = s.gen.fetchAdd(1, .seq_cst);
-        if (s.sleepers.load(.seq_cst) > 0) {
-            if (builtin.is_test) _ = s.wakes.fetchAdd(1, .monotonic);
-            io.futexWake(u32, &s.gen.raw, std.math.maxInt(u32));
-        }
-    }
-};
+/// A wait point with a sleeper count (the core's, shared with HTTP/2).
+pub const Signal = @import("dusty").Signal;
 
 /// Bytes a connection holds unacknowledged across all its send queues.
 pub const Budget = struct {
@@ -606,6 +570,31 @@ pub const SendQueue = struct {
     }
 };
 
+/// The least a stream whose cap follows its path may queue ahead of the
+/// peer: the old fixed cap, so a small response, a slow path and a reader
+/// that stopped reading cost what they did.
+pub const send_floor: usize = 64 * 1024;
+
+/// The cap (`SendQueue.write`'s, on bytes written and not yet acknowledged)
+/// of a stream that follows its path: what it has in flight plus
+/// `send_floor` not yet sent, at most three quarters of the connection's
+/// budget, so the connection's other streams always have room. A fixed cap
+/// on everything unacknowledged held a download to that much per round
+/// trip (#151). Counting only the unsent part lets what is in flight
+/// follow the congestion window, which ngtcp2 already bounds, as fib (64
+/// KiB unsent), goose-http (128 KiB) and Linux's `tcp_notsent_lowat` do. A
+/// reader whose credit ran out holds what nghttp3 already took (up to one
+/// pull, about 32 KiB) plus `send_floor` (research/s2/h3-send-cap.md).
+pub fn pathCap(in_flight: u64, budget_max: usize) usize {
+    const ceiling: u64 = @max(send_floor, budget_max - budget_max / 4);
+    return @intCast(@min(in_flight + send_floor, ceiling));
+}
+
+/// `pathCap` for `queue`. With the connection's mutex held.
+pub fn pathCapOf(queue: *const SendQueue, budget_max: usize) usize {
+    return pathCap(queue.sent - queue.acked, budget_max);
+}
+
 /// Received and not yet read; in order (ngtcp2 delivers in order).
 pub const RecvQueue = struct {
     head: ?*Block = null,
@@ -740,6 +729,23 @@ test "send queue: the cap and the budget stop a write, force passes both and sti
     try std.testing.expectEqual(@as(usize, 450), budget.used);
 }
 
+test "h3 send cap: in flight plus 64 KiB unsent, at most three quarters of the budget" {
+    const KiB: usize = 1024;
+    const MiB = 1024 * KiB;
+    const budget = 4 * MiB;
+    // Nothing in flight: the floor.
+    try std.testing.expectEqual(64 * KiB, pathCap(0, budget));
+    // A reader that stopped, or a window the bytes in flight fill: what is
+    // in flight, plus the floor.
+    try std.testing.expectEqual(100 * KiB + 64 * KiB, pathCap(100 * KiB, budget));
+    try std.testing.expectEqual(2 * MiB + 64 * KiB, pathCap(2 * MiB, budget));
+    // Never past three quarters of the budget.
+    try std.testing.expectEqual(3 * MiB, pathCap(3 * MiB, budget));
+    try std.testing.expectEqual(3 * MiB, pathCap(16 * MiB, budget));
+    // A budget below the floor (tests lower it) leaves the floor.
+    try std.testing.expectEqual(64 * KiB, pathCap(0, 32 * KiB));
+}
+
 test "send queue take hands nghttp3 the same runs and marks them sent" {
     const gpa = std.testing.allocator;
     var pool = BlockPool.init(gpa, 4);
@@ -850,16 +856,4 @@ test "send queue with keep_first keeps its first block across idle spells and gi
     q.deinit(&pool, &budget);
     q.releaseFirst(&pool);
     try std.testing.expectEqual(@as(u32, 0), pool.liveCount());
-}
-
-test "signal: a notify between epoch and wait makes wait return at once; no sleepers, no futex call" {
-    var s: Signal = .{};
-    const seen = s.epoch();
-    // Nobody sleeps, so notify makes no wake call: testIo() is undefined,
-    // and a futex wake through it would crash.
-    s.notify(testIo());
-    try std.testing.expect(s.epoch() != seen);
-    // The epoch moved, so wait returns without sleeping (it would block
-    // here forever otherwise: nothing else notifies).
-    try s.wait(std.testing.io, seen);
 }

@@ -47,6 +47,18 @@ test "parity: every WebSocket UpgradeOptions leaf has a C ABI key or a reason, a
     try parity.checkSchemaAndDefaults(anole.websocket.UpgradeOptions, config.Config, &parity.websocket_options, root);
 }
 
+comptime {
+    parity.checkCoverage(anole.http.StaticOptions, &parity.static_options);
+}
+
+test "parity: every StaticOptions leaf has a C ABI key or a reason, and the defaults agree" {
+    const text = @import("anole_capi_schema").text;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{});
+    try parity.checkSchemaAndDefaults(anole.http.StaticOptions, config.Config, &parity.static_options, root);
+}
+
 test "capi config: every connector option is in the schema or listed" {
     const text = @import("anole_capi_schema").text;
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);

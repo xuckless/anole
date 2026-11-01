@@ -531,13 +531,19 @@ The path stays inside the directory you pass: an absolute path or a `..`
 segment fails with `error.BadPathName` (a 404 if the handler returns it), so
 a name taken from the request (`req.params.get("name")`, a query parameter)
 cannot reach a file elsewhere. Symlinks inside the directory are still
-followed unless `.resolve_beneath = true`. To send a file your program names
-outside the directory, open the directory it is in and pass the name
-relative to that.
+served, but one that leads outside it is `error.AccessDenied` (a 404 if the
+handler returns it): `.resolve_beneath` is on by default, and
+`.resolve_beneath = false` follows symlinks wherever they lead. Use relative
+links: where the OS confines the open itself (Linux 5.6+, macOS 26+) an
+absolute link is refused even when it points back inside the directory,
+while elsewhere (Windows, macOS 15.x, Linux without openat2) the file is
+opened and its real path compared with the directory's, which serves it. To
+send a file your program names outside the directory, open the directory it
+is in and pass the name relative to that.
 
 ```zig
 fn download(_: *anole.Request, res: *anole.Response) !void {
-    _ = res.sendFile(std.Io.Dir.cwd(), "reports/latest.pdf", .{ .resolve_beneath = true }) catch |err| switch (err) {
+    _ = res.sendFile(std.Io.Dir.cwd(), "reports/latest.pdf", .{}) catch |err| switch (err) {
         error.FileNotFound => return error.NotFound,
         else => |e| return e,
     };
@@ -576,13 +582,47 @@ Both take the same options:
   a directory URL without its trailing slash is redirected (301).
 - `..` out of the directory is a 404, and so are dotfiles such as `/.env`
   unless `.hide_dotfiles = false` (serve `/.well-known/` with its own route).
-  Symlinks are followed unless `.resolve_beneath = true`, whose strength
-  depends on the platform.
+  A symlink that leads outside the directory is a 404 too
+  (`.resolve_beneath`, on by default; `false` follows symlinks wherever
+  they lead). Symlinks that stay inside are served, but use relative ones:
+  see "Symlinks out of the directory" below.
 - `precompressed`: `style.css.br`, `.zst` or `.gz` is served for
   `style.css` to a client that accepts that coding, by its q-values and then
   your order, with `Vary: Accept-Encoding`. The plain file must exist too.
-  This is the only way to serve Brotli; there is no runtime Brotli encoder.
+  Static files are not compressed on the fly; responses are (see
+  Compression below).
 - `cache_control` goes out with 200, 206 and 304.
+
+### Symlinks out of the directory
+
+A symlink that leaves the directory is a 404, as is a precompressed copy or
+an index file that does. This changed in 0.5: a layout such as
+`public/system -> ../../shared/system` (Capistrano) or links into a store
+now answers 404. Serve the target as a static directory of its own, or set
+`.resolve_beneath = false` to follow symlinks wherever they lead (the old
+behaviour).
+
+- Links that stay inside the directory work. **Use relative links.** On
+  Linux 5.6+ and macOS 26+ the kernel refuses the open (`openat2` with
+  `RESOLVE_BENEATH`, `O_RESOLVE_BENEATH`), and it refuses an absolute link
+  even when that points back inside. On Windows, macOS 15.x and Linux
+  without `openat2` (kernels before 5.6, Docker before 20.10 under its
+  default seccomp profile) the server opens the file and compares its real
+  path with the directory's, which serves such an absolute link: a link
+  that works on one machine can be a 404 on another.
+- The check without kernel help costs a second blocking-pool hop per
+  open, on top of the open's own. The server logs which way it went at
+  startup (info on Linux, debug elsewhere); `.resolve_beneath = false`
+  restores the old speed where that matters.
+- Where the server checks real paths (Windows, macOS 15, Linux without
+  `openat2`), the real path of the directory is read when the server
+  starts, so a directory renamed or replaced while serving answers 404.
+  With kernel confinement the open directory keeps serving.
+- Linux with neither `openat2` nor `/proc` cannot do the check, and the
+  server refuses to start, with a message that names
+  `.resolve_beneath = false`.
+- Hard links and bind mounts into the directory are not symlinks and are
+  served.
 
 `embedded` serves one file compiled into the binary, with the same
 conditional and range handling and an `ETag` hashed from the content. Its
@@ -600,24 +640,37 @@ With `-Dcompression` (on in `web` and `full`), a response is compressed when
 the handler sets `res.compress = true`, or always through `Compress`.
 
 - zstd, Brotli (`br`, with `-Dbrotli`, on in `web` and `full`) or gzip
-  (zlib-ng) by the client's `Accept-Encoding` q-values; on a tie zstd, then
-  `br`, then gzip. So browsers that offer zstd get zstd, and a client that
-  offers `gzip, br` (Safari, most HTTP benchmarks) gets `br`. `identity`
+  (libdeflate for buffered bodies with `-Dlibdeflate`, on in `web` and
+  `full`; zlib-ng for streamed ones) by the client's `Accept-Encoding` q-values; on a tie zstd, then
+  gzip, then `br`. So browsers that offer zstd get zstd, and a client that
+  offers `gzip, br` (Safari, most HTTP benchmarks) gets gzip: on JSON of a
+  few KiB, Brotli small enough to matter costs about twice gzip's CPU.
+  A client that prefers `br` by q-value gets it. `identity`
   and `*` count as RFC 9110 says: `*` stands for every coding not named,
   and `br;q=0` refuses one. Streamed bodies are compressed as they are
   written, and each `flush` sends what was written so far in a form the
   client can already decode.
-- Brotli runs at quality 5 by default
-  (`.response = .{ .brotli_quality = 5 }`, 0 to 11), or per
-  response with `res.brotli_quality`. On JSON bodies of 1.5 to 12 KB,
-  quality 5 is 10-15% smaller than gzip and zstd and 8-13% smaller than
-  quality 4, at about twice gzip's CPU time; quality 6 gains under 1% more,
-  and 11 is for precompressed files (`precompressed = &.{.br}`), not for
-  responses. Its window is at most 64 KiB, so each Brotli response in
-  flight takes about 600 KiB. Its large blocks, and gzip's for a buffered
-  body, come from a cache per executor, reused from one response to the
-  next (no `mmap` or page faults per response, with glibc or musl),
-  holding at most 4 MiB and trimmed back to one encoder's worth when idle.
+- Brotli runs at quality 4 by default
+  (`.response = .{ .brotli_quality = 4 }`, 0 to 11), or per
+  response with `res.brotli_quality`. On JSON bodies of 4 to 8 KB,
+  quality 4 is about as small as gzip at level 6; quality 5 is 8% smaller
+  at about 1.3x the CPU time, quality 1 is larger than gzip, and 11 is for
+  precompressed files (`precompressed = &.{.br}`), not for responses.
+  Its window is at most 64 KiB, so each Brotli response in flight takes
+  about 600 KiB.
+- gzip runs at libdeflate's level 1 for buffered bodies up to 1 MiB
+  (zlib-ng's level 2 without `-Dlibdeflate`, for larger buffered bodies and
+  for streamed ones), zstd at level 1. On
+  JSON of a few KB that gzip is about 11% larger than at level 6 for a
+  fraction of the CPU, and zstd 1 is both smaller and faster than its
+  default 3.
+- Each executor keeps one zstd context and one gzip encoder for buffered
+  bodies, reused from one response to the next, and frees each one no
+  response took for a trim interval. Their memory, and Brotli's large
+  blocks, come from a cache per executor (no `mmap` or page faults for the
+  encoders per response, with glibc or musl), holding at most 4 MiB and
+  trimmed back to one encoder's worth when idle. The compressed body itself
+  is in the request's arena, as large as the compressed result.
 - Only compressible types: text, JSON, JavaScript, XML, SVG, `+json` and
   `+xml` types and the like. Not images, video, fonts or archives.
 - Buffered bodies under 128 bytes, or that do not shrink, go out as they are.
@@ -832,7 +885,16 @@ run right where the connection reads them, without a task, and the
 responses to one read go out in one write: about 1.7x the requests per core
 for small responses. Over HTTP/3 the same goes for a request that arrives
 whole in one packet: it runs where the endpoint reads the packet, and its
-response leaves with the rest of the batch. The promise covers every
+response leaves with the rest of the batch. Over HTTP/1.1, pipelined
+requests to `noWait` routes that arrive in one read are answered in one
+write: each response waits in the write buffer while the next request is
+already there, and they all go out before the connection could wait (for
+more input, or for a handler that is not `noWait`). A request whose body
+the handler leaves unread still flushes the batch before the body is
+thrown away. A `noWait` handler that
+waits anyway (one that falls back to waiting when `res.canDetach()` is
+false) calls `res.flushOwed()` first, so the earlier answers are not held
+behind its wait. The promise covers every
 middleware that runs for the route too, and it is checked: registering a
 `noWait` route (`anole.noWait(h)`, `RouteOptions.no_wait`, a gRPC service
 registered `no_wait`) behind middleware that does not say it never waits is
@@ -852,6 +914,7 @@ memory limiter, `auth.RequireJwt` on static keys and no hook,
 `session.Middleware` on cookies or a memory store; a Redis limiter or
 store, a JWKS keyring or a database lookup may wait and are not. A handler marked this way that
 waits anyway still works, but holds up every other request on its
-connection (on HTTP/3, every connection of its endpoint) meanwhile and gets
+connection (on HTTP/2 the other streams' output too, which waits until
+its read's handlers are done; on HTTP/3, every connection of its endpoint) meanwhile and gets
 no request timeout, so leave the mark off anything that queries a database,
 a cache or another service. On HTTP/1.1 the mark changes nothing.

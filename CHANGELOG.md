@@ -3,6 +3,206 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.5.0 (2026-11-01)
+
+### Changed
+
+- HTTP/3 lets a client open 256 requests at once per connection, up from
+  100 (`http3.max_streams_bidi`). A stream's credit comes back only once
+  the client has acknowledged its end, so at 64 requests in flight the old
+  window could stall a client for an ACK each round. Session tickets from
+  0.4.x resume without 0-RTT once, since the limit is part of their
+  context (#100).
+
+- HTTP/3 packets are no longer padded to the path MTU. A small answer went
+  out as a ~1,250-byte packet that both sides had to encrypt and decrypt;
+  ngtcp2 still pads what RFC 9000 requires (Initials, path validation,
+  MTU probes) (#100).
+
+- HTTP/3 sockets ask for 4 MiB receive and send buffers (the system caps
+  them: on Linux `net.core.rmem_max`/`wmem_max`). The server logs what it
+  got once at startup, and `/metrics` shows it as
+  `anole_h3_socket_rcvbuf_bytes`/`anole_h3_socket_sndbuf_bytes` (#100).
+
+- HTTP/3 no longer offers clients a QPACK dynamic table for their request
+  headers (capacity 0, no blocked streams): requests arrive as literals
+  and static-table references, and connections keep no decoder table.
+  Session tickets from before resume without 0-RTT once (#100).
+
+- HTTP/3 acknowledges a client's packets within 5 ms at most
+  (`max_ack_delay`), down from 25 ms, so a request whose answer waits
+  does not hold the client's stream open for a delayed ACK (#100).
+
+- HTTP/3 acknowledges every ack-eliciting packet in the next packet it
+  writes (`ack_thresh` 1, ngtcp2's default is 2), so a request's ACK
+  leaves with its answer (#100).
+
+- HTTP/3 connections write up to 48 packets (~56 KiB) per GSO send when
+  pacing allows, up from 10, and each HTTP/3 endpoint's outbox holds
+  256 KiB; raw `anole.net` UDP sockets keep their 128 KiB outboxes (#100).
+
+- Static files and `Response.sendFile` no longer follow a symlink out of
+  their directory: `StaticOptions.resolve_beneath` and
+  `SendFileOptions.resolve_beneath` are on by default, so a path that
+  resolves outside (a link, an index file or a precompressed copy that
+  points out) is a 404. Links that stay inside still work; use relative
+  ones, because where the OS confines the open (Linux 5.6+, macOS 26+) an
+  absolute link is refused even when it points inside, while on Windows,
+  macOS 15.x and Linux without `openat2` the server opens the file and
+  checks its real path, which serves such a link. Layouts such as
+  Capistrano's `public/system -> ../../shared/system` now answer 404:
+  serve the target as its own static directory, or set
+  `.resolve_beneath = false` for the old behaviour. The tier is picked once
+  at startup and logged. Linux without `openat2` (kernels before 5.6, some
+  sandboxes) uses the real-path check, which costs a second blocking-pool
+  hop per static open; `.resolve_beneath = false` restores the old speed. A
+  Linux system with neither `openat2` nor `/proc` refuses to start with a
+  message naming `.resolve_beneath = false`. The real path of each static
+  directory is read at startup where the server checks real paths (Windows,
+  macOS 15, Linux without `openat2`), so renaming a directory while serving
+  answers 404 there; with kernel confinement the open directory keeps
+  serving (#133).
+- C ABI 0.11: `routes[].static` takes `resolve_beneath` (default `true`; the
+  default changes what the bindings' static routes serve, as above). A
+  binding built for 0.11 that sends the key to a 0.10 library has its
+  configuration refused, as the exact version check says before 1.0 (#133).
+
+- Response compression is cheaper per response (#101). A client that
+  offers `gzip` and `br` at the same q-value (Safari, `gzip, br`) now gets
+  gzip instead of Brotli; zstd still wins a tie, and q-values still decide
+  first. Brotli's default quality for responses is 4 (was 5;
+  `response.brotli_quality` and `res.brotli_quality` still set it; a body
+  of 1 MiB or more keeps its 512 KiB hash table rather than a 4 MiB one,
+  which the 64 KiB window could not use), zstd runs at level 1 (was 3) and
+  zlib-ng's gzip at level 2 (was 6).
+- Buffered gzip responses go through libdeflate at level 1, a new bundled
+  dependency (MIT) behind `-Dlibdeflate`, on in the `web` and `full`
+  profiles; zlib-ng still gzips streamed bodies and bodies over 1 MiB, and
+  does all decompression (#101).
+- Each executor keeps one zstd context and one gzip encoder for buffered
+  bodies and reuses them, instead of making them for every response; they
+  are freed when idle for a trim interval (#101).
+- Allocations of 32-64 KiB for compressors come from the per-executor
+  block cache instead of malloc, which with musl mapped and unmapped each
+  one (#101).
+- `application/json` responses (`res.json`, `anole.json`, `content_type =
+  .json`, `.js.map` static files) no longer carry `; charset=UTF-8`: RFC
+  8259 defines no charset parameter for JSON (#101).
+
+- Pipelined HTTP/1.1 requests on `noWait` routes are answered in one write
+  per read: a response waits in the connection's write buffer while the
+  next request is already buffered, and the batch goes out before the
+  connection could wait (more input to read, a handler that is not
+  `noWait`, a body still to arrive) or when the 16 KiB buffer fills. A
+  pipelined batch of 16 took 16 sends; now it takes one (one TLS record
+  under TLS). Bodyless requests and requests whose handler reads its body
+  batch; a request with a body its handler leaves unread still flushes
+  before the body is thrown away. Single requests are unchanged. New
+  `Response.flushOwed()` for a `noWait` handler that may still wait on
+  HTTP/1.1; the C ABI's consumer routes and gRPC methods call it.
+
+- HTTP/2: a request body's queue is sized to the body when its length is
+  known (content-length, or the one DATA frame that carries END_STREAM,
+  which gRPC clients send without a content-length), instead of a whole
+  64 KiB window per stream: a small body comes from the stream's arena or
+  malloc's slabs, a larger one from `block_cache`. A body that overflows
+  its queue resets only its stream (RST_STREAM INTERNAL_ERROR) instead of
+  the connection (#99).
+- HTTP/2: a stream's body window is raised in steps (64 KiB, 256 KiB,
+  1 MiB at the defaults) only when the body is longer than the window or
+  of unknown length and the client has sent a whole window since the
+  last step (however fast the handler reads), instead of to
+  1 MiB on the handler's first read. A handler that reads before its DATA
+  arrives (HEADERS and DATA in separate reads, as browsers, grpc-go and
+  curl often send them) no longer takes a 1 MiB buffer for a small body
+  (#99).
+- HTTP/2: a connection keeps up to `min(max_concurrent_streams, 128)`
+  spare streams (was 16), so a client with 100 streams in flight stops
+  creating and freeing them; spares unused for a whole trim interval go,
+  down to 16 (#99).
+- HTTP/2: a reused stream's arena keeps one 8 KiB node, its header
+  included (was 128 KiB), and a new one starts with that node; the response queue (32 KiB - 64) and body writer
+  (16 KiB) come from malloc's slabs instead of the arena, so a streamed
+  response maps no memory on musl (#99).
+- `block_cache` keeps one free list per size class (64, 128, 256 and 512
+  KiB, 1 and 2 MiB) with an O(1) take and give, serves everything past
+  malloc's slabs (32 KiB), and is trimmed per class, keeping two blocks of
+  each class up to 512 KiB. A block maps one page past its class, where
+  `alloc` keeps its header, so a power-of-two allocation (Brotli's 512 KiB
+  hash table at quality 4) fits its own class. A thread keeps up to 12 MiB
+  (was 4 MiB), of which the 64 KiB class may hold 128 blocks (one HTTP/2
+  burst of bodies of unknown length), the others 2 MiB each, so a full
+  64 KiB class leaves 4 MiB for the compressors (#99).
+- HTTP/2: a handler waiting for its request body waits on its stream's own
+  signal, and only the writer waits on the connection's: a DATA frame or
+  the body's end wakes only its stream's handler, and the writer is kicked
+  once per read instead of once per frame, with no futex call when nobody
+  sleeps. A handler asleep on its body is still woken by each chunk of a
+  DATA frame as it is read, not only at the frame's end. `bridge.Signal` moved to the core (`dusty.Signal`), shared with
+  HTTP/3 (#99).
+- HTTP/2: after running a read's `no_wait` requests on the connection's
+  reader, the reader writes their responses itself, in one write, instead
+  of waking the writer task for them (the writer still takes output when it
+  is writing, or when something is left over); kicks during that round no
+  longer wake the writer, nor does a stream closing while output is taken.
+  A failed inline write ends the connection as a failed write of the writer
+  does: both directions shut, and the round is never written a second time
+  (#99).
+- HTTP/2: a connection's streams are kept in std's array hash map (a
+  dense array, backward-shift deletion, no tombstones) with room for 16
+  streams made when the connection starts (a linear scan, no hash index,
+  until a connection runs more at once), instead of a hash map whose
+  removals left tombstones to walk past (#99).
+- gRPC: a unary call's response is collected in the call's arena and sent
+  whole (HTTP/2 and HTTP/3: HEADERS, DATA and trailers in one round),
+  instead of through a streaming body queue; a binary gRPC message is
+  encoded behind room kept for its 5-byte frame prefix, so the body is
+  never copied. `Call.addHeader` in a unary call now works until the call
+  ends (#99).
+- The per-executor connection and stream gauges (HTTP/1.x, HTTP/2,
+  HTTP/3, WebSocket, WebTransport) keep each executor's counts on a cache
+  line of their own, so executors opening and closing streams at once no
+  longer write the same lines (#51, #99).
+- HTTP/2: a connection counts once in the server's in-flight requests
+  while any of its streams is open or a finished one's last frames are not
+  flushed yet, instead of once per stream: two writes to that shared
+  counter per burst of streams rather than two per stream. The drain still
+  waits for every stream (#99).
+
+### Added
+
+- `/metrics` has HTTP/3 series per endpoint: packets, packets passed on
+  between endpoints and dropped, datagrams and outbox sends, requests,
+  requests served inline and open connections, plus `anole_h3_steering`
+  (whether the kernel steers datagrams by connection ID). The server logs
+  an info line when steering is attached (#100).
+
+### Fixed
+
+- HTTP/3: a response could hold at most 64 KiB unacknowledged, so a
+  download moved 64 KiB per round trip whatever the path allowed (1.2 MB/s
+  at 50 ms RTT, against 14-38 MB/s over HTTP/1.1). A response's buffer now
+  counts only what is not yet sent: what is in flight (which the congestion
+  window bounds) plus 64 KiB unsent, at most 3 MiB, within the connection's
+  unchanged 4 MiB. A client that stops reading still leaves up to about
+  100 KiB queued (what the stack already took, plus 64 KiB). Inline
+  `no_wait` answers, whose writes pass the budget, go to tasks once it is
+  full, so it holds but for one inline body.
+  The HTTP/3 client's request bodies had the same 64 KiB ceiling and now
+  follow the path the same way when `RequestOptions.send_buffer` is null.
+  Message streams (extended CONNECT, and every gRPC, gRPC-Web and Connect
+  streaming request, unary gRPC included) keep their fixed 1 MiB
+  unacknowledged, so a large response there still moves at most 1 MiB per
+  round trip (#151).
+
+- The docs said Anole has no runtime Brotli encoder; it has one (`-Dbrotli`).
+
+- An HTTP/3 connection's flush, which waits up to 1 ms for the requests a
+  batch of packets started, no longer starts that wait over with every
+  new batch: a client sending requests faster than they answered could
+  keep its answers and ACKs back well past `max_ack_delay`. The wait now
+  ends 1 ms after the first batch since the last flush (#100).
+
 ## 0.4.2 (2026-10-31)
 
 ### Changed

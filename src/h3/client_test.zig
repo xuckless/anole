@@ -86,6 +86,28 @@ fn download(req: *dusty.Request, res: *dusty.Response) !void {
     try w.end();
 }
 
+/// GET /ahead: says it started, waits for `ahead_gate`, then streams
+/// `ahead_len` bytes in 4 KiB pieces, each flushed, counting what its
+/// flushes returned: the count is what the stream has queued.
+const ahead_len = 1 << 20;
+var ahead_started: std.atomic.Value(bool) = .init(false);
+var ahead_written: std.atomic.Value(usize) = .init(0);
+var ahead_gate: std.Io.Event = .unset;
+fn ahead(req: *dusty.Request, res: *dusty.Response) !void {
+    ahead_started.store(true, .release);
+    try ahead_gate.wait(req.io);
+    var out_buf: [4096]u8 = undefined;
+    var out = try res.stream(&out_buf);
+    var chunk: [4096]u8 = undefined;
+    for (&chunk, 0..) |*b, i| b.* = @truncate(i);
+    for (0..ahead_len / chunk.len) |_| {
+        try out.interface.writeAll(&chunk);
+        try out.interface.flush();
+        _ = ahead_written.fetchAdd(chunk.len, .release);
+    }
+    try out.end();
+}
+
 fn slow(req: *dusty.Request, res: *dusty.Response) !void {
     try req.io.sleep(.fromSeconds(5), .awake);
     res.body = "too late";
@@ -142,6 +164,13 @@ fn sum(req: *dusty.Request, res: *dusty.Response) !void {
 
 /// Far more than a response ring holds, written at once.
 const big_body_len = 300 * 1024 + 7;
+
+/// GET /file: `file_name` in `file_dir`, which a test sets first.
+var file_dir: std.Io.Dir = undefined;
+const file_name = "body.bin";
+fn fileHandler(_: *dusty.Request, res: *dusty.Response) !void {
+    _ = try res.sendFile(file_dir, file_name, .{});
+}
 
 fn bigBody(_: *dusty.Request, res: *dusty.Response) !void {
     const body = try res.arena.alloc(u8, big_body_len);
@@ -255,6 +284,8 @@ const Fixture = struct {
         successor: bool = false,
         early_data: bool = false,
         prefer_v2: bool = true,
+        /// `Options.send_budget`, when set.
+        send_budget: ?usize = null,
     };
 
     fn startWith(gpa: std.mem.Allocator, io: std.Io, config: dusty.ServerConfig, extra: Extra) !Fixture {
@@ -284,12 +315,15 @@ const Fixture = struct {
         http.router.post("/answer-first", answerFirst);
         http.router.get("/port", port);
         http.router.get("/download", download);
+        http.router.get("/ahead", ahead);
         http.router.get("/huge-head", hugeHead);
         http.router.get("/fields", fields);
         http.router.get("/hold", holdHandler);
         http.router.get("/wait", waitHandler);
         http.router.post("/gated", gated);
         http.router.get("/big-head", bigHead);
+        http.router.get("/file", fileHandler);
+        http.router.get("/file-busy", fileBusyHandler);
         http.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
         http.router.addRouteWith(.post, "/nw/sum", sum, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/big", bigBody, .{ .no_wait = true });
@@ -306,6 +340,7 @@ const Fixture = struct {
             .secret = extra.secret,
             .early_data = extra.early_data,
             .prefer_v2 = extra.prefer_v2,
+            .send_budget = extra.send_budget orelse @import("server.zig").conn_budget,
         });
         errdefer ep.deinit();
         const future = try io.concurrent(runEndpoint, .{ep});
@@ -329,6 +364,16 @@ const Fixture = struct {
         return client.ClientConnection.connect(gpa, io, .{
             .host = "localhost",
             .address = f.ep.address(),
+            .port = f.ep.address().getPort(),
+            .tls = .{ .ca = .{ .pem = f.pem.cert } },
+        });
+    }
+
+    /// Through `relay`.
+    fn connectVia(f: *Fixture, gpa: std.mem.Allocator, io: std.Io, relay: *Relay) !*client.ClientConnection {
+        return client.ClientConnection.connect(gpa, io, .{
+            .host = "localhost",
+            .address = relay.front.socket.address,
             .port = f.ep.address().getPort(),
             .tls = .{ .ca = .{ .pem = f.pem.cert } },
         });
@@ -444,6 +489,38 @@ test "h3 client: 40 requests on one connection wait for stream credit under max_
     try wait.waitAtLeast(io, "40 GETs answered", &ok, 40);
     try group.await(io);
     try std.testing.expectEqual(@as(usize, 40), ok.load(.monotonic));
+}
+
+test "h3 server: without the PADDING flag, both sides' first datagrams (their Initials) are still padded to 1200 bytes" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    const conn = try client.ClientConnection.connect(gpa, io, .{
+        .host = "localhost",
+        .address = relay.front.socket.address,
+        .port = f.ep.address().getPort(),
+        .tls = .{ .ca = .{ .pem = f.pem.cert } },
+    });
+    defer conn.close();
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
+    // RFC 9000 §14.1: a client's Initial datagram, and a server's that
+    // carries an ack-eliciting Initial, are at least 1200 bytes. ngtcp2
+    // pads them itself; the relay's sockets have GRO off, so each read is
+    // one datagram. Not every server Initial: one that only acknowledges
+    // the first half of a ClientHello split over two datagrams (a
+    // post-quantum key share) needs no padding, so the largest is checked,
+    // the one with the ServerHello.
+    relay.mutex.lockUncancelable(io);
+    defer relay.mutex.unlock(io);
+    try std.testing.expect(relay.first_up_len >= 1200);
+    try std.testing.expect(relay.max_down_initial_len >= 1200);
 }
 
 test "h3 server: the outbox sends several datagrams per flush under a bulk transfer" {
@@ -603,6 +680,59 @@ test "h3 server: a no_wait response far past the ring completes" {
     try std.testing.expect(f.ep.stats.served_inline.load(.monotonic) >= inline_before + 1);
     try std.testing.expectEqual(@as(usize, big_body_len), b.len);
     for (b, 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(i *% 13)), byte);
+}
+
+fn requestsServed(ep: *Endpoint) bool {
+    return ep.stats.requests.load(.monotonic) >= budget_gets;
+}
+const budget_gets = 8;
+const budget_test = 512 * 1024;
+
+test "h3 server: no_wait answers past the connection's budget wait on tasks, so it holds but for one inline body" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{}, .request = .{ .max_body_size = 8 << 20 } }, .{ .send_budget = budget_test });
+    defer f.stop(gpa, io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    const conn = try f.connectVia(gpa, io, relay);
+    defer conn.close();
+    // From now on the client hears nothing from the server, so it
+    // acknowledges none of the answers: what the server queued stays.
+    relay.holdDown();
+    defer relay.releaseDown();
+    var streams: [budget_gets]*client.Stream = undefined;
+    var opened: usize = 0;
+    defer for (streams[0..opened]) |st| st.release();
+    // Eight no_wait GETs of 300 KiB each: 2.4 MiB, against a 512 KiB budget.
+    for (&streams) |*st| {
+        st.* = try request(conn, "GET", "/nw/big", .{});
+        opened += 1;
+    }
+    try wait.waitUntil(io, "the server took all eight requests", f.ep, requestsServed);
+    // Every request started: the inline ones answered whole, the rest on
+    // tasks that wait for room. What the queues hold (blocks of 4 KiB)
+    // stays within the budget plus the one inline body that overshot it,
+    // and some slack for partly filled blocks.
+    f.ep.sampleStats();
+    const live: usize = @intCast(f.ep.stats.blocks_live.load(.monotonic));
+    const bound = (budget_test + big_body_len) / 4000 + 4 * budget_gets;
+    if (live > bound) {
+        std.debug.print("{d} send blocks live, more than {d}\n", .{ live, bound });
+        return error.TestUnexpectedResult;
+    }
+    // Once the client hears the server, it acknowledges, and the waiting
+    // answers go out whole.
+    relay.releaseDown();
+    for (streams) |st| {
+        try st.waitHead();
+        try std.testing.expectEqual(@as(u16, 200), st.status);
+        const b = try st.reader().allocRemaining(gpa, .unlimited);
+        defer gpa.free(b);
+        try std.testing.expectEqual(@as(usize, big_body_len), b.len);
+    }
 }
 
 test "h3 server: a no_wait handler that waits still answers" {
@@ -1213,6 +1343,11 @@ pub const Relay = struct {
     gate: std.Io.Event = .unset,
     /// The datagrams recorded before the gate opened: the first flight.
     first_flight: usize = 0,
+    /// The size of the client's first datagram (its Initial), and of the
+    /// largest server datagram that leads with an Initial packet; 0 until
+    /// seen.
+    first_up_len: usize = 0,
+    max_down_initial_len: usize = 0,
     group: std.Io.Group = .init,
 
     pub fn start(gpa: std.mem.Allocator, io: std.Io, server: std.Io.net.IpAddress) !*Relay {
@@ -1340,6 +1475,7 @@ pub const Relay = struct {
     fn forwardUp(r: *Relay, from: std.Io.net.IpAddress, d: []const u8) std.Io.Cancelable!void {
         r.mutex.lockUncancelable(r.io);
         r.client = from;
+        if (r.first_up_len == 0) r.first_up_len = d.len;
         var resent = false;
         if (tokenlessInitial(d)) {
             r.tokenless_initials += 1;
@@ -1382,6 +1518,23 @@ pub const Relay = struct {
         r.hold_up = false;
         r.mutex.unlock(r.io);
         r.up_gate.set(r.io);
+    }
+
+    /// Holds every datagram the server sends from now on (its ACKs among
+    /// them), in order, until `releaseDown`: the client hears nothing.
+    pub fn holdDown(r: *Relay) void {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        r.gate = .unset;
+        r.gate_down = true;
+    }
+
+    /// The held datagrams go on, and so does everything after them.
+    pub fn releaseDown(r: *Relay) void {
+        r.mutex.lockUncancelable(r.io);
+        r.gate_down = false;
+        r.mutex.unlock(r.io);
+        r.gate.set(r.io);
     }
 
     /// Holds the server's datagrams until the client resends its first
@@ -1433,6 +1586,9 @@ pub const Relay = struct {
             }
             r.answered = true;
             const to = r.client;
+            if (dg.data.len >= 5 and dg.data[0] & 0x80 != 0 and
+                LongPackets.kindOf(dg.data[0], std.mem.readInt(u32, dg.data[1..5], .big)) == .initial)
+                r.max_down_initial_len = @max(r.max_down_initial_len, dg.data.len);
             r.mutex.unlock(r.io);
             if (to) |a| while (dg.next()) |d| r.front.send(r.io, a, null, 0, d, d.len);
         }
@@ -2028,7 +2184,8 @@ test "h3 server: a response streamed past its send buffer completes and leaves n
     defer f.stop(gpa, io);
     const conn = try f.connect(gpa, io);
     defer conn.close();
-    // 4 MiB through a 64 KiB per-stream queue and a 4 MiB connection budget.
+    // 4 MiB through a per-stream queue that holds what is in flight plus
+    // 64 KiB (`bridge.pathCap`) and a 4 MiB connection budget.
     const body = try get(conn, "/download?n=4194304", gpa);
     defer gpa.free(body);
     try std.testing.expectEqual(@as(usize, 4 << 20), body.len);
@@ -2040,6 +2197,315 @@ test "h3 server: a response streamed past its send buffer completes and leaves n
             return ep.stats.blocks_live.load(.monotonic) <= 1;
         }
     }.cond);
+}
+
+test "h3 server: a 47 KiB file goes to its stream in 16 KiB pieces, and arrives whole" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var want: [47 * 1024]u8 = undefined;
+    for (&want, 0..) |*b, i| b.* = @truncate(i *% 7);
+    try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = &want });
+    file_dir = tmp.dir;
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const before = Endpoint.test_sink_handoffs.load(.monotonic);
+    const body = try get(conn, "/file", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualSlices(u8, &want, body);
+    // The file is read into the sink's body buffer, which is handed to the
+    // stream each time it fills, and once at the end: 16 + 16 + 15 KiB
+    // with a 16 KiB buffer (with 4 KiB it was 12).
+    try std.testing.expectEqual(@as(usize, 3), Endpoint.test_sink_handoffs.load(.monotonic) - before);
+}
+
+/// GET /file-busy: `fileHandler` after 12 KiB of other work in the
+/// request's arena, as a static handler's path and header work would be.
+fn fileBusyHandler(req: *dusty.Request, res: *dusty.Response) !void {
+    @memset(try res.arena.alloc(u8, 12 * 1024), 'w');
+    return fileHandler(req, res);
+}
+
+/// Counts what an allocator is asked for past the largest slab of Zig's
+/// SmpAllocator (32 KiB): each such block is an mmap of its own.
+const PastSlabs = struct {
+    child: std.mem.Allocator,
+    count: std.atomic.Value(usize) = .init(0),
+
+    const slab_max = 32 * 1024;
+
+    fn allocator(self: *PastSlabs) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn note(self: *PastSlabs, len: usize) void {
+        if (len > slab_max) _ = self.count.fetchAdd(1, .monotonic);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PastSlabs = @ptrCast(@alignCast(ctx));
+        self.note(len);
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *PastSlabs = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) self.note(new_len);
+        return self.child.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *PastSlabs = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) self.note(new_len);
+        return self.child.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *PastSlabs = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ra);
+    }
+};
+
+test "h3 server: files of known length on pooled streams take nothing past malloc's slabs" {
+    // The premise is Zig's malloc on Linux (musl or glibc builds), where an
+    // allocation past its 32 KiB slabs is an mmap; Windows' heap has no such
+    // edge, and its socket path takes larger buffers through the same
+    // allocator.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var want: [47 * 1024]u8 = undefined;
+    for (&want, 0..) |*b, i| b.* = @truncate(i *% 11);
+    file_dir = tmp.dir;
+    // The server's allocator only.
+    var counting: PastSlabs = .{ .child = gpa };
+    var f = try Fixture.start(counting.allocator(), io);
+    defer f.stop(counting.allocator(), io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    gpa.free(try get(conn, "/hello", gpa));
+    try wait.waitUntil(io, "the stream is back in the pool", f.ep, noServerStreams);
+
+    // An 8 KiB and a 47 KiB file, in turn, each request on the stream the
+    // last one gave back to the pool. The body buffer (just under 16 KiB for the
+    // larger) is the stream's own: in the stream's arena, after the
+    // handler's own 12 KiB, it took a node past malloc's largest slab (an
+    // mmap, and a munmap when the stream went back to the pool).
+    const before = counting.count.load(.monotonic);
+    for (0..6) |i| {
+        const len: usize = if (i % 2 == 0) 8 * 1024 else want.len;
+        try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = want[0..len] });
+        const body = try get(conn, "/file-busy", gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualSlices(u8, want[0..len], body);
+        try wait.waitUntil(io, "the stream is back in the pool", f.ep, noServerStreams);
+    }
+    try std.testing.expectEqual(@as(usize, 0), counting.count.load(.monotonic) - before);
+}
+
+test "h3 server: only a body of known length past 4 KiB takes the stream's own buffer, once per pooled stream" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var want: [8 * 1024]u8 = undefined;
+    for (&want, 0..) |*b, i| b.* = @truncate(i *% 13);
+    file_dir = tmp.dir;
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    // A stream of unknown length (an event stream's shape) and a small
+    // file keep the arena's buffer: a long-lived stream holds 4 KiB, not
+    // the stream's 16 KiB.
+    const before = Endpoint.test_sink_bufs.load(.monotonic);
+    const streamed = try get(conn, "/download?n=40000", gpa);
+    gpa.free(streamed);
+    try wait.waitUntil(io, "the stream is back in the pool", f.ep, noServerStreams);
+    try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = want[0..1000] });
+    const small = try get(conn, "/file", gpa);
+    gpa.free(small);
+    try wait.waitUntil(io, "the stream is back in the pool", f.ep, noServerStreams);
+    try std.testing.expectEqual(@as(usize, 0), Endpoint.test_sink_bufs.load(.monotonic) - before);
+
+    // An 8 KiB file takes it, and the next one, on the pooled stream the
+    // first gave back, reuses it.
+    try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = &want });
+    for (0..2) |_| {
+        const body = try get(conn, "/file", gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualSlices(u8, &want, body);
+        try wait.waitUntil(io, "the stream is back in the pool", f.ep, noServerStreams);
+    }
+    try std.testing.expectEqual(@as(usize, 1), Endpoint.test_sink_bufs.load(.monotonic) - before);
+}
+
+test "h3 client: a POST with a body takes nothing past malloc's slabs" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    // The client's allocator only.
+    var counting: PastSlabs = .{ .child = gpa };
+    const conn = try f.connect(counting.allocator(), io);
+    defer conn.close();
+    var data: [8 * 1024]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 5);
+    gpa.free(try post(conn, io, "/echo", &data, gpa));
+
+    // Each stream's two 16 KiB buffers (response body, request body) are
+    // allocations of their own: in the stream's arena they took a node
+    // past malloc's largest slab, an mmap and munmap per request.
+    const before = counting.count.load(.monotonic);
+    for (0..3) |_| {
+        const back = try post(conn, io, "/echo", &data, gpa);
+        defer gpa.free(back);
+        try std.testing.expectEqualSlices(u8, &data, back);
+    }
+    try std.testing.expectEqual(@as(usize, 0), counting.count.load(.monotonic) - before);
+}
+
+test "h3 server: a response gets more than 64 KiB ahead of the client's acknowledgements" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    ahead_started.store(false, .release);
+    ahead_written.store(0, .release);
+    ahead_gate = .unset;
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    // On every exit, before the fixture stops: the handler goes on.
+    defer ahead_gate.set(io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    // A fresh connection, so the congestion window is the initial one
+    // (about 14 KiB) and, with no ACK, stays so: what is in flight stays
+    // small, and the bound below shows the cap still holds.
+    const conn = try f.connectVia(gpa, io, relay);
+    defer conn.close();
+    const s = try request(conn, "GET", "/ahead", .{});
+    defer s.release();
+    try wait.waitFlag(io, "the /ahead handler started", &ahead_started);
+    // From now on the server hears nothing from the client, no ACK either,
+    // and only then does the handler write.
+    relay.holdUp();
+    defer relay.releaseUp();
+    ahead_gate.set(io);
+    // More than the old fixed cap, none of it acknowledged: each write is
+    // flushed, so the count is what the stream holds, and a cap of 64 KiB
+    // on what a response holds unacknowledged stops it at 65,536. The cap
+    // counts what is in flight apart, so the first bytes nghttp3 takes let
+    // the writes past it.
+    try wait.waitUntil(io, "the handler's writes got more than 64 KiB ahead of any acknowledgement", {}, struct {
+        fn cond(_: void) bool {
+            return ahead_written.load(.acquire) > 64 * 1024;
+        }
+    }.cond);
+    // But the cap still bounds the queue: what nghttp3 took (the initial
+    // window plus one pull of about 32 KiB) plus 64 KiB, far below the
+    // 1 MiB response that an uncapped stream would queue at once.
+    try wait.expectStays(io, "the handler's writes stay under 256 KiB ahead of any acknowledgement", {}, struct {
+        fn cond(_: void) bool {
+            return ahead_written.load(.acquire) < 256 * 1024;
+        }
+    }.cond, wait.short_window);
+    relay.releaseUp();
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    const body = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(body);
+    try std.testing.expectEqual(@as(usize, ahead_len), body.len);
+    for (body, 0..) |b, i| if (b != @as(u8, @truncate(i % 4096))) return error.TestUnexpectedResult;
+}
+
+test "h3 client: a request body gets more than 64 KiB ahead of the server's acknowledgements" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    const conn = try f.connectVia(gpa, io, relay);
+    defer conn.close();
+    const body = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 7);
+    // The held upload goes first on the fresh connection, so the client's
+    // congestion window is the initial one and, with no ACK, stays so:
+    // what is in flight stays small, and the bound below shows the cap
+    // still holds.
+    const s = try request(conn, "POST", "/nw/sum", .{ .body = true });
+    defer s.release();
+    // From now on the client hears nothing from the server, no ACK either.
+    relay.holdDown();
+    defer relay.releaseDown();
+    // The writes, in a task, counting what returned.
+    var progress: std.atomic.Value(usize) = .init(0);
+    var writer = try io.concurrent(struct {
+        fn write(st: *client.Stream, data: []const u8, done: *std.atomic.Value(usize)) !void {
+            var off: usize = 0;
+            while (off < data.len) {
+                const k = @min(4096, data.len - off);
+                try st.writer().writeAll(data[off..][0..k]);
+                try st.writer().flush();
+                off += k;
+                done.store(off, .release);
+            }
+            try st.writer().flush();
+        }
+    }.write, .{ s, body, &progress });
+    defer writer.cancel(io) catch {};
+    // More than the old default send buffer, none of it acknowledged: each
+    // write is flushed, so the count is what the stream holds, which a
+    // 64 KiB cap stops at 65,536.
+    try wait.waitUntil(io, "the client's writes got more than 64 KiB ahead of any acknowledgement", &progress, struct {
+        fn cond(p: *std.atomic.Value(usize)) bool {
+            return p.load(.acquire) > 64 * 1024;
+        }
+    }.cond);
+    // But the cap still bounds the queue: what nghttp3 took (the initial
+    // window plus one pull of about 32 KiB) plus 64 KiB, far below the
+    // 1 MiB body that an uncapped stream would queue at once.
+    try wait.expectStays(io, "the client's writes stay under 256 KiB ahead of any acknowledgement", &progress, struct {
+        fn cond(p: *std.atomic.Value(usize)) bool {
+            return p.load(.acquire) < 256 * 1024;
+        }
+    }.cond, wait.short_window);
+    relay.releaseDown();
+    try writer.await(io);
+    try s.closeSend();
+    try s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), s.status);
+    const got = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(got);
+    // The same body again, acknowledged as usual, for the expected sum.
+    const want = blk: {
+        const s2 = try request(conn, "POST", "/nw/sum", .{ .body = true });
+        try s2.writer().writeAll(body);
+        try s2.writer().flush();
+        try s2.closeSend();
+        break :blk try finish(s2, gpa);
+    };
+    defer gpa.free(want);
+    try std.testing.expectEqualStrings(want, got);
 }
 
 test "h3 client: unprocessed is true after H3_REQUEST_REJECTED and for a request the GOAWAY did not reach" {

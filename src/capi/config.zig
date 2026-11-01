@@ -613,7 +613,7 @@ pub const Config = struct {
         /// The UDP address and port; null: the TLS listener's.
         address: ?[]const u8 = null,
         port: ?u16 = null,
-        max_streams_bidi: u64 = 100,
+        max_streams_bidi: u64 = 256,
         /// Make every new client prove its address with a Retry first.
         validate_address: bool = false,
         idle_timeout_ms: u32 = 30_000,
@@ -767,6 +767,7 @@ pub const Config = struct {
         precompressed: []const []const u8 = &.{},
         cache_control: ?[]const u8 = null,
         hide_dotfiles: bool = true,
+        resolve_beneath: bool = true,
     };
     pub const WebSocket = struct {
         /// The consumer's route id for this endpoint's events.

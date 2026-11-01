@@ -1,6 +1,6 @@
 .{
     .name = .anole,
-    .version = "0.4.2",
+    .version = "0.5.0",
     .fingerprint = 0xe9214b117feef58, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
@@ -114,6 +114,14 @@
         .brotli = .{
             .url = "https://github.com/google/brotli/archive/refs/tags/v1.2.0.tar.gz",
             .hash = "N-V-__8AAJudKgCQCuIiH6MJjAiIJHfg_tT_Ew-0vZwVkCo_",
+            .lazy = true,
+        },
+        // -Dlibdeflate: ebiggers/libdeflate 1.26 (MIT), the compressor
+        // only, for buffered gzip responses; built by build/libdeflate.zig
+        // (source list after nilo's build.zig).
+        .libdeflate = .{
+            .url = "https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.26.tar.gz",
+            .hash = "N-V-__8AAEaRCwCsYb_rSsH72Pb6DNFQLSjdRzTFOVsJWcoB",
             .lazy = true,
         },
         .zlib_zig = .{

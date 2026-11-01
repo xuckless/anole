@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/xuckless/anole/blob/v0.4.2/include/anole.schema.json",
-  "x-anole-abi": "0.10",
+  "$id": "https://github.com/xuckless/anole/blob/v0.5.0/include/anole.schema.json",
+  "x-anole-abi": "0.11",
   "title": "Anole C ABI configuration",
   "description": "The JSON document anole_server_create takes (anole_server_options.config_json). Unknown keys are refused, with the line and column in anole_last_error (token UnknownKey).",
   "type": "object",
@@ -1603,7 +1603,7 @@
         "max_streams_bidi": {
           "type": "integer",
           "minimum": 0,
-          "default": 100,
+          "default": 256,
           "description": "Concurrent requests per connection."
         },
         "validate_address": {
@@ -1756,7 +1756,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 11,
-          "default": 5,
+          "default": 4,
           "description": "Brotli's quality, 0 to 11, for responses compressed as br."
         }
       },
@@ -2534,6 +2534,11 @@
         "hide_dotfiles": {
           "type": "boolean",
           "default": true
+        },
+        "resolve_beneath": {
+          "type": "boolean",
+          "default": true,
+          "description": "Answer a path that resolves outside dir (through a symlink) with a 404; symlinks that stay inside are served. Use relative links: where the OS confines the open (Linux 5.6+, macOS 26+) an absolute link is refused even when it points inside dir. false follows symlinks wherever they lead."
         }
       },
       "required": [

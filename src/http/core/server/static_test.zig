@@ -264,8 +264,114 @@ test "static: something other than a regular file is a 404" {
     try tmp.dir.symLink(std.testing.io, "/dev/null", "null", .{});
 
     var out: [4096]u8 = undefined;
-    const got = try exchange(tmp.dir, "/", .{}, "GET /null HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    // Without `resolve_beneath`, which would refuse the link first.
+    const got = try exchange(tmp.dir, "/", .{ .resolve_beneath = false }, "GET /null HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 404"));
+}
+
+/// `secret.txt` beside `root/`, which holds the files of `testDir` and symlinks:
+/// out through relative and absolute links, in through relative ones, and an
+/// index and a precompressed copy that point out. Returns the tmp dir; serve
+/// its `root`. A platform that cannot make symlinks skips the test.
+fn linkTree() !struct { tmp: std.testing.TmpDir, root: std.Io.Dir } {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    errdefer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "secret.txt", .data = "secret" });
+    try tmp.dir.createDir(io, "root", .default_dir);
+    var root = try tmp.dir.openDir(io, "root", .{});
+    errdefer root.close(io);
+    try root.writeFile(io, .{ .sub_path = "style.css", .data = "body { color: red }" });
+    try root.createDir(io, "docs", .default_dir);
+    try root.writeFile(io, .{ .sub_path = "docs/index.html", .data = "<h1>docs</h1>" });
+    try root.writeFile(io, .{ .sub_path = "plain.css", .data = "plain" });
+    try root.createDir(io, "leak", .default_dir);
+
+    // Windows: creating a symlink needs SeCreateSymbolicLinkPrivilege
+    // (Developer Mode); GitHub's runners have it.
+    const secret_abs = try tmp.dir.realPathFileAlloc(io, "secret.txt", std.testing.allocator);
+    defer std.testing.allocator.free(secret_abs);
+    const links = [_][2][]const u8{
+        .{ "../secret.txt", "out.txt" },
+        .{ secret_abs, "abs.txt" },
+        .{ "..", "up" },
+        .{ "style.css", "alias.css" },
+        .{ "docs", "d" },
+        .{ "../../secret.txt", "leak/index.html" },
+        .{ "../secret.txt", "plain.css.br" },
+    };
+    for (links) |l| root.symLink(io, l[0], l[1], .{ .is_directory = std.mem.eql(u8, l[1], "up") or std.mem.eql(u8, l[1], "d") }) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    return .{ .tmp = tmp, .root = root };
+}
+
+/// The three claims about escapes that hold on every tier, for `opts`.
+fn expectEscapesRefused(opts: dusty.StaticOptions) !void {
+    var fixture = try linkTree();
+    defer fixture.tmp.cleanup();
+    defer fixture.root.close(std.testing.io);
+
+    var out: [4096]u8 = undefined;
+    for ([_][]const u8{ "/out.txt", "/abs.txt", "/up/secret.txt", "/up", "/leak/" }) |path| {
+        var request_buf: [128]u8 = undefined;
+        const request = try std.fmt.bufPrint(&request_buf, "GET {s} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", .{path});
+        const got = try exchange(fixture.root, "/", opts, request, &out);
+        try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 404"));
+        try std.testing.expect(std.mem.find(u8, got, "secret") == null);
+        try std.testing.expectEqual(null, header(got, "Location"));
+    }
+
+    // The refused copy counts as missing: the plain file is served.
+    var with_br = opts;
+    with_br.precompressed = &.{.br};
+    const plain = try exchange(fixture.root, "/", with_br, "GET /plain.css HTTP/1.1\r\nHost: x\r\nAccept-Encoding: br\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, plain, "HTTP/1.1 200"));
+    try std.testing.expectEqual(null, header(plain, "Content-Encoding"));
+    try std.testing.expectEqualStrings("plain", body(plain));
+}
+
+test "static: a symlink out of the directory is a 404 by default" {
+    try expectEscapesRefused(.{});
+}
+
+test "static: the real-path check refuses a symlink out of the directory" {
+    // The verify code on every platform, where the natural tier may be the kernel's.
+    const beneath = @import("../beneath.zig");
+    beneath.test_force = .verify;
+    defer beneath.test_force = null;
+    try expectEscapesRefused(.{});
+}
+
+test "static: relative symlinks that stay inside the directory are served" {
+    const beneath = @import("../beneath.zig");
+    for ([_]?beneath.Tier{ null, .verify }) |forced| {
+        beneath.test_force = forced;
+        defer beneath.test_force = null;
+        var fixture = try linkTree();
+        defer fixture.tmp.cleanup();
+        defer fixture.root.close(std.testing.io);
+
+        var out: [4096]u8 = undefined;
+        const alias = try exchange(fixture.root, "/", .{}, "GET /alias.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+        try std.testing.expect(std.mem.startsWith(u8, alias, "HTTP/1.1 200"));
+        try std.testing.expectEqualStrings("body { color: red }", body(alias));
+        const dir = try exchange(fixture.root, "/", .{}, "GET /d/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+        try std.testing.expect(std.mem.startsWith(u8, dir, "HTTP/1.1 200"));
+        try std.testing.expectEqualStrings("<h1>docs</h1>", body(dir));
+    }
+}
+
+test "static: resolve_beneath = false follows a symlink out of the directory" {
+    var fixture = try linkTree();
+    defer fixture.tmp.cleanup();
+    defer fixture.root.close(std.testing.io);
+
+    var out: [4096]u8 = undefined;
+    const got = try exchange(fixture.root, "/", .{ .resolve_beneath = false }, "GET /out.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try std.testing.expectEqualStrings("secret", body(got));
 }
 
 test "embedded: serves the content, with a 304 for its ETag" {
@@ -357,7 +463,7 @@ test "static: newer web types have their media types" {
     const cases = [_][2][]const u8{
         .{ "a.avif", "image/avif" },
         .{ "a.webmanifest", "application/manifest+json" },
-        .{ "a.js.map", "application/json; charset=UTF-8" },
+        .{ "a.js.map", "application/json" },
         .{ "a.otf", "font/otf" },
         .{ "a.csv", "text/csv; charset=UTF-8" },
         .{ "a.md", "text/markdown; charset=UTF-8" },
@@ -431,4 +537,25 @@ test "sendFile: a request path cannot leave the directory through .. or an absol
         try std.testing.expect(std.mem.indexOf(u8, got, "top secret") == null);
         try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 404"));
     }
+}
+
+test "static: serve leaves the tier alone when prepareStatic already ran" {
+    // The App prepares before it starts HTTP/3 beside `serve`; `serve` running
+    // it again would write what other executors read.
+    const beneath = @import("../beneath.zig");
+    beneath.test_force = .verify;
+    defer beneath.test_force = null;
+    var tmp = try testDir();
+    defer tmp.cleanup();
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.static("/", tmp.dir, .{});
+    try server.prepareStatic();
+    try std.testing.expect(server.static_prepared);
+    const root = server.router.statics.items[0].root_real.?;
+    server.beneath = .kernel;
+    var out: [2048]u8 = undefined;
+    _ = try send(&server, "GET /style.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expectEqual(beneath.Tier.kernel, server.beneath);
+    try std.testing.expectEqual(root.ptr, server.router.statics.items[0].root_real.?.ptr);
 }

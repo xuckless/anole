@@ -233,7 +233,7 @@ configuration ([c-abi.md](c-abi.md#configuration)). A duration is an
 `request`: `require_host` (true), `decompress` (true) and `keep_buffers`
 (false). `response`: `write_buffer_size` (16 KiB), `date` (true),
 `default_content_type` (`.text`), `max_header_count` (64) and
-`brotli_quality` (5).
+`brotli_quality` (4).
 
 You get the listeners you name. `.{}` alone leaves them to `listen` or
 `listenTls`, and `run` then serves cleartext HTTP on 127.0.0.1:8080;
@@ -607,7 +607,7 @@ One table; the C ABI's defaults are the same (the schema test checks them).
 | `errors` | `.auto` |
 | `proxy.trusted` / `trusted_hops` | null (the deployment's) / 0 |
 | `environment` / `deployment` / `error_detail` | null / null / null |
-| `response.write_buffer_size` / `date` / `default_content_type` / `max_header_count` / `brotli_quality` | 16 KiB / on / text / 64 / 5 |
+| `response.write_buffer_size` / `date` / `default_content_type` / `max_header_count` / `brotli_quality` | 16 KiB / on / text / 64 / 4 |
 | `executors` | one per CPU |
 | databases: `timeout` / transaction bound | 30 s (`timeout_ms` 30000) / the database's |
 | databases: MongoDB `max_connections` / SQLite `ping_timeout` | 100 (null) / 2 s |
@@ -725,12 +725,15 @@ handlers as HTTP/1.1.
   wait.
 
 `Options.http2` sets `max_concurrent_streams` (250), `stream_window`
-(64 KiB, also each stream's body buffer), `stream_window_reading` (1 MiB:
-the window and buffer from the handler's first read of the body),
+(64 KiB, also the most a stream's body buffer starts with: a body of known
+length, or one that comes whole in one DATA frame, gets a buffer its size),
+`stream_window_reading` (1 MiB: what the window and buffer grow to, in
+steps of four from 64 KiB, while the handler reads a body longer than the
+window and the client keeps sending a whole window per step),
 `tunnel_window` (128 KiB: the one fixed window and buffer of a WebSocket
 over HTTP/2; raise it for bulk uploads over long round trips),
 `reading_window_budget` (16 MiB: what those raised buffers take at most per
-connection; past it a stream keeps `stream_window`), `connection_window`
+connection; past it a stream keeps the window it has), `connection_window`
 (16 MiB), `max_header_list_size` (64 KiB), `stream_reset_burst` and
 `stream_reset_rate` (rapid-reset protection), `refused_stream_burst` (100)
 and `refused_stream_rate` (10 a second: streams refused before a handler,
@@ -763,7 +766,7 @@ listener's. With `listeners`, `http3 = true` on one TLS listener does the
 same for it, and `http3` holds the settings; one HTTP/3 port per server.
 
 `http3` fields: `address` and `port` (the TLS listener's when null), `alt_svc`
-(true), `max_streams_bidi` (100 concurrent requests per connection),
+(true), `max_streams_bidi` (256 concurrent requests per connection),
 `idle_timeout` (30 s, a `std.Io.Duration`), `validate_address` (false), `early_data`
 (false), `prefer_v2` (true: a client that offers QUIC v2 beside v1 is moved
 to v2; false keeps it on v1), `sockets` (null: one per executor on Linux, see
@@ -790,6 +793,28 @@ stream, SSE or a WebSocket, outlives `idle_timeout`; an idle connection
 still closes at it. A client's RESET_STREAM, or STOP_SENDING with an error,
 cancels the handler's task as on HTTP/2: its next wait on `req.io` returns
 `error.Canceled`.
+
+### Response buffering
+
+A handler's write returns once its bytes are queued, and waits only while
+the response has as much queued as its cap allows (a `no_wait` handler on
+the endpoint task never waits). Bytes stay queued until the client
+acknowledges them, so the cap follows the connection's path rather than a
+fixed size: what is in flight (which the congestion window bounds), plus
+64 KiB not yet sent, at most 3 MiB. A download moves as
+fast as the path allows, as over TCP, while a client that stops reading
+leaves its response holding up to about 100 KiB (what the stack already
+took, plus 64 KiB). All of a connection's responses together hold at most
+4 MiB, past which only one inline `no_wait` answer's body may go (its writes
+cannot wait; the ones after it then run on tasks and wait for room). Nothing bounds the total across connections: plan for up to
+connections x 4 MiB of send buffers at worst (one download per connection
+held at most 64 KiB before 0.5.0). Message streams keep a fixed 1 MiB
+unacknowledged each, so a send there returns once buffered up to it: the
+extended CONNECT streams (WebSockets, the WebTransport session's stream)
+and every gRPC request (unary, streaming and gRPC-Web, any
+`application/grpc*` content type) and Connect streaming request
+(`application/connect+*`). A large response on one of them still moves
+at most 1 MiB per round trip (about 20 MB/s at 50 ms RTT).
 
 ### 0-RTT
 

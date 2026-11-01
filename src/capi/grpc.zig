@@ -428,6 +428,9 @@ fn handler(req: *http.Request, res: *http.Response) anyerror!void {
         else => |er| return er,
     };
     const detach = m.detachable and call.impl.protocol != .grpc_web_text and res.canDetach();
+    // Not detached, the call waits for the consumer on this task: the
+    // answers corked before it (pipelined HTTP/1.1) go out first.
+    if (!detach) try res.flushOwed();
     var message: []const u8 = "";
     if (m.kind == .unary or m.kind == .server_streaming) {
         message = readUnary(call, m, detach) catch |err| return serving.finish(call, err);
@@ -453,6 +456,7 @@ fn serveTranscoded(_: ?*anyopaque, req: *dusty.Request, res: *dusty.Response, ca
         else => |er| return er,
     };
     const detach = m.detachable and m.kind == .unary and res.canDetach();
+    if (!detach) try res.flushOwed();
     const whole: ?[]const u8 = if (detach) (req.body() catch |err| return serving.transcodeFailed(call, err)) orelse "" else null;
     const body_text = serving.transcodedBody(call, b.rule.body.len > 0, whole) catch |err| return serving.transcodeFailed(call, err);
     const query = if (std.mem.indexOfScalar(u8, req.url, '?')) |q| req.url[q + 1 ..] else "";

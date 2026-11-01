@@ -13,7 +13,7 @@ attribution header and are listed in part B; that includes the HTTP core
 Which components end up in a binary depends on the build flags:
 `-Dprofile=minimal` links only zio, the HTTP core and llhttp;
 `-Dtls=boringssl` adds BoringSSL; `-Dhttp2` adds nghttp2; `-Dhttp3` adds
-ngtcp2 and nghttp3; `-Dbrotli` adds Brotli; `-Dkafka` adds lz4; `-Dpostgres` adds pg.zig and
+ngtcp2 and nghttp3; `-Dbrotli` adds Brotli; `-Dlibdeflate` adds libdeflate; `-Dkafka` adds lz4; `-Dpostgres` adds pg.zig and
 buffer.zig; `-Dsqlite` adds SQLite and zig-sqlite.
 
 
@@ -113,6 +113,11 @@ Brotli 1.2.0 (Brotli compression)
   Licence:  MIT. Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
   Source:   https://github.com/google/brotli (tag archive v1.2.0)
   Linked:   -Dbrotli=true (the encoder; the decoder only in Anole's tests)
+
+libdeflate 1.26 (gzip compression of buffered responses)
+  Licence:  MIT. Copyright 2016 Eric Biggers, Copyright 2024 Google LLC
+  Source:   https://github.com/ebiggers/libdeflate (tag archive v1.26)
+  Linked:   -Dlibdeflate=true (the compressor, gzip wrapper and CRC-32 only)
 
 zig-jwt (JWT building and signing)
   Licence:  Apache License 2.0 (text in part E). Copyright deatil
@@ -280,6 +285,14 @@ vendored it; its licence is src/http/core/llhttp/LICENSE)
   Source:   https://github.com/nodejs/llhttp
   Linked:   always
 
+src/http/core/beneath.zig (the macOS probe in `probeDarwin`)
+  The idea and the errno rule (trust `O_RESOLVE_BENEATH` only when opening
+  `..` with it fails with ENOTCAPABLE) from Bun's `kernel_resolves_beneath`;
+  the code is a few lines of our own, from that reading.
+  Licence:  MIT. Copyright (c) Oven and the Bun contributors
+  Source:   https://github.com/oven-sh/bun, commit 4f7acde,
+            src/sys/beneath.rs
+
 build/boringssl.zig
   Adapted from allyourcodebase/boringssl's build.zig.
   Licence:  Zlib. Copyright (c) Lukas Kastern
@@ -446,6 +459,16 @@ src/smtp/core/ (the SMTP client's message encoding and protocol pieces)
             538d0ddc064248b6c1431bfd68df2481f431c0fd
   Linked:   -Dsmtp=true
 
+build/libdeflate.zig (the libdeflate build script)
+  Its source list (the compressor, gzip's wrapper, CRC-32 and the CPU
+  feature detection, no decompressor) follows nilo's build.zig
+  (`libdeflateFor`); Anole builds with libc, so `FREESTANDING` stays off and
+  lib/utils.c is built as is. The file carries an attribution header.
+  Licence:  MIT (text in part C). Copyright (c) 2026 Nevindra
+  Source:   https://github.com/nevindra/nilo, commit
+            d3ab2f33bbb8fc2281605c33a12fe3619c63f42d
+  Linked:   -Dlibdeflate=true (build time only)
+
 tests/lambda/events/*.json (sample AWS events for the Lambda adapter's tests)
   Copied unchanged from aws-lambda-rust-runtime: lambda-http/tests/data
   (the API Gateway REST and HTTP API, Function URL, ALB and VPC Lattice
@@ -466,6 +489,8 @@ C. MIT licence text (applies to every MIT component above)
 
 zefir (src/config, src/nats/core, src/openapi, src/validate, src/logging, src/http/core/bind*.zig, json_out.zig): Copyright (c) 2026 vkiryakov
 libvaxis (src/console/ui/ctlseqs.zig, keys.zig): Copyright (c) 2023 Tim Culverhouse
+libdeflate (fetched, -Dlibdeflate): Copyright 2016 Eric Biggers, Copyright 2024 Google LLC
+nilo (build/libdeflate.zig's source list): Copyright (c) 2026 Nevindra
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -8,8 +8,8 @@
  *
  * Linking. Link libanole.a (zig build capi) statically: it is one object in
  * which every symbol but anole_* is hidden, so nothing in it is exported
- * from the binding or bound to the OpenSSL, nghttp2, zstd, brotli, sqlite
- * or zlib a host process (Node, CPython) carries. libanole.so /
+ * from the binding or bound to the OpenSSL, nghttp2, zstd, brotli, sqlite,
+ * zlib or libdeflate a host process (Node, CPython) carries. libanole.so /
  * libanole.dylib exist for C programs and tests. Define ANOLE_SHARED before
  * including this header when linking a Windows DLL import library.
  *
@@ -105,7 +105,7 @@ extern "C" {
 #endif
 
 #define ANOLE_ABI_VERSION_MAJOR 0 /* breaking changes */
-#define ANOLE_ABI_VERSION_MINOR 10 /* additions (and, before 1.0, breaking changes; see CHANGELOG.md) */
+#define ANOLE_ABI_VERSION_MINOR 11 /* additions (and, before 1.0, breaking changes; see CHANGELOG.md) */
 #define ANOLE_ABI_VERSION ((ANOLE_ABI_VERSION_MAJOR << 16) | ANOLE_ABI_VERSION_MINOR)
 /* Whether a library reporting anole_abi_version() == v serves code built
    against this header. Before 1.0 both numbers must match (every 0.x minor

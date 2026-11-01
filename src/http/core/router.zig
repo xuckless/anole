@@ -75,12 +75,18 @@ pub const RouteOptions = struct {
     /// arrived whole right where it reads them, without a task (HTTP/2
     /// does, for a request whose end, body included, came in the read that
     /// brought its HEADERS; HTTP/3 for one whose end came in the packet
-    /// that completed its head). A handler that waits anyway still works,
-    /// but holds up every other request on its connection meanwhile, and
-    /// gets no request timeout. Leave it off for anything that talks to a
-    /// database, a cache, another service or the file system. Checked at
-    /// registration: every middleware in front of the route must say it
-    /// never waits (`pub const no_wait = true`), or the route is a conflict.
+    /// that completed its head). Over HTTP/1.1, pipelined requests to such
+    /// routes that arrive in one read are answered in one write: their
+    /// responses wait in the write buffer for the batch (`Response._cork`).
+    /// A handler that waits anyway still works, but holds up every other
+    /// request on its connection meanwhile, and gets no request timeout;
+    /// one that may wait (that falls back to waiting when it cannot
+    /// `detach`) calls `res.flushOwed()` first, or the answers to the
+    /// requests pipelined before it wait with it. Leave it off for anything
+    /// that talks to a database, a cache, another service or the file
+    /// system. Checked at registration: every middleware in front of the
+    /// route must say it never waits (`pub const no_wait = true`), or the
+    /// route is a conflict.
     no_wait: bool = false,
     /// Parameter names the route's handler reads (`anole.In` path fields);
     /// one the full path lacks is a conflict. Checked at registration.
@@ -135,6 +141,9 @@ pub fn Router(comptime Ctx: type) type {
         /// level the walk tries static children first, so a route of static
         /// segments only wins over any parameter or wildcard route.
         static_routes: std.StringHashMapUnmanaged(*StaticRoute) = .empty,
+        /// The `Static`s `static` registered, in order, for the server to
+        /// prepare at startup (`Server.prepareStatic`).
+        statics: std.ArrayList(*Static) = .empty,
         /// Global middlewares applied to all routes, in the router's
         /// arena. Internal: add to it with `use()`. A list assigned here
         /// directly is copied into the arena when the next route is
@@ -717,6 +726,7 @@ pub fn Router(comptime Ctx: type) type {
             const alloc = self.arena.allocator();
             const files = alloc.create(Static) catch @panic("OOM");
             files.* = .{ .dir = dir, .options = opts };
+            self.statics.append(alloc, files) catch @panic("OOM");
             if (opts.index) |index| files.options.index = alloc.dupe(u8, index) catch @panic("OOM");
             files.options.precompressed = alloc.dupe(Precompressed, opts.precompressed) catch @panic("OOM");
             if (opts.cache_control) |cc| files.options.cache_control = alloc.dupe(u8, cc) catch @panic("OOM");

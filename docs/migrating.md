@@ -1,5 +1,13 @@
 # Migrating
 
+## 0.4 to 0.5
+
+| 0.4 | 0.5 |
+| --- | --- |
+| A static route or `res.sendFile` following a symlink out of its directory | a 404 (`error.AccessDenied` from `sendFile`): `StaticOptions.resolve_beneath` and `SendFileOptions.resolve_beneath` are on by default. Symlinks that stay inside still work, but use relative ones (see [routing.md](routing.md#symlinks-out-of-the-directory)); `.resolve_beneath = false` restores 0.4 |
+| A static route with `"resolve_beneath"` unknown to the C ABI | `routes[].static.resolve_beneath` (default `true`) |
+| A binding built against C ABI 0.10 | rebuild against the new `anole.h`: the ABI is 0.11 (`ANOLE_ABI_COMPATIBLE` asks for an exact match before 1.0); docs/c-abi.md, "From ABI 0.10" |
+
 ## 0.3 to 0.4
 
 0.4 adds raw TCP and UDP servers ([net.md](net.md)), background jobs and

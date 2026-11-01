@@ -221,4 +221,6 @@ test {
     _ = @import("core/exec_counter_test.zig");
     // The push list under real threads (W1 seeds; [stress] in test-stress).
     _ = @import("core/push_list_test.zig");
+    // The HTTP/2 engine's wakes, in zio's known waiter order.
+    if (@import("build_options").http2) _ = @import("h2_wake_test.zig");
 }

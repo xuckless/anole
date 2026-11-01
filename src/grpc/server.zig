@@ -233,11 +233,12 @@ pub const Call = struct {
     }
 
     /// Adds initial metadata (a response header; `name` and `value` are
-    /// copied, and a repeated key keeps every value). The response head goes
-    /// out with the first response message: once it has started this
-    /// returns `error.HeadersSent`. In a streaming handler, where the
-    /// response writer runs as its own task, add headers before the first
-    /// `putOne`.
+    /// copied, and a repeated key keeps every value). A unary call's
+    /// response is sent whole when the call ends, so its headers may be
+    /// added until then. A streaming call's head goes out with the first
+    /// response message: once it has started this returns
+    /// `error.HeadersSent`; in a streaming handler, where the response
+    /// writer runs as its own task, add headers before the first `putOne`.
     pub fn addHeader(self: *Call, name: []const u8, value: []const u8) !void {
         // The writer starts the head under the same lock (`writeBytes`).
         try self.impl.write_lock.lock(self.io);
@@ -444,8 +445,12 @@ fn serve(comptime M: type, comptime handler: anytype, ctx: ?*anyopaque, req: *du
         error.Answered => return,
         else => |e| return e,
     };
+    // A unary response is collected in the call's arena and sent whole
+    // (`endBody`): HEADERS, DATA and the trailers in one go, with no
+    // streaming queue or writer between (#99). The streaming kinds stream.
     var out_buf: [16 * 1024]u8 = undefined;
-    call.impl.out_buf = &out_buf;
+    var collected: std.ArrayList(u8) = .empty;
+    if (M.kind == .unary) call.impl.buffer = &collected else call.impl.out_buf = &out_buf;
     // A call can outlive the server's request timeout: the client's own
     // deadline bounds it, and `max_call_duration`; reading the request
     // messages is bounded by `read_timeout`.
@@ -1240,6 +1245,23 @@ fn encodeMessage(comptime Msg: type, call: *Call, message: Msg) ![]const u8 {
 }
 
 fn writeResponse(comptime Resp: type, call: *Call, message: Resp) !void {
+    // A collected, uncompressed binary gRPC response encodes straight into
+    // the body, behind room kept for the frame's 5-byte prefix, which is
+    // filled in once the length is known (nilo's `prefixed`): the body is
+    // the encoded message itself, never copied.
+    if (call.impl.buffer) |b| if (b.items.len == 0 and call.impl.codec == .proto and
+        call.impl.response_compression == .identity and
+        (call.impl.protocol == .grpc or call.impl.protocol == .grpc_web))
+    {
+        var encoded: std.Io.Writer.Allocating = .init(call.arena);
+        try encoded.writer.splatByteAll(0, frame.header_size);
+        try message.encode(&encoded.writer, call.arena);
+        var list = encoded.toArrayList();
+        std.mem.writeInt(u32, list.items[1..5], @intCast(list.items.len - frame.header_size), .big);
+        b.* = list;
+        call.impl.started = true;
+        return;
+    };
     return writePayload(call, try encodeMessage(Resp, call, message));
 }
 

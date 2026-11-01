@@ -60,17 +60,18 @@ const Token = std.zig.Token;
 /// library called from more than one file is a named set (an exception to
 /// fold into one wrapper at the engine's takeover; listed in SAFETY.md).
 const c_libs = [_]struct { modules: []const []const u8, files: []const []const u8 }{
-    .{ .modules = &.{ "anole_nghttp2_c", "nghttp2" }, .files = &.{ "src/http/core/server/h2.zig", "src/http/core/client.zig", "src/h2/root.zig", "src/h2/client.zig" } },
+    .{ .modules = &.{ "anole_nghttp2_c", "nghttp2" }, .files = &.{ "src/http/core/server/h2_nghttp2.zig", "src/http/core/client.zig", "src/h2/root.zig", "src/h2/client.zig" } },
     .{ .modules = &.{"anole_boringssl_c"}, .files = &.{ "src/tls/root.zig", "src/tls/dusty_tls.zig", "src/h3/root.zig" } },
     .{ .modules = &.{ "anole_ngtcp2_c", "anole_nghttp3_c" }, .files = &.{ "src/h3/root.zig", "src/h3/layout.zig", "src/h3/ngtcp2.zig", "src/h3/nghttp3.zig", "src/h3/quic_tls.zig", "src/h3/client.zig", "src/h3/session_cache.zig", "src/h3/server.zig", "src/h3/bridge.zig", "src/h3/webtransport.zig", "src/h3/net.zig" } },
     .{ .modules = &.{"anole_yyjson_c"}, .files = &.{"src/json/root.zig"} },
     .{ .modules = &.{"anole_hiredis_c"}, .files = &.{"src/redis/root.zig"} },
     .{ .modules = &.{"anole_upb_c"}, .files = &.{"src/capi/grpc_schema.zig"} },
     .{ .modules = &.{"llhttp"}, .files = &.{ "src/http/core/parser.zig", "src/http/core/http.zig" } },
-    .{ .modules = &.{ "zlib", "anole_zlib_c" }, .files = &.{ "src/http/core/root.zig", "src/http/core/response.zig", "src/http/core/parser.zig", "src/compression/root.zig", "src/websocket/deflate.zig", "src/kafka/compress.zig" } },
+    .{ .modules = &.{ "zlib", "anole_zlib_c" }, .files = &.{ "src/http/core/root.zig", "src/http/core/response.zig", "src/http/core/encoders.zig", "src/http/core/parser.zig", "src/compression/root.zig", "src/websocket/deflate.zig", "src/kafka/compress.zig" } },
     .{ .modules = &.{ "zstd", "anole_zstd_c" }, .files = &.{ "src/http/core/zstd_io.zig", "src/http/core/root.zig", "src/compression/root.zig", "src/kafka/compress.zig" } },
     .{ .modules = &.{ "brotli", "anole_brotli_c" }, .files = &.{ "src/http/core/brotli_io.zig", "src/http/core/root.zig", "src/compression/root.zig" } },
     .{ .modules = &.{"anole_lz4_c"}, .files = &.{"src/kafka/compress.zig"} },
+    .{ .modules = &.{"libdeflate"}, .files = &.{"src/http/core/libdeflate_io.zig"} },
     .{ .modules = &.{ "anole_sqlite_c", "sqlite" }, .files = &.{"src/sqlite/root.zig"} },
 };
 

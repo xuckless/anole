@@ -1995,6 +1995,57 @@ fn drainCheck(a: *Answerer, e: *engine.Engine, port: u16, io: std.Io) !void {
     try std.testing.expectEqual(@as(u32, abi.ABORT_DRAIN), a.last_abort_reason.load(.acquire));
 }
 
+test "capi engine over HTTP/1.1: answers to pipelined requests go out before a consumer route waits for its consumer" {
+    var fx: Fixture = undefined;
+    try fx.start(Fixture.plain_listener);
+    defer fx.stop();
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(pipelinedBeforeHold, .{ &fx, io });
+    try f.await(io);
+    try fx.finish();
+}
+
+/// Two pipelined requests to consumer routes, which are `no_wait` but wait
+/// for the consumer over HTTP/1.1: the answer to the first must arrive
+/// while the second is still held, or it would sit corked behind it
+/// until the request deadline.
+fn pipelinedBeforeHold(fx: *Fixture, io: std.Io) !void {
+    const stream = try (try std.Io.net.IpAddress.parse("127.0.0.1", fx.e.port(0))).connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    fx.a.held.store(0, .release);
+    var wbuf: [256]u8 = undefined;
+    var w = stream.writer(io, &wbuf);
+    try w.interface.writeAll("GET /hello/1 HTTP/1.1\r\nHost: x\r\n\r\n" ++
+        "GET /hold HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    try w.interface.flush();
+
+    var rbuf: [2048]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    const status = try r.interface.takeDelimiterInclusive('\n');
+    try std.testing.expect(std.mem.startsWith(u8, status, "HTTP/1.1 200"));
+    var content_length: usize = 0;
+    while (true) {
+        const line = try r.interface.takeDelimiterInclusive('\n');
+        if (std.mem.eql(u8, line, "\r\n")) break;
+        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+            content_length = try std.fmt.parseInt(usize, std.mem.trim(u8, line["content-length:".len..], " \t\r\n"), 10);
+        }
+    }
+    const body = try r.interface.take(content_length);
+    try std.testing.expect(std.mem.startsWith(u8, body, "hello /hello/1"));
+
+    // Only now does the consumer answer the held request.
+    const held = try waitHeld(io, &fx.a.held);
+    try engine.respond(fx.e, held, 200, &.{}, "late", false);
+    var out: [1024]u8 = undefined;
+    var fw: std.Io.Writer = .fixed(&out);
+    try readRest(&r, &fw);
+    try std.testing.expect(std.mem.startsWith(u8, fw.buffered(), "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.endsWith(u8, fw.buffered(), "\r\n\r\nlate"));
+}
+
 test "capi: every ServerError and TlsLoadError name is an ABI error token" {
     // The server design's named error sets (`anole.ServerError`,
     // `anole.TlsLoadError`): their member names are the tokens verbatim.
@@ -2725,6 +2776,63 @@ test "capi engine: a rate_limit refusal answers in the configured error format, 
     defer rt.deinit();
     const io = rt.io();
     var f = try io.concurrent(rateLimitCheck, .{ io, e.port(0) });
+    try f.await(io);
+    try e.drain();
+    try std.testing.expect(e.wait(stopWaitMs()));
+}
+
+fn staticLinkCheck(io: std.Io, port: u16) !void {
+    var buf: [2048]u8 = undefined;
+    const cases = [_]struct { path: []const u8, status: []const u8, body: ?[]const u8 }{
+        .{ .path = "/safe/style.css", .status = "HTTP/1.1 200", .body = "body" },
+        .{ .path = "/safe/out.txt", .status = "HTTP/1.1 404", .body = null },
+        .{ .path = "/open/out.txt", .status = "HTTP/1.1 200", .body = "secret" },
+    };
+    for (cases) |c| {
+        const got = try rawGet(io, port, c.path, &buf);
+        try std.testing.expect(std.mem.startsWith(u8, got, c.status));
+        if (c.body) |b| {
+            try std.testing.expect(std.mem.endsWith(u8, got, b));
+        } else try std.testing.expect(std.mem.find(u8, got, "secret") == null);
+    }
+}
+
+test "capi engine: a static route refuses a symlink out of its directory unless resolve_beneath is false" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(tio, .{ .sub_path = "secret.txt", .data = "secret" });
+    try tmp.dir.createDir(tio, "root", .default_dir);
+    try tmp.dir.writeFile(tio, .{ .sub_path = "root/style.css", .data = "body" });
+    // Windows: creating a symlink needs SeCreateSymbolicLinkPrivilege
+    // (Developer Mode); GitHub's runners have it.
+    tmp.dir.symLink(tio, "../secret.txt", "root/out.txt", .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    const root_abs = try tmp.dir.realPathFileAlloc(tio, "root", alloc);
+    defer alloc.free(root_abs);
+    const json = try std.fmt.allocPrint(alloc,
+        \\{{"executors": 1, "timeouts": {{"shutdown_ms": 200}},
+        \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
+        \\ "routes": [{{"path": "/safe", "static": {{"dir": {f}}}}},
+        \\             {{"path": "/open", "static": {{"dir": {f}, "resolve_beneath": false}}}}]}}
+    , .{ std.json.fmt(root_abs, .{}), std.json.fmt(root_abs, .{}) });
+    defer alloc.free(json);
+
+    var why_buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&why_buf);
+    const e = engine.Engine.create(json, false, &why) catch |err| {
+        std.debug.print("{s}\n", .{why.buffered()});
+        return err;
+    };
+    defer e.destroy();
+    _ = try e.attach(null, null, false);
+    try e.start();
+    const rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try io.concurrent(staticLinkCheck, .{ io, e.port(0) });
     try f.await(io);
     try e.drain();
     try std.testing.expect(e.wait(stopWaitMs()));

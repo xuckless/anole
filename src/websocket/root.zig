@@ -1225,7 +1225,7 @@ const read_block_len = 16 * 1024 + 512;
 /// release builds; never reused in tests). None of the HTTP core's pools fits:
 /// its write buffers are `response.write_buffer_size` long (configurable,
 /// 16384 by default: no room for a frame's tail ahead of a whole record),
-/// `block_cache` serves 64 KiB and more, and the TLS module's ciphertext
+/// `block_cache` serves past 32 KiB, and the TLS module's ciphertext
 /// blocks are its own (and absent without TLS). Owned by the process
 /// (SAFETY.md M2); a block taken is the taking run's until it gives it
 /// back. No I/O or suspension runs between a pool's reads and writes, so a

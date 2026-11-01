@@ -13,6 +13,8 @@ const TrustStore = if (has_trust_store) tls.TrustStore else void;
 const build_options = @import("build_options");
 
 const Router = @import("router.zig").Router;
+const beneath = @import("beneath.zig");
+const Static = @import("server/static.zig").Static;
 const Action = @import("router.zig").Action;
 const RequestParser = @import("parser.zig").RequestParser;
 const RequestBodyReader = @import("parser.zig").RequestBodyReader;
@@ -28,6 +30,7 @@ const body_read_reserve = @import("config.zig").body_read_reserve;
 const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersPool;
 const RequestBuffers = @import("server/request_buffers.zig").RequestBuffers;
 const block_cache = @import("block_cache.zig");
+const encoders = @import("encoders.zig");
 const WriteBuffer = @import("server/request_buffers.zig").WriteBuffer;
 const Chain = @import("middleware.zig").Chain;
 const Middleware = @import("middleware.zig").Middleware;
@@ -41,7 +44,7 @@ const expect_log = @import("expect_log.zig");
 const DrainHooks = @import("drain_hooks.zig").DrainHooks;
 /// The HTTP/2 engine, with the `-Dhttp2` build option.
 const proxy_protocol = @import("proxy_protocol.zig");
-const h2 = if (build_options.use_http2) @import("server/h2.zig") else struct {};
+const h2 = if (build_options.use_http2) @import("server/h2_nghttp2.zig") else struct {};
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 const park = @import("server/park.zig");
 const cgroup = @import("cgroup.zig");
@@ -466,6 +469,32 @@ pub const Connection = struct {
         self.buffers = try allocator.alloc(u8, tls_buffers_len);
     }
 
+    /// Tests only: the writes that reached the socket of any connection
+    /// (`Stream.Writer` drains and sendfiles; over TLS, of the records),
+    /// so a test can count the writes a batch of responses took without
+    /// timing anything.
+    pub const TestSocketWrites = if (builtin.is_test) struct {
+        var count: std.atomic.Value(usize) = .init(0);
+        // SAFETY: only the vtable is taken, at comptime; the stream and
+        // `Io` are never read.
+        const inner = std.Io.net.Stream.Writer.init(undefined, undefined, &.{}).interface.vtable;
+        const vtable: std.Io.Writer.VTable = .{ .drain = drain, .sendFile = sendFile };
+
+        pub fn get() usize {
+            return count.load(.monotonic);
+        }
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            _ = count.fetchAdd(1, .monotonic);
+            return inner.drain(w, data, splat);
+        }
+
+        fn sendFile(w: *std.Io.Writer, file_reader: *std.Io.File.Reader, limit: std.Io.Limit) std.Io.Writer.FileError!usize {
+            _ = count.fetchAdd(1, .monotonic);
+            return inner.sendFile(w, file_reader, limit);
+        }
+    } else void;
+
     pub fn initPlain(
         self: *Connection,
         allocator: std.mem.Allocator,
@@ -475,6 +504,7 @@ pub const Connection = struct {
         try self.init(allocator, io, stream, 0);
         self.tcp_reader = stream.reader(io, &.{});
         self.tcp_writer = stream.writer(io, &.{});
+        if (builtin.is_test) self.tcp_writer.interface.vtable = &TestSocketWrites.vtable;
         self.reader = &self.tcp_reader.interface;
         self.writer = &self.tcp_writer.interface;
     }
@@ -496,6 +526,7 @@ pub const Connection = struct {
 
         self.tcp_reader = stream.reader(io, tcp_read_buffer);
         self.tcp_writer = stream.writer(io, tcp_write_buffer);
+        if (builtin.is_test) self.tcp_writer.interface.vtable = &TestSocketWrites.vtable;
         self.tls_rng = .{ .io = io };
         self.tls_conn = try tls.server(&self.tcp_reader.interface, &self.tcp_writer.interface, .{
             .auth = auth,
@@ -552,10 +583,45 @@ pub const Connection = struct {
         lendWriteBuffer(self);
     }
 
+    /// Sends the responses corked in the write buffer (`Response._cork`), if
+    /// any, and gives the buffer back, so that what comes next -- a read
+    /// that may wait, a handler that may wait -- holds neither. Called at
+    /// every point where the connection task could wait with responses
+    /// owed. A failed send is the connection's recorded write error (a
+    /// cancel included, never swallowed).
+    pub fn flushOwed(self: *Connection) (WriteError || error{Unexpected})!void {
+        if (self.writer.end == 0) return;
+        self.writer.flush() catch return self.getWriteError() orelse error.Unexpected;
+        self.releaseWriteBuffer();
+    }
+
+    /// Best effort, on a connection about to close: the corked responses
+    /// go out before the close, as each would have before corking. What
+    /// cannot be sent is dropped. A cancel is passed on.
+    /// A writer that already failed (a write timeout's cancel among them)
+    /// is not tried again: what it holds is dropped.
+    pub fn flushOwedBeforeClose(self: *Connection) std.Io.Cancelable!void {
+        if (self.writer.end == 0) return;
+        if (self.getWriteError() != null) {
+            self.writer.end = 0;
+            return;
+        }
+        self.writer.flush() catch {
+            self.writer.end = 0;
+            if (self.getWriteError()) |err| if (err == error.Canceled) return error.Canceled;
+        };
+    }
+
+    /// Throws the corked responses away, on a connection that closes
+    /// without them (canceled, or its reads failed).
+    pub fn dropOwed(self: *Connection) void {
+        self.writer.end = 0;
+    }
+
     /// Takes the write buffer back, throwing away what it holds, and gives
-    /// it back to `write_pool` if it came from there. Every response is
-    /// flushed as it ends, so only a failed write leaves anything, on a
-    /// connection that is closing.
+    /// it back to `write_pool` if it came from there. A corked response is
+    /// flushed before this (`flushOwed`), so only a failed write leaves
+    /// anything, on a connection that is closing.
     pub fn releaseWriteBuffer(self: *Connection) void {
         self.writer.buffer = &.{};
         self.writer.end = 0;
@@ -1276,6 +1342,10 @@ pub fn Server(comptime Ctx: type) type {
         /// GOAWAY that no new streams will be taken.
         h2_conns: if (build_options.use_http2) h2.Engine(Ctx).Registry else void =
             if (build_options.use_http2) .{} else {},
+        /// Bumped by the first executor's trim task every
+        /// `request_buffers_trim_interval`: an HTTP/2 connection that sees
+        /// it move frees the spare streams it kept unused since.
+        trim_epoch: std.atomic.Value(u32) = .init(0),
         /// The first listener's bound address, once `ready` is set. A
         /// listener given port zero has its real port here.
         address: Address,
@@ -1302,6 +1372,12 @@ pub fn Server(comptime Ctx: type) type {
         /// The index (in `config.listeners`) of the listener that could not
         /// be opened, when that is why `run` stopped.
         start_error_listener: ?usize = null,
+        /// How file bodies are confined to their directory: `prepareStatic`'s
+        /// verdict, copied into every response. The safe tier until it runs.
+        beneath: beneath.Tier = .verify,
+        /// Set once `prepareStatic` has finished, so `serve` does not run it
+        /// again after a caller (the App, Lambda) ran it before serving.
+        static_prepared: bool = false,
         _middleware_registry: std.SinglyLinkedList,
         request_buffers: RequestBuffersPool,
         /// The listeners while `run` serves them, for `reloadTls`; empty
@@ -1511,7 +1587,56 @@ pub fn Server(comptime Ctx: type) type {
             if (self.start_error) |err| return err;
         }
 
+        /// Picks how `resolve_beneath` is enforced (`beneath.probe`, against the
+        /// first static directory that asks for it, else the working directory)
+        /// and, where that is the real-path check, reads the real path of each
+        /// such directory. Run once before any connection is served; the result
+        /// is read-only afterwards. Fails, with a readable log, when a directory's
+        /// real path cannot be read on the real-path tier: `resolve_beneath = false`
+        /// is the way out.
+        ///
+        /// It writes `beneath` and each `Static.root_real`, which requests read
+        /// without a lock: a caller that serves other protocols beside this
+        /// `serve` (HTTP/3 on other executors) runs it first, before it starts
+        /// any of them. `serve` then skips it.
+        pub fn prepareStatic(self: *Self) !void {
+            try self.prepareStaticInner();
+            self.static_prepared = true;
+        }
+
+        fn prepareStaticInner(self: *Self) !void {
+            const statics = self.router.statics.items;
+            var first: ?*Static = null;
+            for (statics) |s| if (s.options.resolve_beneath) {
+                first = s;
+                break;
+            };
+            const verdict = beneath.probe(self.io, if (first) |s| s.dir else std.Io.Dir.cwd());
+            self.beneath = verdict.tier;
+            if (first == null or verdict.tier == .kernel) return;
+
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const arena = self.router.arena.allocator();
+            for (statics) |s| {
+                if (!s.options.resolve_beneath or s.root_real != null) continue;
+                const n = s.dir.realPath(self.io, &buf) catch |err| {
+                    if (err == error.Canceled) return err;
+                    const protection = self.io.swapCancelProtection(.blocked);
+                    defer _ = self.io.swapCancelProtection(protection);
+                    log.err("a static directory's real path cannot be read ({t}), and this system cannot confine opens to it in the kernel ({s}); set `.resolve_beneath = false` in its StaticOptions to serve it without the check", .{ err, verdict.why.text() });
+                    return error.StaticRealPathUnavailable;
+                };
+                s.root_real = try arena.dupe(u8, buf[0..n]);
+            }
+
+            const protection = self.io.swapCancelProtection(.blocked);
+            defer _ = self.io.swapCancelProtection(protection);
+            const line = "static files: resolve_beneath checks the real path of every opened file, because {s}; that costs a second blocking-pool hop per static open (`.resolve_beneath = false` restores the old speed)";
+            if (verdict.why.expected()) log.debug(line, .{verdict.why.text()}) else log.info(line, .{verdict.why.text()});
+        }
+
         fn serve(self: *Self) !void {
+            if (!self.static_prepared) try self.prepareStatic();
             const listeners = self.configuredListeners();
             if (self.config.max_connections) |max| {
                 if (max == 0) {
@@ -1562,6 +1687,14 @@ pub fn Server(comptime Ctx: type) type {
                 defer _ = self.io.swapCancelProtection(protection);
                 log.debug("at most {d} connections at once (open-file limit {?d})", .{ self.config.max_connections.?, soft });
             }
+            if (build_options.use_zlib or build_options.use_brotli or build_options.use_http2) {
+                const protection = self.io.swapCancelProtection(.blocked);
+                defer _ = self.io.swapCancelProtection(protection);
+                const n = executors orelse 1;
+                log.debug("block cache: at most {d} MiB per executor, {d} MiB for {d} executor(s)", .{
+                    block_cache.max_cached >> 20, (block_cache.max_cached * n) >> 20, n,
+                });
+            }
             // Out of `reloadTls`'s reach before the listeners close.
             self.lockTls();
             self.active_listeners = active;
@@ -1593,6 +1726,12 @@ pub fn Server(comptime Ctx: type) type {
                 defer _ = self.io.swapCancelProtection(protection);
                 for (active) |*l| logListening(l.config, l.address);
             }
+
+            // The trim tasks, one per executor. Canceled last, after the
+            // drain and the connections, so the encoders a response made
+            // during the drain are freed too (`trimLoop`).
+            var trimming: std.Io.Group = .init;
+            defer trimming.cancel(self.io);
 
             var connections: std.Io.Group = .init;
             // Parked connections: a shelf per executor, each with a driver
@@ -1657,7 +1796,7 @@ pub fn Server(comptime Ctx: type) type {
 
             // One per executor, so that each trims its own free list.
             for (0..executors orelse 1) |i| {
-                placement.concurrent(&accepting, self.io, .{ .executor = i }, trimLoop, .{ self, i == 0 }) catch |err| {
+                placement.concurrent(&trimming, self.io, .{ .executor = i }, trimLoop, .{ self, i == 0 }) catch |err| {
                     log.debug("No task to trim the request buffers on executor {d}: {}", .{ i, err });
                 };
             }
@@ -1953,14 +2092,23 @@ pub fn Server(comptime Ctx: type) type {
         /// buffer sets this executor's connections left unused since the
         /// last time, and the first executor's the shared ones too
         /// (`RequestBuffersPool.trimLocal`, `trimShards`); and the
-        /// compressors' blocks it cached that no response took
-        /// (`block_cache`).
+        /// compressors' and HTTP/2 body queues' blocks it cached that
+        /// nothing took (`block_cache`), and the buffered-body encoders
+        /// no response took (`encoders`).
         fn trimLoop(self: *Self, shards: bool) std.Io.Cancelable!void {
+            // One task per executor, canceled at teardown after the drain
+            // and the connections: this runs on the thread that owns the
+            // encoders, and frees those the drain's responses made too.
+            defer if (build_options.use_zlib) encoders.freeLocal();
             while (true) {
                 try self.io.sleep(request_buffers_trim_interval, .awake);
                 self.request_buffers.trimLocal();
                 if (shards) self.request_buffers.trimShards();
-                if (build_options.use_zlib or build_options.use_brotli) block_cache.trimLocal();
+                if (shards) _ = self.trim_epoch.fetchAdd(1, .monotonic);
+                // The encoders first, so the blocks they give back are
+                // unmapped at the next trim if nothing takes them.
+                if (build_options.use_zlib) encoders.trimLocal();
+                if (build_options.use_zlib or build_options.use_brotli or build_options.use_http2) block_cache.trimLocal();
                 // Objects retired with no writer after them (src/http/core/qsbr.zig).
                 if (shards) qsbr.pollAll();
             }
@@ -2378,6 +2526,9 @@ pub fn Server(comptime Ctx: type) type {
             idle_read_buffer: []u8,
             buffers: *?*RequestBuffers,
         ) !void {
+            // Responses corked behind the one that closes (a head refused
+            // without an answer) still go out first.
+            try connection.flushOwedBeforeClose();
             if (buffers.*) |b| {
                 connection.replaceReadBuffer(idle_read_buffer);
                 connection.releaseWriteBuffer();
@@ -2713,8 +2864,28 @@ pub fn Server(comptime Ctx: type) type {
         /// Whether `buffered`, the start of a request, holds its whole head:
         /// the blank line that ends it is there. A head ended by bare LFs
         /// is not recognized, which only costs a header deadline.
+        ///
+        /// Empty lines before the request line are skipped (RFC 9112 section
+        /// 2.2, as llhttp does): the CRLF an old client sends after a body
+        /// is not a head, and must not keep corked responses back while
+        /// the read waits for the real one.
         fn headBuffered(buffered: []const u8) bool {
-            return std.mem.indexOf(u8, buffered, "\r\n\r\n") != null;
+            const start = std.mem.trimStart(u8, buffered, "\r\n");
+            return std.mem.indexOf(u8, start, "\r\n\r\n") != null;
+        }
+
+        /// On a connection closing after a handler's error or abort: the
+        /// responses corked before this one go out first. Once this one's
+        /// body has started (a stream or a file: its head went out, and the
+        /// corked responses with it), the buffer holds only its unsent
+        /// tail, which is dropped, as before corking: a flush could wait
+        /// on a peer that stopped reading, past every deadline.
+        fn closeOwed(connection: *Connection, response: *const Response) std.Io.Cancelable!void {
+            if (response._stream_mode) {
+                connection.dropOwed();
+                return;
+            }
+            try connection.flushOwedBeforeClose();
         }
 
         fn deadlineAfter(start: std.Io.Clock.Timestamp, duration: ?std.Io.Duration) ?std.Io.Clock.Timestamp {
@@ -2753,6 +2924,7 @@ pub fn Server(comptime Ctx: type) type {
             res._error_format = self.config.errors;
             res._write_timeout = self.config.timeout.write;
             res._error_detail = self.config.error_detail;
+            res._beneath = self.beneath;
         }
 
         /// The client address for a request from `peer` with `headers`,
@@ -2890,7 +3062,18 @@ pub fn Server(comptime Ctx: type) type {
             defer if (buffers) |b| {
                 // An adopter's writer is its own, under its lock: it took
                 // it out of the buffers before it returned.
-                if (connection.adopter == null) connection.releaseWriteBuffer();
+                if (connection.adopter == null) {
+                    // The exits that pass `flushOwed`, `flushOwedBeforeClose`
+                    // or `dropOwed` leave nothing owed. The others are
+                    // errors before the next response wrote anything (its
+                    // head or Content-Length refused by `Response.write`,
+                    // out of memory): the responses corked before it are
+                    // whole, and go out before the close, as each would
+                    // have before corking.
+                    connection.flushOwedBeforeClose() catch self.io.recancel();
+                    std.debug.assert(connection.writer.end == 0);
+                    connection.releaseWriteBuffer();
+                }
                 self.request_buffers.release(b);
             };
             // A handler that handed the connection over (`Response.adopt`)
@@ -2941,6 +3124,9 @@ pub fn Server(comptime Ctx: type) type {
                 // itself must replace or clear.
                 var wait_armed = false;
                 if (connection.reader.bufferedLen() == 0) {
+                    // A guard: a response is corked only while the next
+                    // request is buffered, so nothing is owed here.
+                    try connection.flushOwed();
                     if (!self.config.request.keep_buffers_between_requests) {
                         if (buffers) |b| {
                             connection.useReadBuffer(&idle_read_buffer);
@@ -3044,6 +3230,10 @@ pub fn Server(comptime Ctx: type) type {
                     connection.useReadBuffer(b.read_buffer);
                     request.arena = b.arena.allocator();
                 }
+
+                // The rest of the head is still to come: the responses
+                // corked so far go out before the read waits for it.
+                if (!head_buffered) try connection.flushOwed();
 
                 parseHeaders(connection.reader, &parser) catch |err| switch (err) {
                     error.EndOfStream => return .close,
@@ -3205,19 +3395,40 @@ pub fn Server(comptime Ctx: type) type {
                     .allow = if (miss) |m| m.allow else null,
                     .error_handler = self.config.error_handler,
                 };
+                // Corked responses go out before a handler that may wait
+                // (a route not marked `no_wait`, a miss, or a body still to
+                // arrive), so its wait does not hold them back.
+                if (connection.writer.end != 0) {
+                    const never_waits = found != null and found.?.no_wait and
+                        (parser.isBodyComplete() or
+                            (request.content_length != null and request.content_length.? <= connection.reader.bufferedLen()));
+                    if (!never_waits) try connection.flushOwed();
+                }
                 const t0 = hooks.begin(self.io);
                 const run_result = executor.run();
                 hooks.end(&request, &response, run_result, executor.answered, t0);
                 run_result catch |err| switch (err) {
-                    error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
+                    error.ReadFailed => {
+                        connection.dropOwed();
+                        return connection.getReadError() orelse error.Unexpected;
+                    },
                     error.WriteFailed => return connection.getWriteError() orelse error.Unexpected,
                     // `Response.abort`: the connection closes under the
-                    // unfinished response, which is the abort.
+                    // unfinished response, which is the abort. The
+                    // responses corked before it still go out first.
                     error.ResponseAborted => {
                         log.debug("Response aborted ({f} {s})", .{ request.method, request.url });
+                        try closeOwed(connection, &response);
                         return .close;
                     },
-                    else => |e| return e,
+                    error.Canceled => {
+                        connection.dropOwed();
+                        return error.Canceled;
+                    },
+                    else => |e| {
+                        try closeOwed(connection, &response);
+                        return e;
+                    },
                 };
 
                 if (!parser.isBodyComplete()) {
@@ -3239,6 +3450,8 @@ pub fn Server(comptime Ctx: type) type {
                         // A tighter deadline the handler set (gRPC's read
                         // timeout) bounds the drain too; a lifted one does not.
                         const drain_deadline = earlier(request_deadline, request._handler_deadline);
+                        // The drain reads, and may wait for the body.
+                        try connection.flushOwed();
                         if (!try self.boundedDiscard(&parser, connection, max, timer, drain_deadline)) response.keepalive = false;
                     } else {
                         response.keepalive = false;
@@ -3249,6 +3462,13 @@ pub fn Server(comptime Ctx: type) type {
                     response.keepalive = false;
                 }
 
+                // Corking: the next request is already here, so this
+                // response waits in the write buffer and goes out with the
+                // next ones, in one write, at the first point the
+                // connection could wait (`Connection.flushOwed`), or when
+                // the buffer fills. A pipelined batch of `no_wait` requests
+                // is answered in one write per read.
+                response._cork = response.keepalive and parser.isBodyComplete() and connection.reader.bufferedLen() > 0;
                 try response.write();
 
                 if (!response.keepalive) {
@@ -3281,8 +3501,11 @@ pub fn Server(comptime Ctx: type) type {
                 }
 
                 // The write buffer goes back between requests, so the next
-                // holds none while it waits to answer.
-                connection.releaseWriteBuffer();
+                // holds none while it waits to answer -- unless it holds
+                // corked responses, which go out with the next one's, or
+                // at the next point the connection could wait
+                // (`flushOwed`).
+                if (connection.writer.end == 0) connection.releaseWriteBuffer();
                 parser.reset();
                 request._reset();
                 buffers.?.resetArena();
@@ -3476,7 +3699,34 @@ fn fuzzConnection(input: []const u8) !void {
     server.router.post("/", handlers.echo);
     server.router.put("/*rest", handlers.echo);
 
-    var l: Server(void).ActiveListener = .{ .config = &listener, .address = listener.address, .server = undefined };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try feedConnection(io, &server, &listener, input, &out);
+
+    // Every response the server wrote is a response: an HTTP/1.1 status
+    // line, or (HTTP/2) frames that start with its SETTINGS.
+    if (out.items.len > 0) {
+        if (std.mem.startsWith(u8, out.items, "HTTP/1.")) {
+            var it = std.mem.splitSequence(u8, out.items, "\r\n");
+            while (it.next()) |line| for (line) |ch| {
+                // No header value smuggled a line break or a NUL out.
+                try std.testing.expect(ch != '\r' and ch != '\n' and ch != 0 or !std.ascii.startsWithIgnoreCase(line, "x-"));
+            };
+        } else {
+            try std.testing.expect(build_options.use_http2);
+            try std.testing.expect(out.items.len >= 9 and out.items[3] == 0x04);
+        }
+    }
+}
+
+/// Serves `input`, and then its end, as one connection of `server`'s
+/// listener `listener`, through `handleConnectionWrapper` over a socket
+/// pair, and appends what the server wrote to `out`. The whole input is
+/// in the socket before the connection starts reading, so the server's
+/// first read takes all of it (up to its read buffer). Checks that the
+/// connection gave back what it held.
+fn feedConnection(io: std.Io, server: *Server(void), listener: *const @import("config.zig").Listener, input: []const u8, out: *std.ArrayList(u8)) !void {
+    var l: Server(void).ActiveListener = .{ .config = listener, .address = listener.address, .server = undefined };
     var fds: [2]std.c.fd_t = undefined;
     if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPair;
     defer _ = std.c.close(fds[1]);
@@ -3488,8 +3738,9 @@ fn fuzzConnection(input: []const u8) !void {
     // until something else wakes it: a plain C reader on read(2) or
     // recvmsg(2) does this about once in 3,000 to 30,000 pairs on macOS 27
     // (none in 600,000 TCP loopback pairs, none on Linux). An end that is
-    // already there when the reads start is seen at once. The input fits
-    // the socket buffer (at most `fuzz.max_len`, 4 KiB; 8 KiB on macOS).
+    // already there when the reads start is seen at once. The input must
+    // fit the socket buffer (8 KiB on macOS; the fuzzer's is at most
+    // `fuzz.max_len`, 4 KiB).
     var wrote: usize = 0;
     while (wrote < input.len) {
         const n = std.c.write(fds[1], input[wrote..].ptr, input.len - wrote);
@@ -3509,12 +3760,10 @@ fn fuzzConnection(input: []const u8) !void {
     try server.reserveConnectionSlot();
     // With the deadline watch the accept loop gives it, which also bounds
     // a lingering close rather than sleeping it out.
-    var future = try io.concurrent(Server(void).handleConnectionWrapper, .{ &server, &l, stream });
+    var future = try io.concurrent(Server(void).handleConnectionWrapper, .{ server, &l, stream });
     var finished = false;
     defer if (!finished) future.cancel(io) catch {};
 
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(std.testing.allocator);
     while (true) {
         var pfd = [_]std.c.pollfd{.{ .fd = fds[1], .events = std.c.POLL.IN, .revents = 0 }};
         // The peer is done, so the server must finish on its own.
@@ -3527,23 +3776,54 @@ fn fuzzConnection(input: []const u8) !void {
     finished = true;
     future.await(io) catch {};
 
-    // Every response the server wrote is a response: an HTTP/1.1 status
-    // line, or (HTTP/2) frames that start with its SETTINGS.
-    if (out.items.len > 0) {
-        if (std.mem.startsWith(u8, out.items, "HTTP/1.")) {
-            var it = std.mem.splitSequence(u8, out.items, "\r\n");
-            while (it.next()) |line| for (line) |ch| {
-                // No header value smuggled a line break or a NUL out.
-                try std.testing.expect(ch != '\r' and ch != '\n' and ch != 0 or !std.ascii.startsWithIgnoreCase(line, "x-"));
-            };
-        } else {
-            try std.testing.expect(build_options.use_http2);
-            try std.testing.expect(out.items.len >= 9 and out.items[3] == 0x04);
-        }
-    }
     // The connection gave back what it held.
     try std.testing.expectEqual(@as(u32, 0), server.active_connections.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.busy.load(.acquire).count);
+}
+
+test "Server: pipelined no_wait requests that are all buffered are answered in order, in one write" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // feeds the connection through socketpair(2), which Windows lacks
+    const io = std.testing.io;
+    const listener: @import("config.zig").Listener = .{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } };
+    var server = Server(void).init(std.testing.allocator, io, .{ .listeners = &.{listener} }, {});
+    defer server.deinit();
+    const handlers = struct {
+        fn a(_: *Request, res: *Response) !void {
+            res.body = "a";
+        }
+        fn c(_: *Request, res: *Response) !void {
+            res.body = "c";
+        }
+    };
+    server.router.addRouteWith(.get, "/a", handlers.a, .{ .no_wait = true });
+    server.router.addRouteWith(.get, "/c", handlers.c, .{ .no_wait = true });
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    const before = Connection.TestSocketWrites.get();
+    // All three, and the end of input, are in the socket before the
+    // server's first read: the first two answers are corked behind the
+    // requests still buffered, and the third, with nothing buffered
+    // behind it, sends all three.
+    try feedConnection(io, &server, &listener, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n", &out);
+    try std.testing.expectEqual(@as(usize, 1), Connection.TestSocketWrites.get() - before);
+
+    // Three 200s, their bodies in request order.
+    var bodies: [3]u8 = undefined;
+    var n: usize = 0;
+    var rest: []const u8 = out.items;
+    while (std.mem.indexOf(u8, rest, "\r\n\r\n")) |end| {
+        try std.testing.expect(std.mem.startsWith(u8, rest, "HTTP/1.1 200 "));
+        try std.testing.expect(n < bodies.len);
+        bodies[n] = rest[end + 4];
+        n += 1;
+        rest = rest[end + 5 ..];
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("aca", &bodies);
+    try std.testing.expectEqual(@as(usize, 0), rest.len);
 }
 
 test "fuzz: a connection's bytes, HTTP/1.1 or HTTP/2 with prior knowledge" {
