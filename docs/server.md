@@ -805,7 +805,8 @@ fixed size: what is in flight (which the congestion window bounds), plus
 fast as the path allows, as over TCP, while a client that stops reading
 leaves its response holding up to about 100 KiB (what the stack already
 took, plus 64 KiB). All of a connection's responses together hold at most
-4 MiB. Nothing bounds the total across connections: plan for up to
+4 MiB, past which only one inline `no_wait` answer's body may go (its writes
+cannot wait; the ones after it then run on tasks and wait for room). Nothing bounds the total across connections: plan for up to
 connections x 4 MiB of send buffers at worst (one download per connection
 held at most 64 KiB before 0.5.0). Message streams keep a fixed 1 MiB
 unacknowledged each, so a send there returns once buffered up to it: the

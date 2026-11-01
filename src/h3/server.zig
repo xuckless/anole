@@ -318,7 +318,7 @@ fn earlyDataContext(q: *const c.ngtcp2_conn, settings: nghttp3.Settings, wt: boo
 const inbox_len = 256;
 
 /// What one connection's streams hold unacknowledged, all together.
-const conn_budget = 4 << 20;
+pub const conn_budget = 4 << 20;
 /// A message stream's own cap (extended CONNECT: WebSocket over HTTP/3,
 /// the WebTransport CONNECT; and gRPC or Connect streaming calls), which
 /// carry messages and are latency-sensitive: fixed, so a send returns
@@ -2619,6 +2619,16 @@ pub fn Endpoint(comptime Ctx: type) type {
                 const conn = s.conn;
                 conn.lock();
                 const gone = s.reset;
+                // An inline answer's writes pass the connection's budget
+                // (they cannot wait): once the answers before it filled
+                // the budget, it goes to a task, whose writes wait on it.
+                // So the budget holds but for one inline body.
+                if (!gone and conn.budget.room() == 0) {
+                    s.inline_mode = false;
+                    conn.startStream(s);
+                    conn.unlock();
+                    return;
+                }
                 conn.unlock();
                 if (!gone) {
                     _ = conn.ep.stats.served_inline.fetchAdd(1, .monotonic);

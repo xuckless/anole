@@ -284,6 +284,8 @@ const Fixture = struct {
         successor: bool = false,
         early_data: bool = false,
         prefer_v2: bool = true,
+        /// `Options.send_budget`, when set.
+        send_budget: ?usize = null,
     };
 
     fn startWith(gpa: std.mem.Allocator, io: std.Io, config: dusty.ServerConfig, extra: Extra) !Fixture {
@@ -337,6 +339,7 @@ const Fixture = struct {
             .secret = extra.secret,
             .early_data = extra.early_data,
             .prefer_v2 = extra.prefer_v2,
+            .send_budget = extra.send_budget orelse @import("server.zig").conn_budget,
         });
         errdefer ep.deinit();
         const future = try io.concurrent(runEndpoint, .{ep});
@@ -676,6 +679,59 @@ test "h3 server: a no_wait response far past the ring completes" {
     try std.testing.expect(f.ep.stats.served_inline.load(.monotonic) >= inline_before + 1);
     try std.testing.expectEqual(@as(usize, big_body_len), b.len);
     for (b, 0..) |byte, i| try std.testing.expectEqual(@as(u8, @truncate(i *% 13)), byte);
+}
+
+fn requestsServed(ep: *Endpoint) bool {
+    return ep.stats.requests.load(.monotonic) >= budget_gets;
+}
+const budget_gets = 8;
+const budget_test = 512 * 1024;
+
+test "h3 server: no_wait answers past the connection's budget wait on tasks, so it holds but for one inline body" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{}, .request = .{ .max_body_size = 8 << 20 } }, .{ .send_budget = budget_test });
+    defer f.stop(gpa, io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    const conn = try f.connectVia(gpa, io, relay);
+    defer conn.close();
+    // From now on the client hears nothing from the server, so it
+    // acknowledges none of the answers: what the server queued stays.
+    relay.holdDown();
+    defer relay.releaseDown();
+    var streams: [budget_gets]*client.Stream = undefined;
+    var opened: usize = 0;
+    defer for (streams[0..opened]) |st| st.release();
+    // Eight no_wait GETs of 300 KiB each: 2.4 MiB, against a 512 KiB budget.
+    for (&streams) |*st| {
+        st.* = try request(conn, "GET", "/nw/big", .{});
+        opened += 1;
+    }
+    try wait.waitUntil(io, "the server took all eight requests", f.ep, requestsServed);
+    // Every request started: the inline ones answered whole, the rest on
+    // tasks that wait for room. What the queues hold (blocks of 4 KiB)
+    // stays within the budget plus the one inline body that overshot it,
+    // and some slack for partly filled blocks.
+    f.ep.sampleStats();
+    const live: usize = @intCast(f.ep.stats.blocks_live.load(.monotonic));
+    const bound = (budget_test + big_body_len) / 4000 + 4 * budget_gets;
+    if (live > bound) {
+        std.debug.print("{d} send blocks live, more than {d}\n", .{ live, bound });
+        return error.TestUnexpectedResult;
+    }
+    // Once the client hears the server, it acknowledges, and the waiting
+    // answers go out whole.
+    relay.releaseDown();
+    for (streams) |st| {
+        try st.waitHead();
+        try std.testing.expectEqual(@as(u16, 200), st.status);
+        const b = try st.reader().allocRemaining(gpa, .unlimited);
+        defer gpa.free(b);
+        try std.testing.expectEqual(@as(usize, big_body_len), b.len);
+    }
 }
 
 test "h3 server: a no_wait handler that waits still answers" {

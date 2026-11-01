@@ -71,8 +71,10 @@ breaking changes are listed anyway.
   offers `gzip` and `br` at the same q-value (Safari, `gzip, br`) now gets
   gzip instead of Brotli; zstd still wins a tie, and q-values still decide
   first. Brotli's default quality for responses is 4 (was 5;
-  `response.brotli_quality` and `res.brotli_quality` still set it), zstd
-  runs at level 1 (was 3) and zlib-ng's gzip at level 2 (was 6).
+  `response.brotli_quality` and `res.brotli_quality` still set it; a body
+  of 1 MiB or more keeps its 512 KiB hash table rather than a 4 MiB one,
+  which the 64 KiB window could not use), zstd runs at level 1 (was 3) and
+  zlib-ng's gzip at level 2 (was 6).
 - Buffered gzip responses go through libdeflate at level 1, a new bundled
   dependency (MIT) behind `-Dlibdeflate`, on in the `web` and `full`
   profiles; zlib-ng still gzips streamed bodies and bodies over 1 MiB, and
@@ -123,14 +125,15 @@ breaking changes are listed anyway.
   included (was 128 KiB), and a new one starts with that node; the response queue (32 KiB - 64) and body writer
   (16 KiB) come from malloc's slabs instead of the arena, so a streamed
   response maps no memory on musl (#99).
-- `block_cache` keeps one free list per size class (64, 128 and 256 KiB,
-  1 and 2 MiB) with an O(1) take and give, serves everything past
-  malloc's slabs (32 KiB), and is trimmed per class. A block maps one page
-  past its class, where `alloc` keeps its header, so a power-of-two
-  allocation (Brotli's 256 KiB hash tables) fits its own class. A thread
-  keeps up to 8 MiB (was 4 MiB), of which the 64 KiB class may hold 128
-  blocks (one HTTP/2 burst of bodies of unknown length) and the others 2
-  MiB each (#99).
+- `block_cache` keeps one free list per size class (64, 128, 256 and 512
+  KiB, 1 and 2 MiB) with an O(1) take and give, serves everything past
+  malloc's slabs (32 KiB), and is trimmed per class, keeping two blocks of
+  each class up to 512 KiB. A block maps one page past its class, where
+  `alloc` keeps its header, so a power-of-two allocation (Brotli's 512 KiB
+  hash table at quality 4) fits its own class. A thread keeps up to 12 MiB
+  (was 4 MiB), of which the 64 KiB class may hold 128 blocks (one HTTP/2
+  burst of bodies of unknown length), the others 2 MiB each, so a full
+  64 KiB class leaves 4 MiB for the compressors (#99).
 - HTTP/2: a handler waiting for its request body waits on its stream's own
   signal, and only the writer waits on the connection's: a DATA frame or
   the body's end wakes only its stream's handler, and the writer is kicked
@@ -183,7 +186,9 @@ breaking changes are listed anyway.
   counts only what is not yet sent: what is in flight (which the congestion
   window bounds) plus 64 KiB unsent, at most 3 MiB, within the connection's
   unchanged 4 MiB. A client that stops reading still leaves up to about
-  100 KiB queued (what the stack already took, plus 64 KiB).
+  100 KiB queued (what the stack already took, plus 64 KiB). Inline
+  `no_wait` answers, whose writes pass the budget, go to tasks once it is
+  full, so it holds but for one inline body.
   The HTTP/3 client's request bodies had the same 64 KiB ceiling and now
   follow the path the same way when `RequestOptions.send_buffer` is null.
   Message streams (extended CONNECT, and every gRPC, gRPC-Web and Connect

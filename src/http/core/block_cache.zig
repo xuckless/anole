@@ -3,7 +3,8 @@
 // See LICENSE.dusty and THIRD_PARTY_NOTICES. Anole's.
 
 //! Memory for compressors whose state is too large for the request's arena:
-//! Brotli's encoder (about 25 allocations: hash tables of up to 256 KiB,
+//! Brotli's encoder (about 25 allocations: a 512 KiB hash table at the
+//! default quality 4, two of 256 KiB at quality 5,
 //! buffers sized to the body, 100 KiB for 8 KiB, small ones), and the
 //! per-executor buffered-body encoders (`encoders`: zlib-ng's deflate state,
 //! one block of 140 KiB and more, zstd's context, libdeflate's compressor
@@ -16,8 +17,8 @@
 //! until that adapts, and each page then faults in again.
 //!
 //! So allocations past what malloc serves from its slabs (`malloc_max`)
-//! come from a per-thread cache of blocks in a few size classes (64, 128
-//! and 256 KiB, 1 and 2 MiB), one free list each, which keeps their pages
+//! come from a per-thread cache of blocks in a few size classes (64, 128,
+//! 256 and 512 KiB, 1 and 2 MiB), one free list each, which keeps their pages
 //! mapped from one response to the next: under zio a thread is an executor,
 //! and a buffered body is compressed without yielding, so one set of blocks
 //! serves every buffered response an executor compresses. Smaller
@@ -32,7 +33,8 @@
 //! header in front: a 64 KiB queue is a 64 KiB block. `alloc` and `free`
 //! (malloc's contract, for the compressors) need a 16-byte header in front
 //! of what they hand out, and the compressors' large allocations are powers
-//! of two (Brotli's two 256 KiB hash tables at quality 5): a header inside
+//! of two (Brotli's 512 KiB hash table at quality 4, two of 256 KiB at
+//! quality 5): a header inside
 //! the class would push each into the next class up. So every block is
 //! mapped one page longer than its class, and `alloc` puts its header at
 //! the end of that first page and hands out the class from the page after
@@ -46,17 +48,13 @@
 const std = @import("std");
 
 /// The block sizes the cache holds, smallest first.
-pub const classes = [_]usize{ 64 * 1024, 128 * 1024, 256 * 1024, 1024 * 1024, 2 * 1024 * 1024 };
+pub const classes = [_]usize{ 64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024, 2 * 1024 * 1024 };
 /// The largest allocation (header included) `alloc` leaves to malloc:
 /// Zig's malloc (SmpAllocator, musl's and glibc's replacement in Zig
 /// builds) serves up to 32 KiB, its own 16-byte header included, from its
 /// slabs and maps anything larger; the rest is headroom for other mallocs'
 /// headers.
 pub const malloc_max = 32 * 1024 - 64;
-/// Most bytes one thread's cache holds; blocks given back past it are
-/// unmapped. Reached only right after that much was in use at once on the
-/// executor, and trimmed within two trim intervals.
-pub const max_cached = 8 * 1024 * 1024;
 /// Most bytes a class holds, so one size cannot crowd out the others: the
 /// 64 KiB class (an HTTP/2 body of unknown length, one per stream) holds a
 /// burst of 128 streams, a connection's most spare streams; the others 2
@@ -64,13 +62,19 @@ pub const max_cached = 8 * 1024 * 1024;
 pub fn classMax(index: usize) usize {
     return if (index == 0) 128 * classes[0] else 2 * 1024 * 1024;
 }
-/// Blocks of each class up to 256 KiB a trim keeps however long they sat
-/// unused: one buffered encoder's large blocks (Brotli's two hash tables).
-/// The 1 and 2 MiB classes (raised HTTP/2 body windows) keep none.
+/// Most bytes one thread's cache holds; blocks given back past it are
+/// unmapped. A full 64 KiB class leaves 4 MiB for the others (the
+/// compressors' blocks). Reached only right after that much was in use at
+/// once on the executor, and trimmed within two trim intervals.
+pub const max_cached = classMax(0) + 4 * 1024 * 1024;
+/// Blocks of each class up to 512 KiB a trim keeps however long they sat
+/// unused: one buffered encoder's large blocks (Brotli's hash table, 512
+/// KiB at quality 4; zlib-ng's deflate state, about 340 KiB). The 1 and 2
+/// MiB classes (raised HTTP/2 body windows) keep none.
 pub const trim_keep = 2;
 
 fn keepOf(index: usize) usize {
-    return if (classes[index] <= 256 * 1024) trim_keep else 0;
+    return if (classes[index] <= 512 * 1024) trim_keep else 0;
 }
 
 /// In front of every allocation, keeping malloc's 16-byte alignment.
@@ -102,6 +106,9 @@ const Cache = struct {
 };
 
 threadlocal var cache: Cache = .{};
+/// Tests only: allocations on this thread past the largest class (mapped
+/// and unmapped for themselves).
+pub threadlocal var unclassed_for_test: usize = 0;
 
 const page_allocator = std.heap.page_allocator;
 const page_align: std.mem.Alignment = .fromByteUnits(std.heap.page_size_min);
@@ -186,6 +193,7 @@ pub fn alloc(size: usize) ?*anyopaque {
     else blk: {
         // Past the largest class: mapped for this allocation alone, its
         // length (never a class's) in the header.
+        if (@import("builtin").is_test) unclassed_for_test += 1;
         const need = std.mem.alignForward(usize, size, page);
         const fresh = page_allocator.rawAlloc(mapLen(need), page_align, @returnAddress()) orelse return null;
         // SAFETY: mapped at page alignment, past 16.
@@ -337,9 +345,11 @@ test "block_cache: each class keeps its own blocks, and take hands out a class w
     try std.testing.expectEqual(@as(usize, 1), cachedIn(0));
     // Past the largest class: mapped and unmapped, never cached.
     const before = cached();
+    const unclassed = unclassed_for_test;
     const huge = alloc(3 * 1024 * 1024).?;
     free(huge);
     try std.testing.expectEqual(before.count, cached().count);
+    try std.testing.expectEqual(unclassed + 1, unclassed_for_test);
 }
 
 test "block_cache: a class holds at most classMax, the cache max_cached" {
@@ -350,19 +360,30 @@ test "block_cache: a class holds at most classMax, the cache max_cached" {
     for (blocks) |b| give(b);
     try std.testing.expectEqual(@as(usize, 40), cachedIn(0));
     // A class stops at its cap.
+    const mib = classIndex(1024 * 1024).?;
     var bigs: [3][]align(16) u8 = undefined;
     for (&bigs) |*b| b.* = take(1024 * 1024).?;
     for (bigs) |b| give(b);
-    try std.testing.expectEqual(classMax(3) / (1024 * 1024), cachedIn(3));
+    try std.testing.expectEqual(classMax(mib) / (1024 * 1024), cachedIn(mib));
     // A 2 MiB block still fits the total (2.5 + 2 + 2 MiB); the next one
-    // stops at the class cap, and a 256 KiB block past 8 MiB at the total.
+    // stops at the class cap.
     const twos: [2][]align(16) u8 = .{ take(2 * 1024 * 1024).?, take(2 * 1024 * 1024).? };
     for (twos) |b| give(b);
-    try std.testing.expectEqual(@as(usize, 1), cachedIn(4));
+    try std.testing.expectEqual(@as(usize, 1), cachedIn(classIndex(2 * 1024 * 1024).?));
+    // 256 and 512 KiB blocks up to their caps (8.5, then 10.5 MiB) ...
     var quarters: [8][]align(16) u8 = undefined;
     for (&quarters) |*b| b.* = take(256 * 1024).?;
     for (quarters) |b| give(b);
-    try std.testing.expectEqual(@as(usize, 6), cachedIn(2));
+    try std.testing.expectEqual(@as(usize, 8), cachedIn(2));
+    var halves: [5][]align(16) u8 = undefined;
+    for (&halves) |*b| b.* = take(512 * 1024).?;
+    for (halves) |b| give(b);
+    try std.testing.expectEqual(@as(usize, 4), cachedIn(3));
+    // ... and 128 KiB blocks till the total stops them (12 of 16).
+    var eighths: [16][]align(16) u8 = undefined;
+    for (&eighths) |*b| b.* = take(128 * 1024).?;
+    for (eighths) |b| give(b);
+    try std.testing.expectEqual(@as(usize, 12), cachedIn(1));
     try std.testing.expectEqual(max_cached, cached().bytes);
 }
 
@@ -373,6 +394,11 @@ test "block_cache: a burst of 128 bodies of 64 KiB comes back to the cache whole
     for (&blocks) |*b| b.* = take(64 * 1024).?;
     for (blocks) |b| give(b);
     try std.testing.expectEqual(@as(usize, 128), cachedIn(0));
+    // A full 64 KiB class leaves room for the compressors' blocks.
+    give(take(256 * 1024).?);
+    give(take(512 * 1024).?);
+    try std.testing.expectEqual(@as(usize, 1), cachedIn(2));
+    try std.testing.expectEqual(@as(usize, 1), cachedIn(3));
 }
 
 test "block_cache: alloc picks the class by the caller's size, so a power of two fits its class" {
@@ -387,6 +413,12 @@ test "block_cache: alloc picks the class by the caller's size, so a power of two
     free(b);
     try std.testing.expectEqual(@as(usize, 2), cachedIn(2));
     try std.testing.expectEqual(@as(usize, 0), cachedIn(3));
+    // Its table at quality 4 is 512 KiB: the 512 KiB class, not 1 MiB.
+    const q4 = alloc(512 * 1024).?;
+    @memset(@as([*]u8, @ptrCast(q4))[0 .. 512 * 1024], 0x44);
+    free(q4);
+    try std.testing.expectEqual(@as(usize, 1), cachedIn(3));
+    try std.testing.expectEqual(@as(usize, 0), cachedIn(4));
     // 64 KiB exactly is the 64 KiB class.
     const c = alloc(64 * 1024).?;
     free(c);
@@ -403,13 +435,15 @@ test "block_cache: a trim unmaps per class what sat unused, past trim_keep" {
     var small: [5][]align(16) u8 = undefined;
     for (&small) |*b| b.* = take(64 * 1024).?;
     for (small) |b| give(b);
+    give(take(512 * 1024).?);
     give(take(1024 * 1024).?);
     trimLocal(); // ends the interval in which they were taken
     // One 64 KiB block taken and given back in the next interval: four
-    // sat unused all along, of which `trim_keep` stay. The 1 MiB class
-    // keeps none.
+    // sat unused all along, of which `trim_keep` stay. The 512 KiB class
+    // keeps its block too, the 1 MiB class none.
     give(take(64 * 1024).?);
     trimLocal();
     try std.testing.expectEqual(@as(usize, 1 + trim_keep), cachedIn(0));
-    try std.testing.expectEqual(@as(usize, 0), cachedIn(3));
+    try std.testing.expectEqual(@as(usize, 1), cachedIn(classIndex(512 * 1024).?));
+    try std.testing.expectEqual(@as(usize, 0), cachedIn(classIndex(1024 * 1024).?));
 }
