@@ -3340,6 +3340,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
         };
 
+        /// Tests only: how often a response body's buffered bytes were
+        /// handed to a stream (`StreamSink`'s drains and flushes), so a test
+        /// can tell the body buffer's size from the hand-offs a body took.
+        pub var test_sink_handoffs: std.atomic.Value(usize) = .init(0);
+
         /// The response side of a stream, for `Response.initSink`.
         const StreamSink = struct {
             stream: *Stream,
@@ -3414,10 +3419,17 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             fn body(ptr: *anyopaque) *std.Io.Writer {
                 const self = fromPtr(ptr);
-                if (self.writer.buffer.len == 0) {
+                // Sized once the head is recorded, as it names the length.
+                // Before that the writer only goes to `Response.sendHeader`
+                // (which a sink's head ignores), or takes a whole body in
+                // memory, which needs no buffer.
+                if (self.writer.buffer.len == 0 and self.stream.response_nv.len != 0) {
                     // A known length needs no more; at least a little, so
                     // that a body written in pieces is not sent in pieces.
-                    const size = if (self.stream.length_hint) |n| std.math.clamp(n, 256, 4096) else 4096;
+                    // Up to 16 KiB for a known length (a file read into it
+                    // takes a quarter of the reads 4 KiB would); 4 KiB for
+                    // a stream of unknown length.
+                    const size = if (self.stream.length_hint) |n| std.math.clamp(n, 256, known_length_max) else 4096;
                     self.writer.buffer = self.stream.arena.allocator().alloc(u8, size) catch &.{};
                 }
                 return &self.writer;
@@ -3440,8 +3452,13 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.kick();
             }
 
+            /// The most `body` takes from the stream's arena for a body
+            /// of known length.
+            const known_length_max = 16 * 1024;
+
             fn flushFn(w: *std.Io.Writer) std.Io.Writer.Error!void {
                 const self: *StreamSink = @alignCast(@fieldParentPtr("writer", w));
+                if (builtin.is_test) _ = test_sink_handoffs.fetchAdd(1, .monotonic);
                 try self.put(w.buffered());
                 w.end = 0;
                 const conn = self.stream.conn;
@@ -3456,6 +3473,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
                 const self: *StreamSink = @alignCast(@fieldParentPtr("writer", w));
+                if (builtin.is_test) _ = test_sink_handoffs.fetchAdd(1, .monotonic);
                 try self.put(w.buffered());
                 w.end = 0;
                 var n: usize = 0;

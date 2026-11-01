@@ -165,6 +165,13 @@ fn sum(req: *dusty.Request, res: *dusty.Response) !void {
 /// Far more than a response ring holds, written at once.
 const big_body_len = 300 * 1024 + 7;
 
+/// GET /file: `file_name` in `file_dir`, which a test sets first.
+var file_dir: std.Io.Dir = undefined;
+const file_name = "body.bin";
+fn fileHandler(_: *dusty.Request, res: *dusty.Response) !void {
+    _ = try res.sendFile(file_dir, file_name, .{});
+}
+
 fn bigBody(_: *dusty.Request, res: *dusty.Response) !void {
     const body = try res.arena.alloc(u8, big_body_len);
     for (body, 0..) |*b, i| b.* = @truncate(i *% 13);
@@ -313,6 +320,7 @@ const Fixture = struct {
         http.router.get("/wait", waitHandler);
         http.router.post("/gated", gated);
         http.router.get("/big-head", bigHead);
+        http.router.get("/file", fileHandler);
         http.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
         http.router.addRouteWith(.post, "/nw/sum", sum, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/big", bigBody, .{ .no_wait = true });
@@ -2132,6 +2140,32 @@ test "h3 server: a response streamed past its send buffer completes and leaves n
             return ep.stats.blocks_live.load(.monotonic) <= 1;
         }
     }.cond);
+}
+
+test "h3 server: a 47 KiB file goes to its stream in 16 KiB pieces, and arrives whole" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var want: [47 * 1024]u8 = undefined;
+    for (&want, 0..) |*b, i| b.* = @truncate(i *% 7);
+    try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = &want });
+    file_dir = tmp.dir;
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    const before = Endpoint.test_sink_handoffs.load(.monotonic);
+    const body = try get(conn, "/file", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualSlices(u8, &want, body);
+    // The file is read into the sink's body buffer, which is handed to the
+    // stream each time it fills, and once at the end: 16 + 16 + 15 KiB
+    // with a 16 KiB buffer (with 4 KiB it was 12).
+    try std.testing.expectEqual(@as(usize, 3), Endpoint.test_sink_handoffs.load(.monotonic) - before);
 }
 
 test "h3 server: a response gets more than 64 KiB ahead of the client's acknowledgements" {
