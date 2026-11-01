@@ -827,8 +827,34 @@ test "HTTP/2: a body window raised before the client acknowledged SETTINGS never
     try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(id).body.items);
 }
 
+/// `h2.test_writer_rounds` as the writer saw it each time it went to wait
+/// (`h2.test_before_writer_wait`): once this reaches the count after a
+/// round, the writer has passed its take after that round, so only a real
+/// kick can wake it from here on.
+var writer_idle_rounds: std.atomic.Value(u32) = .init(0);
+fn noteWriterIdle(_: std.Io) void {
+    writer_idle_rounds.store(h2.test_writer_rounds.load(.monotonic), .release);
+}
+
+/// A PING round on a warm connection, then until the writer has gone back
+/// to its wait after it (`noteWriterIdle` must be the hook). Returns the
+/// writer's rounds by then.
+fn settleWriterAfterPing(io: std.Io, client: *TestClient) !u32 {
+    const before_ping = h2.test_writer_rounds.load(.monotonic);
+    _ = c.nghttp2_submit_ping(client.session, c.NGHTTP2_FLAG_NONE, null);
+    try client.runUntilPingAck();
+    // Counted before its write, so the PING's round is in by now.
+    const rounds = h2.test_writer_rounds.load(.monotonic);
+    try std.testing.expect(rounds > before_ping);
+    try wait.waitAtLeast(io, "the writer went back to its wait after the PING's round", &writer_idle_rounds, rounds);
+    return rounds;
+}
+
 test "HTTP/2: the reader writes the responses of its no_wait requests itself, without waking the writer" {
     const io = std.testing.io;
+    writer_idle_rounds.store(0, .release);
+    h2.test_before_writer_wait = noteWriterIdle;
+    defer h2.test_before_writer_wait = null;
     var fx: Fixture = undefined;
     try fx.start(io);
     defer fx.stop(io);
@@ -842,12 +868,11 @@ test "HTTP/2: the reader writes the responses of its no_wait requests itself, wi
     const warm = try client.request("GET", "/nw/hello", null);
     try client.run();
     try std.testing.expectEqualStrings("hello", client.get(warm).body.items);
-    const before_ping = h2.test_writer_rounds.load(.monotonic);
-    _ = c.nghttp2_submit_ping(client.session, c.NGHTTP2_FLAG_NONE, null);
-    try client.runUntilPingAck();
-    const rounds = h2.test_writer_rounds.load(.monotonic);
-    try std.testing.expect(rounds > before_ping);
-    // Woken once for the PING, before its round: none after.
+    // The batch goes only once the writer is past its take after the
+    // PING's round: sent sooner, it could meet a writer still on its way
+    // there, which would take the batch's responses or defer to the
+    // reader's round and be woken at its end.
+    const rounds = try settleWriterAfterPing(io, &client);
     const wakes = h2.test_writer_wakes.load(.monotonic);
 
     var ids: [8]i32 = undefined;
