@@ -331,8 +331,14 @@ pub fn Engine(comptime Ctx: type) type {
             /// The trim epoch the spares were last trimmed at.
             spare_epoch: u32 = 0,
             /// Streams with a handler still running or a response still
-            /// going out, each counted in the server's in-flight requests.
+            /// going out.
             open_streams: usize = 0,
+            /// The connection holds one count in the server's in-flight
+            /// requests (`busy`) while any stream is open or a finished
+            /// one's last frames are not flushed yet (`releaseBusyIfIdle`):
+            /// two shared atomic writes per burst of streams, not per
+            /// stream (#99).
+            busy_held: bool = false,
             /// Set while the reader runs the session, so a stream whose head
             /// completes can be handed to a task in the connection's group.
             group: ?*std.Io.Group = null,
@@ -368,14 +374,17 @@ pub fn Engine(comptime Ctx: type) type {
             /// cancel cuts off neither: a close with the peer's last frames
             /// unread would be a reset (#135).
             drain_hold: bool = false,
-            /// Streams that are done but whose last frames the writer may
-            /// not have flushed yet. Each keeps its count in the server's
-            /// in-flight requests until the writer has flushed everything it
-            /// took before the stream finished (`settleFinished`): nghttp2
-            /// closes a stream when the writer takes its last frame, before
+            /// Streams that are done but whose last frames may not have
+            /// been flushed yet. They keep the connection's count in the
+            /// server's in-flight requests until a round has flushed
+            /// everything taken up to their finish (`settleFinished`):
+            /// nghttp2 closes a stream when its last frame is taken, before
             /// the write, and a drain that saw the count reach zero there
             /// would cancel the connection with the response still unsent.
             unflushed_finishes: usize = 0,
+            /// Finished streams a round took out of `unflushed_finishes`
+            /// and has not flushed yet (`takeRound` to `settleFinished`).
+            settling: usize = 0,
             /// The writer has ended: a stream that finishes gives its count
             /// back at once.
             writer_gone: bool = false,
@@ -488,7 +497,36 @@ pub fn Engine(comptime Ctx: type) type {
             /// (`takeRound`), once it has flushed them (or failed to: the
             /// connection is gone then).
             fn settleFinished(conn: *Conn, n: usize) void {
-                for (0..n) |_| conn.server.finishRequest();
+                if (n == 0) return;
+                conn.lock();
+                defer conn.unlock();
+                conn.settling -= n;
+                conn.releaseBusyIfIdle();
+            }
+
+            /// A round that took nothing gives its finished streams back to
+            /// the next one. Under the mutex.
+            fn untake(conn: *Conn, n: usize) void {
+                conn.settling -= n;
+                conn.unflushed_finishes += n;
+            }
+
+            /// A stream is open: the connection counts in the server's
+            /// in-flight requests, once. Under the mutex.
+            fn holdBusy(conn: *Conn) void {
+                conn.open_streams += 1;
+                if (conn.busy_held) return;
+                conn.busy_held = true;
+                _ = conn.server.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
+            }
+
+            /// Gives the connection's count back once no stream is open and
+            /// every finished one's frames are flushed (or the writer is
+            /// gone). Under the mutex.
+            fn releaseBusyIfIdle(conn: *Conn) void {
+                if (!conn.busy_held or conn.open_streams != 0 or conn.unflushed_finishes != 0 or conn.settling != 0) return;
+                conn.busy_held = false;
+                conn.server.finishRequest();
             }
 
             /// Takes the session's output for one round, under the mutex,
@@ -522,6 +560,7 @@ pub fn Engine(comptime Ctx: type) type {
                 // last frame in this round.
                 const settled = conn.unflushed_finishes;
                 conn.unflushed_finishes = 0;
+                conn.settling += settled;
                 return settled;
             }
 
@@ -551,8 +590,8 @@ pub fn Engine(comptime Ctx: type) type {
             /// Under the mutex.
             fn writerGone(conn: *Conn) void {
                 conn.writer_gone = true;
-                for (0..conn.unflushed_finishes) |_| conn.server.finishRequest();
                 conn.unflushed_finishes = 0;
+                conn.releaseBusyIfIdle();
             }
 
             /// Wakes the writer. Nothing else waits on its signal: a
@@ -1074,7 +1113,7 @@ pub fn Engine(comptime Ctx: type) type {
                 if (stream.counted) {
                     conn.open_streams -= 1;
                     if (conn.writer_gone) {
-                        conn.server.finishRequest();
+                        conn.releaseBusyIfIdle();
                     } else {
                         conn.unflushed_finishes += 1;
                         conn.kickWriterLocked();
@@ -1460,7 +1499,7 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.kick_missed.store(false, .seq_cst);
                 settled = try conn.takeRound();
                 if (!conn.roundTaken()) {
-                    conn.unflushed_finishes += settled;
+                    conn.untake(settled);
                     return true;
                 }
                 conn.writing = true;
@@ -2939,8 +2978,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// task.
         fn startStream(conn: *Conn, stream: *Stream) void {
             const group = conn.group orelse return;
-            _ = conn.server.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
-            conn.open_streams += 1;
+            conn.holdBusy();
             stream.counted = true;
             if (stream.connect_protocol.len > 0) stream.setTunnelWindow();
             placement.concurrent(group, conn.io, .local, runStream, .{ conn, stream }) catch {
@@ -2965,8 +3003,7 @@ pub fn Engine(comptime Ctx: type) type {
         /// (`runInline`) once the session has taken the read.
         fn queueInline(conn: *Conn, stream: *Stream) void {
             conn.ready.append(conn.allocator, stream) catch return startStream(conn, stream);
-            _ = conn.server.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
-            conn.open_streams += 1;
+            conn.holdBusy();
             stream.counted = true;
             stream.inline_mode = true;
         }

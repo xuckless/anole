@@ -860,6 +860,33 @@ test "HTTP/2: the reader writes the responses of its no_wait requests itself, wi
     try std.testing.expectEqual(wakes, h2.test_writer_wakes.load(.monotonic));
 }
 
+test "HTTP/2: a connection counts once in the server's in-flight requests, however many streams it has open" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    Handlers.held_gate = .unset;
+    const entered = Handlers.held_entered.load(.acquire);
+    var ids: [5]i32 = undefined;
+    for (&ids) |*id| id.* = try client.request("GET", "/held", null);
+    try client.sendPending();
+    try wait.waitAtLeast(io, "every held request is in its handler", &Handlers.held_entered, entered + @as(u32, ids.len));
+    try std.testing.expectEqual(@as(u31, 1), fx.server.busy.load(.acquire).count);
+    Handlers.held_gate.set(io);
+    try client.run();
+    for (ids) |id| try std.testing.expectEqualStrings("held but whole", client.get(id).body.items);
+    // Given back once the last response is flushed.
+    try wait.waitUntil(io, "the connection's count went back", &fx.server, struct {
+        fn idle(server: *dusty.Server(void)) bool {
+            return server.busy.load(.acquire).count == 0;
+        }
+    }.idle);
+}
+
 test "HTTP/2: a no_wait handler that waits anyway still answers, holding up its connection" {
     const io = std.testing.io;
     var fx: Fixture = undefined;

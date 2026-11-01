@@ -64,6 +64,11 @@ breaking changes are listed anyway.
   HTTP/3, WebSocket, WebTransport) keep each executor's counts on a cache
   line of their own, so executors opening and closing streams at once no
   longer write the same lines (#51, #99).
+- HTTP/2: a connection counts once in the server's in-flight requests
+  while any of its streams is open or a finished one's last frames are not
+  flushed yet, instead of once per stream: two writes to that shared
+  counter per burst of streams rather than two per stream. The drain still
+  waits for every stream (#99).
 
 ## 0.4.2 (2026-10-31)
 
