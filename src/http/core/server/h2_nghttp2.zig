@@ -83,6 +83,11 @@ pub var test_before_writer_wait: if (@import("builtin").is_test) ?*const fn (std
 pub var test_writer_rounds: if (@import("builtin").is_test) std.atomic.Value(u32) else void =
     if (@import("builtin").is_test) .init(0) else {};
 
+/// Tests only: when set, the reader's inline write (`writeInline`) fails
+/// as a write that timed out would, with its round taken and unwritten.
+pub var test_inline_write_fails: if (@import("builtin").is_test) std.atomic.Value(bool) else void =
+    if (@import("builtin").is_test) .init(false) else {};
+
 /// Tests only: streams whose handler asked for a body writer
 /// (`StreamSink.body`), the streaming path; a response sent whole never
 /// does.
@@ -360,8 +365,10 @@ pub fn Engine(comptime Ctx: type) type {
             /// The reader is done; the writer sends what is left and exits.
             closing: bool = false,
             /// The session is over and the writer has shut the send side
-            /// (`shutSend`): what the peer still sends is not for the
-            /// session, only for the lingering close to throw away.
+            /// (`shutSend`), or the reader's inline write failed
+            /// (`inlineWriteFailed`): what the peer still sends is not for
+            /// the session, only for the lingering close to throw away, and
+            /// the writer writes nothing more.
             send_shut: bool = false,
             /// A GOAWAY went out because the server is draining.
             goaway_sent: bool = false,
@@ -1505,11 +1512,30 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.writing = true;
             }
             defer conn.settleFinished(settled);
-            conn.flushRound() catch |err| {
-                _ = endInlineWrite(conn);
+            const flushed = if (comptime @import("builtin").is_test)
+                (if (test_inline_write_fails.load(.acquire)) error.WriteTimeout else conn.flushRound())
+            else
+                conn.flushRound();
+            flushed catch |err| {
+                inlineWriteFailed(conn);
                 return err;
             };
             return endInlineWrite(conn);
+        }
+
+        /// The reader's inline write failed: as when the writer's own write
+        /// fails (`writerLoop`), both directions are shut, and the writer
+        /// exits without writing again. A second write of the same round
+        /// would hold the connection for another `timeout.write`, and a
+        /// round half written already would go out twice (a TLS record cut
+        /// in the middle). The reader's caller kicks the writer.
+        fn inlineWriteFailed(conn: *Conn) void {
+            conn.connection.stream.shutdown(conn.io, .both) catch {};
+            conn.lock();
+            defer conn.unlock();
+            conn.writing = false;
+            conn.writer_deferred = false;
+            conn.send_shut = true;
         }
 
         /// The reader's round is written: the writer may take output
@@ -1567,6 +1593,9 @@ pub fn Engine(comptime Ctx: type) type {
                 {
                     conn.lock();
                     defer conn.unlock();
+                    // The reader's inline write failed: nothing more goes
+                    // out (`inlineWriteFailed`).
+                    if (conn.send_shut) return;
                     closing = conn.closing;
                     if (conn.writing) {
                         // The reader is writing its round (`writeInline`).

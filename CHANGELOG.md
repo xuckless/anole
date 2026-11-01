@@ -48,7 +48,9 @@ breaking changes are listed anyway.
   reader, the reader writes their responses itself, in one write, instead
   of waking the writer task for them (the writer still takes output when it
   is writing, or when something is left over); kicks during that round no
-  longer wake the writer, nor does a stream closing while output is taken
+  longer wake the writer, nor does a stream closing while output is taken.
+  A failed inline write ends the connection as a failed write of the writer
+  does: both directions shut, and the round is never written a second time
   (#99).
 - HTTP/2: a connection's streams are kept in std's array hash map (a
   dense array, backward-shift deletion, no tombstones) with room for the

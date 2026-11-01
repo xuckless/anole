@@ -885,6 +885,38 @@ test "HTTP/2: the reader writes the responses of its no_wait requests itself, wi
     try std.testing.expectEqual(wakes, h2.test_writer_wakes.load(.monotonic));
 }
 
+test "HTTP/2: a reader whose inline write fails ends the connection, and the writer writes nothing more" {
+    // As when the writer's own write fails: both directions shut, and the
+    // round the reader took is not written again by the writer (a second
+    // write would hold the connection for another write timeout, and a
+    // round half written would go out twice).
+    const io = std.testing.io;
+    writer_idle_rounds.store(0, .release);
+    h2.test_before_writer_wait = noteWriterIdle;
+    defer h2.test_before_writer_wait = null;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const warm = try client.request("GET", "/nw/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(warm).body.items);
+    // The writer is asleep, so the next request's response is the
+    // reader's round alone.
+    const rounds = try settleWriterAfterPing(io, &client);
+
+    h2.test_inline_write_fails.store(true, .release);
+    defer h2.test_inline_write_fails.store(false, .release);
+    const id = try client.request("GET", "/nw/hello", null);
+    try client.runUntilClosed();
+    // The response the failed write held never went out.
+    try std.testing.expectEqual(@as(u16, 0), client.get(id).status);
+    try std.testing.expectEqual(rounds, h2.test_writer_rounds.load(.monotonic));
+}
+
 test "HTTP/2: a connection counts once in the server's in-flight requests, however many streams it has open" {
     const io = std.testing.io;
     var fx: Fixture = undefined;
