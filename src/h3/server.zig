@@ -2501,6 +2501,12 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// The response's Content-Length, when the head named one:
             /// sizes the body buffer.
             length_hint: ?usize = null,
+            /// The response body's buffer (`StreamSink.body`), taken from
+            /// the endpoint's allocator the first time the stream needs one
+            /// and kept while it is pooled: in the arena, a 16 KiB buffer
+            /// grew it past `arena_keep` into a node too big for malloc's
+            /// slabs, an mmap and munmap per request.
+            sink_buf: []u8 = &.{},
 
             /// The most a stream's arena keeps when it goes back to the pool:
             /// a typical request's head and response, so the reset at close
@@ -2513,7 +2519,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (ep.takeStream()) |s| {
                     const arena = s.arena;
                     const first = s.out.first;
-                    s.* = .{ .conn = conn, .id = id, .arena = arena };
+                    const sink_buf = s.sink_buf;
+                    s.* = .{ .conn = conn, .id = id, .arena = arena, .sink_buf = sink_buf };
                     s.out.first = first;
                     return s;
                 }
@@ -2542,6 +2549,7 @@ pub fn Endpoint(comptime Ctx: type) type {
 
             fn destroy(s: *Stream, gpa: std.mem.Allocator, blocks: *bridge.BlockPool) void {
                 s.out.releaseFirst(blocks);
+                gpa.free(s.sink_buf);
                 s.arena.deinit();
                 gpa.destroy(s);
             }
@@ -3439,8 +3447,10 @@ pub fn Endpoint(comptime Ctx: type) type {
                     // Up to 16 KiB for a known length (a file read into it
                     // takes a quarter of the reads 4 KiB would); 4 KiB for
                     // a stream of unknown length.
-                    const size = if (self.stream.length_hint) |n| std.math.clamp(n, 256, known_length_max) else 4096;
-                    self.writer.buffer = self.stream.arena.allocator().alloc(u8, size) catch &.{};
+                    const s = self.stream;
+                    const size = if (s.length_hint) |n| std.math.clamp(n, 256, known_length_max) else 4096;
+                    if (s.sink_buf.len == 0) s.sink_buf = s.conn.ep.gpa.alloc(u8, known_length_max) catch &.{};
+                    if (s.sink_buf.len != 0) self.writer.buffer = s.sink_buf[0..size];
                 }
                 return &self.writer;
             }
@@ -3462,8 +3472,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.kick();
             }
 
-            /// The most `body` takes from the stream's arena for a body
-            /// of known length.
+            /// The size of a stream's body buffer (`Stream.sink_buf`): the
+            /// most a body of known length gets of it.
             const known_length_max = 16 * 1024;
 
             fn flushFn(w: *std.Io.Writer) std.Io.Writer.Error!void {

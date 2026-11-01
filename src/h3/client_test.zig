@@ -323,6 +323,7 @@ const Fixture = struct {
         http.router.post("/gated", gated);
         http.router.get("/big-head", bigHead);
         http.router.get("/file", fileHandler);
+        http.router.get("/file-busy", fileBusyHandler);
         http.router.addRouteWith(.get, "/nw/hello", hello, .{ .no_wait = true });
         http.router.addRouteWith(.post, "/nw/sum", sum, .{ .no_wait = true });
         http.router.addRouteWith(.get, "/nw/big", bigBody, .{ .no_wait = true });
@@ -2222,6 +2223,89 @@ test "h3 server: a 47 KiB file goes to its stream in 16 KiB pieces, and arrives 
     // stream each time it fills, and once at the end: 16 + 16 + 15 KiB
     // with a 16 KiB buffer (with 4 KiB it was 12).
     try std.testing.expectEqual(@as(usize, 3), Endpoint.test_sink_handoffs.load(.monotonic) - before);
+}
+
+/// GET /file-busy: `fileHandler` after 12 KiB of other work in the
+/// request's arena, as a static handler's path and header work would be.
+fn fileBusyHandler(req: *dusty.Request, res: *dusty.Response) !void {
+    @memset(try res.arena.alloc(u8, 12 * 1024), 'w');
+    return fileHandler(req, res);
+}
+
+/// Counts what an allocator is asked for past the largest slab of Zig's
+/// SmpAllocator (32 KiB): each such block is an mmap of its own.
+const PastSlabs = struct {
+    child: std.mem.Allocator,
+    count: std.atomic.Value(usize) = .init(0),
+
+    const slab_max = 32 * 1024;
+
+    fn allocator(self: *PastSlabs) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn note(self: *PastSlabs, len: usize) void {
+        if (len > slab_max) _ = self.count.fetchAdd(1, .monotonic);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PastSlabs = @ptrCast(@alignCast(ctx));
+        self.note(len);
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *PastSlabs = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) self.note(new_len);
+        return self.child.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *PastSlabs = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) self.note(new_len);
+        return self.child.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *PastSlabs = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ra);
+    }
+};
+
+test "h3 server: files of known length on pooled streams take nothing past malloc's slabs" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var want: [47 * 1024]u8 = undefined;
+    for (&want, 0..) |*b, i| b.* = @truncate(i *% 11);
+    file_dir = tmp.dir;
+    // The server's allocator only.
+    var counting: PastSlabs = .{ .child = gpa };
+    var f = try Fixture.start(counting.allocator(), io);
+    defer f.stop(counting.allocator(), io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    gpa.free(try get(conn, "/hello", gpa));
+    try wait.waitUntil(io, "the stream is back in the pool", f.ep, noServerStreams);
+
+    // An 8 KiB and a 47 KiB file, in turn, each request on the stream the
+    // last one gave back to the pool. The body buffer (16 KiB for the
+    // larger) is the stream's own: in the stream's arena, after the
+    // handler's own 12 KiB, it took a node past malloc's largest slab (an
+    // mmap, and a munmap when the stream went back to the pool).
+    const before = counting.count.load(.monotonic);
+    for (0..6) |i| {
+        const len: usize = if (i % 2 == 0) 8 * 1024 else want.len;
+        try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = want[0..len] });
+        const body = try get(conn, "/file-busy", gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualSlices(u8, want[0..len], body);
+        try wait.waitUntil(io, "the stream is back in the pool", f.ep, noServerStreams);
+    }
+    try std.testing.expectEqual(@as(usize, 0), counting.count.load(.monotonic) - before);
 }
 
 test "h3 server: a response gets more than 64 KiB ahead of the client's acknowledgements" {

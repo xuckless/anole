@@ -1606,9 +1606,12 @@ pub const Stream = struct {
             .send_closed = !has_body,
         };
         errdefer self.arena.deinit();
-        const a = self.arena.allocator();
-        self.body_reader.buffer = try a.alloc(u8, 16 * 1024);
-        if (has_body) self.out_writer.buffer = try a.alloc(u8, 16 * 1024);
+        // From the allocator, not the arena: two 16 KiB buffers would grow
+        // the arena a node too big for malloc's slabs (an mmap and munmap
+        // per request); each on its own is a slab allocation.
+        self.body_reader.buffer = try conn.gpa.alloc(u8, 16 * 1024);
+        errdefer conn.gpa.free(self.body_reader.buffer);
+        if (has_body) self.out_writer.buffer = try conn.gpa.alloc(u8, 16 * 1024);
         conn.lock();
         conn.live.append(&self.node);
         conn.updateKeepAlive();
@@ -1630,6 +1633,8 @@ pub const Stream = struct {
         const gpa = self.conn.gpa;
         self.body.deinit(gpa);
         self.out.deinit(&self.conn.blocks, &self.conn.budget);
+        gpa.free(self.body_reader.buffer);
+        gpa.free(self.out_writer.buffer);
         self.arena.deinit();
         gpa.destroy(self);
     }
