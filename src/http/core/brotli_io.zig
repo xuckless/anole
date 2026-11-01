@@ -243,13 +243,15 @@ test "brotli_io: an encoder's large blocks are reused by the next, and trimmed w
     const input = text.written();
     // Other tests on this thread may have left blocks (up to `max_cached`).
     block_cache.drainLocalForTest();
+    // Quality 5 throughout, whose hash tables are the 256 KiB blocks the
+    // class checks below count (the default is 4 since #101).
 
     var after_first: usize = 0;
     for (0..3) |round| {
         var encoded: std.Io.Writer.Allocating = try .initCapacity(gpa, 1024);
         defer encoded.deinit();
         var z: Compress = undefined;
-        try z.init(&encoded.writer, &.{}, .{ .lgwin = windowFor(input.len), .size_hint = input.len });
+        try z.init(&encoded.writer, &.{}, .{ .quality = 5, .lgwin = windowFor(input.len), .size_hint = input.len });
         try z.writer.writeAll(input);
         try z.finish();
         z.deinit();
@@ -271,7 +273,7 @@ test "brotli_io: an encoder's large blocks are reused by the next, and trimmed w
     var outs: [2]std.Io.Writer.Allocating = .{ try .initCapacity(gpa, 256), try .initCapacity(gpa, 256) };
     defer for (&outs) |*o| o.deinit();
     var zs: [2]Compress = undefined;
-    for (&zs, &outs) |*z, *o| try z.init(&o.writer, &.{}, .{});
+    for (&zs, &outs) |*z, *o| try z.init(&o.writer, &.{}, .{ .quality = 5 });
     for (&zs) |*z| try z.writer.writeAll(input);
     // Both finish (and hold their blocks) before either gives them back.
     for (&zs) |*z| try z.finish();
