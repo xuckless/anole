@@ -60,6 +60,10 @@ breaking changes are listed anyway.
   encoded behind room kept for its 5-byte frame prefix, so the body is
   never copied. `Call.addHeader` in a unary call now works until the call
   ends (#99).
+- The per-executor connection and stream gauges (HTTP/1.x, HTTP/2,
+  HTTP/3, WebSocket, WebTransport) keep each executor's counts on a cache
+  line of their own, so executors opening and closing streams at once no
+  longer write the same lines (#51, #99).
 
 ## 0.4.2 (2026-10-31)
 
