@@ -306,7 +306,13 @@ pub fn Engine(comptime Ctx: type) type {
             /// Held only for computation, never across I/O.
             mutex: std.Io.Mutex = .init,
             session: ?*c.nghttp2_session = null,
-            streams: std.AutoHashMapUnmanaged(i32, *Stream) = .empty,
+            /// The streams with a handler or a protocol side still holding
+            /// them. Std's array hash map: a dense array of entries (a linear
+            /// scan below 16, Robin Hood with backward-shift deletion above,
+            /// no tombstones), walked as `values()`. Removal swaps the last
+            /// entry in, so a walk that may remove goes backwards or starts
+            /// over.
+            streams: std.AutoArrayHashMapUnmanaged(i32, *Stream) = .empty,
             /// Finished streams kept for reuse with their arenas, so a
             /// connection's requests stop allocating once it is warm.
             spare_streams: std.ArrayList(*Stream) = .empty,
@@ -425,9 +431,8 @@ pub fn Engine(comptime Ctx: type) type {
                 // would hold the drain until its deadline: end them now
                 // (`startDiscard` ends the ones that start discarding
                 // during the drain).
-                var it = conn.streams.valueIterator();
-                while (it.next()) |stream| {
-                    if (stream.*.discarding) resetDiscarded(conn, stream.*);
+                for (conn.streams.values()) |stream| {
+                    if (stream.discarding) resetDiscarded(conn, stream);
                 }
                 if (conn.goaway_sent or conn.drain_notice or conn.closing) return;
                 if (c.nghttp2_submit_shutdown_notice(conn.session) != 0) return;
@@ -1059,7 +1064,7 @@ pub fn Engine(comptime Ctx: type) type {
                 stream.out_buf = &.{};
                 conn.allocator.free(stream.writer_buf);
                 stream.writer_buf = &.{};
-                if (conn.streams.remove(stream.id)) gauges.add(conn.io, .h2_streams, -1);
+                if (conn.streams.swapRemove(stream.id)) gauges.add(conn.io, .h2_streams, -1);
                 if (stream.counted) {
                     conn.open_streams -= 1;
                     if (conn.writer_gone) {
@@ -1137,6 +1142,9 @@ pub fn Engine(comptime Ctx: type) type {
             // are both done with it by then.
             defer conn.spill.deinit(conn.allocator);
             try conn.initSession();
+            // As many streams as the spares, so a connection's usual
+            // streams never grow the map.
+            conn.streams.ensureTotalCapacity(conn.allocator, conn.max_spares) catch {};
             server.h2_conns.add(&conn);
             defer {
                 server.h2_conns.remove(&conn);
@@ -1151,9 +1159,14 @@ pub fn Engine(comptime Ctx: type) type {
                 // and release when they have ended their bursts; the stream
                 // stays until then.
                 {
-                    var it = conn.streams.valueIterator();
-                    while (it.next()) |sp| {
-                        const stream = sp.*;
+                    // Backwards: `release(.protocol)` keeps a parked stream
+                    // (its owner still holds it), but a walk that may
+                    // remove must not skip the entry swapped in.
+                    const all = conn.streams.values();
+                    var i = all.len;
+                    while (i > 0) {
+                        i -= 1;
+                        const stream = all[i];
                         const p = stream.parked orelse continue;
                         stream.reset = true;
                         stream.closeBody();
@@ -1166,9 +1179,8 @@ pub fn Engine(comptime Ctx: type) type {
                 // The tasks are joined (the group's cancel runs first), so
                 // each release here is the freeing one.
                 while (true) {
-                    var it = conn.streams.valueIterator();
-                    const stream = while (it.next()) |sp| {
-                        if (sp.*.parked == null) break sp.*;
+                    const stream = for (conn.streams.values()) |sp| {
+                        if (sp.parked == null) break sp;
                     } else break;
                     stream.reset = true;
                     stream.closeBody();
@@ -1243,17 +1255,16 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.lock();
                 defer conn.unlock();
                 conn.closing = true;
-                var it = conn.streams.valueIterator();
                 var gone: std.ArrayList(*Stream) = .empty;
                 defer gone.deinit(conn.allocator);
-                while (it.next()) |stream| {
+                for (conn.streams.values()) |stream| {
                     // A parked response has nobody to send to once the peer
                     // closed its side of the connection.
-                    if (reader_failed or !stream.*.body_done or stream.*.parked != null) {
-                        stream.*.reset = true;
-                        stream.*.closeBody();
-                        stream.*.cancelHandler();
-                        if (stream.*.detached != null or stream.*.parked != null) gone.append(conn.allocator, stream.*) catch {};
+                    if (reader_failed or !stream.body_done or stream.parked != null) {
+                        stream.reset = true;
+                        stream.closeBody();
+                        stream.cancelHandler();
+                        if (stream.detached != null or stream.parked != null) gone.append(conn.allocator, stream) catch {};
                     }
                 }
                 // Detached responses with nobody left to send them to: let
@@ -1478,12 +1489,11 @@ pub fn Engine(comptime Ctx: type) type {
                 conn.lock();
                 defer conn.unlock();
                 conn.writerGone();
-                var it = conn.streams.valueIterator();
-                while (it.next()) |stream| {
-                    stream.*.reset = true;
-                    if (stream.*.out) |*q| q.close(conn.io);
-                    stream.*.wake.notify(conn.io);
-                    stream.*.cancelHandler();
+                for (conn.streams.values()) |stream| {
+                    stream.reset = true;
+                    if (stream.out) |*q| q.close(conn.io);
+                    stream.wake.notify(conn.io);
+                    stream.cancelHandler();
                 }
             }
             runWriter(conn) catch |err| switch (err) {
@@ -1555,9 +1565,8 @@ pub fn Engine(comptime Ctx: type) type {
                 // when one starts), so nothing is coming from it.
                 var handlers_running = false;
                 if (closing) {
-                    var it = conn.streams.valueIterator();
-                    while (it.next()) |stream| {
-                        if (stream.*.counted and !stream.*.handler_done) handlers_running = true;
+                    for (conn.streams.values()) |stream| {
+                        if (stream.counted and !stream.handler_done) handlers_running = true;
                     }
                 }
                 conn.unlock();
@@ -1628,9 +1637,7 @@ pub fn Engine(comptime Ctx: type) type {
             const now = std.Io.Clock.Timestamp.now(conn.io, .awake);
             var next: ?std.Io.Clock.Timestamp = null;
             var reset = false;
-            var it = conn.streams.valueIterator();
-            while (it.next()) |entry| {
-                const stream = entry.*;
+            for (conn.streams.values()) |stream| {
                 if (!stream.send_pending or stream.reset) continue;
                 const deadline = stream.send_deadline orelse blk: {
                     const d = now.addDuration(.{ .raw = limit, .clock = .awake });
@@ -2826,6 +2833,9 @@ pub fn Engine(comptime Ctx: type) type {
             }
 
             const stream = Stream.create(conn, id) catch return c.NGHTTP2_ERR_CALLBACK_FAILURE;
+            // Room for the client's concurrency was made up front (`serve`);
+            // past it (streams still answering after nghttp2 closed them)
+            // the map grows.
             conn.streams.put(conn.allocator, id, stream) catch {
                 stream.destroy(conn.allocator);
                 return c.NGHTTP2_ERR_CALLBACK_FAILURE;

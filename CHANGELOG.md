@@ -50,6 +50,10 @@ breaking changes are listed anyway.
   is writing, or when something is left over); kicks during that round no
   longer wake the writer, nor does a stream closing while output is taken
   (#99).
+- HTTP/2: a connection's streams are kept in std's array hash map (a
+  dense array, backward-shift deletion, no tombstones) with room for the
+  client's concurrency made when the connection starts, instead of a hash
+  map whose removals left tombstones to walk past (#99).
 
 ## 0.4.2 (2026-10-31)
 
