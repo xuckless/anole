@@ -158,6 +158,10 @@ pub const StaticOptions = @import("server/static.zig").StaticOptions;
 pub const Precompressed = @import("server/static.zig").Precompressed;
 pub const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
 
+/// Tests only: the HTTP/2 engine, for its test hooks (`test_before_*`),
+/// which anole's tests on the real zio set (src/http/h2_wake_test.zig).
+pub const h2_engine_for_tests = if (@import("builtin").is_test and @import("build_options").use_http2) @import("server/h2_nghttp2.zig") else struct {};
+
 // Client
 pub const Client = @import("client.zig").Client;
 pub const ClientOptions = @import("client.zig").ClientOptions;

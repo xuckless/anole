@@ -70,6 +70,13 @@ pub var test_before_flush: if (@import("builtin").is_test) ?*const fn (std.Io) s
 pub var test_before_fill: if (@import("builtin").is_test) ?*const fn (std.Io, FillProbe) std.Io.Cancelable!void else void =
     if (@import("builtin").is_test) null else {};
 
+/// Tests only: runs in the writer just before it waits for more output,
+/// with nothing held, so a test on a one-executor runtime knows the writer
+/// is asleep once the hook has run and the writer has yielded
+/// (src/http/h2_wake_test.zig). Nothing outside tests.
+pub var test_before_writer_wait: if (@import("builtin").is_test) ?*const fn (std.Io) void else void =
+    if (@import("builtin").is_test) null else {};
+
 /// Tests only: runs once the reader has seen the peer's side end cleanly
 /// (EOF, e.g. a half-close) and the connection has marked itself closing
 /// and let go of the streams that can no longer finish, before the writer
@@ -1424,7 +1431,9 @@ pub fn Engine(comptime Ctx: type) type {
                 // Responses whose handlers are done but that the peer is
                 // not taking (no window, or not reading) are bounded: past
                 // their deadline the stream is reset and freed.
-                switch (sweepSends(conn)) {
+                const sweep = sweepSends(conn);
+                if (comptime @import("builtin").is_test) if (sweep != .reset) if (test_before_writer_wait) |hook| hook(conn.io);
+                switch (sweep) {
                     .reset => continue,
                     .none => try conn.io.futexWait(u32, &conn.write_gen.raw, gen),
                     .until => |deadline| try conn.io.futexWaitTimeout(u32, &conn.write_gen.raw, gen, .{ .deadline = deadline }),
