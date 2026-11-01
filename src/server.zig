@@ -3445,6 +3445,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.addHelperRoutes();
             if (comptime features.openapi) if (self.extras.openapi_failed) |err| return err;
             if (self.router.conflict != null) return error.RouteConflict;
+            try self.server.prepareStatic();
             self.startConnectors() catch return error.DatabaseUnavailable;
         }
 
@@ -3807,6 +3808,9 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // route that conflicted with another, or that the helper routes
             // collided with.
             if (self.router.conflict != null) return self.failStart(error.RouteConflict);
+            // Before the HTTP/3 endpoint and the core `serve` start as tasks on
+            // other executors: it writes what their requests read.
+            self.server.prepareStatic() catch |err| return self.failStart(errors.toServerError(err));
             self.startConnectors() catch return self.failStart(error.DatabaseUnavailable);
             const rt_io = self.rt.io();
             const Done = union(enum) {

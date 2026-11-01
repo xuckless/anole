@@ -1307,6 +1307,9 @@ pub fn Server(comptime Ctx: type) type {
         /// How file bodies are confined to their directory: `prepareStatic`'s
         /// verdict, copied into every response. The safe tier until it runs.
         beneath: beneath.Tier = .verify,
+        /// Set once `prepareStatic` has finished, so `serve` does not run it
+        /// again after a caller (the App, Lambda) ran it before serving.
+        static_prepared: bool = false,
         _middleware_registry: std.SinglyLinkedList,
         request_buffers: RequestBuffersPool,
         /// The listeners while `run` serves them, for `reloadTls`; empty
@@ -1523,7 +1526,17 @@ pub fn Server(comptime Ctx: type) type {
         /// is read-only afterwards. Fails, with a readable log, when a directory's
         /// real path cannot be read on the real-path tier: `resolve_beneath = false`
         /// is the way out.
+        ///
+        /// It writes `beneath` and each `Static.root_real`, which requests read
+        /// without a lock: a caller that serves other protocols beside this
+        /// `serve` (HTTP/3 on other executors) runs it first, before it starts
+        /// any of them. `serve` then skips it.
         pub fn prepareStatic(self: *Self) !void {
+            try self.prepareStaticInner();
+            self.static_prepared = true;
+        }
+
+        fn prepareStaticInner(self: *Self) !void {
             const statics = self.router.statics.items;
             var first: ?*Static = null;
             for (statics) |s| if (s.options.resolve_beneath) {
@@ -1555,7 +1568,7 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         fn serve(self: *Self) !void {
-            try self.prepareStatic();
+            if (!self.static_prepared) try self.prepareStatic();
             const listeners = self.configuredListeners();
             if (self.config.max_connections) |max| {
                 if (max == 0) {

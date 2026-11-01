@@ -538,3 +538,24 @@ test "sendFile: a request path cannot leave the directory through .. or an absol
         try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 404"));
     }
 }
+
+test "static: serve leaves the tier alone when prepareStatic already ran" {
+    // The App prepares before it starts HTTP/3 beside `serve`; `serve` running
+    // it again would write what other executors read.
+    const beneath = @import("../beneath.zig");
+    beneath.test_force = .verify;
+    defer beneath.test_force = null;
+    var tmp = try testDir();
+    defer tmp.cleanup();
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.static("/", tmp.dir, .{});
+    try server.prepareStatic();
+    try std.testing.expect(server.static_prepared);
+    const root = server.router.statics.items[0].root_real.?;
+    server.beneath = .kernel;
+    var out: [2048]u8 = undefined;
+    _ = try send(&server, "GET /style.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expectEqual(beneath.Tier.kernel, server.beneath);
+    try std.testing.expectEqual(root.ptr, server.router.statics.items[0].root_real.?.ptr);
+}
