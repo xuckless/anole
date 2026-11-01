@@ -280,6 +280,14 @@ vendored it; its licence is src/http/core/llhttp/LICENSE)
   Source:   https://github.com/nodejs/llhttp
   Linked:   always
 
+src/http/core/beneath.zig (the macOS probe in `probeDarwin`)
+  The idea and the errno rule (trust `O_RESOLVE_BENEATH` only when opening
+  `..` with it fails with ENOTCAPABLE) from Bun's `kernel_resolves_beneath`;
+  the code is a few lines of our own, from that reading.
+  Licence:  MIT. Copyright (c) Oven and the Bun contributors
+  Source:   https://github.com/oven-sh/bun, commit 4f7acde,
+            src/sys/beneath.rs
+
 build/boringssl.zig
   Adapted from allyourcodebase/boringssl's build.zig.
   Licence:  Zlib. Copyright (c) Lukas Kastern

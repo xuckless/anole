@@ -162,6 +162,66 @@ test "anole.App: staticDir serves files, health answers /healthz and /readyz, an
     }.check);
 }
 
+/// Whether this Linux kernel, in this sandbox, refuses `..` under an
+/// openat2 `RESOLVE_BENEATH` open of `dir`: the precondition of the kernel
+/// tier (gVisor, kernels before 5.6 and old seccomp profiles lack it).
+fn kernelRefusesDotDot(dir: std.Io.Dir) bool {
+    if (@import("builtin").os.tag != .linux) return false;
+    const L = std.os.linux;
+    const How = extern struct { flags: u64, mode: u64, resolve: u64 };
+    const resolve_beneath = 0x08;
+    var how: How = .{ .flags = @as(u32, @bitCast(L.O{ .PATH = true })), .mode = 0, .resolve = resolve_beneath };
+    const rc = L.syscall4(.openat2, @as(usize, @bitCast(@as(isize, dir.handle))), @intFromPtr(".."), @intFromPtr(&how), @sizeOf(How));
+    if (L.errno(rc) == .SUCCESS) _ = L.close(@intCast(rc));
+    return L.errno(rc) == .XDEV;
+}
+
+test "anole.App: staticDir refuses a symlink out of its directory" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "secret.txt", .data = "secret" });
+    try tmp.dir.createDir(io, "root", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "root/page.txt", .data = "static page" });
+    // Windows: creating a symlink needs SeCreateSymbolicLinkPrivilege
+    // (Developer Mode); GitHub's runners have it.
+    tmp.dir.symLink(io, "../secret.txt", "root/out.txt", .{}) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    // The production kernel tier (zio + openat2) sees an absolute link, a
+    // directory link up and a relative link that stays inside as well.
+    const secret_abs = try tmp.dir.realPathFileAlloc(io, "secret.txt", alloc);
+    defer alloc.free(secret_abs);
+    tmp.dir.symLink(io, secret_abs, "root/abs.txt", .{}) catch return error.SkipZigTest;
+    tmp.dir.symLink(io, "..", "root/up", .{ .is_directory = true }) catch return error.SkipZigTest;
+    tmp.dir.symLink(io, "page.txt", "root/alias.txt", .{}) catch return error.SkipZigTest;
+    tmp.dir.symLink(io, "../secret.txt", "root/index.html", .{}) catch return error.SkipZigTest;
+    const files = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/root", .{tmp.sub_path});
+    defer alloc.free(files);
+
+    var app = try App.init(alloc, .{ .executors = .exact(2) });
+    defer app.deinit();
+    try app.staticDir("/files", files, .{});
+
+    try listenAndCheck(&app, struct {
+        fn check(io_: std.Io, arena: std.mem.Allocator, port: u16) !void {
+            try std.testing.expectEqualStrings("static page", (try get(io_, arena, try urlOf(arena, port, "/files/page.txt"), &.{})).body);
+            try std.testing.expectEqualStrings("static page", (try get(io_, arena, try urlOf(arena, port, "/files/alias.txt"), &.{})).body);
+            for ([_][]const u8{ "/files/out.txt", "/files/abs.txt", "/files/up/secret.txt", "/files/index.html", "/files/" }) |path| {
+                const out = try get(io_, arena, try urlOf(arena, port, path), &.{});
+                try std.testing.expectEqual(http.Status.not_found, out.status);
+                try std.testing.expect(std.mem.find(u8, out.body, "secret") == null);
+            }
+        }
+    }.check);
+
+    // The probe's own verdict, not zio's behaviour: on the production path
+    // (Linux under zio with openat2) a silent fall to the slower verify tier
+    // would show here. Only where the kernel does refuse `..` in a scoped open.
+    if (kernelRefusesDotDot(tmp.dir)) try std.testing.expectEqualStrings("kernel", @tagName(app.server.beneath));
+}
+
 test "anole.App: ws answers a plain GET with 426 and echoes over a WebSocket" {
     if (comptime !features.websocket) return error.SkipZigTest;
     var app = try App.init(alloc, .{ .executors = .exact(2) });

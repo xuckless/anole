@@ -203,6 +203,7 @@ comptime {
     _ = @import("proxy_protocol.zig");
     _ = @import("fuzz.zig");
     _ = @import("request_fuzz_test.zig");
+    _ = @import("beneath.zig");
     _ = @import("server/static.zig");
     _ = @import("server/static_test.zig");
     if (@import("build_options").use_http2) _ = @import("server/h2_test.zig");

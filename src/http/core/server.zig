@@ -13,6 +13,8 @@ const TrustStore = if (has_trust_store) tls.TrustStore else void;
 const build_options = @import("build_options");
 
 const Router = @import("router.zig").Router;
+const beneath = @import("beneath.zig");
+const Static = @import("server/static.zig").Static;
 const Action = @import("router.zig").Action;
 const RequestParser = @import("parser.zig").RequestParser;
 const RequestBodyReader = @import("parser.zig").RequestBodyReader;
@@ -1302,6 +1304,12 @@ pub fn Server(comptime Ctx: type) type {
         /// The index (in `config.listeners`) of the listener that could not
         /// be opened, when that is why `run` stopped.
         start_error_listener: ?usize = null,
+        /// How file bodies are confined to their directory: `prepareStatic`'s
+        /// verdict, copied into every response. The safe tier until it runs.
+        beneath: beneath.Tier = .verify,
+        /// Set once `prepareStatic` has finished, so `serve` does not run it
+        /// again after a caller (the App, Lambda) ran it before serving.
+        static_prepared: bool = false,
         _middleware_registry: std.SinglyLinkedList,
         request_buffers: RequestBuffersPool,
         /// The listeners while `run` serves them, for `reloadTls`; empty
@@ -1511,7 +1519,56 @@ pub fn Server(comptime Ctx: type) type {
             if (self.start_error) |err| return err;
         }
 
+        /// Picks how `resolve_beneath` is enforced (`beneath.probe`, against the
+        /// first static directory that asks for it, else the working directory)
+        /// and, where that is the real-path check, reads the real path of each
+        /// such directory. Run once before any connection is served; the result
+        /// is read-only afterwards. Fails, with a readable log, when a directory's
+        /// real path cannot be read on the real-path tier: `resolve_beneath = false`
+        /// is the way out.
+        ///
+        /// It writes `beneath` and each `Static.root_real`, which requests read
+        /// without a lock: a caller that serves other protocols beside this
+        /// `serve` (HTTP/3 on other executors) runs it first, before it starts
+        /// any of them. `serve` then skips it.
+        pub fn prepareStatic(self: *Self) !void {
+            try self.prepareStaticInner();
+            self.static_prepared = true;
+        }
+
+        fn prepareStaticInner(self: *Self) !void {
+            const statics = self.router.statics.items;
+            var first: ?*Static = null;
+            for (statics) |s| if (s.options.resolve_beneath) {
+                first = s;
+                break;
+            };
+            const verdict = beneath.probe(self.io, if (first) |s| s.dir else std.Io.Dir.cwd());
+            self.beneath = verdict.tier;
+            if (first == null or verdict.tier == .kernel) return;
+
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const arena = self.router.arena.allocator();
+            for (statics) |s| {
+                if (!s.options.resolve_beneath or s.root_real != null) continue;
+                const n = s.dir.realPath(self.io, &buf) catch |err| {
+                    if (err == error.Canceled) return err;
+                    const protection = self.io.swapCancelProtection(.blocked);
+                    defer _ = self.io.swapCancelProtection(protection);
+                    log.err("a static directory's real path cannot be read ({t}), and this system cannot confine opens to it in the kernel ({s}); set `.resolve_beneath = false` in its StaticOptions to serve it without the check", .{ err, verdict.why.text() });
+                    return error.StaticRealPathUnavailable;
+                };
+                s.root_real = try arena.dupe(u8, buf[0..n]);
+            }
+
+            const protection = self.io.swapCancelProtection(.blocked);
+            defer _ = self.io.swapCancelProtection(protection);
+            const line = "static files: resolve_beneath checks the real path of every opened file, because {s}; that costs a second blocking-pool hop per static open (`.resolve_beneath = false` restores the old speed)";
+            if (verdict.why.expected()) log.debug(line, .{verdict.why.text()}) else log.info(line, .{verdict.why.text()});
+        }
+
         fn serve(self: *Self) !void {
+            if (!self.static_prepared) try self.prepareStatic();
             const listeners = self.configuredListeners();
             if (self.config.max_connections) |max| {
                 if (max == 0) {
@@ -2753,6 +2810,7 @@ pub fn Server(comptime Ctx: type) type {
             res._error_format = self.config.errors;
             res._write_timeout = self.config.timeout.write;
             res._error_detail = self.config.error_detail;
+            res._beneath = self.beneath;
         }
 
         /// The client address for a request from `peer` with `headers`,

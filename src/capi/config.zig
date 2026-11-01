@@ -767,6 +767,7 @@ pub const Config = struct {
         precompressed: []const []const u8 = &.{},
         cache_control: ?[]const u8 = null,
         hide_dotfiles: bool = true,
+        resolve_beneath: bool = true,
     };
     pub const WebSocket = struct {
         /// The consumer's route id for this endpoint's events.

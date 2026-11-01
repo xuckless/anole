@@ -589,7 +589,9 @@ here and runs on Anole's threads:
 
 - A route has exactly one of `handler` (a consumer's route id), `respond` (a
   fixed answer), `static` (files under a directory) or `websocket` (with
-  `"accept": "consumer"`, also `handler`).
+  `"accept": "consumer"`, also `handler`). A `static` route's keys are
+  `dir`, `index`, `precompressed`, `cache_control`, `hide_dotfiles` and
+  `resolve_beneath` (a symlink out of `dir` is a 404; default `true`).
   A `respond` answer's `headers` may not name `Connection` or
   `Transfer-Encoding`, which the server writes itself, and must be valid
   field names and values; the configuration is refused otherwise.
@@ -2006,6 +2008,21 @@ descriptors, JSON and transcoding). The C suite's WebTransport part has its
 server in C and its client in Zig (`tests/capi/wt_client.zig`, built with
 the suite and passed to it), since C has no WebTransport client. `tests/capi/bench.sh` compares consumer
 routes with native ones.
+
+## From ABI 0.10
+
+ABI 0.11 comes with Anole 0.5.0. A 0.10 binding rebuilds against the new
+`anole.h` (`ANOLE_ABI_COMPATIBLE` asks for an exact match before 1.0). What
+it notices:
+
+- `routes[].static` has a new key, `resolve_beneath` (default `true`): a
+  static route answers 404 for a path that resolves outside its `dir`
+  through a symlink, a precompressed copy or an index file included.
+  Symlinks that stay inside are served; use relative ones, since where the
+  OS confines the open (Linux 5.6+, macOS 26+) an absolute link is refused
+  even when it points inside. `false` restores the old behaviour. A binding
+  built for 0.11 that sends the key to a 0.10 library has its configuration
+  refused (unknown key), which the exact version check catches at load.
 
 ## From ABI 0.9
 

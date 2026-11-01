@@ -1672,6 +1672,7 @@ pub const Engine = struct {
                     .precompressed = try config_mod.precompressed(a, st.precompressed),
                     .cache_control = st.cache_control,
                     .hide_dotfiles = st.hide_dotfiles,
+                    .resolve_beneath = st.resolve_beneath,
                 });
             } else if (rc.websocket) |wc| {
                 if (comptime !features.websocket) unreachable;
