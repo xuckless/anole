@@ -89,7 +89,7 @@ src/handlers.zig	U3	1
 src/handoff.zig	U3	5
 src/http/core/bind.zig	U3	4
 src/http/core/bind_strings.zig	U3	1
-src/http/core/block_cache.zig	U3	11
+src/http/core/block_cache.zig	U3	10
 src/http/core/client.zig	L2	2
 src/http/core/deadline.zig	L2	1
 src/http/core/drain_hooks.zig	L2	1
