@@ -48,6 +48,8 @@ const TestClient = struct {
     closes: usize = 0,
     /// WINDOW_UPDATE frames received for a stream (not the connection).
     stream_window_updates: usize = 0,
+    /// PING ACKs received.
+    ping_acks: usize = 0,
 
     const Resp = struct {
         status: u16 = 0,
@@ -258,6 +260,19 @@ const TestClient = struct {
         }
     }
 
+    /// Sends and receives until a PING ACK more than before has come.
+    fn runUntilPingAck(self: *TestClient) !void {
+        const want = self.ping_acks + 1;
+        while (true) {
+            try self.sendPending();
+            if (self.ping_acks >= want) return;
+            const bytes = try self.r.peekGreedy(1);
+            const rv = c.nghttp2_session_mem_recv2(self.session, bytes.ptr, bytes.len);
+            if (rv < 0) return error.Http2Recv;
+            self.r.toss(@intCast(rv));
+        }
+    }
+
     /// Sends and receives until the response on stream `id` is whole,
     /// whether or not the stream is closed.
     fn runUntilAnswered(self: *TestClient, id: i32) !void {
@@ -307,6 +322,7 @@ const TestClient = struct {
         const self: *TestClient = @ptrCast(@alignCast(user_data.?));
         if (frame.*.hd.type == c.NGHTTP2_DATA and frame.*.hd.length == 0 and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) self.empty_ends += 1;
         if (frame.*.hd.type == c.NGHTTP2_WINDOW_UPDATE and frame.*.hd.stream_id != 0) self.stream_window_updates += 1;
+        if (frame.*.hd.type == c.NGHTTP2_PING and frame.*.hd.flags & c.NGHTTP2_FLAG_ACK != 0) self.ping_acks += 1;
         if ((frame.*.hd.type == c.NGHTTP2_DATA or frame.*.hd.type == c.NGHTTP2_HEADERS) and frame.*.hd.flags & c.NGHTTP2_FLAG_END_STREAM != 0) {
             if (respFor(session, frame.*.hd.stream_id)) |resp| resp.answered = true;
         }
@@ -809,6 +825,39 @@ test "HTTP/2: a body window raised before the client acknowledged SETTINGS never
     try releaser.await(io);
     var expect: [64]u8 = undefined;
     try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(id).body.items);
+}
+
+test "HTTP/2: the reader writes the responses of its no_wait requests itself, without waking the writer" {
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    // Warm: SETTINGS both ways, then a PING, which only the writer answers
+    // (no no_wait request in its read). Its round is counted before its
+    // write, so once the ACK is in, the writer has nothing more coming.
+    const warm = try client.request("GET", "/nw/hello", null);
+    try client.run();
+    try std.testing.expectEqualStrings("hello", client.get(warm).body.items);
+    const before_ping = h2.test_writer_rounds.load(.monotonic);
+    _ = c.nghttp2_submit_ping(client.session, c.NGHTTP2_FLAG_NONE, null);
+    try client.runUntilPingAck();
+    const rounds = h2.test_writer_rounds.load(.monotonic);
+    try std.testing.expect(rounds > before_ping);
+    // Woken once for the PING, before its round: none after.
+    const wakes = h2.test_writer_wakes.load(.monotonic);
+
+    var ids: [8]i32 = undefined;
+    for (&ids) |*id| id.* = try client.request("GET", "/nw/hello", null);
+    try client.run();
+    for (ids) |id| try std.testing.expectEqualStrings("hello", client.get(id).body.items);
+    try std.testing.expectEqual(rounds, h2.test_writer_rounds.load(.monotonic));
+    // Nor woken for nothing: the reader's round covers the kicks of its
+    // requests (their heads, their streams closing).
+    try std.testing.expectEqual(wakes, h2.test_writer_wakes.load(.monotonic));
 }
 
 test "HTTP/2: a no_wait handler that waits anyway still answers, holding up its connection" {

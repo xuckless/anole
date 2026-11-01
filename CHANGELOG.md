@@ -44,6 +44,12 @@ breaking changes are listed anyway.
   once per read instead of once per frame, with no futex call when nobody
   sleeps. `bridge.Signal` moved to the core (`dusty.Signal`), shared with
   HTTP/3 (#99).
+- HTTP/2: after running a read's `no_wait` requests on the connection's
+  reader, the reader writes their responses itself, in one write, instead
+  of waking the writer task for them (the writer still takes output when it
+  is writing, or when something is left over); kicks during that round no
+  longer wake the writer, nor does a stream closing while output is taken
+  (#99).
 
 ## 0.4.2 (2026-10-31)
 
