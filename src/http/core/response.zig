@@ -1735,17 +1735,9 @@ pub const Response = struct {
         return !self.head and statusHasBody(self.status);
     }
 
-    /// zlib-ng's level for gzip responses. Level 1 there codes with the
-    /// fixed Huffman table only (`deflate_quick`), 4% larger than 2 on
-    /// JSON of 4-8 KB; 2 is as small as libdeflate's 1 and 11% larger than
-    /// zlib's default 6, at a fraction of its time
-    /// (research/s2/k4-compression.md, §2).
-    /// libdeflate's level for buffered gzip responses (`-Dlibdeflate`):
-    /// 1, which unlike zlib-ng's 1 builds dynamic Huffman codes, as small
-    /// as zlib-ng's 2 on JSON of 4-8 KB.
-    const libdeflate_level: c_int = 1;
-
-    const compression_level: zlib.Level = @fromBackingInt(@intCast(2));
+    /// zlib-ng's level for gzip responses, streamed or buffered
+    /// (`encoders.gzip_options`).
+    const compression_level: zlib.Level = encoders.gzip_options.level;
     /// zstd's level for responses, buffered or streamed. On JSON of 4-8 KB
     /// level 1 is both smaller and faster than zstd's default 3
     /// (research/s2/k4-compression.md, §2).
@@ -1915,30 +1907,36 @@ pub const Response = struct {
     }
 
     /// libdeflate compresses one contiguous input into one output in one
-    /// call: a body in more than one segment is gathered first. The output
-    /// is a single arena segment with room for one byte less than the body,
-    /// since only a shorter result is sent; one that does not fit is
-    /// `error.CompressFailed`, and the body goes out as it is.
+    /// call: a body in more than one segment is gathered first. Both are
+    /// this executor's scratch (`encoders.scratch`), the output with room
+    /// for one byte less than the body, since only a shorter result is
+    /// sent; one that does not fit is `error.CompressFailed`, and the body
+    /// goes out as it is. The result is then copied into an arena segment
+    /// of its own length, so the arena grows by the compressed size, not
+    /// the body's.
     fn libdeflateBody(self: *Response, len: usize) (std.mem.Allocator.Error || error{CompressFailed})!BodyBuffer {
-        const d = encoders.deflater(libdeflate_level) orelse return error.OutOfMemory;
+        const d = encoders.deflater() orelse return error.OutOfMemory;
         defer encoders.release();
-        const input: []const u8 = if (self.body_buffer.len() == 0) self.body else blk: {
+        const contiguous: ?[]const u8 = if (self.body_buffer.len() == 0) self.body else blk: {
             const first = BodyBuffer.Segment.fromNode(self.body_buffer.segments.first.?);
-            if (first.node.next == null) break :blk first.bytes()[0..first.len];
-            const scratch = encoders.gather(len) orelse return error.OutOfMemory;
+            break :blk if (first.node.next == null) first.bytes()[0..first.len] else null;
+        };
+        const scratch = encoders.scratch(if (contiguous == null) len else 0, len - 1) orelse return error.OutOfMemory;
+        const input: []const u8 = contiguous orelse blk: {
             var at: usize = 0;
             var it = self.body_buffer.segments.first;
             while (it) |node| : (it = node.next) {
                 const segment = BodyBuffer.Segment.fromNode(node);
-                @memcpy(scratch[at..][0..segment.len], segment.bytes()[0..segment.len]);
+                @memcpy(scratch.input[at..][0..segment.len], segment.bytes()[0..segment.len]);
                 at += segment.len;
             }
             std.debug.assert(at == len);
-            break :blk scratch;
+            break :blk scratch.input;
         };
-        const segment = try BodyBuffer.Segment.create(self.arena, len - 1);
-        const n = encoders.deflateInto(d, input, segment.bytes());
+        const n = encoders.deflateInto(d, input, scratch.output);
         if (n == 0) return error.CompressFailed;
+        const segment = try BodyBuffer.Segment.create(self.arena, n);
+        @memcpy(segment.bytes(), scratch.output[0..n]);
         segment.len = n;
         var compressed: BodyBuffer = .{};
         compressed.segments.append(&segment.node);
@@ -1946,13 +1944,12 @@ pub const Response = struct {
     }
 
     /// The buffered body through this executor's zlib-ng encoder
-    /// (`encoders`), whose memory (about 300 KiB) comes from `block_cache`.
-    /// Its window is zlib's largest, whatever the body: a reused encoder
-    /// keeps the options it was made with.
+    /// (`encoders`, at `encoders.gzip_options`), whose memory (about 300
+    /// KiB) comes from `block_cache`.
     fn zlibBody(self: *Response) (std.mem.Allocator.Error || std.Io.Writer.Error)!BodyBuffer {
         var compressed: BodyBuffer = try .init(self.arena);
         var out: BodyWriter = .into(self, &compressed);
-        const gzip = try encoders.gzip(&out.interface, .{ .level = compression_level, .window_bits = 15, .mem_level = 8 });
+        const gzip = try encoders.gzip(&out.interface);
         defer encoders.release();
         if (self.body_buffer.len() > 0) try self.body_buffer.writeTo(&gzip.writer) else try gzip.writer.writeAll(self.body);
         try gzip.finish();
@@ -4298,6 +4295,75 @@ test "compress: a buffered body in several segments goes out as gzip that decode
         _ = try d.reader.streamRemaining(&out.writer);
         try std.testing.expectEqualStrings(body, out.written());
     }
+}
+
+test "compress: a large gzipped body takes arena room for its compressed size only" {
+    if (!build_options.use_zlib) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var text: std.Io.Writer.Allocating = .init(arena.allocator());
+    for (0..6000) |i| try text.writer.print("{{\"id\":{d},\"name\":\"Widget {d}\",\"price\":{d}}},", .{ i, i % 9, i * 37 % 500 });
+    const body = text.written();
+    try std.testing.expect(body.len > 200 * 1024);
+
+    // Contiguous, then in segments (gathered first with libdeflate).
+    for ([_]usize{ body.len, 3000 }) |piece| {
+        var connection: Connection = undefined;
+        var request = try testGzipRequest(arena.allocator());
+        var response = try Response._init(arena.allocator(), &connection, 8);
+        defer response.deinit();
+        response._request = &request;
+        var w = try response.writer();
+        var rest = body;
+        while (rest.len > 0) {
+            const n = @min(rest.len, piece);
+            try w.interface.writeAll(rest[0..n]);
+            rest = rest[n..];
+        }
+        try w.end();
+        response.compressBody(.gzip);
+        try std.testing.expectEqualStrings("gzip", response.headers.get("Content-Encoding").?);
+
+        // Every segment is full: no room was taken for the body's length.
+        var room: usize = 0;
+        var encoded: std.Io.Writer.Allocating = .init(arena.allocator());
+        var it = response.body_buffer.segments.first;
+        while (it) |node| : (it = node.next) {
+            const segment = BodyBuffer.Segment.fromNode(node);
+            room += segment.capacity;
+            try encoded.writer.writeAll(segment.bytes()[0..segment.len]);
+        }
+        try std.testing.expect(encoded.written().len < body.len / 2);
+        try std.testing.expect(room < encoded.written().len + 64 * 1024);
+
+        var in: std.Io.Reader = .fixed(encoded.written());
+        var d = try zlib.Decompress.init(arena.allocator(), &in, &.{}, .gzip, .{});
+        defer d.deinit();
+        var out: std.Io.Writer.Allocating = .init(arena.allocator());
+        _ = try d.reader.streamRemaining(&out.writer);
+        try std.testing.expectEqualStrings(body, out.written());
+    }
+}
+
+test "compress: a body that would not shrink goes out as it is" {
+    if (!build_options.use_zlib) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var noise: [4000]u8 = undefined;
+    var prng: std.Random.DefaultPrng = .init(3);
+    prng.random().bytes(&noise);
+
+    var connection: Connection = undefined;
+    var request = try testGzipRequest(arena.allocator());
+    var response = try Response._init(arena.allocator(), &connection, 8);
+    defer response.deinit();
+    response._request = &request;
+    var w = try response.writer();
+    try w.interface.writeAll(&noise);
+    try w.end();
+    response.compressBody(.gzip);
+    try std.testing.expect(response.headers.get("Content-Encoding") == null);
+    try std.testing.expectEqual(noise.len, response.bodyLen());
 }
 
 test "Response: a gzipped body weakens its ETag and drops Accept-Ranges" {

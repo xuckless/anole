@@ -12,13 +12,14 @@
 //! Streamed bodies keep an encoder of their own: they yield between writes.
 //!
 //! With `-Dlibdeflate`, buffered gzip goes through one libdeflate
-//! compressor per thread instead (`libdeflate`), which compresses a
-//! contiguous body in one call: a body in more than one segment is gathered
-//! into a per-thread scratch first (`gather`).
+//! compressor per thread instead (`deflater`), which compresses one
+//! contiguous input into one output in one call: both live in a per-thread
+//! scratch (`scratch`), the input only when the body is in more than one
+//! segment.
 //!
 //! All are made on first use from `block_cache` (not the request's arena,
-//! which is reset under them), and freed by `trimLocal` when no response
-//! took them since the last trim, or by `freeLocal`. The server's trim task
+//! which is reset under them). `trimLocal` frees each one no response took
+//! since the last trim, and `freeLocal` all of them; the server's trim task
 //! calls both on each executor. Brotli has no reset, so it stays per
 //! response (research/s2/k4-compression.md, S1).
 const std = @import("std");
@@ -34,9 +35,28 @@ const block_cache = @import("block_cache.zig");
 /// trim (or zstd's own 128-frame "wasteful" rule).
 pub const max_zstd_context = 1024 * 1024;
 
-/// Largest body gathered for libdeflate; a larger one is gzipped by zlib-ng
+/// Largest body gzipped by libdeflate; a larger one is gzipped by zlib-ng
 /// as it streams, without a copy (and without a scratch that size).
 pub const max_gather = 1024 * 1024;
+
+/// A scratch past this after a response is freed rather than kept (back to
+/// `block_cache`, which keeps its pages for the next large body until its
+/// own trim): the bodies most responses compress are a few KB.
+pub const max_kept_scratch = 64 * 1024;
+
+/// zlib-ng's gzip options for responses, the thread's encoder made with
+/// them. Level 1 there codes with the fixed Huffman table only
+/// (`deflate_quick`), 4% larger than 2 on JSON of 4-8 KB; 2 is as small as
+/// libdeflate's 1 and 11% larger than zlib's default 6, at a fraction of
+/// its time (research/s2/k4-compression.md, §2). The window is zlib's
+/// largest, whatever the body: a reused encoder keeps the options it was
+/// made with.
+pub const gzip_options: zlib.Options = .{ .level = @fromBackingInt(@intCast(2)), .window_bits = 15, .mem_level = 8 };
+
+/// libdeflate's level for buffered gzip responses (`-Dlibdeflate`): 1,
+/// which unlike zlib-ng's 1 builds dynamic Huffman codes, as small as
+/// zlib-ng's 2 on JSON of 4-8 KB.
+pub const libdeflate_level: c_int = 1;
 
 pub const Deflater = if (build_options.use_libdeflate) libdeflate_io.Compressor else void;
 
@@ -44,13 +64,20 @@ const Local = struct {
     zstd: if (build_options.use_zstd) ?*zstd_io.Context else void = if (build_options.use_zstd) null else {},
     gzip: if (build_options.use_zlib) ?zlib.Compress else void = if (build_options.use_zlib) null else {},
     deflater: if (build_options.use_libdeflate) ?*Deflater else void = if (build_options.use_libdeflate) null else {},
-    /// `gather`'s scratch, from `block_cache`.
+    /// `scratch`'s memory, from `block_cache`.
     scratch: []u8 = &.{},
-    /// Taken since the last `trimLocal`.
-    used: bool = false,
+    /// Which were taken since the last `trimLocal`.
+    used: Used = .{},
     /// Safe builds: an encoder is out (between `zstd`/`gzip` and
     /// `release`). A second taker would share its state.
     in_use: if (std.debug.runtime_safety) bool else void = if (std.debug.runtime_safety) false else {},
+};
+
+const Used = packed struct {
+    zstd: bool = false,
+    gzip: bool = false,
+    /// The libdeflate compressor and the scratch.
+    deflater: bool = false,
 };
 
 threadlocal var local: Local = .{};
@@ -58,12 +85,12 @@ threadlocal var local: Local = .{};
 /// Tests only: encoders made on this thread and not freed.
 threadlocal var live_for_test: isize = 0;
 
-fn take() void {
+fn take(comptime which: std.meta.FieldEnum(Used)) void {
     if (std.debug.runtime_safety) {
         std.debug.assert(!local.in_use); // an encoder held across a yield
         local.in_use = true;
     }
-    local.used = true;
+    @field(local.used, @tagName(which)) = true;
 }
 
 /// This thread's zstd context, set up for a new frame into `output` at
@@ -77,40 +104,39 @@ pub fn zstd(z: *zstd_io.Compress, output: *std.Io.Writer, level: c_int, len: usi
         if (builtin.is_test) live_for_test += 1;
         break :blk ctx;
     };
-    take();
+    take(.zstd);
     errdefer release();
     try z.initWith(ctx, output, &.{}, .{ .level = level, .window_log = null, .pledged_size = len });
 }
 
-/// This thread's gzip encoder, writing a new stream into `output`. Its
-/// options are fixed when it is made, so every caller passes the same.
-/// Call `release` once the stream is finished or abandoned, before
-/// anything yields.
-pub fn gzip(output: *std.Io.Writer, options: zlib.Options) std.mem.Allocator.Error!*zlib.Compress {
+/// This thread's gzip encoder (`gzip_options`), writing a new stream into
+/// `output`. Call `release` once the stream is finished or abandoned,
+/// before anything yields.
+pub fn gzip(output: *std.Io.Writer) std.mem.Allocator.Error!*zlib.Compress {
     comptime std.debug.assert(build_options.use_zlib);
     if (local.gzip) |*g| {
-        take();
+        take(.gzip);
         g.reset(output);
         return g;
     }
-    local.gzip = try zlib.Compress.init(block_cache.allocator, output, &.{}, .gzip, options);
+    local.gzip = try zlib.Compress.init(block_cache.allocator, output, &.{}, .gzip, gzip_options);
     if (builtin.is_test) live_for_test += 1;
-    take();
+    take(.gzip);
     return &local.gzip.?;
 }
 
-/// This thread's libdeflate compressor at `level` (which every caller
-/// passes the same), or null when out of memory. Call `release` once done
-/// with it and with `gather`'s scratch, before anything yields.
-pub fn deflater(level: c_int) ?*Deflater {
+/// This thread's libdeflate compressor (`libdeflate_level`), or null when
+/// out of memory. Call `release` once done with it and with `scratch`,
+/// before anything yields.
+pub fn deflater() ?*Deflater {
     comptime std.debug.assert(build_options.use_libdeflate);
     const d = local.deflater orelse blk: {
-        const d = libdeflate_io.create(level) orelse return null;
+        const d = libdeflate_io.create(libdeflate_level) orelse return null;
         local.deflater = d;
         if (builtin.is_test) live_for_test += 1;
         break :blk d;
     };
-    take();
+    take(.deflater);
     return d;
 }
 
@@ -121,11 +147,20 @@ pub fn deflateInto(d: *Deflater, input: []const u8, out: []u8) usize {
     return libdeflate_io.gzip(d, input, out);
 }
 
-/// This thread's scratch of at least `len` bytes (at most `max_gather`),
-/// for a body gathered into one piece; null when out of memory. Only
-/// between `deflater` and `release`.
-pub fn gather(len: usize) ?[]u8 {
-    std.debug.assert(len <= max_gather);
+pub const Scratch = struct {
+    /// For a body gathered into one piece.
+    input: []u8,
+    /// For libdeflate's output.
+    output: []u8,
+};
+
+/// This thread's scratch: `input_len` bytes for a gathered body (0 for a
+/// contiguous one) and `output_len` for the output, each at most
+/// `max_gather`; null when out of memory. Only between `deflater` and
+/// `release`, which frees it if it is larger than `max_kept_scratch`.
+pub fn scratch(input_len: usize, output_len: usize) ?Scratch {
+    std.debug.assert(input_len <= max_gather and output_len <= max_gather);
+    const len = input_len + output_len;
     if (local.scratch.len < len) {
         freeScratch();
         // Rounded up, so a body a little longer than the last takes the
@@ -133,7 +168,7 @@ pub fn gather(len: usize) ?[]u8 {
         const size = std.mem.alignForward(usize, len, 16 * 1024);
         local.scratch = block_cache.allocator.alloc(u8, size) catch return null;
     }
-    return local.scratch[0..len];
+    return .{ .input = local.scratch[0..input_len], .output = local.scratch[input_len..len] };
 }
 
 fn freeScratch() void {
@@ -150,13 +185,14 @@ fn freeDeflater() void {
     };
 }
 
-/// Ends a use of `zstd`, `gzip` or `deflater`. Drops a zstd context that grew past
-/// `max_zstd_context`.
+/// Ends a use of `zstd`, `gzip` or `deflater`. Drops a zstd context that
+/// grew past `max_zstd_context` and a scratch past `max_kept_scratch`.
 pub fn release() void {
     if (std.debug.runtime_safety) local.in_use = false;
     if (build_options.use_zstd) if (local.zstd) |ctx| {
         if (zstd_io.contextSize(ctx) > max_zstd_context) freeZstd();
     };
+    if (local.scratch.len > max_kept_scratch) freeScratch();
 }
 
 fn freeZstd() void {
@@ -175,12 +211,18 @@ fn freeGzip() void {
     };
 }
 
-/// Frees this thread's encoders if no response took one since the last
-/// call. Their memory goes back to `block_cache`, whose own trim unmaps it.
+/// Frees each of this thread's encoders that no response took since the
+/// last call. Their memory goes back to `block_cache`, whose own trim
+/// unmaps it.
 pub fn trimLocal() void {
-    defer local.used = false;
-    if (local.used) return;
-    freeLocal();
+    if (std.debug.runtime_safety) std.debug.assert(!local.in_use);
+    defer local.used = .{};
+    if (!local.used.zstd) freeZstd();
+    if (!local.used.gzip) freeGzip();
+    if (!local.used.deflater) {
+        freeDeflater();
+        freeScratch();
+    }
 }
 
 /// Frees this thread's encoders. Not while one is out.
@@ -203,7 +245,7 @@ pub fn liveForTest() isize {
 pub fn drainLocalForTest() void {
     if (!builtin.is_test) @compileError("drainLocalForTest is for tests");
     freeLocal();
-    local.used = false;
+    local.used = .{};
 }
 
 fn testBody(allocator: std.mem.Allocator, items: usize) ![]u8 {
@@ -216,7 +258,7 @@ fn testBody(allocator: std.mem.Allocator, items: usize) ![]u8 {
 fn testGzip(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = try .initCapacity(allocator, 256);
     errdefer out.deinit();
-    const g = try gzip(&out.writer, .{ .level = .default });
+    const g = try gzip(&out.writer);
     defer release();
     try g.writer.writeAll(body);
     try g.finish();
@@ -327,7 +369,7 @@ test "compress: an abandoned compression leaves the encoder usable" {
     {
         var small: [64]u8 = undefined;
         var out: std.Io.Writer = .fixed(&small);
-        const g = try gzip(&out, .{ .level = .default });
+        const g = try gzip(&out);
         defer release();
         try std.testing.expectError(error.WriteFailed, blk: {
             g.writer.writeAll(body) catch |err| break :blk err;
@@ -368,13 +410,13 @@ test "compress: libdeflate gzips a gathered body, reusing its compressor and scr
     defer a.free(body);
     var first_scratch: ?[*]u8 = null;
     for (0..2) |_| {
-        const d = deflater(1).?;
+        const d = deflater().?;
         defer release();
-        const in = gather(body.len).?;
+        const s = scratch(body.len, body.len - 1).?;
+        const in = s.input;
         if (first_scratch) |p| try std.testing.expectEqual(p, in.ptr) else first_scratch = in.ptr;
         @memcpy(in, body);
-        const out = try a.alloc(u8, body.len - 1);
-        defer a.free(out);
+        const out = s.output;
         const n = deflateInto(d, in, out);
         try std.testing.expect(n > 0 and n < body.len);
         const decoded = try testGunzip(a, out[0..n]);
@@ -387,7 +429,7 @@ test "compress: libdeflate gzips a gathered body, reusing its compressor and scr
     var prng: std.Random.DefaultPrng = .init(7);
     prng.random().bytes(&noise);
     var out: [599]u8 = undefined;
-    const d = deflater(1).?;
+    const d = deflater().?;
     defer release();
     try std.testing.expectEqual(@as(usize, 0), deflateInto(d, &noise, &out));
 }
@@ -408,4 +450,44 @@ test "compress: trim frees idle encoders" {
     // Not used since: freed.
     trimLocal();
     try std.testing.expectEqual(@as(isize, 0), liveForTest());
+}
+
+test "compress: trim frees each idle encoder on its own" {
+    if (!(build_options.use_zlib and build_options.use_zstd)) return error.SkipZigTest;
+    drainLocalForTest();
+    defer drainLocalForTest();
+    const a = std.testing.allocator;
+    const body = try testBody(a, 50);
+    defer a.free(body);
+    a.free(try testGzip(a, body));
+    a.free(try testZstd(a, body, 1));
+    trimLocal();
+    try std.testing.expectEqual(@as(isize, 2), liveForTest());
+    // Only zstd since: gzip's encoder goes, zstd's stays.
+    a.free(try testZstd(a, body, 1));
+    trimLocal();
+    try std.testing.expectEqual(@as(isize, 1), liveForTest());
+    try std.testing.expect(local.gzip == null);
+    try std.testing.expect(local.zstd != null);
+}
+
+test "compress: a scratch past max_kept_scratch is freed after the response" {
+    if (!build_options.use_libdeflate) return error.SkipZigTest;
+    drainLocalForTest();
+    defer drainLocalForTest();
+    {
+        _ = deflater().?;
+        defer release();
+        const s = scratch(4096, 4095).?;
+        try std.testing.expectEqual(@as(usize, 4096), s.input.len);
+        try std.testing.expectEqual(@as(usize, 4095), s.output.len);
+    }
+    // A small one stays for the next response.
+    try std.testing.expect(local.scratch.len > 0);
+    {
+        _ = deflater().?;
+        defer release();
+        _ = scratch(0, max_kept_scratch + 1).?;
+    }
+    try std.testing.expectEqual(@as(usize, 0), local.scratch.len);
 }
