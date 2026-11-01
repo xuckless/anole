@@ -852,6 +852,7 @@ memory limiter, `auth.RequireJwt` on static keys and no hook,
 `session.Middleware` on cookies or a memory store; a Redis limiter or
 store, a JWKS keyring or a database lookup may wait and are not. A handler marked this way that
 waits anyway still works, but holds up every other request on its
-connection (on HTTP/3, every connection of its endpoint) meanwhile and gets
+connection (on HTTP/2 the other streams' output too, which waits until
+its read's handlers are done; on HTTP/3, every connection of its endpoint) meanwhile and gets
 no request timeout, so leave the mark off anything that queries a database,
 a cache or another service. On HTTP/1.1 the mark changes nothing.
