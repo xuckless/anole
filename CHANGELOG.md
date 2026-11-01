@@ -99,8 +99,7 @@ breaking changes are listed anyway.
   batch; a request with a body its handler leaves unread still flushes
   before the body is thrown away. Single requests are unchanged. New
   `Response.flushOwed()` for a `noWait` handler that may still wait on
-  HTTP/1.1; the C ABI's consumer routes and gRPC methods call it (S2 K3;
-  issue number to come).
+  HTTP/1.1; the C ABI's consumer routes and gRPC methods call it.
 
 - HTTP/2: a request body's queue is sized to the body when its length is
   known (content-length, or the one DATA frame that carries END_STREAM,
