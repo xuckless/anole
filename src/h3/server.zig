@@ -2501,9 +2501,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// The response's Content-Length, when the head named one:
             /// sizes the body buffer.
             length_hint: ?usize = null,
-            /// The response body's buffer (`StreamSink.body`), taken from
-            /// the endpoint's allocator the first time the stream needs one
-            /// and kept while it is pooled: in the arena, a 16 KiB buffer
+            /// The response body's buffer (`StreamSink.body`) for a body
+            /// past 4 KiB, taken from the endpoint's allocator the first
+            /// time the stream needs one and kept while it is pooled: in the arena, a 16 KiB buffer
             /// grew it past `arena_keep` into a node too big for malloc's
             /// slabs, an mmap and munmap per request.
             sink_buf: []u8 = &.{},
@@ -3363,6 +3363,10 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// can tell the body buffer's size from the hand-offs a body took.
         pub var test_sink_handoffs: std.atomic.Value(usize) = .init(0);
 
+        /// Tests only: how many streams took a body buffer of their own
+        /// (`Stream.sink_buf`).
+        pub var test_sink_bufs: std.atomic.Value(usize) = .init(0);
+
         /// The response side of a stream, for `Response.initSink`.
         const StreamSink = struct {
             stream: *Stream,
@@ -3447,10 +3451,19 @@ pub fn Endpoint(comptime Ctx: type) type {
                     // Up to 16 KiB for a known length (a file read into it
                     // takes a quarter of the reads 4 KiB would); 4 KiB for
                     // a stream of unknown length.
+                    // Past 4 KiB the buffer is the stream's own
+                    // (`Stream.sink_buf`), taken once and kept while the
+                    // stream is pooled; up to 4 KiB it comes from the arena
+                    // as before, so a long-lived stream (SSE, a CONNECT
+                    // stream) holds no more than it needs. A stream that
+                    // already has its buffer uses it.
                     const s = self.stream;
                     const size = if (s.length_hint) |n| std.math.clamp(n, 256, known_length_max) else 4096;
-                    if (s.sink_buf.len == 0) s.sink_buf = s.conn.ep.gpa.alloc(u8, known_length_max) catch &.{};
-                    if (s.sink_buf.len != 0) self.writer.buffer = s.sink_buf[0..size];
+                    if (s.sink_buf.len == 0 and size > 4096) {
+                        s.sink_buf = s.conn.ep.gpa.alloc(u8, known_length_max) catch &.{};
+                        if (builtin.is_test and s.sink_buf.len != 0) _ = test_sink_bufs.fetchAdd(1, .monotonic);
+                    }
+                    self.writer.buffer = if (s.sink_buf.len >= size) s.sink_buf[0..size] else s.arena.allocator().alloc(u8, size) catch &.{};
                 }
                 return &self.writer;
             }
@@ -3473,8 +3486,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             }
 
             /// The size of a stream's body buffer (`Stream.sink_buf`): the
-            /// most a body of known length gets of it.
-            const known_length_max = 16 * 1024;
+            /// most a body of known length gets of it. Just under 16 KiB:
+            /// Zig's malloc adds a 16 B header, and 16 KiB plus that would
+            /// take a 32 KiB slot of the SmpAllocator; three of these still
+            /// carry a 47 KiB file.
+            const known_length_max = 16 * 1024 - 64;
 
             fn flushFn(w: *std.Io.Writer) std.Io.Writer.Error!void {
                 const self: *StreamSink = @alignCast(@fieldParentPtr("writer", w));

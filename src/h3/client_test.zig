@@ -2292,7 +2292,7 @@ test "h3 server: files of known length on pooled streams take nothing past mallo
     try wait.waitUntil(io, "the stream is back in the pool", f.ep, noServerStreams);
 
     // An 8 KiB and a 47 KiB file, in turn, each request on the stream the
-    // last one gave back to the pool. The body buffer (16 KiB for the
+    // last one gave back to the pool. The body buffer (just under 16 KiB for the
     // larger) is the stream's own: in the stream's arena, after the
     // handler's own 12 KiB, it took a node past malloc's largest slab (an
     // mmap, and a munmap when the stream went back to the pool).
@@ -2304,6 +2304,73 @@ test "h3 server: files of known length on pooled streams take nothing past mallo
         defer gpa.free(body);
         try std.testing.expectEqualSlices(u8, want[0..len], body);
         try wait.waitUntil(io, "the stream is back in the pool", f.ep, noServerStreams);
+    }
+    try std.testing.expectEqual(@as(usize, 0), counting.count.load(.monotonic) - before);
+}
+
+test "h3 server: only a body of known length past 4 KiB takes the stream's own buffer, once per pooled stream" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var want: [8 * 1024]u8 = undefined;
+    for (&want, 0..) |*b, i| b.* = @truncate(i *% 13);
+    file_dir = tmp.dir;
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    // A stream of unknown length (an event stream's shape) and a small
+    // file keep the arena's buffer: a long-lived stream holds 4 KiB, not
+    // the stream's 16 KiB.
+    const before = Endpoint.test_sink_bufs.load(.monotonic);
+    const streamed = try get(conn, "/download?n=40000", gpa);
+    gpa.free(streamed);
+    try wait.waitUntil(io, "the stream is back in the pool", f.ep, noServerStreams);
+    try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = want[0..1000] });
+    const small = try get(conn, "/file", gpa);
+    gpa.free(small);
+    try wait.waitUntil(io, "the stream is back in the pool", f.ep, noServerStreams);
+    try std.testing.expectEqual(@as(usize, 0), Endpoint.test_sink_bufs.load(.monotonic) - before);
+
+    // An 8 KiB file takes it, and the next one, on the pooled stream the
+    // first gave back, reuses it.
+    try tmp.dir.writeFile(io, .{ .sub_path = file_name, .data = &want });
+    for (0..2) |_| {
+        const body = try get(conn, "/file", gpa);
+        defer gpa.free(body);
+        try std.testing.expectEqualSlices(u8, &want, body);
+        try wait.waitUntil(io, "the stream is back in the pool", f.ep, noServerStreams);
+    }
+    try std.testing.expectEqual(@as(usize, 1), Endpoint.test_sink_bufs.load(.monotonic) - before);
+}
+
+test "h3 client: a POST with a body takes nothing past malloc's slabs" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    // The client's allocator only.
+    var counting: PastSlabs = .{ .child = gpa };
+    const conn = try f.connect(counting.allocator(), io);
+    defer conn.close();
+    var data: [8 * 1024]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 5);
+    gpa.free(try post(conn, io, "/echo", &data, gpa));
+
+    // Each stream's two 16 KiB buffers (response body, request body) are
+    // allocations of their own: in the stream's arena they took a node
+    // past malloc's largest slab, an mmap and munmap per request.
+    const before = counting.count.load(.monotonic);
+    for (0..3) |_| {
+        const back = try post(conn, io, "/echo", &data, gpa);
+        defer gpa.free(back);
+        try std.testing.expectEqualSlices(u8, &data, back);
     }
     try std.testing.expectEqual(@as(usize, 0), counting.count.load(.monotonic) - before);
 }
