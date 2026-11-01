@@ -619,17 +619,19 @@ the handler sets `res.compress = true`, or always through `Compress`.
   precompressed files (`precompressed = &.{.br}`), not for responses.
   Its window is at most 64 KiB, so each Brotli response in flight takes
   about 600 KiB.
-- gzip runs at libdeflate's level 1 for buffered bodies (zlib-ng's level 2
-  without `-Dlibdeflate`, and for streamed bodies), zstd at level 1. On
+- gzip runs at libdeflate's level 1 for buffered bodies up to 1 MiB
+  (zlib-ng's level 2 without `-Dlibdeflate`, for larger buffered bodies and
+  for streamed ones), zstd at level 1. On
   JSON of a few KB that gzip is about 11% larger than at level 6 for a
   fraction of the CPU, and zstd 1 is both smaller and faster than its
   default 3.
 - Each executor keeps one zstd context and one gzip encoder for buffered
-  bodies, reused from one response to the next, and frees them when no
-  response took them for a trim interval. Their memory, and Brotli's large
-  blocks, come from a cache per executor (no `mmap` or page faults per
-  response, with glibc or musl), holding at most 4 MiB and trimmed back to
-  one encoder's worth when idle.
+  bodies, reused from one response to the next, and frees each one no
+  response took for a trim interval. Their memory, and Brotli's large
+  blocks, come from a cache per executor (no `mmap` or page faults for the
+  encoders per response, with glibc or musl), holding at most 4 MiB and
+  trimmed back to one encoder's worth when idle. The compressed body itself
+  is in the request's arena, as large as the compressed result.
 - Only compressible types: text, JSON, JavaScript, XML, SVG, `+json` and
   `+xml` types and the like. Not images, video, fonts or archives.
 - Buffered bodies under 128 bytes, or that do not shrink, go out as they are.

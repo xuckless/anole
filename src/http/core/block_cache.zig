@@ -3,16 +3,17 @@
 // See LICENSE.dusty and THIRD_PARTY_NOTICES. Anole's.
 
 //! Memory for compressors whose state is too large for the request's arena:
-//! Brotli's encoder (about 25 allocations: two hash tables of 256 KiB at
-//! quality 5, buffers sized to the body, 100 KiB for 8 KiB, small ones) and
-//! zlib-ng's deflate state for a buffered gzip body (one block of 140 KiB
-//! and more). An arena would keep that much for as long as it is reused (an
-//! HTTP/1.1 connection keeps its arena's capacity), or give it back and map
-//! it again on the next response (HTTP/2 and HTTP/3 keep up to 128 KiB and
-//! 8 KiB of a stream's arena). Fresh from malloc it would be mapped and
-//! unmapped for every response too: musl's malloc maps anything past 128
-//! KiB, glibc's until its threshold adapts, and each page then faults in
-//! again.
+//! Brotli's encoder (about 25 allocations: hash tables of up to 256 KiB,
+//! buffers sized to the body, 100 KiB for 8 KiB, small ones), and the
+//! per-executor buffered-body encoders (`encoders`: zlib-ng's deflate state,
+//! one block of 140 KiB and more, zstd's context, libdeflate's compressor
+//! and its scratch). An arena would keep that much for as long as it is
+//! reused (an HTTP/1.1 connection keeps its arena's capacity), or give it
+//! back and map it again on the next response (HTTP/2 and HTTP/3 keep up
+//! to 128 KiB and 8 KiB of a stream's arena). Fresh from malloc it would be
+//! mapped and unmapped for every response too: musl's malloc maps anything
+//! past its largest size class (`big_min`), glibc's past its threshold
+//! until that adapts, and each page then faults in again.
 //!
 //! So allocations of `big_min` and more come from a per-thread cache of
 //! blocks, best fit, which keeps their pages mapped from one response to
