@@ -1024,9 +1024,9 @@ pub const Response = struct {
         /// with `dir`'s, at the cost of a second blocking-pool hop. See
         /// `StaticOptions.resolve_beneath`.
         resolve_beneath: bool = true,
-        /// The real path of `dir`, if the caller has it, for the real-path check.
+        /// Internal (`Static` sets it): the real path of `dir`, for the real-path check.
         /// Otherwise that check reads it from `dir` on every call.
-        root_real: ?[]const u8 = null,
+        _root_real: ?[]const u8 = null,
     };
 
     pub const SendFileError = std.Io.File.OpenError || std.Io.File.StatError || http.MisuseError || error{ FileTooBig, NotFile };
@@ -1051,7 +1051,7 @@ pub const Response = struct {
         if (!staysInside(sub_path)) return error.BadPathName;
         const io = self.io;
         const handle = if (options.resolve_beneath)
-            try beneath.openFile(io, dir, sub_path, self._beneath, options.root_real, self.arena)
+            try beneath.openFile(io, dir, sub_path, self._beneath, options._root_real, self.arena)
         else
             try dir.openFile(io, sub_path, .{});
         errdefer handle.close(io);

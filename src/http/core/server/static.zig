@@ -111,7 +111,7 @@ pub const Static = struct {
     pub fn serve(self: *const Static, req: *Request, res: *Response) !bool {
         const raw = req.params.get(param) orelse "";
         const sub_path = try cleanPath(req.arena, raw, self.options.hide_dotfiles) orelse return false;
-        const open: Response.SendFileOptions = .{ .resolve_beneath = self.options.resolve_beneath, .root_real = self.root_real };
+        const open: Response.SendFileOptions = .{ .resolve_beneath = self.options.resolve_beneath, ._root_real = self.root_real };
 
         const url_path = urlPath(req.url);
         var served = sub_path;
