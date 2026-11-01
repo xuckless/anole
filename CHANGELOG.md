@@ -41,40 +41,6 @@ breaking changes are listed anyway.
   pacing allows, up from 10, and each HTTP/3 endpoint's outbox holds
   256 KiB; raw `anole.net` UDP sockets keep their 128 KiB outboxes (#100).
 
-### Added
-
-- `/metrics` has HTTP/3 series per endpoint: packets, packets passed on
-  between endpoints and dropped, datagrams and outbox sends, requests,
-  requests served inline and open connections, plus `anole_h3_steering`
-  (whether the kernel steers datagrams by connection ID). The server logs
-  an info line when steering is attached (#100).
-
-### Fixed
-
-- HTTP/3: a response could hold at most 64 KiB unacknowledged, so a
-  download moved 64 KiB per round trip whatever the path allowed (1.2 MB/s
-  at 50 ms RTT, against 14-38 MB/s over HTTP/1.1). A response's buffer now
-  counts only what is not yet sent: what is in flight (which the congestion
-  window bounds) plus 64 KiB unsent, at most 3 MiB, within the connection's
-  unchanged 4 MiB. A client that stops reading still leaves up to about
-  100 KiB queued (what the stack already took, plus 64 KiB).
-  The HTTP/3 client's request bodies had the same 64 KiB ceiling and now
-  follow the path the same way when `RequestOptions.send_buffer` is null.
-  Message streams (extended CONNECT, and every gRPC, gRPC-Web and Connect
-  streaming request, unary gRPC included) keep their fixed 1 MiB
-  unacknowledged, so a large response there still moves at most 1 MiB per
-  round trip (#151).
-
-- The docs said Anole has no runtime Brotli encoder; it has one (`-Dbrotli`).
-
-- An HTTP/3 connection's flush, which waits up to 1 ms for the requests a
-  batch of packets started, no longer starts that wait over with every
-  new batch: a client sending requests faster than they answered could
-  keep its answers and ACKs back well past `max_ack_delay`. The wait now
-  ends 1 ms after the first batch since the last flush (#100).
-
-### _pre
-
 - Static files and `Response.sendFile` no longer follow a symlink out of
   their directory: `StaticOptions.resolve_beneath` and
   `SendFileOptions.resolve_beneath` are on by default, so a path that
@@ -200,6 +166,38 @@ breaking changes are listed anyway.
   flushed yet, instead of once per stream: two writes to that shared
   counter per burst of streams rather than two per stream. The drain still
   waits for every stream (#99).
+
+### Added
+
+- `/metrics` has HTTP/3 series per endpoint: packets, packets passed on
+  between endpoints and dropped, datagrams and outbox sends, requests,
+  requests served inline and open connections, plus `anole_h3_steering`
+  (whether the kernel steers datagrams by connection ID). The server logs
+  an info line when steering is attached (#100).
+
+### Fixed
+
+- HTTP/3: a response could hold at most 64 KiB unacknowledged, so a
+  download moved 64 KiB per round trip whatever the path allowed (1.2 MB/s
+  at 50 ms RTT, against 14-38 MB/s over HTTP/1.1). A response's buffer now
+  counts only what is not yet sent: what is in flight (which the congestion
+  window bounds) plus 64 KiB unsent, at most 3 MiB, within the connection's
+  unchanged 4 MiB. A client that stops reading still leaves up to about
+  100 KiB queued (what the stack already took, plus 64 KiB).
+  The HTTP/3 client's request bodies had the same 64 KiB ceiling and now
+  follow the path the same way when `RequestOptions.send_buffer` is null.
+  Message streams (extended CONNECT, and every gRPC, gRPC-Web and Connect
+  streaming request, unary gRPC included) keep their fixed 1 MiB
+  unacknowledged, so a large response there still moves at most 1 MiB per
+  round trip (#151).
+
+- The docs said Anole has no runtime Brotli encoder; it has one (`-Dbrotli`).
+
+- An HTTP/3 connection's flush, which waits up to 1 ms for the requests a
+  batch of packets started, no longer starts that wait over with every
+  new batch: a client sending requests faster than they answered could
+  keep its answers and ACKs back well past `max_ack_delay`. The wait now
+  ends 1 ms after the first batch since the last flush (#100).
 
 ## 0.4.2 (2026-10-31)
 
