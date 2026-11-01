@@ -116,6 +116,14 @@
             .hash = "N-V-__8AAJudKgCQCuIiH6MJjAiIJHfg_tT_Ew-0vZwVkCo_",
             .lazy = true,
         },
+        // -Dlibdeflate: ebiggers/libdeflate 1.26 (MIT), the compressor
+        // only, for buffered gzip responses; built by build/libdeflate.zig
+        // (source list after nilo's build.zig).
+        .libdeflate = .{
+            .url = "https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.26.tar.gz",
+            .hash = "N-V-__8AAEaRCwCsYb_rSsH72Pb6DNFQLSjdRzTFOVsJWcoB",
+            .lazy = true,
+        },
         .zlib_zig = .{
             .url = "git+https://github.com/lalinsky/zlib.zig#537dbce25b1b29a0361845b019711dad35699aa6",
             .hash = "zlib-0.1.0-X-kZxmTyEQCJtIUdNRXSe6B4h1r1FGi0GvTcX2pvokom",

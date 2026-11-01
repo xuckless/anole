@@ -209,6 +209,7 @@ comptime {
     if (@import("build_options").use_http2) _ = @import("server/h2_test.zig");
     if (@import("build_options").use_brotli) _ = @import("brotli_io.zig");
     _ = @import("block_cache.zig");
+    _ = @import("encoders.zig");
     _ = @import("bind.zig");
     _ = @import("bind_strings.zig");
     _ = @import("bind_violations.zig");

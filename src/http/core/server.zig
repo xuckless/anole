@@ -30,6 +30,7 @@ const body_read_reserve = @import("config.zig").body_read_reserve;
 const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersPool;
 const RequestBuffers = @import("server/request_buffers.zig").RequestBuffers;
 const block_cache = @import("block_cache.zig");
+const encoders = @import("encoders.zig");
 const WriteBuffer = @import("server/request_buffers.zig").WriteBuffer;
 const Chain = @import("middleware.zig").Chain;
 const Middleware = @import("middleware.zig").Middleware;
@@ -1651,6 +1652,12 @@ pub fn Server(comptime Ctx: type) type {
                 for (active) |*l| logListening(l.config, l.address);
             }
 
+            // The trim tasks, one per executor. Canceled last, after the
+            // drain and the connections, so the encoders a response made
+            // during the drain are freed too (`trimLoop`).
+            var trimming: std.Io.Group = .init;
+            defer trimming.cancel(self.io);
+
             var connections: std.Io.Group = .init;
             // Parked connections: a shelf per executor, each with a driver
             // task there that closes them all when the shelf stops. That
@@ -1714,7 +1721,7 @@ pub fn Server(comptime Ctx: type) type {
 
             // One per executor, so that each trims its own free list.
             for (0..executors orelse 1) |i| {
-                placement.concurrent(&accepting, self.io, .{ .executor = i }, trimLoop, .{ self, i == 0 }) catch |err| {
+                placement.concurrent(&trimming, self.io, .{ .executor = i }, trimLoop, .{ self, i == 0 }) catch |err| {
                     log.debug("No task to trim the request buffers on executor {d}: {}", .{ i, err });
                 };
             }
@@ -2011,12 +2018,20 @@ pub fn Server(comptime Ctx: type) type {
         /// last time, and the first executor's the shared ones too
         /// (`RequestBuffersPool.trimLocal`, `trimShards`); and the
         /// compressors' blocks it cached that no response took
-        /// (`block_cache`).
+        /// (`block_cache`), and the buffered-body encoders no response
+        /// took (`encoders`).
         fn trimLoop(self: *Self, shards: bool) std.Io.Cancelable!void {
+            // One task per executor, canceled at teardown after the drain
+            // and the connections: this runs on the thread that owns the
+            // encoders, and frees those the drain's responses made too.
+            defer if (build_options.use_zlib) encoders.freeLocal();
             while (true) {
                 try self.io.sleep(request_buffers_trim_interval, .awake);
                 self.request_buffers.trimLocal();
                 if (shards) self.request_buffers.trimShards();
+                // The encoders first, so the blocks they give back are
+                // unmapped at the next trim if nothing takes them.
+                if (build_options.use_zlib) encoders.trimLocal();
                 if (build_options.use_zlib or build_options.use_brotli) block_cache.trimLocal();
                 // Objects retired with no writer after them (src/http/core/qsbr.zig).
                 if (shards) qsbr.pollAll();

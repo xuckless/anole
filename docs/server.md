@@ -233,7 +233,7 @@ configuration ([c-abi.md](c-abi.md#configuration)). A duration is an
 `request`: `require_host` (true), `decompress` (true) and `keep_buffers`
 (false). `response`: `write_buffer_size` (16 KiB), `date` (true),
 `default_content_type` (`.text`), `max_header_count` (64) and
-`brotli_quality` (5).
+`brotli_quality` (4).
 
 You get the listeners you name. `.{}` alone leaves them to `listen` or
 `listenTls`, and `run` then serves cleartext HTTP on 127.0.0.1:8080;
@@ -607,7 +607,7 @@ One table; the C ABI's defaults are the same (the schema test checks them).
 | `errors` | `.auto` |
 | `proxy.trusted` / `trusted_hops` | null (the deployment's) / 0 |
 | `environment` / `deployment` / `error_detail` | null / null / null |
-| `response.write_buffer_size` / `date` / `default_content_type` / `max_header_count` / `brotli_quality` | 16 KiB / on / text / 64 / 5 |
+| `response.write_buffer_size` / `date` / `default_content_type` / `max_header_count` / `brotli_quality` | 16 KiB / on / text / 64 / 4 |
 | `executors` | one per CPU |
 | databases: `timeout` / transaction bound | 30 s (`timeout_ms` 30000) / the database's |
 | databases: MongoDB `max_connections` / SQLite `ping_timeout` | 100 (null) / 2 s |

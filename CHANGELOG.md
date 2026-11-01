@@ -7,6 +7,26 @@ breaking changes are listed anyway.
 
 ### Changed
 
+### Fixed
+
+- HTTP/3: a response could hold at most 64 KiB unacknowledged, so a
+  download moved 64 KiB per round trip whatever the path allowed (1.2 MB/s
+  at 50 ms RTT, against 14-38 MB/s over HTTP/1.1). A response's buffer now
+  counts only what is not yet sent: what is in flight (which the congestion
+  window bounds) plus 64 KiB unsent, at most 3 MiB, within the connection's
+  unchanged 4 MiB. A client that stops reading still leaves up to about
+  100 KiB queued (what the stack already took, plus 64 KiB).
+  The HTTP/3 client's request bodies had the same 64 KiB ceiling and now
+  follow the path the same way when `RequestOptions.send_buffer` is null.
+  Message streams (extended CONNECT, and every gRPC, gRPC-Web and Connect
+  streaming request, unary gRPC included) keep their fixed 1 MiB
+  unacknowledged, so a large response there still moves at most 1 MiB per
+  round trip (#151).
+
+- The docs said Anole has no runtime Brotli encoder; it has one (`-Dbrotli`).
+
+### _pre
+
 - Static files and `Response.sendFile` no longer follow a symlink out of
   their directory: `StaticOptions.resolve_beneath` and
   `SendFileOptions.resolve_beneath` are on by default, so a path that
@@ -33,23 +53,25 @@ breaking changes are listed anyway.
   binding built for 0.11 that sends the key to a 0.10 library has its
   configuration refused, as the exact version check says before 1.0 (#133).
 
-### Fixed
-
-- HTTP/3: a response could hold at most 64 KiB unacknowledged, so a
-  download moved 64 KiB per round trip whatever the path allowed (1.2 MB/s
-  at 50 ms RTT, against 14-38 MB/s over HTTP/1.1). A response's buffer now
-  counts only what is not yet sent: what is in flight (which the congestion
-  window bounds) plus 64 KiB unsent, at most 3 MiB, within the connection's
-  unchanged 4 MiB. A client that stops reading still leaves up to about
-  100 KiB queued (what the stack already took, plus 64 KiB).
-  The HTTP/3 client's request bodies had the same 64 KiB ceiling and now
-  follow the path the same way when `RequestOptions.send_buffer` is null.
-  Message streams (extended CONNECT, and every gRPC, gRPC-Web and Connect
-  streaming request, unary gRPC included) keep their fixed 1 MiB
-  unacknowledged, so a large response there still moves at most 1 MiB per
-  round trip (#151).
-
-- The docs said Anole has no runtime Brotli encoder; it has one (`-Dbrotli`).
+- Response compression is cheaper per response (#101). A client that
+  offers `gzip` and `br` at the same q-value (Safari, `gzip, br`) now gets
+  gzip instead of Brotli; zstd still wins a tie, and q-values still decide
+  first. Brotli's default quality for responses is 4 (was 5;
+  `response.brotli_quality` and `res.brotli_quality` still set it), zstd
+  runs at level 1 (was 3) and zlib-ng's gzip at level 2 (was 6).
+- Buffered gzip responses go through libdeflate at level 1, a new bundled
+  dependency (MIT) behind `-Dlibdeflate`, on in the `web` and `full`
+  profiles; zlib-ng still gzips streamed bodies and bodies over 1 MiB, and
+  does all decompression (#101).
+- Each executor keeps one zstd context and one gzip encoder for buffered
+  bodies and reuses them, instead of making them for every response; they
+  are freed when idle for a trim interval (#101).
+- Allocations of 32-64 KiB for compressors come from the per-executor
+  block cache instead of malloc, which with musl mapped and unmapped each
+  one (#101).
+- `application/json` responses (`res.json`, `anole.json`, `content_type =
+  .json`, `.js.map` static files) no longer carry `; charset=UTF-8`: RFC
+  8259 defines no charset parameter for JSON (#101).
 
 ## 0.4.2 (2026-10-31)
 

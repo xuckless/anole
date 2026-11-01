@@ -8,8 +8,8 @@
  *
  * Linking. Link libanole.a (zig build capi) statically: it is one object in
  * which every symbol but anole_* is hidden, so nothing in it is exported
- * from the binding or bound to the OpenSSL, nghttp2, zstd, brotli, sqlite
- * or zlib a host process (Node, CPython) carries. libanole.so /
+ * from the binding or bound to the OpenSSL, nghttp2, zstd, brotli, sqlite,
+ * zlib or libdeflate a host process (Node, CPython) carries. libanole.so /
  * libanole.dylib exist for C programs and tests. Define ANOLE_SHARED before
  * including this header when linking a Windows DLL import library.
  *

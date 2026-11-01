@@ -1050,7 +1050,9 @@ pub const ContentType = enum(u32) {
             .css => "text/css; charset=UTF-8",
             .js => "application/javascript; charset=UTF-8",
             .xml => "application/xml; charset=UTF-8",
-            .json => "application/json; charset=UTF-8",
+            // No charset: RFC 8259 §11 defines none for JSON, which is
+            // UTF-8 by definition.
+            .json => "application/json",
             .msgpack => "application/vnd.msgpack",
             .yaml => "application/yaml; charset=UTF-8",
             .png => "image/png",

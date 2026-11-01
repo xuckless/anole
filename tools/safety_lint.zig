@@ -67,10 +67,11 @@ const c_libs = [_]struct { modules: []const []const u8, files: []const []const u
     .{ .modules = &.{"anole_hiredis_c"}, .files = &.{"src/redis/root.zig"} },
     .{ .modules = &.{"anole_upb_c"}, .files = &.{"src/capi/grpc_schema.zig"} },
     .{ .modules = &.{"llhttp"}, .files = &.{ "src/http/core/parser.zig", "src/http/core/http.zig" } },
-    .{ .modules = &.{ "zlib", "anole_zlib_c" }, .files = &.{ "src/http/core/root.zig", "src/http/core/response.zig", "src/http/core/parser.zig", "src/compression/root.zig", "src/websocket/deflate.zig", "src/kafka/compress.zig" } },
+    .{ .modules = &.{ "zlib", "anole_zlib_c" }, .files = &.{ "src/http/core/root.zig", "src/http/core/response.zig", "src/http/core/encoders.zig", "src/http/core/parser.zig", "src/compression/root.zig", "src/websocket/deflate.zig", "src/kafka/compress.zig" } },
     .{ .modules = &.{ "zstd", "anole_zstd_c" }, .files = &.{ "src/http/core/zstd_io.zig", "src/http/core/root.zig", "src/compression/root.zig", "src/kafka/compress.zig" } },
     .{ .modules = &.{ "brotli", "anole_brotli_c" }, .files = &.{ "src/http/core/brotli_io.zig", "src/http/core/root.zig", "src/compression/root.zig" } },
     .{ .modules = &.{"anole_lz4_c"}, .files = &.{"src/kafka/compress.zig"} },
+    .{ .modules = &.{"libdeflate"}, .files = &.{"src/http/core/libdeflate_io.zig"} },
     .{ .modules = &.{ "anole_sqlite_c", "sqlite" }, .files = &.{"src/sqlite/root.zig"} },
 };
 
