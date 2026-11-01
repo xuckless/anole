@@ -1601,6 +1601,14 @@ pub fn Engine(comptime Ctx: type) type {
                 // came in with no stream open) and wants neither to read
                 // nor to write: close the connection (RFC 9113 §5.4.1).
                 conn.lock();
+                if (conn.writing) {
+                    // The reader started a round since this one's take:
+                    // nothing may close or write under it (`shutSend`).
+                    conn.writer_deferred = true;
+                    conn.unlock();
+                    try conn.writer.wait(conn.io, gen);
+                    continue;
+                }
                 const finished = c.nghttp2_session_want_read(conn.session) == 0 and
                     c.nghttp2_session_want_write(conn.session) == 0;
                 // With the reader gone (the peer closed, or only half-closed
