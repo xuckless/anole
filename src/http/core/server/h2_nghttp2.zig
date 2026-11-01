@@ -1194,9 +1194,11 @@ pub fn Engine(comptime Ctx: type) type {
             // are both done with it by then.
             defer conn.spill.deinit(conn.allocator);
             try conn.initSession();
-            // As many streams as the spares, so a connection's usual
-            // streams never grow the map.
-            conn.streams.ensureTotalCapacity(conn.allocator, conn.max_spares) catch {};
+            // Room for a connection's usual streams, but no more than the
+            // map scans without an index (16 i32 keys in a 64-byte line):
+            // only a connection that runs more streams at once grows the
+            // map and gets its hash index.
+            conn.streams.ensureTotalCapacity(conn.allocator, @min(conn.max_spares, std.atomic.cache_line / @sizeOf(i32))) catch {};
             server.h2_conns.add(&conn);
             defer {
                 server.h2_conns.remove(&conn);

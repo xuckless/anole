@@ -53,9 +53,10 @@ breaking changes are listed anyway.
   does: both directions shut, and the round is never written a second time
   (#99).
 - HTTP/2: a connection's streams are kept in std's array hash map (a
-  dense array, backward-shift deletion, no tombstones) with room for the
-  client's concurrency made when the connection starts, instead of a hash
-  map whose removals left tombstones to walk past (#99).
+  dense array, backward-shift deletion, no tombstones) with room for 16
+  streams made when the connection starts (a linear scan, no hash index,
+  until a connection runs more at once), instead of a hash map whose
+  removals left tombstones to walk past (#99).
 - gRPC: a unary call's response is collected in the call's arena and sent
   whole (HTTP/2 and HTTP/3: HEADERS, DATA and trailers in one round),
   instead of through a streaming body queue; a binary gRPC message is
