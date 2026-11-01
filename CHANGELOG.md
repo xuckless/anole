@@ -3,7 +3,7 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
-## 0.5.0 (unreleased)
+## 0.5.0 (2026-11-01)
 
 ### Changed
 
