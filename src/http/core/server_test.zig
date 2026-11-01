@@ -1215,6 +1215,12 @@ const CorkCtx = struct {
         server.router.addRouteWith(.get, "/ws", ws, .{ .no_wait = true });
         server.router.addRouteWith(.get, "/badlen", badLength, .{ .no_wait = true });
         server.router.get("/wait", waitForClient);
+        server.router.addRouteWith(.post, "/ignore", ignore, .{ .no_wait = true });
+    }
+
+    /// Answers without reading its body.
+    fn ignore(_: *CorkCtx, _: *dusty.Request, res: *dusty.Response) !void {
+        res.body = "ignored";
     }
 
     fn a(_: *CorkCtx, _: *dusty.Request, res: *dusty.Response) !void {
@@ -1311,21 +1317,75 @@ const CorkClient = struct {
     }
 };
 
-test "Server: pipelined no_wait requests are answered in order, in one write" {
+// That a batch the server has all buffered goes out in one write is
+// server.zig's test (over a socket pair, so the server's first read is
+// sure to take the whole batch); this one holds however the reads fall.
+test "Server: pipelined no_wait requests are answered in order" {
     var client: CorkClient = .{};
     try client.start();
     defer client.stop();
 
-    const before = dusty.Connection.TestSocketWrites.get();
-    // One write, so one read on the server: all three are buffered when
-    // the first is answered.
     try client.send("GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
         "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
         "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n");
     try client.expectBody("a");
     try client.expectBody("c");
     try client.expectBody("a");
-    try std.testing.expectEqual(@as(usize, 1), dusty.Connection.TestSocketWrites.get() - before);
+}
+
+test "Server: a corked response goes out before a pipelined body its handler left unread is thrown away" {
+    var client: CorkClient = .{};
+    try client.start();
+    defer client.stop();
+
+    // `/ignore` never reads its body, so the server throws it away after
+    // the handler (flush point 3(d), a guard here: the body is buffered
+    // whole, and a body still to come is flushed for before the handler).
+    try client.send("GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "POST /ignore HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello" ++
+        "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try client.expectBody("a");
+    try client.expectBody("ignored");
+    try client.expectBody("c");
+}
+
+test "Server: a peer that stops reading during a corked batch is cut off by timeout.request, and the connection let go" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        // Corked responses are whole bodies in memory, so their writes are
+        // bounded by the request deadline (`timeout.write` is for streams).
+        .timeout = .{ .request = .fromMilliseconds(300) },
+    }, {});
+    defer server.deinit();
+    server.router.addRouteWith(.get, "/big", struct {
+        const body: [64 * 1024]u8 = @splat('x');
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = &body;
+        }
+    }.handle, .{ .no_wait = true });
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    // 400 pipelined requests for 64 KiB each: 25 MiB of answers, corked
+    // behind the requests still buffered and written as the write buffer
+    // fills, far past what loopback's socket buffers hold. The client
+    // reads none of it and keeps its end open.
+    const request = "GET /big HTTP/1.1\r\nHost: x\r\n\r\n";
+    var requests: [400 * request.len]u8 = undefined;
+    for (0..400) |i| @memcpy(requests[i * request.len ..][0..request.len], request);
+    const stream = try startRaw(io, &server, &requests);
+    defer stream.close(io);
+    try wait.waitUntil(io, "the server let the connection go", &server, struct {
+        fn gone(s: *dusty.Server(void)) bool {
+            return s.active_connections.load(.acquire) == 0;
+        }
+    }.gone);
 }
 
 test "Server: corked responses go out before the server waits for the rest of a pipelined head" {

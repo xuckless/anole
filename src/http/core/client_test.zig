@@ -954,6 +954,70 @@ test "Server: reloadTls swaps a listener's certificate; open connections keep th
     try tlsRoundTrip(&conn);
 }
 
+test "Server: pipelined no_wait requests in one TLS record are answered in one write" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const tls = @import("tls");
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } }},
+    }, {});
+    defer server.deinit();
+    server.router.addRouteWith(.get, "/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "ok";
+        }
+    }.handle, .{ .no_wait = true });
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const ca: dusty.Ca = .{ .file = test_cert_path };
+    var bundle = try ca.load(std.testing.allocator, io);
+    defer bundle.deinit(std.testing.allocator);
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var read_buf: [tls.input_buffer_len]u8 = undefined;
+    var write_buf: [tls.output_buffer_len]u8 = undefined;
+    var tcp_reader = stream.reader(io, &read_buf);
+    var tcp_writer = stream.writer(io, &write_buf);
+    var rng: std.Random.IoSource = .{ .io = io };
+    var conn = try tls.client(&tcp_reader.interface, &tcp_writer.interface, .{
+        .host = "localhost",
+        .root_ca = bundle,
+        .now = std.Io.Clock.real.now(io),
+        .rng = rng.interface(),
+    });
+    // One request first: the server is past the handshake, so what it
+    // writes from here on is answers.
+    try tlsRoundTrip(&conn);
+
+    const before = dusty.Connection.TestSocketWrites.get();
+    // One flush of a buffer that holds all three: one record, which the
+    // server decrypts whole, so all three are buffered when the first is
+    // answered.
+    var wbuf: [256]u8 = undefined;
+    var w = conn.writer(&wbuf);
+    for (0..3) |_| try w.interface.writeAll("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.interface.flush();
+    var rbuf: [4096]u8 = undefined;
+    var r = conn.reader(&rbuf);
+    for (0..3) |_| {
+        const status = try r.interface.takeDelimiterInclusive('\n');
+        try std.testing.expect(std.mem.startsWith(u8, status, "HTTP/1.1 200"));
+        while (true) {
+            const line = try r.interface.takeDelimiterInclusive('\n');
+            if (std.mem.eql(u8, line, "\r\n")) break;
+        }
+        try std.testing.expectEqualStrings("ok", try r.interface.take(2));
+    }
+    try std.testing.expectEqual(@as(usize, 1), dusty.Connection.TestSocketWrites.get() - before);
+}
+
 test "Server: tls.alpn_protocols is offered to the client through ALPN" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const tls = @import("tls");

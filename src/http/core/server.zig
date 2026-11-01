@@ -469,9 +469,10 @@ pub const Connection = struct {
         self.buffers = try allocator.alloc(u8, tls_buffers_len);
     }
 
-    /// Tests only: the writes that reached the socket of any plain
-    /// connection (`Stream.Writer` drains and sendfiles), so a test can
-    /// count the writes a batch of responses took without timing anything.
+    /// Tests only: the writes that reached the socket of any connection
+    /// (`Stream.Writer` drains and sendfiles; over TLS, of the records),
+    /// so a test can count the writes a batch of responses took without
+    /// timing anything.
     pub const TestSocketWrites = if (builtin.is_test) struct {
         var count: std.atomic.Value(usize) = .init(0);
         // SAFETY: only the vtable is taken, at comptime; the stream and
@@ -525,6 +526,7 @@ pub const Connection = struct {
 
         self.tcp_reader = stream.reader(io, tcp_read_buffer);
         self.tcp_writer = stream.writer(io, tcp_write_buffer);
+        if (builtin.is_test) self.tcp_writer.interface.vtable = &TestSocketWrites.vtable;
         self.tls_rng = .{ .io = io };
         self.tls_conn = try tls.server(&self.tcp_reader.interface, &self.tcp_writer.interface, .{
             .auth = auth,
@@ -3697,7 +3699,34 @@ fn fuzzConnection(input: []const u8) !void {
     server.router.post("/", handlers.echo);
     server.router.put("/*rest", handlers.echo);
 
-    var l: Server(void).ActiveListener = .{ .config = &listener, .address = listener.address, .server = undefined };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try feedConnection(io, &server, &listener, input, &out);
+
+    // Every response the server wrote is a response: an HTTP/1.1 status
+    // line, or (HTTP/2) frames that start with its SETTINGS.
+    if (out.items.len > 0) {
+        if (std.mem.startsWith(u8, out.items, "HTTP/1.")) {
+            var it = std.mem.splitSequence(u8, out.items, "\r\n");
+            while (it.next()) |line| for (line) |ch| {
+                // No header value smuggled a line break or a NUL out.
+                try std.testing.expect(ch != '\r' and ch != '\n' and ch != 0 or !std.ascii.startsWithIgnoreCase(line, "x-"));
+            };
+        } else {
+            try std.testing.expect(build_options.use_http2);
+            try std.testing.expect(out.items.len >= 9 and out.items[3] == 0x04);
+        }
+    }
+}
+
+/// Serves `input`, and then its end, as one connection of `server`'s
+/// listener `listener`, through `handleConnectionWrapper` over a socket
+/// pair, and appends what the server wrote to `out`. The whole input is
+/// in the socket before the connection starts reading, so the server's
+/// first read takes all of it (up to its read buffer). Checks that the
+/// connection gave back what it held.
+fn feedConnection(io: std.Io, server: *Server(void), listener: *const @import("config.zig").Listener, input: []const u8, out: *std.ArrayList(u8)) !void {
+    var l: Server(void).ActiveListener = .{ .config = listener, .address = listener.address, .server = undefined };
     var fds: [2]std.c.fd_t = undefined;
     if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds) != 0) return error.SocketPair;
     defer _ = std.c.close(fds[1]);
@@ -3709,8 +3738,9 @@ fn fuzzConnection(input: []const u8) !void {
     // until something else wakes it: a plain C reader on read(2) or
     // recvmsg(2) does this about once in 3,000 to 30,000 pairs on macOS 27
     // (none in 600,000 TCP loopback pairs, none on Linux). An end that is
-    // already there when the reads start is seen at once. The input fits
-    // the socket buffer (at most `fuzz.max_len`, 4 KiB; 8 KiB on macOS).
+    // already there when the reads start is seen at once. The input must
+    // fit the socket buffer (8 KiB on macOS; the fuzzer's is at most
+    // `fuzz.max_len`, 4 KiB).
     var wrote: usize = 0;
     while (wrote < input.len) {
         const n = std.c.write(fds[1], input[wrote..].ptr, input.len - wrote);
@@ -3730,12 +3760,10 @@ fn fuzzConnection(input: []const u8) !void {
     try server.reserveConnectionSlot();
     // With the deadline watch the accept loop gives it, which also bounds
     // a lingering close rather than sleeping it out.
-    var future = try io.concurrent(Server(void).handleConnectionWrapper, .{ &server, &l, stream });
+    var future = try io.concurrent(Server(void).handleConnectionWrapper, .{ server, &l, stream });
     var finished = false;
     defer if (!finished) future.cancel(io) catch {};
 
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(std.testing.allocator);
     while (true) {
         var pfd = [_]std.c.pollfd{.{ .fd = fds[1], .events = std.c.POLL.IN, .revents = 0 }};
         // The peer is done, so the server must finish on its own.
@@ -3748,23 +3776,54 @@ fn fuzzConnection(input: []const u8) !void {
     finished = true;
     future.await(io) catch {};
 
-    // Every response the server wrote is a response: an HTTP/1.1 status
-    // line, or (HTTP/2) frames that start with its SETTINGS.
-    if (out.items.len > 0) {
-        if (std.mem.startsWith(u8, out.items, "HTTP/1.")) {
-            var it = std.mem.splitSequence(u8, out.items, "\r\n");
-            while (it.next()) |line| for (line) |ch| {
-                // No header value smuggled a line break or a NUL out.
-                try std.testing.expect(ch != '\r' and ch != '\n' and ch != 0 or !std.ascii.startsWithIgnoreCase(line, "x-"));
-            };
-        } else {
-            try std.testing.expect(build_options.use_http2);
-            try std.testing.expect(out.items.len >= 9 and out.items[3] == 0x04);
-        }
-    }
     // The connection gave back what it held.
     try std.testing.expectEqual(@as(u32, 0), server.active_connections.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.busy.load(.acquire).count);
+}
+
+test "Server: pipelined no_wait requests that are all buffered are answered in order, in one write" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // feeds the connection through socketpair(2), which Windows lacks
+    const io = std.testing.io;
+    const listener: @import("config.zig").Listener = .{ .address = .{ .ip = .{ .ip4 = .loopback(0) } } };
+    var server = Server(void).init(std.testing.allocator, io, .{ .listeners = &.{listener} }, {});
+    defer server.deinit();
+    const handlers = struct {
+        fn a(_: *Request, res: *Response) !void {
+            res.body = "a";
+        }
+        fn c(_: *Request, res: *Response) !void {
+            res.body = "c";
+        }
+    };
+    server.router.addRouteWith(.get, "/a", handlers.a, .{ .no_wait = true });
+    server.router.addRouteWith(.get, "/c", handlers.c, .{ .no_wait = true });
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    const before = Connection.TestSocketWrites.get();
+    // All three, and the end of input, are in the socket before the
+    // server's first read: the first two answers are corked behind the
+    // requests still buffered, and the third, with nothing buffered
+    // behind it, sends all three.
+    try feedConnection(io, &server, &listener, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n", &out);
+    try std.testing.expectEqual(@as(usize, 1), Connection.TestSocketWrites.get() - before);
+
+    // Three 200s, their bodies in request order.
+    var bodies: [3]u8 = undefined;
+    var n: usize = 0;
+    var rest: []const u8 = out.items;
+    while (std.mem.indexOf(u8, rest, "\r\n\r\n")) |end| {
+        try std.testing.expect(std.mem.startsWith(u8, rest, "HTTP/1.1 200 "));
+        try std.testing.expect(n < bodies.len);
+        bodies[n] = rest[end + 4];
+        n += 1;
+        rest = rest[end + 5 ..];
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("aca", &bodies);
+    try std.testing.expectEqual(@as(usize, 0), rest.len);
 }
 
 test "fuzz: a connection's bytes, HTTP/1.1 or HTTP/2 with prior knowledge" {
