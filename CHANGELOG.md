@@ -16,7 +16,8 @@ breaking changes are listed anyway.
   the connection (#99).
 - HTTP/2: a stream's body window is raised in steps (64 KiB, 256 KiB,
   1 MiB at the defaults) only when the body is longer than the window or
-  of unknown length and the client has used the window up, instead of to
+  of unknown length and the client has sent a whole window since the
+  last step (however fast the handler reads), instead of to
   1 MiB on the handler's first read. A handler that reads before its DATA
   arrives (HEADERS and DATA in separate reads, as browsers, grpc-go and
   curl often send them) no longer takes a 1 MiB buffer for a small body

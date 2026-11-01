@@ -325,6 +325,18 @@ const TestClient = struct {
 
     /// Receives, sending nothing (the SETTINGS ACK the session owes stays
     /// queued), until a WINDOW_UPDATE for a stream has come.
+    /// Receives until stream `id` and the connection each have room for
+    /// `n` more body bytes (the server's WINDOW_UPDATEs are on their way).
+    fn recvUntilRoom(self: *TestClient, id: i32, n: usize) !void {
+        while (@min(c.nghttp2_session_get_stream_remote_window_size(self.session, id), c.nghttp2_session_get_remote_window_size(self.session)) < n) {
+            try self.sendPending();
+            const bytes = try self.r.peekGreedy(1);
+            const rv = c.nghttp2_session_mem_recv2(self.session, bytes.ptr, bytes.len);
+            if (rv < 0) return error.Http2Recv;
+            self.r.toss(@intCast(rv));
+        }
+    }
+
     fn recvUntilStreamWindowUpdate(self: *TestClient) !void {
         while (self.stream_window_updates == 0) {
             const bytes = try self.r.peekGreedy(1);
@@ -472,8 +484,8 @@ const Handlers = struct {
     }
     const stall_credit = 512 * 1024;
     var stall_gate: std.Io.Event = .unset;
-    /// `sum`, reading one byte each time the server has seen the peer use
-    /// up the stream's window (`h2.test_window.fulls` past
+    /// `sum`, reading one byte each time the server has seen the peer send
+    /// a whole window since the last raise (`h2.test_window.fulls` past
     /// `stepper_base`), twice, then the rest: each of those reads raises
     /// the window one step.
     fn stepper(req: *dusty.Request, res: *dusty.Response) !void {
@@ -491,6 +503,22 @@ const Handlers = struct {
         try res.print(.text, "{d} {x}", .{ n, hash.final() });
     }
     var stepper_base: u32 = 0;
+    /// `sum`, reading the body straight from the stream as it comes, and
+    /// telling the test how much it has read so far (`reader_got`).
+    fn reader(req: *dusty.Request, res: *dusty.Response) !void {
+        const raw = req._body_source.?.reader;
+        var hash: std.hash.Wyhash = .init(0);
+        var n: usize = 0;
+        while (true) {
+            n += takeBody(raw, &hash, 4096) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => |e| return e,
+            };
+            reader_got.store(@intCast(n), .release);
+        }
+        try res.print(.text, "{d} {x}", .{ n, hash.final() });
+    }
+    var reader_got: std.atomic.Value(u32) = .init(0);
     /// At most `limit` body bytes, straight from the stream: each read is
     /// what the engine credits back.
     fn takeBody(raw: *std.Io.Reader, hash: *std.hash.Wyhash, limit: usize) !usize {
@@ -575,6 +603,7 @@ const Fixture = struct {
         self.server.router.post("/late", Handlers.late);
         self.server.router.post("/stall", Handlers.stall);
         self.server.router.post("/stepper", Handlers.stepper);
+        self.server.router.post("/reader", Handlers.reader);
         // The same handlers on routes that promise not to wait, which run
         // on the connection's reader when their request comes whole.
         self.server.router.addRouteWith(.get, "/nw/hello", Handlers.hello, .{ .no_wait = true });
@@ -1248,6 +1277,52 @@ test "HTTP/2: a long body of unknown length raises its window in steps, 256 KiB 
     try client.run();
     var expect: [64]u8 = undefined;
     try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), client.get(id).body.items);
+    try std.testing.expectEqual(raises + 2, h2.test_window.raises.load(.monotonic));
+    const n = h2.test_window.raised.len;
+    try std.testing.expectEqual(@as(u32, 256 * 1024), h2.test_window.raised[raises % n].load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1024 * 1024), h2.test_window.raised[(raises + 1) % n].load(.monotonic));
+}
+
+test "HTTP/2: a handler that reads each piece of a long body as it comes still gets its window raised" {
+    // Such a handler gives the window back at each half (WINDOW_UPDATE),
+    // so the window never runs out: the raise goes by what the peer sent.
+    const io = std.testing.io;
+    var fx: Fixture = undefined;
+    try fx.start(io);
+    defer fx.stop(io);
+    var client: TestClient = undefined;
+    try client.init(std.testing.allocator, io, fx.server.address.ip);
+    defer client.deinit();
+    const body = try std.testing.allocator.alloc(u8, 512 * 1024);
+    defer std.testing.allocator.free(body);
+    for (body, 0..) |*b, i| b.* = @truncate(i *% 13 +% (i >> 10));
+    Handlers.reader_got.store(0, .release);
+    const raises = h2.test_window.raises.load(.monotonic);
+    // Pieces of a quarter window, each sent only once the handler has
+    // read everything before it.
+    const piece = 16 * 1024;
+    const id = try client.request("POST", "/reader", body[0..piece]);
+    const resp = client.get(id);
+    resp.keep_open = true;
+    var end: usize = piece;
+    while (true) {
+        try client.sendPending();
+        try std.testing.expectEqual(end, @atomicLoad(usize, &resp.sent, .acquire));
+        try wait.waitAtLeast(io, "the handler read every piece sent", &Handlers.reader_got, @intCast(end));
+        if (end == body.len) break;
+        try client.recvUntilRoom(id, piece);
+        end += piece;
+        resp.send = body[0..end];
+        if (end == body.len) resp.keep_open = false;
+        // Deferred by the provider, unless a WINDOW_UPDATE that came
+        // after the piece put the stream back in the queue already (then
+        // the next send asks the provider again).
+        _ = c.nghttp2_session_resume_data(client.session, id);
+    }
+    try client.run();
+    var expect: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expect, "{d} {x}", .{ body.len, std.hash.Wyhash.hash(0, body) }), resp.body.items);
+    // 64 KiB sent: 256 KiB; 256 KiB more: 1 MiB, `stream_window_reading`.
     try std.testing.expectEqual(raises + 2, h2.test_window.raises.load(.monotonic));
     const n = h2.test_window.raised.len;
     try std.testing.expectEqual(@as(u32, 256 * 1024), h2.test_window.raised[raises % n].load(.monotonic));

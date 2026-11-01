@@ -729,7 +729,7 @@ handlers as HTTP/1.1.
 length, or one that comes whole in one DATA frame, gets a buffer its size),
 `stream_window_reading` (1 MiB: what the window and buffer grow to, in
 steps of four from 64 KiB, while the handler reads a body longer than the
-window and the client keeps using the window up),
+window and the client keeps sending a whole window per step),
 `tunnel_window` (128 KiB: the one fixed window and buffer of a WebSocket
 over HTTP/2; raise it for bulk uploads over long round trips),
 `reading_window_budget` (16 MiB: what those raised buffers take at most per

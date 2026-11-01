@@ -92,8 +92,8 @@ pub const test_body_allocs = if (@import("builtin").is_test) struct {
     pub var block: std.atomic.Value(usize) = .init(0);
 } else struct {};
 
-/// Tests only: times a stream's peer used up the window of a stream that
-/// may still be raised (`Stream.window_full`), and the raises, with the
+/// Tests only: times a stream's peer sent a whole window of a body that
+/// may still be raised (`Stream.raise_due`), and the raises, with the
 /// window each raised to (the last `test_raised.len`).
 pub const test_window = if (@import("builtin").is_test) struct {
     pub var fulls: std.atomic.Value(u32) = .init(0);
@@ -631,9 +631,16 @@ pub fn Engine(comptime Ctx: type) type {
             /// peer keeps using it up (`raiseWindow`). Zero until raised
             /// (`window`).
             recv_window: u31 = 0,
-            /// The peer used up the stream's window, which may still be
-            /// raised (`mayRaise`): the handler's next read raises it.
-            window_full: bool = false,
+            /// The peer sent a whole window since the window was last
+            /// raised (`since_raise`), and it may still be raised
+            /// (`mayRaise`): the handler's next read raises it.
+            raise_due: bool = false,
+            /// Body bytes the peer sent since the window was last raised,
+            /// counting what was queued unread then. Counted however fast
+            /// the handler reads: a handler that keeps up gives the window
+            /// back at each half (WINDOW_UPDATE), so the window itself never
+            /// runs out.
+            since_raise: usize = 0,
             /// The request had no body at all (END_STREAM on its HEADERS),
             /// or its body has ended.
             body_done: bool = false,
@@ -728,11 +735,24 @@ pub fn Engine(comptime Ctx: type) type {
                 mem: []u8 = &.{},
                 from: enum { none, arena, heap, block } = .none,
 
+                /// The block a queue of `size` bytes takes from `block_cache`,
+                /// a whole class, or null when it comes from elsewhere.
+                fn blockFor(size: usize) ?usize {
+                    if (size <= block_cache.malloc_max) return null;
+                    return block_cache.classFor(size);
+                }
+
+                /// What a queue of `size` bytes takes: its block, else
+                /// itself.
+                fn footprint(size: usize) usize {
+                    return blockFor(size) orelse size;
+                }
+
                 fn alloc(stream: *Stream, size: usize) ?BodyBuf {
                     const buf: BodyBuf = if (size <= arena_body_max)
                         .{ .mem = stream.arena.allocator().alloc(u8, size) catch return null, .from = .arena }
-                    else if (size > block_cache.malloc_max and size <= block_cache.classes[block_cache.classes.len - 1])
-                        .{ .mem = block_cache.take(block_cache.classFor(size).?) orelse return null, .from = .block }
+                    else if (blockFor(size)) |class|
+                        .{ .mem = block_cache.take(class) orelse return null, .from = .block }
                     else
                         .{ .mem = stream.conn.allocator.alloc(u8, size) catch return null, .from = .heap };
                     if (comptime @import("builtin").is_test) {
@@ -787,8 +807,9 @@ pub fn Engine(comptime Ctx: type) type {
                 return true;
             }
 
-            /// The handler reads the body and the peer used up the window
-            /// (`window_full`): the window grows a step, four times (64 KiB,
+            /// The handler reads the body and the peer sent a whole window
+            /// since the last raise (`raise_due`): the window grows a step,
+            /// four times (64 KiB,
             /// 256 KiB, 1 MiB at the defaults), up to
             /// `stream_window_reading` and the content-length, and the body
             /// queue with it, so the session can still always put a whole
@@ -797,7 +818,7 @@ pub fn Engine(comptime Ctx: type) type {
             /// mutex.
             fn raiseWindow(stream: *Stream) void {
                 const conn = stream.conn;
-                stream.window_full = false;
+                stream.raise_due = false;
                 if (stream.body_done or stream.reset or stream.discarding) return;
                 if (!stream.mayRaise()) return;
                 const want = conn.config.stream_window_reading;
@@ -808,35 +829,42 @@ pub fn Engine(comptime Ctx: type) type {
                 // to the default window, and the ACK still moves this one.
                 const acked = conn.ackedStreamWindow();
                 const size: usize = @max(next, acked);
-                // The connection's raised windows share one budget; a stream
-                // past it reads at the window it has.
-                if (size -| stream.raised_bytes > conn.config.reading_window_budget -| conn.raised_bytes) return;
+                // The connection's raised windows share one budget, charged
+                // with the whole block a queue takes; a stream past it reads
+                // at the window it has (and tries again at its next window).
+                const cost = BodyBuf.footprint(size);
+                if (cost -| stream.raised_bytes > conn.config.reading_window_budget -| conn.raised_bytes) return;
                 var buf = BodyBuf.alloc(stream, size) orelse return;
-                var bigger: std.Io.Queue(u8) = .init(buf.mem[0..size]);
-                if (stream.body) |*q| {
-                    // What is queued moves over, in order; nobody else gets
-                    // from it (this is the handler), and the session puts
-                    // only under the mutex.
-                    var scratch: [4096]u8 = undefined;
-                    while (true) {
-                        const n = q.getUncancelable(conn.io, &scratch, 0) catch break;
-                        if (n == 0) break;
-                        _ = bigger.putUncancelable(conn.io, scratch[0..n], 0) catch unreachable;
-                    }
-                }
-                // Less by what that ACK will add, so the window lands on
-                // `next` and never holds more than the queue.
+                // The window first: if the session refuses it, the old queue
+                // stays as it is. Less by what that ACK will add, so the
+                // window lands on `next` and never holds more than the queue.
+                // Nothing is put meanwhile: the session puts only under the
+                // mutex.
                 const pending = if (conn.config.stream_window > acked) conn.config.stream_window - acked else 0;
                 if (c.nghttp2_session_set_local_window_size(conn.session, c.NGHTTP2_FLAG_NONE, stream.id, next - pending) != 0) {
                     buf.free(conn.allocator);
                     return;
                 }
+                var bigger: std.Io.Queue(u8) = .init(buf.mem[0..size]);
+                var moved: usize = 0;
+                if (stream.body) |*q| {
+                    // What is queued moves over, in order; nobody else gets
+                    // from it (this is the handler).
+                    var scratch: [4096]u8 = undefined;
+                    while (true) {
+                        const n = q.getUncancelable(conn.io, &scratch, 0) catch break;
+                        if (n == 0) break;
+                        _ = bigger.putUncancelable(conn.io, scratch[0..n], 0) catch unreachable;
+                        moved += n;
+                    }
+                }
                 stream.body = bigger;
                 stream.body_buf.free(conn.allocator);
                 stream.body_buf = buf;
                 stream.recv_window = next;
-                conn.raised_bytes = conn.raised_bytes - stream.raised_bytes + size;
-                stream.raised_bytes = size;
+                stream.since_raise = moved;
+                conn.raised_bytes = conn.raised_bytes - stream.raised_bytes + cost;
+                stream.raised_bytes = cost;
                 if (comptime @import("builtin").is_test) {
                     const i = test_window.raises.fetchAdd(1, .monotonic);
                     test_window.raised[i % test_window.raised.len].store(next, .monotonic);
@@ -2084,7 +2112,7 @@ pub fn Engine(comptime Ctx: type) type {
                 const queue = blk: {
                     while (true) {
                         conn.lock();
-                        if (stream.window_full) stream.raiseWindow();
+                        if (stream.raise_due) stream.raiseWindow();
                         const q = if (stream.body) |*q| q else null;
                         const done = stream.body_done;
                         const reset = stream.reset;
@@ -2894,12 +2922,19 @@ pub fn Engine(comptime Ctx: type) type {
                 resetBody(conn, stream, len - put);
                 return 0;
             }
-            // The peer has no window left: the handler's next read raises
-            // it, if it may grow (`Stream.raiseWindow`). Only asked of a
-            // body that may need it, not of one that fits the window.
-            if (!stream.window_full and stream.mayRaise() and c.nghttp2_session_get_stream_local_window_size(session, stream_id) == 0) {
-                stream.window_full = true;
-                if (comptime @import("builtin").is_test) _ = test_window.fulls.fetchAdd(1, .monotonic);
+            // The peer sent a whole window since the last raise: the
+            // handler's next read raises it, if it may grow
+            // (`Stream.raiseWindow`). Only counted for a body that may need
+            // it, not for one that fits the window. Before the first raise
+            // the window is the one the peer may use: the default until it
+            // has acknowledged the server's SETTINGS.
+            if (!stream.raise_due and stream.mayRaise()) {
+                stream.since_raise += len;
+                const window: usize = if (stream.recv_window != 0) stream.recv_window else @min(conn.config.stream_window, conn.ackedStreamWindow());
+                if (stream.since_raise >= window) {
+                    stream.raise_due = true;
+                    if (comptime @import("builtin").is_test) _ = test_window.fulls.fetchAdd(1, .monotonic);
+                }
             }
             return 0;
         }
