@@ -54,6 +54,12 @@ breaking changes are listed anyway.
   dense array, backward-shift deletion, no tombstones) with room for the
   client's concurrency made when the connection starts, instead of a hash
   map whose removals left tombstones to walk past (#99).
+- gRPC: a unary call's response is collected in the call's arena and sent
+  whole (HTTP/2 and HTTP/3: HEADERS, DATA and trailers in one round),
+  instead of through a streaming body queue; a binary gRPC message is
+  encoded behind room kept for its 5-byte frame prefix, so the body is
+  never copied. `Call.addHeader` in a unary call now works until the call
+  ends (#99).
 
 ## 0.4.2 (2026-10-31)
 

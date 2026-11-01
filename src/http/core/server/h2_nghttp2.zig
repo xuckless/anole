@@ -83,6 +83,12 @@ pub var test_before_writer_wait: if (@import("builtin").is_test) ?*const fn (std
 pub var test_writer_rounds: if (@import("builtin").is_test) std.atomic.Value(u32) else void =
     if (@import("builtin").is_test) .init(0) else {};
 
+/// Tests only: streams whose handler asked for a body writer
+/// (`StreamSink.body`), the streaming path; a response sent whole never
+/// does.
+pub var test_sink_bodies: if (@import("builtin").is_test) std.atomic.Value(u32) else void =
+    if (@import("builtin").is_test) .init(0) else {};
+
 /// Tests only: the writer task's waits for output that returned (woken,
 /// or a deadline).
 pub var test_writer_wakes: if (@import("builtin").is_test) std.atomic.Value(u32) else void =
@@ -2466,6 +2472,7 @@ pub fn Engine(comptime Ctx: type) type {
 
             fn body(ptr: *anyopaque) *std.Io.Writer {
                 const self = fromPtr(ptr);
+                if (comptime @import("builtin").is_test) _ = test_sink_bodies.fetchAdd(1, .monotonic);
                 if (self.writer.buffer.len == 0 and self.stream.parked == null) {
                     // A handler that never writes a body never pays for it.
                     const stream = self.stream;

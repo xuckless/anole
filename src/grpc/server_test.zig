@@ -365,6 +365,35 @@ test "gRPC: the four call modes and trailing metadata over h2 (raw nghttp2 clien
     }.run);
 }
 
+test "gRPC: a unary call over h2 is answered whole, never through a streaming body writer" {
+    try withEchoServer(.{}, struct {
+        fn run(env: *EchoEnv) !void {
+            const bodies = dusty.h2_engine_for_tests.test_sink_bodies.load(.monotonic);
+            for ([_][]const u8{ "hello", "", "bin-trailer" }) |message| {
+                const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/Unary", &.{.{ .message = message }}, &.{});
+                defer cl.deinit();
+                try std.testing.expectEqual(@as(u16, 200), cl.status);
+                try std.testing.expectEqual(@as(?u32, 0), cl.grpc_status);
+                const rs = try cl.responses(env.arena);
+                try std.testing.expectEqual(@as(usize, 1), rs.len);
+                try std.testing.expectEqualStrings(message, rs[0].message);
+            }
+            // A failed call too: its status alone, with an empty body.
+            {
+                const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/Unary", &.{.{ .message = "fail" }}, &.{});
+                defer cl.deinit();
+                try std.testing.expectEqual(@as(?u32, @backingInt(grpc.Code.not_found)), cl.grpc_status);
+            }
+            try std.testing.expectEqual(bodies, dusty.h2_engine_for_tests.test_sink_bodies.load(.monotonic));
+            // A server stream still streams.
+            const cl = try Client.call(env.gpa, env.io, env.addr, "/anole.test.Echo/ServerStream", &.{.{ .message = "tick", .repeat = 2 }}, &.{});
+            defer cl.deinit();
+            try std.testing.expectEqual(@as(?u32, 0), cl.grpc_status);
+            try std.testing.expect(dusty.h2_engine_for_tests.test_sink_bodies.load(.monotonic) > bodies);
+        }
+    }.run);
+}
+
 test "gRPC: a handler's fail status and message reach the client" {
     try withEchoServer(.{}, struct {
         fn run(env: *EchoEnv) !void {
