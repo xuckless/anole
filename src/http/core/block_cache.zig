@@ -8,8 +8,8 @@
 //! zlib-ng's deflate state for a buffered gzip body (one block of 140 KiB
 //! and more). An arena would keep that much for as long as it is reused (an
 //! HTTP/1.1 connection keeps its arena's capacity), or give it back and map
-//! it again on the next response (HTTP/2 and HTTP/3 keep up to 128 KiB and
-//! 8 KiB of a stream's arena). Fresh from malloc it would be mapped and
+//! it again on the next response (HTTP/2 and HTTP/3 keep about 8 KiB of a
+//! stream's arena). Fresh from malloc it would be mapped and
 //! unmapped for every response too: musl's malloc maps anything past 128
 //! KiB, glibc's until its threshold adapts, and each page then faults in
 //! again.
@@ -29,8 +29,14 @@
 //! Callers that know their size (the HTTP/2 engine's request body queues)
 //! use `take` and `give`, which hand out a class's block as it is, with no
 //! header in front: a 64 KiB queue is a 64 KiB block. `alloc` and `free`
-//! (malloc's contract, for the compressors) put a 16-byte header in front,
-//! and round up to the class that holds both.
+//! (malloc's contract, for the compressors) need a 16-byte header in front
+//! of what they hand out, and the compressors' large allocations are powers
+//! of two (Brotli's two 256 KiB hash tables at quality 5): a header inside
+//! the class would push each into the next class up. So every block is
+//! mapped one page longer than its class, and `alloc` puts its header at
+//! the end of that first page and hands out the class from the page after
+//! it; `take` hands out the class from the block's start, and the last page
+//! stays untouched (never faulted in).
 //!
 //! A block given back on a thread that never trims (a blocking-pool thread)
 //! stays in that thread's cache, which the same bounds cap. The classes
@@ -93,6 +99,15 @@ threadlocal var cache: Cache = .{};
 const page_allocator = std.heap.page_allocator;
 const page_align: std.mem.Alignment = .fromByteUnits(std.heap.page_size_min);
 
+/// What a block of `class` bytes maps: one page more (see the top).
+fn mapLen(class: usize) usize {
+    return class + std.heap.pageSize();
+}
+
+fn unmap(start: [*]align(16) u8, class: usize) void {
+    page_allocator.rawFree(start[0..mapLen(class)], page_align, @returnAddress());
+}
+
 /// The index of the smallest class that holds `size` bytes, or null past
 /// the largest.
 pub fn classIndex(size: usize) ?usize {
@@ -127,7 +142,7 @@ pub fn take(class_size: usize) ?[]align(16) u8 {
         const block: [*]align(16) u8 = @ptrCast(f);
         return block[0..class_size];
     }
-    const fresh = page_allocator.rawAlloc(class_size, page_align, @returnAddress()) orelse return null;
+    const fresh = page_allocator.rawAlloc(mapLen(class_size), page_align, @returnAddress()) orelse return null;
     // SAFETY: mapped at page alignment, past 16.
     return @alignCast(fresh[0..class_size]);
 }
@@ -138,7 +153,8 @@ pub fn give(block: []u8) void {
     const i = exactIndex(block.len) orelse unreachable; // not from `take`
     const list = &cache.lists[i];
     if (cache.bytes + block.len > max_cached or (list.count + 1) * block.len > class_max) {
-        page_allocator.rawFree(block, page_align, @returnAddress());
+        // SAFETY: from `take`, a page-aligned mapping.
+        unmap(@alignCast(block.ptr), block.len);
         return;
     }
     const f: *Free = @ptrCast(@alignCast(block.ptr));
@@ -156,14 +172,22 @@ pub fn alloc(size: usize) ?*anyopaque {
         @as(*Header, @ptrCast(raw)).* = .{ .len = total, .tag = small_tag };
         return raw + header_len;
     }
-    const block: []align(16) u8 = if (classFor(total)) |class| take(class) orelse return null else blk: {
-        // Past the largest class: mapped for this allocation alone.
-        const need = std.mem.alignForward(usize, total, std.heap.pageSize());
-        const fresh = page_allocator.rawAlloc(need, page_align, @returnAddress()) orelse return null;
-        break :blk @alignCast(fresh[0..need]);
+    // The class holds `size` itself: the header goes in the page in front.
+    const page = std.heap.pageSize();
+    const start: [*]align(16) u8, const len = if (classFor(size)) |class|
+        .{ (take(class) orelse return null).ptr, class }
+    else blk: {
+        // Past the largest class: mapped for this allocation alone, its
+        // length (never a class's) in the header.
+        const need = std.mem.alignForward(usize, size, page);
+        const fresh = page_allocator.rawAlloc(mapLen(need), page_align, @returnAddress()) orelse return null;
+        // SAFETY: mapped at page alignment, past 16.
+        break :blk .{ @alignCast(fresh), need };
     };
-    @as(*Header, @ptrCast(block.ptr)).* = .{ .len = block.len, .tag = big_tag };
-    return block.ptr + header_len;
+    // SAFETY: a page past a page-aligned mapping.
+    const p: [*]align(16) u8 = @alignCast(start + page);
+    @as(*Header, @ptrCast(p - header_len)).* = .{ .len = len, .tag = big_tag };
+    return p;
 }
 
 pub fn free(address: ?*anyopaque) void {
@@ -172,7 +196,11 @@ pub fn free(address: ?*anyopaque) void {
     const h: *Header = @ptrCast(raw);
     switch (h.tag) {
         small_tag => std.c.free(raw),
-        big_tag => if (exactIndex(h.len) != null) give(raw[0..h.len]) else page_allocator.rawFree(raw[0..h.len], page_align, @returnAddress()),
+        big_tag => {
+            // SAFETY: `alloc` handed out the page after the mapping's first.
+            const start: [*]align(16) u8 = @alignCast(p - std.heap.pageSize());
+            if (exactIndex(h.len) != null) give(start[0..h.len]) else unmap(start, h.len);
+        },
         else => unreachable, // not ours
     }
 }
@@ -199,8 +227,7 @@ pub fn trimLocal() void {
             tail = f.next;
             list.count -= 1;
             cache.bytes -= classes[i];
-            const block: [*]align(16) u8 = @ptrCast(f);
-            page_allocator.rawFree(block[0..classes[i]], page_align, @returnAddress());
+            unmap(@ptrCast(f), classes[i]);
         }
     }
 }
@@ -224,8 +251,7 @@ pub fn drainLocalForTest() void {
     for (&cache.lists, 0..) |*list, i| {
         while (list.first) |f| {
             list.first = f.next;
-            const block: [*]align(16) u8 = @ptrCast(f);
-            page_allocator.rawFree(block[0..classes[i]], page_align, @returnAddress());
+            unmap(@ptrCast(f), classes[i]);
         }
     }
     cache = .{};
@@ -293,9 +319,9 @@ test "block_cache: each class keeps its own blocks, and take hands out a class w
     give(b);
 
     // 40 KiB is past malloc's slabs: `alloc` serves it from the 64 KiB
-    // class, the block `b` just went back as.
+    // class, the block `b` just went back as, a page in.
     const mid = alloc(40 * 1024).?;
-    try std.testing.expectEqual(@intFromPtr(b.ptr) + 16, @intFromPtr(mid));
+    try std.testing.expectEqual(@intFromPtr(b.ptr) + std.heap.pageSize(), @intFromPtr(mid));
     free(mid);
     try std.testing.expectEqual(@as(usize, 1), cachedIn(0));
     // Under `malloc_max` it is malloc's.
@@ -322,6 +348,28 @@ test "block_cache: a class holds at most class_max, the cache max_cached" {
     give(take(1024 * 1024).?);
     try std.testing.expectEqual(@as(usize, 0), cachedIn(3));
     try std.testing.expect(cached().bytes <= max_cached);
+}
+
+test "block_cache: alloc picks the class by the caller's size, so a power of two fits its class" {
+    drainLocalForTest();
+    defer drainLocalForTest();
+    // Brotli's hash tables at quality 5 are 256 KiB each.
+    const a = alloc(256 * 1024).?;
+    const b = alloc(256 * 1024).?;
+    @memset(@as([*]u8, @ptrCast(a))[0 .. 256 * 1024], 0x5a);
+    @memset(@as([*]u8, @ptrCast(b))[0 .. 256 * 1024], 0xa5);
+    free(a);
+    free(b);
+    try std.testing.expectEqual(@as(usize, 2), cachedIn(2));
+    try std.testing.expectEqual(@as(usize, 0), cachedIn(3));
+    // 64 KiB exactly is the 64 KiB class.
+    const c = alloc(64 * 1024).?;
+    free(c);
+    try std.testing.expectEqual(@as(usize, 1), cachedIn(0));
+    // The blocks `alloc` used serve `take` as well.
+    const t = take(256 * 1024).?;
+    give(t);
+    try std.testing.expectEqual(@as(usize, 2), cachedIn(2));
 }
 
 test "block_cache: a trim unmaps per class what sat unused, past trim_keep" {

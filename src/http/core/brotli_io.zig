@@ -260,8 +260,10 @@ test "brotli_io: an encoder's large blocks are reused by the next, and trimmed w
         // and give them back, so the cache stops growing.
         if (round == 0) after_first = block_cache.cached().count else try std.testing.expectEqual(after_first, block_cache.cached().count);
     }
-    // At least its two hash tables.
+    // At least its two hash tables, 256 KiB each: the 256 KiB class.
     try std.testing.expect(after_first >= 2);
+    const quarter = block_cache.classIndex(256 * 1024).?;
+    try std.testing.expect(block_cache.cachedIn(quarter) >= 2);
 
     // Two encoders at once (two streams) need twice the blocks; once idle
     // for a whole trim interval, each class goes back to `trim_keep` at
@@ -279,6 +281,8 @@ test "brotli_io: an encoder's large blocks are reused by the next, and trimmed w
     block_cache.trimLocal(); // the low mark of the interval that just ended
     block_cache.trimLocal(); // nothing taken since: down to trim_keep a class
     for (block_cache.classes, 0..) |_, i| try std.testing.expect(block_cache.cachedIn(i) <= block_cache.trim_keep);
+    // One encoder's two hash tables stay however long it sat idle.
+    try std.testing.expectEqual(@as(usize, block_cache.trim_keep), block_cache.cachedIn(quarter));
     try std.testing.expect(block_cache.cached().count < held);
     try std.testing.expect(block_cache.cached().bytes <= block_cache.max_cached);
 }

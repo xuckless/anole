@@ -31,7 +31,9 @@ breaking changes are listed anyway.
   response maps no memory on musl (#99).
 - `block_cache` keeps one free list per size class (64, 128 and 256 KiB,
   1 and 2 MiB) with an O(1) take and give, serves everything past
-  malloc's slabs (32 KiB), and is trimmed per class (#99).
+  malloc's slabs (32 KiB), and is trimmed per class. A block maps one page
+  past its class, where `alloc` keeps its header, so a power-of-two
+  allocation (Brotli's 256 KiB hash tables) fits its own class (#99).
 
 ## 0.4.2 (2026-10-31)
 
