@@ -7,6 +7,48 @@ breaking changes are listed anyway.
 
 ### Changed
 
+- HTTP/3 lets a client open 256 requests at once per connection, up from
+  100 (`http3.max_streams_bidi`). A stream's credit comes back only once
+  the client has acknowledged its end, so at 64 requests in flight the old
+  window could stall a client for an ACK each round. Session tickets from
+  0.4.x resume without 0-RTT once, since the limit is part of their
+  context (#100).
+
+- HTTP/3 packets are no longer padded to the path MTU. A small answer went
+  out as a ~1,250-byte packet that both sides had to encrypt and decrypt;
+  ngtcp2 still pads what RFC 9000 requires (Initials, path validation,
+  MTU probes) (#100).
+
+- HTTP/3 sockets ask for 4 MiB receive and send buffers (the system caps
+  them: on Linux `net.core.rmem_max`/`wmem_max`). The server logs what it
+  got once at startup, and `/metrics` shows it as
+  `anole_h3_socket_rcvbuf_bytes`/`anole_h3_socket_sndbuf_bytes` (#100).
+
+- HTTP/3 no longer offers clients a QPACK dynamic table for their request
+  headers (capacity 0, no blocked streams): requests arrive as literals
+  and static-table references, and connections keep no decoder table.
+  Session tickets from before resume without 0-RTT once (#100).
+
+- HTTP/3 acknowledges a client's packets within 5 ms at most
+  (`max_ack_delay`), down from 25 ms, so a request whose answer waits
+  does not hold the client's stream open for a delayed ACK (#100).
+
+- HTTP/3 acknowledges every ack-eliciting packet in the next packet it
+  writes (`ack_thresh` 1, ngtcp2's default is 2), so a request's ACK
+  leaves with its answer (#100).
+
+- HTTP/3 connections write up to 48 packets (~56 KiB) per GSO send when
+  pacing allows, up from 10, and each HTTP/3 endpoint's outbox holds
+  256 KiB; raw `anole.net` UDP sockets keep their 128 KiB outboxes (#100).
+
+### Added
+
+- `/metrics` has HTTP/3 series per endpoint: packets, packets passed on
+  between endpoints and dropped, datagrams and outbox sends, requests,
+  requests served inline and open connections, plus `anole_h3_steering`
+  (whether the kernel steers datagrams by connection ID). The server logs
+  an info line when steering is attached (#100).
+
 ### Fixed
 
 - HTTP/3: a response could hold at most 64 KiB unacknowledged, so a
@@ -24,6 +66,12 @@ breaking changes are listed anyway.
   round trip (#151).
 
 - The docs said Anole has no runtime Brotli encoder; it has one (`-Dbrotli`).
+
+- An HTTP/3 connection's flush, which waits up to 1 ms for the requests a
+  batch of packets started, no longer starts that wait over with every
+  new batch: a client sending requests faster than they answered could
+  keep its answers and ACKs back well past `max_ack_delay`. The wait now
+  ends 1 ms after the first batch since the last flush (#100).
 
 ### _pre
 

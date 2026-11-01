@@ -107,7 +107,12 @@ pub fn writePacket(side: Side, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, 
             .packet => |n| return n,
             .failed => |rv| return fail(side, rv),
         };
-        var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE | c.NGTCP2_WRITE_STREAM_FLAG_PADDING;
+        // No PADDING flag: ngtcp2 pads what RFC 9000 requires on its own
+        // (a datagram with an ack-eliciting Initial, PATH_RESPONSE, PMTUD
+        // probes), and padding every 1-RTT packet to the path MTU made a
+        // 1-byte answer a ~1,250-byte packet to seal and open. As aegon
+        // and ioxide, the ngtcp2 servers on HttpArena's board, write.
+        var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE;
         if (fin != 0) flags |= c.NGTCP2_WRITE_STREAM_FLAG_FIN;
         var data_len: c.ngtcp2_ssize = -1;
         const datav: []const c.ngtcp2_vec = @as([*]const c.ngtcp2_vec, @ptrCast(&vec))[0..@intCast(count)];

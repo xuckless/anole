@@ -101,6 +101,11 @@ pub const Udp = struct {
     /// Linux only; turned off for good if the kernel or NIC refuses it.
     gso: std.atomic.Value(bool) = .init(false),
     gro: bool = false,
+    /// The socket's receive and send buffers as the system reports them
+    /// after `init` (Linux doubles what it grants, for its bookkeeping);
+    /// 0 where unknown.
+    rcvbuf: u32 = 0,
+    sndbuf: u32 = 0,
 
     const posix = std.posix;
     const native_os = @import("builtin").os.tag;
@@ -130,6 +135,11 @@ pub const Udp = struct {
         /// receive buffer arrives with each datagram (SO_RXQ_OVFL), as
         /// `Datagram.dropped`.
         rxq_ovfl: bool = false,
+        /// SO_RCVBUF / SO_SNDBUF to ask for; null keeps the system's
+        /// default. The system caps them (Linux: net.core.rmem_max and
+        /// wmem_max); `Udp.rcvbuf`/`sndbuf` say what it granted.
+        rcvbuf: ?u31 = null,
+        sndbuf: ?u31 = null,
     };
 
     /// HTTP/3 takes `.{}`: everything on.
@@ -142,6 +152,10 @@ pub const Udp = struct {
         var self: Udp = .{ .socket = socket, .ip6 = ip6, .wildcard = wildcard };
         if (comptime !has_control) return self;
         const fd = socket.handle;
+        if (options.rcvbuf) |n| _ = setOption(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, n);
+        if (options.sndbuf) |n| _ = setOption(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, n);
+        self.rcvbuf = getOption(fd, posix.SOL.SOCKET, posix.SO.RCVBUF);
+        self.sndbuf = getOption(fd, posix.SOL.SOCKET, posix.SO.SNDBUF);
         if (ip6) {
             if (options.ecn) _ = setOption(fd, posix.IPPROTO.IPV6, posix.IPV6.RECVTCLASS, 1);
             if (wildcard) _ = setOption(fd, posix.IPPROTO.IPV6, posix.IPV6.RECVPKTINFO, 1);
@@ -179,6 +193,14 @@ pub const Udp = struct {
         var len: posix.socklen_t = @sizeOf(c_int);
         if (std.c.getsockopt(fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, @ptrCast(&value), &len) != 0) return true;
         return value != 0;
+    }
+
+    /// An int socket option's value; 0 when it can't be read.
+    fn getOption(fd: posix.socket_t, level: i32, name: u32) u32 {
+        var value: c_int = 0;
+        var len: posix.socklen_t = @sizeOf(c_int);
+        if (std.c.getsockopt(fd, level, name, &value, &len) != 0) return 0;
+        return std.math.cast(u32, value) orelse 0;
     }
 
     fn setOption(fd: posix.socket_t, level: i32, name: u32, value: c_int) bool {
@@ -407,21 +429,30 @@ pub const Udp = struct {
         /// Datagrams in all the messages.
         datagrams: usize = 0,
 
-        pub const buf_len = 128 * 1024;
-        pub const max_msgs = 128;
+        /// How much an outbox holds.
+        pub const Size = struct {
+            buf_len: usize,
+            max_msgs: usize,
 
-        pub fn init(gpa: std.mem.Allocator) !Outbox {
-            const buf = try gpa.alloc(u8, buf_len);
+            /// Raw UDP sockets (`anole.net`), which send without GSO.
+            pub const default: Size = .{ .buf_len = 128 * 1024, .max_msgs = 128 };
+            /// HTTP/3 endpoints: room for four ~56 KiB GSO rounds, or 256
+            /// datagrams one by one where there is no GSO.
+            pub const h3: Size = .{ .buf_len = 256 * 1024, .max_msgs = 256 };
+        };
+
+        pub fn init(gpa: std.mem.Allocator, size: Size) !Outbox {
+            const buf = try gpa.alloc(u8, size.buf_len);
             errdefer gpa.free(buf);
-            const msgs = try gpa.alloc(std.Io.net.OutgoingMessage, max_msgs);
+            const msgs = try gpa.alloc(std.Io.net.OutgoingMessage, size.max_msgs);
             errdefer gpa.free(msgs);
-            const addrs = try gpa.alloc(std.Io.net.IpAddress, max_msgs);
+            const addrs = try gpa.alloc(std.Io.net.IpAddress, size.max_msgs);
             errdefer gpa.free(addrs);
-            const locals = try gpa.alloc(?std.Io.net.IpAddress, max_msgs);
+            const locals = try gpa.alloc(?std.Io.net.IpAddress, size.max_msgs);
             errdefer gpa.free(locals);
-            const ecns = try gpa.alloc(u8, max_msgs);
+            const ecns = try gpa.alloc(u8, size.max_msgs);
             errdefer gpa.free(ecns);
-            const controls = try gpa.alignedAlloc(Control, .fromByteUnits(cmsg_align), max_msgs);
+            const controls = try gpa.alignedAlloc(Control, .fromByteUnits(cmsg_align), size.max_msgs);
             return .{ .buf = buf, .msgs = msgs, .addrs = addrs, .locals = locals, .ecns = ecns, .controls = controls };
         }
 
@@ -570,6 +601,36 @@ test "UDP: a send that a cancelation interrupts leaves it for the next cancelati
     try std.testing.expectError(error.Canceled, future.cancel(io));
 }
 
+test "UDP: asked socket buffers are set, and what the system granted is read back" {
+    if (comptime !Udp.has_control) return error.SkipZigTest; // no options on Windows
+    const zio = @import("zio");
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    const lo: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    const asked: u31 = 96 * 1024;
+    var u: Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), .{ .rcvbuf = asked, .sndbuf = asked });
+    defer u.socket.close(io);
+    if (comptime @import("builtin").os.tag == .linux) {
+        // Linux grants up to net.core.{r,w}mem_max and reports twice that.
+        // (@min of a comptime-known value narrows its type: widen first.)
+        const rcv_want: u64 = @min(asked, try testSysctl(io, "/proc/sys/net/core/rmem_max"));
+        const snd_want: u64 = @min(asked, try testSysctl(io, "/proc/sys/net/core/wmem_max"));
+        try std.testing.expect(u.rcvbuf >= 2 * rcv_want);
+        try std.testing.expect(u.sndbuf >= 2 * snd_want);
+    } else {
+        // macOS reports what was asked (kern.ipc.maxsockbuf is 8 MiB).
+        try std.testing.expect(u.rcvbuf >= asked);
+        try std.testing.expect(u.sndbuf >= asked);
+    }
+}
+
+fn testSysctl(io: std.Io, path: []const u8) !u64 {
+    var buf: [32]u8 = undefined;
+    const text = try std.Io.Dir.cwd().readFile(io, path, &buf);
+    return std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10);
+}
+
 test "UDP: ECN codepoints and the local address of a wildcard socket come through" {
     if (comptime !Udp.has_control) return error.SkipZigTest; // no control messages on Windows
     const zio = @import("zio");
@@ -653,7 +714,7 @@ test "UDP: an outbox sends several destinations' packets at once, a run of them 
     var sender: Udp = .init(try lo.bind(io, .{ .mode = .dgram, .protocol = .udp }), .{});
     defer sender.socket.close(io);
 
-    var outbox: Udp.Outbox = try .init(std.testing.allocator);
+    var outbox: Udp.Outbox = try .init(std.testing.allocator, .default);
     defer outbox.deinit(std.testing.allocator);
     try std.testing.expect(outbox.fits(10, 3));
     // Three datagrams of 4, 4 and 2 bytes for `a`, one for `b`.
@@ -666,7 +727,8 @@ test "UDP: an outbox sends several destinations' packets at once, a run of them 
     try std.testing.expectEqual(@as(usize, if (gso) 2 else 4), outbox.count);
     sender.sendOutbox(io, &outbox);
     try std.testing.expectEqual(@as(usize, 0), outbox.count);
-    try std.testing.expect(outbox.fits(Udp.Outbox.buf_len, Udp.Outbox.max_msgs));
+    try std.testing.expect(outbox.fits(Udp.Outbox.Size.default.buf_len, Udp.Outbox.Size.default.max_msgs));
+    try std.testing.expect(!outbox.fits(Udp.Outbox.Size.default.buf_len + 1, 1));
 
     var buf: [2048]u8 = undefined;
     var control: Udp.Control align(cmsg_align) = undefined;

@@ -489,6 +489,66 @@ test "anole.App: listenTls serves HTTPS, and HTTP/3 advertised with Alt-Svc" {
     try checking.await(app.io());
 }
 
+test "anole.App: /metrics shows the HTTP/3 listener's series, with the requests it ran" {
+    if (comptime features.tls != .boringssl or !features.http3) return error.SkipZigTest;
+    var app = try App.init(alloc, .{ .executors = .exact(2) });
+    defer app.deinit();
+    _ = app.metrics(.{});
+    app.get("/hello", AppRoutes.hello);
+
+    const Check = struct {
+        fn run(a: *App) !void {
+            defer a.stop();
+            const io_ = a.io();
+            try a.waitReady();
+            const q = a.http3Address().?;
+            {
+                const conn = try h3.ClientConnection.connect(alloc, io_, .{
+                    .host = "localhost",
+                    .address = q,
+                    .port = q.getPort(),
+                    .tls = .{ .insecure_skip_verify = true },
+                    .connect_timeout = .fromSeconds(3),
+                });
+                defer conn.close();
+                const s = try conn.request(&.{
+                    .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = "/hello" },
+                    .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+                }, .{});
+                defer s.release();
+                try s.waitHead();
+                try std.testing.expectEqual(@as(u16, 200), s.status);
+            }
+            // Scraped over HTTPS (HTTP/1.1): the collector the server
+            // attached copies the endpoints' counters in.
+            var dc = http.Client.init(alloc, io_, .{ .tls = .{ .insecure_skip_verify = true } });
+            defer dc.deinit();
+            var url_buf: [64]u8 = undefined;
+            var resp = try dc.fetch(try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/metrics", .{a.addresses()[0].ip.getPort()}), .{});
+            defer resp.deinit();
+            const text = (try resp.body()).?;
+            var requests: u64 = 0;
+            var endpoints: usize = 0;
+            var steering = false;
+            var lines = std.mem.splitScalar(u8, text, '\n');
+            while (lines.next()) |line| {
+                if (std.mem.startsWith(u8, line, "anole_h3_steering{listener=\"")) steering = true;
+                if (std.mem.startsWith(u8, line, "anole_h3_requests_total{endpoint=\"")) {
+                    endpoints += 1;
+                    requests += try std.fmt.parseInt(u64, line[std.mem.lastIndexOfScalar(u8, line, ' ').? + 1 ..], 10);
+                }
+            }
+            try std.testing.expect(steering);
+            try std.testing.expect(endpoints >= 1);
+            try std.testing.expectEqual(@as(u64, 1), requests);
+        }
+    };
+    var checking = try app.io().concurrent(Check.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
+    try app.listenTls("127.0.0.1:0", .dev_self_signed);
+    try checking.await(app.io());
+}
+
 test "anole.App: an address listen cannot take fails listen, and waitReady with it" {
     const expected_log = @import("errors.zig").expectLog();
     defer expected_log.deinit();

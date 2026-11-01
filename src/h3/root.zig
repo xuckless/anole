@@ -114,4 +114,5 @@ test {
     _ = @import("session_cache.zig");
     _ = @import("quic_tls.zig");
     _ = @import("alt_svc.zig");
+    _ = @import("metrics.zig");
 }

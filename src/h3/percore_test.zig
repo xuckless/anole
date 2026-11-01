@@ -14,6 +14,8 @@ const client = @import("client.zig");
 const server = @import("server.zig");
 const Endpoint = server.Endpoint(void);
 const steer = @import("steer.zig");
+const h3_metrics = @import("metrics.zig");
+const metrics = @import("../observe/metrics.zig");
 
 const executors = 4;
 
@@ -158,6 +160,27 @@ test "h3 per-core: connections spread over the endpoints and stay on their execu
     try std.testing.expectEqual(@as(u64, 0), f.sum("forwarded_out"));
     try std.testing.expectEqual(@as(u64, 0), f.sum("dropped"));
     try f.expectNoForeign();
+    // Each GET counted once, on the endpoint that ran it.
+    try std.testing.expectEqual(@as(u64, conns.len * 4), f.sum("requests"));
+    // What /metrics shows: steering on, nothing passed on, every request.
+    try std.testing.expect(f.ep.steering());
+    {
+        var registry = metrics.Registry.init(gpa, io);
+        defer registry.deinit();
+        h3_metrics.refresh(&registry, f.ep.endpoints(), f.ep.steering(), "h3");
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try registry.render(&out.writer);
+        const text = out.written();
+        try std.testing.expect(std.mem.indexOf(u8, text, "anole_h3_steering{listener=\"h3\"} 1\n") != null);
+        var requests: u64 = 0;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "anole_h3_forwarded_out_total{")) try std.testing.expect(std.mem.endsWith(u8, line, "} 0"));
+            if (std.mem.startsWith(u8, line, "anole_h3_requests_total{")) requests += try std.fmt.parseInt(u64, line[std.mem.lastIndexOfScalar(u8, line, ' ').? + 1 ..], 10);
+        }
+        try std.testing.expectEqual(@as(u64, conns.len * 4), requests);
+    }
 
     // Clients that move to new ports: the program reads the connection ID,
     // not the 4-tuple, so their packets still reach their endpoint.

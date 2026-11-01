@@ -221,7 +221,7 @@ arrive.
 
 Per connection, the peer may open 100 unidirectional WebTransport streams at
 once (beside HTTP/3's own three); its bidirectional streams share
-`http3.max_streams_bidi` (100) with requests. Credit comes back as streams
+`http3.max_streams_bidi` (256) with requests. Credit comes back as streams
 close. Streams that arrive before their session is accepted are held, up to
 32 per connection, and refused past that.
 

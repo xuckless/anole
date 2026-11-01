@@ -73,14 +73,33 @@ const SendError = dusty.Response.SendError;
 /// Our connection IDs' length, as ngtcp2's examples use; one byte of them
 /// names the endpoint (`steer`).
 const scid_len = steer.cid_len;
-/// Packets a connection writes at a time (one message, with GSO).
-const burst = 10;
+/// Packets a connection writes at a time (one message, with GSO): 48 of
+/// 1200 bytes is a ~56 KiB GSO send, under the kernel's 64 segments and
+/// 64 KiB. Only taken when ngtcp2's send quantum (pacing) allows that much.
+const burst = 48;
 /// What a connection may write at a time at most.
 const tx_round = burst * c.NGTCP2_MAX_UDP_PAYLOAD_SIZE;
+comptime {
+    std.debug.assert(Udp.Outbox.Size.h3.buf_len >= 2 * tx_round and Udp.Outbox.Size.h3.max_msgs >= 2 * burst);
+}
 /// How long a connection's flush waits at most for the requests a batch
 /// of datagrams started (`Conn.holding`), so that their answers and the
 /// ACK leave together in as few packets as they fit.
 const hold_ns = std.time.ns_per_ms;
+/// When the flush stops holding for a batch received at `ts`. A batch
+/// that comes while an earlier one's hold is still on keeps that hold's
+/// end: batches arriving faster than their requests answer would
+/// otherwise push the flush, and the ACKs in it, back without end, past
+/// the max_ack_delay we advertise (5 ms; RFC 9000 13.2.1).
+fn holdUntil(held: bool, until: u64, ts: u64) u64 {
+    return if (held) until else ts + hold_ns;
+}
+
+/// The UDP socket buffers each endpoint asks for, both ways: room for
+/// bursts from many connections between two reads (aegon, goose and
+/// agensio ask for 4 MiB too). The system caps it (Linux: rmem_max and
+/// wmem_max, 208 KiB by default); `init` logs what was granted.
+const socket_buffer = 4 << 20;
 /// Stateless resets sent per second at most (ngtcp2's examples' figure).
 const stateless_reset_burst = 100;
 /// Retries an endpoint remembers (`Endpoint.retried`), and for how long:
@@ -122,8 +141,12 @@ pub const Options = struct {
     /// Requests a client may have open at once on a connection. A request
     /// counts until its stream has ended and its handler has returned, so
     /// requests the client resets do not free room while their handlers
-    /// still run.
-    max_streams_bidi: u64 = 100,
+    /// still run. 256 lets a client keep 64 requests in flight with
+    /// room for the streams whose answers wait for its ACK: a stream's
+    /// credit comes back only once its FIN is acknowledged, so a window as
+    /// large as the client's concurrency stalls it for an ACK each round
+    /// (ngtcp2-based servers use 1024 to 65535).
+    max_streams_bidi: u64 = 256,
     /// Connection and per-stream receive windows.
     max_data: u64 = 16 << 20,
     max_stream_data: u64 = 1 << 20,
@@ -212,10 +235,14 @@ pub const Options = struct {
 fn http3Settings(options: *const Options) nghttp3.Settings {
     var settings: nghttp3.Settings = undefined;
     nghttp3.settingsDefault(&settings);
-    // The client's requests may use a dynamic table (smaller requests
-    // in; looking an entry up costs the decoder little).
-    settings.qpack_max_dtable_capacity = 4096;
-    settings.qpack_blocked_streams = 100;
+    // No dynamic table for the client's requests either: it sends
+    // literals (Huffman-coded) and static-table references, and no
+    // connection keeps a decoder table or blocked-stream state. goose
+    // (plod) does the same; aegon and cnetmod take 4096/100. Under A/B
+    // against 4096/100 (#100, HA11): the trade is literal decoding for
+    // table upkeep, memory and the blocked-stream path.
+    settings.qpack_max_dtable_capacity = 0;
+    settings.qpack_blocked_streams = 0;
     // Our responses use the static table and literals only: searching the
     // dynamic table for every field of every response was ~8% of a
     // hello-world profile (Bun's, on lsquic's encoder; nghttp3's does the
@@ -245,6 +272,12 @@ fn transportParams(options: *const Options) ngtcp2.TransportParams {
     // HTTP datagrams (RFC 9297), for WebTransport.
     if (options.webtransport) params.max_datagram_frame_size = 65535;
     params.max_idle_timeout = std.math.lossyCast(u64, options.idle_timeout.toNanoseconds());
+    // 5 ms, not RFC 9000's 25: ngtcp2 delays our ACK by
+    // min(max_ack_delay, srtt/8), and h2load (like any ngtcp2 client)
+    // counts a request done only once its stream closes, which needs our
+    // ACK of the request. It also lowers the client's PTO for what it
+    // sends us. Kept only if the qlog shows late server ACKs (#100, HA3).
+    params.max_ack_delay = 5 * std.time.ns_per_ms;
     return params;
 }
 
@@ -326,6 +359,10 @@ pub const Stats = struct {
     /// Requests for `no_wait` routes run inline, without a task
     /// (`Options.inline_no_wait`).
     served_inline: std.atomic.Value(u64) = .init(0),
+    /// Requests given to a handler: a task spawned for them, or run
+    /// inline (`served_inline`). Not those rejected for want of a task
+    /// or reset before an inline run.
+    requests: std.atomic.Value(u64) = .init(0),
     /// Times a connection armed QUIC keep-alive (a request opened on an
     /// idle connection).
     keep_alive_arms: std.atomic.Value(u64) = .init(0),
@@ -456,6 +493,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// The sockets go to another process: close every connection at
             /// once and stop reading (see `handOver`).
             hand_over: std.atomic.Value(bool) = .init(false),
+            /// The kernel steers each datagram to its connection's
+            /// endpoint (`steer.attach` took): false with one socket, or
+            /// where the program could not be attached.
+            steering: bool = false,
         };
 
         /// A datagram passed from the endpoint whose socket received it to
@@ -512,8 +553,16 @@ pub fn Endpoint(comptime Ctx: type) type {
             // The group numbers its sockets in bind order, as we did, so
             // the program's index is the endpoint's. Inherited sockets keep
             // the order their first owner bound them in.
-            if (count > 1) steer.attach(shared.endpoints[0].udp.socket.handle, @intCast(count)) catch
-                log.warn("HTTP/3: no connection-ID steering (classic BPF on SO_REUSEPORT needs Linux 4.5+); the {d} endpoints pass packets on to each other instead", .{count});
+            {
+                const u = &shared.endpoints[0].udp;
+                log.info("HTTP/3: UDP socket buffers {d} KiB receive, {d} KiB send as the system reports them (asked {d} KiB each; Linux caps them at net.core.rmem_max/wmem_max and reports twice what it grants)", .{ u.rcvbuf / 1024, u.sndbuf / 1024, socket_buffer / 1024 });
+            }
+            if (count > 1) {
+                if (steer.attach(shared.endpoints[0].udp.socket.handle, @intCast(count))) {
+                    shared.steering = true;
+                    log.info("HTTP/3: connection-ID steering attached on {d} sockets", .{count});
+                } else |_| log.warn("HTTP/3: no connection-ID steering (classic BPF on SO_REUSEPORT needs Linux 4.5+); the {d} endpoints pass packets on to each other instead", .{count});
+            }
             net.rand_io = io;
             return shared.endpoints[0];
         }
@@ -532,16 +581,16 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn initOne(gpa: std.mem.Allocator, io: std.Io, http: *HttpServer, options: Options, socket: std.Io.net.Socket, index: u8, shared: *Shared, secret: [32]u8) !*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            var tx0: Udp.Outbox = try .init(gpa);
+            var tx0: Udp.Outbox = try .init(gpa, .h3);
             errdefer tx0.deinit(gpa);
-            var tx1: Udp.Outbox = try .init(gpa);
+            var tx1: Udp.Outbox = try .init(gpa, .h3);
             errdefer tx1.deinit(gpa);
             self.* = .{
                 .gpa = gpa,
                 .io = io,
                 .http = http,
                 .options = options,
-                .udp = .init(socket, .{}),
+                .udp = .init(socket, .{ .rcvbuf = socket_buffer, .sndbuf = socket_buffer }),
                 .local = .from(socket.address),
                 .index = index,
                 .shared = shared,
@@ -643,6 +692,12 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// their sockets, to hand to a successor, and their `stats`.
         pub fn endpoints(self: *const Self) []const *Self {
             return self.shared.endpoints;
+        }
+
+        /// Whether the kernel steers the listener's datagrams by
+        /// connection ID (`Shared.steering`).
+        pub fn steering(self: *const Self) bool {
+            return self.shared.steering;
         }
 
         /// The TLS context for `options`, with session ticket keys of its
@@ -1457,6 +1512,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             round_ts: u64 = 0,
             round: std.atomic.Value(u32) = .init(0),
             hold_until: u64 = 0,
+            /// A batch came since the last flush: `hold_until` stays where
+            /// that batch set it (`holdUntil`).
+            hold_set: bool = false,
             /// Requests of the latest round whose handlers have yet to
             /// answer or wait: the flush holds for them (`hold_ns`).
             holding: std.atomic.Value(u32) = .init(0),
@@ -1512,6 +1570,14 @@ pub fn Endpoint(comptime Ctx: type) type {
                 settings.preferred_versions = versions.ptr;
                 settings.preferred_versionslen = versions.len;
                 settings.max_stream_window = ep.options.max_stream_data;
+                // Every ack-eliciting packet is acknowledged in the next
+                // packet we write (ngtcp2's default waits for 2, or the
+                // ACK delay): the ACK of a request rides on its answer, so
+                // the client closes the stream at once. agensio, goose and
+                // cnetmod carry a pending ACK on every packet the same way.
+                // Kept only if the qlog shows late server ACKs after
+                // max_ack_delay 5 ms (#100, HA1).
+                settings.ack_thresh = 1;
                 // qlog stays off: both of ngtcp2's high-severity
                 // advisories were in its qlog code.
                 settings.qlog_write = null;
@@ -1756,7 +1822,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                     _ = conn.round.fetchAdd(1, .monotonic);
                     conn.holding.store(0, .monotonic);
                     conn.hold_off.store(false, .monotonic);
-                    conn.hold_until = ts + hold_ns;
+                    conn.hold_until = holdUntil(conn.hold_set, conn.hold_until, ts);
+                    conn.hold_set = true;
                 }
                 var r = remote;
                 var l: Addr = if (local) |a| .from(a) else conn.local;
@@ -1818,6 +1885,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         ep.setTimer(conn, conn.hold_until) catch return conn.lost();
                         return;
                     }
+                    conn.hold_set = false;
                     const flushed_at = conn.flush();
 
                     conn.lock();
@@ -2217,7 +2285,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                     }
                     var vec: [1]c.ngtcp2_vec = undefined;
                     var datav: []const c.ngtcp2_vec = &.{};
-                    var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE | c.NGTCP2_WRITE_STREAM_FLAG_PADDING;
+                    // Unpadded, as `bridge.writePacket`.
+                    var flags: u32 = c.NGTCP2_WRITE_STREAM_FLAG_MORE;
                     if (picked) |hs| {
                         const rest = hs.response[hs.sent..];
                         vec[0] = .{ .base = @constCast(rest.ptr), .len = rest.len };
@@ -2261,14 +2330,16 @@ pub fn Endpoint(comptime Ctx: type) type {
                 // 0-RTT: the handshake's flight and the ACK go at once.
                 if (!conn.handshakeDone()) conn.hold_off.store(true, .monotonic);
                 _ = conn.tasks.fetchAdd(1, .acq_rel);
-                placement.concurrent(&conn.group, conn.ep.io, .local, Stream.run, .{stream}) catch {
+                if (placement.concurrent(&conn.group, conn.ep.io, .local, Stream.run, .{stream})) |_| {
+                    _ = conn.ep.stats.requests.fetchAdd(1, .monotonic);
+                } else |_| {
                     _ = conn.tasks.fetchSub(1, .acq_rel);
                     log.err("HTTP/3: no task for stream {d}", .{stream.id});
                     stream.refs.handler = false;
                     stream.unhold();
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, stream.id, h.NGHTTP3_H3_REQUEST_REJECTED);
                     conn.kick();
-                };
+                }
             }
 
             /// Whether the request's route was registered `no_wait`, to run
@@ -2551,6 +2622,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 conn.unlock();
                 if (!gone) {
                     _ = conn.ep.stats.served_inline.fetchAdd(1, .monotonic);
+                    _ = conn.ep.stats.requests.fetchAdd(1, .monotonic);
                     if (s.serve(true)) |served| {
                         // Finished later; the stream is held till then.
                         if (served == .detached) return;
@@ -4101,4 +4173,27 @@ test "0-RTT context: the same for the same settings, different when a limit or a
     with_webtransport.webtransport = true;
     try std.testing.expect(!std.mem.eql(u8, try Ctx.of(base, &a), try Ctx.of(with_webtransport, &b)));
     try std.testing.expectEqual(@as(u8, early_context_version), (try Ctx.of(base, &a))[0]);
+}
+
+test "flush hold: a later batch never moves the hold's end, so ACKs leave within max_ack_delay" {
+    // The first batch since a flush sets it.
+    var until = holdUntil(false, 0, 1000);
+    try std.testing.expectEqual(@as(u64, 1000 + hold_ns), until);
+    // Batches every 0.8 ms before that flush: the end stays put.
+    var ts: u64 = 1000;
+    for (0..10) |_| {
+        ts += 800 * std.time.ns_per_us;
+        until = holdUntil(true, until, ts);
+        try std.testing.expectEqual(@as(u64, 1000 + hold_ns), until);
+    }
+    // After the flush, the next batch starts a new hold.
+    try std.testing.expectEqual(ts + hold_ns, holdUntil(false, until, ts));
+    try std.testing.expect(hold_ns < 5 * std.time.ns_per_ms);
+}
+
+test "transport parameters: 256 concurrent requests per connection by default, and a 5 ms max_ack_delay" {
+    const base: Options = .{ .address = .{ .ip4 = .loopback(0) }, .cert_pem = "", .key_pem = "" };
+    const params = transportParams(&base);
+    try std.testing.expectEqual(@as(u64, 256), params.initial_max_streams_bidi);
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_ms), params.max_ack_delay);
 }

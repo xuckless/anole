@@ -36,6 +36,11 @@ pub const Counter = struct {
     pub fn add(self: *Counter, n: u64) void {
         _ = self.value.fetchAdd(n, .monotonic);
     }
+    /// Sets the value: for a counter that mirrors a count kept
+    /// elsewhere, copied on every scrape (`Registry.addCollector`).
+    pub fn set(self: *Counter, v: u64) void {
+        self.value.store(v, .monotonic);
+    }
 };
 
 /// A value that goes up and down (connections open, queue length). Safe
@@ -258,6 +263,16 @@ pub const Registry = struct {
     /// Whether a scrape first refreshes the runtime gauges
     /// (`observe/runtime.zig`); `app.metrics` turns it on.
     runtime_gauges: bool = false,
+    /// Called on every scrape before rendering (`addCollector`).
+    collectors: std.ArrayList(Collector) = .empty,
+
+    /// Copies counts kept elsewhere into the registry's series on every
+    /// scrape: `refresh(context, registry)`, with no registry lock held,
+    /// so it may register and set series.
+    pub const Collector = struct {
+        context: *anyopaque,
+        refresh: *const fn (context: *anyopaque, registry: *Registry) void,
+    };
 
     /// An empty registry.
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Registry {
@@ -273,6 +288,15 @@ pub const Registry = struct {
             }
             list.deinit(self.gpa);
         }
+        self.collectors.deinit(self.gpa);
+    }
+
+    /// Runs `collector` on every scrape from now on. Its context must
+    /// outlive the scrapes.
+    pub fn addCollector(self: *Registry, collector: Collector) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.collectors.append(self.gpa, collector);
     }
 
     /// A counter family named `name` (by convention ending in `_total`) with
@@ -317,6 +341,14 @@ pub const Registry = struct {
     /// `w` while a lock is held: `w` may be any writer.
     pub fn render(self: *Registry, w: *std.Io.Writer) !void {
         if (self.runtime_gauges) @import("runtime.zig").refresh(self);
+        {
+            self.mutex.lockUncancelable(self.io);
+            const collectors = self.gpa.dupe(Collector, self.collectors.items);
+            self.mutex.unlock(self.io);
+            const list = try collectors;
+            defer self.gpa.free(list);
+            for (list) |col| col.refresh(col.context, self);
+        }
         const counters, const gauges, const histograms = blk: {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
@@ -466,6 +498,30 @@ test "registry renders counters, gauges and histograms" {
     try std.testing.expect(std.mem.indexOf(u8, text, "latency_seconds_bucket{le=\"+Inf\"} 3\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "latency_seconds_count 3\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "latency_seconds_sum 5.55\n") != null);
+}
+
+test "registry: a collector copies counts kept elsewhere into its series on every scrape" {
+    const gpa = std.testing.allocator;
+    var r = Registry.init(gpa, std.testing.io);
+    defer r.deinit();
+    const Source = struct {
+        count: u64 = 0,
+        fn refresh(context: *anyopaque, registry: *Registry) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const f = registry.counter("things_total", "Things.", &.{}) catch return;
+            f.with(&.{}).set(self.count);
+        }
+    };
+    var src: Source = .{ .count = 5 };
+    try r.addCollector(.{ .context = &src, .refresh = Source.refresh });
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try r.render(&out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "things_total 5\n") != null);
+    src.count = 9;
+    out.clearRetainingCapacity();
+    try r.render(&out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "things_total 9\n") != null);
 }
 
 test "histograms: sums kept to the float, buckets checked and cumulative" {

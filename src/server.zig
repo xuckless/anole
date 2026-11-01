@@ -560,7 +560,7 @@ pub const Options = struct {
         /// browsers switch to it.
         alt_svc: bool = true,
         /// Concurrent requests per connection.
-        max_streams_bidi: u64 = 100,
+        max_streams_bidi: u64 = 256,
         /// Make every new client prove its address with a Retry first (one
         /// more round trip; resists spoofed-source floods).
         validate_address: bool = false,
@@ -917,6 +917,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             metrics: ?*observe.metrics.Registry = null,
             metrics_path: []const u8 = "",
             metrics_listener: ?[]const u8 = null,
+            /// The HTTP/3 series' collector is on `metrics`.
+            h3_metrics: bool = false,
             health: ?*observe.Health = null,
             /// `metrics` and `health` register their routes when serving
             /// starts, so `use` can still follow them.
@@ -3836,6 +3838,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // ---- p3/net ----
             self.attachNetMetrics();
             // ---- end p3/net ----
+            self.attachH3Metrics();
             self.startConsole();
             defer if (self.console != null) self.stopConsole(false);
             if (self.console != null) {
@@ -4078,6 +4081,23 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
 
         fn serve(server: *http.Server(Ctx)) anyerror!void {
             return server.run();
+        }
+
+        /// The HTTP/3 listener's series (`h3/metrics.zig`), when the app
+        /// has metrics: copied from its endpoints on every scrape.
+        fn attachH3Metrics(self: *Self) void {
+            if (comptime !features.http3) return;
+            const registry = self.extras.metrics orelse return;
+            if (self.h3 == null or self.extras.h3_metrics) return;
+            registry.addCollector(.{ .context = safety.toCtx(self), .refresh = refreshH3Metrics }) catch return;
+            self.extras.h3_metrics = true;
+        }
+
+        fn refreshH3Metrics(context: *anyopaque, registry: *observe.metrics.Registry) void {
+            if (comptime !features.http3) return;
+            const self = safety.fromCtx(Self, context);
+            const ep = self.h3 orelse return;
+            @import("h3/metrics.zig").refresh(registry, ep.endpoints(), ep.steering(), ep.options.listener_name);
         }
 
         // ---- p3/net ----

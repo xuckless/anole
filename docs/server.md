@@ -766,7 +766,7 @@ listener's. With `listeners`, `http3 = true` on one TLS listener does the
 same for it, and `http3` holds the settings; one HTTP/3 port per server.
 
 `http3` fields: `address` and `port` (the TLS listener's when null), `alt_svc`
-(true), `max_streams_bidi` (100 concurrent requests per connection),
+(true), `max_streams_bidi` (256 concurrent requests per connection),
 `idle_timeout` (30 s, a `std.Io.Duration`), `validate_address` (false), `early_data`
 (false), `prefer_v2` (true: a client that offers QUIC v2 beside v1 is moved
 to v2; false keeps it on v1), `sockets` (null: one per executor on Linux, see
