@@ -76,8 +76,8 @@ pub const Probe = struct {
 pub var test_force: if (builtin.is_test) ?Tier else void = if (builtin.is_test) null else {};
 
 /// Which tier opens through `dir` use on this machine. Never fails: any
-/// doubt is `.verify`. Run it before connections are served; it opens `..`
-/// of `dir` once or twice and closes it.
+/// doubt is `.verify`. Run it before connections are served; it opens `/`
+/// through `dir` once or twice and closes it.
 pub fn probe(io: std.Io, dir: std.Io.Dir) Probe {
     if (builtin.is_test) if (test_force) |forced| return .{ .tier = forced, .why = .flag_ignored };
     return switch (builtin.os.tag) {
@@ -88,23 +88,26 @@ pub fn probe(io: std.Io, dir: std.Io.Dir) Probe {
     };
 }
 
-/// Two opens of `..`: without the flag an O_PATH open (it needs no read
-/// permission on the parent) that must work; with it a plain open that must be
-/// refused. Under `RESOLVE_BENEATH` the kernel answers `EXDEV` for `..` at the
-/// root before any permission check, so the second needs no read permission
-/// either. It is not O_PATH: zio always adds O_NOCTTY, and openat2 (unlike
-/// openat) answers EINVAL for O_PATH combined with it. Through the `Io`, so
-/// one that ignores the flag (Threaded) is detected too.
+/// One scoped open of the absolute path `/`. Under `RESOLVE_BENEATH` the kernel
+/// answers `EXDEV` for an absolute path before it looks at any permission, so
+/// it does not depend on what `dir`'s parent allows; an `Io` that ignores the
+/// flag (Threaded) opens the world-readable `/` instead and is detected. When
+/// the open is refused, an unflagged open of `/` must work, or the refusal
+/// could be a plain permission error from an `Io` that ignores the flag. The
+/// open is not O_PATH: zio always adds O_NOCTTY, and openat2 (unlike openat)
+/// answers EINVAL for O_PATH combined with it.
 fn probeLinux(io: std.Io, dir: std.Io.Dir) Probe {
     const protection = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(protection);
-    const plain = dir.openFile(io, "..", .{ .path_only = true }) catch return .{ .tier = .verify, .why = .probe_failed };
-    plain.close(io);
-    if (dir.openFile(io, "..", .{ .resolve_beneath = true })) |scoped| {
+    if (dir.openFile(io, "/", .{ .resolve_beneath = true })) |scoped| {
         scoped.close(io);
         return .{ .tier = .verify, .why = .flag_ignored };
     } else |err| return switch (err) {
-        error.AccessDenied => .{ .tier = .kernel, .why = .kernel_refuses },
+        error.AccessDenied => {
+            const plain = dir.openFile(io, "/", .{}) catch return .{ .tier = .verify, .why = .probe_failed };
+            plain.close(io);
+            return .{ .tier = .kernel, .why = .kernel_refuses };
+        },
         // zio's strict mode (no openat2) reaches std as `Unexpected`.
         error.Unexpected => .{ .tier = .verify, .why = .no_openat2 },
         error.PermissionDenied => .{ .tier = .verify, .why = .openat2_blocked },
@@ -145,12 +148,18 @@ pub fn openFile(
 ) OpenError!std.Io.File {
     const effective: Tier = if (builtin.is_test) (test_force orelse tier) else tier;
     switch (effective) {
-        .kernel => return dir.openFile(io, sub_path, .{ .resolve_beneath = true }) catch |err| switch (err) {
-            error.Unexpected, error.WouldBlock => return openVerified(io, dir, sub_path, root_real, scratch),
-            else => return err,
+        .kernel => return dir.openFile(io, sub_path, .{ .resolve_beneath = true }) catch |err| {
+            if (retryVerified(err)) return openVerified(io, dir, sub_path, root_real, scratch);
+            return err;
         },
         .verify => return openVerified(io, dir, sub_path, root_real, scratch),
     }
+}
+
+/// Whether a failed kernel-tier open is redone on the verify path (see the
+/// header).
+fn retryVerified(err: OpenError) bool {
+    return err == error.Unexpected or err == error.WouldBlock;
 }
 
 /// Opens (following links), then refuses a file whose real path is not under
@@ -166,15 +175,15 @@ fn openVerified(
     const file = try dir.openFile(io, sub_path, .{});
     errdefer file.close(io);
 
+    // One buffer for both real paths, so it is the arena's last allocation
+    // and `free` gives it back (an arena only reclaims the last one).
+    const bufs = scratch.alloc(u8, (if (root_real == null) @as(usize, 2) else 1) * std.Io.Dir.max_path_bytes) catch return error.SystemResources;
+    defer scratch.free(bufs);
     const root: []const u8 = root_real orelse blk: {
-        const buf = scratch.alloc(u8, std.Io.Dir.max_path_bytes) catch return error.SystemResources;
-        defer scratch.free(buf);
-        const n = dir.realPath(io, buf) catch |err| return realPathFailure(err);
-        // Copy out: `buf` goes back to the arena for the next one.
-        break :blk scratch.dupe(u8, buf[0..n]) catch return error.SystemResources;
+        const n = dir.realPath(io, bufs[0..std.Io.Dir.max_path_bytes]) catch |err| return realPathFailure(err);
+        break :blk bufs[0..n];
     };
-    const buf = scratch.alloc(u8, std.Io.Dir.max_path_bytes) catch return error.SystemResources;
-    defer scratch.free(buf);
+    const buf = bufs[bufs.len - std.Io.Dir.max_path_bytes ..];
     const n = file.realPath(io, buf) catch |err| return realPathFailure(err);
     if (!isUnder(root, buf[0..n])) return error.AccessDenied;
     return file;
@@ -232,4 +241,28 @@ test "isUnder: Windows ignores case and takes either separator" {
     try std.testing.expect(isUnder("C:\\Srv\\Pub", "c:\\srv\\pub\\a.css"));
     try std.testing.expect(isUnder("C:\\Srv\\Pub", "C:\\Srv\\Pub/a.css"));
     try std.testing.expect(!isUnder("C:\\Srv\\Pub", "C:\\Srv\\Public2\\x"));
+}
+
+test "retryVerified: only the errors zio and Threaded give an openat2 that was not refused" {
+    try std.testing.expect(retryVerified(error.Unexpected));
+    try std.testing.expect(retryVerified(error.WouldBlock));
+    try std.testing.expect(!retryVerified(error.AccessDenied));
+    try std.testing.expect(!retryVerified(error.FileNotFound));
+}
+
+test "probe: an Io that ignores the flag is never the kernel tier, even under an unreadable parent" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // std.Io.Threaded has no RESOLVE_BENEATH on Linux: its open of `/` works.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "pub", .default_dir);
+    var pub_dir = try tmp.dir.openDir(io, "pub", .{});
+    defer pub_dir.close(io);
+    // Searchable but not readable: an open of `..` fails with EACCES (unless root).
+    // `chmod` through the handle's path ("."): the handle may be O_PATH.
+    if (std.os.linux.errno(std.os.linux.fchmodat(tmp.dir.handle, ".", 0o311)) != .SUCCESS) return error.SkipZigTest;
+    defer _ = std.os.linux.fchmodat(tmp.dir.handle, ".", 0o755);
+    const verdict = probe(io, pub_dir);
+    try std.testing.expectEqual(Tier.verify, verdict.tier);
 }
