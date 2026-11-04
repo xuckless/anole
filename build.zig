@@ -2593,6 +2593,10 @@ const CModules = struct {
         var bssl_lib: ?*std.Build.Step.Compile = null;
         if (boringssl_dep) |up| {
             const lib = boringssl_build.library(b, up, target, optimize);
+            // Kernel TLS's C entry points to C++-only BoringSSL functions
+            // (src/tls/ktls.zig); Anole's own file, so not in build/boringssl.zig.
+            if (target.result.os.tag == .linux)
+                lib.root_module.addCSourceFile(.{ .file = b.path("src/tls/ktls_secret.cc"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
             bssl_lib = lib;
             m.boringssl = boringssl_build.module(Translator, tc_dep.?, up, lib, b.path("src/tls/bssl.h"), target, optimize);
         }

@@ -21,6 +21,10 @@
 //! | a float                      | a number; NaN and the infinities `null` (`non_finite_null`) |
 //! | integers, bool, enums        | as `std.json.Stringify` writes them        |
 //!
+//! The leaves (integers, floats, bool, enum names, errors, null) are written
+//! by the std formatting functions std.json ends in, with enum names as
+//! literals built at compile time, so without a `Stringify` per value.
+//!
 //! A type with a `jsonStringify` of its own, such as `std.json.Value`,
 //! writes itself through `std.json.Stringify`.
 const std = @import("std");
@@ -125,7 +129,27 @@ pub fn write(w: *Writer, value: anytype, options: Options) Writer.Error!void {
             if (a.child == u8) return writeString(w, &value);
             return writeItems(w, &value, options);
         },
-        .float => if (options.non_finite_null and !std.math.isFinite(value)) return w.writeAll("null"),
+        // The leaves std.json writes through std's formatting functions are
+        // written by those functions directly, without a `Stringify` each.
+        .float => {
+            if (options.non_finite_null and !std.math.isFinite(value)) return w.writeAll("null");
+            // std.json writes a float that f64 holds as that f64, by `{}`;
+            // the rest (NaN, f80 and f128 beyond f64) quoted, below.
+            const wide: f64 = @floatCast(value);
+            if (wide == value) return w.printFloat(wide, .{});
+        },
+        .int, .comptime_int => return w.printInt(value, 10, .lower, .{}),
+        .bool => return w.writeAll(if (value) "true" else "false"),
+        .null => return w.writeAll("null"),
+        .@"enum" => |e| {
+            // A non-exhaustive enum writes an unnamed value as a number, and
+            // `jsonStringify` overrides the name: both left to std.json.
+            if (comptime e.mode != .nonexhaustive and !std.meta.hasFn(T, "jsonStringify")) switch (value) {
+                inline else => |tag| return w.writeAll(comptime stringLiteral(@tagName(tag))),
+            };
+        },
+        .enum_literal => return w.writeAll(comptime stringLiteral(@tagName(value))),
+        .error_set => return Stringify.encodeJsonString(@errorName(value), .{}, w),
         .@"union" => |u| {
             if (comptime std.meta.hasFn(T, "jsonStringify") or u.tag_type == null) return Stringify.value(value, options.stringify(), w);
             try w.writeByte('{');
@@ -139,7 +163,8 @@ pub fn write(w: *Writer, value: anytype, options: Options) Writer.Error!void {
         },
         else => {},
     }
-    // The leaves: integers, floats, bool, enums, errors, null.
+    // The rest as std.json writes it: comptime floats, NaN (without
+    // `non_finite_null`) and floats f64 can't hold, the enums above, vectors.
     return Stringify.value(value, options.stringify(), w);
 }
 
@@ -151,12 +176,16 @@ fn keyOf(comptime T: type, comptime name: []const u8) []const u8 {
 
 /// `"name":`, escaped as std.json escapes a key, built at compile time.
 fn keyLiteral(comptime name: []const u8) []const u8 {
+    return comptime stringLiteral(name) ++ ":";
+}
+
+/// `"name"`, escaped as std.json escapes a string, built at compile time.
+fn stringLiteral(comptime name: []const u8) []const u8 {
     comptime {
         @setEvalBranchQuota(20 * name.len + 1000);
-        var buf: [name.len * 6 + 3]u8 = undefined;
+        var buf: [name.len * 6 + 2]u8 = undefined;
         var w: Writer = .fixed(&buf);
         Stringify.encodeJsonString(name, .{}, &w) catch unreachable;
-        w.writeByte(':') catch unreachable;
         const out = buf[0..w.end].*;
         return &out;
     }
@@ -414,6 +443,97 @@ test "json out: a tuple leaves out void elements, and null ones on request" {
     const t = .{ @as(u8, 1), {}, @as(?u8, null), "x" };
     try expectJson("[1,null,\"x\"]", t, .{});
     try expectJson("[1,\"x\"]", t, .{ .omit_null_fields = true });
+}
+
+/// `value` by `write` (NaN and the infinities left to std.json) and by
+/// std.json, compared.
+fn expectStdLeaf(one: *Writer.Allocating, two: *Writer.Allocating, value: anytype) !void {
+    one.clearRetainingCapacity();
+    two.clearRetainingCapacity();
+    try write(&one.writer, value, .{ .non_finite_null = false });
+    try Stringify.value(value, .{}, &two.writer);
+    try testing.expectEqualStrings(two.written(), one.written());
+}
+
+test "json out: the leaves are std.json's bytes" {
+    @setEvalBranchQuota(20_000);
+    var one: Writer.Allocating = .init(testing.allocator);
+    defer one.deinit();
+    var two: Writer.Allocating = .init(testing.allocator);
+    defer two.deinit();
+    var prng: std.Random.DefaultPrng = .init(0x6c656166);
+    const random = prng.random();
+
+    inline for (.{ u0, u1, i1, u7, u8, i8, u16, i16, u32, i32, u53, i54, u64, i64, usize, isize, u65, i65, u128, i128, u256, i256 }) |I| {
+        const min = std.math.minInt(I);
+        const max = std.math.maxInt(I);
+        try expectStdLeaf(&one, &two, @as(I, min));
+        try expectStdLeaf(&one, &two, @as(I, max));
+        try expectStdLeaf(&one, &two, @as(I, 0));
+        if (max >= 1) try expectStdLeaf(&one, &two, @as(I, 1));
+        if (min <= -1) try expectStdLeaf(&one, &two, @as(I, -1));
+        // Each 10^k - 1 and 10^k that fits, both signs.
+        comptime var p: comptime_int = 10;
+        inline while (p - 1 <= max) : (p *= 10) {
+            try expectStdLeaf(&one, &two, @as(I, p - 1));
+            if (p <= max) try expectStdLeaf(&one, &two, @as(I, p));
+            if (-(p - 1) >= min) try expectStdLeaf(&one, &two, @as(I, -(p - 1)));
+            if (-p >= min) try expectStdLeaf(&one, &two, @as(I, -p));
+        }
+        if (@typeInfo(I).int.bits > 0) {
+            for (0..200) |_| try expectStdLeaf(&one, &two, random.int(I));
+        }
+    }
+    try expectStdLeaf(&one, &two, .{ 0, -1, 1 << 70, -(1 << 70), std.math.maxInt(u128) });
+    try expectStdLeaf(&one, &two, 1 << 70);
+
+    inline for (.{ f16, f32, f64, f80, f128 }) |F| {
+        // 0.1 is not exact in f80 and f128: std.json quotes those.
+        inline for (.{ 0.0, 1.0, -1.5, 0.1, 1e-7, 1e21, 123456789.125 }) |x| {
+            if (comptime x <= std.math.floatMax(F)) try expectStdLeaf(&one, &two, @as(F, x));
+        }
+        const values = [_]F{ -@as(F, 0), std.math.floatMax(F), std.math.floatMin(F), std.math.floatTrueMin(F), std.math.nan(F), std.math.inf(F), -std.math.inf(F) };
+        for (values) |x| try expectStdLeaf(&one, &two, x);
+    }
+    // Any f64, NaN payloads included.
+    for (0..2_000) |_| try expectStdLeaf(&one, &two, @as(f64, @bitCast(random.int(u64))));
+
+    try expectStdLeaf(&one, &two, true);
+    try expectStdLeaf(&one, &two, false);
+    try expectStdLeaf(&one, &two, null);
+    try expectStdLeaf(&one, &two, @as(?u8, null));
+
+    const Named = enum { a, @"we\"ird", @"é", @"\n" };
+    inline for (.{ Named.a, Named.@"we\"ird", Named.@"é", Named.@"\n" }) |e| try expectStdLeaf(&one, &two, e);
+    const Open = enum(u8) { a, _ };
+    try expectStdLeaf(&one, &two, Open.a);
+    try expectStdLeaf(&one, &two, @as(Open, @fromBackingInt(7)));
+    const Custom = enum {
+        a,
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            _ = self;
+            try jw.write(42);
+        }
+    };
+    try expectStdLeaf(&one, &two, Custom.a);
+    try expectStdLeaf(&one, &two, .hello);
+    try expectStdLeaf(&one, &two, error.Oops);
+    try expectStdLeaf(&one, &two, @as(anyerror, error.@"x\"y"));
+
+    const All = struct {
+        small: u8 = 200,
+        big: i128 = std.math.minInt(i128),
+        half: f32 = -1.5,
+        tenth: f128 = 0.1,
+        nan: f64 = std.math.nan(f64),
+        yes: bool = true,
+        none: ?u8 = null,
+        named: Named = .@"we\"ird",
+        open: Open = @fromBackingInt(9),
+        custom: Custom = .a,
+        err: anyerror = error.Oops,
+    };
+    try expectStdLeaf(&one, &two, All{});
 }
 
 /// Larger than a thread's stack: a copy of it there would overflow.
