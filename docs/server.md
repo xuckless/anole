@@ -68,7 +68,7 @@ Both are optional. `zio_options` in your executable's root file sets zio's
 configuration:
 
 ```zig
-pub const zio_options = anole.zio_options; // .{ .scheduling = .pinned, .fast_accept = true }
+pub const zio_options = anole.zio_options; // .{ .scheduling = .pinned, .fast_accept = true, .fast_send = true, ... }
 ```
 
 zio reads it at compile time, as std reads `std_options`. Pinned scheduling
@@ -82,8 +82,9 @@ to write instead. `fast_accept` lets an executor busy with thousands of
 connections still take new ones quickly: the accept loop takes connections
 waiting in the backlog directly, and it (and anything else that starts
 tasks, such as idle connections waking) gets a turn sized to the run queue
-rather than a fixed 128 or 64. Anole's build turns it on too, so leaving it
-out of your own declaration keeps it. To set other zio options, keep
+rather than a fixed 128 or 64. `fast_send` sends a write the socket takes
+at once directly, without parking the task for the event loop. Anole's build
+turns both on too, so leaving them out of your own declaration keeps them. To set other zio options, keep
 `.pinned`:
 
 ```zig

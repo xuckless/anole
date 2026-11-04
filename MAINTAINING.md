@@ -184,7 +184,12 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   queue), all behind zio's `fast_accept` option except the run-queue fix, as
   in lalinsky/zio#837, which Anole turns on in `build.zig` and
   `anole.zio_options`. The bench suite's `conns` and `raw` scenarios measure
-  them.
+  them. `fast_send` (S2 D9 arm B, fork only, not offered upstream; user,
+  2026-11-04): `net_write` tries a nonblocking send() before submitting the
+  write (`sendNow` in io.zig, next to `acceptNow`), returns a short count
+  as is, takes the loop path on WouldBlock or a pending cancel, and spends
+  a tick-budget quantum per direct send; Anole turns it on beside
+  `fast_accept`. Add `--fast-send` to the check.sh runs above.
   Windows IOCP (#139, 4c04fd0 on `anole`, 56e57f6 on `anole-diag`): an
   AF_UNIX connect goes through a plain connect() (as .NET and Go do)
   instead of a wildcard bind and ConnectEx (the all-NUL AF_UNIX wildcard is
