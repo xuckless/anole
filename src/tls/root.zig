@@ -76,6 +76,14 @@ test "TLS: a header ahead of a big payload and keyframe-sized writes arrive in o
     try testing.duplex.framed(std.testing.allocator, rt.io());
 }
 
+test "TLS: a queued flush takes the smallest pooled buffer that fits, then moves up" {
+    try dusty_tls.buf_checks.classes();
+}
+
+test "TLS: a burst of small writes in flight reuses pooled buffers" {
+    try dusty_tls.buf_checks.burst();
+}
+
 /// A certificate and private key as PEM text, owned by the allocator that
 /// made them.
 pub const Pem = struct {

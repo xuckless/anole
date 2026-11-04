@@ -4,8 +4,8 @@
 //!     const user = try anole.json.parse(User, arena, body, .{});
 //!     const text = try anole.json.stringify(arena, user, .{});
 //!
-//! In a handler, `req.bind(User)` and `res.json(value)` (std.json, in every
-//! build) are the usual way; `try anole.json.readBody(User, req)` and
+//! In a handler, `req.bind(User)` and `res.json(value)` (std.json's bytes,
+//! with U+FFFD for invalid UTF-8, in every build) are the usual way; `try anole.json.readBody(User, req)` and
 //! `try anole.json.respond(res, value)` are the same contract on yyjson,
 //! for large documents.
 //!
