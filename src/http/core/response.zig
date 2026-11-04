@@ -1243,25 +1243,36 @@ pub const Response = struct {
         _ = self.headers.remove("Content-Encoding");
     }
 
-    /// Writes `value` as the JSON body (`std.json`), with its content type:
-    /// `res.json(user)`. `jsonWith` takes `std.json`'s options.
+    /// Writes `value` as the JSON body, with its content type:
+    /// `res.json(user)`. The bytes are `std.json`'s, keys by outside names
+    /// (`v.rename`); a string that is not UTF-8 has U+FFFD for each bad
+    /// byte (std.json would write it as an array of numbers). `jsonWith`
+    /// takes `std.json`'s options.
     pub fn json(self: *Response, value: anytype) !void {
         return self.jsonWith(value, .{});
     }
 
     /// `json` with `std.json`'s stringify options (whitespace, nulls left
-    /// out, and so on). `encode` with json.zig's `json.encode` is
-    /// considerably faster for types known at compile time.
+    /// out, and so on). Options other than `emit_null_optional_fields`
+    /// hand a type without renames to `std.json` itself; a type with
+    /// renames ignores them.
     pub fn jsonWith(self: *Response, value: anytype, options: std.json.Stringify.Options) !void {
         // The open writer owns the segment being filled, and would write
         // over this, or publish a length past the end of it.
         if (self._body_writer_buffering) return error.BodyWriterOpen;
         var w: BodyWriter = .init(self);
         defer w.interface.flush() catch unreachable;
-        // A type that renames a field (`v.rename`) is written by outside
-        // names; every other type keeps the std.json path byte for byte.
-        if (comptime json_out.hasOutsideNames(@TypeOf(value))) {
-            try json_out.write(&w.interface, value, .{ .omit_null_fields = !options.emit_null_optional_fields });
+        const renamed = comptime json_out.hasOutsideNames(@TypeOf(value));
+        const plain = options.whitespace == .minified and !options.escape_unicode and
+            !options.emit_strings_as_arrays and !options.emit_nonportable_numbers_as_strings;
+        if (renamed or plain) {
+            // json_out writes what std.json writes, about twice as fast;
+            // a renamed type keeps its own `null` for NaN and the
+            // infinities.
+            try json_out.write(&w.interface, value, .{
+                .omit_null_fields = !options.emit_null_optional_fields,
+                .non_finite_null = renamed,
+            });
         } else {
             const json_formatter = std.json.fmt(value, options);
             try json_formatter.format(&w.interface);
@@ -5266,20 +5277,106 @@ test "json: renamed fields by outside names, nested and in slices" {
     try std.testing.expect(std.mem.indexOf(u8, conn_writer.buffered(), "{\"lines\":[{\"displayName\":\"a\"}],\"n\":1}") != null);
 }
 
-test "json: a type without renames writes exactly what std.json writes" {
+/// The body `jsonWith(value, options)` sends.
+fn expectJsonBody(expected: []const u8, value: anytype, options: std.json.Stringify.Options) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var buf: [1024]u8 = undefined;
+    var buf: [16 * 1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
     var response = try Response._init(arena.allocator(), &connection, 32);
-    const Plain = struct { id: u32, name: []const u8, opt: ?u8 = null };
-    const value: Plain = .{ .id = 1, .name = "x" };
-    try response.json(value);
+    try response.jsonWith(value, options);
     try response.write();
+    const sent = conn_writer.buffered();
+    const head_end = (std.mem.indexOf(u8, sent, "\r\n\r\n") orelse return error.TestUnexpectedResult) + 4;
+    try std.testing.expectEqualStrings(expected, sent[head_end..]);
+}
+
+/// `jsonWith(value, options)` sends exactly what `std.json` writes.
+fn expectStdJson(value: anytype, options: std.json.Stringify.Options) !void {
     var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer expected.deinit();
-    try expected.writer.print("{f}", .{std.json.fmt(value, .{})});
-    try std.testing.expect(std.mem.indexOf(u8, conn_writer.buffered(), expected.written()) != null);
+    try expected.writer.print("{f}", .{std.json.fmt(value, options)});
+    try expectJsonBody(expected.written(), value, options);
+}
+
+test "json: a type without renames writes exactly what std.json writes" {
+    const Plain = struct { id: u32, name: []const u8, opt: ?u8 = null };
+    try expectStdJson(Plain{ .id = 1, .name = "x" }, .{});
+
+    // HttpArena's /json/:count items, with strings of every kind.
+    const Rating = struct { score: f64, count: u32 };
+    const Priced = struct {
+        id: u32,
+        name: []const u8,
+        category: []const u8,
+        price: f64,
+        quantity: u32,
+        active: bool,
+        tags: []const []const u8,
+        rating: Rating,
+        total: f64,
+    };
+    const items = [_]Priced{
+        .{ .id = 1, .name = "Alpha Widget", .category = "electronics", .price = 29.99, .quantity = 3, .active = true, .tags = &.{ "new", "sale" }, .rating = .{ .score = 4.5, .count = 120 }, .total = 89.97 },
+        .{ .id = 2, .name = "Кофе 東京 \u{1F600}", .category = "a \"quoted\" \\ back\nslash\t\r/", .price = -1, .quantity = 0, .active = false, .tags = &.{}, .rating = .{ .score = 0, .count = 0 }, .total = 1e21 },
+    };
+    try expectStdJson(.{ .items = @as([]const Priced, &items), .count = items.len }, .{});
+    var controls: [0x80]u8 = undefined;
+    for (&controls, 0..) |*c, i| c.* = @intCast(i);
+    try expectStdJson(@as([]const u8, &controls), .{});
+
+    // Optionals, with and without the nulls.
+    const Opt = struct { a: ?[]const u8, b: ?[]const u8, inner: ?struct { c: ?u8, d: ?u8 } };
+    const opt: Opt = .{ .a = null, .b = "set", .inner = .{ .c = null, .d = 4 } };
+    try expectStdJson(opt, .{});
+    try expectStdJson(opt, .{ .emit_null_optional_fields = false });
+    const tuple = .{ @as(u8, 1), {}, @as(?u8, null), "x" };
+    try expectStdJson(tuple, .{});
+    try expectStdJson(tuple, .{ .emit_null_optional_fields = false });
+
+    // Unions, enums, the string types, numbers and errors.
+    const Shape = union(enum) { circle: struct { r: u32 }, none, label: []const u8 };
+    try expectStdJson([_]Shape{ .{ .circle = .{ .r = 3 } }, .none, .{ .label = "l" } }, .{});
+    const Level = enum(u8) { low, high, _ };
+    try expectStdJson(.{ Level.high, @as(Level, @fromBackingInt(@intCast(7))), .literal }, .{});
+    const array: [3]u8 = "abc".*;
+    const ints = [_]u16{ 1, 2 };
+    const zstr: [:0]const u8 = "z";
+    const cstr: [*:0]const u8 = "c";
+    try expectStdJson(.{ array, zstr, cstr, &ints, @as([]const u16, &ints) }, .{});
+    try expectStdJson(.{ std.math.maxInt(i128), std.math.minInt(i128), std.math.maxInt(u64), @as(f32, -1), @as(f64, 1e21), @as(f64, 5e-324), @as(f32, 0.1), @as(f64, 2.5) }, .{});
+    try expectStdJson(.{ error.Broken, true, null, 42, 1.5 }, .{});
+
+    // A comptime field, a type that writes itself, a key needing escapes.
+    try expectStdJson(.{ .ok = true }, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"a\":[1,true,null,\"s\"]}", .{});
+    defer parsed.deinit();
+    try expectStdJson(parsed.value, .{});
+    try expectStdJson(struct { @"we\"ird\n": u8 }{ .@"we\"ird\n" = 1 }, .{});
+    try expectStdJson(struct {}{}, .{});
+}
+
+test "json: invalid UTF-8 is U+FFFD for every type" {
+    const validate = @import("validate");
+    const Plain = struct { s: []const u8 };
+    const Renamed = struct {
+        s_s: []const u8,
+        pub const field_rules = .{ .s_s = validate.rename("s") };
+    };
+    try expectJsonBody("{\"s\":\"a\\ufffdb\"}", Plain{ .s = "a\xffb" }, .{});
+    try expectJsonBody("{\"s\":\"a\\ufffdb\"}", Renamed{ .s_s = "a\xffb" }, .{});
+    try expectJsonBody("{\"s\":\"a\\ufffdb\"}", Plain{ .s = "a\xffb" }, .{ .emit_null_optional_fields = false });
+}
+
+test "json: other std.json options keep std.json's bytes" {
+    const Plain = struct { id: u64, name: []const u8, note: ?[]const u8 = null, nested: struct { x: f64 } };
+    const value: Plain = .{ .id = 1 << 60, .name = "é\"x", .nested = .{ .x = 0.5 } };
+    try expectStdJson(value, .{ .whitespace = .indent_2 });
+    try expectStdJson(value, .{ .escape_unicode = true });
+    try expectStdJson(value, .{ .emit_strings_as_arrays = true });
+    try expectStdJson(value, .{ .emit_nonportable_numbers_as_strings = true });
+    // Non-finite floats stay std.json's on a type without renames.
+    try expectStdJson(.{ std.math.nan(f64), std.math.inf(f32), -std.math.inf(f64) }, .{});
 }

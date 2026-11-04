@@ -3,6 +3,20 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+### Changed
+
+- `res.json` writes every type through one writer with std.json's
+  default options (and `jsonWith` with only `emit_null_optional_fields`
+  changed), not only types with renamed fields: keys are encoded at
+  compile time and each string is escaped and checked for UTF-8 in one
+  pass, so a body costs about half the instructions it did (120k vs 265k
+  for HttpArena's /json/50 in a micro-benchmark). The bytes are
+  std.json's, except that a string that is not UTF-8 now has U+FFFD for
+  each bad byte; std.json wrote it as an array of byte values. Other
+  `jsonWith` options still go to std.json itself.
+
 ## 0.5.0 (2026-11-01)
 
 ### Changed
