@@ -768,7 +768,7 @@ Where the idle time comes from, per executor thread:
 measurements and the metrics on epoll and kqueue), `util_enter` (0.85; 0.88 is the documented
 fallback if it holds too early on your hardware), `util_exit` (0.80),
 `lag_enter` (25 ms), `window` (1 s), `sustain` (3), `min_shed` (5 s) and
-`retry_after_s` (`.{ 5, 15 }`). With [`app.metrics`](observe.md) the
+`retry_after_s` (`.{ 5, 15 }`). With [`app.metrics`](observability.md) the
 gate's numbers are on `/metrics`: `anole_executor_utilization_permille`,
 `anole_executor_lag_microseconds{stat="min"|"max"}`,
 `anole_executor_hot`, `anole_admission_signal{source}`,

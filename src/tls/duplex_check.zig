@@ -622,6 +622,8 @@ fn failThenRelease(side: *Side, result: *anyerror!void) void {
 /// out: the send fails, the record stays out, and closing the connection
 /// afterwards copies nothing into the queue.
 pub fn borrowReset(gpa: std.mem.Allocator, io: std.Io) !void {
+    // SO_LINGER through std.posix doesn't compile for Windows (not required).
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     // SAFETY: `open` sets every field.
     var p: Pair = undefined;
     try p.open(gpa, io);
