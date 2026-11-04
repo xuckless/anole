@@ -2187,15 +2187,19 @@ pub const Response = struct {
 
         // Plain writes rather than `print`: a head is on every response, and
         // these are copies into the write buffer, without format parsing.
-        try w.writeAll("HTTP/1.1 ");
-        try writeDecimal(w, @backingInt(self.status));
-        try w.writeByte(' ');
-        try w.writeAll(self.status.phrase());
-        try w.writeAll("\r\n");
-        if (self._send_date and self.headers.get("Date") == null) {
-            try w.writeAll("Date: ");
-            try w.writeAll(http.currentHttpDate(self.io));
+        // Each write costs about as much as its bytes, so the status line,
+        // the Date line and the end are one write each where they can be.
+        if (self.status.statusLine()) |line| {
+            try w.writeAll(line);
+        } else {
+            try w.writeAll("HTTP/1.1 ");
+            try writeDecimal(w, @backingInt(self.status));
+            try w.writeByte(' ');
+            try w.writeAll(self.status.phrase());
             try w.writeAll("\r\n");
+        }
+        if (self._send_date and self.headers.get("Date") == null) {
+            try w.writeAll(http.currentDateLine(self.io));
         }
 
         // Write headers
@@ -2226,11 +2230,8 @@ pub const Response = struct {
             } else if (!self._streaming) {
                 // Write Content-Length if not manually set (skip for streaming responses like SSE)
                 const has_content_length = self.headers.get("Content-Length") != null;
-                if (!has_content_length) {
-                    try w.writeAll("Content-Length: ");
-                    try writeDecimal(w, self.bodyLen());
-                    try w.writeAll("\r\n");
-                }
+                // The length and the end of the head, in one write.
+                if (!has_content_length) return writeLengthTail(w, self.bodyLen());
             }
         }
 
@@ -2499,6 +2500,37 @@ fn writeDecimal(w: *std.Io.Writer, n: usize) std.Io.Writer.Error!void {
     return w.printInt(n, 10, .lower, .{});
 }
 
+/// `n` in decimal at the end of `buf`, right to left, two digits per
+/// division (std's `printIntAny`); returns where the digits start.
+fn decimalInto(buf: []u8, n: usize) usize {
+    var a = n;
+    var i = buf.len;
+    while (a >= 100) : (a /= 100) {
+        i -= 2;
+        buf[i..][0..2].* = std.fmt.digits2(@intCast(a % 100));
+    }
+    if (a < 10) {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @intCast(a));
+    } else {
+        i -= 2;
+        buf[i..][0..2].* = std.fmt.digits2(@intCast(a));
+    }
+    return i;
+}
+
+/// `Content-Length: <n>`, its CRLF and the CRLF that ends the head, in
+/// one write: what hyper and actix-http append as one length line.
+fn writeLengthTail(w: *std.Io.Writer, n: usize) std.Io.Writer.Error!void {
+    const prefix = "Content-Length: ";
+    // The prefix, the digits of maxInt(u64), CRLF CRLF.
+    var buf: [prefix.len + 20 + 4]u8 = undefined;
+    buf[buf.len - 4 ..][0..4].* = "\r\n\r\n".*;
+    const start = decimalInto(buf[0 .. buf.len - 4], n) - prefix.len;
+    buf[start..][0..prefix.len].* = prefix.*;
+    return w.writeAll(buf[start..]);
+}
+
 fn writeJsonString(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
     try std.json.Stringify.encodeJsonString(text, .{}, w);
 }
@@ -2560,6 +2592,17 @@ test writeDecimal {
         try writeDecimal(&w, n);
         var expected: [32]u8 = undefined;
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{d}", .{n}), w.buffered());
+    }
+}
+
+test writeLengthTail {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    for ([_]usize{ 0, 7, 10, 99, 100, 200, 404, 1234567890, std.math.maxInt(usize) }) |n| {
+        w.end = 0;
+        try writeLengthTail(&w, n);
+        var expected: [64]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "Content-Length: {d}\r\n\r\n", .{n}), w.buffered());
     }
 }
 

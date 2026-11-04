@@ -271,6 +271,23 @@ pub const Status = enum(c.llhttp_status_t) {
         };
     }
 
+    /// The whole status line, `HTTP/1.1 200 OK\r\n`, for the statuses
+    /// nearly every response has; null for the rest, which are written a
+    /// piece at a time. One copy instead of five, as nginx's
+    /// `ngx_http_status_lines` and hyper's `HTTP/1.1 200 OK` fast path.
+    pub fn statusLine(self: Status) ?[]const u8 {
+        return switch (self) {
+            .ok => "HTTP/1.1 200 OK\r\n",
+            .created => "HTTP/1.1 201 Created\r\n",
+            .no_content => "HTTP/1.1 204 No Content\r\n",
+            .not_modified => "HTTP/1.1 304 Not Modified\r\n",
+            .bad_request => "HTTP/1.1 400 Bad Request\r\n",
+            .not_found => "HTTP/1.1 404 Not Found\r\n",
+            .internal_server_error => "HTTP/1.1 500 Internal Server Error\r\n",
+            else => null,
+        };
+    }
+
     /// Writes the reason phrase (see `phrase`).
     pub fn format(self: Status, writer: anytype) !void {
         try writer.writeAll(self.phrase());
@@ -329,20 +346,36 @@ fn realSeconds(io: std.Io) i64 {
     return std.Io.Clock.real.now(io).toSeconds();
 }
 
-threadlocal var date_cache: [29]u8 = undefined;
-threadlocal var date_cache_len: usize = 0;
-threadlocal var date_cache_seconds: i64 = -1;
+/// A whole `Date` header line: `Date: `, an IMF-fixdate, CRLF.
+pub const DateLine = [6 + 29 + 2]u8;
 
-/// The current time for a `Date` header (RFC 9110 6.6.1), formatted at most
-/// once a second per thread. The slice is valid until the next call on this
-/// thread; copy it to keep it.
-pub fn currentHttpDate(io: std.Io) []const u8 {
+/// The `Date` line for `seconds` since the epoch (see `formatHttpDate`),
+/// ready to copy into a head in one piece, as actix's `write_date_header`.
+pub fn dateLine(buf: *DateLine, seconds: i64) void {
+    buf[0..6].* = "Date: ".*;
+    _ = formatHttpDate(buf[6..35], seconds);
+    buf[35..37].* = "\r\n".*;
+}
+
+threadlocal var date_line: DateLine = undefined;
+threadlocal var date_line_seconds: i64 = -1;
+
+/// The current time as a `Date` header line (RFC 9110 6.6.1), formatted at
+/// most once a second per thread. Valid until the next call on this thread;
+/// copy it to keep it.
+pub fn currentDateLine(io: std.Io) *const DateLine {
     const now = realSeconds(io);
-    if (now != date_cache_seconds) {
-        date_cache_len = formatHttpDate(&date_cache, now).len;
-        date_cache_seconds = now;
+    if (now != date_line_seconds) {
+        dateLine(&date_line, now);
+        date_line_seconds = now;
     }
-    return date_cache[0..date_cache_len];
+    return &date_line;
+}
+
+/// The current time for a `Date` header, the value of `currentDateLine`.
+/// Valid until the next call on this thread; copy it to keep it.
+pub fn currentHttpDate(io: std.Io) []const u8 {
+    return currentDateLine(io)[6..35];
 }
 
 test "formatHttpDate: IMF-fixdate" {
@@ -354,6 +387,37 @@ test "formatHttpDate: IMF-fixdate" {
     try std.testing.expectEqualStrings("Fri, 31 Dec 9999 23:59:59 GMT", formatHttpDate(&buf, 253402300799));
     try std.testing.expectEqualStrings("Fri, 31 Dec 9999 23:59:59 GMT", formatHttpDate(&buf, 253402300800));
     try std.testing.expectEqualStrings("Fri, 31 Dec 9999 23:59:59 GMT", formatHttpDate(&buf, std.math.maxInt(i64)));
+}
+
+test "dateLine: the Date header line, clamped as formatHttpDate" {
+    var line: DateLine = undefined;
+    dateLine(&line, 784111777);
+    try std.testing.expectEqualStrings("Date: Sun, 06 Nov 1994 08:49:37 GMT\r\n", &line);
+    dateLine(&line, -5);
+    try std.testing.expectEqualStrings("Date: Thu, 01 Jan 1970 00:00:00 GMT\r\n", &line);
+    dateLine(&line, std.math.maxInt(i64));
+    try std.testing.expectEqualStrings("Date: Fri, 31 Dec 9999 23:59:59 GMT\r\n", &line);
+
+    // The clock's own: only its shape, the second may turn between reads.
+    const now = currentDateLine(std.testing.io);
+    try std.testing.expect(std.mem.startsWith(u8, now, "Date: "));
+    try std.testing.expect(std.mem.endsWith(u8, now, " GMT\r\n"));
+    try std.testing.expectEqual(@as(usize, 29), currentHttpDate(std.testing.io).len);
+}
+
+test "Status.statusLine: the literal lines match the code and phrase, for exactly the hot statuses" {
+    var buf: [128]u8 = undefined;
+    var lines: usize = 0;
+    for (std.enums.values(Status)) |status| {
+        const line = status.statusLine() orelse continue;
+        lines += 1;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "HTTP/1.1 {d} {s}\r\n", .{ @backingInt(status), status.phrase() }), line);
+        switch (status) {
+            .ok, .created, .no_content, .not_modified, .bad_request, .not_found, .internal_server_error => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 7), lines);
 }
 
 test "Status: construct from llhttp_status_t" {
