@@ -19,6 +19,8 @@ pub const Server = dusty.Server;
 /// builds it from `anole.ServerOptions`; use that unless you drive the core
 /// alone.
 pub const ServerConfig = dusty.ServerConfig;
+/// The WebSocket admission gate (#129): `ServerConfig.admission`.
+pub const admission = dusty.admission;
 /// An IP address and port, or a Unix socket path.
 pub const Address = dusty.Address;
 /// One socket the core server accepts on (`ServerConfig.listeners`);

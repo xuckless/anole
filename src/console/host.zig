@@ -33,6 +33,7 @@ pub fn Of(comptime S: type) type {
                 .routes = routes,
                 .config = config,
                 .task_stats = taskStats,
+                .admission = admission,
                 .stack_committed = stackCommitted,
                 .before_exec = beforeExec,
             };
@@ -138,7 +139,7 @@ pub fn Of(comptime S: type) type {
         pub fn collect(ctx: *anyopaque, what: collector.What, w: *std.Io.Writer) anyerror!void {
             switch (what) {
                 .db => try collectDatabases(of(ctx), w),
-                .ws => try collectWs(w),
+                .ws => try collectWs(of(ctx), w),
             }
         }
 
@@ -148,10 +149,14 @@ pub fn Of(comptime S: type) type {
             return @intCast(@max(n, 0));
         }
 
-        fn collectWs(w: *std.Io.Writer) !void {
-            try w.print("{{\"sockets\":{{\"h1\":{d},\"h2\":{d},\"h3\":{d}}},\"webtransport\":{d},\"rooms\":[", .{
+        fn collectWs(s: *S, w: *std.Io.Writer) !void {
+            try w.print("{{\"sockets\":{{\"h1\":{d},\"h2\":{d},\"h3\":{d}}},\"webtransport\":{d},", .{
                 gaugeSum(.ws_h1), gaugeSum(.ws_h2), gaugeSum(.ws_h3), gaugeSum(.wt_sessions),
             });
+            const adm = &s.server.admission;
+            try w.print("\"admission\":{{\"admitted\":{d},\"limit\":", .{adm.live.load(.monotonic)});
+            if (adm.frozenLimit()) |l| try w.print("{d}", .{l}) else try w.writeAll("null");
+            try w.print(",\"refused_load\":{d},\"refused_cap\":{d}}},\"rooms\":[", .{ adm.refused_load.load(.monotonic), adm.refused_cap.load(.monotonic) });
             var first = true;
             if (comptime features.websocket) try websocket.Rooms._consoleRows(w, &first);
             try w.writeAll("],\"topics\":[");
@@ -203,6 +208,10 @@ pub fn Of(comptime S: type) type {
             const s = of(ctx);
             const st = s.rt.executorStats(i) orelse return null;
             return .{ .tasks = st.spawned -% st.finished, .run_queue = st.run_queue };
+        }
+
+        fn admission(ctx: *anyopaque) *const dusty.admission.State {
+            return &of(ctx).server.admission;
         }
 
         fn stackCommitted(ctx: *anyopaque) u64 {

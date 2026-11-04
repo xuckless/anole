@@ -97,6 +97,8 @@ const Client = struct {
     answered_user: [32]u8 = undefined,
     answered_user_len: usize = 0,
     path: []const u8 = "/chat",
+    /// The answer's `retry-after`, in seconds; 0 for none.
+    retry_after: u16 = 0,
 
     fn init(self: *Client, io: std.Io, addr: std.Io.net.IpAddress) !void {
         self.* = .{ .io = io, .stream = try addr.connect(io, .{ .mode = .stream }), .reader = undefined, .writer = undefined };
@@ -255,6 +257,7 @@ const Client = struct {
     fn onHeader(_: ?*c.nghttp2_session, _: [*c]const c.nghttp2_frame, name: [*c]const u8, namelen: usize, value: [*c]const u8, valuelen: usize, _: u8, user: ?*anyopaque) callconv(.c) c_int {
         const self: *Client = @ptrCast(@alignCast(user.?));
         if (std.mem.eql(u8, name[0..namelen], ":status")) self.status = std.fmt.parseInt(u16, value[0..valuelen], 10) catch 0;
+        if (std.mem.eql(u8, name[0..namelen], "retry-after")) self.retry_after = std.fmt.parseInt(u16, value[0..valuelen], 10) catch 0;
         if (std.mem.eql(u8, name[0..namelen], "sec-websocket-protocol") and valuelen <= self.answered_protocol.len) {
             @memcpy(self.answered_protocol[0..valuelen], value[0..valuelen]);
             self.answered_protocol_len = valuelen;
@@ -721,6 +724,52 @@ test "WebSocket over HTTP/2: a page from another origin gets 403, one from the s
     own.origin = "http://localhost";
     try own.open();
     try std.testing.expectEqual(@as(u16, 200), own.status);
+}
+
+test "WebSocket over HTTP/2: under an admission freeze the extended CONNECT gets 503 with retry-after, and the connection then serves a GET" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = .{ .ip = .{ .ip4 = .loopback(0) } }, .http2_prior_knowledge = true }},
+        .http2 = .{ .enable_connect_protocol = true },
+    }, {});
+    defer server.deinit();
+    server.router.get("/plain", struct {
+        fn h(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "plain";
+        }
+    }.h);
+    var future = try startEcho(&server, io);
+    defer future.cancel(io) catch {};
+    server.admission.freezeForTest(0);
+
+    var client: Client = undefined;
+    try client.init(io, server.address.ip);
+    defer client.deinit();
+    try client.open();
+    try std.testing.expectEqual(@as(u16, 503), client.status);
+    try std.testing.expect(client.retry_after >= 5 and client.retry_after <= 15);
+    try std.testing.expectEqual(@as(u32, 0), server.admission.live.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), server.admission.refused_load.load(.monotonic));
+
+    // The connection is still good for other streams.
+    client.status = 0;
+    client.closed = false;
+    const nva = [_]c.nghttp2_nv{
+        Client.nv(":method", "GET"),
+        Client.nv(":scheme", "http"),
+        Client.nv(":path", "/plain"),
+        Client.nv(":authority", "localhost"),
+    };
+    if (c.nghttp2_submit_request2(client.session, null, &nva, nva.len, null, null) < 0) return error.Http2Submit;
+    try client.pumpUntilBounded("the GET's answer", struct {
+        fn f(cl: *Client) bool {
+            return cl.status != 0;
+        }
+    }.f);
+    try std.testing.expectEqual(@as(u16, 200), client.status);
 }
 
 var lobby: websocket.Rooms = undefined;

@@ -188,6 +188,7 @@ interface), `":3000"`, or `"127.0.0.1:3000"` (this machine only).
 | `banner` | true | The startup banner (the word "anole" drawn large, the version and the address), only when stderr is a terminal, the logs are text and the process is not run by systemd; `ANOLE_NO_BANNER=1` turns it off. A terminal of 110 columns or more gets one of two full-size drawings at random, a narrower one (55 or more) a half-height one, a narrower one still only the version line. 24-bit colour when `COLORTERM` is `truecolor` or `24bit`, else the nearest 256 colours; `NO_COLOR` draws it uncoloured. |
 | `timeouts` | see below | The request, head, write, keep-alive and drain deadlines. |
 | `limits` | see below | Body, head and connection limits. |
+| `admission` | on | The WebSocket admission gate: under load the number of open WebSockets is held; see [Overload](#overload). |
 | `proxy` | none trusted | Trust in proxies in front: `trusted`, `X-Forwarded-*`. |
 | `request`, `response` | see below | How requests are read and responses written. |
 | `http2` | 250 streams | HTTP/2 settings, for h2c and h2 over TLS. |
@@ -227,6 +228,7 @@ configuration ([c-abi.md](c-abi.md#configuration)). A duration is an
 | `max_connections` | 0 | Open connections at most; 0 follows the open-file limit (10 000 on Windows). |
 | `max_requests_per_connection` | none | Requests per keep-alive connection. |
 | `ws_max_message` | 1 MiB | The largest WebSocket message, in or out; a route's `max_message_size` overrides it. |
+| `max_websockets` | none | Open WebSockets at most, over HTTP/1.1, HTTP/2 and HTTP/3; past it an upgrade gets 503 with `Retry-After`. See [Overload](#overload). |
 
 `proxy`: `trusted` (null), `trusted_hops` (0), `trust_forwarded_proto` (true) and
 `trust_forwarded_host` (false), as in [Behind a proxy](#behind-a-proxy).
@@ -704,6 +706,72 @@ hosts that hold more:
 ```sh
 sysctl -w vm.max_map_count=1048576   # or a file in /etc/sysctl.d/
 ```
+
+### Overload
+
+A server that keeps admitting WebSockets past what its cores can carry
+degrades every socket at once: a relay that is fine at 780 users falls
+apart for all of them at 800. So by default Anole stops admitting new
+WebSockets once an executor is overloaded, and lets the ones it has run
+on (`admission`, [#129](https://github.com/xuckless/anole/issues/129)):
+
+- Each executor measures its **utilization** over 1 s windows: the share
+  of wall time it is not asleep in its event poll (Node's event loop
+  utilization, tokio's busy duration). An executor is *hot* after 3
+  windows in a row at `util_enter` (0.85) or more, or after a window in
+  which every 100 ms probe tick was at least `lag_enter` (25 ms) late
+  (CPU taken away by a quota). It cools after a window under `util_exit`
+  (0.80), no sooner than `min_shed` (5 s) after it went hot; within 5 s
+  of cooling, one window over the line makes it hot again.
+- While any executor is hot, the server **holds the number of open
+  WebSockets** where it was: at the larger of the open count plus the
+  sockets that closed in the last second (clients reconnecting), and the
+  most that were open since the server first turned hot. Every close
+  readmits one, so clients that reconnect, as a load test's do, are never
+  refused.
+- An upgrade past the limit, or past `limits.max_websockets`, is answered
+  **503 with `Retry-After`** (5 to 15 s, at random) before any WebSocket
+  state exists: over HTTP/1.1 the connection closes after it, over HTTP/2
+  and HTTP/3 only the extended CONNECT's stream ends (RFC 8441, RFC 9220).
+  An origin that is not allowed still gets 403 first, and a draining
+  server its own 503. A refusal is logged at debug only; the first freeze
+  and its end are logged as a warning and an info line.
+
+Clients have to honour `Retry-After`: native clients see the 503, browsers
+only an `error` event and close code 1006, so a page should back off
+before it reconnects. A client whose network dropped can hold its old
+socket's place until that socket dies, so give sockets an idle timeout or a
+ping (`UpgradeOptions.timeout`). A raw `websocket.upgrade` caller must
+`deinit` its socket (as always): a socket never deinitialized keeps its
+place until the server stops.
+
+Where the idle time comes from, per executor thread:
+
+- epoll and kqueue: the time inside the waiting `epoll_wait`/`kevent`
+  (libuv's `uv_metrics_idle_time`).
+- io_uring (Anole's default on Linux): the wall time minus the thread's
+  perf task clock, read once a window. The waiting `io_uring_enter` also
+  submits the sends and runs their network softirq, so its wall time
+  would count that work as idle. The task clock needs `perf_event_open`:
+  it opens at `kernel.perf_event_paranoid` 2 or lower (Fedora's default)
+  or with `CAP_PERFMON`. Debian and Ubuntu default to 3 or 4, and Docker's
+  default seccomp profile denies it (and io_uring too, so a container runs
+  on epoll and is measured there). Without it the load gate is off on that
+  server, which says so once at startup; `max_websockets` still applies.
+- `std.Io.Threaded` and other backends: no signal, so no freeze.
+
+`admission` takes `enabled` (true; false keeps the measurements and the
+metrics but never freezes), `util_enter` (0.85; 0.88 is the documented
+fallback if it holds too early on your hardware), `util_exit` (0.80),
+`lag_enter` (25 ms), `window` (1 s), `sustain` (3), `min_shed` (5 s) and
+`retry_after_s` (`.{ 5, 15 }`). With [`app.metrics`](observe.md) the
+gate's numbers are on `/metrics`: `anole_executor_utilization_permille`,
+`anole_executor_lag_microseconds{stat="min"|"max"}`,
+`anole_executor_hot`, `anole_admission_signal{source}`,
+`anole_websockets_admitted`, `anole_websockets_limit` (-1 while not held)
+and `anole_ws_upgrades_refused_total{reason="load"|"cap"}`; the console's
+connections view shows each executor's utilization (a `!` while hot) and
+its WebSockets view the limit and the refusals.
 
 ## HTTP/2
 

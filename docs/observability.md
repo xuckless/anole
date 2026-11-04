@@ -285,6 +285,13 @@ anole_http_request_duration_seconds_count{method="GET",route="/chain/:id"} 1
 | `anole_runtime_stack_committed_bytes` | none | Memory held by coroutine stacks in use (a lower bound: stacks times their initial committed size). |
 | `anole_connections` | `executor` | Open connections. |
 | `anole_streams` | `executor`, `protocol` | Open HTTP/2 and HTTP/3 request streams. |
+| `anole_executor_utilization_permille` | `executor` | Utilization over the last 1 s window, in thousandths: 1 - time asleep in the event poll / wall time ([Overload](server.md#overload)). |
+| `anole_executor_lag_microseconds` | `executor`, `stat` | How late the executor's 100 ms probe tick fired, least (`min`) and most (`max`) over the window. |
+| `anole_executor_hot` | `executor` | 1 while the executor is over the admission gate's line. |
+| `anole_admission_signal` | `executor`, `source` | 1 for where utilization comes from: `poll_wall` (epoll, kqueue), `task_clock` (io_uring) or `none`. |
+| `anole_websockets_admitted` | none | Open WebSockets the admission gate counts. |
+| `anole_websockets_limit` | none | The WebSocket count held under load; -1 while none is held. |
+| `anole_ws_upgrades_refused_total` | `reason` | Upgrades answered 503 by the gate: `load` (held) or `cap` (`limits.max_websockets`). |
 
 The `anole_runtime_*` series come from zio's `diagnostics` option, which
 `anole.zio_options` turns on (one relaxed atomic add per task spawned and

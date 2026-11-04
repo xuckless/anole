@@ -55,6 +55,8 @@ pub const Host = struct {
     /// Plain text (the `/config` view).
     config: ?*const fn (ctx: *anyopaque, w: *std.Io.Writer) anyerror!void = null,
     task_stats: ?*const fn (ctx: *anyopaque, executor: usize) ?TaskStats = null,
+    /// The server's WebSocket admission gate (per-executor utilization).
+    admission: ?*const fn (ctx: *anyopaque) *const dusty.admission.State = null,
     stack_committed: ?*const fn (ctx: *anyopaque) u64 = null,
     /// Before the process execs itself: the in-process console restores the
     /// terminal and the captured descriptors.
@@ -982,6 +984,14 @@ pub const Service = struct {
                         try o.put(a, "run_queue", .{ .integer = @intCast(ts.run_queue) });
                     };
                     try o.put(a, "connections", .{ .integer = dusty.gauges.get(.connections, i) });
+                    if (self.host.admission) |f| {
+                        const rows = f(self.host.ctx).rows;
+                        if (i < rows.len) {
+                            try o.put(a, "util_permille", .{ .integer = rows[i].util_permille.load(.monotonic) });
+                            try o.put(a, "lag_us", .{ .integer = @intCast(rows[i].lag_min_ns.load(.monotonic) / std.time.ns_per_us) });
+                            try o.put(a, "hot", .{ .bool = rows[i].hot.load(.monotonic) });
+                        }
+                    }
                     var streams: std.json.ObjectMap = .empty;
                     try streams.put(a, "h2", .{ .integer = dusty.gauges.get(.h2_streams, i) });
                     try streams.put(a, "h3", .{ .integer = dusty.gauges.get(.h3_streams, i) });

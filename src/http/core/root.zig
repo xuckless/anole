@@ -54,6 +54,8 @@ pub const placement = @import("placement.zig");
 pub const Signal = @import("signal.zig").Signal;
 /// Live connection and stream counts per executor.
 pub const gauges = @import("gauges.zig");
+/// The WebSocket admission gate (#129): `ServerConfig.admission`.
+pub const admission = @import("admission.zig");
 /// Read-mostly data behind an atomic pointer with quiescent-state
 /// reclamation (SAFETY.md L7).
 pub const qsbr = @import("qsbr.zig");
@@ -206,6 +208,7 @@ comptime {
     _ = @import("middleware/middleware.zig");
     _ = @import("locals.zig");
     _ = @import("placement.zig");
+    _ = @import("admission.zig");
     _ = @import("qsbr.zig");
     _ = @import("exec_counter.zig");
     _ = @import("push_list.zig");

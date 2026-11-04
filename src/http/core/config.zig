@@ -7,6 +7,7 @@ const ContentType = @import("http.zig").ContentType;
 const HttpRequest = @import("request.zig").Request;
 const HttpResponse = @import("response.zig").Response;
 const proxy_protocol = @import("proxy_protocol.zig");
+pub const admission = @import("admission.zig");
 
 /// How the server's own error answers (a 404, a 500, `Response.fail`) are
 /// written. `ServerConfig.errors`.
@@ -286,6 +287,14 @@ pub const ServerConfig = struct {
     /// written. A request with a body with a `Content-Encoding` takes 70K
     /// more while `request.decompress` is on.
     max_connections: ?u32 = max_connections_from_fd_limit,
+    /// How many WebSockets may be open at once, over every protocol; past
+    /// it an upgrade is answered 503 with `Retry-After`, before the
+    /// handshake. Null: no cap (the load gate, `admission`, still applies).
+    max_websockets: ?u32 = null,
+    /// The WebSocket admission gate: while an executor is overloaded, the
+    /// number of open WebSockets is held where it was, and an upgrade past
+    /// it gets 503 with `Retry-After` (see `admission.Config`).
+    admission: admission.Config = .{},
     /// How the server's own error answers are written: a 404, a 405, the
     /// status an error maps to, `Response.fail`. See `ErrorFormat`.
     errors: ErrorFormat = .auto,
@@ -526,6 +535,9 @@ pub const ServerConfig = struct {
         /// The largest WebSocket message, in or out (after inflating): what
         /// `anole.websocket.UpgradeOptions.max_message_size` falls back on.
         ws_max_message: usize = 1024 * 1024,
+        /// Internal: the server's WebSocket admission state, set when it
+        /// starts serving (`Server.prepareStatic`). Null never refuses.
+        _admission: ?*admission.State = null,
     };
 
     /// `ServerConfig.response`.

@@ -675,6 +675,16 @@ fn waitAtLeast(io: std.Io, v: *std.atomic.Value(u32), n: u32) !void {
     try wait.waitAtLeast(io, "the counter reached its count", v, n);
 }
 
+/// Until the server's admission count is `n`.
+fn waitLive(io: std.Io, st: *anole.http.admission.State, n: u32) !void {
+    const S = struct { st: *anole.http.admission.State, n: u32 };
+    try wait.waitUntil(io, "the admission count", S{ .st = st, .n = n }, struct {
+        fn f(x: S) bool {
+            return x.st.live.load(.monotonic) == x.n;
+        }
+    }.f);
+}
+
 /// An engine with one WebTransport route (handler 9) on an HTTP/3
 /// listener and its consumer thread (`WtAnswerer`), started for one test.
 const WtFixture = struct {
@@ -2249,7 +2259,8 @@ fn wsDecideRun(comptime claim: anytype, upgrades: u32) !void {
         \\ "routes": [
         \\   {"path": "/decide", "timeout_ms": 300, "websocket": {"handler": 10, "accept": "consumer", "origins": ["*"]}},
         \\   {"path": "/app", "handler": 11, "websocket": {"handler": 12, "accept": "consumer", "origins": ["*"]}},
-        \\   {"path": "/plain", "handler": 13}
+        \\   {"path": "/plain", "handler": 13},
+        \\   {"path": "/native", "websocket": {"handler": 14, "origins": ["*"]}}
         \\ ]}
     ;
     var why_buf: [256]u8 = undefined;
@@ -2350,6 +2361,58 @@ const WsDecideClaims = struct {
         try std.testing.expectEqualStrings("first", first.payload);
     }
 
+    /// The admission gate (#129) on the consumer-decided path: a refused
+    /// upgrade never reaches the consumer and takes no slot; an admitted
+    /// one holds one unit while open, and a declined one gives it back.
+    fn admission(a: *WsDecider, port: u16, io: std.Io) !void {
+        const st = &a.e.app.?.server.admission;
+        st.freezeForTest(0);
+        {
+            var c: RawWs = undefined;
+            try c.open(io, port, "/decide?accept", "Sec-WebSocket-Protocol: a, b\r\n");
+            defer c.close(io);
+            try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 503"));
+            try std.testing.expect(std.ascii.findIgnoreCase(c.headText(), "Retry-After: ") != null);
+        }
+        try std.testing.expectEqual(@as(u32, 0), a.upgrades.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), st.live.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 1), st.refused_load.load(.monotonic));
+        st.reset();
+        {
+            var c: RawWs = undefined;
+            try c.open(io, port, "/decide?refuse", "");
+            defer c.close(io);
+            try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 401"));
+        }
+        try waitLive(io, st, 0);
+        var buf: [256]u8 = undefined;
+        {
+            var c: RawWs = undefined;
+            try c.open(io, port, "/decide?accept", "Sec-WebSocket-Protocol: a, b\r\n");
+            defer c.close(io);
+            try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 101"));
+            try std.testing.expectEqual(@as(u32, 1), st.live.load(.monotonic));
+            _ = try c.frame(&buf);
+            try c.send(0x8, &.{ 0x03, 0xe8 });
+            _ = try c.frame(&buf);
+        }
+        try waitAtLeast(io, &a.closes, 1);
+        try waitLive(io, st, 0);
+    }
+
+    /// The native path (`serveTable`) is gated once, in `openSocket`.
+    fn admissionNative(a: *WsDecider, port: u16, io: std.Io) !void {
+        const st = &a.e.app.?.server.admission;
+        st.freezeForTest(0);
+        var c: RawWs = undefined;
+        try c.open(io, port, "/native", "");
+        defer c.close(io);
+        try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 503"));
+        try std.testing.expectEqual(@as(u64, 1), st.refused_load.load(.monotonic));
+        try std.testing.expectEqual(@as(u32, 0), a.opens.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), st.live.load(.monotonic));
+    }
+
     /// WsDecider holds the plain request of route 13; the test answers it.
     fn acceptPlain(a: *WsDecider, port: u16, io: std.Io) !void {
         var plain: RawGet = undefined;
@@ -2390,6 +2453,16 @@ test "capi engine: a WebSocket handshake past its deadline gets 504, and a late 
 test "capi engine: one route takes plain requests (its handler) and WebSocket handshakes (its websocket handler)" {
     if (comptime !features.websocket) return error.SkipZigTest;
     try wsDecideRun(WsDecideClaims.oneRoute, 1);
+}
+
+test "capi engine: an upgrade the admission gate refuses never reaches the consumer; an accepted socket holds one unit until it closes, a declined one none" {
+    if (comptime !features.websocket) return error.SkipZigTest;
+    try wsDecideRun(WsDecideClaims.admission, 2);
+}
+
+test "capi engine: a native WebSocket route's refused upgrade is counted once" {
+    if (comptime !features.websocket) return error.SkipZigTest;
+    try wsDecideRun(WsDecideClaims.admissionNative, 0);
 }
 
 test "capi engine: anole_ws_accept on a plain request is STATE, and the request is still owed its answer" {

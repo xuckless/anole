@@ -39,6 +39,7 @@ const have_auto_cancel = @import("deadline.zig").have_auto_cancel;
 const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
 const placement = @import("placement.zig");
+const admission = @import("admission.zig");
 const qsbr = @import("qsbr.zig");
 const expect_log = @import("expect_log.zig");
 const DrainHooks = @import("drain_hooks.zig").DrainHooks;
@@ -1391,6 +1392,10 @@ pub fn Server(comptime Ctx: type) type {
         /// The group of every connection task while `run` serves: a task
         /// started for a parked connection joins it.
         connections_group: ?*std.Io.Group = null,
+        /// The open WebSockets and the load gate that may freeze their
+        /// number (`ServerConfig.admission`, `max_websockets`). Requests
+        /// point at it once `prepareStatic` has run.
+        admission: admission.State = .{},
 
         /// A listener while `run` serves it: the socket, and the TLS
         /// material every connection accepted on it shares.
@@ -1530,6 +1535,7 @@ pub fn Server(comptime Ctx: type) type {
             }
             self.router.deinit();
             self.request_buffers.deinit();
+            self.allocator.free(self.admission.rows);
         }
 
         /// Creates a middleware instance managed by the server.
@@ -1599,9 +1605,26 @@ pub fn Server(comptime Ctx: type) type {
         /// without a lock: a caller that serves other protocols beside this
         /// `serve` (HTTP/3 on other executors) runs it first, before it starts
         /// any of them. `serve` then skips it.
+        ///
+        /// It also points requests at the server's WebSocket admission state
+        /// (`admission`), for the same reason: before any protocol serves.
         pub fn prepareStatic(self: *Self) !void {
+            try self.prepareAdmission();
             try self.prepareStaticInner();
             self.static_prepared = true;
+        }
+
+        /// Sizes the admission rows (one per executor, once) and points
+        /// `config.request` at the state, which every request copies.
+        fn prepareAdmission(self: *Self) !void {
+            const a = &self.admission;
+            a.cfg = self.config.admission;
+            a.max_websockets = self.config.max_websockets;
+            if (a.rows.len == 0) {
+                a.rows = try self.allocator.alloc(admission.Row, placement.executorCount(self.io) orelse 1);
+                @memset(a.rows, .{});
+            }
+            self.config.request._admission = a;
         }
 
         fn prepareStaticInner(self: *Self) !void {
@@ -1637,6 +1660,8 @@ pub fn Server(comptime Ctx: type) type {
 
         fn serve(self: *Self) !void {
             if (!self.static_prepared) try self.prepareStatic();
+            // A server run again starts unfrozen.
+            self.admission.reset();
             const listeners = self.configuredListeners();
             if (self.config.max_connections) |max| {
                 if (max == 0) {
@@ -1796,7 +1821,7 @@ pub fn Server(comptime Ctx: type) type {
 
             // One per executor, so that each trims its own free list.
             for (0..executors orelse 1) |i| {
-                placement.concurrent(&trimming, self.io, .{ .executor = i }, trimLoop, .{ self, i == 0 }) catch |err| {
+                placement.concurrent(&trimming, self.io, .{ .executor = i }, trimLoop, .{ self, i }) catch |err| {
                     log.debug("No task to trim the request buffers on executor {d}: {}", .{ i, err });
                 };
             }
@@ -2095,22 +2120,138 @@ pub fn Server(comptime Ctx: type) type {
         /// compressors' and HTTP/2 body queues' blocks it cached that
         /// nothing took (`block_cache`), and the buffered-body encoders
         /// no response took (`encoders`).
-        fn trimLoop(self: *Self, shards: bool) std.Io.Cancelable!void {
+        ///
+        /// It also measures the executor for the WebSocket admission gate:
+        /// a tick every `admission_tick` (its lateness is the lag backstop),
+        /// and at each window's end the loop's idle time (`admission.Probe`).
+        fn trimLoop(self: *Self, index: usize) std.Io.Cancelable!void {
+            const shards = index == 0;
             // One task per executor, canceled at teardown after the drain
             // and the connections: this runs on the thread that owns the
             // encoders, and frees those the drain's responses made too.
             defer if (build_options.use_zlib) encoders.freeLocal();
+            const state = &self.admission;
+            const row: ?*admission.Row = if (index < state.rows.len) &state.rows[index] else null;
+            var signal: Signal = .open(self.io, row != null);
+            defer signal.close();
+            if (row) |r| r.source.store(signal.source, .monotonic);
+            if (shards) self.logSignal(signal);
+            var probe: admission.Probe = .{ .cfg = state.cfg };
+            // A hot row cools as its probe stops, so a stopped server leaves
+            // nothing frozen.
+            defer if (probe.hot) {
+                if (row) |r| r.hot.store(false, .monotonic);
+                _ = state.rowCool(nowNs(self.io));
+            };
+            var last_trim = nowNs(self.io);
+            probe.begin(last_trim, signal.idleNs(self.io, last_trim) orelse 0, state.closed.load(.monotonic));
             while (true) {
-                try self.io.sleep(request_buffers_trim_interval, .awake);
-                self.request_buffers.trimLocal();
-                if (shards) self.request_buffers.trimShards();
-                if (shards) _ = self.trim_epoch.fetchAdd(1, .monotonic);
-                // The encoders first, so the blocks they give back are
-                // unmapped at the next trim if nothing takes them.
-                if (build_options.use_zlib) encoders.trimLocal();
-                if (build_options.use_zlib or build_options.use_brotli or build_options.use_http2) block_cache.trimLocal();
-                // Objects retired with no writer after them (src/http/core/qsbr.zig).
-                if (shards) qsbr.pollAll();
+                const deadline = nowNs(self.io) + admission_tick_ns;
+                try self.io.sleep(.fromNanoseconds(admission_tick_ns), .awake);
+                const now = nowNs(self.io);
+                if (admission.due(now, last_trim, request_buffers_trim_interval)) {
+                    last_trim = now;
+                    self.request_buffers.trimLocal();
+                    if (shards) self.request_buffers.trimShards();
+                    if (shards) _ = self.trim_epoch.fetchAdd(1, .monotonic);
+                    // The encoders first, so the blocks they give back are
+                    // unmapped at the next trim if nothing takes them.
+                    if (build_options.use_zlib) encoders.trimLocal();
+                    if (build_options.use_zlib or build_options.use_brotli or build_options.use_http2) block_cache.trimLocal();
+                    // Objects retired with no writer after them (src/http/core/qsbr.zig).
+                    if (shards) qsbr.pollAll();
+                }
+                const r = row orelse continue;
+                probe.tick(now -| deadline);
+                if (!probe.due(now)) continue;
+                const closed = state.closed.load(.monotonic);
+                // Pinned to its executor; a window measured elsewhere would
+                // read another loop's idle time.
+                if (placement.currentExecutor(self.io) != index) {
+                    probe.discard(now, signal.idleNs(self.io, now) orelse 0, closed);
+                    continue;
+                }
+                const had = signal.source;
+                const idle = signal.idleNs(self.io, now);
+                if (had != signal.source) {
+                    r.source.store(signal.source, .monotonic);
+                    self.logBlocked(.warn, "executor {d}: its task clock can no longer be read; the WebSocket load gate is off on it", .{index});
+                }
+                const step = probe.close(r, now, idle, closed);
+                switch (step.transition) {
+                    .none => {},
+                    .hot => if (state.rowHot(now, step.closed)) |limit| {
+                        if (step.lagged)
+                            self.logBlocked(.warn, "executor {d} is starved of CPU (every timer tick at least {d} ms late); WebSockets held at {d} (new upgrades get 503 until some leave)", .{ index, probe.lag_min / std.time.ns_per_ms, limit })
+                        else
+                            self.logBlocked(.warn, "executor {d} at {d}% utilization for {d} s; WebSockets held at {d} (new upgrades get 503 until some leave)", .{ index, step.util_permille / 10, state.cfg.sustain, limit });
+                    },
+                    .cool => if (state.rowCool(now)) |refused| {
+                        self.logBlocked(.info, "executors back under {d}% utilization; WebSockets no longer held ({d} upgrade(s) refused meanwhile)", .{ @as(u32, @intFromFloat(state.cfg.util_exit * 100)), refused });
+                    },
+                }
+            }
+        }
+
+        /// The probe's tick: the lag backstop's resolution.
+        const admission_tick_ns: u64 = 100 * std.time.ns_per_ms;
+
+        fn nowNs(io: std.Io) u64 {
+            return @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+        }
+
+        /// Where an executor's idle time comes from (see `admission`):
+        /// picked once, on the executor itself, when its probe starts.
+        const Signal = struct {
+            source: admission.Source = .none,
+            clock: ?admission.TaskClock = null,
+            /// Awake-clock nanoseconds when the task clock opened.
+            opened_at: u64 = 0,
+            /// Why the task clock didn't open, for the log.
+            denied: ?admission.TaskClock.OpenError = null,
+
+            fn open(io: std.Io, measured: bool) Signal {
+                if (!measured) return .{};
+                if (placement.loopIdleNs(io) != null) return .{ .source = .poll_wall };
+                // Only an executor of zio's io_uring gets here with a loop to
+                // measure; elsewhere (not zio) there is nothing to gate.
+                if (placement.currentExecutor(io) == null) return .{};
+                if (builtin.is_test and admission.test_deny_task_clock) return .{ .denied = error.AccessDenied };
+                const c = admission.TaskClock.open() catch |err| return .{ .denied = err };
+                return .{ .source = .task_clock, .clock = c, .opened_at = nowNs(io) };
+            }
+
+            /// Idle nanoseconds so far, or null without a source. A task
+            /// clock that fails to read turns the source off for good.
+            fn idleNs(sig: *Signal, io: std.Io, now: u64) ?u64 {
+                switch (sig.source) {
+                    .none => return null,
+                    .poll_wall => return placement.loopIdleNs(io),
+                    .task_clock => {
+                        const busy = sig.clock.?.read() catch {
+                            sig.close();
+                            return null;
+                        };
+                        return (now -| sig.opened_at) -| busy;
+                    },
+                }
+            }
+
+            fn close(sig: *Signal) void {
+                if (sig.clock) |c| c.close();
+                sig.clock = null;
+                sig.source = .none;
+            }
+        };
+
+        /// Says once (from the first executor's probe) where utilization
+        /// comes from, and why there is none where the gate would want it.
+        fn logSignal(self: *Self, signal: Signal) void {
+            if (!self.admission.cfg.enabled) return;
+            if (signal.denied) |err| {
+                self.logBlocked(.info, "the WebSocket load gate is off: the io_uring backend needs the thread's perf task clock, and perf_event_open failed ({t}); CAP_PERFMON, kernel.perf_event_paranoid <= 2, or the epoll backend turn it on", .{err});
+            } else {
+                self.logBlocked(.debug, "WebSocket load gate: executor utilization from {t}", .{signal.source});
             }
         }
 
@@ -2301,13 +2442,26 @@ pub fn Server(comptime Ctx: type) type {
         fn logProtected(self: *Self, comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
             const protection = self.io.swapCancelProtection(.blocked);
             defer _ = self.io.swapCancelProtection(protection);
+            logAt(level, format, args);
+            if (builtin.is_test) if (test_accept_log) |hook| hook(self.io);
+        }
+
+        /// `logProtected` for the trim task, whose log lines also come
+        /// just before a cancelable wait (without the accept loop's test
+        /// hook).
+        fn logBlocked(self: *Self, comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
+            const protection = self.io.swapCancelProtection(.blocked);
+            defer _ = self.io.swapCancelProtection(protection);
+            logAt(level, format, args);
+        }
+
+        fn logAt(comptime level: std.log.Level, comptime format: []const u8, args: anytype) void {
             switch (level) {
                 .err => log.err(format, args),
                 .warn => log.warn(format, args),
                 .info => log.info(format, args),
                 .debug => log.debug(format, args),
             }
-            if (builtin.is_test) if (test_accept_log) |hook| hook(self.io);
         }
 
         /// Takes the slot for a connection just accepted. The check above is

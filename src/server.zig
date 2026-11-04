@@ -235,6 +235,12 @@ pub const Options = struct {
     timeouts: Timeouts = .{},
     /// Size and count limits.
     limits: Limits = .{},
+    /// The WebSocket admission gate: while an executor is overloaded
+    /// (utilization at 0.85 for 3 s), the number of open WebSockets is held
+    /// where it was, and an upgrade past it is answered 503 with
+    /// `Retry-After`; every close readmits one. On by default; see
+    /// docs/server.md, "Overload".
+    admission: http.admission.Config = .{},
     /// Trust in proxies in front of the server.
     proxy: Proxy = .{},
     /// How requests are read.
@@ -472,6 +478,9 @@ pub const Options = struct {
         /// The largest WebSocket message, in or out (after inflating): the
         /// default for routes whose upgrade options set none.
         ws_max_message: usize = 1 << 20,
+        /// Open WebSockets at most, over every protocol; past it an upgrade
+        /// is answered 503 with `Retry-After`. Null: no cap.
+        max_websockets: ?u32 = null,
     };
 
     /// `Options.proxy`.
@@ -739,6 +748,8 @@ fn coreConfig(opts: Options, mode: *const modes.Resolved) http.ServerConfig {
             http.ServerConfig.max_connections_from_fd_limit
         else
             opts.limits.max_connections,
+        .max_websockets = opts.limits.max_websockets,
+        .admission = opts.admission,
         .errors = opts.errors,
         .error_handler = opts.error_handler,
         // A Lambda web function: Lambda names the request in this header.
@@ -919,6 +930,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             metrics_listener: ?[]const u8 = null,
             /// The HTTP/3 series' collector is on `metrics`.
             h3_metrics: bool = false,
+            /// The admission gate's collector is on `metrics`.
+            admission_metrics: bool = false,
             health: ?*observe.Health = null,
             /// `metrics` and `health` register their routes when serving
             /// starts, so `use` can still follow them.
@@ -3839,6 +3852,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             self.attachNetMetrics();
             // ---- end p3/net ----
             self.attachH3Metrics();
+            self.attachAdmissionMetrics();
             self.startConsole();
             defer if (self.console != null) self.stopConsole(false);
             if (self.console != null) {
@@ -4091,6 +4105,20 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (self.h3 == null or self.extras.h3_metrics) return;
             registry.addCollector(.{ .context = safety.toCtx(self), .refresh = refreshH3Metrics }) catch return;
             self.extras.h3_metrics = true;
+        }
+
+        /// The WebSocket admission gate's series (`observe/runtime.zig`),
+        /// when the app has metrics.
+        fn attachAdmissionMetrics(self: *Self) void {
+            const registry = self.extras.metrics orelse return;
+            if (self.extras.admission_metrics) return;
+            registry.addCollector(.{ .context = safety.toCtx(self), .refresh = refreshAdmissionMetrics }) catch return;
+            self.extras.admission_metrics = true;
+        }
+
+        fn refreshAdmissionMetrics(context: *anyopaque, registry: *observe.metrics.Registry) void {
+            const self = safety.fromCtx(Self, context);
+            @import("observe/runtime.zig").refreshAdmission(registry, &self.server.admission);
         }
 
         fn refreshH3Metrics(context: *anyopaque, registry: *observe.metrics.Registry) void {

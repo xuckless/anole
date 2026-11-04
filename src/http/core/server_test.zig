@@ -5024,3 +5024,30 @@ test "reader: a chunked body past body_max fails with BodyTooBig; readerLimited 
     const lifted = try rawAll(io, &server, "POST /lifted HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" ++ body, &buf);
     try std.testing.expect(std.mem.startsWith(u8, lifted, "HTTP/1.1 200"));
 }
+
+test "Server: off zio the admission gate has no signal, so it never freezes; the exact cap still counts" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback, .max_websockets = 1 }, {});
+    defer server.deinit();
+    server.router.get("/", struct {
+        fn h(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "OK";
+        }
+    }.h);
+    var future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    // Every request reaches the server's state.
+    try std.testing.expectEqual(&server.admission, server.config.request._admission.?);
+    try std.testing.expectEqual(@as(usize, 1), server.admission.rows.len);
+    try std.testing.expectEqual(dusty.admission.Source.none, server.admission.rows[0].source.load(.monotonic));
+    try std.testing.expectEqual(@as(?dusty.admission.Refusal, null), server.admission.reserve());
+    try std.testing.expectEqual(@as(?dusty.admission.Refusal, .cap), server.admission.reserve());
+    server.admission.release();
+    try std.testing.expectEqual(@as(?u32, null), server.admission.frozenLimit());
+}

@@ -279,6 +279,9 @@ pub const Socket = struct {
     /// Counted in the open-WebSocket gauge of `_http_version` (sockets
     /// `upgrade` opened; `deinit` takes it off).
     _gauged: bool = false,
+    /// The server's admission count this socket holds a unit of; `deinit`
+    /// gives it back.
+    _admission: ?*dusty.admission.State = null,
     /// The application's, for state it keeps per socket: a callback socket
     /// (`callbacks`) sets it in `open` and frees what it points at in
     /// `close`. See `contextAs`.
@@ -485,6 +488,10 @@ pub const Socket = struct {
             self._gauged = false;
             dusty.gauges.add(self.io, gaugeOf(self._http_version), -1);
         }
+        if (self._admission) |a| {
+            self._admission = null;
+            a.release();
+        }
         if (self._drain_watch) |w| w.stop();
         if (comptime features.compression) if (self._deflate) |d| d.deinit();
         if (self._read.conn != null) {
@@ -595,6 +602,22 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
     for (options.subprotocols) |sp| if (!isToken(sp)) return error.InvalidSubprotocol;
     for (options.headers) |h| if (!handshakeHeaderAllowed(h.name)) return error.InvalidHeaderName;
 
+    // Admission (#129): one unit of the server's WebSocket count, before
+    // anything is allocated or answered. Taken here unless a caller took
+    // it already (the C ABI's accepted upgrades); given back below unless
+    // it moves onto the socket.
+    const adm = req._config._admission;
+    var took = false;
+    if (adm) |a| if (req._ws_admission == .none) {
+        if (a.reserve()) |_| return overloaded(req, res, a);
+        req._ws_admission = .held;
+        took = true;
+    };
+    defer if (took and req._ws_admission == .held) {
+        adm.?.release();
+        req._ws_admission = .none;
+    };
+
     // What lives as long as the socket.
     const alloc = if (h2) req.arena else owner orelse req.arena;
 
@@ -687,7 +710,26 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
     };
     socket._gauged = true;
     dusty.gauges.add(req.io, gaugeOf(socket._http_version), 1);
+    if (req._ws_admission == .held) {
+        socket._admission = adm;
+        req._ws_admission = .moved;
+    }
     return socket;
+}
+
+/// The answer to an upgrade the admission gate refused (over
+/// `max_websockets`, or the count frozen under load): 503 with a jittered
+/// `Retry-After`, before any WebSocket state. Over HTTP/1.1 the connection
+/// closes after it, so the client's retry starts afresh; over HTTP/2 and
+/// HTTP/3 the extended CONNECT's stream ends with it and the connection
+/// stays (RFC 8441 §5, RFC 9220).
+pub noinline fn overloaded(req: *dusty.Request, res: *dusty.Response, a: *dusty.admission.State) error{ServiceUnavailable} {
+    var buf: [8]u8 = undefined;
+    const secs = std.fmt.bufPrint(&buf, "{d}", .{a.retryAfter(req.io)}) catch unreachable;
+    if (req.arena.dupe(u8, secs)) |v| res.header("Retry-After", v) catch {} else |_| {}
+    if (req.version_major < 2) res.keepalive = false;
+    req._ws_admission = .refused;
+    return error.ServiceUnavailable;
 }
 
 fn gaugeOf(v: HttpVersion) dusty.gauges.Kind {
@@ -1890,6 +1932,7 @@ pub const Rooms = struct {
 test {
     _ = @import("rooms_test.zig");
     _ = @import("h1_test.zig");
+    _ = @import("admission_test.zig");
     // About parked callback sockets; idle parking is off on Windows.
     if (@import("builtin").os.tag != .windows) _ = @import("callbacks_test.zig");
     _ = @import("h2_fuzz_test.zig");
