@@ -48,7 +48,7 @@
         // Includes 56e57f6 (#139): IOCP connects AF_UNIX sockets with
         // connect(), not a wildcard bind and ConnectEx.
         // DEVELOPMENT (S2 batch 2A, D9 arm B): the fork worktree, branch
-        // s2a-io (56e57f6 + `fast_send`, 3b84d13, 92a70e3 and 4286fa0), until the fork
+        // s2a-io (56e57f6 + `fast_send`, 3b84d13, 92a70e3, 4286fa0 and 910c8f2), until the fork
         // commit is pushed and pinned. build.sh's Mac slot doesn't sync this
         // path: rsync ../zio-2a-io to pixl-mac:anole-wt/ before a lane build
         // that may land there. Was:
