@@ -496,8 +496,9 @@ pub fn Router(comptime Ctx: type) type {
 
             // The path's segments, on the stack up to 16 of them (past any
             // real route's depth), in the arena past that. At most one
-            // more than the path has '/'.
-            var stack_segments: [16][]const u8 = undefined;
+            // more than the path has '/', the one before a leading '/'
+            // included, so 16 segments of `/a/b/...` fit.
+            var stack_segments: [17][]const u8 = undefined;
             const max_segments = std.mem.count(u8, path, "/") + 1;
             const storage = if (max_segments <= stack_segments.len)
                 stack_segments[0..max_segments]
@@ -569,9 +570,11 @@ pub fn Router(comptime Ctx: type) type {
             var has_head = false;
             for (std.enums.values(Method)) |m| {
                 if (m == req.method) continue;
-                // Matched without capturing parameters, so a route with more
-                // than `max_param_count` of them is listed too.
                 const route = self.peekIn(m, path) orelse continue;
+                // `findHandler` answers a route with more parameters than
+                // `max_param_count` with an error (a 400), so it isn't one
+                // to offer.
+                if (paramCount(route.info.path) > req._config.max_param_count) continue;
                 if (preflight_route) |out| {
                     if (out.* == null or m == wanted) out.* = route;
                 }
@@ -583,6 +586,16 @@ pub fn Router(comptime Ctx: type) type {
             // A GET route answers HEAD too (see `findHandler`).
             if (has_get and !has_head and req.method != .head) try allow.appendSlice(req.arena, ", HEAD");
             return if (allow.items.len == 0) null else allow.items;
+        }
+
+        /// The parameter and wildcard segments of a route pattern.
+        fn paramCount(pattern: []const u8) usize {
+            var n: usize = 0;
+            var iter = std.mem.tokenizeScalar(u8, pattern, '/');
+            while (iter.next()) |segment| {
+                if (segment[0] == ':' or segment[0] == '*') n += 1;
+            }
+            return n;
         }
 
         fn methodNamed(text: []const u8) ?Method {
@@ -2089,6 +2102,9 @@ test "Router: a one-parameter hit makes one arena allocation, the params map; a 
         .{ .url = "/health", .allocations = 0 },
         .{ .url = "/health/", .allocations = 0 },
         .{ .url = "/nothing/here", .allocations = 0 },
+        // 16 segments still fit on the stack; 17 spill to the arena.
+        .{ .url = "/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p", .allocations = 0 },
+        .{ .url = "/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q", .allocations = 1 },
     }) |case| {
         var counting = std.testing.FailingAllocator.init(arena.allocator(), .{});
         var req = testRequest(counting.allocator(), .get, case.url);
@@ -2202,18 +2218,27 @@ test "Router: a HEAD request to a path with no GET route gets no HEAD in Allow" 
     try std.testing.expectEqualStrings("POST", (try router.allowedMethods(&req)).?);
 }
 
-test "Router: Allow lists a route with more parameters than max_param_count" {
+test "Router: Allow leaves out a route with more parameters than max_param_count" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var router = TestVoidRouter.init(std.testing.allocator);
     defer router.deinit();
     router.get("/:a/:b/:c/:d/:e/:f/:g/:h/:i", voidHandler1);
 
-    var req = testRequest(arena.allocator(), .post, "/1/2/3/4/5/6/7/8/9");
+    router.put("/:a/:b/:c/:d/:e/:f/:g/:h/x", voidHandler1);
+
+    // A GET would be a 400 (too many parameters), so only PUT is offered.
+    var req = testRequest(arena.allocator(), .post, "/1/2/3/4/5/6/7/8/x");
     try std.testing.expectEqual(8, req._config.max_param_count);
     try std.testing.expect(try router.findHandler(&req) == null);
-    try std.testing.expectEqualStrings("GET, HEAD", (try router.allowedMethods(&req)).?);
+    try std.testing.expectEqualStrings("PUT", (try router.allowedMethods(&req)).?);
     try std.testing.expectEqual(0, req.params.count());
+    var get = testRequest(arena.allocator(), .get, "/1/2/3/4/5/6/7/8/x");
+    try std.testing.expectError(error.TooManyParams, router.findHandler(&get));
+
+    // With no method left, a 404.
+    var only = testRequest(arena.allocator(), .post, "/1/2/3/4/5/6/7/8/9");
+    try std.testing.expect(try router.allowedMethods(&only) == null);
 }
 
 test "Router.miss: a preflight runs the middleware of the route Access-Control-Request-Method names, else of the first" {
