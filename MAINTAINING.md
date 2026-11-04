@@ -73,6 +73,16 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      tested against one BoringSSL commit; pin BoringSSL at or after it.
      `build/boringssl.zig` reads the file lists from the tarball's
      `gen/sources.json`, so check that it still builds every platform.
+     Re-read what dusty_tls's borrowed ciphertext (`Connection.writeAll`)
+     relies on: `do_tls_write` in ssl/s3_pkt.cc (the retry branch keyed on
+     `pending_write`, the `pending_flight` copy ahead of the record),
+     `tls_write_buffer_flush` (ssl/ssl_buffer.cc), `ssl_send_alert_impl`
+     (an alert deferred while the write buffer holds bytes),
+     `tls13_add_key_update` (the reply sealed into the flight before the key
+     changes), `tls_write_app_data`'s `write_shutdown` check, and
+     `do_send_new_session_ticket`'s deferral to the first write. The
+     SAFETY.md L5 exception for BoringSSL's record buffers rests on
+     `SSLBuffer::EnsureCap` and `Clear`.
    - **nghttp2** comes from the fork, which carries an RFC 9113 strictness
      patch. Rebase the patch onto the new tag on a new branch, run nghttp2's
      unit tests and h2spec in strict mode (147/147 over h2c and TLS), merge
@@ -184,7 +194,20 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   queue), all behind zio's `fast_accept` option except the run-queue fix, as
   in lalinsky/zio#837, which Anole turns on in `build.zig` and
   `anole.zio_options`. The bench suite's `conns` and `raw` scenarios measure
-  them.
+  them. `fast_send` (S2 D9 arm B, fork only, not offered upstream; user,
+  2026-11-04): `net_write` tries a nonblocking send() before submitting the
+  write (`sendNow` in io.zig, next to `acceptNow`), returns a short count
+  as is, takes the loop path on WouldBlock or a pending cancel, and spends
+  a tick-budget quantum per direct send; Anole turns it on beside
+  `fast_accept`. Add `--fast-send` to the check.sh runs above.
+  D10 (fork only, 4286fa0): a wait that completes without parking still
+  yields once the executor's tick is spent and checks held locks
+  (`yieldPointNoPark`), so inline sends can't starve the run queue (#184
+  tracks a wider p99 at saturation since). `Loop.idle_ns` (fork only,
+  5506ac2, 40c6f9f): the time epoll and kqueue spend asleep in a waiting
+  poll (libuv's `uv_metrics_idle_time` bracket), null on io_uring; the
+  WebSocket admission gate (#129) reads it per executor. Pinned at
+  47ad429 on `anole-diag` (0.5.2).
   Windows IOCP (#139, 4c04fd0 on `anole`, 56e57f6 on `anole-diag`): an
   AF_UNIX connect goes through a plain connect() (as .NET and Go do)
   instead of a wildcard bind and ConnectEx (the all-NUL AF_UNIX wildcard is
@@ -485,6 +508,10 @@ Moving to the next minor version (0.18):
    still defers to `root.debug.handleSegfault` (the crash flush). Then run
    `zig build hang-probe --test-timeout 20s` with `ANOLE_TEST_DUMP_AFTER=5`
    and `zig build crash-probe` on Linux and macOS.
+5. `safety.allocUninit` (src/safety/root.zig) and dusty_tls's `mallocUninit`
+   call `Allocator.rawAlloc` to skip `alloc`'s `undefined` fill: re-check
+   `rawAlloc`'s signature, and that `alloc` still fills (if not, drop both
+   helpers for plain `alloc`).
 
 ## Cadence
 

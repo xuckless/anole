@@ -733,6 +733,8 @@ none.
 | `limits.max_connections` | 0 | `limits.max_connections` (0: the open-file limit) |
 | `limits.max_requests_per_connection` | null | `limits.max_requests_per_connection` |
 | `limits.ws_max_message` | 1048576 | `limits.ws_max_message` |
+| `limits.max_websockets` | null | `limits.max_websockets` (null: no cap; past it an upgrade gets 503 with Retry-After) |
+| `admission.enabled`, `util_enter`, `util_exit`, `sustain`, `min_shed_ms`, `lag_enter_ms`, `retry_after_s` | true, 0.85, 0.8, 3, 5000, 25, [5, 15] | `admission.*`, the WebSocket admission gate ([server.md](server.md#overload)); a refused upgrade on an `"accept": "consumer"` route never reaches the consumer |
 | `proxy.trusted`, `trusted_hops`, `trust_forwarded_proto`, `trust_forwarded_host` | null, 0, true, false | `proxy.*` |
 | `environment`, `deployment`, `error_detail` | null, null, null | `environment`, `deployment`, `error_detail` (null: `ANOLE_ENV` else production; `ANOLE_DEPLOYMENT` else standalone; on in development) |
 | `listeners[].address`, `port`, `proxy_protocol` | null, null, null | `Listener.*` (null: the deployment's default: `127.0.0.1`, 8080 or `$PORT`, off or on under `anole_lb`) |
@@ -767,6 +769,7 @@ Zig options with no key, and why:
 | `process`, `restart_timeout` | embedded mode: no hand-off, SIGUSR2, LISTEN_FDS or sd_notify |
 | `blocking` | the ABI starts a pool when SQLite is configured |
 | `client` | no outbound client in the ABI |
+| `admission.window` | 1 s; the A/B and the metrics assume it |
 | `websocket.UpgradeOptions.max_message_size`, `timeout`, `deflate`, `drain_reason` | `limits.ws_max_message` applies to every socket; sockets have no deadline of their own; permessage-deflate runs on its defaults; the drain's close carries the default reason |
 | `websocket.UpgradeOptions.headers` | Zig only: the consumer passes headers per `anole_ws_accept` |
 

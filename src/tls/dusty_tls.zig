@@ -20,8 +20,10 @@
 //! - the BIO never waits. Its read callback hands over only ciphertext that the
 //!   reader task already has buffered (WANT_READ otherwise, and the reader
 //!   refills from the socket with the lock released); its write callback
-//!   appends to a pending buffer that only the writer side sends, so ciphertext
-//!   leaves in the order BoringSSL produced it. Output that `SSL_read` itself
+//!   appends to a pending buffer that only the writer side sends, or leaves a
+//!   response's last record in BoringSSL's buffer for the writer to send
+//!   itself (`Connection.writeAll`), so ciphertext leaves in the order
+//!   BoringSSL produced it. Output that `SSL_read` itself
 //!   produces (alerts, KeyUpdate) goes out with the next write.
 //!
 //! Memory: an idle connection holds no ciphertext buffer. The socket is read
@@ -45,9 +47,11 @@ const Allocator = std.mem.Allocator;
 /// bytes when the handshake starts is read to the end of them first.
 pub const input_buffer_len: usize = 0;
 /// Ciphertext write buffer the core gives the TCP writer: none. Records reach
-/// the socket from `Shared.sending` in one write each flush, so a buffer
-/// here would only copy them once more, and keep pages per connection that
-/// every response dirties.
+/// the socket from `Shared.sending` in one write each flush, or, for a
+/// response's borrowed last record, straight from BoringSSL's write buffer
+/// (`Connection.writeAll`, `Shared.sendBorrowed`), so a buffer here would
+/// only copy them once more, and keep pages per connection that every
+/// response dirties.
 pub const output_buffer_len: usize = 0;
 
 /// Largest TLS record payload; SSL_write is called with at most this much.
@@ -63,6 +67,17 @@ const busy_reads = 8;
 
 /// Queued ciphertext handed to the socket without waiting for `flush`.
 const gather_len = 48 * 1024;
+
+/// Room for a record's TLS overhead when the writing side sizes `pending`
+/// ahead of an SSL_write (`Shared.makeRoom`), so the BIO then appends
+/// without allocating under the lock. The largest overhead per record here
+/// is 57 B (the client's TLS 1.2 CBC suites: 5 header + 16 IV + 20 MAC + 16
+/// padding); the server's TLS 1.2 is AEAD only (29 B); TLS 1.3 takes 22 B,
+/// plus 27 B for a KeyUpdate reply sealed ahead of the record. TLS 1.2 and
+/// later never split a record. Output it cannot size (a first record's
+/// session tickets, alerts, close_notify, handshake flights) still grows
+/// `pending` inside the BIO.
+const seal_slack = 64;
 
 /// The handshake settings `server` and `client` take, in tls.zig's shapes.
 pub const config = struct {
@@ -525,12 +540,20 @@ pub const Connection = struct {
     pub fn parkable(self: *Connection) bool {
         const sh = self.shared orelse return true;
         sh.lock();
-        defer sh.unlock();
-        if (sh.filling or sh.input.bufferedLen() != 0 or sh.pending.len != 0 or sh.sending.len != 0) return false;
-        if (c.SSL_has_pending(sh.ssl) != 0) return false;
-        if (sh.block != null or sh.foreign) sh.useStash();
+        if (sh.filling or sh.input.bufferedLen() != 0 or sh.pending.len != 0 or sh.sending.len != 0 or
+            c.SSL_has_pending(sh.ssl) != 0)
+        {
+            sh.unlock();
+            return false;
+        }
+        // The read block goes back to the pool after the unlock (#178).
+        const block = sh.block;
+        sh.block = null;
+        if (block != null or sh.foreign) sh.useStash();
         sh.read_full = false;
         sh.busy = 0;
+        sh.unlock();
+        if (block) |b| giveBlock(b);
         return true;
     }
 
@@ -625,7 +648,9 @@ pub const Connection = struct {
             if (rc <= 0 and c.ERR_peek_error() != 0) c.ERR_clear_error();
             const total = if (rc > 0) sh.readBuffered(buf, @intCast(rc)) else 0;
             const eof = sh.input_eof;
+            const retired = sh.takeRetired();
             sh.unlock();
+            if (retired) |b| giveBlock(b);
 
             switch (code) {
                 c.SSL_ERROR_NONE => return total,
@@ -648,16 +673,41 @@ pub const Connection = struct {
     }
 
     /// Encrypts all of `bytes` and hands the records to the ciphertext
-    /// writer, without flushing it. Belongs to the writing side.
-    fn writeAll(self: *Connection, bytes: []const u8) WriteError!void {
+    /// writer, without flushing it. Belongs to the writing side. `last`:
+    /// nothing follows `bytes` before the flush.
+    ///
+    /// Borrowed ciphertext: the last record, when nothing is queued ahead
+    /// of it and it is too big for a small buffer, goes to the socket from
+    /// BoringSSL's own sealed buffer rather than being copied into
+    /// `pending` (Envoy's and HAProxy's BIOs send from that buffer too).
+    /// The BIO notes where the record is and has the SSL_write retried
+    /// (`bioWrite`); `Shared.sendBorrowed` sends it with the lock released
+    /// and repeats the SSL_write with the same arguments, as ssl.h
+    /// `SSL_write` requires, and the BIO then takes it as written. A record
+    /// behind queued ones is copied: a response over 16 KiB borrows only a
+    /// last record that follows a gather send (`gather_len`).
+    fn writeAll(self: *Connection, bytes: []const u8, last: bool) WriteError!void {
         const sh = self.shared.?;
         var rest = bytes;
         while (rest.len > 0) {
             const n = @min(rest.len, max_plaintext_len);
             sh.lock();
+            const borrow = last and rest.len == n and n > small_len - seal_slack and
+                sh.pending.len == 0 and sh.borrow == .off;
+            // What `pending` gave up for a bigger buffer, given back once
+            // the lock is released.
+            var old: []u8 = &.{};
+            if (borrow) sh.borrow = .armed else old = sh.makeRoom(n);
             // SSL_write empties the error queue on entry, and a non-empty
             // one sends whatever the reading side queued ahead of its record.
             const rc = c.SSL_write(sh.ssl, rest.ptr, @intCast(n));
+            if (builtin.is_test) _ = test_hooks.ssl_writes.fetchAdd(1, .monotonic);
+            if (borrow and rc <= 0 and sh.borrow == .out) {
+                try sh.sendBorrowed(rest.ptr, n);
+                rest = rest[n..];
+                continue;
+            }
+            if (borrow) sh.borrow = .off;
             if (rc > 0) {
                 sh.write_owed = false;
             } else {
@@ -665,6 +715,7 @@ pub const Connection = struct {
                 c.ERR_clear_error();
             }
             sh.unlock();
+            releaseMem(old);
             // The memory BIO cannot fail a write, so any failure is TLS-level.
             if (rc <= 0) return error.TlsFailure;
             rest = rest[@intCast(rc)..];
@@ -686,6 +737,7 @@ pub const Connection = struct {
         if (sh.write_owed) {
             // Returns 0 for success as well as for some failures.
             _ = c.SSL_write(sh.ssl, "", 0);
+            if (builtin.is_test) _ = test_hooks.ssl_writes.fetchAdd(1, .monotonic);
             if (c.ERR_peek_error() != 0) c.ERR_clear_error();
             sh.write_owed = false;
         }
@@ -749,14 +801,24 @@ pub const Connection = struct {
                 w.end += take;
                 off = take;
             }
-            try self.writeAll(w.buffered());
+            // Bytes of `data` still to write, so the final non-empty write
+            // knows it is last (`Connection.writeAll`). Saturating: a wrong
+            // `last` costs a send, never correctness.
+            var after: usize = 0;
+            if (data.len > 0) {
+                for (data[0 .. data.len - 1], 0..) |full, i| after +|= if (i == 0) full.len - off else full.len;
+                const tail = data[data.len - 1];
+                after +|= (if (data.len == 1) tail.len - off else tail.len) *| splat;
+            }
+            try self.writeAll(w.buffered(), after == 0);
             w.end = 0;
 
             var n: usize = off;
             if (data.len > 0) {
                 for (data[0 .. data.len - 1], 0..) |full, i| {
                     const bytes = if (i == 0) full[off..] else full;
-                    try self.writeAll(bytes);
+                    after -|= bytes.len;
+                    try self.writeAll(bytes, after == 0);
                     n += bytes.len;
                 }
                 const last = data[data.len - 1];
@@ -768,7 +830,8 @@ pub const Connection = struct {
                         n += splat;
                     },
                     else => for (0..splat) |_| {
-                        try self.writeAll(pattern);
+                        after -|= pattern.len;
+                        try self.writeAll(pattern, after == 0);
                         n += pattern.len;
                     },
                 }
@@ -791,13 +854,13 @@ pub const Connection = struct {
             var remaining = count;
             while (remaining > 0) {
                 const len = @min(remaining, chunk.len);
-                try self.writeAll(chunk[0..len]);
+                try self.writeAll(chunk[0..len], false);
                 remaining -= len;
             }
         }
 
-        fn writeAll(self: *Writer, bytes: []const u8) std.Io.Writer.Error!void {
-            self.conn.writeAll(bytes) catch |err| {
+        fn writeAll(self: *Writer, bytes: []const u8, last: bool) std.Io.Writer.Error!void {
+            self.conn.writeAll(bytes, last) catch |err| {
                 self.err = err;
                 return error.WriteFailed;
             };
@@ -831,7 +894,9 @@ fn handshake(sh: *Shared) HandshakeError!void {
         }
         if (rc != 1) c.ERR_clear_error();
         const eof = sh.input_eof;
+        const retired = sh.takeRetired();
         sh.unlock();
+        if (retired) |b| giveBlock(b);
 
         // Send each flight, and on failure the alert explaining it, before
         // waiting for the peer.
@@ -1392,6 +1457,19 @@ const Shared = struct {
     /// a write sends; `Connection.flush` then writes zero bytes to send
     /// them. Set from the start, for anything the handshake left queued.
     write_owed: bool = true,
+    /// A record left in BoringSSL's write buffer for the writing side to
+    /// send itself (`Connection.writeAll`): `armed` during the SSL_write
+    /// that may leave one, `out` from then until the retry takes it back.
+    /// It stays `out` if sending it failed: BoringSSL still holds the
+    /// record, and no later write may copy it into `pending` again.
+    borrow: enum { off, armed, out } = .off,
+    /// The record, in BoringSSL's write buffer, while `borrow` is `out`.
+    borrowed: []const u8 = &.{},
+    /// Set during the SSL_write that retries a borrowed record.
+    retrying: bool = false,
+    /// A read block the BIO is done with, given back to the pool once the
+    /// lock is released (`takeRetired`): giving one back may free it.
+    retired: ?[]u8 = null,
 
     // The reading side's, under the same rules as `input`.
     /// The pool block `input` reads into, if it borrowed one.
@@ -1557,6 +1635,75 @@ const Shared = struct {
         r.end = 0;
     }
 
+    /// The read block the BIO retired, to give back once the lock is
+    /// released. With the lock held, after an SSL call that reads.
+    fn takeRetired(sh: *Shared) ?[]u8 {
+        const b = sh.retired;
+        sh.retired = null;
+        return b;
+    }
+
+    /// Makes room in `pending` for a record of `n` bytes of plaintext, so
+    /// the BIO appends it without allocating under the lock (#178). A
+    /// bigger buffer is taken with the lock released and attached once it
+    /// is held again, after a re-check: the reading side may have queued an
+    /// alert meanwhile. Returns the storage `pending` gave up (or a buffer
+    /// it did not need) to give back once the lock is released. The writing
+    /// side, with the lock held, which it may release and take again.
+    fn makeRoom(sh: *Shared, n: usize) []u8 {
+        var spare: []u8 = &.{};
+        while (true) {
+            const need = sh.pending.len + n + seal_slack;
+            if (sh.pending.mem.len >= need) return spare;
+            if (spare.len >= need) return sh.pending.adopt(spare);
+            const have = sh.pending.mem.len;
+            sh.unlock();
+            releaseMem(spare);
+            // Out of memory: the BIO tries again, and fails the write.
+            spare = takeFor(have, need) orelse &.{};
+            sh.lock();
+            if (spare.len == 0) return spare;
+        }
+    }
+
+    /// Sends the record a borrowing SSL_write left in BoringSSL's buffer,
+    /// then repeats that SSL_write (`ptr`, `n`) so BoringSSL takes it as
+    /// written (`Connection.writeAll`). Called with the lock held; returns
+    /// with it released.
+    ///
+    /// While the record is out, the reading side cannot reach the BIO's
+    /// write: BoringSSL defers an alert while its write buffer holds bytes
+    /// (s3_pkt.cc `ssl_send_alert_impl`), and seals a KeyUpdate reply into
+    /// its pending flight. If the reading side failed the connection
+    /// meanwhile, the retry fails after the record was delivered, and the
+    /// alert BoringSSL deferred is lost: the peer sees the connection close
+    /// without one.
+    fn sendBorrowed(sh: *Shared, ptr: [*]const u8, n: usize) Connection.WriteError!void {
+        // The borrowing SSL_write sent everything queued ahead of its
+        // record. The retry sends nothing queued, so it leaves this alone:
+        // a KeyUpdate reply the reading side queues from here on sets it
+        // again, and the `flush` after this write sends it.
+        sh.write_owed = false;
+        const record = sh.borrowed;
+        sh.unlock();
+        if (builtin.is_test) if (test_hooks.borrow_out) |hook| hook();
+        sh.output.writeAll(record) catch return error.WriteFailed;
+        sh.lock();
+        sh.retrying = true;
+        const rc = c.SSL_write(sh.ssl, ptr, @intCast(n));
+        if (builtin.is_test) _ = test_hooks.ssl_writes.fetchAdd(1, .monotonic);
+        sh.retrying = false;
+        if (rc > 0) {
+            sh.borrow = .off;
+            sh.borrowed = &.{};
+        } else {
+            logErrors("SSL_write");
+            c.ERR_clear_error();
+        }
+        sh.unlock();
+        if (rc <= 0) return error.TlsFailure;
+    }
+
     /// Hands every pending record to `output`. Writing side only: swapping
     /// the buffers under the lock and writing with it released keeps records
     /// in order, since nothing else takes from `pending`. The records' block
@@ -1594,6 +1741,17 @@ const pool_cap = 16;
 threadlocal var pool_blocks: [pool_cap][*]u8 = undefined;
 threadlocal var pool_len: usize = 0;
 
+/// `len` bytes from malloc without std's `undefined` fill, 0xAA over the
+/// whole allocation in ReleaseSafe (safety's `allocUninit`; this module has
+/// no anole_safety). Every user writes before it reads, as with a block
+/// from a pool. Poisoned with 0xDD in Debug and test builds, as safety's
+/// helper does (SAFETY.md M6). Freed with `c_allocator.free`.
+fn mallocUninit(len: usize) ?[]u8 {
+    const p = std.heap.c_allocator.rawAlloc(len, .@"1", @returnAddress()) orelse return null;
+    if (builtin.mode == .debug or builtin.is_test) @memset(p[0..len], 0xDD);
+    return p[0..len];
+}
+
 /// A block from this thread's pool, or a new one; null if out of memory.
 /// Only for short sections: no I/O and nothing that suspends runs between
 /// the pool's reads and writes, so a coroutine that moves to another thread
@@ -1603,7 +1761,7 @@ fn takeBlock() ?[]u8 {
         pool_len -= 1;
         return pool_blocks[pool_len][0..block_len];
     }
-    return std.heap.c_allocator.alloc(u8, block_len) catch null;
+    return mallocUninit(block_len);
 }
 
 fn giveBlock(b: []u8) void {
@@ -1629,7 +1787,7 @@ fn takeBig() ?[]u8 {
         big_pool_len -= 1;
         return big_blocks[big_pool_len][0..big_len];
     }
-    return std.heap.c_allocator.alloc(u8, big_len) catch null;
+    return mallocUninit(big_len);
 }
 
 fn giveBig(b: []u8) void {
@@ -1663,7 +1821,7 @@ fn takeSmall() ?[]u8 {
         small_pool_len -= 1;
         return small_blocks[small_pool_len][0..small_len];
     }
-    return std.heap.c_allocator.alloc(u8, small_len) catch null;
+    return mallocUninit(small_len);
 }
 
 fn giveSmall(b: []u8) void {
@@ -1694,51 +1852,57 @@ const Buf = struct {
         b.len = need;
     }
 
+    /// Inside the BIO, so under the lock: only for output the writing
+    /// side could not size beforehand (`seal_slack`).
     fn grow(b: *Buf, need: usize) error{OutOfMemory}!void {
-        if (b.mem.len == 0 and need <= small_len) {
-            b.mem = takeSmall() orelse return error.OutOfMemory;
-            return;
-        }
-        if (need <= block_len and b.mem.len < block_len) {
-            const block = takeBlock() orelse return error.OutOfMemory;
-            b.move(block);
-            return;
-        }
-        if (need <= big_len and b.mem.len < big_len) {
-            if (takeBig()) |big| {
-                b.move(big);
-                return;
-            }
-        }
-        // Never a pooled length, so `release` can tell them apart.
-        var size = @max(need, 2 * block_len, 2 * b.mem.len);
-        if (size == block_len or size == big_len) size += 1;
-        b.move(try std.heap.c_allocator.alloc(u8, size));
+        if (builtin.is_test) _ = test_hooks.buf_grows.fetchAdd(1, .monotonic);
+        releaseMem(b.adopt(takeFor(b.mem.len, need) orelse return error.OutOfMemory));
     }
 
-    /// Copies the bytes into `new`, gives the old storage back and keeps `new`.
-    fn move(b: *Buf, new: []u8) void {
+    /// Copies the bytes into `new` and keeps it. Returns the old storage,
+    /// not given back, for the caller to give back with `releaseMem`.
+    fn adopt(b: *Buf, new: []u8) []u8 {
         @memcpy(new[0..b.len], b.mem[0..b.len]);
-        const len = b.len;
-        b.release();
+        const old = b.mem;
         b.mem = new;
-        b.len = len;
+        return old;
     }
 
     /// Gives the storage back, with whatever it holds.
     fn release(b: *Buf) void {
-        if (b.mem.len == small_len) {
-            giveSmall(b.mem);
-        } else if (b.mem.len == block_len) {
-            giveBlock(b.mem);
-        } else if (b.mem.len == big_len) {
-            giveBig(b.mem);
-        } else if (b.mem.len > 0) {
-            std.heap.c_allocator.free(b.mem);
-        }
+        releaseMem(b.mem);
         b.* = .{};
     }
 };
+
+/// The buffer a `Buf` of `have` bytes of storage moves to when it needs
+/// `need` (more than `have`): a small buffer for a first small flush, then
+/// a pool block, then a big block, then an allocation; null if out of
+/// memory.
+fn takeFor(have: usize, need: usize) ?[]u8 {
+    if (have == 0 and need <= small_len) return takeSmall();
+    if (need <= block_len and have < block_len) return takeBlock();
+    if (need <= big_len and have < big_len) {
+        if (takeBig()) |big| return big;
+    }
+    // Never a pooled length, so `releaseMem` can tell them apart.
+    var size = @max(need, 2 * block_len, 2 * have);
+    if (size == block_len or size == big_len) size += 1;
+    return mallocUninit(size);
+}
+
+/// Gives back storage from `takeFor`, to its pool by its length.
+fn releaseMem(mem: []u8) void {
+    if (mem.len == small_len) {
+        giveSmall(mem);
+    } else if (mem.len == block_len) {
+        giveBlock(mem);
+    } else if (mem.len == big_len) {
+        giveBig(mem);
+    } else if (mem.len > 0) {
+        std.heap.c_allocator.free(mem);
+    }
+}
 
 /// Checks of the buffer pools, run from src/tls/root.zig's tests (this
 /// module's own `test` blocks are not collected). Each starts and ends with
@@ -1841,6 +2005,109 @@ pub const buf_checks = if (builtin.is_test) struct {
         for (&bufs) |*b| b.release();
         try expectEqual(small_pool_cap, small_pool_len);
     }
+
+    /// Rounds of `n` blocks in flight at once, then all given back: the
+    /// first round allocates every block, each later one `n - pool_cap`
+    /// (a block taken from an empty pool is a miss, `mallocUninit`), and
+    /// the pool keeps at most `pool_cap`. The model of how a hold of many
+    /// streaming sockets on one executor misses; the real rate is the
+    /// benchmark's (an uprobe on malloc).
+    pub fn blockMisses() !void {
+        for ([_]usize{ 16, 17, 64 }) |n| {
+            emptyPools();
+            defer emptyPools();
+            var blocks: [64][]u8 = undefined;
+            for (0..3) |round| {
+                var misses: usize = 0;
+                for (blocks[0..n], 0..) |*b, i| {
+                    const miss = pool_len == 0;
+                    if (miss) misses += 1;
+                    b.* = takeBlock() orelse return error.OutOfMemory;
+                    // A miss is poisoned in test builds (`mallocUninit`).
+                    if (miss) try expect(std.mem.allEqual(u8, b.*, 0xDD));
+                    // Written before it is read, as every user of a block.
+                    @memset(b.*, @truncate(i));
+                }
+                for (blocks[0..n], 0..) |b, i| {
+                    try expectEqual(block_len, b.len);
+                    try expect(std.mem.allEqual(u8, b, @truncate(i)));
+                }
+                try expectEqual(if (round == 0) n else n -| pool_cap, misses);
+                for (blocks[0..n]) |b| giveBlock(b);
+                try expectEqual(@min(n, pool_cap), pool_len);
+            }
+        }
+    }
+
+    /// `takeFor` picks the class `grow` moves to, and `adopt` keeps the
+    /// bytes and hands back the old storage without giving it back.
+    pub fn takeAndAdopt() !void {
+        emptyPools();
+        defer emptyPools();
+        const cases = [_]struct { have: usize, need: usize, want: usize }{
+            .{ .have = 0, .need = 1, .want = small_len },
+            .{ .have = 0, .need = small_len, .want = small_len },
+            .{ .have = 0, .need = small_len + 1, .want = block_len },
+            .{ .have = small_len, .need = small_len + 1, .want = block_len },
+            .{ .have = small_len, .need = block_len + 1, .want = big_len },
+            .{ .have = block_len, .need = block_len + 1, .want = big_len },
+            .{ .have = big_len, .need = big_len + 1, .want = 2 * big_len },
+        };
+        for (cases) |case| {
+            const mem = takeFor(case.have, case.need).?;
+            defer releaseMem(mem);
+            try expectEqual(case.want, mem.len);
+        }
+        emptyPools();
+
+        var b: Buf = .{};
+        defer b.release();
+        try appendPattern(&b, 300);
+        const small = b.mem;
+        const old = b.adopt(takeFor(b.mem.len, 3 * 1024).?);
+        try expectEqual(small.ptr, old.ptr);
+        try expectEqual(block_len, b.mem.len);
+        try expectEqual(300, b.len);
+        try expectPattern(&b);
+        // Not given back yet: the caller does, outside the lock.
+        try expectEqual(0, small_pool_len);
+        releaseMem(old);
+        try expectEqual(1, small_pool_len);
+    }
+} else struct {};
+
+/// Test builds only: counters and a hook for the borrowed-ciphertext and
+/// #178 tests (src/tls/duplex_check.zig). The counters are process-wide.
+pub const test_hooks = if (builtin.is_test) struct {
+    /// SSL_write calls on the writing side, retries and zero-length ones
+    /// included.
+    pub var ssl_writes: std.atomic.Value(usize) = .init(0);
+    /// Writes BoringSSL handed to the BIO: records (with whatever it
+    /// queued ahead of them) copied into `pending` or borrowed.
+    pub var seals: std.atomic.Value(usize) = .init(0);
+    /// Records sent from BoringSSL's buffer.
+    pub var borrows: std.atomic.Value(usize) = .init(0);
+    /// Growths of `pending` inside the BIO, so under the lock.
+    pub var buf_grows: std.atomic.Value(usize) = .init(0);
+    /// Called on the writing side with the lock released, right before a
+    /// borrowed record is sent.
+    pub var borrow_out: ?*const fn () void = null;
+
+    /// Asks the peer to update its keys, as a reading side would queue a
+    /// KeyUpdate: the next `flush` sends it.
+    pub fn keyUpdate(conn: *Connection) !void {
+        const sh = conn.shared.?;
+        sh.lock();
+        defer sh.unlock();
+        if (c.SSL_key_update(sh.ssl, c.SSL_KEY_UPDATE_REQUESTED) != 1) return error.TlsFailure;
+        sh.write_owed = true;
+    }
+
+    /// Whether a borrowed record is still out (its send failed). Only while
+    /// neither side is using the connection.
+    pub fn borrowOut(conn: *const Connection) bool {
+        return conn.shared.?.borrow == .out;
+    }
 } else struct {};
 
 var bio_method: ?*c.BIO_METHOD = null;
@@ -1903,16 +2170,53 @@ fn bioRead(bio: ?*c.BIO, out: [*c]u8, len: c_int) callconv(.c) c_int {
     const n = @min(got.len, @as(usize, @intCast(len)));
     @memcpy(out[0..n], got[0..n]);
     sh.input.toss(n);
-    if (n == got.len and (sh.foreign or (sh.block != null and !sh.read_full))) sh.useStash();
+    if (n == got.len and (sh.foreign or (sh.block != null and !sh.read_full))) {
+        // Given back after the SSL call, with the lock released (#178).
+        if (sh.retired) |old| giveBlock(old); // never expected: the caller takes it back
+        sh.retired = sh.block;
+        sh.block = null;
+        sh.useStash();
+    }
     return @intCast(n);
 }
 
 /// Runs inside an SSL call, so with the lock held. Queues the records for
-/// the writing side.
+/// the writing side, or, during a borrowing SSL_write, leaves them in
+/// BoringSSL's buffer for it to send (`Connection.writeAll`): BoringSSL
+/// keeps a record it could not write, and the retry, with the same buffer,
+/// takes it as written. While a record is out, any other write is refused:
+/// it must reach the socket before anything after it.
 fn bioWrite(bio: ?*c.BIO, in: [*c]const u8, len: c_int) callconv(.c) c_int {
     const sh = bioShared(bio);
     c.BIO_clear_retry_flags(bio);
-    sh.pending.append(in[0..@intCast(len)]) catch return -1;
+    const bytes = in[0..@intCast(len)];
+    switch (sh.borrow) {
+        .off => {},
+        .armed => {
+            if (builtin.is_test) {
+                _ = test_hooks.seals.fetchAdd(1, .monotonic);
+                _ = test_hooks.borrows.fetchAdd(1, .monotonic);
+            }
+            sh.borrowed = bytes;
+            sh.borrow = .out;
+            c.BIO_set_retry_write(bio);
+            return -1;
+        },
+        .out => {
+            if (sh.retrying and bytes.ptr == sh.borrowed.ptr and bytes.len == sh.borrowed.len) return len;
+            // Only the retry may write while the record is out; a retry
+            // with another buffer would be our bug (a BoringSSL bump that
+            // re-presents the record differently). Checked in Debug builds only: a
+            // plain assert is an optimizer assumption in ReleaseFast, which
+            // could fold the line above into accepting any retry, and the
+            // refusal below is the safe path in release.
+            if (builtin.mode == .debug) std.debug.assert(!sh.retrying);
+            c.BIO_set_retry_write(bio);
+            return -1;
+        },
+    }
+    if (builtin.is_test) _ = test_hooks.seals.fetchAdd(1, .monotonic);
+    sh.pending.append(bytes) catch return -1;
     return len;
 }
 
@@ -1938,6 +2242,7 @@ fn bioDestroy(bio: ?*c.BIO) callconv(.c) c_int {
             sh.input.seek = 0;
             sh.input.end = 0;
         }
+        if (sh.retired) |b| giveBlock(b);
         sh.pending.release();
         sh.sending.release();
         std.heap.c_allocator.destroy(sh);

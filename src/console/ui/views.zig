@@ -461,23 +461,31 @@ fn drawConns(app: *App, scr: *Screen, x: u16, y: u16, w: u16, h: u16) void {
     for (d.executors) |e| {
         const s = e.streams orelse protocol.StreamCounts{};
         const vals = [_]u64{ e.connections orelse 0, s.h1, s.h2, s.h3, s.ws, s.wt, s.grpc, e.tasks orelse 0, e.run_queue orelse 0 };
-        const cells = a.alloc([]const u8, 10) catch break;
+        const cells = a.alloc([]const u8, 11) catch break;
         cells[0] = fmt(app, "{d}", .{e.i});
         for (vals, 0..) |v, k| {
             tot[k] += v;
             cells[k + 1] = fmt(app, "{d}", .{v});
         }
+        // Utilization of the last window; "!" while over the admission line.
+        cells[10] = if (e.util_permille) |u| fmt(app, "{d}%{s}", .{ u / 10, if (e.hot orelse false) "!" else "" }) else "";
         table.append(a, cells) catch break;
     }
     if (d.executors.len > 1) {
-        const cells = a.alloc([]const u8, 10) catch return;
+        const cells = a.alloc([]const u8, 11) catch return;
         cells[0] = "all";
         for (tot, 0..) |v, k| cells[k + 1] = fmt(app, "{d}", .{v});
+        cells[10] = "";
         table.append(a, cells) catch {};
     }
-    const cols = [_]Col{ .{ .title = "EXEC", .w = 5 }, .{ .title = "CONNS", .w = 7, .right = true }, .{ .title = "H1", .w = 6, .right = true }, .{ .title = "H2", .w = 6, .right = true }, .{ .title = "H3", .w = 6, .right = true }, .{ .title = "WS", .w = 6, .right = true }, .{ .title = "WT", .w = 6, .right = true }, .{ .title = "GRPC", .w = 6, .right = true }, .{ .title = "TASKS", .w = 7, .right = true }, .{ .title = "RUNQ", .w = 6, .right = true } };
+    const all_cols = [_]Col{ .{ .title = "EXEC", .w = 5 }, .{ .title = "CONNS", .w = 7, .right = true }, .{ .title = "H1", .w = 6, .right = true }, .{ .title = "H2", .w = 6, .right = true }, .{ .title = "H3", .w = 6, .right = true }, .{ .title = "WS", .w = 6, .right = true }, .{ .title = "WT", .w = 6, .right = true }, .{ .title = "GRPC", .w = 6, .right = true }, .{ .title = "TASKS", .w = 7, .right = true }, .{ .title = "RUNQ", .w = 6, .right = true }, .{ .title = "UTIL", .w = 6, .right = true } };
+    // UTIL only from a server that measures it (the admission gate's probe).
+    const measured = for (d.executors) |e| {
+        if (e.util_permille != null) break true;
+    } else false;
+    const cols = if (measured) all_cols[0..] else all_cols[0 .. all_cols.len - 1];
     const used: u16 = @intCast(@min(table.items.len + 1, h));
-    drawTable(scr, x + 1, y, w -| 2, used, &cols, table.items, 0, &app.hcol, null, null);
+    drawTable(scr, x + 1, y, w -| 2, used, cols, table.items, 0, &app.hcol, null, null);
     var row: u16 = used + 1;
     if (d.stack_committed_bytes) |b| {
         if (row < h) _ = scr.print(x + 1, y + row, x + w, fmt(app, "stack memory committed: {s}", .{fmtBytes(app, b)}), .{});
@@ -559,6 +567,10 @@ fn drawWs(app: *App, scr: *Screen, x: u16, y: u16, w: u16, h: u16) void {
         return;
     };
     _ = scr.print(x + 1, y, x + w, fmt(app, "WebSockets  h1 {d}  h2 {d}  h3 {d}      WebTransport sessions {d}", .{ d.sockets.h1, d.sockets.h2, d.sockets.h3, d.webtransport }), .{});
+    if (d.admission) |adm| {
+        const limit = if (adm.limit) |l| fmt(app, "held at {d}", .{l}) else "not held";
+        _ = scr.print(x + 1, y + 1, x + w, fmt(app, "Admission  {s}  refused: load {d}  cap {d}", .{ limit, adm.refused_load, adm.refused_cap }), .{});
+    }
     var table: std.ArrayList([]const []const u8) = .empty;
     for (d.rooms) |r| {
         const cells = a.alloc([]const u8, 5) catch break;

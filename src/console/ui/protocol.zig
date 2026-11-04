@@ -335,6 +335,11 @@ pub const ExecutorConns = struct {
     run_queue: ?u64 = null,
     connections: ?u64 = null,
     streams: ?StreamCounts = null,
+    /// The admission gate's last window: utilization in thousandths, the
+    /// least timer lateness, and whether the executor is over the line.
+    util_permille: ?u64 = null,
+    lag_us: ?u64 = null,
+    hot: ?bool = null,
 };
 
 pub const StreamCounts = struct { h1: u64 = 0, h2: u64 = 0, h3: u64 = 0, ws: u64 = 0, wt: u64 = 0, grpc: u64 = 0 };
@@ -367,8 +372,13 @@ pub const RoomInfo = struct { name: []const u8 = "", members: u64 = 0, queued_by
 pub const TopicInfo = struct { name: []const u8 = "", subscribers: u64 = 0 };
 pub const WsSockets = struct { h1: u64 = 0, h2: u64 = 0, h3: u64 = 0 };
 
+/// The WebSocket admission gate: open sockets it counts, the limit frozen
+/// under load (null: none), and upgrades it refused.
+pub const WsAdmission = struct { admitted: u64 = 0, limit: ?u64 = null, refused_load: u64 = 0, refused_cap: u64 = 0 };
+
 pub const WsData = struct {
     sockets: WsSockets = .{},
+    admission: ?WsAdmission = null,
     webtransport: u64 = 0,
     rooms: []const RoomInfo = &.{},
     topics: []const TopicInfo = &.{},

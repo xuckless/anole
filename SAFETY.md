@@ -113,6 +113,8 @@ Lock order (outer first), to be filled in by the retrofit audit:
 
 **L5. Spin locks only for short, bounded sections.** A spin lock may guard only a short, fixed-length section that never allocates, waits or calls C code that may block.
 
+*Exception (user, 2026-11-04): BoringSSL's record buffers.* Inside an `SSL_*` call under a TLS connection's spin lock (src/tls/dusty_tls.zig), BoringSSL allocates and frees its own record buffers: `SSLBuffer::EnsureCap` and `Clear` (ssl/ssl_buffer.cc) once per record written and per record read, and `BUF_MEM` for handshake and post-handshake flights. Nothing configures it away (`SSL_MODE_RELEASE_BUFFERS` is 0) short of a fork, which was rejected (D3 B9). The exception covers BoringSSL's own allocations only. Anole's buffers for that lock are taken and given back outside it (#178). The exceptions are output Anole cannot size in advance, which grows its queue under the lock: handshake flights (one task, uncontended), a first record's ticket flight, alerts, `close_notify` and KeyUpdate replies sent by a zero-length flush. Re-check on every BoringSSL bump (MAINTAINING.md).
+
 **L6. Atomics through a few wrappers.** Atomics are used only through a few wrappers: counters, flags, generations, the SPSC ring. The existing lock-free structures (the C ABI rings, the HTTP/3 kick list) get dedicated multi-thread stress tests.
 
 **L7. Atomics instead of a lock where they remove a bug class or win in numbers.** A lock is replaced by atomics when that removes a deadlock or use-after-free class, removes real technical debt, or gives a measured performance win (an A/B on the box). Never for style alone. Only these patterns, each through a wrapper with a multi-thread stress test:

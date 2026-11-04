@@ -25,6 +25,8 @@ const zstd_io = if (build_options.use_zstd) @import("zstd_io.zig") else struct {
 const brotli_io = if (build_options.use_brotli) @import("brotli_io.zig") else struct {};
 const encoders = @import("encoders.zig");
 const json_out = @import("json_out.zig");
+const WriteBuffer = @import("server/request_buffers.zig").WriteBuffer;
+const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersPool;
 
 var no_buf: [0]u8 = .{};
 
@@ -232,7 +234,8 @@ pub fn writeEvent(w: *std.Io.Writer, data: []const u8, opts: EventStream.Options
 }
 
 /// A buffered response body: segments of the request arena, each allocated
-/// when the last one fills and never moved. It is collected only so its
+/// when the last one fills and never moved, the first of them possibly in
+/// a write buffer instead (`Response.promote`). It is collected only so its
 /// length is known before the headers go out, so it is never gathered into
 /// one piece; it is sent a segment at a time.
 ///
@@ -248,11 +251,13 @@ const BodyBuffer = struct {
     const max_segment_len = 64 * 1024;
 
     /// A segment's header, with its bytes right behind it in the same
-    /// allocation.
+    /// allocation, or at `data` for one in a write buffer
+    /// (`Response.promote`).
     const Segment = struct {
         node: std.DoublyLinkedList.Node = .{},
         len: usize = 0,
         capacity: usize,
+        data: ?[*]u8 = null,
 
         fn create(arena: std.mem.Allocator, capacity: usize) std.mem.Allocator.Error!*Segment {
             const size = std.math.add(usize, @sizeOf(Segment), capacity) catch return error.OutOfMemory;
@@ -267,6 +272,7 @@ const BodyBuffer = struct {
         }
 
         fn bytes(self: *Segment) []u8 {
+            if (self.data) |data| return data[0..self.capacity];
             const base: [*]u8 = @ptrCast(self);
             return base[@sizeOf(Segment)..][0..self.capacity];
         }
@@ -301,10 +307,15 @@ const BodyBuffer = struct {
 
     /// Sends the segments in order, up to `max_vecs` in one vectored write.
     fn writeTo(self: *const BodyBuffer, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        return writeFrom(self.segments.first, out);
+    }
+
+    /// `writeTo` from segment `first` on.
+    fn writeFrom(first: ?*std.DoublyLinkedList.Node, out: *std.Io.Writer) std.Io.Writer.Error!void {
         const max_vecs = 8;
         var vecs: [max_vecs][]const u8 = undefined;
         var n: usize = 0;
-        var it = self.segments.first;
+        var it = first;
         while (it) |node| : (it = node.next) {
             const segment = Segment.fromNode(node);
             vecs[n] = segment.bytes()[0..segment.len];
@@ -430,8 +441,11 @@ pub const BodyWriter = struct {
         const splat_len = std.math.mul(usize, pattern.len, splat) catch return self.fail(error.OutOfMemory);
         needed = std.math.add(usize, needed, splat_len) catch return self.fail(error.OutOfMemory);
         // Called only when `data` does not fit in what is left, so move on
-        // to a segment it does fit in.
-        self.buffer.nextSegment(self.res.arena, w, needed, 0) catch |err| return self.fail(err);
+        // to a segment it does fit in: a write buffer, for a body past its
+        // first segment that will fit one.
+        if (!(self.buffer == &self.res.body_buffer and self.res.promote(w, needed))) {
+            self.buffer.nextSegment(self.res.arena, w, needed, 0) catch |err| return self.fail(err);
+        }
 
         const start = w.end;
         for (data[0 .. data.len - 1]) |bytes| {
@@ -454,6 +468,8 @@ pub const BodyWriter = struct {
 
     fn rebase(w: *std.Io.Writer, preserve: usize, minimum_len: usize) std.Io.Writer.Error!void {
         const self: *BodyWriter = @alignCast(@fieldParentPtr("interface", w));
+        // `promote` keeps all that is buffered, `preserve` among it.
+        if (self.buffer == &self.res.body_buffer and self.res.promote(w, minimum_len)) return;
         self.buffer.nextSegment(self.res.arena, w, minimum_len, preserve) catch |err| return self.fail(err);
     }
 
@@ -889,6 +905,11 @@ pub const Response = struct {
     /// could wait (`Connection.flushOwed`). Set by the server just before
     /// `write`; a file, a stream or a sink flushes as before.
     _cork: bool = false,
+    /// HTTP/1.x: the write buffer, from the connection's pool, that the
+    /// body moved into when it outgrew its first segment (`promote`). The
+    /// response holds it until `write` hands it to the connection, head
+    /// and body in place, or `deinit` gives it back.
+    _lent: ?*WriteBuffer = null,
 
     /// A file body set up by `sendFile`.
     pub const BodyFile = struct {
@@ -1015,11 +1036,103 @@ pub const Response = struct {
         if (self._sink) |sink| try sink.end(if (self.trailers) |*t| t else null);
     }
 
-    /// Closes a file body that `write` never got to send.
+    /// Closes a file body that `write` never got to send, and gives back
+    /// a write buffer it never handed on.
     pub fn deinit(self: *Response) void {
+        self.giveBackLent();
         self.closeFile();
         if (build_options.use_brotli) if (self.brotli_encoder) |state| brotli_io.destroy(state);
         if (build_options.use_brotli) self.brotli_encoder = null;
+    }
+
+    /// What a write buffer keeps free in front of a body promoted into it,
+    /// for the head to go in front of it: an ordinary head fits.
+    const head_room = 512;
+
+    /// Moves a body that outgrew its first segment, with `needed` bytes
+    /// more to come, into a write buffer from the connection's pool, behind
+    /// `head_room`, and makes it `w`'s buffer: `write` then sends the head
+    /// and the body from there in one write, with no copy into the
+    /// connection's buffer and no more segments for a body that fits.
+    /// False, and nothing changed, when it would not fit, the connection's
+    /// writer holds corked responses (this one goes out behind them), or
+    /// the body cannot go out that way.
+    fn promote(self: *Response, w: *std.Io.Writer, needed: usize) bool {
+        if (self._lent != null or self._sink != null or self._headers_written or self.head) return false;
+        const conn = self._conn orelse return false;
+        const pool = conn.write_pool orelse return false;
+        if (conn.upgraded or conn.writer.end != 0 or self.body_buffer.sealed_len != 0) return false;
+        const total = std.math.add(usize, w.end, needed) catch return false;
+        if (total <= BodyBuffer.first_segment_len or total > pool.write_buffer_len -| head_room) return false;
+        const lent = pool.takeWriteBuffer(@intFromPtr(conn)) catch return false;
+        const segment = self.arena.create(BodyBuffer.Segment) catch {
+            pool.giveWriteBuffer(lent);
+            return false;
+        };
+        const bytes = pool.writeBytes(lent)[head_room..];
+        // All of it, so a rebase's preserved tail stays at the end; counted
+        // as sealed bytes are, ahead of the next flush.
+        segment.* = .{ .capacity = bytes.len, .data = bytes.ptr, .len = w.end };
+        @memcpy(bytes[0..w.end], w.buffer[0..w.end]);
+        // At most the first segment, which this replaces.
+        self.body_buffer.segments = .{};
+        self.body_buffer.segments.append(&segment.node);
+        w.buffer = bytes;
+        self._lent = lent;
+        return true;
+    }
+
+    /// Gives the promoted body's write buffer back to the pool, if this
+    /// response still holds it.
+    fn giveBackLent(self: *Response) void {
+        const lent = self._lent orelse return;
+        self._lent = null;
+        self._conn.?.write_pool.?.giveWriteBuffer(lent);
+    }
+
+    /// The head rendered in front of a promoted body, and the write buffer
+    /// handed to the connection's writer with both in it. A head longer
+    /// than `head_room` moves the body up behind it, so it still takes one
+    /// buffer and one copy of the body, as `sendBody` would. False, and
+    /// nothing changed, for a writer that holds corked responses, a body
+    /// that is not the promoted one (replaced while an abandoned writer
+    /// kept the buffer, `clearBody`), or a head that does not fit in front
+    /// of the body even so; `sendBody` then sends it the usual way.
+    /// Not inlined: its stack buffer is gone before the send runs.
+    noinline fn handOverLent(self: *Response) bool {
+        const lent = self._lent orelse return false;
+        // `write` sends the buffer only when it holds anything, else `body`.
+        if (!self.sendsBody() or self._chunked or self._streaming or self.body_buffer.len() == 0) return false;
+        const first = BodyBuffer.Segment.fromNode(self.body_buffer.segments.first.?);
+        const conn = self._conn.?;
+        const buf = conn.write_pool.?.writeBytes(lent);
+        if (first.data != buf[head_room..].ptr or conn.upgraded) return false;
+        const w = conn.writer;
+        // Between requests the server gives the writer's buffer back unless
+        // it holds corked responses.
+        if (w.end != 0 or w.buffer.len != 0) return false;
+        var stack: [head_room]u8 = undefined;
+        var head: std.Io.Writer = .fixed(&stack);
+        var start: usize = 0;
+        var h: usize = 0;
+        if (self.sendHeader(&head)) |_| {
+            h = head.end;
+            start = head_room - h;
+            @memcpy(buf[start..head_room], stack[0..h]);
+        } else |_| {
+            var long: std.Io.Writer.Allocating = .init(self.arena);
+            self.sendHeader(&long.writer) catch return false;
+            h = long.written().len;
+            if (h > buf.len - first.len) return false;
+            std.mem.copyBackwards(u8, buf[h..][0..first.len], buf[head_room..][0..first.len]);
+            @memcpy(buf[0..h], long.written());
+        }
+        std.debug.assert(conn.write_held == null);
+        conn.write_held = lent;
+        self._lent = null;
+        w.buffer = buf[start..];
+        w.end = h + first.len;
+        return true;
     }
 
     pub const SendFileOptions = struct {
@@ -1211,7 +1324,19 @@ pub const Response = struct {
     pub fn clearWriter(self: *Response) void {
         // A buffering writer is open: its bytes are its own.
         if (self._body_writer_buffering) return;
-        self.body_buffer.clear();
+        self.clearBody(self._body_writer_open);
+    }
+
+    /// Forgets the body. One in a write buffer (`promote`) gives it back
+    /// with it: what replaces it is short, a stream, a file or an upgrade,
+    /// none of which sends from there, and the buffer would otherwise stay
+    /// held until `deinit`, through a stream or an adopted connection's
+    /// life. Not while `writer_open`, an abandoned writer that may still
+    /// write into it: then it goes back at `deinit`.
+    fn clearBody(self: *Response, writer_open: bool) void {
+        if (self._lent == null) return self.body_buffer.clear();
+        self.body_buffer = .{};
+        if (!writer_open) self.giveBackLent();
     }
 
     /// Throws away a body that was started but never finished, so a
@@ -1226,9 +1351,10 @@ pub const Response = struct {
         if (self._headers_written) return error.HeadersAlreadySent;
         // An open writer is abandoned with the body: `end` on it does
         // nothing once it is no longer the open one.
+        const writer_open = self._body_writer_open;
         self._body_writer_open = false;
         self._body_writer_buffering = false;
-        self.clearWriter();
+        self.clearBody(writer_open);
         self.body = "";
         self.closeFile();
         // Everything that described the old body has to go with it.
@@ -1916,6 +2042,8 @@ pub const Response = struct {
         };
         if (compressed.len() >= len) return;
         self.body_buffer = compressed;
+        // The promoted body was the input, and is not sent.
+        self.giveBackLent();
         self.body = "";
         self.markCompressed(coding);
     }
@@ -2059,15 +2187,19 @@ pub const Response = struct {
 
         // Plain writes rather than `print`: a head is on every response, and
         // these are copies into the write buffer, without format parsing.
-        try w.writeAll("HTTP/1.1 ");
-        try writeDecimal(w, @backingInt(self.status));
-        try w.writeByte(' ');
-        try w.writeAll(self.status.phrase());
-        try w.writeAll("\r\n");
-        if (self._send_date and self.headers.get("Date") == null) {
-            try w.writeAll("Date: ");
-            try w.writeAll(http.currentHttpDate(self.io));
+        // Each write costs about as much as its bytes, so the status line,
+        // the Date line and the end are one write each where they can be.
+        if (self.status.statusLine()) |line| {
+            try w.writeAll(line);
+        } else {
+            try w.writeAll("HTTP/1.1 ");
+            try writeDecimal(w, @backingInt(self.status));
+            try w.writeByte(' ');
+            try w.writeAll(self.status.phrase());
             try w.writeAll("\r\n");
+        }
+        if (self._send_date and self.headers.get("Date") == null) {
+            try w.writeAll(http.currentDateLine(self.io));
         }
 
         // Write headers
@@ -2098,11 +2230,8 @@ pub const Response = struct {
             } else if (!self._streaming) {
                 // Write Content-Length if not manually set (skip for streaming responses like SSE)
                 const has_content_length = self.headers.get("Content-Length") != null;
-                if (!has_content_length) {
-                    try w.writeAll("Content-Length: ");
-                    try writeDecimal(w, self.bodyLen());
-                    try w.writeAll("\r\n");
-                }
+                // The length and the end of the head, in one write.
+                if (!has_content_length) return writeLengthTail(w, self.bodyLen());
             }
         }
 
@@ -2194,6 +2323,8 @@ pub const Response = struct {
         if (send_header) if (self._sink) |sink| if (sink.canComplete()) {
             return self.resolve(self.completeSink(sink));
         };
+        // A body in a write buffer goes out from there, its head in front.
+        if (send_header and self.handOverLent()) return self.resolve(self.sendLentRest(self._conn.?.writer));
         return self.resolve(self.sendBody(self.bodyOut(), send_header));
     }
 
@@ -2344,6 +2475,14 @@ pub const Response = struct {
         return self.finish(w);
     }
 
+    /// After `handOverLent`: what the body has past the write buffer, and
+    /// the end, as `sendBody` ends.
+    fn sendLentRest(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try BodyBuffer.writeFrom(self.body_buffer.segments.first.?.next, w);
+        if (self._cork) return;
+        return self.finish(w);
+    }
+
     /// The body length the head announces to a sink: the length a buffered
     /// body or file has (a HEAD reports its GET's), a declared one for a
     /// stream, and null for a stream of unknown length or a status that has
@@ -2358,15 +2497,40 @@ pub const Response = struct {
 /// `n` in decimal, as `print("{d}")` writes it.
 fn writeDecimal(w: *std.Io.Writer, n: usize) std.Io.Writer.Error!void {
     var buf: [20]u8 = undefined;
-    var i: usize = buf.len;
-    var v = n;
-    while (true) {
-        i -= 1;
-        buf[i] = '0' + @as(u8, @intCast(v % 10));
-        v /= 10;
-        if (v == 0) break;
+    return w.writeAll(buf[decimalInto(&buf, n)..]);
+}
+
+/// `n` in decimal at the end of `buf`, right to left, two digits per
+/// division; returns where the digits start. The base-10 branch of std's
+/// `printIntAny` (std/Io/Writer.zig), copied so a head's numbers go
+/// straight into the bytes around them, without its generic path.
+fn decimalInto(buf: []u8, n: usize) usize {
+    var a = n;
+    var i = buf.len;
+    while (a >= 100) : (a /= 100) {
+        i -= 2;
+        buf[i..][0..2].* = std.fmt.digits2(@intCast(a % 100));
     }
-    return w.writeAll(buf[i..]);
+    if (a < 10) {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @intCast(a));
+    } else {
+        i -= 2;
+        buf[i..][0..2].* = std.fmt.digits2(@intCast(a));
+    }
+    return i;
+}
+
+/// `Content-Length: <n>`, its CRLF and the CRLF that ends the head, in
+/// one write: what hyper and actix-http append as one length line.
+fn writeLengthTail(w: *std.Io.Writer, n: usize) std.Io.Writer.Error!void {
+    const prefix = "Content-Length: ";
+    // The prefix, the digits of maxInt(u64), CRLF CRLF.
+    var buf: [prefix.len + 20 + 4]u8 = undefined;
+    buf[buf.len - 4 ..][0..4].* = "\r\n\r\n".*;
+    const start = decimalInto(buf[0 .. buf.len - 4], n) - prefix.len;
+    buf[start..][0..prefix.len].* = prefix.*;
+    return w.writeAll(buf[start..]);
 }
 
 fn writeJsonString(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
@@ -2430,6 +2594,17 @@ test writeDecimal {
         try writeDecimal(&w, n);
         var expected: [32]u8 = undefined;
         try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{d}", .{n}), w.buffered());
+    }
+}
+
+test writeLengthTail {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    for ([_]usize{ 0, 7, 10, 99, 100, 200, 404, 1234567890, std.math.maxInt(usize) }) |n| {
+        w.end = 0;
+        try writeLengthTail(&w, n);
+        var expected: [64]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "Content-Length: {d}\r\n\r\n", .{n}), w.buffered());
     }
 }
 
@@ -2501,6 +2676,113 @@ const CountingSink = struct {
     }
 };
 
+/// A response a head golden sets up, as a handler would, and the whole of
+/// what it puts on the wire.
+const HeadCase = struct {
+    status: http.Status = .ok,
+    body: []const u8 = "",
+    json: bool = false,
+    content_type: ?http.ContentType = null,
+    headers: []const [2][]const u8 = &.{},
+    keepalive: bool = true,
+    http10: bool = false,
+    head: bool = false,
+    send_date: bool = true,
+    stream: bool = false,
+    /// Our own Date's value is masked (`masked_date`): it is the clock's.
+    mask_date: bool = true,
+    expected: []const u8,
+};
+
+/// What stands in the goldens for the current time, 29 bytes as an
+/// IMF-fixdate is.
+const masked_date = "Www, DD Mon YYYY hh:mm:ss GMT";
+const masked_date_line = "Date: " ++ masked_date ++ "\r\n";
+
+const head_cases = [_]HeadCase{
+    .{ .json = true, .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}" },
+    .{ .content_type = .text, .body = "hello", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Type: text/plain; charset=UTF-8\r\nContent-Length: 5\r\n\r\nhello" },
+    .{ .status = .created, .body = "made", .expected = "HTTP/1.1 201 Created\r\n" ++ masked_date_line ++ "Content-Length: 4\r\n\r\nmade" },
+    .{ .status = .no_content, .expected = "HTTP/1.1 204 No Content\r\n" ++ masked_date_line ++ "\r\n" },
+    .{ .status = .not_modified, .expected = "HTTP/1.1 304 Not Modified\r\n" ++ masked_date_line ++ "\r\n" },
+    .{ .status = .bad_request, .body = "bad", .expected = "HTTP/1.1 400 Bad Request\r\n" ++ masked_date_line ++ "Content-Length: 3\r\n\r\nbad" },
+    .{ .status = .not_found, .body = "nope", .expected = "HTTP/1.1 404 Not Found\r\n" ++ masked_date_line ++ "Content-Length: 4\r\n\r\nnope" },
+    .{ .status = .internal_server_error, .body = "oops", .expected = "HTTP/1.1 500 Internal Server Error\r\n" ++ masked_date_line ++ "Content-Length: 4\r\n\r\noops" },
+    .{ .status = .im_a_teapot, .body = "tea", .expected = "HTTP/1.1 418 I'm a teapot\r\n" ++ masked_date_line ++ "Content-Length: 3\r\n\r\ntea" },
+    .{ .status = .unprocessable_entity, .json = true, .expected = "HTTP/1.1 422 Unprocessable Content\r\n" ++ masked_date_line ++ "Content-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}" },
+    .{ .keepalive = false, .body = "x", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Connection: close\r\nContent-Length: 1\r\n\r\nx" },
+    .{ .http10 = true, .body = "x", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Connection: keep-alive\r\nContent-Length: 1\r\n\r\nx" },
+    .{ .headers = &.{.{ "Content-Length", "2" }}, .body = "hi", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Length: 2\r\n\r\nhi" },
+    .{ .stream = true, .body = "abc", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n" },
+    .{ .head = true, .body = "hello", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Length: 5\r\n\r\n" },
+    .{ .headers = &.{.{ "Date", "Sun, 06 Nov 1994 08:49:37 GMT" }}, .body = "x", .mask_date = false, .expected = "HTTP/1.1 200 OK\r\nDate: Sun, 06 Nov 1994 08:49:37 GMT\r\nContent-Length: 1\r\n\r\nx" },
+    .{ .send_date = false, .body = "x", .mask_date = false, .expected = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx" },
+    .{ .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Length: 0\r\n\r\n" },
+    .{ .headers = &.{ .{ "X-One", "1" }, .{ "X-Two", "2" }, .{ "Cache-Control", "no-store" } }, .body = "ok", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "X-One: 1\r\nX-Two: 2\r\nCache-Control: no-store\r\nContent-Length: 2\r\n\r\nok" },
+};
+
+/// Writes `c`'s response to `w` as the server would, Date on.
+fn renderHeadCase(w: *std.Io.Writer, c: HeadCase) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(w);
+
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    response.io = std.testing.io;
+    response._send_date = c.send_date;
+    response.status = c.status;
+    response.keepalive = c.keepalive;
+    response.http10 = c.http10;
+    response.head = c.head;
+    response.content_type = c.content_type;
+    for (c.headers) |h| try response.addHeader(h[0], h[1]);
+    if (c.json) {
+        try response.json(.{ .ok = true });
+    } else if (c.stream) {
+        var body_buf: [64]u8 = undefined;
+        var sw = try response.stream(&body_buf);
+        try sw.interface.writeAll(c.body);
+        try sw.interface.flush();
+    } else {
+        response.body = c.body;
+    }
+    try response.write();
+}
+
+/// `out` with the value of its first Date line replaced by `masked_date`.
+fn maskDate(out: []u8) void {
+    const at = std.mem.indexOf(u8, out, "\r\nDate: ") orelse return;
+    const value = out[at + "\r\nDate: ".len ..];
+    if (value.len < masked_date.len) return;
+    @memcpy(value[0..masked_date.len], masked_date);
+}
+
+test "Response: heads are byte-for-byte what they were, for every status and framing" {
+    for (head_cases) |c| {
+        var buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try renderHeadCase(&w, c);
+        if (c.mask_date) maskDate(w.buffered());
+        try std.testing.expectEqualStrings(c.expected, w.buffered());
+    }
+}
+
+test "Response: heads drained through a small or empty write buffer are the same bytes" {
+    for ([_]usize{ 0, 7 }) |size| {
+        for (head_cases) |c| {
+            var buf: [7]u8 = undefined;
+            var sink: CountingSink = .init(buf[0..size]);
+            try renderHeadCase(&sink.interface, c);
+            try sink.interface.flush();
+            const sent = sink.out[0..sink.len];
+            if (c.mask_date) maskDate(sent);
+            try std.testing.expectEqualStrings(c.expected, sent);
+        }
+    }
+}
+
 test "Response: a corked response stays in the write buffer and goes out with the next in one write" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2552,6 +2834,433 @@ test "Response: a corked stream is still flushed at its head" {
     try response.write();
     try std.testing.expectEqual(@as(usize, 0), sink.interface.end);
     try std.testing.expect(std.mem.endsWith(u8, sink.sent(), "0\r\n\r\n"));
+}
+
+/// A connection writer over an empty buffer, as the server's is between
+/// requests, that keeps what reaches it: for a body promoted into a write
+/// buffer (`Response.promote`).
+const LentSink = struct {
+    interface: std.Io.Writer,
+    out: std.ArrayList(u8) = .empty,
+    drains: usize = 0,
+    /// Bytes that reached it from `data` rather than the buffer: gathered
+    /// past the buffer.
+    gathered: usize = 0,
+
+    fn init() LentSink {
+        return .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} } };
+    }
+
+    fn deinit(self: *LentSink) void {
+        self.out.deinit(std.testing.allocator);
+    }
+
+    fn put(self: *LentSink, bytes: []const u8) std.Io.Writer.Error!void {
+        self.out.appendSlice(std.testing.allocator, bytes) catch return error.WriteFailed;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *LentSink = @alignCast(@fieldParentPtr("interface", w));
+        self.drains += 1;
+        try self.put(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try self.put(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| try self.put(last);
+        n += last.len * splat;
+        self.gathered += n;
+        return n;
+    }
+};
+
+/// One response for the promotion tests: `prepare` is the handler, which
+/// writes a body of `n` bytes.
+const LentCase = struct {
+    prepare: *const fn (*Response, usize) anyerror!void,
+    n: usize = 0,
+    head: bool = false,
+};
+
+/// Runs `case` on a connection that takes its write buffers from `pool`
+/// (none: no promotion), as the server does: write, then the buffer back
+/// between requests, then `deinit`. True when the body went out from the
+/// buffer it was promoted into.
+fn lentRun(pool: ?*RequestBuffersPool, case: LentCase, sink: *LentSink) !bool {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&sink.interface);
+    connection.write_pool = pool;
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    defer response.deinit();
+    response.io = std.testing.io;
+    response.head = case.head;
+    try case.prepare(&response, case.n);
+    const lent = response._lent;
+    try response.write();
+    // Handed over: the connection's writer holds the buffer the body was
+    // promoted into, and the body is still the promoted one (a compressed
+    // body gave it back, and the connection may have taken it again).
+    const first = response.body_buffer.segments.first;
+    const handed = lent != null and connection.write_held == lent and
+        first != null and BodyBuffer.Segment.fromNode(first.?).data != null;
+    connection.releaseWriteBuffer();
+    return handed;
+}
+
+/// `case` with and without a write pool: the same bytes either way.
+/// Returns whether the body was promoted and went out from there.
+fn expectLentSame(pool: *RequestBuffersPool, case: LentCase) !bool {
+    var base: LentSink = .init();
+    defer base.deinit();
+    try std.testing.expect(!try lentRun(null, case, &base));
+    var sink: LentSink = .init();
+    defer sink.deinit();
+    const handed = try lentRun(pool, case, &sink);
+    try std.testing.expectEqualStrings(base.out.items, sink.out.items);
+    if (handed and case.n <= 16384 - Response.head_room) {
+        // Head and body in one write, nothing gathered behind the head.
+        try std.testing.expectEqual(@as(usize, 1), sink.drains);
+        try std.testing.expectEqual(@as(usize, 0), sink.gathered);
+    }
+    return handed;
+}
+
+/// `n` bytes of a pattern, from the response's arena.
+fn lentBytes(res: *Response, n: usize) ![]u8 {
+    const bytes = try res.arena.alloc(u8, n);
+    for (bytes, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i % 26));
+    return bytes;
+}
+
+const lent_prepare = struct {
+    /// Through `writer`, a thousand bytes at a time.
+    fn pieces(res: *Response, n: usize) anyerror!void {
+        const bytes = try lentBytes(res, n);
+        var w = try res.writer();
+        var at: usize = 0;
+        while (at < n) : (at += 1000) try w.interface.writeAll(bytes[at..@min(n, at + 1000)]);
+        try w.end();
+    }
+
+    /// Through `writer`, in one write.
+    fn once(res: *Response, n: usize) anyerror!void {
+        var w = try res.writer();
+        try w.interface.writeAll(try lentBytes(res, n));
+        try w.end();
+    }
+
+    /// `json` of a string, with no writer before it.
+    fn json(res: *Response, n: usize) anyerror!void {
+        try res.json(try lentBytes(res, n));
+    }
+};
+
+/// Whether the body was promoted, on a connection with a write pool;
+/// without one it never is.
+fn expectPromoted(res: *const Response, promoted: bool) !void {
+    try std.testing.expectEqual(promoted and res._conn.?.write_pool != null, res._lent != null);
+}
+
+fn lentFreeWrites(pool: *RequestBuffersPool) usize {
+    var n: usize = 0;
+    for (pool.shards) |shard| n += shard.writes.len;
+    for (pool.locals) |list| n += list.writes.len;
+    return n;
+}
+
+test "Response: a body past its first segment goes out from a write buffer, head in front, in one write" {
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 16384, 256);
+    defer pool.deinit();
+    const room = 16384 - Response.head_room;
+    for ([_]usize{ 0, 1, 512, 513, 8397, room, room + 1, 100 * 1024 }) |n| {
+        // Promoted once past the first segment, if what it holds then fits.
+        const in_pieces = try expectLentSame(&pool, .{ .prepare = lent_prepare.pieces, .n = n });
+        try std.testing.expectEqual(n > 512, in_pieces);
+        const at_once = try expectLentSame(&pool, .{ .prepare = lent_prepare.once, .n = n });
+        try std.testing.expectEqual(n > 512 and n <= room, at_once);
+    }
+    // A first write past 512 bytes into a body with no segment yet.
+    try std.testing.expect(try expectLentSame(&pool, .{ .prepare = lent_prepare.json, .n = 2000 }));
+    try std.testing.expect(!try expectLentSame(&pool, .{ .prepare = lent_prepare.json, .n = 100 }));
+}
+
+test "Response: a rebase that preserves bytes keeps them when the body is promoted" {
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 16384, 256);
+    defer pool.deinit();
+    try std.testing.expect(try expectLentSame(&pool, .{
+        .prepare = struct {
+            fn run(res: *Response, _: usize) anyerror!void {
+                var w = try res.writer();
+                try w.interface.writeAll(try lentBytes(res, 500));
+                // 12 bytes left in the first segment: the rebase promotes.
+                const slice = try w.interface.writableSliceGreedyPreserve(100, 200);
+                try std.testing.expect(slice.len >= 200);
+                @memset(slice[0..200], 'z');
+                w.interface.advance(200);
+                try w.end();
+            }
+        }.run,
+    }));
+}
+
+test "Response: a promoted body's head: its headers, its close, an HTTP/1.0 keep-alive, a Date" {
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 16384, 256);
+    defer pool.deinit();
+    try std.testing.expect(try expectLentSame(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            try lent_prepare.pieces(res, 4096);
+            try res.header("X-One", "1");
+            try res.header("Cache-Control", "no-store");
+            res.content_type = .json;
+            res.keepalive = false;
+        }
+    }.run }));
+    try std.testing.expect(try expectLentSame(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            try lent_prepare.pieces(res, 4096);
+            res.http10 = true;
+        }
+    }.run }));
+
+    // A Date, from the clock: compared by shape, not with a second run.
+    var sink: LentSink = .init();
+    defer sink.deinit();
+    try std.testing.expect(try lentRun(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            res._send_date = true;
+            try lent_prepare.pieces(res, 600);
+        }
+    }.run }, &sink));
+    const sent = sink.out.items;
+    try std.testing.expect(std.mem.startsWith(u8, sent, "HTTP/1.1 200 OK\r\nDate: "));
+    try std.testing.expect(std.mem.indexOf(u8, sent, "\r\nContent-Length: 600\r\n\r\n") != null);
+    try std.testing.expectEqual(@as(u8, 'a' + 599 % 26), sent[sent.len - 1]);
+    try std.testing.expectEqual(@as(usize, 1), sink.drains);
+
+    // A head past the room in front: the body moves up behind it, still
+    // one buffer and one write.
+    try std.testing.expect(try expectLentSame(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            try lent_prepare.pieces(res, 4096);
+            try res.header("X-Long", try lentBytes(res, 600));
+            try expectPromoted(res, true);
+        }
+    }.run }));
+    // One that leaves no room for the body even so: sent the usual way,
+    // the buffer back.
+    try std.testing.expect(!try expectLentSame(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            try lent_prepare.pieces(res, 16384 - Response.head_room);
+            try res.header("X-Long", try lentBytes(res, 600));
+            try expectPromoted(res, true);
+        }
+    }.run }));
+}
+
+test "Response: a HEAD, a 304, a compressed body and a slice body go out as before" {
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 16384, 256);
+    defer pool.deinit();
+    // A HEAD is never promoted: none of its body goes out.
+    try std.testing.expect(!try expectLentSame(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            try lent_prepare.pieces(res, 4096);
+            try expectPromoted(res, false);
+        }
+    }.run, .head = true }));
+    // A 304 set after the body was: promoted, and given back unsent.
+    try std.testing.expect(!try expectLentSame(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            try lent_prepare.pieces(res, 4096);
+            try expectPromoted(res, true);
+            res.status = .not_modified;
+        }
+    }.run }));
+    // Compressed: the promoted body was the input, and goes back then.
+    if (build_options.use_zlib) try std.testing.expect(!try expectLentSame(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            const request = try res.arena.create(Request);
+            request.* = try testGzipRequest(res.arena);
+            res._request = request;
+            res.compress = true;
+            res.content_type = .text;
+            try lent_prepare.pieces(res, 4096);
+            try expectPromoted(res, true);
+        }
+    }.run }));
+    // A slice body is never promoted.
+    try std.testing.expect(!try expectLentSame(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            res.body = try lentBytes(res, 4096);
+        }
+    }.run }));
+    // Nor a stream, chunked or of a declared length.
+    try std.testing.expect(!try expectLentSame(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            var buf: [256]u8 = undefined;
+            var w = try res.stream(&buf);
+            try w.interface.writeAll(try lentBytes(res, 4096));
+            try w.end();
+            try expectPromoted(res, false);
+        }
+    }.run }));
+    try std.testing.expect(!try expectLentSame(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            try res.header("Content-Length", "4096");
+            var buf: [256]u8 = undefined;
+            var w = try res.stream(&buf);
+            try w.interface.writeAll(try lentBytes(res, 4096));
+            try w.end();
+            try expectPromoted(res, false);
+        }
+    }.run }));
+}
+
+test "Response: a body reset after it was promoted" {
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 16384, 256);
+    defer pool.deinit();
+    // Written again through a writer: promoted again, sent from there.
+    try std.testing.expect(try expectLentSame(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            try lent_prepare.pieces(res, 4096);
+            try res.resetBody();
+            res.status = .internal_server_error;
+            try lent_prepare.pieces(res, 700);
+        }
+    }.run }));
+    // Replaced by a short one, past the promoted buffer.
+    try std.testing.expect(!try expectLentSame(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            try lent_prepare.pieces(res, 4096);
+            try res.resetBody();
+            res.status = .internal_server_error;
+            res.body = "oops";
+        }
+    }.run }));
+    // Replaced after it grew past the buffer: the buffer goes back with
+    // it, and the new body is promoted again.
+    try std.testing.expect(try expectLentSame(&pool, .{ .prepare = struct {
+        fn run(res: *Response, _: usize) anyerror!void {
+            try lent_prepare.pieces(res, 20000);
+            try res.resetBody();
+            try lent_prepare.pieces(res, 700);
+        }
+    }.run }));
+}
+
+test "Response: a promoted body that is reset gives its buffer back, unless a writer it was abandoned with may still write into it" {
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 16384, 256);
+    defer pool.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var sink: LentSink = .init();
+    defer sink.deinit();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&sink.interface);
+    connection.write_pool = &pool;
+
+    // Reset, then streamed: only the stream's buffer is held while it runs.
+    {
+        var response = try Response._init(arena.allocator(), &connection, 32);
+        defer response.deinit();
+        try lent_prepare.pieces(&response, 4096);
+        try std.testing.expect(response._lent != null);
+        const free = lentFreeWrites(&pool);
+        try response.resetBody();
+        try std.testing.expect(response._lent == null);
+        try std.testing.expectEqual(free + 1, lentFreeWrites(&pool));
+        var buf: [256]u8 = undefined;
+        var w = try response.stream(&buf);
+        try w.interface.writeAll("streamed");
+        try std.testing.expectEqual(free, lentFreeWrites(&pool));
+        try w.end();
+        try response.write();
+        connection.releaseWriteBuffer();
+        try std.testing.expect(std.mem.endsWith(u8, sink.out.items, "8\r\nstreamed\r\n0\r\n\r\n"));
+    }
+
+    // Reset with its writer still open: kept until `deinit`, and the new
+    // body goes out the usual way.
+    {
+        var response = try Response._init(arena.allocator(), &connection, 32);
+        var w = try response.writer();
+        try w.interface.writeAll(try lentBytes(&response, 4096));
+        try std.testing.expect(response._lent != null);
+        const free = lentFreeWrites(&pool);
+        try response.resetBody();
+        try std.testing.expect(response._lent != null);
+        response.body = "oops";
+        try response.write();
+        connection.releaseWriteBuffer();
+        try std.testing.expect(std.mem.endsWith(u8, sink.out.items, "Content-Length: 4\r\n\r\noops"));
+        // The connection's buffer is back, the promoted one not yet.
+        try std.testing.expectEqual(free + 1, lentFreeWrites(&pool));
+        try std.testing.expect(response._lent != null);
+        response.deinit();
+        try std.testing.expectEqual(free + 2, lentFreeWrites(&pool));
+    }
+}
+
+test "Response: a promoted body never written goes back at deinit" {
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 16384, 256);
+    defer pool.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var sink: LentSink = .init();
+    defer sink.deinit();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&sink.interface);
+    connection.write_pool = &pool;
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    const free = lentFreeWrites(&pool);
+    try lent_prepare.pieces(&response, 4096);
+    try std.testing.expect(response._lent != null);
+    // As for a handler that failed: no `write`.
+    response.deinit();
+    try std.testing.expect(response._lent == null);
+    try std.testing.expectEqual(free + 1, lentFreeWrites(&pool));
+    try std.testing.expectEqual(@as(usize, 0), sink.out.items.len);
+}
+
+test "Response: a corked promoted response goes out with the next one, and corked bytes keep the next body unpromoted" {
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 16384, 256);
+    defer pool.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var sink: LentSink = .init();
+    defer sink.deinit();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&sink.interface);
+    connection.write_pool = &pool;
+
+    var first = try Response._init(arena.allocator(), &connection, 32);
+    defer first.deinit();
+    try lent_prepare.pieces(&first, 2000);
+    const lent = first._lent orelse return error.TestUnexpectedResult;
+    first._cork = true;
+    try first.write();
+    try std.testing.expectEqual(@as(usize, 0), sink.drains);
+    try std.testing.expectEqual(lent, connection.write_held.?);
+
+    // The connection holds the first: the second is not promoted, and goes
+    // out behind it.
+    var second = try Response._init(arena.allocator(), &connection, 32);
+    defer second.deinit();
+    try lent_prepare.pieces(&second, 1000);
+    try std.testing.expect(second._lent == null);
+    try second.write();
+    try std.testing.expectEqual(@as(usize, 1), sink.drains);
+    connection.releaseWriteBuffer();
+
+    const sent = sink.out.items;
+    const one = std.mem.indexOf(u8, sent, "Content-Length: 2000\r\n\r\nabc") orelse return error.TestUnexpectedResult;
+    const two = std.mem.indexOf(u8, sent, "Content-Length: 1000\r\n\r\nabc") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(one < two);
+    try std.testing.expectEqual(2 * "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n".len + 3000, sent.len);
 }
 
 test "Response: write() only writes once" {
@@ -4452,7 +5161,11 @@ test "compress: a large gzipped body takes arena room for its compressed size on
 
     // Contiguous, then in segments (gathered first with libdeflate).
     for ([_]usize{ body.len, 3000 }) |piece| {
+        // Initialized: a body past its first segment reads the connection
+        // (`promote`).
+        var conn_writer: std.Io.Writer = .fixed(&.{});
         var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
         var request = try testGzipRequest(arena.allocator());
         var response = try Response._init(arena.allocator(), &connection, 8);
         defer response.deinit();
@@ -4497,7 +5210,9 @@ test "compress: a body that would not shrink goes out as it is" {
     var prng: std.Random.DefaultPrng = .init(3);
     prng.random().bytes(&noise);
 
+    var conn_writer: std.Io.Writer = .fixed(&.{});
     var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
     var request = try testGzipRequest(arena.allocator());
     var response = try Response._init(arena.allocator(), &connection, 8);
     defer response.deinit();

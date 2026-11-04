@@ -955,3 +955,39 @@ test "metrics: [stress] scrapes racing registration and new series read as the t
     try group.await(io);
     try std.testing.expectEqual(@as(u32, 0), m.failures.load(.monotonic));
 }
+
+test "observe: the WebSocket admission gate's series render from a server's state" {
+    const gpa = std.testing.allocator;
+    var registry = observe.metrics.Registry.init(gpa, std.testing.io);
+    defer registry.deinit();
+    var rows = [_]dusty.admission.Row{ .{}, .{} };
+    rows[1].util_permille.store(870, .monotonic);
+    rows[1].hot.store(true, .monotonic);
+    rows[1].source.store(.task_clock, .monotonic);
+    var state: dusty.admission.State = .{ .rows = &rows };
+    _ = state.reserve();
+    state.freezeForTest(1);
+    _ = state.reserve();
+    @import("runtime.zig").refreshAdmission(&registry, &state);
+
+    var out: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&out);
+    try registry.render(&w);
+    const text = w.buffered();
+    for ([_][]const u8{
+        "anole_executor_utilization_permille{executor=\"1\"} 870",
+        "anole_executor_hot{executor=\"1\"} 1",
+        "anole_executor_hot{executor=\"0\"} 0",
+        "anole_admission_signal{executor=\"1\",source=\"task_clock\"} 1",
+        "anole_admission_signal{executor=\"0\",source=\"none\"} 1",
+        "anole_websockets_admitted 1",
+        "anole_websockets_limit 1",
+        "anole_ws_upgrades_refused_total{reason=\"load\"} 1",
+        "anole_ws_upgrades_refused_total{reason=\"cap\"} 0",
+    }) |line| {
+        if (std.mem.indexOf(u8, text, line) == null) {
+            std.debug.print("missing: {s}\n{s}\n", .{ line, text });
+            return error.TestExpectedEqual;
+        }
+    }
+}

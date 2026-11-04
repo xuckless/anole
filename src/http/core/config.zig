@@ -7,6 +7,7 @@ const ContentType = @import("http.zig").ContentType;
 const HttpRequest = @import("request.zig").Request;
 const HttpResponse = @import("response.zig").Response;
 const proxy_protocol = @import("proxy_protocol.zig");
+pub const admission = @import("admission.zig");
 
 /// How the server's own error answers (a 404, a 500, `Response.fail`) are
 /// written. `ServerConfig.errors`.
@@ -283,9 +284,19 @@ pub const ServerConfig = struct {
     /// for as long as it is open with `request.keep_buffers_between_requests`
     /// on, of which an ordinary request touches one page; and
     /// `response.write_buffer_size` more while its response is being
-    /// written. A request with a body with a `Content-Encoding` takes 70K
+    /// written, or from when a buffered body grows past 512 bytes, so a
+    /// handler that writes such a body and then waits holds it while it
+    /// waits. A request with a body with a `Content-Encoding` takes 70K
     /// more while `request.decompress` is on.
     max_connections: ?u32 = max_connections_from_fd_limit,
+    /// How many WebSockets may be open at once, over every protocol; past
+    /// it an upgrade is answered 503 with `Retry-After`, before the
+    /// handshake. Null: no cap (the load gate, `admission`, still applies).
+    max_websockets: ?u32 = null,
+    /// The WebSocket admission gate: while an executor is overloaded, the
+    /// number of open WebSockets is held where it was, and an upgrade past
+    /// it gets 503 with `Retry-After` (see `admission.Config`).
+    admission: admission.Config = .{},
     /// How the server's own error answers are written: a 404, a 405, the
     /// status an error maps to, `Response.fail`. See `ErrorFormat`.
     errors: ErrorFormat = .auto,
@@ -526,6 +537,9 @@ pub const ServerConfig = struct {
         /// The largest WebSocket message, in or out (after inflating): what
         /// `anole.websocket.UpgradeOptions.max_message_size` falls back on.
         ws_max_message: usize = 1024 * 1024,
+        /// Internal: the server's WebSocket admission state, set when it
+        /// starts serving (`Server.prepareStatic`). Null never refuses.
+        _admission: ?*admission.State = null,
     };
 
     /// `ServerConfig.response`.
@@ -535,7 +549,10 @@ pub const ServerConfig = struct {
         /// in one write; a streamed chunk, an event or a WebSocket frame is
         /// assembled in it and sent as it is finished. Taken from a pool at
         /// the response's first write, and given back once it is out, so a
-        /// request still waiting to answer holds none. Must not be 0.
+        /// request still waiting to answer holds none. A buffered body moves
+        /// into it once it grows past 512 bytes (when it fits, with 512 bytes
+        /// in front for the head), so a handler that writes such a body and
+        /// then waits holds it while it waits. Must not be 0.
         ///
         /// 16K is the most a TLS record carries, so under TLS a smaller
         /// buffer sends what passes through it, a file or a body written in

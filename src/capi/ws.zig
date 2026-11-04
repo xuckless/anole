@@ -272,6 +272,26 @@ fn serveAccepted(route: *const Route, req: *dusty.Request, res: *dusty.Response,
     }
     // Decided natively, before the consumer hears of it.
     if (!origin.allowed(req, route.ws.?.allowed_origins)) return error.Forbidden;
+    // The server's admission gate (#129), once for the whole upgrade: the
+    // consumer never hears of a refused one. `openSocket` sees the unit
+    // held and moves it onto the socket; on every other way out it goes
+    // back here.
+    const adm = req._config._admission;
+    var took = false;
+    if (adm) |a| switch (req._ws_admission) {
+        .none => {
+            if (a.reserve()) |_| return websocket.overloaded(req, res, a);
+            req._ws_admission = .held;
+            took = true;
+        },
+        // Refused once (a handler trying again): refused again, uncounted.
+        .refused => return error.ServiceUnavailable,
+        .held, .moved => {},
+    };
+    defer if (took and req._ws_admission == .held) {
+        adm.?.unreserve();
+        req._ws_admission = .none;
+    };
     const slot = x.ws.reserve(x, route) catch {
         res.fail(.service_unavailable, "too many WebSockets");
         return;

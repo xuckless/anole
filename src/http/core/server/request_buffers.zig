@@ -17,7 +17,9 @@
 //! is not in the set at all. A request takes one from a pool of their own
 //! at its first write (`RequestBuffers.writeBuffer`) and gives it back once
 //! its response is out, so a request that waits before it answers (a
-//! handler sleeping on a timer, a database) holds none.
+//! handler sleeping on a timer, a database) holds none. A buffered body
+//! that grows past 512 bytes takes it then (`Response.promote`), so a
+//! handler that writes such a body and then waits holds it while it waits.
 //!
 //! A free list keeps what a burst left it only for a while: `trimLocal`
 //! and `trimShards`, run on a timer, give back the sets (and free the write

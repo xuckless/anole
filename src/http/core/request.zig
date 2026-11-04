@@ -158,6 +158,14 @@ pub const Request = struct {
     /// unused.
     _body_source: ?BodySource = null,
     _config: ServerConfig.Request = .{},
+    /// This request's unit of the server's WebSocket admission count
+    /// (`_config._admission`): `held` from the upgrade's `reserve` until it
+    /// moves onto the socket (`moved`), or is given back by whoever took it;
+    /// `refused` when the gate answered 503 (logged at debug, not as a
+    /// handler error: shedding load is the server's choice). Taken once per
+    /// upgrade, so a path that gates early (the C ABI's accepted upgrades)
+    /// isn't gated twice.
+    _ws_admission: _WsAdmission = .none,
     _body: ?[]const u8 = null,
     _body_read: bool = false,
     // Set up on the first body read that calls for decoding, and kept so a
@@ -182,6 +190,8 @@ pub const Request = struct {
     // 100-continue support
     _response: ?*Response = null,
     _expects_continue: bool = false,
+
+    pub const _WsAdmission = enum { none, held, moved, refused };
 
     /// The host the client asked for: `X-Forwarded-Host` from a trusted
     /// proxy, else `Host` (which HTTP/2's `:authority` fills).

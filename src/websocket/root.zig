@@ -84,7 +84,9 @@ pub const Origins = origin.Origins;
 pub const WebSocket = dusty.WebSocket;
 /// A message from `Socket.receive` or `Socket.next`: its `type`, its
 /// `data`, and for a close its `close_code`. `data` is valid until the
-/// next `receive` or `next`; copy what must outlive it.
+/// next `receive` or `next`, and may point into the connection's read
+/// buffer: copy what must outlive it or go to another task (Debug builds
+/// overwrite it with 0xDD at the next read).
 pub const Message = WebSocket.Message;
 /// `.text`, `.binary`, `.close`, `.ping` or `.pong` (and `.continuation`,
 /// which `receive` never returns).
@@ -277,6 +279,9 @@ pub const Socket = struct {
     /// Counted in the open-WebSocket gauge of `_http_version` (sockets
     /// `upgrade` opened; `deinit` takes it off).
     _gauged: bool = false,
+    /// The server's admission count this socket holds a unit of; `deinit`
+    /// gives it back.
+    _admission: ?*dusty.admission.State = null,
     /// The application's, for state it keeps per socket: a callback socket
     /// (`callbacks`) sets it in `open` and frees what it points at in
     /// `close`. See `contextAs`.
@@ -333,7 +338,12 @@ pub const Socket = struct {
     /// than through a call for each layer, which costs an echo loop about a
     /// tenth of its CPU.
     pub fn receive(self: *Socket) !Message {
-        if (self._read.conn != null) self._read.between(self._conn.h1.transport.reader);
+        if (self._read.conn != null) {
+            // The last messages' bytes read 0xDD before a window change
+            // can take their buffer (`WebSocket.poisonLent`).
+            self._conn.h1.poisonLent();
+            self._read.between(self._conn.h1.transport.reader);
+        }
         return @call(.always_inline, finishMessage, .{ self, switch (self._conn) {
             inline else => |ws| try @call(.always_inline, @TypeOf(ws.*).receive, .{ws}),
         } });
@@ -478,9 +488,16 @@ pub const Socket = struct {
             self._gauged = false;
             dusty.gauges.add(self.io, gaugeOf(self._http_version), -1);
         }
+        if (self._admission) |a| {
+            self._admission = null;
+            a.release();
+        }
         if (self._drain_watch) |w| w.stop();
         if (comptime features.compression) if (self._deflate) |d| d.deinit();
-        if (self._read.conn != null) self._read.release(self._conn.h1.transport.reader);
+        if (self._read.conn != null) {
+            self._conn.h1.poisonLent();
+            self._read.release(self._conn.h1.transport.reader);
+        }
         switch (self._conn) {
             inline else => |ws| ws.deinit(),
         }
@@ -585,6 +602,27 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
     for (options.subprotocols) |sp| if (!isToken(sp)) return error.InvalidSubprotocol;
     for (options.headers) |h| if (!handshakeHeaderAllowed(h.name)) return error.InvalidHeaderName;
 
+    // Admission (#129): one unit of the server's WebSocket count, before
+    // anything is allocated or answered. Taken here unless a caller took
+    // it already (the C ABI's accepted upgrades); given back below unless
+    // it moves onto the socket.
+    const adm = req._config._admission;
+    var took = false;
+    if (adm) |a| switch (req._ws_admission) {
+        .none => {
+            if (a.reserve()) |_| return overloaded(req, res, a);
+            req._ws_admission = .held;
+            took = true;
+        },
+        // Refused once (a handler trying again): refused again, uncounted.
+        .refused => return error.ServiceUnavailable,
+        .held, .moved => {},
+    };
+    defer if (took and req._ws_admission == .held) {
+        adm.?.unreserve();
+        req._ws_admission = .none;
+    };
+
     // What lives as long as the socket.
     const alloc = if (h2) req.arena else owner orelse req.arena;
 
@@ -677,7 +715,26 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
     };
     socket._gauged = true;
     dusty.gauges.add(req.io, gaugeOf(socket._http_version), 1);
+    if (req._ws_admission == .held) {
+        socket._admission = adm;
+        req._ws_admission = .moved;
+    }
     return socket;
+}
+
+/// The answer to an upgrade the admission gate refused (over
+/// `max_websockets`, or the count frozen under load): 503 with a jittered
+/// `Retry-After`, before any WebSocket state. Over HTTP/1.1 the connection
+/// closes after it, so the client's retry starts afresh; over HTTP/2 and
+/// HTTP/3 the extended CONNECT's stream ends with it and the connection
+/// stays (RFC 8441 §5, RFC 9220).
+pub noinline fn overloaded(req: *dusty.Request, res: *dusty.Response, a: *dusty.admission.State) error{ServiceUnavailable} {
+    var buf: [8]u8 = undefined;
+    const secs = std.fmt.bufPrint(&buf, "{d}", .{a.retryAfter(req.io)}) catch unreachable;
+    if (req.arena.dupe(u8, secs)) |v| res.header("Retry-After", v) catch {} else |_| {}
+    if (req.version_major < 2) res.keepalive = false;
+    req._ws_admission = .refused;
+    return error.ServiceUnavailable;
 }
 
 fn gaugeOf(v: HttpVersion) dusty.gauges.Kind {
@@ -932,6 +989,8 @@ const H1Callbacks = struct {
         // close, a failed read or callback, and a cancel alike.
         defer window.release(ws.transport.reader);
         while (true) {
+            // As `Socket.receive`: before the window may move to a block.
+            ws.poisonLent();
             window.adapt(ws.transport.reader);
             const started = self.socket.receiveStarted() catch |err| return self.finish(err);
             const msg = started orelse {
@@ -1245,7 +1304,7 @@ const read_blocks = struct {
         const b: []u8 = if (free_len > 0) blk: {
             free_len -= 1;
             break :blk free[free_len][0..read_block_len];
-        } else safety.process_gpa.alloc(u8, read_block_len) catch return null;
+        } else safety.allocUninit(safety.process_gpa, read_block_len) catch return null;
         _ = held.fetchAdd(1, .monotonic);
         return b;
     }
@@ -1261,7 +1320,10 @@ const read_blocks = struct {
             free_len += 1;
             return;
         }
-        safety.process_gpa.free(b);
+        // rawFree, not `free`: `free` fills the block with `undefined`
+        // first, 0xAA in ReleaseSafe, and process_gpa is Zig code, so the
+        // store isn't dropped as dead (C1). Poisoned above anyway.
+        safety.process_gpa.rawFree(b, .@"1", @returnAddress());
     }
 };
 
@@ -1875,6 +1937,7 @@ pub const Rooms = struct {
 test {
     _ = @import("rooms_test.zig");
     _ = @import("h1_test.zig");
+    _ = @import("admission_test.zig");
     // About parked callback sockets; idle parking is off on Windows.
     if (@import("builtin").os.tag != .windows) _ = @import("callbacks_test.zig");
     _ = @import("h2_fuzz_test.zig");
@@ -1896,6 +1959,22 @@ fn testHandshake(a: std.mem.Allocator) !dusty.Request {
     try req.headers.add("Sec-WebSocket-Protocol", "b ,  a,,\tc");
     try req.headers.add("sec-websocket-protocol", "d");
     return req;
+}
+
+test "websocket: a read block from an empty pool is new, poisoned in test builds, and counted while held" {
+    // This thread's pool, emptied, so `take` allocates (`allocUninit`).
+    var kept: [read_blocks.cap][]u8 = undefined;
+    var kept_len: usize = 0;
+    while (read_blocks.free_len > 0) : (kept_len += 1) kept[kept_len] = read_blocks.take().?;
+    defer for (kept[0..kept_len]) |b| read_blocks.give(b);
+
+    const held = _readBlocksHeld();
+    const b = read_blocks.take().?;
+    try std.testing.expectEqual(read_block_len, b.len);
+    for (b) |byte| try std.testing.expectEqual(safety.poison_byte, byte);
+    try std.testing.expectEqual(held + 1, _readBlocksHeld());
+    read_blocks.give(b);
+    try std.testing.expectEqual(held, _readBlocksHeld());
 }
 
 test "websocket: isUpgrade accepts a version-13 GET, or an extended CONNECT with :protocol websocket, and nothing else" {
