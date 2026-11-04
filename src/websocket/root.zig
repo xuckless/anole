@@ -1245,7 +1245,7 @@ const read_blocks = struct {
         const b: []u8 = if (free_len > 0) blk: {
             free_len -= 1;
             break :blk free[free_len][0..read_block_len];
-        } else safety.process_gpa.alloc(u8, read_block_len) catch return null;
+        } else safety.allocUninit(safety.process_gpa, read_block_len) catch return null;
         _ = held.fetchAdd(1, .monotonic);
         return b;
     }
@@ -1896,6 +1896,22 @@ fn testHandshake(a: std.mem.Allocator) !dusty.Request {
     try req.headers.add("Sec-WebSocket-Protocol", "b ,  a,,\tc");
     try req.headers.add("sec-websocket-protocol", "d");
     return req;
+}
+
+test "websocket: a read block from an empty pool is new, poisoned in test builds, and counted while held" {
+    // This thread's pool, emptied, so `take` allocates (`allocUninit`).
+    var kept: [read_blocks.cap][]u8 = undefined;
+    var kept_len: usize = 0;
+    while (read_blocks.free_len > 0) : (kept_len += 1) kept[kept_len] = read_blocks.take().?;
+    defer for (kept[0..kept_len]) |b| read_blocks.give(b);
+
+    const held = _readBlocksHeld();
+    const b = read_blocks.take().?;
+    try std.testing.expectEqual(read_block_len, b.len);
+    for (b) |byte| try std.testing.expectEqual(safety.poison_byte, byte);
+    try std.testing.expectEqual(held + 1, _readBlocksHeld());
+    read_blocks.give(b);
+    try std.testing.expectEqual(held, _readBlocksHeld());
 }
 
 test "websocket: isUpgrade accepts a version-13 GET, or an extended CONNECT with :protocol websocket, and nothing else" {

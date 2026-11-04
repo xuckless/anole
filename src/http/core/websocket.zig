@@ -5,6 +5,7 @@
 const std = @import("std");
 const Transport = @import("transport.zig").Transport;
 const placement = @import("placement.zig");
+const safety = @import("anole_safety");
 
 const log = std.log.scoped(.anole);
 
@@ -743,7 +744,7 @@ pub const WebSocket = struct {
         const payload = if (is_control)
             self.control_payload[0..@intCast(payload_len)]
         else
-            try self.msg_arena.allocator().alloc(u8, @intCast(payload_len));
+            try safety.allocUninit(self.msg_arena.allocator(), @intCast(payload_len));
         try self.transport.reader.readSliceAll(payload);
 
         if (masked) applyMask(payload, mask_key);
@@ -2101,6 +2102,179 @@ test "WebSocket: a long payload masked by the client reads back on the server" {
     defer server.deinit();
     const msg = try server.receive();
     try std.testing.expectEqualSlices(u8, &payload, msg.data);
+}
+
+test "WebSocket: a payload read into uninitialized memory is exactly the bytes sent" {
+    // 300 bytes: a 16-bit length, and a multiple of neither 4 nor 16, so
+    // the mask's tail and the vector loop's both run.
+    const gpa = std.testing.allocator;
+    var payload: [300]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var none: std.Io.Reader = .fixed("");
+    var client = WebSocket.init(std.testing.io, .{ .writer = &w, .reader = &none }, gpa, 5);
+    defer client.deinit();
+    client.is_client = true;
+    try client.send(.binary, &payload);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var out: [16]u8 = undefined;
+    var ow: std.Io.Writer = .fixed(&out);
+    var server = WebSocket.init(std.testing.io, .{ .writer = &ow, .reader = &r }, gpa, 6);
+    defer server.deinit();
+    const msg = try server.receive();
+    try std.testing.expectEqual(.binary, msg.type);
+    try std.testing.expectEqualSlices(u8, &payload, msg.data);
+}
+
+test "WebSocket: empty text and binary messages arrive empty, from receive and receiveMany" {
+    const frames = maskedFrame(0x1, "") ++ maskedFrame(0x2, "");
+    var reader: std.Io.Reader = undefined;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+    const text = try ws.receive();
+    try std.testing.expectEqual(.text, text.type);
+    try std.testing.expectEqual(0, text.data.len);
+    const binary = try ws.receive();
+    try std.testing.expectEqual(.binary, binary.type);
+    try std.testing.expectEqual(0, binary.data.len);
+
+    var reader2: std.Io.Reader = undefined;
+    var ws2 = serverSocketOver(&frames, &reader2, &out);
+    defer ws2.deinit();
+    const msgs = try ws2.receiveMany();
+    try std.testing.expectEqual(2, msgs.len);
+    try std.testing.expectEqual(.text, msgs[0].type);
+    try std.testing.expectEqual(0, msgs[0].data.len);
+    try std.testing.expectEqual(.binary, msgs[1].type);
+    try std.testing.expectEqual(0, msgs[1].data.len);
+}
+
+test "WebSocket: a payload cut short by the end of the stream is an error, not a short message" {
+    // Masked with a zero key; the header claims 10 bytes, 4 arrive.
+    var reader: std.Io.Reader = undefined;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var ws = serverSocketOver(&.{ 0x82, 0x8A, 0, 0, 0, 0, 1, 2, 3, 4 }, &reader, &out);
+    defer ws.deinit();
+    try std.testing.expectError(error.EndOfStream, ws.receive());
+    try std.testing.expectEqual(0, out.buffered().len);
+}
+
+/// Counts the calls that reach the allocator under it.
+const CallCounter = struct {
+    inner: std.mem.Allocator,
+    allocs: usize = 0,
+    resizes: usize = 0,
+    remaps: usize = 0,
+    frees: usize = 0,
+
+    fn allocator(self: *CallCounter) std.mem.Allocator {
+        return .{ .ptr = safety.toCtx(self), .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self = safety.fromCtx(CallCounter, ctx);
+        self.allocs += 1;
+        return self.inner.rawAlloc(len, alignment, ra);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self = safety.fromCtx(CallCounter, ctx);
+        self.resizes += 1;
+        return self.inner.rawResize(memory, alignment, new_len, ra);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self = safety.fromCtx(CallCounter, ctx);
+        self.remaps += 1;
+        return self.inner.rawRemap(memory, alignment, new_len, ra);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self = safety.fromCtx(CallCounter, ctx);
+        self.frees += 1;
+        self.inner.rawFree(memory, alignment, ra);
+    }
+
+    fn calls(self: *const CallCounter) usize {
+        return self.allocs + self.resizes + self.remaps + self.frees;
+    }
+};
+
+/// The relay clip's message sizes (research/s2/tier2/relay-lane.md P6):
+/// a keyframe, then per cycle 59 video and audio frames and a keyframe.
+/// With `big_only`, only the messages over a 16,896-byte read block.
+const ClipModel = struct {
+    const keyframe = 93_600;
+    const video = 15_800;
+    const audio = 190;
+    const cycles = 4;
+
+    /// Reads the clip's messages through `arena` as `resetMessages` does,
+    /// and reports the counter's calls and `measured`'s capacity after each
+    /// keyframe cycle.
+    fn run(arena: *std.heap.ArenaAllocator, measured: *const std.heap.ArenaAllocator, counter: *const CallCounter, big_only: bool, calls: *[cycles + 1]usize, capacity: *[cycles + 1]usize) !void {
+        try message(arena, keyframe);
+        calls[0] = counter.calls();
+        capacity[0] = measured.queryCapacity();
+        for (1..cycles + 1) |c| {
+            if (!big_only) for (0..59) |_| {
+                try message(arena, video);
+                try message(arena, audio);
+            };
+            try message(arena, keyframe);
+            calls[c] = counter.calls();
+            capacity[c] = measured.queryCapacity();
+        }
+    }
+
+    fn message(arena: *std.heap.ArenaAllocator, len: usize) !void {
+        const payload = try safety.allocUninit(arena.allocator(), len);
+        @memset(payload, 0x5C);
+        _ = arena.reset(.{ .retain_with_limit = WebSocket.retained_message_max });
+    }
+};
+
+test "WebSocket: the message arena's calls to its allocator over the relay clip" {
+    for ([_]bool{ false, true }) |big_only| {
+        var calls: [ClipModel.cycles + 1]usize = undefined;
+        var capacity: [ClipModel.cycles + 1]usize = undefined;
+
+        // (a) Straight over the allocator: a keyframe outgrows the retained
+        // 64 KiB, so every cycle reaches the allocator again (an alloc, a
+        // free and a resize per keyframe, 2026-11-04).
+        var counter: CallCounter = .{ .inner = std.testing.allocator };
+        {
+            var arena: std.heap.ArenaAllocator = .init(counter.allocator());
+            defer arena.deinit();
+            try ClipModel.run(&arena, &arena, &counter, big_only, &calls, &capacity);
+        }
+        for (1..ClipModel.cycles + 1) |c| {
+            try std.testing.expect(calls[c] >= calls[c - 1] + 2);
+            try std.testing.expect(capacity[c] <= WebSocket.retained_message_max);
+        }
+        try std.testing.expect(counter.allocs >= ClipModel.cycles + 1);
+        try std.testing.expect(counter.frees >= ClipModel.cycles);
+
+        // (b) Over another arena (a socket from `Response.upgrade`, whose
+        // arena is the request's).
+        var counter_b: CallCounter = .{ .inner = std.testing.allocator };
+        var outer: std.heap.ArenaAllocator = .init(counter_b.allocator());
+        defer outer.deinit();
+        var outer_capacity: [ClipModel.cycles + 1]usize = undefined;
+        {
+            var arena: std.heap.ArenaAllocator = .init(outer.allocator());
+            defer arena.deinit();
+            try ClipModel.run(&arena, &outer, &counter_b, big_only, &calls, &outer_capacity);
+        }
+        // The inner arena's nodes come and go at the outer one's end, which
+        // rolls back: after its high water the allocator sees nothing more.
+        for (2..ClipModel.cycles + 1) |c| {
+            try std.testing.expectEqual(calls[1], calls[c]);
+            try std.testing.expectEqual(outer_capacity[1], outer_capacity[c]);
+        }
+    }
 }
 
 test "WebSocket: the answers to what receiveMany returns leave in one write" {

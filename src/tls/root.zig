@@ -84,6 +84,10 @@ test "TLS: a burst of small writes in flight reuses pooled buffers" {
     try dusty_tls.buf_checks.burst();
 }
 
+test "TLS: rounds of blocks in flight miss the pool only past its cap" {
+    try dusty_tls.buf_checks.blockMisses();
+}
+
 /// A certificate and private key as PEM text, owned by the allocator that
 /// made them.
 pub const Pem = struct {
