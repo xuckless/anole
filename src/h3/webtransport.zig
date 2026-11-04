@@ -1137,6 +1137,11 @@ pub const Session = struct {
         pub fn testReset(s: *Session, id: i64) void {
             s.testReset(id);
         }
+        /// Tests only: how many peer streams (`.bidi` or `.uni`) and how
+        /// many datagrams wait to be taken.
+        pub fn testQueued(s: *Session, what: Session.QueuedKind) usize {
+            return s.testQueued(what);
+        }
     };
 
     /// The next stream the peer opened, if any: both ways (`.bidi`) or
@@ -1272,6 +1277,19 @@ pub const Session = struct {
         s.enqueue();
         core.host.kick();
         return id;
+    }
+
+    const QueuedKind = enum { bidi, uni, datagrams };
+
+    fn testQueued(self: *Session, what: QueuedKind) usize {
+        if (!@import("builtin").is_test) @compileError("tests only");
+        self.core.host.lock();
+        defer self.core.host.unlock();
+        return switch (what) {
+            .bidi => self.incoming_bidi.len,
+            .uni => self.incoming_uni.len,
+            .datagrams => self.datagrams_in.len,
+        };
     }
 
     /// Tests only: resets a `testOpenRaw` stream's sending side.

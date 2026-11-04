@@ -166,6 +166,7 @@ const Fixture = struct {
         errdefer http.deinit();
         http.router.get("/wt", webtransport.route(void, echoSession, .{}));
         http.router.get("/ignore", webtransport.route(void, ignoreStreams, .{}));
+        http.router.get("/accept-order", webtransport.route(void, acceptOrderSession, .{}));
         http.router.get("/push", webtransport.route(void, pushSession, .{}));
         http.router.get("/bulk", webtransport.route(void, bulkSession, .{}));
         http.router.get("/herd", webtransport.route(void, herdSession, .{}));
@@ -320,7 +321,7 @@ test "WebTransport: datagrams keep their order with 1, 16 and 256 queued at once
 
     try echoNumbered(session, 1, 1);
     try echoNumbered(session, 16, 16);
-    try echoNumbered(session, 256, 128);
+    try echoNumbered(session, 256, 256);
 }
 
 test "WebTransport: datagram queues wrap around, sending three and reading two per round" {
@@ -358,7 +359,7 @@ test "WebTransport: datagram queues wrap around, sending three and reading two p
     }
 }
 
-test "WebTransport: a connection torn down with datagrams unread frees them" {
+test "WebTransport: a session closed with echoed datagrams unread frees them" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
@@ -367,14 +368,95 @@ test "WebTransport: a connection torn down with datagrams unread frees them" {
     defer f.stop(gpa, io);
     const conn = try f.connect(gpa, io);
     const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/wt", .origin = "https://localhost" });
-    // More than the queue limit, never read: what is still queued when the
-    // connection goes (out, or echoed back to us) must be freed.
-    for (0..300) |i| {
+    // Echoed back and never read: the session's datagrams_in queue is full
+    // of them when it goes. (The connection's outbound queue is drained by
+    // the endpoint as fast as it fills, so its teardown free is not reached
+    // here.)
+    const count = 64;
+    for (0..count) |i| {
         var msg: [16]u8 = undefined;
         try session.sendDatagram(try std.fmt.bufPrint(&msg, "dg-{d}", .{i}));
     }
+    const Queued = struct {
+        session: *wt.Session,
+        fn all(q: @This()) bool {
+            return wt.Session.Driver.testQueued(q.session, .datagrams) == count;
+        }
+    };
+    try wait.waitUntil(io, "all the echoes queued at the client", Queued{ .session = session }, Queued.all);
     session.deinit();
     conn.close();
+}
+
+/// Set by acceptOrderSession: bit 0 when it took its bidirectional streams
+/// in the order they were opened, bit 1 for the unidirectional ones, bit 2
+/// when it finished.
+var accept_order: std.atomic.Value(u32) = .init(0);
+
+/// Waits until the peer's three bidirectional and three unidirectional
+/// streams are all queued, then accepts them and checks their first bytes.
+fn acceptOrderSession(session: *wt.Session, req: *dusty.Request) !void {
+    const Queued = struct {
+        session: *wt.Session,
+        fn all(q: @This()) bool {
+            return wt.Session.Driver.testQueued(q.session, .bidi) == 3 and
+                wt.Session.Driver.testQueued(q.session, .uni) == 3;
+        }
+    };
+    try wait.waitUntil(req.io, "six peer streams queued", Queued{ .session = session }, Queued.all);
+    var bits: u32 = 0;
+    var ok = true;
+    for (0..3) |i| {
+        const s = try session.acceptStream();
+        defer s.release();
+        if ((try s.reader().takeByte()) != '0' + @as(u8, @intCast(i))) ok = false;
+    }
+    if (ok) bits |= 1;
+    ok = true;
+    for (0..3) |i| {
+        const s = try session.acceptUniStream();
+        defer s.release();
+        if ((try s.reader().takeByte()) != '0' + @as(u8, @intCast(i))) ok = false;
+    }
+    if (ok) bits |= 2;
+    _ = accept_order.fetchOr(bits | 4, .release);
+}
+
+test "WebTransport: streams the peer opened before the handler accepts come out in open order" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/accept-order", .origin = "https://localhost" });
+    defer session.deinit();
+
+    // Held open until the handler has them: releasing an unfinished stream
+    // would reset it.
+    var held: [6]*wt.Stream = undefined;
+    var n_held: usize = 0;
+    defer for (held[0..n_held]) |s| s.release();
+    for (0..3) |i| {
+        const b = try session.openStream();
+        held[n_held] = b;
+        n_held += 1;
+        try b.writer().writeAll(&.{'0' + @as(u8, @intCast(i))});
+        try b.writer().flush();
+        const u = try session.openUniStream();
+        held[n_held] = u;
+        n_held += 1;
+        try u.writer().writeAll(&.{'0' + @as(u8, @intCast(i))});
+        try u.writer().flush();
+    }
+    try wait.waitUntil(io, "the handler took all six streams", {}, struct {
+        fn done(_: void) bool {
+            return accept_order.load(.acquire) & 4 != 0;
+        }
+    }.done);
+    try std.testing.expectEqual(@as(u32, 7), accept_order.load(.acquire));
 }
 
 test "WebTransport: the server opens streams both ways" {
