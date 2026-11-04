@@ -752,16 +752,19 @@ Where the idle time comes from, per executor thread:
 - io_uring (Anole's default on Linux): the wall time minus the thread's
   perf task clock, read once a window. The waiting `io_uring_enter` also
   submits the sends and runs their network softirq, so its wall time
-  would count that work as idle. The task clock needs `perf_event_open`:
+  would count that work as idle. The clock opens with the server's first
+  WebSocket, and only while `enabled`: it costs the thread a little kernel
+  time at every context switch, which a server without WebSockets
+  shouldn't pay (its executors show `none` until then). It needs `perf_event_open`:
   it opens at `kernel.perf_event_paranoid` 2 or lower (Fedora's default)
   or with `CAP_PERFMON`. Debian and Ubuntu default to 3 or 4, and Docker's
   default seccomp profile denies it (and io_uring too, so a container runs
   on epoll and is measured there). Without it the load gate is off on that
-  server, which says so once at startup; `max_websockets` still applies.
+  server, which says so once, at its first WebSocket; `max_websockets` still applies.
 - `std.Io.Threaded` and other backends: no signal, so no freeze.
 
-`admission` takes `enabled` (true; false keeps the measurements and the
-metrics but never freezes), `util_enter` (0.85; 0.88 is the documented
+`admission` takes `enabled` (true; false never freezes, and keeps the
+measurements and the metrics on epoll and kqueue), `util_enter` (0.85; 0.88 is the documented
 fallback if it holds too early on your hardware), `util_exit` (0.80),
 `lag_enter` (25 ms), `window` (1 s), `sustain` (3), `min_shed` (5 s) and
 `retry_after_s` (`.{ 5, 15 }`). With [`app.metrics`](observe.md) the

@@ -22,7 +22,8 @@
 //! - epoll and kqueue: zio's bracket around the waiting syscall
 //!   (`Loop.idle_ns`, the libuv bracket).
 //! - io_uring: the thread's perf task clock (`TaskClock`), read once per
-//!   window: idle = wall - task clock. The waiting `io_uring_enter` also
+//!   window: idle = wall - task clock. Opened only while the gate is
+//!   enabled, and only once the server has admitted a WebSocket. The waiting `io_uring_enter` also
 //!   submits, runs task_work and the softirq they raise, so its wall time
 //!   is not idle time; the task clock advances whenever the thread is
 //!   scheduled in, softirq included, and stops while it sleeps (perf's
@@ -42,9 +43,10 @@ const safety = @import("anole_safety");
 
 /// `ServerConfig.admission`.
 pub const Config = struct {
-    /// Freeze the WebSocket count while an executor is overloaded. The
-    /// executors are measured either way (`/metrics`), and
-    /// `ServerConfig.max_websockets` applies either way.
+    /// Freeze the WebSocket count while an executor is overloaded.
+    /// `ServerConfig.max_websockets` applies either way, and epoll and
+    /// kqueue executors are measured either way (`/metrics`); io_uring ones
+    /// only while this is on (their task clock has a cost, `TaskClock`).
     enabled: bool = true,
     /// A window at this utilization or more counts toward going hot. 0.85
     /// fired at 91-95% of the relay's knee on both Linux backends (step 0b,
@@ -108,9 +110,13 @@ pub const State = struct {
 
     /// Open WebSockets admitted through `reserve`.
     live: std.atomic.Value(u32) = .init(0),
+    /// Set by the first `reserve` that took a unit: the server has
+    /// WebSockets, so an io_uring executor opens its task clock now
+    /// (`TaskClock`), not at startup.
+    armed: std.atomic.Value(bool) = .init(false),
     /// The most `live` has been since the current shed episode began.
     peak: std.atomic.Value(u32) = .init(0),
-    /// `release`s so far.
+    /// Open WebSockets closed so far (`release`; not `unreserve`).
     closed: std.atomic.Value(u64) = .init(0),
     /// The limit while frozen, `no_limit` otherwise.
     frozen: std.atomic.Value(u32) = .init(no_limit),
@@ -144,16 +150,25 @@ pub const State = struct {
             }
             live = s.live.cmpxchgWeak(live, live + 1, .monotonic, .monotonic) orelse {
                 if (live + 1 > s.peak.load(.monotonic)) _ = s.peak.fetchMax(live + 1, .monotonic);
+                if (!s.armed.load(.monotonic)) s.armed.store(true, .monotonic);
                 return null;
             };
         }
     }
 
-    /// Gives back a unit `reserve` took.
+    /// Gives back the unit of a WebSocket that opened, as it closes: a
+    /// close, which the freeze counts as slack.
     pub fn release(s: *State) void {
+        s.unreserve();
+        _ = s.closed.fetchAdd(1, .monotonic);
+    }
+
+    /// Gives back a unit `reserve` took for an upgrade that never opened
+    /// (declined, failed, refused later): not a close, so the freeze's
+    /// slack doesn't grow with it.
+    pub fn unreserve(s: *State) void {
         const before = s.live.fetchSub(1, .monotonic);
         std.debug.assert(before > 0);
-        _ = s.closed.fetchAdd(1, .monotonic);
     }
 
     /// A row went hot at `now_ns`, with `closed_last_window` closes in its
@@ -305,7 +320,11 @@ pub const Probe = struct {
             p.goCool(row, now);
             return .{ .transition = .cool };
         };
-        const idle_ns = @min(idle_now -% p.idle_start, wall);
+        // Saturating: on io_uring the idle time is wall minus the task
+        // clock, two clocks that drift apart by ppm, so a window with no
+        // sleep in it can read a few ns of negative idle. That is a busy
+        // window, not an idle one.
+        const idle_ns = @min(idle_now -| p.idle_start, wall);
         const util_permille: u32 = @intCast(1000 - idle_ns * 1000 / wall);
         row.util_permille.store(util_permille, .monotonic);
         var step: Step = .{ .util_permille = util_permille, .closed = closed -| p.closed_start };
@@ -352,6 +371,13 @@ pub const Probe = struct {
 /// 0, any CPU). `exclude_kernel` lets it open at
 /// `kernel.perf_event_paranoid` 2 and doesn't change what a software clock
 /// counts. Close-on-exec, so a SIGUSR2 hand-off's exec doesn't inherit it.
+///
+/// Not free: a per-task event puts the thread's perf context on its
+/// context-switch path (`perf_event_task_sched_out`/`_in`, which stop and
+/// restart the clock), so an io_uring executor pays a little kernel time
+/// at every park and wake, not only at the once-a-window read. Hence it
+/// opens only when the gate can act (`Config.enabled`, a WebSocket
+/// admitted: `State.armed`).
 pub const TaskClock = struct {
     fd: i32,
 
@@ -515,6 +541,21 @@ test "Probe: idle past the wall time clamps to 0, and closes per window are repo
     try testing.expectEqual(@as(u64, 40), step.closed);
 }
 
+test "Probe: idle that went backwards reads as a busy window, not an idle one" {
+    var r: Rig = .init(.{});
+    r.idle = 10 * s_ns;
+    r.probe.begin(0, r.idle, 0);
+    for (0..3) |i| {
+        for (0..10) |_| r.probe.tick(0);
+        r.now += s_ns;
+        r.idle -= 1;
+        const step = r.probe.close(&r.row, r.now, r.idle, 0);
+        try testing.expectEqual(@as(u32, 1000), step.util_permille);
+        try testing.expectEqual(@as(u8, @intCast(i + 1)), r.probe.over);
+    }
+    try testing.expect(r.probe.hot);
+}
+
 test "Probe: losing the source cools a hot row and stops transitions" {
     var r: Rig = .init(.{});
     for (0..3) |_| _ = r.window(0.95, 0);
@@ -660,6 +701,25 @@ test "State: the board's reconnect pattern under a freeze is never refused" {
         }
     }
     try testing.expectEqual(@as(u64, 0), s.refused_load.load(.monotonic));
+}
+
+test "State: the first reservation arms the server, a refusal doesn't" {
+    var s: State = .{ .max_websockets = 0 };
+    try testing.expectEqual(@as(?Refusal, .cap), s.reserve());
+    try testing.expect(!s.armed.load(.monotonic));
+    s.max_websockets = null;
+    try reserveN(&s, 1);
+    try testing.expect(s.armed.load(.monotonic));
+}
+
+test "State: a reservation given back before its socket opened is not a close" {
+    var s: State = .{};
+    try reserveN(&s, 2);
+    s.unreserve();
+    try testing.expectEqual(@as(u64, 0), s.closed.load(.monotonic));
+    s.release();
+    try testing.expectEqual(@as(u64, 1), s.closed.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), s.live.load(.monotonic));
 }
 
 test "State: reset unfreezes and keeps the count" {

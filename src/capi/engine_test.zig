@@ -2385,6 +2385,8 @@ const WsDecideClaims = struct {
             try std.testing.expect(std.mem.startsWith(u8, c.headText(), "HTTP/1.1 401"));
         }
         try waitLive(io, st, 0);
+        // A declined upgrade never opened: not a close, no slack for a freeze.
+        try std.testing.expectEqual(@as(u64, 0), st.closed.load(.monotonic));
         var buf: [256]u8 = undefined;
         {
             var c: RawWs = undefined;

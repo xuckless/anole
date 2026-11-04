@@ -2132,10 +2132,10 @@ pub fn Server(comptime Ctx: type) type {
             defer if (build_options.use_zlib) encoders.freeLocal();
             const state = &self.admission;
             const row: ?*admission.Row = if (index < state.rows.len) &state.rows[index] else null;
-            var signal: Signal = .open(self.io, row != null);
+            var signal: Signal = .open(self.io, row != null, state.cfg.enabled);
             defer signal.close();
             if (row) |r| r.source.store(signal.source, .monotonic);
-            if (shards) self.logSignal(signal);
+            if (shards and !signal.pending) self.logSignal(signal);
             var probe: admission.Probe = .{ .cfg = state.cfg };
             // A hot row cools as its probe stops, so a stopped server leaves
             // nothing frozen.
@@ -2168,6 +2168,15 @@ pub fn Server(comptime Ctx: type) type {
                 // Pinned to its executor; a window measured elsewhere would
                 // read another loop's idle time.
                 if (placement.currentExecutor(self.io) != index) {
+                    probe.discard(now, signal.idleNs(self.io, now) orelse 0, closed);
+                    continue;
+                }
+                // The first WebSocket: open the task clock (on this thread,
+                // which it measures) and start a window on it.
+                if (signal.pending and state.armed.load(.monotonic)) {
+                    signal.arm(self.io);
+                    r.source.store(signal.source, .monotonic);
+                    if (shards) self.logSignal(signal);
                     probe.discard(now, signal.idleNs(self.io, now) orelse 0, closed);
                     continue;
                 }
@@ -2209,16 +2218,33 @@ pub fn Server(comptime Ctx: type) type {
             opened_at: u64 = 0,
             /// Why the task clock didn't open, for the log.
             denied: ?admission.TaskClock.OpenError = null,
+            /// The task clock opens (`arm`) once the server admits its
+            /// first WebSocket: it costs at every context switch
+            /// (`admission.TaskClock`), and a server without WebSockets
+            /// has nothing to gate.
+            pending: bool = false,
 
-            fn open(io: std.Io, measured: bool) Signal {
+            fn open(io: std.Io, measured: bool, enabled: bool) Signal {
                 if (!measured) return .{};
                 if (placement.loopIdleNs(io) != null) return .{ .source = .poll_wall };
                 // Only an executor of zio's io_uring gets here with a loop to
                 // measure; elsewhere (not zio) there is nothing to gate.
                 if (placement.currentExecutor(io) == null) return .{};
-                if (builtin.is_test and admission.test_deny_task_clock) return .{ .denied = error.AccessDenied };
-                const c = admission.TaskClock.open() catch |err| return .{ .denied = err };
-                return .{ .source = .task_clock, .clock = c, .opened_at = nowNs(io) };
+                return .{ .pending = enabled };
+            }
+
+            /// Opens the task clock, on the executor's own thread.
+            fn arm(sig: *Signal, io: std.Io) void {
+                sig.pending = false;
+                if (builtin.is_test and admission.test_deny_task_clock) {
+                    sig.denied = error.AccessDenied;
+                    return;
+                }
+                const c = admission.TaskClock.open() catch |err| {
+                    sig.denied = err;
+                    return;
+                };
+                sig.* = .{ .source = .task_clock, .clock = c, .opened_at = nowNs(io) };
             }
 
             /// Idle nanoseconds so far, or null without a source. A task

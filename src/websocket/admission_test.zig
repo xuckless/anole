@@ -329,7 +329,11 @@ fn sourceIs(row: *admission.Row, want: admission.Source) bool {
     return row.source.load(.monotonic) == want;
 }
 
-test "admission: each executor's probe picks its signal, and a denied task clock turns the gate off there" {
+fn windowClosed(r: *admission.Row) bool {
+    return r.windows.load(.monotonic) > 0;
+}
+
+test "admission: each executor's probe picks its signal (the task clock with the first WebSocket), and a denied task clock turns the gate off there" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
     defer rt.deinit();
@@ -340,6 +344,13 @@ test "admission: each executor's probe picks its signal, and a denied task clock
         defer server.deinit();
         var future = try start(&server, io);
         defer future.cancel(io) catch {};
+        if (want == .task_clock) {
+            // No WebSocket yet: no task clock either.
+            try wait.waitUntil(io, "the probe closed a window", &server.admission.rows[0], windowClosed);
+            try std.testing.expectEqual(admission.Source.none, server.admission.rows[0].source.load(.monotonic));
+        }
+        try std.testing.expectEqual(@as(?admission.Refusal, null), server.admission.reserve());
+        defer server.admission.unreserve();
         const S = struct { row: *admission.Row, want: admission.Source };
         try wait.waitUntil(io, "the probe picked its source", S{ .row = &server.admission.rows[0], .want = want }, struct {
             fn f(x: S) bool {
@@ -355,10 +366,13 @@ test "admission: each executor's probe picks its signal, and a denied task clock
     defer server.deinit();
     var future = try start(&server, io);
     defer future.cancel(io) catch {};
+    try std.testing.expectEqual(@as(?admission.Refusal, null), server.admission.reserve());
+    defer server.admission.unreserve();
     const row = &server.admission.rows[0];
+    // The window that tried the task clock, and one after it.
     try wait.waitUntil(io, "the probe closed a window", row, struct {
         fn f(r: *admission.Row) bool {
-            return r.windows.load(.monotonic) > 0;
+            return r.windows.load(.monotonic) > 1;
         }
     }.f);
     try std.testing.expectEqual(admission.Source.none, row.source.load(.monotonic));
@@ -411,13 +425,27 @@ test "admission: the refusal sets Retry-After and closes the HTTP/1.1 connection
     try std.testing.expectEqual(dusty.Request._WsAdmission.refused, r.request._ws_admission);
 }
 
-test "admission: a handshake whose 101 fails gives its unit back" {
+test "admission: a second upgrade on a refused request is refused again, uncounted" {
+    var r: Rig = undefined;
+    try r.init(64);
+    defer r.deinit();
+    r.state.freezeForTest(0);
+    try std.testing.expectError(error.ServiceUnavailable, websocket.upgrade(&r.request, &r.response, .{}));
+    // A handler that catches the 503 and tries again, after the load passed.
+    r.state.reset();
+    try std.testing.expectError(error.ServiceUnavailable, websocket.upgrade(&r.request, &r.response, .{}));
+    try std.testing.expectEqual(@as(u32, 0), r.state.live.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), r.state.refused_load.load(.monotonic));
+    try std.testing.expectEqual(dusty.Request._WsAdmission.refused, r.request._ws_admission);
+}
+
+test "admission: a handshake whose 101 fails gives its unit back, and it is not a close" {
     var r: Rig = undefined;
     try r.init(4);
     defer r.deinit();
     try std.testing.expectError(error.ConnectionResetByPeer, websocket.upgrade(&r.request, &r.response, .{}));
     try std.testing.expectEqual(@as(u32, 0), r.state.live.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), r.state.closed.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), r.state.closed.load(.monotonic));
     try std.testing.expectEqual(dusty.Request._WsAdmission.none, r.request._ws_admission);
 }
 

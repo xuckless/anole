@@ -608,13 +608,18 @@ fn openSocket(req: *dusty.Request, res: *dusty.Response, options: UpgradeOptions
     // it moves onto the socket.
     const adm = req._config._admission;
     var took = false;
-    if (adm) |a| if (req._ws_admission == .none) {
-        if (a.reserve()) |_| return overloaded(req, res, a);
-        req._ws_admission = .held;
-        took = true;
+    if (adm) |a| switch (req._ws_admission) {
+        .none => {
+            if (a.reserve()) |_| return overloaded(req, res, a);
+            req._ws_admission = .held;
+            took = true;
+        },
+        // Refused once (a handler trying again): refused again, uncounted.
+        .refused => return error.ServiceUnavailable,
+        .held, .moved => {},
     };
     defer if (took and req._ws_admission == .held) {
-        adm.?.release();
+        adm.?.unreserve();
         req._ws_admission = .none;
     };
 
