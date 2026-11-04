@@ -200,6 +200,14 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   as is, takes the loop path on WouldBlock or a pending cancel, and spends
   a tick-budget quantum per direct send; Anole turns it on beside
   `fast_accept`. Add `--fast-send` to the check.sh runs above.
+  D10 (fork only, 4286fa0): a wait that completes without parking still
+  yields once the executor's tick is spent and checks held locks
+  (`yieldPointNoPark`), so inline sends can't starve the run queue (#184
+  tracks a wider p99 at saturation since). `Loop.idle_ns` (fork only,
+  5506ac2, 40c6f9f): the time epoll and kqueue spend asleep in a waiting
+  poll (libuv's `uv_metrics_idle_time` bracket), null on io_uring; the
+  WebSocket admission gate (#129) reads it per executor. Pinned at
+  47ad429 on `anole-diag` (0.5.2).
   Windows IOCP (#139, 4c04fd0 on `anole`, 56e57f6 on `anole-diag`): an
   AF_UNIX connect goes through a plain connect() (as .NET and Go do)
   instead of a wildcard bind and ConnectEx (the all-NUL AF_UNIX wildcard is

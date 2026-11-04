@@ -30,8 +30,9 @@ zio (async runtime)
             upstream as lalinsky/zio #837, #838 and #850; plus the task dump
             and the executor stall watchdog, src/diag.zig, the held-lock
             report hook, and the per-executor quiescent-state counters,
-            quiescent_state)
-  Pinned:   commit d4b3ba6c82d3627ed1f8bdc028fcd031205eb3f4 of the fork
+            quiescent_state; fast_send, the no-park yield and
+            Loop.idle_ns)
+  Pinned:   commit 47ad429a2e605d6bef18779fbf96c5f2d648bb22 of the fork
   Linked:   always
 
 nghttp2 1.70.0 (HTTP/2)

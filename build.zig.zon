@@ -1,6 +1,6 @@
 .{
     .name = .anole,
-    .version = "0.5.1",
+    .version = "0.5.2",
     .fingerprint = 0xe9214b117feef58, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
@@ -47,17 +47,15 @@
         // waits (src/diag.zig in the fork).
         // Includes 56e57f6 (#139): IOCP connects AF_UNIX sockets with
         // connect(), not a wildcard bind and ConnectEx.
-        // DEVELOPMENT (S2 batch 2A): the sibling worktree ../zio-2a-int, branch
-        // s2a-int = s2a-io (56e57f6 + `fast_send`, 3b84d13, 92a70e3, 4286fa0,
-        // 910c8f2; D9/D10) merged with s2a-ws (Loop.idle_ns for the #129 gate,
-        // 5506ac2, 40c6f9f), until the fork commit is pushed and pinned. The
-        // lead repins by commit before the merge to main. build.sh's Mac slot
-        // doesn't sync this path (rsync ../zio-2a-int to pixl-mac:anole-wt/).
-        // Was:
-        // .url = "git+https://github.com/xuckless/zio#56e57f64683677535ecd0a9073a9980dc0478083",
-        // .hash = "zio-0.19.0-xHbVVC_OLgD1hCM7MmB93kzWRU-d0o0k_BggWLQ-A9vW",
+        // Plus S2 batch 2A (0.5.2; anole-diag 47ad429, fork only): `fast_send`
+        // (a send the socket takes at once completes inline, no park; D9 arm B;
+        // 3b84d13, 92a70e3, 910c8f2), a wait that doesn't park still yields once
+        // the tick is spent and checks held locks (4286fa0; D10), and
+        // Loop.idle_ns, the time epoll and kqueue sleep in a waiting poll, for
+        // the WebSocket admission gate's utilization (#129; 5506ac2, 40c6f9f).
         .zio = .{
-            .path = "../zio-2a-int",
+            .url = "git+https://github.com/xuckless/zio#47ad429a2e605d6bef18779fbf96c5f2d648bb22",
+            .hash = "zio-0.19.0-xHbVVDQaLwAXP3onRbo4O9yrKZU3VzTnUNJDaVeVzK_p",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{

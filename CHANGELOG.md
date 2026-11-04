@@ -3,7 +3,22 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
-## Unreleased
+## 0.5.2 (2026-11-04)
+
+### Added
+
+- **WebSocket admission gate** (#129), on by default: each executor's
+  utilization is measured over 1 s windows. While any executor stays at
+  0.85 or more, the server holds its number of open WebSockets: closes
+  readmit, so reconnecting clients still fit. An upgrade past that, or past
+  the new optional cap `limits.max_websockets`, gets 503 with a 5-15 s
+  `Retry-After` before the 101. Settings under `admission`; metrics
+  `anole_executor_utilization_permille`, `anole_executor_hot`,
+  `anole_websockets_admitted`, `anole_websockets_limit` and
+  `anole_ws_upgrades_refused_total`; in the JSON config and the C ABI too.
+  See docs/server.md "Overload". On the box, a video-call relay ramped past
+  its knee froze at 830-840 users with relayed messages flat, and the
+  board's WebSocket cells saw no refusals.
 
 ### Changed
 
@@ -14,6 +29,40 @@ breaking changes are listed anyway.
   until the next `receive`, as documented before, but a slice kept past it
   now changes under you; Debug builds fill it with 0xDD at the next
   receive. Copy what must outlive the call or go to another task.
+
+### Performance
+
+- TLS: a response's last record goes out from BoringSSL's own buffer
+  instead of being copied into Anole's queue, and Anole's queue buffers
+  are taken outside the per-connection TLS lock (#178). json over TLS
+  costs 16.9% less CPU per request (+20% req/s).
+- `res.json` writes numbers, booleans, null, enum names and errors
+  directly, not through a std.json Stringify per value (same bytes):
+  -12% instructions per request on HttpArena's /json/50.
+- A buffered response body past its first 512 B moves into a pooled
+  16 KiB write buffer with room for the head in front, so head and body
+  leave in one write without a gather copy (memory high-water down 2-16%
+  in a write-then-wait test).
+- Response heads: the common status lines, the Date line and the
+  Content-Length with the end of the head are one write each (-226
+  instructions per request in sending the head; same bytes).
+- WebSocket payloads, read blocks and TLS buffer misses skip the
+  ReleaseSafe 0xAA fill of fresh memory (every byte is written before
+  it is read; Debug and test builds still fill with 0xDD).
+- zio: a send the socket takes at once completes without parking the
+  task (`fast_send`), and such a completion still yields once the
+  executor's tick is spent.
+- Together, on the box against 0.5.1: CPU per relayed video-call message
+  -14%, WebSocket echo +12-18% frames/s at 4-16 KiB, json-comp +13%,
+  json +13%, memory high-water lower on every cell measured.
+
+### Known
+
+- At saturation the p99 latency is wider while throughput and the median
+  improve (json-comp 37.6 to 50.5 ms, p50 28.9 to 20.3 ms; WebSocket
+  echo 16 KiB 22.8 to 34.2 ms), likely from `fast_send`. Below
+  saturation the tail is better (p99.9 1.99 to 0.15 ms at 500k req/s).
+  Tracked in #184.
 
 ## 0.5.1 (2026-11-04)
 
