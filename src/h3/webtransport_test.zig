@@ -286,6 +286,97 @@ test "WebTransport: datagrams are echoed, and one past a size limit fails" {
     try std.testing.expectEqualSlices(u8, &big, try session.receiveDatagram(&buf));
 }
 
+/// Sends `count` numbered datagrams in rounds of at most `batch`, reading each
+/// round back from the echo, and checks they return in order.
+fn echoNumbered(session: *wt.Session, count: usize, batch: usize) !void {
+    var sent: usize = 0;
+    var got: usize = 0;
+    var msg: [16]u8 = undefined;
+    var buf: [64]u8 = undefined;
+    while (got < count) {
+        const round = @min(batch, count - sent);
+        for (0..round) |_| {
+            try session.sendDatagram(try std.fmt.bufPrint(&msg, "dg-{d}", .{sent}));
+            sent += 1;
+        }
+        while (got < sent) : (got += 1) {
+            const want = try std.fmt.bufPrint(&msg, "dg-{d}", .{got});
+            try std.testing.expectEqualStrings(want, try session.receiveDatagram(&buf));
+        }
+    }
+}
+
+test "WebTransport: datagrams keep their order with 1, 16 and 256 queued at once" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/wt", .origin = "https://localhost" });
+    defer session.deinit();
+
+    try echoNumbered(session, 1, 1);
+    try echoNumbered(session, 16, 16);
+    try echoNumbered(session, 256, 128);
+}
+
+test "WebTransport: datagram queues wrap around, sending three and reading two per round" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/wt", .origin = "https://localhost" });
+    defer session.deinit();
+
+    var msg: [16]u8 = undefined;
+    var buf: [64]u8 = undefined;
+    var sent: usize = 0;
+    var got: usize = 0;
+    // The backlog grows by one per round, so the head moves past the initial
+    // capacity of the ring.
+    for (0..40) |_| {
+        for (0..3) |_| {
+            try session.sendDatagram(try std.fmt.bufPrint(&msg, "dg-{d}", .{sent}));
+            sent += 1;
+        }
+        for (0..2) |_| {
+            const want = try std.fmt.bufPrint(&msg, "dg-{d}", .{got});
+            try std.testing.expectEqualStrings(want, try session.receiveDatagram(&buf));
+            got += 1;
+        }
+    }
+    while (got < sent) : (got += 1) {
+        const want = try std.fmt.bufPrint(&msg, "dg-{d}", .{got});
+        try std.testing.expectEqualStrings(want, try session.receiveDatagram(&buf));
+    }
+}
+
+test "WebTransport: a connection torn down with datagrams unread frees them" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/wt", .origin = "https://localhost" });
+    // More than the queue limit, never read: what is still queued when the
+    // connection goes (out, or echoed back to us) must be freed.
+    for (0..300) |i| {
+        var msg: [16]u8 = undefined;
+        try session.sendDatagram(try std.fmt.bufPrint(&msg, "dg-{d}", .{i}));
+    }
+    session.deinit();
+    conn.close();
+}
+
 test "WebTransport: the server opens streams both ways" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
