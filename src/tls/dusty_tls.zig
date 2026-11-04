@@ -1597,9 +1597,11 @@ threadlocal var pool_len: usize = 0;
 /// `len` bytes from malloc without std's `undefined` fill, 0xAA over the
 /// whole allocation in ReleaseSafe (safety's `allocUninit`; this module has
 /// no anole_safety). Every user writes before it reads, as with a block
-/// from a pool. Freed with `c_allocator.free`.
+/// from a pool. Poisoned with 0xDD in Debug and test builds, as safety's
+/// helper does (SAFETY.md M6). Freed with `c_allocator.free`.
 fn mallocUninit(len: usize) ?[]u8 {
     const p = std.heap.c_allocator.rawAlloc(len, .@"1", @returnAddress()) orelse return null;
+    if (builtin.mode == .debug or builtin.is_test) @memset(p[0..len], 0xDD);
     return p[0..len];
 }
 
@@ -1865,8 +1867,11 @@ pub const buf_checks = if (builtin.is_test) struct {
             for (0..3) |round| {
                 var misses: usize = 0;
                 for (blocks[0..n], 0..) |*b, i| {
-                    if (pool_len == 0) misses += 1;
+                    const miss = pool_len == 0;
+                    if (miss) misses += 1;
                     b.* = takeBlock() orelse return error.OutOfMemory;
+                    // A miss is poisoned in test builds (`mallocUninit`).
+                    if (miss) try expect(std.mem.allEqual(u8, b.*, 0xDD));
                     // Written before it is read, as every user of a block.
                     @memset(b.*, @truncate(i));
                 }

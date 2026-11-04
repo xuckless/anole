@@ -1261,7 +1261,10 @@ const read_blocks = struct {
             free_len += 1;
             return;
         }
-        safety.process_gpa.free(b);
+        // rawFree, not `free`: `free` fills the block with `undefined`
+        // first, 0xAA in ReleaseSafe, and process_gpa is Zig code, so the
+        // store isn't dropped as dead (C1). Poisoned above anyway.
+        safety.process_gpa.rawFree(b, .@"1", @returnAddress());
     }
 };
 
