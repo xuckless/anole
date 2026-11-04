@@ -69,6 +69,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opt: Options) !void {
     try group.concurrent(io, readAll, .{ &client_side, opt.bytes_per_direction, &results[3] });
     try group.await(io);
     for (results) |r| try r;
+    // Where the kernel can take the server's sending side, it must have:
+    // otherwise this run says nothing about a BoringSSL reader beside a
+    // kernel writer.
+    if (opt.ktls and @import("builtin").os.tag == .linux and
+        !server_side.conn.kernelTx() and !tls.test_hooks.ktlsUlpMissing()) return error.NoKernelSwitch;
 }
 
 /// Exchanges a few small messages, then a bulk transfer each way, then

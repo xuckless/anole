@@ -591,7 +591,11 @@ pub const Connection = struct {
         const sh = self.shared orelse return;
         if (sh.ktls == .on) {
             // BoringSSL's close_notify would leave sealed with a key the
-            // kernel no longer uses.
+            // kernel no longer uses. Known gap, a ship blocker for the
+            // spike (research/s2/2a/ktls.md, Review): a send that met a
+            // full send buffer leaves the end of its last record held by
+            // the kernel's TLS layer, not TCP, and the close that follows
+            // frees it, so the peer gets a truncated response.
             ktls.sendCloseNotify(sh.ktls_fd.?);
             return;
         }
@@ -706,7 +710,8 @@ pub const Connection = struct {
     /// last record that follows a gather send (`gather_len`).
     fn writeAll(self: *Connection, bytes: []const u8, last: bool) WriteError!void {
         const sh = self.shared.?;
-        if (sh.ktls == .on) return sh.kernelWrite(bytes);
+        // A switched connection writes in `Writer.drainKernel` only.
+        std.debug.assert(sh.ktls != .on);
         var rest = bytes;
         while (rest.len > 0) {
             const n = @min(rest.len, max_plaintext_len);
@@ -753,11 +758,7 @@ pub const Connection = struct {
     /// and flushed costs one SSL_write, not two.
     fn flush(self: *Connection) WriteError!void {
         const sh = self.shared.?;
-        // Nothing BoringSSL queues is sent any more (`Shared.toKernel`).
-        if (sh.ktls == .on) {
-            sh.output.flush() catch return error.WriteFailed;
-            return;
-        }
+        std.debug.assert(sh.ktls != .on); // as in `writeAll`
         sh.lock();
         if (sh.write_owed) {
             // Returns 0 for success as well as for some failures.
@@ -886,16 +887,24 @@ pub const Connection = struct {
                 self.err = error.TlsFailure;
                 return error.WriteFailed;
             }
-            const n = sh.output.writeSplatHeader(w.buffered(), data, splat) catch {
-                self.err = error.WriteFailed;
-                return error.WriteFailed;
+            // Short sends (a full send buffer) go on from where they stopped
+            // in the head, never moving its rest to the front of the buffer
+            // (`consume`): the buffer is always emptied, as on BoringSSL.
+            var head = w.buffered();
+            const n = while (true) {
+                const n = sh.output.writeSplatHeader(head, data, splat) catch {
+                    self.err = error.WriteFailed;
+                    return error.WriteFailed;
+                };
+                if (n >= head.len) break n - head.len;
+                head = head[n..];
             };
-            const consumed = w.consume(n);
+            w.end = 0;
             sh.output.flush() catch {
                 self.err = error.WriteFailed;
                 return error.WriteFailed;
             };
-            return consumed;
+            return n;
         }
 
         /// `byte`, `count` times. Out of line and from a small chunk: every
@@ -1787,13 +1796,22 @@ const Shared = struct {
     /// One attempt to attach the ULP per connection; any failure leaves the
     /// connection on BoringSSL for good.
     ///
-    /// The switch itself needs nothing in flight: no record queued, no
-    /// borrowed one out, and no SSL_read since the last write that could
-    /// have queued a reply only an SSL_write sends (`write_owed`).
-    /// Otherwise it waits for the next big write. It holds the lock across
-    /// the TLS_TX setsockopt (a short syscall that does not wait), so the
-    /// reading side cannot seal anything between reading the record number
-    /// and the kernel taking it.
+    /// The switch itself needs nothing in flight: no record queued and no
+    /// borrowed one out. A reply an SSL_read queued for the next SSL_write
+    /// (`write_owed`: a KeyUpdate answer) is drawn out here by a zero-length
+    /// SSL_write, as `flush` does; if it sealed anything, that leaves at the
+    /// next flush and the switch waits for the next big write.
+    ///
+    /// It holds the lock across the TLS_TX setsockopt, so the reading side
+    /// cannot seal anything between reading the record number and the
+    /// kernel taking it. That call can sleep: the first use of an AEAD the
+    /// kernel has as a module loads it (crypto_alloc_aead; ChaCha20-Poly1305
+    /// on Fedora's kernel). In the core a connection's tasks share one
+    /// executor (`placement.concurrent(.., .local, ..)`), so nothing spins
+    /// on the lock meanwhile; the executor itself waits, as for any blocking
+    /// syscall, once per algorithm per boot (`ktls.installTx` latches a
+    /// missing one). A reader on another thread (the 4-executor duplex test)
+    /// would spin for that long.
     ///
     /// After it: no SSL_write, SSL_shutdown or `pending` send runs again.
     /// A fatal alert from SSL_read is dropped (`bioWrite`), and a peer's
@@ -1818,7 +1836,15 @@ const Shared = struct {
         if (sh.ktls != .attached) return;
         sh.lock();
         defer sh.unlock();
-        if (sh.pending.len != 0 or sh.write_owed or sh.borrow != .off) return;
+        if (sh.pending.len != 0 or sh.borrow != .off) return;
+        if (sh.write_owed) {
+            // Returns 0 for success as well as for some failures.
+            _ = c.SSL_write(sh.ssl, "", 0);
+            if (builtin.is_test) _ = test_hooks.ssl_writes.fetchAdd(1, .monotonic);
+            if (c.ERR_peek_error() != 0) c.ERR_clear_error();
+            sh.write_owed = false;
+            if (sh.pending.len != 0) return;
+        }
         var info = ktls.derive(sh.ssl) orelse {
             sh.ktls = .never;
             return;
@@ -1830,12 +1856,6 @@ const Shared = struct {
         c.SSL_set_msg_callback(sh.ssl, keyUpdateWatch);
         c.SSL_set_msg_callback_arg(sh.ssl, sh);
         sh.ktls = .on;
-    }
-
-    /// A plaintext write under kernel TLS.
-    fn kernelWrite(sh: *Shared, bytes: []const u8) Connection.WriteError!void {
-        if (sh.key_update_owed.load(.acquire)) return error.TlsFailure;
-        sh.output.writeAll(bytes) catch return error.WriteFailed;
     }
 
     /// Hands every pending record to `output`. Writing side only: swapping
@@ -2246,6 +2266,13 @@ pub const test_hooks = if (builtin.is_test) struct {
     /// Kernel TLS: whether this process found the `tls` ULP missing.
     pub fn ktlsUlpMissing() bool {
         return ktls.ulpMissing();
+    }
+
+    pub const KtlsState = @FieldType(Shared, "ktls");
+
+    /// Kernel TLS: where the connection's switch stands (`Shared.ktls`).
+    pub fn ktlsState(conn: *const Connection) KtlsState {
+        return conn.shared.?.ktls;
     }
 
     pub const ktls_checks = ktls.checks;
