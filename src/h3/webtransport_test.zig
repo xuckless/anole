@@ -393,17 +393,25 @@ test "WebTransport: a session closed with echoed datagrams unread frees them" {
 /// when it finished.
 var accept_order: std.atomic.Value(u32) = .init(0);
 
-/// Waits until the peer's three bidirectional and three unidirectional
-/// streams are all queued, then accepts them and checks their first bytes.
+/// The server's side of the accept-order session, so the client can wait
+/// for each stream to be queued before opening the next: QUIC doesn't
+/// promise that streams reach the server in the order they were opened.
+var accept_session: std.atomic.Value(?*wt.Session) = .init(null);
+
+/// Set by the client once all six streams are queued: until then the
+/// handler holds its session open and takes nothing from the queues.
+var accept_go: std.atomic.Value(bool) = .init(false);
+
+/// Waits for the client's go (all six of its streams queued, in the order
+/// they were opened), then accepts them and checks their first bytes.
 fn acceptOrderSession(session: *wt.Session, req: *dusty.Request) !void {
-    const Queued = struct {
-        session: *wt.Session,
-        fn all(q: @This()) bool {
-            return wt.Session.Driver.testQueued(q.session, .bidi) == 3 and
-                wt.Session.Driver.testQueued(q.session, .uni) == 3;
+    accept_session.store(session, .release);
+    const Go = struct {
+        fn set(_: void) bool {
+            return accept_go.load(.acquire);
         }
     };
-    try wait.waitUntil(req.io, "six peer streams queued", Queued{ .session = session }, Queued.all);
+    try wait.waitUntil(req.io, "the client's go", {}, Go.set);
     var bits: u32 = 0;
     var ok = true;
     for (0..3) |i| {
@@ -439,18 +447,38 @@ test "WebTransport: streams the peer opened before the handler accepts come out 
     var held: [6]*wt.Stream = undefined;
     var n_held: usize = 0;
     defer for (held[0..n_held]) |s| s.release();
+    const Server = struct {
+        fn ready(_: void) bool {
+            return accept_session.load(.acquire) != null;
+        }
+    };
+    try wait.waitUntil(io, "the server's session", {}, Server.ready);
+    const server_session = accept_session.load(.acquire).?;
+    // One stream at a time, each queued at the server before the next is
+    // opened, so the order they arrive in is the order they were opened.
+    const Arrived = struct {
+        session: *wt.Session,
+        bidi: bool,
+        n: usize,
+        fn queued(q: @This()) bool {
+            return wt.Session.Driver.testQueued(q.session, if (q.bidi) .bidi else .uni) == q.n;
+        }
+    };
     for (0..3) |i| {
         const b = try session.openStream();
         held[n_held] = b;
         n_held += 1;
         try b.writer().writeAll(&.{'0' + @as(u8, @intCast(i))});
         try b.writer().flush();
+        try wait.waitUntil(io, "the bidirectional stream queued", Arrived{ .session = server_session, .bidi = true, .n = i + 1 }, Arrived.queued);
         const u = try session.openUniStream();
         held[n_held] = u;
         n_held += 1;
         try u.writer().writeAll(&.{'0' + @as(u8, @intCast(i))});
         try u.writer().flush();
+        try wait.waitUntil(io, "the unidirectional stream queued", Arrived{ .session = server_session, .bidi = false, .n = i + 1 }, Arrived.queued);
     }
+    accept_go.store(true, .release);
     try wait.waitUntil(io, "the handler took all six streams", {}, struct {
         fn done(_: void) bool {
             return accept_order.load(.acquire) & 4 != 0;
