@@ -8,6 +8,8 @@
 //! type without renames the bytes are std.json's, but for strings that are
 //! not UTF-8 (std.json writes them as arrays of numbers). Keys are encoded
 //! at compile time, and a string is escaped and checked in one pass.
+//! U+FFFD is for the strings `write` writes itself: a type with its own
+//! `jsonStringify` and a `@Vector` of bytes keep std.json's arrays.
 //!
 //! | Value                        | JSON                                       |
 //! |------------------------------|--------------------------------------------|
@@ -41,9 +43,9 @@ pub const Options = struct {
     }
 };
 
-/// Whether writing a `T` needs `write`: it, or a type inside it, has a
-/// field renamed with `v.rename`. Every other type keeps the std.json path
-/// byte for byte.
+/// Whether `T`, or a type inside it, has a field renamed with `v.rename`.
+/// Such a type goes through `write` with any options (those json_out does
+/// not have are ignored) and writes NaN and the infinities as `null`.
 pub fn hasOutsideNames(comptime T: type) bool {
     return comptime holdsRename(T, &.{});
 }
@@ -106,7 +108,12 @@ pub fn write(w: *Writer, value: anytype, options: Options) Writer.Error!void {
         },
         .optional => return if (value) |payload| write(w, payload, options) else w.writeAll("null"),
         .pointer => |p| switch (p.size) {
-            .one => return write(w, value.*, options),
+            // A pointer to an array is a slice, as std.json takes it: no
+            // copy of the array onto the stack.
+            .one => if (comptime @typeInfo(p.child) == .array)
+                return write(w, @as([]const std.meta.Elem(p.child), value), options)
+            else
+                return write(w, value.*, options),
             .slice => {
                 if (p.child == u8) return writeString(w, value);
                 return writeItems(w, value, options);
@@ -407,4 +414,17 @@ test "json out: a tuple leaves out void elements, and null ones on request" {
     const t = .{ @as(u8, 1), {}, @as(?u8, null), "x" };
     try expectJson("[1,null,\"x\"]", t, .{});
     try expectJson("[1,\"x\"]", t, .{ .omit_null_fields = true });
+}
+
+/// Larger than a thread's stack: a copy of it there would overflow.
+// SAFETY: the test fills it before writing it.
+var big_array: [16 << 20]u8 = undefined;
+
+test "json out: a pointer to an array is written as a slice, not copied onto the stack" {
+    @memset(&big_array, 'a');
+    var counter: Writer.Discarding = .init(&.{});
+    try write(&counter.writer, .{ .blob = &big_array }, .{});
+    try testing.expectEqual(@as(u64, big_array.len + "{\"blob\":\"\"}".len), counter.fullCount());
+    const const_ptr: *const [3:0]u8 = "a\xffb";
+    try expectJson("\"a\\ufffdb\"", const_ptr, .{});
 }

@@ -15,7 +15,9 @@ breaking changes are listed anyway.
   for HttpArena's /json/50 in a micro-benchmark). The bytes are
   std.json's, except that a string that is not UTF-8 now has U+FFFD for
   each bad byte; std.json wrote it as an array of byte values. Other
-  `jsonWith` options still go to std.json itself.
+  `jsonWith` options still go to std.json itself and keep its arrays, as
+  do types with their own `jsonStringify` (`std.json.Value`) and byte
+  vectors.
 
 ## 0.5.0 (2026-11-01)
 

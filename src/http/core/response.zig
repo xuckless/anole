@@ -1249,34 +1249,39 @@ pub const Response = struct {
     /// byte (std.json would write it as an array of numbers). `jsonWith`
     /// takes `std.json`'s options.
     pub fn json(self: *Response, value: anytype) !void {
-        return self.jsonWith(value, .{});
+        return self.jsonOut(value, .{ .non_finite_null = comptime json_out.hasOutsideNames(@TypeOf(value)) });
     }
 
     /// `json` with `std.json`'s stringify options (whitespace, nulls left
     /// out, and so on). Options other than `emit_null_optional_fields`
-    /// hand a type without renames to `std.json` itself; a type with
-    /// renames ignores them.
+    /// hand a type without renames to `std.json` itself, which writes a
+    /// string that is not UTF-8 as an array of numbers, not with U+FFFD;
+    /// a type with renames ignores them.
     pub fn jsonWith(self: *Response, value: anytype, options: std.json.Stringify.Options) !void {
+        const renamed = comptime json_out.hasOutsideNames(@TypeOf(value));
+        const plain = options.whitespace == .minified and !options.escape_unicode and
+            !options.emit_strings_as_arrays and !options.emit_nonportable_numbers_as_strings;
+        // json_out writes what std.json writes, about twice as fast; a
+        // renamed type keeps its own `null` for NaN and the infinities.
+        if (renamed or plain) return self.jsonOut(value, .{
+            .omit_null_fields = !options.emit_null_optional_fields,
+            .non_finite_null = renamed,
+        });
         // The open writer owns the segment being filled, and would write
         // over this, or publish a length past the end of it.
         if (self._body_writer_buffering) return error.BodyWriterOpen;
         var w: BodyWriter = .init(self);
         defer w.interface.flush() catch unreachable;
-        const renamed = comptime json_out.hasOutsideNames(@TypeOf(value));
-        const plain = options.whitespace == .minified and !options.escape_unicode and
-            !options.emit_strings_as_arrays and !options.emit_nonportable_numbers_as_strings;
-        if (renamed or plain) {
-            // json_out writes what std.json writes, about twice as fast;
-            // a renamed type keeps its own `null` for NaN and the
-            // infinities.
-            try json_out.write(&w.interface, value, .{
-                .omit_null_fields = !options.emit_null_optional_fields,
-                .non_finite_null = renamed,
-            });
-        } else {
-            const json_formatter = std.json.fmt(value, options);
-            try json_formatter.format(&w.interface);
-        }
+        const json_formatter = std.json.fmt(value, options);
+        try json_formatter.format(&w.interface);
+        try self.header("Content-Type", http.ContentType.json.toContentType());
+    }
+
+    fn jsonOut(self: *Response, value: anytype, options: json_out.Options) !void {
+        if (self._body_writer_buffering) return error.BodyWriterOpen;
+        var w: BodyWriter = .init(self);
+        defer w.interface.flush() catch unreachable;
+        try json_out.write(&w.interface, value, options);
         try self.header("Content-Type", http.ContentType.json.toContentType());
     }
 
@@ -5358,7 +5363,7 @@ test "json: a type without renames writes exactly what std.json writes" {
     try expectStdJson(struct {}{}, .{});
 }
 
-test "json: invalid UTF-8 is U+FFFD for every type" {
+test "json: invalid UTF-8 is U+FFFD on the json_out path" {
     const validate = @import("validate");
     const Plain = struct { s: []const u8 };
     const Renamed = struct {
@@ -5368,6 +5373,8 @@ test "json: invalid UTF-8 is U+FFFD for every type" {
     try expectJsonBody("{\"s\":\"a\\ufffdb\"}", Plain{ .s = "a\xffb" }, .{});
     try expectJsonBody("{\"s\":\"a\\ufffdb\"}", Renamed{ .s_s = "a\xffb" }, .{});
     try expectJsonBody("{\"s\":\"a\\ufffdb\"}", Plain{ .s = "a\xffb" }, .{ .emit_null_optional_fields = false });
+    // Other options go to std.json, which writes the bytes as numbers.
+    try expectJsonBody("{\n  \"s\": [\n    97,\n    255,\n    98\n  ]\n}", Plain{ .s = "a\xffb" }, .{ .whitespace = .indent_2 });
 }
 
 test "json: other std.json options keep std.json's bytes" {
