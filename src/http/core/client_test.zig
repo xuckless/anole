@@ -1018,6 +1018,197 @@ test "Server: pipelined no_wait requests in one TLS record are answered in one w
     try std.testing.expectEqual(@as(usize, 1), dusty.Connection.TestSocketWrites.get() - before);
 }
 
+/// A JSON string `n` bytes long, as the promoted-body tests send it: a
+/// pattern between quotes.
+fn promotedJson(arena: std.mem.Allocator, n: usize) ![]u8 {
+    const s = try arena.alloc(u8, n - 2);
+    for (s, 0..) |*c, i| c.* = 'a' + @as(u8, @intCast(i % 26));
+    return s;
+}
+
+/// The body `promotedJson` makes `n` bytes of, with its quotes.
+fn expectPromotedJson(body: []const u8, n: usize) !void {
+    try std.testing.expectEqual(n, body.len);
+    try std.testing.expectEqual('"', body[0]);
+    try std.testing.expectEqual('"', body[n - 1]);
+    for (body[1 .. n - 1], 0..) |c, i| try std.testing.expectEqual('a' + @as(u8, @intCast(i % 26)), c);
+}
+
+test "Server: a buffered body past 512 bytes written before the handler waits goes out whole, over TCP and TLS" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    const sync = struct {
+        var started: std.Io.Event = .unset;
+        var release: std.Io.Event = .unset;
+    };
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{
+            .{ .address = loopback_addr },
+            .{ .address = loopback_addr, .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } },
+        },
+    }, {});
+    defer server.deinit();
+    // The body moves into a write buffer as it is written, and the handler
+    // then waits holding it (a database call after `res.json`).
+    server.router.get("/json/:n", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            const n = try std.fmt.parseInt(usize, req.params.get("n").?, 10);
+            try res.json(try promotedJson(req.arena, n));
+            sync.started.set(req.io);
+            try sync.release.wait(req.io);
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{ .tls = .{ .ca = .{ .file = test_cert_path } } });
+    defer client.deinit();
+
+    for ([_][]const u8{ "http", "https" }, 0..) |scheme, i| {
+        for ([_]usize{ 513, 4096, 16384 - 512 }) |n| {
+            sync.started = .unset;
+            sync.release = .unset;
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "{s}://localhost:{d}/json/{d}", .{ scheme, server.addresses[i].ip.getPort(), n });
+            var fetch = try io.concurrent(struct {
+                fn run(c: *dusty.Client, u: []const u8, len: usize) !void {
+                    var response = try c.fetch(u, .{});
+                    defer response.deinit();
+                    try std.testing.expectEqual(.ok, response.status());
+                    try expectPromotedJson((try response.body()).?, len);
+                }
+            }.run, .{ &client, url, n });
+            errdefer fetch.cancel(io) catch {};
+            try sync.started.wait(io);
+            sync.release.set(io);
+            try fetch.await(io);
+        }
+    }
+}
+
+test "Server: pipelined no_wait requests with 8 KiB bodies over TLS are answered whole and in order" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const tls = @import("tls");
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } }},
+    }, {});
+    defer server.deinit();
+    // The first is promoted and corked, the next ones go in behind it.
+    server.router.addRouteWith(.get, "/json/:n", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            const n = try std.fmt.parseInt(usize, req.params.get("n").?, 10);
+            try res.json(try promotedJson(req.arena, n));
+        }
+    }.handle, .{ .no_wait = true });
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const ca: dusty.Ca = .{ .file = test_cert_path };
+    var bundle = try ca.load(std.testing.allocator, io);
+    defer bundle.deinit(std.testing.allocator);
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var read_buf: [tls.input_buffer_len]u8 = undefined;
+    var write_buf: [tls.output_buffer_len]u8 = undefined;
+    var tcp_reader = stream.reader(io, &read_buf);
+    var tcp_writer = stream.writer(io, &write_buf);
+    var rng: std.Random.IoSource = .{ .io = io };
+    var conn = try tls.client(&tcp_reader.interface, &tcp_writer.interface, .{
+        .host = "localhost",
+        .root_ca = bundle,
+        .now = std.Io.Clock.real.now(io),
+        .rng = rng.interface(),
+    });
+
+    const sizes = [_]usize{ 8192, 8193, 600 };
+    var wbuf: [512]u8 = undefined;
+    var w = conn.writer(&wbuf);
+    for (sizes) |n| try w.interface.print("GET /json/{d} HTTP/1.1\r\nHost: localhost\r\n\r\n", .{n});
+    try w.interface.flush();
+    var rbuf: [16384]u8 = undefined;
+    var r = conn.reader(&rbuf);
+    for (sizes) |n| {
+        const status = try r.interface.takeDelimiterInclusive('\n');
+        try std.testing.expect(std.mem.startsWith(u8, status, "HTTP/1.1 200"));
+        var length: ?usize = null;
+        while (true) {
+            const line = try r.interface.takeDelimiterInclusive('\n');
+            if (std.mem.eql(u8, line, "\r\n")) break;
+            if (std.ascii.startsWithIgnoreCase(line, "content-length: ")) {
+                length = try std.fmt.parseInt(usize, std.mem.trim(u8, line["content-length: ".len..], " \r\n"), 10);
+            }
+        }
+        try std.testing.expectEqual(n, length.?);
+        try expectPromotedJson(try r.interface.take(n), n);
+    }
+}
+
+test "Server: Expect: 100-continue with a body past 512 bytes written before the request body is read" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    // The 100 Continue goes out while the response body sits promoted.
+    server.router.post("/upload", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            try res.json(try promotedJson(req.arena, 2048));
+            const body = (try req.body()) orelse "";
+            try res.header("X-Got", try req.arena.dupe(u8, body));
+        }
+    }.handle);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.waitReady(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    var read_buf: [4096]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+
+    try writer.interface.writeAll("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n");
+    try writer.interface.flush();
+    try std.testing.expect(std.mem.indexOf(u8, try reader.interface.takeDelimiterInclusive('\n'), "100 Continue") != null);
+    try std.testing.expectEqualStrings("\r\n", try reader.interface.takeDelimiterInclusive('\n'));
+    try writer.interface.writeAll("hello");
+    try writer.interface.flush();
+
+    try std.testing.expect(std.mem.startsWith(u8, try reader.interface.takeDelimiterInclusive('\n'), "HTTP/1.1 200 "));
+    var got = false;
+    var length: ?usize = null;
+    while (true) {
+        const line = try reader.interface.takeDelimiterInclusive('\n');
+        if (std.mem.eql(u8, line, "\r\n")) break;
+        if (std.mem.eql(u8, line, "X-Got: hello\r\n")) got = true;
+        if (std.ascii.startsWithIgnoreCase(line, "content-length: ")) {
+            length = try std.fmt.parseInt(usize, std.mem.trim(u8, line["content-length: ".len..], " \r\n"), 10);
+        }
+    }
+    try std.testing.expect(got);
+    try std.testing.expectEqual(@as(usize, 2048), length.?);
+    try expectPromotedJson(try reader.interface.take(2048), 2048);
+}
+
 test "Server: tls.alpn_protocols is offered to the client through ALPN" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const tls = @import("tls");
