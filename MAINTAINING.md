@@ -73,6 +73,16 @@ Run it by hand with `GH_TOKEN=$(gh auth token) tools/advisories.py`.
      tested against one BoringSSL commit; pin BoringSSL at or after it.
      `build/boringssl.zig` reads the file lists from the tarball's
      `gen/sources.json`, so check that it still builds every platform.
+     Re-read what dusty_tls's borrowed ciphertext (`Connection.writeAll`)
+     relies on: `do_tls_write` in ssl/s3_pkt.cc (the retry branch keyed on
+     `pending_write`, the `pending_flight` copy ahead of the record),
+     `tls_write_buffer_flush` (ssl/ssl_buffer.cc), `ssl_send_alert_impl`
+     (an alert deferred while the write buffer holds bytes),
+     `tls13_add_key_update` (the reply sealed into the flight before the key
+     changes), `tls_write_app_data`'s `write_shutdown` check, and
+     `do_send_new_session_ticket`'s deferral to the first write. The
+     SAFETY.md L5 exception for BoringSSL's record buffers rests on
+     `SSLBuffer::EnsureCap` and `Clear`.
    - **nghttp2** comes from the fork, which carries an RFC 9113 strictness
      patch. Rebase the patch onto the new tag on a new branch, run nghttp2's
      unit tests and h2spec in strict mode (147/147 over h2c and TLS), merge

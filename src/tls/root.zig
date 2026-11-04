@@ -84,6 +84,152 @@ test "TLS: a burst of small writes in flight reuses pooled buffers" {
     try dusty_tls.buf_checks.burst();
 }
 
+test "TLS: a queue buffer taken outside the lock is the class growing would take, and the old one is given back later" {
+    try dusty_tls.buf_checks.takeAndAdopt();
+}
+
+test "TLS: a response's last record over 1,984 bytes goes out from BoringSSL's buffer, every size intact" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    try testing.duplex.borrowSizes(std.testing.allocator, rt.io());
+}
+
+test "TLS: a KeyUpdate handled while a borrowed record is out is answered at the flush (one executor)" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    try testing.duplex.borrowKeyUpdate(std.testing.allocator, rt.io());
+}
+
+test "TLS: a KeyUpdate handled while a borrowed record is out is answered at the flush (4 pinned executors)" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(4) });
+    defer rt.deinit();
+    for (0..3) |_| try testing.duplex.borrowKeyUpdate(std.testing.allocator, rt.io());
+}
+
+test "TLS: a fatal alert while a borrowed record is out: the record arrives, the write fails, the alert is lost" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    try testing.duplex.borrowAlert(std.testing.allocator, rt.io());
+}
+
+test "TLS: a reset while a borrowed record is out fails the write, and closing copies nothing" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    try testing.duplex.borrowReset(std.testing.allocator, rt.io());
+}
+
+test "TLS: a cancel while a borrowed record is out fails the write" {
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    try testing.duplex.borrowCancel(std.testing.allocator, rt.io());
+}
+
+test "TLS: the first response after the handshake carries the session tickets in its borrowed record, and they resume" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // Not on Windows: RawClient is BoringSSL over a blocking BSD socket (SSL_set_fd). The glue under test is platform independent; Linux and macOS run it.
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+    var pem = try selfSigned(gpa, .{});
+    defer pem.deinit(gpa);
+    var auth = try dusty_tls.config.CertKeyPair.fromSlice(gpa, io, pem.cert, pem.key);
+    defer auth.deinit(gpa);
+    const listen_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try listen_addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+
+    const before = dusty_tls.test_hooks.borrows.load(.monotonic);
+    var server_future = try io.concurrent(TicketFlight.serve, .{ io, &listener, &auth });
+    defer server_future.cancel(io) catch {};
+    try RawClient.onThread(io, TicketFlight.client, .{listener.socket.address.getPort()});
+    try server_future.await(io);
+    try std.testing.expectEqual(2, dusty_tls.test_hooks.borrows.load(.monotonic) - before);
+}
+
+/// An 8 KiB response, written first on each of two connections: BoringSSL
+/// seals the session tickets it deferred to the first write into the same
+/// buffer, which is borrowed.
+const TicketFlight = struct {
+    const len = 8 * 1024;
+
+    fn byte(i: usize) u8 {
+        return @truncate(i *% 7 +% 3);
+    }
+
+    fn serve(io: std.Io, listener: *std.Io.net.Server, auth: *dusty_tls.config.CertKeyPair) !void {
+        for (0..2) |_| {
+            const stream = try listener.accept(io);
+            defer stream.close(io);
+            var in_buf: [dusty_tls.input_buffer_len]u8 = undefined;
+            var out_buf: [dusty_tls.output_buffer_len]u8 = undefined;
+            var tcp_reader = stream.reader(io, &in_buf);
+            var tcp_writer = stream.writer(io, &out_buf);
+            var rng: std.Random.IoSource = .{ .io = io };
+            var conn = try dusty_tls.server(&tcp_reader.interface, &tcp_writer.interface, .{
+                .auth = auth,
+                .now = std.Io.Clock.real.now(io),
+                .rng = rng.interface(),
+            });
+            defer conn.deinit();
+            var body: [len]u8 = undefined;
+            for (&body, 0..) |*b, i| b.* = byte(i);
+            var plain: [16 * 1024]u8 = undefined;
+            var w = conn.writer(&plain);
+            try w.interface.writeAll(&body);
+            try w.interface.flush();
+            // Until the client closes.
+            var r = conn.reader(&.{});
+            var buf: [16]u8 = undefined;
+            var vec = [_][]u8{&buf};
+            while (true) _ = r.interface.readVec(&vec) catch break;
+        }
+    }
+
+    /// The latest session the server issued (TLS 1.3 tickets reach this
+    /// callback, not `SSL_get1_session`).
+    var latest: ?*c.SSL_SESSION = null;
+
+    fn onNewSession(_: ?*c.SSL, session: ?*c.SSL_SESSION) callconv(.c) c_int {
+        if (latest) |old| c.SSL_SESSION_free(old);
+        latest = session;
+        return 1; // keeps the reference
+    }
+
+    fn client(port: u16) !void {
+        const ctx = c.SSL_CTX_new(c.TLS_method()) orelse return error.OutOfMemory;
+        defer c.SSL_CTX_free(ctx);
+        _ = c.SSL_CTX_set_min_proto_version(ctx, c.TLS1_3_VERSION);
+        _ = c.SSL_CTX_set_session_cache_mode(ctx, c.SSL_SESS_CACHE_CLIENT);
+        c.SSL_CTX_sess_set_new_cb(ctx, onNewSession);
+        defer if (latest) |sess| {
+            c.SSL_SESSION_free(sess);
+            latest = null;
+        };
+
+        const first = try RawClient.connect(ctx, port, null);
+        try readBody(first);
+        try std.testing.expectEqual(0, c.SSL_session_reused(first.ssl));
+        first.close();
+        const session = latest orelse return error.NoSession;
+
+        const second = try RawClient.connect(ctx, port, session);
+        defer second.close();
+        try std.testing.expectEqual(1, c.SSL_session_reused(second.ssl));
+        try readBody(second);
+    }
+
+    fn readBody(client_conn: RawClient) !void {
+        var buf: [4096]u8 = undefined;
+        var got: usize = 0;
+        while (got < len) {
+            const n = c.SSL_read(client_conn.ssl, &buf, buf.len);
+            if (n <= 0) return error.Read;
+            for (buf[0..@intCast(n)], got..) |b, i| try std.testing.expectEqual(byte(i), b);
+            got += @intCast(n);
+        }
+    }
+};
+
 /// A certificate and private key as PEM text, owned by the allocator that
 /// made them.
 pub const Pem = struct {
