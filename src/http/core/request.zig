@@ -761,16 +761,18 @@ pub const Request = struct {
 };
 
 /// The most `allocRemainingHinted` reserves on a declared length before
-/// the bytes arrive. hyper caps its own reservation (16 KiB) and nginx
-/// its first body buffer the same way, so that a peer declaring a large
-/// body and sending little does not get the memory for it.
-const body_reserve_max = 64 * 1024;
+/// the bytes arrive: hyper's cap (16 KiB) and about nginx's first body
+/// buffer (8k/16k), so a peer declaring a large body and sending little
+/// does not get the memory for it. The reservation is made before any
+/// byte has come (over HTTP/2 and HTTP/3 the handler runs at HEADERS),
+/// so this is what a stalled request or stream costs.
+const body_reserve_max = 16 * 1024;
 
 /// `std.Io.Reader.allocRemaining` that knows the length the body
-/// declared (`hint`): min(hint, 64 KiB) + 1 reserved up front, then
+/// declared (`hint`): min(hint, 16 KiB) + 1 reserved up front, then
 /// std's 1.5x growth clamped to hint + 1, so an honest body ends in one
 /// buffer of its own size and a peer that declares much and sends
-/// little gets about what it sent, or 64 KiB. The + 1 is room for the
+/// little gets about what it sent, or 16 KiB. The + 1 is room for the
 /// read that finds the end, which would otherwise grow a full buffer
 /// before it could say so. Each read is held to the room reserved, so
 /// a source that writes all it has at once (a fixed reader) does not
@@ -2015,7 +2017,9 @@ fn h1BodyCounts(raw: []const u8, expected: anyerror![]const u8, std_read: bool) 
 
 /// Reads `bytes` as an unframed body source (the HTTP/2 and HTTP/3 shape,
 /// and `anole.inmem`'s) declaring `content_length`.
-fn sourceBodyCounts(bytes: []const u8, content_length: ?usize, max_body_size: usize, expected: ?[]const u8) !BodyAllocCounter {
+/// `expected` is the body, `null` for none, or the error `body()` returns;
+/// the counts come back in every case.
+fn sourceBodyCounts(bytes: []const u8, content_length: ?usize, max_body_size: usize, expected: anyerror!?[]const u8) !BodyAllocCounter {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var counter: BodyAllocCounter = .{ .child = arena.allocator() };
@@ -2025,8 +2029,10 @@ fn sourceBodyCounts(bytes: []const u8, content_length: ?usize, max_body_size: us
     req._config.max_body_size = max_body_size;
     req.content_length = content_length;
     req._body_source = .{ .reader = &source, .err = noBodySourceError };
-    const got = try req.body();
-    if (expected) |e| try std.testing.expectEqualSlices(u8, e, got.?);
+    const got = req.body();
+    if (expected) |e| {
+        if (e) |b| try std.testing.expectEqualSlices(u8, b, (try got).?) else try std.testing.expect((try got) == null);
+    } else |e| try std.testing.expectError(e, got);
     return counter;
 }
 
@@ -2037,14 +2043,15 @@ fn bodyPattern(gpa: std.mem.Allocator, len: usize) ![]u8 {
 }
 
 /// Growths past the first allocation a body of each size may take with its
-/// length declared: none up to the 64 KiB reservation, then std's 1.5x
-/// clamped to the length (64K+1 -> 96K -> 100K+1; ... -> 1M+1).
+/// length declared: none up to the 16 KiB reservation, then std's 1.5x
+/// clamped to the length (16K+1 -> 24K -> 36K -> 55K -> 64K+1; ... -> 1M+1).
 const sized_bodies = [_]struct { len: usize, growths: usize }{
     .{ .len = 1024, .growths = 0 },
     .{ .len = 10 * 1024, .growths = 0 },
-    .{ .len = 64 * 1024, .growths = 0 },
-    .{ .len = 100 * 1024, .growths = 2 },
-    .{ .len = 1024 * 1024, .growths = 7 },
+    .{ .len = 16 * 1024, .growths = 0 },
+    .{ .len = 64 * 1024, .growths = 4 },
+    .{ .len = 100 * 1024, .growths = 5 },
+    .{ .len = 1024 * 1024, .growths = 11 },
 };
 
 test "Request.body: a declared length sizes the buffer, over the parser and over a body source" {
@@ -2110,14 +2117,19 @@ test "Request.body: a declared length past the maximum reserves nothing for it" 
     const gpa = std.testing.allocator;
     const bytes = try bodyPattern(gpa, 4000);
     defer gpa.free(bytes);
+    const grow = std.ArrayList(u8).growCapacity;
     // Declared and sent past the maximum: 413 as before, and the buffer
-    // never went past what std's growth to the maximum takes.
-    try std.testing.expectError(error.BodyTooBig, sourceBodyCounts(bytes, 4000, 1000, null));
-    // A source sending more than it declared, under the maximum: all of it.
+    // never went past what std's growth to the maximum takes (the 4000
+    // declared would have reserved 4001). `Allocating.drain` asks for one
+    // byte past what it writes, hence the + 1s.
+    const past = try sourceBodyCounts(bytes, 4000, 1000, error.BodyTooBig);
+    try std.testing.expect(past.largest <= grow(1000 + 1 + 1));
+    // A source sending more than it declared, under the maximum: all of
+    // it, the declared 1001 first and then std's growth past it.
     const more = try sourceBodyCounts(bytes, 1000, 1024 * 1024, bytes);
-    try std.testing.expect(more.largest < 4000 * 2);
+    try std.testing.expect(more.largest <= grow(bytes.len + 1));
     // And past the maximum: 413.
-    try std.testing.expectError(error.BodyTooBig, sourceBodyCounts(bytes, 1000, 2000, null));
+    _ = try sourceBodyCounts(bytes, 1000, 2000, error.BodyTooBig);
 }
 
 test "Request.body: Content-Length: 0 and no body are null" {
