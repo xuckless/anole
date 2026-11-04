@@ -1644,10 +1644,11 @@ fn giveBig(b: []u8) void {
 
 /// A buffer for the records of a small flush (a typical response or
 /// WebSocket message plus TLS overhead), so a small write in flight pins
-/// 2 KiB, not a block. A third pool, with room for a burst of them:
-/// at most 256 KiB per thread.
+/// 2 KiB, not a block. A third pool, with room for a burst of them (256
+/// in flight per executor under a bursty load): at most 512 KiB per thread,
+/// HAProxy's per-thread pool cache size.
 const small_len = 2 * 1024;
-const small_pool_cap = 128;
+const small_pool_cap = 256;
 
 comptime {
     // `Buf.release` tells the classes apart by length.
@@ -1791,12 +1792,18 @@ pub const buf_checks = if (builtin.is_test) struct {
         try expectEqual(1, pool_len);
         try expectEqual(1, big_pool_len);
 
-        // A first write past `small_len` goes straight to a block.
-        try appendPattern(&b, small_len + 1);
+        // A first write past `small_len` goes straight to a block, never
+        // through a small buffer: with the small pool empty, a detour would
+        // allocate one and leave it pooled.
+        emptyPools();
+        var first: [small_len + 1]u8 = undefined;
+        for (&first, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% 7);
+        try b.append(&first);
         try expectEqual(block_len, b.mem.len);
-        try expectEqual(0, pool_len);
-        try expectEqual(1, small_pool_len);
+        try expectEqual(0, small_pool_len);
+        try expectPattern(&b);
         b.release();
+        try expectEqual(0, small_pool_len);
         try expectEqual(1, pool_len);
     }
 
