@@ -28,6 +28,9 @@
     "limits": {
       "$ref": "#/$defs/Limits"
     },
+    "admission": {
+      "$ref": "#/$defs/Admission"
+    },
     "proxy": {
       "$ref": "#/$defs/Proxy"
     },
@@ -1443,6 +1446,20 @@
           "default": 0,
           "description": "Open connections at most; 0 follows the open-file limit."
         },
+        "max_websockets": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Open WebSockets at most, over every protocol; past it an upgrade is answered 503 with Retry-After. Null: no cap."
+        },
         "max_requests_per_connection": {
           "anyOf": [
             {
@@ -1470,6 +1487,68 @@
           "maximum": 4294967295,
           "default": 1048576,
           "description": "The largest event anole_sse_publish and anole_sse_send take."
+        }
+      }
+    },
+    "Admission": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The WebSocket admission gate (docs/server.md, \"Overload\"): while an executor is overloaded, the number of open WebSockets is held where it was, and an upgrade past it is answered 503 with Retry-After; every close readmits one.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Freeze the WebSocket count under load. The executors are measured either way, and limits.max_websockets applies either way."
+        },
+        "util_enter": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.85,
+          "description": "Executor utilization (1 - time asleep in the event poll / wall time) of a 1 s window that counts toward going hot. 0.88 is the documented fallback."
+        },
+        "util_exit": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.8,
+          "description": "A hot executor cools after a window under this, no sooner than min_shed_ms after it went hot."
+        },
+        "sustain": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 255,
+          "default": 3,
+          "description": "Consecutive windows over util_enter before an executor goes hot."
+        },
+        "min_shed_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 5000,
+          "description": "The least time an executor stays hot; within this long after it cooled, one window over the line makes it hot again."
+        },
+        "lag_enter_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 25,
+          "description": "A window whose every probe tick was this late counts as over the line (an executor starved of CPU)."
+        },
+        "retry_after_s": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "minItems": 2,
+          "maxItems": 2,
+          "default": [
+            5,
+            15
+          ],
+          "description": "A refused upgrade's Retry-After, in seconds, drawn uniformly from this range."
         }
       }
     },

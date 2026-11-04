@@ -485,6 +485,10 @@ Moving to the next minor version (0.18):
    still defers to `root.debug.handleSegfault` (the crash flush). Then run
    `zig build hang-probe --test-timeout 20s` with `ANOLE_TEST_DUMP_AFTER=5`
    and `zig build crash-probe` on Linux and macOS.
+5. `safety.allocUninit` (src/safety/root.zig) and dusty_tls's `mallocUninit`
+   call `Allocator.rawAlloc` to skip `alloc`'s `undefined` fill: re-check
+   `rawAlloc`'s signature, and that `alloc` still fills (if not, drop both
+   helpers for plain `alloc`).
 
 ## Cadence
 

@@ -105,6 +105,15 @@ pub fn currentExecutor(io: std.Io) ?usize {
     return rt.currentExecutor() orelse null;
 }
 
+/// Nanoseconds the calling executor's event loop has slept in its waiting
+/// poll syscall, or null off zio, off an executor, or on a backend that
+/// doesn't measure it (io_uring; see `admission`).
+pub fn loopIdleNs(io: std.Io) ?u64 {
+    if (comptime !have_zio) return null;
+    const rt = zio.Runtime.fromIo(io) orelse return null;
+    return rt.currentLoopIdleNs();
+}
+
 /// How many executors accept loops can be spread over, or null when
 /// placement does not apply (not zio).
 pub fn executorCount(io: std.Io) ?usize {

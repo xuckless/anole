@@ -1594,6 +1594,17 @@ const pool_cap = 16;
 threadlocal var pool_blocks: [pool_cap][*]u8 = undefined;
 threadlocal var pool_len: usize = 0;
 
+/// `len` bytes from malloc without std's `undefined` fill, 0xAA over the
+/// whole allocation in ReleaseSafe (safety's `allocUninit`; this module has
+/// no anole_safety). Every user writes before it reads, as with a block
+/// from a pool. Poisoned with 0xDD in Debug and test builds, as safety's
+/// helper does (SAFETY.md M6). Freed with `c_allocator.free`.
+fn mallocUninit(len: usize) ?[]u8 {
+    const p = std.heap.c_allocator.rawAlloc(len, .@"1", @returnAddress()) orelse return null;
+    if (builtin.mode == .debug or builtin.is_test) @memset(p[0..len], 0xDD);
+    return p[0..len];
+}
+
 /// A block from this thread's pool, or a new one; null if out of memory.
 /// Only for short sections: no I/O and nothing that suspends runs between
 /// the pool's reads and writes, so a coroutine that moves to another thread
@@ -1603,7 +1614,7 @@ fn takeBlock() ?[]u8 {
         pool_len -= 1;
         return pool_blocks[pool_len][0..block_len];
     }
-    return std.heap.c_allocator.alloc(u8, block_len) catch null;
+    return mallocUninit(block_len);
 }
 
 fn giveBlock(b: []u8) void {
@@ -1629,7 +1640,7 @@ fn takeBig() ?[]u8 {
         big_pool_len -= 1;
         return big_blocks[big_pool_len][0..big_len];
     }
-    return std.heap.c_allocator.alloc(u8, big_len) catch null;
+    return mallocUninit(big_len);
 }
 
 fn giveBig(b: []u8) void {
@@ -1663,7 +1674,7 @@ fn takeSmall() ?[]u8 {
         small_pool_len -= 1;
         return small_blocks[small_pool_len][0..small_len];
     }
-    return std.heap.c_allocator.alloc(u8, small_len) catch null;
+    return mallocUninit(small_len);
 }
 
 fn giveSmall(b: []u8) void {
@@ -1713,7 +1724,7 @@ const Buf = struct {
         // Never a pooled length, so `release` can tell them apart.
         var size = @max(need, 2 * block_len, 2 * b.mem.len);
         if (size == block_len or size == big_len) size += 1;
-        b.move(try std.heap.c_allocator.alloc(u8, size));
+        b.move(mallocUninit(size) orelse return error.OutOfMemory);
     }
 
     /// Copies the bytes into `new`, gives the old storage back and keeps `new`.
@@ -1840,6 +1851,39 @@ pub const buf_checks = if (builtin.is_test) struct {
         try expect(std.mem.indexOfScalar([*]u8, &warm, bufs[small_pool_cap].mem.ptr) == null);
         for (&bufs) |*b| b.release();
         try expectEqual(small_pool_cap, small_pool_len);
+    }
+
+    /// Rounds of `n` blocks in flight at once, then all given back: the
+    /// first round allocates every block, each later one `n - pool_cap`
+    /// (a block taken from an empty pool is a miss, `mallocUninit`), and
+    /// the pool keeps at most `pool_cap`. The model of how a hold of many
+    /// streaming sockets on one executor misses; the real rate is the
+    /// benchmark's (an uprobe on malloc).
+    pub fn blockMisses() !void {
+        for ([_]usize{ 16, 17, 64 }) |n| {
+            emptyPools();
+            defer emptyPools();
+            var blocks: [64][]u8 = undefined;
+            for (0..3) |round| {
+                var misses: usize = 0;
+                for (blocks[0..n], 0..) |*b, i| {
+                    const miss = pool_len == 0;
+                    if (miss) misses += 1;
+                    b.* = takeBlock() orelse return error.OutOfMemory;
+                    // A miss is poisoned in test builds (`mallocUninit`).
+                    if (miss) try expect(std.mem.allEqual(u8, b.*, 0xDD));
+                    // Written before it is read, as every user of a block.
+                    @memset(b.*, @truncate(i));
+                }
+                for (blocks[0..n], 0..) |b, i| {
+                    try expectEqual(block_len, b.len);
+                    try expect(std.mem.allEqual(u8, b, @truncate(i)));
+                }
+                try expectEqual(if (round == 0) n else n -| pool_cap, misses);
+                for (blocks[0..n]) |b| giveBlock(b);
+                try expectEqual(@min(n, pool_cap), pool_len);
+            }
+        }
     }
 } else struct {};
 

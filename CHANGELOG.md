@@ -3,6 +3,18 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+### Changed
+
+- A WebSocket message over HTTP/1.1 that arrives in one frame small
+  enough for the connection's read buffer is no longer copied: `msg.data`
+  is a slice of the read buffer, unmasked in place (a piece of a
+  fragmented message is copied once, into the whole message). It is valid
+  until the next `receive`, as documented before, but a slice kept past it
+  now changes under you; Debug builds fill it with 0xDD at the next
+  receive. Copy what must outlive the call or go to another task.
+
 ## 0.5.1 (2026-11-04)
 
 ### Changed

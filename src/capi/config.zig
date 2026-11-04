@@ -33,6 +33,8 @@ pub const Config = struct {
     listeners: []const Listener = &.{.{}},
     timeouts: Timeouts = .{},
     limits: Limits = .{},
+    /// The WebSocket admission gate (docs/server.md, "Overload").
+    admission: Admission = .{},
     /// Trust in proxies in front: `trusted_hops` of them for the client's
     /// address from `X-Forwarded-For` (PROXY protocol is per listener),
     /// and whether `X-Forwarded-Proto` / `X-Forwarded-Host` count.
@@ -209,6 +211,9 @@ pub const Config = struct {
         ws_max_message: u32 = 1 << 20,
         /// Open connections at most; 0 follows the open-file limit.
         max_connections: u32 = 0,
+        /// Open WebSockets at most, over every protocol; past it an upgrade
+        /// is answered 503 with Retry-After. Null: no cap.
+        max_websockets: ?u32 = null,
         /// Requests per keep-alive connection; null: no limit.
         max_requests_per_connection: ?u32 = null,
         /// The largest database answer, in bytes of its record: past it,
@@ -219,6 +224,17 @@ pub const Config = struct {
         /// The largest event `anole_sse_publish` and `anole_sse_send` take.
         sse_max_event: u32 = 1 << 20,
         // ---- end p3/realtime ----
+    };
+
+    /// `anole.ServerOptions.admission`, with times in milliseconds.
+    pub const Admission = struct {
+        enabled: bool = true,
+        util_enter: f32 = 0.85,
+        util_exit: f32 = 0.80,
+        sustain: u8 = 3,
+        min_shed_ms: u32 = 5000,
+        lag_enter_ms: u32 = 25,
+        retry_after_s: [2]u16 = .{ 5, 15 },
     };
 
     pub const Database = struct {
@@ -1367,6 +1383,7 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     if (cfg.limits.max_head_size < 1024 or cfg.limits.max_head_size > 1 << 20) return fail(why, "limits.max_head_size: 1024 to 1048576", .{});
     if (cfg.response.write_buffer_size == 0) return fail(why, "response.write_buffer_size: at least 1", .{});
     if (cfg.response.brotli_quality > 11) return fail(why, "response.brotli_quality: 0 to 11", .{});
+    if (!(cfg.admission.util_exit >= 0 and cfg.admission.util_exit <= cfg.admission.util_enter and cfg.admission.util_enter <= 1)) return fail(why, "admission: 0 <= util_exit <= util_enter <= 1", .{});
     if (cfg.http3.sockets) |n| if (n == 0 or n > 255) return fail(why, "http3.sockets: 1 to 255", .{});
     if (cfg.limits.max_inflight == 0 or cfg.limits.max_inflight > 1 << 20) return fail(why, "limits.max_inflight: 1 to 1048576", .{});
     if (cfg.limits.inline_body_max > cfg.limits.body_max) return fail(why, "limits.inline_body_max is above limits.body_max", .{});
