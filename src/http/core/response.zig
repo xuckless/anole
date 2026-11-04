@@ -2355,18 +2355,10 @@ pub const Response = struct {
     }
 };
 
-/// `n` in decimal, as `print("{d}")` writes it.
+/// `n` in decimal, as `print("{d}")` writes it (std's two digits per
+/// division, as json_out's integers).
 fn writeDecimal(w: *std.Io.Writer, n: usize) std.Io.Writer.Error!void {
-    var buf: [20]u8 = undefined;
-    var i: usize = buf.len;
-    var v = n;
-    while (true) {
-        i -= 1;
-        buf[i] = '0' + @as(u8, @intCast(v % 10));
-        v /= 10;
-        if (v == 0) break;
-    }
-    return w.writeAll(buf[i..]);
+    return w.printInt(n, 10, .lower, .{});
 }
 
 fn writeJsonString(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
