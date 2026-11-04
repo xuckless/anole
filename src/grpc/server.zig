@@ -947,7 +947,8 @@ pub fn transcodedBody(call: *Call, has_body: bool, whole: ?[]const u8) ![]const 
         var in_buf: [16 * 1024]u8 = undefined;
         // Bounded by max_message_size below, not by limits.body_max.
         var reader = try call.req.readerLimited(&in_buf, null);
-        break :blk reader.interface.allocRemaining(call.arena, .limited(call.impl.max_message_size +| 1)) catch |err| switch (err) {
+        const hint = if (reader.decode == null) call.req.content_length else null;
+        break :blk dusty.allocRemainingHinted(&reader.interface, call.arena, call.impl.max_message_size +| 1, hint) catch |err| switch (err) {
             error.StreamTooLong => return error.MessageTooLarge,
             else => |e| return e,
         };
@@ -1075,11 +1076,11 @@ pub fn readPayload(call: *Call, body: *dusty.RequestBodyReader, streaming: bool)
             if (call.impl.unary_read) return null;
             call.impl.unary_read = true;
             if (call.impl.get_message) |message| break :blk message;
-            break :blk try readWhole(call, &body.interface, call.impl.max_message_size +| 1, streaming);
+            break :blk try readWhole(call, body, call.impl.max_message_size +| 1, streaming);
         },
         .grpc_web_text => blk: {
             if (call.impl.text_input == null) {
-                const text = try readWhole(call, &body.interface, call.impl.max_message_size *| 2 +| 4096, streaming);
+                const text = try readWhole(call, body, call.impl.max_message_size *| 2 +| 4096, streaming);
                 call.impl.text_input = .fixed(try decodeBase64Chunks(call.arena, text));
             }
             const msg = (try frame.readMessage(&call.impl.text_input.?, scratch, call.impl.max_message_size, call.impl.request_compression)) orelse return null;
@@ -1128,17 +1129,20 @@ fn frameBuffered(reader: *std.Io.Reader) bool {
 }
 
 /// The rest of the body, of at most `limit - 1` bytes, in the call's
-/// arena, read within the call's `read_timeout`.
-fn readWhole(call: *Call, reader: *std.Io.Reader, limit: usize, streaming: bool) ![]u8 {
+/// arena, read within the call's `read_timeout`. Sized by the declared
+/// length while nothing decodes it (`dusty.allocRemainingHinted`).
+fn readWhole(call: *Call, body: *dusty.RequestBodyReader, limit: usize, streaming: bool) ![]u8 {
+    const reader = &body.interface;
+    const hint = if (body.decode == null) call.req.content_length else null;
     const read = struct {
-        fn all(r: *std.Io.Reader, arena: std.mem.Allocator, max: usize) ![]u8 {
-            return r.allocRemaining(arena, .limited(max)) catch |err| switch (err) {
+        fn all(r: *std.Io.Reader, arena: std.mem.Allocator, max: usize, declared: ?usize) ![]u8 {
+            return dusty.allocRemainingHinted(r, arena, max, declared) catch |err| switch (err) {
                 error.StreamTooLong => error.MessageTooLarge,
                 else => |e| e,
             };
         }
     }.all;
-    const timeout = call.impl.read_timeout orelse return read(reader, call.arena, limit);
+    const timeout = call.impl.read_timeout orelse return read(reader, call.arena, limit, hint);
     if (streaming) {
         _ = reader.peekByte() catch |err| switch (err) {
             error.EndOfStream => return &.{},
@@ -1146,7 +1150,7 @@ fn readWhole(call: *Call, reader: *std.Io.Reader, limit: usize, streaming: bool)
         };
     }
     const bound: dusty.Deadline = .init(call.io, .{ .duration = .{ .raw = timeout, .clock = .awake } });
-    return bound.run(read, .{ reader, call.arena, limit }) catch |err| switch (err) {
+    return bound.run(read, .{ reader, call.arena, limit, hint }) catch |err| switch (err) {
         error.Timeout => error.ReadTimeout,
         else => |e| e,
     };
