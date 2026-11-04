@@ -529,3 +529,185 @@ test "Rooms: a member that leaves mid-drain gets nothing after leave returns and
     try wait.expectStays(io, "no bytes reach the member after leave returned", Unchanged{ .member = &member, .after = member.bytes.load(.monotonic) }, Unchanged.f, wait.short_window);
     try std.testing.expectEqual(@as(usize, 0), r.count("room"));
 }
+
+/// An allocator that counts what is asked of it, and fails the requests of
+/// one size when told to. Thread-safe, as `Rooms` needs.
+const Probe = struct {
+    child: std.mem.Allocator,
+    calls: std.atomic.Value(usize) = .init(0),
+    /// Requests of exactly `watch` bytes (the size of a room's snapshot).
+    watched: std.atomic.Value(usize) = .init(0),
+    watch: usize = 0,
+    fail_watched: bool = false,
+
+    fn allocator(self: *Probe) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *Probe = @ptrCast(@alignCast(ctx));
+        _ = self.calls.fetchAdd(1, .monotonic);
+        if (self.watch != 0 and len == self.watch) {
+            _ = self.watched.fetchAdd(1, .monotonic);
+            if (self.fail_watched) return null;
+        }
+        return self.child.rawAlloc(len, alignment, ra);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *Probe = @ptrCast(@alignCast(ctx));
+        _ = self.calls.fetchAdd(1, .monotonic);
+        return self.child.rawResize(memory, alignment, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *Probe = @ptrCast(@alignCast(ctx));
+        _ = self.calls.fetchAdd(1, .monotonic);
+        return self.child.rawRemap(memory, alignment, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *Probe = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ra);
+    }
+};
+
+/// `n` stalled members in one room, for the snapshot tests.
+const Crowd = struct {
+    members: []Stalled,
+
+    fn create(gpa: std.mem.Allocator, io: std.Io, room_set: *websocket.Rooms, n: usize) !Crowd {
+        const members = try gpa.alloc(Stalled, n);
+        for (members) |*m| m.init(gpa, io);
+        var joined: usize = 0;
+        errdefer {
+            for (members[0..joined]) |*m| {
+                m.release.set(io);
+                room_set.leave("room", &m.socket);
+            }
+            for (members) |*m| m.ws.deinit();
+            gpa.free(members);
+        }
+        for (members) |*m| {
+            m.cancelable = true;
+            try room_set.join("room", &m.socket);
+            joined += 1;
+        }
+        return .{ .members = members };
+    }
+
+    fn waitEntered(self: Crowd, io: std.Io) !void {
+        for (self.members) |*m| try wait.waitEvent(io, "a member's sender reached the transport", &m.entered);
+    }
+
+    fn destroy(self: Crowd, gpa: std.mem.Allocator, io: std.Io, room_set: *websocket.Rooms) void {
+        for (self.members) |*m| m.release.set(io);
+        for (self.members) |*m| room_set.leave("room", &m.socket);
+        for (self.members) |*m| m.ws.deinit();
+        gpa.free(self.members);
+    }
+};
+
+test "Rooms: a broadcast to a room of running members allocates nothing" {
+    inline for (.{ 65, 256, 4096 }) |n| {
+        const gpa = std.testing.allocator;
+        const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+        defer rt.deinit();
+        const io = rt.io();
+        var probe: Probe = .{ .child = gpa };
+        var r: websocket.Rooms = .init(probe.allocator(), .{});
+        defer r.deinit();
+        const crowd = try Crowd.create(gpa, io, &r, n);
+        defer crowd.destroy(gpa, io, &r);
+
+        const payload = try websocket.Rooms.Payload.create(gpa, .text, "hello");
+        defer payload.release(gpa);
+        // The first one starts every sender; each pops its message, so its
+        // queue keeps the room it needs for the next.
+        try std.testing.expectEqual(@as(usize, n), r.broadcastPayload("room", payload, null));
+        try crowd.waitEntered(io);
+
+        const before = probe.calls.load(.monotonic);
+        try std.testing.expectEqual(@as(usize, n), r.broadcastPayload("room", payload, null));
+        try std.testing.expectEqual(before, probe.calls.load(.monotonic));
+    }
+}
+
+test "Rooms: a broadcast to idle members takes a snapshot only above 64" {
+    inline for (.{ 64, 65, 4096 }) |n| {
+        const gpa = std.testing.allocator;
+        const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+        defer rt.deinit();
+        const io = rt.io();
+        var probe: Probe = .{ .child = gpa, .watch = n * @sizeOf(*anyopaque) };
+        var r: websocket.Rooms = .init(probe.allocator(), .{});
+        defer r.deinit();
+        const crowd = try Crowd.create(gpa, io, &r, n);
+        defer crowd.destroy(gpa, io, &r);
+
+        const payload = try websocket.Rooms.Payload.create(gpa, .text, "hello");
+        defer payload.release(gpa);
+        probe.watched.store(0, .monotonic);
+        try std.testing.expectEqual(@as(usize, n), r.broadcastPayload("room", payload, null));
+        try std.testing.expectEqual(@as(usize, if (n > 64) 1 else 0), probe.watched.load(.monotonic));
+        try crowd.waitEntered(io);
+    }
+}
+
+test "Rooms: when the snapshot cannot be had, every member still gets its sender" {
+    inline for (.{ 65, 200 }) |n| {
+        const gpa = std.testing.allocator;
+        const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+        defer rt.deinit();
+        const io = rt.io();
+        var probe: Probe = .{ .child = gpa, .watch = n * @sizeOf(*anyopaque), .fail_watched = true };
+        var r: websocket.Rooms = .init(probe.allocator(), .{});
+        defer r.deinit();
+        const crowd = try Crowd.create(gpa, io, &r, n);
+        defer crowd.destroy(gpa, io, &r);
+
+        const payload = try websocket.Rooms.Payload.create(gpa, .text, "hello");
+        defer payload.release(gpa);
+        probe.watched.store(0, .monotonic);
+        try std.testing.expectEqual(@as(usize, n), r.broadcastPayload("room", payload, null));
+        // Asked once, not once per member after the 64th.
+        try std.testing.expectEqual(@as(usize, 1), probe.watched.load(.monotonic));
+        try crowd.waitEntered(io);
+    }
+}
+
+test "Rooms: a member that left and one that joined between broadcasts of a big room" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var r: websocket.Rooms = .init(gpa, .{});
+    defer r.deinit();
+    const crowd = try Crowd.create(gpa, io, &r, 100);
+    defer crowd.destroy(gpa, io, &r);
+
+    const payload = try websocket.Rooms.Payload.create(gpa, .text, "hello");
+    defer payload.release(gpa);
+    try std.testing.expectEqual(@as(usize, 100), r.broadcastPayload("room", payload, null));
+    try crowd.waitEntered(io);
+
+    // The leaver's send under way ends, so its leave returns.
+    const leaver = &crowd.members[50];
+    leaver.release.set(io);
+    r.leave("room", &leaver.socket);
+    const written = leaver.written.load(.monotonic);
+
+    var joiner: Stalled = undefined;
+    joiner.init(gpa, io);
+    defer joiner.ws.deinit();
+    joiner.cancelable = true;
+    try r.join("room", &joiner.socket);
+    defer {
+        joiner.release.set(io);
+        r.leave("room", &joiner.socket);
+    }
+    try std.testing.expectEqual(@as(usize, 100), r.count("room"));
+    try std.testing.expectEqual(@as(usize, 100), r.broadcastPayload("room", payload, null));
+    try joiner.entered.wait(io);
+    try std.testing.expectEqual(written, leaver.written.load(.monotonic));
+}
