@@ -28,7 +28,8 @@
 //! into a small stash inside the connection's state, and only a read that
 //! fills it moves the next reads to a block borrowed from a per-thread pool,
 //! given back as soon as BoringSSL has taken every byte of it. Records to
-//! send go into blocks from the same pool, given back once on the socket.
+//! send go into a small pooled buffer, move up to a block from the same pool
+//! only when they outgrow it, and are given back once on the socket.
 //! The handshake configuration is shed once the handshake is done
 //! (`SSL_set_shed_handshake_config`).
 const std = @import("std");
@@ -918,7 +919,8 @@ fn newServerCtx() !*c.SSL_CTX {
     // only. BoringSSL's default also has RSA key exchange and CBC with
     // SHA-1. TLS 1.3 suites are all of that kind and are not set here.
     if (c.SSL_CTX_set_strict_cipher_list(ctx, server_tls12_ciphers) != 1) return error.TlsFailure;
-    // Idle keep-alive connections give their record buffers back.
+    // A no-op in BoringSSL (SSL_MODE_RELEASE_BUFFERS is 0, ssl.h), which
+    // frees its record buffers after every record anyway; kept for AWS-LC.
     _ = c.SSL_CTX_set_mode(ctx, c.SSL_MODE_RELEASE_BUFFERS);
     // Resumption through stateless session tickets only. The stateful cache
     // holds up to 20k sessions per listener behind one lock that every
@@ -1640,8 +1642,42 @@ fn giveBig(b: []u8) void {
     std.heap.c_allocator.free(b);
 }
 
-/// Bytes queued for the socket, in a pool block, or in a bigger allocation
-/// for anything that does not fit one (a large handshake flight).
+/// A buffer for the records of a small flush (a typical response or
+/// WebSocket message plus TLS overhead), so a small write in flight pins
+/// 2 KiB, not a block. A third pool, with room for a burst of them:
+/// at most 256 KiB per thread.
+const small_len = 2 * 1024;
+const small_pool_cap = 128;
+
+comptime {
+    // `Buf.release` tells the classes apart by length.
+    std.debug.assert(small_len != block_len and small_len != big_len and block_len != big_len);
+}
+
+threadlocal var small_blocks: [small_pool_cap][*]u8 = undefined;
+threadlocal var small_pool_len: usize = 0;
+
+fn takeSmall() ?[]u8 {
+    if (small_pool_len > 0) {
+        small_pool_len -= 1;
+        return small_blocks[small_pool_len][0..small_len];
+    }
+    return std.heap.c_allocator.alloc(u8, small_len) catch null;
+}
+
+fn giveSmall(b: []u8) void {
+    std.debug.assert(b.len == small_len);
+    if (small_pool_len < small_pool_cap) {
+        small_blocks[small_pool_len] = b.ptr;
+        small_pool_len += 1;
+        return;
+    }
+    std.heap.c_allocator.free(b);
+}
+
+/// Bytes queued for the socket, in a small buffer or a pool block, or in a
+/// bigger allocation for anything that does not fit one (a large handshake
+/// flight).
 const Buf = struct {
     mem: []u8 = &.{},
     len: usize = 0,
@@ -1658,24 +1694,29 @@ const Buf = struct {
     }
 
     fn grow(b: *Buf, need: usize) error{OutOfMemory}!void {
-        if (b.mem.len == 0 and need <= block_len) {
-            b.mem = takeBlock() orelse return error.OutOfMemory;
+        if (b.mem.len == 0 and need <= small_len) {
+            b.mem = takeSmall() orelse return error.OutOfMemory;
+            return;
+        }
+        if (need <= block_len and b.mem.len < block_len) {
+            const block = takeBlock() orelse return error.OutOfMemory;
+            b.move(block);
             return;
         }
         if (need <= big_len and b.mem.len < big_len) {
             if (takeBig()) |big| {
-                @memcpy(big[0..b.len], b.mem[0..b.len]);
-                const len = b.len;
-                b.release();
-                b.mem = big;
-                b.len = len;
+                b.move(big);
                 return;
             }
         }
-        // Never `block_len` or `big_len` long, so `release` can tell them apart.
+        // Never a pooled length, so `release` can tell them apart.
         var size = @max(need, 2 * block_len, 2 * b.mem.len);
         if (size == block_len or size == big_len) size += 1;
-        const new = try std.heap.c_allocator.alloc(u8, size);
+        b.move(try std.heap.c_allocator.alloc(u8, size));
+    }
+
+    /// Copies the bytes into `new`, gives the old storage back and keeps `new`.
+    fn move(b: *Buf, new: []u8) void {
         @memcpy(new[0..b.len], b.mem[0..b.len]);
         const len = b.len;
         b.release();
@@ -1685,7 +1726,9 @@ const Buf = struct {
 
     /// Gives the storage back, with whatever it holds.
     fn release(b: *Buf) void {
-        if (b.mem.len == block_len) {
+        if (b.mem.len == small_len) {
+            giveSmall(b.mem);
+        } else if (b.mem.len == block_len) {
             giveBlock(b.mem);
         } else if (b.mem.len == big_len) {
             giveBig(b.mem);
@@ -1695,6 +1738,103 @@ const Buf = struct {
         b.* = .{};
     }
 };
+
+/// Checks of the buffer pools, run from src/tls/root.zig's tests (this
+/// module's own `test` blocks are not collected). Each starts and ends with
+/// this thread's pools empty.
+pub const buf_checks = if (builtin.is_test) struct {
+    const expect = std.testing.expect;
+    const expectEqual = std.testing.expectEqual;
+
+    fn emptyPools() void {
+        while (small_pool_len > 0) std.heap.c_allocator.free(takeSmall().?);
+        while (pool_len > 0) std.heap.c_allocator.free(takeBlock().?);
+        while (big_pool_len > 0) std.heap.c_allocator.free(takeBig().?);
+    }
+
+    fn appendPattern(b: *Buf, upto: usize) !void {
+        var chunk: [256]u8 = undefined;
+        while (b.len < upto) {
+            const n = @min(chunk.len, upto - b.len);
+            for (chunk[0..n], b.len..) |*byte, i| byte.* = @truncate(i *% 31 +% 7);
+            try b.append(chunk[0..n]);
+        }
+    }
+
+    fn expectPattern(b: *const Buf) !void {
+        for (b.items(), 0..) |byte, i| try expectEqual(@as(u8, @truncate(i *% 31 +% 7)), byte);
+    }
+
+    /// A queued flush starts in a small buffer and moves up a class at a
+    /// time, bytes intact, each old buffer back in its own pool.
+    pub fn classes() !void {
+        emptyPools();
+        defer emptyPools();
+        var b: Buf = .{};
+        defer b.release();
+        try appendPattern(&b, 300);
+        try expectEqual(small_len, b.mem.len);
+        try appendPattern(&b, 3 * 1024);
+        try expectEqual(block_len, b.mem.len);
+        try expectEqual(1, small_pool_len);
+        try expectPattern(&b);
+        try appendPattern(&b, 20 * 1024);
+        try expectEqual(big_len, b.mem.len);
+        try expectEqual(1, pool_len);
+        try expectPattern(&b);
+        try appendPattern(&b, 70 * 1024);
+        try expect(b.mem.len > big_len);
+        try expectEqual(1, big_pool_len);
+        try expectPattern(&b);
+        b.release();
+        try expectEqual(1, small_pool_len);
+        try expectEqual(1, pool_len);
+        try expectEqual(1, big_pool_len);
+
+        // A first write past `small_len` goes straight to a block.
+        try appendPattern(&b, small_len + 1);
+        try expectEqual(block_len, b.mem.len);
+        try expectEqual(0, pool_len);
+        try expectEqual(1, small_pool_len);
+        b.release();
+        try expectEqual(1, pool_len);
+    }
+
+    /// A burst of `small_pool_cap` small writes in flight at once, after
+    /// the first, allocates nothing: every buffer comes from the pool and
+    /// goes back to it. One more in flight allocates, and is freed on
+    /// release past the cap.
+    pub fn burst() !void {
+        emptyPools();
+        defer emptyPools();
+        var bufs: [small_pool_cap + 1]Buf = @splat(.{});
+        var warm: [small_pool_cap][*]u8 = undefined;
+
+        for (bufs[0..small_pool_cap]) |*b| try appendPattern(b, 300);
+        for (bufs[0..small_pool_cap], &warm) |*b, *p| {
+            p.* = b.mem.ptr;
+            b.release();
+        }
+        try expectEqual(small_pool_cap, small_pool_len);
+
+        for (0..2) |_| {
+            for (bufs[0..small_pool_cap]) |*b| try appendPattern(b, 300);
+            try expectEqual(0, small_pool_len);
+            for (bufs[0..small_pool_cap]) |*b| {
+                try expect(std.mem.indexOfScalar([*]u8, &warm, b.mem.ptr) != null);
+                try expectPattern(b);
+                b.release();
+            }
+            try expectEqual(small_pool_cap, small_pool_len);
+        }
+
+        for (&bufs) |*b| try appendPattern(b, 300);
+        try expectEqual(0, small_pool_len);
+        try expect(std.mem.indexOfScalar([*]u8, &warm, bufs[small_pool_cap].mem.ptr) == null);
+        for (&bufs) |*b| b.release();
+        try expectEqual(small_pool_cap, small_pool_len);
+    }
+} else struct {};
 
 var bio_method: ?*c.BIO_METHOD = null;
 /// The type `bio_method` was made with (from BIO_get_new_index), so a
