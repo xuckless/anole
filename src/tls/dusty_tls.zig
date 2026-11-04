@@ -47,9 +47,11 @@ const Allocator = std.mem.Allocator;
 /// bytes when the handshake starts is read to the end of them first.
 pub const input_buffer_len: usize = 0;
 /// Ciphertext write buffer the core gives the TCP writer: none. Records reach
-/// the socket from `Shared.sending` in one write each flush, so a buffer
-/// here would only copy them once more, and keep pages per connection that
-/// every response dirties.
+/// the socket from `Shared.sending` in one write each flush, or, for a
+/// response's borrowed last record, straight from BoringSSL's write buffer
+/// (`Connection.writeAll`, `Shared.sendBorrowed`), so a buffer here would
+/// only copy them once more, and keep pages per connection that every
+/// response dirties.
 pub const output_buffer_len: usize = 0;
 
 /// Largest TLS record payload; SSL_write is called with at most this much.
@@ -538,12 +540,20 @@ pub const Connection = struct {
     pub fn parkable(self: *Connection) bool {
         const sh = self.shared orelse return true;
         sh.lock();
-        defer sh.unlock();
-        if (sh.filling or sh.input.bufferedLen() != 0 or sh.pending.len != 0 or sh.sending.len != 0) return false;
-        if (c.SSL_has_pending(sh.ssl) != 0) return false;
-        if (sh.block != null or sh.foreign) sh.useStash();
+        if (sh.filling or sh.input.bufferedLen() != 0 or sh.pending.len != 0 or sh.sending.len != 0 or
+            c.SSL_has_pending(sh.ssl) != 0)
+        {
+            sh.unlock();
+            return false;
+        }
+        // The read block goes back to the pool after the unlock (#178).
+        const block = sh.block;
+        sh.block = null;
+        if (block != null or sh.foreign) sh.useStash();
         sh.read_full = false;
         sh.busy = 0;
+        sh.unlock();
+        if (block) |b| giveBlock(b);
         return true;
     }
 
@@ -2151,8 +2161,12 @@ fn bioWrite(bio: ?*c.BIO, in: [*c]const u8, len: c_int) callconv(.c) c_int {
         .out => {
             if (sh.retrying and bytes.ptr == sh.borrowed.ptr and bytes.len == sh.borrowed.len) return len;
             // Only the retry may write while the record is out; a retry
-            // with another buffer would be our bug.
-            std.debug.assert(!sh.retrying);
+            // with another buffer would be our bug (a BoringSSL bump that
+            // re-presents the record differently). Checked in Debug builds only: a
+            // plain assert is an optimizer assumption in ReleaseFast, which
+            // could fold the line above into accepting any retry, and the
+            // refusal below is the safe path in release.
+            if (builtin.mode == .debug) std.debug.assert(!sh.retrying);
             c.BIO_set_retry_write(bio);
             return -1;
         },
