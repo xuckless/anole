@@ -69,6 +69,9 @@ pub const WebSocket = struct {
     /// The last control frame's payload: a ping's (answered from here) or a
     /// close's reason, valid as a message's data is.
     control_payload: [125]u8 = undefined,
+    /// The last message handed out as a slice of the read buffer, poisoned
+    /// at the next receive (`poisonLent`). Debug and test builds only.
+    lent: if (safety.enabled) []u8 else void = if (safety.enabled) &.{} else {},
 
     /// The largest message a socket accepts unless told otherwise: 16 MiB.
     pub const default_max_message_size: usize = 1024 * 1024; // 1 MiB
@@ -88,7 +91,13 @@ pub const WebSocket = struct {
     /// One whole message, reassembled from its fragments.
     pub const Message = struct {
         type: MessageType,
-        /// The payload, valid until the next receive.
+        /// The payload, valid until the next receive (`receive`,
+        /// `receiveMany`, a `tryReceive` that returns a message, or
+        /// `receiveStarted`). A data frame that fit the read buffer is a
+        /// slice of the connection's read buffer, else of the message arena;
+        /// copy it before keeping it or handing it to another task. Debug
+        /// and test builds fill a read-buffer slice with 0xDD at the next
+        /// receive.
         data: []const u8,
         /// The peer's close code, for a `.close` message that has one.
         close_code: ?CloseCode = null,
@@ -162,7 +171,9 @@ pub const WebSocket = struct {
     /// Ping frames are handled automatically (pong sent).
     /// Pong frames are ignored.
     /// The returned message data is valid until the next call to receive(),
-    /// receiveMany() or tryReceive().
+    /// receiveMany(), tryReceive() (one that returns a message) or
+    /// receiveStarted(); it may point into the connection's read buffer
+    /// (`Message.data`).
     pub fn receive(self: *WebSocket) !Message {
         self.resetMessages();
         // Inlined down to the frame, so a loop that reads gets one function
@@ -176,7 +187,8 @@ pub const WebSocket = struct {
     /// complete in the read buffer, without blocking for more. A close
     /// message comes in a batch of its own, so the messages before it can
     /// still be answered. The messages are valid until the next call to
-    /// receive(), receiveMany() or tryReceive(). With more than one, the
+    /// receive(), receiveMany(), tryReceive() (one that returns a message)
+    /// or receiveStarted(), as `receive`'s are. With more than one, the
     /// answers to them are a batch (`Batch`) until the next call.
     pub fn receiveMany(self: *WebSocket) ![]const Message {
         self.resetMessages();
@@ -205,7 +217,9 @@ pub const WebSocket = struct {
     /// has begun in the read buffer; null once the buffer is empty, after
     /// answering the control frames in it (a ping gets its pong), so a peer
     /// that only pings does not hold the task. Part of a control frame is
-    /// read to its end first. The message as `receive` returns it.
+    /// read to its end first. The message as `receive` returns it, valid as
+    /// long; a control frame read here ends the previous message's
+    /// validity too.
     pub fn receiveStarted(self: *WebSocket) !?Message {
         const r = self.transport.reader;
         while (true) {
@@ -247,7 +261,9 @@ pub const WebSocket = struct {
     }
 
     /// Reading a close answers it, which ends sending, so a close is left
-    /// for the next batch.
+    /// for the next batch. It must never read a message that is only partly
+    /// buffered: the fill would move the read buffer under the messages
+    /// already in the batch, which may be slices of it.
     fn nextBufferedMessage(self: *WebSocket) !?Message {
         if (bufferedMessage(self.transport.reader.buffered()) != .data) return null;
         return try self.nextMessage();
@@ -324,8 +340,32 @@ pub const WebSocket = struct {
     const retained_message_max = 64 * 1024;
 
     fn resetMessages(self: *WebSocket) void {
+        self.poisonLent();
         _ = self.msg_arena.reset(.{ .retain_with_limit = retained_message_max });
         self.auto_responded = false;
+    }
+
+    /// SAFETY.md M6 for a message handed out as a slice of the read buffer
+    /// (`readFrame`): at the next receive its bytes read 0xDD, so a handler
+    /// that kept it, or gave it to another task, reads that instead of a
+    /// plausible next frame. Only while it is still in the reader's buffer,
+    /// and never over the bytes still to be read (a fill or a window's
+    /// rewind may have moved them there). Nothing outside Debug and test
+    /// builds.
+    fn poisonLent(self: *WebSocket) void {
+        if (!safety.enabled) return;
+        const lent = self.lent;
+        self.lent = &.{};
+        if (lent.len == 0) return;
+        const r = self.transport.reader;
+        // SAFETY: addresses only compared, to place the slice in the buffer.
+        const lo = @intFromPtr(lent.ptr);
+        const hi = lo + lent.len;
+        // SAFETY: as `lo`.
+        const base = @intFromPtr(r.buffer.ptr);
+        if (lo < base or hi > base + r.buffer.len) return;
+        if (hi > base + r.seek and lo < base + r.end) return;
+        safety.poison(lent);
     }
 
     /// Whether `bytes` starts with a whole message, along with any control
@@ -642,6 +682,7 @@ pub const WebSocket = struct {
         r.buffer = &.{};
         r.seek = 0;
         r.end = 0;
+        if (safety.enabled) self.lent = &.{};
         self.fragmented_data = .empty;
         self.fragmented_type = null;
         _ = self.msg_arena.reset(.free_all);
@@ -738,14 +779,29 @@ pub const WebSocket = struct {
         if (payload_len > self.max_message_size) {
             return Error.MessageTooLarge;
         }
+        const r = self.transport.reader;
+        const n: usize = @intCast(payload_len);
         // A control frame's payload (at most 125 bytes, checked above) goes
         // in the socket's own buffer, so control frames between a message's
-        // pieces take no memory of the message's.
-        const payload = if (is_control)
-            self.control_payload[0..@intCast(payload_len)]
-        else
-            try safety.allocUninit(self.msg_arena.allocator(), @intCast(payload_len));
-        try self.transport.reader.readSliceAll(payload);
+        // pieces take no memory of the message's. A data frame that fits the
+        // reader's buffer is handed on as a slice of it, unmasked in place,
+        // valid until the next read (std's `readSmallMessage`, uWebSockets,
+        // websocket.zig); a piece of a message is copied into
+        // `fragmented_data` before then. A bigger one is read into the
+        // message arena.
+        const payload: []u8 = if (is_control) blk: {
+            const p = self.control_payload[0..n];
+            try r.readSliceAll(p);
+            break :blk p;
+        } else if (n <= r.buffer.len) blk: {
+            const p = try r.take(n);
+            if (safety.enabled) self.lent = p;
+            break :blk p;
+        } else blk: {
+            const p = try safety.allocUninit(self.msg_arena.allocator(), n);
+            try r.readSliceAll(p);
+            break :blk p;
+        };
 
         if (masked) applyMask(payload, mask_key);
 
@@ -1287,7 +1343,7 @@ test "WebSocket: close sends its code and reason in one close frame" {
 
 test "WebSocket client: an unmasked server frame is read" {
     // A simple unmasked text frame with "Hi" — only valid server-to-client.
-    const frame_data = [_]u8{
+    var frame_data = [_]u8{
         0x81, // FIN + text
         0x02, // length = 2
         'H',
@@ -1309,7 +1365,7 @@ test "WebSocket client: an unmasked server frame is read" {
 }
 
 test "WebSocket: readFrame rejects unmasked client frame (server mode)" {
-    const frame_data = [_]u8{ 0x81, 0x02, 'H', 'i' };
+    var frame_data = [_]u8{ 0x81, 0x02, 'H', 'i' };
     var reader: std.Io.Reader = .fixed(&frame_data);
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
@@ -1321,7 +1377,7 @@ test "WebSocket: readFrame rejects unmasked client frame (server mode)" {
 }
 
 test "WebSocket client: a masked server frame is refused with 1002" {
-    const frame_data = [_]u8{
+    var frame_data = [_]u8{
         0x81, 0x82, // FIN + text, masked + length = 2
         0x12, 0x34, 0x56, 0x78, // mask key
         0x5A, 0x5D, // masked payload
@@ -1349,7 +1405,7 @@ test "WebSocket: the server unmasks a client frame with its key" {
     // A masked text frame with "Hi"
     // Mask key: 0x12, 0x34, 0x56, 0x78
     // 'H' ^ 0x12 = 0x5A, 'i' ^ 0x34 = 0x5D
-    const frame_data = [_]u8{
+    var frame_data = [_]u8{
         0x81, // FIN + text
         0x82, // masked + length = 2
         0x12, 0x34, 0x56, 0x78, // mask key
@@ -1372,7 +1428,7 @@ test "WebSocket: receive handles ping automatically" {
 
     // Masked ping + masked text (client->server frames per RFC 6455).
     // Mask key: 0x00, 0x00, 0x00, 0x00 — payload bytes therefore equal plaintext.
-    const frame_data = [_]u8{
+    var frame_data = [_]u8{
         // Ping frame: FIN+ping, mask+len=4, mask key, masked payload
         0x89, 0x84, 0x00, 0x00, 0x00, 0x00, 'p', 'i', 'n', 'g',
         // Text frame: FIN+text, mask+len=5, mask key, masked payload
@@ -1399,15 +1455,17 @@ test "WebSocket: receive handles ping automatically" {
     try std.testing.expectEqualStrings("ping", written[2..6]);
 }
 
-/// A server-side socket fed `frames`, with what it writes in `out`.
-fn serverSocketOver(frames: []const u8, reader: *std.Io.Reader, out: *std.Io.Writer) WebSocket {
+/// A server-side socket fed `frames`, with what it writes in `out`. The
+/// frames are writable, as a connection's read buffer is: a message is
+/// unmasked where it lies.
+fn serverSocketOver(frames: []u8, reader: *std.Io.Reader, out: *std.Io.Writer) WebSocket {
     reader.* = .fixed(frames);
     return WebSocket.init(std.testing.io, .{ .writer = out, .reader = reader }, std.testing.allocator, 0);
 }
 
 test "WebSocket: a whole message in the middle of a fragmented one is a protocol error" {
     // Masked with a zero key, so the payload bytes are the plaintext.
-    const frames = [_]u8{
+    var frames = [_]u8{
         // Text, FIN clear: the first piece of a message.
         0x01, 0x82, 0x00, 0x00, 0x00, 0x00, 'h', 'i',
         // Text, FIN set: a whole new message before the first is done.
@@ -1424,7 +1482,7 @@ test "WebSocket: a whole message in the middle of a fragmented one is a protocol
 
 test "WebSocket: a fragmented control frame is a protocol error" {
     // Ping with FIN clear.
-    const frames = [_]u8{ 0x09, 0x80, 0x00, 0x00, 0x00, 0x00 };
+    var frames = [_]u8{ 0x09, 0x80, 0x00, 0x00, 0x00, 0x00 };
     var reader: std.Io.Reader = undefined;
     var buf: [64]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buf);
@@ -1435,7 +1493,7 @@ test "WebSocket: a fragmented control frame is a protocol error" {
 }
 
 test "WebSocket: a close frame with a one-byte payload is a protocol error" {
-    const frames = [_]u8{ 0x88, 0x81, 0x00, 0x00, 0x00, 0x00, 0x03 };
+    var frames = [_]u8{ 0x88, 0x81, 0x00, 0x00, 0x00, 0x00, 0x03 };
     var reader: std.Io.Reader = undefined;
     var buf: [64]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buf);
@@ -1448,7 +1506,7 @@ test "WebSocket: a close frame with a one-byte payload is a protocol error" {
 test "WebSocket: a close code that may not be sent is answered with 1002, not echoed" {
     // 1005: reserved for a close with no code, never for the wire. With a
     // reason behind it that is not even UTF-8.
-    const frames = [_]u8{ 0x88, 0x83, 0x00, 0x00, 0x00, 0x00, 0x03, 0xED, 0xFF };
+    var frames = [_]u8{ 0x88, 0x83, 0x00, 0x00, 0x00, 0x00, 0x03, 0xED, 0xFF };
     var reader: std.Io.Reader = undefined;
     var buf: [64]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buf);
@@ -1468,7 +1526,7 @@ test "WebSocket: a close code that may not be sent is answered with 1002, not ec
 
 test "WebSocket: a close reason that is not UTF-8 is answered with 1007" {
     // 1000 with a reason of one stray continuation byte.
-    const frames = [_]u8{ 0x88, 0x83, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE8, 0x80 };
+    var frames = [_]u8{ 0x88, 0x83, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE8, 0x80 };
     var reader: std.Io.Reader = undefined;
     var buf: [64]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buf);
@@ -1485,10 +1543,12 @@ test "WebSocket: a close reason that is not UTF-8 is answered with 1007" {
 /// What a server socket fed `frames` fails with, and the close code it
 /// sends first.
 fn expectFailureClose(frames: []const u8, max_message_size: usize, expected: anyerror, code: u16) !void {
+    var input: [64]u8 = undefined;
+    @memcpy(input[0..frames.len], frames);
     var reader: std.Io.Reader = undefined;
     var buf: [64]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buf);
-    var ws = serverSocketOver(frames, &reader, &out);
+    var ws = serverSocketOver(input[0..frames.len], &reader, &out);
     defer ws.deinit();
     ws.max_message_size = max_message_size;
 
@@ -1520,7 +1580,8 @@ test "WebSocket: a receive that fails on the transport sends no close" {
     var reader: std.Io.Reader = undefined;
     var buf: [64]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buf);
-    var ws = serverSocketOver(&.{0x81}, &reader, &out);
+    var frames = [_]u8{0x81};
+    var ws = serverSocketOver(&frames, &reader, &out);
     defer ws.deinit();
     try std.testing.expect(std.meta.isError(ws.receive()));
     try std.testing.expectEqual(0, out.buffered().len);
@@ -1678,7 +1739,7 @@ test "WebSocket: autoflush off leaves frames in the buffer until flush or a pong
     defer probe.out.deinit(gpa);
 
     // Masked ping, then masked text; zero mask keys leave the payloads readable.
-    const frames = [_]u8{
+    var frames = [_]u8{
         0x89, 0x84, 0, 0, 0, 0, 'p', 'i', 'n', 'g',
         0x81, 0x82, 0, 0, 0, 0, 'h', 'i',
     };
@@ -1702,7 +1763,7 @@ test "WebSocket: autoflush off leaves frames in the buffer until flush or a pong
 test "WebSocket: receiveMany returns the buffered messages and stops at a partial one" {
     // Masked frames with zero mask keys: "a", a ping, "b" + "c" in two
     // fragments, then the start of a frame whose payload has not arrived.
-    const frames = [_]u8{ 0x81, 0x81, 0, 0, 0, 0, 'a' } ++
+    var frames = [_]u8{ 0x81, 0x81, 0, 0, 0, 0, 'a' } ++
         [_]u8{ 0x89, 0x80, 0, 0, 0, 0 } ++
         [_]u8{ 0x01, 0x81, 0, 0, 0, 0, 'b' } ++
         [_]u8{ 0x80, 0x81, 0, 0, 0, 0, 'c' } ++
@@ -1724,7 +1785,7 @@ test "WebSocket: receiveMany returns the buffered messages and stops at a partia
 
 test "WebSocket: receiveMany leaves a close for the next batch" {
     // Masked frames with zero mask keys: "a", then a close with code 1000.
-    const frames = [_]u8{ 0x81, 0x81, 0, 0, 0, 0, 'a' } ++
+    var frames = [_]u8{ 0x81, 0x81, 0, 0, 0, 0, 'a' } ++
         [_]u8{ 0x88, 0x82, 0, 0, 0, 0, 0x03, 0xE8 };
     var reader: std.Io.Reader = undefined;
     var buf: [64]u8 = undefined;
@@ -1745,7 +1806,7 @@ test "WebSocket: receiveMany leaves a close for the next batch" {
 test "WebSocket: tryReceive returns null at a partial message and keeps the last one" {
     // Masked frames with zero mask keys: "a", then the first fragment of a
     // message whose last fragment has not arrived.
-    const frames = [_]u8{ 0x81, 0x81, 0, 0, 0, 0, 'a' } ++
+    var frames = [_]u8{ 0x81, 0x81, 0, 0, 0, 0, 'a' } ++
         [_]u8{ 0x01, 0x81, 0, 0, 0, 0, 'b' };
     var reader: std.Io.Reader = undefined;
     var buf: [64]u8 = undefined;
@@ -1806,7 +1867,7 @@ test "WebSocket: no std.Io sentinel escapes its public API" {
 
 test "WebSocket: RSV1 is refused until an extension allows it, then marks a data message compressed, never a control frame" {
     // A masked text frame with RSV1 (0xC1), then a ping with RSV1 (0xC9).
-    const frames = [_]u8{ 0xC1, 0x82, 0, 0, 0, 0, 'h', 'i', 0xC9, 0x80, 0, 0, 0, 0 };
+    var frames = [_]u8{ 0xC1, 0x82, 0, 0, 0, 0, 'h', 'i', 0xC9, 0x80, 0, 0, 0, 0 };
     var reader: std.Io.Reader = .fixed(&frames);
     var out: [64]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&out);
@@ -1841,7 +1902,7 @@ test "WebSocket: messages read together are answered in one write" {
     var wbuf: [256]u8 = undefined;
     var probe = SocketProbe.init(gpa, &wbuf);
     defer probe.out.deinit(gpa);
-    const frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b") ++ maskedFrame(0x1, "c");
+    var frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b") ++ maskedFrame(0x1, "c");
     var reader: std.Io.Reader = undefined;
     var ws = serverSocketOver(&frames, &reader, &probe.interface);
     defer ws.deinit();
@@ -1864,7 +1925,7 @@ test "WebSocket: a message not all here ends the batch, and held answers go out 
     var probe = SocketProbe.init(gpa, &wbuf);
     defer probe.out.deinit(gpa);
     // "a", "b", then half a frame.
-    const frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b") ++ [_]u8{ 0x81, 0x85, 0, 0 };
+    var frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b") ++ [_]u8{ 0x81, 0x85, 0, 0 };
     var reader: std.Io.Reader = undefined;
     var ws = serverSocketOver(&frames, &reader, &probe.interface);
     defer ws.deinit();
@@ -1888,7 +1949,7 @@ test "WebSocket: a send from another task is not held by the reader's batch" {
     var wbuf: [256]u8 = undefined;
     var probe = SocketProbe.init(gpa, &wbuf);
     defer probe.out.deinit(gpa);
-    const frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b");
+    var frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b");
     var reader: std.Io.Reader = undefined;
     var ws = serverSocketOver(&frames, &reader, &probe.interface);
     defer ws.deinit();
@@ -1915,7 +1976,7 @@ test "WebSocket: a send outside any batch leaves at once; from a task mid-batch 
     var a_buf: [256]u8 = undefined;
     var a_probe = SocketProbe.init(gpa, &a_buf);
     defer a_probe.out.deinit(gpa);
-    const frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b");
+    var frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b");
     var reader: std.Io.Reader = undefined;
     var a = serverSocketOver(&frames, &reader, &a_probe.interface);
     defer a.deinit();
@@ -1956,7 +2017,7 @@ test "WebSocket: from a task mid-batch, a big frame, or one the buffer has no ro
     var a_buf: [256]u8 = undefined;
     var a_probe = SocketProbe.init(gpa, &a_buf);
     defer a_probe.out.deinit(gpa);
-    const frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b");
+    var frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b");
     var reader: std.Io.Reader = undefined;
     var a = serverSocketOver(&frames, &reader, &a_probe.interface);
     defer a.deinit();
@@ -2021,7 +2082,7 @@ test "WebSocket: a pong in a batch keeps its place, and a close ends the batch" 
     var wbuf: [256]u8 = undefined;
     var probe = SocketProbe.init(gpa, &wbuf);
     defer probe.out.deinit(gpa);
-    const frames = maskedFrame(0x9, "p") ++ maskedFrame(0x1, "a") ++ maskedFrame(0x8, &.{ 0x03, 0xE8 });
+    var frames = maskedFrame(0x9, "p") ++ maskedFrame(0x1, "a") ++ maskedFrame(0x8, &.{ 0x03, 0xE8 });
     var reader: std.Io.Reader = undefined;
     var ws = serverSocketOver(&frames, &reader, &probe.interface);
     defer ws.deinit();
@@ -2043,7 +2104,7 @@ test "WebSocket: what a batch holds goes out when the reader waits for something
     var wbuf: [256]u8 = undefined;
     var probe = SocketProbe.init(gpa, &wbuf);
     defer probe.out.deinit(gpa);
-    const frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b");
+    var frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b");
     var reader: std.Io.Reader = undefined;
     var ws = serverSocketOver(&frames, &reader, &probe.interface);
     defer ws.deinit();
@@ -2129,7 +2190,7 @@ test "WebSocket: a payload read into uninitialized memory is exactly the bytes s
 }
 
 test "WebSocket: empty text and binary messages arrive empty, from receive and receiveMany" {
-    const frames = maskedFrame(0x1, "") ++ maskedFrame(0x2, "");
+    var frames = maskedFrame(0x1, "") ++ maskedFrame(0x2, "");
     var reader: std.Io.Reader = undefined;
     var buf: [64]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buf);
@@ -2159,7 +2220,8 @@ test "WebSocket: a payload cut short by the end of the stream is an error, not a
     var reader: std.Io.Reader = undefined;
     var buf: [64]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buf);
-    var ws = serverSocketOver(&.{ 0x82, 0x8A, 0, 0, 0, 0, 1, 2, 3, 4 }, &reader, &out);
+    var frames = [_]u8{ 0x82, 0x8A, 0, 0, 0, 0, 1, 2, 3, 4 };
+    var ws = serverSocketOver(&frames, &reader, &out);
     defer ws.deinit();
     try std.testing.expectError(error.EndOfStream, ws.receive());
     try std.testing.expectEqual(0, out.buffered().len);
@@ -2282,7 +2344,7 @@ test "WebSocket: the answers to what receiveMany returns leave in one write" {
     var wbuf: [256]u8 = undefined;
     var probe = SocketProbe.init(gpa, &wbuf);
     defer probe.out.deinit(gpa);
-    const frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b") ++ maskedFrame(0x1, "c");
+    var frames = maskedFrame(0x1, "a") ++ maskedFrame(0x1, "b") ++ maskedFrame(0x1, "c");
     var reader: std.Io.Reader = undefined;
     var ws = serverSocketOver(&frames, &reader, &probe.interface);
     defer ws.deinit();
@@ -2437,6 +2499,246 @@ test "fuzz: a peer's frames, read as a callback socket and as a reading task do"
         "\x07\x01\x81\x00\x00\x00\x00a" ++ maskedFrame(0xA, &@as([125]u8, @splat('p'))) ++ maskedFrame(0xA, "") ++ "\x80\x81\x00\x00\x00\x00b",
         "\x00\x09\x80\x00\x00\x00\x00",
         "\x05" ++ maskedFrame(0x8, "\x03\xe8bye"),
+    });
+}
+
+/// `payload` as a client sends it, masked with a key from `seed`, into
+/// `buf`; the frame's bytes.
+fn clientFrame(buf: []u8, opcode: WebSocket.MessageType, payload: []const u8, seed: u64) ![]u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    var none: std.Io.Reader = .fixed("");
+    var client = WebSocket.init(std.testing.io, .{ .writer = &w, .reader = &none }, std.testing.allocator, seed);
+    defer client.deinit();
+    client.is_client = true;
+    try client.send(opcode, payload);
+    return w.buffered();
+}
+
+/// Whether `inner` lies inside `outer`.
+fn within(inner: []const u8, outer: []const u8) bool {
+    // SAFETY: addresses only compared.
+    return @intFromPtr(inner.ptr) >= @intFromPtr(outer.ptr) and
+        @intFromPtr(inner.ptr) + inner.len <= @intFromPtr(outer.ptr) + outer.len;
+}
+
+test "WebSocket: a frame that fits the read buffer is handed over in place, unmasked, with no message memory" {
+    var payload: [1024]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i *% 13 +% 1);
+    var buf: [1100]u8 = undefined;
+    const frame = try clientFrame(&buf, .binary, &payload, 9);
+    var reader: std.Io.Reader = undefined;
+    var out_buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var ws = serverSocketOver(frame, &reader, &out);
+    defer ws.deinit();
+
+    const msg = try ws.receive();
+    try std.testing.expectEqual(.binary, msg.type);
+    try std.testing.expectEqualSlices(u8, &payload, msg.data);
+    try std.testing.expect(within(msg.data, reader.buffer));
+    try std.testing.expectEqual(0, ws.msg_arena.queryCapacity());
+}
+
+test "WebSocket: a frame bigger than the read buffer is read into the message arena" {
+    var payload: [300]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @truncate(i *% 7 +% 3);
+    var buf: [400]u8 = undefined;
+    const frame = try clientFrame(&buf, .binary, &payload, 10);
+    var window: [64]u8 = undefined;
+    var trickle: Trickle = .init(frame, &window, 64);
+    var out_buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &out, .reader = &trickle.interface }, std.testing.allocator, 0);
+    defer ws.deinit();
+
+    const msg = try ws.receive();
+    try std.testing.expectEqualSlices(u8, &payload, msg.data);
+    try std.testing.expect(!within(msg.data, &window));
+    try std.testing.expect(ws.msg_arena.queryCapacity() >= payload.len);
+}
+
+test "WebSocket: receiveMany's messages are all in the read buffer and intact at the end, and a partial one stays unread" {
+    var frames = maskedFrame(0x1, "one") ++ maskedFrame(0x2, "two!") ++ maskedFrame(0x1, "three") ++ [_]u8{ 0x81, 0x85, 0, 0, 0, 0, 'f' };
+    var reader: std.Io.Reader = undefined;
+    var out_buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+
+    const msgs = try ws.receiveMany();
+    try std.testing.expectEqual(3, msgs.len);
+    for (msgs, [_][]const u8{ "one", "two!", "three" }) |m, want| {
+        try std.testing.expectEqualStrings(want, m.data);
+        try std.testing.expect(within(m.data, &frames));
+    }
+    // The fourth frame's bytes are still to be read.
+    try std.testing.expectEqual(frames.len - 7, reader.seek);
+}
+
+test "WebSocket: a message in pieces with a ping between them is copied once, and the ping answered" {
+    const piece = 600;
+    var first: [piece]u8 = undefined;
+    var second: [piece]u8 = undefined;
+    for (&first, &second, 0..) |*a, *b, i| {
+        a.* = @truncate(i *% 5);
+        b.* = @truncate(i *% 11 +% 1);
+    }
+    // Text pieces would have to be UTF-8 together: binary.
+    var input: [2 * (piece + 8) + 10]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&input);
+    for ([_]struct { u8, []const u8 }{ .{ 0x02, &first }, .{ 0x89, "ping" }, .{ 0x80, &second } }) |f| {
+        try w.writeByte(f[0]);
+        if (f[1].len < 126) {
+            try w.writeByte(0x80 | @as(u8, @intCast(f[1].len)));
+        } else {
+            try w.writeByte(0x80 | 126);
+            try w.writeInt(u16, @intCast(f[1].len), .big);
+        }
+        try w.writeAll(&.{ 0, 0, 0, 0 });
+        try w.writeAll(f[1]);
+    }
+
+    // Through a window the pieces fit, and through one they don't (each
+    // piece read into the message arena, as before they were borrowed).
+    var capacity: [2]usize = undefined;
+    var big: [2048]u8 = undefined;
+    var small: [256]u8 = undefined;
+    for ([_][]u8{ &big, &small }, &capacity) |window, *cap| {
+        var trickle: Trickle = .init(w.buffered(), window, 7);
+        var out_buf: [64]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        var ws = WebSocket.init(std.testing.io, .{ .writer = &out, .reader = &trickle.interface }, std.testing.allocator, 0);
+        defer ws.deinit();
+
+        const msg = try ws.receive();
+        try std.testing.expectEqual(.binary, msg.type);
+        try std.testing.expectEqualSlices(u8, &first, msg.data[0..piece]);
+        try std.testing.expectEqualSlices(u8, &second, msg.data[piece..]);
+        try std.testing.expect(!within(msg.data, window));
+        try std.testing.expectEqualSlices(u8, &.{ 0x8A, 4, 'p', 'i', 'n', 'g' }, out.buffered());
+        cap.* = ws.msg_arena.queryCapacity();
+    }
+    // The pieces themselves took no message memory.
+    try std.testing.expect(capacity[0] + 2 * piece <= capacity[1]);
+}
+
+test "WebSocket: a frame that has to be moved to the front of the read buffer comes back intact" {
+    // 206 bytes, then a 126-byte frame: through a 256-byte window it runs
+    // past the end, so the reader moves it to the front before handing it
+    // over.
+    var a: [200]u8 = undefined;
+    var b: [120]u8 = undefined;
+    for (&a, 0..) |*x, i| x.* = @truncate(i);
+    for (&b, 0..) |*x, i| x.* = @truncate(i *% 3 +% 100);
+    var buf_a: [256]u8 = undefined;
+    var buf_b: [256]u8 = undefined;
+    const fa = try clientFrame(&buf_a, .binary, &a, 1);
+    const fb = try clientFrame(&buf_b, .binary, &b, 2);
+    var input: [512]u8 = undefined;
+    @memcpy(input[0..fa.len], fa);
+    @memcpy(input[fa.len..][0..fb.len], fb);
+    var window: [256]u8 = undefined;
+    var trickle: Trickle = .init(input[0 .. fa.len + fb.len], &window, 50);
+    var out_buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &out, .reader = &trickle.interface }, std.testing.allocator, 0);
+    defer ws.deinit();
+
+    try std.testing.expectEqualSlices(u8, &a, (try ws.receive()).data);
+    const msg = try ws.receive();
+    try std.testing.expectEqualSlices(u8, &b, msg.data);
+    try std.testing.expect(within(msg.data, &window));
+    // Moved: it starts before where the first frame ended.
+    try std.testing.expect(@intFromPtr(msg.data.ptr) < @intFromPtr(&window) + fa.len);
+}
+
+test "WebSocket: a compressed frame is handed over in place, still compressed" {
+    var frames = [_]u8{ 0xC2, 0x83, 0x01, 0x02, 0x03, 0x04, 0x01 ^ 0xAA, 0x02 ^ 0xBB, 0x03 ^ 0xCC };
+    var reader: std.Io.Reader = undefined;
+    var out_buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+    ws.rsv1_allowed = true;
+
+    const msg = try ws.receive();
+    try std.testing.expect(msg.compressed);
+    try std.testing.expectEqualSlices(u8, &.{ 0xAA, 0xBB, 0xCC }, msg.data);
+    try std.testing.expect(within(msg.data, &frames));
+}
+
+test "WebSocket: a message handed over in place reads 0xDD after the next receive, and the next one is intact" {
+    var frames = maskedFrame(0x1, "first") ++ maskedFrame(0x1, "second") ++ maskedFrame(0x1, "and a third, longer one");
+    var reader: std.Io.Reader = undefined;
+    var out_buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+
+    const a = try ws.receive();
+    try std.testing.expectEqualStrings("first", a.data);
+    const b = try ws.receive();
+    try std.testing.expectEqualStrings("second", b.data);
+    for (a.data) |c| try std.testing.expectEqual(safety.poison_byte, c);
+
+    // The unread frame moved to the front (as a window's rewind does), over
+    // where "second" lies: those bytes are to be read, not poisoned.
+    const rest = reader.buffer[reader.seek..reader.end];
+    std.mem.copyForwards(u8, reader.buffer[0..rest.len], rest);
+    reader.end = rest.len;
+    reader.seek = 0;
+    try std.testing.expect(@intFromPtr(b.data.ptr) < @intFromPtr(reader.buffer.ptr) + reader.end);
+    try std.testing.expectEqualStrings("and a third, longer one", (try ws.receive()).data);
+}
+
+test "fuzz: a peer's frames read in place and through the message arena are the same messages" {
+    try @import("fuzz.zig").bytes(struct {
+        /// What reading `frames` through `window` gives: each message's
+        /// type, flags, close code and bytes, then the error that ended it.
+        fn messages(frames: []const u8, window: []u8, step: usize, list: *std.ArrayListUnmanaged(u8)) !void {
+            const gpa = std.testing.allocator;
+            var trickle: Trickle = .init(frames, window, step);
+            var out_buf: [8192]u8 = undefined;
+            var out: std.Io.Writer = .fixed(&out_buf);
+            var ws = WebSocket.init(std.testing.io, .{ .writer = &out, .reader = &trickle.interface }, gpa, 0);
+            defer ws.deinit();
+            ws.max_message_size = 4096;
+            ws.rsv1_allowed = true;
+            ws.batch.backstop_on = false;
+            for (0..64) |_| {
+                const msg = ws.receive() catch |err| return list.appendSlice(gpa, @errorName(err));
+                try list.appendSlice(gpa, &.{ @backingInt(msg.type), @intFromBool(msg.compressed) });
+                const code: u16 = if (msg.close_code) |c| @backingInt(c) else 0;
+                try list.appendSlice(gpa, std.mem.asBytes(&code));
+                try list.appendSlice(gpa, std.mem.asBytes(&msg.data.len));
+                try list.appendSlice(gpa, msg.data);
+                if (msg.type == .close) break;
+            }
+        }
+
+        fn check(input: []const u8) !void {
+            if (input.len == 0) return;
+            const gpa = std.testing.allocator;
+            const step = @as(usize, input[0]) + 1;
+            const frames = input[1..];
+            var big: [2048]u8 = undefined;
+            var small: [16]u8 = undefined;
+            var in_place: std.ArrayListUnmanaged(u8) = .empty;
+            defer in_place.deinit(gpa);
+            var copied: std.ArrayListUnmanaged(u8) = .empty;
+            defer copied.deinit(gpa);
+            try messages(frames, &big, step, &in_place);
+            try messages(frames, &small, step, &copied);
+            try std.testing.expectEqualSlices(u8, copied.items, in_place.items);
+        }
+    }.check, &.{
+        "\x03" ++ maskedFrame(0x9, "ping") ++ maskedFrame(0x1, "hello"),
+        "\x07\x01\x81\x00\x00\x00\x00a" ++ maskedFrame(0xA, &@as([125]u8, @splat('p'))) ++ maskedFrame(0xA, "") ++ "\x80\x81\x00\x00\x00\x00b",
+        "\x10\x02\x83\x01\x02\x03\x04abc" ++ maskedFrame(0x9, "between") ++ "\x80\x82\x05\x06\x07\x08de",
+        "\x31\xc1\x84\x00\x00\x00\x00\x01\x02\x03\x04" ++ maskedFrame(0x8, "\x03\xe8bye"),
+        "\xff\x82\xfe\x08\x00\x01\x02\x03\x04" ++ @as([2048]u8, @splat('w')) ++ maskedFrame(0x2, "after"),
+        "\x40\x82\xfe\x10\x01\x00\x00\x00\x00" ++ @as([64]u8, @splat('o')),
+        "\x05" ++ maskedFrame(0x1, "a") ++ maskedFrame(0x1, "\xff"),
     });
 }
 

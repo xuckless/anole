@@ -84,7 +84,9 @@ pub const Origins = origin.Origins;
 pub const WebSocket = dusty.WebSocket;
 /// A message from `Socket.receive` or `Socket.next`: its `type`, its
 /// `data`, and for a close its `close_code`. `data` is valid until the
-/// next `receive` or `next`; copy what must outlive it.
+/// next `receive` or `next`, and may point into the connection's read
+/// buffer: copy what must outlive it or go to another task (Debug builds
+/// overwrite it with 0xDD at the next read).
 pub const Message = WebSocket.Message;
 /// `.text`, `.binary`, `.close`, `.ping` or `.pong` (and `.continuation`,
 /// which `receive` never returns).

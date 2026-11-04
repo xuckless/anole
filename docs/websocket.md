@@ -262,8 +262,10 @@ while (true) {
 
 - `msg.type` is `.text`, `.binary` or `.close`. Pings are answered and pongs
   dropped inside `receive`, so you do not see them.
-- `msg.data` is valid until the next `receive` on the same socket. Copy it if
-  you need it longer.
+- `msg.data` is valid until the next `receive` on the same socket. It may point
+  into the connection's read buffer, so copy it if you need it longer or hand
+  it to another task (Debug builds overwrite it with 0xDD at the next
+  `receive`, so a kept slice shows up at once).
 - A fragmented message arrives whole. A compressed message arrives inflated.
 - `receive` returns an error when the peer goes away or breaks the protocol.
   The usual response is to return from the handler.
