@@ -103,6 +103,12 @@ jobs:
       # HttpConnectionClosing), so the fetch is retried before building.
       - name: Fetch dependencies (retried)
         run: for i in 1 2 3 4 5; do zig build --fetch=all && exit 0; sleep $((i * 5)); done; exit 1
+      # The kernel's `tls` module, so the kTLS tests (src/tls/root.zig) run
+      # the kernel path instead of skipping: an unprivileged process cannot
+      # load it. Best effort: a runner kernel without it skips them as before.
+      - name: Load the kernel TLS module
+        if: runner.os == 'Linux'
+        run: sudo modprobe tls && grep -w tls /proc/sys/net/ipv4/tcp_available_ulp || echo "no kernel tls module; the kTLS tests skip"
       - name: Unit and smoke tests (default profile, every feature on)
         timeout-minutes: 36
         run: zig build test --test-timeout 120s --summary all

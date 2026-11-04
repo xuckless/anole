@@ -265,13 +265,25 @@ test "TLS kTLS: after a large response the kernel seals the rest, every size int
     }
 }
 
-test "TLS kTLS: small responses and TLS 1.2 never switch" {
+test "TLS kTLS: small responses and TLS 1.2 never switch, and one large response does try" {
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // RawClient: BoringSSL over a blocking BSD socket
+    // The connection's own state, so this holds with or without the `tls`
+    // module: small responses never start a switch at all.
     const small: [100]usize = @splat(195);
     const got = try KtlsFlight.run(.{ .sizes = &small });
-    try std.testing.expect(!got.kernel_at_end);
+    try std.testing.expectEqual(.off, got.state_at_end);
+    if (comptime !is_linux) return; // nothing switches elsewhere
+    // TLS 1.2 is refused before the ULP is attached.
     const tls12 = try KtlsFlight.run(.{ .sizes = &.{64 * 1024}, .tls12 = true });
-    try std.testing.expect(!tls12.kernel_at_end);
+    try std.testing.expectEqual(.never, tls12.state_at_end);
+    // One response at the threshold tries: switched, or given up because
+    // the `tls` module is missing (the process latch).
+    const large = try KtlsFlight.run(.{ .sizes = &.{ 195, 4 * 1024, 195 } });
+    switch (large.state_at_end) {
+        .on => {},
+        .never => try std.testing.expect(dusty_tls.test_hooks.ktlsUlpMissing()),
+        else => return error.NoSwitchAttempt,
+    }
 }
 
 test "TLS kTLS: a socket the ULP cannot attach to stays on BoringSSL, and the process does not give up on kTLS" {
@@ -431,6 +443,7 @@ const KtlsFlight = struct {
     const Result = struct {
         kernel_after_first: bool = false,
         kernel_at_end: bool = false,
+        state_at_end: dusty_tls.test_hooks.KtlsState = .off,
         write_failed_at: ?usize = null,
         read_failed: bool = false,
         held: usize = 0,
@@ -518,6 +531,7 @@ const KtlsFlight = struct {
             }
         }
         result.kernel_at_end = conn.kernelTx();
+        result.state_at_end = dusty_tls.test_hooks.ktlsState(&conn);
         if (plan.close) {
             conn.close();
         } else if (!plan.corrupt and result.write_failed_at == null) {

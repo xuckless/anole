@@ -61,15 +61,19 @@ extern fn anole_ssl_write_traffic_secret(ssl: *const c.SSL, out: *[*]const u8, o
 extern fn anole_ssl_ctx_no_aes_hw_for_testing(ctx: *c.SSL_CTX) void;
 
 /// Whether `ssl` is a connection the kernel could take over: TLS 1.3 with
-/// one of the three AEADs the kernel has. Under the connection's lock.
+/// one of the three AEADs the kernel has, and not one this process found
+/// missing (`installTx`). Under the connection's lock.
 pub fn eligible(ssl: *c.SSL) bool {
     if (!supported) return false;
     if (c.SSL_version(ssl) != c.TLS1_3_VERSION) return false;
     const cipher = c.SSL_get_current_cipher(ssl) orelse return false;
-    return switch (c.SSL_CIPHER_get_protocol_id(cipher)) {
-        0x1301, 0x1302, 0x1303 => true,
-        else => false,
+    const tag: std.meta.Tag(Info) = switch (c.SSL_CIPHER_get_protocol_id(cipher)) {
+        0x1301 => .aes128,
+        0x1302 => .aes256,
+        0x1303 => .chacha,
+        else => return false,
     };
+    return aead_missing.load(.monotonic) & aeadBit(tag) == 0;
 }
 
 /// The key material for the next record `ssl` would write, or null. Under
@@ -142,22 +146,44 @@ pub fn attachUlp(fd: std.posix.fd_t) bool {
     };
 }
 
+/// One bit per AEAD (`Info` tag) whose TLS_TX said ENOENT: the kernel has
+/// no such AEAD, and every later attempt would try to load its module again
+/// (the crypto API does that for any caller). Later connections with that
+/// cipher stay on BoringSSL without the syscalls (`eligible`).
+var aead_missing: std.atomic.Value(u8) = .init(0);
+
+fn aeadBit(tag: std.meta.Tag(Info)) u8 {
+    return @as(u8, 1) << @backingInt(tag);
+}
+
 /// Hands `info` to the kernel for everything sent on `fd` from now on,
 /// and zeroes it. False on any failure (the AEAD missing, out of memory):
-/// the socket then still passes bytes through as they are. A short
-/// syscall that does not wait.
+/// the socket then still passes bytes through as they are. Usually short,
+/// but it can sleep: the first use of an AEAD the kernel has as a module
+/// loads that module (crypto_alloc_aead), once per boot, or once per
+/// process where the module is missing (`aead_missing`).
 pub fn installTx(fd: std.posix.fd_t, info: *Info) bool {
     if (!supported) return false;
+    const tag = std.meta.activeTag(info.*);
     const b = info.bytes();
     defer std.crypto.secureZero(u8, b);
     const rc = linux.setsockopt(fd, sol_tls, tls_tx, b.ptr, @intCast(b.len));
-    return linux.errno(rc) == .SUCCESS;
+    return switch (linux.errno(rc)) {
+        .SUCCESS => true,
+        .NOENT => {
+            _ = aead_missing.fetchOr(aeadBit(tag), .monotonic);
+            return false;
+        },
+        else => false,
+    };
 }
 
 /// Sends a close_notify alert as a kernel-sealed record: one `sendmsg`
 /// with the record type in a control message (as the `ktls` crate's
 /// `send_close_notify`). Best effort and never waiting: a full send
-/// buffer loses it.
+/// buffer loses it. It does not make the kernel push a record it still
+/// holds from an earlier send (net/tls/tls_sw.c swallows that EAGAIN), so
+/// a close right after can cut the response short (`Connection.close`).
 pub fn sendCloseNotify(fd: std.posix.fd_t) void {
     if (!supported) return;
     const alert = [2]u8{ 1, 0 }; // warning, close_notify
