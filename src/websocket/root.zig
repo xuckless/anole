@@ -335,7 +335,12 @@ pub const Socket = struct {
     /// than through a call for each layer, which costs an echo loop about a
     /// tenth of its CPU.
     pub fn receive(self: *Socket) !Message {
-        if (self._read.conn != null) self._read.between(self._conn.h1.transport.reader);
+        if (self._read.conn != null) {
+            // The last messages' bytes read 0xDD before a window change
+            // can take their buffer (`WebSocket.poisonLent`).
+            self._conn.h1.poisonLent();
+            self._read.between(self._conn.h1.transport.reader);
+        }
         return @call(.always_inline, finishMessage, .{ self, switch (self._conn) {
             inline else => |ws| try @call(.always_inline, @TypeOf(ws.*).receive, .{ws}),
         } });
@@ -482,7 +487,10 @@ pub const Socket = struct {
         }
         if (self._drain_watch) |w| w.stop();
         if (comptime features.compression) if (self._deflate) |d| d.deinit();
-        if (self._read.conn != null) self._read.release(self._conn.h1.transport.reader);
+        if (self._read.conn != null) {
+            self._conn.h1.poisonLent();
+            self._read.release(self._conn.h1.transport.reader);
+        }
         switch (self._conn) {
             inline else => |ws| ws.deinit(),
         }
@@ -934,6 +942,8 @@ const H1Callbacks = struct {
         // close, a failed read or callback, and a cancel alike.
         defer window.release(ws.transport.reader);
         while (true) {
+            // As `Socket.receive`: before the window may move to a block.
+            ws.poisonLent();
             window.adapt(ws.transport.reader);
             const started = self.socket.receiveStarted() catch |err| return self.finish(err);
             const msg = started orelse {

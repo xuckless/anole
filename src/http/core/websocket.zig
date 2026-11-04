@@ -69,9 +69,11 @@ pub const WebSocket = struct {
     /// The last control frame's payload: a ping's (answered from here) or a
     /// close's reason, valid as a message's data is.
     control_payload: [125]u8 = undefined,
-    /// The last message handed out as a slice of the read buffer, poisoned
-    /// at the next receive (`poisonLent`). Debug and test builds only.
-    lent: if (safety.enabled) []u8 else void = if (safety.enabled) &.{} else {},
+    /// The addresses the messages handed out as slices of the read buffer
+    /// since the last receive span (every one of a `receiveMany`), poisoned
+    /// at the next receive or before the buffer goes (`poisonLent`). Debug
+    /// and test builds only.
+    lent: if (safety.enabled) Lent else void = if (safety.enabled) .{} else {},
 
     /// The largest message a socket accepts unless told otherwise: 16 MiB.
     pub const default_max_message_size: usize = 1024 * 1024; // 1 MiB
@@ -345,27 +347,49 @@ pub const WebSocket = struct {
         self.auto_responded = false;
     }
 
-    /// SAFETY.md M6 for a message handed out as a slice of the read buffer
-    /// (`readFrame`): at the next receive its bytes read 0xDD, so a handler
-    /// that kept it, or gave it to another task, reads that instead of a
-    /// plausible next frame. Only while it is still in the reader's buffer,
-    /// and never over the bytes still to be read (a fill or a window's
-    /// rewind may have moved them there). Nothing outside Debug and test
-    /// builds.
-    fn poisonLent(self: *WebSocket) void {
-        if (!safety.enabled) return;
-        const lent = self.lent;
-        self.lent = &.{};
-        if (lent.len == 0) return;
-        const r = self.transport.reader;
+    /// The span of addresses `lent` covers: within one receive the reader
+    /// keeps its buffer, so every slice handed out lies in it.
+    const Lent = struct {
+        lo: usize = 0,
+        hi: usize = 0,
+    };
+
+    /// Adds a payload handed out as a slice of the read buffer to `lent`.
+    fn lend(self: *WebSocket, p: []u8) void {
+        if (p.len == 0) return;
         // SAFETY: addresses only compared, to place the slice in the buffer.
-        const lo = @intFromPtr(lent.ptr);
-        const hi = lo + lent.len;
-        // SAFETY: as `lo`.
+        const lo = @intFromPtr(p.ptr);
+        const l = &self.lent;
+        if (l.hi == 0) {
+            l.* = .{ .lo = lo, .hi = lo + p.len };
+        } else {
+            l.lo = @min(l.lo, lo);
+            l.hi = @max(l.hi, lo + p.len);
+        }
+    }
+
+    /// SAFETY.md M6 for the messages handed out as slices of the read
+    /// buffer (`readFrame`): at the next receive their bytes read 0xDD, so a
+    /// handler that kept one, or gave it to another task, reads that instead
+    /// of a plausible next frame. Also before the reader gives its buffer up
+    /// (`detachBuffers`, `attachBuffers`, a window that moves to or from a
+    /// pooled block), while it still owns it. Only while they are still in
+    /// the reader's buffer, and never over the bytes still to be read (a
+    /// fill or a window's rewind may have moved them there); what else the
+    /// span covers was read already. Nothing outside Debug and test builds.
+    pub fn poisonLent(self: *WebSocket) void {
+        if (!safety.enabled) return;
+        const l = self.lent;
+        self.lent = .{};
+        if (l.hi == 0) return;
+        const r = self.transport.reader;
+        // SAFETY: as `lend`.
         const base = @intFromPtr(r.buffer.ptr);
-        if (lo < base or hi > base + r.buffer.len) return;
-        if (hi > base + r.seek and lo < base + r.end) return;
-        safety.poison(lent);
+        if (l.lo < base or l.hi > base + r.buffer.len) return;
+        const from = l.lo - base;
+        const to = l.hi - base;
+        if (from < r.seek) safety.poison(r.buffer[from..@min(to, r.seek)]);
+        if (to > r.end) safety.poison(r.buffer[@max(from, r.end)..to]);
     }
 
     /// Whether `bytes` starts with a whole message, along with any control
@@ -679,10 +703,10 @@ pub const WebSocket = struct {
             if (close_sending) self.closed = true;
         }
         const r = self.transport.reader;
+        self.poisonLent();
         r.buffer = &.{};
         r.seek = 0;
         r.end = 0;
-        if (safety.enabled) self.lent = &.{};
         self.fragmented_data = .empty;
         self.fragmented_type = null;
         _ = self.msg_arena.reset(.free_all);
@@ -695,6 +719,7 @@ pub const WebSocket = struct {
     pub fn attachBuffers(self: *WebSocket, read: []u8) void {
         const r = self.transport.reader;
         std.debug.assert(r.bufferedLen() == 0);
+        self.poisonLent();
         r.buffer = read;
         r.seek = 0;
         r.end = 0;
@@ -795,7 +820,7 @@ pub const WebSocket = struct {
             break :blk p;
         } else if (n <= r.buffer.len) blk: {
             const p = try r.take(n);
-            if (safety.enabled) self.lent = p;
+            if (safety.enabled) self.lend(p);
             break :blk p;
         } else blk: {
             const p = try safety.allocUninit(self.msg_arena.allocator(), n);
@@ -2691,6 +2716,57 @@ test "WebSocket: a message handed over in place reads 0xDD after the next receiv
     try std.testing.expectEqualStrings("and a third, longer one", (try ws.receive()).data);
 }
 
+test "WebSocket: every message of a receiveMany reads 0xDD after the next one" {
+    const first = maskedFrame(0x1, "one") ++ maskedFrame(0x2, "two!") ++ maskedFrame(0x1, "three");
+    const input = first ++ maskedFrame(0x1, "four");
+    var window: [256]u8 = undefined;
+    // The first fill brings exactly the first three frames.
+    var trickle: Trickle = .init(&input, &window, first.len);
+    var out_buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &out, .reader = &trickle.interface }, std.testing.allocator, 0);
+    defer ws.deinit();
+
+    const msgs = try ws.receiveMany();
+    try std.testing.expectEqual(3, msgs.len);
+    var kept: [3][]const u8 = undefined;
+    for (msgs, &kept) |m, *k| {
+        try std.testing.expect(within(m.data, &window));
+        k.* = m.data;
+    }
+    const next = try ws.receiveMany();
+    try std.testing.expectEqual(1, next.len);
+    try std.testing.expectEqualStrings("four", next[0].data);
+    for (kept) |k| for (k) |c| try std.testing.expectEqual(safety.poison_byte, c);
+}
+
+test "WebSocket: a message handed over in place reads 0xDD once the reader gives its buffer up" {
+    var frames = maskedFrame(0x1, "first");
+    var reader: std.Io.Reader = undefined;
+    var out_buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+
+    const a = try ws.receive();
+    try std.testing.expectEqualStrings("first", a.data);
+    // As a parked connection's reading task does, before the buffer goes
+    // back to its pool.
+    ws.detachBuffers();
+    for (a.data) |c| try std.testing.expectEqual(safety.poison_byte, c);
+
+    // And as a window that moves to another buffer: the old one is
+    // poisoned before it goes.
+    var more = maskedFrame(0x1, "second");
+    ws.attachBuffers(&more);
+    reader.end = more.len;
+    const b = try ws.receive();
+    try std.testing.expectEqualStrings("second", b.data);
+    var other: [16]u8 = undefined;
+    ws.attachBuffers(&other);
+    for (b.data) |c| try std.testing.expectEqual(safety.poison_byte, c);
+}
+
 test "fuzz: a peer's frames read in place and through the message arena are the same messages" {
     try @import("fuzz.zig").bytes(struct {
         /// What reading `frames` through `window` gives: each message's
@@ -2722,7 +2798,9 @@ test "fuzz: a peer's frames read in place and through the message arena are the 
             const step = @as(usize, input[0]) + 1;
             const frames = input[1..];
             var big: [2048]u8 = undefined;
-            var small: [16]u8 = undefined;
+            // Every payload of two bytes or more goes through the message
+            // arena (the seeds' all do).
+            var small: [1]u8 = undefined;
             var in_place: std.ArrayListUnmanaged(u8) = .empty;
             defer in_place.deinit(gpa);
             var copied: std.ArrayListUnmanaged(u8) = .empty;
@@ -2733,12 +2811,12 @@ test "fuzz: a peer's frames read in place and through the message arena are the 
         }
     }.check, &.{
         "\x03" ++ maskedFrame(0x9, "ping") ++ maskedFrame(0x1, "hello"),
-        "\x07\x01\x81\x00\x00\x00\x00a" ++ maskedFrame(0xA, &@as([125]u8, @splat('p'))) ++ maskedFrame(0xA, "") ++ "\x80\x81\x00\x00\x00\x00b",
+        "\x07\x01\x82\x00\x00\x00\x00ab" ++ maskedFrame(0xA, &@as([125]u8, @splat('p'))) ++ maskedFrame(0xA, "") ++ "\x80\x82\x00\x00\x00\x00cd",
         "\x10\x02\x83\x01\x02\x03\x04abc" ++ maskedFrame(0x9, "between") ++ "\x80\x82\x05\x06\x07\x08de",
         "\x31\xc1\x84\x00\x00\x00\x00\x01\x02\x03\x04" ++ maskedFrame(0x8, "\x03\xe8bye"),
         "\xff\x82\xfe\x08\x00\x01\x02\x03\x04" ++ @as([2048]u8, @splat('w')) ++ maskedFrame(0x2, "after"),
         "\x40\x82\xfe\x10\x01\x00\x00\x00\x00" ++ @as([64]u8, @splat('o')),
-        "\x05" ++ maskedFrame(0x1, "a") ++ maskedFrame(0x1, "\xff"),
+        "\x05" ++ maskedFrame(0x1, "ab") ++ maskedFrame(0x1, "a\xff"),
     });
 }
 
