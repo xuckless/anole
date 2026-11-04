@@ -2631,6 +2631,113 @@ const CountingSink = struct {
     }
 };
 
+/// A response a head golden sets up, as a handler would, and the whole of
+/// what it puts on the wire.
+const HeadCase = struct {
+    status: http.Status = .ok,
+    body: []const u8 = "",
+    json: bool = false,
+    content_type: ?http.ContentType = null,
+    headers: []const [2][]const u8 = &.{},
+    keepalive: bool = true,
+    http10: bool = false,
+    head: bool = false,
+    send_date: bool = true,
+    stream: bool = false,
+    /// Our own Date's value is masked (`masked_date`): it is the clock's.
+    mask_date: bool = true,
+    expected: []const u8,
+};
+
+/// What stands in the goldens for the current time, 29 bytes as an
+/// IMF-fixdate is.
+const masked_date = "Www, DD Mon YYYY hh:mm:ss GMT";
+const masked_date_line = "Date: " ++ masked_date ++ "\r\n";
+
+const head_cases = [_]HeadCase{
+    .{ .json = true, .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}" },
+    .{ .content_type = .text, .body = "hello", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Type: text/plain; charset=UTF-8\r\nContent-Length: 5\r\n\r\nhello" },
+    .{ .status = .created, .body = "made", .expected = "HTTP/1.1 201 Created\r\n" ++ masked_date_line ++ "Content-Length: 4\r\n\r\nmade" },
+    .{ .status = .no_content, .expected = "HTTP/1.1 204 No Content\r\n" ++ masked_date_line ++ "\r\n" },
+    .{ .status = .not_modified, .expected = "HTTP/1.1 304 Not Modified\r\n" ++ masked_date_line ++ "\r\n" },
+    .{ .status = .bad_request, .body = "bad", .expected = "HTTP/1.1 400 Bad Request\r\n" ++ masked_date_line ++ "Content-Length: 3\r\n\r\nbad" },
+    .{ .status = .not_found, .body = "nope", .expected = "HTTP/1.1 404 Not Found\r\n" ++ masked_date_line ++ "Content-Length: 4\r\n\r\nnope" },
+    .{ .status = .internal_server_error, .body = "oops", .expected = "HTTP/1.1 500 Internal Server Error\r\n" ++ masked_date_line ++ "Content-Length: 4\r\n\r\noops" },
+    .{ .status = .im_a_teapot, .body = "tea", .expected = "HTTP/1.1 418 I'm a teapot\r\n" ++ masked_date_line ++ "Content-Length: 3\r\n\r\ntea" },
+    .{ .status = .unprocessable_entity, .json = true, .expected = "HTTP/1.1 422 Unprocessable Content\r\n" ++ masked_date_line ++ "Content-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}" },
+    .{ .keepalive = false, .body = "x", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Connection: close\r\nContent-Length: 1\r\n\r\nx" },
+    .{ .http10 = true, .body = "x", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Connection: keep-alive\r\nContent-Length: 1\r\n\r\nx" },
+    .{ .headers = &.{.{ "Content-Length", "2" }}, .body = "hi", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Length: 2\r\n\r\nhi" },
+    .{ .stream = true, .body = "abc", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n" },
+    .{ .head = true, .body = "hello", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Length: 5\r\n\r\n" },
+    .{ .headers = &.{.{ "Date", "Sun, 06 Nov 1994 08:49:37 GMT" }}, .body = "x", .mask_date = false, .expected = "HTTP/1.1 200 OK\r\nDate: Sun, 06 Nov 1994 08:49:37 GMT\r\nContent-Length: 1\r\n\r\nx" },
+    .{ .send_date = false, .body = "x", .mask_date = false, .expected = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx" },
+    .{ .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "Content-Length: 0\r\n\r\n" },
+    .{ .headers = &.{ .{ "X-One", "1" }, .{ "X-Two", "2" }, .{ "Cache-Control", "no-store" } }, .body = "ok", .expected = "HTTP/1.1 200 OK\r\n" ++ masked_date_line ++ "X-One: 1\r\nX-Two: 2\r\nCache-Control: no-store\r\nContent-Length: 2\r\n\r\nok" },
+};
+
+/// Writes `c`'s response to `w` as the server would, Date on.
+fn renderHeadCase(w: *std.Io.Writer, c: HeadCase) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(w);
+
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    response.io = std.testing.io;
+    response._send_date = c.send_date;
+    response.status = c.status;
+    response.keepalive = c.keepalive;
+    response.http10 = c.http10;
+    response.head = c.head;
+    response.content_type = c.content_type;
+    for (c.headers) |h| try response.addHeader(h[0], h[1]);
+    if (c.json) {
+        try response.json(.{ .ok = true });
+    } else if (c.stream) {
+        var body_buf: [64]u8 = undefined;
+        var sw = try response.stream(&body_buf);
+        try sw.interface.writeAll(c.body);
+        try sw.interface.flush();
+    } else {
+        response.body = c.body;
+    }
+    try response.write();
+}
+
+/// `out` with the value of its first Date line replaced by `masked_date`.
+fn maskDate(out: []u8) void {
+    const at = std.mem.indexOf(u8, out, "\r\nDate: ") orelse return;
+    const value = out[at + "\r\nDate: ".len ..];
+    if (value.len < masked_date.len) return;
+    @memcpy(value[0..masked_date.len], masked_date);
+}
+
+test "Response: heads are byte-for-byte what they were, for every status and framing" {
+    for (head_cases) |c| {
+        var buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try renderHeadCase(&w, c);
+        if (c.mask_date) maskDate(w.buffered());
+        try std.testing.expectEqualStrings(c.expected, w.buffered());
+    }
+}
+
+test "Response: heads drained through a small or empty write buffer are the same bytes" {
+    for ([_]usize{ 0, 7 }) |size| {
+        for (head_cases) |c| {
+            var buf: [7]u8 = undefined;
+            var sink: CountingSink = .init(buf[0..size]);
+            try renderHeadCase(&sink.interface, c);
+            try sink.interface.flush();
+            const sent = sink.out[0..sink.len];
+            if (c.mask_date) maskDate(sent);
+            try std.testing.expectEqualStrings(c.expected, sent);
+        }
+    }
+}
+
 test "Response: a corked response stays in the write buffer and goes out with the next in one write" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
