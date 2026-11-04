@@ -152,15 +152,19 @@ const E2E = struct {
         // attempt go once the webhooks clock is 2 s on.
         clock.advance(.fromSeconds(2));
         _ = try jc.enqueueRaw(&cx, "anole.webhook.prune", "{}", .{ .queue = "webhooks" });
+        // Postgres prunes messages and attempts in two statements, so wait
+        // for both rather than reading the attempts between them.
         const Pruned = struct {
             hooks: *wh.Client,
             cx: *anole.db.Ctx,
             owner: []const u8,
+            message: []const u8,
             fn gone(c: @This()) !bool {
-                return (try c.hooks.messages(c.cx, .{ .owner = c.owner })).len == 0;
+                return (try c.hooks.messages(c.cx, .{ .owner = c.owner })).len == 0 and
+                    (try c.hooks.attempts(c.cx, .{ .message = c.message })).len == 0;
             }
         };
-        try wait.waitUntil(io, "the prune job removed the messages", Pruned{ .hooks = hooks, .cx = &cx, .owner = owner }, Pruned.gone);
+        try wait.waitUntil(io, "the prune job removed the messages and attempts", Pruned{ .hooks = hooks, .cx = &cx, .owner = owner, .message = p.message_id }, Pruned.gone);
         try std.testing.expectEqual(@as(usize, 0), (try hooks.messages(&cx, .{ .owner = owner })).len);
         try std.testing.expectEqual(@as(usize, 0), (try hooks.attempts(&cx, .{ .message = p.message_id })).len);
     }

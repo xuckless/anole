@@ -3,6 +3,42 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.5.1 (2026-11-04)
+
+### Changed
+
+- `res.json` writes every type through one writer with std.json's
+  default options (and `jsonWith` with only `emit_null_optional_fields`
+  changed), not only types with renamed fields: keys are encoded at
+  compile time and each string is escaped and checked for UTF-8 in one
+  pass, so a body costs about half the instructions it did (120k vs 265k
+  for HttpArena's /json/50 in a micro-benchmark). The bytes are
+  std.json's, except that a string that is not UTF-8 now has U+FFFD for
+  each bad byte; std.json wrote it as an array of byte values. Other
+  `jsonWith` options still go to std.json itself and keep its arrays, as
+  do types with their own `jsonStringify` (`std.json.Value`) and byte
+  vectors.
+
+### Performance
+
+- `req.body()` (and Connect unary, grpc-web-text and JSON transcoding)
+  sizes its buffer from an identity-coded `Content-Length`: up to 16 KiB
+  up front, then growing toward the declared length only as bytes arrive.
+  A 16 KiB POST no longer maps and unmaps memory per request (1.0 to
+  0.0001 mmap per request; 16 KiB echo +94% on the box).
+- The router keeps path segments on the stack (up to 16) instead of two
+  arena arrays per dynamic lookup, and a 405 builds its `Allow` header
+  without splitting the path again. A 405's `Allow` no longer lists a
+  method whose own request would be refused with 400 (more parameters
+  than `max_param_count`).
+- TLS: a queued record starts in a pooled 2 KiB buffer (256 per
+  executor) instead of a 16.9 KB block, so a small write in flight pins
+  2 KiB.
+- WebSocket rooms: a broadcast to more than 64 members allocates nothing
+  when every member is already running.
+- WebTransport: datagram and pending-stream queues are deques; a pop no
+  longer shifts the queue under the connection lock.
+
 ## 0.5.0 (2026-11-01)
 
 ### Changed

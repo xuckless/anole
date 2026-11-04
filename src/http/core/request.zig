@@ -356,10 +356,13 @@ pub const Request = struct {
             return self._body;
         }
 
-        // Nothing to stage: `allocRemaining` streams straight into the arena.
+        // Nothing to stage: the body streams straight into the arena. The
+        // declared length sizes it only while nothing is decoded; a decoder
+        // makes it the wire length, not what comes out.
         var no_buf: [0]u8 = .{};
         var r = try self.reader(&no_buf);
-        const result = r.interface.allocRemaining(self.arena, .limited(self._config.max_body_size)) catch |err| switch (err) {
+        const hint = if (r.decode == null) self.content_length else null;
+        const result = allocRemainingHinted(&r.interface, self.arena, self._config.max_body_size, hint) catch |err| switch (err) {
             error.StreamTooLong => return error.BodyTooBig,
             // The interface can only say that a read failed; the reader
             // holds what it was.
@@ -756,6 +759,51 @@ pub const Request = struct {
         };
     }
 };
+
+/// The most `allocRemainingHinted` reserves on a declared length before
+/// the bytes arrive: hyper's cap (16 KiB) and about nginx's first body
+/// buffer (8k/16k), so a peer declaring a large body and sending little
+/// does not get the memory for it. The reservation is made before any
+/// byte has come (over HTTP/2 and HTTP/3 the handler runs at HEADERS),
+/// so this is what a stalled request or stream costs.
+const body_reserve_max = 16 * 1024;
+
+/// `std.Io.Reader.allocRemaining` that knows the length the body
+/// declared (`hint`): min(hint, 16 KiB) + 1 reserved up front, then
+/// std's 1.5x growth clamped to hint + 1, so an honest body ends in one
+/// buffer of its own size and a peer that declares much and sends
+/// little gets about what it sent, or 16 KiB. The + 1 is room for the
+/// read that finds the end, which would otherwise grow a full buffer
+/// before it could say so. Each read is held to the room reserved, so
+/// a source that writes all it has at once (a fixed reader) does not
+/// overshoot either. A hint of 0 or past `limit`, and bytes past the
+/// hint, fall back to std's growth. The hint must describe the bytes
+/// `r` yields: no hint when something between the wire and `r`
+/// changes their length (a decoder).
+pub fn allocRemainingHinted(r: *std.Io.Reader, gpa: std.mem.Allocator, limit: usize, hint: ?usize) std.Io.Reader.LimitedAllocError![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const declared: usize = if (hint) |n| (if (n <= limit) n else 0) else 0;
+    if (declared > 0) try aw.ensureTotalCapacityPrecise(@min(declared, body_reserve_max) + 1);
+    // As `allocRemaining`: one byte past `limit` is how it is exceeded.
+    var remaining: std.Io.Limit = .limited(limit +| 1);
+    while (remaining != .nothing) {
+        const w = &aw.writer;
+        var step = remaining;
+        if (w.end < declared) {
+            if (w.end == w.buffer.len)
+                try aw.ensureTotalCapacityPrecise(@min(declared +| 1, std.ArrayList(u8).growCapacity(w.end + 1)));
+            step = step.min(.limited(w.buffer.len - w.end));
+        }
+        const n = r.stream(w, step) catch |err| switch (err) {
+            error.EndOfStream => return aw.toOwnedSlice(),
+            error.WriteFailed => return error.OutOfMemory,
+            error.ReadFailed => |e| return e,
+        };
+        remaining = remaining.subtract(n).?;
+    }
+    return error.StreamTooLong;
+}
 
 const MultipartForm = struct {
     const Entry = struct { value: []const u8, filename: ?[]const u8 = null };
@@ -1868,6 +1916,281 @@ test "Request.body: a gzip body from a body source is decoded" {
     req._body_source = .{ .reader = &source, .err = noBodySourceError };
 
     try std.testing.expectEqualStrings("hello", (try req.body()).?);
+}
+
+/// Counts what a body read asks of its allocator: the allocations, the
+/// largest one and the bytes in all. It refuses to grow anything in place,
+/// so every growth is a fresh allocation and a copy, and the counts do not
+/// depend on where the allocator below happens to have room.
+const BodyAllocCounter = struct {
+    child: std.mem.Allocator,
+    allocs: usize = 0,
+    largest: usize = 0,
+    total: usize = 0,
+    /// Allocations of exactly `watch_len` bytes.
+    watch_len: usize = 0,
+    watched: usize = 0,
+
+    fn allocator(self: *BodyAllocCounter) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn reset(self: *BodyAllocCounter) void {
+        self.* = .{ .child = self.child, .watch_len = self.watch_len };
+    }
+
+    /// Growths of the body buffer past its first allocation.
+    fn growths(self: *const BodyAllocCounter) usize {
+        return self.allocs -| 1;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *BodyAllocCounter = @ptrCast(@alignCast(ctx)); // SAFETY: `allocator` made ctx from self.
+        self.allocs += 1;
+        self.total += len;
+        self.largest = @max(self.largest, len);
+        if (len == self.watch_len) self.watched += 1;
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *BodyAllocCounter = @ptrCast(@alignCast(ctx)); // SAFETY: `allocator` made ctx from self.
+        return new_len <= memory.len and self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *BodyAllocCounter = @ptrCast(@alignCast(ctx)); // SAFETY: `allocator` made ctx from self.
+        if (new_len > memory.len) return null;
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *BodyAllocCounter = @ptrCast(@alignCast(ctx)); // SAFETY: `allocator` made ctx from self.
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+/// Reads the body of `raw` (a whole HTTP/1.1 request) over the parser and
+/// returns what the read asked of the request's arena. `std_read` reads it
+/// with std's `allocRemaining` instead of `body`: what it cost before the
+/// declared length was used. `expected` is the body, or the error the read
+/// must fail with.
+fn h1BodyCounts(raw: []const u8, expected: anyerror![]const u8, std_read: bool) !BodyAllocCounter {
+    const gpa = std.testing.allocator;
+    const backing = try gpa.alloc(u8, raw.len + body_read_reserve);
+    defer gpa.free(backing);
+    @memcpy(backing[0..raw.len], raw);
+    var reader: std.Io.Reader = .fixed(backing);
+    reader.end = raw.len;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var counter: BodyAllocCounter = .{ .child = arena.allocator() };
+    // SAFETY: a body read never writes, and `_parser` is set just below.
+    var req: Request = .{
+        .arena = counter.allocator(),
+        ._transport = .{ .reader = &reader, .writer = undefined },
+        ._parser = undefined,
+    };
+    var parser: RequestParser = undefined; // SAFETY: `init` fills it.
+    try parser.init(&req);
+    defer parser.deinit();
+    req._parser = &parser;
+    try parseHeaders(&reader, &parser);
+
+    counter.reset();
+    const got: anyerror!?[]const u8 = if (std_read) blk: {
+        var no_buf: [0]u8 = .{};
+        var r = try req.reader(&no_buf);
+        break :blk r.interface.allocRemaining(req.arena, .limited(req._config.max_body_size)) catch |err| switch (err) {
+            error.ReadFailed => r.err orelse error.Unexpected,
+            else => |e| e,
+        };
+    } else req.body();
+    if (expected) |e| {
+        try std.testing.expectEqualSlices(u8, e, (try got).?);
+    } else |e| {
+        try std.testing.expectError(e, got);
+    }
+    return counter;
+}
+
+/// Reads `bytes` as an unframed body source (the HTTP/2 and HTTP/3 shape,
+/// and `anole.inmem`'s) declaring `content_length`.
+/// `expected` is the body, `null` for none, or the error `body()` returns;
+/// the counts come back in every case.
+fn sourceBodyCounts(bytes: []const u8, content_length: ?usize, max_body_size: usize, expected: anyerror!?[]const u8) !BodyAllocCounter {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var counter: BodyAllocCounter = .{ .child = arena.allocator() };
+    var source: std.Io.Reader = .fixed(bytes);
+    // SAFETY: a body source stands in for the parser and the transport.
+    var req: Request = .{ .arena = counter.allocator(), ._transport = undefined, ._parser = undefined };
+    req._config.max_body_size = max_body_size;
+    req.content_length = content_length;
+    req._body_source = .{ .reader = &source, .err = noBodySourceError };
+    const got = req.body();
+    if (expected) |e| {
+        if (e) |b| try std.testing.expectEqualSlices(u8, b, (try got).?) else try std.testing.expect((try got) == null);
+    } else |e| try std.testing.expectError(e, got);
+    return counter;
+}
+
+fn bodyPattern(gpa: std.mem.Allocator, len: usize) ![]u8 {
+    const bytes = try gpa.alloc(u8, len);
+    for (bytes, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    return bytes;
+}
+
+/// Growths past the first allocation a body of each size may take with its
+/// length declared: none up to the 16 KiB reservation, then std's 1.5x
+/// clamped to the length (16K+1 -> 24K -> 36K -> 55K -> 64K+1; ... -> 1M+1).
+const sized_bodies = [_]struct { len: usize, growths: usize }{
+    .{ .len = 1024, .growths = 0 },
+    .{ .len = 10 * 1024, .growths = 0 },
+    .{ .len = 16 * 1024, .growths = 0 },
+    .{ .len = 64 * 1024, .growths = 4 },
+    .{ .len = 100 * 1024, .growths = 5 },
+    .{ .len = 1024 * 1024, .growths = 11 },
+};
+
+test "Request.body: a declared length sizes the buffer, over the parser and over a body source" {
+    const gpa = std.testing.allocator;
+    for (sized_bodies) |case| {
+        const bytes = try bodyPattern(gpa, case.len);
+        defer gpa.free(bytes);
+        const raw = try std.fmt.allocPrint(gpa, "POST /u HTTP/1.1\r\nContent-Length: {d}\r\n\r\n{s}", .{ case.len, bytes });
+        defer gpa.free(raw);
+
+        const h1 = try h1BodyCounts(raw, bytes, false);
+        const before = try h1BodyCounts(raw, bytes, true);
+        try std.testing.expect(h1.growths() <= case.growths);
+        try std.testing.expect(h1.growths() < before.growths());
+        try std.testing.expect(h1.largest <= case.len + 1);
+        if (case.len <= body_reserve_max) try std.testing.expectEqual(1, h1.allocs);
+
+        const src = try sourceBodyCounts(bytes, case.len, 1024 * 1024, bytes);
+        try std.testing.expect(src.growths() <= case.growths);
+        try std.testing.expect(src.largest <= case.len + 1);
+        if (case.len <= body_reserve_max) try std.testing.expectEqual(1, src.allocs);
+    }
+}
+
+test "Request.body: a chunked body grows as it did, the hint does not engage" {
+    const gpa = std.testing.allocator;
+    for (sized_bodies) |case| {
+        const bytes = try bodyPattern(gpa, case.len);
+        defer gpa.free(bytes);
+        var raw: std.ArrayList(u8) = .empty;
+        defer raw.deinit(gpa);
+        try raw.appendSlice(gpa, "POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        var at: usize = 0;
+        while (at < bytes.len) {
+            const n = @min(4096, bytes.len - at);
+            try raw.print(gpa, "{x}\r\n{s}\r\n", .{ n, bytes[at..][0..n] });
+            at += n;
+        }
+        try raw.appendSlice(gpa, "0\r\n\r\n");
+
+        const now = try h1BodyCounts(raw.items, bytes, false);
+        const before = try h1BodyCounts(raw.items, bytes, true);
+        try std.testing.expectEqual(before.allocs, now.allocs);
+        try std.testing.expectEqual(before.largest, now.largest);
+        try std.testing.expectEqual(before.total, now.total);
+    }
+}
+
+test "Request.body: a peer declaring the maximum and sending a byte gets no more than the reservation" {
+    const max = 1024 * 1024;
+    const raw = std.fmt.comptimePrint("POST /u HTTP/1.1\r\nContent-Length: {d}\r\n\r\nx", .{max});
+    // Over the parser the body is cut short.
+    const h1 = try h1BodyCounts(raw, error.IncompleteBody, false);
+    try std.testing.expect(h1.largest <= body_reserve_max + 1);
+    try std.testing.expect(h1.total < 128 * 1024);
+    // A body source that ends early hands over what came.
+    const src = try sourceBodyCounts("x", max, max, "x");
+    try std.testing.expect(src.largest <= body_reserve_max + 1);
+    try std.testing.expect(src.total < 128 * 1024);
+}
+
+test "Request.body: a declared length past the maximum reserves nothing for it" {
+    const gpa = std.testing.allocator;
+    const bytes = try bodyPattern(gpa, 4000);
+    defer gpa.free(bytes);
+    const grow = std.ArrayList(u8).growCapacity;
+    // Declared and sent past the maximum: 413 as before, and the buffer
+    // never went past what std's growth to the maximum takes (the 4000
+    // declared would have reserved 4001). `Allocating.drain` asks for one
+    // byte past what it writes, hence the + 1s.
+    const past = try sourceBodyCounts(bytes, 4000, 1000, error.BodyTooBig);
+    try std.testing.expect(past.largest <= grow(1000 + 1 + 1));
+    // A source sending more than it declared, under the maximum: all of
+    // it, the declared 1001 first and then std's growth past it.
+    const more = try sourceBodyCounts(bytes, 1000, 1024 * 1024, bytes);
+    try std.testing.expect(more.largest <= grow(bytes.len + 1));
+    // And past the maximum: 413.
+    _ = try sourceBodyCounts(bytes, 1000, 2000, error.BodyTooBig);
+}
+
+test "Request.body: Content-Length: 0 and no body are null" {
+    const zero = try sourceBodyCounts("", 0, 1024 * 1024, null);
+    try std.testing.expectEqual(0, zero.largest);
+    const none = try sourceBodyCounts("", null, 1024 * 1024, null);
+    try std.testing.expectEqual(0, none.largest);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var source: std.Io.Reader = .fixed("");
+    var req: Request = .{ .arena = arena.allocator(), ._transport = undefined, ._parser = undefined };
+    req.content_length = 0;
+    req._body_source = .{ .reader = &source, .err = noBodySourceError };
+    try std.testing.expect((try req.body()) == null);
+}
+
+test "Request.body: a coded body's declared length is the wire's, used only while nothing decodes" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    for ([_]bool{ true, false }) |decompress| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var counter: BodyAllocCounter = .{ .child = arena.allocator(), .watch_len = gzip_hello.len + 1 };
+        var source: std.Io.Reader = .fixed(gzip_hello);
+        var req: Request = .{ .arena = counter.allocator(), ._transport = undefined, ._parser = undefined };
+        req._config.decompress = decompress;
+        req.headers = try http.Headers.init(arena.allocator(), 4);
+        try req.headers.put("content-encoding", "gzip");
+        try req.headers.put("content-length", std.fmt.comptimePrint("{d}", .{gzip_hello.len}));
+        req._applyEntityHeaders();
+        req._body_source = .{ .reader = &source, .err = noBodySourceError };
+        counter.reset();
+        const got = (try req.body()).?;
+        if (decompress) {
+            try std.testing.expectEqualStrings("hello", got);
+            try std.testing.expectEqual(0, counter.watched);
+        } else {
+            try std.testing.expectEqualStrings(gzip_hello, got);
+            try std.testing.expectEqual(1, counter.allocs);
+            try std.testing.expectEqual(1, counter.watched);
+        }
+    }
+}
+
+test "Request.body: a 1 KiB body stays in the request set's chunks" {
+    const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersPool;
+    var counter: BodyAllocCounter = .{ .child = std.testing.allocator };
+    var pool: RequestBuffersPool = .init(counter.allocator(), std.testing.io, 4096 + body_read_reserve, 1024, 8 * 1024);
+    defer pool.deinit();
+    const set = try pool.acquire(1);
+    defer pool.release(set);
+
+    const bytes = try bodyPattern(std.testing.allocator, 1024);
+    defer std.testing.allocator.free(bytes);
+    var source: std.Io.Reader = .fixed(bytes);
+    var req: Request = .{ .arena = set.arena.allocator(), ._transport = undefined, ._parser = undefined };
+    req.content_length = bytes.len;
+    req._body_source = .{ .reader = &source, .err = noBodySourceError };
+    counter.reset();
+    try std.testing.expectEqualSlices(u8, bytes, (try req.body()).?);
+    try std.testing.expectEqual(0, counter.allocs);
 }
 
 test "Request.body: 100 Continue goes through the response's sink" {

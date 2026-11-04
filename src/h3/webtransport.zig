@@ -226,7 +226,7 @@ pub const Core = struct {
     /// Streams with something to send, by urgency and in turn.
     sched: Sched = .{},
     /// Datagrams to send, oldest first, each with its session prefix.
-    datagrams_out: std.ArrayList([]u8) = .empty,
+    datagrams_out: std.Deque([]u8) = .empty,
     /// Which of WebTransport's streams and nghttp3's leads the next packet
     /// (when no WebTransport stream is more urgent than nghttp3's default).
     turn: bool = false,
@@ -251,7 +251,7 @@ pub const Core = struct {
         core.orphans.deinit(gpa);
         core.undecided.deinit(gpa);
         core.sessions.deinit(gpa);
-        for (core.datagrams_out.items) |d| gpa.free(d);
+        while (core.datagrams_out.popFront()) |d| gpa.free(d);
         core.datagrams_out.deinit(gpa);
         gpa.destroy(core);
     }
@@ -383,10 +383,10 @@ pub const Core = struct {
         const session = core.sessions.get(@intCast(qsid.value * 4)) orelse return;
         const payload = data[qsid.len..];
         if (session.state != .open or
-            session.datagrams_in.items.len >= core.limits.datagrams_in or
+            session.datagrams_in.len >= core.limits.datagrams_in or
             session.datagrams_in_bytes + payload.len > core.limits.datagrams_in_bytes) return;
         const copy = core.gpa.dupe(u8, payload) catch return;
-        session.datagrams_in.append(core.gpa, copy) catch {
+        session.datagrams_in.pushBack(core.gpa, copy) catch {
             core.gpa.free(copy);
             return;
         };
@@ -520,15 +520,14 @@ pub const Core = struct {
 
     /// The oldest datagram into the packet.
     pub fn writeDatagram(core: *Core, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, dest: []u8, ts: u64) ?Wrote {
-        if (core.datagrams_out.items.len == 0) return null;
-        const d = core.datagrams_out.items[0];
+        const d = core.datagrams_out.front() orelse return null;
         var accepted: c_int = 0;
         const vec = [_]c.ngtcp2_vec{.{ .base = d.ptr, .len = d.len }};
         const n = ngtcp2.connWritevDatagram(core.q, p, pi, dest, &accepted, c.NGTCP2_WRITE_DATAGRAM_FLAG_MORE, 0, &vec, ts);
         // Taken, or never will be (too big for the peer, or the peer takes
         // none): off the queue either way.
         if (accepted != 0 or n == c.NGTCP2_ERR_INVALID_ARGUMENT or n == c.NGTCP2_ERR_INVALID_STATE) {
-            _ = core.datagrams_out.orderedRemove(0);
+            _ = core.datagrams_out.popFront();
             core.gpa.free(d);
             // A slot is free: sessions waiting to send wake.
             var sit = core.sessions.valueIterator();
@@ -783,11 +782,11 @@ pub const Session = struct {
     reason_buf: [max_close_message]u8 = undefined,
     /// Either side has started to drain.
     draining_flag: bool = false,
-    incoming_bidi: std.ArrayList(*Stream) = .empty,
-    incoming_uni: std.ArrayList(*Stream) = .empty,
+    incoming_bidi: std.Deque(*Stream) = .empty,
+    incoming_uni: std.Deque(*Stream) = .empty,
     /// Every stream of the session that QUIC or a handler still holds.
     members: std.ArrayList(*Stream) = .empty,
-    datagrams_in: std.ArrayList([]u8) = .empty,
+    datagrams_in: std.Deque([]u8) = .empty,
     datagrams_in_bytes: usize = 0,
     /// Unregistered from the core (`deinit`).
     detached: bool = false,
@@ -947,7 +946,7 @@ pub const Session = struct {
             s.maybeFree();
         }
         self.members.deinit(core.gpa);
-        for (self.datagrams_in.items) |d| core.gpa.free(d);
+        while (self.datagrams_in.popFront()) |d| core.gpa.free(d);
         self.datagrams_in.deinit(core.gpa);
         self.ev.notify(core.io);
         host.kick();
@@ -957,13 +956,13 @@ pub const Session = struct {
     fn deliver(self: *Session, s: *Stream) void {
         const gpa = self.core.gpa;
         const queue = if (s.kind == .bidi) &self.incoming_bidi else &self.incoming_uni;
-        if (queue.items.len >= self.core.limits.incoming_streams) return s.disown(error_buffered_stream_rejected);
+        if (queue.len >= self.core.limits.incoming_streams) return s.disown(error_buffered_stream_rejected);
         s.session = self;
         self.members.append(gpa, s) catch {
             s.session = null;
             return s.disown(error_buffered_stream_rejected);
         };
-        queue.append(gpa, s) catch {
+        queue.pushBack(gpa, s) catch {
             _ = self.members.pop();
             s.session = null;
             return s.disown(error_buffered_stream_rejected);
@@ -1138,6 +1137,11 @@ pub const Session = struct {
         pub fn testReset(s: *Session, id: i64) void {
             s.testReset(id);
         }
+        /// Tests only: how many peer streams (`.bidi` or `.uni`) and how
+        /// many datagrams wait to be taken.
+        pub fn testQueued(s: *Session, what: Session.QueuedKind) usize {
+            return s.testQueued(what);
+        }
     };
 
     /// The next stream the peer opened, if any: both ways (`.bidi`) or
@@ -1147,8 +1151,7 @@ pub const Session = struct {
         host.lock();
         defer host.unlock();
         const queue = if (dir == .bidi) &self.incoming_bidi else &self.incoming_uni;
-        if (queue.items.len == 0) return null;
-        const s = queue.orderedRemove(0);
+        const s = queue.popFront() orelse return null;
         // The reader's buffer only now that a handler has the stream.
         s.allocReader() catch {
             s.refuse(error_session_gone);
@@ -1197,8 +1200,7 @@ pub const Session = struct {
         const host = self.core.host;
         host.lock();
         defer host.unlock();
-        if (self.datagrams_in.items.len == 0) return null;
-        const d = self.datagrams_in.orderedRemove(0);
+        const d = self.datagrams_in.popFront() orelse return null;
         self.datagrams_in_bytes -= d.len;
         return d;
     }
@@ -1241,11 +1243,11 @@ pub const Session = struct {
             core.host.unlock();
             return error.DatagramTooLarge;
         }
-        if (core.datagrams_out.items.len >= core.limits.datagrams_out) {
+        if (core.datagrams_out.len >= core.limits.datagrams_out) {
             core.host.unlock();
             return false;
         }
-        core.datagrams_out.append(core.gpa, d) catch {
+        core.datagrams_out.pushBack(core.gpa, d) catch {
             core.host.unlock();
             return error.OutOfMemory;
         };
@@ -1275,6 +1277,19 @@ pub const Session = struct {
         s.enqueue();
         core.host.kick();
         return id;
+    }
+
+    const QueuedKind = enum { bidi, uni, datagrams };
+
+    fn testQueued(self: *Session, what: QueuedKind) usize {
+        if (!@import("builtin").is_test) @compileError("tests only");
+        self.core.host.lock();
+        defer self.core.host.unlock();
+        return switch (what) {
+            .bidi => self.incoming_bidi.len,
+            .uni => self.incoming_uni.len,
+            .datagrams => self.datagrams_in.len,
+        };
     }
 
     /// Tests only: resets a `testOpenRaw` stream's sending side.
@@ -1315,13 +1330,12 @@ pub const Session = struct {
         while (true) {
             const seen = self.ev.epoch();
             core.host.lock();
-            if (self.datagrams_in.items.len > 0) {
-                const d = self.datagrams_in.items[0];
+            if (self.datagrams_in.front()) |d| {
                 if (d.len > buf.len) {
                     core.host.unlock();
                     return error.NoSpaceLeft;
                 }
-                _ = self.datagrams_in.orderedRemove(0);
+                _ = self.datagrams_in.popFront();
                 self.datagrams_in_bytes -= d.len;
                 core.host.unlock();
                 @memcpy(buf[0..d.len], d);

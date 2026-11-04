@@ -427,7 +427,8 @@ pub fn Router(comptime Ctx: type) type {
             }
         }
 
-        fn matchRecursive(node: *Node, req: *Request, path: []const u8, segments: []const []const u8, segment_offsets: []const usize, index: usize) !?*Node {
+        /// `segments` are `path`'s non-empty segments, subslices of it.
+        fn matchRecursive(node: *Node, req: *Request, path: []const u8, segments: []const []const u8, index: usize) !?*Node {
             // Terminal case: consumed all segments
             if (index >= segments.len) {
                 // Only return node if it has a route registered
@@ -443,7 +444,7 @@ pub fn Router(comptime Ctx: type) type {
             var static_child = node.static_children;
             while (static_child) |c| {
                 if (std.mem.eql(u8, c.segment, current_segment)) {
-                    const result = try matchRecursive(c, req, path, segments, segment_offsets, index + 1);
+                    const result = try matchRecursive(c, req, path, segments, index + 1);
                     if (result != null) return result;
                 }
                 static_child = c.next_sibling;
@@ -455,7 +456,7 @@ pub fn Router(comptime Ctx: type) type {
                     return error.TooManyParams;
                 }
                 try req.params.map.put(req.arena, c.param_name.?, current_segment);
-                const result = try matchRecursive(c, req, path, segments, segment_offsets, index + 1);
+                const result = try matchRecursive(c, req, path, segments, index + 1);
                 if (result != null) return result;
                 _ = req.params.map.remove(c.param_name.?); // backtrack
             }
@@ -465,8 +466,12 @@ pub fn Router(comptime Ctx: type) type {
                 if (req.params.count() >= req._config.max_param_count) {
                     return error.TooManyParams;
                 }
-                // Capture remaining path (without query parameters)
-                const remaining = path[segment_offsets[index]..];
+                // Capture remaining path (without query parameters), from
+                // where the segment starts in it.
+                // SAFETY: `segments` are subslices of `path` (`findHandler`).
+                const start = @intFromPtr(current_segment.ptr) - @intFromPtr(path.ptr);
+                std.debug.assert(start < path.len);
+                const remaining = path[start..];
                 try req.params.map.put(req.arena, c.param_name.?, remaining);
                 return c;
             }
@@ -489,33 +494,31 @@ pub fn Router(comptime Ctx: type) type {
                 return r.*;
             }
 
-            // Count segments (max possible is number of '/' + 1)
+            // The path's segments, on the stack up to 16 of them (past any
+            // real route's depth), in the arena past that. At most one
+            // more than the path has '/', the one before a leading '/'
+            // included, so 16 segments of `/a/b/...` fit.
+            var stack_segments: [17][]const u8 = undefined;
             const max_segments = std.mem.count(u8, path, "/") + 1;
-
-            // Pre-allocate exact capacity needed
-            var segments = try std.ArrayList([]const u8).initCapacity(req.arena, max_segments);
-            defer segments.deinit(req.arena);
-
-            var offsets = try std.ArrayList(usize).initCapacity(req.arena, max_segments);
-            defer offsets.deinit(req.arena);
-
-            // Split path into segments and track their offsets
-            var offset: usize = 0;
+            const storage = if (max_segments <= stack_segments.len)
+                stack_segments[0..max_segments]
+            else
+                try req.arena.alloc([]const u8, max_segments);
+            var n: usize = 0;
             var iter = std.mem.splitScalar(u8, path, '/');
             while (iter.next()) |segment| {
-                if (segment.len > 0) {
-                    segments.appendAssumeCapacity(segment);
-                    offsets.appendAssumeCapacity(offset);
-                }
-                offset += segment.len + 1; // +1 for the '/'
+                if (segment.len == 0) continue;
+                storage[n] = segment;
+                n += 1;
             }
+            const segments = storage[0..n];
 
-            const route = try self.matchIn(req.method, req, path, segments.items, offsets.items) orelse
+            const route = try self.matchIn(req.method, req, path, segments) orelse
                 // A HEAD response is the GET response without the body, so a
                 // HEAD with no route of its own is answered by the GET one.
                 // Second, so a route registered with `head` still wins.
-                (if (req.method == .head) try self.matchIn(.get, req, path, segments.items, offsets.items) else null) orelse
-                try self.matchIn(null, req, path, segments.items, offsets.items);
+                (if (req.method == .head) try self.matchIn(.get, req, path, segments) else null) orelse
+                try self.matchIn(null, req, path, segments);
             if (route) |r| {
                 req.route = &r.info;
                 return r.*;
@@ -560,20 +563,6 @@ pub fn Router(comptime Ctx: type) type {
             else
                 null;
             const path = if (std.mem.indexOfScalar(u8, req.url, '?')) |q| req.url[0..q] else req.url;
-            const max_segments = std.mem.count(u8, path, "/") + 1;
-            const segments = try req.arena.alloc([]const u8, max_segments);
-            const offsets = try req.arena.alloc(usize, max_segments);
-            var n: usize = 0;
-            var offset: usize = 0;
-            var iter = std.mem.splitScalar(u8, path, '/');
-            while (iter.next()) |segment| {
-                if (segment.len > 0) {
-                    segments[n] = segment;
-                    offsets[n] = offset;
-                    n += 1;
-                }
-                offset += segment.len + 1;
-            }
             defer req.params.map.clearRetainingCapacity();
 
             var allow: std.ArrayList(u8) = .empty;
@@ -581,9 +570,11 @@ pub fn Router(comptime Ctx: type) type {
             var has_head = false;
             for (std.enums.values(Method)) |m| {
                 if (m == req.method) continue;
-                req.params.map.clearRetainingCapacity();
-                const route = self.matchIn(m, req, path, segments[0..n], offsets[0..n]) catch continue;
-                if (route == null) continue;
+                const route = self.peekIn(m, path) orelse continue;
+                // `findHandler` answers a route with more parameters than
+                // `max_param_count` with an error (a 400), so it isn't one
+                // to offer.
+                if (paramCount(route.info.path) > req._config.max_param_count) continue;
                 if (preflight_route) |out| {
                     if (out.* == null or m == wanted) out.* = route;
                 }
@@ -597,6 +588,16 @@ pub fn Router(comptime Ctx: type) type {
             return if (allow.items.len == 0) null else allow.items;
         }
 
+        /// The parameter and wildcard segments of a route pattern.
+        fn paramCount(pattern: []const u8) usize {
+            var n: usize = 0;
+            var iter = std.mem.tokenizeScalar(u8, pattern, '/');
+            while (iter.next()) |segment| {
+                if (segment[0] == ':' or segment[0] == '*') n += 1;
+            }
+            return n;
+        }
+
         fn methodNamed(text: []const u8) ?Method {
             for (std.enums.values(Method)) |m| if (std.mem.eql(u8, m.name(), text)) return m;
             return null;
@@ -608,10 +609,9 @@ pub fn Router(comptime Ctx: type) type {
             req: *Request,
             path: []const u8,
             segments: []const []const u8,
-            offsets: []const usize,
         ) !?*const Route {
             const root = (if (method) |m| self.trees[@backingInt(m)] else self.any_tree) orelse return null;
-            const node = try matchRecursive(root, req, path, segments, offsets, 0) orelse return null;
+            const node = try matchRecursive(root, req, path, segments, 0) orelse return null;
             const opaque_route = node.route orelse return null;
             return @ptrCast(@alignCast(opaque_route));
         }
@@ -2077,6 +2077,205 @@ test "Router: HEAD falling back to GET still captures path params" {
     };
     try std.testing.expect(try router.findHandler(&req) != null);
     try std.testing.expectEqualStrings("42", req.params.get("id").?);
+}
+
+fn testRequest(arena: std.mem.Allocator, method: Method, url: []const u8) Request {
+    // SAFETY: the router reads neither the parser nor the transport.
+    return .{ .method = method, .url = url, .arena = arena, ._parser = undefined, ._transport = undefined };
+}
+
+test "Router: a one-parameter hit makes one arena allocation, the params map; a static hit and a miss none" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.get("/users/:id", voidHandler1);
+    router.get("/users/:id/posts/:post", voidHandler1);
+    router.get("/health", voidHandler1);
+
+    // Segments live on the stack. Zero from routing would take a fixed
+    // params store: `req.params.map` starts empty on every request, so
+    // its first entry allocates.
+    for ([_]struct { url: []const u8, allocations: usize }{
+        .{ .url = "/users/123", .allocations = 1 },
+        .{ .url = "/users/123/posts/9", .allocations = 1 },
+        .{ .url = "/health", .allocations = 0 },
+        .{ .url = "/health/", .allocations = 0 },
+        .{ .url = "/nothing/here", .allocations = 0 },
+        // 16 segments still fit on the stack; 17 spill to the arena.
+        .{ .url = "/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p", .allocations = 0 },
+        .{ .url = "/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q", .allocations = 1 },
+    }) |case| {
+        var counting = std.testing.FailingAllocator.init(arena.allocator(), .{});
+        var req = testRequest(counting.allocator(), .get, case.url);
+        _ = try router.findHandler(&req);
+        try std.testing.expectEqual(case.allocations, counting.allocations);
+    }
+}
+
+test "Router: a parameter past 16 segments is captured (segments spill to the arena)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+    const prefix = "/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s";
+    router.get(prefix ++ "/:x", voidHandler1);
+
+    var req = testRequest(arena.allocator(), .get, prefix ++ "/twenty");
+    try std.testing.expect(try router.findHandler(&req) != null);
+    try std.testing.expectEqualStrings("twenty", req.params.get("x").?);
+
+    var miss = testRequest(arena.allocator(), .get, prefix ++ "/twenty/more");
+    try std.testing.expect(try router.findHandler(&miss) == null);
+}
+
+fn repeated(comptime text: []const u8, comptime n: usize) []const u8 {
+    comptime var out: []const u8 = "";
+    inline for (0..n) |_| out = out ++ text;
+    return out;
+}
+
+test "Router: a wildcard captures the exact tail of a path past 16 segments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.get("/deep/*rest", voidHandler1);
+    router.get("/*all", voidHandler2);
+
+    const tail = comptime repeated("s1/", 28) ++ "end";
+    var req = testRequest(arena.allocator(), .get, "/deep/" ++ tail ++ "?q=1");
+    const route = (try router.findHandler(&req)).?;
+    try std.testing.expect(route.action == voidHandler1);
+    try std.testing.expectEqualStrings(tail, req.params.get("rest").?);
+
+    // The spill, with the tail starting at the first segment.
+    const all = comptime repeated("a/", 17) ++ "z";
+    var req2 = testRequest(arena.allocator(), .get, "/" ++ all);
+    _ = (try router.findHandler(&req2)).?;
+    try std.testing.expectEqualStrings(all, req2.params.get("all").?);
+}
+
+test "Router: a wildcard tail keeps empty segments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.get("/files/*path", voidHandler1);
+
+    var req = testRequest(arena.allocator(), .get, "/files//a//b");
+    try std.testing.expect(try router.findHandler(&req) != null);
+    try std.testing.expectEqualStrings("a//b", req.params.get("path").?);
+}
+
+test "Router: allowedMethods is null for a path no method has (a 404) and leaves params empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.get("/items/:id", voidHandler1);
+    router.post("/items", voidHandler1);
+
+    var req = testRequest(arena.allocator(), .put, "/orders/7");
+    try std.testing.expect(try router.findHandler(&req) == null);
+    try std.testing.expect(try router.allowedMethods(&req) == null);
+    try std.testing.expectEqual(0, req.params.count());
+}
+
+test "Router: a 405 lists the methods with a route for the path, then HEAD for a GET route" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.get("/items/:id", voidHandler1);
+    router.post("/items/:id", voidHandler1);
+    router.delete("/items/:id", voidHandler1);
+    router.put("/items", voidHandler1);
+
+    var req = testRequest(arena.allocator(), .put, "/items/7?x=1");
+    try std.testing.expect(try router.findHandler(&req) == null);
+    try std.testing.expectEqualStrings("DELETE, GET, POST, HEAD", (try router.allowedMethods(&req)).?);
+    try std.testing.expectEqual(0, req.params.count());
+
+    // Any other method gets the same list.
+    var patch = testRequest(arena.allocator(), .patch, "/items/7");
+    try std.testing.expectEqualStrings("DELETE, GET, POST, HEAD", (try router.allowedMethods(&patch)).?);
+    // An OPTIONS request's own HEAD folds in the same way.
+    var options = testRequest(arena.allocator(), .options, "/items/7");
+    try std.testing.expectEqualStrings("DELETE, GET, POST, HEAD", (try router.allowedMethods(&options)).?);
+}
+
+test "Router: a HEAD request to a path with no GET route gets no HEAD in Allow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.get("/a", voidHandler1);
+    router.post("/b/:id", voidHandler1);
+
+    var req = testRequest(arena.allocator(), .head, "/b/1");
+    try std.testing.expect(try router.findHandler(&req) == null);
+    try std.testing.expectEqualStrings("POST", (try router.allowedMethods(&req)).?);
+}
+
+test "Router: Allow leaves out a route with more parameters than max_param_count" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.get("/:a/:b/:c/:d/:e/:f/:g/:h/:i", voidHandler1);
+
+    router.put("/:a/:b/:c/:d/:e/:f/:g/:h/x", voidHandler1);
+
+    // A GET would be a 400 (too many parameters), so only PUT is offered.
+    var req = testRequest(arena.allocator(), .post, "/1/2/3/4/5/6/7/8/x");
+    try std.testing.expectEqual(8, req._config.max_param_count);
+    try std.testing.expect(try router.findHandler(&req) == null);
+    try std.testing.expectEqualStrings("PUT", (try router.allowedMethods(&req)).?);
+    try std.testing.expectEqual(0, req.params.count());
+    var get = testRequest(arena.allocator(), .get, "/1/2/3/4/5/6/7/8/x");
+    try std.testing.expectError(error.TooManyParams, router.findHandler(&get));
+
+    // With no method left, a 404.
+    var only = testRequest(arena.allocator(), .post, "/1/2/3/4/5/6/7/8/9");
+    try std.testing.expect(try router.allowedMethods(&only) == null);
+}
+
+test "Router.miss: a preflight runs the middleware of the route Access-Control-Request-Method names, else of the first" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+    const TestMw = struct {
+        id: u8,
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Chain(void)) !void {}
+    };
+    var mw_global = TestMw{ .id = 0 };
+    var mw_get = TestMw{ .id = 1 };
+    var mw_post = TestMw{ .id = 2 };
+    router.use(Middleware(void).init(&mw_global));
+    router.group("/v1", &.{Middleware(void).init(&mw_get)}).get("/items/:id", voidHandler1);
+    router.group("/v1", &.{Middleware(void).init(&mw_post)}).post("/items/:id", voidHandler1);
+
+    var asks_post = testRequest(arena.allocator(), .options, "/v1/items/7");
+    asks_post.headers = try .init(arena.allocator(), 4);
+    try asks_post.headers.put("Access-Control-Request-Method", "POST");
+    try std.testing.expect(try router.findHandler(&asks_post) == null);
+    const miss_post = try router.miss(&asks_post);
+    try std.testing.expectEqualStrings("GET, POST, HEAD", miss_post.allow.?);
+    try std.testing.expect(miss_post.middlewares[miss_post.middlewares.len - 1].ptr == @as(*anyopaque, @ptrCast(&mw_post)));
+    try std.testing.expectEqual(0, asks_post.params.count());
+
+    var asks_nothing = testRequest(arena.allocator(), .options, "/v1/items/7");
+    const miss_first = try router.miss(&asks_nothing);
+    try std.testing.expect(miss_first.middlewares[miss_first.middlewares.len - 1].ptr == @as(*anyopaque, @ptrCast(&mw_get)));
+
+    // Not a preflight: the global middleware, and a 404 has no Allow.
+    var plain = testRequest(arena.allocator(), .options, "/v2/items/7");
+    const miss_plain = try router.miss(&plain);
+    try std.testing.expect(miss_plain.allow == null);
+    try std.testing.expectEqual(1, miss_plain.middlewares.len);
+    try std.testing.expect(miss_plain.middlewares[0].ptr == @as(*anyopaque, @ptrCast(&mw_global)));
 }
 
 test "router: a no_wait route behind middleware that may wait is a conflict, recorded under record_conflicts" {

@@ -1442,8 +1442,9 @@ pub const Rooms = struct {
     /// The most queued messages a member's sender writes before one flush.
     const send_round = 64;
 
-    /// Members a broadcast notes on the stack for starting their senders; a
-    /// bigger room borrows from the allocator.
+    /// Members a broadcast notes on the stack for starting their senders;
+    /// the 65th one needing a start borrows from the allocator (a room whose
+    /// members are running, the usual case, never does).
     const stack_snapshot = 64;
 
     /// No rooms yet. `allocator` holds the room names, members and queued
@@ -1735,8 +1736,10 @@ pub const Rooms = struct {
         const io = self.bound() orelse return 0;
 
         var stack: [stack_snapshot]*Member = undefined;
+        var buf: []*Member = &stack;
         var heap: []*Member = &.{};
         defer self.allocator.free(heap);
+        var no_heap = false;
         var start: []*Member = &.{};
         var reached: usize = 0;
         {
@@ -1744,12 +1747,11 @@ pub const Rooms = struct {
             defer self.mutex.unlock(io);
             const members = (self.rooms.get(room) orelse return 0).items;
             // The members whose sender has to be started, started once the
-            // lock is let go. Without memory to note them, they are started
-            // here.
-            const buf: ?[]*Member = if (members.len <= stack.len) &stack else if (self.allocator.alloc(*Member, members.len)) |h| big: {
-                heap = h;
-                break :big h;
-            } else |_| null;
+            // lock is let go. The stack holds the first 64; the 65th takes
+            // one snapshot from the allocator, big enough for the room. Should
+            // that fail, the members after the 64th are left idle with their
+            // message queued, for the next broadcast to start: a sender is
+            // never started under the lock (its failure path takes it).
             var n: usize = 0;
             for (members) |m| {
                 if (m.socket == except or m.broken or m.left) continue;
@@ -1766,12 +1768,19 @@ pub const Rooms = struct {
                 reached += 1;
                 if (m.running) continue;
                 m.running = true;
-                if (buf) |b| {
-                    b[n] = m;
+                if (n == buf.len and heap.len == 0 and !no_heap) {
+                    if (self.allocator.alloc(*Member, members.len)) |h| {
+                        @memcpy(h[0..n], buf[0..n]);
+                        heap = h;
+                        buf = h;
+                    } else |_| no_heap = true;
+                }
+                if (n < buf.len) {
+                    buf[n] = m;
                     n += 1;
-                } else self.startSender(io, m);
+                } else m.running = false;
             }
-            if (buf) |b| start = b[0..n];
+            start = buf[0..n];
         }
         for (start) |m| self.startSender(io, m);
         return reached;
