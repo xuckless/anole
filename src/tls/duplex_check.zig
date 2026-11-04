@@ -12,9 +12,6 @@ const selfSigned = @import("root.zig").selfSigned;
 pub const Options = struct {
     /// Bytes each side sends (and so receives).
     bytes_per_direction: usize = 8 * 1024 * 1024,
-    /// The server may move its sending side to kernel TLS (where the `tls`
-    /// module is loaded), so a BoringSSL reader runs beside a kernel writer.
-    ktls: bool = false,
 };
 
 /// Deterministic, side-dependent stream content, so a reordered, dropped or
@@ -48,7 +45,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opt: Options) !void {
     var server_side: Side = undefined;
     var client_side: Side = undefined;
 
-    var accept_future = try io.concurrent(acceptAndHandshake, .{ io, &listener, &server_side, &auth, opt.ktls });
+    var accept_future = try io.concurrent(acceptAndHandshake, .{ io, &listener, &server_side, &auth });
     defer _ = accept_future.cancel(io) catch {};
     try connectAndHandshake(io, addr, &client_side);
     try accept_future.await(io);
@@ -87,7 +84,7 @@ pub fn idle(gpa: std.mem.Allocator, io: std.Io) !void {
 
     var server_side: Side = undefined;
     var client_side: Side = undefined;
-    var accept_future = try io.concurrent(acceptAndHandshake, .{ io, &listener, &server_side, &auth, false });
+    var accept_future = try io.concurrent(acceptAndHandshake, .{ io, &listener, &server_side, &auth });
     defer _ = accept_future.cancel(io) catch {};
     try connectAndHandshake(io, listener.socket.address, &client_side);
     try accept_future.await(io);
@@ -125,7 +122,7 @@ pub fn batched(gpa: std.mem.Allocator, io: std.Io) !void {
 
     var server_side: Side = undefined;
     var client_side: Side = undefined;
-    var accept_future = try io.concurrent(acceptAndHandshake, .{ io, &listener, &server_side, &auth, false });
+    var accept_future = try io.concurrent(acceptAndHandshake, .{ io, &listener, &server_side, &auth });
     defer _ = accept_future.cancel(io) catch {};
     try connectAndHandshake(io, listener.socket.address, &client_side);
     try accept_future.await(io);
@@ -190,7 +187,7 @@ fn readExactlyInner(side: *Side, total: usize) !void {
     try std.testing.expectEqual(0, r.interface.bufferedLen());
 }
 
-fn acceptAndHandshake(io: std.Io, listener: *std.Io.net.Server, side: *Side, auth: *tls.config.CertKeyPair, ktls: bool) !void {
+fn acceptAndHandshake(io: std.Io, listener: *std.Io.net.Server, side: *Side, auth: *tls.config.CertKeyPair) !void {
     const stream = try listener.accept(io);
     side.* = .{ .conn = undefined, .tcp_reader = undefined, .tcp_writer = undefined, .stream = stream, .id = 1 };
     side.tcp_reader = stream.reader(io, &side.in_buf);
@@ -200,7 +197,6 @@ fn acceptAndHandshake(io: std.Io, listener: *std.Io.net.Server, side: *Side, aut
         .auth = auth,
         .now = std.Io.Clock.real.now(io),
         .rng = rng.interface(),
-        .ktls_socket = if (ktls) stream.socket.handle else null,
     });
 }
 
@@ -278,7 +274,7 @@ pub fn framed(gpa: std.mem.Allocator, io: std.Io) !void {
 
     var server_side: Side = undefined;
     var client_side: Side = undefined;
-    var accept_future = try io.concurrent(acceptAndHandshake, .{ io, &listener, &server_side, &auth, false });
+    var accept_future = try io.concurrent(acceptAndHandshake, .{ io, &listener, &server_side, &auth });
     defer _ = accept_future.cancel(io) catch {};
     try connectAndHandshake(io, listener.socket.address, &client_side);
     try accept_future.await(io);
@@ -350,7 +346,7 @@ const Pair = struct {
         p.listener = try listen_addr.listen(io, .{ .reuse_address = true });
         errdefer p.listener.deinit(io);
         p.client_closed = false;
-        var accept_future = try io.concurrent(acceptAndHandshake, .{ io, &p.listener, &p.server, &p.auth, false });
+        var accept_future = try io.concurrent(acceptAndHandshake, .{ io, &p.listener, &p.server, &p.auth });
         defer _ = accept_future.cancel(io) catch {};
         try connectAndHandshake(io, p.listener.socket.address, &p.client);
         accept_future.await(io) catch |err| {
