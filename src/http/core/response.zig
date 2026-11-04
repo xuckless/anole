@@ -2494,14 +2494,16 @@ pub const Response = struct {
     }
 };
 
-/// `n` in decimal, as `print("{d}")` writes it (std's two digits per
-/// division, as json_out's integers).
+/// `n` in decimal, as `print("{d}")` writes it.
 fn writeDecimal(w: *std.Io.Writer, n: usize) std.Io.Writer.Error!void {
-    return w.printInt(n, 10, .lower, .{});
+    var buf: [20]u8 = undefined;
+    return w.writeAll(buf[decimalInto(&buf, n)..]);
 }
 
 /// `n` in decimal at the end of `buf`, right to left, two digits per
-/// division (std's `printIntAny`); returns where the digits start.
+/// division; returns where the digits start. The base-10 branch of std's
+/// `printIntAny` (std/Io/Writer.zig), copied so a head's numbers go
+/// straight into the bytes around them, without its generic path.
 fn decimalInto(buf: []u8, n: usize) usize {
     var a = n;
     var i = buf.len;

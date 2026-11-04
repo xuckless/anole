@@ -358,13 +358,18 @@ pub fn dateLine(buf: *DateLine, seconds: i64) void {
 }
 
 threadlocal var date_line: DateLine = undefined;
-threadlocal var date_line_seconds: i64 = -1;
+// A second the clock can't give: -1 is a real reading (a clock set to
+// 1969-12-31T23:59:59Z), and would hand out the never-written line.
+threadlocal var date_line_seconds: i64 = std.math.minInt(i64);
 
 /// The current time as a `Date` header line (RFC 9110 6.6.1), formatted at
 /// most once a second per thread. Valid until the next call on this thread;
 /// copy it to keep it.
 pub fn currentDateLine(io: std.Io) *const DateLine {
-    const now = realSeconds(io);
+    return cachedDateLine(realSeconds(io));
+}
+
+fn cachedDateLine(now: i64) *const DateLine {
     if (now != date_line_seconds) {
         dateLine(&date_line, now);
         date_line_seconds = now;
@@ -403,6 +408,19 @@ test "dateLine: the Date header line, clamped as formatHttpDate" {
     try std.testing.expect(std.mem.startsWith(u8, now, "Date: "));
     try std.testing.expect(std.mem.endsWith(u8, now, " GMT\r\n"));
     try std.testing.expectEqual(@as(usize, 29), currentHttpDate(std.testing.io).len);
+}
+
+test "currentDateLine: a thread's first line is written even for the second before the epoch" {
+    // A fresh thread has the cache in its initial state.
+    const T = struct {
+        fn run(out: *DateLine) void {
+            out.* = cachedDateLine(-1).*;
+        }
+    };
+    var line: DateLine = undefined;
+    const thread = try std.Thread.spawn(.{}, T.run, .{&line});
+    thread.join();
+    try std.testing.expectEqualStrings("Date: Thu, 01 Jan 1970 00:00:00 GMT\r\n", &line);
 }
 
 test "Status.statusLine: the literal lines match the code and phrase, for exactly the hot statuses" {
