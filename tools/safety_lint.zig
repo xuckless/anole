@@ -61,7 +61,7 @@ const Token = std.zig.Token;
 /// fold into one wrapper at the engine's takeover; listed in SAFETY.md).
 const c_libs = [_]struct { modules: []const []const u8, files: []const []const u8 }{
     .{ .modules = &.{ "anole_nghttp2_c", "nghttp2" }, .files = &.{ "src/http/core/server/h2_nghttp2.zig", "src/http/core/client.zig", "src/h2/root.zig", "src/h2/client.zig" } },
-    .{ .modules = &.{"anole_boringssl_c"}, .files = &.{ "src/tls/root.zig", "src/tls/dusty_tls.zig", "src/tls/ktls.zig", "src/h3/root.zig" } },
+    .{ .modules = &.{"anole_boringssl_c"}, .files = &.{ "src/tls/root.zig", "src/tls/dusty_tls.zig", "src/h3/root.zig" } },
     .{ .modules = &.{ "anole_ngtcp2_c", "anole_nghttp3_c" }, .files = &.{ "src/h3/root.zig", "src/h3/layout.zig", "src/h3/ngtcp2.zig", "src/h3/nghttp3.zig", "src/h3/quic_tls.zig", "src/h3/client.zig", "src/h3/session_cache.zig", "src/h3/server.zig", "src/h3/bridge.zig", "src/h3/webtransport.zig", "src/h3/net.zig" } },
     .{ .modules = &.{"anole_yyjson_c"}, .files = &.{"src/json/root.zig"} },
     .{ .modules = &.{"anole_hiredis_c"}, .files = &.{"src/redis/root.zig"} },

@@ -547,9 +547,6 @@ pub const Connection = struct {
             .now = std.Io.Clock.real.now(io),
             .rng = self.tls_rng.interface(),
             .alpn_protocols = alpn_protocols,
-            // Kernel TLS after a large response (Linux; tls_stub.zig takes
-            // any options).
-            .ktls_socket = if (builtin.os.tag == .linux) stream.socket.handle else null,
         });
         self.tls_reader = self.tls_conn.?.reader(&.{});
         self.tls_writer = self.tls_conn.?.writer(&.{});
