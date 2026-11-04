@@ -654,7 +654,7 @@ test "Rooms: a broadcast to idle members takes a snapshot only above 64" {
     }
 }
 
-test "Rooms: when the snapshot cannot be had, every member still gets its sender" {
+test "Rooms: when the snapshot cannot be had, the members after the 64th wait for the next broadcast" {
     inline for (.{ 65, 200 }) |n| {
         const gpa = std.testing.allocator;
         const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
@@ -672,6 +672,14 @@ test "Rooms: when the snapshot cannot be had, every member still gets its sender
         try std.testing.expectEqual(@as(usize, n), r.broadcastPayload("room", payload, null));
         // Asked once, not once per member after the 64th.
         try std.testing.expectEqual(@as(usize, 1), probe.watched.load(.monotonic));
+        for (crowd.members[0..64]) |*m| try wait.waitEvent(io, "a member's sender reached the transport", &m.entered);
+        // No sender was started for the rest: no task exists to set this.
+        for (crowd.members[64..]) |*m| try std.testing.expect(!m.entered.isSet());
+
+        // With memory back, the next broadcast starts them, message queued
+        // before first.
+        probe.fail_watched = false;
+        try std.testing.expectEqual(@as(usize, n), r.broadcastPayload("room", payload, null));
         try crowd.waitEntered(io);
     }
 }

@@ -1749,8 +1749,9 @@ pub const Rooms = struct {
             // The members whose sender has to be started, started once the
             // lock is let go. The stack holds the first 64; the 65th takes
             // one snapshot from the allocator, big enough for the room. Should
-            // that fail, the members after the 64th are started here, under
-            // the lock.
+            // that fail, the members after the 64th are left idle with their
+            // message queued, for the next broadcast to start: a sender is
+            // never started under the lock (its failure path takes it).
             var n: usize = 0;
             for (members) |m| {
                 if (m.socket == except or m.broken or m.left) continue;
@@ -1777,7 +1778,7 @@ pub const Rooms = struct {
                 if (n < buf.len) {
                     buf[n] = m;
                     n += 1;
-                } else self.startSender(io, m);
+                } else m.running = false;
             }
             start = buf[0..n];
         }
