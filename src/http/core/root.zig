@@ -75,6 +75,9 @@ pub const Deadline = @import("deadline.zig").Deadline;
 pub const BodySource = @import("request.zig").BodySource;
 pub const BodyWriter = @import("response.zig").BodyWriter;
 pub const StreamingBodyWriter = @import("response.zig").StreamingBodyWriter;
+/// `std.Io.Reader.allocRemaining` sized by a body's declared length; what
+/// `Request.body` reads with, for other whole-body readers (gRPC Connect).
+pub const allocRemainingHinted = @import("request.zig").allocRemainingHinted;
 /// What `Request.reader` returns.
 pub const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 pub const EventStream = @import("response.zig").EventStream;
