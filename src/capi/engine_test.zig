@@ -2913,55 +2913,6 @@ test "capi engine: a static route refuses a symlink out of its directory unless 
     try std.testing.expect(e.wait(stopWaitMs()));
 }
 
-fn staticCacheCheck(io: std.Io, port: u16) !void {
-    var buf: [2048]u8 = undefined;
-    for ([_][]const u8{ "/c/style.css", "/c/style.css", "/n/style.css", "/n/style.css" }) |path| {
-        const got = try rawGet(io, port, path, &buf);
-        try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
-        try std.testing.expect(std.mem.endsWith(u8, got, "body"));
-    }
-}
-
-test "capi engine: static routes use the static file cache, except with cache false" {
-    if (!anole.http.static_cache.supported) return error.SkipZigTest;
-    const tio = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(tio, .{ .sub_path = "style.css", .data = "body" });
-    const root_abs = try tmp.dir.realPathFileAlloc(tio, ".", alloc);
-    defer alloc.free(root_abs);
-    const json = try std.fmt.allocPrint(alloc,
-        \\{{"executors": 1, "timeouts": {{"shutdown_ms": 200}},
-        \\ "listeners": [{{"address": "127.0.0.1", "port": 0}}],
-        \\ "static_cache": {{"bytes": 1048576, "max_file": 1024}},
-        \\ "routes": [{{"path": "/c", "static": {{"dir": {f}}}}},
-        \\             {{"path": "/n", "static": {{"dir": {f}, "cache": false}}}}]}}
-    , .{ std.json.fmt(root_abs, .{}), std.json.fmt(root_abs, .{}) });
-    defer alloc.free(json);
-
-    var why_buf: [256]u8 = undefined;
-    var why: std.Io.Writer = .fixed(&why_buf);
-    const e = engine.Engine.create(json, false, &why) catch |err| {
-        std.debug.print("{s}\n", .{why.buffered()});
-        return err;
-    };
-    defer e.destroy();
-    _ = try e.attach(null, null, false);
-    try e.start();
-    const rt = try zio.Runtime.init(alloc, .{});
-    defer rt.deinit();
-    const io = rt.io();
-    var f = try io.concurrent(staticCacheCheck, .{ io, e.port(0) });
-    try f.await(io);
-    const cache = e.app.?.server.static_cache.?;
-    try std.testing.expectEqual(@as(usize, 1048576), cache.opts.bytes);
-    const s = cache.stats();
-    try std.testing.expectEqual(@as(u64, 1), s.fills);
-    try std.testing.expectEqual(@as(u64, 1), s.hits);
-    try e.drain();
-    try std.testing.expect(e.wait(stopWaitMs()));
-}
-
 fn testVarsReal(_: ?*const anyopaque, name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, name, "PORT")) return "41234";
     return null;

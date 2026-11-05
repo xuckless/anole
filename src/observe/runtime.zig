@@ -14,10 +14,6 @@
 //! `anole_websockets_limit` (the frozen limit, -1 while nothing is frozen)
 //! and `anole_ws_upgrades_refused_total{reason="load"|"cap"}`. Integer
 //! gauges, hence permille and microseconds.
-//!
-//! `refreshStaticCache` adds the static file cache's (K7):
-//! `anole_static_cache_{hits,misses,fills,swept}_total`,
-//! `anole_static_cache_skipped_total{reason}` and `anole_static_cache_bytes`.
 const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("dusty");
@@ -76,20 +72,4 @@ pub fn refreshAdmission(registry: *metrics.Registry, state: *const dusty.admissi
     const refused = registry.counter("anole_ws_upgrades_refused_total", "WebSocket upgrades answered 503 by the admission gate.", &.{"reason"}) catch return;
     refused.with(&.{"load"}).set(state.refused_load.load(.monotonic));
     refused.with(&.{"cap"}).set(state.refused_cap.load(.monotonic));
-}
-
-/// The static file cache's series (`http/core/server/static_cache.zig`).
-pub fn refreshStaticCache(registry: *metrics.Registry, s: dusty.static_cache.Stats) void {
-    const hits = registry.counter("anole_static_cache_hits_total", "Static file requests served from the static file cache.", &.{}) catch return;
-    hits.with(&.{}).set(s.hits);
-    const misses = registry.counter("anole_static_cache_misses_total", "Requests for a file the static file cache held that went to the file: it changed, or the client took another encoding.", &.{}) catch return;
-    misses.with(&.{}).set(s.misses);
-    const fills = registry.counter("anole_static_cache_fills_total", "Files read into the static file cache.", &.{}) catch return;
-    fills.with(&.{}).set(s.fills);
-    const swept = registry.counter("anole_static_cache_swept_total", "Entries the trim loop dropped because their file changed or went away.", &.{}) catch return;
-    swept.with(&.{}).set(s.swept);
-    const skipped = registry.counter("anole_static_cache_skipped_total", "Files served but not kept, by reason: budget, table, racy (changed in the last 2 s), retire, fs (not a local filesystem), changed (while read).", &.{"reason"}) catch return;
-    inline for (@typeInfo(dusty.static_cache.Skip).@"enum".field_names, 0..) |name, i| skipped.with(&.{name}).set(s.skipped[i]);
-    const bytes = registry.gauge("anole_static_cache_bytes", "Bytes the static file cache holds, against ServerOptions.static_cache.bytes.", &.{}) catch return;
-    bytes.with(&.{}).set(@intCast(s.bytes));
 }

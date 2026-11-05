@@ -881,9 +881,6 @@ pub const Response = struct {
     /// The body, when it is a file: opened by `sendFile`, sent and closed
     /// by `write`.
     file: ?BodyFile = null,
-    /// The body holds a file's bytes (`_bodyFromFile`): compression and
-    /// response caches treat it as the file body it stands for.
-    _file_bytes: bool = false,
     /// Set by an engine that can finish this response with no task waiting
     /// for it (HTTP/2 and HTTP/3 requests that run on the reader): see
     /// `detach`.
@@ -1212,16 +1209,6 @@ pub const Response = struct {
         self.file = null;
     }
 
-    /// Internal (the static file cache): makes `bytes`, a file's contents,
-    /// the body in place of the file `sendFile` opened, if any. It stays a
-    /// file body to the rest of the server: never compressed on the fly
-    /// (`compress`), never kept by `ResponseCache`.
-    pub fn _bodyFromFile(self: *Response, bytes: []const u8) void {
-        self.closeFile();
-        self.body = bytes;
-        self._file_bytes = true;
-    }
-
     /// Sets header `name` to `value`, replacing an earlier value under
     /// the same name (case-insensitive). Neither is copied: use literals
     /// or the arena. Fails once the headers have gone out, on a name or
@@ -1370,7 +1357,6 @@ pub const Response = struct {
         self.clearBody(writer_open);
         self.body = "";
         self.closeFile();
-        self._file_bytes = false;
         // Everything that described the old body has to go with it.
         // `content_type` is the usual way to set one, but a handler can
         // write any of these directly, and then a stale Content-Length
@@ -1965,7 +1951,7 @@ pub const Response = struct {
     /// nothing fails after a response has started claiming a coding.
     fn negotiateCompression(self: *Response) Compression {
         if (!(build_options.use_zlib or build_options.use_zstd or build_options.use_brotli) or !self.compress) return .off;
-        if (self.file != null or self._file_bytes) return .off;
+        if (self.file != null) return .off;
         // A tunnel (RFC 8441), not a representation.
         if (self._request) |r| if (r.protocol != null) return .off;
         const not_modified = self.status == .not_modified;

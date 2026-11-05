@@ -272,9 +272,6 @@ pub const ResponseCache = struct {
     /// Keeps what the route answered `req` with, when it may be kept.
     fn keep(self: *ResponseCache, local: *Local, req: *const Request, res: *Response, before: usize, stamp: store.Stamp) !void {
         if (!kept(res.status) or res.trailers != null) return;
-        // A static file's bytes from the static file cache: kept, they
-        // would outlive a change to the file.
-        if (res._file_bytes) return;
         const body_len = res.memoryBodyLen() orelse return;
         if (res.headers.get("Set-Cookie") != null) return;
         const ttl = lifetime(res.headers.get("Cache-Control"), self.options.ttl) orelse return;

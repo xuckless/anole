@@ -35,9 +35,6 @@ pub const Config = struct {
     limits: Limits = .{},
     /// The WebSocket admission gate (docs/server.md, "Overload").
     admission: Admission = .{},
-    /// The static file cache (docs/routing.md, "Static files"): bytes 0
-    /// turns it off.
-    static_cache: http.StaticCacheOptions = .{},
     /// Trust in proxies in front: `trusted_hops` of them for the client's
     /// address from `X-Forwarded-For` (PROXY protocol is per listener),
     /// and whether `X-Forwarded-Proto` / `X-Forwarded-Host` count.
@@ -791,8 +788,6 @@ pub const Config = struct {
         cache_control: ?[]const u8 = null,
         hide_dotfiles: bool = true,
         resolve_beneath: bool = true,
-        /// Kept in the static file cache (`static_cache`).
-        cache: bool = true,
     };
     pub const WebSocket = struct {
         /// The consumer's route id for this endpoint's events.

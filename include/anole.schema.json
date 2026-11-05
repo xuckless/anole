@@ -31,9 +31,6 @@
     "admission": {
       "$ref": "#/$defs/Admission"
     },
-    "static_cache": {
-      "$ref": "#/$defs/StaticCache"
-    },
     "proxy": {
       "$ref": "#/$defs/Proxy"
     },
@@ -1493,25 +1490,6 @@
         }
       }
     },
-    "StaticCache": {
-      "type": "object",
-      "additionalProperties": false,
-      "description": "The static file cache (docs/routing.md, \"Static files\"): files of static routes up to max_file kept in memory, up to bytes process-wide, served while a stat per request shows them unchanged. Linux only for now.",
-      "properties": {
-        "bytes": {
-          "type": "integer",
-          "minimum": 0,
-          "default": 8388608,
-          "description": "What the cache may hold: contents plus each entry's path and header. Fills stop once it is used up. 0 turns the cache off."
-        },
-        "max_file": {
-          "type": "integer",
-          "minimum": 0,
-          "default": 65536,
-          "description": "Files larger than this go out from the file, never cached."
-        }
-      }
-    },
     "Admission": {
       "type": "object",
       "additionalProperties": false,
@@ -2653,11 +2631,6 @@
           "type": "boolean",
           "default": true,
           "description": "Answer a path that resolves outside dir (through a symlink) with a 404; symlinks that stay inside are served. Use relative links: where the OS confines the open (Linux 5.6+, macOS 26+) an absolute link is refused even when it points inside dir. false follows symlinks wherever they lead."
-        },
-        "cache": {
-          "type": "boolean",
-          "default": true,
-          "description": "Keep small files of dir in the static file cache (static_cache; Linux only for now). false serves every request from the file."
         }
       },
       "required": [

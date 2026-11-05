@@ -15,7 +15,6 @@ const build_options = @import("build_options");
 const Router = @import("router.zig").Router;
 const beneath = @import("beneath.zig");
 const Static = @import("server/static.zig").Static;
-const StaticCache = @import("server/static_cache.zig").StaticCache;
 const Action = @import("router.zig").Action;
 const RequestParser = @import("parser.zig").RequestParser;
 const RequestBodyReader = @import("parser.zig").RequestBodyReader;
@@ -1380,9 +1379,6 @@ pub fn Server(comptime Ctx: type) type {
         /// Set once `prepareStatic` has finished, so `serve` does not run it
         /// again after a caller (the App, Lambda) ran it before serving.
         static_prepared: bool = false,
-        /// The static file cache, made by `prepareStatic` when a static
-        /// directory may use it; freed by `deinit`.
-        static_cache: ?*StaticCache = null,
         _middleware_registry: std.SinglyLinkedList,
         request_buffers: RequestBuffersPool,
         /// The listeners while `run` serves them, for `reloadTls`; empty
@@ -1530,10 +1526,6 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            // Before the router, whose arena holds the directories it
-            // points at.
-            if (self.static_cache) |c| c.destroy();
-            self.static_cache = null;
             // Call deinit on all registered middlewares
             var it = self._middleware_registry.first;
             while (it) |node| {
@@ -1619,20 +1611,7 @@ pub fn Server(comptime Ctx: type) type {
         pub fn prepareStatic(self: *Self) !void {
             try self.prepareAdmission();
             try self.prepareStaticInner();
-            try self.prepareStaticCache();
             self.static_prepared = true;
-        }
-
-        /// Makes the static file cache, once: its domain is registered at
-        /// its address, and a caller may run `prepareStatic` again.
-        fn prepareStaticCache(self: *Self) !void {
-            if (self.static_cache != null) return;
-            const opts = self.config.static_cache;
-            const c = try StaticCache.create(self.allocator, self.io, self.router.statics.items, opts) orelse return;
-            self.static_cache = c;
-            const protection = self.io.swapCancelProtection(.blocked);
-            defer _ = self.io.swapCancelProtection(protection);
-            log.info("static cache: up to {Bi} process-wide, files up to {Bi}, checked by a stat per request", .{ opts.bytes, opts.max_file });
         }
 
         /// Sizes the admission rows (one per executor, once) and points
@@ -2181,8 +2160,6 @@ pub fn Server(comptime Ctx: type) type {
                     if (build_options.use_zlib or build_options.use_brotli or build_options.use_http2) block_cache.trimLocal();
                     // Objects retired with no writer after them (src/http/core/qsbr.zig).
                     if (shards) qsbr.pollAll();
-                    // Entries whose files changed or went (static_cache.zig).
-                    if (shards) if (self.static_cache) |c| try c.sweep(self.io, 256);
                 }
                 const r = row orelse continue;
                 probe.tick(now -| deadline);
