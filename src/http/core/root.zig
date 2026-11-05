@@ -163,6 +163,9 @@ pub const describeListener = @import("server.zig").describeListener;
 /// The open-file limit, and the connection cap worked out from it.
 pub const fd_limit = @import("fd_limit.zig");
 pub const StaticOptions = @import("server/static.zig").StaticOptions;
+pub const StaticCacheOptions = @import("server/static_cache.zig").Options;
+pub const StaticCache = @import("server/static_cache.zig").StaticCache;
+pub const static_cache = @import("server/static_cache.zig");
 pub const Precompressed = @import("server/static.zig").Precompressed;
 pub const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
 
@@ -218,6 +221,8 @@ comptime {
     _ = @import("request_fuzz_test.zig");
     _ = @import("beneath.zig");
     _ = @import("server/static.zig");
+    _ = @import("server/static_cache.zig");
+    _ = @import("server/static_cache_test.zig");
     _ = @import("server/static_test.zig");
     if (@import("build_options").use_http2) _ = @import("server/h2_test.zig");
     if (@import("build_options").use_brotli) _ = @import("brotli_io.zig");

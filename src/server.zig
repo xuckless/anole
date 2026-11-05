@@ -243,6 +243,12 @@ pub const Options = struct {
     /// `Retry-After`; every close readmits one. On by default; see
     /// docs/server.md, "Overload".
     admission: http.admission.Config = .{},
+    /// The static file cache: files up to `max_file` (64 KiB) of static
+    /// directories kept in memory, up to `bytes` (8 MiB) process-wide,
+    /// served while a stat per request shows them unchanged. On by default
+    /// on Linux; `bytes = 0` turns it off, `StaticOptions.cache = false`
+    /// for one directory. See docs/routing.md, "Static files".
+    static_cache: http.StaticCacheOptions = .{},
     /// Trust in proxies in front of the server.
     proxy: Proxy = .{},
     /// How requests are read.
@@ -752,6 +758,7 @@ fn coreConfig(opts: Options, mode: *const modes.Resolved) http.ServerConfig {
             opts.limits.max_connections,
         .max_websockets = opts.limits.max_websockets,
         .admission = opts.admission,
+        .static_cache = opts.static_cache,
         .errors = opts.errors,
         .error_handler = opts.error_handler,
         // A Lambda web function: Lambda names the request in this header.
@@ -934,6 +941,8 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             h3_metrics: bool = false,
             /// The admission gate's collector is on `metrics`.
             admission_metrics: bool = false,
+            /// The static file cache's collector is on `metrics`.
+            static_cache_metrics: bool = false,
             health: ?*observe.Health = null,
             /// `metrics` and `health` register their routes when serving
             /// starts, so `use` can still follow them.
@@ -3855,6 +3864,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // ---- end p3/net ----
             self.attachH3Metrics();
             self.attachAdmissionMetrics();
+            self.attachStaticCacheMetrics();
             self.startConsole();
             defer if (self.console != null) self.stopConsole(false);
             if (self.console != null) {
@@ -4116,6 +4126,21 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (self.extras.admission_metrics) return;
             registry.addCollector(.{ .context = safety.toCtx(self), .refresh = refreshAdmissionMetrics }) catch return;
             self.extras.admission_metrics = true;
+        }
+
+        /// The static file cache's series (`observe/runtime.zig`), when the
+        /// app has metrics and `prepareStatic` made a cache.
+        fn attachStaticCacheMetrics(self: *Self) void {
+            const registry = self.extras.metrics orelse return;
+            if (self.extras.static_cache_metrics or self.server.static_cache == null) return;
+            registry.addCollector(.{ .context = safety.toCtx(self), .refresh = refreshStaticCacheMetrics }) catch return;
+            self.extras.static_cache_metrics = true;
+        }
+
+        fn refreshStaticCacheMetrics(context: *anyopaque, registry: *observe.metrics.Registry) void {
+            const self = safety.fromCtx(Self, context);
+            const cache = self.server.static_cache orelse return;
+            @import("observe/runtime.zig").refreshStaticCache(registry, cache.stats());
         }
 
         fn refreshAdmissionMetrics(context: *anyopaque, registry: *observe.metrics.Registry) void {

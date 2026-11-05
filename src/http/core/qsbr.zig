@@ -104,12 +104,12 @@ pub const hard_bound_factor = 4;
 pub const Domain = struct {
     io: std.Io,
     rt: if (have_qs) ?*Runtime else void,
-    /// Leaf (L4): guards `head` and `pending`, and the counted reads off
+    /// Leaf (L4): guards `head` and `unfreed`, and the counted reads off
     /// the executors. Never held across an allocation or a free (L5).
     lock: safety.SpinLock(.leaf) = .init,
     head: ?*Retired = null,
     /// Retired and not yet freed, including a batch a `poll` is checking.
-    pending: u32 = 0,
+    unfreed: u32 = 0,
     max_retired: u32,
     /// The process-wide list `pollAll` walks (under `registry_lock`).
     next_domain: ?*Domain = null,
@@ -156,7 +156,7 @@ pub const Domain = struct {
         d.lock.lock();
         var it = d.head;
         d.head = null;
-        d.pending = 0;
+        d.unfreed = 0;
         d.lock.unlock();
         while (it) |r| {
             it = r.next;
@@ -185,9 +185,10 @@ pub const Domain = struct {
     /// store before `retire`. On an executor it takes no lock (the same
     /// executor check as `Cell.read`); elsewhere it holds the domain's spin
     /// lock (a leaf) until `end`, so keep it short: no allocation, no other
-    /// lock, and no `read`, `acquire`, `store`, `retire` or `poll` on the
-    /// same domain inside, which would take that lock again and spin on
-    /// itself forever on a thread that is not an executor.
+    /// lock, and no `read`, `acquire`, `store`, `retire`, `poll` or
+    /// `pending` on the same domain inside, which would take that lock
+    /// again and spin on itself forever on a thread that is not an
+    /// executor.
     pub fn enter(d: *Domain, io: std.Io) Section {
         safety.readSectionEntered(@returnAddress());
         if (d.onExecutor(io)) return .{ .domain = d, .locked = false };
@@ -207,30 +208,39 @@ pub const Domain = struct {
     /// `poll` (the next retire, `synchronize`, the trim loop) frees later.
     /// At `hard_bound_factor` times `max_retired` such a caller panics
     /// (U4: a writer that can't wait is retiring faster than anything
-    /// frees). Writers are rare tasks (a reload, a refill), never request
-    /// handlers.
+    /// frees). Writers on a request path check `pending()` first and skip
+    /// publishing at `max_retired / 2`; `retire` may still wait, bounded by
+    /// one scheduler pass of every executor, if writers race past the
+    /// check (deploy churn, a stuck executor).
     pub fn retire(d: *Domain, node: *Retired) void {
-        d.lock.lock();
-        const pending = d.pending;
-        d.lock.unlock();
-        if (pending >= d.max_retired) {
+        const n = d.pending();
+        if (n >= d.max_retired) {
             if (callerMayWait(d)) {
                 // C2: a writer that started retiring finishes; the wait is
                 // bounded by the slowest executor's next scheduler pass.
                 const prev = d.io.swapCancelProtection(.blocked);
                 defer _ = d.io.swapCancelProtection(prev);
                 d.synchronize(d.io) catch unreachable;
-            } else if (pending >= @as(u64, d.max_retired) * hard_bound_factor) {
-                std.debug.panic("SAFETY.md U4: a qsbr domain has {d} objects retired and not freed ({d} times max_retired), and the caller of retire can't wait for a grace period (scheduler code, a no-suspend region, or a lock or read section held); retire from a task that holds nothing", .{ pending, hard_bound_factor });
+            } else if (n >= @as(u64, d.max_retired) * hard_bound_factor) {
+                std.debug.panic("SAFETY.md U4: a qsbr domain has {d} objects retired and not freed ({d} times max_retired), and the caller of retire can't wait for a grace period (scheduler code, a no-suspend region, or a lock or read section held); retire from a task that holds nothing", .{ n, hard_bound_factor });
             }
         }
         node.target = d.snapshot();
         d.lock.lock();
         node.next = d.head;
         d.head = node;
-        d.pending += 1;
+        d.unfreed += 1;
         d.lock.unlock();
         d.poll();
+    }
+
+    /// Retired and not yet freed: a hint for writers on a request path,
+    /// which skip publishing at `max_retired / 2` so `retire` rarely waits.
+    /// Takes the domain's lock: not inside a read section (see `enter`).
+    pub fn pending(d: *Domain) u32 {
+        d.lock.lock();
+        defer d.lock.unlock();
+        return d.unfreed;
     }
 
     /// Whether `retire` may wait here for a grace period without stalling
@@ -324,7 +334,7 @@ pub const Domain = struct {
             t.next = d.head;
             d.head = keep;
         }
-        d.pending -= freed;
+        d.unfreed -= freed;
         d.lock.unlock();
 
         // L5: frees (and `destroy` hooks, such as SSL_CTX_free) outside the
@@ -659,7 +669,9 @@ test "qsbr: a retire past max_retired frees what it can first" {
         try c.store(.{ .v = i, .freed = &freed });
     }
     try std.testing.expectEqual(@as(u32, 0), freed);
+    try std.testing.expectEqual(@as(u32, 3), d.pending());
     for (held) |h| h.release();
     try c.store(.{ .v = 9, .freed = &freed });
     try std.testing.expectEqual(@as(u32, 4), freed);
+    try std.testing.expectEqual(@as(u32, 0), d.pending());
 }

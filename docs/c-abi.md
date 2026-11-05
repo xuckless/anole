@@ -590,8 +590,9 @@ here and runs on Anole's threads:
 - A route has exactly one of `handler` (a consumer's route id), `respond` (a
   fixed answer), `static` (files under a directory) or `websocket` (with
   `"accept": "consumer"`, also `handler`). A `static` route's keys are
-  `dir`, `index`, `precompressed`, `cache_control`, `hide_dotfiles` and
-  `resolve_beneath` (a symlink out of `dir` is a 404; default `true`).
+  `dir`, `index`, `precompressed`, `cache_control`, `hide_dotfiles`,
+  `resolve_beneath` (a symlink out of `dir` is a 404; default `true`) and
+  `cache` (kept in the static file cache, `static_cache`; default `true`).
   A `respond` answer's `headers` may not name `Connection` or
   `Transfer-Encoding`, which the server writes itself, and must be valid
   field names and values; the configuration is refused otherwise.
@@ -735,6 +736,7 @@ none.
 | `limits.ws_max_message` | 1048576 | `limits.ws_max_message` |
 | `limits.max_websockets` | null | `limits.max_websockets` (null: no cap; past it an upgrade gets 503 with Retry-After) |
 | `admission.enabled`, `util_enter`, `util_exit`, `sustain`, `min_shed_ms`, `lag_enter_ms`, `retry_after_s` | true, 0.85, 0.8, 3, 5000, 25, [5, 15] | `admission.*`, the WebSocket admission gate ([server.md](server.md#overload)); a refused upgrade on an `"accept": "consumer"` route never reaches the consumer |
+| `static_cache.bytes`, `max_file` | 8388608, 65536 | `static_cache.*`, the static file cache ([routing.md](routing.md#static-files)); `bytes` 0 turns it off; Linux only for now |
 | `proxy.trusted`, `trusted_hops`, `trust_forwarded_proto`, `trust_forwarded_host` | null, 0, true, false | `proxy.*` |
 | `environment`, `deployment`, `error_detail` | null, null, null | `environment`, `deployment`, `error_detail` (null: `ANOLE_ENV` else production; `ANOLE_DEPLOYMENT` else standalone; on in development) |
 | `listeners[].address`, `port`, `proxy_protocol` | null, null, null | `Listener.*` (null: the deployment's default: `127.0.0.1`, 8080 or `$PORT`, off or on under `anole_lb`) |

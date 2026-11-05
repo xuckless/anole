@@ -311,6 +311,7 @@ pub const server_options = [_]Entry{
     .{ .zig = "admission.lag_enter", .json = "admission.lag_enter_ms", .kind = .ms },
     .{ .zig = "admission.min_shed", .json = "admission.min_shed_ms", .kind = .ms },
     .{ .zig = "admission.window", .omitted = "1 s; the A/B and the metrics assume it" },
+    .{ .zig = "static_cache", .json = "static_cache", .kind = .same },
     .{ .zig = "proxy", .json = "proxy", .kind = .same_type },
     .{ .zig = "request", .json = "request", .kind = .same_type },
     .{ .zig = "response", .json = "response", .kind = .same_type, .note = "default_content_type by tag name: \"text\", \"json\"; null: none" },
@@ -357,6 +358,7 @@ pub const static_options = [_]Entry{
     .{ .zig = "hide_dotfiles", .json = "routes[].static.hide_dotfiles" },
     .{ .zig = "resolve_beneath", .json = "routes[].static.resolve_beneath" },
     .{ .zig = "cache_control", .json = "routes[].static.cache_control" },
+    .{ .zig = "cache", .json = "routes[].static.cache" },
 };
 
 // ---------------------------------------------------------------------------
