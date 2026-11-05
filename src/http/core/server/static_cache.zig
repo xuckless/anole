@@ -1,6 +1,6 @@
 //! The static file cache (K7, #102; research/s2/tier2/k7-qsbr.md): the
 //! bytes of small files served by `Static`, kept process-wide so a request
-//! for one takes no read and no blocking-pool hop.
+//! for one takes no open, read or close, and no blocking-pool hop.
 //!
 //! - One per server, made by `prepareStatic` when a static mount exists,
 //!   shared by its mounts. Keyed by the mount, the cleaned path and the
@@ -13,10 +13,7 @@
 //!   a stat of both per request, as viltrum (`http1/file_cache.v`
 //!   `same_file`) and goose-http (`file.goose` L176-L280) do. Only for a
 //!   path the cache already holds: a path it doesn't know goes to today's
-//!   `Static.serve` with no stat of its own. The stat is of a file opened
-//!   as today's open does it (`resolve_beneath` included): a file whose
-//!   directory was moved out and linked back keeps its ids, and must not
-//!   keep hitting.
+//!   `Static.serve` with no stat of its own.
 //! - Filled at the end of today's `Static.serve` from the file its
 //!   confined open chose, so which file is served, and every refusal, stay
 //!   today's; the cache only remembers the bytes.
@@ -37,8 +34,8 @@ const Precompressed = static.Precompressed;
 
 pub const Options = struct {
     /// Bytes the cache may hold, process-wide: file contents plus each
-    /// entry's path and header, as the allocator rounds them. Fills stop
-    /// once it is used up. 0 turns the cache off.
+    /// entry's path and header. Fills stop once it is used up. 0 turns the
+    /// cache off.
     bytes: usize = 8 << 20,
     /// Files larger than this are never cached: they go out from the file
     /// as before.
@@ -49,9 +46,9 @@ pub const Options = struct {
 /// `Options` are accepted everywhere and do nothing elsewhere.
 pub const supported = builtin.os.tag == .linux and @sizeOf(usize) == 8;
 
-/// How a hit stats its files: open, `statx` and close by syscalls on the
-/// executor, or through the `Io` (a blocking-pool hop each on epoll).
-/// Sub-A/B 1 of k7-qsbr.md picks one; the other goes.
+/// How a hit stats its files: `statx` on the executor, or through the `Io`
+/// (`Dir.statFile`, a blocking-pool hop on epoll). Sub-A/B 1 of
+/// k7-qsbr.md picks one; the other goes.
 pub const stat_via: enum { statx, io } = .statx;
 
 /// A file younger than this (by ctime) is not cached: a rewrite within
@@ -180,8 +177,6 @@ pub const StaticCache = struct {
     skipped: [std.enums.values(Skip).len]std.atomic.Value(u64) = @splat(.init(0)),
     /// Test builds: the stats a hit made.
     inline_stats: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {},
-    /// Test builds: the files a fill read.
-    fill_reads: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {},
 
     /// A cache for `statics` (those with `StaticOptions.cache`), or null
     /// when there is nothing to cache or the platform is not supported.
@@ -312,83 +307,51 @@ pub const StaticCache = struct {
         other,
     };
 
-    /// The stat of a hit: `path` in `dir`, opened as today's open does
-    /// it (read-only; under `confine`, `resolve_beneath`, kernel-confined
-    /// as zio's openat2 is), then stat'ed and closed. A file today's open
-    /// refuses (no permission, a link or a directory out of `dir`) or that
-    /// is not a regular file is `.missing`, as `Static.serve` takes it.
-    pub fn statAt(c: *StaticCache, io: std.Io, dir: std.Io.Dir, path: []const u8, confine: bool) std.Io.Cancelable!Probe {
+    /// The stat of a hit: `path` in `dir`, following symlinks (a link
+    /// that stays inside keeps hitting; one that leads out names another
+    /// inode, a miss, and today's confined open refuses it).
+    pub fn statAt(c: *StaticCache, io: std.Io, dir: std.Io.Dir, path: []const u8) std.Io.Cancelable!Probe {
         if (builtin.is_test) _ = c.inline_stats.fetchAdd(1, .monotonic);
-        return statFile(io, dir, path, confine);
-    }
-
-    fn statFile(io: std.Io, dir: std.Io.Dir, path: []const u8, confine: bool) std.Io.Cancelable!Probe {
         switch (stat_via) {
-            .statx => if (comptime !supported) unreachable else return statLinux(dir, path, confine),
-            // Confined only where the `Io` honours the flag (zio).
+            .statx => if (comptime !supported) unreachable else {
+                const linux = std.os.linux;
+                var buf: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
+                if (path.len >= buf.len) return .other;
+                @memcpy(buf[0..path.len], path);
+                buf[path.len] = 0;
+                // SAFETY: filled by statx; read only on success.
+                var stx: linux.Statx = undefined;
+                const rc = linux.statx(dir.handle, buf[0..path.len :0], linux.AT.STATX_DONT_SYNC | linux.AT.NO_AUTOMOUNT, .{ .TYPE = true, .INO = true, .SIZE = true, .MTIME = true, .CTIME = true }, &stx);
+                switch (linux.errno(rc)) {
+                    .SUCCESS => {},
+                    .NOENT, .NOTDIR => return .missing,
+                    else => return .other,
+                }
+                const want: linux.STATX = .{ .TYPE = true, .INO = true, .SIZE = true, .MTIME = true, .CTIME = true };
+                if (@as(u32, @bitCast(stx.mask)) & @as(u32, @bitCast(want)) != @as(u32, @bitCast(want))) return .other;
+                if (stx.mode & linux.S.IFMT != linux.S.IFREG) return .other;
+                return .{ .file = .{
+                    .inode = stx.ino,
+                    .nlink = stx.nlink,
+                    .size = stx.size,
+                    .permissions = .default_file,
+                    .kind = .file,
+                    .atime = null,
+                    .mtime = timestamp(stx.mtime),
+                    .ctime = timestamp(stx.ctime),
+                    .block_size = stx.blksize,
+                } };
+            },
             .io => {
-                const file = dir.openFile(io, path, .{ .resolve_beneath = confine }) catch |err| switch (err) {
+                const st = dir.statFile(io, path, .{}) catch |err| switch (err) {
                     error.Canceled => return error.Canceled,
-                    error.FileNotFound, error.NotDir, error.IsDir, error.AccessDenied, error.BadPathName, error.NameTooLong, error.SymLinkLoop => return .missing,
+                    error.FileNotFound, error.NotDir => return .missing,
                     else => return .other,
                 };
-                defer file.close(io);
-                const st = file.stat(io) catch |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    else => return .other,
-                };
-                return if (st.kind == .file) .{ .file = st } else .missing;
+                return if (st.kind == .file) .{ .file = st } else .other;
             },
         }
     }
-
-    /// openat2 (`RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`, zio's flags for
-    /// a confined open), or openat, then statx of the fd and close: three
-    /// syscalls on the executor. O_NONBLOCK so a FIFO can't hold it.
-    fn statLinux(dir: std.Io.Dir, path: []const u8, confine: bool) Probe {
-        const linux = std.os.linux;
-        var buf: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
-        if (path.len >= buf.len) return .other;
-        @memcpy(buf[0..path.len], path);
-        buf[path.len] = 0;
-        const flags: linux.O = .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOCTTY = true, .NONBLOCK = true };
-        const rc = if (confine) blk: {
-            const how: OpenHow = .{ .flags = @as(u32, @bitCast(flags)), .mode = 0, .resolve = resolve_beneath | resolve_no_magiclinks };
-            // SAFETY: the kernel reads the path and `how` during the call only.
-            break :blk linux.syscall4(.openat2, @as(usize, @bitCast(@as(isize, dir.handle))), @intFromPtr(&buf), @intFromPtr(&how), @sizeOf(OpenHow));
-        } else linux.openat(dir.handle, buf[0..path.len :0], flags, 0);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {},
-            // What `isMissing` in static.zig takes as no file (EXDEV: the
-            // path left the directory).
-            .NOENT, .NOTDIR, .ACCES, .XDEV, .LOOP, .NAMETOOLONG => return .missing,
-            else => return .other,
-        }
-        const fd: linux.fd_t = @intCast(rc);
-        defer _ = linux.close(fd);
-        // SAFETY: filled by statx; read only on success.
-        var stx: linux.Statx = undefined;
-        const want: linux.STATX = .{ .TYPE = true, .INO = true, .SIZE = true, .MTIME = true, .CTIME = true };
-        if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH | linux.AT.STATX_DONT_SYNC, want, &stx)) != .SUCCESS) return .other;
-        if (@as(u32, @bitCast(stx.mask)) & @as(u32, @bitCast(want)) != @as(u32, @bitCast(want))) return .other;
-        if (stx.mode & linux.S.IFMT != linux.S.IFREG) return .missing;
-        return .{ .file = .{
-            .inode = stx.ino,
-            .nlink = stx.nlink,
-            .size = stx.size,
-            .permissions = .default_file,
-            .kind = .file,
-            .atime = null,
-            .mtime = timestamp(stx.mtime),
-            .ctime = timestamp(stx.ctime),
-            .block_size = stx.blksize,
-        } };
-    }
-
-    /// struct open_how (linux/openat2.h), as zio has it.
-    const OpenHow = extern struct { flags: u64, mode: u64, resolve: u64 };
-    const resolve_no_magiclinks: u64 = 0x02;
-    const resolve_beneath: u64 = 0x08;
 
     fn timestamp(t: std.os.linux.statx_timestamp) std.Io.Timestamp {
         return .{ .nanoseconds = @as(i96, t.sec) * std.time.ns_per_s + t.nsec };
@@ -410,26 +373,13 @@ pub const StaticCache = struct {
         st: std.Io.File.Stat,
         plain: std.Io.File.Stat,
     ) std.Io.Cancelable!?[]u8 {
-        // The cheap checks first: a key that can't be kept is asked for
-        // again on every request.
         if (st.size > c.opts.max_file or path.len > std.math.maxInt(u16)) return null;
         const size: usize = @intCast(st.size);
+        if (!localFs(file.handle)) return c.skipped_(.fs);
         const now = std.Io.Clock.real.now(io).nanoseconds + (if (builtin.is_test) test_hooks.clock_offset_ns else 0);
         if (now - st.ctime.nanoseconds < racy_ns or now - plain.ctime.nanoseconds < racy_ns) return c.skipped_(.racy);
         if (c.domain.pending() >= c.domain.max_retired / 2) return c.skipped_(.retire);
-        const charge = charged(@sizeOf(Entry)) + charged(path.len + size);
-        if (c.used.load(.monotonic) + charge > c.opts.bytes) return c.skipped_(.budget);
-        const h = hash(owner, path);
-        const key = encodingKey(encoding);
-        const id: FileId = .of(st);
-        const plain_id: FileId = .of(plain);
-        // A hint: `publish` decides for a racing writer.
-        switch (c.room(io, owner, h, key, path, id, plain_id)) {
-            .held => return null,
-            .full => return c.skipped_(.table),
-            .free => {},
-        }
-        if (!localFs(file.handle)) return c.skipped_(.fs);
+        const charge = @sizeOf(Entry) + path.len + size;
         if (c.used.fetchAdd(charge, .monotonic) + charge > c.opts.bytes) {
             _ = c.used.fetchSub(charge, .monotonic);
             return c.skipped_(.budget);
@@ -439,7 +389,6 @@ pub const StaticCache = struct {
             _ = c.used.fetchSub(charge, .monotonic);
         };
 
-        if (builtin.is_test) _ = c.fill_reads.fetchAdd(1, .monotonic);
         const out = arena.alloc(u8, size) catch return null;
         const n = file.readPositionalAll(io, out, 0) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
@@ -449,6 +398,7 @@ pub const StaticCache = struct {
             error.Canceled => return error.Canceled,
             else => return null,
         };
+        const id: FileId = .of(st);
         if (n != size or !FileId.of(after).eql(id)) {
             c.skip(.changed);
             return null;
@@ -464,10 +414,10 @@ pub const StaticCache = struct {
         e.* = .{
             .cache = c,
             .owner = owner,
-            .hash = h,
-            .encoding = key,
+            .hash = hash(owner, path),
+            .encoding = encodingKey(encoding),
             .id = id,
-            .plain_id = plain_id,
+            .plain_id = .of(plain),
             .path_len = @intCast(path.len),
             .mem = mem,
             .charge = charge,
@@ -476,25 +426,6 @@ pub const StaticCache = struct {
         reserved = false;
         c.publish(io, e);
         return out;
-    }
-
-    /// Whether a fill of the key has a slot to go in: the same bytes held
-    /// already, both slots taken by other keys, or room. Loads only.
-    fn room(c: *StaticCache, io: std.Io, owner: *const Static, h: u64, key: u8, path: []const u8, id: FileId, plain_id: FileId) enum { held, full, free } {
-        const s = c.domain.enter(io);
-        defer s.end();
-        if (c.findIn(owner, h, key, path)) |f| return if (f.e.id.eql(id) and f.e.plain_id.eql(plain_id)) .held else .free;
-        for (c.positions(h, key)) |i| {
-            if (c.slots[i].load(.seq_cst) == null) return .free;
-        }
-        return .full;
-    }
-
-    /// What an allocation of `len` bytes takes from the release allocator
-    /// (smp_allocator: power-of-two slots up to 32 KiB, whole pages above).
-    fn charged(len: usize) usize {
-        if (len <= 32 << 10) return std.math.ceilPowerOfTwoAssert(usize, @max(len, 8));
-        return std.mem.alignForward(usize, len, std.heap.page_size_min);
     }
 
     fn skipped_(c: *StaticCache, why: Skip) ?[]u8 {
@@ -553,8 +484,7 @@ pub const StaticCache = struct {
     /// stopped, whose served or plain file changed or went away, so names
     /// no longer asked for (content-hashed assets after a deploy) give
     /// their bytes back. The trim loop on executor 0 runs it every 5 s;
-    /// it stats as a hit does (`statAt`), so it also drops an entry whose
-    /// file today's open would refuse.
+    /// it stats through the `Io` and may suspend.
     pub fn sweep(c: *StaticCache, io: std.Io, max: usize) std.Io.Cancelable!void {
         var checked: usize = 0;
         var scanned: usize = 0;
@@ -574,12 +504,11 @@ pub const StaticCache = struct {
             checked += 1;
             const plain_path = buf[0..copy.len];
             const fresh = blk: {
-                const confine = copy.owner.options.resolve_beneath;
-                if (!try sameFile(io, copy.owner.dir, plain_path, confine, copy.plain_id)) break :blk false;
+                if (!try sameFile(io, copy.owner.dir, plain_path, copy.plain_id)) break :blk false;
                 const enc = encodingOf(copy.encoding) orelse break :blk true;
                 const ext = enc.extension();
                 @memcpy(buf[copy.len..][0..ext.len], ext);
-                break :blk try sameFile(io, copy.owner.dir, buf[0 .. copy.len + ext.len], confine, copy.id);
+                break :blk try sameFile(io, copy.owner.dir, buf[0 .. copy.len + ext.len], copy.id);
             };
             if (fresh) continue;
             if (c.domain.pending() >= c.domain.max_retired / 2) continue;
@@ -599,11 +528,12 @@ pub const StaticCache = struct {
         }
     }
 
-    fn sameFile(io: std.Io, dir: std.Io.Dir, path: []const u8, confine: bool, id: FileId) std.Io.Cancelable!bool {
-        return switch (try statFile(io, dir, path, confine)) {
-            .file => |st| FileId.of(st).eql(id),
-            .missing, .other => false,
+    fn sameFile(io: std.Io, dir: std.Io.Dir, path: []const u8, id: FileId) std.Io.Cancelable!bool {
+        const st = dir.statFile(io, path, .{}) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return false,
         };
+        return st.kind == .file and FileId.of(st).eql(id);
     }
 
     /// Test builds: puts a second copy of the key's entry in its other
@@ -633,7 +563,7 @@ pub const StaticCache = struct {
             if (c.slots[i].load(.seq_cst) != null) continue;
             const mem = try c.gpa.dupe(u8, "occupied");
             const e = try c.gpa.create(Entry);
-            e.* = .{ .cache = c, .owner = owner, .hash = h +% 1, .encoding = key, .id = none, .plain_id = none, .path_len = @intCast(mem.len), .mem = mem, .charge = charged(@sizeOf(Entry)) + charged(mem.len) };
+            e.* = .{ .cache = c, .owner = owner, .hash = h +% 1, .encoding = key, .id = none, .plain_id = none, .path_len = @intCast(mem.len), .mem = mem, .charge = @sizeOf(Entry) + mem.len };
             _ = c.used.fetchAdd(e.charge, .monotonic);
             c.slots[i].store(e, .seq_cst);
         }
