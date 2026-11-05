@@ -47,6 +47,10 @@ pub const WebSocket = struct {
     max_message_size: usize = default_max_message_size,
     closed: bool = false,
     auto_responded: bool = false,
+    /// `msg_arena` gave out memory since its last reset: a receive that
+    /// allocated nothing (a borrowed payload) leaves the reset for the next
+    /// one that did (`resetMessages`).
+    msg_arena_used: bool = false,
     fragmented_type: ?MessageType = null,
     /// The message in pieces had RSV1 on its first frame.
     fragmented_compressed: bool = false,
@@ -194,7 +198,7 @@ pub const WebSocket = struct {
     /// answers to them are a batch (`Batch`) until the next call.
     pub fn receiveMany(self: *WebSocket) ![]const Message {
         self.resetMessages();
-        const arena = self.msg_arena.allocator();
+        const arena = self.messageAllocator();
         var msgs: std.ArrayListUnmanaged(Message) = .empty;
         try msgs.append(arena, try self.nextMessage());
         while (msgs.getLast().type != .close) {
@@ -341,9 +345,21 @@ pub const WebSocket = struct {
     /// received a keyframe does not hold it for good.
     const retained_message_max = 64 * 1024;
 
+    /// The message arena's allocator, marking it for the next reset.
+    fn messageAllocator(self: *WebSocket) std.mem.Allocator {
+        self.msg_arena_used = true;
+        return self.msg_arena.allocator();
+    }
+
+    /// std's reset walks the arena's nodes even when nothing was allocated
+    /// (lib/std/heap/ArenaAllocator.zig `reset`): after a borrowed message
+    /// that would touch a retained node's cold header for nothing.
     fn resetMessages(self: *WebSocket) void {
         self.poisonLent();
-        _ = self.msg_arena.reset(.{ .retain_with_limit = retained_message_max });
+        if (self.msg_arena_used) {
+            _ = self.msg_arena.reset(.{ .retain_with_limit = retained_message_max });
+            self.msg_arena_used = false;
+        }
         self.auto_responded = false;
     }
 
@@ -495,10 +511,10 @@ pub const WebSocket = struct {
                     if (self.fragmented_data.items.len + frame.payload.len > self.max_message_size) {
                         return Error.MessageTooLarge;
                     }
-                    try self.fragmented_data.appendSlice(self.msg_arena.allocator(), frame.payload);
+                    try self.fragmented_data.appendSlice(self.messageAllocator(), frame.payload);
                     if (frame.fin) {
                         const msg_type = self.fragmented_type.?;
-                        const data = try self.fragmented_data.toOwnedSlice(self.msg_arena.allocator());
+                        const data = try self.fragmented_data.toOwnedSlice(self.messageAllocator());
                         self.fragmented_type = null;
                         const compressed = self.fragmented_compressed;
                         if (!compressed and msg_type == .text and !std.unicode.utf8ValidateSlice(data)) {
@@ -527,7 +543,7 @@ pub const WebSocket = struct {
                         self.fragmented_type = frame.opcode;
                         self.fragmented_compressed = frame.rsv1;
                         self.fragmented_data.clearRetainingCapacity();
-                        try self.fragmented_data.appendSlice(self.msg_arena.allocator(), frame.payload);
+                        try self.fragmented_data.appendSlice(self.messageAllocator(), frame.payload);
                     }
                 },
                 _ => return Error.InvalidOpcode,
@@ -710,6 +726,7 @@ pub const WebSocket = struct {
         self.fragmented_data = .empty;
         self.fragmented_type = null;
         _ = self.msg_arena.reset(.free_all);
+        self.msg_arena_used = false;
     }
 
     /// The reader takes `read` as its buffer: a task reads the socket again
@@ -823,7 +840,7 @@ pub const WebSocket = struct {
             if (safety.enabled) self.lend(p);
             break :blk p;
         } else blk: {
-            const p = try safety.allocUninit(self.msg_arena.allocator(), n);
+            const p = try safety.allocUninit(self.messageAllocator(), n);
             try r.readSliceAll(p);
             break :blk p;
         };
@@ -2582,6 +2599,87 @@ test "WebSocket: a frame bigger than the read buffer is read into the message ar
     try std.testing.expect(ws.msg_arena.queryCapacity() >= payload.len);
 }
 
+test "WebSocket: messages handed over in place never reset the message arena" {
+    var frames = maskedFrame(0x1, "one") ++ maskedFrame(0x2, "two!") ++ maskedFrame(0x1, "three");
+    var reader: std.Io.Reader = .fixed(&frames);
+    var out_buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var counter: CallCounter = .{ .inner = std.testing.allocator };
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &out, .reader = &reader }, counter.allocator(), 0);
+    defer ws.deinit();
+
+    for ([_][]const u8{ "one", "two!", "three" }) |want| {
+        try std.testing.expectEqualStrings(want, (try ws.receive()).data);
+        try std.testing.expect(!ws.msg_arena_used);
+        try std.testing.expectEqual(0, counter.calls());
+        try std.testing.expectEqual(0, ws.msg_arena.queryCapacity());
+    }
+}
+
+test "WebSocket: a message read into the arena is reset once by the next receive, and borrowed ones after it leave the arena alone" {
+    const gpa = std.testing.allocator;
+    // Bigger than the window, and bigger than what is kept between messages.
+    for ([_]usize{ 300, WebSocket.retained_message_max + 5000 }) |size| {
+        const payload = try gpa.alloc(u8, size);
+        defer gpa.free(payload);
+        for (payload, 0..) |*b, i| b.* = @truncate(i *% 7 +% 3);
+        const buf = try gpa.alloc(u8, size + 16);
+        defer gpa.free(buf);
+        const big = try clientFrame(buf, .binary, payload, 10);
+        const small = maskedFrame(0x1, "small") ++ maskedFrame(0x1, "again") ++ maskedFrame(0x1, "and again");
+        const input = try gpa.alloc(u8, big.len + small.len);
+        defer gpa.free(input);
+        @memcpy(input[0..big.len], big);
+        @memcpy(input[big.len..], &small);
+
+        var window: [256]u8 = undefined;
+        var trickle: Trickle = .init(input, &window, 64);
+        var out_buf: [16]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&out_buf);
+        var counter: CallCounter = .{ .inner = gpa };
+        var ws = WebSocket.init(std.testing.io, .{ .writer = &out, .reader = &trickle.interface }, counter.allocator(), 0);
+        defer ws.deinit();
+
+        try std.testing.expectEqualSlices(u8, payload, (try ws.receive()).data);
+        try std.testing.expect(ws.msg_arena_used);
+        try std.testing.expect(ws.msg_arena.queryCapacity() >= size);
+
+        // The one reset: trimmed to what is kept between messages.
+        try std.testing.expectEqualStrings("small", (try ws.receive()).data);
+        try std.testing.expect(!ws.msg_arena_used);
+        const capacity = ws.msg_arena.queryCapacity();
+        try std.testing.expect(capacity <= WebSocket.retained_message_max);
+        const calls = counter.calls();
+
+        // No more: the arena and its allocator are not touched.
+        for ([_][]const u8{ "again", "and again" }) |want| {
+            try std.testing.expectEqualStrings(want, (try ws.receive()).data);
+            try std.testing.expect(!ws.msg_arena_used);
+            try std.testing.expectEqual(capacity, ws.msg_arena.queryCapacity());
+            try std.testing.expectEqual(calls, counter.calls());
+        }
+    }
+}
+
+test "WebSocket: a message in pieces marks the message arena, and the next receive resets it" {
+    // Binary in two pieces, then a whole text message (zero mask keys).
+    var frames = [_]u8{ 0x02, 0x83, 0, 0, 0, 0, 'a', 'b', 'c', 0x80, 0x83, 0, 0, 0, 0, 'd', 'e', 'f' } ++ maskedFrame(0x1, "next");
+    var reader: std.Io.Reader = .fixed(&frames);
+    var out_buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var counter: CallCounter = .{ .inner = std.testing.allocator };
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &out, .reader = &reader }, counter.allocator(), 0);
+    defer ws.deinit();
+
+    try std.testing.expectEqualStrings("abcdef", (try ws.receive()).data);
+    try std.testing.expect(ws.msg_arena_used);
+    try std.testing.expect(counter.allocs > 0);
+
+    try std.testing.expectEqualStrings("next", (try ws.receive()).data);
+    try std.testing.expect(!ws.msg_arena_used);
+    try std.testing.expect(ws.msg_arena.queryCapacity() <= WebSocket.retained_message_max);
+}
+
 test "WebSocket: receiveMany's messages are all in the read buffer and intact at the end, and a partial one stays unread" {
     var frames = maskedFrame(0x1, "one") ++ maskedFrame(0x2, "two!") ++ maskedFrame(0x1, "three") ++ [_]u8{ 0x81, 0x85, 0, 0, 0, 0, 'f' };
     var reader: std.Io.Reader = undefined;
@@ -2705,6 +2803,8 @@ test "WebSocket: a message handed over in place reads 0xDD after the next receiv
     const b = try ws.receive();
     try std.testing.expectEqualStrings("second", b.data);
     for (a.data) |c| try std.testing.expectEqual(safety.poison_byte, c);
+    // Poisoned, though the arena was not reset (it held nothing).
+    try std.testing.expect(!ws.msg_arena_used);
 
     // The unread frame moved to the front (as a window's rewind does), over
     // where "second" lies: those bytes are to be read, not poisoned.
