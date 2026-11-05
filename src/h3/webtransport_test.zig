@@ -1113,8 +1113,10 @@ fn creditUnlinked(session: *wt.Session) bool {
     return !wt.Session.Driver.testCreditLinked(session, .bidi);
 }
 
-/// Opens a stream, waiting for credit; notes how it ended.
-fn openWaiting(session: *wt.Session, result: *std.atomic.Value(u32)) std.Io.Cancelable!void {
+/// Opens a stream, waiting for credit; notes that it started, and how it
+/// ended.
+fn openWaiting(session: *wt.Session, started: *std.atomic.Value(u32), result: *std.atomic.Value(u32)) std.Io.Cancelable!void {
+    started.store(1, .release);
     const s = session.openStream() catch |err| {
         result.store(if (err == error.SessionClosed) 2 else 3, .release);
         if (err == error.Canceled) return error.Canceled;
@@ -1142,10 +1144,16 @@ test "WebTransport: a session freed while it waits for stream credit is not woke
         var held: [16]*wt.Stream = undefined;
         _ = try holdBidiCredit(session, &held);
         try std.testing.expect(creditLinked(session));
+        // The node is the session's, linked by the last `tryOpen` above;
+        // the opener waits on it and is cancelled there (`tryOpen` has no
+        // cancellation point, so the cancel lands in its wait).
+        var started: std.atomic.Value(u32) = .init(0);
         var result: std.atomic.Value(u32) = .init(0);
         var group: std.Io.Group = .init;
-        try group.concurrent(io, openWaiting, .{ session, &result });
+        try group.concurrent(io, openWaiting, .{ session, &started, &result });
+        _ = try wait.waitNonZero(io, "the opener started", &started);
         group.cancel(io);
+        try std.testing.expectEqual(@as(u32, 3), result.load(.acquire));
         try std.testing.expect(creditLinked(session));
         // `deinit` resets the held streams and frees the session (a
         // `ClientSession`) with its node still linked, unless `detach`
@@ -1178,10 +1186,11 @@ test "WebTransport: a session closed while it waits for stream credit fails the 
 
     var held: [16]*wt.Stream = undefined;
     const n = try holdBidiCredit(session, &held);
+    var started: std.atomic.Value(u32) = .init(0);
     var result: std.atomic.Value(u32) = .init(0);
     var group: std.Io.Group = .init;
     defer group.cancel(io);
-    try group.concurrent(io, openWaiting, .{ session, &result });
+    try group.concurrent(io, openWaiting, .{ session, &started, &result });
     try std.testing.expect(creditLinked(session));
     try session.close(0, "");
     _ = try wait.waitNonZero(io, "the opener returned", &result);
@@ -1191,7 +1200,7 @@ test "WebTransport: a session closed while it waits for stream credit fails the 
     try wait.waitUntil(io, "the credit unlinked the closed session", session, creditUnlinked);
 }
 
-test "WebTransport: a datagram burst under the queue's limit wakes nobody; past it every refused sender is woken" {
+test "WebTransport: a datagram burst under the queue's limit wakes nobody; a sender refused while it is full is woken" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
     defer rt.deinit();
@@ -1210,27 +1219,45 @@ test "WebTransport: a datagram burst under the queue's limit wakes nobody; past 
     try std.testing.expectEqual(@as(u32, 0), w.full);
     try std.testing.expectEqual(@as(u32, 0), w.walks);
 
-    // 1000 from one task: it completes (no wake lost), and a sender that
-    // was refused and then got room was woken by a walk.
-    var sent: std.atomic.Value(usize) = .init(0);
+    // Held, so the queue fills whatever the writer's pace: the senders
+    // fill it until one is refused, then one more waits. Let go, the next
+    // datagram that goes wakes it.
+    wt.Session.Driver.testHoldDatagrams(session, true);
+    var queued: usize = 0;
+    while (true) {
+        const d = try session.allocator().dupe(u8, "past the limit");
+        if (!try session.trySendDatagramOwned(d)) {
+            session.freeDatagram(d);
+            break;
+        }
+        queued += 1;
+    }
+    try std.testing.expect(queued <= 256);
+    var sent: std.atomic.Value(u32) = .init(0);
     var group: std.Io.Group = .init;
     defer group.cancel(io);
     try group.concurrent(io, struct {
-        fn burst(sess: *wt.Session, count: *std.atomic.Value(usize)) std.Io.Cancelable!void {
-            for (0..1000) |_| {
-                sess.sendDatagram("past the limit") catch |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    else => return,
-                };
-                _ = count.fetchAdd(1, .monotonic);
-            }
+        fn one(sess: *wt.Session, done: *std.atomic.Value(u32)) std.Io.Cancelable!void {
+            sess.sendDatagram("refused, then woken") catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return,
+            };
+            done.store(1, .release);
         }
-    }.burst, .{ session, &sent });
-    try wait.waitAtLeast(io, "1000 datagrams queued", &sent, 1000);
+    }.one, .{ session, &sent });
+    try wait.waitUntil(io, "the sender was refused", session, refusedTwice);
+    w = wt.Session.Driver.testDatagramWaits(session);
+    try std.testing.expectEqual(@as(u32, 0), w.walks);
+    try std.testing.expectEqual(@as(u32, 0), sent.load(.acquire));
+    wt.Session.Driver.testHoldDatagrams(session, false);
+    _ = try wait.waitNonZero(io, "the refused sender was woken", &sent);
     try group.await(io);
     w = wt.Session.Driver.testDatagramWaits(session);
-    try std.testing.expect(w.walks <= w.full);
-    if (w.full > 0) try std.testing.expect(w.walks >= 1);
+    try std.testing.expect(w.walks >= 1);
+}
+
+fn refusedTwice(session: *wt.Session) bool {
+    return wt.Session.Driver.testDatagramWaits(session).full >= 2;
 }
 
 test "WebTransport: 130 one-way streams in a row get credit back as they close" {

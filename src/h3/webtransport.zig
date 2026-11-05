@@ -206,6 +206,8 @@ pub const Wrote = union(enum) {
 /// A counter kept in test builds only.
 const TestCount = if (@import("builtin").is_test) u32 else void;
 const test_count_zero: TestCount = if (@import("builtin").is_test) 0 else {};
+const TestFlag = if (@import("builtin").is_test) bool else void;
+const test_flag_off: TestFlag = if (@import("builtin").is_test) false else {};
 
 /// A datagram to send: a buffer the queue owns (from `Core.gpa`), and its
 /// session's quarter stream ID, written in front of it when it goes out.
@@ -247,6 +249,8 @@ pub const Core = struct {
     /// often a datagram that went woke the sessions for it.
     test_dgram_full: TestCount = test_count_zero,
     test_dgram_walks: TestCount = test_count_zero,
+    /// Test builds: no datagram goes while set (`Driver.testHoldDatagrams`).
+    test_dgram_hold: TestFlag = test_flag_off,
     /// Which of WebTransport's streams and nghttp3's leads the next packet
     /// (when no WebTransport stream is more urgent than nghttp3's default).
     turn: bool = false,
@@ -603,6 +607,7 @@ pub const Core = struct {
     /// and keeps neither (ngtcp2_conn.c conn_write_pkt: DATAGRAM is never
     /// retransmitted), so the prefix can live on the stack.
     pub fn writeDatagram(core: *Core, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, dest: []u8, ts: u64) ?Wrote {
+        if (@import("builtin").is_test and core.test_dgram_hold) return null;
         const d = core.datagrams_out.front() orelse return null;
         var prefix: [8]u8 = undefined;
         const plen = putVarint(&prefix, d.qsid);
@@ -1242,6 +1247,16 @@ pub const Session = struct {
             host.lock();
             defer host.unlock();
             return .{ .full = s.core.test_dgram_full, .walks = s.core.test_dgram_walks };
+        }
+        /// Tests only: while `hold`, no datagram of the session's
+        /// connection goes, so the queue fills whatever the writer's pace.
+        pub fn testHoldDatagrams(s: *Session, hold: bool) void {
+            if (!@import("builtin").is_test) @compileError("tests only");
+            const host = s.core.host;
+            host.lock();
+            s.core.test_dgram_hold = hold;
+            host.unlock();
+            if (!hold) host.kick();
         }
     };
 
