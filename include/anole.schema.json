@@ -1756,6 +1756,19 @@
           "type": "boolean",
           "default": true,
           "description": "Run no_wait requests that arrive whole on the endpoint task."
+        },
+        "send_memory": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 4096,
+              "description": "Bytes of send buffers all HTTP/3 connections may hold before every stream's cap drops to 64 KiB and new connections are refused (until under 7/8 of it); null: a quarter of the cgroup's memory.max, else of RAM, at least 64 MiB.",
+              "default": null
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -2726,9 +2739,9 @@
         "datagram_queue": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 4294967295,
+          "maximum": 4096,
           "default": 64,
-          "description": "Datagrams a session holds for sending; past it the oldest is dropped (counted in anole_server_stats)."
+          "description": "Datagrams a session holds for sending (1 to 4096; its queue is that many slots from the start); past it the oldest is dropped (counted in anole_server_stats)."
         }
       },
       "required": [

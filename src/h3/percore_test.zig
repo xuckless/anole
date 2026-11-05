@@ -167,7 +167,7 @@ test "h3 per-core: connections spread over the endpoints and stay on their execu
     {
         var registry = metrics.Registry.init(gpa, io);
         defer registry.deinit();
-        h3_metrics.refresh(&registry, f.ep.endpoints(), f.ep.steering(), "h3");
+        h3_metrics.refresh(&registry, f.ep.endpoints(), f.ep.steering(), f.ep.sendMemory(), "h3");
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
         try registry.render(&out.writer);

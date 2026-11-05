@@ -613,6 +613,12 @@ pub const Options = struct {
         /// handler that waits anyway then holds up every HTTP/3 connection
         /// on its core; false gives each request its task again.
         inline_no_wait: bool = true,
+        /// The bytes of send buffers all HTTP/3 connections may hold
+        /// together before every stream's cap drops to 64 KiB and new
+        /// connections are refused, until usage is under 7/8 of it. Null:
+        /// a quarter of the cgroup's memory.max, else of RAM, at least
+        /// 64 MiB.
+        send_memory: ?usize = null,
     };
 
     /// `Options.https`: a TLS listener with HTTP/2 and HTTP/1.1 by ALPN.
@@ -1787,6 +1793,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     .enable_connect_protocol = q.enable_connect_protocol,
                     .webtransport = q.webtransport or self.extras.webtransport,
                     .inline_no_wait = q.inline_no_wait,
+                    .send_memory = q.send_memory,
                     .client_auth = h3ClientAuth(client_auth, client_ca),
                     .listener_name = specs[at].name,
                     .fds = h3_fds,
@@ -4152,7 +4159,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             if (comptime !features.http3) return;
             const self = safety.fromCtx(Self, context);
             const ep = self.h3 orelse return;
-            @import("h3/metrics.zig").refresh(registry, ep.endpoints(), ep.steering(), ep.options.listener_name);
+            @import("h3/metrics.zig").refresh(registry, ep.endpoints(), ep.steering(), ep.sendMemory(), ep.options.listener_name);
         }
 
         // ---- p3/net ----

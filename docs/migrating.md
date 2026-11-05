@@ -222,7 +222,9 @@ implementations set it; a Redis or database one leaves it off, and a
 | `ws.closed.load(.acquire)` | `ws.isClosed()` |
 | `Rooms.init(a)`, `Rooms.initOptions(a, o)` | `Rooms.init(a, .{})`, `Rooms.init(a, o)` |
 | `res.upgradeWebSocket(req)` | `anole.websocket.upgrade(req, res, .{})` (all three HTTP versions) |
-| `session.start(...)`, `tryAccept`, `tryOpen`, `takeDatagram`, `freeDatagram`, `trySendDatagram`, `generation`, `waitChange`, `wake` | `Session.Driver.<same>(session, ...)` (Anole's own drivers; not for handlers) |
+| `session.start(...)`, `tryAccept`, `tryOpen`, `generation`, `waitChange`, `wake` | `Session.Driver.<same>(session, ...)` (Anole's own drivers; not for handlers) |
+| `Session.Driver.takeDatagram`, `freeDatagram` | `session.takeDatagram()`, `session.freeDatagram(d)` (public on `Session`) |
+| `Session.Driver.trySendDatagram(session, data)` | `session.trySendDatagramOwned(buf)` (moves `buf`, from `session.allocator()`; false or an error leaves it with the caller) |
 | `stream.tryRead`, `tryWrite`, `sendError`, `Stream.Poll` | `Stream.Driver.<same>`, `Stream.Driver.Poll` |
 | `req.params.get("name")` for an encoded segment | still raw; `try req.paramDecoded("name")` decodes |
 

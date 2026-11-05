@@ -8,11 +8,17 @@
 //! `anole_h3_datagrams_out_total`, `anole_h3_tx_flushes_total`,
 //! `anole_h3_requests_total`, `anole_h3_served_inline_total` and
 //! `anole_h3_connections_open`, and the socket buffers the system granted,
-//! `anole_h3_socket_rcvbuf_bytes` and `anole_h3_socket_sndbuf_bytes`. Per listener: `anole_h3_steering` (1 when
-//! the kernel steers datagrams to their connection's endpoint).
+//! `anole_h3_socket_rcvbuf_bytes` and `anole_h3_socket_sndbuf_bytes`, and
+//! `anole_h3_connections_refused_total{endpoint,reason}` (reason "memory":
+//! refused under send-memory pressure). Per listener: `anole_h3_steering`
+//! (1 when the kernel steers datagrams to their connection's endpoint),
+//! and the send memory (`bridge.SendMemory`): `anole_h3_send_memory_bytes`,
+//! `anole_h3_send_pressure` (0 or 1) and
+//! `anole_h3_send_pressure_entries_total`.
 const std = @import("std");
 const metrics = @import("../observe/metrics.zig");
 const Stats = @import("server.zig").Stats;
+const SendMemory = @import("bridge.zig").SendMemory;
 
 const Series = struct {
     name: []const u8,
@@ -32,13 +38,14 @@ const counters = [_]Series{
 };
 
 /// Copies `endpoints`' stats (each with `.index`, `.stats` and `.udp`) into
-/// `registry`; `steering` and `listener` name the listener.
-pub fn refresh(registry: *metrics.Registry, endpoints: anytype, steering: bool, listener: []const u8) void {
+/// `registry`; `steering`, `send` and `listener` are the listener's.
+pub fn refresh(registry: *metrics.Registry, endpoints: anytype, steering: bool, send: *SendMemory, listener: []const u8) void {
     var families: [counters.len]*metrics.Family(metrics.Counter) = undefined;
     inline for (counters, 0..) |s, i| families[i] = registry.counter(s.name, s.help, &.{"endpoint"}) catch return;
     const open = registry.gauge("anole_h3_connections_open", "HTTP/3 connections open on an endpoint.", &.{"endpoint"}) catch return;
     const rcvbuf = registry.gauge("anole_h3_socket_rcvbuf_bytes", "An HTTP/3 endpoint's UDP receive buffer, as the system reports it (Linux: twice what it granted).", &.{"endpoint"}) catch return;
     const sndbuf = registry.gauge("anole_h3_socket_sndbuf_bytes", "An HTTP/3 endpoint's UDP send buffer, as the system reports it (Linux: twice what it granted).", &.{"endpoint"}) catch return;
+    const refused = registry.counter("anole_h3_connections_refused_total", "New HTTP/3 connections refused (CONNECTION_REFUSED), by reason: memory, while the send memory was past its limit.", &.{ "endpoint", "reason" }) catch return;
     var buf: [4]u8 = undefined;
     for (endpoints) |ep| {
         const id = std.fmt.bufPrint(&buf, "{d}", .{ep.index}) catch continue;
@@ -47,12 +54,19 @@ pub fn refresh(registry: *metrics.Registry, endpoints: anytype, steering: bool, 
         open.with(&.{id}).set(@intCast(st.connections_open.load(.monotonic)));
         rcvbuf.with(&.{id}).set(ep.udp.rcvbuf);
         sndbuf.with(&.{id}).set(ep.udp.sndbuf);
+        refused.with(&.{ id, "memory" }).set(st.refused_memory.load(.monotonic));
     }
     const steer = registry.gauge("anole_h3_steering", "1 when the kernel steers an HTTP/3 listener's datagrams to their connection's endpoint (classic BPF on SO_REUSEPORT).", &.{"listener"}) catch return;
     steer.with(&.{listener}).set(@intFromBool(steering));
+    const bytes = registry.gauge("anole_h3_send_memory_bytes", "Send blocks an HTTP/3 listener's connections hold (4 KiB each, folded every 64 per endpoint; not the free blocks pooled for reuse).", &.{"listener"}) catch return;
+    const pressure = registry.gauge("anole_h3_send_pressure", "1 while an HTTP/3 listener's send memory is past its limit: stream caps at 64 KiB, new connections refused.", &.{"listener"}) catch return;
+    const entries = registry.counter("anole_h3_send_pressure_entries_total", "Times an HTTP/3 listener's send memory went past its limit.", &.{"listener"}) catch return;
+    bytes.with(&.{listener}).set(@intCast(send.bytes()));
+    pressure.with(&.{listener}).set(@intFromBool(send.under()));
+    entries.with(&.{listener}).set(send.entries.load(.monotonic));
 }
 
-test "h3 metrics: a scrape shows each endpoint's counts and the steering gauge" {
+test "h3 metrics: a scrape shows each endpoint's counts, the steering gauge and the send memory" {
     const gpa = std.testing.allocator;
     var r = metrics.Registry.init(gpa, std.testing.io);
     defer r.deinit();
@@ -62,8 +76,11 @@ test "h3 metrics: a scrape shows each endpoint's counts and the steering gauge" 
     eps[1].stats.requests.store(4, .monotonic);
     eps[1].stats.forwarded_out.store(2, .monotonic);
     eps[1].stats.connections_open.store(1, .monotonic);
+    eps[0].stats.refused_memory.store(5, .monotonic);
+    var send: SendMemory = .init(64 * 4096);
+    send.add(65);
     const ptrs = [_]*const Ep{ &eps[0], &eps[1] };
-    refresh(&r, &ptrs, true, "https");
+    refresh(&r, &ptrs, true, &send, "https");
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try r.render(&out.writer);
@@ -76,6 +93,11 @@ test "h3 metrics: a scrape shows each endpoint's counts and the steering gauge" 
         "anole_h3_connections_open{endpoint=\"1\"} 1\n",
         "anole_h3_steering{listener=\"https\"} 1\n",
         "anole_h3_socket_rcvbuf_bytes{endpoint=\"0\"} 425984\n",
+        "anole_h3_connections_refused_total{endpoint=\"0\",reason=\"memory\"} 5\n",
+        "anole_h3_connections_refused_total{endpoint=\"1\",reason=\"memory\"} 0\n",
+        "anole_h3_send_memory_bytes{listener=\"https\"} 266240\n",
+        "anole_h3_send_pressure{listener=\"https\"} 1\n",
+        "anole_h3_send_pressure_entries_total{listener=\"https\"} 1\n",
     }) |line| {
         if (std.mem.indexOf(u8, text, line) == null) {
             std.debug.print("missing {s} in:\n{s}\n", .{ line, text });

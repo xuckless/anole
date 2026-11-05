@@ -10,6 +10,9 @@ const dusty = @import("dusty");
 const anole_tls = @import("../tls/root.zig");
 const client = @import("client.zig");
 const Endpoint = @import("server.zig").Endpoint(void);
+const bridge = @import("bridge.zig");
+const h3_metrics = @import("metrics.zig");
+const metrics = @import("../observe/metrics.zig");
 const quic_tls = @import("quic_tls.zig");
 const net = @import("net.zig");
 const udp_net = @import("../net/udp.zig");
@@ -286,6 +289,8 @@ const Fixture = struct {
         prefer_v2: bool = true,
         /// `Options.send_budget`, when set.
         send_budget: ?usize = null,
+        /// `Options.send_memory`; null: automatic.
+        send_memory: ?usize = null,
     };
 
     fn startWith(gpa: std.mem.Allocator, io: std.Io, config: dusty.ServerConfig, extra: Extra) !Fixture {
@@ -341,6 +346,7 @@ const Fixture = struct {
             .early_data = extra.early_data,
             .prefer_v2 = extra.prefer_v2,
             .send_budget = extra.send_budget orelse @import("server.zig").conn_budget,
+            .send_memory = extra.send_memory,
         });
         errdefer ep.deinit();
         const future = try io.concurrent(runEndpoint, .{ep});
@@ -732,6 +738,151 @@ test "h3 server: no_wait answers past the connection's budget wait on tasks, so 
         const b = try st.reader().allocRemaining(gpa, .unlimited);
         defer gpa.free(b);
         try std.testing.expectEqual(@as(usize, big_body_len), b.len);
+    }
+}
+
+/// #172: a listener's send memory past its limit.
+const pressure_limit = 256 * 1024;
+const pressure_download = 4 << 20;
+
+fn pressureEntered(ep: *Endpoint) bool {
+    return ep.sendMemory().entries.load(.monotonic) >= 1;
+}
+
+/// Six streams, each at its floor, a partly filled block and the block it
+/// keeps, at most. Once a paused reader's credit has run out and the rest
+/// is acknowledged, its stream holds `send_floor` with or without pressure
+/// (`pathCap` of nothing in flight), so this is a sanity bound on what the
+/// paused streams keep, not a check of the pressure cap: that one only
+/// shows while data is in flight, and the `SendQueue.write` unit test in
+/// bridge.zig checks it deterministically.
+fn heldToFloors(ep: *Endpoint) bool {
+    return ep.blocks.sendLiveCount() <= 6 * (bridge.send_floor / bridge.block_size + 2);
+}
+
+fn pressureLeft(ep: *Endpoint) bool {
+    ep.blocks.foldSend();
+    return !ep.sendMemory().under();
+}
+
+/// Pressure as if the listener were past its limit: a limit of 0 is never
+/// left. Gives back the limit to restore.
+fn forcePressure(ep: *Endpoint) i64 {
+    const m = ep.sendMemory();
+    const limit = m.limit.swap(0, .monotonic);
+    m.pressure.store(true, .monotonic);
+    return limit;
+}
+
+fn downloadPath(buf: []u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "/download?n={d}", .{pressure_download});
+}
+
+test "h3 server: past its send-memory limit every stream holds its floor, and the pressure clears once the clients read" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{}, .request = .{ .max_body_size = 8 << 20 } }, .{ .send_memory = pressure_limit });
+    defer f.stop(gpa, io);
+    var conns: [2]*client.ClientConnection = undefined;
+    var connected: usize = 0;
+    defer for (conns[0..connected]) |conn| conn.close();
+    for (&conns) |*conn| {
+        conn.* = try f.connect(gpa, io);
+        connected += 1;
+    }
+    // Three 4 MiB downloads on each connection, none read yet: each stream
+    // queues at least its floor, 384 KiB against a 256 KiB limit.
+    var path_buf: [64]u8 = undefined;
+    const path = try downloadPath(&path_buf);
+    var streams: [6]*client.Stream = undefined;
+    var opened: usize = 0;
+    defer for (streams[0..opened]) |st| st.release();
+    for (&streams, 0..) |*st, i| {
+        st.* = try request(conns[i % 2], "GET", path, .{});
+        opened += 1;
+    }
+    try wait.waitUntil(io, "send-memory pressure", f.ep, pressureEntered);
+    try wait.waitUntil(io, "the paused streams down to their floors", f.ep, heldToFloors);
+    // The connections already open carry on: every download completes.
+    for (streams) |st| {
+        try st.waitHead();
+        try std.testing.expectEqual(@as(u16, 200), st.status);
+        const b = try st.reader().allocRemaining(gpa, .unlimited);
+        defer gpa.free(b);
+        try std.testing.expectEqual(@as(usize, pressure_download), b.len);
+    }
+    try wait.waitUntil(io, "the pressure left", f.ep, pressureLeft);
+}
+
+test "h3 server: under send-memory pressure a reading stream finishes beside four paused ones" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const limit = forcePressure(f.ep);
+    defer f.ep.sendMemory().limit.store(limit, .monotonic);
+    var path_buf: [64]u8 = undefined;
+    const path = try downloadPath(&path_buf);
+    var paused: [4]*client.Stream = undefined;
+    var opened: usize = 0;
+    defer for (paused[0..opened]) |st| st.release();
+    for (&paused) |*st| {
+        st.* = try request(conn, "GET", path, .{});
+        opened += 1;
+    }
+    // Each paused stream holds its floor, not the connection's budget: the
+    // fifth gets room all the way.
+    const b = try get(conn, path, gpa);
+    defer gpa.free(b);
+    try std.testing.expectEqual(@as(usize, pressure_download), b.len);
+    try std.testing.expect(f.ep.sendMemory().under());
+}
+
+test "h3 server: under send-memory pressure a new connection is refused, and served once it is over" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const limit = forcePressure(f.ep);
+    // CONNECTION_REFUSED ends the handshake at once: no timeout.
+    try std.testing.expectError(error.HandshakeFailed, f.connect(gpa, io));
+    // One refusal per Initial datagram of its first flight.
+    try std.testing.expect(f.ep.stats.refused_memory.load(.monotonic) >= 1);
+    try std.testing.expectEqual(@as(u64, 0), f.ep.stats.accepted.load(.monotonic));
+    f.ep.sendMemory().limit.store(limit, .monotonic);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const body = try get(conn, "/hello", gpa);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("hello over h3", body);
+    try std.testing.expect(!f.ep.sendMemory().under());
+    // What /metrics shows.
+    var registry = metrics.Registry.init(gpa, io);
+    defer registry.deinit();
+    h3_metrics.refresh(&registry, f.ep.endpoints(), f.ep.steering(), f.ep.sendMemory(), "h3");
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try registry.render(&out.writer);
+    const text = out.written();
+    var want_buf: [128]u8 = undefined;
+    for ([_][]const u8{
+        try std.fmt.bufPrint(&want_buf, "anole_h3_connections_refused_total{{endpoint=\"0\",reason=\"memory\"}} {d}\n", .{f.ep.stats.refused_memory.load(.monotonic)}),
+        "anole_h3_send_pressure{listener=\"h3\"} 0\n",
+        "anole_h3_send_pressure_entries_total{listener=\"h3\"} 0\n",
+        "anole_h3_send_memory_bytes{listener=\"h3\"} ",
+    }) |line| {
+        if (std.mem.indexOf(u8, text, line) == null) {
+            std.debug.print("missing {s} in:\n{s}\n", .{ line, text });
+            return error.TestUnexpectedResult;
+        }
     }
 }
 

@@ -325,6 +325,10 @@ with its own UDP socket; `endpoint` is the socket's index.
 | `anole_h3_served_inline_total` | `endpoint` | Requests for `no_wait` routes run without a task. |
 | `anole_h3_connections_open` | `endpoint` | Connections open. |
 | `anole_h3_socket_rcvbuf_bytes`, `anole_h3_socket_sndbuf_bytes` | `endpoint` | The UDP socket buffers as the system reports them. Each endpoint asks for 4 MiB both ways; Linux caps that at `net.core.rmem_max`/`wmem_max` (208 KiB by default) and reports twice what it granted. Raise those sysctls for bursty HTTP/3 loads. |
+| `anole_h3_connections_refused_total` | `endpoint`, `reason` | New connections refused with CONNECTION_REFUSED. `reason="memory"`: the listener's send memory was past its limit. |
+| `anole_h3_send_memory_bytes` | `listener` | Send buffers the listener's connections hold, in 4 KiB blocks, against `http3.send_memory` (docs/server.md "Response buffering"). Each endpoint folds its count in every 64 blocks and once per round, so it lags by up to 256 KiB per endpoint. It leaves out the free blocks pooled for reuse (up to the peak of the last 2 s) and the tasks' stacks, so RSS trails it after a burst. |
+| `anole_h3_send_pressure` | `listener` | 1 while past the limit: every stream's cap is 64 KiB, WebTransport datagram queues are 16, new connections are refused. 0 once under 7/8 of it. |
+| `anole_h3_send_pressure_entries_total` | `listener` | Times the send memory went past its limit. |
 | `anole_h3_steering` | `listener` | 1 when the kernel steers each datagram to its connection's endpoint (a classic BPF program on the SO_REUSEPORT group), 0 with one socket or when the program could not be attached. |
 
 The server also logs one info line when steering is attached, and a warning

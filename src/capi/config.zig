@@ -649,6 +649,10 @@ pub const Config = struct {
         enable_connect_protocol: bool = true,
         /// Run `no_wait` requests that arrive whole on the endpoint task.
         inline_no_wait: bool = true,
+        /// Bytes of send buffers all HTTP/3 connections may hold before
+        /// stream caps drop and new connections are refused; null: a
+        /// quarter of the cgroup's memory.max, else of RAM, at least 64 MiB.
+        send_memory: ?usize = null,
     };
 
     pub const Middleware = union(enum) {
@@ -1390,6 +1394,7 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
     if (cfg.response.brotli_quality > 11) return fail(why, "response.brotli_quality: 0 to 11", .{});
     if (!(cfg.admission.util_exit >= 0 and cfg.admission.util_exit <= cfg.admission.util_enter and cfg.admission.util_enter <= 1)) return fail(why, "admission: 0 <= util_exit <= util_enter <= 1", .{});
     if (cfg.http3.sockets) |n| if (n == 0 or n > 255) return fail(why, "http3.sockets: 1 to 255", .{});
+    if (cfg.http3.send_memory) |n| if (n < 4096) return fail(why, "http3.send_memory: at least 4096 (one block)", .{});
     if (cfg.limits.max_inflight == 0 or cfg.limits.max_inflight > 1 << 20) return fail(why, "limits.max_inflight: 1 to 1048576", .{});
     if (cfg.limits.inline_body_max > cfg.limits.body_max) return fail(why, "limits.inline_body_max is above limits.body_max", .{});
     // Events carry their length in 32 bits: what goes inside one is bounded
@@ -1614,7 +1619,8 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             var h3 = false;
             for (cfg.listeners) |l| h3 = h3 or l.http3;
             if (!h3) return fail(why, "routes[{d}].webtransport: needs a listener with http3", .{i});
-            if (w.datagram_queue == 0) return fail(why, "routes[{d}].webtransport.datagram_queue: at least 1", .{i});
+            // The session holds this many slots from its start (16 B each).
+            if (w.datagram_queue == 0 or w.datagram_queue > 4096) return fail(why, "routes[{d}].webtransport.datagram_queue: 1 to 4096", .{i});
         }
         if (r.static != null and r.method != null) return fail(why, "routes[{d}]: a static route takes no method (GET and HEAD)", .{i});
         if (r.cache != null and r.handler == null and r.respond == null) return fail(why, "routes[{d}].cache: on handler and respond routes", .{i});
@@ -2045,6 +2051,7 @@ test "parse: each refused document is error.Config with a reason" {
         "{\"routes\": [{\"path\": \"/wt\", \"webtransport\": {\"handler\": 1}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true}, \"http3\": true}], \"routes\": [{\"method\": \"GET\", \"path\": \"/wt\", \"webtransport\": {\"handler\": 1}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true}, \"http3\": true}], \"routes\": [{\"path\": \"/wt\", \"webtransport\": {\"handler\": 1, \"datagram_queue\": 0}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true}, \"http3\": true}], \"routes\": [{\"path\": \"/wt\", \"webtransport\": {\"handler\": 1, \"datagram_queue\": 4097}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"always\"}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"require\"}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"request\", \"client_ca_file\": \"a\", \"client_ca_pem\": \"b\"}}]}",
@@ -2236,6 +2243,19 @@ test "config: environment, deployment, error_detail, proxy.trusted and proxy_pro
     const d = try parse(a, "{}", &why);
     try std.testing.expect(d.environment == null and d.deployment == null and d.error_detail == null);
     try std.testing.expectEqual(@as(?u32, 75_000), d.timeouts.keepalive_ms);
+}
+
+test "config: http3.send_memory parses, defaults to null (auto) and is at least one block" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [256]u8 = undefined;
+    var why: std.Io.Writer = .fixed(&buf);
+    const c = try parse(a, "{\"http3\": {\"send_memory\": 1048576}}", &why);
+    try std.testing.expectEqual(@as(?usize, 1 << 20), c.http3.send_memory);
+    const d = try parse(a, "{}", &why);
+    try std.testing.expectEqual(@as(?usize, null), d.http3.send_memory);
+    try std.testing.expectError(error.Config, parse(a, "{\"http3\": {\"send_memory\": 100}}", &why));
 }
 
 test "config: log.format and log.service parse; the access log's format defaults to auto" {
