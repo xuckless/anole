@@ -598,8 +598,9 @@ Both take the same options:
 ### The static file cache
 
 On Linux (64-bit) small static files are kept in memory, so a request for
-one costs no open, read or close: by default files up to 64 KiB, up to
-8 MiB in all for the process (`ServerOptions.static_cache`, the C ABI's
+one costs no read and no blocking-pool hop, only an open, a stat and a
+close on the executor: by default files up to 64 KiB, up to 8 MiB in all
+(as the allocator rounds it) for the process (`ServerOptions.static_cache`, the C ABI's
 `static_cache`). The server logs the budget at startup.
 
 ```zig
@@ -608,9 +609,10 @@ var app = try anole.App.init(gpa, .{
 });
 ```
 
-- **Always fresh:** a cached copy is served only while a stat of the file
-  per request (and of the plain file, for a precompressed copy) shows the
-  same inode, size, mtime and ctime as when it was read. The next request
+- **Always fresh:** a cached copy is served only while the file, opened
+  per request as for serving it (symlink refusals included), and the plain
+  file, for a precompressed copy, show the same inode, size, mtime and
+  ctime as when it was read. The next request
   after a file is replaced or rewritten gets the new bytes; the cache never
   serves what the file no longer holds. A file changed in the last 2 s is
   served but not kept yet, since a filesystem's timestamps can be too

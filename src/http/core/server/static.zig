@@ -173,7 +173,7 @@ pub const Static = struct {
                 }
             }
         }
-        try self.respond(req, res, served, stat, encoding);
+        try self.respond(req, res, served, stat, encoding, try formatEtag(req.arena, stat, encoding));
 
         // The index is left out: its bytes would be kept under the
         // directory's path. A HEAD, a 304, a 412 or a range is too.
@@ -185,15 +185,16 @@ pub const Static = struct {
     }
 
     /// The headers and the conditional and range handling of a file about
-    /// to be served, `stat` (in `encoding`) for the request path `served`,
-    /// whose body is set: the file, or its bytes from the cache.
-    fn respond(self: *const Static, req: *Request, res: *Response, served: []const u8, stat: std.Io.File.Stat, encoding: ?Precompressed) !void {
+    /// to be served, `stat` (in `encoding`, with `etag`) for the request
+    /// path `served`, whose body is set: the file, or its bytes from the
+    /// cache.
+    fn respond(self: *const Static, req: *Request, res: *Response, served: []const u8, stat: std.Io.File.Stat, encoding: ?Precompressed, etag: []const u8) !void {
         res.content_type = .fromExtension(extension(served));
         // Which file is served depends on Accept-Encoding, whichever it
         // turns out to be.
         if (self.options.precompressed.len > 0) try addVary(req, res);
         if (encoding) |e| try res.header("Content-Encoding", e.name());
-        try finish(req, res, try formatEtag(req.arena, stat, encoding), mtimeSeconds(stat));
+        try finish(req, res, etag, mtimeSeconds(stat));
         // Not on a 412 or 416, which a cache could otherwise keep.
         if (self.options.cache_control) |cc| switch (res.status) {
             .ok, .partial_content, .not_modified => try res.header("Cache-Control", cc),
@@ -214,10 +215,10 @@ pub const Static = struct {
         const h = StaticCache.hash(self, sub_path);
         if (!cache.known(io, self, h, sub_path, order)) return false;
 
-        // Today's path picks the first candidate it can open: the first
-        // here that exists. One it can't open (no permission, a link out
-        // of the directory) is never cached, so it misses every time.
-        const plain = switch (try cache.statAt(io, self.dir, sub_path)) {
+        // Today's path picks the first candidate it can open: so does
+        // `statAt`, which opens as it does.
+        const confine = self.options.resolve_beneath;
+        const plain = switch (try cache.statAt(io, self.dir, sub_path, confine)) {
             .file => |st| st,
             .missing, .other => return self.cachedMiss(cache, io),
         };
@@ -229,7 +230,7 @@ pub const Static = struct {
             if (sub_path.len + ext.len > path_buf.len) return self.cachedMiss(cache, io);
             @memcpy(path_buf[0..sub_path.len], sub_path);
             @memcpy(path_buf[sub_path.len..][0..ext.len], ext);
-            switch (try cache.statAt(io, self.dir, path_buf[0 .. sub_path.len + ext.len])) {
+            switch (try cache.statAt(io, self.dir, path_buf[0 .. sub_path.len + ext.len], confine)) {
                 .file => |st| {
                     stat = st;
                     encoding = candidate;
@@ -244,7 +245,9 @@ pub const Static = struct {
         if (stat.size > cache.opts.max_file) return self.cachedMiss(cache, io);
 
         // Everything that allocates comes before the read section (L5);
-        // a conditional request that copies no body takes no buffer.
+        // a conditional request that copies no body takes no buffer. On
+        // h1 a body past about 15 KiB grows the arena beyond smp's 32 KiB
+        // classes: an mmap and munmap per hit (k7.md "Review"; sub-A/B 2).
         const etag = try formatEtag(req.arena, stat, encoding);
         const proceed = checkPreconditions(req, etag, mtimeSeconds(stat)) == .proceed;
         const buf = try req.arena.alloc(u8, if (proceed) @intCast(stat.size) else 0);
@@ -254,7 +257,7 @@ pub const Static = struct {
         }
         cache.countHit(io);
         res._bodyFromFile(buf);
-        try self.respond(req, res, sub_path, stat, encoding);
+        try self.respond(req, res, sub_path, stat, encoding, etag);
         return true;
     }
 
