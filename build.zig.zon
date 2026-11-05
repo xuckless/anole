@@ -53,9 +53,12 @@
         // the tick is spent and checks held locks (4286fa0; D10), and
         // Loop.idle_ns, the time epoll and kqueue sleep in a waiting poll, for
         // the WebSocket admission gate's utilization (#129; 5506ac2, 40c6f9f).
-        // Batch 2B (#184, fork worktree s2b a77def3, not pushed): the no-park
-        // yield is charged to the task past a spent tick (yieldIfOverrun).
-        // The integration re-pins by commit; the released pin was:
+        // Batch 2B (#184, fork worktree s2b a77def3 + 806b5e4, not pushed):
+        // the no-park yield is charged to the task past a spent tick
+        // (yieldIfOverrun). Until the integration re-pins by commit, build on
+        // the box only: build.sh's Mac slot rsyncs this worktree but not
+        // ../zio-2b (hold mac.lock: `flock ~/Dev/anole-wt/.build/mac.lock
+        // ~/Dev/anole-wt/build.sh ...`). The released pin was:
         //   .url = "git+https://github.com/xuckless/zio#47ad429a2e605d6bef18779fbf96c5f2d648bb22",
         //   .hash = "zio-0.19.0-xHbVVDQaLwAXP3onRbo4O9yrKZU3VzTnUNJDaVeVzK_p",
         .zio = .{
