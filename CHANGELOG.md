@@ -3,6 +3,16 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.5.3 (unreleased)
+
+### Fixed
+
+- Under saturation, a connection whose response went out at once no
+  longer waits a whole extra pass of the run queue for its next request
+  (#184): zio's no-park yield is charged to the running task only past a
+  spent tick, after 16 more operations without a park (Tokio's per-task
+  budget, Netty's count), not to whichever task the tick ends in.
+
 ## 0.5.2 (2026-11-04)
 
 ### Added
