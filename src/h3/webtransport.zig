@@ -260,6 +260,13 @@ pub const Core = struct {
         return core.host.pool;
     }
 
+    /// Datagrams the connection queues at most: fewer while the server's
+    /// send memory is past its limit (`bridge.SendMemory`).
+    fn datagramLimit(core: *const Core) usize {
+        if (core.pool().send) |m| if (m.under()) return @min(bridge.SendMemory.pressure_datagrams, core.limits.datagrams_out);
+        return core.limits.datagrams_out;
+    }
+
     fn budget(core: *const Core) *bridge.Budget {
         return core.host.budget;
     }
@@ -1243,7 +1250,7 @@ pub const Session = struct {
             core.host.unlock();
             return error.DatagramTooLarge;
         }
-        if (core.datagrams_out.len >= core.limits.datagrams_out) {
+        if (core.datagrams_out.len >= core.datagramLimit()) {
             core.host.unlock();
             return false;
         }
@@ -2103,6 +2110,38 @@ test "varints round trip at every length" {
     try std.testing.expectEqual(@as(u64, 494878333), getVarint(&.{ 0x9d, 0x7f, 0x3e, 0x7d }).?.value);
     try std.testing.expectEqual(@as(u64, 15293), getVarint(&.{ 0x7b, 0xbd }).?.value);
     try std.testing.expectEqual(@as(u64, 37), getVarint(&.{0x25}).?.value);
+}
+
+test "WebTransport: a connection queues 16 datagrams under send-memory pressure, its limit otherwise" {
+    const Noop = struct {
+        fn f(_: *anyopaque) void {}
+    };
+    var memory: bridge.SendMemory = .init(1 << 20);
+    var pool = bridge.BlockPool.init(std.testing.allocator, 0);
+    defer pool.deinit();
+    var dummy: u8 = 0;
+    var core: Core = .{
+        .gpa = std.testing.allocator,
+        .io = undefined,
+        .q = undefined,
+        .host = .{ .ctx = &dummy, .gen = undefined, .pool = &pool, .budget = undefined, .lock_fn = Noop.f, .unlock_fn = Noop.f, .kick_fn = Noop.f },
+        .server = true,
+        .limits = .{},
+    };
+    // A client's pool has no send memory.
+    try std.testing.expectEqual(@as(usize, 256), core.datagramLimit());
+    pool.send = &memory;
+    try std.testing.expectEqual(@as(usize, 256), core.datagramLimit());
+    memory.add(1 << 20 >> 12);
+    memory.add(1);
+    try std.testing.expectEqual(@as(usize, 16), core.datagramLimit());
+    // A lower limit of its own stays.
+    core.limits.datagrams_out = 4;
+    try std.testing.expectEqual(@as(usize, 4), core.datagramLimit());
+    core.limits.datagrams_out = 256;
+    // Under 7/8 of the limit: back to 256.
+    memory.add(-64);
+    try std.testing.expectEqual(@as(usize, 256), core.datagramLimit());
 }
 
 test "WebTransport error codes map onto HTTP/3's and back, skipping the reserved ones" {

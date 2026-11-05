@@ -153,6 +153,11 @@ pub const Options = struct {
     /// What one connection's streams may hold unacknowledged, all together
     /// (each stream has its own cap too). Internal; tests lower it.
     send_budget: usize = conn_budget,
+    /// The bytes of send blocks the listener's connections may hold, all
+    /// together, before every stream's cap drops to 64 KiB and new
+    /// connections are refused (`bridge.SendMemory`). Null: a quarter of
+    /// the cgroup's memory.max, else of RAM, at least 64 MiB.
+    send_memory: ?usize = null,
     /// How long a connection may sit idle before it is closed.
     idle_timeout: std.Io.Duration = .fromSeconds(30),
     /// Validate every client address with a Retry round trip before
@@ -371,7 +376,20 @@ pub const Stats = struct {
     /// (`Endpoint.sampleStats` fills them in).
     blocks_live: std.atomic.Value(u64) = .init(0),
     blocks_pooled: std.atomic.Value(u64) = .init(0),
+    /// New connections refused (CONNECTION_REFUSED) while the listener's
+    /// send memory was past its limit.
+    refused_memory: std.atomic.Value(u64) = .init(0),
 };
+
+/// The send-memory limit when `Options.send_memory` is null: a quarter of
+/// the cgroup's limit or of RAM, whichever is lower, at least 64 MiB (as
+/// the JVM sizes its heap by default, MaxRAMPercentage=25); 1 GiB when
+/// neither can be read.
+pub fn autoSendMemory(cgroup_max: ?u64, ram: ?u64) u64 {
+    const min_limit: u64 = 64 << 20;
+    const memory = if (cgroup_max) |cg| (if (ram) |r| @min(cg, r) else cg) else ram orelse return 1 << 30;
+    return @max(min_limit, memory / 4);
+}
 
 /// One HTTP/3 listener, serving `server`'s router: one endpoint per UDP
 /// socket. On Linux a listener may have several (`Options.sockets`), each
@@ -433,6 +451,9 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// already running.
         test_given_up_with_tasks: if (builtin.is_test) std.atomic.Value(u32) else void = if (builtin.is_test) .init(0) else {},
         draining: bool = false,
+        /// `Shared.send_memory.entries` when this endpoint last looked
+        /// (`foldSendMemory`).
+        send_entries_seen: u64 = 0,
         /// Stateless resets left in the current second.
         reset_budget: u32 = 0,
         reset_window: u64 = 0,
@@ -497,6 +518,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// endpoint (`steer.attach` took): false with one socket, or
             /// where the program could not be attached.
             steering: bool = false,
+            /// The send blocks every endpoint's connections hold, and the
+            /// pressure past its limit (#172).
+            send_memory: bridge.SendMemory,
         };
 
         /// A datagram passed from the endpoint whose socket received it to
@@ -518,9 +542,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             else if (builtin.os.tag == .linux) options.sockets else 1;
             if (count == 0 or count > steer.max_sockets) return error.InvalidSocketCount;
 
+            const send_limit = try sendMemoryLimit(io, options.send_memory);
             const shared = try gpa.create(Shared);
             errdefer gpa.destroy(shared);
-            shared.* = .{ .endpoints = try gpa.alloc(*Self, count), .tls = undefined };
+            shared.* = .{ .endpoints = try gpa.alloc(*Self, count), .tls = undefined, .send_memory = .init(send_limit) };
             errdefer gpa.free(shared.endpoints);
             shared.tls = try newTlsContext(options);
             errdefer shared.tls.deinit();
@@ -567,6 +592,20 @@ pub fn Endpoint(comptime Ctx: type) type {
             return shared.endpoints[0];
         }
 
+        /// `Options.send_memory`, or the automatic limit, in bytes; logged.
+        fn sendMemoryLimit(io: std.Io, set: ?usize) std.Io.Cancelable!u64 {
+            if (set) |n| {
+                log.info("HTTP/3: send memory limit {d} KiB (set)", .{n / 1024});
+                return n;
+            }
+            const cgroup_max = try dusty.cgroup.memoryLimit(io);
+            const ram = std.process.totalSystemMemory() catch null;
+            const limit = autoSendMemory(cgroup_max, ram);
+            const of = if (cgroup_max != null and (ram == null or cgroup_max.? <= ram.?)) "the cgroup's memory.max" else if (ram != null) "RAM" else "neither could be read: 1 GiB";
+            log.info("HTTP/3: send memory limit {d} MiB (a quarter of {s}, at least 64 MiB)", .{ limit >> 20, of });
+            return limit;
+        }
+
         /// One more socket of the group, SO_REUSEPORT, as zio wants it.
         fn bindMember(io: std.Io, at: std.Io.net.IpAddress, ipv6_only: ?bool) !std.Io.net.Socket {
             // One socket per listener there (`init`).
@@ -601,6 +640,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 .tx = .{ tx0, tx1 },
                 .blocks = .initAdaptive(gpa, 256),
             };
+            self.blocks.send = &shared.send_memory;
             self.inbox = .init(&self.inbox_buf);
             return self;
         }
@@ -644,6 +684,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             const shared = self.shared;
             const gpa = self.gpa;
             for (shared.endpoints) |ep| ep.deinitOne();
+            // Every pool gave its send blocks back and folded them.
+            if (builtin.is_test) std.debug.assert(shared.send_memory.total.load(.monotonic) == 0);
             shared.tls.deinit();
             gpa.free(shared.endpoints);
             gpa.destroy(shared);
@@ -692,6 +734,11 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// their sockets, to hand to a successor, and their `stats`.
         pub fn endpoints(self: *const Self) []const *Self {
             return self.shared.endpoints;
+        }
+
+        /// The listener's send memory (`Shared.send_memory`).
+        pub fn sendMemory(self: *const Self) *bridge.SendMemory {
+            return &self.shared.send_memory;
         }
 
         /// Whether the kernel steers the listener's datagrams by
@@ -924,6 +971,23 @@ pub fn Endpoint(comptime Ctx: type) type {
             const t = now(self.io);
             while (self.timers.items.len > 0 and self.timers.items[0].timer_at <= t) self.timers.items[0].service();
             self.blocks.trim(t);
+            self.foldSendMemory(t);
+        }
+
+        /// Publishes what this endpoint's send blocks moved, and checks the
+        /// total, so a pressure flag a reader cleared on a stale total is
+        /// set again within a round. Warns of pressure once per 10 s.
+        fn foldSendMemory(self: *Self, t: u64) void {
+            const m = &self.shared.send_memory;
+            self.blocks.foldSend();
+            m.check(m.total.load(.monotonic));
+            const entries = m.entries.load(.monotonic);
+            if (entries == self.send_entries_seen) return;
+            self.send_entries_seen = entries;
+            const last = m.warned_at.load(.monotonic);
+            if (last != 0 and t -% last < 10 * std.time.ns_per_s) return;
+            if (m.warned_at.cmpxchgStrong(last, @max(t, 1), .monotonic, .monotonic) != null) return;
+            log.warn("HTTP/3 send memory past its limit ({d} MiB): stream caps at 64 KiB, new connections refused until it is under 7/8 of it", .{@as(u64, @intCast(m.limit.load(.monotonic))) * bridge.block_size >> 20});
         }
 
         /// Has the driver service `conn` in its next round, waking it if it
@@ -1273,6 +1337,15 @@ pub fn Endpoint(comptime Ctx: type) type {
                     self.sendStatelessReset(remote.ip(), local, data.len, vc.dcid[0..vc.dcidlen]);
                 return;
             }
+            // Past the send-memory limit: no new connections until it is
+            // under again (RFC 9000 §5.2.2). Before any token or Retry
+            // work, which would be spent on a refusal anyway. No
+            // amplification: ngtcp2_accept took an Initial of at least
+            // 1200 bytes, and the close is smaller.
+            if (self.shared.send_memory.under()) {
+                _ = self.stats.refused_memory.fetchAdd(1, .monotonic);
+                return self.sendStatelessClose(&hd, remote, local, c.NGTCP2_CONNECTION_REFUSED);
+            }
 
             var ocid: c.ngtcp2_cid = undefined;
             var pocid: ?*c.ngtcp2_cid = null;
@@ -1280,7 +1353,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (self.options.validate_address or hd.tokenlen > 0) {
                 if (hd.tokenlen == 0) return self.sendRetry(&hd, remote, local, data.len * 3);
                 if (hd.token[0] != c.NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY2 and hd.dcid.datalen < c.NGTCP2_MIN_INITIAL_DCIDLEN)
-                    return self.sendStatelessClose(&hd, remote, local);
+                    return self.sendStatelessClose(&hd, remote, local, c.NGTCP2_INVALID_TOKEN);
                 switch (hd.token[0]) {
                     c.NGTCP2_CRYPTO_TOKEN_MAGIC_RETRY2 => {
                         const rv = c.ngtcp2_crypto_verify_retry_token2(&ocid, hd.token, hd.tokenlen, &self.secret, self.secret.len, hd.version, @ptrCast(&remote.storage), remote.len, &hd.dcid, 10 * c.NGTCP2_SECONDS, wallClock(self.io));
@@ -1288,7 +1361,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                             pocid = &ocid;
                             token_type = c.NGTCP2_TOKEN_TYPE_RETRY;
                         } else if (rv == c.NGTCP2_CRYPTO_ERR_VERIFY_TOKEN or self.options.validate_address) {
-                            return self.sendStatelessClose(&hd, remote, local);
+                            return self.sendStatelessClose(&hd, remote, local, c.NGTCP2_INVALID_TOKEN);
                         } else {
                             hd.token = null;
                             hd.tokenlen = 0;
@@ -1410,9 +1483,9 @@ pub fn Endpoint(comptime Ctx: type) type {
             self.send(remote.ip(), from, buf[0..@intCast(n)]);
         }
 
-        fn sendStatelessClose(self: *Self, chd: *const c.ngtcp2_pkt_hd, remote: Addr, from: ?std.Io.net.IpAddress) void {
+        fn sendStatelessClose(self: *Self, chd: *const c.ngtcp2_pkt_hd, remote: Addr, from: ?std.Io.net.IpAddress, error_code: u64) void {
             var buf: [c.NGTCP2_MAX_UDP_PAYLOAD_SIZE]u8 = undefined;
-            const n = c.ngtcp2_crypto_write_connection_close(&buf, buf.len, chd.version, &chd.scid, &chd.dcid, c.NGTCP2_INVALID_TOKEN, null, 0);
+            const n = c.ngtcp2_crypto_write_connection_close(&buf, buf.len, chd.version, &chd.scid, &chd.dcid, error_code, null, 0);
             if (n > 0) self.send(remote.ip(), from, buf[0..@intCast(n)]);
         }
 
@@ -4250,4 +4323,20 @@ test "transport parameters: 256 concurrent requests per connection by default, a
     const params = transportParams(&base);
     try std.testing.expectEqual(@as(u64, 256), params.initial_max_streams_bidi);
     try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_ms), params.max_ack_delay);
+}
+
+test "send memory: the automatic limit is a quarter of the lower of the cgroup's and RAM, at least 64 MiB" {
+    const MiB: u64 = 1 << 20;
+    const GiB: u64 = 1 << 30;
+    // A quarter of RAM with no cgroup limit; of the cgroup's when lower.
+    try std.testing.expectEqual(8 * GiB, autoSendMemory(null, 32 * GiB));
+    try std.testing.expectEqual(512 * MiB, autoSendMemory(2 * GiB, 32 * GiB));
+    // A cgroup limit above RAM (or a huge one) leaves RAM's.
+    try std.testing.expectEqual(8 * GiB, autoSendMemory(1 << 62, 32 * GiB));
+    try std.testing.expectEqual(GiB, autoSendMemory(4 * GiB, null));
+    // At least 64 MiB; 1 GiB when neither is known.
+    try std.testing.expectEqual(64 * MiB, autoSendMemory(128 * MiB, 32 * GiB));
+    try std.testing.expectEqual(GiB, autoSendMemory(null, null));
+    // In blocks, rounded up.
+    try std.testing.expectEqual(@as(i64, 16384), bridge.SendMemory.init(autoSendMemory(null, 256 * MiB)).limit.load(.monotonic));
 }

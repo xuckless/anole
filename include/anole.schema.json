@@ -1734,6 +1734,19 @@
           "type": "boolean",
           "default": true,
           "description": "Run no_wait requests that arrive whole on the endpoint task."
+        },
+        "send_memory": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 4096,
+              "description": "Bytes of send buffers all HTTP/3 connections may hold before every stream's cap drops to 64 KiB and new connections are refused (until under 7/8 of it); null: a quarter of the cgroup's memory.max, else of RAM, at least 64 MiB.",
+              "default": null
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },

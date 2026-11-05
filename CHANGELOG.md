@@ -3,6 +3,22 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+### Added
+
+- **HTTP/3 send-memory bound** (#172), on by default: a listener counts
+  the send buffers all its connections hold against
+  `http3.send_memory` (a quarter of the cgroup's `memory.max`, else of
+  RAM, at least 64 MiB). Past it, as Linux's `tcp_mem` pressure, every
+  stream's cap drops to 64 KiB, a WebTransport connection queues 16
+  datagrams, and new connections are refused with CONNECTION_REFUSED
+  until usage is under 7/8 of it. Before, nothing bounded the total
+  across connections. Metrics `anole_h3_send_memory_bytes`,
+  `anole_h3_send_pressure`, `anole_h3_send_pressure_entries_total` and
+  `anole_h3_connections_refused_total{reason="memory"}`; the key is in the
+  JSON config and the C ABI too. See docs/server.md "Response buffering".
+
 ## 0.5.2 (2026-11-04)
 
 ### Added

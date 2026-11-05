@@ -878,9 +878,25 @@ fast as the path allows, as over TCP, while a client that stops reading
 leaves its response holding up to about 100 KiB (what the stack already
 took, plus 64 KiB). All of a connection's responses together hold at most
 4 MiB, past which only one inline `no_wait` answer's body may go (its writes
-cannot wait; the ones after it then run on tasks and wait for room). Nothing bounds the total across connections: plan for up to
-connections x 4 MiB of send buffers at worst (one download per connection
-held at most 64 KiB before 0.5.0). Message streams keep a fixed 1 MiB
+cannot wait; the ones after it then run on tasks and wait for room).
+
+Across connections, a listener counts the send buffers they all hold
+against `.http3 = .{ .send_memory = ... }`: by default a quarter of the
+cgroup's `memory.max`, else of RAM, at least 64 MiB (the startup log names
+it). Past it, as Linux's `tcp_mem` pressure: every stream's cap drops to
+64 KiB, a WebTransport connection queues 16 datagrams instead of 256, and
+new connections are refused with CONNECTION_REFUSED, until the total is
+under 7/8 of the limit. Connections already open carry on, each stream at
+its 64 KiB. It is a soft bound: while under pressure the open connections
+may still hold, beyond the limit, each up to
+`min(4 MiB, active streams x (64 KiB + about 32 KiB))`, plus one inline
+`no_wait` body and the datagrams queued before. What it stops is the
+number of connections growing. `anole_h3_send_memory_bytes`,
+`anole_h3_send_pressure` and `anole_h3_connections_refused_total` show it
+(docs/observability.md), and the server warns when it enters pressure. A
+limit set too low holds every download to 64 KiB per round trip; the
+cgroup limit is read from the process's own cgroup only (a limit on a
+parent slice is not seen, and RAM's applies). Message streams keep a fixed 1 MiB
 unacknowledged each, so a send there returns once buffered up to it: the
 extended CONNECT streams (WebSockets, the WebTransport session's stream)
 and every gRPC request (unary, streaming and gRPC-Web, any
