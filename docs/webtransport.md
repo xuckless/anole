@@ -187,6 +187,36 @@ and nothing says whether one arrived. Up to 256 incoming datagrams (and 1
 MiB) wait for a session's handler, and past that new ones are dropped;
 `sendDatagram` waits while 256 are queued to go out.
 
+### Without copies
+
+`receiveDatagram` and `sendDatagram` copy. To pass datagrams on as they
+are, move the buffers instead:
+
+```zig
+// a and b: sessions of the same server.
+const d = try a.nextDatagram();
+errdefer a.freeDatagram(d);
+try b.sendDatagramOwned(d);
+```
+
+`nextDatagram` waits for the next datagram and returns the received buffer
+itself (`error.SessionClosed` once the session has ended and none is
+left); give it back with `freeDatagram`. `takeDatagram` does the same
+without waiting (null when none is there). `sendDatagramOwned(buf)` queues
+`buf` without copying it: when it returns, the queue owns `buf`; when it
+fails (any error, `Canceled` too), the caller still does.
+`trySendDatagramOwned(buf)` does not wait: true means the queue took
+`buf`, false (the connection's queue is full) or an error that the caller
+still owns it.
+
+A buffer moved into a session must be a whole buffer from its
+`allocator()` (or one `nextDatagram` or `takeDatagram` returned), never a
+slice of one: the queue frees it as it is. To change the bytes, change
+them in place or copy them. Every
+session of one server shares it, so a datagram from one moves to another
+as it is; between a client's session and a server's (or two servers),
+copy it with `b.allocator().dupe(u8, d)`.
+
 ## Closing
 
 `session.close(code, reason)` sends CLOSE_WEBTRANSPORT_SESSION with a 32-bit

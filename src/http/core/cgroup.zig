@@ -2,7 +2,8 @@
 // contributors), base d3cb485, via Anole's fork xuckless/dusty 86d152f.
 // See LICENSE.dusty and THIRD_PARTY_NOTICES.
 
-//! Linux cgroup CPU limit detection, ported from zio's `cgroup.zig`.
+//! Linux cgroup CPU limit detection, ported from zio's `cgroup.zig`, and
+//! the cgroup v2 memory limit (`memoryLimit`), read the same way.
 //!
 //! Container CPU limits (Docker `--cpus`, Kubernetes `resources.limits.cpu`)
 //! are enforced by the CFS bandwidth controller as a quota/period pair. That
@@ -52,7 +53,7 @@ fn quotaRatio(io: std.Io) std.Io.Cancelable!?f64 {
     // the mount root (namespaced container) or in a leaf slice (systemd
     // CPUQuota=, or a container without a cgroup namespace).
     var path_buf: [512]u8 = undefined;
-    if (try v2CpuMaxPath(io, &path_buf)) |cpu_max_path| {
+    if (try v2Path(io, "cpu.max", &path_buf)) |cpu_max_path| {
         var buf: [128]u8 = undefined;
         if (try readFile(io, cpu_max_path, &buf)) |content| {
             // cpu.max holds "<quota> <period>", with <quota> being the literal
@@ -77,23 +78,42 @@ fn quotaRatio(io: std.Io) std.Io.Cancelable!?f64 {
     return @as(f64, @floatFromInt(quota)) / @as(f64, @floatFromInt(period));
 }
 
-/// Build the path to the current process's cgroup v2 cpu.max file into `out`,
-/// or null if the process is not on a unified (v2) hierarchy. The v2 line in
-/// /proc/self/cgroup has the form "0::<path>"; the file lives at
-/// /sys/fs/cgroup<path>/cpu.max.
-fn v2CpuMaxPath(io: std.Io, out: []u8) std.Io.Cancelable!?[]const u8 {
-    var buf: [1024]u8 = undefined;
-    const content = try readFile(io, "/proc/self/cgroup", &buf) orelse return null;
-    return buildV2Path(content, out);
+/// The memory limit of the current process's cgroup v2 (its `memory.max`),
+/// in bytes, or null when there is none (or not Linux, or cgroup v1). Only
+/// the process's own cgroup is read, as `cpuLimit` reads its `cpu.max`: a
+/// limit set on an ancestor (a systemd slice) is not seen.
+pub fn memoryLimit(io: std.Io) std.Io.Cancelable!?u64 {
+    if (builtin.os.tag != .linux) return null;
+    var path_buf: [512]u8 = undefined;
+    const path = try v2Path(io, "memory.max", &path_buf) orelse return null;
+    var buf: [64]u8 = undefined;
+    return parseMemoryMax(try readFile(io, path, &buf) orelse return null);
 }
 
-/// Parse /proc/self/cgroup `content` and build the v2 cpu.max path into `out`.
-fn buildV2Path(content: []const u8, out: []u8) ?[]const u8 {
+/// memory.max holds a byte count, or the literal "max" when there is no limit.
+fn parseMemoryMax(content: []const u8) ?u64 {
+    const s = std.mem.trim(u8, content, " \n");
+    if (std.mem.eql(u8, s, "max")) return null;
+    return std.fmt.parseInt(u64, s, 10) catch null;
+}
+
+/// Build the path to the current process's cgroup v2 `file` into `out`, or
+/// null if the process is not on a unified (v2) hierarchy. The v2 line in
+/// /proc/self/cgroup has the form "0::<path>"; the file lives at
+/// /sys/fs/cgroup<path>/<file>.
+fn v2Path(io: std.Io, file: []const u8, out: []u8) std.Io.Cancelable!?[]const u8 {
+    var buf: [1024]u8 = undefined;
+    const content = try readFile(io, "/proc/self/cgroup", &buf) orelse return null;
+    return buildV2Path(content, file, out);
+}
+
+/// Parse /proc/self/cgroup `content` and build the v2 path of `file` into `out`.
+fn buildV2Path(content: []const u8, file: []const u8, out: []u8) ?[]const u8 {
     var lines = std.mem.tokenizeScalar(u8, content, '\n');
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, "0::")) continue;
         const rel = line["0::".len..];
-        return std.fmt.bufPrint(out, "/sys/fs/cgroup{s}/cpu.max", .{rel}) catch return null;
+        return std.fmt.bufPrint(out, "/sys/fs/cgroup{s}/{s}", .{ rel, file }) catch return null;
     }
     return null;
 }
@@ -142,22 +162,38 @@ test "parseV2: malformed" {
 
 test "buildV2Path: root and leaf" {
     var out: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("/sys/fs/cgroup//cpu.max", buildV2Path("0::/\n", &out).?);
+    try std.testing.expectEqualStrings("/sys/fs/cgroup//cpu.max", buildV2Path("0::/\n", "cpu.max", &out).?);
     try std.testing.expectEqualStrings(
         "/sys/fs/cgroup/app.slice/my.service/cpu.max",
-        buildV2Path("0::/app.slice/my.service\n", &out).?,
+        buildV2Path("0::/app.slice/my.service\n", "cpu.max", &out).?,
     );
     // Hybrid layout: v1 controller lines precede the unified "0::" line.
     try std.testing.expectEqualStrings(
         "/sys/fs/cgroup/foo/cpu.max",
-        buildV2Path("3:cpu,cpuacct:/foo\n0::/foo\n", &out).?,
+        buildV2Path("3:cpu,cpuacct:/foo\n0::/foo\n", "cpu.max", &out).?,
     );
+}
+
+test "buildV2Path: memory.max" {
+    var out: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "/sys/fs/cgroup/app.slice/my.service/memory.max",
+        buildV2Path("0::/app.slice/my.service\n", "memory.max", &out).?,
+    );
+}
+
+test "parseMemoryMax: a limit, none, malformed" {
+    try std.testing.expectEqual(@as(?u64, 536870912), parseMemoryMax("536870912\n"));
+    try std.testing.expectEqual(@as(?u64, null), parseMemoryMax("max\n"));
+    try std.testing.expectEqual(@as(?u64, null), parseMemoryMax(""));
+    try std.testing.expectEqual(@as(?u64, null), parseMemoryMax("12abc"));
+    try std.testing.expectEqual(@as(?u64, null), parseMemoryMax("-1"));
 }
 
 test "buildV2Path: no unified hierarchy" {
     var out: [256]u8 = undefined;
-    try std.testing.expectEqual(@as(?[]const u8, null), buildV2Path("3:cpu,cpuacct:/foo\n", &out));
-    try std.testing.expectEqual(@as(?[]const u8, null), buildV2Path("", &out));
+    try std.testing.expectEqual(@as(?[]const u8, null), buildV2Path("3:cpu,cpuacct:/foo\n", "cpu.max", &out));
+    try std.testing.expectEqual(@as(?[]const u8, null), buildV2Path("", "cpu.max", &out));
 }
 
 test "roundRatio: ceil with floor of 2" {

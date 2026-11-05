@@ -32,7 +32,7 @@ zio (async runtime)
             report hook, and the per-executor quiescent-state counters,
             quiescent_state; fast_send, the no-park yield and
             Loop.idle_ns)
-  Pinned:   commit 47ad429a2e605d6bef18779fbf96c5f2d648bb22 of the fork
+  Pinned:   commit 806b5e4fa82592564f4e788ab4797370e43a99a5 of the fork
   Linked:   always
 
 nghttp2 1.70.0 (HTTP/2)

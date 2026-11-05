@@ -1264,7 +1264,7 @@ pub const ClientConnection = struct {
     fn onExtendMaxLocalStreamsUni(_: ?*c.ngtcp2_conn, _: u64, user_data: ?*anyopaque) callconv(.c) c_int {
         // A WebTransport session waiting to open a stream may go on.
         const self = connOf(user_data);
-        if (self.wt) |w| w.onStreamCredit();
+        if (self.wt) |w| w.onStreamCredit(.uni);
         self.kick();
         return 0;
     }
@@ -1281,7 +1281,7 @@ pub const ClientConnection = struct {
         // A request, or a WebTransport session, waiting for a stream may go
         // on.
         const self = connOf(user_data);
-        if (self.wt) |w| w.onStreamCredit();
+        if (self.wt) |w| w.onStreamCredit(.bidi);
         self.kick();
         return 0;
     }

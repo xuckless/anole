@@ -742,7 +742,7 @@ none.
 | `request.require_host`, `decompress`, `keep_buffers` | true, true, false | `request.*` |
 | `response.write_buffer_size`, `date`, `default_content_type`, `max_header_count`, `brotli_quality` | 16384, true, "text", 64, 4 | `response.*` (`default_content_type` by tag name; null: none) |
 | `http2.*` | 250 streams, ..., `enable_connect_protocol` false | `http2.*` (`max_concurrent_streams`, `stream_window`, `stream_window_reading`, `tunnel_window`, `reading_window_budget`, `connection_window`, `max_header_list_size`, `stream_reset_burst`, `stream_reset_rate`, `max_continuations`, `refused_stream_burst`, `refused_stream_rate`, `enable_connect_protocol`, `inline_no_wait`) |
-| `http3.address`, `port`, `max_streams_bidi`, `validate_address`, `idle_timeout_ms`, `alt_svc`, `early_data`, `prefer_v2`, `sockets`, `enable_connect_protocol`, `inline_no_wait` | null, null, 256, false, 30000, true, false, true, null, true, true | `http3.*` |
+| `http3.address`, `port`, `max_streams_bidi`, `validate_address`, `idle_timeout_ms`, `alt_svc`, `early_data`, `prefer_v2`, `sockets`, `enable_connect_protocol`, `inline_no_wait`, `send_memory` | null, null, 256, false, 30000, true, false, true, null, true, true, null (auto) | `http3.*` |
 | `errors` | "auto" | `errors` ("auto", "json", "text") |
 | `routes[].websocket.accept`, `subprotocols`, `compression`, `close_on_drain`, `origins` | "auto", [], true, true, [] | `websocket.UpgradeOptions` (`subprotocols`, `compression`, `close_on_drain`, `allowed_origins`); `accept` is the ABI's own: "consumer" hands each handshake to the application |
 | `executors` | 0 | `executors` (0 is `.auto`, n is `.exact(n)`) |
@@ -1049,7 +1049,8 @@ anole_wt_close(w, 0, (anole_str){"bye", 3});
 - Datagrams: received ones are `ANOLE_EV_WT_DATAGRAM` (the session keeps
   up to 256 or 1 MiB waiting for the consumer, then drops new ones, as
   Anole does in Zig). Sent ones wait in a queue of the route's
-  `datagram_queue` (64 by default) and past it **the oldest is dropped**:
+  `datagram_queue` (64 by default, at most 4096; the session keeps that
+  many 16-byte slots from its start) and past it **the oldest is dropped**:
   datagrams are for data that goes stale (positions, frames), so a new one
   matters more than the one it replaces, and the consumer never has to
   hold or retry them. Drops count in `anole_stats.wt_datagrams_dropped`.

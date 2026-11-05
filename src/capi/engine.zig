@@ -1589,6 +1589,7 @@ pub const Engine = struct {
                 .sockets = cfg.http3.sockets,
                 .enable_connect_protocol = cfg.http3.enable_connect_protocol,
                 .inline_no_wait = cfg.http3.inline_no_wait,
+                .send_memory = cfg.http3.send_memory,
                 .webtransport = wantsWebTransport(cfg),
             } else null,
         };
@@ -4189,6 +4190,7 @@ test {
     _ = @import("kafka_test.zig");
     _ = @import("parity_test.zig");
     if (features.grpc) _ = grpc;
+    if (features.http3) _ = wt;
     _ = net;
     _ = jobs;
     _ = webhooks;

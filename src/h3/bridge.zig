@@ -177,6 +177,66 @@ pub const Block = struct {
 };
 const block_data = @sizeOf(@FieldType(Block, "data"));
 
+/// The send blocks live across one HTTP/3 server's endpoints, as Linux's
+/// `tcp_mem` pressure mode (net/core/sock.c `__sk_mem_raise_allocated`):
+/// past `limit` every stream's cap drops to `send_floor` (each keeps that
+/// much, as a socket keeps its `wmem[0]`), a connection's datagram queue
+/// to `pressure_datagrams`, and new connections are refused, until usage
+/// is under 7/8 of it. The endpoints' pools fold their counts in every
+/// `fold_blocks` blocks, every millisecond of a busy driver and before an
+/// idle one waits, so `total` lags by less than that per endpoint (#172).
+pub const SendMemory = struct {
+    /// Blocks, as the pools folded them in.
+    total: std.atomic.Value(i64) align(std.atomic.cache_line) = .init(0),
+    /// Read by every capped write: on a line of its own, away from
+    /// `total`'s folds, and written only when it changes.
+    pressure: std.atomic.Value(bool) align(std.atomic.cache_line) = .init(false),
+    /// In blocks; set at init (tests change it).
+    limit: std.atomic.Value(i64),
+    /// Times pressure was entered.
+    entries: std.atomic.Value(u64) = .init(0),
+    /// When an endpoint last warned of it (`net.now`), so one warns.
+    warned_at: std.atomic.Value(u64) = .init(0),
+
+    /// A pool folds its count in once it moved this many blocks.
+    pub const fold_blocks = 64;
+    /// A connection's datagram queue under pressure.
+    pub const pressure_datagrams = 16;
+
+    pub fn init(limit_bytes: u64) SendMemory {
+        return .{ .limit = .init(@intCast(@max(1, std.math.divCeil(u64, limit_bytes, block_size) catch unreachable))) };
+    }
+
+    /// Whether the server is under pressure. Leaving it is decided here,
+    /// by readers, against the folded total, as the kernel leaves it on
+    /// the next allocation: a stale `true` cannot stick.
+    pub fn under(m: *SendMemory) bool {
+        if (!m.pressure.load(.monotonic)) return false;
+        const limit = m.limit.load(.monotonic);
+        if (m.total.load(.monotonic) < limit - @divTrunc(limit, 8)) {
+            m.pressure.store(false, .monotonic);
+            return false;
+        }
+        return true;
+    }
+
+    pub fn add(m: *SendMemory, d: i64) void {
+        m.check(m.total.fetchAdd(d, .monotonic) + d);
+    }
+
+    /// Enters pressure when `t` is past the limit. Each driver calls it
+    /// with the current total too (`foldSendMemory`), so a clear that raced an entry (a
+    /// reader's `under` on a stale total) is undone within a millisecond.
+    pub fn check(m: *SendMemory, t: i64) void {
+        if (t <= m.limit.load(.monotonic) or m.pressure.load(.monotonic)) return;
+        if (!m.pressure.swap(true, .monotonic)) _ = m.entries.fetchAdd(1, .monotonic);
+    }
+
+    pub fn bytes(m: *const SendMemory) u64 {
+        return @as(u64, @intCast(@max(0, m.total.load(.monotonic)))) * block_size;
+    }
+};
+
 /// Free blocks of one endpoint (or one client connection). All users run on
 /// the owner's executor; the spin lock only keeps other Io's safe.
 pub const BlockPool = struct {
@@ -198,6 +258,13 @@ pub const BlockPool = struct {
     /// When the window began (`trim`), in `net.now` nanoseconds; written
     /// by the owner only.
     window_start: u64 = 0,
+    /// The server's send memory, which `getSend`/`putSend` count into
+    /// (null: client pools, which count nothing). Set before first use.
+    send: ?*SendMemory = null,
+    /// Send blocks handed out and not yet returned, and how far that
+    /// moved since the last fold into `send`. Under `lock`.
+    send_live: u32 = 0,
+    send_delta: i32 = 0,
 
     /// How long a peak keeps its blocks.
     pub const window_ns: u64 = 2 * std.time.ns_per_s;
@@ -217,42 +284,95 @@ pub const BlockPool = struct {
     }
 
     pub fn get(p: *BlockPool) error{OutOfMemory}!*Block {
+        return p.take(false);
+    }
+
+    pub fn put(p: *BlockPool, b: *Block) void {
+        p.give(b, false);
+    }
+
+    /// `get` for a send queue: counted in `send_live` and the server's
+    /// send memory.
+    pub fn getSend(p: *BlockPool) error{OutOfMemory}!*Block {
+        return p.take(true);
+    }
+
+    /// `put` of a block from `getSend`.
+    pub fn putSend(p: *BlockPool, b: *Block) void {
+        p.give(b, true);
+    }
+
+    fn take(p: *BlockPool, comptime send: bool) error{OutOfMemory}!*Block {
         p.acquire();
         p.live += 1;
         if (p.live > p.peak) {
             p.peak = p.live;
             if (p.adaptive and p.peak > p.keep) p.keep = p.peak;
         }
+        const fold = if (send) p.countSend(1) else 0;
         if (p.free) |b| {
             p.free = b.next;
             p.free_count -= 1;
             p.lock.unlock();
+            if (send) p.publish(fold);
             b.next = null;
             return b;
         }
         p.lock.unlock();
+        if (send) p.publish(fold);
         const b = p.gpa.create(Block) catch |err| {
             p.acquire();
             p.live -= 1;
+            const back = if (send) p.countSend(-1) else 0;
             p.lock.unlock();
+            if (send) p.publish(back);
             return err;
         };
         b.next = null;
         return b;
     }
 
-    pub fn put(p: *BlockPool, b: *Block) void {
+    fn give(p: *BlockPool, b: *Block, comptime send: bool) void {
         p.acquire();
         p.live -= 1;
+        const fold = if (send) p.countSend(-1) else 0;
         if (p.free_count < p.keep) {
             b.next = p.free;
             p.free = b;
             p.free_count += 1;
             p.lock.unlock();
+            if (send) p.publish(fold);
             return;
         }
         p.lock.unlock();
+        if (send) p.publish(fold);
         p.gpa.destroy(b);
+    }
+
+    /// Under `lock`: counts `d` send blocks, and returns the delta to fold
+    /// into `send` once it reached `SendMemory.fold_blocks` (else 0).
+    fn countSend(p: *BlockPool, d: i32) i32 {
+        p.send_live = @intCast(@as(i64, p.send_live) + d);
+        p.send_delta += d;
+        if (@abs(p.send_delta) < SendMemory.fold_blocks) return 0;
+        defer p.send_delta = 0;
+        return p.send_delta;
+    }
+
+    /// After `lock`: what `countSend` returned, into the shared total.
+    fn publish(p: *BlockPool, d: i32) void {
+        if (d == 0) return;
+        if (p.send) |m| m.add(d);
+    }
+
+    /// Folds what the send count moved since the last fold. From any
+    /// thread; the driver calls it every millisecond and before it waits.
+    pub fn foldSend(p: *BlockPool) void {
+        p.acquire();
+        const d = p.send_delta;
+        p.send_delta = 0;
+        p.lock.unlock();
+        p.publish(d);
     }
 
     /// Adaptive: once a window has passed since the last, `keep` becomes
@@ -295,6 +415,12 @@ pub const BlockPool = struct {
         return p.live;
     }
 
+    pub fn sendLiveCount(p: *BlockPool) u32 {
+        p.acquire();
+        defer p.lock.unlock();
+        return p.send_live;
+    }
+
     pub fn pooled(p: *BlockPool) u32 {
         p.acquire();
         defer p.lock.unlock();
@@ -302,6 +428,9 @@ pub const BlockPool = struct {
     }
 
     pub fn deinit(p: *BlockPool) void {
+        // Every send block came back, and the server's total hears so.
+        if (builtin.is_test) std.debug.assert(p.send_live == 0);
+        p.foldSend();
         var it = p.free;
         while (it) |b| {
             it = b.next;
@@ -407,7 +536,13 @@ pub const SendQueue = struct {
     pub fn write(q: *SendQueue, pool: *BlockPool, budget: *Budget, bytes: []const u8, cap: usize, force: bool) error{OutOfMemory}!usize {
         var want = bytes.len;
         if (!force) {
-            want = @min(want, cap -| @as(usize, @intCast(q.buffered())));
+            // Under the server's send-memory pressure, every stream keeps
+            // its floor and no more (`SendMemory`).
+            var capped = cap;
+            if (pool.send) |m| if (m.under()) {
+                capped = @min(capped, send_floor);
+            };
+            want = @min(want, capped -| @as(usize, @intCast(q.buffered())));
             want = @min(want, budget.room());
         }
         var done: usize = 0;
@@ -440,12 +575,12 @@ pub const SendQueue = struct {
     }
 
     fn newBlock(q: *SendQueue, pool: *BlockPool) error{OutOfMemory}!*Block {
-        if (!q.keep_first or q.head != null) return pool.get();
+        if (!q.keep_first or q.head != null) return pool.getSend();
         if (q.first) |b| {
             b.next = null;
             return b;
         }
-        const b = try pool.get();
+        const b = try pool.getSend();
         q.first = b;
         return b;
     }
@@ -454,7 +589,7 @@ pub const SendQueue = struct {
     /// one it keeps.
     fn release(q: *SendQueue, pool: *BlockPool, b: *Block) void {
         if (b == q.first) return;
-        pool.put(b);
+        pool.putSend(b);
     }
 
     /// Gives back the block the queue keeps (`keep_first`). With nothing
@@ -463,7 +598,7 @@ pub const SendQueue = struct {
         std.debug.assert(q.head == null);
         const b = q.first orelse return;
         q.first = null;
-        pool.put(b);
+        pool.putSend(b);
     }
 
     /// The block holding offset `off` (>= acked), and its base.
@@ -856,4 +991,134 @@ test "send queue with keep_first keeps its first block across idle spells and gi
     q.deinit(&pool, &budget);
     q.releaseFirst(&pool);
     try std.testing.expectEqual(@as(u32, 0), pool.liveCount());
+}
+
+test "send memory: pools fold their send count every 64 blocks and on foldSend; get and put count nothing" {
+    const gpa = std.testing.allocator;
+    var m: SendMemory = .init(1 << 30);
+    var pool = BlockPool.init(gpa, 8);
+    pool.send = &m;
+    defer pool.deinit();
+    var held: [SendMemory.fold_blocks + 1]*Block = undefined;
+    for (held[0 .. SendMemory.fold_blocks - 1]) |*b| b.* = try pool.getSend();
+    // 63 blocks: still the pool's own.
+    try std.testing.expectEqual(@as(i64, 0), m.total.load(.monotonic));
+    held[SendMemory.fold_blocks - 1] = try pool.getSend();
+    try std.testing.expectEqual(@as(i64, SendMemory.fold_blocks), m.total.load(.monotonic));
+    held[SendMemory.fold_blocks] = try pool.getSend();
+    // Plain blocks (a receive queue's) are not send memory.
+    const r = try pool.get();
+    try std.testing.expectEqual(@as(u32, SendMemory.fold_blocks + 1), pool.send_live);
+    pool.put(r);
+    try std.testing.expectEqual(@as(i32, 1), pool.send_delta);
+    pool.foldSend();
+    try std.testing.expectEqual(@as(i64, SendMemory.fold_blocks + 1), m.total.load(.monotonic));
+    for (held) |b| pool.putSend(b);
+    // 65 back: one fold of -64, one block left to fold.
+    try std.testing.expectEqual(@as(i64, 1), m.total.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), pool.send_live);
+    pool.foldSend();
+    try std.testing.expectEqual(@as(i64, 0), m.total.load(.monotonic));
+}
+
+test "send memory: pressure is entered past the limit and left under 7/8 of it" {
+    var m: SendMemory = .init(64 * block_size);
+    try std.testing.expectEqual(@as(i64, 64), m.limit.load(.monotonic));
+    m.add(64);
+    try std.testing.expect(!m.under());
+    m.add(1);
+    try std.testing.expect(m.under());
+    try std.testing.expectEqual(@as(u64, 1), m.entries.load(.monotonic));
+    // Still past 7/8 (56 blocks): still under pressure, entered once.
+    m.add(-9);
+    try std.testing.expect(m.under());
+    m.add(10);
+    try std.testing.expectEqual(@as(u64, 1), m.entries.load(.monotonic));
+    m.add(-10);
+    try std.testing.expect(m.under());
+    m.add(-1);
+    try std.testing.expect(!m.under());
+    try std.testing.expect(!m.pressure.load(.monotonic));
+    // Rounding: a limit in bytes is a whole number of blocks, at least one.
+    try std.testing.expectEqual(@as(i64, 2), SendMemory.init(block_size + 1).limit.load(.monotonic));
+    try std.testing.expectEqual(@as(i64, 1), SendMemory.init(0).limit.load(.monotonic));
+}
+
+test "send memory: a stale true is cleared by the next reader, a stale false is re-entered by check" {
+    var m: SendMemory = .init(64 * block_size);
+    // A fold stored true on a total another fold has since lowered.
+    m.add(100);
+    m.add(-100);
+    try std.testing.expect(m.pressure.load(.monotonic));
+    try std.testing.expect(!m.under());
+    // A reader cleared it on a stale total while another fold entered:
+    // pressure reads false with the total past the limit, and no fold
+    // comes. The driver round's check enters it again.
+    m.total.store(100, .monotonic);
+    try std.testing.expect(!m.under());
+    m.check(m.total.load(.monotonic));
+    try std.testing.expect(m.under());
+    try std.testing.expectEqual(@as(u64, 2), m.entries.load(.monotonic));
+}
+
+test "send memory: a getSend the allocator refuses leaves the counts as they were" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var m: SendMemory = .init(1 << 30);
+    var pool = BlockPool.init(failing.allocator(), 0);
+    pool.send = &m;
+    defer pool.deinit();
+    try std.testing.expectError(error.OutOfMemory, pool.getSend());
+    try std.testing.expectEqual(@as(u32, 0), pool.send_live);
+    try std.testing.expectEqual(@as(i32, 0), pool.send_delta);
+    try std.testing.expectEqual(@as(u32, 0), pool.liveCount());
+    try std.testing.expectEqual(@as(i64, 0), m.total.load(.monotonic));
+}
+
+test "send queue under send-memory pressure: a capped write stops at the floor, a forced one passes, the budget is the same" {
+    const gpa = std.testing.allocator;
+    var m: SendMemory = .init(1 << 30);
+    var pool = BlockPool.init(gpa, 0);
+    pool.send = &m;
+    defer pool.deinit();
+    var budget = Budget.init(testIo(), 4 << 20);
+    const data = try gpa.alloc(u8, 256 * 1024);
+    defer gpa.free(data);
+    @memset(data, 5);
+    // Forced pressure: a limit of 0 is never left.
+    m.limit.store(0, .monotonic);
+    m.pressure.store(true, .monotonic);
+    var q: SendQueue = .{};
+    defer q.deinit(&pool, &budget);
+    // A message stream's 1 MiB cap and a path cap both stop at the floor.
+    try std.testing.expectEqual(send_floor, try q.write(&pool, &budget, data, 1 << 20, false));
+    try std.testing.expectEqual(@as(usize, 0), try q.write(&pool, &budget, data, pathCap(1 << 20, 4 << 20), false));
+    // A smaller cap still wins.
+    var q2: SendQueue = .{};
+    defer q2.deinit(&pool, &budget);
+    try std.testing.expectEqual(@as(usize, 1000), try q2.write(&pool, &budget, data, 1000, false));
+    // Forced writes pass; the budget's room is the connection's as before.
+    try std.testing.expectEqual(@as(usize, 1000), try q.write(&pool, &budget, data[0..1000], 0, true));
+    try std.testing.expectEqual((4 << 20) - send_floor - 2000, budget.room());
+    // Once the limit is back, the cap is the stream's own again.
+    m.limit.store(1 << 20, .monotonic);
+    try std.testing.expectEqual(@as(usize, 1000), try q2.write(&pool, &budget, data[0..1000], 1 << 20, false));
+    try std.testing.expect(!m.pressure.load(.monotonic));
+    q.deinit(&pool, &budget);
+    q2.deinit(&pool, &budget);
+    pool.foldSend();
+    try std.testing.expectEqual(@as(i64, 0), m.total.load(.monotonic));
+}
+
+test "send queue with no send memory (a client's pool) is capped as before" {
+    const gpa = std.testing.allocator;
+    var pool = BlockPool.init(gpa, 0);
+    defer pool.deinit();
+    var budget = Budget.init(testIo(), 4 << 20);
+    var q: SendQueue = .{};
+    defer q.deinit(&pool, &budget);
+    const data = try gpa.alloc(u8, 256 * 1024);
+    defer gpa.free(data);
+    @memset(data, 5);
+    try std.testing.expectEqual(data.len, try q.write(&pool, &budget, data, 1 << 20, false));
+    try std.testing.expectEqual(@as(u32, @intCast(std.math.divCeil(usize, data.len, block_data) catch unreachable)), pool.send_live);
 }

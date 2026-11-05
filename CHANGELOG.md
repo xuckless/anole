@@ -3,6 +3,65 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## 0.5.3 (2026-11-05)
+
+### Added
+
+- **HTTP/3 send-memory bound** (#172), on by default: a listener counts
+  the send buffers all its connections hold against
+  `http3.send_memory` (a quarter of the cgroup's `memory.max`, else of
+  RAM, at least 64 MiB). Past it, as Linux's `tcp_mem` pressure, every
+  stream's cap drops to 64 KiB, a WebTransport connection queues 16
+  datagrams, and new connections are refused with CONNECTION_REFUSED
+  until usage is under 7/8 of it. Before, nothing bounded the total
+  across connections. Metrics `anole_h3_send_memory_bytes`,
+  `anole_h3_send_pressure`, `anole_h3_send_pressure_entries_total` and
+  `anole_h3_connections_refused_total{reason="memory"}`; the key is in the
+  JSON config and the C ABI too. See docs/server.md "Response buffering".
+- **WebTransport datagrams without copies** (A2-1b, A2-1c):
+  `session.nextDatagram()` waits for the next datagram and returns the
+  received buffer itself; `takeDatagram`/`freeDatagram` (public again)
+  do the same without waiting; `sendDatagramOwned`/`trySendDatagramOwned`
+  move a buffer from `session.allocator()` into the connection's queue.
+  A forward between sessions of one server costs no allocation or copy.
+  See docs/webtransport.md "Datagrams".
+
+### Changed
+
+- WebTransport: a sent datagram no longer gets a copy with its quarter
+  stream ID in front (ngtcp2 takes the ID as its own vec), so
+  `sendDatagram` costs one allocation and one copy, and a C ABI datagram
+  one of each instead of two. `Session.Driver.takeDatagram`,
+  `freeDatagram` and `trySendDatagram` are gone: the first two are on
+  `Session`, the third is `trySendDatagramOwned`.
+
+### Fixed
+
+- C ABI: a WebTransport session's datagram queue no longer allocates or
+  frees under its spin lock, and no longer leaks datagrams when putting
+  back the ones the connection could not take; its capacity
+  (`datagram_queue`, now at most 4096) is set when the session opens.
+- Under saturation, a connection whose response went out at once no
+  longer waits a whole extra pass of the run queue for its next request
+  (#184): zio's no-park yield is charged to the running task only past a
+  spent tick, after 16 more operations without a park (Tokio's per-task
+  budget, Netty's count), not to whichever task the tick ends in.
+  On the box, json-comp at 4096 connections: p99 49.4 to 29.3 ms with
+  3.8% more requests per second; echo-ws at 16,384 connections: p99 34.1
+  to 20.2 ms.
+
+### Performance
+
+- WebSocket: the message arena is reset only after a receive that
+  allocated from it, so a relayed message that borrowed the read buffer
+  skips it (0.11-0.15 us per message, about 2% of relay CPU).
+- WebTransport: datagram sends and credit wake-ups are cheaper: a
+  datagram that goes out wakes waiting sessions only when a sender found
+  the queue full, and stream credit wakes only the sessions that waited
+  for that direction (A2-5). On the box, 8-12% fewer cycles per echoed
+  datagram.
+
+
 ## 0.5.2 (2026-11-04)
 
 ### Added

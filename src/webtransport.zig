@@ -43,7 +43,9 @@ const origin = @import("origin.zig");
 pub const Origins = origin.Origins;
 
 /// A session: `acceptStream`, `acceptUniStream`, `openStream`,
-/// `openUniStream`, `receiveDatagram`, `sendDatagram`, `close`.
+/// `openUniStream`, `receiveDatagram`, `sendDatagram`, `close`; datagrams
+/// without copies: `nextDatagram`, `takeDatagram`, `freeDatagram`,
+/// `sendDatagramOwned`, `trySendDatagramOwned`, `allocator`.
 pub const Session = engine.Session;
 /// One stream: `reader`, `writer`, `closeSend`, `reset`, `stopSending`,
 /// `release`.
