@@ -2,7 +2,9 @@
 //! the fork's `quiescent_state`: part of anole's suite (the core's own
 //! tests run on its stub zio, where every read is in lock mode).
 //! research/s15/lock-inventory.md §3, cases 1-6; case 7 is in zio's suite;
-//! case 8 is K7's table of slots (research/s2/tier2/k7-qsbr.md §1).
+//! case 8 is K7's table of slots (research/s2/tier2/k7-qsbr.md §1), on
+//! executors and again with no runtime (every section in lock mode,
+//! entries under the spin check).
 //!
 //! Objects live in pages of their own from the never-reuse allocator, so a
 //! read after a free faults at once instead of reading stale bytes, and
@@ -508,10 +510,11 @@ test "qsbr: a task that suspends inside a read section panics, naming where the 
 const Entry = struct {
     link: qsbr.Retired = .{ .destroy = destroyLink },
     obj: Obj,
+    gpa: std.mem.Allocator,
 
-    fn create(stats: *Stats, key: u32, version: u32) !*Entry {
-        const e = try object_gpa.create(Entry);
-        e.* = .{ .obj = .make(stats, @as(u64, key) << 32 | version) };
+    fn create(gpa: std.mem.Allocator, stats: *Stats, key: u32, version: u32) !*Entry {
+        const e = try gpa.create(Entry);
+        e.* = .{ .obj = .make(stats, @as(u64, key) << 32 | version), .gpa = gpa };
         return e;
     }
 
@@ -522,17 +525,21 @@ const Entry = struct {
     fn destroyLink(r: *qsbr.Retired) void {
         const e: *Entry = @fieldParentPtr("link", r);
         e.obj.destroy();
-        object_gpa.destroy(e);
+        e.gpa.destroy(e);
     }
 };
 
 const TableTest = struct {
+    /// 0: no runtime (`std.testing.io`), every section in lock mode and
+    /// the writers on `writer_threads` threads.
     executors: u6,
-    readers_per_executor: u32,
+    readers_per_executor: u32 = 0,
     /// Readers on threads that are not executors (lock mode), at most 8.
     threads: usize,
     iterations: u32,
     writers_per_executor: u32 = 2,
+    /// Writers on threads, with no runtime only; at most 8.
+    writer_threads: usize = 0,
     ops: u32,
     max_retired: u32,
 };
@@ -549,6 +556,8 @@ const Table = struct {
     domain: *qsbr.Domain,
     stats: *Stats,
     io: std.Io,
+    /// The entries' allocator.
+    gpa: std.mem.Allocator,
     t: TableTest,
     slots: [n_slots]std.atomic.Value(?*Entry) = @splat(.init(null)),
     next_version: std.atomic.Value(u32) = .init(1),
@@ -613,6 +622,13 @@ const Table = struct {
         return taskResult(tb.stats, "a writer", tb.write(seed));
     }
 
+    fn writerThread(tb: *Table, seed: u64) void {
+        tb.write(seed) catch |err| {
+            std.debug.print("a writer thread failed: {t}\n", .{err});
+            _ = tb.stats.failures.fetchAdd(1, .monotonic);
+        };
+    }
+
     /// Fills and replaces (7 in 10) and removes, as K7's request tasks and
     /// sweep do.
     fn write(tb: *Table, seed: u64) !void {
@@ -621,7 +637,7 @@ const Table = struct {
         for (0..tb.t.ops) |_| {
             const k = r.uintLessThan(u32, n_keys);
             if (r.uintLessThan(u32, 10) < 7) _ = try tb.fill(k) else tb.remove(k);
-            try zio.yield();
+            if (tb.t.executors == 0) std.Thread.yield() catch {} else try zio.yield();
         }
     }
 
@@ -657,7 +673,7 @@ const Table = struct {
     fn fill(tb: *Table, k: u32) !bool {
         if (tb.gated()) return false;
         const slots = slotsOf(k);
-        const new = try Entry.create(tb.stats, k, tb.next_version.fetchAdd(1, .monotonic));
+        const new = try Entry.create(tb.gpa, tb.stats, k, tb.next_version.fetchAdd(1, .monotonic));
         const at: u8 = publish: for (0..2) |_| {
             if (tb.find(k, &slots)) |f| {
                 if (tb.slots[f.slot].cmpxchgStrong(f.e, new, .seq_cst, .seq_cst) == null) {
@@ -697,7 +713,7 @@ fn slotTable(t: TableTest) !void {
     var d: qsbr.Domain = undefined;
     d.init(io, .{ .max_retired = t.max_retired });
     defer d.deinit();
-    var tb: Table = .{ .domain = &d, .stats = &stats, .io = io, .t = t };
+    var tb: Table = .{ .domain = &d, .stats = &stats, .io = io, .gpa = object_gpa, .t = t };
     {
         var pool: [8]std.Thread = undefined;
         var started: usize = 0;
@@ -717,6 +733,49 @@ fn slotTable(t: TableTest) !void {
         }
         try group.await(io);
     }
+    try checkTable(&tb, io);
+}
+
+/// The lock-mode table: no runtime, readers and writers on threads, every
+/// section (the readers' and the writers' `find`) under the domain's spin
+/// lock, and the entries from a `SpinCheckedAllocator`, so an allocation
+/// that slips into a section panics (L5). Frees then wait only for
+/// references (`rt` is null).
+fn slotTableLocked(t: TableTest) !void {
+    const io = std.testing.io;
+    var checked: safety.SpinCheckedAllocator = .init(object_gpa);
+    var stats: Stats = .{};
+    var d: qsbr.Domain = undefined;
+    d.init(io, .{ .max_retired = t.max_retired });
+    defer d.deinit();
+    var tb: Table = .{ .domain = &d, .stats = &stats, .io = io, .gpa = checked.allocator(), .t = t };
+    {
+        var readers: [8]std.Thread = undefined;
+        var started: usize = 0;
+        defer {
+            tb.stop.store(true, .release);
+            for (readers[0..started]) |th| th.join();
+        }
+        for (readers[0..t.threads], 0..) |*th, i| {
+            th.* = try std.Thread.spawn(.{}, Table.thread, .{ &tb, 0x7ab1e000 + i });
+            started += 1;
+        }
+        var writers: [8]std.Thread = undefined;
+        var wstarted: usize = 0;
+        defer for (writers[0..wstarted]) |th| th.join();
+        for (writers[0..t.writer_threads], 0..) |*th, i| {
+            th.* = try std.Thread.spawn(.{}, Table.writerThread, .{ &tb, 1 << 48 | i });
+            wstarted += 1;
+        }
+    }
+    try checkTable(&tb, io);
+}
+
+/// After the writers: no duplicate key, the `pending()` gate, then the
+/// table emptied with nothing torn, leaked or left retired.
+fn checkTable(tb: *Table, io: std.Io) !void {
+    const d = tb.domain;
+    const stats = tb.stats;
     // The writers are done: no key is left in both of its slots.
     var dups: u32 = 0;
     for (0..Table.n_keys) |k| {
@@ -729,15 +788,16 @@ fn slotTable(t: TableTest) !void {
     {
         // The gate: with half of max_retired held retired by counted
         // references, a fill skips.
-        var cell: ObjCell = try .init(&d, object_gpa, .make(&stats, 0));
+        var cell: ObjCell = try .init(d, tb.gpa, .make(stats, 0));
         defer cell.deinit();
         var held: [32]ObjCell.Ref = undefined;
-        const half = held[0 .. t.max_retired / 2];
-        for (half) |*h| {
+        var taken: usize = 0;
+        defer for (held[0..taken]) |h| h.release();
+        for (held[0 .. tb.t.max_retired / 2]) |*h| {
             h.* = cell.acquire(io);
-            try cell.store(.make(&stats, 0));
+            taken += 1;
+            try cell.store(.make(stats, 0));
         }
-        defer for (half) |h| h.release();
         const skipped = tb.skipped.load(.monotonic);
         try std.testing.expect(!try tb.fill(0));
         try std.testing.expectEqual(skipped + 1, tb.skipped.load(.monotonic));
@@ -758,6 +818,15 @@ test "qsbr: a table of atomic slots, filled, replaced and removed by tasks on ev
 test "qsbr: a table of atomic slots, filled, replaced and removed by tasks on every executor under many readers (executor and lock mode), never shows a freed or torn object, keeps no key twice and leaks nothing [stress]" {
     try wait.requireStress();
     try slotTable(.{ .executors = 8, .readers_per_executor = 64, .threads = 8, .iterations = 2000, .ops = 2000, .max_retired = 64 });
+}
+
+test "qsbr: the table of atomic slots with no runtime (every section in lock mode, writers and readers on threads, entries under the spin check) never shows a freed or torn object, keeps no key twice and leaks nothing" {
+    try slotTableLocked(.{ .executors = 0, .threads = 4, .writer_threads = 4, .iterations = 100, .ops = 200, .max_retired = 8 });
+}
+
+test "qsbr: the table of atomic slots with no runtime (every section in lock mode, writers and readers on threads, entries under the spin check) never shows a freed or torn object, keeps no key twice and leaks nothing [stress]" {
+    try wait.requireStress();
+    try slotTableLocked(.{ .executors = 0, .threads = 8, .writer_threads = 8, .iterations = 2000, .ops = 2000, .max_retired = 64 });
 }
 
 // ---- Writers at the retire list's cap ----
