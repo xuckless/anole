@@ -3,7 +3,7 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
-## Unreleased
+## 0.5.3 (2026-11-05)
 
 ### Added
 
@@ -46,6 +46,20 @@ breaking changes are listed anyway.
   (#184): zio's no-park yield is charged to the running task only past a
   spent tick, after 16 more operations without a park (Tokio's per-task
   budget, Netty's count), not to whichever task the tick ends in.
+  On the box, json-comp at 4096 connections: p99 49.4 to 29.3 ms with
+  3.8% more requests per second; echo-ws at 16,384 connections: p99 34.1
+  to 20.2 ms.
+
+### Performance
+
+- WebSocket: the message arena is reset only after a receive that
+  allocated from it, so a relayed message that borrowed the read buffer
+  skips it (0.11-0.15 us per message, about 2% of relay CPU).
+- WebTransport: datagram sends and credit wake-ups are cheaper: a
+  datagram that goes out wakes waiting sessions only when a sender found
+  the queue full, and stream credit wakes only the sessions that waited
+  for that direction (A2-5). On the box, 8-12% fewer cycles per echoed
+  datagram.
 
 
 ## 0.5.2 (2026-11-04)

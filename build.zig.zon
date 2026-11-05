@@ -1,6 +1,6 @@
 .{
     .name = .anole,
-    .version = "0.5.2",
+    .version = "0.5.3",
     .fingerprint = 0xe9214b117feef58, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
@@ -53,16 +53,13 @@
         // the tick is spent and checks held locks (4286fa0; D10), and
         // Loop.idle_ns, the time epoll and kqueue sleep in a waiting poll, for
         // the WebSocket admission gate's utilization (#129; 5506ac2, 40c6f9f).
-        // Batch 2B (#184, fork worktree s2b a77def3 + 806b5e4, not pushed):
-        // the no-park yield is charged to the task past a spent tick
-        // (yieldIfOverrun). Until the integration re-pins by commit, build on
-        // the box only: build.sh's Mac slot rsyncs this worktree but not
-        // ../zio-2b (hold mac.lock: `flock ~/Dev/anole-wt/.build/mac.lock
-        // ~/Dev/anole-wt/build.sh ...`). The released pin was:
-        //   .url = "git+https://github.com/xuckless/zio#47ad429a2e605d6bef18779fbf96c5f2d648bb22",
-        //   .hash = "zio-0.19.0-xHbVVDQaLwAXP3onRbo4O9yrKZU3VzTnUNJDaVeVzK_p",
+        // Plus S2 batch 2B (0.5.3; anole-diag 806b5e4, fork only): a no-park
+        // yield point past a spent tick yields only after 16 more operations
+        // without a park, charged to the task that overran (yieldIfOverrun;
+        // #184; a77def3, 806b5e4).
         .zio = .{
-            .path = "../zio-2b",
+            .url = "git+https://github.com/xuckless/zio#806b5e4fa82592564f4e788ab4797370e43a99a5",
+            .hash = "zio-0.19.0-xHbVVIMtLwDVv7QRh5xtsF5I6CLdB5cRG41W5o5Yn6M8",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{

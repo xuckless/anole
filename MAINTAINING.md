@@ -206,8 +206,11 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   tracks a wider p99 at saturation since). `Loop.idle_ns` (fork only,
   5506ac2, 40c6f9f): the time epoll and kqueue spend asleep in a waiting
   poll (libuv's `uv_metrics_idle_time` bracket), null on io_uring; the
-  WebSocket admission gate (#129) reads it per executor. Pinned at
-  47ad429 on `anole-diag` (0.5.2).
+  WebSocket admission gate (#129) reads it per executor. #184 (fork
+  only, a77def3, 806b5e4): past a spent tick, the no-park yield point
+  yields only after `no_park_grace` (16) more operations without a park,
+  charged to the task that overran (`yieldIfOverrun`). Pinned at 806b5e4
+  on `anole-diag` (0.5.3).
   Windows IOCP (#139, 4c04fd0 on `anole`, 56e57f6 on `anole-diag`): an
   AF_UNIX connect goes through a plain connect() (as .NET and Go do)
   instead of a wildcard bind and ConnectEx (the all-NUL AF_UNIX wildcard is
