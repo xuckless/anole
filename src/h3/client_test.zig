@@ -750,7 +750,12 @@ fn pressureEntered(ep: *Endpoint) bool {
 }
 
 /// Six streams, each at its floor, a partly filled block and the block it
-/// keeps, at most.
+/// keeps, at most. Once a paused reader's credit has run out and the rest
+/// is acknowledged, its stream holds `send_floor` with or without pressure
+/// (`pathCap` of nothing in flight), so this is a sanity bound on what the
+/// paused streams keep, not a check of the pressure cap: that one only
+/// shows while data is in flight, and the `SendQueue.write` unit test in
+/// bridge.zig checks it deterministically.
 fn heldToFloors(ep: *Endpoint) bool {
     return ep.blocks.sendLiveCount() <= 6 * (bridge.send_floor / bridge.block_size + 2);
 }
@@ -799,7 +804,7 @@ test "h3 server: past its send-memory limit every stream holds its floor, and th
         opened += 1;
     }
     try wait.waitUntil(io, "send-memory pressure", f.ep, pressureEntered);
-    try wait.waitUntil(io, "every stream at its floor", f.ep, heldToFloors);
+    try wait.waitUntil(io, "the paused streams down to their floors", f.ep, heldToFloors);
     // The connections already open carry on: every download completes.
     for (streams) |st| {
         try st.waitHead();

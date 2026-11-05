@@ -183,8 +183,8 @@ const block_data = @sizeOf(@FieldType(Block, "data"));
 /// much, as a socket keeps its `wmem[0]`), a connection's datagram queue
 /// to `pressure_datagrams`, and new connections are refused, until usage
 /// is under 7/8 of it. The endpoints' pools fold their counts in every
-/// `fold_blocks` blocks and at the end of each driver round, so `total`
-/// lags by less than that per endpoint (#172).
+/// `fold_blocks` blocks, every millisecond of a busy driver and before an
+/// idle one waits, so `total` lags by less than that per endpoint (#172).
 pub const SendMemory = struct {
     /// Blocks, as the pools folded them in.
     total: std.atomic.Value(i64) align(std.atomic.cache_line) = .init(0),
@@ -224,9 +224,9 @@ pub const SendMemory = struct {
         m.check(m.total.fetchAdd(d, .monotonic) + d);
     }
 
-    /// Enters pressure when `t` is past the limit. Each driver round calls
-    /// it with the current total too, so a clear that raced an entry (a
-    /// reader's `under` on a stale total) is undone within a round.
+    /// Enters pressure when `t` is past the limit. Each driver calls it
+    /// with the current total too (`foldSendMemory`), so a clear that raced an entry (a
+    /// reader's `under` on a stale total) is undone within a millisecond.
     pub fn check(m: *SendMemory, t: i64) void {
         if (t <= m.limit.load(.monotonic) or m.pressure.load(.monotonic)) return;
         if (!m.pressure.swap(true, .monotonic)) _ = m.entries.fetchAdd(1, .monotonic);
@@ -366,7 +366,7 @@ pub const BlockPool = struct {
     }
 
     /// Folds what the send count moved since the last fold. From any
-    /// thread; the driver calls it at the end of each round.
+    /// thread; the driver calls it every millisecond and before it waits.
     pub fn foldSend(p: *BlockPool) void {
         p.acquire();
         const d = p.send_delta;

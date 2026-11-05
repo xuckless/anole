@@ -891,7 +891,12 @@ its 64 KiB. It is a soft bound: while under pressure the open connections
 may still hold, beyond the limit, each up to
 `min(4 MiB, active streams x (64 KiB + about 32 KiB))`, plus one inline
 `no_wait` body and the datagrams queued before. What it stops is the
-number of connections growing. `anole_h3_send_memory_bytes`,
+number of connections growing. Pressure lasts as long as that memory is
+held: peers that keep their connections alive (acknowledging and pinging)
+but never grant stream credit keep their buffers, and so the refusal, for
+as long as they like (the h3 server has no write-stall timeout yet). New
+HTTP/3 clients are refused meanwhile; browsers fall back to TCP through
+Alt-Svc, so HTTP/1.1 and HTTP/2 keep serving. `anole_h3_send_memory_bytes`,
 `anole_h3_send_pressure` and `anole_h3_connections_refused_total` show it
 (docs/observability.md), and the server warns when it enters pressure. A
 limit set too low holds every download to 64 KiB per round trip; the

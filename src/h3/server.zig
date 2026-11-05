@@ -102,6 +102,11 @@ fn holdUntil(held: bool, until: u64, ts: u64) u64 {
 const socket_buffer = 4 << 20;
 /// Stateless resets sent per second at most (ngtcp2's examples' figure).
 const stateless_reset_burst = 100;
+/// How often a busy driver folds its send blocks' leftover into the
+/// listener's total (`Endpoint.foldSendMemory`); an idle one folds before
+/// it waits. The pools fold every 64 blocks anyway: this keeps the shared
+/// line out of every round.
+const send_fold_ns = std.time.ns_per_ms;
 /// Retries an endpoint remembers (`Endpoint.retried`), and for how long:
 /// as long as a Retry's token is good.
 const retried_len = 64;
@@ -454,6 +459,8 @@ pub fn Endpoint(comptime Ctx: type) type {
         /// `Shared.send_memory.entries` when this endpoint last looked
         /// (`foldSendMemory`).
         send_entries_seen: u64 = 0,
+        /// When it last folded (`foldSendMemory`).
+        send_fold_at: u64 = 0,
         /// Stateless resets left in the current second.
         reset_budget: u32 = 0,
         reset_window: u64 = 0,
@@ -935,6 +942,9 @@ pub fn Endpoint(comptime Ctx: type) type {
                     // more than its floor.
                     const next = @min(self.nextTimer(), self.blocks.trimAt());
                     if (next > t) {
+                        // Whatever the send blocks moved since the last
+                        // fold, before going quiet.
+                        self.foldSendMemory(t);
                         const wait: std.Io.Timeout = if (next == std.math.maxInt(u64)) .none else .{ .duration = .{
                             .raw = .fromNanoseconds(@intCast(next - t)),
                             .clock = .awake,
@@ -971,14 +981,16 @@ pub fn Endpoint(comptime Ctx: type) type {
             const t = now(self.io);
             while (self.timers.items.len > 0 and self.timers.items[0].timer_at <= t) self.timers.items[0].service();
             self.blocks.trim(t);
-            self.foldSendMemory(t);
+            if (t -% self.send_fold_at >= send_fold_ns) self.foldSendMemory(t);
         }
 
         /// Publishes what this endpoint's send blocks moved, and checks the
         /// total, so a pressure flag a reader cleared on a stale total is
-        /// set again within a round. Warns of pressure once per 10 s.
+        /// set again within `send_fold_ns` (or before the driver waits).
+        /// Warns of pressure once per 10 s.
         fn foldSendMemory(self: *Self, t: u64) void {
             const m = &self.shared.send_memory;
+            self.send_fold_at = t;
             self.blocks.foldSend();
             m.check(m.total.load(.monotonic));
             const entries = m.entries.load(.monotonic);
