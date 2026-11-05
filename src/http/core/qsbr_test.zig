@@ -1,7 +1,8 @@
 //! The QSBR helper (src/http/core/qsbr.zig) on the real zio runtime, with
 //! the fork's `quiescent_state`: part of anole's suite (the core's own
 //! tests run on its stub zio, where every read is in lock mode).
-//! research/s15/lock-inventory.md §3, cases 1-6; case 7 is in zio's suite.
+//! research/s15/lock-inventory.md §3, cases 1-6; case 7 is in zio's suite;
+//! case 8 is K7's table of slots (research/s2/tier2/k7-qsbr.md §1).
 //!
 //! Objects live in pages of their own from the never-reuse allocator, so a
 //! read after a free faults at once instead of reading stale bytes, and
@@ -498,6 +499,265 @@ test "qsbr: a task that suspends inside a read section panics, naming where the 
             }
         }
     }
+}
+
+// ---- 8. A table of slots (K7's index) ----
+
+/// An object in the table: `obj.gen` holds its key in the high 32 bits and
+/// a version in the low ones (the checksum covers both).
+const Entry = struct {
+    link: qsbr.Retired = .{ .destroy = destroyLink },
+    obj: Obj,
+
+    fn create(stats: *Stats, key: u32, version: u32) !*Entry {
+        const e = try object_gpa.create(Entry);
+        e.* = .{ .obj = .make(stats, @as(u64, key) << 32 | version) };
+        return e;
+    }
+
+    fn keyOf(e: *const Entry) u32 {
+        return @intCast(e.obj.gen >> 32);
+    }
+
+    fn destroyLink(r: *qsbr.Retired) void {
+        const e: *Entry = @fieldParentPtr("link", r);
+        e.obj.destroy();
+        object_gpa.destroy(e);
+    }
+};
+
+const TableTest = struct {
+    executors: u6,
+    readers_per_executor: u32,
+    /// Readers on threads that are not executors (lock mode), at most 8.
+    threads: usize,
+    iterations: u32,
+    writers_per_executor: u32 = 2,
+    ops: u32,
+    max_retired: u32,
+};
+
+/// 256 atomic slots, two choices per key (k7-qsbr §2), read through
+/// `Domain.enter`; writers follow k7-qsbr §5's publish rule. The
+/// never-reuse allocator rules out ABA on a kept pointer here; in K7 a
+/// stale cmpxchg only removes a valid entry (one miss), and whoever wins a
+/// cmpxchg retires what it took out, once.
+const Table = struct {
+    const n_slots = 256;
+    const n_keys = 384;
+
+    domain: *qsbr.Domain,
+    stats: *Stats,
+    io: std.Io,
+    t: TableTest,
+    slots: [n_slots]std.atomic.Value(?*Entry) = @splat(.init(null)),
+    next_version: std.atomic.Value(u32) = .init(1),
+    /// Writes skipped at the gate (`pending()`), and fills with no slot.
+    skipped: std.atomic.Value(u64) = .init(0),
+    skipped_table: std.atomic.Value(u64) = .init(0),
+    stop: std.atomic.Value(bool) = .init(false),
+
+    fn slotsOf(k: u32) [2]u8 {
+        const h1: u8 = @truncate(std.hash.Wyhash.hash(1, std.mem.asBytes(&k)));
+        const h2: u8 = @truncate(std.hash.Wyhash.hash(2, std.mem.asBytes(&k)));
+        return .{ h1, if (h2 == h1) h1 ^ 1 else h2 };
+    }
+
+    const Copy = struct { gen: u64, payload: [64]u8, checksum: u64 };
+
+    /// One request: 1-3 lookups in one read section, the payloads copied
+    /// into a buffer taken before it, the copies checked after `end`.
+    fn lookup(tb: *Table, io: std.Io, r: std.Random) void {
+        var out: [3]Copy = undefined;
+        var keys: [3]u32 = undefined;
+        const want = 1 + r.uintLessThan(usize, 3);
+        for (keys[0..want]) |*k| k.* = r.uintLessThan(u32, n_keys);
+        var n: usize = 0;
+        var bad: u64 = 0;
+        const s = tb.domain.enter(io);
+        for (keys[0..want]) |k| {
+            for (slotsOf(k)) |i| {
+                const e = tb.slots[i].load(.seq_cst) orelse continue;
+                // Whatever a slot holds is intact and hashes there.
+                const home = slotsOf(e.keyOf());
+                if (!e.obj.intact() or (home[0] != i and home[1] != i)) bad += 1;
+                if (e.keyOf() != k) continue;
+                out[n] = .{ .gen = e.obj.gen, .payload = e.obj.payload, .checksum = e.obj.checksum };
+                n += 1;
+                break;
+            }
+        }
+        s.end();
+        for (out[0..n]) |c| {
+            if (std.hash.Wyhash.hash(c.gen, &c.payload) != c.checksum) bad += 1;
+        }
+        if (bad != 0) _ = tb.stats.failures.fetchAdd(bad, .monotonic);
+    }
+
+    fn reader(tb: *Table, io: std.Io, seed: u64) std.Io.Cancelable!void {
+        var prng: std.Random.DefaultPrng = .init(seed);
+        for (0..tb.t.iterations) |i| {
+            tb.lookup(io, prng.random());
+            if (i % 16 == 15) try zio.yield();
+        }
+    }
+
+    /// On a thread that is not an executor: `enter` is in lock mode.
+    fn thread(tb: *Table, seed: u64) void {
+        var prng: std.Random.DefaultPrng = .init(seed);
+        var n: u32 = 0;
+        while (n < tb.t.iterations or !tb.stop.load(.acquire)) : (n += 1) tb.lookup(tb.io, prng.random());
+    }
+
+    fn writer(tb: *Table, seed: u64) std.Io.Cancelable!void {
+        return taskResult(tb.stats, "a writer", tb.write(seed));
+    }
+
+    /// Fills and replaces (7 in 10) and removes, as K7's request tasks and
+    /// sweep do.
+    fn write(tb: *Table, seed: u64) !void {
+        var prng: std.Random.DefaultPrng = .init(seed);
+        const r = prng.random();
+        for (0..tb.t.ops) |_| {
+            const k = r.uintLessThan(u32, n_keys);
+            if (r.uintLessThan(u32, 10) < 7) _ = try tb.fill(k) else tb.remove(k);
+            try zio.yield();
+        }
+    }
+
+    /// A writer skips at half of `max_retired`. K7's trim loop polls
+    /// (`pollAll`); here the writer that skips does.
+    fn gated(tb: *Table) bool {
+        if (tb.domain.pending() < tb.t.max_retired / 2) return false;
+        _ = tb.skipped.fetchAdd(1, .monotonic);
+        tb.domain.poll();
+        return true;
+    }
+
+    const Found = struct { slot: u8, e: *Entry };
+
+    /// The first of `slots` holding `k`'s entry: the key is read inside a
+    /// read section, and the pointer is kept only for a cmpxchg and a
+    /// retire, never dereferenced after `end`.
+    fn find(tb: *Table, k: u32, slots: []const u8) ?Found {
+        const s = tb.domain.enter(tb.io);
+        defer s.end();
+        for (slots) |i| {
+            const e = tb.slots[i].load(.seq_cst) orelse continue;
+            if (e.keyOf() == k) return .{ .slot = i, .e = e };
+        }
+        return null;
+    }
+
+    /// k7-qsbr §5: replace this key's entry, else take the first empty of
+    /// its two slots in fixed order, rescanning once; after publishing,
+    /// take out a copy a racing writer put in the other slot (seq_cst
+    /// store then load on both sides: at least one of two racers sees the
+    /// other). Whether `k` was published.
+    fn fill(tb: *Table, k: u32) !bool {
+        if (tb.gated()) return false;
+        const slots = slotsOf(k);
+        const new = try Entry.create(tb.stats, k, tb.next_version.fetchAdd(1, .monotonic));
+        const at: u8 = publish: for (0..2) |_| {
+            if (tb.find(k, &slots)) |f| {
+                if (tb.slots[f.slot].cmpxchgStrong(f.e, new, .seq_cst, .seq_cst) == null) {
+                    tb.domain.retire(&f.e.link);
+                    break :publish f.slot;
+                }
+                continue;
+            }
+            for (slots) |i| {
+                if (tb.slots[i].cmpxchgStrong(null, new, .seq_cst, .seq_cst) == null) break :publish i;
+            }
+        } else {
+            // Never published: freed at once.
+            _ = tb.skipped_table.fetchAdd(1, .monotonic);
+            Entry.destroyLink(&new.link);
+            return false;
+        };
+        const other = if (at == slots[0]) slots[1] else slots[0];
+        if (tb.find(k, &.{other})) |dup| {
+            if (tb.slots[other].cmpxchgStrong(dup.e, null, .seq_cst, .seq_cst) == null) tb.domain.retire(&dup.e.link);
+        }
+        return true;
+    }
+
+    fn remove(tb: *Table, k: u32) void {
+        if (tb.gated()) return;
+        const f = tb.find(k, &slotsOf(k)) orelse return;
+        if (tb.slots[f.slot].cmpxchgStrong(f.e, null, .seq_cst, .seq_cst) == null) tb.domain.retire(&f.e.link);
+    }
+};
+
+fn slotTable(t: TableTest) !void {
+    const rt = try startRuntime(t.executors);
+    defer rt.deinit();
+    const io = rt.io();
+    var stats: Stats = .{};
+    var d: qsbr.Domain = undefined;
+    d.init(io, .{ .max_retired = t.max_retired });
+    defer d.deinit();
+    var tb: Table = .{ .domain = &d, .stats = &stats, .io = io, .t = t };
+    {
+        var pool: [8]std.Thread = undefined;
+        var started: usize = 0;
+        defer {
+            tb.stop.store(true, .release);
+            for (pool[0..started]) |th| th.join();
+        }
+        for (pool[0..t.threads], 0..) |*th, i| {
+            th.* = try std.Thread.spawn(.{}, Table.thread, .{ &tb, 0x7ab1e000 + i });
+            started += 1;
+        }
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        for (0..t.executors) |e| {
+            for (0..t.readers_per_executor) |i| try placement.concurrent(&group, io, .{ .executor = e }, Table.reader, .{ &tb, io, e << 32 | i });
+            for (0..t.writers_per_executor) |i| try placement.concurrent(&group, io, .{ .executor = e }, Table.writer, .{ &tb, 1 << 48 | e << 32 | i });
+        }
+        try group.await(io);
+    }
+    // The writers are done: no key is left in both of its slots.
+    var dups: u32 = 0;
+    for (0..Table.n_keys) |k| {
+        const slots = Table.slotsOf(@intCast(k));
+        const a = tb.slots[slots[0]].load(.seq_cst) orelse continue;
+        const b = tb.slots[slots[1]].load(.seq_cst) orelse continue;
+        if (a.keyOf() == k and b.keyOf() == k) dups += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 0), dups);
+    {
+        // The gate: with half of max_retired held retired by counted
+        // references, a fill skips.
+        var cell: ObjCell = try .init(&d, object_gpa, .make(&stats, 0));
+        defer cell.deinit();
+        var held: [32]ObjCell.Ref = undefined;
+        const half = held[0 .. t.max_retired / 2];
+        for (half) |*h| {
+            h.* = cell.acquire(io);
+            try cell.store(.make(&stats, 0));
+        }
+        defer for (half) |h| h.release();
+        const skipped = tb.skipped.load(.monotonic);
+        try std.testing.expect(!try tb.fill(0));
+        try std.testing.expectEqual(skipped + 1, tb.skipped.load(.monotonic));
+    }
+    for (&tb.slots) |*slot| {
+        if (slot.swap(null, .seq_cst)) |e| d.retire(&e.link);
+    }
+    try d.synchronize(io);
+    try std.testing.expectEqual(@as(u64, 0), stats.failures.load(.acquire));
+    try std.testing.expectEqual(stats.created.load(.acquire), stats.freed.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), d.pending());
+}
+
+test "qsbr: a table of atomic slots, filled, replaced and removed by tasks on every executor under many readers (executor and lock mode), never shows a freed or torn object, keeps no key twice and leaks nothing" {
+    try slotTable(.{ .executors = 4, .readers_per_executor = 4, .threads = 2, .iterations = 100, .ops = 200, .max_retired = 8 });
+}
+
+test "qsbr: a table of atomic slots, filled, replaced and removed by tasks on every executor under many readers (executor and lock mode), never shows a freed or torn object, keeps no key twice and leaks nothing [stress]" {
+    try wait.requireStress();
+    try slotTable(.{ .executors = 8, .readers_per_executor = 64, .threads = 8, .iterations = 2000, .ops = 2000, .max_retired = 64 });
 }
 
 // ---- Writers at the retire list's cap ----
