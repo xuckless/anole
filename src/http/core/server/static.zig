@@ -7,6 +7,8 @@ const builtin = @import("builtin");
 const http = @import("../http.zig");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
+const static_cache = @import("static_cache.zig");
+const StaticCache = static_cache.StaticCache;
 
 /// How `app.static` and `app.staticDir` serve a directory:
 /// `try app.staticDir("/", "public", .{ .precompressed = &.{ .br, .gzip } })`.
@@ -42,6 +44,11 @@ pub const StaticOptions = struct {
     /// Sent as `Cache-Control` with a 200, 206 or 304, such as
     /// "public, max-age=3600". Copied by the router.
     cache_control: ?[]const u8 = null,
+    /// Keep small files of this directory in the server's static file
+    /// cache (`ServerOptions.static_cache`; Linux only for now): a file is
+    /// read once and then served from memory while a stat per request
+    /// shows it unchanged. `false` serves every request from the file.
+    cache: bool = true,
 };
 
 /// `candidates` in the order to try them for `req`: by the client's
@@ -78,7 +85,7 @@ pub const Precompressed = enum {
         return @tagName(self);
     }
 
-    fn extension(self: Precompressed) []const u8 {
+    pub fn extension(self: Precompressed) []const u8 {
         return switch (self) {
             .br => ".br",
             .zstd => ".zst",
@@ -95,6 +102,9 @@ pub const Static = struct {
     /// The real path of `dir`, read when the server starts, for the
     /// real-path check of `resolve_beneath`. Null until then.
     root_real: ?[]const u8 = null,
+    /// The server's static file cache, set when the server starts if
+    /// `options.cache` and the server has one.
+    cache: ?*StaticCache = null,
 
     /// The wildcard the routes capture the path under.
     pub const param = "path";
@@ -111,11 +121,12 @@ pub const Static = struct {
     pub fn serve(self: *const Static, req: *Request, res: *Response) !bool {
         const raw = req.params.get(param) orelse "";
         const sub_path = try cleanPath(req.arena, raw, self.options.hide_dotfiles) orelse return false;
+        if (self.cache) |cache| if (try self.serveCached(cache, req, res, sub_path)) return true;
         const open: Response.SendFileOptions = .{ .resolve_beneath = self.options.resolve_beneath, ._root_real = self.root_real };
 
         const url_path = urlPath(req.url);
         var served = sub_path;
-        var stat = blk: {
+        const plain = blk: {
             if (sub_path.len > 0) {
                 if (res.sendFile(self.dir, sub_path, open)) |stat| {
                     // A file is not a directory to have a slash after it.
@@ -147,13 +158,9 @@ pub const Static = struct {
             };
         };
 
-        res.content_type = .fromExtension(extension(served));
-
+        var stat = plain;
         var encoding: ?Precompressed = null;
         if (self.options.precompressed.len > 0) {
-            // Which file is served depends on Accept-Encoding, whichever it
-            // turns out to be.
-            try addVary(req, res);
             var order: [8]Precompressed = undefined;
             for (byQuality(req, self.options.precompressed, &order)) |candidate| {
                 const path = try std.mem.concat(req.arena, u8, &.{ served, candidate.extension() });
@@ -166,6 +173,25 @@ pub const Static = struct {
                 }
             }
         }
+        try self.respond(req, res, served, stat, encoding);
+
+        // The index is left out: its bytes would be kept under the
+        // directory's path. A HEAD, a 304, a 412 or a range is too.
+        if (self.cache) |cache| if (served.ptr == sub_path.ptr and req.method == .get and res.status == .ok) {
+            const file = res.file orelse return true;
+            if (try cache.fill(req.io, req.arena, self, sub_path, encoding, file.handle, stat, plain)) |bytes| res._bodyFromFile(bytes);
+        };
+        return true;
+    }
+
+    /// The headers and the conditional and range handling of a file about
+    /// to be served, `stat` (in `encoding`) for the request path `served`,
+    /// whose body is set: the file, or its bytes from the cache.
+    fn respond(self: *const Static, req: *Request, res: *Response, served: []const u8, stat: std.Io.File.Stat, encoding: ?Precompressed) !void {
+        res.content_type = .fromExtension(extension(served));
+        // Which file is served depends on Accept-Encoding, whichever it
+        // turns out to be.
+        if (self.options.precompressed.len > 0) try addVary(req, res);
         if (encoding) |e| try res.header("Content-Encoding", e.name());
         try finish(req, res, try formatEtag(req.arena, stat, encoding), mtimeSeconds(stat));
         // Not on a 412 or 416, which a cache could otherwise keep.
@@ -173,7 +199,68 @@ pub const Static = struct {
             .ok, .partial_content, .not_modified => try res.header("Cache-Control", cc),
             else => {},
         };
+    }
+
+    /// A request for a file the cache holds (static_cache.zig): served
+    /// from memory when the plain file and the copy the client takes are
+    /// the ones the cache read. False: take today's path, with nothing set
+    /// on `res`. Only a GET for a path the cache knows stats anything.
+    fn serveCached(self: *const Static, cache: *StaticCache, req: *Request, res: *Response, sub_path: []const u8) !bool {
+        if (req.method != .get or sub_path.len == 0) return false;
+        if (std.mem.endsWith(u8, urlPath(req.url), "/")) return false;
+        const io = req.io;
+        var order_buf: [8]Precompressed = undefined;
+        const order = if (self.options.precompressed.len > 0) byQuality(req, self.options.precompressed, &order_buf) else &.{};
+        const h = StaticCache.hash(self, sub_path);
+        if (!cache.known(io, self, h, sub_path, order)) return false;
+
+        // Today's path picks the first candidate it can open: the first
+        // here that exists. One it can't open (no permission, a link out
+        // of the directory) is never cached, so it misses every time.
+        const plain = switch (try cache.statAt(io, self.dir, sub_path)) {
+            .file => |st| st,
+            .missing, .other => return self.cachedMiss(cache, io),
+        };
+        var stat = plain;
+        var encoding: ?Precompressed = null;
+        var path_buf: [std.Io.Dir.max_path_bytes + 8]u8 = undefined;
+        for (order) |candidate| {
+            const ext = candidate.extension();
+            if (sub_path.len + ext.len > path_buf.len) return self.cachedMiss(cache, io);
+            @memcpy(path_buf[0..sub_path.len], sub_path);
+            @memcpy(path_buf[sub_path.len..][0..ext.len], ext);
+            switch (try cache.statAt(io, self.dir, path_buf[0 .. sub_path.len + ext.len])) {
+                .file => |st| {
+                    stat = st;
+                    encoding = candidate;
+                    break;
+                },
+                .missing => {},
+                .other => return self.cachedMiss(cache, io),
+            }
+        }
+        // Grown past the limit: no entry can match, and the buffer would
+        // be its whole size.
+        if (stat.size > cache.opts.max_file) return self.cachedMiss(cache, io);
+
+        // Everything that allocates comes before the read section (L5);
+        // a conditional request that copies no body takes no buffer.
+        const etag = try formatEtag(req.arena, stat, encoding);
+        const proceed = checkPreconditions(req, etag, mtimeSeconds(stat)) == .proceed;
+        const buf = try req.arena.alloc(u8, if (proceed) @intCast(stat.size) else 0);
+        if (!cache.copyOut(io, self, h, sub_path, encoding, .of(stat), .of(plain), buf)) {
+            req.arena.free(buf);
+            return self.cachedMiss(cache, io);
+        }
+        cache.countHit(io);
+        res._bodyFromFile(buf);
+        try self.respond(req, res, sub_path, stat, encoding);
         return true;
+    }
+
+    fn cachedMiss(_: *const Static, cache: *StaticCache, io: std.Io) bool {
+        cache.countMiss(io);
+        return false;
     }
 };
 

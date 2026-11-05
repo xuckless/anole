@@ -63,6 +63,9 @@ pub const Client = dusty.Client;
 pub const ClientOptions = dusty.ClientOptions;
 /// Options for `Server.static` / `Router.static` and `Server.embedded`.
 pub const StaticOptions = dusty.StaticOptions;
+/// The static file cache's settings (`ServerOptions.static_cache`).
+pub const StaticCacheOptions = dusty.StaticCacheOptions;
+pub const static_cache = dusty.static_cache;
 /// Options for `Server.embedded`.
 pub const EmbeddedOptions = dusty.EmbeddedOptions;
 /// `ClientOptions.tls`; `anole.h2` and `anole.h3` take the same fields.

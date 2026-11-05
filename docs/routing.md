@@ -592,6 +592,49 @@ Both take the same options:
   Static files are not compressed on the fly; responses are (see
   Compression below).
 - `cache_control` goes out with 200, 206 and 304.
+- `cache`: kept in the static file cache (below); `false` reads every
+  request from the file.
+
+### The static file cache
+
+On Linux (64-bit) small static files are kept in memory, so a request for
+one costs no open, read or close: by default files up to 64 KiB, up to
+8 MiB in all for the process (`ServerOptions.static_cache`, the C ABI's
+`static_cache`). The server logs the budget at startup.
+
+```zig
+var app = try anole.App.init(gpa, .{
+    .static_cache = .{ .bytes = 32 << 20, .max_file = 128 << 10 },
+});
+```
+
+- **Always fresh:** a cached copy is served only while a stat of the file
+  per request (and of the plain file, for a precompressed copy) shows the
+  same inode, size, mtime and ctime as when it was read. The next request
+  after a file is replaced or rewritten gets the new bytes; the cache never
+  serves what the file no longer holds. A file changed in the last 2 s is
+  served but not kept yet, since a filesystem's timestamps can be too
+  coarse to tell two quick writes apart.
+- **Nothing else changes:** a path the cache doesn't hold goes to the file
+  as before, with no extra stat; which copy is served, 404s, symlink
+  refusals, `ETag`, ranges and conditional requests are as without the
+  cache. Cached bytes count as a file for `Compress` (never compressed on
+  the fly) and `ResponseCache` (never kept).
+- **Local filesystems only:** files are cached only on ext2/3/4, XFS,
+  Btrfs, tmpfs, overlayfs, F2FS, ZFS, bcachefs, SquashFS and EROFS, since
+  the per-request stat runs on the executor. A network filesystem (NFS,
+  SMB, FUSE, Ceph) is served from the file every time. Set `.cache = false`
+  for a directory on a block device that can stall (a network volume under
+  memory pressure).
+- **No eviction:** once `bytes` is used, new files are served from disk.
+  Every 5 s the server checks up to 256 entries and drops those whose file
+  changed or went away, so names left behind by a deploy (content-hashed
+  assets) give their room back within a minute or so. The Lambda and
+  in-memory modes don't run that check.
+- `HEAD` requests and directory index pages are served from the file.
+  `bytes = 0` turns the cache off; it is off on macOS and Windows for now.
+  `/metrics` has its counters (`anole_static_cache_*`, see
+  [observability.md](observability.md)).
 
 ### Symlinks out of the directory
 

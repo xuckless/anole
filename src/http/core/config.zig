@@ -8,6 +8,7 @@ const HttpRequest = @import("request.zig").Request;
 const HttpResponse = @import("response.zig").Response;
 const proxy_protocol = @import("proxy_protocol.zig");
 pub const admission = @import("admission.zig");
+pub const StaticCacheOptions = @import("server/static_cache.zig").Options;
 
 /// How the server's own error answers (a 404, a 500, `Response.fail`) are
 /// written. `ServerConfig.errors`.
@@ -297,6 +298,10 @@ pub const ServerConfig = struct {
     /// number of open WebSockets is held where it was, and an upgrade past
     /// it gets 503 with `Retry-After` (see `admission.Config`).
     admission: admission.Config = .{},
+    /// The static file cache: small files of static directories kept in
+    /// memory, checked by a stat per request (`server/static_cache.zig`;
+    /// Linux only for now). `bytes = 0` turns it off.
+    static_cache: StaticCacheOptions = .{},
     /// How the server's own error answers are written: a 404, a 405, the
     /// status an error maps to, `Response.fail`. See `ErrorFormat`.
     errors: ErrorFormat = .auto,

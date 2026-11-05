@@ -292,11 +292,19 @@ anole_http_request_duration_seconds_count{method="GET",route="/chain/:id"} 1
 | `anole_websockets_admitted` | none | Open WebSockets the admission gate counts. |
 | `anole_websockets_limit` | none | The WebSocket count held under load; -1 while none is held. |
 | `anole_ws_upgrades_refused_total` | `reason` | Upgrades answered 503 by the gate: `load` (held) or `cap` (`limits.max_websockets`). |
+| `anole_static_cache_hits_total` | none | Static file requests served from the static file cache ([routing.md](routing.md#the-static-file-cache)). |
+| `anole_static_cache_misses_total` | none | Requests for a path the cache held that went to the file: the file changed, or the client took a copy the cache didn't have. |
+| `anole_static_cache_fills_total` | none | Files read into the cache. |
+| `anole_static_cache_swept_total` | none | Entries dropped every 5 s because their file changed or went away. |
+| `anole_static_cache_skipped_total` | `reason` | Files served but not kept: `budget` (`static_cache.bytes` used up), `table` (no slot for the key), `racy` (changed in the last 2 s), `retire` (too many replaced entries not yet freed), `fs` (not a local filesystem), `changed` (changed while read). |
+| `anole_static_cache_bytes` | none | Bytes the cache holds, against `static_cache.bytes`. |
 
 The `anole_runtime_*` series come from zio's `diagnostics` option, which
 `anole.zio_options` turns on (one relaxed atomic add per task spawned and
 finished). A program that declares its own `zio_options` without it gets
-only `anole_connections` and `anole_streams`. A registry of your own gets
+only `anole_connections` and `anole_streams`. The `anole_static_cache_*`
+series appear when the server has a static file cache (a static directory,
+on Linux). A registry of your own gets
 them with `registry.runtime_gauges = true`.
 
 ### HTTP/3 series

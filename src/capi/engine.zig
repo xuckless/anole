@@ -1572,6 +1572,7 @@ pub const Engine = struct {
                 .lag_enter = .fromMilliseconds(cfg.admission.lag_enter_ms),
                 .retry_after_s = cfg.admission.retry_after_s,
             },
+            .static_cache = cfg.static_cache,
             .proxy = cfg.proxy,
             .request = cfg.request,
             .response = cfg.response,
@@ -1683,6 +1684,7 @@ pub const Engine = struct {
                     .cache_control = st.cache_control,
                     .hide_dotfiles = st.hide_dotfiles,
                     .resolve_beneath = st.resolve_beneath,
+                    .cache = st.cache,
                 });
             } else if (rc.websocket) |wc| {
                 if (comptime !features.websocket) unreachable;
