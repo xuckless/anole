@@ -1089,6 +1089,150 @@ test "WebTransport: 30 streams at once wait for credit past a limit of 8" {
     try std.testing.expectEqual(@as(usize, 30), ok.load(.monotonic));
 }
 
+/// Opens bidirectional streams on `session` until the peer's limit is
+/// reached, into `held`; the last `tryOpen` left the session linked for
+/// credit. Returns how many it holds.
+fn holdBidiCredit(session: *wt.Session, held: []*wt.Stream) !usize {
+    var n: usize = 0;
+    while (try wt.Session.Driver.tryOpen(session, .bidi)) |s| {
+        if (n == held.len) {
+            s.release();
+            return error.TestUnexpectedResult;
+        }
+        held[n] = s;
+        n += 1;
+    }
+    return n;
+}
+
+fn creditLinked(session: *wt.Session) bool {
+    return wt.Session.Driver.testCreditLinked(session, .bidi);
+}
+
+fn creditUnlinked(session: *wt.Session) bool {
+    return !wt.Session.Driver.testCreditLinked(session, .bidi);
+}
+
+/// Opens a stream, waiting for credit; notes how it ended.
+fn openWaiting(session: *wt.Session, result: *std.atomic.Value(u32)) std.Io.Cancelable!void {
+    const s = session.openStream() catch |err| {
+        result.store(if (err == error.SessionClosed) 2 else 3, .release);
+        if (err == error.Canceled) return error.Canceled;
+        return;
+    };
+    s.release();
+    result.store(1, .release);
+}
+
+test "WebTransport: a session freed while it waits for stream credit is not woken by the credit that comes after" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+
+    {
+        const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/wt" });
+        defer session.deinit();
+        // Every stream the server allows is held (the CONNECT stream among
+        // them), and an opener waits for credit.
+        var held: [16]*wt.Stream = undefined;
+        _ = try holdBidiCredit(session, &held);
+        try std.testing.expect(creditLinked(session));
+        var result: std.atomic.Value(u32) = .init(0);
+        var group: std.Io.Group = .init;
+        try group.concurrent(io, openWaiting, .{ session, &result });
+        group.cancel(io);
+        try std.testing.expect(creditLinked(session));
+        // `deinit` resets the held streams and frees the session (a
+        // `ClientSession`) with its node still linked, unless `detach`
+        // unlinks it.
+    }
+    // The resets give the credit back after the free: the next CONNECT
+    // waits for it, and its stream for more.
+    const next = try conn.openWebTransport(.{ .authority = "localhost", .path = "/wt" });
+    defer next.deinit();
+    const s = try next.openStream();
+    defer s.release();
+    try s.writer().writeAll("after");
+    try s.closeSend();
+    const back = try s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(back);
+    try std.testing.expectEqualStrings("after", back);
+}
+
+test "WebTransport: a session closed while it waits for stream credit fails the opener, and the credit after unlinks it" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/wt" });
+    defer session.deinit();
+
+    var held: [16]*wt.Stream = undefined;
+    const n = try holdBidiCredit(session, &held);
+    var result: std.atomic.Value(u32) = .init(0);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, openWaiting, .{ session, &result });
+    try std.testing.expect(creditLinked(session));
+    try session.close(0, "");
+    _ = try wait.waitNonZero(io, "the opener returned", &result);
+    try std.testing.expectEqual(@as(u32, 2), result.load(.acquire));
+    // Closed, not detached: the node stays until credit comes back.
+    for (held[0..n]) |s| s.release();
+    try wait.waitUntil(io, "the credit unlinked the closed session", session, creditUnlinked);
+}
+
+test "WebTransport: a datagram burst under the queue's limit wakes nobody; past it every refused sender is woken" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/wt" });
+    defer session.deinit();
+
+    // 200 queued at most (the limit is 256): never full, so a datagram
+    // that goes wakes nobody.
+    for (0..200) |_| try session.sendDatagram("under");
+    var w = wt.Session.Driver.testDatagramWaits(session);
+    try std.testing.expectEqual(@as(u32, 0), w.full);
+    try std.testing.expectEqual(@as(u32, 0), w.walks);
+
+    // 1000 from one task: it completes (no wake lost), and a sender that
+    // was refused and then got room was woken by a walk.
+    var sent: std.atomic.Value(usize) = .init(0);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, struct {
+        fn burst(sess: *wt.Session, count: *std.atomic.Value(usize)) std.Io.Cancelable!void {
+            for (0..1000) |_| {
+                sess.sendDatagram("past the limit") catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => return,
+                };
+                _ = count.fetchAdd(1, .monotonic);
+            }
+        }
+    }.burst, .{ session, &sent });
+    try wait.waitAtLeast(io, "1000 datagrams queued", &sent, 1000);
+    try group.await(io);
+    w = wt.Session.Driver.testDatagramWaits(session);
+    try std.testing.expect(w.walks <= w.full);
+    if (w.full > 0) try std.testing.expect(w.walks >= 1);
+}
+
 test "WebTransport: 130 one-way streams in a row get credit back as they close" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });

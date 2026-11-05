@@ -3814,8 +3814,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             cb.stream_close2 = onStreamClose;
             cb.path_validation = onPathValidation;
             cb.recv_datagram = onRecvDatagram;
-            cb.extend_max_local_streams_bidi = onExtendMaxLocalStreams;
-            cb.extend_max_local_streams_uni = onExtendMaxLocalStreams;
+            cb.extend_max_local_streams_bidi = onExtendMaxLocalStreamsBidi;
+            cb.extend_max_local_streams_uni = onExtendMaxLocalStreamsUni;
             break :blk cb;
         };
 
@@ -3875,10 +3875,20 @@ pub fn Endpoint(comptime Ctx: type) type {
             return 0;
         }
 
-        fn onExtendMaxLocalStreams(_: ?*c.ngtcp2_conn, _: u64, user_data: ?*anyopaque) callconv(.c) c_int {
-            // A WebTransport handler waiting to open a stream may go on.
+        fn onExtendMaxLocalStreamsBidi(_: ?*c.ngtcp2_conn, _: u64, user_data: ?*anyopaque) callconv(.c) c_int {
+            return onExtendMaxLocalStreams(user_data, .bidi);
+        }
+
+        fn onExtendMaxLocalStreamsUni(_: ?*c.ngtcp2_conn, _: u64, user_data: ?*anyopaque) callconv(.c) c_int {
+            return onExtendMaxLocalStreams(user_data, .uni);
+        }
+
+        fn onExtendMaxLocalStreams(user_data: ?*anyopaque, comptime dir: webtransport.Session.Driver.Direction) c_int {
+            // A WebTransport handler waiting to open a stream that way may
+            // go on; the kick wakes the C ABI's session driver, which waits
+            // on the connection's change count.
             const conn = connOf(user_data);
-            if (conn.wt) |w| w.onStreamCredit();
+            if (conn.wt) |w| w.onStreamCredit(dir);
             conn.kick();
             return 0;
         }

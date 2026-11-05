@@ -203,6 +203,10 @@ pub const Wrote = union(enum) {
     failed: c.ngtcp2_ssize,
 };
 
+/// A counter kept in test builds only.
+const TestCount = if (@import("builtin").is_test) u32 else void;
+const test_count_zero: TestCount = if (@import("builtin").is_test) 0 else {};
+
 /// A datagram to send: a buffer the queue owns (from `Core.gpa`), and its
 /// session's quarter stream ID, written in front of it when it goes out.
 const OutDatagram = struct { bytes: []u8, qsid: u64 };
@@ -231,6 +235,18 @@ pub const Core = struct {
     sched: Sched = .{},
     /// Datagrams to send, oldest first.
     datagrams_out: std.Deque(OutDatagram) = .empty,
+    /// A sender found `datagrams_out` full since the last datagram went:
+    /// the next one to go wakes the sessions (quinn's `send_blocked`).
+    dgram_waiting: bool = false,
+    /// Sessions whose `tryOpen` found the peer's stream limit reached, by
+    /// direction (`Session.uni_node`, `bidi_node`): the next credit of that
+    /// direction wakes them, no other session.
+    uni_waiters: std.DoublyLinkedList = .{},
+    bidi_waiters: std.DoublyLinkedList = .{},
+    /// Test builds: how often a sender found `datagrams_out` full, and how
+    /// often a datagram that went woke the sessions for it.
+    test_dgram_full: TestCount = test_count_zero,
+    test_dgram_walks: TestCount = test_count_zero,
     /// Which of WebTransport's streams and nghttp3's leads the next packet
     /// (when no WebTransport stream is more urgent than nghttp3's default).
     turn: bool = false,
@@ -247,6 +263,8 @@ pub const Core = struct {
     /// have ended), and the connection with them.
     pub fn destroy(core: *Core) void {
         const gpa = core.gpa;
+        // `detach` unlinks a session: one still linked was freed without it.
+        std.debug.assert(core.uni_waiters.first == null and core.bidi_waiters.first == null);
         // Orphans are among them, but for those QUIC is done with.
         var it = core.streams.valueIterator();
         while (it.next()) |s| s.*.free();
@@ -275,11 +293,62 @@ pub const Core = struct {
         return core.host.budget;
     }
 
-    /// The peer raised its stream limits: sessions waiting to open wake.
+    /// The peer raised its stream limit of `dir`: the sessions waiting to
+    /// open a stream that way wake. Locked.
+    pub fn onStreamCredit(core: *Core, comptime dir: Session.Driver.Direction) void {
+        const list = creditWaiters(core, dir);
+        while (list.popFirst()) |node| {
+            const s: *Session = @fieldParentPtr(creditNode(dir), node);
+            if (std.debug.runtime_safety) std.debug.assert(core.sessions.get(s.id) == s);
+            @field(s, creditLinked(dir)) = false;
+            s.ev.notify(core.io);
+        }
+    }
+
+    fn creditWaiters(core: *Core, comptime dir: Session.Driver.Direction) *std.DoublyLinkedList {
+        return if (dir == .bidi) &core.bidi_waiters else &core.uni_waiters;
+    }
+    fn creditNode(comptime dir: Session.Driver.Direction) []const u8 {
+        return if (dir == .bidi) "bidi_node" else "uni_node";
+    }
+    fn creditLinked(comptime dir: Session.Driver.Direction) []const u8 {
+        return if (dir == .bidi) "bidi_linked" else "uni_linked";
+    }
+
+    /// `s` waits for stream credit of `dir`; once at most. Locked.
+    fn linkCredit(core: *Core, s: *Session, comptime dir: Session.Driver.Direction) void {
+        if (@field(s, creditLinked(dir))) return;
+        @field(s, creditLinked(dir)) = true;
+        creditWaiters(core, dir).append(&@field(s, creditNode(dir)));
+    }
+
+    /// `s` no longer waits for stream credit of `dir`. Locked.
+    fn unlinkCredit(core: *Core, s: *Session, comptime dir: Session.Driver.Direction) void {
+        if (!@field(s, creditLinked(dir))) return;
+        @field(s, creditLinked(dir)) = false;
+        creditWaiters(core, dir).remove(&@field(s, creditNode(dir)));
+    }
+
+    /// Room for one more datagram to send; when there is none, the next
+    /// one to go wakes the sessions (`datagramSent`). Locked: the flag is
+    /// set in the same hold that saw the queue full, so no wake is lost.
+    fn datagramRoom(core: *Core) bool {
+        if (core.datagrams_out.len < core.datagramLimit()) return true;
+        core.dgram_waiting = true;
+        if (@import("builtin").is_test) core.test_dgram_full += 1;
+        return false;
+    }
+
+    /// A datagram left the queue: if a sender found it full, the sessions
+    /// wake (and the C ABI's driver, on the connection's change count).
     /// Locked.
-    pub fn onStreamCredit(core: *Core) void {
-        var it = core.sessions.valueIterator();
-        while (it.next()) |session| session.*.ev.notify(core.io);
+    fn datagramSent(core: *Core) void {
+        if (!core.dgram_waiting) return;
+        core.dgram_waiting = false;
+        if (@import("builtin").is_test) core.test_dgram_walks += 1;
+        var sit = core.sessions.valueIterator();
+        while (sit.next()) |session| session.*.ev.notify(core.io);
+        core.host.kick();
     }
 
     fn isUni(stream_id: i64) bool {
@@ -548,10 +617,7 @@ pub const Core = struct {
         if (accepted != 0 or n == c.NGTCP2_ERR_INVALID_ARGUMENT or n == c.NGTCP2_ERR_INVALID_STATE) {
             _ = core.datagrams_out.popFront();
             core.gpa.free(d.bytes);
-            // A slot is free: sessions waiting to send wake.
-            var sit = core.sessions.valueIterator();
-            while (sit.next()) |session| session.*.ev.notify(core.io);
-            core.host.kick();
+            core.datagramSent();
         }
         return switch (n) {
             c.NGTCP2_ERR_WRITE_MORE => .more,
@@ -809,6 +875,14 @@ pub const Session = struct {
     datagrams_in_bytes: usize = 0,
     /// Unregistered from the core (`deinit`).
     detached: bool = false,
+    /// In the core's credit wait lists (`Core.uni_waiters`, `bidi_waiters`)
+    /// while linked: from a `tryOpen` that found the limit reached until
+    /// the next credit of that direction or `detach`. Under the
+    /// connection's lock.
+    uni_node: std.DoublyLinkedList.Node = .{},
+    bidi_node: std.DoublyLinkedList.Node = .{},
+    uni_linked: bool = false,
+    bidi_linked: bool = false,
     /// Woken by what a waiting `acceptFrom`, `open`, `receiveDatagram` or
     /// `sendDatagram` looks at: a new stream, a datagram, the session's end,
     /// the drain, stream credit.
@@ -952,6 +1026,9 @@ pub const Session = struct {
         defer host.unlock();
         if (self.detached) return;
         self.detached = true;
+        // The only way out of `core.sessions`: no credit reaches it after.
+        core.unlinkCredit(self, .uni);
+        core.unlinkCredit(self, .bidi);
         self.endLocked(.{ .code = 0, .reason = "", .by = .local });
         _ = core.sessions.remove(self.id);
         core.markGone(self.id);
@@ -1148,6 +1225,24 @@ pub const Session = struct {
         pub fn testQueued(s: *Session, what: Session.QueuedKind) usize {
             return s.testQueued(what);
         }
+        /// Tests only: the session waits for stream credit of `dir`.
+        pub fn testCreditLinked(s: *Session, dir: Direction) bool {
+            if (!@import("builtin").is_test) @compileError("tests only");
+            const host = s.core.host;
+            host.lock();
+            defer host.unlock();
+            return if (dir == .bidi) s.bidi_linked else s.uni_linked;
+        }
+        /// Tests only: how often a sender on the session's connection found
+        /// the datagram queue full, and how often a datagram that went woke
+        /// the sessions for it.
+        pub fn testDatagramWaits(s: *Session) struct { full: u32, walks: u32 } {
+            if (!@import("builtin").is_test) @compileError("tests only");
+            const host = s.core.host;
+            host.lock();
+            defer host.unlock();
+            return .{ .full = s.core.test_dgram_full, .walks = s.core.test_dgram_walks };
+        }
     };
 
     /// The next stream the peer opened, if any: both ways (`.bidi`) or
@@ -1183,6 +1278,13 @@ pub const Session = struct {
         else
             c.ngtcp2_conn_open_uni_stream(core.q, &id, null);
         if (rv == c.NGTCP2_ERR_STREAM_ID_BLOCKED) {
+            // Linked before the unlock, so the credit that ends the wait
+            // finds it (`open` read the epoch before the lock). A waiter
+            // cancelled meanwhile leaves it linked; the node is the
+            // session's, so the next credit or `detach` takes it off.
+            switch (dir) {
+                inline else => |d| core.linkCredit(self, d),
+            }
             core.host.unlock();
             return null;
         }
@@ -1244,7 +1346,7 @@ pub const Session = struct {
             core.host.unlock();
             return error.DatagramTooLarge;
         }
-        if (core.datagrams_out.len >= core.datagramLimit()) {
+        if (!core.datagramRoom()) {
             core.host.unlock();
             return false;
         }
@@ -2163,6 +2265,142 @@ test "WebTransport: a connection queues 16 datagrams under send-memory pressure,
     // Under 7/8 of the limit: back to 256.
     memory.add(-64);
     try std.testing.expectEqual(@as(usize, 256), core.datagramLimit());
+}
+
+test "WebTransport: stream credit wakes only the sessions waiting on its direction, with 1, 64 and 1024 sessions" {
+    const Noop = struct {
+        fn f(_: *anyopaque) void {}
+    };
+    const gpa = std.testing.allocator;
+    var dummy: u8 = 0;
+    for ([_]usize{ 1, 64, 1024 }) |n| {
+        var core: Core = .{
+            .gpa = gpa,
+            .io = undefined,
+            .q = undefined,
+            .host = .{ .ctx = &dummy, .gen = undefined, .pool = undefined, .budget = undefined, .lock_fn = Noop.f, .unlock_fn = Noop.f, .kick_fn = Noop.f },
+            .server = true,
+            .limits = .{},
+        };
+        defer core.sessions.deinit(gpa);
+        const sessions = try gpa.alloc(Session, n);
+        defer gpa.free(sessions);
+        for (sessions, 0..) |*s, i| {
+            s.* = .{ .core = &core, .id = @intCast(4 * i), .channel = undefined };
+            try core.sessions.put(gpa, s.id, s);
+        }
+        const epochs = try gpa.alloc(u32, n);
+        defer gpa.free(epochs);
+        const Moved = struct {
+            fn count(all: []Session, before: []u32) usize {
+                var moved: usize = 0;
+                for (all, before) |*s, *e| {
+                    if (s.ev.epoch() != e.*) moved += 1;
+                    e.* = s.ev.epoch();
+                }
+                return moved;
+            }
+        };
+        _ = Moved.count(sessions, epochs);
+        // The last one waits to open a one-way stream; twice is once.
+        const waiting = &sessions[n - 1];
+        core.linkCredit(waiting, .uni);
+        core.linkCredit(waiting, .uni);
+        try std.testing.expectEqual(@as(usize, 1), core.uni_waiters.len());
+        // Bidirectional credit wakes nobody.
+        core.onStreamCredit(.bidi);
+        try std.testing.expectEqual(@as(usize, 0), Moved.count(sessions, epochs));
+        try std.testing.expect(waiting.uni_linked);
+        // One-way credit wakes it alone, and only once.
+        core.onStreamCredit(.uni);
+        try std.testing.expectEqual(@as(usize, 1), Moved.count(sessions, epochs));
+        try std.testing.expect(!waiting.uni_linked);
+        try std.testing.expect(core.uni_waiters.first == null);
+        core.onStreamCredit(.uni);
+        try std.testing.expectEqual(@as(usize, 0), Moved.count(sessions, epochs));
+        // Unlinked (as `detach` does): no credit finds it.
+        core.linkCredit(waiting, .bidi);
+        core.unlinkCredit(waiting, .bidi);
+        core.unlinkCredit(waiting, .bidi);
+        core.onStreamCredit(.bidi);
+        try std.testing.expectEqual(@as(usize, 0), Moved.count(sessions, epochs));
+        try std.testing.expect(core.bidi_waiters.first == null);
+    }
+}
+
+test "WebTransport: a datagram that goes wakes the sessions only after a sender found the queue full, across a pressure change" {
+    const Kicks = struct {
+        fn noop(_: *anyopaque) void {}
+        fn kick(ctx: *anyopaque) void {
+            const n: *u32 = @ptrCast(@alignCast(ctx));
+            n.* += 1;
+        }
+    };
+    const gpa = std.testing.allocator;
+    var memory: bridge.SendMemory = .init(1 << 20);
+    var pool = bridge.BlockPool.init(gpa, 0);
+    defer pool.deinit();
+    pool.send = &memory;
+    var kicks: u32 = 0;
+    var core: Core = .{
+        .gpa = gpa,
+        .io = undefined,
+        .q = undefined,
+        .host = .{ .ctx = &kicks, .gen = undefined, .pool = &pool, .budget = undefined, .lock_fn = Kicks.noop, .unlock_fn = Kicks.noop, .kick_fn = Kicks.kick },
+        .server = true,
+        .limits = .{},
+    };
+    defer {
+        while (core.datagrams_out.popFront()) |d| gpa.free(d.bytes);
+        core.datagrams_out.deinit(gpa);
+        core.sessions.deinit(gpa);
+    }
+    var session: Session = .{ .core = &core, .id = 0, .channel = undefined };
+    try core.sessions.put(gpa, 0, &session);
+    const Out = struct {
+        fn push(c0: *Core) !void {
+            const d = try c0.gpa.dupe(u8, "d");
+            c0.datagrams_out.pushBack(c0.gpa, .{ .bytes = d, .qsid = 0 }) catch |err| {
+                c0.gpa.free(d);
+                return err;
+            };
+        }
+        fn pop(c0: *Core) void {
+            const d = c0.datagrams_out.popFront().?;
+            c0.gpa.free(d.bytes);
+            c0.datagramSent();
+        }
+    };
+
+    // Nobody refused: a datagram that goes wakes nobody and kicks nothing.
+    try Out.push(&core);
+    Out.pop(&core);
+    try std.testing.expectEqual(@as(u32, 0), kicks);
+    try std.testing.expectEqual(@as(u32, 0), core.test_dgram_walks);
+
+    // Under pressure the queue holds 16; the 17th sender is refused.
+    memory.add(1 << 20 >> 12);
+    memory.add(1);
+    for (0..bridge.SendMemory.pressure_datagrams) |_| {
+        try std.testing.expect(core.datagramRoom());
+        try Out.push(&core);
+    }
+    try std.testing.expect(!core.datagramRoom());
+    try std.testing.expect(core.dgram_waiting);
+    // The pressure ends: room again, and the refused sender's wake is
+    // still owed.
+    memory.add(-64);
+    try std.testing.expect(core.datagramRoom());
+    const seen = session.ev.epoch();
+    Out.pop(&core);
+    try std.testing.expect(session.ev.epoch() != seen);
+    try std.testing.expectEqual(@as(u32, 1), kicks);
+    try std.testing.expectEqual(@as(u32, 1), core.test_dgram_walks);
+    try std.testing.expect(!core.dgram_waiting);
+    // Owed once: the next one wakes nobody.
+    Out.pop(&core);
+    try std.testing.expectEqual(@as(u32, 1), kicks);
+    try std.testing.expectEqual(@as(u32, 1), core.test_dgram_full);
 }
 
 test "WebTransport: a connection that goes with owned datagrams queued frees them" {
