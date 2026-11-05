@@ -190,6 +190,46 @@ pub const SessionSlot = struct {
         return true;
     }
 
+    /// Datagrams out, oldest first, moved into the connection's queue
+    /// one at a time; the lock is held only to take one or put it back.
+    /// At most a queue's worth per round, so consumers that keep sending
+    /// don't hold the rest of the round back. `session` has
+    /// `trySendDatagramOwned` (a `*Session`; a fake in the test), `a` is
+    /// what the datagrams came from (`gpa`). True when one moved.
+    fn flushDatagrams(s: *SessionSlot, session: anytype, a: std.mem.Allocator, dropped: *std.atomic.Value(u64)) bool {
+        var moved_any = false;
+        for (0..s.datagrams.buffer.len) |_| {
+            spin(&s.lock);
+            const next = s.datagrams.popFront();
+            s.lock.unlock();
+            const d = next orelse break;
+            const moved = session.trySendDatagramOwned(d) catch |err| {
+                a.free(d);
+                switch (err) {
+                    error.DatagramTooLarge, error.OutOfMemory => _ = dropped.fetchAdd(1, .monotonic),
+                    // The session is over: the rest are dropped with it.
+                    else => {},
+                }
+                continue;
+            };
+            if (!moved) {
+                // The connection's queue is full: it waits in front, unless
+                // consumers filled the slot meanwhile; then it is the oldest
+                // and goes.
+                spin(&s.lock);
+                const kept = s.putBackOldest(d);
+                s.lock.unlock();
+                if (!kept) {
+                    a.free(d);
+                    _ = dropped.fetchAdd(1, .monotonic);
+                }
+                break;
+            }
+            moved_any = true;
+        }
+        return moved_any;
+    }
+
     fn clear(s: *SessionSlot) void {
         while (s.datagrams.popFront()) |d| gpa.free(d);
         s.datagrams.deinit(gpa);
@@ -432,39 +472,7 @@ fn drive(s: *SessionSlot, g: u32, session: *Session) std.Io.Cancelable!void {
         }
         var opens_list = opens;
         opens_list.deinit(gpa);
-        // Datagrams out, oldest first, moved into the connection's queue
-        // one at a time; the lock is held only to take one or put it back.
-        // At most a queue's worth per round, so consumers that keep
-        // sending don't hold the rest of the round back.
-        for (0..s.datagrams.buffer.len) |_| {
-            spin(&s.lock);
-            const next = s.datagrams.popFront();
-            s.lock.unlock();
-            const d = next orelse break;
-            const moved = session.trySendDatagramOwned(d) catch |err| {
-                gpa.free(d);
-                switch (err) {
-                    error.DatagramTooLarge, error.OutOfMemory => _ = e.wt_datagrams_dropped.fetchAdd(1, .monotonic),
-                    // The session is over: the rest are dropped with it.
-                    else => {},
-                }
-                continue;
-            };
-            if (!moved) {
-                // The connection's queue is full: it waits in front, unless
-                // consumers filled the slot meanwhile; then it is the oldest
-                // and goes.
-                spin(&s.lock);
-                const kept = s.putBackOldest(d);
-                s.lock.unlock();
-                if (!kept) {
-                    gpa.free(d);
-                    _ = e.wt_datagrams_dropped.fetchAdd(1, .monotonic);
-                }
-                break;
-            }
-            progress = true;
-        }
+        if (s.flushDatagrams(session, gpa, &e.wt_datagrams_dropped)) progress = true;
 
         // The peer's new streams.
         inline for (.{ Session.Driver.Direction.bidi, Session.Driver.Direction.uni }) |dir| {
@@ -989,4 +997,96 @@ test "capi engine: WebTransport: a session's datagram queue keeps the newest and
     try std.testing.expect(s.putBackOldest(again));
     try std.testing.expectEqualStrings("7", s.datagrams.front().?);
     try std.testing.expectEqual(@as(usize, 4), s.datagrams.len);
+}
+
+test "capi engine: WebTransport: the datagram flush moves, puts back, drops and counts, allocating nothing" {
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const a = fa.allocator();
+    var s: SessionSlot = .{};
+    s.datagrams = try .initCapacity(a, 4);
+    defer {
+        while (s.datagrams.popFront()) |d| a.free(d);
+        s.datagrams.deinit(a);
+    }
+    var dropped: std.atomic.Value(u64) = .init(0);
+    var name: [8]u8 = undefined;
+
+    // The connection's queue: takes `room`, then is full. On the first
+    // full answer it can play a consumer that refills the slot.
+    const Fake = struct {
+        slot: *SessionSlot,
+        room: usize,
+        refill: ?[]u8 = null,
+        got: [8][]u8 = undefined,
+        n: usize = 0,
+        fn trySendDatagramOwned(f: *@This(), d: []u8) error{ SessionClosed, DatagramTooLarge, OutOfMemory }!bool {
+            if (std.mem.eql(u8, d, "big")) return error.DatagramTooLarge;
+            if (f.n == f.room) {
+                if (f.refill) |r| {
+                    f.refill = null;
+                    spin(&f.slot.lock);
+                    std.debug.assert(f.slot.pushNewest(r) == null);
+                    f.slot.lock.unlock();
+                }
+                return false;
+            }
+            f.got[f.n] = d;
+            f.n += 1;
+            return true;
+        }
+    };
+
+    // Ten sends into four, as `sendDatagram` does: one allocation each,
+    // the six oldest dropped and counted.
+    const before_sends = fa.allocations;
+    for (0..10) |i| {
+        const d = try a.dupe(u8, try std.fmt.bufPrint(&name, "{d}", .{i}));
+        spin(&s.lock);
+        const old = s.pushNewest(d);
+        s.lock.unlock();
+        if (old) |o| {
+            a.free(o);
+            _ = dropped.fetchAdd(1, .monotonic);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 10), fa.allocations - before_sends);
+    try std.testing.expectEqual(@as(u64, 6), dropped.load(.monotonic));
+
+    // The connection's queue is full: the held one goes back in front.
+    var full: Fake = .{ .slot = &s, .room = 0 };
+    var allocs = fa.allocations;
+    try std.testing.expect(!s.flushDatagrams(&full, a, &dropped));
+    try std.testing.expectEqual(allocs, fa.allocations);
+    try std.testing.expectEqual(@as(usize, 4), s.datagrams.len);
+    try std.testing.expectEqualStrings("6", s.datagrams.front().?);
+    try std.testing.expectEqual(@as(u64, 6), dropped.load(.monotonic));
+
+    // Full, and a consumer refills the slot meanwhile: the held one is
+    // now the oldest, so it is dropped and counted.
+    var refilled: Fake = .{ .slot = &s, .room = 0, .refill = try a.dupe(u8, "10") };
+    const big = try a.dupe(u8, "big");
+    allocs = fa.allocations;
+    const frees = fa.deallocations;
+    try std.testing.expect(!s.flushDatagrams(&refilled, a, &dropped));
+    try std.testing.expectEqual(allocs, fa.allocations);
+    try std.testing.expectEqual(frees + 1, fa.deallocations);
+    try std.testing.expectEqual(@as(u64, 7), dropped.load(.monotonic));
+    try std.testing.expectEqualStrings("7", s.datagrams.front().?);
+
+    // One too large behind the rest: the others move in order, it is
+    // dropped and counted, and nothing is left.
+    spin(&s.lock);
+    const seven = s.pushNewest(big).?;
+    s.lock.unlock();
+    a.free(seven);
+    _ = dropped.fetchAdd(1, .monotonic);
+    var open: Fake = .{ .slot = &s, .room = 8 };
+    defer for (open.got[0..open.n]) |d| a.free(d);
+    allocs = fa.allocations;
+    try std.testing.expect(s.flushDatagrams(&open, a, &dropped));
+    try std.testing.expectEqual(allocs, fa.allocations);
+    try std.testing.expectEqual(@as(usize, 3), open.n);
+    for (open.got[0..open.n], [_][]const u8{ "8", "9", "10" }) |d, want| try std.testing.expectEqualStrings(want, d);
+    try std.testing.expectEqual(@as(u64, 9), dropped.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), s.datagrams.len);
 }

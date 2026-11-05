@@ -1227,16 +1227,12 @@ pub const Session = struct {
         self.core.gpa.free(d);
     }
 
-    /// Queues `buf` (from `allocator()`) as one datagram without waiting
-    /// or copying. True: the queue owns `buf`. False (the connection's
-    /// queue is full) or an error: the caller still does.
+    /// Queues `buf` as one datagram without waiting or copying. `buf`
+    /// must be a whole buffer from `allocator()` (or `takeDatagram`,
+    /// `nextDatagram`), never a slice of one: the queue frees it as it
+    /// is. True: the queue owns `buf`. False (the connection's queue is
+    /// full; nothing allocated) or an error: the caller still does.
     pub fn trySendDatagramOwned(self: *Session, buf: []u8) (Error || error{ DatagramTooLarge, OutOfMemory })!bool {
-        return self.queueDatagramOwned(buf);
-    }
-
-    /// Takes `buf` into the connection's queue, or false (having
-    /// allocated nothing) when it is full.
-    fn queueDatagramOwned(self: *Session, buf: []u8) (Error || error{ DatagramTooLarge, OutOfMemory })!bool {
         const len = buf.len;
         const core = self.core;
         core.host.lock();
@@ -1409,14 +1405,15 @@ pub const Session = struct {
         try self.sendDatagramOwned(d);
     }
 
-    /// Sends `buf` (from `allocator()`) as one datagram without copying
-    /// it, waiting while many are queued. Returned: the queue owns `buf`.
+    /// Sends `buf` (a whole buffer from `allocator()`, as for
+    /// `trySendDatagramOwned`) as one datagram without copying it,
+    /// waiting while many are queued. Returned: the queue owns `buf`.
     /// An error (`Canceled` too): the caller still does. To forward:
-    /// `b.sendDatagramOwned(d) catch a.freeDatagram(d)`.
+    /// `{ errdefer a.freeDatagram(d); try b.sendDatagramOwned(d); }`.
     pub fn sendDatagramOwned(self: *Session, buf: []u8) (Error || error{ DatagramTooLarge, OutOfMemory })!void {
         while (true) {
             const seen = self.ev.epoch();
-            if (try self.queueDatagramOwned(buf)) return;
+            if (try self.trySendDatagramOwned(buf)) return;
             try self.ev.wait(self.core.io, seen);
         }
     }
@@ -2178,7 +2175,7 @@ test "WebTransport: a connection that goes with owned datagrams queued frees the
     var dummy: u8 = 0;
     const host: Host = .{ .ctx = &dummy, .gen = undefined, .pool = &pool, .budget = undefined, .lock_fn = Noop.f, .unlock_fn = Noop.f, .kick_fn = Noop.f };
     const core = try Core.create(gpa, undefined, undefined, host, true, .{});
-    // As `queueDatagramOwned` leaves them: buffers moved in, never written.
+    // As `trySendDatagramOwned` leaves them: buffers moved in, never written.
     for (0..20) |i| {
         const d = try gpa.dupe(u8, "queued");
         core.datagrams_out.pushBack(gpa, .{ .bytes = d, .qsid = i }) catch |err| {

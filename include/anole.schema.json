@@ -2712,9 +2712,9 @@
         "datagram_queue": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 4294967295,
+          "maximum": 4096,
           "default": 64,
-          "description": "Datagrams a session holds for sending; past it the oldest is dropped (counted in anole_server_stats)."
+          "description": "Datagrams a session holds for sending (1 to 4096; its queue is that many slots from the start); past it the oldest is dropped (counted in anole_server_stats)."
         }
       },
       "required": [

@@ -1049,7 +1049,8 @@ anole_wt_close(w, 0, (anole_str){"bye", 3});
 - Datagrams: received ones are `ANOLE_EV_WT_DATAGRAM` (the session keeps
   up to 256 or 1 MiB waiting for the consumer, then drops new ones, as
   Anole does in Zig). Sent ones wait in a queue of the route's
-  `datagram_queue` (64 by default) and past it **the oldest is dropped**:
+  `datagram_queue` (64 by default, at most 4096; the session keeps that
+  many 16-byte slots from its start) and past it **the oldest is dropped**:
   datagrams are for data that goes stale (positions, frames), so a new one
   matters more than the one it replaces, and the consumer never has to
   hold or retry them. Drops count in `anole_stats.wt_datagrams_dropped`.

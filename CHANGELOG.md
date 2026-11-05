@@ -40,7 +40,7 @@ breaking changes are listed anyway.
 - C ABI: a WebTransport session's datagram queue no longer allocates or
   frees under its spin lock, and no longer leaks datagrams when putting
   back the ones the connection could not take; its capacity
-  (`datagram_queue`) is set when the session opens.
+  (`datagram_queue`, now at most 4096) is set when the session opens.
 
 ## 0.5.2 (2026-11-04)
 

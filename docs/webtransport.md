@@ -195,7 +195,8 @@ are, move the buffers instead:
 ```zig
 // a and b: sessions of the same server.
 const d = try a.nextDatagram();
-b.sendDatagramOwned(d) catch a.freeDatagram(d);
+errdefer a.freeDatagram(d);
+try b.sendDatagramOwned(d);
 ```
 
 `nextDatagram` waits for the next datagram and returns the received buffer
@@ -208,7 +209,10 @@ fails (any error, `Canceled` too), the caller still does.
 `buf`, false (the connection's queue is full) or an error that the caller
 still owns it.
 
-A buffer moved into a session must come from its `allocator()`. Every
+A buffer moved into a session must be a whole buffer from its
+`allocator()` (or one `nextDatagram` or `takeDatagram` returned), never a
+slice of one: the queue frees it as it is. To change the bytes, change
+them in place or copy them. Every
 session of one server shares it, so a datagram from one moves to another
 as it is; between a client's session and a server's (or two servers),
 copy it with `b.allocator().dupe(u8, d)`.

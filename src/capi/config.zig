@@ -1614,7 +1614,8 @@ fn check(cfg: Config, why: *std.Io.Writer) Problem!void {
             var h3 = false;
             for (cfg.listeners) |l| h3 = h3 or l.http3;
             if (!h3) return fail(why, "routes[{d}].webtransport: needs a listener with http3", .{i});
-            if (w.datagram_queue == 0) return fail(why, "routes[{d}].webtransport.datagram_queue: at least 1", .{i});
+            // The session holds this many slots from its start (16 B each).
+            if (w.datagram_queue == 0 or w.datagram_queue > 4096) return fail(why, "routes[{d}].webtransport.datagram_queue: 1 to 4096", .{i});
         }
         if (r.static != null and r.method != null) return fail(why, "routes[{d}]: a static route takes no method (GET and HEAD)", .{i});
         if (r.cache != null and r.handler == null and r.respond == null) return fail(why, "routes[{d}].cache: on handler and respond routes", .{i});
@@ -2045,6 +2046,7 @@ test "parse: each refused document is error.Config with a reason" {
         "{\"routes\": [{\"path\": \"/wt\", \"webtransport\": {\"handler\": 1}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true}, \"http3\": true}], \"routes\": [{\"method\": \"GET\", \"path\": \"/wt\", \"webtransport\": {\"handler\": 1}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true}, \"http3\": true}], \"routes\": [{\"path\": \"/wt\", \"webtransport\": {\"handler\": 1, \"datagram_queue\": 0}}]}",
+        "{\"listeners\": [{\"tls\": {\"self_signed\": true}, \"http3\": true}], \"routes\": [{\"path\": \"/wt\", \"webtransport\": {\"handler\": 1, \"datagram_queue\": 4097}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"always\"}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"require\"}}]}",
         "{\"listeners\": [{\"tls\": {\"self_signed\": true, \"client_auth\": \"request\", \"client_ca_file\": \"a\", \"client_ca_pem\": \"b\"}}]}",
