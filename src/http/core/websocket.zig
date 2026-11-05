@@ -356,10 +356,9 @@ pub const WebSocket = struct {
     /// that would touch a retained node's cold header for nothing.
     fn resetMessages(self: *WebSocket) void {
         self.poisonLent();
-        if (self.msg_arena_used) {
-            _ = self.msg_arena.reset(.{ .retain_with_limit = retained_message_max });
+        // A failed trim keeps the mark, so the next receive tries again.
+        if (self.msg_arena_used and self.msg_arena.reset(.{ .retain_with_limit = retained_message_max }))
             self.msg_arena_used = false;
-        }
         self.auto_responded = false;
     }
 
@@ -2608,12 +2607,25 @@ test "WebSocket: messages handed over in place never reset the message arena" {
     var ws = WebSocket.init(std.testing.io, .{ .writer = &out, .reader = &reader }, counter.allocator(), 0);
     defer ws.deinit();
 
+    // Straight from the arena, unmarked: a reset would rewind it.
+    _ = try ws.msg_arena.allocator().alloc(u8, 8);
+    const end = arenaEnd(&ws);
+    try std.testing.expect(end > 0);
+    const calls = counter.calls();
+    const capacity = ws.msg_arena.queryCapacity();
+
     for ([_][]const u8{ "one", "two!", "three" }) |want| {
         try std.testing.expectEqualStrings(want, (try ws.receive()).data);
         try std.testing.expect(!ws.msg_arena_used);
-        try std.testing.expectEqual(0, counter.calls());
-        try std.testing.expectEqual(0, ws.msg_arena.queryCapacity());
+        try std.testing.expectEqual(end, arenaEnd(&ws));
+        try std.testing.expectEqual(calls, counter.calls());
+        try std.testing.expectEqual(capacity, ws.msg_arena.queryCapacity());
     }
+}
+
+/// Where the message arena's current node is filled to: a reset sets it to 0.
+fn arenaEnd(ws: *WebSocket) usize {
+    return ws.msg_arena.state.used_list.?.end_index;
 }
 
 test "WebSocket: a message read into the arena is reset once by the next receive, and borrowed ones after it leave the arena alone" {
@@ -2649,12 +2661,17 @@ test "WebSocket: a message read into the arena is reset once by the next receive
         try std.testing.expect(!ws.msg_arena_used);
         const capacity = ws.msg_arena.queryCapacity();
         try std.testing.expect(capacity <= WebSocket.retained_message_max);
+        // Straight from the arena, unmarked: a reset would rewind it.
+        _ = try ws.msg_arena.allocator().alloc(u8, 8);
+        const end = arenaEnd(&ws);
+        try std.testing.expect(end > 0);
         const calls = counter.calls();
 
         // No more: the arena and its allocator are not touched.
         for ([_][]const u8{ "again", "and again" }) |want| {
             try std.testing.expectEqualStrings(want, (try ws.receive()).data);
             try std.testing.expect(!ws.msg_arena_used);
+            try std.testing.expectEqual(end, arenaEnd(&ws));
             try std.testing.expectEqual(capacity, ws.msg_arena.queryCapacity());
             try std.testing.expectEqual(calls, counter.calls());
         }
