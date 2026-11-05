@@ -203,6 +203,10 @@ pub const Wrote = union(enum) {
     failed: c.ngtcp2_ssize,
 };
 
+/// A datagram to send: a buffer the queue owns (from `Core.gpa`), and its
+/// session's quarter stream ID, written in front of it when it goes out.
+const OutDatagram = struct { bytes: []u8, qsid: u64 };
+
 pub const Core = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -225,8 +229,8 @@ pub const Core = struct {
     gone_next: usize = 0,
     /// Streams with something to send, by urgency and in turn.
     sched: Sched = .{},
-    /// Datagrams to send, oldest first, each with its session prefix.
-    datagrams_out: std.Deque([]u8) = .empty,
+    /// Datagrams to send, oldest first.
+    datagrams_out: std.Deque(OutDatagram) = .empty,
     /// Which of WebTransport's streams and nghttp3's leads the next packet
     /// (when no WebTransport stream is more urgent than nghttp3's default).
     turn: bool = false,
@@ -251,7 +255,7 @@ pub const Core = struct {
         core.orphans.deinit(gpa);
         core.undecided.deinit(gpa);
         core.sessions.deinit(gpa);
-        while (core.datagrams_out.popFront()) |d| gpa.free(d);
+        while (core.datagrams_out.popFront()) |d| gpa.free(d.bytes);
         core.datagrams_out.deinit(gpa);
         gpa.destroy(core);
     }
@@ -525,17 +529,25 @@ pub const Core = struct {
         return core.turn;
     }
 
-    /// The oldest datagram into the packet.
+    /// The oldest datagram into the packet, behind its session's quarter
+    /// stream ID. ngtcp2 copies both vecs into the packet during the call
+    /// and keeps neither (ngtcp2_conn.c conn_write_pkt: DATAGRAM is never
+    /// retransmitted), so the prefix can live on the stack.
     pub fn writeDatagram(core: *Core, p: [*c]c.ngtcp2_path, pi: [*c]c.ngtcp2_pkt_info, dest: []u8, ts: u64) ?Wrote {
         const d = core.datagrams_out.front() orelse return null;
+        var prefix: [8]u8 = undefined;
+        const plen = putVarint(&prefix, d.qsid);
         var accepted: c_int = 0;
-        const vec = [_]c.ngtcp2_vec{.{ .base = d.ptr, .len = d.len }};
+        const vec = [_]c.ngtcp2_vec{
+            .{ .base = &prefix, .len = plen },
+            .{ .base = d.bytes.ptr, .len = d.bytes.len },
+        };
         const n = ngtcp2.connWritevDatagram(core.q, p, pi, dest, &accepted, c.NGTCP2_WRITE_DATAGRAM_FLAG_MORE, 0, &vec, ts);
         // Taken, or never will be (too big for the peer, or the peer takes
         // none): off the queue either way.
         if (accepted != 0 or n == c.NGTCP2_ERR_INVALID_ARGUMENT or n == c.NGTCP2_ERR_INVALID_STATE) {
             _ = core.datagrams_out.popFront();
-            core.gpa.free(d);
+            core.gpa.free(d.bytes);
             // A slot is free: sessions waiting to send wake.
             var sit = core.sessions.valueIterator();
             while (sit.next()) |session| session.*.ev.notify(core.io);
@@ -1121,19 +1133,6 @@ pub const Session = struct {
         pub fn tryOpen(s: *Session, dir: Direction) (Error || error{OutOfMemory})!?*Stream {
             return s.tryOpen(dir);
         }
-        /// The next datagram received, if any; give it back with
-        /// `freeDatagram`.
-        pub fn takeDatagram(s: *Session) ?[]u8 {
-            return s.takeDatagram();
-        }
-        pub fn freeDatagram(s: *Session, d: []u8) void {
-            s.freeDatagram(d);
-        }
-        /// Queues `data` as one datagram; false, with nothing queued, while
-        /// the connection's queue is full.
-        pub fn trySendDatagram(s: *Session, data: []const u8) (Error || error{ DatagramTooLarge, OutOfMemory })!bool {
-            return s.trySendDatagram(data);
-        }
         /// Tests only: opens a stream of `kind` that starts with `head`
         /// instead of a whole prefix, held by nobody. Returns its ID, for
         /// `testReset`.
@@ -1201,9 +1200,20 @@ pub const Session = struct {
         return s;
     }
 
-    /// The next datagram received, if any; give it back with
-    /// `freeDatagram`.
-    fn takeDatagram(self: *Session) ?[]u8 {
+    /// The allocator of the session's datagram buffers: what
+    /// `takeDatagram` and `nextDatagram` return comes from it, and what
+    /// `sendDatagramOwned` and `trySendDatagramOwned` take must. Every
+    /// session of one server shares it, so a received datagram can move
+    /// to another session of the same server as it is; to a client's or
+    /// another server's session, copy it (`b.allocator().dupe(u8, d)`).
+    pub fn allocator(self: *Session) std.mem.Allocator {
+        return self.core.gpa;
+    }
+
+    /// The next datagram received, if any, without waiting or copying;
+    /// give it back with `freeDatagram` (or move it on with
+    /// `sendDatagramOwned`).
+    pub fn takeDatagram(self: *Session) ?[]u8 {
         const host = self.core.host;
         host.lock();
         defer host.unlock();
@@ -1212,34 +1222,22 @@ pub const Session = struct {
         return d;
     }
 
-    fn freeDatagram(self: *Session, d: []u8) void {
+    /// Frees a datagram from `takeDatagram` or `nextDatagram`.
+    pub fn freeDatagram(self: *Session, d: []u8) void {
         self.core.gpa.free(d);
     }
 
-    /// Queues `data` as one datagram; false, with nothing queued, while
-    /// the connection's queue is full.
-    fn trySendDatagram(self: *Session, data: []const u8) (Error || error{ DatagramTooLarge, OutOfMemory })!bool {
-        const d = try self.prefixDatagram(data);
-        const queued = self.queueDatagram(d, data.len) catch |err| {
-            self.core.gpa.free(d);
-            return err;
-        };
-        if (!queued) self.core.gpa.free(d);
-        return queued;
+    /// Queues `buf` (from `allocator()`) as one datagram without waiting
+    /// or copying. True: the queue owns `buf`. False (the connection's
+    /// queue is full) or an error: the caller still does.
+    pub fn trySendDatagramOwned(self: *Session, buf: []u8) (Error || error{ DatagramTooLarge, OutOfMemory })!bool {
+        return self.queueDatagramOwned(buf);
     }
 
-    /// `data` behind the session's prefix, in a new buffer.
-    fn prefixDatagram(self: *Session, data: []const u8) error{OutOfMemory}![]u8 {
-        const qsid: u64 = @as(u64, @intCast(self.id)) / 4;
-        const d = try self.core.gpa.alloc(u8, varintLen(qsid) + data.len);
-        const n = putVarint(d, qsid);
-        @memcpy(d[n..], data);
-        return d;
-    }
-
-    /// Takes `d` (a prefixed datagram of `len` payload bytes) into the
-    /// connection's queue, or false when it is full.
-    fn queueDatagram(self: *Session, d: []u8, len: usize) (Error || error{ DatagramTooLarge, OutOfMemory })!bool {
+    /// Takes `buf` into the connection's queue, or false (having
+    /// allocated nothing) when it is full.
+    fn queueDatagramOwned(self: *Session, buf: []u8) (Error || error{ DatagramTooLarge, OutOfMemory })!bool {
+        const len = buf.len;
         const core = self.core;
         core.host.lock();
         if (self.state != .open or core.closed) {
@@ -1254,7 +1252,8 @@ pub const Session = struct {
             core.host.unlock();
             return false;
         }
-        core.datagrams_out.pushBack(core.gpa, d) catch {
+        const qsid: u64 = @as(u64, @intCast(self.id)) / 4;
+        core.datagrams_out.pushBack(core.gpa, .{ .bytes = buf, .qsid = qsid }) catch {
             core.host.unlock();
             return error.OutOfMemory;
         };
@@ -1356,6 +1355,27 @@ pub const Session = struct {
         }
     }
 
+    /// The next datagram, waiting for one: the received buffer itself, no
+    /// copy. Give it back with `freeDatagram` or move it on with
+    /// `sendDatagramOwned`. `error.SessionClosed` once the session has
+    /// ended and nothing is left.
+    pub fn nextDatagram(self: *Session) Error![]u8 {
+        const core = self.core;
+        while (true) {
+            const seen = self.ev.epoch();
+            core.host.lock();
+            if (self.datagrams_in.popFront()) |d| {
+                self.datagrams_in_bytes -= d.len;
+                core.host.unlock();
+                return d;
+            }
+            const still_open = self.state == .open;
+            core.host.unlock();
+            if (!still_open) return error.SessionClosed;
+            try self.ev.wait(core.io, seen);
+        }
+    }
+
     /// The largest datagram payload `sendDatagram` takes now: what fits in
     /// one packet on the current path and in the peer's limit. 0 when the
     /// peer takes no datagrams.
@@ -1384,15 +1404,19 @@ pub const Session = struct {
     /// Sends `data` as one datagram, waiting while many are queued. It may
     /// be lost; nothing says whether it arrived.
     pub fn sendDatagram(self: *Session, data: []const u8) (Error || error{ DatagramTooLarge, OutOfMemory })!void {
-        const d = try self.prefixDatagram(data);
-        var queued = false;
-        defer if (!queued) self.core.gpa.free(d);
+        const d = try self.core.gpa.dupe(u8, data);
+        errdefer self.core.gpa.free(d);
+        try self.sendDatagramOwned(d);
+    }
+
+    /// Sends `buf` (from `allocator()`) as one datagram without copying
+    /// it, waiting while many are queued. Returned: the queue owns `buf`.
+    /// An error (`Canceled` too): the caller still does. To forward:
+    /// `b.sendDatagramOwned(d) catch a.freeDatagram(d)`.
+    pub fn sendDatagramOwned(self: *Session, buf: []u8) (Error || error{ DatagramTooLarge, OutOfMemory })!void {
         while (true) {
             const seen = self.ev.epoch();
-            if (try self.queueDatagram(d, data.len)) {
-                queued = true;
-                return;
-            }
+            if (try self.queueDatagramOwned(buf)) return;
             try self.ev.wait(self.core.io, seen);
         }
     }
@@ -2142,6 +2166,28 @@ test "WebTransport: a connection queues 16 datagrams under send-memory pressure,
     // Under 7/8 of the limit: back to 256.
     memory.add(-64);
     try std.testing.expectEqual(@as(usize, 256), core.datagramLimit());
+}
+
+test "WebTransport: a connection that goes with owned datagrams queued frees them" {
+    const Noop = struct {
+        fn f(_: *anyopaque) void {}
+    };
+    const gpa = std.testing.allocator;
+    var pool = bridge.BlockPool.init(gpa, 0);
+    defer pool.deinit();
+    var dummy: u8 = 0;
+    const host: Host = .{ .ctx = &dummy, .gen = undefined, .pool = &pool, .budget = undefined, .lock_fn = Noop.f, .unlock_fn = Noop.f, .kick_fn = Noop.f };
+    const core = try Core.create(gpa, undefined, undefined, host, true, .{});
+    // As `queueDatagramOwned` leaves them: buffers moved in, never written.
+    for (0..20) |i| {
+        const d = try gpa.dupe(u8, "queued");
+        core.datagrams_out.pushBack(gpa, .{ .bytes = d, .qsid = i }) catch |err| {
+            gpa.free(d);
+            core.destroy();
+            return err;
+        };
+    }
+    core.destroy();
 }
 
 test "WebTransport error codes map onto HTTP/3's and back, skipping the reserved ones" {

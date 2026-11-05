@@ -18,6 +18,29 @@ breaking changes are listed anyway.
   `anole_h3_send_pressure`, `anole_h3_send_pressure_entries_total` and
   `anole_h3_connections_refused_total{reason="memory"}`; the key is in the
   JSON config and the C ABI too. See docs/server.md "Response buffering".
+- **WebTransport datagrams without copies** (A2-1b, A2-1c):
+  `session.nextDatagram()` waits for the next datagram and returns the
+  received buffer itself; `takeDatagram`/`freeDatagram` (public again)
+  do the same without waiting; `sendDatagramOwned`/`trySendDatagramOwned`
+  move a buffer from `session.allocator()` into the connection's queue.
+  A forward between sessions of one server costs no allocation or copy.
+  See docs/webtransport.md "Datagrams".
+
+### Changed
+
+- WebTransport: a sent datagram no longer gets a copy with its quarter
+  stream ID in front (ngtcp2 takes the ID as its own vec), so
+  `sendDatagram` costs one allocation and one copy, and a C ABI datagram
+  one of each instead of two. `Session.Driver.takeDatagram`,
+  `freeDatagram` and `trySendDatagram` are gone: the first two are on
+  `Session`, the third is `trySendDatagramOwned`.
+
+### Fixed
+
+- C ABI: a WebTransport session's datagram queue no longer allocates or
+  frees under its spin lock, and no longer leaks datagrams when putting
+  back the ones the connection could not take; its capacity
+  (`datagram_queue`) is set when the session opens.
 
 ## 0.5.2 (2026-11-04)
 

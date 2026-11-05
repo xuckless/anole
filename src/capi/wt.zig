@@ -131,7 +131,10 @@ pub const SessionSlot = struct {
     lock: std.atomic.Mutex = .unlocked,
     /// Streams `anole_wt_open_stream` asked for, to open in order.
     opens: std.ArrayList(*StreamSlot) = .empty,
-    datagrams: std.ArrayList([]u8) = .empty,
+    /// Datagrams to send, oldest first; its capacity is the route's
+    /// `datagram_queue`, set when the session opens, so nothing is
+    /// allocated or freed under `lock` (`pushNewest`, `putBackOldest`).
+    datagrams: std.Deque([]u8) = .empty,
     close_code: ?u32 = null,
     close_reason: []u8 = &.{},
     /// `kick` is in the executor's inbox (never posted twice).
@@ -139,8 +142,6 @@ pub const SessionSlot = struct {
     /// The largest datagram the session takes now (0: none), for
     /// consumers to check against.
     max_datagram: usize = 0,
-    /// The route's `datagram_queue`.
-    datagram_queue: u32 = 0,
 
     // Executor-local from here.
     session: ?*Session = null,
@@ -172,8 +173,25 @@ pub const SessionSlot = struct {
         if (post) s.exec.post(&s.kick);
     }
 
+    /// Under `lock`: queues `d` behind the others; when the queue is
+    /// full, the oldest makes room and is returned, for the caller to
+    /// free (after unlocking) and count.
+    fn pushNewest(s: *SessionSlot, d: []u8) ?[]u8 {
+        const dropped = if (s.datagrams.len == s.datagrams.buffer.len) s.datagrams.popFront() else null;
+        s.datagrams.pushBackBounded(d) catch unreachable;
+        return dropped;
+    }
+
+    /// Under `lock`: puts `d`, just taken from the front, back there.
+    /// False when consumers filled the queue meanwhile: `d` is the
+    /// oldest, for the caller to drop.
+    fn putBackOldest(s: *SessionSlot, d: []u8) bool {
+        s.datagrams.pushFrontBounded(d) catch return false;
+        return true;
+    }
+
     fn clear(s: *SessionSlot) void {
-        for (s.datagrams.items) |d| gpa.free(d);
+        while (s.datagrams.popFront()) |d| gpa.free(d);
         s.datagrams.deinit(gpa);
         s.opens.deinit(gpa);
         gpa.free(s.close_reason);
@@ -343,8 +361,15 @@ pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
     const session = (try webtransport.accept(req, res, opts.accept)) orelse
         return res.fail(.bad_request, "this endpoint speaks WebTransport over HTTP/3");
     defer session.deinit();
+    // Datagrams move from the slot's queue into the session's as they
+    // are: both must be the engine's allocator.
+    std.debug.assert(session.allocator().ptr == gpa.ptr and session.allocator().vtable == gpa.vtable);
 
-    const s = x.wt.sessions.alloc(x) catch return;
+    var queue = std.Deque([]u8).initCapacity(gpa, @max(opts.datagram_queue, 1)) catch return;
+    const s = x.wt.sessions.alloc(x) catch {
+        queue.deinit(gpa);
+        return;
+    };
     const g = s.gen();
     s.route = route;
     s.session = session;
@@ -352,7 +377,7 @@ pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
     spin(&s.lock);
     s.close_code = null;
     s.max_datagram = session.maxDatagramSize();
-    s.datagram_queue = opts.datagram_queue;
+    s.datagrams = queue;
     s.lock.unlock();
     s.word.store(pack(g, .open), .release);
     _ = e.wt_sessions.fetchAdd(1, .monotonic);
@@ -371,13 +396,13 @@ pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
         x.postRecord(rec, true);
     } else |_| {}
 
-    const result = drive(s, g, session, opts);
+    const result = drive(s, g, session);
     finish(s, g, session);
     return result;
 }
 
 /// Runs the session until it closes (or the task is canceled).
-fn drive(s: *SessionSlot, g: u32, session: *Session, opts: Options) std.Io.Cancelable!void {
+fn drive(s: *SessionSlot, g: u32, session: *Session) std.Io.Cancelable!void {
     const x = s.exec;
     const e = x.engine;
     const high = e.stream_high_water;
@@ -390,8 +415,6 @@ fn drive(s: *SessionSlot, g: u32, session: *Session, opts: Options) std.Io.Cance
         spin(&s.lock);
         const opens = s.opens;
         s.opens = .empty;
-        var datagrams = s.datagrams;
-        s.datagrams = .empty;
         const close_code = s.close_code;
         const reason = s.close_reason;
         s.close_reason = &.{};
@@ -409,39 +432,39 @@ fn drive(s: *SessionSlot, g: u32, session: *Session, opts: Options) std.Io.Cance
         }
         var opens_list = opens;
         opens_list.deinit(gpa);
-        var sent: usize = 0;
-        for (datagrams.items) |d| {
-            const ok = Session.Driver.trySendDatagram(session, d) catch |err| switch (err) {
-                error.DatagramTooLarge, error.OutOfMemory => blk: {
-                    _ = e.wt_datagrams_dropped.fetchAdd(1, .monotonic);
-                    break :blk true;
-                },
-                else => blk: {
-                    // The session is over: the rest are dropped with it.
-                    break :blk true;
-                },
-            };
-            if (!ok) break;
-            gpa.free(d);
-            sent += 1;
-        }
-        if (sent < datagrams.items.len) {
-            // The connection's queue is full: the rest wait, in front of
-            // any queued since, within the session's bound.
+        // Datagrams out, oldest first, moved into the connection's queue
+        // one at a time; the lock is held only to take one or put it back.
+        // At most a queue's worth per round, so consumers that keep
+        // sending don't hold the rest of the round back.
+        for (0..s.datagrams.buffer.len) |_| {
             spin(&s.lock);
-            const later = s.datagrams;
-            s.datagrams = .empty;
-            s.datagrams.appendSlice(gpa, datagrams.items[sent..]) catch {};
-            s.datagrams.appendSlice(gpa, later.items) catch {};
-            var l = later;
-            l.deinit(gpa);
-            while (s.datagrams.items.len > opts.datagram_queue) {
-                gpa.free(s.datagrams.orderedRemove(0));
-                _ = e.wt_datagrams_dropped.fetchAdd(1, .monotonic);
-            }
+            const next = s.datagrams.popFront();
             s.lock.unlock();
-        } else if (sent > 0) progress = true;
-        datagrams.deinit(gpa);
+            const d = next orelse break;
+            const moved = session.trySendDatagramOwned(d) catch |err| {
+                gpa.free(d);
+                switch (err) {
+                    error.DatagramTooLarge, error.OutOfMemory => _ = e.wt_datagrams_dropped.fetchAdd(1, .monotonic),
+                    // The session is over: the rest are dropped with it.
+                    else => {},
+                }
+                continue;
+            };
+            if (!moved) {
+                // The connection's queue is full: it waits in front, unless
+                // consumers filled the slot meanwhile; then it is the oldest
+                // and goes.
+                spin(&s.lock);
+                const kept = s.putBackOldest(d);
+                s.lock.unlock();
+                if (!kept) {
+                    gpa.free(d);
+                    _ = e.wt_datagrams_dropped.fetchAdd(1, .monotonic);
+                }
+                break;
+            }
+            progress = true;
+        }
 
         // The peer's new streams.
         inline for (.{ Session.Driver.Direction.bidi, Session.Driver.Direction.uni }) |dir| {
@@ -452,8 +475,8 @@ fn drive(s: *SessionSlot, g: u32, session: *Session, opts: Options) std.Io.Cance
         }
 
         // Datagrams in.
-        while (Session.Driver.takeDatagram(session)) |d| {
-            defer Session.Driver.freeDatagram(session, d);
+        while (session.takeDatagram()) |d| {
+            defer session.freeDatagram(d);
             progress = true;
             const size = @sizeOf(abi.WtDatagramEvent) + d.len;
             const rec = newRecord(size, .wt_datagram, s.handle(g)) catch continue;
@@ -684,12 +707,15 @@ fn finish(s: *SessionSlot, g: u32, session: *Session) void {
     s.word.store(pack(engine.nextGen(g), .free), .release);
     const opens = s.opens;
     s.opens = .empty;
-    for (s.datagrams.items) |d| gpa.free(d);
-    s.datagrams.clearAndFree(gpa);
-    gpa.free(s.close_reason);
+    var datagrams = s.datagrams;
+    s.datagrams = .empty;
+    const reason = s.close_reason;
     s.close_reason = &.{};
     s.close_code = null;
     s.lock.unlock();
+    gpa.free(reason);
+    while (datagrams.popFront()) |d| gpa.free(d);
+    datagrams.deinit(gpa);
     for (opens.items) |st| abandon(st);
     var ol = opens;
     ol.deinit(gpa);
@@ -889,18 +915,12 @@ pub fn sendDatagram(e: *Engine, hv: u64, data: []const u8, borrow: bool) engine.
         gpa.free(copy);
         return error.TooBig;
     }
-    s.datagrams.append(gpa, copy) catch {
-        s.lock.unlock();
-        gpa.free(copy);
-        return error.OutOfMemory;
-    };
-    var dropped: u64 = 0;
-    while (s.datagrams.items.len > s.datagram_queue) {
-        gpa.free(s.datagrams.orderedRemove(0));
-        dropped += 1;
-    }
+    const dropped = s.pushNewest(copy);
     s.lock.unlock();
-    if (dropped > 0) _ = e.wt_datagrams_dropped.fetchAdd(dropped, .monotonic);
+    if (dropped) |d| {
+        gpa.free(d);
+        _ = e.wt_datagrams_dropped.fetchAdd(1, .monotonic);
+    }
     if (sent) |r| s.exec.postSentRec(hv, r);
     s.wake();
 }
@@ -932,4 +952,41 @@ pub fn close(e: *Engine, hv: u64, code: u32, reason: []const u8) engine.AnswerEr
     s.close_reason = copy;
     s.lock.unlock();
     s.wake();
+}
+
+test "capi engine: WebTransport: a session's datagram queue keeps the newest and puts a held one back in front" {
+    const t = std.testing.allocator;
+    var s: SessionSlot = .{};
+    s.datagrams = try .initCapacity(t, 4);
+    defer {
+        while (s.datagrams.popFront()) |d| t.free(d);
+        s.datagrams.deinit(t);
+    }
+    var name: [8]u8 = undefined;
+    // Ten into four: the six oldest come back, in order.
+    for (0..10) |i| {
+        const d = try t.dupe(u8, try std.fmt.bufPrint(&name, "{d}", .{i}));
+        if (s.pushNewest(d)) |old| {
+            defer t.free(old);
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&name, "{d}", .{i - 4}), old);
+        } else try std.testing.expect(i < 4);
+    }
+    try std.testing.expectEqual(@as(usize, 4), s.datagrams.len);
+    try std.testing.expectEqualStrings("6", s.datagrams.front().?);
+
+    // Held by the flush while a consumer refills the queue: it is the
+    // oldest, so it is the one to go.
+    const held = s.datagrams.popFront().?;
+    try std.testing.expectEqualStrings("6", held);
+    const d10 = try t.dupe(u8, "10");
+    try std.testing.expectEqual(@as(?[]u8, null), s.pushNewest(d10));
+    try std.testing.expect(!s.putBackOldest(held));
+    t.free(held);
+
+    // With room, it goes back in front.
+    const again = s.datagrams.popFront().?;
+    try std.testing.expectEqualStrings("7", again);
+    try std.testing.expect(s.putBackOldest(again));
+    try std.testing.expectEqualStrings("7", s.datagrams.front().?);
+    try std.testing.expectEqual(@as(usize, 4), s.datagrams.len);
 }

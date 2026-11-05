@@ -4190,6 +4190,7 @@ test {
     _ = @import("kafka_test.zig");
     _ = @import("parity_test.zig");
     if (features.grpc) _ = grpc;
+    if (features.http3) _ = wt;
     _ = net;
     _ = jobs;
     _ = webhooks;

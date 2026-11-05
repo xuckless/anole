@@ -141,6 +141,103 @@ fn pushSession(session: *wt.Session) !void {
     }
 }
 
+/// Allocations made through a `CountingAllocator` on this thread: a count
+/// taken around a call that does not suspend is that call's.
+threadlocal var counted_allocs: usize = 0;
+
+/// Counts allocations into `counted_allocs`; the rest is its child's.
+const CountingAllocator = struct {
+    child: std.mem.Allocator,
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        counted_allocs += 1;
+        return self.child.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        counted_allocs += 1;
+        return self.child.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(m, a, ra);
+    }
+};
+
+/// Allocations `forwardSession` saw in the sends of datagrams that start
+/// with 'm' (the measured ones).
+var forward_allocs: std.atomic.Value(usize) = .init(0);
+
+/// Sends each datagram back as it was received: the received buffer is
+/// moved into the connection's queue, no copy.
+fn forwardSession(session: *wt.Session, req: *dusty.Request) !void {
+    _ = req;
+    defer _ = handlers_done.fetchAdd(1, .release);
+    while (true) {
+        const d = session.nextDatagram() catch return;
+        const measured = d.len > 0 and d[0] == 'm';
+        const before = counted_allocs;
+        session.sendDatagramOwned(d) catch {
+            session.freeDatagram(d);
+            return;
+        };
+        if (measured) _ = forward_allocs.fetchAdd(counted_allocs - before, .release);
+    }
+}
+
+/// What `ownedSession` saw.
+var owned: struct {
+    too_large_kept: bool = false,
+    queued: usize = 0,
+    full_allocs: usize = std.math.maxInt(usize),
+    closed_kept: bool = false,
+    next_closed: bool = false,
+} = .{};
+
+/// The owned sends' failures: a datagram too large, the connection's
+/// queue full, the session closed; each leaves the buffer with the
+/// caller, which frees it (a double free or a leak fails the test).
+fn ownedSession(session: *wt.Session, req: *dusty.Request) !void {
+    _ = req;
+    defer _ = handlers_done.fetchAdd(1, .release);
+    const gpa = session.allocator();
+
+    const big = try gpa.alloc(u8, session.maxDatagramSize() + 1);
+    @memset(big, 'b');
+    if (session.sendDatagramOwned(big)) |_| {} else |err| owned.too_large_kept = err == error.DatagramTooLarge;
+    gpa.free(big);
+
+    // Nothing here waits, so ngtcp2 cannot drain the queue meanwhile.
+    while (true) {
+        const d = try gpa.dupe(u8, "fill");
+        const before = counted_allocs;
+        const moved = session.trySendDatagramOwned(d) catch |err| {
+            gpa.free(d);
+            return err;
+        };
+        if (!moved) {
+            owned.full_allocs = counted_allocs - before;
+            gpa.free(d);
+            break;
+        }
+        owned.queued += 1;
+    }
+
+    try session.close(0, "");
+    const late = try gpa.dupe(u8, "late");
+    if (session.sendDatagramOwned(late)) |_| {} else |err| owned.closed_kept = err == error.SessionClosed;
+    gpa.free(late);
+    if (session.nextDatagram()) |d| session.freeDatagram(d) else |err| owned.next_closed = err == error.SessionClosed;
+}
+
 /// RFC 9220: frames echoed until a close.
 fn wsEcho(ws: *websocket.Socket) !void {
     while (try ws.next()) |msg| try ws.send(msg.type, msg.data);
@@ -173,6 +270,8 @@ const Fixture = struct {
         http.router.get("/prio", webtransport.route(void, prioSession, .{}));
         http.router.get("/budget", webtransport.route(void, budgetSession, .{}));
         http.router.get("/inline", webtransport.route(void, inlineSession, .{}));
+        http.router.get("/forward", webtransport.route(void, forwardSession, .{}));
+        http.router.get("/owned", webtransport.route(void, ownedSession, .{}));
         if (features.websocket) http.router.get("/ws", websocket.route(void, wsEcho, .{}));
         const ep = try Endpoint.init(gpa, io, http, .{
             .address = .{ .ip4 = .loopback(0) },
@@ -386,6 +485,62 @@ test "WebTransport: a session closed with echoed datagrams unread frees them" {
     try wait.waitUntil(io, "all the echoes queued at the client", Queued{ .session = session }, Queued.all);
     session.deinit();
     conn.close();
+}
+
+test "WebTransport: a forwarded datagram is moved, not copied: no allocation per datagram" {
+    var counting: CountingAllocator = .{ .child = std.testing.allocator };
+    const gpa = counting.allocator();
+    const rt = try zio.Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var f = try Fixture.start(gpa, io);
+    defer f.stop(gpa, io);
+    // The client's allocations are not the server's to count.
+    const conn = try f.connect(std.testing.allocator, io);
+    defer conn.close();
+    const before = handlers_done.load(.acquire);
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/forward", .origin = "https://localhost" });
+    defer session.deinit();
+
+    // Warm-up: the connection's queue grows to hold 16 at once.
+    try echoNumbered(session, 64, 16);
+    // Measured: one at a time, so the queue never needs to grow.
+    forward_allocs.store(0, .release);
+    var msg: [16]u8 = undefined;
+    var buf: [64]u8 = undefined;
+    for (0..64) |i| {
+        const d = try std.fmt.bufPrint(&msg, "m-{d}", .{i});
+        try session.sendDatagram(d);
+        try std.testing.expectEqualStrings(d, try session.receiveDatagram(&buf));
+    }
+    try std.testing.expectEqual(@as(usize, 0), forward_allocs.load(.acquire));
+    try session.close(0, "");
+    // nextDatagram ends with the session.
+    try waitHandlers(io, before + 1);
+}
+
+test "WebTransport: owned datagram sends that fail leave the buffer with the caller" {
+    const gpa = std.testing.allocator;
+    // One executor: the handler's sends run with nothing else in between.
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(1) });
+    defer rt.deinit();
+    const io = rt.io();
+    var counting: CountingAllocator = .{ .child = gpa };
+    var f = try Fixture.start(counting.allocator(), io);
+    defer f.stop(counting.allocator(), io);
+    const conn = try f.connect(gpa, io);
+    defer conn.close();
+    owned = .{};
+    const before = handlers_done.load(.acquire);
+    const session = try conn.openWebTransport(.{ .authority = "localhost", .path = "/owned", .origin = "https://localhost" });
+    defer session.deinit();
+    try waitHandlers(io, before + 1);
+
+    try std.testing.expect(owned.too_large_kept);
+    try std.testing.expect(owned.queued >= 16);
+    try std.testing.expectEqual(@as(usize, 0), owned.full_allocs);
+    try std.testing.expect(owned.closed_kept);
+    try std.testing.expect(owned.next_closed);
 }
 
 /// Set by acceptOrderSession: bit 0 when it took its bidirectional streams
