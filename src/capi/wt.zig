@@ -402,8 +402,9 @@ pub fn handler(req: *dusty.Request, res: *dusty.Response) anyerror!void {
         return res.fail(.bad_request, "this endpoint speaks WebTransport over HTTP/3");
     defer session.deinit();
     // Datagrams move from the slot's queue into the session's as they
-    // are: both must be the engine's allocator.
-    std.debug.assert(session.allocator().ptr == gpa.ptr and session.allocator().vtable == gpa.vtable);
+    // are: both must be the engine's allocator. The vtable says which; in
+    // release builds `gpa` is `smp_allocator`, whose `ptr` is undefined.
+    std.debug.assert(session.allocator().vtable == gpa.vtable);
 
     var queue = std.Deque([]u8).initCapacity(gpa, @max(opts.datagram_queue, 1)) catch return;
     const s = x.wt.sessions.alloc(x) catch {
