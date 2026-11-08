@@ -5,7 +5,11 @@
 const std = @import("std");
 
 pub const huffman = @import("huffman.zig");
+pub const hpack = @import("hpack.zig");
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("hpack_test.zig");
+    // Against nghttp2's own inflater; compiled out with -Dhttp2=false.
+    if (@import("build_options").use_http2) _ = @import("hpack_diff_test.zig");
 }

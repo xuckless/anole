@@ -261,7 +261,9 @@ client, WebSocket, the HTTP/2 server engine, static files, assets)
 
 src/http/core/h2/ (the HTTP/2 codecs and protocol core; so far the HPACK
 Huffman codec, whose huffman_table.zig tools/gen_huffman_table.py generates
-from nghttp2's lib/nghttp2_hd_huffman_data.c)
+from nghttp2's lib/nghttp2_hd_huffman_data.c, and the HPACK codec from
+lib/nghttp2_hd.c; testdata/hpack_blocks.bin holds header blocks that
+tools/extract_hpack_blocks.py takes from nghttp2's fuzz/corpus)
   Translated from nghttp2's lib/. Every translated Zig file carries an
   attribution header; nghttp2's licence is kept as
   src/http/core/h2/LICENSE.nghttp2.
