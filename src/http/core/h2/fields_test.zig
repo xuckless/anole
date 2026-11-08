@@ -346,7 +346,7 @@ test "fuzz: h2 fields" {
 
         fn take(rest: *[]const u8) []const u8 {
             if (rest.len == 0) return "";
-            const n = @min(rest.*[0], rest.len - 1);
+            const n: usize = @min(rest.*[0], rest.len - 1);
             const s = rest.*[1..][0..n];
             rest.* = rest.*[1 + n ..];
             return s;
