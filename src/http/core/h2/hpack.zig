@@ -475,10 +475,7 @@ pub const Encoder = struct {
 
     pub fn encode(e: *Encoder, out: []u8, fields: []const Field) error{NoSpaceLeft}!usize {
         var w: usize = 0;
-        if (e.size_update_pending) {
-            try putInt(out, &w, 0x20, 5, 0);
-            e.size_update_pending = false;
-        }
+        if (e.size_update_pending) try putInt(out, &w, 0x20, 5, 0);
         for (fields) |f| {
             // deflate_nv's rule, "the same criteria used in Firefox".
             const never = f.never_index or std.mem.eql(u8, f.name, "authorization") or
@@ -500,6 +497,8 @@ pub const Encoder = struct {
             if (first == 0) try putString(out, &w, f.name);
             try putString(out, &w, f.value);
         }
+        // Only once the block is whole: a NoSpaceLeft retry still sends it.
+        e.size_update_pending = false;
         return w;
     }
 

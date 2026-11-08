@@ -14,8 +14,10 @@ const Field = hpack.Field;
 const Buf = vectors.Buf;
 
 /// Large enough that the list limit never fires on these inputs: every
-/// field is emitted, as nghttp2 does.
+/// field is emitted, as nghttp2 does. The second limit is a realistic one,
+/// which refuses blocks (INTENTIONAL.md 1-3).
 const scratch_len = 1 << 20;
+const limits = [_]u32{ scratch_len, 4096 };
 
 /// One connection's decoders.
 const Pair = struct {
@@ -23,16 +25,22 @@ const Pair = struct {
     ng: *c.nghttp2_hd_inflater,
     ours: *hpack.Decoder,
     scratch: []u8,
-    /// Both failed: the connection is over.
+    /// The decoded list limit passed to `block`.
+    limit: u32 = scratch_len,
+    /// Both failed, or ours ended the connection (INTENTIONAL.md 2, 3).
     done: bool = false,
     blocks: usize = 0,
+    /// Blocks our limit refused, and those whose `skipRest` completed
+    /// (the tables then compared).
+    refused: usize = 0,
+    skipped: usize = 0,
 
-    fn init(a: std.mem.Allocator) !Pair {
+    fn init(a: std.mem.Allocator, limit: u32) !Pair {
         var ng: ?*c.nghttp2_hd_inflater = null;
         if (c.nghttp2_hd_inflate_new(&ng) != 0) return error.OutOfMemory;
         const ours = try a.create(hpack.Decoder);
         ours.* = .init(.{});
-        return .{ .a = a, .ng = ng.?, .ours = ours, .scratch = try a.alloc(u8, scratch_len) };
+        return .{ .a = a, .ng = ng.?, .ours = ours, .scratch = try a.alloc(u8, scratch_len), .limit = limit };
     }
 
     fn deinit(p: *Pair) void {
@@ -51,30 +59,41 @@ const Pair = struct {
         var theirs: std.ArrayList(Field) = .empty;
         const ng_ok = try p.ngDecode(a, block, &theirs);
         var mine: std.ArrayList(Field) = .empty;
-        var b = p.ours.block(block, p.scratch, scratch_len);
+        var b = p.ours.block(block, p.scratch, p.limit);
         const our_err: ?hpack.Error = while (true) {
             const f = (b.next() catch |err| break err) orelse break null;
             try mine.append(a, .{ .name = try a.dupe(u8, f.name), .value = try a.dupe(u8, f.value), .never_index = f.never_index });
         };
         errdefer std.debug.print("hpack diff: block {d} of the pair, nghttp2 {s}, ours {?t}: \"{f}\"\n", .{ p.blocks, if (ng_ok) "ok" else "error", our_err, std.zig.fmtString(block) });
-        var refused = false;
-        const err = our_err orelse error.CompressionError;
-        if (our_err != null and err == error.HeaderListTooLarge) {
-            // Our limit (INTENTIONAL.md 1): nghttp2's list must be larger,
-            // and the rest of the block still decodes for the table.
-            var size: u64 = 0;
-            for (theirs.items) |t| size += t.name.len + t.value.len + 32;
-            try testing.expect(size > scratch_len);
-            try testing.expect(mine.items.len < theirs.items.len);
-            refused = true;
-            b.skipRest() catch |e| try testing.expectEqual(error.CompressionError, e);
-        } else if (our_err != null) try testing.expectEqual(error.CompressionError, err);
-        try testing.expectEqual(ng_ok, our_err == null or (refused and p.ours.state != .bad));
-        if (!refused) try testing.expectEqual(theirs.items.len, mine.items.len);
-        for (theirs.items[0..mine.items.len], mine.items) |t, m| {
-            try testing.expectEqualStrings(t.name, m.name);
-            try testing.expectEqualStrings(t.value, m.value);
-            try testing.expectEqual(t.never_index, m.never_index);
+        if (if (our_err) |e| e == error.HeaderListTooLarge else false) {
+            // Our limit (INTENTIONAL.md 1): our fields are a prefix of
+            // nghttp2's, its list is over the limit (unless it failed inside
+            // the refused field), and the rest of the block still decodes
+            // for the table, or ends the connection (INTENTIONAL.md 2, 3).
+            try testing.expect(mine.items.len <= theirs.items.len);
+            try expectPrefix(theirs.items, mine.items);
+            if (ng_ok) {
+                var size: u64 = 0;
+                for (theirs.items) |t| size += t.name.len + t.value.len + 32;
+                try testing.expect(size > p.limit);
+                try testing.expect(mine.items.len < theirs.items.len);
+            }
+            p.refused += 1;
+            const skip_ok = if (b.skipRest()) |_| true else |e| switch (e) {
+                error.HeaderBlockTooCostly => {
+                    p.done = true;
+                    return;
+                },
+                error.CompressionError => false,
+                else => return e,
+            };
+            try testing.expectEqual(ng_ok, skip_ok);
+            if (skip_ok) p.skipped += 1;
+        } else {
+            if (our_err) |e| try testing.expectEqual(error.CompressionError, e);
+            try testing.expectEqual(ng_ok, our_err == null);
+            try testing.expectEqual(theirs.items.len, mine.items.len);
+            try expectPrefix(theirs.items, mine.items);
         }
         if (!ng_ok) {
             p.done = true;
@@ -121,6 +140,14 @@ const Pair = struct {
     }
 };
 
+fn expectPrefix(theirs: []const Field, mine: []const Field) !void {
+    for (theirs[0..mine.len], mine) |t, m| {
+        try testing.expectEqualStrings(t.name, m.name);
+        try testing.expectEqualStrings(t.value, m.value);
+        try testing.expectEqual(t.never_index, m.never_index);
+    }
+}
+
 fn nvSlice(ptr: [*c]u8, len: usize) []const u8 {
     return if (len == 0) "" else ptr[0..len];
 }
@@ -130,7 +157,7 @@ test "h2 hpack diff: RFC 7541 vectors and nghttp2's test blocks" {
     defer arena.deinit();
     const a = arena.allocator();
     for (vectors.rfc_groups) |g| {
-        var p: Pair = try .init(testing.allocator);
+        var p: Pair = try .init(testing.allocator, scratch_len);
         defer p.deinit();
         for (g.vectors, 0..) |v, i| {
             var b: Buf = .init(a);
@@ -142,7 +169,7 @@ test "h2 hpack diff: RFC 7541 vectors and nghttp2's test blocks" {
         }
     }
     for (try vectors.portedCases(a)) |case| {
-        var p: Pair = try .init(testing.allocator);
+        var p: Pair = try .init(testing.allocator, scratch_len);
         defer p.deinit();
         for (case.blocks) |blk| try p.feed(blk);
     }
@@ -152,21 +179,23 @@ test "h2 hpack diff: real header blocks from nghttp2's fuzz corpus" {
     // tools/extract_hpack_blocks.py: u32 connections; per connection a
     // u32 block count, then u32 length + bytes per block.
     const data = @embedFile("testdata/hpack_blocks.bin");
-    var pos: usize = 0;
-    const conns = readU32(data, &pos);
-    var blocks: usize = 0;
-    for (0..conns) |_| {
-        var p: Pair = try .init(testing.allocator);
-        defer p.deinit();
-        for (0..readU32(data, &pos)) |_| {
-            const n = readU32(data, &pos);
-            try p.feed(data[pos..][0..n]);
-            pos += n;
-            blocks += 1;
+    for (limits) |limit| {
+        var pos: usize = 0;
+        const conns = readU32(data, &pos);
+        var blocks: usize = 0;
+        for (0..conns) |_| {
+            var p: Pair = try .init(testing.allocator, limit);
+            defer p.deinit();
+            for (0..readU32(data, &pos)) |_| {
+                const n = readU32(data, &pos);
+                try p.feed(data[pos..][0..n]);
+                pos += n;
+                blocks += 1;
+            }
         }
+        try testing.expectEqual(data.len, pos);
+        try testing.expect(blocks >= 300);
     }
-    try testing.expectEqual(data.len, pos);
-    try testing.expect(blocks >= 300);
 }
 
 fn readU32(data: []const u8, pos: *usize) u32 {
@@ -195,34 +224,40 @@ fn randomString(a: std.mem.Allocator, r: std.Random, pool: []const []const u8) !
     };
 }
 
-/// A block of random representations, mostly valid against a table of
-/// `table_len` entries: indexed (now and then past the table or 0),
-/// literals of the three kinds on static, dynamic or new names, Huffman or
-/// raw, size updates at the start (now and then past 4096 or later).
+/// A block of random representations against a table of `table_len`
+/// entries: indexed, literals of the three kinds on static, dynamic or new
+/// names, Huffman or raw, size updates at the start. About one in 200 is
+/// invalid (an index of 0 or past the table, a size update past 4096 or
+/// after a field), so most connections run many blocks. Dynamic indexes
+/// are only used while the table is known not to have shrunk: before any
+/// size update or insertion in the block.
 fn generate(a: std.mem.Allocator, r: std.Random, table_len: usize) ![]u8 {
     var b: Buf = .init(a);
-    if (r.uintLessThan(u8, 6) == 0) for (0..1 + r.uintLessThan(usize, 2)) |_| {
-        try b.sizeUpdate(if (r.uintLessThan(u8, 10) == 0) 4097 + r.uintAtMost(u64, 100) else r.uintAtMost(u64, 4096));
-    };
-    const max_idx = hpack.static_table.len + table_len;
-    for (0..r.uintAtMost(usize, 12)) |_| {
-        const idx: u64 = switch (r.uintLessThan(u8, 20)) {
-            0 => 0,
-            1 => max_idx + 1 + r.uintAtMost(u64, 3),
-            else => 1 + r.uintLessThan(u64, max_idx),
-        };
-        switch (r.uintLessThan(u8, 5)) {
-            0 => try b.indexed(if (idx == 0) 1 else idx),
-            1 => if (r.uintLessThan(u8, 20) == 0) try b.indexed(0) else try b.indexed(idx),
-            else => {
-                const mode: Buf.Mode = @fromBackingInt(@intCast(r.uintLessThan(u2, 3)));
-                const name_idx = if (r.boolean()) 0 else idx;
-                try b.literal(mode, name_idx, try randomString(a, r, &pool_names), try randomString(a, r, &pool_values));
-            },
+    var dynamic = table_len;
+    if (r.uintLessThan(u8, 6) == 0) {
+        for (0..1 + r.uintLessThan(usize, 2)) |_| {
+            try b.sizeUpdate(if (rare(r)) 4097 + r.uintAtMost(u64, 100) else r.uintAtMost(u64, 4096));
         }
-        if (r.uintLessThan(u8, 30) == 0) try b.sizeUpdate(r.uintAtMost(u64, 4096));
+        dynamic = 0;
+    }
+    for (0..r.uintAtMost(usize, 12)) |_| {
+        const max_idx = hpack.static_table.len + dynamic;
+        const idx: u64 = if (rare(r)) (if (r.boolean()) 0 else max_idx + 1 + r.uintAtMost(u64, 3)) else 1 + r.uintLessThan(u64, max_idx);
+        if (r.uintLessThan(u8, 5) < 2) {
+            try b.indexed(idx);
+        } else {
+            const mode: Buf.Mode = @fromBackingInt(@intCast(r.uintLessThan(u2, 3)));
+            const name_idx = if (r.boolean()) 0 else idx;
+            try b.literal(mode, name_idx, try randomString(a, r, &pool_names), try randomString(a, r, &pool_values));
+            if (mode == .with) dynamic = 0;
+        }
+        if (rare(r)) try b.sizeUpdate(r.uintAtMost(u64, 4096));
     }
     return b.take();
+}
+
+fn rare(r: std.Random) bool {
+    return r.uintLessThan(u8, 200) == 0;
 }
 
 /// Bit flips, a byte set, truncation, an extra byte, as fuzz.zig's.
@@ -242,45 +277,68 @@ test "h2 hpack diff: 5000 generated blocks with table churn, and nghttp2's defla
     defer arena.deinit();
     var prng: std.Random.DefaultPrng = .init(0x6870616b);
     const r = prng.random();
-    var errors: usize = 0;
-    for (0..50) |conn| {
-        var p: Pair = try .init(testing.allocator);
-        defer p.deinit();
-        var deflater: ?*c.nghttp2_hd_deflater = null;
-        try testing.expectEqual(0, c.nghttp2_hd_deflate_new(&deflater, 4096));
-        defer c.nghttp2_hd_deflate_del(deflater);
-        for (0..100) |_| {
-            _ = arena.reset(.retain_capacity);
-            const a = arena.allocator();
-            // Every other connection is nghttp2's deflater (with indexing,
-            // the dynamic table churning) with a mutation now and then.
-            const block = if (conn % 2 == 0) blk: {
-                if (r.uintLessThan(u8, 20) == 0) try testing.expectEqual(0, c.nghttp2_hd_deflate_change_table_size(deflater, r.uintAtMost(usize, 4096)));
-                var nva: [16]c.nghttp2_nv = undefined;
-                const n = r.uintAtMost(usize, nva.len);
-                for (nva[0..n]) |*nv| {
-                    const name = try randomString(a, r, &pool_names);
-                    const value = try randomString(a, r, &pool_values);
-                    nv.* = .{ .name = @constCast(name.ptr), .namelen = name.len, .value = @constCast(value.ptr), .valuelen = value.len, .flags = @intCast(if (r.uintLessThan(u8, 10) == 0) c.NGHTTP2_NV_FLAG_NO_INDEX else c.NGHTTP2_NV_FLAG_NONE) };
+    for (limits) |limit| {
+        // Per kind (0 nghttp2's deflater, 1 the generator): blocks fed,
+        // connections that ended, and those that ran 20 blocks or more.
+        var fed: [2]usize = .{ 0, 0 };
+        var errors: [2]usize = .{ 0, 0 };
+        var long: [2]usize = .{ 0, 0 };
+        var refused: usize = 0;
+        var skipped: usize = 0;
+        for (0..50) |slot| {
+            const kind = slot % 2;
+            // 100 blocks per slot: a connection that ends is replaced.
+            var left: usize = 100;
+            while (left > 0) {
+                var p: Pair = try .init(testing.allocator, limit);
+                defer p.deinit();
+                var deflater: ?*c.nghttp2_hd_deflater = null;
+                try testing.expectEqual(0, c.nghttp2_hd_deflate_new(&deflater, 4096));
+                defer c.nghttp2_hd_deflate_del(deflater);
+                while (left > 0 and !p.done) : (left -= 1) {
+                    _ = arena.reset(.retain_capacity);
+                    const a = arena.allocator();
+                    // nghttp2's deflater (with indexing, the dynamic table
+                    // churning) with a mutation now and then, or ours.
+                    const block = if (kind == 0) blk: {
+                        if (r.uintLessThan(u8, 20) == 0) try testing.expectEqual(0, c.nghttp2_hd_deflate_change_table_size(deflater, r.uintAtMost(usize, 4096)));
+                        var nva: [16]c.nghttp2_nv = undefined;
+                        const n = r.uintAtMost(usize, nva.len);
+                        for (nva[0..n]) |*nv| {
+                            const name = try randomString(a, r, &pool_names);
+                            const value = try randomString(a, r, &pool_values);
+                            nv.* = .{ .name = @constCast(name.ptr), .namelen = name.len, .value = @constCast(value.ptr), .valuelen = value.len, .flags = @intCast(if (r.uintLessThan(u8, 10) == 0) c.NGHTTP2_NV_FLAG_NO_INDEX else c.NGHTTP2_NV_FLAG_NONE) };
+                        }
+                        const out = try a.alloc(u8, c.nghttp2_hd_deflate_bound(deflater, &nva[0], n));
+                        const rv = c.nghttp2_hd_deflate_hd(deflater, out.ptr, out.len, &nva[0], n);
+                        try testing.expect(rv >= 0);
+                        const enc = out[0..@intCast(rv)];
+                        break :blk if (r.uintLessThan(u8, 25) == 0) mutate(r, enc) else enc;
+                    } else blk: {
+                        const g = try generate(a, r, p.ours.tableLen());
+                        break :blk if (r.uintLessThan(u8, 20) == 0) mutate(r, g) else g;
+                    };
+                    try p.feed(block);
+                    fed[kind] += 1;
                 }
-                const out = try a.alloc(u8, c.nghttp2_hd_deflate_bound(deflater, &nva[0], n));
-                const rv = c.nghttp2_hd_deflate_hd(deflater, out.ptr, out.len, &nva[0], n);
-                try testing.expect(rv >= 0);
-                const enc = out[0..@intCast(rv)];
-                break :blk if (r.uintLessThan(u8, 25) == 0) mutate(r, enc) else enc;
-            } else blk: {
-                const g = try generate(a, r, p.ours.tableLen());
-                break :blk if (r.uintLessThan(u8, 4) == 0) mutate(r, g) else g;
-            };
-            try p.feed(block);
-            if (p.done) {
-                errors += 1;
-                break;
+                if (p.done) errors[kind] += 1;
+                if (p.blocks >= 20) long[kind] += 1;
+                refused += p.refused;
+                skipped += p.skipped;
             }
         }
+        errdefer std.debug.print("hpack diff: limit {d}, fed {any}, ended {any}, long {any}, refused {d}, skipped {d}\n", .{ limit, fed, errors, long, refused, skipped });
+        // Every block ran and both kinds hit errors. Without the limit
+        // firing, many connections went a long way on one decoder; with
+        // it, blocks were refused and some of them completed skipRest and
+        // compared tables (most of the rest end in HeaderBlockTooCostly).
+        try testing.expectEqual(.{ 2500, 2500 }, fed);
+        for (errors) |e| try testing.expect(e > 0);
+        if (limit == scratch_len) {
+            try testing.expectEqual(0, refused);
+            for (long) |l| try testing.expect(l >= 30);
+        } else try testing.expect(refused >= 1000 and skipped >= 500);
     }
-    // Both paths ran: some connections failed, most went the distance.
-    try testing.expect(errors > 0 and errors < 50);
 }
 
 test "h2 hpack diff: our encoder through nghttp2's inflater" {

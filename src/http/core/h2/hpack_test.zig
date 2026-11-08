@@ -477,6 +477,20 @@ test "h2 hpack: encoder static matches, literals and the first size update" {
     try testing.expectEqual(4 + 5, ng.len);
 }
 
+test "h2 hpack: encoder keeps the first size update across a NoSpaceLeft" {
+    var e: hpack.Encoder = .{};
+    var buf: [128]u8 = undefined;
+    const f: Field = .{ .name = "x-custom", .value = "value" };
+    // The size update fits, the field doesn't: the retry must still send it.
+    try testing.expectError(error.NoSpaceLeft, e.encode(buf[0..3], &.{f}));
+    try testing.expect(e.size_update_pending);
+    const n = try e.encode(&buf, &.{f});
+    try testing.expectEqual(0x20, buf[0]);
+    try testing.expect(!e.size_update_pending);
+    try testing.expectEqual(0x00, (try encodeOne(&e, &buf, f))[0]);
+    try testing.expect(n > 1);
+}
+
 test "h2 hpack: encoder never indexes authorization, short cookies and flagged fields" {
     var e: hpack.Encoder = .{ .size_update_pending = false };
     var buf: [128]u8 = undefined;
