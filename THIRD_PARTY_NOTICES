@@ -259,6 +259,19 @@ client, WebSocket, the HTTP/2 server engine, static files, assets)
             86d152f353c8ec029185e75ce5d2caf8d5756e59 (branch anole)
   Linked:   always
 
+src/http/core/h2/ (the HTTP/2 codecs and protocol core; so far the HPACK
+Huffman codec, whose huffman_table.zig tools/gen_huffman_table.py generates
+from nghttp2's lib/nghttp2_hd_huffman_data.c)
+  Translated from nghttp2's lib/. Every translated Zig file carries an
+  attribution header; nghttp2's licence is kept as
+  src/http/core/h2/LICENSE.nghttp2.
+  Licence:  MIT. Copyright (c) 2012, 2014, 2015, 2016 Tatsuhiro Tsujikawa;
+            Copyright (c) 2012, 2014, 2015, 2016 nghttp2 contributors
+  Source:   https://github.com/nghttp2/nghttp2, tag v1.70.0, through
+            https://github.com/xuckless/nghttp2, commit
+            0f8bc1c4271f4380409071eade31830e6e436bd6 (branch anole)
+  Linked:   tests only (until the engine uses it, M3)
+
 src/nats/core/ (the NATS protocol engine and client: parser, encoder,
 connection, reconnect, subscriptions, requests, drain, its tests and fake
 server)

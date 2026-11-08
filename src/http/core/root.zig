@@ -231,4 +231,5 @@ comptime {
     _ = @import("bind_violations.zig");
     _ = @import("json_out.zig");
     _ = @import("route_pattern.zig");
+    _ = @import("h2/root.zig");
 }
