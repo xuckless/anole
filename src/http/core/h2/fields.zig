@@ -11,9 +11,10 @@
 //!   * `ok`: pass it on;
 //!   * `ignore`: drop it silently, the stream lives (nghttp2 is lenient with
 //!     regular fields: bad bytes in a name or value, whitespace around a
-//!     value, an empty name);
+//!     value);
 //!   * `malformed`: the request is malformed (RFC 9113 §8.1.1), a stream
-//!     error PROTOCOL_ERROR.
+//!     error PROTOCOL_ERROR. One departure from nghttp2: an empty name is
+//!     malformed here (PLAN §5.4), where nghttp2 drops the field.
 //!
 //! Then `end` checks the head as a whole (the mandatory pseudo-headers).
 //! Nothing is allocated or kept: the slices are the caller's.
@@ -66,10 +67,11 @@ pub const Request = struct {
     fn onField(r: *Request, name: []const u8, value: []const u8, is_trailer: bool, opts: Opts) Verdict {
         // Strict with pseudo-headers, lenient with regular fields (the
         // reasoning is nghttp2's: there are so many bad ones about).
-        if (name.len == 0) {
-            r.seen.pseudo_disallowed = true;
-            return .ignore;
-        }
+        // An empty name is no token (RFC 9110 §5.1) and the request is
+        // malformed (PLAN §5.4, CVE-2019-9516's case), as in Go's
+        // x/net/http2 (validWireHeaderFieldName). nghttp2 drops the field
+        // instead: an intentional divergence.
+        if (name.len == 0) return .malformed;
         const tok = token(name);
         if (name[0] == ':') {
             if (tok == null or is_trailer or r.seen.pseudo_disallowed) return .malformed;

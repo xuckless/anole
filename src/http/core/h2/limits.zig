@@ -49,8 +49,12 @@ pub const TokenBucket = struct {
     }
 };
 
-/// PLAN §5.4's defaults, plus nghttp2 1.70's own where it has one. The
-/// config keys and the engine that charges them come with M2.
+/// PLAN §5.4's defaults that have no config key yet, plus nghttp2 1.70's
+/// own where it has one. The limits that already have one live only there
+/// (config.ServerConfig.Http2: stream_reset_burst/rate, charged per D15
+/// point 1 only for streams not yet answered, provoked resets included;
+/// refused_stream_burst/rate; max_continuations). The config keys for
+/// these and the engine that charges them come with M2.
 pub const Limits = struct {
     /// Queued control answers (PING ACK, SETTINGS ACK, RST_STREAM) before
     /// the connection is closed: nghttp2's max_outbound_ack
@@ -69,21 +73,6 @@ pub const Limits = struct {
     /// the session differential matches for free.
     glitch_burst: u64 = 10000,
     glitch_rate: u64 = 330,
-    /// Rapid reset (CVE-2023-44487). D15 point 1: charged only for streams
-    /// not yet answered (END_STREAM queued); resets we send because of
-    /// the peer's errors (MadeYouReset) still count. nghttp2 answers an empty
-    /// bucket with GOAWAY INTERNAL_ERROR, PLAN with ENHANCE_YOUR_CALM: M2's
-    /// choice, recorded in INTENTIONAL.md if it departs.
-    stream_reset_burst: u64 = 1000,
-    stream_reset_rate: u64 = 33,
-    /// Streams refused over max_concurrent_streams (the engine's
-    /// refusedHead today).
-    refused_stream_burst: u64 = 100,
-    refused_stream_rate: u64 = 10,
-    /// CONTINUATION frames after one HEADERS (CVE-2024-27316 class,
-    /// nghttp2 CVE-2024-28182); the block's bytes are also capped by
-    /// max_header_list_size before decoding.
-    max_continuations: u8 = 8,
     /// SETTINGS entries in one frame (nghttp2's NGHTTP2_DEFAULT_MAX_SETTINGS);
     /// more is ENHANCE_YOUR_CALM (frame.Options.max_settings).
     max_settings: u8 = 32,

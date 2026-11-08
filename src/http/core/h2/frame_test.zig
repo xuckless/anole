@@ -1,3 +1,8 @@
+// Tests translated from nghttp2 (MIT, Copyright (c) 2012, 2014, 2015, 2016
+// Tatsuhiro Tsujikawa; Copyright (c) 2012, 2014, 2015, 2016 nghttp2
+// contributors), v1.70.0 via Anole's fork xuckless/nghttp2 0f8bc1c,
+// tests/nghttp2_frame_test.c and tests/nghttp2_session_test.c. See LICENSE.nghttp2 and THIRD_PARTY_NOTICES.
+
 //! Tests for frame.zig. The round trips use the values of nghttp2's
 //! tests/nghttp2_frame_test.c (MIT, v1.70.0) pack_* tests; the rejections
 //! follow nghttp2_session_mem_recv2's checks, one row each.
@@ -357,6 +362,24 @@ test "h2 frame: need returns the exact byte counts" {
     const r = frame.parse(two, .{}).frame;
     try expectEqual(ping.len, r.len);
     try expectEqual(5, frame.parse(two[r.len..], .{}).need);
+}
+
+test "h2 frame: parseHead takes a DATA head before its payload" {
+    // A max-size DATA frame split by a read: the head alone is checked and
+    // handed out (flags masked), so the payload can be taken as it arrives.
+    const split = raw(16384, T.data, F.padded | F.end_stream | 0x40, 1, "\x03abc");
+    const h = frame.parseHead(split, .{}).head;
+    try expectEqual(16384, h.length);
+    try expectEqual(frame.Type.data, h.type);
+    try expectEqual(F.padded | F.end_stream, h.flags);
+    try expectEqual(1, h.stream_id);
+    try expectEqual(16384 + frame.header_len - split.len, frame.parse(split, .{}).need);
+    // The header-stage faults are the same as parse's.
+    try expectEqual(3, frame.parseHead(split[0..6], .{}).need);
+    const zero = raw(5, T.data, 0, 0, "");
+    try expectEqualDeep(frame.parse(zero, .{}).fault, frame.parseHead(zero, .{}).fault);
+    const big = raw(16385, T.data, 0, 1, "");
+    try expectEqual(frame.ErrorCode.frame_size_error, frame.parseHead(big, .{}).fault.code);
 }
 
 test "h2 frame: a larger max_frame_size is the caller's" {

@@ -194,14 +194,36 @@ pub const Result = union(enum) {
     fault: Fault,
 };
 
-/// Parses one frame from the front of `bytes`.
-pub fn parse(bytes: []const u8, opts: Options) Result {
+pub const HeadResult = union(enum) {
+    /// Not a whole frame header yet: this many more bytes.
+    need: usize,
+    /// With undefined flags cleared (as in `Parsed.header`).
+    head: FrameHeader,
+    fault: Fault,
+};
+
+/// Parses and checks only the frame header at the front of `bytes`: the
+/// checks nghttp2 makes before the payload is in (NGHTTP2_IB_READ_HEAD).
+/// For a connection that takes a DATA payload as it arrives instead of
+/// waiting for the whole frame; the payload's own checks (the pad length)
+/// are then the caller's.
+pub fn parseHead(bytes: []const u8, opts: Options) HeadResult {
     if (bytes.len < header_len) return .{ .need = header_len - bytes.len };
     var h = FrameHeader.parse(bytes[0..header_len]);
     if (checkHeader(h, opts)) |f| return .{ .fault = f };
+    h.flags &= definedFlags(h.type);
+    return .{ .head = h };
+}
+
+/// Parses one frame from the front of `bytes`.
+pub fn parse(bytes: []const u8, opts: Options) Result {
+    const h = switch (parseHead(bytes, opts)) {
+        .need => |n| return .{ .need = n },
+        .head => |h| h,
+        .fault => |f| return .{ .fault = f },
+    };
     const len = header_len + @as(usize, h.length);
     if (bytes.len < len) return .{ .need = len - bytes.len };
-    h.flags &= definedFlags(h.type);
     const frame = switch (parsePayload(h, bytes[header_len..len])) {
         .frame => |fr| fr,
         .fault => |f| return .{ .fault = f },

@@ -1,3 +1,8 @@
+// Tests translated from nghttp2 (MIT, Copyright (c) 2012, 2014, 2015, 2016
+// Tatsuhiro Tsujikawa; Copyright (c) 2012, 2014, 2015, 2016 nghttp2
+// contributors), v1.70.0 via Anole's fork xuckless/nghttp2 0f8bc1c,
+// tests/nghttp2_ratelim_test.c. See LICENSE.nghttp2 and THIRD_PARTY_NOTICES.
+
 //! Tests for limits.zig. The token bucket's are ported from nghttp2's
 //! tests/nghttp2_ratelim_test.c (MIT, v1.70.0).
 
@@ -74,11 +79,6 @@ test "h2 limits: defaults" {
     try expectEqual(100, l.empty_frame_rate);
     try expectEqual(10000, l.glitch_burst);
     try expectEqual(330, l.glitch_rate);
-    try expectEqual(1000, l.stream_reset_burst);
-    try expectEqual(33, l.stream_reset_rate);
-    try expectEqual(100, l.refused_stream_burst);
-    try expectEqual(10, l.refused_stream_rate);
-    try expectEqual(8, l.max_continuations);
     try expectEqual(32, l.max_settings);
     // The frame parser's default agrees.
     try expectEqual(@as(u32, l.max_settings), (@import("frame.zig").Options{}).max_settings);

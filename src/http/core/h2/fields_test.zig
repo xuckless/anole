@@ -1,3 +1,9 @@
+// Tests translated from nghttp2 (MIT, Copyright (c) 2012, 2014, 2015, 2016
+// Tatsuhiro Tsujikawa; Copyright (c) 2012, 2014, 2015, 2016 nghttp2
+// contributors), v1.70.0 via Anole's fork xuckless/nghttp2 0f8bc1c,
+// tests/nghttp2_helper_test.c, tests/nghttp2_http_test.c and
+// tests/nghttp2_session_test.c. See LICENSE.nghttp2 and THIRD_PARTY_NOTICES.
+
 //! Tests for fields.zig, ported from nghttp2's (MIT, v1.70.0)
 //! tests/nghttp2_helper_test.c, tests/nghttp2_http_test.c and the request
 //! cases of tests/nghttp2_session_test.c (test_nghttp2_http_mandatory_headers
@@ -186,11 +192,16 @@ test "h2 fields: te and the connection-specific fields" {
 
 test "h2 fields: empty name" {
     // CVE-2019-9516 was a leak of 0-length names; nothing is allocated
-    // here. nghttp2 drops the field and allows no pseudo-header after it.
+    // here. PLAN §5.4: the request is malformed (a stream reset), in the
+    // head and in trailers, whatever came before (nghttp2 drops the field).
     var r: Request = .{};
     try expectEqual(Verdict.ok, verdict(&r, ":method", "GET"));
-    try expectEqual(Verdict.ignore, verdict(&r, "", "x"));
-    try expectEqual(Verdict.malformed, verdict(&r, ":path", "/"));
+    try expectEqual(Verdict.malformed, verdict(&r, "", "x"));
+    r = .{};
+    try expectEqual(Verdict.malformed, verdict(&r, "", ""));
+    r = .{};
+    try expectEqual(Verdict.malformed, r.trailer("", "x", .{}));
+    try expect(!accepts(cat(get, &.{.{ "", "x" }}), .{}));
 }
 
 test "h2 fields: an uppercase name is malformed, other bad bytes are dropped" {
