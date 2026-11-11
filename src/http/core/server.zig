@@ -2768,6 +2768,12 @@ pub fn Server(comptime Ctx: type) type {
                 // the error log (nginx logs these at info, as the TLS
                 // handshake failures are).
                 log.info("Malformed request: {}", .{err});
+            } else if (err == error.WriteTimeout) {
+                // A peer that stops reading is the peer's doing too (nginx:
+                // "client timed out", at info). Whether the stream's write or
+                // the connection's last write meets the deadline depends on
+                // the platform's socket buffers, so this is not an error.
+                log.info("Peer stopped reading: {}", .{err});
             } else {
                 log.err("Connection error: {}", .{err});
             }
