@@ -204,8 +204,8 @@ src/tls/dusty_tls.zig	L2	4
 src/typed.zig	U3	2
 src/validate/core.zig	U3	1
 src/validate/dates.zig	U3	2
-src/watch/pg.zig	L2	2
-src/watch/redis.zig	L2	3
+src/watch/hub.zig	L2	2
+src/watch/redis.zig	L2	1
 src/watch/redis.zig	U3	1
 src/watch/root.zig	L2	5
 src/watch/root.zig	U3	18

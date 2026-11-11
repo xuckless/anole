@@ -1186,6 +1186,7 @@ test {
     _ = @import("watch_test.zig");
     _ = @import("live_test.zig");
     if (features.redis) _ = @import("redis.zig");
+    if (features.postgres or features.redis) _ = @import("hub.zig");
 }
 
 test "watch: the feeds and the change stream compile" {

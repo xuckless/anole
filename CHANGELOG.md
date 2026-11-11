@@ -97,6 +97,14 @@ breaking changes are listed anyway.
 
 ### Fixed
 
+- **watch (Redis Pub/Sub)**: a channel or pattern whose first watch
+  started while the shared SUBSCRIBE connection was being opened was not
+  subscribed until the connection was next lost (#216). The PostgreSQL
+  and Redis Pub/Sub watches now share one hub, which subscribes such
+  names (and unsubscribes names whose last watch left meanwhile) once
+  the connection is open. The PostgreSQL hub, like the Redis one, now
+  stops reconnecting once no watch is left, and starts again with the
+  next.
 - **SSE**: `Subscriber.close()` on a subscriber whose write had just
   failed queued an end and claimed a sender for the dead stream (#211).
   In the fallback (S3) nothing ran that sender, so ending the subscriber
