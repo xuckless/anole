@@ -2576,6 +2576,29 @@ test "capi engine: ANOLE_EV_DRAINING reaches every consumer once when the drain 
     try std.testing.expect(e.wait(stopWaitMs()));
 }
 
+test "capi engine: a drain the console or a signal starts (App.stop, not anole_server_drain) posts ANOLE_EV_DRAINING once (#201)" {
+    const e, const c = try ringEngine(8);
+    defer e.destroy();
+    e.testStopServer();
+    var counts: [64]u32 = @splat(0);
+    try drainCounts(c, &counts, 2);
+    try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.draining)]);
+    try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.stopped)]);
+    try std.testing.expect(e.wait(stopWaitMs()));
+}
+
+test "capi engine: anole_server_drain after a drain the console started posts no second ANOLE_EV_DRAINING (#201)" {
+    const e, const c = try ringEngine(8);
+    defer e.destroy();
+    e.testStopServer();
+    try e.drain();
+    var counts: [64]u32 = @splat(0);
+    try drainCounts(c, &counts, 2);
+    try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.draining)]);
+    try std.testing.expectEqual(@as(u32, 1), counts[@backingInt(abi.EventType.stopped)]);
+    try std.testing.expect(e.wait(stopWaitMs()));
+}
+
 // ---------------------------------------------------------------------------
 // A streamed answer outlives request_ms and Anole's backstop on every protocol
 

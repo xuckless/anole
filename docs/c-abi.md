@@ -319,7 +319,7 @@ parameters, metadata) are reached through the offset stored in the record.
 | (127-131) | reserved for storage and mail | | |
 | `ANOLE_EV_CONSOLE_CLOSED` (132) | `anole_console_closed_event`: the in-process console closed (`reason`: `ANOLE_CONSOLE_QUIT`, `_INTERRUPT`, `_RESTARTING`); only after `anole_console_open` | 0 | none: resume reading stdin |
 | (133-135) | reserved for the console | | |
-| `ANOLE_EV_DRAINING` (41) | `anole_event`: `anole_server_drain` was called; once per consumer, before sockets get 1001 or requests are cut: finish long polls and event streams | 0 | none |
+| `ANOLE_EV_DRAINING` (41) | `anole_event`: the drain started, whatever started it (`anole_server_drain`, the console, a signal under `ANOLE_SERVER_SIGNALS`, a restart's hand-off); once per consumer, before sockets get 1001 or requests are cut: finish long polls and event streams | 0 | none |
 
 The numbers are allocated once and frozen: 0 none; 1-11 core; 12-19 gRPC;
 20-29 WebTransport; 30-39 database; 40-49 HTTP and WebSocket additions;

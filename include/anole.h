@@ -490,7 +490,9 @@ enum anole_event_type {
                                     route with "accept": "consumer": answer it with anole_ws_accept,
                                     or refuse it with any answer to a request (anole_req_respond,
                                     anole_req_fail, anole_req_stream_*, anole_req_abort) */
-  ANOLE_EV_DRAINING = 41,        /* anole_event, handle 0: anole_server_drain was called; once per
+  ANOLE_EV_DRAINING = 41,        /* anole_event, handle 0: the drain started, whatever started it
+                                    (anole_server_drain, the console, a signal under
+                                    ANOLE_SERVER_SIGNALS, a restart's hand-off); once per
                                     consumer, before any WebSocket 1001 or abort. Long polls and
                                     event streams finish up while the drain's deadline
                                     (timeouts.shutdown_ms) runs */

@@ -94,9 +94,21 @@ breaking changes are listed anyway.
   longer searches its member list (each membership keeps its position),
   so many subscribers leaving at once no longer hold the hub's lock for
   a time that grows with the square of their number.
+- **Docs, net (raw TCP)**: docs/net.md and docs/c-abi.md said a raw TCP
+  connection that had parked (`timeouts.idle_park`) was closed at drain
+  start whatever the listener asked, its queue dropped (#200). It is not:
+  raw connections count for the drain while parked, the park shelf stops
+  only after the drain's wait, and a parked connection gets the
+  listener's drain handling (`drain`, `close_on_drain: false`, or the
+  default close after its queue) like any other. Tests now cover it.
 
 ### Fixed
 
+- **C ABI**: `ANOLE_EV_DRAINING` was posted only when the drain came
+  from `anole_server_drain`; a drain the console started, a signal (with
+  `ANOLE_SERVER_SIGNALS`), a restart's hand-off or a failing listener
+  posted none (#201). It is now posted when the server's drain starts,
+  whatever started it, once per consumer.
 - **net (raw TCP)**: a connection whose write side was already ended
   (`conn.end()`, `ANOLE_NET_F_END`) and whose peer then stayed silent was
   not closed by the drain or by a later graceful close until the peer
@@ -108,13 +120,6 @@ breaking changes are listed anyway.
   server's own shutdown (a reset, a failure, the linger) is no longer
   reported to a `half_open` handler as the peer's `end`
   (`ANOLE_EV_NET_END`).
-- **net (raw TCP), docs**: docs/net.md and docs/c-abi.md said a raw TCP
-  connection that had parked (`timeouts.idle_park`) was closed at drain
-  start whatever the listener asked, its queue dropped (#200). It is not:
-  raw connections count for the drain while parked, the park shelf stops
-  only after the drain's wait, and a parked connection gets the
-  listener's drain handling (`drain`, `close_on_drain: false`, or the
-  default close after its queue) like any other. Tests now cover it.
 - **watch (Redis Pub/Sub)**: a channel or pattern whose first watch
   started while the shared SUBSCRIBE connection was being opened was not
   subscribed until the connection was next lost (#216). The PostgreSQL
