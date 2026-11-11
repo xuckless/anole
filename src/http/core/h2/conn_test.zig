@@ -1175,6 +1175,39 @@ test "h2 conn: a stream reset over its DATA gives the connection credit back" {
     try expectEqual(before, connCredit(&t.c));
 }
 
+test "h2 conn: a DATA frame past the window is a FLOW_CONTROL_ERROR however the reads cut it" {
+    // Found by the session differential (nghttp2's corpus, tight profile):
+    // charged per chunk, credit the handler gave back for the frame's first
+    // bytes made room for the rest when they arrived a few at a time, and
+    // the 2000-byte frame on a 1024-byte window was taken.
+    for ([_]bool{ false, true }) |bytewise| {
+        const t = try ready(.{ .initial_window = 1024 });
+        defer t.destroy();
+        t.bytewise = bytewise;
+        try t.feed(try t.headers(1, &post, false));
+        const big: [2000]u8 = @splat('x');
+        try expectError(error.ConnectionError, t.feed(try t.data(1, &big, true)));
+        try expectFrames(try t.drain(), &.{goawayWith(.flow_control_error)});
+        try expectEqual(0, t.rec.count(.data));
+    }
+}
+
+test "h2 conn: DATA on a stream this end reset is skipped whole, its padding unchecked" {
+    // Found by the session differential: a Pad Length past the payload of
+    // such a frame was a connection PROTOCOL_ERROR; nghttp2 ignores the
+    // frame before it reads the padding.
+    const t = try ready(.{});
+    defer t.destroy();
+    try t.feed(try t.headers(1, &post, false));
+    try t.c.reset(t.stream(1), .cancel);
+    try expectFrames(try t.drain(), &.{rstWith(1, .cancel)});
+    const before = connCredit(&t.c);
+    try t.feed(try t.raw(0, F.padded, 1, "\x08ppppppp"));
+    try expectFrames(try t.drain(), &.{});
+    try expectEqual(0, t.rec.count(.data));
+    try expectEqual(before, connCredit(&t.c));
+}
+
 test "h2 conn: interim responses before the final one" {
     const t = try ready(.{});
     defer t.destroy();
@@ -2259,10 +2292,12 @@ fn fuzzOne(input: []const u8) anyerror!void {
     try expectEqual(0, peak.live);
 }
 
-test "fuzz: h2 conn recv" {
-    const alloc = testing.allocator;
-    var seeds: std.ArrayList([]const u8) = .empty;
-    defer {
+/// The 'fuzz: h2 conn recv' seeds, owned by `alloc`: each a split byte
+/// (fuzzOne's stride) and then frames sent after the handshake. The
+/// session differential (conn_diff_test.zig) runs them too.
+pub fn fuzzSeeds(alloc: Allocator) ![][]u8 {
+    var seeds: std.ArrayList([]u8) = .empty;
+    errdefer {
         for (seeds.items) |s| alloc.free(s);
         seeds.deinit(alloc);
     }
@@ -2280,9 +2315,20 @@ test "fuzz: h2 conn recv" {
     };
     for (shapes, 0..) |frames, k| {
         var b: std.ArrayList(u8) = .empty;
+        errdefer b.deinit(alloc);
         try b.append(alloc, @intCast(k * 7));
         for (frames) |f| try b.appendSlice(alloc, f);
         try seeds.append(alloc, try b.toOwnedSlice(alloc));
     }
-    try fuzz.bytes(fuzzOne, seeds.items);
+    return seeds.toOwnedSlice(alloc);
+}
+
+test "fuzz: h2 conn recv" {
+    const alloc = testing.allocator;
+    const seeds = try fuzzSeeds(alloc);
+    defer {
+        for (seeds) |s| alloc.free(s);
+        alloc.free(seeds);
+    }
+    try fuzz.bytes(fuzzOne, seeds);
 }

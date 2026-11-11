@@ -531,7 +531,11 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             }
             const end_stream = h.flags & frame.flags.end_stream != 0;
             const padded = h.flags & frame.flags.padded != 0;
-            c.data_in = .{ .stream_id = id, .left = h.length, .pad = if (padded) null else 0, .end_stream = end_stream, .deliver = deliver };
+            // Ignored DATA is skipped whole, its padding unread: nghttp2
+            // goes to NGHTTP2_IB_IGN_DATA before inbound_frame_handle_pad
+            // (found by the session differential).
+            c.data_in = .{ .stream_id = id, .left = h.length, .pad = if (padded and deliver) null else 0, .end_stream = end_stream, .deliver = deliver };
+            try c.recvWindows(&c.data_in.?, h.length);
             if (h.length == 0) {
                 if (!end_stream) try c.chargeEmptyFrame();
                 var none: usize = 0;
@@ -548,8 +552,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 const pad = bytes[pos.*];
                 pos.* += 1;
                 d.left -= 1;
-                // The Pad Length byte is flow-controlled and consumed at once.
-                try c.recvWindows(d, 1);
+                // The Pad Length byte is consumed at once.
                 try c.consumeNow(if (d.deliver) c.table.get(d.stream_id) else null, 1);
                 if (pad > d.left) return c.terminate(.protocol_error, "DATA: invalid padding");
                 d.pad = pad;
@@ -564,7 +567,6 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             const dn = @min(n, data_left);
             d.left -= n;
             const last = d.left == 0;
-            try c.recvWindows(d, n);
             const s = (if (d.deliver) c.table.get(d.stream_id) else null) orelse {
                 d.deliver = false;
                 // Ignored DATA is consumed at once (nghttp2's IB_IGN_DATA).
@@ -605,7 +607,12 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         }
 
         /// nghttp2_session_update_recv_{connection,stream}_window_size: DATA
-        /// past a window is a connection FLOW_CONTROL_ERROR.
+        /// past a window is a connection FLOW_CONTROL_ERROR. Charged for the
+        /// whole frame at its header (RFC 9113 §6.9.1: the frame's length is
+        /// what must fit), where nghttp2 charges each chunk as it is read, so
+        /// that credit the handler gives back while a frame is still
+        /// arriving can't make room for it: the answer doesn't depend on how
+        /// the reads cut the frame (INTENTIONAL.md, session 5).
         fn recvWindows(c: *Self, d: *DataIn, n: u32) RecvError!void {
             if (n > c.recv_window) return c.terminate(.flow_control_error, "");
             c.recv_window -= @intCast(n);
