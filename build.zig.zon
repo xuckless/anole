@@ -65,9 +65,11 @@
         // run-queue-sized budgets stay behind it); Windows streaming files
         // on IOCP are upstream's (#857). zio sets TCP_NODELAY on the
         // listeners it opens only (#870); Anole sets it on its own.
+        // On io_uring a datagram batch after a full one is received with a
+        // direct recvmmsg, and with `fast_send` a batch is sent with a direct
+        // sendmmsg before the ring (#106, 4652663).
         .zio = .{
-            .url = "git+https://github.com/xuckless/zio#d799693f1ed594be28be0c192f662ec633443460",
-            .hash = "zio-0.19.0-xHbVVJ0EMQAArWJfQQKYIYFetjIrBygYFUnIfviRXFa5",
+            .path = "../zio-t3",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
