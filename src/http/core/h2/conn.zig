@@ -99,6 +99,8 @@ pub const client_magic = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub const default_window = 65535;
 /// The largest header block we send (nghttp2's NGHTTP2_MAX_HEADERSLEN).
 pub const max_headers_len = 65536;
+/// RFC 9218 §7.1's PRIORITY_UPDATE; frame.zig reports it as unknown.
+const priority_update_type = 0x10;
 
 /// config.ServerConfig's defaults, so that every limit's default number
 /// lives in one place (config.zig, or limits.Limits for those with no key).
@@ -276,9 +278,11 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         now_s: u64 = 0,
         /// PLAN §5.4's flood budgets: rapid and provoked resets (D15 point
         /// 1), streams refused before a handler saw them, empty and unknown
-        /// frames (D15 point 2), and nghttp2's glitch limiter (PRIORITY,
-        /// header blocks decoded only for the table). One of the last two
-        /// goes after the D15 point 5 calibration.
+        /// frames (D15 point 2), and nghttp2's glitch limiter (header blocks
+        /// decoded only for the table). The D15 point 5 calibration
+        /// (bench/results/20261111-h2-limits-calibration) kept both:
+        /// PRIORITY and PRIORITY_UPDATE are validated and charged to neither
+        /// (Chromium sends one per subresource; INTENTIONAL.md, limits 9).
         reset_budget: limits.TokenBucket,
         refused_budget: limits.TokenBucket,
         empty_budget: limits.TokenBucket,
@@ -485,8 +489,13 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 .ping => |pg| try c.onPing(pg),
                 .goaway => |g| try c.onGoaway(g),
                 .window_update => |inc| try c.onWindowUpdate(id, inc),
-                // RFC 9113 §4.1: ignored; D15 point 2 counts it as empty.
-                .unknown => try c.chargeEmptyFrame(),
+                // RFC 9113 §4.1: ignored; D15 point 2 counts it as empty,
+                // except RFC 9218's PRIORITY_UPDATE (INTENTIONAL.md, limits
+                // 9).
+                .unknown => |payload| if (@backingInt(p.header.type) == priority_update_type)
+                    try c.onPriorityUpdate(id, payload)
+                else
+                    try c.chargeEmptyFrame(),
             }
         }
 
@@ -828,16 +837,31 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
 
         /// The fork patch's PRIORITY handling (RFC 9113 §6.3): validated,
         /// otherwise ignored. Stream 0 is frame.zig's check.
-        /// No tree (D15 point 3, SETTINGS_NO_RFC7540_PRIORITIES): nothing
-        /// changes but nghttp2's glitch budget (:5843; CVE-2019-9513 has
-        /// nothing to loop over).
+        /// No tree (D15 point 3, SETTINGS_NO_RFC7540_PRIORITIES): it holds
+        /// no state and queues no output, so no budget is charged
+        /// (CVE-2019-9513 has nothing to loop over). nghttp2 charges its
+        /// glitch budget (:5843); INTENTIONAL.md, limits 9.
         fn onPriority(c: *Self, id: u31, p: frame.Priority) RecvError!void {
-            try c.chargeGlitch();
             if (p.dependency != id) return;
             // A stream error, except that RST_STREAM must not be sent on an
             // idle stream, which leaves a connection error.
             if (c.idle(id)) return c.terminate(.protocol_error, "PRIORITY: stream depends on itself");
             try c.provokedRst(id, .protocol_error);
+        }
+
+        /// RFC 9218 §7.1's PRIORITY_UPDATE (we advertise
+        /// SETTINGS_NO_RFC7540_PRIORITIES, so RFC 9218 clients send one
+        /// about as often as others send PRIORITY): validated as nghttp2
+        /// does with the extension on (:6192 the length, :4982 the stream,
+        /// :4987 an idle push stream; every even ID is one, we push
+        /// nothing), plus the RFC's Prioritized Stream ID 0, then ignored
+        /// and charged to no budget (INTENTIONAL.md, limits 9).
+        fn onPriorityUpdate(c: *Self, id: u31, payload: []const u8) RecvError!void {
+            if (payload.len < 4) return c.terminate(.frame_size_error, "PRIORITY_UPDATE: length < 4");
+            if (id != 0) return c.terminate(.protocol_error, "PRIORITY_UPDATE: stream_id != 0");
+            const target: u31 = @truncate(std.mem.readInt(u32, payload[0..4], .big));
+            if (target == 0) return c.terminate(.protocol_error, "PRIORITY_UPDATE: prioritized stream_id == 0");
+            if (target & 1 == 0) return c.terminate(.protocol_error, "PRIORITY_UPDATE: prioritizing idle push is not allowed");
         }
 
         /// nghttp2_session_on_rst_stream_received.
@@ -1086,8 +1110,8 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         }
 
         /// nghttp2's glitch limiter for what PLAN's empty-frame row doesn't
-        /// name: PRIORITY (:5843) and header blocks decoded only for the
-        /// table (:5811, :6332).
+        /// name: header blocks decoded only for the table (:5811, :6332).
+        /// Not PRIORITY or PRIORITY_UPDATE (INTENTIONAL.md, limits 9).
         fn chargeGlitch(c: *Self) RecvError!void {
             return c.charge(&c.glitch_budget, "too many glitches");
         }

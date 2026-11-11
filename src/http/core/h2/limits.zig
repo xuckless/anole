@@ -63,15 +63,17 @@ pub const Limits = struct {
     control_frame_budget: u32 = 1000,
     /// Empty-frame flood (CVE-2019-9518): DATA, HEADERS and CONTINUATION
     /// frames with an empty payload and no END_STREAM, per connection per
-    /// second. D15 point 2: unknown and extension frames count too.
-    /// Uncalibrated until D15 point 5.
+    /// second. D15 point 2: unknown and extension frames count too, but not
+    /// RFC 9218's PRIORITY_UPDATE. Kept at 100 by the D15 point 5
+    /// calibration (legitimate clients sent none).
     empty_frame_rate: u32 = 100,
     /// nghttp2's glitch limiter (session_update_glitch_ratelim; burst and
     /// rate per second), which PLAN §5.4 doesn't name. conn.zig charges it
-    /// for what the empty-frame budget doesn't take (PRIORITY, header
-    /// blocks decoded only for the table), GOAWAY ENHANCE_YOUR_CALM when
-    /// empty. After the D15 point 5 calibration one of the two buckets
-    /// goes, and conn.zig charges the survivor.
+    /// for what the empty-frame budget doesn't take (header blocks decoded
+    /// only for the table), GOAWAY ENHANCE_YOUR_CALM when empty. Not for
+    /// PRIORITY or PRIORITY_UPDATE, which nghttp2 charges here: the D15
+    /// point 5 calibration measured Chromium above the 330/s rate with
+    /// them (h2/INTENTIONAL.md, limits 9).
     glitch_burst: u64 = 10000,
     glitch_rate: u64 = 330,
     /// Bytes queued for the peer and not yet written past which new
