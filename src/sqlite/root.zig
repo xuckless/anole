@@ -332,7 +332,9 @@ pub const Client = struct {
     }
 
     /// The rows a batch at a time (`next`), holding a connection until
-    /// `deinit`.
+    /// `deinit`. On the writer, the checkout stays on the task that made it,
+    /// and a `Client` write from that task while it is open fails with "this
+    /// task already holds the writer" (#160).
     pub fn iterate(self: *Client, comptime T: type, cx: anytype, sql: []const u8, args: anytype) Error!Rows(T) {
         return self.with(.{}).iterate(T, cx, sql, args);
     }
@@ -405,7 +407,9 @@ pub const Client = struct {
     }
 
     /// The writer connection for the driver's own calls (`Conn.run`), held
-    /// until `release`.
+    /// until `release`. The checkout stays on the task that made it, and a
+    /// `Client` write from that task while it is open fails with "this task
+    /// already holds the writer" (#160).
     pub fn acquire(self: *Client, cx: anytype) Error!Conn {
         const lease = try self.checkOutWriter(cx);
         return .{ .db = self, .io = cx.io, .lease = lease };
