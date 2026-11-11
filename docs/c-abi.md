@@ -1572,8 +1572,8 @@ programmer error. Input Anole reads after the close is dropped (records
 already posted still come). The connection closes once the peer ends its
 side, or 2 s after this side ended (the queue written, TLS close_notify,
 FIN); writing the queue is bounded by `tcp.write_timeout_ms`. A connection
-idle long enough to have parked (`timeouts.idle_park_ms`) is closed at once
-instead, without waiting for its queue. `ANOLE_EV_NET_CLOSE` is posted once
+idle long enough to have parked (`timeouts.idle_park_ms`) is closed the same
+way, after its queue. `ANOLE_EV_NET_CLOSE` is posted once
 the connection's reading side lets go: one waiting for read credit (a
 consumer that stopped polling) holds it until the consumer polls or
 `timeouts.shutdown_ms` passes. A connection the consumer closed or reset
@@ -1586,8 +1586,8 @@ goodbye, set `"close_on_drain": false` on the listener's `tcp`: its
 connections stay open through the drain until the consumer closes them
 (after `ANOLE_EV_DRAINING`), or `timeouts.shutdown_ms` closes them with
 `ANOLE_NET_CLOSED_DRAIN`, as `node:net`'s `server.close()` leaves its
-sockets. Either way a connection that has parked (no input for
-`timeouts.idle_park_ms`) is closed at drain start. A connection whose write
+sockets. Parked connections (no input for `timeouts.idle_park_ms`) are no
+exception either way. A connection whose write
 side the consumer already ended (`ANOLE_NET_F_END`) is closed by the drain
 too: its FIN went already, so the 2 s wait for the peer starts at once (as for
 `ANOLE_NET_CLOSE_GRACEFUL` after `ANOLE_NET_F_END`).

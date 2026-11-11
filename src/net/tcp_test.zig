@@ -1854,3 +1854,123 @@ test "net tcp: the drain closes a half-closed connection whose peer stays silent
     try app.run();
     try checking.await(app.io());
 }
+
+fn waitParked(a: *App) !void {
+    try wait.waitUntil(a.io(), "the connection parked", a, struct {
+        fn one(ap: *App) bool {
+            return ap.server.parkedConnections() >= 1;
+        }
+    }.one);
+}
+
+/// Echoes; its `drain` says so and leaves the connection open.
+const KeepParked = struct {
+    var drains: std.atomic.Value(u32) = .init(0);
+    var closed: std.atomic.Value(u32) = .init(0);
+    var reason: std.atomic.Value(u32) = .init(99);
+    pub fn data(c: *net.Conn, bytes: []const u8) !void {
+        _ = try c.send(bytes);
+    }
+    pub fn drain(c: *net.Conn) !void {
+        _ = drains.fetchAdd(1, .release);
+        _ = try c.send("draining");
+    }
+    pub fn close(_: *net.Conn, r: net.CloseReason) void {
+        reason.store(@backingInt(r), .release);
+        _ = closed.fetchAdd(1, .release);
+    }
+};
+
+test "net tcp: a parked connection whose drain callback leaves it open stays open through the drain (#200)" {
+    KeepParked.drains.store(0, .monotonic);
+    KeepParked.closed.store(0, .monotonic);
+    KeepParked.reason.store(99, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1), .timeouts = .{ .idle_park = .fromMilliseconds(5), .shutdown = null } });
+    defer app.deinit();
+    if (!app.server.parksIdle()) return error.SkipZigTest;
+    try app.tcp("127.0.0.1:0", KeepParked, .{});
+    const Run = struct {
+        fn run(a: *App) !void {
+            try a.waitReady();
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            try s.writer().writeAll("a");
+            try s.writer().flush();
+            try expectRead(s, "a");
+            try waitParked(a);
+            a.stop();
+            try expectRead(s, "draining");
+            // Still open: input wakes it and is answered.
+            try s.writer().writeAll("ping");
+            try s.writer().flush();
+            try expectRead(s, "ping");
+            halfClose(s);
+            try expectEnd(s);
+            try waitFor(a.io(), &KeepParked.closed, 1);
+            try std.testing.expectEqual(@backingInt(net.CloseReason.peer), KeepParked.reason.load(.acquire));
+        }
+    };
+    var checking = try app.io().concurrent(Run.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
+    try app.run();
+    try checking.await(app.io());
+    try std.testing.expectEqual(@as(u32, 1), KeepParked.drains.load(.acquire));
+}
+
+/// Takes no input; the test sends to it.
+const Flood = struct {
+    var conn: std.atomic.Value(?*net.Conn) = .init(null);
+    var closed: std.atomic.Value(u32) = .init(0);
+    var reason: std.atomic.Value(u32) = .init(99);
+    pub fn open(c: *net.Conn) !void {
+        conn.store(c, .release);
+    }
+    pub fn data(_: *net.Conn, _: []const u8) !void {}
+    pub fn close(_: *net.Conn, r: net.CloseReason) void {
+        reason.store(@backingInt(r), .release);
+        _ = closed.fetchAdd(1, .release);
+    }
+};
+
+test "net tcp: the drain's close of a parked connection writes its queue before the FIN (#200)" {
+    Flood.conn.store(null, .monotonic);
+    Flood.closed.store(0, .monotonic);
+    Flood.reason.store(99, .monotonic);
+    var app = try App.init(alloc, .{ .executors = .exact(1), .timeouts = .{ .idle_park = .fromMilliseconds(5), .shutdown = null } });
+    defer app.deinit();
+    if (!app.server.parksIdle()) return error.SkipZigTest;
+    // More than the kernel's socket buffers hold on loopback: most of it
+    // is still queued when the drain starts.
+    const total = 32 * 1024 * 1024;
+    try app.tcp("127.0.0.1:0", Flood, .{ .write_max = total });
+    const Run = struct {
+        fn run(a: *App) !void {
+            try a.waitReady();
+            const s = try connect(a, portOf(a));
+            defer s.close();
+            const c = try waitConn(a.io(), "the connection opened", &Flood.conn);
+            try waitParked(a);
+            const big = try alloc.alloc(u8, total);
+            defer alloc.free(big);
+            @memset(big, 'f');
+            _ = try c.send(big);
+            try std.testing.expect(c.queued() > 0);
+            a.stop();
+            var buf: [64 * 1024]u8 = undefined;
+            var got: usize = 0;
+            while (true) {
+                const n = s.reader().readSliceShort(&buf) catch break;
+                if (n == 0) break;
+                got += n;
+            }
+            try std.testing.expectEqual(@as(usize, total), got);
+            halfClose(s);
+            try waitFor(a.io(), &Flood.closed, 1);
+            try std.testing.expectEqual(@backingInt(net.CloseReason.drain), Flood.reason.load(.acquire));
+        }
+    };
+    var checking = try app.io().concurrent(Run.run, .{&app});
+    defer checking.cancel(app.io()) catch {};
+    try app.run();
+    try checking.await(app.io());
+}

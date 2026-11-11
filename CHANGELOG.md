@@ -108,6 +108,13 @@ breaking changes are listed anyway.
   server's own shutdown (a reset, a failure, the linger) is no longer
   reported to a `half_open` handler as the peer's `end`
   (`ANOLE_EV_NET_END`).
+- **net (raw TCP), docs**: docs/net.md and docs/c-abi.md said a raw TCP
+  connection that had parked (`timeouts.idle_park`) was closed at drain
+  start whatever the listener asked, its queue dropped (#200). It is not:
+  raw connections count for the drain while parked, the park shelf stops
+  only after the drain's wait, and a parked connection gets the
+  listener's drain handling (`drain`, `close_on_drain: false`, or the
+  default close after its queue) like any other. Tests now cover it.
 - **watch (Redis Pub/Sub)**: a channel or pattern whose first watch
   started while the shared SUBSCRIBE connection was being opened was not
   subscribed until the connection was next lost (#216). The PostgreSQL
