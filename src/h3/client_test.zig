@@ -84,6 +84,46 @@ fn always425(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = "again";
 }
 
+/// GET /late-425 and GET /late-425-fill, for a 425 that comes while the
+/// server's stream limit holds the resend back (`dueBehindLimit`).
+const Late425 = struct {
+    /// Lets the early GET /late-425 answer its 425.
+    var answer: std.Io.Event = .unset;
+    /// Lets the GET /late-425-fill requests answer.
+    var fill: std.Io.Event = .unset;
+    /// GET /late-425-fill requests the server has taken.
+    var fillers: std.atomic.Value(u32) = .init(0);
+    /// GET /late-425 run after the handshake.
+    var runs: std.atomic.Value(u32) = .init(0);
+
+    fn reset() void {
+        answer = .unset;
+        fill = .unset;
+        fillers.store(0, .monotonic);
+        runs.store(0, .monotonic);
+    }
+
+    /// From early data: 425 Too Early once the test says so. After the
+    /// handshake: runs.
+    fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+        if (early_data.isEarly(req)) {
+            try answer.wait(req.io);
+            res.status = .too_early;
+            res.body = "too early";
+            return;
+        }
+        _ = runs.fetchAdd(1, .monotonic);
+        res.body = "ran";
+    }
+
+    /// Holds its stream open until the test lets it answer.
+    fn filler(req: *dusty.Request, res: *dusty.Response) !void {
+        _ = fillers.fetchAdd(1, .monotonic);
+        try fill.wait(req.io);
+        res.body = "filled";
+    }
+};
+
 /// POST /answer-first: answers without reading the request body.
 fn answerFirst(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = "first";
@@ -343,6 +383,8 @@ const Fixture = struct {
         http.router.post("/early-post", earlyPost);
         http.router.group("/too-early", &[_]dusty.Middleware(void){.init(&too_early_guard)}).get("/", tooEarlyRoute);
         http.router.get("/always-425", always425);
+        http.router.get("/late-425", Late425.handle);
+        http.router.get("/late-425-fill", Late425.filler);
         http.router.post("/answer-first", answerFirst);
         http.router.get("/port", port);
         http.router.get("/download", download);
@@ -2280,6 +2322,169 @@ test "h3: a request with a body sent in 0-RTT gets the 425, not a retry" {
     try std.testing.expectEqual(runs + 1, always_425_runs.load(.monotonic));
 }
 
+/// A GET of /late-425 sent in 0-RTT and answered 425 after the
+/// handshake, while the server's stream limit (8, `Fixture`) holds the
+/// resend back: the GET and seven GET /late-425-fill take every stream,
+/// and the client's datagrams are held (`Relay.holdUp`) so the server
+/// never hears the 425's stream end and gives no stream back. On return
+/// the request is due to go again (`testStreams().resend_due == 1`); the
+/// caller lets the fillers answer (`Late425.fill`) and the relay go on.
+const DueBehindLimit = struct {
+    f: Fixture,
+    relay: *Relay,
+    cache: client.SessionCache,
+    conn: *client.ClientConnection,
+    s: *client.Stream,
+    fillers: [7]*client.Stream,
+
+    fn start(d: *DueBehindLimit, gpa: std.mem.Allocator, io: std.Io) !void {
+        Late425.reset();
+        d.f = try Fixture.startWith(gpa, io, .{ .listeners = &.{} }, .{ .early_data = true });
+        errdefer d.f.stop(gpa, io);
+        d.relay = try Relay.start(gpa, io, d.f.ep.address());
+        errdefer d.relay.stop();
+        d.cache = .init(gpa, io);
+        errdefer d.cache.deinit();
+        {
+            const first = try d.f.connectResuming(gpa, io, &d.cache, true, d.relay);
+            defer first.close();
+            const b = try finish(try request(first, "GET", "/hello", .{}), gpa);
+            gpa.free(b);
+            try wait.waitUntil(io, "hasTicket", &d.cache, hasTicket);
+        }
+        d.relay.armGated();
+        d.conn = try d.f.connectResuming(gpa, io, &d.cache, true, d.relay);
+        errdefer d.conn.close();
+        try std.testing.expectEqual(client.EarlyData.pending, d.conn.earlyData());
+        d.s = try request(d.conn, "GET", "/late-425", .{ .early = true });
+        errdefer d.s.release();
+        // Served from early data, its answer held back by `Late425.answer`.
+        try d.relay.openDownWhenEarly(io, d.f.ep, 1, 0);
+        d.relay.disarm();
+        try d.conn.waitConnected();
+        try std.testing.expectEqual(client.EarlyData.accepted, d.conn.earlyData());
+        for (&d.fillers) |*filler| filler.* = try request(d.conn, "GET", "/late-425-fill", .{ .early = false });
+        try wait.waitUntil(io, "the server took the seven fillers", {}, struct {
+            fn cond(_: void) bool {
+                return Late425.fillers.load(.monotonic) == 7;
+            }
+        }.cond);
+        d.relay.holdUp();
+        Late425.answer.set(io);
+        try wait.waitUntil(io, "the 425 came and the resend is held back", d.conn, struct {
+            fn cond(conn: *client.ClientConnection) bool {
+                return conn.testStreams().resend_due == 1;
+            }
+        }.cond);
+    }
+
+    /// Lets everything go and frees it; `s` is the caller's to release.
+    fn stop(d: *DueBehindLimit, gpa: std.mem.Allocator, io: std.Io) void {
+        Late425.fill.set(io);
+        d.relay.releaseUp();
+        for (d.fillers) |filler| filler.release();
+        d.conn.close();
+        d.relay.stop();
+        d.cache.deinit();
+        d.f.stop(gpa, io);
+    }
+};
+
+test "h3: a resend held back by the server's stream limit goes once a stream is free" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var d: DueBehindLimit = undefined;
+    try d.start(gpa, io);
+    defer d.stop(gpa, io);
+    defer d.s.release();
+    // The server hears the 425's stream end and gives that stream back.
+    d.relay.releaseUp();
+    try d.s.waitHead();
+    try std.testing.expectEqual(@as(u16, 200), d.s.status);
+    const body = try d.s.reader().allocRemaining(gpa, .unlimited);
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("ran", body);
+    try std.testing.expectEqual(@as(u32, 1), Late425.runs.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), d.conn.testStreams().resend_due);
+}
+
+test "h3: a GOAWAY between the 425 and the resend ends the request as unprocessed" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var d: DueBehindLimit = undefined;
+    try d.start(gpa, io);
+    defer d.stop(gpa, io);
+    defer d.s.release();
+    d.conn.testGoaway();
+    try std.testing.expectError(error.StreamReset, d.s.waitHead());
+    try std.testing.expect(d.s.unprocessed());
+    // Not the server's reset: no code of its own.
+    try std.testing.expectEqual(null, d.s.resetCode());
+    try std.testing.expectEqual(@as(u32, 0), d.conn.testStreams().resend_due);
+    try std.testing.expectEqual(@as(u32, 0), Late425.runs.load(.monotonic));
+}
+
+test "h3: the connection closing while a 425's resend is due ends the request as unprocessed" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // hand-over, as in the hand-over test
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    var d: DueBehindLimit = undefined;
+    try d.start(gpa, io);
+    defer d.stop(gpa, io);
+    defer d.s.release();
+    // The server goes at once: GOAWAY and CONNECTION_CLOSE.
+    d.f.ep.handOver();
+    d.f.future.cancel(io) catch {};
+    try wait.waitUntil(io, "the client saw the close", d.conn, struct {
+        fn cond(conn: *client.ClientConnection) bool {
+            return !conn.isOpen();
+        }
+    }.cond);
+    if (d.s.waitHead()) |_| return error.AnsweredAfterClose else |err| try std.testing.expect(err == error.ConnectionClosed or err == error.StreamReset);
+    try std.testing.expect(d.s.unprocessed());
+    try std.testing.expectEqual(@as(u32, 0), d.conn.testStreams().resend_due);
+}
+
+test "h3: a request released or canceled while its 425's resend is due is freed, and the connection goes on" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    for ([_]bool{ false, true }) |cancel_first| {
+        var d: DueBehindLimit = undefined;
+        try d.start(gpa, io);
+        defer d.stop(gpa, io);
+        if (cancel_first) {
+            d.s.cancel();
+            try std.testing.expectError(error.Canceled, d.s.waitHead());
+            try std.testing.expect(d.s.canceledLocally());
+        }
+        // The driver frees it (the testing allocator's leak check would
+        // otherwise see it only at `close`, so count the live streams):
+        // only the seven fillers stay.
+        d.s.release();
+        try wait.waitUntil(io, "only the fillers are live", d.conn, struct {
+            fn cond(conn: *client.ClientConnection) bool {
+                const n = conn.testStreams();
+                return n.live == 7 and n.resend_due == 0;
+            }
+        }.cond);
+        try std.testing.expectEqual(@as(u32, 0), Late425.runs.load(.monotonic));
+        // The connection serves the next request once streams come back.
+        Late425.fill.set(io);
+        d.relay.releaseUp();
+        const b = try finish(try request(d.conn, "GET", "/hello", .{}), gpa);
+        defer gpa.free(b);
+        try std.testing.expectEqualStrings("hello over h3", b);
+    }
+}
+
 test "h3: a client offering QUIC v2 moves to it only when the server prefers v2" {
     const gpa = std.testing.allocator;
     const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
@@ -2842,6 +3047,7 @@ test "h3 client: unprocessed is true after H3_REQUEST_REJECTED and for a request
     s.id = 4;
     s.status = 0;
     s.reset_code = null;
+    s.early = .not_early;
     conn.goaway_id = std.math.maxInt(i64);
     // Nothing happened to it.
     try std.testing.expect(!s.unprocessed());

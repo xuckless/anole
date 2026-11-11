@@ -714,6 +714,18 @@ pub const ClientConnection = struct {
         self.kick();
     }
 
+    /// Tests: the streams in `live`, and how many of them wait to go again
+    /// (`Stream.Early.resend_due`). Test builds only.
+    pub fn testStreams(self: *ClientConnection) struct { live: usize, resend_due: u32 } {
+        comptime std.debug.assert(builtin.is_test);
+        self.lock();
+        defer self.unlock();
+        var n: usize = 0;
+        var it = self.live.first;
+        while (it) |node| : (it = node.next) n += 1;
+        return .{ .live = n, .resend_due = self.resend_due };
+    }
+
     /// Whether QUIC keep-alive is armed: a request is live. For tests.
     pub fn keepAliveArmed(self: *ClientConnection) bool {
         self.lock();
@@ -1038,19 +1050,36 @@ pub const ClientConnection = struct {
             s.maybeFree();
             return .ended;
         }
+        // The server's GOAWAY (or our `close`) came first: a new stream
+        // would be refused, and the request never ran there, so it ends
+        // as one the server did not process (`unprocessed`).
+        if (self.closing) {
+            s.unsent();
+            s.endEarly(error.StreamReset);
+            s.protocol_done = true;
+            s.maybeFree();
+            return .ended;
+        }
         var id: i64 = -1;
         const rv = c.ngtcp2_conn_open_bidi_stream(self.q, &id, s);
         if (rv == c.NGTCP2_ERR_STREAM_ID_BLOCKED) return .blocked;
-        const reader: h.nghttp3_data_reader = .{ .read_data = readData };
-        if (rv != 0 or h.nghttp3_conn_submit_request(hc, id, head.ptr, head.len, if (s.has_body) &reader else null, s) != 0) {
-            if (id >= 0) _ = c.ngtcp2_conn_shutdown_stream(self.q, 0, id, h.NGHTTP3_H3_INTERNAL_ERROR);
+        if (rv != 0) {
             s.resent();
             s.endEarly(error.StreamReset);
-            // A stream QUIC has closes with its `onStreamClose`.
-            s.protocol_done = id < 0;
+            s.protocol_done = true;
             return .ended;
         }
+        // The new ID from here on, whatever the submit does: the old one
+        // is not this request's any more.
         s.id = id;
+        const reader: h.nghttp3_data_reader = .{ .read_data = readData };
+        if (h.nghttp3_conn_submit_request(hc, id, head.ptr, head.len, if (s.has_body) &reader else null, s) != 0) {
+            _ = c.ngtcp2_conn_shutdown_stream(self.q, 0, id, h.NGHTTP3_H3_INTERNAL_ERROR);
+            s.resent();
+            s.endEarly(error.StreamReset);
+            // QUIC has the stream: it closes with its `onStreamClose`.
+            return .ended;
+        }
         // The body from its start: none of it was acknowledged.
         s.out.sent = s.out.acked;
         s.deferred = false;
@@ -1197,6 +1226,8 @@ pub const ClientConnection = struct {
         var it = self.live.first;
         while (it) |node| : (it = node.next) {
             const stream: *Stream = @alignCast(@fieldParentPtr("node", node));
+            // Due to go again: it never will, and the server never ran it.
+            if (stream.early == .resend_due) stream.unsent();
             stream.endEarly(error.ConnectionClosed);
         }
         self.kick();
@@ -1672,17 +1703,22 @@ pub const Stream = struct {
     early: Early = .not_early,
 
     /// Where a request stands with early data (0-RTT), with the head kept
-    /// to send it again. It changes only through `sentEarly`, `tooEarly`
-    /// and `resent` below, all locked:
+    /// to send it again. It changes only through `sentEarly`, `tooEarly`,
+    /// `resent` and `unsent` below, all locked:
     ///
     ///     not_early  --sentEarly(retry)----> sent_early          (request)
     ///     not_early  --sentEarly(no retry)-> sent_early_final    (request)
     ///     sent_early --tooEarly------------> resend_due          (onH3EndHeaders, 425)
     ///     sent_early, sent_early_final,
     ///     resend_due --resent--------------> resent              (resendOne, resendEarly)
+    ///     sent_early, sent_early_final,
+    ///     resend_due --unsent--------------> unsent              (resendOne after a GOAWAY,
+    ///                                                             closeLocked)
     ///
-    /// `.not_early` and `.resent` are final; a 425 in any state but
-    /// `.sent_early` reaches the caller.
+    /// `.not_early`, `.resent` and `.unsent` are final; a 425 in any state
+    /// but `.sent_early` reaches the caller. Leaving `.resend_due` (by
+    /// `resent` or `unsent`) is what counts `ClientConnection.resend_due`
+    /// down.
     ///
     /// Who owns the stream while it goes again. In `.sent_early` and
     /// `.sent_early_final` it is a submitted stream like any other: QUIC
@@ -1698,14 +1734,15 @@ pub const Stream = struct {
     /// is in `live`, the caller holds it, and `protocol_done` stays false,
     /// so `release` does not free it: the driver does, in `resendOne`,
     /// which either submits it on a new stream (from there it is a
-    /// submitted stream again) or, released or canceled meanwhile, ends it
-    /// (`protocol_done`, then `maybeFree`, which frees it if released).
-    /// Should the connection close first (the driver stops), `release`
-    /// frees it after the close (a closed connection has no stream close
-    /// to wait for), and `ClientConnection.close` frees one released
-    /// before. `id` keeps the old ID until the resend; a `cancel` meanwhile
-    /// resets that stream again, which ngtcp2 ignores (its flags are set,
-    /// or the stream is gone).
+    /// submitted stream again) or, released or canceled meanwhile, or
+    /// after a GOAWAY, ends it (`protocol_done`, then `maybeFree`, which
+    /// frees it if released). Should the connection close first (the
+    /// driver stops), `closeLocked` ends it `.unsent`, `release` frees it
+    /// after the close (a closed connection has no stream close to wait
+    /// for), and `ClientConnection.close` frees one released before. `id`
+    /// keeps the old ID until the resend opens a new stream; a `cancel`
+    /// meanwhile resets that stream again, which ngtcp2 ignores (its flags
+    /// are set, or the stream is gone).
     const Early = union(enum) {
         /// Sent after the handshake, or not sent in 0-RTT.
         not_early,
@@ -1723,12 +1760,15 @@ pub const Stream = struct {
         /// Sent again after the handshake (or ended trying): a 425 now
         /// reaches the caller.
         resent,
+        /// Not sent again: the server's GOAWAY or the connection's close
+        /// came first. The server never processed it (`unprocessed`).
+        unsent,
 
         /// The head to send again, if any.
         fn head(e: Early) ?[]h.nghttp3_nv {
             return switch (e) {
                 .sent_early, .sent_early_final, .resend_due => |kept| kept,
-                .not_early, .resent => null,
+                .not_early, .resent, .unsent => null,
             };
         }
     };
@@ -1776,12 +1816,24 @@ pub const Stream = struct {
     /// The kept head went again on a new stream, or the stream ended
     /// instead. Locked.
     fn resent(self: *Stream) void {
+        self.leaveKept();
+        self.early = .resent;
+    }
+
+    /// The kept head will not go again, and the server never ran it: its
+    /// GOAWAY, or the connection's close, came first. Locked.
+    fn unsent(self: *Stream) void {
+        self.leaveKept();
+        self.early = .unsent;
+    }
+
+    /// Out of a state that keeps the head (`resent`, `unsent`). Locked.
+    fn leaveKept(self: *Stream) void {
         switch (self.early) {
             .sent_early, .sent_early_final => {},
             .resend_due => self.conn.resend_due -= 1,
-            .not_early, .resent => unreachable,
+            .not_early, .resent, .unsent => unreachable,
         }
-        self.early = .resent;
     }
 
     fn create(conn: *ClientConnection, has_body: bool, deadline: Deadline) !*Stream {
@@ -1870,10 +1922,13 @@ pub const Stream = struct {
     }
 
     /// True when the server provably did not process the request: it
-    /// rejected the stream (H3_REQUEST_REJECTED) or its GOAWAY's stream ID
-    /// is at or below this stream's. Such a request can be sent again on
-    /// another connection whatever its method.
+    /// rejected the stream (H3_REQUEST_REJECTED), its GOAWAY's stream ID
+    /// is at or below this stream's, or the request, answered 425 Too
+    /// Early, was to go again when the GOAWAY or the connection's end came
+    /// (`Early.unsent`). Such a request can be sent again on another
+    /// connection whatever its method.
     pub fn unprocessed(self: *const Stream) bool {
+        if (self.early == .unsent) return true;
         if (self.reset_code) |code| if (code == h.NGHTTP3_H3_REQUEST_REJECTED) return true;
         return self.id >= self.conn.goaway_id and self.status == 0;
     }
