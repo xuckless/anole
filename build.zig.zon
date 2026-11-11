@@ -69,7 +69,8 @@
         // direct recvmmsg, and with `fast_send` a batch is sent with a direct
         // sendmmsg before the ring (#106, 4652663).
         .zio = .{
-            .path = "../zio-t3",
+            .url = "git+https://github.com/xuckless/zio#3c863fc3f307015b78a2e9861ff2d23d912e1be9",
+            .hash = "zio-0.19.0-xHbVVKQ4MQD0Zp_ukQKtc_Rm5Bh2spEEialz-G-U9H-5",
         },
         // C bindings generator, branch zig-0.17.x (v2.0.2), pinned by commit.
         .translate_c = .{
