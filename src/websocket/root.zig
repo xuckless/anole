@@ -1448,6 +1448,9 @@ pub const Rooms = struct {
         /// name, valid while the member is in it.
         rooms: *Rooms,
         room: []const u8 = "",
+        /// Its position in its room's list, so it leaves without a search.
+        /// Under the mutex.
+        index: u32 = 0,
         /// The socket's next membership (`Socket.memberships`); once out of
         /// that list, the next of the members being left together.
         next_of_socket: ?*Member = null,
@@ -1666,10 +1669,9 @@ pub const Rooms = struct {
     /// nothing queued and nothing more to get. Under the mutex.
     fn detach(self: *Rooms, m: *Member) void {
         if (self.rooms.getPtr(m.room)) |members| {
-            for (members.items, 0..) |other, i| if (other == m) {
-                _ = members.swapRemove(i);
-                break;
-            };
+            std.debug.assert(members.items[m.index] == m);
+            _ = members.swapRemove(m.index);
+            if (m.index < members.items.len) members.items[m.index].index = m.index;
             if (members.items.len == 0) {
                 const key = self.rooms.getKey(m.room).?;
                 _ = self.slow.remove(key);
@@ -1755,6 +1757,7 @@ pub const Rooms = struct {
             entry.value_ptr.* = .empty;
         }
         for (entry.value_ptr.items) |m| if (m.socket == socket) return;
+        member.index = @intCast(entry.value_ptr.items.len);
         entry.value_ptr.append(self.allocator, member) catch |err| {
             if (entry.value_ptr.items.len == 0) {
                 const key = entry.key_ptr.*;
@@ -1775,10 +1778,18 @@ pub const Rooms = struct {
     pub fn leave(self: *Rooms, room: []const u8, socket: *Socket) void {
         const io = self.bind(socket.io);
         self.mutex.lockUncancelable(io);
-        const members = self.rooms.getPtr(room) orelse return self.mutex.unlock(io);
-        const member = for (members.items) |m| {
-            if (m.socket == socket) break m;
-        } else return self.mutex.unlock(io);
+        // The socket's own memberships, not the room's members: as many as
+        // the rooms it is in.
+        const key = self.rooms.getKey(room) orelse return self.mutex.unlock(io);
+        const member = found: {
+            lockMemberships(socket);
+            defer socket._memberships_lock.unlock();
+            var it = socket._memberships;
+            while (it) |m| : (it = m.next_of_socket) {
+                if (m.rooms == self and std.mem.eql(u8, m.room, key)) break :found m;
+            }
+            break :found null;
+        } orelse return self.mutex.unlock(io);
         unlinkMember(socket, member);
         self.detach(member);
         const canceled = self.awaitSenders(io, member);

@@ -90,6 +90,10 @@ breaking changes are listed anyway.
   GOAWAY or the connection's close overtakes ends as "unprocessed", so
   a gRPC call may retry it elsewhere.
 - **`-Dtest-filter`** (#167) also filters the HTTP core's tests.
+- **SSE topics and WebSocket rooms** (#219): leaving a topic or room no
+  longer searches its member list (each membership keeps its position),
+  so many subscribers leaving at once no longer hold the hub's lock for
+  a time that grows with the square of their number.
 
 ### Fixed
 

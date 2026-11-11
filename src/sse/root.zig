@@ -753,12 +753,12 @@ pub const Topics = struct {
 
     fn joinLocked(self: *Topics, sub: *Subscriber, name: []const u8) error{ OutOfMemory, TooManyTopics, InvalidTopic }!void {
         if (!validTopic(name)) return error.InvalidTopic;
-        for (sub.memberships.items) |t| if (std.mem.eql(u8, t.name, name)) return;
+        for (sub.memberships.items) |m| if (std.mem.eql(u8, m.topic.name, name)) return;
         if (sub.memberships.items.len >= self.options.max_topics_per_subscriber) return error.TooManyTopics;
         const t = try self.topicLocked(name);
         try t.members.append(self.gpa, sub);
         errdefer _ = t.members.pop();
-        try sub.memberships.append(self.gpa, t);
+        try sub.memberships.append(self.gpa, .{ .topic = t, .index = @intCast(t.members.items.len - 1) });
         t.empty_since_ms = null;
     }
 
@@ -773,15 +773,27 @@ pub const Topics = struct {
         return t;
     }
 
+    /// `sub` out of `t.members`, where it is at `index`; the member moved
+    /// into its place learns its new position (from its own memberships,
+    /// at most `max_topics_per_subscriber`). Under the mutex.
+    fn removeMember(t: *Topic, sub: *Subscriber, index: u32) void {
+        std.debug.assert(t.members.items[index] == sub);
+        _ = t.members.swapRemove(index);
+        if (index == t.members.items.len) return;
+        const moved = t.members.items[index];
+        for (moved.memberships.items) |*m| if (m.topic == t) {
+            m.index = index;
+            return;
+        };
+        unreachable;
+    }
+
     /// Takes `sub` out of every topic and its executor's list.
     fn unlinkLocked(self: *Topics, sub: *Subscriber) void {
         const now = if (self.io_set.load(.acquire)) self.nowMs() else 0;
-        for (sub.memberships.items) |t| {
-            for (t.members.items, 0..) |m, i| if (m == sub) {
-                _ = t.members.swapRemove(i);
-                break;
-            };
-            if (t.members.items.len == 0) t.empty_since_ms = now;
+        for (sub.memberships.items) |m| {
+            removeMember(m.topic, sub, m.index);
+            if (m.topic.members.items.len == 0) m.topic.empty_since_ms = now;
         }
         sub.memberships.clearRetainingCapacity();
         if (sub.linked) {
@@ -848,7 +860,8 @@ pub const Topics = struct {
             var all_gap = parsed == null or parsed.?.epoch != self.epoch;
             if (!all_gap) {
                 const last = parsed.?.seq;
-                for (joined) |t| {
+                for (joined) |m| {
+                    const t = m.topic;
                     if (last < t.ring.complete_after) {
                         try gap_topics.append(self.gpa, t.name);
                         continue;
@@ -872,11 +885,12 @@ pub const Topics = struct {
             if (all_gap) {
                 entries.clearRetainingCapacity();
                 gap_topics.clearRetainingCapacity();
-                for (joined) |t| try gap_topics.append(self.gpa, t.name);
+                for (joined) |m| try gap_topics.append(self.gpa, m.topic.name);
             }
             _ = self.n_resumed.fetchAdd(1, .monotonic);
         } else if (last_n > 0) {
-            for (joined) |t| {
+            for (joined) |m| {
+                const t = m.topic;
                 var node = t.ring.list.last;
                 var taken: u16 = 0;
                 var first: ?*std.DoublyLinkedList.Node = null;
@@ -1366,13 +1380,17 @@ pub const Subscriber = struct {
     close_reason: CloseReason = .client_gone,
     sending_since_ms: ?i64 = null,
     last_write_ms: i64,
-    memberships: std.ArrayList(*Topics.Topic) = .empty,
+    /// The topics it is in, each with its position in the topic's
+    /// `members`. Under the hub's mutex.
+    memberships: std.ArrayList(Membership) = .empty,
     exec_node: std.DoublyLinkedList.Node = .{},
     sender: std.Io.Group = .init,
     task: ?placement.Task = null,
     wake: std.Io.Event = .unset,
 
     pub const JoinOptions = struct { last: u16 = 0 };
+
+    pub const Membership = struct { topic: *Topics.Topic, index: u32 };
 
     fn execIndex(sub: *const Subscriber, hub: *const Topics) usize {
         const e = sub.executor orelse return 0;
@@ -1434,13 +1452,11 @@ pub const Subscriber = struct {
         defer hub.mutex.unlock(io);
         var i: usize = 0;
         while (i < sub.memberships.items.len) : (i += 1) {
-            const t = sub.memberships.items[i];
+            const m = sub.memberships.items[i];
+            const t = m.topic;
             if (!std.mem.eql(u8, t.name, topic)) continue;
             _ = sub.memberships.swapRemove(i);
-            for (t.members.items, 0..) |m, j| if (m == sub) {
-                _ = t.members.swapRemove(j);
-                break;
-            };
+            Topics.removeMember(t, sub, m.index);
             if (t.members.items.len == 0) t.empty_since_ms = hub.nowMs();
             break;
         }

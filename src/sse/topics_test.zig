@@ -662,3 +662,69 @@ test "sse: leave while a write is under way: nothing is written after the end re
     try std.testing.expectEqual(@as(usize, 0), c.f.bytes.items.len);
     try std.testing.expectEqual(@as(usize, 0), c.hub.count("t"));
 }
+
+/// Every member of every topic stores its own position in the topic's
+/// list, and every membership points back at its subscriber.
+fn expectIndexed(h: *Harness) !void {
+    h.hub.mutex.lockUncancelable(io);
+    defer h.hub.mutex.unlock(io);
+    var it = h.hub.topics.valueIterator();
+    while (it.next()) |tp| {
+        const t = tp.*;
+        for (t.members.items, 0..) |sub, i| {
+            const m = for (sub.memberships.items) |m| {
+                if (m.topic == t) break m;
+            } else return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(u32, @intCast(i)), m.index);
+        }
+    }
+    for (h.recs.items) |rec| {
+        if (rec.done.load(.acquire)) continue;
+        for (rec.sub.memberships.items) |m| try std.testing.expectEqual(rec.sub, m.topic.members.items[m.index]);
+    }
+}
+
+/// The subscriber at `pos` of topic `name` (`null`: the last one).
+fn memberAt(h: *Harness, name: []const u8, pos: ?usize) *Subscriber {
+    h.hub.mutex.lockUncancelable(io);
+    defer h.hub.mutex.unlock(io);
+    const members = h.hub.topics.get(name).?.members.items;
+    return members[pos orelse members.len - 1];
+}
+
+test "sse: leaving from the front, middle and end keeps every member's index" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    // The first three are in "u" too.
+    for (0..3) |_| _ = try h.add(&.{ "t", "u" }, null);
+    for (0..3) |_| _ = try h.add(&.{"t"}, null);
+    try expectIndexed(h);
+
+    // Leave (one topic) and an end (every topic), from the front, the
+    // middle and the end, down to the last member.
+    var closed: u32 = 0;
+    const Op = struct { pos: ?usize, end: bool };
+    for ([_]Op{
+        .{ .pos = 0, .end = false },
+        .{ .pos = 2, .end = true },
+        .{ .pos = null, .end = false },
+        .{ .pos = null, .end = true },
+        .{ .pos = 0, .end = true },
+        .{ .pos = 0, .end = false },
+    }, 0..) |op, done| {
+        const sub = memberAt(h, "t", op.pos);
+        if (op.end) {
+            Topics._gone(sub);
+            closed += 1;
+            try h.waitClosed(closed);
+        } else sub.leave("t");
+        try std.testing.expectEqual(@as(usize, 5 - done), h.hub.count("t"));
+        try expectIndexed(h);
+    }
+    try std.testing.expectEqual(@as(usize, 0), h.hub.count("t"));
+    // "u" kept its members that did not end, and they still leave it.
+    while (h.hub.count("u") > 0) {
+        memberAt(h, "u", 0).leave("u");
+        try expectIndexed(h);
+    }
+}
