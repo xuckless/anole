@@ -16,7 +16,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const max_window_size = @import("frame.zig").max_window_size;
+const frame = @import("frame.zig");
+const max_window_size = frame.max_window_size;
 
 /// RFC 9113 §5.1, without the reserved states (server push is dropped).
 pub const State = enum(u8) { idle, open, half_closed_remote, half_closed_local, closed };
@@ -30,7 +31,12 @@ pub const Flags = packed struct(u8) {
     /// END_STREAM is queued (not yet sent): the stream was answered, so a
     /// reset after this is not charged to the reset budget (PLAN §5.4, D15).
     answered: bool = false,
-    _: u5 = 0,
+    /// The response's HEADERS went out (conn.zig's submitHead).
+    head_sent: bool = false,
+    /// The stream's ID is in conn.zig's ready queue (out.zig): it has
+    /// output to frame and send credit.
+    ready: bool = false,
+    _: u3 = 0,
 };
 
 /// One stream. END_STREAM received and sent are the state (half_closed_remote
@@ -50,12 +56,17 @@ pub const Stream = struct {
     content_left: i64 = -1,
     state: State = .idle,
     flags: Flags = .{},
+    /// The code it closed with (RST_STREAM's, or NO_ERROR), for
+    /// conn.zig's deferred onStreamClose. Sits in padding: the size stays
+    /// 64 bytes.
+    code: frame.ErrorCode = .no_error,
     /// The handler's side of the stream.
     user: ?*anyopaque = null,
-    /// M3: the queued output parts. Unused in M2.
+    /// The queued output (conn.zig's `Pending` nodes: borrowed DATA parts
+    /// and trailers), oldest first.
     pending: std.DoublyLinkedList = .{},
-    /// The slab's freelist while the stream is free; M3's ready queue while
-    /// it is live. Never both: a stream is destroyed only off the queue.
+    /// The slab's freelist while the stream is free; conn.zig's list of
+    /// closed streams awaiting onStreamClose once it is closed. Never both.
     link: std.SinglyLinkedList.Node = .{},
 
     /// Receiving END_STREAM (open -> half_closed_remote -> closed). The

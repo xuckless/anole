@@ -266,7 +266,9 @@ lib/nghttp2_hd.c; testdata/hpack_blocks.bin holds header blocks that
 tools/extract_hpack_blocks.py takes from nghttp2's fuzz/corpus; streams.zig's
 stream table from lib/nghttp2_map.c, its window and content-length checks from
 lib/nghttp2_stream.c and lib/nghttp2_http.c, and its closed-stream memory from
-the fork patch in lib/nghttp2_session.c)
+the fork patch in lib/nghttp2_session.c; conn.zig's inbound state machine from
+lib/nghttp2_session.c and lib/nghttp2_http.c, with its tests from
+tests/nghttp2_session_test.c)
   Translated from nghttp2's lib/. Every translated Zig file carries an
   attribution header; nghttp2's licence is kept as
   src/http/core/h2/LICENSE.nghttp2.
