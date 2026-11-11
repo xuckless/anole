@@ -3,6 +3,84 @@
 All notable changes to Anole. Before 1.0 there is no API stability promise;
 breaking changes are listed anyway.
 
+## Unreleased
+
+### Added
+
+- **HTTP/3 handshake timeout** (#35): `http3.handshake_timeout` (JSON
+  and C ABI: `handshake_timeout_ms`), 10 s by default. The server closes
+  a QUIC connection whose handshake is not done in time, and drops the
+  0-RTT requests held on it. Before, a client that replayed a 0-RTT
+  flight and never finished the handshake held its requests and buffers
+  until the idle timeout.
+- **`listeners[].tcp.close_on_drain`** (#166, default true): see
+  Changed. Set it to false to keep a C ABI listener's raw TCP
+  connections open through the drain.
+- **I/O engine visibility** (#134): a startup line names the engine the
+  runtime runs on (io_uring, epoll, kqueue, ...), and when io_uring fell
+  back to epoll, the likely cause. `/config` has a `# runtime` block
+  with `io_engine`, and `/metrics` has the gauge `anole_io_engine`
+  (labelled `engine`, 1 for the active one).
+- **Rate-limit `Options.scope`** (#183): `ratelimit.Middleware.Options`
+  takes an optional `scope`. Each `Middleware.init` gets its own scope
+  by itself; set `.scope` when several processes share a
+  `RedisLimiter` and do not create their middlewares in the same order.
+  Two middlewares given the same scope share buckets on purpose. A
+  custom `Limiter` must key its buckets on `policy.scope`.
+
+### Changed
+
+- **C ABI raw TCP connections close at drain start** (#166): C ABI raw
+  TCP listeners now close their connections at drain start, as callback
+  handlers have since #107: what the consumer queued goes out, this side
+  ends, and `ANOLE_EV_NET_CLOSE` follows with `ANOLE_NET_CLOSED_DRAIN`
+  (in no set order with `ANOLE_EV_DRAINING`); a write after that answers
+  `ANOLE_E_INVALID` ("Ended"), and a connection the consumer already
+  closed or reset keeps its own reason. The new
+  `listeners[].tcp.close_on_drain` (default true) set to false keeps the
+  old behaviour. Known gaps: #199, #200.
+- **Rate-limit keys** (#183): the Redis key is now
+  `anole:rl:<scope>:<key>`, so buckets start over at the upgrade, and a
+  mixed-version rollout can briefly allow about twice the limit.
+  `max_entries` counts buckets, per policy and key.
+- **HTTP/3 client** (#39): a request without a body that the server
+  answers 425 Too Early is sent again once, after the handshake. A
+  request with a body, one with its own `Early-Data` header, or a
+  second 425 reaches the caller as before. A resend that the server's
+  GOAWAY or the connection's close overtakes ends as "unprocessed", so
+  a gRPC call may retry it elsewhere.
+- **`-Dtest-filter`** (#167) also filters the HTTP core's tests.
+
+### Fixed
+
+- **watch**: `gapAll` could use a watch after free when a stop took it
+  out concurrently; each watch now gets its gap under the hub's lock
+  (#165).
+- **kafka**: consumers made before the server started never recorded
+  their metrics; they now read the producer's telemetry at use (#168).
+- **kafka**: `Producer.flush` waited for other tasks' later appends and
+  could run into its timeout; it now waits only for the records
+  appended before it (#156).
+- **SQLite**: a write on the client from the task that holds the writer
+  (its own `Tx`, `iterate` or `acquire`) failed after waiting for itself
+  until the timeout; it now fails at once with "this task already holds
+  the writer" (#160).
+- **HTTP client**: `ClientResponse.body()` sizes its buffer from the
+  response's Content-Length, capped at 16 KiB, instead of growing from
+  empty (#177).
+- **Rate limit**: two policies on one limiter shared buckets for the
+  same key, so a strict login limit could be refilled by an app-wide
+  one; each now counts in buckets of its own (#183).
+- **gRPC transcoding**: a trailing `**` in a template matches zero
+  segments too, and the route for its prefix never outranks an exact
+  route there (#45).
+- **console**: `/config` shows the listeners that `listen` and
+  `listenTls` set, not the ones at init (#96).
+- **docs**: `anole.h` and `c-abi.md` say who writes Content-Length,
+  that WRITABLE is edge-triggered, that `:authority` arrives as `host`,
+  and that WRITABLE ends a wait on a finished WebTransport stream only
+  (#189).
+
 ## 0.5.3 (2026-11-05)
 
 ### Added
