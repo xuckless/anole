@@ -102,6 +102,10 @@ breaking changes are listed anyway.
   In the fallback (S3) nothing ran that sender, so ending the subscriber
   waited for it forever; otherwise `on_close` could report `closed`
   instead of `client_gone`. `close()` now does nothing once a write failed.
+- **SSE**: a subscriber whose peer leaves while it is being opened (the
+  head going out over HTTP/2 or HTTP/3, or `on_open` waiting) is no
+  longer written after its end: its end now starts only once the open
+  is done. `on_close`'s reason is read under the hub's lock.
 - **watch**: `gapAll` could use a watch after free when a stop took it
   out concurrently; each watch now gets its gap under the hub's lock
   (#165).

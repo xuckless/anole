@@ -736,6 +736,9 @@ pub const Topics = struct {
     }
 
     /// Everything after the head is out: `on_open`, the first sender.
+    /// Its last touch of `sub` ends the opening: an end asked for since
+    /// the subscriber was made (the peer gone while `on_open` ran or the
+    /// head went out, a failed first write) starts only then (`opened`).
     fn arm(self: *Topics, io: std.Io, sub: *Subscriber, opts: ServeOptions) void {
         if (opts.on_open) |f| f(sub);
         var launch = false;
@@ -747,6 +750,7 @@ pub const Topics = struct {
         }
         if (launch) self.startSender(io, sub);
         self.ensureTickers(io, sub);
+        self.opened(sub);
     }
 
     fn joinLocked(self: *Topics, sub: *Subscriber, name: []const u8) error{ OutOfMemory, TooManyTopics, InvalidTopic }!void {
@@ -1093,26 +1097,54 @@ pub const Topics = struct {
         return if (ended or aborted) .over else if (failed) .broken else .idle;
     }
 
-    /// Starts the task that ends `sub`, once.
+    /// Starts the task that ends `sub`, once; while it is being opened,
+    /// only notes that it is to start (`opened` starts it). Must not wait.
     fn spawnEnd(self: *Topics, sub: *Subscriber) void {
-        if (sub.end_started.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+        var cur = sub.end.load(.acquire);
+        while (true) {
+            const next: Subscriber.EndTask = switch (cur) {
+                .none => .started,
+                .opening => .asked,
+                .asked, .started => return,
+            };
+            cur = sub.end.cmpxchgWeak(cur, next, .acq_rel, .acquire) orelse {
+                if (next == .started) self.startEnd(sub);
+                return;
+            };
+        }
+    }
+
+    /// The opening is done (the end of `arm`, the caller's last touch of
+    /// `sub`): an end asked for meanwhile starts now.
+    fn opened(self: *Topics, sub: *Subscriber) void {
+        // Only `spawnEnd` moves it on from `opening`, to `asked`.
+        if (sub.end.cmpxchgStrong(.opening, .none, .acq_rel, .acquire)) |cur| {
+            std.debug.assert(cur == .asked);
+            sub.end.store(.started, .release);
+            self.startEnd(sub);
+        }
+    }
+
+    fn startEnd(self: *Topics, sub: *Subscriber) void {
         const io = self.io;
         const where: placement.Where = if (sub.executor) |i| .{ .executor = i } else .local;
         placement.concurrent(&self.ends, io, where, endTask, .{ self, sub }) catch {
             // A tick tries again.
-            sub.end_started.store(false, .release);
+            sub.end.store(.none, .release);
         };
     }
 
     fn endTask(self: *Topics, sub: *Subscriber) std.Io.Cancelable!void {
-        self.finishSubscriber(sub, sub.close_reason);
+        self.finishSubscriber(sub, null);
     }
 
     /// Leaves every topic, waits for the sender, releases the stream, tells
-    /// `on_close` and frees the subscriber.
-    fn finishSubscriber(self: *Topics, sub: *Subscriber, reason: CloseReason) void {
+    /// `on_close` and frees the subscriber. `reason` null: the one the hub
+    /// recorded (`close_reason`, read under the mutex).
+    fn finishSubscriber(self: *Topics, sub: *Subscriber, reason_arg: ?CloseReason) void {
         const io = self.io;
         self.mutex.lockUncancelable(io);
+        const reason = reason_arg orelse sub.close_reason;
         sub.phase = .{ .left = switch (sub.phase) {
             .ending => |e| e,
             else => null,
@@ -1163,11 +1195,12 @@ pub const Topics = struct {
     // -- the peer going away ---------------------------------------------
 
     /// `Parked.Owner.gone`: must not wait. Marks the subscriber and starts
-    /// its end task.
+    /// its end task (or, while it is being opened, has `arm` start it).
+    /// The reason needs no write: an open subscriber's `close_reason` is
+    /// `client_gone` already, and an ending one keeps its own.
     fn onGone(ctx: *anyopaque) void {
         const sub: *Subscriber = @ptrCast(@alignCast(ctx));
         sub.gone.store(true, .release);
-        if (sub.phase == .open) sub.close_reason = .client_gone;
         sub.hub.spawnEnd(sub);
     }
 
@@ -1229,7 +1262,7 @@ pub const Topics = struct {
             var node = list.subscribers.first;
             while (node) |nd| : (node = nd.next) {
                 const sub: *Subscriber = @alignCast(@fieldParentPtr("exec_node", nd));
-                if (sub.gone.load(.acquire) and !sub.end_started.load(.acquire)) {
+                if (sub.gone.load(.acquire) and sub.end.load(.acquire) == .none) {
                     if (ne < ends.len) {
                         ends[ne] = sub;
                         ne += 1;
@@ -1389,7 +1422,8 @@ pub const Subscriber = struct {
     draining_at_start: bool = false,
     /// The peer is gone (set from the engine's callback).
     gone: std.atomic.Value(bool) = .init(false),
-    end_started: std.atomic.Value(bool) = .init(false),
+    /// Its end task (`spawnEnd`), started once.
+    end: std.atomic.Value(EndTask) = .init(.opening),
     close_reason: CloseReason = .client_gone,
     sending_since_ms: ?i64 = null,
     last_write_ms: i64,
@@ -1403,10 +1437,24 @@ pub const Subscriber = struct {
 
     pub const JoinOptions = struct { last: u16 = 0 };
 
+    /// Where its end task is. A subscriber is `opening` from its making
+    /// until `arm` has touched it for the last time: the owner's `gone`
+    /// can come as soon as `Response._park` has the owner (the peer
+    /// leaving while the head goes out or `on_open` runs), and an end
+    /// started then would free the subscriber under `arm`.
+    pub const EndTask = enum(u8) {
+        /// Being opened (`serve`, `_attach`): an end asked for waits.
+        opening,
+        /// Asked for while opening: `opened` starts it.
+        asked,
+        /// Not asked for (or its start failed: a tick tries again).
+        none,
+        started,
+    };
+
     pub const Membership = struct { topic: *Topics.Topic, index: u32 };
 
-    /// Where the subscriber is in its life, under the hub's mutex (onGone
-    /// alone reads it without, as it read `ending` before):
+    /// Where the subscriber is in its life, under the hub's mutex:
     ///
     ///   open --close/slow/drain--> ending --end written--> over
     ///   open, ending --write failed--> broken (ending + abort --canceled--> over)

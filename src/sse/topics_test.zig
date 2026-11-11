@@ -761,3 +761,30 @@ test "sse: leaving from the front, middle and end keeps every member's index" {
         try expectIndexed(h);
     }
 }
+
+test "sse: the peer leaving while on_open runs: the end waits for the open, then frees the subscriber" {
+    const h = try Harness.init(.{});
+    defer h.deinit();
+    const f = try gpa.create(Fake);
+    f.* = .init(gpa, io);
+    try h.fakes.append(gpa, f);
+    const rec = try gpa.create(Rec);
+    rec.* = .{ .h = h };
+    try h.recs.append(gpa, rec);
+    const Open = struct {
+        // The engine's `gone` while the subscriber is being opened (the
+        // owner is reachable from `Response._park` on), then every end
+        // task that started has run: before the fix that freed the
+        // subscriber, and the rest of the open wrote to freed memory.
+        fn onOpen(sub: *Subscriber) void {
+            Topics._gone(sub);
+            sub.hub.ends.await(io) catch unreachable;
+        }
+    };
+    rec.sub = try h.hub._attach(io, f.out(), .{ .topics = &.{"t"}, .context = rec, .on_open = Open.onOpen, .on_close = Harness.onClose }, null);
+    try h.waitClosed(1);
+    try std.testing.expectEqual(@as(u32, @backingInt(root.CloseReason.client_gone)), h.last_reason.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), h.hub.count("t"));
+    try std.testing.expectEqual(@as(usize, 0), h.hub.stats().subscribers);
+    try std.testing.expect(f.released);
+}
