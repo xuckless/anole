@@ -140,21 +140,23 @@ func (p *Proxy) handle(client net.Conn, listener, upstream string) {
 	p.mu.Unlock()
 }
 
-// pipe copies src to dst unchanged, then shows the bytes to the parser, so a
-// parse failure never changes what is forwarded.
+// pipe copies src to dst unchanged and shows the same bytes to the parser (the
+// parser only reads them, so a parse failure never changes what is forwarded).
+// The parser runs before the write: the answer to a request can only arrive
+// after the write, and its END_STREAM must find the stream already registered.
 func (p *Proxy) pipe(dst, src net.Conn, c *Conn, f *framer, bytes *int64, desync *bool) {
 	buf := make([]byte, 32<<10)
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
-			if _, werr := dst.Write(buf[:n]); werr != nil {
-				err = werr
-			}
 			p.mu.Lock()
 			*bytes += int64(n)
 			f.feed(buf[:n])
 			*desync = f.desync
 			p.mu.Unlock()
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				err = werr
+			}
 		}
 		if err != nil {
 			if cw, ok := dst.(closeWriter); ok && err == io.EOF {
@@ -192,17 +194,35 @@ type Scenario struct {
 	Detail []*Conn          `json:"conns"`
 }
 
+// Dump renders the report as JSON and as a table while holding the lock: the
+// report points at live connections whose maps the pipes keep changing.
+func (p *Proxy) Dump() ([]byte, string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	r := p.report()
+	b, _ := json.MarshalIndent(r, "", " ")
+	return b, r.Table()
+}
+
 // Report snapshots every connection (still open ones with their time so far)
 // and rolls each scenario up: per counter the largest 1 s peak over its
-// connections, because every budget applies to one connection.
+// connections, because every budget applies to one connection. The result
+// shares the connections' maps: read it only once they are idle (Dump
+// otherwise).
 func (p *Proxy) Report() *Report {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.report()
+}
+
+func (p *Proxy) report() *Report {
 	byName := map[string]*Scenario{}
 	var order []string
 	for _, c := range p.conns {
-		if c.Seconds == 0 {
-			c.Seconds = time.Since(c.Start).Seconds()
+		if c.Seconds == 0 { // still open: report a copy so the duration is not frozen
+			cp := *c
+			cp.Seconds = time.Since(c.Start).Seconds()
+			c = &cp
 		}
 		s := byName[c.Scenario]
 		if s == nil {
@@ -319,12 +339,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "h2count: %s on %s -> %s\n", kind, a, upstream)
 	}
 	write := func() {
-		r := p.Report()
-		b, _ := json.MarshalIndent(r, "", " ")
+		b, table := p.Dump()
 		if err := os.WriteFile(*out, b, 0o644); err != nil {
 			fmt.Fprintln(os.Stderr, "h2count:", err)
 		}
-		fmt.Fprint(os.Stderr, r.Table())
+		fmt.Fprint(os.Stderr, table)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/scenario", func(w http.ResponseWriter, r *http.Request) {

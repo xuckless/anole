@@ -79,8 +79,8 @@ largest HPACK-encoded block, `WU/s` WINDOW_UPDATE, `PRIO` PRIORITY frames (per s
 | node-upload | 1 | 1 | 1 | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 22 | 0 | 0 | 0 |
 | node-ping-tool-driven | 1 | 0 | 0 | 50 | 50 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 | grpc-go | 1 | 50 | 1020 | 36 | 36 | 1 | 0 | 19 | 19 | 19 | 0 | 0 | 0 | 0 | 0 | 94 | 36 | 0 | 0 |
-| envoy-default | 25 | 8 | 10 | 1 | 2 | 1 | 5 | 1 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 97 | 2 | 0 | 0 |
-| envoy-keepalive | 27 | 12 | 14 | 1 | 2 | 1 | 5 | 1 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 97 | 2 | 0 | 0 |
+| envoy-default | 24 | 8 | 10 | 0 | 0 | 1 | 5 | 1 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 97 | 2 | 0 | 0 |
+| envoy-keepalive | 28 | 12 | 14 | 1 | 2 | 1 | 5 | 1 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 97 | 2 | 0 | 0 |
 | h2load-synthetic | 4 | 100 | 500 | 0 | 0 | 1 | 2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 37 | 1 | 0 | 0 |
 | firefox-load | 2 | 71 | 204 | 0 | 0 | 1 | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 281 | 205 | 0 | 0 |
 | firefox-reload | 2 | 59 | 1515 | 0 | 0 | 1 | 4 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 283 | 1515 | 0 | 0 |
@@ -130,21 +130,27 @@ one-DATA response).
 1. **Empty DATA / HEADERS / CONTINUATION without END_STREAM: none.** All of Chromium, Firefox, curl, Node,
    grpc-go, Envoy and h2load sent zero. `empty_frame_rate` 100/s therefore has unbounded headroom over
    legitimate traffic (Envoy's own default is 1 *consecutive* such frame, `max_consecutive_inbound_frames_with_empty_payload`).
-2. **WINDOW_UPDATE:** up to 4096/s on a 64 MiB download (Node; Firefox 35/s, Chromium 30/s on the same download) and 1515/s on
-   Firefox page reloads, at 1.0 per server DATA frame at most in sustained transfers (curl: 2 per tiny
-   response). A flat per-second cap would need to sit above 40,000/s to keep a 10x margin, which defeats it;
+2. **WINDOW_UPDATE:** 4096 on a 64 MiB download (Node), all inside 0.095 s, 2790 of them in one 100 ms window, so
+   the real rate was 28,000-43,000/s (the 4096 is 64 MiB / 16 KiB, a property of the scenario; Firefox 35/s,
+   Chromium 30/s on the same download) and 1515/s on Firefox page reloads, at 1.0 per server DATA frame at most in sustained transfers (curl: 2 per tiny
+   response). A flat per-second cap would need to sit above 280,000/s to keep a 10x margin over the Node burst, which defeats it;
    a ratio bound like Envoy's (10 WINDOW_UPDATE per DATA frame the server sent) has 3x headroom over the
    worst observed (3.0) and 10x over the sustained worst (1.0).
-3. **PING:** Chromium and Firefox 0 in these scenarios; Envoy 2 in 12 s with and without a 5 s keepalive
-   (default Envoy 1.34.1 also pings; kept as observed, not investigated); grpc-go **36/s, 24 in 100 ms** under a
+3. **PING:** Chromium and Firefox 0 in these scenarios; Envoy 0 with its default config and 2 per connection in
+   12.5 s with a 5 s `connection_keepalive` (an earlier version of this table filed one keepalive connection
+   under the default row, because the readiness probe ran before the scenario label; fixed in `run.sh`, and
+   the raw JSON was relabelled by hand: connection 26, started 06:14:10.917, after the keepalive container was up); grpc-go **36/s, 24 in 100 ms** under a
    1000-call unary burst (BDP probes), the highest legitimate rate. The budget is the number of *queued*
-   PING ACKs (1000), not a rate: 36/s fills it only if the write side stalls for 28 s, and the write timeout
-   (`timeouts.write`, 30 s) closes a connection that stalled that long first.
-4. **RST_STREAM:** highest 48/s (29 in 100 ms), all unanswered, Chromium aborting 40 `/slow` requests and 8
-   downloads; Firefox 26/s; Node cancelling 20 streams 20/s; grpc-go deadline cuts 19/s; a 30-page-load reload
+   PING ACKs (1000), not a rate. 36/s fills it after 27.8 s of stalled writes, about 2 s before the 30 s write
+   timeout (`timeouts.write`), so a peer pinging at that rate against a stalled writer gets ENHANCE_YOUR_CALM
+   first. That is acceptable: the 36/s came from BDP probes, which grpc-go sends after received DATA, so the
+   rate collapses when the server stops writing, and a client that keeps pinging at 36/s into a 28 s stall is
+   not behaving legitimately. Both times are one burst, not a sustained rate (the scenario lasted 0.23 s).
+4. **RST_STREAM:** highest 48 in one burst (0.26 s connection, 29 in 100 ms), all unanswered, which is exactly the
+   scenario's 8 downloads + 40 `/slow` fetches aborted, so a count set by the script, not a client rate; Firefox 26/s; Node cancelling 20 streams in 11 ms; grpc-go deadline cuts, 19 in 0.23 s; a 30-page-load reload
    storm only 20 RST (8 unanswered) in Chromium and 0 in Firefox. h2load aborted nothing. Against burst 1000 /
-   33 per second this is 20x under the burst; sustained 48/s would exhaust the bucket in 66 s, which these
-   short scenarios cannot say is normal or not.
+   33 per second the largest burst is 20x under the bucket; a *sustained* 48/s would exhaust it in 66 s, which
+   these sub-second scenarios cannot say is normal or not.
 5. **SETTINGS entries per frame:** 5 at most (Envoy), 4 for both browsers, 3 curl, 2 h2load, 0 for Node and
    grpc-go (empty initial SETTINGS); one SETTINGS frame per connection. `max_settings` 32 is 6x over the
    maximum.
@@ -166,7 +172,10 @@ one-DATA response).
   nghttp2 1.70 charges *every* PRIORITY and PRIORITY_UPDATE frame to its glitch bucket
   (`lib/nghttp2_session.c`, `session_update_glitch_ratelim` in the PRIORITY receive path: "very unpopular ... we
   do not expect it is received so frequently"), 10000 burst / 330 per second. Chromium's 956/s peak is 2.9x the
-  refill rate; the 30-reload burst used 14% of the bucket, and a sustained 956/s would empty it in 16 s.
+  refill rate; the 30-reload run used 14% of the bucket, and a sustained 956/s would empty it in 16 s. The
+  per-second peak is set by `drive.html`'s reload cadence (an iframe created and removed every 20-120 ms,
+  about 14 page loads a second), not by Chromium; the property of the browser is the per-page count (117
+  PRIORITY on one plain page load, about one per subresource), and nghttp2 charges every one of them.
   **Recommendation: M2 must not put PRIORITY (nor PRIORITY_UPDATE) in a rate bucket.** The new engine has no
   priority tree, a PRIORITY frame costs no state and queues no output, so validating it (length 5, no
   self-dependency in the PROTOCOL_ERROR sense) is the whole job; CVE-2019-9513 was about the tree. Charging
@@ -193,6 +202,10 @@ one-DATA response).
 
 ## Budget by budget
 
+Per-second peaks of the browser reload rows come from the script's cadence, and the sub-second scenarios
+(Node download 0.095 s, Node cancel 11 ms, Chromium abort 0.26 s, grpc-go 0.23 s) are bursts bounded by what
+the driver generates; read them as burst counts, not sustained client rates.
+
 "Legit" is the highest value in the table above (synthetic rows excluded). Rule from the research note:
 a per-second rate default >= 10x the legit per-second peak, a burst default >= 4x the legit burst; a *queued*
 budget is converted with legit rate x write-stall time. Attack tools send thousands per second, so anything
@@ -200,18 +213,18 @@ under about 1000/s separates the two.
 
 | budget (PLAN 5.4 / limits.zig) | highest legit | current default | recommendation | reference values |
 |---|---|---|---|---|
-| `stream_reset_burst` / `_rate` (unanswered RST, D15 point 1) | 48/s, 29 per 100 ms (Chromium abort) | 1000 burst, 33/s | **keep.** Burst is 20x the peak; the rate (33/s) is below the 48/s peak, so a short abort storm is absorbed by the burst and only a minute-long 48/s stream would hit it. | nghttp2 1000 / 33; Envoy: no equivalent, `max_outbound_frames` 10000 / `max_outbound_control_frames` 1000 (queued) |
-| `control_frame_budget` (queued PING ACK + SETTINGS ACK + RST) | PING 36/s (grpc-go), SETTINGS ACK 1 per connection | 1000 queued | **keep 1000.** 36/s needs a 28 s write stall to fill it, shorter than the 30 s write timeout; 10x the rate only matters for a peer that stops reading but keeps sending, which the write timeout handles. | nghttp2 `max_outbound_ack` 1000 (`NGHTTP2_DEFAULT_MAX_OBQ_FLOOD_ITEM`); Envoy 1000 control frames; Go `http2maxQueuedControlFrames` 10000 (h2_bundle.go:4047) |
+| `stream_reset_burst` / `_rate` (unanswered RST, D15 point 1) | 48 in one burst of 0.26 s, 29 per 100 ms (Chromium abort; the count is the script's 8 + 40 aborts) | 1000 burst, 33/s | **keep.** The burst is 20x the largest observed; the rate (33/s) is below that burst's per-second figure, so a short abort storm is absorbed by the burst and only a minute-long 48/s stream would hit it. | nghttp2 1000 / 33; Envoy: no equivalent, `max_outbound_frames` 10000 / `max_outbound_control_frames` 1000 (queued) |
+| `control_frame_budget` (queued PING ACK + SETTINGS ACK + RST) | PING 36/s (grpc-go), SETTINGS ACK 1 per connection | 1000 queued | **keep 1000.** 36 PING in one 0.23 s burst; 36/s would fill 1000 after 27.8 s of stalled writes, about 2 s before the 30 s write timeout, but grpc-go's BDP pings follow received DATA and stop when the server stops writing; a peer that stops reading but keeps pinging is exactly what ENHANCE_YOUR_CALM is for. | nghttp2 `max_outbound_ack` 1000 (`NGHTTP2_DEFAULT_MAX_OBQ_FLOOD_ITEM`); Envoy 1000 control frames; Go `http2maxQueuedControlFrames` 10000 (h2_bundle.go:4047) |
 | `empty_frame_rate` (empty DATA/HEADERS/CONTINUATION, plus unknown frames per D15 point 2) | 0 empty; 0 unknown (but see the PRIORITY_UPDATE finding) | 100/s | **keep 100/s; adopt it instead of the glitch bucket; exempt PRIORITY and PRIORITY_UPDATE.** | nghttp2 glitch bucket 10000 / 330 (also charges PRIORITY); Envoy `max_consecutive_inbound_frames_with_empty_payload` 1 (consecutive, not a rate) |
 | `glitch_burst` / `glitch_rate` (nghttp2 parity) | PRIORITY 956/s, 1354 per connection (Chromium) | 10000 / 330 | **do not adopt as is.** Rate 330 < Chromium's PRIORITY peak 956/s. If kept for the differential tests, exempt PRIORITY and PRIORITY_UPDATE. | nghttp2 `NGHTTP2_DEFAULT_GLITCH_BURST/RATE` 10000 / 330 |
 | `max_settings` (entries per SETTINGS frame) | 5 (Envoy), 4 (browsers) | 32 | **keep 32** (6x; the cost of an entry is trivial, ENHANCE_YOUR_CALM above). | nghttp2 `NGHTTP2_DEFAULT_MAX_SETTINGS` 32 |
 | SETTINGS frames per second | 1 per connection | (counted through the control budget via ACKs) | **no extra rate needed**; every ACK is queued output and bounded by the control budget. | |
 | `max_continuations` | 1 (curl, 24 KB block) | 8 | **keep 8.** 8x the legit; verified on the current engine: 8 answered, 9 not. | nghttp2 `NGHTTP2_DEFAULT_MAX_CONTINUATIONS` 8 |
-| `max_header_list_size` | 24,052 encoded bytes (30 KB cookie-like value); all clients stayed under the advertised value | 64 KiB | **keep 64 KiB** (2.7x over the largest legit block seen). 48 KiB accepted, 70 KiB closed with COMPRESSION_ERROR. M2 should give the 431 the table promises. | not verified for other servers |
+| `max_header_list_size` | 24,052 encoded bytes, about 30.2 KB decoded (curl's 30,000-byte test value + `x-big` + 32 overhead + pseudo-headers; a test input, not an observed client; the limit applies to the decoded list, RFC 9113 6.5.2); all clients stayed under the advertised value | 64 KiB | **keep 64 KiB** (about 2.1x over that test input decoded, 2.7x over its encoded size; no real-client header list was measured). 48 KiB accepted, 70 KiB closed with COMPRESSION_ERROR. M2 should give the 431 the table promises. | not verified for other servers |
 | `max_concurrent_streams` | 100 (curl `-Z`, Node, Chromium page, h2load) | 250 | **keep 250** (2.5x). No client in the set exceeded what it was offered; Go's server default is also 250, Envoy's 1024. Raise only if field data shows pages with more than ~250 parallel subresources. | Go `http2defaultMaxStreams` 250 (h2_bundle.go:4042); Envoy `max_concurrent_streams` 1024 (default in the field docs); nghttp2 unlimited by default (0xFFFFFFFF) |
 | `refused_stream_burst` / `_rate` | none seen (no client exceeded the advertised limit) | 100 / 10/s | **keep**; not exercised here (clients obey `max_concurrent_streams`). | |
-| WINDOW_UPDATE | 4096/s sustained, 1.0 per DATA (3.0 on tiny responses) | counted in the control budget in PLAN 5.4 | **do not count received WINDOW_UPDATE in the queued control budget** (it queues nothing; counting would trip on a 64 MiB download at 4096/s). If a cap is ever wanted, use Envoy's ratio (10 per server DATA frame), which has >= 3x headroom. | Envoy `max_inbound_window_update_frames_per_data_frame_sent` 10 |
-| PRIORITY | 956/s (Chromium) | charged to the glitch bucket in nghttp2 | **ignore after validation, no budget** (see above). | Envoy `max_inbound_priority_frames_per_stream` 100 (per stream); nghttp2 charges the glitch bucket |
+| WINDOW_UPDATE | 4096 in 0.095 s (about 28,000/s, 2790 per 100 ms; Node download), 1.0 per DATA (3.0 on tiny responses) | counted in the control budget in PLAN 5.4 | **do not count received WINDOW_UPDATE in the queued control budget** (it queues nothing; counting would trip on a 64 MiB download at about 28,000/s). If a cap is ever wanted, use Envoy's ratio (10 per server DATA frame), which has >= 3x headroom. | Envoy `max_inbound_window_update_frames_per_data_frame_sent` 10 |
+| PRIORITY | 956/s (Chromium reload script; 117 per plain page load) | charged to the glitch bucket in nghttp2 | **ignore after validation, no budget** (see above). | Envoy `max_inbound_priority_frames_per_stream` 100 (per stream); nghttp2 charges the glitch bucket |
 | PING rate (as opposed to queued ACKs) | 36/s (grpc-go) | no separate rate | **none**; bounded by the queued ACK budget. | |
 | Unknown frames | 0 | counted with `empty_frame_rate` | keep counting, **with PRIORITY_UPDATE (0x10) exempt** | |
 

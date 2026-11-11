@@ -98,9 +98,9 @@ run_envoy() {
     local ka=""
     [ $variant = keepalive ] && ka=$'            connection_keepalive: { interval: 5s, timeout: 2s }'
     sed -e "s|__UPSTREAM_PORT__|$H2C_PORT|" "$here/envoy.yaml" | awk -v ka="$ka" '/__KEEPALIVE__/{ if (ka != "") print ka; else print "            {}"; next } {print}' >"$tmp/envoy-$variant.yaml"
+    scn "envoy-$variant"   # before the container: its readiness probe opens the first pooled upstream connection
     docker run -d --rm --name h2count-envoy --network host -v "$tmp/envoy-$variant.yaml:/etc/envoy/envoy.yaml:ro" "envoyproxy/envoy:$tag" -c /etc/envoy/envoy.yaml --log-level warning >/dev/null
     for _ in $(seq 50); do curl -s -o /dev/null http://127.0.0.1:10000/r/1 && break; sleep 0.2; done
-    scn "envoy-$variant"
     curl -s -Z --parallel-max 100 -o /dev/null "http://127.0.0.1:10000/r/[1-100].png"
     curl -s -Z --max-time 1 -o /dev/null "http://127.0.0.1:10000/download?[1-10]"
     curl -s --max-time 12 -o /dev/null http://127.0.0.1:10000/sse   # an idle-ish stream so a 5 s keepalive fires
