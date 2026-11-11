@@ -527,6 +527,9 @@ const Rule = enum {
     peer_goaway,
     /// Session 5: DATA charged to the windows per frame, not per chunk.
     window_per_frame,
+    /// Limits 9: a malformed PRIORITY_UPDATE, an unknown frame to nghttp2
+    /// set up as today's engine (no PRIORITY_UPDATE extension).
+    priority_update,
 };
 
 const n_rules = @typeInfo(Rule).@"enum".field_names.len;
@@ -554,6 +557,10 @@ fn classify(p: *Pair, a: Allocator, ours: *const Batch, theirs: *const Batch) !?
     if (reasonIs(og, "too many stream resets") or (tg != null and tg.?.code == .internal_error)) return .{ .reset_budget, true };
     if (reasonIs(og, "too many empty frames") or reasonIs(og, "too many glitches") or
         theirsFirst(og, tg, .enhance_your_calm)) return .{ .empty_budget, true };
+    // nghttp2 without the extension takes the frame as unknown and fails
+    // only on its glitch budget (above); its output after it is the rest of
+    // the input, fed at once once we stop.
+    if (og != null and std.mem.startsWith(u8, og.?.debug, "PRIORITY_UPDATE: ")) return .{ .priority_update, true };
     if (reasonIs(og, "too many CONTINUATION frames") or p.ng.fatal == c.NGHTTP2_ERR_TOO_MANY_CONTINUATIONS) return .{ .continuations, true };
     // A frame past a window that nghttp2, charging chunk by chunk, took
     // because credit given back for its first chunks made room (only when

@@ -1545,7 +1545,7 @@ test "h2 conn: recv_unknown_frame" {
     const t = try ready(.{});
     defer t.destroy();
     try t.feed(try t.raw(0xfa, 0xff, 0, "unknown"));
-    try t.feed(try t.raw(0x10, 0, 3, "extension"));
+    try t.feed(try t.raw(0x20, 0, 3, "extension"));
     try expectFrames(try t.drain(), &.{});
     try t.feed(try t.headers(1, &get, true));
     try expectEqual(1, t.rec.count(.end));

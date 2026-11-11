@@ -592,9 +592,75 @@ test "h2: PRIORITY frames have no effect beyond validation" {
     // The idle stream opens as if no PRIORITY had come.
     try t.feed(try t.headers(5, &get, true));
     try expectEqual(2, t.rec.count(.open));
-    // Only nghttp2's glitch budget moved.
-    try expectError(error.ConnectionError, t.feed(try t.priority(7, 1)));
+    // No budget moved (nghttp2 charges its glitch budget; INTENTIONAL.md,
+    // limits 9).
+    try t.feed(try t.priority(7, 1));
+    try expectFrames(try t.drain(), &.{});
+}
+
+/// Budgets far below what a browser sends, so a charge would show.
+const tight: conn.Options = .{ .limits = .{ .glitch_burst = 10, .glitch_rate = 1, .empty_frame_rate = 10 } };
+
+fn priorityUpdate(t: *T, id: u31, target: u32, value: []const u8) ![]const u8 {
+    const p = try t.arena().alloc(u8, 4 + value.len);
+    std.mem.writeInt(u32, p[0..4], target, .big);
+    @memcpy(p[4..], value);
+    return t.raw(0x10, 0, id, p);
+}
+
+test "h2 limits: PRIORITY frames from a page load are not charged" {
+    // Chromium sends about one per subresource, 956/s on reloads
+    // (bench/results/20261111-h2-limits-calibration).
+    const t = try ready(tight);
+    defer t.destroy();
+    try t.feed(try t.headers(1, &get, true));
+    var id: u31 = 3;
+    for (0..2000) |_| {
+        try t.feed(try t.priority(id, 1));
+        id += 2;
+    }
+    try expectEqual(0, count(try t.drain(), .goaway));
+    // The connection is still in use.
+    try t.feed(try t.headers(3, &get, true));
+    try expectEqual(2, t.rec.count(.open));
+}
+
+test "h2 limits: PRIORITY_UPDATE is not counted as an unknown frame" {
+    const t = try ready(tight);
+    defer t.destroy();
+    var id: u31 = 1;
+    for (0..2000) |_| {
+        try t.feed(try priorityUpdate(t, 0, id, "u=1, i"));
+        id += 2;
+    }
+    try t.feed(try priorityUpdate(t, 0, 1 << 31 | 5, ""));
+    try expectEqual(0, count(try t.drain(), .goaway));
+    try t.feed(try t.headers(1, &get, true));
+    try expectEqual(1, t.rec.count(.open));
+    // Any other unknown type still counts (D15 point 2).
+    for (0..10) |_| try t.feed(try t.raw(0xfa, 0, 0, "x"));
+    try expectError(error.ConnectionError, t.feed(try t.raw(0xfa, 0, 0, "x")));
     try expectFrames(try t.drain(), &.{goawayWith(.enhance_your_calm)});
+}
+
+test "h2 limits: a malformed PRIORITY_UPDATE is a connection error" {
+    const Case = struct { id: u31, payload: []const u8, code: ErrorCode };
+    const cases = [_]Case{
+        // RFC 9113 §4.2: too short for the Prioritized Stream ID.
+        .{ .id = 0, .payload = "\x00\x00\x01", .code = .frame_size_error },
+        .{ .id = 0, .payload = "", .code = .frame_size_error },
+        // RFC 9218 §7.1: on a stream, for stream 0, for a push stream.
+        .{ .id = 1, .payload = "\x00\x00\x00\x01", .code = .protocol_error },
+        .{ .id = 0, .payload = "\x00\x00\x00\x00u=1", .code = .protocol_error },
+        .{ .id = 0, .payload = "\x80\x00\x00\x00", .code = .protocol_error },
+        .{ .id = 0, .payload = "\x00\x00\x00\x02", .code = .protocol_error },
+    };
+    for (cases) |cs| {
+        const t = try ready(.{});
+        defer t.destroy();
+        try expectError(error.ConnectionError, t.feed(try t.raw(0x10, 0, cs.id, cs.payload)));
+        try expectFrames(try t.drain(), &.{goawayWith(cs.code)});
+    }
 }
 
 test "h2: body over the limit" {

@@ -63,11 +63,12 @@ v1.70.0's lib/nghttp2_session.c (the fork, 0f8bc1c).
    (`Limits.empty_frame_rate`, 100 tokens refilled at 100/s; D15 point 2):
    DATA with an empty payload and no END_STREAM, HEADERS with an empty
    fragment and no END_STREAM (END_HEADERS or not), an empty CONTINUATION
-   without END_HEADERS, and every frame of an unknown type. nghttp2 charges
-   these to its one glitch budget (10000, 330/s: :5721, :6930, :6025), which
-   conn.zig keeps for PRIORITY and blocks decoded only for the table until
-   the D15 point 5 calibration picks one. An empty HEADERS or CONTINUATION
-   isn't a glitch in nghttp2.
+   without END_HEADERS, and every frame of an unknown type but
+   PRIORITY_UPDATE (9). nghttp2 charges these to its one glitch budget
+   (10000, 330/s: :5721, :6930, :6025), which conn.zig keeps
+   (`glitch_burst/rate`) for blocks decoded only for the table; the D15
+   point 5 calibration kept both buckets (9). An empty HEADERS or
+   CONTINUATION isn't a glitch in nghttp2.
 4. **The control-frame budget counts our RST_STREAMs too, sends a GOAWAY when
    spent, and is released as the writer writes.** PLAN §5.4 counts queued
    PING ACK + SETTINGS ACK + RST_STREAM against 1000; nghttp2's
@@ -110,6 +111,32 @@ v1.70.0's lib/nghttp2_session.c (the fork, 0f8bc1c).
    Borrowed DATA isn't counted: it is framed only at `pending`, so a peer
    that reads normally while one large frame is being written (a 16 MiB
    SETTINGS_MAX_FRAME_SIZE, or many iovecs) is never refused.
+9. **PRIORITY and PRIORITY_UPDATE are validated and charged to no budget**
+   (rule `priority_update` for the second). The D15 point 5 calibration
+   (bench/results/20261111-h2-limits-calibration/README.md, "Findings that
+   change something" and "Budget by budget") measured Chromium sending
+   about one PRIORITY per subresource (117 on one page load, 956/s and 1354
+   on one connection on reloads), above the glitch budget's 330/s; Conn has
+   no priority tree, so a PRIORITY frame holds no state and queues no output
+   (CVE-2019-9513 was about the tree). nghttp2 charges every PRIORITY to its
+   glitch budget (:5843). PRIORITY_UPDATE (type 0x10, RFC 9218 §7.1) is what
+   RFC 9218 clients (Chromium, Firefox) send instead once they see our
+   SETTINGS_NO_RFC7540_PRIORITIES = 1, at about the same rate, so it isn't
+   counted as an unknown frame (3) either; it is checked and ignored:
+   shorter than 4 bytes is FRAME_SIZE_ERROR, on a stream other than 0, for
+   Prioritized Stream ID 0, or for a push stream (an even ID; we push
+   nothing, so every one is idle) PROTOCOL_ERROR, all connection errors.
+   nghttp2 with the extension on checks the length (:6192), the stream
+   (:4982) and the idle push stream (:4987) the same way and charges the
+   glitch budget (:6198); it ignores Prioritized Stream ID 0, which RFC 9218
+   §7.1 makes a PROTOCOL_ERROR, and makes an idle request stream past
+   SETTINGS_MAX_CONCURRENT_STREAMS a PROTOCOL_ERROR (:5004), which Conn,
+   keeping no idle streams, doesn't check. Today's engine doesn't turn the
+   extension on, so its nghttp2 takes type 0x10 as unknown: ignored, and
+   charged to the glitch budget (:6161). The diff harness accepts Conn
+   ending the connection with a `PRIORITY_UPDATE:` reason on a frame
+   nghttp2 ignored, and nghttp2 running out of its glitch budget first (rule
+   `empty_budget`).
 
 ## The session (conn.zig against an nghttp2 server session)
 
@@ -117,7 +144,8 @@ v1.70.0's lib/nghttp2_session.c (the fork, 0f8bc1c).
 to an nghttp2 server session set up as today's engine sets it up, and
 compares the output; the limits entries above are its rules
 `reset_budget` (1, 2), `empty_budget` (3), `continuations` (4),
-`block_bytes` (5), `head_431` (6) and `refused` (7, 8), and HPACK 2 and 3
+`block_bytes` (5), `head_431` (6), `refused` (7, 8) and `priority_update`
+(9), and HPACK 2 and 3
 its `hpack_cost`. Both sides are drained after every frame, as if their
 writers kept up: nghttp2 closes a stream once its last frame is written
 (CLOSING until then, and judged by its earlier state), Conn once that frame
