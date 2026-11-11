@@ -5,6 +5,7 @@
 const std = @import("std");
 const zio = @import("zio");
 const placement = @import("placement.zig");
+const park = @import("server/park.zig");
 const test_wait = @import("anole_test_wait");
 
 /// Whether the injected `zio` can arm a timer against the running task. The
@@ -102,20 +103,67 @@ pub const Watch = struct {
 /// zio arms a timer against the running task. `std.Io` has no deadline for a
 /// stream read, only cancelation, so elsewhere the deadline goes to a second
 /// task that cancels this one when it passes.
+///
+/// A deadline that may come up to about a second late (a request's, the
+/// wait for the next one's, a write's) is set with `setLazy`: on zio, once
+/// the task is registered with its executor's shelf (`register`), that is a
+/// store the shelf's sweep enforces (`park.Lazy`), with no timer. One set
+/// with `set` is exact. Each replaces the other.
 pub const Timer = if (have_auto_cancel) struct {
     inner: zio.AutoCancel = .init,
+    /// `inner` was armed since it was last cleared: a clear of a timer that
+    /// never was takes the executor's timer lock all the same.
+    armed: bool = false,
+    lazy: park.Lazy = .{},
+    /// The shelf `lazy` is registered with, if any.
+    shelf: ?*park.Shelf = null,
 
     pub fn init(_: ?*Watch) @This() {
         return .{};
     }
 
+    /// Lets `setLazy` keep its deadlines to `shelf`'s sweep, the calling
+    /// task's executor's: once per task serving a connection, which calls
+    /// `unregister` before it is done with the timer. Nothing without a
+    /// shelf, or with one that is closing.
+    pub fn register(self: *@This(), shelf: ?*park.Shelf) void {
+        const s = shelf orelse return;
+        if (s.register(&self.lazy)) self.shelf = s;
+    }
+
+    pub fn unregister(self: *@This()) void {
+        const s = self.shelf orelse return;
+        self.lazy.clear();
+        s.unregister(&self.lazy);
+        self.shelf = null;
+    }
+
     pub fn set(self: *@This(), _: std.Io, timeout: std.Io.Timeout) void {
+        self.lazy.clear();
+        if (timeout == .none) return self.clearExact();
         // `Timeout.fromStd` keeps the value clockless and `Clock.fromStdTimeout`
         // carries the clock, which is how zio wants the two halves.
         self.inner.setClock(.fromStd(timeout), .fromStdTimeout(timeout));
+        self.armed = true;
+    }
+
+    /// `deadline`, or none, up to about a second late: on the shelf's sweep
+    /// when registered, on the timer otherwise.
+    pub fn setLazy(self: *@This(), io: std.Io, deadline: ?std.Io.Clock.Timestamp) void {
+        const d = deadline orelse return self.clear(io);
+        if (self.shelf == null or d.clock != .awake) return self.set(io, .{ .deadline = d });
+        self.clearExact();
+        self.lazy.set(d.raw.nanoseconds);
     }
 
     pub fn clear(self: *@This(), _: std.Io) void {
+        self.lazy.clear();
+        self.clearExact();
+    }
+
+    fn clearExact(self: *@This()) void {
+        if (!self.armed) return;
+        self.armed = false;
         self.inner.clear();
     }
 
@@ -127,7 +175,7 @@ pub const Timer = if (have_auto_cancel) struct {
     /// then consumes; false for a cancel from anyone else (the server
     /// stopping), which stays the task's.
     pub fn fired(self: *@This()) bool {
-        return self.inner.check(error.Canceled);
+        return self.inner.check(error.Canceled) or self.lazy.fired();
     }
 } else struct {
     /// Null when no deadline was configured.
@@ -145,6 +193,15 @@ pub const Timer = if (have_auto_cancel) struct {
     pub fn clear(self: *@This(), io: std.Io) void {
         const w = self.watch orelse return;
         w.disarm(io);
+    }
+
+    /// No sweep here: `setLazy` is `set`.
+    pub fn register(_: *@This(), _: ?*park.Shelf) void {}
+
+    pub fn unregister(_: *@This()) void {}
+
+    pub fn setLazy(self: *@This(), io: std.Io, deadline: ?std.Io.Clock.Timestamp) void {
+        if (deadline) |d| self.set(io, .{ .deadline = d }) else self.clear(io);
     }
 
     /// Whether `set` does anything: there is no watcher when no deadline

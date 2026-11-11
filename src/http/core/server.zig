@@ -1195,6 +1195,12 @@ fn setRequestTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) v
     timer.set(io, timeout);
 }
 
+fn setLazyRequestTimeout(context: *anyopaque, io: std.Io, deadline: ?std.Io.Clock.Timestamp) void {
+    // SAFETY: `_timeout_context` is the connection's `Timer` (`handleRequests`).
+    const timer: *Timer = @ptrCast(@alignCast(context));
+    timer.setLazy(io, deadline);
+}
+
 fn claimRequestTimeout(context: *anyopaque) bool {
     const timer: *Timer = @ptrCast(@alignCast(context));
     return timer.fired();
@@ -1857,15 +1863,20 @@ pub fn Server(comptime Ctx: type) type {
             unreachable;
         }
 
-        /// A shelf for each executor and its driver task, when connections can
-        /// park: `timeout.idle_park` is set, and the `Io` is zio with pinned
-        /// executors. Empty otherwise.
+        /// A shelf for each executor and its driver task, when the `Io` is
+        /// zio with pinned executors: for idle connections to park on
+        /// (`timeout.idle_park`), and for the sweep that keeps the
+        /// deadlines of the connections served there (`park.Lazy`), which
+        /// runs whether they park or not. Empty otherwise.
         fn openShelves(self: *Self, sweepers: *std.Io.Group, executors: ?usize) []park.Shelf {
-            const idle_park = self.config.timeout.idle_park orelse return &.{};
-            if (idle_park.nanoseconds <= 0 or !park.usable(self.io)) return &.{};
+            if (!park.usable(self.io)) return &.{};
             const n = executors orelse return &.{};
             const shelves = self.allocator.alloc(park.Shelf, n) catch return &.{};
-            @memset(shelves, .{ .io = self.io, .long_park = idle_park });
+            // Nothing parks without `idle_park` (`parkAfter`), so the
+            // fallback is never read.
+            const idle_park = self.config.timeout.idle_park orelse park.sweep_interval;
+            const long_park = if (idle_park.nanoseconds > 0) idle_park else park.sweep_interval;
+            @memset(shelves, .{ .io = self.io, .long_park = long_park });
             for (shelves, 0..) |*shelf, i| {
                 park.spawnOn(sweepers, i, park.drive, .{ shelf, self.io }) catch |err| {
                     log.debug("Idle connections keep their tasks: {}", .{err});
@@ -1912,6 +1923,7 @@ pub fn Server(comptime Ctx: type) type {
         fn parkAfter(self: *const Self, wait_timeout: ?std.Io.Duration) ?std.Io.Duration {
             if (self.shelves.len == 0) return null;
             const after = self.config.timeout.idle_park orelse return null;
+            if (after.nanoseconds <= 0) return null;
             if (wait_timeout) |w| if (after.nanoseconds >= w.nanoseconds) return null;
             return after;
         }
@@ -2599,29 +2611,35 @@ pub fn Server(comptime Ctx: type) type {
 
         /// Waits for the first byte of a request, with nothing in flight:
         /// the drain does not wait for a connection here, and the cancel
-        /// that follows it closes the socket cleanly. With `park_timer`,
-        /// that timer firing is the park delay passing, reported as `.idle`.
-        fn waitForRequest(self: *Self, connection: *Connection, busy: *bool, park_timer: ?*Timer) !RequestWait {
+        /// that follows it closes the socket cleanly. With `park_watch`, the
+        /// shelf's driver ending the wait is the park delay passing,
+        /// reported as `.idle` (`park.Watch`: no timer per wait).
+        fn waitForRequest(self: *Self, connection: *Connection, busy: *bool, park_watch: ?*park.Watch) !RequestWait {
             // A task started for a parked connection is not counted yet.
             if (busy.*) {
                 busy.* = false;
                 self.finishRequest();
             }
 
+            if (park_watch) |w| w.begin();
             connection.reader.fillMore() catch |err| switch (err) {
-                error.EndOfStream => return .peer_gone,
+                error.EndOfStream => {
+                    if (park_watch) |w| _ = w.end(false);
+                    return .peer_gone;
+                },
                 error.ReadFailed => {
                     const e = connection.getReadError() orelse error.Unexpected;
-                    // Nothing is in flight between requests, so a peer that
-                    // went away here has cost us nothing.
-                    if (Connection.isPeerGone(e)) return .peer_gone;
-                    if (e == error.Canceled) if (park_timer) |t| if (t.fired()) {
+                    if (park_watch) |w| if (w.end(e == error.Canceled)) {
                         connection.clearReadError();
                         return .idle;
                     };
+                    // Nothing is in flight between requests, so a peer that
+                    // went away here has cost us nothing.
+                    if (Connection.isPeerGone(e)) return .peer_gone;
                     return e;
                 },
             };
+            if (park_watch) |w| _ = w.end(false);
 
             const was = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
             busy.* = true;
@@ -2801,16 +2819,19 @@ pub fn Server(comptime Ctx: type) type {
                 .connection = .{ .io = self.io, .stream = stream, .allocator = self.allocator, .buffers = &.{}, .read_buffer = &.{} },
                 // The first request's deadlines run from here, handshake
                 // included.
-                .accepted_at = .now(self.io, .awake),
+                .accepted_at = self.tickNow(),
             };
 
             var timer: Timer = .init(watch);
+            timer.register(self.shelfHere());
             const outcome = self.startConnection(conn, &timer, &busy) catch |err| {
                 timer.clear(self.io);
+                timer.unregister();
                 self.closeConn(conn);
                 return err;
             };
             timer.clear(self.io);
+            timer.unregister();
             self.settle(conn, outcome);
         }
 
@@ -2832,9 +2853,9 @@ pub fn Server(comptime Ctx: type) type {
                 }
                 defer timer.clear(self.io);
                 if (l.config.raw != null)
-                    self.armDeadline(timer, deadlineAfter(conn.accepted_at, l.config.handshake_timeout))
+                    timer.setLazy(self.io, deadlineAfter(conn.accepted_at, l.config.handshake_timeout))
                 else
-                    self.armDeadline(timer, earlier(
+                    timer.setLazy(self.io, earlier(
                         deadlineAfter(conn.accepted_at, self.config.timeout.read_header),
                         deadlineAfter(conn.accepted_at, self.config.timeout.request),
                     ));
@@ -2866,7 +2887,7 @@ pub fn Server(comptime Ctx: type) type {
                     // slow request, which is bounded.
                     {
                         defer timer.clear(self.io);
-                        self.armTimer(timer, if (l.config.raw != null) l.config.handshake_timeout else self.config.timeout.request);
+                        timer.setLazy(self.io, deadlineAfter(self.tickNow(), if (l.config.raw != null) l.config.handshake_timeout else self.config.timeout.request));
 
                         connection.initTls(self.allocator, self.io, stream, &m.auth, m.clientAuth(), l.config.tls.?.alpn_protocols) catch |err| {
                             // tls.zig only saw the ciphertext reader or
@@ -3000,13 +3021,16 @@ pub fn Server(comptime Ctx: type) type {
             defer if (busy) self.finishRequest();
 
             var timer: Timer = .init(null);
+            timer.register(self.shelfHere());
             const outcome = self.serveRequests(conn, &timer, &busy) catch |err| {
                 timer.clear(self.io);
+                timer.unregister();
                 self.closeConn(conn);
                 logConnectionError(err);
                 return;
             };
             timer.clear(self.io);
+            timer.unregister();
             self.settle(conn, outcome);
         }
 
@@ -3101,14 +3125,10 @@ pub fn Server(comptime Ctx: type) type {
             if (deadline) |d| timer.set(self.io, .{ .deadline = d }) else timer.clear(self.io);
         }
 
-        /// Cleared when `duration` is unset, so an earlier deadline does not
-        /// carry into a wait meant to be unbounded.
-        fn armTimer(self: *Self, timer: *Timer, duration: ?std.Io.Duration) void {
-            if (duration) |d| {
-                timer.set(self.io, .{ .duration = .{ .raw = d, .clock = .awake } });
-            } else {
-                timer.clear(self.io);
-            }
+        /// The awake clock as this executor last read it (`park.now`): what
+        /// the deadlines a shelf's sweep enforces are taken from.
+        fn tickNow(self: *const Self) std.Io.Clock.Timestamp {
+            return park.now(self.io).withClock(.awake);
         }
 
         /// Applies `ServerConfig.response` to a response the server built,
@@ -3219,10 +3239,12 @@ pub fn Server(comptime Ctx: type) type {
         /// the connection closes instead. Whether the connection can carry
         /// on.
         fn boundedDiscard(self: *Self, parser: *RequestParser, connection: *Connection, max: usize, timer: *Timer, request_deadline: ?std.Io.Clock.Timestamp) error{Canceled}!bool {
-            const now = std.Io.Clock.Timestamp.now(self.io, .awake);
+            const now = self.tickNow();
             if (request_deadline) |d| if (now.compare(.gte, d)) return false;
-            const own = now.addDuration(.{ .raw = drainTimeout(&self.config), .clock = .awake });
-            self.armDeadline(timer, earlier(request_deadline, own));
+            const budget = drainTimeout(&self.config);
+            const deadline = earlier(request_deadline, now.addDuration(.{ .raw = budget, .clock = .awake }));
+            // A budget of a second or more can be a second late.
+            if (budget.nanoseconds >= park.sweep_interval.nanoseconds) timer.setLazy(self.io, deadline) else self.armDeadline(timer, deadline);
             defer timer.clear(self.io);
             return discardBody(parser, connection, max) catch |err| switch (err) {
                 error.Canceled => if (timer.fired()) false else error.Canceled,
@@ -3249,6 +3271,13 @@ pub fn Server(comptime Ctx: type) type {
             // A connection woken after a long park parks again once it has
             // served a request (`park.Shelf.long_park`).
             var repark_after: ?usize = if (conn.parked.woke_from_long) conn.request_count + 1 else null;
+            // What ends a wait for the next request at the park delay, with
+            // no timer per wait: the shelf's driver (`park.Watch`). Without
+            // a shelf to watch it, the connection does not park.
+            var park_watch: park.Watch = .{};
+            const watch_shelf = if (self.parkAfter(null) == null) null else if (self.shelfHere()) |s| (if (s.closed) null else s) else null;
+            if (watch_shelf) |s| s.watch(&park_watch);
+            defer if (watch_shelf) |s| s.unwatch(&park_watch);
             var idle_read_buffer: [idle_read_buffer_len]u8 = undefined;
             connection.useReadBuffer(&idle_read_buffer);
             // Last: the reader must not point into this frame once it is
@@ -3297,6 +3326,7 @@ pub fn Server(comptime Ctx: type) type {
                 .peer_certificate = connection.peerCertificate(),
                 ._timeout_context = timer,
                 ._set_timeout = setRequestTimeout,
+                ._set_lazy_timeout = setLazyRequestTimeout,
                 ._claim_timeout = claimRequestTimeout,
                 // Its entry table is never read past `len`: not zeroed.
                 .session = undefined,
@@ -3316,9 +3346,6 @@ pub fn Server(comptime Ctx: type) type {
                 // deadline, and its request deadline runs from arrival. A
                 // request pipelined behind the last one is already here.
                 const first = conn.request_count == 0;
-                // Whether the wait below left a timer armed that the request
-                // itself must replace or clear.
-                var wait_armed = false;
                 if (connection.reader.bufferedLen() == 0) {
                     // A guard: a response is corked only while the next
                     // request is buffered, so nothing is owed here.
@@ -3332,18 +3359,22 @@ pub fn Server(comptime Ctx: type) type {
                         }
                     }
                     const wait_timeout = if (first) self.config.timeout.request else self.config.timeout.keepalive;
-                    // Parking: the wait goes on for `idle_park` first, and a
-                    // connection with nothing by then parks. One woken after
-                    // a long park parks again as soon as it has answered
-                    // what woke it, as if the delay had passed.
-                    const park_after = self.parkAfter(wait_timeout);
+                    // The wait's deadline, up to a second late, for as long
+                    // as the connection waits: on this task, and parked.
+                    const wait_deadline = if (wait_timeout != null) deadlineAfter(self.tickNow(), wait_timeout) else null;
+                    timer.setLazy(self.io, wait_deadline);
+                    // Parking: the wait goes on for `idle_park` first (up to
+                    // half as long again, `park.Watch`), and a connection
+                    // with nothing by then parks. One woken after a long
+                    // park parks again as soon as it has answered what woke
+                    // it, as if the delay had passed.
+                    const park_after = if (watch_shelf != null) self.parkAfter(wait_timeout) else null;
                     const repark_now = if (repark_after) |n| conn.request_count >= n else false;
                     if (repark_now) repark_after = null;
-                    wait_armed = wait_timeout != null;
-                    var arrival: RequestWait = if (repark_now and park_after != null) .idle else arrival: {
-                        self.armTimer(timer, park_after orelse wait_timeout);
-                        break :arrival try self.waitForRequest(connection, busy, if (park_after != null) timer else null);
-                    };
+                    var arrival: RequestWait = if (repark_now and park_after != null)
+                        .idle
+                    else
+                        try self.waitForRequest(connection, busy, if (park_after != null) &park_watch else null);
                     if (arrival == .idle) {
                         const shelf = self.shelfHere();
                         if (shelf != null and !shelf.?.closed and connection.parkable()) {
@@ -3355,22 +3386,12 @@ pub fn Server(comptime Ctx: type) type {
                             }
                             // The wait's own deadline, which a parked
                             // connection keeps to the shelf's sweep.
-                            conn.parked.deadline = if (wait_timeout) |w|
-                                std.Io.Timestamp.now(self.io, .awake).addDuration(.fromNanoseconds(w.nanoseconds - park_after.?.nanoseconds))
-                            else
-                                null;
+                            conn.parked.deadline = if (wait_deadline) |d| d.raw else null;
                             return .park;
                         }
                         // Something is in flight after all (a partial TLS
                         // record): the rest of the wait, on this task.
-                        self.armTimer(timer, if (wait_timeout) |w| .fromNanoseconds(w.nanoseconds - park_after.?.nanoseconds) else null);
                         arrival = try self.waitForRequest(connection, busy, null);
-                    } else if (park_after != null) {
-                        // The park timer, gone before anything else can wait:
-                        // had it fired just as the request arrived, its
-                        // cancel would hit the next wait.
-                        timer.clear(self.io);
-                        wait_armed = false;
                     }
                     switch (arrival) {
                         .arrived => {},
@@ -3404,19 +3425,21 @@ pub fn Server(comptime Ctx: type) type {
                 // `timeout.read_header` of the same point, whichever is
                 // sooner; then the request deadline alone applies.
                 //
-                // A head that is already buffered whole (the usual case: it
-                // came in one read) is parsed without waiting, so it needs no
-                // header deadline: the timer is set once per request rather
-                // than twice, and without a request deadline the clock is not
-                // read at all. A wait timer still armed then lasts through
-                // the parse, which does not wait, and is replaced after it.
+                // Arrival is when the read that brought its first bytes
+                // returned, and the head deadline is set once, from it:
+                // more bytes of a trickled head never move it later
+                // (Slowloris). A head that is already buffered whole (the
+                // usual case: it came in one read) is parsed without
+                // waiting, so it needs no header deadline: the request's is
+                // set at once, in place of the wait's, and without one the
+                // clock is not read at all.
                 const head_buffered = headBuffered(connection.reader.buffered());
                 const needs_clock = self.config.timeout.request != null or
                     (!head_buffered and self.config.timeout.read_header != null);
-                const started_at: std.Io.Clock.Timestamp = if (first or !needs_clock) accepted_at else .now(self.io, .awake);
+                const started_at: std.Io.Clock.Timestamp = if (first or !needs_clock) accepted_at else self.tickNow();
                 const request_deadline = if (needs_clock) deadlineAfter(started_at, self.config.timeout.request) else null;
                 const header_deadline = earlier(deadlineAfter(started_at, self.config.timeout.read_header), request_deadline);
-                if (!head_buffered) self.armDeadline(timer, header_deadline);
+                timer.setLazy(self.io, if (head_buffered) request_deadline else header_deadline);
                 conn.request_count += 1;
 
                 if (buffers == null) {
@@ -3488,10 +3511,8 @@ pub fn Server(comptime Ctx: type) type {
                     else => |e| return e,
                 };
                 // The head is in: from here the request deadline alone.
-                if (head_buffered) {
-                    if (request_deadline != null or wait_armed) self.armDeadline(timer, request_deadline);
-                } else if (header_deadline != null and (request_deadline == null or !header_deadline.?.compare(.eq, request_deadline.?))) {
-                    self.armDeadline(timer, request_deadline);
+                if (!head_buffered and header_deadline != null and (request_deadline == null or !header_deadline.?.compare(.eq, request_deadline.?))) {
+                    timer.setLazy(self.io, request_deadline);
                 }
 
                 // This is per request, not per connection: a keepalive

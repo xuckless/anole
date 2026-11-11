@@ -49,6 +49,10 @@ pub const writeEvent = @import("response.zig").writeEvent;
 /// Task placement on zio's executors, for protocol engines outside the
 /// core (HTTP/3) that keep a connection's tasks on one executor.
 pub const placement = @import("placement.zig");
+/// Internal, for tests on the real runtime: the per-executor shelf and its
+/// deadline sweep, and the timer that keeps a connection's deadlines.
+pub const _park = @import("server/park.zig");
+pub const _Timer = @import("deadline.zig").Timer;
 /// A wait point with a sleeper count, for one task's waits that others
 /// notify (HTTP/2 and HTTP/3 streams, their writers).
 pub const Signal = @import("signal.zig").Signal;

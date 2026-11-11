@@ -141,6 +141,9 @@ pub const Request = struct {
     // module does not depend on the server's backend-specific timer type.
     _timeout_context: ?*anyopaque = null,
     _set_timeout: ?*const fn (*anyopaque, std.Io, std.Io.Timeout) void = null,
+    /// As `_set_timeout`, for a deadline that may come up to about a second
+    /// late (`Timer.setLazy`); null where every deadline is exact.
+    _set_lazy_timeout: ?*const fn (*anyopaque, std.Io, ?std.Io.Clock.Timestamp) void = null,
     _claim_timeout: ?*const fn (*anyopaque) bool = null,
     /// The last deadline the handler set with `setTimeout`, on the awake
     /// clock; null for none (or `.none`). The rest of an unread body is
@@ -230,9 +233,9 @@ pub const Request = struct {
 
     fn keptOnReset(comptime name: []const u8) bool {
         const kept = [_][]const u8{
-            "arena",            "io",           "_parser",        "_transport", "_config",      "_response",
-            "remote_address",   "listener",     "secure",         "drain",      "_drain_hooks", "peer_certificate",
-            "_timeout_context", "_set_timeout", "_claim_timeout",
+            "arena",            "io",           "_parser",           "_transport",     "_config",      "_response",
+            "remote_address",   "listener",     "secure",            "drain",          "_drain_hooks", "peer_certificate",
+            "_timeout_context", "_set_timeout", "_set_lazy_timeout", "_claim_timeout",
         };
         @setEvalBranchQuota(10_000);
         for (kept) |k| if (std.mem.eql(u8, k, name)) return true;
@@ -293,6 +296,16 @@ pub const Request = struct {
         else
             null;
         set(self._timeout_context.?, self.io, timeout);
+    }
+
+    /// As `_applyDeadline`, with an absolute deadline on the awake clock
+    /// (or none) that may fire up to about a second late, where the engine
+    /// supports that (`_set_lazy_timeout`), and exactly otherwise.
+    pub fn _applyLazyDeadline(self: *Request, deadline: ?std.Io.Clock.Timestamp) void {
+        const set = self._set_lazy_timeout orelse
+            return self._applyDeadline(if (deadline) |d| .{ .deadline = d } else .none);
+        self._handler_deadline = deadline;
+        set(self._timeout_context.?, self.io, deadline);
     }
 
     /// The request body: transfer framing undone, and the content coding
