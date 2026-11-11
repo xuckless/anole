@@ -1522,8 +1522,9 @@ listener's `framing`. See [net.md](net.md) for the same servers in Zig.
 `handler` is any number the consumer picks; it comes back as `handler_id`.
 `framing` is exactly one of `{"lines": {max, strip_cr, crlf}}`, `{"length":
 {bytes, endian, includes_header, max}}` and `{"varint": {max}}`; left out, bytes
-come as they arrive. Every other key is the Zig option of the same name (a
-duration as `<name>_ms`), listed with its default in the schema. A raw
+come as they arrive. Every other key but `close_on_drain` (see "The drain"
+below) is the Zig option of the same name (a duration as `<name>_ms`), listed
+with its default in the schema. A raw
 listener needs `port` (0 for a free one) or `unix`, and never takes `$PORT`.
 UDP takes no `tls`, `unix` or `proxy_protocol`.
 
@@ -1554,20 +1555,42 @@ framing around the bytes; `ANOLE_NET_F_END` ends this side after them (`len`
 may be 0), with TLS close_notify and a FIN. After this side ended, a write is
 `ANOLE_E_INVALID` ("Ended"). `anole_net_close(c, how)` closes gracefully
 (`ANOLE_NET_CLOSE_GRACEFUL`: what is queued goes out, input is dropped until
-the peer ends, at most 2 s) or with a reset (`ANOLE_NET_CLOSE_RESET`: now);
+the peer ends, or 2 s after this side ended) or with a reset (`ANOLE_NET_CLOSE_RESET`: now);
 `anole_handle_release` on a connection is the graceful close.
 `anole_net_pause` and `anole_net_resume` stop and restart reading (the input
 waits in the kernel, so TCP slows the peer); `anole_net_set_idle_timeout`
 replaces `tcp.idle_timeout_ms` for one connection.
 
-**The drain.** At drain start Anole closes each raw TCP connection as
-`ANOLE_NET_CLOSE_GRACEFUL` does: what was queued goes out, this side ends, and
-`ANOLE_EV_NET_CLOSE` follows with `ANOLE_NET_CLOSED_DRAIN` once the peer ends
-its side (at most 2 s). From then on a write is `ANOLE_E_INVALID` ("Ended"),
-and after `ANOLE_EV_NET_CLOSE` the handle is stale (`ANOLE_E_GONE`; a close or
-release is a no-op). `ANOLE_EV_DRAINING` comes on another ring: it may arrive
-before or after these closes. A protocol that wants to say goodbye can't count
-on writing it after `ANOLE_EV_DRAINING`.
+**The drain.** By default (`tcp.close_on_drain`, true) Anole closes each raw
+TCP connection at drain start as `ANOLE_NET_CLOSE_GRACEFUL` does, and
+`ANOLE_EV_NET_CLOSE` follows with `ANOLE_NET_CLOSED_DRAIN`. What the consumer
+wrote before it goes out. From then on a write answers `ANOLE_E_INVALID`
+("Ended") and is not sent, so a reply the consumer still owed is lost; a
+binding treats that `ANOLE_E_INVALID` as the connection going away, not as a
+programmer error. Input Anole reads after the close is dropped (records
+already posted still come). The connection closes once the peer ends its
+side, or 2 s after this side ended (the queue written, TLS close_notify,
+FIN); writing the queue is bounded by `tcp.write_timeout_ms`. A connection
+idle long enough to have parked (`timeouts.idle_park_ms`) is closed at once
+instead, without waiting for its queue. `ANOLE_EV_NET_CLOSE` is posted once
+the connection's reading side lets go: one waiting for read credit (a
+consumer that stopped polling) holds it until the consumer polls or
+`timeouts.shutdown_ms` passes. A connection the consumer closed or reset
+before the drain keeps its own reason. After `ANOLE_EV_NET_CLOSE` the handle
+is stale (`ANOLE_E_GONE`; a close or release is a no-op).
+`ANOLE_EV_DRAINING` comes on another ring: it may arrive before or after
+these closes, so a protocol that wants to say goodbye can't count on writing
+it after `ANOLE_EV_DRAINING`. To finish the exchanges in flight or say
+goodbye, set `"close_on_drain": false` on the listener's `tcp`: its
+connections stay open through the drain until the consumer closes them
+(after `ANOLE_EV_DRAINING`), or `timeouts.shutdown_ms` closes them with
+`ANOLE_NET_CLOSED_DRAIN`, as `node:net`'s `server.close()` leaves its
+sockets. Either way a connection that has parked (no input for
+`timeouts.idle_park_ms`) is closed at drain start. Known gap: a connection whose write side the consumer already
+ended (`ANOLE_NET_F_END`), whose peer then sends nothing, and that read input
+within `timeouts.idle_park_ms` before the drain is not closed by it; it stays
+until the peer sends or ends, `tcp.idle_timeout_ms` or `tcp.lifetime_ms`, or
+`timeouts.shutdown_ms`.
 
 **Read credit.** A connection posts at most `tcp.read_ahead` bytes the
 consumer has not polled yet; the rest waits in the kernel. One fast peer and a

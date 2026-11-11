@@ -834,6 +834,55 @@ test "capi net: a connection the consumer closed just before a drain closes once
     try expectNoMoreCloses(rig);
 }
 
+/// `close_on_drain: false`, a bounded shutdown far past the test, and no
+/// connection parks (a parked one is closed at drain start either way).
+const tcp_kept = "{\"executors\": 2, \"timeouts\": {\"shutdown_ms\": 60000, \"idle_park_ms\": null}, \"listeners\": [{\"name\": \"chat\", \"address\": \"127.0.0.1\", \"port\": 0, \"tcp\": {\"handler\": 7, \"close_on_drain\": false}}]}";
+
+test "capi net: close_on_drain false leaves a connection to the consumer through the drain, closed by its own close (#166)" {
+    if (comptime !features.net) return error.SkipZigTest;
+    const rig = try Rig.create(tcp_kept);
+    defer rig.destroy();
+    const s = try rig.client();
+    defer s.close();
+    try s.writer().writeAll("x");
+    try s.writer().flush();
+    const open = try rig.take(.net_open);
+    defer free(open);
+    const first = try rig.take(.net_data);
+    free(first);
+
+    try rig.e.drain();
+    const draining = try rig.take(.draining);
+    free(draining);
+    // Still open after DRAINING: the client's input is delivered and the
+    // consumer's answer is taken and sent.
+    try s.writer().writeAll("ping");
+    try s.writer().flush();
+    const ping = try rig.take(.net_data);
+    defer free(ping);
+    try std.testing.expectEqual(open.handle, ping.handle);
+    var r: ToEnd = .{ .s = s };
+    try r.start();
+    defer r.join();
+    _ = try engine.net.write(rig.e, open.handle, "pong", 0);
+    // The consumer ends it.
+    try engine.net.closeConn(rig.e, open.handle, abi.NET_CLOSE_GRACEFUL);
+    try wait.waitFlag(std.testing.io, "the client read the server's FIN", &r.ended);
+    try std.testing.expectEqualStrings("pong", r.got);
+    s.socket.shutdown(s.io, .send) catch {};
+
+    const close = try rig.take(.net_close);
+    defer free(close);
+    try std.testing.expectEqual(open.handle, close.handle);
+    // The consumer's close, not the drain's: PEER at the client's FIN (the
+    // ABI's graceful close sets no reason itself), or LOCAL had the
+    // connection read again after it.
+    const ce: *const abi.NetCloseEvent = @ptrCast(close.bytes.ptr);
+    try std.testing.expect(ce.reason != abi.NET_CLOSED_DRAIN);
+    try std.testing.expect(ce.reason == abi.NET_CLOSED_PEER or ce.reason == abi.NET_CLOSED_LOCAL);
+    try expectNoMoreCloses(rig);
+}
+
 test "capi net: config tcp and udp keys parse, and each refusal says why" {
     if (comptime !features.net) return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(alloc);

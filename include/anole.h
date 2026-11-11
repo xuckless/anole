@@ -520,8 +520,9 @@ enum anole_event_type {
                                     end this side when done (ANOLE_NET_F_END or a close) */
   ANOLE_EV_NET_CLOSE = 99,       /* anole_net_close_event: the connection is over; its handle
                                     is stale. A drain closes every raw TCP connection at its
-                                    start (reason ANOLE_NET_CLOSED_DRAIN), in no set order
-                                    with ANOLE_EV_DRAINING */
+                                    start (reason ANOLE_NET_CLOSED_DRAIN) unless the listener's
+                                    tcp.close_on_drain is false, in no set order with
+                                    ANOLE_EV_DRAINING */
   ANOLE_EV_NET_DATAGRAMS = 100,  /* anole_net_datagrams_event; handle: anole_net_udp */
   /* ---- end p3/net ---- */
 

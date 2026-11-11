@@ -153,6 +153,11 @@ pub const TcpTable = struct {
     /// the net driver and in any order with one another, instead of on a
     /// task of their own one at a time.
     inline_events: bool = false,
+    /// Without `drain`: the drain ends each connection (#107). False
+    /// leaves them open until the handler closes them or
+    /// `timeouts.shutdown` (the C ABI's `tcp.close_on_drain`; a Zig
+    /// handler that wants that gives itself a `drain` callback).
+    close_on_drain: bool = true,
 };
 
 /// A TCP service for `Listener.tcp`: what `app.tcp` builds.
@@ -2119,11 +2124,12 @@ const TcpConn = struct {
     /// the default end (`drainEndKick`). The task form watches `drainEvent`
     /// and gets no default. The C ABI's table has no `drain` and gets it
     /// (#166), taken by the driver itself: its consumer sees
-    /// ANOLE_EV_NET_CLOSE with reason DRAIN.
+    /// ANOLE_EV_NET_CLOSE with reason DRAIN. A table without
+    /// `close_on_drain` gets nothing either.
     fn onDrain(hook: *dusty.DrainHooks.Hook) void {
         const t: *TcpConn = @alignCast(@fieldParentPtr("drain_hook", hook));
         const table = t.service.table;
-        if (table.drain == null and table.task != null) return;
+        if (table.drain == null and (table.task != null or !table.close_on_drain)) return;
         // `.seq_cst`: see `serviceKick`.
         _ = t.flags.fetchOr(Flag.drain_pending, .seq_cst);
         t.driver.kick(t.kick);
