@@ -53,8 +53,9 @@ pub const TokenBucket = struct {
 /// own where it has one. The limits that already have one live only there
 /// (config.ServerConfig.Http2: stream_reset_burst/rate, charged per D15
 /// point 1 only for streams not yet answered, provoked resets included;
-/// refused_stream_burst/rate; max_continuations). The config keys for
-/// these and the engine that charges them come with M2.
+/// refused_stream_burst/rate; max_continuations; conn.Options defaults to
+/// them). conn.zig charges these; their config keys come with M3. Every
+/// default is here or in config.zig, nowhere else.
 pub const Limits = struct {
     /// Queued control answers (PING ACK, SETTINGS ACK, RST_STREAM) before
     /// the connection is closed: nghttp2's max_outbound_ack
@@ -62,17 +63,24 @@ pub const Limits = struct {
     control_frame_budget: u32 = 1000,
     /// Empty-frame flood (CVE-2019-9518): DATA, HEADERS and CONTINUATION
     /// frames with an empty payload and no END_STREAM, per connection per
-    /// second. D15 point 2: unknown and extension frames count too.
-    /// Uncalibrated until D15 point 5.
+    /// second. D15 point 2: unknown and extension frames count too, but not
+    /// RFC 9218's PRIORITY_UPDATE. Kept at 100 by the D15 point 5
+    /// calibration (legitimate clients sent none).
     empty_frame_rate: u32 = 100,
     /// nghttp2's glitch limiter (session_update_glitch_ratelim; burst and
-    /// rate per second), which PLAN §5.4 doesn't name: one bucket for empty
-    /// DATA, PRIORITY, unknown frames, ignored header blocks and malformed
-    /// heads, GOAWAY ENHANCE_YOUR_CALM when empty. M2 picks this or
-    /// `empty_frame_rate` after the D15 point 5 calibration; this one is what
-    /// the session differential matches for free.
+    /// rate per second), which PLAN §5.4 doesn't name. conn.zig charges it
+    /// for what the empty-frame budget doesn't take (header blocks decoded
+    /// only for the table), GOAWAY ENHANCE_YOUR_CALM when empty. Not for
+    /// PRIORITY or PRIORITY_UPDATE, which nghttp2 charges here: the D15
+    /// point 5 calibration measured Chromium above the 330/s rate with
+    /// them (h2/INTENTIONAL.md, limits 9).
     glitch_burst: u64 = 10000,
     glitch_rate: u64 = 330,
+    /// Bytes queued for the peer and not yet written past which new
+    /// streams are refused (CVE-2019-9517, a peer that stops reading; PLAN
+    /// §3.3, h2o's H2O_HTTP2_DEFAULT_OUTBUF_SOFT_MAX_SIZE). The write
+    /// timeout that then closes the connection is M3's sweeper.
+    out_high: usize = 1 << 20,
     /// SETTINGS entries in one frame (nghttp2's NGHTTP2_DEFAULT_MAX_SETTINGS);
     /// more is ENHANCE_YOUR_CALM (frame.Options.max_settings).
     max_settings: u8 = 32,

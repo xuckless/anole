@@ -1,0 +1,33 @@
+h2count: tls on 127.0.0.1:19443 -> 127.0.0.1:18080
+h2count: h2c on 127.0.0.1:19080 -> 127.0.0.1:18080
+h2count: h2c on 127.0.0.1:19083 -> 127.0.0.1:18083
+scenario               conns  streams  req/s  PING/s  SETT  ent/frm  RST/s  RST/100ms  RSTun  emptyD  emptyH  emptyC  unk  CONT/blk  hblk B  WU/s  PRIO
+curl-load-tls          1      100      100    0       1     3        0      0          0      0       0       0       0    0         38      201   0
+curl-load-h2c          1      99       100    0       1     3        0      0          0      0       0       0       0    0         38      201   0
+curl-abort             4      20       20     0       1     3        0      0          0      0       0       0       0    0         41      163   0
+curl-upload            1      1        1      0       1     3        0      0          0      0       0       0       0    0         72      3     0
+curl-sse               1      1        1      0       1     3        1      1          1      0       0       0       0    0         35      3     0
+curl-header-30k        1      1        1      0       1     3        0      0          0      0       0       0       0    1         24052   3     0
+curl-header-200k       1      0        0      0       1     3        0      0          0      0       0       0       0    0         0       1     0
+raw-continuation       7      1        1      0       1     0        0      0          0      0       0       0       0    20        71705   0     0
+node-page              1      100      100    0       1     0        0      0          0      0       0       0       0    0         23      0     0
+node-download          1      1        1      0       1     0        0      0          0      0       0       0       0    0         24      4096  0
+node-cancel            1      20       20     0       1     0        20     20         20     0       0       0       0    0         24      158   0
+node-upload            1      1        1      0       1     0        0      0          0      0       0       0       0    0         22      0     0
+node-ping-tool-driven  1      0        0      50      1     0        0      0          0      0       0       0       0    0         0       0     0
+grpc-go                1      50       1020   36      1     0        19     19         19     0       0       0       0    0         94      36    0
+scenario               conns  streams  req/s  PING/s  SETT  ent/frm  RST/s  RST/100ms  RSTun  emptyD  emptyH  emptyC  unk  CONT/blk  hblk B  WU/s  PRIO
+curl-load-tls          1      100      100    0       1     3        0      0          0      0       0       0       0    0         38      201   0
+curl-load-h2c          1      99       100    0       1     3        0      0          0      0       0       0       0    0         38      201   0
+curl-abort             4      20       20     0       1     3        0      0          0      0       0       0       0    0         41      163   0
+curl-upload            1      1        1      0       1     3        0      0          0      0       0       0       0    0         72      3     0
+curl-sse               1      1        1      0       1     3        1      1          1      0       0       0       0    0         35      3     0
+curl-header-30k        1      1        1      0       1     3        0      0          0      0       0       0       0    1         24052   3     0
+curl-header-200k       1      0        0      0       1     3        0      0          0      0       0       0       0    0         0       1     0
+raw-continuation       7      1        1      0       1     0        0      0          0      0       0       0       0    20        71705   0     0
+node-page              1      100      100    0       1     0        0      0          0      0       0       0       0    0         23      0     0
+node-download          1      1        1      0       1     0        0      0          0      0       0       0       0    0         24      4096  0
+node-cancel            1      20       20     0       1     0        20     20         20     0       0       0       0    0         24      158   0
+node-upload            1      1        1      0       1     0        0      0          0      0       0       0       0    0         22      0     0
+node-ping-tool-driven  1      0        0      50      1     0        0      0          0      0       0       0       0    0         0       0     0
+grpc-go                1      50       1020   36      1     0        19     19         19     0       0       0       0    0         94      36    0
