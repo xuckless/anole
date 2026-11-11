@@ -583,7 +583,10 @@ try app.db.transaction(req, .{ .retries = 3 }, move, .{ req, from, to, amount })
 
 A transaction holds the writer (`BEGIN IMMEDIATE`) until it commits or
 rolls back, so make it short, and inside it use the `Tx`, not the `Client`: a
-write on the `Client` would wait for the transaction's own writer. `transaction`
+write on the `Client` from the task that holds the transaction (or an open
+`iterate` or `acquire` on the writer) fails at once with `error.Database`
+("this task already holds the writer"), because it could only wait for
+itself; make that call through the `Tx`. `transaction`
 runs again after `SQLITE_BUSY` (another process held the file past
 `busy_timeout`, as during a restart), up to `retries` more times.
 `begin(req, .{ .read_only = true })` is a snapshot on a reader that writes

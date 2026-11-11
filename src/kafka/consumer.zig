@@ -159,7 +159,6 @@ pub const Host = struct {
     io: std.Io,
     cluster: *cluster_mod.Cluster,
     producer: *producer_mod.Producer,
-    tel: ?*const Telemetry = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -326,6 +325,13 @@ pub const Consumer = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     started: bool = false,
     active: std.atomic.Value(u32) = .init(0),
+
+    /// The client's telemetry, once `Client.start` set it: stored once with
+    /// release (the producer's `tel`, #159), so a consumer made before the
+    /// start counts too (#168).
+    fn tel(c: *const Consumer) ?*const Telemetry {
+        return c.host.producer.tel.load(.acquire);
+    }
 
     /// Copies the options (so the caller's strings need not outlive it).
     pub fn create(host: Host, opts: ConsumeOptions, handler: HandlerFn, context: ?*anyopaque) !*Consumer {
@@ -556,7 +562,7 @@ fn runSession(m: *Member) (SessionError || error{ InvalidOptions, ConcurrencyUna
         const assigned = protocol.decodeAssignment(arena, s.assignment) catch return error.ProtocolError;
         try setUpPartitions(&sess, assigned);
     }
-    if (host.tel) |t| t.rebalanced(c.opts.group);
+    if (c.tel()) |t| t.rebalanced(c.opts.group);
     log.info("kafka group {s}: member {s} joined generation {d} with {d} partitions", .{ c.opts.group, m.member_id.items, sess.generation, sess.parts.len });
 
     // ---- positions
@@ -933,7 +939,7 @@ fn heartbeatLoop(sess: *Session) std.Io.Cancelable!void {
             },
             else => log.warn("kafka group {s}: Heartbeat: {s}", .{ c.opts.group, protocol.errorName(ec) }),
         }
-        if (c.host.tel) |t| for (sess.parts) |ps| {
+        if (c.tel()) |t| for (sess.parts) |ps| {
             const hw = ps.high_watermark.load(.acquire);
             if (hw >= 0) t.setLag(c.opts.group, ps.topic, ps.partition, @max(0, hw - ps.processed.load(.acquire)));
         };
@@ -1094,7 +1100,7 @@ fn deliverLoop(sess: *Session, ps: *PartState) std.Io.Cancelable!void {
                 chunk.resp.release();
                 c.host.gpa.destroy(chunk);
             } else ps.mutex.unlock(io);
-            if (c.host.tel) |t| for (0..n) |_| t.consumedOne(c.opts.group, ps.topic);
+            if (c.tel()) |t| for (0..n) |_| t.consumedOne(c.opts.group, ps.topic);
             continue;
         }
         const rec = chunk.recs[chunk.idx];
@@ -1113,7 +1119,7 @@ fn deliverLoop(sess: *Session, ps: *PartState) std.Io.Cancelable!void {
             chunk.resp.release();
             c.host.gpa.destroy(chunk);
         } else ps.mutex.unlock(io);
-        if (c.host.tel) |t| t.consumedOne(c.opts.group, ps.topic);
+        if (c.tel()) |t| t.consumedOne(c.opts.group, ps.topic);
     }
 }
 
@@ -1166,7 +1172,7 @@ fn handleRecord(sess: *Session, ps: *PartState, scratch: *std.heap.ArenaAllocato
     if (c.opts.dead_letter) |dlt| {
         while (true) {
             if (deadLetter(c, dlt, &msg, last_error, arena)) {
-                if (c.host.tel) |t| t.deadLettered(c.opts.group, ps.topic);
+                if (c.tel()) |t| t.deadLettered(c.opts.group, ps.topic);
                 return true;
             }
             if (sess.stop.load(.acquire)) return false;
