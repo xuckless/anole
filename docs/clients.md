@@ -344,8 +344,12 @@ handshake is done, bodies included. `conn.earlyData()` reports `.none`,
 session was resumed; and `conn.waitConnected()` waits for the handshake.
 
 Each ticket is used once. One cache can serve any number of connections at
-once. A server may answer 425 Too Early to a request it got in early data;
-send it again after `waitConnected`.
+once. A server may answer 425 Too Early to a request it got in early data.
+A request without a body then goes again once, after the handshake (RFC 8470
+section 5.2), and `waitHead` returns the answer to that one; a second 425
+reaches you. A request with a body, or one carrying your own `Early-Data`
+field (a proxy forwarding a request it took in early data must pass the 425
+on), gets the 425: send it again after `waitConnected` if it should go.
 
 ### Changing networks
 

@@ -64,6 +64,26 @@ fn earlyPost(req: *dusty.Request, res: *dusty.Response) !void {
     res.body = if (early_data.isEarly(req)) "early" else "late";
 }
 
+/// How often GET /too-early/ ran: behind `TooEarly`, so only once the
+/// handshake is done.
+var too_early_runs: std.atomic.Value(u32) = .init(0);
+var too_early_guard: early_data.TooEarly = .{};
+
+fn tooEarlyRoute(_: *dusty.Request, res: *dusty.Response) !void {
+    _ = too_early_runs.fetchAdd(1, .monotonic);
+    res.body = "ran";
+}
+
+/// How often GET /always-425 ran.
+var always_425_runs: std.atomic.Value(u32) = .init(0);
+
+/// GET /always-425: 425 Too Early every time, early or not.
+fn always425(_: *dusty.Request, res: *dusty.Response) !void {
+    _ = always_425_runs.fetchAdd(1, .monotonic);
+    res.status = .too_early;
+    res.body = "again";
+}
+
 /// POST /answer-first: answers without reading the request body.
 fn answerFirst(_: *dusty.Request, res: *dusty.Response) !void {
     res.body = "first";
@@ -321,6 +341,8 @@ const Fixture = struct {
         http.router.get("/abort", aborted);
         http.router.get("/early", early);
         http.router.post("/early-post", earlyPost);
+        http.router.group("/too-early", &[_]dusty.Middleware(void){.init(&too_early_guard)}).get("/", tooEarlyRoute);
+        http.router.get("/always-425", always425);
         http.router.post("/answer-first", answerFirst);
         http.router.get("/port", port);
         http.router.get("/download", download);
@@ -2159,6 +2181,103 @@ test "h3: 0-RTT the server refuses goes again after the handshake" {
     try std.testing.expectEqual(client.EarlyData.rejected, conn.earlyData());
     try std.testing.expect(!conn.resumed());
     try std.testing.expectEqual(@as(u64, 0), new.ep.early_served.load(.monotonic));
+}
+
+/// What a GET of `path` sent in 0-RTT got: the status, the body (the
+/// caller frees it) and what became of 0-RTT. A first connection gets a
+/// ticket; on the second, resumed one, the relay holds the server's
+/// datagrams until the server has run the GET from early data, so it went
+/// in 0-RTT and any 425 arrives once the client hears the server.
+/// `caller_early_data` adds the caller's own `early-data: 1`; `with_body`
+/// sends a body.
+fn earlyGet(gpa: std.mem.Allocator, io: std.Io, path: []const u8, caller_early_data: bool, with_body: bool) !struct { status: u16, body: []u8, early: client.EarlyData } {
+    var f = try Fixture.startWith(gpa, io, .{ .listeners = &.{} }, .{ .early_data = true });
+    defer f.stop(gpa, io);
+    const relay = try Relay.start(gpa, io, f.ep.address());
+    defer relay.stop();
+    var cache: client.SessionCache = .init(gpa, io);
+    defer cache.deinit();
+    {
+        const conn = try f.connectResuming(gpa, io, &cache, true, relay);
+        defer conn.close();
+        const b = try finish(try request(conn, "GET", "/hello", .{}), gpa);
+        gpa.free(b);
+        try wait.waitUntil(io, "hasTicket", &cache, hasTicket);
+    }
+    relay.armGated();
+    const conn = try f.connectResuming(gpa, io, &cache, true, relay);
+    defer conn.close();
+    try std.testing.expectEqual(client.EarlyData.pending, conn.earlyData());
+    const head = [_]client.Header{
+        .{ .name = ":method", .value = "GET" },   .{ .name = ":path", .value = path },
+        .{ .name = ":scheme", .value = "https" }, .{ .name = ":authority", .value = "localhost" },
+        .{ .name = "early-data", .value = "1" },
+    };
+    const s = try conn.request(head[0..if (caller_early_data) 5 else 4], .{ .body = with_body, .early = true });
+    defer s.release();
+    if (with_body) {
+        try s.writer().writeAll("sent early");
+        try s.closeSend();
+    }
+    try relay.openDownWhenEarly(io, f.ep, 1, 0);
+    try s.waitHead();
+    const body = try s.reader().allocRemaining(gpa, .unlimited);
+    relay.disarm();
+    return .{ .status = s.status, .body = body, .early = conn.earlyData() };
+}
+
+test "h3: a 425 to a GET sent in 0-RTT goes again after the handshake" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const runs = too_early_runs.load(.monotonic);
+    const got = try earlyGet(gpa, io, "/too-early/", false, false);
+    defer gpa.free(got.body);
+    // The early GET got the 425 (the handler did not run); the one sent
+    // again after the handshake ran.
+    try std.testing.expectEqual(@as(u16, 200), got.status);
+    try std.testing.expectEqualStrings("ran", got.body);
+    try std.testing.expectEqual(runs + 1, too_early_runs.load(.monotonic));
+    try std.testing.expectEqual(client.EarlyData.accepted, got.early);
+}
+
+test "h3: a second 425 reaches the caller" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const runs = always_425_runs.load(.monotonic);
+    const got = try earlyGet(gpa, io, "/always-425", false, false);
+    defer gpa.free(got.body);
+    // Sent once more after the first 425, not again after the second.
+    try std.testing.expectEqual(@as(u16, 425), got.status);
+    try std.testing.expectEqualStrings("again", got.body);
+    try std.testing.expectEqual(runs + 2, always_425_runs.load(.monotonic));
+}
+
+test "h3: a request carrying Early-Data gets the 425, not a retry" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const runs = always_425_runs.load(.monotonic);
+    const got = try earlyGet(gpa, io, "/always-425", true, false);
+    defer gpa.free(got.body);
+    try std.testing.expectEqual(@as(u16, 425), got.status);
+    try std.testing.expectEqual(runs + 1, always_425_runs.load(.monotonic));
+}
+
+test "h3: a request with a body sent in 0-RTT gets the 425, not a retry" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const runs = always_425_runs.load(.monotonic);
+    const got = try earlyGet(gpa, io, "/always-425", false, true);
+    defer gpa.free(got.body);
+    try std.testing.expectEqual(@as(u16, 425), got.status);
+    try std.testing.expectEqual(runs + 1, always_425_runs.load(.monotonic));
 }
 
 test "h3: a client offering QUIC v2 moves to it only when the server prefers v2" {
