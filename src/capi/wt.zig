@@ -20,6 +20,9 @@ const anole = @import("../root.zig");
 const dusty = @import("dusty");
 const abi = @import("abi.zig");
 const engine = @import("engine.zig");
+const slot_table = @import("slot_table.zig");
+const SlotTable = slot_table.SlotTable;
+const spin = slot_table.spin;
 const placement = dusty.placement;
 const webtransport = anole.webtransport;
 const Session = webtransport.Session;
@@ -46,80 +49,14 @@ fn pack(gen: u32, state: State) u64 {
     return (@as(u64, gen) << 32) | @backingInt(state);
 }
 
-fn spin(l: *std.atomic.Mutex) void {
-    while (!l.tryLock()) std.atomic.spinLoopHint();
+fn freeWord(gen: u32) u64 {
+    return pack(gen, .free);
 }
 
-/// Slots of one kind on one executor: grown a chunk at a time, never
-/// moved or freed until the engine goes.
+/// Slots of one kind on one executor; also taken from consumer threads, so
+/// the free list is under a lock.
 fn Table(comptime T: type) type {
-    return struct {
-        const Self = @This();
-        const chunk_len = 256;
-        const max_chunks = 4096;
-        const Chunk = [chunk_len]T;
-        comptime {
-            std.debug.assert(chunk_len * max_chunks <= engine.max_slots);
-        }
-
-        chunks: [max_chunks]std.atomic.Value(?*Chunk) = @splat(.init(null)),
-        nchunks: u32 = 0,
-        free_head: u32 = engine.no_slot,
-        lock: std.atomic.Mutex = .unlocked,
-
-        fn slot(t: *Self, i: u32) ?*T {
-            // `i` may come from a made-up handle: past the table is nothing.
-            if (i / chunk_len >= max_chunks) return null;
-            const c = t.chunks[i / chunk_len].load(.acquire) orelse return null;
-            return &c[i % chunk_len];
-        }
-
-        fn alloc(t: *Self, x: *Exec) !*T {
-            spin(&t.lock);
-            defer t.lock.unlock();
-            if (t.free_head == engine.no_slot) {
-                if (t.nchunks == max_chunks) return error.OutOfMemory;
-                const c = try gpa.create(Chunk);
-                const base = t.nchunks * chunk_len;
-                for (c, 0..) |*s, j| s.* = .{
-                    .word = .init(pack(x.engine.first_gen, .free)),
-                    .exec = x,
-                    .index = @intCast(base + j),
-                    .next_free = if (j + 1 < chunk_len) @intCast(base + j + 1) else engine.no_slot,
-                };
-                t.chunks[t.nchunks].store(c, .release);
-                t.nchunks += 1;
-                t.free_head = base;
-            }
-            const s = t.slot(t.free_head).?;
-            t.free_head = s.next_free;
-            return s;
-        }
-
-        fn free(t: *Self, s: *T) void {
-            spin(&t.lock);
-            defer t.lock.unlock();
-            s.next_free = t.free_head;
-            t.free_head = s.index;
-        }
-
-        fn maxGen(t: *const Self) u32 {
-            var max: u32 = 0;
-            for (t.chunks[0..t.nchunks]) |*cv| {
-                for (cv.load(.acquire).?) |*s| max = @max(max, s.gen());
-            }
-            return max;
-        }
-
-        fn deinit(t: *Self) void {
-            for (t.chunks[0..t.nchunks]) |*cv| {
-                const c = cv.load(.acquire).?;
-                for (c) |*s| s.clear();
-                gpa.destroy(c);
-            }
-            t.nchunks = 0;
-        }
-    };
+    return SlotTable(T, .{ .chunk_len = 256, .max_chunks = 4096, .full = error.OutOfMemory, .locked = true }, freeWord);
 }
 
 // ---------------------------------------------------------------------------
@@ -355,8 +292,8 @@ pub const ExecState = struct {
     }
 
     pub fn deinit(st: *ExecState) void {
-        st.sessions.deinit();
-        st.streams.deinit();
+        st.sessions.deinit(SessionSlot.clear);
+        st.streams.deinit(StreamSlot.clear);
     }
 };
 

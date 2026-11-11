@@ -475,7 +475,7 @@ test "capi net: pause holds input until resume" {
 fn slotUnpolled(e: *engine.Engine, hv: u64) u32 {
     const h = engine.Handle.decode(hv);
     const x = &e.execs[h.exec];
-    const chunk = x.net.chunks[h.slot / 256].load(.acquire).?;
+    const chunk = x.net.slots.chunks[h.slot / 256].load(.acquire).?;
     return chunk[h.slot % 256].unpolled.load(.acquire);
 }
 

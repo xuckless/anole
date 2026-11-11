@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const dusty = @import("dusty");
 const anole = @import("../root.zig");
 const engine = @import("engine.zig");
+const SlotTable = @import("slot_table.zig").SlotTable;
 const abi = @import("abi.zig");
 const config_mod = @import("config.zig");
 const db_mod = @import("db.zig");
@@ -118,12 +119,6 @@ fn packT(gen: u32, state: TState) u64 {
     return (@as(u64, gen) << 32) | @backingInt(state);
 }
 
-const chunk_len = 64;
-const max_chunks = 1024;
-comptime {
-    std.debug.assert(chunk_len * max_chunks <= engine.max_slots);
-}
-
 const Kind = enum(u8) { upload, download };
 
 pub const TSlot = struct {
@@ -160,59 +155,15 @@ pub const TSlot = struct {
     }
 };
 
-const Chunk = [chunk_len]TSlot;
+fn tFreeWord(gen: u32) u64 {
+    return packT(gen, .free);
+}
 
-pub const TransferTable = struct {
-    chunks: [max_chunks]std.atomic.Value(?*Chunk) = @splat(.init(null)),
-    nchunks: std.atomic.Value(u32) = .init(0),
-    free_head: u32 = engine.no_slot,
+pub const TransferTable = SlotTable(TSlot, .{ .chunk_len = 64, .max_chunks = 1024, .full = error.TooManyTransfers }, tFreeWord);
 
-    fn slot(t: *TransferTable, i: u32) ?*TSlot {
-        if (i / chunk_len >= max_chunks) return null;
-        const c = t.chunks[i / chunk_len].load(.acquire) orelse return null;
-        return &c[i % chunk_len];
-    }
-
-    fn alloc(t: *TransferTable, x: *Exec) !*TSlot {
-        if (t.free_head == engine.no_slot) {
-            const n = t.nchunks.load(.monotonic);
-            if (n == max_chunks) return error.TooManyTransfers;
-            const c = try gpa.create(Chunk);
-            const base = n * chunk_len;
-            for (c, 0..) |*s, j| s.* = .{
-                .word = .init(packT(x.engine.first_gen, .free)),
-                .exec = x,
-                .index = @intCast(base + j),
-                .next_free = if (j + 1 < chunk_len) @intCast(base + j + 1) else engine.no_slot,
-            };
-            t.chunks[n].store(c, .release);
-            t.nchunks.store(n + 1, .release);
-            t.free_head = base;
-        }
-        const s = t.slot(t.free_head).?;
-        t.free_head = s.next_free;
-        return s;
-    }
-
-    fn markStopped(t: *TransferTable) void {
-        for (t.chunks[0..t.nchunks.load(.acquire)]) |*cv| {
-            for (cv.load(.acquire).?) |*s| s.stopped = true;
-        }
-    }
-
-    fn maxGen(t: *const TransferTable) u32 {
-        var max: u32 = 0;
-        for (t.chunks[0..t.nchunks.load(.acquire)]) |*cv| {
-            for (cv.load(.acquire).?) |*s| max = @max(max, s.gen());
-        }
-        return max;
-    }
-
-    fn deinit(t: *TransferTable) void {
-        for (t.chunks[0..t.nchunks.load(.acquire)]) |*cv| gpa.destroy(cv.load(.acquire).?);
-        t.nchunks.store(0, .release);
-    }
-};
+fn markStopped(t: *TSlot) void {
+    t.stopped = true;
+}
 
 /// Per executor (`Exec.s3`): the tasks it runs are canceled at the stop.
 pub const ExecState = struct {
@@ -220,17 +171,17 @@ pub const ExecState = struct {
     transfers: TransferTable = .{},
 
     pub fn cancel(st: *ExecState, io: std.Io) void {
-        st.transfers.markStopped();
+        st.transfers.forEach(markStopped);
         st.work.cancel(io);
     }
 
     /// The highest generation handed out (`Engine.destroy`).
     pub fn maxGen(st: *const ExecState) u32 {
-        return @constCast(&st.transfers).maxGen();
+        return st.transfers.maxGen();
     }
 
     pub fn deinit(st: *ExecState) void {
-        st.transfers.deinit();
+        st.transfers.deinit(null);
     }
 };
 
@@ -241,8 +192,7 @@ fn freeSlot(x: *Exec, t: *TSlot, g: u32) void {
     t.finish_requested.store(false, .monotonic);
     t.event.reset();
     t.word.store(packT(engine.nextGen(g), .free), .release);
-    t.next_free = x.s3.transfers.free_head;
-    x.s3.transfers.free_head = t.index;
+    x.s3.transfers.free(t);
 }
 
 const Found = struct { *TSlot, Handle };
