@@ -457,9 +457,12 @@ enum anole_event_type {
                               has room (ev.handle). Edge-triggered: one event per wait, however
                               many writes answered BUSY before it; the next BUSY arms another.
                               It may come when nothing waits (rarely, after a refused write was
-                              retried and fit), and it also comes when the handle can take no
-                              more writes (the next write answers ANOLE_E_GONE): a binding emits
-                              its own 'drain' only while it is waiting */
+                              retried and fit). It may also come when a WebTransport stream's
+                              sending side is over (its next write answers ANOLE_E_GONE); for
+                              every other handle its own end (ANOLE_EV_ABORT, ANOLE_EV_NET_CLOSE,
+                              ANOLE_EV_WS_CLOSE, ANOLE_EV_SSE_CLOSE, the S3 transfer's
+                              ANOLE_EV_S3_RESULT) ends the wait, never a WRITABLE. A binding
+                              emits its own 'drain' only while it is waiting */
   ANOLE_EV_SENT = 5,       /* anole_sent_event: a borrowed body is no longer read */
   ANOLE_EV_WS_OPEN = 6,    /* anole_request_event (the upgrade request; subprotocol set); handle:
                               anole_ws. Routes with "accept": "auto" only (the default) */
