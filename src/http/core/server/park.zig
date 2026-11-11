@@ -66,6 +66,20 @@ fn sweepInterval() std.Io.Duration {
     return sweep_interval;
 }
 
+/// The awake clock as the calling executor last read it (`placement.tickNow`),
+/// read afresh off an executor: the clock every deadline a shelf enforces is
+/// taken from, so the sweep never finds one past before it is.
+pub fn now(io: std.Io) std.Io.Timestamp {
+    return placement.tickNow(io) orelse std.Io.Timestamp.now(io, .awake);
+}
+
+/// Whether a deadline at `deadline` (nanoseconds on `now`'s clock) is far
+/// enough off for the sweep: one sooner than a sweep from now could come
+/// many times its length late, so it goes on an exact timer instead.
+pub fn sweepable(io: std.Io, deadline: i96) bool {
+    return deadline - now(io).nanoseconds >= sweepInterval().nanoseconds;
+}
+
 /// What a parked connection keeps for its shelf, in the connection's own
 /// heap state.
 pub const Parked = struct {
@@ -112,9 +126,9 @@ pub const Parked = struct {
 /// callbacks), without a timer armed and cleared around every wait: the
 /// task marks its waits (`begin`, `end`) and is registered with its shelf
 /// for as long as it serves (`Shelf.watch`), and the shelf's driver, which
-/// looks at every registered task each half `Shelf.long_park`, ends a wait
-/// that has gone on for `long_park` (up to half as long again) the way a
-/// timer would, with an auto-cancel of the task's wait. A busy connection
+/// looks at every registered task each quarter `Shelf.long_park`, ends a
+/// wait that has gone on for `long_park` (or up to a quarter less) the way
+/// a timer would, with an auto-cancel of the task's wait. A busy connection
 /// then pays two stores per wait, where a timer took a clock read, a lock
 /// and two operations on the executor's timer heap, whose cost grows with
 /// the number of sockets waiting.
@@ -157,6 +171,73 @@ pub const Watch = struct {
     /// From the driver, on the task's executor: cancels the task's wait.
     fn poke(self: *Watch) void {
         if (comptime !supported) return;
+        self.poked = true;
+        if (self.task.setCanceled(.auto)) |d| {
+            self.delivered = d;
+            self.task.wake();
+        } else {
+            // Canceled already (the server stops): nothing to take back.
+            self.poked = false;
+        }
+    }
+};
+
+/// A deadline of a task serving a connection (a request's, the wait for
+/// the next one's, a write's), kept to the shelf's sweep rather than to a
+/// timer: the task stores it (`set`, `clear`), is registered with its shelf
+/// for as long as it serves (`Shelf.register`), and every
+/// `sweep_interval` the driver ends whatever the task is doing past it
+/// with an auto-cancel, the way a timer would, up to about a second late.
+/// A request then pays a few stores for its deadlines, where timers took a
+/// clock read, the executor's timer lock and two heap operations each.
+pub const Lazy = struct {
+    node: std.DoublyLinkedList.Node = .{},
+    // SAFETY: set by `Shelf.register`, and read only while registered.
+    task: TaskPtr = undefined,
+    /// When the driver cancels the task, in nanoseconds on the awake clock
+    /// (`now`); `never` for no deadline.
+    deadline: i96 = never,
+    /// The driver canceled the task, which the task's `delivered` count was
+    /// at, and nobody has claimed or taken the cancel back yet.
+    poked: bool = false,
+    delivered: u7 = 0,
+
+    pub const never = std.math.maxInt(i96);
+
+    /// A new deadline, in place of the last. A cancel the last one made and
+    /// no cancelation point reported yet is taken back, as
+    /// `zio.AutoCancel.clear` does, so that it does not fail what the task
+    /// does next.
+    pub fn set(self: *Lazy, deadline: i96) void {
+        self.retract();
+        self.deadline = deadline;
+    }
+
+    pub fn clear(self: *Lazy) void {
+        self.set(never);
+    }
+
+    /// Whether the cancel the task just got was this deadline's, which it
+    /// then consumes (`zio.AutoCancel.check`).
+    pub fn fired(self: *Lazy) bool {
+        if (comptime !supported) return false;
+        if (!self.poked) return false;
+        self.poked = false;
+        return self.task.checkAutoCancel();
+    }
+
+    fn retract(self: *Lazy) void {
+        if (comptime !supported) return;
+        if (!self.poked) return;
+        self.poked = false;
+        _ = self.task.retractAutoCancel(self.delivered);
+    }
+
+    /// From the driver, on the task's executor: the deadline passed. It
+    /// fires once, as a timer does.
+    fn poke(self: *Lazy) void {
+        if (comptime !supported) return;
+        self.deadline = never;
         self.poked = true;
         if (self.task.setCanceled(.auto)) |d| {
             self.delivered = d;
@@ -218,9 +299,16 @@ pub const Shelf = struct {
     long_park: std.Io.Duration,
     /// The tasks serving adopted connections on this executor (`Watch`).
     watches: std.DoublyLinkedList = .{},
+    /// The deadlines of the tasks serving connections on this executor
+    /// (`Lazy`).
+    lazies: std.DoublyLinkedList = .{},
     /// Test builds only: connections ended by `sweep` because their
     /// deadline passed while they were parked (not by the stop).
     test_deadline_expired: if (@import("builtin").is_test) std.atomic.Value(u32) else void = if (@import("builtin").is_test) .init(0) else {},
+    /// Test builds only: `Lazy` deadlines `sweep` found past, and how many
+    /// sweeps ran.
+    test_lazy_fired: if (@import("builtin").is_test) std.atomic.Value(u32) else void = if (@import("builtin").is_test) .init(0) else {},
+    test_sweeps: if (@import("builtin").is_test) std.atomic.Value(u32) else void = if (@import("builtin").is_test) .init(0) else {},
 
     /// Registers the calling task, on the shelf's executor, for idle
     /// detection while it serves a connection: `unwatch` before it is done
@@ -241,13 +329,34 @@ pub const Shelf = struct {
         self.watches.remove(&w.node);
     }
 
-    /// How often the driver looks at the watches.
+    /// Registers the calling task's deadline `l`, on the shelf's executor,
+    /// for the sweep to enforce: `unregister` before the task is done with
+    /// `l`. False when the shelf is closed (the server stops), whose driver
+    /// is ending: the task keeps its deadlines on a timer.
+    pub fn register(self: *Shelf, l: *Lazy) bool {
+        if (comptime !supported) return false;
+        if (self.closed) return false;
+        l.* = .{ .task = zio.currentTask().? };
+        self.lazies.append(&l.node);
+        return true;
+    }
+
+    /// Takes `l` off the shelf (`register`), on the same executor.
+    pub fn unregister(self: *Shelf, l: *Lazy) void {
+        if (comptime !supported) return;
+        self.lazies.remove(&l.node);
+    }
+
+    /// How often the driver looks at the watches: each quarter
+    /// `long_park`, so that a wait seen at four looks in a row
+    /// (`lookAtWatches`) has gone on for 3/4 to all of `long_park`, never
+    /// longer, as with a timer armed for it.
     fn watchInterval(self: *const Shelf) std.Io.Duration {
-        return .fromNanoseconds(@max(self.long_park.nanoseconds >> 1, std.time.ns_per_ms));
+        return .fromNanoseconds(@max(self.long_park.nanoseconds >> 2, std.time.ns_per_ms));
     }
 
     /// The driver's look at the watches: ends each wait seen going on at
-    /// the last two looks too.
+    /// the last three looks too.
     fn lookAtWatches(self: *Shelf) void {
         if (self.closed) return;
         var it = self.watches.first;
@@ -260,7 +369,7 @@ pub const Shelf = struct {
             }
             if (w.poked) continue;
             w.seen_count +|= 1;
-            if (w.seen_count >= 2) w.poke();
+            if (w.seen_count >= 3) w.poke();
         }
     }
 
@@ -276,7 +385,7 @@ pub const Shelf = struct {
         p.expired = false;
         p.expiring = false;
         p.back = false;
-        p.parked_at = std.Io.Timestamp.now(self.io, .awake);
+        p.parked_at = now(self.io);
         self.cq.submit(&p.poll.c) catch return false;
         self.insert(p);
         _ = self.count.fetchAdd(1, .monotonic);
@@ -316,13 +425,25 @@ pub const Shelf = struct {
         p.vtable.expire(p) catch p.expireDone();
     }
 
-    /// Expires the connections whose deadline is not after `now`.
-    fn sweep(self: *Shelf, now: std.Io.Timestamp) void {
+    /// Expires the parked connections whose deadline is not after `at`,
+    /// and cancels the tasks whose `Lazy` deadline is not. From the driver
+    /// (tests call it directly), on the shelf's executor.
+    pub fn sweep(self: *Shelf, at: std.Io.Timestamp) void {
+        if (@import("builtin").is_test) _ = self.test_sweeps.fetchAdd(1, .monotonic);
         while (self.timed.first) |n| {
             const p: *Parked = @alignCast(@fieldParentPtr("node", n));
-            if (p.deadline.?.nanoseconds > now.nanoseconds) break;
+            if (p.deadline.?.nanoseconds > at.nanoseconds) break;
             if (@import("builtin").is_test) _ = self.test_deadline_expired.fetchAdd(1, .monotonic);
             self.expire(p);
+        }
+        var it = self.lazies.first;
+        while (it) |n| : (it = n.next) {
+            // SAFETY: only `Lazy` nodes are on `lazies` (`register`).
+            const l: *Lazy = @alignCast(@fieldParentPtr("node", n));
+            if (l.deadline <= at.nanoseconds) {
+                if (@import("builtin").is_test) _ = self.test_lazy_fired.fetchAdd(1, .monotonic);
+                l.poke();
+            }
         }
     }
 
@@ -343,7 +464,7 @@ pub const Shelf = struct {
             return;
         }
         self.remove(p);
-        const parked_for = p.parked_at.durationTo(std.Io.Timestamp.now(self.io, .awake));
+        const parked_for = p.parked_at.durationTo(now(self.io));
         p.woke_from_long = parked_for.nanoseconds >= self.long_park.nanoseconds;
         p.vtable.wake(p) catch p.vtable.close(p);
     }
@@ -362,26 +483,28 @@ pub fn drive(shelf: *Shelf, io: std.Io) std.Io.Cancelable!void {
         shelf.closed = true;
         return;
     };
-    var next_sweep = std.Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = sweepInterval(), .clock = .awake });
+    const start: std.Io.Clock.Timestamp = .{ .raw = now(io), .clock = .awake };
+    var next_sweep = start.addDuration(.{ .raw = sweepInterval(), .clock = .awake });
     var next_look: ?std.Io.Clock.Timestamp = null;
     while (!shelf.closed or shelf.count.load(.monotonic) > 0) {
-        const now = std.Io.Clock.Timestamp.now(io, .awake);
+        // The same clock as every deadline the sweep enforces.
+        const tick: std.Io.Clock.Timestamp = .{ .raw = now(io), .clock = .awake };
         // Here rather than on a timeout only, which a steady stream of
         // wakes would never let happen.
-        if (now.compare(.gte, next_sweep)) {
-            shelf.sweep(now.raw);
-            next_sweep = now.addDuration(.{ .raw = sweepInterval(), .clock = .awake });
+        if (tick.compare(.gte, next_sweep)) {
+            shelf.sweep(tick.raw);
+            next_sweep = tick.addDuration(.{ .raw = sweepInterval(), .clock = .awake });
         }
         if (shelf.watches.first == null) {
             next_look = null;
         } else if (next_look == null) {
-            next_look = now.addDuration(.{ .raw = shelf.watchInterval(), .clock = .awake });
-        } else if (now.compare(.gte, next_look.?)) {
+            next_look = tick.addDuration(.{ .raw = shelf.watchInterval(), .clock = .awake });
+        } else if (tick.compare(.gte, next_look.?)) {
             shelf.lookAtWatches();
-            next_look = now.addDuration(.{ .raw = shelf.watchInterval(), .clock = .awake });
+            next_look = tick.addDuration(.{ .raw = shelf.watchInterval(), .clock = .awake });
         }
         const until = if (next_look) |l| (if (l.compare(.lt, next_sweep)) l else next_sweep) else next_sweep;
-        const left = now.durationTo(until).raw.nanoseconds;
+        const left = tick.durationTo(until).raw.nanoseconds;
         const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(@max(0, left)), .clock = .awake } };
         const c = shelf.cq.waitTimeout(.fromStd(timeout)) catch |err| switch (err) {
             error.Timeout => continue,

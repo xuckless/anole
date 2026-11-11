@@ -114,6 +114,20 @@ pub fn loopIdleNs(io: std.Io) ?u64 {
     return rt.currentLoopIdleNs();
 }
 
+/// The awake clock as the calling task's executor last read it: zio reads
+/// `CLOCK_MONOTONIC` (the same clock as `std.Io.Clock.awake`) once per pass
+/// of its event loop, so this is a load rather than a clock read, and at
+/// most one pass behind (a task that runs long without yielding holds it
+/// back as long). For deadlines that may come that much early, never late:
+/// a timestamp of something that happened is never after it. Null off zio
+/// or off an executor; callers read the clock instead.
+pub fn tickNow(io: std.Io) ?std.Io.Timestamp {
+    if (comptime !have_zio) return null;
+    if (zio.Runtime.fromIo(io) == null) return null;
+    const task = zio.currentTask() orelse return null;
+    return .fromNanoseconds(task.getExecutor().loop.now().toNanoseconds());
+}
+
 /// How many executors accept loops can be spread over, or null when
 /// placement does not apply (not zio).
 pub fn executorCount(io: std.Io) ?usize {

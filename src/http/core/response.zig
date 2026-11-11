@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const http = @import("http.zig");
 const Request = @import("request.zig").Request;
 const beneath = @import("beneath.zig");
+const placement = @import("placement.zig");
 pub const WebSocket = @import("websocket.zig").WebSocket;
 const WebSocketModule = @import("websocket.zig");
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
@@ -566,8 +567,8 @@ pub const StreamingBodyWriter = struct {
             return w.consume(total);
         }
 
-        self.res.armWrite();
-        defer self.res.disarmWrite();
+        const armed = self.res.armWrite();
+        defer self.res.disarmWrite(armed);
         if (self.compressor) |compressor| {
             // Charged by the compressor for what it sends instead.
             try self.record(compressor.write(pending, data, splat));
@@ -593,8 +594,8 @@ pub const StreamingBodyWriter = struct {
     /// otherwise hold on to what it was given until it had more.
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
         const self: *StreamingBodyWriter = @alignCast(@fieldParentPtr("interface", w));
-        self.res.armWrite();
-        defer self.res.disarmWrite();
+        const armed = self.res.armWrite();
+        defer self.res.disarmWrite(armed);
         const compressor = self.compressor orelse return std.Io.Writer.defaultFlush(w);
         try self.record(compressor.flush(w.buffered()));
         w.end = 0;
@@ -616,8 +617,8 @@ pub const StreamingBodyWriter = struct {
         // its headers promised, and the connection cannot carry another
         // response.
         errdefer res.keepalive = false;
-        res.armWrite();
-        defer res.disarmWrite();
+        const armed = res.armWrite();
+        defer res.disarmWrite(armed);
 
         if (self.compressor) |compressor| {
             try res.resolve(compressor.finish(self.interface.buffered()));
@@ -1855,10 +1856,14 @@ pub const Response = struct {
                 else
                     (self._conn.?.getWriteError() orelse error.Unexpected);
                 // A write that was canceled after its own deadline passed
-                // was the write timeout's doing (the cancel stays pending
-                // for the engine, which closes the connection or the stream).
+                // was the write timeout's doing; the engine closes the
+                // connection or the stream. The deadline's cancel is used
+                // up here, as `Request.setTimeout`'s is by a handler that
+                // answers it, so that no later wait mistakes it for one
+                // still to propagate.
                 if (cause == error.Canceled) if (self._write_deadline) |d| {
                     if (std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, d)) {
+                        if (self._request) |req| _ = req._claimTimeoutCancel();
                         self.keepalive = false;
                         return error.WriteTimeout;
                     }
@@ -1878,22 +1883,27 @@ pub const Response = struct {
         self._stream_mode = true;
     }
 
-    /// Starts timing one hand-off of bytes to the connection.
-    fn armWrite(self: *Response) void {
-        if (!self._stream_mode) return;
-        const d = self._write_timeout orelse return;
-        const req = self._request orelse return;
-        self._write_deadline = std.Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = d, .clock = .awake });
-        req._applyDeadline(.{ .duration = .{ .raw = d, .clock = .awake } });
+    /// Starts timing one hand-off of bytes to the connection: one deadline
+    /// for all of it, however many bytes the peer takes meanwhile, so a
+    /// peer that reads slowly cannot stretch it, and a hand-off inside
+    /// another (the flush `end` makes) runs under the outer one's. Kept to
+    /// about a second (`Request._applyLazyDeadline`). Whether this call
+    /// armed it, for `disarmWrite`.
+    fn armWrite(self: *Response) bool {
+        if (!self._stream_mode or self._write_deadline != null) return false;
+        const d = self._write_timeout orelse return false;
+        const req = self._request orelse return false;
+        const now = (placement.tickNow(self.io) orelse std.Io.Timestamp.now(self.io, .awake)).withClock(.awake);
+        self._write_deadline = now.addDuration(.{ .raw = d, .clock = .awake });
+        req._applyLazyDeadline(self._write_deadline);
+        return true;
     }
 
-    /// Stops timing it.
-    fn disarmWrite(self: *Response) void {
-        if (!self._stream_mode) return;
-        const req = self._request orelse return;
-        if (self._write_deadline == null) return;
+    /// Stops timing it, if `armed` (what `armWrite` returned).
+    fn disarmWrite(self: *Response, armed: bool) void {
+        if (!armed) return;
         self._write_deadline = null;
-        req._applyDeadline(.none);
+        self._request.?._applyLazyDeadline(null);
     }
 
     /// Puts `content_type` into the headers. Before `headers_written` is
@@ -2315,8 +2325,8 @@ pub const Response = struct {
             if (send_header) try self.resolve(self.sendHeader(self.bodyOut()));
             self.liftDeadline();
             if (self.sendsBody()) try self.sendFileBody(body);
-            self.armWrite();
-            defer self.disarmWrite();
+            const armed = self.armWrite();
+            defer self.disarmWrite(armed);
             return self.resolve(self.finish(self.bodyOut()));
         }
         // A whole body in memory goes to a sink that takes it in one call.
@@ -2325,6 +2335,10 @@ pub const Response = struct {
         };
         // A body in a write buffer goes out from there, its head in front.
         if (send_header and self.handOverLent()) return self.resolve(self.sendLentRest(self._conn.?.writer));
+        // The end of a stream (its terminator, what its writer still held)
+        // is a hand-off like the stream's own writes.
+        const armed = self.armWrite();
+        defer self.disarmWrite(armed);
         return self.resolve(self.sendBody(self.bodyOut(), send_header));
     }
 
@@ -2377,8 +2391,8 @@ pub const Response = struct {
         var left = body.size;
         while (left > 0) {
             const piece = @min(left, file_piece);
-            self.armWrite();
-            defer self.disarmWrite();
+            const armed = self.armWrite();
+            defer self.disarmWrite(armed);
             const sent = self.bodyOut().sendFileAll(&reader, .limited(piece)) catch |err| switch (err) {
                 error.WriteFailed => {
                     self.keepalive = false;
@@ -3392,6 +3406,99 @@ test "StreamingBodyWriter: writes between flushes are framed as one chunk" {
 
     // One chunk for all three writes, not three.
     try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "8\r\naaabbb42\r\n0\r\n\r\n"));
+}
+
+test "StreamingBodyWriter: one write deadline per hand-off, however little the peer takes at a time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A peer that takes 3 bytes per write.
+    const Trickle = struct {
+        out: [8192]u8 = undefined,
+        len: usize = 0,
+        writes: usize = 0,
+        interface: std.Io.Writer,
+
+        fn take(self: *@This(), bytes: []const u8) usize {
+            const n = @min(bytes.len, 3);
+            @memcpy(self.out[self.len..][0..n], bytes[0..n]);
+            self.len += n;
+            self.writes += 1;
+            return n;
+        }
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("interface", w));
+            if (w.end > 0) {
+                const n = self.take(w.buffered());
+                std.mem.copyForwards(u8, w.buffer[0 .. w.end - n], w.buffer[n..w.end]);
+                w.end -= n;
+                return 0;
+            }
+            for (data[0 .. data.len - 1]) |d| if (d.len > 0) return self.take(d);
+            const last = data[data.len - 1];
+            if (splat == 0 or last.len == 0) return 0;
+            return self.take(last);
+        }
+    };
+    var trickle_buf: [8]u8 = undefined;
+    var trickle: Trickle = .{ .interface = .{ .buffer = &trickle_buf, .vtable = &.{ .drain = Trickle.drain } } };
+
+    // What the response asks of the request's deadline.
+    const Probe = struct {
+        armed: usize = 0,
+        disarmed: usize = 0,
+        /// Armed twice without a disarm between.
+        rearmed: bool = false,
+        exact: usize = 0,
+        last: ?std.Io.Clock.Timestamp = null,
+
+        fn setLazy(context: *anyopaque, _: std.Io, deadline: ?std.Io.Clock.Timestamp) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (deadline != null) {
+                if (self.last != null) self.rearmed = true;
+                self.armed += 1;
+            } else self.disarmed += 1;
+            self.last = deadline;
+        }
+
+        fn set(context: *anyopaque, _: std.Io, _: std.Io.Timeout) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.exact += 1;
+        }
+    };
+    var probe: Probe = .{};
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .io = std.testing.io,
+        ._parser = undefined,
+        ._transport = undefined,
+        ._timeout_context = &probe,
+        ._set_timeout = Probe.set,
+        ._set_lazy_timeout = Probe.setLazy,
+    };
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&trickle.interface);
+    var response = try Response._init(arena.allocator(), &connection, 32);
+    response.io = std.testing.io;
+    response._request = &req;
+    response._write_timeout = .fromSeconds(30);
+
+    var body_buf: [16]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    const payload: [100]u8 = @splat('x');
+    try body.interface.writeAll(&payload);
+    try body.end();
+
+    // The request deadline went (once, exactly), and each hand-off had one
+    // write deadline, never moved while the peer took its bytes.
+    try std.testing.expectEqual(1, probe.exact);
+    try std.testing.expect(!probe.rearmed);
+    try std.testing.expect(probe.armed >= 2);
+    try std.testing.expectEqual(probe.armed, probe.disarmed);
+    try std.testing.expect(trickle.writes > 3 * probe.armed);
+    try std.testing.expect(std.mem.endsWith(u8, trickle.out[0..trickle.len], "0\r\n\r\n"));
 }
 
 test "StreamingBodyWriter: an empty flush does not terminate the body" {
