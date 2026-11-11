@@ -226,8 +226,11 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   directly inside `loop.add`; a short batch or EAGAIN drops the hint, so
   only a socket whose queue stays full skips the ring. With `fast_send`,
   `net_sendmmsg` tries sendmmsg directly and falls back to the SENDMSG
-  SQE on EAGAIN (the kernel retries it on writable). Delivery stays
-  batched, so each batch still gives the executor a turn.
+  SQE on EAGAIN (the kernel retries it on writable). 3c863fc: an untimed
+  batch receive or send that finished inside `loop.add` returns at once
+  (`waitForIoPreferInline`, as accept), so a full socket gives several
+  batches per executor pass under the tick budget and `no_park_grace`,
+  not one park and backend poll per batch; a timed receive still parks.
   D10 (fork only, 4286fa0): a wait that completes without parking still
   yields once the executor's tick is spent and checks held locks
   (`yieldPointNoPark`), so inline sends can't starve the run queue (#184
