@@ -951,11 +951,11 @@ const StressTask = struct {
                 else => {
                     try t.client.send(&c, record);
                     t.kinds[i] = .send;
-                    // A flush waits until nothing is pending, the other
-                    // tasks' records included: under their load it may time
-                    // out (delivery_pending), which is its contract (#156:
-                    // only the records before it). Once the tasks stop, the
-                    // flushes below must return.
+                    // A flush waits only for the records before it (#156),
+                    // but with injected failures and dropped answers one of
+                    // those may still take longer than its 1 s: it then
+                    // times out (delivery_pending), which is its contract.
+                    // Once the tasks stop, the flushes below must return.
                     t.client.with(.{ .timeout = .fromSeconds(1) }).flush(&c) catch |err| switch (err) {
                         error.Canceled => return error.Canceled,
                         else => {
@@ -1250,6 +1250,55 @@ test "kafka producer: a record waiting for its leader is delivered after a produ
     const outcome = try client.producer.waitFor(ref, wait.deadline());
     try testing.expect(outcome == .ok);
     try testing.expectEqual(@as(i64, 1), broker.count("lead", 1));
+}
+
+/// A flush on the executor: `err` is its failure.
+fn flushTask(client: *kafka.Client, out: *TaskResult) std.Io.Cancelable!void {
+    defer out.finish();
+    client.producer.flush(wait.deadline()) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => out.err = err,
+    };
+}
+
+test "kafka producer: a flush returns once the records before it are delivered, while a later record still waits (#156)" {
+    const rt = try zio.Runtime.init(gpa, .{ .executors = .exact(2) });
+    defer rt.deinit();
+    const io = rt.io();
+    const broker = try FakeBroker.start(gpa, io, .{ .partitions = 1 });
+    defer broker.deinit();
+    // Only a flush sends.
+    const client = try kafka.Client.init(gpa, io, opts(broker, .{ .linger = .fromSeconds(3600) }));
+    defer client.deinit();
+    const level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = level;
+    try client.producer.append("early", null, "early", &.{}, 0, 0);
+
+    // The flush stops once it has begun, before it wakes the senders.
+    var began: TestHold = .{ .point = .flush_began };
+    began.arm();
+    defer hold_mod.test_hold.store(null, .release);
+    var result: TaskResult = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    defer began.let(io);
+    try dusty.placement.concurrent(&group, io, .{ .executor = 1 }, flushTask, .{ client, &result });
+    try wait.waitFlag(io, "the flush began", &began.held);
+    // A record appended after it began, and kept unsent: its topic has no
+    // leader, so even the flush's sealing cannot send it.
+    broker.hide_leaders.store(true, .release);
+    const late = try client.producer.appendWaiting("late", null, "late", &.{}, 0, 0);
+    began.let(io);
+    // The flush returns once the record before it is stored; the later one
+    // does not hold it.
+    try result.wait(io);
+    try testing.expectEqual(@as(i64, 1), broker.count("early", 0));
+    try testing.expect(try client.producer.waitFor(late, .zero) == .timeout);
+    // Once a leader is known, a new flush sends the later record too.
+    broker.hide_leaders.store(false, .release);
+    try client.producer.flush(wait.deadline());
+    try testing.expectEqual(@as(i64, 1), broker.count("late", 0));
 }
 
 test "kafka producer: a produce to a topic dropped from the metadata cache between its refresh and its lookup is delivered" {

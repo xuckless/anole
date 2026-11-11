@@ -38,6 +38,9 @@ pub const TestPoint = enum {
     /// `partitionCountWait` and `partitionCount`, between a refresh and the
     /// look at the cache.
     metadata_refreshed,
+    /// `Producer.flush`, its generations taken, before it wakes the senders
+    /// (no lock held).
+    flush_began,
 };
 
 /// One stop: armed through `test_hold`, taken once by the first caller at
