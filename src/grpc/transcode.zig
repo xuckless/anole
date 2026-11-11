@@ -788,14 +788,36 @@ pub fn errorBody(arena: std.mem.Allocator, code: u32, message: []const u8) ![]co
 /// Serves one binding once its template matched.
 pub const ServeFn = fn (ctx: ?*anyopaque, req: *dusty.Request, res: *dusty.Response, captures: []const Capture, options: *const server.RegisterOptions) anyerror!void;
 
-/// The bindings that share one router route, tried in turn: those with a
-/// verb first, then the others in the order they were registered.
+/// The bindings that share one router route, tried in turn: exact ones
+/// with a verb first, then exact ones without, then the `.rest_prefix`
+/// ones, each group in the order it was registered (`insert`).
 const Binding = struct {
     template: *const Template,
     serve: *const ServeFn,
     options: *const server.RegisterOptions,
     where: []const u8,
+    /// Set when the binding is made and never changed.
+    role: Role,
     next: ?*Binding = null,
+
+    const Role = enum {
+        /// The route is the template's own path.
+        exact,
+        /// The route is the prefix before a template's trailing `**`, so
+        /// that `**` also matches zero segments. It stays behind every
+        /// exact binding of its route, registered before or after it (as
+        /// in Envoy's matcher), and a clash with a route that is not a
+        /// transcoding one is not reported: nobody asked for this route.
+        rest_prefix,
+    };
+
+    /// Its group in the route's list: lower goes first.
+    fn rank(b: *const Binding) u2 {
+        return switch (b.role) {
+            .exact => if (b.template.verb.len > 0) 0 else 1,
+            .rest_prefix => 2,
+        };
+    }
 };
 
 const Bindings = struct { first: ?*Binding = null };
@@ -873,9 +895,9 @@ pub fn addBinding(
     const router = server.routerOf(Ctx, target);
     const alloc = router.arena.allocator();
     const binding = alloc.create(Binding) catch @panic("OOM");
-    binding.* = .{ .template = template, .serve = serve, .options = options, .where = where };
+    binding.* = .{ .template = template, .serve = serve, .options = options, .where = where, .role = .exact };
     const segments = template.segments();
-    attach(Ctx, target, method, template, segments.len, binding, no_wait, .by_verb);
+    attach(Ctx, target, method, template, segments.len, binding, no_wait);
 
     // `**` matches zero or more segments, but the router's wildcard needs
     // one: the prefix gets a route of its own, with its own copy of the
@@ -883,19 +905,10 @@ pub fn addBinding(
     // Envoy's matcher). `/{a=**}:v` has no prefix a request could reach.
     if (segments.len > 0 and segments[segments.len - 1] == .rest and !(segments.len == 1 and template.verb.len > 0)) {
         const prefix_binding = alloc.create(Binding) catch @panic("OOM");
-        prefix_binding.* = .{ .template = template, .serve = serve, .options = options, .where = where };
-        attach(Ctx, target, method, template, segments.len - 1, prefix_binding, no_wait, .last);
+        prefix_binding.* = .{ .template = template, .serve = serve, .options = options, .where = where, .role = .rest_prefix };
+        attach(Ctx, target, method, template, segments.len - 1, prefix_binding, no_wait);
     }
 }
-
-/// Where `attach` puts a binding in its route's list.
-const Position = enum {
-    /// After the other bindings with a verb, before those without.
-    by_verb,
-    /// After all of them, and a clash with another route is not reported:
-    /// the route is one nobody asked for.
-    last,
-};
 
 /// Joins `binding` to the route for the first `count` segments of `template`,
 /// or makes it.
@@ -907,7 +920,6 @@ fn attach(
     count: usize,
     binding: *Binding,
     no_wait: bool,
-    position: Position,
 ) void {
     const router = server.routerOf(Ctx, target);
     const alloc = router.arena.allocator();
@@ -958,17 +970,17 @@ fn attach(
     if (node) |n| if (n.route) |opaque_route| {
         const route: *const dusty.Router(Ctx).Route = @ptrCast(@alignCast(opaque_route));
         if (route.action != &Dispatch(Ctx).handle) {
-            if (position == .last) return;
+            if (binding.role == .rest_prefix) return;
             router.conflicted("google.api.http on {s}: {s} {s} is already a route", .{ where, method.name(), route.info.path }) catch @panic("OOM");
             return;
         }
         if (!sameChain(Ctx, route.middlewares, server.chainOf(Ctx, target))) {
-            if (position == .last) return;
+            if (binding.role == .rest_prefix) return;
             router.conflicted("google.api.http on {s}: {s} {s} is already a route of a service registered with other middleware", .{ where, method.name(), route.info.path }) catch @panic("OOM");
             return;
         }
         const bindings: *Bindings = @ptrCast(@alignCast(@constCast(route.info.data.?)));
-        insert(bindings, binding, method, position);
+        insert(bindings, binding, method);
         return;
     };
     const bindings = alloc.create(Bindings) catch @panic("OOM");
@@ -983,7 +995,9 @@ fn sameChain(comptime Ctx: type, a: []const dusty.Middleware(Ctx), b: []const du
     return true;
 }
 
-fn insert(bindings: *Bindings, binding: *Binding, method: dusty.Method, position: Position) void {
+/// Puts `binding` after every binding of its rank or a lower one, so the
+/// list stays in `Binding.rank` order and registration order within a rank.
+fn insert(bindings: *Bindings, binding: *Binding, method: dusty.Method) void {
     var it = bindings.first;
     while (it) |b| : (it = b.next) {
         if (b.template.sameShape(binding.template)) {
@@ -991,11 +1005,8 @@ fn insert(bindings: *Bindings, binding: *Binding, method: dusty.Method, position
         }
     }
     var link = &bindings.first;
-    if (position == .by_verb and binding.template.verb.len > 0) {
-        while (link.*) |b| : (link = &b.next) if (b.template.verb.len == 0) break;
-    } else {
-        while (link.*) |b| link = &b.next;
-    }
+    const rank = binding.rank();
+    while (link.*) |b| : (link = &b.next) if (b.rank() > rank) break;
     binding.next = link.*;
     link.* = binding;
 }
@@ -1148,18 +1159,49 @@ test "addBinding: a ** template also gets the route of its prefix, and a route t
     try std.testing.expect((try router.findHandler(&req)).?.action == &Dispatch(void).handle);
 }
 
-test "insert: a binding for the prefix of a ** template, added last, stays behind the exact ones before it" {
+test "insert: a binding for the prefix of a ** template stays behind the exact ones before it" {
     const fallback = try Template.parse("/files/{p=**}");
     const exact = try Template.parse("/files");
     const exact_verb = try Template.parse("/files:v");
-    var a: Binding = .{ .template = &fallback, .serve = noServe, .options = &.{}, .where = "a" };
-    var b: Binding = .{ .template = &exact, .serve = noServe, .options = &.{}, .where = "b" };
-    var c: Binding = .{ .template = &exact_verb, .serve = noServe, .options = &.{}, .where = "c" };
+    var a: Binding = .{ .template = &fallback, .serve = noServe, .options = &.{}, .where = "a", .role = .rest_prefix };
+    var b: Binding = .{ .template = &exact, .serve = noServe, .options = &.{}, .where = "b", .role = .exact };
+    var c: Binding = .{ .template = &exact_verb, .serve = noServe, .options = &.{}, .where = "c", .role = .exact };
     var list: Bindings = .{};
-    insert(&list, &b, .get, .by_verb);
-    insert(&list, &a, .get, .last);
-    insert(&list, &c, .get, .by_verb);
+    insert(&list, &b, .get);
+    insert(&list, &a, .get);
+    insert(&list, &c, .get);
     try std.testing.expectEqual(&c, list.first.?);
     try std.testing.expectEqual(&b, c.next.?);
     try std.testing.expectEqual(&a, b.next.?);
+    try std.testing.expectEqual(null, a.next);
+}
+
+test "insert: an exact binding registered after the prefix of a ** template still comes first" {
+    const fallback = try Template.parse("/files/{p=**}");
+    const other_fallback = try Template.parse("/files/{q=**}:v");
+    const exact = try Template.parse("/files");
+    const exact_verb = try Template.parse("/files:v");
+    var a: Binding = .{ .template = &fallback, .serve = noServe, .options = &.{}, .where = "a", .role = .rest_prefix };
+    var d: Binding = .{ .template = &other_fallback, .serve = noServe, .options = &.{}, .where = "d", .role = .rest_prefix };
+    var b: Binding = .{ .template = &exact, .serve = noServe, .options = &.{}, .where = "b", .role = .exact };
+    var c: Binding = .{ .template = &exact_verb, .serve = noServe, .options = &.{}, .where = "c", .role = .exact };
+    var list: Bindings = .{};
+    insert(&list, &a, .get);
+    insert(&list, &d, .get);
+    insert(&list, &b, .get);
+    insert(&list, &c, .get);
+    // Exact with a verb, exact without, then the prefixes in registration order.
+    try std.testing.expectEqual(&c, list.first.?);
+    try std.testing.expectEqual(&b, c.next.?);
+    try std.testing.expectEqual(&a, b.next.?);
+    try std.testing.expectEqual(&d, a.next.?);
+    try std.testing.expectEqual(null, d.next);
+
+    // Dispatch takes the first match: /files goes to the exact binding.
+    var captures: [max_variables]Capture = undefined;
+    var it = list.first;
+    const winner = while (it) |x| : (it = x.next) {
+        if (x.template.match("/files", &captures) != null) break x;
+    } else null;
+    try std.testing.expectEqual(&b, winner.?);
 }
