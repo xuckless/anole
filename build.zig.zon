@@ -57,6 +57,14 @@
         // yield point past a spent tick yields only after 16 more operations
         // without a park, charged to the task that overran (yieldIfOverrun;
         // #184; a77def3, 806b5e4).
+        // Plus upstream main 299a618 (2026-11-11; merge d799693): upstream's
+        // free-stack cache per executor (#909) replaces the stack half of
+        // the spawn cache (task allocations stay), and its accept without
+        // parking (#872) and per-run spawn backpressure (#873) are the
+        // behaviour without `fast_accept` (Anole's direct accept and
+        // run-queue-sized budgets stay behind it); Windows streaming files
+        // on IOCP are upstream's (#857). zio sets TCP_NODELAY on the
+        // listeners it opens only (#870); Anole sets it on its own.
         .zio = .{
             .path = "../zio-t3",
         },
