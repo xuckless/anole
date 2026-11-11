@@ -65,6 +65,10 @@ test "h2 streams: table insert, find, remove at load with collisions and wrap" {
     // The chain runs 15, 0, 1, ...: something wrapped.
     try expect(t.psl[0] != 0 and t.psl[15] != 0);
 
+    // The run fills slots 15, 0, ..., 6.
+    for (0..8) |j| try expect(t.psl[(15 + j) & 15] != 0);
+    try expectEqual(0, t.psl[7]);
+
     // Remove from the middle of the chain: the rest shift back and stay
     // findable, with no tombstones.
     try expect(t.remove(keys[2]));
@@ -77,10 +81,9 @@ test "h2 streams: table insert, find, remove at load with collisions and wrap" {
         if (i == 2 or i == 6) continue;
         try expectEqual(k, t.get(k).?.id);
     }
-    // The last entry of the run moved back, leaving its old slot empty.
-    var empty: usize = 0;
-    for (0..t.slots()) |i| empty += @intFromBool(t.psl[i] == 0);
-    try expectEqual(10, empty);
+    // Each removal shifted the tail back one slot: the run is 15, 0, ..., 4
+    // now, and its last two slots are empty.
+    for (0..8) |j| try expectEqual(j < 6, t.psl[(15 + j) & 15] != 0);
 
     // A never-seen key that shares the home is a miss, found or removed.
     while (t.index(id) != 15) id += 2;
@@ -196,7 +199,7 @@ test "h2 streams: slab reuses streams without leaks" {
 
     var ptrs: [100]*Stream = undefined;
     for (&ptrs, 0..) |*p, i| p.* = try slab.create(@intCast(2 * i + 1), 65535, 65535);
-    try expectEqual(4, counting.allocations); // ceil(100 / 32)
+    try expectEqual(4, counting.allocations); // ceil(100 / 31)
     // Pointers stay put as chunks are added.
     for (ptrs, 0..) |p, i| {
         try expectEqual(2 * i + 1, p.id);
@@ -289,7 +292,7 @@ test "h2 streams: stream states" {
 test "h2 streams: closed ring evicts the oldest and answers how" {
     var r: ClosedRing = .{};
     const fates = [_]Fate{ .rst_received, .end_stream, .rst_sent };
-    for (0..300) |i| r.record(@intCast(2 * i + 1), fates[i % 3]);
+    for (0..300) |i| r.record(1, @intCast(2 * i + 1), fates[i % 3]);
     for (0..300) |i| {
         const want: Fate = if (i < 44) .unknown else fates[i % 3];
         try expectEqual(want, r.lookup(@intCast(2 * i + 1)));
@@ -298,7 +301,7 @@ test "h2 streams: closed ring evicts the oldest and answers how" {
 
     // The highest ID survives the u30 packing; its neighbour doesn't alias.
     const top: u31 = std.math.maxInt(u31);
-    r.record(top, .rst_sent);
+    r.record(1, top, .rst_sent);
     try expectEqual(.rst_sent, r.lookup(top));
     try expectEqual(.unknown, r.lookup(top - 2));
 }
@@ -353,20 +356,84 @@ test "h2 streams: peerFate follows the patch" {
     }
     // HEADERS on 3, below the highest opened and never opened itself:
     // connection error PROTOCOL_ERROR in conn.zig (anole_strict_frames).
-    try expectEqual(.never_opened, streams.peerFate(&r, &b, last, 3));
+    try expectEqual(.never_opened, streams.peerFate(&r, &b, 1, last, 3));
     // 1 closed and forgotten (not in the ring): ignored.
-    try expectEqual(.unknown, streams.peerFate(&r, &b, last, 1));
+    try expectEqual(.unknown, streams.peerFate(&r, &b, 1, last, 1));
     // Above last_recv: never never_opened.
-    try expectEqual(.unknown, streams.peerFate(&r, &b, last, 7));
+    try expectEqual(.unknown, streams.peerFate(&r, &b, 1, last, 7));
 
     // The ring wins over the bitmap.
-    r.record(1, .rst_received); // DATA after the peer's RST: STREAM_CLOSED
-    try expectEqual(.rst_received, streams.peerFate(&r, &b, last, 1));
-    r.record(3, .rst_sent);
-    try expectEqual(.rst_sent, streams.peerFate(&r, &b, last, 3));
+    r.record(1, 1, .rst_received); // DATA after the peer's RST: STREAM_CLOSED
+    try expectEqual(.rst_received, streams.peerFate(&r, &b, 1, last, 1));
+    r.record(1, 3, .rst_sent);
+    try expectEqual(.rst_sent, streams.peerFate(&r, &b, 1, last, 3));
     // Closed by END_STREAM: a connection error STREAM_CLOSED in conn.zig.
-    r.record(5, .end_stream);
-    try expectEqual(.end_stream, streams.peerFate(&r, &b, last, 5));
+    r.record(1, 5, .end_stream);
+    try expectEqual(.end_stream, streams.peerFate(&r, &b, 1, last, 5));
+}
+
+test "h2 streams: our own IDs don't alias their peer neighbours" {
+    // The ring and the bitmap key on id >> 1, so on a server even 2k would
+    // match odd 2k+1; the patch's is_my_stream_id guard answers unknown.
+    var r: ClosedRing = .{};
+    var b: OpenedBitmap = .{};
+    b.markOpened(0, 1);
+    b.markOpened(1, 5); // 3 skipped
+    r.record(1, 5, .end_stream);
+    r.record(1, 6, .rst_sent); // ours: not recorded
+    try expectEqual(.end_stream, streams.peerFate(&r, &b, 1, 5, 5));
+    try expectEqual(.never_opened, streams.peerFate(&r, &b, 1, 5, 3));
+    try expectEqual(.unknown, streams.peerFate(&r, &b, 1, 5, 4));
+    try expectEqual(.unknown, streams.peerFate(&r, &b, 1, 5, 2));
+    try expectEqual(.unknown, streams.peerFate(&r, &b, 1, 5, 6));
+    try expectEqual(.unknown, r.lookup(7));
+}
+
+test "h2 streams: a failed probe-length resize leaves the stream out" {
+    // 130 IDs with one home slot at 1024 slots share it at every smaller
+    // size too, so the 129th lands 128 past it and forces the resize.
+    var shape: StreamTable = .init(testing.allocator, 1000, 0);
+    shape.hashbits = 10;
+    var ids: [130]u31 = undefined;
+    var n: usize = 0;
+    var id: u31 = 1;
+    while (n < ids.len) : (id += 2) {
+        if (shape.index(id) != 0) continue;
+        ids[n] = id;
+        n += 1;
+    }
+
+    var slab: Slab = .init(testing.allocator);
+    defer slab.deinit();
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+    var t: StreamTable = .init(failing.allocator(), 1000, 0);
+    defer t.deinit();
+    for (ids[0..128]) |k| try t.insert(try slab.create(k, 0, 0));
+    try expectEqual(256, t.slots());
+
+    // The 129th first doubles for the load (allowed), then the probe-length
+    // resize fails.
+    failing.fail_index = failing.alloc_index + 1;
+    const s = try slab.create(ids[128], 0, 0);
+    try testing.expectError(error.OutOfMemory, t.insert(s));
+    try expectEqual(512, t.slots());
+    try expectEqual(128, t.size);
+    try expect(t.get(ids[128]) == null);
+    try checkPsl(&t);
+    // The caller destroys it; a new stream reusing the slot is not reachable
+    // under the old ID.
+    slab.destroy(s);
+    const other = try slab.create(99999, 0, 0);
+    try expectEqual(s, other);
+    try expect(t.get(ids[128]) == null);
+    slab.destroy(other);
+
+    failing.fail_index = std.math.maxInt(usize);
+    for (ids[128..]) |k| try t.insert(try slab.create(k, 0, 0));
+    try expectEqual(130, t.size);
+    try expect(t.slots() >= 1024);
+    try checkPsl(&t);
+    for (ids) |k| try expectEqual(k, t.get(k).?.id);
 }
 
 test "h2 streams: sizes" {
@@ -375,5 +442,7 @@ test "h2 streams: sizes" {
     try expectEqual(256, @sizeOf(OpenedBitmap));
     // The closed-stream memory per connection, against the patch's 2313 B.
     try expectEqual(1284, @sizeOf(ClosedRing) + @sizeOf(OpenedBitmap));
-    try expect(@sizeOf(Slab.Chunk) <= 32 * 64 + 8);
+    try expectEqual(64, @sizeOf(Stream));
+    // A chunk plus malloc's 16 B header stays in the 2 KiB size class.
+    try expect(@sizeOf(Slab.Chunk) + 16 <= 2048);
 }

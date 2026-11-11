@@ -117,15 +117,19 @@ pub fn updateInitialWindow(w: *i32, new: u31, old: u31) error{FlowControl}!void 
     w.* = @intCast(v);
 }
 
-/// Streams from 32-stream chunks with a LIFO freelist (PLAN §3.4). Chunks are
-/// kept until `deinit`, so a connection keeps its high-water mark (8 chunks,
-/// 16 KiB, at 250 streams); returning idle chunks and the block cache are M3.
+/// Streams from 31-stream chunks with a LIFO freelist (PLAN §3.4). 31 x 64 B
+/// plus the link is 1992 B, which with malloc's 16 B header still fits the
+/// allocators' 2 KiB size class (32 streams would spill into 4 KiB and waste
+/// half of it). Chunks are kept until `deinit`, so a connection keeps its
+/// high-water mark (9 chunks, 18 KiB, at 250 streams); returning idle chunks
+/// is M3 (the block cache's smallest class is 64 KiB, so chunks stay on the
+/// general allocator).
 pub const Slab = struct {
     gpa: Allocator,
     chunks: ?*Chunk = null,
     free: std.SinglyLinkedList = .{},
 
-    pub const chunk_len = 32;
+    pub const chunk_len = 31;
     pub const Chunk = struct {
         next: ?*Chunk,
         streams: [chunk_len]Stream,
@@ -178,9 +182,11 @@ pub const Slab = struct {
 /// The one change is the sizing: nothing is allocated until the first
 /// insert, then 16 slots, doubling when the load would pass 1/2 (nghttp2:
 /// 7/8), and never shrinking. At 250 concurrent streams that is 512 slots
-/// (6.5 KiB); once a connection has reached its high-water mark it never
+/// of 13 B (6656 B, an 8 KiB size class); once a connection has reached its high-water mark it never
 /// rehashes again. nghttp2's resize at a probe length of 128 stays as the
-/// safety net that keeps the u8 lengths from overflowing.
+/// safety net that keeps the u8 lengths from overflowing; long probes need
+/// many IDs on one home slot, which a peer can only aim for if it knows the
+/// seed, so conn.zig (M3) takes a fresh CSPRNG seed per connection.
 pub const StreamTable = struct {
     gpa: Allocator,
     seed: u64,
@@ -204,8 +210,9 @@ pub const StreamTable = struct {
     const fibo = 0x9E3779B97F4A7C15; // NGHTTP2_MAP_FIBO
     const slot_bytes = @sizeOf(*Stream) + @sizeOf(u32) + @sizeOf(u8);
 
-    /// `seed` should differ per connection in production (hash flooding);
-    /// tests pass fixed ones.
+    /// `seed` must come from a CSPRNG per connection in production (hash
+    /// flooding; nghttp2 falls back to 0 without a rand callback); tests pass
+    /// fixed ones.
     pub fn init(gpa: Allocator, max_live: u32, seed: u64) StreamTable {
         return .{ .gpa = gpa, .max_live = max_live, .seed = seed };
     }
@@ -292,6 +299,9 @@ pub const StreamTable = struct {
     }
 
     /// nghttp2_map_insert. `s.id` is the key, and must not be in the table.
+    /// On an error the table is as it was: `s` is not in it, so the caller
+    /// may destroy it (nghttp2 leaves the entry in when the probe-length
+    /// resize fails, and its caller then frees the stream).
     pub fn insert(t: *StreamTable, s: *Stream) Allocator.Error!void {
         std.debug.assert(t.size < @as(u64, t.max_live) * 2);
         if (t.hashbits == 0 or t.size + 1 > t.slots() / 2) {
@@ -301,7 +311,10 @@ pub const StreamTable = struct {
         // Resize if psl reaches a really large value, which is almost
         // improbable, but just in case (nghttp2).
         if (t.psl[idx] - 1 < max_psl_resize_thresh) return;
-        try t.resize(t.hashbits + 1);
+        t.resize(t.hashbits + 1) catch |err| {
+            std.debug.assert(t.remove(s.id));
+            return err;
+        };
     }
 
     /// nghttp2_map_find.
@@ -384,7 +397,9 @@ pub const Fate = enum(u3) {
 /// (NGHTTP2_CLOSED_STREAM_LOG_LEN). Packed to 4 bytes an entry: only peer IDs
 /// are recorded (one parity), so `id >> 1` fits in 30 bits, and the three
 /// stored fates fit in 2 with 0 meaning an empty slot. 1028 B against the
-/// patch's 2056.
+/// patch's 2056. Because of the packing an ID of our parity would alias its
+/// peer neighbour, so `record` and `peerFate` keep the patch's
+/// is_my_stream_id guard and ignore those IDs.
 pub const ClosedRing = struct {
     slots: [len]Record = @splat(.{}),
     next: u8 = 0,
@@ -392,16 +407,18 @@ pub const ClosedRing = struct {
     pub const len = 256;
     const Record = packed struct(u32) { fate: u2 = 0, half_id: u30 = 0 };
 
-    /// session_log_peer_stream_closed; conn.zig skips our own IDs as the
-    /// patch's is_my_stream_id check did.
-    pub fn record(r: *ClosedRing, id: u31, how: Fate) void {
+    /// session_log_peer_stream_closed. `peer_parity` is 1 for a server (the
+    /// client opens odd IDs); our own IDs are not recorded.
+    pub fn record(r: *ClosedRing, peer_parity: u1, id: u31, how: Fate) void {
         std.debug.assert(how == .rst_received or how == .end_stream or how == .rst_sent);
+        if (id & 1 != peer_parity) return;
         r.slots[r.next] = .{ .fate = @intCast(@backingInt(how)), .half_id = @intCast(id >> 1) };
         r.next +%= 1;
     }
 
     /// The ring half of session_peer_stream_fate: a scan of all 256 entries
-    /// (only for a frame on a stream without a `Stream`).
+    /// (only for a frame on a stream without a `Stream`). Peer IDs only; use
+    /// `peerFate`, which checks the parity.
     pub fn lookup(r: *const ClosedRing, id: u31) Fate {
         const half: u30 = @intCast(id >> 1);
         for (r.slots) |rec| {
@@ -428,25 +445,33 @@ pub const OpenedBitmap = struct {
     /// `last_recv`; the IDs skipped in between were closed without being
     /// opened. Call it before `last_recv` moves to `id`.
     pub fn markOpened(b: *OpenedBitmap, last_recv: u31, id: u31) void {
+        std.debug.assert(last_recv == 0 or (last_recv ^ id) & 1 == 0);
         const from: u32 = if (last_recv == 0) id & 1 else @as(u32, last_recv) + 2;
         if (id < from or (id - from) / 2 >= window) {
             b.bits = .empty;
         } else {
-            var skipped = from;
-            while (skipped < id) : (skipped += 2) b.bits.unset(bit(@intCast(skipped)));
+            // The patch clears the skipped IDs one by one; a range clears a
+            // word at a time, wrapping past the end of the window.
+            const start = bit(@intCast(from));
+            const end = start + (id - from) / 2;
+            b.bits.setRangeValue(.{ .start = start, .end = @min(end, window) }, false);
+            if (end > window) b.bits.setRangeValue(.{ .start = 0, .end = end - window }, false);
         }
         b.bits.set(bit(id));
     }
 
-    /// The bitmap half of session_peer_stream_fate.
+    /// The bitmap half of session_peer_stream_fate. Peer IDs only.
     pub fn neverOpened(b: *const OpenedBitmap, last_recv: u31, id: u31) bool {
+        std.debug.assert(last_recv == 0 or (last_recv ^ id) & 1 == 0);
         return id < last_recv and (last_recv - id) / 2 < window and !b.bits.isSet(bit(id));
     }
 };
 
-/// session_peer_stream_fate for a peer-parity ID with no `Stream` that is
-/// not idle: a ring entry first, then the bitmap.
-pub fn peerFate(r: *const ClosedRing, b: *const OpenedBitmap, last_recv: u31, id: u31) Fate {
+/// session_peer_stream_fate for an ID with no `Stream` that is not idle: a
+/// ring entry first, then the bitmap. One of our own IDs is `.unknown`, as
+/// the patch's is_my_stream_id guard returns (`peer_parity` as in `record`).
+pub fn peerFate(r: *const ClosedRing, b: *const OpenedBitmap, peer_parity: u1, last_recv: u31, id: u31) Fate {
+    if (id & 1 != peer_parity) return .unknown;
     const f = r.lookup(id);
     if (f != .unknown) return f;
     return if (b.neverOpened(last_recv, id)) .never_opened else .unknown;
