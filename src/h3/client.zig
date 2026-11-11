@@ -1928,9 +1928,15 @@ pub const Stream = struct {
     /// (`Early.unsent`). Such a request can be sent again on another
     /// connection whatever its method.
     pub fn unprocessed(self: *const Stream) bool {
-        if (self.early == .unsent) return true;
-        if (self.reset_code) |code| if (code == h.NGHTTP3_H3_REQUEST_REJECTED) return true;
-        return self.id >= self.conn.goaway_id and self.status == 0;
+        const conn = self.conn;
+        conn.lock();
+        const result = blk: {
+            if (self.early == .unsent) break :blk true;
+            if (self.reset_code) |code| if (code == h.NGHTTP3_H3_REQUEST_REJECTED) break :blk true;
+            break :blk self.id >= conn.goaway_id and self.status == 0;
+        };
+        conn.unlock();
+        return result;
     }
 
     /// Waits for the response head (`status`, `headers`).

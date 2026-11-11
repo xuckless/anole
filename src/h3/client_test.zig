@@ -3048,6 +3048,9 @@ test "h3 client: unprocessed is true after H3_REQUEST_REJECTED and for a request
     s.status = 0;
     s.reset_code = null;
     s.early = .not_early;
+    // unprocessed() reads under the connection's lock.
+    conn.io = std.testing.io;
+    conn.mutex = .init;
     conn.goaway_id = std.math.maxInt(i64);
     // Nothing happened to it.
     try std.testing.expect(!s.unprocessed());
