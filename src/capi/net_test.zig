@@ -792,9 +792,13 @@ test "capi net: a drain closes the connections the consumer leaves open at its s
     try expectNoMoreCloses(rig);
 }
 
-test "capi net: a connection the consumer closed just before a drain closes once (#166)" {
+/// As `tcp_no_deadline`, and no connection parks: a parked one is closed
+/// by the core's own sweep at drain start, with the fallback reason DRAIN.
+const tcp_no_deadline_unparked = "{\"executors\": 2, \"timeouts\": {\"shutdown_ms\": null, \"idle_park_ms\": null}, \"listeners\": [{\"name\": \"chat\", \"address\": \"127.0.0.1\", \"port\": 0, \"tcp\": {\"handler\": 7}}]}";
+
+test "capi net: a connection the consumer closed just before a drain closes once, with the consumer's reason (#166)" {
     if (comptime !features.net) return error.SkipZigTest;
-    const rig = try Rig.create(tcp_no_deadline);
+    const rig = try Rig.create(tcp_no_deadline_unparked);
     defer rig.destroy();
     const s = try rig.client();
     defer s.close();
@@ -807,8 +811,8 @@ test "capi net: a connection the consumer closed just before a drain closes once
     defer r.join();
     _ = try engine.net.write(rig.e, open.handle, "bye", 0);
     try engine.net.closeConn(rig.e, open.handle, abi.NET_CLOSE_GRACEFUL);
-    // The drain's own close of it may run before or after the consumer's
-    // has ended this side: both end it the same way.
+    // The consumer's close is taken before `drain` is called: the drain
+    // leaves the connection to it.
     try rig.e.drain();
     const draining = try rig.take(.draining);
     free(draining);
@@ -819,12 +823,12 @@ test "capi net: a connection the consumer closed just before a drain closes once
     const close = try rig.take(.net_close);
     defer free(close);
     try std.testing.expectEqual(open.handle, close.handle);
-    // The first reason set stands: the drain's, if its close ran before
-    // the client's FIN came, else the peer's (or local, had the connection
-    // read again after the consumer's close).
+    // Never DRAIN. The ABI's graceful close sets no reason itself; the
+    // reading side gives it: LOCAL when it reads again after the close
+    // (the "x" came after it), else PEER at the client's FIN.
     const ce: *const abi.NetCloseEvent = @ptrCast(close.bytes.ptr);
-    const ok = ce.reason == abi.NET_CLOSED_DRAIN or ce.reason == abi.NET_CLOSED_PEER or ce.reason == abi.NET_CLOSED_LOCAL;
-    try std.testing.expect(ok);
+    try std.testing.expect(ce.reason != abi.NET_CLOSED_DRAIN);
+    try std.testing.expect(ce.reason == abi.NET_CLOSED_PEER or ce.reason == abi.NET_CLOSED_LOCAL);
     try std.testing.expectError(error.Gone, engine.net.write(rig.e, open.handle, "late", 0));
     engine.net.closeConn(rig.e, open.handle, abi.NET_CLOSE_GRACEFUL) catch |err| try std.testing.expectEqual(error.Over, err);
     try expectNoMoreCloses(rig);
