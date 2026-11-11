@@ -24,6 +24,7 @@ test {
     _ = @import("limits_test.zig");
     _ = @import("streams_test.zig");
     _ = @import("conn_test.zig");
+    _ = @import("conn_limits_test.zig");
     // Against nghttp2's own inflater; compiled out with -Dhttp2=false.
     if (@import("build_options").use_http2) _ = @import("hpack_diff_test.zig");
 }

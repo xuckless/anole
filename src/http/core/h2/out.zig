@@ -150,6 +150,11 @@ pub const Out = struct {
         return o.borrowed != 0;
     }
 
+    /// Bytes queued and not yet written (conn.zig's `out_high` check).
+    pub fn queuedBytes(o: *const Out) u64 {
+        return o.queued_total - o.sent_total;
+    }
+
     /// `sent_total` reaches this once everything queued so far is written.
     pub fn mark(o: *const Out) u64 {
         return o.queued_total;

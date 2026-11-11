@@ -38,7 +38,9 @@
 //!     **also when it fails** (before returning, or later with `s` null):
 //!     Conn gives back only the bytes it doesn't deliver;
 //!   * `onStreamClose(h, s, code) void`: the stream is closed; `s` is
-//!     invalid once it returns. Never runs inside another callback: closes
+//!     invalid once it returns. It may come after onStreamOpen and some
+//!     onField calls with no onHeadersEnd (a head past a limit, answered
+//!     431 by Conn). Never runs inside another callback: closes
 //!     are deferred to the end of the outermost Conn call. **On a normal
 //!     end it runs inside the `pending` call that framed the last DATA,
 //!     before the writer has written it**: the response's parts may still
@@ -60,6 +62,7 @@ const fields = @import("fields.zig");
 const limits = @import("limits.zig");
 const streams = @import("streams.zig");
 const Out = @import("out.zig").Out;
+const config = @import("../config.zig");
 
 pub const Stream = streams.Stream;
 pub const ErrorCode = frame.ErrorCode;
@@ -97,33 +100,43 @@ pub const default_window = 65535;
 /// The largest header block we send (nghttp2's NGHTTP2_MAX_HEADERSLEN).
 pub const max_headers_len = 65536;
 
+/// config.ServerConfig's defaults, so that every limit's default number
+/// lives in one place (config.zig, or limits.Limits for those with no key).
+const h2_defaults: config.ServerConfig.Http2 = .{};
+
 /// The connection's limits. The defaults are config.ServerConfig.Http2's
-/// (M3 maps the config into this), except `max_frame_size`, which has no
-/// config key and is advertised only above 16384.
+/// and Request's (M3 maps the config into this), except `max_frame_size`,
+/// which has no config key and is advertised only above 16384, and
+/// `limits`, whose keys come with M3 (PLAN §5.4).
 pub const Options = struct {
-    /// SETTINGS_MAX_CONCURRENT_STREAMS (`max_concurrent_streams`).
-    max_concurrent_streams: u32 = 250,
+    /// SETTINGS_MAX_CONCURRENT_STREAMS (`max_concurrent_streams`); a
+    /// request past it is refused (REFUSED_STREAM, the refused budget).
+    max_concurrent_streams: u32 = h2_defaults.max_concurrent_streams,
     /// SETTINGS_INITIAL_WINDOW_SIZE (`stream_window`).
-    initial_window: u31 = 64 * 1024,
+    initial_window: u31 = h2_defaults.stream_window,
     /// The connection's receive window (`connection_window`), at least
     /// 65535: raised with a WINDOW_UPDATE right after our SETTINGS.
-    connection_window: u31 = 16 * 1024 * 1024,
+    connection_window: u31 = h2_defaults.connection_window,
     /// SETTINGS_MAX_FRAME_SIZE.
     max_frame_size: u24 = frame.min_max_frame_size,
     /// SETTINGS_MAX_HEADER_LIST_SIZE (`max_header_list_size`); also the
     /// most a header block may take on the wire before it is decoded
     /// (PLAN §5.4).
-    max_header_list_size: u32 = 64 * 1024,
+    max_header_list_size: u32 = h2_defaults.max_header_list_size,
+    /// Regular fields in a request head (`request.max_header_count`):
+    /// more is answered 431. Cookie crumbs count once, pseudo-headers not.
+    max_header_count: usize = (config.ServerConfig.Request{}).max_header_count,
     /// CONTINUATION frames after one HEADERS (`max_continuations`).
-    max_continuations: u32 = 8,
+    max_continuations: u32 = h2_defaults.max_continuations,
     /// SETTINGS_ENABLE_CONNECT_PROTOCOL (`enable_connect_protocol`).
     enable_connect_protocol: bool = false,
-    /// The flood budgets the connlimits item charges (PLAN §5.4):
-    /// `stream_reset_burst/rate`, `refused_stream_burst/rate`, and the rest.
-    stream_reset_burst: u64 = 1000,
-    stream_reset_rate: u64 = 33,
-    refused_stream_burst: u64 = 100,
-    refused_stream_rate: u64 = 10,
+    /// The rapid-reset budget (`stream_reset_burst/rate`, D15 point 1).
+    stream_reset_burst: u64 = h2_defaults.stream_reset_burst,
+    stream_reset_rate: u64 = h2_defaults.stream_reset_rate,
+    /// Streams refused before a handler saw them
+    /// (`refused_stream_burst/rate`).
+    refused_stream_burst: u64 = h2_defaults.refused_stream_burst,
+    refused_stream_rate: u64 = h2_defaults.refused_stream_rate,
     limits: limits.Limits = .{},
     /// The stream table's hash seed: a CSPRNG value per connection in
     /// production (streams.StreamTable).
@@ -261,6 +274,20 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         spare_len: u8 = 0,
         /// The caller's time in whole seconds, for the flood budgets.
         now_s: u64 = 0,
+        /// PLAN §5.4's flood budgets: rapid and provoked resets (D15 point
+        /// 1), streams refused before a handler saw them, empty and unknown
+        /// frames (D15 point 2), and nghttp2's glitch limiter (PRIORITY,
+        /// header blocks decoded only for the table). One of the last two
+        /// goes after the D15 point 5 calibration.
+        reset_budget: limits.TokenBucket,
+        refused_budget: limits.TokenBucket,
+        empty_budget: limits.TokenBucket,
+        glitch_budget: limits.TokenBucket,
+        /// Control answers queued (PING ACK, SETTINGS ACK, RST_STREAM) since
+        /// the writer last caught up, and `out`'s byte position just past the
+        /// last one: `advance` past it empties the count.
+        control_queued: u32 = 0,
+        control_mark: u64 = 0,
 
         const max_spare = 32;
 
@@ -299,6 +326,10 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 .slab = .init(gpa),
                 .table = .init(gpa, opts.max_concurrent_streams, opts.seed),
                 .recv_window = cw,
+                .reset_budget = .init(opts.stream_reset_burst, opts.stream_reset_rate),
+                .refused_budget = .init(opts.refused_stream_burst, opts.refused_stream_rate),
+                .empty_budget = .init(opts.limits.empty_frame_rate, opts.limits.empty_frame_rate),
+                .glitch_budget = .init(opts.limits.glitch_burst, opts.limits.glitch_rate),
             };
             errdefer c.out.deinit();
             var entries: [6]frame.Setting = undefined;
@@ -628,20 +659,26 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             return if (s.state == .closed) .ignore else .request;
         }
 
-        /// A new stream's admission, in nghttp2's order; null opens it.
-        /// connlimits replaces the connection error over the acknowledged
-        /// maximum with PLAN §5.4's REFUSED_STREAM and refused budget.
+        /// A new stream's admission; null opens it. Past
+        /// max_concurrent_streams, or while the peer isn't reading what we
+        /// queued, the stream is refused (PLAN §5.4), and its block is still
+        /// decoded for the table. nghttp2 makes a stream past the
+        /// acknowledged maximum a connection PROTOCOL_ERROR
+        /// (nghttp2_session_on_request_headers_received :3998) and refuses
+        /// only past one not yet acknowledged (:4014); INTENTIONAL.md,
+        /// limits 7 and 8.
         fn admitStream(c: *Self, id: u31, hd: frame.Headers) RecvError!?Kind {
-            if (c.table.size >= c.local.max_concurrent_streams)
-                return c.terminate(.protocol_error, "request HEADERS: max concurrent streams exceeded");
             // After our GOAWAY: ignored.
             if (c.goaway_sent != null) return .ignore;
             if (hd.priority) |p| if (p.dependency == id)
                 return c.terminate(.protocol_error, "request HEADERS: depend on itself");
-            // Over the maximum we sent, not yet acknowledged.
-            if (c.table.size >= c.opts.max_concurrent_streams) {
-                try c.chargeRefused();
-                try c.provokedRst(id, .refused_stream);
+            // The slow reader (CVE-2019-9517): above out_high, new streams
+            // are refused while everything else is still processed (credit
+            // and ACKs can only shrink the queue; DATA on open streams goes
+            // on). The other half, closing a connection whose flushes stall,
+            // is M3's sweeper (`timeouts.write`, PLAN §3.3).
+            if (c.table.size >= c.opts.max_concurrent_streams or c.out.queuedBytes() > c.opts.limits.out_high) {
+                try c.refuse(id);
                 return .ignore;
             }
             return null;
@@ -649,8 +686,10 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
 
         fn onContinuation(c: *Self, ct: frame.Continuation, scratch: []u8) RecvError!void {
             const b = if (c.block) |*b| b else return c.terminate(.protocol_error, "CONTINUATION: unexpected");
+            // nghttp2_session_mem_recv2 :6831 (CVE-2024-28182), with a
+            // GOAWAY where nghttp2 returns a fatal error (INTENTIONAL.md,
+            // limits 4).
             b.continuations += 1;
-            try c.chargeContinuation();
             if (b.continuations > c.opts.max_continuations)
                 return c.terminate(.enhance_your_calm, "too many CONTINUATION frames");
             if (ct.fragment.len == 0 and !ct.end_headers) try c.chargeEmptyFrame();
@@ -673,8 +712,15 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             const trailers = kind == .trailers;
             c.req = .{};
             const fo: fields.Opts = .{ .connect_protocol = c.opts.enable_connect_protocol, .stream_id = id };
+            // Regular fields, the cookie's crumbs once (RFC 9113 §8.2.3: a
+            // browser sends one crumb a cookie, joined again for the handler).
+            var count: usize = 0;
+            var cookie = false;
             while (true) {
-                const f = (blk.next() catch |err| return c.blockError(s, &blk, err)) orelse break;
+                const f = (blk.next() catch |err| switch (err) {
+                    error.HeaderListTooLarge => return c.refuseHead(s, &blk, trailers, end_stream),
+                    else => return c.blockError(s, err),
+                }) orelse break;
                 const v = if (trailers) c.req.trailer(f.name, f.value, fo) else c.req.field(f.name, f.value, fo);
                 switch (v) {
                     .ok => {},
@@ -683,6 +729,12 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                         try c.provokedReset(s, .protocol_error);
                         return c.skipBlock(s, &blk);
                     },
+                }
+                if (f.name[0] != ':') {
+                    const crumb = std.mem.eql(u8, f.name, "cookie");
+                    if (!crumb or !cookie) count += 1;
+                    cookie = cookie or crumb;
+                    if (count > c.opts.max_header_count) return c.refuseHead(s, &blk, trailers, end_stream);
                 }
                 c.handler.onField(s, f.name, f.value) catch {
                     try c.handlerReset(s);
@@ -707,19 +759,13 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         }
 
         fn skipBlock(c: *Self, s: ?*Stream, blk: *hpack.Block) RecvError!void {
-            blk.skipRest() catch |err| return c.blockError(s, blk, err);
+            blk.skipRest() catch |err| return c.blockError(s, err);
         }
 
-        fn blockError(c: *Self, s: ?*Stream, blk: *hpack.Block, err: hpack.Error) RecvError!void {
+        fn blockError(c: *Self, s: ?*Stream, err: hpack.Error) RecvError!void {
             switch (err) {
-                // The list is over SETTINGS_MAX_HEADER_LIST_SIZE: the
-                // stream is refused before the handler sees it, as today's
-                // engine does (an INTERNAL_ERROR reset); the rest of the
-                // block is decoded for the table.
-                error.HeaderListTooLarge => {
-                    try c.skipBlock(s, blk);
-                    if (s) |x| if (x.state != .closed) try c.provokedReset(x, .internal_error);
-                },
+                // Only `next` gives it (decodeBlock's refuseHead).
+                error.HeaderListTooLarge => unreachable,
                 // inflate_header_block: RST_STREAM, then GOAWAY.
                 error.CompressionError => {
                     if (s) |x| if (x.state != .closed) try c.resetStream(x, .compression_error);
@@ -729,10 +775,39 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             }
         }
 
+        /// A head past max_header_list_size (the HPACK bomb) or
+        /// max_header_count (PLAN §5.4): the rest of the block is decoded for
+        /// the table only (RFC 9113 §4.3), and the request answered 431 with
+        /// END_STREAM, then RST_STREAM(NO_ERROR) if the peer's half is still
+        /// open (RFC 9113 §8.1), as Go's handleHeaderListTooLong answers 431.
+        /// No handler saw a whole head: the refused budget. Trailers past a
+        /// limit reset the stream instead (the handler has the head).
+        /// Today's engine resets with INTERNAL_ERROR (INTENTIONAL.md,
+        /// limits 6).
+        fn refuseHead(c: *Self, s: *Stream, blk: *hpack.Block, trailers: bool, end_stream: bool) RecvError!void {
+            try c.skipBlock(s, blk);
+            if (s.state == .closed) return;
+            if (trailers or s.flags.head_sent) return c.provokedReset(s, .internal_error);
+            try c.chargeRefused();
+            c.writeHeaders(s.id, 431, &.{}, true) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.HeadersTooLarge, error.StreamClosed => unreachable,
+            };
+            s.flags.head_sent = true;
+            s.flags.answered = true;
+            c.endLocal(s);
+            if (end_stream) return c.endRemote(s);
+            try c.chargeControl(frame.header_len + 4);
+            try c.resetStream(s, .no_error);
+        }
+
         // The other frames --------------------------------------------------
 
         /// The fork patch's PRIORITY handling (RFC 9113 §6.3): validated,
         /// otherwise ignored. Stream 0 is frame.zig's check.
+        /// No tree (D15 point 3, SETTINGS_NO_RFC7540_PRIORITIES): nothing
+        /// changes but nghttp2's glitch budget (:5843; CVE-2019-9513 has
+        /// nothing to loop over).
         fn onPriority(c: *Self, id: u31, p: frame.Priority) RecvError!void {
             try c.chargeGlitch();
             if (p.dependency != id) return;
@@ -745,8 +820,14 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// nghttp2_session_on_rst_stream_received.
         fn onRstStream(c: *Self, id: u31, code: ErrorCode) RecvError!void {
             if (c.idle(id)) return c.terminate(.protocol_error, "RST_STREAM: stream in idle");
-            if (c.table.get(id)) |s| c.closeStream(s, code, .rst_received);
-            try c.chargeRstReceived();
+            const s = c.table.get(id) orelse return;
+            const answered = s.flags.answered;
+            c.closeStream(s, code, .rst_received);
+            // session_update_stream_reset_ratelim (:4186) charges every
+            // RST_STREAM; D15 point 1 only those on streams we hadn't
+            // answered (a browser's navigation or a gRPC cancel after the
+            // response is ordinary traffic). INTENTIONAL.md, limits 1.
+            if (!answered) try c.chargeReset();
         }
 
         /// nghttp2_session_on_settings_received.
@@ -757,6 +838,9 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 return c.applyLocalSettings();
             }
             c.first_settings = false;
+            // nghttp2's early flood check (:5897): with the budget spent,
+            // the entries aren't applied.
+            try c.chargeControl(frame.header_len);
             var grew = false;
             var it = st.iterator();
             while (it.next()) |e| switch (e.id) {
@@ -780,7 +864,6 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
                 _ => {},
             };
             if (c.remote.no_rfc7540_priorities == null) c.remote.no_rfc7540_priorities = false;
-            try c.chargeControlOut();
             const b = try c.out.writable(frame.header_len);
             c.out.commit(frame.writeSettings(b, true, &.{}));
             if (grew) c.handler.onWindow(null);
@@ -818,7 +901,7 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
 
         fn onPing(c: *Self, p: frame.Ping) RecvError!void {
             if (p.ack) return c.handler.onPingAck(p.data);
-            try c.chargeControlOut();
+            try c.chargeControl(frame.header_len + 8);
             const b = try c.out.writable(frame.header_len + 8);
             c.out.commit(frame.writePing(b, true, p.data));
         }
@@ -913,10 +996,14 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             c.closeStream(s, code, .rst_sent);
         }
 
-        /// A reset the peer's frames caused (counted toward the reset
-        /// budget, PLAN §5.4's "provoked resets").
+        /// A reset the peer's frames caused: STREAM_CLOSED answers, overflows,
+        /// a broken content-length or head (MadeYouReset, CVE-2025-8671,
+        /// whose advice is to count what the server sends). Charged to the
+        /// reset budget whether answered or not (D15 point 1); nghttp2
+        /// charges these to its glitch budget (:3747, :3884, :5130).
         fn provokedReset(c: *Self, s: *Stream, code: ErrorCode) RecvError!void {
-            try c.chargeRstSent(s.flags.answered, true);
+            try c.chargeReset();
+            try c.chargeControl(frame.header_len + 4);
             try c.resetStream(s, code);
         }
 
@@ -924,57 +1011,85 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
         /// it, else just the frame.
         fn provokedRst(c: *Self, id: u31, code: ErrorCode) RecvError!void {
             if (c.table.get(id)) |s| return c.provokedReset(s, code);
-            try c.chargeRstSent(false, true);
+            try c.chargeReset();
+            try c.chargeControl(frame.header_len + 4);
             try c.queueRst(id, code);
         }
 
-        /// A handler callback failed.
+        /// A stream refused before any handler saw it (REFUSED_STREAM): the
+        /// refused budget, today's engine's `refusedHead` rule.
+        fn refuse(c: *Self, id: u31) RecvError!void {
+            try c.chargeRefused();
+            try c.chargeControl(frame.header_len + 4);
+            try c.queueRst(id, .refused_stream);
+        }
+
+        /// A handler callback failed: not the peer's doing, so only the
+        /// control budget.
         fn handlerReset(c: *Self, s: *Stream) RecvError!void {
             if (s.state == .closed) return;
-            try c.chargeRstSent(s.flags.answered, false);
+            try c.chargeControl(frame.header_len + 4);
             try c.resetStream(s, .internal_error);
         }
 
         // ---------------------------------------------------------------
-        // The connlimits item's charge points (PLAN §5.4, D15). Empty
-        // here; each may end the connection with `terminate`.
+        // PLAN §5.4's flood budgets (D15). Each ends the connection with
+        // GOAWAY ENHANCE_YOUR_CALM once spent; nothing is allocated.
 
-        /// A RST_STREAM received (rapid reset, CVE-2023-44487).
-        inline fn chargeRstReceived(c: *Self) RecvError!void {
-            _ = c;
+        /// nghttp2's ratelim pattern (session_update_glitch_ratelim :3497):
+        /// refill for the time passed, take one.
+        fn charge(c: *Self, b: *limits.TokenBucket, reason: []const u8) RecvError!void {
+            b.update(c.now_s);
+            if (!b.drain(1)) return c.terminate(.enhance_your_calm, reason);
         }
-        /// A RST_STREAM we send: `answered` streams are not charged (D15
-        /// point 1); `provoked` ones are (MadeYouReset).
-        inline fn chargeRstSent(c: *Self, answered: bool, provoked: bool) RecvError!void {
-            _ = .{ c, answered, provoked };
+
+        /// Rapid reset (CVE-2023-44487) and provoked resets. nghttp2 answers
+        /// a graceful GOAWAY INTERNAL_ERROR (:4196); PLAN §5.4 and
+        /// INTENTIONAL.md, limits 2: ENHANCE_YOUR_CALM, and close.
+        fn chargeReset(c: *Self) RecvError!void {
+            return c.charge(&c.reset_budget, "too many stream resets");
         }
-        /// An empty DATA/HEADERS/CONTINUATION without END_STREAM, or an
-        /// unknown frame (CVE-2019-9518, D15 point 2).
-        inline fn chargeEmptyFrame(c: *Self) RecvError!void {
-            _ = c;
+
+        fn chargeRefused(c: *Self) RecvError!void {
+            return c.charge(&c.refused_budget, "too many refused streams");
         }
-        /// A queued PING or SETTINGS ACK (the control-frame budget).
-        inline fn chargeControlOut(c: *Self) RecvError!void {
-            _ = c;
+
+        /// An empty DATA/HEADERS/CONTINUATION without END_STREAM (or
+        /// END_HEADERS), or any unknown or extension frame
+        /// (CVE-2019-9518, D15 point 2). nghttp2 charges both to its glitch
+        /// budget (:5721, :6930, :6025); INTENTIONAL.md, limits 3.
+        fn chargeEmptyFrame(c: *Self) RecvError!void {
+            return c.charge(&c.empty_budget, "too many empty frames");
         }
-        /// A stream refused over the concurrency limit.
-        inline fn chargeRefused(c: *Self) RecvError!void {
-            _ = c;
+
+        /// nghttp2's glitch limiter for what PLAN's empty-frame row doesn't
+        /// name: PRIORITY (:5843) and header blocks decoded only for the
+        /// table (:5811, :6332).
+        fn chargeGlitch(c: *Self) RecvError!void {
+            return c.charge(&c.glitch_budget, "too many glitches");
         }
-        /// One more CONTINUATION; the count limit itself is checked at the
-        /// call site.
-        inline fn chargeContinuation(c: *Self) RecvError!void {
-            _ = c;
+
+        /// A control answer of `len` bytes is about to be queued
+        /// (CVE-2019-9512 PING, 9514 reset, 9515 SETTINGS): nghttp2's
+        /// obq_flood_counter_ against max_outbound_ack (nghttp2_session_add_ping
+        /// :7343, nghttp2_submit_settings :7493), which counts only the ACKs
+        /// and is released as each is packed (:2244); here the RST_STREAMs
+        /// recv queues count too, and the count is released once `advance`
+        /// passes the last one (Go's queuedControlFrames, released in
+        /// wroteFrame). INTENTIONAL.md, limits 4.
+        fn chargeControl(c: *Self, len: usize) RecvError!void {
+            if (c.control_queued >= c.opts.limits.control_frame_budget)
+                return c.terminate(.enhance_your_calm, "too many control frames queued");
+            c.control_queued += 1;
+            c.control_mark = c.out.mark() + len;
         }
+
         /// A header block of `len` bytes so far, before decoding: past
         /// max_header_list_size the connection can't keep its HPACK state
-        /// without holding the block, so it ends (PLAN §5.4).
+        /// without holding the block, so it ends (PLAN §5.4; nghttp2 inflates
+        /// as it reads and has no such cap: INTENTIONAL.md, limits 5).
         inline fn chargeHeaderBlock(c: *Self, len: usize) RecvError!void {
             if (len > c.opts.max_header_list_size) return c.terminate(.enhance_your_calm, "header block too large");
-        }
-        /// nghttp2's glitch limiter: PRIORITY, ignored header blocks.
-        inline fn chargeGlitch(c: *Self) RecvError!void {
-            _ = c;
         }
 
         // ---------------------------------------------------------------
@@ -1121,7 +1236,6 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             c.enter();
             defer c.leave();
             if (s.state == .closed) return;
-            c.chargeRstSent(s.flags.answered, false) catch {};
             try c.resetStream(s, code);
         }
 
@@ -1163,9 +1277,12 @@ pub fn Conn(comptime role: Role, comptime H: type) type {
             return c.out.iovecs(vecs);
         }
 
-        /// `n` bytes of what `pending` returned were written.
+        /// `n` bytes of what `pending` returned were written. Past the last
+        /// control answer queued, the control budget is whole again
+        /// (`chargeControl`).
         pub fn advance(c: *Self, n: usize) void {
             c.out.advance(n);
+            if (c.out.sent_total >= c.control_mark) c.control_queued = 0;
         }
 
         /// Borrowed DATA parts or trailers are still referenced, framed or

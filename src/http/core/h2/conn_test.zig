@@ -30,7 +30,7 @@ const F = frame.flags;
 // ---------------------------------------------------------------------------
 // The harness
 
-const Event = union(enum) {
+pub const Event = union(enum) {
     open: u31,
     field: struct { id: u31, name: []const u8, value: []const u8, trailer: bool },
     end: struct { id: u31, end_stream: bool, trailers: bool },
@@ -42,7 +42,7 @@ const Event = union(enum) {
 };
 
 /// The handler: logs every callback, and answers or fails as told.
-const Rec = struct {
+pub const Rec = struct {
     gpa: Allocator,
     arena: Allocator,
     c: *C = undefined,
@@ -60,11 +60,11 @@ const Rec = struct {
     /// `reset(s, CANCEL)` from onField.
     reset_in_field: bool = false,
 
-    fn log(r: *Rec, e: Event) void {
+    pub fn log(r: *Rec, e: Event) void {
         if (r.record) r.events.append(r.gpa, e) catch @panic("OOM");
     }
 
-    fn dupe(r: *Rec, b: []const u8) []const u8 {
+    pub fn dupe(r: *Rec, b: []const u8) []const u8 {
         return if (r.record) r.arena.dupe(u8, b) catch @panic("OOM") else "";
     }
 
@@ -108,12 +108,12 @@ const Rec = struct {
         r.log(.{ .ping_ack = data });
     }
 
-    fn respond(r: *Rec, s: *Stream) void {
+    pub fn respond(r: *Rec, s: *Stream) void {
         r.c.submitHead(s, 200, &.{}, false) catch @panic("submitHead");
         r.c.submitData(s, r.body, true) catch @panic("submitData");
     }
 
-    fn count(r: *const Rec, comptime tag: std.meta.Tag(Event)) usize {
+    pub fn count(r: *const Rec, comptime tag: std.meta.Tag(Event)) usize {
         var n: usize = 0;
         for (r.events.items) |e| {
             if (e == tag) n += 1;
@@ -121,7 +121,7 @@ const Rec = struct {
         return n;
     }
 
-    fn closeCode(r: *const Rec, id: u31) ?ErrorCode {
+    pub fn closeCode(r: *const Rec, id: u31) ?ErrorCode {
         for (r.events.items) |e| switch (e) {
             .close => |x| if (x.id == id) return x.code,
             else => {},
@@ -130,10 +130,10 @@ const Rec = struct {
     }
 };
 
-const C = conn.Conn(.server, Rec);
+pub const C = conn.Conn(.server, Rec);
 
 /// One frame we sent, re-parsed (HEADERS with its CONTINUATIONs, decoded).
-const OutFrame = struct {
+pub const OutFrame = struct {
     type: frame.Type,
     flags: u8,
     id: u31,
@@ -148,7 +148,7 @@ const OutFrame = struct {
     frames: usize = 1,
 };
 
-const T = struct {
+pub const T = struct {
     gpa: Allocator,
     arena_state: std.heap.ArenaAllocator,
     rec: Rec,
@@ -162,12 +162,12 @@ const T = struct {
     enc: hpack.Encoder = .{},
     now: u64 = 1,
 
-    fn create(gpa: Allocator, opts: conn.Options) !*T {
+    pub fn create(gpa: Allocator, opts: conn.Options) !*T {
         return createSplit(gpa, gpa, opts);
     }
 
     /// Conn's allocations on `conn_gpa`, the harness's on `gpa`.
-    fn createSplit(gpa: Allocator, conn_gpa: Allocator, opts: conn.Options) !*T {
+    pub fn createSplit(gpa: Allocator, conn_gpa: Allocator, opts: conn.Options) !*T {
         const t = try gpa.create(T);
         errdefer gpa.destroy(t);
         t.* = .{
@@ -185,7 +185,7 @@ const T = struct {
         return t;
     }
 
-    fn destroy(t: *T) void {
+    pub fn destroy(t: *T) void {
         t.c.deinit();
         t.rec.events.deinit(t.gpa);
         t.inbuf.deinit(t.gpa);
@@ -195,13 +195,13 @@ const T = struct {
         t.gpa.destroy(t);
     }
 
-    fn arena(t: *T) Allocator {
+    pub fn arena(t: *T) Allocator {
         return t.arena_state.allocator();
     }
 
     /// Feeds client bytes (one at a time when `bytewise`), keeping what
     /// recv leaves, as the engine's reader does.
-    fn feed(t: *T, bytes: []const u8) !void {
+    pub fn feed(t: *T, bytes: []const u8) !void {
         if (t.bytewise) {
             for (bytes) |b| {
                 try t.inbuf.append(t.gpa, b);
@@ -213,7 +213,7 @@ const T = struct {
         }
     }
 
-    fn pump(t: *T) !void {
+    pub fn pump(t: *T) !void {
         const n = try t.c.recv(t.inbuf.items, t.now, t.scratch);
         std.debug.assert(n <= t.inbuf.items.len);
         const rest = t.inbuf.items.len - n;
@@ -223,7 +223,7 @@ const T = struct {
 
     /// Takes everything Conn has to send (pending/advance in rounds, as a
     /// writer would) and parses it frame by frame.
-    fn drain(t: *T) ![]OutFrame {
+    pub fn drain(t: *T) ![]OutFrame {
         var vecs: [8][]const u8 = undefined;
         while (true) {
             const v = try t.c.pending(&vecs);
@@ -289,7 +289,7 @@ const T = struct {
         return list.items;
     }
 
-    fn decode(t: *T, bytes: []const u8) ![]const Field {
+    pub fn decode(t: *T, bytes: []const u8) ![]const Field {
         var scratch: [65536]u8 = undefined;
         var blk = t.dec.block(bytes, &scratch, scratch.len);
         var l: std.ArrayList(Field) = .empty;
@@ -299,7 +299,7 @@ const T = struct {
 
     /// The client preface, an empty SETTINGS and the ACK of ours; our
     /// SETTINGS, WINDOW_UPDATE and SETTINGS ACK drained and checked.
-    fn handshake(t: *T) !void {
+    pub fn handshake(t: *T) !void {
         try t.feed(conn.client_magic);
         try t.feed(try t.settings(&.{}));
         try t.feed(try t.settingsAck());
@@ -313,40 +313,40 @@ const T = struct {
 
     // The client's frames.
 
-    fn settings(t: *T, entries: []const frame.Setting) ![]const u8 {
+    pub fn settings(t: *T, entries: []const frame.Setting) ![]const u8 {
         const b = try t.arena().alloc(u8, 9 + 6 * entries.len);
         return b[0..frame.writeSettings(b, false, entries)];
     }
 
-    fn settingsAck(t: *T) ![]const u8 {
+    pub fn settingsAck(t: *T) ![]const u8 {
         const b = try t.arena().alloc(u8, 9);
         return b[0..frame.writeSettings(b, true, &.{})];
     }
 
-    fn block(t: *T, fs: []const Field) ![]const u8 {
+    pub fn block(t: *T, fs: []const Field) ![]const u8 {
         const b = try t.arena().alloc(u8, hpack.Encoder.bound(fs));
         return b[0..try t.enc.encode(b, fs)];
     }
 
-    fn headers(t: *T, id: u31, fs: []const Field, end_stream: bool) ![]const u8 {
+    pub fn headers(t: *T, id: u31, fs: []const Field, end_stream: bool) ![]const u8 {
         return t.headersFrame(id, .{ .end_stream = end_stream, .end_headers = true, .fragment = try t.block(fs) });
     }
 
-    fn headersFrame(t: *T, id: u31, hd: frame.Headers) ![]const u8 {
+    pub fn headersFrame(t: *T, id: u31, hd: frame.Headers) ![]const u8 {
         const b = try t.arena().alloc(u8, 9 + 6 + 256 + hd.fragment.len);
         return b[0..frame.writeHeaders(b, id, hd)];
     }
 
-    fn continuation(t: *T, id: u31, end_headers: bool, fragment: []const u8) ![]const u8 {
+    pub fn continuation(t: *T, id: u31, end_headers: bool, fragment: []const u8) ![]const u8 {
         const b = try t.arena().alloc(u8, 9 + fragment.len);
         return b[0..frame.writeContinuation(b, id, end_headers, fragment)];
     }
 
-    fn data(t: *T, id: u31, bytes: []const u8, end_stream: bool) ![]const u8 {
+    pub fn data(t: *T, id: u31, bytes: []const u8, end_stream: bool) ![]const u8 {
         return t.dataPadded(id, bytes, end_stream, null);
     }
 
-    fn dataPadded(t: *T, id: u31, bytes: []const u8, end_stream: bool, pad: ?u8) ![]const u8 {
+    pub fn dataPadded(t: *T, id: u31, bytes: []const u8, end_stream: bool, pad: ?u8) ![]const u8 {
         const p: usize = if (pad) |x| x else 0;
         const b = try t.arena().alloc(u8, 10 + bytes.len + p);
         var n = frame.writeData(b, id, end_stream, bytes.len, pad);
@@ -356,75 +356,75 @@ const T = struct {
         return b[0 .. n + p];
     }
 
-    fn rst(t: *T, id: u31, code: ErrorCode) ![]const u8 {
+    pub fn rst(t: *T, id: u31, code: ErrorCode) ![]const u8 {
         const b = try t.arena().alloc(u8, 13);
         return b[0..frame.writeRstStream(b, id, code)];
     }
 
-    fn windowUpdate(t: *T, id: u31, inc: u31) ![]const u8 {
+    pub fn windowUpdate(t: *T, id: u31, inc: u31) ![]const u8 {
         const b = try t.arena().alloc(u8, 13);
         return b[0..frame.writeWindowUpdate(b, id, inc)];
     }
 
-    fn ping(t: *T, ack: bool, d: [8]u8) ![]const u8 {
+    pub fn ping(t: *T, ack: bool, d: [8]u8) ![]const u8 {
         const b = try t.arena().alloc(u8, 17);
         return b[0..frame.writePing(b, ack, d)];
     }
 
-    fn priority(t: *T, id: u31, dep: u31) ![]const u8 {
+    pub fn priority(t: *T, id: u31, dep: u31) ![]const u8 {
         const b = try t.arena().alloc(u8, 14);
         return b[0..frame.writePriority(b, id, .{ .exclusive = false, .dependency = dep, .weight = 15 })];
     }
 
-    fn goaway(t: *T, last: u31, code: ErrorCode) ![]const u8 {
+    pub fn goaway(t: *T, last: u31, code: ErrorCode) ![]const u8 {
         const b = try t.arena().alloc(u8, 17);
         return b[0..frame.writeGoaway(b, last, code, "")];
     }
 
-    fn raw(t: *T, ty: u8, fl: u8, id: u31, payload: []const u8) ![]const u8 {
+    pub fn raw(t: *T, ty: u8, fl: u8, id: u31, payload: []const u8) ![]const u8 {
         const b = try t.arena().alloc(u8, 9 + payload.len);
         _ = frame.writeHeader(b, .{ .length = @intCast(payload.len), .type = @fromBackingInt(ty), .flags = fl, .stream_id = id });
         @memcpy(b[9..], payload);
         return b;
     }
 
-    fn pushPromise(t: *T, id: u31, promised: u31) ![]const u8 {
+    pub fn pushPromise(t: *T, id: u31, promised: u31) ![]const u8 {
         const b = try t.arena().alloc(u8, 64);
         return b[0..frame.writePushPromise(b, id, .{ .end_headers = true, .promised_id = promised, .fragment = try t.block(&get) })];
     }
 
-    fn stream(t: *T, id: u31) *Stream {
+    pub fn stream(t: *T, id: u31) *Stream {
         return t.c.table.get(id).?;
     }
 };
 
-const get = [_]Field{
+pub const get = [_]Field{
     .{ .name = ":method", .value = "GET" },
     .{ .name = ":scheme", .value = "https" },
     .{ .name = ":path", .value = "/" },
     .{ .name = ":authority", .value = "example.org" },
 };
 
-const post = [_]Field{
+pub const post = [_]Field{
     .{ .name = ":method", .value = "POST" },
     .{ .name = ":scheme", .value = "https" },
     .{ .name = ":path", .value = "/up" },
     .{ .name = ":authority", .value = "example.org" },
 };
 
-fn postLen(comptime n: []const u8) [5]Field {
+pub fn postLen(comptime n: []const u8) [5]Field {
     return post ++ [_]Field{.{ .name = "content-length", .value = n }};
 }
 
 /// What a frame must be; null fields aren't checked.
-const Want = struct {
+pub const Want = struct {
     type: frame.Type,
     id: ?u31 = null,
     code: ?ErrorCode = null,
     flags: ?u8 = null,
 };
 
-fn expectFrames(got: []const OutFrame, want: []const Want) !void {
+pub fn expectFrames(got: []const OutFrame, want: []const Want) !void {
     errdefer {
         std.debug.print("got {d} frames:\n", .{got.len});
         for (got) |g| std.debug.print("  {t} id={d} flags={x} code={any}\n", .{ g.type, g.id, g.flags, g.code });
@@ -438,16 +438,16 @@ fn expectFrames(got: []const OutFrame, want: []const Want) !void {
     }
 }
 
-fn goawayWith(code: ErrorCode) Want {
+pub fn goawayWith(code: ErrorCode) Want {
     return .{ .type = .goaway, .code = code };
 }
 
-fn rstWith(id: u31, code: ErrorCode) Want {
+pub fn rstWith(id: u31, code: ErrorCode) Want {
     return .{ .type = .rst_stream, .id = id, .code = code };
 }
 
 /// A connection after the handshake.
-fn ready(opts: conn.Options) !*T {
+pub fn ready(opts: conn.Options) !*T {
     const t = try T.create(testing.allocator, opts);
     errdefer t.destroy();
     try t.handshake();
@@ -460,7 +460,7 @@ fn both(comptime body: fn (bool) anyerror!void) !void {
     try body(true);
 }
 
-fn readyAs(bytewise: bool) !*T {
+pub fn readyAs(bytewise: bool) !*T {
     const t = try ready(.{});
     t.bytewise = bytewise;
     return t;
@@ -895,8 +895,11 @@ test "h2 conn: a header list over the limit is refused" {
     // 4247 bytes decoded from a block under 4096.
     const big = @as([2000]u8, @splat('~'));
     try t.feed(try t.headers(1, &get ++ [_]Field{ .{ .name = "x-a", .value = &big }, .{ .name = "x-b", .value = &big } }, true));
-    try expectFrames(try t.drain(), &.{rstWith(1, .internal_error)});
+    const out = try t.drain();
+    try expectFrames(out, &.{.{ .type = .headers, .id = 1, .flags = F.end_stream | F.end_headers }});
+    try expectEqualStrings("431", out[0].fields[0].value);
     try expectEqual(0, t.rec.count(.end));
+    try expectEqual(ErrorCode.no_error, t.rec.closeCode(1).?);
     try t.feed(try t.headers(3, &get, true));
     try expectEqual(1, t.rec.count(.end));
 }
@@ -1567,10 +1570,11 @@ test "h2 conn: on_request_headers_received" {
         try t.feed(try t.headers(3, &get, false));
         try expectFrames(try t.drain(), &.{rstWith(3, .refused_stream)});
         try expectEqual(1, t.c.last_proc);
-        // Acknowledged: a connection error.
+        // Acknowledged: nghttp2 makes it a connection error; Anole still
+        // refuses it (PLAN §5.4, INTENTIONAL.md, limits 7).
         try t.feed(try t.settingsAck());
-        try expectError(error.ConnectionError, t.feed(try t.headers(5, &get, false)));
-        try expectFrames(try t.drain(), &.{goawayWith(.protocol_error)});
+        try t.feed(try t.headers(5, &get, false));
+        try expectFrames(try t.drain(), &.{rstWith(5, .refused_stream)});
     }
 }
 
@@ -1897,8 +1901,11 @@ test "h2 conn: max_concurrent_streams" {
     defer t.destroy();
     try t.feed(try t.headers(1, &get, false));
     try t.feed(try t.headers(3, &get, false));
-    try expectError(error.ConnectionError, t.feed(try t.headers(5, &get, false)));
-    try expectFrames(try t.drain(), &.{goawayWith(.protocol_error)});
+    // Refused, where nghttp2 gives a connection PROTOCOL_ERROR
+    // (INTENTIONAL.md, limits 7).
+    try t.feed(try t.headers(5, &get, false));
+    try expectFrames(try t.drain(), &.{rstWith(5, .refused_stream)});
+    try expectEqual(2, t.rec.count(.open));
 }
 
 test "h2 conn: stop_data_with_rst_stream" {
