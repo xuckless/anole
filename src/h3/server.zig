@@ -1833,7 +1833,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     session.onCapsuleBytes(buf[0..n]);
                     if (!s.reset) conn.consume(id, n);
                 }
-                if (s.body_done) session.onChannelEnd(.peer) else if (s.reset) session.onChannelEnd(.connection);
+                if (s.recv == .done) session.onChannelEnd(.peer) else if (s.reset) session.onChannelEnd(.connection);
             }
 
             /// Ends the CONNECT stream's response (its FIN) without
@@ -2297,10 +2297,11 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// a peer still sending when STOP_SENDING arrives can fail the
             /// whole call though its response came complete (.NET's HTTP/3
             /// client did, in the gRPC interop's early-status cases). Past
-            /// `linger_max`, STOP_SENDING (H3_NO_ERROR). Locked.
+            /// `linger_max`, STOP_SENDING (H3_NO_ERROR). Only while the body
+            /// is open (callers check `done` and `reset`). Locked.
             fn lingerRead(conn: *Conn, s: *Stream) void {
-                if (s.lingering) return;
-                s.lingering = true;
+                if (s.recv != .open) return;
+                s.recv = .lingering;
                 // What the handler left unread: dropped, its credit given
                 // back so the peer can send the rest and end the stream.
                 const left = s.body.len;
@@ -2312,8 +2313,8 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// `n` more bytes of an unwanted body were dropped. Locked.
             fn lingered(conn: *Conn, s: *Stream, n: u64) void {
                 s.lingered += n;
-                if (s.lingered <= linger_max or s.read_stopped) return;
-                s.read_stopped = true;
+                if (s.lingered <= linger_max or s.recv == .stopped) return;
+                s.recv = .stopped;
                 _ = c.ngtcp2_conn_shutdown_stream_read(conn.q, 0, s.id, h.NGHTTP3_H3_NO_ERROR);
             }
 
@@ -2526,13 +2527,10 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// A WebTransport session on this CONNECT stream with its
             /// capsules parsed as they arrive (`Session.Options.inline_capsules`).
             wt_session: ?*webtransport.Session = null,
-            body_done: bool = false,
-            /// The answer is done before the body: what is left is read and
-            /// dropped (`lingerRead`), `lingered` bytes so far.
-            lingering: bool = false,
+            /// The request body's receive side (`Recv`). Locked.
+            recv: Recv = .open,
+            /// Bytes of an unwanted body dropped so far (`lingerRead`).
             lingered: u64 = 0,
-            /// STOP_SENDING went out: the peer is to send no more.
-            read_stopped: bool = false,
             /// The peer reset the stream, or the connection is gone.
             reset: bool = false,
             /// The task running the handler, published for `cancelHandler`;
@@ -2616,6 +2614,35 @@ pub fn Endpoint(comptime Ctx: type) type {
             /// grew it past `arena_keep` into a node too big for malloc's
             /// slabs, an mmap and munmap per request.
             sink_buf: []u8 = &.{},
+
+            /// The request body's receive side:
+            ///
+            ///   open -> done                    the body's end (FIN) came
+            ///   open -> lingering               the answer is done first: the
+            ///                                   rest is read and dropped
+            ///                                   (`lingerRead`)
+            ///   lingering -> stopped            past `linger_max`: STOP_SENDING
+            ///                                   went out (`lingered`)
+            ///   lingering | stopped -> done     the FIN came anyway (it may be
+            ///                                   in the same read as the bytes
+            ///                                   past `linger_max`)
+            ///
+            /// `done` is final: nothing after it asks whether the body
+            /// lingered, and no data follows a FIN. Lingering starts only
+            /// from `open` (its callers check `done` and `reset`). Whether
+            /// the peer reset the stream is `reset`, which covers the
+            /// response too. The values make `dropping` one compare.
+            const Recv = enum(u8) {
+                open = 0,
+                done = 1,
+                lingering = 2,
+                stopped = 3,
+
+                /// What arrives is read and dropped (lingering, or past it).
+                fn dropping(r: Recv) bool {
+                    return @backingInt(r) >= @backingInt(Recv.lingering);
+                }
+            };
 
             /// The most a stream's arena keeps when it goes back to the pool:
             /// a typical request's head and response, so the reset at close
@@ -2725,7 +2752,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     if (!burst_owns) s.task = null;
                     // A handler done before the request body is: the rest
                     // is not wanted (RFC 9114 §4.1).
-                    if (!s.body_done and !s.reset) conn.lingerRead(s);
+                    if (s.recv != .done and !s.reset) conn.lingerRead(s);
                     s.release(.handler);
                     conn.unlock();
                     conn.kick();
@@ -3003,7 +3030,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 if (request.headers.get("Expect")) |expect| {
                     if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
                         conn.lock();
-                        request._expects_continue = !s.body_done;
+                        request._expects_continue = s.recv != .done;
                         conn.unlock();
                     } else {
                         response.status = .expectation_failed;
@@ -3203,7 +3230,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return;
             }
             s.detached = null;
-            if (!s.body_done and !s.reset) conn.lingerRead(s);
+            if (s.recv != .done and !s.reset) conn.lingerRead(s);
             if (!s.in_handler) s.release(.handler);
             conn.unlock();
             conn.kick();
@@ -3368,7 +3395,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                     s.reset = true;
                     s.wakeAll();
                     _ = c.ngtcp2_conn_shutdown_stream(conn.q, 0, s.id, h.NGHTTP3_H3_REQUEST_CANCELLED);
-                } else if (!s.body_done and !s.reset and s.refs.quic) {
+                } else if (s.recv != .done and !s.reset and s.refs.quic) {
                     conn.lingerRead(s);
                 }
                 s.parked = null;
@@ -3464,7 +3491,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                         w.advance(n);
                         return n;
                     }
-                    const done = s.body_done;
+                    const done = s.recv == .done;
                     const reset = s.reset;
                     conn.unlock();
                     if (done) return error.EndOfStream;
@@ -3973,7 +4000,7 @@ pub fn Endpoint(comptime Ctx: type) type {
             if (c.ngtcp2_is_bidi_stream(stream_id) != 0) {
                 if (conn.streamOf(stream_id)) |s| {
                     // Unless it ended cleanly, the handler sees it gone.
-                    if (!(s.ended and s.allSent() and s.body_done)) {
+                    if (!(s.ended and s.allSent() and s.recv == .done)) {
                         s.reset = true;
                         s.cancelHandler();
                     }
@@ -4131,7 +4158,7 @@ pub fn Endpoint(comptime Ctx: type) type {
                 return 0;
             }
             // Nobody wants the rest of this body: dropped, its credit back.
-            if (s.lingering) {
+            if (s.recv.dropping()) {
                 conn.consume(stream_id, len);
                 conn.lingered(s, len);
                 // The window update (or the STOP_SENDING) goes out.
@@ -4204,13 +4231,13 @@ pub fn Endpoint(comptime Ctx: type) type {
             const conn = connOf(user_data);
             const s = streamOfUser(sud) orelse return 0;
             if (s.started) return 0;
-            if (fin != 0) s.body_done = true;
+            if (fin != 0) s.recv = .done;
             // On a server, 1-RTT data is only read once the handshake has
             // completed, so a head that ends before came in 0-RTT.
             s.early = !conn.handshakeDone();
             if (!conn.noWaitRoute(s)) {
                 conn.startStream(s);
-            } else if (s.body_done) {
+            } else if (s.recv == .done) {
                 conn.queueInline(s);
             } else if (conn.awaiting.append(conn.ep.gpa, s)) |_| {
                 s.started = true;
@@ -4223,7 +4250,7 @@ pub fn Endpoint(comptime Ctx: type) type {
         fn onH3EndStream(_: ?*h.nghttp3_conn, _: i64, user_data: ?*anyopaque, sud: ?*anyopaque) callconv(.c) c_int {
             const conn = connOf(user_data);
             const s = streamOfUser(sud) orelse return 0;
-            s.body_done = true;
+            s.recv = .done;
             s.rx.notify(conn.ep.io);
             if (s.wt_session) |session| session.onChannelEnd(.peer);
             if (s.await_body) {
