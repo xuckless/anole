@@ -515,10 +515,12 @@ Each `Middleware.init` is a policy with buckets of its own, so the two
 above share a limiter but not their counts: a client that spends its login
 attempts still has its 1000 calls, and the other way round. One
 `Middleware` value used on several routes or groups is one policy, counted
-in one bucket per key.
+in one bucket per key. Make a `Middleware` with `init`, never as a struct
+literal: `init` is what gives it its scope.
 
-- `MemoryLimiter` is for one process. It holds at most `max_entries` keys
-  and forgets a key idle for `idle` once its bucket is full again. When
+- `MemoryLimiter` is for one process. It holds at most `max_entries`
+  buckets, one per policy and key: a client behind two policies takes two
+  of them. It forgets a bucket idle for `idle` once it is full again. When
   the table is full, a new key takes the place of a least recently used
   bucket that is full again, else of one that still has tokens; a throttled
   bucket is never pushed out, so a flood of new keys can't refill it. If
@@ -529,11 +531,18 @@ in one bucket per key.
   `app.redis(.{})`, keys `anole:rl:<scope>:<key>`)
   is shared by every node. One Lua script refills and takes atomically, on
   the Redis server's clock. The scope tells the policies apart; `init`
-  numbers it in the order the middlewares are made in the process, so nodes
-  running the same app agree. Nodes that make their middlewares in a
-  different order (different apps, or routes registered conditionally) set
-  it themselves: `.{ .limit = 5, .scope = 1 }` for the login limit on every
-  node. Two middlewares given the same `.scope` share their buckets.
+  numbers it from 2^31 in the order the middlewares are made in the
+  process, so nodes running the same app agree. Nodes that make their
+  middlewares in a different order (different apps, or routes registered
+  conditionally) set it themselves, below 2^31 so that it never meets an
+  automatic one (`init` panics on 2^31 and up): `.{ .limit = 5, .scope = 1 }`
+  for the login limit on every node. Two middlewares given the same
+  `.scope` share their buckets.
+
+  Upgrading from a version with keys `anole:rl:<key>`: the buckets start
+  over full (the old keys expire on their own), and while old and new
+  nodes serve side by side they count in different keys, so a client can
+  briefly get up to about twice its limit.
 - Your own limiter implements `anole.ratelimit.Limiter`: a vtable with
   `take(ptr, key, cost, policy) !Result`. Make `policy.scope` part of the
   bucket's key, or every policy on it counts in one bucket.

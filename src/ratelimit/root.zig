@@ -489,11 +489,14 @@ pub const Middleware = struct {
         /// through, `.deny` answers 503. Either way a warning is logged.
         on_error: OnError = .allow,
         /// Whose buckets (`Policy.scope`). Null (the default): `init` gives
-        /// the middleware a scope of its own, numbered in the order
-        /// middlewares are made in this process. Set it when processes that
-        /// share a `RedisLimiter` do not make their middlewares in the same
-        /// order; two middlewares given the same scope share their buckets
-        /// on purpose.
+        /// the middleware a scope of its own, numbered from 2^31 in the
+        /// order middlewares are made in this process. Set it when
+        /// processes that share a `RedisLimiter` do not make their
+        /// middlewares in the same order: below 2^31, so it never meets an
+        /// automatic one (`init` panics otherwise). Two middlewares given
+        /// the same scope share their buckets on purpose; 0 is the scope of
+        /// takes that come through no `Middleware` (a `Policy` left as it
+        /// is).
         scope: ?u32 = null,
 
         /// The bucket policy these options describe.
@@ -502,20 +505,37 @@ pub const Middleware = struct {
         }
     };
 
-    /// The next scope `init` hands out. From 1: scope 0 is for takes that
-    /// do not come through a `Middleware` (`Server.rateLimit`, the C ABI,
-    /// whose limiters are their own).
-    var next_scope: std.atomic.Value(u32) = .init(1);
+    /// The first scope `init` hands out by itself; `Options.scope` stays
+    /// below it, so a scope given and an automatic one are never equal.
+    pub const first_automatic_scope: u32 = 1 << 31;
+
+    /// The next scope `init` hands out.
+    var next_scope: std.atomic.Value(u32) = .init(first_automatic_scope);
 
     /// A middleware taking from `limiter` (which must outlive it) as
     /// `options` say: `.{ .limit = 5, .window = .fromSeconds(60) }` per client
     /// address, `.key` to count by something else. It counts in buckets of
     /// its own (`Options.scope`), apart from other middlewares on the same
-    /// limiter.
+    /// limiter. A `Middleware` is made here, never as a struct literal: the
+    /// scope is set here. Panics on a `.scope` of 2^31 or more.
     pub fn init(limiter: Limiter, options: Options) Middleware {
         var resolved = options;
-        resolved.scope = options.scope orelse next_scope.fetchAdd(1, .monotonic);
+        resolved.scope = scopeOf(options) catch std.debug.panic(
+            "ratelimit.Middleware: .scope = {d} is taken by the automatic scopes (2^31 and up); give a scope below 2^31 (2147483648), or none for one of its own",
+            .{options.scope.?},
+        );
         return .{ .limiter = limiter, .options = resolved };
+    }
+
+    /// The scope `init` gives a middleware with `options`.
+    fn scopeOf(options: Options) error{ReservedScope}!u32 {
+        if (options.scope) |given| {
+            return if (given < first_automatic_scope) given else error.ReservedScope;
+        }
+        const automatic = next_scope.fetchAdd(1, .monotonic);
+        // 2^31 middlewares in one process before the counter wraps.
+        std.debug.assert(automatic >= first_automatic_scope);
+        return automatic;
     }
 
     /// Does nothing after `next()`: requests behind it can detach.
@@ -880,6 +900,34 @@ test "ratelimit.Middleware.init: each middleware gets its own scope, .scope over
     try std.testing.expect(first.options.policy().scope != second.options.policy().scope);
     try std.testing.expectEqual(@as(u32, 7), Middleware.init(l.limiter(), .{ .scope = 7 }).options.policy().scope);
     try std.testing.expectEqual(@as(u32, 7), Middleware.init(l.limiter(), .{ .scope = 7 }).options.policy().scope);
+}
+
+test "ratelimit.Middleware.init: an automatic scope and a given one are never equal; 2^31 and up is refused" {
+    var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{});
+    defer l.deinit();
+    const first = Middleware.first_automatic_scope;
+    // Automatic scopes are 2^31 and up, whatever was made before.
+    for (0..3) |_| try std.testing.expect(Middleware.init(l.limiter(), .{}).options.policy().scope >= first);
+    // Given ones are below, 0 and 2^31 - 1 included.
+    try std.testing.expectEqual(@as(u32, 0), try Middleware.scopeOf(.{ .scope = 0 }));
+    try std.testing.expectEqual(first - 1, try Middleware.scopeOf(.{ .scope = first - 1 }));
+    // What `init` panics on.
+    try std.testing.expectError(error.ReservedScope, Middleware.scopeOf(.{ .scope = first }));
+    try std.testing.expectError(error.ReservedScope, Middleware.scopeOf(.{ .scope = std.math.maxInt(u32) }));
+}
+
+test "ratelimit.Middleware: the docs' app-wide limit and a login limit at .scope = 1 keep separate buckets" {
+    var l = MemoryLimiter.init(std.testing.allocator, std.testing.io, .{});
+    defer l.deinit();
+    // docs/auth.md: an automatic scope for the app, `.scope = 1` for the login.
+    const app_wide = Middleware.init(l.limiter(), .{ .limit = 100, .window = .fromMilliseconds(60_000) });
+    const login = Middleware.init(l.limiter(), .{ .limit = 1, .window = .fromMilliseconds(60_000), .scope = 1 });
+    try std.testing.expect(app_wide.options.policy().scope != login.options.policy().scope);
+    try std.testing.expect((try l.takeAt("k", 1, login.options.policy(), 0)).allowed);
+    try std.testing.expectEqual(@as(u32, 99), (try l.takeAt("k", 1, app_wide.options.policy(), 0)).remaining);
+    try std.testing.expect(!(try l.takeAt("k", 1, login.options.policy(), 0)).allowed);
+    try std.testing.expectEqual(@as(u32, 98), (try l.takeAt("k", 1, app_wide.options.policy(), 0)).remaining);
+    try std.testing.expectEqual(@as(usize, 2), l.count());
 }
 
 test "RedisLimiter: a bucket's key is the prefix, the scope and the key" {
