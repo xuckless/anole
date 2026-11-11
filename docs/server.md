@@ -606,7 +606,7 @@ One table; the C ABI's defaults are the same (the schema test checks them).
 | `limits.max_connections` | 0: the open-file limit |
 | `limits.ws_max_message` | 1 MiB |
 | `http2.max_concurrent_streams` | 250 |
-| HTTP/3 streams / idle / 0-RTT / Retry | 100 / 30 s / off / off |
+| HTTP/3 streams / idle / handshake / 0-RTT / Retry | 100 / 30 s / 10 s / off / off |
 | `errors` | `.auto` |
 | `proxy.trusted` / `trusted_hops` | null (the deployment's) / 0 |
 | `environment` / `deployment` / `error_detail` | null / null / null |
@@ -839,7 +839,7 @@ same for it, and `http3` holds the settings; one HTTP/3 port per server.
 
 `http3` fields: `address` and `port` (the TLS listener's when null), `alt_svc`
 (true), `max_streams_bidi` (256 concurrent requests per connection),
-`idle_timeout` (30 s, a `std.Io.Duration`), `validate_address` (false), `early_data`
+`idle_timeout` (30 s, a `std.Io.Duration`), `handshake_timeout` (10 s; a new connection that has not completed its handshake by then is closed, zero: no limit), `validate_address` (false), `early_data`
 (false), `prefer_v2` (true: a client that offers QUIC v2 beside v1 is moved
 to v2; false keeps it on v1), `sockets` (null: one per executor on Linux, see
 [Cores](#cores)), `enable_connect_protocol` (true: extended CONNECT, for RFC 9220
@@ -921,7 +921,8 @@ does not stop the copy, so Anole does what RFC 8470 asks of a server:
   `anole.early_data.isEarly(req)` says so.
 - Every other method waits until the handshake completes. A replay never
   completes it (it lacks the client's keys), so a replayed POST never
-  reaches its handler; the real client's POST runs one round trip later and
+  reaches its handler (the connection, and the POST held on it, end at
+  `handshake_timeout`); the real client's POST runs one round trip later and
   is not marked.
 - A route whose GET has effects that must not repeat takes the
   `anole.early_data.TooEarly` middleware, which answers 425 Too Early to any

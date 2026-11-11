@@ -8,12 +8,15 @@
 # libmsquic 2.2 or later. Green with these pins on 2026-10-23 (aarch64).
 FROM mcr.microsoft.com/dotnet/sdk:10.0-noble@sha256:747cbade5bfd918a175ac32f8f1d931edec2c7d0d5397a3de72eaef1ac1f66d2
 
-RUN apt-get update \
+# Error-Mode=any: an index that can't be fetched fails the update (and the
+# build, which run.sh retries) instead of going on with stale lists to a
+# misleading "libnuma1 is not installable".
+RUN apt-get -o APT::Update::Error-Mode=any update \
  && apt-get install -y --no-install-recommends ca-certificates curl git openssl \
  && curl -fsSL -o /tmp/ms.deb https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb \
  && dpkg -i /tmp/ms.deb \
  && rm /tmp/ms.deb \
- && apt-get update \
+ && apt-get -o APT::Update::Error-Mode=any update \
  && apt-get install -y --no-install-recommends libmsquic=2.6.3 \
  && rm -rf /var/lib/apt/lists/*
 

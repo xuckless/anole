@@ -197,8 +197,25 @@ its side (FIN) and drops further input, and the connection closes, with reason
 `.drain`, as soon as the peer ends its side too, or after 2 s. A client that
 closes on FIN goes at once instead of holding the stop until
 `timeouts.shutdown`. Give the handler a `drain` callback to decide otherwise.
-The C ABI's raw TCP listeners keep their connections open until the consumer
-closes them or `timeouts.shutdown` passes.
+After that close a send answers `error.Ended` and is not sent, so a reply
+still owed is lost; input read after it is dropped. The connection closes
+once the peer ends its side, or 2 s after this side ended (the queue written,
+bounded by `write_timeout`; TLS close_notify; FIN). One idle long enough to
+have parked (`timeouts.idle_park`) is closed by the server at once instead,
+without waiting for its queue. Known gap: a connection the handler already
+`end`ed (half-closed), whose peer then stays silent, and that read input
+within `timeouts.idle_park` before the drain stays until the peer sends or
+ends, `idle_timeout` or `lifetime`, or `timeouts.shutdown`.
+
+The C ABI's raw TCP listeners get the same close at drain start: the consumer
+sees `ANOLE_EV_DRAINING` and an `ANOLE_EV_NET_CLOSE` with
+`ANOLE_NET_CLOSED_DRAIN` for each connection, in no set order between the two.
+A write after it answers `ANOLE_E_INVALID` ("Ended"), which a binding treats
+as the connection going away. `"close_on_drain": false` on the listener's
+`tcp` keeps them open until the consumer closes them (after
+`ANOLE_EV_DRAINING`) or `timeouts.shutdown` passes: the way to finish the
+exchanges in flight. (A Zig handler does that with a `drain` callback.) Either
+way a connection that has parked is closed at drain start.
 
 With `ServerOptions.process`, raw TCP listeners are inherited and handed over
 by name like HTTP ones: a systemd unit can use `ListenStream=` and

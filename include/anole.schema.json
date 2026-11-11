@@ -1152,6 +1152,11 @@
           "type": "boolean",
           "default": false,
           "description": "One access-log line per closed connection."
+        },
+        "close_on_drain": {
+          "type": "boolean",
+          "default": true,
+          "description": "End each connection (gracefully, reason ANOLE_NET_CLOSED_DRAIN) when the server starts to drain; false leaves them to the consumer (until timeouts.shutdown_ms)."
         }
       }
     },
@@ -1695,6 +1700,13 @@
           "minimum": 0,
           "maximum": 4294967295,
           "default": 30000
+        },
+        "handshake_timeout_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10000,
+          "description": "How long a new connection may take to complete its handshake (0: no limit)."
         },
         "alt_svc": {
           "type": "boolean",

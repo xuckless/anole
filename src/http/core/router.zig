@@ -176,6 +176,15 @@ pub fn Router(comptime Ctx: type) type {
         record_conflicts: bool = builtin.is_test,
         /// The first conflict found under `record_conflicts`.
         conflict: ?[]const u8 = null,
+        /// Registrations that wait for every other route (`addDeferred`),
+        /// run by `finish`.
+        deferred: std.ArrayList(Deferred) = .empty,
+
+        /// A registration run by `finish`, once every other route is in.
+        pub const Deferred = struct {
+            context: *anyopaque,
+            run: *const fn (router: *Self, context: *anyopaque) void,
+        };
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
@@ -242,6 +251,30 @@ pub fn Router(comptime Ctx: type) type {
             if (node.param_child) |c| if (findConflictIn(c, path, path_is_any)) |other| return other;
             if (node.wildcard_child) |c| if (findConflictIn(c, path, path_is_any)) |other| return other;
             return null;
+        }
+
+        /// Whether a route for `method` at `path` would conflict with an
+        /// `any` route already registered (see `any`).
+        pub fn conflictsWithAny(self: *const Self, path: []const u8, method: Method) bool {
+            return self.findConflict(path, method) != null;
+        }
+
+        /// Runs `deferred` from `finish`, after every route registered
+        /// before it: for a route that only exists where no other route
+        /// wants its path, which must not depend on the order of
+        /// registration. `deferred.context` must outlive the router.
+        pub fn addDeferred(self: *Self, deferred: Deferred) void {
+            self.deferred.append(self.arena.allocator(), deferred) catch @panic("OOM");
+        }
+
+        /// Runs the registrations `addDeferred` holds, in the order they
+        /// were added, and forgets them. The server calls it before it
+        /// serves (`Server.prepareStatic`); a router used without a server
+        /// calls it once its routes are in.
+        pub fn finish(self: *Self) void {
+            const list = self.deferred.items;
+            self.deferred = .empty;
+            for (list) |d| d.run(self, d.context);
         }
 
         /// A conflict: a panic, or under `record_conflicts` the message

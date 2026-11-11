@@ -275,6 +275,7 @@ pub const PubSubHub = struct {
         var seen: std.ArrayList(*Watch) = .empty;
         defer seen.deinit(self.gpa);
         self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         inline for (.{ &self.channels, &self.patterns }) |map| {
             var it = map.valueIterator();
             while (it.next()) |e| for (e.*.watches.items) |w| {
@@ -286,10 +287,25 @@ pub const PubSubHub = struct {
                 if (!dup) seen.append(self.gpa, w) catch {};
             };
         }
-        self.mutex.unlock(self.io);
-        for (seen.items) |w| w.gapped(detail);
+        // Still under the hub's lock, as `dispatch` and `statusAll`: a watch
+        // that `stop` took out (and `deinit` may have freed) is never reached
+        // (#165, #157).
+        for (seen.items) |w| {
+            testOnGap(self);
+            w.gapped(detail);
+        }
     }
 };
+
+/// Tests: runs before each watch `gapAll` gives a gap, with the hub.
+/// Test builds only.
+pub var test_on_gap: if (builtin.is_test) std.atomic.Value(?*const fn (*PubSubHub) void) else void = if (builtin.is_test) .init(null) else {};
+
+fn testOnGap(hub: *PubSubHub) void {
+    if (comptime !builtin.is_test) return;
+    const hook = test_on_gap.load(.acquire) orelse return;
+    hook(hub);
+}
 
 /// Tests: runs once, on the hub's reader task, as `statusAll` begins (before
 /// it takes the hub's lock), where a watch's owner may end and free it.
@@ -819,4 +835,52 @@ fn buildReply(a: std.mem.Allocator, input: []const u8, pos: *usize, depth: u32) 
         4 => return .{ .int = 7 },
         else => return .{ .status = "OK" },
     }
+}
+
+const GapProbe = struct {
+    var calls: usize = 0;
+    var unlocked: usize = 0;
+    fn hook(hub: *PubSubHub) void {
+        calls += 1;
+        // `tryLock` succeeding means the hub's lock was free at the gap.
+        if (hub.mutex.tryLock()) {
+            hub.mutex.unlock(hub.io);
+            unlocked += 1;
+        }
+    }
+};
+
+test "watch redis: gapAll reaches each watch under the hub's lock, once (#165)" {
+    if (comptime !@import("build_options").redis) return error.SkipZigTest;
+    const zio = @import("zio");
+    const g = @import("../errors.zig").expectLog();
+    defer g.deinit();
+    const rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const rio = rt.io();
+    const gpa = std.testing.allocator;
+    // Nothing listens on port 1, and the reader is never started: the hub
+    // only holds the two watches.
+    const client = try redis.Client.init(gpa, rio, .{ .url = "redis://127.0.0.1:1", .environ = .empty });
+    defer client.deinit();
+    const hub = try client._pubsubHub();
+    const w1 = try Watch.init(gpa, rio, .{ .redis = .{ .client = client, .channels = &.{ "a", "b" } } }, .{});
+    defer w1.deinit();
+    const w2 = try Watch.init(gpa, rio, .{ .redis = .{ .client = client, .channels = &.{"a"} } }, .{});
+    defer w2.deinit();
+    try hub.add(w1, &.{ "a", "b" }, false);
+    try hub.add(w2, &.{"a"}, false);
+    defer {
+        hub.remove(w1, &.{ "a", "b" }, false);
+        hub.remove(w2, &.{"a"}, false);
+    }
+    GapProbe.calls = 0;
+    GapProbe.unlocked = 0;
+    test_on_gap.store(&GapProbe.hook, .release);
+    defer test_on_gap.store(null, .release);
+    hub.gapAll("test");
+    try std.testing.expectEqual(@as(usize, 2), GapProbe.calls);
+    try std.testing.expectEqual(@as(usize, 0), GapProbe.unlocked);
+    try std.testing.expectEqual(@as(u64, 1), w1.n_gaps.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), w2.n_gaps.load(.monotonic));
 }

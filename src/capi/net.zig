@@ -233,7 +233,7 @@ pub fn tcpService(e: *Engine, a: std.mem.Allocator, t: config_mod.Config.NetTcp)
         .net_framing = config_mod.netFraming(t.framing),
     };
     return .{
-        .table = &tcp_table,
+        .table = if (t.close_on_drain) &tcp_table else &tcp_table_kept,
         .options = .{
             .framing = config_mod.netFraming(t.framing),
             .half_open = t.half_open,
@@ -324,6 +324,15 @@ const tcp_table: net.TcpTable = .{
     .close = onClose,
     .sent = onSent,
     .inline_events = true,
+};
+
+/// `tcp_table` for a listener with `tcp.close_on_drain` false: the drain
+/// leaves its connections to the consumer (`ANOLE_EV_DRAINING`), until
+/// `timeouts.shutdown_ms`.
+const tcp_table_kept: net.TcpTable = blk: {
+    var k = tcp_table;
+    k.close_on_drain = false;
+    break :blk k;
 };
 
 fn execOf(e: *Engine) ?*Exec {

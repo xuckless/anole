@@ -771,8 +771,10 @@ pub fn build(b: *std.Build) void {
     // test: unit + smoke tests for the enabled features.
     const test_step = b.step("test", "Run unit tests and the smoke tests of the enabled features");
     // `zig build test -Dtest-filter="WebSocket over HTTP/2"` runs only the
-    // main suite's tests whose names contain the text (repeatable).
-    const test_filters = b.option([]const []const u8, "test-filter", "Run only the main suite's tests whose names contain this text (repeatable; zig build test -Dtest-filter=golden)") orelse &.{};
+    // main suite's and the HTTP core's tests whose names contain the text
+    // (repeatable); the core's runner gets it as TEST_FILTER, `|`-joined.
+    const test_filters = b.option([]const []const u8, "test-filter", "Run only the tests (main suite and HTTP core) whose names contain this text (repeatable, text without '|'; zig build test -Dtest-filter=golden)") orelse &.{};
+    const core_test_filter: ?[]const u8 = if (test_filters.len > 0) std.mem.join(b.allocator, "|", test_filters) catch @panic("OOM") else null;
     const tests = addSafeTest(b, .{
         .name = "anole-test",
         .filters = test_filters,
@@ -1160,6 +1162,7 @@ pub fn build(b: *std.Build) void {
         const core_test_step = b.step("core-test", "Run the HTTP core's own tests (src/http/core) on Anole's TLS, nghttp2, zlib-ng, zstd and Brotli");
         for (core_runs) |run_core_tests| {
             run_core_tests.setCwd(certs_dir);
+            if (core_test_filter) |f| run_core_tests.setEnvironmentVariable("TEST_FILTER", f);
             test_step.dependOn(&run_core_tests.step);
             core_test_step.dependOn(&run_core_tests.step);
         }
@@ -1169,6 +1172,7 @@ pub fn build(b: *std.Build) void {
             const run_timing = b.addRunArtifact(core_tests);
             run_timing.setEnvironmentVariable("ANOLE_TEST_TIMING", "1");
             run_timing.setCwd(certs_dir);
+            if (core_test_filter) |f| run_timing.setEnvironmentVariable("TEST_FILTER", f);
             run_timing.has_side_effects = true;
             timing_step.dependOn(&run_timing.step);
         }

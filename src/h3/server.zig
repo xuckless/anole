@@ -165,6 +165,10 @@ pub const Options = struct {
     send_memory: ?usize = null,
     /// How long a connection may sit idle before it is closed.
     idle_timeout: std.Io.Duration = .fromSeconds(30),
+    /// How long a new connection may take to complete its handshake before
+    /// it is closed; requests held for a 0-RTT handshake end with it.
+    /// Zero: no limit (only `idle_timeout`).
+    handshake_timeout: std.Io.Duration = .fromSeconds(10),
     /// Validate every client address with a Retry round trip before
     /// keeping state for it (costs one RTT; resists spoofed floods).
     validate_address: bool = false,
@@ -1643,6 +1647,8 @@ pub fn Endpoint(comptime Ctx: type) type {
                 var settings: ngtcp2.Settings = undefined;
                 ngtcp2.settingsDefault(&settings);
                 settings.initial_ts = now(ep.io);
+                const handshake_ns = ep.options.handshake_timeout.toNanoseconds();
+                settings.handshake_timeout = if (handshake_ns > 0) std.math.lossyCast(u64, handshake_ns) else std.math.maxInt(u64);
                 settings.token = hd.token;
                 settings.tokenlen = hd.tokenlen;
                 settings.token_type = token_type;
