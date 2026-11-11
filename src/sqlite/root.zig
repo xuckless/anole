@@ -68,6 +68,7 @@ const db = @import("../db/root.zig");
 const internal = @import("../db/internal.zig");
 const blocking = @import("../blocking.zig");
 const dusty = @import("dusty");
+const placement = dusty.placement;
 const observe = @import("../observe/root.zig");
 
 /// SQLite's C API (sqlite3.h, as built), for what Anole's calls leave out.
@@ -341,7 +342,9 @@ pub const Client = struct {
     /// `deinit`; with `.read_only`, on a reader, a snapshot that writes do
     /// not disturb. SQLite's transactions are serializable, whatever
     /// `isolation` asks. Inside, use the `Tx`, not the `Client`: a write on the
-    /// `Client` would wait for the transaction's own writer.
+    /// `Client` from the task holding the transaction fails at once
+    /// (`error.Database`, "this task already holds the writer"; #160). A
+    /// `Tx` stays on the task that began it.
     ///
     ///     var tx = try app.db.begin(req, .{});
     ///     defer tx.deinit();
@@ -356,7 +359,7 @@ pub const Client = struct {
             lease = taken_.lease;
             break :blk taken_.conn;
         } else blk: {
-            lease = try self.lockWriter(cx.io);
+            lease = try self.checkOutWriter(cx);
             break :blk &self.writer.conn;
         };
         var tx: Tx = .{ .db = self, .io = cx.io, .conn = conn, .on_writer = !reader, .lease = lease };
@@ -404,7 +407,7 @@ pub const Client = struct {
     /// The writer connection for the driver's own calls (`Conn.run`), held
     /// until `release`.
     pub fn acquire(self: *Client, cx: anytype) Error!Conn {
-        const lease = try self.lockWriter(cx.io);
+        const lease = try self.checkOutWriter(cx);
         return .{ .db = self, .io = cx.io, .lease = lease };
     }
 
@@ -452,25 +455,45 @@ pub const Client = struct {
         self.given(io);
     }
 
+    /// `lockWriter` for a call of `cx`: a writer this very task holds is
+    /// refused with a message saying what to do.
+    fn checkOutWriter(self: *Client, cx: anytype) Error!u32 {
+        return self.lockWriter(cx.io) catch |err| switch (err) {
+            error.WriterHeldByCaller => failedWith(self, cx, writer_held_by_caller),
+            error.Canceled => error.Canceled,
+        };
+    }
+
     /// Checks the writer out: one call, transaction, `iterate` or `acquire`
     /// holds it at a time (a pool of one; no order among the waiters). The
     /// returned lease gives it back (`unlockWriter`). Nothing is locked
     /// when this returns: the holder suspends freely (SAFETY.md L2).
-    fn lockWriter(self: *Client, io: std.Io) error{Canceled}!u32 {
+    /// `WriterHeldByCaller`: the holder is the calling task itself (its own
+    /// transaction, `iterate` or `acquire`), which waiting would never see
+    /// end; glibc's error-checking mutex answers EDEADLK there (#160).
+    fn lockWriter(self: *Client, io: std.Io) error{ Canceled, WriterHeldByCaller }!u32 {
         const w = &self.writer;
         const started: std.Io.Clock.Timestamp = .now(io, .awake);
+        const me = placement.currentTask(io);
         try w.mutex.lock(io);
-        if (w.held) {
-            self.waits(io, 1);
-            while (w.held) w.free.wait(io, &w.mutex) catch |err| {
-                // `deregister` hands a wake this waiter took on to the next.
-                w.mutex.unlock(io);
+        switch (w.holder) {
+            .free => {},
+            .held => |task| {
+                if (sameTask(task, me)) {
+                    w.mutex.unlock(io);
+                    return error.WriterHeldByCaller;
+                }
+                self.waits(io, 1);
+                while (w.holder == .held) w.free.wait(io, &w.mutex) catch |err| {
+                    // `deregister` hands a wake this waiter took on to the next.
+                    w.mutex.unlock(io);
+                    self.waits(io, -1);
+                    return err;
+                };
                 self.waits(io, -1);
-                return err;
-            };
-            self.waits(io, -1);
+            },
         }
-        w.held = true;
+        w.holder = .{ .held = me };
         w.lease +%= 1;
         const lease = w.lease;
         w.mutex.unlock(io);
@@ -484,13 +507,12 @@ pub const Client = struct {
     fn unlockWriter(self: *Client, io: std.Io, lease: u32) void {
         const w = &self.writer;
         w.mutex.lockUncancelable(io);
-        if (!w.held or w.lease != lease) {
+        if (w.holder == .free or w.lease != lease) {
             w.mutex.unlock(io);
             log.err("sqlite \"{s}\": the writer was given back twice; the second time did nothing", .{self.name});
             return;
         }
-        w.held = false;
-        w.lease +%= 1;
+        w.holder = .free;
         w.free.signal(io);
         w.mutex.unlock(io);
         self.given(io);
@@ -501,7 +523,7 @@ pub const Client = struct {
         const w = &self.writer;
         w.mutex.lockUncancelable(io);
         defer w.mutex.unlock(io);
-        return w.held and w.lease == lease;
+        return w.holder == .held and w.lease == lease;
     }
 
     /// Whether `lease` is the checkout holding the reader `conn` now.
@@ -754,7 +776,7 @@ pub const Query = struct {
                 else => |e| return e,
             }
         }
-        const lease = try self.lockWriter(cx.io);
+        const lease = try self.checkOutWriter(cx);
         defer self.unlockWriter(cx.io, lease);
         return runOnWriter(self, cx, op, T, sql, args, flags);
     }
@@ -969,6 +991,22 @@ pub const TxQuery = struct {
     }
 };
 
+/// What a writing call made by the task that holds the writer gets (#160).
+/// Class `.other`, never `.deadlock`: `transaction()` would retry it into
+/// the same error.
+const writer_held_by_caller = "this task already holds the writer (an open transaction, iterate or acquire): make the call through the Tx, or end it first";
+
+/// Whether the writer's holder `holder` is the calling task `me`. A holder
+/// or caller with no task identity (a thread off the zio runtime, a
+/// blocking-pool thread, std.Io.Threaded) never matches: never a false
+/// `WriterHeldByCaller`.
+fn sameTask(holder: ?placement.Task, me: ?placement.Task) bool {
+    if (comptime placement.Task == void) return false;
+    const a = holder orelse return false;
+    const b = me orelse return false;
+    return a == b;
+}
+
 /// A call's failure that is Anole's own (not SQLite's): recorded for
 /// `lastError`, as `error.Database`.
 fn failedWith(d: *Client, cx: anytype, comptime message: []const u8) Error {
@@ -1058,7 +1096,7 @@ pub fn Rows(comptime T: type) type {
                     if (err != error.NeedsWriter) return @errorCast(err);
                 }
             }
-            const lease = try d.lockWriter(cx.io);
+            const lease = try d.checkOutWriter(cx);
             errdefer d.unlockWriter(cx.io, lease);
             var rows = startOn(d, cx, &d.writer.conn, true, true, sql, args) catch |err| switch (err) {
                 error.NeedsWriter => unreachable,
@@ -1242,6 +1280,15 @@ const Job = struct {
     done: std.Io.Event = .unset,
 };
 
+/// Who has the writer checked out (`Client.lockWriter`): nobody, or one
+/// holder with its zio task, null when it has none (a blocking-pool thread,
+/// a thread off the runtime, std.Io.Threaded), which never counts as the
+/// caller itself.
+const Holder = union(enum) {
+    free,
+    held: ?placement.Task,
+};
+
 /// owner: the `Client` (process-wide, M2); the thread is joined in
 /// `Client.deinit` before anything here is freed, so it wakes callers
 /// directly (SAFETY.md T5).
@@ -1260,9 +1307,10 @@ const Writer = struct {
     /// `acquire` (`Client.lockWriter`): one holder at a time, which alone
     /// hands the thread jobs. A pool of one, as database/sql's
     /// SetMaxOpenConns(1), not a lock held across the holder's calls.
-    held: bool = false,
-    /// Bumped by each checkout and each give-back (odd while held): a
-    /// give-back with another lease does nothing (M6).
+    holder: Holder = .free,
+    /// The number of the latest checkout, bumped by each: a give-back or a
+    /// `holdsWriter` with another one, or while `free`, does nothing (M6).
+    /// Whether it is held is `holder` alone.
     lease: u32 = 0,
     /// Signalled when the writer is given back.
     free: safety.Condition = .init,
