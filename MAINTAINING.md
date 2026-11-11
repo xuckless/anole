@@ -219,6 +219,18 @@ lalinsky invited the scheduler PRs, lalinsky/zio #836-#838).
   as is, takes the loop path on WouldBlock or a pending cancel, and spends
   a tick-budget quantum per direct send; Anole turns it on beside
   `fast_accept`. Add `--fast-send` to the check.sh runs above.
+  UDP batches on io_uring (#106, 4652663; offer upstream as a sibling of
+  #872, the receive half needs no option): a socket whose last
+  `net_recvmmsg` filled every slot goes on a per-loop hint table (#872's
+  accept-hint table, renamed `FdHints`) and its next batch tries recvmmsg
+  directly inside `loop.add`; a short batch or EAGAIN drops the hint, so
+  only a socket whose queue stays full skips the ring. With `fast_send`,
+  `net_sendmmsg` tries sendmmsg directly and falls back to the SENDMSG
+  SQE on EAGAIN (the kernel retries it on writable). 3c863fc: an untimed
+  batch receive or send that finished inside `loop.add` returns at once
+  (`waitForIoPreferInline`, as accept), so a full socket gives several
+  batches per executor pass under the tick budget and `no_park_grace`,
+  not one park and backend poll per batch; a timed receive still parks.
   D10 (fork only, 4286fa0): a wait that completes without parking still
   yields once the executor's tick is spent and checks held locks
   (`yieldPointNoPark`), so inline sends can't starve the run queue (#184
