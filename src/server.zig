@@ -42,16 +42,17 @@ const lambda_serve = if (features.lambda) @import("lambda/serve.zig") else struc
 /// SIGUSR2 (restart) and SIGHUP (certificate reload): not on Windows.
 const unix_signals = builtin.os.tag != .windows;
 
-/// The text `/config` shows, rendered once at init: the resolved modes, the
+/// The text `/config` shows, rendered at init and again in `listenOn`, once
+/// the listeners are decided: the resolved modes, the
 /// options with secrets left out, the `.env` files read (names and counts
 /// only) and the features this build has.
-fn renderConsoleConfig(a: std.mem.Allocator, opts: *const Options, mode: *const modes.Resolved) ![]const u8 {
+fn renderConsoleConfig(a: std.mem.Allocator, opts: *const Options, mode: *const modes.Resolved, used_listen_tls: bool) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(a);
     const w = &aw.writer;
     try w.writeAll("# modes\n");
     var lines: [2048]u8 = undefined;
     var lw: std.Io.Writer = .fixed(&lines);
-    modes.writeLines(mode, .{ .used_listen_tls = false }, &lw) catch {};
+    modes.writeLines(mode, .{ .used_listen_tls = used_listen_tls }, &lw) catch {};
     var it = std.mem.splitScalar(u8, lw.buffered(), '\n');
     while (it.next()) |line| {
         if (line.len == 0) continue;
@@ -1251,7 +1252,7 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
                     return err;
                 };
             }
-            const console_config_text: []const u8 = if (features.console and console_resolved.enabled) renderConsoleConfig(a, &opts, mode) catch "" else "";
+            const console_config_text: []const u8 = if (features.console and console_resolved.enabled) renderConsoleConfig(a, &opts, mode, false) catch "" else "";
 
             // Under AWS Lambda at one invocation at a time, one executor:
             // one thread, the least memory, the fastest init.
@@ -1597,6 +1598,13 @@ fn ServerOf(comptime Ctx: type, comptime app_init: bool) type {
             // What the options left null, from the modes.
             var opts = opts_in;
             try modes.fillListeners(a, &opts, self.mode);
+            // What this server binds (#96): `listen` and `listenTls` set
+            // http/https after init and the modes filled the rest just now.
+            // The console starts after this (`runInner`), so no reader yet;
+            // the init text stays in the arena.
+            if (comptime features.console) if (self.console_resolved.enabled) {
+                self.console_config_text = renderConsoleConfig(a, &opts, self.mode, self.used_listen_tls) catch self.console_config_text;
+            };
             const specs = try listenerSpecs(a, opts, self.mode);
             {
                 var why_buf: [512]u8 = undefined;

@@ -432,6 +432,10 @@ const Check = struct {
         // /config: the resolved options, as set.
         const cfg = (try c.snapshot(protocol.ConfigData, .config)).?;
         try std.testing.expect(std.mem.find(u8, cfg.text, "console.name = \"live\"") != null);
+        // The listener `app.listen` set after init, not `http = (unset)` (#96).
+        try std.testing.expect(std.mem.find(u8, cfg.text, "http.address = \"127.0.0.1\"") != null);
+        try std.testing.expect(std.mem.find(u8, cfg.text, "http.port = 0") != null);
+        try std.testing.expect(std.mem.find(u8, cfg.text, "http = (unset)") == null);
     }
 };
 
